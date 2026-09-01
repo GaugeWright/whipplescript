@@ -771,15 +771,10 @@ impl<Sql: DoSql + Clone> whipplescript_kernel::effect_handlers::CapabilityProvid
             Ok(streams) => streams,
             Err(error) => return failed(format!("workstream store unavailable: {error:?}")),
         };
-        let branches = match crate::do_branches::DoBranches::new(self.sql.clone()) {
-            Ok(branches) => branches,
-            Err(error) => return failed(format!("branch store unavailable: {error:?}")),
+        let mut vcs = match crate::do_branches::compose_vcs(&self.sql) {
+            Ok(vcs) => vcs,
+            Err(error) => return failed(format!("branch stores unavailable: {error:?}")),
         };
-        let content = match crate::do_branches::DoContentBlobs::new(self.sql.clone()) {
-            Ok(content) => content,
-            Err(error) => return failed(format!("content blobs unavailable: {error:?}")),
-        };
-        let mut vcs = whipplescript_store::vcs::WorkspaceVcs::from_parts(branches, content);
         let seed = crate::do_store::stable_hash_hex(&format!("promote|{}", effect.effect_id));
         let at = format!("promote:{}", effect.effect_id);
         let reservation_id = format!("effect-{}", effect.effect_id);
@@ -995,11 +990,11 @@ impl<Sql: DoSql + Clone> whipplescript_kernel::effect_handlers::CapabilityProvid
                     .to_owned(),
             );
         };
-        let content = match crate::do_branches::DoContentBlobs::new(self.sql.clone()) {
-            Ok(content) => content,
-            Err(error) => return failed(format!("content blobs unavailable: {error:?}")),
+        drop(branches);
+        let mut vcs = match crate::do_branches::compose_vcs(&self.sql) {
+            Ok(vcs) => vcs,
+            Err(error) => return failed(format!("branch stores unavailable: {error:?}")),
         };
-        let mut vcs = whipplescript_store::vcs::WorkspaceVcs::from_parts(branches, content);
         vcs.set_actor(Some(format!("instance:{}", self.instance_id)));
         vcs.set_intent(Some(effect.effect_id.clone()));
         let seed = crate::do_store::stable_hash_hex(&format!("selective|{}", effect.effect_id));
@@ -1105,8 +1100,8 @@ impl<Sql: DoSql + Clone> whipplescript_kernel::effect_handlers::CapabilityProvid
 }
 
 /// DR-0086 F4: the DO half of the receipt staleness-delta advisory — the
-/// same kernel evaluation native uses, over the DO's own views. Subjects
-/// are the listable issues (assertion listing on the DO rides F5).
+/// same kernel evaluation native uses, over the DO's own views. Subjects are the
+/// listable issues and active assertions (DR-0086 F5).
 fn do_staleness_deltas<Sql: crate::do_store::DoSql + Clone>(
     sql: &Sql,
     vcs: &whipplescript_store::vcs::WorkspaceVcs<
@@ -1118,12 +1113,21 @@ fn do_staleness_deltas<Sql: crate::do_store::DoSql + Clone>(
 ) -> Vec<serde_json::Value> {
     use whipplescript_store::items::WorkItems;
     let items = crate::do_store::DoSqliteStore::new(sql.clone());
-    let subjects: Vec<String> = items
+    let mut subjects: Vec<String> = items
         .list_items(None, None)
         .unwrap_or_default()
         .into_iter()
         .map(|issue| issue.id)
         .collect();
+    // DR-0086 F5: assertions are listable on the DO now, so the receipt
+    // advisory covers both nouns, native parity complete.
+    subjects.extend(
+        items
+            .list_assertions(false)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|assertion| assertion.id),
+    );
     whipplescript_kernel::effect_handlers::staleness_deltas_generic(
         &items, vcs, &subjects, branch_id, cut_id,
     )
@@ -1258,10 +1262,7 @@ mod tests {
         let sql = sql();
         let mut branches = crate::do_branches::DoBranches::new(Rc::clone(&sql)).expect("open");
         branches.ensure_mainline("t0").expect("mainline");
-        let mut vcs = whipplescript_store::vcs::WorkspaceVcs::from_parts(
-            crate::do_branches::DoBranches::new(Rc::clone(&sql)).expect("open"),
-            crate::do_branches::DoContentBlobs::new(Rc::clone(&sql)).expect("open"),
-        );
+        let mut vcs = crate::do_branches::compose_vcs(&sql).expect("open");
         vcs.init("t0").expect("init");
         vcs.create_branch(
             "member-line",
@@ -1403,11 +1404,7 @@ mod tests {
         let mut streams = DoWorkstreams::new(Rc::clone(&sql)).expect("open");
         let mut branches = crate::do_branches::DoBranches::new(Rc::clone(&sql)).expect("open");
         branches.ensure_mainline("t0").expect("mainline");
-        let content = crate::do_branches::DoContentBlobs::new(Rc::clone(&sql)).expect("open");
-        let mut vcs = whipplescript_store::vcs::WorkspaceVcs::from_parts(
-            crate::do_branches::DoBranches::new(Rc::clone(&sql)).expect("open"),
-            content,
-        );
+        let mut vcs = crate::do_branches::compose_vcs(&sql).expect("open");
         vcs.init("t0").expect("init");
         vcs.create_branch(
             "line-triage",

@@ -8301,6 +8301,39 @@ impl<Sql: DoSql> DoSqliteStore<Sql> {
             new_alias.insert(content_id, alias);
             report.new_issues += 1;
         }
+        // Re-alias every newly-seen assertion the same way, minting AS-N
+        // from the assertion counter (DR-0086 F5: the DO's assertion
+        // projection — no duplicate-submission advisory, assertions have
+        // no queue).
+        let unaliased_assertions = self
+            .sql
+            .query(
+                "SELECT issue_id FROM tracker_events \
+                 WHERE kind = 'assertion.created' AND issue_id IS NOT NULL \
+                   AND issue_id NOT IN (SELECT content_id FROM tracker_aliases) \
+                 GROUP BY issue_id ORDER BY MIN(event_seq)",
+                &[],
+            )
+            .map_err(sql_err)?;
+        for row in &unaliased_assertions {
+            let content_id = as_text(&row[0]);
+            let bumped = self
+                .sql
+                .query(
+                    "UPDATE tracker_assertion_counter SET next_id = next_id + 1 \
+                     WHERE singleton = 1 RETURNING next_id - 1",
+                    &[],
+                )
+                .map_err(sql_err)?;
+            let next = bumped.first().map_or(0, |row| as_i64(&row[0]));
+            self.sql
+                .execute(
+                    "INSERT INTO tracker_aliases (content_id, alias) VALUES (?1, ?2)",
+                    &[text(&content_id), text(&format!("AS-{next}"))],
+                )
+                .map_err(sql_err)?;
+            report.new_assertions += 1;
+        }
         // Genuine duplicate submission: a newly-seen creation describing the same
         // work (queue + title) as a DISTINCT issue already in the log — two
         // independent submissions, distinct content ids. Advisory, never a
@@ -8365,6 +8398,7 @@ impl<Sql: DoSql> DoSqliteStore<Sql> {
             "tracker_comments",
             "tracker_evidence",
             "tracker_anchors",
+            "tracker_assertions",
         ] {
             self.sql
                 .execute(&format!("DELETE FROM {table}"), &[])
@@ -8626,6 +8660,33 @@ fn do_fold_tracker_event(
                         opt_text(str_of("basis").as_deref()),
                         opt_text(fingerprint_json.as_deref()),
                     ],
+                )
+                .map_err(sql_err)?;
+            }
+        }
+        "assertion.created" => {
+            if let Some(alias) = issue_id {
+                sql.execute(
+                    "INSERT OR IGNORE INTO tracker_assertions \
+                     (assertion_id, title, body, status, created_by, created_at, updated_at) \
+                     VALUES (?1, ?2, ?3, 'active', ?4, ?5, ?5)",
+                    &[
+                        text(alias),
+                        text(&str_of("title").unwrap_or_default()),
+                        text(&str_of("body").unwrap_or_default()),
+                        opt_text(str_of("created_by").as_deref()),
+                        text(created_at),
+                    ],
+                )
+                .map_err(sql_err)?;
+            }
+        }
+        "assertion.retired" => {
+            if let Some(alias) = issue_id {
+                sql.execute(
+                    "UPDATE tracker_assertions SET status = 'retired', updated_at = ?2 \
+                     WHERE assertion_id = ?1",
+                    &[text(alias), text(created_at)],
                 )
                 .map_err(sql_err)?;
             }
@@ -9377,6 +9438,16 @@ pub(crate) mod test_support {
                 role TEXT NOT NULL DEFAULT 'subject', added_by TEXT,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
+            CREATE TABLE tracker_assertions (
+                assertion_id TEXT PRIMARY KEY, title TEXT NOT NULL,
+                body TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'active',
+                created_by TEXT, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE tracker_assertion_counter (
+                singleton INTEGER PRIMARY KEY CHECK (singleton = 1), next_id INTEGER NOT NULL
+            );
+            INSERT INTO tracker_assertion_counter (singleton, next_id) VALUES (1, 1);
             CREATE INDEX idx_tracker_issues_queue ON tracker_issues(queue, status);
             CREATE INDEX idx_tracker_leases_issue ON tracker_leases(issue_id, released_at);
             CREATE INDEX idx_tracker_events_issue ON tracker_events(issue_id, kind);
@@ -9563,6 +9634,56 @@ impl<Sql: DoSql + Clone> whipplescript_store::vcs::FrontierRead for DoSqliteStor
 }
 
 impl<Sql: DoSql + Clone> DoSqliteStore<Sql> {
+    /// Every assertion, newest first; retired only when asked (DR-0086 F5:
+    /// the DO's assertion listing).
+    pub fn list_assertions(
+        &self,
+        include_retired: bool,
+    ) -> StoreResult<Vec<whipplescript_store::items::Assertion>> {
+        let filter = if include_retired {
+            ""
+        } else {
+            "WHERE a.status = 'active'"
+        };
+        let rows = self
+            .sql
+            .query(
+                &format!(
+                    "SELECT a.assertion_id, l.content_id, a.title, a.body, a.status, \
+                            a.created_by, a.created_at, a.updated_at \
+                     FROM tracker_assertions a \
+                     JOIN tracker_aliases l ON l.alias = a.assertion_id \
+                     {filter} ORDER BY a.created_at DESC, a.assertion_id DESC"
+                ),
+                &[],
+            )
+            .map_err(sql_err)?;
+        Ok(rows
+            .iter()
+            .map(|row| whipplescript_store::items::Assertion {
+                id: as_text(&row[0]),
+                content_id: as_text(&row[1]),
+                title: as_text(&row[2]),
+                body: as_text(&row[3]),
+                status: as_text(&row[4]),
+                created_by: as_opt_text(&row[5]),
+                created_at: as_text(&row[6]),
+                updated_at: as_text(&row[7]),
+            })
+            .collect())
+    }
+
+    /// The verification view over one subject (DR-0086 F5): the same
+    /// kernel-rendered report native serves, evaluated against the DO's
+    /// own mainline frontier. `None` = no frontier or unreadable evidence.
+    pub fn verification_report(&self, subject: &str) -> Option<serde_json::Value> {
+        let (frontier, units) = whipplescript_kernel::effect_handlers::frontier_context(
+            self,
+            whipplescript_store::branches::MAINLINE_BRANCH_ID,
+        )?;
+        whipplescript_kernel::effect_handlers::verification_report(self, &frontier, &units, subject)
+    }
+
     /// The composed read-side workspace view the FrontierRead impl serves.
     fn frontier_vcs(
         &self,
@@ -9573,15 +9694,7 @@ impl<Sql: DoSql + Clone> DoSqliteStore<Sql> {
         >,
         (),
     > {
-        let branches = crate::do_branches::DoBranches::new(self.sql.clone()).map_err(|_| ())?;
-        let content = crate::do_branches::DoContentBlobs::new(self.sql.clone()).map_err(|_| ())?;
-        let mut vcs = whipplescript_store::vcs::WorkspaceVcs::from_parts(branches, content);
-        // Kernel-internal canonicalization (DR-0086 Decision 1): decl
-        // entries are real on the DO, not a native privilege.
-        vcs.set_decl_canonicalizer(Box::new(
-            whipplescript_kernel::source_merge::WhipDeclCanonicalizer,
-        ));
-        Ok(vcs)
+        crate::do_branches::compose_vcs(&self.sql).map_err(|_| ())
     }
 }
 
@@ -9923,9 +10036,7 @@ pub(crate) mod tests {
         assert_eq!(do_anchors[0].region, "decl(rule close)");
 
         // A program lands on the DO's own mainline.
-        let branches = crate::do_branches::DoBranches::new(store.sql.clone()).expect("branches");
-        let content = crate::do_branches::DoContentBlobs::new(store.sql.clone()).expect("content");
-        let mut vcs = whipplescript_store::vcs::WorkspaceVcs::from_parts(branches, content);
+        let mut vcs = crate::do_branches::compose_vcs(&store.sql).expect("branch stores");
         vcs.init("t0").expect("init");
         vcs.write(
             "main",
@@ -9954,6 +10065,41 @@ pub(crate) mod tests {
             fingerprint.contains_key("decl:rule close"),
             "{fingerprint:?}"
         );
+
+        // DR-0086 F5: the DO serves the verification view itself — fresh at
+        // the attest frontier, stale with a witnessed breaking cut after an
+        // edit, exactly the report native renders.
+        let report = store.verification_report(&issue.id).expect("report");
+        assert_eq!(report["status"], "verified");
+        let mut vcs = crate::do_branches::compose_vcs(&store.sql).expect("branch stores");
+        vcs.set_actor(Some("s:editor".to_owned()));
+        vcs.write(
+            "main",
+            "src/close.whip",
+            Some("workflow K\noutput result R\nclass R { ok bool }\nrule close\n  when started\n=> { complete result { ok false } }\n"),
+            "cut_do_f5",
+            "t2",
+        )
+        .expect("write");
+        let report = store.verification_report(&issue.id).expect("report");
+        eprintln!(
+            "DEBUG units: {:?}",
+            whipplescript_store::vcs::FrontierRead::frontier_change_units(&store, "main", 100)
+        );
+        assert_eq!(report["status"], "stale");
+        let stale_row = report["evidence"]
+            .as_array()
+            .expect("rows")
+            .iter()
+            .find(|row| row["freshness"] == "stale")
+            .expect("stale row");
+        let witness = stale_row["witness"].as_array().expect("witness");
+        assert!(
+            witness
+                .iter()
+                .any(|unit| unit["cut"] == "cut_do_f5" && unit["actor"] == "s:editor"),
+            "{witness:?}"
+        );
     }
 
     /// DR-0086 Decision 1 (F1), the DO half: the DoSqliteStore serves the
@@ -9972,9 +10118,7 @@ pub(crate) mod tests {
             .is_empty());
 
         // Write a real program through the DO's own branch tables.
-        let branches = crate::do_branches::DoBranches::new(store.sql.clone()).expect("branches");
-        let content = crate::do_branches::DoContentBlobs::new(store.sql.clone()).expect("content");
-        let mut vcs = whipplescript_store::vcs::WorkspaceVcs::from_parts(branches, content);
+        let mut vcs = crate::do_branches::compose_vcs(&store.sql).expect("branch stores");
         vcs.init("t0").expect("init");
         vcs.write(
             "main",
@@ -10069,6 +10213,15 @@ pub(crate) mod tests {
         let report = a.import_events(&[created, retired]).expect("import");
         assert_eq!(report.rejected, 0, "root-kind identity admits assertions");
         assert_eq!(report.imported, 2);
+        // DR-0086 F5: the DO PROJECTS assertions now — AS-N minted, the
+        // retirement folded, retired hidden from the default listing.
+        assert_eq!(report.new_assertions, 1);
+        assert!(a.list_assertions(false).expect("list").is_empty());
+        let all = a.list_assertions(true).expect("list");
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].id, "AS-1");
+        assert_eq!(all[0].status, "retired");
+        assert_eq!(all[0].title, "custody core verified");
 
         let exported = a.export_events().expect("export");
         assert!(exported

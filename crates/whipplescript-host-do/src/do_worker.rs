@@ -471,10 +471,9 @@ impl<Sql: DoSql + 'static> DurableInstance<Sql> {
                         .and_then(|row| row.head_cut_id)
                         .unwrap_or_default();
                     let seed = crate::do_store::stable_hash_hex(&format!("{instance_id}|{head}"));
-                    let content = crate::do_branches::DoContentBlobs::new(Rc::clone(&sql))
-                        .map_err(|error| format!("content blobs unavailable: {error:?}"))?;
-                    let mut vcs =
-                        whipplescript_store::vcs::WorkspaceVcs::from_parts(branches, content);
+                    drop(branches);
+                    let mut vcs = crate::do_branches::compose_vcs(&sql)
+                        .map_err(|error| format!("branch stores unavailable: {error:?}"))?;
                     // The run's writes carry the deepest observed tier
                     // (DR-0052; session carriage upgrades this later).
                     vcs.set_actor(Some(format!("instance:{instance_id}")));
@@ -598,9 +597,9 @@ impl<Sql: DoSql + 'static> DurableInstance<Sql> {
             .and_then(|row| row.head_cut_id)
             .unwrap_or_default();
         let seed = crate::do_store::stable_hash_hex(&format!("{}|{head}", self.instance_id));
-        let content = crate::do_branches::DoContentBlobs::new(Rc::clone(&sql))
-            .map_err(|error| format!("content blobs unavailable: {error:?}"))?;
-        let mut vcs = whipplescript_store::vcs::WorkspaceVcs::from_parts(branches, content);
+        drop(branches);
+        let mut vcs = crate::do_branches::compose_vcs(&sql)
+            .map_err(|error| format!("branch stores unavailable: {error:?}"))?;
         // DR-0086 F4: same stamp on the re-point path.
         if let Some(intent) = whipplescript_kernel::effect_handlers::claim_intent_for(
             &crate::do_store::DoSqliteStore::new(Rc::clone(&sql)),
@@ -1490,12 +1489,11 @@ rule go
 #[cfg(test)]
 mod branch_dispatch_tests {
     use super::*;
-    use crate::do_branches::{DoBranches, DoContentBlobs};
+    use crate::do_branches::DoBranches;
     use crate::do_store::test_support::store;
     use whipplescript_store::branches::{
         Branches, CreateBranch, CreateBranchOutcome, MAINLINE_BRANCH_ID,
     };
-    use whipplescript_store::vcs::WorkspaceVcs;
 
     const TEST_NOW_MS: i64 = 1_767_225_600_000;
 
@@ -1562,10 +1560,7 @@ mod branch_dispatch_tests {
 
         // The content is a cut on the branch, keyed by the resolved full
         // path — read back through the same generic VCS the native CLI uses.
-        let vcs = WorkspaceVcs::from_parts(
-            DoBranches::new(Rc::clone(&sql)).expect("branch store"),
-            DoContentBlobs::new(Rc::clone(&sql)).expect("content blobs"),
-        );
+        let vcs = crate::do_branches::compose_vcs(&sql).expect("branch stores");
         assert_eq!(
             vcs.read("draft_a", "/ws/note.md").expect("read").as_deref(),
             Some("branch body")

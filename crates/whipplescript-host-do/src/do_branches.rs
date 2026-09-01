@@ -1395,3 +1395,24 @@ impl<S: DoSql> ContentBlobs for DoContentBlobs<S> {
         })
     }
 }
+
+/// DR-0086 F5: the ONE way host-do composes a workspace view. Installs the
+/// kernel canonicalizer so declaration sub-rows are recorded at
+/// index-maintenance time — without this, every DO composition wrote a
+/// decl-less change-unit index and `decl()` selection / witness scans were
+/// silently path-level on the DO (fail closed per DR-0054, but a parity gap
+/// F5 exposed). Actor/intent stay the caller's to set.
+pub(crate) fn compose_vcs<Sql: crate::do_store::DoSql + Clone>(
+    sql: &Sql,
+) -> Result<
+    whipplescript_store::vcs::WorkspaceVcs<DoBranches<Sql>, DoContentBlobs<Sql>>,
+    whipplescript_store::StoreError,
+> {
+    let branches = DoBranches::new(sql.clone())?;
+    let content = DoContentBlobs::new(sql.clone())?;
+    let mut vcs = whipplescript_store::vcs::WorkspaceVcs::from_parts(branches, content);
+    vcs.set_decl_canonicalizer(Box::new(
+        whipplescript_kernel::source_merge::WhipDeclCanonicalizer,
+    ));
+    Ok(vcs)
+}

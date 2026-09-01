@@ -1780,6 +1780,117 @@ pub fn plan_finish_attest<W: WorkItems + ?Sized, F: FrontierRead + ?Sized>(
     })
 }
 
+/// DR-0086 F5: one frontier context per read, shared by every verification
+/// view — the content maps plus the change-unit window the witness scans.
+pub fn frontier_context<F: FrontierRead + ?Sized>(
+    frontier: &F,
+    branch_id: &str,
+) -> Option<(
+    whipplescript_store::freshness::FrontierContent,
+    Vec<whipplescript_store::selection::ChangeUnit>,
+)> {
+    let (_at_cut, content) = frontier.frontier_content(branch_id).ok()??;
+    let units = frontier
+        .frontier_change_units(branch_id, 10_000)
+        .unwrap_or_default();
+    Some((content, units))
+}
+
+/// DR-0086 F5: the witness scan — post-at-cut change units the basis
+/// selects, with actor and intent (attribution, never the freshness
+/// definition). Conservative when the at-cut has left the window: every
+/// matching unit is reported, more candidates rather than fewer.
+pub fn witness_units(
+    basis: Option<&str>,
+    at_cut: Option<&str>,
+    units: &[whipplescript_store::selection::ChangeUnit],
+) -> Vec<serde_json::Value> {
+    let Some(basis) = basis else {
+        return Vec::new();
+    };
+    let Ok(expr) = whipplescript_store::selection::parse(basis) else {
+        return Vec::new();
+    };
+    let boundary = at_cut.and_then(|cut| units.iter().position(|unit| unit.cut_id == cut));
+    whipplescript_store::selection::eval(&expr, units)
+        .into_iter()
+        .filter(|&index| boundary.is_none_or(|b| index > b))
+        .map(|index| {
+            let unit = &units[index];
+            serde_json::json!({
+                "cut": unit.cut_id, "path": unit.path,
+                "actor": unit.actor, "intent": unit.intent,
+            })
+        })
+        .collect()
+}
+
+/// DR-0086 F5: the verification view, generic so both hosts render the
+/// SAME report — per-evidence fresh/stale/unkeyed with mismatched entries,
+/// moved advisories, and the witness; subject status verified/stale/
+/// unverified. Derived, never stored. `None` = the subject's evidence is
+/// unreadable (unknown subjects report as unverified-with-no-rows, which
+/// is what an empty evidence list honestly is).
+pub fn verification_report<W: WorkItems + ?Sized>(
+    items: &W,
+    frontier: &whipplescript_store::freshness::FrontierContent,
+    units: &[whipplescript_store::selection::ChangeUnit],
+    subject: &str,
+) -> Option<serde_json::Value> {
+    use whipplescript_store::freshness::{evaluate, Freshness};
+    let evidence = items.evidence(subject).ok()?;
+    let mut any_fresh = false;
+    let mut any_keyed = false;
+    let mut rows = Vec::new();
+    for row in &evidence {
+        let Some(fingerprint_json) = &row.basis_fingerprint_json else {
+            rows.push(serde_json::json!({
+                "evidence_id": row.id, "kind": row.kind, "freshness": "unkeyed",
+            }));
+            continue;
+        };
+        let Ok(fingerprint) =
+            serde_json::from_str::<std::collections::BTreeMap<String, String>>(fingerprint_json)
+        else {
+            rows.push(serde_json::json!({
+                "evidence_id": row.id, "kind": row.kind, "freshness": "unkeyed",
+                "note": "unreadable fingerprint",
+            }));
+            continue;
+        };
+        any_keyed = true;
+        match evaluate(&fingerprint, frontier) {
+            Freshness::Fresh => {
+                any_fresh = true;
+                rows.push(serde_json::json!({
+                    "evidence_id": row.id, "kind": row.kind, "freshness": "fresh",
+                    "at_cut": row.at_cut,
+                }));
+            }
+            Freshness::Stale { mismatched, moved } => {
+                rows.push(serde_json::json!({
+                    "evidence_id": row.id, "kind": row.kind, "freshness": "stale",
+                    "at_cut": row.at_cut,
+                    "mismatched": mismatched,
+                    "moved": moved
+                        .iter()
+                        .map(|(from, to)| serde_json::json!({ "from": from, "moved_to": to }))
+                        .collect::<Vec<_>>(),
+                    "witness": witness_units(row.basis.as_deref(), row.at_cut.as_deref(), units),
+                }));
+            }
+        }
+    }
+    let status = if any_fresh {
+        "verified"
+    } else if any_keyed {
+        "stale"
+    } else {
+        "unverified"
+    };
+    Some(serde_json::json!({ "status": status, "evidence": rows }))
+}
+
 /// DR-0086 F4: the staleness deltas a proposal cut caused, generic over the
 /// two read views so the native provider and the DO handler report the SAME
 /// receipt advisory — every keyed evidence row among `subjects` that is

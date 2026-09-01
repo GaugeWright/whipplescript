@@ -307,6 +307,16 @@
                 role TEXT NOT NULL DEFAULT 'subject', added_by TEXT,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
+            CREATE TABLE tracker_assertions (
+                assertion_id TEXT PRIMARY KEY, title TEXT NOT NULL,
+                body TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'active',
+                created_by TEXT, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE tracker_assertion_counter (
+                singleton INTEGER PRIMARY KEY CHECK (singleton = 1), next_id INTEGER NOT NULL
+            );
+            INSERT INTO tracker_assertion_counter (singleton, next_id) VALUES (1, 1);
             CREATE INDEX idx_tracker_issues_queue ON tracker_issues(queue, status);
             CREATE INDEX idx_tracker_leases_issue ON tracker_leases(issue_id, released_at);
             CREATE INDEX idx_tracker_events_issue ON tracker_events(issue_id, kind);

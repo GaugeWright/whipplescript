@@ -32347,42 +32347,6 @@ fn freshness_context() -> Option<(
     Some((frontier, units))
 }
 
-/// Witness scan (DR-0084 Decision 3: attribution, never the definition):
-/// the post-at-cut change-units the basis selects — the cuts that broke it,
-/// with their actors and intents. When the at-cut has left the change-unit
-/// window, every matching unit in the window is reported (conservative:
-/// more attribution candidates, never fewer).
-fn witness_units(
-    basis: Option<&str>,
-    at_cut: Option<&str>,
-    units: &[whipplescript_store::selection::ChangeUnit],
-) -> Vec<Value> {
-    let Some(basis) = basis else {
-        return Vec::new();
-    };
-    let Ok(expr) = whipplescript_store::selection::parse(basis) else {
-        return Vec::new();
-    };
-    let boundary = at_cut.and_then(|cut| units.iter().position(|unit| unit.cut_id == cut));
-    whipplescript_store::selection::eval(&expr, units)
-        .into_iter()
-        .filter(|&index| boundary.is_none_or(|b| index > b))
-        .map(|index| {
-            let unit = &units[index];
-            json!({
-                "cut": unit.cut_id, "path": unit.path,
-                "actor": unit.actor, "intent": unit.intent,
-            })
-        })
-        .collect()
-}
-
-/// The derived verification view of a ledger subject (DR-0084, K3):
-/// per-evidence freshness at the mainline frontier — `fresh`, `stale` (with
-/// the mismatched entries, the moved advisories, and the witness cuts), or
-/// `unkeyed` — and the subject's status: `verified` (some keyed evidence is
-/// fresh), `stale` (keyed evidence exists, none fresh), `unverified`
-/// (nothing keyed). Derived, never stored.
 fn verification_json(
     store: &whipplescript_store::items::WorkItemStore,
     id: &str,
@@ -32391,63 +32355,8 @@ fn verification_json(
         Vec<whipplescript_store::selection::ChangeUnit>,
     ),
 ) -> Option<Value> {
-    use whipplescript_store::freshness::{evaluate, Freshness};
-    let (frontier, units) = context;
-    let evidence = store.evidence(id).ok()?;
-    let mut any_fresh = false;
-    let mut any_keyed = false;
-    let mut rows = Vec::new();
-    for row in &evidence {
-        let Some(fingerprint_json) = &row.basis_fingerprint_json else {
-            rows.push(json!({
-                "evidence_id": row.id, "kind": row.kind, "freshness": "unkeyed",
-            }));
-            continue;
-        };
-        let Ok(fingerprint) =
-            serde_json::from_str::<std::collections::BTreeMap<String, String>>(fingerprint_json)
-        else {
-            rows.push(json!({
-                "evidence_id": row.id, "kind": row.kind, "freshness": "unkeyed",
-                "note": "unreadable fingerprint",
-            }));
-            continue;
-        };
-        any_keyed = true;
-        match evaluate(&fingerprint, frontier) {
-            Freshness::Fresh => {
-                any_fresh = true;
-                rows.push(json!({
-                    "evidence_id": row.id, "kind": row.kind, "freshness": "fresh",
-                    "at_cut": row.at_cut,
-                }));
-            }
-            Freshness::Stale { mismatched, moved } => {
-                rows.push(json!({
-                    "evidence_id": row.id, "kind": row.kind, "freshness": "stale",
-                    "at_cut": row.at_cut,
-                    "mismatched": mismatched,
-                    "moved": moved
-                        .iter()
-                        .map(|(from, to)| json!({ "from": from, "moved_to": to }))
-                        .collect::<Vec<_>>(),
-                    "witness": witness_units(
-                        row.basis.as_deref(),
-                        row.at_cut.as_deref(),
-                        units,
-                    ),
-                }));
-            }
-        }
-    }
-    let status = if any_fresh {
-        "verified"
-    } else if any_keyed {
-        "stale"
-    } else {
-        "unverified"
-    };
-    Some(json!({ "status": status, "evidence": rows }))
+    // One report, both hosts (DR-0086 F5): the kernel renders it.
+    whipplescript_kernel::effect_handlers::verification_report(store, &context.0, &context.1, id)
 }
 
 const ASSERT_USAGE: &str = "usage: whip assert <\

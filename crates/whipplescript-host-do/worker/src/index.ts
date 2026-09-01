@@ -398,6 +398,22 @@ function ensureSchema(sql: SqlStorage): void {
     role TEXT NOT NULL DEFAULT 'subject', added_by TEXT,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
   )`);
+  // DR-0086 F5: the DO's assertion projection. The counter seed is an
+  // INSERT the schema gate cannot check — kept in hand-lockstep with
+  // do_schema.sql and the Rust fixture, OR IGNORE so an already-seeded
+  // object is untouched.
+  sql.exec(`CREATE TABLE IF NOT EXISTS tracker_assertions (
+    assertion_id TEXT PRIMARY KEY, title TEXT NOT NULL,
+    body TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'active',
+    created_by TEXT, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+  )`);
+  sql.exec(`CREATE TABLE IF NOT EXISTS tracker_assertion_counter (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1), next_id INTEGER NOT NULL
+  )`);
+  sql.exec(
+    `INSERT OR IGNORE INTO tracker_assertion_counter (singleton, next_id) VALUES (1, 1)`,
+  );
   for (const [column, definition] of [
     ["event_id", "event_id TEXT"],
     ["parents_json", "parents_json TEXT NOT NULL DEFAULT '[]'"],
