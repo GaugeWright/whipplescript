@@ -478,6 +478,14 @@ impl<Sql: DoSql + 'static> DurableInstance<Sql> {
                     // The run's writes carry the deepest observed tier
                     // (DR-0052; session carriage upgrades this later).
                     vcs.set_actor(Some(format!("instance:{instance_id}")));
+                    // DR-0086 F4: the DO stamps the held claim as intent
+                    // exactly as native does — one lookup, both hosts.
+                    if let Some(intent) = whipplescript_kernel::effect_handlers::claim_intent_for(
+                        &crate::do_store::DoSqliteStore::new(Rc::clone(&sql)),
+                        &instance_id,
+                    ) {
+                        vcs.set_intent(Some(intent));
+                    }
                     Box::new(whipplescript_store::vcs::BranchFileStore::new(
                         vcs,
                         &branch_id,
@@ -592,7 +600,14 @@ impl<Sql: DoSql + 'static> DurableInstance<Sql> {
         let seed = crate::do_store::stable_hash_hex(&format!("{}|{head}", self.instance_id));
         let content = crate::do_branches::DoContentBlobs::new(Rc::clone(&sql))
             .map_err(|error| format!("content blobs unavailable: {error:?}"))?;
-        let vcs = whipplescript_store::vcs::WorkspaceVcs::from_parts(branches, content);
+        let mut vcs = whipplescript_store::vcs::WorkspaceVcs::from_parts(branches, content);
+        // DR-0086 F4: same stamp on the re-point path.
+        if let Some(intent) = whipplescript_kernel::effect_handlers::claim_intent_for(
+            &crate::do_store::DoSqliteStore::new(Rc::clone(&sql)),
+            &self.instance_id,
+        ) {
+            vcs.set_intent(Some(intent));
+        }
         self.files = Box::new(whipplescript_store::vcs::BranchFileStore::new(
             vcs,
             branch_id,

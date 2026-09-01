@@ -7393,6 +7393,117 @@ fn do_live_event_ids<S: DoSql>(
 }
 
 impl<Sql: DoSql> WorkItems for DoSqliteStore<Sql> {
+    fn subject_content_id(&self, id: &str) -> StoreResult<Option<String>> {
+        do_content_id(&self.sql, id)
+    }
+
+    fn was_ever_claimed(&self, id: &str) -> StoreResult<bool> {
+        let rows = self
+            .sql
+            .query(
+                "SELECT 1 FROM tracker_leases WHERE issue_id = ?1 LIMIT 1",
+                &[text(id)],
+            )
+            .map_err(sql_err)?;
+        Ok(!rows.is_empty())
+    }
+
+    fn active_claim_subjects(&self, actor: &str) -> StoreResult<Vec<String>> {
+        let now = do_now(&self.sql)?;
+        let rows = self
+            .sql
+            .query(
+                "SELECT a.content_id FROM tracker_leases l \
+                 JOIN tracker_aliases a ON a.alias = l.issue_id \
+                 WHERE l.actor = ?1 AND l.released_at IS NULL \
+                   AND (l.expires_at IS NULL OR l.expires_at > ?2) \
+                 ORDER BY l.acquired_at, l.lease_id",
+                &[text(actor), text(&now)],
+            )
+            .map_err(sql_err)?;
+        Ok(rows.iter().map(|row| as_text(&row[0])).collect())
+    }
+
+    fn evidence(&self, item_id: &str) -> StoreResult<Vec<whipplescript_store::items::Evidence>> {
+        DoSqliteStore::evidence(self, item_id)
+    }
+
+    fn anchors(&self, item_id: &str) -> StoreResult<Vec<whipplescript_store::items::Anchor>> {
+        let rows = self
+            .sql
+            .query(
+                "SELECT anchor_id, subject, region, role, added_by, created_at \
+                 FROM tracker_anchors WHERE subject = ?1 ORDER BY created_at, anchor_id",
+                &[text(item_id)],
+            )
+            .map_err(sql_err)?;
+        Ok(rows
+            .iter()
+            .map(|row| whipplescript_store::items::Anchor {
+                id: as_text(&row[0]),
+                subject: as_text(&row[1]),
+                region: as_text(&row[2]),
+                role: as_text(&row[3]),
+                added_by: as_opt_text(&row[4]),
+                created_at: as_text(&row[5]),
+            })
+            .collect())
+    }
+
+    fn attest(
+        &mut self,
+        item_id: &str,
+        kind: Option<&str>,
+        reference: Option<&str>,
+        note: Option<&str>,
+        added_by: Option<&str>,
+        at_cut: Option<&str>,
+        basis: Option<&str>,
+        basis_fingerprint_json: Option<&str>,
+    ) -> StoreResult<Option<String>> {
+        let now = do_now(&self.sql)?;
+        let Some(content_id) = do_content_id(&self.sql, item_id)? else {
+            return Ok(None);
+        };
+        let payload = serde_json::json!({
+            "kind": kind, "reference": reference, "note": note, "added_by": added_by,
+            "at_cut": at_cut, "basis": basis,
+            "basis_fingerprint": basis_fingerprint_json
+                .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok()),
+        });
+        let evidence_id = do_tracker_append_raw(
+            &self.sql,
+            Some(&content_id),
+            None,
+            "evidence.added",
+            &payload.to_string(),
+            added_by,
+            self.event_effect_id.as_deref(),
+            &now,
+        )?;
+        self.sql
+            .execute(
+                "INSERT OR IGNORE INTO tracker_evidence \
+                 (evidence_id, issue_id, kind, reference, note, added_by, created_at, \
+                  at_cut, basis, basis_fingerprint_json) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                &[
+                    text(&evidence_id),
+                    text(item_id),
+                    opt_text(kind),
+                    opt_text(reference),
+                    opt_text(note),
+                    opt_text(added_by),
+                    text(&now),
+                    opt_text(at_cut),
+                    opt_text(basis),
+                    opt_text(basis_fingerprint_json),
+                ],
+            )
+            .map_err(sql_err)?;
+        Ok(Some(evidence_id))
+    }
+
     fn set_event_effect_id(&mut self, effect_id: Option<&str>) {
         self.event_effect_id = effect_id.map(str::to_owned);
     }
@@ -8253,6 +8364,7 @@ impl<Sql: DoSql> DoSqliteStore<Sql> {
             "tracker_leases",
             "tracker_comments",
             "tracker_evidence",
+            "tracker_anchors",
         ] {
             self.sql
                 .execute(&format!("DELETE FROM {table}"), &[])
@@ -8346,7 +8458,8 @@ impl<Sql: DoSql> DoSqliteStore<Sql> {
         let rows = self
             .sql
             .query(
-                "SELECT evidence_id, kind, reference, note, added_by, created_at \
+                "SELECT evidence_id, kind, reference, note, added_by, created_at, \
+                        at_cut, basis, basis_fingerprint_json \
                  FROM tracker_evidence WHERE issue_id = ?1 ORDER BY created_at, evidence_id",
                 &[text(item_id)],
             )
@@ -8360,12 +8473,12 @@ impl<Sql: DoSql> DoSqliteStore<Sql> {
                 note: as_opt_text(&row[3]),
                 added_by: as_opt_text(&row[4]),
                 created_at: as_text(&row[5]),
-                // DR-0084 validity keys are not projected on the DO yet
-                // (deferred with cause: no DO-side freshness consumer);
-                // the events carry them and transport preserves them.
-                at_cut: None,
-                basis: None,
-                basis_fingerprint_json: None,
+                // DR-0086 F3: the validity keys project on the DO now —
+                // the effect-door auto-attest is the consumer the K2
+                // deferral was waiting for.
+                at_cut: as_opt_text(&row[6]),
+                basis: as_opt_text(&row[7]),
+                basis_fingerprint_json: as_opt_text(&row[8]),
             })
             .collect())
     }
@@ -8490,10 +8603,17 @@ fn do_fold_tracker_event(
         }
         "evidence.added" => {
             if let (Some(evidence_id), Some(issue)) = (event_id, issue_id) {
+                // DR-0084 validity keys fold verbatim (kept in lockstep with
+                // the native fold; the fingerprint is data, evaluated later).
+                let fingerprint_json = payload
+                    .get("basis_fingerprint")
+                    .filter(|value| !value.is_null())
+                    .map(std::string::ToString::to_string);
                 sql.execute(
                     "INSERT OR IGNORE INTO tracker_evidence \
-                     (evidence_id, issue_id, kind, reference, note, added_by, created_at) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                     (evidence_id, issue_id, kind, reference, note, added_by, created_at, \
+                      at_cut, basis, basis_fingerprint_json) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                     &[
                         text(evidence_id),
                         text(issue),
@@ -8502,7 +8622,37 @@ fn do_fold_tracker_event(
                         opt_text(str_of("note").as_deref()),
                         opt_text(str_of("added_by").as_deref()),
                         text(created_at),
+                        opt_text(str_of("at_cut").as_deref()),
+                        opt_text(str_of("basis").as_deref()),
+                        opt_text(fingerprint_json.as_deref()),
                     ],
+                )
+                .map_err(sql_err)?;
+            }
+        }
+        "anchor.added" => {
+            if let (Some(anchor_id), Some(subject)) = (event_id, issue_id) {
+                sql.execute(
+                    "INSERT OR IGNORE INTO tracker_anchors \
+                     (anchor_id, subject, region, role, added_by, created_at) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    &[
+                        text(anchor_id),
+                        text(subject),
+                        text(&str_of("region").unwrap_or_default()),
+                        text(&str_of("role").unwrap_or_else(|| "subject".to_owned())),
+                        opt_text(str_of("added_by").as_deref()),
+                        text(created_at),
+                    ],
+                )
+                .map_err(sql_err)?;
+            }
+        }
+        "anchor.removed" => {
+            if let Some(anchor_id) = str_of("anchor_id") {
+                sql.execute(
+                    "DELETE FROM tracker_anchors WHERE anchor_id = ?1",
+                    &[text(&anchor_id)],
                 )
                 .map_err(sql_err)?;
             }
@@ -9219,7 +9369,13 @@ pub(crate) mod test_support {
             );
             CREATE TABLE tracker_evidence (
                 evidence_id TEXT PRIMARY KEY, issue_id TEXT NOT NULL, kind TEXT, reference TEXT,
-                note TEXT, added_by TEXT, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                note TEXT, added_by TEXT, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                at_cut TEXT, basis TEXT, basis_fingerprint_json TEXT
+            );
+            CREATE TABLE tracker_anchors (
+                anchor_id TEXT PRIMARY KEY, subject TEXT NOT NULL, region TEXT NOT NULL,
+                role TEXT NOT NULL DEFAULT 'subject', added_by TEXT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
             CREATE INDEX idx_tracker_issues_queue ON tracker_issues(queue, status);
             CREATE INDEX idx_tracker_leases_issue ON tracker_leases(issue_id, released_at);
@@ -9360,6 +9516,73 @@ pub fn do_mark_turn_commands_applied<Sql: DoSql>(
         .map_err(sql_err)?;
     }
     Ok(())
+}
+
+/// DR-0086 Decision 1, the DO half: the frontier view over the DO's own
+/// branch and content tables, composed exactly as the selective-verb
+/// handler composes them, with the kernel's canonicalizer installed so
+/// declaration entries are real. Read-only by construction — the trait has
+/// no write surface, per Decision 2.
+impl<Sql: DoSql + Clone> whipplescript_store::vcs::FrontierRead for DoSqliteStore<Sql> {
+    fn frontier_content(
+        &self,
+        branch_id: &str,
+    ) -> whipplescript_store::StoreResult<
+        Option<(
+            Option<String>,
+            whipplescript_store::freshness::FrontierContent,
+        )>,
+    > {
+        let Ok(vcs) = self.frontier_vcs() else {
+            return Ok(None); // inert: no branch tables yet
+        };
+        vcs.frontier_content(branch_id)
+    }
+
+    fn frontier_change_units(
+        &self,
+        branch_id: &str,
+        limit: usize,
+    ) -> whipplescript_store::StoreResult<Vec<whipplescript_store::selection::ChangeUnit>> {
+        let Ok(vcs) = self.frontier_vcs() else {
+            return Ok(Vec::new());
+        };
+        vcs.change_units(branch_id, limit)
+    }
+
+    fn frontier_file(
+        &self,
+        branch_id: &str,
+        path: &str,
+    ) -> whipplescript_store::StoreResult<Option<String>> {
+        let Ok(vcs) = self.frontier_vcs() else {
+            return Ok(None);
+        };
+        vcs.read(branch_id, path)
+    }
+}
+
+impl<Sql: DoSql + Clone> DoSqliteStore<Sql> {
+    /// The composed read-side workspace view the FrontierRead impl serves.
+    fn frontier_vcs(
+        &self,
+    ) -> Result<
+        whipplescript_store::vcs::WorkspaceVcs<
+            crate::do_branches::DoBranches<Sql>,
+            crate::do_branches::DoContentBlobs<Sql>,
+        >,
+        (),
+    > {
+        let branches = crate::do_branches::DoBranches::new(self.sql.clone()).map_err(|_| ())?;
+        let content = crate::do_branches::DoContentBlobs::new(self.sql.clone()).map_err(|_| ())?;
+        let mut vcs = whipplescript_store::vcs::WorkspaceVcs::from_parts(branches, content);
+        // Kernel-internal canonicalization (DR-0086 Decision 1): decl
+        // entries are real on the DO, not a native privilege.
+        vcs.set_decl_canonicalizer(Box::new(
+            whipplescript_kernel::source_merge::WhipDeclCanonicalizer,
+        ));
+        Ok(vcs)
+    }
 }
 
 #[cfg(test)]
@@ -9598,6 +9821,197 @@ pub(crate) mod tests {
     /// (events keyed by opaque content_id, not WS-N), shares the native conflict
     /// analysis, and merges via export/import — two DO clones editing one issue
     /// converge to a surfaced conflict, exactly like native.
+    /// DR-0086 F4: the generic intent-stamp lookup answers identically on
+    /// the DO — both holder spellings union, exactly-one stamps, two
+    /// claims across the doors stamp nothing.
+    #[test]
+    fn do_claim_intent_lookup_spans_both_doors() {
+        use whipplescript_store::items::WorkItems;
+        let mut store = store();
+        let first = WorkItems::file_item(
+            &mut store,
+            "q",
+            "one",
+            "",
+            &[],
+            &serde_json::json!({}),
+            Some("s:a"),
+        )
+        .expect("file");
+        store
+            .claim_item(&first.id, "agent:ins-x", None)
+            .expect("claim");
+        let content_id = WorkItems::subject_content_id(&store, &first.id)
+            .expect("content id")
+            .expect("known");
+        assert_eq!(
+            whipplescript_kernel::effect_handlers::claim_intent_for(&store, "ins-x"),
+            Some(content_id)
+        );
+        // A second claim through the kernel door makes it ambiguous.
+        let second = WorkItems::file_item(
+            &mut store,
+            "q",
+            "two",
+            "",
+            &[],
+            &serde_json::json!({}),
+            Some("s:a"),
+        )
+        .expect("file");
+        store.claim_item(&second.id, "ins-x", None).expect("claim");
+        assert_eq!(
+            whipplescript_kernel::effect_handlers::claim_intent_for(&store, "ins-x"),
+            None
+        );
+    }
+
+    /// DR-0086 F3, the DO half: the same generic finish auto-attest mints
+    /// KEYED evidence over the DO's own frontier. The anchor arrives by
+    /// event transport from a native clone (the fold projects it — the
+    /// DR-0084 K2 deferral this slice discharges), the claim and finish
+    /// happen on the DO, and the fingerprint carries real kernel-
+    /// canonicalizer decl entries.
+    #[test]
+    fn do_kernel_finish_auto_attests_keyed_over_the_do_frontier() {
+        use whipplescript_store::items::WorkItems;
+
+        // An issue filed on the DO; its anchor arrives by event transport
+        // (hand-rolled with the shared content-id core, exactly as another
+        // clone's export would carry it) and the fold projects it.
+        let mut store = store();
+        let issue = WorkItems::file_item(
+            &mut store,
+            "q",
+            "worked",
+            "",
+            &[],
+            &serde_json::json!({}),
+            Some("s:a"),
+        )
+        .expect("file");
+        let content_id = WorkItems::subject_content_id(&store, &issue.id)
+            .expect("content id")
+            .expect("known");
+        let anchor_payload = serde_json::json!({
+            "region": "decl(rule close)", "role": "subject", "added_by": "s:a",
+        })
+        .to_string();
+        let anchored_at = "2026-08-31 00:00:10".to_owned();
+        let anchor_id = whipplescript_store::items::event_content_id(
+            "anchor.added",
+            Some(&content_id),
+            &anchor_payload,
+            Some("s:a"),
+            std::slice::from_ref(&content_id),
+            &anchored_at,
+        );
+        let report = store
+            .import_events(&[whipplescript_store::items::TrackerEvent {
+                event_id: anchor_id,
+                parents: vec![content_id.clone()],
+                issue_id: Some(content_id.clone()),
+                kind: "anchor.added".to_owned(),
+                payload_json: anchor_payload,
+                actor: Some("s:a".to_owned()),
+                created_at: anchored_at,
+            }])
+            .expect("import");
+        assert_eq!(report.rejected, 0);
+        let do_anchors = WorkItems::anchors(&store, &issue.id).expect("anchors");
+        assert_eq!(do_anchors.len(), 1, "anchor transported and projected");
+        assert_eq!(do_anchors[0].region, "decl(rule close)");
+
+        // A program lands on the DO's own mainline.
+        let branches = crate::do_branches::DoBranches::new(store.sql.clone()).expect("branches");
+        let content = crate::do_branches::DoContentBlobs::new(store.sql.clone()).expect("content");
+        let mut vcs = whipplescript_store::vcs::WorkspaceVcs::from_parts(branches, content);
+        vcs.init("t0").expect("init");
+        vcs.write(
+            "main",
+            "src/close.whip",
+            Some("workflow K\noutput result R\nclass R { ok bool }\nrule close\n  when started\n=> { complete result { ok true } }\n"),
+            "cut_do_f3",
+            "t1",
+        )
+        .expect("write");
+
+        // Claimed on the DO, finished on the DO, attested by the kernel fn.
+        store.claim_item(&issue.id, "ins-do", None).expect("claim");
+        whipplescript_kernel::effect_handlers::auto_attest_finish_generic(
+            &mut store,
+            &issue.id,
+            Some("ins-do"),
+        );
+        let trail = store.evidence(&issue.id).expect("evidence");
+        assert_eq!(trail.len(), 1);
+        assert_eq!(trail[0].kind.as_deref(), Some("cuts"));
+        assert!(trail[0].at_cut.is_some(), "keyed over the DO frontier");
+        let fingerprint: std::collections::BTreeMap<String, String> =
+            serde_json::from_str(trail[0].basis_fingerprint_json.as_deref().expect("keyed"))
+                .expect("fingerprint json");
+        assert!(
+            fingerprint.contains_key("decl:rule close"),
+            "{fingerprint:?}"
+        );
+    }
+
+    /// DR-0086 Decision 1 (F1), the DO half: the DoSqliteStore serves the
+    /// FrontierRead view over its own branch tables with the KERNEL
+    /// canonicalizer installed — declaration entries are real on the DO,
+    /// not a native privilege — and answers inert on an untouched store.
+    #[test]
+    fn do_frontier_read_serves_real_decl_entries_and_is_inert_when_empty() {
+        use whipplescript_store::vcs::FrontierRead;
+        let store = store();
+        // Untouched: inert, not an error.
+        assert_eq!(store.frontier_content("main").expect("inert"), None);
+        assert!(store
+            .frontier_change_units("main", 10)
+            .expect("inert")
+            .is_empty());
+
+        // Write a real program through the DO's own branch tables.
+        let branches = crate::do_branches::DoBranches::new(store.sql.clone()).expect("branches");
+        let content = crate::do_branches::DoContentBlobs::new(store.sql.clone()).expect("content");
+        let mut vcs = whipplescript_store::vcs::WorkspaceVcs::from_parts(branches, content);
+        vcs.init("t0").expect("init");
+        vcs.write(
+            "main",
+            "src/close.whip",
+            Some(
+                "workflow K\noutput result R\nclass R { ok bool }\nrule close\n  when started\n=> { complete result { ok true } }\n",
+            ),
+            "cut_do_f1",
+            "t1",
+        )
+        .expect("write");
+
+        let (at_cut, frontier) = store
+            .frontier_content("main")
+            .expect("frontier")
+            .expect("branch exists");
+        assert!(at_cut.is_some());
+        assert!(
+            frontier.decls.contains_key("rule close"),
+            "kernel canonicalizer produced decl entries on the DO: {:?}",
+            frontier.decls.keys().collect::<Vec<_>>()
+        );
+        assert!(frontier.decl_renames.contains_key("rule close"));
+        assert!(frontier.paths.contains_key("src/close.whip"));
+        assert_eq!(
+            store
+                .frontier_change_units("main", 10)
+                .expect("units")
+                .len(),
+            1
+        );
+        assert!(store
+            .frontier_file("main", "src/close.whip")
+            .expect("read")
+            .is_some());
+    }
+
     /// DR-0084 Decision 2 transport parity: `assertion.created` is a ROOT
     /// kind (shared `is_creation_kind`), so the DO's untrusted-transport
     /// identity gate admits assertion events instead of rejecting them as

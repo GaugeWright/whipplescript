@@ -1015,6 +1015,10 @@ impl<Sql: DoSql + Clone> whipplescript_kernel::effect_handlers::CapabilityProvid
                     "variant": "Applied",
                     "cut_id": cut_id,
                     "detail": serde_json::to_string(&reverted_paths).unwrap_or_default(),
+                    // DR-0086 F4: the DO receipt carries the same
+                    // staleness-delta advisory as native (issue subjects;
+                    // DO assertion listing rides F5).
+                    "staleness": do_staleness_deltas(&self.sql, &vcs, &branch_id, &cut_id),
                 })),
                 Ok(whipplescript_store::vcs::UndoSelectionOutcome::WouldStrand { stranded }) => {
                     CapabilityOutcome::Produced(serde_json::json!({
@@ -1069,6 +1073,8 @@ impl<Sql: DoSql + Clone> whipplescript_kernel::effect_handlers::CapabilityProvid
                     "variant": "Applied",
                     "cut_id": cut_id,
                     "detail": serde_json::to_string(&moved_paths).unwrap_or_default(),
+                    // DR-0086 F4: destination-line deltas, as native.
+                    "staleness": do_staleness_deltas(&self.sql, &vcs, &onto_line, &cut_id),
                 })),
                 Ok(whipplescript_store::vcs::TransportOutcome::Conflicted { conflicts }) => {
                     CapabilityOutcome::Produced(serde_json::json!({
@@ -1096,6 +1102,31 @@ impl<Sql: DoSql + Clone> whipplescript_kernel::effect_handlers::CapabilityProvid
             }
         }
     }
+}
+
+/// DR-0086 F4: the DO half of the receipt staleness-delta advisory — the
+/// same kernel evaluation native uses, over the DO's own views. Subjects
+/// are the listable issues (assertion listing on the DO rides F5).
+fn do_staleness_deltas<Sql: crate::do_store::DoSql + Clone>(
+    sql: &Sql,
+    vcs: &whipplescript_store::vcs::WorkspaceVcs<
+        crate::do_branches::DoBranches<Sql>,
+        crate::do_branches::DoContentBlobs<Sql>,
+    >,
+    branch_id: &str,
+    cut_id: &str,
+) -> Vec<serde_json::Value> {
+    use whipplescript_store::items::WorkItems;
+    let items = crate::do_store::DoSqliteStore::new(sql.clone());
+    let subjects: Vec<String> = items
+        .list_items(None, None)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|issue| issue.id)
+        .collect();
+    whipplescript_kernel::effect_handlers::staleness_deltas_generic(
+        &items, vcs, &subjects, branch_id, cut_id,
+    )
 }
 
 #[cfg(test)]
@@ -1314,6 +1345,10 @@ mod tests {
             panic!("expected produced");
         };
         assert_eq!(value["variant"], "Applied");
+        // DR-0086 F4: the DO receipt carries the staleness-delta advisory
+        // (empty here — no anchored evidence in the fixture — but present
+        // on every applied proposal, native parity).
+        assert!(value["staleness"].is_array(), "{value}");
         assert_eq!(
             vcs.read(
                 whipplescript_store::branches::MAINLINE_BRANCH_ID,

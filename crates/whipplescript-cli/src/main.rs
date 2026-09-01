@@ -32204,23 +32204,10 @@ fn stamp_claim_intent(vcs: &mut whipplescript_store::vcs::NativeWorkspaceVcs, in
     let Ok(items) = whipplescript_store::items::WorkItemStore::open(items_store_path()) else {
         return;
     };
-    // Two claim doors, one join (the agent-door claim join): kernel-driven
-    // claims hold as the bare instance id; the harness todo tool holds as
-    // `agent:<instance id>` (live turns pass the instance as the holder).
-    // Union both spellings — the exactly-one rule then spans the doors, so
-    // a turn that todo-claimed one issue while its workflow kernel-claimed
-    // another stamps nothing (ambiguity is never guessed).
-    let mut held = match items.active_claim_subjects(instance_id) {
-        Ok(held) => held,
-        Err(_) => return,
-    };
-    if let Ok(agent_held) = items.active_claim_subjects(&format!("agent:{instance_id}")) {
-        held.extend(agent_held);
-    }
-    held.sort();
-    held.dedup();
-    if held.len() == 1 {
-        vcs.set_intent(Some(held.remove(0)));
+    if let Some(intent) =
+        whipplescript_kernel::effect_handlers::claim_intent_for(&items, instance_id)
+    {
+        vcs.set_intent(Some(intent));
     }
 }
 
@@ -32234,52 +32221,29 @@ fn auto_attest_finish(
     id: &str,
     actor: Option<&str>,
 ) {
-    let Ok(true) = store.was_ever_claimed(id) else {
+    // One plan, every door (DR-0086 F4): the kernel computes the evidence;
+    // this door only supplies its two views and applies.
+    let plan = match open_vcs() {
+        Ok(vcs) => whipplescript_kernel::effect_handlers::plan_finish_attest(store, &vcs, id),
+        Err(_) => whipplescript_kernel::effect_handlers::plan_finish_attest(
+            store,
+            &whipplescript_store::vcs::InertFrontier,
+            id,
+        ),
+    };
+    let Some(plan) = plan else {
         return;
     };
-    let Ok(Some(content_id)) = store.subject_content_id(id) else {
-        return;
-    };
-    let reference = format!("intent({content_id})");
-    let basis_text = store
-        .anchors(id)
-        .ok()
-        .map(|anchors| {
-            anchors
-                .into_iter()
-                .filter(|anchor| anchor.role == "subject")
-                .map(|anchor| format!("({})", anchor.region))
-                .collect::<Vec<_>>()
-        })
-        .filter(|regions| !regions.is_empty())
-        .map(|regions| regions.join(" | "));
-    let keyed = basis_text.as_ref().and_then(|basis_text| {
-        let expr = whipplescript_store::selection::parse(basis_text).ok()?;
-        let vcs = open_vcs().ok()?;
-        let (at_cut, frontier) = vcs
-            .frontier_content(whipplescript_store::branches::MAINLINE_BRANCH_ID)
-            .ok()??;
-        let fingerprint = whipplescript_store::freshness::resolve_basis(&expr, &frontier).ok()?;
-        let fingerprint_json = serde_json::to_string(&fingerprint).ok()?;
-        Some((at_cut, fingerprint_json))
-    });
-    match keyed {
-        Some((at_cut, fingerprint_json)) => {
-            let _ = store.attest(
-                id,
-                Some("cuts"),
-                Some(&reference),
-                None,
-                actor,
-                at_cut.as_deref(),
-                basis_text.as_deref(),
-                Some(&fingerprint_json),
-            );
-        }
-        None => {
-            let _ = store.add_evidence(id, Some("cuts"), Some(&reference), None, actor);
-        }
-    }
+    let _ = store.attest(
+        id,
+        Some("cuts"),
+        Some(&plan.reference),
+        None,
+        actor,
+        plan.at_cut.as_deref(),
+        plan.basis.as_deref(),
+        plan.fingerprint_json.as_deref(),
+    );
 }
 
 /// DR-0084 O1, the receipt half: the staleness deltas one proposal cut
@@ -32294,17 +32258,9 @@ fn staleness_deltas(
     branch_id: &str,
     cut_id: &str,
 ) -> Vec<Value> {
-    if cut_id.is_empty() {
-        return Vec::new();
-    }
     let Ok(items) = whipplescript_store::items::WorkItemStore::open(items_store_path()) else {
         return Vec::new();
     };
-    let Ok(Some((_at_cut, frontier))) = vcs.frontier_content(branch_id) else {
-        return Vec::new();
-    };
-    let units = vcs.change_units(branch_id, 10_000).unwrap_or_default();
-    let context = (frontier, units);
     let mut subjects: Vec<String> = Vec::new();
     if let Ok(issues) = items.list_items(None, None) {
         subjects.extend(issues.into_iter().map(|issue| issue.id));
@@ -32312,35 +32268,9 @@ fn staleness_deltas(
     if let Ok(assertions) = items.list_assertions(false) {
         subjects.extend(assertions.into_iter().map(|assertion| assertion.id));
     }
-    let mut deltas = Vec::new();
-    for subject in subjects {
-        let Some(verification) = verification_json(&items, &subject, &context) else {
-            continue;
-        };
-        let Some(rows) = verification.get("evidence").and_then(Value::as_array) else {
-            continue;
-        };
-        for row in rows {
-            if row.get("freshness").and_then(Value::as_str) != Some("stale") {
-                continue;
-            }
-            let hit = row
-                .get("witness")
-                .and_then(Value::as_array)
-                .is_some_and(|witness| {
-                    witness
-                        .iter()
-                        .any(|unit| unit.get("cut").and_then(Value::as_str) == Some(cut_id))
-                });
-            if hit {
-                deltas.push(json!({
-                    "subject": subject,
-                    "evidence_id": row.get("evidence_id"),
-                }));
-            }
-        }
-    }
-    deltas
+    whipplescript_kernel::effect_handlers::staleness_deltas_generic(
+        &items, vcs, &subjects, branch_id, cut_id,
+    )
 }
 
 /// DR-0084 O1, the classification half as a pure-over-stores function: the

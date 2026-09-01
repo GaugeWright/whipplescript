@@ -372,7 +372,31 @@ function ensureSchema(sql: SqlStorage): void {
   )`);
   sql.exec(`CREATE TABLE IF NOT EXISTS tracker_evidence (
     evidence_id TEXT PRIMARY KEY, issue_id TEXT NOT NULL, kind TEXT, reference TEXT,
-    note TEXT, added_by TEXT, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    note TEXT, added_by TEXT, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    at_cut TEXT, basis TEXT, basis_fingerprint_json TEXT
+  )`);
+  // DR-0086 F3: the knowledge plane's validity keys and anchors reach the
+  // DO. Objects from earlier deploys gain the evidence columns lazily and
+  // the anchors table on first touch; no existing row is rewritten.
+  for (const [column, definition] of [
+    ["at_cut", "at_cut TEXT"],
+    ["basis", "basis TEXT"],
+    ["basis_fingerprint_json", "basis_fingerprint_json TEXT"],
+  ] as const) {
+    const present = sql
+      .exec(
+        `SELECT name FROM pragma_table_info('tracker_evidence') WHERE name = ?`,
+        column,
+      )
+      .toArray();
+    if (present.length === 0) {
+      sql.exec(`ALTER TABLE tracker_evidence ADD COLUMN ${definition}`);
+    }
+  }
+  sql.exec(`CREATE TABLE IF NOT EXISTS tracker_anchors (
+    anchor_id TEXT PRIMARY KEY, subject TEXT NOT NULL, region TEXT NOT NULL,
+    role TEXT NOT NULL DEFAULT 'subject', added_by TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
   )`);
   for (const [column, definition] of [
     ["event_id", "event_id TEXT"],

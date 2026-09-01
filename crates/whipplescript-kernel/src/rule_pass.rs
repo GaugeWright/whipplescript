@@ -16,6 +16,7 @@ use whipplescript_core::Severity;
 use whipplescript_parser::IrProgram;
 use whipplescript_store::coordination::Coordination;
 use whipplescript_store::items::WorkItems;
+use whipplescript_store::vcs::FrontierRead;
 use whipplescript_store::{
     DiagnosticRecord, DurableDiagnosticCode, EffectCancellation, EffectCancellationRequest,
     EventView, RuleCommit, RuleCommitRevisionGuard, RuntimeStore, StoreError,
@@ -192,7 +193,7 @@ fn park_if_step_budget_spent<S: RuntimeStore + Coordination + WorkItems>(
     Ok(true)
 }
 
-pub fn step_instance_generic<S: RuntimeStore + Coordination + WorkItems>(
+pub fn step_instance_generic<S: RuntimeStore + Coordination + WorkItems + FrontierRead>(
     kernel: &mut RuntimeKernel<S>,
     instance_id: &str,
     ir: &IrProgram,

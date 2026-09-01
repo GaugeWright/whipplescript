@@ -24,6 +24,13 @@ pub struct NativeStores {
     pub runtime: SqliteStore,
     pub coord: CoordinationStore,
     pub items: WorkItemStore,
+    /// DR-0086 Decision 1: the read-only frontier view. `None` = a
+    /// workspace with no versioned world — the facade answers INERT
+    /// (`FrontierRead` on `None` is `InertFrontier` behavior), so every
+    /// zero-setup path is preserved by content rather than by absence.
+    /// Wiring a live frontier (with the kernel canonicalizer installed) is
+    /// the call sites' job as they move behind the bound (F4).
+    pub frontier: Option<crate::vcs::NativeWorkspaceVcs>,
 }
 
 impl NativeStores {
@@ -37,6 +44,7 @@ impl NativeStores {
             runtime: SqliteStore::open_in_memory()?,
             coord: CoordinationStore::open_in_memory()?,
             items: WorkItemStore::open_in_memory()?,
+            frontier: None,
         })
     }
 
@@ -51,12 +59,52 @@ impl NativeStores {
             runtime: SqliteStore::open(runtime)?,
             coord: CoordinationStore::open(coord)?,
             items: WorkItemStore::open(items)?,
+            frontier: None,
         })
     }
 
-    /// Consume the facade, returning the three underlying stores.
+    /// Consume the facade, returning the three underlying stores. The
+    /// frontier member, if any, is dropped — it is a read view, not a
+    /// fourth owned plane.
     pub fn into_parts(self) -> (SqliteStore, CoordinationStore, WorkItemStore) {
         (self.runtime, self.coord, self.items)
+    }
+
+    /// Install the frontier view (builder-style; the F4 call sites use it
+    /// with the kernel canonicalizer already set on the handle).
+    pub fn with_frontier(mut self, frontier: crate::vcs::NativeWorkspaceVcs) -> Self {
+        self.frontier = Some(frontier);
+        self
+    }
+}
+
+impl crate::vcs::FrontierRead for NativeStores {
+    fn frontier_content(
+        &self,
+        branch_id: &str,
+    ) -> StoreResult<Option<(Option<String>, crate::freshness::FrontierContent)>> {
+        match &self.frontier {
+            Some(vcs) => crate::vcs::FrontierRead::frontier_content(vcs, branch_id),
+            None => Ok(None),
+        }
+    }
+
+    fn frontier_change_units(
+        &self,
+        branch_id: &str,
+        limit: usize,
+    ) -> StoreResult<Vec<crate::selection::ChangeUnit>> {
+        match &self.frontier {
+            Some(vcs) => vcs.frontier_change_units(branch_id, limit),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    fn frontier_file(&self, branch_id: &str, path: &str) -> StoreResult<Option<String>> {
+        match &self.frontier {
+            Some(vcs) => vcs.frontier_file(branch_id, path),
+            None => Ok(None),
+        }
     }
 }
 
@@ -778,6 +826,50 @@ impl Coordination for NativeStores {
 }
 
 impl WorkItems for NativeStores {
+    fn subject_content_id(&self, id: &str) -> StoreResult<Option<String>> {
+        WorkItems::subject_content_id(&self.items, id)
+    }
+
+    fn was_ever_claimed(&self, id: &str) -> StoreResult<bool> {
+        WorkItems::was_ever_claimed(&self.items, id)
+    }
+
+    fn anchors(&self, item_id: &str) -> StoreResult<Vec<Anchor>> {
+        WorkItems::anchors(&self.items, item_id)
+    }
+
+    fn active_claim_subjects(&self, actor: &str) -> StoreResult<Vec<String>> {
+        WorkItems::active_claim_subjects(&self.items, actor)
+    }
+
+    fn evidence(&self, item_id: &str) -> StoreResult<Vec<Evidence>> {
+        WorkItems::evidence(&self.items, item_id)
+    }
+
+    fn attest(
+        &mut self,
+        item_id: &str,
+        kind: Option<&str>,
+        reference: Option<&str>,
+        note: Option<&str>,
+        added_by: Option<&str>,
+        at_cut: Option<&str>,
+        basis: Option<&str>,
+        basis_fingerprint_json: Option<&str>,
+    ) -> StoreResult<Option<String>> {
+        WorkItems::attest(
+            &mut self.items,
+            item_id,
+            kind,
+            reference,
+            note,
+            added_by,
+            at_cut,
+            basis,
+            basis_fingerprint_json,
+        )
+    }
+
     fn event_position(&self) -> StoreResult<i64> {
         WorkItems::event_position(&self.items)
     }

@@ -15,6 +15,7 @@ use std::path::Path;
 use whipplescript_store::coordination::Coordination;
 use whipplescript_store::files::FileStore;
 use whipplescript_store::items::WorkItems;
+use whipplescript_store::vcs::FrontierRead;
 use whipplescript_store::{
     ClaimableEffect, EffectCompletion, FactView, RunStart, RuntimeStore, StoreError, StoredEvent,
 };
@@ -1705,7 +1706,175 @@ fn tracker_expires_from_now(now: &str, ttl_seconds: Option<i64>) -> Option<Strin
     )
 }
 
-pub fn run_queue_effect_generic<S: RuntimeStore + WorkItems>(
+/// DR-0086 F4: the intent-stamp lookup, generic so both hosts stamp
+/// identically. Kernel-driven claims hold as the bare instance id; the
+/// harness todo tool holds as `agent:<instance id>` — the union spans the
+/// doors, and EXACTLY one held subject is an unambiguous intent (zero or
+/// several stamp nothing; ambiguity is never guessed).
+pub fn claim_intent_for<S: WorkItems + ?Sized>(store: &S, instance_id: &str) -> Option<String> {
+    let mut held = store.active_claim_subjects(instance_id).ok()?;
+    if let Ok(agent_held) = store.active_claim_subjects(&format!("agent:{instance_id}")) {
+        held.extend(agent_held);
+    }
+    held.sort();
+    held.dedup();
+    (held.len() == 1).then(|| held.remove(0))
+}
+
+/// The prepared finish-attest arguments (DR-0086 F4: one plan, every door).
+pub struct FinishAttestPlan {
+    pub reference: String,
+    pub basis: Option<String>,
+    pub at_cut: Option<String>,
+    pub fingerprint_json: Option<String>,
+}
+
+/// Plan the finish auto-attest — pure reads over the two views, so every
+/// door computes the SAME evidence: `None` when the subject was never
+/// claimed or is unknown; keyed when a mainline frontier exists and the
+/// subject carries subject-role anchors, unkeyed otherwise.
+pub fn plan_finish_attest<W: WorkItems + ?Sized, F: FrontierRead + ?Sized>(
+    items: &W,
+    frontier: &F,
+    id: &str,
+) -> Option<FinishAttestPlan> {
+    if !items.was_ever_claimed(id).ok()? {
+        return None;
+    }
+    let content_id = items.subject_content_id(id).ok()??;
+    let reference = format!("intent({content_id})");
+    let basis = items
+        .anchors(id)
+        .ok()
+        .map(|anchors| {
+            anchors
+                .into_iter()
+                .filter(|anchor| anchor.role == "subject")
+                .map(|anchor| format!("({})", anchor.region))
+                .collect::<Vec<_>>()
+        })
+        .filter(|regions| !regions.is_empty())
+        .map(|regions| regions.join(" | "));
+    let keyed = basis.as_ref().and_then(|basis_text| {
+        let expr = whipplescript_store::selection::parse(basis_text).ok()?;
+        let (at_cut, content) = frontier
+            .frontier_content(whipplescript_store::branches::MAINLINE_BRANCH_ID)
+            .ok()??;
+        let fingerprint = whipplescript_store::freshness::resolve_basis(&expr, &content).ok()?;
+        let fingerprint_json = serde_json::to_string(&fingerprint).ok()?;
+        Some((at_cut, fingerprint_json))
+    });
+    let (at_cut, fingerprint_json) = match keyed {
+        Some((at_cut, fingerprint_json)) => (at_cut, Some(fingerprint_json)),
+        None => (None, None),
+    };
+    Some(FinishAttestPlan {
+        reference,
+        basis: if fingerprint_json.is_some() {
+            basis
+        } else {
+            None
+        },
+        at_cut,
+        fingerprint_json,
+    })
+}
+
+/// DR-0086 F4: the staleness deltas a proposal cut caused, generic over the
+/// two read views so the native provider and the DO handler report the SAME
+/// receipt advisory — every keyed evidence row among `subjects` that is
+/// stale at the branch's frontier AND whose witness includes `cut_id`.
+/// Read-only; empty on any missing prerequisite (a receipt never fails
+/// over its advisory).
+pub fn staleness_deltas_generic<W: WorkItems + ?Sized, F: FrontierRead + ?Sized>(
+    items: &W,
+    frontier: &F,
+    subjects: &[String],
+    branch_id: &str,
+    cut_id: &str,
+) -> Vec<serde_json::Value> {
+    use whipplescript_store::freshness::{evaluate, Freshness};
+    if cut_id.is_empty() {
+        return Vec::new();
+    }
+    let Ok(Some((_at_cut, content))) = frontier.frontier_content(branch_id) else {
+        return Vec::new();
+    };
+    let units = frontier
+        .frontier_change_units(branch_id, 10_000)
+        .unwrap_or_default();
+    let mut deltas = Vec::new();
+    for subject in subjects {
+        let Ok(rows) = items.evidence(subject) else {
+            continue;
+        };
+        for row in rows {
+            let Some(fingerprint_json) = &row.basis_fingerprint_json else {
+                continue;
+            };
+            let Ok(fingerprint) = serde_json::from_str::<std::collections::BTreeMap<String, String>>(
+                fingerprint_json,
+            ) else {
+                continue;
+            };
+            let Freshness::Stale { .. } = evaluate(&fingerprint, &content) else {
+                continue;
+            };
+            // Witness: post-at-cut units the basis selects; conservative
+            // when the at-cut has left the window.
+            let hit = row.basis.as_deref().is_some_and(|basis| {
+                let Ok(expr) = whipplescript_store::selection::parse(basis) else {
+                    return false;
+                };
+                let boundary = row
+                    .at_cut
+                    .as_deref()
+                    .and_then(|cut| units.iter().position(|unit| unit.cut_id == cut));
+                whipplescript_store::selection::eval(&expr, &units)
+                    .into_iter()
+                    .filter(|&index| boundary.is_none_or(|b| index > b))
+                    .any(|index| units[index].cut_id == cut_id)
+            });
+            if hit {
+                deltas.push(serde_json::json!({
+                    "subject": subject,
+                    "evidence_id": row.id,
+                }));
+            }
+        }
+    }
+    deltas
+}
+
+/// DR-0086 F3: the finish auto-attest, generic over the store bound so
+/// every door mints the same evidence — the CLI and agent doors carried
+/// this natively since DR-0084 I1; the effect door was the deferral this
+/// discharges. On a subject that was ever claimed: `kind: "cuts"` evidence
+/// referencing the `intent(<content-id>)` selection, KEYED over the
+/// subject's subject-role anchors when a mainline frontier exists, unkeyed
+/// otherwise (degraded and tagged). Advisory by contract: errors are
+/// swallowed — a finish never fails over its evidence trail.
+pub fn auto_attest_finish_generic<S: WorkItems + FrontierRead>(
+    store: &mut S,
+    id: &str,
+    actor: Option<&str>,
+) {
+    let Some(plan) = plan_finish_attest(&*store, &*store, id) else {
+        return;
+    };
+    let _ = store.attest(
+        id,
+        Some("cuts"),
+        Some(&plan.reference),
+        None,
+        actor,
+        plan.at_cut.as_deref(),
+        plan.basis.as_deref(),
+        plan.fingerprint_json.as_deref(),
+    );
+}
+
+pub fn run_queue_effect_generic<S: RuntimeStore + WorkItems + FrontierRead>(
     kernel: &mut RuntimeKernel<S>,
     instance_id: &str,
     effect: &ClaimableEffect,
@@ -1828,6 +1997,9 @@ pub fn run_queue_effect_generic<S: RuntimeStore + WorkItems>(
                 .map(str::to_owned);
             match kernel.store_mut().finish_item(id, summary.as_deref(), None) {
                 Ok(FinishOutcome::Finished) => {
+                    // DR-0086 F3: the effect door mints the same cut-trail
+                    // evidence the CLI and agent doors do (advisory).
+                    auto_attest_finish_generic(kernel.store_mut(), id, Some(instance_id));
                     Ok(json!({"id": id, "status": "done", "summary": summary}))
                 }
                 Ok(FinishOutcome::NotOpen) => {

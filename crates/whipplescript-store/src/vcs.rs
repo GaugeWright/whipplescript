@@ -456,6 +456,66 @@ pub enum UndoOpOutcome {
     NothingToUndo,
 }
 
+/// DR-0086 Decision 1: the kernel's read-only view of the versioned
+/// workspace — the FRONTIER. Deliberately narrow: the content maps
+/// freshness evaluates against, the change-unit window the witness and
+/// selection scans read, and file bodies at the head. Never a write
+/// surface — "the kernel reads the world freely; it changes the world only
+/// through the governed verbs" (DR-0086 Decision 2), and widening this
+/// trait toward writes is that record's Decision 4 to make, not a rider.
+///
+/// The inert contract: an empty or untouched store answers `Ok(None)` /
+/// empty, never an error — a workspace that has never used the VCS behaves
+/// as if the world were empty, which preserves every zero-setup behavior
+/// by content rather than by absence.
+pub trait FrontierRead {
+    /// The branch's head cut id and frontier content maps. `Ok(None)` = no
+    /// such branch (including the untouched store).
+    fn frontier_content(
+        &self,
+        branch_id: &str,
+    ) -> StoreResult<Option<(Option<String>, crate::freshness::FrontierContent)>>;
+
+    /// The branch's change-unit window, oldest first. Empty for an absent
+    /// branch.
+    fn frontier_change_units(
+        &self,
+        branch_id: &str,
+        limit: usize,
+    ) -> StoreResult<Vec<crate::selection::ChangeUnit>>;
+
+    /// A file body at the branch head. `Ok(None)` = no such file or branch.
+    fn frontier_file(&self, branch_id: &str, path: &str) -> StoreResult<Option<String>>;
+}
+
+/// The frontier of a workspace with no versioned world at all: everything
+/// inert. The facade's stand-in wherever no branch store participates, and
+/// the fixture for kernel tests that need the bound satisfied and nothing
+/// else.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct InertFrontier;
+
+impl FrontierRead for InertFrontier {
+    fn frontier_content(
+        &self,
+        _branch_id: &str,
+    ) -> StoreResult<Option<(Option<String>, crate::freshness::FrontierContent)>> {
+        Ok(None)
+    }
+
+    fn frontier_change_units(
+        &self,
+        _branch_id: &str,
+        _limit: usize,
+    ) -> StoreResult<Vec<crate::selection::ChangeUnit>> {
+        Ok(Vec::new())
+    }
+
+    fn frontier_file(&self, _branch_id: &str, _path: &str) -> StoreResult<Option<String>> {
+        Ok(None)
+    }
+}
+
 pub struct WorkspaceVcs<B: Branches, C: ContentBlobs> {
     branches: B,
     content: C,
@@ -477,6 +537,27 @@ pub struct WorkspaceVcs<B: Branches, C: ContentBlobs> {
 /// The native workspace VCS: rusqlite-backed branch + content stores.
 #[cfg(feature = "native")]
 pub type NativeWorkspaceVcs = WorkspaceVcs<BranchStore, ContentStore>;
+
+impl<B: Branches, C: ContentBlobs> FrontierRead for WorkspaceVcs<B, C> {
+    fn frontier_content(
+        &self,
+        branch_id: &str,
+    ) -> StoreResult<Option<(Option<String>, crate::freshness::FrontierContent)>> {
+        WorkspaceVcs::frontier_content(self, branch_id)
+    }
+
+    fn frontier_change_units(
+        &self,
+        branch_id: &str,
+        limit: usize,
+    ) -> StoreResult<Vec<crate::selection::ChangeUnit>> {
+        self.change_units(branch_id, limit)
+    }
+
+    fn frontier_file(&self, branch_id: &str, path: &str) -> StoreResult<Option<String>> {
+        self.read(branch_id, path)
+    }
+}
 
 /// A stored manifest as it lies: a tree root to descend, or the flat map cuts
 /// carried before DR-0070 §1.
@@ -4409,6 +4490,100 @@ mod tests {
             .expect("frontier")
             .expect("branch");
         assert_eq!(evaluate(&fingerprint, &round_trip), Freshness::Fresh);
+    }
+
+    /// DR-0086 Decision 1 (F1): the FrontierRead trait conforms to the
+    /// inherent methods on a live store, answers INERT on an untouched
+    /// one — Ok(None)/empty, never an error, so a workspace that has
+    /// never used the VCS behaves as if the world were empty — and the
+    /// InertFrontier stand-in is inert by construction.
+    #[test]
+    fn frontier_read_trait_conforms_and_is_inert_when_empty() {
+        struct StubCanon3;
+        impl DeclCanonicalizer for StubCanon3 {
+            fn canonical_declarations(&self, source: &str) -> Option<Vec<CanonDecl>> {
+                let mut declarations = Vec::new();
+                for line in source.lines() {
+                    let (name, hash) = line.split_once('=')?;
+                    declarations.push(CanonDecl {
+                        identity: name.to_owned(),
+                        canon_hash: hash.to_owned(),
+                        rename_hash: hash.to_owned(),
+                    });
+                }
+                Some(declarations)
+            }
+        }
+        // Untouched store: inert, not an error.
+        let empty = vcs();
+        assert_eq!(
+            FrontierRead::frontier_content(&*empty, MAINLINE_BRANCH_ID).expect("inert"),
+            None
+        );
+        assert!(empty
+            .frontier_change_units(MAINLINE_BRANCH_ID, 10)
+            .expect("inert")
+            .is_empty());
+        assert_eq!(
+            empty
+                .frontier_file(MAINLINE_BRANCH_ID, "src/a.whip")
+                .expect("inert"),
+            None
+        );
+
+        // Live store: the trait IS the inherent surface.
+        let mut live = vcs();
+        live.init("t0").expect("init");
+        live.set_decl_canonicalizer(Box::new(StubCanon3));
+        live.write(
+            MAINLINE_BRANCH_ID,
+            "main.whip",
+            Some("rule a=k1"),
+            "cut_f1",
+            "t1",
+        )
+        .expect("write");
+        let (at_cut, frontier) = FrontierRead::frontier_content(&*live, MAINLINE_BRANCH_ID)
+            .expect("frontier")
+            .expect("branch exists");
+        assert!(at_cut.is_some());
+        assert_eq!(frontier.decls.get("rule a"), Some(&"k1".to_owned()));
+        let inherent = live
+            .frontier_content(MAINLINE_BRANCH_ID)
+            .expect("frontier")
+            .expect("branch");
+        assert_eq!(inherent.1, frontier, "trait == inherent");
+        assert_eq!(
+            live.frontier_change_units(MAINLINE_BRANCH_ID, 10)
+                .expect("units")
+                .len(),
+            live.change_units(MAINLINE_BRANCH_ID, 10)
+                .expect("units")
+                .len()
+        );
+        assert_eq!(
+            live.frontier_file(MAINLINE_BRANCH_ID, "main.whip")
+                .expect("read")
+                .as_deref(),
+            Some("rule a=k1")
+        );
+
+        // The no-world stand-in: inert everywhere.
+        let inert = InertFrontier;
+        assert_eq!(
+            inert.frontier_content(MAINLINE_BRANCH_ID).expect("inert"),
+            None
+        );
+        assert!(inert
+            .frontier_change_units(MAINLINE_BRANCH_ID, 10)
+            .expect("inert")
+            .is_empty());
+        assert_eq!(
+            inert
+                .frontier_file(MAINLINE_BRANCH_ID, "main.whip")
+                .expect("inert"),
+            None
+        );
     }
 
     /// DR-0054: with a canonicalizer installed, `.whip` units carry

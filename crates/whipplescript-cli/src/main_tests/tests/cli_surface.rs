@@ -283,6 +283,107 @@ fn anchor_door_refuses_change_set_atoms() {
     std::fs::remove_dir_all(&root).ok();
 }
 
+/// DR-0086 F3: the effect door's finish auto-attest, at the kernel level —
+/// the same generic fn the tracker.finish handler calls. A claimed issue
+/// with a subject anchor mints KEYED cut-trail evidence against the
+/// facade's frontier (real canonicalizer entries); an unclaimed issue
+/// mints nothing.
+#[test]
+fn kernel_finish_auto_attests_keyed_on_the_native_facade() {
+    use whipplescript_store::items::WorkItems;
+    let _guard = crate::env_lock();
+    let root = std::env::temp_dir().join(format!(
+        "whip-f3-native-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos(),
+    ));
+    std::fs::create_dir_all(&root).expect("mkdir");
+
+    let mut vcs = whipplescript_store::vcs::WorkspaceVcs::open(
+        root.join("branches.sqlite"),
+        root.join("content.sqlite"),
+    )
+    .expect("vcs");
+    vcs.set_decl_canonicalizer(Box::new(
+        whipplescript_kernel::source_merge::WhipDeclCanonicalizer,
+    ));
+    vcs.init("t0").expect("init");
+    vcs.write(
+        whipplescript_store::branches::MAINLINE_BRANCH_ID,
+        "src/close.whip",
+        Some("workflow K\noutput result R\nclass R { ok bool }\nrule close\n  when started\n=> { complete result { ok true } }\n"),
+        "cut_f3",
+        "t1",
+    )
+    .expect("write");
+
+    let mut stores = whipplescript_store::native_stores::NativeStores::open(
+        root.join("runtime.sqlite"),
+        root.join("coord.sqlite"),
+        root.join("items.sqlite"),
+    )
+    .expect("stores")
+    .with_frontier(vcs);
+
+    let claimed = stores
+        .items
+        .file_item("q", "worked", "", &[], &json!({}), Some("s:a"))
+        .expect("file");
+    stores
+        .items
+        .add_anchor(&claimed.id, "decl(rule close)", "subject", Some("s:a"))
+        .expect("anchor")
+        .expect("known");
+    stores
+        .items
+        .claim_item(&claimed.id, "ins-f3", None)
+        .expect("claim");
+    let unclaimed = stores
+        .items
+        .file_item("q", "untouched", "", &[], &json!({}), Some("s:a"))
+        .expect("file");
+
+    whipplescript_kernel::effect_handlers::auto_attest_finish_generic(
+        &mut stores,
+        &claimed.id,
+        Some("ins-f3"),
+    );
+    whipplescript_kernel::effect_handlers::auto_attest_finish_generic(
+        &mut stores,
+        &unclaimed.id,
+        Some("ins-f3"),
+    );
+
+    let trail = stores.items.evidence(&claimed.id).expect("evidence");
+    assert_eq!(trail.len(), 1);
+    assert_eq!(trail[0].kind.as_deref(), Some("cuts"));
+    assert!(trail[0].at_cut.is_some(), "keyed: the frontier was live");
+    let fingerprint: std::collections::BTreeMap<String, String> =
+        serde_json::from_str(trail[0].basis_fingerprint_json.as_deref().expect("keyed"))
+            .expect("fingerprint json");
+    assert!(
+        fingerprint.contains_key("decl:rule close"),
+        "{fingerprint:?}"
+    );
+    let content_id = WorkItems::subject_content_id(&stores, &claimed.id)
+        .expect("content id")
+        .expect("known");
+    assert_eq!(
+        trail[0].reference.as_deref(),
+        Some(format!("intent({content_id})").as_str())
+    );
+    assert!(stores
+        .items
+        .evidence(&unclaimed.id)
+        .expect("evidence")
+        .is_empty());
+
+    std::fs::remove_dir_all(&root).ok();
+}
+
 /// The agent-door claim join: the harness todo tool holds claims as
 /// `agent:<instance id>` (live turns pass the instance as the holder), and
 /// the intent stamp unions that spelling with the kernel door's bare

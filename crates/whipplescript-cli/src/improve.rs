@@ -2258,6 +2258,7 @@ fn replay_scenario(
         runtime: store,
         coord: open_scratch_coord(seq)?,
         items: open_scratch_items(seq)?,
+        frontier: None,
     };
     let mut kernel = whipplescript_kernel::RuntimeKernel::new(stores);
     let version = kernel

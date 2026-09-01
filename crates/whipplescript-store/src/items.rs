@@ -3157,10 +3157,94 @@ pub trait WorkItems {
     /// Records a `blocks(from -> to)` edge (`to` is gated until `from` closes).
     /// The relation source-verbs' A+blockers seam; `from` blocks `to`.
     fn add_blocks(&mut self, from: &str, to: &str) -> StoreResult<()>;
+
+    // ------------------------------------------------------------------
+    // The knowledge plane (DR-0084), joining the trait with its first
+    // workflow consumer: the effect-door finish auto-attest (DR-0086 F3).
+    // ------------------------------------------------------------------
+
+    /// The opaque content id an issue or assertion alias resolves to.
+    fn subject_content_id(&self, id: &str) -> StoreResult<Option<String>>;
+
+    /// Whether any claim (active or released) was ever taken on the subject
+    /// — the finish auto-attest's cheap "was this worked under a claim" gate.
+    fn was_ever_claimed(&self, id: &str) -> StoreResult<bool>;
+
+    /// The subject's current anchors, in creation order.
+    fn anchors(&self, item_id: &str) -> StoreResult<Vec<Anchor>>;
+
+    /// The content ids of the subjects `actor` currently holds active
+    /// claims on — the intent stamp's lookup (DR-0084 I1, generic since
+    /// DR-0086 F4 so both hosts stamp identically).
+    fn active_claim_subjects(&self, actor: &str) -> StoreResult<Vec<String>>;
+
+    /// A subject's attached evidence in chronological order.
+    fn evidence(&self, item_id: &str) -> StoreResult<Vec<Evidence>>;
+
+    /// Attach KEYED evidence: kind/reference/note/actor plus the DR-0084
+    /// validity key (at-cut, copied basis, resolved fingerprint) — all key
+    /// fields optional, so unkeyed evidence is the same door with `None`s.
+    /// `Ok(None)` = unknown subject.
+    #[allow(clippy::too_many_arguments)]
+    fn attest(
+        &mut self,
+        item_id: &str,
+        kind: Option<&str>,
+        reference: Option<&str>,
+        note: Option<&str>,
+        added_by: Option<&str>,
+        at_cut: Option<&str>,
+        basis: Option<&str>,
+        basis_fingerprint_json: Option<&str>,
+    ) -> StoreResult<Option<String>>;
 }
 
 #[cfg(feature = "native")]
 impl WorkItems for WorkItemStore {
+    fn subject_content_id(&self, id: &str) -> StoreResult<Option<String>> {
+        WorkItemStore::subject_content_id(self, id)
+    }
+
+    fn was_ever_claimed(&self, id: &str) -> StoreResult<bool> {
+        WorkItemStore::was_ever_claimed(self, id)
+    }
+
+    fn anchors(&self, item_id: &str) -> StoreResult<Vec<Anchor>> {
+        WorkItemStore::anchors(self, item_id)
+    }
+
+    fn active_claim_subjects(&self, actor: &str) -> StoreResult<Vec<String>> {
+        WorkItemStore::active_claim_subjects(self, actor)
+    }
+
+    fn evidence(&self, item_id: &str) -> StoreResult<Vec<Evidence>> {
+        WorkItemStore::evidence(self, item_id)
+    }
+
+    fn attest(
+        &mut self,
+        item_id: &str,
+        kind: Option<&str>,
+        reference: Option<&str>,
+        note: Option<&str>,
+        added_by: Option<&str>,
+        at_cut: Option<&str>,
+        basis: Option<&str>,
+        basis_fingerprint_json: Option<&str>,
+    ) -> StoreResult<Option<String>> {
+        WorkItemStore::attest(
+            self,
+            item_id,
+            kind,
+            reference,
+            note,
+            added_by,
+            at_cut,
+            basis,
+            basis_fingerprint_json,
+        )
+    }
+
     fn set_event_effect_id(&mut self, effect_id: Option<&str>) {
         self.event_effect_id = effect_id.map(str::to_owned);
     }

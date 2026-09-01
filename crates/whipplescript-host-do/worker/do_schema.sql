@@ -299,7 +299,13 @@
             );
             CREATE TABLE tracker_evidence (
                 evidence_id TEXT PRIMARY KEY, issue_id TEXT NOT NULL, kind TEXT, reference TEXT,
-                note TEXT, added_by TEXT, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                note TEXT, added_by TEXT, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                at_cut TEXT, basis TEXT, basis_fingerprint_json TEXT
+            );
+            CREATE TABLE tracker_anchors (
+                anchor_id TEXT PRIMARY KEY, subject TEXT NOT NULL, region TEXT NOT NULL,
+                role TEXT NOT NULL DEFAULT 'subject', added_by TEXT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
             CREATE INDEX idx_tracker_issues_queue ON tracker_issues(queue, status);
             CREATE INDEX idx_tracker_leases_issue ON tracker_leases(issue_id, released_at);
