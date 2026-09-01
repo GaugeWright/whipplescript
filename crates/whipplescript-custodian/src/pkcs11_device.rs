@@ -4,6 +4,9 @@
 //! for what evidences the rung is checked by the ordinary green bar, and only
 //! the module conversation needs a device.
 
+use std::collections::BTreeMap;
+use std::sync::Arc;
+
 use cryptoki::context::{CInitializeArgs, CInitializeFlags, Pkcs11};
 use cryptoki::object::{Attribute, AttributeType, ObjectHandle};
 use cryptoki::session::{Session, UserType};
@@ -12,13 +15,33 @@ use cryptoki::types::AuthPin;
 
 use crate::pkcs11::KeyAttributes;
 
-/// Load a PKCS#11 module and initialise it.
+/// Every module this process has loaded, by path.
+///
+/// PKCS#11 allows exactly ONE `C_Initialize` per module per process: a second
+/// call returns CKR_CRYPTOKI_ALREADY_INITIALIZED, so a custodian that loaded
+/// the module afresh for each operation would sign once and fail forever after.
+/// Found by doing two operations in a row rather than one — the same way the
+/// TPM path's session bug surfaced.
+///
+/// Caching also matches what the module is: a loaded shared library with
+/// process-wide state, not a handle to open per call.
+static MODULES: std::sync::OnceLock<std::sync::Mutex<BTreeMap<String, Arc<Pkcs11>>>> =
+    std::sync::OnceLock::new();
+
+/// Load a PKCS#11 module and initialise it, or return the one already loaded.
 ///
 /// The module path is the operator's: a token is whatever `.so` their vendor
 /// ships, and whip has no business guessing. Naming it is also what makes the
 /// live smoke able to report WHICH module answered, which is the difference
 /// between evidence and plumbing.
-pub fn module(path: &str) -> Result<Pkcs11, String> {
+pub fn module(path: &str) -> Result<Arc<Pkcs11>, String> {
+    let modules = MODULES.get_or_init(|| std::sync::Mutex::new(BTreeMap::new()));
+    let mut loaded = modules
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(context) = loaded.get(path) {
+        return Ok(Arc::clone(context));
+    }
     let context = Pkcs11::new(path)
         .map_err(|error| format!("cannot load the PKCS#11 module at {path}: {error}"))?;
     context
@@ -26,6 +49,8 @@ pub fn module(path: &str) -> Result<Pkcs11, String> {
         // module must tolerate being called from more than one.
         .initialize(CInitializeArgs::new(CInitializeFlags::OS_LOCKING_OK))
         .map_err(|error| format!("cannot initialise the PKCS#11 module at {path}: {error}"))?;
+    let context = Arc::new(context);
+    loaded.insert(path.to_owned(), Arc::clone(&context));
     Ok(context)
 }
 
