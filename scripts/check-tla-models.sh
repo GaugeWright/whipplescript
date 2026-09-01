@@ -15,7 +15,7 @@ else
   fi
 fi
 
-for MODEL in "$ROOT/models/tla/ControlPlaneLifecycle.tla" "$ROOT/models/tla/NativeProviderLifecycle.tla" "$ROOT/models/tla/ResumableEffectLifecycle.tla" "$ROOT/models/tla/InstanceSchedulerLifecycle.tla" "$ROOT/models/tla/ClockSourceLifecycle.tla" "$ROOT/models/tla/InfoflowReleaseBudget.tla" "$ROOT/models/tla/InfoflowLabelCarriage.tla" "$ROOT/models/tla/ReconciliationDaemonLifecycle.tla" "$ROOT/models/tla/CoordLease.tla" "$ROOT/models/tla/CoordCounter.tla" "$ROOT/models/tla/CoordLedger.tla" "$ROOT/models/tla/CredentialCustody.tla" "$ROOT/models/tla/LogChainIntegrity.tla" "$ROOT/models/tla/PinnedResolution.tla" "$ROOT/models/tla/SubstratePublishOrder.tla"; do
+for MODEL in "$ROOT/models/tla/ControlPlaneLifecycle.tla" "$ROOT/models/tla/NativeProviderLifecycle.tla" "$ROOT/models/tla/ResumableEffectLifecycle.tla" "$ROOT/models/tla/InstanceSchedulerLifecycle.tla" "$ROOT/models/tla/ClockSourceLifecycle.tla" "$ROOT/models/tla/InfoflowReleaseBudget.tla" "$ROOT/models/tla/InfoflowLabelCarriage.tla" "$ROOT/models/tla/ReconciliationDaemonLifecycle.tla" "$ROOT/models/tla/CoordLease.tla" "$ROOT/models/tla/CoordCounter.tla" "$ROOT/models/tla/CoordLedger.tla" "$ROOT/models/tla/CredentialCustody.tla" "$ROOT/models/tla/LogChainIntegrity.tla" "$ROOT/models/tla/PinnedResolution.tla" "$ROOT/models/tla/SubstratePublishOrder.tla" "$ROOT/models/tla/IngressDeliveryLifecycle.tla"; do
   "${APALACHE[@]}" typecheck "$MODEL"
   "${APALACHE[@]}" check \
     --cinit=ConstInit \
@@ -25,6 +25,40 @@ for MODEL in "$ROOT/models/tla/ControlPlaneLifecycle.tla" "$ROOT/models/tla/Nati
     --length="$LENGTH" \
     "$MODEL"
 done
+
+# --- Ingress delivery bite (see models/tla/IngressDeliveryLifecycle.tla) ---------
+# A webhook sender retries, and reuses its delivery id when it does. Three
+# guards decide what that is allowed to do, and each is proven load-bearing by
+# removing it: authentication (a forged delivery must not reach the admission
+# core), settlement (a settled key must not admit again), and validation (a
+# malformed payload must not append a fact).
+#
+# The fixture gives each guard a WITNESS -- d1 clean, d2 authentic-but-malformed,
+# d3 forged. Without that the validation mutation went uncaught, because every
+# key was well formed and the guard never fired.
+ING_MODEL="$ROOT/models/tla/IngressDeliveryLifecycle.tla"
+ING_DIR="$(mktemp -d)"
+trap 'rm -rf "$ING_DIR"' EXIT
+ingress_bite() {
+  local name="$1" prog="$2"
+  awk "$prog" "$ING_MODEL" > "$ING_DIR/IngressDeliveryLifecycle.tla"
+  if "${APALACHE[@]}" check --cinit=ConstInit --init=Init --next=Next \
+        --inv=SafetyInvariants --length=6 \
+        "$ING_DIR/IngressDeliveryLifecycle.tla" > "$ING_DIR/out.log" 2>&1; then
+    echo "ingress-delivery bite FAILED: the $name-dropped mutant violated nothing" >&2
+    exit 1
+  fi
+  if ! grep -qiE 'invariant .* violated|outcome is: Error' "$ING_DIR/out.log"; then
+    echo "ingress-delivery bite FAILED: the $name mutant erred for the wrong reason" >&2
+    cat "$ING_DIR/out.log" >&2
+    exit 1
+  fi
+  echo "ingress-delivery bite OK ($name guard is load-bearing)"
+}
+echo "== ingress-delivery: each guard must be load-bearing"
+ingress_bite auth '/^Authenticate\(k\) ==/{i=1} i && /k \\in Authentic/ {print "  \\* MUTANT"; i=0; next} {print}'
+ingress_bite settled '/^Authenticate\(k\) ==/{i=1} i && /~Settled\(k\)/ {print "  \\* MUTANT"; i=0; next} {print}'
+ingress_bite validation '/^Authenticate\(k\) ==/{i=1} i && /k \\in WellFormed/ {print "  \\* MUTANT"; i=0; next} {print}'
 
 # --- Requeue-necessity bite (see models/tla/EffectRequeueNecessity.tla) -----------
 # ControlPlaneLifecycle enforces "a blocked effect must be requeued before it can be
@@ -40,7 +74,9 @@ echo "== requeue-necessity: correct model must hold"
 
 echo "== requeue-necessity: mutant (guard dropped) must be caught"
 MUT_DIR="$(mktemp -d)"
-trap 'rm -rf "$MUT_DIR"' EXIT
+# Both dirs: an EXIT trap REPLACES the previous one rather than adding to it,
+# so this is the surviving handler and has to clean the ingress dir too.
+trap 'rm -rf "$MUT_DIR" "$ING_DIR"' EXIT
 awk '
   /^Claim ==/ {inclaim=1}
   inclaim && /status = "queued"/ {print "  \\* MUTANT: guard removed"; inclaim=0; next}

@@ -127,6 +127,7 @@ mod credential_proxy;
 mod exec_server;
 mod harness_tools;
 mod improve;
+mod ingress_listener;
 mod injected_secrets;
 mod instance_view;
 mod lsp_server;
@@ -33787,19 +33788,114 @@ fn signal(options: &CliOptions) -> ExitCode {
 /// stdout; the process exits 0 at EOF (dev/test reference path, native-only,
 /// no M2 effect seam involved). The HTTP LISTENER driver is deferred with
 /// slice I4 ("Deferred with cause").
+/// `whip ingress serve --http <bind>` (spec/std-ingress.md slice I4).
+///
+/// The listener the clause grammar was waiting for, written to
+/// `models/tla/IngressDeliveryLifecycle.tla`: route, AUTHENTICATE, validate,
+/// admit — and every stage refuses rather than falling through.
+///
+/// Deliveries are handled one at a time on the accept thread. The kernel and
+/// the store are not `Sync`, and an admission path whose job is a serialized
+/// append gains nothing from concurrency — it would need a lock around the
+/// store anyway. The connection cap bounds peers waiting, not work in flight.
+fn ingress_serve_http<S: whipplescript_store::RuntimeStore>(
+    kernel: &mut RuntimeKernel<S>,
+    ir: &whipplescript_parser::IrProgram,
+    bind: &str,
+    default_instance: Option<&str>,
+) -> ExitCode {
+    use crate::ingress_listener::{decide, map_admission, routes, secret_env_var, serve_on};
+
+    let routes = match routes(&ir.sources) {
+        Ok(routes) => routes,
+        Err(problem) => {
+            eprintln!("{problem}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if routes.is_empty() {
+        // Serving nothing is a configuration mistake, not a quiet success: the
+        // operator asked for a listener and this program declares no endpoint.
+        eprintln!(
+            "this program declares no inbound source, so there is nothing to serve; add \
+             `path \"<endpoint>\"` and `auth <mode> secret <reference>` to an `http` source"
+        );
+        return ExitCode::FAILURE;
+    }
+    for (path, source) in &routes {
+        eprintln!(
+            "ingress: {path} -> {} ({})",
+            source.emit_signal, source.name
+        );
+    }
+    let default_instance = default_instance.unwrap_or("default").to_owned();
+    let envelope = whipplescript_kernel::ifc::VerifiedEnvelope::load_from_env();
+    let listener = match std::net::TcpListener::bind(bind) {
+        Ok(listener) => listener,
+        Err(error) => {
+            eprintln!("cannot bind {bind}: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let secret_for = |reference: &str| std::env::var(secret_env_var(reference)).ok();
+    let result = serve_on(listener, |delivery| {
+        decide(
+            &routes,
+            &secret_for,
+            delivery,
+            &default_instance,
+            // The MAPPING lives in the listener module, where both of its
+            // refusals are ordinary tests: an admission refusal needs a store
+            // in a particular state and a store failure needs a broken one, so
+            // neither is reachable through a socket.
+            |source, instance, observation, key| {
+                map_admission(
+                    whipplescript_kernel::ingress_pass::admit_observation(
+                        kernel,
+                        instance,
+                        ir,
+                        source,
+                        observation,
+                        key.to_owned(),
+                        &envelope,
+                    )
+                    .map_err(|error| format!("{error:?}")),
+                )
+            },
+        )
+    });
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("ingress listener stopped: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
 fn ingress_command(options: &CliOptions) -> ExitCode {
-    let usage = "usage: whip ingress serve --stdio --program <workflow.whip> [--root <workflow>]";
+    let usage = "usage: whip ingress serve (--stdio | --http <bind>) --program <workflow.whip> [--instance <id>] [--root <workflow>]";
     if options.args.first().map(String::as_str) != Some("serve") {
         eprintln!("{usage}");
         return ExitCode::from(2);
     }
     let mut stdio = false;
+    let mut http_bind: Option<String> = None;
+    let mut instance: Option<String> = None;
     let mut program_path = None;
     let mut root = None;
     let mut index = 1;
     while index < options.args.len() {
         match options.args[index].as_str() {
             "--stdio" => stdio = true,
+            "--http" => {
+                index += 1;
+                http_bind = options.args.get(index).cloned();
+            }
+            "--instance" => {
+                index += 1;
+                instance = options.args.get(index).cloned();
+            }
             "--program" => {
                 index += 1;
                 program_path = options.args.get(index).cloned();
@@ -33816,11 +33912,13 @@ fn ingress_command(options: &CliOptions) -> ExitCode {
         }
         index += 1;
     }
-    if !stdio {
-        eprintln!(
-            "`whip ingress serve` currently drives --stdio only; the HTTP listener driver is \
-             deferred (spec/std-ingress.md \"Deferred with cause\", slice I4)"
-        );
+    if stdio && http_bind.is_some() {
+        eprintln!("`whip ingress serve` drives one transport at a time: --stdio or --http");
+        eprintln!("{usage}");
+        return ExitCode::from(2);
+    }
+    if !stdio && http_bind.is_none() {
+        eprintln!("`whip ingress serve` needs a transport: --stdio or --http <bind>");
         eprintln!("{usage}");
         return ExitCode::from(2);
     }
@@ -33840,6 +33938,9 @@ fn ingress_command(options: &CliOptions) -> ExitCode {
     use whipplescript_kernel::ingress_pass::{
         admit_external_signal, refusal_reason, signal_delivery_key, SignalAdmission,
     };
+    if let Some(bind) = http_bind {
+        return ingress_serve_http(&mut kernel, &ir, &bind, instance.as_deref());
+    }
     let stdin = std::io::stdin();
     let mut line_number = 0usize;
     for line in std::io::BufRead::lines(stdin.lock()) {

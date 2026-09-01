@@ -957,6 +957,24 @@ fn format_source(source: SourceDecl, formatted: &mut String) {
     if let Some(dedup) = &source.dedup {
         push_line(formatted, format!("  dedup {}", format_source_value(dedup)));
     }
+    // An inbound source's endpoint prints as `path`, which is the spelling it
+    // was written in — the IR splits it from the file `path` so nothing has to
+    // know the provider kind, and the formatter puts it back.
+    if let Some(endpoint) = &source.endpoint {
+        push_line(formatted, format!("  path {:?}", endpoint.value));
+    }
+    if let Some(auth) = &source.auth {
+        push_line(
+            formatted,
+            format!("  auth {} secret {}", auth.mode.as_str(), auth.secret),
+        );
+    }
+    if let Some(correlate) = &source.correlate {
+        push_line(
+            formatted,
+            format!("  correlate {}", format_source_value(correlate)),
+        );
+    }
     push_line(
         formatted,
         format!("  observe as {}", source.observe_binding.name),

@@ -428,8 +428,13 @@ pub fn resolve_due_http_sources<S: RuntimeStore>(
 /// onto the declared payload by the author's `emit` clause, derive the
 /// delivery key, admit. Duplicates are absorbed silently (idempotent pass);
 /// refusals are noted for the host to surface.
+///
+/// `pub` so the INBOUND listener admits through the same function the pollers
+/// do. A second copy would be a second place for the emit mapping, the delivery
+/// key and the refusal handling to drift, and the whole point of the admission
+/// core is that every door reaches the store the same way.
 #[allow(clippy::too_many_arguments)]
-fn admit_source_observation<S: RuntimeStore>(
+pub fn admit_source_observation<S: RuntimeStore>(
     kernel: &mut RuntimeKernel<S>,
     instance_id: &str,
     ir: &IrProgram,
@@ -439,17 +444,13 @@ fn admit_source_observation<S: RuntimeStore>(
     envelope: &ifc::EnvelopeStatus,
     report: &mut IngressPassReport,
 ) -> StoreResult<()> {
-    let empty = serde_json::Map::new();
-    let observation_map = observation.as_object().unwrap_or(&empty);
-    let payload = clock_emit_payload(source, observation_map);
-    let delivery_key = source_delivery_key(source, observation, ordinal_key);
-    match admit_external_signal_with_envelope(
+    match admit_observation(
         kernel,
         instance_id,
         ir,
-        &source.emit_signal,
-        &payload,
-        &delivery_key,
+        source,
+        observation,
+        ordinal_key,
         envelope,
     )? {
         SignalAdmission::Admitted { .. } => report.admitted += 1,
@@ -462,6 +463,38 @@ fn admit_source_observation<S: RuntimeStore>(
         )),
     }
     Ok(())
+}
+
+/// The shared core both doors reach the store through: map the observation onto
+/// the declared payload by the author's `emit` clause, derive the delivery key,
+/// admit — and hand the OUTCOME back rather than folding it into a report.
+///
+/// A poller wants a running tally and absorbs duplicates silently; a listener
+/// has to answer the sender and so needs to know which happened. Same core, two
+/// wrappers, one place where the emit mapping and the delivery key live.
+#[allow(clippy::too_many_arguments)]
+pub fn admit_observation<S: RuntimeStore>(
+    kernel: &mut RuntimeKernel<S>,
+    instance_id: &str,
+    ir: &IrProgram,
+    source: &IrSource,
+    observation: &Value,
+    ordinal_key: String,
+    envelope: &ifc::EnvelopeStatus,
+) -> StoreResult<SignalAdmission> {
+    let empty = serde_json::Map::new();
+    let observation_map = observation.as_object().unwrap_or(&empty);
+    let payload = clock_emit_payload(source, observation_map);
+    let delivery_key = source_delivery_key(source, observation, ordinal_key);
+    admit_external_signal_with_envelope(
+        kernel,
+        instance_id,
+        ir,
+        &source.emit_signal,
+        &payload,
+        &delivery_key,
+        envelope,
+    )
 }
 
 /// A one-line human reason for a refusal (drivers surface it; the CLI door

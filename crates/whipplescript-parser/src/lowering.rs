@@ -1959,17 +1959,26 @@ fn lower_source(
     // `url` clause is meaningful only for `http` (rejecting it elsewhere keeps
     // provider intent unambiguous, mirroring the file-only-clause rejection).
     let is_http = source.provider.name == "http";
-    if is_http && source.url.is_none() {
+    // An http source is one direction or the other, and needs the clause for
+    // the direction it is: `url` to poll, `path` to serve. This check predates
+    // the inbound direction, when `url` was the only thing an http source could
+    // mean — so it now asks for EITHER rather than for `url`.
+    if is_http && source.url.is_none() && source.endpoint.is_none() {
         diagnostics.push(Diagnostic {
             code: diagnostic_code!("construct.missing_requirement"),
             severity: Severity::Error,
             related: Vec::new(),
             span: source.span,
             message: format!(
-                "`http` source `{}` requires a `url` clause",
+                "`http` source `{}` declares neither `url` nor `path`, so it neither polls \
+                 nor serves",
                 source.name.name
             ),
-            suggestion: Some("add `url \"https://example.com/feed.json\"`".to_owned()),
+            suggestion: Some(
+                "add `url \"https://example.com/feed.json\"` to POLL, or `path \"/hooks/x\"` \
+                 to SERVE"
+                    .to_owned(),
+            ),
         });
     }
     // The runtime GETs the url with an HTTP client, so it must be an absolute
@@ -2075,6 +2084,123 @@ fn lower_source(
             }
         }
     }
+    // An INBOUND source is one that declares an endpoint to serve. Everything
+    // below is judged against that rather than against the provider kind alone,
+    // because `http` covers both directions: `url` polls, `path` serves.
+    let inbound = source.endpoint.is_some();
+    if inbound && source.url.is_some() {
+        diagnostics.push(Diagnostic {
+            code: diagnostic_code!("construct.incompatible_clause"),
+            severity: Severity::Error,
+            related: Vec::new(),
+            span: source.span,
+            message: format!(
+                "source `{}` declares both `url` and `path`, so it is both polling and \
+                 listening",
+                source.name.name
+            ),
+            suggestion: Some(
+                "keep `url` to POLL an endpoint, or `path` to SERVE one — a source is one \
+                 direction or the other"
+                    .to_owned(),
+            ),
+        });
+    }
+    // Fail-closed by construction: an inbound endpoint with no `auth` has no
+    // unauthenticated mode to fall into, so the refusal is at the declaration
+    // rather than at the first forged delivery.
+    if inbound && source.auth.is_none() {
+        diagnostics.push(Diagnostic {
+            code: diagnostic_code!("construct.missing_requirement"),
+            severity: Severity::Error,
+            related: Vec::new(),
+            span: source.span,
+            message: format!(
+                "inbound source `{}` declares no `auth`, so anything that can reach the \
+                 listener could inject its signal",
+                source.name.name
+            ),
+            suggestion: Some(
+                "add `auth hmac secret <reference>` (or `bearer`/`shared`)".to_owned(),
+            ),
+        });
+    }
+    if let Some(auth) = &source.auth {
+        if !inbound {
+            diagnostics.push(Diagnostic {
+                code: diagnostic_code!("construct.incompatible_clause"),
+                severity: Severity::Error,
+                related: Vec::new(),
+                span: auth.span,
+                message: format!(
+                    "source `{}` declares `auth` but serves no endpoint, so there is no \
+                     delivery to authenticate",
+                    source.name.name
+                ),
+                suggestion: Some(
+                    "add `path \"<endpoint>\"`, or remove the `auth` clause".to_owned(),
+                ),
+            });
+        }
+    }
+    let mut correlate_field = None;
+    if let Some(correlate) = &source.correlate {
+        let span = match correlate {
+            SourceValue::Path { span, .. } => *span,
+            SourceValue::String(literal) => literal.span,
+            SourceValue::Number(_, span) => *span,
+        };
+        if !inbound {
+            diagnostics.push(Diagnostic {
+                code: diagnostic_code!("construct.incompatible_clause"),
+                severity: Severity::Error,
+                related: Vec::new(),
+                span,
+                message: format!(
+                    "source `{}` declares `correlate` but serves no endpoint; a polling \
+                     source already knows which instance it runs for",
+                    source.name.name
+                ),
+                suggestion: Some("remove the `correlate` clause".to_owned()),
+            });
+        } else {
+            match correlate {
+                // Anchored at a known observation field, then free inside it.
+                // `body` is the sender's JSON, so its interior cannot be
+                // checked here — but WHICH observation field the path starts
+                // from can be, and that is the half worth checking: a typo in
+                // the anchor is a correlation that silently never matches.
+                SourceValue::Path {
+                    binding, segments, ..
+                } if binding.name == source.observe_binding.name && !segments.is_empty() => {
+                    correlate_field = Some(
+                        segments
+                            .iter()
+                            .map(|segment| segment.name.clone())
+                            .collect::<Vec<_>>()
+                            .join("."),
+                    );
+                }
+                _ => {
+                    diagnostics.push(Diagnostic {
+                        code: diagnostic_code!("construct.invalid_clause_value"),
+                        severity: Severity::Error,
+                        related: Vec::new(),
+                        span,
+                        message: format!(
+                            "source `{}` `correlate` must name a path off the `observe` \
+                             binding (e.g. `correlate {}.body.instance`)",
+                            source.name.name, source.observe_binding.name
+                        ),
+                        suggestion: Some(format!(
+                            "the observation binding is `{}` (declared by `observe as {}`)",
+                            source.observe_binding.name, source.observe_binding.name
+                        )),
+                    });
+                }
+            }
+        }
+    }
     let path = source.path.as_ref().map(|literal| literal.value.clone());
     let watch = source.watch.as_ref().map(|literal| literal.value.clone());
     let url = source.url.as_ref().map(|literal| literal.value.clone());
@@ -2097,6 +2223,16 @@ fn lower_source(
         watch,
         url,
         dedup_field,
+        endpoint: source
+            .endpoint
+            .as_ref()
+            .map(|literal| literal.value.clone()),
+        auth_mode: source
+            .auth
+            .as_ref()
+            .map(|auth| auth.mode.as_str().to_owned()),
+        auth_secret: source.auth.as_ref().map(|auth| auth.secret.clone()),
+        correlate_field,
         observe_binding: source.observe_binding.name,
         emit_signal: source.emit.signal,
         emit_from: source.emit.from.as_ref().map(|ident| ident.name.clone()),

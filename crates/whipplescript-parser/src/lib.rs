@@ -812,6 +812,27 @@ pub struct SourceDecl {
     /// positional ordinal, so a re-ordered or head-inserted feed still admits
     /// each delivery exactly once.
     pub dedup: Option<SourceValue>,
+    /// `path "<endpoint>"` on an `http` source is the INBOUND endpoint the
+    /// listener routes to, not a file — the provider kind decides which `path`
+    /// means what, and the closed-set check refuses the wrong one. Exactly one
+    /// of `url` (poll that) and `path` (serve this): a source is inbound or
+    /// outbound, never both (spec/std-ingress.md I4).
+    ///
+    /// Carried separately from `path` above so a reader of the IR does not have
+    /// to know the provider kind to know which was meant.
+    pub endpoint: Option<StringLiteral>,
+    /// `auth <mode> secret <ident>` — how an inbound delivery proves it is from
+    /// the sender, and WHERE the secret lives. `ident` is a reference the
+    /// custodian or the environment resolves, never a literal: "no source-level
+    /// secret literals" (event-ingress.md Non-Goals).
+    ///
+    /// Required on an inbound source. Fail-closed by construction rather than
+    /// by default: there is no unauthenticated mode to omit it into.
+    pub auth: Option<SourceAuth>,
+    /// `correlate <observe>.<field>` — the observation field carrying the
+    /// instance id a delivery belongs to. A listener serves one endpoint for
+    /// many instances, so something in the delivery has to say which.
+    pub correlate: Option<SourceValue>,
     /// `observe as <binding>` — binds the provider observation schema.
     pub observe_binding: Ident,
     /// `emit <signal> { <field> <value> ... }` — maps the observation into the
@@ -1433,6 +1454,48 @@ pub struct IrSharedCoordinationUsage {
     pub workflow_principals: Vec<String>,
 }
 
+/// `auth <mode> secret <ident>` on an inbound source.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SourceAuth {
+    pub mode: SourceAuthMode,
+    /// The secret REFERENCE — an identifier the runtime resolves, never the
+    /// secret itself.
+    pub secret: String,
+    pub span: SourceSpan,
+}
+
+/// How an inbound delivery authenticates (spec/std-ingress.md Surface).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SourceAuthMode {
+    /// A signature over the body under a shared secret: the only mode that
+    /// binds the CONTENT, so a replayed body cannot be re-signed for different
+    /// bytes.
+    Hmac,
+    /// A bearer token in the Authorization header.
+    Bearer,
+    /// A shared secret in a sender-named header.
+    Shared,
+}
+
+impl SourceAuthMode {
+    pub fn parse(word: &str) -> Option<Self> {
+        match word {
+            "hmac" => Some(SourceAuthMode::Hmac),
+            "bearer" => Some(SourceAuthMode::Bearer),
+            "shared" => Some(SourceAuthMode::Shared),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SourceAuthMode::Hmac => "hmac",
+            SourceAuthMode::Bearer => "bearer",
+            SourceAuthMode::Shared => "shared",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct IrSourceTag {
     pub name: String,
@@ -1769,6 +1832,15 @@ pub struct IrSource {
     /// delivery id for `file` (line mode) / `http` sources; replaces the
     /// positional-ordinal admission key when declared.
     pub dedup_field: Option<String>,
+    /// `path "<endpoint>"` on an `http` source: the inbound endpoint the
+    /// listener routes to. Present exactly when this source is inbound.
+    pub endpoint: Option<String>,
+    /// `auth <mode> secret <ident>`: the mode and the secret REFERENCE.
+    pub auth_mode: Option<String>,
+    pub auth_secret: Option<String>,
+    /// `correlate <observe>.<field>`: the observation field naming the instance
+    /// a delivery belongs to.
+    pub correlate_field: Option<String>,
     pub observe_binding: String,
     pub emit_signal: String,
     /// S6 `emit … from` — the projection source binding; when set, the
@@ -23480,6 +23552,11 @@ fn validate_source_emit_signal_declared(
         // READING stays std.files).
         "file" if source.watch.is_some() => Some(&["path", "content_hash", "watch"]),
         "file" => Some(&["line", "line_index", "path"]),
+        // An INBOUND source observes a delivery, not a poll: what the listener
+        // knows is the body the sender posted, the endpoint it arrived on, and
+        // the delivery id it was keyed by. `item`/`item_index` are the polling
+        // shape and mean nothing here — there is no array to be an element of.
+        "http" if source.endpoint.is_some() => Some(&["body", "path", "delivery"]),
         "http" => Some(&["item", "item_index", "url"]),
         _ => None,
     };

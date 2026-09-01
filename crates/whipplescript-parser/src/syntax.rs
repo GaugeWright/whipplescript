@@ -3320,6 +3320,8 @@ impl Parser<'_> {
         let mut watch: Option<StringLiteral> = None;
         let mut url: Option<StringLiteral> = None;
         let mut dedup: Option<SourceValue> = None;
+        let mut auth: Option<SourceAuth> = None;
+        let mut correlate: Option<SourceValue> = None;
         let mut observe_binding: Option<Ident> = None;
         let mut emit: Option<SourceEmit> = None;
 
@@ -3345,6 +3347,15 @@ impl Parser<'_> {
             } else if self.at_ident("dedup") {
                 self.advance();
                 dedup = self.parse_source_value();
+            } else if self.at_ident("auth") {
+                self.advance();
+                auth = self.parse_source_auth();
+                if auth.is_none() {
+                    self.synchronize_to_source_clause();
+                }
+            } else if self.at_ident("correlate") {
+                self.advance();
+                correlate = self.parse_source_value();
             } else if self.at_ident("missed") {
                 missed = self.parse_missed_policy();
             } else if self.at_ident("observe") {
@@ -3357,7 +3368,7 @@ impl Parser<'_> {
                 emit = self.parse_source_emit();
             } else {
                 self.unexpected(
-                    "a source clause (`every`/`at`, `timezone`, `path`, `watch`, `url`, `dedup`, `missed`, `observe`, `emit`)",
+                    "a source clause (`every`/`at`, `timezone`, `path`, `watch`, `url`, `dedup`, `auth`, `correlate`, `missed`, `observe`, `emit`)",
                 );
                 self.synchronize_to_block_item();
             }
@@ -3443,6 +3454,11 @@ impl Parser<'_> {
             None
         };
 
+        // `path` on an http source is the INBOUND endpoint, not a file. The
+        // provider kind decides which one the author meant, and splitting it
+        // here means nothing downstream has to know the kind to read the IR.
+        let inbound = provider.name == "http";
+        let (path, endpoint) = if inbound { (None, path) } else { (path, None) };
         Some(SourceDecl {
             name,
             provider,
@@ -3451,9 +3467,62 @@ impl Parser<'_> {
             watch,
             url,
             dedup,
+            endpoint,
+            auth,
+            correlate,
             observe_binding,
             emit,
             span,
+        })
+    }
+
+    /// `auth <mode> secret <ident>`.
+    ///
+    /// The secret is an IDENTIFIER, never a string: a string literal here would
+    /// be a secret in the source text, which "Non-Goals" forbids, and refusing
+    /// it at the parse is the only place the refusal is cheap.
+    fn parse_source_auth(&mut self) -> Option<SourceAuth> {
+        let start = self.peek().map(|t| t.span.start).unwrap_or_default();
+        let mode_token = self.expect_ident("auth mode (`hmac`, `bearer` or `shared`)")?;
+        let Some(mode) = SourceAuthMode::parse(&mode_token.name) else {
+            self.diagnostics.push(Diagnostic {
+                code: diagnostic_code!("construct.invalid_clause_value"),
+                severity: Severity::Error,
+                related: Vec::new(),
+                span: mode_token.span,
+                message: format!("unknown auth mode `{}`", mode_token.name),
+                suggestion: Some("auth modes are `hmac`, `bearer` and `shared`".to_owned()),
+            });
+            return None;
+        };
+        if !self.consume_ident("secret") {
+            self.expected("`secret <reference>` after the auth mode");
+            return None;
+        }
+        if matches!(self.peek().map(|t| &t.kind), Some(TokenKind::String(_))) {
+            let span = self.peek().map(|t| t.span).unwrap_or(mode_token.span);
+            self.diagnostics.push(Diagnostic {
+                code: diagnostic_code!("construct.invalid_clause_value"),
+                severity: Severity::Error,
+                related: Vec::new(),
+                span,
+                message: "a source may not carry a secret literal".to_owned(),
+                suggestion: Some(
+                    "name a secret REFERENCE the runtime resolves, e.g. `auth hmac secret \
+                     github_webhook`"
+                        .to_owned(),
+                ),
+            });
+            return None;
+        }
+        let secret = self.expect_ident("secret reference")?;
+        Some(SourceAuth {
+            mode,
+            secret: secret.name,
+            span: SourceSpan {
+                start,
+                end: secret.span.end,
+            },
         })
     }
 
@@ -4846,6 +4915,35 @@ impl Parser<'_> {
             suggestion: suggestion.or_else(|| suggestion_for_expected(&expected)),
         };
         self.push_with_open_block(diagnostic);
+    }
+
+    /// Recover to the next SOURCE clause after a bad one.
+    ///
+    /// `synchronize_to_block_item` looks for agent-block keywords and so runs
+    /// straight past `observe`/`emit`, which turns one bad clause into three
+    /// diagnostics — the last of them "expected top-level declaration, found
+    /// `}`", pointing nowhere near what the author wrote. A source block has
+    /// its own clause vocabulary, so it gets its own resync.
+    fn synchronize_to_source_clause(&mut self) {
+        while !self.is_at_end() {
+            if self.at_symbol('}')
+                || self.at_ident("every")
+                || self.at_ident("at")
+                || self.at_ident("timezone")
+                || self.at_ident("path")
+                || self.at_ident("watch")
+                || self.at_ident("url")
+                || self.at_ident("dedup")
+                || self.at_ident("auth")
+                || self.at_ident("correlate")
+                || self.at_ident("missed")
+                || self.at_ident("observe")
+                || self.at_ident("emit")
+            {
+                return;
+            }
+            self.advance();
+        }
     }
 
     fn synchronize_to_block_item(&mut self) {

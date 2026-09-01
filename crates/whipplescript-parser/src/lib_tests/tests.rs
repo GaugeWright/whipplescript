@@ -7311,8 +7311,14 @@ source file as feed {{
 "
                 ),
             ),
+            // `path` on an http source is no longer a file-only clause used in
+            // the wrong place: it is the INBOUND endpoint (std.ingress I4), so
+            // the refusal for declaring it beside `url` is that the source
+            // would be polling and listening at once. The old message asserted
+            // here said `path` belonged to `file`, which stopped being true
+            // when http gained a direction.
             (
-                "source `feed` declares a `path` clause but its provider is `http`, not `file`",
+                "source `feed` declares both `url` and `path`, so it is both polling and listening",
                 format!(
                     "{SOURCE_PRELUDE}
 source http as feed {{
