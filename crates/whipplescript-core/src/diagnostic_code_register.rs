@@ -106,6 +106,7 @@ pub const DIAGNOSTIC_CODES: &[DiagnosticCode] = &[
     DiagnosticCode("graph.unbounded_tool_grant_recursion"),
     DiagnosticCode("graph.unbounded_workflow_invocation_recursion"),
     DiagnosticCode("graph.unmatchable_fact"),
+    DiagnosticCode("graph.unmeasured_resource_cycle"),
     DiagnosticCode("graph.unreachable_terminal"),
     DiagnosticCode("graph.unreleased_lease"),
     DiagnosticCode("lowering.internal"),

@@ -438,7 +438,8 @@ pub(crate) fn lower_program(
     validate_streams(&ir, &mut diagnostics);
     validate_regions(&ir, &mut diagnostics);
     ir.rule_dependencies = build_rule_dependencies(&ir.rules);
-    let (measures, cycle_classes) = validate_effectful_rule_recursion(&ir, &mut diagnostics);
+    let (measures, cycle_classes) =
+        validate_effectful_rule_recursion(&ir, &mut diagnostics, &mut warnings);
     ir.measures = measures;
     validate_measure_declarations(&ir, &cycle_classes, &mut diagnostics, &mut warnings);
     validate_turn_access_grant_file_operations(&ir, &mut diagnostics);

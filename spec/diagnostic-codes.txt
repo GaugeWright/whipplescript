@@ -111,6 +111,7 @@ graph.unbounded_pattern_recursion COVERED
 graph.unbounded_tool_grant_recursion COVERED
 graph.unbounded_workflow_invocation_recursion COVERED
 graph.unmatchable_fact COVERED
+graph.unmeasured_resource_cycle COVERED
 graph.unreachable_terminal COVERED
 graph.unreleased_lease COVERED
 lowering.internal PROVISIONAL

@@ -216,9 +216,19 @@ function mergeBaseSchema() {
   } catch {
     return null;
   }
-  const base = execFileSync("git", ["merge-base", "origin/main", "HEAD"], {
-    encoding: "utf8",
-  }).trim();
+  let base;
+  try {
+    base = execFileSync("git", ["merge-base", "origin/main", "HEAD"], {
+      encoding: "utf8",
+    }).trim();
+  } catch {
+    // origin/main exists but shares no reachable ancestor with HEAD — the
+    // depth-1 CI checkout, where the decision-record gate fetches the ref as a
+    // shallow tip earlier in check.sh. Before that fetch this function bailed
+    // on the rev-parse above; a base the history cannot reach is the same
+    // condition, so it degrades the same way rather than crashing the gate.
+    return null;
+  }
   try {
     return execFileSync("git", ["show", `${base}:${WORKER_SCHEMA}`], { encoding: "utf8" });
   } catch {

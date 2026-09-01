@@ -9532,6 +9532,34 @@ fn validate_measure_declarations(
     }
 }
 
+/// The resource a cycle turns through, when it turns through a resource and no
+/// fact at all (the `tracker:<name>` edges of DR-0085).
+///
+/// A ring with even one schema edge is a fact ring: it has a token a measure can
+/// speak about, so an unproven one is either the analysis being too weak or the
+/// program being unbounded, and both are already reported. A ring with none has
+/// no token at all — what goes round is work in a queue.
+fn resource_only_cycle(ir: &IrProgram, component: &[usize]) -> Option<String> {
+    let names = component
+        .iter()
+        .map(|member| ir.rules[*member].name.as_str())
+        .collect::<BTreeSet<_>>();
+    let mut resource = None;
+    for dependency in &ir.rule_dependencies {
+        if !names.contains(dependency.producer.as_str())
+            || !names.contains(dependency.consumer.as_str())
+        {
+            continue;
+        }
+        match dependency.fact.split_once(':') {
+            Some(("schema", _)) => return None,
+            Some((_, name)) => resource = Some(name.to_owned()),
+            None => {}
+        }
+    }
+    resource
+}
+
 /// Reject an effect-bearing rule cycle that turns without waiting on the world
 /// (`graph.unbounded_effect_recursion`), and any effect-bearing cycle at all in
 /// a workflow that declares itself `@bounded` (`graph.bounded_workflow_effect_cycle`).
@@ -9587,11 +9615,17 @@ fn validate_measure_declarations(
 fn validate_effectful_rule_recursion(
     ir: &IrProgram,
     diagnostics: &mut Vec<Diagnostic>,
+    warnings: &mut Vec<Diagnostic>,
 ) -> (Vec<IrMeasure>, BTreeSet<String>) {
     let mut measures = Vec::new();
     let mut cycle_classes = BTreeSet::new();
     let rules = &ir.rules;
-    if rules.len() < 2 {
+    // One rule is enough for a cycle since #313 made self-edges count. The old
+    // `< 2` was written when they did not, and it hid a real shape: a single
+    // rule fed by a TRACKER loops on itself with no second rule anywhere, and a
+    // fact-fed one needs a producer only because a `table` lowers to a rule of
+    // its own. A lone rule with a self-edge escaped the analysis entirely.
+    if rules.is_empty() {
         return (measures, cycle_classes);
     }
     let index_of = rules
@@ -9757,6 +9791,45 @@ fn validate_effectful_rule_recursion(
                         .to_owned(),
                 ),
             }),
+            // A ring that turns through a RESOURCE and nothing else: work
+            // returned to a tracker, matched again, returned again. It is legal
+            // — a worker that runs as long as the world gives it work is the
+            // point of the language — and it is also how a review loop runs
+            // forever when no verdict settles it, which the source does not show.
+            //
+            // A warning rather than a refusal, because the two are
+            // indistinguishable here and only one is a mistake. It names the
+            // pattern that bounds it, because the pattern is not discoverable:
+            // an item comes back from `release` in the state it left and carries
+            // no count of its own, so the count has to live in a fact beside it.
+            measure::MeasureOutcome::None => {
+                // Not under `@bounded`, where the ring is already an error. The
+                // nudge's advice — that a loop running as long as work arrives
+                // is fine — is the opposite of what that declaration says, and
+                // one mistake earns one diagnostic.
+                if let Some(resource) = resource_only_cycle(ir, &component)
+                    .filter(|_| !bounded_workflow)
+                {
+                    warnings.push(Diagnostic {
+                        code: diagnostic_code!("graph.unmeasured_resource_cycle"),
+                        severity: Severity::Warning,
+                        related: Vec::new(),
+                        span: rules[component[0]]
+                            .whens
+                            .first()
+                            .map(|when| when.span)
+                            .unwrap_or(SourceSpan { start: 0, end: 0 }),
+                        message: format!(
+                            "rule cycle {} returns work to `{resource}` and nothing bounds it",
+                            names.join(" -> ")
+                        ),
+                        suggestion: Some(
+                            "if it is meant to run for as long as work arrives, nothing is wrong. If it is meant to stop, carry the count in a fact beside the item — `when Attempt as a where a.n < 3 and a.id == issue.id`, advanced with `done a -> record Attempt { n a.n + 1 }` on each turn — because an item returns from `release` in the state it left and carries no count of its own"
+                                .to_owned(),
+                        ),
+                    });
+                }
+            }
             _ => {}
         }
     }

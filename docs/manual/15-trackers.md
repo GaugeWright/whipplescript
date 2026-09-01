@@ -349,6 +349,72 @@ workflow is durable work in the queue of the person. The answer of the person
 is durable work in the queue of the workflow. The two items continue after a
 restart, show in the `whip issue list` output, and carry provenance.
 
+## A loop that returns work, and how to bound it
+
+A review loop returns work to the tracker. The rule claims a ready issue, asks
+an agent, and on a verdict of `"revise"` it releases the issue. The issue is
+ready again, the rule matches it again, and the loop continues.
+
+Such a loop has no end of its own. The `release` statement returns an issue in
+the state that the issue left, so the issue carries no count of the turns. The
+only thing that stops the loop is a verdict of `"merge"`, and nothing in the
+program requires one to arrive. The compiler says so:
+
+```text
+warning: rule cycle review -> review returns work to `backlog` and nothing bounds it
+```
+
+The warning is not an error. A worker that runs for as long as work arrives is
+the shape of a service, and the compiler cannot tell that shape from a review
+loop that never settles. It tells you which one you wrote, and leaves the choice
+to you.
+
+**To bound the loop, carry the count in a fact beside the item.** The tracker
+holds the work. A fact holds the number of turns that the work has taken.
+
+```whipplescript
+rule review
+  when backlog has ready issue as issue
+  when Attempt as a where a.n < 3 and a.id == issue.id
+=> {
+  claim issue as claimed
+
+  after claimed completes {
+    tell reviewer "{{ issue.title }}" as turn
+
+    after turn completes {
+      release issue
+
+      done a -> record Attempt {
+        id a.id
+        n a.n + 1
+      }
+    }
+  }
+}
+```
+
+The guard of the second `when` clause is the bound. The `done` statement
+advances it. The rule is the retry of chapter 13 with the tracker in place of
+the effect, and the compiler proves it in the same way:
+
+```text
+measures
+  review -> review: a.n rises by 1 toward 3 (step-bounded, bounded by rule `review`)
+```
+
+The `a.id == issue.id` part of the guard is what makes the bound belong to the
+ticket. Without it, one `Attempt` fact bounds the rule as a whole, and three
+turns of any ticket stop the work of every other. With it, each ticket carries
+its own three turns.
+
+Two properties of the pattern deserve a note. A rule needs both of its `when`
+clauses, so an issue that reaches the tracker with no `Attempt` fact beside it
+is never worked. File the fact where you file the issue. And the compiler cannot
+check that the count you carry is the count of anything: a rule that reads the
+fact and forgets to advance it compiles, and loops. What the compiler proves is
+that the fact descends, not that it counts what you meant.
+
 ## Where next
 
 A tracker moves work between participants that share a workspace. Chapter 16

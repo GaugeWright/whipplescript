@@ -12450,6 +12450,118 @@ rule poll
     );
 }
 
+/// A ring that turns through a tracker and no fact at all has no token a measure
+/// can speak about — an item comes back from `release` in the state it left. The
+/// loop is legal, because a worker that runs as long as work arrives is the
+/// point, and it is also how a review loop runs forever. The compiler cannot
+/// tell those apart, so it says which shape was written and names the pattern
+/// that bounds it.
+#[test]
+fn an_unbounded_resource_cycle_is_named() {
+    let release_loop = r#"
+@service
+workflow ReviewLoop
+use std.tracker
+
+tracker backlog { provider builtin }
+
+agent reviewer { provider fixture  profile "repo-writer"  capacity 1 }
+
+rule review
+  when backlog has ready issue as issue
+=> {
+  claim issue as claimed
+
+  after claimed completes {
+    tell reviewer "{{ issue.title }}" as turn
+
+    after turn completes {
+      release issue
+    }
+  }
+}
+"#;
+    let compiled = compile_program(release_loop);
+    assert!(
+        compiled.warnings.iter().any(|warning| {
+            warning.code.as_str() == "graph.unmeasured_resource_cycle"
+                && warning
+                    .message
+                    .contains("returns work to `backlog` and nothing bounds it")
+        }),
+        "{:?}",
+        compiled.warnings
+    );
+
+    // A worker that only finishes has no cycle at all: `finish` takes work out
+    // of ready, so nothing returns and there is nothing to warn about.
+    let drain = compile_program(
+        &release_loop.replace("release issue", "finish issue { summary \"done\" }"),
+    );
+    assert!(
+        !drain
+            .warnings
+            .iter()
+            .any(|warning| warning.code.as_str() == "graph.unmeasured_resource_cycle"),
+        "a draining worker is not a loop: {:?}",
+        drain.warnings
+    );
+}
+
+/// And the pattern the warning names actually works: a fact beside the item
+/// carries the count, correlated so the bound belongs to the ticket rather than
+/// to the rule. The ring becomes a fact ring, the measure proves it, and the
+/// warning goes quiet.
+#[test]
+fn a_fact_beside_the_item_bounds_a_resource_loop() {
+    let source = r#"
+@service
+workflow BoundedReview
+use std.tracker
+
+class Attempt { id string  n int }
+
+tracker backlog { provider builtin }
+
+table counters as Attempt [ { id "i1"  n 0 } ]
+
+agent reviewer { provider fixture  profile "repo-writer"  capacity 1 }
+
+rule review
+  when backlog has ready issue as issue
+  when Attempt as a where a.n < 3 and a.id == issue.id
+=> {
+  claim issue as claimed
+
+  after claimed completes {
+    tell reviewer "{{ issue.title }}" as turn
+
+    after turn completes {
+      release issue
+
+      done a -> record Attempt { id a.id  n a.n + 1 }
+    }
+  }
+}
+"#;
+    let compiled = compile_program(source);
+    let ir = compiled.ir.expect("the bounded shape compiles");
+    assert!(
+        ir.to_snapshot()
+            .contains("a.n rises by 1 toward 3 (step-bounded"),
+        "{}",
+        ir.to_snapshot()
+    );
+    assert!(
+        !compiled
+            .warnings
+            .iter()
+            .any(|warning| warning.code.as_str() == "graph.unmeasured_resource_cycle"),
+        "a bounded loop must not be nudged: {:?}",
+        compiled.warnings
+    );
+}
+
 /// The termination argument `docs/manual/04-rules.md` teaches before it teaches
 /// a counter: a ticket goes `"queued" -> "routed"` and the ring stops, not
 /// because a number descends but because the status will not be `"queued"`
