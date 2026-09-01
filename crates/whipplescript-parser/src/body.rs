@@ -877,6 +877,22 @@ pub struct AfterBlock {
 impl AfterPredicate {
     /// The kernel text-scanner's spelling of this predicate (what
     /// `after <binding> <predicate>` looks like in body text).
+    /// DR-0088: the arm predicate in the spelling an EFFECT KEY is built from,
+    /// which is neither of the other two.
+    ///
+    /// `kernel_str` renders the source spelling (`times out`, two tokens) and
+    /// `as_str` the display one. The key folds the two-token predicate to
+    /// `times_out` so its parts stay single tokens
+    /// (`whipplescript_kernel::rule_lowering::parse_after_header`). `Reaches`
+    /// returns the bare keyword; the caller appends `:<milestone>` from
+    /// `AfterBlock::milestone`, because the name is not on this enum.
+    pub fn arm_key_str(&self) -> &'static str {
+        match self {
+            AfterPredicate::TimedOut => "times_out",
+            other => other.kernel_str(),
+        }
+    }
+
     pub fn kernel_str(&self) -> &'static str {
         match self {
             AfterPredicate::Succeeds => "succeeds",
@@ -3837,7 +3853,7 @@ impl<'a> BodyParser<'a> {
             }));
         }
         // A duration-typed path waits for a length the fact carries, which is
-        // what makes a stored duration usable at all (DR-0087 §Slices 4). The
+        // what makes a stored duration usable at all (DR-0088 §Slices 4). The
         // value is resolved when the rule fires; `duration_seconds` stays zero
         // because there is no compile-time answer.
         if let Some(Tok::Ident(path)) = self.peek().map(|t| t.tok.clone()) {

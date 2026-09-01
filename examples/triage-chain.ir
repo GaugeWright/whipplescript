@@ -44,7 +44,7 @@ rules
       schema:Ticket
     effects
       __then_plan kind=agent.tell binding=__then_plan key=b2f4e606aea9c1ba39c518de46a5e5f6
-      __then_signoff kind=schema.coerce binding=__then_signoff key=1b7b322ee80097a719e1f253b29c9dba
+      __then_signoff kind=schema.coerce binding=__then_signoff key=1b7b322ee80097a719e1f253b29c9dba arm=__then_plan:succeeds
     dependencies
       __then_plan --succeeds--> __then_signoff
     case_branches

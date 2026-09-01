@@ -37,6 +37,14 @@ pub struct SnapshotEffect {
     /// The derived effect key. Static per program version; a firing's actual
     /// effect id is not this.
     pub key: String,
+    /// DR-0088: the enclosing `after` arm as `(binding, predicate)`, or `None`
+    /// for an effect at the rule's top level.
+    ///
+    /// This is what makes a continuation effect id recomputable from the stored
+    /// snapshot alone. The `dependencies` edge cannot stand in for it: it
+    /// records the completion-shaped predicate, so a lease arm reads
+    /// `completes` there and `held` here, and only the latter is in the key.
+    pub arm: Option<(String, String)>,
 }
 
 /// One rule's structure.
@@ -101,6 +109,11 @@ fn parse_effect(line: &str) -> Option<SnapshotEffect> {
             .get("key")
             .map(|k| (*k).to_string())
             .unwrap_or_default(),
+        arm: fields.get("arm").and_then(|value| {
+            value
+                .split_once(':')
+                .map(|(binding, predicate)| (binding.to_owned(), predicate.to_owned()))
+        }),
     })
 }
 
@@ -223,6 +236,26 @@ mod tests {
             .expect("effect7");
         assert_eq!(unbound.binding, None);
         assert_eq!(unbound.kind, "tracker.finish");
+
+        // DR-0088: the arm the effect key is built from. The dependency edge
+        // for this pair says `completes`; the key says `held`, and only one of
+        // those reproduces the id.
+        assert_eq!(
+            turn.arm,
+            Some(("slot".to_owned(), "held".to_owned())),
+            "the lease arm survives as written, not as the edge collapses it"
+        );
+        let root = rule
+            .effects
+            .iter()
+            .find(|effect| effect.id == "claimed")
+            .expect("claimed effect");
+        assert_eq!(root.arm, None, "a top-level effect has no arm");
+        assert!(rule.dependencies.contains(&(
+            "slot".to_owned(),
+            "completes".to_owned(),
+            "turn".to_owned()
+        )));
 
         assert!(rule.dependencies.contains(&(
             "claimed".to_owned(),

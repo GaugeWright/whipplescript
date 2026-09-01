@@ -34,10 +34,10 @@ rules
       schema:ReviewedWork
     effects
       active_claim kind=tracker.claim binding=active_claim key=f9b8e615dc6b0001a3b1a9d844181da3
-      turn kind=agent.tell binding=turn key=646546e2b1b8aa39e978f44def9967a2
-      review kind=schema.coerce binding=review key=c11847c6fd4d8d7e6daf04ebfb49ff68
-      effect4 kind=tracker.finish binding=- key=28a4c3372ca9812f259710ce95997e91
-      effect5 kind=tracker.release binding=- key=23385968a426d985a6f3faf2c50da4bc
+      turn kind=agent.tell binding=turn key=646546e2b1b8aa39e978f44def9967a2 arm=active_claim:succeeds
+      review kind=schema.coerce binding=review key=c11847c6fd4d8d7e6daf04ebfb49ff68 arm=turn:succeeds
+      effect4 kind=tracker.finish binding=- key=28a4c3372ca9812f259710ce95997e91 arm=review:succeeds
+      effect5 kind=tracker.release binding=- key=23385968a426d985a6f3faf2c50da4bc arm=review:fails
     dependencies
       active_claim --succeeds--> turn
       turn --succeeds--> review

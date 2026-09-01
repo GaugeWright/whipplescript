@@ -49,7 +49,7 @@ rules
       schema:Hypothesis
     effects
       budget kind=counter.consume binding=budget key=40a647a96303801f2652699a5f494e3d
-      metric kind=exec.command binding=metric key=5bb1c65c9c5f791e31c058d5f6c6a97e
+      metric kind=exec.command binding=metric key=5bb1c65c9c5f791e31c058d5f6c6a97e arm=budget:ok
     dependencies
       budget --completes--> metric
     body_hash c48222fe2596671a93061d32141e8ef4

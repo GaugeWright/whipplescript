@@ -2270,6 +2270,16 @@ pub struct IrEffectNode {
     pub id: String,
     pub kind: IrEffectKind,
     pub binding: Option<String>,
+    /// DR-0088: the innermost enclosing `after` arm, as
+    /// `(binding, arm predicate)`, or `None` for an effect at the rule's top
+    /// level.
+    ///
+    /// This is what an effect key is built from for a continuation effect, and
+    /// nothing else in the IR carries it: the `dependencies` edge collapses
+    /// `held` and `contended` to `completes`, so a reader holding only the
+    /// stored `.ir` could recompute a root effect id and not a continuation
+    /// one — which is most of them.
+    pub after_arm: Option<(String, String)>,
     pub required_capabilities: Vec<String>,
     pub construct_use: Option<IrConstructUse>,
     pub idempotency_key: String,
@@ -2674,6 +2684,8 @@ enum BlockFrame {
     After {
         binding: String,
         predicate: DependencyPredicate,
+        /// DR-0088: the arm predicate in the effect key's spelling.
+        arm: String,
     },
 }
 
@@ -2684,7 +2696,7 @@ enum LiteralExpr<'a> {
     Bool,
     Null,
     Ident(&'a str),
-    /// `<integer><unit>`, as its whole number of seconds (DR-0087 §1).
+    /// `<integer><unit>`, as its whole number of seconds (DR-0088 §1).
     Duration(i64),
 }
 
@@ -2767,7 +2779,7 @@ pub enum ExprLiteral {
     Bool(bool),
     Null,
     Ident(String),
-    /// A `<integer><unit>` literal as its whole number of seconds (DR-0087 §1).
+    /// A `<integer><unit>` literal as its whole number of seconds (DR-0088 §1).
     /// It renders canonically wherever it is written down, so the value and its
     /// stored form cannot disagree.
     Duration(i64),
@@ -2881,7 +2893,7 @@ impl ExprLiteral {
             Self::Bool(value) => value.to_string(),
             Self::Null => "null".to_owned(),
             // The canonical spelling, so a snapshot shows the value rather than
-            // the way it happened to be typed (DR-0087 §2).
+            // the way it happened to be typed (DR-0088 §2).
             Self::Duration(seconds) => canonical_duration(*seconds),
         }
     }
@@ -4510,10 +4522,18 @@ impl IrProgram {
                         } else {
                             format!(" skills={}", effect.turn_skills.join(","))
                         };
+                        // DR-0088: the arm this effect sits in, appended only
+                        // when there is one, so a top-level effect keeps its
+                        // existing snapshot shape.
+                        let arm = effect
+                            .after_arm
+                            .as_ref()
+                            .map(|(binding, predicate)| format!(" arm={binding}:{predicate}"))
+                            .unwrap_or_default();
                         push_line(
                             &mut snapshot,
                             format!(
-                                "      {} kind={} binding={}{} key={}{}{}{}",
+                                "      {} kind={} binding={}{} key={}{}{}{}{}",
                                 effect.id,
                                 effect.kind.as_str(),
                                 binding,
@@ -4521,7 +4541,8 @@ impl IrProgram {
                                 effect.idempotency_key,
                                 grants,
                                 skills,
-                                homing
+                                homing,
+                                arm
                             ),
                         );
                     }
@@ -12275,8 +12296,12 @@ fn analyze_rule(
             // containing a brace made it report a predicate fault on a line the
             // parser accepts. The scanner keeps only the job the parser cannot
             // do for it, tracking the block stack.
-            if let Some((binding, predicate)) = parse_after_line(line) {
-                block_stack.push(BlockFrame::After { binding, predicate });
+            if let Some((binding, predicate, arm)) = parse_after_line(line) {
+                block_stack.push(BlockFrame::After {
+                    binding,
+                    predicate,
+                    arm,
+                });
             }
             continue;
         }
@@ -12323,10 +12348,16 @@ fn analyze_rule(
                 });
             }
             let idempotency_key = effect_idempotency_key(&rule.name.name, &id, &kind, &binding);
+            // Innermost enclosing arm: the block that actually lowers this
+            // effect, which is the one the kernel keys on.
+            let after_arm = block_stack.last().map(|frame| match frame {
+                BlockFrame::After { binding, arm, .. } => (binding.clone(), arm.clone()),
+            });
             metadata.effects.push(IrEffectNode {
                 id,
                 kind,
                 binding,
+                after_arm,
                 required_capabilities: parse_required_capabilities(line),
                 construct_use: None,
                 idempotency_key,
@@ -15176,7 +15207,7 @@ fn collect_effects_from_ast(
     let mut effects = Vec::new();
     let mut dependencies = Vec::new();
     let mut counter = 0usize;
-    let mut after_stack: Vec<(String, DependencyPredicate)> = Vec::new();
+    let mut after_stack: Vec<(String, DependencyPredicate, String)> = Vec::new();
     let mut case_stack: Vec<(String, String)> = Vec::new();
     // Renew disambiguation (T3, mirroring the shipped `release` split): a
     // `renew <binding>` whose binding names a same-rule `claim <issue> as
@@ -15222,7 +15253,7 @@ fn walk_effects(
     claim_bindings: &BTreeSet<String>,
     binding_resources: &BTreeMap<String, String>,
     counter: &mut usize,
-    after_stack: &mut Vec<(String, DependencyPredicate)>,
+    after_stack: &mut Vec<(String, DependencyPredicate, String)>,
     case_stack: &mut Vec<(String, String)>,
     effects: &mut Vec<IrEffectNode>,
     dependencies: &mut Vec<IrEffectDependency>,
@@ -15243,7 +15274,7 @@ fn walk_effects(
                     } if claim_bindings.contains(acquire_binding) => IrEffectKind::TrackerRenew,
                     other => ir_effect_kind_for_body(other),
                 };
-                for (upstream, predicate) in after_stack.iter() {
+                for (upstream, predicate, _arm) in after_stack.iter() {
                     dependencies.push(IrEffectDependency {
                         upstream: upstream.clone(),
                         predicate: predicate.clone(),
@@ -15284,6 +15315,9 @@ fn walk_effects(
                     id,
                     kind,
                     binding: effect.binding.clone(),
+                    after_arm: after_stack
+                        .last()
+                        .map(|(binding, _, arm)| (binding.clone(), arm.clone())),
                     required_capabilities,
                     construct_use,
                     idempotency_key,
@@ -15336,7 +15370,13 @@ fn walk_effects(
                     // metadata only.
                     body::AfterPredicate::Reaches => DependencyPredicate::Completes,
                 };
-                after_stack.push((after.binding.clone(), predicate));
+                // DR-0088: the arm the key is built from, alongside the
+                // completion-shaped dependency predicate.
+                let arm = match (&after.predicate, &after.milestone) {
+                    (body::AfterPredicate::Reaches, Some(name)) => format!("reaches:{name}"),
+                    (predicate, _) => predicate.arm_key_str().to_owned(),
+                };
+                after_stack.push((after.binding.clone(), predicate, arm));
                 walk_effects(
                     &after.body,
                     rule_name,
@@ -16992,7 +17032,7 @@ fn infer_binary_type(
             ExprType::Bool
         }
         BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div => {
-            // DR-0087 §3: a duration is a length. Two lengths add and subtract,
+            // DR-0088 §3: a duration is a length. Two lengths add and subtract,
             // and a length scales by a count; anything else — dividing one, or
             // adding a number to one — is unit confusion the record rules out.
             match (op, &left_ty, &right_ty) {
@@ -17656,7 +17696,7 @@ fn active_completes_binding_for_case(lines: &[&str], case_index: usize, scrutine
     let mut scopes: Vec<(String, DependencyPredicate, i32)> = Vec::new();
     for line in lines.iter().take(case_index) {
         let trimmed = line.trim();
-        if let Some((binding, predicate)) = parse_after_line(trimmed) {
+        if let Some((binding, predicate, _arm)) = parse_after_line(trimmed) {
             scopes.push((binding, predicate, brace_delta(trimmed).max(1)));
         } else {
             let delta = brace_delta(trimmed);
@@ -18467,7 +18507,9 @@ fn after_scopes(block_stack: &[BlockFrame]) -> Vec<(String, DependencyPredicate)
     block_stack
         .iter()
         .map(|frame| match frame {
-            BlockFrame::After { binding, predicate } => (binding.clone(), predicate.clone()),
+            BlockFrame::After {
+                binding, predicate, ..
+            } => (binding.clone(), predicate.clone()),
         })
         .collect()
 }
@@ -24961,7 +25003,7 @@ fn parse_literal_expr(expr: &str) -> Option<LiteralExpr<'_>> {
     }
     // `30s` in a table row or a record body is the same literal the expression
     // lexer reads, so a seed and a computed value cannot disagree about what a
-    // duration is (DR-0087 §1).
+    // duration is (DR-0088 §1).
     if let Some(unit) = expr.chars().last() {
         if matches!(unit, 's' | 'm' | 'h' | 'd') {
             let digits = &expr[..expr.len() - unit.len_utf8()];
@@ -25008,7 +25050,7 @@ enum ExprTokenKind {
     String(String),
     Number(String),
     /// `<integer><unit>` with units `s`, `m`, `h`, `d` (spec/time.md), as its
-    /// whole number of seconds (DR-0087 §1).
+    /// whole number of seconds (DR-0088 §1).
     Duration(i64),
     Symbol(char),
     Op(&'static str),
@@ -25239,7 +25281,7 @@ impl<'a> ExprParser<'a> {
                 // only welds WHOLE digits to a unit. Saying so beats the generic
                 // parse error a stranded `s` would otherwise produce: a duration
                 // is a whole number of seconds, and rounding the value someone
-                // wrote is not the compiler's decision to make (DR-0087 §1).
+                // wrote is not the compiler's decision to make (DR-0088 §1).
                 if value.contains('.') {
                     if let Some(ExprTokenKind::Ident(unit)) = self.peek().map(|t| t.kind.clone()) {
                         if matches!(unit.as_str(), "s" | "m" | "h" | "d") {
@@ -25473,7 +25515,7 @@ fn lex_expr(source: &str) -> Vec<ExprToken> {
             let digits = &source[start..index];
             // A duration literal is the number with its unit welded on, and the
             // unit must not run into an identifier: `30s` is thirty seconds,
-            // `30slots` is not a duration at all (spec/time.md, DR-0087 §1).
+            // `30slots` is not a duration at all (spec/time.md, DR-0088 §1).
             let unit = bytes.get(index).copied();
             let unit_ends_token = bytes
                 .get(index + 1)
@@ -25887,7 +25929,21 @@ pub fn binding_after_as(line: &str) -> Option<String> {
     None
 }
 
-fn parse_after_line(line: &str) -> Option<(String, DependencyPredicate)> {
+/// The `(binding, dependency predicate, arm predicate)` of an `after` header.
+///
+/// The third value is DR-0088's addition and is not a synonym for the second.
+/// The dependency predicate is completion-shaped — `held`, `contended`, `ok`,
+/// `over` and their siblings all collapse to `Completes`, because the runtime
+/// gates them all on a terminal arriving. The ARM predicate is the token the
+/// author wrote, in the spelling the effect key is built from
+/// (`whipplescript_kernel::rule_lowering::parse_after_header`): `times out`
+/// folds to `times_out`, `reaches "<name>"` folds to `reaches:<name>`, and
+/// every other arm is its own token.
+///
+/// Keeping only the collapsed form is what made a stored `.ir` unable to
+/// recompute a continuation effect id: the snapshot said
+/// `slot --completes--> turn` while the key was built from `held`.
+fn parse_after_line(line: &str) -> Option<(String, DependencyPredicate, String)> {
     let rest = line.strip_prefix("after ")?;
     if rest.contains("=>") {
         return None;
@@ -25895,22 +25951,40 @@ fn parse_after_line(line: &str) -> Option<(String, DependencyPredicate)> {
     let before_body = rest.split('{').next().unwrap_or(rest).trim();
     let mut parts = before_body.split_whitespace();
     let binding = parts.next()?.to_owned();
+    let mut arm = String::new();
     let predicate = match parts.next()? {
-        "succeeds" => DependencyPredicate::Succeeds,
-        "fails" => DependencyPredicate::Fails,
+        "succeeds" => {
+            arm.push_str("succeeds");
+            DependencyPredicate::Succeeds
+        }
+        "fails" => {
+            arm.push_str("fails");
+            DependencyPredicate::Fails
+        }
         // `times out` / `cancelled` react only to that specific non-success
         // terminal status (spec/expression-kernel.md), mirroring succeeds/fails.
-        "cancelled" => DependencyPredicate::Cancelled,
+        "cancelled" => {
+            arm.push_str("cancelled");
+            DependencyPredicate::Cancelled
+        }
         "times" => {
             if parts.next()? != "out" {
                 return None;
             }
+            // The kernel's key spells the two-token predicate `times_out`.
+            arm.push_str("times_out");
             DependencyPredicate::TimedOut
         }
         // Coordination outcomes (spec/coordination.md) are completion-valued;
         // the arm dispatch happens on the outcome variant at lowering.
-        "completes" | "held" | "contended" | "ok" | "over" | "promoted" | "conflicted"
-        | "applied" | "stranded" => DependencyPredicate::Completes,
+        token @ ("completes" | "held" | "contended" | "ok" | "over" | "promoted" | "conflicted"
+        | "applied" | "stranded") => {
+            // The arm survives here where the dependency predicate does not:
+            // all of these gate on a terminal, so the edge is `Completes`, but
+            // the key is built from the token the author wrote.
+            arm.push_str(token);
+            DependencyPredicate::Completes
+        }
         // `after p reaches "<name>" [as m]` (Family C): consume the quoted
         // milestone name (which may contain whitespace — token-splitting used
         // to reject multi-word names); the IR predicate is completion-shaped
@@ -25927,7 +26001,12 @@ fn parse_after_line(line: &str) -> Option<(String, DependencyPredicate)> {
                 (Some("as"), Some(alias), None) if is_identifier(alias) => {}
                 _ => return None,
             }
-            return Some((binding, DependencyPredicate::Completes));
+            let milestone = &quoted[..close];
+            return Some((
+                binding,
+                DependencyPredicate::Completes,
+                format!("reaches:{milestone}"),
+            ));
         }
         _ => return None,
     };
@@ -25936,7 +26015,7 @@ fn parse_after_line(line: &str) -> Option<(String, DependencyPredicate)> {
         (Some("as"), Some(alias), None) if is_identifier(alias) => {}
         _ => return None,
     }
-    Some((binding, predicate))
+    Some((binding, predicate, arm))
 }
 
 pub(crate) fn is_identifier(value: &str) -> bool {
@@ -25970,7 +26049,7 @@ pub(crate) fn stable_hash(value: &str) -> String {
 /// `<integer><unit>` as its whole number of seconds, or `None` when the digits
 /// carry a fraction.
 ///
-/// A duration is a whole number of seconds (DR-0087 §1), so `1.5s` is not a
+/// A duration is a whole number of seconds (DR-0088 §1), so `1.5s` is not a
 /// duration this language can hold — it is refused as a literal rather than
 /// rounded, because rounding a value the author wrote is a decision the compiler
 /// has no business making quietly.
@@ -25986,7 +26065,7 @@ pub fn duration_literal_seconds(digits: &str, unit: char) -> Option<i64> {
     count.checked_mul(multiplier)
 }
 
-/// The one spelling of a duration (DR-0087 §2): `PT<n>S`, so two ways of writing
+/// The one spelling of a duration (DR-0088 §2): `PT<n>S`, so two ways of writing
 /// the same length are one value, and therefore one fact under content
 /// addressing.
 pub fn canonical_duration(seconds: i64) -> String {

@@ -21,8 +21,8 @@ rules
       pattern:implementer is available
     effects
       active_claim kind=tracker.claim binding=active_claim key=cb7e25b5f2da26b1bc15c393c7d59caa
-      turn kind=agent.tell binding=turn key=1f5a5a19ebbebe916906b261da56ffe7
-      effect3 kind=tracker.finish binding=- key=f5f36187e872a4bca8c5e26289b35ad1
+      turn kind=agent.tell binding=turn key=1f5a5a19ebbebe916906b261da56ffe7 arm=active_claim:succeeds
+      effect3 kind=tracker.finish binding=- key=f5f36187e872a4bca8c5e26289b35ad1 arm=turn:succeeds
     dependencies
       active_claim --succeeds--> turn
       turn --succeeds--> effect3

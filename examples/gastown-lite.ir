@@ -61,14 +61,14 @@ rules
       schema:MergeRecord
     effects
       claimed kind=tracker.claim binding=claimed key=ea89cbaf03db98ca1752806578c92108
-      slot kind=lease.acquire binding=slot key=b49f59f40d86864795918debcb703c8f
-      turn kind=agent.tell binding=turn key=703adb3084d862acbb29fb95914ee41b
-      effect4 kind=tracker.release binding=- key=774301c99cf55083c80f3daf2b382776
-      review kind=schema.coerce binding=review key=2b7bcdf94cc0b6f1a9949e8c06121470
-      log_entry kind=ledger.append binding=log_entry key=cff8c48b12170d938db4dca84b4c53ec
-      effect7 kind=tracker.finish binding=- key=73f2857ebc87383ff27d61a0e0b5a419
-      effect8 kind=tracker.release binding=- key=341e2484f8794650a07e0e655bd1d536
-      effect9 kind=tracker.release binding=- key=656c54c42411e2993e0713acd35295cb
+      slot kind=lease.acquire binding=slot key=b49f59f40d86864795918debcb703c8f arm=claimed:succeeds
+      turn kind=agent.tell binding=turn key=703adb3084d862acbb29fb95914ee41b arm=slot:held
+      effect4 kind=tracker.release binding=- key=774301c99cf55083c80f3daf2b382776 arm=slot:contended
+      review kind=schema.coerce binding=review key=2b7bcdf94cc0b6f1a9949e8c06121470 arm=turn:succeeds
+      log_entry kind=ledger.append binding=log_entry key=cff8c48b12170d938db4dca84b4c53ec arm=review:succeeds
+      effect7 kind=tracker.finish binding=- key=73f2857ebc87383ff27d61a0e0b5a419 arm=log_entry:succeeds
+      effect8 kind=tracker.release binding=- key=341e2484f8794650a07e0e655bd1d536 arm=log_entry:succeeds
+      effect9 kind=tracker.release binding=- key=656c54c42411e2993e0713acd35295cb arm=log_entry:succeeds
     dependencies
       claimed --succeeds--> slot
       slot --completes--> turn

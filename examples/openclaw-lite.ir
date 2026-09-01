@@ -46,9 +46,9 @@ rules
       schema:Plan
     effects
       context kind=capability.call binding=context key=7f1b4ae835c680dd269eda813cae3511
-      planTurn kind=agent.tell binding=planTurn key=160376d1d7d8cb740b2612cdc88f11a4
-      effect3 kind=tracker.file binding=- key=33c89ee6807957a9839dd51516715552
-      effect4 kind=capability.call binding=- key=1c03939441cac35a45777eabf4e20762
+      planTurn kind=agent.tell binding=planTurn key=160376d1d7d8cb740b2612cdc88f11a4 arm=context:succeeds
+      effect3 kind=tracker.file binding=- key=33c89ee6807957a9839dd51516715552 arm=planTurn:succeeds
+      effect4 kind=capability.call binding=- key=1c03939441cac35a45777eabf4e20762 arm=planTurn:succeeds
     dependencies
       context --succeeds--> planTurn
       planTurn --succeeds--> effect3

@@ -89,7 +89,7 @@ rules
       schema:LanguageTask
     effects
       turn kind=agent.tell binding=turn key=b867a0da93c5077c90efeb97c439473d
-      review kind=schema.coerce binding=review key=fe26f09ff7ce5e7067bb0c63ca5cb30d
+      review kind=schema.coerce binding=review key=fe26f09ff7ce5e7067bb0c63ca5cb30d arm=turn:succeeds
     dependencies
       turn --succeeds--> review
     body_hash d30739fe485aa5a6f2e8aa757ab42a85

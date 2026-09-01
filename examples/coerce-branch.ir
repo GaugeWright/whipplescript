@@ -26,8 +26,8 @@ rules
       schema:ClassifiedMessage
     effects
       active_claim kind=tracker.claim binding=active_claim key=3d04fedec851786f38bf4e8fe5acc9e2
-      classification kind=schema.coerce binding=classification key=44afbf47e063e5764d019b64e8b18e22
-      effect3 kind=tracker.file binding=- key=eb527750949abe45eecc99a09085da09
+      classification kind=schema.coerce binding=classification key=44afbf47e063e5764d019b64e8b18e22 arm=active_claim:succeeds
+      effect3 kind=tracker.file binding=- key=eb527750949abe45eecc99a09085da09 arm=classification:fails
     dependencies
       active_claim --succeeds--> classification
       classification --fails--> effect3
