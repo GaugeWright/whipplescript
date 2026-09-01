@@ -1,0 +1,21 @@
+load ../duration-arithmetic.maude
+
+--- Bite: subtracting a longer length from a shorter one never derives a
+--- negative duration. This is the saturation, and it is the whole reason
+--- subtraction is total rather than fallible.
+search [1] in WHIPPLESCRIPT-DURATION-ARITHMETIC :
+  check(minus(secs(10), secs(30))) =>* negative RESIDUAL:Cfg .
+
+--- Bite: nor does any chain of them.
+search [1] in WHIPPLESCRIPT-DURATION-ARITHMETIC :
+  check(minus(minus(secs(60), secs(45)), secs(30))) =>* negative RESIDUAL:Cfg .
+
+--- Coverage: saturation is a floor, not a silence — the ordinary case still
+--- computes.
+search [1] in WHIPPLESCRIPT-DURATION-ARITHMETIC :
+  check(minus(secs(60), secs(30))) =>* check(secs(30)) .
+
+--- Coverage: two spellings of one length are one value. Sixty seconds is sixty
+--- seconds however it was written, which is what makes duration facts dedup.
+search [1] in WHIPPLESCRIPT-DURATION-ARITHMETIC :
+  check(secs(canonical(plus(secs(30), secs(30))))) =>* check(secs(60)) .

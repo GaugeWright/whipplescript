@@ -1,0 +1,52 @@
+--- Duration arithmetic, per DR-0087. A duration is a whole number of seconds,
+--- one canonical spelling per value, and positive.
+---
+--- The two properties worth a model are the ones a reader would otherwise have
+--- to take on trust:
+---
+---   * SUBTRACTION SATURATES. A duration is a length and a negative length has
+---     no meaning here, so `a - b` with `b` larger is zero. The alternative was
+---     an operation that fails in a value position, which is how an error object
+---     reached a durable fact before #350 -- a total function cannot do that.
+---   * CANONICAL FORM IS A FUNCTION OF THE VALUE, not of the spelling. Sixty
+---     seconds written `PT1M` and written `PT60S` are one value and therefore
+---     one fact under content addressing.
+mod WHIPPLESCRIPT-DURATION-ARITHMETIC is
+  protecting INT .
+  protecting BOOL .
+
+  sorts Duration Cfg .
+
+  --- A duration is its seconds. The constructor does NOT clamp: clamping there
+  --- would be an equation whose right side is its own left side, which does not
+  --- terminate. The property lives where it belongs, in the operations, and the
+  --- searches below are the evidence that none of them can reach a negative.
+  op secs : Int -> Duration [ctor] .
+
+  op plus : Duration Duration -> Duration .
+  op minus : Duration Duration -> Duration .
+  op times : Duration Int -> Duration .
+  op canonical : Duration -> Int .
+
+  vars A B : Int .
+  var K : Int .
+
+  eq plus(secs(A), secs(B)) = secs(A + B) .
+  --- The saturation: never below zero.
+  ceq minus(secs(A), secs(B)) = secs(A - B) if A >= B .
+  ceq minus(secs(A), secs(B)) = secs(0) if A < B .
+  eq times(secs(A), K) = secs(A * K) .
+
+  --- The canonical form is the seconds, which is what makes two spellings one
+  --- value: nothing else about how it was written survives.
+  eq canonical(secs(A)) = A .
+
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+  op negative : -> Cfg [ctor] .
+  op check : Duration -> Cfg [ctor] .
+
+  --- A derived negative duration would be reachable here; the equations above
+  --- are what make it unreachable, which the searches below are the evidence for.
+  crl [negative] : check(secs(A)) => check(secs(A)) negative if A < 0 .
+endm

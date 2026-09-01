@@ -32,6 +32,10 @@ pub(crate) enum MeasureBound {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct CounterMeasure {
     pub field: String,
+    /// The field is a `duration`, so its numbers are seconds and render as the
+    /// canonical spelling — "rises by 30 toward 300" on a length says thirty of
+    /// what.
+    pub duration: bool,
     /// Positive when the field rises toward an upper bound, negative when it
     /// falls toward a lower one. The smallest step around the ring.
     pub step: i64,
@@ -84,13 +88,13 @@ impl Measure {
             Self::Counter(counter) => {
                 let direction = if counter.step > 0 { "rises" } else { "falls" };
                 let bound = match &counter.bound {
-                    MeasureBound::Literal(value) => value.to_string(),
+                    MeasureBound::Literal(value) => counter.amount(*value),
                     MeasureBound::InvariantField(field) => format!("{binding}.{field}"),
                 };
                 format!(
                     "`{binding}.{}` {direction} by {} toward {bound}",
                     counter.field,
-                    counter.step.abs()
+                    counter.amount(counter.step.abs())
                 )
             }
             Self::Domain(domain) => format!(
@@ -108,10 +112,13 @@ impl Measure {
             Self::Counter(counter) => {
                 let direction = if counter.step > 0 { "rises" } else { "falls" };
                 let bound = match &counter.bound {
-                    MeasureBound::Literal(value) => value.to_string(),
+                    MeasureBound::Literal(value) => counter.amount(*value),
                     MeasureBound::InvariantField(field) => field.clone(),
                 };
-                format!("{direction} by {} toward {bound}", counter.step.abs())
+                format!(
+                    "{direction} by {} toward {bound}",
+                    counter.amount(counter.step.abs())
+                )
             }
             Self::Domain(domain) => {
                 format!("advances through {}", domain.render_transitions())
@@ -125,7 +132,7 @@ impl Measure {
             Self::Counter(counter) => {
                 let direction = if counter.step > 0 { "rises" } else { "falls" };
                 let bound = match &counter.bound {
-                    MeasureBound::Literal(value) => value.to_string(),
+                    MeasureBound::Literal(value) => counter.amount(*value),
                     MeasureBound::InvariantField(field) => format!("{binding}.{field}"),
                 };
                 let kind = if counter.step_bounded {
@@ -136,7 +143,7 @@ impl Measure {
                 format!(
                     "{binding}.{} {direction} by {} toward {bound} ({kind}, bounded by rule `{}`)",
                     counter.field,
-                    counter.step.abs(),
+                    counter.amount(counter.step.abs()),
                     counter.bounding_rule
                 )
             }
@@ -147,6 +154,16 @@ impl Measure {
                 domain.transitions.len(),
                 domain.domain
             ),
+        }
+    }
+}
+
+impl CounterMeasure {
+    fn amount(&self, seconds: i64) -> String {
+        if self.duration {
+            crate::canonical_duration(seconds)
+        } else {
+            seconds.to_string()
         }
     }
 }
@@ -211,9 +228,17 @@ pub(crate) fn prove_cycle_measure(ir: &IrProgram, component: &[usize]) -> Measur
         let Some(fields) = classes.get(hop.in_schema.as_str()) else {
             return MeasureOutcome::None;
         };
+        // `duration` counts alongside `int` since DR-0087 made it a whole
+        // number of seconds: the well-foundedness argument is the same one, and
+        // it was only excluded while the value was float-backed.
         let ints = fields
             .iter()
-            .filter(|(_, ty)| matches!(ty, IrType::Primitive(IrPrimitiveType::Int)))
+            .filter(|(_, ty)| {
+                matches!(
+                    ty,
+                    IrType::Primitive(IrPrimitiveType::Int | IrPrimitiveType::Duration)
+                )
+            })
             .map(|(name, _)| name.clone())
             .collect::<BTreeSet<_>>();
         candidates = Some(match candidates {
@@ -390,8 +415,18 @@ fn prove_field(
     let step_bounded = matches!(bound, MeasureBound::Literal(_))
         && outside_producers_seed_literally(ir, hops, field, component);
 
+    let duration = hops.first().is_some_and(|hop| {
+        class_index(ir)
+            .get(hop.in_schema.as_str())
+            .is_some_and(|fields| {
+                fields.iter().any(|(name, ty)| {
+                    name == field && matches!(ty, IrType::Primitive(IrPrimitiveType::Duration))
+                })
+            })
+    });
     MeasureOutcome::Proven(Box::new(Measure::Counter(CounterMeasure {
         field: field.to_owned(),
+        duration,
         step,
         bound,
         bounding_rule,
@@ -676,6 +711,9 @@ fn is_field_path(expr: &Expr, binding: &str, field: &str) -> bool {
 fn integer_literal(expr: &Expr) -> Option<i64> {
     match expr {
         Expr::Literal(ExprLiteral::Number(text)) => text.parse::<i64>().ok(),
+        // A duration literal IS its whole number of seconds (DR-0087 §1), so a
+        // measure over one is the same descent over a different spelling.
+        Expr::Literal(ExprLiteral::Duration(seconds)) => Some(*seconds),
         Expr::Unary {
             op: crate::UnaryOp::Not,
             ..

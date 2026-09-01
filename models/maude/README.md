@@ -149,6 +149,11 @@ effect-cycle-pacing.maude        effect-bearing rule cycles: a same-commit ring
                                  paced ring (graph.bounded_workflow_effect_cycle);
                                  a preserved self-trigger stays with the per-rule
                                  refusal so one defect earns one diagnostic
+duration-arithmetic.maude        DR-0087: subtracting a longer duration from a
+                                 shorter one never derives a negative — the
+                                 saturation that keeps subtraction total — and a
+                                 canonical form that is a function of the value,
+                                 so two spellings of one length are one fact
 termination-measure.maude        DR-0081 §2, both measures: a ring that
                                  advances in one direction, is bounded
                                  somewhere, and consumes its token is admitted

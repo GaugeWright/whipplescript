@@ -12280,12 +12280,9 @@ rule step
     };
 
     // Every operand type the runtime cannot add, refused where it is written.
-    for (field, expr) in [
-        ("s", "k.s + k.s"),
-        ("b", "k.b + k.b"),
-        ("d", "k.d + k.d"),
-        ("n", "k.n + k.d"),
-    ] {
+    // `duration + duration` is NOT among them since DR-0087: two lengths add,
+    // and the case below asserts that they do.
+    for (field, expr) in [("s", "k.s + k.s"), ("b", "k.b + k.b"), ("n", "k.n + k.d")] {
         let compiled = compile_program(&program(field, expr));
         assert!(
             compiled
@@ -12297,9 +12294,12 @@ rule step
         );
     }
 
-    // And arithmetic that the runtime CAN do is untouched.
+    // And arithmetic that the runtime CAN do is untouched — including the
+    // duration arithmetic DR-0087 added, where two lengths make a length.
     let numeric = compile_program(&program("n", "k.n + 1"));
     assert!(numeric.ir.is_some(), "{:?}", numeric.diagnostics);
+    let durations = compile_program(&program("d", "k.d + k.d"));
+    assert!(durations.ir.is_some(), "{:?}", durations.diagnostics);
 }
 
 /// The same check reaches a terminal payload and a milestone, because each
@@ -12330,6 +12330,123 @@ rule finish
             .any(|diagnostic| diagnostic.code.as_str() == "expr.non_numeric_operand"),
         "{:?}",
         compiled.diagnostics
+    );
+}
+
+/// DR-0087: a duration becomes a value the language can hold. `spec/time.md`
+/// specified the `<integer><unit>` literal and nothing built it, so a program
+/// could declare a `duration` field and then neither compute with it nor wait
+/// for it.
+#[test]
+fn a_duration_literal_is_a_value() {
+    let source = r#"
+workflow DurationLiteral
+output result Report
+
+class Report { total duration }
+class Task { wait duration }
+
+table seeds as Task [ { wait 30s } ]
+
+rule step
+  when Task as t where t.wait < 5m
+=> {
+  complete result { total t.wait + 30s }
+}
+"#;
+    let compiled = compile_program(source);
+    assert!(compiled.ir.is_some(), "{:?}", compiled.diagnostics);
+
+    // A whole number of seconds, so a fraction is refused rather than rounded —
+    // rounding the value someone wrote is not the compiler's call.
+    let fractional = compile_program(&source.replace("wait 30s", "wait 1.5s"));
+    assert!(fractional.ir.is_none());
+    assert!(
+        fractional.diagnostics.iter().any(|diagnostic| diagnostic
+            .message
+            .contains("is not a duration: a duration is a whole number of seconds")),
+        "{:?}",
+        fractional.diagnostics
+    );
+}
+
+/// Two lengths add and subtract, and a length scales by a count. Anything else
+/// is the unit confusion the record rules out.
+#[test]
+fn duration_arithmetic_is_typed_by_the_unit() {
+    let program = |expr: &str| {
+        format!(
+            r#"
+workflow DurationArithmetic
+output result Report
+
+class Report {{ total duration }}
+class Task {{ wait duration  n int }}
+
+table seeds as Task [ {{ wait 30s  n 2 }} ]
+
+rule step
+  when Task as t
+=> {{
+  complete result {{ total {expr} }}
+}}
+"#
+        )
+    };
+    for legal in [
+        "t.wait + 30s",
+        "t.wait - 10s",
+        "t.wait * t.n",
+        "t.n * t.wait",
+    ] {
+        let compiled = compile_program(&program(legal));
+        assert!(compiled.ir.is_some(), "{legal}: {:?}", compiled.diagnostics);
+    }
+    // A length divided by a length, or a length plus a number, has no unit the
+    // language can name.
+    for refused in ["t.wait / 2", "t.wait + t.n"] {
+        let compiled = compile_program(&program(refused));
+        assert!(
+            compiled
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code.as_str() == "expr.non_numeric_operand"),
+            "{refused} was admitted: {:?}",
+            compiled.diagnostics
+        );
+    }
+}
+
+/// The measure DR-0081 §7 could not express, now that seconds are whole:
+/// "poll until the window closes" descends over a duration exactly as it does
+/// over an int, and renders in the unit rather than as a bare number.
+#[test]
+fn a_duration_carries_a_measure() {
+    let source = r#"
+@service
+workflow DurationMeasure
+
+class Window { elapsed duration }
+
+agent worker { provider fixture  profile "repo-writer"  capacity 1 }
+
+table seeds as Window [ { elapsed 0s } ]
+
+rule poll
+  when Window as w where w.elapsed < 5m
+=> {
+  tell worker "poll"
+
+  done w -> record Window { elapsed w.elapsed + 30s }
+}
+"#;
+    let compiled = compile_program(source);
+    let ir = compiled.ir.expect("a measured duration ring compiles");
+    assert!(
+        ir.to_snapshot()
+            .contains("w.elapsed rises by PT30S toward PT300S (step-bounded"),
+        "{}",
+        ir.to_snapshot()
     );
 }
 

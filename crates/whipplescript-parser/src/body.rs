@@ -3836,13 +3836,58 @@ impl<'a> BodyParser<'a> {
                 span: self.span_from(start),
             }));
         }
+        // A duration-typed path waits for a length the fact carries, which is
+        // what makes a stored duration usable at all (DR-0087 §Slices 4). The
+        // value is resolved when the rule fires; `duration_seconds` stays zero
+        // because there is no compile-time answer.
+        if let Some(Tok::Ident(path)) = self.peek().map(|t| t.tok.clone()) {
+            let mut text = path;
+            self.pos += 1;
+            while matches!(self.peek().map(|t| &t.tok), Some(Tok::Sym('.'))) {
+                self.pos += 1;
+                if let Some(Tok::Ident(segment)) = self.peek().map(|t| t.tok.clone()) {
+                    text.push('.');
+                    text.push_str(&segment);
+                    self.pos += 1;
+                } else {
+                    break;
+                }
+            }
+            let mut binding = None;
+            let mut requires = Vec::new();
+            let mut timeout_seconds = None;
+            if !self.parse_effect_modifiers(&mut binding, &mut requires, &mut timeout_seconds) {
+                return None;
+            }
+            if binding.is_none() {
+                let span = self.span_from(start);
+                self.error(
+                    diagnostic_code!("construct.missing_requirement"),
+                    span,
+                    "`timer` requires an `as` binding".to_owned(),
+                    Some("rules react to the timer with `after <binding> succeeds`".to_owned()),
+                );
+            }
+            return Some(BodyStmt::Effect(EffectStmt {
+                kind: BodyEffectKind::Timer {
+                    duration_seconds: 0,
+                    duration_source: text,
+                    until: None,
+                },
+                binding,
+                requires,
+                timeout_seconds,
+                prompt: None,
+                span: self.span_from(start),
+            }));
+        }
         let Some(Tok::Number(value)) = self.peek().map(|t| t.tok.clone()) else {
             self.error(
                 diagnostic_code!("parse.unexpected_token"),
                 span,
                 "expected a duration after `timer`".to_owned(),
                 Some(
-                    "use `<n><unit>` with unit s, m, h, or d, e.g. `timer 24h as deadline`"
+                    "use `<n><unit>` with unit s, m, h, or d, or a duration-typed field, e.g. `timer 24h as deadline` or `timer t.wait as deadline`"
                         .to_owned(),
                 ),
             );

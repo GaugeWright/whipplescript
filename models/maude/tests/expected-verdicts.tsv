@@ -35,6 +35,7 @@ credential-verify-endorse.maude	SSSSNNNNNN
 credential-wrap-carriage.maude	SSSSNNNNN
 delegated-settings-authority.maude	SSNN
 delegated-wire-lifecycle.maude	SSSNNN
+duration-arithmetic.maude	NNSS
 discriminant-schema.maude	SSSSSNNN
 effect-cycle-pacing.maude	SSSSNNNNNNSNNN
 effect-dependencies.maude	NSNSSS

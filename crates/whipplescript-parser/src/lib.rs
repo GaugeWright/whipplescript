@@ -2665,6 +2665,8 @@ enum LiteralExpr<'a> {
     Bool,
     Null,
     Ident(&'a str),
+    /// `<integer><unit>`, as its whole number of seconds (DR-0087 §1).
+    Duration(i64),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2746,6 +2748,10 @@ pub enum ExprLiteral {
     Bool(bool),
     Null,
     Ident(String),
+    /// A `<integer><unit>` literal as its whole number of seconds (DR-0087 §1).
+    /// It renders canonically wherever it is written down, so the value and its
+    /// stored form cannot disagree.
+    Duration(i64),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2855,6 +2861,9 @@ impl ExprLiteral {
             Self::Number(value) | Self::Ident(value) => value.clone(),
             Self::Bool(value) => value.to_string(),
             Self::Null => "null".to_owned(),
+            // The canonical spelling, so a snapshot shows the value rather than
+            // the way it happened to be typed (DR-0087 §2).
+            Self::Duration(seconds) => canonical_duration(*seconds),
         }
     }
 }
@@ -12915,7 +12924,12 @@ fn collect_expr_binding_roots(expr: &Expr, out: &mut BTreeSet<String>) {
         Expr::Literal(ExprLiteral::Ident(name)) => {
             out.insert(name.clone());
         }
-        Expr::Literal(ExprLiteral::Number(_) | ExprLiteral::Bool(_) | ExprLiteral::Null) => {}
+        Expr::Literal(
+            ExprLiteral::Number(_)
+            | ExprLiteral::Bool(_)
+            | ExprLiteral::Null
+            | ExprLiteral::Duration(_),
+        ) => {}
         Expr::Path(segments) => {
             if let Some(root) = segments.first() {
                 out.insert(root.clone());
@@ -16837,6 +16851,17 @@ fn infer_binary_type(
             ExprType::Bool
         }
         BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div => {
+            // DR-0087 §3: a duration is a length. Two lengths add and subtract,
+            // and a length scales by a count; anything else — dividing one, or
+            // adding a number to one — is unit confusion the record rules out.
+            match (op, &left_ty, &right_ty) {
+                (BinaryOp::Add | BinaryOp::Sub, ExprType::Duration, ExprType::Duration) => {
+                    return ExprType::Duration
+                }
+                (BinaryOp::Mul, ExprType::Duration, ExprType::Int)
+                | (BinaryOp::Mul, ExprType::Int, ExprType::Duration) => return ExprType::Duration,
+                _ => {}
+            }
             for ty in [&left_ty, &right_ty] {
                 if !matches!(ty, ExprType::Int | ExprType::Float | ExprType::Unknown) {
                     diagnostics.push(Diagnostic {
@@ -16999,6 +17024,7 @@ fn expr_literal_type(literal: &ExprLiteral) -> ExprType {
         ExprLiteral::Number(_) => ExprType::Int,
         ExprLiteral::Bool(_) => ExprType::Bool,
         ExprLiteral::Null => ExprType::Null,
+        ExprLiteral::Duration(_) => ExprType::Duration,
     }
 }
 
@@ -24792,6 +24818,19 @@ fn parse_literal_expr(expr: &str) -> Option<LiteralExpr<'_>> {
     {
         return Some(LiteralExpr::Number(expr));
     }
+    // `30s` in a table row or a record body is the same literal the expression
+    // lexer reads, so a seed and a computed value cannot disagree about what a
+    // duration is (DR-0087 §1).
+    if let Some(unit) = expr.chars().last() {
+        if matches!(unit, 's' | 'm' | 'h' | 'd') {
+            let digits = &expr[..expr.len() - unit.len_utf8()];
+            if !digits.is_empty() && digits.chars().all(|ch| ch.is_ascii_digit()) {
+                if let Some(seconds) = duration_literal_seconds(digits, unit) {
+                    return Some(LiteralExpr::Duration(seconds));
+                }
+            }
+        }
+    }
     match expr {
         "true" => Some(LiteralExpr::Bool),
         "false" => Some(LiteralExpr::Bool),
@@ -24827,6 +24866,9 @@ enum ExprTokenKind {
     Ident(String),
     String(String),
     Number(String),
+    /// `<integer><unit>` with units `s`, `m`, `h`, `d` (spec/time.md), as its
+    /// whole number of seconds (DR-0087 §1).
+    Duration(i64),
     Symbol(char),
     Op(&'static str),
 }
@@ -25051,7 +25093,26 @@ impl<'a> ExprParser<'a> {
         }
         match self.advance().map(|token| token.kind.clone()) {
             Some(ExprTokenKind::String(value)) => Ok(Expr::Literal(ExprLiteral::String(value))),
-            Some(ExprTokenKind::Number(value)) => Ok(Expr::Literal(ExprLiteral::Number(value))),
+            Some(ExprTokenKind::Number(value)) => {
+                // `1.5s` lexes as a number and a stray unit, because the lexer
+                // only welds WHOLE digits to a unit. Saying so beats the generic
+                // parse error a stranded `s` would otherwise produce: a duration
+                // is a whole number of seconds, and rounding the value someone
+                // wrote is not the compiler's decision to make (DR-0087 §1).
+                if value.contains('.') {
+                    if let Some(ExprTokenKind::Ident(unit)) = self.peek().map(|t| t.kind.clone()) {
+                        if matches!(unit.as_str(), "s" | "m" | "h" | "d") {
+                            return Err(format!(
+                                "`{value}{unit}` is not a duration: a duration is a whole number of seconds"
+                            ));
+                        }
+                    }
+                }
+                Ok(Expr::Literal(ExprLiteral::Number(value)))
+            }
+            Some(ExprTokenKind::Duration(seconds)) => {
+                Ok(Expr::Literal(ExprLiteral::Duration(seconds)))
+            }
             Some(ExprTokenKind::Ident(value)) if value == "true" => {
                 Ok(Expr::Literal(ExprLiteral::Bool(true)))
             }
@@ -25156,6 +25217,7 @@ impl<'a> ExprParser<'a> {
     fn token_text(&self, token: &ExprToken) -> String {
         match &token.kind {
             ExprTokenKind::Ident(value) | ExprTokenKind::Number(value) => value.clone(),
+            ExprTokenKind::Duration(seconds) => canonical_duration(*seconds),
             ExprTokenKind::String(value) => format!("{value:?}"),
             ExprTokenKind::Symbol(value) => value.to_string(),
             ExprTokenKind::Op(value) => value.to_string(),
@@ -25267,8 +25329,26 @@ fn lex_expr(source: &str) -> Vec<ExprToken> {
             while index < bytes.len() && (bytes[index].is_ascii_digit() || bytes[index] == b'.') {
                 index += 1;
             }
+            let digits = &source[start..index];
+            // A duration literal is the number with its unit welded on, and the
+            // unit must not run into an identifier: `30s` is thirty seconds,
+            // `30slots` is not a duration at all (spec/time.md, DR-0087 §1).
+            let unit = bytes.get(index).copied();
+            let unit_ends_token = bytes
+                .get(index + 1)
+                .map(|next| !is_ident_continue(*next))
+                .unwrap_or(true);
+            if let (Some(unit @ (b's' | b'm' | b'h' | b'd')), true) = (unit, unit_ends_token) {
+                if let Some(seconds) = duration_literal_seconds(digits, unit as char) {
+                    index += 1;
+                    tokens.push(ExprToken {
+                        kind: ExprTokenKind::Duration(seconds),
+                    });
+                    continue;
+                }
+            }
             tokens.push(ExprToken {
-                kind: ExprTokenKind::Number(source[start..index].to_owned()),
+                kind: ExprTokenKind::Number(digits.to_owned()),
             });
             continue;
         }
@@ -25354,6 +25434,7 @@ fn validate_primitive_literal(
             | ("bool", LiteralExpr::Bool)
             | ("null", LiteralExpr::Null)
             | ("duration", LiteralExpr::String(_))
+            | ("duration", LiteralExpr::Duration(_))
             | ("time", LiteralExpr::String(_))
     );
     if !valid {
@@ -25743,6 +25824,32 @@ pub(crate) fn stable_hash(value: &str) -> String {
         hex.push_str(&format!("{byte:02x}"));
     }
     hex
+}
+
+/// `<integer><unit>` as its whole number of seconds, or `None` when the digits
+/// carry a fraction.
+///
+/// A duration is a whole number of seconds (DR-0087 §1), so `1.5s` is not a
+/// duration this language can hold — it is refused as a literal rather than
+/// rounded, because rounding a value the author wrote is a decision the compiler
+/// has no business making quietly.
+pub fn duration_literal_seconds(digits: &str, unit: char) -> Option<i64> {
+    let count = digits.parse::<i64>().ok()?;
+    let multiplier = match unit {
+        's' => 1,
+        'm' => 60,
+        'h' => 3_600,
+        'd' => 86_400,
+        _ => return None,
+    };
+    count.checked_mul(multiplier)
+}
+
+/// The one spelling of a duration (DR-0087 §2): `PT<n>S`, so two ways of writing
+/// the same length are one value, and therefore one fact under content
+/// addressing.
+pub fn canonical_duration(seconds: i64) -> String {
+    format!("PT{}S", seconds.max(0))
 }
 
 pub fn parse_duration_seconds(value: &str) -> Option<f64> {

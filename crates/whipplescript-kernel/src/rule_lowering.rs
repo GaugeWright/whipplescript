@@ -852,7 +852,49 @@ pub fn eval_expr_literal(literal: &ExprLiteral) -> Value {
             .unwrap_or_else(|_| Value::String(value.clone())),
         ExprLiteral::Bool(value) => Value::Bool(*value),
         ExprLiteral::Null => Value::Null,
+        // Canonical from the moment it is written: the literal `5m` and the
+        // literal `300s` are one value and one stored form (DR-0087 §2).
+        ExprLiteral::Duration(seconds) => {
+            Value::String(whipplescript_parser::canonical_duration(*seconds))
+        }
     }
+}
+
+/// Duration arithmetic (DR-0087 §3): two lengths add and subtract, a length
+/// scales by a count, and the result is canonical.
+///
+/// Subtraction SATURATES at zero. A duration is positive, and the alternative to
+/// saturating is an operation that fails in a value position — which is exactly
+/// how an error object reached a durable fact before #350. `a - b` where `b > a`
+/// is "no time remains", which is the question anyone subtracting lengths is
+/// asking.
+fn eval_duration_arithmetic(
+    op: BinaryOp,
+    left: &EvalValue,
+    right: &EvalValue,
+) -> Option<EvalValue> {
+    let seconds = |value: &EvalValue| -> Option<i64> {
+        let EvalValue::Json(Value::String(text)) = value else {
+            return None;
+        };
+        whipplescript_parser::parse_duration_seconds(text).map(|seconds| seconds as i64)
+    };
+    let count = |value: &EvalValue| -> Option<i64> {
+        let EvalValue::Json(Value::Number(number)) = value else {
+            return None;
+        };
+        number.as_i64()
+    };
+    let result = match (op, seconds(left), seconds(right)) {
+        (BinaryOp::Add, Some(lhs), Some(rhs)) => lhs.saturating_add(rhs),
+        (BinaryOp::Sub, Some(lhs), Some(rhs)) => lhs.saturating_sub(rhs).max(0),
+        (BinaryOp::Mul, Some(lhs), None) => lhs.saturating_mul(count(right)?),
+        (BinaryOp::Mul, None, Some(rhs)) => rhs.saturating_mul(count(left)?),
+        _ => return None,
+    };
+    Some(EvalValue::Json(Value::String(
+        whipplescript_parser::canonical_duration(result),
+    )))
 }
 
 pub fn eval_binary(op: BinaryOp, left: &Expr, right: &Expr, scope: &EvalScope<'_>) -> EvalValue {
@@ -926,6 +968,9 @@ pub fn eval_binary(op: BinaryOp, left: &Expr, right: &Expr, scope: &EvalScope<'_
         BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div => {
             let left = eval_expr_value(left, scope);
             let right = eval_expr_value(right, scope);
+            if let Some(duration) = eval_duration_arithmetic(op, &left, &right) {
+                return duration;
+            }
             let (Some(lhs), Some(rhs)) = (number_value(&left), number_value(&right)) else {
                 return EvalValue::error("arithmetic requires numeric operands");
             };
@@ -3444,9 +3489,24 @@ pub fn parse_effect_statements(
             });
         } else if let Some(rest) = trimmed.strip_prefix("timer ") {
             let duration = rest.split_whitespace().next().unwrap_or_default();
+            // A literal, or a duration the firing fact carries (DR-0087): the
+            // path is resolved here, where the binding exists, exactly as the
+            // absolute `timer until` form resolves its deadline.
             let duration_seconds =
                 whipplescript_parser::body::parse_short_duration_seconds(duration)
-                    .map(|seconds| seconds as i64);
+                    .map(|seconds| seconds as i64)
+                    .or_else(|| {
+                        parse_field_value_scoped(
+                            duration,
+                            context,
+                            live_facts,
+                            live_effects,
+                            live_ir,
+                        )
+                        .as_str()
+                        .and_then(whipplescript_parser::parse_duration_seconds)
+                        .map(|seconds| seconds as i64)
+                    });
             effects.push(ParsedEffect {
                 timeout_seconds: duration_seconds,
                 kind: "timer.wait".to_owned(),
