@@ -38,6 +38,10 @@ use whipplescript_kernel::host_protocol::{
 use whipplescript_kernel::AgentThreadSeed;
 use whipplescript_store::{EffectCancellationRequest, NewEvent, RuntimeStore};
 
+use crate::host_discard::{
+    validate_discard_eligibility, verify_discard_event, DISCARDED_FORK_REASON,
+};
+
 /// Verify and normalize one GaugeDesk-signed hosted policy epoch. This is a
 /// direct wasm export so the Worker shell can fail closed before persisting a
 /// placement bootstrap. The signer and key come from Worker bindings, never
@@ -136,20 +140,40 @@ pub fn host_discard_instance(
         .ok_or_else(|| JsValue::from_str("discarded host instance is unavailable"))?;
     let metadata: serde_json::Value = serde_json::from_str(&instance.input_json)
         .map_err(|error| JsValue::from_str(&error.to_string()))?;
-    if metadata.get("protocol").and_then(serde_json::Value::as_str) != Some(HOST_PROTOCOL)
-        || metadata.get("policy") != Some(&serde_json::to_value(&command.policy).unwrap())
-    {
-        return Err(JsValue::from_str(
-            "discarded instance does not belong to the admitted host policy",
-        ));
-    }
+    let events = facade
+        .kernel()
+        .store()
+        .list_events(&command.instance_ref)
+        .map_err(|error| JsValue::from_str(&format!("{error:?}")))?;
+    let effects = facade
+        .kernel()
+        .store()
+        .list_effects(&command.instance_ref)
+        .map_err(|error| JsValue::from_str(&format!("{error:?}")))?;
+    validate_discard_eligibility(
+        &command.instance_ref,
+        &command.policy,
+        &metadata,
+        &events,
+        &effects,
+    )
+    .map_err(JsValue::from_str)?;
+    let discard_key = whipplescript_kernel::idempotency_key(&[
+        &command.instance_ref,
+        &command.request_id,
+        "host-instance-discarded",
+    ]);
     let event = match facade
         .kernel()
         .store()
-        .event_by_idempotency_key(&command.instance_ref, &command.request_id)
+        .event_by_idempotency_key(&command.instance_ref, &discard_key)
         .map_err(|error| JsValue::from_str(&format!("{error:?}")))?
     {
-        Some(event) => event,
+        Some(event) => {
+            verify_discard_event(&events, &event.event_id, &command.instance_ref)
+                .map_err(|error| JsValue::from_str(error))?;
+            event
+        }
         None => {
             let running = facade
                 .kernel()
@@ -167,23 +191,26 @@ pub fn host_discard_instance(
                 .kernel_mut()
                 .cancel_instance(
                     &command.instance_ref,
-                    Some("embedding host did not admit fork"),
-                    Some(&command.request_id),
+                    Some(DISCARDED_FORK_REASON),
+                    Some(&discard_key),
                 )
                 .map_err(|error| JsValue::from_str(&format!("{error:?}")))?
         }
     };
-    serde_json::to_string(&DiscardedInstance {
+    let result = DiscardedInstance {
         protocol: HOST_PROTOCOL.to_owned(),
-        request_id: command.request_id,
+        request_id: command.request_id.clone(),
         instance_ref: command.instance_ref.clone(),
         discarded_at: EventPosition {
-            instance_ref: command.instance_ref,
+            instance_ref: command.instance_ref.clone(),
             sequence: u64::try_from(event.sequence)
                 .map_err(|_| JsValue::from_str("discard event position is invalid"))?,
         },
-    })
-    .map_err(|error| JsValue::from_str(&error.to_string()))
+    };
+    result
+        .validate_for(&command)
+        .map_err(|error| JsValue::from_str(&error.to_string()))?;
+    serde_json::to_string(&result).map_err(|error| JsValue::from_str(&error.to_string()))
 }
 
 /// Phase one of a hosted turn: validate the signed epoch, instance, package,

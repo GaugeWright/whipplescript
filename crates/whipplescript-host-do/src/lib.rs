@@ -50,6 +50,8 @@ pub mod do_worker;
 pub mod do_workstreams;
 /// GaugeDesk-compatible governance verification for hosted placements.
 pub mod governance;
+#[cfg(any(target_arch = "wasm32", test))]
+mod host_discard;
 /// Placement-neutral projection of one governed hosted turn into the public
 /// host protocol's body-free pointers and terminal receipt.
 pub mod host_projection;

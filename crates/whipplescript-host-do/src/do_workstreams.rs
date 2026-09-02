@@ -12,6 +12,7 @@
 //! transactions collapse to plain statement sequences (the do_branches
 //! posture).
 
+use whipplescript_store::branches::HeadReservationOutcome;
 use whipplescript_store::workstreams::{
     branch_home_evidence_handle, ArchiveOutcome, BoundaryReservation, BranchHomeReceiptV1,
     ClosePromotedOutcome, CreateStreamOutcome, JoinOutcome, RecordRefAdvancedOutcome,
@@ -785,6 +786,9 @@ impl<Sql: DoSql + Clone> whipplescript_kernel::effect_handlers::CapabilityProvid
             Err(error) => return failed(format!("workstream read failed: {error:?}")),
         };
         if stream.status == StreamStatus::Archived {
+            if let Some(reservation_id) = stream.reservation_id.as_deref() {
+                let _ = vcs.release_branch_head_reservation(&stream.line_branch_id, reservation_id);
+            }
             return match stream.boundary_receipt("durable-object-workspace") {
                 Some(receipt) => CapabilityOutcome::Produced(serde_json::json!({
                     "variant": "Promoted",
@@ -834,7 +838,22 @@ impl<Sql: DoSql + Clone> whipplescript_kernel::effect_handlers::CapabilityProvid
             if let Err(error) = streams.close_promoted(stream_id, &reservation_id, &at) {
                 return failed(format!("post-CAS close failed: {error:?}"));
             }
+            if let Err(error) =
+                vcs.release_branch_head_reservation(&stream.line_branch_id, &reservation_id)
+            {
+                return failed(format!("stream-line reservation release failed: {error:?}"));
+            }
         } else if stream.status == StreamStatus::BoundaryReserved {
+            match vcs.reserve_branch_head(&stream.line_branch_id, &reservation_id, &at) {
+                Ok(HeadReservationOutcome::Reserved) | Ok(HeadReservationOutcome::Existing) => {}
+                Ok(other) => {
+                    let _ = streams.release_boundary(stream_id, &reservation_id, &at);
+                    return failed(format!("stream-line reservation refused: {other:?}"));
+                }
+                Err(error) => {
+                    return failed(format!("stream-line reservation failed: {error:?}"));
+                }
+            }
             fn cut_value(value: &str) -> Option<&str> {
                 (!value.is_empty()).then_some(value)
             }
@@ -850,6 +869,7 @@ impl<Sql: DoSql + Clone> whipplescript_kernel::effect_handlers::CapabilityProvid
                 Some(evidence) => evidence,
                 None => match vcs.promote_line_exact(
                     &stream.line_branch_id,
+                    &reservation_id,
                     cut_value(&expected_line),
                     cut_value(&expected_main),
                     &proposed_main,
@@ -864,6 +884,10 @@ impl<Sql: DoSql + Clone> whipplescript_kernel::effect_handlers::CapabilityProvid
                         conflicts,
                     }) => {
                         let _ = streams.release_boundary(stream_id, &reservation_id, &at);
+                        let _ = vcs.release_branch_head_reservation(
+                            &stream.line_branch_id,
+                            &reservation_id,
+                        );
                         return CapabilityOutcome::Produced(serde_json::json!({
                             "variant": "Conflicted",
                             "stream": stream_id,
@@ -882,10 +906,18 @@ impl<Sql: DoSql + Clone> whipplescript_kernel::effect_handlers::CapabilityProvid
                         ..
                     }) => {
                         let _ = streams.release_boundary(stream_id, &reservation_id, &at);
+                        let _ = vcs.release_branch_head_reservation(
+                            &stream.line_branch_id,
+                            &reservation_id,
+                        );
                         return failed("exact stream/Main cut moved; retry".to_owned());
                     }
                     Ok(other) => {
                         let _ = streams.release_boundary(stream_id, &reservation_id, &at);
+                        let _ = vcs.release_branch_head_reservation(
+                            &stream.line_branch_id,
+                            &reservation_id,
+                        );
                         return failed(format!("promotion refused: {other:?}"));
                     }
                     Err(error) => return failed(format!("promotion failed: {error:?}")),
@@ -902,6 +934,11 @@ impl<Sql: DoSql + Clone> whipplescript_kernel::effect_handlers::CapabilityProvid
                 | Ok(ClosePromotedOutcome::AlreadyClosed) => {}
                 Ok(other) => return failed(format!("post-CAS close refused: {other:?}")),
                 Err(error) => return failed(format!("post-CAS close failed: {error:?}")),
+            }
+            if let Err(error) =
+                vcs.release_branch_head_reservation(&stream.line_branch_id, &reservation_id)
+            {
+                return failed(format!("stream-line reservation release failed: {error:?}"));
             }
         } else {
             return failed(format!(

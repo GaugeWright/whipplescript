@@ -338,6 +338,15 @@ pub enum ExactForkAdmissionOutcome {
     ForkRefused(ExactInstanceForkBinding),
 }
 
+fn require_restored_fork_home(restored: bool, fork_branch_id: &str) -> StoreResult<()> {
+    if !restored {
+        return Err(crate::StoreError::Conflict(format!(
+            "exact fork refusal could not restore `{fork_branch_id}` to its prior home"
+        )));
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ExactForkAdmissionV1 {
     pub schema: String,
@@ -429,7 +438,7 @@ where
     B: Branches,
     C: ContentBlobs,
 {
-    let admitted_stream = match destination {
+    let destination_stream = match destination {
         ExactForkDestination::Main => None,
         ExactForkDestination::Workstream(stream_id) => {
             let Some(stream) = streams.get_stream(stream_id)? else {
@@ -450,15 +459,33 @@ where
                 }
                 StreamStatus::Active => {}
             }
-            match streams.transfer(fork_branch_id, stream_id, at)? {
-                JoinOutcome::Joined { .. } => Some(stream_id),
-                other => {
-                    return Ok(ExactForkAdmissionOutcome::DestinationChanged {
-                        detail: format!("{other:?}"),
-                    })
-                }
-            }
+            Some(stream_id)
         }
+    };
+
+    if let crate::vcs::ExactInstanceForkPreflight::Refused(refusal) = vcs
+        .preflight_fork_binding_for_instance_at_cut(
+            source_instance,
+            source_cut_id,
+            target_instance,
+            fork_branch_id,
+            name,
+        )?
+    {
+        return Ok(ExactForkAdmissionOutcome::ForkRefused(refusal));
+    }
+
+    let prior_home = streams.home_of(fork_branch_id)?;
+    let admitted_stream = match destination_stream {
+        None => None,
+        Some(stream_id) => match streams.transfer(fork_branch_id, stream_id, at)? {
+            JoinOutcome::Joined { .. } => Some(stream_id),
+            other => {
+                return Ok(ExactForkAdmissionOutcome::DestinationChanged {
+                    detail: format!("{other:?}"),
+                })
+            }
+        },
     };
 
     let fork = vcs.fork_binding_for_instance_at_cut(
@@ -477,9 +504,17 @@ where
     } = fork
     else {
         if admitted_stream.is_some() {
-            // No branch exists on every refusal from the exact fork preflight.
-            // Remove the prospective membership so failure is externally null.
-            let _ = streams.leave(fork_branch_id);
+            let restored = match prior_home.as_deref() {
+                Some(stream_id) => matches!(
+                    streams.transfer(fork_branch_id, stream_id, at)?,
+                    JoinOutcome::Joined { .. }
+                ),
+                None => {
+                    streams.leave(fork_branch_id)?;
+                    true
+                }
+            };
+            require_restored_fork_home(restored, fork_branch_id)?;
         }
         return Ok(ExactForkAdmissionOutcome::ForkRefused(fork));
     };
@@ -1373,7 +1408,63 @@ mod tests {
             .expect("branch lookup")
             .is_none());
         assert_eq!(streams.home_of("chat-child-closed").expect("home"), None);
+
+        vcs.create_branch(
+            "occupied-fork-id",
+            None,
+            crate::branches::MAINLINE_BRANCH_ID,
+            "t9",
+        )
+        .expect("occupied branch");
+        streams
+            .create_stream("other", None, "line-other", "t9", None)
+            .expect("other stream");
+        streams
+            .join("occupied-fork-id", "other", "t9")
+            .expect("original home");
+        let occupied_home_before = streams
+            .home_receipt("occupied-fork-id")
+            .expect("original home receipt");
+        let occupied_refusal = fork_at_cut_and_admit(
+            &mut streams,
+            &mut vcs,
+            "parent",
+            "chat-1",
+            "child-occupied",
+            "occupied-fork-id",
+            None,
+            ExactForkDestination::Workstream("live"),
+            "t10",
+        )
+        .expect("occupied refusal");
+        assert_eq!(
+            occupied_refusal,
+            ExactForkAdmissionOutcome::ForkRefused(
+                crate::vcs::ExactInstanceForkBinding::ForkBranchIdTaken {
+                    branch_id: "occupied-fork-id".to_owned(),
+                }
+            )
+        );
+        assert_eq!(
+            streams.home_of("occupied-fork-id").expect("preserved home"),
+            Some("other".to_owned()),
+            "preflight refusal must not transfer or re-home an existing branch"
+        );
+        assert_eq!(
+            streams
+                .home_receipt("occupied-fork-id")
+                .expect("final home receipt"),
+            occupied_home_before,
+            "preflight refusal must not advance the existing branch's topology authority position"
+        );
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn late_fork_refusal_requires_exact_home_restoration() {
+        let error = require_restored_fork_home(false, "chat-child")
+            .expect_err("a failed topology rollback must never be reported as a normal refusal");
+        assert!(format!("{error:?}").contains("could not restore `chat-child`"));
     }
 
     /// Archive re-homes every member atomically and the dead line refuses

@@ -878,7 +878,7 @@ describe("real WorkflowInstance hibernation", () => {
         protocol: "whipplescript.model-egress.v1",
         credential_ref: "managed-openai",
       });
-      if (brokerAttempt === 2) {
+      if (brokerAttempt === 3) {
         announceCancelableRound();
         await cancelableRoundRelease;
       }
@@ -1119,6 +1119,21 @@ describe("real WorkflowInstance hibernation", () => {
       await exportedResponse.clone().text(),
     ).toBe(200);
     const exported = await exportedResponse.json<Record<string, unknown>>();
+    const rootDiscard = await placementFetch(`${instancePath}/discard`, {
+      method: "POST",
+      body: JSON.stringify({
+        command: {
+          protocol: HOST_PROTOCOL,
+          request_id: "discard-root-placement-journey",
+          instance_ref: opened.instance_ref,
+          policy: POLICY_REF,
+        },
+      }),
+    });
+    expect(rootDiscard.status, await rootDiscard.clone().text()).toBe(409);
+    expect(await rootDiscard.text()).toContain(
+      "only an unadmitted host fork target can be discarded",
+    );
     const forkCommand = {
       protocol: HOST_PROTOCOL,
       request_id: "fork-placement-journey",
@@ -1194,6 +1209,58 @@ describe("real WorkflowInstance hibernation", () => {
     });
     expect(discardedTurn.status).toBe(400);
 
+    const usedForkResponse = await placementFetch("/host/forks/import", {
+      method: "POST",
+      body: JSON.stringify({
+        command: {
+          ...forkCommand,
+          request_id: "fork-used-placement-journey",
+          target_request_id: "open-used-fork-placement-journey",
+        },
+        export: exported,
+        package: packageDocs,
+      }),
+    });
+    expect(usedForkResponse.status, await usedForkResponse.clone().text()).toBe(201);
+    const usedFork = await usedForkResponse.json<{
+      target: { instance_ref: string };
+    }>();
+    const usedForkTurn = await placementFetch("/host/turns", {
+      method: "POST",
+      body: JSON.stringify({
+        command: {
+          ...turnCommand,
+          command_id: "turn-used-fork-placement-journey",
+          run_ref: "gaugedesk:run:used-fork-placement-journey",
+          instance_ref: usedFork.target.instance_ref,
+        },
+        package: packageDocs,
+        image_bodies: [],
+      }),
+    });
+    expect(usedForkTurn.status, await usedForkTurn.clone().text()).toBe(200);
+    const usedForkDiscard = await placementFetch(
+      `/host/instances/${encodeURIComponent(usedFork.target.instance_ref)}/discard`,
+      {
+        method: "POST",
+        body: JSON.stringify({
+          command: {
+            protocol: HOST_PROTOCOL,
+            request_id: "discard-used-fork-placement-journey",
+            instance_ref: usedFork.target.instance_ref,
+            policy: POLICY_REF,
+          },
+        }),
+      },
+    );
+    expect(
+      usedForkDiscard.status,
+      await usedForkDiscard.clone().text(),
+    ).toBe(409);
+    expect(await usedForkDiscard.text()).toContain(
+      "with an admitted turn cannot be discarded",
+    );
+
     eventSocket!.close(1000, "done");
     const cancelCommandId = "turn-placement-cancel";
     const cancelableTurn = placementFetch("/host/turns", {
@@ -1243,7 +1310,7 @@ describe("real WorkflowInstance hibernation", () => {
       // that a request is an abort.
       status: "completed",
     });
-    expect(brokerFetch).toHaveBeenCalledTimes(2);
+    expect(brokerFetch).toHaveBeenCalledTimes(3);
 
     vi.unstubAllGlobals();
   });

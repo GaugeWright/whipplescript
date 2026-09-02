@@ -1,6 +1,6 @@
 {
   "schema": "whipplescript.workstream_host_contract_fixtures.v1",
-  "contract_revision": "whipplescript-workstream-host/v1.0.0",
+  "contract_revision": "whipplescript-workstream-host/v1.0.1",
   "cases": [
     {
       "id": "reservation_freezes_topology_and_contribution",
@@ -136,6 +136,77 @@
         "main_advance_count": 1
       },
       "coverage": "vcs::tests::concurrent_exact_promotions_have_one_main_cas_winner"
+    },
+    {
+      "id": "reserved_line_rejects_direct_head_advance",
+      "given": {
+        "line": "line-ws",
+        "reservation_id": "reservation-ws",
+        "head_cut": "line-1"
+      },
+      "when": "direct_branch_write",
+      "expect": {
+        "outcome": "reserved",
+        "head_cut": "line-1",
+        "body_changed": false
+      },
+      "coverage": "vcs::tests::reserved_stream_line_refuses_every_direct_head_advance"
+    },
+    {
+      "id": "proposal_record_failure_precedes_main_publication",
+      "given": {
+        "expected_main_cut": "main-1",
+        "proposed_main_cut": "main-2",
+        "proposed_cut_identity": "occupied_by_incompatible_cut"
+      },
+      "when": "promote_line_exact",
+      "expect": {
+        "outcome": "immutable_cut_conflict",
+        "main_cut": "main-1"
+      },
+      "coverage": "vcs::tests::promotion_cut_record_failure_cannot_publish_main"
+    },
+    {
+      "id": "fork_identity_refusal_preserves_existing_home",
+      "given": {
+        "fork_branch_id": "occupied-fork-id",
+        "existing_home": "other",
+        "requested_home": "live"
+      },
+      "when": "fork_at_cut_and_admit",
+      "expect": {
+        "outcome": "fork_branch_id_taken",
+        "final_home": "other",
+        "authority_position_changed": false
+      },
+      "coverage": "workstreams::tests::exact_fork_admission_keeps_source_content_and_rejects_closed_home_first"
+    },
+    {
+      "id": "discard_requires_unused_fork_evidence",
+      "given": {
+        "same_policy_instances": ["root", "unused_fork", "used_fork"]
+      },
+      "when": "host_discard_instance",
+      "expect": {
+        "root": "refused",
+        "unused_fork": "discarded",
+        "used_fork": "refused"
+      },
+      "coverage": "host_discard::tests::discard_eligibility_requires_fork_evidence_and_no_admitted_turn"
+    },
+    {
+      "id": "discard_replay_key_is_namespaced_and_verified",
+      "given": {
+        "request_id": "reused-input",
+        "colliding_event_type": "host.instance.opened"
+      },
+      "when": "host_discard_instance_replay",
+      "expect": {
+        "unrelated_event_accepted": false,
+        "required_event_type": "instance.transitioned",
+        "required_status": "cancelled"
+      },
+      "coverage": "host_discard::tests::discard_replay_accepts_only_the_exact_cancellation_event"
     }
   ]
 }

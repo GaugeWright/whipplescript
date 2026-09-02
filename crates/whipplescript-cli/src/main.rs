@@ -36373,6 +36373,7 @@ fn run_reserved_boundary_promotion(
     holder: &str,
     at: &str,
 ) -> Result<BoundaryRunOutcome, String> {
+    use whipplescript_store::branches::HeadReservationOutcome;
     use whipplescript_store::branches::MAINLINE_BRANCH_ID;
     use whipplescript_store::workstreams::{
         BoundaryReservation, ClosePromotedOutcome, RecordRefAdvancedOutcome,
@@ -36387,6 +36388,9 @@ fn run_reserved_boundary_promotion(
         .ok_or_else(|| format!("no such stream `{stream_id}`"))?;
 
     if stream.status == StreamStatus::Archived {
+        if let Some(reservation_id) = stream.reservation_id.as_deref() {
+            let _ = vcs.release_branch_head_reservation(&stream.line_branch_id, reservation_id);
+        }
         let receipt = stream
             .boundary_receipt("native-workspace")
             .ok_or_else(|| format!("stream `{stream_id}` is archived"))?;
@@ -36439,6 +36443,7 @@ fn run_reserved_boundary_promotion(
             .map_err(|error| format!("post-CAS close failed: {error:?}"))?
         {
             ClosePromotedOutcome::Closed { rehomed_branch_ids } => {
+                let _ = vcs.release_branch_head_reservation(&stream.line_branch_id, reservation_id);
                 let receipt = streams
                     .get_stream(stream_id)
                     .map_err(|error| format!("receipt read failed: {error:?}"))?
@@ -36450,6 +36455,7 @@ fn run_reserved_boundary_promotion(
                 });
             }
             ClosePromotedOutcome::AlreadyClosed => {
+                let _ = vcs.release_branch_head_reservation(&stream.line_branch_id, reservation_id);
                 let receipt = streams
                     .get_stream(stream_id)
                     .map_err(|error| format!("receipt read failed: {error:?}"))?
@@ -36482,6 +36488,18 @@ fn run_reserved_boundary_promotion(
         return Ok(BoundaryRunOutcome::Refused(
             "reserved stream is missing its durable recovery coordinate".to_owned(),
         ));
+    }
+    match vcs
+        .reserve_branch_head(&stream.line_branch_id, &reservation_id, at)
+        .map_err(|error| format!("stream-line reservation failed: {error:?}"))?
+    {
+        HeadReservationOutcome::Reserved | HeadReservationOutcome::Existing => {}
+        other => {
+            let _ = streams.release_boundary(stream_id, &reservation_id, at);
+            return Ok(BoundaryRunOutcome::Refused(format!(
+                "stream-line reservation refused: {other:?}"
+            )));
+        }
     }
 
     let lease_key = format!("{}::{MAINLINE_BRANCH_ID}", branch_store_path().display());
@@ -36526,6 +36544,7 @@ fn run_reserved_boundary_promotion(
             let outcome = vcs
                 .promote_line_exact(
                     &stream.line_branch_id,
+                    &reservation_id,
                     cut_value(&expected_line),
                     cut_value(&expected_main),
                     &proposed_main,
@@ -36557,12 +36576,16 @@ fn run_reserved_boundary_promotion(
                 },
                 whipplescript_store::vcs::BoundaryPromotionOutcome::Conflicted { conflicts } => {
                     let _ = streams.release_boundary(stream_id, &reservation_id, at);
+                    let _ = vcs
+                        .release_branch_head_reservation(&stream.line_branch_id, &reservation_id);
                     return Ok(BoundaryRunOutcome::Conflicted { conflicts });
                 }
                 whipplescript_store::vcs::BoundaryPromotionOutcome::ExpectedCutsMoved {
                     ..
                 } => {
                     let _ = streams.release_boundary(stream_id, &reservation_id, at);
+                    let _ = vcs
+                        .release_branch_head_reservation(&stream.line_branch_id, &reservation_id);
                     return Ok(BoundaryRunOutcome::Refused(
                         "the exact stream/Main cut moved before promotion; retry from active"
                             .to_owned(),
@@ -36570,6 +36593,8 @@ fn run_reserved_boundary_promotion(
                 }
                 other => {
                     let _ = streams.release_boundary(stream_id, &reservation_id, at);
+                    let _ = vcs
+                        .release_branch_head_reservation(&stream.line_branch_id, &reservation_id);
                     return Ok(BoundaryRunOutcome::Refused(format!(
                         "promotion refused: {other:?}"
                     )));
@@ -36591,6 +36616,8 @@ fn run_reserved_boundary_promotion(
                 )))
             }
         }
+        vcs.release_branch_head_reservation(&stream.line_branch_id, &reservation_id)
+            .map_err(|error| format!("stream-line reservation release failed: {error:?}"))?;
         let receipt = streams
             .get_stream(stream_id)
             .map_err(|error| format!("receipt read failed: {error:?}"))?

@@ -22,6 +22,7 @@ use std::path::Path;
 use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::event_chain;
+#[cfg(feature = "native")]
 use crate::StoreError;
 use crate::StoreResult;
 use std::collections::BTreeSet;
@@ -117,6 +118,19 @@ pub enum AdvanceOutcome {
         status: BranchStatus,
     },
     NotFound,
+}
+
+/// Durable exclusion around a branch head. Workstream boundary promotion
+/// uses this to freeze its shared line in the same authority every head CAS
+/// already consults; storing the reservation only in the topology database
+/// leaves direct VCS mutations able to race past it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum HeadReservationOutcome {
+    Reserved,
+    Existing,
+    Busy { holder_reservation_id: String },
+    BranchNotActive { status: BranchStatus },
+    BranchMissing,
 }
 
 /// Outcome of binding an instance to a branch. An instance is BORN on a
@@ -372,6 +386,18 @@ pub trait Branches {
         manifest_hash: &str,
         at: &str,
     ) -> StoreResult<AdvanceOutcome>;
+    fn reserve_head(
+        &mut self,
+        branch_id: &str,
+        reservation_id: &str,
+        at: &str,
+    ) -> StoreResult<HeadReservationOutcome>;
+    fn head_reservation(&self, branch_id: &str) -> StoreResult<Option<String>>;
+    fn release_head_reservation(
+        &mut self,
+        branch_id: &str,
+        reservation_id: &str,
+    ) -> StoreResult<bool>;
     /// Rebase-down bookkeeping: move the branch POINT to the (new) parent
     /// head and the branch HEAD to the rebased manifest in one atomic
     /// step, optimistically guarded like `advance_head`. The caller (the
@@ -774,6 +800,11 @@ fn ensure_branch_schema(connection: &Connection) -> StoreResult<()> {
             WHERE name IS NOT NULL AND status = 'active';
         CREATE INDEX IF NOT EXISTS branches_parent_idx
             ON branches(parent_branch_id);
+        CREATE TABLE IF NOT EXISTS branch_head_reservations (
+            branch_id TEXT PRIMARY KEY,
+            reservation_id TEXT NOT NULL,
+            reserved_at TEXT NOT NULL
+        );
         CREATE TABLE IF NOT EXISTS branch_instances (
             instance_id TEXT PRIMARY KEY,
             branch_id TEXT NOT NULL,
@@ -1100,6 +1131,18 @@ impl Branches for BranchStore {
         if row.status != BranchStatus::Active {
             return Ok(AdvanceOutcome::NotActive { status: row.status });
         }
+        let reservation: Option<String> = tx
+            .query_row(
+                "SELECT reservation_id FROM branch_head_reservations WHERE branch_id = ?1",
+                params![branch_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(reservation_id) = reservation {
+            return Err(StoreError::Conflict(format!(
+                "branch `{branch_id}` head is reserved by `{reservation_id}`"
+            )));
+        }
         if row.head_cut_id.as_deref() != expected_head_cut_id {
             return Ok(AdvanceOutcome::Stale {
                 current_head_cut_id: row.head_cut_id,
@@ -1113,6 +1156,69 @@ impl Branches for BranchStore {
         let row = Self::row_by_id(&tx, branch_id)?.expect("advanced row");
         tx.commit()?;
         Ok(AdvanceOutcome::Advanced(Box::new(row)))
+    }
+
+    fn reserve_head(
+        &mut self,
+        branch_id: &str,
+        reservation_id: &str,
+        at: &str,
+    ) -> StoreResult<HeadReservationOutcome> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let Some(row) = Self::row_by_id(&tx, branch_id)? else {
+            return Ok(HeadReservationOutcome::BranchMissing);
+        };
+        if row.status != BranchStatus::Active {
+            return Ok(HeadReservationOutcome::BranchNotActive { status: row.status });
+        }
+        let existing: Option<String> = tx
+            .query_row(
+                "SELECT reservation_id FROM branch_head_reservations WHERE branch_id = ?1",
+                params![branch_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(holder_reservation_id) = existing {
+            tx.commit()?;
+            return Ok(if holder_reservation_id == reservation_id {
+                HeadReservationOutcome::Existing
+            } else {
+                HeadReservationOutcome::Busy {
+                    holder_reservation_id,
+                }
+            });
+        }
+        tx.execute(
+            "INSERT INTO branch_head_reservations (branch_id, reservation_id, reserved_at) \
+             VALUES (?1, ?2, ?3)",
+            params![branch_id, reservation_id, at],
+        )?;
+        tx.commit()?;
+        Ok(HeadReservationOutcome::Reserved)
+    }
+
+    fn head_reservation(&self, branch_id: &str) -> StoreResult<Option<String>> {
+        Ok(self
+            .connection
+            .query_row(
+                "SELECT reservation_id FROM branch_head_reservations WHERE branch_id = ?1",
+                params![branch_id],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
+    fn release_head_reservation(
+        &mut self,
+        branch_id: &str,
+        reservation_id: &str,
+    ) -> StoreResult<bool> {
+        Ok(self.connection.execute(
+            "DELETE FROM branch_head_reservations WHERE branch_id = ?1 AND reservation_id = ?2",
+            params![branch_id, reservation_id],
+        )? == 1)
     }
 
     fn rebase_branch(
@@ -1133,6 +1239,18 @@ impl Branches for BranchStore {
         };
         if row.status != BranchStatus::Active {
             return Ok(AdvanceOutcome::NotActive { status: row.status });
+        }
+        let reservation: Option<String> = tx
+            .query_row(
+                "SELECT reservation_id FROM branch_head_reservations WHERE branch_id = ?1",
+                params![branch_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(reservation_id) = reservation {
+            return Err(StoreError::Conflict(format!(
+                "branch `{branch_id}` head is reserved by `{reservation_id}`"
+            )));
         }
         if row.head_cut_id.as_deref() != expected_head_cut_id {
             return Ok(AdvanceOutcome::Stale {
@@ -2274,6 +2392,43 @@ mod tests {
                 .expect("op"),
             AdvanceOutcome::Advanced(_)
         ));
+    }
+
+    #[test]
+    fn a_head_reservation_blocks_both_native_mutation_primitives() {
+        let mut store = store();
+        store.ensure_mainline("t0").expect("mainline");
+        assert_eq!(
+            store
+                .reserve_head(MAINLINE_BRANCH_ID, "reservation-a", "t1")
+                .expect("reserve"),
+            HeadReservationOutcome::Reserved
+        );
+        for refusal in [
+            store.advance_head(MAINLINE_BRANCH_ID, None, "cut-a", "manifest-a", "t2"),
+            store.rebase_branch(
+                MAINLINE_BRANCH_ID,
+                None,
+                "point-a",
+                "point-manifest-a",
+                "cut-a",
+                "manifest-a",
+                "t2",
+            ),
+        ] {
+            let Err(StoreError::Conflict(message)) = refusal else {
+                panic!("reserved head mutation must be refused, got {refusal:?}");
+            };
+            assert!(message.contains("reserved by `reservation-a`"));
+        }
+        assert_eq!(
+            store
+                .get_branch(MAINLINE_BRANCH_ID)
+                .expect("main read")
+                .expect("main")
+                .head_cut_id,
+            None
+        );
     }
 
     #[test]

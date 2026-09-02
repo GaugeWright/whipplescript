@@ -18,8 +18,8 @@ use std::collections::BTreeSet;
 
 use whipplescript_store::branches::{
     AdvanceOutcome, BindOutcome, BranchRow, BranchStatus, Branches, ClosurePinState, ConflictRow,
-    CreateBranch, CreateBranchOutcome, CutRecord, CutRow, OpBranchDelta, OpRow, RetargetOutcome,
-    StatusOutcome, MAINLINE_BRANCH_ID,
+    CreateBranch, CreateBranchOutcome, CutRecord, CutRow, HeadReservationOutcome, OpBranchDelta,
+    OpRow, RetargetOutcome, StatusOutcome, MAINLINE_BRANCH_ID,
 };
 use whipplescript_store::content::{BlobStatus, ContentBlobs, EraseOutcome};
 use whipplescript_store::event_chain;
@@ -64,6 +64,11 @@ impl<S: DoSql> DoBranches<S> {
                 WHERE name IS NOT NULL AND status = 'active'",
             "CREATE INDEX IF NOT EXISTS branches_parent_idx
                 ON branches(parent_branch_id)",
+            "CREATE TABLE IF NOT EXISTS branch_head_reservations (
+                branch_id TEXT PRIMARY KEY,
+                reservation_id TEXT NOT NULL,
+                reserved_at TEXT NOT NULL
+            )",
             "CREATE TABLE IF NOT EXISTS branch_instances (
                 instance_id TEXT PRIMARY KEY,
                 branch_id TEXT NOT NULL,
@@ -419,6 +424,11 @@ impl<S: DoSql> Branches for DoBranches<S> {
         if row.status != BranchStatus::Active {
             return Ok(AdvanceOutcome::NotActive { status: row.status });
         }
+        if let Some(reservation_id) = self.head_reservation(branch_id)? {
+            return Err(StoreError::Conflict(format!(
+                "branch `{branch_id}` head is reserved by `{reservation_id}`"
+            )));
+        }
         if row.head_cut_id.as_deref() != expected_head_cut_id {
             return Ok(AdvanceOutcome::Stale {
                 current_head_cut_id: row.head_cut_id,
@@ -437,6 +447,70 @@ impl<S: DoSql> Branches for DoBranches<S> {
         Ok(AdvanceOutcome::Advanced(Box::new(row)))
     }
 
+    /// Install the durable exclusion consulted by both head-mutation paths.
+    ///
+    /// The reservation shares this branch authority instead of relying on a
+    /// topology-only lock that direct VCS operations cannot observe.
+    ///
+    /// Repeating the holder is idempotent; a different holder is reported.
+    fn reserve_head(
+        &mut self,
+        branch_id: &str,
+        reservation_id: &str,
+        at: &str,
+    ) -> StoreResult<HeadReservationOutcome> {
+        let Some(row) = self.row_by_id(branch_id)? else {
+            return Ok(HeadReservationOutcome::BranchMissing);
+        };
+        if row.status != BranchStatus::Active {
+            return Ok(HeadReservationOutcome::BranchNotActive { status: row.status });
+        }
+        if let Some(holder_reservation_id) = self.head_reservation(branch_id)? {
+            return Ok(if holder_reservation_id == reservation_id {
+                HeadReservationOutcome::Existing
+            } else {
+                HeadReservationOutcome::Busy {
+                    holder_reservation_id,
+                }
+            });
+        }
+        self.sql
+            .execute(
+                "INSERT INTO branch_head_reservations (branch_id, reservation_id, reserved_at) \
+                 VALUES (?1, ?2, ?3)",
+                &[text(branch_id), text(reservation_id), text(at)],
+            )
+            .map_err(sql_err)?;
+        Ok(HeadReservationOutcome::Reserved)
+    }
+
+    fn head_reservation(&self, branch_id: &str) -> StoreResult<Option<String>> {
+        let rows = self
+            .sql
+            .query(
+                "SELECT reservation_id FROM branch_head_reservations WHERE branch_id = ?1",
+                &[text(branch_id)],
+            )
+            .map_err(sql_err)?;
+        Ok(rows.first().map(|row| as_text(&row[0])))
+    }
+
+    fn release_head_reservation(
+        &mut self,
+        branch_id: &str,
+        reservation_id: &str,
+    ) -> StoreResult<bool> {
+        Ok(self
+            .sql
+            .execute(
+                "DELETE FROM branch_head_reservations \
+                 WHERE branch_id = ?1 AND reservation_id = ?2",
+                &[text(branch_id), text(reservation_id)],
+            )
+            .map_err(sql_err)?
+            == 1)
+    }
+
     fn rebase_branch(
         &mut self,
         branch_id: &str,
@@ -452,6 +526,11 @@ impl<S: DoSql> Branches for DoBranches<S> {
         };
         if row.status != BranchStatus::Active {
             return Ok(AdvanceOutcome::NotActive { status: row.status });
+        }
+        if let Some(reservation_id) = self.head_reservation(branch_id)? {
+            return Err(StoreError::Conflict(format!(
+                "branch `{branch_id}` head is reserved by `{reservation_id}`"
+            )));
         }
         if row.head_cut_id.as_deref() != expected_head_cut_id {
             return Ok(AdvanceOutcome::Stale {

@@ -440,6 +440,12 @@ pub enum ExactInstanceForkBinding {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ExactInstanceForkPreflight {
+    Ready,
+    Refused(ExactInstanceForkBinding),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum UndoOpOutcome {
     Undone {
         undo_op_id: String,
@@ -650,6 +656,38 @@ impl NativeWorkspaceVcs {
 }
 
 impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
+    fn require_head_reservation(&self, branch_id: &str, reservation_id: &str) -> StoreResult<()> {
+        if self.branches.head_reservation(branch_id)?.as_deref() != Some(reservation_id) {
+            return Err(StoreError::Conflict(format!(
+                "stream line `{branch_id}` is not frozen by reservation `{reservation_id}`"
+            )));
+        }
+        Ok(())
+    }
+
+    fn verify_recorded_promotion_cut(
+        recorded: Option<&CutRow>,
+        proposed_main_cut: &str,
+        expected_main_cut: Option<&str>,
+        manifest_hash: &str,
+        origin: &str,
+    ) -> StoreResult<()> {
+        let recorded = recorded.ok_or_else(|| {
+            StoreError::Conflict("proposed promotion cut is unavailable".to_owned())
+        })?;
+        if recorded.change_id != proposed_main_cut
+            || recorded.branch_id != MAINLINE_BRANCH_ID
+            || recorded.manifest_hash != manifest_hash
+            || recorded.parent_cut_id.as_deref() != expected_main_cut
+            || recorded.origin.as_deref() != Some(origin)
+        {
+            return Err(StoreError::Conflict(format!(
+                "cut `{proposed_main_cut}` already names different immutable content or provenance"
+            )));
+        }
+        Ok(())
+    }
+
     fn boundary_receipt_handle(
         &self,
         stream_line_id: &str,
@@ -2182,11 +2220,13 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
     pub fn promote_line_exact(
         &mut self,
         stream_line_id: &str,
+        reservation_id: &str,
         expected_line_cut: Option<&str>,
         expected_main_cut: Option<&str>,
         proposed_main_cut: &str,
         at: &str,
     ) -> StoreResult<BoundaryPromotionOutcome> {
+        self.require_head_reservation(stream_line_id, reservation_id)?;
         let Some(line) = self.branches.get_branch(stream_line_id)? else {
             return Ok(BoundaryPromotionOutcome::StreamLineMissing);
         };
@@ -2249,6 +2289,33 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
             });
         }
 
+        self.require_head_reservation(stream_line_id, reservation_id)?;
+
+        // Persist the immutable proposed coordinate before publishing it.
+        // A stale Main CAS can leave an unreferenced cut, which is safe and
+        // collectible; publishing a head whose cut record can still fail is
+        // not recoverable.
+        let origin = format!("promote:{stream_line_id}");
+        self.branches.record_cut(CutRecord {
+            cut_id: proposed_main_cut,
+            change_id: proposed_main_cut,
+            branch_id: MAINLINE_BRANCH_ID,
+            manifest_hash: &manifest_hash,
+            parent_cut_id: expected_main_cut,
+            origin: Some(&origin),
+            actor: self.actor.as_deref(),
+            intent: self.intent.as_deref(),
+            recorded_at: at,
+        })?;
+        let recorded = self.branches.get_cut(proposed_main_cut)?;
+        Self::verify_recorded_promotion_cut(
+            recorded.as_ref(),
+            proposed_main_cut,
+            expected_main_cut,
+            &manifest_hash,
+            &origin,
+        )?;
+
         let advanced = match self.branches.advance_head(
             MAINLINE_BRANCH_ID,
             expected_main_cut,
@@ -2268,18 +2335,6 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
             AdvanceOutcome::NotActive { .. } => return Ok(BoundaryPromotionOutcome::MainNotActive),
             AdvanceOutcome::NotFound => return Ok(BoundaryPromotionOutcome::MainMissing),
         };
-        let origin = format!("promote:{stream_line_id}");
-        self.branches.record_cut(CutRecord {
-            cut_id: proposed_main_cut,
-            change_id: proposed_main_cut,
-            branch_id: MAINLINE_BRANCH_ID,
-            manifest_hash: &manifest_hash,
-            parent_cut_id: expected_main_cut,
-            origin: Some(&origin),
-            actor: self.actor.as_deref(),
-            intent: self.intent.as_deref(),
-            recorded_at: at,
-        })?;
         self.log_op(
             &format!("op-{proposed_main_cut}"),
             "promote-boundary",
@@ -3957,6 +4012,24 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
         self.branches.list_bound_instances(branch_id)
     }
 
+    pub fn reserve_branch_head(
+        &mut self,
+        branch_id: &str,
+        reservation_id: &str,
+        at: &str,
+    ) -> StoreResult<crate::branches::HeadReservationOutcome> {
+        self.branches.reserve_head(branch_id, reservation_id, at)
+    }
+
+    pub fn release_branch_head_reservation(
+        &mut self,
+        branch_id: &str,
+        reservation_id: &str,
+    ) -> StoreResult<bool> {
+        self.branches
+            .release_head_reservation(branch_id, reservation_id)
+    }
+
     /// The branch half of a chat fork (chat-fork.maude): give the forked
     /// instance its OWN line — a fresh branch forked at the source line's
     /// current head, bound to the target at birth. Never rebinds the fork
@@ -4030,6 +4103,80 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
     /// Exact-cut variant for application fork snapshots. Content always comes
     /// from `source_cut_id`; destination workstream admission is deliberately
     /// a separate authority operation and must not replace the branch point.
+    pub fn preflight_fork_binding_for_instance_at_cut(
+        &self,
+        source_instance: &str,
+        source_cut_id: &str,
+        target_instance: &str,
+        fork_branch_id: &str,
+        name: Option<&str>,
+    ) -> StoreResult<ExactInstanceForkPreflight> {
+        let Some(source_branch_id) = self.instance_branch(source_instance)? else {
+            return Ok(ExactInstanceForkPreflight::Refused(
+                ExactInstanceForkBinding::SourceUnbound,
+            ));
+        };
+        let Some(source_branch) = self.get_branch(&source_branch_id)? else {
+            return Ok(ExactInstanceForkPreflight::Refused(
+                ExactInstanceForkBinding::SourceBranchUnavailable {
+                    branch_id: source_branch_id,
+                },
+            ));
+        };
+        if source_branch.status != BranchStatus::Active {
+            return Ok(ExactInstanceForkPreflight::Refused(
+                ExactInstanceForkBinding::SourceBranchUnavailable {
+                    branch_id: source_branch_id,
+                },
+            ));
+        }
+        let Some(source_cut) = self.get_cut(source_cut_id)? else {
+            return Ok(ExactInstanceForkPreflight::Refused(
+                ExactInstanceForkBinding::SourceCutMissing {
+                    cut_id: source_cut_id.to_owned(),
+                },
+            ));
+        };
+        if source_cut.branch_id != source_branch_id {
+            return Ok(ExactInstanceForkPreflight::Refused(
+                ExactInstanceForkBinding::SourceCutNotOnBranch {
+                    cut_id: source_cut_id.to_owned(),
+                    recorded_branch_id: source_cut.branch_id,
+                },
+            ));
+        }
+        if let Some(branch_id) = self.instance_branch(target_instance)? {
+            return Ok(ExactInstanceForkPreflight::Refused(
+                ExactInstanceForkBinding::TargetAlreadyBound { branch_id },
+            ));
+        }
+        if let Some(row) = self.get_branch(fork_branch_id)? {
+            if row.status != BranchStatus::Active
+                || row.parent_branch_id.as_deref() != Some(source_branch_id.as_str())
+                || row.branch_point_cut_id.as_deref() != Some(source_cut_id)
+            {
+                return Ok(ExactInstanceForkPreflight::Refused(
+                    ExactInstanceForkBinding::ForkBranchIdTaken {
+                        branch_id: row.branch_id,
+                    },
+                ));
+            }
+        } else if let Some(name) = name {
+            if let Some(holder) = self
+                .list_branches(Some(BranchStatus::Active))?
+                .into_iter()
+                .find(|row| row.name.as_deref() == Some(name))
+            {
+                return Ok(ExactInstanceForkPreflight::Refused(
+                    ExactInstanceForkBinding::ForkBranchIdTaken {
+                        branch_id: holder.branch_id,
+                    },
+                ));
+            }
+        }
+        Ok(ExactInstanceForkPreflight::Ready)
+    }
+
     pub fn fork_binding_for_instance_at_cut(
         &mut self,
         source_instance: &str,
@@ -4039,6 +4186,17 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
         name: Option<&str>,
         at: &str,
     ) -> StoreResult<ExactInstanceForkBinding> {
+        if let ExactInstanceForkPreflight::Refused(refusal) = self
+            .preflight_fork_binding_for_instance_at_cut(
+                source_instance,
+                source_cut_id,
+                target_instance,
+                fork_branch_id,
+                name,
+            )?
+        {
+            return Ok(refusal);
+        }
         let Some(source_branch_id) = self.instance_branch(source_instance)? else {
             return Ok(ExactInstanceForkBinding::SourceUnbound);
         };
@@ -6371,9 +6529,21 @@ mod tests {
             .expect("line");
         vcs.write("line-ws", "work.md", Some("work"), "line-1", "t3")
             .expect("stream work");
+        assert_eq!(
+            vcs.reserve_branch_head("line-ws", "reservation-ws", "t4")
+                .expect("reserve line"),
+            crate::branches::HeadReservationOutcome::Reserved
+        );
 
         let outcome = vcs
-            .promote_line_exact("line-ws", Some("line-1"), Some("main-1"), "main-2", "t4")
+            .promote_line_exact(
+                "line-ws",
+                "reservation-ws",
+                Some("line-1"),
+                Some("main-1"),
+                "main-2",
+                "t4",
+            )
             .expect("promote");
         let BoundaryPromotionOutcome::Promoted {
             main_cut_id,
@@ -6408,7 +6578,14 @@ mod tests {
         );
 
         let stale = vcs
-            .promote_line_exact("line-ws", Some("line-1"), Some("main-1"), "main-3", "t5")
+            .promote_line_exact(
+                "line-ws",
+                "reservation-ws",
+                Some("line-1"),
+                Some("main-1"),
+                "main-3",
+                "t5",
+            )
             .expect("stale attempt");
         assert!(matches!(
             stale,
@@ -6417,7 +6594,36 @@ mod tests {
                 ..
             } if cut == "main-2"
         ));
-        assert!(vcs.get_cut("main-3").expect("cut lookup").is_none());
+        assert!(
+            vcs.get_cut("main-3").expect("cut lookup").is_none(),
+            "the stale cut is rejected before proposal persistence"
+        );
+    }
+
+    #[test]
+    fn exact_promotion_requires_its_durable_reservation() {
+        let mut vcs = vcs();
+        vcs.init("t0").expect("init");
+        vcs.create_branch("line-ws", None, MAINLINE_BRANCH_ID, "t1")
+            .expect("line");
+
+        let error = vcs
+            .promote_line_exact("line-ws", "missing-reservation", None, None, "main-1", "t2")
+            .expect_err("promotion without the matching reservation must refuse");
+        assert!(format!("{error:?}").contains("not frozen by reservation"));
+    }
+
+    #[test]
+    fn recorded_promotion_cut_verification_refuses_a_missing_row() {
+        let error = NativeWorkspaceVcs::verify_recorded_promotion_cut(
+            None,
+            "main-2",
+            Some("main-1"),
+            "manifest",
+            "promote:line-ws",
+        )
+        .expect_err("a missing immutable proposal cannot be published");
+        assert!(format!("{error:?}").contains("proposed promotion cut is unavailable"));
     }
 
     #[test]
@@ -6432,9 +6638,18 @@ mod tests {
             .expect("stream work");
         vcs.write(MAINLINE_BRANCH_ID, "same.md", Some("main"), "main-2", "t4")
             .expect("main work");
+        vcs.reserve_branch_head("line-ws", "reservation-ws", "t5")
+            .expect("reserve line");
 
         let outcome = vcs
-            .promote_line_exact("line-ws", Some("line-1"), Some("main-2"), "main-3", "t5")
+            .promote_line_exact(
+                "line-ws",
+                "reservation-ws",
+                Some("line-1"),
+                Some("main-2"),
+                "main-3",
+                "t5",
+            )
             .expect("probe");
         assert!(matches!(
             outcome,
@@ -6455,6 +6670,73 @@ mod tests {
                 .head_cut_id
                 .as_deref(),
             Some("line-1")
+        );
+    }
+
+    #[test]
+    fn reserved_stream_line_refuses_every_direct_head_advance() {
+        let mut vcs = vcs();
+        vcs.init("t0").expect("init");
+        vcs.create_branch("line-ws", None, MAINLINE_BRANCH_ID, "t1")
+            .expect("line");
+        vcs.write("line-ws", "work.md", Some("before"), "line-1", "t2")
+            .expect("seed line");
+        vcs.reserve_branch_head("line-ws", "reservation-ws", "t3")
+            .expect("reserve line");
+
+        let error = vcs
+            .write("line-ws", "work.md", Some("after"), "line-2", "t4")
+            .expect_err("a direct write cannot bypass the boundary reservation");
+        assert!(format!("{error:?}").contains("reserved by `reservation-ws`"));
+        assert_eq!(
+            vcs.get_branch("line-ws")
+                .expect("line read")
+                .expect("line")
+                .head_cut_id
+                .as_deref(),
+            Some("line-1")
+        );
+        assert_eq!(
+            vcs.read("line-ws", "work.md").expect("body read"),
+            Some("before".to_owned())
+        );
+    }
+
+    #[test]
+    fn promotion_cut_record_failure_cannot_publish_main() {
+        let mut vcs = vcs();
+        vcs.init("t0").expect("init");
+        vcs.write(MAINLINE_BRANCH_ID, "base.md", Some("base"), "main-1", "t1")
+            .expect("seed main");
+        vcs.create_branch("line-ws", None, MAINLINE_BRANCH_ID, "t2")
+            .expect("line");
+        vcs.write("line-ws", "work.md", Some("work"), "line-1", "t3")
+            .expect("stream work");
+        vcs.create_branch("unrelated", None, MAINLINE_BRANCH_ID, "t3")
+            .expect("unrelated branch");
+        vcs.write("unrelated", "other.md", Some("other"), "main-2", "t3")
+            .expect("squat proposed cut identity");
+        vcs.reserve_branch_head("line-ws", "reservation-ws", "t4")
+            .expect("reserve line");
+
+        let error = vcs
+            .promote_line_exact(
+                "line-ws",
+                "reservation-ws",
+                Some("line-1"),
+                Some("main-1"),
+                "main-2",
+                "t4",
+            )
+            .expect_err("conflicting immutable cut identity must fail before Main CAS");
+        assert!(format!("{error:?}").contains("different immutable content"));
+        assert_eq!(
+            vcs.get_branch(MAINLINE_BRANCH_ID)
+                .expect("main read")
+                .expect("main")
+                .head_cut_id
+                .as_deref(),
+            Some("main-1")
         );
     }
 
@@ -6481,6 +6763,9 @@ mod tests {
         setup
             .write("line-ws", "work.md", Some("work"), "line-1", "t3")
             .expect("work");
+        setup
+            .reserve_branch_head("line-ws", "reservation-race", "t4")
+            .expect("reserve line");
         drop(setup);
 
         let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
@@ -6492,8 +6777,15 @@ mod tests {
             joins.push(std::thread::spawn(move || {
                 let mut vcs = NativeWorkspaceVcs::open(branches, content).expect("racing vcs");
                 barrier.wait();
-                vcs.promote_line_exact("line-ws", Some("line-1"), Some("main-1"), proposed, "race")
-                    .expect("promotion outcome")
+                vcs.promote_line_exact(
+                    "line-ws",
+                    "reservation-race",
+                    Some("line-1"),
+                    Some("main-1"),
+                    proposed,
+                    "race",
+                )
+                .expect("promotion outcome")
             }));
         }
         barrier.wait();

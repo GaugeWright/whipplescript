@@ -240,6 +240,59 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_do_head_reservation_blocks_advance_and_rebase_until_its_holder_releases() {
+        use whipplescript_store::branches::{AdvanceOutcome, Branches, HeadReservationOutcome};
+
+        let mut branches =
+            crate::do_branches::DoBranches::new(RusqliteDoSql::in_memory()).expect("branches open");
+        branches.ensure_mainline("t0").expect("mainline");
+        assert_eq!(
+            branches
+                .reserve_head("main", "reservation-a", "t1")
+                .expect("reserve"),
+            HeadReservationOutcome::Reserved
+        );
+
+        for refusal in [
+            branches.advance_head("main", None, "cut-a", "manifest-a", "t2"),
+            branches.rebase_branch(
+                "main",
+                None,
+                "point-a",
+                "point-manifest-a",
+                "cut-a",
+                "manifest-a",
+                "t2",
+            ),
+        ] {
+            let Err(whipplescript_store::StoreError::Conflict(message)) = refusal else {
+                panic!("reserved head mutation must be refused, got {refusal:?}");
+            };
+            assert!(message.contains("reserved by `reservation-a`"));
+        }
+        assert_eq!(
+            branches
+                .get_branch("main")
+                .expect("main read")
+                .expect("main")
+                .head_cut_id,
+            None
+        );
+        assert!(!branches
+            .release_head_reservation("main", "reservation-b")
+            .expect("wrong holder release"));
+        assert!(branches
+            .release_head_reservation("main", "reservation-a")
+            .expect("holder release"));
+        assert!(matches!(
+            branches
+                .advance_head("main", None, "cut-a", "manifest-a", "t3")
+                .expect("advance after release"),
+            AdvanceOutcome::Advanced(_)
+        ));
+    }
+
     fn head(
         instance: &str,
         sequence: i64,

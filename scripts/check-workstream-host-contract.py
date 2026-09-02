@@ -23,8 +23,8 @@ def fail(message: str) -> None:
 pin = json.loads(PIN.read_text(encoding="utf-8"))
 if pin.get("schema") != "whipplescript.workstream_host_contract_pin.v1":
     fail("wrong pin schema")
-if pin.get("contract_revision") != "whipplescript-workstream-host/v1.0.0":
-    fail("the published revision changed without a new contract file")
+if pin.get("contract_revision") != "whipplescript-workstream-host/v1.0.1":
+    fail("the current published v1 revision drifted")
 
 claimed_digest = pin.get("contract_digest")
 digest_body = dict(pin)
@@ -44,10 +44,13 @@ required_operations = {
     "close_promoted",
     "home_receipt",
     "transfer",
+    "reserve_branch_head",
+    "release_branch_head_reservation",
     "promote_line_exact",
     "boundary_ref_evidence",
     "fork_binding_for_instance_at_cut",
     "fork_at_cut_and_admit",
+    "host_discard_instance",
     "materialize_manifest_subset",
     "import_scratch",
 }
@@ -98,6 +101,11 @@ required_cases = {
     "home_rejoin_has_new_authority_position",
     "concurrent_reservation_has_one_winner",
     "concurrent_main_cas_has_one_winner",
+    "reserved_line_rejects_direct_head_advance",
+    "proposal_record_failure_precedes_main_publication",
+    "fork_identity_refusal_preserves_existing_home",
+    "discard_requires_unused_fork_evidence",
+    "discard_replay_key_is_namespaced_and_verified",
 }
 if len(ids) != len(set(ids)) or set(ids) != required_cases:
     fail("fixture case inventory is incomplete or duplicated")
