@@ -337,6 +337,19 @@ impl CredentialKind {
                     // Under `egress through custodian`, which is the default.
                     | CredentialKind::MtlsClient
             ),
+            // The SYMMETRIC and opaque kinds, which have no public half to
+            // publish instead. DR-0053 §5's amendment is explicit that
+            // asymmetric kinds hand off by publishing their public half — that
+            // is not material and needs no operation — so admitting them here
+            // would offer a way to ship a private key that the design says
+            // nobody needs.
+            Operation::Deliver => matches!(
+                self,
+                CredentialKind::Bearer
+                    | CredentialKind::Basic
+                    | CredentialKind::Raw
+                    | CredentialKind::HmacSha256
+            ),
             Operation::Sign => matches!(
                 self,
                 CredentialKind::HmacSha256
@@ -465,6 +478,18 @@ pub enum Operation {
     Wrap,
     Unwrap,
     Mint,
+    /// Hand the credential ITSELF to a recipient (DR-0053 §5 Amendment): the
+    /// custodian makes the call and the credential is the payload rather than
+    /// the authentication — `request` with the roles swapped, bounded by the
+    /// same egress allow-list.
+    ///
+    /// A SEPARATE grant class from `request`, and that is the whole reason it
+    /// is an operation rather than a flag on one. Spending a credential and
+    /// giving it away are different authorities: a program granted `request` on
+    /// a deploy key may call the API with it, and must not be able to post it
+    /// to an endpoint of its choosing. One grant covering both would make every
+    /// existing `request` grant a handoff grant retroactively.
+    Deliver,
     /// Create sealed material in a declared vault (DR-0053 §2 Amendment
     /// 2026-08-29). A CONTAINER operation: it acts on a vault rather than on an
     /// existing credential, so no kind is consulted and `supports` is false for
@@ -492,7 +517,7 @@ impl Operation {
     /// `Generate` and `Revoke` act on a container and belong to vault grants,
     /// so listing them here would offer them as `allow` entries that every kind
     /// then refuses.
-    pub const ALL: [Operation; 7] = [
+    pub const ALL: [Operation; 8] = [
         Operation::Request,
         Operation::Sign,
         Operation::Verify,
@@ -500,6 +525,7 @@ impl Operation {
         Operation::Wrap,
         Operation::Unwrap,
         Operation::Mint,
+        Operation::Deliver,
     ];
 
     /// The CONTAINER operations, which act on a vault rather than a member.
@@ -527,6 +553,7 @@ impl Operation {
             Operation::Wrap => "wrap",
             Operation::Unwrap => "unwrap",
             Operation::Mint => "mint",
+            Operation::Deliver => "deliver",
             Operation::Generate => "generate",
             Operation::Rotate => "rotate",
             Operation::Register => "register",
@@ -537,6 +564,7 @@ impl Operation {
     pub fn parse(s: &str) -> Result<Self, String> {
         match s {
             "request" => Ok(Operation::Request),
+            "deliver" => Ok(Operation::Deliver),
             "sign" => Ok(Operation::Sign),
             "verify" => Ok(Operation::Verify),
             "derive" => Ok(Operation::Derive),
@@ -558,7 +586,11 @@ impl Operation {
     /// declares which axis, if any, it narrows on.
     pub fn grant_class(&self) -> GrantClass {
         match self {
-            Operation::Request | Operation::Mint => GrantClass::Narrowable,
+            // Narrowable for the reason `request` is, and more urgently: a
+            // grant to hand a credential over is only meaningful if it says
+            // WHERE. `deliver` with no destination list would be "give this to
+            // anyone", which is not a grant so much as an abdication.
+            Operation::Request | Operation::Mint | Operation::Deliver => GrantClass::Narrowable,
             Operation::Unwrap => GrantClass::TypeNarrowed,
             Operation::Sign | Operation::Verify | Operation::Derive | Operation::Wrap => {
                 GrantClass::NonNarrowable
@@ -920,6 +952,23 @@ pub enum CustodyOp {
         /// cannot remove the author's, so the totals disagree.
         slots: usize,
     },
+    /// Hand the credential to a recipient: substitute at the marked slots,
+    /// egress, and RECORD the handoff.
+    ///
+    /// Mechanically `Request` — the same substitution, the same allow-list, the
+    /// same sentinel-count defence. What differs is the grant it needs and the
+    /// record it leaves. The record is the point: DR-0053 §5's reaping rule is
+    /// "reap what was never handed off", and until something performs the
+    /// handoff there is nothing for that rule to read.
+    Deliver {
+        credential: CredentialName,
+        request: EgressRequest,
+        /// As `Request::slots`, and the defence matters more here: a sentinel
+        /// arriving inside interpolated data would put the bare secret at a
+        /// position the author never designated, and for `deliver` the whole
+        /// payload IS the secret.
+        slots: usize,
+    },
     /// Keyed signature, optionally through a derivation chain (§7): the
     /// custodian folds `HMAC` over the chain from the sealed material, then
     /// signs the payload with the final key. For AWS SigV4 the chain is
@@ -1008,6 +1057,7 @@ impl CustodyOp {
             CustodyOp::Wrap { .. } => Operation::Wrap,
             CustodyOp::Unwrap { .. } => Operation::Unwrap,
             CustodyOp::Mint { .. } => Operation::Mint,
+            CustodyOp::Deliver { .. } => Operation::Deliver,
         }
     }
 
@@ -1020,6 +1070,7 @@ impl CustodyOp {
             | CustodyOp::Wrap { credential, .. }
             | CustodyOp::Unwrap { credential, .. }
             | CustodyOp::Mint { credential, .. }
+            | CustodyOp::Deliver { credential, .. }
             | CustodyOp::Generate { credential, .. }
             | CustodyOp::Register { credential, .. }
             | CustodyOp::Rotate { credential }
@@ -1102,6 +1153,15 @@ pub enum CustodyOk {
     },
     Requested {
         response: EgressResponse,
+    },
+    /// The credential reached the recipient, and WHEN.
+    ///
+    /// The timestamp is the handoff record DR-0053 §5's reaping rule needs:
+    /// "reap what was never handed off" cannot be written until something says
+    /// a handoff happened.
+    Delivered {
+        response: EgressResponse,
+        handed_off_at: u64,
     },
     Signed {
         signature_b64: String,
@@ -1456,7 +1516,14 @@ mod tests {
             .copied()
             .filter(Operation::narrowable)
             .collect();
-        assert_eq!(narrowable, vec![Operation::Request, Operation::Mint]);
+        // `deliver` joined this class deliberately (DR-0053 §5 Amendment): a
+        // grant to HAND A CREDENTIAL OVER is only meaningful if it says where,
+        // and one with no destination list would be "give this to anyone",
+        // which is an abdication rather than a grant.
+        assert_eq!(
+            narrowable,
+            vec![Operation::Request, Operation::Mint, Operation::Deliver]
+        );
         // DR-0074 §2: `unwrap` left the non-narrowable class for a third one.
         assert_eq!(Operation::Unwrap.grant_class(), GrantClass::TypeNarrowed);
         assert!(!Operation::Unwrap.narrowable());

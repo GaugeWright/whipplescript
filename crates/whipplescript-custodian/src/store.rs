@@ -114,6 +114,13 @@ struct SealedEntry {
     /// rather than one replacing the other.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     lease_expires_at: Option<u64>,
+    /// When this credential was HANDED OFF, epoch seconds (DR-0053 §5's
+    /// reaping rule). Durable, because the rule it feeds — "reap what was never
+    /// handed off" — is asked at instance terminal, which may be after a
+    /// custodian restart. A handoff that only lived in process memory would
+    /// reap a key that already reached its recipient.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    delivered_at: Option<u64>,
 }
 
 /// Where a remote entry's material lives. One variant per remote backend.
@@ -181,6 +188,9 @@ pub struct Entry {
     /// Epoch seconds after which this credential refuses use. See the sealed
     /// entry's field for why it is durable where the budget is not.
     pub lease_expires_at: Option<u64>,
+    /// When this credential was handed off, if it was. `None` means it never
+    /// left, which is what makes it reapable.
+    pub delivered_at: Option<u64>,
 }
 
 /// The passphrase-sealed store, fully unsealed into custodian memory at open.
@@ -286,6 +296,7 @@ impl SealedStore {
                         revoked: sealed.revoked,
                         budget: sealed.budget,
                         lease_expires_at: sealed.lease_expires_at,
+                        delivered_at: sealed.delivered_at,
                     },
                 );
                 continue;
@@ -301,6 +312,7 @@ impl SealedStore {
                         revoked: sealed.revoked,
                         budget: sealed.budget,
                         lease_expires_at: sealed.lease_expires_at,
+                        delivered_at: sealed.delivered_at,
                     },
                 );
                 continue;
@@ -345,6 +357,7 @@ impl SealedStore {
                     revoked: sealed.revoked,
                     budget: sealed.budget,
                     lease_expires_at: sealed.lease_expires_at,
+                    delivered_at: sealed.delivered_at,
                 },
             );
         }
@@ -384,6 +397,7 @@ impl SealedStore {
                 revoked: false,
                 budget,
                 lease_expires_at,
+                delivered_at: None,
             },
         );
         self.persist()
@@ -408,6 +422,7 @@ impl SealedStore {
                 revoked: false,
                 budget,
                 lease_expires_at,
+                delivered_at: None,
             },
         );
         self.persist()
@@ -432,6 +447,7 @@ impl SealedStore {
                 revoked: false,
                 budget,
                 lease_expires_at,
+                delivered_at: None,
             },
         );
         self.persist()
@@ -460,9 +476,42 @@ impl SealedStore {
                 revoked: false,
                 budget,
                 lease_expires_at,
+                delivered_at: None,
             },
         );
         self.persist()
+    }
+
+    /// Record that a credential was handed off, and persist it.
+    ///
+    /// Persisted rather than kept in memory because the rule it feeds is asked
+    /// at instance terminal — possibly after a custodian restart — and a
+    /// handoff the restart forgot would reap a key that already reached its
+    /// recipient.
+    ///
+    /// The FIRST handoff wins. A credential delivered twice was still handed
+    /// off once, and moving the timestamp would say the reaping question is
+    /// "when did this last leave" when it is "did this ever leave".
+    pub fn mark_delivered(&mut self, name: &CredentialName, at: u64) -> Result<(), StoreError> {
+        match self.entries.get_mut(name) {
+            Some(entry) => {
+                if entry.delivered_at.is_none() {
+                    entry.delivered_at = Some(at);
+                    self.persist()?;
+                }
+                Ok(())
+            }
+            None => Err(StoreError::Format(format!(
+                "cannot record a handoff for {}, which is not in this store",
+                name.resource_id()
+            ))),
+        }
+    }
+
+    /// Whether a credential was ever handed off — the question DR-0053 §5's
+    /// reaping rule asks.
+    pub fn delivered_at(&self, name: &CredentialName) -> Option<u64> {
+        self.entries.get(name).and_then(|entry| entry.delivered_at)
     }
 
     pub fn revoke(&mut self, name: &CredentialName) -> Result<bool, StoreError> {
@@ -507,6 +556,7 @@ impl SealedStore {
                         revoked: entry.revoked,
                         budget: entry.budget,
                         lease_expires_at: entry.lease_expires_at,
+                        delivered_at: entry.delivered_at,
                     }
                 }
                 // Remote entries persist as plaintext metadata: no nonce, no
@@ -523,6 +573,7 @@ impl SealedStore {
                     revoked: entry.revoked,
                     budget: entry.budget,
                     lease_expires_at: entry.lease_expires_at,
+                    delivered_at: entry.delivered_at,
                 },
                 // Same shape as remote, and for the same reason: an r2 entry
                 // has no secret on this box to seal, only the platform state it
@@ -537,6 +588,7 @@ impl SealedStore {
                     revoked: entry.revoked,
                     budget: entry.budget,
                     lease_expires_at: entry.lease_expires_at,
+                    delivered_at: entry.delivered_at,
                 },
                 // Same shape again: no secret on this box, only where the key
                 // is and what admitted it.
@@ -556,6 +608,7 @@ impl SealedStore {
                     revoked: entry.revoked,
                     budget: entry.budget,
                     lease_expires_at: entry.lease_expires_at,
+                    delivered_at: entry.delivered_at,
                 },
             };
             sealed_entries.insert(name.as_str().to_string(), sealed);

@@ -529,6 +529,7 @@ impl Custodian {
             // below — so routing it through them means one implementation of
             // those refusals rather than a second copy inside a handler.
             CustodyOp::Rotate { .. }
+            | CustodyOp::Deliver { .. }
             | CustodyOp::Request { .. }
             | CustodyOp::Sign { .. }
             | CustodyOp::Verify { .. }
@@ -604,6 +605,9 @@ impl Custodian {
         match op {
             CustodyOp::Request { request, slots, .. } => {
                 self.op_request(&name, kind, &material, request, *slots)
+            }
+            CustodyOp::Deliver { request, slots, .. } => {
+                self.op_deliver(&name, kind, &material, request, *slots)
             }
             CustodyOp::Sign {
                 alg,
@@ -772,6 +776,64 @@ impl Custodian {
         // place that holds both the material and the response.
         Ok(CustodyOk::Requested {
             response: secrets.scrub_response(response, name),
+        })
+    }
+
+    /// Hand the credential to a recipient, and RECORD that it happened.
+    ///
+    /// Mechanically `op_request`: the same substitution, the same allow-list,
+    /// the same sentinel-count defence. Two things differ, and both are the
+    /// reason this is its own operation.
+    ///
+    /// The GRANT is separate — spending a credential and giving it away are
+    /// different authorities, and one grant covering both would have made every
+    /// existing `request` grant a handoff grant retroactively.
+    ///
+    /// The RECORD is the point. DR-0053 §5 states the reaping rule as "reap
+    /// what was never handed off" and deliberately did not build it, because
+    /// until something performs a handoff there is nothing for the rule to
+    /// read. This writes that fact, so `retain instance` can stop reaping a key
+    /// that already reached CI.
+    ///
+    /// The response is scrubbed like any other, and here that is not belt and
+    /// braces: an endpoint that echoes its request body would otherwise hand
+    /// the credential straight back into whip's run record, and for `deliver`
+    /// the body IS the credential.
+    fn op_deliver(
+        &self,
+        name: &CredentialName,
+        kind: CredentialKind,
+        material: &[u8],
+        request: &EgressRequest,
+        declared_slots: usize,
+    ) -> Result<CustodyOk, CustodyError> {
+        let (substituted, secrets) =
+            substitute_request(name, kind, material, request, declared_slots)?;
+        let response = self
+            .egress
+            .perform(&substituted)
+            .map_err(|detail| CustodyError::EgressFailed { detail })?;
+        // Recorded only on a response the recipient actually gave: a handoff
+        // that failed to egress did not happen, and marking it would tell the
+        // reaper to spare a credential nobody received.
+        let handed_off_at = now_epoch_s();
+        // A handoff that the store could not record is a handoff nobody can
+        // prove: the credential HAS reached the recipient, and reporting
+        // success while the reaper still believes it never left would revoke a
+        // live key. Failing loudly is the honest answer — the operator can see
+        // that the delivery happened and the record did not.
+        if let Err(error) = lock(&self.store).mark_delivered(name, handed_off_at) {
+            // Bound rather than constructed inline: `unrecordable_handoff` is
+            // where the decision and its words live and where they are tested,
+            // so this line FORWARDS a refusal rather than being one. That also
+            // keeps the sweep's account of this file honest — a call inside
+            // `Err(...)` is a site it cannot mutate.
+            let refusal = unrecordable_handoff(name, &error.to_string());
+            return Err(refusal);
+        }
+        Ok(CustodyOk::Delivered {
+            response: secrets.scrub_response(response, name),
+            handed_off_at,
         })
     }
 
@@ -1451,6 +1513,34 @@ fn hkdf_expand(material: &[u8], info: &[u8]) -> Result<Zeroizing<Vec<u8>>, Custo
 /// `basic` is deliberately absent from v1. We could generate the password half,
 /// but a `basic` credential is a PAIR and the username is not ours to invent,
 /// so generating one would produce a credential that authenticates to nothing.
+/// What an operator is told when a delivery succeeded and its record did not.
+///
+/// A function rather than a `map_err` closure, and not for tidiness: a refusal
+/// built inside `map_err` is not an `Err(` construction, so the mutation sweep
+/// does not see it AT ALL — it is not reported as unmeasured, it is simply not
+/// a site. The gate passes and the refusal is unpinned, which is worse than
+/// being told it is unpinned.
+///
+/// The message has to carry the asymmetry: the credential HAS reached the
+/// recipient and cannot be recalled, so the failure is the record's. Reporting
+/// success would leave a reaper believing the key never left, and it would
+/// revoke a live one.
+pub fn unrecordable_handoff_detail(name: &CredentialName, error: &str) -> String {
+    match unrecordable_handoff(name, error) {
+        CustodyError::Backend { detail } => detail,
+        other => other.to_string(),
+    }
+}
+
+fn unrecordable_handoff(name: &CredentialName, error: &str) -> CustodyError {
+    CustodyError::Backend {
+        detail: format!(
+            "credential {name} reached its recipient but the handoff could not be recorded \
+             ({error}), so a reaper would still treat it as never delivered"
+        ),
+    }
+}
+
 fn generatable_key_len(kind: CredentialKind) -> Option<usize> {
     // WHICH kinds can be generated is `CredentialKind::is_generatable`, in the
     // vocabulary crate, because the language asks the same question when it

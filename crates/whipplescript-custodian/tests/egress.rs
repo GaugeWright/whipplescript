@@ -331,3 +331,125 @@ fn an_echoed_credential_is_redacted_out_of_the_response() {
     assert!(body.contains("[redacted echo_api]"), "{body}");
     assert!(headers.contains("[redacted echo_api]"), "{headers}");
 }
+
+/// `deliver` hands the credential over as the PAYLOAD, and records that it
+/// happened (DR-0053 §5's reaping rule).
+#[test]
+fn deliver_puts_the_credential_in_the_body_and_records_the_handoff() {
+    let (port, server) = one_shot_server(r#"{"stored":true}"#);
+
+    let mut store = SealedStore::create(None, "pw").expect("store");
+    store
+        .register(
+            name("ci_token"),
+            CredentialKind::Bearer,
+            Zeroizing::new(b"tok-for-ci-987".to_vec()),
+            None,
+            None,
+        )
+        .expect("register");
+    let custodian = Custodian::new(store, Box::new(UreqEgress::new(vec!["127.0.0.1".into()])));
+
+    // The sentinel is in the BODY: that is the roles swapped. In `request` the
+    // credential authenticates the call; here it IS the call's content.
+    let sentinel = Sentinel::new(name("ci_token"), PresentationForm::Raw).render();
+    let body = format!(r#"{{"secret":"{sentinel}"}}"#);
+    let reply = custodian.handle(&CustodyCall::new(
+        UseAttribution {
+            run_id: "deliver-test".into(),
+            actor: None,
+            effect_key: None,
+        },
+        CustodyOp::Deliver {
+            credential: name("ci_token"),
+            slots: 1,
+            request: EgressRequest {
+                method: "PUT".into(),
+                url: format!("http://127.0.0.1:{port}/repos/x/secrets/TOKEN"),
+                headers: vec![],
+                body_b64: Some(B64.encode(body.as_bytes())),
+            },
+        },
+    ));
+
+    let handed_off_at = match reply.outcome.expect("the recipient answered") {
+        CustodyOk::Delivered {
+            response,
+            handed_off_at,
+        } => {
+            assert_eq!(response.status, 200);
+            handed_off_at
+        }
+        other => panic!("expected a delivery, got {other:?}"),
+    };
+    assert!(handed_off_at > 0, "the handoff carries when it happened");
+
+    let seen = server.join().expect("server thread");
+    assert!(
+        seen.contains("tok-for-ci-987"),
+        "the recipient received the credential itself: {seen}"
+    );
+    assert!(
+        !seen.contains("whip-credential:"),
+        "and not the sentinel: {seen}"
+    );
+}
+
+/// An endpoint that echoes the body hands the credential straight back. The
+/// scrub is what stops it landing in whip's run record — and for `deliver` the
+/// body IS the credential, so this is the case that matters most.
+#[test]
+fn a_recipient_that_echoes_the_credential_does_not_return_it_to_whip() {
+    let mut store = SealedStore::create(None, "pw").expect("store");
+    store
+        .register(
+            name("ci_token"),
+            CredentialKind::Bearer,
+            Zeroizing::new(b"tok-echoed-555".to_vec()),
+            None,
+            None,
+        )
+        .expect("register");
+    // A server that replies with the credential in its body.
+    let (port, server) = one_shot_server(r#"{"stored":"tok-echoed-555"}"#);
+    let custodian = Custodian::new(store, Box::new(UreqEgress::new(vec!["127.0.0.1".into()])));
+
+    let sentinel = Sentinel::new(name("ci_token"), PresentationForm::Raw).render();
+    let reply = custodian.handle(&CustodyCall::new(
+        UseAttribution {
+            run_id: "deliver-echo".into(),
+            actor: None,
+            effect_key: None,
+        },
+        CustodyOp::Deliver {
+            credential: name("ci_token"),
+            slots: 1,
+            request: EgressRequest {
+                method: "PUT".into(),
+                url: format!("http://127.0.0.1:{port}/repos/x/secrets/TOKEN"),
+                headers: vec![],
+                body_b64: Some(B64.encode(format!(r#"{{"secret":"{sentinel}"}}"#).as_bytes())),
+            },
+        },
+    ));
+    let _ = server.join();
+
+    match reply.outcome.expect("answered") {
+        CustodyOk::Delivered { response, .. } => {
+            let returned = response
+                .body_b64
+                .as_ref()
+                .map(|b| String::from_utf8_lossy(&B64.decode(b).expect("b64")).into_owned())
+                .unwrap_or_default();
+            assert!(
+                !returned.contains("tok-echoed-555"),
+                "the credential came back and was not scrubbed: {returned}"
+            );
+            assert!(
+                returned.contains("[redacted"),
+                "and the redaction says so: {returned}"
+            );
+        }
+        other => panic!("expected a delivery, got {other:?}"),
+    }
+}

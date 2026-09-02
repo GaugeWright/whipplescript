@@ -759,8 +759,19 @@ fn use_records_cover_all_operations() {
         Operation::Wrap,
         Operation::Unwrap,
         Operation::Mint,
+        Operation::Deliver,
     ];
     assert_eq!(ops.len(), Operation::ALL.len());
+    // Named individually rather than counted, so adding a member operation
+    // fails here with the NAME of the one that has no attribution rather than
+    // with two numbers.
+    for op in Operation::ALL {
+        assert!(
+            ops.contains(&op),
+            "`{}` is a member operation with no use record: §1 claims attribution for EVERY use",
+            op.as_str()
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1290,4 +1301,191 @@ fn a_lease_survives_a_custodian_restart() {
         "an expiry must survive the restart that resets a budget: {reply:?}"
     );
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `deliver` is a SEPARATE authority from `request`, and only for the kinds
+/// that have no public half to publish instead (DR-0053 §5 Amendment).
+#[test]
+fn delivering_a_credential_is_not_the_same_authority_as_spending_it() {
+    use whipplescript_custody::Operation;
+
+    // Spending and giving away are different grants. One covering both would
+    // have made every existing `request` grant a handoff grant retroactively.
+    assert_ne!(Operation::Request, Operation::Deliver);
+    assert_eq!(
+        Operation::parse("deliver").expect("known"),
+        Operation::Deliver
+    );
+    assert!(
+        Operation::ALL.contains(&Operation::Deliver),
+        "a member operation, so a declaration's `allow` list may name it"
+    );
+    assert!(
+        !Operation::Deliver.is_container(),
+        "it acts on an existing credential rather than on a vault"
+    );
+    // Narrowable, and more urgently than `request`: a handoff grant with no
+    // destination list would be "give this to anyone".
+    assert!(Operation::Deliver.narrowable());
+}
+
+#[test]
+fn only_kinds_with_no_public_half_can_be_delivered() {
+    use whipplescript_custody::{CredentialKind, Operation};
+
+    // The symmetric and opaque kinds have nothing to publish instead.
+    for kind in [
+        CredentialKind::Bearer,
+        CredentialKind::Basic,
+        CredentialKind::Raw,
+        CredentialKind::HmacSha256,
+    ] {
+        assert!(
+            kind.supports(Operation::Deliver),
+            "{kind} has no public half, so handing it over is the only handoff"
+        );
+    }
+    // §5 is explicit that asymmetric kinds hand off by publishing their public
+    // half — not material, no operation needed — so admitting them here would
+    // offer a way to ship a private key the design says nobody needs.
+    for kind in [
+        CredentialKind::Ed25519,
+        CredentialKind::JwtRs256,
+        CredentialKind::MtlsClient,
+    ] {
+        assert!(
+            !kind.supports(Operation::Deliver),
+            "{kind} hands off by publishing its public half"
+        );
+    }
+}
+
+#[test]
+fn a_kind_that_cannot_be_delivered_is_refused_by_name() {
+    let mut store = SealedStore::create(None, "pw").expect("store");
+    store
+        .register(
+            name("release_signing"),
+            CredentialKind::Ed25519,
+            zeroize::Zeroizing::new([7u8; 32].to_vec()),
+            None,
+            None,
+        )
+        .expect("register");
+    let custodian = Custodian::new(store, Box::new(whipplescript_custodian::DeniedEgress));
+
+    let reply = custodian.handle(&call(CustodyOp::Deliver {
+        credential: name("release_signing"),
+        slots: 0,
+        request: whipplescript_custody::EgressRequest {
+            method: "PUT".into(),
+            url: "https://ci.example/secrets".into(),
+            headers: vec![],
+            body_b64: None,
+        },
+    }));
+    let error = reply.outcome.expect_err("an ed25519 key is not delivered");
+    let said = error.to_string();
+    assert!(said.contains("release_signing"), "{said}");
+    assert!(
+        said.contains("deliver"),
+        "the refusal names the operation: {said}"
+    );
+}
+
+#[test]
+fn a_handoff_is_recorded_once_and_survives_a_restart() {
+    // The reaping rule asks "did this EVER leave", not "when did it last
+    // leave", so a second delivery does not move the timestamp. And it is asked
+    // at instance terminal, possibly after a restart — a handoff that only
+    // lived in memory would reap a key that already reached its recipient.
+    let directory = std::env::temp_dir().join(format!("whip-handoff-{}", std::process::id()));
+    std::fs::create_dir_all(&directory).expect("temp dir");
+    let path = directory.join("store.json");
+
+    let mut store = SealedStore::create(Some(path.clone()), "pw").expect("store");
+    store
+        .register(
+            name("ci_token"),
+            CredentialKind::Bearer,
+            zeroize::Zeroizing::new(b"tok".to_vec()),
+            None,
+            None,
+        )
+        .expect("register");
+    assert_eq!(
+        store.delivered_at(&name("ci_token")),
+        None,
+        "never handed off yet"
+    );
+
+    store
+        .mark_delivered(&name("ci_token"), 1_000)
+        .expect("recorded");
+    store
+        .mark_delivered(&name("ci_token"), 2_000)
+        .expect("again");
+    assert_eq!(
+        store.delivered_at(&name("ci_token")),
+        Some(1_000),
+        "the FIRST handoff stands: it left, and when it last left is a different question"
+    );
+
+    let reopened = SealedStore::open(&path, "pw").expect("reopen");
+    assert_eq!(
+        reopened.delivered_at(&name("ci_token")),
+        Some(1_000),
+        "the record survives the restart the reaping question is asked after"
+    );
+    let _ = std::fs::remove_dir_all(&directory);
+}
+
+#[test]
+fn a_handoff_for_a_credential_that_is_not_there_is_refused() {
+    let mut store = SealedStore::create(None, "pw").expect("store");
+    let refused = store
+        .mark_delivered(&name("absent"), 1_000)
+        .expect_err("nothing to record against");
+    assert!(
+        refused.to_string().contains("not in this store"),
+        "{refused}"
+    );
+}
+
+/// A delivery whose record failed says so, and does NOT report success.
+///
+/// The asymmetry is the point: the credential has already reached the
+/// recipient and cannot be recalled, so the only thing that failed is the
+/// record — and a reaper reading a missing record would revoke a live key.
+#[test]
+fn a_handoff_that_cannot_be_recorded_fails_loudly() {
+    let mut store = SealedStore::create(None, "pw").expect("store");
+    store
+        .register(
+            name("ci_token"),
+            CredentialKind::Bearer,
+            zeroize::Zeroizing::new(b"tok".to_vec()),
+            None,
+            None,
+        )
+        .expect("register");
+    // The store refuses a handoff for a credential it does not hold, which is
+    // the failure this message renders.
+    let error = store
+        .mark_delivered(&name("absent"), 1_000)
+        .expect_err("nothing to record against")
+        .to_string();
+    let said = whipplescript_custodian::unrecordable_handoff_detail(&name("ci_token"), &error);
+    assert!(
+        said.contains("reached its recipient"),
+        "the credential is GONE, and the message must say so: {said}"
+    );
+    assert!(
+        said.contains("could not be recorded"),
+        "and that the record is what failed: {said}"
+    );
+    assert!(
+        said.contains("treat it as never delivered"),
+        "and what that costs: {said}"
+    );
 }
