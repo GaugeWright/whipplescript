@@ -2340,6 +2340,41 @@ grant has with the store's own `allow` globs. The material never enters the
 agent's process: the turn names a credential, and the custodian substitutes at
 egress.
 
+#### Handing a credential over
+
+`request` SPENDS a credential: the material authenticates a call and never
+appears in the body. `deliver` GIVES IT AWAY — the credential is the payload,
+and the recipient can use it afterwards without the workflow.
+
+Those are different authorities, so they are different grants. A turn granted
+`request` on a credential has no way to ship it, and the two lists are separate
+in the signed envelope too — `grant request` says where a credential may be
+spent and `grant deliver` says where it may be sent:
+
+<!-- check: skip — excerpt; the surrounding program's declarations are not shown -->
+```whip
+tell deployer
+  with access to credential ci_token {
+    deliver ["POST https://ci.example.com/secrets/*"]
+  }
+"Hand the deploy token to CI."
+```
+
+`deliver` is narrowable like `request` and the destination list is required: a
+handoff grant naming nowhere is "give this to anyone", which the checker
+refuses. Only the kinds with no public half can be handed over — `bearer`,
+`basic`, `raw`, `hmac-sha256` — because an asymmetric credential hands off by
+publishing its public half, which is not material and needs no operation.
+
+The turn is offered a `credential_deliver` tool naming exactly those
+credentials. It takes no body: the tool places the credential itself, either as
+the whole body or as one JSON field named by `field`, so the slot cannot be
+aimed somewhere the author never designated.
+
+A delivery is RECORDED, durably and first-wins, because the record is what
+`retain instance` reads at the end of a run: a credential that reached a
+recipient outlives the run that made it, and one that never left is revoked.
+
 ### The sealing rung and the governance floor
 
 The custodian seals material at a rung that it derives from evidence:

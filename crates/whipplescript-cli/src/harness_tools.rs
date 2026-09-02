@@ -199,6 +199,15 @@ pub const TOOL_CREDENTIAL_REQUEST: &str = "credential_request";
 /// need it.
 pub const TOOL_CREDENTIAL_GENERATE: &str = "credential_generate";
 
+/// The agent-facing HANDOFF surface (DR-0053 §5's `deliver`).
+///
+/// Separate from `credential_request` because it is a separate authority and a
+/// separate act: `request` SPENDS a credential — the material authenticates a
+/// call and never appears in the body — while `deliver` GIVES IT AWAY, and the
+/// material is the payload. A turn sees this tool only if its grant lists
+/// `deliver`, so holding `request` on a credential offers no way to ship it.
+pub const TOOL_CREDENTIAL_DELIVER: &str = "credential_deliver";
+
 /// The agent-facing custody surface (DR-0053 §14). Offered only to a turn whose
 /// grant lists `request` on at least one credential, and the credentials it may
 /// name are exactly those — so a turn granted nothing sees no tool at all,
@@ -210,6 +219,7 @@ pub const TOOL_CREDENTIAL_GENERATE: &str = "credential_generate";
 fn credential_tool_specs_for_turn(access: &TurnToolAccess) -> Vec<ToolSpec> {
     let mut specs = Vec::new();
     specs.extend(vault_tool_specs_for_turn(access));
+    specs.extend(deliver_tool_specs_for_turn(access));
     if access.credentials.is_empty() {
         return specs;
     }
@@ -240,6 +250,54 @@ fn credential_tool_specs_for_turn(access: &TurnToolAccess) -> Vec<ToolSpec> {
         }),
     });
     specs
+}
+
+/// The handoff surface, offered only to a turn whose grant lists `deliver` on
+/// at least one credential, and naming exactly those.
+///
+/// The tool does NOT take a body. It builds one, because for a delivery the
+/// secret IS the payload: a body the model wrote could place the slot in a
+/// header, place several, or wrap it in text the recipient never asked for.
+/// `field` chooses between the two shapes a recipient actually asks for — a
+/// bare secret, or a one-field JSON object — and the slot goes where this code
+/// puts it either way. That is the same rule `credential_request` follows for
+/// its `Authorization` header, applied where the stakes are higher.
+fn deliver_tool_specs_for_turn(access: &TurnToolAccess) -> Vec<ToolSpec> {
+    if access.credentials.handoffs_are_empty() {
+        return Vec::new();
+    }
+    let handles: Vec<String> = access.credentials.handoffs.keys().cloned().collect();
+    vec![ToolSpec {
+        name: TOOL_CREDENTIAL_DELIVER.into(),
+        description: format!(
+            "Hand a credential this turn was granted ({}) to a recipient that needs to hold \
+             it. The material never enters this process: the custodian substitutes it into \
+             the body at egress. This GIVES THE CREDENTIAL AWAY rather than spending it, so \
+             the recipient can use it afterwards without you. Destinations outside the \
+             granted list are refused.",
+            handles.join(", ")
+        ),
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "credential": { "type": "string", "enum": handles },
+                "method": { "type": "string" },
+                "url": { "type": "string" },
+                "field": {
+                    "type": "string",
+                    "description": "optional JSON field to carry the secret; omitted sends the \
+                                    secret as the whole body"
+                },
+                "headers": {
+                    "type": "object",
+                    "description": "extra headers; the credential is placed in the body, not here",
+                    "additionalProperties": { "type": "string" }
+                }
+            },
+            "required": ["credential", "method", "url"],
+            "additionalProperties": false
+        }),
+    }]
 }
 
 /// The creation surface, offered only to a turn granted `create` on at least
@@ -289,6 +347,42 @@ fn generated_reply(
         })
         .to_string()),
         Ok(other) => Err(format!("custodian answered a generate with {other:?}")),
+        Err(refusal) => Err(format!("custodian refused: {refusal:?}")),
+    }
+}
+
+/// What a `deliver` reply means, as a pure function — extracted for the reason
+/// `generated_reply` is, so its refusal arms are reachable without a live
+/// custodian socket.
+///
+/// The response body is reported because a recipient's answer is how an agent
+/// learns the handoff was accepted, and the custodian has already scrubbed the
+/// material out of it. `handed_off_at` is reported because it is the durable
+/// record's timestamp: the moment after which a reap will spare this
+/// credential, which is the thing that changed.
+fn delivered_reply(
+    outcome: Result<whipplescript_custody::CustodyOk, whipplescript_custody::CustodyError>,
+) -> Result<String, String> {
+    match outcome {
+        Ok(whipplescript_custody::CustodyOk::Delivered {
+            response,
+            handed_off_at,
+        }) => {
+            let body = response
+                .body_b64
+                .as_deref()
+                .map(whipplescript_custody::decode_body_b64)
+                .transpose()?
+                .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+                .unwrap_or_default();
+            Ok(json!({
+                "status": response.status,
+                "body": body,
+                "handed_off_at": handed_off_at,
+            })
+            .to_string())
+        }
+        Ok(other) => Err(format!("custodian answered a deliver with {other:?}")),
         Err(refusal) => Err(format!("custodian refused: {refusal:?}")),
     }
 }
@@ -612,7 +706,16 @@ struct TurnToolAccess {
 /// grant writes it.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 struct TurnCredentialAccess {
+    /// Where this turn may SPEND each credential — `request`.
     scopes: BTreeMap<String, Vec<String>>,
+    /// Where this turn may HAND each credential OVER — `deliver`.
+    ///
+    /// A second map rather than a second flag on the first, because the two are
+    /// different authorities over the same handle. Sharing one map would make a
+    /// turn granted `request` on a credential a turn that may also ship it, and
+    /// the point of `deliver` being its own operation is that those are not the
+    /// same permission. A turn may hold either, both, or neither.
+    handoffs: BTreeMap<String, Vec<String>>,
 }
 
 /// The vaults this turn may create into (DR-0053 §5/§14 Amendments).
@@ -661,8 +764,19 @@ impl TurnCredentialAccess {
             .extend(globs);
     }
 
+    fn grant_handoff(&mut self, credential: &str, globs: Vec<String>) {
+        self.handoffs
+            .entry(credential.to_owned())
+            .or_default()
+            .extend(globs);
+    }
+
     fn is_empty(&self) -> bool {
         self.scopes.is_empty()
+    }
+
+    fn handoffs_are_empty(&self) -> bool {
+        self.handoffs.is_empty()
     }
 
     /// Whether this turn may take `credential` to `target`, and why not when it
@@ -688,6 +802,37 @@ impl TurnCredentialAccess {
         }
         Err(format!(
             "`{}` is outside this turn's grant on credential `{credential}`",
+            target.render()
+        ))
+    }
+
+    /// Whether this turn may HAND `credential` to `target`, and why not when it
+    /// may not.
+    ///
+    /// Reads `handoffs` and never `scopes`: a turn granted `request` on a
+    /// credential has been told where it may spend it, which says nothing about
+    /// where it may give it away. The refusal names `deliver` so an author who
+    /// granted the wrong one can see which grant is missing.
+    fn admits_handoff(
+        &self,
+        credential: &str,
+        target: &whipplescript_custody::egress::EgressTarget,
+    ) -> Result<(), String> {
+        let Some(entries) = self.handoffs.get(credential) else {
+            return Err(format!(
+                "this turn was granted no `deliver` on credential `{credential}`"
+            ));
+        };
+        // Empty is unreachable for the reason it is on `request`: §14 requires
+        // the list on a narrowable operation and the checker refuses a bare
+        // one. Reading it as "anywhere" would be the abdication that rule
+        // exists to prevent, and more starkly here.
+        let parsed = whipplescript_custody::egress::parse_scope(&entries.join(","))?;
+        if whipplescript_custody::egress::admits(&parsed, target) {
+            return Ok(());
+        }
+        Err(format!(
+            "`{}` is outside this turn's `deliver` grant on credential `{credential}`",
             target.render()
         ))
     }
@@ -1433,6 +1578,7 @@ impl FileToolExecutor {
             TOOL_WEB_SEARCH => self.web_search(args),
             TOOL_WEB_FETCH => self.web_fetch(args),
             TOOL_CREDENTIAL_REQUEST => self.credential_request(args),
+            TOOL_CREDENTIAL_DELIVER => self.credential_deliver(args),
             TOOL_CREDENTIAL_GENERATE => self.credential_generate(args),
             TOOL_RECALL_MEMORY => self.recall_memory(args),
             TOOL_LEARN_MEMORY => self.learn_memory(args),
@@ -2524,6 +2670,103 @@ impl FileToolExecutor {
             Ok(other) => Err(format!("custodian answered a request with {other:?}")),
             Err(refusal) => Err(format!("custodian refused: {refusal:?}")),
         }
+    }
+
+    /// Hand a credential to a recipient (DR-0053 §5's `deliver`).
+    ///
+    /// Two ceilings, the same pair `credential_request` asks and neither shared
+    /// with it: this turn's `deliver` grant, then governance's handoff scope. A
+    /// `request` grant at either level admits nothing here.
+    fn credential_deliver(&self, args: &Value) -> Result<String, String> {
+        let credential = args
+            .get("credential")
+            .and_then(Value::as_str)
+            .ok_or("credential_deliver needs a `credential`")?;
+        let method = args
+            .get("method")
+            .and_then(Value::as_str)
+            .ok_or("credential_deliver needs a `method`")?;
+        let url = args
+            .get("url")
+            .and_then(Value::as_str)
+            .ok_or("credential_deliver needs a `url`")?;
+        let target = whipplescript_custody::egress::EgressTarget::parse(method, url)?;
+
+        // Ceiling 1: this turn's handoff grant.
+        let Some(access) = self.credential_access.as_ref() else {
+            return Err("this turn was granted no credential".to_owned());
+        };
+        access.admits_handoff(credential, &target)?;
+        // Ceiling 2: the signed envelope's handoff scope, which is a different
+        // list from its egress scope for the same reason.
+        if let Some(verified) = governance_envelope(crate::ifc::VerifiedEnvelope::load_from_env())?
+        {
+            verified.admits_deliver(credential, method, url)?;
+        }
+
+        let name = whipplescript_custody::CredentialName::new(credential)
+            .map_err(|error| format!("credential name: {error}"))?;
+        let headers: Vec<(String, String)> = args
+            .get("headers")
+            .and_then(Value::as_object)
+            .map(|object| {
+                object
+                    .iter()
+                    .filter_map(|(key, value)| {
+                        value.as_str().map(|text| (key.clone(), text.to_owned()))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        // The slot is placed HERE and nowhere else, and in `Raw` form: a
+        // handoff gives the recipient the material itself, not an
+        // `Authorization` header they would have to strip. Exactly one slot is
+        // written, so `slots: 1` is true by construction rather than by trust.
+        let slot = whipplescript_custody::Sentinel {
+            credential: name.clone(),
+            form: whipplescript_custody::PresentationForm::Raw,
+        }
+        .render();
+        let (body, content_type) = match args.get("field").and_then(Value::as_str) {
+            Some(field) => (json!({ field: slot }).to_string(), "application/json"),
+            None => (slot, "text/plain"),
+        };
+        let mut headers = headers;
+        if !headers
+            .iter()
+            .any(|(key, _)| key.eq_ignore_ascii_case("content-type"))
+        {
+            headers.push(("Content-Type".to_owned(), content_type.to_owned()));
+        }
+        let request = whipplescript_custody::EgressRequest {
+            method: method.to_ascii_uppercase(),
+            url: url.to_owned(),
+            headers,
+            body_b64: Some(whipplescript_custody::encode_body_b64(body.as_bytes())),
+        };
+        let Some(transport) = crate::custody_egress_transport()? else {
+            return Err(
+                "no custodian socket (WHIPPLESCRIPT_CUSTODIAN_SOCKET): a credential cannot be \
+                 handed over without one"
+                    .to_owned(),
+            );
+        };
+        let call = whipplescript_custody::CustodyCall::new(
+            whipplescript_custody::UseAttribution {
+                run_id: self.work_unit.clone(),
+                actor: Some(self.holder.clone()),
+                effect_key: None,
+            },
+            whipplescript_custody::CustodyOp::Deliver {
+                credential: name,
+                request,
+                slots: 1,
+            },
+        );
+        let reply = transport
+            .call(call)
+            .map_err(|error| format!("custodian unreachable: {error:?}"))?;
+        delivered_reply(reply.outcome)
     }
 
     fn list_todos(&self, args: &Value) -> Result<String, String> {
@@ -4278,6 +4521,16 @@ fn turn_tool_access_from_input(input_json: &str) -> Result<TurnToolAccess, Strin
                         credentials.grant(handle, globs);
                     }
                 }
+                // The handoff class, parsed into its own map. `deliver` is
+                // narrowable exactly as `request` is, and kept apart from it
+                // because granting a turn the right to spend a credential is
+                // not granting it the right to ship one.
+                "deliver" if resource.starts_with("credential ") => {
+                    let handle = resource.trim_start_matches("credential ").trim();
+                    if !handle.is_empty() {
+                        credentials.grant_handoff(handle, globs);
+                    }
+                }
                 // A vault grant is container-scoped: `create` names what may be
                 // done TO the container, and the vault's own `allow` list says
                 // what its members may do. No globs — there is no URL to
@@ -5526,6 +5779,108 @@ mod tests {
         assert!(outside.contains("stripe_api"), "{outside}");
     }
 
+    /// `credential_deliver`'s pre-flight refusals, the twins of the request
+    /// handler's — and the one that matters most: a turn holding `request` on a
+    /// credential must not get past this point.
+    #[test]
+    fn deliver_refuses_before_it_reaches_a_custodian() {
+        let root = temp_root();
+        let call = json!({
+            "credential": "ci_token",
+            "method": "POST",
+            "url": "https://ci.example.com/secrets/deploy"
+        });
+
+        let ungranted = FileToolExecutor::new(&root);
+        let err = ungranted
+            .credential_deliver(&call)
+            .expect_err("a turn with no credential must refuse");
+        assert!(err.contains("granted no credential"), "{err}");
+
+        // A turn holding `request` on the very credential, aimed at a
+        // destination its request grant DOES admit. This is the whole design in
+        // one assertion: spending is not handing over.
+        let mut spender = FileToolExecutor::new(&root);
+        let mut access = TurnCredentialAccess::default();
+        access.grant("ci_token", vec!["https://ci.example.com/*".to_owned()]);
+        spender.credential_access = Some(access);
+        let refused = spender
+            .credential_deliver(&call)
+            .expect_err("a `request` grant must not admit a handoff");
+        assert!(
+            refused.contains("no `deliver` on credential") && refused.contains("ci_token"),
+            "the refusal names the grant that is missing: {refused}"
+        );
+
+        let mut hander = FileToolExecutor::new(&root);
+        let mut access = TurnCredentialAccess::default();
+        access.grant_handoff(
+            "ci_token",
+            vec!["https://ci.example.com/secrets/*".to_owned()],
+        );
+        hander.credential_access = Some(access);
+
+        let outside = hander
+            .credential_deliver(&json!({
+                "credential": "ci_token",
+                "method": "POST",
+                "url": "https://evil.example/"
+            }))
+            .expect_err("a destination outside the turn grant must refuse");
+        assert!(
+            outside.contains("outside this turn's `deliver` grant"),
+            "{outside}"
+        );
+
+        // Past every check and into the transport, which is absent here — so
+        // the refusals above are refusing for their own reasons rather than
+        // because nothing works.
+        let socket = hander
+            .credential_deliver(&call)
+            .expect_err("no custodian socket must refuse");
+        assert!(
+            socket.contains("no custodian socket") && socket.contains("handed over"),
+            "the socket refusal says what could not happen: {socket}"
+        );
+    }
+
+    /// The deliver reply mapping, as a pure function, for the reason its
+    /// generate sibling is one: both refusal arms are otherwise reachable only
+    /// through a live custodian socket.
+    #[test]
+    fn a_deliver_reply_is_a_receipt_or_a_named_refusal() {
+        let ok = delivered_reply(Ok(whipplescript_custody::CustodyOk::Delivered {
+            response: whipplescript_custody::EgressResponse {
+                status: 202,
+                headers: Vec::new(),
+                body_b64: Some(whipplescript_custody::encode_body_b64(b"stored")),
+            },
+            handed_off_at: 1_756_000_000,
+        }))
+        .expect("a delivered reply maps to a receipt");
+        // The timestamp is reported because it is the durable record's: the
+        // moment after which a reap spares this credential.
+        assert!(
+            ok.contains("202") && ok.contains("stored") && ok.contains("1756000000"),
+            "{ok}"
+        );
+
+        let wrong = delivered_reply(Ok(whipplescript_custody::CustodyOk::Revoked {
+            existed: true,
+        }))
+        .expect_err("another outcome is not a delivery");
+        assert!(wrong.contains("answered a deliver with"), "{wrong}");
+
+        let refused = delivered_reply(Err(whipplescript_custody::CustodyError::Backend {
+            detail: "recipient refused".to_owned(),
+        }))
+        .expect_err("a custodian refusal stays a refusal");
+        assert!(
+            refused.contains("custodian refused") && refused.contains("recipient refused"),
+            "{refused}"
+        );
+    }
+
     /// The governance ceiling's three arms. The rejected one is the reason the
     /// status is three-way rather than an `Option`: a tampered policy must not
     /// read as a permissive one, and it was unreachable from a test until the
@@ -6186,6 +6541,122 @@ mod tests {
             .expect("enum");
         assert_eq!(enumerated.len(), 1);
         assert_eq!(enumerated[0].as_str(), Some("stripe_api"));
+    }
+
+    /// The separation of authorities, which is the whole reason `deliver` is
+    /// its own operation. A turn granted `request` on a credential must see no
+    /// way to ship it, and a turn granted `deliver` must see no way to spend it.
+    #[test]
+    fn a_request_grant_confers_no_handoff_and_a_handoff_grant_confers_no_request() {
+        let grant = |operation: &str| {
+            json!({
+                "access_grants": [
+                    {
+                        "resource": "credential stripe_api",
+                        "operations": [
+                            { "operation": operation, "target": null,
+                              "globs": ["https://api.stripe.com/v1/*"] }
+                        ]
+                    }
+                ]
+            })
+            .to_string()
+        };
+
+        let spender = turn_tool_access_from_input(&grant("request")).expect("grants parse");
+        let specs = credential_tool_specs_for_turn(&spender);
+        let names: Vec<&str> = specs.iter().map(|spec| spec.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![TOOL_CREDENTIAL_REQUEST],
+            "a `request` grant offers no handoff tool"
+        );
+        let target = whipplescript_custody::egress::EgressTarget::parse(
+            "POST",
+            "https://api.stripe.com/v1/charges",
+        )
+        .expect("target");
+        let Err(refusal) = spender.credentials.admits_handoff("stripe_api", &target) else {
+            panic!("a `request` grant must not admit a handoff");
+        };
+        assert!(
+            refusal.contains("no `deliver` on credential") && refusal.contains("stripe_api"),
+            "the refusal names the grant that is missing: {refusal}"
+        );
+        // The control: the same turn MAY spend it at the same destination, so
+        // the refusal is about the authority rather than about the URL.
+        spender
+            .credentials
+            .admits("stripe_api", &target)
+            .expect("a `request` grant admits a request");
+
+        let hander = turn_tool_access_from_input(&grant("deliver")).expect("grants parse");
+        let specs = credential_tool_specs_for_turn(&hander);
+        let names: Vec<&str> = specs.iter().map(|spec| spec.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![TOOL_CREDENTIAL_DELIVER],
+            "a `deliver` grant offers the handoff tool and no request tool"
+        );
+        hander
+            .credentials
+            .admits_handoff("stripe_api", &target)
+            .expect("a `deliver` grant admits a handoff");
+        assert!(
+            hander.credentials.admits("stripe_api", &target).is_err(),
+            "a `deliver` grant must not admit spending"
+        );
+    }
+
+    /// The destination list bites on the handoff tool, and the enum names
+    /// exactly the credentials the turn may hand over.
+    #[test]
+    fn a_handoff_outside_the_granted_destinations_is_refused() {
+        let granted = turn_tool_access_from_input(
+            &json!({
+                "access_grants": [
+                    {
+                        "resource": "credential deploy/ci",
+                        "operations": [
+                            { "operation": "deliver", "target": null,
+                              "globs": ["https://ci.example.com/secrets/*"] }
+                        ]
+                    }
+                ]
+            })
+            .to_string(),
+        )
+        .expect("grants parse");
+
+        let specs = deliver_tool_specs_for_turn(&granted);
+        assert_eq!(specs.len(), 1);
+        let enumerated = specs[0].input_schema["properties"]["credential"]["enum"]
+            .as_array()
+            .expect("enum");
+        assert_eq!(enumerated.len(), 1);
+        assert_eq!(enumerated[0].as_str(), Some("deploy/ci"));
+
+        let inside = whipplescript_custody::egress::EgressTarget::parse(
+            "POST",
+            "https://ci.example.com/secrets/deploy",
+        )
+        .expect("target");
+        granted
+            .credentials
+            .admits_handoff("deploy/ci", &inside)
+            .expect("the granted destination is admitted");
+
+        let elsewhere =
+            whipplescript_custody::egress::EgressTarget::parse("POST", "https://evil.example.com/")
+                .expect("target");
+        let Err(refusal) = granted.credentials.admits_handoff("deploy/ci", &elsewhere) else {
+            panic!("a destination outside the list must be refused");
+        };
+        assert!(
+            refusal.contains("outside this turn's `deliver` grant")
+                && refusal.contains("evil.example.com"),
+            "the refusal names the destination it turned down: {refusal}"
+        );
     }
 
     #[test]

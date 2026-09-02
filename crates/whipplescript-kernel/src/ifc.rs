@@ -180,6 +180,17 @@ pub struct Envelope {
     /// without one a compromised whip obtains a signature over bytes of its
     /// choosing under any credential the grant names.
     sign_prefixes: BTreeMap<String, Vec<Vec<u8>>>,
+    /// Where a credential may be HANDED OVER, by credential (DR-0053 §5's
+    /// `deliver`). Kept apart from `request_scopes` because spending a
+    /// credential and giving it away are different authorities: one map would
+    /// have made every policy that already grants egress under a credential a
+    /// policy that permits shipping the credential itself to the same host,
+    /// retroactively and silently.
+    ///
+    /// Absent is not empty, exactly as for `request_scopes`: an absent list
+    /// means governance never said where this credential may be handed, which
+    /// a governed program reads as a refusal.
+    deliver_scopes: BTreeMap<String, Vec<String>>,
     /// Credential ADDRESSES whose egress is confined to the workflow — the
     /// custodian signs the handshake and never sees the payload (DR-0053 §9
     /// Amendment 2026-08-29).
@@ -400,6 +411,7 @@ impl Envelope {
         let mut declassify = Vec::new();
         let mut unwrap_grants: Vec<UnwrapGrant> = Vec::new();
         let mut request_scopes: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        let mut deliver_scopes: BTreeMap<String, Vec<String>> = BTreeMap::new();
         let sign_prefixes: BTreeMap<String, Vec<Vec<u8>>> = BTreeMap::new();
         let confined_egress: BTreeSet<String> = BTreeSet::new();
         let custodian_role: Option<String> = None;
@@ -680,6 +692,25 @@ impl Envelope {
                 request_scopes.insert(credential.clone(), raw);
             }
         }
+        // The handoff allow-list, through the same parser for the same reason:
+        // a JSON envelope must not carry an entry the DSL would refuse.
+        if let Some(object) = value.get("deliver_scopes").and_then(|d| d.as_object()) {
+            for (credential, entries) in object {
+                reject_pattern_resource(credential)
+                    .map_err(|problem| format!("invalid IFC envelope: {problem}"))?;
+                let Some(items) = entries.as_array() else {
+                    return Err("invalid IFC envelope: deliver_scopes values must be arrays".into());
+                };
+                let raw: Vec<String> = items
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .map(str::to_owned)
+                    .collect();
+                whipplescript_custody::egress::parse_scope(&raw.join(","))
+                    .map_err(|problem| format!("invalid IFC envelope: deliver scope: {problem}"))?;
+                deliver_scopes.insert(credential.clone(), raw);
+            }
+        }
         if let Some(pairs) = value.get("declassifications").and_then(|d| d.as_array()) {
             for pair in pairs {
                 if let Some(items) = pair.as_array() {
@@ -720,6 +751,7 @@ impl Envelope {
             deleg,
             declassify,
             request_scopes,
+            deliver_scopes,
             sign_prefixes,
             confined_egress,
             custodian_role,
@@ -760,6 +792,7 @@ impl Envelope {
         let mut declassify = Vec::new();
         let mut unwrap_grants: Vec<UnwrapGrant> = Vec::new();
         let mut request_scopes: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        let mut deliver_scopes: BTreeMap<String, Vec<String>> = BTreeMap::new();
         let mut sign_prefixes: BTreeMap<String, Vec<Vec<u8>>> = BTreeMap::new();
         let mut confined_egress: BTreeSet<String> = BTreeSet::new();
         let mut custodian_role: Option<String> = None;
@@ -944,6 +977,41 @@ impl Envelope {
                 whipplescript_custody::egress::parse_scope(&raw)
                     .map_err(|problem| format!("line {}: request grant: {problem}", index + 1))?;
                 request_scopes
+                    .entry(credential.to_owned())
+                    .or_default()
+                    .extend(
+                        raw.split(',')
+                            .map(|entry| entry.trim().to_owned())
+                            .filter(|entry| !entry.is_empty()),
+                    );
+                continue;
+            }
+            // `grant deliver <Credential> for <entry>[, …]` — where the
+            // credential itself may be SENT (DR-0053 §5). A separate line from
+            // `grant request` because it is a separate authority: an operator
+            // who wrote "this key may call api.example.com" did not thereby say
+            // "this key may be given to api.example.com", and reading one as
+            // the other would widen every existing policy the moment `deliver`
+            // shipped.
+            if tokens.first().copied() == Some("grant") && tokens.get(1).copied() == Some("deliver")
+            {
+                let (Some(credential), Some("for")) =
+                    (tokens.get(2).copied(), tokens.get(3).copied())
+                else {
+                    return Err(format!(
+                        "line {}: deliver grant needs \
+                         `grant deliver <Credential> for <entry>[, <entry> …]` \
+                         (the list is required: a handoff grant with no destination \
+                         is `give this to anyone`, which is an abdication rather than a grant)",
+                        index + 1
+                    ));
+                };
+                reject_pattern_resource(credential)
+                    .map_err(|problem| format!("line {}: {problem}", index + 1))?;
+                let raw = tokens[4..].join(" ");
+                whipplescript_custody::egress::parse_scope(&raw)
+                    .map_err(|problem| format!("line {}: deliver grant: {problem}", index + 1))?;
+                deliver_scopes
                     .entry(credential.to_owned())
                     .or_default()
                     .extend(
@@ -1313,6 +1381,7 @@ impl Envelope {
             deleg,
             declassify,
             request_scopes,
+            deliver_scopes,
             sign_prefixes,
             confined_egress,
             custodian_role,
@@ -1494,6 +1563,19 @@ impl Envelope {
         if !self.request_scopes.is_empty() {
             canonical["request_scopes"] = serde_json::Value::Object(
                 self.request_scopes
+                    .iter()
+                    .map(|(credential, entries)| (credential.clone(), serde_json::json!(entries)))
+                    .collect(),
+            );
+        }
+        // The handoff allow-list is covered for the reason the egress one is,
+        // and the stakes are higher: a scope outside the signature is a set of
+        // recipients anyone holding the file could add to. Emitted only when
+        // present, so an envelope that grants no handoff keeps its existing
+        // hash.
+        if !self.deliver_scopes.is_empty() {
+            canonical["deliver_scopes"] = serde_json::Value::Object(
+                self.deliver_scopes
                     .iter()
                     .map(|(credential, entries)| (credential.clone(), serde_json::json!(entries)))
                     .collect(),
@@ -1927,6 +2009,57 @@ impl Envelope {
         }
         Err(format!(
             "`{}` is outside the egress scope governance grants credential `{credential}`",
+            target.render()
+        ))
+    }
+
+    /// A credential's HANDOFF allow-list, by the same nearest-ancestor walk
+    /// `request_scope` uses: a bound on a vault binds every member, including
+    /// ones that do not exist yet, so a mint cannot be the way around a
+    /// ceiling.
+    pub fn deliver_scope(&self, credential: &str) -> Option<&[String]> {
+        for probe in credential_ancestors(credential) {
+            if let Some(entries) = self
+                .deliver_scopes
+                .get(probe)
+                .or_else(|| self.deliver_scopes.get(self.resolve(probe)))
+            {
+                return Some(entries.as_slice());
+            }
+        }
+        None
+    }
+
+    /// Whether this policy admits handing `credential` to `method url`.
+    ///
+    /// Read against `admits_request`, the shape is deliberately the same and
+    /// the two lists are deliberately NOT: a policy that grants egress under a
+    /// credential has said where that credential may be SPENT, and says nothing
+    /// about where it may be GIVEN AWAY. Falling back to the request scope here
+    /// would turn every existing policy into a handoff policy the day `deliver`
+    /// shipped, which is precisely the retroactive widening that made `deliver`
+    /// a separate operation.
+    pub fn admits_deliver(&self, credential: &str, method: &str, url: &str) -> Result<(), String> {
+        let Some(entries) = self.deliver_scope(credential) else {
+            // Governance that never mentions this credential does not constrain
+            // it. Once it takes one under management, silence about handoff is
+            // an omission rather than a decision, and fail-closed is the only
+            // safe reading of an omission about giving a secret away.
+            if !credential_ancestors(credential).any(|probe| self.governs(probe)) {
+                return Ok(());
+            }
+            return Err(format!(
+                "governance binds credential `{credential}` but names no handoff scope for it: \
+                 add `grant deliver {credential} for <method> <url-glob>` to the policy"
+            ));
+        };
+        let target = whipplescript_custody::egress::EgressTarget::parse(method, url)?;
+        let parsed = whipplescript_custody::egress::parse_scope(&entries.join(","))?;
+        if whipplescript_custody::egress::admits(&parsed, &target) {
+            return Ok(());
+        }
+        Err(format!(
+            "`{}` is outside the handoff scope governance grants credential `{credential}`",
             target.render()
         ))
     }
@@ -3208,6 +3341,13 @@ impl VerifiedEnvelope {
     /// Whether this verified policy admits `method url` under `credential`.
     pub fn admits_request(&self, credential: &str, method: &str, url: &str) -> Result<(), String> {
         self.envelope.admits_request(credential, method, url)
+    }
+
+    /// Whether this verified policy admits HANDING `credential` to `method
+    /// url`. Delegated like its egress twin, and separate from it for the
+    /// reason the underlying lists are separate.
+    pub fn admits_deliver(&self, credential: &str, method: &str, url: &str) -> Result<(), String> {
+        self.envelope.admits_deliver(credential, method, url)
     }
 
     /// The signing bound of DR-0053 §14's amendment, delegated like its
@@ -12788,6 +12928,200 @@ rule refund
                 .any(|m| m.contains("denied egress") && m.contains("names no egress scope")),
             "{messages:#?}"
         );
+    }
+
+    /// Governance's handoff scope is its OWN list. This is the property that
+    /// made `deliver` a separate operation: if the egress scope answered here,
+    /// every policy already granting a credential reach would have become a
+    /// policy permitting that credential to be shipped, retroactively and
+    /// without an operator writing a line.
+    #[test]
+    fn a_request_scope_grants_no_handoff() {
+        let envelope = Envelope::from_dsl(
+            "authority acme\n\
+             grant credential deploy_key -> credential:acme/deploy sealed at hardware\n\
+             grant request deploy_key for POST https://ci.example.com/*\n",
+        )
+        .expect("valid envelope");
+        let verified = VerifiedEnvelope::for_test(envelope);
+
+        verified
+            .admits_request("deploy_key", "POST", "https://ci.example.com/build")
+            .expect("the egress scope admits the request it names");
+
+        let refused = verified
+            .admits_deliver("deploy_key", "POST", "https://ci.example.com/build")
+            .expect_err("an egress scope must not admit a handoff");
+        assert!(
+            refused.contains("names no handoff scope")
+                && refused.contains("grant deliver deploy_key"),
+            "the refusal says which line the policy is missing: {refused}"
+        );
+    }
+
+    /// Progressive rigor at the handoff door: governance that never mentions a
+    /// credential does not constrain it.
+    ///
+    /// This pins the EARLY RETURN rather than the refusal beside it, and the
+    /// two are different rules. Falsifying the `governs` guard makes the
+    /// refusal fire for every credential, including ones no policy names — an
+    /// ungoverned program would suddenly be unable to hand anything over. A
+    /// test that only reads the refusal's words cannot see that, because the
+    /// refusal still says exactly what it said.
+    #[test]
+    fn governance_that_names_no_credential_constrains_no_handoff() {
+        let envelope = Envelope::from_dsl(
+            "authority acme\n\
+             grant credential deploy_key -> credential:acme/deploy sealed at hardware\n\
+             grant deliver deploy_key for POST https://ci.example.com/*\n",
+        )
+        .expect("valid envelope");
+        let verified = VerifiedEnvelope::for_test(envelope);
+
+        // A credential this policy never took under management. Unlabelled is
+        // the public bottom, not a refusal.
+        verified
+            .admits_deliver("some_other_key", "POST", "https://anywhere.example/")
+            .expect("an ungoverned credential is unconstrained");
+
+        // And the credential the policy DOES bind is still bounded, so the
+        // permission above is about governance's silence rather than about
+        // handoffs being ungated.
+        verified
+            .admits_deliver("deploy_key", "POST", "https://evil.example/")
+            .expect_err("a governed credential keeps its bound");
+    }
+
+    /// The DSL refuses a handoff grant that names no destination, at the line
+    /// the operator wrote.
+    #[test]
+    fn a_handoff_grant_with_no_destination_is_refused() {
+        let Err(bare) = Envelope::from_dsl("authority acme\ngrant deliver deploy_key\n") else {
+            panic!("a bare handoff grant must be refused");
+        };
+        assert!(
+            bare.contains("deliver grant needs") && bare.contains("abdication"),
+            "the refusal says why the list is required: {bare}"
+        );
+
+        let Err(malformed) = Envelope::from_dsl(
+            "authority acme\ngrant deliver deploy_key for POST https://*evil.example/*\n",
+        ) else {
+            panic!("an over-promising destination must be refused");
+        };
+        assert!(
+            malformed.contains("deliver grant"),
+            "the refusal names the clause it read: {malformed}"
+        );
+    }
+
+    /// The JSON envelope refuses what the DSL refuses, so a policy cannot smuggle
+    /// a handoff scope in through the other door.
+    #[test]
+    fn a_json_handoff_scope_must_be_a_list() {
+        let Err(err) = Envelope::from_json(
+            &serde_json::json!({
+                "authority": "acme",
+                "deliver_scopes": { "deploy_key": "POST https://ci.example.com/*" }
+            })
+            .to_string(),
+        ) else {
+            panic!("a bare string is not a scope list");
+        };
+        assert!(
+            err.contains("deliver_scopes values must be arrays"),
+            "{err}"
+        );
+
+        let Err(over) = Envelope::from_json(
+            &serde_json::json!({
+                "authority": "acme",
+                "deliver_scopes": { "deploy_key": ["POST https://*evil.example/*"] }
+            })
+            .to_string(),
+        ) else {
+            panic!("a JSON envelope cannot carry an entry the DSL would refuse");
+        };
+        assert!(over.contains("deliver scope"), "{over}");
+    }
+
+    /// The handoff scope bites the same way the egress one does, including the
+    /// ancestor walk — a bound on a vault binds members that do not exist yet.
+    #[test]
+    fn a_handoff_scope_bounds_where_a_credential_may_be_sent() {
+        let envelope = Envelope::from_dsl(
+            "authority acme\n\
+             grant credential deploy -> credential:acme/deploy sealed at hardware\n\
+             grant deliver deploy for POST https://ci.example.com/secrets/*\n",
+        )
+        .expect("valid envelope");
+        let verified = VerifiedEnvelope::for_test(envelope);
+
+        verified
+            .admits_deliver("deploy", "POST", "https://ci.example.com/secrets/x")
+            .expect("the granted destination is admitted");
+        // A member the policy never named inherits the bound rather than
+        // escaping it.
+        verified
+            .admits_deliver(
+                "deploy/runner-7",
+                "POST",
+                "https://ci.example.com/secrets/x",
+            )
+            .expect("a child inherits its parent's handoff bound");
+
+        let refused = verified
+            .admits_deliver("deploy/runner-7", "POST", "https://evil.example.com/")
+            .expect_err("outside the parent's handoff bound");
+        assert!(
+            refused.contains("outside the handoff scope"),
+            "the refusal distinguishes itself from the egress one: {refused}"
+        );
+
+        // And a handoff grant confers no egress: the separation runs both ways.
+        let refused = verified
+            .admits_request("deploy", "POST", "https://ci.example.com/secrets/x")
+            .expect_err("a handoff scope must not admit spending");
+        assert!(refused.contains("names no egress scope"), "{refused}");
+    }
+
+    /// The other half of §14's "the list is required", and the half nothing was
+    /// asking for: a policy that never mentions a credential does not constrain
+    /// it.
+    ///
+    /// Governance is progressive here, exactly as an unlabelled resource is the
+    /// public bottom rather than a refusal. Taking a credential under management
+    /// is what obliges a policy to be complete about it — so a policy that
+    /// governs one credential must not thereby refuse every other.
+    ///
+    /// Found by mutation while building `deliver`'s twin of this rule:
+    /// falsifying the `governs` guard here passed the ENTIRE workspace suite.
+    /// The two tests beside this one pin the REFUSING direction, and the
+    /// refusal still says exactly what it said when the guard dies, so nothing
+    /// noticed that every ungoverned credential had stopped being admitted.
+    /// `admits_sign` has carried this assertion since it shipped; this is its
+    /// egress twin catching up.
+    #[test]
+    fn governance_that_names_no_credential_constrains_no_egress() {
+        let envelope = Envelope::from_dsl(
+            "authority acme\n\
+             grant credential stripe_api -> credential:acme/stripe-live sealed at hardware\n\
+             grant request stripe_api for POST https://api.stripe.com/v1/refunds/*\n",
+        )
+        .expect("valid envelope");
+        let verified = VerifiedEnvelope::for_test(envelope);
+
+        // A credential this policy never took under management, at a URL it
+        // never named. Unconstrained, because governance said nothing about it.
+        verified
+            .admits_request("some_other_key", "POST", "https://anywhere.example/")
+            .expect("an ungoverned credential is unconstrained");
+
+        // And the one it DID bind keeps its bound, so the permission above is
+        // about governance's silence rather than about egress being ungated.
+        verified
+            .admits_request("stripe_api", "POST", "https://evil.example/")
+            .expect_err("a governed credential keeps its bound");
     }
 
     #[test]

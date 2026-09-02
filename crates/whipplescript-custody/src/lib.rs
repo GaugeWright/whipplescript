@@ -337,15 +337,15 @@ impl CredentialKind {
                     // Under `egress through custodian`, which is the default.
                     | CredentialKind::MtlsClient
             ),
+            // Not kind-conditioned: a reap ends whatever the instance made, and
+            // an entry's kind has no bearing on whether it was handed off.
+            Operation::Reap => false,
             // The SYMMETRIC and opaque kinds, which have no public half to
             // publish instead. DR-0053 §5's amendment is explicit that
             // asymmetric kinds hand off by publishing their public half — that
             // is not material and needs no operation — so admitting them here
             // would offer a way to ship a private key that the design says
             // nobody needs.
-            // Not kind-conditioned: a reap ends whatever the instance made,
-            // and an entry's kind has no bearing on whether it was handed off.
-            Operation::Reap => false,
             Operation::Deliver => matches!(
                 self,
                 CredentialKind::Bearer
