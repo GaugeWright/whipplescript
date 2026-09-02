@@ -24,6 +24,24 @@ provider is the workspace. The issues are adjacent to your instances, in the
 and so on. The durable status of an issue is `open`, `closed`, or `canceled`.
 The tracker stores no other status.
 
+The `status` field of an issue holds one of five values: `open`, `in_progress`,
+`closed`, `canceled`, and `archived`. The compiler knows the five. A comparison
+against anything else is an error at the comparison, not a guard that quietly
+matches nothing:
+
+<!-- render: examples/diagnostics/work-item-status-typo.whip code type.invalid_literal -->
+```text
+error[type.invalid_literal]: rule `r` compares finite-domain value to unknown `cancelled`
+   --> examples/diagnostics/work-item-status-typo.whip:11:8
+   |
+11 |   when backlog has ready issue as issue where issue.status == "cancelled"
+   |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   = help: did you mean `canceled`? use one of: open, in_progress, closed, canceled, archived
+```
+
+A `case` over the status of an issue must cover the five values or carry a `_`
+arm. The compiler names the arms that are absent.
+
 ## Assignment
 
 An issue can name who should act on it:

@@ -80,6 +80,29 @@ pub struct WorkItem {
     pub updated_at: String,
 }
 
+/// The durable statuses this store can produce, asserted against the one set
+/// the compiler refuses programs on behalf of.
+///
+/// The compiler declares `WorkItem.status` as a literal union of
+/// `WORK_ITEM_STATUSES`, so a rule comparing against anything outside it does
+/// not compile. If this store ever folded an issue into a status the union
+/// omits, that item would be unmatchable by any rule — refused at the source
+/// for a value the runtime had actually produced. The test below is what keeps
+/// the two honest; the constant itself lives in `whipplescript-core` because
+/// the parser cannot depend on this crate.
+#[cfg(test)]
+const STORE_PRODUCED_STATUSES: &[&str] = &[
+    // `open` on file, `closed` on finish, `canceled` on cancel, `open` again on
+    // reopen (items.rs fold), `archived` via `whip issue archive`.
+    "open",
+    "closed",
+    "canceled",
+    "archived",
+    // Never written durably — the readiness overlay presents a leased `open`
+    // item as this. A rule still matches on it, so the union must carry it.
+    "in_progress",
+];
+
 /// The relation kinds the builtin provider supports (ADR-0002 "Relations And
 /// Dependencies"). Only `blocks` gates readiness; the rest are graph metadata.
 pub const RELATION_KINDS: &[&str] = &[
@@ -5190,6 +5213,31 @@ mod tests {
             ReleaseOutcome::Released
         );
         assert_eq!(store.ready_items("backlog").expect("ready").len(), 1);
+    }
+
+    /// The compiler refuses a `status` comparison outside `WORK_ITEM_STATUSES`,
+    /// so a status this store can produce and that set omits would make a real
+    /// item unmatchable by any rule. Compared as SETS: the order differs
+    /// deliberately (the union reads as the lifecycle, this list as the events
+    /// that write it) and order is not the property under test.
+    #[test]
+    fn every_status_this_store_produces_is_one_the_compiler_admits() {
+        use std::collections::BTreeSet;
+        let admitted: BTreeSet<&str> = whipplescript_core::WORK_ITEM_STATUSES
+            .iter()
+            .copied()
+            .collect();
+        let produced: BTreeSet<&str> = STORE_PRODUCED_STATUSES.iter().copied().collect();
+        assert_eq!(
+            produced.difference(&admitted).collect::<Vec<_>>(),
+            Vec::<&&str>::new(),
+            "the store produces a status no program can compare against"
+        );
+        assert_eq!(
+            admitted.difference(&produced).collect::<Vec<_>>(),
+            Vec::<&&str>::new(),
+            "the union admits a status nothing produces; drop it or say why"
+        );
     }
 
     /// DR-0088: the count a rework loop's termination measure rests on. The

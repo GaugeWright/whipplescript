@@ -87,7 +87,7 @@ short reference. Each subject below also has a full chapter above.
 Facts are typed. Use an enum for a closed set of decisions. Use a literal field
 for a small state machine:
 
-<!-- check: fragment -->
+<!-- check: context overview -->
 ```whip
 enum ReviewStatus {
   Accept
@@ -120,7 +120,7 @@ commits.
 
 ## Request agent work
 
-<!-- check: fragment -->
+<!-- check: in overview -->
 ```whip
 agent worker {
   provider fixture

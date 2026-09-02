@@ -12746,6 +12746,120 @@ rule review
     );
 }
 
+/// `WorkItem.status` is the decided set, declared as the union it always was in
+/// prose. The point is not new machinery — none was needed — but that the
+/// ordinary finite-domain checks now apply to a builtin class.
+#[test]
+fn a_work_item_status_outside_the_decided_set_is_refused() {
+    let source = r#"
+@service
+workflow Typo
+use std.tracker
+
+tracker backlog { provider builtin }
+
+rule r
+  when backlog has ready issue as issue where issue.status == "cancelled"
+=> {
+  finish issue { summary "done" }
+}
+"#;
+    let compiled = compile_program(source);
+    assert!(
+        compiled.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code.as_str() == "type.invalid_literal"
+                && diagnostic
+                    .message
+                    .contains("compares finite-domain value to unknown `cancelled`")
+        }),
+        "the double-l spelling this repository renamed AWAY from must not compile: {:?}",
+        compiled
+            .diagnostics
+            .iter()
+            .map(|diagnostic| &diagnostic.message)
+            .collect::<Vec<_>>()
+    );
+
+    // The same guard against a member of the set compiles.
+    let ok = compile_program(&source.replace("\"cancelled\"", "\"canceled\""));
+    assert!(ok.ir.is_some(), "{:?}", ok.diagnostics);
+}
+
+/// And a `case` over it is checked for exhaustiveness, which a `string` could
+/// never be: the missing arms are named, so adding a status to the set fails
+/// every total `case` rather than falling quietly through one.
+#[test]
+fn a_case_over_work_item_status_must_be_exhaustive() {
+    let source = r#"
+@service
+workflow NonExhaustive
+use std.tracker
+
+tracker backlog { provider builtin }
+
+rule r
+  when backlog has ready issue as issue
+=> {
+  case issue.status {
+    "open" => { finish issue { summary "a" } }
+    "in_progress" => { finish issue { summary "b" } }
+  }
+}
+"#;
+    let compiled = compile_program(source);
+    assert!(
+        compiled.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code.as_str() == "expr.non_exhaustive_case"
+                && diagnostic
+                    .message
+                    .contains("missing closed, canceled, archived")
+        }),
+        "{:?}",
+        compiled
+            .diagnostics
+            .iter()
+            .map(|diagnostic| &diagnostic.message)
+            .collect::<Vec<_>>()
+    );
+}
+
+/// A program that declares its OWN `WorkItem` still shadows the builtin, which
+/// is what makes this change non-breaking: several fixtures in this repository
+/// carry a hand-written `WorkItem` with a free-string status, and they compile
+/// exactly as they did.
+#[test]
+fn a_declared_work_item_still_shadows_the_builtin() {
+    let compiled = compile_program(
+        r#"
+@service
+workflow Shadow
+
+class WorkItem {
+  id string
+  title string
+  status string
+}
+
+agent w { provider fixture  profile "repo-writer"  capacity 1 }
+
+rule step
+  when WorkItem as item where item.status == "queued"
+=> {
+  tell w "handle {{ item.title }}" as turn
+
+  after turn completes {
+    done item -> record WorkItem { id item.id  title item.title  status "done" }
+  }
+}
+"#,
+    );
+    assert_eq!(
+        compiled.diagnostics,
+        Vec::new(),
+        "a hand-written WorkItem owns its own status vocabulary"
+    );
+}
+
 /// DR-0088: the shorter answer to the same question. The tracker counts the
 /// times it has handed an item back, so one clause on the `when` bounds the ring
 /// — no second schema, no correlation predicate, and no way to forget to advance

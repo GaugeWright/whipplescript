@@ -173,6 +173,7 @@ EXPECTED = {
     "docs/manual/07-case.md": 1,
     "docs/manual/13-agent-patterns.md": 1,
     "docs/manual/14-coordination.md": 3,
+    "docs/manual/15-trackers.md": 1,
     "docs/manual/16-progressions.md": 2,
     "docs/manual/20-files.md": 1,
     "docs/manual/22-infoflow-labels.md": 1,

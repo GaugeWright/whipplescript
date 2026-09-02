@@ -127,6 +127,18 @@ pub struct ConstructGrammarClause {
     pub connective: Option<String>,
 }
 
+/// The durable status of a tracker work item (`spec/std-tracker.md`, "Surface").
+///
+/// One owner, because the set is now load-bearing in two places that would
+/// otherwise drift: the parser declares `WorkItem.status` as a literal union of
+/// exactly these values, so a program comparing against anything else fails to
+/// compile, and the store folds its projections into them. A set that differed
+/// between the two would refuse a status the store can actually produce.
+///
+/// Ordered as the lifecycle reads, not alphabetically: a diagnostic listing the
+/// missing arms of a `case` is easier to act on in that order.
+pub const WORK_ITEM_STATUSES: &[&str] = &["open", "in_progress", "closed", "canceled", "archived"];
+
 pub const CONSTRUCT_GRAMMAR_SHAPE_EFFECT_OPERATION: &str = "effect_operation";
 pub const CONSTRUCT_GRAMMAR_SHAPE_DECLARATION_BLOCK: &str = "declaration_block";
 /// `with` (DR-0074 §12) closes a gap rather than widening the set: core

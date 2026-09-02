@@ -7895,7 +7895,17 @@ impl SchemaIndex {
                 ("title", string_ty()),
                 ("body", string_ty()),
                 ("queue", string_ty()),
-                ("status", string_ty()),
+                // The status is a DECIDED set, so it is declared as the union
+                // it always was in prose (`spec/std-tracker.md`). A `string`
+                // let `status == "cancelled"` — the very spelling this
+                // repository renamed away from — compile and then match
+                // nothing, which is the failure a finite domain exists to
+                // refuse. `whipplescript_core::WORK_ITEM_STATUSES` owns the
+                // set; the store folds into the same one.
+                (
+                    "status",
+                    literal_union_ty(whipplescript_core::WORK_ITEM_STATUSES),
+                ),
                 ("labels", array_ty(string_ty())),
                 // How many times the tracker has returned this item to ready.
                 // Provider-maintained, which is what lets it bound a rework
@@ -8309,6 +8319,24 @@ fn zero_span() -> SourceSpan {
 fn string_ty() -> TypeSyntax {
     TypeSyntax::Primitive {
         name: "string".to_owned(),
+        span: zero_span(),
+    }
+}
+
+/// A finite domain of string literals, for a builtin whose values are decided.
+///
+/// A builtin class carries the same union a user could write by hand, which is
+/// what makes the ordinary machinery apply to it: the finite-domain comparison
+/// check reads it, and so does `case` exhaustiveness. Neither needed teaching.
+fn literal_union_ty(values: &[&str]) -> TypeSyntax {
+    TypeSyntax::Union {
+        variants: values
+            .iter()
+            .map(|value| TypeSyntax::LiteralString {
+                value: (*value).to_owned(),
+                span: zero_span(),
+            })
+            .collect(),
         span: zero_span(),
     }
 }

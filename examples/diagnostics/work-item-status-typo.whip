@@ -1,0 +1,14 @@
+# The status of a tracker item is a decided set, so the compiler knows it
+# (DR-0093). `cancelled` with two Ls is the spelling this project renamed away
+# from; against a `string` it compiled and matched nothing, forever.
+@service
+workflow WorkItemStatusTypo
+use std.tracker
+
+tracker backlog { provider builtin }
+
+rule r
+  when backlog has ready issue as issue where issue.status == "cancelled"
+=> {
+  finish issue { summary "done" }
+}
