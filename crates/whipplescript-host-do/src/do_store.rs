@@ -2288,7 +2288,14 @@ fn do_replay_workflow_terminal<Sql: DoSql>(
     Ok(())
 }
 
-fn do_replay_instance_transition<Sql: DoSql>(
+/// Apply one `instance.transitioned` event to the `instances` projection.
+///
+/// The ONE statement of that mutation on this host, mirroring
+/// `apply_instance_transitioned` in `whipplescript-store`: the forward path
+/// calls it after appending the event, and the rebuild calls it while folding
+/// the log. It was two hand-copied UPDATEs that disagreed about `'failed'` --
+/// the same divergence, in the same shape, as the native store's.
+fn do_apply_instance_transitioned<Sql: DoSql>(
     sql: &Sql,
     instance_id: &str,
     event_id: &str,
@@ -2302,8 +2309,8 @@ fn do_replay_instance_transition<Sql: DoSql>(
     sql.execute(
         "UPDATE instances SET status = ?1, last_event_id = ?2, last_error = ?3, \
          updated_at = CURRENT_TIMESTAMP, completed_at = CASE \
-         WHEN ?1 IN ('completed', 'cancelled') THEN CURRENT_TIMESTAMP ELSE completed_at END \
-         WHERE instance_id = ?4",
+         WHEN ?1 IN ('completed', 'cancelled', 'failed') THEN CURRENT_TIMESTAMP \
+         ELSE completed_at END WHERE instance_id = ?4",
         &[
             text(status),
             text(event_id),
@@ -3637,9 +3644,12 @@ impl<Sql: DoSql> DoSqliteStore<Sql> {
                     &event_type,
                     &payload_json,
                 )?,
-                "instance.transitioned" => {
-                    do_replay_instance_transition(&self.sql, instance_id, &event_id, &payload_json)?
-                }
+                "instance.transitioned" => do_apply_instance_transitioned(
+                    &self.sql,
+                    instance_id,
+                    &event_id,
+                    &payload_json,
+                )?,
                 "workflow.revision_activated" => do_replay_revision_activation(
                     &self.sql,
                     instance_id,
@@ -6628,20 +6638,15 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
                 idempotency_key: transition.idempotency_key,
             },
         )?;
-        self.sql
-            .execute(
-                "UPDATE instances SET status = ?1, last_event_id = ?2, last_error = ?3, \
-                 updated_at = CURRENT_TIMESTAMP, completed_at = CASE \
-                 WHEN ?1 IN ('completed', 'cancelled', 'failed') THEN CURRENT_TIMESTAMP \
-                 ELSE completed_at END WHERE instance_id = ?4",
-                &[
-                    text(transition.status),
-                    text(&event.event_id),
-                    opt_text(transition.reason),
-                    text(transition.instance_id),
-                ],
-            )
-            .map_err(sql_err)?;
+        // One statement of the mutation, as on the native store: append the
+        // event, then apply it with the same fold the rebuild replays. These
+        // were two hand-copied UPDATEs and they disagreed about `'failed'`.
+        do_apply_instance_transitioned(
+            &self.sql,
+            transition.instance_id,
+            &event.event_id,
+            &payload,
+        )?;
         Ok(event)
     }
 

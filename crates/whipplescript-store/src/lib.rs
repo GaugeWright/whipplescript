@@ -5714,26 +5714,17 @@ impl SqliteStore {
                 idempotency_key: transition.idempotency_key,
             },
         )?;
-        tx.execute(
-            r#"
-            UPDATE instances
-            SET status = ?1,
-                last_event_id = ?2,
-                last_error = ?3,
-                updated_at = CURRENT_TIMESTAMP,
-                completed_at = CASE
-                    WHEN ?1 IN ('completed', 'cancelled', 'failed') THEN CURRENT_TIMESTAMP
-                    ELSE completed_at
-                END
-            WHERE instance_id = ?4
-            "#,
-            params![
-                transition.status,
-                event.event_id,
-                transition.reason,
-                transition.instance_id,
-            ],
-        )?;
+        // The projection mutation is stated ONCE, by the fold `rebuild_projections`
+        // replays. The forward path appends the event and then applies it, so the
+        // two cannot say different things -- they did: this UPDATE carried
+        // `'failed'` and its replay twin did not, so rebuilding an instance that
+        // failed silently dropped its `completed_at`.
+        // The projection mutation is stated ONCE, by the fold `rebuild_projections`
+        // replays. The forward path appends the event and then applies it, so the
+        // two cannot say different things -- they did: this carried `'failed'`
+        // and its replay twin did not, so folding the log for an instance that
+        // failed did not reproduce its `completed_at`.
+        apply_instance_transitioned(&tx, transition.instance_id, &event.event_id, &payload)?;
         tx.commit()?;
         Ok(event)
     }
@@ -6522,7 +6513,7 @@ impl SqliteStore {
                     &payload_json,
                 )?,
                 "instance.transitioned" => {
-                    replay_instance_transition(&tx, instance_id, &event_id, &payload_json)?
+                    apply_instance_transitioned(&tx, instance_id, &event_id, &payload_json)?
                 }
                 "workflow.revision_activated" => replay_revision_activation(
                     &tx,
@@ -11237,8 +11228,19 @@ fn replay_workflow_terminal(
     Ok(())
 }
 
+/// Apply one `instance.transitioned` event to the `instances` projection.
+///
+/// The ONE statement of that mutation: `transition_instance` calls this after
+/// appending the event, and `rebuild_projections` calls it while folding the
+/// log, so "the projection is a function of the log" is true by construction
+/// rather than by two hand-copied UPDATEs agreeing. They did not agree -- the
+/// forward copy stamped `completed_at` for `('completed','cancelled','failed')`
+/// and this one omitted `'failed'`, which `instance_transition_allowed` admits
+/// from `running`, `paused` and `blocked` -- so rebuilding any instance that
+/// failed reverted its `completed_at` to NULL. Nothing caught it because the
+/// replay tests asserted named fields rather than row equality.
 #[cfg(feature = "native")]
-fn replay_instance_transition(
+fn apply_instance_transitioned(
     connection: &Connection,
     instance_id: &str,
     event_id: &str,
@@ -11257,7 +11259,7 @@ fn replay_instance_transition(
             last_error = ?3,
             updated_at = CURRENT_TIMESTAMP,
             completed_at = CASE
-                WHEN ?1 IN ('completed', 'cancelled') THEN CURRENT_TIMESTAMP
+                WHEN ?1 IN ('completed', 'cancelled', 'failed') THEN CURRENT_TIMESTAMP
                 ELSE completed_at
             END
         WHERE instance_id = ?4
@@ -16921,6 +16923,117 @@ mod tests {
         assert_eq!(runs[0].status, "running");
         assert!(runs[0].cancel_requested);
         assert_eq!(lease_status(&store, "lease-replay-running"), "active");
+    }
+
+    /// The projection must be a FUNCTION OF THE LOG: folding the log has to
+    /// reproduce the row the forward path wrote, field for field.
+    ///
+    /// Asserted as ROW EQUALITY rather than field by field, which is the whole
+    /// point. The forward path and the replay fold were two hand-copied UPDATEs
+    /// that disagreed about `'failed'`, so `rebuild_projections` reverted
+    /// `completed_at` to NULL for every instance that failed -- and the eight
+    /// existing replay tests all passed, because each asserts named fields and
+    /// none compares the row.
+    ///
+    /// The cases come from `instance_transition_allowed` itself rather than a
+    /// hand list, so a transition added to the table is covered here the day it
+    /// is added.
+    #[test]
+    fn rebuilding_reproduces_the_instance_row_for_every_admitted_transition() {
+        #[derive(Debug, PartialEq)]
+        struct InstanceRow {
+            status: String,
+            last_error: Option<String>,
+            completed_at_set: bool,
+        }
+
+        let row_of = |store: &SqliteStore, instance_id: &str| -> InstanceRow {
+            store
+                .connection
+                .query_row(
+                    "SELECT status, last_error, completed_at FROM instances \
+                     WHERE instance_id = ?1",
+                    [instance_id],
+                    |row| {
+                        Ok(InstanceRow {
+                            status: row.get(0)?,
+                            last_error: row.get(1)?,
+                            completed_at_set: row.get::<_, Option<String>>(2)?.is_some(),
+                        })
+                    },
+                )
+                .expect("the instance row reads back")
+        };
+
+        // Every status the table could name, filtered by what it actually
+        // admits from `running`. `completed` is deliberately in the candidate
+        // set and is NOT admitted here -- an instance completes through the
+        // workflow-terminal door, not through a transition.
+        let admitted: Vec<&str> = ["paused", "cancelled", "failed", "completed", "blocked"]
+            .into_iter()
+            .filter(|next| instance_transition_allowed("running", next))
+            .collect();
+        assert!(
+            admitted.contains(&"failed"),
+            "`running` -> `failed` is the flow auto-fail path and must be covered"
+        );
+
+        for next in admitted {
+            let mut store = SqliteStore::open_in_memory().expect("store opens");
+            let version = store
+                .create_program_version(test_program_version(
+                    "ReplayFold",
+                    "source-fold",
+                    "ir-fold",
+                ))
+                .expect("program version creates");
+            let instance = store
+                .create_instance(NewInstance {
+                    program_id: &version.program_id,
+                    version_id: &version.version_id,
+                    input_json: "{}",
+                })
+                .expect("instance creates");
+            store
+                .transition_instance(InstanceTransition {
+                    instance_id: &instance.instance_id,
+                    status: next,
+                    reason: Some("the reason the forward path recorded"),
+                    idempotency_key: Some("transition"),
+                })
+                .expect("the admitted transition applies");
+
+            let forward = row_of(&store, &instance.instance_id);
+            assert_eq!(forward.status, next);
+
+            // `rebuild_projections` DELETES and re-derives effects, facts,
+            // leases and runs, but it PATCHES the `instances` row rather than
+            // clearing it -- and the fold's `ELSE completed_at` preserves
+            // whatever is already there. So the forward path's own stamp masks
+            // whether the fold would have produced it. Clear the columns the
+            // fold owns, so this asserts what "a function of the log" means:
+            // the log alone reproduces the row.
+            store
+                .connection
+                .execute(
+                    "UPDATE instances SET status = 'running', last_error = NULL, \
+                     completed_at = NULL WHERE instance_id = ?1",
+                    [&instance.instance_id],
+                )
+                .expect("the projection row clears");
+
+            store
+                .rebuild_projections(&instance.instance_id)
+                .expect("projections rebuild");
+
+            assert_eq!(
+                row_of(&store, &instance.instance_id),
+                forward,
+                "folding the log did not reproduce the row the forward path \
+                 wrote for `running` -> `{next}`: the projection is not a \
+                 function of the log"
+            );
+        }
     }
 
     #[test]
