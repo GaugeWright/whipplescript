@@ -44,7 +44,7 @@ use zeroize::Zeroizing;
 use whipplescript_custody::{
     CredentialKind, CredentialName, CustodyCall, CustodyError, CustodyOk, CustodyOp, CustodyReply,
     CustodyTransport, EgressRequest, EgressResponse, Envelope, MintExtraction, Operation,
-    PresentationForm, Rung, Sentinel, SignatureAlg, TransportError, UseAttribution,
+    PresentationForm, Retention, Rung, Sentinel, SignatureAlg, TransportError, UseAttribution,
     CUSTODY_PROTOCOL,
 };
 
@@ -88,7 +88,12 @@ impl Egress for DeniedEgress {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UseRecord {
     pub use_id: String,
-    pub credential: String,
+    /// What the call acted on: a credential for a member or container
+    /// operation, and `instance:<id>` for a reap, whose subject is a RUN and
+    /// whose effects are several credentials. Named `subject` rather than
+    /// `credential` because putting an instance in a field called `credential`
+    /// would be a record that reads as a use of something it never touched.
+    pub subject: String,
     pub operation: Operation,
     pub attribution: UseAttribution,
     pub rung: Rung,
@@ -470,10 +475,16 @@ impl Custodian {
 
     /// Handle one protocol call. Always replies; every reply is recorded.
     pub fn handle(&self, call: &CustodyCall) -> CustodyReply {
-        let (rung, degraded) = self.entry_rung(call.op.credential());
+        // A reap names no credential, so there is no entry whose evidence could
+        // set the rung: it reports the custodian's own floor, which is what an
+        // unknown entry already does.
+        let (rung, degraded) = match call.op.credential() {
+            Some(credential) => self.entry_rung(credential),
+            None => self.rung(),
+        };
         let use_id = self.fresh_id("use");
         let outcome = if call.protocol == CUSTODY_PROTOCOL {
-            self.dispatch(&call.op)
+            self.dispatch(&call.op, &call.attribution)
         } else {
             Err(CustodyError::Backend {
                 detail: format!("unsupported protocol {:?}", call.protocol),
@@ -481,7 +492,7 @@ impl Custodian {
         };
         let record = UseRecord {
             use_id: use_id.clone(),
-            credential: call.op.credential().as_str().to_string(),
+            subject: call.op.subject(),
             operation: call.op.operation(),
             attribution: call.attribution.clone(),
             rung,
@@ -501,8 +512,48 @@ impl Custodian {
         }
     }
 
-    fn dispatch(&self, op: &CustodyOp) -> Result<CustodyOk, CustodyError> {
-        let name = op.credential().clone();
+    /// `attribution` reaches here because provenance is recorded at BIRTH: a
+    /// generated credential has to know which run made it, and the run is on
+    /// the call rather than in the operation. Nothing else reads it — the use
+    /// record takes its own copy.
+    fn dispatch(
+        &self,
+        op: &CustodyOp,
+        attribution: &UseAttribution,
+    ) -> Result<CustodyOk, CustodyError> {
+        // Every operation below this point acts on ONE credential. A reap does
+        // not, so it is answered before the entry lookup that follows — there
+        // is no entry to look up, and the lookup's refusal would be about a
+        // credential nobody named.
+        //
+        // The name is bound STRUCTURALLY here rather than by unwrapping
+        // `credential()`'s `Option`, for the reason the container split below
+        // gives: an `Option` needs an impossible-state arm, and that arm is a
+        // refusal no test can reach — so it is a refusal nothing gates.
+        let name = match op {
+            CustodyOp::Reap { instance } => return self.op_reap(instance),
+            CustodyOp::Request { credential, .. }
+            | CustodyOp::Sign { credential, .. }
+            | CustodyOp::Verify { credential, .. }
+            | CustodyOp::Derive { credential, .. }
+            | CustodyOp::Wrap { credential, .. }
+            | CustodyOp::Unwrap { credential, .. }
+            | CustodyOp::Mint { credential, .. }
+            | CustodyOp::Deliver { credential, .. }
+            | CustodyOp::Generate { credential, .. }
+            | CustodyOp::Register { credential, .. }
+            | CustodyOp::Rotate { credential }
+            | CustodyOp::Revoke { credential } => credential.clone(),
+        };
+        self.dispatch_credential_op(op, name, attribution)
+    }
+
+    fn dispatch_credential_op(
+        &self,
+        op: &CustodyOp,
+        name: CredentialName,
+        attribution: &UseAttribution,
+    ) -> Result<CustodyOk, CustodyError> {
         let operation = op.operation();
 
         // Container operations act on a vault rather than on an existing
@@ -519,7 +570,8 @@ impl Custodian {
             CustodyOp::Generate {
                 credential: _,
                 kind,
-            } => return self.op_generate(&name, *kind),
+                retain,
+            } => return self.op_generate(&name, *kind, *retain, attribution),
             CustodyOp::Register {
                 kind, material_b64, ..
             } => return self.op_register(&name, *kind, material_b64),
@@ -528,7 +580,11 @@ impl Custodian {
             // that exists and is not revoked — exactly the two admissions
             // below — so routing it through them means one implementation of
             // those refusals rather than a second copy inside a handler.
-            CustodyOp::Rotate { .. }
+            // Answered before this match, which never sees it. Listed rather
+            // than wildcarded so a future credential-less op is a compile error
+            // here instead of falling into the entry lookup below.
+            CustodyOp::Reap { .. }
+            | CustodyOp::Rotate { .. }
             | CustodyOp::Deliver { .. }
             | CustodyOp::Request { .. }
             | CustodyOp::Sign { .. }
@@ -609,6 +665,10 @@ impl Custodian {
             CustodyOp::Deliver { request, slots, .. } => {
                 self.op_deliver(&name, kind, &material, request, *slots)
             }
+            // `Reap` returns before any entry is loaded, so this arm exists for
+            // exhaustiveness. It delegates rather than refusing: a refusal here
+            // could never fire, and one nothing can reach is one nothing gates.
+            CustodyOp::Reap { instance } => self.op_reap(instance),
             CustodyOp::Sign {
                 alg,
                 derivation,
@@ -837,6 +897,41 @@ impl Custodian {
         })
     }
 
+    /// End what an instance made and never handed off (DR-0053 §5's reaping
+    /// rule).
+    ///
+    /// Three facts decide and all three are the custodian's, which is why this
+    /// takes only an instance id: which run made an entry, what retention it
+    /// was made under, and whether it was delivered. A terminal path holds no
+    /// program text, so a rule that had to read the vault declaration could not
+    /// run on the cancel and fail paths that need it most.
+    ///
+    /// Idempotent. Reaping a run twice revokes nothing the second time, because
+    /// a revoked entry is already revoked — terminal handling retries, and a
+    /// reap that failed halfway must be safe to repeat.
+    fn op_reap(&self, instance: &str) -> Result<CustodyOk, CustodyError> {
+        let mut store = lock(&self.store);
+        let reapable = store.reapable_for(instance);
+        let mut revoked = Vec::new();
+        for name in reapable {
+            match store.revoke(&name) {
+                // `false` means it was already revoked, which is the idempotent
+                // case rather than a failure.
+                Ok(true) => revoked.push(name.as_str().to_owned()),
+                Ok(false) => {}
+                Err(error) => {
+                    return Err(CustodyError::Backend {
+                        detail: format!(
+                            "reaping instance {instance} stopped at {}: {error}",
+                            name.as_str()
+                        ),
+                    })
+                }
+            }
+        }
+        Ok(CustodyOk::Reaped { revoked })
+    }
+
     // -- derive -------------------------------------------------------------
 
     fn op_derive(
@@ -911,6 +1006,8 @@ impl Custodian {
         &self,
         name: &CredentialName,
         kind: CredentialKind,
+        retain: Retention,
+        attribution: &UseAttribution,
     ) -> Result<CustodyOk, CustodyError> {
         // Not `KindMismatch`: that variant says a CREDENTIAL's kind cannot
         // perform an operation, and here the credential does not exist yet —
@@ -940,6 +1037,21 @@ impl Custodian {
         }
         store
             .register(name.clone(), kind, material, None, None)
+            .map_err(|e| CustodyError::Backend {
+                detail: e.to_string(),
+            })?;
+        // Provenance at birth. Recorded AFTER registration and in the same
+        // lock, so an entry never exists without knowing whose it is —
+        // an entry with no origin is one no terminal owns, and would never be
+        // reaped.
+        store
+            .record_origin(
+                name,
+                crate::store::CredentialOrigin {
+                    instance: attribution.run_id.clone(),
+                    retain,
+                },
+            )
             .map_err(|e| CustodyError::Backend {
                 detail: e.to_string(),
             })?;

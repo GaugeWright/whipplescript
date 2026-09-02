@@ -24,7 +24,7 @@ use ring::rand::{SecureRandom, SystemRandom};
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
-use whipplescript_custody::{CredentialKind, CredentialName};
+use whipplescript_custody::{CredentialKind, CredentialName, Retention};
 
 const STORE_VERSION: u32 = 1;
 const PBKDF2_ITERATIONS: u32 = 600_000;
@@ -121,6 +121,28 @@ struct SealedEntry {
     /// reap a key that already reached its recipient.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     delivered_at: Option<u64>,
+    /// Which instance created this credential, and under what retention
+    /// (DR-0053 §5's provenance-at-birth). Absent for entries an operator
+    /// imported: nobody's terminal owns those, so they are never reaped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    origin: Option<CredentialOrigin>,
+}
+
+/// Where a generated credential came from, recorded at birth.
+///
+/// The RETENTION is copied here rather than read from the program at terminal,
+/// for two reasons. A credential is made under a promise about its lifetime,
+/// and editing the vault declaration afterwards should not retroactively change
+/// what happens to keys already made. And the paths that must reap — a
+/// cancelled instance, a failed one — have no program text in hand.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct CredentialOrigin {
+    /// The work-unit root that created it (DR-0025). Sub-workflow children
+    /// inherit their root's id, so a credential a child made for the root to
+    /// use is reaped when the ROOT ends rather than when the child does —
+    /// reaping at child terminal would kill a key the run is still using.
+    pub instance: String,
+    pub retain: Retention,
 }
 
 /// Where a remote entry's material lives. One variant per remote backend.
@@ -191,6 +213,9 @@ pub struct Entry {
     /// When this credential was handed off, if it was. `None` means it never
     /// left, which is what makes it reapable.
     pub delivered_at: Option<u64>,
+    /// Which instance made it and under what retention. `None` for imported
+    /// entries — nobody's terminal owns those.
+    pub origin: Option<CredentialOrigin>,
 }
 
 /// The passphrase-sealed store, fully unsealed into custodian memory at open.
@@ -297,6 +322,7 @@ impl SealedStore {
                         budget: sealed.budget,
                         lease_expires_at: sealed.lease_expires_at,
                         delivered_at: sealed.delivered_at,
+                        origin: sealed.origin.clone(),
                     },
                 );
                 continue;
@@ -313,6 +339,7 @@ impl SealedStore {
                         budget: sealed.budget,
                         lease_expires_at: sealed.lease_expires_at,
                         delivered_at: sealed.delivered_at,
+                        origin: sealed.origin.clone(),
                     },
                 );
                 continue;
@@ -358,6 +385,7 @@ impl SealedStore {
                     budget: sealed.budget,
                     lease_expires_at: sealed.lease_expires_at,
                     delivered_at: sealed.delivered_at,
+                    origin: sealed.origin.clone(),
                 },
             );
         }
@@ -398,6 +426,7 @@ impl SealedStore {
                 budget,
                 lease_expires_at,
                 delivered_at: None,
+                origin: None,
             },
         );
         self.persist()
@@ -423,6 +452,7 @@ impl SealedStore {
                 budget,
                 lease_expires_at,
                 delivered_at: None,
+                origin: None,
             },
         );
         self.persist()
@@ -448,6 +478,7 @@ impl SealedStore {
                 budget,
                 lease_expires_at,
                 delivered_at: None,
+                origin: None,
             },
         );
         self.persist()
@@ -477,6 +508,7 @@ impl SealedStore {
                 budget,
                 lease_expires_at,
                 delivered_at: None,
+                origin: None,
             },
         );
         self.persist()
@@ -512,6 +544,53 @@ impl SealedStore {
     /// reaping rule asks.
     pub fn delivered_at(&self, name: &CredentialName) -> Option<u64> {
         self.entries.get(name).and_then(|entry| entry.delivered_at)
+    }
+
+    /// Record who made a credential and under what retention.
+    pub fn record_origin(
+        &mut self,
+        name: &CredentialName,
+        origin: CredentialOrigin,
+    ) -> Result<(), StoreError> {
+        match self.entries.get_mut(name) {
+            Some(entry) => {
+                entry.origin = Some(origin);
+                self.persist()
+            }
+            None => Err(StoreError::Format(format!(
+                "cannot record provenance for {}, which is not in this store",
+                name.resource_id()
+            ))),
+        }
+    }
+
+    /// The credentials this instance made that were never handed off, under a
+    /// retention that reaps.
+    ///
+    /// The conditions are the whole rule, and each excludes a case that must
+    /// survive: an entry another run made, one whose vault owns its contents,
+    /// one that already reached a recipient — a key handed to CI is supposed to
+    /// outlive the run that made it — and one already revoked, which has
+    /// nothing left to end.
+    pub fn reapable_for(&self, instance: &str) -> Vec<CredentialName> {
+        self.entries
+            .iter()
+            .filter(|(_, entry)| {
+                entry
+                    .origin
+                    .as_ref()
+                    .is_some_and(|origin| {
+                        origin.instance == instance && origin.retain == Retention::Instance
+                    })
+                    && entry.delivered_at.is_none()
+                    // Already revoked: nothing left to end. `revoke` answers
+                    // whether the entry EXISTED rather than whether it changed,
+                    // so without this a repeated reap would report the same
+                    // credentials again — and terminal paths retry.
+                    && !entry.revoked
+            })
+            .map(|(name, _)| name.clone())
+            .collect()
     }
 
     pub fn revoke(&mut self, name: &CredentialName) -> Result<bool, StoreError> {
@@ -557,6 +636,7 @@ impl SealedStore {
                         budget: entry.budget,
                         lease_expires_at: entry.lease_expires_at,
                         delivered_at: entry.delivered_at,
+                        origin: entry.origin.clone(),
                     }
                 }
                 // Remote entries persist as plaintext metadata: no nonce, no
@@ -574,6 +654,7 @@ impl SealedStore {
                     budget: entry.budget,
                     lease_expires_at: entry.lease_expires_at,
                     delivered_at: entry.delivered_at,
+                    origin: entry.origin.clone(),
                 },
                 // Same shape as remote, and for the same reason: an r2 entry
                 // has no secret on this box to seal, only the platform state it
@@ -589,6 +670,7 @@ impl SealedStore {
                     budget: entry.budget,
                     lease_expires_at: entry.lease_expires_at,
                     delivered_at: entry.delivered_at,
+                    origin: entry.origin.clone(),
                 },
                 // Same shape again: no secret on this box, only where the key
                 // is and what admitted it.
@@ -609,6 +691,7 @@ impl SealedStore {
                     budget: entry.budget,
                     lease_expires_at: entry.lease_expires_at,
                     delivered_at: entry.delivered_at,
+                    origin: entry.origin.clone(),
                 },
             };
             sealed_entries.insert(name.as_str().to_string(), sealed);
@@ -641,6 +724,43 @@ mod tests {
 
     fn name(s: &str) -> CredentialName {
         CredentialName::new(s).expect("valid name")
+    }
+
+    /// Provenance is recorded on an entry that exists. Asked for one that does
+    /// not, the store REFUSES rather than creating a bare entry: an entry whose
+    /// only content is "run X made me" would be reapable, and a reap revokes.
+    #[test]
+    fn provenance_cannot_be_recorded_for_a_credential_the_store_does_not_hold() {
+        let mut store = SealedStore::create(None, "hunter2").expect("create");
+        store
+            .register(
+                name("v/present"),
+                CredentialKind::Bearer,
+                Zeroizing::new(b"sk_live_123".to_vec()),
+                None,
+                None,
+            )
+            .expect("register");
+
+        let origin = CredentialOrigin {
+            instance: "run-1".to_owned(),
+            retain: Retention::Instance,
+        };
+        store
+            .record_origin(&name("v/present"), origin.clone())
+            .expect("an entry the store holds takes its provenance");
+
+        let Err(StoreError::Format(detail)) = store.record_origin(&name("v/absent"), origin) else {
+            panic!("provenance for an absent credential must be refused");
+        };
+        assert!(
+            detail.contains("v/absent") && detail.contains("not in this store"),
+            "the refusal names the credential it could not find: {detail}"
+        );
+        assert!(
+            store.get(&name("v/absent")).is_none(),
+            "and the refused call left no entry behind"
+        );
     }
 
     #[test]

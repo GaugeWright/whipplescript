@@ -1125,7 +1125,12 @@ pub fn step_instance_generic<S: RuntimeStore + Coordination + WorkItems + Fronti
                 // instance reaching a workflow terminal auto-releases
                 // every lease it held.
                 if lowering.terminal.is_some() {
-                    release_holder_resources_on_terminal(kernel.store_mut(), instance_id);
+                    let reaper = kernel.credential_reaper();
+                    release_holder_resources_on_terminal(
+                        kernel.store_mut(),
+                        reaper.as_deref(),
+                        instance_id,
+                    );
                 }
                 made_progress = true;
                 last_committed_rule = Some(rule.name.clone());
@@ -1620,10 +1625,35 @@ fn load_version_ir<S: RuntimeStore>(
 /// terminal.
 pub fn release_holder_resources_on_terminal<S: Coordination + WorkItems>(
     store: &mut S,
+    reaper: Option<&dyn CredentialReaper>,
     instance_id: &str,
 ) {
     let _ = Coordination::release_all_for_holder(store, instance_id);
     let _ = WorkItems::release_claims_for_holder(store, instance_id);
+    // Credentials are the third resource type an instance holds, and they are
+    // released from the same place for the reason stated above: a terminal path
+    // that has to remember a resource type is one that will forget it.
+    if let Some(reaper) = reaper {
+        reaper.reap(instance_id);
+    }
+}
+
+/// The host's door to the custodian, for reaping at instance terminal
+/// (DR-0053 §5's "reap what was never handed off").
+///
+/// A seam rather than a direct call because the custodian lives behind a socket
+/// the kernel does not own — the same shape the ingress pass uses for
+/// filesystem and network I/O. A host that installs none reaps nothing, which
+/// is the honest degradation: `retain instance` then means what it meant before
+/// this existed.
+pub trait CredentialReaper: Send + Sync {
+    /// End what this instance made and never handed off.
+    ///
+    /// BEST-EFFORT, like the two releases beside it: a custodian that cannot be
+    /// reached must not fail a terminal that has already been committed. The
+    /// credential outliving its instance is the failure this exists to prevent,
+    /// and a terminal that refuses to complete is a worse one.
+    fn reap(&self, instance_id: &str);
 }
 
 /// Projects ready work items from declared builtin queues into

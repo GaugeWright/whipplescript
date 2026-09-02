@@ -90,6 +90,9 @@ pub struct RuntimeKernel<S: RuntimeStore = SqliteStore> {
     /// Folded into `schema.coerce` effect admission keys by the rule pass —
     /// see [`RuntimeKernel::with_coercion_config_fingerprint`].
     coercion_config_fingerprint: String,
+    /// The host's door to the custodian, for reaping at instance terminal.
+    /// `None` reaps nothing, which is what every host did before this existed.
+    credential_reaper: Option<std::sync::Arc<dyn crate::rule_pass::CredentialReaper>>,
 }
 
 /// wasm / no-native form: no default backend (rusqlite `SqliteStore` is absent).
@@ -100,6 +103,9 @@ pub struct RuntimeKernel<S: RuntimeStore> {
     /// Folded into `schema.coerce` effect admission keys by the rule pass —
     /// see [`RuntimeKernel::with_coercion_config_fingerprint`].
     coercion_config_fingerprint: String,
+    /// The host's door to the custodian, for reaping at instance terminal.
+    /// `None` reaps nothing, which is what every host did before this existed.
+    credential_reaper: Option<std::sync::Arc<dyn crate::rule_pass::CredentialReaper>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -411,6 +417,7 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
             store,
             trace: Vec::new(),
             coercion_config_fingerprint: "fixture".to_owned(),
+            credential_reaper: None,
         }
     }
 
@@ -422,6 +429,26 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
     /// keeps the constructor's literal `"fixture"` so tests stay
     /// deterministic. Switching backend/model re-runs future coercions
     /// instead of replaying a stale terminal.
+    /// Install the host's door to the custodian, so an instance reaching
+    /// terminal reaps what it made and never handed off.
+    ///
+    /// Opt-in: a host that installs none reaps nothing, which is what every
+    /// host did before this existed. The kernel cannot reach a custodian on its
+    /// own — it lives behind a socket the host owns.
+    pub fn with_credential_reaper(
+        mut self,
+        reaper: std::sync::Arc<dyn crate::rule_pass::CredentialReaper>,
+    ) -> Self {
+        self.credential_reaper = Some(reaper);
+        self
+    }
+
+    pub fn credential_reaper(
+        &self,
+    ) -> Option<std::sync::Arc<dyn crate::rule_pass::CredentialReaper>> {
+        self.credential_reaper.clone()
+    }
+
     pub fn with_coercion_config_fingerprint(mut self, fingerprint: impl Into<String>) -> Self {
         self.coercion_config_fingerprint = fingerprint.into();
         self
@@ -1592,7 +1619,14 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
             reason,
             idempotency_key,
         })?;
-        crate::rule_pass::release_holder_resources_on_terminal(&mut self.store, instance_id);
+        // Cloned first: the reaper and the store are both behind `self`, and
+        // the release needs the store mutably.
+        let reaper = self.credential_reaper.clone();
+        crate::rule_pass::release_holder_resources_on_terminal(
+            &mut self.store,
+            reaper.as_deref(),
+            instance_id,
+        );
         self.emit(TraceEvent::InstanceCancelled);
         Ok(event)
     }
@@ -1621,7 +1655,14 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
             idempotency_key,
         })?;
         // Same bound, same reason as `cancel_instance` above.
-        crate::rule_pass::release_holder_resources_on_terminal(&mut self.store, instance_id);
+        // Cloned first: the reaper and the store are both behind `self`, and
+        // the release needs the store mutably.
+        let reaper = self.credential_reaper.clone();
+        crate::rule_pass::release_holder_resources_on_terminal(
+            &mut self.store,
+            reaper.as_deref(),
+            instance_id,
+        );
         self.emit(TraceEvent::InstanceFailed);
         Ok(event)
     }

@@ -19789,9 +19789,16 @@ fn step_instance(
     // it; rung 1 is per-effect and stays out of the kernel-construction
     // fingerprint; credentials are never consulted).
     let registry_default = coerce_registry_default(&stores.runtime, instance_id)?;
-    let mut kernel = RuntimeKernel::new(stores).with_coercion_config_fingerprint(
-        coerce_runtime::coercion_config_fingerprint_with_registry(registry_default.as_ref()),
-    );
+    let mut kernel = RuntimeKernel::new(stores)
+        .with_coercion_config_fingerprint(
+            coerce_runtime::coercion_config_fingerprint_with_registry(registry_default.as_ref()),
+        )
+        // Installed HERE because this is the one door the CLI has into the rule
+        // pass, and the rule pass is where an instance reaches terminal. The
+        // other kernels this binary builds inspect, replay or report; none of
+        // them can end a run, so a reaper on those would be a door onto
+        // nothing.
+        .with_credential_reaper(std::sync::Arc::new(CustodianReaper));
     step_instance_generic(
         &mut kernel,
         instance_id,
@@ -25676,6 +25683,56 @@ fn run_queue_effect(
 /// Boxed so both arms return ONE type: a non-Unix build has no transport type
 /// to name, and an `Infallible` placeholder would still have to satisfy
 /// `CustodyTransport` at the call site.
+/// The host's reaper: ends what an instance made and never handed off
+/// (DR-0053 §5's "reap what was never handed off").
+///
+/// Best-effort by contract. A terminal has already been committed by the time
+/// this runs, so a custodian that cannot be reached must not fail it — the
+/// operator's log carries what did not happen. Left un-reaped, a credential
+/// outlives its instance, which is the failure this exists to reduce rather
+/// than a new one it introduces.
+struct CustodianReaper;
+
+impl whipplescript_kernel::rule_pass::CredentialReaper for CustodianReaper {
+    fn reap(&self, instance_id: &str) {
+        let transport = match custody_egress_transport() {
+            Ok(Some(transport)) => transport,
+            // No custodian configured: this run made no custodian-held
+            // credentials either, so there is nothing to reap and nothing to
+            // say.
+            Ok(None) => return,
+            Err(problem) => {
+                eprintln!("reap: {problem}");
+                return;
+            }
+        };
+        let call = whipplescript_custody::CustodyCall::new(
+            whipplescript_custody::UseAttribution {
+                run_id: instance_id.to_owned(),
+                actor: None,
+                effect_key: None,
+            },
+            whipplescript_custody::CustodyOp::Reap {
+                instance: instance_id.to_owned(),
+            },
+        );
+        match transport.call(call) {
+            Ok(reply) => match reply.outcome {
+                Ok(whipplescript_custody::CustodyOk::Reaped { revoked }) => {
+                    // Named rather than counted: the revocation IS the record,
+                    // and an operator reading "3 revoked" cannot tell which.
+                    for credential in revoked {
+                        eprintln!("reap: revoked {credential} (instance {instance_id} ended)");
+                    }
+                }
+                Ok(other) => eprintln!("reap: the custodian answered {other:?}"),
+                Err(error) => eprintln!("reap: {error}"),
+            },
+            Err(error) => eprintln!("reap: could not reach the custodian: {error:?}"),
+        }
+    }
+}
+
 /// This run's `require credential <rung>` floor (DR-0053 §4).
 ///
 /// A REJECTED envelope is an error rather than "no floor". Reading a tampered

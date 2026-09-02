@@ -343,6 +343,9 @@ impl CredentialKind {
             // is not material and needs no operation — so admitting them here
             // would offer a way to ship a private key that the design says
             // nobody needs.
+            // Not kind-conditioned: a reap ends whatever the instance made,
+            // and an entry's kind has no bearing on whether it was handed off.
+            Operation::Reap => false,
             Operation::Deliver => matches!(
                 self,
                 CredentialKind::Bearer
@@ -401,6 +404,55 @@ impl fmt::Display for CredentialKind {
 // ---------------------------------------------------------------------------
 // The rung ladder
 // ---------------------------------------------------------------------------
+
+/// What happens to a vault's credentials when the instance that made them ends
+/// (DR-0053 §5 Amendment).
+///
+/// Fixed AT BIRTH on each credential rather than read from the program at
+/// terminal. A credential is created under a promise about its lifetime, and
+/// editing the vault declaration afterwards should not retroactively change
+/// what happens to keys already made — nor should reaping depend on a program
+/// text that a cancelled or failed instance may no longer be running.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Retention {
+    /// The default. The instance owns what it made, and terminal revokes what
+    /// was never handed off.
+    Instance,
+    /// The vault owns its contents; terminal does nothing and reconciliation is
+    /// the operator's. Has to be typed — the safe option is the default.
+    Durable,
+}
+
+impl Retention {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Retention::Instance => "instance",
+            Retention::Durable => "durable",
+        }
+    }
+
+    pub fn parse(text: &str) -> Result<Self, String> {
+        match text {
+            "instance" => Ok(Retention::Instance),
+            "durable" => Ok(Retention::Durable),
+            other => Err(format!(
+                "unknown retention {other:?}: a vault retains `instance` (the default) or `durable`"
+            )),
+        }
+    }
+}
+
+impl Default for Retention {
+    /// The SAFE option is the default and the dangerous one has to be typed —
+    /// the same shape as a file store's `allow write`. Under this default,
+    /// forgetting to hand a credential off kills it at instance end and you
+    /// find out immediately; under an unbounded default, authority accumulates
+    /// where nobody is looking.
+    fn default() -> Self {
+        Retention::Instance
+    }
+}
 
 /// Sealing rung, ordered (DR-0053 §4). Derived from evidence by the
 /// custodian, never asserted in configuration — `require credential <rung>`
@@ -509,6 +561,10 @@ pub enum Operation {
     /// it creates an entry rather than exercising one, so no kind is consulted.
     Register,
     Revoke,
+    /// End what an instance made and never handed off. Addressed by instance
+    /// rather than by credential, and so neither a member nor a container
+    /// operation — it is the terminal act on a RUN.
+    Reap,
 }
 
 impl Operation {
@@ -558,6 +614,7 @@ impl Operation {
             Operation::Rotate => "rotate",
             Operation::Register => "register",
             Operation::Revoke => "revoke",
+            Operation::Reap => "reap",
         }
     }
 
@@ -575,6 +632,7 @@ impl Operation {
             "rotate" => Ok(Operation::Rotate),
             "register" => Ok(Operation::Register),
             "revoke" => Ok(Operation::Revoke),
+            "reap" => Ok(Operation::Reap),
             other => Err(format!("unknown custody operation {other:?}")),
         }
     }
@@ -597,9 +655,13 @@ impl Operation {
             }
             // Container grants are named bare on the vault; a glob on one is a
             // check error, exactly as for the non-narrowable member class.
-            Operation::Generate | Operation::Rotate | Operation::Register | Operation::Revoke => {
-                GrantClass::NonNarrowable
-            }
+            Operation::Generate
+            | Operation::Rotate
+            | Operation::Register
+            | Operation::Revoke
+            // A reap narrows on nothing: it ends what an instance made, and
+            // the instance is the address rather than a bound on it.
+            | Operation::Reap => GrantClass::NonNarrowable,
         }
     }
 
@@ -902,6 +964,11 @@ pub enum CustodyOp {
     Generate {
         credential: CredentialName,
         kind: CredentialKind,
+        /// The vault's retention, carried from the declaration at the moment of
+        /// creation. The custodian records it so reaping needs only an instance
+        /// id — the terminal paths that must reap have no program text to read.
+        #[serde(default)]
+        retain: Retention,
     },
     /// Produce a SUCCESSOR under the same entry, both valid (DR-0053 §12
     /// Amendment 2026-08-29).
@@ -936,6 +1003,20 @@ pub enum CustodyOp {
     /// the custodian's admin surface since the split, gated by the store
     /// passphrase. What this moves is the gate: from passphrase to governance.
     Revoke { credential: CredentialName },
+    /// End the credentials an instance made and never handed off (DR-0053 §5
+    /// Amendment: "reap what was never handed off").
+    ///
+    /// Addressed by INSTANCE rather than by credential, because the whole point
+    /// is to end things the program forgot: a reap that had to name them would
+    /// only ever revoke what someone remembered, which is the case that needed
+    /// no help.
+    ///
+    /// Three facts decide, and all three are the custodian's: which instance
+    /// made an entry, what retention it was made under, and whether it was
+    /// delivered. A `retain durable` entry is left alone, and so is one that
+    /// reached a recipient — a key handed to CI is supposed to outlive the run
+    /// that made it.
+    Reap { instance: String },
     /// Substitute at marked slots, egress, return the response.
     Request {
         credential: CredentialName,
@@ -1050,6 +1131,7 @@ impl CustodyOp {
             CustodyOp::Register { .. } => Operation::Register,
             CustodyOp::Rotate { .. } => Operation::Rotate,
             CustodyOp::Revoke { .. } => Operation::Revoke,
+            CustodyOp::Reap { .. } => Operation::Reap,
             CustodyOp::Request { .. } => Operation::Request,
             CustodyOp::Sign { .. } => Operation::Sign,
             CustodyOp::Verify { .. } => Operation::Verify,
@@ -1061,7 +1143,13 @@ impl CustodyOp {
         }
     }
 
-    pub fn credential(&self) -> &CredentialName {
+    /// The credential this call acts on, when it acts on one.
+    ///
+    /// `None` for `Reap`, which is addressed by INSTANCE: its subject is a run
+    /// and its effects are several credentials. Returning some borrowed name
+    /// there would put an unrelated credential in the use record, so the option
+    /// is the honest shape — not every custody act is about one credential.
+    pub fn credential(&self) -> Option<&CredentialName> {
         match self {
             CustodyOp::Request { credential, .. }
             | CustodyOp::Sign { credential, .. }
@@ -1074,7 +1162,23 @@ impl CustodyOp {
             | CustodyOp::Generate { credential, .. }
             | CustodyOp::Register { credential, .. }
             | CustodyOp::Rotate { credential }
-            | CustodyOp::Revoke { credential } => credential,
+            | CustodyOp::Revoke { credential } => Some(credential),
+            CustodyOp::Reap { .. } => None,
+        }
+    }
+
+    /// What this call acts on, for the use record: a credential, or the
+    /// instance a reap names.
+    pub fn subject(&self) -> String {
+        match self {
+            CustodyOp::Reap { instance } => format!("instance:{instance}"),
+            other => other
+                .credential()
+                .map(|credential| credential.as_str().to_owned())
+                // Total by construction: `Reap` is the only credential-less op
+                // and it is handled above. A `String::new()` here would be a
+                // record that says a use happened to nothing.
+                .unwrap_or_else(|| "instance:unknown".to_owned()),
         }
     }
 }
@@ -1151,6 +1255,13 @@ pub enum CustodyOk {
     Revoked {
         existed: bool,
     },
+    /// What a reap ended. Names the credentials rather than counting them: the
+    /// revocation IS the record, and an operator reading "3 revoked" cannot
+    /// tell which three were meant.
+    Reaped {
+        revoked: Vec<String>,
+    },
+
     Requested {
         response: EgressResponse,
     },
@@ -1746,5 +1857,32 @@ mod tests {
         assert!(!CredentialKind::Ed25519.supports(Operation::Request));
         assert!(CredentialKind::AwsSigv4.supports(Operation::Request));
         assert!(CredentialKind::AwsSigv4.supports(Operation::Sign));
+    }
+}
+
+#[cfg(test)]
+mod retention_tests {
+    use super::Retention;
+
+    /// Retention is a closed set of two, and an unknown word is refused rather
+    /// than defaulted. Defaulting would be the dangerous direction: a typo'd
+    /// `durabel` silently becoming `instance` reaps a key the author meant to
+    /// keep, and silently becoming `durable` accumulates keys forever.
+    #[test]
+    fn an_unknown_retention_is_refused_rather_than_defaulted() {
+        assert_eq!(Retention::parse("instance"), Ok(Retention::Instance));
+        assert_eq!(Retention::parse("durable"), Ok(Retention::Durable));
+
+        for typo in ["durabel", "forever", "Instance", ""] {
+            let Err(detail) = Retention::parse(typo) else {
+                panic!("{typo:?} must not parse as a retention");
+            };
+            assert!(
+                detail.contains("unknown retention")
+                    && detail.contains("instance")
+                    && detail.contains("durable"),
+                "the refusal names both retentions an author may write: {detail}"
+            );
+        }
     }
 }

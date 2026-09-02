@@ -789,6 +789,7 @@ fn generate_creates_a_usable_credential_and_returns_only_a_handle() {
     let reply = custodian.handle(&call(CustodyOp::Generate {
         credential: target.clone(),
         kind: CredentialKind::Ed25519,
+        retain: Retention::Instance,
     }));
     let CustodyReply {
         outcome: Ok(CustodyOk::Generated { credential, kind }),
@@ -824,6 +825,7 @@ fn generate_refuses_a_kind_nobody_here_can_issue() {
         let reply = custodian.handle(&call(CustodyOp::Generate {
             credential: name("v/member"),
             kind,
+            retain: Retention::Instance,
         }));
         let Err(CustodyError::Backend { detail }) = &reply.outcome else {
             panic!("{kind:?} must not be generatable: {reply:?}");
@@ -845,6 +847,7 @@ fn generate_refuses_to_overwrite_an_existing_credential() {
     let reply = custodian.handle(&call(CustodyOp::Generate {
         credential: name("vault/live"),
         kind: CredentialKind::HmacSha256,
+        retain: Retention::Instance,
     }));
     let Err(CustodyError::Backend { detail }) = &reply.outcome else {
         panic!("an existing name must not be overwritten: {reply:?}");
@@ -913,11 +916,12 @@ fn a_generate_is_recorded_as_a_use() {
     custodian.handle(&call(CustodyOp::Generate {
         credential: name("v/m"),
         kind: CredentialKind::Raw,
+        retain: Retention::Instance,
     }));
     let uses = custodian.uses();
     assert_eq!(uses.len(), 1);
     assert_eq!(uses[0].operation, Operation::Generate);
-    assert_eq!(uses[0].credential, "v/m");
+    assert_eq!(uses[0].subject, "v/m");
 }
 
 /// Rotation is remote-only, and the refusal names why rather than failing
@@ -1487,5 +1491,239 @@ fn a_handoff_that_cannot_be_recorded_fails_loudly() {
     assert!(
         said.contains("treat it as never delivered"),
         "and what that costs: {said}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Reaping (DR-0053 §5 Amendment: "reap what was never handed off")
+// ---------------------------------------------------------------------------
+
+use whipplescript_custodian::store::CredentialOrigin;
+use whipplescript_custody::Retention;
+
+fn made_by(store: &mut SealedStore, credential: &str, instance: &str, retain: Retention) {
+    store
+        .register(
+            name(credential),
+            CredentialKind::Raw,
+            zeroize::Zeroizing::new(b"0123456789abcdef0123456789abcdef".to_vec()),
+            None,
+            None,
+        )
+        .expect("register");
+    store
+        .record_origin(
+            &name(credential),
+            CredentialOrigin {
+                instance: instance.to_owned(),
+                retain,
+            },
+        )
+        .expect("origin");
+}
+
+/// The three conditions ARE the rule, and each excludes a case that must
+/// survive a terminal.
+#[test]
+fn a_reap_ends_only_what_this_instance_made_kept_and_never_handed_off() {
+    let mut store = SealedStore::create(None, "pw").expect("store");
+
+    // Reapable: this instance made it, it retains per-instance, it never left.
+    made_by(&mut store, "v/mine", "run-1", Retention::Instance);
+    // Another run's. Reaping it would end a credential a live instance is using.
+    made_by(&mut store, "v/theirs", "run-2", Retention::Instance);
+    // The vault owns its contents; terminal does nothing.
+    made_by(&mut store, "v/durable", "run-1", Retention::Durable);
+    // Handed off. A key delivered to CI is supposed to outlive the run that
+    // made it — that is the whole reason `deliver` had to exist first.
+    made_by(&mut store, "v/delivered", "run-1", Retention::Instance);
+    store
+        .mark_delivered(&name("v/delivered"), 1_000)
+        .expect("delivered");
+    // Imported by an operator: no origin, so nobody's terminal owns it.
+    store
+        .register(
+            name("v/imported"),
+            CredentialKind::Raw,
+            zeroize::Zeroizing::new(b"0123456789abcdef0123456789abcdef".to_vec()),
+            None,
+            None,
+        )
+        .expect("register");
+
+    let mut reapable: Vec<String> = store
+        .reapable_for("run-1")
+        .into_iter()
+        .map(|name| name.as_str().to_owned())
+        .collect();
+    reapable.sort();
+    assert_eq!(
+        reapable,
+        vec!["v/mine".to_owned()],
+        "only what run-1 made, kept per-instance, and never handed off"
+    );
+}
+
+#[test]
+fn a_reap_revokes_and_names_what_it_ended() {
+    let mut store = SealedStore::create(None, "pw").expect("store");
+    made_by(&mut store, "v/one", "run-1", Retention::Instance);
+    made_by(&mut store, "v/two", "run-1", Retention::Instance);
+    made_by(&mut store, "v/other", "run-2", Retention::Instance);
+    let custodian = Custodian::new(store, Box::new(whipplescript_custodian::DeniedEgress));
+
+    let reply = custodian.handle(&CustodyCall::new(
+        UseAttribution {
+            run_id: "run-1".to_owned(),
+            actor: None,
+            effect_key: None,
+        },
+        CustodyOp::Reap {
+            instance: "run-1".to_owned(),
+        },
+    ));
+    let mut revoked = match reply.outcome.expect("the reap ran") {
+        CustodyOk::Reaped { revoked } => revoked,
+        other => panic!("expected a reap, got {other:?}"),
+    };
+    revoked.sort();
+    assert_eq!(revoked, vec!["v/one".to_owned(), "v/two".to_owned()]);
+
+    // Idempotent: a terminal path retries, and a reap that failed halfway must
+    // be safe to repeat. The second run revokes nothing because there is
+    // nothing left to revoke.
+    let again = custodian.handle(&CustodyCall::new(
+        UseAttribution {
+            run_id: "run-1".to_owned(),
+            actor: None,
+            effect_key: None,
+        },
+        CustodyOp::Reap {
+            instance: "run-1".to_owned(),
+        },
+    ));
+    match again.outcome.expect("the second reap ran") {
+        CustodyOk::Reaped { revoked } => assert!(
+            revoked.is_empty(),
+            "a second reap ends nothing: {revoked:?}"
+        ),
+        other => panic!("expected a reap, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_reap_is_attributed_to_the_instance_rather_than_to_a_credential() {
+    // §1 claims attribution for every use. A reap's subject is a RUN, and
+    // putting an unrelated credential's name in that record would say a use
+    // happened to something it never touched.
+    let store = SealedStore::create(None, "pw").expect("store");
+    let custodian = Custodian::new(store, Box::new(whipplescript_custodian::DeniedEgress));
+    custodian.handle(&CustodyCall::new(
+        UseAttribution {
+            run_id: "run-9".to_owned(),
+            actor: None,
+            effect_key: None,
+        },
+        CustodyOp::Reap {
+            instance: "run-9".to_owned(),
+        },
+    ));
+    let uses = custodian.uses();
+    let last = uses.last().expect("a use was recorded");
+    assert_eq!(last.operation, Operation::Reap);
+    assert_eq!(last.subject, "instance:run-9");
+}
+
+/// The protocol field is the version handshake, and a call carrying another
+/// value is refused rather than interpreted. It reaches the use record like any
+/// other call: a peer speaking the wrong protocol is exactly the event an
+/// operator needs to see.
+#[test]
+fn a_call_in_another_protocol_is_refused_and_still_recorded() {
+    let custodian = custodian_with(&[("v/one", CredentialKind::Bearer, b"secret")]);
+    let mut wrong = call(CustodyOp::Revoke {
+        credential: name("v/one"),
+    });
+    wrong.protocol = "custody/99".to_owned();
+
+    let reply = custodian.handle(&wrong);
+    let Err(CustodyError::Backend { detail }) = &reply.outcome else {
+        panic!("another protocol must be refused: {reply:?}");
+    };
+    assert!(
+        detail.contains("unsupported protocol") && detail.contains("custody/99"),
+        "the refusal names the protocol that was offered: {detail}"
+    );
+    assert!(
+        custodian
+            .uses()
+            .iter()
+            .any(|use_record| use_record.subject == "v/one"),
+        "a refused call is still a use worth recording"
+    );
+
+    // The control: the same operation in the right protocol is honoured, so the
+    // refusal is about the protocol rather than about the operation.
+    let ok = custodian.handle(&call(CustodyOp::Revoke {
+        credential: name("v/one"),
+    }));
+    assert!(
+        matches!(ok.outcome, Ok(CustodyOk::Revoked { existed: true })),
+        "the same call in the right protocol succeeds: {ok:?}"
+    );
+}
+
+/// A reap that cannot write the store STOPS and says where. The alternative —
+/// carrying on and reporting the credentials it managed to revoke — would hand
+/// the caller a list that the store does not agree with, and the caller uses
+/// that list to decide the run left nothing behind.
+#[test]
+fn a_reap_that_cannot_persist_stops_and_names_where() {
+    let dir = std::env::temp_dir().join(format!(
+        "whip-custody-reap-persist-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let store =
+        SealedStore::create(Some(dir.join("store.json")), "test-passphrase").expect("create");
+    let custodian = Custodian::new(store, Box::new(DeniedEgress));
+
+    let born = custodian.handle(&CustodyCall::new(
+        UseAttribution {
+            run_id: "run-doomed".into(),
+            actor: None,
+            effect_key: None,
+        },
+        CustodyOp::Generate {
+            credential: name("v/one"),
+            kind: CredentialKind::Ed25519,
+            retain: Retention::Instance,
+        },
+    ));
+    expect_ok(&born);
+
+    // The store's directory goes away underneath it, so the rename that
+    // `persist` ends with has nowhere to land. Removing the DIRECTORY rather
+    // than clearing a write bit fails the same way whatever user runs the
+    // suite.
+    std::fs::remove_dir_all(&dir).expect("rmdir");
+
+    let reply = custodian.handle(&call(CustodyOp::Reap {
+        instance: "run-doomed".to_owned(),
+    }));
+    let Err(CustodyError::Backend { detail }) = &reply.outcome else {
+        panic!("a reap that cannot persist must not report success: {reply:?}");
+    };
+    assert!(
+        // The literal "stopped at" is asserted alongside the interpolated
+        // names: a mutation sweep preserves placeholders, so a test that
+        // checked only the run and the credential would pass with the whole
+        // message rewritten — and the refusal would be free to stop refusing.
+        detail.contains("reaping instance")
+            && detail.contains("run-doomed")
+            && detail.contains("stopped at")
+            && detail.contains("v/one"),
+        "the refusal names the run it was reaping and the credential it stopped at: {detail}"
     );
 }

@@ -623,15 +623,19 @@ struct TurnCredentialAccess {
 /// nothing to glob.
 #[derive(Debug, Default, Clone, Eq, PartialEq)]
 struct TurnVaultAccess {
-    /// Vault name to the KIND its declaration fixes for every member. The kind
-    /// is projected into the grant by the lowering rather than written on the
-    /// grant, so the declaration stays the single source.
-    creatable: BTreeMap<String, String>,
+    /// Vault name to the KIND and RETENTION its declaration fixes for every
+    /// member. Both are projected into the grant by the lowering rather than
+    /// written on the grant, so the declaration stays the single source.
+    ///
+    /// The retention travels with the grant because the custodian records it at
+    /// birth: reaping runs on terminal paths that hold no program text, so the
+    /// policy has to reach the entry when the entry is made.
+    creatable: BTreeMap<String, (String, String)>,
 }
 
 impl TurnVaultAccess {
-    fn grant_create(&mut self, vault: &str, kind: String) {
-        self.creatable.insert(vault.to_owned(), kind);
+    fn grant_create(&mut self, vault: &str, kind: String, retain: String) {
+        self.creatable.insert(vault.to_owned(), (kind, retain));
     }
 
     fn is_empty(&self) -> bool {
@@ -641,10 +645,10 @@ impl TurnVaultAccess {
     /// Whether this turn may create into `vault`, and why not when it may not.
     /// Governance is a separate ceiling asked after this one — a turn grant can
     /// only narrow.
-    fn admits_create(&self, vault: &str) -> Result<&str, String> {
+    fn admits_create(&self, vault: &str) -> Result<(&str, &str), String> {
         self.creatable
             .get(vault)
-            .map(String::as_str)
+            .map(|(kind, retain)| (kind.as_str(), retain.as_str()))
             .ok_or_else(|| format!("this turn was granted no `create` on vault `{vault}`"))
     }
 }
@@ -2362,7 +2366,7 @@ impl FileToolExecutor {
         let Some(access) = self.vault_access.as_ref() else {
             return Err("this turn was granted no vault".to_owned());
         };
-        let kind = access.admits_create(vault)?;
+        let (kind, retain) = access.admits_create(vault)?;
 
         // Ceiling 2: the signed envelope. A REJECTED policy is an error rather
         // than a silent "no scope" — a tampered policy must not read as a
@@ -2381,6 +2385,8 @@ impl FileToolExecutor {
         }
         let kind = whipplescript_custody::CredentialKind::parse(kind)
             .map_err(|error| format!("vault `{vault}` kind: {error}"))?;
+        let retain = whipplescript_custody::Retention::parse(retain)
+            .map_err(|error| format!("vault `{vault}` retention: {error}"))?;
         let name = whipplescript_custody::CredentialName::new(&format!("{vault}/{member}"))
             .map_err(|error| format!("credential name: {error}"))?;
 
@@ -2400,6 +2406,10 @@ impl FileToolExecutor {
             whipplescript_custody::CustodyOp::Generate {
                 credential: name.clone(),
                 kind,
+                // The vault's declared retention, carried to the custodian so
+                // it is recorded on the entry at birth. A reap on a terminal
+                // path has no program to consult.
+                retain,
             },
         );
         let reply = transport
@@ -4290,6 +4300,14 @@ fn turn_tool_access_from_input(input_json: &str) -> Result<TurnToolAccess, Strin
                         .get("vault_policy")
                         .and_then(|policy| policy.get("kind"))
                         .and_then(Value::as_str);
+                    // Retention rides the same policy object. Absent means the
+                    // DEFAULT, which is `instance` — the safe option, so a
+                    // grant that says nothing reaps rather than accumulates.
+                    let retain = grant
+                        .get("vault_policy")
+                        .and_then(|policy| policy.get("retain"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("instance");
                     if let (false, Some(kind)) = (vault.is_empty(), kind) {
                         // A `generate` grant on a kind whose material a third
                         // party issues can never be honoured: the custodian
@@ -4309,7 +4327,7 @@ fn turn_tool_access_from_input(input_json: &str) -> Result<TurnToolAccess, Strin
                                 ));
                             }
                         }
-                        vaults.grant_create(vault, kind.to_owned());
+                        vaults.grant_create(vault, kind.to_owned(), retain.to_owned());
                     }
                 }
                 "run" if resource == "command" => command_run = true,
@@ -5423,8 +5441,9 @@ mod tests {
             .expect("an ed25519 vault is generatable");
         assert_eq!(
             admitted.vaults.admits_create("deploy_keys"),
-            Ok("ed25519"),
-            "a generatable vault keeps its create grant"
+            Ok(("ed25519", "instance")),
+            "a generatable vault keeps its create grant, and a policy that says \
+             nothing about retention gets the reapable default"
         );
     }
 
@@ -5445,7 +5464,7 @@ mod tests {
 
         let mut granted = FileToolExecutor::new(&root);
         let mut access = TurnVaultAccess::default();
-        access.grant_create("deploy_keys", "ed25519".to_owned());
+        access.grant_create("deploy_keys", "ed25519".to_owned(), "instance".to_owned());
         granted.vault_access = Some(access);
 
         // A vault the turn does not hold.
@@ -6211,7 +6230,10 @@ mod tests {
         );
 
         // And the kind the lowering projected is what the turn will generate as.
-        assert_eq!(granted.vaults.admits_create("deploy_keys"), Ok("ed25519"));
+        assert_eq!(
+            granted.vaults.admits_create("deploy_keys"),
+            Ok(("ed25519", "instance"))
+        );
         assert!(granted.vaults.admits_create("other").is_err());
     }
 
