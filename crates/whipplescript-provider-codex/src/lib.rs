@@ -20,7 +20,7 @@ use whipplescript_kernel::{
     provider::{
         CancellationDepth, NativeProviderAdapter, NativeProviderArtifactRef,
         NativeProviderBoundaryError, NativeProviderCancellation, NativeProviderEvent,
-        NativeProviderEventKind, NativeProviderTurnRequest, ProviderCapability,
+        NativeProviderEventKind, NativeProviderTurnRequest, ProviderCapability, WorkspacePolicy,
     },
 };
 
@@ -426,7 +426,7 @@ pub struct CodexAppServerPolicyError {
 pub fn build_codex_app_server_policy(
     profile: Option<&str>,
     required_capabilities: &[String],
-    workspace_policy: &str,
+    workspace_policy: WorkspacePolicy,
     approval_mode: Option<&str>,
 ) -> Result<CodexAppServerPolicy, CodexAppServerPolicyError> {
     let profile = profile.ok_or_else(|| {
@@ -508,7 +508,7 @@ pub fn build_codex_app_server_policy(
 
 fn require_codex_writer(
     profile: &str,
-    workspace_policy: &str,
+    workspace_policy: WorkspacePolicy,
     capability: &str,
 ) -> Result<(), CodexAppServerPolicyError> {
     // A destructive capability is granted only when the preset's table row
@@ -521,15 +521,31 @@ fn require_codex_writer(
             format!("profile `{profile}` cannot use Codex capability `{capability}`"),
         ));
     }
+    // Exhaustive over the kernel's vocabulary, so a policy added there stops
+    // this adapter at compile time instead of silently landing in a catch-all.
     match workspace_policy {
-        "shared" | "per_effect_worktree" | "per_issue_worktree" => Ok(()),
-        "read_only" => Err(codex_policy_error(
+        // A writable local checkout the app server can be given as its `cwd`.
+        WorkspacePolicy::Shared
+        | WorkspacePolicy::PerEffectWorktree
+        | WorkspacePolicy::PerIssueWorktree => Ok(()),
+        WorkspacePolicy::ReadOnly => Err(codex_policy_error(
             "workspace_denied",
-            format!("workspace policy `{workspace_policy}` denies Codex capability `{capability}`"),
+            format!(
+                "workspace policy `{}` denies Codex capability `{capability}`",
+                workspace_policy.as_str()
+            ),
         )),
-        other => Err(codex_policy_error(
+        // DELIBERATE refusal, not an oversight: `remote_sandbox` is a policy the
+        // kernel admits, but this adapter maps a write to a LOCAL
+        // `sandbox_mode="workspace-write"` over a local `cwd`. Nothing here can
+        // reach a remote sandbox, so accepting the request would write to the
+        // wrong tree. It refuses until a remote-sandbox transport exists.
+        WorkspacePolicy::RemoteSandbox => Err(codex_policy_error(
             "unsupported_workspace_policy",
-            format!("workspace policy `{other}` is not supported for Codex app-server writes"),
+            format!(
+                "workspace policy `{}` is not supported for Codex app-server writes",
+                workspace_policy.as_str()
+            ),
         )),
     }
 }
@@ -767,7 +783,7 @@ impl<T: CodexAppServerTransport> NativeProviderAdapter for CodexAppServerAdapter
         let policy = build_codex_app_server_policy(
             request.profile.as_deref(),
             &request.required_capabilities,
-            &request.workspace_policy,
+            request.workspace_policy,
             request
                 .provider_options
                 .get("approval_mode")
@@ -1269,7 +1285,7 @@ mod tests {
     use super::*;
     use std::collections::BTreeMap;
 
-    use whipplescript_kernel::provider::NativeProviderAdapter;
+    use whipplescript_kernel::provider::{ArtifactPolicy, NativeProviderAdapter};
 
     #[derive(Default)]
     struct FakeTransport {
@@ -1345,10 +1361,10 @@ mod tests {
             agent: "codex".to_owned(),
             profile: Some("repo-writer".to_owned()),
             prompt_json: json!("edit README"),
-            workspace_policy: "per_effect_worktree".to_owned(),
+            workspace_policy: WorkspacePolicy::PerEffectWorktree,
             required_capabilities: vec!["repo.write".to_owned()],
             cancellation_depth: CancellationDepth::NativeStop,
-            artifact_policy: "manifest".to_owned(),
+            artifact_policy: ArtifactPolicy::Manifest,
             credential_ref: Some("secret:codex".to_owned()),
             provider_options: BTreeMap::from([
                 ("approval_mode".to_owned(), json!("manual")),
@@ -1528,7 +1544,7 @@ mod tests {
         let policy = build_codex_app_server_policy(
             Some("repo-reader"),
             &["repo.read".to_owned()],
-            "read_only",
+            WorkspacePolicy::ReadOnly,
             None,
         )
         .expect("reader policy maps");
@@ -1551,7 +1567,7 @@ mod tests {
         let policy = build_codex_app_server_policy(
             Some("repo-writer"),
             &["repo.write".to_owned(), "command.run".to_owned()],
-            "per_effect_worktree",
+            WorkspacePolicy::PerEffectWorktree,
             Some("manual"),
         )
         .expect("writer policy maps");
@@ -1569,7 +1585,7 @@ mod tests {
         let error = build_codex_app_server_policy(
             Some("repo-reader"),
             &["repo.write".to_owned()],
-            "shared",
+            WorkspacePolicy::Shared,
             Some("manual"),
         )
         .expect_err("reader write denied");
@@ -1582,7 +1598,7 @@ mod tests {
         let error = build_codex_app_server_policy(
             Some("repo-writer"),
             &["command.run".to_owned()],
-            "shared",
+            WorkspacePolicy::Shared,
             None,
         )
         .expect_err("approval required");
@@ -1595,7 +1611,7 @@ mod tests {
         let error = build_codex_app_server_policy(
             Some("repo-writer"),
             &["repo.write".to_owned()],
-            "read_only",
+            WorkspacePolicy::ReadOnly,
             Some("manual"),
         )
         .expect_err("read only workspace denied");
@@ -1608,7 +1624,7 @@ mod tests {
         let error = build_codex_app_server_policy(
             Some("repo-writer"),
             &["repo.write".to_owned()],
-            "remote_sandbox",
+            WorkspacePolicy::RemoteSandbox,
             Some("manual"),
         )
         .expect_err("remote sandbox requires explicit workspace implementation");
@@ -1618,8 +1634,13 @@ mod tests {
 
     #[test]
     fn policy_rejects_missing_profile() {
-        let error = build_codex_app_server_policy(None, &["repo.read".to_owned()], "shared", None)
-            .expect_err("profile required");
+        let error = build_codex_app_server_policy(
+            None,
+            &["repo.read".to_owned()],
+            WorkspacePolicy::Shared,
+            None,
+        )
+        .expect_err("profile required");
 
         assert_eq!(error.code, "missing_profile");
     }

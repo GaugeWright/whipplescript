@@ -14,9 +14,42 @@
 use std::{env, fs, path::PathBuf};
 
 use serde_json::Value;
+// The DR-0011 grammar vocabulary has exactly one owner, `whipplescript-core`,
+// and this script reads it from there instead of re-declaring it. It used to
+// keep private copies "mirroring" core, and they drifted: core admitted `onto`
+// as a `declaration_block` clause connective and this script did not, so a
+// manifest the kernel's package registry accepted panicked the parser's build.
+// A build script may depend on a crate in the graph as long as that crate does
+// not depend back on the crate being built; `whipplescript-core` is a leaf.
+use whipplescript_core::{
+    CONSTRUCT_GRAMMAR_BINDING_MODES as BINDING_MODES,
+    CONSTRUCT_GRAMMAR_CLAUSE_CONNECTIVES as CLAUSE_CONNECTIVES,
+    CONSTRUCT_GRAMMAR_CLAUSE_KINDS as CLAUSE_KINDS, CONSTRUCT_GRAMMAR_CONNECTIVES as CONNECTIVES,
+    CONSTRUCT_GRAMMAR_SLOT_KINDS as SLOT_KINDS,
+};
 
-/// The embedded std manifests, relative to this crate's manifest dir. Keep in
-/// sync with `EMBEDDED_STD_MANIFESTS` in crates/whipplescript-cli/src/main.rs.
+/// The std manifests this build script reads, relative to this crate's manifest
+/// dir: the ones whose constructs carry an `effect_operation` grammar the body
+/// parser has to be able to parse.
+///
+/// This is NOT a copy of `EMBEDDED_STD_MANIFESTS`, and it must not be made into
+/// one. (The constant also does not live where this comment used to say: it is
+/// `crates/whipplescript-cli/src/lib.rs`, not `main.rs`.) The two lists answer
+/// different questions and are deliberately different sizes:
+///
+///   this list   4 manifests, paired with DECL_GRAMMARS below — everything the
+///               PARSER needs a compiled grammar row for, and nothing else. The
+///               grammar-only files have no counterpart in the CLI at all.
+///   the CLI's   15 manifests, two of them behind cargo features, and zero
+///               grammars — everything a HOST needs to seed capability,
+///               provider, profile and contract rows so a workflow runs with no
+///               package lock.
+///
+/// A manifest with no construct grammar has nothing to contribute here, and a
+/// grammar file has nothing to contribute to admission seeding. "Syncing" the
+/// two would compile grammar rows for constructs the parser does not dispatch
+/// on, or drop rows it does. What actually keeps the copies honest is
+/// `scripts/check-vendored-std.sh`, below.
 ///
 /// Paths are the crate-local `vendored-std/` copies, NOT the workspace root's
 /// `std/`. A published crate tarball contains only files under the crate
@@ -46,32 +79,6 @@ const DECL_GRAMMARS: &[&str] = &[
     "vendored-std/grammars/vcs-grammar.json",
     "vendored-std/grammars/custody-grammar.json",
 ];
-
-/// The DR-0011 grammar vocabulary (mirrors whipplescript-core's
-/// `CONSTRUCT_GRAMMAR_*` constants; a build script cannot depend on the crate
-/// graph it builds for).
-// `with` (DR-0074 §12): the vocabulary lacked the word core constructs already
-// use for an instrument slot (`signed with <cred>`, `verify <v> with <handle>`),
-// which only surfaced when a construct instance first needed a credential.
-// Aligning the package-authorable set with the core spelling, not opening it.
-const CONNECTIVES: &[&str] = &["from", "for", "into", "to", "via", "onto", "with"];
-const SLOT_KINDS: &[&str] = &["identifier", "expression"];
-const BINDING_MODES: &[&str] = &["required", "optional", "none"];
-
-/// The Shape 1 clause value kinds (DR-0011 amended 2026-07-08).
-const CLAUSE_KINDS: &[&str] = &[
-    "identifier",
-    "expression",
-    "duration",
-    "glob",
-    "schema",
-    "scalar",
-    "flag",
-];
-
-/// Clause connective vocabulary: Shape 2's slot connectives plus `by` (ledger
-/// `partition by`), per the 2026-07-08 amendment.
-const CLAUSE_CONNECTIVES: &[&str] = &["from", "for", "into", "to", "via", "by", "with"];
 
 fn main() {
     let manifest_dir = PathBuf::from(
@@ -147,11 +154,46 @@ fn main() {
          // `parse_effect_operation`.\n\
          const EFFECT_OPERATION_GRAMMAR: &[EffectOperationSpec] = &[\n{rows}];\n"
     );
-    let out_path = PathBuf::from(out_dir).join("effect_operation_grammar.rs");
+    let out_path = PathBuf::from(&out_dir).join("effect_operation_grammar.rs");
     fs::write(&out_path, generated).unwrap_or_else(|error| {
         panic!(
             "could not write generated grammar table `{}`: {error}",
             out_path.display()
+        )
+    });
+
+    emit_build_script_probe(&out_dir);
+}
+
+/// Record, for this crate's tests, which vocabulary this run validated against
+/// and where this script's own executable is.
+///
+/// The snapshot consts are formatted from the names in scope above, so a future
+/// private re-declaration of any vocabulary list shows up as a snapshot that no
+/// longer equals `whipplescript-core`'s constant — which is what
+/// `tests/construct_grammar_vocabulary.rs` asserts. The path lets the same test
+/// re-run this exact script over a fixture manifest tree, so "the vocabulary is
+/// shared" is proved by a manifest that parses rather than by reading the
+/// source. Test scaffolding only: nothing in the parser reads this file.
+fn emit_build_script_probe(out_dir: &str) {
+    let executable = env::current_exe()
+        .expect("cargo runs the build script as a file on disk")
+        .display()
+        .to_string();
+    let probe = format!(
+        "// Generated by build.rs — do not edit. See `emit_build_script_probe`.\n\
+         pub const BUILD_SCRIPT_PATH: &str = {executable:?};\n\
+         pub const BUILD_CONNECTIVES: &[&str] = &{CONNECTIVES:?};\n\
+         pub const BUILD_SLOT_KINDS: &[&str] = &{SLOT_KINDS:?};\n\
+         pub const BUILD_BINDING_MODES: &[&str] = &{BINDING_MODES:?};\n\
+         pub const BUILD_CLAUSE_KINDS: &[&str] = &{CLAUSE_KINDS:?};\n\
+         pub const BUILD_CLAUSE_CONNECTIVES: &[&str] = &{CLAUSE_CONNECTIVES:?};\n"
+    );
+    let probe_path = PathBuf::from(out_dir).join("build_script_probe.rs");
+    fs::write(&probe_path, probe).unwrap_or_else(|error| {
+        panic!(
+            "could not write generated build-script probe `{}`: {error}",
+            probe_path.display()
         )
     });
 }

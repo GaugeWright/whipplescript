@@ -215,8 +215,10 @@ pub enum Item {
 }
 
 impl Item {
-    /// Source span of this top-level item, used to interleave preserved comments.
-    fn span(&self) -> SourceSpan {
+    /// Source span of this top-level item: used to interleave preserved
+    /// comments, and (public) to slice source at declaration granularity so a
+    /// decomposition can never disagree with the grammar.
+    pub fn span(&self) -> SourceSpan {
         match self {
             Self::Include(decl) => decl.path.span,
             Self::Measure(decl) => decl.span,

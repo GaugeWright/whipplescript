@@ -9,12 +9,23 @@ repository.workspace = true
 readme.workspace = true
 
 [dependencies]
-whipplescript-core = { version = "0.5.5", path = "../whipplescript-core" }
-whipplescript-custody = { version = "0.5.5", path = "../whipplescript-custody" }
+whipplescript-core = { version = "0.5.6", path = "../whipplescript-core" }
+whipplescript-custody = { version = "0.5.6", path = "../whipplescript-custody" }
 # Collision-resistant source/IR identity hashes (pure-Rust, wasm-safe).
 sha2 = "0.11"
 
+[dev-dependencies]
+# Reading `spec/report-schemas/package_manifest_v0.schema.json` back, to pin its
+# copy of the grammar vocabulary to core's. Test-only: the parser itself does
+# not link a JSON parser.
+serde_json = "1"
+
 [build-dependencies]
+# The construct-grammar vocabulary (`CONSTRUCT_GRAMMAR_*`) has one owner, and
+# the build script reads it from there rather than re-declaring it. `core`
+# depends on nothing but serde, so this costs a host-side compile of a leaf
+# crate the parser already links.
+whipplescript-core = { version = "0.5.6", path = "../whipplescript-core" }
 serde_json = "1"
 
 [lints]

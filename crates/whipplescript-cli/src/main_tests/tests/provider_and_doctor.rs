@@ -462,7 +462,7 @@ fn agent_provider_selection_uses_provider_config_for_harness_surface() {
         .expect("provider config selected");
     assert_eq!(config.provider_kind, "codex".to_owned());
     assert_eq!(config.surface, "codex_app_server".to_owned());
-    assert_eq!(config.workspace_policy, "read_only");
+    assert_eq!(config.workspace_policy, WorkspacePolicy::ReadOnly);
     assert_eq!(
         config.credentials_ref.as_deref(),
         Some("env:OPENAI_API_KEY")
@@ -717,12 +717,12 @@ fn native_turn_request_applies_provider_config_fields() {
             .expect("request builds");
 
     assert_eq!(request.provider_id, "coder");
-    assert_eq!(request.workspace_policy, "shared");
+    assert_eq!(request.workspace_policy, WorkspacePolicy::Shared);
     assert_eq!(
         request.cancellation_depth,
         CancellationDepth::HardProcessStop
     );
-    assert_eq!(request.artifact_policy, "required");
+    assert_eq!(request.artifact_policy, ArtifactPolicy::Required);
     assert_eq!(
         request.credential_ref.as_deref(),
         Some("env:OPENAI_API_KEY")
@@ -784,7 +784,10 @@ fn native_turn_request_applies_provider_config_fields() {
     .expect("claude request builds");
 
     assert_eq!(claude_request.provider_id, "reviewer");
-    assert_eq!(claude_request.workspace_policy, "per_effect_worktree");
+    assert_eq!(
+        claude_request.workspace_policy,
+        WorkspacePolicy::PerEffectWorktree
+    );
     assert_eq!(
         claude_request.cancellation_depth,
         CancellationDepth::CooperativeRequest
@@ -815,4 +818,81 @@ fn native_turn_request_applies_provider_config_fields() {
             .and_then(Value::as_str),
         Some("project")
     );
+}
+
+/// A provider entry that does not PARSE yields no binding at all. Before this
+/// was a refusal, `provider_binding_for_harness` iterated only the bindings and
+/// discarded the results, so the harness that entry governed fell out as
+/// `Ok(None)` — indistinguishable from "this file names no such harness" — and
+/// the turn ran with the entry's profile allow-list, credential reference and
+/// workspace policy silently dropped. Which harness a malformed entry names is
+/// exactly what could not be read, so the file refuses every harness.
+#[test]
+fn an_unreadable_provider_entry_refuses_the_harness_rather_than_vanishing() {
+    let config_path = std::env::temp_dir().join(format!(
+        "whipplescript-unreadable-provider-entry-{}.json",
+        std::process::id()
+    ));
+    fs::write(
+        &config_path,
+        json!({
+            "providers": [
+                {
+                    "provider_id": "runner",
+                    "provider_kind": "command",
+                    "surface": "command",
+                    "credentials_ref": "env:RUNNER_TOKEN",
+                    "profile_ids": ["repo-reader"],
+                    "workspace_policy": "read_only",
+                    "cancellation_depth": "none",
+                    "executable": "/bin/true",
+                    // In no vocabulary: the entry no longer parses.
+                    "artifact_policy": "keep_everything"
+                }
+            ]
+        })
+        .to_string(),
+    )
+    .expect("config writes");
+
+    let error = provider_binding_for_harness("runner", std::slice::from_ref(&config_path))
+        .expect_err("a file with an unreadable entry refuses");
+    let StoreError::Conflict(message) = error else {
+        panic!("expected a refusal naming the unreadable entry");
+    };
+    assert!(
+        message.contains("could not be read") && message.contains("runner"),
+        "the refusal must name the file's unreadable entry and the harness: {message}"
+    );
+
+    // The control: the SAME entry with a vocabulary artifact policy resolves,
+    // so the refusal is about the unreadable entry and not about the harness
+    // being absent from the file.
+    fs::write(
+        &config_path,
+        json!({
+            "providers": [
+                {
+                    "provider_id": "runner",
+                    "provider_kind": "command",
+                    "surface": "command",
+                    "credentials_ref": "env:RUNNER_TOKEN",
+                    "profile_ids": ["repo-reader"],
+                    "workspace_policy": "read_only",
+                    "cancellation_depth": "none",
+                    "executable": "/bin/true",
+                    "artifact_policy": "metadata"
+                }
+            ]
+        })
+        .to_string(),
+    )
+    .expect("config rewrites");
+    let binding = provider_binding_for_harness("runner", std::slice::from_ref(&config_path))
+        .expect("a well-formed file resolves");
+    assert_eq!(
+        binding.map(|config| config.artifact_policy),
+        Some(ArtifactPolicy::Metadata)
+    );
+    let _ = fs::remove_file(&config_path);
 }

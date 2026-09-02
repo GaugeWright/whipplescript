@@ -267,6 +267,41 @@ pub struct Envelope {
     placements: BTreeMap<String, PlacementPolicy>,
 }
 
+/// `p` acts-for `q` over a set of delegation edges: reflexive-transitive over
+/// the edges, with `public` as the universal bottom (everyone acts-for `public`;
+/// `public` acts-for nothing but itself). Cycle-safe via a visited set.
+///
+/// One traversal, two edge sets. A single envelope walks its own `deleg`; a
+/// composition walks the UNANIMOUS edges of its constituents (`CompositionMeet::
+/// edges`), which is a different set of edges but the same reachability
+/// question. Written twice, the two could drift — and a drift here is not a
+/// cosmetic one: `dominates` is the leak/inject decision, so an envelope and a
+/// composition of that one envelope could disagree about whether a flow leaks.
+fn acts_for_over(edges: &[(String, String)], p: &str, q: &str) -> bool {
+    if q == PUBLIC || p == q {
+        return true;
+    }
+    if p == PUBLIC {
+        return false;
+    }
+    let mut frontier = vec![p.to_owned()];
+    let mut visited = BTreeSet::new();
+    while let Some(current) = frontier.pop() {
+        if current == q {
+            return true;
+        }
+        if !visited.insert(current.clone()) {
+            continue;
+        }
+        for (left, right) in edges {
+            if *left == current {
+                frontier.push(right.clone());
+            }
+        }
+    }
+    false
+}
+
 impl Envelope {
     /// Resolve a whip-facing handle to its canonical `kind:address` identity; a
     /// handle with no governance binding is its own identity.
@@ -1637,32 +1672,11 @@ impl Envelope {
             .all(|req| provider.iter().any(|prov| self.can_act(prov, req)))
     }
 
-    /// `p` acts-for `q`: reflexive-transitive over the delegation edges, with
-    /// `public` as the universal bottom (everyone acts-for `public`; `public`
-    /// acts-for nothing but itself). Cycle-safe via a visited set.
+    /// `p` acts-for `q`: reflexive-transitive over this envelope's delegation
+    /// edges, with `public` as the universal bottom (everyone acts-for `public`;
+    /// `public` acts-for nothing but itself). Cycle-safe via a visited set.
     fn can_act(&self, p: &str, q: &str) -> bool {
-        if q == PUBLIC || p == q {
-            return true;
-        }
-        if p == PUBLIC {
-            return false;
-        }
-        let mut frontier = vec![p.to_owned()];
-        let mut visited = BTreeSet::new();
-        while let Some(current) = frontier.pop() {
-            if current == q {
-                return true;
-            }
-            if !visited.insert(current.clone()) {
-                continue;
-            }
-            for (left, right) in &self.deleg {
-                if *left == current {
-                    frontier.push(right.clone());
-                }
-            }
-        }
-        false
+        acts_for_over(&self.deleg, p, q)
     }
 
     /// Does data from `source` leak when written to `sink`? Safe iff every party
@@ -2159,16 +2173,7 @@ fn rule_read_resources(
     let mut reads: Vec<String> = Vec::new();
     for effect in &rule.metadata.effects {
         if let Some(resource) = ifc_resource_for_effect(effect, shared_coordination) {
-            if matches!(
-                effect.kind,
-                IrEffectKind::FileRead
-                    | IrEffectKind::FileImport
-                    // A response is inbound external data.
-                    | IrEffectKind::HttpRequest
-                    | IrEffectKind::LeaseAcquire
-                    | IrEffectKind::LedgerAppend
-                    | IrEffectKind::CounterConsume
-            ) {
+            if effect_flow(&effect.kind).reads_resource {
                 reads.push(resource.to_owned());
             }
         }
@@ -2242,12 +2247,7 @@ fn emitted_signal_ports(rule: &IrRule) -> Vec<String> {
     rule.metadata
         .effects
         .iter()
-        .filter(|effect| {
-            matches!(
-                effect.kind,
-                IrEffectKind::EventEmit | IrEffectKind::SignalEmit
-            )
-        })
+        .filter(|effect| effect_flow(&effect.kind).emits_stream)
         .filter_map(|effect| effect.resource.clone())
         .filter(|resource| resource.starts_with("signal:"))
         .collect()
@@ -2377,6 +2377,156 @@ fn is_coordination_effect(kind: &IrEffectKind) -> bool {
     )
 }
 
+/// What one effect kind does to the resource it names, on the axes this checker
+/// asks about.
+///
+/// Every flow site used to spell its own `matches!` list over `IrEffectKind`,
+/// and the lists disagreed: `request` was a read at one site and invisible at
+/// three others, `exec` was a sink at one and nowhere else. Each disagreement
+/// failed OPEN — in the leak checker itself — because a kind a list omits is a
+/// door that check cannot see. A `matches!` list also defaults a NEW variant to
+/// `false` silently, so a kind added to the language becomes invisible to every
+/// list nobody remembered to extend.
+///
+/// So the audit lives here once, the sites ask for the axis they need, and the
+/// match below has no wildcard: a new variant stops the build until someone has
+/// decided what it does to the flow.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct EffectFlow {
+    /// External data comes IN through `effect.resource`. The rule performing
+    /// the effect has read that resource: its integrity drops to the meet with
+    /// the resource's, and the acting principal must be cleared for it.
+    reads_resource: bool,
+    /// Rule data goes OUT through `effect.resource`. The resource is a sink, so
+    /// anything the rule read whose readers exceed the sink's leaks there.
+    writes_resource: bool,
+    /// The effect pushes the broadcast `stream` sink rather than its own
+    /// resource: the durable session-event log and the telemetry export both
+    /// observe it (E2), and `stream` is unlabeled-public by default.
+    emits_stream: bool,
+    /// The effect's OUTPUT BINDING is attributable to `effect.resource` — a
+    /// value the effect produced carries that resource as its provenance root.
+    ///
+    /// Deliberately NARROWER than `reads_resource`, and the difference is not
+    /// an oversight: a `request`, an `exec` or a turn also brings data in, but
+    /// its output's provenance is the EXECUTOR token DR-0046 attributes
+    /// (`output_tokens_for_root`), not the resource handle. `resolve_root_
+    /// sources` returning "unattributable" for those is what ARMS that
+    /// fallback, so naming the resource here would suppress the more precise
+    /// attribution rather than add to it.
+    resource_is_output_provenance: bool,
+}
+
+impl EffectFlow {
+    /// The effect's resource is not a flow edge in either direction.
+    const NONE: Self = Self {
+        reads_resource: false,
+        writes_resource: false,
+        emits_stream: false,
+        resource_is_output_provenance: false,
+    };
+    /// Inbound only, and the output binding carries the resource as its root.
+    const READ_ATTRIBUTED: Self = Self {
+        reads_resource: true,
+        resource_is_output_provenance: true,
+        ..Self::NONE
+    };
+    /// Outbound only: the rule's data reaches the resource.
+    const WRITE: Self = Self {
+        writes_resource: true,
+        ..Self::NONE
+    };
+    /// Both directions across one resource.
+    const BOTH: Self = Self {
+        reads_resource: true,
+        writes_resource: true,
+        ..Self::NONE
+    };
+    /// Outbound to the broadcast `stream` sink instead of to a resource.
+    const STREAM: Self = Self {
+        emits_stream: true,
+        ..Self::NONE
+    };
+}
+
+/// The single audit of what each effect kind does to the resource it names.
+fn effect_flow(kind: &IrEffectKind) -> EffectFlow {
+    match kind {
+        // A read or import brings the file's contents in, and the binding it
+        // produces IS those contents — the one output whose provenance the
+        // checker can attribute to a resource by name.
+        IrEffectKind::FileRead | IrEffectKind::FileImport => EffectFlow::READ_ATTRIBUTED,
+        IrEffectKind::FileWrite | IrEffectKind::FileExport => EffectFlow::WRITE,
+        // `send via <channel>` lowers to a capability call carrying the
+        // channel as its resource; it is an egress sink.
+        IrEffectKind::CapabilityCall => EffectFlow::WRITE,
+        // Shared coordination is bidirectional: the mutation writes the
+        // resource, and the outcome/discriminant reads it.
+        IrEffectKind::LeaseAcquire | IrEffectKind::LedgerAppend | IrEffectKind::CounterConsume => {
+            EffectFlow::BOTH
+        }
+        // Renewing a lease is the same bidirectional coordination as acquiring
+        // one.
+        IrEffectKind::LeaseRenew => EffectFlow::BOTH,
+        // Filing an issue writes a durable, shared surface. It is NOT a read: a
+        // rule reads a tracker through its trigger, which DR-0051 §1 keys
+        // separately, and the filed id it returns is data whip already had.
+        IrEffectKind::TrackerFile => EffectFlow::WRITE,
+        // `finish <item> { … }` carries a SUMMARY into a durable tracker row
+        // that other actors and humans read, so it is a data sink like
+        // `file issue`.
+        IrEffectKind::TrackerFinish => EffectFlow::WRITE,
+        // Claim, release and renew carry no rule data: what they write is the
+        // HOLDER and a TTL, not anything the rule read. Treating them as data
+        // sinks over-reports, and not in a harmless direction — it refuses
+        // DR-0051 §3's endorsed claim, which is the sanctioned crossing itself,
+        // because the rule's untrusted trigger would then inject into the queue
+        // it claims from.
+        //
+        // Their real influence is implicit: the DECISION to claim was shaped by
+        // whatever the rule read. That is the implicit-flow gap
+        // `spec/ifc-guard-query-implicit-flow-note.md` records deliberately, and
+        // chasing it for one construct while leaving it everywhere else would be
+        // inconsistent rather than safer. They keep a resource — the queue is
+        // now knowable — so a later pass has something to name.
+        IrEffectKind::TrackerClaim | IrEffectKind::TrackerRelease | IrEffectKind::TrackerRenew => {
+            EffectFlow::NONE
+        }
+        // A `request` is BOTH, and the accurate reading rather than merely the
+        // conservative one: its URL, headers, and body leave the process for an
+        // external endpoint, and its response comes back in. It was neither
+        // until DR-0053, so an authenticated call to an arbitrary host was the
+        // one egress this checker could not see.
+        IrEffectKind::HttpRequest => EffectFlow::BOTH,
+        // A mint spends its parent at a token endpoint, so the exchange is an
+        // egress under that credential and the reply comes back in — the same
+        // reading as `request`, for the same reason.
+        IrEffectKind::MintCredential => EffectFlow::BOTH,
+        // An exec sends its argv and stdin out to a process and reads its
+        // stdout back. Both directions, and the resource is the script
+        // capability or `exec:raw`.
+        IrEffectKind::ExecCommand => EffectFlow::BOTH,
+        // Invoking a child workflow ships it a payload and takes its result
+        // back.
+        IrEffectKind::WorkflowInvoke => EffectFlow::BOTH,
+        // emit/notify publish an event to the durable log, which the DR-0026
+        // session-event stream and the telemetry export both observe (E2, the
+        // last two of the five doors). The sink is `stream`, not
+        // `effect.resource` — which for these names the signal port.
+        IrEffectKind::EventEmit | IrEffectKind::SignalEmit => EffectFlow::STREAM,
+        // `AgentTell` egresses to its agent's PROVIDER, which is a different
+        // resource from `effect.resource`; the provider-egress block in
+        // `check_with_envelope` reads the agent declaration to find it.
+        IrEffectKind::AgentTell => EffectFlow::NONE,
+        // `SchemaCoerce` egresses to `model`, resolved through the
+        // marked-crossing machinery rather than by resource.
+        IrEffectKind::SchemaCoerce => EffectFlow::NONE,
+        // A timer carries no payload in either direction: it waits and reports
+        // that it waited.
+        IrEffectKind::TimerWait => EffectFlow::NONE,
+    }
+}
+
 fn shared_coordination_resources(ir: &IrProgram) -> BTreeSet<String> {
     if !ir.shared_coordination_usage.is_empty() {
         return ir
@@ -2475,18 +2625,9 @@ fn selected_effect_integrity_sinks(
     shared_coordination: &BTreeSet<String>,
 ) -> Vec<String> {
     let mut sinks = Vec::new();
+    let flow = effect_flow(&effect.kind);
     if let Some(resource) = ifc_resource_for_effect(effect, shared_coordination) {
-        if matches!(
-            effect.kind,
-            IrEffectKind::FileWrite
-                | IrEffectKind::FileExport
-                | IrEffectKind::CapabilityCall
-                | IrEffectKind::HttpRequest
-                | IrEffectKind::TrackerFile
-                | IrEffectKind::LeaseAcquire
-                | IrEffectKind::LedgerAppend
-                | IrEffectKind::CounterConsume
-        ) {
+        if flow.writes_resource {
             sinks.push(resource.to_owned());
         }
     }
@@ -2499,10 +2640,7 @@ fn selected_effect_integrity_sinks(
             sinks.push(grant.resource.clone());
         }
     }
-    if matches!(
-        effect.kind,
-        IrEffectKind::EventEmit | IrEffectKind::SignalEmit
-    ) {
+    if flow.emits_stream {
         sinks.push("stream".to_owned());
     }
     sinks.sort();
@@ -2841,33 +2979,9 @@ impl Composition {
 
     fn dominates(&self, provider: &BTreeSet<String>, required: &BTreeSet<String>) -> bool {
         let edges = self.edges();
-        let acts_for = |p: &str, q: &str| {
-            if q == PUBLIC || p == q {
-                return true;
-            }
-            if p == PUBLIC {
-                return false;
-            }
-            let mut frontier = vec![p.to_owned()];
-            let mut visited = BTreeSet::new();
-            while let Some(current) = frontier.pop() {
-                if current == q {
-                    return true;
-                }
-                if !visited.insert(current.clone()) {
-                    continue;
-                }
-                for (left, right) in &edges {
-                    if *left == current {
-                        frontier.push(right.clone());
-                    }
-                }
-            }
-            false
-        };
         required
             .iter()
-            .all(|req| provider.iter().any(|prov| acts_for(prov, req)))
+            .all(|req| provider.iter().any(|prov| acts_for_over(&edges, prov, req)))
     }
 
     /// Whether data read from `source` leaks when written to `sink`, under the
@@ -2937,14 +3051,33 @@ impl VerifiedEnvelope {
     /// The same trust boundary for an EXPLICIT envelope path — the discovery half
     /// (which path) split from the verification half (is it authentic), so a caller
     /// that already knows its envelope does not have to publish it through the
-    /// process-global environment to be governed by it. `None` is ungoverned dev
-    /// mode, exactly as an unset `WHIPPLESCRIPT_IFC_ENVELOPE` is.
+    /// process-global environment to be governed by it. `None` — nobody named an
+    /// envelope — is ungoverned dev mode, exactly as an unset
+    /// `WHIPPLESCRIPT_IFC_ENVELOPE` is.
+    ///
+    /// A NAMED path that cannot be read is `Rejected`. Only the absence of a
+    /// name is ungoverned: naming an envelope is the act that ends dev mode, and
+    /// whether the file behind the name opens is not the operator's statement of
+    /// intent. Returning `Ungoverned` here — which this did until the contract
+    /// two lines above was enforced — meant a typo'd path, a dangling symlink or
+    /// a mode-600 policy read by the wrong user turned EVERY flow check off and
+    /// let `whip check` pass clean, which is the exact failure the whole
+    /// boundary exists to prevent.
     pub fn load_from_path(path: Option<&std::path::Path>) -> EnvelopeStatus {
         let Some(path) = path else {
             return EnvelopeStatus::Ungoverned;
         };
-        let Ok(text) = std::fs::read_to_string(path) else {
-            return EnvelopeStatus::Ungoverned;
+        let text = match std::fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(error) => {
+                return EnvelopeStatus::Rejected(format!(
+                    "the configured governance envelope `{}` cannot be read: {error} — a named \
+                     envelope is rejected, never silently treated as ungoverned; point \
+                     `WHIPPLESCRIPT_IFC_ENVELOPE` at a readable policy, or unset it to run \
+                     ungoverned on purpose",
+                    path.display()
+                ));
+            }
         };
         Self::from_text(&text)
     }
@@ -3636,14 +3769,7 @@ fn fact_reach_map(
             let mut own: BTreeSet<String> = BTreeSet::new();
             for effect in &rule.metadata.effects {
                 if let Some(resource) = ifc_resource_for_effect(effect, &shared_coordination) {
-                    if matches!(
-                        effect.kind,
-                        IrEffectKind::FileRead
-                            | IrEffectKind::FileImport
-                            | IrEffectKind::LeaseAcquire
-                            | IrEffectKind::LedgerAppend
-                            | IrEffectKind::CounterConsume
-                    ) {
+                    if effect_flow(&effect.kind).reads_resource {
                         own.insert(resource.to_owned());
                     }
                 }
@@ -3830,13 +3956,13 @@ fn resolve_root_sources(
         return Some(carried);
     }
     if let Some(effect) = effect_by_binding.get(base) {
-        return match effect.kind {
-            IrEffectKind::FileRead | IrEffectKind::FileImport => effect
-                .resource
-                .as_ref()
-                .map(|resource| BTreeSet::from([resource.clone()])),
-            _ => None,
-        };
+        if !effect_flow(&effect.kind).resource_is_output_provenance {
+            return None;
+        }
+        return effect
+            .resource
+            .as_ref()
+            .map(|resource| BTreeSet::from([resource.clone()]));
     }
     trigger_sources.get(base).cloned()
 }
@@ -3927,7 +4053,33 @@ fn output_tokens_for_root(
             };
             out.push((handle, crossed));
         }
-        _ => {}
+        // Everything else is not an effect OUTPUT: the binding it produces
+        // carries no executing principal whose `from` clearance could be the
+        // output's provided integrity. Named rather than left to a wildcard,
+        // because "contributes nothing" is a decision about each kind and a new
+        // one must make it deliberately — a wildcard here would silently give a
+        // new executor no token, which reads downstream as "vouched by nobody
+        // and produced by nobody" rather than as an unattributed executor.
+        IrEffectKind::CapabilityCall
+        | IrEffectKind::EventEmit
+        | IrEffectKind::WorkflowInvoke
+        | IrEffectKind::TimerWait
+        | IrEffectKind::HttpRequest
+        | IrEffectKind::MintCredential
+        | IrEffectKind::TrackerFile
+        | IrEffectKind::TrackerClaim
+        | IrEffectKind::TrackerRenew
+        | IrEffectKind::TrackerRelease
+        | IrEffectKind::TrackerFinish
+        | IrEffectKind::LeaseAcquire
+        | IrEffectKind::LeaseRenew
+        | IrEffectKind::LedgerAppend
+        | IrEffectKind::CounterConsume
+        | IrEffectKind::SignalEmit
+        | IrEffectKind::FileRead
+        | IrEffectKind::FileWrite
+        | IrEffectKind::FileImport
+        | IrEffectKind::FileExport => {}
     }
 }
 
@@ -4276,151 +4428,48 @@ pub fn check_with_envelope_imports(
         let mut span = None;
         for effect in &rule.metadata.effects {
             if let Some(resource) = ifc_resource_for_effect(effect, &shared_coordination) {
-                match effect.kind {
-                    IrEffectKind::FileRead | IrEffectKind::FileImport => {
-                        reads.push(resource);
-                        span.get_or_insert(effect.span);
-                    }
-                    IrEffectKind::FileWrite | IrEffectKind::FileExport => {
-                        writes.push(resource);
-                        span.get_or_insert(effect.span);
-                    }
-                    // `send via <channel>` lowers to a capability call carrying the
-                    // channel as its resource; it is an egress sink.
-                    IrEffectKind::CapabilityCall => {
-                        writes.push(resource);
-                        span.get_or_insert(effect.span);
-                    }
-                    // Shared coordination is bidirectional: the mutation writes the
-                    // resource, and the outcome/discriminant reads it.
-                    IrEffectKind::LeaseAcquire
-                    | IrEffectKind::LedgerAppend
-                    | IrEffectKind::CounterConsume => {
-                        reads.push(resource);
-                        writes.push(resource);
-                        span.get_or_insert(effect.span);
-                    }
-                    // Filing an issue writes a durable, shared surface. It is
-                    // NOT a read: a rule reads a tracker through its trigger,
-                    // which DR-0051 §1 keys separately, and the filed id it
-                    // returns is data whip already had.
-                    IrEffectKind::TrackerFile => {
-                        writes.push(resource);
-                        span.get_or_insert(effect.span);
-                    }
-                    // A `request` is BOTH, and the accurate reading rather
-                    // than merely the conservative one: its URL, headers, and
-                    // body leave the process for an external endpoint, and its
-                    // response comes back in. It was neither until now, so an
-                    // authenticated call to an arbitrary host was the one
-                    // egress this checker could not see.
-                    IrEffectKind::HttpRequest => {
-                        reads.push(resource);
-                        writes.push(resource);
-                        span.get_or_insert(effect.span);
-                        // The governance ceiling, refused at CHECK time when
-                        // the URL is a literal (DR-0053 §14 as amended). An
-                        // interpolated URL is not knowable here and is refused
-                        // at egress instead; this catches what it can prove,
-                        // which is the common case and the better diagnostic.
-                        if let Some(request) = effect.http_request.as_ref() {
-                            if !request.url.contains("{{") {
-                                if let Err(problem) =
-                                    envelope.admits_request(resource, &request.method, &request.url)
-                                {
-                                    diagnostics.push(Diagnostic {
-                                        code: diagnostic_code!("security.egress_scope_exceeded"),
-                                        severity: Severity::Error,
-                                        span: effect.span,
-                                        message: format!(
-                                            "denied egress in rule `{}`: {problem}",
-                                            rule.name
-                                        ),
-                                        suggestion: Some(format!(
-                                            "add `grant request {resource} for {} {}` to the \
-                                             policy, or point the request inside the scope it \
-                                             already grants",
-                                            request.method, request.url
-                                        )),
-                                        related: Vec::new(),
-                                    });
-                                }
+                // The audit of which kinds read and which write lives in
+                // `effect_flow`, so this join box and the five other flow sites
+                // cannot disagree about a kind.
+                let flow = effect_flow(&effect.kind);
+                if flow.reads_resource {
+                    reads.push(resource);
+                    span.get_or_insert(effect.span);
+                }
+                if flow.writes_resource {
+                    writes.push(resource);
+                    span.get_or_insert(effect.span);
+                }
+                // The governance ceiling on a `request`, refused at CHECK time
+                // when the URL is a literal (DR-0053 §14 as amended). An
+                // interpolated URL is not knowable here and is refused at
+                // egress instead; this catches what it can prove, which is the
+                // common case and the better diagnostic.
+                if effect.kind == IrEffectKind::HttpRequest {
+                    if let Some(request) = effect.http_request.as_ref() {
+                        if !request.url.contains("{{") {
+                            if let Err(problem) =
+                                envelope.admits_request(resource, &request.method, &request.url)
+                            {
+                                diagnostics.push(Diagnostic {
+                                    code: diagnostic_code!("security.egress_scope_exceeded"),
+                                    severity: Severity::Error,
+                                    span: effect.span,
+                                    message: format!(
+                                        "denied egress in rule `{}`: {problem}",
+                                        rule.name
+                                    ),
+                                    suggestion: Some(format!(
+                                        "add `grant request {resource} for {} {}` to the \
+                                         policy, or point the request inside the scope it \
+                                         already grants",
+                                        request.method, request.url
+                                    )),
+                                    related: Vec::new(),
+                                });
                             }
                         }
                     }
-                    // A mint spends its parent at a token endpoint, so the
-                    // exchange is an egress under that credential and the
-                    // reply comes back in — the same reading as `request`,
-                    // for the same reason.
-                    IrEffectKind::MintCredential => {
-                        reads.push(resource);
-                        writes.push(resource);
-                        span.get_or_insert(effect.span);
-                    }
-                    // `finish <item> { … }` carries a SUMMARY into a durable
-                    // tracker row that other actors and humans read, so it is a
-                    // data sink like `file issue`.
-                    IrEffectKind::TrackerFinish => {
-                        writes.push(resource);
-                        span.get_or_insert(effect.span);
-                    }
-                    // Claim, release and renew carry no rule data: what they
-                    // write is the HOLDER and a TTL, not anything the rule
-                    // read. Treating them as data sinks over-reports, and not
-                    // in a harmless direction — it refuses DR-0051 §3's
-                    // endorsed claim, which is the sanctioned crossing itself,
-                    // because the rule's untrusted trigger would then inject
-                    // into the queue it claims from.
-                    //
-                    // Their real influence is implicit: the DECISION to claim
-                    // was shaped by whatever the rule read. That is the
-                    // implicit-flow gap `spec/ifc-guard-query-implicit-flow-note.md`
-                    // records deliberately, and chasing it for one construct
-                    // while leaving it everywhere else would be inconsistent
-                    // rather than safer. They keep a resource — the queue is
-                    // now knowable — so a later pass has something to name.
-                    IrEffectKind::TrackerClaim
-                    | IrEffectKind::TrackerRelease
-                    | IrEffectKind::TrackerRenew => {}
-                    // Renewing a lease is the same bidirectional coordination
-                    // as acquiring one.
-                    IrEffectKind::LeaseRenew => {
-                        reads.push(resource);
-                        writes.push(resource);
-                        span.get_or_insert(effect.span);
-                    }
-                    // An exec sends its argv and stdin out to a process and
-                    // reads its stdout back. Both directions, and the resource
-                    // is the script capability or `exec:raw`.
-                    IrEffectKind::ExecCommand => {
-                        reads.push(resource);
-                        writes.push(resource);
-                        span.get_or_insert(effect.span);
-                    }
-                    // Invoking a child workflow ships it a payload and takes
-                    // its result back.
-                    IrEffectKind::WorkflowInvoke => {
-                        reads.push(resource);
-                        writes.push(resource);
-                        span.get_or_insert(effect.span);
-                    }
-                    // Handled elsewhere in this function, deliberately, and
-                    // named here so the match stays exhaustive rather than
-                    // letting a wildcard decide for a kind nobody considered.
-                    //
-                    // `AgentTell` egresses to its agent's PROVIDER, which is a
-                    // different resource from `effect.resource`; the block
-                    // below reads the agent declaration to find it.
-                    // `EventEmit`/`SignalEmit` push the `stream` sink below.
-                    // `SchemaCoerce` egresses to `model`, resolved through the
-                    // marked-crossing machinery rather than by resource.
-                    IrEffectKind::AgentTell
-                    | IrEffectKind::EventEmit
-                    | IrEffectKind::SignalEmit
-                    | IrEffectKind::SchemaCoerce => {}
-                    // A timer carries no payload in either direction: it waits
-                    // and reports that it waited.
-                    IrEffectKind::TimerWait => {}
                 }
             }
             for grant in &effect.access_grants {
@@ -4438,14 +4487,10 @@ pub fn check_with_envelope_imports(
                     }
                 }
             }
-            // emit/notify publish an event to the durable log, which the DR-0026
-            // session-event stream and the telemetry export both observe (E2, the
-            // last two of the five doors). Egress sink `stream`; unlabeled defaults
-            // to public, so confidential data in an emitted event is caught.
-            if matches!(
-                effect.kind,
-                IrEffectKind::EventEmit | IrEffectKind::SignalEmit
-            ) {
+            // Egress sink `stream` (see `EffectFlow::emits_stream`); unlabeled
+            // defaults to public, so confidential data in an emitted event is
+            // caught.
+            if effect_flow(&effect.kind).emits_stream {
                 writes.push("stream");
                 span.get_or_insert(effect.span);
             }
@@ -5283,14 +5328,7 @@ pub fn check_principal_ceiling(
         let mut reads: Vec<(String, whipplescript_parser::SourceSpan)> = Vec::new();
         for effect in &rule.metadata.effects {
             if let Some(resource) = ifc_resource_for_effect(effect, &shared_coordination) {
-                if matches!(
-                    effect.kind,
-                    IrEffectKind::FileRead
-                        | IrEffectKind::FileImport
-                        | IrEffectKind::LeaseAcquire
-                        | IrEffectKind::LedgerAppend
-                        | IrEffectKind::CounterConsume
-                ) {
+                if effect_flow(&effect.kind).reads_resource {
                     reads.push((resource.to_owned(), effect.span));
                 }
             }
@@ -5390,10 +5428,7 @@ pub fn ifc_surface(ir: &IrProgram) -> Vec<String> {
             for grant in &effect.access_grants {
                 surface.insert(grant.resource.clone());
             }
-            if matches!(
-                effect.kind,
-                IrEffectKind::EventEmit | IrEffectKind::SignalEmit
-            ) {
+            if effect_flow(&effect.kind).emits_stream {
                 surface.insert("stream".to_owned());
             }
             if effect.kind == IrEffectKind::AgentTell {
@@ -13481,6 +13516,478 @@ rule act
         assert!(
             messages.iter().all(|m| !m.contains("denied flow")),
             "a claim carries no rule data and must not be denied: {messages:#?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod envelope_discovery_tests {
+    //! The discovery half of the trust boundary: which paths end dev mode.
+
+    use super::*;
+    use std::path::Path;
+
+    /// A NAMED envelope that cannot be read is REJECTED. Before this was
+    /// enforced the read error returned `Ungoverned`, so a typo'd
+    /// `WHIPPLESCRIPT_IFC_ENVELOPE`, a dangling symlink, or a policy whose mode
+    /// excluded the running user turned off every flow check in this file and
+    /// let `whip check` print a clean bill of health.
+    #[test]
+    fn a_named_envelope_that_cannot_be_read_is_rejected() {
+        let missing = Path::new("/whipplescript-no-such-governance-envelope.policy");
+        assert!(
+            !missing.exists(),
+            "this test needs a path that does not exist"
+        );
+        match VerifiedEnvelope::load_from_path(Some(missing)) {
+            EnvelopeStatus::Rejected(message) => {
+                assert!(
+                    message.contains("cannot be read"),
+                    "the refusal must say the envelope could not be read: {message}"
+                );
+                assert!(
+                    message.contains("never silently treated as ungoverned"),
+                    "the refusal must say why an unreadable envelope is not dev mode: {message}"
+                );
+            }
+            EnvelopeStatus::Ungoverned => panic!(
+                "an unreadable named envelope silently disabled every flow check — the operator \
+                 named a policy and got no governance and no diagnostic"
+            ),
+            EnvelopeStatus::Verified(_) => panic!("verified an envelope that does not exist"),
+        }
+    }
+
+    /// The other half of the same rule, so the refusal above cannot grow into
+    /// the gradual model: naming NO envelope is still ungoverned dev mode
+    /// (DR-0027 I-IFC6). Absence of a name is the operator's statement; failure
+    /// to read a named file is not.
+    #[test]
+    fn naming_no_envelope_at_all_stays_ungoverned() {
+        assert!(
+            matches!(
+                VerifiedEnvelope::load_from_path(None),
+                EnvelopeStatus::Ungoverned
+            ),
+            "an unset envelope path must stay ungoverned dev mode"
+        );
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod effect_flow_tests {
+    //! The single classifier, and the three holes closing it removed.
+    //!
+    //! Six sites used to spell their own `matches!` list over `IrEffectKind`,
+    //! and the lists disagreed. Every disagreement failed OPEN: a kind a list
+    //! omitted was a door that check could not see. These tests pin both the
+    //! table and the flows the table restored.
+
+    use super::*;
+    use whipplescript_parser::compile_program;
+
+    /// The audit itself, one row per variant. `effect_flow` has no wildcard, so
+    /// a NEW variant will not compile until someone decides its flow — but a
+    /// wrong decision for an existing one would compile fine, and every site in
+    /// this file now believes this table.
+    #[test]
+    fn the_classifier_decides_every_effect_kind() {
+        let expected: &[(IrEffectKind, bool, bool, bool, bool)] = &[
+            // kind, reads, writes, stream, output-provenance
+            (IrEffectKind::FileRead, true, false, false, true),
+            (IrEffectKind::FileImport, true, false, false, true),
+            (IrEffectKind::FileWrite, false, true, false, false),
+            (IrEffectKind::FileExport, false, true, false, false),
+            (IrEffectKind::CapabilityCall, false, true, false, false),
+            (IrEffectKind::LeaseAcquire, true, true, false, false),
+            (IrEffectKind::LeaseRenew, true, true, false, false),
+            (IrEffectKind::LedgerAppend, true, true, false, false),
+            (IrEffectKind::CounterConsume, true, true, false, false),
+            (IrEffectKind::TrackerFile, false, true, false, false),
+            (IrEffectKind::TrackerFinish, false, true, false, false),
+            (IrEffectKind::TrackerClaim, false, false, false, false),
+            (IrEffectKind::TrackerRelease, false, false, false, false),
+            (IrEffectKind::TrackerRenew, false, false, false, false),
+            (IrEffectKind::HttpRequest, true, true, false, false),
+            (IrEffectKind::MintCredential, true, true, false, false),
+            (IrEffectKind::ExecCommand, true, true, false, false),
+            (IrEffectKind::WorkflowInvoke, true, true, false, false),
+            (IrEffectKind::EventEmit, false, false, true, false),
+            (IrEffectKind::SignalEmit, false, false, true, false),
+            (IrEffectKind::AgentTell, false, false, false, false),
+            (IrEffectKind::SchemaCoerce, false, false, false, false),
+            (IrEffectKind::TimerWait, false, false, false, false),
+        ];
+        for (kind, reads, writes, stream, provenance) in expected {
+            let flow = effect_flow(kind);
+            assert_eq!(
+                (
+                    flow.reads_resource,
+                    flow.writes_resource,
+                    flow.emits_stream,
+                    flow.resource_is_output_provenance
+                ),
+                (*reads, *writes, *stream, *provenance),
+                "{kind:?} is classified differently from the audit"
+            );
+        }
+    }
+
+    /// Hole (a): the selector-sink write set omitted `finish`, so an untrusted
+    /// invoke input could select a branch that files a summary into a durable
+    /// Operator-integrity tracker row and nothing said so. The join box has
+    /// treated `finish` as a sink since DR-0051; this site had not been told.
+    #[test]
+    fn an_untrusted_invoke_selector_may_not_gate_a_finish() {
+        let source = r#"
+@service
+workflow Child
+
+use std.ingress
+use std.tracker
+
+tracker ops { provider builtin }
+
+input request Req
+output result R
+class Req { mode "drain" | "noop" }
+class R { ok bool }
+
+rule dispatch
+  when Req as request
+  when ops has ready issue as item
+=> {
+  case request.mode {
+    "drain" => {
+      claim item as held
+      finish held { summary "drained" }
+      complete result { ok true }
+    }
+    "noop" => {
+      complete result { ok true }
+    }
+  }
+}
+"#;
+        let compiled = compile_program(source);
+        assert!(
+            compiled.diagnostics.is_empty(),
+            "fixture must compile: {:?}",
+            compiled
+                .diagnostics
+                .iter()
+                .map(|d| d.message.as_str())
+                .collect::<Vec<_>>()
+        );
+        let ir = compiled.ir.expect("ir");
+        let envelope = Envelope::from_dsl("grant tracker ops -> tracker:ops from Operator\n")
+            .expect("valid policy");
+        let messages: Vec<String> = check_with_envelope(&ir, &VerifiedEnvelope::for_test(envelope))
+            .into_iter()
+            .map(|d| d.message)
+            .collect();
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.contains("NMIF-on-invoke-selector")
+                    && m.contains("request.mode")
+                    && m.contains("ops")),
+            "an unvouched invoke input must not select a finish into an Operator \
+             tracker: {messages:#?}"
+        );
+    }
+
+    /// The accept half of the same rule, so the refusal above is not a blanket
+    /// ban on `finish` inside a `case`: vouching the inbound invoke port makes
+    /// the selector trusted and the SAME program is allowed.
+    #[test]
+    fn a_vouched_invoke_selector_may_gate_the_same_finish() {
+        let source = r#"
+@service
+workflow Child
+
+use std.ingress
+use std.tracker
+
+tracker ops { provider builtin }
+
+input request Req
+output result R
+class Req { mode "drain" | "noop" }
+class R { ok bool }
+
+rule dispatch
+  when Req as request
+  when ops has ready issue as item
+=> {
+  case request.mode {
+    "drain" => {
+      claim item as held
+      finish held { summary "drained" }
+      complete result { ok true }
+    }
+    "noop" => {
+      complete result { ok true }
+    }
+  }
+}
+"#;
+        let ir = compile_program(source).ir.expect("compiles");
+        let envelope = Envelope::from_dsl(
+            "grant tracker ops -> tracker:ops from Operator\n\
+             grant invoke Child -> invoke:Child from Operator\n",
+        )
+        .expect("valid policy");
+        let messages: Vec<String> = check_with_envelope(&ir, &VerifiedEnvelope::for_test(envelope))
+            .into_iter()
+            .map(|d| d.message)
+            .collect();
+        assert!(
+            !messages
+                .iter()
+                .any(|m| m.contains("NMIF-on-invoke-selector")),
+            "a vouched invoke port meets the tracker's integrity: {messages:#?}"
+        );
+    }
+
+    fn request_program() -> IrProgram {
+        let source = r#"
+@service
+workflow RequestCeiling
+
+use std.custody
+use std.ingress
+
+credential stripe_api { kind bearer }
+
+signal charge.disputed { note string }
+
+output result R
+class R { v string }
+
+rule refund
+  when charge.disputed as charge
+=> {
+  request POST "https://api.stripe.com/v1/refunds" {
+    header "Authorization" bearer stripe_api
+    body charge.note
+  } as refund
+
+  after refund succeeds {
+    complete result { v "ok" }
+  }
+}
+"#;
+        let compiled = compile_program(source);
+        assert!(
+            compiled.diagnostics.is_empty(),
+            "fixture must compile: {:?}",
+            compiled
+                .diagnostics
+                .iter()
+                .map(|d| d.message.as_str())
+                .collect::<Vec<_>>()
+        );
+        compiled.ir.expect("ir")
+    }
+
+    /// Hole (b): `request` was missing from the principal ceiling's read set,
+    /// so an agent acting for a role with no clearance for the credential could
+    /// still call the endpoint and take its response back. The join box has
+    /// read `request` since DR-0053; this site had not been told, which is the
+    /// same "`request` shipped invisible to the IFC checker" hole closed at one
+    /// site only.
+    #[test]
+    fn a_request_is_a_read_at_the_principal_ceiling() {
+        let ir = request_program();
+        let envelope = Envelope::from_dsl(
+            "authority acme\n\
+             grant credential stripe_api -> credential:acme/stripe-live readable by Operator\n\
+             grant request stripe_api for POST https://api.stripe.com/v1/refunds\n",
+        )
+        .expect("valid policy");
+        let verified = VerifiedEnvelope::for_test(envelope);
+        let messages: Vec<String> = check_principal_ceiling(&ir, &verified, PUBLIC)
+            .into_iter()
+            .map(|d| d.message)
+            .collect();
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.contains("denied read in rule `refund`") && m.contains("stripe_api")),
+            "an uncleared principal must not reach the endpoint's response: {messages:#?}"
+        );
+    }
+
+    /// The accept half: the principal that IS the credential's reader may make
+    /// the same call, so the ceiling is a clearance check and not a ban on
+    /// `request`.
+    #[test]
+    fn the_credentials_own_reader_may_make_the_request() {
+        let ir = request_program();
+        let envelope = Envelope::from_dsl(
+            "authority acme\n\
+             grant credential stripe_api -> credential:acme/stripe-live readable by Operator\n\
+             grant request stripe_api for POST https://api.stripe.com/v1/refunds\n",
+        )
+        .expect("valid policy");
+        let verified = VerifiedEnvelope::for_test(envelope);
+        let messages: Vec<String> = check_principal_ceiling(&ir, &verified, "acme::Operator")
+            .into_iter()
+            .map(|d| d.message)
+            .collect();
+        assert!(
+            !messages.iter().any(|m| m.contains("stripe_api")),
+            "the credential's own reader is cleared for it: {messages:#?}"
+        );
+    }
+
+    /// Hole (b), second half: `request` was missing from `fact_reach_map`'s
+    /// own-reads too, so a fact recorded by a rule that made a request carried
+    /// none of the endpoint's confidentiality forward. The fact is the opaque
+    /// box (DR-0045): a rule's own reads join the WHOLE fact, so a request two
+    /// hops upstream of a public egress has to travel the chain like a file
+    /// read does.
+    #[test]
+    fn a_request_travels_the_fact_chain_to_a_public_egress() {
+        let source = r#"
+use std.custody
+use std.messaging
+
+@service
+workflow RequestChain
+
+credential stripe_api { kind bearer }
+
+class Origin { id string }
+class Middle { id string }
+
+channel public_out { provider fixture  destination "out" }
+
+table seed as Origin [ { id "T1" } ]
+
+rule derive
+  when Origin as origin
+=> {
+  request POST "https://api.stripe.com/v1/refunds" {
+    header "Authorization" bearer stripe_api
+    body origin.id
+  } as refund
+  after refund succeeds {
+    record Middle { id origin.id }
+  }
+}
+
+rule consume
+  when Middle as m
+=> {
+  send via public_out {
+    text "{{ m.id }}"
+  } as sent
+}
+"#;
+        let compiled = compile_program(source);
+        assert!(
+            compiled.diagnostics.is_empty(),
+            "fixture must compile: {:?}",
+            compiled
+                .diagnostics
+                .iter()
+                .map(|d| d.message.as_str())
+                .collect::<Vec<_>>()
+        );
+        let ir = compiled.ir.expect("ir");
+        let envelope = Envelope::from_dsl(
+            "authority acme\n\
+             grant channel public_out -> smtp:out readable by public from public\n\
+             grant credential stripe_api -> credential:acme/stripe-live readable by Operator from \
+             Operator\n\
+             grant request stripe_api for POST https://api.stripe.com/v1/refunds\n",
+        )
+        .expect("valid policy");
+        let messages: Vec<String> = check_with_envelope(&ir, &VerifiedEnvelope::for_test(envelope))
+            .into_iter()
+            .map(|d| d.message)
+            .collect();
+        assert!(
+            messages.iter().any(|m| m.contains("denied flow")
+                && m.contains("stripe_api")
+                && m.contains("public_out")),
+            "the endpoint's confidentiality must travel the fact chain: {messages:#?}"
+        );
+    }
+
+    /// Hole (c): `exec` was missing from `rule_read_resources`, so a rule that
+    /// ran a command and emitted a signal carried TOP integrity to its
+    /// receivers — the process's stdout laundered into "trusted (derived)".
+    /// An ungoverned `exec:raw` is vouched by nobody, so the signal must carry
+    /// nobody's vouch and driving an Operator sink with it is an injection.
+    #[test]
+    fn an_exec_drops_the_integrity_a_rules_emit_carries() {
+        let source = r##"@service
+workflow ExecCarriage
+
+use std.script
+
+output result R
+class R { ok bool }
+class Ticket { id string  status "open" }
+
+signal work.done { detail string }
+file store ledger { root "./ledger"  allow write ["**"] }
+
+table seed as Ticket [ { id "T1"  status "open" } ]
+
+rule produce
+  when Ticket as ticket where ticket.status == "open"
+=> {
+  exec "./collect.sh" as ran
+  after ran succeeds {
+    emit signal work.done to ticket.id {
+      detail "collected"
+    } as sent
+  }
+}
+
+rule consume
+  when work.done as evt
+=> {
+  write text to ledger at "out.txt" {
+    body "{{ evt.detail }}"
+    mode append
+  } as noted
+  after noted succeeds {
+    complete result { ok true }
+  }
+}
+"##;
+        let compiled = compile_program(source);
+        assert!(
+            compiled.diagnostics.is_empty(),
+            "fixture must compile: {:?}",
+            compiled
+                .diagnostics
+                .iter()
+                .map(|d| d.message.as_str())
+                .collect::<Vec<_>>()
+        );
+        let ir = compiled.ir.expect("ir");
+        let envelope = Envelope::from_dsl(
+            "grant file_store ledger -> file:/srv/ledger from Operator\n\
+             grant signal work.done -> signal:work.done internal\n",
+        )
+        .expect("valid policy");
+        let messages: Vec<String> = check_with_envelope(&ir, &VerifiedEnvelope::for_test(envelope))
+            .into_iter()
+            .map(|d| d.message)
+            .collect();
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.contains("denied influence in rule `consume`") && m.contains("ledger")),
+            "a signal emitted by a rule that ran a command must not read as trusted: \
+             {messages:#?}"
         );
     }
 }

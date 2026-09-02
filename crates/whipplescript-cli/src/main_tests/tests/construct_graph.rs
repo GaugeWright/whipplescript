@@ -248,7 +248,7 @@ fn construct_graph_reports_core_effect_dependencies() {
         node.get("node_id").and_then(Value::as_str) == Some("effect:start:first")
             && node.get("construct_id").and_then(Value::as_str) == Some("core.effect.agent.tell")
             && node.get("lowering_class").and_then(Value::as_str)
-                == Some(CORE_EFFECT_LOWERING_CLASS)
+                == Some(CONSTRUCT_LOWERING_CORE_EFFECT)
             && node.get("owner").and_then(Value::as_str) == Some("std.agent")
     }));
     assert!(nodes.iter().any(|node| {
@@ -345,7 +345,7 @@ fn construct_graph_reports_schedule_templates() {
     );
     assert_eq!(
         node.get("lowering_class").and_then(Value::as_str),
-        Some(SCHEDULE_LOWERING_CLASS)
+        Some(CONSTRUCT_LOWERING_SCHEDULE_EMITTER)
     );
     assert_eq!(
         node.get("lifecycle_profile").and_then(Value::as_str),

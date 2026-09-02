@@ -322,12 +322,31 @@ jobs:
       - name: Report schema checks
         run: scripts/check-report-schemas.sh
 
-  # `-src` only, and dispatch only. It drives scripts and credentials the
-  # mirror does not carry, and it is far too long for `-src`'s weekly cron to
-  # ever finish — so it is a deliberate manual pre-release step, matching how
-  # spec/release-checklist.md already describes it.
+  # `-src` only: it drives scripts and credentials the mirror does not carry.
+  #
+  # ON THE SCHEDULE AS WELL AS ON DISPATCH, which it was not. The condition read
+  # `inputs.deep` alone, and `inputs` is null on a `schedule` event — so the
+  # weekly cron could never fire this job and its ONLY trigger was a hand
+  # dispatch, which AGENTS.md forbids an agent from performing. Everything
+  # reachable only from `scripts/check-release-readiness.sh` therefore had no
+  # effective trigger at all: the `.ir` golden check, the store-replay and
+  # trace<->model conformance bridges, the artifact-admission differential, the
+  # cancellation policy matrix, the control-plane driver, the docs site.
+  # `scripts/README.md` already described this job as "on schedule or dispatch";
+  # the condition is what did not say so.
+  #
+  # The comment this replaces justified dispatch-only as "far too long for
+  # `-src`'s weekly cron to ever finish". That reasoning belongs to the era when
+  # `-src` had exhausted its Actions allowance and jobs there were evicted; the
+  # header of this file records that constraint as retired, and every other deep
+  # job already runs on the cron. The 20-minute timeout below is the real budget,
+  # and it is the same one the dispatch path has always had.
+  #
+  # Every sibling deep job spells the same pair the same way — see formal-models,
+  # lean-models, tla-models, e2e, report-schemas above; only the repository half
+  # differs, because those five run on the mirror and this one cannot.
   release-readiness:
-    if: ${{ github.repository != 'GaugeWright/whipplescript' && inputs.deep }}
+    if: ${{ github.repository != 'GaugeWright/whipplescript' && (github.event_name == 'schedule' || inputs.deep) }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -340,6 +359,11 @@ jobs:
       - name: Install Python tooling
         run: python3 -m pip install --user -r requirements-dev.txt
       - name: Release readiness
+        # The skip is a delegation, not a hole: `report-schemas` above runs
+        # `scripts/check-report-schemas.sh` on the same weekly cron, on the
+        # mirror, with the Maude and jsonschema tooling it needs and this job
+        # does not install. Dropping the flag here would fail on missing tooling
+        # rather than check anything more.
         run: WHIPPLESCRIPT_RELEASE_SKIP_REPORT_SCHEMAS=1 scripts/check-release-readiness.sh
       - name: Upload readiness reports
         if: always()

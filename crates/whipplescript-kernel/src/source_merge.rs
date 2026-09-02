@@ -25,7 +25,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use whipplescript_parser::{canonical_declarations, compile_program, DeclCanon, IrProgram};
+use whipplescript_parser::{
+    canonical_declarations, compile_program, parse_program, DeclCanon, IrProgram,
+};
 use whipplescript_store::vcs::{CanonDecl, DeclCanonicalizer, SourceMergeVerdict, SourceMerger};
 
 /// The parser-backed source merger the hosts install into `WorkspaceVcs`.
@@ -58,90 +60,87 @@ struct DeclBlock {
     text: String,
 }
 
-/// The keywords that may open a top-level declaration. A line at brace
-/// depth zero starting with one of these begins a new block; everything
-/// else (bodies, `=>` lines, comments, blanks) extends the current one.
-const DECL_KEYWORDS: &[&str] = &[
-    "workflow", "use", "output", "failure", "class", "rule", "signal", "source", "file", "channel",
-    "agent", "action", "pattern", "gauge", "campaign",
-];
-
-fn starts_declaration(line: &str) -> bool {
-    let trimmed = line.trim_start();
-    if trimmed.len() != line.len() {
-        // Indented lines are always body continuations.
-        return false;
+/// The offset of the start of the line containing `offset`. An item's span
+/// points at the declaration's payload (`use`'s name, `include`'s path), so
+/// the block boundary is the start of the line that declaration opens.
+fn line_start(source: &str, offset: usize) -> usize {
+    let mut cut = offset.min(source.len());
+    while !source.is_char_boundary(cut) {
+        cut -= 1;
     }
-    DECL_KEYWORDS.iter().any(|keyword| {
-        trimmed
-            .strip_prefix(keyword)
-            .is_some_and(|rest| rest.is_empty() || rest.starts_with(' ') || rest.starts_with('\t'))
-    })
+    source[..cut].rfind('\n').map_or(0, |newline| newline + 1)
 }
 
-/// Advance the brace depth across a line, skipping string literals.
-fn depth_after(line: &str, mut depth: i64) -> i64 {
-    let mut in_string = false;
-    let mut escaped = false;
-    for character in line.chars() {
-        if in_string {
-            if escaped {
-                escaped = false;
-            } else if character == '\\' {
-                escaped = true;
-            } else if character == '"' {
-                in_string = false;
-            }
-            continue;
-        }
-        match character {
-            '"' => in_string = true,
-            '{' => depth += 1,
-            '}' => depth -= 1,
-            _ => {}
-        }
-    }
-    depth
-}
-
-/// Split source into declaration blocks. `None` = the split cannot be
-/// trusted (duplicate identities, or reassembly is not byte-identical) —
-/// the caller fails closed.
+/// Split source into declaration blocks by the PARSER's top-level item
+/// spans, so the decomposition cannot disagree with the grammar: every
+/// `Item` the grammar admits opens a block, and a declaration keyword the
+/// grammar grows is recognized here the day it parses. A hand-kept keyword
+/// list could not say that — the keywords it lacked were glued onto the
+/// preceding block, which then answered for them under the preceding
+/// declaration's identity, and a non-rule edit smuggled in that way earned
+/// a certificate the footprint wall was supposed to refuse.
+///
+/// Each block runs from the start of its declaration's line to the start of
+/// the next one, so blank lines and the comments above a declaration ride
+/// the block before it; the reassembly check below still proves the split
+/// loses nothing.
+///
+/// `None` = the split cannot be trusted (the source does not parse cleanly,
+/// duplicate identities, or reassembly is not byte-identical) — the caller
+/// fails closed.
 fn split_declarations(source: &str) -> Option<Vec<DeclBlock>> {
+    let parsed = parse_program(source);
+    if !parsed.diagnostics.is_empty() {
+        return None;
+    }
+    let program = parsed.program;
+    // Depth-zero units only: a `workflow X { … }` block is ONE unit and its
+    // nested items ride inside it, matching DR-0054 canonicalization.
+    let mut starts: Vec<usize> = Vec::new();
+    if let Some(workflow) = &program.workflow {
+        starts.push(line_start(source, workflow.span.start));
+    }
+    for pattern in &program.patterns {
+        starts.push(line_start(source, pattern.span.start));
+    }
+    for item in &program.items {
+        starts.push(line_start(source, item.span().start));
+    }
+    for workflow in &program.workflows {
+        starts.push(line_start(source, workflow.span.start));
+    }
+    starts.sort_unstable();
+    // The compact contract signature desugars several items onto ONE line;
+    // a line the source cannot separate is one editable unit.
+    starts.dedup();
+
     let mut blocks: Vec<DeclBlock> = Vec::new();
-    let mut current: Option<DeclBlock> = None;
-    let mut depth = 0i64;
-    for line in source.split_inclusive('\n') {
-        let logical = line.strip_suffix('\n').unwrap_or(line);
-        if depth == 0 && starts_declaration(logical) {
-            if let Some(block) = current.take() {
-                blocks.push(block);
-            }
-            current = Some(DeclBlock {
-                identity: logical
-                    .trim_end()
-                    .trim_end_matches('{')
-                    .trim_end()
-                    .to_owned(),
-                text: String::new(),
-            });
-        }
-        match current.as_mut() {
-            Some(block) => block.text.push_str(line),
-            None => {
-                // Leading prose before the first declaration: attach to a
-                // synthetic preamble block keyed by its own text.
-                current = Some(DeclBlock {
-                    identity: format!("preamble:{}", logical.trim()),
-                    text: line.to_owned(),
-                });
-            }
-        }
-        depth = depth_after(logical, depth);
+    let first = starts.first().copied().unwrap_or(source.len());
+    if first > 0 {
+        // Leading prose before the first declaration: a synthetic preamble
+        // block keyed by its own text.
+        let text = &source[..first];
+        blocks.push(DeclBlock {
+            identity: format!("preamble:{}", text.lines().next().unwrap_or("").trim()),
+            text: text.to_owned(),
+        });
     }
-    if let Some(block) = current.take() {
-        blocks.push(block);
+    for (index, &start) in starts.iter().enumerate() {
+        let end = starts.get(index + 1).copied().unwrap_or(source.len());
+        let text = &source[start..end];
+        blocks.push(DeclBlock {
+            identity: text
+                .lines()
+                .next()
+                .unwrap_or("")
+                .trim_end()
+                .trim_end_matches('{')
+                .trim_end()
+                .to_owned(),
+            text: text.to_owned(),
+        });
     }
+
     // Lossless + unambiguous, or nothing.
     let reassembled: String = blocks.iter().map(|block| block.text.as_str()).collect();
     if reassembled != source {
@@ -374,12 +373,47 @@ impl SourceMerger for WhipSourceMerger {
                              side_map: &BTreeMap<String, String>|
          -> Option<Footprint> {
             let Some(rule_name) = identity.strip_prefix("rule ") else {
-                // A non-rule declaration ADDED by this side (absent in
-                // base) cannot interfere with edits that compiled without
-                // it: empty footprint. Modifying or deleting a non-rule
-                // declaration has no footprint model — fail closed.
-                return (!base_map.contains_key(identity) && side_map.contains_key(identity))
-                    .then(Footprint::default);
+                // Modifying or deleting a non-rule declaration has no
+                // footprint model — fail closed.
+                if base_map.contains_key(identity) || !side_map.contains_key(identity) {
+                    return None;
+                }
+                // An ADDED non-rule declaration is footprint-free only if it
+                // contributed nothing to the fact graph. A `class` qualifies:
+                // it declares a type. A `table`, `view` or `apply` does NOT --
+                // each lowers into fact-writing rules -- and an `assert` reads
+                // the fact sets it names without producing a rule at all.
+                //
+                // Splitting by parser spans is what made those reachable here:
+                // while the decomposition was a 15-keyword scan, every one of
+                // them glued into the preceding block instead of arriving as
+                // its own identity, so this branch only ever saw the kinds the
+                // list happened to name. The question is therefore asked of the
+                // lowered IR rather than of a second keyword list, which is the
+                // failure this decomposition was rewritten to end.
+                //
+                // Attribution is deliberately coarse: a generated rule does not
+                // carry which declaration produced it, so a side that generated
+                // ANY rule fails closed for ALL of its added non-rule
+                // declarations rather than guessing which one owns it.
+                let declared_rules: BTreeSet<&str> = side_map
+                    .keys()
+                    .filter_map(|key| key.strip_prefix("rule "))
+                    .map(str::trim)
+                    .collect();
+                let base_rules: BTreeSet<&str> = base_ir
+                    .rules
+                    .iter()
+                    .map(|rule| rule.name.as_str())
+                    .collect();
+                let generated = side_ir.rules.iter().any(|rule| {
+                    !base_rules.contains(rule.name.as_str())
+                        && !declared_rules.contains(rule.name.as_str())
+                });
+                if generated || side_ir.assertions != base_ir.assertions {
+                    return None;
+                }
+                return Some(Footprint::default());
             };
             let rule_name = rule_name.trim().to_owned();
             let mut footprint = Footprint::default();
@@ -465,6 +499,47 @@ mod tests {
     use super::*;
 
     const BASE: &str = "workflow Demo\n\noutput result Report\n\nclass Report {\n  message string\n}\n\nclass Ticket {\n  status string\n}\n\nrule triage\n  when started\n=> {\n  record Ticket {\n    status \"open\"\n  }\n}\n\nrule close\n  when Ticket as t\n=> {\n  complete result {\n    message \"done\"\n  }\n}\n";
+
+    /// An ADDED non-rule declaration takes the empty-footprint branch, and
+    /// that branch is only sound when the declaration touched no facts. An
+    /// `assert` READS the fact sets it names while producing no rule of its
+    /// own, so a side adding one against a side that WRITES that fact is the
+    /// anti-dependence `slices_disjoint` exists to refuse.
+    ///
+    /// This certified while the decomposition was a keyword scan, because
+    /// `assert` was one of the eighteen kinds the scan did not name and it
+    /// glued into the preceding rule instead of arriving as its own identity.
+    #[test]
+    fn an_added_assert_over_a_written_fact_conflicts() {
+        let ours = format!("{BASE}\nassert count(Ticket) == 1\n");
+        let theirs = format!(
+            "{BASE}\nrule seed_more\n  when started\n=> {{\n  record Ticket {{\n    status \"extra\"\n  }}\n}}\n"
+        );
+        assert!(
+            matches!(
+                WhipSourceMerger.merge_source(Some(BASE), &ours, &theirs),
+                SourceMergeVerdict::Conflict
+            ),
+            "an assert reading Ticket must not certify against a rule writing it"
+        );
+    }
+
+    /// The control that proves the guard above is about the fact flow and not
+    /// about `assert` in particular: the same flow with the read expressed as
+    /// a rule conflicts too, and always did.
+    #[test]
+    fn the_same_flow_expressed_as_a_rule_also_conflicts() {
+        let ours = format!(
+            "{BASE}\nrule watch\n  when Ticket as t\n=> {{\n  record Report {{\n    message \"seen\"\n  }}\n}}\n"
+        );
+        let theirs = format!(
+            "{BASE}\nrule seed_more\n  when started\n=> {{\n  record Ticket {{\n    status \"extra\"\n  }}\n}}\n"
+        );
+        assert!(matches!(
+            WhipSourceMerger.merge_source(Some(BASE), &ours, &theirs),
+            SourceMergeVerdict::Conflict
+        ));
+    }
 
     /// Disjoint rule edits to the SAME file certify: ours rewrites
     /// `close`'s message, theirs adds an independent logging rule over a
@@ -602,6 +677,94 @@ mod tests {
         assert_eq!(
             WhipSourceMerger.merge_source(None, BASE, BASE),
             SourceMergeVerdict::Conflict
+        );
+    }
+}
+
+#[cfg(test)]
+mod glued_declaration_tests {
+    use super::*;
+
+    /// A base whose top-level `counter` and `lease` sit BETWEEN two rules —
+    /// the declaration shapes a hand-kept keyword list did not name, and so
+    /// glued onto the preceding `rule triage` block.
+    const COORD_BASE: &str = "workflow Demo\n\nuse std.coord\n\noutput result Report\n\nclass Report {\n  message string\n}\n\nclass Ticket {\n  status string\n}\n\nrule triage\n  when started\n=> {\n  record Ticket {\n    status \"open\"\n  }\n}\n\ncounter attempts {\n  key Ticket\n  cap 3\n  reset daily\n  timezone \"America/New_York\"\n}\n\nlease deploy_slot {\n  key Ticket\n  slots 1\n  ttl 10m\n}\n\nrule close\n  when Ticket as t\n=> {\n  complete result {\n    message \"done\"\n  }\n}\n";
+
+    /// Theirs: an independent rule over its own fact — disjoint from every
+    /// rule in the base, so the certificate turns entirely on what OURS is
+    /// judged to have changed.
+    fn independent_addition(base: &str) -> String {
+        format!(
+            "{base}\nclass Audit {{\n  note string\n}}\n\nrule log_start\n  when started\n=> {{\n  record Audit {{\n    note \"started\"\n  }}\n}}\n"
+        )
+    }
+
+    /// A side whose ONLY edit is a top-level `counter` has no footprint
+    /// model, so the merge must refuse. Decomposed by a keyword list, the
+    /// counter was part of `rule triage`'s block: the edit answered under
+    /// that rule's identity, borrowed that rule's footprint, and the
+    /// composition was certified with no model of the real edit at all.
+    #[test]
+    fn counter_only_edit_has_no_footprint_model() {
+        let ours = COORD_BASE.replace("cap 3", "cap 5");
+        assert_ne!(ours, COORD_BASE, "the counter edit must actually change");
+        assert_eq!(
+            WhipSourceMerger.merge_source(
+                Some(COORD_BASE),
+                &ours,
+                &independent_addition(COORD_BASE)
+            ),
+            SourceMergeVerdict::Conflict
+        );
+    }
+
+    /// The same wall for a top-level `lease`: changing how many slots a
+    /// lease has is not a rule edit and has no footprint model.
+    #[test]
+    fn lease_only_edit_has_no_footprint_model() {
+        let ours = COORD_BASE.replace("slots 1", "slots 2");
+        assert_ne!(ours, COORD_BASE, "the lease edit must actually change");
+        assert_eq!(
+            WhipSourceMerger.merge_source(
+                Some(COORD_BASE),
+                &ours,
+                &independent_addition(COORD_BASE)
+            ),
+            SourceMergeVerdict::Conflict
+        );
+    }
+
+    /// A source the grammar cannot read has no trustworthy decomposition:
+    /// the split refuses rather than handing back a partial item list whose
+    /// gaps would glue declarations back together.
+    #[test]
+    fn a_source_that_does_not_parse_has_no_split() {
+        assert!(split_declarations("not whip at all").is_none());
+    }
+
+    /// The decomposition itself: every top-level declaration is its own
+    /// block, whatever keyword opens it, and the preceding rule keeps only
+    /// its own text.
+    #[test]
+    fn every_top_level_declaration_is_its_own_block() {
+        let identities: Vec<String> = split_declarations(COORD_BASE)
+            .expect("the base splits")
+            .into_iter()
+            .map(|block| block.identity)
+            .collect();
+        assert_eq!(
+            identities,
+            vec![
+                "workflow Demo",
+                "use std.coord",
+                "output result Report",
+                "class Report",
+                "class Ticket",
+                "rule triage",
+                "counter attempts",
+                "lease deploy_slot",
+                "rule close",
+            ]
         );
     }
 }

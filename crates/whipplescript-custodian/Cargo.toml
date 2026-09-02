@@ -39,7 +39,7 @@ tpm = ["dep:tss-esapi"]
 pkcs11 = ["dep:cryptoki"]
 
 [dependencies]
-whipplescript-custody = { version = "0.5.5", path = "../whipplescript-custody" }
+whipplescript-custody = { version = "0.5.6", path = "../whipplescript-custody" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 base64 = "0.23"

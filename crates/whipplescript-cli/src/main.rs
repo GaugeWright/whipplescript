@@ -13,10 +13,15 @@ use sha2::{Digest, Sha256};
 use whipplescript_core::{
     diagnostic_code, ConstructField, ConstructInterface, ConstructRegistration, ContractRegistry,
     EffectContract, LibraryRegistration, Severity, TypedOutputValidation,
-    CONSTRUCT_FAMILY_EFFECT_OPERATION, CONSTRUCT_INTERFACE_CAPABILITY,
-    CONSTRUCT_INTERFACE_CARDINALITY_EXACTLY_ONE, CONSTRUCT_INTERFACE_EFFECT_HANDLE,
-    CONSTRUCT_INTERFACE_PHASE_COMPILE_RUNTIME, CONSTRUCT_LOWERING_CAPABILITY_CALL,
-    CORE_CAPABILITY_CALL_CONSTRUCT_ID, PLATFORM_CONSTRUCT_CATALOG,
+    CONSTRUCT_FAMILY_ASSERTION, CONSTRUCT_FAMILY_EFFECT_OPERATION,
+    CONSTRUCT_FAMILY_PROJECTION_READ, CONSTRUCT_FAMILY_RULE, CONSTRUCT_FAMILY_SOURCE_DECLARATION,
+    CONSTRUCT_INTERFACE_CAPABILITY, CONSTRUCT_INTERFACE_CARDINALITY_EXACTLY_ONE,
+    CONSTRUCT_INTERFACE_EFFECT_HANDLE, CONSTRUCT_INTERFACE_PHASE_COMPILE_RUNTIME,
+    CONSTRUCT_LOWERING_ASSERTION_CHECK, CONSTRUCT_LOWERING_CAPABILITY_CALL,
+    CONSTRUCT_LOWERING_CLOCK_SOURCE, CONSTRUCT_LOWERING_CORE_EFFECT, CONSTRUCT_LOWERING_METADATA,
+    CONSTRUCT_LOWERING_RULE_TEMPLATE, CONSTRUCT_LOWERING_SCHEDULE_EMITTER,
+    CONSTRUCT_LOWERING_SIGNAL_SOURCE, CORE_CAPABILITY_CALL_CONSTRUCT_ID,
+    PLATFORM_CONSTRUCT_CATALOG,
 };
 // Generic JSON/string utilities relocated to the leaf core crate (S7 Step 2)
 // so the wasm-kernel-hostable package-registry validators can share them.
@@ -40,10 +45,10 @@ use whipplescript_kernel::{
     program_analysis_summary_json,
     provider::{
         builtin_provider_capabilities, validate_provider_binding, validate_provider_binding_json,
-        CancellationDepth, NativeProviderAdapter, NativeProviderArtifactRef,
+        ArtifactPolicy, CancellationDepth, NativeProviderAdapter, NativeProviderArtifactRef,
         NativeProviderBoundaryError, NativeProviderCancellation, NativeProviderEvent,
         NativeProviderEventKind, NativeProviderTurnRequest, ProviderBindingConfig,
-        ProviderCapability, ProviderValidationResult, ProviderValidationStatus,
+        ProviderCapability, ProviderValidationResult, ProviderValidationStatus, WorkspacePolicy,
     },
     // The pure rule-lowering closure (`lower_rule`/`ready_contexts` + helpers +
     // their support types), lifted into the wasm-clean kernel (DR-0033 chunk 1b).
@@ -153,20 +158,11 @@ use maude_model::{maude_bool_cases, MaudeExprContext};
 use mcp_cli::mcp_command;
 use otel::{otel_export, read_otel_cursor_v2, OTEL_MAPPING_VERSION, OTEL_PROVIDER_ID};
 
-const CORE_EFFECT_LOWERING_CLASS: &str = "core_effect";
-const SCHEDULE_LOWERING_CLASS: &str = "schedule_emitter";
-const SIGNAL_SOURCE_LOWERING_CLASS: &str = "signal_source";
-const CLOCK_SOURCE_LOWERING_CLASS: &str = "clock_source";
-const CONSTRUCT_FAMILY_SOURCE_DECLARATION: &str = "source_declaration";
+// The construct-family and lowering-class names are `whipplescript_core`'s
+// (imported above); only the graph node-id prefixes are this binary's own.
 const SOURCE_DECLARATION_NODE_PREFIX: &str = "source:";
-const ASSERTION_LOWERING_CLASS: &str = "assertion_check";
-const CONSTRUCT_FAMILY_ASSERTION: &str = "assertion";
 const ASSERTION_NODE_PREFIX: &str = "assertion:";
-const RULE_TEMPLATE_LOWERING_CLASS: &str = "rule_template";
-const CONSTRUCT_FAMILY_RULE: &str = "rule";
 const RULE_NODE_PREFIX: &str = "rule:";
-const PROJECTION_READ_LOWERING_CLASS: &str = "metadata";
-const CONSTRUCT_FAMILY_PROJECTION_READ: &str = "projection_read";
 const PROJECTION_READ_NODE_PREFIX: &str = "projection_read:";
 const CHECK_REPORT_SCHEMA: &str = "whipplescript.check_report.v0";
 const COMPILE_REPORT_SCHEMA: &str = "whipplescript.compile_report.v0";
@@ -218,103 +214,32 @@ fn main() -> ExitCode {
     }
 
     match options.command.as_deref() {
-        Some("doctor") => doctor(&options),
-        Some("package") => package(&options),
-        Some("check") => check(&options),
-        Some("gov") => gov(&options),
-        Some("infoflow") => whip_infoflow(&options),
         // The IFC REPL moved to `whip infoflow` (spec/std-agent.md "Operator
         // CLI", ecosystem shape "Names"): a one-way rename with no alias, so the
-        // `whip agent`/`whip agents` namespace belongs to std.agent.
+        // `whip agent`/`whip agents` namespace belongs to std.agent. A tombstone
+        // rather than a command, so it is not in `COMMANDS`.
         Some("agent") => {
             eprintln!("`whip agent` was renamed: the information-flow REPL is now `whip infoflow`");
             eprintln!("try `whip infoflow`");
             ExitCode::from(2)
         }
-        Some("agents") => agents(&options),
-        Some("providers") => providers(&options),
-        Some("skills") => skills(&options),
-        Some("skill") => skill(&options),
-        Some("lint") => lint(&options),
-        Some("lsp") => lsp(&options),
-        Some("fmt") => fmt(&options),
-        Some("test") => test_command(&options),
-        Some("compile") => compile(&options),
-        Some("verify-report") => verify_report(&options),
-        Some("start") => start(&options),
-        Some("revise") => revise(&options),
-        Some("step") => step(&options),
-        Some("worker") => worker(&options),
-        Some("run") => run(&options),
-        Some("accept") => accept(&options),
-        Some("instances") => instances(&options),
-        Some("status") => status(&options),
-        Some("log") => log(&options),
-        Some("facts") => facts(&options),
-        Some("effects") => effects(&options),
-        Some("view") => view(&options),
-        Some("progressions") => progressions(&options),
-        Some("progression") => progression_command(&options),
-        Some("runs") => runs(&options),
-        Some("artifacts") => artifacts(&options),
-        Some("signal") => signal(&options),
-        Some("ingress") => ingress_command(&options),
-        Some("message") => message_command(&options),
-        Some("mailbox") => mailbox_command(&options),
-        Some("otel-export") => otel_export(&options),
-        Some("telemetry") => telemetry(&options),
-        Some("coercion") => coercion(&options),
-        Some("leases") => coordination_list(&options, "leases"),
-        Some("ledger") => coordination_list(&options, "ledger"),
-        Some("counters") => coordination_list(&options, "counters"),
-        Some("issue") => issue(&options),
-        Some("assert") => assert_command(&options),
-        Some("memory") => memory_command(&options),
-        Some("script") => script_command(&options),
-        Some("evidence") => evidence_router(&options),
-        Some("improve") => improve::improve_command(&options),
-        Some("campaigns") => improve::campaigns_command(&options),
-        Some("campaign") => improve::campaign_detail_command(&options),
-        Some("adopt") => improve::adopt_command(&options),
-        Some("answer") => improve::answer_command(&options),
-        Some("pin") => improve::pin_command(&options),
-        Some("suppose") => improve::suppose_command(&options),
-        Some("settle") => improve::settle_command(&options),
-        Some("gauges") => improve::gauges_command(&options),
-        Some("diagnostics") => diagnostics(&options),
-        Some("trace") => trace(&options),
-        Some("pause") => pause(&options),
-        Some("resume") => resume(&options),
-        Some("cancel") => cancel(&options),
-        Some("checkpoint") => checkpoint(&options),
-        Some("restore") => restore(&options),
-        Some("fork") => fork_instance_command(&options),
-        Some("handles") => handles_command(&options),
-        Some("branch") => branch_command(&options),
-        Some("repair") => repair_command(&options),
-        Some("publish") => publish_command(&options),
-        Some("ingest") => ingest_command(&options),
-        Some("changes") => changes_command(&options),
-        Some("undo") => ambient_undo_command(&options),
-        Some("stream") => stream_command(&options),
-        Some("retry") => retry(&options),
-        Some("recover") => recover(&options),
-        Some("auth") => auth_command(&options),
-        Some("mcp") => mcp_command(&options),
-        Some("provider") => provider_command(&options),
-        Some("deploy") => deploy_command(&options),
-        Some("executor") => executor_command(&options),
-        Some("credential-proxy") => credential_proxy_command(&options),
+        // Not an operator verb either: the narrow batch seam a trusted
+        // scheduler drives (see `turn_once_command`), deliberately unlisted.
         Some("turn-once") => turn_once_command(&options),
         Some("help") | Some("--help") | Some("-h") | None => {
             print_usage();
             ExitCode::SUCCESS
         }
-        Some(command) => {
-            eprintln!("unknown command `{command}`");
-            eprintln!("try `whip help` to see available commands");
-            ExitCode::from(2)
-        }
+        // Every other command is an entry in `COMMANDS`; there is no second
+        // place to add one.
+        Some(command) => match command_spec(command) {
+            Some(spec) => (spec.run)(&options),
+            None => {
+                eprintln!("unknown command `{command}`");
+                eprintln!("try `whip help` to see available commands");
+                ExitCode::from(2)
+            }
+        },
     }
 }
 
@@ -1044,100 +969,268 @@ fn which_on_path(tool: &str) -> Option<PathBuf> {
     })
 }
 
-fn print_usage() {
-    println!(
-        "whipplescript {} ({})",
-        whipplescript_core::version(),
-        whipplescript_core::IMPLEMENTATION_STAGE
-    );
-    println!("usage: whip [--store path] [--json] <command> [args]");
-    println!();
-    println!("authoring:    check  compile  verify-report  fmt  lint  lsp  test  package");
-    println!("run:          run  start  revise  step  worker  accept  ingress");
-    println!(
-        "inspect:      instances  status  log  facts  effects  runs  artifacts  evidence  diagnostics  trace  progressions"
-    );
-    println!("messaging:    signal  message  mailbox");
-    println!("coordinate:   leases  ledger  counters");
-    println!("lifecycle:    pause  resume  cancel  retry  recover  progression");
-    println!("context:      checkpoint  restore  handles  fork");
-    println!("version ctl:  branch  stream");
-    println!("tracker:      issue");
-    println!(
-        "improve:      improve  campaigns  campaign  adopt  answer  pin  suppose  settle  gauges  evidence"
-    );
-    println!("ops/deploy:   doctor  deploy  executor  otel-export  telemetry");
-    println!("config:       auth  coercion  memory  script  agents  providers  skills  skill  mcp");
-    println!("governance:   gov  infoflow");
-    println!();
-    println!("run `whip <command> --help` or `whip help <command>` for command usage");
+/// One `whip` command: the name the dispatch matches, the `whip help` group it
+/// is listed under, the `--help` text, and the handler. `COMMANDS` is the
+/// single statement of the command grammar — `main`, `whip help` and
+/// `whip <command> --help` all read it, so a command cannot be dispatchable
+/// without being documented and indexed.
+struct CommandSpec {
+    name: &'static str,
+    group: &'static str,
+    usage: &'static str,
+    run: fn(&CliOptions) -> ExitCode,
 }
 
-fn command_usage(command: &str) -> Option<&'static str> {
-    Some(match command {
-        "check" => "usage: whip check [--model-search] [--root <workflow>] [--exec-profile dev|hosted] [--script-manifest <path>] [--package-lock <path>] <workflow.whip>...",
-        "lint" => "usage: whip [--json] lint [--root <workflow>] <workflow.whip>",
-        "improve" => "usage: whip [--json] improve [<gauge>[><=<target>] ... [then ...] | <campaign> | --resume <campaign-id>] [--program <workflow.whip>] [--sacrifice <gauge>] [--within <gauge>=<band>%] [--spend-cap $<n>] [--proposer fixture|native] [--provider <name>] [--provider-config <path>] [--redacted-view]\n  bare `whip improve` = repair mode (restore violated bars, touch nothing else); --resume continues a campaign parked on its spend cap (fresh per-invocation allowance)\n  spend prices from the provider config's `prices` block (USD per Mtok per provider/model); unpriced usage records cost 0 and cannot bind the cap",
-        "campaigns" => "usage: whip [--json] campaigns",
-        "campaign" => "usage: whip [--json] campaign <id>",
-        "adopt" => "usage: whip [--json] adopt <campaign>:<candidate> [--program <workflow.whip>]",
-        "answer" => "usage: whip [--json] answer <campaign>:<candidate> --accept|--reject|--revoke [--by <who>]\n  answers a surfaced tradeoff; the answer is a precedent that auto-resolves future tradeoffs it Pareto-dominates",
-        "pin" => "usage: whip [--json] pin <instance> [at <mark>] --as <name>",
-        "suppose" => "usage: whip [--json] suppose <scenario> [--program <workflow.whip>] [--root <workflow>] [--provider <name>] [--provider-config <path>]\n  one what-if regeneration of the pinned scenario; mark pins replay the frozen prefix and re-execute only the suffix",
-        "settle" => "usage: whip [--json] settle <gauge> [--certify] [--threshold <k>] [--spend-cap $<n>] [--program <workflow.whip>] [--root <workflow>] [--provider <name>] [--provider-config <path>]\n  name the decision and let the system stop itself: races regenerations over the pinned scenarios until the gauge's bar is cleared or evidence is exhausted (an honest undetermined) — never an operator-chosen N\n  --spend-cap is a guardrail in currency over PRICED regeneration cost (provider config `prices` block); unpriced usage cannot bind it",
-        "gauges" => "usage: whip [--json] gauges [<gauge>]",
-        "lsp" => "usage: whip lsp   (Language Server over stdio; launched by an editor)",
-        "compile" => "usage: whip compile [--model-search] [--root <workflow>] [--package-lock <path>] <workflow.whip>",
-        "fmt" => "usage: whip fmt [--check] <workflow.whip>...",
-        "test" => "usage: whip [--json] test <workflow.whip|dir>... [--list] [-i <pattern>]... [-x <pattern>]... [--pass-if-no-tests]\n       whip [--json] test replay <instance-id>",
-        "verify-report" => "usage: whip verify-report [--entry-index <n>] [--emit construct-graph|lowered-ir|artifacts] <check-or-compile-or-artifacts-report.json>...",
-        "package" => "usage: whip package catalog | whip package check <manifest.json>... | whip package lock [--output <path>] <manifest.json>... | whip package sync --file <manifest.json> [--output <path>] [--check-only]",
-        "start" => "usage: whip [--store path] [--input <json>] start <workflow.whip> [--root <workflow>] [--package-lock <path>]\n  starts a durable instance and returns; drive it with `whip worker` (use `whip run` to run locally to idle)",
-        "revise" => "usage: whip revise <instance> <workflow.whip> [--root <workflow>] [--dry-run] [--cancel keep|queued|running]",
-        "step" => "usage: whip step <instance> --program <workflow.whip> [--root <workflow>]",
-        "worker" => "usage: whip worker <instance> [--provider <name>] [--provider-config <path>] [--program <path>] [--root <workflow>] [--exec-profile dev|hosted] [--script-manifest <path>] [--package-lock <path>] [--once] [--fail|--timeout|--cancel] [--max-child-iterations <n>]",
-        "run" => "usage: whip run <workflow.whip> [--provider <name>] [--provider-config <path>] [--root <workflow>] [--exec-profile dev|hosted] [--script-manifest <path>] [--package-lock <path>] [--include-tag <tag>] [--exclude-tag <tag>] [--stream ndjson] [--until idle] [--wait] [--max-iterations <n>] [--fail|--timeout|--cancel]",
-        "accept" => "usage: whip accept <fixture.json>",
-        "instances" => "usage: whip [--store path] [--json] instances",
-        "status" => "usage: whip status <instance>",
-        "log" => "usage: whip log <instance>",
-        "facts" => "usage: whip facts <instance>",
-        "effects" => "usage: whip effects <instance>",
-        "view" => "usage: whip [--json] view <instance>\n  the instance view model: each firing's effects joined to the program structure the\n  version stores, including the static effects a firing never REQUESTED (a `case` arm\n  not taken), which the event log cannot distinguish from an arm that does not exist.\n  Carries identifiers, statuses and reasons only — never fact values or effect input",
-        "progressions" => "usage: whip progressions <instance>",
-        "progression" => "usage: whip progression cancel <instance> <firing-id> [--reason <text>]",
-        "runs" => "usage: whip runs <instance>",
-        "artifacts" => "usage: whip artifacts <run-id>",
-        "signal" => "usage: whip signal <instance> --name <name> --data <json> --program <workflow.whip> [--root <workflow>] [--delivery-id <id>]\n  --delivery-id: the provider/operator delivery id wins over the derived payload-hash key; the same id twice admits once (the duplicate is absorbed with a diagnostic)",
-        "ingress" => "usage: whip ingress serve --stdio --program <workflow.whip> [--root <workflow>]\n  reads JSONL envelopes {\"instance\", \"signal\", \"payload\", \"delivery_id\"?} from stdin and admits each\n  through the shared admission core; one JSON result line per envelope on stdout\n  (the HTTP listener driver is deferred: spec/std-ingress.md \"Deferred with cause\")",
-        "otel-export" => "usage: whip otel-export <instance> [--dry-run] [--telemetry-allowlist <Schema.field,...>] (reads OTEL_EXPORTER_OTLP_ENDPOINT, OTEL_SERVICE_NAME, WHIPPLESCRIPT_TELEMETRY_ALLOWLIST)",
-        "telemetry" => "usage: whip telemetry <status|reset-cursor> [<instance>] (export-cursor management for otel-export)",
-        "coercion" => "usage: whip [--store path] [--json] coercion status (the resolved schema.coerce provider config: provider, backend, model, credential source, selecting rung, fingerprint)",
-        "leases" => "usage: whip leases [<resource>]",
-        "ledger" => "usage: whip ledger [<ledger>] [--partition <value>]",
-        "counters" => "usage: whip counters [<counter>]",
-        "issue" => ISSUE_USAGE,
-        "assert" => ASSERT_USAGE,
-        "memory" => "usage: whip memory <pools|entries <pool> [--limit <n>]> (the workspace memory store; WHIPPLESCRIPT_MEMORY_STORE overrides the path)",
-        "script" => "usage: whip script <list|verify> [--script-manifest <path>] (read-only views over the pinned script-capability manifest; verify re-hashes each pin, exit 1 on any mismatch)",
-        "evidence" => "usage: whip [--json] evidence [<gauge>] | whip evidence instance <instance-id>\n  bare/gauge form = the gauge evidence view (estimates + standing-contradiction flags; same as `whip gauges`); `instance` = a run's provider evidence chain",
-        "diagnostics" => "usage: whip diagnostics [--grouped] <instance>",
-        "trace" => "usage: whip trace <instance> [--check]",
-        "pause" => "usage: whip pause <instance>",
-        "resume" => "usage: whip resume <instance>",
-        "cancel" => "usage: whip cancel <instance>",
-        "checkpoint" => "usage: whip [--json] checkpoint <instance> [--cut-id <id>] [--external-positions <json|@file>]",
-        "restore" => "usage: whip [--json] restore <instance> <cut-id>",
-        "fork" => "usage: whip [--json] fork <instance> [--agent <name>] [--branch-id <id>]",
-        "handles" => "usage: whip [--json] handles <instance>",
-        "branch" => BRANCH_USAGE,
-        "publish" => "usage: whip [--json] publish <branch-or-stream> --to <git-dir> [--as <git-branch>]\n\
-  publication, never sync: regenerate a git branch from a whip line\n\
-  (consecutive same-actor cut runs -> one commit each, Whip-* trailers)",
-        "ingest" => "usage: whip [--json] ingest <git-dir> [--at <ref>] --onto <branch>\n\
-  one squash cut of the git tree at <ref>, actor git:<author-email> (a CLAIM,\n\
-  never an observation), intent ingest:<sha>",
-        "repair" => "usage: whip [--json] repair <list|show|plan|apply|close> ...\n\
+/// Commands deliberately listed under a SECOND `whip help` group, appended
+/// after that group's own entries. A `CommandSpec` has one `group` because a
+/// command has one home; this is the short, explicit list of the places where
+/// the index usefully repeats itself. `evidence` is here because it reads both
+/// as an inspection verb and as the improve loop's last step, and the index
+/// listed it twice long before the table did.
+const ALSO_LISTED_IN: &[(&str, &str)] = &[("evidence", "improve")];
+
+/// Entries are grouped: each group's commands are contiguous, and `whip help`
+/// prints the groups in the order they first appear here.
+const COMMANDS: &[CommandSpec] = &[
+    CommandSpec {
+        name: "check",
+        group: "authoring",
+        usage: "usage: whip check [--model-search] [--root <workflow>] [--exec-profile dev|hosted] [--script-manifest <path>] [--package-lock <path>] <workflow.whip>...",
+        run: check,
+    },
+    CommandSpec {
+        name: "compile",
+        group: "authoring",
+        usage: "usage: whip compile [--model-search] [--root <workflow>] [--package-lock <path>] <workflow.whip>",
+        run: compile,
+    },
+    CommandSpec {
+        name: "verify-report",
+        group: "authoring",
+        usage: "usage: whip verify-report [--entry-index <n>] [--emit construct-graph|lowered-ir|artifacts] <check-or-compile-or-artifacts-report.json>...",
+        run: verify_report,
+    },
+    CommandSpec {
+        name: "fmt",
+        group: "authoring",
+        usage: "usage: whip fmt [--check] <workflow.whip>...",
+        run: fmt,
+    },
+    CommandSpec {
+        name: "lint",
+        group: "authoring",
+        usage: "usage: whip [--json] lint [--root <workflow>] <workflow.whip>",
+        run: lint,
+    },
+    CommandSpec {
+        name: "lsp",
+        group: "authoring",
+        usage: "usage: whip lsp   (Language Server over stdio; launched by an editor)",
+        run: lsp,
+    },
+    CommandSpec {
+        name: "test",
+        group: "authoring",
+        usage: "usage: whip [--json] test <workflow.whip|dir>... [--list] [-i <pattern>]... [-x <pattern>]... [--pass-if-no-tests]\n       whip [--json] test replay <instance-id>",
+        run: test_command,
+    },
+    CommandSpec {
+        name: "package",
+        group: "authoring",
+        usage: "usage: whip package catalog | whip package check <manifest.json>... | whip package lock [--output <path>] <manifest.json>... | whip package sync --file <manifest.json> [--output <path>] [--check-only]",
+        run: package,
+    },
+    CommandSpec {
+        name: "run",
+        group: "run",
+        usage: "usage: whip run <workflow.whip> [--provider <name>] [--provider-config <path>] [--root <workflow>] [--exec-profile dev|hosted] [--script-manifest <path>] [--package-lock <path>] [--include-tag <tag>] [--exclude-tag <tag>] [--stream ndjson] [--until idle] [--wait] [--max-iterations <n>] [--fail|--timeout|--cancel]",
+        // The handler is `run`, same as the field.
+        run,
+    },
+    CommandSpec {
+        name: "start",
+        group: "run",
+        usage: "usage: whip [--store path] [--input <json>] start <workflow.whip> [--root <workflow>] [--package-lock <path>]\n  starts a durable instance and returns; drive it with `whip worker` (use `whip run` to run locally to idle)",
+        run: start,
+    },
+    CommandSpec {
+        name: "revise",
+        group: "run",
+        usage: "usage: whip revise <instance> <workflow.whip> [--root <workflow>] [--dry-run] [--cancel keep|queued|running]",
+        run: revise,
+    },
+    CommandSpec {
+        name: "step",
+        group: "run",
+        usage: "usage: whip step <instance> --program <workflow.whip> [--root <workflow>]",
+        run: step,
+    },
+    CommandSpec {
+        name: "worker",
+        group: "run",
+        usage: "usage: whip worker <instance> [--provider <name>] [--provider-config <path>] [--program <path>] [--root <workflow>] [--exec-profile dev|hosted] [--script-manifest <path>] [--package-lock <path>] [--once] [--fail|--timeout|--cancel] [--max-child-iterations <n>]",
+        run: worker,
+    },
+    CommandSpec {
+        name: "accept",
+        group: "run",
+        usage: "usage: whip accept <fixture.json>",
+        run: accept,
+    },
+    CommandSpec {
+        name: "ingress",
+        group: "run",
+        usage: "usage: whip ingress serve --stdio --program <workflow.whip> [--root <workflow>]\n  reads JSONL envelopes {\"instance\", \"signal\", \"payload\", \"delivery_id\"?} from stdin and admits each\n  through the shared admission core; one JSON result line per envelope on stdout\n  (the HTTP listener driver is deferred: spec/std-ingress.md \"Deferred with cause\")",
+        run: ingress_command,
+    },
+    CommandSpec {
+        name: "instances",
+        group: "inspect",
+        usage: "usage: whip [--store path] [--json] instances",
+        run: instances,
+    },
+    CommandSpec {
+        name: "status",
+        group: "inspect",
+        usage: "usage: whip status <instance>",
+        run: status,
+    },
+    CommandSpec {
+        name: "log",
+        group: "inspect",
+        usage: "usage: whip log <instance>",
+        run: log,
+    },
+    CommandSpec {
+        name: "facts",
+        group: "inspect",
+        usage: "usage: whip facts <instance>",
+        run: facts,
+    },
+    CommandSpec {
+        name: "effects",
+        group: "inspect",
+        usage: "usage: whip effects <instance>",
+        run: effects,
+    },
+    CommandSpec {
+        name: "runs",
+        group: "inspect",
+        usage: "usage: whip runs <instance>",
+        run: runs,
+    },
+    CommandSpec {
+        name: "artifacts",
+        group: "inspect",
+        usage: "usage: whip artifacts <run-id>",
+        run: artifacts,
+    },
+    CommandSpec {
+        name: "evidence",
+        group: "inspect",
+        usage: "usage: whip [--json] evidence [<gauge>] | whip evidence instance <instance-id>\n  bare/gauge form = the gauge evidence view (estimates + standing-contradiction flags; same as `whip gauges`); `instance` = a run's provider evidence chain",
+        run: evidence_router,
+    },
+    CommandSpec {
+        name: "diagnostics",
+        group: "inspect",
+        usage: "usage: whip diagnostics [--grouped] <instance>",
+        run: diagnostics,
+    },
+    CommandSpec {
+        name: "trace",
+        group: "inspect",
+        usage: "usage: whip trace <instance> [--check]",
+        run: trace,
+    },
+    CommandSpec {
+        name: "view",
+        group: "inspect",
+        usage: "usage: whip [--json] view <instance>\n  the instance view model: each firing's effects joined to the program structure the\n  version stores, including the static effects a firing never REQUESTED (a `case` arm\n  not taken), which the event log cannot distinguish from an arm that does not exist.\n  Carries identifiers, statuses and reasons only — never fact values or effect input",
+        run: view,
+    },
+    CommandSpec {
+        name: "progressions",
+        group: "inspect",
+        usage: "usage: whip progressions <instance>",
+        run: progressions,
+    },
+    CommandSpec {
+        name: "signal",
+        group: "messaging",
+        usage: "usage: whip signal <instance> --name <name> --data <json> --program <workflow.whip> [--root <workflow>] [--delivery-id <id>]\n  --delivery-id: the provider/operator delivery id wins over the derived payload-hash key; the same id twice admits once (the duplicate is absorbed with a diagnostic)",
+        run: signal,
+    },
+    CommandSpec {
+        name: "message",
+        group: "messaging",
+        usage: "usage: whip message <instance> --channel <name> --text <text> [--markdown <md>] [--by <sender>] [--thread <id>] --program <workflow.whip> [--root <workflow>]",
+        run: message_command,
+    },
+    CommandSpec {
+        name: "mailbox",
+        group: "messaging",
+        usage: "usage: whip mailbox <outbound [--channel <name>] [--limit <n>] | inbound <channel> [--limit <n>]> (the local messaging provider's delivered/received JSONL files)",
+        run: mailbox_command,
+    },
+    CommandSpec {
+        name: "leases",
+        group: "coordinate",
+        usage: "usage: whip leases [<resource>]",
+        run: leases_command,
+    },
+    CommandSpec {
+        name: "ledger",
+        group: "coordinate",
+        usage: "usage: whip ledger [<ledger>] [--partition <value>]",
+        run: ledger_command,
+    },
+    CommandSpec {
+        name: "counters",
+        group: "coordinate",
+        usage: "usage: whip counters [<counter>]",
+        run: counters_command,
+    },
+    CommandSpec {
+        name: "pause",
+        group: "lifecycle",
+        usage: "usage: whip pause <instance>",
+        run: pause,
+    },
+    CommandSpec {
+        name: "resume",
+        group: "lifecycle",
+        usage: "usage: whip resume <instance>",
+        run: resume,
+    },
+    CommandSpec {
+        name: "cancel",
+        group: "lifecycle",
+        usage: "usage: whip cancel <instance>",
+        run: cancel,
+    },
+    CommandSpec {
+        name: "retry",
+        group: "lifecycle",
+        usage: "usage: whip retry <instance> <effect>",
+        run: retry,
+    },
+    CommandSpec {
+        name: "recover",
+        group: "lifecycle",
+        usage: "usage: whip recover <instance>",
+        run: recover,
+    },
+    CommandSpec {
+        name: "progression",
+        group: "lifecycle",
+        usage: "usage: whip progression cancel <instance> <firing-id> [--reason <text>]",
+        run: progression_command,
+    },
+    CommandSpec {
+        name: "repair",
+        group: "lifecycle",
+        usage: "usage: whip [--json] repair <list|show|plan|apply|close> ...\n\
   whip repair list [--all]\n\
   whip repair show <incident>\n\
   whip repair plan <incident> undo\n\
@@ -1145,28 +1238,304 @@ fn command_usage(command: &str) -> Option<&'static str> {
   whip repair close <incident>\n\
   incidents arm only from mediator-observed stalls; apply takes no free-form\n\
   selection and there is no --force — a refusal escalates to a human",
-        "changes" => "usage: whip [--json] changes [--others] [--by <prefix>] [--path <glob>] [--since <cut>]\n  what moved on the ambient session's line (WHIPPLESCRIPT_SESSION); --others = everyone but me",
-        "undo" => "usage: whip [--json] undo \"<selection>\" [--apply]\n  the ambient-session form of `whip branch undo` (line implied by WHIPPLESCRIPT_SESSION; preview by default)",
-        "stream" => STREAM_USAGE,
-        "retry" => "usage: whip retry <instance> <effect>",
-        "recover" => "usage: whip recover <instance>",
-        "doctor" => "usage: whip doctor [--providers] [--provider-config <path>] [--record-provider-evidence <instance>]",
-        "gov" => "usage: whip gov <sign | verify | escalate | escalations | agent> [args]",
-        "infoflow" => "usage: whip infoflow   (interactive information-flow REPL: check <file> | escalate <request> | quit; renamed from `whip agent`)",
-        "agents" => "usage: whip [--json] agents [--root <workflow>] <workflow.whip>",
-        "providers" => "usage: whip [--json] providers [--root <workflow>] <workflow.whip>",
-        "skills" => "usage: whip [--json] skills [--root <workflow>] <workflow.whip>",
-        "skill" => "usage: whip [--store path] [--json] skill <list | validate <SKILL.md|dir> | install <SKILL.md|dir>>",
-        "auth" => "usage: whip auth <status | set <openai|anthropic> <key>>",
-        "mcp" => "usage: whip [--json] mcp <list | add <name> (--url <url> | --command <cmd> [--arg <a>]...) [--env K=V]... [--header K=V]... | import <file> | status <name> | pin <name> | sync <name> | attest <name> --trust-annotations | forget <name>>\n  the trust ladder: unattested (added) -> pinned -> attested -> classified (roles in the config file)\n  `env:NAME`/`header env:NAME` values resolve from the environment at connect time; the file is chmod 600",
-        "provider" => "usage: whip [--json] provider <list | status <name> | pin <name> | attest <name> --custody <class> --signer <who> --until <rfc3339> | operator-run <name> [--off]> [--effect-kind <agent.tell|schema.coerce>]\n  custody classes: unknown (c0) | trains (c1) | retained (c2) | zero-retention (c3) | operator-held (c4), ordered by WHO HOLDS THE TRANSCRIPT\n  evidence lives here; the bar it is judged against lives in the signed envelope as `require custody <class> for <Role>`",
-        "deploy" => "usage: whip deploy [--worker-dir <path>] [--config <file>] [--name <worker>] [--dry-run] [--skip-build] [--set-secrets]",
-        "executor" => "usage: whip executor [--bind <addr:port>]   (Class-A exec sidecar; default 127.0.0.1:8080)",
-        "credential-proxy" => "usage: whip credential-proxy --upstream <origin> --credential <name> [--form bearer|basic|raw] [--bind <addr:port>]   (localhost front-end for CustodyOp::Request; prints its base_url and token)",
-        "message" => "usage: whip message <instance> --channel <name> --text <text> [--markdown <md>] [--by <sender>] [--thread <id>] --program <workflow.whip> [--root <workflow>]",
-        "mailbox" => "usage: whip mailbox <outbound [--channel <name>] [--limit <n>] | inbound <channel> [--limit <n>]> (the local messaging provider's delivered/received JSONL files)",
-        _ => return None,
-    })
+        run: repair_command,
+    },
+    CommandSpec {
+        name: "checkpoint",
+        group: "context",
+        usage: "usage: whip [--json] checkpoint <instance> [--cut-id <id>] [--external-positions <json|@file>]",
+        run: checkpoint,
+    },
+    CommandSpec {
+        name: "restore",
+        group: "context",
+        usage: "usage: whip [--json] restore <instance> <cut-id>",
+        run: restore,
+    },
+    CommandSpec {
+        name: "handles",
+        group: "context",
+        usage: "usage: whip [--json] handles <instance>",
+        run: handles_command,
+    },
+    CommandSpec {
+        name: "fork",
+        group: "context",
+        usage: "usage: whip [--json] fork <instance> [--agent <name>] [--branch-id <id>]",
+        run: fork_instance_command,
+    },
+    CommandSpec {
+        name: "branch",
+        group: "version ctl",
+        usage: BRANCH_USAGE,
+        run: branch_command,
+    },
+    CommandSpec {
+        name: "stream",
+        group: "version ctl",
+        usage: STREAM_USAGE,
+        run: stream_command,
+    },
+    CommandSpec {
+        name: "changes",
+        group: "version ctl",
+        usage: "usage: whip [--json] changes [--others] [--by <prefix>] [--path <glob>] [--since <cut>]\n  what moved on the ambient session's line (WHIPPLESCRIPT_SESSION); --others = everyone but me",
+        run: changes_command,
+    },
+    CommandSpec {
+        name: "undo",
+        group: "version ctl",
+        usage: "usage: whip [--json] undo \"<selection>\" [--apply]\n  the ambient-session form of `whip branch undo` (line implied by WHIPPLESCRIPT_SESSION; preview by default)",
+        run: ambient_undo_command,
+    },
+    CommandSpec {
+        name: "publish",
+        group: "version ctl",
+        usage: "usage: whip [--json] publish <branch-or-stream> --to <git-dir> [--as <git-branch>]\n\
+  publication, never sync: regenerate a git branch from a whip line\n\
+  (consecutive same-actor cut runs -> one commit each, Whip-* trailers)",
+        run: publish_command,
+    },
+    CommandSpec {
+        name: "ingest",
+        group: "version ctl",
+        usage: "usage: whip [--json] ingest <git-dir> [--at <ref>] --onto <branch>\n\
+  one squash cut of the git tree at <ref>, actor git:<author-email> (a CLAIM,\n\
+  never an observation), intent ingest:<sha>",
+        run: ingest_command,
+    },
+    CommandSpec {
+        name: "issue",
+        group: "tracker",
+        usage: ISSUE_USAGE,
+        run: issue,
+    },
+    CommandSpec {
+        name: "assert",
+        group: "tracker",
+        usage: ASSERT_USAGE,
+        run: assert_command,
+    },
+    CommandSpec {
+        name: "improve",
+        group: "improve",
+        usage: "usage: whip [--json] improve [<gauge>[><=<target>] ... [then ...] | <campaign> | --resume <campaign-id>] [--program <workflow.whip>] [--sacrifice <gauge>] [--within <gauge>=<band>%] [--spend-cap $<n>] [--proposer fixture|native] [--provider <name>] [--provider-config <path>] [--redacted-view]\n  bare `whip improve` = repair mode (restore violated bars, touch nothing else); --resume continues a campaign parked on its spend cap (fresh per-invocation allowance)\n  spend prices from the provider config's `prices` block (USD per Mtok per provider/model); unpriced usage records cost 0 and cannot bind the cap",
+        run: improve::improve_command,
+    },
+    CommandSpec {
+        name: "campaigns",
+        group: "improve",
+        usage: "usage: whip [--json] campaigns",
+        run: improve::campaigns_command,
+    },
+    CommandSpec {
+        name: "campaign",
+        group: "improve",
+        usage: "usage: whip [--json] campaign <id>",
+        run: improve::campaign_detail_command,
+    },
+    CommandSpec {
+        name: "adopt",
+        group: "improve",
+        usage: "usage: whip [--json] adopt <campaign>:<candidate> [--program <workflow.whip>]",
+        run: improve::adopt_command,
+    },
+    CommandSpec {
+        name: "answer",
+        group: "improve",
+        usage: "usage: whip [--json] answer <campaign>:<candidate> --accept|--reject|--revoke [--by <who>]\n  answers a surfaced tradeoff; the answer is a precedent that auto-resolves future tradeoffs it Pareto-dominates",
+        run: improve::answer_command,
+    },
+    CommandSpec {
+        name: "pin",
+        group: "improve",
+        usage: "usage: whip [--json] pin <instance> [at <mark>] --as <name>",
+        run: improve::pin_command,
+    },
+    CommandSpec {
+        name: "suppose",
+        group: "improve",
+        usage: "usage: whip [--json] suppose <scenario> [--program <workflow.whip>] [--root <workflow>] [--provider <name>] [--provider-config <path>]\n  one what-if regeneration of the pinned scenario; mark pins replay the frozen prefix and re-execute only the suffix",
+        run: improve::suppose_command,
+    },
+    CommandSpec {
+        name: "settle",
+        group: "improve",
+        usage: "usage: whip [--json] settle <gauge> [--certify] [--threshold <k>] [--spend-cap $<n>] [--program <workflow.whip>] [--root <workflow>] [--provider <name>] [--provider-config <path>]\n  name the decision and let the system stop itself: races regenerations over the pinned scenarios until the gauge's bar is cleared or evidence is exhausted (an honest undetermined) — never an operator-chosen N\n  --spend-cap is a guardrail in currency over PRICED regeneration cost (provider config `prices` block); unpriced usage cannot bind it",
+        run: improve::settle_command,
+    },
+    CommandSpec {
+        name: "gauges",
+        group: "improve",
+        usage: "usage: whip [--json] gauges [<gauge>]",
+        run: improve::gauges_command,
+    },
+    CommandSpec {
+        name: "doctor",
+        group: "ops/deploy",
+        usage: "usage: whip doctor [--providers] [--provider-config <path>] [--record-provider-evidence <instance>]",
+        run: doctor,
+    },
+    CommandSpec {
+        name: "deploy",
+        group: "ops/deploy",
+        usage: "usage: whip deploy [--worker-dir <path>] [--config <file>] [--name <worker>] [--dry-run] [--skip-build] [--set-secrets]",
+        run: deploy_command,
+    },
+    CommandSpec {
+        name: "executor",
+        group: "ops/deploy",
+        usage: "usage: whip executor [--bind <addr:port>]   (Class-A exec sidecar; default 127.0.0.1:8080)",
+        run: executor_command,
+    },
+    CommandSpec {
+        name: "credential-proxy",
+        group: "ops/deploy",
+        usage: "usage: whip credential-proxy --upstream <origin> --credential <name> [--form bearer|basic|raw] [--bind <addr:port>]   (localhost front-end for CustodyOp::Request; prints its base_url and token)",
+        run: credential_proxy_command,
+    },
+    CommandSpec {
+        name: "otel-export",
+        group: "ops/deploy",
+        usage: "usage: whip otel-export <instance> [--dry-run] [--telemetry-allowlist <Schema.field,...>] (reads OTEL_EXPORTER_OTLP_ENDPOINT, OTEL_SERVICE_NAME, WHIPPLESCRIPT_TELEMETRY_ALLOWLIST)",
+        run: otel_export,
+    },
+    CommandSpec {
+        name: "telemetry",
+        group: "ops/deploy",
+        usage: "usage: whip telemetry <status|reset-cursor> [<instance>] (export-cursor management for otel-export)",
+        run: telemetry,
+    },
+    CommandSpec {
+        name: "auth",
+        group: "config",
+        usage: "usage: whip auth <status | set <openai|anthropic> <key>>",
+        run: auth_command,
+    },
+    CommandSpec {
+        name: "coercion",
+        group: "config",
+        usage: "usage: whip [--store path] [--json] coercion status (the resolved schema.coerce provider config: provider, backend, model, credential source, selecting rung, fingerprint)",
+        run: coercion,
+    },
+    CommandSpec {
+        name: "memory",
+        group: "config",
+        usage: "usage: whip memory <pools|entries <pool> [--limit <n>]> (the workspace memory store; WHIPPLESCRIPT_MEMORY_STORE overrides the path)",
+        run: memory_command,
+    },
+    CommandSpec {
+        name: "script",
+        group: "config",
+        usage: "usage: whip script <list|verify> [--script-manifest <path>] (read-only views over the pinned script-capability manifest; verify re-hashes each pin, exit 1 on any mismatch)",
+        run: script_command,
+    },
+    CommandSpec {
+        name: "agents",
+        group: "config",
+        usage: "usage: whip [--json] agents [--root <workflow>] <workflow.whip>",
+        run: agents,
+    },
+    CommandSpec {
+        name: "providers",
+        group: "config",
+        usage: "usage: whip [--json] providers [--root <workflow>] <workflow.whip>",
+        run: providers,
+    },
+    CommandSpec {
+        name: "skills",
+        group: "config",
+        usage: "usage: whip [--json] skills [--root <workflow>] <workflow.whip>",
+        run: skills,
+    },
+    CommandSpec {
+        name: "skill",
+        group: "config",
+        usage: "usage: whip [--store path] [--json] skill <list | validate <SKILL.md|dir> | install <SKILL.md|dir>>",
+        run: skill,
+    },
+    CommandSpec {
+        name: "mcp",
+        group: "config",
+        usage: "usage: whip [--json] mcp <list | add <name> (--url <url> | --command <cmd> [--arg <a>]...) [--env K=V]... [--header K=V]... | import <file> | status <name> | pin <name> | sync <name> | attest <name> --trust-annotations | forget <name>>\n  the trust ladder: unattested (added) -> pinned -> attested -> classified (roles in the config file)\n  `env:NAME`/`header env:NAME` values resolve from the environment at connect time; the file is chmod 600",
+        run: mcp_command,
+    },
+    CommandSpec {
+        name: "provider",
+        group: "config",
+        usage: "usage: whip [--json] provider <list | status <name> | pin <name> | attest <name> --custody <class> --signer <who> --until <rfc3339> | operator-run <name> [--off]> [--effect-kind <agent.tell|schema.coerce>]\n  custody classes: unknown (c0) | trains (c1) | retained (c2) | zero-retention (c3) | operator-held (c4), ordered by WHO HOLDS THE TRANSCRIPT\n  evidence lives here; the bar it is judged against lives in the signed envelope as `require custody <class> for <Role>`",
+        run: provider_command,
+    },
+    CommandSpec {
+        name: "gov",
+        group: "governance",
+        usage: "usage: whip gov <sign | verify | escalate | escalations | agent> [args]",
+        run: gov,
+    },
+    CommandSpec {
+        name: "infoflow",
+        group: "governance",
+        usage: "usage: whip infoflow   (interactive information-flow REPL: check <file> | escalate <request> | quit; renamed from `whip agent`)",
+        run: whip_infoflow,
+    },
+];
+
+fn command_spec(command: &str) -> Option<&'static CommandSpec> {
+    COMMANDS.iter().find(|spec| spec.name == command)
+}
+
+fn command_usage(command: &str) -> Option<&'static str> {
+    command_spec(command).map(|spec| spec.usage)
+}
+
+// The three coordination views share one handler; these name them so the table
+// can hold a plain function pointer.
+fn leases_command(options: &CliOptions) -> ExitCode {
+    coordination_list(options, "leases")
+}
+
+fn ledger_command(options: &CliOptions) -> ExitCode {
+    coordination_list(options, "ledger")
+}
+
+fn counters_command(options: &CliOptions) -> ExitCode {
+    coordination_list(options, "counters")
+}
+
+/// The `whip help` index, rendered from `COMMANDS`.
+fn usage_text() -> String {
+    let mut out = format!(
+        "whipplescript {} ({})\nusage: whip [--store path] [--json] <command> [args]\n\n",
+        whipplescript_core::version(),
+        whipplescript_core::IMPLEMENTATION_STAGE
+    );
+    let mut printed: Vec<&str> = Vec::new();
+    for spec in COMMANDS {
+        if printed.contains(&spec.group) {
+            continue;
+        }
+        printed.push(spec.group);
+        let mut names = COMMANDS
+            .iter()
+            .filter(|other| other.group == spec.group)
+            .map(|other| other.name)
+            .collect::<Vec<_>>();
+        names.extend(
+            ALSO_LISTED_IN
+                .iter()
+                .filter(|(_, group)| *group == spec.group)
+                .map(|(name, _)| *name),
+        );
+        let names = names.join("  ");
+        let label = format!("{}:", spec.group);
+        out.push_str(&format!("{label:<14}{names}\n"));
+    }
+    out.push_str("\nrun `whip <command> --help` or `whip help <command>` for command usage\n");
+    out
+}
+
+fn print_usage() {
+    print!("{}", usage_text());
 }
 
 fn doctor(options: &CliOptions) -> ExitCode {
@@ -1552,7 +1921,7 @@ fn doctor_provider_config_checks(
     paths
         .iter()
         .map(|path| {
-            let (results, bindings) = match fs::read_to_string(path) {
+            let (results, bindings, _unparsed) = match fs::read_to_string(path) {
                 Ok(config_json) => {
                     validate_doctor_provider_config_json_with_bindings(&config_json, capabilities)
                 }
@@ -1565,6 +1934,7 @@ fn doctor_provider_config_checks(
                         format!("could not read provider config: {error}"),
                     )],
                     Vec::new(),
+                    0,
                 ),
             };
             DoctorProviderConfigCheck {
@@ -1591,10 +1961,14 @@ fn validate_doctor_provider_config_json_with_bindings(
 ) -> (
     Vec<ProviderValidationResult>,
     Vec<DoctorProviderBindingCheck>,
+    usize,
 ) {
     let value = match serde_json::from_str::<Value>(config_json) {
         Ok(value) => value,
-        Err(_) => return (validate_provider_binding_json(config_json), Vec::new()),
+        // Not JSON at all: no binding is known, and the file may well have
+        // named the harness the caller is about to run. Counted as unparsed
+        // for the same reason a single malformed entry is.
+        Err(_) => return (validate_provider_binding_json(config_json), Vec::new(), 1),
     };
     let provider_values = if let Some(providers) = value.get("providers").and_then(Value::as_array)
     {
@@ -1607,6 +1981,11 @@ fn validate_doctor_provider_config_json_with_bindings(
 
     let mut all_results = Vec::new();
     let mut bindings = Vec::new();
+    // An entry that does not PARSE yields no binding, so a caller that reads
+    // only `bindings` cannot tell "this file names no such harness" from "the
+    // entry that names it is malformed". Count them, so a caller that must
+    // fail closed can.
+    let mut unparsed = 0usize;
     for provider in provider_values {
         match ProviderBindingConfig::from_value(provider) {
             Ok(config) => {
@@ -1615,10 +1994,13 @@ fn validate_doctor_provider_config_json_with_bindings(
                 all_results.extend(results.iter().cloned());
                 bindings.push(DoctorProviderBindingCheck { config, results });
             }
-            Err(results) => all_results.extend(results),
+            Err(results) => {
+                unparsed += 1;
+                all_results.extend(results);
+            }
         }
     }
-    (all_results, bindings)
+    (all_results, bindings, unparsed)
 }
 
 fn validate_provider_runtime_config(
@@ -4966,7 +5348,7 @@ fn construct_graph_json_with_digests(
         let span = construct_graph_span(Some(path), source.span, Some("source"));
         let (lowering, lifecycle, object_kind, entrypoint, output_kind) = if source.is_clock {
             (
-                CLOCK_SOURCE_LOWERING_CLASS,
+                CONSTRUCT_LOWERING_CLOCK_SOURCE,
                 "clock_source_template",
                 "clock_source",
                 "clock_source_template",
@@ -4974,7 +5356,7 @@ fn construct_graph_json_with_digests(
             )
         } else {
             (
-                SIGNAL_SOURCE_LOWERING_CLASS,
+                CONSTRUCT_LOWERING_SIGNAL_SOURCE,
                 "signal_source_template",
                 "signal_source",
                 "signal_source_template",
@@ -5015,7 +5397,7 @@ fn construct_graph_json_with_digests(
             "node_id": node_id,
             "construct_id": format!("core.assertion.{}", assertion_id),
             "construct_family": CONSTRUCT_FAMILY_ASSERTION,
-            "lowering_class": ASSERTION_LOWERING_CLASS,
+            "lowering_class": CONSTRUCT_LOWERING_ASSERTION_CHECK,
             "lifecycle_profile": "assertion_check",
             "owner": "core",
             "source_span": span,
@@ -5052,7 +5434,7 @@ fn construct_graph_json_with_digests(
                 "node_id": node_id,
                 "construct_id": format!("core.rule.{rule_ref}"),
                 "construct_family": CONSTRUCT_FAMILY_RULE,
-                "lowering_class": RULE_TEMPLATE_LOWERING_CLASS,
+                "lowering_class": CONSTRUCT_LOWERING_RULE_TEMPLATE,
                 "lifecycle_profile": "rule_template",
                 "owner": "core",
                 "source_span": span,
@@ -5131,7 +5513,7 @@ fn construct_graph_json_with_digests(
                 "node_id": node_id,
                 "construct_id": format!("core.projection_read.{read_ref}"),
                 "construct_family": CONSTRUCT_FAMILY_PROJECTION_READ,
-                "lowering_class": PROJECTION_READ_LOWERING_CLASS,
+                "lowering_class": CONSTRUCT_LOWERING_METADATA,
                 "lifecycle_profile": "none",
                 "owner": "compiler",
                 "source_span": construct_graph_span(Some(path), span, Some("projection_read")),
@@ -5172,7 +5554,7 @@ fn construct_graph_json_with_digests(
                 "node_id": node_id,
                 "construct_id": format!("core.projection_read.{read_ref}"),
                 "construct_family": CONSTRUCT_FAMILY_PROJECTION_READ,
-                "lowering_class": PROJECTION_READ_LOWERING_CLASS,
+                "lowering_class": CONSTRUCT_LOWERING_METADATA,
                 "lifecycle_profile": "none",
                 "owner": "compiler",
                 "source_span": construct_graph_span(Some(path), assertion.expr.span, Some("projection_read")),
@@ -5421,9 +5803,9 @@ fn construct_graph_json_with_digests(
                 .unwrap_or_else(|| effect.required_capabilities.clone());
             let is_schedule = effect.kind == IrEffectKind::TimerWait;
             let lowering_class = if is_schedule {
-                SCHEDULE_LOWERING_CLASS
+                CONSTRUCT_LOWERING_SCHEDULE_EMITTER
             } else {
-                CORE_EFFECT_LOWERING_CLASS
+                CONSTRUCT_LOWERING_CORE_EFFECT
             };
             let lifecycle_profile = if is_schedule {
                 "schedule_template"
@@ -21441,10 +21823,25 @@ fn provider_binding_for_harness(
 ) -> Result<Option<ProviderBindingConfig>, StoreError> {
     for path in config_paths {
         let config_json = fs::read_to_string(path)?;
-        let (_results, bindings) = validate_doctor_provider_config_json_with_bindings(
+        let (_results, bindings, unparsed) = validate_doctor_provider_config_json_with_bindings(
             &config_json,
             &effective_provider_capabilities(),
         );
+        // A malformed entry produces no binding, so without this the harness it
+        // governs falls out of the loop below as `Ok(None)` — "no binding" —
+        // and the turn runs with the profile allow-list, the credential
+        // reference and the workspace policy all silently dropped. Which
+        // harness a malformed entry names is exactly what could not be read,
+        // so a file carrying one refuses every harness it might have named.
+        if unparsed > 0 {
+            return Err(StoreError::Conflict(format!(
+                "provider config `{}` has {unparsed} entr{} that could not be read; \
+                 refusing to run harness `{harness}` from a file whose bindings \
+                 are not fully known",
+                path.display(),
+                if unparsed == 1 { "y" } else { "ies" }
+            )));
+        }
         for binding in bindings {
             if binding.config.provider_id != harness {
                 continue;
@@ -21791,10 +22188,10 @@ fn codex_native_turn_request(
         agent: execution.agent.to_owned(),
         profile: execution.profile.map(str::to_owned),
         prompt_json,
-        workspace_policy: provider_workspace_policy(config, "read_only"),
+        workspace_policy: provider_workspace_policy(config, WorkspacePolicy::ReadOnly),
         required_capabilities: native_required_capabilities(effect)?,
         cancellation_depth: provider_cancellation_depth(config, CancellationDepth::NativeStop),
-        artifact_policy: provider_artifact_policy(config, "metadata"),
+        artifact_policy: provider_artifact_policy(config, ArtifactPolicy::Metadata),
         credential_ref: provider_credential_ref(config),
         provider_options,
     })
@@ -21918,28 +22315,30 @@ fn claude_native_turn_request(
             .map(str::to_owned)
             .or_else(|| Some("repo-reader".to_owned())),
         prompt_json,
-        workspace_policy: provider_workspace_policy(config, "read_only"),
+        workspace_policy: provider_workspace_policy(config, WorkspacePolicy::ReadOnly),
         required_capabilities: native_required_capabilities(effect)?,
         cancellation_depth: provider_cancellation_depth(
             config,
             CancellationDepth::CooperativeRequest,
         ),
-        artifact_policy: provider_artifact_policy(config, "metadata"),
+        artifact_policy: provider_artifact_policy(config, ArtifactPolicy::Metadata),
         credential_ref: provider_credential_ref(config),
         provider_options,
     })
 }
 
-fn provider_workspace_policy(config: Option<&ProviderBindingConfig>, default: &str) -> String {
-    config
-        .map(|config| config.workspace_policy.clone())
-        .unwrap_or_else(|| default.to_owned())
+fn provider_workspace_policy(
+    config: Option<&ProviderBindingConfig>,
+    default: WorkspacePolicy,
+) -> WorkspacePolicy {
+    config.map_or(default, |config| config.workspace_policy)
 }
 
-fn provider_artifact_policy(config: Option<&ProviderBindingConfig>, default: &str) -> String {
-    config
-        .map(|config| config.artifact_policy.clone())
-        .unwrap_or_else(|| default.to_owned())
+fn provider_artifact_policy(
+    config: Option<&ProviderBindingConfig>,
+    default: ArtifactPolicy,
+) -> ArtifactPolicy {
+    config.map_or(default, |config| config.artifact_policy)
 }
 
 fn provider_cancellation_depth(
@@ -22128,7 +22527,7 @@ impl NativeProviderAdapter for NativeFixtureAdapter {
             sequence: Some(1),
             evidence: json!({
                 "prompt_shape": request.to_json_redacted().get("prompt_shape").cloned(),
-                "workspace_policy": request.workspace_policy,
+                "workspace_policy": request.workspace_policy.as_str(),
             }),
             artifacts: Vec::new(),
         })
@@ -22217,10 +22616,14 @@ fn native_fixture_turn_request(
         agent: execution.agent.to_owned(),
         profile: execution.profile.map(str::to_owned),
         prompt_json: serde_json::from_str(input_json).unwrap_or_else(|_| json!({"raw": "invalid"})),
-        workspace_policy: "isolated".to_owned(),
+        // The fixture provider touches no workspace, so it takes the
+        // least-authority policy. This read `"isolated"` until the vocabulary
+        // became a type — a value no vocabulary in the tree has ever held, and
+        // one nothing asserted, so nothing could notice it.
+        workspace_policy: WorkspacePolicy::ReadOnly,
         required_capabilities: Vec::new(),
         cancellation_depth: CancellationDepth::CooperativeRequest,
-        artifact_policy: "metadata".to_owned(),
+        artifact_policy: ArtifactPolicy::Metadata,
         credential_ref: None,
         provider_options: BTreeMap::new(),
     }
@@ -38031,7 +38434,19 @@ fn branch_command(options: &CliOptions) -> ExitCode {
             while let Some(arg) = iter.next() {
                 match *arg {
                     "--name" => name = iter.next().copied(),
-                    "--from" => parent = iter.next().copied().unwrap_or(parent),
+                    // A `--from` with its value eaten by the end of the
+                    // argument list used to fall back to the mainline, so the
+                    // branch was silently cut from somewhere the operator
+                    // never named. Refuse instead.
+                    "--from" => match iter.next() {
+                        Some(value) => parent = value,
+                        None => {
+                            eprintln!(
+                                "`branch create --from` requires a parent branch id\n{BRANCH_USAGE}"
+                            );
+                            return ExitCode::from(2);
+                        }
+                    },
                     other if branch_id.is_none() => branch_id = Some(other),
                     other => {
                         eprintln!("unexpected argument `{other}`\n{BRANCH_USAGE}");
@@ -38737,7 +39152,17 @@ fn branch_command(options: &CliOptions) -> ExitCode {
             while let Some(arg) = iter.next() {
                 match *arg {
                     "--name" => name = iter.next().copied(),
-                    "--from" => from = iter.next().copied().unwrap_or(from),
+                    // Same hazard as `branch create --from`: a value-less
+                    // `--from` must not silently fork off the mainline.
+                    "--from" => match iter.next() {
+                        Some(value) => from = value,
+                        None => {
+                            eprintln!(
+                                "`branch fork --from` requires a source branch id\n{BRANCH_USAGE}"
+                            );
+                            return ExitCode::from(2);
+                        }
+                    },
                     "--at-cut" => at_cut = iter.next().copied(),
                     other if branch_id.is_none() => branch_id = Some(other),
                     other => {

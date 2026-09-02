@@ -135,6 +135,30 @@ echo "== workflow action pins =="
 # and cannot be undone. Cheap, needs no toolchain, so it runs on every change.
 scripts/check-actions-pinned.sh
 
+echo "== intra-workspace version pins =="
+# Every crate here pins its sibling with `version = "X", path = "../…"`. The
+# version half is what crates.io consumers resolve against; the path half is what
+# the workspace builds. Cargo has no inheritance for that field — `version =
+# { workspace = true }` inside a dependency entry is "invalid type: map, expected
+# a string" — so the pins are 24 hand-maintained copies of one number, and
+# nothing compared them to `[workspace.package] version`. They had drifted: the
+# workspace was 0.5.6 and all 24 still said 0.5.5. Caret semantics hid it (a
+# `0.5.5` requirement accepts 0.5.6), which is exactly why it could sit there.
+ws_version="$(awk -F'"' '/^\[workspace\.package\]/{p=1;next} /^\[/{p=0} p&&/^version *= *"/{print $2;exit}' Cargo.toml)"
+if [ -z "$ws_version" ]; then
+    echo "could not read [workspace.package] version out of Cargo.toml" >&2
+    exit 1
+fi
+pin_drift="$(grep -n 'path = "\.\./whipplescript-' crates/*/Cargo.toml \
+    | grep 'version = "' \
+    | grep -v "version = \"$ws_version\"" || true)"
+if [ -n "$pin_drift" ]; then
+    echo "intra-workspace pins disagree with [workspace.package] version $ws_version:" >&2
+    echo "$pin_drift" >&2
+    echo "Bump each to \"$ws_version\"; cargo cannot inherit this field." >&2
+    exit 1
+fi
+
 # DR-0066: the shared digest/verification cores must stay free of ambient time,
 # randomness, and IO, or deterministic simulation stops being available and the
 # two hosts become able to disagree. Cheap enough for the green bar; the script
@@ -202,6 +226,37 @@ cargo fmt --all -- --check
 
 echo "== lints =="
 cargo clippy --workspace --all-targets -- -D warnings
+
+# The default feature set is not the only one this repository promises. Until
+# now `grep -rn 'no-default-features\|all-features' scripts/ .github/` returned
+# NOTHING: the `--no-default-features` build that
+# crates/whipplescript-cli/Cargo.toml documents was compiled by nobody, and the
+# wasm path DR-0033 Phase 5 rests on — a kernel and a store without rusqlite —
+# was equally uncompiled. A `#[cfg(feature = "native")]` boundary that no gate
+# crosses is a boundary that has already drifted; it just has not been asked.
+#
+# `cargo check` rather than clippy or test, and the lib/bin target rather than
+# `--all-targets`: the point is that the configured-out build still type-checks.
+# The test targets of the store and the kernel legitimately assume `native` (they
+# construct a SqliteStore), so `--all-targets` here would demand a second, larger
+# claim than the crates make. Warm this costs about 1.7s; cold — a fresh CI
+# runner, where these feature unifications share no artifacts with the workspace
+# build above — about 80s.
+echo "== non-default feature builds =="
+cargo check -p whipplescript-store --no-default-features
+cargo check -p whipplescript-kernel --no-default-features
+cargo check -p whipplescript --no-default-features
+# whipplescript-custodian's `pkcs11` gates eight cfg sites and was compiled by
+# nothing. cryptoki loads its vendor module at runtime and its bindings are
+# pre-generated, so this needs no system library and is portable.
+#
+# Its sibling `tpm` is deliberately NOT here: tss-esapi links the native tss2
+# stack, so the check would pass on a box with libtss2-dev and fail everywhere
+# else — a gate that means two different things in two places, which is the one
+# thing this script exists not to be. Those eight cfg sites remain compiled by
+# nothing; closing that needs a decision about libtss2-dev as a prerequisite,
+# not a line here.
+cargo check -p whipplescript-custodian --features pkcs11 --all-targets
 
 echo "== tests =="
 cargo test --workspace
@@ -273,6 +328,16 @@ scripts/regen-docs-diagnostics.sh --check
 # list, which is the same self-flattering shape the coverage gate had.
 echo "== invalid-fixture diagnostics =="
 scripts/regen-invalid-diagnostics.sh --check
+
+# The `.ir` lowering goldens. Same shape as the two --check regenerations above,
+# and it belonged here for the same reason: it was reachable only from
+# check-release-readiness.sh, whose weekly trigger was broken (see ci.yml's
+# release-readiness job), so a lowering change that moved a golden was caught at
+# release time or not at all. It costs about eight seconds on a warm tree —
+# `whip` is already built by the docs gate above — which is cheap enough to ask
+# on every change, and one command blesses a deliberate move.
+echo "== IR lowering goldens =="
+scripts/regen-ir-goldens.sh --check
 
 # The diagnostic code registers, and the coverage column that makes the code set
 # answerable. A second audit of the codes kept finding one-fault-two-codes pairs

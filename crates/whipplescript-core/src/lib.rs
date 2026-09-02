@@ -137,8 +137,8 @@ pub const CONSTRUCT_GRAMMAR_CONNECTIVES: &[&str] =
     &["from", "for", "into", "to", "via", "onto", "with"];
 pub const CONSTRUCT_GRAMMAR_SLOT_KINDS: &[&str] = &["identifier", "expression"];
 pub const CONSTRUCT_GRAMMAR_BINDING_MODES: &[&str] = &["required", "optional", "none"];
-/// `declaration_block` clause value kinds (DR-0011 Shape 1, mirrors
-/// `build.rs`'s `CLAUSE_KINDS`).
+/// `declaration_block` clause value kinds (DR-0011 Shape 1). This crate owns
+/// the list; the parser's build script reads it from here.
 pub const CONSTRUCT_GRAMMAR_CLAUSE_KINDS: &[&str] = &[
     "identifier",
     "expression",
@@ -149,7 +149,9 @@ pub const CONSTRUCT_GRAMMAR_CLAUSE_KINDS: &[&str] = &[
     "flag",
 ];
 /// `declaration_block` clause connectives: the Shape 2 slot connectives plus
-/// `by` (ledger `partition by`). Mirrors `build.rs`'s `CLAUSE_CONNECTIVES`.
+/// `by` (ledger `partition by`). This crate owns the list; the parser's build
+/// script reads it from here, and it once carried its own copy that drifted
+/// by exactly this entry's neighbour `onto`.
 pub const CONSTRUCT_GRAMMAR_CLAUSE_CONNECTIVES: &[&str] =
     &["from", "for", "into", "to", "via", "onto", "by", "with"];
 

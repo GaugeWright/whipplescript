@@ -217,7 +217,8 @@
           "enum": ["identifier", "expression"]
         },
         "connective": {
-          "enum": ["from", "for", "into", "to", "via"]
+          "comment": "Mirrors CONSTRUCT_GRAMMAR_CONNECTIVES in crates/whipplescript-core/src/lib.rs, which owns the DR-0011 vocabulary. Pinned to it by the parser test `the_manifest_schema_mirrors_cores_vocabulary`; do not edit one without the other.",
+          "enum": ["from", "for", "into", "to", "via", "onto", "with"]
         }
       }
     },

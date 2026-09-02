@@ -57,8 +57,12 @@ use whipplescript_store::{NewEffect, RuleCommit};
 // they are written against.
 #[path = "tests/authority.rs"]
 mod authority;
+#[path = "tests/branch_from_flag_refusal.rs"]
+mod branch_from_flag_refusal;
 #[path = "tests/cli_surface.rs"]
 mod cli_surface;
+#[path = "tests/command_table.rs"]
+mod command_table;
 #[path = "tests/construct_graph.rs"]
 mod construct_graph;
 #[path = "tests/exec_and_deploy.rs"]

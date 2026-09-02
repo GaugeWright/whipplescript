@@ -62,6 +62,77 @@ impl CancellationDepth {
     }
 }
 
+// Workspace and artifact policy are CLOSED vocabularies, unlike `provider_kind`
+// / `surface` above. A binding names an authority the kernel itself defines
+// (DR-0009 binding fields; spec/agent-harness.md "Provider bindings"), so the
+// kernel parses each once, at the binding boundary, and every adapter downstream
+// receives a value it must match exhaustively. Carrying them as strings let two
+// adapters re-derive the same vocabulary independently and made a value the
+// kernel ADMITS indistinguishable from one it never heard of.
+//
+// `as_str` is the durable spelling on the wire and in redacted evidence; it must
+// stay byte-identical.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum WorkspacePolicy {
+    Shared,
+    ReadOnly,
+    PerEffectWorktree,
+    PerIssueWorktree,
+    RemoteSandbox,
+}
+
+impl WorkspacePolicy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Shared => "shared",
+            Self::ReadOnly => "read_only",
+            Self::PerEffectWorktree => "per_effect_worktree",
+            Self::PerIssueWorktree => "per_issue_worktree",
+            Self::RemoteSandbox => "remote_sandbox",
+        }
+    }
+
+    fn from_str(value: &str) -> Option<Self> {
+        match value {
+            "shared" => Some(Self::Shared),
+            "read_only" => Some(Self::ReadOnly),
+            "per_effect_worktree" => Some(Self::PerEffectWorktree),
+            "per_issue_worktree" => Some(Self::PerIssueWorktree),
+            "remote_sandbox" => Some(Self::RemoteSandbox),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum ArtifactPolicy {
+    Optional,
+    Required,
+    Metadata,
+    Manifest,
+}
+
+impl ArtifactPolicy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Optional => "optional",
+            Self::Required => "required",
+            Self::Metadata => "metadata",
+            Self::Manifest => "manifest",
+        }
+    }
+
+    fn from_str(value: &str) -> Option<Self> {
+        match value {
+            "optional" => Some(Self::Optional),
+            "required" => Some(Self::Required),
+            "metadata" => Some(Self::Metadata),
+            "manifest" => Some(Self::Manifest),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProviderValidationStatus {
     Pass,
@@ -126,10 +197,10 @@ pub struct ProviderBindingConfig {
     pub credentials_ref: Option<String>,
     pub profile_ids: Vec<String>,
     pub default_model: Option<String>,
-    pub workspace_policy: String,
+    pub workspace_policy: WorkspacePolicy,
     pub timeout_ms: Option<u64>,
     pub cancellation_depth: CancellationDepth,
-    pub artifact_policy: String,
+    pub artifact_policy: ArtifactPolicy,
     pub health_checks: Vec<String>,
     pub extra: BTreeMap<String, Value>,
 }
@@ -171,9 +242,9 @@ impl ProviderBindingConfig {
         let provider_kind = required_string(object, "provider_kind");
         let surface = required_string(object, "surface");
         let workspace_policy = optional_workspace_policy(object, "workspace_policy")
-            .unwrap_or_else(|| Ok("shared".to_owned()));
-        let artifact_policy =
-            optional_string(object, "artifact_policy").unwrap_or_else(|| "optional".to_owned());
+            .unwrap_or(Ok(WorkspacePolicy::Shared));
+        let artifact_policy = optional_artifact_policy(object, "artifact_policy")
+            .unwrap_or(Ok(ArtifactPolicy::Optional));
         let cancellation_depth =
             optional_enum_string(object, "cancellation_depth", CancellationDepth::from_str)
                 .unwrap_or(Ok(CancellationDepth::None));
@@ -214,7 +285,14 @@ impl ProviderBindingConfig {
             Ok(workspace_policy) => workspace_policy,
             Err(error) => {
                 errors.push(*error);
-                String::new()
+                WorkspacePolicy::Shared
+            }
+        };
+        let artifact_policy = match artifact_policy {
+            Ok(artifact_policy) => artifact_policy,
+            Err(error) => {
+                errors.push(*error);
+                ArtifactPolicy::Optional
             }
         };
         let cancellation_depth = match cancellation_depth {
@@ -287,10 +365,10 @@ impl ProviderBindingConfig {
             "credentials_ref": self.credentials_ref,
             "profile_ids": self.profile_ids,
             "default_model": self.default_model,
-            "workspace_policy": self.workspace_policy,
+            "workspace_policy": self.workspace_policy.as_str(),
             "timeout_ms": self.timeout_ms,
             "cancellation_depth": self.cancellation_depth.as_str(),
-            "artifact_policy": self.artifact_policy,
+            "artifact_policy": self.artifact_policy.as_str(),
             "health_checks": self.health_checks,
             "extra_keys": self.extra.keys().cloned().collect::<Vec<_>>(),
         })
@@ -377,10 +455,10 @@ pub struct NativeProviderTurnRequest {
     pub agent: String,
     pub profile: Option<String>,
     pub prompt_json: Value,
-    pub workspace_policy: String,
+    pub workspace_policy: WorkspacePolicy,
     pub required_capabilities: Vec<String>,
     pub cancellation_depth: CancellationDepth,
-    pub artifact_policy: String,
+    pub artifact_policy: ArtifactPolicy,
     pub credential_ref: Option<String>,
     pub provider_options: BTreeMap<String, Value>,
 }
@@ -396,10 +474,10 @@ impl NativeProviderTurnRequest {
             "agent": self.agent,
             "profile": self.profile,
             "prompt_shape": json_shape(&self.prompt_json),
-            "workspace_policy": self.workspace_policy,
+            "workspace_policy": self.workspace_policy.as_str(),
             "required_capabilities": self.required_capabilities,
             "cancellation_depth": self.cancellation_depth.as_str(),
-            "artifact_policy": self.artifact_policy,
+            "artifact_policy": self.artifact_policy.as_str(),
             "credential_ref": self.credential_ref,
             "provider_option_keys": self.provider_options.keys().cloned().collect::<Vec<_>>(),
         })
@@ -893,20 +971,38 @@ fn optional_string(object: &serde_json::Map<String, Value>, key: &str) -> Option
 fn optional_workspace_policy(
     object: &serde_json::Map<String, Value>,
     key: &str,
-) -> Option<Result<String, Box<ProviderValidationResult>>> {
-    optional_string(object, key).map(|value| match value.as_str() {
-        "shared"
-        | "read_only"
-        | "per_effect_worktree"
-        | "per_issue_worktree"
-        | "remote_sandbox" => Ok(value),
-        _ => Err(Box::new(ProviderValidationResult::fail(
-            "",
-            "",
-            "provider.config.invalid",
-            "unsupported_workspace_policy",
-            format!("provider config `{key}` has unsupported value `{value}`"),
-        ))),
+) -> Option<Result<WorkspacePolicy, Box<ProviderValidationResult>>> {
+    optional_string(object, key).map(|value| {
+        WorkspacePolicy::from_str(&value).ok_or_else(|| {
+            Box::new(ProviderValidationResult::fail(
+                "",
+                "",
+                "provider.config.invalid",
+                "unsupported_workspace_policy",
+                format!("provider config `{key}` has unsupported value `{value}`"),
+            ))
+        })
+    })
+}
+
+// `artifact_policy` had no vocabulary check on any path: any string at all
+// reached the adapters, which then had nothing to match on. This is the same
+// door as the workspace one and carries its own code and message so the two
+// refusals stay distinguishable in a report.
+fn optional_artifact_policy(
+    object: &serde_json::Map<String, Value>,
+    key: &str,
+) -> Option<Result<ArtifactPolicy, Box<ProviderValidationResult>>> {
+    optional_string(object, key).map(|value| {
+        ArtifactPolicy::from_str(&value).ok_or_else(|| {
+            Box::new(ProviderValidationResult::fail(
+                "",
+                "",
+                "provider.config.invalid",
+                "unsupported_artifact_policy",
+                format!("provider config `{key}` names no artifact policy: `{value}`"),
+            ))
+        })
     })
 }
 
@@ -1027,6 +1123,17 @@ mod tests {
         assert_eq!(config.provider_kind, "codex".to_owned());
         assert_eq!(config.surface, "codex_app_server".to_owned());
         assert_eq!(config.cancellation_depth, CancellationDepth::NativeStop);
+        assert_eq!(config.workspace_policy, WorkspacePolicy::PerEffectWorktree);
+        assert_eq!(config.artifact_policy, ArtifactPolicy::Required);
+        // The parsed vocabulary spells itself back onto the wire unchanged.
+        assert_eq!(
+            config.to_json_redacted()["workspace_policy"],
+            json!("per_effect_worktree")
+        );
+        assert_eq!(
+            config.to_json_redacted()["artifact_policy"],
+            json!("required")
+        );
         assert_eq!(
             config.to_json_redacted()["extra_keys"],
             json!(["secret_value"])
@@ -1072,6 +1179,40 @@ mod tests {
             result.status == ProviderValidationStatus::Fail
                 && result.code == "unsupported_workspace_policy"
         }));
+    }
+
+    #[test]
+    fn rejects_unknown_artifact_policy() {
+        let results = ProviderBindingConfig::from_json_str(
+            r#"{
+              "provider_id": "codex-main",
+              "provider_kind": "codex",
+              "surface": "codex_app_server",
+              "artifact_policy": "keep_everything"
+            }"#,
+        )
+        .expect_err("artifact policy is invalid");
+
+        assert!(results.iter().any(|result| {
+            result.status == ProviderValidationStatus::Fail
+                && result.code == "unsupported_artifact_policy"
+                && result.message == "provider config `artifact_policy` names no artifact policy: `keep_everything`"
+        }));
+    }
+
+    #[test]
+    fn defaults_workspace_and_artifact_policy_when_absent() {
+        let config = ProviderBindingConfig::from_json_str(
+            r#"{
+              "provider_id": "codex-main",
+              "provider_kind": "codex",
+              "surface": "codex_app_server"
+            }"#,
+        )
+        .expect("config parses");
+
+        assert_eq!(config.workspace_policy, WorkspacePolicy::Shared);
+        assert_eq!(config.artifact_policy, ArtifactPolicy::Optional);
     }
 
     #[test]
@@ -1209,10 +1350,10 @@ mod tests {
             agent: "worker".to_owned(),
             profile: Some("repo-writer".to_owned()),
             prompt_json: json!({"prompt": "contains sk-never-print"}),
-            workspace_policy: "per_effect_worktree".to_owned(),
+            workspace_policy: WorkspacePolicy::PerEffectWorktree,
             required_capabilities: vec!["repo.write".to_owned()],
             cancellation_depth: CancellationDepth::NativeStop,
-            artifact_policy: "required".to_owned(),
+            artifact_policy: ArtifactPolicy::Required,
             credential_ref: Some("secret:codex".to_owned()),
             provider_options,
         };
@@ -1408,10 +1549,10 @@ mod tests {
             agent: "worker".to_owned(),
             profile: Some("repo-reader".to_owned()),
             prompt_json: json!({"prompt": "go"}),
-            workspace_policy: "read_only".to_owned(),
+            workspace_policy: WorkspacePolicy::ReadOnly,
             required_capabilities: vec!["repo.read".to_owned()],
             cancellation_depth: CancellationDepth::NativeStop,
-            artifact_policy: "optional".to_owned(),
+            artifact_policy: ArtifactPolicy::Optional,
             credential_ref: Some("secret:codex".to_owned()),
             provider_options: BTreeMap::new(),
         };

@@ -19,7 +19,7 @@ use whipplescript_kernel::{
     provider::{
         CancellationDepth, NativeProviderAdapter, NativeProviderArtifactRef,
         NativeProviderBoundaryError, NativeProviderCancellation, NativeProviderEvent,
-        NativeProviderEventKind, NativeProviderTurnRequest, ProviderCapability,
+        NativeProviderEventKind, NativeProviderTurnRequest, ProviderCapability, WorkspacePolicy,
     },
 };
 
@@ -165,7 +165,7 @@ pub struct ClaudeAgentPolicyError {
 pub fn build_claude_agent_tool_policy(
     profile: Option<&str>,
     required_capabilities: &[String],
-    workspace_policy: &str,
+    workspace_policy: WorkspacePolicy,
     approval_mode: Option<&str>,
     mcp_config_ref: Option<&str>,
     settings: Option<&str>,
@@ -283,18 +283,31 @@ fn policy_error(code: impl Into<String>, message: impl Into<String>) -> ClaudeAg
 }
 
 fn require_writable_workspace(
-    workspace_policy: &str,
+    workspace_policy: WorkspacePolicy,
     capability: &str,
 ) -> Result<(), ClaudeAgentPolicyError> {
+    // Exhaustive over the kernel's vocabulary, so a policy added there stops
+    // this adapter at compile time instead of silently landing in a catch-all.
     match workspace_policy {
-        "shared" | "per_effect_worktree" | "per_issue_worktree" => Ok(()),
-        "read_only" => Err(policy_error(
+        // A writable local checkout the sidecar can be pointed at with `cwd`.
+        WorkspacePolicy::Shared
+        | WorkspacePolicy::PerEffectWorktree
+        | WorkspacePolicy::PerIssueWorktree => Ok(()),
+        WorkspacePolicy::ReadOnly => Err(policy_error(
             "workspace_denied",
             format!("capability `{capability}` cannot run in a read-only workspace"),
         )),
-        other => Err(policy_error(
+        // DELIBERATE refusal, not an oversight: `remote_sandbox` is a policy the
+        // kernel admits, but this adapter drives a LOCAL sidecar process against
+        // a local `cwd`. It has no way to place a write inside a remote sandbox,
+        // so honouring the request would edit the wrong tree. It refuses until a
+        // remote-sandbox transport exists to honour it.
+        WorkspacePolicy::RemoteSandbox => Err(policy_error(
             "unsupported_workspace_policy",
-            format!("workspace policy `{other}` is not supported for Claude writes"),
+            format!(
+                "workspace policy `{}` is not supported for Claude writes",
+                workspace_policy.as_str()
+            ),
         )),
     }
 }
@@ -781,7 +794,7 @@ impl<T: ClaudeAgentSdkTransport> NativeProviderAdapter for ClaudeAgentSdkAdapter
         let policy = build_claude_agent_tool_policy(
             request.profile.as_deref(),
             &request.required_capabilities,
-            &request.workspace_policy,
+            request.workspace_policy,
             request
                 .provider_options
                 .get("approval_mode")
@@ -1152,7 +1165,7 @@ mod tests {
     use super::*;
     use std::collections::VecDeque;
 
-    use whipplescript_kernel::provider::NativeProviderAdapter;
+    use whipplescript_kernel::provider::{ArtifactPolicy, NativeProviderAdapter};
 
     #[derive(Default)]
     struct FakeTransport {
@@ -1250,10 +1263,10 @@ mod tests {
             agent: "claude".to_owned(),
             profile: Some("repo-writer".to_owned()),
             prompt_json: json!("inspect the repo"),
-            workspace_policy: "shared".to_owned(),
+            workspace_policy: WorkspacePolicy::Shared,
             required_capabilities: vec!["repo.write".to_owned()],
             cancellation_depth: CancellationDepth::CooperativeRequest,
-            artifact_policy: "manifest".to_owned(),
+            artifact_policy: ArtifactPolicy::Manifest,
             credential_ref: Some("secret:claude".to_owned()),
             provider_options: std::collections::BTreeMap::from([
                 ("approval_mode".to_owned(), json!("manual")),
@@ -1354,7 +1367,7 @@ mod tests {
         let policy = build_claude_agent_tool_policy(
             Some("repo-reader"),
             &["repo.read".to_owned()],
-            "read_only",
+            WorkspacePolicy::ReadOnly,
             None,
             None,
             None,
@@ -1373,7 +1386,7 @@ mod tests {
         let policy = build_claude_agent_tool_policy(
             Some("repo-reader"),
             &["repo.read".to_owned()],
-            "read_only",
+            WorkspacePolicy::ReadOnly,
             None,
             None,
             None,
@@ -1394,7 +1407,7 @@ mod tests {
             let policy = build_claude_agent_tool_policy(
                 Some("repo-reader"),
                 &["repo.read".to_owned()],
-                "read_only",
+                WorkspacePolicy::ReadOnly,
                 None,
                 None,
                 Some(settings),
@@ -1414,7 +1427,7 @@ mod tests {
         let error = build_claude_agent_tool_policy(
             Some("repo-reader"),
             &["repo.read".to_owned()],
-            "read_only",
+            WorkspacePolicy::ReadOnly,
             None,
             None,
             Some("workspace"),
@@ -1429,7 +1442,7 @@ mod tests {
         let policy = build_claude_agent_tool_policy(
             Some("repo-writer"),
             &["repo.write".to_owned(), "command.run".to_owned()],
-            "shared",
+            WorkspacePolicy::Shared,
             Some("manual"),
             Some("mcp/readonly.json"),
             None,
@@ -1450,7 +1463,7 @@ mod tests {
         let error = build_claude_agent_tool_policy(
             Some("repo-reader"),
             &["repo.write".to_owned()],
-            "shared",
+            WorkspacePolicy::Shared,
             Some("manual"),
             None,
             None,
@@ -1465,7 +1478,7 @@ mod tests {
         let error = build_claude_agent_tool_policy(
             Some("repo-writer"),
             &["repo.write".to_owned()],
-            "shared",
+            WorkspacePolicy::Shared,
             None,
             None,
             None,
@@ -1480,7 +1493,7 @@ mod tests {
         let error = build_claude_agent_tool_policy(
             Some("repo-writer"),
             &["repo.write".to_owned()],
-            "read_only",
+            WorkspacePolicy::ReadOnly,
             Some("manual"),
             None,
             None,
@@ -1495,7 +1508,7 @@ mod tests {
         let error = build_claude_agent_tool_policy(
             Some("repo-writer"),
             &["repo.write".to_owned()],
-            "remote_sandbox",
+            WorkspacePolicy::RemoteSandbox,
             Some("manual"),
             None,
             None,
@@ -1510,7 +1523,7 @@ mod tests {
         let error = build_claude_agent_tool_policy(
             None,
             &["repo.read".to_owned()],
-            "shared",
+            WorkspacePolicy::Shared,
             None,
             None,
             None,
