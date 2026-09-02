@@ -1,0 +1,28 @@
+// Invalid: workflow terminals whose DECLARED payload contract no payload can
+// take. spec/language.md: a terminal payload contract is either a class (a
+// field block) or a scalar type.
+//
+// The refusal used to fire only from the rule that COMPLETES the terminal, so
+// a workflow that declared the contract and never completed that terminal was
+// accepted, contract and all — and `error` here is never failed, `extra` never
+// completed. The declaration is the mistake; the completion was only where it
+// happened to be noticed. D14, spec/diagnostic-quality-tracker.md.
+workflow DeclaredUnsupportedPayloadContract
+
+output result Outcome
+output extra Outcome[]
+failure error Trouble?
+
+class Outcome {
+  note string
+}
+
+class Trouble {
+  reason string
+}
+
+rule r
+  when started
+=> {
+  complete result { note "x" }
+}

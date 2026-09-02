@@ -35,8 +35,9 @@ credential-verify-endorse.maude	SSSSNNNNNN
 credential-wrap-carriage.maude	SSSSNNNNN
 delegated-settings-authority.maude	SSNN
 delegated-wire-lifecycle.maude	SSSNNN
-duration-arithmetic.maude	NNSS
+diagnostic-adequacy.maude	SSSSSSSSSSSSSSSSSNSNSNSNSNSSNSNSNSNSNS
 discriminant-schema.maude	SSSSSNNN
+duration-arithmetic.maude	NNSS
 effect-cycle-pacing.maude	SSSSNNNNNNSNNN
 effect-dependencies.maude	NSNSSS
 effect-error.maude	SSSSNNNSN
@@ -64,8 +65,8 @@ infoflow-integrity.maude	SSSSNNNN
 infoflow-output-integrity.maude	SSSNNN
 infoflow-package.maude	SSSNN
 infoflow-reader-sets.maude	SSSSNNNN
-infoflow-redact-provenance.maude	SSNN
 infoflow-redaction.maude	SSNNN
+infoflow-redact-provenance.maude	SSNN
 infoflow-signal-carriage.maude	SSSSNNNNN
 infoflow-signature.maude	SSNNNSNNN
 infoflow-staging.maude	SSNN
@@ -106,8 +107,8 @@ script-capability-seeding.maude	SNN
 script-hard-off.maude	SNNNNNSS
 seam-crossing.maude	SSNNSS
 selective-undo.maude	SNSSN
-settle-stopping.maude	NSSSN
 settled-firing-closure.maude	SSSNNNS
+settle-stopping.maude	NSSSN
 skills-never-grant.maude	SSNN
 stat-cache.maude	SNSNSSNS
 std-construct-authorization.maude	SSSNNNNSNSNN
@@ -120,8 +121,8 @@ termination-measure.maude	SSNNNNNNSSSNNN
 text-merge-compose.maude	SSSSSNNNSSN
 trace-lifecycle-conformance.maude	SSSNNSSSSSNSS
 tracker-claim-turn.maude	NSNS
-tracker-lease-merge.maude	SSSNNS
 tracker-lease.maude	SSSSSNNNN
+tracker-lease-merge.maude	SSSNNS
 tracker-merge.maude	SSSSSNNNS
 tracker-projection.maude	SSNNN
 tracker-readiness.maude	SSSNNNN

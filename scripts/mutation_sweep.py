@@ -126,6 +126,20 @@ FORWARDED_PAYLOAD = re.compile(
     r"^[\s(]*(?:None|[a-z_][a-z0-9_]*)(?:\s*,\s*(?:None|[a-z_][a-z0-9_]*))*[\s)]*$"
 )
 
+# `Err(ExitCode::FAILURE)` is a PROCESS EXIT STATUS, not a refusal. The command
+# has already told the user why — the line above it is an `eprintln!` or a
+# report push — and this only carries the failure out of `main`. There is no
+# message in it to corrupt, so `mutate_message` finds nothing, and the site was
+# reported UNMEASURED: the sweep asking for a test that cannot be written,
+# against a line that refuses nothing.
+#
+# Narrow on purpose, and narrower than "the payload has no message": a variant
+# carrying no text can still be a refusal, which is why
+# `Err(CustodyError::Revoked { .. })` stays a site above. This excludes exactly
+# the exit-status type, whose whole job is to be returned rather than read.
+EXIT_STATUS_PAYLOAD = re.compile(r"^[\s(]*ExitCode::[A-Za-z_][A-Za-z0-9_]*[\s)]*$")
+
+
 
 def err_payload(line: str, open_paren: int) -> str | None:
     """The text inside the `Err(` whose opening paren is at `open_paren`."""
@@ -181,6 +195,8 @@ def err_is_refusal(line: str) -> bool:
         # carry a refusal rather than making one. See `FORWARDED_PAYLOAD`.
         payload = err_payload(line, found.end() - 1)
         if payload is not None and FORWARDED_PAYLOAD.match(payload):
+            continue
+        if payload is not None and EXIT_STATUS_PAYLOAD.match(payload):
             continue
         return True
     return False

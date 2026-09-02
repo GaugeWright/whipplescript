@@ -114,8 +114,15 @@ pub struct ProgramVersionInput<'a> {
     pub source_hash: &'a str,
     pub ir_hash: &'a str,
     pub compiler_version: &'a str,
-    /// The `.ir` snapshot `ir_hash` is the hash of, supplied by whoever computed
+    /// The `.ir` document `ir_hash` is the hash of, supplied by whoever computed
     /// that hash — never derived here.
+    ///
+    /// Since DR-0095 that document is the snapshot's IDENTITY PROJECTION —
+    /// `whipplescript_parser::snapshot::identity_projection`, the snapshot with
+    /// its source offsets erased — not the spanned snapshot the compiler
+    /// prints. `ir_hash` is the hash of the projection, and a content blob's id
+    /// is the hash of the bytes it names, so it is the projection that lands
+    /// here.
     ///
     /// Deriving it from the `IrProgram` looked tidier and was wrong: on the host
     /// protocol path `ir_hash` arrives from a REMOTE compiler while the program

@@ -1078,7 +1078,10 @@ rule start_ready_item
         None => panic!("expected rule item"),
     };
     assert_eq!(rule.whens.len(), 2);
-    assert_eq!(rule.whens[0].text, "backlog has ready issue as item");
+    assert_eq!(
+        rule.whens[0].text.as_str(),
+        "backlog has ready issue as item"
+    );
     assert!(rule.body.text.contains("after claim succeeds"));
 }
 
@@ -7200,6 +7203,612 @@ fn a_brace_inside_a_string_is_not_structure() {
     assert_eq!(brace_delta("} on lapse {"), 0);
 }
 
+/// A brace written in prose does not move a `case` walker.
+///
+/// `brace_delta` is honest about ONE LINE and blind past it: a `//` comment's
+/// braces are not braces, and an interior line of a `"""` body carries no quote
+/// of its own to mark itself as content. Both are reachable — not in theory,
+/// here — through `validate_case_blocks`, and one mistake produced two defects
+/// at once. A `}` in either place closed the `case` block early, so the arms
+/// below it were never read: `expr.duplicate_case_pattern` ESCAPED on the
+/// duplicate arm, and the case, which covers its whole domain, was refused as
+/// `expr.non_exhaustive_case`. `BraceScan` masks the whole body once and slices
+/// it per line, which answers both. D14, spec/diagnostic-quality-tracker.md.
+#[test]
+fn a_brace_in_prose_does_not_move_a_case_walker() {
+    const PRELUDE: &str = r#"use std.agent
+
+workflow W
+
+output result Outcome
+
+class Outcome {
+  note string
+}
+
+class Ticket {
+  id string
+  status "open" | "triaged" | "done"
+}
+
+agent worker {
+  provider fixture
+  profile "reader"
+  capacity 1
+}
+
+"#;
+    // Every arm of the domain is present, and one is written twice. The only
+    // error the compiler may report is the duplicate.
+    let expect_only_the_duplicate = |label: &str, source: &str| {
+        let compiled = compile_program(source);
+        let codes: Vec<&str> = compiled
+            .diagnostics
+            .iter()
+            .filter(|d| d.severity == Severity::Error)
+            .map(|d| d.code.as_str())
+            .collect();
+        assert_eq!(
+            codes,
+            vec!["expr.duplicate_case_pattern"],
+            "{label}: {:?}",
+            compiled.diagnostics
+        );
+    };
+
+    let arms = |first_body: &str| {
+        format!(
+            "{PRELUDE}rule r\n  when Ticket as ticket\n  when worker is available\n=> {{\n  case ticket.status {{\n    \"open\" => {{\n{first_body}    }}\n    \"open\" => {{\n      complete result {{ note \"again\" }}\n    }}\n    \"triaged\" => {{\n      complete result {{ note \"triaged\" }}\n    }}\n    \"done\" => {{\n      complete result {{ note \"done\" }}\n    }}\n  }}\n}}\n"
+        )
+    };
+
+    expect_only_the_duplicate(
+        "a brace in a comment",
+        &arms("      // a brace in prose } } is not a block\n      complete result { note \"opened\" }\n"),
+    );
+    expect_only_the_duplicate(
+        "a brace on an interior line of a prompt body",
+        &arms(
+            "      tell worker as turn \"\"\"markdown\n      Close the block like this: } }\n      \"\"\"\n      after turn completes {\n        complete result { note \"opened\" }\n      }\n",
+        ),
+    );
+}
+
+/// Quoting a value does not stop its bindings being checked.
+///
+/// `dangling_value_root` carried a `!value.contains('"')` guard — the blunt
+/// patch for a prose false positive that string-masking answers properly now —
+/// and it failed OPEN: ANY value holding a quote was skipped, an interpolation
+/// included. `"{{ nosuchbinding.field }}"` and `nosuchbinding.field` are the
+/// same mistake and now draw the same diagnostic. The prose the guard was
+/// standing in for is asserted in the same breath, because deleting it must not
+/// bring the false positive back. D14, spec/diagnostic-quality-tracker.md.
+#[test]
+fn a_quoted_value_is_still_checked_for_its_bindings() {
+    const PRELUDE: &str = r#"workflow W
+
+output result Outcome
+failure error Trouble
+
+class Outcome {
+  note string
+}
+
+class Trouble {
+  reason string
+}
+
+rule r
+  when started
+=> {
+"#;
+    let unknown_bindings = |body: &str| -> usize {
+        let compiled = compile_program(&format!(
+            "{PRELUDE}{body}}}
+"
+        ));
+        compiled
+            .diagnostics
+            .iter()
+            .filter(|d| d.code.as_str() == "type.unknown_binding")
+            .count()
+    };
+    assert_eq!(
+        unknown_bindings("  fail error { reason \"{{ nosuchbinding.field }}\" }\n"),
+        1,
+        "an interpolated unknown binding escaped because its value carried a quote"
+    );
+    // The same value without the quotes, which was always refused.
+    assert_eq!(
+        unknown_bindings("  fail error { reason nosuchbinding.field }\n"),
+        1
+    );
+    // And the false positive the guard existed for stays gone: a dotted word in
+    // PROSE is not a binding read.
+    assert_eq!(
+        unknown_bindings("  fail error { reason \"see nosuchbinding.field for why\" }\n"),
+        0,
+        "prose inside a string was read as a binding"
+    );
+}
+
+/// An unsupported terminal payload contract is refused where it is DECLARED.
+///
+/// The refusal fired only from the rule that COMPLETES the terminal, so a
+/// workflow that declared `output extra Outcome[]` and completed only `result`
+/// was accepted with the contract in its IR. Both halves are asserted: the
+/// declaration alone is enough, and the same contract with the terminal
+/// actually completed is still refused. D14,
+/// spec/diagnostic-quality-tracker.md.
+#[test]
+fn an_unsupported_payload_contract_is_refused_at_its_declaration() {
+    const NEVER_COMPLETED: &str = r#"workflow W
+
+output result Outcome
+output extra Outcome[]
+failure error Trouble?
+
+class Outcome {
+  note string
+}
+
+class Trouble {
+  reason string
+}
+
+rule r
+  when started
+=> {
+  complete result { note "x" }
+}
+"#;
+    let compiled = compile_program(NEVER_COMPLETED);
+    let unsupported: Vec<&str> = compiled
+        .diagnostics
+        .iter()
+        .filter(|d| d.code.as_str() == "type.unsupported_payload_contract")
+        .map(|d| d.message.as_str())
+        .collect();
+    assert_eq!(
+        unsupported.len(),
+        2,
+        "a declared contract no payload can take was accepted: {:?}",
+        compiled.diagnostics
+    );
+    assert!(
+        unsupported.iter().any(|m| m.contains("`extra`"))
+            && unsupported.iter().any(|m| m.contains("`error`")),
+        "{unsupported:?}"
+    );
+
+    // A class contract and a scalar contract are what the language admits, and
+    // neither is touched.
+    const SUPPORTED: &str = r#"workflow W
+
+output result Outcome
+output score float
+failure error Trouble
+
+class Outcome {
+  note string
+}
+
+class Trouble {
+  reason string
+}
+
+rule r
+  when started
+=> {
+  complete result { note "x" }
+}
+"#;
+    let compiled = compile_program(SUPPORTED);
+    assert!(
+        !compiled
+            .diagnostics
+            .iter()
+            .any(|d| d.code.as_str() == "type.unsupported_payload_contract"),
+        "{:?}",
+        compiled.diagnostics
+    );
+}
+
+/// A terminal contract naming an unknown schema is ONE mistake, not two.
+///
+/// `output extra NoSuchClass` drew `type.unknown_schema` AND
+/// `type.unsupported_payload_contract` at the same caret. The second is derived
+/// from the first — the name resolves to nothing, so of course the contract "is
+/// not a class" — and a reader who fixes the name loses both. D14,
+/// spec/diagnostic-quality-tracker.md.
+#[test]
+fn an_unknown_schema_contract_is_one_mistake_not_two() {
+    const UNKNOWN_NAME: &str = r#"workflow W
+
+output result Outcome
+output extra NoSuchClass
+failure error NoSuchFailure
+
+class Outcome {
+  note string
+}
+
+rule r
+  when started
+=> {
+  complete result { note "x" }
+}
+"#;
+    let compiled = compile_program(UNKNOWN_NAME);
+    let codes: Vec<&str> = compiled
+        .diagnostics
+        .iter()
+        .map(|d| d.code.as_str())
+        .collect();
+    assert_eq!(
+        codes
+            .iter()
+            .filter(|code| **code == "type.unknown_schema")
+            .count(),
+        2,
+        "the mistake itself must still be reported: {:?}",
+        compiled.diagnostics
+    );
+    assert!(
+        !codes.contains(&"type.unsupported_payload_contract"),
+        "an unresolvable name drew a second, derived diagnostic at the same caret: {:?}",
+        compiled.diagnostics
+    );
+
+    // The suppression is for the BARE reference only. Fix the name in
+    // `NoSuchClass[]` and the array is still a contract no payload can take, so
+    // that IS a second mistake and keeps its own line.
+    const UNKNOWN_NAME_IN_AN_ARRAY: &str = r#"workflow W
+
+output result Outcome
+output extra NoSuchClass[]
+
+class Outcome {
+  note string
+}
+
+rule r
+  when started
+=> {
+  complete result { note "x" }
+}
+"#;
+    let compiled = compile_program(UNKNOWN_NAME_IN_AN_ARRAY);
+    let codes: Vec<&str> = compiled
+        .diagnostics
+        .iter()
+        .map(|d| d.code.as_str())
+        .collect();
+    assert!(
+        codes.contains(&"type.unknown_schema")
+            && codes.contains(&"type.unsupported_payload_contract"),
+        "{:?}",
+        compiled.diagnostics
+    );
+
+    // And a name that DOES resolve, to something no payload can take, is still
+    // refused: the suppression keys on resolution, not on being a `Ref`.
+    const A_RESOLVED_ENUM: &str = r#"workflow W
+
+output result Outcome
+output extra Stage
+
+enum Stage {
+  one
+  two
+}
+
+class Outcome {
+  note string
+}
+
+rule r
+  when started
+=> {
+  complete result { note "x" }
+}
+"#;
+    let compiled = compile_program(A_RESOLVED_ENUM);
+    assert!(
+        compiled
+            .diagnostics
+            .iter()
+            .any(|d| d.code.as_str() == "type.unsupported_payload_contract"),
+        "{:?}",
+        compiled.diagnostics
+    );
+}
+
+/// A `case` whose `{` is written BELOW its head is a real `case`.
+///
+/// `brace_delta(head).max(1)` answered "depth 1, body starts on the next line"
+/// to a head that opened nothing at all. The `{` line then took the walker to
+/// depth 2, and every arm — which sits one level inside the block, at depth 1 —
+/// was read at depth 2 and never parsed. The case reached the IR with NO
+/// branches: both of its mistakes escaped and nothing dispatched on it at run
+/// time. D14, spec/diagnostic-quality-tracker.md.
+#[test]
+fn a_case_block_that_opens_below_its_head_is_still_read() {
+    const SOURCE: &str = r#"workflow W
+
+input ticket Ticket
+
+output result Outcome
+
+class Outcome {
+  note string
+}
+
+class Ticket {
+  id string
+  status "open" | "triaged" | "done"
+}
+
+rule r
+  when Ticket as ticket
+=> {
+  case ticket.status
+  {
+    "open" => {
+      complete result { note "opened" }
+    }
+    "open" => {
+      complete result { note "again" }
+    }
+  }
+}
+"#;
+    let compiled = compile_program(SOURCE);
+    let mut codes: Vec<&str> = compiled
+        .diagnostics
+        .iter()
+        .filter(|d| d.severity == Severity::Error)
+        .map(|d| d.code.as_str())
+        .collect();
+    codes.sort_unstable();
+    assert_eq!(
+        codes,
+        vec!["expr.duplicate_case_pattern", "expr.non_exhaustive_case"],
+        "{:?}",
+        compiled.diagnostics
+    );
+}
+
+/// An arm written on ONE line owns no line below it.
+///
+/// `"open" => { complete result { note \"x\" } }` opens and closes on its own
+/// line, and the `.max(1)` floor read it as a block that continues. The arm
+/// swallowed the arms that FOLLOWED it — they never reached the IR, their
+/// bodies were never validated in the scope their own pattern binds, and the
+/// arm's `body_hash` ended up hashing its siblings' text. Both `case` walkers
+/// carry the shape; both are asserted, because a terminal-case guard is
+/// validated in exactly one place and that place is the walk this derailed.
+/// D14, spec/diagnostic-quality-tracker.md.
+#[test]
+fn an_arm_written_on_one_line_does_not_swallow_the_arms_below_it() {
+    const VALUE_CASE: &str = r#"workflow W
+
+input review Review
+
+output result Outcome
+
+class Outcome {
+  note string
+}
+
+enum Verdict {
+  Approved {
+    score float
+  }
+  Rejected {
+    reason string
+  }
+}
+
+class Review {
+  verdict Verdict
+}
+
+rule r
+  when Review as review
+=> {
+  case review.verdict {
+    Approved as a => { complete result { note "ok" } }
+    Rejected as x => { complete result { note x.nosuchfield } }
+  }
+}
+"#;
+    let compiled = compile_program(VALUE_CASE);
+    assert!(
+        compiled
+            .diagnostics
+            .iter()
+            .any(|d| d.code.as_str() == "type.unknown_field"),
+        "the arm below a one-line arm was never read: {:?}",
+        compiled.diagnostics
+    );
+    // And with the field corrected, BOTH arms reach the IR — the one written
+    // on a line of its own is not the only branch the compiled program holds.
+    let compiled = compile_program(&VALUE_CASE.replace("x.nosuchfield", "x.reason"));
+    let ir = compiled.ir.as_ref().expect("the program lowers");
+    let branches: Vec<&str> = ir
+        .rules
+        .iter()
+        .flat_map(|rule| rule.metadata.case_branches.iter())
+        .map(|branch| branch.scrutinee.as_str())
+        .collect();
+    assert_eq!(branches.len(), 2, "{branches:?}");
+
+    const TERMINAL_CASE: &str = r#"use std.coercion
+
+@service
+workflow W
+
+class WorkItem {
+  title string
+}
+
+class Classification {
+  summary string
+}
+
+class TerminalRoute {
+  branch string
+  detail string
+}
+
+coerce classify(title string) -> Classification {
+  prompt "Classify the work item"
+}
+
+rule classify_work
+  when WorkItem as item
+=>
+{
+  coerce classify(item.title) as classification
+
+  after classification completes {
+    case classification {
+      Completed as result => { record TerminalRoute { branch "c" detail result.summary } }
+      Failed as failure where failure.nosuchfield == "y" => {
+        record TerminalRoute {
+          branch "failed"
+          detail failure.reason
+        }
+      }
+      TimedOut as timeout => {
+        record TerminalRoute {
+          branch "timed_out"
+          detail timeout.summary
+        }
+      }
+      Cancelled as cancel => {
+        record TerminalRoute {
+          branch "cancelled"
+          detail cancel.summary
+        }
+      }
+    }
+  }
+}
+"#;
+    let compiled = compile_program(TERMINAL_CASE);
+    assert!(
+        compiled
+            .diagnostics
+            .iter()
+            .any(|d| d.code.as_str() == "type.unknown_field"
+                && d.message.contains("failure.nosuchfield")),
+        "the guard below a one-line terminal arm was never validated: {:?}",
+        compiled.diagnostics
+    );
+}
+
+/// An `after … completes` block written on one line guards nothing below it.
+///
+/// The `.max(1)` floor gave it a scope one level deep that nothing closed, so
+/// every `case` to the end of the rule was read as being INSIDE it — a
+/// terminal-output case rather than a case over a value — and
+/// `expr.untyped_case_scrutinee` stopped firing. Byte for byte the same program
+/// with the block written across three lines is refused; the two forms now
+/// agree. D14, spec/diagnostic-quality-tracker.md.
+#[test]
+fn a_one_line_after_block_does_not_keep_its_scope_open() {
+    const PRELUDE: &str = r#"use std.coercion
+
+@service
+workflow W
+
+class WorkItem {
+  title string
+}
+
+class Classification {
+  summary string
+}
+
+class TerminalRoute {
+  branch string
+  detail string
+}
+
+coerce classify(title string) -> Classification {
+  prompt "Classify the work item"
+}
+
+rule classify_work
+  when WorkItem as item
+=>
+{
+  coerce classify(item.title) as classification
+
+"#;
+    const TAIL: &str = r#"
+  case classification {
+    Completed as result => {
+      record TerminalRoute { branch "completed" detail result.summary }
+    }
+    Failed as failure => {
+      record TerminalRoute { branch "failed" detail failure.reason }
+    }
+    TimedOut as timeout => {
+      record TerminalRoute { branch "timed_out" detail timeout.summary }
+    }
+    Cancelled as cancel => {
+      record TerminalRoute { branch "cancelled" detail cancel.summary }
+    }
+  }
+}
+"#;
+    let refuses = |label: &str, block: &str| {
+        let compiled = compile_program(&format!("{PRELUDE}{block}{TAIL}"));
+        assert!(
+            compiled
+                .diagnostics
+                .iter()
+                .any(|d| d.code.as_str() == "expr.untyped_case_scrutinee"),
+            "{label}: {:?}",
+            compiled.diagnostics
+        );
+    };
+    refuses(
+        "written on one line",
+        "  after classification completes { record TerminalRoute { branch \"seen\" detail \"x\" } }\n",
+    );
+    refuses(
+        "written across three",
+        "  after classification completes {\n    record TerminalRoute { branch \"seen\" detail \"x\" }\n  }\n",
+    );
+}
+
+/// The mask a whole-body brace scan reads, asked directly.
+#[test]
+fn a_whole_body_brace_scan_sees_past_prose() {
+    let body = "  // } }\n  case x {\n  }\n";
+    let scan = BraceScan::new(body);
+    // The comment line moves nothing.
+    assert_eq!(scan.delta(0, "  // } }"), 0);
+    // The lines that are structure still count.
+    assert_eq!(scan.delta(9, "  case x {"), 1);
+    assert_eq!(scan.delta(20, "  }"), -1);
+
+    // An interior line of a `"""` body carries no quote of its own, so only a
+    // scan that saw the opening delimiter can know it is prose.
+    let prompt = "  tell w as t \"\"\"markdown\n  close it } }\n  \"\"\"\n";
+    let scan = BraceScan::new(prompt);
+    assert_eq!(
+        brace_delta("  close it } }"),
+        -2,
+        "the per-line counter is blind"
+    );
+    assert_eq!(scan.delta(26, "  close it } }"), 0);
+}
+
 /// inside its message text, which is what an unasserted message looks like.
 #[test]
 fn declaration_refusals_fire() {
@@ -9652,6 +10261,42 @@ fn invalid_fixtures_have_actionable_diagnostics() {
             include_str!("../../../../examples/invalid/bad-agent.whip"),
         ),
         (
+            "case-brace-in-prose",
+            include_str!("../../../../examples/invalid/case-brace-in-prose.whip"),
+        ),
+        (
+            "case-block-shapes",
+            include_str!("../../../../examples/invalid/case-block-shapes.whip"),
+        ),
+        (
+            "case-outside-its-after-block",
+            include_str!("../../../../examples/invalid/case-outside-its-after-block.whip"),
+        ),
+        (
+            "duplicate-rule-name",
+            include_str!("../../../../examples/invalid/duplicate-rule-name.whip"),
+        ),
+        (
+            "declared-unsupported-payload-contract",
+            include_str!("../../../../examples/invalid/declared-unsupported-payload-contract.whip"),
+        ),
+        (
+            "unknown-schema-terminal-contract",
+            include_str!("../../../../examples/invalid/unknown-schema-terminal-contract.whip"),
+        ),
+        (
+            "quoted-value-unknown-binding",
+            include_str!("../../../../examples/invalid/quoted-value-unknown-binding.whip"),
+        ),
+        (
+            "bad-pattern-guard",
+            include_str!("../../../../examples/invalid/bad-pattern-guard.whip"),
+        ),
+        (
+            "bad-pattern-assertion",
+            include_str!("../../../../examples/invalid/bad-pattern-assertion.whip"),
+        ),
+        (
             "bounded-unmeasured-ring",
             include_str!("../../../../examples/invalid/bounded-unmeasured-ring.whip"),
         ),
@@ -9952,6 +10597,341 @@ fn invalid_fixtures_have_actionable_diagnostics() {
             compiled.channel_severity_violation()
         );
     }
+}
+
+/// Every `.whip` under `examples/` and `examples/invalid/`, read from disk.
+///
+/// A directory read rather than an `include_str!` list on purpose: the invariant
+/// below is about a POPULATION, and a hand-maintained list is the shape that
+/// silently under-counts — add a fixture and a list-driven test goes on passing
+/// over the set it already knew about. (The sibling
+/// `invalid_fixtures_have_actionable_diagnostics` keeps its list because
+/// `scripts/regen-invalid-diagnostics.sh` greps that list to prove no fixture is
+/// missing from it; this walk needs no such guard because it cannot miss one.)
+fn example_sources() -> Vec<(String, String)> {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let mut sources = Vec::new();
+    for dir in ["examples", "examples/invalid"] {
+        let mut paths: Vec<_> = std::fs::read_dir(root.join(dir))
+            .unwrap_or_else(|error| panic!("read {dir}: {error}"))
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "whip"))
+            .collect();
+        paths.sort();
+        for path in paths {
+            let name = format!(
+                "{dir}/{}",
+                path.file_name()
+                    .expect("fixture has a name")
+                    .to_string_lossy()
+            );
+            let source = std::fs::read_to_string(&path)
+                .unwrap_or_else(|error| panic!("read {name}: {error}"));
+            sources.push((name, source));
+        }
+    }
+    assert!(
+        sources.len() > 100,
+        "the example corpus went missing: only {} files were read",
+        sources.len()
+    );
+    sources
+}
+
+/// Everything a reader can tell apart about a diagnostic ACROSS an edit.
+///
+/// Spans move when text is replaced, so the identity used here is the code and
+/// the sentence — which is what a reader sees disappear when a diagnostic is
+/// repaired, and what they see appear when a repair breaks something else.
+fn diagnostic_identities(compiled: &CompileOutput) -> Vec<(String, String)> {
+    compiled
+        .diagnostics
+        .iter()
+        .chain(&compiled.warnings)
+        .map(|diagnostic| {
+            (
+                diagnostic.code.as_str().to_owned(),
+                diagnostic.message.clone(),
+            )
+        })
+        .collect()
+}
+
+/// The identity of every diagnostic, paired with the span it is reported at.
+///
+/// The identity answers "is this one new"; the span answers "did it come from
+/// the site the fixit touched", which is the half the corrected property below
+/// turns on.
+fn diagnostics_with_spans(compiled: &CompileOutput) -> Vec<((String, String), SourceSpan)> {
+    compiled
+        .diagnostics
+        .iter()
+        .chain(&compiled.warnings)
+        .map(|diagnostic| {
+            (
+                (
+                    diagnostic.code.as_str().to_owned(),
+                    diagnostic.message.clone(),
+                ),
+                diagnostic.span,
+            )
+        })
+        .collect()
+}
+
+/// Where `fixit`'s replacements END UP in the PATCHED text — the extents a new
+/// diagnostic must not land in.
+///
+/// Not the same as the spans the fixit carries: those address the original, and
+/// each replacement shifts everything after it by the difference in length. One
+/// edit today, but the arithmetic is the general one, because a fixit whose
+/// second edit was measured against the first edit's coordinates would silently
+/// check the wrong bytes.
+fn edited_extents(fixit: &Fixit) -> Vec<(usize, usize)> {
+    let mut edits: Vec<&FixitEdit> = fixit.edits.iter().collect();
+    edits.sort_by_key(|edit| (edit.span.start, edit.span.end));
+    let mut extents = Vec::new();
+    let mut shift = 0isize;
+    for edit in edits {
+        let start = (edit.span.start as isize + shift) as usize;
+        extents.push((start, start + edit.replacement.len()));
+        shift += edit.replacement.len() as isize - (edit.span.end - edit.span.start) as isize;
+    }
+    extents
+}
+
+/// Whether `span` lies INSIDE one of `extents` — the diagnostic is about the
+/// bytes the fixit wrote and nothing else.
+///
+/// Containment, not overlap, and the difference is the whole allowance below. A
+/// `case` block, a comparison, an `after` block: each is a span that CONTAINS the
+/// token a fixit repaired, and each of those diagnostics is about the enclosing
+/// construct that could not be checked until the token resolved. Reading those
+/// as "at the edited span" would mean a fixit is forbidden from letting the next
+/// check run.
+///
+/// An EMPTY span is inside nothing, which is deliberate: a workflow-level
+/// diagnostic carries `0..0` because it has no site, and treating that as
+/// "at byte 0" would call every such diagnostic a defect of a fixit that
+/// happened to edit the first token.
+fn span_is_inside(span: SourceSpan, extents: &[(usize, usize)]) -> bool {
+    span.start < span.end
+        && extents
+            .iter()
+            .any(|(start, end)| *start <= span.start && span.end <= *end)
+}
+
+/// Whether `span` overlaps one of `extents` at all.
+///
+/// The looser test, used only for a diagnostic carrying the CODE the fixit
+/// claimed to repair: the code matching is the corroboration that makes an
+/// enclosing span suspicious rather than expected.
+fn span_touches(span: SourceSpan, extents: &[(usize, usize)]) -> bool {
+    span.start < span.end
+        && extents
+            .iter()
+            .any(|(start, end)| span.start < *end && *start < span.end)
+}
+
+/// THE PROPERTY THAT MAKES A FIXIT A FIXIT (tracker D9), over the PARSER plane.
+///
+/// `spec/error-handling.md` "Suggestions And Fixits" separates a suggestion — a
+/// sentence for a person, who will notice when it is wrong — from a fixit, which
+/// a tool may apply on a keystroke or unattended. That claim is about the program
+/// that RESULTS, and a claim about a resulting program can only be checked by
+/// producing it. So this compiles every example, applies every fixit the compiler
+/// offered, recompiles, and asserts:
+///
+///   * ONE FEWER of the diagnostic that carried it — a fixit that does not fix is
+///     the failure mode this row must not ship. Counted rather than tested for
+///     absence, because a program with the same mistake at five sites reports one
+///     sentence five times, and repairing one site must not have to repair all
+///     five to count;
+///   * nothing new INSIDE the bytes it wrote — an error about the very text the
+///     fixit put there is the fixit's own doing;
+///   * nothing new carrying the SAME CODE as the one repaired, anywhere touching
+///     what it wrote — trading one `type.unknown_field` for another at the site
+///     is moving the problem, not fixing it.
+///
+/// WHAT IS DELIBERATELY ALLOWED, AND WHY. This test used to assert that the
+/// multiset of diagnostics could only SHRINK. That property is false — over an
+/// injected-typo population of 844 applications, 153 of them reveal a diagnostic
+/// — and it is false in this very corpus:
+/// `examples/invalid/misspelled-keyword.whip` spells `record` as `recrod`, and
+/// repairing it reveals `graph.unreachable_terminal` — the workflow never
+/// reaches a terminal, which was true all along and was masked by the statement
+/// that would not parse. A compiler that surfaces the next genuine fault once
+/// the first is out of the way is a compiler working. Refusing to emit a fixit
+/// because a LATER fault is waiting behind it would mean withholding correct
+/// repairs from every program more than one edit from correct.
+///
+/// So a revealed fault elsewhere passes, and the clauses above are what keeps
+/// that from becoming "anything goes": the fixit still owns the bytes it wrote.
+/// The line between the two is CONTAINMENT. A diagnostic whose span lies inside
+/// the replacement is about what the fixit put there. A diagnostic whose span
+/// CONTAINS it — the enclosing `case` block, comparison, or `after` block — is
+/// the check that could not run until the token resolved, which is the repair
+/// working rather than failing. Under the same 844 applications, containment
+/// leaves zero failures while overlap would condemn 28 of these enclosing
+/// checks.
+///
+/// WHAT THIS TEST CANNOT SEE, and why it is not the whole proof. `compile_program`
+/// is the parser plane. `graph.unreachable_terminal` above is emitted by the CLI's
+/// `lint_workflow_liveness`, and so are the script hard-off, the authority-import
+/// gate, the tool-grant resolution and the whole information-flow checker — none
+/// of which exists here. Measuring the property on a plane where its failures are
+/// invisible is how the false claim survived in the first place. The proof over
+/// EVERY plane is the CLI integration test
+/// `crates/whipplescript-cli/tests/fixit_application.rs`, which drives
+/// `whip check --json`, the path a user actually gets. This one stays as the
+/// guard on a population that is EMPTY TODAY: a fixit attached to a warning.
+/// `check --json` renders warnings to stderr as text and never puts them in the
+/// report, so the CLI test cannot see one, and no warning currently earns a
+/// fixit — the one warning that names a candidate writes its own sentence and
+/// so is not recognised by the derivation. Standing guard over nothing is the
+/// point: the day a warning does earn one, this is what checks it repairs.
+///
+/// Each fixit is applied to the ORIGINAL source, alone. Applying them together
+/// would test a combination no consumer performs and would let two edits with
+/// overlapping spans mask each other.
+#[test]
+fn fixits_repair_the_program_over_the_example_corpus() {
+    let mut applied = 0usize;
+    let mut carrying = 0usize;
+    for (name, source) in example_sources() {
+        let compiled = compile_program(&source);
+        let before = diagnostic_identities(&compiled);
+        for diagnostic in compiled.diagnostics.iter().chain(&compiled.warnings) {
+            if !diagnostic.fixits.is_empty() {
+                carrying += 1;
+            }
+            let identity = (
+                diagnostic.code.as_str().to_owned(),
+                diagnostic.message.clone(),
+            );
+            for fixit in &diagnostic.fixits {
+                assert!(
+                    !fixit.edits.is_empty(),
+                    "{name}: fixit `{}` carries no edits",
+                    fixit.title
+                );
+                let patched = fixit.apply_to(&source).unwrap_or_else(|| {
+                    panic!(
+                        "{name}: fixit `{}` does not apply to the source it was derived \
+                         from: {:?}",
+                        fixit.title, fixit.edits
+                    )
+                });
+                assert_ne!(
+                    patched, source,
+                    "{name}: fixit `{}` is a no-op",
+                    fixit.title
+                );
+                applied += 1;
+
+                let after = diagnostics_with_spans(&compile_program(&patched));
+                let carried = |set: &[((String, String), SourceSpan)]| {
+                    set.iter().filter(|(seen, _)| *seen == identity).count()
+                };
+                assert!(
+                    carried(&after) < before.iter().filter(|seen| **seen == identity).count(),
+                    "{name}: applying `{}` did not remove an instance of its own \
+                     diagnostic: {identity:?}",
+                    fixit.title
+                );
+                // NEW is a multiset question: a second copy of a diagnostic the
+                // program already had is as new as one it never had.
+                let extents = edited_extents(fixit);
+                let mut remaining = before.clone();
+                for (seen, span) in &after {
+                    if let Some(index) = remaining.iter().position(|had| had == seen) {
+                        remaining.remove(index);
+                        continue;
+                    }
+                    assert!(
+                        !span_is_inside(*span, &extents),
+                        "{name}: applying `{}` introduced {seen:?} inside the bytes it \
+                         just wrote ({extents:?})",
+                        fixit.title
+                    );
+                    assert!(
+                        seen.0 != identity.0 || !span_touches(*span, &extents),
+                        "{name}: applying `{}` introduced another `{}` — the code it \
+                         claimed to repair — over the span it edited ({extents:?})",
+                        fixit.title,
+                        identity.0
+                    );
+                }
+            }
+        }
+    }
+    // A floor, not a count. Every assertion above is vacuous if nothing emits a
+    // fixit, so a refactor that quietly stopped attaching them would otherwise
+    // leave this test green. The floor sits below what the corpus produces today
+    // so that narrowing a caret — which ADDS fixits — never fails it, while
+    // losing the population does.
+    assert!(
+        applied >= 5 && carrying >= 4,
+        "the fixit population collapsed: {applied} fixits over {carrying} diagnostics"
+    );
+}
+
+/// The did-you-mean clause is BUILT and READ BACK in one place, so deriving a
+/// fixit from a finished diagnostic is a round trip rather than a scrape of
+/// prose that happened to look parseable.
+///
+/// Every helper that offers a candidate composes `fixit::did_you_mean_of`, and
+/// the reader is anchored at the start of the suggestion. Asserted through all
+/// three helpers plus the bare clause — including the case that matters most: a
+/// fallback carrying its own backticks must never be read as a replacement.
+///
+/// The clause has TWO forms since the tie decision (`did you mean \`x\`?` and
+/// `did you mean \`x\` or \`y\`?`), and both round-trip; the ambiguous form is
+/// pinned by `a_tied_candidate_is_named_in_the_clause_and_is_only_likely` in
+/// `fixit.rs`, which is where the rung it produces lives.
+#[test]
+fn did_you_mean_round_trips_through_every_helper() {
+    let candidate = |suggestion: &str| {
+        crate::fixit::suggested_candidate(suggestion).map(|(name, _)| name.to_owned())
+    };
+    assert_eq!(
+        candidate(&suggest_otherwise(
+            "prioirty",
+            ["priority"],
+            "declare `field priority` on `Issue`"
+        )),
+        Some("priority".to_owned())
+    );
+    assert_eq!(
+        candidate(&suggest_then(
+            "summarise",
+            ["summarize", "continue"],
+            "supported strategies are `summarize` and `continue`"
+        )),
+        Some("summarize".to_owned())
+    );
+    assert_eq!(
+        candidate(&suggest_then_keyword(
+            "recrod",
+            ["record", "decide"],
+            "statements start with `record`, `decide`, or `tell`"
+        )),
+        Some("record".to_owned())
+    );
+    assert_eq!(
+        candidate(&crate::fixit::did_you_mean("x")),
+        Some("x".to_owned())
+    );
+    assert_eq!(
+        candidate(&suggest_otherwise(
+            "wildly_unrelated",
+            ["priority"],
+            "declare `field priority` on `Issue`"
+        )),
+        None,
+        "a fallback's backticked prose must never be read as a replacement"
+    );
 }
 
 /// THE INVARIANT tying `CompileOutput`'s two channels to the `severity` field.
@@ -10295,10 +11275,18 @@ rule shorthand_span
     );
 }
 
-/// Two rules may carry the same name — the compiler accepts it (D14) — so a
-/// whole-program check that looked its rule's body origin up BY NAME re-parsed
-/// one rule's text against another rule's position, and put the caret on a
-/// statement that performs no write at all.
+/// Two rules in one workflow may not carry the same name.
+///
+/// A rule NAME is the rule's identity everywhere outside `ir.rules`'s own
+/// ordering — the effect graph, a `mark` site, a DR-0043 region, source tags,
+/// and `firing.rule` in the run record — and none of those can spell a
+/// position instead. Two rules sharing a name are one rule to the kernel and
+/// to every report, and inside the compiler the collision was already
+/// producing wrong answers: a whole-program check that looked its rule's body
+/// origin up BY NAME re-parsed one rule's text against another rule's
+/// position, and put the caret on a statement that performs no write at all.
+/// Both halves are asserted, because the pairing stays positional whether or
+/// not the collision is refused. D14, spec/diagnostic-quality-tracker.md.
 #[test]
 fn a_duplicate_rule_name_does_not_borrow_another_rules_position() {
     let source = r#"
@@ -10333,6 +11321,14 @@ rule same_name
 }
 "#;
     let compiled = compile_program(source);
+    assert!(
+        compiled.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code.as_str() == "construct.duplicate_declaration"
+                && diagnostic.message.contains("rule `same_name`")
+        }),
+        "the collision was accepted: {:?}",
+        compiled.diagnostics
+    );
     let write_policy: Vec<_> = compiled
         .diagnostics
         .iter()
@@ -10352,9 +11348,10 @@ rule same_name
 }
 
 /// Several parts of one fragment can be wrong the same way while none of them
-/// has a span of its own (`Expr` carries no spans — D10), so one pass reports
-/// the same message at the same span more than once and every copy is a
-/// separate mistake. A collapse over the finished diagnostic list cannot tell
+/// has a span of its own — the walker that checks a `coerce` argument's list
+/// items holds one anchor for the whole argument — so one pass reports the same
+/// message at the same span more than once and every copy is a separate
+/// mistake. A collapse over the finished diagnostic list cannot tell
 /// that from a re-report; it would show the reader one wrong list item, and the
 /// second only after they fixed the first and re-ran.
 #[test]
@@ -10407,6 +11404,7 @@ fn merging_passes_keeps_distinct_findings_and_order() {
         code: diagnostic_code!("parse.unexpected_token"),
         severity: Severity::Error,
         related: Vec::new(),
+        fixits: Vec::new(),
         span: span(start, end),
         message: message.to_owned(),
         suggestion: suggestion.map(str::to_owned),
@@ -10416,8 +11414,9 @@ fn merging_passes_keeps_distinct_findings_and_order() {
     // `examples/invalid/bad-record.whip` used to put five of these on one arrow,
     // and finer spans make convergence more common, not less. And the same
     // finding TWICE from one pass is two mistakes with no spans to tell them
-    // apart (`coerce f([1, 2])` against a `string[]`), which is why this is
-    // per-pass and not a collapse over the finished list.
+    // apart (`coerce f([1, 2])` against a `string[]`, whose items are checked
+    // against one anchor), which is why this is per-pass and not a collapse over
+    // the finished list.
     let first_pass = vec![
         diagnostic(3, 9, "second", None),
         diagnostic(3, 9, "first", None),
@@ -20832,6 +21831,20 @@ fn closest_name_policy() {
 
 /// Every vocabulary the LANGUAGE defines, as the sweep below measures them.
 ///
+/// The closest keyword WITHOUT its rival — the shape the closeness tests below
+/// assert over. The compiler itself has no such helper any more: every closed-
+/// vocabulary consumer writes a did-you-mean clause and so needs the rival too
+/// (`crate::closest_keyword_rivals`). These tests are asking which word wins,
+/// not what the sentence says, so they drop the second half here rather than at
+/// twelve call sites.
+fn closest_keyword<S, I>(target: &str, candidates: I) -> Option<String>
+where
+    S: AsRef<str>,
+    I: IntoIterator<Item = S>,
+{
+    crate::closest_keyword_rivals(target, candidates).map(|(name, _)| name)
+}
+
 /// Assembled by hand from the `suggest_then_keyword`/`closest_keyword` call
 /// sites, because that is the set the policy has to hold for. A vocabulary that
 /// drifts out of this list loses its sweep coverage silently, so a new closed
@@ -22537,5 +23550,475 @@ rule finish
     assert!(
         !ir.measures.is_empty(),
         "the ring is admitted BECAUSE it has a measure, so one must be published"
+    );
+}
+
+/// The spans tree mirrors the expression tree, node for node, and every node's
+/// range names the text that node was parsed from.
+///
+/// `ExprSpans` is a PARALLEL tree (tracker D10): keeping positions out of `Expr`
+/// is what stops them reaching `ir_hash`, the Maude export and the model-search
+/// keys, and the price is that the two structures can drift. This is the check
+/// that they have not. Re-parsing `source[range]` and comparing SNAPSHOTS is the
+/// strong form — a range that names the wrong text almost never re-parses to the
+/// same node — and it fails the moment a parser arm forgets a child or hands one
+/// the wrong extent.
+#[test]
+fn expr_spans_mirror_the_expression_tree() {
+    fn check(source: &str, expr: &Expr, spans: &ExprSpans) {
+        let children = expr.children();
+        assert_eq!(
+            children.len(),
+            spans.child_count(),
+            "child count disagrees for `{}` in `{source}`",
+            expr.to_snapshot()
+        );
+        let range = spans
+            .range()
+            .unwrap_or_else(|| panic!("no range for `{}` in `{source}`", expr.to_snapshot()));
+        assert!(
+            range.end <= source.len() && range.start < range.end,
+            "range {range:?} is not inside `{source}`"
+        );
+        let text = &source[range.clone()];
+        // A query is only an expression inside `count(…)`/`exists(…)`, so it is
+        // re-parsed in the position the grammar gives it and unwrapped again.
+        let (probe, unwrap) = match expr {
+            Expr::Query { .. } => (format!("count({text})"), true),
+            _ => (text.to_owned(), false),
+        };
+        let reparsed = parse_expression(&probe).unwrap_or_else(|error| {
+            panic!("`{text}` (from `{source}`) does not re-parse: {error}")
+        });
+        let reparsed = match (unwrap, &reparsed) {
+            (true, Expr::Call { args, .. }) if args.len() == 1 => args[0].clone(),
+            _ => reparsed,
+        };
+        assert_eq!(
+            reparsed.to_snapshot(),
+            expr.to_snapshot(),
+            "range {range:?} of `{source}` is `{text}`, which is not that node"
+        );
+        for (index, child) in children.iter().enumerate() {
+            let child_spans = spans.child(index);
+            let child_range = child_spans.range().expect("a child has a range");
+            assert!(
+                range.start <= child_range.start && child_range.end <= range.end,
+                "child {index} of `{}` sits outside its parent in `{source}`",
+                expr.to_snapshot()
+            );
+            check(source, child, child_spans);
+        }
+    }
+
+    let sources = [
+        "task.title",
+        "!task.ready",
+        "not task.ready",
+        "task.a + 1 > 2",
+        "task.a == 1 && task.b != \"x\"",
+        "task.a in [1, 2, 3]",
+        "task.a not in [\"x\"]",
+        "task.labels[\"team\"] == \"runtime\"",
+        "(task.a + 1) * 2 > task.b",
+        "count(Task where status == \"open\") >= 1",
+        "count(effect agent.tell where target == \"worker\") == 0",
+        "exists task.owner",
+        "exists(task.owner) and task.owner.name == \"Ada\"",
+        "empty(task.labels)",
+        "{title task.title, meta {phase \"kernel\"}} == task.meta",
+        "[\"a\", \"b\"][0] == \"a\"",
+        "task.wait + 30s > 1m",
+    ];
+    for source in sources {
+        let (expr, spans) = parse_expression_spanned(source).expect(source);
+        check(source, &expr, &spans);
+    }
+}
+
+/// A parse failure names the token it stopped at — except for the call whose
+/// name the kernel does not have, where it names the NAME (see
+/// `an_unsupported_call_underlines_the_name_not_the_parenthesis`).
+///
+/// The message already said "unexpected token"; without a range the caret
+/// underlined the whole clause the expression was written in, so the message
+/// named a token and the caret named a rule (D10).
+#[test]
+fn expression_parse_errors_carry_the_offending_token() {
+    let cases = [
+        ("uppercase(task.title) == \"x\"", "uppercase"),
+        ("task.a == 1)", ")"),
+        ("task..a", "a"),
+        ("task.a not b", "b"),
+    ];
+    for (source, token) in cases {
+        let error = parse_expression_spanned(source).expect_err(source);
+        let range = error
+            .range
+            .unwrap_or_else(|| panic!("`{source}` -> `{}` has no range", error.message));
+        assert_eq!(&source[range], token, "for `{source}`");
+    }
+    // A failure with no token to blame — it ran out of input — says so rather
+    // than pointing at the last thing it read.
+    assert!(parse_expression_spanned("1 +")
+        .expect_err("1 +")
+        .range
+        .is_none());
+}
+
+/// The same expression written at two different offsets is the same `Expr`, and
+/// the two programs have the same `ir_hash`.
+///
+/// This is the D13 invariant (`A span is where something was written, not what
+/// it means`) applied to the thing D10 added. `ExprSpans` exists precisely so a
+/// position never becomes part of what a program MEANS; if a future change moves
+/// a range into `Expr`, into `to_snapshot`, or into the IR, this fails.
+#[test]
+fn expression_positions_stay_out_of_program_identity() {
+    let (early, _) = parse_expression_spanned("task.a == 1").expect("parses");
+    let (late, late_spans) = parse_expression_spanned("        task.a == 1").expect("parses");
+    assert_eq!(
+        early, late,
+        "an offset must not make two expressions differ"
+    );
+    assert_eq!(early.to_snapshot(), late.to_snapshot());
+    assert_eq!(
+        late_spans.range(),
+        Some(8..19),
+        "the spans, and only the spans, know where it was written"
+    );
+
+    let program = |padding: &str| {
+        format!(
+            r#"
+workflow Pad
+
+output result Verdict
+
+class Verdict {{
+  note string
+}}
+
+class Task {{
+  ready bool
+}}
+
+rule finish
+  when Task as task where{padding} task.ready
+=> {{
+  complete result {{
+    note "done"
+  }}
+}}
+"#
+        )
+    };
+    let one = compile_program(&program(""));
+    let two = compile_program(&program("   "));
+    assert_eq!(one.diagnostics, Vec::new());
+    assert_eq!(two.diagnostics, Vec::new());
+    assert_eq!(
+        snapshot::identity_hash(&one.ir.expect("compiles").to_snapshot()),
+        snapshot::identity_hash(&two.ir.expect("compiles").to_snapshot()),
+        "moving a guard sideways must not change what the program IS"
+    );
+}
+
+/// A guard diagnostic underlines the operand its message names, and a guard in
+/// a `when` clause the parser did not cut from the file falls back to the
+/// clause's own span rather than a position that means nothing.
+#[test]
+fn guard_diagnostics_underline_the_operand_they_name() {
+    let source = r#"
+workflow Triage
+
+output result Verdict
+
+class Verdict {
+  note string
+}
+
+class Issue {
+  title string
+  attempts int
+}
+
+rule count_words
+  when Issue as issue where issue.title + 1 > 2
+=> {
+  complete result {
+    note "counted"
+  }
+}
+"#;
+    let compiled = compile_program(source);
+    let diagnostic = compiled
+        .diagnostics
+        .iter()
+        .find(|d| d.code.as_str() == "expr.non_numeric_operand")
+        .expect("the non-numeric operand is refused");
+    assert_eq!(
+        &source[diagnostic.span.start..diagnostic.span.end],
+        "issue.title",
+        "the caret must name the operand the message calls non-numeric"
+    );
+
+    // No recorded origin (a canonicalized or synthesized clause): the anchor
+    // degrades to the clause's span, which is what every guard finding got
+    // before this row.
+    let synthesized = WhenClause {
+        text: SourceText::generated("Issue as issue where issue.title + 1 > 2".to_owned()),
+        span: SourceSpan { start: 40, end: 80 },
+    };
+    let (_, guard) = split_when_guard(&synthesized.text);
+    let anchor = when_guard_anchor(&synthesized, guard.expect("a guard"));
+    assert_eq!(anchor.whole(), synthesized.span);
+    assert_eq!(anchor.at(0..5), synthesized.span);
+}
+
+/// `parse.invalid_expression` is reached most often by calling a function the
+/// expression kernel does not have. The parser stops on the `(` — every call it
+/// supports is spelled out, so anything else parses as a bare identifier and
+/// leaves the parenthesis behind — but the parenthesis is not what the reader
+/// has to change. The NAME is.
+#[test]
+fn an_unsupported_call_underlines_the_name_not_the_parenthesis() {
+    let source = r#"
+workflow Triage
+
+output result Verdict
+
+class Verdict {
+  note string
+}
+
+class Issue {
+  title string
+}
+
+rule shout
+  when Issue as issue where uppercase(issue.title) == "FLAKY"
+=> {
+  complete result {
+    note "shouted"
+  }
+}
+"#;
+    let compiled = compile_program(source);
+    let diagnostic = compiled
+        .diagnostics
+        .iter()
+        .find(|d| d.code.as_str() == "parse.invalid_expression")
+        .expect("the unsupported call is refused");
+    assert_eq!(
+        &source[diagnostic.span.start..diagnostic.span.end],
+        "uppercase",
+        "the caret must name the call the reader has to replace"
+    );
+
+    // A leftover `(` that follows something which is not a name has no name to
+    // blame, and keeps the parenthesis it always had.
+    let source = r#""flaky"(1)"#;
+    let error = parse_expression_spanned(source).expect_err("refused");
+    let range = error.range.expect("a token range");
+    assert_eq!(&source[range], "(", "nothing to rename, so nothing renamed");
+}
+
+/// A `pattern` rewrites the text of the guards and assertions inside it while
+/// their spans go on naming the file, so a range measured against the rewritten
+/// text resolves to a byte the author never wrote.
+///
+/// This is the D2d defect in a new place — text rewritten without invalidating
+/// its origin — and it is worse than the coarseness it replaced: the guard
+/// caret walked forward by the length the substitution added, and the assertion
+/// caret walked onto the `apply` line three lines below. Both must degrade to
+/// the whole fragment. `examples/invalid/bad-pattern-{guard,assertion}.whip`
+/// pin the rendered form; this pins the spans, and fails on its own if
+/// `SourceText::rewrite` stops clearing the origin.
+#[test]
+fn pattern_expansion_gives_up_the_carets_it_can_no_longer_place() {
+    // `Input` -> `IncomingChangeRequest` is sixteen bytes longer, so a stale
+    // origin does not merely blur the caret, it moves it.
+    let source = r#"
+workflow PatternCarets
+
+output result Verdict
+
+class Verdict {
+  note string
+}
+
+class IncomingChangeRequest {
+  id string
+  title string
+  attempts int
+}
+
+table requests as IncomingChangeRequest [
+  {
+    id "CR-1"
+    title "t"
+    attempts 1
+  }
+]
+
+pattern Triage<Input> {
+  rule shout
+    when Input as item where item.title + 1 > 2
+  => {
+    record Triaged {
+      id item.id
+    }
+  }
+
+  assert count(Input) == nope(0)
+}
+
+class Triaged {
+  id string
+}
+
+apply Triage<IncomingChangeRequest> as triage {
+}
+
+rule finish
+  when Triaged as triaged
+=> {
+  complete result {
+    note "done"
+  }
+}
+"#;
+    let compiled = compile_program(source);
+    let underlined = |code: &str| -> String {
+        let diagnostic = compiled
+            .diagnostics
+            .iter()
+            .find(|d| d.code.as_str() == code)
+            .unwrap_or_else(|| panic!("{code} is refused"));
+        source[diagnostic.span.start..diagnostic.span.end].to_owned()
+    };
+    assert_eq!(
+        underlined("expr.non_numeric_operand"),
+        "Input as item where item.title + 1 > 2",
+        "a guard whose text a pattern rewrote degrades to the whole clause"
+    );
+    assert_eq!(
+        underlined("parse.invalid_expression"),
+        "count(Input) == nope(0)",
+        "an assertion whose text a pattern rewrote degrades to the whole assertion"
+    );
+}
+
+/// `IrWhen.guard.span` degrades too, and it is not a diagnostic span.
+///
+/// It travels into the IR and becomes the `source_span` of the `core.projection`
+/// a guarded `when` produces, so it is read at RUN time by anything explaining
+/// where a projection came from. It used to reconstruct its position as
+/// `when.span.start + guard_offset` — the arithmetic D2b deleted from rule
+/// bodies — which is wrong for exactly the clauses a pattern rewrote. Nothing
+/// else covers it: the pattern fixtures assert on diagnostics, and a diagnostic
+/// is not what this field feeds.
+#[test]
+fn a_pattern_expanded_guard_does_not_claim_a_position_in_the_ir() {
+    let program = |guard_in_pattern: bool| {
+        let (pattern_guard, plain_guard) = if guard_in_pattern {
+            ("where item.attempts > 1", "")
+        } else {
+            ("", "where direct.attempts > 1")
+        };
+        format!(
+            r#"
+workflow PatternGuardSpan
+
+output result Verdict
+
+class Verdict {{
+  note string
+}}
+
+class IncomingChangeRequest {{
+  id string
+  title string
+  attempts int
+}}
+
+table requests as IncomingChangeRequest [
+  {{
+    id "CR-1"
+    title "t"
+    attempts 1
+  }}
+]
+
+pattern Triage<Input> {{
+  rule shout
+    when Input as item {pattern_guard}
+  => {{
+    record Triaged {{
+      id item.id
+    }}
+  }}
+}}
+
+class Triaged {{
+  id string
+}}
+
+apply Triage<IncomingChangeRequest> as triage {{
+}}
+
+rule direct_rule
+  when IncomingChangeRequest as direct {plain_guard}
+=> {{
+  record Triaged {{
+    id direct.id
+  }}
+}}
+
+rule finish
+  when Triaged as triaged
+=> {{
+  complete result {{
+    note "done"
+  }}
+}}
+"#
+        )
+    };
+
+    let guard_span_of = |source: &str, rule: &str| -> SourceSpan {
+        let compiled = compile_program(source);
+        let ir = compiled
+            .ir
+            .unwrap_or_else(|| panic!("the program compiles: {:?}", compiled.diagnostics));
+        ir.rules
+            .iter()
+            .find(|candidate| candidate.name == rule)
+            .and_then(|candidate| candidate.whens.iter().find_map(|when| when.guard.as_ref()))
+            .map(|guard| guard.span)
+            .unwrap_or_else(|| panic!("rule `{rule}` has a guarded `when`"))
+    };
+
+    // The control: a guard the parser cut from the file keeps its own position,
+    // so the span slices back to exactly the guard text.
+    let plain = program(false);
+    let plain_span = guard_span_of(&plain, "direct_rule");
+    assert_eq!(
+        &plain[plain_span.start..plain_span.end],
+        "direct.attempts > 1",
+        "a guard whose text is still the file's keeps its own position"
+    );
+
+    // The subject: `Input` -> `IncomingChangeRequest` is sixteen bytes longer,
+    // so a reconstructed offset would land past the guard. It degrades to the
+    // clause instead — text that still CONTAINS the guard.
+    let expanded = program(true);
+    let expanded_span = guard_span_of(&expanded, "triage_shout");
+    let underlined = &expanded[expanded_span.start..expanded_span.end];
+    assert!(
+        underlined.contains("item.attempts > 1"),
+        "a pattern-rewritten guard degrades to text that contains it, never to a \
+         computed offset past it; got {underlined:?}"
     );
 }

@@ -1,0 +1,89 @@
+// Invalid: a duplicate `case` arm, written under prose that carries a brace.
+// The mistake being pinned is the duplicate arm; the prose is what used to hide
+// it. A block scanner that reads one line at a time cannot tell a `}` in a
+// comment, or one on an interior line of a `"""` prompt body, from a brace that
+// closes a block — so a `}` written in either place ended the `case` early, the
+// arms below it were never read, and the compiler both MISSED the duplicate and
+// refused the exhaustive case as non-exhaustive. D14,
+// spec/diagnostic-quality-tracker.md.
+use std.agent
+
+workflow CaseBraceInProse
+
+output result Outcome
+
+class Outcome {
+  note string
+}
+
+class Ticket {
+  id string
+  status "open" | "triaged" | "done"
+}
+
+agent worker {
+  provider fixture
+  profile "reader"
+  capacity 1
+}
+
+rule a_brace_in_a_comment
+  when Ticket as ticket
+=> {
+  case ticket.status {
+    "open" => {
+      // a brace in prose } } is not a block
+      complete result {
+        note "opened"
+      }
+    }
+    "open" => {
+      complete result {
+        note "again"
+      }
+    }
+    "triaged" => {
+      complete result {
+        note "triaged"
+      }
+    }
+    "done" => {
+      complete result {
+        note "done"
+      }
+    }
+  }
+}
+
+rule a_brace_in_a_prompt_body
+  when Ticket as ticket
+  when worker is available
+=> {
+  case ticket.status {
+    "open" => {
+      tell worker as turn """markdown
+      Close the block like this: } }
+      """
+      after turn completes {
+        complete result {
+          note "opened"
+        }
+      }
+    }
+    "open" => {
+      complete result {
+        note "again"
+      }
+    }
+    "triaged" => {
+      complete result {
+        note "triaged"
+      }
+    }
+    "done" => {
+      complete result {
+        note "done"
+      }
+    }
+  }
+}

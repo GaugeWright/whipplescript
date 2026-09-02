@@ -590,7 +590,9 @@ fn artifact_model_search_check_report_entry(path: &str, graph: &Value, lowered: 
         .expect("lowered report object")
         .insert(
             "accepted_program_digest".to_owned(),
-            Value::String(sha256_hex(format!("{graph_id}\n{snapshot}").as_bytes())),
+            Value::String(sha256_hex(
+                format!("{graph_id}\n{}", ir_identity_projection(snapshot)).as_bytes(),
+            )),
         );
     let lowered_validation = validate_lowered_ir_artifact(&lowered, &graph);
     assert!(
@@ -618,7 +620,7 @@ fn artifact_model_search_check_report_entry(path: &str, graph: &Value, lowered: 
         "status": "ok",
         "workflow": "ArtifactModelSearchTest",
         "source_hash": stable_hash_hex(path),
-        "ir_hash": stable_hash_hex(snapshot),
+        "ir_hash": ir_identity_hash(snapshot),
         "snapshot": snapshot,
         "source_metadata": {
             "tags": [],
@@ -915,9 +917,10 @@ fn set_report_snapshot_for_test(entry: &mut Value, snapshot: &str) {
         .insert("snapshot".to_owned(), Value::String(snapshot.to_owned()));
     entry.as_object_mut().expect("report entry object").insert(
         "ir_hash".to_owned(),
-        Value::String(stable_hash_hex(snapshot)),
+        Value::String(ir_identity_hash(snapshot)),
     );
-    let accepted_program_digest = sha256_hex(format!("{graph_id}\n{snapshot}").as_bytes());
+    let accepted_program_digest =
+        sha256_hex(format!("{graph_id}\n{}", ir_identity_projection(snapshot)).as_bytes());
     entry
         .get_mut("lowered_ir_report")
         .and_then(Value::as_object_mut)

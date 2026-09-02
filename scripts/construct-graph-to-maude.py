@@ -16,6 +16,7 @@ from artifact_admission import (
     canonical_json,
     catalog_lowerings,
     derived_fact_predicates,
+    ir_identity_hash,
     is_sha256_digest,
     is_stable_digest,
     load_platform_construct_catalog,
@@ -23,7 +24,6 @@ from artifact_admission import (
     maude_port_list,
     require_predicate,
     required_string,
-    stable_hash_hex,
     validate_contract_registry_shape,
     validate_empty_diagnostics,
     validate_package_contract_platform,
@@ -214,10 +214,14 @@ def validate_report_entry_identity(
         raise SystemExit(f"{label}.ir_hash must be a 32-character lowercase hex digest")
     if not is_stable_digest(source_hash):
         raise SystemExit(f"{label}.source_hash must be a 32-character lowercase hex digest")
-    expected_ir_hash = stable_hash_hex(snapshot)
+    # DR-0095: `ir_hash` is the hash of the snapshot's IDENTITY projection —
+    # the same document with its source offsets erased — so a compiler change
+    # that only improves a diagnostic span leaves a program's identity alone.
+    # Offsets only: `body_hash` stays, so this is not whitespace-insensitive.
+    expected_ir_hash = ir_identity_hash(snapshot)
     if ir_hash != expected_ir_hash:
         raise SystemExit(
-            f"{label}.ir_hash must match embedded snapshot hash: "
+            f"{label}.ir_hash must match the embedded snapshot's identity hash: "
             f"got {ir_hash!r}, expected {expected_ir_hash!r}"
         )
 

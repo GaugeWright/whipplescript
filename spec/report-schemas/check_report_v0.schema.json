@@ -205,7 +205,27 @@
         "severity": {"enum": ["error", "warning", "info", "hint"]},
         "message": {"type": "string"},
         "suggestion": {"type": ["string", "null"]},
-        "source_span": {"$ref": "#/$defs/span"}
+        "source_span": {"$ref": "#/$defs/span"},
+        "fixits": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/fixit"}}
+      },
+      "additionalProperties": true
+    },
+    "fixit": {
+      "type": "object",
+      "required": ["title", "edits", "applicability"],
+      "properties": {
+        "title": {"type": "string", "minLength": 1},
+        "edits": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/fixit_edit"}},
+        "applicability": {"enum": ["exact", "likely"]}
+      },
+      "additionalProperties": true
+    },
+    "fixit_edit": {
+      "type": "object",
+      "required": ["source_span", "replacement"],
+      "properties": {
+        "source_span": {"$ref": "#/$defs/span"},
+        "replacement": {"type": "string"}
       },
       "additionalProperties": true
     },

@@ -5,10 +5,10 @@ warning[effect.unhandled_failure]: effect `review`'s failure is unhandled in rul
    |   ^^^^^^^^^^^^^^^^^^^^^
    = help: handle it with `after review fails { … }` (typed failure or recovery) or observe every outcome with `after review completes`
 error[expr.untyped_object_literal]: rule `bad_coerce` uses an object literal without an expected object or map type
-   --> examples/invalid/bad-effect-payload.whip:28:8
+   --> examples/invalid/bad-effect-payload.whip:28:27
    |
 28 |   when Task as task where { owner "Ada" } == task.owner
-   |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |                           ^^^^^^^^^^^^^^^
    = help: use object literals only in typed record fields or typed effect arguments
 error[type.unknown_field]: class `Owner` has no field `handle`
    --> examples/invalid/bad-effect-payload.whip:30:3

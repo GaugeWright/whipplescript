@@ -1,0 +1,6 @@
+error[parse.invalid_expression]: invalid assertion expression: unexpected token in expression `count(IncomingChangeRequest) == nope(0)`
+   --> examples/invalid/bad-pattern-assertion.whip:34:10
+   |
+34 |   assert count(Input) == nope(0)
+   |          ^^^^^^^^^^^^^^^^^^^^^^^
+   = help: use a deterministic expression such as `count(Fact) == 1`

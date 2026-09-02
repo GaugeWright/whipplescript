@@ -272,7 +272,13 @@ impl<Sql: DoSql + 'static> DurableInstance<Sql> {
         // change does natively.
         let source_hash = whipplescript_kernel::exec_http::sha256_hex(program_source.as_bytes());
         let compiler_version = concat!("whipplescript-host-do ", env!("CARGO_PKG_VERSION"));
-        let ir_snapshot = ir.to_snapshot();
+        // DR-0095: identity is the span-free PROJECTION of the snapshot, and the
+        // projection is what lands under `ir_hash` — exactly as natively.
+        // Hashing the spanned document here would make the two hosts disagree
+        // about `ir_hash` for one program, which is the thing repairing this
+        // path was for, and would file a blob whose id is not the hash of the
+        // bytes it names, which is what `verify_body` exists to catch.
+        let ir_snapshot = whipplescript_parser::snapshot::identity_projection(&ir.to_snapshot());
         let ir_hash = crate::do_store::stable_hash_hex(&ir_snapshot);
         let version = kernel
             .create_program_version_for_program(

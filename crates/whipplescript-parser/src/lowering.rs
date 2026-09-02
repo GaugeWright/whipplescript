@@ -16,6 +16,9 @@ pub(crate) fn lower_program(
     // checks below see only `IrRule`, which keeps the body text and drops where
     // it came from.
     let mut rule_bodies: Vec<BlockSource> = Vec::new();
+    // Where each rule NAME was first written, for the duplicate refusal in
+    // `lower_rule`.
+    let mut rule_names: BTreeMap<String, SourceSpan> = BTreeMap::new();
     let (program, pattern_applications) = expand_pattern_applications(program, &mut diagnostics);
     let pending_regions: BTreeMap<String, IrRegion>;
     let program = {
@@ -49,7 +52,8 @@ pub(crate) fn lower_program(
         for item in &mut expanded {
             if let Item::Rule(rule) = item {
                 if rule.body.text.contains('#') {
-                    rule.body.text = body::blank_full_line_comments(&rule.body.text);
+                    let blanked = body::blank_full_line_comments(&rule.body.text);
+                    rule.body.text.rewrite_byte_preserving(blanked);
                 }
             }
         }
@@ -186,6 +190,7 @@ pub(crate) fn lower_program(
                 &mut ir,
                 &schema_names,
                 &agent_names,
+                &semantic,
                 &mut diagnostics,
             ),
             Item::Use(use_decl) => lower_use(use_decl, &mut ir, &mut diagnostics),
@@ -198,6 +203,7 @@ pub(crate) fn lower_program(
                 code: diagnostic_code!("construct.invalid_declaration_scope"),
                 severity: Severity::Error,
                 related: Vec::new(),
+                fixits: Vec::new(),
                 span: pattern.span,
                 message: format!(
                     "pattern `{}` is not allowed inside this declaration scope",
@@ -209,6 +215,7 @@ pub(crate) fn lower_program(
                 code: diagnostic_code!("lowering.unexpanded_pattern_application"),
                 severity: Severity::Error,
                 related: Vec::new(),
+                fixits: Vec::new(),
                 span: apply.span,
                 message: format!(
                     "pattern application `{}` was not expanded",
@@ -244,6 +251,7 @@ pub(crate) fn lower_program(
                             code: diagnostic_code!("construct.unknown_provider"),
                             severity: Severity::Error,
                             related: Vec::new(),
+                            fixits: Vec::new(),
                             span: provider.span,
                             message: format!(
                                 "file store `{}` names unknown provider `{}`",
@@ -297,6 +305,7 @@ pub(crate) fn lower_program(
                         code: diagnostic_code!("type.unknown_schema"),
                         severity: Severity::Error,
                         related: Vec::new(),
+                        fixits: Vec::new(),
                         span: lease.key_type.span,
                         message: format!(
                             "lease `{}` keys on undeclared type `{}`",
@@ -324,6 +333,7 @@ pub(crate) fn lower_program(
                         code: diagnostic_code!("type.unknown_schema"),
                         severity: Severity::Error,
                         related: Vec::new(),
+                        fixits: Vec::new(),
                         span: ledger.entry_schema.span,
                         message: format!(
                             "ledger `{}` records undeclared entry type `{}`",
@@ -351,6 +361,7 @@ pub(crate) fn lower_program(
                         code: diagnostic_code!("type.unknown_schema"),
                         severity: Severity::Error,
                         related: Vec::new(),
+                        fixits: Vec::new(),
                         span: counter.key_type.span,
                         message: format!(
                             "counter `{}` keys on undeclared type `{}`",
@@ -394,6 +405,7 @@ pub(crate) fn lower_program(
                     &workflow_contract_names,
                     &mut ir,
                     &mut rule_bodies,
+                    &mut rule_names,
                     &mut diagnostics,
                 )
             }
@@ -429,6 +441,7 @@ pub(crate) fn lower_program(
                     &workflow_contract_names,
                     &mut ir,
                     &mut rule_bodies,
+                    &mut rule_names,
                     &mut diagnostics,
                 )
             }
@@ -500,13 +513,20 @@ fn lower_assert(
     ir: &mut IrProgram,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
-    match parse_expression(&assertion.expr) {
-        Ok(expr) => {
+    // The origin the parser RECORDED, not `span.start`. The two agree for every
+    // assertion cut straight from the file, and disagree for one a `pattern`
+    // expansion rewrote underneath: the text is no longer the file's, the span
+    // still names the file, and resolving one against the other put the caret
+    // on an unrelated line. `source_text_anchor` degrades instead (D10).
+    let at = source_text_anchor(&assertion.expr, assertion.span);
+    match parse_expression_spanned(&assertion.expr) {
+        Ok((expr, spans)) => {
             validate_parsed_expression(
                 &expr,
+                &spans,
                 semantic,
                 &ExprScope::default(),
-                &ExprValidationContext::assertion(assertion.span),
+                &ExprValidationContext::assertion(at),
                 "assertion",
                 diagnostics,
             );
@@ -514,19 +534,20 @@ fn lower_assert(
             sort_projection_reads(&mut projection_reads);
             ir.assertions.push(IrAssertion {
                 expr: IrExpression {
-                    source: assertion.expr,
+                    source: assertion.expr.into_string(),
                     expr,
                     span: assertion.span,
                 },
                 projection_reads,
             });
         }
-        Err(message) => diagnostics.push(Diagnostic {
+        Err(error) => diagnostics.push(Diagnostic {
             code: diagnostic_code!("parse.invalid_expression"),
             severity: Severity::Error,
             related: Vec::new(),
-            span: assertion.span,
-            message: format!("invalid assertion expression: {message}"),
+            fixits: Vec::new(),
+            span: error.range.map_or_else(|| at.whole(), |range| at.at(range)),
+            message: format!("invalid assertion expression: {}", error.message),
             suggestion: Some(
                 "use a deterministic expression such as `count(Fact) == 1`".to_owned(),
             ),
@@ -554,9 +575,18 @@ fn lower_workflow_contract(
     ir: &mut IrProgram,
     schema_names: &BTreeSet<String>,
     agent_names: &BTreeSet<String>,
+    semantic: &SemanticContext,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
     validate_type_refs(&contract.ty, schema_names, agent_names, diagnostics);
+    crate::validate_declared_terminal_payload_contract(
+        &contract.kind,
+        &contract.name.name,
+        &contract.ty,
+        schema_names,
+        semantic,
+        diagnostics,
+    );
     let kind = match contract.kind {
         WorkflowContractKind::Input => IrWorkflowContractKind::Input,
         WorkflowContractKind::Output => IrWorkflowContractKind::Output,
@@ -587,6 +617,7 @@ fn lower_use(use_decl: UseDecl, ir: &mut IrProgram, diagnostics: &mut Vec<Diagno
             code: diagnostic_code!("package_set.unknown_package"),
             severity: Severity::Error,
             related: Vec::new(),
+            fixits: Vec::new(),
             span: use_decl.name.span,
             message: format!("unknown standard package `{}`", use_decl.name.value),
             suggestion: Some(crate::suggest_then_keyword(
@@ -616,6 +647,7 @@ fn lower_tracker(tracker: TrackerDecl, ir: &mut IrProgram, diagnostics: &mut Vec
             code: diagnostic_code!("provider.feature_unavailable"),
             severity: Severity::Error,
             related: Vec::new(),
+            fixits: Vec::new(),
             span: tracker.provider.span,
             message: format!(
                 "tracker `{}` uses unavailable provider `{}`",
@@ -646,6 +678,7 @@ fn lower_region(region: RegionDecl, ir: &mut IrProgram, diagnostics: &mut Vec<Di
             code: diagnostic_code!("construct.duplicate_declaration"),
             severity: Severity::Error,
             related: Vec::new(),
+            fixits: Vec::new(),
             span: region.name.span,
             message: format!("duplicate region `{}`", region.name.name),
             suggestion: Some(
@@ -676,6 +709,7 @@ fn lower_stream(stream: StreamDecl, ir: &mut IrProgram, diagnostics: &mut Vec<Di
                 code: diagnostic_code!("construct.duplicate_declaration"),
                 severity: Severity::Error,
                 related: Vec::new(),
+                fixits: Vec::new(),
                 span: stream.name.span,
                 message: format!("duplicate stream `{}`", stream.name.name),
                 suggestion: Some(format!(
@@ -714,6 +748,7 @@ fn lower_channel(channel: ChannelDecl, ir: &mut IrProgram, diagnostics: &mut Vec
                 code: diagnostic_code!("construct.duplicate_declaration"),
                 severity: Severity::Error,
                 related: Vec::new(),
+                fixits: Vec::new(),
                 span: channel.name.span,
                 message: format!("channel `{}` is declared more than once", channel.name.name),
                 suggestion: Some("give each channel a unique name".to_owned()),
@@ -737,6 +772,7 @@ fn lower_channel(channel: ChannelDecl, ir: &mut IrProgram, diagnostics: &mut Vec
             code: diagnostic_code!("construct.unknown_provider"),
             severity: Severity::Error,
             related: Vec::new(),
+            fixits: Vec::new(),
             span: channel.provider.span,
             message: format!(
                 "channel `{}` names unknown messaging provider `{}`",
@@ -782,6 +818,7 @@ fn lower_vault(vault: VaultDecl, ir: &mut IrProgram, diagnostics: &mut Vec<Diagn
                 code: diagnostic_code!("construct.duplicate_declaration"),
                 severity: Severity::Error,
                 related: Vec::new(),
+                fixits: Vec::new(),
                 span: vault.span,
                 message: format!("vault `{}` is declared more than once", vault.name.name),
                 suggestion: Some("give each vault a unique name".to_owned()),
@@ -800,6 +837,7 @@ fn lower_vault(vault: VaultDecl, ir: &mut IrProgram, diagnostics: &mut Vec<Diagn
             code: diagnostic_code!("construct.unknown_option"),
             severity: Severity::Error,
             related: Vec::new(),
+            fixits: Vec::new(),
             span: vault.kind.span,
             message: format!(
                 "vault `{}` names unknown kind `{}`",
@@ -819,6 +857,7 @@ fn lower_vault(vault: VaultDecl, ir: &mut IrProgram, diagnostics: &mut Vec<Diagn
                 code: diagnostic_code!("construct.unknown_option"),
                 severity: Severity::Error,
                 related: Vec::new(),
+                fixits: Vec::new(),
                 span: entry.span,
                 message: format!(
                     "vault `{}` allows unknown operation `{}`",
@@ -846,6 +885,7 @@ fn lower_vault(vault: VaultDecl, ir: &mut IrProgram, diagnostics: &mut Vec<Diagn
                     code: diagnostic_code!("construct.incompatible_clause"),
                     severity: Severity::Error,
                     related: Vec::new(),
+                    fixits: Vec::new(),
                     span: entry.span,
                     message: format!(
                         "vault `{}` is `{normalized}` and allows `{}`, which that kind cannot perform",
@@ -874,6 +914,7 @@ fn lower_vault(vault: VaultDecl, ir: &mut IrProgram, diagnostics: &mut Vec<Diagn
                 code: diagnostic_code!("construct.unknown_option"),
                 severity: Severity::Error,
                 related: Vec::new(),
+                fixits: Vec::new(),
                 span: policy.span,
                 message: format!(
                     "vault `{}` names unknown retention `{}`",
@@ -913,6 +954,7 @@ fn lower_credential(
                 code: diagnostic_code!("construct.duplicate_declaration"),
                 severity: Severity::Error,
                 related: Vec::new(),
+                fixits: Vec::new(),
                 span: credential.span,
                 message: format!(
                     "credential `{}` is declared more than once",
@@ -935,6 +977,7 @@ fn lower_credential(
             code: diagnostic_code!("construct.unknown_option"),
             severity: Severity::Error,
             related: Vec::new(),
+            fixits: Vec::new(),
             span: credential.kind.span,
             message: format!(
                 "credential `{}` names unknown kind `{}`",
@@ -967,6 +1010,7 @@ fn lower_credential(
                 code: diagnostic_code!("construct.unknown_option"),
                 severity: Severity::Error,
                 related: Vec::new(),
+                fixits: Vec::new(),
                 span: entry.span,
                 message: format!(
                     "credential `{}` allows unknown operation `{}`",
@@ -994,6 +1038,7 @@ fn lower_credential(
                     code: diagnostic_code!("construct.incompatible_clause"),
                     severity: Severity::Error,
                     related: Vec::new(),
+                    fixits: Vec::new(),
                     span: entry.span,
                     message: format!(
                         "credential `{}` is `{normalized}` and allows `{}`, which that kind cannot perform",
@@ -1028,6 +1073,7 @@ fn lower_gauge(gauge: GaugeDecl, ir: &mut IrProgram, diagnostics: &mut Vec<Diagn
                 code: diagnostic_code!("construct.duplicate_declaration"),
                 severity: Severity::Error,
                 related: Vec::new(),
+                fixits: Vec::new(),
                 span: gauge.name.span,
                 message: format!("gauge `{}` is declared more than once", gauge.name.name),
                 suggestion: Some("give each gauge a unique name".to_owned()),
@@ -1073,6 +1119,7 @@ fn lower_mark(mark: MarkDecl, ir: &mut IrProgram, diagnostics: &mut Vec<Diagnost
                 code: diagnostic_code!("construct.duplicate_declaration"),
                 severity: Severity::Error,
                 related: Vec::new(),
+                fixits: Vec::new(),
                 span: mark.name.span,
                 message: format!("mark `{}` is declared more than once", mark.name.value),
                 suggestion: Some("give each mark a unique name".to_owned()),
@@ -1099,6 +1146,7 @@ fn lower_campaign(campaign: CampaignDecl, ir: &mut IrProgram, diagnostics: &mut 
                 code: diagnostic_code!("construct.duplicate_declaration"),
                 severity: Severity::Error,
                 related: Vec::new(),
+                fixits: Vec::new(),
                 span: campaign.name.span,
                 message: format!(
                     "campaign `{}` is declared more than once",
@@ -1189,6 +1237,7 @@ fn lower_agent(
                 code: diagnostic_code!("type.unknown_harness"),
                 severity: Severity::Error,
                 related: Vec::new(),
+                fixits: Vec::new(),
                 span: harness.span,
                 message: format!(
                     "agent `{}` uses unknown harness `{}`",
@@ -1217,6 +1266,7 @@ fn lower_agent(
                 code: diagnostic_code!("construct.incompatible_clause"),
                 severity: Severity::Error,
                 related: Vec::new(),
+                fixits: Vec::new(),
                 span: delegate.span,
                 message: format!(
                     "agent `{}` delegates to `{}`, which is a managed kind",
@@ -1244,6 +1294,7 @@ fn lower_agent(
                         code: diagnostic_code!("construct.duplicate_field"),
                         severity: Severity::Error,
                         related: Vec::new(),
+                        fixits: Vec::new(),
                         span: provider.span,
                         message: format!(
                             "agent `{}` declares provider more than once",
@@ -1259,6 +1310,7 @@ fn lower_agent(
                         code: diagnostic_code!("construct.cardinality_conflict"),
                         severity: Severity::Error,
                         related: Vec::new(),
+                        fixits: Vec::new(),
                         span: provider.span,
                         message: format!(
                             "agent `{}` declares both `using` harness and direct provider `{}`",
@@ -1275,6 +1327,7 @@ fn lower_agent(
                         code: diagnostic_code!("construct.cardinality_conflict"),
                         severity: Severity::Error,
                         related: Vec::new(),
+                        fixits: Vec::new(),
                         span: provider.span,
                         message: format!(
                             "agent `{}` declares both `delegated to` and direct provider `{}`",
@@ -1298,6 +1351,7 @@ fn lower_agent(
                         code: diagnostic_code!("construct.invalid_clause_value"),
                         severity: Severity::Error,
                         related: Vec::new(),
+                        fixits: Vec::new(),
                         span,
                         message: format!(
                             "agent `{}` capacity must be greater than zero",
@@ -1316,6 +1370,7 @@ fn lower_agent(
                             code: diagnostic_code!("construct.duplicate_field"),
                             severity: Severity::Error,
                             related: Vec::new(),
+                            fixits: Vec::new(),
                             span: skill.span,
                             message: format!(
                                 "agent `{}` attaches skill `{}` more than once",
@@ -1335,6 +1390,7 @@ fn lower_agent(
                             code: diagnostic_code!("construct.duplicate_field"),
                             severity: Severity::Error,
                             related: Vec::new(),
+                            fixits: Vec::new(),
                             span: capability.span,
                             message: format!(
                                 "agent `{}` declares capability `{}` more than once",
@@ -1361,6 +1417,7 @@ fn lower_agent(
                             code: diagnostic_code!("construct.unknown_option"),
                             severity: Severity::Error,
                             related: Vec::new(),
+                            fixits: Vec::new(),
                             span: class.span,
                             message: format!(
                                 "agent `{}` requires unknown feature class `{}`",
@@ -1383,6 +1440,7 @@ fn lower_agent(
                             code: diagnostic_code!("construct.duplicate_field"),
                             severity: Severity::Error,
                             related: Vec::new(),
+                            fixits: Vec::new(),
                             span: class.span,
                             message: format!(
                                 "agent `{}` requires feature class `{}` more than once",
@@ -1402,6 +1460,7 @@ fn lower_agent(
                             code: diagnostic_code!("construct.duplicate_field"),
                             severity: Severity::Error,
                             related: Vec::new(),
+                            fixits: Vec::new(),
                             span: tool.span,
                             message: format!(
                                 "agent `{}` grants tool `{}` more than once",
@@ -1420,6 +1479,7 @@ fn lower_agent(
                         code: diagnostic_code!("construct.duplicate_field"),
                         severity: Severity::Error,
                         related: Vec::new(),
+                        fixits: Vec::new(),
                         span: strategy.span,
                         message: format!(
                             "agent `{}` declares compaction more than once",
@@ -1433,6 +1493,7 @@ fn lower_agent(
                         code: diagnostic_code!("construct.unknown_option"),
                         severity: Severity::Error,
                         related: Vec::new(),
+                        fixits: Vec::new(),
                         span: strategy.span,
                         message: format!(
                             "agent `{}` uses unknown compaction strategy `{}`",
@@ -1455,6 +1516,7 @@ fn lower_agent(
                         code: diagnostic_code!("construct.duplicate_field"),
                         severity: Severity::Error,
                         related: Vec::new(),
+                        fixits: Vec::new(),
                         span: mode.span,
                         message: format!(
                             "agent `{}` declares thread more than once",
@@ -1468,6 +1530,7 @@ fn lower_agent(
                         code: diagnostic_code!("construct.unknown_option"),
                         severity: Severity::Error,
                         related: Vec::new(),
+                        fixits: Vec::new(),
                         span: mode.span,
                         message: format!(
                             "agent `{}` uses unknown thread mode `{}`",
@@ -1490,6 +1553,7 @@ fn lower_agent(
                         code: diagnostic_code!("construct.duplicate_field"),
                         severity: Severity::Error,
                         related: Vec::new(),
+                        fixits: Vec::new(),
                         span: sources.span,
                         message: format!(
                             "agent `{}` declares settings more than once",
@@ -1503,6 +1567,7 @@ fn lower_agent(
                         code: diagnostic_code!("construct.unknown_option"),
                         severity: Severity::Error,
                         related: Vec::new(),
+                        fixits: Vec::new(),
                         span: sources.span,
                         message: format!(
                             "agent `{}` uses unknown settings source `{}`",
@@ -1523,6 +1588,7 @@ fn lower_agent(
                     code: diagnostic_code!("construct.unknown_clause"),
                     severity: Severity::Error,
                     related: Vec::new(),
+                    fixits: Vec::new(),
                     span: name.span,
                     message: format!(
                         "unknown agent field `{}` on agent `{}`",
@@ -1590,6 +1656,7 @@ fn lower_agent(
                     code: diagnostic_code!("construct.incompatible_clause"),
                     severity: Severity::Error,
                     related: Vec::new(),
+                    fixits: Vec::new(),
                     span,
                     message: format!(
                         "agent `{}` is delegated; `compaction` is a managed-harness knob",
@@ -1606,6 +1673,7 @@ fn lower_agent(
                     code: diagnostic_code!("construct.incompatible_clause"),
                     severity: Severity::Error,
                     related: Vec::new(),
+                    fixits: Vec::new(),
                     span,
                     message: format!(
                         "agent `{}` is delegated; `thread` is a managed-harness knob",
@@ -1622,6 +1690,7 @@ fn lower_agent(
                 code: diagnostic_code!("construct.incompatible_clause"),
                 severity: Severity::Error,
                 related: Vec::new(),
+                fixits: Vec::new(),
                 span,
                 message: format!(
                     "agent `{}` is managed; `settings` is a delegated-harness knob",
@@ -1659,6 +1728,7 @@ fn lower_enum(enum_decl: EnumDecl, ir: &mut IrProgram, diagnostics: &mut Vec<Dia
                 code: diagnostic_code!("construct.duplicate_field"),
                 severity: Severity::Error,
                 related: Vec::new(),
+                fixits: Vec::new(),
                 span: variant.span,
                 message: format!(
                     "enum `{}` declares variant `{}` more than once",
@@ -1677,6 +1747,7 @@ fn lower_enum(enum_decl: EnumDecl, ir: &mut IrProgram, diagnostics: &mut Vec<Dia
                     code: diagnostic_code!("construct.reserved_name"),
                     severity: Severity::Error,
                     related: Vec::new(),
+                    fixits: Vec::new(),
                     span: field.name.span,
                     message: format!(
                         "variant `{}` of enum `{}` declares reserved field `variant`",
@@ -1741,6 +1812,7 @@ fn lower_test(test: TestDecl, ir: &mut IrProgram, diagnostics: &mut Vec<Diagnost
                 code: diagnostic_code!("construct.duplicate_declaration"),
                 severity: Severity::Error,
                 related: Vec::new(),
+                fixits: Vec::new(),
                 span: test.name.span,
                 message: format!("test `{}` is declared more than once", test.name.value),
                 suggestion: Some("give each test scenario a distinct name".to_owned()),
@@ -1757,6 +1829,7 @@ fn lower_test(test: TestDecl, ir: &mut IrProgram, diagnostics: &mut Vec<Diagnost
             code: diagnostic_code!("construct.missing_requirement"),
             severity: Severity::Error,
             related: Vec::new(),
+            fixits: Vec::new(),
             span: test.span,
             message: format!("test `{}` has no `expect` clause", test.name.value),
             suggestion: Some("a test must assert at least one expected outcome".to_owned()),
@@ -1821,6 +1894,7 @@ fn lower_source(
                 code: diagnostic_code!("construct.duplicate_declaration"),
                 severity: Severity::Error,
                 related: Vec::new(),
+                fixits: Vec::new(),
                 span: source.name.span,
                 message: format!("source `{}` is declared more than once", source.name.name),
                 suggestion: Some("remove the duplicate source declaration".to_owned()),
@@ -1838,6 +1912,7 @@ fn lower_source(
                 code: diagnostic_code!("construct.missing_requirement"),
                 severity: Severity::Error,
                 related: Vec::new(),
+                fixits: Vec::new(),
                 span: clock.span,
                 message: format!(
                     "recurring source `{}` must declare a `missed` policy",
@@ -1868,6 +1943,7 @@ fn lower_source(
                 code: diagnostic_code!("construct.missing_timezone"),
                 severity: Severity::Warning,
                 related: Vec::new(),
+                fixits: Vec::new(),
                 span: clock.span,
                 message: format!(
                     "calendar source `{}` should declare a `timezone`",
@@ -1890,6 +1966,7 @@ fn lower_source(
             code: diagnostic_code!("construct.missing_requirement"),
             severity: Severity::Error,
             related: Vec::new(),
+            fixits: Vec::new(),
             span: source.span,
             message: format!(
                 "`file` source `{}` requires a `path` or `watch` clause",
@@ -1907,6 +1984,7 @@ fn lower_source(
             code: diagnostic_code!("construct.cardinality_conflict"),
             severity: Severity::Error,
             related: Vec::new(),
+            fixits: Vec::new(),
             span: source
                 .watch
                 .as_ref()
@@ -1929,6 +2007,7 @@ fn lower_source(
                 code: diagnostic_code!("construct.incompatible_clause"),
                 severity: Severity::Error,
                 related: Vec::new(),
+                fixits: Vec::new(),
                 span: path.span,
                 message: format!(
                     "source `{}` declares a `path` clause but its provider is `{}`, not `file`",
@@ -1944,6 +2023,7 @@ fn lower_source(
                 code: diagnostic_code!("construct.incompatible_clause"),
                 severity: Severity::Error,
                 related: Vec::new(),
+                fixits: Vec::new(),
                 span: watch.span,
                 message: format!(
                     "source `{}` declares a `watch` clause but its provider is `{}`, not `file`",
@@ -1968,6 +2048,7 @@ fn lower_source(
             code: diagnostic_code!("construct.missing_requirement"),
             severity: Severity::Error,
             related: Vec::new(),
+            fixits: Vec::new(),
             span: source.span,
             message: format!(
                 "`http` source `{}` declares neither `url` nor `path`, so it neither polls \
@@ -1992,6 +2073,7 @@ fn lower_source(
                     code: diagnostic_code!("construct.invalid_clause_value"),
                     severity: Severity::Error,
                     related: Vec::new(),
+                    fixits: Vec::new(),
                     span: url.span,
                     message: format!(
                         "`http` source `{}` url `{}` is not an absolute http(s) URL",
@@ -2011,6 +2093,7 @@ fn lower_source(
                 code: diagnostic_code!("construct.incompatible_clause"),
                 severity: Severity::Error,
                 related: Vec::new(),
+                fixits: Vec::new(),
                 span: url.span,
                 message: format!(
                     "source `{}` declares a `url` clause but its provider is `{}`, not `http`",
@@ -2044,6 +2127,7 @@ fn lower_source(
                 code: diagnostic_code!("construct.incompatible_clause"),
                 severity: Severity::Error,
                 related: Vec::new(),
+                fixits: Vec::new(),
                 span,
                 message: format!(
                     "source `{}` declares a `dedup` clause but its provider is `{}`{}",
@@ -2069,6 +2153,7 @@ fn lower_source(
                         code: diagnostic_code!("construct.invalid_clause_value"),
                         severity: Severity::Error,
                         related: Vec::new(),
+                        fixits: Vec::new(),
                         span,
                         message: format!(
                             "source `{}` `dedup` must name one observation field off the \
@@ -2090,6 +2175,7 @@ fn lower_source(
     let inbound = source.endpoint.is_some();
     if inbound && source.url.is_some() {
         diagnostics.push(Diagnostic {
+            fixits: Vec::new(),
             code: diagnostic_code!("construct.incompatible_clause"),
             severity: Severity::Error,
             related: Vec::new(),
@@ -2111,6 +2197,7 @@ fn lower_source(
     // rather than at the first forged delivery.
     if inbound && source.auth.is_none() {
         diagnostics.push(Diagnostic {
+            fixits: Vec::new(),
             code: diagnostic_code!("construct.missing_requirement"),
             severity: Severity::Error,
             related: Vec::new(),
@@ -2128,6 +2215,7 @@ fn lower_source(
     if let Some(auth) = &source.auth {
         if !inbound {
             diagnostics.push(Diagnostic {
+                fixits: Vec::new(),
                 code: diagnostic_code!("construct.incompatible_clause"),
                 severity: Severity::Error,
                 related: Vec::new(),
@@ -2152,6 +2240,7 @@ fn lower_source(
         };
         if !inbound {
             diagnostics.push(Diagnostic {
+                fixits: Vec::new(),
                 code: diagnostic_code!("construct.incompatible_clause"),
                 severity: Severity::Error,
                 related: Vec::new(),
@@ -2183,6 +2272,7 @@ fn lower_source(
                 }
                 _ => {
                     diagnostics.push(Diagnostic {
+                        fixits: Vec::new(),
                         code: diagnostic_code!("construct.invalid_clause_value"),
                         severity: Severity::Error,
                         related: Vec::new(),
@@ -2261,6 +2351,7 @@ fn lower_event(event: EventDecl, ir: &mut IrProgram, diagnostics: &mut Vec<Diagn
                 code: diagnostic_code!("construct.duplicate_declaration"),
                 severity: Severity::Error,
                 related: Vec::new(),
+                fixits: Vec::new(),
                 span: event.name_span,
                 message: format!("signal `{}` is declared more than once", event.name),
                 suggestion: Some("remove the duplicate signal declaration".to_owned()),
@@ -2275,6 +2366,7 @@ fn lower_event(event: EventDecl, ir: &mut IrProgram, diagnostics: &mut Vec<Diagn
                 code: diagnostic_code!("construct.duplicate_field"),
                 severity: Severity::Error,
                 related: Vec::new(),
+                fixits: Vec::new(),
                 span: field.name.span,
                 message: format!(
                     "signal `{}` declares field `{}` more than once",
@@ -2319,6 +2411,7 @@ fn lower_class(
                 code: diagnostic_code!("construct.duplicate_field"),
                 severity: Severity::Error,
                 related: Vec::new(),
+                fixits: Vec::new(),
                 span: field.name.span,
                 message: format!(
                     "class `{}` declares field `{}` more than once",
@@ -2344,6 +2437,7 @@ fn lower_class(
                 code: diagnostic_code!("construct.cardinality_conflict"),
                 severity: Severity::Error,
                 related: Vec::new(),
+                fixits: Vec::new(),
                 span: field.span,
                 message: format!(
                     "class `{}` declares more than one `@key` field",
@@ -2379,6 +2473,7 @@ fn lower_table(
     workflow_contract_names: &WorkflowContractNames,
     ir: &mut IrProgram,
     rule_bodies: &mut Vec<BlockSource>,
+    rule_names: &mut BTreeMap<String, SourceSpan>,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
     if !semantic.schemas.class_exists(&table.schema.name) {
@@ -2386,6 +2481,7 @@ fn lower_table(
             code: diagnostic_code!("type.unknown_schema"),
             severity: Severity::Error,
             related: Vec::new(),
+            fixits: Vec::new(),
             span: table.schema.span,
             message: format!(
                 "table `{}` targets unknown class `{}`",
@@ -2405,6 +2501,7 @@ fn lower_table(
             code: diagnostic_code!("construct.missing_requirement"),
             severity: Severity::Error,
             related: Vec::new(),
+            fixits: Vec::new(),
             span: table.span,
             message: format!("table `{}` has no rows", table.name.name),
             suggestion: Some("add at least one `{ ... }` row".to_owned()),
@@ -2434,15 +2531,12 @@ fn lower_table(
         tags: Vec::new(),
         description: None,
         whens: vec![WhenClause {
-            text: "started".to_owned(),
+            // Synthesized from the table declaration; not in the file.
+            text: SourceText::generated("started".to_owned()),
             span: table.name.span,
         }],
-        body: BlockSource {
-            text: body,
-            span: table.span,
-            // Synthesized from the table's rows; the text is not in the file.
-            origin: BodyOrigin::Generated,
-        },
+        // Synthesized from the table's rows; the text is not in the file.
+        body: BlockSource::generated(body, table.span),
         span: table.span,
     };
 
@@ -2456,22 +2550,39 @@ fn lower_table(
         })
         .collect::<Vec<_>>();
 
-    let rule_name = rule.name.name.clone();
+    // The seeder rule this just lowered is the one it PUSHED, found by position
+    // rather than by searching `ir.rules` for its name. A name is not an
+    // identity here — that is the whole of the duplicate-rule-name refusal — and
+    // a search answers with whichever rule happens to carry it.
+    //
+    // The length check is not decoration. `lower_rule` DECLINES to push a
+    // duplicate, so `last_mut()` on its own would hang this table's rows on some
+    // earlier rule, and `record_sources` renders into `to_snapshot`: the
+    // misattachment would reach the `.ir` golden as one table's rows under
+    // another's name. Two tables sharing a name is the way in, and that program
+    // is now refused for the collision before anything reads its IR — so this is
+    // correct by construction rather than observable, and no test can watch it
+    // from outside. The assertion below is what watches it instead, and it fires
+    // the day a second reason for declining a push appears.
+    let before = ir.rules.len();
+    let seeder = rule.name.name.clone();
     lower_rule(
         rule,
         semantic,
         workflow_contract_names,
         ir,
         rule_bodies,
+        rule_names,
         diagnostics,
     );
-    if let Some(rule) = ir
-        .rules
-        .iter_mut()
-        .rev()
-        .find(|rule| rule.name == rule_name)
-    {
-        rule.metadata.record_sources = record_sources;
+    if ir.rules.len() == before + 1 {
+        if let Some(rule) = ir.rules.last_mut() {
+            debug_assert_eq!(
+                rule.name, seeder,
+                "a table's rows are about to be attached to a rule it did not lower"
+            );
+            rule.metadata.record_sources = record_sources;
+        }
     }
 }
 
@@ -2489,6 +2600,7 @@ fn lower_coerce(
                 code: diagnostic_code!("construct.duplicate_field"),
                 severity: Severity::Error,
                 related: Vec::new(),
+                fixits: Vec::new(),
                 span: param.name.span,
                 message: format!(
                     "coerce `{}` declares parameter `{}` more than once",
@@ -2518,7 +2630,7 @@ fn lower_coerce(
             .collect(),
         output: lower_type(coerce.output),
         provider: coerce_declared_provider(&coerce.body.text),
-        body: coerce.body.text,
+        body: coerce.body.text.into_string(),
     });
 }
 
@@ -2528,8 +2640,42 @@ fn lower_rule(
     workflow_contract_names: &WorkflowContractNames,
     ir: &mut IrProgram,
     rule_bodies: &mut Vec<BlockSource>,
+    rule_names: &mut BTreeMap<String, SourceSpan>,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
+    // A rule NAME is the rule's identity everywhere outside this vector's
+    // ordering, and there is no position to fall back on in any of those
+    // places: `rule_dependencies` is a graph over names, a `mark` names its
+    // site, a DR-0043 region names its rules, `source_tags` and
+    // `source_descriptions` are keyed by name, and the runtime matches a firing
+    // to its rule group by `firing.rule`. Two rules sharing one name are
+    // therefore ONE rule to the kernel, to every report the compiler prints,
+    // and to the durable record of what fired — and inside the compiler they
+    // were already producing wrong answers, from `lower_table` attaching a
+    // table's row sources to whichever same-named rule it found first to a
+    // write-policy caret landing on a statement that performs no write. The
+    // collision is refused rather than resolved, because the alternative is a
+    // positional identity that a log, a report and a person's `mark site` all
+    // have no way to spell. D14, spec/diagnostic-quality-tracker.md.
+    if let Some(first) = rule_names.get(&rule.name.name) {
+        diagnostics.push(
+            Diagnostic {
+                code: diagnostic_code!("construct.duplicate_declaration"),
+                severity: Severity::Error,
+                related: Vec::new(),
+                fixits: Vec::new(),
+                span: rule.name.span,
+                message: format!("rule `{}` is declared more than once", rule.name.name),
+                suggestion: Some(
+                    "give each rule a unique name; the name is what the effect graph, `mark` sites and the run record address it by"
+                        .to_owned(),
+                ),
+            }
+            .with_related(*first, "first declared here"),
+        );
+        return;
+    }
+    rule_names.insert(rule.name.name.clone(), rule.name.span);
     validate_canonical_rule_body_syntax(&rule, diagnostics);
     // Statement-form gate: every body must parse into the body AST. Unknown
     // statements, malformed modifiers, and unclosed blocks are spanned errors
@@ -2559,37 +2705,34 @@ fn lower_rule(
     // can.
     //
     // Pushed BESIDE the rule, in the same statement, rather than into a map
-    // keyed by rule name: the compiler accepts two rules with the same name in
-    // one workflow (a hole recorded as D14), and a name-keyed map kept only the
-    // last, so the write-policy check re-parsed one rule's body against
-    // ANOTHER's origin and put the caret on a statement that performs no write.
-    // Position cannot collide.
+    // keyed by rule name. Two rules sharing a name are refused above (D14), but
+    // the pairing does not lean on that: a name-keyed map kept only the last, so
+    // the write-policy check re-parsed one rule's body against ANOTHER's origin
+    // and put the caret on a statement that performs no write. Position cannot
+    // collide.
     rule_bodies.push(rule.body.clone());
     ir.rules.push(IrRule {
         name: rule.name.name,
         kind: rule.kind,
         whens: rule.whens.into_iter().map(lower_when_clause).collect(),
-        body: rule.body.text,
+        body: rule.body.text.into_string(),
         metadata,
     });
 }
 
 fn lower_when_clause(when: WhenClause) -> IrWhen {
-    let source = when.text;
-    let (pattern, guard_source) = split_when_guard(&source);
+    let (pattern, guard_source) = split_when_guard(&when.text);
     let pattern = pattern.to_owned();
     let guard = guard_source.and_then(|guard_source| {
-        let guard_offset = source.find(guard_source).unwrap_or(0);
-        lower_expression(
-            guard_source,
-            SourceSpan {
-                start: when.span.start + guard_offset,
-                end: when.span.start + guard_offset + guard_source.len(),
-            },
-        )
+        // `when.span.start + offset` was the same reconstruction D2b deleted
+        // everywhere else: right for a clause cut from the file, a lie for one
+        // a `pattern` expansion rewrote underneath. Ask the text where it came
+        // from, and report the whole clause when it will not say.
+        let span = when_guard_span(&when, guard_source);
+        lower_expression(guard_source, span)
     });
     IrWhen {
-        source,
+        source: when.text.into_string(),
         pattern,
         guard,
         span: when.span,

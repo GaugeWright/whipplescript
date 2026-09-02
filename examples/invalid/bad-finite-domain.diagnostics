@@ -1,36 +1,36 @@
 error[type.invalid_literal]: rule `invalid_guard_literal` compares finite-domain value to unknown `gpt5`
-   --> examples/invalid/bad-finite-domain.whip:15:8
+   --> examples/invalid/bad-finite-domain.whip:15:27
    |
 15 |   when Task as task where task.provider == "gpt5"
-   |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |                           ^^^^^^^^^^^^^^^^^^^^^^^
    = help: use one of: codex, claude
 error[type.invalid_literal]: rule `invalid_enum_variant` compares finite-domain value to unknown `Missing`
-   --> examples/invalid/bad-finite-domain.whip:20:8
+   --> examples/invalid/bad-finite-domain.whip:20:27
    |
 20 |   when Task as task where Missing == task.status
-   |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |                           ^^^^^^^^^^^^^^^^^^^^^^
    = help: use one of: Accept, Revise
 error[type.invalid_literal]: rule `invalid_membership_literal` compares finite-domain value to unknown `bad`
-   --> examples/invalid/bad-finite-domain.whip:25:8
+   --> examples/invalid/bad-finite-domain.whip:25:27
    |
 25 |   when Task as task where task.provider in ["codex", "bad"]
-   |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
    = help: use one of: codex, claude
 error[type.invalid_literal]: rule `implicit_query_invalid_variant` compares finite-domain value to unknown `Missing`
-   --> examples/invalid/bad-finite-domain.whip:30:8
+   --> examples/invalid/bad-finite-domain.whip:30:45
    |
 30 |   when Task as task where exists(Task where status == Missing)
-   |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |                                             ^^^^^^^^^^^^^^^^^
    = help: use one of: Accept, Revise
 error[expr.unsatisfiable_comparison]: rule `impossible_domain_equality` has statically unsatisfiable finite-domain equality
-   --> examples/invalid/bad-finite-domain.whip:35:8
+   --> examples/invalid/bad-finite-domain.whip:35:27
    |
 35 |   when Task as task where task.provider == task.route
-   |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^
    = help: compare domains with at least one shared value; left: codex, claude, right: gpt5, coerce
 error[expr.unsatisfiable_comparison]: rule `impossible_domain_membership` has statically unsatisfiable finite-domain exclusion
-   --> examples/invalid/bad-finite-domain.whip:40:8
+   --> examples/invalid/bad-finite-domain.whip:40:27
    |
 40 |   when Task as task where task.provider not in ["codex", "claude"]
-   |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
    = help: leave at least one domain value outside the exclusion set

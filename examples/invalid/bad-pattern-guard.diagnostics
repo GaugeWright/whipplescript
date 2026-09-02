@@ -1,0 +1,6 @@
+error[expr.non_numeric_operand]: rule `triage_shout` uses arithmetic with a non-numeric operand
+   --> examples/invalid/bad-pattern-guard.whip:37:10
+   |
+37 |     when Input as item where item.title + 1 > 2
+   |          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   = help: use `+ - * /` only with int or float values

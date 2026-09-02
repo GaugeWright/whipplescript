@@ -66,6 +66,33 @@ follow [Semantic Versioning](https://semver.org). Dates are UTC.
   under the store's own `allow` globs. The material never enters the agent's
   process: the turn names a credential and the custodian substitutes at egress.
 
+### Changed
+
+- **A source span is no longer part of a program's identity** (DR-0095).
+  `ir_hash` is now `stable_hash_hex` of the `.ir` snapshot's *identity
+  projection* — the same document with its source offsets erased. So **a
+  compiler change that only improves a diagnostic span rotates nothing**, and
+  `ir_hash` is stable under formatting changes outside a rule body.
+  `lowered_ir_report.accepted_program_digest` goes through the same projection.
+  The snapshot keeps its spans: `to_snapshot` is unchanged, all 25 `.ir`
+  goldens are byte-identical, and a runtime event is still attributed back to
+  source through them.
+
+  Scope, stated because it is narrower than "formatting is free": a reformat
+  still mints a new program version. A version row is
+  `UNIQUE(program_id, source_hash, ir_hash)` and `source_hash` hashes the
+  source TEXT, so whitespace mints a row through `source_hash` whatever
+  `ir_hash` does. And a rule's `body_hash` is still a digest of its body TEXT,
+  so a blank line *inside* a rule body still moves `ir_hash` — deliberately,
+  because inside a `"""` prompt indentation is prose a model reads.
+
+  **This rotates `ir_hash` once, for every program that exists.** It is the
+  same cost that was already being paid silently on every span fix, paid once
+  deliberately instead, and it lands on the mechanism built for it: a matching
+  `source_hash` with a differing `ir_hash` is re-attested with an
+  `instance.program.reattested` event, not refused. Which programs compile does
+  not change.
+
 ### Fixed
 
 - **A `mint` exchange was invisible to the information-flow checker.** It

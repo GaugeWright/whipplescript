@@ -83,6 +83,16 @@ if cargo run --quiet -p whipplescript -- --json compile \
   echo "expected compile --json with a missing package lock to fail" >&2
   exit 1
 fi
+# A REFUSED program, so the report carries diagnostics rather than artifacts —
+# and this one carries fixits (spec/error-handling.md "Suggestions And Fixits"),
+# which is the only report shape in this gate that does. Without it the `fixit`
+# definitions in check_report_v0 would be validated against nothing.
+if cargo run --quiet -p whipplescript -- --json check \
+  examples/invalid/misspelled-field.whip \
+  > "$TMP_DIR/check-fixits.json"; then
+  echo "expected check --json on examples/invalid/misspelled-field.whip to fail" >&2
+  exit 1
+fi
 cargo run --quiet -p whipplescript -- --store "$TMP_STORE" --json run \
   examples/provider-language-e2e.whip --provider fixture --until idle \
   > "$TMP_DIR/dev.json"
@@ -1968,6 +1978,7 @@ for report_name in [
 
 pairs = [
     ("spec/report-schemas/check_report_v0.schema.json", tmp_dir / "check.json"),
+    ("spec/report-schemas/check_report_v0.schema.json", tmp_dir / "check-fixits.json"),
     ("spec/report-schemas/compile_report_v0.schema.json", tmp_dir / "compile.json"),
     ("spec/report-schemas/compile_report_v0.schema.json", tmp_dir / "event-bridge-compile.json"),
     ("spec/report-schemas/compile_report_v0.schema.json", tmp_dir / "scheduled-escalation-compile.json"),
@@ -2741,6 +2752,47 @@ if compile_error.get("status") != "error":
     raise SystemExit("compile-error.json was not an error report")
 if compile_error.get("error", {}).get("kind") != "package_lock":
     raise SystemExit("compile-error.json did not report package_lock")
+
+# Fixits in a check report (spec/error-handling.md "Suggestions And Fixits").
+# Validating the report against the schema is not enough on its own: the
+# `fixits` property is optional, so a report that carries none validates
+# happily and the definitions would be checking nothing. So the presence is
+# asserted FIRST, and then the schema is shown to bite on a malformed one.
+check_fixits = json.loads((tmp_dir / "check-fixits.json").read_text())
+fixit_bearing = [
+    diagnostic
+    for entry in check_fixits
+    for diagnostic in entry.get("error", {}).get("diagnostics", [])
+    if diagnostic.get("fixits")
+]
+if not fixit_bearing:
+    raise SystemExit(
+        "check-fixits.json carries no fixit, so the check_report_v0 fixit "
+        "definitions are unexercised; pick a fixture whose diagnostics carry one"
+    )
+for diagnostic in fixit_bearing:
+    for fixit in diagnostic["fixits"]:
+        if fixit.get("applicability") not in {"exact", "likely"}:
+            raise SystemExit(f"fixit carried an unknown applicability: {fixit}")
+        if not fixit.get("edits"):
+            raise SystemExit(f"fixit carried no edits: {fixit}")
+check_fixit_validator = Draft202012Validator(
+    json.loads(Path("spec/report-schemas/check_report_v0.schema.json").read_text())
+)
+for mutate, label in [
+    (lambda fixit: fixit.__setitem__("applicability", "probably"), "unknown applicability"),
+    (lambda fixit: fixit.__setitem__("edits", []), "empty edit list"),
+    (lambda fixit: fixit["edits"][0].pop("replacement"), "edit without replacement"),
+    (lambda fixit: fixit["edits"][0].pop("source_span"), "edit without a span"),
+    (lambda fixit: fixit.pop("title"), "fixit without a title"),
+]:
+    bad_fixits = copy.deepcopy(check_fixits)
+    for entry in bad_fixits:
+        for diagnostic in entry.get("error", {}).get("diagnostics", []):
+            for fixit in diagnostic.get("fixits", []):
+                mutate(fixit)
+    assert_schema_rejects(check_fixit_validator, bad_fixits, f"check report with a {label}")
+print("validated check report fixits and that the schema rejects malformed ones")
 
 package_check = json.loads((tmp_dir / "package-memory-check.json").read_text())
 package_graph = package_check[0]["construct_graph"]

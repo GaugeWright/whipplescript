@@ -12,7 +12,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use whipplescript_core::{
     diagnostic_code, ConstructField, ConstructInterface, ConstructRegistration, ContractRegistry,
-    EffectContract, LibraryRegistration, Severity, TypedOutputValidation,
+    DiagnosticCode, EffectContract, LibraryRegistration, Severity, TypedOutputValidation,
     CONSTRUCT_FAMILY_ASSERTION, CONSTRUCT_FAMILY_EFFECT_OPERATION,
     CONSTRUCT_FAMILY_PROJECTION_READ, CONSTRUCT_FAMILY_RULE, CONSTRUCT_FAMILY_SOURCE_DECLARATION,
     CONSTRUCT_INTERFACE_CAPABILITY, CONSTRUCT_INTERFACE_CARDINALITY_EXACTLY_ONE,
@@ -66,15 +66,18 @@ use whipplescript_kernel::{
     ProgramVersionInput,
     RuntimeKernel,
 };
+use whipplescript_parser::snapshot::{
+    identity_hash as ir_identity_hash, identity_projection as ir_identity_projection,
+};
 use whipplescript_parser::suggest_then_keyword;
 use whipplescript_parser::{
     format_program, format_program_preserving_comments, harness_class, lex_comments,
     parse_expression, BinaryOp, DependencyPredicate as IrDependencyPredicate, Diagnostic,
-    EffectStatus as TestEffectStatus, ExpectTarget, Expr, ExprLiteral, ExprObjectField,
-    FormatOutput, GivenClause, HarnessClass, IrConstructUse, IrEffectDependency, IrEffectKind,
-    IrEffectNode, IrExecTarget, IrInclude, IrProgram, IrProjectionRead, IrRule, IrSchema, IrTest,
-    IrType, IrWorkflowContract, IrWorkflowContractKind, Item, ProjQueryKind, QueryKind, RuleStatus,
-    RunKind, SourceSpan, StubPayload, TestClause, TestField, UnaryOp,
+    EffectStatus as TestEffectStatus, ExpectTarget, Expr, ExprLiteral, ExprObjectField, Fixit,
+    FixitEdit, FormatOutput, GivenClause, HarnessClass, IrConstructUse, IrEffectDependency,
+    IrEffectKind, IrEffectNode, IrExecTarget, IrInclude, IrProgram, IrProjectionRead, IrRule,
+    IrSchema, IrTest, IrType, IrWorkflowContract, IrWorkflowContractKind, Item, ProjQueryKind,
+    QueryKind, RuleStatus, RunKind, SourceSpan, StubPayload, TestClause, TestField, UnaryOp,
 };
 #[cfg(feature = "claude")]
 use whipplescript_provider_claude::{
@@ -2246,13 +2249,88 @@ fn python_module_available(python: &str, module: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Whether `code` sits in the namespace `spec/error-handling.md` gives the
+/// linter: "the `lint.*` namespace is owned by the linter; all other namespaces
+/// are owned by `check` / runtime / providers and a lint rule must not reuse
+/// them."
+///
+/// `const` so `lint_diagnostic_code!` can ask it at compile time, and a plain
+/// predicate so the rule is falsifiable by a unit test rather than only by a
+/// build that fails. A prefix test is the whole of it: `DiagnosticCode` has already
+/// established that the string is a registered, well-shaped, reserved-namespace
+/// code, so the only question left is which subsystem owns it.
+const fn is_lint_namespace(code: &str) -> bool {
+    let (bytes, prefix) = (code.as_bytes(), b"lint.");
+    if bytes.len() <= prefix.len() {
+        return false;
+    }
+    let mut index = 0;
+    while index < prefix.len() {
+        if bytes[index] != prefix[index] {
+            return false;
+        }
+        index += 1;
+    }
+    true
+}
+
+/// The door a lint rule's code comes through — the ordinary code macro with the
+/// linter's namespace enforced on the way in.
+///
+/// A lint code is a `DiagnosticCode` like every other, so it is SELECTED from
+/// the one register rather than minted, and `spec/diagnostic-codes.txt` carries
+/// it beside every check-plane code. This macro adds the one rule that is
+/// specific to this producer, and adds it at COMPILE time: a lint rule that
+/// reached for `type.unknown_field` would be emitting a correctness code from
+/// the advisory plane, where a project `whip.lint.json` could then `allow` it
+/// out of existence.
+///
+/// **The name ends in `diagnostic_code` on purpose.** The register scans — the
+/// one in `scripts/regen-diagnostic-codes.sh` and its mirror in
+/// `whipplescript-core`'s `diagnostic_code_ledger` test — read the emitted set
+/// by finding that macro name as a SUBSTRING, which is why they mask
+/// `runtime_diagnostic_code!` before the check-plane pass. Sharing the suffix is
+/// what puts these 25 codes in the register through the same mechanism as
+/// everything else, with no third scan and no list to keep in step. It cannot
+/// rot quietly either: a scan that stopped seeing these would leave the register
+/// without them, and the next build would fail at every one of these call sites.
+macro_rules! lint_diagnostic_code {
+    ($literal:literal) => {{
+        const _: () = assert!(
+            is_lint_namespace($literal),
+            "a lint rule's code must be in the `lint.*` namespace it owns \
+             (spec/error-handling.md \"## Codes\")"
+        );
+        diagnostic_code!($literal)
+    }};
+}
+
 /// One `whip lint` finding: a quality observation beyond the correctness errors
 /// `whip check` reports. Carries a stable code + severity plus the declared entity
 /// `name` it concerns; `span` is resolved from that name against the source so the
 /// finding can point at a location (CLI line/col and LSP diagnostics).
+///
+/// **Deliberately not a `Diagnostic`** (tracker D11). The two share the code
+/// and severity VOCABULARY — `code` is the same non-mintable `DiagnosticCode`
+/// selected from the same register, `severity` is the one shared enum — and
+/// they differ in the two things that are actually different about a lint
+/// finding:
+///
+///  1. it is addressed by DECLARATION NAME, not by span. A rule sees the IR and
+///     names the declaration it is about; `lint_program` resolves that name to
+///     a span once, centrally, against the source. A `Diagnostic`'s span is
+///     mandatory and known at the emission site, and giving a finding one there
+///     would mean handing every rule the source text so it could look one up.
+///  2. it carries a configured ACTION (`allow`/`warn`/`deny`) resolved from
+///     `--allow`/`--deny` over `whip.lint.json` — configuration, a separate axis
+///     from severity, and one no `check` diagnostic has or should have. A
+///     correctness error that a project file could switch off is not a
+///     correctness error.
 #[derive(Debug)]
 struct LintFinding {
-    code: &'static str,
+    /// Selected from the one register through `lint_diagnostic_code!`, which
+    /// pins it to the `lint.*` namespace the linter owns.
+    code: DiagnosticCode,
     severity: Severity,
     message: String,
     /// The top-level declaration this finding is about. Every lint finding concerns
@@ -2358,7 +2436,7 @@ fn lint_unused_coerces(ir: &IrProgram) -> Vec<LintFinding> {
         .iter()
         .filter(|coerce| !called.contains(&coerce.name))
         .map(|coerce| LintFinding {
-            code: "lint.unused_coerce",
+            code: lint_diagnostic_code!("lint.unused_coerce"),
             severity: Severity::Warning,
             message: format!("coerce `{}` is declared but never called", coerce.name),
             name: Some(coerce.name.clone()),
@@ -2393,7 +2471,7 @@ fn lint_missing_coercion_import(ir: &IrProgram) -> Vec<LintFinding> {
         return Vec::new();
     }
     vec![LintFinding {
-        code: "lint.missing_coercion_import",
+        code: lint_diagnostic_code!("lint.missing_coercion_import"),
         severity: Severity::Warning,
         message: "program uses `coerce`/`decide`/`prompt` without `use std.coercion`; add the \
                   import to name the package that configures the schema.coerce backend \
@@ -2437,7 +2515,7 @@ fn lint_missing_coord_import(ir: &IrProgram) -> Vec<LintFinding> {
         return Vec::new();
     }
     vec![LintFinding {
-        code: "lint.missing_coord_import",
+        code: lint_diagnostic_code!("lint.missing_coord_import"),
         severity: Severity::Warning,
         message: "program uses coordination resources (`lease`/`ledger`/`counter`, \
                   `acquire`/`append`/`consume`/`release`) without `use std.coord`; add the \
@@ -2477,7 +2555,7 @@ fn lint_missing_files_import(ir: &IrProgram) -> Vec<LintFinding> {
         return Vec::new();
     }
     vec![LintFinding {
-        code: "lint.missing_files_import",
+        code: lint_diagnostic_code!("lint.missing_files_import"),
         severity: Severity::Warning,
         message: "program uses file stores (`file store`, \
                   `read`/`write`/`import`/`export`) without `use std.files`; add the \
@@ -2525,7 +2603,7 @@ fn lint_missing_tracker_import(ir: &IrProgram) -> Vec<LintFinding> {
         return Vec::new();
     }
     vec![LintFinding {
-        code: "lint.missing_tracker_import",
+        code: lint_diagnostic_code!("lint.missing_tracker_import"),
         severity: Severity::Warning,
         message: "program uses the work tracker (`tracker`, \
                   `file`/`claim`/`release`/`finish`) without `use std.tracker`; add the \
@@ -2573,7 +2651,7 @@ fn lint_missing_ingress_import(ir: &IrProgram) -> Vec<LintFinding> {
         return Vec::new();
     }
     vec![LintFinding {
-        code: "lint.missing_ingress_import",
+        code: lint_diagnostic_code!("lint.missing_ingress_import"),
         severity: Severity::Warning,
         message: "program uses typed signal admission (`signal`, external `source` blocks, \
                   `emit signal … to`) without `use std.ingress`; add the import to name the \
@@ -2603,7 +2681,7 @@ fn lint_missing_agent_import(ir: &IrProgram) -> Vec<LintFinding> {
             }
             if flagged_packages.insert(*package) {
                 findings.push(LintFinding {
-                    code: "lint.missing_agent_import",
+                    code: lint_diagnostic_code!("lint.missing_agent_import"),
                     severity: Severity::Warning,
                     message: format!(
                         "provider kind `{kind}` is contributed by the std package \
@@ -2672,7 +2750,7 @@ fn lint_unused_coerce_results(ir: &IrProgram) -> Vec<LintFinding> {
             }
             if whole_token_count(&rule.body, &binding) == 1 {
                 findings.push(LintFinding {
-                    code: "lint.coerce_result_unused",
+                    code: lint_diagnostic_code!("lint.coerce_result_unused"),
                     severity: Severity::Warning,
                     message: format!(
                         "coerce result `{binding}` in rule `{}` is never used — drop the coercion or handle its result",
@@ -2731,7 +2809,7 @@ fn lint_unused_resources(ir: &IrProgram) -> Vec<LintFinding> {
     for lease in &ir.leases {
         if !tokens.contains(lease.name.as_str()) {
             findings.push(LintFinding {
-                code: "lint.unused_lease",
+                code: lint_diagnostic_code!("lint.unused_lease"),
                 severity: Severity::Warning,
                 message: format!("lease `{}` is declared but never acquired", lease.name),
                 name: Some(lease.name.clone()),
@@ -2742,7 +2820,7 @@ fn lint_unused_resources(ir: &IrProgram) -> Vec<LintFinding> {
     for ledger in &ir.ledgers {
         if !tokens.contains(ledger.name.as_str()) {
             findings.push(LintFinding {
-                code: "lint.unused_ledger",
+                code: lint_diagnostic_code!("lint.unused_ledger"),
                 severity: Severity::Warning,
                 message: format!("ledger `{}` is declared but never appended to", ledger.name),
                 name: Some(ledger.name.clone()),
@@ -2753,7 +2831,7 @@ fn lint_unused_resources(ir: &IrProgram) -> Vec<LintFinding> {
     for counter in &ir.counters {
         if !tokens.contains(counter.name.as_str()) {
             findings.push(LintFinding {
-                code: "lint.unused_counter",
+                code: lint_diagnostic_code!("lint.unused_counter"),
                 severity: Severity::Warning,
                 message: format!("counter `{}` is declared but never consumed", counter.name),
                 name: Some(counter.name.clone()),
@@ -2764,7 +2842,7 @@ fn lint_unused_resources(ir: &IrProgram) -> Vec<LintFinding> {
     for tracker in &ir.trackers {
         if !tokens.contains(tracker.name.as_str()) {
             findings.push(LintFinding {
-                code: "lint.unused_tracker",
+                code: lint_diagnostic_code!("lint.unused_tracker"),
                 severity: Severity::Warning,
                 message: format!(
                     "tracker `{}` is declared but never filed into or claimed",
@@ -2778,7 +2856,7 @@ fn lint_unused_resources(ir: &IrProgram) -> Vec<LintFinding> {
     for file_store in &ir.file_stores {
         if !tokens.contains(file_store.name.as_str()) {
             findings.push(LintFinding {
-                code: "lint.unused_file_store",
+                code: lint_diagnostic_code!("lint.unused_file_store"),
                 severity: Severity::Warning,
                 message: format!(
                     "file store `{}` is declared but never read or written",
@@ -2808,7 +2886,7 @@ fn lint_noop_rules(ir: &IrProgram) -> Vec<LintFinding> {
             })
         })
         .map(|rule| LintFinding {
-            code: "lint.noop_rule",
+            code: lint_diagnostic_code!("lint.noop_rule"),
             severity: Severity::Warning,
             message: format!(
                 "rule `{}` has an empty body — it fires but does nothing",
@@ -2853,8 +2931,16 @@ fn lint_unused_types(source: &str, ir: &IrProgram) -> Vec<LintFinding> {
         .iter()
         .filter_map(|schema| {
             let (name, kind, code) = match schema {
-                IrSchema::Class(class) => (&class.name, "class", "lint.unused_class"),
-                IrSchema::Enum(enum_type) => (&enum_type.name, "enum", "lint.unused_enum"),
+                IrSchema::Class(class) => (
+                    &class.name,
+                    "class",
+                    lint_diagnostic_code!("lint.unused_class"),
+                ),
+                IrSchema::Enum(enum_type) => (
+                    &enum_type.name,
+                    "enum",
+                    lint_diagnostic_code!("lint.unused_enum"),
+                ),
             };
             (freq.get(name.as_str()).copied().unwrap_or(0) == 1).then(|| LintFinding {
                 code,
@@ -2879,7 +2965,7 @@ fn lint_broad_file_grants(ir: &IrProgram) -> Vec<LintFinding> {
         for (kind, globs) in [("read", &store.read_globs), ("write", &store.write_globs)] {
             if globs.iter().any(|glob| is_match_all(glob)) {
                 findings.push(LintFinding {
-                    code: "lint.broad_file_grant",
+                    code: lint_diagnostic_code!("lint.broad_file_grant"),
                     severity: Severity::Warning,
                     message: format!(
                         "file store `{}` grants `{kind}` to everything under its root (`**`) — narrow the glob to the paths actually used",
@@ -2935,7 +3021,7 @@ fn lint_broad_vault_grants(ir: &IrProgram) -> Vec<LintFinding> {
                 .all(|op| vault.allow.iter().any(|a| a == op))
         {
             findings.push(LintFinding {
-                code: "lint.broad_vault_grant",
+                code: lint_diagnostic_code!("lint.broad_vault_grant"),
                 severity: Severity::Warning,
                 message: format!(
                     "vault `{}` allows every operation `{}` can perform ({}) — narrow it to the \
@@ -2952,7 +3038,7 @@ fn lint_broad_vault_grants(ir: &IrProgram) -> Vec<LintFinding> {
         let stays_local = vault.allow.iter().any(|op| !egress(op));
         if reaches_network && stays_local {
             findings.push(LintFinding {
-                code: "lint.broad_vault_grant",
+                code: lint_diagnostic_code!("lint.broad_vault_grant"),
                 severity: Severity::Warning,
                 message: format!(
                     "vault `{}` allows both egress and non-egress operations ({}) — one container \
@@ -2979,7 +3065,7 @@ fn lint_deep_after_nesting(ir: &IrProgram) -> Vec<LintFinding> {
         .iter()
         .filter(|rule| rule.metadata.max_after_depth >= DEEP_AFTER_THRESHOLD)
         .map(|rule| LintFinding {
-            code: "lint.deep_after_nesting",
+            code: lint_diagnostic_code!("lint.deep_after_nesting"),
             severity: Severity::Info,
             message: format!(
                 "rule `{}` nests `after` blocks {} levels deep — consider a `flow` for the sequence",
@@ -3013,7 +3099,7 @@ fn lint_tool_grant_requires_owned_harness(ir: &IrProgram) -> Vec<LintFinding> {
             !direct_owned && !harness_owned
         })
         .map(|agent| LintFinding {
-            code: "lint.tool_grant_requires_owned_harness",
+            code: lint_diagnostic_code!("lint.tool_grant_requires_owned_harness"),
             severity: Severity::Warning,
             message: format!(
                 "agent `{}` grants tools [{}] but does not use the owned harness; `tools` grants only take effect with `provider owned`",
@@ -3084,7 +3170,7 @@ fn lint_mark_consumption_boundaries(ir: &IrProgram) -> Vec<LintFinding> {
                 continue;
             }
             findings.push(LintFinding {
-                code: "lint.mark_off_consumption_boundary",
+                code: lint_diagnostic_code!("lint.mark_off_consumption_boundary"),
                 severity: Severity::Warning,
                 message: format!(
                     "mark `{}` sits off a consumption boundary: pre-cut rule `{}` creates \
@@ -3222,7 +3308,7 @@ fn lint_readmission_unprotected_effects(ir: &IrProgram) -> Vec<LintFinding> {
                 "a rule consumes that class and records it again"
             };
             findings.push(LintFinding {
-                code: "lint.readmission_unprotected_effect",
+                code: lint_diagnostic_code!("lint.readmission_unprotected_effect"),
                 severity: Severity::Warning,
                 message: format!(
                     "rule `{}` runs world-visible work (`{}`) on a trigger that can be \
@@ -3268,7 +3354,7 @@ fn lint_envelope_field_on_payload(ir: &IrProgram) -> Vec<LintFinding> {
                 .envelope_reads_on_payload
                 .iter()
                 .map(move |read| LintFinding {
-                    code: "lint.envelope_field_on_payload",
+                    code: lint_diagnostic_code!("lint.envelope_field_on_payload"),
                     severity: Severity::Warning,
                     message: format!(
                         "rule `{}` reads `{}.{}` off the `Completed` payload of `{}`, whose shape is not statically known; `{}` is a field of the terminal envelope — read it as `{}.{}`",
@@ -3339,12 +3425,20 @@ fn lint_source(
     let config_actions = match load_lint_config(path) {
         Ok(config) => config.unwrap_or_default(),
         Err(error) => {
+            // The linter's INFRASTRUCTURE failure, not a finding: an `error`
+            // severity that spec/editor-tooling.md is explicit is not a
+            // redefinition of `error` for valid source. It has no configured
+            // action to resolve — a broken config cannot be `allow`ed by the
+            // config that is broken — so `deny` is stated rather than looked up.
+            // The code is selected from the same register as every other, so a
+            // typo here fails the build like a typo in a rule's.
+            let internal = lint_diagnostic_code!("lint.internal").as_str();
             if json {
                 let _ = emit_json(json!({
                     "schema": "whipplescript.lint.v0",
                     "path": path,
                     "findings": [{
-                        "code": "lint.internal",
+                        "code": internal,
                         "severity": "error",
                         "default_severity": "error",
                         "configured_action": "deny",
@@ -3352,7 +3446,7 @@ fn lint_source(
                     }],
                 }));
             } else {
-                eprintln!("error: [lint.internal] {error}");
+                eprintln!("error: [{internal}] {error}");
             }
             return Err(ExitCode::FAILURE);
         }
@@ -3380,8 +3474,10 @@ fn lint_source(
     let findings = lint_program(&source, &ir);
     let resolved: Vec<(&LintFinding, LintAction)> = findings
         .iter()
-        .filter(|finding| selected_rules.is_empty() || selected_rules.contains(finding.code))
-        .map(|finding| (finding, action_of(finding.code)))
+        .filter(|finding| {
+            selected_rules.is_empty() || selected_rules.contains(finding.code.as_str())
+        })
+        .map(|finding| (finding, action_of(finding.code.as_str())))
         .filter(|(_, action)| *action != LintAction::Allow)
         .collect();
     let denied = resolved
@@ -3395,7 +3491,7 @@ fn lint_source(
                 .iter()
                 .map(|(finding, action)| {
                     json!({
-                        "code": finding.code,
+                        "code": finding.code.as_str(),
                         "severity": finding.severity.as_str(),
                         // default_severity is the analysis's intrinsic severity;
                         // configured_action is the resolved policy axis (a separate
@@ -3430,7 +3526,7 @@ fn lint_source(
             println!(
                 "{path}{location}: {} [{}] {} ({})",
                 finding.severity.as_str(),
-                finding.code,
+                finding.code.as_str(),
                 finding.message,
                 action.as_str(),
             );
@@ -3880,15 +3976,35 @@ fn check(options: &CliOptions) -> ExitCode {
                 if !sibling_diagnostics.is_empty() {
                     failed = true;
                     if options.json {
+                        // A sibling workflow's diagnostics carry fixits like any
+                        // other, and their offsets are in BUNDLE space. This
+                        // report names one file, so they go into that file's
+                        // coordinates before anything can apply them: an edit
+                        // written at a bundle offset lands elsewhere in the file
+                        // or past its end. Segments are re-resolved rather than
+                        // threaded, because `check_sibling_workflows` hands back
+                        // diagnostics alone; if that resolution fails there is
+                        // nothing to rebase against, so every fixit is dropped
+                        // and the suggestion stands on its own.
+                        let reported = display_path(&path);
+                        let segments = resolve_source_bundle(Path::new(&path))
+                            .map(|bundle| bundle.segments)
+                            .unwrap_or_default();
                         reports.push(json!({
                             "schema": "whipplescript.check_report.v0",
-                            "path": display_path(&path),
+                            "path": reported,
                             "status": "error",
                             "error": {
                                 "kind": "diagnostics",
                                 "diagnostics": sibling_diagnostics
                                     .iter()
-                                    .map(parser_diagnostic_to_json)
+                                    .map(|diagnostic| {
+                                        parser_diagnostic_to_json(
+                                            &diagnostic_with_reported_fixits(
+                                                &reported, &source, &segments, diagnostic,
+                                            ),
+                                        )
+                                    })
                                     .collect::<Vec<_>>(),
                             },
                         }));
@@ -4118,7 +4234,7 @@ fn check(options: &CliOptions) -> ExitCode {
                     "status": "ok",
                     "workflow": ir.workflow.as_str(),
                     "source_hash": stable_hash_hex(&source),
-                    "ir_hash": stable_hash_hex(&snapshot),
+                    "ir_hash": ir_identity_hash(&snapshot),
                     "snapshot": snapshot,
                     "source_metadata": source_metadata_json(&ir),
                     "contract_registry": contract_registry_to_json(&contract_registry),
@@ -4200,15 +4316,23 @@ fn check(options: &CliOptions) -> ExitCode {
             }) => {
                 failed = true;
                 if options.json {
+                    // `path` below is what a consumer will apply the fixits to,
+                    // so the fixits are put into THAT file's coordinates first
+                    // (see `diagnostic_with_reported_fixits`).
+                    let reported = display_path(&path);
                     reports.push(json!({
                         "schema": "whipplescript.check_report.v0",
-                        "path": display_path(&path),
+                        "path": reported,
                         "status": "error",
                         "error": {
                             "kind": "diagnostics",
                             "diagnostics": diagnostics
                                 .iter()
-                                .map(parser_diagnostic_to_json)
+                                .map(|diagnostic| {
+                                    parser_diagnostic_to_json(&diagnostic_with_reported_fixits(
+                                        &reported, &source, &segments, diagnostic,
+                                    ))
+                                })
                                 .collect::<Vec<_>>(),
                         },
                     }));
@@ -4592,6 +4716,7 @@ fn lint_hosted_exec(
                     code: diagnostic_code!("security.raw_exec_disabled"),
                     severity: Severity::Error,
                     related: Vec::new(),
+                    fixits: Vec::new(),
                     span: effect.span,
                     message: "raw `exec \"...\"` is not allowed in hosted exec profile".to_owned(),
                     suggestion: Some(
@@ -4613,6 +4738,7 @@ fn lint_hosted_exec(
                         code: diagnostic_code!("construct.capability_not_declared"),
                         severity: Severity::Error,
                         related: Vec::new(),
+                        fixits: Vec::new(),
                         span: effect.span,
                         message: format!(
                             "exec capability `{name}` is not declared in the script manifest"
@@ -5971,8 +6097,13 @@ fn lowered_ir_report_json_with_digest(
         .get("graph_id")
         .and_then(Value::as_str)
         .unwrap_or("construct_graph:unknown");
+    // DR-0095: the "accepted program" a lowering report names is the LOWERED
+    // program, so this digest is taken over the snapshot's identity projection —
+    // the same document with its source offsets erased. Over the spanned
+    // snapshot it would be rewritten by a compiler change that only moves a
+    // caret, which is the rotation that record exists to stop.
     let accepted_program_digest =
-        sha256_hex(format!("{graph_id}\n{}", ir.to_snapshot()).as_bytes());
+        sha256_hex(format!("{graph_id}\n{}", ir_identity_projection(&ir.to_snapshot())).as_bytes());
     let empty = Vec::new();
     let nodes = construct_graph
         .get("nodes")
@@ -11712,6 +11843,38 @@ fn parser_diagnostic_to_json(diagnostic: &Diagnostic) -> Value {
             .expect("diagnostic json is object")
             .insert("related".to_owned(), Value::Array(related));
     }
+    // Machine-applicable repairs (spec/error-handling.md "Suggestions And
+    // Fixits"). Omitted when empty for the same reason `related` is: a report
+    // consumer that has never heard of fixits sees the shape it always saw.
+    //
+    // This is the surface a NON-INTERACTIVE consumer reads — a CI annotation, a
+    // patch bot, a future `--fix`. Each edit carries the byte span and the
+    // replacement text, which is everything needed to apply it without asking
+    // the compiler again, and `applicability` says how far to trust it.
+    if !diagnostic.fixits.is_empty() {
+        let fixits: Vec<Value> = diagnostic
+            .fixits
+            .iter()
+            .map(|fixit| {
+                json!({
+                    "title": fixit.title,
+                    "applicability": fixit.applicability.as_str(),
+                    "edits": fixit
+                        .edits
+                        .iter()
+                        .map(|edit| json!({
+                            "source_span": source_span_to_json(edit.span),
+                            "replacement": edit.replacement,
+                        }))
+                        .collect::<Vec<_>>(),
+                })
+            })
+            .collect();
+        value
+            .as_object_mut()
+            .expect("diagnostic json is object")
+            .insert("fixits".to_owned(), Value::Array(fixits));
+    }
     value
 }
 
@@ -12639,6 +12802,11 @@ fn execute_scenario(
     };
 
     let snapshot = ir.to_snapshot();
+    // DR-0095: identity is the span-free projection of the snapshot, and it is
+    // the projection that lands under `ir_hash` in the content store — filing
+    // the spanned document there would leave a blob id that is not the hash of
+    // the bytes it names, which is the one thing `verify_body` exists to catch.
+    let ir_identity = ir_identity_projection(&snapshot);
     // DR-0043 Decision 3: content-address the source (blob id == source_hash)
     // so old-body completion can reload this version's rule bodies after a
     // later revision. Idempotent; best-effort.
@@ -12648,9 +12816,9 @@ fn execute_scenario(
             ProgramVersionInput {
                 program_name: &ir.workflow,
                 source_hash: &stable_hash_hex(source),
-                ir_hash: &stable_hash_hex(&snapshot),
+                ir_hash: &stable_hash_hex(&ir_identity),
                 compiler_version: whipplescript_core::version(),
-                ir_snapshot: Some(&snapshot),
+                ir_snapshot: Some(&ir_identity),
             },
             ir,
         )
@@ -13347,7 +13515,7 @@ fn compile(options: &CliOptions) -> ExitCode {
             "path": display_path(&compile_options.program_path),
             "workflow": ir.workflow.as_str(),
             "source_hash": stable_hash_hex(&source),
-            "ir_hash": stable_hash_hex(&snapshot),
+            "ir_hash": ir_identity_hash(&snapshot),
             "snapshot": snapshot,
             "source_metadata": source_metadata_json(&ir),
             "contract_registry": contract_registry_to_json(&contract_registry),
@@ -14172,10 +14340,10 @@ fn verify_verified_artifact_bundle_entry(
     verify_report_digest_field(entry, "ir_hash", label)?;
     let snapshot = required_json_str(entry, "snapshot", label)?;
     let ir_hash = required_json_str(entry, "ir_hash", label)?;
-    let recomputed_ir_hash = stable_hash_hex(snapshot);
+    let recomputed_ir_hash = ir_identity_hash(snapshot);
     if ir_hash != recomputed_ir_hash {
         return Err(format!(
-            "{label}.ir_hash must match the embedded snapshot hash; got `{ir_hash}`, expected `{recomputed_ir_hash}`"
+            "{label}.ir_hash must match the embedded snapshot's identity hash; got `{ir_hash}`, expected `{recomputed_ir_hash}`"
         ));
     }
     let contract_registry = require_json_object_field(entry, "contract_registry", label)?;
@@ -14454,10 +14622,10 @@ fn verify_report_success_common_shape(entry: &Value, label: &str) -> Result<(), 
     verify_report_digest_field(entry, "ir_hash", label)?;
     let snapshot = required_json_str(entry, "snapshot", label)?;
     let ir_hash = required_json_str(entry, "ir_hash", label)?;
-    let recomputed_ir_hash = stable_hash_hex(snapshot);
+    let recomputed_ir_hash = ir_identity_hash(snapshot);
     if ir_hash != recomputed_ir_hash {
         return Err(format!(
-            "{label}.ir_hash must match the embedded snapshot hash; got `{ir_hash}`, expected `{recomputed_ir_hash}`"
+            "{label}.ir_hash must match the embedded snapshot's identity hash; got `{ir_hash}`, expected `{recomputed_ir_hash}`"
         ));
     }
     require_json_object_field(entry, "source_metadata", label)?;
@@ -15105,7 +15273,7 @@ fn verify_source_backed_source_and_ir(
         return Err(format!("{label} source-backed {owner} snapshot mismatch"));
     }
     let report_ir_hash = required_json_str(entry, "ir_hash", label)?;
-    let computed_ir_hash = stable_hash_hex(&computed_snapshot);
+    let computed_ir_hash = ir_identity_hash(&computed_snapshot);
     if report_ir_hash != computed_ir_hash {
         return Err(format!(
             "{label} source-backed {owner} ir_hash mismatch: got `{report_ir_hash}`, expected `{computed_ir_hash}`"
@@ -15205,10 +15373,12 @@ fn verify_report_lowered_ir_artifact_identity(
     let lowered_graph_id = required_json_str(lowered, "graph_id", "lowered_ir_report")?;
     let accepted_program_digest =
         required_json_str(lowered, "accepted_program_digest", "lowered_ir_report")?;
-    let expected_digest = sha256_hex(format!("{lowered_graph_id}\n{snapshot}").as_bytes());
+    // DR-0095: over the snapshot's identity projection, matching the producer.
+    let expected_digest =
+        sha256_hex(format!("{lowered_graph_id}\n{}", ir_identity_projection(snapshot)).as_bytes());
     if accepted_program_digest != expected_digest {
         return Err(format!(
-            "{label} lowered_ir_report.accepted_program_digest does not match graph_id + snapshot"
+            "{label} lowered_ir_report.accepted_program_digest does not match graph_id + the snapshot's identity projection"
         ));
     }
     Ok(())
@@ -15550,7 +15720,7 @@ fn verify_model_search_ir_obligations_from_source_if_available(
         ));
     }
     let report_ir_hash = required_json_str(entry, "ir_hash", label)?;
-    let computed_ir_hash = stable_hash_hex(&computed_snapshot);
+    let computed_ir_hash = ir_identity_hash(&computed_snapshot);
     if report_ir_hash != computed_ir_hash {
         return Err(format!(
             "{label} source-backed model_search ir_hash mismatch: got `{report_ir_hash}`, expected `{computed_ir_hash}`"
@@ -16747,22 +16917,33 @@ fn compile_failure_json_report(path: &str, error: CompileFailure) -> Value {
             compile_json_error_report(Some(path), "io", Some(error.to_string()), None, None, None)
         }
         CompileFailure::Diagnostics {
-            source: _,
+            source,
+            segments,
             diagnostics,
-            ..
-        } => compile_json_error_report(
-            Some(path),
-            "diagnostics",
-            None,
-            Some(
-                diagnostics
-                    .iter()
-                    .map(parser_diagnostic_to_json)
-                    .collect::<Vec<_>>(),
-            ),
-            None,
-            None,
-        ),
+        } => {
+            // Same reason as the `check` report: the `path` this names is the
+            // file a consumer will apply the fixits to, so they are rebased into
+            // its coordinates and the ones belonging to an included file are
+            // dropped.
+            let reported = display_path(path);
+            compile_json_error_report(
+                Some(path),
+                "diagnostics",
+                None,
+                Some(
+                    diagnostics
+                        .iter()
+                        .map(|diagnostic| {
+                            parser_diagnostic_to_json(&diagnostic_with_reported_fixits(
+                                &reported, &source, &segments, diagnostic,
+                            ))
+                        })
+                        .collect::<Vec<_>>(),
+                ),
+                None,
+                None,
+            )
+        }
     }
 }
 
@@ -16994,7 +17175,12 @@ fn revise(options: &CliOptions) -> ExitCode {
     };
     let snapshot = ir.to_snapshot();
     let source_hash = stable_hash_hex(&source);
-    let ir_hash = stable_hash_hex(&snapshot);
+    // DR-0095: identity is the span-free projection of the snapshot, and it is
+    // the projection that lands under `ir_hash` in the content store — filing
+    // the spanned document there would leave a blob id that is not the hash of
+    // the bytes it names, which is the one thing `verify_body` exists to catch.
+    let ir_identity = ir_identity_projection(&snapshot);
+    let ir_hash = stable_hash_hex(&ir_identity);
     let analysis_summary_json = program_analysis_summary_json(&ir);
     let candidate_label = format!("candidate:{ir_hash}");
 
@@ -17078,7 +17264,7 @@ fn revise(options: &CliOptions) -> ExitCode {
             source_hash: &source_hash,
             ir_hash: &ir_hash,
             compiler_version: whipplescript_core::version(),
-            ir_snapshot: Some(&snapshot),
+            ir_snapshot: Some(&ir_identity),
         },
         &ir,
     ) {
@@ -19306,6 +19492,11 @@ fn start_workflow_instance(
         }
     };
     let snapshot = ir.to_snapshot();
+    // DR-0095: identity is the span-free projection of the snapshot, and it is
+    // the projection that lands under `ir_hash` in the content store — filing
+    // the spanned document there would leave a blob id that is not the hash of
+    // the bytes it names, which is the one thing `verify_body` exists to catch.
+    let ir_identity = ir_identity_projection(&snapshot);
     let run_source = Path::new(path);
     let package_lock = match load_package_lock(package_lock_path, std::slice::from_ref(&run_source))
     {
@@ -19339,9 +19530,9 @@ fn start_workflow_instance(
         ProgramVersionInput {
             program_name: &ir.workflow,
             source_hash: &stable_hash_hex(&source),
-            ir_hash: &stable_hash_hex(&snapshot),
+            ir_hash: &stable_hash_hex(&ir_identity),
             compiler_version: whipplescript_core::version(),
-            ir_snapshot: Some(&snapshot),
+            ir_snapshot: Some(&ir_identity),
         },
         &ir,
     ) {
@@ -19574,7 +19765,7 @@ fn validate_step_program_version(
         .ok_or_else(|| StoreError::Conflict("active program version does not exist".to_owned()))?;
     let snapshot = ir.to_snapshot();
     let source_hash = stable_hash_hex(source);
-    let ir_hash = stable_hash_hex(&snapshot);
+    let ir_hash = ir_identity_hash(&snapshot);
     if source_hash != active_version.source_hash || ir_hash != active_version.ir_hash {
         let message = format!(
             "step program `{program_path}` does not match active version {} at epoch {} (expected source_hash={} ir_hash={}, got source_hash={} ir_hash={}); activate the candidate with `whip revise` before stepping it",
@@ -26840,6 +27031,11 @@ fn start_child_workflow_instance_in_package(
         }
     }
     let snapshot = ir.to_snapshot();
+    // DR-0095: identity is the span-free projection of the snapshot, and it is
+    // the projection that lands under `ir_hash` in the content store — filing
+    // the spanned document there would leave a blob id that is not the hash of
+    // the bytes it names, which is the one thing `verify_body` exists to catch.
+    let ir_identity = ir_identity_projection(&snapshot);
     let store = SqliteStore::open(store_path)?;
     let mut kernel = RuntimeKernel::new(store);
     // DR-0043 Decision 3: content-address the source (blob id == source_hash)
@@ -26850,9 +27046,9 @@ fn start_child_workflow_instance_in_package(
         ProgramVersionInput {
             program_name: &ir.workflow,
             source_hash: &stable_hash_hex(&source),
-            ir_hash: &stable_hash_hex(&snapshot),
+            ir_hash: &stable_hash_hex(&ir_identity),
             compiler_version: whipplescript_core::version(),
-            ir_snapshot: Some(&snapshot),
+            ir_snapshot: Some(&ir_identity),
         },
         &ir,
     )?;
@@ -40196,6 +40392,7 @@ fn check_authority_imports(ir: &IrProgram) -> Vec<Diagnostic> {
             code: diagnostic_code!("security.package_import_required"),
             severity: Severity::Error,
             related: Vec::new(),
+            fixits: Vec::new(),
             span,
             message: format!(
                 "{construct} requires `use {package}`: \
@@ -40246,6 +40443,7 @@ fn check_script_hard_off(ir: &IrProgram) -> Vec<Diagnostic> {
                             .to_owned(),
                     ),
                     related: Vec::new(),
+                    fixits: Vec::new(),
                 });
             }
         }
@@ -40300,6 +40498,7 @@ fn lint_workflow_liveness(ir: &IrProgram) -> Vec<Diagnostic> {
             code: diagnostic_code!("graph.unreachable_terminal"),
             severity: Severity::Error,
             related: Vec::new(),
+            fixits: Vec::new(),
             span: SourceSpan { start: 0, end: 0 },
             message: format!(
                 "workflow `{}` has no rule that reaches `complete` or `fail`",
@@ -40354,6 +40553,7 @@ fn lint_workflow_liveness(ir: &IrProgram) -> Vec<Diagnostic> {
             code: diagnostic_code!("construct.tag_conflict"),
             severity: Severity::Error,
             related: Vec::new(),
+            fixits: Vec::new(),
             span: SourceSpan { start: 0, end: 0 },
             message: format!(
                 "workflow `{}` is both `@bounded` and `@service`; the two tags make opposite promises about termination",
@@ -40376,6 +40576,7 @@ fn lint_workflow_liveness(ir: &IrProgram) -> Vec<Diagnostic> {
                 code: diagnostic_code!("construct.tag_conflict"),
                 severity: Severity::Error,
                 related: Vec::new(),
+                fixits: Vec::new(),
                 span: SourceSpan { start: 0, end: 0 },
                 message: format!(
                     "workflow `{}` is both `@tool` and `@service`; a `@tool` workflow must terminate",
@@ -40398,6 +40599,7 @@ fn lint_workflow_liveness(ir: &IrProgram) -> Vec<Diagnostic> {
                 code: diagnostic_code!("graph.tool_not_convergent"),
                 severity: Severity::Error,
                 related: Vec::new(),
+                fixits: Vec::new(),
                 span: SourceSpan { start: 0, end: 0 },
                 message: format!(
                     "`@tool` workflow `{}` invokes a sub-workflow; v1 `@tool` workflows must be leaves",
@@ -40424,6 +40626,7 @@ fn lint_workflow_liveness(ir: &IrProgram) -> Vec<Diagnostic> {
                     code: diagnostic_code!("graph.tool_not_convergent"),
                     severity: Severity::Error,
                     related: Vec::new(),
+                    fixits: Vec::new(),
                     span: SourceSpan { start: 0, end: 0 },
                     message: format!(
                         "`@tool` workflow `{}` rule `{}` is `@external`; a `@tool` workflow may not depend on external arrival",
@@ -40441,6 +40644,7 @@ fn lint_workflow_liveness(ir: &IrProgram) -> Vec<Diagnostic> {
                         code: diagnostic_code!("graph.tool_not_convergent"),
                         severity: Severity::Error,
                         related: Vec::new(),
+                        fixits: Vec::new(),
                         span: when.span,
                         message: format!(
                             "`@tool` workflow `{}` rule `{}` awaits an inbound message; a `@tool` workflow may not consume external signals",
@@ -40481,6 +40685,7 @@ fn lint_workflow_liveness(ir: &IrProgram) -> Vec<Diagnostic> {
                             code: diagnostic_code!("graph.rule_never_fires"),
                             severity: Severity::Error,
                             related: Vec::new(),
+                            fixits: Vec::new(),
                             span: when.span,
                             message: format!(
                                 "rule `{}` can never fire: nothing produces `{name}`",
@@ -40501,6 +40706,7 @@ fn lint_workflow_liveness(ir: &IrProgram) -> Vec<Diagnostic> {
                         code: diagnostic_code!("graph.rule_never_fires"),
                         severity: Severity::Error,
                         related: Vec::new(),
+                        fixits: Vec::new(),
                         span: when.span,
                         message: format!(
                             "rule `{}` can never fire: no rule creates an agent turn",
@@ -40539,6 +40745,7 @@ fn lint_workflow_liveness(ir: &IrProgram) -> Vec<Diagnostic> {
                 code: diagnostic_code!("graph.rule_never_fires"),
                 severity: Severity::Error,
                 related: Vec::new(),
+                fixits: Vec::new(),
                 span: when.span,
                 message: format!(
                     "rule `{}` can never fire: nothing produces `{first}`",
@@ -40698,6 +40905,7 @@ fn agent_provider_kind_diagnostics(
             code: diagnostic_code!("construct.unknown_provider_kind"),
             severity: Severity::Error,
             related: Vec::new(),
+            fixits: Vec::new(),
             span,
             message: format!(
                 "{owner} uses unknown provider kind `{kind}`: no known package \
@@ -40767,6 +40975,7 @@ fn agent_requires_diagnostics(ir: &IrProgram) -> Vec<Diagnostic> {
                 code: diagnostic_code!("provider.feature_unavailable"),
                 severity: Severity::Error,
                 related: Vec::new(),
+                fixits: Vec::new(),
                 span: SourceSpan { start: 0, end: 0 },
                 message: format!(
                     "agent `{}` requires feature class `{class}`, but {stated}",
@@ -40807,7 +41016,7 @@ fn lint_agent_requires_probed_source(ir: &IrProgram) -> Vec<LintFinding> {
             if entry.support.satisfies_requirement() && entry.source == FeatureReportSource::Probed
             {
                 findings.push(LintFinding {
-                    code: "lint.agent_requires_probed_source",
+                    code: lint_diagnostic_code!("lint.agent_requires_probed_source"),
                     severity: Severity::Warning,
                     message: format!(
                         "agent `{}` requires `{class}`, satisfied only by a probed (not \
@@ -40836,6 +41045,7 @@ fn lint_agent_tool_grants(
                     code: diagnostic_code!("capability.invalid_tool_grant"),
                     severity: Severity::Error,
                     related: Vec::new(),
+                    fixits: Vec::new(),
                     span: SourceSpan { start: 0, end: 0 },
                     message: format!("agent `{}` is granted `{tool}`: {reason}", agent.name),
                     suggestion: Some(
@@ -41014,6 +41224,7 @@ impl SourceBundleResolver {
                     code: diagnostic_code!("graph.include_cycle"),
                     severity: Severity::Error,
                     related: Vec::new(),
+                    fixits: Vec::new(),
                     span: SourceSpan { start: 0, end: 0 },
                     message: format!("include cycle through `{}`", path.display()),
                     suggestion: Some("remove the recursive include".to_owned()),
@@ -41062,6 +41273,7 @@ impl SourceBundleResolver {
                         code: diagnostic_code!("construct.duplicate_include"),
                         severity: Severity::Error,
                         related: Vec::new(),
+                        fixits: Vec::new(),
                         span: include.path.span,
                         message: format!("duplicate include `{}`", include.path.value),
                         suggestion: Some("remove the duplicate include".to_owned()),
@@ -41081,6 +41293,7 @@ impl SourceBundleResolver {
                         code: diagnostic_code!("construct.invalid_include_path"),
                         severity: Severity::Error,
                         related: Vec::new(),
+                        fixits: Vec::new(),
                         span: include.path.span,
                         message: "include paths must be relative".to_owned(),
                         suggestion: Some(
@@ -41101,6 +41314,7 @@ impl SourceBundleResolver {
                         code: diagnostic_code!("construct.invalid_include_path"),
                         severity: Severity::Error,
                         related: Vec::new(),
+                        fixits: Vec::new(),
                         span: include.path.span,
                         message: "only `.whip` includes are supported right now".to_owned(),
                         suggestion: Some("include a `.whip` source library file".to_owned()),
@@ -41202,6 +41416,7 @@ fn render_bundle_diagnostic(
         message: diagnostic.message.clone(),
         suggestion: diagnostic.suggestion.clone(),
         related: Vec::new(),
+        fixits: Vec::new(),
     };
     let related = diagnostic
         .related
@@ -41224,6 +41439,74 @@ fn rebase_span(span: SourceSpan, file_start: usize, file_len: usize) -> SourceSp
     SourceSpan {
         start: span.start.saturating_sub(file_start).min(file_len),
         end: span.end.saturating_sub(file_start).min(file_len),
+    }
+}
+
+/// `diagnostic` with its fixits rebased into the coordinates of the file the
+/// report NAMES, and with every fixit that file cannot honour dropped.
+///
+/// THE PROBLEM. A span leaving the compiler is an offset into the concatenated
+/// include BUNDLE, where each file's own text is appended AFTER everything it
+/// includes. [`render_bundle_diagnostic`] rebases the primary and related spans
+/// before printing them, so the caret and the notes are in the named file's
+/// coordinates. A fixit's edits were not rebased, and a fixit is the one thing
+/// here that is not read by a person: an editor applies it on a keystroke and a
+/// `--fix` applies it unattended, against the file the report's `path` names. So
+/// for any program with an `include`, those offsets addressed either a different
+/// file or a position past the end of the named one — not a wrong sentence a
+/// reader would catch, but source corruption.
+///
+/// THE RULE. Each edit is resolved back to its originating file exactly as the
+/// primary span is, and a fixit survives only when EVERY one of its edits lands
+/// wholly inside the reported file — an edit belonging to an included file, or
+/// straddling the seam between two, takes its whole fixit with it. Never
+/// retargeted, never partially applied: a patch carries no filename of its own,
+/// the report's `path` is the only thing that says where its offsets point, and
+/// half a fixit is a different program rather than a weaker repair (which is the
+/// same reason [`whipplescript_parser::Fixit::apply_to`] refuses an overlap).
+/// Dropping is the safe direction, and it is why this returns a `Diagnostic`
+/// whose sentence still names the repair the reader can make by hand.
+fn diagnostic_with_reported_fixits(
+    reported_path: &str,
+    source: &str,
+    segments: &[SourceSegment],
+    diagnostic: &Diagnostic,
+) -> Diagnostic {
+    let fixits = diagnostic
+        .fixits
+        .iter()
+        .filter_map(|fixit| {
+            let edits = fixit
+                .edits
+                .iter()
+                .map(|edit| {
+                    let (file, file_start, file_end) =
+                        resolve_span_file(reported_path, source, segments, edit.span);
+                    if file != reported_path
+                        || edit.span.start < file_start
+                        || edit.span.end > file_end
+                    {
+                        return None;
+                    }
+                    Some(FixitEdit {
+                        span: SourceSpan {
+                            start: edit.span.start - file_start,
+                            end: edit.span.end - file_start,
+                        },
+                        replacement: edit.replacement.clone(),
+                    })
+                })
+                .collect::<Option<Vec<_>>>()?;
+            Some(Fixit {
+                title: fixit.title.clone(),
+                edits,
+                applicability: fixit.applicability,
+            })
+        })
+        .collect();
+    Diagnostic {
+        fixits,
+        ..diagnostic.clone()
     }
 }
 
@@ -41350,7 +41633,7 @@ fn ir_model_search_obligations_artifact(
     json!({
         "schema": "whipplescript.ir_model_search_obligations.v0",
         "source_hash": stable_hash_hex(source),
-        "ir_hash": stable_hash_hex(snapshot),
+        "ir_hash": ir_identity_hash(snapshot),
         "generator": format!("whipplescript-{}", whipplescript_core::version()),
         "obligations": expected
             .iter()
@@ -41486,6 +41769,7 @@ fn run_expected_model_searches(
             code: diagnostic_code!("graph.model_search_mismatch"),
             severity: Severity::Error,
             related: Vec::new(),
+            fixits: Vec::new(),
             span: first_expected.span,
             message: format!(
                 "model search produced {} result(s), expected {}",
@@ -41513,6 +41797,7 @@ fn run_expected_model_searches(
                 code: diagnostic_code!("graph.model_search_mismatch"),
                 severity: Severity::Error,
                 related: Vec::new(),
+                fixits: Vec::new(),
                 span: expected.span,
                 message: format!("model-search counterexample for {}", expected.description),
                 suggestion: Some(format!(

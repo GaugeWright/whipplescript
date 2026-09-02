@@ -1,0 +1,6 @@
+error[expr.untyped_case_scrutinee]: rule `classify_work` has case scrutinee `classification` that is not a typed path
+   --> examples/invalid/case-outside-its-after-block.whip:40:3
+   |
+40 |   case classification {
+   |   ^^^^^^^^^^^^^^^^^^^^^
+   = help: match on a bound field such as `task.provider`

@@ -284,15 +284,22 @@ pub struct NewProgramVersion<'a> {
     pub source_hash: &'a str,
     pub ir_hash: &'a str,
     pub compiler_version: &'a str,
-    /// The `.ir` snapshot this version's `ir_hash` is the hash OF, captured
+    /// The `.ir` document this version's `ir_hash` is the hash OF, captured
     /// content-addressed alongside the row.
     ///
-    /// `ir_hash` is `stable_hash_hex(snapshot)` and `content_blobs.id` IS the
-    /// content hash, so the snapshot lands under the id the version already
+    /// `ir_hash` is `stable_hash_hex(document)` and `content_blobs.id` IS the
+    /// content hash, so the document lands under the id the version already
     /// carries: no second pointer, and `get_content(&record.ir_hash)` reads it
     /// back. Without it a program version records a hash of a document nobody
     /// kept, and an instance's static structure is unrecoverable for anyone who
     /// no longer holds the exact source (the view-model note's G1).
+    ///
+    /// Since DR-0095 the document is the snapshot's identity projection — the
+    /// `.ir` text with its source offsets erased — because `ir_hash` stopped
+    /// being the hash of the spanned snapshot. The store is unchanged by that:
+    /// it still checks that the id names the bytes, which is the whole of what
+    /// it promises. Byte offsets are recovered by recompiling the source, which
+    /// DR-0043 content-addresses under `source_hash` in this same table.
     ///
     /// `None` where the caller genuinely has no snapshot — it withholds the
     /// bytes rather than inventing them. A `Some` whose hash disagrees with

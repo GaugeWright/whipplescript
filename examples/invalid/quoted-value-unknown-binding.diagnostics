@@ -1,0 +1,12 @@
+error[type.unknown_binding]: rule `interpolated_in_a_string` has unknown binding `nosuchbinding` in `record Trouble` field `reason`
+   --> examples/invalid/quoted-value-unknown-binding.whip:26:23
+   |
+26 |   fail error { reason "{{ nosuchbinding.field }}" }
+   |                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   = help: reference a binding from a `when ... as name` clause, an effect `as` binding, or a `case` pattern
+error[type.unknown_binding]: rule `the_same_value_without_quotes` has unknown binding `nosuchbinding` in `record Trouble` field `reason`
+   --> examples/invalid/quoted-value-unknown-binding.whip:32:23
+   |
+32 |   fail error { reason nosuchbinding.field }
+   |                       ^^^^^^^^^^^^^^^^^^^
+   = help: reference a binding from a `when ... as name` clause, an effect `as` binding, or a `case` pattern

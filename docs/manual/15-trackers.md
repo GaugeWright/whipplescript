@@ -32,10 +32,10 @@ matches nothing:
 <!-- render: examples/diagnostics/work-item-status-typo.whip code type.invalid_literal -->
 ```text
 error[type.invalid_literal]: rule `r` compares finite-domain value to unknown `cancelled`
-   --> examples/diagnostics/work-item-status-typo.whip:11:8
+   --> examples/diagnostics/work-item-status-typo.whip:11:47
    |
 11 |   when backlog has ready issue as issue where issue.status == "cancelled"
-   |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |                                               ^^^^^^^^^^^^^^^^^^^^^^^^^^^
    = help: did you mean `canceled`? use one of: open, in_progress, closed, canceled, archived
 ```
 

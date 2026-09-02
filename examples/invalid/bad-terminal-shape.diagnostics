@@ -1,15 +1,15 @@
+error[type.unsupported_payload_contract]: workflow terminal `stage` declares an unsupported payload contract type `Stage`
+   --> examples/invalid/bad-terminal-shape.whip:10:14
+   |
+10 | output stage Stage
+   |              ^^^^^
+   = help: declare the payload as a class (field block) or a scalar type: `output stage <Class>` or `output stage string`
 error[type.mismatch]: workflow terminal `score` has a scalar payload contract but is given a field block
    --> examples/invalid/bad-terminal-shape.whip:34:12
    |
 34 |   complete score {
    |            ^^^^^
    = help: write a bare scalar value: `complete score <value>`
-error[type.unsupported_payload_contract]: workflow terminal `stage` uses an unsupported payload contract type
-   --> examples/invalid/bad-terminal-shape.whip:42:12
-   |
-42 |   complete stage {
-   |            ^^^^^
-   = help: declare the terminal payload as a class (field block) or a scalar type (`string`, `int`, `float`, or `bool`)
 error[type.mismatch]: workflow terminal `error` has a class payload contract `Rejected` but is given a bare scalar value
    --> examples/invalid/bad-terminal-shape.whip:50:8
    |

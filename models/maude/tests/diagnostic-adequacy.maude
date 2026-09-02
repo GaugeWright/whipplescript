@@ -1,0 +1,321 @@
+load ../diagnostic-adequacy.maude
+
+--- spec/error-handling.md "Formal Diagnostic Adequacy", tracker row D12. The
+--- four obligations are searched in WHIPPLESCRIPT-DIAGNOSTIC-ADEQUACY and each
+--- is paired with a sibling module that reaches the same forbidden state, so no
+--- No-solution here rests on a rule nobody wrote.
+
+--- === Coverage: the rejection cases the spec requires the model to carry =====
+
+--- A program whose every obligation is satisfied is accepted...
+search [1] in WHIPPLESCRIPT-DIAGNOSTIC-ADEQUACY :
+  cleanProgram =>* accepted(progAlpha) RESIDUAL:Cfg .
+
+--- ...and its diagnostics are complete, because every discharge on the ledger
+--- was the checker's own.
+search [1] in WHIPPLESCRIPT-DIAGNOSTIC-ADEQUACY :
+  cleanProgram =>* diagnosticsComplete(progAlpha) RESIDUAL:Cfg .
+
+--- Missing required port -> construct_graph.interface.unsatisfied. Each search
+--- below asks for the rejection AND the exact diagnostic: right object, right
+--- invariant, checker-owned, and -- through `such that` -- the right code
+--- SPELLING rather than merely the right code constant. Binding the code to a
+--- variable and constraining its text is what makes `codeText` load-bearing:
+--- the search asserts the whole chain invariant -> codeOf -> constant ->
+--- codeText -> spelling, so swapping two constants' spellings turns two of
+--- these into No-solutions and changes the gate's verdict signature. A case
+--- that stopped being reachable, or started carrying another case's code,
+--- fails here.
+search [1] in WHIPPLESCRIPT-DIAGNOSTIC-ADEQUACY :
+  programFailing(portMemory, requiredPortSatisfied)
+  =>* rejectedGraph(progAlpha)
+      emitted(progAlpha,
+        d(C:Code, errorSev, portMemory, requiredPortSatisfied, validatorOwned))
+      RESIDUAL:Cfg
+  such that codeText(C:Code) == "construct_graph.interface.unsatisfied" .
+
+--- Two providers for an exactly-one port -> construct_graph.cardinality.exactly_one.
+search [1] in WHIPPLESCRIPT-DIAGNOSTIC-ADEQUACY :
+  programFailing(portMemory, resolutionUnambiguous)
+  =>* rejectedGraph(progAlpha)
+      emitted(progAlpha,
+        d(C:Code, errorSev, portMemory, resolutionUnambiguous, validatorOwned))
+      RESIDUAL:Cfg
+  such that codeText(C:Code) == "construct_graph.cardinality.exactly_one" .
+
+--- Wrong resource identity -> construct_graph.edge.resource_mismatch.
+search [1] in WHIPPLESCRIPT-DIAGNOSTIC-ADEQUACY :
+  programFailing(edgeOne, resourceIdentityMatches)
+  =>* rejectedGraph(progAlpha)
+      emitted(progAlpha,
+        d(C:Code, errorSev, edgeOne, resourceIdentityMatches, validatorOwned))
+      RESIDUAL:Cfg
+  such that codeText(C:Code) == "construct_graph.edge.resource_mismatch" .
+
+--- Wrong type -> construct_graph.edge.type_mismatch.
+search [1] in WHIPPLESCRIPT-DIAGNOSTIC-ADEQUACY :
+  programFailing(edgeOne, typeCompatible)
+  =>* rejectedGraph(progAlpha)
+      emitted(progAlpha,
+        d(C:Code, errorSev, edgeOne, typeCompatible, validatorOwned))
+      RESIDUAL:Cfg
+  such that codeText(C:Code) == "construct_graph.edge.type_mismatch" .
+
+--- Wrong phase -> construct_graph.edge.phase_mismatch. This search and the
+--- version one below are the pair the audit swapped: with the code pinned only
+--- as a constant, exchanging the two `codeText` equations left every verdict
+--- unchanged and the model went on claiming the phase case emits the version
+--- code. Constrained by spelling, the swap turns both into No-solutions.
+search [1] in WHIPPLESCRIPT-DIAGNOSTIC-ADEQUACY :
+  programFailing(edgeOne, phaseCompatible)
+  =>* rejectedGraph(progAlpha)
+      emitted(progAlpha,
+        d(C:Code, errorSev, edgeOne, phaseCompatible, validatorOwned))
+      RESIDUAL:Cfg
+  such that codeText(C:Code) == "construct_graph.edge.phase_mismatch" .
+
+--- Wrong contract version -> construct_graph.edge.version_mismatch.
+search [1] in WHIPPLESCRIPT-DIAGNOSTIC-ADEQUACY :
+  programFailing(edgeOne, versionCompatible)
+  =>* rejectedGraph(progAlpha)
+      emitted(progAlpha,
+        d(C:Code, errorSev, edgeOne, versionCompatible, validatorOwned))
+      RESIDUAL:Cfg
+  such that codeText(C:Code) == "construct_graph.edge.version_mismatch" .
+
+--- A name the platform reserves, used without the privilege to use it ->
+--- construct.reserved_name. NOT package_manifest.reserved_std_name: that is a
+--- `whip package sync` refusal about a manifest claiming the std namespace,
+--- which is a different rejection in a different surface.
+search [1] in WHIPPLESCRIPT-DIAGNOSTIC-ADEQUACY :
+  programFailing(keywordEvery, keywordPrivileged)
+  =>* rejectedGraph(progAlpha)
+      emitted(progAlpha,
+        d(C:Code, errorSev, keywordEvery, keywordPrivileged, validatorOwned))
+      RESIDUAL:Cfg
+  such that codeText(C:Code) == "construct.reserved_name" .
+
+--- Unsupported lowering class -> construct_graph.node.lowering_class_unsupported.
+search [1] in WHIPPLESCRIPT-DIAGNOSTIC-ADEQUACY :
+  programFailing(nodeAlpha, loweringClassSupported)
+  =>* rejectedGraph(progAlpha)
+      emitted(progAlpha,
+        d(C:Code, errorSev, nodeAlpha, loweringClassSupported, validatorOwned))
+      RESIDUAL:Cfg
+  such that codeText(C:Code) == "construct_graph.node.lowering_class_unsupported" .
+
+--- Duplicate lowered core-object owner -> lowered_ir.core_object.owner_duplicate.
+search [1] in WHIPPLESCRIPT-DIAGNOSTIC-ADEQUACY :
+  programFailing(coreRun, coreObjectOwnerUnique)
+  =>* rejectedGraph(progAlpha)
+      emitted(progAlpha,
+        d(C:Code, errorSev, coreRun, coreObjectOwnerUnique, validatorOwned))
+      RESIDUAL:Cfg
+  such that codeText(C:Code) == "lowered_ir.core_object.owner_duplicate" .
+
+--- Lowering emits forbidden runtime state ->
+--- lowered_ir.core_object.runtime_state_materialized.
+search [1] in WHIPPLESCRIPT-DIAGNOSTIC-ADEQUACY :
+  programFailing(coreRun, noRuntimeStateMaterialized)
+  =>* rejectedGraph(progAlpha)
+      emitted(progAlpha,
+        d(C:Code, errorSev, coreRun, noRuntimeStateMaterialized, validatorOwned))
+      RESIDUAL:Cfg
+  such that codeText(C:Code) == "lowered_ir.core_object.runtime_state_materialized" .
+
+--- An event source lowered as an event occurrence, and every other lowering
+--- that produces a core-object kind the graph does not allow ->
+--- lowered_ir.node.output_kind_unallowed.
+search [1] in WHIPPLESCRIPT-DIAGNOSTIC-ADEQUACY :
+  programFailing(nodeBeta, outputKindAllowed)
+  =>* rejectedGraph(progAlpha)
+      emitted(progAlpha,
+        d(C:Code, errorSev, nodeBeta, outputKindAllowed, validatorOwned))
+      RESIDUAL:Cfg
+  such that codeText(C:Code) == "lowered_ir.node.output_kind_unallowed" .
+
+--- A shape the scanner cannot read is a rejection with its own code, and the
+--- diagnostic cites the invariant that actually failed: `shapeReadable`.
+search [1] in WHIPPLESCRIPT-DIAGNOSTIC-ADEQUACY :
+  unreadableProgram
+  =>* rejectedGraph(progAlpha)
+      emitted(progAlpha,
+        d(C:Code, errorSev, nodeAlpha, shapeReadable, validatorOwned))
+      RESIDUAL:Cfg
+  such that codeText(C:Code) == "construct_graph.node.id_missing" .
+
+--- An accepted program MAY carry a warning. This is why soundness below is
+--- stated over error diagnostics: a near miss is worth saying and is not a
+--- reason to refuse.
+search [1] in WHIPPLESCRIPT-DIAGNOSTIC-ADEQUACY :
+  cleanProgram nearMiss(nodeAlpha, loweringClassSupported)
+  =>* accepted(progAlpha)
+      emitted(progAlpha,
+        d(C:Code, warningSev, nodeAlpha, loweringClassSupported, validatorOwned))
+      RESIDUAL:Cfg
+  such that codeText(C:Code) == "construct_graph.node.lowering_class_unsupported" .
+
+--- A program every one of whose obligations was discharged against a fact its
+--- PACKAGE declared still compiles. This is what keeps the ownership
+--- No-solution below from being an artefact of a broken seed: the same seed
+--- reaches acceptance, and only adequacy is out of the package's reach.
+search [1] in WHIPPLESCRIPT-DIAGNOSTIC-ADEQUACY :
+  packageOnlyProgram =>* accepted(progAlpha) RESIDUAL:Cfg .
+
+--- ...and it is positively concluded NOT diagnostic-complete, rather than
+--- merely failing to conclude.
+search [1] in WHIPPLESCRIPT-DIAGNOSTIC-ADEQUACY :
+  packageOnlyProgram =>* diagnosticsNotComplete(progAlpha) RESIDUAL:Cfg .
+
+--- === Completeness: no rejection path is silent ==============================
+
+--- `search rejectedGraph(G) /\ noDiagnostic(G)` -- a refusal with no error
+--- diagnostic behind it. The verdict flag and the diagnostic list are written by
+--- one transition, so the two cannot disagree.
+search [1] in WHIPPLESCRIPT-DIAGNOSTIC-ADEQUACY :
+  programFailing(edgeOne, typeCompatible)
+  =>* silentRejection(progAlpha) RESIDUAL:Cfg .
+
+--- Bite: a check that fails and returns early without pushing its diagnostic
+--- reaches it from the same program.
+search [1] in DIAGNOSTIC-ADEQUACY-SILENT :
+  programFailing(edgeOne, typeCompatible)
+  =>* silentRejection(progAlpha) RESIDUAL:Cfg .
+
+--- Completeness, second leg: an object whose shape the scanner cannot read is
+--- never accepted. Declining to read is fail-closed.
+search [1] in WHIPPLESCRIPT-DIAGNOSTIC-ADEQUACY :
+  unreadableProgram =>* accepted(progAlpha) RESIDUAL:Cfg .
+
+--- Bite: a scanner that skips the shape it cannot parse accepts the program
+--- with the object never checked -- the 2026-09-01 defect in the small.
+search [1] in DIAGNOSTIC-ADEQUACY-SKIPPING :
+  unreadableProgram =>* accepted(progAlpha) RESIDUAL:Cfg .
+
+--- === Soundness: an accepted program carries no error diagnostic =============
+
+--- `search graphAccepted(G) /\ errorDiagnostic(G)`.
+search [1] in WHIPPLESCRIPT-DIAGNOSTIC-ADEQUACY :
+  programFailing(edgeOne, typeCompatible)
+  =>* unsoundAcceptance(progAlpha) RESIDUAL:Cfg .
+
+--- Bite: a check that pushes its diagnostic but leaves the flag the verdict is
+--- read from alone compiles the program with an error standing against it.
+search [1] in DIAGNOSTIC-ADEQUACY-EAGER :
+  programFailing(edgeOne, typeCompatible)
+  =>* unsoundAcceptance(progAlpha) RESIDUAL:Cfg .
+
+--- === Provenance: a diagnostic cites what actually failed ====================
+---
+--- The obligation is the whole property the spec states: every error diagnostic
+--- must cite an object that actually failed an invariant it actually owed.
+--- There are two ways to be neither, and both are searched.
+
+--- Sibling leg. `search diagnostic(G, D) /\ noFailedInvariant(G, D)`. edgeTwo
+--- owes the same `typeCompatible` obligation as edgeOne and satisfies it, so a
+--- diagnostic landing on edgeTwo is a complaint with nothing behind it.
+search [1] in WHIPPLESCRIPT-DIAGNOSTIC-ADEQUACY :
+  programFailing(edgeOne, typeCompatible) sibling(edgeOne, edgeTwo)
+  =>* floatingDiagnostic(progAlpha, edgeTwo, typeCompatible) RESIDUAL:Cfg .
+
+--- Bite: a checker that reports one finding against a neighbourhood re-mints
+--- the code against the sibling that satisfies the invariant.
+search [1] in DIAGNOSTIC-ADEQUACY-BATCHING :
+  programFailing(edgeOne, typeCompatible) sibling(edgeOne, edgeTwo)
+  =>* floatingDiagnostic(progAlpha, edgeTwo, typeCompatible) RESIDUAL:Cfg .
+
+--- Bystander leg. keywordEvery owes `keywordPrivileged` and NOTHING else, so it
+--- never owed `typeCompatible` and has no fact either way about it. This is the
+--- case the obligation missed while it was stated as "cites a pair the checker
+--- found to HOLD": with no `holds(keywordEvery, typeCompatible)` to match, the
+--- noisy validator below was reachable and uncaught.
+search [1] in WHIPPLESCRIPT-DIAGNOSTIC-ADEQUACY :
+  programFailing(edgeOne, typeCompatible)
+  =>* floatingDiagnostic(progAlpha, keywordEvery, typeCompatible) RESIDUAL:Cfg .
+
+--- Bite: a checker that blames whatever object its scan cursor holds reaches it
+--- from the same program.
+search [1] in DIAGNOSTIC-ADEQUACY-BYSTANDER :
+  programFailing(edgeOne, typeCompatible)
+  =>* floatingDiagnostic(progAlpha, keywordEvery, typeCompatible) RESIDUAL:Cfg .
+
+--- Anti-vacuity for the bystander leg: the misattributed diagnostic really is
+--- minted, and the graph really is refused while carrying it. Without this the
+--- No-solution above could be a bystander module that does nothing.
+search [1] in DIAGNOSTIC-ADEQUACY-BYSTANDER :
+  programFailing(edgeOne, typeCompatible)
+  =>* rejectedGraph(progAlpha)
+      emitted(progAlpha,
+        d(cgEdgeTypeMismatch, errorSev, keywordEvery, typeCompatible, validatorOwned))
+      RESIDUAL:Cfg .
+
+--- Severity leg: a warning ABOUT a satisfied invariant is not a floating
+--- diagnostic. Severity is what separates an advisory from a citation, and
+--- dropping it is not a way to lose provenance.
+search [1] in WHIPPLESCRIPT-DIAGNOSTIC-ADEQUACY :
+  cleanProgram nearMiss(nodeAlpha, loweringClassSupported)
+  =>* floatingDiagnostic(progAlpha, nodeAlpha, loweringClassSupported) RESIDUAL:Cfg .
+
+--- Bite: a checker that mints its advisory at error severity refuses the
+--- program for an invariant that holds.
+search [1] in DIAGNOSTIC-ADEQUACY-ESCALATING :
+  cleanProgram nearMiss(nodeAlpha, loweringClassSupported)
+  =>* floatingDiagnostic(progAlpha, nodeAlpha, loweringClassSupported) RESIDUAL:Cfg .
+
+--- The obligation in general shape, and unbounded: over the WHOLE reachable
+--- state space of the failing program, the correct module reaches no floating
+--- diagnostic citing ANY object and ANY invariant. The three searches above
+--- each name one misattribution; this one says there is no other.
+search in WHIPPLESCRIPT-DIAGNOSTIC-ADEQUACY :
+  programFailing(edgeOne, typeCompatible) sibling(edgeOne, edgeTwo)
+  =>* floatingDiagnostic(progAlpha, O:Obj, I:Inv) RESIDUAL:Cfg .
+
+--- Bite in general shape: the bystander checker reaches it from the same seed,
+--- so the general No-solution is not an unsatisfiable pattern.
+search [1] in DIAGNOSTIC-ADEQUACY-BYSTANDER :
+  programFailing(edgeOne, typeCompatible) sibling(edgeOne, edgeTwo)
+  =>* floatingDiagnostic(progAlpha, O:Obj, I:Inv) RESIDUAL:Cfg .
+
+--- === Ownership: only checker/runtime-owned facts satisfy adequacy ===========
+
+--- `search diagnosticComplete(G) supplied only by package facts`. Every
+--- obligation on this program was discharged against a fact its package
+--- declared; the ledger is all package-supplied, and adequacy is out of reach.
+search [1] in WHIPPLESCRIPT-DIAGNOSTIC-ADEQUACY :
+  packageOnlyProgram =>* diagnosticsComplete(progAlpha) RESIDUAL:Cfg .
+
+--- Bite: a checker that does not record which facts were its own concludes
+--- adequacy from the package's word.
+search [1] in DIAGNOSTIC-ADEQUACY-TRUSTING :
+  packageOnlyProgram =>* diagnosticsComplete(progAlpha) RESIDUAL:Cfg .
+
+--- Ownership, second leg: a package-supplied ACCEPTANCE fact is inert. The
+--- program it is attached to has an unreadable object, so honouring the claim
+--- would accept a program the checker refuses.
+search [1] in WHIPPLESCRIPT-DIAGNOSTIC-ADEQUACY :
+  unreadableProgram packageClaimsAccepted(progAlpha)
+  =>* accepted(progAlpha) RESIDUAL:Cfg .
+
+--- Bite: a checker that honours the claim accepts it in one step, without
+--- reading the program at all.
+search [1] in DIAGNOSTIC-ADEQUACY-TRUSTING :
+  unreadableProgram packageClaimsAccepted(progAlpha)
+  =>* accepted(progAlpha) RESIDUAL:Cfg .
+
+--- The provenance witness's own premise: `realFailures` must describe the
+--- program. A pair listed there whose object is recorded as SATISFYING the
+--- invariant is a seed that lies, and would make a genuine misattribution read
+--- as well-founded. No seed in this model does.
+search [1] in WHIPPLESCRIPT-DIAGNOSTIC-ADEQUACY :
+  programFailing(edgeOne, typeCompatible)
+  =>* unrealFailure(progAlpha, O:Obj, I:Inv) RESIDUAL:Cfg .
+
+--- Bite: a seed claiming a failure the program does not have. `keywordEvery`
+--- satisfies `keywordPrivileged`, and the seed lists it as failed.
+search [1] in WHIPPLESCRIPT-DIAGNOSTIC-ADEQUACY :
+  candidate(progAlpha) checking(progAlpha, allObs, false, noDiags, noOwners)
+  allReadable factsHolding(allObs)
+  realFailures(progAlpha, obcons(ob(keywordEvery, keywordPrivileged), noObs))
+  =>* unrealFailure(progAlpha, O:Obj, I:Inv) RESIDUAL:Cfg .
+
+quit .

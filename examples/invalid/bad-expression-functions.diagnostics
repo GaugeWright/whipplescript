@@ -2,71 +2,71 @@ error[expr.arity_mismatch]: assertion calls `count` with 0 arguments, expected 1
    --> examples/invalid/bad-expression-functions.whip:17:8
    |
 17 | assert count() == 0
-   |        ^^^^^^^^^^^^
+   |        ^^^^^^^
    = help: call `count` with exactly one array, map, fact query, or effect query argument
 error[expr.arity_mismatch]: assertion calls `count` with 2 arguments, expected 1
    --> examples/invalid/bad-expression-functions.whip:18:8
    |
 18 | assert count(["a"], ["b"]) == 0
-   |        ^^^^^^^^^^^^^^^^^^^^^^^^
+   |        ^^^^^^^^^^^^^^^^^^^
    = help: call `count` with exactly one array, map, fact query, or effect query argument
 error[type.unknown_schema]: assertion queries unknown fact schema `MissingTask`
-   --> examples/invalid/bad-expression-functions.whip:19:8
+   --> examples/invalid/bad-expression-functions.whip:19:14
    |
 19 | assert count(MissingTask) == 0
-   |        ^^^^^^^^^^^^^^^^^^^^^^^
+   |              ^^^^^^^^^^^
    = help: use a declared class name in fact queries
 error[type.unknown_field]: assertion fact query `Task` has unknown field `missing`
-   --> examples/invalid/bad-expression-functions.whip:20:8
+   --> examples/invalid/bad-expression-functions.whip:20:25
    |
 20 | assert count(Task where missing == "x") == 0
-   |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |                         ^^^^^^^
    = help: use a field declared on `Task` inside the query `where` expression
 error[expr.non_boolean_condition]: assertion fact query `Task` has non-boolean `where` expression
-   --> examples/invalid/bad-expression-functions.whip:21:8
+   --> examples/invalid/bad-expression-functions.whip:21:25
    |
 21 | assert count(Task where priority) == 0
-   |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |                         ^^^^^^^^
    = help: query `where` expressions must evaluate to bool
 error[expr.unsupported_argument_type]: assertion calls `exists` with unsupported argument type `int`
-   --> examples/invalid/bad-expression-functions.whip:22:8
+   --> examples/invalid/bad-expression-functions.whip:22:15
    |
 22 | assert exists(1)
-   |        ^^^^^^^^^
+   |               ^
    = help: use `exists path` for optional/map presence checks or pass an array, map, fact query, or effect query
 error[expr.unsupported_argument_type]: assertion calls `empty` with unsupported argument type `bool`
-   --> examples/invalid/bad-expression-functions.whip:23:8
+   --> examples/invalid/bad-expression-functions.whip:23:14
    |
 23 | assert empty(true)
-   |        ^^^^^^^^^^^
+   |              ^^^^
    = help: use `empty` only with arrays, maps, strings, fact queries, effect queries, null, or supported optional values
 error[expr.unsupported_argument_type]: rule `bad_function_shapes` calls `count` with unsupported argument type `string`
-   --> examples/invalid/bad-expression-functions.whip:26:8
+   --> examples/invalid/bad-expression-functions.whip:26:33
    |
 26 |   when Task as task where count(task.title) == 0
-   |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |                                 ^^^^^^^^^^
    = help: use `count` only with arrays, maps, fact queries, or effect queries
 error[expr.arity_mismatch]: rule `bad_function_shapes` calls `count` with 2 arguments, expected 1
-   --> examples/invalid/bad-expression-functions.whip:27:8
+   --> examples/invalid/bad-expression-functions.whip:27:33
    |
 27 |   when Task as array_task where count(array_task.labels, array_task.metadata) == 0
-   |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |                                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
    = help: call `count` with exactly one array, map, fact query, or effect query argument
 error[expr.unsupported_argument_type]: rule `bad_function_shapes` calls `exists` with unsupported argument type `int`
-   --> examples/invalid/bad-expression-functions.whip:28:8
+   --> examples/invalid/bad-expression-functions.whip:28:41
    |
 28 |   when Task as task_exists where exists(task_exists.priority)
-   |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |                                         ^^^^^^^^^^^^^^^^^^^^
    = help: use `exists path` for optional/map presence checks or pass an array, map, fact query, or effect query
 error[expr.unsupported_argument_type]: rule `bad_function_shapes` calls `empty` with unsupported argument type `bool`
-   --> examples/invalid/bad-expression-functions.whip:29:8
+   --> examples/invalid/bad-expression-functions.whip:29:39
    |
 29 |   when Task as task_empty where empty(task_empty.ready)
-   |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |                                       ^^^^^^^^^^^^^^^^
    = help: use `empty` only with arrays, maps, strings, fact queries, effect queries, null, or supported optional values
 error[expr.unsupported_argument_type]: rule `bad_function_shapes` calls `empty` with unsupported optional argument type `object?`
-   --> examples/invalid/bad-expression-functions.whip:30:8
+   --> examples/invalid/bad-expression-functions.whip:30:42
    |
 30 |   when Task as task_optional where empty(task_optional.owner)
-   |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |                                          ^^^^^^^^^^^^^^^^^^^
    = help: use `empty` only with arrays, maps, strings, fact queries, effect queries, null, or supported optional values

@@ -878,6 +878,41 @@ def stable_hash_hex(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()[:32]
 
 
+# The offset-bearing spellings an `.ir` snapshot uses, each erased to `-` — the
+# snapshot's own spelling for a field with nothing in it.
+_OFFSET_MARKERS = ("span=", "defined-at ", "applied-at ")
+
+
+def _erase_trailing_offsets(line: str) -> str:
+    for marker in _OFFSET_MARKERS:
+        index = line.rfind(marker)
+        if index < 0:
+            continue
+        start, separator, end = line[index + len(marker):].partition("..")
+        if not separator:
+            continue
+        if not (start.isascii() and start.isdigit()):
+            continue
+        if not (end.isascii() and end.isdigit()):
+            continue
+        return line[: index + len(marker)] + "-"
+    return line
+
+
+def ir_identity_projection(snapshot: str) -> str:
+    # Mirrors the Rust `whipplescript_parser::snapshot::identity_projection`
+    # (DR-0095): a source span is where something was written, not what it
+    # means, so it stays in the snapshot and is erased from the bytes `ir_hash`
+    # and `accepted_program_digest` are computed over. Offsets only — a rule's
+    # `body_hash` stays, so this is not a whitespace normalization. Extend every
+    # mirror together.
+    return "\n".join(_erase_trailing_offsets(line) for line in snapshot.split("\n"))
+
+
+def ir_identity_hash(snapshot: str) -> str:
+    return stable_hash_hex(ir_identity_projection(snapshot))
+
+
 def is_stable_digest(value: str) -> bool:
     return len(value) == 32 and all(ch in "0123456789abcdef" for ch in value)
 

@@ -1,0 +1,14 @@
+error[expr.duplicate_case_pattern]: rule `a_brace_in_a_comment` has duplicate unguarded case pattern `open`
+   --> examples/invalid/case-brace-in-prose.whip:40:5
+   |
+40 |     "open" => {
+   |     ^^^^^^
+   = note: `open` is already matched here (examples/invalid/case-brace-in-prose.whip:34:5)
+   = help: remove the duplicate branch or add mutually exclusive `where` guards
+error[expr.duplicate_case_pattern]: rule `a_brace_in_a_prompt_body` has duplicate unguarded case pattern `open`
+   --> examples/invalid/case-brace-in-prose.whip:73:5
+   |
+73 |     "open" => {
+   |     ^^^^^^
+   = note: `open` is already matched here (examples/invalid/case-brace-in-prose.whip:63:5)
+   = help: remove the duplicate branch or add mutually exclusive `where` guards

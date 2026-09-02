@@ -1,0 +1,43 @@
+// Invalid: two rules in one workflow carrying the same name.
+//
+// A rule's NAME is its identity everywhere outside the compiler's own vector
+// of rules, and none of those places has a position to fall back on: the
+// effect graph is edges between names, a `mark` names its site, a DR-0043
+// region names its rules, source tags and descriptions are keyed by name, and
+// the runtime matches a firing to its rule by `firing.rule`. Two rules sharing
+// a name are one rule to the kernel and to every report the compiler prints,
+// so the collision is refused rather than resolved. D14,
+// spec/diagnostic-quality-tracker.md.
+use std.files
+
+workflow DuplicateRuleName
+
+output result Saved
+
+class Saved {
+  content string
+}
+
+file store notes_store {
+  root "./.whipplescript/dup-demo"
+  allow read ["notes/**"]
+}
+
+rule same_name
+  when started
+=> {
+  write text to notes_store at "notes/hello.txt" {
+    body "hello"
+    mode upsert
+  } as written
+
+  after written completes {
+    complete result { content "done" }
+  }
+}
+
+rule same_name
+  when started
+=> {
+  complete result { content "other" }
+}

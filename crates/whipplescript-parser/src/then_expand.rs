@@ -255,6 +255,7 @@ fn diag(span: SourceSpan, message: String, suggestion: &str) -> Diagnostic {
         code: diagnostic_code!("construct.invalid_expansion"),
         severity: Severity::Error,
         related: Vec::new(),
+        fixits: Vec::new(),
         span,
         message,
         suggestion: Some(suggestion.to_owned()),

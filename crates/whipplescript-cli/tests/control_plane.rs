@@ -13956,6 +13956,205 @@ fn lsp_document_highlight_marks_all_occurrences() {
     );
 }
 
+/// The NON-INTERACTIVE surface of a fixit (tracker D9): a JSON report carries
+/// the edit in full, so a CI annotation or a patch bot can apply it without
+/// asking the compiler a second question.
+///
+/// The edit is applied here, against the file's real bytes, because a span and a
+/// replacement that do not compose into the repaired text are not a fixit —
+/// they are two numbers and a string.
+#[test]
+fn json_check_report_carries_an_applicable_fixit() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let stores = temp_store_path();
+    let path = example_path("invalid/misspelled-field.whip");
+    let source = fs::read_to_string(&path).expect("read fixture");
+    let output = whip(bin, &stores)
+        .args(["--json", "check", path.to_str().expect("utf-8 path")])
+        .output()
+        .expect("check runs");
+    assert!(
+        !output.status.success(),
+        "a fixture under examples/invalid must be refused"
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).expect("check emits a JSON report");
+    let diagnostics = report
+        .as_array()
+        .and_then(|entries| entries.first())
+        .and_then(|entry| entry.pointer("/error/diagnostics"))
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let fixits: Vec<&Value> = diagnostics
+        .iter()
+        .filter_map(|diagnostic| diagnostic.get("fixits"))
+        .filter_map(Value::as_array)
+        .flatten()
+        .collect();
+    assert!(
+        !fixits.is_empty(),
+        "the report carries no fixit: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    for fixit in fixits {
+        assert_eq!(
+            fixit.get("applicability").and_then(Value::as_str),
+            Some("exact"),
+            "a did-you-mean with an exact candidate is an exact fixit: {fixit}"
+        );
+        let edits = fixit
+            .get("edits")
+            .and_then(Value::as_array)
+            .expect("fixit carries edits");
+        assert_eq!(edits.len(), 1, "{fixit}");
+        let start = edits[0]
+            .pointer("/source_span/start")
+            .and_then(Value::as_u64)
+            .expect("edit span start") as usize;
+        let end = edits[0]
+            .pointer("/source_span/end")
+            .and_then(Value::as_u64)
+            .expect("edit span end") as usize;
+        let replacement = edits[0]
+            .get("replacement")
+            .and_then(Value::as_str)
+            .expect("edit replacement");
+        // The span and the replacement compose into the repair, against the
+        // bytes on disk rather than against a copy of them.
+        let patched = format!("{}{replacement}{}", &source[..start], &source[end..]);
+        assert!(
+            patched.len() != source.len() || patched != source,
+            "the edit is a no-op: {fixit}"
+        );
+        assert!(
+            !patched.contains(&source[start..end]),
+            "the misspelling survived the edit: {fixit}"
+        );
+    }
+}
+
+/// TEXT OUTPUT DOES NOT PRINT FIXITS, and that is the decision, not an omission.
+///
+/// A rendered diagnostic already carries the repair twice over for a human: the
+/// caret is under the exact bytes to change, and the `= help:` line names the
+/// replacement. A third block restating them as a title and a byte range would
+/// be noise in the surface that is read by eye — and `spec/error-handling.md`
+/// "Rendering" asks for concise by default. The machine-shaped form belongs in
+/// the surfaces a machine reads, which are the JSON report and the LSP.
+///
+/// It is also what keeps `examples/invalid/*.diagnostics` byte-identical across
+/// this change: a fixit is additive metadata, not a new line of output.
+#[test]
+fn text_diagnostics_do_not_print_fixits() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let stores = temp_store_path();
+    let path = example_path("invalid/misspelled-field.whip");
+    let output = whip(bin, &stores)
+        .args(["check", path.to_str().expect("utf-8 path")])
+        .output()
+        .expect("check runs");
+    let rendered = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        rendered.contains("= help: did you mean `priority`?"),
+        "the human-facing repair is the help line: {rendered}"
+    );
+    assert!(
+        !rendered.contains("replace `prioirty`"),
+        "text output must not restate the fixit the caret and help line already \
+         carry: {rendered}"
+    );
+    assert!(
+        !rendered.to_lowercase().contains("applicability"),
+        "the applicability lattice is a machine's concern: {rendered}"
+    );
+}
+
+#[test]
+fn lsp_offers_a_compiler_fixit_as_a_quickfix_code_action() {
+    // THE EDITOR HALF OF A FIXIT (tracker D9). A misspelled field earns a
+    // `type.unknown_field` diagnostic whose caret is exactly the wrong name, so
+    // the compiler attaches a machine-applicable repair; `textDocument/codeAction`
+    // is where an editor collects it. The action must carry the exact replacement
+    // range and text — an action a user has to finish by hand is a suggestion, and
+    // the suggestion already rides in the diagnostic message.
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let stores = temp_store_path();
+    // `issue.prioirty` for the declared `priority`, inside a prompt body.
+    let text = "workflow Demo\\nclass Issue {\\n  priority string\\n}\\nagent a {\\n  provider fixture\\n  capacity 1\\n}\\nrule r\\n  when Issue as issue\\n=> {\\n  tell a \\\"look at {{ issue.prioirty }}\\\"\\n}\\n";
+    let mut input = String::new();
+    input += &frame(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#);
+    input += &frame(&format!(
+        r#"{{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{{"textDocument":{{"uri":"file:///ca.whip","text":"{text}"}}}}}}"#
+    ));
+    // The whole `tell` line, which is how an editor asks about the squiggle on it.
+    input += &frame(
+        r#"{"jsonrpc":"2.0","id":2,"method":"textDocument/codeAction","params":{"textDocument":{"uri":"file:///ca.whip"},"range":{"start":{"line":11,"character":0},"end":{"line":11,"character":40}},"context":{"diagnostics":[]}}}"#,
+    );
+    input += &frame(r#"{"jsonrpc":"2.0","method":"exit","params":{}}"#);
+
+    let stdout = lsp_stdout(bin, &stores, &input);
+
+    assert!(
+        stdout.contains(r#""title":"replace `prioirty` with `priority`""#),
+        "codeAction should offer the compiler's fixit: {stdout}"
+    );
+    assert!(
+        stdout.contains(r#""kind":"quickfix""#),
+        "the action should be a quickfix: {stdout}"
+    );
+    assert!(
+        stdout.contains(r#""newText":"priority""#),
+        "the action should carry the replacement text: {stdout}"
+    );
+    assert!(
+        stdout.contains(r#""isPreferred":true"#),
+        "an `exact` fixit is the preferred action: {stdout}"
+    );
+    // The action names the diagnostic it repairs, so the editor attaches it to
+    // that squiggle rather than to the line.
+    assert!(
+        stdout.contains(r#""code":"type.unknown_field""#),
+        "the action should name the diagnostic it repairs: {stdout}"
+    );
+}
+
+#[test]
+fn lsp_offers_no_code_action_where_the_compiler_knows_no_edit() {
+    // The other half, and the one that keeps the feature honest. `Isue` DOES name
+    // a candidate — the diagnostic says "did you mean `Issue`?" — but the caret
+    // covers the whole `Isue as t` clause rather than the name, so the compiler
+    // does not know which bytes to replace and offers nothing. An editor that is
+    // handed a repair for every error learns to ignore the lightbulb, and an
+    // editor handed THIS one would replace the binding along with the class.
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let stores = temp_store_path();
+    let text = "workflow Demo\\nclass Issue {\\n  priority string\\n}\\nrule r\\n  when Isue as t\\n=> {\\n  done t\\n}\\n";
+    let mut input = String::new();
+    input += &frame(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#);
+    input += &frame(&format!(
+        r#"{{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{{"textDocument":{{"uri":"file:///na.whip","text":"{text}"}}}}}}"#
+    ));
+    input += &frame(
+        r#"{"jsonrpc":"2.0","id":2,"method":"textDocument/codeAction","params":{"textDocument":{"uri":"file:///na.whip"},"range":{"start":{"line":5,"character":0},"end":{"line":5,"character":20}},"context":{"diagnostics":[]}}}"#,
+    );
+    input += &frame(r#"{"jsonrpc":"2.0","method":"exit","params":{}}"#);
+
+    let stdout = lsp_stdout(bin, &stores, &input);
+
+    assert!(
+        stdout.contains(r#"did you mean `Issue`?"#),
+        "the fixture stopped producing the did-you-mean this test is about: {stdout}"
+    );
+    assert!(
+        stdout.contains(r#"{"id":2,"jsonrpc":"2.0","result":[]}"#),
+        "a caret wider than the name should yield no code action: {stdout}"
+    );
+}
+
 #[test]
 fn lsp_workspace_symbol_indexes_open_documents() {
     // `workspace/symbol` returns matching symbols across every OPEN document. Here

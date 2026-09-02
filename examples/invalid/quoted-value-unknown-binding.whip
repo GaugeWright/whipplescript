@@ -1,0 +1,33 @@
+// Invalid: a terminal payload field whose value interpolates a binding that
+// does not exist. Quoting a value is not a way to stop its bindings being
+// checked — `"{{ nosuchbinding.field }}"` and `nosuchbinding.field` are the
+// same mistake, and the compiler used to report only the second of them.
+//
+// A `!value.contains('"')` guard stood in `dangling_value_root`, the blunt
+// patch for a prose false positive that string-masking now answers properly.
+// It failed OPEN in the other direction: any value carrying a quote was
+// skipped, interpolations included. D14, spec/diagnostic-quality-tracker.md.
+workflow QuotedValueUnknownBinding
+
+output result Outcome
+failure error Trouble
+
+class Outcome {
+  note string
+}
+
+class Trouble {
+  reason string
+}
+
+rule interpolated_in_a_string
+  when started
+=> {
+  fail error { reason "{{ nosuchbinding.field }}" }
+}
+
+rule the_same_value_without_quotes
+  when started
+=> {
+  fail error { reason nosuchbinding.field }
+}

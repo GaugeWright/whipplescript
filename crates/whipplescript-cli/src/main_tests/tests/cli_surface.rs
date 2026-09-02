@@ -804,6 +804,36 @@ fn retired_effect_kinds_are_flagged_but_current_kinds_are_not() {
     assert!(!is_retired_effect_kind("tracker.claim"));
 }
 
+/// The linter's half of tracker D11. `LintFinding` and `Diagnostic` stay
+/// separate types — a finding is addressed by declaration name and carries a
+/// configured action, neither of which a check diagnostic has — but they share
+/// one code vocabulary, and `is_lint_namespace` is the rule that keeps the
+/// sharing from becoming a leak.
+///
+/// Tested as a predicate rather than only through the `lint_diagnostic_code!`
+/// const assertion it drives: a compile-time refusal cannot be exercised by a
+/// test that has to compile, so the falsifiable thing is the question it asks.
+/// Delete the prefix check and this fails.
+#[test]
+fn only_the_lint_namespace_is_the_linters_to_emit() {
+    // Every code a lint rule actually ships passes.
+    assert!(is_lint_namespace("lint.unused_class"));
+    assert!(is_lint_namespace("lint.internal"));
+
+    // The codes `check` owns do not, which is the point: a lint rule that
+    // emitted one would put a correctness diagnostic under `whip.lint.json`,
+    // where a project file could `allow` it out of existence.
+    assert!(!is_lint_namespace("type.unknown_field"));
+    assert!(!is_lint_namespace("security.raw_exec_disabled"));
+
+    // A prefix is not a namespace. `lint` alone has no leaf, and `lintel.x`
+    // merely starts with the same five letters.
+    assert!(!is_lint_namespace("lint"));
+    assert!(!is_lint_namespace("lint."));
+    assert!(!is_lint_namespace("lintel.broad_grant"));
+    assert!(!is_lint_namespace(""));
+}
+
 #[test]
 fn lint_flags_tool_grant_on_non_owned_agent_only() {
     // DR-0025: a `tools [...]` grant only works under the owned harness. A
@@ -829,7 +859,10 @@ fn lint_flags_tool_grant_on_non_owned_agent_only() {
         1,
         "non-owned grant should warn: {findings:?}"
     );
-    assert_eq!(findings[0].code, "lint.tool_grant_requires_owned_harness");
+    assert_eq!(
+        findings[0].code.as_str(),
+        "lint.tool_grant_requires_owned_harness"
+    );
 
     // No grant → no finding regardless of provider.
     let no_grant = whipplescript_parser::compile_program(
@@ -1088,6 +1121,7 @@ fn renders_source_span_diagnostic() {
         code: diagnostic_code!("parse.unexpected_token"),
         severity: Severity::Error,
         related: Vec::new(),
+        fixits: Vec::new(),
         span: SourceSpan { start: 25, end: 27 },
         message: "expected profile string, found number literal".to_owned(),
         suggestion: Some("write `profile \"profile-name\"`".to_owned()),
@@ -1128,6 +1162,7 @@ fn a_span_inside_a_character_degrades_instead_of_panicking() {
                     code: diagnostic_code!("parse.unexpected_token"),
                     severity: Severity::Error,
                     related: Vec::new(),
+                    fixits: Vec::new(),
                     span: SourceSpan { start, end },
                     message: "boundary probe".to_owned(),
                     suggestion: None,
@@ -1202,6 +1237,7 @@ fn resolve_span_file_maps_offset_to_originating_file() {
         message: "expected profile string, found number literal".to_owned(),
         suggestion: None,
         related: Vec::new(),
+        fixits: Vec::new(),
     };
     let rendered = render_bundle_diagnostic("root.whip", &combined, &segments, &lib_diag);
     assert!(rendered.contains("--> lib.whip:2:11"), "{rendered}");
@@ -1220,6 +1256,7 @@ fn resolve_span_file_maps_offset_to_originating_file() {
         message: "expected profile string, found number literal".to_owned(),
         suggestion: None,
         related: Vec::new(),
+        fixits: Vec::new(),
     };
     let rendered = render_bundle_diagnostic("root.whip", &combined, &segments, &root_diag);
     assert!(rendered.contains("--> root.whip:3:11"), "{rendered}");
@@ -1271,6 +1308,7 @@ fn a_bundle_note_is_rebased_into_the_file_it_points_at() {
             },
             message: "`Widget` is declared here".to_owned(),
         }],
+        fixits: Vec::new(),
     };
     let rendered = render_bundle_diagnostic("root.whip", &combined, &segments, &diagnostic);
     assert!(rendered.contains("--> root.whip:2:1"), "{rendered}");
@@ -1298,6 +1336,7 @@ fn a_bundle_note_is_rebased_into_the_file_it_points_at() {
             },
             message: "`id` is declared `string` here".to_owned(),
         }],
+        fixits: Vec::new(),
     };
     let rendered = render_bundle_diagnostic("root.whip", &combined, &segments, &diagnostic);
     assert!(

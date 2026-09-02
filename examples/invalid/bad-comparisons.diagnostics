@@ -1,30 +1,30 @@
 error[expr.incomparable_types]: rule `compares_incompatible_types` compares incompatible expression types
-   --> examples/invalid/bad-comparisons.whip:17:8
+   --> examples/invalid/bad-comparisons.whip:17:27
    |
 17 |   when Task as task where task.title == task.priority
-   |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^
    = help: compare values with compatible scalar or finite-domain types
 error[expr.unorderable_types]: rule `orders_unorderable_values` orders non-orderable expression values
-   --> examples/invalid/bad-comparisons.whip:22:8
+   --> examples/invalid/bad-comparisons.whip:22:27
    |
 22 |   when Task as task where task.title > task.ready
-   |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |                           ^^^^^^^^^^^^^^^^^^^^^^^
    = help: use ordering only with int, float, duration, or time values
 error[expr.non_boolean_operand]: rule `uses_a_non_boolean_operand` uses boolean operator with non-boolean operand
-   --> examples/invalid/bad-comparisons.whip:27:8
+   --> examples/invalid/bad-comparisons.whip:27:27
    |
 27 |   when Task as task where task.priority && task.ready
-   |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |                           ^^^^^^^^^^^^^
    = help: use `&&` and `||` only with boolean expressions
 error[expr.non_collection_membership]: rule `tests_membership_against_a_scalar` uses membership against a non-array/non-map expression
-   --> examples/invalid/bad-comparisons.whip:32:8
+   --> examples/invalid/bad-comparisons.whip:32:41
    |
 32 |   when Task as task where task.title in task.priority
-   |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |                                         ^^^^^^^^^^^^^
    = help: use `in` with an array literal, array value, or map value
 error[type.unknown_binding]: rule `reads_an_undeclared_binding` has unknown expression root `other`
-   --> examples/invalid/bad-comparisons.whip:37:8
+   --> examples/invalid/bad-comparisons.whip:37:27
    |
 37 |   when Task as task where other.title == task.title
-   |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |                           ^^^^^^^^^^^
    = help: use a binding introduced by a `when ... as name` clause

@@ -284,7 +284,7 @@ fn verify_report_rejects_stale_ir_hash() {
 
     let error = verify_report_value(&report, "check.json", None).expect_err("ir_hash is stale");
     assert!(
-        error.contains("ir_hash must match the embedded snapshot hash"),
+        error.contains("ir_hash must match the embedded snapshot's identity hash"),
         "{error}"
     );
 }
@@ -325,7 +325,9 @@ fn verify_report_rejects_stale_accepted_program_digest() {
     let error = verify_report_value(&report, "check.json", None)
         .expect_err("accepted_program_digest is stale");
     assert!(
-        error.contains("accepted_program_digest does not match graph_id + snapshot"),
+        error.contains(
+            "accepted_program_digest does not match graph_id + the snapshot's identity projection"
+        ),
         "{error}"
     );
 }
@@ -1666,6 +1668,217 @@ fn verify_report_rejects_unsupported_ir_model_search_obligation() {
         .expect_err("unsupported generated IR obligation should fail");
     assert!(
         error.contains("not supported by the embedded snapshot"),
+        "{error}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The identity-hash refusals, and the source-backed re-check.
+//
+// `scripts/check-report-schemas.sh` already exercises all five, but it is a
+// dispatch-only deep suite: the mutation sweep runs `cargo test -p whipplescript`
+// and cannot see it, so every one of them read as unpinned. That reading is
+// right rather than pedantic — a refusal only a script nobody runs on a pull
+// request exercises is a refusal that can stop refusing without any gate
+// noticing.
+
+/// The source the source-backed re-check compiles.
+///
+/// `signal_source_construct_graph_and_lowered_report_for_test`'s program, plus
+/// the `use std.ingress` its `signal` declaration needs: the source-backed
+/// re-check compiles through `compile_source_path_for_validation`, which runs
+/// the authority-import gate the bare parser does not.
+const SOURCE_BACKED_FIXTURE: &str = r#"
+@service
+workflow EventIngress
+
+use std.ingress
+
+signal deploy.finished {
+  service string
+  status "ok" | "failed"
+}
+
+source webhook as deploy_events {
+  observe as obs
+  emit deploy.finished {
+    service obs.service
+    status obs.status
+  }
+}
+"#;
+
+/// A digest of the right shape that is not the right digest: 32 lowercase hex
+/// characters, so `verify_report_digest_field` passes it through to the
+/// identity comparison that is under test rather than rejecting it first.
+const NOT_THE_IDENTITY_HASH: &str = "00000000000000000000000000000000";
+
+#[test]
+fn verify_report_rejects_verified_artifact_bundle_stale_ir_hash() {
+    // A bundle entry is verified by its own function, not by the check-report
+    // shape's: `verify_report_rejects_stale_ir_hash` corrupts the same field on
+    // the same fixture and never reaches this refusal.
+    let (graph, lowered) = signal_source_construct_graph_and_lowered_report_for_test();
+    let entry = artifact_model_search_check_report_entry("event-ingress.whip", &graph, &lowered);
+    let verified_entries = verify_report_value(&Value::Array(vec![entry]), "check.json", None)
+        .expect("check report verifies");
+    let mut bundle = verified_report_artifacts_json(&verified_entries, VerifyReportEmit::Artifacts);
+    bundle
+        .get_mut("entries")
+        .and_then(Value::as_array_mut)
+        .and_then(|entries| entries.first_mut())
+        .and_then(Value::as_object_mut)
+        .expect("bundle entry object")
+        .insert(
+            "ir_hash".to_owned(),
+            Value::String(NOT_THE_IDENTITY_HASH.to_owned()),
+        );
+
+    let error = verify_report_value(&bundle, "artifacts.json", None)
+        .expect_err("a bundle entry's ir_hash must name its own snapshot");
+    assert!(
+        error.contains(
+            "artifacts.json.entries[0].ir_hash must match the embedded snapshot's identity hash"
+        ),
+        "{error}"
+    );
+}
+
+#[test]
+fn verify_report_rejects_source_backed_snapshot_mismatch() {
+    let ir = whipplescript_parser::compile_program(SOURCE_BACKED_FIXTURE)
+        .ir
+        .expect("source-backed fixture compiles");
+    let snapshot = ir.to_snapshot();
+    let entry = json!({
+        "source_hash": stable_hash_hex(SOURCE_BACKED_FIXTURE),
+        "snapshot": format!("{snapshot}\ndrifted_declaration\n"),
+        "ir_hash": ir_identity_hash(&snapshot),
+    });
+    let graph = json!({ "source_digest": sha256_hex(SOURCE_BACKED_FIXTURE.as_bytes()) });
+
+    let error = verify_source_backed_source_and_ir(
+        &entry,
+        &graph,
+        SOURCE_BACKED_FIXTURE,
+        &ir,
+        "check.json[0]",
+        "artifact",
+    )
+    .expect_err("a snapshot the source does not produce should reject");
+    assert_eq!(
+        error,
+        "check.json[0] source-backed artifact snapshot mismatch"
+    );
+}
+
+#[test]
+fn verify_report_rejects_source_backed_ir_hash_mismatch() {
+    // The snapshot itself is the compiler's own, so the mismatch this test
+    // isolates is the one the snapshot comparison above cannot catch: an
+    // `ir_hash` that is not the identity hash of the snapshot standing beside
+    // it. Nothing upstream can substitute for it — the check-report shape
+    // compares `ir_hash` against the snapshot the REPORT carries, and this
+    // compares it against the one the SOURCE produces.
+    let ir = whipplescript_parser::compile_program(SOURCE_BACKED_FIXTURE)
+        .ir
+        .expect("source-backed fixture compiles");
+    let snapshot = ir.to_snapshot();
+    let entry = json!({
+        "source_hash": stable_hash_hex(SOURCE_BACKED_FIXTURE),
+        "snapshot": snapshot,
+        "ir_hash": NOT_THE_IDENTITY_HASH,
+    });
+    let graph = json!({ "source_digest": sha256_hex(SOURCE_BACKED_FIXTURE.as_bytes()) });
+
+    let error = verify_source_backed_source_and_ir(
+        &entry,
+        &graph,
+        SOURCE_BACKED_FIXTURE,
+        &ir,
+        "check.json[0]",
+        "artifact",
+    )
+    .expect_err("an ir_hash that is not the snapshot's identity hash should reject");
+    assert!(
+        error.contains("check.json[0] source-backed artifact ir_hash mismatch"),
+        "{error}"
+    );
+}
+
+/// Writes the fixture where the model-search re-check can find it, and compiles
+/// it the way that re-check will: an absent file is not an error there, it is
+/// "nothing to re-derive", so a test that skips this step proves nothing.
+fn source_backed_model_search_fixture() -> (PathBuf, String, IrProgram) {
+    let path = temp_scratch_path(
+        "whipplescript-source-backed-model-search",
+        "event-ingress",
+        "whip",
+    );
+    fs::write(&path, SOURCE_BACKED_FIXTURE).expect("source-backed fixture writes");
+    let (source, ir) = match compile_source_path_for_validation(
+        path.to_str().expect("fixture path is utf-8"),
+        None,
+    ) {
+        Ok(compiled) => compiled,
+        Err(error) => panic!(
+            "source-backed fixture compiles from disk: {}",
+            compile_failure_summary(error)
+        ),
+    };
+    (path, source, ir)
+}
+
+#[test]
+fn verify_report_rejects_source_backed_model_search_snapshot_mismatch() {
+    let (path, source, ir) = source_backed_model_search_fixture();
+    let snapshot = ir.to_snapshot();
+    let entry = json!({
+        "path": path.to_str().expect("fixture path is utf-8"),
+        "source_hash": stable_hash_hex(&source),
+        "snapshot": format!("{snapshot}\ndrifted_declaration\n"),
+        "ir_hash": ir_identity_hash(&snapshot),
+    });
+    let graph = json!({ "source_digest": sha256_hex(source.as_bytes()) });
+
+    let error = verify_model_search_ir_obligations_from_source_if_available(
+        &entry,
+        &graph,
+        &[],
+        1,
+        "check.json[0]",
+    )
+    .expect_err("a snapshot the source does not produce should reject");
+    let _ = fs::remove_file(&path);
+    assert_eq!(
+        error,
+        "check.json[0] source-backed model_search snapshot mismatch"
+    );
+}
+
+#[test]
+fn verify_report_rejects_source_backed_model_search_ir_hash_mismatch() {
+    let (path, source, ir) = source_backed_model_search_fixture();
+    let snapshot = ir.to_snapshot();
+    let entry = json!({
+        "path": path.to_str().expect("fixture path is utf-8"),
+        "source_hash": stable_hash_hex(&source),
+        "snapshot": snapshot,
+        "ir_hash": NOT_THE_IDENTITY_HASH,
+    });
+    let graph = json!({ "source_digest": sha256_hex(source.as_bytes()) });
+
+    let error = verify_model_search_ir_obligations_from_source_if_available(
+        &entry,
+        &graph,
+        &[],
+        1,
+        "check.json[0]",
+    )
+    .expect_err("an ir_hash that is not the snapshot's identity hash should reject");
+    let _ = fs::remove_file(&path);
+    assert!(
+        error.contains("check.json[0] source-backed model_search ir_hash mismatch"),
         "{error}"
     );
 }

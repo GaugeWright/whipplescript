@@ -1,0 +1,112 @@
+// Invalid: three `case` shapes a `brace_delta(head).max(1)` floor used to read
+// as "one level deep, body starts on the next line" whatever was actually
+// written. Each is a mistake the compiler now catches; each was accepted, or
+// half-read, before. D14, spec/diagnostic-quality-tracker.md.
+use std.coercion
+
+@service
+workflow CaseBlockShapes
+
+input ticket Ticket
+input review Review
+
+output result Outcome
+
+class Outcome {
+  note string
+}
+
+class Ticket {
+  id string
+  status "open" | "triaged" | "done"
+}
+
+enum Verdict {
+  Approved {
+    score float
+  }
+  Rejected {
+    reason string
+  }
+}
+
+class Review {
+  verdict Verdict
+}
+
+class Classification {
+  summary string
+}
+
+class TerminalRoute {
+  branch string
+  detail string
+}
+
+coerce classify(title string) -> Classification {
+  prompt "Classify the work item"
+}
+
+// The `{` is written BELOW the head. The floor entered the block at depth 1,
+// the `{` line took it to 2, and every arm — which sits at depth 1 — was read
+// at depth 2 and never parsed as an arm. The case reached the IR with no
+// branches at all: nothing dispatched on it, and both of its mistakes escaped.
+rule the_block_opens_below_the_head
+  when Ticket as ticket
+=> {
+  case ticket.status
+  {
+    "open" => {
+      complete result { note "opened" }
+    }
+    "open" => {
+      complete result { note "again" }
+    }
+  }
+}
+
+// The first arm opens AND closes on its own line, so it owns no line below it.
+// The floor said depth 1, the arm swallowed the arms that followed, and they
+// left the compiler entirely. `x` is bound by its arm's pattern and nowhere
+// else, so the arm walk is the only pass that can type `x.nosuchfield` at all.
+rule an_arm_written_on_one_line
+  when Review as review
+=> {
+  case review.verdict {
+    Approved as a => { complete result { note "ok" } }
+    Rejected as x => { complete result { note x.nosuchfield } }
+  }
+}
+
+// A terminal-case guard is validated in exactly one place — the walk that the
+// one-line arm above derailed — so `failure.nosuchfield` escaped with it.
+rule a_terminal_arm_written_on_one_line
+  when Ticket as ticket
+=>
+{
+  coerce classify(ticket.id) as classification
+
+  after classification completes {
+    case classification {
+      Completed as result => { record TerminalRoute { branch "c" detail result.summary } }
+      Failed as failure where failure.nosuchfield == "y" => {
+        record TerminalRoute {
+          branch "failed"
+          detail failure.reason
+        }
+      }
+      TimedOut as timeout => {
+        record TerminalRoute {
+          branch "timed_out"
+          detail timeout.summary
+        }
+      }
+      Cancelled as cancel => {
+        record TerminalRoute {
+          branch "cancelled"
+          detail cancel.summary
+        }
+      }
+    }
+  }
+}

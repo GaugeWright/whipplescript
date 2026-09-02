@@ -2,9 +2,10 @@
 // function the expression kernel does not have, doing arithmetic on a string,
 // writing an array literal whose items do not share a type, indexing an array as
 // if it were a map, and reading through an optional field without proving it is
-// there. The caret is the whole `when` clause in every case because `Expr`
-// carries no spans of its own (tracker D10) — these fixtures pin the codes and
-// the repairs, not a sub-expression location that does not exist yet.
+// there. Each caret names what its message names — the rejected token, the
+// non-numeric operand, the literal, the indexed value, the unsafe path — which
+// is what tracker D10 bought; the snapshot beside this file is where that is
+// pinned, byte for byte.
 workflow Triage
 
 output result Verdict

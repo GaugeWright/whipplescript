@@ -33,7 +33,7 @@ use crate::body::parse_rule_body;
 use crate::body_print::print_statement_rn;
 use crate::{
     binding_after_as, format_description, format_item, format_tags, format_workflow, lex_comments,
-    parse_program, push_line, split_when_guard, stable_hash, Item, RuleDecl, WhenClause,
+    parse_program, push_line, split_when_guard, stable_hash, Item, RuleDecl,
 };
 
 /// One declaration's canonical identity and content hash.
@@ -338,10 +338,11 @@ fn try_alpha_rule(rule: &RuleDecl) -> Option<RuleDecl> {
             }
             None => new_pattern,
         };
-        whens.push(WhenClause {
-            text: new_text,
-            span: when.span,
-        });
+        // Alpha-renamed: the text is no longer what the file says, unless the
+        // reprint came out byte-identical — which `rewrite` is what decides.
+        let mut renamed_when = when.clone();
+        renamed_when.text.rewrite(new_text);
+        whens.push(renamed_when);
     }
 
     // Body: structured rename for definitions and `after` references, the

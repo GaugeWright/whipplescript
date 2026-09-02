@@ -45,9 +45,20 @@
 # hand-maintained, it would be a claim about coverage rather than a measurement
 # of it, and the first stale line would freeze a code nobody has ever seen.
 #
-# Coverage is measured through `whip check` only. A code reachable solely via
-# `whip lint`, `whip test`, or the LSP reads as PROVISIONAL here, which is
-# honest: this corpus does not reach it.
+# Coverage is measured through `whip check` AND `whip lint`, because both are
+# the compiler emitting a registered code over this corpus, and both are gated:
+# a code that stops coming out of either is caught. `whip lint` joined when the
+# linter's codes joined the register — before that the linter minted its codes
+# as bare strings, so its 25 codes were in no register and no coverage question
+# could be asked about them at all. A code reachable only through `whip test` or
+# the LSP still reads as PROVISIONAL, which is honest: this corpus does not
+# reach it.
+#
+# The two surfaces are grepped apart because they RENDER apart: `whip check`
+# heads a diagnostic `error[code]:` while `whip lint` writes
+# `path:line:col: warning [code] message (action)`. Reading the lint corpus with
+# the check pattern would have found nothing and marked every lint code
+# PROVISIONAL, which is the quiet failure this comment exists to prevent.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -255,7 +266,8 @@ if [[ ! -x "$WHIP" ]]; then
   exit 1
 fi
 
-: > "$work/emitted"
+: > "$work/raw"
+: > "$work/raw-lint"
 corpus=0
 while read -r whip; do
   [[ -n "$whip" ]] || continue
@@ -267,6 +279,11 @@ while read -r whip; do
   fi
   # A refused fixture exits non-zero; that is the normal case here, not a fault.
   "$WHIP" check "$whip" "${args[@]}" >>"$work/raw" 2>&1 || true
+  # The advisory plane, kept in its own file so the two renderings are read by
+  # their own patterns. A program `check` refuses never reaches a lint rule —
+  # `lint` reports the compile failure and stops — so this adds coverage only
+  # where a program compiles, which is exactly where a lint code can be emitted.
+  "$WHIP" lint "$whip" "${args[@]}" >>"$work/raw-lint" 2>&1 || true
 done < <(git ls-files '*.whip')
 
 if [[ "$corpus" -lt 50 ]]; then
@@ -275,8 +292,10 @@ if [[ "$corpus" -lt 50 ]]; then
   exit 1
 fi
 
-grep -Eho '^(error|warning|info|hint)\[[a-z0-9_.]+\]' "$work/raw" \
-  | sed 's/.*\[//;s/\]//' | sort -u > "$work/emitted" || true
+{
+  grep -Eho '^(error|warning|info|hint)\[[a-z0-9_.]+\]' "$work/raw" || true
+  grep -Eho ' (error|warning|info|hint) \[[a-z0-9_.]+\]' "$work/raw-lint" || true
+} | sed 's/.*\[//;s/\]//' | sort -u > "$work/emitted"
 
 # ---------------------------------------------------------------------------
 # 5. The check-plane ledger, with the coverage column.
@@ -288,14 +307,20 @@ grep -Eho '^(error|warning|info|hint)\[[a-z0-9_.]+\]' "$work/raw" \
   echo "# in the sources; do not hand-edit."
   echo "#"
   echo "# Second column: whether any .whip file in this repository makes"
-  echo "# \`whip check\` emit the code. The corpus is every .whip git tracks —"
-  echo "# examples/invalid/ and examples/diagnostics/ (the companion programs the"
-  echo "# docs' rendered samples come from) alike, plus the crate fixtures and the"
-  echo "# dogfood solutions. A code reached only by a companion program still"
-  echo "# counts: scripts/regen-docs-diagnostics.sh --check fails when one stops"
-  echo "# emitting the code its page documents, which is the guarantee the"
-  echo "# COVERED mark stands for. Quote a coverage figure with the corpus it"
-  echo "# was measured over; the count alone does not say."
+  echo "# \`whip check\` or \`whip lint\` emit the code. The corpus is every"
+  echo "# .whip git tracks — examples/invalid/ and examples/diagnostics/ (the"
+  echo "# companion programs the docs' rendered samples come from) alike, plus"
+  echo "# the crate fixtures and the dogfood solutions. A code reached only by a"
+  echo "# companion program still counts: scripts/regen-docs-diagnostics.sh"
+  echo "# --check fails when one stops emitting the code its page documents,"
+  echo "# which is the guarantee the COVERED mark stands for. Quote a coverage"
+  echo "# figure with the corpus it was measured over; the count alone does not"
+  echo "# say."
+  echo "#"
+  echo "# Both surfaces are the compiler emitting a registered code, and both are"
+  echo "# gated, so both count. \`whip lint\` joined when the lint codes"
+  echo "# joined the register: before that the linter minted them as bare"
+  echo "# strings, and no coverage question could be asked about them at all."
   echo "#"
   echo "#   COVERED      the corpus reaches it. Append-only: it may not be renamed"
   echo "#                or removed."

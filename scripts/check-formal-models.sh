@@ -132,6 +132,7 @@ declare -A EXPECTED_NO_SOLUTION=(
   ["effect-cycle-pacing.maude"]=9
   ["termination-measure.maude"]=9
   ["duration-arithmetic.maude"]=2
+  ["diagnostic-adequacy.maude"]=10
   ["rule-autofail.maude"]=5
   ["pinned-progressions.maude"]=5
   ["view-derivation.maude"]=5
@@ -268,6 +269,7 @@ declare -A EXPECTED_SOLUTION=(
   ["effect-cycle-pacing.maude"]=5
   ["termination-measure.maude"]=5
   ["duration-arithmetic.maude"]=2
+  ["diagnostic-adequacy.maude"]=28
   ["rule-autofail.maude"]=4
   ["pinned-progressions.maude"]=7
   ["view-derivation.maude"]=8
@@ -422,6 +424,42 @@ for test_name in "${!EXPECTED_SOLUTION[@]}"; do
     exit 1
   fi
 done
+
+# The adequacy model (models/maude/diagnostic-adequacy.maude) names real diagnostic
+# codes rather than invented ones, so that "the model tracks codes, not rendered text"
+# means something. A code renamed in the sources must rename here too, or the model is
+# reasoning about a code the compiler no longer emits.
+#
+# Two halves, because checking the SET is not checking the MAPPING. Existence in
+# crates/ is checked here; which constant carries which spelling is checked by the
+# model itself, because every `codeText` spelling is pinned by a `such that` clause on
+# the coverage search for the case that emits it. Exchange two spellings and the set is
+# unchanged and this loop still passes, but those two searches turn into No-solutions
+# and the verdict-signature comparison above fails. The second loop is what keeps that
+# true: a spelling no search names would be back to being dead data.
+echo "== diagnostic codes named by the adequacy model"
+(
+  cd "$ROOT"
+  adequacy_model="models/maude/diagnostic-adequacy.maude"
+  adequacy_test="models/maude/tests/diagnostic-adequacy.maude"
+  codes="$(sed -n 's/^ *eq codeText(.*) = "\(.*\)" \.$/\1/p' "$adequacy_model" | sort -u)"
+  if [[ -z "$codes" ]]; then
+    echo "no codeText spellings found in $adequacy_model" >&2
+    exit 1
+  fi
+  while read -r code; do
+    if ! grep -qrF "\"$code\"" crates/; then
+      echo "$adequacy_model names diagnostic code \`$code\`, which no source emits" >&2
+      exit 1
+    fi
+    if ! grep -qF "codeText(C:Code) == \"$code\"" "$adequacy_test"; then
+      echo "$adequacy_model spells \`$code\` but no search in $adequacy_test pins it," >&2
+      echo "so swapping it with another code's spelling would change no verdict" >&2
+      exit 1
+    fi
+  done <<< "$codes"
+  echo "checked $(wc -l <<<"$codes") codes against crates/ and against $adequacy_test"
+)
 
 echo "== generated Maude from platform construct catalog"
 (

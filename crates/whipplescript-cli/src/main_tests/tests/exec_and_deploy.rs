@@ -479,7 +479,7 @@ fn hermetic_capability_exec_served_from_cache_on_second_run() {
             ProgramVersionInput {
                 program_name: &ir.workflow,
                 source_hash: &stable_hash_hex(&source_text),
-                ir_hash: &stable_hash_hex(&snapshot),
+                ir_hash: &ir_identity_hash(&snapshot),
                 compiler_version: whipplescript_core::version(),
                 ir_snapshot: None,
             },
@@ -977,5 +977,105 @@ fn only_a_broken_pipe_survives_a_failed_stdin_write() {
     assert!(
         reason.starts_with("exec command failed to write stdin: "),
         "{reason}"
+    );
+}
+
+/// `whip step` refuses an instance the store does not have.
+///
+/// Pinned here because the mutation sweep could not see it: nothing referenced
+/// `validate_step_program_version`, whose only caller is the `step` command, so
+/// both of its `ok_or_else` refusals could have stopped refusing without a test
+/// noticing. They came into scope when the `ir_hash` line below them became the
+/// snapshot's identity hash.
+#[test]
+fn stepping_an_instance_the_store_does_not_have_is_refused() {
+    let store_path = unique_test_path("step-missing-instance", "sqlite");
+    let source = "workflow StepMissing\n\noutput result Done\n\nclass Done {\n  ok bool\n}\n\nrule go\n  when started\n=> {\n  complete result { ok true }\n}\n";
+    let ir = whipplescript_parser::compile_program(source)
+        .ir
+        .expect("the probe program compiles");
+    // The store exists and is empty, so the instance lookup is the first refusal.
+    SqliteStore::open(&store_path).expect("store");
+
+    let error = validate_step_program_version(
+        store_path.as_ref(),
+        "inst_does_not_exist",
+        "probe.whip",
+        source,
+        &ir,
+    )
+    .expect_err("an absent instance is refused");
+    assert!(
+        format!("{error:?}").contains("instance does not exist"),
+        "{error:?}"
+    );
+}
+
+/// ...and refuses an instance whose active version row is gone.
+///
+/// The state this guards CANNOT be built through the store's own API: a foreign
+/// key from `instances.version_id` to `program_versions` refuses it, which is
+/// why the refusal had no test and why one cannot be written from outside. It
+/// is defence against a store whose invariant was broken some other way — a
+/// legacy row, a manual edit, a bug elsewhere — so the test breaks it the same
+/// way, with the constraint off, rather than pretending the API allows it.
+#[test]
+fn stepping_an_instance_whose_active_version_is_gone_is_refused() {
+    let store_path = unique_test_path("step-missing-version", "sqlite");
+    let source = "workflow StepMissingVersion\n\noutput result Done\n\nclass Done {\n  ok bool\n}\n\nrule go\n  when started\n=> {\n  complete result { ok true }\n}\n";
+    let ir = whipplescript_parser::compile_program(source)
+        .ir
+        .expect("the probe program compiles");
+
+    let mut store = SqliteStore::open(&store_path).expect("store");
+    // A real program row, so only the VERSION is missing.
+    let version = store
+        .create_program_version(whipplescript_store::NewProgramVersion {
+            program_name: "StepMissingVersion",
+            source_hash: "src",
+            ir_hash: "irh",
+            compiler_version: "test",
+            ir_snapshot: None,
+            declared_capabilities_json: "[]",
+            declared_profiles_json: "[]",
+            declared_skills_json: "[]",
+            declared_schemas_json: "[]",
+            analysis_summary_json: "{}",
+            generated_artifacts_json: "[]",
+            artifact_root: None,
+        })
+        .expect("program version");
+    let instance = store
+        .create_instance(whipplescript_store::NewInstance {
+            program_id: &version.program_id,
+            version_id: &version.version_id,
+            input_json: "{}",
+        })
+        .expect("instance");
+    drop(store);
+
+    // Break the invariant the foreign key normally holds, which is the only
+    // state in which this refusal has anything to say.
+    let raw = rusqlite::Connection::open(AsRef::<Path>::as_ref(&store_path)).expect("reopen");
+    raw.execute_batch("PRAGMA foreign_keys = OFF;")
+        .expect("constraint off");
+    raw.execute(
+        "DELETE FROM program_versions WHERE version_id = ?1",
+        [version.version_id.as_str()],
+    )
+    .expect("orphan the instance");
+    drop(raw);
+
+    let error = validate_step_program_version(
+        store_path.as_ref(),
+        &instance.instance_id,
+        "probe.whip",
+        source,
+        &ir,
+    )
+    .expect_err("an absent active version is refused");
+    assert!(
+        format!("{error:?}").contains("active program version does not exist"),
+        "{error:?}"
     );
 }

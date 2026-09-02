@@ -262,7 +262,7 @@ workflow Child {
             ProgramVersionInput {
                 program_name: &parent_ir.workflow,
                 source_hash: &stable_hash_hex(&source_text),
-                ir_hash: &stable_hash_hex(&snapshot),
+                ir_hash: &ir_identity_hash(&snapshot),
                 compiler_version: whipplescript_core::version(),
                 ir_snapshot: None,
             },
@@ -340,7 +340,7 @@ workflow Child {
             ProgramVersionInput {
                 program_name: &parent_ir.workflow,
                 source_hash: &stable_hash_hex(&source_text),
-                ir_hash: &stable_hash_hex(&snapshot),
+                ir_hash: &ir_identity_hash(&snapshot),
                 compiler_version: whipplescript_core::version(),
                 ir_snapshot: None,
             },
@@ -497,7 +497,7 @@ workflow Child {
             ProgramVersionInput {
                 program_name: &parent_ir.workflow,
                 source_hash: &stable_hash_hex(&source_text),
-                ir_hash: &stable_hash_hex(&snapshot),
+                ir_hash: &ir_identity_hash(&snapshot),
                 compiler_version: whipplescript_core::version(),
                 ir_snapshot: None,
             },
@@ -578,7 +578,7 @@ workflow Child {
             ProgramVersionInput {
                 program_name: &parent_ir.workflow,
                 source_hash: &stable_hash_hex(&source_text),
-                ir_hash: &stable_hash_hex(&snapshot),
+                ir_hash: &ir_identity_hash(&snapshot),
                 compiler_version: whipplescript_core::version(),
                 ir_snapshot: None,
             },
@@ -694,7 +694,7 @@ workflow Child {
             ProgramVersionInput {
                 program_name: &parent_ir.workflow,
                 source_hash: &stable_hash_hex(&source_text),
-                ir_hash: &stable_hash_hex(&snapshot),
+                ir_hash: &ir_identity_hash(&snapshot),
                 compiler_version: whipplescript_core::version(),
                 ir_snapshot: None,
             },

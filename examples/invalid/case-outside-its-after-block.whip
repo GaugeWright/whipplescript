@@ -1,0 +1,54 @@
+// Invalid: a terminal-output `case` written OUTSIDE the `after … completes`
+// block whose outcome it matches on. `classification` names an effect, not a
+// value, so at rule level it is not a typed path and the `case` never runs.
+//
+// The mistake was invisible when the `after` block was written on one line:
+// `brace_delta(head).max(1)` gave that block a scope one level deep, nothing
+// closed it, and the `case` below was read as being inside it. The same
+// program with the same block written across three lines was refused. D14,
+// spec/diagnostic-quality-tracker.md.
+use std.coercion
+
+@service
+workflow CaseOutsideItsAfterBlock
+
+class WorkItem {
+  title string
+}
+
+class Classification {
+  summary string
+}
+
+class TerminalRoute {
+  branch string
+  detail string
+}
+
+coerce classify(title string) -> Classification {
+  prompt "Classify the work item"
+}
+
+rule classify_work
+  when WorkItem as item
+=>
+{
+  coerce classify(item.title) as classification
+
+  after classification completes { record TerminalRoute { branch "seen" detail "x" } }
+
+  case classification {
+    Completed as result => {
+      record TerminalRoute { branch "completed" detail result.summary }
+    }
+    Failed as failure => {
+      record TerminalRoute { branch "failed" detail failure.reason }
+    }
+    TimedOut as timeout => {
+      record TerminalRoute { branch "timed_out" detail timeout.summary }
+    }
+    Cancelled as cancel => {
+      record TerminalRoute { branch "cancelled" detail cancel.summary }
+    }
+  }
+}

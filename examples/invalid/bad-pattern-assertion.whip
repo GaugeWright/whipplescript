@@ -1,0 +1,46 @@
+// An `assert` written INSIDE a `pattern`, calling a function the expression
+// kernel does not have — the same mistake as the first rule of
+// `bad-guard-expressions`, in the one place where the expression's text stops
+// being the file's.
+//
+// `apply` substitutes `Input` with `IncomingChangeRequest`, so the parse error's
+// range — measured against `count(IncomingChangeRequest) == nope(0)` — is
+// sixteen bytes past where the same range sits in the file. Resolved against
+// `span.start` it landed on the `apply` line, three lines below, underlining a
+// schema name that has nothing to do with the message. The assertion's text
+// records that it is no longer the file's, and the caret degrades to the whole
+// assertion. The snapshot beside this file is where that is pinned.
+workflow PatternAssertion
+
+output result Verdict
+
+class Verdict {
+  note string
+}
+
+class IncomingChangeRequest {
+  id string
+  title string
+}
+
+table requests as IncomingChangeRequest [
+  {
+    id "CR-1"
+    title "the timer fires twice"
+  }
+]
+
+pattern Audit<Input> {
+  assert count(Input) == nope(0)
+}
+
+apply Audit<IncomingChangeRequest> as audit {
+}
+
+rule finish
+  when IncomingChangeRequest as request
+=> {
+  complete result {
+    note "done"
+  }
+}

@@ -1,0 +1,673 @@
+--- Formal diagnostic ADEQUACY, spec/error-handling.md "Formal Diagnostic
+--- Adequacy" (tracker row D12). The four obligations that section states are
+--- about the shape of the checker, not about the quality of its prose:
+---
+---   completeness  every modeled rejection path emits or requires a diagnostic
+---   soundness     every modeled diagnostic corresponds to a real failed invariant
+---   provenance    every modeled diagnostic cites the rejected object or transition
+---   ownership     only checker/runtime-owned facts can satisfy diagnostic adequacy
+---
+--- The model tracks diagnostic CODES and provenance classes, never rendered
+--- text -- the section says so, and human wording belongs to fixtures. Every
+--- code constant below carries its exact spelling from a real emitting site:
+--- `crates/whipplescript-cli/src/main.rs` for the report-validator families and
+--- `crates/whipplescript-parser/src/lib.rs` for the registered `construct.*`
+--- one. `scripts/check-formal-models.sh` greps those spellings back out of the
+--- sources, so a renamed code fails the gate rather than leaving the model
+--- naming something the compiler no longer emits.
+---
+--- The spelling is load-bearing, not decoration. Every coverage search in
+--- models/maude/tests/diagnostic-adequacy.maude binds the emitted code to a
+--- VARIABLE and constrains it with `such that codeText(C) == "..."`, so the
+--- chain invariant -> `codeOf` -> constant -> `codeText` -> spelling is what
+--- each search asserts. Swap two constants' spellings and the two searches that
+--- named them flip to No-solution, which changes the verdict signature the gate
+--- compares. A gate that only checked that twelve strings exist somewhere in
+--- `crates/` could not see that swap.
+---
+--- What the checker abstracts to. A candidate program carries a WORKLIST of
+--- obligations -- one (object, invariant) pair per thing the checker owes an
+--- answer about. Discharging an obligation pops it and updates two things at
+--- once: the ERROR FLAG the verdict reads, and the DIAGNOSTIC LIST the person
+--- reads. The whole static claim is that those two cannot come apart, because
+--- one transition writes both. The negative modules take them apart, each in a
+--- way this repository has actually shipped:
+---
+---   -SKIPPING  a scanner meets a shape it cannot parse and moves on. This is
+---              the defect of 2026-09-01 ("The scanners that could not read a
+---              shape were not checking it"): declining to read reads as
+---              accepting.
+---   -SILENT    a check fails and returns early without pushing its diagnostic.
+---              The verdict says no and says nothing.
+---   -EAGER     a check pushes its diagnostic but the verdict is computed from
+---              a flag it forgot to set. The program compiles with an error
+---              standing against it.
+---   -BATCHING  a finding minted against one object is re-attached to its
+---              neighbour. The finding is real; the citation is not.
+---   -BYSTANDER a finding is re-attached to whatever object the scan's cursor
+---              happens to be holding -- an object that never owed the
+---              invariant at all. This is the ordinary noisy-validator defect,
+---              and it is a DIFFERENT defect from -BATCHING: the sibling a
+---              finding is batched onto at least owed the same obligation and
+---              satisfied it, whereas the bystander was never asked.
+---   -ESCALATING  a near-miss advisory is minted at error severity, so a
+---              program is refused for an invariant that holds.
+---   -TRUSTING  the checker forgets which facts were its own. A package's
+---              manifest discharges the obligation and adequacy is concluded
+---              from the package's word.
+---
+--- Runtime diagnostic adequacy -- capability denial, assertion failure,
+--- provider failure and output validation, stale completion, script disabled,
+--- cancel/revision conflict -- is deliberately NOT here. Those are durable
+--- lifecycle obligations; see the note in spec/error-handling.md and tracker
+--- row D12 for which of them already hold in models/tla and
+--- models/trace-invariant-correspondence.tsv and which are still open.
+
+mod WHIPPLESCRIPT-DIAGNOSTIC-ADEQUACY-DATA is
+  protecting BOOL .
+  protecting STRING .
+
+  sorts GraphId Obj Inv Code Sev Owner OwnerList Diag DiagList Ob ObList Verdict Cfg .
+
+  op progAlpha : -> GraphId [ctor] .
+
+  --- The objects a static diagnostic can cite. Two edges so that a diagnostic
+  --- has a SIBLING to be wrongly attached to, which is what provenance is about.
+  ops nodeAlpha nodeBeta portMemory edgeOne edgeTwo coreRun keywordEvery : -> Obj [ctor] .
+
+  --- One invariant per rejection case spec/error-handling.md requires the model
+  --- to cover, plus `shapeReadable`: the obligation that the checker could read
+  --- the object at all, which is the one the skipping defect drops.
+  ops
+    requiredPortSatisfied
+    resolutionUnambiguous
+    resourceIdentityMatches
+    typeCompatible
+    phaseCompatible
+    versionCompatible
+    keywordPrivileged
+    loweringClassSupported
+    coreObjectOwnerUnique
+    noRuntimeStateMaterialized
+    outputKindAllowed
+    shapeReadable
+    : -> Inv [ctor] .
+
+  ops
+    cgInterfaceUnsatisfied
+    cgCardinalityExactlyOne
+    cgEdgeResourceMismatch
+    cgEdgeTypeMismatch
+    cgEdgePhaseMismatch
+    cgEdgeVersionMismatch
+    cReservedName
+    cgLoweringClassUnsupported
+    liOwnerDuplicate
+    liRuntimeStateMaterialized
+    liOutputKindUnallowed
+    cgNodeIdMissing
+    : -> Code [ctor] .
+
+  --- The exact spelling each code constant stands for. Nothing rewrites over
+  --- these; they exist so the model names real codes and so the gate can check
+  --- that it still does.
+  op codeText : Code -> String .
+  eq codeText(cgInterfaceUnsatisfied) = "construct_graph.interface.unsatisfied" .
+  eq codeText(cgCardinalityExactlyOne) = "construct_graph.cardinality.exactly_one" .
+  eq codeText(cgEdgeResourceMismatch) = "construct_graph.edge.resource_mismatch" .
+  eq codeText(cgEdgeTypeMismatch) = "construct_graph.edge.type_mismatch" .
+  eq codeText(cgEdgePhaseMismatch) = "construct_graph.edge.phase_mismatch" .
+  eq codeText(cgEdgeVersionMismatch) = "construct_graph.edge.version_mismatch" .
+  --- `construct.reserved_name` and not `package_manifest.reserved_std_name`.
+  --- The latter is a `PackageSyncDiagnostic` raised by `whip package sync` when
+  --- a locked manifest claims the reserved std namespace -- a package-management
+  --- refusal about who may PUBLISH a name, which is not the case this model
+  --- carries. The case here is a program using a name the platform reserves
+  --- without the privilege to use it, and that is
+  --- `diagnostic_code!("construct.reserved_name")`, at THREE sites: a rule that
+  --- binds a reserved keyword and a rule that records a kernel-owned terminal
+  --- schema, both in `crates/whipplescript-parser/src/lib.rs`, and an enum
+  --- variant declaring the reserved field `variant` in `lowering.rs`. The
+  --- privilege-tuple half of the same idea -- a package construct claiming a
+  --- reserved keyword with no platform-catalog authorization -- is
+  --- `reserved_keyword_privilege_error` in
+  --- `crates/whipplescript-kernel/src/package_registry.rs`, and it refuses with
+  --- a bare registry string carrying no code at all; see tracker row D12.
+  eq codeText(cReservedName) = "construct.reserved_name" .
+  eq codeText(cgLoweringClassUnsupported) = "construct_graph.node.lowering_class_unsupported" .
+  eq codeText(liOwnerDuplicate) = "lowered_ir.core_object.owner_duplicate" .
+  eq codeText(liRuntimeStateMaterialized) = "lowered_ir.core_object.runtime_state_materialized" .
+  eq codeText(liOutputKindUnallowed) = "lowered_ir.node.output_kind_unallowed" .
+  eq codeText(cgNodeIdMissing) = "construct_graph.node.id_missing" .
+
+  --- A failed invariant determines the code. The mapping is total and is a
+  --- FUNCTION of the invariant: one defect earns one code, and a code cannot be
+  --- minted from anywhere except the invariant it belongs to.
+  op codeOf : Inv -> Code .
+  eq codeOf(requiredPortSatisfied) = cgInterfaceUnsatisfied .
+  eq codeOf(resolutionUnambiguous) = cgCardinalityExactlyOne .
+  eq codeOf(resourceIdentityMatches) = cgEdgeResourceMismatch .
+  eq codeOf(typeCompatible) = cgEdgeTypeMismatch .
+  eq codeOf(phaseCompatible) = cgEdgePhaseMismatch .
+  eq codeOf(versionCompatible) = cgEdgeVersionMismatch .
+  eq codeOf(keywordPrivileged) = cReservedName .
+  eq codeOf(loweringClassSupported) = cgLoweringClassUnsupported .
+  eq codeOf(coreObjectOwnerUnique) = liOwnerDuplicate .
+  eq codeOf(noRuntimeStateMaterialized) = liRuntimeStateMaterialized .
+  eq codeOf(outputKindAllowed) = liOutputKindUnallowed .
+  eq codeOf(shapeReadable) = cgNodeIdMissing .
+
+  ops errorSev warningSev : -> Sev [ctor] .
+
+  --- Provenance classes. `validatorOwned` and `runtimeOwned` are the checker's
+  --- own conclusions; `packageSupplied` is a fact a package's manifest asserts.
+  ops validatorOwned runtimeOwned packageSupplied : -> Owner [ctor] .
+
+  op noOwners : -> OwnerList [ctor] .
+  op ocons : Owner OwnerList -> OwnerList [ctor] .
+
+  --- Adequacy may rest only on facts the checker or the runtime owns. One
+  --- package-supplied discharge is enough to lose it, and nothing puts it back.
+  --- Nothing in the static half mints `runtimeOwned`: it is the class the
+  --- runtime obligations discharge under, and admitting it here is what keeps
+  --- this predicate from having to change when that half lands.
+  op adequatelyOwned : OwnerList -> Bool .
+  eq adequatelyOwned(noOwners) = true .
+  eq adequatelyOwned(ocons(validatorOwned, Ws:OwnerList)) = adequatelyOwned(Ws:OwnerList) .
+  eq adequatelyOwned(ocons(runtimeOwned, Ws:OwnerList)) = adequatelyOwned(Ws:OwnerList) .
+  eq adequatelyOwned(ocons(packageSupplied, Ws:OwnerList)) = false .
+
+  --- A diagnostic IS its code, severity, the object it cites, the invariant it
+  --- was minted from, and who minted it. There is no rendered text in the model.
+  op d : Code Sev Obj Inv Owner -> Diag [ctor] .
+  op noDiags : -> DiagList [ctor] .
+  op dcons : Diag DiagList -> DiagList [ctor] .
+
+  op hasError : DiagList -> Bool .
+  eq hasError(noDiags) = false .
+  eq hasError(dcons(d(C:Code, errorSev, O:Obj, I:Inv, W:Owner), Ds:DiagList)) = true .
+  eq hasError(dcons(d(C:Code, warningSev, O:Obj, I:Inv, W:Owner), Ds:DiagList)) = hasError(Ds:DiagList) .
+
+  op ob : Obj Inv -> Ob [ctor] .
+  op noObs : -> ObList [ctor] .
+  op obcons : Ob ObList -> ObList [ctor] .
+
+  ops acceptVerdict rejectVerdict : -> Verdict [ctor] .
+
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+
+  --- Program under check, and the checker's running state: the graph, the
+  --- obligations still owed, the error flag the VERDICT reads, the diagnostics
+  --- the PERSON reads, and the ledger of who supplied each discharge.
+  op candidate : GraphId -> Cfg [ctor] .
+  op checking : GraphId ObList Bool DiagList OwnerList -> Cfg [ctor] .
+
+  --- Facts about the program the checker reads.
+  op readable : Obj -> Cfg [ctor] .
+  op unreadable : Obj -> Cfg [ctor] .
+  op holds : Obj Inv -> Cfg [ctor] .
+  op violates : Obj Inv -> Cfg [ctor] .
+  op nearMiss : Obj Inv -> Cfg [ctor] .
+  op sibling : Obj Obj -> Cfg [ctor] .
+
+  --- What is actually wrong with the program, listed independently of anything
+  --- the checker does or says: the (object, invariant) pairs the object OWED
+  --- and FAILED. It is part of the seed, written by the same generators that
+  --- write the `holds`/`violates` facts, and no rule anywhere reads or writes
+  --- it except the provenance witness. That is what keeps the provenance
+  --- obligation from being circular: it compares what the checker SAID against
+  --- the program's defects, not against the checker's own bookkeeping.
+  ---
+  --- Every seed below carries exactly one of these. A seed without one puts the
+  --- provenance witness permanently out of reach, so seeds are defined here and
+  --- nowhere else.
+  op realFailures : GraphId ObList -> Cfg [ctor] .
+  op unrealFailure : GraphId Obj Inv -> Cfg [ctor] .
+
+  --- Membership: did this object owe this invariant and fail it?
+  op owedAndFailed : Obj Inv ObList -> Bool .
+  eq owedAndFailed(O:Obj, I:Inv, noObs) = false .
+  eq owedAndFailed(O:Obj, I:Inv, obcons(ob(O:Obj, I:Inv), Fs:ObList)) = true .
+  ceq owedAndFailed(O:Obj, I:Inv, obcons(ob(O2:Obj, I2:Inv), Fs:ObList)) =
+    owedAndFailed(O:Obj, I:Inv, Fs:ObList)
+    if O2:Obj =/= O:Obj or I2:Inv =/= I:Inv .
+
+  --- Facts a PACKAGE asserts. A manifest may declare that an object satisfies
+  --- an invariant; that is what a package contract is for. It may also claim
+  --- the whole graph is accepted, or that its diagnostics are complete.
+  op packageDeclares : GraphId Obj Inv -> Cfg [ctor] .
+  op packageClaimsAccepted : GraphId -> Cfg [ctor] .
+  op packageClaimsComplete : GraphId -> Cfg [ctor] .
+
+  --- Outcomes.
+  op verdict : GraphId Verdict DiagList OwnerList -> Cfg [ctor] .
+  op report : GraphId DiagList OwnerList -> Cfg [ctor] .
+  op emitted : GraphId Diag -> Cfg [ctor] .
+  op accepted : GraphId -> Cfg [ctor] .
+  op rejectedGraph : GraphId -> Cfg [ctor] .
+  op diagnosticsComplete : GraphId -> Cfg [ctor] .
+  op diagnosticsNotComplete : GraphId -> Cfg [ctor] .
+
+  --- The three forbidden states the obligations are stated over. Nothing in the
+  --- correct module mints them; each negative module reaches one.
+  op silentRejection : GraphId -> Cfg [ctor] .
+  op unsoundAcceptance : GraphId -> Cfg [ctor] .
+  op floatingDiagnostic : GraphId Obj Inv -> Cfg [ctor] .
+
+  --- The obligation set of the sample program. Every rejection case
+  --- spec/error-handling.md requires is here, and `typeCompatible` is owed for
+  --- BOTH edges so a diagnostic has a same-invariant sibling to be misattached
+  --- to.
+  op allObs : -> ObList .
+  eq allObs =
+    obcons(ob(portMemory, requiredPortSatisfied),
+    obcons(ob(portMemory, resolutionUnambiguous),
+    obcons(ob(edgeOne, resourceIdentityMatches),
+    obcons(ob(edgeOne, typeCompatible),
+    obcons(ob(edgeTwo, typeCompatible),
+    obcons(ob(edgeOne, phaseCompatible),
+    obcons(ob(edgeOne, versionCompatible),
+    obcons(ob(keywordEvery, keywordPrivileged),
+    obcons(ob(nodeAlpha, loweringClassSupported),
+    obcons(ob(coreRun, coreObjectOwnerUnique),
+    obcons(ob(coreRun, noRuntimeStateMaterialized),
+    obcons(ob(nodeBeta, outputKindAllowed), noObs)))))))))))) .
+
+  --- Every object's shape parses.
+  op allReadable : -> Cfg .
+  eq allReadable =
+    readable(nodeAlpha) readable(nodeBeta) readable(portMemory)
+    readable(edgeOne) readable(edgeTwo) readable(coreRun) readable(keywordEvery) .
+
+  --- The same program with nodeAlpha's shape unparseable.
+  op alphaUnreadable : -> Cfg .
+  eq alphaUnreadable =
+    unreadable(nodeAlpha) readable(nodeBeta) readable(portMemory)
+    readable(edgeOne) readable(edgeTwo) readable(coreRun) readable(keywordEvery) .
+
+  --- Every obligation satisfied.
+  op factsHolding : ObList -> Cfg .
+  eq factsHolding(noObs) = none .
+  eq factsHolding(obcons(ob(O:Obj, I:Inv), Obs:ObList)) =
+    holds(O:Obj, I:Inv) factsHolding(Obs:ObList) .
+
+  --- Every obligation satisfied except one, which fails.
+  op factsFailing : ObList Obj Inv -> Cfg .
+  eq factsFailing(noObs, O:Obj, I:Inv) = none .
+  eq factsFailing(obcons(ob(O:Obj, I:Inv), Obs:ObList), O:Obj, I:Inv) =
+    violates(O:Obj, I:Inv) factsFailing(Obs:ObList, O:Obj, I:Inv) .
+  ceq factsFailing(obcons(ob(O2:Obj, I2:Inv), Obs:ObList), O:Obj, I:Inv) =
+    holds(O2:Obj, I2:Inv) factsFailing(Obs:ObList, O:Obj, I:Inv)
+    if O2:Obj =/= O:Obj or I2:Inv =/= I:Inv .
+
+  --- Every obligation discharged by a fact the PACKAGE asserts, and nothing else.
+  op factsPackageDeclared : ObList -> Cfg .
+  eq factsPackageDeclared(noObs) = none .
+  eq factsPackageDeclared(obcons(ob(O:Obj, I:Inv), Obs:ObList)) =
+    packageDeclares(progAlpha, O:Obj, I:Inv) factsPackageDeclared(Obs:ObList) .
+
+  --- The seeds every module below is searched from. They are shared so that a
+  --- negative module reaches its forbidden state from the SAME program the
+  --- correct module cannot. Each states, in `realFailures`, what is actually
+  --- wrong with it -- nothing for a clean program, the one pair for a failing
+  --- one, and the unreadable object's `shapeReadable` for the unparseable one.
+  op cleanProgram : -> Cfg .
+  eq cleanProgram =
+    candidate(progAlpha) checking(progAlpha, allObs, false, noDiags, noOwners)
+    allReadable factsHolding(allObs) realFailures(progAlpha, noObs) .
+
+  op programFailing : Obj Inv -> Cfg .
+  eq programFailing(O:Obj, I:Inv) =
+    candidate(progAlpha) checking(progAlpha, allObs, false, noDiags, noOwners)
+    allReadable factsFailing(allObs, O:Obj, I:Inv)
+    realFailures(progAlpha, obcons(ob(O:Obj, I:Inv), noObs)) .
+
+  op unreadableProgram : -> Cfg .
+  eq unreadableProgram =
+    candidate(progAlpha) checking(progAlpha, allObs, false, noDiags, noOwners)
+    alphaUnreadable factsHolding(allObs)
+    realFailures(progAlpha, obcons(ob(nodeAlpha, shapeReadable), noObs)) .
+
+  op packageOnlyProgram : -> Cfg .
+  eq packageOnlyProgram =
+    candidate(progAlpha) checking(progAlpha, allObs, false, noDiags, noOwners)
+    allReadable factsPackageDeclared(allObs) realFailures(progAlpha, noObs) .
+endm
+
+--- The parts of the checker every module below shares: how an obligation is
+--- discharged against the checker's OWN reading of the program, how the verdict
+--- is settled, and the three forbidden states. What varies between the correct
+--- module and -TRUSTING is only what a PACKAGE-supplied fact is allowed to do,
+--- so that difference is the one the ownership searches range over.
+mod WHIPPLESCRIPT-DIAGNOSTIC-ADEQUACY-CHECKER is
+  protecting WHIPPLESCRIPT-DIAGNOSTIC-ADEQUACY-DATA .
+
+  var G : GraphId .
+  var O : Obj .
+  var I : Inv .
+  var Obs : ObList .
+  var E : Bool .
+  var Ds : DiagList .
+  var Ws : OwnerList .
+  var Fs : ObList .
+  var C : Code .
+  var W : Owner .
+
+  --- The invariant holds: discharge quietly, the error flag untouched.
+  rl [check-holds] :
+    checking(G, obcons(ob(O, I), Obs), E, Ds, Ws) readable(O) holds(O, I)
+    =>
+    checking(G, Obs, E, Ds, ocons(validatorOwned, Ws)) readable(O) holds(O, I) .
+
+  --- The invariant fails. ONE transition sets the error flag the verdict reads
+  --- AND appends the diagnostic the person reads, and the diagnostic it appends
+  --- carries the object and the invariant it was minted from. This single rule
+  --- is what completeness, soundness and provenance all rest on: there is no
+  --- state between raising the verdict and saying why.
+  rl [check-violates] :
+    checking(G, obcons(ob(O, I), Obs), E, Ds, Ws) readable(O) violates(O, I)
+    =>
+    checking(G, Obs, true,
+      dcons(d(codeOf(I), errorSev, O, I, validatorOwned), Ds),
+      ocons(validatorOwned, Ws))
+    readable(O) violates(O, I)
+    emitted(G, d(codeOf(I), errorSev, O, I, validatorOwned)) .
+
+  --- The scanner cannot read the object's shape. Declining to read is a
+  --- REJECTION, not a pass. The same transition records the invariant it is
+  --- citing -- `shapeReadable` genuinely failed -- so the diagnostic it mints
+  --- has something real behind it.
+  rl [check-unreadable] :
+    checking(G, obcons(ob(O, I), Obs), E, Ds, Ws) unreadable(O)
+    =>
+    checking(G, Obs, true,
+      dcons(d(codeOf(shapeReadable), errorSev, O, shapeReadable, validatorOwned), Ds),
+      ocons(validatorOwned, Ws))
+    unreadable(O) violates(O, shapeReadable)
+    emitted(G, d(codeOf(shapeReadable), errorSev, O, shapeReadable, validatorOwned)) .
+
+  --- An advisory. The object satisfies the invariant and a near miss is still
+  --- worth saying; a warning never touches the error flag. This is the reason
+  --- soundness is stated over ERROR diagnostics: an accepted program may carry
+  --- warnings, and must never carry an error.
+  rl [check-near-miss] :
+    checking(G, obcons(ob(O, I), Obs), E, Ds, Ws) readable(O) holds(O, I) nearMiss(O, I)
+    =>
+    checking(G, Obs, E,
+      dcons(d(codeOf(I), warningSev, O, I, validatorOwned), Ds),
+      ocons(validatorOwned, Ws))
+    readable(O) holds(O, I)
+    emitted(G, d(codeOf(I), warningSev, O, I, validatorOwned)) .
+
+  --- The worklist is empty: the verdict is read off the error flag.
+  rl [settle-accept] :
+    checking(G, noObs, false, Ds, Ws) => verdict(G, acceptVerdict, Ds, Ws) .
+
+  rl [settle-reject] :
+    checking(G, noObs, true, Ds, Ws) => verdict(G, rejectVerdict, Ds, Ws) .
+
+  --- Concluding the verdict. The four rules below are total and mutually
+  --- exclusive over (verdict, hasError). Two of them are the outcomes; the other
+  --- two are the forbidden states, and they are UNREACHABLE here only because
+  --- the flag and the list are written by the same transitions above.
+  crl [conclude-accepted] :
+    verdict(G, acceptVerdict, Ds, Ws) => accepted(G) report(G, Ds, Ws)
+    if hasError(Ds) = false .
+
+  crl [conclude-rejected] :
+    verdict(G, rejectVerdict, Ds, Ws) => rejectedGraph(G) report(G, Ds, Ws)
+    if hasError(Ds) = true .
+
+  --- Completeness: a graph refused with no error diagnostic behind the refusal.
+  crl [witness-silent-rejection] :
+    verdict(G, rejectVerdict, Ds, Ws) => silentRejection(G)
+    if hasError(Ds) = false .
+
+  --- Soundness: a graph accepted while an error diagnostic stands against it.
+  crl [witness-unsound-acceptance] :
+    verdict(G, acceptVerdict, Ds, Ws) => unsoundAcceptance(G)
+    if hasError(Ds) = true .
+
+  --- Provenance: an ERROR diagnostic citing an (object, invariant) pair that is
+  --- not among the program's real defects. The obligation the spec states is
+  --- "every modeled diagnostic cites the rejected object or transition", so the
+  --- witness is stated over the whole property: a citation is floating unless
+  --- the object it names actually FAILED an invariant it actually OWED.
+  ---
+  --- Both ways of not being that are caught, and they are different defects:
+  ---
+  ---   sibling    the cited object owed the same invariant and SATISFIED it --
+  ---              a finding batched onto a neighbour (-BATCHING).
+  ---   bystander  the cited object never owed the invariant at all -- a finding
+  ---              attached to whatever the scan's cursor held (-BYSTANDER).
+  ---
+  --- An earlier form of this rule required `holds(O, I)` in the configuration,
+  --- which is only the sibling half: the bystander has neither a `holds` nor a
+  --- `violates` fact for the pair, so nothing matched and the noisy validator
+  --- went uncaught. Reading `realFailures` instead states the property once and
+  --- catches both.
+  crl [witness-floating-diagnostic] :
+    emitted(G, d(C, errorSev, O, I, W)) realFailures(G, Fs)
+    =>
+    floatingDiagnostic(G, O, I) realFailures(G, Fs)
+    if owedAndFailed(O, I, Fs) = false .
+
+  --- The provenance witness rests entirely on `realFailures` telling the truth
+  --- about the program, and nothing above forces it to. The seed generators
+  --- write it and `factsFailing` from the same arguments, so they cannot
+  --- disagree by construction -- but a seed written by hand could claim a
+  --- failure the program does not have, and the witness would then read a
+  --- genuine misattribution as well-founded. So the premise is itself an
+  --- obligation: a listed failure whose object is recorded as SATISFYING that
+  --- invariant is a seed that lies.
+  crl [witness-unreal-failure] :
+    realFailures(G, Fs) holds(O, I)
+    =>
+    unrealFailure(G, O, I) holds(O, I)
+    if owedAndFailed(O, I, Fs) = true .
+
+  --- Ownership: adequacy is a checker-owned conclusion. It may be drawn only
+  --- when every discharge on the ledger came from a fact the checker or the
+  --- runtime owns.
+  crl [conclude-complete] :
+    report(G, Ds, Ws) => diagnosticsComplete(G)
+    if adequatelyOwned(Ws) = true .
+
+  crl [conclude-incomplete] :
+    report(G, Ds, Ws) => diagnosticsNotComplete(G)
+    if adequatelyOwned(Ws) = false .
+
+endm
+
+--- The checker as it must be shaped for the four obligations to hold: the
+--- shared machinery, plus the one door a package's own facts come through.
+mod WHIPPLESCRIPT-DIAGNOSTIC-ADEQUACY is
+  including WHIPPLESCRIPT-DIAGNOSTIC-ADEQUACY-CHECKER .
+
+  var G : GraphId .
+  var O : Obj .
+  var I : Inv .
+  var Obs : ObList .
+  var E : Bool .
+  var Ds : DiagList .
+  var Ws : OwnerList .
+
+  --- A package's manifest may discharge an obligation -- the contract is what
+  --- the package is for -- but the discharge is recorded as package-supplied,
+  --- and `adequatelyOwned` never recovers from one. What a package may not do
+  --- is make the graph diagnostic-complete.
+  rl [check-package-declared] :
+    checking(G, obcons(ob(O, I), Obs), E, Ds, Ws) packageDeclares(G, O, I)
+    =>
+    checking(G, Obs, E, Ds, ocons(packageSupplied, Ws)) packageDeclares(G, O, I) .
+
+  --- There is deliberately NO rule consuming packageClaimsAccepted or
+  --- packageClaimsComplete. A package-supplied acceptance or
+  --- diagnostic-complete fact is inert: it discharges nothing and concludes
+  --- nothing, which is the "rejected or ignored" spec/error-handling.md
+  --- requires. The -TRUSTING module supplies the rules that would honour it.
+endm
+
+--- Bite for completeness. The scanner meets a shape it cannot parse and moves
+--- on: the obligation leaves the worklist with no diagnostic and no error, so
+--- the program is ACCEPTED with the object never checked. This is the defect of
+--- 2026-09-01 in the small -- declining to read reads as accepting -- and it is
+--- reached from the same `unreadableProgram` the correct module refuses.
+mod DIAGNOSTIC-ADEQUACY-SKIPPING is
+  including WHIPPLESCRIPT-DIAGNOSTIC-ADEQUACY .
+
+  var G : GraphId .
+  var O : Obj .
+  var I : Inv .
+  var Obs : ObList .
+  var E : Bool .
+  var Ds : DiagList .
+  var Ws : OwnerList .
+
+  rl [check-skip-unreadable] :
+    checking(G, obcons(ob(O, I), Obs), E, Ds, Ws) unreadable(O)
+    =>
+    checking(G, Obs, E, Ds, ocons(validatorOwned, Ws)) unreadable(O) .
+endm
+
+--- Bite for completeness, second leg. A check that fails and returns early
+--- without pushing its diagnostic: the error flag goes up, the list stays as it
+--- was, and the verdict says no while saying nothing.
+mod DIAGNOSTIC-ADEQUACY-SILENT is
+  including WHIPPLESCRIPT-DIAGNOSTIC-ADEQUACY .
+
+  var G : GraphId .
+  var O : Obj .
+  var I : Inv .
+  var Obs : ObList .
+  var E : Bool .
+  var Ds : DiagList .
+  var Ws : OwnerList .
+
+  rl [check-violates-quietly] :
+    checking(G, obcons(ob(O, I), Obs), E, Ds, Ws) readable(O) violates(O, I)
+    =>
+    checking(G, Obs, true, Ds, ocons(validatorOwned, Ws)) readable(O) violates(O, I) .
+endm
+
+--- Bite for soundness. A check that pushes its diagnostic but leaves the flag
+--- the verdict is computed from alone. The program compiles with an error
+--- standing against it, which is exactly `graphAccepted(G) /\ errorDiagnostic(G)`.
+mod DIAGNOSTIC-ADEQUACY-EAGER is
+  including WHIPPLESCRIPT-DIAGNOSTIC-ADEQUACY .
+
+  var G : GraphId .
+  var O : Obj .
+  var I : Inv .
+  var Obs : ObList .
+  var E : Bool .
+  var Ds : DiagList .
+  var Ws : OwnerList .
+
+  rl [check-violates-unscored] :
+    checking(G, obcons(ob(O, I), Obs), E, Ds, Ws) readable(O) violates(O, I)
+    =>
+    checking(G, Obs, E,
+      dcons(d(codeOf(I), errorSev, O, I, validatorOwned), Ds),
+      ocons(validatorOwned, Ws))
+    readable(O) violates(O, I)
+    emitted(G, d(codeOf(I), errorSev, O, I, validatorOwned)) .
+endm
+
+--- Bite for provenance. A checker that reports one finding against a whole
+--- neighbourhood: having minted a diagnostic for one object it re-mints the
+--- same code against the sibling, which satisfies the invariant. The finding is
+--- real; the citation is not.
+mod DIAGNOSTIC-ADEQUACY-BATCHING is
+  including WHIPPLESCRIPT-DIAGNOSTIC-ADEQUACY .
+
+  var G : GraphId .
+  vars O O2 : Obj .
+  var I : Inv .
+  var C : Code .
+  var S : Sev .
+  var W : Owner .
+
+  rl [batch-to-sibling] :
+    emitted(G, d(C, S, O, I, W)) sibling(O, O2)
+    =>
+    emitted(G, d(C, S, O, I, W)) emitted(G, d(C, S, O2, I, W)) .
+endm
+
+--- Bite for provenance, bystander leg. The ordinary noisy validator: the scan
+--- that found the defect attaches it to the object its cursor is holding rather
+--- than to the object that failed. `keywordEvery` owes `keywordPrivileged` and
+--- nothing else, so a `typeCompatible` finding landing on it names an object
+--- that was never asked the question -- which is NOT the -BATCHING case, where
+--- the object owed the same obligation and satisfied it. The old
+--- `holds`-shaped provenance witness could not see this at all: there is no
+--- `holds(keywordEvery, typeCompatible)` fact for it to match.
+mod DIAGNOSTIC-ADEQUACY-BYSTANDER is
+  including WHIPPLESCRIPT-DIAGNOSTIC-ADEQUACY .
+
+  var G : GraphId .
+  var O : Obj .
+  var I : Inv .
+  var C : Code .
+  var W : Owner .
+
+  rl [blame-scan-cursor] :
+    emitted(G, d(C, errorSev, O, I, W)) readable(keywordEvery)
+    =>
+    emitted(G, d(C, errorSev, keywordEvery, I, W)) readable(keywordEvery) .
+endm
+
+--- Bite for ownership. A checker that does not track which facts were its own:
+--- a package's manifest discharges the obligation and is written to the ledger
+--- as if the checker had concluded it, so adequacy is concluded from the
+--- package's word. It is the shared checker with the package door widened, not
+--- the correct module with a rule bolted on, because the defect IS what the
+--- package door does. Its second rule honours a package-supplied acceptance
+--- fact directly, which is the other half of the case the spec names.
+mod DIAGNOSTIC-ADEQUACY-TRUSTING is
+  including WHIPPLESCRIPT-DIAGNOSTIC-ADEQUACY-CHECKER .
+
+  var G : GraphId .
+  var O : Obj .
+  var I : Inv .
+  var Obs : ObList .
+  var E : Bool .
+  var Ds : DiagList .
+  var Ws : OwnerList .
+
+  rl [check-package-trusted] :
+    checking(G, obcons(ob(O, I), Obs), E, Ds, Ws) packageDeclares(G, O, I)
+    =>
+    checking(G, Obs, E, Ds, ocons(validatorOwned, Ws)) packageDeclares(G, O, I) .
+
+  rl [trust-package-acceptance] :
+    candidate(G) packageClaimsAccepted(G)
+    =>
+    accepted(G) .
+endm
+
+--- Bite for provenance, second leg. A checker that mints its near-miss advisory
+--- at error severity: the invariant HOLDS, and the program is refused for it
+--- anyway. The severity carried on the diagnostic is what keeps an advisory
+--- from becoming a rejection reason, and this is the module where it does.
+mod DIAGNOSTIC-ADEQUACY-ESCALATING is
+  including WHIPPLESCRIPT-DIAGNOSTIC-ADEQUACY .
+
+  var G : GraphId .
+  var O : Obj .
+  var I : Inv .
+  var Obs : ObList .
+  var E : Bool .
+  var Ds : DiagList .
+  var Ws : OwnerList .
+
+  rl [check-near-miss-as-error] :
+    checking(G, obcons(ob(O, I), Obs), E, Ds, Ws) readable(O) holds(O, I) nearMiss(O, I)
+    =>
+    checking(G, Obs, true,
+      dcons(d(codeOf(I), errorSev, O, I, validatorOwned), Ds),
+      ocons(validatorOwned, Ws))
+    readable(O) holds(O, I)
+    emitted(G, d(codeOf(I), errorSev, O, I, validatorOwned)) .
+endm

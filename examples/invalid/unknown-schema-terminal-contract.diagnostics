@@ -1,0 +1,6 @@
+error[type.unknown_schema]: unknown schema reference `NoSuchClass`
+   --> examples/invalid/unknown-schema-terminal-contract.whip:13:14
+   |
+13 | output extra NoSuchClass
+   |              ^^^^^^^^^^^
+   = help: declare `class NoSuchClass` or `enum NoSuchClass` before using it

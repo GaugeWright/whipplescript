@@ -125,6 +125,28 @@ lowering-class-lifecycle.maude   platform lowering-class lifecycle profiles:
                                  allowed object-entrypoint pairs, and forbidden
                                  hidden lifecycle authority
 effect-dependencies.maude        success/failure/completes dependency release
+diagnostic-adequacy.maude        spec/error-handling.md "Formal Diagnostic
+                                 Adequacy", static half: the checker's error
+                                 flag and its diagnostic list are written by one
+                                 transition, so a rejection cannot be silent
+                                 (completeness), an accepted program cannot
+                                 carry an error (soundness), an error
+                                 diagnostic cannot cite an object that did not
+                                 fail an invariant it owed (provenance), and a
+                                 ledger of package-supplied discharges never
+                                 concludes adequacy (ownership). Eleven
+                                 rejection cases carry their real codes, pinned
+                                 by SPELLING in each search and checked back
+                                 against crates/ by the gate, so exchanging two
+                                 spellings changes a verdict. Seven negative
+                                 modules, one per leg: a scanner that skips the
+                                 shape it cannot read, a check that fails
+                                 without pushing, one that pushes without
+                                 failing, a finding batched onto a sibling that
+                                 owed the same obligation, a finding blamed on a
+                                 bystander that owed nothing at all, an advisory
+                                 minted at error severity, and a checker that
+                                 forgets whose facts these were
 guard-commit-bite.maude          bite proof: the generated no-commit search shape
                                  stays sound on the correct kernel yet catches an
                                  unsafe guard/assertion commit rewrite

@@ -4,14 +4,20 @@
 # in the sources; do not hand-edit.
 #
 # Second column: whether any .whip file in this repository makes
-# `whip check` emit the code. The corpus is every .whip git tracks —
-# examples/invalid/ and examples/diagnostics/ (the companion programs the
-# docs' rendered samples come from) alike, plus the crate fixtures and the
-# dogfood solutions. A code reached only by a companion program still
-# counts: scripts/regen-docs-diagnostics.sh --check fails when one stops
-# emitting the code its page documents, which is the guarantee the
-# COVERED mark stands for. Quote a coverage figure with the corpus it
-# was measured over; the count alone does not say.
+# `whip check` or `whip lint` emit the code. The corpus is every
+# .whip git tracks — examples/invalid/ and examples/diagnostics/ (the
+# companion programs the docs' rendered samples come from) alike, plus
+# the crate fixtures and the dogfood solutions. A code reached only by a
+# companion program still counts: scripts/regen-docs-diagnostics.sh
+# --check fails when one stops emitting the code its page documents,
+# which is the guarantee the COVERED mark stands for. Quote a coverage
+# figure with the corpus it was measured over; the count alone does not
+# say.
+#
+# Both surfaces are the compiler emitting a registered code, and both are
+# gated, so both count. `whip lint` joined when the lint codes
+# joined the register: before that the linter minted them as bare
+# strings, and no coverage question could be asked about them at all.
 #
 #   COVERED      the corpus reaches it. Append-only: it may not be renamed
 #                or removed.
@@ -94,7 +100,7 @@ expr.unreachable_case_branch COVERED
 expr.unsatisfiable_comparison COVERED
 expr.unsupported_argument_type COVERED
 expr.unsupported_function PROVISIONAL
-expr.untyped_case_scrutinee PROVISIONAL
+expr.untyped_case_scrutinee COVERED
 expr.untyped_object_literal COVERED
 expr.variant_without_payload PROVISIONAL
 graph.bounded_workflow_effect_cycle COVERED
@@ -114,6 +120,31 @@ graph.unmatchable_fact COVERED
 graph.unmeasured_resource_cycle COVERED
 graph.unreachable_terminal COVERED
 graph.unreleased_lease COVERED
+lint.agent_requires_probed_source PROVISIONAL
+lint.broad_file_grant COVERED
+lint.broad_vault_grant PROVISIONAL
+lint.coerce_result_unused PROVISIONAL
+lint.deep_after_nesting COVERED
+lint.envelope_field_on_payload PROVISIONAL
+lint.internal PROVISIONAL
+lint.mark_off_consumption_boundary PROVISIONAL
+lint.missing_agent_import COVERED
+lint.missing_coercion_import COVERED
+lint.missing_coord_import PROVISIONAL
+lint.missing_files_import PROVISIONAL
+lint.missing_ingress_import PROVISIONAL
+lint.missing_tracker_import PROVISIONAL
+lint.noop_rule COVERED
+lint.readmission_unprotected_effect COVERED
+lint.tool_grant_requires_owned_harness PROVISIONAL
+lint.unused_class COVERED
+lint.unused_coerce PROVISIONAL
+lint.unused_counter PROVISIONAL
+lint.unused_enum PROVISIONAL
+lint.unused_file_store PROVISIONAL
+lint.unused_lease PROVISIONAL
+lint.unused_ledger PROVISIONAL
+lint.unused_tracker COVERED
 lowering.internal PROVISIONAL
 lowering.unexpanded_pattern_application PROVISIONAL
 package_set.unknown_package PROVISIONAL

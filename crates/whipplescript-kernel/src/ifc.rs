@@ -3481,6 +3481,7 @@ pub fn check_ifc_program_with_imports(ir: &IrProgram, imports: &[IrProgram]) -> 
                 "re-sign the envelope with `whip gov sign` after editing it".to_owned(),
             ),
             related: Vec::new(),
+            fixits: Vec::new(),
         }],
         EnvelopeStatus::Verified(verified) => {
             let mut diagnostics = check_with_envelope_imports(ir, &verified, imports);
@@ -3549,6 +3550,7 @@ pub fn check_imported_tool_surfaces(imported: &[(String, Vec<String>)]) -> Vec<D
                  not import `{tool}`"
             )),
             related: Vec::new(),
+            fixits: Vec::new(),
         })
         .collect()
 }
@@ -4329,6 +4331,7 @@ fn flag_redacted_egress_projections(
                 ),
                 suggestion: Some(suggestion),
                 related: Vec::new(),
+                fixits: Vec::new(),
             });
         }
     }
@@ -4497,6 +4500,7 @@ pub fn check_with_envelope_imports(
                      crossing, drop the `endorsed` marker instead"
                 )),
                 related: Vec::new(),
+                fixits: Vec::new(),
             });
         }
         // DR-0051 §4: only closed fields cross. A record field shaped by an
@@ -4557,6 +4561,7 @@ pub fn check_with_envelope_imports(
                              separate fact the envelope leaves at public integrity"
                         )),
                         related: Vec::new(),
+                        fixits: Vec::new(),
                     });
                 }
             }
@@ -4606,6 +4611,7 @@ pub fn check_with_envelope_imports(
                                         request.method, request.url
                                     )),
                                     related: Vec::new(),
+                                    fixits: Vec::new(),
                                 });
                             }
                         }
@@ -4679,6 +4685,7 @@ pub fn check_with_envelope_imports(
                                     })
                                     .into_iter()
                                     .collect(),
+                                fixits: Vec::new(),
                             });
                             break;
                         }
@@ -4766,6 +4773,7 @@ pub fn check_with_envelope_imports(
                             })
                             .into_iter()
                             .collect(),
+                        fixits: Vec::new(),
                     });
                     break;
                 }
@@ -4873,6 +4881,7 @@ pub fn check_with_envelope_imports(
                     sink = bounded.sink,
                 )),
                 related: Vec::new(),
+                fixits: Vec::new(),
             });
         }
         // DR-0030 X2 (cross-package): a `tell <agent>` turn whose agent may call an
@@ -4936,6 +4945,7 @@ pub fn check_with_envelope_imports(
                                          reaches the turn"
                                     )),
                                     related: Vec::new(),
+                                    fixits: Vec::new(),
                                 });
                             }
                         }
@@ -5201,6 +5211,7 @@ pub fn check_with_envelope_imports(
                      judgment under `grant endorse {handle} to <role vouched for {sink}>`"
                 )),
                 related: Vec::new(),
+                fixits: Vec::new(),
             });
         }
         if let Some((src, sink, reaches_marked)) = leak {
@@ -5230,6 +5241,7 @@ pub fn check_with_envelope_imports(
                      {sink}>` (a grant alone never blesses a raw flow)"
                 )),
                 related: Vec::new(),
+                fixits: Vec::new(),
             });
         }
         if let Some((src, sink, src_int)) = inject {
@@ -5258,6 +5270,7 @@ pub fn check_with_envelope_imports(
                      influence)"
                 )),
                 related: Vec::new(),
+                fixits: Vec::new(),
             });
         }
 
@@ -5332,6 +5345,7 @@ pub fn check_with_envelope_imports(
                          high-integrity data, or endorse `{root}` before the `case`"
                     )),
                     related: Vec::new(),
+                    fixits: Vec::new(),
                 });
             }
             let Some(selector_integrity) = selector_integrity else {
@@ -5363,6 +5377,7 @@ pub fn check_with_envelope_imports(
                          <role>`, or move the effect outside the untrusted `case`"
                     )),
                     related: Vec::new(),
+                    fixits: Vec::new(),
                 });
             }
         }
@@ -5422,6 +5437,7 @@ fn check_turn_unwrap_scoping(
                         severity: Severity::Error,
                         span: effect.span,
                         related: Vec::new(),
+                        fixits: Vec::new(),
                         message: format!(
                             "rule `{rule}` scopes `unwrap for {payload_type}` on credential \
                              `{credential}`, which governance grants to nobody for that type",
@@ -5516,6 +5532,7 @@ pub fn check_principal_ceiling(
                          whose role acts-for {required}, or do not read `{src}`"
                     )),
                     related: Vec::new(),
+                    fixits: Vec::new(),
                 });
             }
         }

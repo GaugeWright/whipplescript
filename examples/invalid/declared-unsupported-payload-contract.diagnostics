@@ -1,0 +1,12 @@
+error[type.unsupported_payload_contract]: workflow terminal `extra` declares an unsupported payload contract type `Outcome[]`
+   --> examples/invalid/declared-unsupported-payload-contract.whip:13:14
+   |
+13 | output extra Outcome[]
+   |              ^^^^^^^^^
+   = help: declare the payload as a class (field block) or a scalar type: `output extra <Class>` or `output extra string`
+error[type.unsupported_payload_contract]: workflow terminal `error` declares an unsupported payload contract type `Trouble?`
+   --> examples/invalid/declared-unsupported-payload-contract.whip:14:15
+   |
+14 | failure error Trouble?
+   |               ^^^^^^^^
+   = help: declare the payload as a class (field block) or a scalar type: `failure error <Class>` or `failure error string`

@@ -1,0 +1,23 @@
+// Invalid: a workflow terminal whose declared payload contract names a class
+// that does not exist.
+//
+// The point of the snapshot beside this file is what it does NOT contain. The
+// name resolves to nothing, so the contract also "is not a class" — and
+// `type.unsupported_payload_contract` was reported for that, under the same
+// caret as `type.unknown_schema`. One mistake, one diagnostic: fix the name and
+// both complaints go, so only the one the reader can act on is written down.
+// D14, spec/diagnostic-quality-tracker.md.
+workflow UnknownSchemaTerminalContract
+
+output result Outcome
+output extra NoSuchClass
+
+class Outcome {
+  note string
+}
+
+rule r
+  when started
+=> {
+  complete result { note "x" }
+}

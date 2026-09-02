@@ -6,6 +6,7 @@
 
 mod action_expand;
 mod canonical;
+pub mod fixit;
 pub use canonical::{canonical_declarations, canonical_program_hash, DeclCanon};
 pub mod body;
 mod body_print;
@@ -16,6 +17,8 @@ pub mod snapshot;
 use format::*;
 pub use format::{format_program, format_program_preserving_comments, FormatOutput};
 use lowering::*;
+mod source_text;
+pub use source_text::{BlockSource, BodyOrigin, SourceText};
 mod syntax;
 // The lexer/parser front end moved out whole; these three were public API
 // before the move and are re-exported so the crate's surface is unchanged.
@@ -72,6 +75,16 @@ pub struct Diagnostic {
     /// diagnostics; surfaced in CLI text, JSON reports, and LSP
     /// `relatedInformation`.
     pub related: Vec<RelatedInfo>,
+    /// Machine-applicable edits (spec/error-handling.md "Suggestions And
+    /// Fixits"). A [`Fixit`] is not advice, it is a patch: a tool may apply it
+    /// without asking, so it is attached only where the compiler knows the exact
+    /// bytes to replace and the exact text to put there.
+    ///
+    /// Empty for almost every diagnostic, and empty is the honest default —
+    /// [`crate::fixit::attach_fixits`] is the ONE place that fills it, from the
+    /// finished diagnostic and the source it was produced from, so no emission
+    /// site can attach an edit it has not proved against the text.
+    pub fixits: Vec<Fixit>,
 }
 
 /// A secondary span + short label attached to a [`Diagnostic`] as related
@@ -80,6 +93,104 @@ pub struct Diagnostic {
 pub struct RelatedInfo {
     pub span: SourceSpan,
     pub message: String,
+}
+
+/// How far a consumer may trust a [`Fixit`] (spec/error-handling.md
+/// "Suggestions And Fixits").
+///
+/// The spec's lattice for a *suggestion* has a third rung, `manual`; a fixit's
+/// has two, because a fixit that needs a human to finish it is not applicable
+/// and has no business being an edit. `Exact` means applying it is expected to
+/// produce a program without the diagnostic it is attached to — which
+/// `fixits_repair_the_program_over_the_example_corpus` proves by applying every
+/// one of them and recompiling.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Applicability {
+    /// The compiler knows the whole edit. Safe for an editor to apply on a
+    /// keystroke, and for a `--fix` mode to apply unattended.
+    Exact,
+    /// The edit is the likely repair but the author may have meant something
+    /// else. Offer it; do not apply it unattended.
+    Likely,
+}
+
+impl Applicability {
+    /// The wire spelling used in JSON reports.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Exact => "exact",
+            Self::Likely => "likely",
+        }
+    }
+}
+
+/// One replacement in a [`Fixit`]: the bytes to replace, and what to put there.
+///
+/// Deletion is `replacement: ""` and insertion is an empty span; neither has a
+/// producer today.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FixitEdit {
+    pub span: SourceSpan,
+    pub replacement: String,
+}
+
+/// A machine-applicable repair (spec/error-handling.md "Suggestions And
+/// Fixits"): a title to show, the edits to apply, and how far to trust them.
+///
+/// `edits` is a list because one repair can touch several places, and applying a
+/// fixit means applying ALL of its edits — a partially applied fixit is not a
+/// weaker repair, it is a different program.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Fixit {
+    pub title: String,
+    pub edits: Vec<FixitEdit>,
+    pub applicability: Applicability,
+}
+
+impl Fixit {
+    /// A single-span replacement, which is every fixit the compiler emits today.
+    pub fn replace(
+        title: impl Into<String>,
+        span: SourceSpan,
+        replacement: impl Into<String>,
+        applicability: Applicability,
+    ) -> Self {
+        Self {
+            title: title.into(),
+            edits: vec![FixitEdit {
+                span,
+                replacement: replacement.into(),
+            }],
+            applicability,
+        }
+    }
+
+    /// Apply this fixit's edits to `source`, or `None` when any span is out of
+    /// bounds, off a character boundary, or overlaps another edit of the same
+    /// fixit.
+    ///
+    /// The one applier, shared by the property test, the LSP code-action path's
+    /// tests, and anything that later grows a `--fix`. Two consumers applying
+    /// edits two ways is how "the fixit is proved to work" and "the fixit the
+    /// user got" come apart.
+    pub fn apply_to(&self, source: &str) -> Option<String> {
+        let mut edits: Vec<&FixitEdit> = self.edits.iter().collect();
+        edits.sort_by_key(|edit| (edit.span.start, edit.span.end));
+        let mut out = String::with_capacity(source.len());
+        let mut cursor = 0usize;
+        for edit in edits {
+            if edit.span.start < cursor || edit.span.end < edit.span.start {
+                return None;
+            }
+            out.push_str(source.get(cursor..edit.span.start)?);
+            // Proves the end offset is a boundary too; the slice is discarded.
+            source.get(edit.span.start..edit.span.end)?;
+            out.push_str(&edit.replacement);
+            cursor = edit.span.end;
+        }
+        out.push_str(source.get(cursor..)?);
+        Some(out)
+    }
 }
 
 impl Diagnostic {
@@ -94,6 +205,7 @@ impl Diagnostic {
             message: message.into(),
             suggestion: None,
             related: Vec::new(),
+            fixits: Vec::new(),
         }
     }
 
@@ -307,7 +419,13 @@ impl WorkflowContractKind {
 pub struct AssertDecl {
     pub tags: Vec<TagDecl>,
     pub description: Option<StringLiteral>,
-    pub expr: String,
+    /// The assertion expression as written, carrying whether it is still the
+    /// file's bytes and where they start.
+    ///
+    /// `span.start` used to be taken as that origin, which is right for every
+    /// assertion the parser cut from the file and wrong for one that a
+    /// `pattern` expansion rewrote underneath it. See [`SourceText`].
+    pub expr: SourceText,
     pub span: SourceSpan,
 }
 
@@ -1228,118 +1346,19 @@ impl RuleKind {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WhenClause {
-    pub text: String,
-    pub span: SourceSpan,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct BlockSource {
-    pub text: String,
-    /// The block's OUTER extent: `{` through `}` wherever the surface has
-    /// braces, and the whole construct that stands in for a block where it does
-    /// not (the prompt-only `coerce` sugar, a `table` lowered to a rule). It is
-    /// the fallback span for anything genuinely about the block as a whole.
+    /// The clause as written — `Issue as issue where issue.attempts > 1` —
+    /// carrying whether it is still the file's bytes and where they start.
     ///
-    /// It is NOT where `text` starts — `text` is trimmed of the brace and the
-    /// surrounding whitespace. `origin` is what carries that; use
-    /// [`BlockSource::span_of`] to turn a text offset into a source span.
+    /// The origin is recorded rather than derived. `span.start` is where the
+    /// clause begins and `span.len() == text.len()` holds for every clause the
+    /// parser cut from the file — but it also holds by coincidence for a
+    /// synthesized one (a canonical reprint, a lowered `table`'s seeder), and a
+    /// caret placed on a coincidence underlines whatever happens to be there
+    /// (the D2b heuristic, in a new place). It is recorded IN the text rather
+    /// than beside it so that rewriting the one without the other is not
+    /// expressible; see [`SourceText`].
+    pub text: SourceText,
     pub span: SourceSpan,
-    /// Where `text` came from. Set once at parse time and narrowed by every
-    /// pass that rewrites the text.
-    pub origin: BodyOrigin,
-}
-
-/// Whether a `BlockSource`'s text is still a slice of the file, and where.
-///
-/// Keeping only `text` and the block `span` loses the one fact every precise
-/// diagnostic needs: where `text[0]` lives. Consumers used to reconstruct it —
-/// from `span.start` (short by `1 + leading whitespace`) or from `span.end -
-/// (2 + text.len())` (wrong whenever the closing `}` is not preceded by exactly
-/// one newline) — and every reconstruction was wrong in some program.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum BodyOrigin {
-    /// `text` is a verbatim slice of the file beginning at this byte offset.
-    Source(usize),
-    /// `text` was assembled by a line-based rewriter (`then` expansion, action
-    /// inlining, region surgery) that copied most of its input verbatim. The
-    /// map says which output lines are still the file's bytes and where they
-    /// live; an offset anywhere else degrades to `span`.
-    Mapped(body::BodyLineMap),
-    /// `text` was synthesized or rewritten token-by-token (pattern
-    /// substitution, an alpha-renamed reprint, a lowered `table`), so no offset
-    /// into it is a source position.
-    Generated,
-}
-
-impl BlockSource {
-    /// The base to hand [`body::parse_rule_body`], so no AST span is a lie.
-    pub fn body_base(&self) -> body::BodyBase<'_> {
-        match &self.origin {
-            BodyOrigin::Source(start) => body::BodyBase::Source(*start),
-            BodyOrigin::Mapped(map) => body::BodyBase::Mapped {
-                map,
-                fallback: self.span,
-            },
-            BodyOrigin::Generated => body::BodyBase::Generated(self.span),
-        }
-    }
-
-    /// The source span for `text[range]`, degrading to the block span when the
-    /// text has no source position for it. Never panics: the arithmetic is on
-    /// byte offsets and the renderer clamps a span it cannot place.
-    pub fn span_of(&self, range: std::ops::Range<usize>) -> SourceSpan {
-        self.body_base().span(range.start, range.end)
-    }
-
-    /// Record that `text` is no longer a slice of the file. Every pass that
-    /// rewrites the text non-byte-preservingly must call this, or the offsets
-    /// it leaves behind will name tokens that are not there.
-    pub fn mark_generated(&mut self) {
-        self.origin = BodyOrigin::Generated;
-    }
-
-    /// The file offset a byte offset into the CURRENT text names, or `None`
-    /// when the text has no source position for it.
-    fn source_offset(&self, offset: usize) -> Option<usize> {
-        match &self.origin {
-            BodyOrigin::Source(start) => Some(start + offset),
-            BodyOrigin::Mapped(map) => map.source_offset(offset),
-            BodyOrigin::Generated => None,
-        }
-    }
-
-    /// Replace the text, downgrading the origin unless the rewrite was a no-op.
-    fn rewrite(&mut self, text: String) {
-        if text != self.text {
-            self.text = text;
-            self.mark_generated();
-        }
-    }
-
-    /// Replace the text with a line-based rewriter's output, carrying its
-    /// per-output-line provenance.
-    ///
-    /// `input_offsets` holds one entry per line of `text`: the byte offset in
-    /// the CURRENT text of the line those bytes were copied from, or `None` for
-    /// a line the rewriter generated. Resolving each of those through the
-    /// origin the body already has IS the composition — action inlining, then
-    /// `then` expansion, then region surgery each report offsets into the text
-    /// they were handed, so the maps never have to be composed with each other
-    /// and a body may be rewritten any number of times without drifting.
-    fn rewrite_mapped(&mut self, text: String, input_offsets: Vec<Option<usize>>) {
-        if text == self.text {
-            return;
-        }
-        let resolved = input_offsets
-            .into_iter()
-            .map(|offset| offset.and_then(|offset| self.source_offset(offset)))
-            .collect();
-        self.origin = match body::BodyLineMap::new(&text, resolved) {
-            Some(map) => BodyOrigin::Mapped(map),
-            None => BodyOrigin::Generated,
-        };
-        self.text = text;
-    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2888,12 +2907,117 @@ pub enum QueryKind {
     Effect,
 }
 
+/// Where each node of a parsed [`Expr`] was written, as a tree of byte ranges
+/// that mirrors the expression tree (tracker D10).
+///
+/// A PARALLEL tree, deliberately, rather than a span field on every `Expr`
+/// variant or a `Spanned<Expr>` wrapper. `Expr` is compared, hashed, snapshotted
+/// into `ir_hash`, exported to the Maude model and used as a model-search
+/// comparison key; a position living inside it would make two identical
+/// expressions written in different places stop being the same expression, and
+/// DR-0086's companion (`A span is where something was written, not what it
+/// means`) has just finished taking offsets OUT of program identity. Keeping the
+/// positions beside the tree means identity cannot acquire one by accident: the
+/// type that carries meaning is byte-for-byte the type it was before this row.
+///
+/// Ranges are offsets into the expression TEXT that was parsed, not file
+/// offsets — only the caller knows where that text came from, which is what
+/// `BodyAnchor` resolves.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ExprSpans {
+    /// This node's own extent, or `None` when nothing recorded one.
+    range: Option<Range<usize>>,
+    /// One entry per child, in [`Expr::children`] order.
+    children: Vec<ExprSpans>,
+}
+
+impl ExprSpans {
+    /// A tree with no positions at all: every lookup degrades to the caller's
+    /// fallback span, which is exactly the behaviour every expression
+    /// diagnostic had before this row. The honest answer for an `Expr` that
+    /// reached a checker without the text it was parsed from.
+    pub fn unknown() -> Self {
+        Self::default()
+    }
+
+    fn node(range: Range<usize>, children: Vec<ExprSpans>) -> Self {
+        Self {
+            range: Some(range),
+            children,
+        }
+    }
+
+    fn leaf(range: Range<usize>) -> Self {
+        Self::node(range, Vec::new())
+    }
+
+    fn range(&self) -> Option<Range<usize>> {
+        self.range.clone()
+    }
+
+    /// The spans of the `index`th child, in [`Expr::children`] order.
+    ///
+    /// A walker that has drifted out of step with the tree gets THIS node back
+    /// rather than a panic or a neighbour's range. A parent's range contains
+    /// every child's, so drift costs precision and never truth — the same trade
+    /// `BodyAnchor::at` makes when a range does not fit its fragment.
+    fn child(&self, index: usize) -> &ExprSpans {
+        self.children.get(index).unwrap_or(self)
+    }
+
+    /// How many children this node recorded — the number
+    /// `expr_spans_mirror_the_expression_tree` checks against
+    /// [`Expr::children`].
+    fn child_count(&self) -> usize {
+        self.children.len()
+    }
+}
+
+/// A parse failure with the token it stopped at, when it stopped at one.
+///
+/// `parse_expression` keeps returning the bare message: most callers only need
+/// to know that the text is not an expression, and every one of them would
+/// otherwise have to name a range it has no use for.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExprParseError {
+    pub message: String,
+    /// Byte range within the parsed text of the token the parser rejected.
+    /// `None` when the failure is about the expression as a whole (it ran out
+    /// of input, or it nested past the depth ceiling).
+    pub range: Option<Range<usize>>,
+}
+
 /// Parses a deterministic expression used by guards, assertions, and branch guards.
 pub fn parse_expression(expr: &str) -> Result<Expr, String> {
+    parse_expression_spanned(expr)
+        .map(|(expr, _)| expr)
+        .map_err(|error| error.message)
+}
+
+/// `parse_expression`, keeping the byte range each node was written at.
+pub fn parse_expression_spanned(expr: &str) -> Result<(Expr, ExprSpans), ExprParseError> {
     ExprParser::new(expr).parse()
 }
 
 impl Expr {
+    /// This node's sub-expressions, in the order [`ExprSpans`] records them.
+    ///
+    /// The one place that order is written down. A walker that pairs an `Expr`
+    /// with its `ExprSpans` steps through both by this order, and
+    /// `expr_spans_mirror_the_expression_tree` checks the parser agrees.
+    pub fn children(&self) -> Vec<&Expr> {
+        match self {
+            Self::Literal(_) | Self::Path(_) => Vec::new(),
+            Self::Index { target, key } => vec![target.as_ref(), key.as_ref()],
+            Self::Array(items) => items.iter().collect(),
+            Self::Object(fields) => fields.iter().map(|field| &field.value).collect(),
+            Self::Unary { expr, .. } => vec![expr.as_ref()],
+            Self::Binary { left, right, .. } => vec![left.as_ref(), right.as_ref()],
+            Self::Call { args, .. } => args.iter().collect(),
+            Self::Query { guard, .. } => guard.iter().map(|guard| guard.as_ref()).collect(),
+        }
+    }
+
     pub fn to_snapshot(&self) -> String {
         match self {
             Self::Literal(literal) => literal.to_snapshot(),
@@ -3024,7 +3148,13 @@ pub fn workflow_names(source: &str) -> Vec<String> {
 }
 
 pub fn compile_program_with_root(source: &str, root: Option<&str>) -> CompileOutput {
-    let output = compile_program_with_root_inner(source, root);
+    let mut output = compile_program_with_root_inner(source, root);
+    // Machine-applicable repairs are decided HERE, once, over the finished
+    // diagnostics and the source they were produced from — see [`fixit`] for why
+    // an emission site is the wrong place to attach one. Additive only: nothing
+    // above this line can see a fixit, so acceptance, wording, spans and the
+    // text rendering are untouched by it.
+    fixit::attach_fixits(&mut output, source);
     // The channel and the severity field must agree (see
     // `CompileOutput::channel_severity_violation`). This is the cheap in-process
     // guard on every debug compile; the standing test over the whole invalid
@@ -3087,9 +3217,12 @@ fn diagnostic_key_without_related(diagnostic: &Diagnostic) -> (usize, usize, Str
 ///
 /// Deduplicated PER PASS, and deliberately not over the finished diagnostic list.
 /// A single pass repeating itself is not repeating itself: several parts of one
-/// fragment can be wrong the same way while none of them has a span of its own
-/// (`Expr` carries no spans — D10), so one pass legitimately emits the same
-/// message at the same span more than once. `coerce classify([1, 2])` against a
+/// fragment can be wrong the same way while none of them has a span of its own,
+/// so one pass legitimately emits the same message at the same span more than
+/// once. D10 gave the expression kernel ranges, which narrowed this to the
+/// positions that have no anchor to resolve a range against — a `coerce`
+/// argument's list items are checked by a literal walker holding one anchor for
+/// the whole argument, and that is still one span for four findings. `coerce classify([1, 2])` against a
 /// `string[]` parameter is two wrong list items, and a reader who is shown one
 /// fixes it, re-runs, and only then learns about the other. A collapse over the
 /// whole list cannot tell that from a re-report; this can, because it knows
@@ -3211,8 +3344,10 @@ fn compile_program_with_root_inner(source: &str, root: Option<&str>) -> CompileO
         //
         // MULTISET, not set. A key may legitimately repeat WITHIN one workflow —
         // four bad items in one list literal are four findings that share a
-        // statement-head span and a message, and `Expr` carries no spans to tell
-        // them apart (D10). Counting per workflow and dropping only down to the
+        // statement-head span and a message, because the walker that checks them
+        // holds one anchor for the whole argument (D10 gave expression NODES
+        // ranges; it did not give this walker somewhere to resolve them).
+        // Counting per workflow and dropping only down to the
         // largest count any earlier workflow already showed removes the
         // cross-workflow copies while keeping every repeat a single lowering
         // genuinely produced. Keying on presence alone collapsed those four to
@@ -3853,6 +3988,7 @@ fn select_root_workflow(
             code: diagnostic_code!("construct.missing_workflow"),
             severity: Severity::Error,
             related: Vec::new(),
+            fixits: Vec::new(),
             span: SourceSpan { start: 0, end: 0 },
             message: "program declares no `workflow`".to_owned(),
             suggestion: Some(
@@ -3873,6 +4009,7 @@ fn select_root_workflow(
                         code: diagnostic_code!("type.unknown_workflow"),
                         severity: Severity::Error,
                         related: Vec::new(),
+                        fixits: Vec::new(),
                         span: workflow.span,
                         message: format!("root workflow `{root}` was not found"),
                         suggestion: Some(format!("available workflow: `{}`", workflow.name)),
@@ -3883,6 +4020,7 @@ fn select_root_workflow(
                         code: diagnostic_code!("type.unknown_workflow"),
                         severity: Severity::Error,
                         related: Vec::new(),
+                        fixits: Vec::new(),
                         span: SourceSpan { start: 0, end: 0 },
                         message: format!("root workflow `{root}` was not found"),
                         suggestion: Some(
@@ -3913,6 +4051,7 @@ fn select_root_workflow(
                     code: diagnostic_code!("type.unknown_workflow"),
                     severity: Severity::Error,
                     related: Vec::new(),
+                    fixits: Vec::new(),
                     span: SourceSpan { start: 0, end: 0 },
                     message: format!("root workflow `{root}` was not found"),
                     suggestion: Some(format!("available workflows: {names}")),
@@ -3931,6 +4070,7 @@ fn select_root_workflow(
                 code: diagnostic_code!("construct.ambiguous_root_workflow"),
                 severity: Severity::Error,
                 related: Vec::new(),
+                fixits: Vec::new(),
                 span: SourceSpan { start: 0, end: 0 },
                 message: "multiple workflow declarations require an explicit root".to_owned(),
                 suggestion: Some(format!(
@@ -5221,6 +5361,7 @@ fn validate_turn_access_grant_file_operations(ir: &IrProgram, diagnostics: &mut 
                             code: diagnostic_code!("capability.invalid_grant_operation"),
                             severity: Severity::Error,
                             related: Vec::new(),
+                            fixits: Vec::new(),
                             span: effect.span,
                             message: format!(
                                 "rule `{}` grants `{}` on file store `{}`, which is not a file operation",
@@ -5266,6 +5407,7 @@ fn validate_turn_access_grant_memory_operations(ir: &IrProgram, diagnostics: &mu
                             code: diagnostic_code!("capability.invalid_grant_operation"),
                             severity: Severity::Error,
                             related: Vec::new(),
+                            fixits: Vec::new(),
                             span: effect.span,
                             message: format!(
                                 "rule `{}` grants `{}` on memory pool `{}`, which is not a memory operation",
@@ -5324,6 +5466,7 @@ fn validate_turn_access_grant_vaults(ir: &IrProgram, diagnostics: &mut Vec<Diagn
                         code: diagnostic_code!("type.unknown_resource"),
                         severity: Severity::Error,
                         related: Vec::new(),
+                        fixits: Vec::new(),
                         span: effect.span,
                         message: format!(
                             "rule `{}` grants access to undeclared vault `{name}`",
@@ -5341,6 +5484,7 @@ fn validate_turn_access_grant_vaults(ir: &IrProgram, diagnostics: &mut Vec<Diagn
                             code: diagnostic_code!("capability.invalid_grant_operation"),
                             severity: Severity::Error,
                             related: Vec::new(),
+                            fixits: Vec::new(),
                             span: effect.span,
                             message: format!(
                                 "rule `{}` grants unknown operation `{}` on vault `{name}`",
@@ -5362,6 +5506,7 @@ fn validate_turn_access_grant_vaults(ir: &IrProgram, diagnostics: &mut Vec<Diagn
                             code: diagnostic_code!("capability.invalid_narrowing"),
                             severity: Severity::Error,
                             related: Vec::new(),
+                            fixits: Vec::new(),
                             span: effect.span,
                             message: format!(
                                 "rule `{}` grants member operation `{}` on vault `{name}`, which \
@@ -5422,6 +5567,7 @@ fn validate_turn_access_grant_credential_kinds(ir: &IrProgram, diagnostics: &mut
                         code: diagnostic_code!("capability.credential_kind_mismatch"),
                         severity: Severity::Error,
                         related: Vec::new(),
+                        fixits: Vec::new(),
                         span: effect.span,
                         message: format!(
                             "rule `{}` grants `{}` on credential `{name}`, whose kind `{declared}` \
@@ -5452,11 +5598,12 @@ fn validate_turn_access_grant_credential_kinds(ir: &IrProgram, diagnostics: &mut
 /// diagnostic this raises at `1:1` — on the `workflow` line, in a file whose
 /// offending `write` may be a hundred lines further down.
 ///
-/// Paired by POSITION and not by rule name. The compiler accepts two rules with
-/// the same name in one workflow (D14 in spec/diagnostic-quality-tracker.md),
-/// so a name-keyed map kept the last of them and this check re-parsed one
-/// rule's body against another rule's origin — a caret confidently under a
-/// statement that performs no write at all. A length mismatch would mean a rule
+/// Paired by POSITION and not by rule name. Two rules with the same name in one
+/// workflow are refused now (D14 in spec/diagnostic-quality-tracker.md), but the
+/// pairing was positional first and stays that way: a name-keyed map kept the
+/// last of them and this check re-parsed one rule's body against another rule's
+/// origin — a caret confidently under a statement that performs no write at
+/// all. A length mismatch would mean a rule
 /// reached `ir.rules` by some path that did not record its block; the check
 /// degrades to the coarse base rather than pairing the wrong two.
 fn validate_file_store_write_policy(
@@ -5493,6 +5640,7 @@ fn validate_file_store_write_policy(
                                 code: diagnostic_code!("capability.not_granted"),
                                 severity: Severity::Error,
                                 related: Vec::new(),
+                                fixits: Vec::new(),
                                 span: effect.span,
                                 message: format!(
                                     "rule `{rule_name}` writes to store `{store}`, which permits \
@@ -5568,6 +5716,7 @@ fn expand_source_emit_from(ir: &mut IrProgram, diagnostics: &mut Vec<Diagnostic>
                 code: diagnostic_code!("type.unknown_binding"),
                 severity: Severity::Error,
                 related: Vec::new(),
+                fixits: Vec::new(),
                 span: source.span,
                 message: format!(
                     "source `{}` emits `from {from}`, but the only binding in scope is the observe binding `{}`",
@@ -5671,6 +5820,7 @@ fn warn_unhandled_effect_failures(ir: &IrProgram, warnings: &mut Vec<Diagnostic>
                 code: diagnostic_code!("effect.unhandled_failure"),
                 severity: Severity::Warning,
                 related: Vec::new(),
+                fixits: Vec::new(),
                 span: effect.span,
                 message: format!(
                     "effect `{binding}`'s failure is unhandled in rule `{}`; if it fails or \
@@ -5776,6 +5926,7 @@ fn warn_near_miss_semantic_tags(ir: &IrProgram, warnings: &mut Vec<Diagnostic>) 
             code: diagnostic_code!("construct.near_miss_tag"),
             severity: Severity::Warning,
             related: Vec::new(),
+            fixits: Vec::new(),
             span: tag.span,
             message: format!(
                 "tag `@{}` is not a semantic tag, and looks like `@{candidate}`",
@@ -5798,6 +5949,7 @@ fn warn_counter_without_timezone(ir: &IrProgram, warnings: &mut Vec<Diagnostic>)
                 code: diagnostic_code!("construct.missing_timezone"),
                 severity: Severity::Warning,
                 related: Vec::new(),
+                fixits: Vec::new(),
                 span: counter.span,
                 message: format!(
                     "counter `{}` declares no `timezone`; its `{}` reset boundary anchors to UTC",
@@ -5855,6 +6007,7 @@ fn warn_inert_memory_grant_on_native_adapter(ir: &IrProgram, warnings: &mut Vec<
                         code: diagnostic_code!("capability.inert_grant"),
                         severity: Severity::Warning,
                         related: Vec::new(),
+                        fixits: Vec::new(),
                         span: effect.span,
                         message: format!(
                             "rule `{}` grants memory pool `{}` on a tell to `{agent}`, whose \
@@ -5959,6 +6112,7 @@ fn detect_pattern_recursion(
                 code: diagnostic_code!("graph.unbounded_pattern_recursion"),
                 severity: Severity::Error,
                 related: Vec::new(),
+                fixits: Vec::new(),
                 span,
                 message: format!(
                     "recursive pattern application is not allowed: expansion cycle {}",
@@ -6069,6 +6223,7 @@ fn detect_workflow_invoke_recursion(program: &Program, diagnostics: &mut Vec<Dia
                 code: diagnostic_code!("graph.unbounded_workflow_invocation_recursion"),
                 severity: Severity::Error,
                 related: Vec::new(),
+                fixits: Vec::new(),
                 span,
                 message: format!(
                     "recursive workflow invocation is not allowed: invocation cycle {}",
@@ -6105,6 +6260,7 @@ fn detect_private_workflow_invocations(program: &Program, diagnostics: &mut Vec<
                     code: diagnostic_code!("graph.invoke_private_workflow"),
                     severity: Severity::Error,
                     related: Vec::new(),
+                    fixits: Vec::new(),
                     span: rule.body.span_of(at),
                     message: format!(
                         "rule `{}` invokes private workflow `{target}`",
@@ -6201,6 +6357,7 @@ fn detect_service_workflow_invocations(program: &Program, diagnostics: &mut Vec<
                     code: diagnostic_code!("graph.invoke_awaits_service_workflow"),
                     severity: Severity::Error,
                     related: Vec::new(),
+                    fixits: Vec::new(),
                     span: rule.body.span_of(at),
                     message: format!(
                         "rule `{}` invokes `{target}`, which is tagged `@service`: `@service` declares that a workflow need not terminate, and an invocation awaits its terminal output",
@@ -6425,6 +6582,7 @@ fn detect_agent_tool_grant_recursion(program: &Program, diagnostics: &mut Vec<Di
                 code: diagnostic_code!("graph.unbounded_tool_grant_recursion"),
                 severity: Severity::Error,
                 related: Vec::new(),
+                fixits: Vec::new(),
                 span,
                 message: format!(
                     "recursive agent tool grant is not allowed: invoke-tool cycle {}",
@@ -6453,6 +6611,7 @@ fn expand_pattern_applications(
                     code: diagnostic_code!("construct.duplicate_declaration"),
                     severity: Severity::Error,
                     related: Vec::new(),
+                    fixits: Vec::new(),
                     span: pattern.name.span,
                     message: format!("pattern `{}` is declared more than once", pattern.name.name),
                     suggestion: Some("rename one pattern declaration".to_owned()),
@@ -6482,6 +6641,7 @@ fn expand_pattern_applications(
                 code: diagnostic_code!("type.unknown_pattern"),
                 severity: Severity::Error,
                 related: Vec::new(),
+                fixits: Vec::new(),
                 span: apply.pattern.span,
                 message: format!("pattern `{}` was not found", apply.pattern.name),
                 suggestion: Some("declare the pattern before applying it".to_owned()),
@@ -6493,6 +6653,7 @@ fn expand_pattern_applications(
                 code: diagnostic_code!("construct.type_argument_arity"),
                 severity: Severity::Error,
                 related: Vec::new(),
+                fixits: Vec::new(),
                 span: apply.span,
                 message: format!(
                     "pattern `{}` expects {} type arguments but got {}",
@@ -6619,6 +6780,7 @@ fn parse_pattern_value_arguments(
                 code: diagnostic_code!("construct.invalid_pattern_argument"),
                 severity: Severity::Error,
                 related: Vec::new(),
+                fixits: Vec::new(),
                 span: apply.body.span,
                 message: format!(
                     "pattern application `{}` has malformed argument `{line}`",
@@ -6637,6 +6799,7 @@ fn parse_pattern_value_arguments(
                 code: diagnostic_code!("construct.invalid_pattern_argument"),
                 severity: Severity::Error,
                 related: Vec::new(),
+                fixits: Vec::new(),
                 span: apply.body.span,
                 message: format!(
                     "pattern application `{}` argument `{name}` is missing a value",
@@ -6651,6 +6814,7 @@ fn parse_pattern_value_arguments(
                 code: diagnostic_code!("construct.duplicate_pattern_argument"),
                 severity: Severity::Error,
                 related: Vec::new(),
+                fixits: Vec::new(),
                 span: apply.body.span,
                 message: format!(
                     "pattern application `{}` passes argument `{name}` more than once",
@@ -6686,6 +6850,7 @@ fn pattern_body_admission(
             code: diagnostic_code!("construct.forbidden_pattern_item"),
             severity: Severity::Error,
             related: Vec::new(),
+            fixits: Vec::new(),
             span: contract.span,
             message: "workflow contracts are not allowed in pattern bodies".to_owned(),
             suggestion: Some(
@@ -6696,6 +6861,7 @@ fn pattern_body_admission(
             code: diagnostic_code!("construct.forbidden_pattern_item"),
             severity: Severity::Error,
             related: Vec::new(),
+            fixits: Vec::new(),
             span: pattern.span,
             message: "nested pattern declarations are not supported in pattern bodies".to_owned(),
             suggestion: Some("declare reusable patterns at source top level".to_owned()),
@@ -6707,6 +6873,7 @@ fn pattern_body_admission(
             code: diagnostic_code!("construct.forbidden_pattern_item"),
             severity: Severity::Error,
             related: Vec::new(),
+            fixits: Vec::new(),
             span: apply.span,
             message: "pattern applications inside pattern bodies are not supported yet".to_owned(),
             suggestion: Some(
@@ -6720,6 +6887,7 @@ fn pattern_body_admission(
             code: diagnostic_code!("construct.forbidden_pattern_item"),
             severity: Severity::Error,
             related: Vec::new(),
+            fixits: Vec::new(),
             span: gauge.span,
             message: "gauge declarations are not allowed in pattern bodies".to_owned(),
             suggestion: Some("declare gauges at source top level".to_owned()),
@@ -6728,6 +6896,7 @@ fn pattern_body_admission(
             code: diagnostic_code!("construct.forbidden_pattern_item"),
             severity: Severity::Error,
             related: Vec::new(),
+            fixits: Vec::new(),
             span: campaign.span,
             message: "campaign declarations are not allowed in pattern bodies".to_owned(),
             suggestion: Some("declare campaigns at source top level".to_owned()),
@@ -6736,6 +6905,7 @@ fn pattern_body_admission(
             code: diagnostic_code!("construct.forbidden_pattern_item"),
             severity: Severity::Error,
             related: Vec::new(),
+            fixits: Vec::new(),
             span: mark.span,
             message: "mark declarations are not allowed in pattern bodies".to_owned(),
             suggestion: Some("declare marks at source top level".to_owned()),
@@ -6744,6 +6914,7 @@ fn pattern_body_admission(
             code: diagnostic_code!("construct.pattern_terminal_action"),
             severity: Severity::Error,
             related: Vec::new(),
+            fixits: Vec::new(),
             span,
             message: format!(
                 "rule `{}` in a pattern body cannot reach a workflow terminal (`complete`/`fail`)",
@@ -6930,12 +7101,18 @@ fn expand_pattern_item(
             Some((generated, Item::Coerce(coerce)))
         }
         Item::Assert(mut assertion) => {
-            assertion.expr = substitute_pattern_text(
+            let substituted = substitute_pattern_text(
                 &assertion.expr,
                 type_substitutions,
                 value_substitutions,
                 local_names,
             );
+            // `rewrite`, not an assignment: a substitution that changed a byte
+            // moved every offset after it, so the expression is no longer the
+            // file's and a range measured against it names nothing here. It
+            // degrades to the assertion's own span. A substitution that changed
+            // nothing left the file's bytes in place and keeps its carets.
+            assertion.expr.rewrite(substituted);
             Some((format!("assert:{alias}"), Item::Assert(assertion)))
         }
         Item::Rule(mut rule) => {
@@ -6943,12 +7120,17 @@ fn expand_pattern_item(
             let generated = format!("rule:{}", name.name);
             rule.name = name;
             for when in &mut rule.whens {
-                when.text = substitute_pattern_text(
+                let substituted = substitute_pattern_text(
                     &when.text,
                     type_substitutions,
                     value_substitutions,
                     local_names,
                 );
+                // See the `Item::Assert` arm: substituting a type parameter
+                // shifts every offset after it, so a guard's caret degrades to
+                // the clause rather than underlining the token that moved into
+                // its place.
+                when.text.rewrite(substituted);
             }
             let substituted = substitute_pattern_text(
                 &rule.body.text,
@@ -7169,6 +7351,7 @@ fn collect_schema_names(program: &Program, diagnostics: &mut Vec<Diagnostic>) ->
                 code: diagnostic_code!("construct.duplicate_declaration"),
                 severity: Severity::Error,
                 related: Vec::new(),
+                fixits: Vec::new(),
                 span: name.span,
                 message: format!("schema `{}` is declared more than once", name.name),
                 suggestion: Some("rename one declaration or merge the schemas".to_owned()),
@@ -7202,6 +7385,7 @@ fn collect_harness_kinds(
                     code: diagnostic_code!("construct.duplicate_declaration"),
                     severity: Severity::Error,
                     related: Vec::new(),
+                    fixits: Vec::new(),
                     span: harness.name.span,
                     message: format!("harness `{}` is declared more than once", harness.name.name),
                     suggestion: Some(
@@ -7237,6 +7421,7 @@ fn collect_agent_names(program: &Program, diagnostics: &mut Vec<Diagnostic>) -> 
                 code: diagnostic_code!("construct.duplicate_declaration"),
                 severity: Severity::Error,
                 related: Vec::new(),
+                fixits: Vec::new(),
                 span: agent.name.span,
                 message: format!("agent `{}` is declared more than once", agent.name.name),
                 suggestion: Some("rename one agent declaration or merge the settings".to_owned()),
@@ -7284,6 +7469,7 @@ fn collect_workflow_contract_names(
                 code: diagnostic_code!("construct.duplicate_declaration"),
                 severity: Severity::Error,
                 related: Vec::new(),
+                fixits: Vec::new(),
                 span: contract.name.span,
                 message: format!(
                     "workflow declares {} `{}` more than once",
@@ -7594,6 +7780,7 @@ fn validate_milestone_statements(
                 code: diagnostic_code!("type.unknown_schema"),
                 severity: Severity::Error,
                 related: Vec::new(),
+                fixits: Vec::new(),
                 span: rule.body.span_of(at),
                 message: format!(
                     "rule `{}` emits milestone `{name}` with unknown payload class `{class}`",
@@ -7616,6 +7803,7 @@ fn validate_milestone_statements(
                 code: diagnostic_code!("type.unknown_binding"),
                 severity: Severity::Error,
                 related: Vec::new(),
+                fixits: Vec::new(),
                 span: rule.body.span_of(at),
                 message: format!(
                     "rule `{}` has `after {binding} reaches \"{milestone}\"` for `{binding}`, which is not a workflow-invoke binding in this rule",
@@ -7655,6 +7843,7 @@ fn validate_milestone_statements(
                 code: diagnostic_code!("type.unknown_milestone"),
                 severity: Severity::Error,
                 related: Vec::new(),
+                fixits: Vec::new(),
                 span: rule.body.span_of(at),
                 message: format!(
                     "rule `{}` reaches milestone `{milestone}` that workflow `{workflow}` does not declare",
@@ -8271,7 +8460,7 @@ impl SchemaIndex {
                 return Err(FieldPathError::at_field(
                     index,
                     format!("schema `{schema}` has no field `{field}`"),
-                    closest_name(field, fields.keys()),
+                    closest_name_rivals(field, fields.keys()),
                     &schema,
                 ));
             };
@@ -8411,6 +8600,7 @@ fn validate_streams(ir: &IrProgram, diagnostics: &mut Vec<Diagnostic>) {
                     code: diagnostic_code!("type.unknown_agent"),
                     severity: Severity::Error,
                     related: Vec::new(),
+                    fixits: Vec::new(),
                     span: *span,
                     message: format!(
                         "stream `{}` member `{}` is not a declared agent",
@@ -8433,6 +8623,7 @@ fn validate_streams(ir: &IrProgram, diagnostics: &mut Vec<Diagnostic>) {
                         code: diagnostic_code!("construct.cardinality_conflict"),
                         severity: Severity::Error,
                         related: Vec::new(),
+                        fixits: Vec::new(),
                         span: *span,
                         message: format!(
                             "agent `{member}` is already a member of stream `{holder}`",
@@ -8460,6 +8651,7 @@ fn validate_streams(ir: &IrProgram, diagnostics: &mut Vec<Diagnostic>) {
                         code: diagnostic_code!("type.unknown_stream"),
                         severity: Severity::Error,
                         related: Vec::new(),
+                        fixits: Vec::new(),
                         span: effect.span,
                         message: format!("`on stream {target}` names an undeclared stream"),
                         suggestion: Some(suggest_otherwise(
@@ -8484,6 +8676,7 @@ fn validate_streams(ir: &IrProgram, diagnostics: &mut Vec<Diagnostic>) {
                                 code: diagnostic_code!("parse.invalid_selection"),
                                 severity: Severity::Error,
                                 related: Vec::new(),
+                                fixits: Vec::new(),
                                 span: effect.span,
                                 message: format!("the selection does not parse: {error}"),
                                 suggestion: Some(
@@ -8522,6 +8715,7 @@ fn validate_streams(ir: &IrProgram, diagnostics: &mut Vec<Diagnostic>) {
                                                     ),
                                                     severity: Severity::Error,
                                                     related: Vec::new(),
+                                                    fixits: Vec::new(),
                                                     span: effect.span,
                                                     message: format!(
                                                         "`region({name})` names no declared region"
@@ -8559,6 +8753,7 @@ fn validate_streams(ir: &IrProgram, diagnostics: &mut Vec<Diagnostic>) {
                         code: diagnostic_code!("capability.grant_not_permitted"),
                         severity: Severity::Error,
                         related: Vec::new(),
+                        fixits: Vec::new(),
                         span: effect.span,
                         message: "a `vcs` access grant rides an `invoke` only".to_owned(),
                         suggestion: Some(
@@ -8576,6 +8771,7 @@ fn validate_streams(ir: &IrProgram, diagnostics: &mut Vec<Diagnostic>) {
                             code: diagnostic_code!("capability.invalid_grant_operation"),
                             severity: Severity::Error,
                             related: Vec::new(),
+                            fixits: Vec::new(),
                             span: effect.span,
                             message: format!("unknown `vcs` grant operation `{}`", op.operation),
                             suggestion: Some(suggest_then_keyword(
@@ -8591,6 +8787,7 @@ fn validate_streams(ir: &IrProgram, diagnostics: &mut Vec<Diagnostic>) {
                             code: diagnostic_code!("construct.missing_requirement"),
                             severity: Severity::Error,
                             related: Vec::new(),
+                            fixits: Vec::new(),
                             span: effect.span,
                             message: "`repair` names no binding".to_owned(),
                             suggestion: Some(
@@ -8610,6 +8807,7 @@ fn validate_streams(ir: &IrProgram, diagnostics: &mut Vec<Diagnostic>) {
                             code: diagnostic_code!("type.unknown_binding"),
                             severity: Severity::Error,
                             related: Vec::new(),
+                            fixits: Vec::new(),
                             span: effect.span,
                             message: format!("`repair for {target}` names no binding of this rule"),
                             suggestion: Some(
@@ -8630,6 +8828,7 @@ fn validate_streams(ir: &IrProgram, diagnostics: &mut Vec<Diagnostic>) {
                         code: diagnostic_code!("type.unknown_stream"),
                         severity: Severity::Error,
                         related: Vec::new(),
+                        fixits: Vec::new(),
                         span: effect.span,
                         message: format!(
                             "`onto {target}` names neither `mainline` nor a declared stream"
@@ -8660,6 +8859,7 @@ fn validate_regions(ir: &IrProgram, diagnostics: &mut Vec<Diagnostic>) {
                     code: diagnostic_code!("parse.invalid_selection"),
                     severity: Severity::Error,
                     related: Vec::new(),
+                    fixits: Vec::new(),
                     span: region.span,
                     message: format!(
                         "region `{}`: the selection does not parse: {error}",
@@ -8679,6 +8879,7 @@ fn validate_regions(ir: &IrProgram, diagnostics: &mut Vec<Diagnostic>) {
                         code: diagnostic_code!("construct.invalid_clause_value"),
                         severity: Severity::Error,
                         related: Vec::new(),
+                        fixits: Vec::new(),
                         span: region.span,
                         message: format!(
                             "region `{}` uses change-set atoms ({}), but a region denotes a \
@@ -8806,6 +9007,7 @@ fn validate_improve_declarations(ir: &IrProgram, diagnostics: &mut Vec<Diagnosti
                 code: diagnostic_code!("type.unknown_rule"),
                 severity: Severity::Error,
                 related: Vec::new(),
+                fixits: Vec::new(),
                 span: mark.span,
                 message: format!("mark `{}` rides unknown site `{}`", mark.name, mark.site),
                 suggestion: Some(suggest_then(
@@ -8830,6 +9032,7 @@ fn validate_improve_declarations(ir: &IrProgram, diagnostics: &mut Vec<Diagnosti
             code: diagnostic_code!("type.unknown_gauge"),
             severity: Severity::Error,
             related: Vec::new(),
+            fixits: Vec::new(),
             span,
             message: format!("unknown gauge `{name}`"),
             suggestion: Some(suggest_otherwise(
@@ -8857,6 +9060,7 @@ fn validate_improve_declarations(ir: &IrProgram, diagnostics: &mut Vec<Diagnosti
                         code: diagnostic_code!("type.unknown_coerce"),
                         severity: Severity::Error,
                         related: Vec::new(),
+                        fixits: Vec::new(),
                         span: gauge.span,
                         message: format!(
                             "gauge `{}` judges via undeclared coerce `{}`",
@@ -8884,6 +9088,7 @@ fn validate_improve_declarations(ir: &IrProgram, diagnostics: &mut Vec<Diagnosti
                                 code: diagnostic_code!("expr.arity_mismatch"),
                                 severity: Severity::Error,
                                 related: Vec::new(),
+                                fixits: Vec::new(),
                                 span: gauge.span,
                                 message: format!(
                                     "gauge `{}`: the reserved `(record)` form needs a \
@@ -8913,6 +9118,7 @@ fn validate_improve_declarations(ir: &IrProgram, diagnostics: &mut Vec<Diagnosti
                                     code: diagnostic_code!("expr.invalid_path"),
                                     severity: Severity::Error,
                                     related: Vec::new(),
+                                    fixits: Vec::new(),
                                     span: gauge.span,
                                     message: format!(
                                         "gauge `{}`: judge argument `{arg}` is not a record \
@@ -8933,6 +9139,7 @@ fn validate_improve_declarations(ir: &IrProgram, diagnostics: &mut Vec<Diagnosti
                                 code: diagnostic_code!("expr.arity_mismatch"),
                                 severity: Severity::Error,
                                 related: Vec::new(),
+                                fixits: Vec::new(),
                                 span: gauge.span,
                                 message: format!(
                                     "gauge `{}`: judge passes {} argument{} but coerce `{}` \
@@ -8958,6 +9165,7 @@ fn validate_improve_declarations(ir: &IrProgram, diagnostics: &mut Vec<Diagnosti
                 code: diagnostic_code!("construct.incompatible_clause"),
                 severity: Severity::Error,
                 related: Vec::new(),
+                fixits: Vec::new(),
                 span: gauge.span,
                 message: format!(
                     "derived gauge `{}` must judge via exec (its judge receives the input score vector)",
@@ -8972,6 +9180,7 @@ fn validate_improve_declarations(ir: &IrProgram, diagnostics: &mut Vec<Diagnosti
                     code: diagnostic_code!("graph.gauge_input_cycle"),
                     severity: Severity::Error,
                     related: Vec::new(),
+                    fixits: Vec::new(),
                     span: gauge.span,
                     message: format!("derived gauge `{}` cannot input itself", gauge.name),
                     suggestion: None,
@@ -9016,6 +9225,7 @@ fn validate_improve_declarations(ir: &IrProgram, diagnostics: &mut Vec<Diagnosti
                     code: diagnostic_code!("construct.duplicate_member"),
                     severity: Severity::Error,
                     related: Vec::new(),
+                    fixits: Vec::new(),
                     span: campaign.span,
                     message,
                     suggestion: Some("name each gauge once, in at most one clause".to_owned()),
@@ -9086,6 +9296,7 @@ fn validate_test_expr_source(
             code: diagnostic_code!("expr.empty_expression"),
             severity: Severity::Error,
             related: Vec::new(),
+            fixits: Vec::new(),
             span,
             message: format!("{label} is empty"),
             suggestion: Some("provide an expression".to_owned()),
@@ -9097,6 +9308,7 @@ fn validate_test_expr_source(
             code: diagnostic_code!("parse.invalid_expression"),
             severity: Severity::Error,
             related: Vec::new(),
+            fixits: Vec::new(),
             span,
             message: format!("{label} is not a valid expression: {error}"),
             suggestion: None,
@@ -9141,6 +9353,7 @@ fn validate_presence_conditions(
                 code: diagnostic_code!("type.unknown_field"),
                 severity: Severity::Error,
                 related: Vec::new(),
+                fixits: Vec::new(),
                 span: field.span,
                 message: format!(
                     "`{container}` field `{}` is conditioned on unknown discriminant `{disc}`",
@@ -9168,6 +9381,7 @@ fn validate_presence_conditions(
                 code: diagnostic_code!("type.invalid_literal"),
                 severity: Severity::Error,
                 related: Vec::new(),
+                fixits: Vec::new(),
                 span: field.span,
                 message: format!(
                     "`{container}` field `{}` is conditioned on `{disc} is \"{literal}\"`, which is not a value of `{disc}`",
@@ -9183,6 +9397,7 @@ fn validate_presence_conditions(
                 code: diagnostic_code!("type.mismatch"),
                 severity: Severity::Error,
                 related: Vec::new(),
+                fixits: Vec::new(),
                 span: field.span,
                 message: format!(
                     "`{container}` field `{}` is conditioned on `{disc}`, which is not a string-literal discriminant",
@@ -9311,6 +9526,7 @@ fn validate_coerce_body_fields(coerce: &CoerceDecl, diagnostics: &mut Vec<Diagno
                     code: diagnostic_code!("construct.invalid_clause"),
                     severity: Severity::Error,
                     related: Vec::new(),
+                    fixits: Vec::new(),
                     span: coerce.name.span,
                     message: format!(
                         "coerce `{}` has a malformed `provider` clause: `{trimmed}`",
@@ -9326,6 +9542,7 @@ fn validate_coerce_body_fields(coerce: &CoerceDecl, diagnostics: &mut Vec<Diagno
             code: diagnostic_code!("construct.unknown_clause"),
             severity: Severity::Error,
             related: Vec::new(),
+            fixits: Vec::new(),
             span: coerce.name.span,
             message: format!(
                 "unknown coerce field `{field}` on coerce `{}`",
@@ -9374,6 +9591,7 @@ fn validate_type_refs(
                     code: diagnostic_code!("construct.unknown_option"),
                     severity: Severity::Error,
                     related: Vec::new(),
+                    fixits: Vec::new(),
                     span: kind.span,
                     message: format!("`secret` names unknown credential kind `{}`", kind.name),
                     suggestion: Some(suggest_then_keyword(
@@ -9386,11 +9604,12 @@ fn validate_type_refs(
         }
         TypeSyntax::Secret { kind: None, .. } => {}
         TypeSyntax::Ref { name } => {
-            if !schema_names.contains(&name.name) && !is_builtin_schema_ref(&name.name) {
+            if !schema_ref_resolves(&name.name, schema_names) {
                 diagnostics.push(Diagnostic {
                     code: diagnostic_code!("type.unknown_schema"),
                     severity: Severity::Error,
                     related: Vec::new(),
+                    fixits: Vec::new(),
                     span: name.span,
                     message: format!("unknown schema reference `{}`", name.name),
                     suggestion: Some(suggest_otherwise(
@@ -9416,6 +9635,7 @@ fn validate_type_refs(
                             code: diagnostic_code!("construct.duplicate_member"),
                             severity: Severity::Error,
                             related: Vec::new(),
+                            fixits: Vec::new(),
                             span: agent.span,
                             message: format!(
                                 "AgentRef lists agent `{}` more than once",
@@ -9435,6 +9655,7 @@ fn validate_type_refs(
                         code: diagnostic_code!("type.unknown_agent"),
                         severity: Severity::Error,
                         related: Vec::new(),
+                        fixits: Vec::new(),
                         span: agent.span,
                         message: format!("AgentRef references unknown agent `{}`", agent.name),
                         suggestion: Some(suggest_otherwise(
@@ -9485,6 +9706,19 @@ fn is_builtin_schema_ref(name: &str) -> bool {
     BUILTIN_SCHEMA_REFS.contains(&name)
 }
 
+/// Whether a `Ref` type names something this program can resolve.
+///
+/// One predicate read from two directions, which is why it is a function rather
+/// than the two-clause condition it was: [`validate_type_refs`] raises
+/// `type.unknown_schema` when it is false, and
+/// [`validate_declared_terminal_payload_contract`] stays SILENT when it is
+/// false, because a name that resolves to nothing is not also a second mistake
+/// about payload shape. Written apart, the suppression could stop matching the
+/// report it suppresses and the double diagnostic would come back.
+fn schema_ref_resolves(name: &str, schema_names: &BTreeSet<String>) -> bool {
+    schema_names.contains(name) || is_builtin_schema_ref(name)
+}
+
 /// The terminal-family schemas are `origin = observer` (discriminated-families
 /// design §5.4): the kernel projects them when it observes an effect or child
 /// terminal, and user rules may only *eliminate* them (`after … fails/times
@@ -9523,6 +9757,7 @@ fn validate_canonical_rule_body_syntax(rule: &RuleDecl, diagnostics: &mut Vec<Di
                 code: diagnostic_code!("parse.unsupported_syntax"),
                 severity: Severity::Error,
                 related: Vec::new(),
+                fixits: Vec::new(),
                 span: at.whole(),
                 message: format!(
                     "rule `{}` uses unsupported `then` sequencing",
@@ -9538,6 +9773,7 @@ fn validate_canonical_rule_body_syntax(rule: &RuleDecl, diagnostics: &mut Vec<Di
                 code: diagnostic_code!("parse.unsupported_syntax"),
                 severity: Severity::Error,
                 related: Vec::new(),
+                fixits: Vec::new(),
                 span: at.whole(),
                 message: format!(
                     "rule `{}` uses unsupported `after ... =>` sequencing",
@@ -9578,6 +9814,7 @@ fn validate_measure_declarations(
                 code: diagnostic_code!("construct.unknown_reference"),
                 severity: Severity::Error,
                 related: Vec::new(),
+                fixits: Vec::new(),
                 span: declaration.span,
                 message: format!("`measure` names unknown class `{}`", declaration.class),
                 suggestion: Some(format!(
@@ -9598,6 +9835,7 @@ fn validate_measure_declarations(
                 code: diagnostic_code!("construct.unknown_reference"),
                 severity: Severity::Error,
                 related: Vec::new(),
+                fixits: Vec::new(),
                 span: declaration.span,
                 message: format!(
                     "`measure` names field `{}`, which class `{}` does not declare",
@@ -9612,6 +9850,7 @@ fn validate_measure_declarations(
                 code: diagnostic_code!("type.invalid_measure_field"),
                 severity: Severity::Error,
                 related: Vec::new(),
+                fixits: Vec::new(),
                 span: declaration.span,
                 message: format!(
                     "`measure` names field `{}.{}`, which is not an `int`",
@@ -9630,6 +9869,7 @@ fn validate_measure_declarations(
                 code: diagnostic_code!("type.invalid_measure_field"),
                 severity: Severity::Error,
                     related: Vec::new(),
+                    fixits: Vec::new(),
                     span: declaration.span,
                     message: format!(
                         "`measure` bound `{}.{bound}` is not an `int` field of the class",
@@ -9648,6 +9888,7 @@ fn validate_measure_declarations(
                 code: diagnostic_code!("construct.duplicate_declaration"),
                 severity: Severity::Error,
                 related: Vec::new(),
+                fixits: Vec::new(),
                 span: declaration.span,
                 message: format!(
                     "`measure {}.{}` is declared more than once",
@@ -9665,6 +9906,7 @@ fn validate_measure_declarations(
                 code: diagnostic_code!("construct.dead_measure"),
                 severity: Severity::Warning,
                 related: Vec::new(),
+                fixits: Vec::new(),
                 span: declaration.span,
                 message: format!(
                     "`measure {}.{}` governs no cycle",
@@ -9925,6 +10167,7 @@ fn validate_effectful_rule_recursion(
                 code: diagnostic_code!("graph.declared_measure_unmet"),
                 severity: Severity::Error,
                 related: Vec::new(),
+                fixits: Vec::new(),
                 span: declared.map(|declaration| declaration.span).unwrap_or(SourceSpan {
                     start: 0,
                     end: 0,
@@ -9971,6 +10214,7 @@ fn validate_effectful_rule_recursion(
                     .filter(|_| !bounded_workflow)
                 {
                     warnings.push(Diagnostic {
+                        fixits: Vec::new(),
                         code: diagnostic_code!("graph.unmeasured_resource_cycle"),
                         severity: Severity::Warning,
                         related: Vec::new(),
@@ -10151,6 +10395,7 @@ fn validate_effectful_rule_recursion(
                 code: diagnostic_code!("graph.bounded_workflow_effect_cycle"),
                 severity: Severity::Error,
                 related: Vec::new(),
+                fixits: Vec::new(),
                 span,
                 message: if component_carries_an_effect {
                     format!(
@@ -10173,6 +10418,7 @@ fn validate_effectful_rule_recursion(
                 code: diagnostic_code!("graph.unbounded_effect_recursion"),
                 severity: Severity::Error,
                 related: Vec::new(),
+                fixits: Vec::new(),
                 span,
                 message: format!(
                     "effectful rule cycle is not allowed: rule cycle {} turns inside one commit, and rule `{}` runs effects on every turn of it",
@@ -10449,6 +10695,7 @@ fn validate_message_from_channels(
                 code: diagnostic_code!("type.unknown_channel"),
                 severity: Severity::Error,
                 related: Vec::new(),
+                fixits: Vec::new(),
                 span: when.span,
                 message: format!("`when message from {channel}` names an unknown channel"),
                 suggestion: Some(suggest_otherwise(
@@ -10475,6 +10722,7 @@ fn validate_message_from_channels(
                     code: diagnostic_code!("provider.feature_unavailable"),
                     severity: Severity::Error,
                     related: Vec::new(),
+                    fixits: Vec::new(),
                     span: when.span,
                     message: format!(
                         "`when message from {channel}` observes a channel whose provider `{}` is outbound-only (its capability report cannot deliver inbound messages)",
@@ -10516,6 +10764,7 @@ fn validate_send_channels(
                                         code: diagnostic_code!("type.unknown_channel"),
                                         severity: Severity::Error,
                                         related: Vec::new(),
+                                        fixits: Vec::new(),
                                         span: effect.span,
                                         message: format!(
                                             "`send via {}` names an unknown channel",
@@ -10546,6 +10795,7 @@ fn validate_send_channels(
                                             code: diagnostic_code!("provider.feature_unavailable"),
                                             severity: Severity::Error,
                                             related: Vec::new(),
+                                            fixits: Vec::new(),
                                             span: effect.span,
                                             message: format!(
                                                 "`send via {}` targets a channel whose provider `{}` is inbound-only (its capability report cannot accept outbound sends)",
@@ -10569,6 +10819,7 @@ fn validate_send_channels(
                                         code: diagnostic_code!("type.unknown_memory_pool"),
                                         severity: Severity::Error,
                                         related: Vec::new(),
+                                        fixits: Vec::new(),
                                         span: effect.span,
                                         message: format!(
                                             "`{keyword}` names unknown memory pool `{}`",
@@ -10632,6 +10883,7 @@ fn validate_turn_access_grants(
                     code: diagnostic_code!("construct.missing_requirement"),
                     severity: Severity::Error,
                     related: Vec::new(),
+                    fixits: Vec::new(),
                     span: effect.span,
                     message: format!(
                         "rule `{}` has a `with access to {}` grant that grants no operations",
@@ -10649,6 +10901,7 @@ fn validate_turn_access_grants(
                     code: diagnostic_code!("capability.duplicate_grant"),
                     severity: Severity::Error,
                     related: Vec::new(),
+                    fixits: Vec::new(),
                     span: effect.span,
                     message: format!(
                         "rule `{}` lists access resource `{}` more than once on one effect",
@@ -10705,6 +10958,7 @@ fn validate_credential_grant_classes(
             code: diagnostic_code!("capability.invalid_narrowing"),
             severity: Severity::Error,
             related: Vec::new(),
+            fixits: Vec::new(),
             span,
             message: format!(
                 "rule `{}` grants `{}` on credential `{credential}` but {detail}: this operation takes {}",
@@ -10744,6 +10998,7 @@ fn validate_evidence_fact_not_matched(rule: &RuleDecl, diagnostics: &mut Vec<Dia
                 code: diagnostic_code!("graph.unmatchable_fact"),
                 severity: Severity::Error,
                 related: Vec::new(),
+                fixits: Vec::new(),
                 span: when.span,
                 message: format!(
                     "rule `{}` matches evidence-only fact `{name}`: in-turn observations are evidence, not rule-matchable facts",
@@ -10811,6 +11066,7 @@ fn extract_rule_regions(
                 code: diagnostic_code!("construct.cardinality_conflict"),
                 severity: Severity::Error,
                 related: Vec::new(),
+                fixits: Vec::new(),
                 span: regions[1].0.span,
                 message: format!(
                     "rule `{}` declares more than one `during`/`until` region",
@@ -10830,6 +11086,7 @@ fn extract_rule_regions(
                 code: diagnostic_code!("construct.missing_requirement"),
                 severity: Severity::Error,
                 related: Vec::new(),
+                fixits: Vec::new(),
                 span: region.span,
                 message: format!(
                     "the `{}` region in rule `{}` contains no progression",
@@ -10862,6 +11119,7 @@ fn extract_rule_regions(
                     code: diagnostic_code!("expr.binding_out_of_scope"),
                     severity: Severity::Error,
                     related: Vec::new(),
+                    fixits: Vec::new(),
                     span: region.span,
                     message: format!(
                         "the `on lapse` arm of rule `{}` references `{root}`, a binding the \
@@ -10901,6 +11159,7 @@ fn extract_rule_regions(
                 code: diagnostic_code!("lowering.internal"),
                 severity: Severity::Error,
                 related: Vec::new(),
+                fixits: Vec::new(),
                 span: region.span,
                 message: format!(
                     "internal: region span reconstruction failed for rule `{}`",
@@ -11214,6 +11473,7 @@ fn validate_effectful_self_trigger(
                 code: diagnostic_code!("effect.unconsumed_trigger"),
                 severity: Severity::Error,
                 related: Vec::new(),
+                fixits: Vec::new(),
                 span: rule.body.span,
                 message: format!(
                     "effectful rule `{}` preserves trigger fact `{written_fact}`",
@@ -11284,6 +11544,7 @@ fn validate_workflow_terminal_actions(
                         code: diagnostic_code!("type.unknown_terminal"),
                         severity: Severity::Error,
                         related: Vec::new(),
+                        fixits: Vec::new(),
                         span: name_anchor(name).whole(),
                         message: format!(
                             "rule `{}` {action}s unknown workflow terminal `{name}`",
@@ -11343,6 +11604,7 @@ fn validate_workflow_terminal_actions(
                 code: diagnostic_code!("parse.malformed_statement"),
                 severity: Severity::Error,
                 related: Vec::new(),
+                fixits: Vec::new(),
                 span: BodyAnchor::text(&rule.body, head, line).whole(),
                 message: format!("rule `{}` has malformed `{action}` action", rule.name.name),
                 suggestion: Some(format!(
@@ -11356,6 +11618,7 @@ fn validate_workflow_terminal_actions(
                 code: diagnostic_code!("type.unknown_terminal"),
                 severity: Severity::Error,
                 related: Vec::new(),
+                fixits: Vec::new(),
                 span: name_anchor(name).whole(),
                 message: format!(
                     "rule `{}` {action}s unknown workflow terminal `{name}`",
@@ -11393,6 +11656,100 @@ fn validate_workflow_terminal_actions(
     }
 }
 
+/// What a workflow terminal's declared payload contract IS.
+///
+/// spec/language.md, "A terminal payload contract is either a class (a `{ field
+/// ... }` block) or a scalar type (`int`/`float`/`string`/`bool`)". Two places
+/// need that answer — the DECLARATION, where an unsupported contract is the
+/// mistake, and the `complete`/`fail` that carries a payload, where the
+/// class/scalar split decides which shape the payload must take — and they read
+/// it here so they cannot come to disagree about what the language admits.
+///
+/// The refusal used to live only at the use site, so a workflow that DECLARED
+/// `output extra Outcome[]` and had no rule completing `extra` was accepted,
+/// contract and all: the declaration is the mistake, and the completion was
+/// only where it happened to be noticed. D14,
+/// spec/diagnostic-quality-tracker.md.
+enum TerminalPayloadContract<'a> {
+    /// A class: the payload is a field block over this schema.
+    Class(&'a str),
+    /// A scalar: the payload is a bare value.
+    Scalar,
+    /// Anything else — an array, an optional, a `map<…>`, a `sealed<…>`, an
+    /// agent ref, or a name that resolves to an enum rather than a class.
+    Unsupported,
+}
+
+fn terminal_payload_contract<'a>(
+    ty: &'a TypeSyntax,
+    semantic: &SemanticContext,
+) -> TerminalPayloadContract<'a> {
+    match ty {
+        TypeSyntax::Ref { name } if semantic.schemas.class_exists(&name.name) => {
+            TerminalPayloadContract::Class(&name.name)
+        }
+        TypeSyntax::Primitive { .. }
+        | TypeSyntax::LiteralString { .. }
+        | TypeSyntax::Union { .. } => TerminalPayloadContract::Scalar,
+        _ => TerminalPayloadContract::Unsupported,
+    }
+}
+
+/// The declaration-site half of [`terminal_payload_contract`]: an `output` or
+/// `failure` contract whose type no terminal payload can take is refused where
+/// it is WRITTEN, whether or not any rule completes that terminal.
+pub(crate) fn validate_declared_terminal_payload_contract(
+    kind: &WorkflowContractKind,
+    name: &str,
+    ty: &TypeSyntax,
+    schema_names: &BTreeSet<String>,
+    semantic: &SemanticContext,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    if matches!(kind, WorkflowContractKind::Input) {
+        return;
+    }
+    if !matches!(
+        terminal_payload_contract(ty, semantic),
+        TerminalPayloadContract::Unsupported
+    ) {
+        return;
+    }
+    // DERIVED, and therefore not said. `output extra NoSuchClass` names
+    // something this program does not declare, so of course the contract "is
+    // not a class" — one mistake, and `type.unknown_schema` already reports it
+    // at this very caret. Two errors under one underline read as two things to
+    // fix; the reader fixes the name and both go.
+    //
+    // Only the BARE `Ref` is derived. `output extra NoSuchClass[]` keeps both:
+    // fix the name and the array is still a contract no payload can take, which
+    // is a second mistake and is owed its own line. D14,
+    // spec/diagnostic-quality-tracker.md.
+    if let TypeSyntax::Ref { name } = ty {
+        if !schema_ref_resolves(&name.name, schema_names) {
+            return;
+        }
+    }
+    let keyword = match kind {
+        WorkflowContractKind::Failure => "failure",
+        _ => "output",
+    };
+    diagnostics.push(Diagnostic {
+        code: diagnostic_code!("type.unsupported_payload_contract"),
+        severity: Severity::Error,
+        related: Vec::new(),
+        fixits: Vec::new(),
+        span: ty.span(),
+        message: format!(
+            "workflow terminal `{name}` declares an unsupported payload contract type `{}`",
+            ty.to_source()
+        ),
+        suggestion: Some(format!(
+            "declare the payload as a class (field block) or a scalar type: `{keyword} {name} <Class>` or `{keyword} {name} string`"
+        )),
+    });
+}
+
 #[allow(clippy::too_many_arguments)]
 fn validate_workflow_terminal_payload(
     rule: &RuleDecl,
@@ -11416,17 +11773,16 @@ fn validate_workflow_terminal_payload(
         return;
     };
     let block_anchor = BodyAnchor::text(&rule.body, block.start, body);
-    let schema = match contract_ty {
-        TypeSyntax::Ref { name } if semantic.schemas.class_exists(&name.name) => &name.name,
-        TypeSyntax::Primitive { .. }
-        | TypeSyntax::LiteralString { .. }
-        | TypeSyntax::Union { .. } => {
+    let schema = match terminal_payload_contract(contract_ty, semantic) {
+        TerminalPayloadContract::Class(schema) => schema,
+        TerminalPayloadContract::Scalar => {
             // A scalar (primitive/literal/union) contract takes a bare value, not
             // a field block.
             diagnostics.push(Diagnostic {
                 code: diagnostic_code!("type.mismatch"),
                 severity: Severity::Error,
                 related: Vec::new(),
+                fixits: Vec::new(),
                 span: at.whole(),
                 message: format!(
                     "workflow terminal `{terminal_name}` has a scalar payload contract but is given a field block"
@@ -11437,22 +11793,11 @@ fn validate_workflow_terminal_payload(
             });
             return;
         }
-        _ => {
-            diagnostics.push(Diagnostic {
-                code: diagnostic_code!("type.unsupported_payload_contract"),
-                severity: Severity::Error,
-                related: Vec::new(),
-                span: at.whole(),
-                message: format!(
-                    "workflow terminal `{terminal_name}` uses an unsupported payload contract type"
-                ),
-                suggestion: Some(
-                    "declare the terminal payload as a class (field block) or a scalar type (`string`, `int`, `float`, or `bool`)"
-                        .to_owned(),
-                ),
-            });
-            return;
-        }
+        // Unreachable in a program the declaration refused, and kept as a
+        // second line of defence rather than an `unreachable!`: the contract
+        // shape is decided in one place (`terminal_payload_contract`) and this
+        // site does not get to assume the other one ran.
+        TerminalPayloadContract::Unsupported => return,
     };
     for site in collect_field_assignments(body) {
         let (field, value) = match &site.assignment {
@@ -11498,6 +11843,7 @@ fn validate_scalar_terminal_payload(
                 code: diagnostic_code!("type.mismatch"),
                 severity: Severity::Error,
                 related: Vec::new(),
+                fixits: Vec::new(),
                 span: site.field.whole(),
                 message: format!(
                     "workflow terminal `{terminal_name}` has a class payload contract `{}` but is given a bare scalar value",
@@ -11513,6 +11859,7 @@ fn validate_scalar_terminal_payload(
             code: diagnostic_code!("type.missing_payload_value"),
             severity: Severity::Error,
             related: Vec::new(),
+            fixits: Vec::new(),
             span: site.field.whole(),
             message: format!("workflow terminal `{terminal_name}` is missing its scalar value"),
             suggestion: Some(format!("write `{action} {terminal_name} <value>`")),
@@ -11530,11 +11877,31 @@ fn validate_scalar_terminal_payload(
         semantic,
         diagnostics,
     );
-    if let Some(root) = dangling_value_root(value, known_roots) {
+    let dangling = dangling_value_roots(value, known_roots);
+    if dangling.is_empty() {
+        // Every path the value holds, not only a lone one: a value carrying two
+        // reads carries two reads. Local scopes only — a terminal payload line
+        // is also walked by the scoped field-path pass in `analyze_rule`, which
+        // is where an invoke-derived binding resolves; making this one
+        // scope-aware too would report the same read twice.
+        for dotted in source_dotted_paths(value) {
+            check_field_path(
+                rule,
+                &dotted.root.clone(),
+                &dotted.path(),
+                FieldPathSpans::scanned(site.value, &dotted),
+                SchemaScopes::local(&semantic.schemas),
+                binding_types,
+                diagnostics,
+            );
+        }
+    }
+    for root in dangling {
         diagnostics.push(Diagnostic {
             code: diagnostic_code!("type.unknown_binding"),
             severity: Severity::Error,
             related: Vec::new(),
+            fixits: Vec::new(),
             span: site.value.whole(),
             message: format!(
                 "rule `{}` has unknown binding `{root}` in `{action} {terminal_name}` value",
@@ -11546,20 +11913,6 @@ fn validate_scalar_terminal_payload(
                 BINDING_ROOT_FALLBACK,
             )),
         });
-    } else if let Some(dotted) = expression_dotted_path(value) {
-        // Local scopes only. A terminal payload line is also walked by the
-        // scoped field-path pass in `analyze_rule`, which is where an
-        // invoke-derived binding resolves; making this one scope-aware too would
-        // report the same read twice.
-        check_field_path(
-            rule,
-            &dotted.root.clone(),
-            &dotted.path(),
-            FieldPathSpans::scanned(site.value, &dotted),
-            SchemaScopes::local(&semantic.schemas),
-            binding_types,
-            diagnostics,
-        );
     }
 }
 
@@ -11589,6 +11942,7 @@ fn validate_required_terminal_fields(
             code: diagnostic_code!("type.missing_required_field"),
             severity: Severity::Error,
             related: Vec::new(),
+            fixits: Vec::new(),
             span: at.whole(),
             message: format!(
                 "workflow terminal `{terminal_name}` is missing required field `{schema}.{required}`"
@@ -11780,6 +12134,7 @@ fn analyze_rule(
                 code: diagnostic_code!("parse.unsupported_when_pattern"),
                 severity: Severity::Error,
                 related: Vec::new(),
+                fixits: Vec::new(),
                 span: when.span,
                 message: format!(
                     "rule `{}` has unknown readiness pattern `{pattern_text}`",
@@ -11803,6 +12158,7 @@ fn analyze_rule(
                     code: diagnostic_code!("type.unknown_schema"),
                     severity: Severity::Error,
                     related: Vec::new(),
+                    fixits: Vec::new(),
                     span: when.span,
                     message: format!("rule `{}` matches unknown class `{schema}`", rule.name.name),
                     suggestion: Some(suggestion),
@@ -11819,6 +12175,7 @@ fn analyze_rule(
                     code: diagnostic_code!("type.unknown_signal"),
                     severity: Severity::Error,
                     related: Vec::new(),
+                    fixits: Vec::new(),
                     span: when.span,
                     message: format!(
                         "rule `{}` reacts to undeclared signal `{schema}`",
@@ -11954,6 +12311,7 @@ fn analyze_rule(
                     code: diagnostic_code!("effect.ambiguous_outcome_predicate"),
                     severity: Severity::Error,
                     related: Vec::new(),
+                    fixits: Vec::new(),
                     span: at.whole(),
                     message: format!(
                         "rule `{}` observes {verb} `{binding}` with `succeeds`, which also \
@@ -11975,6 +12333,7 @@ fn analyze_rule(
                         code: diagnostic_code!("effect.ambiguous_outcome_predicate"),
                         severity: Severity::Error,
                         related: Vec::new(),
+                        fixits: Vec::new(),
                         span: at.whole(),
                         message: format!(
                             "rule `{}` observes acquire `{binding}` with `succeeds`, which also \
@@ -11993,6 +12352,7 @@ fn analyze_rule(
                         code: diagnostic_code!("effect.ambiguous_outcome_predicate"),
                         severity: Severity::Error,
                         related: Vec::new(),
+                        fixits: Vec::new(),
                         span: at.whole(),
                         message: format!(
                             "rule `{}` observes counter consume `{binding}` with `succeeds`, \
@@ -12114,21 +12474,25 @@ fn analyze_rule(
     }
     for when in &rule.whens {
         if let (_, Some(guard)) = split_when_guard(&when.text) {
+            // The guard is a slice of the `when` clause, and the clause is a
+            // verbatim slice of the file when the parser cut it from one, so a
+            // finding inside the guard can name the guard rather than the whole
+            // clause (D10). A synthesized clause records no origin and every
+            // finding lands on the clause, exactly as before.
+            let guard_anchor = when_guard_anchor(when, guard);
             validate_expression(
                 rule,
                 guard,
-                when.span,
+                guard_anchor,
                 semantic,
                 &binding_types,
                 "guard",
                 diagnostics,
             );
-            // The guard is part of the `when` clause, not of the body, so the
-            // clause is the closest span this scan can honestly name.
             validate_known_field_paths(
                 rule,
                 guard,
-                BodyAnchor::fixed(when.span),
+                guard_anchor,
                 semantic,
                 &binding_types,
                 diagnostics,
@@ -12331,6 +12695,7 @@ fn analyze_rule(
                 code: diagnostic_code!("parse.misplaced_binding"),
                 severity: Severity::Error,
                 related: Vec::new(),
+                fixits: Vec::new(),
                 span: statement.whole(),
                 message: format!(
                     "rule `{}` places effect binding `{binding}` after a multiline string delimiter",
@@ -12391,6 +12756,7 @@ fn analyze_rule(
                     code: diagnostic_code!("type.unknown_binding"),
                     severity: Severity::Error,
                     related: Vec::new(),
+                    fixits: Vec::new(),
                     span: statement.whole(),
                     message: format!(
                         "rule `{}` consumes unknown fact binding `{binding}`",
@@ -13631,6 +13997,7 @@ fn collect_effect_payload_types(
                     code: diagnostic_code!("effect.binding_type_conflict"),
                     severity: Severity::Error,
                     related: Vec::new(),
+                    fixits: Vec::new(),
                     span: rule.body.span_of(at.clone()),
                     message: format!(
                         "rule `{}` reuses effect binding `{binding}` for effects with conflicting result types",
@@ -13723,7 +14090,7 @@ fn collect_rule_case_metadata(
             validate_expression(
                 rule,
                 guard,
-                guard_anchor.whole(),
+                guard_anchor,
                 semantic,
                 &branch_scope,
                 "case guard",
@@ -13785,8 +14152,8 @@ fn rule_case_branch_sources(
     semantic: &SemanticContext,
     binding_types: &BTreeMap<String, String>,
 ) -> Vec<RuleCaseBranchSource> {
-    let lines = body_line_offsets(&rule.body.text);
-    let text_lines = lines.iter().map(|(line, _)| *line).collect::<Vec<_>>();
+    let scan = BraceScan::new(&rule.body.text);
+    let lines = case_scan_lines(&rule.body.text, &scan);
     let mut branches = Vec::new();
     let mut index = 0usize;
     while index < lines.len() {
@@ -13796,7 +14163,7 @@ fn rule_case_branch_sources(
             index += 1;
             continue;
         };
-        if active_completes_binding_for_case(&text_lines, index, scrutinee) {
+        if active_completes_binding_for_case(&lines, &scan, index, scrutinee) {
             index += 1;
             continue;
         }
@@ -13804,8 +14171,11 @@ fn rule_case_branch_sources(
             index += 1;
             continue;
         };
-        let mut depth = brace_delta(trimmed).max(1);
-        index += 1;
+        let Some((start, mut depth)) = case_block_start(&lines, &scan, index) else {
+            index += 1;
+            continue;
+        };
+        index = start;
         while index < lines.len() && depth > 0 {
             let (branch_line, branch_line_offset) = lines[index];
             let branch_trimmed = branch_line.trim();
@@ -13829,21 +14199,10 @@ fn rule_case_branch_sources(
                     // same lines with "\n" reproduces exactly these bytes
                     // (`body::raw_body_lines` drops only the `\n`), so the
                     // text handed to the checkers is unchanged.
-                    let mut body_at: Option<Range<usize>> = None;
-                    let mut branch_depth = brace_delta(body_start).max(1);
-                    index += 1;
-                    while index < lines.len() && branch_depth > 0 {
-                        let (body_line, body_line_offset) = lines[index];
-                        let next_depth = branch_depth + brace_delta(body_line);
-                        if next_depth >= 1 {
-                            let start = body_at
-                                .as_ref()
-                                .map_or(body_line_offset, |range: &Range<usize>| range.start);
-                            body_at = Some(start..body_line_offset + body_line.len());
-                        }
-                        branch_depth = next_depth;
-                        index += 1;
-                    }
+                    let body_start_at = slice_offset(branch_line, body_start)
+                        .map_or(branch_line_offset, |offset| branch_line_offset + offset);
+                    let body_at =
+                        case_arm_body(&lines, &scan, &mut index, body_start_at, body_start);
                     let body = body_at
                         .clone()
                         .and_then(|range| rule.body.text.get(range))
@@ -13862,7 +14221,7 @@ fn rule_case_branch_sources(
                     continue;
                 }
             }
-            depth += brace_delta(branch_trimmed);
+            depth += scan.delta(branch_line_offset, branch_line);
             index += 1;
         }
     }
@@ -13955,7 +14314,7 @@ fn collect_terminal_case_metadata(
             validate_expression(
                 rule,
                 guard,
-                guard_anchor.whole(),
+                guard_anchor,
                 semantic,
                 &branch_scope,
                 "case guard",
@@ -14061,23 +14420,26 @@ fn envelope_fields_read_on_payload(
 }
 
 fn terminal_case_branch_sources(rule: &RuleDecl) -> Vec<TerminalBranchSource> {
-    let lines = body_line_offsets(&rule.body.text);
-    let text_lines = lines.iter().map(|(line, _)| *line).collect::<Vec<_>>();
+    let scan = BraceScan::new(&rule.body.text);
+    let lines = case_scan_lines(&rule.body.text, &scan);
     let mut branches = Vec::new();
     let mut index = 0usize;
     while index < lines.len() {
-        let (line, line_offset) = lines[index];
+        let (line, _) = lines[index];
         let trimmed = line.trim();
         let Some(scrutinee) = case_scrutinee(trimmed) else {
             index += 1;
             continue;
         };
-        if !active_completes_binding_for_case(&text_lines, index, scrutinee) {
+        if !active_completes_binding_for_case(&lines, &scan, index, scrutinee) {
             index += 1;
             continue;
         }
-        let mut depth = brace_delta(trimmed).max(1);
-        index += 1;
+        let Some((start, mut depth)) = case_block_start(&lines, &scan, index) else {
+            index += 1;
+            continue;
+        };
+        index = start;
         while index < lines.len() && depth > 0 {
             let (branch_line, branch_line_offset) = lines[index];
             let branch_trimmed = branch_line.trim();
@@ -14101,21 +14463,10 @@ fn terminal_case_branch_sources(rule: &RuleDecl) -> Vec<TerminalBranchSource> {
                     // same lines with "\n" reproduces exactly these bytes
                     // (`body::raw_body_lines` drops only the `\n`), so the
                     // text handed to the checkers is unchanged.
-                    let mut body_at: Option<Range<usize>> = None;
-                    let mut branch_depth = brace_delta(body_start).max(1);
-                    index += 1;
-                    while index < lines.len() && branch_depth > 0 {
-                        let (body_line, body_line_offset) = lines[index];
-                        let next_depth = branch_depth + brace_delta(body_line);
-                        if next_depth >= 1 {
-                            let start = body_at
-                                .as_ref()
-                                .map_or(body_line_offset, |range: &Range<usize>| range.start);
-                            body_at = Some(start..body_line_offset + body_line.len());
-                        }
-                        branch_depth = next_depth;
-                        index += 1;
-                    }
+                    let body_start_at = slice_offset(branch_line, body_start)
+                        .map_or(branch_line_offset, |offset| branch_line_offset + offset);
+                    let body_at =
+                        case_arm_body(&lines, &scan, &mut index, body_start_at, body_start);
                     let body = body_at
                         .clone()
                         .and_then(|range| rule.body.text.get(range))
@@ -14133,10 +14484,9 @@ fn terminal_case_branch_sources(rule: &RuleDecl) -> Vec<TerminalBranchSource> {
                     continue;
                 }
             }
-            depth += brace_delta(branch_trimmed);
+            depth += scan.delta(branch_line_offset, branch_line);
             index += 1;
         }
-        let _ = line_offset;
     }
     branches
 }
@@ -14164,6 +14514,36 @@ fn branch_anchor(
 /// here do both before they know a diagnostic is coming. The pointers still
 /// carry it, so nothing has to be re-found by searching for the text — which
 /// would land on the wrong copy the moment a line repeats a token.
+/// The anchor for a whole [`SourceText`] the parser cut from the file.
+///
+/// The origin is the recorded fact that the text is still the file's bytes;
+/// without it (a canonical reprint, a lowered `table`'s seeder, a `pattern`
+/// expansion that substituted a type parameter) no offset into the text is a
+/// source position and every finding degrades to `fallback`, which is what it
+/// was before D10.
+fn source_text_anchor<'a>(text: &SourceText, fallback: SourceSpan) -> BodyAnchor<'a> {
+    match text.file_offset() {
+        Some(at) => BodyAnchor::file(at, text.len(), fallback),
+        None => BodyAnchor::fixed(fallback),
+    }
+}
+
+/// Where `guard` — a slice of `when.text` — lives in the file, as a span.
+///
+/// The clause's span when the text is no longer the file's, which is honest
+/// coarseness rather than a byte offset measured against text that moved.
+pub(crate) fn when_guard_span(when: &WhenClause, guard: &str) -> SourceSpan {
+    when_guard_anchor(when, guard).whole()
+}
+
+/// Where `guard` — a slice of `when.text` — lives in the file.
+fn when_guard_anchor<'a>(when: &WhenClause, guard: &str) -> BodyAnchor<'a> {
+    match slice_offset(&when.text, guard) {
+        Some(offset) => source_text_anchor(&when.text, when.span).sub(offset..offset + guard.len()),
+        None => BodyAnchor::fixed(when.span),
+    }
+}
+
 fn slice_offset(whole: &str, part: &str) -> Option<usize> {
     let base = whole.as_ptr() as usize;
     let start = part.as_ptr() as usize;
@@ -14468,6 +14848,7 @@ fn validate_mint_credential(
             code: diagnostic_code!("type.unknown_credential"),
             severity: Severity::Error,
             related: Vec::new(),
+            fixits: Vec::new(),
             span: effect.span,
             message: format!(
                 "rule `{}` mints from undeclared credential `{parent}`",
@@ -14495,6 +14876,7 @@ fn validate_mint_credential(
             code: diagnostic_code!("security.mint_parent_not_presented"),
             severity: Severity::Error,
             related: Vec::new(),
+            fixits: Vec::new(),
             span: effect.span,
             message: format!(
                 "rule `{}` mints from `{parent}` without presenting it",
@@ -14515,6 +14897,7 @@ fn validate_mint_credential(
                 code: diagnostic_code!("security.mint_parent_not_presented"),
                 severity: Severity::Error,
                 related: Vec::new(),
+                fixits: Vec::new(),
                 span: effect.span,
                 message: format!(
                     "rule `{}` mints from `{parent}` but the exchange presents `{handle}`",
@@ -14564,6 +14947,7 @@ fn validate_credential_allow(
                         code: diagnostic_code!("capability.not_granted"),
                         severity: Severity::Error,
                         related: Vec::new(),
+                        fixits: Vec::new(),
                         span,
                         message: format!(
                             "rule `{}` uses credential `{credential}` for `{operation}`, which its \
@@ -14700,6 +15084,7 @@ fn validate_obtain_credential(
         code: diagnostic_code!("type.unknown_credential"),
         severity: Severity::Error,
         related: Vec::new(),
+        fixits: Vec::new(),
         span: effect.span,
         message: format!(
             "rule `{}` escalates for undeclared credential `{credential}`",
@@ -14776,6 +15161,7 @@ fn validate_no_raw_authorization_header(
             code: diagnostic_code!("security.raw_authorization_header"),
             severity: Severity::Error,
             related: Vec::new(),
+            fixits: Vec::new(),
             span: header.span,
             message: format!(
                 "rule `{}` writes a raw `Authorization` header in a `{construct}`",
@@ -14808,6 +15194,7 @@ fn validate_http_request(
                 code: diagnostic_code!("type.unknown_credential"),
                 severity: Severity::Error,
                 related: Vec::new(),
+                fixits: Vec::new(),
                 span: effect.span,
                 message: format!(
                     "rule `{}` presents undeclared credential `{handle}` in a `request`",
@@ -14833,6 +15220,7 @@ fn validate_http_request(
             code: diagnostic_code!("security.multiple_credentials_presented"),
             severity: Severity::Error,
             related: Vec::new(),
+            fixits: Vec::new(),
             span: effect.span,
             message: format!(
                 "rule `{}` presents {} credentials in one `request` ({})",
@@ -14856,6 +15244,7 @@ fn validate_http_request(
             code: diagnostic_code!("security.unauthenticated_request"),
             severity: Severity::Error,
             related: Vec::new(),
+            fixits: Vec::new(),
             span: effect.span,
             message: format!(
                 "rule `{}` has a `request` that authenticates nothing",
@@ -15194,6 +15583,7 @@ fn validate_after_bindings(
                         code: diagnostic_code!("effect.unsatisfiable_dependency"),
                         severity: Severity::Error,
                         related: Vec::new(),
+                        fixits: Vec::new(),
                         span: after.span,
                         message: format!(
                             "rule `{}` has `after` block for unknown effect binding `{binding}`",
@@ -15574,6 +15964,7 @@ fn validate_coerce_call(
             code: diagnostic_code!("parse.malformed_statement"),
             severity: Severity::Error,
             related: Vec::new(),
+            fixits: Vec::new(),
             span: at.whole(),
             message: format!("rule `{}` has malformed coerce call", rule.name.name),
             suggestion: Some("write `coerce functionName(arg, ...) as name`".to_owned()),
@@ -15585,6 +15976,7 @@ fn validate_coerce_call(
             code: diagnostic_code!("type.unknown_coerce"),
             severity: Severity::Error,
             related: Vec::new(),
+            fixits: Vec::new(),
             span: at.whole(),
             message: format!(
                 "rule `{}` calls unknown coerce function `{function_name}`",
@@ -15605,6 +15997,7 @@ fn validate_coerce_call(
             code: diagnostic_code!("expr.arity_mismatch"),
             severity: Severity::Error,
             related: Vec::new(),
+            fixits: Vec::new(),
             span: at.whole(),
             message: format!(
                 "rule `{}` calls coerce `{function_name}` with {} argument(s), expected {}",
@@ -15621,11 +16014,12 @@ fn validate_coerce_call(
         // Dangling-root check (mirrors record/terminal value validation): an arg
         // whose root is not a known binding is a typo/unbound reference, which the
         // type-checker below accepts leniently.
-        if let Some(root) = dangling_value_root(arg, known_roots) {
+        for root in dangling_value_roots(arg, known_roots) {
             diagnostics.push(Diagnostic {
                 code: diagnostic_code!("type.unknown_binding"),
                 severity: Severity::Error,
                 related: Vec::new(),
+                fixits: Vec::new(),
                 span: at.whole(),
                 message: format!(
                     "rule `{}` has unknown binding `{root}` in coerce `{function_name}` argument",
@@ -15690,6 +16084,7 @@ fn validate_workflow_invocations(
                 code: diagnostic_code!("parse.malformed_statement"),
                 severity: Severity::Error,
                 related: Vec::new(),
+                fixits: Vec::new(),
                 span: at.whole(),
                 message: format!(
                     "rule `{}` has malformed workflow invocation",
@@ -15704,6 +16099,7 @@ fn validate_workflow_invocations(
                 code: diagnostic_code!("graph.unbounded_workflow_invocation_recursion"),
                 severity: Severity::Error,
                 related: Vec::new(),
+                fixits: Vec::new(),
                 span: at.whole(),
                 message: format!(
                     "rule `{}` recursively invokes workflow `{target}`",
@@ -15721,6 +16117,7 @@ fn validate_workflow_invocations(
                 code: diagnostic_code!("type.unknown_workflow"),
                 severity: Severity::Error,
                 related: Vec::new(),
+                fixits: Vec::new(),
                 span: at.whole(),
                 message: format!(
                     "rule `{}` invokes unknown workflow `{target}`",
@@ -15749,6 +16146,7 @@ fn validate_workflow_invocations(
                     code: diagnostic_code!("type.duplicate_field"),
                     severity: Severity::Error,
                     related: Vec::new(),
+                    fixits: Vec::new(),
                     span: at.whole(),
                     message: format!("workflow invocation `{target}` repeats input `{field}`"),
                     suggestion: Some("remove the duplicate invocation input".to_owned()),
@@ -15766,6 +16164,7 @@ fn validate_workflow_invocations(
                     code: diagnostic_code!("type.unexpected_field"),
                     severity: Severity::Error,
                     related: Vec::new(),
+                    fixits: Vec::new(),
                     span: at.whole(),
                     message: format!("workflow `{target}` has no input `{field}`"),
                     suggestion: Some(if known.is_empty() {
@@ -15780,11 +16179,12 @@ fn validate_workflow_invocations(
                 });
                 continue;
             };
-            if let Some(root) = dangling_value_root(&value, known_roots) {
+            for root in dangling_value_roots(&value, known_roots) {
                 diagnostics.push(Diagnostic {
                     code: diagnostic_code!("type.unknown_binding"),
                     severity: Severity::Error,
                     related: Vec::new(),
+                    fixits: Vec::new(),
                     span: at.whole(),
                     message: format!(
                         "rule `{}` has unknown binding `{root}` in `invoke {target}` input `{field}`",
@@ -15814,6 +16214,7 @@ fn validate_workflow_invocations(
                 code: diagnostic_code!("type.missing_required_field"),
                 severity: Severity::Error,
                 related: Vec::new(),
+                fixits: Vec::new(),
                 span: at.whole(),
                 message: format!("workflow invocation `{target}` is missing input `{input}`"),
                 suggestion: Some(format!(
@@ -15843,6 +16244,7 @@ fn validate_agent_tell_target(
             code: diagnostic_code!("parse.malformed_statement"),
             severity: Severity::Error,
             related: Vec::new(),
+            fixits: Vec::new(),
             span: at.whole(),
             message: format!("rule `{}` has malformed tell target", rule.name.name),
             suggestion: Some("write `tell agentName ...` or `tell task.agentRef ...`".to_owned()),
@@ -15854,6 +16256,7 @@ fn validate_agent_tell_target(
             code: diagnostic_code!("type.mismatch"),
             severity: Severity::Error,
             related: Vec::new(),
+            fixits: Vec::new(),
             span: at.whole(),
             message: format!(
                 "rule `{}` uses a string literal as a tell target",
@@ -15869,11 +16272,12 @@ fn validate_agent_tell_target(
             // Unknown type can mean a dangling root (the path's binding does not
             // exist) — caught here since the type lookup returns None silently. A
             // known root with a bad path is left to other validation.
-            if let Some(root) = dangling_value_root(target, known_roots) {
+            for root in dangling_value_roots(target, known_roots) {
                 diagnostics.push(Diagnostic {
                     code: diagnostic_code!("type.unknown_binding"),
                     severity: Severity::Error,
                     related: Vec::new(),
+                    fixits: Vec::new(),
                     span: at.whole(),
                     message: format!(
                         "rule `{}` has unknown binding `{root}` in tell target `{target}`",
@@ -15904,6 +16308,7 @@ fn validate_agent_tell_target(
                 code: diagnostic_code!("type.mismatch"),
                 severity: Severity::Error,
                 related: Vec::new(),
+                fixits: Vec::new(),
                 span: at.whole(),
                 message: format!(
                     "rule `{}` uses non-AgentRef dynamic tell target `{target}`",
@@ -15922,6 +16327,7 @@ fn validate_agent_tell_target(
             code: diagnostic_code!("type.unknown_agent"),
             severity: Severity::Error,
             related: Vec::new(),
+            fixits: Vec::new(),
             span: at.whole(),
             message: format!("rule `{}` tells unknown agent `{target}`", rule.name.name),
             suggestion: Some(suggest_otherwise(
@@ -15964,6 +16370,7 @@ fn validate_agent_capabilities(
                 code: diagnostic_code!("construct.capability_not_declared"),
                 severity: Severity::Error,
                 related: Vec::new(),
+                fixits: Vec::new(),
                 span: at.whole(),
                 message: format!(
                     "rule `{}` tells agent `{agent}` requiring undeclared capability `{capability}`",
@@ -16002,6 +16409,7 @@ fn validate_availability_when(
                 code: diagnostic_code!("type.mismatch"),
                 severity: Severity::Error,
                 related: Vec::new(),
+                fixits: Vec::new(),
                 span: at,
                 message: format!(
                     "rule `{}` checks availability for non-AgentRef `{target}`",
@@ -16020,6 +16428,7 @@ fn validate_availability_when(
             code: diagnostic_code!("type.unknown_agent"),
             severity: Severity::Error,
             related: Vec::new(),
+            fixits: Vec::new(),
             span: at,
             message: format!("rule `{}` checks unknown agent `{target}`", rule.name.name),
             suggestion: Some(suggest_otherwise(
@@ -16053,27 +16462,46 @@ impl ExprScope {
 }
 
 #[derive(Clone, Debug)]
-struct ExprValidationContext {
+struct ExprValidationContext<'a> {
     subject: String,
-    span: SourceSpan,
+    /// Where the expression TEXT was written, so a finding about one node in it
+    /// can be resolved from that node's [`ExprSpans`] range (D10).
+    ///
+    /// A caller that has no such anchor passes `BodyAnchor::fixed(span)`, and
+    /// every finding lands at `span` — which is what every expression
+    /// diagnostic did before this row.
+    at: BodyAnchor<'a>,
 }
 
-impl ExprValidationContext {
-    /// `at` is where the expression was WRITTEN — the `when` clause holding the
-    /// guard, the `case` branch pattern, the record field's value. An expression
-    /// has no spans of its own (D10), so this is as close as a finding inside
-    /// one can land.
-    fn rule(rule: &RuleDecl, at: SourceSpan) -> Self {
+impl<'a> ExprValidationContext<'a> {
+    /// `at` is the expression text: the guard after `where`, the `case` branch
+    /// guard, the record field's value.
+    fn rule(rule: &RuleDecl, at: BodyAnchor<'a>) -> Self {
         Self {
             subject: format!("rule `{}`", rule.name.name),
-            span: at,
+            at,
         }
     }
 
-    fn assertion(span: SourceSpan) -> Self {
+    fn assertion(at: BodyAnchor<'a>) -> Self {
         Self {
             subject: "assertion".to_owned(),
-            span,
+            at,
+        }
+    }
+
+    /// The whole expression — the honest span for a finding that is about the
+    /// expression rather than about a node inside it.
+    fn span(&self) -> SourceSpan {
+        self.at.whole()
+    }
+
+    /// Where the node `spans` describes was written, degrading to the whole
+    /// expression when nothing recorded a position for it.
+    fn node(&self, spans: &ExprSpans) -> SourceSpan {
+        match spans.range() {
+            Some(range) if !range.is_empty() && self.at.holds(&range) => self.at.at(range),
+            _ => self.span(),
         }
     }
 }
@@ -16101,11 +16529,17 @@ fn validate_value_expression(
     binding_types: &BTreeMap<String, String>,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
+    // No `ExprSpans`: `body::FieldValue` stores a parsed `Expr` and the source
+    // text it came from, but not where that text starts, so nothing here can
+    // turn a node's range into a file position. The field's own span is the
+    // truth this position has (D10 covers guards; a value position needs an
+    // origin on `FieldValue`, which is a COMPARED node).
     infer_expr_type(
         expr,
+        &ExprSpans::unknown(),
         semantic,
         &ExprScope::from_bindings(binding_types),
-        &ExprValidationContext::rule(rule, at),
+        &ExprValidationContext::rule(rule, BodyAnchor::fixed(at)),
         diagnostics,
     );
 }
@@ -16194,19 +16628,22 @@ fn validate_value_expressions(
     }
 }
 
+/// `at` is the expression TEXT — the guard after `where`, not the clause that
+/// contains it — so a finding about one node in it can name that node (D10).
 fn validate_expression(
     rule: &RuleDecl,
     expr: &str,
-    at: SourceSpan,
+    at: BodyAnchor,
     semantic: &SemanticContext,
     binding_types: &BTreeMap<String, String>,
     label: &str,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
-    match parse_expression(expr) {
-        Ok(expr) => {
+    match parse_expression_spanned(expr) {
+        Ok((expr, spans)) => {
             validate_parsed_expression(
                 &expr,
+                &spans,
                 semantic,
                 &ExprScope::from_bindings(binding_types),
                 &ExprValidationContext::rule(rule, at),
@@ -16214,12 +16651,16 @@ fn validate_expression(
                 diagnostics,
             );
         }
-        Err(message) => diagnostics.push(Diagnostic {
+        Err(error) => diagnostics.push(Diagnostic {
             code: diagnostic_code!("parse.invalid_expression"),
             severity: Severity::Error,
             related: Vec::new(),
-            span: at,
-            message: format!("rule `{}` has invalid {label} expression: {message}", rule.name.name),
+            fixits: Vec::new(),
+            // The message says which token the parser rejected; the caret says
+            // where it is. A failure with no token to blame reports at the whole
+            // expression.
+            span: error.range.map_or_else(|| at.whole(), |range| at.at(range)),
+            message: format!("rule `{}` has invalid {label} expression: {}", rule.name.name, error.message),
             suggestion: Some("use deterministic field paths, literals, boolean operators, comparisons, membership, count, or exists".to_owned()),
         }),
     }
@@ -16227,6 +16668,7 @@ fn validate_expression(
 
 fn validate_parsed_expression(
     expr: &Expr,
+    spans: &ExprSpans,
     semantic: &SemanticContext,
     scope: &ExprScope,
     context: &ExprValidationContext,
@@ -16236,27 +16678,35 @@ fn validate_parsed_expression(
     let presence_proofs = BTreeSet::new();
     validate_expr_node(
         expr,
+        spans,
         semantic,
         scope,
         context,
         &presence_proofs,
         diagnostics,
     );
-    let ty = infer_expr_type(expr, semantic, scope, context, diagnostics);
+    let ty = infer_expr_type(expr, spans, semantic, scope, context, diagnostics);
     if ty != ExprType::Bool && ty != ExprType::Unknown {
         diagnostics.push(Diagnostic {
             code: diagnostic_code!("expr.non_boolean_condition"),
             severity: Severity::Error,
             related: Vec::new(),
-            span: context.span,
+            fixits: Vec::new(),
+            // About the expression, not about a node in it: it is the RESULT
+            // that is not a bool.
+            span: context.span(),
             message: format!("{} has non-boolean {label} expression", context.subject),
             suggestion: Some(format!("{label} expressions must evaluate to bool")),
         });
     }
 }
 
+/// `spans` mirrors `expr`: `spans.child(n)` is the `n`th entry of
+/// [`Expr::children`], so the two walk in lockstep and a finding about one node
+/// can name that node instead of the clause the expression sits in (D10).
 fn validate_expr_node(
     expr: &Expr,
+    spans: &ExprSpans,
     semantic: &SemanticContext,
     scope: &ExprScope,
     context: &ExprValidationContext,
@@ -16268,6 +16718,8 @@ fn validate_expr_node(
             if path.len() < 2 {
                 return;
             }
+            // Every finding below names the PATH, and the path is this node.
+            let at = context.node(spans);
             let root = &path[0];
             let Some(schema) = scope.binding_types.get(root) else {
                 if let Some(schema) = &scope.implicit_schema {
@@ -16283,7 +16735,8 @@ fn validate_expr_node(
                             code: diagnostic_code!("expr.optional_without_presence"),
                             severity: Severity::Error,
                             related: Vec::new(),
-                            span: context.span,
+                            fixits: Vec::new(),
+                            span: at,
                             message: format!(
                                 "{} has unsafe optional path `{}`: {message}",
                                 context.subject,
@@ -16302,7 +16755,8 @@ fn validate_expr_node(
                             code: diagnostic_code!("type.unknown_field"),
                             severity: Severity::Error,
                             related: Vec::new(),
-                            span: context.span,
+                            fixits: Vec::new(),
+                            span: at,
                             message: format!(
                                 "{} has invalid expression path `{}`: {message}",
                                 context.subject,
@@ -16323,7 +16777,8 @@ fn validate_expr_node(
                     code: diagnostic_code!("type.unknown_binding"),
                     severity: Severity::Error,
                     related: Vec::new(),
-                    span: context.span,
+                    fixits: Vec::new(),
+                    span: at,
                     message: format!("{} has unknown expression root `{root}`", context.subject),
                     suggestion: Some(suggest_otherwise(
                         root,
@@ -16345,7 +16800,8 @@ fn validate_expr_node(
                     code: diagnostic_code!("expr.optional_without_presence"),
                     severity: Severity::Error,
                     related: Vec::new(),
-                    span: context.span,
+                    fixits: Vec::new(),
+                    span: at,
                     message: format!(
                         "{} has unsafe optional path `{}`: {message}",
                         context.subject,
@@ -16363,7 +16819,8 @@ fn validate_expr_node(
                     code: diagnostic_code!("type.unknown_field"),
                     severity: Severity::Error,
                     related: Vec::new(),
-                    span: context.span,
+                    fixits: Vec::new(),
+                    span: at,
                     message: format!(
                         "{} has invalid expression path `{}`: {message}",
                         context.subject,
@@ -16380,20 +16837,32 @@ fn validate_expr_node(
         Expr::Index { target, key } => {
             validate_expr_node(
                 target,
+                spans.child(0),
                 semantic,
                 scope,
                 context,
                 presence_proofs,
                 diagnostics,
             );
-            validate_expr_node(key, semantic, scope, context, presence_proofs, diagnostics);
-            let key_ty = infer_expr_type(key, semantic, scope, context, diagnostics);
+            validate_expr_node(
+                key,
+                spans.child(1),
+                semantic,
+                scope,
+                context,
+                presence_proofs,
+                diagnostics,
+            );
+            let key_ty =
+                infer_expr_type(key, spans.child(1), semantic, scope, context, diagnostics);
             if !matches!(key_ty, ExprType::String | ExprType::Unknown) {
                 diagnostics.push(Diagnostic {
                     code: diagnostic_code!("expr.non_string_map_key"),
                     severity: Severity::Error,
                     related: Vec::new(),
-                    span: context.span,
+                    fixits: Vec::new(),
+                    // The key is the operand the message is about.
+                    span: context.node(spans.child(1)),
                     message: format!("{} indexes a map with a non-string key", context.subject),
                     suggestion: Some(
                         "use a string literal or string expression as the map key".to_owned(),
@@ -16402,8 +16871,16 @@ fn validate_expr_node(
             }
         }
         Expr::Array(items) => {
-            for item in items {
-                validate_expr_node(item, semantic, scope, context, presence_proofs, diagnostics);
+            for (index, item) in items.iter().enumerate() {
+                validate_expr_node(
+                    item,
+                    spans.child(index),
+                    semantic,
+                    scope,
+                    context,
+                    presence_proofs,
+                    diagnostics,
+                );
             }
         }
         Expr::Object(fields) => {
@@ -16411,7 +16888,10 @@ fn validate_expr_node(
                 code: diagnostic_code!("expr.untyped_object_literal"),
                 severity: Severity::Error,
                 related: Vec::new(),
-                span: context.span,
+                fixits: Vec::new(),
+                // About the literal as a whole — it is the `{ … }` that has no
+                // expected type.
+                span: context.node(spans),
                 message: format!(
                     "{} uses an object literal without an expected object or map type",
                     context.subject
@@ -16421,9 +16901,10 @@ fn validate_expr_node(
                         .to_owned(),
                 ),
             });
-            for field in fields {
+            for (index, field) in fields.iter().enumerate() {
                 validate_expr_node(
                     &field.value,
+                    spans.child(index),
                     semantic,
                     scope,
                     context,
@@ -16432,23 +16913,54 @@ fn validate_expr_node(
                 );
             }
         }
-        Expr::Unary { expr, .. } => {
-            validate_expr_node(expr, semantic, scope, context, presence_proofs, diagnostics)
-        }
+        Expr::Unary { expr, .. } => validate_expr_node(
+            expr,
+            spans.child(0),
+            semantic,
+            scope,
+            context,
+            presence_proofs,
+            diagnostics,
+        ),
         Expr::Binary {
             op: BinaryOp::And,
             left,
             right,
         } => {
-            validate_expr_node(left, semantic, scope, context, presence_proofs, diagnostics);
+            validate_expr_node(
+                left,
+                spans.child(0),
+                semantic,
+                scope,
+                context,
+                presence_proofs,
+                diagnostics,
+            );
             let mut right_proofs = presence_proofs.clone();
             collect_presence_proofs(left, &mut right_proofs);
-            validate_expr_node(right, semantic, scope, context, &right_proofs, diagnostics);
-        }
-        Expr::Binary { op, left, right } => {
-            validate_expr_node(left, semantic, scope, context, presence_proofs, diagnostics);
             validate_expr_node(
                 right,
+                spans.child(1),
+                semantic,
+                scope,
+                context,
+                &right_proofs,
+                diagnostics,
+            );
+        }
+        Expr::Binary { op, left, right } => {
+            validate_expr_node(
+                left,
+                spans.child(0),
+                semantic,
+                scope,
+                context,
+                presence_proofs,
+                diagnostics,
+            );
+            validate_expr_node(
+                right,
+                spans.child(1),
                 semantic,
                 scope,
                 context,
@@ -16458,26 +16970,46 @@ fn validate_expr_node(
             validate_unknown_implicit_idents(
                 *op,
                 left,
+                spans.child(0),
                 right,
+                spans.child(1),
                 semantic,
                 scope,
                 context,
                 diagnostics,
             );
-            validate_finite_domain_expr(*op, left, right, semantic, scope, context, diagnostics);
+            validate_finite_domain_expr(
+                *op,
+                left,
+                right,
+                spans,
+                semantic,
+                scope,
+                context,
+                diagnostics,
+            );
         }
         Expr::Call { name, args } => {
-            validate_function_call(name, args, semantic, scope, context, diagnostics);
-            for arg in args {
-                validate_expr_node(arg, semantic, scope, context, presence_proofs, diagnostics);
+            validate_function_call(name, args, spans, semantic, scope, context, diagnostics);
+            for (index, arg) in args.iter().enumerate() {
+                validate_expr_node(
+                    arg,
+                    spans.child(index),
+                    semantic,
+                    scope,
+                    context,
+                    presence_proofs,
+                    diagnostics,
+                );
             }
         }
         Expr::Query { guard, .. } => {
-            validate_query_expr(expr, semantic, scope, context, diagnostics);
+            validate_query_expr(expr, spans, semantic, scope, context, diagnostics);
             if let Some(guard) = guard {
                 let guard_scope = query_guard_scope(expr, semantic, scope);
                 validate_expr_node(
                     guard,
+                    spans.child(0),
                     semantic,
                     &guard_scope,
                     context,
@@ -16490,10 +17022,13 @@ fn validate_expr_node(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn validate_unknown_implicit_idents(
     op: BinaryOp,
     left: &Expr,
+    left_spans: &ExprSpans,
     right: &Expr,
+    right_spans: &ExprSpans,
     semantic: &SemanticContext,
     scope: &ExprScope,
     context: &ExprValidationContext,
@@ -16505,12 +17040,29 @@ fn validate_unknown_implicit_idents(
     ) {
         return;
     }
-    validate_unknown_implicit_ident(left, right, semantic, scope, context, diagnostics);
-    validate_unknown_implicit_ident(right, left, semantic, scope, context, diagnostics);
+    validate_unknown_implicit_ident(
+        left,
+        left_spans,
+        right,
+        semantic,
+        scope,
+        context,
+        diagnostics,
+    );
+    validate_unknown_implicit_ident(
+        right,
+        right_spans,
+        left,
+        semantic,
+        scope,
+        context,
+        diagnostics,
+    );
 }
 
 fn validate_unknown_implicit_ident(
     expr: &Expr,
+    spans: &ExprSpans,
     other: &Expr,
     semantic: &SemanticContext,
     scope: &ExprScope,
@@ -16538,7 +17090,9 @@ fn validate_unknown_implicit_ident(
         code: diagnostic_code!("type.unknown_field"),
         severity: Severity::Error,
         related: Vec::new(),
-        span: context.span,
+        fixits: Vec::new(),
+        // `name` is this operand, and it is what the message names.
+        span: context.node(spans),
         message: format!(
             "{} fact query `{schema}` has unknown field `{name}`",
             context.subject
@@ -16573,11 +17127,17 @@ fn implicit_ident_field_exists(expr: &Expr, semantic: &SemanticContext, scope: &
 fn validate_function_call(
     name: &str,
     args: &[Expr],
+    spans: &ExprSpans,
     semantic: &SemanticContext,
     scope: &ExprScope,
     context: &ExprValidationContext,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
+    // An arity finding is about the CALL — there is no one argument to blame
+    // when the count is wrong — and an argument-type finding is about the
+    // argument.
+    let call = context.node(spans);
+    let argument = context.node(spans.child(0));
     match name {
         "count" => {
             if args.len() != 1 {
@@ -16585,7 +17145,8 @@ fn validate_function_call(
                     code: diagnostic_code!("expr.arity_mismatch"),
                     severity: Severity::Error,
                     related: Vec::new(),
-                    span: context.span,
+                    fixits: Vec::new(),
+                    span: call,
                     message: format!(
                         "{} calls `count` with {} arguments, expected 1",
                         context.subject,
@@ -16598,13 +17159,21 @@ fn validate_function_call(
                 });
                 return;
             }
-            let ty = infer_expr_type(&args[0], semantic, scope, context, diagnostics);
+            let ty = infer_expr_type(
+                &args[0],
+                spans.child(0),
+                semantic,
+                scope,
+                context,
+                diagnostics,
+            );
             if !is_countable_type(&ty) {
                 diagnostics.push(Diagnostic {
                     code: diagnostic_code!("expr.unsupported_argument_type"),
                     severity: Severity::Error,
                     related: Vec::new(),
-                    span: context.span,
+                    fixits: Vec::new(),
+                    span: argument,
                     message: format!(
                         "{} calls `count` with unsupported argument type `{}`",
                         context.subject,
@@ -16623,7 +17192,8 @@ fn validate_function_call(
                     code: diagnostic_code!("expr.arity_mismatch"),
                     severity: Severity::Error,
                     related: Vec::new(),
-                    span: context.span,
+                    fixits: Vec::new(),
+                    span: call,
                     message: format!(
                         "{} calls `exists` with {} arguments, expected 1",
                         context.subject,
@@ -16633,13 +17203,21 @@ fn validate_function_call(
                 });
                 return;
             }
-            let ty = infer_expr_type(&args[0], semantic, scope, context, diagnostics);
+            let ty = infer_expr_type(
+                &args[0],
+                spans.child(0),
+                semantic,
+                scope,
+                context,
+                diagnostics,
+            );
             if !matches!(args[0], Expr::Index { .. }) && !is_exists_type(&ty) {
                 diagnostics.push(Diagnostic {
                     code: diagnostic_code!("expr.unsupported_argument_type"),
                     severity: Severity::Error,
                     related: Vec::new(),
-                    span: context.span,
+                    fixits: Vec::new(),
+                    span: argument,
                     message: format!(
                         "{} calls `exists` with unsupported argument type `{}`",
                         context.subject,
@@ -16658,7 +17236,8 @@ fn validate_function_call(
                     code: diagnostic_code!("expr.arity_mismatch"),
                     severity: Severity::Error,
                     related: Vec::new(),
-                    span: context.span,
+                    fixits: Vec::new(),
+                    span: call,
                     message: format!(
                         "{} calls `empty` with {} arguments, expected 1",
                         context.subject,
@@ -16671,7 +17250,14 @@ fn validate_function_call(
                 });
                 return;
             }
-            let ty = infer_expr_type(&args[0], semantic, scope, context, diagnostics);
+            let ty = infer_expr_type(
+                &args[0],
+                spans.child(0),
+                semantic,
+                scope,
+                context,
+                diagnostics,
+            );
             if !is_emptiable_type(&ty) {
                 // An optional gets its own message: the inner type is what
                 // makes it unsupported (spec: `empty(Optional<T>)` is defined
@@ -16681,7 +17267,8 @@ fn validate_function_call(
                     code: diagnostic_code!("expr.unsupported_argument_type"),
                     severity: Severity::Error,
                     related: Vec::new(),
-                    span: context.span,
+                    fixits: Vec::new(),
+                    span: argument,
                     message: format!(
                         "{} calls `empty` with unsupported {}argument type `{}`",
                         context.subject,
@@ -16701,6 +17288,7 @@ fn validate_function_call(
 
 fn validate_query_expr(
     expr: &Expr,
+    spans: &ExprSpans,
     semantic: &SemanticContext,
     scope: &ExprScope,
     context: &ExprValidationContext,
@@ -16715,7 +17303,9 @@ fn validate_query_expr(
                 code: diagnostic_code!("type.unknown_schema"),
                 severity: Severity::Error,
                 related: Vec::new(),
-                span: context.span,
+                fixits: Vec::new(),
+                // The query, head and all: the head has no range of its own.
+                span: context.node(spans),
                 message: format!(
                     "{} queries unknown fact schema `{}`",
                     context.subject,
@@ -16731,13 +17321,22 @@ fn validate_query_expr(
         };
         if let Some(guard) = guard {
             let guard_scope = scope.with_implicit_schema(schema);
-            let ty = infer_expr_type(guard, semantic, &guard_scope, context, diagnostics);
+            let ty = infer_expr_type(
+                guard,
+                spans.child(0),
+                semantic,
+                &guard_scope,
+                context,
+                diagnostics,
+            );
             if !matches!(ty, ExprType::Bool | ExprType::Unknown) {
                 diagnostics.push(Diagnostic {
                     code: diagnostic_code!("expr.non_boolean_condition"),
                     severity: Severity::Error,
                     related: Vec::new(),
-                    span: context.span,
+                    fixits: Vec::new(),
+                    // The `where` expression is the one that has to be a bool.
+                    span: context.node(spans.child(0)),
                     message: format!(
                         "{} fact query `{}` has non-boolean `where` expression",
                         context.subject,
@@ -16929,8 +17528,10 @@ fn implicit_field_type(
         .ok()
 }
 
+/// `spans` mirrors `expr` — see [`validate_expr_node`].
 fn infer_expr_type(
     expr: &Expr,
+    spans: &ExprSpans,
     semantic: &SemanticContext,
     scope: &ExprScope,
     context: &ExprValidationContext,
@@ -16943,14 +17544,24 @@ fn infer_expr_type(
         Expr::Literal(literal) => expr_literal_type(literal),
         Expr::Path(path) => expr_path_type(path, semantic, scope).unwrap_or(ExprType::Unknown),
         Expr::Index { target, key } => {
-            let target_ty = infer_expr_type(target, semantic, scope, context, diagnostics);
-            let key_ty = infer_expr_type(key, semantic, scope, context, diagnostics);
+            let target_ty = infer_expr_type(
+                target,
+                spans.child(0),
+                semantic,
+                scope,
+                context,
+                diagnostics,
+            );
+            let key_ty =
+                infer_expr_type(key, spans.child(1), semantic, scope, context, diagnostics);
             if !matches!(key_ty, ExprType::String | ExprType::Unknown) {
                 diagnostics.push(Diagnostic {
                     code: diagnostic_code!("expr.non_string_map_key"),
                     severity: Severity::Error,
                     related: Vec::new(),
-                    span: context.span,
+                    fixits: Vec::new(),
+                    // The key.
+                    span: context.node(spans.child(1)),
                     message: format!("{} indexes a map with a non-string key", context.subject),
                     suggestion: Some(
                         "use a string literal or string expression as the map key".to_owned(),
@@ -16965,7 +17576,10 @@ fn infer_expr_type(
                         code: diagnostic_code!("expr.non_map_index"),
                         severity: Severity::Error,
                         related: Vec::new(),
-                        span: context.span,
+                        fixits: Vec::new(),
+                        // The expression being indexed is the one that is not a
+                        // map — not the `[…]` around it, and not the clause.
+                        span: context.node(spans.child(0)),
                         message: format!("{} indexes a non-map expression", context.subject),
                         suggestion: Some("use indexing only on map values".to_owned()),
                     });
@@ -16973,10 +17587,17 @@ fn infer_expr_type(
                 }
             }
         }
-        Expr::Array(items) => infer_array_type(items, semantic, scope, context, diagnostics),
+        Expr::Array(items) => infer_array_type(items, spans, semantic, scope, context, diagnostics),
         Expr::Object(fields) => {
-            for field in fields {
-                infer_expr_type(&field.value, semantic, scope, context, diagnostics);
+            for (index, field) in fields.iter().enumerate() {
+                infer_expr_type(
+                    &field.value,
+                    spans.child(index),
+                    semantic,
+                    scope,
+                    context,
+                    diagnostics,
+                );
             }
             ExprType::Object
         }
@@ -16984,13 +17605,16 @@ fn infer_expr_type(
             op: UnaryOp::Not,
             expr,
         } => {
-            let inner = infer_expr_type(expr, semantic, scope, context, diagnostics);
+            let inner =
+                infer_expr_type(expr, spans.child(0), semantic, scope, context, diagnostics);
             if !matches!(inner, ExprType::Bool | ExprType::Unknown) {
                 diagnostics.push(Diagnostic {
                     code: diagnostic_code!("expr.non_boolean_operand"),
                     severity: Severity::Error,
                     related: Vec::new(),
-                    span: context.span,
+                    fixits: Vec::new(),
+                    // The operand `!` was applied to.
+                    span: context.node(spans.child(0)),
                     message: format!(
                         "{} applies `!` to a non-boolean expression",
                         context.subject
@@ -17000,9 +17624,18 @@ fn infer_expr_type(
             }
             ExprType::Bool
         }
-        Expr::Binary { op, left, right } => {
-            infer_binary_type(*op, left, right, semantic, scope, context, diagnostics)
-        }
+        Expr::Binary { op, left, right } => infer_binary_type(
+            *op,
+            left,
+            spans.child(0),
+            right,
+            spans.child(1),
+            spans,
+            semantic,
+            scope,
+            context,
+            diagnostics,
+        ),
         Expr::Call { name, args } => match name.as_str() {
             "count" => ExprType::Int,
             "exists" => ExprType::Bool,
@@ -17012,15 +17645,25 @@ fn infer_expr_type(
                     code: diagnostic_code!("expr.unsupported_function"),
                     severity: Severity::Error,
                     related: Vec::new(),
-                    span: context.span,
+                    fixits: Vec::new(),
+                    // The call, name and arguments: it is the call that is not
+                    // one of the three the kernel has.
+                    span: context.node(spans),
                     message: format!(
                         "{} calls unsupported expression function `{name}`",
                         context.subject
                     ),
                     suggestion: Some("use `count`, `exists`, or `empty`".to_owned()),
                 });
-                for arg in args {
-                    infer_expr_type(arg, semantic, scope, context, diagnostics);
+                for (index, arg) in args.iter().enumerate() {
+                    infer_expr_type(
+                        arg,
+                        spans.child(index),
+                        semantic,
+                        scope,
+                        context,
+                        diagnostics,
+                    );
                 }
                 ExprType::Unknown
             }
@@ -17028,24 +17671,38 @@ fn infer_expr_type(
         Expr::Query { guard, .. } => {
             if let Some(guard) = guard {
                 let guard_scope = query_guard_scope(expr, semantic, scope);
-                infer_expr_type(guard, semantic, &guard_scope, context, diagnostics);
+                infer_expr_type(
+                    guard,
+                    spans.child(0),
+                    semantic,
+                    &guard_scope,
+                    context,
+                    diagnostics,
+                );
             }
             ExprType::Collection
         }
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn infer_binary_type(
     op: BinaryOp,
     left: &Expr,
+    left_spans: &ExprSpans,
     right: &Expr,
+    right_spans: &ExprSpans,
+    spans: &ExprSpans,
     semantic: &SemanticContext,
     scope: &ExprScope,
     context: &ExprValidationContext,
     diagnostics: &mut Vec<Diagnostic>,
 ) -> ExprType {
-    let left_ty = infer_expr_type(left, semantic, scope, context, diagnostics);
-    let right_ty = infer_expr_type(right, semantic, scope, context, diagnostics);
+    let left_ty = infer_expr_type(left, left_spans, semantic, scope, context, diagnostics);
+    let right_ty = infer_expr_type(right, right_spans, semantic, scope, context, diagnostics);
+    // A finding about a RELATION is about the whole operation; a finding about
+    // an OPERAND is about that operand.
+    let relation = context.node(spans);
     // ONE user mistake, one diagnostic. An object literal in an expression
     // position has already been refused as `expr.untyped_object_literal` — the
     // checker has just said this operand has no type — so every type RELATION it
@@ -17060,13 +17717,14 @@ fn infer_binary_type(
         matches!(left, Expr::Object(_)) || matches!(right, Expr::Object(_));
     match op {
         BinaryOp::And | BinaryOp::Or => {
-            for ty in [&left_ty, &right_ty] {
+            for (ty, operand) in [(&left_ty, left_spans), (&right_ty, right_spans)] {
                 if !matches!(ty, ExprType::Bool | ExprType::Unknown) {
                     diagnostics.push(Diagnostic {
                         code: diagnostic_code!("expr.non_boolean_operand"),
                         severity: Severity::Error,
                         related: Vec::new(),
-                        span: context.span,
+                        fixits: Vec::new(),
+                        span: context.node(operand),
                         message: format!(
                             "{} uses boolean operator with non-boolean operand",
                             context.subject
@@ -17086,7 +17744,8 @@ fn infer_binary_type(
                     code: diagnostic_code!("expr.incomparable_types"),
                     severity: Severity::Error,
                     related: Vec::new(),
-                    span: context.span,
+                    fixits: Vec::new(),
+                    span: relation,
                     message: format!("{} compares incompatible expression types", context.subject),
                     suggestion: Some(
                         "compare values with compatible scalar or finite-domain types".to_owned(),
@@ -17101,7 +17760,8 @@ fn infer_binary_type(
                     code: diagnostic_code!("expr.unorderable_types"),
                     severity: Severity::Error,
                     related: Vec::new(),
-                    span: context.span,
+                    fixits: Vec::new(),
+                    span: relation,
                     message: format!("{} orders non-orderable expression values", context.subject),
                     suggestion: Some(
                         "use ordering only with int, float, duration, or time values".to_owned(),
@@ -17118,7 +17778,8 @@ fn infer_binary_type(
                             code: diagnostic_code!("expr.incomparable_types"),
                             severity: Severity::Error,
                             related: Vec::new(),
-                            span: context.span,
+                            fixits: Vec::new(),
+                            span: relation,
                             message: format!(
                                 "{} uses membership with incompatible item type",
                                 context.subject
@@ -17136,7 +17797,9 @@ fn infer_binary_type(
                             code: diagnostic_code!("expr.non_string_map_key"),
                             severity: Severity::Error,
                             related: Vec::new(),
-                            span: context.span,
+                            fixits: Vec::new(),
+                            // The key is the left operand.
+                            span: context.node(left_spans),
                             message: format!(
                                 "{} uses map membership with a non-string key",
                                 context.subject
@@ -17152,7 +17815,9 @@ fn infer_binary_type(
                     code: diagnostic_code!("expr.non_collection_membership"),
                     severity: Severity::Error,
                     related: Vec::new(),
-                    span: context.span,
+                    fixits: Vec::new(),
+                    // The collection is the right operand.
+                    span: context.node(right_spans),
                     message: format!(
                         "{} uses membership against a non-array/non-map expression",
                         context.subject
@@ -17176,13 +17841,14 @@ fn infer_binary_type(
                 | (BinaryOp::Mul, ExprType::Int, ExprType::Duration) => return ExprType::Duration,
                 _ => {}
             }
-            for ty in [&left_ty, &right_ty] {
+            for (ty, operand) in [(&left_ty, left_spans), (&right_ty, right_spans)] {
                 if !matches!(ty, ExprType::Int | ExprType::Float | ExprType::Unknown) {
                     diagnostics.push(Diagnostic {
                         code: diagnostic_code!("expr.non_numeric_operand"),
                         severity: Severity::Error,
                         related: Vec::new(),
-                        span: context.span,
+                        fixits: Vec::new(),
+                        span: context.node(operand),
                         message: format!(
                             "{} uses arithmetic with a non-numeric operand",
                             context.subject
@@ -17205,14 +17871,22 @@ fn infer_binary_type(
 
 fn infer_array_type(
     items: &[Expr],
+    spans: &ExprSpans,
     semantic: &SemanticContext,
     scope: &ExprScope,
     context: &ExprValidationContext,
     diagnostics: &mut Vec<Diagnostic>,
 ) -> ExprType {
     let mut item_ty: Option<ExprType> = None;
-    for item in items {
-        let ty = infer_expr_type(item, semantic, scope, context, diagnostics);
+    for (index, item) in items.iter().enumerate() {
+        let ty = infer_expr_type(
+            item,
+            spans.child(index),
+            semantic,
+            scope,
+            context,
+            diagnostics,
+        );
         if matches!(ty, ExprType::Unknown) {
             continue;
         }
@@ -17224,7 +17898,10 @@ fn infer_array_type(
                     code: diagnostic_code!("expr.mixed_array_types"),
                     severity: Severity::Error,
                     related: Vec::new(),
-                    span: context.span,
+                    fixits: Vec::new(),
+                    // The LITERAL is what has mixed types — one item alone is
+                    // not wrong, it is wrong beside the others.
+                    span: context.node(spans),
                     message: format!("{} has mixed-type array literal", context.subject),
                     suggestion: Some("use array literals whose elements share one type".to_owned()),
                 });
@@ -17448,10 +18125,17 @@ fn expr_type_label(ty: &ExprType) -> String {
     }
 }
 
+/// `spans` is the BINARY node's, not either operand's. Every finding here is
+/// about the comparison — which side holds the domain and which the literals is
+/// decided by trying both — so the operation is the honest span, and a literal
+/// that is not in the domain keeps its name in the message rather than a caret
+/// of its own.
+#[allow(clippy::too_many_arguments)]
 fn validate_finite_domain_expr(
     op: BinaryOp,
     left: &Expr,
     right: &Expr,
+    spans: &ExprSpans,
     semantic: &SemanticContext,
     scope: &ExprScope,
     context: &ExprValidationContext,
@@ -17463,10 +18147,11 @@ fn validate_finite_domain_expr(
     ) {
         return;
     }
+    let at = context.node(spans);
     let Some((domain, literals)) = finite_domain_comparison(left, right, semantic, scope)
         .or_else(|| finite_domain_comparison(right, left, semantic, scope))
     else {
-        validate_finite_domain_relation(op, left, right, semantic, scope, context, diagnostics);
+        validate_finite_domain_relation(op, left, right, at, semantic, scope, context, diagnostics);
         return;
     };
     for literal in literals.into_iter().flatten() {
@@ -17475,7 +18160,8 @@ fn validate_finite_domain_expr(
                 code: diagnostic_code!("type.invalid_literal"),
                 severity: Severity::Error,
                 related: Vec::new(),
-                span: context.span,
+                fixits: Vec::new(),
+                span: at,
                 message: format!(
                     "{} compares finite-domain value to unknown `{literal}`",
                     context.subject
@@ -17488,13 +18174,15 @@ fn validate_finite_domain_expr(
             });
         }
     }
-    validate_finite_domain_relation(op, left, right, semantic, scope, context, diagnostics);
+    validate_finite_domain_relation(op, left, right, at, semantic, scope, context, diagnostics);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn validate_finite_domain_relation(
     op: BinaryOp,
     left: &Expr,
     right: &Expr,
+    at: SourceSpan,
     semantic: &SemanticContext,
     scope: &ExprScope,
     context: &ExprValidationContext,
@@ -17516,7 +18204,8 @@ fn validate_finite_domain_relation(
                     code: diagnostic_code!("expr.unsatisfiable_comparison"),
                     severity: Severity::Error,
                     related: Vec::new(),
-                    span: context.span,
+                    fixits: Vec::new(),
+                    span: at,
                     message: format!(
                         "{} has statically unsatisfiable finite-domain equality",
                         context.subject
@@ -17544,7 +18233,8 @@ fn validate_finite_domain_relation(
                     code: diagnostic_code!("expr.unsatisfiable_comparison"),
                     severity: Severity::Error,
                     related: Vec::new(),
-                    span: context.span,
+                    fixits: Vec::new(),
+                    span: at,
                     message: format!(
                         "{} has statically unsatisfiable finite-domain membership",
                         context.subject
@@ -17569,7 +18259,8 @@ fn validate_finite_domain_relation(
                     code: diagnostic_code!("expr.unsatisfiable_comparison"),
                     severity: Severity::Error,
                     related: Vec::new(),
-                    span: context.span,
+                    fixits: Vec::new(),
+                    span: at,
                     message: format!(
                         "{} has statically unsatisfiable finite-domain exclusion",
                         context.subject
@@ -17704,8 +18395,8 @@ fn validate_case_blocks(
     binding_types: &BTreeMap<String, String>,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
-    let lines = body_line_offsets(&rule.body.text);
-    let text_lines = lines.iter().map(|(line, _)| *line).collect::<Vec<_>>();
+    let scan = BraceScan::new(&rule.body.text);
+    let lines = case_scan_lines(&rule.body.text, &scan);
     let mut index = 0usize;
     while index < lines.len() {
         let trimmed = lines[index].0.trim();
@@ -17715,13 +18406,14 @@ fn validate_case_blocks(
         };
         let scrutinee_ty = expression_type(scrutinee, semantic, binding_types);
         let terminal_case = scrutinee_ty.is_none()
-            && active_completes_binding_for_case(&text_lines, index, scrutinee);
+            && active_completes_binding_for_case(&lines, &scan, index, scrutinee);
         if scrutinee_ty.is_none() && !terminal_case {
             let head = lines[index].1 + (lines[index].0.len() - lines[index].0.trim_start().len());
             diagnostics.push(Diagnostic {
                 code: diagnostic_code!("expr.untyped_case_scrutinee"),
                 severity: Severity::Error,
                 related: Vec::new(),
+                fixits: Vec::new(),
                 span: BodyAnchor::text(&rule.body, head, trimmed).whole(),
                 message: format!(
                     "rule `{}` has case scrutinee `{scrutinee}` that is not a typed path",
@@ -17730,8 +18422,11 @@ fn validate_case_blocks(
                 suggestion: Some("match on a bound field such as `task.provider`".to_owned()),
             });
         }
-        let mut depth = brace_delta(trimmed).max(1);
-        let mut case_index = index + 1;
+        let Some((start, mut depth)) = case_block_start(&lines, &scan, index) else {
+            index += 1;
+            continue;
+        };
+        let mut case_index = start;
         let mut branches = Vec::new();
         while case_index < lines.len() && depth > 0 {
             let (raw_line, line_offset) = lines[case_index];
@@ -17790,7 +18485,7 @@ fn validate_case_blocks(
                         validate_expression(
                             rule,
                             guard,
-                            at.whole(),
+                            at,
                             semantic,
                             &branch_scope,
                             "case guard",
@@ -17807,7 +18502,7 @@ fn validate_case_blocks(
                     }
                 }
             }
-            depth += brace_delta(line);
+            depth += scan.delta(line_offset, raw_line);
             case_index += 1;
         }
         if terminal_case {
@@ -17825,19 +18520,56 @@ fn validate_case_blocks(
     }
 }
 
-fn active_completes_binding_for_case(lines: &[&str], case_index: usize, scrutinee: &str) -> bool {
-    let mut scopes: Vec<(String, DependencyPredicate, i32)> = Vec::new();
-    for line in lines.iter().take(case_index) {
+/// Whether the `case` at `case_index` sits inside an `after <scrutinee>
+/// completes` block — which is what makes it a TERMINAL-output case rather
+/// than a case over a value.
+///
+/// The `after` head has the three shapes every block head in this file has, and
+/// the `brace_delta(head).max(1)` floor this replaces answered "one level deep"
+/// to all three. Written on ONE line, `after b completes { … }` guards nothing
+/// below it, and the floor kept its scope open to the next unmatched `}` — in
+/// practice the end of the rule. A `case b { … }` written after such a block
+/// was then read as a terminal-output case, so `expr.untyped_case_scrutinee`
+/// stopped firing on it: the same program with the same block written across
+/// three lines is refused, and written across one is accepted. D14,
+/// spec/diagnostic-quality-tracker.md.
+fn active_completes_binding_for_case(
+    lines: &[(&str, usize)],
+    scan: &BraceScan,
+    case_index: usize,
+    scrutinee: &str,
+) -> bool {
+    /// A head that opens no block on its own line is `AwaitingOpen` until one
+    /// opens below it, exactly as [`RecordScan`] treats a braceless `record`
+    /// head.
+    enum Scope {
+        AwaitingOpen,
+        Open(i32),
+    }
+    let mut scopes: Vec<(String, DependencyPredicate, Scope)> = Vec::new();
+    for (line, offset) in lines.iter().take(case_index) {
         let trimmed = line.trim();
+        let delta = scan.delta(*offset, line);
         if let Some((binding, predicate, _arm)) = parse_after_line(trimmed) {
-            scopes.push((binding, predicate, brace_delta(trimmed).max(1)));
-        } else {
-            let delta = brace_delta(trimmed);
-            for (_, _, depth) in &mut scopes {
-                *depth += delta;
-            }
-            scopes.retain(|(_, _, depth)| *depth > 0);
+            let scope = if delta > 0 {
+                Scope::Open(delta)
+            } else if scan.line(*offset, line).contains('{') {
+                // Opened and closed here: nothing below it is inside.
+                continue;
+            } else {
+                Scope::AwaitingOpen
+            };
+            scopes.push((binding, predicate, scope));
+            continue;
         }
+        for (_, _, scope) in &mut scopes {
+            *scope = match scope {
+                Scope::AwaitingOpen if delta > 0 => Scope::Open(delta),
+                Scope::AwaitingOpen => Scope::AwaitingOpen,
+                Scope::Open(depth) => Scope::Open(*depth + delta),
+            };
+        }
+        scopes.retain(|(_, _, scope)| !matches!(scope, Scope::Open(depth) if *depth <= 0));
     }
     scopes.iter().any(|(binding, predicate, _)| {
         binding == scrutinee && predicate == &DependencyPredicate::Completes
@@ -17863,11 +18595,55 @@ fn active_completes_binding_for_case(lines: &[&str], case_index: usize, scrutine
 ///
 /// One line is all it can see, and two shapes stay outside that: the interior
 /// lines of a `"""` body, which carry no quote of their own, and a `//` comment,
-/// whose braces are not braces. Both were blind here before this change too —
-/// it narrows the counter's blind spot rather than closing it — and both are
-/// measured in D14 rather than assumed harmless.
+/// whose braces are not braces. A scanner that has the WHOLE body reads it
+/// through [`BraceScan`] instead, which answers both; this stays for the
+/// callers that genuinely hold one line and nothing else.
 fn brace_delta(line: &str) -> i32 {
     syntax::brace_delta_outside_strings(line)
+}
+
+/// [`brace_delta`] with the whole body in view.
+///
+/// The per-line counter is honest about one line and blind past it. The
+/// interior lines of a `"""` body carry no quote of their own, so a scanner
+/// walking them line by line reads a model's prose as structure; a `//`
+/// comment's braces are not braces at all. Both were reachable, and not
+/// theoretically: a `}` written inside a comment or a prompt in a `case` arm
+/// closed the `case` block early, which BOTH escaped
+/// `expr.duplicate_case_pattern` on the arms below it and refused an exhaustive
+/// `case` as `expr.non_exhaustive_case` — a hole and a false positive from one
+/// mistake. D14, spec/diagnostic-quality-tracker.md.
+///
+/// It is the same mask `source_scan_text` cuts, minus the interpolation
+/// add-back: `{{` opens no block. The mask is offset-for-offset with the text,
+/// so a scanner that already knows where a line starts reads its structural
+/// braces by handing back that offset.
+struct BraceScan {
+    masked: String,
+}
+
+impl BraceScan {
+    fn new(text: &str) -> Self {
+        Self {
+            masked: non_code_blanked(text, KeepInterpolations::No),
+        }
+    }
+
+    /// How much deeper the text written at `offset` leaves a block scanner.
+    ///
+    /// `offset` is a position in the text the mask was cut from, and `text` is
+    /// what was written there. A range the mask cannot address falls back to
+    /// the per-line counter rather than silently reading zero, because a
+    /// scanner that loses its depth loses the rest of the body with it.
+    fn delta(&self, offset: usize, text: &str) -> i32 {
+        brace_delta(self.line(offset, text))
+    }
+
+    /// The masked text at `offset`, for a caller asking what braces are there
+    /// rather than how deep they go.
+    fn line<'a>(&'a self, offset: usize, text: &'a str) -> &'a str {
+        self.masked.get(offset..offset + text.len()).unwrap_or(text)
+    }
 }
 
 /// Where a line scanner stands relative to a `record` statement's field block.
@@ -17952,6 +18728,208 @@ impl RecordScan {
             Self::Outside
         }
     }
+}
+
+/// Where a `case` walker stands after reading its HEAD line, or `None` when
+/// the head opens no block the walker can enter.
+///
+/// The answer is `(first line inside the block, depth on entering it)`. Three
+/// shapes, the same three [`RecordScan`] answers for `record`:
+///
+/// - `case x {` opens the block on its own head line, at that line's depth.
+/// - `case x` opens nothing on its own line, and the `{` is written below it.
+///   The block is that line's, and the walker enters underneath it.
+/// - a head whose braces balance to zero WITH a brace on the line opened and
+///   closed here; there is nothing below to walk.
+///
+/// The `brace_delta(head).max(1)` floor this replaces answered "depth 1, start
+/// below the head" to all three. For the braceless head that was wrong twice
+/// over: the walker entered at 1, the `{` line took it to 2, and every arm —
+/// which sits one level inside the block, at depth 1 — was read at depth 2 and
+/// so never parsed as an arm. A `case` written that way reached the IR with NO
+/// branches: `expr.non_exhaustive_case` and `expr.duplicate_case_pattern` both
+/// escaped, no arm body or guard was ever validated, and nothing at run time
+/// dispatched on it. D14, spec/diagnostic-quality-tracker.md.
+/// The byte range of ONE `case` arm's body, given where its `{` was written.
+///
+/// `index` enters at the arm's HEADER line and leaves at the first line the
+/// arm does not own, so the walker above resumes on the next arm.
+///
+/// Two shapes, and the `brace_delta(body_start).max(1)` floor this replaces
+/// read them as one. `"open" => {` opens a block the lines below it fill.
+/// `"open" => { complete result { note "x" } }` opens AND closes on the header
+/// line, so the arm's body is the text between its own braces and there is
+/// nothing below to consume — but the floor said "depth 1", the loop swallowed
+/// the lines below, and the arm ended up holding the text of the arms that
+/// FOLLOWED it. Those arms were then consumed with it: a `case` whose first arm
+/// is written on one line reached the IR with that arm alone, its `body_hash`
+/// the hash of its siblings' text, and every following arm's guard and body
+/// never validated — and a terminal-case guard is validated in exactly one
+/// place, so a bad one escaped entirely. D14,
+/// spec/diagnostic-quality-tracker.md.
+fn case_arm_body(
+    lines: &[(&str, usize)],
+    scan: &BraceScan,
+    index: &mut usize,
+    body_start_at: usize,
+    body_start: &str,
+) -> Option<Range<usize>> {
+    let mut branch_depth = scan.delta(body_start_at, body_start);
+    *index += 1;
+    if branch_depth <= 0 {
+        // Opened and closed on the header line: the body is what is between
+        // the arm's own braces.
+        let masked = scan.line(body_start_at, body_start);
+        let open = masked.find('{')?;
+        let close = masked.rfind('}')?;
+        if close <= open {
+            return None;
+        }
+        let inner = &body_start[open + 1..close];
+        let lead = inner.len() - inner.trim_start().len();
+        let start = body_start_at + open + 1 + lead;
+        return Some(start..start + inner.trim().len());
+    }
+    let mut body_at: Option<Range<usize>> = None;
+    while *index < lines.len() && branch_depth > 0 {
+        let (body_line, body_line_offset) = lines[*index];
+        let next_depth = branch_depth + scan.delta(body_line_offset, body_line);
+        if next_depth >= 1 {
+            let start = body_at
+                .as_ref()
+                .map_or(body_line_offset, |range: &Range<usize>| range.start);
+            body_at = Some(start..body_line_offset + body_line.len());
+        }
+        branch_depth = next_depth;
+        *index += 1;
+    }
+    body_at
+}
+
+fn case_block_start(
+    lines: &[(&str, usize)],
+    scan: &BraceScan,
+    head: usize,
+) -> Option<(usize, i32)> {
+    let (line, offset) = lines[head];
+    let delta = scan.delta(offset, line);
+    if delta > 0 {
+        return Some((head + 1, delta));
+    }
+    if delta < 0 || scan.line(offset, line).contains('{') {
+        return None;
+    }
+    // The head opened nothing. The block is the next line that opens one;
+    // a line that says nothing between the two is not a decision.
+    //
+    // "Says nothing" is read off the MASK, not off the raw text, which is the
+    // whole reason [`BraceScan`] exists. A `//` comment written between `case x`
+    // and its `{` is raw text and blank source, and reading it as raw text made
+    // this lookahead give up: the `case` was skipped entirely, so
+    // `expr.duplicate_case_pattern` and `expr.non_exhaustive_case` both escaped
+    // — while deleting the comment refused the same program. A scanner must not
+    // read prose as structure in EITHER direction. D14,
+    // spec/diagnostic-quality-tracker.md.
+    for (next, (line, offset)) in lines.iter().enumerate().skip(head + 1) {
+        if scan.line(*offset, line).trim().is_empty() {
+            continue;
+        }
+        let delta = scan.delta(*offset, line);
+        return (delta > 0).then_some((next + 1, delta));
+    }
+    None
+}
+
+/// A rule body's lines for the `case` walkers, with a head that carries its
+/// block on the SAME line split into the segments a line scanner can read.
+///
+/// The walkers read a body line by line, and a `case` whose arms are written on
+/// its head line owns no line below it. `case_block_start` answered `None` to
+/// that — the head's braces balance, and it holds a `{` — so the whole `case`
+/// was SKIPPED: `expr.duplicate_case_pattern` and `expr.non_exhaustive_case`
+/// both escaped, no arm body or guard was validated, and
+/// `case x { "a" => { … } "a" => { … } }` compiled clean. The same shape half
+/// written — the first arm beside the head, the rest below — lost just that
+/// first arm, so a duplicate of it escaped and the coverage check counted one
+/// arm short.
+///
+/// The body parser reads it correctly (it is token-level and the form is
+/// legal), so the repair is to read it here too rather than to refuse it. A
+/// segment is a SUBSLICE of the line at its own source offset, so every span,
+/// caret and `slice_offset` downstream stays a real source position, and
+/// [`BraceScan`] — which is offset-for-offset with the body — answers for a
+/// segment exactly as it does for a line.
+///
+/// Only a `case` head is split, and only when it carries block content. Every
+/// other line is handed through untouched: splitting on brace structure
+/// generally would move the byte range `case_arm_body` returns for arms that
+/// are already read correctly, and an arm's `body_hash` is part of a program's
+/// identity. D14, spec/diagnostic-quality-tracker.md.
+fn case_scan_lines<'a>(text: &'a str, scan: &BraceScan) -> Vec<(&'a str, usize)> {
+    let mut lines = Vec::new();
+    for (line, offset) in body_line_offsets(text) {
+        let masked = scan.line(offset, line);
+        if case_scrutinee(masked.trim()).is_none() {
+            lines.push((line, offset));
+            continue;
+        }
+        split_inline_case_head(masked, line, offset, &mut lines);
+    }
+    lines
+}
+
+/// The segment split behind [`case_scan_lines`], cutting on the MASKED text so
+/// a brace in prose opens nothing and emitting slices of the RAW line so every
+/// offset stays a source position.
+fn split_inline_case_head<'a>(
+    masked: &str,
+    line: &'a str,
+    offset: usize,
+    out: &mut Vec<(&'a str, usize)>,
+) {
+    let Some(open) = masked.find('{') else {
+        // A braceless head; its block opens on a line below it.
+        out.push((line, offset));
+        return;
+    };
+    if masked[open + 1..].trim().is_empty() {
+        // The ordinary shape: the head opens the block and says nothing else.
+        out.push((line, offset));
+        return;
+    }
+    let mut push = |range: Range<usize>| {
+        // A run of whitespace carries no brace, so dropping it leaves every
+        // depth count downstream unchanged.
+        if !line[range.clone()].trim().is_empty() {
+            out.push((&line[range.clone()], offset + range.start));
+        }
+    };
+    push(0..open + 1);
+    let mut depth = 0i32;
+    let mut start = open + 1;
+    for (at, ch) in masked[open + 1..].char_indices() {
+        let at = open + 1 + at;
+        match ch {
+            '{' => depth += 1,
+            // The `}` that closes the `case` block itself. It and whatever
+            // follows it on the line are one segment, so the walker's depth
+            // returns to where it started.
+            '}' if depth == 0 => {
+                push(start..at);
+                push(at..line.len());
+                return;
+            }
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    push(start..at + 1);
+                    start = at + 1;
+                }
+            }
+            _ => {}
+        }
+    }
+    push(start..line.len());
 }
 
 fn case_scrutinee(line: &str) -> Option<&str> {
@@ -18040,6 +19018,7 @@ fn validate_case_pattern(
                 code: diagnostic_code!("expr.case_pattern_mismatch"),
                 severity: Severity::Error,
                 related: Vec::new(),
+                fixits: Vec::new(),
                 span,
                 message: format!(
                     "rule `{}` uses `None` for a non-optional case",
@@ -18056,6 +19035,7 @@ fn validate_case_pattern(
                 code: diagnostic_code!("expr.case_pattern_mismatch"),
                 severity: Severity::Error,
                 related: Vec::new(),
+                fixits: Vec::new(),
                 span,
                 message: format!(
                     "rule `{}` uses `Some` for a non-optional case",
@@ -18080,6 +19060,7 @@ fn validate_case_pattern(
                     code: diagnostic_code!("type.unknown_enum_variant"),
                     severity: Severity::Error,
                     related: Vec::new(),
+                    fixits: Vec::new(),
                     span,
                     message: format!("enum `{}` has no variant `{variant}`", name.name),
                     suggestion: Some(suggest_then(
@@ -18104,6 +19085,7 @@ fn validate_case_pattern(
                     code: diagnostic_code!("expr.variant_without_payload"),
                     severity: Severity::Error,
                     related: Vec::new(),
+                    fixits: Vec::new(),
                     span,
                     message: format!(
                         "variant `{variant}` of enum `{}` carries no payload to bind",
@@ -18119,6 +19101,7 @@ fn validate_case_pattern(
                     code: diagnostic_code!("expr.invalid_case_pattern"),
                     severity: Severity::Error,
                     related: Vec::new(),
+                    fixits: Vec::new(),
                     span,
                     message: format!(
                         "rule `{}` has unsupported case pattern `{pattern}`",
@@ -18136,6 +19119,7 @@ fn validate_case_pattern(
                     code: diagnostic_code!("expr.invalid_case_pattern"),
                     severity: Severity::Error,
                     related: Vec::new(),
+                    fixits: Vec::new(),
                     span,
                     message: format!(
                         "rule `{}` has unsupported AgentRef case pattern `{pattern}`",
@@ -18160,6 +19144,7 @@ fn validate_case_pattern(
                     code: diagnostic_code!("expr.case_pattern_mismatch"),
                     severity: Severity::Error,
                     related: Vec::new(),
+                    fixits: Vec::new(),
                     span,
                     message: format!(
                         "rule `{}` has case pattern `{pattern}` that is not a `bool` value",
@@ -18174,6 +19159,7 @@ fn validate_case_pattern(
                 code: diagnostic_code!("expr.unmatchable_scrutinee"),
                 severity: Severity::Error,
                 related: Vec::new(),
+                fixits: Vec::new(),
                 span,
                 message: format!(
                     "rule `{}` cannot pattern-match this scrutinee type",
@@ -18217,6 +19203,7 @@ fn validate_terminal_case_pattern(
             code: diagnostic_code!("expr.invalid_case_pattern"),
             severity: Severity::Error,
             related: Vec::new(),
+            fixits: Vec::new(),
             span,
             message: format!(
                 "rule `{}` has malformed terminal-output case pattern `{pattern}`",
@@ -18232,6 +19219,7 @@ fn validate_terminal_case_pattern(
             code: diagnostic_code!("type.unknown_terminal_tag"),
             severity: Severity::Error,
             related: Vec::new(),
+            fixits: Vec::new(),
             span,
             message: format!(
                 "rule `{}` terminal-output case pattern cannot be `{tag}`",
@@ -18272,6 +19260,7 @@ fn validate_terminal_case_coverage(
             code: diagnostic_code!("expr.non_exhaustive_case"),
             severity: Severity::Error,
             related: Vec::new(),
+            fixits: Vec::new(),
             span: rule.body.span,
             message: format!(
                 "rule `{}` has non-exhaustive terminal-output case; missing {}",
@@ -18304,6 +19293,7 @@ fn validate_duplicate_terminal_case_patterns(
                     code: diagnostic_code!("expr.duplicate_case_pattern"),
                     severity: Severity::Error,
                     related: Vec::new(),
+                    fixits: Vec::new(),
                     span: branch.pattern_span,
                     message: format!(
                         "rule `{}` has duplicate unguarded terminal-output case pattern `{pattern}`",
@@ -18358,6 +19348,7 @@ fn validate_case_coverage(
             code: diagnostic_code!("expr.non_exhaustive_case"),
             severity: Severity::Error,
             related: Vec::new(),
+            fixits: Vec::new(),
             span: rule.body.span,
             message: format!(
                 "rule `{}` has non-exhaustive case; missing {}",
@@ -18385,6 +19376,7 @@ fn validate_duplicate_case_patterns(
                     code: diagnostic_code!("expr.duplicate_case_pattern"),
                     severity: Severity::Error,
                     related: Vec::new(),
+                    fixits: Vec::new(),
                     span: branch.pattern_span,
                     message: format!(
                         "rule `{}` has duplicate unguarded case pattern `{pattern}`",
@@ -18423,6 +19415,7 @@ fn validate_unreachable_after_fallback(
                     code: diagnostic_code!("expr.unreachable_case_branch"),
                     severity: Severity::Error,
                     related: Vec::new(),
+                    fixits: Vec::new(),
                     span: branch.pattern_span,
                     message: format!(
                         "rule `{}` has an unreachable case branch after the `_` wildcard",
@@ -18541,6 +19534,7 @@ fn validate_union_case_pattern(
             code: diagnostic_code!("expr.invalid_case_pattern"),
             severity: Severity::Error,
             related: Vec::new(),
+            fixits: Vec::new(),
             span,
             message: format!(
                 "rule `{}` case pattern must be one of its literal variants",
@@ -18555,6 +19549,7 @@ fn validate_union_case_pattern(
             code: diagnostic_code!("expr.case_pattern_mismatch"),
             severity: Severity::Error,
             related: Vec::new(),
+            fixits: Vec::new(),
             span,
             message: format!("rule `{}` case pattern cannot be `{value}`", rule.name.name),
             suggestion: Some(suggest_then(
@@ -18582,6 +19577,7 @@ fn validate_agent_ref_case_pattern(
             code: diagnostic_code!("expr.invalid_case_pattern"),
             severity: Severity::Error,
             related: Vec::new(),
+            fixits: Vec::new(),
             span,
             message: format!("rule `{}` has non-agent case pattern", rule.name.name),
             suggestion: Some(format!("use one of: {}", allowed.join(", "))),
@@ -18593,6 +19589,7 @@ fn validate_agent_ref_case_pattern(
             code: diagnostic_code!("type.unknown_agent"),
             severity: Severity::Error,
             related: Vec::new(),
+            fixits: Vec::new(),
             span,
             message: format!("AgentRef has no agent `{value}`"),
             suggestion: Some(suggest_then(
@@ -18624,6 +19621,7 @@ fn validate_binding_uses(
             code: diagnostic_code!("effect.output_scope_leak"),
             severity: Severity::Error,
             related: Vec::new(),
+            fixits: Vec::new(),
             span: at.whole(),
             message: format!(
                 "rule `{}` uses effect output `{root}` outside a matching `after {root} ...` block",
@@ -19392,6 +20390,7 @@ fn validate_redactions(
                 code: diagnostic_code!("type.unknown_schema"),
                 severity: Severity::Error,
                 related: Vec::new(),
+                fixits: Vec::new(),
                 span,
                 message: format!(
                     "rule `{}` redacts `{source}`, which has no known schema",
@@ -19414,6 +20413,7 @@ fn validate_redactions(
                     code: diagnostic_code!("type.unknown_field"),
                     severity: Severity::Error,
                     related: Vec::new(),
+                    fixits: Vec::new(),
                     span,
                     message: format!(
                         "rule `{}` redacts `{source}` keeping unknown field `{field}` of `{schema}`",
@@ -19651,6 +20651,7 @@ fn refuse_confined_crossing(
         code: diagnostic_code!("security.confinement_crossing"),
         severity: Severity::Error,
         related: Vec::new(),
+        fixits: Vec::new(),
         span,
         message: format!(
             "rule `{}` {what} using `{first}`, which holds plaintext opened inside a \
@@ -19986,6 +20987,7 @@ fn validate_seal_storage(
                         code: diagnostic_code!("security.seal_type_mismatch"),
                         severity: Severity::Error,
                         related: Vec::new(),
+                        fixits: Vec::new(),
                         span: field.span,
                         message: format!(
                             "rule `{}` stores `{}` in `{}.{}`, which expects \
@@ -20097,6 +21099,7 @@ fn validate_declassify_projection(
                         code: diagnostic_code!("type.unknown_schema"),
                         severity: Severity::Error,
                         related: Vec::new(),
+                        fixits: Vec::new(),
                         span: *span,
                         message: format!(
                             "rule `{}` declassifies into `{target_type}`, which is not a \
@@ -20134,6 +21137,7 @@ fn validate_declassify_projection(
                             code: diagnostic_code!("security.declassify_projection_mismatch"),
                             severity: Severity::Error,
                             related: Vec::new(),
+                            fixits: Vec::new(),
                             span: *span,
                             message: format!(
                                 "rule `{}` declassifies `{source}` into `{target_type}`, which \
@@ -20253,6 +21257,7 @@ fn validate_open_type_agreement(
                         code: diagnostic_code!("security.not_sealed"),
                         severity: Severity::Error,
                         related: Vec::new(),
+                        fixits: Vec::new(),
                         span: effect.span,
                         message: format!(
                             "rule `{}` opens `{envelope}`, which is not a sealed value",
@@ -20276,6 +21281,7 @@ fn validate_open_type_agreement(
                     code: diagnostic_code!("security.seal_type_mismatch"),
                     severity: Severity::Error,
                     related: Vec::new(),
+                    fixits: Vec::new(),
                     span: effect.span,
                     message: format!(
                         "rule `{}` opens `{envelope}` into `{declared}`, but it is sealed as \
@@ -20516,6 +21522,7 @@ fn validate_recorded_schemas(
                     code: diagnostic_code!("construct.reserved_name"),
                     severity: Severity::Error,
                     related: Vec::new(),
+                    fixits: Vec::new(),
                     span: record.span,
                     message: format!(
                         "rule `{}` cannot record kernel-owned terminal schema `{schema}`",
@@ -20531,6 +21538,7 @@ fn validate_recorded_schemas(
                     code: diagnostic_code!("type.unknown_schema"),
                     severity: Severity::Error,
                     related: Vec::new(),
+                    fixits: Vec::new(),
                     span: record.span,
                     message: format!("rule `{}` records unknown class `{schema}`", rule.name.name),
                     suggestion: Some(suggest_otherwise(
@@ -20648,6 +21656,7 @@ fn validate_coordination_discipline(
                     code: diagnostic_code!("effect.unhandled_outcome"),
                     severity: Severity::Error,
                     related: Vec::new(),
+                    fixits: Vec::new(),
                     span: *span,
                     message: format!(
                         "rule `{}` does not handle the `{required}` outcome of {verb} `{binding}`",
@@ -20688,6 +21697,7 @@ fn validate_coordination_discipline(
                         code: diagnostic_code!("type.unknown_binding"),
                         severity: Severity::Error,
                         related: Vec::new(),
+                        fixits: Vec::new(),
                         span: effect.span,
                         message: format!(
                             "rule `{}` renews unbound coordination binding `{}`",
@@ -20731,6 +21741,7 @@ fn validate_coordination_discipline(
                         code: diagnostic_code!("type.unknown_binding"),
                         severity: Severity::Error,
                         related: Vec::new(),
+                        fixits: Vec::new(),
                         span: effect.span,
                         message: format!(
                             "rule `{}` releases unbound coordination item `{}`",
@@ -20750,6 +21761,7 @@ fn validate_coordination_discipline(
             code: diagnostic_code!("effect.multiple_leases"),
             severity: Severity::Error,
             related: Vec::new(),
+            fixits: Vec::new(),
             span: acquires[1].2,
             message: format!(
                 "rule `{}` acquires more than one lease in a single progression",
@@ -20773,6 +21785,7 @@ fn validate_coordination_discipline(
                     code: diagnostic_code!("effect.unhandled_outcome"),
                     severity: Severity::Error,
                     related: Vec::new(),
+                    fixits: Vec::new(),
                     span: *span,
                     message: format!(
                         "rule `{}` does not handle the `{required}` outcome of lease `{binding}`",
@@ -20790,6 +21803,7 @@ fn validate_coordination_discipline(
                     code: diagnostic_code!("graph.unreleased_lease"),
                     severity: Severity::Error,
                     related: Vec::new(),
+                    fixits: Vec::new(),
                     span: *span,
                     message: format!(
                         "rule `{}` can hold lease `{binding}` forever: the `held` branch neither releases it nor reaches a workflow terminal",
@@ -20811,6 +21825,7 @@ fn validate_coordination_discipline(
                     code: diagnostic_code!("effect.unhandled_outcome"),
                     severity: Severity::Error,
                     related: Vec::new(),
+                    fixits: Vec::new(),
                     span: *span,
                     message: format!(
                         "rule `{}` does not handle the `{required}` outcome of counter consume `{binding}`",
@@ -21018,6 +22033,7 @@ fn check_conditioned_read(
         code: diagnostic_code!("expr.conditional_without_presence"),
         severity: Severity::Error,
         related: Vec::new(),
+        fixits: Vec::new(),
         span,
         message: format!(
             "rule `{}` reads conditional field `{root}.{field}` outside a matching `case {root}.{disc}` arm",
@@ -21627,6 +22643,7 @@ fn validate_body_effect_operands(
                             code: diagnostic_code!("type.unknown_resource"),
                             severity: Severity::Error,
                             related: Vec::new(),
+                            fixits: Vec::new(),
                             span: effect.span,
                             message: format!(
                                 "rule `{}` acquires undeclared lease `{resource}`",
@@ -21647,6 +22664,7 @@ fn validate_body_effect_operands(
                                 code: diagnostic_code!("type.unknown_resource"),
                                 severity: Severity::Error,
                                 related: Vec::new(),
+                                fixits: Vec::new(),
                                 span: effect.span,
                                 message: format!(
                                     "rule `{}` appends to undeclared ledger `{ledger}`",
@@ -21666,6 +22684,7 @@ fn validate_body_effect_operands(
                                 code: diagnostic_code!("type.unknown_schema"),
                                 severity: Severity::Error,
                                 related: Vec::new(),
+                                fixits: Vec::new(),
                                 span: effect.span,
                                 message: format!(
                                     "rule `{}` appends unknown entry class `{schema}`",
@@ -21686,6 +22705,7 @@ fn validate_body_effect_operands(
                             code: diagnostic_code!("type.unknown_resource"),
                             severity: Severity::Error,
                             related: Vec::new(),
+                            fixits: Vec::new(),
                             span: effect.span,
                             message: format!(
                                 "rule `{}` consumes undeclared counter `{counter}`",
@@ -21721,6 +22741,7 @@ fn validate_body_effect_operands(
                                 code: diagnostic_code!("type.unknown_binding"),
                                 severity: Severity::Error,
                                 related: Vec::new(),
+                                fixits: Vec::new(),
                                 span: effect.span,
                                 message: format!(
                                     "rule `{}` uses unknown binding `{stdin_binding}` in `exec {name} with {stdin_binding}` — `with` requires a typed record binding",
@@ -21747,6 +22768,7 @@ fn validate_body_effect_operands(
                                 code: diagnostic_code!("type.mismatch"),
                                 severity: Severity::Error,
                                 related: Vec::new(),
+                                fixits: Vec::new(),
                                 span: effect.span,
                                 message: format!(
                                     "rule `{}` passes untyped fact binding `{stdin_binding}` to `exec {name} with` — `with` requires a typed record binding",
@@ -21775,6 +22797,7 @@ fn validate_body_effect_operands(
                             code: diagnostic_code!("type.unknown_schema"),
                             severity: Severity::Error,
                             related: Vec::new(),
+                            fixits: Vec::new(),
                             span: effect.span,
                             message: format!(
                                 "rule `{}` parses exec output into unknown schema `{}`",
@@ -21801,6 +22824,7 @@ fn validate_body_effect_operands(
                         code: diagnostic_code!("type.unknown_binding"),
                         severity: Severity::Error,
                         related: Vec::new(),
+                        fixits: Vec::new(),
                         span: effect.span,
                         message: format!(
                             "rule `{}` uses unknown binding `{root}` in `timer until {until}`",
@@ -21834,6 +22858,7 @@ fn validate_body_effect_operands(
                             code: diagnostic_code!("type.mismatch"),
                             severity: Severity::Error,
                             related: Vec::new(),
+                            fixits: Vec::new(),
                             span: effect.span,
                             message: format!(
                                 "rule `{}` uses non-time operand `{until}` in `timer until`",
@@ -21854,6 +22879,7 @@ fn validate_body_effect_operands(
                             code: diagnostic_code!("type.unknown_field"),
                             severity: Severity::Error,
                             related: Vec::new(),
+                            fixits: Vec::new(),
                             span: effect.span,
                             message: format!(
                                 "rule `{}` has invalid `timer until` operand `{until}`: {message}",
@@ -22205,6 +23231,7 @@ fn check_field_path(
             code: diagnostic_code!("type.unknown_field"),
             severity: Severity::Error,
             related: Vec::new(),
+            fixits: Vec::new(),
             // The caret goes under the segment that did not resolve, not under
             // the whole path: `issue.prioirty` is wrong at `prioirty`, and
             // underlining `issue` too says the binding is the mistake.
@@ -22432,6 +23459,7 @@ fn validate_sealed_effect_inputs(
                         code: diagnostic_code!("security.sealed_value_crossing"),
                         severity: Severity::Error,
                         related: Vec::new(),
+                        fixits: Vec::new(),
                         span: effect.span,
                         message: format!(
                             "rule `{}` passes `{at}` to an effect, which is \
@@ -22518,7 +23546,7 @@ struct FieldPathError {
     /// close enough to be worth naming (D4). Carried on the error rather than
     /// recomputed by the caller because only this function knows WHICH hop of a
     /// nested path failed, and so which class's fields are the candidates.
-    did_you_mean: Option<String>,
+    did_you_mean: Option<(String, Option<String>)>,
     /// The schema the lookup failed ON — the last hop reached, not the path's
     /// root. For `invoice.customer.emial` the caller wants `Customer` declared
     /// here, not `Invoice`, and only the resolver walking the path knows which
@@ -22537,7 +23565,12 @@ impl FieldPathError {
     }
 
     /// A failure the resolver can name a candidate for.
-    fn at_field(index: usize, message: String, did_you_mean: Option<String>, schema: &str) -> Self {
+    fn at_field(
+        index: usize,
+        message: String,
+        did_you_mean: Option<(String, Option<String>)>,
+        schema: &str,
+    ) -> Self {
         Self {
             index,
             message,
@@ -22552,7 +23585,10 @@ impl FieldPathError {
     /// suggestion that is only sometimes there.
     fn suggestion(&self, fallback: &str) -> String {
         match &self.did_you_mean {
-            Some(name) => format!("did you mean `{name}`? otherwise {fallback}"),
+            Some((name, rival)) => format!(
+                "{} otherwise {fallback}",
+                fixit::did_you_mean_of(name, rival.as_deref())
+            ),
             None => fallback.to_owned(),
         }
     }
@@ -22591,20 +23627,18 @@ impl<'a> FieldPathSpans<'a> {
 /// Where a fragment of text a checker is scanning lives, so a diagnostic about
 /// a token inside it can name the token instead of the block that contains it.
 ///
-/// The rule-body checks scan raw text line by line — deliberately, because
-/// `Expr` carries no spans and an AST walk cannot reach inside an expression.
-/// A line scanner therefore has to carry the one fact a precise span needs:
-/// where the fragment it was handed starts in the body text. `BlockSource`
-/// already knows how to turn a body offset into a file span (and how to degrade
-/// when the body was rewritten), so an anchor is just that offset plus the body
-/// to resolve it against.
-#[derive(Clone, Copy)]
+/// The rule-body checks scan raw text line by line, and an expression is parsed
+/// from a slice of that text. Neither a line scanner nor `ExprSpans` measures
+/// anything against the file — both measure against the fragment they were
+/// handed — so both need the one fact a precise span needs: where the fragment
+/// starts. `BlockSource` already knows how to turn a body offset into a file
+/// span (and how to degrade when the body was rewritten), so an anchor is that
+/// offset plus whatever resolves it.
+#[derive(Clone, Copy, Debug)]
 struct BodyAnchor<'a> {
-    /// The body the fragment is a slice of, or `None` when the fragment was
-    /// synthesized (a line rebuilt from an AST node, a `when` clause) and no
-    /// offset into it is a source position.
-    body: Option<&'a BlockSource>,
-    /// Byte offset of the fragment within that body's `text`.
+    /// What turns an offset in the fragment into a file position.
+    origin: AnchorOrigin<'a>,
+    /// Byte offset of the fragment within its origin.
     base: usize,
     /// Byte length of the fragment, so `whole()` can span it.
     len: usize,
@@ -22612,15 +23646,47 @@ struct BodyAnchor<'a> {
     fallback: SourceSpan,
 }
 
+/// What a [`BodyAnchor`]'s offsets are measured against.
+#[derive(Clone, Copy, Debug)]
+enum AnchorOrigin<'a> {
+    /// The fragment was synthesized (a line rebuilt from an AST node, a
+    /// canonicalized `when` clause) and no offset into it is a source position.
+    Nowhere,
+    /// The fragment is a slice of this body's `text`, which knows its own
+    /// provenance and how to degrade when it was rewritten.
+    Body(&'a BlockSource),
+    /// The fragment is a verbatim slice of the FILE, and `base` is a file
+    /// offset. The `when` clause a guard is cut from is one: it never passed
+    /// through a `BlockSource`, because a guard is part of the rule's header
+    /// rather than of its body.
+    File,
+}
+
 impl<'a> BodyAnchor<'a> {
     /// A fragment with no source position of its own: every offset in it
     /// reports at `span`.
     fn fixed(span: SourceSpan) -> Self {
         Self {
-            body: None,
+            origin: AnchorOrigin::Nowhere,
             base: 0,
             len: 0,
             fallback: span,
+        }
+    }
+
+    /// A fragment that is `source[span.start..span.end]` verbatim.
+    ///
+    /// Mint one only from RECORDED provenance — `SourceText::file_offset`, by
+    /// way of `source_text_anchor` — never from a length that happens to match.
+    /// A rewritten fragment can be exactly as long as the one it replaced, so
+    /// equal lengths are coincidence rather than evidence, and resolving an
+    /// offset against text that moved is how a caret lands on unrelated source.
+    fn file(base: usize, len: usize, fallback: SourceSpan) -> Self {
+        Self {
+            origin: AnchorOrigin::File,
+            base,
+            len,
+            fallback,
         }
     }
 
@@ -22633,7 +23699,7 @@ impl<'a> BodyAnchor<'a> {
     /// `body.text[base..base + len]`.
     fn slice(body: &'a BlockSource, base: usize, len: usize) -> Self {
         Self {
-            body: Some(body),
+            origin: AnchorOrigin::Body(body),
             base,
             len,
             fallback: body.span,
@@ -22660,13 +23726,15 @@ impl<'a> BodyAnchor<'a> {
     /// The anchor for `fragment[range]`, so a scanner that hands a sub-fragment
     /// to another scanner keeps the provenance.
     fn sub(self, range: Range<usize>) -> Self {
-        match self.body {
-            Some(body) if self.holds(&range) => {
-                Self::slice(body, self.base + range.start, range.len())
-            }
+        if !self.holds(&range) {
             // Not a position in this fragment, so nothing narrower than the
             // fallback is true of it — see `holds`.
-            _ => Self::fixed(self.fallback),
+            return Self::fixed(self.fallback);
+        }
+        match self.origin {
+            AnchorOrigin::Body(body) => Self::slice(body, self.base + range.start, range.len()),
+            AnchorOrigin::File => Self::file(self.base + range.start, range.len(), self.fallback),
+            AnchorOrigin::Nowhere => Self::fixed(self.fallback),
         }
     }
 
@@ -22680,11 +23748,18 @@ impl<'a> BodyAnchor<'a> {
     /// span at least says only true things. That is the trade the whole D2
     /// series has made.
     fn at(self, range: Range<usize>) -> SourceSpan {
-        match self.body {
-            Some(body) if !range.is_empty() && self.holds(&range) => {
+        if range.is_empty() || !self.holds(&range) {
+            return self.fallback;
+        }
+        match self.origin {
+            AnchorOrigin::Body(body) => {
                 body.span_of(self.base + range.start..self.base + range.end)
             }
-            _ => self.fallback,
+            AnchorOrigin::File => SourceSpan {
+                start: self.base + range.start,
+                end: self.base + range.end,
+            },
+            AnchorOrigin::Nowhere => self.fallback,
         }
     }
 
@@ -22834,6 +23909,25 @@ fn interpolation_ranges(text: &str) -> Vec<Range<usize>> {
 /// pins two of them to the column. Line breaks are kept so the mask stays
 /// line-addressable alongside the text it was cut from.
 fn source_scan_text(text: &str) -> String {
+    non_code_blanked(text, KeepInterpolations::Yes)
+}
+
+/// Whether a mask puts `{{ … }}` back after blanking the string that held it.
+///
+/// An identifier scan wants them back — an interpolation is a field read
+/// wherever it is written, which is the whole point of [`source_scan_text`]. A
+/// BRACE scan wants them gone: the two characters of `{{` open no block, and
+/// restoring them makes a counter's answer depend on whether an interpolation
+/// happens to be balanced inside the fragment it is reading.
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum KeepInterpolations {
+    Yes,
+    No,
+}
+
+/// `text` with every byte that is not source blanked to a space, byte for byte
+/// — the one mask under both [`source_scan_text`] and [`BraceScan`].
+fn non_code_blanked(text: &str, keep: KeepInterpolations) -> String {
     let spans = non_code_spans(text);
     if spans.strings.is_empty() && spans.comments.is_empty() {
         return text.to_owned();
@@ -22852,15 +23946,17 @@ fn source_scan_text(text: &str) -> String {
     }
     // Interpolations come back only for STRING spans. One inside a comment is
     // still commented out.
-    for span in &spans.strings {
-        let end = span.end.min(original.len());
-        if span.start >= end {
-            continue;
-        }
-        for range in interpolation_ranges(&text[span.start..end]) {
-            let at = span.start + range.start;
-            let to = span.start + range.end;
-            bytes[at..to].copy_from_slice(&original[at..to]);
+    if keep == KeepInterpolations::Yes {
+        for span in &spans.strings {
+            let end = span.end.min(original.len());
+            if span.start >= end {
+                continue;
+            }
+            for range in interpolation_ranges(&text[span.start..end]) {
+                let at = span.start + range.start;
+                let to = span.start + range.end;
+                bytes[at..to].copy_from_slice(&original[at..to]);
+            }
         }
     }
     debug_assert_eq!(
@@ -22924,6 +24020,7 @@ fn validate_binding_name(
             code: diagnostic_code!("construct.reserved_name"),
             severity: Severity::Error,
             related: Vec::new(),
+            fixits: Vec::new(),
             span,
             message: format!(
                 "rule `{}` binds reserved keyword `{binding}`",
@@ -23021,15 +24118,36 @@ where
     closest_in(target, candidates, Vocabulary::Declared)
 }
 
-/// The closest word the LANGUAGE defines, or `None` when nothing is close
-/// enough. See [`closest_in`]; this is the closed half of the policy, and it is
-/// deliberately much quieter than [`closest_name`].
-pub(crate) fn closest_keyword<S, I>(target: &str, candidates: I) -> Option<String>
+/// [`closest_name`] with the RIVAL, for the sites that WRITE a did-you-mean
+/// clause. See [`closest_rivals`] for why the clause needs it and the plain
+/// answer does not.
+pub(crate) fn closest_name_rivals<S, I>(
+    target: &str,
+    candidates: I,
+) -> Option<(String, Option<String>)>
 where
     S: AsRef<str>,
     I: IntoIterator<Item = S>,
 {
-    closest_in(target, candidates, Vocabulary::Language)
+    closest_rivals(target, candidates, Vocabulary::Declared)
+}
+
+/// The closest word the LANGUAGE defines, with the RIVAL, or `None` when nothing
+/// is close enough. See [`closest_in`]; this is the closed half of the policy,
+/// and it is deliberately much quieter than [`closest_name`].
+///
+/// There is no rival-less closed-vocabulary helper, because every consumer of
+/// this half writes a did-you-mean clause and therefore needs the rival. The
+/// tests that ask only "which word" wrap it themselves.
+pub(crate) fn closest_keyword_rivals<S, I>(
+    target: &str,
+    candidates: I,
+) -> Option<(String, Option<String>)>
+where
+    S: AsRef<str>,
+    I: IntoIterator<Item = S>,
+{
+    closest_rivals(target, candidates, Vocabulary::Language)
 }
 
 /// The closest candidate to `target`, or `None` when nothing is close enough.
@@ -23059,7 +24177,10 @@ where
 /// - **Deterministic tie-breaking** on `(distance, candidate)`, so two equally
 ///   close candidates always give the same answer regardless of whether the
 ///   universe arrived as a sorted map or an unordered `Vec`. A diagnostic that
-///   changes between runs is worse than one that suggests nothing.
+///   changes between runs is worse than one that suggests nothing. The tie is
+///   REPORTED as well as broken — see [`closest_rivals`] — because breaking it
+///   consistently is good enough for a sentence a person reads and is not good
+///   enough for a patch a machine applies.
 /// - **Never the name the author already wrote.** A site may route a name here
 ///   after rejecting it for a reason other than spelling (kind, scope,
 ///   ownership); telling the author to write what they wrote is noise.
@@ -23082,6 +24203,35 @@ where
     S: AsRef<str>,
     I: IntoIterator<Item = S>,
 {
+    closest_rivals(target, candidates, vocabulary).map(|(best, _)| best)
+}
+
+/// [`closest_in`]'s answer, plus the RIVAL: a second candidate exactly as close
+/// as the winner, when the winner has one.
+///
+/// One policy, two questions, because the two consumers are not the same reader.
+/// A SUGGESTION is a sentence, and a deterministic alphabetical tie-break is
+/// enough for it: the person reading judges the candidate and edits, or does
+/// not. A FIXIT is a patch an editor applies on a keystroke and a `--fix` applies
+/// with nobody watching, and `spec/error-handling.md` gives it `exact` only when
+/// the compiler knows the edit. Two names at the same distance means the compiler
+/// does not know it; it sorted. `xode` is one edit from both `mode` and `node`,
+/// and shipping `mode` as `exact` would be calling a coin flip a fact.
+///
+/// So the tie travels out of here rather than being swallowed at the door — see
+/// [`fixit::did_you_mean_of`], which is where it becomes visible in the clause,
+/// and [`fixit::fixits_for`], which is where it becomes `Applicability::Likely`.
+/// Only the FIRST rival is reported: the claim being tested is "the best is not
+/// strictly better than the second best", and one counterexample settles it.
+pub(crate) fn closest_rivals<S, I>(
+    target: &str,
+    candidates: I,
+    vocabulary: Vocabulary,
+) -> Option<(String, Option<String>)>
+where
+    S: AsRef<str>,
+    I: IntoIterator<Item = S>,
+{
     let fold = vocabulary == Vocabulary::Declared;
     let measured_target = if fold {
         target.to_lowercase()
@@ -23090,6 +24240,7 @@ where
     };
     let target_len = measured_target.chars().count();
     let mut best: Option<(usize, String)> = None;
+    let mut rival: Option<(usize, String)> = None;
     for candidate in candidates {
         let candidate = candidate.as_ref();
         if candidate == target {
@@ -23116,17 +24267,37 @@ where
         if distance > ceiling {
             continue;
         }
-        let better = match &best {
-            None => true,
-            Some((best_distance, best_name)) => {
-                (distance, candidate) < (*best_distance, best_name.as_str())
-            }
+        // The runner-up is kept under the SAME ordering that picks the winner, so
+        // "second best" means second in the one order the policy defines rather
+        // than whichever candidate happened to arrive next.
+        let ranks_before = |entry: &(usize, String), other: &(usize, String)| {
+            (entry.0, entry.1.as_str()) < (other.0, other.1.as_str())
         };
-        if better {
-            best = Some((distance, candidate.to_owned()));
+        let entry = (distance, candidate.to_owned());
+        match &best {
+            // The SAME NAME twice is a duplicated universe, not a tie. Sites
+            // assemble candidates from several tables and hand over whatever
+            // they collected; `WorkItem` arriving twice made `WorkIItem` read
+            // "did you mean `WorkItem` or `WorkItem`?" and dropped a fixit the
+            // compiler did know to `likely`. A rival must be a name the reader
+            // could choose differently.
+            Some(current) if current.1 == entry.1 => {}
+            Some(current) if !ranks_before(&entry, current) => {
+                if rival.as_ref().is_none_or(|held| ranks_before(&entry, held)) {
+                    rival = Some(entry);
+                }
+            }
+            _ => rival = best.replace(entry),
         }
     }
-    best.map(|(_, name)| name)
+    best.map(|(distance, name)| {
+        (
+            name,
+            rival
+                .filter(|(rival_distance, _)| *rival_distance == distance)
+                .map(|(_, rival_name)| rival_name),
+        )
+    })
 }
 
 /// Restricted Damerau-Levenshtein (optimal string alignment): insertion,
@@ -23265,8 +24436,11 @@ where
     I: IntoIterator<Item = S>,
 {
     let fallback = fallback.into();
-    match closest_name(target, candidates) {
-        Some(name) => format!("did you mean `{name}`? otherwise {fallback}"),
+    match closest_name_rivals(target, candidates) {
+        Some((name, rival)) => format!(
+            "{} otherwise {fallback}",
+            fixit::did_you_mean_of(&name, rival.as_deref())
+        ),
         None => fallback,
     }
 }
@@ -23284,8 +24458,11 @@ where
     I: IntoIterator<Item = S>,
 {
     let domain = domain.into();
-    match closest_name(target, candidates) {
-        Some(name) => format!("did you mean `{name}`? {domain}"),
+    match closest_name_rivals(target, candidates) {
+        Some((name, rival)) => format!(
+            "{} {domain}",
+            fixit::did_you_mean_of(&name, rival.as_deref())
+        ),
         None => domain,
     }
 }
@@ -23331,8 +24508,11 @@ where
     I: IntoIterator<Item = S>,
 {
     let domain = domain.into();
-    match closest_keyword(target, words) {
-        Some(name) => format!("did you mean `{name}`? {domain}"),
+    match closest_keyword_rivals(target, words) {
+        Some((name, rival)) => format!(
+            "{} {domain}",
+            fixit::did_you_mean_of(&name, rival.as_deref())
+        ),
         None => domain,
     }
 }
@@ -23382,6 +24562,7 @@ fn validate_record_field(
             code: diagnostic_code!("parse.invalid_field_assignment"),
             severity: Severity::Error,
             related: Vec::new(),
+            fixits: Vec::new(),
             span: site.field.whole(),
             message: format!(
                 "rule `{}` has malformed field assignment in `record {record_schema}`",
@@ -23401,6 +24582,7 @@ fn validate_record_field(
                 code: diagnostic_code!("type.unknown_field"),
                 severity: Severity::Error,
                 related: Vec::new(),
+                fixits: Vec::new(),
                 span: site.field.whole(),
                 message: format!("class `{record_schema}` has no field `{field}`"),
                 suggestion: Some(suggest_otherwise(
@@ -23415,7 +24597,10 @@ fn validate_record_field(
         return;
     };
 
-    if let Some(dotted) = expression_dotted_path(expr) {
+    // Every path the value holds, not only a lone one. `"{{ ticket.id }} and
+    // {{ nosuchbinding.field }}"` holds two reads and used to be read as none.
+    let mut reported: BTreeSet<String> = BTreeSet::new();
+    for dotted in source_dotted_paths(expr) {
         let (root, path) = (dotted.root.clone(), dotted.path());
         // Local scopes only, for the same reason as the terminal payload above.
         match check_field_path(
@@ -23435,11 +24620,15 @@ fn validate_record_field(
             // A field access whose root is neither a bound name nor a special
             // root is a dangling reference: the binding does not exist.
             FieldPathCheck::Unbound => {
-                if let Some(root) = dangling_value_root(expr, known_roots) {
+                if let Some(root) = dangling_path_root(&dotted, known_roots) {
+                    if !reported.insert(root.clone()) {
+                        continue;
+                    }
                     diagnostics.push(Diagnostic {
                         code: diagnostic_code!("type.unknown_binding"),
                         severity: Severity::Error,
                         related: Vec::new(),
+                        fixits: Vec::new(),
                         span: at.whole(),
                         message: format!(
                             "rule `{}` has unknown binding `{root}` in `record {record_schema}` field `{field}`",
@@ -23584,6 +24773,7 @@ fn validate_source_emit_signal_declared(
             code: diagnostic_code!("type.unknown_signal"),
             severity: Severity::Error,
             related: Vec::new(),
+            fixits: Vec::new(),
             span: source.emit.signal_span,
             message: format!(
                 "source `{}` emits undeclared signal `{}`",
@@ -23632,6 +24822,7 @@ fn validate_source_emit_signal_declared(
                     code: diagnostic_code!("type.unknown_field"),
                     severity: Severity::Error,
                     related: Vec::new(),
+                    fixits: Vec::new(),
                     span: field.span,
                     message: format!(
                         "source `{}` `dedup` reads `{}.{}`, but a `{}` source's observation has no field `{}`",
@@ -23666,6 +24857,7 @@ fn validate_source_emit_signal_declared(
                     code: diagnostic_code!("type.unknown_binding"),
                     severity: Severity::Error,
                     related: Vec::new(),
+                    fixits: Vec::new(),
                     span: *span,
                     message: format!(
                         "source `{}` emit reads unknown binding `{}`",
@@ -23683,6 +24875,7 @@ fn validate_source_emit_signal_declared(
                         code: diagnostic_code!("type.unknown_field"),
                         severity: Severity::Error,
                         related: Vec::new(),
+                        fixits: Vec::new(),
                         span: obs_field.span,
                         message: format!(
                             "source `{}` emit reads `{}.{}`, but a `{}` source's observation has no field `{}`",
@@ -23723,6 +24916,7 @@ fn validate_emit_signal_declarations(
                             code: diagnostic_code!("type.unknown_signal"),
                             severity: Severity::Error,
                             related: Vec::new(),
+                            fixits: Vec::new(),
                             span: effect.span,
                             message: format!(
                                 "rule `{}` emits undeclared signal `{event}`",
@@ -23892,33 +25086,49 @@ fn validate_effect_field_roots(
     }
 }
 
-/// The single source of truth for value-position root validation: returns the
-/// dangling root of a single-path value expression — a `root.field…` access whose
-/// root is neither a known binding nor a recognized special root — or `None`.
-/// Bare atoms (agents, enum variants, literals) have no path and are ignored.
-/// Used by every value-position validator (record/terminal/coerce/tell/invoke/
-/// effect payloads/operands).
+/// Whether ONE scanned path's root names nothing: a `root.field…` read whose
+/// root is neither a known binding nor a recognized special root. A bare atom
+/// (an agent, an enum variant, a literal) has no path and is not one of these.
+fn dangling_path_root(dotted: &DottedPath, known_roots: &BTreeSet<String>) -> Option<String> {
+    (!dotted.fields.is_empty()
+        && !known_roots.contains(&dotted.root)
+        && !SPECIAL_VALUE_ROOTS.contains(&dotted.root.as_str()))
+    .then(|| dotted.root.clone())
+}
+
+/// The single source of truth for value-position root validation: EVERY
+/// dangling root a value expression holds, in source order, once each. Used by
+/// every value-position validator (record/terminal/coerce/tell/invoke/effect
+/// payloads/operands).
 ///
-/// The `"`-guard is a survivor, not a design. It was the blunt patch for the
-/// prose false positive `expression_dotted_path` now answers properly — a
-/// "path" mis-extracted from inside a string literal — and for that it is
-/// redundant. It also skips anything genuinely INTERPOLATED, though: `fail
-/// error { reason "{{ nosuchbinding.field }}" }` compiles with no diagnostic,
-/// while the same value unquoted draws `type.unknown_binding`. Deleting it is
-/// an acceptance WIDENING, the opposite direction from the scanner fix, so it
-/// is filed rather than dropped in passing. D14,
-/// spec/diagnostic-quality-tracker.md.
-fn dangling_value_root(value: &str, known_roots: &BTreeSet<String>) -> Option<String> {
-    let (root, path) = expression_path(value)?;
-    if !path.is_empty()
-        && !value.contains('"')
-        && !known_roots.contains(&root)
-        && !SPECIAL_VALUE_ROOTS.contains(&root.as_str())
-    {
-        Some(root)
-    } else {
-        None
+/// Every, not "the one it holds if it holds exactly one". This read
+/// `expression_path`, which answers only for a value holding a LONE path, so
+/// `"{{ ticket.id }} and {{ nosuchbinding.field }}"` was not checked at all
+/// while deleting the first interpolation refused it. A value the compiler
+/// cannot reduce to a single path is not a value it may decline to read: two
+/// reads are two reads. Counting was never the question — the question is
+/// whether each root names something.
+///
+/// The false-positive direction the count was standing in for is answered by
+/// the MASK, not by the count: `source_dotted_paths` blanks string prose and
+/// comments first, so `"see item.priority"` holds no path at either arity and
+/// `"{{ item.priority }}"` holds one wherever it is written.
+///
+/// A `!value.contains('"')` guard used to stand here too, and is gone for the
+/// same reason: it failed OPEN on any value carrying a quote, interpolations
+/// included. Quoting a value is not a way to stop its bindings being checked.
+/// D14, spec/diagnostic-quality-tracker.md.
+fn dangling_value_roots(value: &str, known_roots: &BTreeSet<String>) -> Vec<String> {
+    let mut roots: Vec<String> = Vec::new();
+    for dotted in source_dotted_paths(value) {
+        if let Some(root) = dangling_path_root(&dotted, known_roots) {
+            // One value naming one missing binding twice is one mistake.
+            if !roots.contains(&root) {
+                roots.push(root);
+            }
+        }
     }
+    roots
 }
 
 /// Flags a dangling root in a single effect-operand expression (e.g. an
@@ -23932,11 +25142,12 @@ fn check_operand_root(
     known_roots: &BTreeSet<String>,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
-    if let Some(root) = dangling_value_root(operand, known_roots) {
+    for root in dangling_value_roots(operand, known_roots) {
         diagnostics.push(Diagnostic {
             code: diagnostic_code!("type.unknown_binding"),
             severity: Severity::Error,
             related: Vec::new(),
+            fixits: Vec::new(),
             span: at,
             message: format!(
                 "rule `{}` has unknown binding `{root}` in {context} `{operand}`",
@@ -23961,11 +25172,12 @@ fn check_field_value_roots(
     for field in fields {
         match &field.value {
             body::FieldValue::Expr { source, .. } => {
-                if let Some(root) = dangling_value_root(source, known_roots) {
+                for root in dangling_value_roots(source, known_roots) {
                     diagnostics.push(Diagnostic {
                         code: diagnostic_code!("type.unknown_binding"),
                         severity: Severity::Error,
                         related: Vec::new(),
+                        fixits: Vec::new(),
                         span: field.span,
                         message: format!(
                             "rule `{}` has unknown binding `{root}` in {context} field `{}`",
@@ -24017,6 +25229,7 @@ fn validate_record_blocks(
                 code: diagnostic_code!("parse.invalid_field_assignment"),
                 severity: Severity::Error,
                 related: Vec::new(),
+                fixits: Vec::new(),
                 span: block_anchor.at(stray_at),
                 message: format!(
                     "rule `{}` has a value with no field name in `record {schema}`: `{stray}`",
@@ -24072,6 +25285,7 @@ fn assignment_anchor<'a>(block: BodyAnchor<'a>, site: &RecordFieldSite) -> Assig
 fn record_blocks(body: &str) -> Vec<(String, Option<String>, Range<usize>)> {
     let mut blocks = Vec::new();
     let raw = body_line_offsets(body);
+    let scan = BraceScan::new(body);
     let lines = raw.iter().map(|(line, _)| *line).collect::<Vec<_>>();
     let mut index = 0usize;
     while index < lines.len() {
@@ -24085,7 +25299,7 @@ fn record_blocks(body: &str) -> Vec<(String, Option<String>, Range<usize>)> {
         // Single-line record `record X { f y }`: opens and closes on one line
         // (brace_delta 0), so the multi-line loop below never collects its fields,
         // leaving them unvalidated. Extract the inner content directly.
-        if brace_delta(trimmed) == 0 && trimmed.contains('{') {
+        if scan.delta(line_start, line) == 0 && trimmed.contains('{') {
             if let (Some(open), Some(close)) = (trimmed.find('{'), trimmed.rfind('}')) {
                 if close > open {
                     let inner = &trimmed[open + 1..close];
@@ -24097,7 +25311,7 @@ fn record_blocks(body: &str) -> Vec<(String, Option<String>, Range<usize>)> {
             index += 1;
             continue;
         }
-        let mut depth = brace_delta(trimmed);
+        let mut depth = scan.delta(line_start, line);
         // The block's fields are a CONTIGUOUS run of lines — the only line the
         // old join dropped was the closing `}`, which is necessarily the last —
         // so the block can be a byte range into the body rather than a copy,
@@ -24107,7 +25321,7 @@ fn record_blocks(body: &str) -> Vec<(String, Option<String>, Range<usize>)> {
         while index < lines.len() && depth > 0 {
             let (line, line_start) = raw[index];
             let before = depth;
-            depth += brace_delta(line);
+            depth += scan.delta(line_start, line);
             if !(before == 1 && depth == 0 && line.trim() == "}") {
                 let range =
                     span.as_ref().map_or(line_start, |range| range.start)..line_start + line.len();
@@ -24183,6 +25397,7 @@ fn inline_terminal_block(rest: &str) -> Option<&str> {
 fn workflow_terminal_blocks(body: &str) -> Vec<(String, String, Range<usize>)> {
     let mut blocks = Vec::new();
     let raw = body_line_offsets(body);
+    let scan = BraceScan::new(body);
     let lines = raw.iter().map(|(line, _)| *line).collect::<Vec<_>>();
     let mut index = 0usize;
     while index < lines.len() {
@@ -24221,13 +25436,13 @@ fn workflow_terminal_blocks(body: &str) -> Vec<(String, String, Range<usize>)> {
             // Otherwise the block continues onto the lines below; a terminal
             // whose payload spans lines is the only statement on its line, so
             // consuming them here cannot skip a sibling.
-            let mut depth = brace_delta(rest);
+            let mut depth = scan.delta(head + start, rest);
             let mut span: Option<Range<usize>> = None;
             index += 1;
             while index < lines.len() && depth > 0 {
                 let (line, line_start) = raw[index];
                 let before = depth;
-                depth += brace_delta(line);
+                depth += scan.delta(line_start, line);
                 if !(before == 1 && depth == 0 && line.trim() == "}") {
                     let range = span.as_ref().map_or(line_start, |range| range.start)
                         ..line_start + line.len();
@@ -24373,6 +25588,7 @@ fn validate_literal_assignment_inner(
                     code: diagnostic_code!("type.invalid_literal"),
                     severity: Severity::Error,
                     related: Vec::new(),
+                    fixits: Vec::new(),
                     span: at.whole(),
                     message: format!(
                         "field `{record_schema}.{field}` expects literal string `{value}`"
@@ -24429,6 +25645,7 @@ fn validate_literal_assignment_inner(
                     code: diagnostic_code!("type.invalid_literal"),
                     severity: Severity::Error,
                     related: Vec::new(),
+                    fixits: Vec::new(),
                     span: at.whole(),
                     message: format!(
                         "field `{record_schema}.{field}` expects `{}`, which has no literal form",
@@ -24450,6 +25667,7 @@ fn validate_literal_assignment_inner(
                 code: diagnostic_code!("type.invalid_literal"),
                 severity: Severity::Error,
                 related: Vec::new(),
+                fixits: Vec::new(),
                 span: at.whole(),
                 message: format!(
                     "field `{record_schema}.{field}` is `{}`: secrets have no literal form",
@@ -24517,6 +25735,7 @@ fn validate_expr_source_against_type(
                         code: diagnostic_code!("type.mismatch"),
                         severity: Severity::Error,
                         related: Vec::new(),
+                        fixits: Vec::new(),
                         span: at.whole(),
                         message: format!("field `{record_schema}.{field}` expects a map literal"),
                         suggestion: Some(format!("record `{field} {{ key value }}`")),
@@ -24528,6 +25747,7 @@ fn validate_expr_source_against_type(
                         code: diagnostic_code!("parse.invalid_expression"),
                         severity: Severity::Error,
                         related: Vec::new(),
+                        fixits: Vec::new(),
                         span: at.whole(),
                         message: format!(
                             "field `{record_schema}.{field}` expects a map literal: {message}"
@@ -24769,6 +25989,7 @@ fn push_invalid_assignment_expr(
         code: diagnostic_code!("parse.invalid_expression"),
         severity: Severity::Error,
         related: Vec::new(),
+        fixits: Vec::new(),
         span: at.whole(),
         message: format!(
             "rule `{}` has invalid expression for field `{record_schema}.{field}`: {message}",
@@ -24803,6 +26024,7 @@ fn validate_object_literal_fields(
                 code: diagnostic_code!("type.duplicate_field"),
                 severity: Severity::Error,
                 related: Vec::new(),
+                fixits: Vec::new(),
                 span: at.whole(),
                 message: format!(
                     "field `{record_schema}.{field}` repeats object field `{}`",
@@ -24818,6 +26040,7 @@ fn validate_object_literal_fields(
                     code: diagnostic_code!("type.unknown_field"),
                     severity: Severity::Error,
                     related: Vec::new(),
+                    fixits: Vec::new(),
                     span: at.whole(),
                     message: format!(
                         "class `{object_schema}` has no field `{}`",
@@ -24859,6 +26082,7 @@ fn validate_object_literal_fields(
             code: diagnostic_code!("type.missing_required_field"),
             severity: Severity::Error,
             related: Vec::new(),
+            fixits: Vec::new(),
             span: at.whole(),
             message: format!(
                 "field `{record_schema}.{field}` is missing required object field `{object_schema}.{required}`"
@@ -24896,9 +26120,19 @@ fn validate_inferred_assignment_type(
         return;
     }
 
-    let context = ExprValidationContext::rule(rule, at.whole());
+    let context = ExprValidationContext::rule(rule, BodyAnchor::fixed(at.whole()));
     let mut local_diagnostics = Vec::new();
-    let actual_ty = infer_expr_type(expr, semantic, scope, &context, &mut local_diagnostics);
+    // A record field's value: `body::FieldValue` keeps the expression's source
+    // text but not where it starts, so nothing here can place a caret inside it
+    // and every finding reports at the assignment (D10 covers guards).
+    let actual_ty = infer_expr_type(
+        expr,
+        &ExprSpans::unknown(),
+        semantic,
+        scope,
+        &context,
+        &mut local_diagnostics,
+    );
     diagnostics.extend(local_diagnostics);
     let expected_expr_ty = expr_type_from_type_syntax(expected_ty, semantic);
     if !types_comparable(&actual_ty, &expected_expr_ty) {
@@ -24907,6 +26141,7 @@ fn validate_inferred_assignment_type(
                 code: diagnostic_code!("type.mismatch"),
                 severity: Severity::Error,
                 related: Vec::new(),
+                fixits: Vec::new(),
                 span: at.whole(),
                 message: format!(
                     "field `{record_schema}.{field}` receives incompatible expression type"
@@ -24976,6 +26211,7 @@ fn validate_literal_against_type_inner(
                     code: diagnostic_code!("type.invalid_literal"),
                     severity: Severity::Error,
                     related: Vec::new(),
+                    fixits: Vec::new(),
                     span: at.whole(),
                     message: format!(
                         "field `{record_schema}.{field}` expects literal string `{value}`"
@@ -25025,6 +26261,7 @@ fn validate_literal_against_type_inner(
                 code: diagnostic_code!("type.invalid_literal"),
                 severity: Severity::Error,
                 related: Vec::new(),
+                fixits: Vec::new(),
                 span: at.whole(),
                 message: format!(
                     "field `{record_schema}.{field}` expects `{}`, which has no literal form",
@@ -25044,6 +26281,7 @@ fn validate_literal_against_type_inner(
                 code: diagnostic_code!("type.invalid_literal"),
                 severity: Severity::Error,
                 related: Vec::new(),
+                fixits: Vec::new(),
                 span: at.whole(),
                 message: format!(
                     "field `{record_schema}.{field}` is `{}`: secrets have no literal form",
@@ -25088,6 +26326,7 @@ fn validate_agent_ref_literal(
             code: diagnostic_code!("type.invalid_literal"),
             severity: Severity::Error,
             related: Vec::new(),
+            fixits: Vec::new(),
             span: at.whole(),
             message: format!(
                 "field `{record_schema}.{field}` expects an AgentRef value, not string `{value}`"
@@ -25104,6 +26343,7 @@ fn validate_agent_ref_literal(
             code: diagnostic_code!("type.invalid_literal"),
             severity: Severity::Error,
             related: Vec::new(),
+            fixits: Vec::new(),
             span: at.whole(),
             message: format!("field `{record_schema}.{field}` expects an AgentRef value"),
             suggestion: Some(format!("use one of: {}", allowed.join(", "))),
@@ -25115,6 +26355,7 @@ fn validate_agent_ref_literal(
             code: diagnostic_code!("type.invalid_literal"),
             severity: Severity::Error,
             related: Vec::new(),
+            fixits: Vec::new(),
             span: at.whole(),
             message: format!("field `{record_schema}.{field}` cannot reference agent `{value}`"),
             suggestion: Some(suggest_then(
@@ -25180,6 +26421,12 @@ const MAX_EXPR_DEPTH: usize = 256;
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ExprToken {
     kind: ExprTokenKind,
+    /// Byte offset of the token's first byte within the expression text
+    /// `lex_expr` was handed. Not a file offset: an expression is parsed from a
+    /// slice, and only the caller knows where that slice came from (D10).
+    start: usize,
+    /// Byte offset one past the token's last byte, same frame as `start`.
+    end: usize,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -25194,6 +26441,51 @@ enum ExprTokenKind {
     Op(&'static str),
 }
 
+/// An `Expr` and the byte ranges its nodes were written at, so the parser
+/// builds both in one pass and neither can drift from the other.
+struct Spanned {
+    expr: Expr,
+    spans: ExprSpans,
+}
+
+impl Spanned {
+    fn new(expr: Expr, range: Range<usize>, children: Vec<ExprSpans>) -> Self {
+        debug_assert_eq!(
+            expr.children().len(),
+            children.len(),
+            "ExprSpans arity disagrees with Expr::children for {expr:?}"
+        );
+        Self {
+            spans: ExprSpans::node(range, children),
+            expr,
+        }
+    }
+
+    fn leaf(expr: Expr, range: Range<usize>) -> Self {
+        debug_assert!(expr.children().is_empty(), "leaf with children: {expr:?}");
+        Self {
+            spans: ExprSpans::leaf(range),
+            expr,
+        }
+    }
+
+    /// Replace the node while keeping its position — for the two places the
+    /// parser rewrites a finished node in place (`exists x` lifting a bare
+    /// identifier to a path, and a parenthesized group).
+    fn map(self, rewrite: impl FnOnce(Expr) -> Expr) -> Self {
+        let expr = rewrite(self.expr);
+        debug_assert_eq!(
+            expr.children().len(),
+            self.spans.child_count(),
+            "rewrite changed the child count of {expr:?}"
+        );
+        Self {
+            expr,
+            spans: self.spans,
+        }
+    }
+}
+
 impl<'a> ExprParser<'a> {
     fn new(source: &'a str) -> Self {
         Self {
@@ -25204,44 +26496,120 @@ impl<'a> ExprParser<'a> {
         }
     }
 
-    fn parse(mut self) -> Result<Expr, String> {
-        let expr = self.parse_or()?;
-        if self.peek().is_some() {
-            return Err(format!(
-                "unexpected token in expression `{}`",
-                self.source.trim()
-            ));
-        }
-        Ok(expr)
+    /// Where the token the parser is about to read begins, in the parsed text.
+    fn at(&self) -> usize {
+        self.peek()
+            .map(|token| token.start)
+            .unwrap_or(self.source.len())
     }
 
-    fn parse_or(&mut self) -> Result<Expr, String> {
+    /// Where the token the parser last consumed ended.
+    fn behind(&self) -> usize {
+        self.pos
+            .checked_sub(1)
+            .and_then(|index| self.tokens.get(index))
+            .map(|token| token.end)
+            .unwrap_or(0)
+    }
+
+    /// The range of everything consumed since `start`.
+    fn since(&self, start: usize) -> Range<usize> {
+        start..self.behind().max(start)
+    }
+
+    /// The failure `message`, blamed on the token the parser is sitting at.
+    fn stopped_at(&self, message: String) -> ExprParseError {
+        ExprParseError {
+            message,
+            range: self.peek().map(|token| token.start..token.end),
+        }
+    }
+
+    /// The failure `message`, about the expression rather than about a token.
+    fn whole(message: String) -> ExprParseError {
+        ExprParseError {
+            message,
+            range: None,
+        }
+    }
+
+    fn parse(mut self) -> Result<(Expr, ExprSpans), ExprParseError> {
+        let parsed = self.parse_or()?;
+        if self.peek().is_some() {
+            let message = format!("unexpected token in expression `{}`", self.source.trim());
+            return Err(match self.unsupported_call_name() {
+                Some(range) => ExprParseError {
+                    message,
+                    range: Some(range),
+                },
+                None => self.stopped_at(message),
+            });
+        }
+        Ok((parsed.expr, parsed.spans))
+    }
+
+    /// The range of the NAME being called, when the parser stopped on the `(`
+    /// of a call the expression kernel does not have.
+    ///
+    /// This is the commonest way to reach "unexpected token in expression":
+    /// `uppercase(issue.title)`, `nope(0)`. The kernel supports a fixed set of
+    /// calls, so anything else parses as a bare identifier and leaves the `(`
+    /// behind — which is where the caret used to land. The parenthesis is
+    /// where the parser stopped, and it is not what the reader has to change;
+    /// the name is. Nothing else about the diagnostic moves: same code, same
+    /// severity, same message naming the whole expression.
+    fn unsupported_call_name(&self) -> Option<Range<usize>> {
+        if !self.at_symbol('(') {
+            return None;
+        }
+        // The token before the `(` — an identifier there is the name being
+        // called. A word operator cannot appear in that position (`not (1)`,
+        // `x and (y)` parse the parenthesis as a group and consume it), so the
+        // only identifier a leftover `(` can follow is a call head. Anything
+        // else — `1 (2)` — keeps the parenthesis it always had, because there
+        // is no name to blame.
+        let name = self.tokens.get(self.pos.checked_sub(1)?)?;
+        matches!(name.kind, ExprTokenKind::Ident(_)).then(|| name.start..name.end)
+    }
+
+    fn parse_or(&mut self) -> Result<Spanned, ExprParseError> {
+        let start = self.at();
         let mut expr = self.parse_and()?;
         while self.consume_op("||") || self.consume_ident("or") {
             let right = self.parse_and()?;
-            expr = Expr::Binary {
-                op: BinaryOp::Or,
-                left: Box::new(expr),
-                right: Box::new(right),
-            };
+            expr = Spanned::new(
+                Expr::Binary {
+                    op: BinaryOp::Or,
+                    left: Box::new(expr.expr),
+                    right: Box::new(right.expr),
+                },
+                self.since(start),
+                vec![expr.spans, right.spans],
+            );
         }
         Ok(expr)
     }
 
-    fn parse_and(&mut self) -> Result<Expr, String> {
+    fn parse_and(&mut self) -> Result<Spanned, ExprParseError> {
+        let start = self.at();
         let mut expr = self.parse_comparison()?;
         while self.consume_op("&&") || self.consume_ident("and") {
             let right = self.parse_comparison()?;
-            expr = Expr::Binary {
-                op: BinaryOp::And,
-                left: Box::new(expr),
-                right: Box::new(right),
-            };
+            expr = Spanned::new(
+                Expr::Binary {
+                    op: BinaryOp::And,
+                    left: Box::new(expr.expr),
+                    right: Box::new(right.expr),
+                },
+                self.since(start),
+                vec![expr.spans, right.spans],
+            );
         }
         Ok(expr)
     }
 
-    fn parse_comparison(&mut self) -> Result<Expr, String> {
+    fn parse_comparison(&mut self) -> Result<Spanned, ExprParseError> {
+        let start = self.at();
         let mut expr = self.parse_additive()?;
         loop {
             let op = if self.consume_op("==") {
@@ -25258,7 +26626,7 @@ impl<'a> ExprParser<'a> {
                 Some(BinaryOp::Gt)
             } else if self.consume_ident("not") {
                 if !self.consume_ident("in") {
-                    return Err("expected `in` after `not`".to_owned());
+                    return Err(self.stopped_at("expected `in` after `not`".to_owned()));
                 }
                 Some(BinaryOp::NotIn)
             } else if self.consume_ident("in") {
@@ -25270,15 +26638,20 @@ impl<'a> ExprParser<'a> {
                 return Ok(expr);
             };
             let right = self.parse_additive()?;
-            expr = Expr::Binary {
-                op,
-                left: Box::new(expr),
-                right: Box::new(right),
-            };
+            expr = Spanned::new(
+                Expr::Binary {
+                    op,
+                    left: Box::new(expr.expr),
+                    right: Box::new(right.expr),
+                },
+                self.since(start),
+                vec![expr.spans, right.spans],
+            );
         }
     }
 
-    fn parse_additive(&mut self) -> Result<Expr, String> {
+    fn parse_additive(&mut self) -> Result<Spanned, ExprParseError> {
+        let start = self.at();
         let mut expr = self.parse_multiplicative()?;
         loop {
             let op = if self.consume_symbol('+') {
@@ -25292,15 +26665,20 @@ impl<'a> ExprParser<'a> {
                 return Ok(expr);
             };
             let right = self.parse_multiplicative()?;
-            expr = Expr::Binary {
-                op,
-                left: Box::new(expr),
-                right: Box::new(right),
-            };
+            expr = Spanned::new(
+                Expr::Binary {
+                    op,
+                    left: Box::new(expr.expr),
+                    right: Box::new(right.expr),
+                },
+                self.since(start),
+                vec![expr.spans, right.spans],
+            );
         }
     }
 
-    fn parse_multiplicative(&mut self) -> Result<Expr, String> {
+    fn parse_multiplicative(&mut self) -> Result<Spanned, ExprParseError> {
+        let start = self.at();
         let mut expr = self.parse_unary()?;
         loop {
             let op = if self.consume_symbol('*') {
@@ -25314,66 +26692,87 @@ impl<'a> ExprParser<'a> {
                 return Ok(expr);
             };
             let right = self.parse_unary()?;
-            expr = Expr::Binary {
-                op,
-                left: Box::new(expr),
-                right: Box::new(right),
-            };
+            expr = Spanned::new(
+                Expr::Binary {
+                    op,
+                    left: Box::new(expr.expr),
+                    right: Box::new(right.expr),
+                },
+                self.since(start),
+                vec![expr.spans, right.spans],
+            );
         }
     }
 
-    fn parse_unary(&mut self) -> Result<Expr, String> {
+    fn parse_unary(&mut self) -> Result<Spanned, ExprParseError> {
         // Depth guard (every nesting level descends through here): return a
         // diagnostic rather than recurse the native stack to a crash.
         self.depth += 1;
         if self.depth > MAX_EXPR_DEPTH {
             self.depth -= 1;
-            return Err(format!(
+            return Err(Self::whole(format!(
                 "expression in `{}` is nested too deeply (limit {MAX_EXPR_DEPTH})",
                 self.source.trim()
-            ));
+            )));
         }
         let result = self.parse_unary_inner();
         self.depth -= 1;
         result
     }
 
-    fn parse_unary_inner(&mut self) -> Result<Expr, String> {
+    fn parse_unary_inner(&mut self) -> Result<Spanned, ExprParseError> {
+        let start = self.at();
         if self.consume_symbol('!') {
-            return Ok(Expr::Unary {
-                op: UnaryOp::Not,
-                expr: Box::new(self.parse_unary()?),
-            });
+            let operand = self.parse_unary()?;
+            return Ok(Spanned::new(
+                Expr::Unary {
+                    op: UnaryOp::Not,
+                    expr: Box::new(operand.expr),
+                },
+                self.since(start),
+                vec![operand.spans],
+            ));
         }
         // Prefix `not` binds looser than comparisons so `not x in y`
         // reads as `not (x in y)`; binary `not in` is handled by
         // parse_comparison before this prefix form is reached.
         if self.consume_ident("not") {
-            return Ok(Expr::Unary {
-                op: UnaryOp::Not,
-                expr: Box::new(self.parse_comparison()?),
-            });
+            let operand = self.parse_comparison()?;
+            return Ok(Spanned::new(
+                Expr::Unary {
+                    op: UnaryOp::Not,
+                    expr: Box::new(operand.expr),
+                },
+                self.since(start),
+                vec![operand.spans],
+            ));
         }
         self.parse_postfix()
     }
 
-    fn parse_postfix(&mut self) -> Result<Expr, String> {
+    fn parse_postfix(&mut self) -> Result<Spanned, ExprParseError> {
+        let start = self.at();
         let mut expr = self.parse_primary()?;
         loop {
             if self.consume_symbol('[') {
                 let key = self.parse_or()?;
                 self.expect_symbol(']')?;
-                expr = Expr::Index {
-                    target: Box::new(expr),
-                    key: Box::new(key),
-                };
+                expr = Spanned::new(
+                    Expr::Index {
+                        target: Box::new(expr.expr),
+                        key: Box::new(key.expr),
+                    },
+                    self.since(start),
+                    vec![expr.spans, key.spans],
+                );
                 continue;
             }
             return Ok(expr);
         }
     }
 
-    fn parse_primary(&mut self) -> Result<Expr, String> {
+    fn parse_primary(&mut self) -> Result<Spanned, ExprParseError> {
+        let start = self.at();
         if self.consume_symbol('(') {
             let expr = self.parse_or()?;
             self.expect_symbol(')')?;
@@ -25381,39 +26780,50 @@ impl<'a> ExprParser<'a> {
         }
         if self.consume_symbol('[') {
             let mut items = Vec::new();
+            let mut spans = Vec::new();
             if self.consume_symbol(']') {
-                return Ok(Expr::Array(items));
+                return Ok(Spanned::new(Expr::Array(items), self.since(start), spans));
             }
             loop {
-                items.push(self.parse_or()?);
+                let item = self.parse_or()?;
+                items.push(item.expr);
+                spans.push(item.spans);
                 if self.consume_symbol(']') {
                     break;
                 }
                 self.expect_symbol(',')?;
             }
-            return Ok(Expr::Array(items));
+            return Ok(Spanned::new(Expr::Array(items), self.since(start), spans));
         }
         if self.consume_symbol('{') {
             let mut fields = Vec::new();
+            let mut spans = Vec::new();
             if self.consume_symbol('}') {
-                return Ok(Expr::Object(fields));
+                return Ok(Spanned::new(Expr::Object(fields), self.since(start), spans));
             }
             loop {
                 let key = match self.advance().map(|token| token.kind.clone()) {
                     Some(ExprTokenKind::Ident(value) | ExprTokenKind::String(value)) => value,
-                    _ => return Err("expected object field name".to_owned()),
+                    _ => return Err(Self::whole("expected object field name".to_owned())),
                 };
                 let value = self.parse_or()?;
-                fields.push(ExprObjectField { key, value });
+                spans.push(value.spans);
+                fields.push(ExprObjectField {
+                    key,
+                    value: value.expr,
+                });
                 if self.consume_symbol('}') {
                     break;
                 }
                 let _ = self.consume_symbol(',');
             }
-            return Ok(Expr::Object(fields));
+            return Ok(Spanned::new(Expr::Object(fields), self.since(start), spans));
         }
         match self.advance().map(|token| token.kind.clone()) {
-            Some(ExprTokenKind::String(value)) => Ok(Expr::Literal(ExprLiteral::String(value))),
+            Some(ExprTokenKind::String(value)) => Ok(Spanned::leaf(
+                Expr::Literal(ExprLiteral::String(value)),
+                self.since(start),
+            )),
             Some(ExprTokenKind::Number(value)) => {
                 // `1.5s` lexes as a number and a stray unit, because the lexer
                 // only welds WHOLE digits to a unit. Saying so beats the generic
@@ -25423,35 +26833,49 @@ impl<'a> ExprParser<'a> {
                 if value.contains('.') {
                     if let Some(ExprTokenKind::Ident(unit)) = self.peek().map(|t| t.kind.clone()) {
                         if matches!(unit.as_str(), "s" | "m" | "h" | "d") {
-                            return Err(format!(
-                                "`{value}{unit}` is not a duration: a duration is a whole number of seconds"
-                            ));
+                            return Err(ExprParseError {
+                                message: format!(
+                                    "`{value}{unit}` is not a duration: a duration is a whole number of seconds"
+                                ),
+                                range: Some(start..self.peek().map_or(self.behind(), |t| t.end)),
+                            });
                         }
                     }
                 }
-                Ok(Expr::Literal(ExprLiteral::Number(value)))
+                Ok(Spanned::leaf(
+                    Expr::Literal(ExprLiteral::Number(value)),
+                    self.since(start),
+                ))
             }
-            Some(ExprTokenKind::Duration(seconds)) => {
-                Ok(Expr::Literal(ExprLiteral::Duration(seconds)))
-            }
-            Some(ExprTokenKind::Ident(value)) if value == "true" => {
-                Ok(Expr::Literal(ExprLiteral::Bool(true)))
-            }
-            Some(ExprTokenKind::Ident(value)) if value == "false" => {
-                Ok(Expr::Literal(ExprLiteral::Bool(false)))
-            }
-            Some(ExprTokenKind::Ident(value)) if value == "null" => {
-                Ok(Expr::Literal(ExprLiteral::Null))
-            }
+            Some(ExprTokenKind::Duration(seconds)) => Ok(Spanned::leaf(
+                Expr::Literal(ExprLiteral::Duration(seconds)),
+                self.since(start),
+            )),
+            Some(ExprTokenKind::Ident(value)) if value == "true" => Ok(Spanned::leaf(
+                Expr::Literal(ExprLiteral::Bool(true)),
+                self.since(start),
+            )),
+            Some(ExprTokenKind::Ident(value)) if value == "false" => Ok(Spanned::leaf(
+                Expr::Literal(ExprLiteral::Bool(false)),
+                self.since(start),
+            )),
+            Some(ExprTokenKind::Ident(value)) if value == "null" => Ok(Spanned::leaf(
+                Expr::Literal(ExprLiteral::Null),
+                self.since(start),
+            )),
             Some(ExprTokenKind::Ident(value)) if value == "exists" && !self.at_symbol('(') => {
-                let arg = match self.parse_postfix()? {
+                let arg = self.parse_postfix()?.map(|expr| match expr {
                     Expr::Literal(ExprLiteral::Ident(path)) => Expr::Path(vec![path]),
                     expr => expr,
-                };
-                Ok(Expr::Call {
-                    name: value,
-                    args: vec![arg],
-                })
+                });
+                Ok(Spanned::new(
+                    Expr::Call {
+                        name: value,
+                        args: vec![arg.expr],
+                    },
+                    self.since(start),
+                    vec![arg.spans],
+                ))
             }
             Some(ExprTokenKind::Ident(value))
                 if matches!(value.as_str(), "count" | "exists" | "empty")
@@ -25460,23 +26884,38 @@ impl<'a> ExprParser<'a> {
                 self.expect_symbol('(')?;
                 if let Some(query) = self.try_parse_query()? {
                     self.expect_symbol(')')?;
-                    Ok(Expr::Call {
-                        name: value,
-                        args: vec![query],
-                    })
+                    Ok(Spanned::new(
+                        Expr::Call {
+                            name: value,
+                            args: vec![query.expr],
+                        },
+                        self.since(start),
+                        vec![query.spans],
+                    ))
                 } else {
                     let mut args = Vec::new();
+                    let mut spans = Vec::new();
                     if self.consume_symbol(')') {
-                        return Ok(Expr::Call { name: value, args });
+                        return Ok(Spanned::new(
+                            Expr::Call { name: value, args },
+                            self.since(start),
+                            spans,
+                        ));
                     }
                     loop {
-                        args.push(self.parse_or()?);
+                        let arg = self.parse_or()?;
+                        args.push(arg.expr);
+                        spans.push(arg.spans);
                         if self.consume_symbol(')') {
                             break;
                         }
                         self.expect_symbol(',')?;
                     }
-                    Ok(Expr::Call { name: value, args })
+                    Ok(Spanned::new(
+                        Expr::Call { name: value, args },
+                        self.since(start),
+                        spans,
+                    ))
                 }
             }
             Some(ExprTokenKind::Ident(value)) => {
@@ -25485,22 +26924,30 @@ impl<'a> ExprParser<'a> {
                     let Some(ExprTokenKind::Ident(field)) =
                         self.advance().map(|token| token.kind.clone())
                     else {
-                        return Err("expected field name after `.`".to_owned());
+                        return Err(self.stopped_at("expected field name after `.`".to_owned()));
                     };
                     path.push(field);
                 }
+                let range = self.since(start);
                 if path.len() == 1 {
-                    Ok(Expr::Literal(ExprLiteral::Ident(path.remove(0))))
+                    Ok(Spanned::leaf(
+                        Expr::Literal(ExprLiteral::Ident(path.remove(0))),
+                        range,
+                    ))
                 } else {
-                    Ok(Expr::Path(path))
+                    Ok(Spanned::leaf(Expr::Path(path), range))
                 }
             }
-            _ => Err(format!("expected expression in `{}`", self.source.trim())),
+            _ => Err(Self::whole(format!(
+                "expected expression in `{}`",
+                self.source.trim()
+            ))),
         }
     }
 
-    fn try_parse_query(&mut self) -> Result<Option<Expr>, String> {
+    fn try_parse_query(&mut self) -> Result<Option<Spanned>, ExprParseError> {
         let checkpoint = self.pos;
+        let start = self.at();
         let kind = if self.consume_ident("effect") {
             QueryKind::Effect
         } else if matches!(
@@ -25523,16 +26970,21 @@ impl<'a> ExprParser<'a> {
             self.pos = checkpoint;
             return Ok(None);
         }
-        let guard = if self.consume_ident("where") {
-            Some(Box::new(self.parse_or()?))
+        let (guard, guard_spans) = if self.consume_ident("where") {
+            let guard = self.parse_or()?;
+            (Some(Box::new(guard.expr)), vec![guard.spans])
         } else {
-            None
+            (None, Vec::new())
         };
-        Ok(Some(Expr::Query {
-            kind,
-            head: join_query_head(&head),
-            guard,
-        }))
+        Ok(Some(Spanned::new(
+            Expr::Query {
+                kind,
+                head: join_query_head(&head),
+                guard,
+            },
+            self.since(start),
+            guard_spans,
+        )))
     }
 
     fn token_text(&self, token: &ExprToken) -> String {
@@ -25571,11 +27023,11 @@ impl<'a> ExprParser<'a> {
         }
     }
 
-    fn expect_symbol(&mut self, symbol: char) -> Result<(), String> {
+    fn expect_symbol(&mut self, symbol: char) -> Result<(), ExprParseError> {
         if self.consume_symbol(symbol) {
             Ok(())
         } else {
-            Err(format!("expected `{symbol}`"))
+            Err(self.stopped_at(format!("expected `{symbol}`")))
         }
     }
 
@@ -25641,6 +27093,8 @@ fn lex_expr(source: &str) -> Vec<ExprToken> {
             }
             tokens.push(ExprToken {
                 kind: ExprTokenKind::Ident(source[start..index].to_owned()),
+                start,
+                end: index,
             });
             continue;
         }
@@ -25664,16 +27118,24 @@ fn lex_expr(source: &str) -> Vec<ExprToken> {
                     index += 1;
                     tokens.push(ExprToken {
                         kind: ExprTokenKind::Duration(seconds),
+                        start,
+                        end: index,
                     });
                     continue;
                 }
             }
             tokens.push(ExprToken {
                 kind: ExprTokenKind::Number(digits.to_owned()),
+                start,
+                end: index,
             });
             continue;
         }
         if byte == b'"' {
+            // The token is the quoted literal INCLUDING its quotes, so a caret
+            // on a string operand underlines what the author wrote; `start`
+            // below is where the contents begin.
+            let open = index;
             let start = index + 1;
             index += 1;
             while index < bytes.len() && bytes[index] != b'"' {
@@ -25683,6 +27145,8 @@ fn lex_expr(source: &str) -> Vec<ExprToken> {
             index = (index + 1).min(bytes.len());
             tokens.push(ExprToken {
                 kind: ExprTokenKind::String(value),
+                start: open,
+                end: index,
             });
             continue;
         }
@@ -25690,41 +27154,19 @@ fn lex_expr(source: &str) -> Vec<ExprToken> {
         // advances over ASCII bytes, and the fallback below advances by a whole
         // character. Slicing on a byte inside a multi-byte character panicked
         // (a non-ASCII character in a prompt crashed `whip check`).
+        let start = index;
         let rest = &source[index..];
-        if rest.starts_with("&&") {
-            tokens.push(ExprToken {
-                kind: ExprTokenKind::Op("&&"),
-            });
+        if let Some(op) = ["&&", "||", "==", "!=", "<=", ">="]
+            .into_iter()
+            .find(|op| rest.starts_with(op))
+        {
             index += 2;
-        } else if rest.starts_with("||") {
             tokens.push(ExprToken {
-                kind: ExprTokenKind::Op("||"),
+                kind: ExprTokenKind::Op(op),
+                start,
+                end: index,
             });
-            index += 2;
-        } else if rest.starts_with("==") {
-            tokens.push(ExprToken {
-                kind: ExprTokenKind::Op("=="),
-            });
-            index += 2;
-        } else if rest.starts_with("!=") {
-            tokens.push(ExprToken {
-                kind: ExprTokenKind::Op("!="),
-            });
-            index += 2;
-        } else if rest.starts_with("<=") {
-            tokens.push(ExprToken {
-                kind: ExprTokenKind::Op("<="),
-            });
-            index += 2;
-        } else if rest.starts_with(">=") {
-            tokens.push(ExprToken {
-                kind: ExprTokenKind::Op(">="),
-            });
-            index += 2;
         } else {
-            // One character, not one byte: `byte as char` would mangle a
-            // multi-byte character into its lead byte and leave `index` inside
-            // it, which panicked the next slice.
             // One character, not one byte: `byte as char` would mangle a
             // multi-byte character into its lead byte and leave `index` inside
             // it, which panicked the next slice.
@@ -25732,6 +27174,8 @@ fn lex_expr(source: &str) -> Vec<ExprToken> {
             index += symbol.len_utf8();
             tokens.push(ExprToken {
                 kind: ExprTokenKind::Symbol(symbol),
+                start,
+                end: index,
             });
         }
     }
@@ -25763,6 +27207,7 @@ fn validate_primitive_literal(
             code: diagnostic_code!("type.invalid_literal"),
             severity: Severity::Error,
             related: Vec::new(),
+            fixits: Vec::new(),
             span: at.whole(),
             message: format!("field `{record_schema}.{field}` expects `{primitive}`"),
             suggestion: Some(format!("record a value compatible with `{primitive}`")),
@@ -25775,6 +27220,7 @@ fn validate_primitive_literal(
                 code: diagnostic_code!("type.invalid_literal"),
                 severity: Severity::Error,
                 related: Vec::new(),
+                fixits: Vec::new(),
                 span: at.whole(),
                 message: format!("field `{record_schema}.{field}` has invalid duration literal"),
                 suggestion: Some("use an ISO-8601 duration such as `\"PT30M\"`".to_owned()),
@@ -25785,6 +27231,7 @@ fn validate_primitive_literal(
                 code: diagnostic_code!("type.invalid_literal"),
                 severity: Severity::Error,
                 related: Vec::new(),
+                fixits: Vec::new(),
                 span: at.whole(),
                 message: format!("field `{record_schema}.{field}` has invalid time literal"),
                 suggestion: Some(
@@ -25813,6 +27260,7 @@ fn validate_enum_literal(
             code: diagnostic_code!("type.invalid_literal"),
             severity: Severity::Error,
             related: Vec::new(),
+            fixits: Vec::new(),
             span: at.whole(),
             message: format!("field `{record_schema}.{field}` expects enum `{schema}`"),
             suggestion: Some(format!(
@@ -25827,6 +27275,7 @@ fn validate_enum_literal(
             code: diagnostic_code!("type.unknown_enum_variant"),
             severity: Severity::Error,
             related: Vec::new(),
+            fixits: Vec::new(),
             span: at.whole(),
             message: format!("enum `{schema}` has no variant `{variant}`"),
             suggestion: Some(suggest_then(
@@ -25864,6 +27313,7 @@ fn validate_union_literal(
             code: diagnostic_code!("type.invalid_literal"),
             severity: Severity::Error,
             related: Vec::new(),
+            fixits: Vec::new(),
             span: at.whole(),
             message: format!("field `{record_schema}.{field}` expects one of its literal variants"),
             suggestion: Some(format!("use one of: {}", allowed.join(", "))),
@@ -25875,6 +27325,7 @@ fn validate_union_literal(
             code: diagnostic_code!("type.invalid_literal"),
             severity: Severity::Error,
             related: Vec::new(),
+            fixits: Vec::new(),
             span: at.whole(),
             message: format!("field `{record_schema}.{field}` cannot be `{value}`"),
             suggestion: Some(suggest_then(
@@ -25972,6 +27423,7 @@ fn validate_rule_prompt_content_type_annotation(
         code: diagnostic_code!("parse.invalid_content_type"),
         severity: Severity::Error,
         related: Vec::new(),
+        fixits: Vec::new(),
         span: at.whole(),
         message: format!(
             "rule `{}` has malformed multiline prompt content type `{annotation}`",
@@ -25999,6 +27451,7 @@ fn validate_coerce_prompt_content_type_annotations(
             code: diagnostic_code!("parse.invalid_content_type"),
             severity: Severity::Error,
             related: Vec::new(),
+            fixits: Vec::new(),
             span: coerce.body.span,
             message: format!(
                 "coerce `{}` has malformed multiline prompt content type `{annotation}`",

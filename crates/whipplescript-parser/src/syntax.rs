@@ -264,6 +264,7 @@ pub(crate) fn lex(source: &str) -> Lexed {
             code: diagnostic_code!("parse.unexpected_character"),
             severity: Severity::Error,
             related: Vec::new(),
+            fixits: Vec::new(),
             span: SourceSpan {
                 start: index,
                 end: index + 1,
@@ -432,6 +433,7 @@ pub(crate) fn lex_string(source: &str, start: usize) -> (Token, usize, Option<Di
             code: diagnostic_code!("parse.unterminated_string"),
             severity: Severity::Error,
             related: Vec::new(),
+            fixits: Vec::new(),
             span: SourceSpan {
                 start,
                 end: source.len(),
@@ -688,6 +690,7 @@ impl Parser<'_> {
                                 code: diagnostic_code!("construct.cardinality_conflict"),
                                 severity: Severity::Error,
                                 related: Vec::new(),
+                                fixits: Vec::new(),
                                 span: parsed_workflow.decl.name.span,
                                 message: "multiple implicit workflow headers are not supported"
                                     .to_owned(),
@@ -731,7 +734,7 @@ impl Parser<'_> {
                     Some(TokenKind::Ident(word)) => word.clone(),
                     _ => String::new(),
                 };
-                let candidate = crate::closest_keyword(
+                let candidate = crate::closest_keyword_rivals(
                     &written,
                     TOP_LEVEL_DECLARATION_KEYWORDS
                         .iter()
@@ -740,7 +743,9 @@ impl Parser<'_> {
                 );
                 self.unexpected_with(
                     "top-level declaration",
-                    candidate.map(|name| format!("did you mean `{name}`?")),
+                    candidate.map(|(name, rival)| {
+                        crate::fixit::did_you_mean_of(&name, rival.as_deref())
+                    }),
                 );
                 if !self.is_at_end() {
                     self.advance();
@@ -942,6 +947,7 @@ impl Parser<'_> {
                 code: diagnostic_code!("parse.invalid_name"),
                 severity: Severity::Error,
                 related: Vec::new(),
+                fixits: Vec::new(),
                 span,
                 message: "tag is missing a name".to_owned(),
                 suggestion: Some("write a tag such as `@fixture`".to_owned()),
@@ -956,6 +962,7 @@ impl Parser<'_> {
                 code: diagnostic_code!("parse.invalid_name"),
                 severity: Severity::Error,
                 related: Vec::new(),
+                fixits: Vec::new(),
                 span,
                 message: format!("tag `@{name}` contains unsupported characters"),
                 suggestion: Some(
@@ -973,6 +980,7 @@ impl Parser<'_> {
                 code: diagnostic_code!("parse.misplaced_annotation"),
                 severity: Severity::Error,
                 related: Vec::new(),
+                fixits: Vec::new(),
                 span: tag.span,
                 message: format!("tag `@{}` cannot be attached to {target}", tag.name),
                 suggestion: Some(
@@ -991,6 +999,7 @@ impl Parser<'_> {
                 code: diagnostic_code!("parse.misplaced_annotation"),
                 severity: Severity::Error,
                 related: Vec::new(),
+                fixits: Vec::new(),
                 span: previous.span,
                 message: "description is not attached to a declaration".to_owned(),
                 suggestion: Some(
@@ -1022,6 +1031,7 @@ impl Parser<'_> {
                 code: diagnostic_code!("parse.misplaced_annotation"),
                 severity: Severity::Error,
                 related: Vec::new(),
+                fixits: Vec::new(),
                 span: description.span,
                 message: format!("description cannot be attached to {target}"),
                 suggestion: Some(
@@ -1046,6 +1056,7 @@ impl Parser<'_> {
             code: diagnostic_code!("parse.unsupported_syntax"),
             severity: Severity::Error,
             related: Vec::new(),
+            fixits: Vec::new(),
             span,
             message: format!(
                 "Gherkin keyword `{keyword}` is not WhippleScript workflow syntax"
@@ -1123,6 +1134,7 @@ impl Parser<'_> {
                 code: diagnostic_code!("parse.unsupported_syntax"),
                 severity: Severity::Error,
                 related: Vec::new(),
+                fixits: Vec::new(),
                 span,
                 message: "the `flow` declaration was removed".to_owned(),
                 suggestion: Some(
@@ -1319,19 +1331,25 @@ impl Parser<'_> {
                 // The clause HEADS of the declaration block being parsed, which
                 // is one edit's distance from most of what an author gets wrong
                 // in a `lease`/`ledger`/`counter`/`tracker`/`file store` block.
-                let candidate = crate::closest_keyword(
+                let candidate = crate::closest_keyword_rivals(
                     &written,
                     spec.clauses.iter().map(|clause| clause.words.join(" ")),
                 );
                 let suggestion = match (candidate, hint) {
-                    (Some(name), Some(hint)) => Some(format!("did you mean `{name}`? {hint}")),
-                    (Some(name), None) => Some(format!("did you mean `{name}`?")),
+                    (Some((name, rival)), Some(hint)) => Some(format!(
+                        "{} {hint}",
+                        crate::fixit::did_you_mean_of(&name, rival.as_deref())
+                    )),
+                    (Some((name, rival)), None) => {
+                        Some(crate::fixit::did_you_mean_of(&name, rival.as_deref()))
+                    }
                     (None, hint) => hint.map(str::to_owned),
                 };
                 self.diagnostics.push(Diagnostic {
                     code: diagnostic_code!("construct.unknown_clause"),
                     severity: Severity::Error,
                     related: Vec::new(),
+                    fixits: Vec::new(),
                     span: first_word_span,
                     message: format!("unknown {} field `{}`", spec.keyword, written),
                     suggestion,
@@ -1347,6 +1365,7 @@ impl Parser<'_> {
                         code: diagnostic_code!("parse.unexpected_token"),
                         severity: Severity::Error,
                         related: Vec::new(),
+                        fixits: Vec::new(),
                         span: first_word_span,
                         message: format!("expected `{connective}` after `{}`", clause.name),
                         suggestion: Some(format!("write `{} {connective} <field>`", clause.name)),
@@ -1461,6 +1480,7 @@ impl Parser<'_> {
                         code: diagnostic_code!("construct.missing_requirement"),
                         severity: Severity::Error,
                         related: Vec::new(),
+                        fixits: Vec::new(),
                         span,
                         message: format!("credential `{}` must declare its kind", name.name),
                         suggestion: Some(format!(
@@ -1483,6 +1503,7 @@ impl Parser<'_> {
                         code: diagnostic_code!("construct.missing_requirement"),
                         severity: Severity::Error,
                         related: Vec::new(),
+                        fixits: Vec::new(),
                         span,
                         message: format!("vault `{}` must declare its kind", name.name),
                         suggestion: Some(format!(
@@ -1501,6 +1522,7 @@ impl Parser<'_> {
                         code: diagnostic_code!("construct.missing_requirement"),
                         severity: Severity::Error,
                         related: Vec::new(),
+                        fixits: Vec::new(),
                         span,
                         message: format!(
                             "vault `{}` must declare the operations it allows",
@@ -1530,6 +1552,7 @@ impl Parser<'_> {
                         code: diagnostic_code!("construct.missing_requirement"),
                         severity: Severity::Error,
                         related: Vec::new(),
+                        fixits: Vec::new(),
                         span,
                         message: format!("stream `{}` must declare its members", name.name),
                         suggestion: Some(
@@ -1561,6 +1584,7 @@ impl Parser<'_> {
                             code: diagnostic_code!("construct.unknown_option"),
                             severity: Severity::Error,
                             related: Vec::new(),
+                            fixits: Vec::new(),
                             span: period.span,
                             message: format!("unknown reset period `{}`", period.name),
                             suggestion: Some(crate::suggest_then_keyword(
@@ -1578,6 +1602,7 @@ impl Parser<'_> {
                         code: diagnostic_code!("construct.missing_requirement"),
                         severity: Severity::Error,
                         related: Vec::new(),
+                        fixits: Vec::new(),
                         span,
                         message: format!(
                             "counter `{}` must declare `key`, `cap`, and `reset`",
@@ -1609,6 +1634,7 @@ impl Parser<'_> {
                         code: diagnostic_code!("construct.missing_requirement"),
                         severity: Severity::Error,
                         related: Vec::new(),
+                        fixits: Vec::new(),
                         span,
                         message: format!(
                             "lease `{}` must declare a `key` type and a `ttl` backstop",
@@ -1642,6 +1668,7 @@ impl Parser<'_> {
                         code: diagnostic_code!("construct.missing_requirement"),
                         severity: Severity::Error,
                         related: Vec::new(),
+                        fixits: Vec::new(),
                         span,
                         message: format!(
                             "ledger `{}` must declare `entry`, `partition by`, and `retain`",
@@ -1676,6 +1703,7 @@ impl Parser<'_> {
                         code: diagnostic_code!("construct.missing_requirement"),
                         severity: Severity::Error,
                         related: Vec::new(),
+                        fixits: Vec::new(),
                         span,
                         message: format!("file store `{}` is missing a root", name.name),
                         suggestion: Some(
@@ -1854,6 +1882,7 @@ impl Parser<'_> {
                     code: diagnostic_code!("parse.invalid_measure"),
                     severity: Severity::Error,
                     related: Vec::new(),
+                    fixits: Vec::new(),
                     span: direction.span,
                     message: format!("`measure` takes `up to` or `down to`, not `{other} to`"),
                     suggestion: Some(
@@ -1875,6 +1904,7 @@ impl Parser<'_> {
                     code: diagnostic_code!("parse.invalid_measure"),
                     severity: Severity::Error,
                         related: Vec::new(),
+                        fixits: Vec::new(),
                         span: keyword.span,
                         message: format!("`measure` bound `{literal}` is not a whole number"),
                         suggestion: Some(
@@ -1894,6 +1924,7 @@ impl Parser<'_> {
                     code: diagnostic_code!("parse.invalid_measure"),
                     severity: Severity::Error,
                     related: Vec::new(),
+                    fixits: Vec::new(),
                     span: bound_class.span,
                     message: format!(
                         "`measure` bound names class `{}`, but the measured field is on `{}`",
@@ -2018,6 +2049,7 @@ impl Parser<'_> {
                 code: diagnostic_code!("parse.unsupported_syntax"),
                 severity: Severity::Error,
                 related: Vec::new(),
+                fixits: Vec::new(),
                 span: removed_kind.span,
                 message: format!("`use {removed_label}` is no longer supported"),
                 suggestion: Some(
@@ -2043,6 +2075,7 @@ impl Parser<'_> {
                     code: diagnostic_code!("type.invalid_literal"),
                     severity: Severity::Error,
                     related: Vec::new(),
+                    fixits: Vec::new(),
                     span: span.join(unit.span),
                     message: format!("invalid duration `{value}{}`", unit.name),
                     suggestion: Some("use `<n><unit>` with unit s, m, h, or d".to_owned()),
@@ -2236,6 +2269,7 @@ impl Parser<'_> {
                         code: diagnostic_code!("parse.unexpected_token"),
                         severity: Severity::Error,
                         related: Vec::new(),
+                        fixits: Vec::new(),
                         span: variant.span,
                         message: format!(
                             "enum `{}` declares variant `{}` on the same line as the previous variant",
@@ -2319,6 +2353,7 @@ impl Parser<'_> {
                 code: diagnostic_code!("parse.invalid_name"),
                 severity: Severity::Error,
                 related: Vec::new(),
+                fixits: Vec::new(),
                 span: name_span,
                 message: format!("signal name `{name}` must be dotted lowercase"),
                 suggestion: Some(
@@ -2448,6 +2483,7 @@ impl Parser<'_> {
             code: diagnostic_code!("parse.unexpected_token"),
             severity: Severity::Error,
             related: Vec::new(),
+            fixits: Vec::new(),
             span: SourceSpan {
                 start: gap_start,
                 end: gap_end.max(gap_start),
@@ -2507,6 +2543,7 @@ impl Parser<'_> {
                 code: diagnostic_code!("construct.missing_requirement"),
                 severity: Severity::Error,
                 related: Vec::new(),
+                fixits: Vec::new(),
                 span,
                 message: format!("region `{}` must declare its selection", name.name),
                 suggestion: Some(
@@ -2577,6 +2614,7 @@ impl Parser<'_> {
                         code: diagnostic_code!("construct.unknown_clause"),
                         severity: Severity::Error,
                         related: Vec::new(),
+                        fixits: Vec::new(),
                         span: keyword.span,
                         message: "unknown judge form".to_owned(),
                         suggestion: Some(crate::suggest_then_keyword(
@@ -2600,6 +2638,7 @@ impl Parser<'_> {
                         code: diagnostic_code!("construct.cardinality_conflict"),
                         severity: Severity::Error,
                         related: Vec::new(),
+                        fixits: Vec::new(),
                         span: keyword.span,
                         message: "gauge declares more than one judge".to_owned(),
                         suggestion: Some("a gauge has exactly one judge".to_owned()),
@@ -2637,6 +2676,7 @@ impl Parser<'_> {
                             code: diagnostic_code!("construct.unknown_option"),
                             severity: Severity::Error,
                             related: Vec::new(),
+                            fixits: Vec::new(),
                             span: subject_ident.span,
                             message: format!("unknown bar statistic `{stat}`"),
                             // `mean` is the whole closed half of the vocabulary;
@@ -2669,6 +2709,7 @@ impl Parser<'_> {
                         code: diagnostic_code!("construct.cardinality_conflict"),
                         severity: Severity::Error,
                         related: Vec::new(),
+                        fixits: Vec::new(),
                         span: keyword.span,
                         message: "gauge declares more than one bar".to_owned(),
                         suggestion: Some("a gauge has at most one `expect` bar".to_owned()),
@@ -2702,6 +2743,7 @@ impl Parser<'_> {
                     code: diagnostic_code!("construct.unknown_clause"),
                     severity: Severity::Error,
                     related: Vec::new(),
+                    fixits: Vec::new(),
                     span,
                     message: "unknown gauge clause".to_owned(),
                     suggestion: Some(crate::suggest_then_keyword(
@@ -2722,6 +2764,7 @@ impl Parser<'_> {
                 code: diagnostic_code!("construct.missing_requirement"),
                 severity: Severity::Error,
                 related: Vec::new(),
+                fixits: Vec::new(),
                 span: name.span,
                 message: format!("gauge `{}` declares no judge", name.name),
                 suggestion: Some(
@@ -2846,6 +2889,7 @@ impl Parser<'_> {
                     code: diagnostic_code!("construct.unknown_clause"),
                     severity: Severity::Error,
                     related: Vec::new(),
+                    fixits: Vec::new(),
                     span,
                     message: "unknown campaign clause".to_owned(),
                     // Same shape as the gauge clause above: the message does not
@@ -2872,6 +2916,7 @@ impl Parser<'_> {
                 code: diagnostic_code!("construct.missing_requirement"),
                 severity: Severity::Error,
                 related: Vec::new(),
+                fixits: Vec::new(),
                 span: name.span,
                 message: format!("campaign `{}` names nothing to improve", name.name),
                 suggestion: Some("add an `ascend` or `reach` clause".to_owned()),
@@ -2967,6 +3012,7 @@ impl Parser<'_> {
                                 code: diagnostic_code!("construct.cardinality_conflict"),
                                 severity: Severity::Error,
                                 related: Vec::new(),
+                                fixits: Vec::new(),
                                 span: name.span,
                                 message: "a test scenario binds at most one `workflow`".to_owned(),
                                 suggestion: Some(
@@ -3130,6 +3176,7 @@ impl Parser<'_> {
                 code: diagnostic_code!("construct.missing_requirement"),
                 severity: Severity::Error,
                 related: Vec::new(),
+                fixits: Vec::new(),
                 span: SourceSpan {
                     start,
                     end: self.last_span_end(),
@@ -3386,6 +3433,7 @@ impl Parser<'_> {
                     code: diagnostic_code!("construct.missing_requirement"),
                     severity: Severity::Error,
                     related: Vec::new(),
+                    fixits: Vec::new(),
                     span,
                     message: format!("source `{}` must declare `observe as <binding>`", name.name),
                     suggestion: Some("add `observe as tick`".to_owned()),
@@ -3400,6 +3448,7 @@ impl Parser<'_> {
                     code: diagnostic_code!("construct.missing_requirement"),
                     severity: Severity::Error,
                     related: Vec::new(),
+                    fixits: Vec::new(),
                     span,
                     message: format!(
                         "source `{}` must declare `emit <signal> {{ ... }}`",
@@ -3419,6 +3468,7 @@ impl Parser<'_> {
                         code: diagnostic_code!("construct.missing_requirement"),
                         severity: Severity::Error,
                         related: Vec::new(),
+                        fixits: Vec::new(),
                         span,
                         message: format!("clock source `{}` must declare a recurrence", name.name),
                         suggestion: Some(
@@ -3440,6 +3490,7 @@ impl Parser<'_> {
                     code: diagnostic_code!("construct.incompatible_clause"),
                     severity: Severity::Error,
                     related: Vec::new(),
+                    fixits: Vec::new(),
                     span,
                     message: format!(
                         "source `{}` uses clock-only clauses but its provider is `{}`, not `clock`",
@@ -3486,6 +3537,7 @@ impl Parser<'_> {
         let mode_token = self.expect_ident("auth mode (`hmac`, `bearer` or `shared`)")?;
         let Some(mode) = SourceAuthMode::parse(&mode_token.name) else {
             self.diagnostics.push(Diagnostic {
+                fixits: Vec::new(),
                 code: diagnostic_code!("construct.invalid_clause_value"),
                 severity: Severity::Error,
                 related: Vec::new(),
@@ -3502,6 +3554,7 @@ impl Parser<'_> {
         if matches!(self.peek().map(|t| &t.kind), Some(TokenKind::String(_))) {
             let span = self.peek().map(|t| t.span).unwrap_or(mode_token.span);
             self.diagnostics.push(Diagnostic {
+                fixits: Vec::new(),
                 code: diagnostic_code!("construct.invalid_clause_value"),
                 severity: Severity::Error,
                 related: Vec::new(),
@@ -3552,6 +3605,7 @@ impl Parser<'_> {
                         code: diagnostic_code!("construct.unknown_option"),
                         severity: Severity::Error,
                         related: Vec::new(),
+                        fixits: Vec::new(),
                         span: unit.span,
                         message: format!("unknown duration unit `{other}`"),
                         // Every unit is one character, so the length ceiling
@@ -3591,6 +3645,7 @@ impl Parser<'_> {
                     code: diagnostic_code!("construct.unknown_option"),
                     severity: Severity::Error,
                     related: Vec::new(),
+                    fixits: Vec::new(),
                     span: pattern_ident.span,
                     message: format!("unknown calendar pattern `{other}`"),
                     suggestion: Some(crate::suggest_then_keyword(
@@ -3623,6 +3678,7 @@ impl Parser<'_> {
                 code: diagnostic_code!("type.invalid_literal"),
                 severity: Severity::Error,
                 related: Vec::new(),
+                fixits: Vec::new(),
                 span: hour_span.join(minute_span),
                 message: format!("invalid time of day `{hour:02}:{minute:02}`"),
                 suggestion: Some("use a 24-hour `hh:mm` such as `09:00`".to_owned()),
@@ -3785,6 +3841,7 @@ impl Parser<'_> {
                             code: diagnostic_code!("construct.unknown_clause"),
                             severity: Severity::Error,
                             related: Vec::new(),
+                            fixits: Vec::new(),
                             span: tag.span,
                             message: format!("unknown field tag `@{}`", tag.name),
                             suggestion: Some(crate::suggest_then_keyword(
@@ -3895,6 +3952,7 @@ impl Parser<'_> {
                 code: diagnostic_code!("parse.unclosed_delimiter"),
                 severity: Severity::Error,
                 related: Vec::new(),
+                fixits: Vec::new(),
                 span: SourceSpan {
                     start: open.span.start,
                     end: body_end,
@@ -3918,11 +3976,7 @@ impl Parser<'_> {
             end: close_end,
         };
         Some(TableRow {
-            body: BlockSource {
-                text,
-                span: outer,
-                origin: BodyOrigin::Source(text_span.start),
-            },
+            body: BlockSource::from_file(text, text_span.start, outer),
             span: outer,
         })
     }
@@ -3946,13 +4000,9 @@ impl Parser<'_> {
                         end: token.span.end,
                     })
                     .to_owned();
-                let body = BlockSource {
-                    text: format!("prompt {raw}"),
-                    // Synthesized sugar: `prompt ` is not in the file, so no
-                    // offset into this text is a source position.
-                    origin: BodyOrigin::Generated,
-                    span: token.span,
-                };
+                // Synthesized sugar: `prompt ` is not in the file, so no
+                // offset into this text is a source position.
+                let body = BlockSource::generated(format!("prompt {raw}"), token.span);
                 let span = SourceSpan {
                     start,
                     end: body.span.end,
@@ -4066,6 +4116,7 @@ impl Parser<'_> {
                     code: diagnostic_code!("construct.unknown_clause"),
                     severity: Severity::Error,
                     related: Vec::new(),
+                    fixits: Vec::new(),
                     span,
                     message: "`with` is not a rule readiness clause".to_owned(),
                     suggestion: Some("use `when` for rule conditions".to_owned()),
@@ -4130,7 +4181,7 @@ impl Parser<'_> {
         Some(AssertDecl {
             tags,
             description,
-            expr,
+            expr: SourceText::from_file(expr, span.start),
             span,
         })
     }
@@ -4160,7 +4211,10 @@ impl Parser<'_> {
             end: text_end,
         };
         let (text, span) = trimmed_source_text(self.source_text(span), span);
-        Some(WhenClause { text, span })
+        Some(WhenClause {
+            text: SourceText::from_file(text, span.start),
+            span,
+        })
     }
 
     /// The file-level lexer steps over expression operators (`==`, `!=`,
@@ -4232,6 +4286,7 @@ impl Parser<'_> {
                 code: diagnostic_code!("parse.unclosed_delimiter"),
                 severity: Severity::Error,
                 related: Vec::new(),
+                fixits: Vec::new(),
                 span: SourceSpan {
                     start: when.start,
                     end: body_end,
@@ -4260,7 +4315,10 @@ impl Parser<'_> {
                 continue;
             }
             clauses.push(WhenClause {
-                text: self.source[trimmed_start..trimmed_end].to_owned(),
+                text: SourceText::from_file(
+                    self.source[trimmed_start..trimmed_end].to_owned(),
+                    trimmed_start,
+                ),
                 span: SourceSpan {
                     start: trimmed_start,
                     end: trimmed_end,
@@ -4273,6 +4331,7 @@ impl Parser<'_> {
                 code: diagnostic_code!("construct.missing_requirement"),
                 severity: Severity::Error,
                 related: Vec::new(),
+                fixits: Vec::new(),
                 span: SourceSpan {
                     start: when.start,
                     end: close_end,
@@ -4311,14 +4370,14 @@ impl Parser<'_> {
                         };
                         let (text, text_span) =
                             trimmed_source_text(self.source_text(content), content);
-                        return Some(BlockSource {
+                        return Some(BlockSource::from_file(
                             text,
-                            span: SourceSpan {
+                            text_span.start,
+                            SourceSpan {
                                 start: open.span.start,
                                 end: token.span.end,
                             },
-                            origin: BodyOrigin::Source(text_span.start),
-                        });
+                        ));
                     }
                     body_end = token.span.end;
                 }
@@ -4332,6 +4391,7 @@ impl Parser<'_> {
             code: diagnostic_code!("parse.unclosed_delimiter"),
             severity: Severity::Error,
             related: Vec::new(),
+            fixits: Vec::new(),
             span: SourceSpan {
                 start: open.span.start,
                 end: body_end,
@@ -4344,14 +4404,14 @@ impl Parser<'_> {
             end: body_end,
         };
         let (text, text_span) = trimmed_source_text(self.source_text(content), content);
-        Some(BlockSource {
+        Some(BlockSource::from_file(
             text,
-            span: SourceSpan {
+            text_span.start,
+            SourceSpan {
                 start: open.span.start,
                 end: body_end,
             },
-            origin: BodyOrigin::Source(text_span.start),
-        })
+        ))
     }
 
     fn parse_type(&mut self) -> Option<TypeSyntax> {
@@ -4665,6 +4725,7 @@ impl Parser<'_> {
                         code: diagnostic_code!("type.invalid_literal"),
                         severity: Severity::Error,
                         related: Vec::new(),
+                        fixits: Vec::new(),
                         span,
                         message: format!("{label} must fit in u32"),
                         suggestion: Some("use a non-negative integer such as `1`".to_owned()),
@@ -4763,6 +4824,7 @@ impl Parser<'_> {
             code: diagnostic_code!("parse.unexpected_token"),
             severity: Severity::Error,
             related: Vec::new(),
+            fixits: Vec::new(),
             span,
             message: format!("expected {expected}, found {found}"),
             suggestion: suggestion_for_expected(&expected),
@@ -4910,6 +4972,7 @@ impl Parser<'_> {
             code: diagnostic_code!("parse.unexpected_token"),
             severity: Severity::Error,
             related: Vec::new(),
+            fixits: Vec::new(),
             span,
             message: format!("expected {expected}, found {found}"),
             suggestion: suggestion.or_else(|| suggestion_for_expected(&expected)),

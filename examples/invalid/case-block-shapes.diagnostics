@@ -1,0 +1,38 @@
+error[expr.duplicate_case_pattern]: rule `the_block_opens_below_the_head` has duplicate unguarded case pattern `open`
+   --> examples/invalid/case-block-shapes.whip:62:5
+   |
+62 |     "open" => {
+   |     ^^^^^^
+   = note: `open` is already matched here (examples/invalid/case-block-shapes.whip:59:5)
+   = help: remove the duplicate branch or add mutually exclusive `where` guards
+error[expr.non_exhaustive_case]: rule `the_block_opens_below_the_head` has non-exhaustive case; missing triaged, done
+   --> examples/invalid/case-block-shapes.whip:56:4
+   |
+56 | => {
+   |    ^
+   = help: add branches for every value or add `_ => { ... }`
+error[type.unknown_field]: rule `an_arm_written_on_one_line` has invalid field path `x.nosuchfield`: schema `Verdict.Rejected` has no field `nosuchfield`
+   --> examples/invalid/case-block-shapes.whip:77:49
+   |
+77 |     Rejected as x => { complete result { note x.nosuchfield } }
+   |                                                 ^^^^^^^^^^^
+   = note: `Verdict.Rejected` is declared here (examples/invalid/case-block-shapes.whip:28:3)
+   = help: use a field declared on the bound schema or add it to the class declaration
+error[expr.non_exhaustive_case]: rule `a_terminal_arm_written_on_one_line` has non-exhaustive terminal-output case; missing Failed
+   --> examples/invalid/case-block-shapes.whip:86:1
+   |
+86 | {
+   | ^
+   = help: add terminal branches for every value or add `_ => { ... }`
+error[type.unknown_field]: rule `a_terminal_arm_written_on_one_line` has invalid expression path `failure.nosuchfield`: schema `TerminalFailed` has no field `nosuchfield`
+   --> examples/invalid/case-block-shapes.whip:92:31
+   |
+92 |       Failed as failure where failure.nosuchfield == "y" => {
+   |                               ^^^^^^^^^^^^^^^^^^^
+   = help: use a field declared on the bound schema
+error[type.unknown_field]: rule `a_terminal_arm_written_on_one_line` has invalid field path `failure.nosuchfield`: schema `TerminalFailed` has no field `nosuchfield`
+   --> examples/invalid/case-block-shapes.whip:92:39
+   |
+92 |       Failed as failure where failure.nosuchfield == "y" => {
+   |                                       ^^^^^^^^^^^
+   = help: use a field declared on the bound schema or add it to the class declaration

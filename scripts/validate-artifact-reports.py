@@ -13,6 +13,8 @@ from types import ModuleType
 from typing import Any
 
 from artifact_admission import (
+    ir_identity_hash,
+    ir_identity_projection,
     is_sha256_digest,
     load_platform_construct_catalog,
     validate_contract_registry_shape,
@@ -124,12 +126,6 @@ def diagnostic_error_codes(artifact: dict[str, Any]) -> list[str]:
     return codes
 
 
-def stable_hash_hex(value: str) -> str:
-    # Mirrors the Rust `stable_hash_hex`: SHA-256 truncated to 128 bits (the
-    # FNV-collision hardening swap). Extend BOTH mirrors together.
-    return hashlib.sha256(value.encode("utf-8")).hexdigest()[:32]
-
-
 def canonical_json(value: Any) -> str:
     return json.dumps(value, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
 
@@ -144,10 +140,14 @@ def validate_report_identity(label: str, entry: dict[str, Any]) -> None:
         fail(f"{label}.ir_hash must be a 32-character lowercase hex digest")
     if not isinstance(source_hash, str) or not is_stable_digest(source_hash):
         fail(f"{label}.source_hash must be a 32-character lowercase hex digest")
-    expected_ir_hash = stable_hash_hex(snapshot)
+    # DR-0095: `ir_hash` is the hash of the snapshot's IDENTITY projection —
+    # the same document with its source offsets erased — so a compiler change
+    # that only improves a diagnostic span leaves a program's identity alone.
+    # Offsets only: `body_hash` stays, so this is not whitespace-insensitive.
+    expected_ir_hash = ir_identity_hash(snapshot)
     if ir_hash != expected_ir_hash:
         fail(
-            f"{label}.ir_hash must match embedded snapshot hash: "
+            f"{label}.ir_hash must match the embedded snapshot's identity hash: "
             f"got {ir_hash!r}, expected {expected_ir_hash!r}"
         )
 
@@ -229,13 +229,16 @@ def validate_artifact_identity(
     if isinstance(lowered, dict):
         lowered_graph_id = lowered.get("graph_id")
         accepted_program_digest = lowered.get("accepted_program_digest")
+        # DR-0095: over the snapshot's IDENTITY PROJECTION, matching the
+        # producer — the accepted program a lowering report names is the
+        # lowered program, not the byte positions that expressed it.
         expected_program_digest = hashlib.sha256(
-            f"{lowered_graph_id}\n{entry['snapshot']}".encode("utf-8")
+            f"{lowered_graph_id}\n{ir_identity_projection(entry['snapshot'])}".encode("utf-8")
         ).hexdigest()
         if accepted_program_digest != expected_program_digest:
             fail(
                 f"{label} lowered_ir_report.accepted_program_digest does not match "
-                "graph_id + snapshot"
+                "graph_id + the snapshot's identity projection"
             )
 
 

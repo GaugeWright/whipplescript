@@ -1,4 +1,5 @@
-//! Reading an `.ir` snapshot back into structure.
+//! Reading an `.ir` snapshot back into structure, and projecting one down to
+//! the bytes a program's identity is computed over.
 //!
 //! [`IrProgram::to_snapshot`](crate::IrProgram::to_snapshot) writes this format;
 //! this module reads it. The two directions live in one crate on purpose. The
@@ -12,7 +13,12 @@
 //! those effects, and the rule-to-rule edges. Schemas, agents, coercions and
 //! spans are in the snapshot and are not parsed here, because nothing reads them
 //! yet and a parser for a field no caller wants is a field that goes wrong
-//! quietly.
+//! quietly. Offsets are also what [`identity_projection`] erases: the durable
+//! document a version stores under its `ir_hash` is the projection, so a reader
+//! here sees `span=-` where a freshly compiled snapshot carries a byte range.
+//! Only the offsets go. A rule's `body_hash` is a digest of the body's raw
+//! source text and stays in the projection, so the identity a projection hashes
+//! is position-free but not whitespace-free (DR-0095).
 //!
 //! The parser is deliberately total: an unrecognized line is skipped rather than
 //! refused. A snapshot is written by a compiler that may be NEWER than the
@@ -20,6 +26,7 @@
 //! reader that failed on an unknown section would turn a supported condition
 //! into an error, which is the same mistake G1's first draft made.
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 
 /// One effect a rule lowers, as the snapshot records it.
@@ -191,9 +198,454 @@ pub fn parse(snapshot: &str) -> SnapshotView {
     view
 }
 
+/// The bytes a program version's identity — `ir_hash` — is computed over.
+///
+/// DR-0095: a source span is *where* something was written, not *what it
+/// means*, so it stays in the snapshot (a runtime event is attributed back to
+/// source through it, and `examples/*.ir` is a debugging surface) and is erased
+/// here. `ir_hash` is `stable_hash_hex(identity_projection(snapshot))`, so a
+/// compiler change that only improves a diagnostic span rotates nothing, and
+/// `ir_hash` holds under formatting changes outside a rule body.
+///
+/// Not what it means, and the record says so too: a reformat still mints a
+/// program version through `source_hash`, which hashes the source TEXT, and a
+/// rule's `body_hash` — which IS in this snapshot — is a digest of the body's
+/// raw text, so whitespace inside a rule body still moves the identity.
+/// Deliberately: inside a `"""` prompt, indentation is prose a model reads.
+///
+/// The projection is deliberately TEXTUAL rather than a second rendering of
+/// `IrProgram`. Every checker that verifies a report's `ir_hash` holds only the
+/// report's `snapshot` string — never the program — so a projection they cannot
+/// compute from that string would end the "`ir_hash` matches the embedded
+/// snapshot" invariant instead of restating it. Mirrored in
+/// `scripts/artifact_admission.py::ir_identity_projection`; extend both
+/// together.
+///
+/// Three markers carry an offset pair, under two conventions. Every span field
+/// renders as a trailing `span=<start>..<end>`; a pattern application's
+/// `defined-at`/`applied-at` lines predate that convention and are named
+/// explicitly. The two word-shaped markers are matched only at the START of a
+/// trimmed line — see `erase_trailing_offsets` for the collision that anchoring
+/// prevents. Nothing else is touched: an offset pair that is not at the end of
+/// its line under a known marker is left alone rather than guessed at.
+///
+/// A span field added later is therefore erased only if it keeps the trailing
+/// spelling. That is a convention, not a guarantee, so it is gated rather than
+/// asserted: `no_offset_pair_survives_the_projection_anywhere_in_the_corpus`
+/// scans every projection the repository can produce for a surviving
+/// `<digits>..<digits>` and names the line that carries one.
+pub fn identity_projection(snapshot: &str) -> String {
+    snapshot
+        .split('\n')
+        .map(erase_trailing_offsets)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// `ir_hash`: the identity of the lowered program.
+pub fn identity_hash(snapshot: &str) -> String {
+    crate::stable_hash(&identity_projection(snapshot))
+}
+
+/// The offset-bearing spellings, each replaced by `-` — the snapshot's own
+/// spelling for a field with nothing in it.
+const OFFSET_MARKERS: [&str; 3] = ["span=", "defined-at ", "applied-at "];
+
+fn erase_trailing_offsets(line: &str) -> Cow<'_, str> {
+    // The two word-shaped markers are ANCHORED to the start of the trimmed
+    // line, because that is the only place the snapshot ever renders them:
+    // `    defined-at 671..1125`. Matching them anywhere in the line — which
+    // this did — lets AUTHOR-CONTROLLED text wear the marker's clothes. A
+    // pattern argument is trimmed source (`arg note applied-at 1..2`), so two
+    // programs differing only in that value were erased to one line and ALIASED
+    // to a single `ir_hash`: distinct programs sharing an identity, and a
+    // durable `.ir` blob under that hash describing neither. That is the
+    // failure direction this projection must never have — a rotation costs a
+    // re-attestation, a collision costs correctness.
+    //
+    // `span=` keeps its unanchored search: it is a key=value field that appears
+    // mid-line by construction (`... guard=- body_hash=… span=671..1125`), and
+    // the `=` makes it unspellable as a bare identifier value.
+    let trimmed_start = line.len() - line.trim_start().len();
+    for marker in OFFSET_MARKERS {
+        let anchored = marker.ends_with(' ');
+        let index = if anchored {
+            if line[trimmed_start..].starts_with(marker) {
+                Some(trimmed_start)
+            } else {
+                None
+            }
+        } else {
+            line.rfind(marker)
+        };
+        let Some(index) = index else {
+            continue;
+        };
+        let rest = &line[index + marker.len()..];
+        let Some((start, end)) = rest.split_once("..") else {
+            continue;
+        };
+        if start.is_empty()
+            || end.is_empty()
+            || !start.bytes().all(|byte| byte.is_ascii_digit())
+            || !end.bytes().all(|byte| byte.is_ascii_digit())
+        {
+            continue;
+        }
+        return Cow::Owned(format!("{}-", &line[..index + marker.len()]));
+    }
+    Cow::Borrowed(line)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The corpus below has to reach every offset-bearing spelling, or the
+    /// equality test passes on programs that never carried one.
+    const IDENTITY_CORPUS: [(&str, &str); 4] = [
+        (
+            "terminal-output-union",
+            include_str!("../../../examples/terminal-output-union.whip"),
+        ),
+        (
+            "expression-kernel",
+            include_str!("../../../examples/expression-kernel.whip"),
+        ),
+        (
+            "autoresearch-lite",
+            include_str!("../../../examples/autoresearch-lite.whip"),
+        ),
+        (
+            "reusable-review-pattern",
+            include_str!("../../../examples/reusable-review-pattern.whip"),
+        ),
+    ];
+
+    fn snapshot_of(name: &str, source: &str) -> String {
+        let compiled = crate::compile_program(source);
+        compiled
+            .ir
+            .unwrap_or_else(|| panic!("{name} compiles: {:?}", compiled.diagnostics))
+            .to_snapshot()
+    }
+
+    /// DR-0095. A source span is where something was written, not what it
+    /// means, so shifting every byte offset in a program must leave `ir_hash`
+    /// alone. This FAILS on the compiler before that record: identity was
+    /// `stable_hash_hex(snapshot)` and the snapshot renders absolute offsets,
+    /// so one blank line above a rule minted a new program version.
+    ///
+    /// The perturbation is deliberately OUTSIDE every rule body. A rule's
+    /// `body_hash` is a digest of its body TEXT — whitespace included, because
+    /// a `"""` prompt's indentation is prose a model reads — so a body edit is
+    /// a text change and is expected to move identity. What this pins is that
+    /// a program's *position* does not.
+    #[test]
+    fn shifting_every_byte_offset_leaves_a_programs_identity_alone() {
+        let mut spellings_seen = (false, false, false);
+
+        for (name, source) in IDENTITY_CORPUS {
+            let shifted = format!("# a comment that shifts every offset below it\n\n{source}");
+
+            let original = snapshot_of(name, source);
+            let moved = snapshot_of(name, &shifted);
+
+            spellings_seen.0 |= original.contains(" span=");
+            spellings_seen.1 |= original.contains("defined-at ");
+            spellings_seen.2 |= original.contains("applied-at ");
+
+            assert_ne!(
+                original, moved,
+                "{name}: the perturbation moved no offset, so this proves nothing"
+            );
+            assert_eq!(
+                identity_hash(&original),
+                identity_hash(&moved),
+                "{name}: a source position re-entered the identity hash"
+            );
+            assert!(
+                original.contains(" span=") || original.contains("defined-at "),
+                "{name} carries no offset at all and does not belong in this corpus"
+            );
+        }
+
+        assert_eq!(
+            spellings_seen,
+            (true, true, true),
+            "the corpus stopped covering one of the offset spellings \
+             (span= / defined-at / applied-at)"
+        );
+    }
+
+    /// The spans leave the identity hash; they stay in the snapshot, which is
+    /// how a runtime event is attributed back to source and what the
+    /// `examples/*.ir` goldens are read for.
+    #[test]
+    fn the_snapshot_still_carries_the_spans_the_identity_drops() {
+        let snapshot = snapshot_of("terminal-output-union", IDENTITY_CORPUS[0].1);
+        assert!(
+            snapshot.contains(" span=575..594"),
+            "the snapshot lost its offsets: {snapshot}"
+        );
+        assert!(
+            identity_projection(&snapshot).contains(" span=-"),
+            "the projection kept an offset"
+        );
+        assert!(
+            !identity_projection(&snapshot).contains("575..594"),
+            "the projection kept an offset"
+        );
+    }
+
+    /// The converse, and the reason the test above is not satisfied by hashing
+    /// a constant: erasing offsets must erase NOTHING ELSE. Each pair below
+    /// differs in meaning while sharing most of its text.
+    #[test]
+    fn a_difference_in_meaning_still_moves_a_programs_identity() {
+        let base = IDENTITY_CORPUS[0].1;
+        let baseline = identity_hash(&snapshot_of("baseline", base));
+
+        for (what, changed) in [
+            // A literal one arm records — same shape, same offsets, different
+            // program.
+            (
+                "a changed literal",
+                base.replace("\"completed\"", "\"done\""),
+            ),
+            // A renamed binding: the arm's `binding=` field moves, and so does
+            // the body that reads it.
+            (
+                "a renamed binding",
+                base.replace("as result", "as outcome")
+                    .replace("result.summary", "outcome.summary"),
+            ),
+            // A renamed schema: the recorded fact is a different fact.
+            (
+                "a renamed schema",
+                base.replace("TerminalRoute", "RouteRecord"),
+            ),
+            // One arm's body, rewritten in place: same arm, same offsets, a
+            // different field recorded. This is what `body_hash` is for.
+            (
+                "a rewritten case arm",
+                base.replace("detail cancel.summary", "detail cancel.effect_id"),
+            ),
+        ] {
+            assert_ne!(changed, base, "{what}: the edit did not apply");
+            assert_ne!(
+                identity_hash(&snapshot_of(what, &changed)),
+                baseline,
+                "{what} left the program's identity unmoved"
+            );
+        }
+    }
+
+    /// Author-controlled text may WEAR a marker's spelling, and must survive.
+    ///
+    /// A pattern argument renders trimmed source (`arg note applied-at 1..2`),
+    /// so an unanchored search for `applied-at ` erased the argument's VALUE and
+    /// aliased two distinct programs onto one `ir_hash` — distinct programs
+    /// sharing an identity, with a durable `.ir` blob under that hash describing
+    /// neither. No corpus program emits an `arg` line, which is why the
+    /// projection's own corpus scan could not see it: that test asks whether an
+    /// offset SURVIVES, and this failure is the opposite direction.
+    #[test]
+    fn author_text_wearing_a_marker_is_not_erased() {
+        // The real spellings sit at the start of their trimmed line; these do not.
+        for line in [
+            "    arg note applied-at 1..2",
+            "    arg note defined-at 1..2",
+            "    row label span=1..2 applied-at 3..4",
+        ] {
+            assert_eq!(
+                identity_projection(line),
+                line,
+                "author text was erased as if it were a source position: {line}"
+            );
+        }
+        // ...and the real ones still are, so this does not pass by erasing nothing.
+        assert_eq!(
+            identity_projection("    applied-at 1..2"),
+            "    applied-at -"
+        );
+    }
+
+    /// The projection is conservative on purpose: it erases an offset pair that
+    /// ENDS its line under a known spelling, and leaves everything else alone.
+    #[test]
+    fn the_projection_erases_offsets_and_nothing_else() {
+        assert_eq!(
+            identity_projection("      case c Failed binding=f guard=- body_hash=ab span=1..2\n"),
+            "      case c Failed binding=f guard=- body_hash=ab span=-\n"
+        );
+        assert_eq!(
+            identity_projection("    defined-at 671..1125\n    applied-at 1127..1195\n"),
+            "    defined-at -\n    applied-at -\n"
+        );
+        // Not an offset pair, and not at the end of its line: left alone.
+        assert_eq!(
+            identity_projection("  x span=1..2 tail\n  y span=a..b\n  z 1..2\n"),
+            "  x span=1..2 tail\n  y span=a..b\n  z 1..2\n"
+        );
+        // Line structure is preserved exactly, trailing newline included.
+        assert_eq!(identity_projection(""), "");
+        assert_eq!(identity_projection("a\n"), "a\n");
+    }
+
+    /// Every `<digits>..<digits>` in `line`, whatever spelling surrounds it.
+    /// Deliberately looser than [`erase_trailing_offsets`]: the point is to
+    /// catch an offset the projection did NOT recognize.
+    fn offset_pairs(line: &str) -> Vec<&str> {
+        let bytes = line.as_bytes();
+        let mut pairs = Vec::new();
+        let mut index = 0;
+        while let Some(found) = line[index..].find("..") {
+            let dots = index + found;
+            let mut left = dots;
+            while left > 0 && bytes[left - 1].is_ascii_digit() {
+                left -= 1;
+            }
+            let mut right = dots + 2;
+            while right < bytes.len() && bytes[right].is_ascii_digit() {
+                right += 1;
+            }
+            if left < dots && right > dots + 2 {
+                pairs.push(&line[left..right]);
+            }
+            index = dots + 2;
+        }
+        pairs
+    }
+
+    /// Every `.ir` golden committed under `examples/`, read at test time so the
+    /// scan below covers the whole corpus rather than the four programs the
+    /// identity tests compile.
+    fn committed_ir_goldens() -> Vec<(String, String)> {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples");
+        let mut goldens: Vec<(String, String)> = std::fs::read_dir(&dir)
+            .unwrap_or_else(|error| panic!("examples/ is readable: {error}"))
+            .map(|entry| entry.expect("directory entry").path())
+            .filter(|path| path.extension().is_some_and(|extension| extension == "ir"))
+            .map(|path| {
+                let name = path
+                    .file_name()
+                    .expect("golden has a name")
+                    .to_string_lossy()
+                    .into_owned();
+                let body = std::fs::read_to_string(&path)
+                    .unwrap_or_else(|error| panic!("{name} is readable: {error}"));
+                (name, body)
+            })
+            .collect();
+        goldens.sort();
+        goldens
+    }
+
+    /// DR-0095 claims a span field added later is excluded from identity "by
+    /// construction". That was an assertion, not a gate: `identity_projection`
+    /// erases an offset pair only where one of three markers puts it at the end
+    /// of its line, so a span rendered any other way would sail straight into
+    /// the identity hash and nothing would say so.
+    ///
+    /// This pins it. Over every projection the repository can produce — the
+    /// four compiled corpus programs and all 25 committed `.ir` goldens — no
+    /// `<digits>..<digits>` may survive. The scan is proved to bite by first
+    /// asserting the UNPROJECTED corpus is full of them, so it cannot pass by
+    /// examining offset-free text.
+    #[test]
+    fn no_offset_pair_survives_the_projection_anywhere_in_the_corpus() {
+        let mut documents: Vec<(String, String)> = IDENTITY_CORPUS
+            .iter()
+            .map(|(name, source)| ((*name).to_owned(), snapshot_of(name, source)))
+            .collect();
+        let goldens = committed_ir_goldens();
+        assert!(
+            goldens.len() >= 20,
+            "examples/ stopped supplying the golden corpus this scan reads: {} file(s)",
+            goldens.len()
+        );
+        documents.extend(goldens);
+
+        let mut pairs_before = 0usize;
+        let mut survivors: Vec<String> = Vec::new();
+        for (name, snapshot) in &documents {
+            for line in snapshot.split('\n') {
+                pairs_before += offset_pairs(line).len();
+            }
+            for (number, line) in identity_projection(snapshot).split('\n').enumerate() {
+                for pair in offset_pairs(line) {
+                    survivors.push(format!("{name}:{}: `{pair}` in `{line}`", number + 1));
+                }
+            }
+        }
+
+        assert!(
+            pairs_before > 0,
+            "the corpus carries no offsets at all, so this scan proves nothing"
+        );
+        assert!(
+            survivors.is_empty(),
+            "an offset pair survived the identity projection, so a source position \
+             is back in `ir_hash`. Either the span field below is rendered in a \
+             spelling `erase_trailing_offsets` does not know, or it is not a span \
+             at all and this scan needs narrowing:\n{}",
+            survivors.join("\n")
+        );
+    }
+
+    /// The reason row D13 was opened, stated as its own test: a compiler change
+    /// that only moves where a caret points must rotate NOTHING. Simulated the
+    /// way such a change actually shows up — the same program, re-rendered with
+    /// different byte ranges under the same span fields — rather than by moving
+    /// the source, which the corpus test above already covers.
+    #[test]
+    fn a_compiler_change_that_only_moves_a_span_rotates_no_identity() {
+        for (name, source) in IDENTITY_CORPUS {
+            let snapshot = snapshot_of(name, source);
+            let repointed = snapshot
+                .split('\n')
+                .map(|line| match erase_trailing_offsets(line) {
+                    Cow::Borrowed(_) => line.to_owned(),
+                    // The projection recognized an offset here; a span fix
+                    // replaces it with a different range.
+                    Cow::Owned(erased) => format!("{}7..9", &erased[..erased.len() - 1]),
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+
+            assert_ne!(
+                snapshot, repointed,
+                "{name}: no span was repointed, so this proves nothing"
+            );
+            assert_eq!(
+                identity_hash(&snapshot),
+                identity_hash(&repointed),
+                "{name}: improving a diagnostic span rotated the program's identity"
+            );
+        }
+    }
+
+    /// The residual DR-0095 records rather than fixes, pinned so it stays
+    /// measurable: a rule's `body_hash` is a digest of its body TEXT, so a
+    /// blank line INSIDE a rule body still moves `ir_hash` — which is why this
+    /// change cannot claim that reformatting is free. Deliberate: inside a
+    /// `"""` prompt, whitespace is prose a model reads. When `body_hash` is
+    /// ruled on, this test is what fails and says so.
+    #[test]
+    fn whitespace_inside_a_rule_body_still_moves_identity_through_body_hash() {
+        let source = IDENTITY_CORPUS[0].1;
+        let reformatted = source.replace("as classification\n", "as classification\n\n");
+        assert_ne!(reformatted, source, "the blank line was not inserted");
+
+        assert_ne!(
+            identity_hash(&snapshot_of("terminal-output-union", source)),
+            identity_hash(&snapshot_of("reformatted", &reformatted)),
+            "`body_hash` stopped being whitespace-sensitive: identity now ignores \
+             text inside a rule body, which is a RULING, not a refactor — update \
+             DR-0095 and row D13 rather than this assertion"
+        );
+    }
 
     /// The property that matters: what the writer emits, the reader recovers.
     /// Asserted against the real committed golden rather than a hand-written

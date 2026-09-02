@@ -1,0 +1,58 @@
+// A `where` guard written INSIDE a `pattern`, with the same mistake as the
+// second rule of `bad-guard-expressions`: arithmetic on a string field.
+//
+// The point of this fixture is not the refusal — that one is already covered —
+// but WHERE the caret lands. `apply` substitutes `Input` with
+// `IncomingChangeRequest`, sixteen bytes longer, so every byte offset measured
+// against the substituted clause names a different byte of the file. The
+// expression kernel's ranges are measured against exactly that text, so a
+// caret resolved through them would underline `+ 1 > 2` — or, with a longer
+// schema name, source on another line entirely. The clause's text records that
+// it is no longer the file's, and the finding degrades to the whole clause:
+// coarse, and true. The snapshot beside this file is where that is pinned.
+workflow PatternGuard
+
+output result Verdict
+
+class Verdict {
+  note string
+}
+
+class IncomingChangeRequest {
+  id string
+  title string
+  attempts int
+}
+
+table requests as IncomingChangeRequest [
+  {
+    id "CR-1"
+    title "the timer fires twice"
+    attempts 1
+  }
+]
+
+pattern Triage<Input> {
+  rule shout
+    when Input as item where item.title + 1 > 2
+  => {
+    record Triaged {
+      id item.id
+    }
+  }
+}
+
+class Triaged {
+  id string
+}
+
+apply Triage<IncomingChangeRequest> as triage {
+}
+
+rule finish
+  when Triaged as triaged
+=> {
+  complete result {
+    note "done"
+  }
+}

@@ -56,6 +56,13 @@ pub(crate) fn lsp_byte_to_position(text: &str, offset: usize) -> (u32, u32) {
     (line, character)
 }
 
+/// An LSP `Position` as JSON, for the places that build a `Range` rather than
+/// destructure one.
+fn lsp_position_value(text: &str, offset: usize) -> Value {
+    let (line, character) = lsp_byte_to_position(text, offset);
+    json!({ "line": line, "character": character })
+}
+
 /// Byte offset of an LSP `Position` (0-based `line`, UTF-16 `character`). Clamps a
 /// past-the-line-end character to the line's newline, and an out-of-range line to
 /// the document end.
@@ -313,7 +320,7 @@ fn lsp_publish_diagnostics<W: std::io::Write>(writer: &mut W, uri: &str, text: &
                 },
                 "severity": finding.severity.lsp_code(),
                 "source": "whip lint",
-                "code": finding.code,
+                "code": finding.code.as_str(),
                 "message": finding.message,
             }));
         }
@@ -409,6 +416,13 @@ pub(crate) fn lsp(_options: &CliOptions) -> ExitCode {
                                 "documentFormattingProvider": true,
                                 "documentHighlightProvider": true,
                                 "workspaceSymbolProvider": true,
+                                // Quick fixes, and only quick fixes: every
+                                // action this server offers is a compiler fixit
+                                // attached to a diagnostic, never a refactor
+                                // the editor invented.
+                                "codeActionProvider": {
+                                    "codeActionKinds": ["quickfix"],
+                                },
                             },
                             "serverInfo": { "name": "whip-lsp", "version": "0" },
                         },
@@ -576,6 +590,101 @@ pub(crate) fn lsp(_options: &CliOptions) -> ExitCode {
                 lsp_write(
                     &mut writer,
                     &json!({ "jsonrpc": "2.0", "id": id, "result": results }),
+                );
+            }
+            "textDocument/codeAction" => {
+                // THE INTERACTIVE HALF OF A FIXIT (tracker D9). The compiler has
+                // already decided which repairs are machine-applicable and
+                // proved they compile; this hands them to the editor in the
+                // shape it asks for, and adds nothing of its own. There is no
+                // "organize imports", no rename, no refactor here — a code
+                // action this server offers is a `Fixit` the compiler emitted or
+                // it does not exist.
+                //
+                // Recompiled rather than cached: the client sends the range it
+                // is asking about, and the text it is asking about is whatever
+                // `didChange` last delivered. Deriving the actions from the
+                // diagnostics of THAT text is what keeps an edit from being
+                // applied at a span the document no longer has.
+                let actions = (|| {
+                    let document = params.get("textDocument")?;
+                    let uri = document.get("uri").and_then(Value::as_str)?;
+                    let text = documents.get(uri)?;
+                    let range = params.get("range")?;
+                    let position = |key: &str| -> Option<usize> {
+                        let point = range.get(key)?;
+                        let line = point.get("line").and_then(Value::as_u64)? as u32;
+                        let character = point.get("character").and_then(Value::as_u64)? as u32;
+                        Some(lsp_position_to_byte(text, line, character))
+                    };
+                    let (from, to) = (position("start")?, position("end")?);
+                    let compiled = whipplescript_parser::compile_program(text);
+                    let mut actions = Vec::new();
+                    for diagnostic in compiled.diagnostics.iter().chain(&compiled.warnings) {
+                        // Overlap, not containment: an editor asks with the
+                        // cursor's empty range, and a caret the cursor sits
+                        // inside contains that range rather than the reverse.
+                        if diagnostic.span.end < from || to < diagnostic.span.start {
+                            continue;
+                        }
+                        for fixit in &diagnostic.fixits {
+                            let edits: Vec<Value> = fixit
+                                .edits
+                                .iter()
+                                .map(|edit| {
+                                    let (start_line, start_char) =
+                                        lsp_byte_to_position(text, edit.span.start);
+                                    let (end_line, end_char) =
+                                        lsp_byte_to_position(text, edit.span.end);
+                                    json!({
+                                        "range": {
+                                            "start": {
+                                                "line": start_line,
+                                                "character": start_char,
+                                            },
+                                            "end": { "line": end_line, "character": end_char },
+                                        },
+                                        "newText": edit.replacement,
+                                    })
+                                })
+                                .collect();
+                            actions.push(json!({
+                                "title": fixit.title,
+                                "kind": "quickfix",
+                                // The diagnostic this repairs, so the editor can
+                                // show the action on that squiggle rather than on
+                                // the line.
+                                "diagnostics": [{
+                                    "range": {
+                                        "start": lsp_position_value(text, diagnostic.span.start),
+                                        "end": lsp_position_value(text, diagnostic.span.end),
+                                    },
+                                    "severity": diagnostic.severity.lsp_code(),
+                                    "code": diagnostic.code.as_str(),
+                                    "source": "whip",
+                                    "message": diagnostic.message,
+                                }],
+                                // `exact` is the compiler's claim that applying
+                                // this produces a program without the
+                                // diagnostic, which is exactly what an editor's
+                                // "preferred" (auto-applied on `.` / fix-all)
+                                // means. A `likely` fixit, when one exists, must
+                                // not be marked so.
+                                "isPreferred": fixit.applicability
+                                    == whipplescript_parser::Applicability::Exact,
+                                "edit": { "changes": { uri: edits } },
+                            }));
+                        }
+                    }
+                    Some(actions)
+                })();
+                lsp_write(
+                    &mut writer,
+                    &json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": actions.map(Value::Array).unwrap_or(Value::Null),
+                    }),
                 );
             }
             "textDocument/documentHighlight" => {

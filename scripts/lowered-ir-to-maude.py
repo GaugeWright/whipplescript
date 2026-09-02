@@ -20,13 +20,14 @@ from artifact_admission import (
     canonical_json,
     catalog_lowerings,
     derived_fact_predicates,
+    ir_identity_hash,
+    ir_identity_projection,
     is_sha256_digest,
     is_stable_digest,
     load_platform_construct_catalog,
     maude_graph_node_list,
     require_predicate,
     required_string,
-    stable_hash_hex,
     validate_contract_registry_shape,
     validate_empty_diagnostics,
     validate_package_contract_platform,
@@ -172,10 +173,14 @@ def validate_report_entry_identity(
         raise SystemExit(f"{label}.ir_hash must be a 32-character lowercase hex digest")
     if not is_stable_digest(source_hash):
         raise SystemExit(f"{label}.source_hash must be a 32-character lowercase hex digest")
-    expected_ir_hash = stable_hash_hex(snapshot)
+    # DR-0095: `ir_hash` is the hash of the snapshot's IDENTITY projection —
+    # the same document with its source offsets erased — so a compiler change
+    # that only improves a diagnostic span leaves a program's identity alone.
+    # Offsets only: `body_hash` stays, so this is not whitespace-insensitive.
+    expected_ir_hash = ir_identity_hash(snapshot)
     if ir_hash != expected_ir_hash:
         raise SystemExit(
-            f"{label}.ir_hash must match embedded snapshot hash: "
+            f"{label}.ir_hash must match the embedded snapshot's identity hash: "
             f"got {ir_hash!r}, expected {expected_ir_hash!r}"
         )
 
@@ -253,13 +258,16 @@ def validate_report_entry_identity(
 
     lowered_graph_id = lowered.get("graph_id")
     accepted_program_digest = lowered.get("accepted_program_digest")
+    # DR-0095: over the snapshot's IDENTITY PROJECTION, matching the producer —
+    # the accepted program a lowering report names is the lowered program, not
+    # the byte positions that expressed it.
     expected_program_digest = hashlib.sha256(
-        f"{lowered_graph_id}\n{snapshot}".encode("utf-8")
+        f"{lowered_graph_id}\n{ir_identity_projection(snapshot)}".encode("utf-8")
     ).hexdigest()
     if accepted_program_digest != expected_program_digest:
         raise SystemExit(
             f"{label} lowered_ir_report.accepted_program_digest does not match "
-            "graph_id + snapshot"
+            "graph_id + the snapshot's identity projection"
         )
 
 

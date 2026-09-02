@@ -2266,7 +2266,7 @@ fn replay_scenario(
             whipplescript_kernel::ProgramVersionInput {
                 program_name: &ir.workflow,
                 source_hash: &whipplescript_kernel::rule_lowering::stable_hash_hex(&source),
-                ir_hash: &whipplescript_kernel::rule_lowering::stable_hash_hex(&snapshot),
+                ir_hash: &whipplescript_parser::snapshot::identity_hash(&snapshot),
                 compiler_version: whipplescript_core::version(),
                 ir_snapshot: None,
             },
