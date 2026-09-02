@@ -33,6 +33,14 @@ on:
   push:
     branches: [main]
   pull_request:
+  # The merge queue re-runs the required checks on a ref that carries the TRUE
+  # prospective base — current main plus every entry queued ahead. A pull
+  # request's own checks run against the base as of run creation, and merging
+  # on them raced: the fourth DR-number collision (two DR-0088s) merged on
+  # checks whose origin/main predated the sibling that claimed the number.
+  # Without this trigger a queued entry times out waiting for required checks
+  # that never start.
+  merge_group:
   schedule:
     - cron: "37 6 * * 2"
 
@@ -161,7 +169,12 @@ jobs:
     # `-src` only. The mirror is a squash-published projection with disjoint
     # history, so a merge base there names the whole projection rather than a
     # change, and the sweep would try to pin every refusal in the repository.
-    if: ${{ github.repository != 'GaugeWright/whipplescript' }}
+    #
+    # Not on the merge queue's ref either: the sweep already ran on the pull
+    # request, it is not a required check so the queue never waits on it, and
+    # at up to forty-five minutes it is the one job whose duplication would
+    # dominate the queue's CI cost.
+    if: ${{ github.repository != 'GaugeWright/whipplescript' && github.event_name != 'merge_group' }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
