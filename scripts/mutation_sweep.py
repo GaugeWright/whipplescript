@@ -69,6 +69,31 @@ OK_OR_OPEN = re.compile(r"\.ok_or(?:_else)?\(")
 # `rustfmt` emits; more would start joining unrelated statements.
 OK_OR_WINDOW = 3
 
+# A refusal that is neither `Err` nor a push: a domain enum whose VARIANT NAME
+# says it refused. `EnvelopeStatus::Rejected(...)`, `DeliveryOutcome::Refused(...)`,
+# `AdvanceOutcome::Rejected { ... }`. The function's contract is not `Result`, so
+# there is no `Err` to find, and the tree carries 88 of these across eight types
+# — ingress delivery, signal admission, restore preflight, boundary runs, ref
+# advance — every one of them invisible to this sweep until 2026-09-02.
+#
+# Found the way the `ok_or` gap was: a change ADDED one (`EnvelopeStatus::Rejected`
+# closing an IFC fail-open) and `check-new-refusals.sh` reported the file as
+# carrying one touched site, having never seen it.
+#
+# Deliberately narrow, for the reason `OK_OR_REFUSAL` is: the variant name must
+# itself be a refusal word. A sweep that took every `Type::Variant(` would report
+# unexercised "refusals" that are ordinary values, which is how an instrument
+# gets ignored.
+REFUSAL_VARIANT = re.compile(
+    r"\b[A-Z][A-Za-z0-9_]*::(?:Rejected|Refused|Denied)\s*[({]"
+)
+
+# The brace form is a PATTERN, not a construction, when it binds rather than
+# supplies: `RestoreDecision::Refused { .. }` and
+# `AdvanceOutcome::Rejected { ref current, .. }` both destructure. A construction
+# names fields with values (`Refused { reason: format!(...) }`).
+VARIANT_PATTERN_BODY = re.compile(r"^\s*(?:\.\.|ref\b|[a-z_][a-z0-9_]*\s*(?:,|\}|$))")
+
 # A pattern binds a name or wildcard and closes immediately: `Err(e)`, `Err(_)`,
 # `Err(ref error)`. An expression opens a call or a literal instead.
 ERR_BINDING = re.compile(r"^(?:ref\s+|mut\s+)*(?:_|[a-z][a-z0-9_]*)\s*[),]")
@@ -202,6 +227,51 @@ def cfg_test_extent(lines: list[str], index: int) -> str | None:
     return None
 
 
+def variant_is_refusal(line: str) -> bool:
+    """True when the line CONSTRUCTS a refusal-named enum variant.
+
+    Excludes the two shapes that merely name one: a match arm (`=> `after it)
+    and a destructuring pattern (`{ .. }`, `{ ref x, .. }`).
+    """
+    if ERR_NOT_A_REFUSAL.search(line):
+        return False
+    for found in REFUSAL_VARIANT.finditer(line):
+        rest = line[found.end() :]
+        # `EnvelopeStatus::Rejected(message) => ...` is an arm, not a refusal.
+        if "=>" in rest:
+            continue
+        # `let RestoreDecision::Refused { .. } = ...` destructures.
+        if LET_PATTERN.search(line[: found.start()]):
+            continue
+        if line[found.end() - 1] == "{" and VARIANT_PATTERN_BODY.match(rest):
+            continue
+        if line[found.end() - 1] == "(" and ERR_BINDING.match(rest.lstrip()):
+            continue
+        return True
+    return False
+
+
+# An `Option` refusal, declared. `None` IS the refusal here -- the contract has
+# no error type and no message, so nothing in the line says a decision was made,
+# and `return None` is far too common to key on. The author says so instead:
+#
+#     // REFUSAL: a source the grammar cannot read has no trustworthy split
+#     if !parsed.diagnostics.is_empty() {
+#         return None;
+#     }
+#
+# The marker names the guard BELOW it, which `neutralise_guard` then falsifies,
+# so the mutation asks the right question -- does anything notice this stopped
+# refusing -- rather than rewriting a message that does not exist.
+#
+# Opt-in on purpose. There is no rule that separates a fail-closed `None` from
+# an ordinary absent value by looking at it; a sweep that guessed would report
+# hundreds of non-refusals and be ignored. This gives the idiom a way to be
+# measured at all, which it did not have: `source_merge`'s fail-closed wall was
+# a refusal the gate structurally could not ask about.
+REFUSAL_MARKER = re.compile(r"^\s*//\s*REFUSAL\b:?\s*(.*)$")
+
+
 def find_sites(lines: list[str]) -> list[Site]:
     """Every refusal site outside the file's own test-only items.
 
@@ -219,9 +289,29 @@ def find_sites(lines: list[str]) -> list[Site]:
         if stripped == "#[cfg(test)]":
             skip_until = cfg_test_extent(lines, index)
             continue
+        marked = REFUSAL_MARKER.match(line)
+        if marked:
+            # The marker names the next GUARD, so the site is that guard's
+            # line -- `neutralise_guard` scans back from a site to find it.
+            for offset in range(1, 4):
+                if index + offset >= len(lines):
+                    break
+                if GUARD_LINE.match(lines[index + offset]):
+                    # The site IS the guard line: `neutralise_guard` probes
+                    # from the site line and falsifies the first guard it
+                    # finds, so pointing at the guard makes the mutation exact.
+                    guard_line = index + offset + 1
+                    label = marked.group(1).strip()[:70]
+                    sites.append(Site(guard_line, label or f"line {guard_line}"))
+                    break
+            continue
         if stripped.startswith("//"):
             continue
-        is_site = any(pattern in line for pattern in PUSH_PATTERNS) or err_is_refusal(line)
+        is_site = (
+            any(pattern in line for pattern in PUSH_PATTERNS)
+            or err_is_refusal(line)
+            or variant_is_refusal(line)
+        )
         if not is_site and OK_OR_OPEN.search(line):
             # Joined only for THIS rule. Running the `Err(` rule over a joined
             # window would read a match arm on the next line as a construction.
@@ -627,11 +717,52 @@ fn mutation_sweep_self_test_wrapped_ok_or_refusal(
         ))
     })
 }
+
+// A refusal whose contract is not `Result`: the VARIANT NAME is what says it
+// refused. Message-carrying, so `mutate_message` reaches it; the brace form
+// without a message is measured through its guard instead.
+#[allow(dead_code)]
+enum MutationSweepSelfTestOutcome {
+    Admitted,
+    Refused(String),
+}
+
+#[allow(dead_code)]
+fn mutation_sweep_self_test_variant_refusal(
+    reached: bool,
+    detail: &str,
+) -> MutationSweepSelfTestOutcome {
+    if reached {
+        return MutationSweepSelfTestOutcome::Admitted;
+    }
+    MutationSweepSelfTestOutcome::Refused(format!(
+        "mutation sweep self test variant refusal at {}",
+        detail
+    ))
+}
+
+// A fail-closed `Option` refusal, declared by its marker. `None` carries no
+// message and no error type, so this plant is measured ONLY through the guard
+// the marker names — it fails if marker parsing or the guard mutation stops
+// landing.
+#[allow(dead_code)]
+fn mutation_sweep_self_test_option_refusal(reached: bool) -> Option<u8> {
+    // REFUSAL: mutation sweep self test option refusal
+    if !reached {
+        return None;
+    }
+    Some(1)
+}
 """
 
 # How many refusals `PLANT` contains. Asserted rather than counted so that
 # adding a plant without teaching the self test about it fails loudly.
-PLANT_COUNT = 6
+#
+# Two were added 2026-09-02 with the variant and marker rules. Both are shapes
+# the scanner could not see at all before, so a plant that reports "caught"
+# means the new rule found a site the mutator cannot actually falsify — which
+# is the failure mode this count exists to make loud.
+PLANT_COUNT = 8
 
 
 def self_test(target: str, filter_expr: str, backup: str) -> bool:

@@ -90,6 +90,7 @@ fn line_start(source: &str, offset: usize) -> usize {
 /// fails closed.
 fn split_declarations(source: &str) -> Option<Vec<DeclBlock>> {
     let parsed = parse_program(source);
+    // REFUSAL: a source the grammar cannot read has no trustworthy decomposition
     if !parsed.diagnostics.is_empty() {
         return None;
     }
