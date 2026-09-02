@@ -115,6 +115,11 @@ EXPECTED = {
     # scripts/regen-docs-diagnostics.sh.
     "docs/language-reference.md": 8,
     "docs/manual.md": 2,
+    # Not under docs/. This file is what an agent reads before writing a
+    # program, so its fences are the most literally copied in the repository —
+    # and they were outside every gate until DR-0093 turned two of them into
+    # hard errors with nothing to say so.
+    "skills/whipplescript-author/SKILL.md": 8,
     "docs/manual/01-smallest-workflow.md": 1,
     "docs/manual/02-facts-and-types.md": 10,
     "docs/manual/03-expressions.md": 1,
@@ -323,7 +328,14 @@ def first_error(result) -> str:
     return (result.stderr or result.stdout).strip().splitlines()[:1] or ["(no output)"]
 
 
-for md in sorted(pathlib.Path("docs").rglob("*.md")):
+# `skills/` is scanned beside `docs/` because a fence there is copied more
+# literally than any other in the repository: SKILL.md is what an agent reads
+# before writing a program. It was outside every gate until DR-0093 turned its
+# central example into two hard errors, and nothing said so.
+pages = sorted(pathlib.Path("docs").rglob("*.md")) + sorted(
+    pathlib.Path("skills").rglob("*.md")
+)
+for md in pages:
     text = md.read_text()
     contexts: dict[str, str] = {}
     for match in FENCE.finditer(text):

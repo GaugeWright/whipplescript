@@ -104,7 +104,7 @@ effect requests. Workers execute effects later and record evidence.
 | --- | --- | --- | --- |
 | Durable unit of work | `workflow`, `input`, `output`, `failure` | `workflow Name` | [`language-reference.md#workflow`](../../docs/language-reference.md#workflow) |
 | Terminal contract | `complete`, `fail`, `@service` | `complete result { ... }` | [`manual.md#end-the-workflow`](../../docs/manual.md#end-the-workflow) |
-| Typed state | `class`, `enum`, literal fields | `class WorkItem { status "queued" }` | [`manual.md#model-data-with-classes-and-enums`](../../docs/manual.md#model-data-with-classes-and-enums) |
+| Typed state | `class`, `enum`, literal fields | `class Task { status "queued" }` | [`manual.md#model-data-with-classes-and-enums`](../../docs/manual.md#model-data-with-classes-and-enums) |
 | Sum types | enum payload variants, `case` | `enum Outcome { Approved { score float } }` | [`language-reference.md#sum-types`](../../docs/language-reference.md#sum-types) |
 | Static seed data | `table` | `table tasks as Task [ ... ]` | [`language-reference.md#table`](../../docs/language-reference.md#table) |
 | Agent target | `agent`, `profile`, `capacity`, `skills` | `agent worker { provider fixture ... }` | [`language-reference.md#agent`](../../docs/language-reference.md#agent) |
@@ -232,8 +232,70 @@ Use this only as a syntax sanity check. For useful patterns, start with:
 
 ## Canonical Patterns
 
+The patterns below share these declarations. Each is a whole program when read
+with them, and the docs gate compiles it that way — this file is copied more
+literally than any other in the repository, so its examples are checked rather
+than trusted.
+
+<!-- check: context author -->
+```whip
+use std.tracker
+
+class Task {
+  id string
+  title string
+  body string
+  status "queued" | "done"
+}
+
+class Ticket {
+  id string
+  title string
+  status "open" | "triaged"
+}
+
+class RequestClassification {
+  priority "low" | "high"
+  area string
+}
+
+class ClassifiedWork {
+  item Task
+  classification RequestClassification
+}
+
+agent triager {
+  provider fixture
+  profile "repo-writer"
+  capacity 1
+  capabilities ["agent.tell"]
+}
+
+agent codex {
+  provider fixture
+  profile "repo-writer"
+  capacity 1
+  capabilities ["agent.tell"]
+}
+
+agent claude {
+  provider fixture
+  profile "repo-writer"
+  capacity 1
+  capabilities ["agent.tell"]
+}
+
+failure error Failed
+class Failed { reason string }
+
+tracker backlog { provider builtin }
+tracker triage { provider builtin }
+tracker escalations { provider builtin }
+```
+
 Agent work with explicit sequencing:
 
+<!-- check: context author -->
 ```whip
 agent worker {
   provider fixture
@@ -243,7 +305,7 @@ agent worker {
 }
 
 rule implement
-  when WorkItem as item where item.status == "queued"
+  when Task as item where item.status == "queued"
   when worker is available
 => {
   tell worker requires ["agent.tell"] as turn """markdown
@@ -253,7 +315,7 @@ rule implement
   """
 
   after turn succeeds as completed {
-    done item -> record WorkItem {
+    done item -> record Task {
       id item.id
       title item.title
       status "done"
@@ -271,6 +333,7 @@ rule implement
 
 Typed model decision:
 
+<!-- check: in author -->
 ```whip
 coerce classifyRequest(title string, body string) -> RequestClassification {
   prompt """markdown
@@ -284,7 +347,7 @@ coerce classifyRequest(title string, body string) -> RequestClassification {
 }
 
 rule classify
-  when WorkItem as item where item.status == "queued"
+  when Task as item where item.status == "queued"
 => {
   coerce classifyRequest(item.title, item.body) as classification
 
@@ -305,6 +368,7 @@ rule classify
 
 Sequential steps (`then` chaining — the `flow` construct was removed):
 
+<!-- check: in author -->
 ```whip
 rule triage_ticket
   when Ticket as ticket where ticket.status == "open"
@@ -329,6 +393,7 @@ rule triage_ticket
 
 Track work (the `std.tracker` backlog):
 
+<!-- check: in author -->
 ```whip
 use std.tracker
 
@@ -358,11 +423,12 @@ rule work_ready_issue
 
 Package context with provenance:
 
+<!-- check: in author -->
 ```whip
 use std.memory
 
 rule recall_before_work
-  when WorkItem as item where item.status == "queued"
+  when Task as item where item.status == "queued"
 => {
   call memory.query for item as context
 
@@ -374,6 +440,7 @@ rule recall_before_work
 
 Typed dynamic agent routing:
 
+<!-- check: in author -->
 ```whip
 class ReviewTask {
   reviewer AgentRef<codex | claude>
