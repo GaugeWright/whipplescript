@@ -326,13 +326,47 @@ def mutate_message(line: str) -> str | None:
     refusal — the sweep would report a false catch. `run_suite` tells the two
     apart as a second line of defence, but the mutation should compile.
     """
-    found = re.search(r'"([^"]{4,}?)"', line)
-    if not found:
-        return None
-    placeholders = PLACEHOLDER.findall(BRACE_ESCAPE.sub("", found.group(1)))
-    mutated = " ".join(["MUTATED-BY-SWEEP", *placeholders])
-    return line[: found.start()] + '"' + mutated + '"' + line[found.end() :]
+    for start, end, body in string_literals(line):
+        if len(body) < 4:
+            continue
+        if CODE_MACRO_ARG.search(line[:start]):
+            # A diagnostic code, not a message. The codes are a closed register
+            # looked up at COMPILE time, so rewriting one does not weaken a
+            # refusal — it stops the crate building, and the sweep reports "not
+            # measured" for a site it never tested. Skipping it lets the search
+            # walk on to the real message, usually a few lines below.
+            continue
+        placeholders = PLACEHOLDER.findall(BRACE_ESCAPE.sub("", body))
+        mutated = " ".join(["MUTATED-BY-SWEEP", *placeholders])
+        return line[:start] + '"' + mutated + '"' + line[end + 1 :]
+    return None
 
+
+def string_literals(line: str) -> list[tuple[int, int, str]]:
+    """Every complete `"…"` on the line, as (open index, close index, body).
+
+    Pairing the quotes matters rather than matching `"([^"]{4,}?)"`: that pattern
+    cannot cross a quote, so on a line carrying TWO literals it fails on the
+    first and then matches from the first literal's CLOSING quote to the second
+    literal's opening one — a span that is not a literal at all, and rewriting it
+    produces a line that does not parse. The idiom that hits this is a one-line
+    `Diagnostic { code: …!("a.b"), message: "…" }`.
+    """
+    quotes = [found.start() for found in UNESCAPED_QUOTE.finditer(line)]
+    return [
+        (quotes[index], quotes[index + 1], line[quotes[index] + 1 : quotes[index + 1]])
+        for index in range(0, len(quotes) - 1, 2)
+    ]
+
+
+# The argument to a code-minting macro, which is never a message. The idiom is
+# `code: diagnostic_code!("graph.unbounded_effect_recursion"),` and the literal
+# is a key into a compile-time register, so a rewritten one is a build failure
+# rather than a weakened refusal. Four sites in the parser reported "not
+# measured" for exactly this reason, and the shape they use — an `Err` carrying
+# a code above its message, with no falsifiable guard in reach — is the
+# dominant one, so the class was larger than the count suggested.
+CODE_MACRO_ARG = re.compile(r"\b\w*code!\(\s*$")
 
 # A `"` that actually opens or closes a literal, rather than one escaped inside
 # one. An odd count on a line means the literal continues onto the next.
@@ -475,6 +509,12 @@ def sweep(
 # exists to catch, one level up: the rule could stop matching and every sweep
 # would still come back clean.
 #
+# The sixth was added 2026-09-01 with the code-literal skip. It is the second
+# plant whose point is being MEASURED at all: its mutation used to rewrite a
+# compile-time code register key, so the crate failed to build and the site
+# reported "not measured" — indistinguishable, in a summary, from a refusal the
+# sweep had actually asked about and could not answer.
+#
 # The fifth was added 2026-08-31 with `neutralise_guard`, and it is the one that
 # has to be MEASURED rather than merely reported. A message-less refusal has no
 # text to rewrite, so before that mutation the sweep skipped it — and a skip and
@@ -536,6 +576,44 @@ fn mutation_sweep_self_test_ok_or_refusal(value: Option<u8>, detail: &str) -> Re
     value.ok_or_else(|| MutationSweepSelfTestError::Missing(format!("mutation sweep self test ok_or refusal at {}", detail)))
 }
 
+// A refusal whose CODE is minted above its message. `mutation_sweep_self_test_code!`
+// stands in for `diagnostic_code!`: one literal arm, so a rewritten argument
+// matches no rule and the crate stops building — which is what made four real
+// parser sites report "not measured" rather than answering the question. The
+// plant only bites while the code sits ABOVE the message inside the search
+// window, because that is the ordering that makes the code the first literal
+// found.
+macro_rules! mutation_sweep_self_test_code {
+    ("mutation-sweep.self-test") => {
+        "mutation-sweep.self-test"
+    };
+}
+
+#[allow(dead_code)]
+struct MutationSweepSelfTestDiagnostic {
+    code: &'static str,
+    message: String,
+}
+
+#[allow(dead_code)]
+fn mutation_sweep_self_test_coded_refusal(
+    reached: Option<&str>,
+    detail: &str,
+) -> Result<(), MutationSweepSelfTestDiagnostic> {
+    // An `if let`, not an `if`, and that is the whole plant. `neutralise_guard`
+    // excludes `let` bindings — falsifying one leaves the binding unused and the
+    // arm below unreachable — so this refusal falls through to the message
+    // rewrite, which is where the code literal was being hit. Behind a plain
+    // `if` the guard mutation fires first and the bug is never reached.
+    if let Some(_reached) = reached {
+        return Ok(());
+    }
+    Err(MutationSweepSelfTestDiagnostic {
+        code: mutation_sweep_self_test_code!("mutation-sweep.self-test"),
+        message: format!("mutation sweep self test coded refusal at {}", detail),
+    })
+}
+
 #[allow(dead_code)]
 fn mutation_sweep_self_test_wrapped_ok_or_refusal(
     value: Option<u8>,
@@ -553,7 +631,7 @@ fn mutation_sweep_self_test_wrapped_ok_or_refusal(
 
 # How many refusals `PLANT` contains. Asserted rather than counted so that
 # adding a plant without teaching the self test about it fails loudly.
-PLANT_COUNT = 5
+PLANT_COUNT = 6
 
 
 def self_test(target: str, filter_expr: str, backup: str) -> bool:

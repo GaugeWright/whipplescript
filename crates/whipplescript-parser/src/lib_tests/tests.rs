@@ -10478,10 +10478,19 @@ fn merging_passes_keeps_distinct_findings_and_order() {
     assert_eq!(diagnostics, labelled, "a related label was collapsed away");
 }
 
-/// Seven refusals that a mutation sweep found nothing exercised: disabling
-/// each one left the whole workspace suite green, so the compiler advertised
-/// a rule no test proved it applies. They are grouped because they share that
-/// provenance, not because they share a subject.
+/// Refusals that a mutation sweep found nothing exercised: disabling each one
+/// left the whole workspace suite green, so the compiler advertised a rule no
+/// test proved it applies. They are grouped because they share that provenance,
+/// not because they share a subject.
+///
+/// Seven came from the first sweep. Seven more came from a full sweep of this
+/// file on 2026-09-01, which measured 277 refusal sites and found 19 that
+/// nothing in the workspace reaches. That audit corrected the assumption behind
+/// it: the suspicion was that loose `contains` assertions were being satisfied
+/// by the WRONG diagnostic, and only one finding worked that way. Twelve were
+/// refusals no test named in any form — absent coverage, not misleading
+/// coverage — which is why these are new programs rather than tightened
+/// assertions.
 ///
 /// Each case asserts the message, not merely that compilation failed — a
 /// program can fail for a reason other than the one under test, and that is
@@ -10605,6 +10614,169 @@ table seed as Task [ { id "1" } ]
 rule r
   when Task as record
 => { complete result { ok true } }
+"#,
+        ),
+        (
+            "derived gauge `loops` cannot input itself",
+            r#"
+workflow GaugeCycle
+
+output result R
+class R { v string }
+signal go.now { x string }
+
+gauge loops {
+  judge via exec "score"
+  inputs loops
+}
+
+rule j
+  when go.now as g
+=> { complete result { v "ok" } }
+"#,
+        ),
+        (
+            "field `Ticket.kind` expects one of its literal variants",
+            r#"
+workflow LiteralVariant
+
+output result R
+class R { v string }
+class Ticket { kind "bug" | "chore" }
+signal go.now { x string }
+
+rule j
+  when go.now as g
+=> {
+  record Ticket { kind 3 }
+  complete result { v "ok" }
+}
+"#,
+        ),
+        (
+            "the `during` region in rule `j` contains no progression",
+            r#"
+workflow RegionEmpty
+use std.ingress
+
+output result R
+class R { v string }
+signal go.now { x string }
+
+rule j
+  when go.now as g
+=> {
+  during quiet {
+    record R { v "x" }
+  } on lapse {
+    complete result { v "lapsed" }
+  }
+  complete result { v "ok" }
+}
+"#,
+        ),
+        (
+            "rule `keep` declassifies into `Ghost`, which is not a declared class",
+            r#"
+use std.custody
+@service
+workflow Declass
+
+class PatientRecord { notes string }
+class Claim { id string  rec PatientRecord }
+
+credential phi_key { kind raw }
+
+@external
+rule keep
+  when Claim as claim
+=> {
+  seal claim.rec with phi_key as sealing
+  after sealing succeeds as envelope {
+    declassify envelope into Ghost as opened
+  }
+}
+"#,
+        ),
+        (
+            "rule `j` has invalid field path `t.hue.name`: schema `Colour` has no declared fields",
+            r#"
+workflow FieldPath
+use std.ingress
+
+enum Colour {
+  Red
+  Green
+}
+
+class Ticket { id string  hue Colour }
+
+output result R
+class R { v string }
+signal go.now { x string }
+
+rule j
+  when Ticket as t
+=> { complete result { v t.hue.name } }
+"#,
+        ),
+        (
+            "rule `scoped` mints from `stripe_api` without presenting it",
+            r#"
+@service
+workflow MintNothing
+
+use std.custody
+use std.ingress
+
+credential stripe_api { kind bearer }
+
+signal charge.disputed { note string }
+
+output result R
+class R { v string }
+rule scoped
+  when charge.disputed as charge
+=> {
+  mint credential from stripe_api {
+    at POST "https://connect.stripe.com/oauth/token"
+    header "X-Note" charge.note
+    body "grant_type=client_credentials"
+    token at "access_token"
+    public ["expires_in"]
+  } as token
+
+  after token succeeds {
+    complete result { v "minted" }
+  }
+}
+"#,
+        ),
+        (
+            "given field `title` is not a valid expression: expected expression in `1 +`",
+            r#"
+workflow Triage
+
+class Ticket { title string  sev string }
+output result R
+class R { v string }
+
+rule j
+  when Ticket as t
+=> { complete result { v t.title } }
+
+test "malformed given value" {
+  workflow Triage
+
+  given fact Ticket {
+    title 1 +
+    sev "low"
+  }
+
+  run until idle
+
+  expect workflow completed
+}
 "#,
         ),
     ];
@@ -16295,6 +16467,50 @@ workflow RepairFlow {
         .diagnostics
         .iter()
         .any(|d| d.message.contains("unknown `vcs` grant operation")));
+
+    // A bare `repair`. The sibling arm above — `repair for <unbound>` — was
+    // tested and this one was not, so the 2026-09-01 sweep could delete it and
+    // leave the suite green: the two arms differ only in whether a target was
+    // written at all.
+    let bare = base.replace("repair for r", "repair");
+    let compiled = compile_program_with_root(&bare, Some("Main"));
+    assert!(
+        compiled
+            .diagnostics
+            .iter()
+            .any(|d| d.message == "`repair` names no binding"),
+        "{:?}",
+        compiled
+            .diagnostics
+            .iter()
+            .map(|d| &d.message)
+            .collect::<Vec<_>>()
+    );
+
+    // The grant rides an `invoke` only. On a `tell` it would hand a MODEL
+    // repair authority, which is the reason the restriction exists.
+    let on_tell = base
+        .replace(
+            "workflow Main {",
+            "workflow Main {\n  agent fixer { provider fixture  profile \"repo-writer\"  capacity 1 }",
+        )
+        .replace(
+            "invoke RepairFlow { note \"repair\" } as fix",
+            "tell fixer \"repair\" as fix",
+        );
+    let compiled = compile_program_with_root(&on_tell, Some("Main"));
+    assert!(
+        compiled
+            .diagnostics
+            .iter()
+            .any(|d| d.message == "a `vcs` access grant rides an `invoke` only"),
+        "{:?}",
+        compiled
+            .diagnostics
+            .iter()
+            .map(|d| &d.message)
+            .collect::<Vec<_>>()
+    );
 }
 
 #[test]
@@ -19622,6 +19838,130 @@ fn a_sealed_value_can_be_stored_in_a_sealed_field() {
     assert_eq!(compiled.diagnostics, Vec::new());
 }
 
+/// The SECOND site that refuses a literal in a sealed field, which the test
+/// below never reached. Both emit a byte-identical message, so no assertion on
+/// the text can tell them apart — tightening the one above from `contains` to
+/// equality does not help, and that is exactly why the 2026-09-01 sweep could
+/// delete this one and leave the suite green. What pins it is a PROGRAM that
+/// reaches only this site.
+///
+/// The two are the line-scanner path and the parsed-expression path.
+/// `validate_literal_assignment_inner` reads a raw source value and exempts a
+/// bare identifier, because that is how a `seal`'s own output lands in the
+/// field. `validate_literal_against_type_inner` reads a parsed `Expr` and has
+/// no such exemption; an ARRAY of sealed reaches it, because it recurses per
+/// element.
+/// Two arms of "the root you asked for is not here", found by the sweep only
+/// after `mutate_message` stopped rewriting `diagnostic_code!` arguments: both
+/// sites reported "not measured" before that, which reads like a covered
+/// refusal in a summary and is actually an unasked question.
+#[test]
+fn a_root_that_names_no_workflow_is_refused() {
+    // Several workflows, and the root names none of them.
+    let many = r#"
+workflow Alpha {
+  output result R
+  class R { v string }
+  rule a
+    when started
+  => { complete result { v "a" } }
+}
+
+workflow Beta {
+  output result R2
+  class R2 { v string }
+  rule b
+    when started
+  => { complete result { v "b" } }
+}
+"#;
+    let compiled = compile_program_with_root(many, Some("Ghost"));
+    assert!(
+        compiled
+            .diagnostics
+            .iter()
+            .any(|d| d.message == "root workflow `Ghost` was not found"),
+        "{:?}",
+        compiled
+            .diagnostics
+            .iter()
+            .map(|d| &d.message)
+            .collect::<Vec<_>>()
+    );
+
+    // The single-workflow file, whose one workflow is named something else.
+    let one = r#"
+workflow Alpha
+
+output result R
+class R { v string }
+
+rule a
+  when started
+=> { complete result { v "a" } }
+"#;
+    let compiled = compile_program_with_root(one, Some("Ghost"));
+    assert!(
+        compiled
+            .diagnostics
+            .iter()
+            .any(|d| d.message == "root workflow `Ghost` was not found"),
+        "{:?}",
+        compiled
+            .diagnostics
+            .iter()
+            .map(|d| &d.message)
+            .collect::<Vec<_>>()
+    );
+
+    // The THIRD arm — no workflow declaration at all, with a root asked for —
+    // is unreachable, and this asserts the reason rather than leaving the sweep
+    // to keep reporting it. `construct.missing_workflow` answers the same
+    // condition earlier and more precisely: "declares no `workflow`" is what
+    // the author needs to read, where "root `Ghost` was not found" would
+    // blame the flag for a file that has nothing to point it at.
+    let empty = compile_program_with_root("class Ticket { title string }", Some("Ghost"));
+    assert!(
+        empty
+            .diagnostics
+            .iter()
+            .any(|d| d.code.as_str() == "construct.missing_workflow"),
+        "{:?}",
+        empty
+            .diagnostics
+            .iter()
+            .map(|d| &d.message)
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        !empty
+            .diagnostics
+            .iter()
+            .any(|d| d.message == "root workflow `Ghost` was not found"),
+        "the arm is shadowed; if this fires, it became reachable and wants its own test"
+    );
+}
+
+#[test]
+fn a_literal_in_an_array_of_sealed_is_refused_by_the_other_site() {
+    let compiled = compile_program(
+        &seal_storage_source("claim.rec", "sealed<PatientRecord>[]")
+            .replace("body envelope }", "body [\"ciphertext\"] }"),
+    );
+    assert!(
+        compiled.diagnostics.iter().any(|diagnostic| {
+            diagnostic.message
+                == "field `Stored.body` expects `sealed<PatientRecord>`, which has no literal form"
+        }),
+        "{:?}",
+        compiled
+            .diagnostics
+            .iter()
+            .map(|diagnostic| &diagnostic.message)
+            .collect::<Vec<_>>()
+    );
+}
+
 #[test]
 fn a_literal_in_a_sealed_field_is_still_refused() {
     // The exemption above is for BINDINGS. A literal still has no sealed form,
@@ -19631,10 +19971,10 @@ fn a_literal_in_a_sealed_field_is_still_refused() {
             .replace("body envelope }", "body \"ciphertext\" }"),
     );
     assert!(
-        compiled
-            .diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.message.contains("which has no literal form")),
+        compiled.diagnostics.iter().any(|diagnostic| {
+            diagnostic.message
+                == "field `Stored.body` expects `sealed<PatientRecord>`, which has no literal form"
+        }),
         "{:?}",
         compiled
             .diagnostics
