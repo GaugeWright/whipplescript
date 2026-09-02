@@ -5220,7 +5220,8 @@ rule start
             .ingest_external_event(&instance_id, "external.started", "{}", Some("start"))
             .expect("event ingests");
 
-        assert_eq!(event.sequence, 1);
+        // Sequence 1 is `instance.created` (DR-0094); this is the event after it.
+        assert_eq!(event.sequence, 2);
         assert!(instance_id.starts_with("ins_"));
     }
 
@@ -5928,11 +5929,14 @@ rule wait
             .cancel_instance(&instance_id, Some("operator"), Some("cancel-instance"))
             .expect("instance cancels");
 
-        assert_eq!(cancelled_effect.sequence, 2);
-        // cancel_effect also derives the effect.cancelled settling fact at sequence 3
-        assert_eq!(paused.sequence, 4);
-        assert_eq!(resumed.sequence, 5);
-        assert_eq!(cancelled_instance.sequence, 6);
+        // Shifted by `instance.created` at sequence 1 (DR-0094).
+        assert_eq!(cancelled_effect.sequence, 3);
+        // cancel_effect also derives the effect.cancelled settling fact, now at
+        // sequence 4 -- every sequence here is one later than it was, because
+        // `instance.created` takes sequence 1 (DR-0094).
+        assert_eq!(paused.sequence, 5);
+        assert_eq!(resumed.sequence, 6);
+        assert_eq!(cancelled_instance.sequence, 7);
         check_trace(kernel.trace()).expect("kernel trace conforms");
     }
 
@@ -6124,7 +6128,8 @@ rule wait
             )
             .expect("mock turn runs");
 
-        assert_eq!(terminal.sequence, 3);
+        // Shifted by `instance.created` at sequence 1 (DR-0094).
+        assert_eq!(terminal.sequence, 4);
         check_trace(kernel.trace()).expect("kernel trace conforms");
         let mut store = kernel.into_store();
         let artifacts = store
@@ -8284,7 +8289,8 @@ rule wait
             )
             .expect("coerce runs");
 
-        assert_eq!(terminal.sequence, 3);
+        // Shifted by `instance.created` at sequence 1 (DR-0094).
+        assert_eq!(terminal.sequence, 4);
         check_trace(kernel.trace()).expect("kernel trace conforms");
         let store = kernel.into_store();
         let evidence = store.list_evidence(&instance_id).expect("evidence lists");

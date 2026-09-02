@@ -620,9 +620,12 @@ fn e2e_restart_rebuilds_projection_from_event_log() {
             .len(),
         2
     );
+    // `instance.created` (DR-0094) plus the rule commit. The load-bearing
+    // assertion here is the one above -- both effects came back out of the log
+    // -- and the instance row is now folded from the log alongside them.
     assert_eq!(
         store.list_events(&instance_id).expect("events list").len(),
-        1
+        2
     );
 }
 

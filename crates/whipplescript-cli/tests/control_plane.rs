@@ -3063,12 +3063,16 @@ fn starts_and_inspects_two_instances_independently() {
     );
     assert_eq!(ticket(&first_status), Some("one"));
     assert_eq!(ticket(&second_status), Some("two"));
+    // Two events, and both belong to THIS instance: `instance.created`
+    // (DR-0094) and the rule commit that recorded its ticket. The point of the
+    // assertion is isolation -- the sibling instance's events are not here --
+    // so it counts what this instance's log holds.
     assert_eq!(
         first_status
             .get("recent_events")
             .and_then(Value::as_array)
             .map(Vec::len),
-        Some(1)
+        Some(2)
     );
     let first_trace = run_json_isolated(
         bin,
@@ -3085,12 +3089,13 @@ fn starts_and_inspects_two_instances_independently() {
         first_trace.get("schema").and_then(Value::as_str),
         Some("whipplescript.local_trace.v0")
     );
+    // Same two as `recent_events` above: creation and the rule commit.
     assert_eq!(
         first_trace
             .get("events")
             .and_then(Value::as_array)
             .map(Vec::len),
-        Some(1)
+        Some(2)
     );
     let checked_trace = run_json_isolated(
         bin,

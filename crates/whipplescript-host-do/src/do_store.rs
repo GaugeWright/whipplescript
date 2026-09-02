@@ -2288,6 +2288,46 @@ fn do_replay_workflow_terminal<Sql: DoSql>(
     Ok(())
 }
 
+/// Apply one `instance.created` event to the `instances` projection.
+///
+/// DR-0094 parity with `apply_instance_created` in `whipplescript-store`: the
+/// fold that makes the identity columns log-derived on this host too.
+fn do_apply_instance_created<Sql: DoSql>(
+    sql: &Sql,
+    instance_id: &str,
+    payload_json: &str,
+) -> StoreResult<()> {
+    let payload: Value = serde_json::from_str(payload_json)?;
+    let text_of = |key: &str| payload.get(key).and_then(Value::as_str).unwrap_or("");
+    let program_id = text_of("program_id");
+    let version_id = text_of("version_id");
+    if program_id.is_empty() || version_id.is_empty() {
+        return Ok(());
+    }
+    sql.execute(
+        "UPDATE instances SET program_id = ?1, version_id = ?2, revision_epoch = ?3, \
+         workflow_principal = ?4, effective_authority = ?5, input_json = ?6, \
+         created_at = ?7, started_at = ?8, status = ?9 WHERE instance_id = ?10",
+        &[
+            text(program_id),
+            text(version_id),
+            int(payload
+                .get("revision_epoch")
+                .and_then(Value::as_i64)
+                .unwrap_or(0)),
+            text(text_of("workflow_principal")),
+            text(text_of("effective_authority")),
+            text(text_of("input_json")),
+            text(text_of("created_at")),
+            opt_text(payload.get("started_at").and_then(Value::as_str)),
+            text(text_of("status")),
+            text(instance_id),
+        ],
+    )
+    .map_err(sql_err)?;
+    Ok(())
+}
+
 /// Apply one `instance.transitioned` event to the `instances` projection.
 ///
 /// The ONE statement of that mutation on this host, mirroring
@@ -3560,6 +3600,19 @@ impl<Sql: DoSql> DoSqliteStore<Sql> {
                 .map_err(sql_err)?;
         }
 
+        // DR-0094 parity: the `instances` row is RESET rather than deleted
+        // (three tables reference it), so the fold recomputes it instead of
+        // adding to whatever was already there. Native counterpart carries the
+        // reasoning; `version_id`/`revision_epoch` are left for the same
+        // foreign-key reason and restored by the creation fold.
+        self.sql
+            .execute(
+                "UPDATE instances SET status = 'running', last_event_id = NULL, \
+                 last_error = NULL, completed_at = NULL WHERE instance_id = ?1",
+                &[text(instance_id)],
+            )
+            .map_err(sql_err)?;
+
         // RC-2 Delta A: when a bound is present, cut the replayed event set at
         // `sequence <= N` (INCLUSIVE). `N` is an i64 so interpolation is
         // injection-safe; when unbounded the clause is empty, leaving the
@@ -3577,7 +3630,8 @@ impl<Sql: DoSql> DoSqliteStore<Sql> {
                 &format!(
                     "SELECT event_id, event_type, payload_json, idempotency_key, causation_id, source, sequence, format_version \
                      FROM events WHERE instance_id = ?1 AND event_type IN ( \
-                     'rule.committed', 'fact.derived', 'workflow.completed', 'workflow.failed', \
+                     'instance.created', 'rule.committed', 'fact.derived', 'workflow.completed', \
+                     'workflow.failed', \
                      'instance.transitioned', 'workflow.revision_activated', 'effect.run_started', \
                      'effect.terminal', 'effect.cancelled', 'effect.cancellation_requested', \
                      'lease.expired', 'context.restored'){bound_clause} ORDER BY sequence"
@@ -3644,6 +3698,9 @@ impl<Sql: DoSql> DoSqliteStore<Sql> {
                     &event_type,
                     &payload_json,
                 )?,
+                "instance.created" => {
+                    do_apply_instance_created(&self.sql, instance_id, &payload_json)?
+                }
                 "instance.transitioned" => do_apply_instance_transitioned(
                     &self.sql,
                     instance_id,
@@ -3968,7 +4025,9 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
                 "INSERT INTO instances (instance_id, program_id, version_id, workflow_principal, \
                  effective_authority, status, input_json, started_at) VALUES \
                  ('ins_' || lower(hex(randomblob(16))), ?1, ?2, ?3, ?4, 'running', ?5, \
-                 CURRENT_TIMESTAMP) RETURNING instance_id, status",
+                 CURRENT_TIMESTAMP) RETURNING instance_id, status, program_id, version_id, \
+                 revision_epoch, workflow_principal, effective_authority, input_json, \
+                 created_at, started_at",
                 &[
                     text(instance.program_id),
                     text(instance.version_id),
@@ -3981,10 +4040,42 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
         let row = rows
             .first()
             .ok_or_else(|| sql_err("create_instance returned no row".to_string()))?;
-        Ok(InstanceRecord {
+        let record = InstanceRecord {
             instance_id: as_text(&row[0]),
             status: as_text(&row[1]),
+        };
+        // DR-0094 parity: creation is an event on this host too, so the DO's
+        // rebuild folds the same identity the native store's does. Without it
+        // the two hosts would disagree about what a rebuilt instance row is.
+        let started_at = match &row[9] {
+            SqlValue::Null => serde_json::Value::Null,
+            other => serde_json::Value::String(as_text(other)),
+        };
+        let payload = serde_json::json!({
+            "program_id": as_text(&row[2]),
+            "version_id": as_text(&row[3]),
+            "revision_epoch": as_opt_i64(&row[4]).unwrap_or(0),
+            "workflow_principal": as_text(&row[5]),
+            "effective_authority": as_text(&row[6]),
+            "input_json": as_text(&row[7]),
+            "created_at": as_text(&row[8]),
+            "started_at": started_at,
+            "status": record.status,
         })
+        .to_string();
+        do_append_event(
+            &self.sql,
+            NewEvent {
+                instance_id: &record.instance_id,
+                event_type: "instance.created",
+                payload_json: &payload,
+                source: "kernel",
+                causation_id: None,
+                correlation_id: None,
+                idempotency_key: None,
+            },
+        )?;
+        Ok(record)
     }
 
     fn list_instance_revisions(&self, instance_id: &str) -> StoreResult<Vec<WorkflowRevisionView>> {

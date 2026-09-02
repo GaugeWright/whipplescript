@@ -1314,6 +1314,41 @@ pub struct RetryEffect<'a> {
     pub idempotency_key: Option<&'a str>,
 }
 
+/// What `instance.created` records: every column the INSERT set, so the fold
+/// can reproduce the row rather than assume it.
+#[cfg(feature = "native")]
+struct CreatedInstance {
+    program_id: String,
+    version_id: String,
+    revision_epoch: i64,
+    workflow_principal: String,
+    effective_authority: String,
+    input_json: String,
+    created_at: String,
+    started_at: Option<String>,
+    status: String,
+}
+
+#[cfg(feature = "native")]
+impl CreatedInstance {
+    fn to_payload(&self) -> String {
+        json!({
+            "program_id": self.program_id,
+            "version_id": self.version_id,
+            "revision_epoch": self.revision_epoch,
+            "workflow_principal": self.workflow_principal,
+            // Stored as a JSON TEXT column; carried verbatim so the fold writes
+            // back the same bytes rather than a re-serialisation of them.
+            "effective_authority": self.effective_authority,
+            "input_json": self.input_json,
+            "created_at": self.created_at,
+            "started_at": self.started_at,
+            "status": self.status,
+        })
+        .to_string()
+    }
+}
+
 #[cfg(feature = "native")]
 struct Migration {
     version: i64,
@@ -1728,14 +1763,22 @@ impl SqliteStore {
         self.create_instance_with_authority(instance, NewInstanceAuthority::empty())
     }
 
+    /// Create an instance AND record its creation in the log.
+    ///
+    /// DR-0094: the `instances` row used to be the one projection with no event
+    /// behind it — the identity fields existed only here, so folding the log
+    /// could not reproduce the row and `rebuild_projections` had to PATCH it
+    /// rather than recompute it. `instance.created` carries what the INSERT
+    /// wrote, so the fold can. The two go in one transaction: a row without its
+    /// creation event is exactly the state the fold cannot reconstruct.
     pub fn create_instance_with_authority(
         &self,
         instance: NewInstance<'_>,
         authority: NewInstanceAuthority<'_>,
     ) -> StoreResult<InstanceRecord> {
-        self.connection
-            .query_row(
-                r#"
+        let tx = self.connection.unchecked_transaction()?;
+        let (record, created) = tx.query_row(
+            r#"
                 INSERT INTO instances (
                     instance_id,
                     program_id,
@@ -1756,23 +1799,62 @@ impl SqliteStore {
                     ?5,
                     CURRENT_TIMESTAMP
                 )
-                RETURNING instance_id, status
+                RETURNING
+                    instance_id,
+                    status,
+                    program_id,
+                    version_id,
+                    revision_epoch,
+                    workflow_principal,
+                    effective_authority,
+                    input_json,
+                    created_at,
+                    started_at
                 "#,
-                params![
-                    instance.program_id,
-                    instance.version_id,
-                    authority.workflow_principal,
-                    authority.effective_authority_json,
-                    instance.input_json,
-                ],
-                |row| {
-                    Ok(InstanceRecord {
+            params![
+                instance.program_id,
+                instance.version_id,
+                authority.workflow_principal,
+                authority.effective_authority_json,
+                instance.input_json,
+            ],
+            |row| {
+                Ok((
+                    InstanceRecord {
                         instance_id: row.get(0)?,
                         status: row.get(1)?,
-                    })
-                },
-            )
-            .map_err(Into::into)
+                    },
+                    // The timestamps are read back rather than recomputed: the
+                    // fold has to reproduce what the INSERT actually wrote, and
+                    // a second `CURRENT_TIMESTAMP` is a different instant.
+                    CreatedInstance {
+                        program_id: row.get::<_, String>(2)?,
+                        version_id: row.get::<_, String>(3)?,
+                        revision_epoch: row.get::<_, i64>(4)?,
+                        workflow_principal: row.get::<_, String>(5)?,
+                        effective_authority: row.get::<_, String>(6)?,
+                        input_json: row.get::<_, String>(7)?,
+                        created_at: row.get::<_, String>(8)?,
+                        started_at: row.get::<_, Option<String>>(9)?,
+                        status: row.get::<_, String>(1)?,
+                    },
+                ))
+            },
+        )?;
+        append_event_on(
+            &tx,
+            NewEvent {
+                instance_id: &record.instance_id,
+                event_type: "instance.created",
+                payload_json: &created.to_payload(),
+                source: "kernel",
+                causation_id: None,
+                correlation_id: None,
+                idempotency_key: None,
+            },
+        )?;
+        tx.commit()?;
+        Ok(record)
     }
 
     pub fn list_instance_revisions(
@@ -6395,6 +6477,42 @@ impl SqliteStore {
         tx.execute("DELETE FROM effects WHERE instance_id = ?1", [instance_id])?;
         tx.execute("DELETE FROM facts WHERE instance_id = ?1", [instance_id])?;
 
+        // The `instances` row is RESET rather than deleted: three tables carry
+        // `REFERENCES instances(instance_id)` and `PRAGMA foreign_keys` is ON,
+        // so the row has to outlive the rebuild that recomputes it. Resetting
+        // is what makes the fold a recomputation instead of a patch — every
+        // column below is owned by an event, and leaving them in place meant a
+        // fold could only ever ADD to what was already there. That is why
+        // `completed_at` survived a rebuild that should not have produced it,
+        // and why `reset_instance_to_running` had to exist as a manual step
+        // beside prefix replay.
+        //
+        // The identity columns (`program_id`, `input_json`, `created_at`,
+        // `started_at`, the authority pair) are reset ONLY when the log carries
+        // the `instance.created` event that can restore them. An instance whose
+        // log predates that event keeps them, because nothing in its log could
+        // put them back — its row is as log-derived as its log allows, and the
+        // difference is visible rather than assumed.
+        // `version_id` and `revision_epoch` are NOT cleared here even though
+        // they are log-owned: `version_id` carries
+        // `REFERENCES program_versions(version_id)`, so there is no empty value
+        // to reset it to. `apply_instance_created` writes both unconditionally
+        // and the activation fold moves them, so they are recomputed anyway —
+        // for an instance whose log carries a creation event. For one whose log
+        // does not, `set_instance_version` is still the way to place them, and
+        // that is the residue this change leaves rather than hides.
+        tx.execute(
+            r#"
+            UPDATE instances
+            SET status = 'running',
+                last_event_id = NULL,
+                last_error = NULL,
+                completed_at = NULL
+            WHERE instance_id = ?1
+            "#,
+            [instance_id],
+        )?;
+
         let fetched = {
             // RC-2 Delta A: when a bound is present, cut the replayed event set
             // at `sequence <= N` (INCLUSIVE). `N` is an i64 so interpolation is
@@ -6414,6 +6532,7 @@ impl SqliteStore {
                 FROM events
                 WHERE instance_id = ?1
                   AND event_type IN (
+                      'instance.created',
                       'rule.committed',
                       'fact.derived',
                       'workflow.completed',
@@ -6512,6 +6631,7 @@ impl SqliteStore {
                     &event_type,
                     &payload_json,
                 )?,
+                "instance.created" => apply_instance_created(&tx, instance_id, &payload_json)?,
                 "instance.transitioned" => {
                     apply_instance_transitioned(&tx, instance_id, &event_id, &payload_json)?
                 }
@@ -11228,6 +11348,59 @@ fn replay_workflow_terminal(
     Ok(())
 }
 
+/// Apply one `instance.created` event to the `instances` projection.
+///
+/// The fold that makes the row log-derived: it writes back exactly what the
+/// INSERT wrote, so a rebuild recomputes the identity columns instead of
+/// trusting whatever the row already held. An instance whose log predates this
+/// event has none, and `rebuild_projections` leaves its identity columns alone
+/// — see the reset there for what that costs.
+#[cfg(feature = "native")]
+fn apply_instance_created(
+    connection: &Connection,
+    instance_id: &str,
+    payload_json: &str,
+) -> StoreResult<()> {
+    let payload: Value = serde_json::from_str(payload_json)?;
+    let text = |key: &str| payload.get(key).and_then(Value::as_str).unwrap_or("");
+    let program_id = text("program_id");
+    let version_id = text("version_id");
+    if program_id.is_empty() || version_id.is_empty() {
+        return Ok(());
+    }
+    connection.execute(
+        r#"
+        UPDATE instances
+        SET program_id = ?1,
+            version_id = ?2,
+            revision_epoch = ?3,
+            workflow_principal = ?4,
+            effective_authority = ?5,
+            input_json = ?6,
+            created_at = ?7,
+            started_at = ?8,
+            status = ?9
+        WHERE instance_id = ?10
+        "#,
+        params![
+            program_id,
+            version_id,
+            payload
+                .get("revision_epoch")
+                .and_then(Value::as_i64)
+                .unwrap_or(0),
+            text("workflow_principal"),
+            text("effective_authority"),
+            text("input_json"),
+            text("created_at"),
+            payload.get("started_at").and_then(Value::as_str),
+            text("status"),
+            instance_id,
+        ],
+    )?;
+    Ok(())
+}
+
 /// Apply one `instance.transitioned` event to the `instances` projection.
 ///
 /// The ONE statement of that mutation: `transition_instance` calls this after
@@ -14206,16 +14379,19 @@ mod tests {
             })
             .expect("terminal commit succeeds");
 
-        assert_eq!(event.sequence, 1);
+        // Sequence 1 is `instance.created`; the terminal commit is the second
+        // event this instance's log carries.
+        assert_eq!(event.sequence, 2);
         assert_eq!(instance_status(&store, &instance.instance_id), "completed");
         let event_type = store
             .connection
             .query_row(
-                "SELECT event_type FROM events WHERE instance_id = ?1 AND sequence = 2",
+                "SELECT event_type FROM events WHERE instance_id = ?1 AND sequence = 3",
                 [&instance.instance_id],
                 |row| row.get::<_, String>(0),
             )
             .expect("terminal event type");
+        // 1 `instance.created`, 2 `rule.committed`, 3 the terminal.
         assert_eq!(event_type, "workflow.completed");
 
         let duplicate = store.commit_rule(RuleCommit {
@@ -15073,7 +15249,8 @@ mod tests {
             .expect("instance cancels");
 
         assert_eq!(instance_status(&store, &instance.instance_id), "cancelled");
-        assert_eq!(row_count(&store, "events"), 3);
+        // `instance.created` plus the three transitions.
+        assert_eq!(row_count(&store, "events"), 4);
     }
 
     #[test]
@@ -16925,6 +17102,159 @@ mod tests {
         assert_eq!(lease_status(&store, "lease-replay-running"), "active");
     }
 
+    /// The whole `instances` row is derived from the log, not just the columns
+    /// a fold happens to touch.
+    ///
+    /// `rebuild_projections` used to PATCH this row: it deleted and re-derived
+    /// effects, facts, leases and runs, but left `instances` in place and let
+    /// each fold write over it. So a column no surviving event set could
+    /// survive whatever was already there — which is why `completed_at`
+    /// outlived a rebuild that should not have produced it, and why
+    /// `reset_instance_to_running` existed as a manual step beside prefix
+    /// replay. `instance.created` gives the identity columns an event, and the
+    /// rebuild now resets the log-owned columns before folding.
+    ///
+    /// Asserted by CORRUPTING every column first: if the rebuild reproduces the
+    /// row from a deliberately wrong one, the row is a function of the log.
+    #[test]
+    fn a_rebuild_reproduces_the_whole_instance_row_from_the_log() {
+        let mut store = SqliteStore::open_in_memory().expect("store opens");
+        let version = store
+            .create_program_version(test_program_version("LogDerived", "source-ld", "ir-ld"))
+            .expect("program version creates");
+        let other = store
+            .create_program_version(test_program_version("LogDerived", "source-ld2", "ir-ld2"))
+            .expect("second program version creates");
+        let instance = store
+            .create_instance(NewInstance {
+                program_id: &version.program_id,
+                version_id: &version.version_id,
+                input_json: r#"{"seed":1}"#,
+            })
+            .expect("instance creates");
+        store
+            .transition_instance(InstanceTransition {
+                instance_id: &instance.instance_id,
+                status: "failed",
+                reason: Some("the flow auto-failed"),
+                idempotency_key: Some("fail"),
+            })
+            .expect("instance fails");
+
+        let columns = "program_id, version_id, revision_epoch, workflow_principal, \
+                       effective_authority, status, input_json, last_error, \
+                       created_at, started_at, completed_at IS NOT NULL";
+        let read = |store: &SqliteStore| -> Vec<String> {
+            store
+                .connection
+                .query_row(
+                    &format!("SELECT {columns} FROM instances WHERE instance_id = ?1"),
+                    [&instance.instance_id],
+                    |row| {
+                        Ok((0..11)
+                            .map(|index| {
+                                row.get::<_, Option<String>>(index)
+                                    .map(|value| value.unwrap_or_else(|| "NULL".to_owned()))
+                                    .or_else(|_| row.get::<_, i64>(index).map(|n| n.to_string()))
+                                    .unwrap_or_else(|_| "?".to_owned())
+                            })
+                            .collect::<Vec<_>>())
+                    },
+                )
+                .expect("the instance row reads back")
+        };
+        let expected = read(&store);
+
+        // Every column wrong, including the ones no fold used to touch. The
+        // version pointer moves to a real second version so the foreign key
+        // still holds -- the corruption has to be one the schema admits.
+        store
+            .connection
+            .execute(
+                "UPDATE instances SET program_id = program_id, version_id = ?2, \
+                 revision_epoch = 99, workflow_principal = 'wrong', \
+                 effective_authority = '[\"wrong\"]', status = 'running', \
+                 input_json = '{\"wrong\":true}', last_error = 'wrong', \
+                 created_at = '1999-01-01 00:00:00', started_at = '1999-01-01 00:00:00', \
+                 completed_at = NULL WHERE instance_id = ?1",
+                params![&instance.instance_id, &other.version_id],
+            )
+            .expect("the row is corrupted");
+        assert_ne!(
+            read(&store),
+            expected,
+            "the corruption must actually differ"
+        );
+
+        store
+            .rebuild_projections(&instance.instance_id)
+            .expect("projections rebuild");
+
+        assert_eq!(
+            read(&store),
+            expected,
+            "the rebuild did not reproduce the instance row from the log"
+        );
+    }
+
+    /// Bounded replay ROLLS BACK. `rebuild_projections_to(N)` is documented as
+    /// reconstructing state as of `N`; before the reset it could only ever add
+    /// to the row it found, so a terminal stamped after the cut survived a
+    /// rebuild that was supposed to predate it. `reset_instance_to_running`
+    /// exists because of exactly that, as a manual step beside prefix replay.
+    #[test]
+    fn a_bounded_rebuild_rolls_the_instance_back_past_its_terminal() {
+        let mut store = SqliteStore::open_in_memory().expect("store opens");
+        let version = store
+            .create_program_version(test_program_version("Bounded", "source-b", "ir-b"))
+            .expect("program version creates");
+        let instance = store
+            .create_instance(NewInstance {
+                program_id: &version.program_id,
+                version_id: &version.version_id,
+                input_json: "{}",
+            })
+            .expect("instance creates");
+        store
+            .transition_instance(InstanceTransition {
+                instance_id: &instance.instance_id,
+                status: "failed",
+                reason: Some("the flow auto-failed"),
+                idempotency_key: Some("fail"),
+            })
+            .expect("instance fails");
+
+        let creation_sequence: i64 = store
+            .connection
+            .query_row(
+                "SELECT sequence FROM events WHERE instance_id = ?1 \
+                 AND event_type = 'instance.created'",
+                [&instance.instance_id],
+                |row| row.get(0),
+            )
+            .expect("the creation event is in the log");
+
+        // Cut at creation: the terminal is after it, so it must not survive.
+        store
+            .rebuild_projections_to(&instance.instance_id, creation_sequence)
+            .expect("bounded rebuild");
+
+        let (status, last_error, completed): (String, Option<String>, Option<String>) = store
+            .connection
+            .query_row(
+                "SELECT status, last_error, completed_at FROM instances WHERE instance_id = ?1",
+                [&instance.instance_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("the instance row reads back");
+        assert_eq!(status, "running", "the terminal was after the cut");
+        assert_eq!(last_error, None, "the failure reason was after the cut");
+        assert_eq!(
+            completed, None,
+            "`completed_at` outlived a rebuild that predates the terminal that set it"
+        );
+    }
+
     /// The projection must be a FUNCTION OF THE LOG: folding the log has to
     /// reproduce the row the forward path wrote, field for field.
     ///
@@ -17006,21 +17336,12 @@ mod tests {
             let forward = row_of(&store, &instance.instance_id);
             assert_eq!(forward.status, next);
 
-            // `rebuild_projections` DELETES and re-derives effects, facts,
-            // leases and runs, but it PATCHES the `instances` row rather than
-            // clearing it -- and the fold's `ELSE completed_at` preserves
-            // whatever is already there. So the forward path's own stamp masks
-            // whether the fold would have produced it. Clear the columns the
-            // fold owns, so this asserts what "a function of the log" means:
-            // the log alone reproduces the row.
-            store
-                .connection
-                .execute(
-                    "UPDATE instances SET status = 'running', last_error = NULL, \
-                     completed_at = NULL WHERE instance_id = ?1",
-                    [&instance.instance_id],
-                )
-                .expect("the projection row clears");
+            // This used to clear the row by hand, because `rebuild_projections`
+            // PATCHED it and the fold's `ELSE completed_at` preserved the
+            // forward path's own stamp -- so the assertion below could not tell
+            // whether the fold had produced the value or merely left it. The
+            // rebuild resets the log-owned columns itself now (DR-0094), so the
+            // hand-clearing is gone and this asserts the real thing.
 
             store
                 .rebuild_projections(&instance.instance_id)
@@ -18376,8 +18697,10 @@ mod tests {
         assert!(!runs[0].cancel_requested);
 
         let events = store.list_events(&instance_id).expect("events list");
-        assert_eq!(events.len(), 3);
+        // Creation is itself an event now, so it is the first of the four.
+        assert_eq!(events.len(), 4);
         assert_eq!(events[0].sequence, 1);
+        assert_eq!(events[0].event_type, "instance.created");
 
         let status = store
             .status(&instance_id)
@@ -18388,7 +18711,8 @@ mod tests {
         assert_eq!(status.blocked_effect_count, 0);
         assert_eq!(status.active_run_count, 1);
         assert_eq!(status.failure_count, 0);
-        assert_eq!(status.recent_events.len(), 3);
+        // Creation joins the log, so the recent-event window shows four.
+        assert_eq!(status.recent_events.len(), 4);
     }
 
     /// The narrowed run lookup answers with the row `list_runs` + a linear
