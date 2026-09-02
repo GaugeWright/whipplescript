@@ -31183,17 +31183,6 @@ fn view(options: &CliOptions) -> ExitCode {
         }
         Err(error) => return report_store_error("failed to load instance", error),
     };
-    let version = match store.get_program_version(&instance.version_id) {
-        Ok(version) => version,
-        Err(error) => return report_store_error("failed to load program version", error),
-    };
-    let ir_hash = version.map(|version| version.ir_hash).unwrap_or_default();
-    // The snapshot rides under the version's own `ir_hash` (the view-model
-    // note's G1), so there is no second pointer to follow.
-    let snapshot = match store.get_content(&ir_hash) {
-        Ok(snapshot) => snapshot,
-        Err(error) => return report_store_error("failed to load the program snapshot", error),
-    };
     let events = match store.list_events(instance_id) {
         Ok(events) => events,
         Err(error) => return report_store_error("failed to load events", error),
@@ -31207,14 +31196,43 @@ fn view(options: &CliOptions) -> ExitCode {
         Err(error) => return report_store_error("failed to load runs", error),
     };
 
-    let view = instance_view::project(
-        &instance,
-        &ir_hash,
-        snapshot.as_deref(),
-        &events,
-        &effects,
-        &runs,
-    );
+    // A revision moves a live instance between program versions, so its firings
+    // can belong to more than one (the view-model note's G3). Load every version
+    // the commits name, not just the current one, or older firings get drawn
+    // against a structure they never ran under.
+    let mut version_ids: Vec<String> = vec![instance.version_id.clone()];
+    for event in &events {
+        if event.event_type != "rule.committed" {
+            continue;
+        }
+        if let Ok(payload) = serde_json::from_str::<Value>(&event.payload_json) {
+            if let Some(id) = payload.get("program_version_id").and_then(Value::as_str) {
+                if !version_ids.iter().any(|seen| seen == id) {
+                    version_ids.push(id.to_owned());
+                }
+            }
+        }
+    }
+    let mut versions = std::collections::BTreeMap::new();
+    for version_id in version_ids {
+        let ir_hash = match store.get_program_version(&version_id) {
+            Ok(Some(version)) => version.ir_hash,
+            Ok(None) => continue,
+            Err(error) => return report_store_error("failed to load program version", error),
+        };
+        // The snapshot rides under the version's own `ir_hash` (G1), so there
+        // is no second pointer to follow.
+        let snapshot = match store.get_content(&ir_hash) {
+            Ok(snapshot) => snapshot,
+            Err(error) => return report_store_error("failed to load the program snapshot", error),
+        };
+        versions.insert(
+            version_id,
+            instance_view::VersionSnapshot { ir_hash, snapshot },
+        );
+    }
+
+    let view = instance_view::project(&instance, &versions, &events, &effects, &runs);
 
     if options.json {
         return emit_json(view);

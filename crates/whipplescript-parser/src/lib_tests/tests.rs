@@ -9668,6 +9668,10 @@ fn invalid_fixtures_have_actionable_diagnostics() {
             include_str!("../../../../examples/invalid/bounded-tracker-ring.whip"),
         ),
         (
+            "bounded-channel-ring",
+            include_str!("../../../../examples/invalid/bounded-channel-ring.whip"),
+        ),
+        (
             "bad-record",
             include_str!("../../../../examples/invalid/bad-record.whip"),
         ),
@@ -13273,6 +13277,59 @@ fn bounded_workflow_refuses_a_tracker_mediated_ring() {
             diagnostic.code.as_str() == "graph.bounded_workflow_effect_cycle"
                 && diagnostic.message.contains("spin -> spin")
         }),
+        "{:?}",
+        compiled.diagnostics
+    );
+}
+
+/// The channel half of DR-0085's coupling: a rule that observes a channel and
+/// sends to the same one re-presents its own work, exactly as a tracker
+/// `release` does. `send` lowers through the package construct path rather than
+/// a dedicated effect kind, which is why this was scoped out of the original
+/// record and closed separately.
+#[test]
+fn bounded_workflow_refuses_a_channel_mediated_ring() {
+    let source = include_str!("../../../../examples/invalid/bounded-channel-ring.whip");
+    let compiled = compile_program(source);
+
+    assert!(compiled.ir.is_none());
+    assert!(
+        compiled.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code.as_str() == "graph.bounded_workflow_effect_cycle"
+                && diagnostic.message.contains("echo_forever -> echo_forever")
+        }),
+        "{:?}",
+        compiled.diagnostics
+    );
+}
+
+/// And the same loop stays legal where it was always legal.
+/// `examples/messaging-demo.whip` IS this ring — `acknowledge_message` observes
+/// `ops_room` and sends to it — under `@service`, where a world-paced loop needs
+/// no declaration. The edge now appears in its graph; the refusal still does not.
+#[test]
+fn a_channel_ring_is_legal_in_a_workflow_that_never_promised_to_settle() {
+    let source = include_str!("../../../../examples/messaging-demo.whip");
+    let compiled = compile_program(source);
+    let ir = compiled
+        .ir
+        .as_ref()
+        .unwrap_or_else(|| panic!("messaging-demo compiles: {:?}", compiled.diagnostics));
+
+    assert!(
+        ir.rule_dependencies.iter().any(|dependency| {
+            dependency.producer == "acknowledge_message"
+                && dependency.consumer == "acknowledge_message"
+                && dependency.fact == "channel:ops_room"
+        }),
+        "the self-ring is drawn: {:?}",
+        ir.rule_dependencies
+    );
+    assert!(
+        !compiled
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code.as_str() == "graph.bounded_workflow_effect_cycle"),
         "{:?}",
         compiled.diagnostics
     );

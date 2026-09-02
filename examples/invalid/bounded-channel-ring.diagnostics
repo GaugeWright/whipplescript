@@ -1,0 +1,12 @@
+warning[effect.unhandled_failure]: effect `ack`'s failure is unhandled in rule `echo_forever`; if it fails or times out, the instance will auto-fail with a generic reason
+   --> examples/invalid/bounded-channel-ring.whip:28:3
+   |
+28 |   send via ops_room {
+   |   ^^^^^^^^^^^^^^^^^^^
+   = help: handle it with `after ack fails { … }` (typed failure or recovery) or observe every outcome with `after ack completes`
+error[graph.bounded_workflow_effect_cycle]: effect cycle in a bounded workflow is not allowed: workflow `BoundedChannelRing` is `@bounded`, and rule cycle echo_forever -> echo_forever runs the effects of rule `echo_forever` on every turn
+   --> examples/invalid/bounded-channel-ring.whip:28:3
+   |
+28 |   send via ops_room {
+   |   ^^^^^^^^^^^^^^^^^^^
+   = help: a bounded workflow settles instead of turning, so it may not loop with the world without a proof: give the cycle a measure — an `int` field every hop advances by a literal step, with a rule on the cycle bounding it — or break the cycle, or drop `@bounded` if this workflow is meant to keep going

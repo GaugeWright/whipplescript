@@ -10239,7 +10239,8 @@ fn dependency_read_facts(metadata: &IrRuleMetadata) -> Vec<String> {
         .collect()
 }
 
-/// DR-0085: the trackers a rule observes, as `tracker:<name>`.
+/// DR-0085: the declared resources a rule observes — `tracker:<name>` for
+/// `when <tracker> has ready issue`, `channel:<name>` for `when message from`.
 ///
 /// Mirrors the pattern `binding_resources` already matches for binding
 /// resolution, so the two cannot disagree about what a tracker observation
@@ -10255,11 +10256,19 @@ fn tracker_resource_reads(rule: &RuleDecl, semantic: &SemanticContext) -> Vec<St
                 reads.insert(format!("tracker:{}", words[0]));
             }
         }
+        // A channel observation is the same shape one word over: the resource
+        // is named after `message from` rather than first.
+        if let ["message", "from", channel] = &words[..words.len().min(3)] {
+            if semantic.channels.contains(*channel) {
+                reads.insert(format!("channel:{channel}"));
+            }
+        }
     }
     reads.into_iter().collect()
 }
 
-/// DR-0085: the trackers a rule puts ready work INTO, as `tracker:<name>`.
+/// DR-0085: the declared resources a rule puts work INTO — a tracker `file`
+/// or `release`, or a `send via <channel>`.
 ///
 /// `file` creates a ready issue. `release` returns a claimed one to ready, which
 /// is the same availability from a consumer's side and is how a review loop
@@ -10285,6 +10294,28 @@ fn tracker_resource_writes(
         if let Some(queue) = queue {
             if semantic.trackers.contains(&queue) {
                 writes.insert(format!("tracker:{queue}"));
+            }
+        }
+        // `send via <channel>` puts a message where `when message from <channel>`
+        // observes it. The verb lowers through the package construct path rather
+        // than a dedicated effect kind, so the channel is read off the `via`
+        // slot the std.messaging manifest names.
+        if let body::BodyEffectKind::ConstructCapabilityCall {
+            target_capability,
+            fields,
+            ..
+        } = &effect.kind
+        {
+            if target_capability == "messaging.send" {
+                if let Some(channel) = fields
+                    .iter()
+                    .find(|field| field.name == "channel")
+                    .map(|field| field.source.trim().to_owned())
+                {
+                    if semantic.channels.contains(&channel) {
+                        writes.insert(format!("channel:{channel}"));
+                    }
+                }
             }
         }
     });

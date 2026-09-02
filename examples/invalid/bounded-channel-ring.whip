@@ -1,0 +1,37 @@
+# The channel half of DR-0085's resource coupling: a rule that observes a
+# channel and sends to the same one re-presents its own work, exactly as a
+# tracker `release` does.
+#
+# Every hop waits on an effect terminal, so this is world-paced and legal in an
+# ordinary workflow — `examples/messaging-demo.whip` is precisely this loop and
+# compiles. `@bounded` is the author's declaration that this workflow settles,
+# and looping with the world is what that rules out.
+#
+# Before the channel edges, `rule_dependencies` carried only tracker and
+# schema-fact coupling, so this ring was invisible to the refusal that exists
+# to catch it.
+@bounded
+workflow BoundedChannelRing
+
+use std.messaging
+
+output result Report
+class Report { seen int }
+
+channel ops_room {
+  provider fixture
+}
+
+rule echo_forever
+  when message from ops_room as msg
+=> {
+  send via ops_room {
+    text "ack"
+  } as ack
+}
+
+rule settle
+  when Report as r
+=> {
+  complete result { seen r.seen }
+}

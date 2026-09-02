@@ -133,20 +133,44 @@ fn runs_for<'a>(runs: &'a [RunView], effect_id: &str) -> Vec<&'a RunView> {
         .collect()
 }
 
+/// One program version's stored structure: the `ir_hash` the version carries,
+/// and the `.ir` that hash names when the store holds it.
+#[derive(Clone, Debug, Default)]
+pub struct VersionSnapshot {
+    pub ir_hash: String,
+    pub snapshot: Option<String>,
+}
+
 /// Project one instance into the view model.
 ///
-/// `snapshot_text` is the `.ir` the version's `ir_hash` names. Without it the
-/// structure — and therefore absence — is not recoverable, and the view says so
-/// rather than presenting a runtime-only picture as if it were whole.
+/// `versions` is keyed by `program_version_id`, and a firing is drawn against
+/// ITS OWN version rather than the instance's current one. A revision moves a
+/// live instance between program versions, so its effects can belong to two
+/// different static graphs (the note's G3); drawing an older firing against the
+/// newer structure would predict ids from the wrong nodes and report absences
+/// that are artefacts of the revision.
+///
+/// Without a version's snapshot, structure — and therefore absence — is not
+/// recoverable for its firings, and the view says so rather than presenting a
+/// runtime-only picture as if it were whole.
 pub fn project(
     instance: &InstanceView,
-    ir_hash: &str,
-    snapshot_text: Option<&str>,
+    versions: &BTreeMap<String, VersionSnapshot>,
     events: &[EventView],
     effects: &[EffectView],
     runs: &[RunView],
 ) -> Value {
-    let structure = snapshot_text.map(snapshot::parse);
+    let parsed: BTreeMap<&str, snapshot::SnapshotView> = versions
+        .iter()
+        .filter_map(|(version_id, version)| {
+            Some((
+                version_id.as_str(),
+                snapshot::parse(version.snapshot.as_ref()?),
+            ))
+        })
+        .collect();
+    let current = versions.get(&instance.version_id);
+    let structure = parsed.get(instance.version_id.as_str());
     let by_id: BTreeMap<&str, &EffectView> = effects
         .iter()
         .map(|effect| (effect.effect_id.as_str(), effect))
@@ -173,8 +197,10 @@ pub fn project(
         let group = &grouped[key];
         let (rule, identity) = key;
         let first = group[0];
+        // G3: this firing's OWN version, not the instance's current one.
+        let firing_structure = parsed.get(first.program_version_id.as_str());
         let mut slots = Vec::new();
-        if let Some(view) = structure.as_ref().and_then(|view| view.rule(rule)) {
+        if let Some(view) = firing_structure.and_then(|view| view.rule(rule)) {
             for node in &view.effects {
                 // The epoch key for an unbranched, never-restored instance is
                 // the bare epoch (`rule_pass::revision_branch_key`). A branched
@@ -255,8 +281,20 @@ pub fn project(
             })).collect::<Vec<_>>(),
             "program_version_id": first.program_version_id,
             "revision_epoch": first.revision_epoch,
+            // Stated per firing: a revision means the answer differs BETWEEN
+            // firings of one instance, so one flag at the top would be wrong.
+            "structure_available": firing_structure.is_some(),
             "effects": slots,
         }));
+    }
+
+    // Every program version the firings actually belong to, in order. More than
+    // one means the instance was revised mid-flight.
+    let mut versions_seen: Vec<String> = Vec::new();
+    for commit in &commits {
+        if !versions_seen.contains(&commit.program_version_id) {
+            versions_seen.push(commit.program_version_id.clone());
+        }
     }
 
     // Self-check. Every effect a commit reported creating should have been
@@ -278,11 +316,17 @@ pub fn project(
             "status": instance.status,
             "program_version_id": instance.version_id,
             "revision_epoch": instance.revision_epoch,
-            "ir_hash": ir_hash,
+            "ir_hash": current.map(|version| version.ir_hash.clone()).unwrap_or_default(),
         },
-        "structure": match &structure {
+        // G3, said out loud: this instance was revised while running, so its
+        // firings do not all belong to one program. A reader that assumed one
+        // structure would be reading some of them against the wrong graph.
+        "program_versions_seen": versions_seen,
+        "structure": match structure {
             Some(view) => json!({
                 "available": true,
+                "program_version_id": instance.version_id,
+                "ir_hash": current.map(|version| version.ir_hash.clone()).unwrap_or_default(),
                 "workflow": view.workflow,
                 "rules": view.rules.iter().map(|rule| json!({
                     "name": rule.name,
@@ -308,6 +352,7 @@ pub fn project(
             // not computable and the firings below carry no slots.
             None => json!({
                 "available": false,
+                "program_version_id": instance.version_id,
                 "reason": "no .ir snapshot is stored under this version's ir_hash",
             }),
         },
@@ -320,6 +365,21 @@ pub fn project(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn versions(entries: &[(&str, Option<&str>)]) -> BTreeMap<String, VersionSnapshot> {
+        entries
+            .iter()
+            .map(|(version_id, snapshot)| {
+                (
+                    (*version_id).to_owned(),
+                    VersionSnapshot {
+                        ir_hash: format!("ir-{version_id}"),
+                        snapshot: snapshot.map(str::to_owned),
+                    },
+                )
+            })
+            .collect()
+    }
 
     fn instance() -> InstanceView {
         InstanceView {
@@ -398,8 +458,7 @@ mod tests {
         let first = id_for("first", None, "id-1");
         let view = project(
             &instance(),
-            "ir1",
-            Some(SNAPSHOT),
+            &versions(&[("ver_1", Some(SNAPSHOT))]),
             &[commit_event("id-1", &[&first])],
             &[effect(&first, "completed")],
             &[],
@@ -426,8 +485,7 @@ mod tests {
         let second = id_for("second", Some(("first", "succeeds")), "id-1");
         let view = project(
             &instance(),
-            "ir1",
-            Some(SNAPSHOT),
+            &versions(&[("ver_1", Some(SNAPSHOT))]),
             &[commit_event("id-1", &[&first, &second])],
             &[effect(&first, "completed"), effect(&second, "running")],
             &[],
@@ -451,8 +509,7 @@ mod tests {
 
         let view = project(
             &instance(),
-            "ir1",
-            Some(SNAPSHOT),
+            &versions(&[("ver_1", Some(SNAPSHOT))]),
             &[commit_event("id-1", &[&first]), later],
             &[effect(&first, "completed"), effect(&second, "queued")],
             &[],
@@ -471,8 +528,7 @@ mod tests {
         let b = id_for("first", None, "id-2");
         let view = project(
             &instance(),
-            "ir1",
-            Some(SNAPSHOT),
+            &versions(&[("ver_1", Some(SNAPSHOT))]),
             &[commit_event("id-1", &[&a]), commit_event("id-2", &[&b])],
             &[effect(&a, "completed"), effect(&b, "blocked_by_capacity")],
             &[],
@@ -492,8 +548,7 @@ mod tests {
     fn an_effect_no_prediction_claims_is_reported_not_ignored() {
         let view = project(
             &instance(),
-            "ir1",
-            Some(SNAPSHOT),
+            &versions(&[("ver_1", Some(SNAPSHOT))]),
             &[commit_event("id-1", &["key_from_another_keying"])],
             &[effect("key_from_another_keying", "completed")],
             &[],
@@ -512,8 +567,7 @@ mod tests {
     fn a_missing_snapshot_is_stated_not_silently_empty() {
         let view = project(
             &instance(),
-            "ir1",
-            None,
+            &versions(&[("ver_1", None)]),
             &[commit_event("id-1", &[])],
             &[],
             &[],
@@ -529,6 +583,76 @@ mod tests {
         );
     }
 
+    /// G3: a revision moves a live instance between program versions, so one
+    /// instance's firings can belong to two different static graphs. Each is
+    /// drawn against ITS OWN version — drawing the older one against the newer
+    /// structure would predict ids from nodes it never had and report absences
+    /// that are artefacts of the revision, not of the run.
+    #[test]
+    fn a_revised_instance_draws_each_firing_against_its_own_version() {
+        // v2 renamed the second node, so the two versions disagree about what
+        // this rule contains.
+        const V2: &str = "workflow Demo\n\
+            rules\n  \
+            rule work\n    \
+            when started\n    \
+            effects\n      \
+            first kind=exec.command binding=first key=k1\n      \
+            renamed kind=exec.command binding=renamed key=k9 arm=first:succeeds\n";
+
+        let old_first = id_for("first", None, "id-1");
+        let mut new_commit = commit_event("id-2", &[]);
+        new_commit.sequence = 9;
+        new_commit.payload_json = new_commit.payload_json.replace("\"ver_1\"", "\"ver_2\"");
+
+        let mut current = instance();
+        current.version_id = "ver_2".to_owned();
+
+        let view = project(
+            &current,
+            &versions(&[("ver_1", Some(SNAPSHOT)), ("ver_2", Some(V2))]),
+            &[commit_event("id-1", &[&old_first]), new_commit],
+            &[effect(&old_first, "completed")],
+            &[],
+        );
+
+        assert_eq!(
+            view["program_versions_seen"],
+            json!(["ver_1", "ver_2"]),
+            "the split is stated, not hidden behind one structure"
+        );
+        let firings = view["firings"].as_array().expect("firings");
+        // The old firing keeps the node its own version had...
+        assert_eq!(firings[0]["program_version_id"], "ver_1");
+        assert_eq!(firings[0]["effects"][1]["node"], "second");
+        // ...and the new one gets the renamed node, from v2.
+        assert_eq!(firings[1]["program_version_id"], "ver_2");
+        assert_eq!(firings[1]["effects"][1]["node"], "renamed");
+    }
+
+    /// A version whose snapshot the store does not hold makes absence
+    /// uncomputable for ITS firings only. Said per firing, because after a
+    /// revision the answer genuinely differs between them.
+    #[test]
+    fn a_firing_whose_version_has_no_snapshot_says_so_for_itself() {
+        let first = id_for("first", None, "id-1");
+        let mut unknown = commit_event("id-2", &[]);
+        unknown.payload_json = unknown.payload_json.replace("\"ver_1\"", "\"ver_gone\"");
+
+        let view = project(
+            &instance(),
+            &versions(&[("ver_1", Some(SNAPSHOT))]),
+            &[commit_event("id-1", &[&first]), unknown],
+            &[effect(&first, "completed")],
+            &[],
+        );
+
+        let firings = view["firings"].as_array().expect("firings");
+        assert_eq!(firings[0]["structure_available"], true);
+        assert_eq!(firings[1]["structure_available"], false);
+        assert_eq!(firings[1]["effects"].as_array().unwrap().len(), 0);
+    }
+
     /// The payload boundary, as a property of the projection rather than a
     /// renderer's setting: no fact value, effect input or turn output crosses.
     #[test]
@@ -539,8 +663,7 @@ mod tests {
 
         let view = project(
             &instance(),
-            "ir1",
-            Some(SNAPSHOT),
+            &versions(&[("ver_1", Some(SNAPSHOT))]),
             &[commit_event("id-1", &[&first])],
             &[carrying],
             &[],

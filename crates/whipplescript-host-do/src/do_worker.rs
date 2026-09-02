@@ -253,18 +253,27 @@ impl<Sql: DoSql + 'static> DurableInstance<Sql> {
             .with_coercion_config_fingerprint(do_coercion_config_fingerprint(
                 ports.coerce.as_ref(),
             ));
-        // DR-0054 Phase B: real revision identity. The literal "do" stamps
-        // meant every deployed wasm — whatever its lowering — reattached to old
-        // instance state under one indistinguishable version, so a redeploy
-        // that changed semantics was invisible. Stamp the actual bootstrap
-        // source hash and this build's crate version. The IR is compiled
-        // in-process from `program_source` by THIS build, so
-        // (source_hash, compiler_version) identifies the lowering; ir_hash
-        // records that derived identity (no canonical IR serialization exists
-        // to hash directly).
+        // DR-0054 Phase B introduced real revision identity here, and stamped
+        // `ir_hash` as `source_hash+compiler_version` for a stated reason: "no
+        // canonical IR serialization exists to hash directly". That reason is
+        // gone. `IrProgram::to_snapshot` is that serialization — golden-tested
+        // across the example corpus, and read back by
+        // `whipplescript_parser::snapshot::parse` — and the native host has
+        // hashed it as `ir_hash` since the view-model note's G1.
+        //
+        // So hash the document the field is named after. Two things follow: the
+        // snapshot can be stored under it and read back by it, which is what a
+        // hosted instance needs before anything can draw its structure (G1a);
+        // and `ir_hash` means the same thing on both hosts, where before the
+        // same column held a content hash natively and a derived string here.
+        //
+        // Existing hosted instances keep the version they point at. A deploy
+        // mints a new version row under the new identity, exactly as a compiler
+        // change does natively.
         let source_hash = whipplescript_kernel::exec_http::sha256_hex(program_source.as_bytes());
         let compiler_version = concat!("whipplescript-host-do ", env!("CARGO_PKG_VERSION"));
-        let ir_hash = format!("{source_hash}+{compiler_version}");
+        let ir_snapshot = ir.to_snapshot();
+        let ir_hash = crate::do_store::stable_hash_hex(&ir_snapshot);
         let version = kernel
             .create_program_version_for_program(
                 ProgramVersionInput {
@@ -272,12 +281,9 @@ impl<Sql: DoSql + 'static> DurableInstance<Sql> {
                     source_hash: &source_hash,
                     ir_hash: &ir_hash,
                     compiler_version,
-                    // No snapshot: this path's `ir_hash` is a synthetic
-                    // identity (`source_hash+compiler_version`, above), not the
-                    // hash of any `.ir` document, so nothing could be stored
-                    // under it and read back by it. Passing the snapshot here
-                    // would file it against an id that does not name it.
-                    ir_snapshot: None,
+                    // The snapshot `ir_hash` now names. The store checks the
+                    // two agree and refuses the pair if they do not.
+                    ir_snapshot: Some(&ir_snapshot),
                 },
                 &ir,
             )
@@ -1099,6 +1105,37 @@ rule observe_start
             view.compiler_version
         );
         assert_ne!(view.ir_hash, "do", "no placeholder identity remains");
+        // G1a: `ir_hash` is the hash of a real document, and that document is
+        // stored under it. Before this, the hosted stamp was
+        // `source_hash+compiler_version` — a derived string naming nothing — so
+        // a hosted instance had no way to recover the structure it was running
+        // and `whip view` could only report that the structure was unavailable.
+        let snapshot = kernel
+            .store()
+            .get_content(&view.ir_hash)
+            .expect("snapshot reads")
+            .expect("a hosted version stores the .ir its ir_hash names");
+        assert_eq!(
+            whipplescript_store::stable_hash_hex(&snapshot),
+            view.ir_hash,
+            "the stored snapshot is the one the id names"
+        );
+        assert!(
+            snapshot.starts_with("workflow MinimalNoop"),
+            "the stored bytes are this program's snapshot: {snapshot:.40}"
+        );
+        // And it is the same identity the native host derives for the same
+        // program, which the two did not share while one was synthetic.
+        assert_eq!(
+            view.ir_hash,
+            whipplescript_store::stable_hash_hex(
+                &whipplescript_parser::compile_program(&source_v1)
+                    .ir
+                    .expect("compiles")
+                    .to_snapshot()
+            ),
+            "hosted and native ir_hash agree for one program"
+        );
         assert!(
             kernel
                 .store()

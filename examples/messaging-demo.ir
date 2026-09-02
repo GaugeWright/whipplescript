@@ -20,3 +20,5 @@ rules
     effects
       reply kind=capability.call binding=reply construct=send->messaging.send key=ebbf62ddd92a9bb6882f32ac88a1498b
     body_hash b1031d50a50b6011bea84b2a5b7e7775
+rule_dependencies
+  acknowledge_message --channel:ops_room--> acknowledge_message
