@@ -9113,8 +9113,11 @@ impl<Sql: DoSql> Coordination for DoSqliteStore<Sql> {
     }
 }
 
-#[cfg(test)]
-pub(crate) mod test_support {
+/// Rusqlite-backed `DoSql` for this crate's tests and, behind the
+/// `test-support` feature, for cross-host harnesses — the DR-0091 W4
+/// parity tests drive the DO doors from the native crate through this.
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support {
     use super::*;
     use rusqlite::types::{Value, ValueRef};
     use rusqlite::Connection;
@@ -9124,7 +9127,7 @@ pub(crate) mod test_support {
     // SQLite requires). This lets `DoInstanceDriver` require `Sql: Clone` for
     // binding-driven provider selection (e.g. the memory provider).
     #[derive(Clone)]
-    pub(crate) struct RusqliteDoSql {
+    pub struct RusqliteDoSql {
         conn: std::rc::Rc<Connection>,
     }
 
@@ -9132,7 +9135,7 @@ pub(crate) mod test_support {
         /// A bare in-memory handle with no schema applied — for a module that
         /// creates its own tables (`do_refs`), where `store()`'s full runtime
         /// schema would be noise.
-        pub(crate) fn in_memory() -> Self {
+        pub fn in_memory() -> Self {
             Self {
                 conn: std::rc::Rc::new(Connection::open_in_memory().expect("sqlite")),
             }
@@ -9186,6 +9189,10 @@ pub(crate) mod test_support {
         }
     }
 
+    /// In-crate tests only: out-of-crate `test-support` consumers build
+    /// their own worlds, so without `cfg(test)` this would be dead code
+    /// under feature unification.
+    #[cfg(test)]
     pub(crate) fn store() -> DoSqliteStore<RusqliteDoSql> {
         let conn = Connection::open_in_memory().expect("sqlite");
         conn.execute_batch(

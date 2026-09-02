@@ -711,6 +711,10 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
     /// Recover the evidence for an already-landed DR-0078 Main cut without
     /// issuing another CAS. `None` means Main does not currently name that cut
     /// or the immutable cut record is unavailable.
+    ///
+    /// Governed write surface (DR-0091): every call site is pinned by
+    /// `scripts/check-governed-doors.sh` — a new caller belongs behind a
+    /// kernel door, never here directly.
     pub fn boundary_ref_evidence(
         &self,
         stream_line_id: &str,
@@ -2216,6 +2220,10 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
     /// through one `advance_head` compare-and-set. A conflict or stale cut moves
     /// no pointer; certified content written by the probe is unreferenced and
     /// collected normally if the operation refuses.
+    ///
+    /// Governed write surface (DR-0091): every call site is pinned by
+    /// `scripts/check-governed-doors.sh` — a new caller belongs behind a
+    /// kernel door, never here directly.
     #[allow(clippy::too_many_arguments)]
     pub fn promote_line_exact(
         &mut self,
@@ -3007,6 +3015,10 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
     /// Apply an undo-selection plan: one proposal cut on the branch —
     /// honestly a counterfactual state (a state that never ran), tagged
     /// by its origin until gates revalidate. Refuses a stranding plan.
+    ///
+    /// Governed write surface (DR-0091): every call site is pinned by
+    /// `scripts/check-governed-doors.sh` — a new caller belongs behind a
+    /// kernel door, never here directly.
     pub fn apply_undo_selection(
         &mut self,
         branch_id: &str,
@@ -3148,6 +3160,10 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
     /// Certified precondition per path: the target currently holds the
     /// unit's recorded BEFORE (or already holds the after — idempotent
     /// skip); anything else is an honest conflict and nothing moves.
+    ///
+    /// Governed write surface (DR-0091): every call site is pinned by
+    /// `scripts/check-governed-doors.sh` — a new caller belongs behind a
+    /// kernel door, never here directly.
     pub fn transport_selection(
         &mut self,
         branch_id: &str,

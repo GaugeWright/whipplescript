@@ -2900,6 +2900,7 @@ dependencies = [
  "url",
  "whipplescript-core",
  "whipplescript-custody",
+ "whipplescript-host-do",
  "whipplescript-kernel",
  "whipplescript-parser",
  "whipplescript-provider-claude",

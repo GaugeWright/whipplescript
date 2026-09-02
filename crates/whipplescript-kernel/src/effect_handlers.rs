@@ -16,6 +16,7 @@ use whipplescript_store::coordination::Coordination;
 use whipplescript_store::files::FileStore;
 use whipplescript_store::items::WorkItems;
 use whipplescript_store::vcs::FrontierRead;
+use whipplescript_store::workstreams::Workstreams;
 use whipplescript_store::{
     ClaimableEffect, EffectCompletion, FactView, RunStart, RuntimeStore, StoreError, StoredEvent,
 };
@@ -2585,6 +2586,578 @@ pub fn run_notify_effect_generic<S: RuntimeStore>(
 
 // -- capability core + contract projection (batch lift, DR-0033 chunk 5b) -----
 
+// ---------------------------------------------------------------------------
+// The `vcs.promote` governed door (DR-0091 W1): one choreography, every host.
+// ---------------------------------------------------------------------------
+
+/// What a host door supplies to the promote choreography. Every field is
+/// identity-bearing or scope-bearing and therefore MINTED BY THE DOOR, never
+/// by the kernel: `reservation_id` and `proposed_main` are exactly-once keys
+/// (a changed spelling is a changed identity), `at` follows the host's time
+/// discipline (wall clock native, deterministic on the DO), and
+/// `receipt_scope` names the workspace the boundary receipt speaks for.
+pub struct PromoteDoorRequest<'a> {
+    pub stream_id: &'a str,
+    pub reservation_id: &'a str,
+    /// The Main cut id to propose when reserving from `Active`. Used only on
+    /// that path; every later state replays the coordinate the reservation
+    /// row recorded.
+    pub proposed_main: &'a str,
+    pub at: &'a str,
+    pub receipt_scope: &'a str,
+}
+
+/// The promote choreography's result. `Refused` is data — the door completes
+/// the effect either way; only a `Err(String)` from the runner is a failure.
+#[derive(Debug)]
+pub enum BoundaryRunOutcome {
+    Promoted {
+        receipt: Box<whipplescript_store::workstreams::WorkstreamBoundaryReceiptV1>,
+        member_branches: Vec<String>,
+        /// True when the receipt was recovered from an already-archived
+        /// stream rather than minted by this run.
+        recovered: bool,
+    },
+    Conflicted {
+        conflicts: Vec<whipplescript_store::merge::PathConflict>,
+    },
+    Refused(String),
+}
+
+/// DR-0091 Decision 2, as a seam: the kernel owns the promotion PROTOCOL
+/// (the reservation, the exact CAS, the receipts); the host owns the
+/// SCHEDULER. A host that supplies no serialization gets a refused CAS,
+/// never a torn ref — the reservation is what makes the host's
+/// serialization sufficient, not the other way around.
+pub trait PromotionSerialization {
+    /// `Ok(None)` = held, proceed. `Ok(Some(refusal))` = contended — the
+    /// door refuses as data and the caller retries. `Err` = the
+    /// serialization mechanism itself is unavailable.
+    fn acquire(&mut self) -> Result<Option<String>, String>;
+    fn release(&mut self);
+}
+
+/// The serialization of a host whose execution is already serial (the DO's
+/// single-writer turn): nothing to acquire, nothing to release.
+pub struct SingleWriterSerialization;
+
+impl PromotionSerialization for SingleWriterSerialization {
+    fn acquire(&mut self) -> Result<Option<String>, String> {
+        Ok(None)
+    }
+    fn release(&mut self) {}
+}
+
+/// The stream a `vcs.promote` effect input names, in either spelling the
+/// lowering produces (`/message/stream` from the boundary-hop sugar, bare
+/// `stream` from direct capability calls).
+pub fn promote_stream_id(input: &Value) -> Option<&str> {
+    input
+        .pointer("/message/stream")
+        .or_else(|| input.get("stream"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+}
+
+fn promote_cut_value(value: &str) -> Option<&str> {
+    (!value.is_empty()).then_some(value)
+}
+
+/// DR-0078's promotion coordinator, kernel-generic (DR-0091 W1) — the ONE
+/// implementation of the boundary hop, for every host door. The workstream
+/// reservation freezes the line before preflight; `promote_line_exact` owns
+/// the single Main CAS; the `ref_advanced` row makes every post-CAS crash
+/// close forward on retry. The bound is taken here, per-handler, and joins
+/// no blanket kernel bound — the scheduler tier stays read-only (DR-0091
+/// Decision 1).
+pub fn run_reserved_boundary_promotion_generic<W, B, C>(
+    streams: &mut W,
+    vcs: &mut whipplescript_store::vcs::WorkspaceVcs<B, C>,
+    request: &PromoteDoorRequest<'_>,
+    serialization: &mut dyn PromotionSerialization,
+) -> Result<BoundaryRunOutcome, String>
+where
+    W: Workstreams + ?Sized,
+    B: whipplescript_store::branches::Branches,
+    C: whipplescript_store::content::ContentBlobs,
+{
+    use whipplescript_store::branches::MAINLINE_BRANCH_ID;
+    use whipplescript_store::workstreams::{
+        BoundaryReservation, ClosePromotedOutcome, RecordRefAdvancedOutcome,
+        ReserveBoundaryOutcome, StreamStatus,
+    };
+
+    let stream_id = request.stream_id;
+    let at = request.at;
+    vcs.init(at)
+        .map_err(|error| format!("workspace unavailable: {error:?}"))?;
+    let mut stream = streams
+        .get_stream(stream_id)
+        .map_err(|error| format!("workstream read failed: {error:?}"))?
+        .ok_or_else(|| format!("no such stream `{stream_id}`"))?;
+
+    if stream.status == StreamStatus::Archived {
+        if let Some(reservation_id) = stream.reservation_id.as_deref() {
+            let _ = vcs.release_branch_head_reservation(&stream.line_branch_id, reservation_id);
+        }
+        let receipt = stream
+            .boundary_receipt(request.receipt_scope)
+            .ok_or_else(|| format!("stream `{stream_id}` is archived"))?;
+        return Ok(BoundaryRunOutcome::Promoted {
+            receipt: Box::new(receipt),
+            member_branches: Vec::new(),
+            recovered: true,
+        });
+    }
+
+    if stream.status == StreamStatus::Active {
+        let line = vcs
+            .get_branch(&stream.line_branch_id)
+            .map_err(|error| format!("stream line read failed: {error:?}"))?
+            .ok_or_else(|| format!("stream `{stream_id}` has no line"))?;
+        let main = vcs
+            .get_branch(MAINLINE_BRANCH_ID)
+            .map_err(|error| format!("Main read failed: {error:?}"))?
+            .ok_or_else(|| "Main is missing".to_owned())?;
+        let expected_line = line.head_cut_id.unwrap_or_default();
+        let expected_main = main.head_cut_id.unwrap_or_default();
+        match streams
+            .reserve_boundary(
+                stream_id,
+                BoundaryReservation {
+                    reservation_id: request.reservation_id,
+                    expected_line_cut: &expected_line,
+                    expected_main_cut: &expected_main,
+                    proposed_main_cut: request.proposed_main,
+                    at,
+                },
+            )
+            .map_err(|error| format!("boundary reservation failed: {error:?}"))?
+        {
+            ReserveBoundaryOutcome::Reserved(row) | ReserveBoundaryOutcome::Existing(row) => {
+                stream = row;
+            }
+            other => {
+                return Ok(BoundaryRunOutcome::Refused(format!(
+                    "boundary reservation refused: {other:?}"
+                )))
+            }
+        }
+    }
+
+    if stream.status == StreamStatus::RefAdvanced {
+        let reservation_id = stream.reservation_id.as_deref().unwrap_or_default();
+        match streams
+            .close_promoted(stream_id, reservation_id, at)
+            .map_err(|error| format!("post-CAS close failed: {error:?}"))?
+        {
+            ClosePromotedOutcome::Closed { rehomed_branch_ids } => {
+                vcs.release_branch_head_reservation(&stream.line_branch_id, reservation_id)
+                    .map_err(|error| {
+                        format!("stream-line reservation release failed: {error:?}")
+                    })?;
+                let receipt = streams
+                    .get_stream(stream_id)
+                    .map_err(|error| format!("receipt read failed: {error:?}"))?
+                    .and_then(|row| row.boundary_receipt(request.receipt_scope))
+                    .ok_or_else(|| "closed promotion has no receipt".to_owned())?;
+                return Ok(BoundaryRunOutcome::Promoted {
+                    receipt: Box::new(receipt),
+                    member_branches: rehomed_branch_ids,
+                    recovered: false,
+                });
+            }
+            ClosePromotedOutcome::AlreadyClosed => {
+                vcs.release_branch_head_reservation(&stream.line_branch_id, reservation_id)
+                    .map_err(|error| {
+                        format!("stream-line reservation release failed: {error:?}")
+                    })?;
+                let receipt = streams
+                    .get_stream(stream_id)
+                    .map_err(|error| format!("receipt read failed: {error:?}"))?
+                    .and_then(|row| row.boundary_receipt(request.receipt_scope))
+                    .ok_or_else(|| "closed promotion has no receipt".to_owned())?;
+                return Ok(BoundaryRunOutcome::Promoted {
+                    receipt: Box::new(receipt),
+                    member_branches: Vec::new(),
+                    recovered: false,
+                });
+            }
+            other => {
+                return Ok(BoundaryRunOutcome::Refused(format!(
+                    "post-CAS close refused: {other:?}"
+                )))
+            }
+        }
+    }
+
+    if stream.status != StreamStatus::BoundaryReserved {
+        return Ok(BoundaryRunOutcome::Refused(format!(
+            "stream `{stream_id}` cannot promote from {}",
+            stream.status.as_str()
+        )));
+    }
+    let reservation_id = stream.reservation_id.clone().unwrap_or_default();
+    let expected_line = stream.expected_line_cut.clone().unwrap_or_default();
+    let expected_main = stream.expected_main_cut.clone().unwrap_or_default();
+    let proposed_main = stream.proposed_main_cut.clone().unwrap_or_default();
+    if reservation_id.is_empty() || proposed_main.is_empty() {
+        return Ok(BoundaryRunOutcome::Refused(
+            "reserved stream is missing its durable recovery coordinate".to_owned(),
+        ));
+    }
+
+    // DR-0078 (GWPW residuals): the stream line's HEAD is reserved for this
+    // promotion before any host serialization, so a concurrent writer on the
+    // line itself is refused by the engine rather than raced.
+    match vcs
+        .reserve_branch_head(&stream.line_branch_id, &reservation_id, at)
+        .map_err(|error| format!("stream-line reservation failed: {error:?}"))?
+    {
+        whipplescript_store::branches::HeadReservationOutcome::Reserved
+        | whipplescript_store::branches::HeadReservationOutcome::Existing => {}
+        other => {
+            let _ = streams.release_boundary(stream_id, &reservation_id, at);
+            return Ok(BoundaryRunOutcome::Refused(format!(
+                "stream-line reservation refused: {other:?}"
+            )));
+        }
+    }
+
+    match serialization.acquire() {
+        Ok(None) => {}
+        Ok(Some(refusal)) => return Ok(BoundaryRunOutcome::Refused(refusal)),
+        Err(error) => return Err(error),
+    }
+
+    let operation = (|| -> Result<BoundaryRunOutcome, String> {
+        // Crash recovery after the CAS: observe the proposed immutable cut and
+        // record it without issuing a second CAS.
+        if let Some((position, handle)) = vcs
+            .boundary_ref_evidence(
+                &stream.line_branch_id,
+                promote_cut_value(&expected_main),
+                &proposed_main,
+            )
+            .map_err(|error| format!("boundary recovery read failed: {error:?}"))?
+        {
+            match streams
+                .record_ref_advanced(stream_id, &reservation_id, position, &handle, at)
+                .map_err(|error| format!("ref receipt record failed: {error:?}"))?
+            {
+                RecordRefAdvancedOutcome::Recorded(_) | RecordRefAdvancedOutcome::Existing(_) => {}
+                other => {
+                    return Ok(BoundaryRunOutcome::Refused(format!(
+                        "ref receipt record refused: {other:?}"
+                    )))
+                }
+            }
+        } else {
+            let outcome = vcs
+                .promote_line_exact(
+                    &stream.line_branch_id,
+                    &reservation_id,
+                    promote_cut_value(&expected_line),
+                    promote_cut_value(&expected_main),
+                    &proposed_main,
+                    at,
+                )
+                .map_err(|error| format!("promotion failed: {error:?}"))?;
+            match outcome {
+                whipplescript_store::vcs::BoundaryPromotionOutcome::Promoted {
+                    ref_position,
+                    ref_receipt_handle,
+                    ..
+                } => match streams
+                    .record_ref_advanced(
+                        stream_id,
+                        &reservation_id,
+                        ref_position,
+                        &ref_receipt_handle,
+                        at,
+                    )
+                    .map_err(|error| format!("ref receipt record failed: {error:?}"))?
+                {
+                    RecordRefAdvancedOutcome::Recorded(_)
+                    | RecordRefAdvancedOutcome::Existing(_) => {}
+                    other => {
+                        return Ok(BoundaryRunOutcome::Refused(format!(
+                            "ref receipt record refused: {other:?}"
+                        )))
+                    }
+                },
+                whipplescript_store::vcs::BoundaryPromotionOutcome::Conflicted { conflicts } => {
+                    let _ = streams.release_boundary(stream_id, &reservation_id, at);
+                    let _ = vcs
+                        .release_branch_head_reservation(&stream.line_branch_id, &reservation_id);
+                    return Ok(BoundaryRunOutcome::Conflicted { conflicts });
+                }
+                whipplescript_store::vcs::BoundaryPromotionOutcome::ExpectedCutsMoved {
+                    ..
+                } => {
+                    let _ = streams.release_boundary(stream_id, &reservation_id, at);
+                    let _ = vcs
+                        .release_branch_head_reservation(&stream.line_branch_id, &reservation_id);
+                    return Ok(BoundaryRunOutcome::Refused(
+                        "the exact stream/Main cut moved before promotion; retry from active"
+                            .to_owned(),
+                    ));
+                }
+                other => {
+                    let _ = streams.release_boundary(stream_id, &reservation_id, at);
+                    let _ = vcs
+                        .release_branch_head_reservation(&stream.line_branch_id, &reservation_id);
+                    return Ok(BoundaryRunOutcome::Refused(format!(
+                        "promotion refused: {other:?}"
+                    )));
+                }
+            }
+        }
+
+        let members = streams
+            .members(stream_id)
+            .map_err(|error| format!("member read failed: {error:?}"))?;
+        match streams
+            .close_promoted(stream_id, &reservation_id, at)
+            .map_err(|error| format!("post-CAS close failed: {error:?}"))?
+        {
+            ClosePromotedOutcome::Closed { .. } | ClosePromotedOutcome::AlreadyClosed => {}
+            other => {
+                return Ok(BoundaryRunOutcome::Refused(format!(
+                    "post-CAS close refused: {other:?}"
+                )))
+            }
+        }
+        vcs.release_branch_head_reservation(&stream.line_branch_id, &reservation_id)
+            .map_err(|error| format!("stream-line reservation release failed: {error:?}"))?;
+        let receipt = streams
+            .get_stream(stream_id)
+            .map_err(|error| format!("receipt read failed: {error:?}"))?
+            .and_then(|row| row.boundary_receipt(request.receipt_scope))
+            .ok_or_else(|| "closed promotion has no receipt".to_owned())?;
+        Ok(BoundaryRunOutcome::Promoted {
+            receipt: Box::new(receipt),
+            member_branches: members,
+            recovered: false,
+        })
+    })();
+    serialization.release();
+    operation
+}
+
+/// One conflict projection for every door — the eight-field shape the native
+/// CLI has always emitted. Lifting it exposed the first drift specimen: the
+/// DO's inline copy carried only the first four fields, so a DO conflict
+/// receipt named the paths but not which side at which cut.
+pub fn promote_conflict_json(conflict: &whipplescript_store::merge::PathConflict) -> Value {
+    json!({
+        "path": conflict.path,
+        "base": conflict.base,
+        "ours": conflict.ours,
+        "theirs": conflict.theirs,
+        "ours_branch": conflict.ours_side.label,
+        "ours_cut": conflict.ours_side.cut_id,
+        "theirs_branch": conflict.theirs_side.label,
+        "theirs_cut": conflict.theirs_side.cut_id,
+    })
+}
+
+/// Render a promote run as the effect door's outcome — one output shape for
+/// every host, so receipt parity is by construction rather than lockstep.
+/// `Refused` and `Err` both complete as `Failed` with the `vcs_promote`
+/// error kind, exactly as both host doors always have.
+pub fn promote_effect_outcome(
+    stream_id: &str,
+    result: &Result<BoundaryRunOutcome, String>,
+) -> CapabilityOutcome {
+    let failed = |message: &str| CapabilityOutcome::Failed {
+        error_kind: "vcs_promote".to_owned(),
+        message: message.to_owned(),
+    };
+    match result {
+        Ok(BoundaryRunOutcome::Promoted {
+            receipt, recovered, ..
+        }) => CapabilityOutcome::Produced(json!({
+            "variant": "Promoted",
+            "stream": stream_id,
+            "sync_cut_id": receipt.proposed_main_cut,
+            "detail": if *recovered { "recovered" } else { "" },
+            "boundary_receipt": receipt,
+        })),
+        Ok(BoundaryRunOutcome::Conflicted { conflicts }) => CapabilityOutcome::Produced(json!({
+            "variant": "Conflicted",
+            "stream": stream_id,
+            "sync_cut_id": "",
+            "detail": serde_json::to_string(
+                &conflicts.iter().map(promote_conflict_json).collect::<Vec<_>>()
+            ).unwrap_or_default(),
+        })),
+        Ok(BoundaryRunOutcome::Refused(message)) => failed(message),
+        Err(message) => failed(message),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The selective governed doors, `vcs.undo` / `vcs.transport` (DR-0091 W2).
+// ---------------------------------------------------------------------------
+
+/// The selection a selective effect names, checked the way both doors always
+/// checked it: present, parseable, and free of unexpanded `region()` atoms
+/// (DR-0084 — a region literal expands at effect-input build; one that
+/// reaches a door names a region the program never declared, and silently
+/// matching empty is the failure the refusal exists to prevent).
+pub fn selective_selection(
+    input: &Value,
+) -> Result<whipplescript_store::selection::SelExpr, String> {
+    let Some(selection) = input
+        .get("selection")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+    else {
+        return Err("the effect names no selection".to_owned());
+    };
+    let expr = whipplescript_store::selection::parse(selection)
+        .map_err(|error| format!("selection does not parse: {error}"))?;
+    if let Some(name) = whipplescript_store::selection::contains_region_atom(&expr) {
+        return Err(format!(
+            "`region({name})` did not resolve: the program declares no region by that name"
+        ));
+    }
+    Ok(expr)
+}
+
+/// The staleness advisory's host seam: given the vcs, a line, and the cut
+/// just minted, list the receipt's staleness deltas (the host supplies the
+/// subject listing; the evaluation is `staleness_deltas_generic`).
+pub type StalenessAdvisory<'a, B, C> =
+    dyn FnMut(&whipplescript_store::vcs::WorkspaceVcs<B, C>, &str, &str) -> Vec<Value> + 'a;
+
+/// The selective verbs' choreography, kernel-generic (DR-0091 W2) — one
+/// implementation of `vcs.undo` / `vcs.transport` for every host door, with
+/// the same output shape by construction. The host resolves the acting
+/// branch (ambient line or repair scope), stamps actor/intent on the vcs,
+/// and mints the identity-bearing `cut_id`/`at` under its own time
+/// discipline; the two seams it supplies are the stream-line resolver (how
+/// `onto <stream>` finds a line on this host) and the staleness advisory's
+/// subject listing (`staleness_deltas_generic` over the host's stores).
+/// `Err` is the door's refusal text; refusal-shaped engine outcomes render
+/// as data exactly as both doors always rendered them.
+#[allow(clippy::too_many_arguments)]
+pub fn run_selective_verb_generic<B, C>(
+    vcs: &mut whipplescript_store::vcs::WorkspaceVcs<B, C>,
+    target: Option<&str>,
+    input: &Value,
+    expr: &whipplescript_store::selection::SelExpr,
+    branch_id: &str,
+    cut_id: &str,
+    at: &str,
+    resolve_stream_line: &mut dyn FnMut(&str) -> Option<String>,
+    staleness: &mut StalenessAdvisory<'_, B, C>,
+) -> Result<Value, String>
+where
+    B: whipplescript_store::branches::Branches,
+    C: whipplescript_store::content::ContentBlobs,
+{
+    use whipplescript_store::vcs::{TransportOutcome, UndoSelectionOutcome};
+
+    if target == Some("vcs.undo") {
+        match vcs.apply_undo_selection(branch_id, expr, cut_id, at) {
+            Ok(UndoSelectionOutcome::Proposed {
+                cut_id,
+                reverted_paths,
+                ..
+            }) => Ok(json!({
+                "variant": "Applied",
+                "cut_id": cut_id,
+                "detail": serde_json::to_string(&reverted_paths).unwrap_or_default(),
+                // DR-0084 O1: what this proposal cut staled (advisory).
+                "staleness": staleness(vcs, branch_id, &cut_id),
+            })),
+            Ok(UndoSelectionOutcome::WouldStrand { stranded }) => Ok(json!({
+                "variant": "Stranded",
+                "cut_id": "",
+                // Three fields, attribution included — the shape native
+                // always emitted; the DO's inline copy dropped `by`.
+                "detail": serde_json::to_string(
+                    &stranded
+                        .iter()
+                        .map(|unit| json!({
+                            "path": unit.path,
+                            "cut": unit.cut_id,
+                            "by": unit.actor,
+                        }))
+                        .collect::<Vec<_>>()
+                )
+                .unwrap_or_default(),
+            })),
+            Ok(UndoSelectionOutcome::NothingSelected) => Ok(json!({
+                "variant": "Applied",
+                "cut_id": "",
+                "detail": "nothing_selected",
+            })),
+            Ok(other) => Err(format!("undo refused: {other:?}")),
+            Err(error) => Err(format!("undo failed: {error:?}")),
+        }
+    } else {
+        let onto = input
+            .get("onto")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let onto_line = if onto == "mainline" {
+            whipplescript_store::branches::MAINLINE_BRANCH_ID.to_owned()
+        } else {
+            match resolve_stream_line(onto) {
+                Some(line) => line,
+                None => return Err(format!("`onto {onto}` names no stream")),
+            }
+        };
+        match vcs.transport_selection(branch_id, expr, &onto_line, cut_id, at) {
+            Ok(TransportOutcome::Transported {
+                cut_id,
+                moved_paths,
+                ..
+            }) => Ok(json!({
+                "variant": "Applied",
+                "cut_id": cut_id,
+                "detail": serde_json::to_string(&moved_paths).unwrap_or_default(),
+                // DR-0084 O1: what landed content staled on the
+                // DESTINATION line (advisory).
+                "staleness": staleness(vcs, &onto_line, &cut_id),
+            })),
+            Ok(TransportOutcome::Conflicted { conflicts }) => Ok(json!({
+                "variant": "Conflicted",
+                "cut_id": "",
+                "detail": serde_json::to_string(
+                    &conflicts
+                        .iter()
+                        .map(|conflict| json!({"path": conflict.path}))
+                        .collect::<Vec<_>>()
+                )
+                .unwrap_or_default(),
+            })),
+            Ok(TransportOutcome::UpToDate | TransportOutcome::NothingSelected) => Ok(json!({
+                "variant": "Applied",
+                "cut_id": "",
+                "detail": "nothing_to_move",
+            })),
+            Ok(other) => Err(format!("transport refused: {other:?}")),
+            Err(error) => Err(format!("transport failed: {error:?}")),
+        }
+    }
+}
+
+/// Render a selective run as the effect door's outcome — the `vcs_selective`
+/// failure kind both doors always used.
+pub fn selective_effect_outcome(result: Result<Value, String>) -> CapabilityOutcome {
+    match result {
+        Ok(value) => CapabilityOutcome::Produced(value),
+        Err(message) => CapabilityOutcome::Failed {
+            error_kind: "vcs_selective".to_owned(),
+            message,
+        },
+    }
+}
+
 /// Host projection of capability-output validation. Native validates the fixture
 /// output against the workflow's package-lock capability contract; the DO validates
 /// against the contract carried in its program metadata. Projecting it (like
@@ -4020,5 +4593,330 @@ mod queue_effect_refusal_tests {
             recorded.contains("unknown queue effect kind"),
             "the refusal names the kind it could not dispatch: {recorded}"
         );
+    }
+}
+
+#[cfg(test)]
+mod promote_door_tests {
+    //! DR-0091 W1: the door pieces every host shares. The choreography
+    //! itself is bound by the workstream engine tests and both host door
+    //! tests; these pin the shared input reading and the ONE output shape
+    //! receipt parity rests on.
+
+    use super::*;
+
+    #[test]
+    fn promote_stream_id_reads_both_spellings_and_refuses_empty() {
+        let sugar = json!({ "message": { "stream": "triage" } });
+        assert_eq!(promote_stream_id(&sugar), Some("triage"));
+        let bare = json!({ "stream": "triage" });
+        assert_eq!(promote_stream_id(&bare), Some("triage"));
+        assert_eq!(promote_stream_id(&json!({ "stream": "" })), None);
+        assert_eq!(promote_stream_id(&json!({})), None);
+    }
+
+    fn receipt() -> Box<whipplescript_store::workstreams::WorkstreamBoundaryReceiptV1> {
+        Box::new(
+            whipplescript_store::workstreams::WorkstreamBoundaryReceiptV1 {
+                schema: "workstream-boundary-receipt.v1".to_owned(),
+                workspace_authority_id: "test-workspace".to_owned(),
+                stream_id: "triage".to_owned(),
+                reservation_id: "effect-eff-1".to_owned(),
+                outcome: "promoted".to_owned(),
+                expected_stream_cut: "cut-line".to_owned(),
+                expected_main_cut: "cut-main".to_owned(),
+                proposed_main_cut: "cut-seed-promote".to_owned(),
+                main_ref_position: Some(3),
+                ref_receipt_handle: Some("handle-3".to_owned()),
+                recorded_at: "t9".to_owned(),
+            },
+        )
+    }
+
+    #[test]
+    fn promoted_output_shape_is_the_one_both_hosts_emit() {
+        let fresh = Ok(BoundaryRunOutcome::Promoted {
+            receipt: receipt(),
+            member_branches: vec!["b1".to_owned()],
+            recovered: false,
+        });
+        let CapabilityOutcome::Produced(value) = promote_effect_outcome("triage", &fresh) else {
+            panic!("promoted renders as produced");
+        };
+        assert_eq!(value["variant"], "Promoted");
+        assert_eq!(value["stream"], "triage");
+        assert_eq!(value["sync_cut_id"], "cut-seed-promote");
+        assert_eq!(value["detail"], "");
+        assert_eq!(
+            value["boundary_receipt"]["reservation_id"], "effect-eff-1",
+            "the receipt rides the output whole"
+        );
+
+        let recovered = Ok(BoundaryRunOutcome::Promoted {
+            receipt: receipt(),
+            member_branches: Vec::new(),
+            recovered: true,
+        });
+        let CapabilityOutcome::Produced(value) = promote_effect_outcome("triage", &recovered)
+        else {
+            panic!("recovered renders as produced");
+        };
+        assert_eq!(
+            value["detail"], "recovered",
+            "an archived stream's replay says so"
+        );
+    }
+
+    #[test]
+    fn conflict_detail_carries_both_sides_with_provenance() {
+        let conflicts = vec![whipplescript_store::merge::PathConflict {
+            path: "contested.md".to_owned(),
+            base: None,
+            ours: Some("h-ours".to_owned()),
+            theirs: Some("h-theirs".to_owned()),
+            ours_side: whipplescript_store::merge::MergeSide {
+                label: "line-conflict".to_owned(),
+                cut_id: Some("cut-2".to_owned()),
+            },
+            theirs_side: whipplescript_store::merge::MergeSide {
+                label: "main".to_owned(),
+                cut_id: Some("cut-3".to_owned()),
+            },
+        }];
+        let result = Ok(BoundaryRunOutcome::Conflicted { conflicts });
+        let CapabilityOutcome::Produced(value) = promote_effect_outcome("conflict", &result) else {
+            panic!("conflict renders as produced — refusal is data");
+        };
+        assert_eq!(value["variant"], "Conflicted");
+        let detail: Value =
+            serde_json::from_str(value["detail"].as_str().expect("detail is a string"))
+                .expect("detail parses");
+        // The eight-field shape the native CLI always emitted; the DO's
+        // inline copy carried only the first four until the W1 lift.
+        assert_eq!(detail[0]["path"], "contested.md");
+        assert_eq!(detail[0]["ours_branch"], "line-conflict");
+        assert_eq!(detail[0]["ours_cut"], "cut-2");
+        assert_eq!(detail[0]["theirs_branch"], "main");
+        assert_eq!(detail[0]["theirs_cut"], "cut-3");
+    }
+
+    #[test]
+    fn refusal_and_error_both_fail_with_the_promote_kind() {
+        for result in [
+            Ok(BoundaryRunOutcome::Refused(
+                "adoption lease held; retry".to_owned(),
+            )),
+            Err("workspace unavailable".to_owned()),
+        ] {
+            let CapabilityOutcome::Failed {
+                error_kind,
+                message,
+            } = promote_effect_outcome("triage", &result)
+            else {
+                panic!("refusal/error render as failed");
+            };
+            assert_eq!(error_kind, "vcs_promote");
+            assert!(!message.is_empty());
+        }
+    }
+}
+
+#[cfg(test)]
+mod selective_door_tests {
+    //! DR-0091 W2: the selective doors' shared pieces — the selection gate's
+    //! three refusals (each message-pinned for the mutation sweep) and the
+    //! verb choreography end to end over a real workspace.
+
+    use super::*;
+
+    #[test]
+    fn selective_selection_gate_refuses_by_reason() {
+        let missing = selective_selection(&json!({})).expect_err("no selection");
+        assert_eq!(missing, "the effect names no selection");
+        let empty = selective_selection(&json!({"selection": ""})).expect_err("empty");
+        assert_eq!(empty, "the effect names no selection");
+        let unparseable = selective_selection(&json!({"selection": "path((("})).expect_err("parse");
+        assert!(
+            unparseable.starts_with("selection does not parse:"),
+            "{unparseable}"
+        );
+        let region =
+            selective_selection(&json!({"selection": "region(nope)"})).expect_err("region");
+        assert_eq!(
+            region,
+            "`region(nope)` did not resolve: the program declares no region by that name"
+        );
+        assert!(selective_selection(&json!({"selection": "path(src/**)"})).is_ok());
+    }
+
+    fn temp_vcs(
+        tag: &str,
+    ) -> (
+        whipplescript_store::vcs::NativeWorkspaceVcs,
+        std::path::PathBuf,
+    ) {
+        let dir =
+            std::env::temp_dir().join(format!("whip-selective-door-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let mut vcs = whipplescript_store::vcs::NativeWorkspaceVcs::open(
+            dir.join("branches.sqlite"),
+            dir.join("content.sqlite"),
+        )
+        .expect("open vcs");
+        vcs.init("t0").expect("init");
+        (vcs, dir)
+    }
+
+    #[test]
+    fn selective_verb_runs_undo_and_refuses_unknown_onto() {
+        let (mut vcs, _dir) = temp_vcs("undo");
+        vcs.create_branch(
+            "line-a",
+            None,
+            whipplescript_store::branches::MAINLINE_BRANCH_ID,
+            "t1",
+        )
+        .expect("branch");
+        vcs.write("line-a", "src/lib.rs", Some("v1"), "cut_1", "t2")
+            .expect("write");
+        let expr = selective_selection(&json!({"selection": "path(src/**)"})).expect("parse");
+
+        let mut staleness_calls = 0;
+        let value = run_selective_verb_generic(
+            &mut vcs,
+            Some("vcs.undo"),
+            &json!({"selection": "path(src/**)"}),
+            &expr,
+            "line-a",
+            "cut-undo-1",
+            "t3",
+            &mut |_| None,
+            &mut |_, _, _| {
+                staleness_calls += 1;
+                Vec::new()
+            },
+        )
+        .expect("undo applies");
+        assert_eq!(value["variant"], "Applied");
+        assert!(value["detail"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("src/lib.rs"));
+        assert_eq!(staleness_calls, 1, "the applied cut gets its advisory");
+
+        // Undoing what no longer matches selects nothing — data, not failure.
+        let nothing = run_selective_verb_generic(
+            &mut vcs,
+            Some("vcs.undo"),
+            &json!({"selection": "path(docs/**)"}),
+            &selective_selection(&json!({"selection": "path(docs/**)"})).expect("parse"),
+            "line-a",
+            "cut-undo-2",
+            "t4",
+            &mut |_| None,
+            &mut |_, _, _| Vec::new(),
+        )
+        .expect("nothing selected is data");
+        assert_eq!(nothing["detail"], "nothing_selected");
+
+        // Transport onto a stream this host cannot resolve refuses by name.
+        let refusal = run_selective_verb_generic(
+            &mut vcs,
+            Some("vcs.transport"),
+            &json!({"selection": "path(src/**)", "onto": "ghost"}),
+            &expr,
+            "line-a",
+            "cut-t-1",
+            "t5",
+            &mut |_| None,
+            &mut |_, _, _| Vec::new(),
+        )
+        .expect_err("unresolvable stream refuses");
+        assert_eq!(refusal, "`onto ghost` names no stream");
+    }
+
+    /// The verb runner's four catch-all arms: an engine outcome the door
+    /// does not render as data refuses with the verb's name, and a store
+    /// that fails mid-verb fails with it too. The store failure is forced
+    /// the house way (`queue_effect_refusal_tests`): break the store's
+    /// invariant directly — here, drop the branches table out from under
+    /// the open composition.
+    #[test]
+    fn selective_verb_catch_alls_name_the_verb_and_disposition() {
+        let (mut vcs, dir) = temp_vcs("catchall");
+        vcs.create_branch(
+            "line-a",
+            None,
+            whipplescript_store::branches::MAINLINE_BRANCH_ID,
+            "t1",
+        )
+        .expect("branch");
+        vcs.write("line-a", "src/lib.rs", Some("v1"), "cut_1", "t2")
+            .expect("write");
+        let expr = selective_selection(&json!({"selection": "path(src/**)"})).expect("parse");
+
+        // Undo on a branch the workspace does not have: refused, by name.
+        let refused = run_selective_verb_generic(
+            &mut vcs,
+            Some("vcs.undo"),
+            &json!({"selection": "path(src/**)"}),
+            &expr,
+            "no-such-line",
+            "cut-r1",
+            "t3",
+            &mut |_| None,
+            &mut |_, _, _| Vec::new(),
+        )
+        .expect_err("missing branch refuses");
+        assert_eq!(refused, "undo refused: BranchMissing");
+
+        // Transport onto a line the resolver names but the workspace lacks.
+        let refused = run_selective_verb_generic(
+            &mut vcs,
+            Some("vcs.transport"),
+            &json!({"selection": "path(src/**)", "onto": "ghost"}),
+            &expr,
+            "line-a",
+            "cut-r2",
+            "t4",
+            &mut |_| Some("ghost-line".to_owned()),
+            &mut |_, _, _| Vec::new(),
+        )
+        .expect_err("missing target refuses");
+        assert_eq!(refused, "transport refused: TargetMissing");
+
+        // Break the store under the open composition: every verb now FAILS
+        // rather than refusing, and says which verb.
+        rusqlite::Connection::open(dir.join("branches.sqlite"))
+            .expect("second connection")
+            .execute_batch("DROP TABLE branches;")
+            .expect("drop");
+        let failed = run_selective_verb_generic(
+            &mut vcs,
+            Some("vcs.undo"),
+            &json!({"selection": "path(src/**)"}),
+            &expr,
+            "line-a",
+            "cut-f1",
+            "t5",
+            &mut |_| None,
+            &mut |_, _, _| Vec::new(),
+        )
+        .expect_err("broken store fails undo");
+        assert!(failed.starts_with("undo failed:"), "{failed}");
+        let failed = run_selective_verb_generic(
+            &mut vcs,
+            Some("vcs.transport"),
+            &json!({"selection": "path(src/**)", "onto": "mainline"}),
+            &expr,
+            "line-a",
+            "cut-f2",
+            "t6",
+            &mut |_| None,
+            &mut |_, _, _| Vec::new(),
+        )
+        .expect_err("broken store fails transport");
+        assert!(failed.starts_with("transport failed:"), "{failed}");
     }
 }

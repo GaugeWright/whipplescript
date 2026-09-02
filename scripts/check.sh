@@ -93,6 +93,9 @@ if [ -f AGENTS.md ]; then
     echo "== decision records =="
     scripts/check-decision-records.sh
 
+    echo "== governed doors =="
+    scripts/check-governed-doors.sh
+
     # A conformance suite is worth what it is pointed at. `ContentBlobs` had
     # seven implementations and three ran its suite, and two of the four that
     # did not were minting ids no real backend produces.

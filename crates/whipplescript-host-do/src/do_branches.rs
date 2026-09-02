@@ -1481,6 +1481,19 @@ impl<S: DoSql> ContentBlobs for DoContentBlobs<S> {
 /// decl-less change-unit index and `decl()` selection / witness scans were
 /// silently path-level on the DO (fail closed per DR-0054, but a parity gap
 /// F5 exposed). Actor/intent stay the caller's to set.
+/// The composition door for OUT-OF-CRATE harnesses (`test-support`): the
+/// same canonicalizer discipline as every production site, so a parity test
+/// never mints a decl-less composition (the F5 bug class).
+#[cfg(any(test, feature = "test-support"))]
+pub fn compose_vcs_shared<Sql: crate::do_store::DoSql + Clone>(
+    sql: &Sql,
+) -> Result<
+    whipplescript_store::vcs::WorkspaceVcs<DoBranches<Sql>, DoContentBlobs<Sql>>,
+    whipplescript_store::StoreError,
+> {
+    compose_vcs(sql)
+}
+
 pub(crate) fn compose_vcs<Sql: crate::do_store::DoSql + Clone>(
     sql: &Sql,
 ) -> Result<

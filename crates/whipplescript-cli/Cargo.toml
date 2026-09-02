@@ -46,6 +46,10 @@ codex = ["dep:whipplescript-provider-codex"]
 claude = ["dep:whipplescript-provider-claude"]
 
 [dev-dependencies]
+# The DO host, so the W4 parity harness drives both hosts' governed doors in
+# one test and diffs the receipt shapes. Path-only: the crate is unpublished
+# and dev-dependencies without a version never enter the publish graph.
+whipplescript-host-do = { path = "../whipplescript-host-do", features = ["test-support"] }
 # Raw store access for upgrade-shaped fixtures: the re-attestation tests age a
 # recorded ir_hash the way an older toolchain would have written it, which no
 # store API does (and none should).

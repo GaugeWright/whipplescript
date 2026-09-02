@@ -10,8 +10,9 @@ description = "Cloudflare Durable Object host binding for the sans-IO WhippleScr
 # registry copy would be inert off that target. The publish chain is the seven
 # crates named in `spec/distribution-tracker.md`; without this flag that
 # exclusion lived only in prose and `cargo publish --workspace` would ship it.
-# Nothing depends on this crate — verified across the workspace, GaugeDesk, and
-# gaugewright-cloud, whose sole mentions are a comment.
+# One in-repo exception: the native CLI dev-depends on it (path-only, feature
+# `test-support`) so the DR-0091 W4 parity harness can drive the DO doors
+# beside the native ones; a dev-dependency never enters the publish graph.
 publish = false
 homepage.workspace = true
 repository.workspace = true
@@ -30,6 +31,14 @@ serde = { version = "1", features = ["derive"] }
 p256 = { version = "0.14", default-features = false, features = ["ecdsa"] }
 hex = "0.4"
 regex = "1"
+# Optional: backs `do_store::test_support` for OUT-OF-CRATE consumers (the W4
+# cross-host parity harness). This crate's own tests get rusqlite from
+# dev-dependencies; the wasm build never enables the feature.
+rusqlite = { version = "0.40.1", features = ["bundled"], optional = true }
+
+[features]
+# Exposes the rusqlite-backed `DoSql` test harness to other crates' tests.
+test-support = ["dep:rusqlite"]
 
 [dev-dependencies]
 # Backs the DoSql interface with real SQLite in tests, so the ported DO-store SQL

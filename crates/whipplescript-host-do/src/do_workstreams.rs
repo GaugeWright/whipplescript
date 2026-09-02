@@ -12,7 +12,6 @@
 //! transactions collapse to plain statement sequences (the do_branches
 //! posture).
 
-use whipplescript_store::branches::HeadReservationOutcome;
 use whipplescript_store::workstreams::{
     branch_home_evidence_handle, ArchiveOutcome, BoundaryReservation, BranchHomeReceiptV1,
     ClosePromotedOutcome, CreateStreamOutcome, JoinOutcome, RecordRefAdvancedOutcome,
@@ -725,15 +724,14 @@ pub fn home_do_turn_branch<Sql: DoSql + Clone>(
     }
 }
 
-/// The DO-side `vcs.promote` provider (DR-0052 grammar-pass DO-parity
-/// residual, closed 2026-07-31): the boundary hop over the DO's own
-/// branch/workstream tables, sharing `WorkspaceVcs`'s sync logic with
-/// native byte-for-byte. Two deliberate divergences from the native
-/// provider, both architectural rather than gaps: **no adoption lease**
-/// — the DO is single-writer per object, so the mediator's
-/// serialization is literal (vw note §7) and a lease would guard
-/// against a writer that cannot exist; and **no fact routing** — vcs.*
-/// fact delivery is the mediator surface (A5), which lives native-side.
+/// The DO-side `vcs.promote` provider: since DR-0091 W1 a dispatch onto
+/// the kernel's one promotion choreography, over the DO's own
+/// branch/workstream tables. The two deliberate divergences from the
+/// native door are both host-supplied seams, not copies: **no adoption
+/// lease** — the DO is single-writer per object, so its turn is the
+/// serialization (`SingleWriterSerialization`, vw note §7); and **no
+/// fact routing** — vcs.* fact delivery is the mediator surface (A5),
+/// which lives native-side.
 pub struct DoVcsPromoteCapabilityProvider<Sql: DoSql + Clone> {
     /// The shared DO SQLite handle (an `Rc<…>` in every real
     /// instantiation, so cloning is a refcount bump).
@@ -761,10 +759,7 @@ impl<Sql: DoSql + Clone> whipplescript_kernel::effect_handlers::CapabilityProvid
             Ok(value) => value,
             Err(error) => return failed(format!("invalid vcs.promote input: {error}")),
         };
-        let Some(stream_id) = input
-            .get("stream")
-            .and_then(serde_json::Value::as_str)
-            .filter(|value| !value.is_empty())
+        let Some(stream_id) = whipplescript_kernel::effect_handlers::promote_stream_id(&input)
         else {
             return failed("vcs.promote input names no stream".to_owned());
         };
@@ -776,192 +771,29 @@ impl<Sql: DoSql + Clone> whipplescript_kernel::effect_handlers::CapabilityProvid
             Ok(vcs) => vcs,
             Err(error) => return failed(format!("branch stores unavailable: {error:?}")),
         };
+        // The identity-bearing coordinates, exactly as this door has always
+        // minted them: deterministic in the effect id, never a clock.
         let seed = crate::do_store::stable_hash_hex(&format!("promote|{}", effect.effect_id));
         let at = format!("promote:{}", effect.effect_id);
         let reservation_id = format!("effect-{}", effect.effect_id);
         let proposed_main = format!("cut-{seed}-promote");
-        let mut stream = match streams.get_stream(stream_id) {
-            Ok(Some(stream)) => stream,
-            Ok(None) => return failed(format!("no such stream `{stream_id}`")),
-            Err(error) => return failed(format!("workstream read failed: {error:?}")),
-        };
-        if stream.status == StreamStatus::Archived {
-            if let Some(reservation_id) = stream.reservation_id.as_deref() {
-                let _ = vcs.release_branch_head_reservation(&stream.line_branch_id, reservation_id);
-            }
-            return match stream.boundary_receipt("durable-object-workspace") {
-                Some(receipt) => CapabilityOutcome::Produced(serde_json::json!({
-                    "variant": "Promoted",
-                    "stream": stream_id,
-                    "sync_cut_id": receipt.proposed_main_cut,
-                    "detail": "recovered",
-                    "boundary_receipt": receipt,
-                })),
-                None => failed(format!("stream `{stream_id}` is archived")),
-            };
-        }
-        if stream.status == StreamStatus::Active {
-            let line = match vcs.get_branch(&stream.line_branch_id) {
-                Ok(Some(line)) => line,
-                Ok(None) => return failed("stream line is missing".to_owned()),
-                Err(error) => return failed(format!("stream line read failed: {error:?}")),
-            };
-            let main = match vcs.get_branch(whipplescript_store::branches::MAINLINE_BRANCH_ID) {
-                Ok(Some(main)) => main,
-                Ok(None) => return failed("Main is missing".to_owned()),
-                Err(error) => return failed(format!("Main read failed: {error:?}")),
-            };
-            let expected_line = line.head_cut_id.unwrap_or_default();
-            let expected_main = main.head_cut_id.unwrap_or_default();
-            stream = match streams.reserve_boundary(
+        // Single-writer per object: the DO's turn IS the serialization
+        // (DR-0091 Decision 2), so the kernel choreography runs unleased.
+        let result = whipplescript_kernel::effect_handlers::run_reserved_boundary_promotion_generic(
+            &mut streams,
+            &mut vcs,
+            &whipplescript_kernel::effect_handlers::PromoteDoorRequest {
                 stream_id,
-                BoundaryReservation {
-                    reservation_id: &reservation_id,
-                    expected_line_cut: &expected_line,
-                    expected_main_cut: &expected_main,
-                    proposed_main_cut: &proposed_main,
-                    at: &at,
-                },
-            ) {
-                Ok(ReserveBoundaryOutcome::Reserved(row))
-                | Ok(ReserveBoundaryOutcome::Existing(row)) => row,
-                Ok(other) => return failed(format!("boundary reservation refused: {other:?}")),
-                Err(error) => return failed(format!("boundary reservation failed: {error:?}")),
-            };
-        }
-
-        let reservation_id = stream.reservation_id.clone().unwrap_or_default();
-        let expected_line = stream.expected_line_cut.clone().unwrap_or_default();
-        let expected_main = stream.expected_main_cut.clone().unwrap_or_default();
-        let proposed_main = stream.proposed_main_cut.clone().unwrap_or_default();
-        if stream.status == StreamStatus::RefAdvanced {
-            if let Err(error) = streams.close_promoted(stream_id, &reservation_id, &at) {
-                return failed(format!("post-CAS close failed: {error:?}"));
-            }
-            if let Err(error) =
-                vcs.release_branch_head_reservation(&stream.line_branch_id, &reservation_id)
-            {
-                return failed(format!("stream-line reservation release failed: {error:?}"));
-            }
-        } else if stream.status == StreamStatus::BoundaryReserved {
-            match vcs.reserve_branch_head(&stream.line_branch_id, &reservation_id, &at) {
-                Ok(HeadReservationOutcome::Reserved) | Ok(HeadReservationOutcome::Existing) => {}
-                Ok(other) => {
-                    let _ = streams.release_boundary(stream_id, &reservation_id, &at);
-                    return failed(format!("stream-line reservation refused: {other:?}"));
-                }
-                Err(error) => {
-                    return failed(format!("stream-line reservation failed: {error:?}"));
-                }
-            }
-            fn cut_value(value: &str) -> Option<&str> {
-                (!value.is_empty()).then_some(value)
-            }
-            let evidence = match vcs.boundary_ref_evidence(
-                &stream.line_branch_id,
-                cut_value(&expected_main),
-                &proposed_main,
-            ) {
-                Ok(evidence) => evidence,
-                Err(error) => return failed(format!("boundary recovery failed: {error:?}")),
-            };
-            let (position, handle) = match evidence {
-                Some(evidence) => evidence,
-                None => match vcs.promote_line_exact(
-                    &stream.line_branch_id,
-                    &reservation_id,
-                    cut_value(&expected_line),
-                    cut_value(&expected_main),
-                    &proposed_main,
-                    &at,
-                ) {
-                    Ok(whipplescript_store::vcs::BoundaryPromotionOutcome::Promoted {
-                        ref_position,
-                        ref_receipt_handle,
-                        ..
-                    }) => (ref_position, ref_receipt_handle),
-                    Ok(whipplescript_store::vcs::BoundaryPromotionOutcome::Conflicted {
-                        conflicts,
-                    }) => {
-                        let _ = streams.release_boundary(stream_id, &reservation_id, &at);
-                        let _ = vcs.release_branch_head_reservation(
-                            &stream.line_branch_id,
-                            &reservation_id,
-                        );
-                        return CapabilityOutcome::Produced(serde_json::json!({
-                            "variant": "Conflicted",
-                            "stream": stream_id,
-                            "sync_cut_id": "",
-                            "detail": serde_json::to_string(
-                                &conflicts.iter().map(|conflict| serde_json::json!({
-                                    "path": conflict.path,
-                                    "base": conflict.base,
-                                    "ours": conflict.ours,
-                                    "theirs": conflict.theirs,
-                                })).collect::<Vec<_>>()
-                            ).unwrap_or_default(),
-                        }));
-                    }
-                    Ok(whipplescript_store::vcs::BoundaryPromotionOutcome::ExpectedCutsMoved {
-                        ..
-                    }) => {
-                        let _ = streams.release_boundary(stream_id, &reservation_id, &at);
-                        let _ = vcs.release_branch_head_reservation(
-                            &stream.line_branch_id,
-                            &reservation_id,
-                        );
-                        return failed("exact stream/Main cut moved; retry".to_owned());
-                    }
-                    Ok(other) => {
-                        let _ = streams.release_boundary(stream_id, &reservation_id, &at);
-                        let _ = vcs.release_branch_head_reservation(
-                            &stream.line_branch_id,
-                            &reservation_id,
-                        );
-                        return failed(format!("promotion refused: {other:?}"));
-                    }
-                    Err(error) => return failed(format!("promotion failed: {error:?}")),
-                },
-            };
-            match streams.record_ref_advanced(stream_id, &reservation_id, position, &handle, &at) {
-                Ok(RecordRefAdvancedOutcome::Recorded(_))
-                | Ok(RecordRefAdvancedOutcome::Existing(_)) => {}
-                Ok(other) => return failed(format!("ref receipt refused: {other:?}")),
-                Err(error) => return failed(format!("ref receipt failed: {error:?}")),
-            }
-            match streams.close_promoted(stream_id, &reservation_id, &at) {
-                Ok(ClosePromotedOutcome::Closed { .. })
-                | Ok(ClosePromotedOutcome::AlreadyClosed) => {}
-                Ok(other) => return failed(format!("post-CAS close refused: {other:?}")),
-                Err(error) => return failed(format!("post-CAS close failed: {error:?}")),
-            }
-            if let Err(error) =
-                vcs.release_branch_head_reservation(&stream.line_branch_id, &reservation_id)
-            {
-                return failed(format!("stream-line reservation release failed: {error:?}"));
-            }
-        } else {
-            return failed(format!(
-                "stream `{stream_id}` cannot promote from {}",
-                stream.status.as_str()
-            ));
-        }
-
-        let receipt = match streams.get_stream(stream_id) {
-            Ok(Some(row)) => match row.boundary_receipt("durable-object-workspace") {
-                Some(receipt) => receipt,
-                None => return failed("closed promotion has no receipt".to_owned()),
+                reservation_id: &reservation_id,
+                proposed_main: &proposed_main,
+                at: &at,
+                receipt_scope: "durable-object-workspace",
             },
-            Ok(None) => return failed("promoted stream vanished".to_owned()),
-            Err(error) => return failed(format!("receipt read failed: {error:?}")),
-        };
-        CapabilityOutcome::Produced(serde_json::json!({
-            "variant": "Promoted",
-            "stream": stream_id,
-            "sync_cut_id": receipt.proposed_main_cut,
-            "detail": "",
-            "boundary_receipt": receipt,
-        }))
+            &mut whipplescript_kernel::effect_handlers::SingleWriterSerialization,
+        );
+        // No fact routing: vcs.* fact delivery is the mediator surface (A5),
+        // which lives native-side.
+        whipplescript_kernel::effect_handlers::promote_effect_outcome(stream_id, &result)
     }
 }
 
@@ -997,25 +829,10 @@ impl<Sql: DoSql + Clone> whipplescript_kernel::effect_handlers::CapabilityProvid
             Ok(value) => value,
             Err(error) => return failed(format!("invalid input: {error}")),
         };
-        let Some(selection) = input
-            .get("selection")
-            .and_then(serde_json::Value::as_str)
-            .filter(|value| !value.is_empty())
-        else {
-            return failed("the effect names no selection".to_owned());
-        };
-        let expr = match whipplescript_store::selection::parse(selection) {
+        let expr = match whipplescript_kernel::effect_handlers::selective_selection(&input) {
             Ok(expr) => expr,
-            Err(error) => return failed(format!("selection does not parse: {error}")),
+            Err(message) => return failed(message),
         };
-        // DR-0084: an unexpanded region atom must never silently match empty
-        // -- refuse it by name (literals expand at effect-input build; only a
-        // dynamic selection naming an undeclared region reaches here).
-        if let Some(name) = whipplescript_store::selection::contains_region_atom(&expr) {
-            return failed(format!(
-                "`region({name})` did not resolve: the program declares no region by that name"
-            ));
-        }
         let branches = match crate::do_branches::DoBranches::new(self.sql.clone()) {
             Ok(branches) => branches,
             Err(error) => return failed(format!("branch store unavailable: {error:?}")),
@@ -1037,102 +854,28 @@ impl<Sql: DoSql + Clone> whipplescript_kernel::effect_handlers::CapabilityProvid
         let seed = crate::do_store::stable_hash_hex(&format!("selective|{}", effect.effect_id));
         let cut_id = format!("cut-{seed}");
         let at = format!("selective:{}", effect.effect_id);
-        if effect.target.as_deref() == Some("vcs.undo") {
-            match vcs.apply_undo_selection(&branch_id, &expr, &cut_id, &at) {
-                Ok(whipplescript_store::vcs::UndoSelectionOutcome::Proposed {
-                    cut_id,
-                    reverted_paths,
-                    ..
-                }) => CapabilityOutcome::Produced(serde_json::json!({
-                    "variant": "Applied",
-                    "cut_id": cut_id,
-                    "detail": serde_json::to_string(&reverted_paths).unwrap_or_default(),
-                    // DR-0086 F4: the DO receipt carries the same
-                    // staleness-delta advisory as native (issue subjects;
-                    // DO assertion listing rides F5).
-                    "staleness": do_staleness_deltas(&self.sql, &vcs, &branch_id, &cut_id),
-                })),
-                Ok(whipplescript_store::vcs::UndoSelectionOutcome::WouldStrand { stranded }) => {
-                    CapabilityOutcome::Produced(serde_json::json!({
-                        "variant": "Stranded",
-                        "cut_id": "",
-                        "detail": serde_json::to_string(
-                            &stranded
-                                .iter()
-                                .map(|unit| {
-                                    serde_json::json!({"path": unit.path, "cut": unit.cut_id})
-                                })
-                                .collect::<Vec<_>>()
-                        )
-                        .unwrap_or_default(),
-                    }))
-                }
-                Ok(whipplescript_store::vcs::UndoSelectionOutcome::NothingSelected) => {
-                    CapabilityOutcome::Produced(serde_json::json!({
-                        "variant": "Applied",
-                        "cut_id": "",
-                        "detail": "nothing_selected",
-                    }))
-                }
-                Ok(other) => failed(format!("undo refused: {other:?}")),
-                Err(error) => failed(format!("undo failed: {error:?}")),
-            }
-        } else {
-            let onto = input
-                .get("onto")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or_default();
-            let onto_line = if onto == "mainline" {
-                whipplescript_store::branches::MAINLINE_BRANCH_ID.to_owned()
-            } else {
-                let streams = match DoWorkstreams::new(self.sql.clone()) {
-                    Ok(streams) => streams,
-                    Err(error) => {
-                        return failed(format!("workstream store unavailable: {error:?}"))
-                    }
-                };
-                match streams.get_stream(onto) {
-                    Ok(Some(stream)) => stream.line_branch_id,
-                    _ => return failed(format!("`onto {onto}` names no stream")),
-                }
-            };
-            match vcs.transport_selection(&branch_id, &expr, &onto_line, &cut_id, &at) {
-                Ok(whipplescript_store::vcs::TransportOutcome::Transported {
-                    cut_id,
-                    moved_paths,
-                    ..
-                }) => CapabilityOutcome::Produced(serde_json::json!({
-                    "variant": "Applied",
-                    "cut_id": cut_id,
-                    "detail": serde_json::to_string(&moved_paths).unwrap_or_default(),
-                    // DR-0086 F4: destination-line deltas, as native.
-                    "staleness": do_staleness_deltas(&self.sql, &vcs, &onto_line, &cut_id),
-                })),
-                Ok(whipplescript_store::vcs::TransportOutcome::Conflicted { conflicts }) => {
-                    CapabilityOutcome::Produced(serde_json::json!({
-                        "variant": "Conflicted",
-                        "cut_id": "",
-                        "detail": serde_json::to_string(
-                            &conflicts
-                                .iter()
-                                .map(|conflict| serde_json::json!({"path": conflict.path}))
-                                .collect::<Vec<_>>()
-                        )
-                        .unwrap_or_default(),
-                    }))
-                }
-                Ok(
-                    whipplescript_store::vcs::TransportOutcome::UpToDate
-                    | whipplescript_store::vcs::TransportOutcome::NothingSelected,
-                ) => CapabilityOutcome::Produced(serde_json::json!({
-                    "variant": "Applied",
-                    "cut_id": "",
-                    "detail": "nothing_to_move",
-                })),
-                Ok(other) => failed(format!("transport refused: {other:?}")),
-                Err(error) => failed(format!("transport failed: {error:?}")),
-            }
-        }
+        // DR-0091 W2: the verb is the kernel's one choreography. This door's
+        // seams: stream lines resolve through the DO's own workstream table,
+        // and the staleness advisory lists this store's issues + assertions.
+        // No fact routing — the mediator surface is native (A5).
+        let sql = self.sql.clone();
+        let result = whipplescript_kernel::effect_handlers::run_selective_verb_generic(
+            &mut vcs,
+            effect.target.as_deref(),
+            &input,
+            &expr,
+            &branch_id,
+            &cut_id,
+            &at,
+            &mut |onto| {
+                DoWorkstreams::new(sql.clone())
+                    .ok()
+                    .and_then(|streams| streams.get_stream(onto).ok().flatten())
+                    .map(|stream| stream.line_branch_id)
+            },
+            &mut |vcs, line, cut| do_staleness_deltas(&sql, vcs, line, cut),
+        );
+        whipplescript_kernel::effect_handlers::selective_effect_outcome(result)
     }
 }
 
@@ -1173,57 +916,12 @@ fn do_staleness_deltas<Sql: crate::do_store::DoSql + Clone>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rusqlite::types::{Value as RValue, ValueRef};
-    use rusqlite::Connection;
     use std::rc::Rc;
 
-    /// Minimal rusqlite-backed `DoSql` (the do_memory test harness's
-    /// shape) so the ported SQL runs against a real engine.
-    struct TestSql {
-        conn: Connection,
-    }
-    fn to_value(v: &SqlValue) -> RValue {
-        match v {
-            SqlValue::Null => RValue::Null,
-            SqlValue::Int(n) => RValue::Integer(*n),
-            SqlValue::Text(s) => RValue::Text(s.clone()),
-        }
-    }
-    fn from_ref(r: ValueRef<'_>) -> SqlValue {
-        match r {
-            ValueRef::Null => SqlValue::Null,
-            ValueRef::Integer(n) => SqlValue::Int(n),
-            ValueRef::Real(f) => SqlValue::Int(f as i64),
-            ValueRef::Text(t) => SqlValue::Text(String::from_utf8_lossy(t).into_owned()),
-            ValueRef::Blob(_) => SqlValue::Null,
-        }
-    }
-    impl DoSql for TestSql {
-        fn execute(&self, sql: &str, params: &[SqlValue]) -> Result<u64, String> {
-            self.conn
-                .execute(sql, rusqlite::params_from_iter(params.iter().map(to_value)))
-                .map(|n| n as u64)
-                .map_err(|e| e.to_string())
-        }
-        fn query(&self, sql: &str, params: &[SqlValue]) -> Result<Vec<Vec<SqlValue>>, String> {
-            let mut stmt = self.conn.prepare(sql).map_err(|e| e.to_string())?;
-            let cols = stmt.column_count();
-            let rows = stmt
-                .query_map(
-                    rusqlite::params_from_iter(params.iter().map(to_value)),
-                    |row| Ok((0..cols).map(|i| from_ref(row.get_ref_unwrap(i))).collect()),
-                )
-                .map_err(|e| e.to_string())?
-                .collect::<Result<Vec<Vec<SqlValue>>, _>>()
-                .map_err(|e| e.to_string())?;
-            Ok(rows)
-        }
-    }
+    use crate::do_store::test_support::RusqliteDoSql;
 
-    fn sql() -> Rc<TestSql> {
-        Rc::new(TestSql {
-            conn: Connection::open_in_memory().expect("sqlite"),
-        })
+    fn sql() -> Rc<RusqliteDoSql> {
+        Rc::new(RusqliteDoSql::in_memory())
     }
 
     /// DO workstream parity: create/join (single-valued upsert), staleness
@@ -1369,6 +1067,19 @@ mod tests {
             panic!("expected produced");
         };
         assert_eq!(value["variant"], "Stranded");
+        // DR-0091 W2 parity gain: the stranded detail carries native's
+        // three-field shape — the DO's pre-lift copy dropped the `by`
+        // attribution, so a stranded refusal named the unit but not whose
+        // work would strand.
+        let stranded: serde_json::Value =
+            serde_json::from_str(value["detail"].as_str().expect("detail is a string"))
+                .expect("detail parses");
+        assert!(stranded[0]["path"].is_string());
+        assert!(stranded[0]["cut"].is_string());
+        assert!(
+            stranded[0].get("by").is_some(),
+            "the stranded unit names its actor: {stranded}"
+        );
 
         // Transport the kept work onto mainline: applies.
         let outcome = provider.produce(
@@ -1480,6 +1191,16 @@ mod tests {
             panic!("expected produced, got failure");
         };
         assert_eq!(value["variant"], "Promoted");
+        // DR-0091 W1 identity pin: the proposed Main cut is minted from the
+        // effect id exactly as this door always minted it — the lift must
+        // reproduce the exactly-once key byte for byte.
+        let seed = crate::do_store::stable_hash_hex("promote|eff-1");
+        assert_eq!(
+            value["sync_cut_id"],
+            serde_json::Value::String(format!("cut-{seed}-promote")),
+            "the deterministic promote cut id survives the kernel dispatch"
+        );
+        assert_eq!(value["detail"], "");
         // Mainline actually received the stream's work.
         let main_manifest = vcs
             .read(
@@ -1525,9 +1246,30 @@ mod tests {
             panic!("expected produced, got failure");
         };
         assert_eq!(value["variant"], "Conflicted");
-        assert!(value["detail"]
-            .as_str()
-            .unwrap_or("")
-            .contains("contested.md"));
+        // DR-0091 W1 parity gain: the conflict detail carries native's full
+        // eight-field shape — the DO's pre-lift copy dropped the side
+        // provenance, so a DO conflict named paths but not which side at
+        // which cut.
+        let detail: serde_json::Value =
+            serde_json::from_str(value["detail"].as_str().expect("detail is a string"))
+                .expect("detail parses");
+        assert_eq!(detail[0]["path"], "contested.md");
+        assert_eq!(detail[0]["ours_branch"], "line-conflict");
+        assert_eq!(detail[0]["theirs_branch"], "main");
+        assert!(detail[0]["theirs_cut"].is_string());
+
+        // Replaying the promoted effect recovers the archived stream's
+        // receipt and says so — recovery is data, not a second promotion.
+        let outcome = provider.produce(&effect("eff-1", "triage"), &config);
+        let CapabilityOutcome::Produced(value) = outcome else {
+            panic!("expected produced, got failure");
+        };
+        assert_eq!(value["variant"], "Promoted");
+        assert_eq!(value["detail"], "recovered");
+        assert_eq!(
+            value["sync_cut_id"],
+            serde_json::Value::String(format!("cut-{seed}-promote")),
+            "the recovered receipt replays the original coordinate"
+        );
     }
 }

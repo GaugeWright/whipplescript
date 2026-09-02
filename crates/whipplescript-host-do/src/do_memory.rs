@@ -268,57 +268,11 @@ impl<Sql: DoSql + Clone> CapabilityProvider for DoMemoryCapabilityProvider<Sql> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rusqlite::types::{Value, ValueRef};
-    use rusqlite::Connection;
 
-    /// Minimal rusqlite-backed `DoSql` so the ported SQL runs against a real
-    /// engine (mirrors the `RusqliteDoSql` in `do_store` tests).
-    struct TestSql {
-        conn: Connection,
-    }
-    fn to_value(v: &SqlValue) -> Value {
-        match v {
-            SqlValue::Null => Value::Null,
-            SqlValue::Int(n) => Value::Integer(*n),
-            SqlValue::Text(s) => Value::Text(s.clone()),
-        }
-    }
-    fn from_ref(r: ValueRef<'_>) -> SqlValue {
-        match r {
-            ValueRef::Null => SqlValue::Null,
-            ValueRef::Integer(n) => SqlValue::Int(n),
-            ValueRef::Real(f) => SqlValue::Int(f as i64),
-            ValueRef::Text(t) => SqlValue::Text(String::from_utf8_lossy(t).into_owned()),
-            ValueRef::Blob(_) => SqlValue::Null,
-        }
-    }
-    impl DoSql for TestSql {
-        fn execute(&self, sql: &str, params: &[SqlValue]) -> Result<u64, String> {
-            self.conn
-                .execute(sql, rusqlite::params_from_iter(params.iter().map(to_value)))
-                .map(|n| n as u64)
-                .map_err(|e| e.to_string())
-        }
-        fn query(&self, sql: &str, params: &[SqlValue]) -> Result<Vec<Vec<SqlValue>>, String> {
-            let mut stmt = self.conn.prepare(sql).map_err(|e| e.to_string())?;
-            let cols = stmt.column_count();
-            let rows = stmt
-                .query_map(
-                    rusqlite::params_from_iter(params.iter().map(to_value)),
-                    |row| Ok((0..cols).map(|i| from_ref(row.get_ref_unwrap(i))).collect()),
-                )
-                .map_err(|e| e.to_string())?
-                .collect::<Result<Vec<Vec<SqlValue>>, _>>()
-                .map_err(|e| e.to_string())?;
-            Ok(rows)
-        }
-    }
+    use crate::do_store::test_support::RusqliteDoSql as TestSql;
 
     fn store() -> DoMemoryStore<TestSql> {
-        DoMemoryStore::open(TestSql {
-            conn: Connection::open_in_memory().expect("sqlite"),
-        })
-        .expect("open")
+        DoMemoryStore::open(TestSql::in_memory()).expect("open")
     }
 
     fn learn<'a>(pool: &'a str, text: &'a str, effect: &'a str) -> NewMemoryEntry<'a> {

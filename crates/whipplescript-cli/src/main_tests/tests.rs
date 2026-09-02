@@ -1584,3 +1584,428 @@ fn a_guard_refusal_aborts_the_pass_while_a_semantic_conflict_is_absorbed() {
     };
     assert_eq!(guard, GuardKind::OwnershipFence);
 }
+
+/// DR-0091 W1: the adoption-lease serialization's one hard failure — the
+/// coordination store cannot open — refuses with a message that names it.
+/// The path is pointed UNDER an existing file, so opening must fail with
+/// zero test scaffolding and without touching any real store.
+#[test]
+fn promote_serialization_refuses_when_the_coordination_store_cannot_open() {
+    use whipplescript_kernel::effect_handlers::PromotionSerialization;
+    let _guard = env_lock();
+    let impossible = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/Cargo.toml/coordination.sqlite"
+    );
+    let prior = env::var("WHIPPLESCRIPT_COORDINATION_STORE").ok();
+    env::set_var("WHIPPLESCRIPT_COORDINATION_STORE", impossible);
+    let mut serialization = AdoptionLeaseSerialization::new("test-holder");
+    let result = serialization.acquire();
+    match prior {
+        Some(value) => env::set_var("WHIPPLESCRIPT_COORDINATION_STORE", value),
+        None => env::remove_var("WHIPPLESCRIPT_COORDINATION_STORE"),
+    }
+    let error = result.expect_err("a store under a file must fail to open");
+    assert!(
+        error.starts_with("adoption lease unavailable:"),
+        "the refusal names the lease mechanism: {error}"
+    );
+    // Release with nothing acquired is a no-op, never a panic.
+    serialization.release();
+}
+
+// ---------------------------------------------------------------------------
+// DR-0091 W4: the cross-host parity harness. One scenario, both hosts' doors,
+// and the receipts must agree — in exact text where nothing is volatile, in
+// structural shape everywhere else — so the F4/F5 drift class (a field one
+// host mints and the other forgot) fails a test instead of waiting for the
+// next lift to trip over it.
+// ---------------------------------------------------------------------------
+
+/// The structural shape of a receipt: objects keep their sorted key set,
+/// arrays their element shapes, leaves their JSON type. A `detail` field
+/// whose string parses as JSON is compared as its parsed shape, because
+/// that is what a consumer reads out of it.
+fn receipt_shape(value: &Value) -> Value {
+    match value {
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .map(|(key, inner)| {
+                    let inner = if key == "detail" {
+                        inner
+                            .as_str()
+                            .and_then(|text| serde_json::from_str::<Value>(text).ok())
+                            .map(|parsed| receipt_shape(&parsed))
+                            .unwrap_or_else(|| receipt_shape(inner))
+                    } else {
+                        receipt_shape(inner)
+                    };
+                    (key.clone(), inner)
+                })
+                .collect(),
+        ),
+        Value::Array(items) => Value::Array(items.iter().map(receipt_shape).collect()),
+        Value::Null => json!("null"),
+        Value::Bool(_) => json!("bool"),
+        Value::Number(_) => json!("number"),
+        Value::String(_) => json!("string"),
+    }
+}
+
+struct ParityWorlds {
+    _dir: std::path::PathBuf,
+    store_path: PathBuf,
+    prior_env: Vec<(&'static str, Option<String>)>,
+    do_sql: whipplescript_host_do::do_store::test_support::RusqliteDoSql,
+}
+
+const PARITY_ENV: [&str; 5] = [
+    "WHIPPLESCRIPT_BRANCH_STORE",
+    "WHIPPLESCRIPT_VCS_CONTENT_STORE",
+    "WHIPPLESCRIPT_WORKSTREAM_STORE",
+    "WHIPPLESCRIPT_COORDINATION_STORE",
+    "WHIPPLESCRIPT_ITEMS_STORE",
+];
+
+impl ParityWorlds {
+    /// Point every native store at a fresh temp directory (under `env_lock`)
+    /// and open a fresh in-memory DO. The two worlds start empty and each
+    /// scenario builds the SAME state in both before knocking on the doors.
+    fn open(tag: &str) -> Self {
+        let dir =
+            std::env::temp_dir().join(format!("whip-door-parity-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let prior_env = PARITY_ENV
+            .iter()
+            .map(|name| (*name, env::var(name).ok()))
+            .collect();
+        env::set_var("WHIPPLESCRIPT_BRANCH_STORE", dir.join("branches.sqlite"));
+        env::set_var(
+            "WHIPPLESCRIPT_VCS_CONTENT_STORE",
+            dir.join("content.sqlite"),
+        );
+        env::set_var(
+            "WHIPPLESCRIPT_WORKSTREAM_STORE",
+            dir.join("workstreams.sqlite"),
+        );
+        env::set_var(
+            "WHIPPLESCRIPT_COORDINATION_STORE",
+            dir.join("coordination.sqlite"),
+        );
+        env::set_var("WHIPPLESCRIPT_ITEMS_STORE", dir.join("items.sqlite"));
+        let do_sql = whipplescript_host_do::do_store::test_support::RusqliteDoSql::in_memory();
+        Self {
+            store_path: dir.join("items.sqlite"),
+            _dir: dir,
+            prior_env,
+            do_sql,
+        }
+    }
+
+    fn native_vcs(&self) -> whipplescript_store::vcs::NativeWorkspaceVcs {
+        open_vcs().unwrap_or_else(|_| panic!("native vcs opens"))
+    }
+
+    fn do_vcs(
+        &self,
+    ) -> whipplescript_store::vcs::WorkspaceVcs<
+        whipplescript_host_do::do_branches::DoBranches<
+            whipplescript_host_do::do_store::test_support::RusqliteDoSql,
+        >,
+        whipplescript_host_do::do_branches::DoContentBlobs<
+            whipplescript_host_do::do_store::test_support::RusqliteDoSql,
+        >,
+    > {
+        whipplescript_host_do::do_branches::compose_vcs_shared(&self.do_sql).expect("do vcs")
+    }
+
+    /// The same line-with-work-on-a-stream state on both hosts.
+    fn seed_stream(&self, line: &str, stream: &str, path: &str, content: &str) {
+        let mut vcs = self.native_vcs();
+        vcs.init("t0").expect("init");
+        vcs.create_branch(
+            line,
+            None,
+            whipplescript_store::branches::MAINLINE_BRANCH_ID,
+            "t1",
+        )
+        .expect("branch");
+        vcs.write(line, path, Some(content), &format!("cut-{line}-1"), "t2")
+            .expect("write");
+        let mut streams =
+            whipplescript_store::workstreams::WorkstreamStore::open(workstream_store_path())
+                .expect("streams");
+        whipplescript_store::workstreams::Workstreams::create_stream(
+            &mut streams,
+            stream,
+            None,
+            line,
+            "t1",
+            None,
+        )
+        .expect("stream");
+
+        let mut vcs = self.do_vcs();
+        vcs.init("t0").expect("init");
+        vcs.create_branch(
+            line,
+            None,
+            whipplescript_store::branches::MAINLINE_BRANCH_ID,
+            "t1",
+        )
+        .expect("branch");
+        vcs.write(line, path, Some(content), &format!("cut-{line}-1"), "t2")
+            .expect("write");
+        let mut streams =
+            whipplescript_host_do::do_workstreams::DoWorkstreams::new(self.do_sql.clone())
+                .expect("streams");
+        whipplescript_store::workstreams::Workstreams::create_stream(
+            &mut streams,
+            stream,
+            None,
+            line,
+            "t1",
+            None,
+        )
+        .expect("stream");
+    }
+
+    /// Knock on both promote doors with the same effect and return both
+    /// outcomes as (produced-or-failed) JSON for comparison.
+    fn promote_both(&self, effect_id: &str, stream: &str) -> (Value, Value) {
+        let effect = |id: &str| ClaimableEffect {
+            effect_id: id.to_owned(),
+            kind: "capability.call".to_owned(),
+            target: Some("vcs.promote".to_owned()),
+            profile: None,
+            input_json: json!({ "stream": stream }).to_string(),
+            required_capabilities_json: "[]".to_owned(),
+            declared_profiles_json: "[]".to_owned(),
+        };
+        let config = EffectConfig::default();
+        let native = VcsPromoteCapabilityProvider {
+            store_path: self.store_path.clone(),
+        };
+        let do_door = whipplescript_host_do::do_workstreams::DoVcsPromoteCapabilityProvider {
+            sql: self.do_sql.clone(),
+        };
+        use whipplescript_kernel::effect_handlers::CapabilityProvider;
+        (
+            capability_outcome_json(native.produce(&effect(effect_id), &config)),
+            capability_outcome_json(do_door.produce(&effect(effect_id), &config)),
+        )
+    }
+
+    fn selective_both(&self, effect_id: &str, target: &str, input: Value) -> (Value, Value) {
+        let effect = |id: &str| ClaimableEffect {
+            effect_id: id.to_owned(),
+            kind: "capability.call".to_owned(),
+            target: Some(target.to_owned()),
+            profile: None,
+            input_json: input.to_string(),
+            required_capabilities_json: "[]".to_owned(),
+            declared_profiles_json: "[]".to_owned(),
+        };
+        let config = EffectConfig::default();
+        let native = VcsSelectiveCapabilityProvider {
+            store_path: self.store_path.clone(),
+            instance_id: "ins-parity".to_owned(),
+        };
+        let do_door = whipplescript_host_do::do_workstreams::DoVcsSelectiveCapabilityProvider {
+            sql: self.do_sql.clone(),
+            instance_id: "ins-parity".to_owned(),
+        };
+        use whipplescript_kernel::effect_handlers::CapabilityProvider;
+        (
+            capability_outcome_json(native.produce(&effect(effect_id), &config)),
+            capability_outcome_json(do_door.produce(&effect(effect_id), &config)),
+        )
+    }
+
+    fn close(self) {
+        for (name, prior) in self.prior_env {
+            match prior {
+                Some(value) => env::set_var(name, value),
+                None => env::remove_var(name),
+            }
+        }
+    }
+}
+
+/// Both outcome arms as one comparable JSON value: a produced receipt keeps
+/// its shape; a failure becomes {failed: {error_kind, message}} so refusal
+/// TEXT parity is assertable too.
+fn capability_outcome_json(
+    outcome: whipplescript_kernel::effect_handlers::CapabilityOutcome,
+) -> Value {
+    use whipplescript_kernel::effect_handlers::CapabilityOutcome;
+    match outcome {
+        CapabilityOutcome::Produced(value) => json!({ "produced": value }),
+        CapabilityOutcome::Failed {
+            error_kind,
+            message,
+        } => json!({ "failed": { "error_kind": error_kind, "message": message } }),
+    }
+}
+
+#[test]
+fn promote_door_receipts_agree_across_hosts() {
+    let _guard = env_lock();
+    let worlds = ParityWorlds::open("promote");
+    worlds.seed_stream("line-a", "triage", "feature.md", "stream work");
+
+    // Fresh promote: same variant, same empty detail, same receipt SHAPE
+    // (values legitimately differ: scopes, seeds, timestamps).
+    let (native, do_side) = worlds.promote_both("e-p1", "triage");
+    assert_eq!(native["produced"]["variant"], "Promoted", "{native}");
+    assert_eq!(do_side["produced"]["variant"], "Promoted", "{do_side}");
+    assert_eq!(native["produced"]["detail"], do_side["produced"]["detail"]);
+    assert_eq!(
+        receipt_shape(&native),
+        receipt_shape(&do_side),
+        "native:\n{native}\nDO:\n{do_side}"
+    );
+
+    // Replay: both hosts recover the archived receipt and say so, exactly.
+    let (native, do_side) = worlds.promote_both("e-p1", "triage");
+    assert_eq!(native["produced"]["detail"], "recovered", "{native}");
+    assert_eq!(do_side["produced"]["detail"], "recovered", "{do_side}");
+    assert_eq!(receipt_shape(&native), receipt_shape(&do_side));
+
+    // Conflict: the detail carries the SAME eight-field conflict projection
+    // on both hosts — the exact drift W1 found and fixed.
+    worlds.seed_stream("line-b", "conflict", "contested.md", "stream side");
+    {
+        let mut vcs = worlds.native_vcs();
+        vcs.write(
+            whipplescript_store::branches::MAINLINE_BRANCH_ID,
+            "contested.md",
+            Some("main side"),
+            "cut-main-c",
+            "t4",
+        )
+        .expect("write");
+        let mut vcs = worlds.do_vcs();
+        vcs.write(
+            whipplescript_store::branches::MAINLINE_BRANCH_ID,
+            "contested.md",
+            Some("main side"),
+            "cut-main-c",
+            "t4",
+        )
+        .expect("write");
+    }
+    let (native, do_side) = worlds.promote_both("e-p2", "conflict");
+    assert_eq!(native["produced"]["variant"], "Conflicted", "{native}");
+    assert_eq!(
+        receipt_shape(&native),
+        receipt_shape(&do_side),
+        "native:\n{native}\nDO:\n{do_side}"
+    );
+
+    // Refusal parity is EXACT: same kind, same words.
+    let (native, do_side) = worlds.promote_both("e-p3", "ghost");
+    assert_eq!(native["failed"], do_side["failed"], "{native} vs {do_side}");
+    assert!(native["failed"]["message"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("no such stream"));
+    worlds.close();
+}
+
+#[test]
+fn selective_door_receipts_agree_across_hosts() {
+    let _guard = env_lock();
+    let worlds = ParityWorlds::open("selective");
+
+    // The same instance-bound line on both hosts, with two dependent cuts so
+    // undo can be made to strand.
+    {
+        let mut vcs = worlds.native_vcs();
+        // The doors stamp their own actors; the SEEDED history must carry
+        // the same attribution on both hosts, or `by` in a stranded unit
+        // diverges for reasons that are the test's, not the doors'.
+        vcs.set_actor(Some("human:parity".to_owned()));
+        vcs.init("t0").expect("init");
+        vcs.create_branch(
+            "line-sel",
+            None,
+            whipplescript_store::branches::MAINLINE_BRANCH_ID,
+            "t1",
+        )
+        .expect("branch");
+        vcs.bind_instance("ins-parity", "line-sel", "t1")
+            .expect("bind");
+        vcs.write("line-sel", "src/f.rs", Some("v1"), "cut_k1", "t2")
+            .expect("write");
+        vcs.write("line-sel", "src/f.rs", Some("v2"), "cut_k2", "t3")
+            .expect("write");
+        let mut vcs = worlds.do_vcs();
+        vcs.set_actor(Some("human:parity".to_owned()));
+        vcs.init("t0").expect("init");
+        vcs.create_branch(
+            "line-sel",
+            None,
+            whipplescript_store::branches::MAINLINE_BRANCH_ID,
+            "t1",
+        )
+        .expect("branch");
+        vcs.bind_instance("ins-parity", "line-sel", "t1")
+            .expect("bind");
+        vcs.write("line-sel", "src/f.rs", Some("v1"), "cut_k1", "t2")
+            .expect("write");
+        vcs.write("line-sel", "src/f.rs", Some("v2"), "cut_k2", "t3")
+            .expect("write");
+    }
+
+    // Undoing the buried cut strands: same variant, same stranded-unit key
+    // set (the `by` attribution W2 restored to the DO).
+    let (native, do_side) =
+        worlds.selective_both("e-s1", "vcs.undo", json!({"selection": "cut(cut_k1)"}));
+    assert_eq!(native["produced"]["variant"], "Stranded", "{native}");
+    assert_eq!(
+        receipt_shape(&native),
+        receipt_shape(&do_side),
+        "native:\n{native}\nDO:\n{do_side}"
+    );
+
+    // Undoing the tip applies: same variant, same key set — including the
+    // staleness advisory both hosts now carry.
+    let (native, do_side) =
+        worlds.selective_both("e-s2", "vcs.undo", json!({"selection": "cut(cut_k2)"}));
+    assert_eq!(native["produced"]["variant"], "Applied", "{native}");
+    assert_eq!(
+        receipt_shape(&native),
+        receipt_shape(&do_side),
+        "native:\n{native}\nDO:\n{do_side}"
+    );
+
+    // Nothing to move is EXACT on both hosts (no volatile fields at all)
+    // once the staleness advisory is absent and the cut id empty.
+    let (native, do_side) = worlds.selective_both(
+        "e-s3",
+        "vcs.transport",
+        json!({"selection": "path(docs/**)", "onto": "mainline"}),
+    );
+    assert_eq!(
+        native["produced"], do_side["produced"],
+        "{native} vs {do_side}"
+    );
+
+    // Refusal parity is EXACT: the unknown stream and the unparseable
+    // selection refuse with the same kind and the same words.
+    let (native, do_side) = worlds.selective_both(
+        "e-s4",
+        "vcs.transport",
+        json!({"selection": "path(src/**)", "onto": "ghost"}),
+    );
+    assert_eq!(native["failed"], do_side["failed"], "{native} vs {do_side}");
+    let (native, do_side) = worlds.selective_both("e-s5", "vcs.undo", json!({}));
+    assert_eq!(native["failed"], do_side["failed"], "{native} vs {do_side}");
+    assert_eq!(
+        native["failed"]["message"], "the effect names no selection",
+        "{native}"
+    );
+    worlds.close();
+}
