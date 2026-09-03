@@ -6397,21 +6397,6 @@ impl SqliteStore {
         Ok(())
     }
 
-    /// Prefix-replay support: a truncated prefix may predate the source
-    /// run's terminal, but `rebuild_projections` never resets the instance
-    /// row's status (only replayed terminal/transition events move it) —
-    /// reopen it so the suffix can drive.
-    pub fn reset_instance_to_running(&mut self, instance_id: &str) -> StoreResult<()> {
-        self.connection
-            .execute(
-                "UPDATE instances SET status = 'running', last_error = NULL,
-                   completed_at = NULL WHERE instance_id = ?1",
-                params![instance_id],
-            )
-            .map_err(StoreError::from)?;
-        Ok(())
-    }
-
     pub fn rebuild_projections(&mut self, instance_id: &str) -> StoreResult<()> {
         self.rebuild_projections_impl(instance_id, None)
     }
@@ -6492,7 +6477,7 @@ impl SqliteStore {
         // fold could only ever ADD to what was already there. That is why
         // `completed_at` survived a rebuild that should not have produced it,
         // and why `reset_instance_to_running` had to exist as a manual step
-        // beside prefix replay.
+        // beside prefix replay -- deleted once this reset subsumed it.
         //
         // The identity columns (`program_id`, `input_json`, `created_at`,
         // `started_at`, the authority pair) are reset ONLY when the log carries

@@ -2204,9 +2204,11 @@ fn replay_scenario(
             }
         }
     }
-    store
-        .reset_instance_to_running(&scenario.instance_id)
-        .map_err(|error| format!("failed to reopen the instance: {error:?}"))?;
+    // The instance is already reopened: DR-0094 made `rebuild_projections`
+    // reset the log-owned columns before folding, so a prefix that predates the
+    // terminal folds to `running` on its own. This called
+    // `reset_instance_to_running` to do it by hand, back when the rebuild
+    // patched the row instead of recomputing it.
     // Quiescence at the cut: a mid-flight effect would fold as `running`
     // — unclaimable and never completing — so the suffix would hang.
     // Refuse (mirroring capture_checkpoint) and let the caller fall back.
