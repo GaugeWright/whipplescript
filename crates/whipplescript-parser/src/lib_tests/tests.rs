@@ -9742,11 +9742,18 @@ rule r
     );
 }
 
+/// DR-0097 reversed the decision this test used to guard.
+///
+/// It asserted that `WorkItem` "must remain user-writable" and recording it must
+/// not be refused. That decision had exactly one user — this test — and DR-0093
+/// had already broken its program without it noticing: `status "reviewed"` is not
+/// in the status union, so the program stopped compiling while the assertion went
+/// on passing, because it checked for the ABSENCE of one message rather than that
+/// the program compiled.
+///
+/// The name is what is reserved, and only when the program has not claimed it.
 #[test]
-fn allows_recording_user_writable_builtin_schema() {
-    // Regression guard for the fix above: `WorkItem` is a builtin schema ref
-    // but user-writable (work-tracking state), so recording it must NOT be
-    // rejected as observer-only.
+fn recording_a_platform_schema_the_program_did_not_declare_is_refused() {
     let source = r#"
 workflow WriteWork
 
@@ -9759,17 +9766,117 @@ class Done { id string }
 rule track
   when Job as q
 => {
-  record WorkItem { title "t" status "reviewed" }
+  record WorkItem { title "t" status "closed" }
   complete result { id q.id }
 }
 "#;
     let compiled = compile_program(source);
     assert!(
-        !compiled.diagnostics.iter().any(|d| d
-            .message
-            .contains("cannot record kernel-owned terminal schema")),
-        "WorkItem must remain user-writable, got {:?}",
-        compiled.diagnostics
+        compiled.diagnostics.iter().any(|d| {
+            d.code.as_str() == "construct.reserved_name"
+                && d.message
+                    .contains("cannot record kernel-owned terminal schema `WorkItem`")
+        }),
+        "{:?}",
+        compiled
+            .diagnostics
+            .iter()
+            .map(|d| &d.message)
+            .collect::<Vec<_>>()
+    );
+
+    // Forging an `AgentTurn` asserts the stronger thing — that an agent did
+    // work — and nothing in this repository records one.
+    let turn = compile_program(&source.replace(
+        r#"record WorkItem { title "t" status "closed" }"#,
+        r#"record AgentTurn { id "t" summary "s" agent "a" provider "p" status "completed" run_id "r" effect_id "e" }"#,
+    ));
+    assert!(
+        turn.diagnostics.iter().any(|d| {
+            d.code.as_str() == "construct.reserved_name" && d.message.contains("`AgentTurn`")
+        }),
+        "{:?}",
+        turn.diagnostics
+            .iter()
+            .map(|d| &d.message)
+            .collect::<Vec<_>>()
+    );
+}
+
+/// The other half of the same rule: a class the PROGRAM declared is the
+/// program's own type, whatever it is called, and recording it forges nothing.
+///
+/// This is what keeps the change from breaking the six programs in this
+/// repository that carry a hand-written `WorkItem`. DR-0096 already closed the
+/// one case where a declared name would be ambiguous — reading it from a
+/// provider as well — so what is left here is unambiguous by construction.
+#[test]
+fn recording_a_class_the_program_declared_is_not_forgery() {
+    let compiled = compile_program(
+        r#"
+workflow OwnType
+
+output result Done
+class Done { id string }
+
+class WorkItem {
+  title string
+  status string
+}
+
+rule track
+  when WorkItem as w
+=> {
+  complete result { id w.title }
+}
+
+rule seed
+  when started
+=> {
+  record WorkItem { title "t" status "anything at all" }
+}
+"#,
+    );
+    assert_eq!(
+        compiled.diagnostics,
+        Vec::new(),
+        "a declared class is the author's own type"
+    );
+
+    // Including for a schema whose name is otherwise the mediator's. This is a
+    // LOOSENING of the pre-existing refusal, which matched by name alone: a
+    // program declaring `class VcsChange` could not record it even though no
+    // mediator was present to disagree. The refusal exists so the name cannot
+    // silently come to mean "a fact some rule invented", and a declaration in
+    // the source is not silent.
+    let vcs = compile_program(
+        r#"
+workflow OwnVcs
+
+output result Done
+class Done { id string }
+
+class VcsChange {
+  path string
+}
+
+rule seed
+  when started
+=> {
+  record VcsChange { path "src/main.rs" }
+}
+
+rule react
+  when VcsChange as c
+=> {
+  complete result { id c.path }
+}
+"#,
+    );
+    assert_eq!(
+        vcs.diagnostics,
+        Vec::new(),
+        "a declared `VcsChange` in a program with no mediator is the author's own type"
     );
 }
 

@@ -9741,6 +9741,14 @@ fn is_observer_only_schema(name: &str) -> bool {
             // Knowledge-plane observer schema (DR-0084 W1): a rule that
             // records one forges a staleness observation.
             | "TrackerStale"
+            // DR-0097. `WorkItem` was deliberately absent, as work-tracking
+            // state a program may write; that decision had exactly one user —
+            // its own regression guard — and DR-0093 had already broken that
+            // guard's program without it noticing. `AgentTurn` was never argued
+            // about, just missing, and forging one asserts the stronger thing:
+            // that an agent did work.
+            | "WorkItem"
+            | "AgentTurn"
     )
 }
 
@@ -21584,7 +21592,14 @@ fn validate_recorded_schemas(
         };
         if let Some(record) = recorded {
             let schema = &record.schema;
-            if is_observer_only_schema(schema) {
+            // A class the PROGRAM declared is the program's own type, whatever
+            // it is called, and recording it forges nothing (DR-0097). The
+            // refusal is about the platform's schema, and `decl_span` is `None`
+            // for exactly that. Without this the six programs in this
+            // repository that declare their own `WorkItem` would stop
+            // compiling, and DR-0096 already forbids the one case where a
+            // declared name is ambiguous: reading it from a provider too.
+            if is_observer_only_schema(schema) && semantic.schemas.decl_span(schema).is_none() {
                 diagnostics.push(Diagnostic {
                     code: diagnostic_code!("construct.reserved_name"),
                     severity: Severity::Error,
