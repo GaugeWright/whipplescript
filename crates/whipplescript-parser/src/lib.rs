@@ -9936,7 +9936,14 @@ fn validate_measure_declarations(
 /// speak about, so an unproven one is either the analysis being too weak or the
 /// program being unbounded, and both are already reported. A ring with none has
 /// no token at all — what goes round is work in a queue.
-fn resource_only_cycle(ir: &IrProgram, component: &[usize]) -> Option<String> {
+/// The resource a cycle turns through, as (kind, name) — `("tracker", "backlog")`.
+///
+/// The KIND is carried because the advice differs by it and the diagnostic used
+/// to give a tracker's advice to every resource. That was harmless while
+/// trackers were the only kind; DR-0092 made a channel coupling a rule
+/// dependency, and a channel loop began being told to bound `issue.releases`,
+/// which names nothing in such a program.
+fn resource_only_cycle(ir: &IrProgram, component: &[usize]) -> Option<(String, String)> {
     let names = component
         .iter()
         .map(|member| ir.rules[*member].name.as_str())
@@ -9950,7 +9957,7 @@ fn resource_only_cycle(ir: &IrProgram, component: &[usize]) -> Option<String> {
         }
         match dependency.fact.split_once(':') {
             Some(("schema", _)) => return None,
-            Some((_, name)) => resource = Some(name.to_owned()),
+            Some((kind, name)) => resource = Some((kind.to_owned(), name.to_owned())),
             None => {}
         }
     }
@@ -10218,7 +10225,7 @@ fn validate_effectful_rule_recursion(
                 // nudge's advice — that a loop running as long as work arrives
                 // is fine — is the opposite of what that declaration says, and
                 // one mistake earns one diagnostic.
-                if let Some(resource) = resource_only_cycle(ir, &component)
+                if let Some((kind, resource)) = resource_only_cycle(ir, &component)
                     .filter(|_| !bounded_workflow)
                 {
                     warnings.push(Diagnostic {
@@ -10235,10 +10242,18 @@ fn validate_effectful_rule_recursion(
                             "rule cycle {} returns work to `{resource}` and nothing bounds it",
                             names.join(" -> ")
                         ),
-                        suggestion: Some(
+                        // A tracker counts its own returns, so the advice can
+                        // name the field. Nothing else does, and telling the
+                        // author of a channel loop to bound `issue.releases`
+                        // sends them looking for a tracker they do not have.
+                        suggestion: Some(if kind == "tracker" {
                             "if it is meant to run for as long as work arrives, nothing is wrong. If it is meant to stop after a fixed number of tries, bound the tracker's own count of them — `where issue.releases < 3` on the `when` that matches the item"
-                                .to_owned(),
-                        ),
+                                .to_owned()
+                        } else {
+                            format!(
+                                "if it is meant to run for as long as work arrives, nothing is wrong. If it is meant to stop, nothing about a `{kind}` counts the turns for you: carry the count in a fact beside the work and bound it there"
+                            )
+                        }),
                     });
                 }
             }

@@ -17,7 +17,7 @@
     "validate": "cargo build -p whipplescript-host-do --no-default-features --target wasm32-unknown-unknown --release && wasm-bindgen ../../../target/wasm32-unknown-unknown/release/whipplescript_host_do.wasm --out-dir pkg --target nodejs && node validate.cjs",
     "build:executor": "cargo build --release -p whipplescript --bin whip && cp ../../../target/release/whip executor/whip",
     "test": "npm run contracts:check && npm run canaries:check && npm run test:unit && npm run test:workerd",
-    "test:unit": "node --experimental-strip-types --test src/assistant-text.test.ts src/executor-broker.test.ts src/model-broker.test.ts src/private-home-protocol.test.ts src/provider-realization.test.ts src/session-lifecycle.test.ts src/session-collection.test.ts",
+    "test:unit": "node --experimental-strip-types --test src/assistant-text.test.ts src/credential-class-ref.test.ts src/executor-broker.test.ts src/model-broker.test.ts src/private-home-protocol.test.ts src/provider-realization.test.ts src/session-lifecycle.test.ts src/session-collection.test.ts",
     "deploy:private-staging": "npm run build:wasm && wrangler deploy --config wrangler.private-staging.toml",
     "test:private-staging": "node --experimental-strip-types scripts/private-home-staging-test.ts",
     "test:private-staging:open": "node --experimental-strip-types scripts/private-home-staging-test.ts open",

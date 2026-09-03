@@ -13905,6 +13905,59 @@ rule review
     );
 }
 
+/// The nudge's advice has to be true of the resource it is given, and DR-0092
+/// made that a live question: a channel coupling became a rule dependency, so
+/// this warning began firing on channel loops while still telling their authors
+/// to bound `issue.releases` — a field, and a tracker, that such a program does
+/// not have.
+///
+/// Neither change was wrong alone. The interaction was, and nothing either
+/// gate ran could see it: each was green on its own branch.
+///
+/// The warning is unwrapped rather than defaulted because the negative
+/// assertion below — that the advice does NOT mention `issue.releases` — passes
+/// on an empty string, and the first draft of this test did exactly that when
+/// its program used the wrong field name and produced no warning at all.
+#[test]
+fn the_nudge_advises_by_the_kind_of_resource_it_names() {
+    let channel = compile_program(
+        r#"
+@service
+workflow ChannelLoop
+use std.messaging
+
+channel ops_room { provider local }
+
+rule acknowledge_message
+  when message from ops_room as msg
+=> {
+  send via ops_room {
+    text "ack: {{ msg.text }}"
+  } as reply
+}
+"#,
+    );
+    let warning = channel
+        .warnings
+        .iter()
+        .find(|w| w.code.as_str() == "graph.unmeasured_resource_cycle")
+        .unwrap_or_else(|| {
+            panic!(
+                "the channel loop must warn at all, or the assertions below pass on nothing: {:?}",
+                channel.diagnostics
+            )
+        });
+    let help = warning.suggestion.clone().unwrap_or_default();
+    assert!(
+        help.contains("nothing about a `channel` counts the turns for you"),
+        "a channel loop is told what is true of a channel: {help}"
+    );
+    assert!(
+        !help.contains("issue.releases"),
+        "a program with no tracker must not be sent looking for one: {help}"
+    );
+}
+
 /// And the pattern the warning names actually works: a fact beside the item
 /// carries the count, correlated so the bound belongs to the ticket rather than
 /// to the rule. The ring becomes a fact ring, the measure proves it, and the

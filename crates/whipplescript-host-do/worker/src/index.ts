@@ -263,6 +263,7 @@ const INSTANCE_DUE_KEY = "instance-next-due-unix-ms";
 // The DO schema (36 tables) as a bundled text module (wrangler.toml `rules`).
 import DO_SCHEMA from "../do_schema.sql";
 import { selectAssistantText } from "./assistant-text";
+import { credentialIdForHostPolicy } from "./credential-class-ref";
 
 // Builtin capability seeds, mirroring the native migration-0001 builtin rows
 // for the two effect families the DO drives today (schema.coerce + agent.tell).
@@ -2802,7 +2803,12 @@ export class WorkflowInstance implements DurableObject {
         provider_binding: {
           binding_id: session.host_policy.provider_binding_ref,
           credential: {
-            credential_id: session.host_policy.credential_class,
+            // The closure's raw class, or its canonical custody spelling when
+            // that is what the signed envelope names — see
+            // `credential-class-ref.ts`. Presenting the raw class against a
+            // canonical envelope refused every turn of every release
+            // published after 2026-08-27 with "no exact realization".
+            credential_id: credentialIdForHostPolicy(session.host_policy),
           },
         },
         placement_ceiling_ref: session.host_policy.placement_ref,
