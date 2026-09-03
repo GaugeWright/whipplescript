@@ -209,6 +209,135 @@ marker_bite SubstratePublishOrder 'CONTENT BEFORE HISTORY'          NoHistoryWit
 marker_bite SubstratePublishOrder 'HISTORY BEFORE REF'              NoRefWithoutItsHistory
 marker_bite SubstratePublishOrder 'NO REF STRONGER THAN ITS CLOSURE' NoRefStrongerThanItsClosure
 
+# --- D12 runtime evidence: vacuity witnesses and per-guard bites ------------------
+# (spec/error-handling.md "Runtime And TLA+/Trace Obligations";
+#  models/trace-invariant-correspondence.tsv rows `capability_denial_names_subject`
+#  .. `terminal_diagnostic_names_effect`.)
+#
+# These invariants are quantified over evidence logs. An invariant over a log
+# nothing appends to is TRUE and proves nothing, so each gets two checks, and
+# the vacuity half comes first because it is the failure that hides the other.
+#
+#   1. WITNESS: an invariant saying the log is empty must be VIOLATED. That is
+#      the proof the model reaches a state where the evidence exists and the
+#      real invariant is satisfied non-trivially.
+#   2. BITE: with the guard removed, the paired invariant must be violated BY
+#      NAME. Named rather than via SafetyInvariants, because "some conjunct
+#      broke" would let one guard ride on another's teeth -- and these five
+#      guards sit in three actions that share variables.
+#
+# Length 4, not 6: every witness and every mutant here is reachable in at most
+# four steps (claim, start, recover, terminal), and the full-length run of the
+# unmutated spec above is what covers the rest.
+CPL_MODEL="$ROOT/models/tla/ControlPlaneLifecycle.tla"
+
+evidence_witness() {
+  local witness="$1" what="$2" dir
+  dir="$(mktemp -d)"
+  echo "== control-plane evidence witness: $witness must be VIOLATED ($what)"
+  if "${APALACHE[@]}" check --cinit=ConstInit --init=Init --next=Next \
+        --inv="$witness" --length=4 "$CPL_MODEL" > "$dir/out.log" 2>&1; then
+    echo "evidence witness FAILED: $witness holds, so $what is never written and" >&2
+    echo "  every invariant over it is vacuously true" >&2
+    rm -rf "$dir"
+    exit 1
+  fi
+  if ! grep -qiE 'invariant .* violated|outcome is: Error' "$dir/out.log"; then
+    echo "evidence witness FAILED: $witness erred for the wrong reason" >&2
+    cat "$dir/out.log" >&2
+    rm -rf "$dir"
+    exit 1
+  fi
+  rm -rf "$dir"
+  echo "evidence witness OK ($what is reachable, so its invariants have content)"
+}
+
+evidence_witness NoDenialEvidenceWitness      "denial evidence"
+evidence_witness NoAssertionEvidenceWitness   "assertion failure evidence"
+evidence_witness NoTerminalDiagnosticWitness  "terminal diagnostics"
+
+# Delete the guard line carrying MARKER and require the NAMED invariant to break.
+evidence_bite() {
+  local marker="$1" expect_inv="$2" dir
+  dir="$(mktemp -d)"
+  grep -v "$marker" "$CPL_MODEL" > "$dir/ControlPlaneLifecycle.tla"
+  if cmp -s "$dir/ControlPlaneLifecycle.tla" "$CPL_MODEL"; then
+    echo "evidence bite FAILED: marker '$marker' matched nothing, so it tested nothing" >&2
+    rm -rf "$dir"
+    exit 1
+  fi
+  echo "== control-plane evidence bite: without '$marker', $expect_inv must break"
+  if "${APALACHE[@]}" check --cinit=ConstInit --init=Init --next=Next \
+        --inv="$expect_inv" --length=4 "$dir/ControlPlaneLifecycle.tla" \
+        > "$dir/out.log" 2>&1; then
+    echo "evidence bite FAILED: dropping '$marker' did not violate $expect_inv" >&2
+    rm -rf "$dir"
+    exit 1
+  fi
+  if ! grep -qiE 'invariant .* violated|outcome is: Error' "$dir/out.log"; then
+    echo "evidence bite FAILED: '$marker' mutant erred for the wrong reason" >&2
+    cat "$dir/out.log" >&2
+    rm -rf "$dir"
+    exit 1
+  fi
+  rm -rf "$dir"
+  echo "evidence bite OK ($expect_inv guard is load-bearing)"
+}
+
+evidence_bite 'THE DENIAL NAMES ITS SUBJECT'          DenialEvidenceNamesItsSubject
+evidence_bite 'THE DENIAL CODE IS REGISTERED'         DenialEvidenceCodeIsRegistered
+evidence_bite 'THE EVIDENCE NAMES ITS ASSERTION'      AssertionFailureNamesItsAssertion
+evidence_bite 'THE ASSERTION CODE IS REGISTERED'      AssertionFailureCarriesRegisteredCode
+evidence_bite 'THE SCRIPT DENIAL CARRIES ITS ID'     ScriptDenialCarriesItsDiagnosticId
+evidence_bite 'THE TERMINAL DIAGNOSTIC CARRIES A CODE' TerminalDiagnosticCarriesCode
+
+# The two denial guards sit in one action and write one record; if either could
+# stand in for the other the pair would really be one invariant. It cannot:
+# with the naming guard gone, the CODE invariant still holds.
+CPL_DIR="$(mktemp -d)"
+grep -v 'THE DENIAL NAMES ITS SUBJECT' "$CPL_MODEL" > "$CPL_DIR/ControlPlaneLifecycle.tla"
+echo "== control-plane evidence: the two denial guards are independent"
+if ! "${APALACHE[@]}" check --cinit=ConstInit --init=Init --next=Next \
+      --inv=DenialEvidenceCodeIsRegistered --length=4 \
+      "$CPL_DIR/ControlPlaneLifecycle.tla" > "$CPL_DIR/out.log" 2>&1; then
+  echo "evidence bite FAILED: the naming mutant also broke DenialEvidenceCodeIsRegistered," >&2
+  echo "  so one invariant is riding on the other's teeth" >&2
+  rm -rf "$CPL_DIR"
+  exit 1
+fi
+rm -rf "$CPL_DIR"
+echo "evidence OK (naming and code guards break different invariants)"
+
+# Attribution is a SUBSTITUTION, not a deletion: removing the append would leave
+# terminalDiagnostics' unassigned, and a parse failure is not the invariant doing
+# its job. `CHOOSE e \in Effects : TRUE` is deterministic, so the mutant names one
+# fixed effect for every run -- a bystander whenever the run executed the other.
+CPL_DIR="$(mktemp -d)"
+sed 's|Append(terminalDiagnostics, <<r, runEffect\[r\], code>>)|Append(terminalDiagnostics, <<r, CHOOSE bystander \\in Effects : TRUE, code>>)|' \
+  "$CPL_MODEL" > "$CPL_DIR/ControlPlaneLifecycle.tla"
+if cmp -s "$CPL_DIR/ControlPlaneLifecycle.tla" "$CPL_MODEL"; then
+  echo "evidence bite FAILED: the attribution substitution matched nothing" >&2
+  rm -rf "$CPL_DIR"
+  exit 1
+fi
+echo "== control-plane evidence bite: a diagnostic naming a bystander must break"
+echo "   TerminalDiagnosticNamesItsRunEffect"
+if "${APALACHE[@]}" check --cinit=ConstInit --init=Init --next=Next \
+      --inv=TerminalDiagnosticNamesItsRunEffect --length=4 \
+      "$CPL_DIR/ControlPlaneLifecycle.tla" > "$CPL_DIR/out.log" 2>&1; then
+  echo "evidence bite FAILED: attributing a failure to a bystander violated nothing" >&2
+  rm -rf "$CPL_DIR"
+  exit 1
+fi
+if ! grep -qiE 'invariant .* violated|outcome is: Error' "$CPL_DIR/out.log"; then
+  echo "evidence bite FAILED: the attribution mutant erred for the wrong reason" >&2
+  cat "$CPL_DIR/out.log" >&2
+  rm -rf "$CPL_DIR"
+  exit 1
+fi
+rm -rf "$CPL_DIR"
+echo "evidence bite OK (TerminalDiagnosticNamesItsRunEffect guard is load-bearing)"
+
 # --- DR-0068 pinned-resolution bites (models/tla/PinnedResolution.tla) -----------
 # Three guards, three invariants, and they must be independent for the same
 # reason the log-chain pair must be. Two of these are SUBSTITUTIONS rather than

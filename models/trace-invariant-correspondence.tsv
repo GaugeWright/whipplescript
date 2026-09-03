@@ -14,6 +14,15 @@
 #     actually checks it). Removing it from the model fails the gate.
 # A row can only be added/removed by changing all three in lockstep.
 #
+# The last six rows are the D12 RUNTIME EVIDENCE half (spec/error-handling.md
+# "Runtime And TLA+/Trace Obligations"). The rows above them say the denied work
+# does not happen; these say the log explains why it did not. Their TLA
+# counterparts are additionally guarded against vacuity: three witness
+# invariants in ControlPlaneLifecycle.tla assert each evidence log is NEVER
+# written, and scripts/check-tla-models.sh requires Apalache to violate all
+# three -- an invariant quantified over a sequence nothing appends to is true
+# and proves nothing.
+#
 # Columns: key <TAB> violation_substring <TAB> tla_invariant
 #
 key	violation_substring	tla_invariant
@@ -25,3 +34,9 @@ no_claim_while_paused	claimed while instance is paused	NoNewEffectfulWorkWhilePa
 no_claim_after_cancel	claimed after instance cancellation	NoNewEffectfulWorkAfterTerminalInstance
 blocked_not_from_terminal	blocked from invalid status	BlockedEffectIsNotTerminal
 revision_epoch_advances	did not advance epoch	RevisionEpochMatchesEvents
+capability_denial_names_subject	denial reason does not name the denied subject	DenialEvidenceNamesItsSubject
+denial_diagnostic_code_registered	unregistered denial diagnostic code	DenialEvidenceCodeIsRegistered
+script_denial_carries_disabled_code	denies a script capability without the	ScriptDenialCarriesItsDiagnosticId
+assertion_failure_evidence	assertion failure evidence names no assertion	AssertionFailureNamesItsAssertion
+terminal_diagnostic_carries_code	carries no diagnostic code	TerminalDiagnosticCarriesCode
+terminal_diagnostic_names_effect	provider diagnostic subject	TerminalDiagnosticNamesItsRunEffect

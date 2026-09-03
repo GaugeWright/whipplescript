@@ -29977,7 +29977,10 @@ fn trace_event_mentions_effect(event: &TraceEvent, effect_id: &str) -> bool {
                     .iter()
                     .any(|candidate| candidate == effect_id)
         }
-        TraceEvent::InstancePaused
+        // An assertion failure is evidence about an assertion, not about an
+        // effect: the D12 obligation is precisely that it settles none.
+        TraceEvent::AssertionFailed { .. }
+        | TraceEvent::InstancePaused
         | TraceEvent::InstanceResumed
         | TraceEvent::InstanceCancelled
         | TraceEvent::InstanceFailed => false,
@@ -35912,6 +35915,49 @@ fn reconstruct_trace_records(events: &[EventView]) -> Vec<TraceRecord> {
                         .unwrap_or("failed"),
                 );
                 if let Some(run_id) = payload.get("run_id").and_then(Value::as_str) {
+                    // D12 runtime evidence: `effect.terminal` carries the whole
+                    // terminal diagnostic in its payload, and the abstract trace
+                    // used to drop it. Reconstruct it as the ProviderDiagnostic
+                    // that precedes the terminal -- before, because the run is
+                    // still live at that point, which is the order the in-kernel
+                    // trace emits in (`emit_provider_diagnostic`). This is what
+                    // makes the terminal-diagnostic invariants non-vacuous over
+                    // a real store log rather than only over a built trace.
+                    if let Some(diagnostic) = payload.get("diagnostic") {
+                        if !diagnostic.is_null() {
+                            push_trace_record(
+                                &mut records,
+                                TraceEvent::ProviderDiagnostic {
+                                    run_id: run_id.to_owned(),
+                                    effect_id: effect_id.to_owned(),
+                                    provider: payload
+                                        .get("provider")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or_default()
+                                        .to_owned(),
+                                    status: status.clone(),
+                                    summary: payload
+                                        .get("summary")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or_default()
+                                        .to_owned(),
+                                    diagnostics_json: payload
+                                        .get("metadata")
+                                        .map(ToString::to_string)
+                                        .unwrap_or_else(|| "{}".to_owned()),
+                                    code: diagnostic
+                                        .get("code")
+                                        .and_then(Value::as_str)
+                                        .map(str::to_owned),
+                                    subject_effect_id: diagnostic
+                                        .get("subject_id")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or_default()
+                                        .to_owned(),
+                                },
+                            );
+                        }
+                    }
                     push_trace_record(
                         &mut records,
                         TraceEvent::EffectTerminal {
@@ -35945,6 +35991,28 @@ fn reconstruct_trace_records(events: &[EventView]) -> Vec<TraceRecord> {
                             .get("reason")
                             .and_then(Value::as_str)
                             .unwrap_or("blocked")
+                            .to_owned(),
+                    },
+                );
+            }
+            // D12 runtime evidence: a failing assertion's record. The code is
+            // the event type, which IS the registered code spelling
+            // (`assertion.failed` / `assertion.errored`, both in
+            // spec/diagnostic-codes-runtime.txt) and the code the paired
+            // `diagnostics` row carries.
+            event_type @ ("assertion.failed" | "assertion.errored") => {
+                let Some(assertion_id) = payload.get("assertion_id").and_then(Value::as_str) else {
+                    continue;
+                };
+                push_trace_record(
+                    &mut records,
+                    TraceEvent::AssertionFailed {
+                        assertion_id: assertion_id.to_owned(),
+                        code: event_type.to_owned(),
+                        message: payload
+                            .get("message")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
                             .to_owned(),
                     },
                 );
@@ -43467,6 +43535,8 @@ fn trace_event_to_json(event: &TraceEvent) -> Value {
             status,
             summary,
             diagnostics_json,
+            code,
+            subject_effect_id,
         } => json!({
             "type": "provider_diagnostic",
             "run_id": run_id,
@@ -43475,6 +43545,18 @@ fn trace_event_to_json(event: &TraceEvent) -> Value {
             "status": trace_status_name(status),
             "summary": summary,
             "diagnostics": json_from_str(diagnostics_json),
+            "code": code,
+            "subject_effect_id": subject_effect_id,
+        }),
+        TraceEvent::AssertionFailed {
+            assertion_id,
+            code,
+            message,
+        } => json!({
+            "type": "assertion_failed",
+            "assertion_id": assertion_id,
+            "code": code,
+            "message": message,
         }),
         TraceEvent::EffectBlocked {
             effect_id,

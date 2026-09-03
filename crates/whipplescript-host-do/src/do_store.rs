@@ -3447,9 +3447,14 @@ fn do_policy_block<Sql: DoSql>(
                 None => {
                     return Ok(Some(PolicyBlock {
                         status: "blocked_by_capability",
-                        reason: "capability.call effect has no target capability requirement"
+                        // Names the subject it refused, as every other denial
+                        // reason does: the trace checker's D12 evidence
+                        // invariant requires a policy denial to say WHICH
+                        // capability or profile it would not authorize, and
+                        // here the answer is the effect kind itself.
+                        reason: "effect kind `capability.call` names no capability to authorize"
                             .to_owned(),
-                    }))
+                    }));
                 }
             }
         }

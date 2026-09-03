@@ -18,7 +18,23 @@ CONSTANTS
   \* @type: Set(Str);
   RequestableEffects,
   \* @type: Set(<<Str, Str, Str>>);
-  Dependencies
+  Dependencies,
+  \* Denial/diagnostic domains. Each is DELIBERATELY WIDER than the set the
+  \* corresponding guard admits (ConstInit seeds each with one value the guard
+  \* must reject), so the evidence invariants below are not true by construction:
+  \* drop a guard and Apalache finds the rejected value in the evidence log.
+  \* @type: Set(Str);
+  DenialReasonDomain,
+  \* @type: Set(Str);
+  DenialCodeDomain,
+  \* @type: Set(Str);
+  Assertions,
+  \* @type: Set(Str);
+  AssertionSubjectDomain,
+  \* @type: Set(Str);
+  AssertionCodeDomain,
+  \* @type: Set(Str);
+  TerminalDiagnosticCodeDomain
 
 VARIABLES
   \* @type: Seq(Str);
@@ -64,21 +80,46 @@ VARIABLES
   \* @type: Seq(<<Str, Str, Str>>);
   terminalRunEvents,
   \* @type: Seq(<<Str, Str>>);
-  terminalControlEvents
+  terminalControlEvents,
+  \* D12 evidence logs. Each denial the runtime refuses to perform appends the
+  \* record that explains it, so "the work did not happen" is joined by "the log
+  \* says why". <<effect, reason, code>>.
+  \* @type: Seq(<<Str, Str, Str>>);
+  denialEvidence,
+  \* <<assertion, code>>.
+  \* @type: Seq(<<Str, Str>>);
+  assertionEvidence,
+  \* <<run, effect, code>>.
+  \* @type: Seq(<<Str, Str, Str>>);
+  terminalDiagnostics,
+  \* The set of effects `denialEvidence` carries a record for. A projection of
+  \* the sequence, kept as its own variable only because Apalache cannot
+  \* evaluate an existential over a sequence index range (`\E i \in 1..Len(s)`).
+  \* BindBlock writes both in one step, so they cannot disagree.
+  \* @type: Set(Str);
+  deniedEffects
 
 vars ==
   << eventLog, recoveryLog, effects, runs, runEffect, leases, terminalEffects,
      projectionCursor, paused, cancelled, completed, failed, recovering,
      activeVersion, revisionEpoch, effectVersion, cancelRequested,
      cancelAcknowledged, revisionPolicy, revisionEvents, terminalRunEvents,
-     terminalControlEvents >>
+     terminalControlEvents, denialEvidence, assertionEvidence,
+     terminalDiagnostics, deniedEffects >>
+
+EvidenceVars ==
+  << denialEvidence, assertionEvidence, terminalDiagnostics, deniedEffects >>
 
 RevisionVars ==
   << activeVersion, revisionEpoch, effectVersion, cancelRequested,
      cancelAcknowledged, revisionPolicy, revisionEvents >>
 
+\* `policy_denied` is the admission gate's refusal (blocked_by_capability /
+\* blocked_by_profile), kept distinct from the worker-time `blocked` of a
+\* provider-binding failure because only the former owes denial evidence -- the
+\* same split the Rust checker makes with `NON_DENIAL_BLOCK_STATUSES`.
 EffectStatuses ==
-  {"queued", "blocked", "claimed", "running", "completed",
+  {"queued", "blocked", "policy_denied", "claimed", "running", "completed",
    "failed", "timed_out", "cancelled"}
 
 RunStatuses ==
@@ -96,6 +137,54 @@ RevisionPolicies ==
 
 LeaseStatuses ==
   {"none", "active", "released", "expired"}
+
+\* -- D12 runtime diagnostic adequacy: what counts as EVIDENCE -----------------
+\*
+\* A denial reason NAMES the denied subject. The store's admission gate writes
+\* "capability `x` is not bound for program p" / "profile `p` is not registered"
+\* / "profile `p` does not allow capability `x`"; each backtick-quotes the
+\* subject it refused. `unnamedDenial` is the shape that does not, and the
+\* Rust checker rejects it for the same reason (trace.rs `EffectBlocked`).
+\* `scriptCapabilityNotBound` is the same shape for a `script.*` capability --
+\* the denial that IS the script hard-off, singled out because it is the one
+\* denial the runtime owes a diagnostic id (see below).
+NamedDenialReasons ==
+  {"capabilityNotRegistered", "capabilityNotBound", "profileNotRegistered",
+   "profileDisallowsCapability", "scriptCapabilityNotBound"}
+
+\* A denial that carries a diagnostic id carries a REGISTERED one. The only id
+\* the runtime prefixes onto a block reason today is the script hard-off id
+\* (`security.script_disabled:`, spec/std-script.md); an uncoded denial carries
+\* the empty code. `unregisteredDenialCode` stands for a misspelt or invented id.
+RegisteredDenialCodes ==
+  {"", "securityScriptDisabled"}
+
+\* A failing assertion's evidence carries one of the two registered assertion
+\* codes (spec/diagnostic-codes-runtime.txt `assertion.failed`,
+\* `assertion.errored`).
+RegisteredAssertionCodes ==
+  {"assertionFailed", "assertionErrored"}
+
+\* A terminal diagnostic carries a CODE -- an identifier, not prose. When a
+\* terminal records a diagnostic at all, the runtime passes either the provider's
+\* own failure kind (`nonzero_exit`) or a registered runtime code
+\* (`schema.coerce.failed`, `runtime.recovery_uncertain`); it never leaves the
+\* code empty and never puts the message there. `proseDiagnostic` and the empty
+\* string are the two shapes that are not a code.
+CodeShapedTerminalDiagnostics ==
+  {"nonzeroExit", "schemaCoerceFailed", "schemaCoerceTimedOut",
+   "runtimeRecoveryUncertain"}
+
+\* The claim modeled here is CONDITIONAL, because the runtime's is: `fail_run`
+\* and `timeout_run` forward `None` as the diagnostic and more than a dozen
+\* production call sites use them, so a terminal that records no diagnostic at
+\* all is a real state (spec/error-handling.md records it as an open product
+\* gap). `noDiagnostic` is that state, and a terminal in it appends nothing --
+\* it is never a code that reaches `terminalDiagnostics`. What the model and the
+\* checker both say is: IF a terminal diagnostic exists, it carries a code and
+\* names its own run's effect.
+NoTerminalDiagnostic ==
+  "noDiagnostic"
 
 Init ==
   /\ eventLog = << >>
@@ -120,6 +209,10 @@ Init ==
   /\ revisionEvents = << >>
   /\ terminalRunEvents = << >>
   /\ terminalControlEvents = << >>
+  /\ denialEvidence = << >>
+  /\ assertionEvidence = << >>
+  /\ terminalDiagnostics = << >>
+  /\ deniedEffects = {}
 
 InstanceRunning ==
   /\ ~paused
@@ -134,7 +227,7 @@ AppendEvent(ev) ==
   /\ UNCHANGED << effects, runs, runEffect, leases, terminalEffects,
                   projectionCursor, terminalRunEvents, terminalControlEvents,
                   paused, cancelled, completed, failed,
-                  recoveryLog, recovering, RevisionVars >>
+                  recoveryLog, recovering, RevisionVars, EvidenceVars >>
 
 \* @type: (<<Str, Str, Str>>) => Str;
 DepUpstream(d) == d[1]
@@ -175,7 +268,7 @@ ClaimEffect(e, r) ==
   /\ runEffect' = [runEffect EXCEPT ![r] = e]
   /\ UNCHANGED << eventLog, recoveryLog, leases, terminalEffects, projectionCursor,
                   terminalRunEvents, terminalControlEvents, paused, cancelled,
-                  completed, failed, recovering, RevisionVars >>
+                  completed, failed, recovering, RevisionVars, EvidenceVars >>
 
 StartRun(r) ==
   /\ r \in Runs
@@ -188,13 +281,20 @@ StartRun(r) ==
   /\ leases' = [leases EXCEPT ![r] = "active"]
   /\ UNCHANGED << eventLog, recoveryLog, runEffect, terminalEffects, projectionCursor,
                   terminalRunEvents, terminalControlEvents, paused, cancelled,
-                  completed, failed, recovering, RevisionVars >>
+                  completed, failed, recovering, RevisionVars, EvidenceVars >>
 
 \* Worker-time provider-binding failure (missing config/credentials/enforcement/
 \* healthy binding): a claimed effect parks back to a non-terminal `blocked`
 \* state BEFORE provider execution, releasing its run and lease. Recoverable, not
 \* terminal (DR-0020). The categorized reason is a runtime field abstracted away
 \* here; the lifecycle guarantee is that this never fabricates a terminal outcome.
+\*
+\* This is NOT the D12 denial. A binding block is a `provider_health:`-style
+\* category written by `block_effect_binding` from a run that had already been
+\* claimed, and it owes no named subject -- exactly as the Rust checker owes it
+\* none (trace.rs lists the bare `blocked` status a binding block writes in
+\* `NON_DENIAL_BLOCK_STATUSES`). The admission-gate denial is `PolicyDenyEffect`
+\* below.
 BindBlock(r) ==
   /\ r \in Runs
   /\ ~recovering
@@ -206,7 +306,46 @@ BindBlock(r) ==
   /\ leases' = [leases EXCEPT ![r] = "none"]
   /\ UNCHANGED << eventLog, recoveryLog, runEffect, terminalEffects, projectionCursor,
                   terminalRunEvents, terminalControlEvents, paused, cancelled,
-                  completed, failed, recovering, RevisionVars >>
+                  completed, failed, recovering, RevisionVars, EvidenceVars >>
+
+\* D12 (capability denial -> diagnostic, no provider run; script disabled ->
+\* security.script_disabled diagnostic, no exec boundary crossed).
+\*
+\* THE ADMISSION GATE, and deliberately a different action from BindBlock above.
+\* The store's `policy_block_on` refuses a QUEUED effect before any run row
+\* exists: no run is claimed, no lease is taken, the effect lands in
+\* `blocked_by_capability`/`blocked_by_profile` (abstracted here as the single
+\* status `policy_denied`), and the refusal WRITES -- an `effect.blocked` event
+\* plus the reason record that explains it. That is the shape the Rust checker
+\* reads (trace.rs `EffectBlocked` with any status NOT in
+\* `NON_DENIAL_BLOCK_STATUSES`), so the two planes are quantified over the same
+\* class of denial and not over two different ones -- and stay so when a new
+\* denial status appears, since the Rust side classifies by exclusion.
+\*
+\* All three guards below are load-bearing -- `DenialReasonDomain` and
+\* `DenialCodeDomain` each carry a value the guard rejects, so removing a guard
+\* puts that value into `denialEvidence` and Apalache reports the paired
+\* invariant violated (scripts/check-tla-models.sh).
+PolicyDenyEffect(e, ev, reason, code) ==
+  /\ e \in Effects
+  /\ ev \in Events
+  /\ reason \in DenialReasonDomain
+  /\ code \in DenialCodeDomain
+  /\ ~recovering
+  /\ InstanceRunning
+  /\ effects[e] = "queued"
+  /\ e \notin terminalEffects
+  /\ reason \in NamedDenialReasons  \* THE DENIAL NAMES ITS SUBJECT
+  /\ code \in RegisteredDenialCodes  \* THE DENIAL CODE IS REGISTERED
+  /\ (reason = "scriptCapabilityNotBound") => (code = "securityScriptDisabled")  \* THE SCRIPT DENIAL CARRIES ITS ID
+  /\ effects' = [effects EXCEPT ![e] = "policy_denied"]
+  /\ denialEvidence' = Append(denialEvidence, <<e, reason, code>>)
+  /\ deniedEffects' = deniedEffects \cup {e}
+  /\ eventLog' = Append(eventLog, ev)
+  /\ UNCHANGED << recoveryLog, runs, runEffect, leases, terminalEffects,
+                  projectionCursor, terminalRunEvents, terminalControlEvents,
+                  paused, cancelled, completed, failed, recovering, RevisionVars,
+                  assertionEvidence, terminalDiagnostics >>
 
 \* The binding prerequisite becomes available: a blocked effect returns to
 \* `queued` and is claimable again, so a fixed config/credential resumes work
@@ -223,7 +362,7 @@ UnblockEffect(e) ==
   /\ effects' = [effects EXCEPT ![e] = "queued"]
   /\ UNCHANGED << eventLog, recoveryLog, runs, runEffect, leases, terminalEffects,
                   projectionCursor, terminalRunEvents, terminalControlEvents,
-                  paused, cancelled, completed, failed, recovering, RevisionVars >>
+                  paused, cancelled, completed, failed, recovering, RevisionVars, EvidenceVars >>
 
 CompleteRun(r, ev) ==
   /\ r \in Runs
@@ -240,11 +379,19 @@ CompleteRun(r, ev) ==
   /\ UNCHANGED << recoveryLog, runEffect, projectionCursor, paused, cancelled,
                   completed, failed, recovering, activeVersion, revisionEpoch,
                   effectVersion, cancelRequested, cancelAcknowledged,
-                  revisionPolicy, revisionEvents, terminalControlEvents >>
+                  revisionPolicy, revisionEvents, terminalControlEvents, EvidenceVars >>
 
-FailRun(r, ev) ==
+\* D12 (provider failure -> terminal failure diagnostic; provider output
+\* validation failure -> failed effect and validation diagnostic). IF the
+\* terminal records a diagnostic, that diagnostic is CODE-SHAPED and NAMES the
+\* effect its run executed. `TerminalDiagnosticCodeDomain` carries a value that
+\* is not a code, so the guard is load-bearing; it also carries
+\* `NoTerminalDiagnostic`, which is the runtime state where no diagnostic is
+\* recorded at all and nothing is appended.
+FailRun(r, ev, code) ==
   /\ r \in Runs
   /\ ev \in Events
+  /\ code \in TerminalDiagnosticCodeDomain
   /\ ~recovering
   /\ runs[r] = "running"
   /\ runEffect[r] \notin terminalEffects
@@ -253,11 +400,16 @@ FailRun(r, ev) ==
   /\ leases' = [leases EXCEPT ![r] = "released"]
   /\ terminalEffects' = terminalEffects \cup {runEffect[r]}
   /\ terminalRunEvents' = Append(terminalRunEvents, <<r, runEffect[r], "failed">>)
+  /\ \/ /\ code = NoTerminalDiagnostic
+        /\ terminalDiagnostics' = terminalDiagnostics
+     \/ /\ terminalDiagnostics' = Append(terminalDiagnostics, <<r, runEffect[r], code>>)  \* THE DIAGNOSTIC NAMES ITS RUN EFFECT
+        /\ code \in CodeShapedTerminalDiagnostics  \* THE TERMINAL DIAGNOSTIC CARRIES A CODE
   /\ eventLog' = Append(eventLog, ev)
   /\ UNCHANGED << recoveryLog, runEffect, projectionCursor, paused, cancelled,
                   completed, failed, recovering, activeVersion, revisionEpoch,
                   effectVersion, cancelRequested, cancelAcknowledged,
-                  revisionPolicy, revisionEvents, terminalControlEvents >>
+                  revisionPolicy, revisionEvents, terminalControlEvents,
+                  denialEvidence, assertionEvidence, deniedEffects >>
 
 CancelAcknowledgedRun(r, ev) ==
   /\ r \in Runs
@@ -275,11 +427,12 @@ CancelAcknowledgedRun(r, ev) ==
   /\ UNCHANGED << recoveryLog, runEffect, projectionCursor, paused, cancelled,
                   completed, failed, recovering, activeVersion, revisionEpoch,
                   effectVersion, cancelRequested, cancelAcknowledged,
-                  revisionPolicy, revisionEvents, terminalControlEvents >>
+                  revisionPolicy, revisionEvents, terminalControlEvents, EvidenceVars >>
 
-TimeoutRun(r, ev) ==
+TimeoutRun(r, ev, code) ==
   /\ r \in Runs
   /\ ev \in Events
+  /\ code \in TerminalDiagnosticCodeDomain
   /\ ~recovering
   /\ runs[r] = "running"
   /\ runEffect[r] \notin terminalEffects
@@ -288,11 +441,16 @@ TimeoutRun(r, ev) ==
   /\ leases' = [leases EXCEPT ![r] = "released"]
   /\ terminalEffects' = terminalEffects \cup {runEffect[r]}
   /\ terminalRunEvents' = Append(terminalRunEvents, <<r, runEffect[r], "timed_out">>)
+  /\ \/ /\ code = NoTerminalDiagnostic
+        /\ terminalDiagnostics' = terminalDiagnostics
+     \/ /\ terminalDiagnostics' = Append(terminalDiagnostics, <<r, runEffect[r], code>>)  \* THE DIAGNOSTIC NAMES ITS RUN EFFECT
+        /\ code \in CodeShapedTerminalDiagnostics  \* THE TERMINAL DIAGNOSTIC CARRIES A CODE
   /\ eventLog' = Append(eventLog, ev)
   /\ UNCHANGED << recoveryLog, runEffect, projectionCursor, paused, cancelled,
                   completed, failed, recovering, activeVersion, revisionEpoch,
                   effectVersion, cancelRequested, cancelAcknowledged,
-                  revisionPolicy, revisionEvents, terminalControlEvents >>
+                  revisionPolicy, revisionEvents, terminalControlEvents,
+                  denialEvidence, assertionEvidence, deniedEffects >>
 
 ExpireLease(r, ev) ==
   /\ r \in Runs
@@ -311,7 +469,7 @@ ExpireLease(r, ev) ==
   /\ UNCHANGED << recoveryLog, runEffect, terminalEffects, projectionCursor,
                   terminalControlEvents, paused, cancelled, completed, failed,
                   recovering, activeVersion, revisionEpoch, effectVersion,
-                  cancelRequested, revisionPolicy, revisionEvents >>
+                  cancelRequested, revisionPolicy, revisionEvents, EvidenceVars >>
 
 RetryEffect(e, ev) ==
   /\ e \in Effects
@@ -327,7 +485,7 @@ RetryEffect(e, ev) ==
   /\ UNCHANGED << recoveryLog, runs, runEffect, leases, projectionCursor,
                   terminalRunEvents, terminalControlEvents, paused, cancelled,
                   completed, failed, recovering, activeVersion, revisionEpoch,
-                  effectVersion, revisionPolicy, revisionEvents >>
+                  effectVersion, revisionPolicy, revisionEvents, EvidenceVars >>
 
 DeriveProjection ==
   /\ ~recovering
@@ -336,7 +494,7 @@ DeriveProjection ==
   /\ UNCHANGED << eventLog, recoveryLog, effects, runs, runEffect, leases, terminalEffects,
                   terminalRunEvents, terminalControlEvents, paused, cancelled,
                   completed, failed, recovering,
-                  RevisionVars >>
+                  RevisionVars, EvidenceVars >>
 
 PauseInstance ==
   /\ ~recovering
@@ -346,7 +504,7 @@ PauseInstance ==
   /\ UNCHANGED << eventLog, recoveryLog, effects, runs, runEffect, leases, terminalEffects,
                   projectionCursor, terminalRunEvents, terminalControlEvents,
                   cancelled, completed, failed, recovering,
-                  RevisionVars >>
+                  RevisionVars, EvidenceVars >>
 
 ResumeInstance ==
   /\ ~recovering
@@ -358,7 +516,7 @@ ResumeInstance ==
   /\ UNCHANGED << eventLog, recoveryLog, effects, runs, runEffect, leases, terminalEffects,
                   projectionCursor, terminalRunEvents, terminalControlEvents,
                   cancelled, completed, failed, recovering,
-                  RevisionVars >>
+                  RevisionVars, EvidenceVars >>
 
 CancelInstance(ev) ==
   /\ ev \in Events
@@ -372,7 +530,7 @@ CancelInstance(ev) ==
   /\ UNCHANGED << recoveryLog, effects, runs, runEffect, leases, terminalEffects,
                   projectionCursor, terminalRunEvents, terminalControlEvents,
                   completed, failed, recovering,
-                  RevisionVars >>
+                  RevisionVars, EvidenceVars >>
 
 CompleteWorkflow(ev) ==
   /\ ev \in Events
@@ -383,7 +541,7 @@ CompleteWorkflow(ev) ==
   /\ UNCHANGED << recoveryLog, effects, runs, runEffect, leases, terminalEffects,
                   projectionCursor, terminalRunEvents, terminalControlEvents,
                   paused, cancelled, failed, recovering,
-                  RevisionVars >>
+                  RevisionVars, EvidenceVars >>
 
 FailWorkflow(ev) ==
   /\ ev \in Events
@@ -394,7 +552,7 @@ FailWorkflow(ev) ==
   /\ UNCHANGED << recoveryLog, effects, runs, runEffect, leases, terminalEffects,
                   projectionCursor, terminalRunEvents, terminalControlEvents,
                   paused, cancelled, completed, recovering,
-                  RevisionVars >>
+                  RevisionVars, EvidenceVars >>
 
 OldVersionEffect(e) ==
   effectVersion[e] # activeVersion
@@ -414,7 +572,7 @@ ActivateRevision(newVersion, policy, ev) ==
   /\ UNCHANGED << recoveryLog, effects, runs, runEffect, leases, terminalEffects,
                   projectionCursor, terminalRunEvents, terminalControlEvents,
                   paused, cancelled, completed, failed, recovering,
-                  effectVersion, cancelRequested, cancelAcknowledged >>
+                  effectVersion, cancelRequested, cancelAcknowledged, EvidenceVars >>
 
 TerminalCancelQueuedRevisionEffect(e, ev) ==
   /\ e \in Effects
@@ -433,7 +591,7 @@ TerminalCancelQueuedRevisionEffect(e, ev) ==
                   terminalRunEvents, paused, cancelled, completed, failed,
                   recovering, activeVersion, revisionEpoch, effectVersion,
                   cancelRequested, cancelAcknowledged, revisionPolicy,
-                  revisionEvents >>
+                  revisionEvents, EvidenceVars >>
 
 RequestCancelEffect(e, ev) ==
   /\ e \in Effects
@@ -451,7 +609,7 @@ RequestCancelEffect(e, ev) ==
                   projectionCursor, terminalRunEvents, terminalControlEvents,
                   paused, cancelled, completed, failed,
                   recovering, activeVersion, revisionEpoch, effectVersion,
-                  cancelAcknowledged, revisionPolicy, revisionEvents >>
+                  cancelAcknowledged, revisionPolicy, revisionEvents, EvidenceVars >>
 
 AcknowledgeCancelRun(r, ev) ==
   /\ r \in Runs
@@ -466,7 +624,7 @@ AcknowledgeCancelRun(r, ev) ==
                   terminalEffects, projectionCursor, terminalRunEvents,
                   terminalControlEvents, paused, cancelled, completed, failed,
                   recovering, activeVersion, revisionEpoch, effectVersion,
-                  cancelRequested, revisionPolicy, revisionEvents >>
+                  cancelRequested, revisionPolicy, revisionEvents, EvidenceVars >>
 
 IgnoreLateCancelAfterTerminal(e) ==
   /\ e \in Effects
@@ -479,7 +637,7 @@ IgnoreLateCancelAfterTerminal(e) ==
                   terminalControlEvents, paused, cancelled,
                   completed, failed, recovering, activeVersion, revisionEpoch,
                   effectVersion, cancelAcknowledged, revisionPolicy,
-                  revisionEvents >>
+                  revisionEvents, EvidenceVars >>
 
 StartRecovery ==
   /\ ~recovering
@@ -487,7 +645,7 @@ StartRecovery ==
   /\ recoveryLog' = eventLog
   /\ UNCHANGED << eventLog, effects, runs, runEffect, leases, terminalEffects,
                   projectionCursor, terminalRunEvents, terminalControlEvents,
-                  paused, cancelled, completed, failed, RevisionVars >>
+                  paused, cancelled, completed, failed, RevisionVars, EvidenceVars >>
 
 FinishRecovery ==
   /\ recovering
@@ -496,7 +654,7 @@ FinishRecovery ==
   /\ recovering' = FALSE
   /\ UNCHANGED << recoveryLog, effects, runs, runEffect, leases, terminalEffects,
                   terminalRunEvents, terminalControlEvents, paused, cancelled,
-                  completed, failed, RevisionVars >>
+                  completed, failed, RevisionVars, EvidenceVars >>
 
 \* Recovery resolution for a run that started its external side effect but whose
 \* worker crashed before the terminal was appended. The provider has no idempotent
@@ -504,9 +662,10 @@ FinishRecovery ==
 \* than being silently re-executed (admission-and-idempotency.md exactly-once).
 \* The event is appended to both logs so it survives FinishRecovery and the
 \* RecoveryDoesNotReorderEventLog invariant (eventLog = recoveryLog) holds.
-ResolveUncertainRun(r, ev) ==
+ResolveUncertainRun(r, ev, code) ==
   /\ r \in Runs
   /\ ev \in Events
+  /\ code \in TerminalDiagnosticCodeDomain
   /\ recovering
   /\ runs[r] = "running"
   /\ runEffect[r] \notin terminalEffects
@@ -515,23 +674,54 @@ ResolveUncertainRun(r, ev) ==
   /\ leases' = [leases EXCEPT ![r] = "released"]
   /\ terminalEffects' = terminalEffects \cup {runEffect[r]}
   /\ terminalRunEvents' = Append(terminalRunEvents, <<r, runEffect[r], "uncertain">>)
+  /\ \/ /\ code = NoTerminalDiagnostic
+        /\ terminalDiagnostics' = terminalDiagnostics
+     \/ /\ terminalDiagnostics' = Append(terminalDiagnostics, <<r, runEffect[r], code>>)  \* THE DIAGNOSTIC NAMES ITS RUN EFFECT
+        /\ code \in CodeShapedTerminalDiagnostics  \* THE TERMINAL DIAGNOSTIC CARRIES A CODE
   /\ eventLog' = Append(eventLog, ev)
   /\ recoveryLog' = Append(recoveryLog, ev)
   /\ UNCHANGED << runEffect, projectionCursor, paused, cancelled, completed,
                   failed, recovering, activeVersion, revisionEpoch, effectVersion,
                   cancelRequested, cancelAcknowledged, revisionPolicy,
-                  revisionEvents, terminalControlEvents >>
+                  revisionEvents, terminalControlEvents, denialEvidence,
+                  assertionEvidence, deniedEffects >>
+
+\* D12 (assertion failure -> diagnostic/evidence, no user fact/effect mutation).
+\* A failing assertion appends the evidence that explains it -- the assertion it
+\* names and one of the two REGISTERED assertion codes -- and settles nothing:
+\* every effect, run, lease and terminal set is UNCHANGED, so the denial half and
+\* the evidence half are one step. `AssertionSubjectDomain` carries a nameless
+\* subject and `AssertionCodeDomain` an unregistered code, so both guards below
+\* are load-bearing.
+FailAssertion(a, code, ev) ==
+  /\ a \in AssertionSubjectDomain
+  /\ code \in AssertionCodeDomain
+  /\ ev \in Events
+  /\ ~recovering
+  /\ InstanceRunning
+  /\ a \in Assertions  \* THE EVIDENCE NAMES ITS ASSERTION
+  /\ code \in RegisteredAssertionCodes  \* THE ASSERTION CODE IS REGISTERED
+  /\ assertionEvidence' = Append(assertionEvidence, <<a, code>>)
+  /\ eventLog' = Append(eventLog, ev)
+  /\ UNCHANGED << recoveryLog, effects, runs, runEffect, leases, terminalEffects,
+                  projectionCursor, terminalRunEvents, terminalControlEvents,
+                  paused, cancelled, completed, failed, recovering, RevisionVars,
+                  denialEvidence, terminalDiagnostics, deniedEffects >>
 
 Next ==
   \/ \E ev \in Events : AppendEvent(ev)
   \/ \E e \in Effects, r \in Runs : ClaimEffect(e, r)
   \/ \E r \in Runs : StartRun(r)
   \/ \E r \in Runs : BindBlock(r)
+  \/ \E e \in Effects, ev \in Events, reason \in DenialReasonDomain,
+       code \in DenialCodeDomain : PolicyDenyEffect(e, ev, reason, code)
   \/ \E e \in Effects : UnblockEffect(e)
   \/ \E r \in Runs, ev \in Events : CompleteRun(r, ev)
-  \/ \E r \in Runs, ev \in Events : FailRun(r, ev)
+  \/ \E r \in Runs, ev \in Events, code \in TerminalDiagnosticCodeDomain :
+       FailRun(r, ev, code)
   \/ \E r \in Runs, ev \in Events : CancelAcknowledgedRun(r, ev)
-  \/ \E r \in Runs, ev \in Events : TimeoutRun(r, ev)
+  \/ \E r \in Runs, ev \in Events, code \in TerminalDiagnosticCodeDomain :
+       TimeoutRun(r, ev, code)
   \/ \E r \in Runs, ev \in Events : ExpireLease(r, ev)
   \/ \E e \in Effects, ev \in Events : RetryEffect(e, ev)
   \/ DeriveProjection
@@ -548,7 +738,10 @@ Next ==
   \/ \E e \in Effects : IgnoreLateCancelAfterTerminal(e)
   \/ StartRecovery
   \/ FinishRecovery
-  \/ \E r \in Runs, ev \in Events : ResolveUncertainRun(r, ev)
+  \/ \E r \in Runs, ev \in Events, code \in TerminalDiagnosticCodeDomain :
+       ResolveUncertainRun(r, ev, code)
+  \/ \E a \in AssertionSubjectDomain, code \in AssertionCodeDomain, ev \in Events :
+       FailAssertion(a, code, ev)
 
 Spec ==
   Init /\ [][Next]_vars
@@ -562,12 +755,12 @@ StartAny(e) ==
     /\ StartRun(r)
 
 ProviderTerminalOrRecovered(e) ==
-  \E r \in Runs, ev \in Events :
+  \E r \in Runs, ev \in Events, code \in TerminalDiagnosticCodeDomain :
     /\ runEffect[r] = e
     /\ \/ CompleteRun(r, ev)
-       \/ FailRun(r, ev)
+       \/ FailRun(r, ev, code)
        \/ CancelAcknowledgedRun(r, ev)
-       \/ TimeoutRun(r, ev)
+       \/ TimeoutRun(r, ev, code)
        \/ ExpireLease(r, ev)
 
 FairSpec ==
@@ -671,7 +864,7 @@ ActiveLeaseForEffect(e) ==
     /\ leases[r] = "active"
 
 EffectTerminalOrNotRunning(e) ==
-  \/ effects[e] \in {"blocked", "claimed"}
+  \/ effects[e] \in {"blocked", "policy_denied", "claimed"}
   \/ e \in terminalEffects
   \/ paused
   \/ cancelled
@@ -715,12 +908,36 @@ TerminalControlEventSeqOk(seq) ==
     /\ seq[i][1] \in Effects
     /\ seq[i][2] \in TerminalEffectStatuses
 
+\* @type: (Seq(<<Str, Str, Str>>)) => Bool;
+DenialEvidenceSeqOk(seq) ==
+  \A i \in 1..Len(seq) :
+    /\ seq[i][1] \in Effects
+    /\ seq[i][2] \in DenialReasonDomain
+    /\ seq[i][3] \in DenialCodeDomain
+
+\* @type: (Seq(<<Str, Str>>)) => Bool;
+AssertionEvidenceSeqOk(seq) ==
+  \A i \in 1..Len(seq) :
+    /\ seq[i][1] \in AssertionSubjectDomain
+    /\ seq[i][2] \in AssertionCodeDomain
+
+\* @type: (Seq(<<Str, Str, Str>>)) => Bool;
+TerminalDiagnosticSeqOk(seq) ==
+  \A i \in 1..Len(seq) :
+    /\ seq[i][1] \in Runs
+    /\ seq[i][2] \in Effects
+    /\ seq[i][3] \in TerminalDiagnosticCodeDomain
+
 TypeOk ==
   /\ EventSeqOk(eventLog)
   /\ EventSeqOk(recoveryLog)
   /\ EventSeqOk(revisionEvents)
   /\ TerminalRunEventSeqOk(terminalRunEvents)
   /\ TerminalControlEventSeqOk(terminalControlEvents)
+  /\ DenialEvidenceSeqOk(denialEvidence)
+  /\ AssertionEvidenceSeqOk(assertionEvidence)
+  /\ TerminalDiagnosticSeqOk(terminalDiagnostics)
+  /\ deniedEffects \subseteq Effects
   /\ RequestableEffects \subseteq Effects
   /\ effects \in [Effects -> EffectStatuses]
   /\ runs \in [Runs -> RunStatuses]
@@ -767,6 +984,121 @@ NoConflictingInstanceTerminalStates ==
 NoNewEffectfulWorkAfterTerminalInstance ==
   (cancelled \/ completed \/ failed) => \A e \in Effects : ~Claimable(e)
 
+\* -- D12 runtime diagnostic adequacy: the EVIDENCE half ------------------------
+\*
+\* The invariants above say the denied work does not happen. These say the log
+\* explains why. Each is paired one-for-one with a richer invariant in the Rust
+\* trace checker through models/trace-invariant-correspondence.tsv; the shared
+\* claim is stated in the comment on each pair.
+
+\* An effect the ADMISSION GATE denied has a record saying so. The denial is
+\* never silent, so "no provider run" is always accompanied by the reason there
+\* was none. Scoped to `policy_denied` and not to `blocked`, because a
+\* worker-time binding block (`BindBlock`) owes no denial evidence and the Rust
+\* checker demands none from it either -- the two planes must forbid the same
+\* thing. Supporting invariant only: it has no correspondence row, because it is
+\* a claim about the model's own shape (no future action may reach
+\* `policy_denied` without writing evidence), not a claim a trace can falsify.
+\* Non-vacuity of the rows below is carried by the witness invariants instead.
+EveryPolicyDeniedEffectHasDenialEvidence ==
+  \A e \in Effects :
+    effects[e] = "policy_denied" => e \in deniedEffects
+
+\* SHARED CLAIM (tsv row `capability_denial_names_subject`): a policy denial's
+\* record NAMES the subject it refused -- the capability or the profile -- not
+\* merely that something was denied. Rust counterpart: trace.rs rejects an
+\* `EffectBlocked` whose reason quotes no subject, for every block status it does
+\* not recognise as a non-denial (capacity, dependency, binding). That is an
+\* exclusion rather than an allowlist so the Rust side keeps quantifying over as
+\* much as this invariant does when the store grows a new denial.
+DenialEvidenceNamesItsSubject ==
+  \A i \in 1..Len(denialEvidence) :
+    denialEvidence[i][2] \in NamedDenialReasons
+
+\* SHARED CLAIM (tsv row `denial_diagnostic_code_registered`): when a denial
+\* carries a diagnostic id, the id is a REGISTERED runtime diagnostic code --
+\* this is what makes script disablement read as `security.script_disabled`
+\* rather than as prose. Rust counterpart: trace.rs rejects an `EffectBlocked`
+\* whose reason carries a `<domain>.<id>:` prefix that is not a registered code.
+DenialEvidenceCodeIsRegistered ==
+  \A i \in 1..Len(denialEvidence) :
+    denialEvidence[i][3] \in RegisteredDenialCodes
+
+\* SHARED CLAIM (tsv row `script_denial_carries_disabled_code`): the denial of a
+\* `script.*` capability IS the "scripts are disabled" state, and it says so --
+\* it carries the `security.script_disabled` id and not merely some registered
+\* id. This is the claim that pins the spelling; `DenialEvidenceCodeIsRegistered`
+\* above admits the empty code and so cannot. Rust counterpart: trace.rs rejects
+\* an `EffectBlocked` whose named subject is a `script.*` capability and whose
+\* reason does not carry the `security.script_disabled:` prefix.
+ScriptDenialCarriesItsDiagnosticId ==
+  \A i \in 1..Len(denialEvidence) :
+    denialEvidence[i][2] = "scriptCapabilityNotBound" =>
+      denialEvidence[i][3] = "securityScriptDisabled"
+
+\* SHARED CLAIM (tsv row `assertion_failure_evidence`): a failing assertion's
+\* evidence NAMES a real assertion, so the log says WHICH expectation was not
+\* met rather than only that one was not. The Rust counterpart reads the event
+\* payload's `assertion_id`, which a store can leave empty.
+AssertionFailureNamesItsAssertion ==
+  \A i \in 1..Len(assertionEvidence) :
+    assertionEvidence[i][1] \in Assertions
+
+\* TLA-ONLY (no correspondence row, deliberately): that same evidence carries one
+\* of the two registered assertion diagnostic codes. There is no Rust counterpart
+\* because there is nothing in the store log for one to read: the
+\* `assertion.failed`/`assertion.errored` event payload carries no code field and
+\* its `diagnostic_ids` is hardcoded `[]`, so the registered code lives only in
+\* the `diagnostics` side table, which no event points into. A trace checker
+\* could only re-derive the code from the event type it just matched -- a check
+\* no runtime state could ever fail, which is why `check_record` deliberately
+\* ignores the code and the corresponding conjunct was removed rather than kept
+\* as a tautology. The runtime behaviour is held instead by store-level tests
+\* that assert the persisted diagnostic's code. Carrying the code (or the
+\* diagnostic link) in the event payload is the runtime change that would let the
+\* trace plane pin it; see spec/error-handling.md for the recorded gap.
+AssertionFailureCarriesRegisteredCode ==
+  \A i \in 1..Len(assertionEvidence) :
+    assertionEvidence[i][2] \in RegisteredAssertionCodes
+
+\* SHARED CLAIM (tsv row `terminal_diagnostic_carries_code`): WHERE a failed or
+\* timed-out provider terminal -- including a recovery's `uncertain` resolution
+\* -- records a diagnostic, that diagnostic's code is a CODE: an identifier,
+\* never empty and never the message. Conditional on both sides: the model's
+\* `NoTerminalDiagnostic` branch appends nothing, and the Rust checker only sees
+\* a `ProviderDiagnostic` record where one was persisted. That a terminal
+\* records a diagnostic AT ALL is not claimed by either plane and is an open
+\* product gap (spec/error-handling.md).
+TerminalDiagnosticCarriesCode ==
+  \A i \in 1..Len(terminalDiagnostics) :
+    terminalDiagnostics[i][3] \in CodeShapedTerminalDiagnostics
+
+\* SHARED CLAIM (tsv row `terminal_diagnostic_names_effect`): a terminal
+\* diagnostic that exists explains its OWN run's effect -- the subject it names
+\* is the effect that run executed, so a failure is never attributed to a
+\* bystander. Rust counterpart: trace.rs rejects a `ProviderDiagnostic` whose
+\* recorded subject is not the effect the run is executing.
+TerminalDiagnosticNamesItsRunEffect ==
+  \A i \in 1..Len(terminalDiagnostics) :
+    terminalDiagnostics[i][2] = runEffect[terminalDiagnostics[i][1]]
+
+\* -- Vacuity witnesses (scripts/check-tla-models.sh) --------------------------
+\*
+\* These three are DELIBERATELY FALSE of the model and are never conjoined into
+\* SafetyInvariants. Each says an evidence log is never written; the gate checks
+\* Apalache VIOLATES each one, which is the proof that the evidence invariants
+\* above are satisfied non-trivially rather than over an empty log. An invariant
+\* quantified over a sequence the spec never appends to is true and proves
+\* nothing -- that is the failure this row exists to end.
+NoDenialEvidenceWitness ==
+  Len(denialEvidence) = 0
+
+NoAssertionEvidenceWitness ==
+  Len(assertionEvidence) = 0
+
+NoTerminalDiagnosticWitness ==
+  Len(terminalDiagnostics) = 0
+
 ConstInit ==
   /\ Effects = {"effectA", "effectB"}
   /\ Runs = {"runA", "runB"}
@@ -778,6 +1110,24 @@ ConstInit ==
        <<"effectA", "fails", "effectB">>,
        <<"effectA", "completes", "effectB">>
      }
+  \* Each domain below is a WITNESS SET: it carries the values the guards admit
+  \* PLUS one the guards must reject. Without the rejected value the evidence
+  \* invariants would hold no matter what the guards did, and the mutation bites
+  \* in scripts/check-tla-models.sh would find nothing to report.
+  /\ DenialReasonDomain = {"capabilityNotBound", "profileDisallowsCapability",
+                           "scriptCapabilityNotBound", "unnamedDenial"}
+  /\ DenialCodeDomain = {"", "securityScriptDisabled", "unregisteredDenialCode"}
+  /\ Assertions = {"assertionA"}
+  \* `noAssertion` is evidence that some assertion failed without saying which:
+  \* the value the naming guard must reject.
+  /\ AssertionSubjectDomain = {"assertionA", "noAssertion"}
+  /\ AssertionCodeDomain = {"assertionFailed", "assertionErrored",
+                            "unregisteredAssertionCode"}
+  \* Carries `noDiagnostic` (the terminal that records none -- a real runtime
+  \* state, not a rejected value) alongside two codes the guard admits and two
+  \* shapes it must reject.
+  /\ TerminalDiagnosticCodeDomain = {"nonzeroExit", "schemaCoerceFailed", "",
+                                     "proseDiagnostic", "noDiagnostic"}
 
 SafetyInvariants ==
   /\ TypeOk
@@ -804,5 +1154,13 @@ SafetyInvariants ==
   /\ NoReleasedLeaseWithoutTerminalRun
   /\ AtMostOneRunExecutingEffect
   /\ TerminaledRunStaysTerminal
+  /\ EveryPolicyDeniedEffectHasDenialEvidence
+  /\ DenialEvidenceNamesItsSubject
+  /\ DenialEvidenceCodeIsRegistered
+  /\ ScriptDenialCarriesItsDiagnosticId
+  /\ AssertionFailureNamesItsAssertion
+  /\ AssertionFailureCarriesRegisteredCode
+  /\ TerminalDiagnosticCarriesCode
+  /\ TerminalDiagnosticNamesItsRunEffect
 
 ====

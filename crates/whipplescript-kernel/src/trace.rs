@@ -67,6 +67,24 @@ pub enum TraceEvent {
         status: EffectStatus,
         summary: String,
         diagnostics_json: String,
+        /// The terminal diagnostic's code (`DurableDiagnosticCode`) -- either a
+        /// registered runtime code (`schema.coerce.failed`) or the provider's
+        /// own failure kind (`nonzero_exit`). D12: a failure explains itself
+        /// with a code, never with the message alone.
+        code: Option<String>,
+        /// The effect the diagnostic names as its subject, read from the
+        /// terminal diagnostic's own `subject_id` rather than from the event
+        /// that carries it -- so an attribution to a bystander is visible.
+        subject_effect_id: String,
+    },
+    /// A failing (or erroring) assertion. D12: the failure leaves durable
+    /// evidence naming the assertion and carrying a registered assertion
+    /// diagnostic code, and settles no effect -- the arm mutates nothing, which
+    /// is why this event touches no effect or run state below.
+    AssertionFailed {
+        assertion_id: String,
+        code: String,
+        message: String,
     },
     EffectBlocked {
         effect_id: String,
@@ -333,6 +351,8 @@ fn check_record(state: &mut TraceState, record: &TraceRecord) -> Result<(), Trac
             effect_id,
             status,
             diagnostics_json,
+            code,
+            subject_effect_id,
             ..
         } => {
             if !status.is_terminal() {
@@ -382,11 +402,41 @@ fn check_record(state: &mut TraceState, record: &TraceRecord) -> Result<(), Trac
             if serde_json::from_str::<serde_json::Value>(diagnostics_json).is_err() {
                 return violation(record, "provider diagnostic metadata is not valid JSON");
             }
+            // D12 shared claim with ControlPlaneLifecycle.tla
+            // `TerminalDiagnosticCarriesCode`: a provider or coercion failure
+            // explains itself with a CODE -- an identifier, never empty and
+            // never the message. The runtime passes either a registered runtime
+            // code (`schema.coerce.failed`, `runtime.recovery_uncertain`) or the
+            // provider's own failure kind (`nonzero_exit`); a terminal that
+            // failed with neither says only that something went wrong.
+            if !code.as_deref().is_some_and(is_code_identifier) {
+                return violation(
+                    record,
+                    format!(
+                        "provider diagnostic for run {run_id} carries no diagnostic code: {code:?}"
+                    ),
+                );
+            }
+            // D12 shared claim with ControlPlaneLifecycle.tla
+            // `TerminalDiagnosticNamesItsRunEffect`: the diagnostic explains its
+            // OWN run's effect. The subject read here is the diagnostic record's
+            // `subject_id`, written independently of the event that carries it,
+            // so a failure attributed to a bystander is caught rather than
+            // assumed away.
+            if subject_effect_id != effect_id {
+                return violation(
+                    record,
+                    format!(
+                        "provider diagnostic subject {subject_effect_id:?} is not the effect \
+                         {effect_id} that run {run_id} is executing"
+                    ),
+                );
+            }
         }
         TraceEvent::EffectBlocked {
             effect_id,
             status: blocked_status,
-            ..
+            reason,
         } => {
             let Some(status) = state.effects.get(effect_id) else {
                 return violation(record, format!("blocked unknown effect {effect_id}"));
@@ -395,6 +445,76 @@ fn check_record(state: &mut TraceState, record: &TraceRecord) -> Result<(), Trac
                 return violation(
                     record,
                     format!("effect {effect_id} blocked from invalid status {status:?}"),
+                );
+            }
+            // D12 shared claim with ControlPlaneLifecycle.tla
+            // `DenialEvidenceNamesItsSubject`: a denial records WHICH subject
+            // it refused -- the capability, the profile, whatever a later
+            // admission rule refuses on -- so the log explains why no provider
+            // ran rather than only that none did. Which blocks count as denials
+            // is decided by exclusion; see NON_DENIAL_BLOCK_STATUSES.
+            let is_denial = blocked_status
+                .as_deref()
+                .is_some_and(|status| !NON_DENIAL_BLOCK_STATUSES.contains(&status));
+            // REFUSAL: a denial that does not say what it refused
+            if is_denial && !denial_reason_names_subject(reason) {
+                return violation(
+                    record,
+                    format!(
+                        "effect {effect_id} denial reason does not name the denied subject: \
+                         {reason:?}"
+                    ),
+                );
+            }
+            // D12 shared claim with ControlPlaneLifecycle.tla
+            // `DenialEvidenceCodeIsRegistered`: when a denial carries a
+            // diagnostic id it carries a REGISTERED one. This is what makes a
+            // script-capability block read as `security.script_disabled` rather
+            // than as prose, and it refuses a misspelt or invented id.
+            if let Some(code) = denial_diagnostic_code(reason) {
+                if !REGISTERED_DENIAL_DIAGNOSTIC_CODES.contains(&code) {
+                    return violation(
+                        record,
+                        format!(
+                            "effect {effect_id} denial carries unregistered denial diagnostic \
+                             code `{code}`"
+                        ),
+                    );
+                }
+            }
+            // D12 shared claim with ControlPlaneLifecycle.tla
+            // `ScriptDenialCarriesItsDiagnosticId`: the denial of a `script.*`
+            // capability carries the `security.script_disabled` id, not merely
+            // SOME registered id. `DenialEvidenceCodeIsRegistered` above admits
+            // an uncoded denial and so cannot pin the spelling; without this a
+            // script block could report as bare prose and an operator reading
+            // the log would not know scripts are off rather than unbound.
+            //
+            // Read as an assertion about the PRODUCT, not a description of one
+            // code path. `policy_block_on`'s `exec.command` branch prefixes the
+            // id on every script-capability block, which is the hard-off; a
+            // `capability.call` whose target were itself a `script.*` capability
+            // would reach `policy_block_for_capabilities` directly and be denied
+            // without it. No such capability exists today, and if one appears
+            // this check going red is the correct outcome: a denied script
+            // capability that does not say scripts are disabled leaves the
+            // operator unable to tell "off" from "unbound", whichever gate
+            // refused it. The subject read is the FIRST backtick-quoted name, so
+            // a profile denial that mentions a script capability second
+            // (`profile `p` does not allow capability `script.raw``) is a
+            // profile denial here, as it is in the model.
+            let denies_script_capability = denied_subject(reason)
+                .is_some_and(|subject| subject.starts_with(SCRIPT_CAPABILITY_PREFIX));
+            let carries_the_id =
+                denial_diagnostic_code(reason) == Some(SCRIPT_DISABLED_DIAGNOSTIC_CODE);
+            // REFUSAL: a denied script capability that does not say scripts are off
+            if denies_script_capability && !carries_the_id {
+                return violation(
+                    record,
+                    format!(
+                        "effect {effect_id} denies a script capability without the \
+                         `{SCRIPT_DISABLED_DIAGNOSTIC_CODE}` id: {reason:?}"
+                    ),
                 );
             }
             if matches!(blocked_status.as_deref(), Some("blocked_by_dependency"))
@@ -526,6 +646,37 @@ fn check_record(state: &mut TraceState, record: &TraceRecord) -> Result<(), Trac
             state.cancelled = true;
             state.paused = true;
         }
+        // D12 shared claim with ControlPlaneLifecycle.tla
+        // `AssertionFailureNamesItsAssertion`: a failing assertion leaves evidence
+        // that NAMES the assertion and EXPLAINS it. The arm settles nothing --
+        // no effect, run or terminal state is touched here, which is the "no
+        // user fact/effect mutation" half of the same obligation.
+        //
+        // It deliberately does NOT check the diagnostic CODE, though the TLA
+        // side can. The reconstructor has only the event log, and the log does
+        // not carry the code: `reconstruct_trace_records` sets it from the event
+        // TYPE it just matched, and that arm accepts only the two spellings that
+        // are already registered. A check over it could not fail on any store,
+        // which is a tautology wearing a proof's clothes. The store DOES write
+        // the code, on the paired `diagnostics` row, and the event payload's
+        // `diagnostic_ids` is hardcoded empty -- so nothing links the two. See
+        // tracker row D12: carrying the code (or the link) in the event payload
+        // is the runtime change that would let this plane pin it.
+        TraceEvent::AssertionFailed {
+            assertion_id,
+            code: _,
+            message,
+        } => {
+            if assertion_id.trim().is_empty() {
+                return violation(record, "assertion failure evidence names no assertion");
+            }
+            if message.trim().is_empty() {
+                return violation(
+                    record,
+                    format!("assertion {assertion_id} failure evidence carries no message"),
+                );
+            }
+        }
         // A generic internal failure is a terminal; replay records it like any
         // other terminal and reprojects identically (no extra trace invariant).
         TraceEvent::InstanceFailed => {}
@@ -560,6 +711,79 @@ fn dependency_satisfied(state: &TraceState, edge: &DependencyEdge) -> bool {
         }
         DependencyPredicate::Completes => status.is_terminal(),
     }
+}
+
+/// The block statuses that are NOT policy denials: a block on these grounds is
+/// arithmetic or ordering, not a refusal, and owes no named subject. Everything
+/// else the store can write into an `effect.blocked` event is treated as a
+/// policy denial and must name what it refused.
+///
+/// This list is a DENYLIST on purpose. An allowlist of the two policy statuses
+/// (`blocked_by_capability`, `blocked_by_profile`) reads more directly, but it
+/// fails OPEN: a store that grows a third policy block status would leave this
+/// check silently classifying it as "owes no named subject", and no gate would
+/// say so -- while ControlPlaneLifecycle.tla's `DenialEvidenceNamesItsSubject`
+/// went on quantifying over EVERY denial. The two planes would then forbid
+/// different things with nothing to notice. Inverted, a new status arrives
+/// checked, and the cost of being wrong is a red gate rather than a hole.
+const NON_DENIAL_BLOCK_STATUSES: [&str; 3] =
+    ["blocked", "blocked_by_capacity", "blocked_by_dependency"];
+
+/// The diagnostic id the script hard-off owes. Denying a `script.*` capability
+/// IS the "scripts are disabled" state, so its evidence must say so under the
+/// registered spelling rather than under prose or a sibling code.
+const SCRIPT_CAPABILITY_PREFIX: &str = "script.";
+const SCRIPT_DISABLED_DIAGNOSTIC_CODE: &str = "security.script_disabled";
+
+/// Diagnostic ids a denial reason may carry as a `<id>: ` prefix. The only one
+/// the runtime writes today is the script hard-off id (spec/std-script.md; the
+/// code is registered in `spec/diagnostic-codes.txt`), prefixed onto the block
+/// reason by the store's `exec.command` admission arm. A denial carrying any
+/// other id is a misspelling or an unregistered invention. Spelled once, above:
+/// the list of ids a denial may carry and the id a script denial owes are the
+/// same string, and two copies of it could drift apart silently.
+const REGISTERED_DENIAL_DIAGNOSTIC_CODES: [&str; 1] = [SCRIPT_DISABLED_DIAGNOSTIC_CODE];
+
+/// The two runtime codes a failing assertion's `diagnostics` row may carry.
+/// The trace plane cannot check an assertion against these -- the event log
+/// carries no code, only the event TYPE, so see `TraceEvent::AssertionFailed`
+/// above. What is checkable, and what the test below checks, is that both
+/// spellings stay registered in `spec/diagnostic-codes-runtime.txt`: deleting
+/// one there turns a store's runtime diagnostic into an unregistered code.
+#[cfg(test)]
+const REGISTERED_ASSERTION_DIAGNOSTIC_CODES: [&str; 2] = ["assertion.failed", "assertion.errored"];
+
+/// A denial reason NAMES its subject when it backtick-quotes a non-empty name:
+/// "capability `x` is not bound for program p", "profile `p` does not allow
+/// capability `x`", "agent `a` is not declared by the program". A reason that
+/// quotes nothing says only that something was refused.
+fn denial_reason_names_subject(reason: &str) -> bool {
+    denied_subject(reason).is_some()
+}
+
+/// The subject a denial reason backtick-quotes, if it quotes a non-empty one.
+fn denied_subject(reason: &str) -> Option<&str> {
+    let (_, rest) = reason.split_once('`')?;
+    let (subject, _) = rest.split_once('`')?;
+    (!subject.trim().is_empty()).then(|| subject.trim())
+}
+
+/// The diagnostic id a denial reason carries as a `<id>: ` prefix, if any. An id
+/// is a DOTTED code identifier; prose before a colon -- a provider's own message,
+/// a `provider_health:` category -- is not one and yields `None`, so this reads
+/// only the reasons that claim to be coded.
+fn denial_diagnostic_code(reason: &str) -> Option<&str> {
+    let (head, _) = reason.split_once(": ")?;
+    (is_code_identifier(head) && head.contains('.')).then_some(head)
+}
+
+/// A code is an identifier: non-empty and carrying no whitespace. Deliberately
+/// looser than a charset rule, because a terminal diagnostic's code may be the
+/// PROVIDER's own failure kind passed through (`DurableDiagnosticCode::ProviderKind`)
+/// rather than a WhippleScript code. What it still rules out is the shape D12
+/// cares about: an empty code, or the message put in the code's place.
+fn is_code_identifier(code: &str) -> bool {
+    !code.is_empty() && !code.contains(char::is_whitespace)
 }
 
 fn violation<T>(record: &TraceRecord, message: impl Into<String>) -> Result<T, TraceViolation> {
@@ -661,6 +885,34 @@ mod tests {
                 status,
                 summary: "provider failed".to_owned(),
                 diagnostics_json: r#"{"error":"boom"}"#.to_owned(),
+                code: Some("nonzero_exit".to_owned()),
+                subject_effect_id: effect_id.to_owned(),
+            },
+        }
+    }
+
+    fn capability_denial(sequence: u64, effect_id: &str, reason: &str) -> TraceRecord {
+        TraceRecord {
+            sequence,
+            event: TraceEvent::EffectBlocked {
+                effect_id: effect_id.to_owned(),
+                status: Some("blocked_by_capability".to_owned()),
+                reason: reason.to_owned(),
+            },
+        }
+    }
+
+    /// A failing assertion's evidence, parameterised on the two things the
+    /// checker reads. It is deliberately NOT parameterised on the code: the
+    /// event log carries none, so a trace varying it would be a state the
+    /// runtime cannot reach (see `TraceEvent::AssertionFailed` in check_record).
+    fn assertion_failed(sequence: u64, assertion_id: &str, message: &str) -> TraceRecord {
+        TraceRecord {
+            sequence,
+            event: TraceEvent::AssertionFailed {
+                assertion_id: assertion_id.to_owned(),
+                code: "assertion.failed".to_owned(),
+                message: message.to_owned(),
             },
         }
     }
@@ -1277,6 +1529,73 @@ mod tests {
                 capacity_block(5, "e"), // blocking a terminal effect
             ],
             "revision_epoch_advances" => vec![revision_activated(1, 0, 0)], // 0 -> 0 does not advance
+            // D12 evidence rows. Each trace is a DENIAL THAT HAPPENED with the
+            // record that should explain it broken in exactly one way.
+            "capability_denial_names_subject" => vec![
+                effect_created(1, "e"),
+                // A real capability denial, but the reason quotes no subject:
+                // the log says work was refused and not which capability.
+                capability_denial(2, "e", "the capability is not bound for this program"),
+            ],
+            "denial_diagnostic_code_registered" => vec![
+                effect_created(1, "e"),
+                // The script hard-off denial with its id misspelt: coded, but
+                // with a code no register carries.
+                capability_denial(
+                    2,
+                    "e",
+                    "security.script_disabld: capability `script.raw` is not bound for program p",
+                ),
+            ],
+            "script_denial_carries_disabled_code" => vec![
+                // A script capability denied as prose: the operator reading this
+                // cannot tell "scripts are off" from "this one is unbound".
+                effect_created(1, "e"),
+                capability_denial(2, "e", "capability `script.raw` is not bound for program p"),
+            ],
+            "assertion_failure_evidence" => vec![
+                // Evidence that a named assertion failed -- without naming it.
+                assertion_failed(1, "  ", "assertion failed: count(Scored) == 99"),
+            ],
+            "terminal_diagnostic_carries_code" => vec![
+                effect_created(1, "e"),
+                claim(2, "e"),
+                start_run_id(3, "e", "r1"),
+                TraceRecord {
+                    sequence: 4,
+                    event: TraceEvent::ProviderDiagnostic {
+                        run_id: "r1".to_owned(),
+                        effect_id: "e".to_owned(),
+                        provider: "test".to_owned(),
+                        status: EffectStatus::Failed,
+                        summary: "provider failed".to_owned(),
+                        diagnostics_json: "{}".to_owned(),
+                        // The message put where the code belongs.
+                        code: Some("fixture failed with exit code 42".to_owned()),
+                        subject_effect_id: "e".to_owned(),
+                    },
+                },
+            ],
+            "terminal_diagnostic_names_effect" => vec![
+                effect_created(1, "bystander"),
+                effect_created(2, "e"),
+                claim(3, "e"),
+                start_run_id(4, "e", "r1"),
+                TraceRecord {
+                    sequence: 5,
+                    event: TraceEvent::ProviderDiagnostic {
+                        run_id: "r1".to_owned(),
+                        effect_id: "e".to_owned(),
+                        provider: "test".to_owned(),
+                        status: EffectStatus::Failed,
+                        summary: "provider failed".to_owned(),
+                        diagnostics_json: "{}".to_owned(),
+                        code: Some("nonzero_exit".to_owned()),
+                        // The failure attributed to an effect that did not fail.
+                        subject_effect_id: "bystander".to_owned(),
+                    },
+                },
+            ],
             other => panic!("no violation builder for correspondence key {other}"),
         }
     }
@@ -1325,10 +1644,119 @@ mod tests {
             "no_claim_after_cancel",
             "blocked_not_from_terminal",
             "revision_epoch_advances",
+            "capability_denial_names_subject",
+            "denial_diagnostic_code_registered",
+            "script_denial_carries_disabled_code",
+            "assertion_failure_evidence",
+            "terminal_diagnostic_carries_code",
+            "terminal_diagnostic_names_effect",
         ] {
             assert!(
                 keys_seen.contains(key),
                 "builder key {key} is not in the correspondence corpus"
+            );
+        }
+    }
+
+    /// The denial-subject check classifies by exclusion, so a block status the
+    /// store has not written yet arrives CHECKED. Without this the inversion is
+    /// invisible: the corpus trace in `richer_invariants_have_bite` uses a known
+    /// policy status, and an allowlist would pass it identically.
+    #[test]
+    fn an_unrecognised_block_status_owes_a_named_subject() {
+        let block = |status: &str, reason: &str| TraceRecord {
+            sequence: 2,
+            event: TraceEvent::EffectBlocked {
+                effect_id: "e".to_owned(),
+                status: Some(status.to_owned()),
+                reason: reason.to_owned(),
+            },
+        };
+
+        // Arithmetic blocks are not refusals and owe nothing. `blocked_by_
+        // dependency` is excluded here only because a separate, older invariant
+        // demands it point at a real unsatisfied dependency, which would be what
+        // this trace tripped over rather than the denial-subject rule.
+        for status in NON_DENIAL_BLOCK_STATUSES {
+            if status == "blocked_by_dependency" {
+                continue;
+            }
+            let trace = vec![effect_created(1, "e"), block(status, "waiting")];
+            assert_eq!(
+                check_trace(&trace),
+                Ok(()),
+                "{status} should owe no subject"
+            );
+        }
+
+        // A status this checker has never seen is presumed a refusal.
+        let trace = vec![effect_created(1, "e"), block("blocked_by_quota", "refused")];
+        let violation = check_trace(&trace).expect_err("an unknown block status is a denial");
+        assert!(
+            violation
+                .message
+                .contains("does not name the denied subject"),
+            "unexpected violation: {violation:?}"
+        );
+
+        // ... and naming one satisfies it, so the rule is about the reason, not
+        // about the status being unfamiliar.
+        let named = vec![
+            effect_created(1, "e"),
+            block("blocked_by_quota", "quota `tokens.daily` is exhausted"),
+        ];
+        assert_eq!(check_trace(&named), Ok(()));
+    }
+
+    /// The second half of a failing assertion's evidence. `richer_invariants_have
+    /// _bite` covers the clause the TLA model shares (the evidence NAMES its
+    /// assertion); this covers the clause it does not model, because
+    /// `assertionEvidence` in ControlPlaneLifecycle.tla is a `<<assertion, code>>`
+    /// pair with no message component. Evidence naming an assertion and saying
+    /// nothing about it reports that something failed without reporting what.
+    #[test]
+    fn assertion_failure_evidence_must_explain_itself() {
+        let named_and_explained = vec![assertion_failed(
+            1,
+            "key_assertion",
+            "assertion failed: count(Scored) == 99",
+        )];
+        assert_eq!(check_trace(&named_and_explained), Ok(()));
+
+        let named_but_silent = vec![assertion_failed(1, "key_assertion", "   ")];
+        let violation = check_trace(&named_but_silent).expect_err("silent evidence is a violation");
+        assert!(
+            violation
+                .message
+                .contains("assertion key_assertion failure evidence carries no message"),
+            "unexpected violation: {violation:?}"
+        );
+    }
+
+    /// The code lists this checker refuses against are not free text: every code
+    /// named must exist in one of the two diagnostic registers. Without this a
+    /// register rename would leave the invariant refusing the code the runtime
+    /// actually writes, and nothing would say so.
+    #[test]
+    fn denial_and_assertion_codes_are_registered() {
+        const STATIC_CODES: &str = include_str!("../../../spec/diagnostic-codes.txt");
+        const RUNTIME_CODES: &str = include_str!("../../../spec/diagnostic-codes-runtime.txt");
+
+        let registered: BTreeSet<&str> = STATIC_CODES
+            .lines()
+            .chain(RUNTIME_CODES.lines())
+            .filter_map(|line| line.split_whitespace().next())
+            .filter(|name| !name.starts_with('#'))
+            .collect();
+
+        for code in REGISTERED_DENIAL_DIAGNOSTIC_CODES
+            .iter()
+            .chain(REGISTERED_ASSERTION_DIAGNOSTIC_CODES.iter())
+        {
+            assert!(
+                registered.contains(code),
+                "`{code}` is not in spec/diagnostic-codes.txt or \
+                 spec/diagnostic-codes-runtime.txt"
             );
         }
     }
@@ -1390,6 +1818,8 @@ mod tests {
                     status: EffectStatus::Failed,
                     summary: "provider failed".to_owned(),
                     diagnostics_json: "not json".to_owned(),
+                    code: Some("nonzero_exit".to_owned()),
+                    subject_effect_id: "a".to_owned(),
                 },
             },
         ];

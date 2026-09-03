@@ -803,6 +803,8 @@ fn renders_provider_diagnostic_trace_json() {
             status: EffectStatus::Failed,
             summary: "provider failed".to_owned(),
             diagnostics_json: json!({"stage": "tool", "retryable": false}).to_string(),
+            code: Some("nonzero_exit".to_owned()),
+            subject_effect_id: "effect-1".to_owned(),
         },
     };
 
@@ -817,6 +819,17 @@ fn renders_provider_diagnostic_trace_json() {
         Some("fixture")
     );
     assert_eq!(event.get("status").and_then(Value::as_str), Some("failed"));
+    // D12: the rendered trace carries the diagnostic's code and subject, which
+    // is what `whip trace --json` has to show for the terminal-diagnostic
+    // invariants to be readable by a human as well as by check_trace.
+    assert_eq!(
+        event.get("code").and_then(Value::as_str),
+        Some("nonzero_exit")
+    );
+    assert_eq!(
+        event.get("subject_effect_id").and_then(Value::as_str),
+        Some("effect-1")
+    );
     assert_eq!(
         event
             .get("diagnostics")

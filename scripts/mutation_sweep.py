@@ -140,6 +140,50 @@ FORWARDED_PAYLOAD = re.compile(
 EXIT_STATUS_PAYLOAD = re.compile(r"^[\s(]*ExitCode::[A-Za-z_][A-Za-z0-9_]*[\s)]*$")
 
 
+# A refusal NAMES its reason. `Err(CustodyError::RungBelowFloor { .. })` says why
+# in the variant, which is precisely why the rule above keeps a textless variant
+# as a site. A BARE struct literal names nothing -- `Err(TraceViolation { .. })`
+# is the same shape whatever went wrong -- and when its fields are all forwarded
+# from elsewhere it is a refusal CONSTRUCTOR rather than a refusal:
+#
+#     fn violation<T>(record: &TraceRecord, message: impl Into<String>) -> ... {
+#         Err(TraceViolation { sequence: record.sequence, message: message.into() })
+#     }
+#
+# Every caller passes its own text and is its own site (`// REFUSAL:` markers
+# make the guards measurable where the helper hides the `Err(`). The helper has
+# no message of its own to corrupt, so `mutate_message` found nothing and the
+# sweep reported it UNMEASURED -- asking for a test that cannot be written, since
+# neutralising a constructor stops EVERY refusal in the file at once.
+#
+# Narrow deliberately, and measured before it was written: across the workspace
+# 32 sites open a multi-line struct payload carrying no literal text, and 31 of
+# them are named variants that stay sites under this rule. A path (`::`) in the
+# payload's type disqualifies it, as does any field value that is not a plain
+# forwarded expression.
+BARE_STRUCT_PAYLOAD = re.compile(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*\{\s*$")
+FORWARDED_FIELD = re.compile(
+    r"^\s*[a-z_][a-z0-9_]*\s*:\s*[a-z_][A-Za-z0-9_]*(?:\.[a-z_][A-Za-z0-9_]*(?:\(\))?)*\s*,?\s*$"
+)
+
+
+def is_refusal_constructor(lines: list[str], index: int) -> bool:
+    """True when the `Err(` at `index` opens a bare, all-forwarded struct."""
+    found = ERR_CALL.search(lines[index])
+    if found is None:
+        return False
+    if not BARE_STRUCT_PAYLOAD.match(lines[index][found.end() :]):
+        return False
+    fields = 0
+    for line in lines[index + 1 : index + 8]:
+        if re.match(r"^\s*\}\s*\)?[,;]?\s*$", line):
+            return fields > 0
+        if not FORWARDED_FIELD.match(line):
+            return False
+        fields += 1
+    return False
+
+
 
 def err_payload(line: str, open_paren: int) -> str | None:
     """The text inside the `Err(` whose opening paren is at `open_paren`."""
@@ -328,6 +372,8 @@ def find_sites(lines: list[str]) -> list[Site]:
             or err_is_refusal(line)
             or variant_is_refusal(line)
         )
+        if is_site and is_refusal_constructor(lines, index):
+            continue
         if not is_site and OK_OR_OPEN.search(line):
             # Joined only for THIS rule. Running the `Err(` rule over a joined
             # window would read a match arm on the next line as a construction.

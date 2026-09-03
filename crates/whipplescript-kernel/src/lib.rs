@@ -1811,6 +1811,22 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
             result,
             run_metadata_json,
         );
+        // Built BEFORE the trace emit so the trace and the persisted row carry
+        // one code and one subject (D12 terminal-diagnostic evidence).
+        let diagnostic = self.provider_terminal_diagnostic(
+            execution.instance_id,
+            execution.effect_id,
+            execution.run_id,
+            execution.provider,
+            provider_effect_status(&result.status),
+            &safe_summary,
+            Some(DurableDiagnosticCode::ProviderKind(provider_failure_code(
+                result.failure.as_ref(),
+                provider_status(&result.status),
+            ))),
+            &metadata_json,
+            &evidence,
+        );
         self.emit_provider_diagnostic(
             execution.run_id,
             execution.effect_id,
@@ -1818,6 +1834,7 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
             provider_effect_status(&result.status),
             &safe_summary,
             &metadata_json,
+            diagnostic.as_ref(),
         );
         let completion = EffectCompletion {
             instance_id: execution.instance_id,
@@ -1836,20 +1853,6 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
                 &terminal_hash,
             )),
         };
-        let diagnostic = self.provider_terminal_diagnostic(
-            execution.instance_id,
-            execution.effect_id,
-            execution.run_id,
-            execution.provider,
-            provider_effect_status(&result.status),
-            &safe_summary,
-            Some(DurableDiagnosticCode::ProviderKind(provider_failure_code(
-                result.failure.as_ref(),
-                provider_status(&result.status),
-            ))),
-            &metadata_json,
-            &evidence,
-        );
 
         let event = match result.status {
             ProviderRunStatus::Completed => self.complete_run(completion)?,
@@ -2444,30 +2447,7 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
         let safe_summary = redacted_provider_summary(&result.summary);
         let evidence = self.record_coerce_result(execution, result, &safe_summary)?;
         let metadata_json = coerce_metadata(result);
-        self.emit_provider_diagnostic(
-            execution.run_id,
-            execution.effect_id,
-            execution.provider,
-            coerce_effect_status(&result.status),
-            &safe_summary,
-            &metadata_json,
-        );
-        let completion = EffectCompletion {
-            instance_id: execution.instance_id,
-            effect_id: execution.effect_id,
-            run_id: execution.run_id,
-            provider: execution.provider,
-            worker_id: execution.worker_id,
-            status: coerce_status(&result.status),
-            exit_code: coerce_exit_code(&result.status),
-            summary: Some(&safe_summary),
-            metadata_json: &metadata_json,
-            idempotency_key: Some(&idempotency_key(&[
-                execution.instance_id,
-                execution.run_id,
-                "coerce-terminal",
-            ])),
-        };
+        // Built BEFORE the trace emit for the same reason as the provider path.
         let diagnostic = self.provider_terminal_diagnostic(
             execution.instance_id,
             execution.effect_id,
@@ -2489,6 +2469,31 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
             &metadata_json,
             &evidence,
         );
+        self.emit_provider_diagnostic(
+            execution.run_id,
+            execution.effect_id,
+            execution.provider,
+            coerce_effect_status(&result.status),
+            &safe_summary,
+            &metadata_json,
+            diagnostic.as_ref(),
+        );
+        let completion = EffectCompletion {
+            instance_id: execution.instance_id,
+            effect_id: execution.effect_id,
+            run_id: execution.run_id,
+            provider: execution.provider,
+            worker_id: execution.worker_id,
+            status: coerce_status(&result.status),
+            exit_code: coerce_exit_code(&result.status),
+            summary: Some(&safe_summary),
+            metadata_json: &metadata_json,
+            idempotency_key: Some(&idempotency_key(&[
+                execution.instance_id,
+                execution.run_id,
+                "coerce-terminal",
+            ])),
+        };
 
         let event = match result.status {
             CoerceStatus::Succeeded => self.complete_run(completion)?,
@@ -3204,6 +3209,12 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
         });
     }
 
+    /// Emit the in-kernel trace's view of a terminal diagnostic. The code and
+    /// subject are read from the `TerminalDiagnosticRecord` the store is about
+    /// to persist, not restated here, so the trace checker's D12 invariants
+    /// (`TerminalDiagnosticCarriesCode`, `TerminalDiagnosticNamesItsRunEffect`)
+    /// see the same values a `whip trace --check` reconstructs from the log.
+    #[allow(clippy::too_many_arguments)]
     fn emit_provider_diagnostic(
         &mut self,
         run_id: &str,
@@ -3212,6 +3223,7 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
         status: EffectStatus,
         summary: &str,
         diagnostics_json: &str,
+        diagnostic: Option<&TerminalDiagnosticRecord>,
     ) {
         if status == EffectStatus::Completed {
             return;
@@ -3223,6 +3235,12 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
             status,
             summary: summary.to_owned(),
             diagnostics_json: diagnostics_json.to_owned(),
+            code: diagnostic
+                .and_then(|diagnostic| diagnostic.code.as_ref())
+                .map(|code| code.as_str().to_owned()),
+            subject_effect_id: diagnostic
+                .and_then(|diagnostic| diagnostic.subject_id.clone())
+                .unwrap_or_default(),
         });
     }
 
