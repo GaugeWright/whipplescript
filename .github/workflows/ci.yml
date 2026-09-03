@@ -120,6 +120,12 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           submodules: recursive
+          # The green bar's advisory check diffs against the merge base, which a
+          # shallow clone does not have. `scripts/check-new-advisories.sh` exits
+          # non-zero rather than skipping when it cannot find one, so a shallow
+          # checkout here fails the bar loudly instead of quietly auditing
+          # nothing — same reason `new-refusals` fetches full history.
+          fetch-depth: 0
       # rustup materializes the toolchain named in rust-toolchain.toml.
       - name: Install Rust
         run: rustup show active-toolchain || rustup toolchain install
