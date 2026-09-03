@@ -405,7 +405,9 @@ fn settle_failed_file_effect<S: RuntimeStore>(
         status: "failed",
         exit_code: None,
         summary: Some(reason),
-        metadata_json: &json!({ "failure": { "message": reason } }).to_string(),
+        metadata_json:
+            &json!({ "failure": { "error_kind": "file_effect_failed", "message": reason } })
+                .to_string(),
         idempotency_key: Some(terminal_key),
     })?;
     kernel.derive_fact(
@@ -1270,7 +1272,9 @@ fn fail_coordination_effect<S: RuntimeStore>(
         status: "failed",
         exit_code: None,
         summary: Some(reason),
-        metadata_json: &json!({ "failure": { "message": reason } }).to_string(),
+        metadata_json:
+            &json!({ "failure": { "error_kind": "coordination_failed", "message": reason } })
+                .to_string(),
         idempotency_key: Some(&idempotency_key(&[
             instance_id,
             &effect.effect_id,
@@ -2207,7 +2211,9 @@ pub fn run_queue_effect_generic<S: RuntimeStore + WorkItems + FrontierRead>(
                 status: "failed",
                 exit_code: Some(1),
                 summary: Some(&reason),
-                metadata_json: &json!({"failure": {"message": reason}}).to_string(),
+                metadata_json:
+                    &json!({"failure": {"error_kind": "queue_failed", "message": reason}})
+                        .to_string(),
                 idempotency_key: Some(&idempotency_key(&[
                     instance_id,
                     &effect.effect_id,
@@ -2496,7 +2502,9 @@ pub fn run_notify_effect_generic<S: RuntimeStore>(
             status: "failed",
             exit_code: None,
             summary: Some(&reason),
-            metadata_json: &json!({"failure": {"message": reason}}).to_string(),
+            metadata_json:
+                &json!({"failure": {"error_kind": "notify_rejected", "message": reason}})
+                    .to_string(),
             idempotency_key: Some(&idempotency_key(&[
                 instance_id,
                 &effect.effect_id,

@@ -25570,7 +25570,15 @@ fn run_exec_effect(
                     status: "failed",
                     exit_code: Some(1),
                     summary: Some(&format!("{error:?}")),
-                    metadata_json: &json!({ "mode": mode, "capability": capability }).to_string(),
+                    metadata_json: &json!({
+                        "mode": mode,
+                        "capability": capability,
+                        "failure": {
+                            "error_kind": "agent_input_unsealable",
+                            "message": format!("{error:?}"),
+                        },
+                    })
+                    .to_string(),
                     idempotency_key: Some(&idempotency_key(&[
                         instance_id,
                         &effect.effect_id,
@@ -25771,14 +25779,15 @@ fn run_exec_effect(
             Ok(terminal)
         }
         Err((detail, reason)) => {
+            let failure = json!({"error_kind": "exec_failed", "message": reason});
             let mut metadata = match &detail {
                 Some((exit_code, stdout, stderr)) => json!({
-                    "failure": {"message": reason},
+                    "failure": failure,
                     "exit_code": exit_code,
                     "stdout": stdout,
                     "stderr": stderr,
                 }),
-                None => json!({"failure": {"message": reason}}),
+                None => json!({"failure": failure}),
             };
             // SC6: structured evidence (e.g. hash-mismatch
             // expected_sha256/actual_sha256) rides the failure object as
@@ -26043,7 +26052,11 @@ fn run_custody_mint_effect(
             status: "failed",
             exit_code: Some(1),
             summary: Some(summary),
-            metadata_json: &json!({ "error": summary }).to_string(),
+            metadata_json: &json!({
+                "error": summary,
+                "failure": { "error_kind": "custody_mint_failed", "message": summary },
+            })
+            .to_string(),
             idempotency_key: None,
         })
     };
@@ -26254,7 +26267,11 @@ fn run_custody_request_effect(
             status: "failed",
             exit_code: Some(1),
             summary: Some(summary),
-            metadata_json: &json!({ "error": summary }).to_string(),
+            metadata_json: &json!({
+                "error": summary,
+                "failure": { "error_kind": "custody_request_failed", "message": summary },
+            })
+            .to_string(),
             idempotency_key: None,
         })
     };
@@ -26471,15 +26488,31 @@ fn run_event_effect(
 /// The start-failure exits used to fail the run bare: an `after child fails`
 /// arm in the parent (which suppresses the auto-fail net) then had no fact to
 /// match, and the parent idled forever.
+/// `error_kind` is taken per call site rather than derived here: the three
+/// callers fail for three different reasons -- the invocation was refused, the
+/// child would not start, the link to a started child could not be written --
+/// and one kind covering all of them would name the helper rather than the
+/// failure. It is merged into the caller's metadata so the terminal records a
+/// diagnostic; without it `fail_run` has no kind to read.
+#[allow(clippy::too_many_arguments)]
 fn fail_invoke_run_with_fact(
     kernel: &mut RuntimeKernel<SqliteStore>,
     instance_id: &str,
     effect_id: &str,
     run_id: &str,
     provider: &str,
+    error_kind: &str,
     summary: &str,
     metadata_json: &str,
 ) -> Result<whipplescript_store::StoredEvent, StoreError> {
+    let mut metadata: Value = serde_json::from_str(metadata_json).unwrap_or_else(|_| json!({}));
+    if let Some(object) = metadata.as_object_mut() {
+        object.insert(
+            "failure".to_owned(),
+            json!({ "error_kind": error_kind, "message": summary }),
+        );
+    }
+    let metadata_json = &metadata.to_string();
     let terminal = kernel.fail_run(EffectCompletion {
         instance_id,
         effect_id,
@@ -26550,6 +26583,7 @@ fn run_workflow_invoke_effect(
             &effect.effect_id,
             &run_id,
             &options.provider,
+            "invocation_program_missing",
             "workflow invocation requires --program",
             &json!({"input": input}).to_string(),
         );
@@ -26626,6 +26660,7 @@ fn run_workflow_invoke_effect(
                         &effect.effect_id,
                         &run_id,
                         &options.provider,
+                        "child_workflow_start_failed",
                         "child workflow failed to start",
                         &metadata_json,
                     );
@@ -26667,6 +26702,7 @@ fn run_workflow_invoke_effect(
                     &effect.effect_id,
                     &run_id,
                     &options.provider,
+                    "child_workflow_link_failed",
                     "child workflow invocation link failed",
                     &metadata_json,
                 );
@@ -26760,6 +26796,8 @@ fn run_workflow_invoke_effect(
             "child workflow timed out",
         ),
     };
+    // A settle that carried only `child_status` recorded no diagnostic, so a
+    // parent workflow whose child failed reported "failed" and nothing else.
     let metadata_json = json!({
         "input": input,
         "child_instance_id": child_instance_id,
@@ -26767,6 +26805,30 @@ fn run_workflow_invoke_effect(
         "value": value,
     })
     .to_string();
+    // Only a settle that FAILS carries a failure object: a completed or
+    // cancelled child did not fail, and `complete_run`/`cancel_run` record no
+    // diagnostic to read one from. The kind is the child's own outcome, since
+    // that IS why the parent's effect did not succeed.
+    let failure_kind = match status {
+        "failed" => Some("child_workflow_failed"),
+        "timed_out" => Some("child_workflow_timed_out"),
+        "completed" | "cancelled" => None,
+        _ => Some("child_workflow_unexpected_status"),
+    };
+    let metadata_json = match failure_kind {
+        None => metadata_json,
+        Some(error_kind) => {
+            let mut metadata: Value =
+                serde_json::from_str(&metadata_json).unwrap_or_else(|_| json!({}));
+            if let Some(object) = metadata.as_object_mut() {
+                object.insert(
+                    "failure".to_owned(),
+                    json!({ "error_kind": error_kind, "message": summary }),
+                );
+            }
+            metadata.to_string()
+        }
+    };
     let settle_result = (|kernel: &mut RuntimeKernel<SqliteStore>| -> Result<
         whipplescript_store::StoredEvent,
         StoreError,

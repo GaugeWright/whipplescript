@@ -116,6 +116,13 @@ pub fn resolve_due_time_effects<S: RuntimeStore>(
                     metadata_json: &json!({
                         "timeout_seconds": effect.timeout_seconds,
                         "reason": "deadline exceeded",
+                        // Under `failure` so the terminal carries a diagnostic:
+                        // a deadline expiry is the effect's own failure kind,
+                        // and the operator plane could not see it before.
+                        "failure": {
+                            "error_kind": "deadline_exceeded",
+                            "message": "deadline exceeded",
+                        },
                     })
                     .to_string(),
                     idempotency_key: Some(&idempotency_key(&[

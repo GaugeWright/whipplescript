@@ -1809,7 +1809,17 @@ impl<Sql: DoSql + Clone> InstanceDriver for DoInstanceDriver<'_, Sql> {
                         status: "failed",
                         exit_code: None,
                         summary: Some(&summary),
-                        metadata_json: "{}",
+                        // An empty object recorded no diagnostic at all, so the
+                        // one placement failure the DO can produce reached the
+                        // operator as a bare "failed". It names itself now, as
+                        // the native host's failures do.
+                        metadata_json: &serde_json::json!({
+                            "failure": {
+                                "error_kind": "placement_unsupported",
+                                "message": summary,
+                            }
+                        })
+                        .to_string(),
                         idempotency_key: Some(&idempotency_key(&[
                             self.instance_id,
                             &effect.effect_id,

@@ -1394,7 +1394,9 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
     }
 
     pub fn fail_run(&mut self, completion: EffectCompletion<'_>) -> StoreResult<StoredEvent> {
-        self.fail_run_with_diagnostic(completion, None)
+        let diagnostic =
+            self.terminal_diagnostic_from_completion(&completion, EffectStatus::Failed);
+        self.fail_run_with_diagnostic(completion, diagnostic)
     }
 
     fn fail_run_with_diagnostic(
@@ -1470,7 +1472,9 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
     }
 
     pub fn timeout_run(&mut self, completion: EffectCompletion<'_>) -> StoreResult<StoredEvent> {
-        self.timeout_run_with_diagnostic(completion, None)
+        let diagnostic =
+            self.terminal_diagnostic_from_completion(&completion, EffectStatus::TimedOut);
+        self.timeout_run_with_diagnostic(completion, diagnostic)
     }
 
     pub fn cancel_run(&mut self, completion: EffectCompletion<'_>) -> StoreResult<StoredEvent> {
@@ -3244,6 +3248,47 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
         });
     }
 
+    /// The terminal diagnostic for a failure the KERNEL settled, rather than one
+    /// a provider reported. `fail_run`/`timeout_run` forwarded `None` here and
+    /// every one of their call sites -- file, coordination, queue, notify,
+    /// capability, http, timer, and the DO mirror -- produced a terminal that
+    /// recorded no diagnostic at all: the effect failed and the operator plane
+    /// was told only that, never why. That is the open product gap
+    /// `spec/error-handling.md` records behind the model's `NoTerminalDiagnostic`
+    /// branch.
+    ///
+    /// The code is the failure's own `error_kind`, read from the metadata the
+    /// site already writes, and carried as `ProviderKind` -- the variant that
+    /// exists for exactly this, "a provider's own error kind, passed through
+    /// verbatim, never registered as a WhippleScript code". Deriving it rather
+    /// than taking it as an argument keeps ONE spelling: the kind in the durable
+    /// metadata and the kind in the diagnostic cannot drift apart, because they
+    /// are the same string read once.
+    ///
+    /// A completion whose metadata carries no `error_kind` still records no
+    /// diagnostic. That is deliberate and visible rather than silent: the code
+    /// would be the only thing missing, and inventing one here would put a
+    /// kernel-chosen word where the failure's own name belongs.
+    fn terminal_diagnostic_from_completion(
+        &self,
+        completion: &EffectCompletion<'_>,
+        status: EffectStatus,
+    ) -> Option<TerminalDiagnosticRecord> {
+        let error_kind = failure_error_kind(completion.metadata_json)?;
+        let summary = completion.summary.unwrap_or_default();
+        self.provider_terminal_diagnostic(
+            completion.instance_id,
+            completion.effect_id,
+            completion.run_id,
+            completion.provider,
+            status,
+            summary,
+            Some(DurableDiagnosticCode::ProviderKind(error_kind.as_str())),
+            completion.metadata_json,
+            &ProviderEvidence::default(),
+        )
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn provider_terminal_diagnostic(
         &self,
@@ -3291,6 +3336,27 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
             idempotency_key: Some(idempotency_key),
         })
     }
+}
+
+/// The failure's own kind, out of the `failure.error_kind` a settling site wrote
+/// into its terminal metadata. `None` where there is none to read, which is the
+/// one case that still records no diagnostic -- see
+/// `terminal_diagnostic_from_completion`.
+///
+/// Deliberately tolerant of everything except a MISSING kind: malformed JSON, a
+/// `failure` that is not an object, and a non-string kind all read as absent
+/// rather than panicking. This runs on the path that records a failure, and a
+/// terminal that cannot be written because its own metadata was odd would lose
+/// the failure entirely -- strictly worse than losing its code.
+fn failure_error_kind(metadata_json: &str) -> Option<String> {
+    let metadata: Value = serde_json::from_str(metadata_json).ok()?;
+    let kind = metadata
+        .get("failure")?
+        .get("error_kind")?
+        .as_str()?
+        .trim()
+        .to_owned();
+    (!kind.is_empty()).then_some(kind)
 }
 
 fn effect_status(status: &str) -> EffectStatus {
@@ -8692,5 +8758,40 @@ rule wait
         assert!(kernel
             .load_agent_thread_transcript(&instance_id, "other")
             .is_empty());
+    }
+
+    /// D12 product gap: `fail_run`/`timeout_run` forwarded `None` as the
+    /// diagnostic, so every kernel-settled failure -- file, coordination, queue,
+    /// notify, capability, exec, deadline, DO placement, custody -- produced a
+    /// terminal recording no diagnostic at all. The code now comes from the
+    /// failure's own `error_kind`, and this is the reader that decides whether
+    /// there is one.
+    #[test]
+    fn a_failures_kind_is_read_from_its_own_metadata() {
+        let kind = |json: &str| super::failure_error_kind(json);
+
+        assert_eq!(
+            kind(r#"{"failure": {"error_kind": "deadline_exceeded", "message": "late"}}"#),
+            Some("deadline_exceeded".to_owned())
+        );
+        // Surrounding keys are the site's own evidence and do not interfere.
+        assert_eq!(
+            kind(r#"{"exit_code": 1, "failure": {"error_kind": "exec_failed"}, "stdout": ""}"#),
+            Some("exec_failed".to_owned())
+        );
+
+        // The shapes that mean "no kind to report". Each records no diagnostic
+        // rather than inventing one or, worse, failing to record the terminal:
+        // this runs on the path that reports a failure.
+        for absent in [
+            r#"{}"#,                              // the DO's old metadata
+            r#"{"failure": {"message": "why"}}"#, // message but no kind
+            r#"{"failure": "not an object"}"#,
+            r#"{"failure": {"error_kind": 7}}"#, // not a string
+            r#"{"failure": {"error_kind": "   "}}"#, // blank is not a code
+            r#"not json at all"#,
+        ] {
+            assert_eq!(kind(absent), None, "should read as absent: {absent}");
+        }
     }
 }

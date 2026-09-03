@@ -1645,3 +1645,73 @@ fn e2e_counter_period_is_timezone_anchored_and_replay_deterministic() {
     );
     let _ = fs::remove_dir_all(&dir);
 }
+
+/// D12 product gap, end to end: a failure the KERNEL settles now leaves a
+/// diagnostic naming its own kind. `fail_run` forwarded `None` here, so the
+/// `diagnostics` table held nothing for a file, coordination, queue, notify,
+/// exec, deadline, DO-placement or custody failure -- the effect was `failed`
+/// and the operator plane could read only that, never why.
+///
+/// Asserted through `list_diagnostics` rather than through the trace, because
+/// the durable row is the thing that was missing; the trace projection of it is
+/// covered by `renders_provider_diagnostic_trace_json`.
+#[test]
+fn e2e_a_kernel_settled_failure_records_a_diagnostic_naming_its_kind() {
+    let source = include_str!("../../../examples/ralph.whip");
+    let (mut kernel, instance_id) = kernel_from_source("Ralph", source);
+    commit_single_effect(
+        &mut kernel,
+        &instance_id,
+        effect("tell", "agent.tell", r#"{"prompt":"go"}"#),
+        "begin",
+    );
+    kernel
+        .start_run(RunStart {
+            instance_id: &instance_id,
+            effect_id: "tell",
+            run_id: "run-tell-1",
+            provider: "files",
+            worker_id: "worker-1",
+            lease_id: "lease-tell-1",
+            lease_expires_at: "2030-01-01T00:00:00Z",
+            metadata_json: "{}",
+        })
+        .expect("run starts");
+    kernel
+        .fail_run(EffectCompletion {
+            instance_id: &instance_id,
+            effect_id: "tell",
+            run_id: "run-tell-1",
+            provider: "files",
+            worker_id: "worker-1",
+            status: "failed",
+            exit_code: None,
+            summary: Some("read of `notes.md` failed"),
+            // The shape every settling site writes now.
+            metadata_json: r#"{"failure":{"error_kind":"file_effect_failed","message":"read of `notes.md` failed"}}"#,
+            idempotency_key: Some("fail-run-tell-1"),
+        })
+        .expect("run fails");
+
+    let store = kernel.into_store();
+    let diagnostics = store
+        .list_diagnostics(Some(&instance_id))
+        .expect("diagnostics readable");
+    let recorded: Vec<&str> = diagnostics
+        .iter()
+        .filter_map(|diagnostic| diagnostic.code.as_deref())
+        .collect();
+    assert!(
+        recorded.contains(&"file_effect_failed"),
+        "the failure recorded no diagnostic carrying its kind: {recorded:?}"
+    );
+
+    // And it is attributed to the effect that failed, not to a bystander -- the
+    // `TerminalDiagnosticNamesItsRunEffect` half of the same obligation.
+    let diagnostic = diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.code.as_deref() == Some("file_effect_failed"))
+        .expect("the diagnostic just asserted");
+    assert_eq!(diagnostic.subject_type.as_deref(), Some("effect"));
+    assert_eq!(diagnostic.subject_id.as_deref(), Some("tell"));
+}

@@ -372,14 +372,18 @@ pub fn settle_exec_http_result<S: RuntimeStore>(
             Ok(terminal)
         }
         Err((detail, reason)) => {
+            // Both arms name the same failure: the exec boundary was crossed and
+            // the far side did not succeed. The detail arm carries the process's
+            // own output as well, which is evidence, not a different kind.
+            let failure = json!({"error_kind": "exec_failed", "message": reason});
             let metadata = match &detail {
                 Some((exit_code, stdout, stderr)) => json!({
-                    "failure": {"message": reason},
+                    "failure": failure,
                     "exit_code": exit_code,
                     "stdout": stdout,
                     "stderr": stderr,
                 }),
-                None => json!({"failure": {"message": reason}}),
+                None => json!({"failure": failure}),
             };
             let terminal = kernel.fail_run(EffectCompletion {
                 instance_id: ctx.instance_id,
