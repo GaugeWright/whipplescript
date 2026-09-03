@@ -189,6 +189,12 @@ jobs:
     # race the queue exists to close.
     if: ${{ github.repository != 'GaugeWright/whipplescript' }}
     runs-on: ubuntu-latest
+    # The queue fast-path below reads the pull request's head and its check
+    # verdict; everything else in this job only reads the tree.
+    permissions:
+      contents: read
+      checks: read
+      pull-requests: read
     # The observed ceiling is 41 minutes on a twelve-site sweep; 45 left four
     # minutes of headroom, and a slow sweep read as a timeout would eject a
     # queue entry that deserved an answer.
@@ -203,8 +209,48 @@ jobs:
       - name: Install Rust
         run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      # On a pull request the sweep diffs against the merge base with the base
+      # branch. On the merge queue's ref the right base is HEAD^1, not
+      # origin/main: the queue (method SQUASH) builds each entry as ONE
+      # single-parent squashed commit on top of main plus the entries ahead,
+      # so an origin/main diff re-sweeps the entries ahead too — their sites
+      # spend the twelve-site cap in diff order before this entry's own, and
+      # each costs a crate rebuild their own entries already paid for. HEAD^1
+      # scopes the question to what this entry adds to the true base, which is
+      # the question the queue run exists to ask.
+      #
+      # And when that question was already answered: an entry whose tree is
+      # IDENTICAL to the pull request's head, where this same check already
+      # passed, would run the same mutations against the same code — same
+      # tree, and a scope the pull-request run's scope contains. Forwarding
+      # that verdict is a proof, not a shortcut, so the run says whose verdict
+      # it forwards; any doubt — trees differ, the head moved, the check not
+      # green, the ref unparseable — falls through to the full sweep. The
+      # forwarded verdict carries the pull-request run's own declared
+      # cap-skips; this path never narrows what that run said.
       - name: Sweep the refusals this change touched
-        run: scripts/check-new-refusals.sh "origin/${{ github.base_ref || 'main' }}"
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MG_HEAD_REF: ${{ github.event.merge_group.head_ref }}
+        run: |
+          if [ "${{ github.event_name }}" != "merge_group" ]; then
+            exec scripts/check-new-refusals.sh "origin/${{ github.base_ref || 'main' }}"
+          fi
+          prnum="$(sed -nE 's|.*/pr-([0-9]+)-.*|\1|p' <<< "$MG_HEAD_REF")"
+          if [ -n "$prnum" ]; then
+            pr_head="$(gh api "repos/$GITHUB_REPOSITORY/pulls/$prnum" --jq .head.sha 2>/dev/null || true)"
+            pr_tree="$(gh api "repos/$GITHUB_REPOSITORY/commits/$pr_head" --jq .commit.tree.sha 2>/dev/null || true)"
+            if [ -n "$pr_tree" ] && [ "$pr_tree" = "$(git rev-parse 'HEAD^{tree}')" ]; then
+              verdict="$(gh api "repos/$GITHUB_REPOSITORY/commits/$pr_head/check-runs?check_name=new-refusals" \
+                --jq '[.check_runs[] | select(.name=="new-refusals")] | sort_by(.completed_at) | last | .conclusion // empty' 2>/dev/null || true)"
+              if [ "$verdict" = "success" ]; then
+                echo "queue tree is identical to pull request #$prnum head $pr_head, whose sweep passed;"
+                echo "forwarding that verdict — same tree, contained scope, same answer."
+                exit 0
+              fi
+            fi
+          fi
+          exec scripts/check-new-refusals.sh HEAD^1
 
   windows-compiles:
     runs-on: windows-latest
