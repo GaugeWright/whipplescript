@@ -9635,6 +9635,113 @@ rule sneak
     }
 }
 
+/// DR-0095: one name, two shapes, and a provider filling one of them.
+///
+/// `when <tracker> has ready issue as issue` binds `WorkItem` — and types it
+/// through the schema index, where a hand-written `class WorkItem` has replaced
+/// the builtin. The rule then checks against the author's fields while the
+/// tracker projects its own, so a field that never arrives compiles.
+#[test]
+fn a_class_named_after_a_schema_a_provider_fills_is_refused() {
+    let source = r#"
+@service
+workflow Hijack
+use std.tracker
+
+tracker backlog { provider builtin }
+
+class WorkItem {
+  nonsense string
+}
+
+rule r
+  when backlog has ready issue as issue
+=> {
+  finish issue { summary "{{ issue.nonsense }}" }
+}
+"#;
+    let compiled = compile_program(source);
+    assert!(
+        compiled.diagnostics.iter().any(|d| {
+            d.code.as_str() == "construct.reserved_name"
+                && d.message.contains(
+                    "reads `WorkItem` from a provider, and this program declares a class of that name",
+                )
+        }),
+        "{:?}",
+        compiled
+            .diagnostics
+            .iter()
+            .map(|d| &d.message)
+            .collect::<Vec<_>>()
+    );
+
+    // Only the COLLISION is refused, not the name. With no tracker there is no
+    // provider filling `WorkItem`, so the class is the author's own type — six
+    // programs in this repository are exactly that.
+    let alone = compile_program(
+        r#"
+workflow Alone
+
+output result Done
+class Done { id string }
+
+class WorkItem {
+  nonsense string
+}
+
+rule r
+  when WorkItem as w
+=> {
+  complete result { id w.nonsense }
+}
+"#,
+    );
+    assert_eq!(
+        alone.diagnostics,
+        Vec::new(),
+        "a `WorkItem` no provider fills is an ordinary class"
+    );
+}
+
+/// The guard that the refusal above needs and did not have when it was first
+/// written: it fired on every rule whose `when` names its class indirectly.
+///
+/// `when fact Ghost as g` opens with `fact`, not with `Ghost`, so the schema is
+/// implied exactly as a tracker's is — but `Ghost` is a class only this program
+/// writes, and one writer cannot disagree with itself. Only a schema the
+/// PLATFORM owns can be filled by something else.
+#[test]
+fn a_sugar_bound_user_class_is_not_a_provider_collision() {
+    let compiled = compile_program(
+        r#"
+workflow SugarBound
+
+output result Done
+class Done { id string }
+class Ghost { id string }
+
+rule r
+  when fact Ghost as g
+=> {
+  complete result { id g.id }
+}
+"#,
+    );
+    assert!(
+        !compiled
+            .diagnostics
+            .iter()
+            .any(|d| d.code.as_str() == "construct.reserved_name"),
+        "{:?}",
+        compiled
+            .diagnostics
+            .iter()
+            .map(|d| &d.message)
+            .collect::<Vec<_>>()
+    );
+}
+
 #[test]
 fn allows_recording_user_writable_builtin_schema() {
     // Regression guard for the fix above: `WorkItem` is a builtin schema ref

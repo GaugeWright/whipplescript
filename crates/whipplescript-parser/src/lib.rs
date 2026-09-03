@@ -12907,6 +12907,7 @@ fn analyze_rule(
         &mut metadata.fact_consumes,
     );
     validate_recorded_schemas(rule, &body_ast.statements, semantic, diagnostics);
+    validate_observer_schema_not_redeclared(rule, semantic, diagnostics);
     validate_value_expressions(
         rule,
         &body_ast.statements,
@@ -21498,6 +21499,72 @@ fn collect_record_and_consume_facts(
 /// compiled clean while the same record on its own line was refused. A refusal a
 /// line break escapes is not a refusal.
 ///
+/// A rule that reads an observer schema through a PROVIDER's sugar, in a program
+/// that declares a class of that name (DR-0095).
+///
+/// `when <tracker> has ready issue as issue` binds `WorkItem`, and the binding is
+/// typed through the schema index — where a hand-written `class WorkItem` has
+/// replaced the builtin. The rule then type-checks against the author's fields
+/// while the provider projects its own, so `issue.nonsense` compiles and no such
+/// field ever arrives. The program is wrong in the one way a type system exists
+/// to prevent, and it compiled.
+///
+/// Only the COLLISION is refused, not the name. A class named `WorkItem` in a
+/// program with no tracker reads nothing from a provider and is the author's own
+/// type; six programs in this repository are exactly that, and they are
+/// untouched. What cannot stand is one name meaning two shapes in one program,
+/// with a provider filling one of them.
+///
+/// The bare form is not sugar: `when WorkItem as w` names the class the author
+/// declared and means it. The sugar forms are the ones where the schema is
+/// IMPLIED — the pattern opens with something else, a tracker or a phrase — and
+/// the author never wrote the name whose shape they are getting.
+fn validate_observer_schema_not_redeclared(
+    rule: &RuleDecl,
+    semantic: &SemanticContext,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    for when in &rule.whens {
+        let (pattern, _) = split_when_guard(&when.text);
+        let Some((_, schema)) = binding_from_when(&when.text) else {
+            continue;
+        };
+        // Only a schema the PLATFORM owns can be filled by something other
+        // than this program. A sugar form that binds an ordinary user class —
+        // `when fact Ghost as g` — names a class only the program writes, so
+        // there is no second shape to disagree with and nothing to refuse.
+        // Without this the check fired on every such rule.
+        if !is_builtin_schema_ref(&schema) {
+            continue;
+        }
+        // The author wrote the schema name themselves: they get their class.
+        if pattern.split_whitespace().next() == Some(schema.as_str()) {
+            continue;
+        }
+        // `decl_span` is `None` for a builtin, so this is exactly "the program
+        // declared this name itself".
+        let Some(span) = semantic.schemas.decl_span(&schema) else {
+            continue;
+        };
+        diagnostics.push(Diagnostic {
+            code: diagnostic_code!("construct.reserved_name"),
+            severity: Severity::Error,
+            related: Vec::new(),
+            span,
+            message: format!(
+                "rule `{}` reads `{schema}` from a provider, and this program declares a class of that name",
+                rule.name.name
+            ),
+            suggestion: Some(format!(
+                "the provider fills `{schema}` with its own fields, so the two shapes cannot both be `{schema}`: rename the declared class"
+            )),
+            // Empty is the honest default: `attach_fixits` is the one place that
+            // fills this, from a diagnostic it has proved against the source.
+            fixits: Vec::new(),
+        });
+    }
+}
+
 /// The span is the record statement's own, which is better than the whole-body
 /// span the scanner could offer.
 fn validate_recorded_schemas(
