@@ -1,0 +1,45 @@
+workflow Housekeeping
+
+// `lint.noop_rule`, from the lint list in `docs/api-reference.md`: a rule whose
+// body is empty fires and supplies nothing. The compiler ACCEPTS this — an
+// empty body is well formed, and `whip check` exits 0 — so the finding is
+// advisory and reaches the program only through `whip lint`.
+//
+// `sweep` is the noop. `settle` is here so the workflow still terminates:
+// without it the liveness refusal fires first, `check` refuses, and a refused
+// program never reaches a lint rule at all.
+
+output result Summary
+
+class Summary {
+  note string
+}
+
+class Chore {
+  id string
+}
+
+class Swept {
+  id string
+}
+
+table chores as Chore [
+  { id "c-1" }
+]
+
+rule sweep
+  when Chore as chore
+=> {
+}
+
+rule settle
+  when Chore as chore
+=> {
+  done chore -> record Swept {
+    id chore.id
+  }
+
+  complete result {
+    note "swept"
+  }
+}
