@@ -10,8 +10,9 @@ on:
         type: boolean
   # NO `paths-ignore`, deliberately, and re-adding one has bitten twice over.
   #
-  # `green-bar` and `hosted-runtime-contracts` are required status checks on
-  # `main`. A required check that never runs is not pending — it is missing —
+  # `green-bar`, `hosted-runtime-contracts`, and `new-refusals` are required
+  # status checks on `main` (`windows-compiles` too, from this file).
+  # A required check that never runs is not pending — it is missing —
   # so any pull request whose files all matched an ignore list reported BLOCKED
   # and could not merge at all. That stayed hidden while every documentation
   # change happened to touch `mkdocs.yml` or an asset outside the list, and
@@ -28,7 +29,7 @@ on:
   # The gate is cheap here: `-src`'s minutes come out of the Enterprise plan's
   # included allowance, and the mirror runs on GitHub-hosted runners for free
   # as a public repository. If a future filter is still wanted,
-  # it has to leave the two required contexts reported on every pull request, or
+  # it has to leave the required contexts reported on every pull request, or
   # the deadlock comes back silently.
   push:
     branches: [main]
@@ -170,13 +171,22 @@ jobs:
     # history, so a merge base there names the whole projection rather than a
     # change, and the sweep would try to pin every refusal in the repository.
     #
-    # Not on the merge queue's ref either: the sweep already ran on the pull
-    # request, it is not a required check so the queue never waits on it, and
-    # at up to forty-five minutes it is the one job whose duplication would
-    # dominate the queue's CI cost.
-    if: ${{ github.repository != 'GaugeWright/whipplescript' && github.event_name != 'merge_group' }}
+    # REQUIRED, and therefore on the merge queue's ref too. It went red
+    # nineteen times in its first four days and every merged branch fixed the
+    # finding before landing — a record held purely by each author choosing to
+    # wait for an advisory check, which the queue quietly stopped showing them:
+    # the queue consults only required checks, and on refusal-touching changes
+    # this is the slowest check running, so "enqueue while the sweep still
+    # runs" would merge an unpinned refusal without anyone declining anything.
+    # The queue-ref re-run is not duplication: the sweep's scope is the diff
+    # against the merge base, and the base moving underneath is exactly the
+    # race the queue exists to close.
+    if: ${{ github.repository != 'GaugeWright/whipplescript' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    # The observed ceiling is 41 minutes on a twelve-site sweep; 45 left four
+    # minutes of headroom, and a slow sweep read as a timeout would eject a
+    # queue entry that deserved an answer.
+    timeout-minutes: 55
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
