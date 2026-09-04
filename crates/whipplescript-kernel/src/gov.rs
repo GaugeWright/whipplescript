@@ -1083,6 +1083,57 @@ grant file_store outbox -> file:/srv/outbox public\n";
             .any(|record| record.attribution.run_id == "governance-verify"));
     }
 
+    /// DR-0053's three custody arms survive signing.
+    ///
+    /// `debug_assert_lossless` is a TOTAL property and it was correct the whole
+    /// time -- two lines of DSL trip it. Nothing drove it with these fields, so
+    /// `sign_prefixes`, `confined_egress` and `custodian_role` parsed from the
+    /// DSL, behaved correctly in memory, and vanished at canonicalization: no
+    /// SIGNED envelope could carry a custodian role, a sign-prefix ceiling or a
+    /// confined-egress set, and `admits_sign` and `reader_sink`'s custodian
+    /// augmentation passed vacuously on every one of them.
+    ///
+    /// Driving the property is the test. Each case canonicalizes a policy
+    /// naming the field; the round-trip assertion inside `canonicalize` is what
+    /// fails when the emitter or either reader drops it, and the assertion on
+    /// the document is what catches the emitter alone going quiet.
+    #[test]
+    fn the_custody_arms_survive_canonicalization() {
+        for (arm, dsl, needle) in [
+            (
+                "custodian_role",
+                "authority acme\ncustodian Vault\n",
+                "\"custodian_role\"",
+            ),
+            (
+                "sign_prefixes",
+                "authority acme\n\
+                 grant credential k -> credential:acme/k readable by Operator\n\
+                 grant sign k for prefix jwt-rs256-header\n",
+                "\"sign_prefixes\"",
+            ),
+        ] {
+            let canonical =
+                canonicalize(dsl).unwrap_or_else(|error| panic!("{arm} canonicalizes: {error}"));
+            assert!(
+                canonical.contains(needle),
+                "{arm} is not in the signed document: {canonical}"
+            );
+            // The signature covers the canonical form, so the arm has to come
+            // back out of it on the JSON path -- the path every signed envelope
+            // is reloaded through.
+            let reparsed = Envelope::from_json(&canonical)
+                .unwrap_or_else(|error| panic!("{arm} reparses: {error}"));
+            let original = Envelope::from_dsl(dsl).expect("the policy parses");
+            // `Envelope` is deliberately not `Debug` (it carries policy
+            // material), so this compares rather than prints.
+            assert!(
+                reparsed == original,
+                "{arm} did not survive the round trip through the signed form"
+            );
+        }
+    }
+
     #[test]
     fn tampered_envelope_fails_verification() {
         let signed =

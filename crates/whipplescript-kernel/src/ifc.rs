@@ -412,9 +412,52 @@ impl Envelope {
         let mut unwrap_grants: Vec<UnwrapGrant> = Vec::new();
         let mut request_scopes: BTreeMap<String, Vec<String>> = BTreeMap::new();
         let mut deliver_scopes: BTreeMap<String, Vec<String>> = BTreeMap::new();
-        let sign_prefixes: BTreeMap<String, Vec<Vec<u8>>> = BTreeMap::new();
-        let confined_egress: BTreeSet<String> = BTreeSet::new();
-        let custodian_role: Option<String> = None;
+        // DR-0053's custody arms. These read back on THIS path too, not just
+        // `from_dsl`: a signed envelope is JSON, so a field only the DSL parser
+        // knows is a field no signed envelope can carry, and the check resting
+        // on it passes vacuously once the document is signed and reloaded.
+        let sign_prefixes: BTreeMap<String, Vec<Vec<u8>>> = value
+            .get("sign_prefixes")
+            .and_then(serde_json::Value::as_object)
+            .map(|map| {
+                map.iter()
+                    .map(|(credential, entries)| {
+                        let prefixes = entries
+                            .as_array()
+                            .map(|list| {
+                                list.iter()
+                                    .filter_map(serde_json::Value::as_str)
+                                    // Parsed rather than hex-decoded inline so
+                                    // the named form stays readable here too:
+                                    // this path also reads envelopes a human
+                                    // wrote by hand, not only ones we emitted.
+                                    .filter_map(|entry| {
+                                        whipplescript_custody::sign_prefix::parse(entry).ok()
+                                    })
+                                    .collect::<Vec<_>>()
+                            })
+                            .unwrap_or_default();
+                        (credential.clone(), prefixes)
+                    })
+                    .filter(|(_, prefixes): &(String, Vec<Vec<u8>>)| !prefixes.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let confined_egress: BTreeSet<String> = value
+            .get("confined_egress")
+            .and_then(serde_json::Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let custodian_role: Option<String> = value
+            .get("custodian_role")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned);
         let mut integrity = BTreeMap::new();
         let mut endorse = Vec::new();
         let mut principals = BTreeSet::new();
@@ -1578,6 +1621,48 @@ impl Envelope {
                 self.deliver_scopes
                     .iter()
                     .map(|(credential, entries)| (credential.clone(), serde_json::json!(entries)))
+                    .collect(),
+            );
+        }
+        // DR-0053's custody arms, covered on exactly the rule the arms above
+        // are: the signature covers the canonical form, so a field the emitter
+        // drops is a field the signed document does not carry. Each of these
+        // parsed correctly, behaved correctly in memory, and then vanished at
+        // signing -- so `admits_sign` and `reader_sink`'s custodian
+        // augmentation passed VACUOUSLY on every signed envelope, which is the
+        // failure mode `debug_assert_lossless` exists to refuse. Emitted only
+        // when present, so an envelope naming none keeps its existing hash.
+        if let Some(role) = &self.custodian_role {
+            canonical["custodian_role"] = serde_json::Value::String(role.clone());
+        }
+        if !self.confined_egress.is_empty() {
+            canonical["confined_egress"] =
+                serde_json::json!(self.confined_egress.iter().cloned().collect::<Vec<_>>());
+        }
+        if !self.sign_prefixes.is_empty() {
+            // `hex:` rather than the named form the DSL also accepts: the
+            // envelope stores BYTES, a name resolves to bytes at parse, and
+            // `sign_prefix::parse` reads `hex:` back to the same bytes. So the
+            // canonical form round-trips exactly and does not depend on the
+            // name table staying fixed.
+            canonical["sign_prefixes"] = serde_json::Value::Object(
+                self.sign_prefixes
+                    .iter()
+                    .map(|(credential, prefixes)| {
+                        let rendered: Vec<serde_json::Value> = prefixes
+                            .iter()
+                            .map(|bytes| {
+                                let mut hex = String::with_capacity(2 * bytes.len() + 4);
+                                hex.push_str("hex:");
+                                for byte in bytes {
+                                    use std::fmt::Write as _;
+                                    let _ = write!(hex, "{byte:02x}");
+                                }
+                                serde_json::Value::String(hex)
+                            })
+                            .collect();
+                        (credential.clone(), serde_json::Value::Array(rendered))
+                    })
                     .collect(),
             );
         }
