@@ -1,0 +1,106 @@
+//! Run at the published pre-repair source; never regenerate with the successor.
+use std::path::Path;
+use whipplescript_kernel::{
+    coerce::{CoerceRequest, FakeCoerceClient},
+    rule_pass::step_instance_generic,
+    CoerceExecution, ProgramVersionInput, RuntimeKernel,
+};
+use whipplescript_parser::compile_program;
+use whipplescript_store::{native_stores::NativeStores, RuntimeStore};
+
+const SOURCE: &str = r#"use std.coercion
+@service
+workflow LegacyAssertions
+signal item.arrived { item string }
+class Decision { disposition "keep" | "flag" }
+class Choice { disposition "keep" | "flag" }
+class Settled { item string stage string }
+coerce choose(text string) -> Choice {
+  prompt """markdown
+Return keep. {{ text }}
+{{ ctx.output_format }}
+"""
+}
+rule decide
+  when item.arrived as item
+=> {
+  record Decision { disposition "keep" }
+  record Settled { item item.item stage "top" }
+  coerce choose(item.item) as first
+  after first succeeds as result {
+    record Decision { disposition "keep" }
+    record Settled { item item.item stage "after" }
+    coerce choose(item.item) as second
+    after second succeeds as result {
+      record Decision { disposition "keep" }
+      record Settled { item item.item stage "nested" }
+    }
+  }
+}
+"#;
+
+fn save(path: &Path, value: &[u8]) {
+    use std::io::Write;
+    std::fs::OpenOptions::new().write(true).create_new(true).open(path)
+        .expect("new fixture output").write_all(value).expect("write fixture");
+}
+
+fn main() {
+    let root = std::path::PathBuf::from(std::env::args_os().nth(1).expect("new output directory"));
+    std::fs::create_dir(&root).expect("new fixture directory");
+    let compiled = compile_program(SOURCE);
+    let ir = compiled.ir.unwrap_or_else(|| panic!("{:?}", compiled.diagnostics));
+    let mut kernel = RuntimeKernel::new(NativeStores::open(
+        root.join("runtime.sqlite"), root.join("coord.sqlite"), root.join("items.sqlite"),
+    ).expect("native stores"));
+    kernel.store_mut().register_package_manifest(include_str!("../../../std/manifests/coercion.json"))
+        .expect("coercion manifest");
+    let source_hash = kernel.store_mut().put_content(SOURCE).expect("retain source");
+    let snapshot = ir.to_snapshot();
+    let ir_hash = kernel.store_mut().put_content(&snapshot).expect("retain IR");
+    let version = kernel.create_program_version_for_program(ProgramVersionInput {
+        program_name: &ir.workflow, source_hash: &source_hash,
+        ir_hash: &ir_hash, compiler_version: "legacy-fixture",
+        ir_snapshot: Some(&snapshot),
+    }, &ir).expect("version");
+    let instance = kernel.create_instance(&version, "{}").expect("instance");
+    kernel.ingest_external_event(&instance, "external.started", "{}", Some("start")).expect("start");
+    kernel.derive_fact(&instance, "item.arrived", "first", r#"{"item":"first"}"#, None, Some("first"))
+        .expect("old firing");
+    let mut executed = 0;
+    for _ in 0..6 {
+        step_instance_generic(&mut kernel, &instance, &ir, None, None).expect("step");
+        let effects = kernel.claimable_effects(&instance).expect("claimable effects");
+        if effects.is_empty() { break; }
+        for effect in effects {
+            let request = CoerceRequest::with_evidence_hashes(
+                "choose".into(), "{\"text\":\"fixture\"}".into(), "Choice".into(),
+            );
+            kernel.run_coerce(CoerceExecution {
+                instance_id: &instance, effect_id: &effect.effect_id,
+                run_id: &format!("run:{}", effect.effect_id), provider: "fixture", worker_id: "test",
+                lease_id: &format!("lease:{}", effect.effect_id),
+                lease_expires_at: "2030-01-01T00:00:00Z", request: &request, model: None,
+            }, &FakeCoerceClient::succeeds(r#"{"disposition":"keep"}"#)).expect("complete effect");
+            executed += 1;
+        }
+    }
+    assert_eq!(executed, 2, "complete both old continuation effects");
+    assert_eq!(step_instance_generic(&mut kernel, &instance, &ir, None, None).expect("stable replay").committed_rules, 0);
+    let events = kernel.store().list_events(&instance).expect("old events");
+    assert!(!events.iter().any(|event| event.event_type == "instance.created"));
+    save(&root.join("source.whip"), SOURCE.as_bytes());
+    let event_views = events.iter().map(|event| serde_json::json!({
+        "event_id": event.event_id, "sequence": event.sequence,
+        "event_type": event.event_type, "payload_json": event.payload_json,
+        "source": event.source, "occurred_at": event.occurred_at,
+    })).collect::<Vec<_>>();
+    save(&root.join("events.json"), &serde_json::to_vec_pretty(&event_views).expect("serialize events"));
+    save(&root.join("provenance.json"), &serde_json::to_vec_pretty(&serde_json::json!({
+        "source_revision": "44302912257d49dbf033fe2543400c640f6fa71b",
+        "instance_id": instance, "version_id": version.version_id,
+        "completed_effects": executed,
+    })).expect("serialize provenance"));
+    drop(kernel);
+    println!("Old assertion fixture written to {}", root.display());
+}

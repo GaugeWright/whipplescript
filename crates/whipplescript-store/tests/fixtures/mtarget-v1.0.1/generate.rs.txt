@@ -1,0 +1,84 @@
+//! Evidence generator run only at the exact currently-published source revision.
+//! Uses real native APIs; no synthetic SQL reconstruction of old receipts.
+use std::path::Path;
+use whipplescript_store::vcs::{BoundaryPromotionOutcome, NativeWorkspaceVcs};
+use whipplescript_store::workstreams::{
+    fork_at_cut_and_admit, BoundaryReservation, ExactForkDestination, WorkstreamStore,
+    Workstreams,
+};
+
+fn save(path: &Path, value: &impl serde::Serialize) {
+    use std::io::Write;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .unwrap();
+    file.write_all(&serde_json::to_vec_pretty(value).unwrap()).unwrap();
+}
+
+fn stores(root: &Path) -> (WorkstreamStore, NativeWorkspaceVcs) {
+    std::fs::create_dir(root).unwrap();
+    let streams = WorkstreamStore::open(root.join("streams.sqlite")).unwrap();
+    let vcs = NativeWorkspaceVcs::open(root.join("branches.sqlite"), root.join("content.sqlite")).unwrap();
+    (streams, vcs)
+}
+
+fn main() {
+    let root = std::path::PathBuf::from(std::env::args_os().nth(1).expect("new output directory"));
+    std::fs::create_dir(&root).unwrap();
+    let fork_root = root.join("fork");
+    let (mut streams, mut vcs) = stores(&fork_root);
+    vcs.init("t0").unwrap();
+    vcs.create_branch("chat", None, "main", "t1").unwrap();
+    vcs.bind_instance("parent", "chat", "t1").unwrap();
+    vcs.write("chat", "state.txt", Some("point"), "chat-1", "t2").unwrap();
+    vcs.write("chat", "state.txt", Some("new tip"), "chat-2", "t3").unwrap();
+    vcs.create_branch("line", None, "main", "t3").unwrap();
+    streams.create_stream("ws", None, "line", "t4", None).unwrap();
+    streams.join("chat", "ws", "t4").unwrap();
+    save(&fork_root.join("source-home.json"), &streams.home_receipt("chat").unwrap());
+    let fork = fork_at_cut_and_admit(&mut streams, &mut vcs, "parent", "chat-1", "child", "chat-child", None,
+        ExactForkDestination::Workstream("ws"), "t5").unwrap().receipt();
+    assert_eq!(fork.outcome, "forked");
+    save(&fork_root.join("fork.json"), &fork);
+    drop(streams);
+    drop(vcs);
+
+    for mode in ["archived", "landed"] {
+        let case = root.join(mode);
+        let (mut streams, mut vcs) = stores(&case);
+        vcs.init("t0").unwrap();
+        vcs.write("main", "base", Some("base"), "main-1", "t1").unwrap();
+        vcs.create_branch("line", None, "main", "t1").unwrap();
+        vcs.write("line", "work", Some("work"), "line-1", "t2").unwrap();
+        streams.create_stream("ws", None, "line", "t1", None).unwrap();
+        streams.reserve_boundary("ws", BoundaryReservation {
+            reservation_id: "reservation", expected_line_cut: "line-1", expected_main_cut: "main-1",
+            proposed_main_cut: "main-2", at: "t2",
+        }).unwrap();
+        vcs.reserve_branch_head("line", "reservation", "t2").unwrap();
+        let promoted = vcs.promote_line_exact("line", "reservation", Some("line-1"), Some("main-1"), "main-2", "t3").unwrap();
+        let BoundaryPromotionOutcome::Promoted { ref_position, ref_receipt_handle, .. } = promoted else {
+            panic!("unexpected promotion: {promoted:?}");
+        };
+        save(&case.join("accepted-ref.json"), &serde_json::json!({ "ref_position": ref_position, "ref_receipt_handle": ref_receipt_handle }));
+        if mode == "archived" {
+            streams.record_ref_advanced("ws", "reservation", ref_position, &ref_receipt_handle, "t3").unwrap();
+            streams.close_promoted("ws", "reservation", "t4").unwrap();
+            vcs.release_branch_head_reservation("line", "reservation").unwrap();
+        }
+        save(&case.join("boundary.json"), &streams.get_stream("ws").unwrap().unwrap().boundary_receipt("workspace").unwrap());
+        // Closing the actual databases flushes the WAL; the landed case stops
+        // before any topology receipt write, exactly like a process interruption.
+        drop(streams);
+        drop(vcs);
+    }
+    save(&root.join("provenance.json"), &serde_json::json!({
+        "source_revision": "44302912257d49dbf033fe2543400c640f6fa71b",
+        "crate_version": env!("CARGO_PKG_VERSION"),
+        "generator": "crates/whipplescript-store/examples/mtarget_legacy_receipts.rs",
+        "cases": ["fork", "archived", "landed"]
+    }));
+    println!("Legacy evidence written to {}", root.display());
+}

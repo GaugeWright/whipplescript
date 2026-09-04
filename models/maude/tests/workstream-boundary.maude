@@ -87,3 +87,36 @@ search [1] in WHIPPLESCRIPT-WORKSTREAM-BOUNDARY :
 search [1] in WHIPPLESCRIPT-WORKSTREAM-BOUNDARY :
   useInheritedReceipt(b1, t1) inheritedReceipt(b1, t1, r1)
   =>* C:Cfg badInheritedReceiptGrantedAuthority(b1) .
+
+--- A crash after cancellation must not leave an unowned line lock.
+search [1] in WHIPPLESCRIPT-WORKSTREAM-BOUNDARY :
+  naiveForgetCleanup(s1, r1) stream(s1, reserved) boundaryOwner(s1, r1)
+  reservation(s1, c0, c1, c2) lineLock(s1, r1) mainAt(c1)
+  =>* stream(s1, active) lineLock(s1, r1) C:Cfg
+  such that hasCleanup(C:Cfg, s1, r1) == false .
+search [1] in WHIPPLESCRIPT-WORKSTREAM-BOUNDARY :
+  beginCleanup(s1, r1) stream(s1, reserved) boundaryOwner(s1, r1)
+  reservation(s1, c0, c1, c2) lineLock(s1, r1) mainAt(c1)
+  =>* stream(s1, active) lineLock(s1, r1) C:Cfg
+  such that hasCleanup(C:Cfg, s1, r1) == false .
+
+--- An old retry cannot unlock a newer cancellation's token.
+search [1] in WHIPPLESCRIPT-WORKSTREAM-BOUNDARY :
+  naiveUnlockAny(s1, r1) stream(s1, active) pendingCleanup(s1, r2) lineLock(s1, r2)
+  =>* C:Cfg lineUnlocked(s1) .
+search [1] in WHIPPLESCRIPT-WORKSTREAM-BOUNDARY :
+  unlockCleanup(s1, r1) stream(s1, active) pendingCleanup(s1, r2) lineLock(s1, r2)
+  =>* C:Cfg lineUnlocked(s1) .
+
+--- Progress pair (S,N): each durable intermediate state can resume, whereas
+--- forgetting the coordinate strands the subsequent cleanup commands.
+search [1] in WHIPPLESCRIPT-WORKSTREAM-BOUNDARY :
+  beginCleanup(s1, r1) unlockCleanup(s1, r1) acknowledgeCleanup(s1, r1)
+  stream(s1, reserved) boundaryOwner(s1, r1) reservation(s1, c0, c1, c2)
+  lineLock(s1, r1) mainAt(c1)
+  =>* C:Cfg cleanupAcknowledged(s1, r1) mainAt(c1) .
+search [1] in WHIPPLESCRIPT-WORKSTREAM-BOUNDARY :
+  naiveForgetCleanup(s1, r1) unlockCleanup(s1, r1) acknowledgeCleanup(s1, r1)
+  stream(s1, reserved) boundaryOwner(s1, r1) reservation(s1, c0, c1, c2)
+  lineLock(s1, r1) mainAt(c1)
+  =>* C:Cfg cleanupAcknowledged(s1, r1) mainAt(c1) .

@@ -13,9 +13,10 @@
 //! posture).
 
 use whipplescript_store::workstreams::{
-    branch_home_evidence_handle, ArchiveOutcome, BoundaryReservation, BranchHomeReceiptV1,
-    ClosePromotedOutcome, CreateStreamOutcome, JoinOutcome, RecordRefAdvancedOutcome,
-    ReleaseBoundaryOutcome, ReserveBoundaryOutcome, StreamStatus, WorkstreamRow, Workstreams,
+    branch_home_evidence_handle, AcknowledgeBoundaryReleaseOutcome, ArchiveOutcome,
+    BoundaryReservation, BranchHomeReceiptV1, ClosePromotedOutcome, CreateStreamOutcome,
+    JoinOutcome, RecordRefAdvancedOutcome, ReleaseBoundaryOutcome, ReserveBoundaryOutcome,
+    StreamStatus, WorkstreamRow, Workstreams,
 };
 use whipplescript_store::{StoreError, StoreResult};
 
@@ -436,9 +437,14 @@ impl<S: DoSql> Workstreams for DoWorkstreams<S> {
 
     fn archive_stream(&mut self, stream_id: &str, at: &str) -> StoreResult<ArchiveOutcome> {
         let Some(stream) = self.row_by_id(stream_id)? else {
+            // MUTATION-SUCCESS: ArchiveOutcome::AlreadyArchived
             return Ok(ArchiveOutcome::StreamMissing);
         };
         match stream.status {
+            StreamStatus::Active if stream.reservation_id.is_some() => {
+                // MUTATION-SUCCESS: ArchiveOutcome::AlreadyArchived
+                return Ok(ArchiveOutcome::BoundaryReserved);
+            }
             StreamStatus::Active => {}
             StreamStatus::BoundaryReserved => return Ok(ArchiveOutcome::BoundaryReserved),
             StreamStatus::RefAdvanced => return Ok(ArchiveOutcome::RefAlreadyAdvanced),
@@ -472,23 +478,30 @@ impl<S: DoSql> Workstreams for DoWorkstreams<S> {
         reservation: BoundaryReservation<'_>,
     ) -> StoreResult<ReserveBoundaryOutcome> {
         let Some(stream) = self.row_by_id(stream_id)? else {
+            // MUTATION-SUCCESS: ReserveBoundaryOutcome::StreamArchived
             return Ok(ReserveBoundaryOutcome::StreamMissing);
         };
         match stream.status {
             StreamStatus::Archived => return Ok(ReserveBoundaryOutcome::StreamArchived),
             StreamStatus::BoundaryReserved | StreamStatus::RefAdvanced => {
-                if stream.reservation_id.as_deref() == Some(reservation.reservation_id)
-                    && stream.expected_line_cut.as_deref() == Some(reservation.expected_line_cut)
-                    && stream.expected_main_cut.as_deref() == Some(reservation.expected_main_cut)
-                    && stream.proposed_main_cut.as_deref() == Some(reservation.proposed_main_cut)
+                if stream.reservation_id.as_deref() != Some(reservation.reservation_id)
+                    || stream.expected_line_cut.as_deref() != Some(reservation.expected_line_cut)
+                    || stream.expected_main_cut.as_deref() != Some(reservation.expected_main_cut)
+                    || stream.proposed_main_cut.as_deref() != Some(reservation.proposed_main_cut)
                 {
-                    return Ok(ReserveBoundaryOutcome::Existing(stream));
+                    return Ok(ReserveBoundaryOutcome::Busy {
+                        holder_reservation_id: stream.reservation_id.unwrap_or_default(),
+                    });
                 }
-                return Ok(ReserveBoundaryOutcome::Busy {
-                    holder_reservation_id: stream.reservation_id.unwrap_or_default(),
-                });
+                return Ok(ReserveBoundaryOutcome::Existing(stream));
             }
-            StreamStatus::Active => {}
+            StreamStatus::Active => {
+                if let Some(holder_reservation_id) = stream.reservation_id {
+                    return Ok(ReserveBoundaryOutcome::Busy {
+                        holder_reservation_id,
+                    });
+                }
+            }
         }
         self.sql
             .execute(
@@ -519,10 +532,24 @@ impl<S: DoSql> Workstreams for DoWorkstreams<S> {
         at: &str,
     ) -> StoreResult<ReleaseBoundaryOutcome> {
         let Some(stream) = self.row_by_id(stream_id)? else {
+            // MUTATION-SUCCESS: ReleaseBoundaryOutcome::AlreadyActive
             return Ok(ReleaseBoundaryOutcome::StreamMissing);
         };
         match stream.status {
-            StreamStatus::Active => return Ok(ReleaseBoundaryOutcome::AlreadyActive),
+            StreamStatus::Active => {
+                return Ok(
+                    if stream
+                        .reservation_id
+                        .as_deref()
+                        .is_none_or(|id| id == reservation_id)
+                    {
+                        ReleaseBoundaryOutcome::AlreadyActive
+                    } else {
+                        // MUTATION-SUCCESS: ReleaseBoundaryOutcome::AlreadyActive
+                        ReleaseBoundaryOutcome::ReservationMismatch
+                    },
+                );
+            }
             StreamStatus::Archived => return Ok(ReleaseBoundaryOutcome::StreamArchived),
             StreamStatus::RefAdvanced => return Ok(ReleaseBoundaryOutcome::RefAlreadyAdvanced),
             StreamStatus::BoundaryReserved => {}
@@ -532,7 +559,7 @@ impl<S: DoSql> Workstreams for DoWorkstreams<S> {
         }
         self.sql
             .execute(
-                "UPDATE workstreams SET status = 'active', reservation_id = NULL,
+                "UPDATE workstreams SET status = 'active',
                  expected_line_cut = NULL, expected_main_cut = NULL,
                  proposed_main_cut = NULL, ref_position = NULL,
                  ref_receipt_handle = NULL, updated_at = ?3
@@ -542,6 +569,35 @@ impl<S: DoSql> Workstreams for DoWorkstreams<S> {
             )
             .map_err(sql_err)?;
         Ok(ReleaseBoundaryOutcome::Released)
+    }
+
+    fn acknowledge_boundary_release(
+        &mut self,
+        stream_id: &str,
+        reservation_id: &str,
+        at: &str,
+    ) -> StoreResult<AcknowledgeBoundaryReleaseOutcome> {
+        let Some(stream) = self.row_by_id(stream_id)? else {
+            // MUTATION-SUCCESS: AcknowledgeBoundaryReleaseOutcome::Acknowledged
+            return Ok(AcknowledgeBoundaryReleaseOutcome::StreamMissing);
+        };
+        if stream.status != StreamStatus::Active {
+            return Ok(AcknowledgeBoundaryReleaseOutcome::NotReleased);
+        }
+        let Some(pending) = stream.reservation_id.as_deref() else {
+            return Ok(AcknowledgeBoundaryReleaseOutcome::AlreadyAcknowledged);
+        };
+        if pending != reservation_id {
+            return Ok(AcknowledgeBoundaryReleaseOutcome::ReservationMismatch);
+        }
+        self.sql
+            .execute(
+                "UPDATE workstreams SET reservation_id = NULL, updated_at = ?3
+             WHERE stream_id = ?1 AND status = 'active' AND reservation_id = ?2",
+                &[text(stream_id), text(reservation_id), text(at)],
+            )
+            .map_err(sql_err)?;
+        Ok(AcknowledgeBoundaryReleaseOutcome::Acknowledged)
     }
 
     fn record_ref_advanced(
@@ -924,6 +980,209 @@ mod tests {
         Rc::new(RusqliteDoSql::in_memory())
     }
 
+    #[test]
+    fn do_missing_stream_boundary_operations_return_typed_outcomes() {
+        let sql = sql();
+        let mut streams = DoWorkstreams::new(Rc::clone(&sql)).unwrap();
+
+        assert_eq!(
+            streams.archive_stream("missing", "t1").unwrap(),
+            ArchiveOutcome::StreamMissing
+        );
+        assert_eq!(
+            streams
+                .reserve_boundary(
+                    "missing",
+                    BoundaryReservation {
+                        reservation_id: "reservation",
+                        expected_line_cut: "line-1",
+                        expected_main_cut: "main-1",
+                        proposed_main_cut: "main-2",
+                        at: "t1",
+                    },
+                )
+                .unwrap(),
+            ReserveBoundaryOutcome::StreamMissing
+        );
+        assert_eq!(
+            streams
+                .release_boundary("missing", "reservation", "t1")
+                .unwrap(),
+            ReleaseBoundaryOutcome::StreamMissing
+        );
+    }
+
+    #[test]
+    fn do_cancellation_cleanup_retains_its_token_until_both_stores_finish() {
+        use crate::do_branches::{DoBranches, DoContentBlobs};
+        use whipplescript_kernel::effect_handlers::release_reserved_boundary_generic;
+        use whipplescript_store::vcs::WorkspaceVcs;
+        for fault in ["topology", "line", "acknowledgement", "foreign-lock"] {
+            let sql = sql();
+            let mut streams = DoWorkstreams::new(Rc::clone(&sql)).unwrap();
+            let mut vcs = WorkspaceVcs::from_parts(
+                DoBranches::new(Rc::clone(&sql)).unwrap(),
+                DoContentBlobs::new(Rc::clone(&sql)).unwrap(),
+            );
+            vcs.init("t0").unwrap();
+            vcs.create_branch("line", None, "main", "t0").unwrap();
+            streams
+                .create_stream("ws", None, "line", "t0", None)
+                .unwrap();
+            let reservation = |id| BoundaryReservation {
+                reservation_id: id,
+                expected_line_cut: "",
+                expected_main_cut: "",
+                proposed_main_cut: "proposed",
+                at: "t1",
+            };
+            streams
+                .reserve_boundary("ws", reservation("cancelled"))
+                .unwrap();
+            assert_eq!(
+                streams.release_boundary("ws", "stale", "t1").unwrap(),
+                ReleaseBoundaryOutcome::ReservationMismatch
+            );
+            let reserved = streams.get_stream("ws").unwrap().unwrap();
+            assert_eq!(reserved.status, StreamStatus::BoundaryReserved);
+            assert_eq!(reserved.reservation_id.as_deref(), Some("cancelled"));
+            assert_eq!(
+                streams
+                    .acknowledge_boundary_release("ws", "cancelled", "t1")
+                    .unwrap(),
+                AcknowledgeBoundaryReleaseOutcome::NotReleased
+            );
+            vcs.reserve_branch_head("line", "cancelled", "t1").unwrap();
+            let trigger = match fault {
+                "topology" => "CREATE TRIGGER fail_cleanup BEFORE UPDATE ON workstreams WHEN NEW.status = 'active' BEGIN SELECT RAISE(FAIL, 'topology'); END;",
+                "line" => "CREATE TRIGGER fail_cleanup BEFORE DELETE ON branch_head_reservations BEGIN SELECT RAISE(FAIL, 'line'); END;",
+                "acknowledgement" => "CREATE TRIGGER fail_cleanup BEFORE UPDATE ON workstreams WHEN NEW.status = 'active' AND NEW.reservation_id IS NULL BEGIN SELECT RAISE(FAIL, 'acknowledgement'); END;",
+                _ => "",
+            };
+            if fault == "foreign-lock" {
+                vcs.release_branch_head_reservation("line", "cancelled")
+                    .unwrap();
+                vcs.reserve_branch_head("line", "other", "t1").unwrap();
+            } else {
+                sql.execute(trigger, &[]).unwrap();
+            }
+            let error =
+                release_reserved_boundary_generic(&mut streams, &mut vcs, "ws", "cancelled", "t2")
+                    .unwrap_err();
+            assert!(error.contains("cleanup"), "{fault}: {error}");
+            let pending = streams.get_stream("ws").unwrap().unwrap();
+            assert_eq!(pending.reservation_id.as_deref(), Some("cancelled"));
+            assert_eq!(
+                pending.status,
+                if fault == "topology" {
+                    StreamStatus::BoundaryReserved
+                } else {
+                    StreamStatus::Active
+                }
+            );
+            assert_eq!(
+                vcs.branch_head_reservation("line").unwrap().as_deref(),
+                match fault {
+                    "acknowledgement" => None,
+                    "foreign-lock" => Some("other"),
+                    _ => Some("cancelled"),
+                }
+            );
+            assert!(matches!(
+                streams
+                    .reserve_boundary("ws", reservation("fresh"))
+                    .unwrap(),
+                ReserveBoundaryOutcome::Busy { .. }
+            ));
+            assert_eq!(
+                streams.archive_stream("ws", "t2").unwrap(),
+                ArchiveOutcome::BoundaryReserved
+            );
+            assert!(
+                release_reserved_boundary_generic(&mut streams, &mut vcs, "ws", "stale", "t2")
+                    .is_err()
+            );
+            if fault == "foreign-lock" {
+                assert_eq!(
+                    vcs.branch_head_reservation("line").unwrap().as_deref(),
+                    Some("other")
+                );
+                vcs.release_branch_head_reservation("line", "other")
+                    .unwrap();
+            } else {
+                sql.execute("DROP TRIGGER fail_cleanup", &[]).unwrap();
+            }
+            // Recreate the host adapters over the retained DO storage.
+            drop(streams);
+            drop(vcs);
+            let mut streams = DoWorkstreams::new(Rc::clone(&sql)).unwrap();
+            let mut vcs = WorkspaceVcs::from_parts(
+                DoBranches::new(Rc::clone(&sql)).unwrap(),
+                DoContentBlobs::new(Rc::clone(&sql)).unwrap(),
+            );
+            release_reserved_boundary_generic(&mut streams, &mut vcs, "ws", "cancelled", "t3")
+                .unwrap();
+            release_reserved_boundary_generic(&mut streams, &mut vcs, "ws", "cancelled", "t3")
+                .unwrap();
+            assert!(streams
+                .get_stream("ws")
+                .unwrap()
+                .unwrap()
+                .reservation_id
+                .is_none());
+            assert!(vcs.branch_head_reservation("line").unwrap().is_none());
+            assert!(vcs
+                .get_branch("main")
+                .unwrap()
+                .unwrap()
+                .head_cut_id
+                .is_none());
+            streams
+                .reserve_boundary("ws", reservation("fresh"))
+                .unwrap();
+            vcs.reserve_branch_head("line", "fresh", "t4").unwrap();
+            assert!(release_reserved_boundary_generic(
+                &mut streams,
+                &mut vcs,
+                "ws",
+                "cancelled",
+                "t4"
+            )
+            .is_err());
+            assert_eq!(
+                vcs.branch_head_reservation("line").unwrap().as_deref(),
+                Some("fresh")
+            );
+            assert_eq!(
+                streams.release_boundary("ws", "fresh", "t5").unwrap(),
+                ReleaseBoundaryOutcome::Released
+            );
+            assert_eq!(
+                streams.release_boundary("ws", "cancelled", "t5").unwrap(),
+                ReleaseBoundaryOutcome::ReservationMismatch
+            );
+            assert_eq!(
+                streams
+                    .acknowledge_boundary_release("ws", "cancelled", "t5")
+                    .unwrap(),
+                AcknowledgeBoundaryReleaseOutcome::ReservationMismatch
+            );
+            assert_eq!(
+                streams
+                    .acknowledge_boundary_release("missing", "fresh", "t5")
+                    .unwrap(),
+                AcknowledgeBoundaryReleaseOutcome::StreamMissing
+            );
+            release_reserved_boundary_generic(&mut streams, &mut vcs, "ws", "fresh", "t6").unwrap();
+            assert_eq!(
+                streams
+                    .acknowledge_boundary_release("ws", "fresh", "t6")
+                    .unwrap(),
+                AcknowledgeBoundaryReleaseOutcome::AlreadyAcknowledged
+            );
+        }
+    }
+
     /// DO workstream parity: create/join (single-valued upsert), staleness
     /// column round-trip, archive re-homes members — the native store's
     /// semantics byte-for-byte over `DoSql`.
@@ -1271,5 +1530,182 @@ mod tests {
             serde_json::Value::String(format!("cut-{seed}-promote")),
             "the recovered receipt replays the original coordinate"
         );
+    }
+
+    #[test]
+    fn do_promote_releases_both_reservations_after_proven_pre_cas_error() {
+        use whipplescript_kernel::effect_handlers::{CapabilityOutcome, CapabilityProvider};
+        use whipplescript_store::branches::{Branches, HeadReservationOutcome};
+
+        let sql = sql();
+        let mut streams = DoWorkstreams::new(Rc::clone(&sql)).expect("open");
+        let mut branches = crate::do_branches::DoBranches::new(Rc::clone(&sql)).expect("open");
+        branches.ensure_mainline("t0").expect("mainline");
+        let mut vcs = crate::do_branches::compose_vcs(&sql).expect("open");
+        vcs.init("t0").expect("init");
+        vcs.create_branch(
+            "line-pre-cas",
+            None,
+            whipplescript_store::branches::MAINLINE_BRANCH_ID,
+            "t1",
+        )
+        .expect("line");
+        streams
+            .create_stream("pre-cas", None, "line-pre-cas", "t1", None)
+            .expect("create");
+        vcs.write(
+            "line-pre-cas",
+            "feature.md",
+            Some("stream work"),
+            "line-cut",
+            "t2",
+        )
+        .expect("write");
+
+        let effect_id = "eff-pre-cas";
+        let seed = crate::do_store::stable_hash_hex(&format!("promote|{effect_id}"));
+        let proposed_main = format!("cut-{seed}-promote");
+        vcs.create_branch(
+            "unrelated",
+            None,
+            whipplescript_store::branches::MAINLINE_BRANCH_ID,
+            "t2",
+        )
+        .expect("unrelated branch");
+        vcs.write(
+            "unrelated",
+            "unrelated.md",
+            Some("occupy immutable cut id"),
+            &proposed_main,
+            "t2",
+        )
+        .expect("occupy proposed cut identity");
+
+        let provider = DoVcsPromoteCapabilityProvider {
+            sql: Rc::clone(&sql),
+        };
+        let effect = whipplescript_store::ClaimableEffect {
+            effect_id: effect_id.to_owned(),
+            kind: "capability.call".to_owned(),
+            target: Some("vcs.promote".to_owned()),
+            profile: None,
+            input_json: serde_json::json!({ "stream": "pre-cas" }).to_string(),
+            required_capabilities_json: "[]".to_owned(),
+            declared_profiles_json: "[]".to_owned(),
+        };
+        let config = whipplescript_kernel::effect_config::EffectConfig::default();
+        let outcome = provider.produce(&effect, &config);
+        let CapabilityOutcome::Failed { message, .. } = outcome else {
+            panic!("a conflicting immutable cut identity must fail");
+        };
+        assert!(message.contains("reservations released"), "{message}");
+        assert_eq!(
+            streams
+                .get_stream("pre-cas")
+                .expect("stream read")
+                .expect("stream")
+                .status,
+            StreamStatus::Active
+        );
+        assert_eq!(
+            vcs.reserve_branch_head("line-pre-cas", "next-attempt", "t3")
+                .expect("line can be reserved again"),
+            HeadReservationOutcome::Reserved
+        );
+        vcs.release_branch_head_reservation("line-pre-cas", "next-attempt")
+            .expect("release probe");
+        vcs.write(
+            "line-pre-cas",
+            "feature.md",
+            Some("later work"),
+            "later-line-cut",
+            "t4",
+        )
+        .expect("later write");
+        assert_eq!(
+            vcs.get_branch("main")
+                .expect("main")
+                .expect("main")
+                .head_cut_id,
+            None
+        );
+
+        for (stream_id, lose_cut) in [("post-cas", false), ("missing-evidence", true)] {
+            let line = format!("line-{stream_id}");
+            vcs.create_branch(&line, None, "main", "t5").expect("line");
+            vcs.write(
+                &line,
+                "next.md",
+                Some(stream_id),
+                &format!("cut-{stream_id}"),
+                "t5",
+            )
+            .expect("line write");
+            streams
+                .create_stream(stream_id, None, &line, "t5", None)
+                .expect("stream");
+            let seed = crate::do_store::stable_hash_hex(&format!("promote|{stream_id}"));
+            let proposed_main = format!("cut-{seed}-promote");
+            let lose_evidence = if lose_cut {
+                format!("DELETE FROM cuts WHERE cut_id = '{proposed_main}';")
+            } else {
+                String::new()
+            };
+            sql.execute(
+                &format!(
+                    "CREATE TRIGGER fail_promotion_log BEFORE INSERT ON ops
+                 WHEN NEW.kind = 'promote-boundary' BEGIN
+                 {lose_evidence} SELECT RAISE(FAIL, 'injected post-CAS failure'); END;"
+                ),
+                &[],
+            )
+            .expect("inject post-CAS fault");
+            let effect = whipplescript_store::ClaimableEffect {
+                effect_id: stream_id.to_owned(),
+                kind: "capability.call".to_owned(),
+                target: Some("vcs.promote".to_owned()),
+                profile: None,
+                input_json: serde_json::json!({ "stream": stream_id }).to_string(),
+                required_capabilities_json: "[]".to_owned(),
+                declared_profiles_json: "[]".to_owned(),
+            };
+            let outcome = provider.produce(&effect, &config);
+            sql.execute("DROP TRIGGER fail_promotion_log;", &[])
+                .expect("remove fault");
+            assert_eq!(
+                vcs.get_branch("main")
+                    .expect("main")
+                    .expect("main")
+                    .head_cut_id
+                    .as_deref(),
+                Some(proposed_main.as_str()),
+                "the fault was after the Main CAS"
+            );
+            let row = streams
+                .get_stream(stream_id)
+                .expect("read stream")
+                .expect("stream");
+            if lose_cut {
+                let CapabilityOutcome::Failed { message, .. } = outcome else {
+                    panic!("missing cut evidence must retain the reservation");
+                };
+                assert!(message.contains("reservations retained"), "{message}");
+                assert_eq!(row.status, StreamStatus::BoundaryReserved);
+                let error = vcs
+                    .write(&line, "next.md", Some("not allowed"), "cut-forbidden", "t7")
+                    .expect_err("line remains frozen");
+                assert!(format!("{error:?}").contains("reserved"));
+            } else {
+                let CapabilityOutcome::Produced(value) = outcome else {
+                    panic!("a landed Main CAS must close forward");
+                };
+                assert_eq!(value["variant"], "Promoted");
+                assert_eq!(row.status, StreamStatus::Archived);
+                assert!(matches!(
+                    provider.produce(&effect, &config),
+                    CapabilityOutcome::Produced(_)
+                ));
+            }
+        }
     }
 }

@@ -60,6 +60,232 @@ fn e2e_compiles_and_runs_minimal_workflow() {
 }
 
 #[test]
+fn distinct_firings_reassert_identical_decisions_without_replaying_old_firings() {
+    use whipplescript_kernel::rule_pass::step_instance_generic;
+
+    for retire in [false, true] {
+        let mut source = r#"@service
+workflow ContextDecisions
+signal item.arrived { item string }
+class Decision { disposition "keep" | "flag" }
+class Settled { item string }
+rule decide
+  when item.arrived as item
+=> {
+  record Decision { disposition "keep" }
+  record Settled { item item.item }
+}
+"#
+        .to_owned();
+        if retire {
+            source.push_str("\nrule retire\n  when Decision as decision\n=> { done decision }\n");
+        }
+        let compiled = compile_program(&source);
+        assert!(compiled.ir.is_some(), "{:?}", compiled.diagnostics);
+        let ir = compiled.ir.unwrap();
+        let (mut kernel, instance_id) = kernel_from_source("ContextDecisions", &source);
+        kernel
+            .ingest_external_event(&instance_id, "external.started", "{}", Some("start"))
+            .unwrap();
+        for item in ["first", "second", "third"] {
+            kernel
+                .derive_fact(
+                    &instance_id,
+                    "item.arrived",
+                    item,
+                    &serde_json::json!({ "item": item }).to_string(),
+                    None,
+                    Some(item),
+                )
+                .unwrap();
+            step_instance_generic(&mut kernel, &instance_id, &ir, None, None).unwrap();
+            let events = kernel.store().list_events(&instance_id).unwrap();
+            let commit = events
+                .iter()
+                .filter(|event| event.event_type == "rule.committed")
+                .map(|event| {
+                    serde_json::from_str::<serde_json::Value>(&event.payload_json).unwrap()
+                })
+                .find(|payload| {
+                    payload["facts"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|fact| fact["name"] == "Settled" && fact["value"]["item"] == item)
+                })
+                .expect("item settlement committed");
+            assert_eq!(
+                commit["facts"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(
+                        |fact| fact["name"] == "Decision" && fact["value"]["disposition"] == "keep"
+                    )
+                    .count(),
+                1,
+                "each new firing needs its own assertion evidence, retire={retire}, item={item}"
+            );
+            let live = kernel.store().list_facts(&instance_id).unwrap();
+            assert_eq!(
+                live.iter().filter(|fact| fact.name == "Decision").count(),
+                usize::from(!retire)
+            );
+            let before = events.len();
+            // Drop the kernel's transient state. Recorded firings, not global
+            // content deduplication, must prevent replay or resurrection.
+            kernel = RuntimeKernel::new(kernel.into_store());
+            let replay = step_instance_generic(&mut kernel, &instance_id, &ir, None, None).unwrap();
+            assert_eq!(replay.committed_rules, 0);
+            assert_eq!(
+                kernel.store().list_events(&instance_id).unwrap().len(),
+                before
+            );
+        }
+    }
+}
+
+#[test]
+fn continuation_firings_reassert_identical_decisions_at_each_depth() {
+    use whipplescript_kernel::rule_pass::step_instance_generic;
+
+    for nested in [false, true] {
+        let records =
+            "record Decision { disposition result.disposition }\nrecord Settled { item item.item }";
+        let continuation = if nested {
+            format!("coerce choose(\"again\") as second\nafter second succeeds as result {{\n{records}\n}}")
+        } else {
+            records.to_owned()
+        };
+        let source = format!(
+            r#"use std.coercion
+@service
+workflow ContinuationDecisions
+signal item.arrived {{ item string }}
+class Decision {{ disposition "keep" | "flag" }}
+class Settled {{ item string }}
+coerce choose(text string) -> Decision {{
+  prompt """markdown
+Return keep. {{{{ text }}}}
+{{{{ ctx.output_format }}}}
+"""
+}}
+rule decide
+  when item.arrived as item
+=> {{
+  coerce choose(item.item) as first
+  after first succeeds as result {{
+    {continuation}
+  }}
+}}
+"#
+        );
+        let compiled = compile_program(&source);
+        let ir = compiled.ir.expect("continuation compiles");
+        let store = NativeStores::open_in_memory().unwrap();
+        let mut kernel = RuntimeKernel::new(store);
+        kernel
+            .store_mut()
+            .register_package_manifest(include_str!("../../../std/manifests/coercion.json"))
+            .unwrap();
+        let version = kernel
+            .create_program_version_for_program(
+                ProgramVersionInput {
+                    program_name: &ir.workflow,
+                    source_hash: "continuation",
+                    ir_hash: "continuation",
+                    compiler_version: "test",
+                    ir_snapshot: None,
+                },
+                &ir,
+            )
+            .unwrap();
+        let instance = kernel.create_instance(&version, "{}").unwrap();
+        kernel
+            .ingest_external_event(&instance, "external.started", "{}", Some("start"))
+            .unwrap();
+        for item in ["first", "second"] {
+            kernel
+                .derive_fact(
+                    &instance,
+                    "item.arrived",
+                    item,
+                    &serde_json::json!({"item":item}).to_string(),
+                    None,
+                    Some(item),
+                )
+                .unwrap();
+            for _ in 0..4 {
+                step_instance_generic(&mut kernel, &instance, &ir, None, None).unwrap();
+                let effects = kernel.claimable_effects(&instance).unwrap();
+                if effects.is_empty() {
+                    break;
+                }
+                for effect in effects {
+                    let request = CoerceRequest::with_evidence_hashes(
+                        "choose".into(),
+                        "{\"text\":\"fixture\"}".into(),
+                        "Decision".into(),
+                    );
+                    kernel
+                        .run_coerce(
+                            CoerceExecution {
+                                instance_id: &instance,
+                                effect_id: &effect.effect_id,
+                                run_id: &format!("run:{}", effect.effect_id),
+                                provider: "fixture",
+                                worker_id: "test",
+                                lease_id: &format!("lease:{}", effect.effect_id),
+                                lease_expires_at: "2030-01-01T00:00:00Z",
+                                request: &request,
+                                model: None,
+                            },
+                            &FakeCoerceClient::succeeds(r#"{"disposition":"keep"}"#),
+                        )
+                        .unwrap();
+                }
+            }
+            let events = kernel.store().list_events(&instance).unwrap();
+            let paired = events
+                .iter()
+                .filter(|event| event.event_type == "rule.committed")
+                .map(|event| {
+                    serde_json::from_str::<serde_json::Value>(&event.payload_json).unwrap()
+                })
+                .filter(|event| {
+                    event["facts"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|fact| fact["name"] == "Settled" && fact["value"]["item"] == item)
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(paired.len(), 1, "nested={nested}, item={item}");
+            assert_eq!(
+                paired[0]["facts"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|fact| fact["name"] == "Decision")
+                    .count(),
+                1
+            );
+            kernel = RuntimeKernel::new(kernel.into_store());
+            assert_eq!(
+                step_instance_generic(&mut kernel, &instance, &ir, None, None)
+                    .unwrap()
+                    .committed_rules,
+                0
+            );
+            assert_eq!(
+                kernel.store().list_events(&instance).unwrap().len(),
+                events.len()
+            );
+        }
+    }
+}
+
+#[test]
 fn e2e_coerce_success_and_failure_branches_are_deterministic() {
     let source = include_str!("../../../examples/coerce-branch.whip");
     let (mut success_kernel, success_instance) = kernel_from_source("CoerceBranch", source);

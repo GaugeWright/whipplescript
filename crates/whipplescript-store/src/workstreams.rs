@@ -75,7 +75,9 @@ pub struct WorkstreamRow {
     pub staleness_seconds: Option<i64>,
     /// DR-0078's durable promotion coordinate. These fields are populated as
     /// one reservation record before any boundary work begins and retained in
-    /// the terminal row as evidence.
+    /// the terminal row as evidence. On an Active row, reservation_id alone
+    /// is a cancelled boundary's pending line-lock cleanup coordinate. No new
+    /// reservation may replace it before acknowledge_boundary_release.
     pub reservation_id: Option<String>,
     pub expected_line_cut: Option<String>,
     pub expected_main_cut: Option<String>,
@@ -111,6 +113,15 @@ pub enum ReleaseBoundaryOutcome {
     ReservationMismatch,
     RefAlreadyAdvanced,
     StreamArchived,
+    StreamMissing,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AcknowledgeBoundaryReleaseOutcome {
+    Acknowledged,
+    AlreadyAcknowledged,
+    ReservationMismatch,
+    NotReleased,
     StreamMissing,
 }
 
@@ -168,7 +179,8 @@ pub struct BranchHomeReceiptV1 {
     pub recorded_at: Option<String>,
 }
 
-/// Body-free digest used by native and Durable Object implementations.
+/// Frozen v1 SHA-256/128 identifier, shared by native and Durable Object hosts.
+/// Widening the digest would re-key already issued evidence on an exact retry.
 pub fn branch_home_evidence_handle(
     branch_id: &str,
     stream_id: Option<&str>,
@@ -290,6 +302,14 @@ pub trait Workstreams {
         reservation_id: &str,
         at: &str,
     ) -> StoreResult<ReleaseBoundaryOutcome>;
+    /// Called only after the host verifies the cancelled token's line lock is
+    /// absent, under the same serialization as promotion/cancellation.
+    fn acknowledge_boundary_release(
+        &mut self,
+        stream_id: &str,
+        reservation_id: &str,
+        at: &str,
+    ) -> StoreResult<AcknowledgeBoundaryReleaseOutcome>;
     fn record_ref_advanced(
         &mut self,
         stream_id: &str,
@@ -970,6 +990,10 @@ impl Workstreams for WorkstreamStore {
             return Ok(ArchiveOutcome::StreamMissing);
         };
         match stream.status {
+            StreamStatus::Active if stream.reservation_id.is_some() => {
+                // MUTATION-SUCCESS: ArchiveOutcome::AlreadyArchived
+                return Ok(ArchiveOutcome::BoundaryReserved);
+            }
             StreamStatus::Active => {}
             StreamStatus::BoundaryReserved => return Ok(ArchiveOutcome::BoundaryReserved),
             StreamStatus::RefAdvanced => return Ok(ArchiveOutcome::RefAlreadyAdvanced),
@@ -1036,7 +1060,13 @@ impl Workstreams for WorkstreamStore {
                     holder_reservation_id: stream.reservation_id.unwrap_or_default(),
                 });
             }
-            StreamStatus::Active => {}
+            StreamStatus::Active => {
+                if let Some(holder_reservation_id) = stream.reservation_id {
+                    return Ok(ReserveBoundaryOutcome::Busy {
+                        holder_reservation_id,
+                    });
+                }
+            }
         }
         tx.execute(
             "UPDATE workstreams SET status = 'boundary_reserved', reservation_id = ?2, \
@@ -1070,7 +1100,20 @@ impl Workstreams for WorkstreamStore {
             return Ok(ReleaseBoundaryOutcome::StreamMissing);
         };
         match stream.status {
-            StreamStatus::Active => return Ok(ReleaseBoundaryOutcome::AlreadyActive),
+            StreamStatus::Active => {
+                return Ok(
+                    if stream
+                        .reservation_id
+                        .as_deref()
+                        .is_none_or(|id| id == reservation_id)
+                    {
+                        ReleaseBoundaryOutcome::AlreadyActive
+                    } else {
+                        // MUTATION-SUCCESS: ReleaseBoundaryOutcome::AlreadyActive
+                        ReleaseBoundaryOutcome::ReservationMismatch
+                    },
+                );
+            }
             StreamStatus::Archived => return Ok(ReleaseBoundaryOutcome::StreamArchived),
             StreamStatus::RefAdvanced => return Ok(ReleaseBoundaryOutcome::RefAlreadyAdvanced),
             StreamStatus::BoundaryReserved => {}
@@ -1079,7 +1122,7 @@ impl Workstreams for WorkstreamStore {
             return Ok(ReleaseBoundaryOutcome::ReservationMismatch);
         }
         tx.execute(
-            "UPDATE workstreams SET status = 'active', reservation_id = NULL, \
+            "UPDATE workstreams SET status = 'active', \
              expected_line_cut = NULL, expected_main_cut = NULL, \
              proposed_main_cut = NULL, ref_position = NULL, \
              ref_receipt_handle = NULL, updated_at = ?3 \
@@ -1089,6 +1132,37 @@ impl Workstreams for WorkstreamStore {
         )?;
         tx.commit()?;
         Ok(ReleaseBoundaryOutcome::Released)
+    }
+
+    fn acknowledge_boundary_release(
+        &mut self,
+        stream_id: &str,
+        reservation_id: &str,
+        at: &str,
+    ) -> StoreResult<AcknowledgeBoundaryReleaseOutcome> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let Some(stream) = Self::stream_by_id(&tx, stream_id)? else {
+            // MUTATION-SUCCESS: AcknowledgeBoundaryReleaseOutcome::Acknowledged
+            return Ok(AcknowledgeBoundaryReleaseOutcome::StreamMissing);
+        };
+        if stream.status != StreamStatus::Active {
+            return Ok(AcknowledgeBoundaryReleaseOutcome::NotReleased);
+        }
+        let Some(pending) = stream.reservation_id.as_deref() else {
+            return Ok(AcknowledgeBoundaryReleaseOutcome::AlreadyAcknowledged);
+        };
+        if pending != reservation_id {
+            return Ok(AcknowledgeBoundaryReleaseOutcome::ReservationMismatch);
+        }
+        tx.execute(
+            "UPDATE workstreams SET reservation_id = NULL, updated_at = ?3 \
+             WHERE stream_id = ?1 AND status = 'active' AND reservation_id = ?2",
+            params![stream_id, reservation_id, at],
+        )?;
+        tx.commit()?;
+        Ok(AcknowledgeBoundaryReleaseOutcome::Acknowledged)
     }
 
     fn record_ref_advanced(
@@ -1298,6 +1372,10 @@ mod tests {
         store.join("branch", "one", "t1").expect("join one");
         let first = store.home_receipt("branch").expect("first receipt");
         assert_eq!(first.schema, "branch_home_receipt_v1");
+        assert_eq!(
+            first.evidence_handle,
+            "sha256:5fdd5de568a3e734bbeba5eeb46d8215"
+        );
         assert_eq!(first.authority_position, 1);
         assert_eq!(first.stream_id.as_deref(), Some("one"));
 
@@ -1370,6 +1448,14 @@ mod tests {
         let fork_receipt = forked.receipt();
         assert_eq!(fork_receipt.schema, "exact_fork_admission_v1");
         assert_eq!(fork_receipt.outcome, "forked");
+        assert_eq!(
+            fork_receipt.fork_evidence_handle.as_ref().unwrap().len(),
+            39
+        );
+        assert_eq!(
+            fork_receipt.home.as_ref().unwrap().evidence_handle.len(),
+            39
+        );
         let ExactForkAdmissionOutcome::Forked { home, .. } = forked else {
             panic!("expected admitted fork");
         };
@@ -1378,6 +1464,29 @@ mod tests {
             vcs.read("chat-child", "state.txt").expect("child read"),
             Some("point".to_owned()),
             "destination admission must not rematerialize its head"
+        );
+        let home_before_retry = streams
+            .home_receipt("chat-child")
+            .expect("home before retry");
+        let retried = fork_at_cut_and_admit(
+            &mut streams,
+            &mut vcs,
+            "parent",
+            "chat-1",
+            "child",
+            "chat-child",
+            None,
+            ExactForkDestination::Workstream("live"),
+            "t5-retry",
+        )
+        .expect("lost-response retry");
+        assert_eq!(retried.receipt(), fork_receipt);
+        assert_eq!(
+            streams
+                .home_receipt("chat-child")
+                .expect("home after retry"),
+            home_before_retry,
+            "an exact retry must not advance topology authority"
         );
 
         streams
@@ -1687,14 +1796,93 @@ mod tests {
             .expect("reserve");
         assert_eq!(
             store
+                .acknowledge_boundary_release("ws", "reservation-1", "t2")
+                .unwrap(),
+            AcknowledgeBoundaryReleaseOutcome::NotReleased
+        );
+        assert_eq!(
+            store
                 .release_boundary("ws", "reservation-1", "t3")
                 .expect("release"),
             ReleaseBoundaryOutcome::Released
         );
         let row = store.get_stream("ws").expect("read").expect("stream");
         assert_eq!(row.status, StreamStatus::Active);
-        assert!(row.reservation_id.is_none());
+        assert_eq!(row.reservation_id.as_deref(), Some("reservation-1"));
         assert!(row.boundary_receipt("workspace").is_none());
+        assert_eq!(
+            store.release_boundary("ws", "reservation-1", "t4").unwrap(),
+            ReleaseBoundaryOutcome::AlreadyActive
+        );
+        assert_eq!(
+            store.release_boundary("ws", "stale", "t4").unwrap(),
+            ReleaseBoundaryOutcome::ReservationMismatch
+        );
+        assert_eq!(
+            store
+                .acknowledge_boundary_release("ws", "stale", "t4")
+                .unwrap(),
+            AcknowledgeBoundaryReleaseOutcome::ReservationMismatch
+        );
+        assert_eq!(
+            store
+                .reserve_boundary("ws", reservation("reservation-2"))
+                .unwrap(),
+            ReserveBoundaryOutcome::Busy {
+                holder_reservation_id: "reservation-1".to_owned(),
+            }
+        );
+        assert_eq!(
+            store.archive_stream("ws", "t4").unwrap(),
+            ArchiveOutcome::BoundaryReserved
+        );
+        assert!(matches!(
+            store.join("member", "ws", "t4").unwrap(),
+            JoinOutcome::Joined { .. }
+        ));
+        assert_eq!(
+            store
+                .acknowledge_boundary_release("ws", "reservation-1", "t5")
+                .unwrap(),
+            AcknowledgeBoundaryReleaseOutcome::Acknowledged
+        );
+        assert_eq!(
+            store
+                .acknowledge_boundary_release("ws", "reservation-1", "t6")
+                .unwrap(),
+            AcknowledgeBoundaryReleaseOutcome::AlreadyAcknowledged
+        );
+        assert!(store
+            .get_stream("ws")
+            .unwrap()
+            .unwrap()
+            .reservation_id
+            .is_none());
+        assert!(matches!(
+            store
+                .reserve_boundary("ws", reservation("reservation-2"))
+                .unwrap(),
+            ReserveBoundaryOutcome::Reserved(_)
+        ));
+        assert_eq!(
+            store
+                .acknowledge_boundary_release("ws", "reservation-1", "t7")
+                .unwrap(),
+            AcknowledgeBoundaryReleaseOutcome::NotReleased
+        );
+        store.release_boundary("ws", "reservation-2", "t8").unwrap();
+        assert_eq!(
+            store
+                .acknowledge_boundary_release("ws", "reservation-1", "t9")
+                .unwrap(),
+            AcknowledgeBoundaryReleaseOutcome::ReservationMismatch
+        );
+        assert_eq!(
+            store
+                .acknowledge_boundary_release("missing", "reservation-1", "t9")
+                .unwrap(),
+            AcknowledgeBoundaryReleaseOutcome::StreamMissing
+        );
     }
 
     #[test]

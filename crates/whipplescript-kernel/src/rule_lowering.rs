@@ -1455,10 +1455,12 @@ pub fn lower_rule(
             &fact_key,
             &value_json,
         ]);
-        if existing_fact_ids
-            .iter()
-            .any(|existing| *existing == fact_id)
-        {
+        // The commit records this firing's assertion even when another
+        // firing already asserted identical content. The store coalesces live
+        // rows; rule_pass suppresses re-emission by this same recorded firing.
+        // Global content suppression loses the assertion's causal evidence and
+        // prevents a new firing from re-admitting a since-consumed fact.
+        if lowering.facts.iter().any(|fact| fact.fact_id == fact_id) {
             continue;
         }
         let record_source = rule
@@ -1733,11 +1735,7 @@ pub fn lower_rule(
                 &fact_key,
                 &value_json,
             ]);
-            if existing_fact_ids
-                .iter()
-                .any(|existing| *existing == fact_id)
-                || lowering.facts.iter().any(|fact| fact.fact_id == fact_id)
-            {
+            if lowering.facts.iter().any(|fact| fact.fact_id == fact_id) {
                 continue;
             }
             lowering.facts.push(OwnedFact {
@@ -1913,7 +1911,6 @@ pub fn lower_rule(
             rule,
             facts,
             effects,
-            &existing_fact_ids,
             &binding_to_effect_id,
             &selected_after_body,
             &after_context,
@@ -2015,7 +2012,6 @@ fn lower_nested_after_blocks(
     rule: &IrRule,
     facts: &[FactView],
     effects: &[EffectView],
-    existing_fact_ids: &[&str],
     binding_to_effect_id: &std::collections::BTreeMap<String, String>,
     body: &str,
     context: &RuleContext,
@@ -2087,11 +2083,7 @@ fn lower_nested_after_blocks(
                 &fact_key,
                 &value_json,
             ]);
-            if existing_fact_ids
-                .iter()
-                .any(|existing| *existing == fact_id)
-                || lowering.facts.iter().any(|fact| fact.fact_id == fact_id)
-            {
+            if lowering.facts.iter().any(|fact| fact.fact_id == fact_id) {
                 continue;
             }
             lowering.facts.push(OwnedFact {
@@ -2116,7 +2108,6 @@ fn lower_nested_after_blocks(
             rule,
             facts,
             effects,
-            existing_fact_ids,
             binding_to_effect_id,
             &selected_after_body,
             &after_context,

@@ -1,0 +1,10 @@
+{
+  "schema": "branch_home_receipt_v1",
+  "branch_id": "chat",
+  "stream_id": "ws",
+  "line_branch_id": "line",
+  "stream_status": "active",
+  "authority_position": 1,
+  "evidence_handle": "sha256:d56499ef12082c8391de3f979ba4264c",
+  "recorded_at": "t4"
+}

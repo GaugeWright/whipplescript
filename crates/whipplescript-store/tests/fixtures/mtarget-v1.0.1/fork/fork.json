@@ -1,0 +1,17 @@
+{
+  "schema": "exact_fork_admission_v1",
+  "outcome": "forked",
+  "branch_id": "chat-child",
+  "source_cut_id": "chat-1",
+  "fork_evidence_handle": "sha256:2ae915a4d679acf713ee21529bfc26e2",
+  "home": {
+    "schema": "branch_home_receipt_v1",
+    "branch_id": "chat-child",
+    "stream_id": "ws",
+    "line_branch_id": "line",
+    "stream_status": "active",
+    "authority_position": 1,
+    "evidence_handle": "sha256:1f57868682d6d871ed5087cb3f4ccdcb",
+    "recorded_at": "t5"
+  }
+}

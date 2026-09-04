@@ -132,7 +132,7 @@ lint.missing_agent_import COVERED
 lint.missing_coercion_import COVERED
 lint.missing_coord_import PROVISIONAL
 lint.missing_files_import PROVISIONAL
-lint.missing_ingress_import PROVISIONAL
+lint.missing_ingress_import COVERED
 lint.missing_tracker_import PROVISIONAL
 lint.noop_rule COVERED
 lint.readmission_unprotected_effect COVERED
@@ -174,7 +174,7 @@ security.integrity_injection PROVISIONAL
 security.mint_parent_not_presented PROVISIONAL
 security.multiple_credentials_presented PROVISIONAL
 security.not_sealed PROVISIONAL
-security.package_import_required PROVISIONAL
+security.package_import_required COVERED
 security.principal_ceiling_exceeded PROVISIONAL
 security.projection_leak PROVISIONAL
 security.provider_egress_leak PROVISIONAL

@@ -19,7 +19,7 @@
     },
     "branch_id": { "type": "string", "minLength": 1 },
     "source_cut_id": { "type": "string", "minLength": 1 },
-    "fork_evidence_handle": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+    "fork_evidence_handle": { "type": "string", "description": "Frozen v1 evidence identifier: SHA-256 truncated to 128 bits; not an authorization proof.", "pattern": "^sha256:[0-9a-f]{32}$" },
     "home": { "$ref": "branch_home_receipt_v1.schema.json" },
     "stream_id": { "type": "string", "minLength": 1 },
     "detail": { "type": "string" }

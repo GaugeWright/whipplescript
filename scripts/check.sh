@@ -184,6 +184,9 @@ node scripts/check-do-schema-consistency.mjs
 echo "== workstream host contract =="
 python3 scripts/check-workstream-host-contract.py
 
+echo "== refusal scanner contracts =="
+python3 scripts/test-mutation-sweep.py
+
 echo "== production dependency advisories =="
 # The audit lives here rather than in a workflow step so that the documented
 # local green bar and the enforced gate stay the same command. What it asks is

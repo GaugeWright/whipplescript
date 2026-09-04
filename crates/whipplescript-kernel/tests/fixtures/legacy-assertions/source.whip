@@ -1,0 +1,29 @@
+use std.coercion
+@service
+workflow LegacyAssertions
+signal item.arrived { item string }
+class Decision { disposition "keep" | "flag" }
+class Choice { disposition "keep" | "flag" }
+class Settled { item string stage string }
+coerce choose(text string) -> Choice {
+  prompt """markdown
+Return keep. {{ text }}
+{{ ctx.output_format }}
+"""
+}
+rule decide
+  when item.arrived as item
+=> {
+  record Decision { disposition "keep" }
+  record Settled { item item.item stage "top" }
+  coerce choose(item.item) as first
+  after first succeeds as result {
+    record Decision { disposition "keep" }
+    record Settled { item item.item stage "after" }
+    coerce choose(item.item) as second
+    after second succeeds as result {
+      record Decision { disposition "keep" }
+      record Settled { item item.item stage "nested" }
+    }
+  }
+}

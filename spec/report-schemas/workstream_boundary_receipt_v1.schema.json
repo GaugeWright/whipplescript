@@ -21,7 +21,8 @@
     "stream_id": { "$ref": "#/$defs/nonempty" },
     "reservation_id": { "$ref": "#/$defs/nonempty" },
     "outcome": {
-      "enum": ["reserved", "conflicted", "ref_advanced", "archived", "indeterminate"]
+      "description": "boundary_reserved is the durable reservation projection; reserved is its retained v1 report spelling.",
+      "enum": ["reserved", "boundary_reserved", "conflicted", "ref_advanced", "archived", "indeterminate"]
     },
     "expected_stream_cut": { "type": "string" },
     "expected_main_cut": { "type": "string" },
@@ -29,7 +30,8 @@
     "main_ref_position": { "type": ["integer", "null"], "minimum": 0 },
     "ref_receipt_handle": {
       "type": ["string", "null"],
-      "pattern": "^sha256:[0-9a-f]{64}$"
+      "description": "Frozen v1 evidence identifier: SHA-256 truncated to 128 bits; not an authorization proof.",
+      "pattern": "^sha256:[0-9a-f]{32}$"
     },
     "recorded_at": { "$ref": "#/$defs/nonempty" }
   },
@@ -40,7 +42,7 @@
         "required": ["main_ref_position", "ref_receipt_handle"],
         "properties": {
           "main_ref_position": { "type": "integer", "minimum": 0 },
-          "ref_receipt_handle": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" }
+          "ref_receipt_handle": { "type": "string", "pattern": "^sha256:[0-9a-f]{32}$" }
         }
       }
     }

@@ -883,12 +883,13 @@ impl<Sql: DoSql> DoSqliteStore<Sql> {
             .map_err(sql_err)?;
         self.sql
             .execute(
-                "UPDATE effects SET status = ?1, updated_at = CURRENT_TIMESTAMP \
+                "UPDATE effects SET status = ?1, updated_at = (SELECT occurred_at FROM events WHERE event_id = ?4) \
                  WHERE effect_id = ?2 AND instance_id = ?3",
                 &[
                     text(completion.status),
                     text(completion.effect_id),
                     text(completion.instance_id),
+                    text(&event.event_id),
                 ],
             )
             .map_err(sql_err)?;
@@ -1933,8 +1934,10 @@ fn do_insert_effect<Sql: DoSql>(
     sql.execute(
         "INSERT INTO effects (effect_id, instance_id, kind, target, input_json, status, \
          created_by_rule, created_by_event_id, program_version_id, revision_epoch, correlation_id, \
-         idempotency_key, required_capabilities, profile, timeout_seconds) VALUES \
-         (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+         idempotency_key, required_capabilities, profile, timeout_seconds, created_at, updated_at) VALUES \
+         (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, \
+          (SELECT occurred_at FROM events WHERE event_id = ?8), \
+          (SELECT occurred_at FROM events WHERE event_id = ?8))",
         &[
             text(effect.effect_id),
             text(instance_id),
@@ -2561,9 +2564,9 @@ fn do_replay_effect_terminal<Sql: DoSql>(
         .map_err(sql_err)?;
     }
     sql.execute(
-        "UPDATE effects SET status = ?1, updated_at = CURRENT_TIMESTAMP \
+        "UPDATE effects SET status = ?1, updated_at = (SELECT occurred_at FROM events WHERE event_id = ?4) \
          WHERE effect_id = ?2 AND instance_id = ?3",
-        &[text(status), text(effect_id), text(instance_id)],
+        &[text(status), text(effect_id), text(instance_id), text(event_id)],
     )
     .map_err(sql_err)?;
     do_mark_cancellation_requests_terminal(sql, instance_id, effect_id, event_id)?;
@@ -13705,6 +13708,20 @@ pub(crate) mod tests {
             })
             .expect("complete");
 
+        // Give this synthetic SQL replay fixture distinct historical event
+        // times. Using this test's wall clock would let the old CURRENT_TIMESTAMP
+        // implementation pass whenever construction and replay share a second.
+        store
+            .sql
+            .execute(
+                "UPDATE events SET occurred_at = CASE event_type \
+             WHEN 'rule.committed' THEN '2001-01-01 00:00:00' \
+             ELSE '2002-01-01 00:00:00' END WHERE instance_id = ?1",
+                &[text("i1")],
+            )
+            .expect("historical replay clock fixture");
+        let original_events = store.list_events("i1").expect("original events");
+
         // Corrupt the projections: wipe the fact and flip the effect status.
         store
             .sql
@@ -13734,6 +13751,19 @@ pub(crate) mod tests {
             )
             .expect("read effect");
         assert_eq!(as_text(&eff[0][0]), "completed");
+        let times = store
+            .sql
+            .query(
+                "SELECT created_at, updated_at FROM effects WHERE effect_id = ?1",
+                &[text("eff_1")],
+            )
+            .expect("replayed effect times");
+        assert_eq!(as_text(&times[0][0]), "2001-01-01 00:00:00");
+        assert_eq!(as_text(&times[0][1]), "2002-01-01 00:00:00");
+        assert_eq!(
+            store.list_events("i1").expect("retained events"),
+            original_events
+        );
         let runs = store.list_runs("i1").expect("runs");
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].status, "completed");

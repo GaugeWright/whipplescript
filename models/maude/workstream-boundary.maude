@@ -37,6 +37,17 @@ mod WHIPPLESCRIPT-WORKSTREAM-BOUNDARY is
   op settledFirst : Target -> Cfg [ctor] .
   op settledSecond : Target -> Cfg [ctor] .
 
+  --- Cancellation spans topology and branch authorities. Receipt symbols are
+  --- opaque owner tokens here, not evidence granting any effect authority.
+  op boundaryOwner : Stream Receipt -> Cfg [ctor] .
+  op lineLock : Stream Receipt -> Cfg [ctor] .
+  op lineUnlocked : Stream -> Cfg [ctor] .
+  op pendingCleanup : Stream Receipt -> Cfg [ctor] .
+  op cleanupAcknowledged : Stream Receipt -> Cfg [ctor] .
+  ops beginCleanup naiveForgetCleanup unlockCleanup naiveUnlockAny : Stream Receipt -> Cfg [ctor] .
+  op acknowledgeCleanup : Stream Receipt -> Cfg [ctor] .
+  op hasCleanup : Cfg Stream Receipt -> Bool .
+
   --- Commands and violation witnesses.
   op materializeSubset : Branch Path -> Cfg [ctor] .
   op naiveMaterializeMeansMember : Branch Path Stream -> Cfg [ctor] .
@@ -81,7 +92,29 @@ mod WHIPPLESCRIPT-WORKSTREAM-BOUNDARY is
   vars C C' P : Cut .
   vars X Y : Path .
   var T : Target .
-  var R : Receipt .
+  vars R R' : Receipt .
+  var REST : Cfg .
+
+  eq hasCleanup(pendingCleanup(S, R) REST, S, R) = true .
+  eq hasCleanup(REST, S, R) = false [owise] .
+
+  rl [begin-recoverable-cleanup] :
+    beginCleanup(S, R) stream(S, reserved) boundaryOwner(S, R)
+      reservation(S, C, C', P)
+    => stream(S, active) pendingCleanup(S, R) .
+  rl [naive-forget-cleanup-coordinate] :
+    naiveForgetCleanup(S, R) stream(S, reserved) boundaryOwner(S, R)
+      reservation(S, C, C', P)
+    => stream(S, active) .
+  rl [unlock-exact-cancelled-owner] :
+    unlockCleanup(S, R) stream(S, active) pendingCleanup(S, R) lineLock(S, R)
+    => stream(S, active) pendingCleanup(S, R) lineUnlocked(S) .
+  rl [naive-unlock-different-owner] :
+    naiveUnlockAny(S, R) stream(S, active) pendingCleanup(S, R') lineLock(S, R')
+    => stream(S, active) pendingCleanup(S, R') lineUnlocked(S) .
+  rl [acknowledge-only-unlocked-cleanup] :
+    acknowledgeCleanup(S, R) stream(S, active) pendingCleanup(S, R) lineUnlocked(S)
+    => stream(S, active) lineUnlocked(S) cleanupAcknowledged(S, R) .
 
   --- Materialization is a projection, never topology authority.
   rl [materialize-subset] : materializeSubset(B, X)

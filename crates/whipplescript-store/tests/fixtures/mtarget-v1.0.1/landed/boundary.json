@@ -1,0 +1,11 @@
+{
+  "schema": "workstream_boundary_receipt_v1",
+  "workspace_authority_id": "workspace",
+  "stream_id": "ws",
+  "reservation_id": "reservation",
+  "outcome": "boundary_reserved",
+  "expected_stream_cut": "line-1",
+  "expected_main_cut": "main-1",
+  "proposed_main_cut": "main-2",
+  "recorded_at": "t2"
+}

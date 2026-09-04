@@ -1,17 +1,20 @@
 {
   "schema": "whipplescript.workstream_host_contract_pin.v1",
-  "contract_revision": "whipplescript-workstream-host/v1.0.1",
-  "contract_digest": "40d9dba3fd43d6ed531457ff40e0c92b1b6847ac66e799992e04685e7ff2a25d",
+  "contract_revision": "whipplescript-workstream-host/v1.0.2",
+  "contract_digest": "a6ac1ea8be061c728c89dd2b4b005f206e604a151260ae329f34bd1bdbcdc5b0",
   "authority": "WhippleScript DR-0078",
   "normative_surface": "std.vcs durable boundary protocol",
   "operations": [
     "reserve_boundary",
     "release_boundary",
+    "acknowledge_boundary_release",
+    "release_reserved_boundary_generic",
     "record_ref_advanced",
     "close_promoted",
     "home_receipt",
     "transfer",
     "reserve_branch_head",
+    "branch_head_reservation",
     "release_branch_head_reservation",
     "promote_line_exact",
     "boundary_ref_evidence",
@@ -25,22 +28,22 @@
     {
       "name": "workstream_boundary_receipt_v1",
       "path": "spec/report-schemas/workstream_boundary_receipt_v1.schema.json",
-      "sha256": "abfd0f69156b1360360669d2efcc356e7642abad6afee5482c3f054b5eccceeb"
+      "sha256": "8aaca83e4ee4f3e9d35928beaa23f61fa4db3abbf3d71f935eca71e92fbe6006"
     },
     {
       "name": "branch_home_receipt_v1",
       "path": "spec/report-schemas/branch_home_receipt_v1.schema.json",
-      "sha256": "80aaf4afa51cf4937f7400f40d0077753ab2e64400fff3e23565cd827a60d260"
+      "sha256": "94e1b66e2b00dd8e820e8a1ed0ed9f9706abe80ed92f97be808126009e460530"
     },
     {
       "name": "exact_fork_admission_v1",
       "path": "spec/report-schemas/exact_fork_admission_v1.schema.json",
-      "sha256": "0147ace16c4c6abe743bab2f76f2a387202dbb87cf7d38f051324f10ffe80435"
+      "sha256": "67219be3f756a02219fa8843f838b4297ca46cd101ba64147f67fc8c9f52103a"
     }
   ],
   "fixtures": {
     "path": "spec/workstream-host-contract-fixtures-v1.json",
-    "sha256": "6e69033303e0ee66beb4daea8592611bf2db399cd48d4552213accb59217d3e1"
+    "sha256": "9e7aab63622f40bf3777f971256210b2fe7f61e4082625068a24f58806b70068"
   },
   "compatibility": {
     "earlier_revision_accepted": false,

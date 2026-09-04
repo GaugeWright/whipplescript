@@ -88,6 +88,24 @@ REFUSAL_VARIANT = re.compile(
     r"\b[A-Z][A-Za-z0-9_]*::(?:Rejected|Refused|Denied)\s*[({]"
 )
 
+# Workstream APIs return typed refusals inside Ok, including unit variants.
+# These names describe refusal, not an arbitrary status or ordinary absence.
+# Keep unit constructors distinct from patterns and enum declarations below.
+TYPED_REFUSAL = re.compile(
+    r"\b[A-Z][A-Za-z0-9_]*::(?:Busy|NotReleased|ReservationMismatch|StreamMissing)\b"
+)
+RETURNED_VALUE = re.compile(r"\breturn\s+(?:Ok\(\s*)?$")
+
+# Some refusals cannot have their branch removed: a let-else must diverge,
+# and an if-expression must still return its enum. The author may name the
+# false success to substitute, immediately above a UNIT refusal. Never infer
+# success from another enum variant or fall back to panic (still a refusal).
+MUTATION_SUCCESS = re.compile(
+    r"^\s*// MUTATION-SUCCESS: ([A-Z][A-Za-z0-9_]*::[A-Z][A-Za-z0-9_]*)\s*$"
+)
+UNIT_VALUE = re.compile(r"\b[A-Z][A-Za-z0-9_]*::[A-Z][A-Za-z0-9_]*\b")
+TEST_CFG = re.compile(r'^#\[cfg\((?:test|all\(test,\s*[^()]*\))\)\]$')
+
 # The brace form is a PATTERN, not a construction, when it binds rather than
 # supplies: `RestoreDecision::Refused { .. }` and
 # `AdvanceOutcome::Rejected { ref current, .. }` both destructure. A construction
@@ -295,6 +313,15 @@ def variant_is_refusal(line: str) -> bool:
     """
     if ERR_NOT_A_REFUSAL.search(line):
         return False
+    for found in TYPED_REFUSAL.finditer(line):
+        before, after = line[:found.start()], line[found.end():]
+        if LET_PATTERN.search(before) or "=>" in after:
+            continue
+        if RETURNED_VALUE.search(before):
+            return True
+        # Tail expressions, not `Type::Variant` patterns spanning more lines.
+        if not before.strip() and after.strip() in ("", ","):
+            return True
     for found in REFUSAL_VARIANT.finditer(line):
         rest = line[found.end() :]
         # `EnvelopeStatus::Rejected(message) => ...` is an arm, not a refusal.
@@ -346,7 +373,7 @@ def find_sites(lines: list[str]) -> list[Site]:
                 skip_until = None
             continue
         stripped = line.strip()
-        if stripped == "#[cfg(test)]":
+        if TEST_CFG.match(stripped):
             skip_until = cfg_test_extent(lines, index)
             continue
         marked = REFUSAL_MARKER.match(line)
@@ -372,6 +399,12 @@ def find_sites(lines: list[str]) -> list[Site]:
             or err_is_refusal(line)
             or variant_is_refusal(line)
         )
+        # The annotation is also an explicit refusal declaration for an
+        # ambiguous name such as ArchiveOutcome::BoundaryReserved. Its name
+        # alone must not make an ordinary lifecycle projection a refusal.
+        declared = index > 0 and MUTATION_SUCCESS.match(lines[index - 1])
+        if declared and UNIT_VALUE.search(line):
+            is_site = True
         if is_site and is_refusal_constructor(lines, index):
             continue
         if not is_site and OK_OR_OPEN.search(line):
@@ -383,8 +416,15 @@ def find_sites(lines: list[str]) -> list[Site]:
             is_site = bool(OK_OR_REFUSAL.search(window))
         if not is_site:
             continue
-        label = None
+        typed = (UNIT_VALUE if declared else TYPED_REFUSAL).search(line)
+        if typed and index + 1 < len(lines):
+            following = lines[index + 1].strip()
+            if following.startswith(("=>", "|", "=")):
+                continue
+        label = typed.group() if typed else None
         for offset in range(0, 6):
+            if label is not None:
+                break
             if index + offset >= len(lines):
                 break
             found = MESSAGE.search(lines[index + offset])
@@ -462,6 +502,12 @@ def neutralise_guard(lines: list[str], index: int) -> list[str] | None:
         if not found:
             probe -= 1
             continue
+        # A closure body can open on the first line of an unfinished guard.
+        # Replacing only that line leaves its `}) {` tail behind. Let the
+        # complete early-return mutation handle such multiline conditions.
+        header = lines[probe].rsplit("{", 1)[0]
+        if header.count("(") != header.count(")"):
+            return None
         mutated = list(lines)
         mutated[probe] = f"{found.group(1)}{found.group(2)} false {{"
         return mutated
@@ -572,9 +618,93 @@ def mutate_wrapped_message(lines: list[str], index: int) -> list[str] | None:
     return None
 
 
+def neutralise_early_return(lines: list[str], index: int) -> list[str] | None:
+    """Disable one complete early return without destroying its bindings.
+
+    Rewriting a multiline `if` can leave its continuation behind, and an
+    `if let` cannot become `if false` without losing the bound refusal payload.
+    A dead wrapper around the return asks the same stronger question without
+    rewriting either guard. Stop at its balanced statement terminator; quoted
+    delimiters and semicolons are data, not Rust structure. Unsupported raw
+    literals/block comments fall back to the existing mutations.
+    """
+    if not re.match(r"^\s*return\s+", lines[index]):
+        return None
+    # A return at the end of a match arm supplies that arm's value. Disabling
+    # it produces `()` and a type error, not a measured mutation. Only disable
+    # returns enclosed by an if block; other returns keep the message rewrite.
+    return_indent = len(lines[index]) - len(lines[index].lstrip())
+    enclosing = None
+    for probe in range(index - 1, max(-1, index - 20), -1):
+        stripped = lines[probe].strip()
+        if not stripped or stripped.startswith("//"):
+            continue
+        indent = len(lines[probe]) - len(lines[probe].lstrip())
+        if indent >= return_indent:
+            continue
+        if re.match(r"(?:}\s*else\s+)?if\s", stripped):
+            enclosing = probe
+            break
+        # The last line of a multiline if condition may be only `{` or `}) {`.
+        if stripped in ("{", "}) {"):
+            continue
+        return None
+    if enclosing is None:
+        return None
+    stack: list[str] = []
+    quoted = False
+    escaped = False
+    closing = {"(": ")", "[": "]", "{": "}"}
+    for end in range(index, min(index + 40, len(lines))):
+        line = lines[end]
+        if RAW_STRING.search(line):
+            return None
+        for offset, char in enumerate(line):
+            if quoted:
+                if escaped:
+                    escaped = False
+                elif char == "\\":
+                    escaped = True
+                elif char == '"':
+                    quoted = False
+                continue
+            if line[offset:].startswith("//"):
+                break
+            if line[offset:].startswith("/*"):
+                return None
+            if char == '"':
+                quoted = True
+            elif char in closing:
+                stack.append(closing[char])
+            elif char in closing.values():
+                if not stack or stack.pop() != char:
+                    return None
+            elif char == ";" and not stack:
+                if line[offset + 1:].strip():
+                    return None
+                indent = re.match(r"^\s*", lines[index]).group()
+                return (lines[:index] + [indent + "if false {"]
+                        + lines[index:end + 1] + [indent + "}"] + lines[end + 1:])
+    return None
+
+
 def apply_mutation(lines: list[str], site: Site) -> list[str] | None:
     mutated = list(lines)
     index = site.line - 1
+    if index > 0:
+        success = MUTATION_SUCCESS.match(lines[index - 1])
+        refusal = UNIT_VALUE.search(lines[index])
+        if success and refusal:
+            original = refusal.group()
+            replacement = success.group(1)
+            # Only the same enum's unit value may be replaced; no arbitrary
+            # expression injection, payload guessing, or no-op mutation.
+            after = lines[index][refusal.end():].lstrip()
+            if (original.split("::")[0] == replacement.split("::")[0]
+                    and original != replacement and not after.startswith(("(", "{"))):
+                mutated[index] = (lines[index][:refusal.start()] + replacement
+                                  + lines[index][refusal.end():])
+                return mutated
     replaced = neutralise(mutated[index])
     if replaced is not None:
         mutated[index] = replaced
@@ -584,6 +714,9 @@ def apply_mutation(lines: list[str], site: Site) -> list[str] | None:
     guarded = neutralise_guard(mutated, index)
     if guarded is not None:
         return guarded
+    early_return = neutralise_early_return(mutated, index)
+    if early_return is not None:
+        return early_return
     for offset in range(0, 6):
         if index + offset >= len(mutated):
             break
@@ -815,6 +948,89 @@ fn mutation_sweep_self_test_option_refusal(reached: bool) -> Option<u8> {
     }
     Some(1)
 }
+
+// Preserve bound variables and whole multiline guards while removing ONLY
+// the refusal. These are the three forms the GWPW retry sweep could not build.
+#[allow(dead_code)]
+fn mutation_sweep_self_test_if_let_return(detail: Option<String>) -> MutationSweepSelfTestOutcome {
+    if let Some(detail) = detail {
+        return MutationSweepSelfTestOutcome::Refused(format!("if-let refusal: {detail}"));
+    }
+    MutationSweepSelfTestOutcome::Admitted
+}
+
+#[allow(dead_code)]
+fn mutation_sweep_self_test_multiline_return(left: bool, right: bool) -> Result<(), MutationSweepSelfTestError> {
+    if left
+        || right
+    {
+        return Err(MutationSweepSelfTestError::Guarded);
+    }
+    Ok(())
+}
+
+#[allow(dead_code)]
+fn mutation_sweep_self_test_closure_guard(value: Option<u8>) -> Result<(), MutationSweepSelfTestError> {
+    if !value.is_some_and(|number| {
+        number == 1
+    }) {
+        return Err(MutationSweepSelfTestError::Missing(format!(
+            "mutation sweep self test; quoted delimiters {{ ( [ at {:?}", value
+        )));
+    }
+    Ok(())
+}
+
+#[allow(dead_code)]
+enum MutationSweepTypedOutcome {
+    Admitted,
+    Busy { holder_reservation_id: String },
+    NotReleased,
+    ReservationMismatch,
+    StreamMissing,
+    BoundaryReserved,
+}
+
+#[allow(dead_code)]
+fn mutation_sweep_self_test_busy(holder: Option<String>) -> MutationSweepTypedOutcome {
+    if let Some(holder_reservation_id) = holder {
+        return MutationSweepTypedOutcome::Busy { holder_reservation_id };
+    }
+    MutationSweepTypedOutcome::Admitted
+}
+
+#[allow(dead_code)]
+fn mutation_sweep_self_test_not_released(released: bool) -> MutationSweepTypedOutcome {
+    if !released {
+        return MutationSweepTypedOutcome::NotReleased;
+    }
+    MutationSweepTypedOutcome::Admitted
+}
+
+#[allow(dead_code)]
+fn mutation_sweep_self_test_mismatch(matches: bool) -> MutationSweepTypedOutcome {
+    if matches {
+        MutationSweepTypedOutcome::Admitted
+    } else {
+        // MUTATION-SUCCESS: MutationSweepTypedOutcome::Admitted
+        MutationSweepTypedOutcome::ReservationMismatch
+    }
+}
+
+#[allow(dead_code)]
+fn mutation_sweep_self_test_missing(stream: Option<u8>) -> MutationSweepTypedOutcome {
+    let Some(_) = stream else {
+        // MUTATION-SUCCESS: MutationSweepTypedOutcome::Admitted
+        return MutationSweepTypedOutcome::StreamMissing;
+    };
+    MutationSweepTypedOutcome::Admitted
+}
+
+#[allow(dead_code)]
+fn mutation_sweep_self_test_declared_unit() -> MutationSweepTypedOutcome {
+    // MUTATION-SUCCESS: MutationSweepTypedOutcome::Admitted
+    MutationSweepTypedOutcome::BoundaryReserved
+}
 """
 
 # How many refusals `PLANT` contains. Asserted rather than counted so that
@@ -824,7 +1040,7 @@ fn mutation_sweep_self_test_option_refusal(reached: bool) -> Option<u8> {
 # the scanner could not see at all before, so a plant that reports "caught"
 # means the new rule found a site the mutator cannot actually falsify — which
 # is the failure mode this count exists to make loud.
-PLANT_COUNT = 8
+PLANT_COUNT = 16
 
 
 def self_test(target: str, filter_expr: str, backup: str) -> bool:

@@ -22,6 +22,12 @@ except Exception as exc:
     )
 PY
 
+# GWPW/MTARGET: serialization and upgrade compatibility, not only the fixture
+# inventory. The emitter never opens a user store and includes actual old-store
+# receipts alongside current native API results.
+cargo run --quiet -p whipplescript-store --example workstream_receipt_reports \
+  | python3 scripts/check-workstream-receipt-reports.py
+
 TMP_DIR="$(mktemp -d)"
 TMP_STORE="$TMP_DIR/dev.sqlite"
 TMP_STREAM_STORE="$TMP_DIR/dev-stream.sqlite"

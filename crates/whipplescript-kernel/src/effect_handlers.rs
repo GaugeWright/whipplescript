@@ -2671,6 +2671,87 @@ fn promote_cut_value(value: &str) -> Option<&str> {
     (!value.is_empty()).then_some(value)
 }
 
+fn release_promotion_line_reservation<B, C>(
+    vcs: &mut whipplescript_store::vcs::WorkspaceVcs<B, C>,
+    line: &str,
+    reservation_id: &str,
+) -> Result<(), String>
+where
+    B: whipplescript_store::branches::Branches,
+    C: whipplescript_store::content::ContentBlobs,
+{
+    vcs.release_branch_head_reservation(line, reservation_id)
+        .map_err(|error| format!("line reservation cleanup failed: {error:?}"))?;
+    if let Some(holder) = vcs
+        .branch_head_reservation(line)
+        .map_err(|error| format!("line reservation cleanup read failed: {error:?}"))?
+    {
+        return Err(format!(
+            "line reservation cleanup incomplete: `{line}` is held by `{holder}`"
+        ));
+    }
+    Ok(())
+}
+
+/// Finish a proved pre-CAS cancellation across the two durable authorities.
+/// The caller must hold the same host serialization as promotion and must
+/// have proved that this boundary did not advance Main. Repeated calls resume
+/// the exact pending token; they never clear another operation's line lock.
+pub fn release_reserved_boundary_generic<W, B, C>(
+    streams: &mut W,
+    vcs: &mut whipplescript_store::vcs::WorkspaceVcs<B, C>,
+    stream_id: &str,
+    reservation_id: &str,
+    at: &str,
+) -> Result<(), String>
+where
+    W: Workstreams + ?Sized,
+    B: whipplescript_store::branches::Branches,
+    C: whipplescript_store::content::ContentBlobs,
+{
+    use whipplescript_store::workstreams::{
+        AcknowledgeBoundaryReleaseOutcome, ReleaseBoundaryOutcome, StreamStatus,
+    };
+    let released = streams
+        .release_boundary(stream_id, reservation_id, at)
+        .map_err(|error| format!("topology reservation cleanup failed: {error:?}"))?;
+    if !matches!(
+        released,
+        ReleaseBoundaryOutcome::Released | ReleaseBoundaryOutcome::AlreadyActive
+    ) {
+        return Err(format!(
+            "topology reservation cleanup refused: {released:?}"
+        ));
+    }
+    let row = streams
+        .get_stream(stream_id)
+        .map_err(|error| format!("topology cleanup read failed: {error:?}"))?
+        .ok_or_else(|| "topology cleanup stream disappeared".to_owned())?;
+    if row.status != StreamStatus::Active {
+        return Err("topology cleanup no longer names a cancelled boundary".to_owned());
+    }
+    let Some(pending) = row.reservation_id.as_deref() else {
+        return Ok(());
+    };
+    if pending != reservation_id {
+        return Err("topology cleanup token changed; line reservation retained".to_owned());
+    }
+    release_promotion_line_reservation(vcs, &row.line_branch_id, reservation_id)?;
+    let acknowledged = streams
+        .acknowledge_boundary_release(stream_id, reservation_id, at)
+        .map_err(|error| format!("topology cleanup acknowledgement failed: {error:?}"))?;
+    if !matches!(
+        acknowledged,
+        AcknowledgeBoundaryReleaseOutcome::Acknowledged
+            | AcknowledgeBoundaryReleaseOutcome::AlreadyAcknowledged
+    ) {
+        return Err(format!(
+            "topology cleanup acknowledgement refused: {acknowledged:?}"
+        ));
+    }
+    Ok(())
+}
+
 /// DR-0078's promotion coordinator, kernel-generic (DR-0091 W1) — the ONE
 /// implementation of the boundary hop, for every host door. The workstream
 /// reservation freezes the line before preflight; `promote_line_exact` owns
@@ -2683,6 +2764,26 @@ pub fn run_reserved_boundary_promotion_generic<W, B, C>(
     vcs: &mut whipplescript_store::vcs::WorkspaceVcs<B, C>,
     request: &PromoteDoorRequest<'_>,
     serialization: &mut dyn PromotionSerialization,
+) -> Result<BoundaryRunOutcome, String>
+where
+    W: Workstreams + ?Sized,
+    B: whipplescript_store::branches::Branches,
+    C: whipplescript_store::content::ContentBlobs,
+{
+    match serialization.acquire() {
+        Ok(None) => {}
+        Ok(Some(refusal)) => return Ok(BoundaryRunOutcome::Refused(refusal)),
+        Err(error) => return Err(error),
+    }
+    let result = run_reserved_boundary_promotion_serialized(streams, vcs, request);
+    serialization.release();
+    result
+}
+
+fn run_reserved_boundary_promotion_serialized<W, B, C>(
+    streams: &mut W,
+    vcs: &mut whipplescript_store::vcs::WorkspaceVcs<B, C>,
+    request: &PromoteDoorRequest<'_>,
 ) -> Result<BoundaryRunOutcome, String>
 where
     W: Workstreams + ?Sized,
@@ -2706,7 +2807,7 @@ where
 
     if stream.status == StreamStatus::Archived {
         if let Some(reservation_id) = stream.reservation_id.as_deref() {
-            let _ = vcs.release_branch_head_reservation(&stream.line_branch_id, reservation_id);
+            release_promotion_line_reservation(vcs, &stream.line_branch_id, reservation_id)?;
         }
         let receipt = stream
             .boundary_receipt(request.receipt_scope)
@@ -2719,6 +2820,9 @@ where
     }
 
     if stream.status == StreamStatus::Active {
+        if let Some(pending) = stream.reservation_id.as_deref() {
+            release_reserved_boundary_generic(streams, vcs, stream_id, pending, at)?;
+        }
         let line = vcs
             .get_branch(&stream.line_branch_id)
             .map_err(|error| format!("stream line read failed: {error:?}"))?
@@ -2760,10 +2864,7 @@ where
             .map_err(|error| format!("post-CAS close failed: {error:?}"))?
         {
             ClosePromotedOutcome::Closed { rehomed_branch_ids } => {
-                vcs.release_branch_head_reservation(&stream.line_branch_id, reservation_id)
-                    .map_err(|error| {
-                        format!("stream-line reservation release failed: {error:?}")
-                    })?;
+                release_promotion_line_reservation(vcs, &stream.line_branch_id, reservation_id)?;
                 let receipt = streams
                     .get_stream(stream_id)
                     .map_err(|error| format!("receipt read failed: {error:?}"))?
@@ -2776,10 +2877,7 @@ where
                 });
             }
             ClosePromotedOutcome::AlreadyClosed => {
-                vcs.release_branch_head_reservation(&stream.line_branch_id, reservation_id)
-                    .map_err(|error| {
-                        format!("stream-line reservation release failed: {error:?}")
-                    })?;
+                release_promotion_line_reservation(vcs, &stream.line_branch_id, reservation_id)?;
                 let receipt = streams
                     .get_stream(stream_id)
                     .map_err(|error| format!("receipt read failed: {error:?}"))?
@@ -2816,8 +2914,8 @@ where
     }
 
     // DR-0078 (GWPW residuals): the stream line's HEAD is reserved for this
-    // promotion before any host serialization, so a concurrent writer on the
-    // line itself is refused by the engine rather than raced.
+    // promotion, so a direct writer is refused by the engine rather than
+    // relying on the host's serialization alone.
     match vcs
         .reserve_branch_head(&stream.line_branch_id, &reservation_id, at)
         .map_err(|error| format!("stream-line reservation failed: {error:?}"))?
@@ -2825,132 +2923,144 @@ where
         whipplescript_store::branches::HeadReservationOutcome::Reserved
         | whipplescript_store::branches::HeadReservationOutcome::Existing => {}
         other => {
-            let _ = streams.release_boundary(stream_id, &reservation_id, at);
+            release_reserved_boundary_generic(streams, vcs, stream_id, &reservation_id, at)?;
             return Ok(BoundaryRunOutcome::Refused(format!(
                 "stream-line reservation refused: {other:?}"
             )));
         }
     }
 
-    match serialization.acquire() {
-        Ok(None) => {}
-        Ok(Some(refusal)) => return Ok(BoundaryRunOutcome::Refused(refusal)),
-        Err(error) => return Err(error),
-    }
-
-    let operation = (|| -> Result<BoundaryRunOutcome, String> {
-        // Crash recovery after the CAS: observe the proposed immutable cut and
-        // record it without issuing a second CAS.
-        if let Some((position, handle)) = vcs
-            .boundary_ref_evidence(
+    // Crash recovery after the CAS: observe the proposed immutable cut and
+    // record it without issuing a second CAS.
+    let recovered_evidence = vcs
+        .boundary_ref_evidence(
+            &stream.line_branch_id,
+            promote_cut_value(&expected_main),
+            &proposed_main,
+        )
+        .map_err(|error| format!("boundary recovery read failed: {error:?}"))?;
+    let (position, handle) = if let Some(evidence) = recovered_evidence {
+        evidence
+    } else {
+        // If a prior attempt stored its proposal, a different Main without
+        // acceptance history cannot distinguish a losing CAS from a landed
+        // CAS whose evidence was lost. Do not turn that into a cut conflict.
+        let main = vcs
+            .get_branch(MAINLINE_BRANCH_ID)
+            .map_err(|error| format!("boundary recovery Main read failed: {error:?}"))?;
+        if main.is_some_and(|row| row.head_cut_id.as_deref() != promote_cut_value(&expected_main))
+            && vcs
+                .get_cut(&proposed_main)
+                .map_err(|error| format!("boundary proposal read failed: {error:?}"))?
+                .is_some()
+        {
+            return Err(
+                    "Main moved after the proposal was recorded but acceptance is unproved; reservations retained for recovery"
+                        .to_owned(),
+                );
+        }
+        match vcs.promote_line_exact(
+            &stream.line_branch_id,
+            &reservation_id,
+            promote_cut_value(&expected_line),
+            promote_cut_value(&expected_main),
+            &proposed_main,
+            at,
+        ) {
+            Ok(whipplescript_store::vcs::BoundaryPromotionOutcome::Promoted {
+                ref_position,
+                ref_receipt_handle,
+                ..
+            }) => (ref_position, ref_receipt_handle),
+            Ok(whipplescript_store::vcs::BoundaryPromotionOutcome::Conflicted { conflicts }) => {
+                release_reserved_boundary_generic(streams, vcs, stream_id, &reservation_id, at)?;
+                return Ok(BoundaryRunOutcome::Conflicted { conflicts });
+            }
+            Ok(whipplescript_store::vcs::BoundaryPromotionOutcome::ExpectedCutsMoved {
+                ..
+            }) => {
+                release_reserved_boundary_generic(streams, vcs, stream_id, &reservation_id, at)?;
+                return Ok(BoundaryRunOutcome::Refused(
+                    "the exact stream/Main cut moved before promotion; retry from active"
+                        .to_owned(),
+                ));
+            }
+            Ok(other) => {
+                release_reserved_boundary_generic(streams, vcs, stream_id, &reservation_id, at)?;
+                return Ok(BoundaryRunOutcome::Refused(format!(
+                    "promotion refused: {other:?}"
+                )));
+            }
+            Err(error) => match vcs.boundary_ref_evidence(
                 &stream.line_branch_id,
                 promote_cut_value(&expected_main),
                 &proposed_main,
-            )
-            .map_err(|error| format!("boundary recovery read failed: {error:?}"))?
-        {
-            match streams
-                .record_ref_advanced(stream_id, &reservation_id, position, &handle, at)
-                .map_err(|error| format!("ref receipt record failed: {error:?}"))?
-            {
-                RecordRefAdvancedOutcome::Recorded(_) | RecordRefAdvancedOutcome::Existing(_) => {}
-                other => {
-                    return Ok(BoundaryRunOutcome::Refused(format!(
-                        "ref receipt record refused: {other:?}"
-                    )))
-                }
-            }
-        } else {
-            let outcome = vcs
-                .promote_line_exact(
-                    &stream.line_branch_id,
-                    &reservation_id,
-                    promote_cut_value(&expected_line),
-                    promote_cut_value(&expected_main),
-                    &proposed_main,
-                    at,
-                )
-                .map_err(|error| format!("promotion failed: {error:?}"))?;
-            match outcome {
-                whipplescript_store::vcs::BoundaryPromotionOutcome::Promoted {
-                    ref_position,
-                    ref_receipt_handle,
-                    ..
-                } => match streams
-                    .record_ref_advanced(
-                        stream_id,
-                        &reservation_id,
-                        ref_position,
-                        &ref_receipt_handle,
-                        at,
-                    )
-                    .map_err(|error| format!("ref receipt record failed: {error:?}"))?
-                {
-                    RecordRefAdvancedOutcome::Recorded(_)
-                    | RecordRefAdvancedOutcome::Existing(_) => {}
-                    other => {
-                        return Ok(BoundaryRunOutcome::Refused(format!(
-                            "ref receipt record refused: {other:?}"
-                        )))
+            ) {
+                Ok(Some(evidence)) => evidence,
+                Ok(None) => {
+                    let current_main = vcs.get_branch(MAINLINE_BRANCH_ID).map_err(|read_error| {
+                            format!("promotion failed; reservations retained because Main could not be read: {error:?}; {read_error:?}")
+                        })?;
+                    if !current_main.is_some_and(|main| {
+                        main.head_cut_id.as_deref() == promote_cut_value(&expected_main)
+                    }) {
+                        return Err(format!(
+                                "promotion failed; reservations retained because Main no longer matches the expected cut and landed evidence is unavailable: {error:?}"
+                            ));
                     }
-                },
-                whipplescript_store::vcs::BoundaryPromotionOutcome::Conflicted { conflicts } => {
-                    let _ = streams.release_boundary(stream_id, &reservation_id, at);
-                    let _ = vcs
-                        .release_branch_head_reservation(&stream.line_branch_id, &reservation_id);
-                    return Ok(BoundaryRunOutcome::Conflicted { conflicts });
-                }
-                whipplescript_store::vcs::BoundaryPromotionOutcome::ExpectedCutsMoved {
-                    ..
-                } => {
-                    let _ = streams.release_boundary(stream_id, &reservation_id, at);
-                    let _ = vcs
-                        .release_branch_head_reservation(&stream.line_branch_id, &reservation_id);
-                    return Ok(BoundaryRunOutcome::Refused(
-                        "the exact stream/Main cut moved before promotion; retry from active"
-                            .to_owned(),
+                    release_reserved_boundary_generic(streams, vcs, stream_id, &reservation_id, at)
+                        .map_err(|cleanup_error| {
+                            format!("promotion failed before Main CAS: {error:?}; {cleanup_error}")
+                        })?;
+                    return Err(format!(
+                        "promotion failed before Main CAS; reservations released: {error:?}"
                     ));
                 }
-                other => {
-                    let _ = streams.release_boundary(stream_id, &reservation_id, at);
-                    let _ = vcs
-                        .release_branch_head_reservation(&stream.line_branch_id, &reservation_id);
-                    return Ok(BoundaryRunOutcome::Refused(format!(
-                        "promotion refused: {other:?}"
-                    )));
+                Err(recovery_error) => {
+                    return Err(format!(
+                            "promotion failed and Main advance could not be determined; reservations retained for recovery: {error:?}; recovery read failed: {recovery_error:?}"
+                        ));
                 }
-            }
+            },
         }
+    };
+    match streams
+        .record_ref_advanced(stream_id, &reservation_id, position, &handle, at)
+        .map_err(|error| format!("ref receipt record failed: {error:?}"))?
+    {
+        RecordRefAdvancedOutcome::Recorded(_) | RecordRefAdvancedOutcome::Existing(_) => {}
+        other => {
+            return Ok(BoundaryRunOutcome::Refused(format!(
+                "ref receipt record refused: {other:?}"
+            )))
+        }
+    }
 
-        let members = streams
-            .members(stream_id)
-            .map_err(|error| format!("member read failed: {error:?}"))?;
-        match streams
-            .close_promoted(stream_id, &reservation_id, at)
-            .map_err(|error| format!("post-CAS close failed: {error:?}"))?
-        {
-            ClosePromotedOutcome::Closed { .. } | ClosePromotedOutcome::AlreadyClosed => {}
-            other => {
-                return Ok(BoundaryRunOutcome::Refused(format!(
-                    "post-CAS close refused: {other:?}"
-                )))
-            }
+    let members = streams
+        .members(stream_id)
+        .map_err(|error| format!("member read failed: {error:?}"))?;
+    match streams
+        .close_promoted(stream_id, &reservation_id, at)
+        .map_err(|error| format!("post-CAS close failed: {error:?}"))?
+    {
+        ClosePromotedOutcome::Closed { .. } | ClosePromotedOutcome::AlreadyClosed => {}
+        other => {
+            return Ok(BoundaryRunOutcome::Refused(format!(
+                "post-CAS close refused: {other:?}"
+            )))
         }
-        vcs.release_branch_head_reservation(&stream.line_branch_id, &reservation_id)
-            .map_err(|error| format!("stream-line reservation release failed: {error:?}"))?;
-        let receipt = streams
-            .get_stream(stream_id)
-            .map_err(|error| format!("receipt read failed: {error:?}"))?
-            .and_then(|row| row.boundary_receipt(request.receipt_scope))
-            .ok_or_else(|| "closed promotion has no receipt".to_owned())?;
-        Ok(BoundaryRunOutcome::Promoted {
-            receipt: Box::new(receipt),
-            member_branches: members,
-            recovered: false,
-        })
-    })();
-    serialization.release();
-    operation
+    }
+    release_promotion_line_reservation(vcs, &stream.line_branch_id, &reservation_id)?;
+    let receipt = streams
+        .get_stream(stream_id)
+        .map_err(|error| format!("receipt read failed: {error:?}"))?
+        .and_then(|row| row.boundary_receipt(request.receipt_scope))
+        .ok_or_else(|| "closed promotion has no receipt".to_owned())?;
+    Ok(BoundaryRunOutcome::Promoted {
+        receipt: Box::new(receipt),
+        member_branches: members,
+        recovered: false,
+    })
 }
 
 /// One conflict projection for every door — the eight-field shape the native
@@ -4612,6 +4722,1038 @@ mod promote_door_tests {
     //! receipt parity rests on.
 
     use super::*;
+    use whipplescript_store::workstreams as ws;
+
+    struct AtAcquire<F>(F);
+    impl<F: FnMut()> PromotionSerialization for AtAcquire<F> {
+        fn acquire(&mut self) -> Result<Option<String>, String> {
+            (self.0)();
+            Ok(None)
+        }
+        fn release(&mut self) {}
+    }
+
+    // Inject a concurrent authority change precisely before the receipt write,
+    // not before acquiring serialization (which is now before the first read).
+    struct BeforeRecord<'a> {
+        inner: &'a mut ws::WorkstreamStore,
+        hook: &'a mut dyn FnMut(),
+    }
+    macro_rules! forward_stream {
+        ($($method:ident($($arg:ident: $ty:ty),*) -> $out:ty;)*) => {$ (
+            fn $method(&mut self, $($arg: $ty),*) -> whipplescript_store::StoreResult<$out> {
+                self.inner.$method($($arg),*)
+            }
+        )*};
+    }
+    macro_rules! read_stream {
+        ($($method:ident($($arg:ident: $ty:ty),*) -> $out:ty;)*) => {$ (
+            fn $method(&self, $($arg: $ty),*) -> whipplescript_store::StoreResult<$out> {
+                self.inner.$method($($arg),*)
+            }
+        )*};
+    }
+    impl Workstreams for BeforeRecord<'_> {
+        forward_stream! {
+            create_stream(id: &str, name: Option<&str>, line: &str, at: &str, key: Option<&str>) -> ws::CreateStreamOutcome;
+            join(branch: &str, stream: &str, at: &str) -> ws::JoinOutcome;
+            leave(branch: &str) -> Option<String>;
+            archive_stream(id: &str, at: &str) -> ws::ArchiveOutcome;
+            reserve_boundary(id: &str, reservation: ws::BoundaryReservation<'_>) -> ws::ReserveBoundaryOutcome;
+            release_boundary(id: &str, token: &str, at: &str) -> ws::ReleaseBoundaryOutcome;
+            acknowledge_boundary_release(id: &str, token: &str, at: &str) -> ws::AcknowledgeBoundaryReleaseOutcome;
+            close_promoted(id: &str, token: &str, at: &str) -> ws::ClosePromotedOutcome;
+        }
+        read_stream! {
+            get_stream(id: &str) -> Option<ws::WorkstreamRow>;
+            list_streams(status: Option<ws::StreamStatus>) -> Vec<ws::WorkstreamRow>;
+            home_of(branch: &str) -> Option<String>;
+            home_receipt(branch: &str) -> ws::BranchHomeReceiptV1;
+            members(id: &str) -> Vec<String>;
+        }
+        fn record_ref_advanced(
+            &mut self,
+            id: &str,
+            token: &str,
+            position: u64,
+            handle: &str,
+            at: &str,
+        ) -> whipplescript_store::StoreResult<ws::RecordRefAdvancedOutcome> {
+            (self.hook)();
+            self.inner
+                .record_ref_advanced(id, token, position, handle, at)
+        }
+    }
+
+    // These faults sit at the host's Workstreams seam. Each is independent of
+    // SQLite's transaction behavior: the coordinator must check typed outcomes
+    // and re-read coordinates even when a store returns successfully.
+    struct RefusingStreams<'a> {
+        inner: &'a mut ws::WorkstreamStore,
+        mode: &'static str,
+        released: bool,
+        acknowledgements: usize,
+    }
+
+    impl Workstreams for RefusingStreams<'_> {
+        forward_stream! {
+            create_stream(id: &str, name: Option<&str>, line: &str, at: &str, key: Option<&str>) -> ws::CreateStreamOutcome;
+            join(branch: &str, stream: &str, at: &str) -> ws::JoinOutcome;
+            leave(branch: &str) -> Option<String>;
+            archive_stream(id: &str, at: &str) -> ws::ArchiveOutcome;
+            record_ref_advanced(id: &str, token: &str, position: u64, handle: &str, at: &str) -> ws::RecordRefAdvancedOutcome;
+        }
+        read_stream! {
+            list_streams(status: Option<ws::StreamStatus>) -> Vec<ws::WorkstreamRow>;
+            home_of(branch: &str) -> Option<String>;
+            home_receipt(branch: &str) -> ws::BranchHomeReceiptV1;
+            members(id: &str) -> Vec<String>;
+        }
+        fn get_stream(
+            &self,
+            id: &str,
+        ) -> whipplescript_store::StoreResult<Option<ws::WorkstreamRow>> {
+            let mut row = self.inner.get_stream(id)?;
+            if let Some(row) = row.as_mut().filter(|_| self.released) {
+                match self.mode {
+                    "status-changed" => row.status = ws::StreamStatus::RefAdvanced,
+                    "token-changed" => row.reservation_id = Some("other".to_owned()),
+                    _ => {}
+                }
+            }
+            Ok(row)
+        }
+        fn release_boundary(
+            &mut self,
+            id: &str,
+            token: &str,
+            at: &str,
+        ) -> whipplescript_store::StoreResult<ws::ReleaseBoundaryOutcome> {
+            if self.mode == "release-refused" {
+                return Ok(ws::ReleaseBoundaryOutcome::ReservationMismatch);
+            }
+            let outcome = self.inner.release_boundary(id, token, at)?;
+            self.released = true;
+            Ok(outcome)
+        }
+        fn acknowledge_boundary_release(
+            &mut self,
+            id: &str,
+            token: &str,
+            at: &str,
+        ) -> whipplescript_store::StoreResult<ws::AcknowledgeBoundaryReleaseOutcome> {
+            self.acknowledgements += 1;
+            if self.mode == "ack-refused" {
+                return Ok(ws::AcknowledgeBoundaryReleaseOutcome::NotReleased);
+            }
+            self.inner.acknowledge_boundary_release(id, token, at)
+        }
+        fn reserve_boundary(
+            &mut self,
+            id: &str,
+            reservation: ws::BoundaryReservation<'_>,
+        ) -> whipplescript_store::StoreResult<ws::ReserveBoundaryOutcome> {
+            if self.mode == "reserve-refused" {
+                return Ok(ws::ReserveBoundaryOutcome::Busy {
+                    holder_reservation_id: "other".to_owned(),
+                });
+            }
+            let mut outcome = self.inner.reserve_boundary(id, reservation)?;
+            if let ws::ReserveBoundaryOutcome::Reserved(row) = &mut outcome {
+                match self.mode {
+                    "wrong-status" => row.status = ws::StreamStatus::Active,
+                    "missing-token" => row.reservation_id = None,
+                    "missing-proposal" => row.proposed_main_cut = None,
+                    _ => {}
+                }
+            }
+            Ok(outcome)
+        }
+        fn close_promoted(
+            &mut self,
+            id: &str,
+            token: &str,
+            at: &str,
+        ) -> whipplescript_store::StoreResult<ws::ClosePromotedOutcome> {
+            if self.mode == "close-refused" {
+                return Ok(ws::ClosePromotedOutcome::ReservationMismatch);
+            }
+            self.inner.close_promoted(id, token, at)
+        }
+    }
+
+    fn refusal_fixture() -> (
+        ws::WorkstreamStore,
+        whipplescript_store::vcs::NativeWorkspaceVcs,
+    ) {
+        let mut vcs =
+            whipplescript_store::vcs::NativeWorkspaceVcs::open(":memory:", ":memory:").unwrap();
+        let mut streams = ws::WorkstreamStore::open(":memory:").unwrap();
+        vcs.init("t0").unwrap();
+        vcs.write("main", "base", Some("base"), "main-1", "t1")
+            .unwrap();
+        vcs.create_branch("line", None, "main", "t1").unwrap();
+        vcs.write("line", "work", Some("work"), "line-1", "t2")
+            .unwrap();
+        streams
+            .create_stream("ws", None, "line", "t1", None)
+            .unwrap();
+        (streams, vcs)
+    }
+
+    fn reserve_refusal_fixture(streams: &mut ws::WorkstreamStore) {
+        assert!(matches!(
+            streams
+                .reserve_boundary(
+                    "ws",
+                    ws::BoundaryReservation {
+                        reservation_id: "reservation",
+                        expected_line_cut: "line-1",
+                        expected_main_cut: "main-1",
+                        proposed_main_cut: "main-2",
+                        at: "t2",
+                    }
+                )
+                .unwrap(),
+            ws::ReserveBoundaryOutcome::Reserved(_)
+        ));
+    }
+
+    #[test]
+    fn cancellation_checks_every_typed_outcome_and_reread_before_acknowledging() {
+        for (mode, expected) in [
+            (
+                "release-refused",
+                "topology reservation cleanup refused: ReservationMismatch",
+            ),
+            (
+                "status-changed",
+                "topology cleanup no longer names a cancelled boundary",
+            ),
+            (
+                "token-changed",
+                "topology cleanup token changed; line reservation retained",
+            ),
+            (
+                "ack-refused",
+                "topology cleanup acknowledgement refused: NotReleased",
+            ),
+        ] {
+            let (mut streams, mut vcs) = refusal_fixture();
+            reserve_refusal_fixture(&mut streams);
+            vcs.reserve_branch_head("line", "reservation", "t2")
+                .unwrap();
+            let (error, acknowledgements) = {
+                let mut faulty = RefusingStreams {
+                    inner: &mut streams,
+                    mode,
+                    released: false,
+                    acknowledgements: 0,
+                };
+                let error = release_reserved_boundary_generic(
+                    &mut faulty,
+                    &mut vcs,
+                    "ws",
+                    "reservation",
+                    "t3",
+                )
+                .expect_err(mode);
+                (error, faulty.acknowledgements)
+            };
+            assert_eq!(error, expected, "{mode}");
+            let acknowledgement_attempted = mode == "ack-refused";
+            assert_eq!(
+                acknowledgements,
+                usize::from(acknowledgement_attempted),
+                "{mode}"
+            );
+            assert_eq!(
+                vcs.branch_head_reservation("line").unwrap().as_deref(),
+                if acknowledgement_attempted {
+                    None
+                } else {
+                    Some("reservation")
+                },
+                "{mode}"
+            );
+            let row = streams.get_stream("ws").unwrap().unwrap();
+            assert_eq!(
+                row.status,
+                if mode == "release-refused" {
+                    ws::StreamStatus::BoundaryReserved
+                } else {
+                    ws::StreamStatus::Active
+                },
+                "{mode}"
+            );
+            assert_eq!(row.reservation_id.as_deref(), Some("reservation"), "{mode}");
+            assert_eq!(
+                vcs.get_branch("main")
+                    .unwrap()
+                    .unwrap()
+                    .head_cut_id
+                    .as_deref(),
+                Some("main-1"),
+                "{mode}"
+            );
+            assert_eq!(
+                vcs.get_branch("line")
+                    .unwrap()
+                    .unwrap()
+                    .head_cut_id
+                    .as_deref(),
+                Some("line-1"),
+                "{mode}"
+            );
+
+            // Removing the injected fault is enough: no guessed token or
+            // manual clearing of the durable state is needed to finish.
+            release_reserved_boundary_generic(&mut streams, &mut vcs, "ws", "reservation", "t4")
+                .unwrap();
+            assert_eq!(
+                streams.get_stream("ws").unwrap().unwrap().reservation_id,
+                None
+            );
+            assert_eq!(vcs.branch_head_reservation("line").unwrap(), None);
+            vcs.write("line", "later", Some("later"), "line-2", "t5")
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn line_reservation_cleanup_refuses_to_clear_another_operations_token() {
+        let (_streams, mut vcs) = refusal_fixture();
+        vcs.reserve_branch_head("line", "holder", "t2").unwrap();
+
+        let error = release_promotion_line_reservation(&mut vcs, "line", "other")
+            .expect_err("a different operation's reservation must remain held");
+
+        assert_eq!(
+            error,
+            "line reservation cleanup incomplete: `line` is held by `holder`"
+        );
+        assert_eq!(
+            vcs.branch_head_reservation("line").unwrap().as_deref(),
+            Some("holder")
+        );
+    }
+
+    #[test]
+    fn promotion_refuses_invalid_reservation_results_before_touching_main() {
+        for (mode, expected) in [
+            ("reserve-refused", "boundary reservation refused: Busy"),
+            ("wrong-status", "cannot promote from active"),
+            (
+                "missing-token",
+                "reserved stream is missing its durable recovery coordinate",
+            ),
+            (
+                "missing-proposal",
+                "reserved stream is missing its durable recovery coordinate",
+            ),
+        ] {
+            let (mut streams, mut vcs) = refusal_fixture();
+            let result = run_reserved_boundary_promotion_generic(
+                &mut RefusingStreams {
+                    inner: &mut streams,
+                    mode,
+                    released: false,
+                    acknowledgements: 0,
+                },
+                &mut vcs,
+                &PromoteDoorRequest {
+                    stream_id: "ws",
+                    reservation_id: "reservation",
+                    proposed_main: "main-2",
+                    at: "t3",
+                    receipt_scope: "workspace",
+                },
+                &mut SingleWriterSerialization,
+            )
+            .unwrap();
+            let BoundaryRunOutcome::Refused(message) = result else {
+                panic!("{mode}: {result:?}")
+            };
+            assert!(message.contains(expected), "{mode}: {message}");
+            assert_eq!(
+                vcs.get_branch("main")
+                    .unwrap()
+                    .unwrap()
+                    .head_cut_id
+                    .as_deref(),
+                Some("main-1"),
+                "{mode}"
+            );
+            assert!(vcs.get_cut("main-2").unwrap().is_none(), "{mode}");
+            assert_eq!(vcs.branch_head_reservation("line").unwrap(), None, "{mode}");
+            assert_eq!(
+                streams.get_stream("ws").unwrap().unwrap().status,
+                if mode == "reserve-refused" {
+                    ws::StreamStatus::Active
+                } else {
+                    ws::StreamStatus::BoundaryReserved
+                },
+                "{mode}"
+            );
+        }
+    }
+
+    #[test]
+    fn promotion_close_refusal_preserves_accepted_main_and_frozen_line_on_both_paths() {
+        for already_advanced in [false, true] {
+            let (mut streams, mut vcs) = refusal_fixture();
+            reserve_refusal_fixture(&mut streams);
+            if already_advanced {
+                vcs.reserve_branch_head("line", "reservation", "t2")
+                    .unwrap();
+                let promoted = vcs
+                    .promote_line_exact(
+                        "line",
+                        "reservation",
+                        Some("line-1"),
+                        Some("main-1"),
+                        "main-2",
+                        "t3",
+                    )
+                    .unwrap();
+                let whipplescript_store::vcs::BoundaryPromotionOutcome::Promoted {
+                    ref_position,
+                    ref_receipt_handle,
+                    ..
+                } = promoted
+                else {
+                    panic!("{promoted:?}")
+                };
+                streams
+                    .record_ref_advanced(
+                        "ws",
+                        "reservation",
+                        ref_position,
+                        &ref_receipt_handle,
+                        "t3",
+                    )
+                    .unwrap();
+            }
+            let request = PromoteDoorRequest {
+                stream_id: "ws",
+                reservation_id: "reservation",
+                proposed_main: "main-2",
+                at: "t4",
+                receipt_scope: "workspace",
+            };
+            let result = run_reserved_boundary_promotion_generic(
+                &mut RefusingStreams {
+                    inner: &mut streams,
+                    mode: "close-refused",
+                    released: false,
+                    acknowledgements: 0,
+                },
+                &mut vcs,
+                &request,
+                &mut SingleWriterSerialization,
+            )
+            .unwrap();
+            let BoundaryRunOutcome::Refused(message) = result else {
+                panic!("{result:?}")
+            };
+            assert_eq!(message, "post-CAS close refused: ReservationMismatch");
+            let row = streams.get_stream("ws").unwrap().unwrap();
+            assert_eq!(row.status, ws::StreamStatus::RefAdvanced);
+            assert_eq!(row.reservation_id.as_deref(), Some("reservation"));
+            assert_eq!(
+                vcs.get_branch("main")
+                    .unwrap()
+                    .unwrap()
+                    .head_cut_id
+                    .as_deref(),
+                Some("main-2")
+            );
+            assert_eq!(
+                vcs.branch_head_reservation("line").unwrap().as_deref(),
+                Some("reservation")
+            );
+            assert!(vcs
+                .write("line", "later", Some("later"), "line-2", "t5")
+                .is_err());
+
+            let result = run_reserved_boundary_promotion_generic(
+                &mut streams,
+                &mut vcs,
+                &request,
+                &mut SingleWriterSerialization,
+            )
+            .unwrap();
+            let BoundaryRunOutcome::Promoted { receipt, .. } = result else {
+                panic!("{result:?}")
+            };
+            assert_eq!(receipt.ref_receipt_handle, row.ref_receipt_handle);
+            assert_eq!(
+                streams.get_stream("ws").unwrap().unwrap().status,
+                ws::StreamStatus::Archived
+            );
+            assert_eq!(vcs.branch_head_reservation("line").unwrap(), None);
+        }
+    }
+
+    #[test]
+    fn promotion_reports_a_missing_reserved_line_without_advancing_main() {
+        let (mut streams, mut vcs) = refusal_fixture();
+        streams
+            .create_stream("missing-line", None, "absent", "t1", None)
+            .unwrap();
+        streams
+            .reserve_boundary(
+                "missing-line",
+                ws::BoundaryReservation {
+                    reservation_id: "reservation",
+                    expected_line_cut: "",
+                    expected_main_cut: "main-1",
+                    proposed_main_cut: "main-2",
+                    at: "t2",
+                },
+            )
+            .unwrap();
+        let result = run_reserved_boundary_promotion_generic(
+            &mut streams,
+            &mut vcs,
+            &PromoteDoorRequest {
+                stream_id: "missing-line",
+                reservation_id: "reservation",
+                proposed_main: "main-2",
+                at: "t3",
+                receipt_scope: "workspace",
+            },
+            &mut SingleWriterSerialization,
+        )
+        .unwrap();
+        let BoundaryRunOutcome::Refused(message) = result else {
+            panic!("{result:?}")
+        };
+        assert!(
+            message.starts_with("stream-line reservation refused:"),
+            "{message}"
+        );
+        assert_eq!(
+            vcs.get_branch("main")
+                .unwrap()
+                .unwrap()
+                .head_cut_id
+                .as_deref(),
+            Some("main-1")
+        );
+        assert!(vcs.get_cut("main-2").unwrap().is_none());
+        let row = streams.get_stream("missing-line").unwrap().unwrap();
+        assert_eq!(row.status, ws::StreamStatus::Active);
+        assert_eq!(row.reservation_id, None);
+    }
+
+    #[test]
+    fn promotion_recovers_cancelled_line_lock_after_restart() {
+        use whipplescript_store::vcs::NativeWorkspaceVcs;
+        use whipplescript_store::workstreams::{BoundaryReservation, WorkstreamStore};
+
+        for stop_after in ["topology", "line", "acknowledgement", "serialization"] {
+            let dir = std::env::temp_dir().join(format!(
+                "whip-cancel-restart-{stop_after}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos(),
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            let mut vcs =
+                NativeWorkspaceVcs::open(dir.join("branches.sqlite"), dir.join("content.sqlite"))
+                    .unwrap();
+            let mut streams = WorkstreamStore::open(dir.join("streams.sqlite")).unwrap();
+            vcs.init("t0").unwrap();
+            vcs.write("main", "base", Some("base"), "main-1", "t1")
+                .unwrap();
+            vcs.create_branch("line", None, "main", "t1").unwrap();
+            vcs.write("line", "work", Some("work"), "line-1", "t2")
+                .unwrap();
+            streams
+                .create_stream("ws", None, "line", "t1", None)
+                .unwrap();
+            streams
+                .reserve_boundary(
+                    "ws",
+                    BoundaryReservation {
+                        reservation_id: "cancelled",
+                        expected_line_cut: "line-1",
+                        expected_main_cut: "main-1",
+                        proposed_main_cut: "abandoned",
+                        at: "t2",
+                    },
+                )
+                .unwrap();
+            vcs.reserve_branch_head("line", "cancelled", "t2").unwrap();
+            if stop_after != "serialization" {
+                streams.release_boundary("ws", "cancelled", "t3").unwrap();
+            }
+            if matches!(stop_after, "line" | "acknowledgement") {
+                vcs.release_branch_head_reservation("line", "cancelled")
+                    .unwrap();
+            }
+            if stop_after == "acknowledgement" {
+                streams
+                    .acknowledge_boundary_release("ws", "cancelled", "t3")
+                    .unwrap();
+            }
+            // Stop after each independently durable cleanup write. The next
+            // process has no in-memory token from the cancelled operation.
+            drop(streams);
+            drop(vcs);
+            let mut streams = WorkstreamStore::open(dir.join("streams.sqlite")).unwrap();
+            let mut vcs =
+                NativeWorkspaceVcs::open(dir.join("branches.sqlite"), dir.join("content.sqlite"))
+                    .unwrap();
+            // Deterministically schedule cancellation while the caller waits
+            // for serialization. A pre-acquire snapshot would still contain
+            // the cancelled reservation and its abandoned proposed cut.
+            let mut serialization = AtAcquire(|| {
+                if stop_after == "serialization" {
+                    let mut canceller = WorkstreamStore::open(dir.join("streams.sqlite")).unwrap();
+                    let mut cancel_vcs = NativeWorkspaceVcs::open(
+                        dir.join("branches.sqlite"),
+                        dir.join("content.sqlite"),
+                    )
+                    .unwrap();
+                    release_reserved_boundary_generic(
+                        &mut canceller,
+                        &mut cancel_vcs,
+                        "ws",
+                        "cancelled",
+                        "t3",
+                    )
+                    .unwrap();
+                }
+            });
+            let result = run_reserved_boundary_promotion_generic(
+                &mut streams,
+                &mut vcs,
+                &PromoteDoorRequest {
+                    stream_id: "ws",
+                    reservation_id: "fresh",
+                    proposed_main: "main-2",
+                    at: "t4",
+                    receipt_scope: "workspace",
+                },
+                &mut serialization,
+            )
+            .unwrap();
+            let BoundaryRunOutcome::Promoted { receipt, .. } = result else {
+                panic!("{stop_after}: {result:?}");
+            };
+            assert_eq!(receipt.reservation_id, "fresh", "{stop_after}");
+            assert_eq!(
+                vcs.get_branch("main")
+                    .unwrap()
+                    .unwrap()
+                    .head_cut_id
+                    .as_deref(),
+                Some("main-2")
+            );
+            drop(streams);
+            drop(vcs);
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    /// Exercise the actual shared door, including failures between the engine's
+    /// Main CAS and its result. Host entry-point tests repeat the three recovery
+    /// cases; these pin the kernel's error and refusal arms directly as well.
+    #[test]
+    fn promotion_errors_release_only_proven_pre_cas_reservations() {
+        use whipplescript_store::workstreams::{
+            BoundaryReservation, StreamStatus, WorkstreamStore,
+        };
+
+        for mode in [
+            "pre-cas",
+            "cleanup-error",
+            "post-cas",
+            "missing-cut",
+            "unreadable-main",
+            "cuts-moved",
+            "unproved-proposal",
+            "failure-after-main-movement",
+            "line-closed",
+            "receipt-mismatch",
+            "close-mismatch",
+        ] {
+            let dir = std::env::temp_dir().join(format!(
+                "whip-promotion-door-{mode}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(&dir).expect("temp dir");
+            let mut vcs = whipplescript_store::vcs::NativeWorkspaceVcs::open(
+                dir.join("branches.sqlite"),
+                dir.join("content.sqlite"),
+            )
+            .expect("vcs");
+            let mut streams = WorkstreamStore::open(dir.join("streams.sqlite")).expect("streams");
+            vcs.init("t0").expect("init");
+            vcs.write("main", "base.md", Some("base"), "main-1", "t1")
+                .expect("main");
+            vcs.create_branch("line", None, "main", "t1").expect("line");
+            vcs.write("line", "work.md", Some("work"), "line-1", "t2")
+                .expect("work");
+            if matches!(mode, "pre-cas" | "cleanup-error") {
+                vcs.create_branch("unrelated", None, "main", "t2")
+                    .expect("other branch");
+                vcs.write("unrelated", "other.md", Some("other"), "main-2", "t2")
+                    .expect("occupy proposed cut identity");
+            }
+            streams
+                .create_stream("ws", None, "line", "t1", None)
+                .expect("stream");
+            streams
+                .reserve_boundary(
+                    "ws",
+                    BoundaryReservation {
+                        reservation_id: "reservation",
+                        expected_line_cut: "line-1",
+                        expected_main_cut: "main-1",
+                        proposed_main_cut: "main-2",
+                        at: "t2",
+                    },
+                )
+                .expect("boundary");
+            let branch_db =
+                rusqlite::Connection::open(dir.join("branches.sqlite")).expect("branches");
+            let stream_db =
+                rusqlite::Connection::open(dir.join("streams.sqlite")).expect("topology");
+            let mut serialization = AtAcquire(|| {
+                match mode {
+                    "cleanup-error" => stream_db.execute_batch(
+                        "CREATE TRIGGER fail_cleanup BEFORE UPDATE ON workstreams
+                         WHEN NEW.status = 'active' BEGIN SELECT RAISE(FAIL, 'cleanup fault'); END;"
+                    ).expect("cleanup trigger"),
+                    "post-cas" | "missing-cut" | "unreadable-main" => {
+                        let extra = match mode {
+                            "missing-cut" => "DELETE FROM cuts WHERE cut_id = 'main-2';",
+                            "unreadable-main" => "UPDATE branches SET head_cut_id = x'00' WHERE branch_id = 'main';",
+                            _ => "",
+                        };
+                        branch_db.execute_batch(&format!(
+                            "CREATE TRIGGER fail_log BEFORE INSERT ON ops
+                             WHEN NEW.kind = 'promote-boundary' BEGIN
+                             {extra} SELECT RAISE(FAIL, 'post-CAS fault'); END;"
+                        )).expect("post-CAS trigger");
+                    }
+                    "failure-after-main-movement" => branch_db.execute_batch(
+                        "CREATE TRIGGER move_main_before_failed_cut BEFORE INSERT ON cuts
+                         WHEN NEW.cut_id = 'main-2' BEGIN
+                         INSERT INTO cuts (cut_id, change_id, branch_id, manifest_hash, parent_cut_id, origin, recorded_at)
+                         SELECT 'moved', 'moved', 'main', manifest_hash, 'main-1', 'write:other', 't3' FROM cuts WHERE cut_id = 'main-1';
+                         UPDATE branches SET head_cut_id = 'moved' WHERE branch_id = 'main';
+                         SELECT RAISE(FAIL, 'Main moved during a failing cut write'); END;"
+                    ).expect("concurrent Main change and store failure"),
+                    "cuts-moved" | "unproved-proposal" => {
+                        let mut other = whipplescript_store::vcs::NativeWorkspaceVcs::open(
+                            dir.join("branches.sqlite"), dir.join("content.sqlite"),
+                        ).expect("racing writer");
+                        other.write("main", "other.md", Some("other"), "moved", "t3").expect("move main");
+                        if mode == "unproved-proposal" {
+                            use whipplescript_store::branches::{Branches, BranchStore, CutRecord};
+                            let manifest = other.get_cut("main-1").unwrap().unwrap().manifest_hash;
+                            BranchStore::open(dir.join("branches.sqlite")).unwrap().record_cut(CutRecord {
+                                cut_id: "main-2", change_id: "main-2", branch_id: "main",
+                                manifest_hash: &manifest, parent_cut_id: Some("main-1"),
+                                origin: Some("promote:line"), actor: None, intent: None, recorded_at: "t3",
+                            }).expect("proposal with no acceptance evidence");
+                        }
+                    }
+                    "line-closed" => branch_db.execute_batch(
+                        "CREATE TRIGGER close_reserved_line AFTER INSERT ON branch_head_reservations
+                         WHEN NEW.branch_id = 'line' BEGIN
+                         UPDATE branches SET status = 'discarded' WHERE branch_id = 'line'; END;"
+                    ).expect("close line"),
+                    "close-mismatch" => stream_db.execute_batch(
+                        "CREATE TRIGGER change_token AFTER UPDATE ON workstreams
+                         WHEN NEW.status = 'ref_advanced' BEGIN
+                         UPDATE workstreams SET reservation_id = 'other' WHERE stream_id = 'ws'; END;"
+                    ).expect("close trigger"),
+                    _ => {}
+                }
+            });
+            let mut before_record = || {
+                if mode == "receipt-mismatch" {
+                    stream_db.execute_batch(
+                        "UPDATE workstreams SET reservation_id = 'other' WHERE stream_id = 'ws';"
+                    ).expect("change token immediately before receipt record");
+                }
+            };
+            let result = run_reserved_boundary_promotion_generic(
+                &mut BeforeRecord {
+                    inner: &mut streams,
+                    hook: &mut before_record,
+                },
+                &mut vcs,
+                &PromoteDoorRequest {
+                    stream_id: "ws",
+                    reservation_id: "reservation",
+                    proposed_main: "main-2",
+                    at: "t3",
+                    receipt_scope: "test-workspace",
+                },
+                &mut serialization,
+            );
+            let row = streams
+                .get_stream("ws")
+                .expect("stream read")
+                .expect("stream");
+            let expected_message = match mode {
+                "pre-cas" => "promotion failed before Main CAS; reservations released:",
+                "cleanup-error" => "topology reservation cleanup failed:",
+                "missing-cut" => "promotion failed and Main advance could not be determined; reservations retained for recovery:",
+                "unreadable-main" => "promotion failed and Main advance could not be determined; reservations retained for recovery:",
+                "cuts-moved" => "the exact stream/Main cut moved before promotion; retry from active",
+                "unproved-proposal" => "Main moved after the proposal was recorded but acceptance is unproved; reservations retained for recovery",
+                "failure-after-main-movement" => "promotion failed; reservations retained because Main no longer matches the expected cut and landed evidence is unavailable",
+                "line-closed" => "promotion refused: StreamLineNotActive",
+                "receipt-mismatch" => "ref receipt record refused: ReservationMismatch",
+                "close-mismatch" => "post-CAS close refused: ReservationMismatch",
+                "post-cas" => "",
+                _ => unreachable!(),
+            };
+            if mode == "post-cas" {
+                assert!(
+                    matches!(result, Ok(BoundaryRunOutcome::Promoted { .. })),
+                    "{result:?}"
+                );
+                assert_eq!(row.status, StreamStatus::Archived);
+            } else {
+                let message = match result {
+                    Err(message) | Ok(BoundaryRunOutcome::Refused(message)) => message,
+                    other => panic!("{mode} did not fail: {other:?}"),
+                };
+                assert!(message.contains(expected_message), "{mode}: {message}");
+                match mode {
+                    "pre-cas" | "cuts-moved" | "line-closed" => {
+                        assert_eq!(row.status, StreamStatus::Active)
+                    }
+                    "close-mismatch" => assert_eq!(row.status, StreamStatus::RefAdvanced),
+                    _ => assert_eq!(row.status, StreamStatus::BoundaryReserved),
+                }
+            }
+            if matches!(mode, "pre-cas" | "cleanup-error") {
+                assert_eq!(
+                    vcs.get_branch("main")
+                        .unwrap()
+                        .unwrap()
+                        .head_cut_id
+                        .as_deref(),
+                    Some("main-1")
+                );
+                let write = vcs.write("line", "later.md", Some("later"), "later-cut", "t4");
+                if mode == "pre-cas" {
+                    write.expect("both reservations released");
+                } else {
+                    assert!(
+                        write.is_err(),
+                        "failed topology cleanup must keep the line frozen"
+                    );
+                }
+            }
+            if matches!(mode, "missing-cut" | "receipt-mismatch" | "close-mismatch") {
+                assert_eq!(
+                    vcs.get_branch("main")
+                        .unwrap()
+                        .unwrap()
+                        .head_cut_id
+                        .as_deref(),
+                    Some("main-2")
+                );
+                let error = vcs
+                    .write("line", "later.md", Some("later"), "later-cut", "t4")
+                    .expect_err("landed or uncertain boundary remains frozen");
+                assert!(format!("{error:?}").contains("reserved"));
+            }
+            if mode == "missing-cut" {
+                let retry = run_reserved_boundary_promotion_generic(
+                    &mut streams,
+                    &mut vcs,
+                    &PromoteDoorRequest {
+                        stream_id: "ws",
+                        reservation_id: "reservation",
+                        proposed_main: "main-2",
+                        at: "t4",
+                        receipt_scope: "test-workspace",
+                    },
+                    &mut SingleWriterSerialization,
+                );
+                assert!(
+                    retry.is_err(),
+                    "missing evidence must stay uncertain on retry: {retry:?}"
+                );
+                assert_eq!(
+                    streams.get_stream("ws").unwrap().unwrap().status,
+                    StreamStatus::BoundaryReserved
+                );
+                assert!(vcs
+                    .write("line", "retry.md", Some("retry"), "retry-cut", "t5")
+                    .is_err());
+            }
+            drop(streams);
+            drop(vcs);
+            drop(branch_db);
+            drop(stream_db);
+            std::fs::remove_dir_all(dir).expect("remove fixture");
+        }
+    }
+
+    #[test]
+    fn promotion_recovery_after_another_promotion_preserves_the_original_receipt() {
+        use whipplescript_store::vcs::NativeWorkspaceVcs;
+        use whipplescript_store::workstreams::{StreamStatus, WorkstreamStore};
+
+        let dir = std::env::temp_dir().join(format!(
+            "whip-promotion-history-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        std::fs::create_dir_all(&dir).expect("fixture");
+        let mut vcs =
+            NativeWorkspaceVcs::open(dir.join("branches.sqlite"), dir.join("content.sqlite"))
+                .expect("vcs");
+        let mut streams = WorkstreamStore::open(dir.join("streams.sqlite")).expect("streams");
+        vcs.init("t0").expect("init");
+        vcs.write("main", "base.md", Some("base"), "main-1", "t1")
+            .expect("main");
+        vcs.create_branch("line-first", None, "main", "t1")
+            .expect("line");
+        vcs.write("line-first", "first.md", Some("first"), "first-cut", "t2")
+            .expect("work");
+        streams
+            .create_stream("first", None, "line-first", "t1", None)
+            .expect("stream");
+        let database = rusqlite::Connection::open(dir.join("streams.sqlite")).expect("database");
+        database
+            .execute_batch(
+                "CREATE TRIGGER lose_receipt BEFORE UPDATE ON workstreams
+             WHEN NEW.status = 'ref_advanced' AND NEW.stream_id = 'first'
+             BEGIN SELECT RAISE(FAIL, 'crash before receipt'); END;",
+            )
+            .expect("crash injection");
+        let request = PromoteDoorRequest {
+            stream_id: "first",
+            reservation_id: "first-reservation",
+            proposed_main: "main-2",
+            at: "t3",
+            receipt_scope: "workspace",
+        };
+        let error = run_reserved_boundary_promotion_generic(
+            &mut streams,
+            &mut vcs,
+            &request,
+            &mut SingleWriterSerialization,
+        )
+        .expect_err("receipt write fails after CAS");
+        assert!(error.contains("ref receipt record failed"), "{error}");
+        assert_eq!(
+            streams.get_stream("first").unwrap().unwrap().status,
+            StreamStatus::BoundaryReserved
+        );
+        let original = vcs
+            .boundary_ref_evidence("line-first", Some("main-1"), "main-2")
+            .unwrap()
+            .expect("first CAS evidence");
+        database
+            .execute_batch("DROP TRIGGER lose_receipt")
+            .expect("restore storage");
+
+        vcs.create_branch("line-second", None, "main", "t4")
+            .expect("second line");
+        vcs.write(
+            "line-second",
+            "second.md",
+            Some("second"),
+            "second-cut",
+            "t4",
+        )
+        .expect("second work");
+        streams
+            .create_stream("second", None, "line-second", "t4", None)
+            .expect("second stream");
+        let second = run_reserved_boundary_promotion_generic(
+            &mut streams,
+            &mut vcs,
+            &PromoteDoorRequest {
+                stream_id: "second",
+                reservation_id: "second-reservation",
+                proposed_main: "main-3",
+                at: "t5",
+                receipt_scope: "workspace",
+            },
+            &mut SingleWriterSerialization,
+        )
+        .expect("later promotion");
+        assert!(matches!(second, BoundaryRunOutcome::Promoted { .. }));
+        drop(streams);
+        drop(vcs);
+        let mut vcs =
+            NativeWorkspaceVcs::open(dir.join("branches.sqlite"), dir.join("content.sqlite"))
+                .expect("reopen vcs");
+        let mut streams =
+            WorkstreamStore::open(dir.join("streams.sqlite")).expect("reopen topology");
+        let BoundaryRunOutcome::Promoted { receipt, .. } = run_reserved_boundary_promotion_generic(
+            &mut streams,
+            &mut vcs,
+            &request,
+            &mut SingleWriterSerialization,
+        )
+        .expect("recover earlier promotion") else {
+            panic!("earlier landed promotion must close forward");
+        };
+        assert_eq!(receipt.main_ref_position, Some(original.0));
+        assert_eq!(
+            receipt.ref_receipt_handle.as_deref(),
+            Some(original.1.as_str())
+        );
+        assert_eq!(
+            streams.get_stream("first").unwrap().unwrap().status,
+            StreamStatus::Archived
+        );
+        assert_eq!(
+            vcs.get_branch("main")
+                .unwrap()
+                .unwrap()
+                .head_cut_id
+                .as_deref(),
+            Some("main-3")
+        );
+        assert_eq!(
+            vcs.read("main", "first.md").unwrap().as_deref(),
+            Some("first")
+        );
+        assert_eq!(
+            vcs.read("main", "second.md").unwrap().as_deref(),
+            Some("second")
+        );
+        let repeated = run_reserved_boundary_promotion_generic(
+            &mut streams,
+            &mut vcs,
+            &request,
+            &mut SingleWriterSerialization,
+        )
+        .expect("replay receipt");
+        assert!(
+            matches!(repeated, BoundaryRunOutcome::Promoted { receipt: replayed, .. } if replayed == receipt)
+        );
+        drop(vcs);
+        drop(streams);
+        drop(database);
+        std::fs::remove_dir_all(dir).expect("remove fixture");
+    }
 
     #[test]
     fn promote_stream_id_reads_both_spellings_and_refuses_empty() {

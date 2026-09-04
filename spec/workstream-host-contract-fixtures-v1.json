@@ -1,7 +1,21 @@
 {
   "schema": "whipplescript.workstream_host_contract_fixtures.v1",
-  "contract_revision": "whipplescript-workstream-host/v1.0.1",
+  "contract_revision": "whipplescript-workstream-host/v1.0.2",
   "cases": [
+    {
+      "id": "cancelled_boundary_cleanup_survives_each_crash",
+      "given": { "stream_status": "active", "pending_cleanup_token": "cancelled" },
+      "when": "restart_after_each_cleanup_write_then_promote",
+      "expect": { "old_lock_released": true, "new_promotion_succeeds": true, "cancelled_cas_replayed": false },
+      "coverage": "effect_handlers::promote_door_tests::promotion_recovers_cancelled_line_lock_after_restart"
+    },
+    {
+      "id": "cleanup_failures_and_stale_tokens_preserve_the_owner",
+      "given": { "cleanup_failures": ["topology", "line", "acknowledgement", "foreign-lock"] },
+      "when": "cancel_then_retry_with_fresh_host_adapters",
+      "expect": { "cleanup_coordinate_retained_until_ack": true, "new_reservation_waits": true, "foreign_lock_preserved": true, "main_unchanged": true },
+      "coverage": "do_workstreams::tests::do_cancellation_cleanup_retains_its_token_until_both_stores_finish"
+    },
     {
       "id": "reservation_freezes_topology_and_contribution",
       "given": {
@@ -47,9 +61,64 @@
       "expect": {
         "status_sequence": ["ref_advanced", "archived"],
         "main_cas_count": 0,
-        "ref_receipt_handle": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+        "ref_receipt_handle": "sha256:00000000000000000000000000000000"
       },
       "coverage": "vcs::tests::reserved_boundary_promotes_with_one_exact_main_cas"
+    },
+    {
+      "id": "receipt_handles_match_shipped_v1_schema",
+      "given": {
+        "receipt_schemas": ["workstream_boundary_receipt_v1", "branch_home_receipt_v1", "exact_fork_admission_v1"]
+      },
+      "when": "create_receipt",
+      "expect": {
+        "handle_prefix": "sha256:",
+        "digest_hex_digits": 32,
+        "workspace_content_ids_unchanged": true
+      },
+      "coverage": "workstreams::tests::home_receipt_positions_distinguish_rejoin_history",
+      "additional_coverage": [
+        "workstreams::tests::exact_fork_admission_keeps_source_content_and_rejects_closed_home_first",
+        "vcs::tests::exact_instance_fork_uses_historical_cut_not_source_tip",
+        "vcs::tests::reserved_boundary_promotes_with_one_exact_main_cas"
+      ]
+    },
+    {
+      "id": "v1_receipt_identity_survives_runtime_upgrade",
+      "given": {
+        "source_revision": "44302912257d49dbf033fe2543400c640f6fa71b",
+        "native_store_fixtures": ["fork", "archived", "landed"]
+      },
+      "when": "open_with_successor_and_retry",
+      "expect": {
+        "historical_receipts_unchanged": true,
+        "exact_fork_evidence_unchanged": true,
+        "post_cas_recovery_main_writes": 0,
+        "workspace_content_ids_unchanged": true
+      },
+      "coverage": "mtarget_receipt_upgrade::old_home_and_lost_fork_response_replay_the_original_evidence",
+      "additional_coverage": [
+        "mtarget_receipt_upgrade::old_archived_receipt_replays_without_rewriting_its_handle",
+        "mtarget_receipt_upgrade::old_landed_boundary_recovers_without_rekeying_the_accepted_fact",
+        "mtarget_receipt_upgrade::old_post_cas_store_closes_forward_without_another_main_write"
+      ]
+    },
+    {
+      "id": "historical_promotion_receipt_survives_later_main_work",
+      "given": {
+        "accepted_promotion": "main-2",
+        "later_main_cut": "main-3",
+        "unreferenced_proposal": "orphan"
+      },
+      "when": "boundary_ref_evidence",
+      "expect": {
+        "original_receipt_unchanged": true,
+        "orphan_is_not_acceptance": true,
+        "explicit_undo_preserves_acceptance_evidence": true,
+        "main_cas_count": 0
+      },
+      "coverage": "vcs::tests::boundary_evidence_is_stable_after_later_main_cuts_and_orphan_proposals",
+      "coordinator_coverage": "effect_handlers::promote_door_tests::promotion_recovery_after_another_promotion_preserves_the_original_receipt"
     },
     {
       "id": "sparse_member_import_preserves_absent_partition",
@@ -180,6 +249,87 @@
         "authority_position_changed": false
       },
       "coverage": "workstreams::tests::exact_fork_admission_keeps_source_content_and_rejects_closed_home_first"
+    },
+    {
+      "id": "exact_fork_lost_response_retry_replays_success",
+      "given": {
+        "source_cut": "chat-1",
+        "target_instance": "child",
+        "fork_branch_id": "chat-child",
+        "existing_binding": "chat-child",
+        "existing_home": "live"
+      },
+      "when": "fork_at_cut_and_admit",
+      "expect": {
+        "outcome": "forked",
+        "branch_point_cut": "chat-1",
+        "home_stream_id": "live",
+        "authority_position_changed": false,
+        "evidence_changed": false
+      },
+      "coverage": "workstreams::tests::exact_fork_admission_keeps_source_content_and_rejects_closed_home_first"
+    },
+    {
+      "id": "native_pre_cas_error_releases_both_reservations",
+      "given": {
+        "status": "boundary_reserved",
+        "expected_main_cut": "main-1",
+        "proposed_main_cut": "occupied-cut",
+        "proposed_cut_identity": "occupied_by_incompatible_cut"
+      },
+      "when": "promote_line_exact",
+      "expect": {
+        "outcome": "pre_cas_error",
+        "main_cut": "main-1",
+        "status": "active",
+        "line_reservation_released": true
+      },
+      "coverage": "tests::cli_surface::native_promotion_releases_both_reservations_after_proven_pre_cas_error"
+    },
+    {
+      "id": "hosted_pre_cas_error_releases_both_reservations",
+      "given": {
+        "status": "boundary_reserved",
+        "expected_main_cut": "main-1",
+        "proposed_main_cut": "occupied-cut",
+        "proposed_cut_identity": "occupied_by_incompatible_cut"
+      },
+      "when": "promote_line_exact",
+      "expect": {
+        "outcome": "pre_cas_error",
+        "main_cut": "main-1",
+        "status": "active",
+        "line_reservation_released": true
+      },
+      "coverage": "do_workstreams::tests::do_promote_releases_both_reservations_after_proven_pre_cas_error"
+    },
+    {
+      "id": "native_post_cas_error_recovers_or_retains",
+      "given": {
+        "main_advanced": true,
+        "operation_log_write": "fails_after_cas"
+      },
+      "when": "recover_boundary_ref_evidence",
+      "expect": {
+        "with_cut_evidence": "close_forward",
+        "without_cut_evidence": "retain_both_reservations",
+        "main_cas_count": 1
+      },
+      "coverage": "tests::cli_surface::native_promotion_releases_both_reservations_after_proven_pre_cas_error"
+    },
+    {
+      "id": "hosted_post_cas_error_recovers_or_retains",
+      "given": {
+        "main_advanced": true,
+        "operation_log_write": "fails_after_cas"
+      },
+      "when": "recover_boundary_ref_evidence",
+      "expect": {
+        "with_cut_evidence": "close_forward",
+        "without_cut_evidence": "retain_both_reservations",
+        "main_cas_count": 1
+      },
+      "coverage": "do_workstreams::tests::do_promote_releases_both_reservations_after_proven_pre_cas_error"
     },
     {
       "id": "discard_requires_unused_fork_evidence",

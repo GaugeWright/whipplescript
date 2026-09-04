@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from pathlib import Path
 
 
@@ -23,7 +24,7 @@ def fail(message: str) -> None:
 pin = json.loads(PIN.read_text(encoding="utf-8"))
 if pin.get("schema") != "whipplescript.workstream_host_contract_pin.v1":
     fail("wrong pin schema")
-if pin.get("contract_revision") != "whipplescript-workstream-host/v1.0.1":
+if pin.get("contract_revision") != "whipplescript-workstream-host/v1.0.2":
     fail("the current published v1 revision drifted")
 
 claimed_digest = pin.get("contract_digest")
@@ -40,11 +41,14 @@ if claimed_digest != actual_digest:
 required_operations = {
     "reserve_boundary",
     "release_boundary",
+    "acknowledge_boundary_release",
+    "release_reserved_boundary_generic",
     "record_ref_advanced",
     "close_promoted",
     "home_receipt",
     "transfer",
     "reserve_branch_head",
+    "branch_head_reservation",
     "release_branch_head_reservation",
     "promote_line_exact",
     "boundary_ref_evidence",
@@ -94,7 +98,12 @@ ids = [case.get("id") for case in cases]
 required_cases = {
     "reservation_freezes_topology_and_contribution",
     "conflict_releases_without_main_movement",
+    "cancelled_boundary_cleanup_survives_each_crash",
+    "cleanup_failures_and_stale_tokens_preserve_the_owner",
     "post_cas_recovery_closes_forward",
+    "receipt_handles_match_shipped_v1_schema",
+    "v1_receipt_identity_survives_runtime_upgrade",
+    "historical_promotion_receipt_survives_later_main_work",
     "sparse_member_import_preserves_absent_partition",
     "exact_fork_admits_home_without_rematerialization",
     "archived_inherited_home_creates_nothing",
@@ -104,15 +113,28 @@ required_cases = {
     "reserved_line_rejects_direct_head_advance",
     "proposal_record_failure_precedes_main_publication",
     "fork_identity_refusal_preserves_existing_home",
+    "exact_fork_lost_response_retry_replays_success",
+    "native_pre_cas_error_releases_both_reservations",
+    "hosted_pre_cas_error_releases_both_reservations",
+    "native_post_cas_error_recovers_or_retains",
+    "hosted_post_cas_error_recovers_or_retains",
     "discard_requires_unused_fork_evidence",
     "discard_replay_key_is_namespaced_and_verified",
 }
 if len(ids) != len(set(ids)) or set(ids) != required_cases:
     fail("fixture case inventory is incomplete or duplicated")
+test_sources = [path.read_text(encoding="utf-8") for path in (ROOT / "crates").rglob("*.rs")]
 for case in cases:
     coverage = case.get("coverage")
-    if not isinstance(coverage, str) or "::tests::" not in coverage:
+    if not isinstance(coverage, str) or "::" not in coverage:
         fail(f"fixture {case.get('id')} has no concrete test coverage")
+    test_name = coverage.rsplit("::", 1)[-1]
+    test_definition = re.compile(
+        r"#\[(?:\w+::)?test(?:\([^]]*\))?\]\s*(?:async\s+)?fn\s+"
+        + re.escape(test_name) + r"\s*\("
+    )
+    if not any(test_definition.search(source) for source in test_sources):
+        fail(f"fixture {case.get('id')} names missing test {coverage}")
 
 compatibility = pin.get("compatibility", {})
 if compatibility != {

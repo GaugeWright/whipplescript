@@ -30,6 +30,7 @@ METHODS=(
     record_ref_advanced
     close_promoted
     release_boundary
+    acknowledge_boundary_release
     reserve_branch_head
     release_branch_head_reservation
 )
@@ -42,21 +43,40 @@ crates/whipplescript-cli/src/main.rs|apply_undo_selection|2
 crates/whipplescript-store/src/vcs.rs|transport_selection|4
 crates/whipplescript-kernel/src/effect_handlers.rs|transport_selection|1
 crates/whipplescript-cli/src/main.rs|transport_selection|1
-crates/whipplescript-store/src/vcs.rs|promote_line_exact|6
-crates/whipplescript-kernel/src/effect_handlers.rs|promote_line_exact|1
-crates/whipplescript-store/src/vcs.rs|boundary_ref_evidence|1
-crates/whipplescript-kernel/src/effect_handlers.rs|boundary_ref_evidence|1
-crates/whipplescript-store/src/workstreams.rs|reserve_boundary|5
-crates/whipplescript-kernel/src/effect_handlers.rs|reserve_boundary|1
+crates/whipplescript-store/src/vcs.rs|promote_line_exact|7
+crates/whipplescript-kernel/src/effect_handlers.rs|promote_line_exact|2
+crates/whipplescript-store/src/vcs.rs|boundary_ref_evidence|6
+crates/whipplescript-kernel/src/effect_handlers.rs|boundary_ref_evidence|3
+crates/whipplescript-store/src/workstreams.rs|reserve_boundary|7
+crates/whipplescript-kernel/src/effect_handlers.rs|reserve_boundary|6
 crates/whipplescript-store/src/workstreams.rs|record_ref_advanced|1
-crates/whipplescript-kernel/src/effect_handlers.rs|record_ref_advanced|2
+crates/whipplescript-kernel/src/effect_handlers.rs|record_ref_advanced|3
 crates/whipplescript-store/src/workstreams.rs|close_promoted|2
-crates/whipplescript-kernel/src/effect_handlers.rs|close_promoted|2
-crates/whipplescript-store/src/workstreams.rs|release_boundary|3
-crates/whipplescript-kernel/src/effect_handlers.rs|release_boundary|4
-crates/whipplescript-store/src/vcs.rs|reserve_branch_head|5
-crates/whipplescript-kernel/src/effect_handlers.rs|reserve_branch_head|1
-crates/whipplescript-kernel/src/effect_handlers.rs|release_branch_head_reservation|7"
+crates/whipplescript-kernel/src/effect_handlers.rs|close_promoted|3
+crates/whipplescript-store/src/workstreams.rs|release_boundary|6
+crates/whipplescript-kernel/src/effect_handlers.rs|release_boundary|3
+crates/whipplescript-store/src/workstreams.rs|acknowledge_boundary_release|7
+crates/whipplescript-kernel/src/effect_handlers.rs|acknowledge_boundary_release|3
+crates/whipplescript-host-do/src/do_workstreams.rs|acknowledge_boundary_release|4
+crates/whipplescript-store/src/vcs.rs|reserve_branch_head|6
+crates/whipplescript-kernel/src/effect_handlers.rs|reserve_branch_head|5
+crates/whipplescript-kernel/src/effect_handlers.rs|release_branch_head_reservation|2
+crates/whipplescript-cli/src/main_tests/tests/cli_surface.rs|reserve_boundary|2
+crates/whipplescript-cli/src/main_tests/tests/cli_surface.rs|reserve_branch_head|1
+crates/whipplescript-cli/src/main_tests/tests/cli_surface.rs|release_branch_head_reservation|1
+crates/whipplescript-host-do/src/do_workstreams.rs|reserve_boundary|4
+crates/whipplescript-host-do/src/do_workstreams.rs|release_boundary|4
+crates/whipplescript-host-do/src/do_workstreams.rs|reserve_branch_head|4
+crates/whipplescript-host-do/src/do_workstreams.rs|release_branch_head_reservation|3
+crates/whipplescript-store/examples/workstream_receipt_reports.rs|close_promoted|1
+crates/whipplescript-store/examples/workstream_receipt_reports.rs|promote_line_exact|1
+crates/whipplescript-store/examples/workstream_receipt_reports.rs|record_ref_advanced|1
+crates/whipplescript-store/examples/workstream_receipt_reports.rs|reserve_boundary|1
+crates/whipplescript-store/examples/workstream_receipt_reports.rs|reserve_branch_head|1
+crates/whipplescript-store/tests/mtarget_receipt_upgrade.rs|boundary_ref_evidence|1"
+
+# workstream_receipt_reports is a schema-test emitter over in-memory/fixture
+# stores only: no user-store argument, credentials, or additional host door.
 
 # The DISPATCH half (DR-0091 W4): each host door must reach the kernel's one
 # choreography and one renderer. These are free functions, so the pattern has
@@ -66,6 +86,7 @@ crates/whipplescript-kernel/src/effect_handlers.rs|release_branch_head_reservati
 # parity tests then catch in shape.
 DISPATCH=(
     run_reserved_boundary_promotion_generic
+    release_reserved_boundary_generic
     run_selective_verb_generic
     promote_effect_outcome
     selective_effect_outcome
@@ -74,6 +95,10 @@ DISPATCH=(
 DISPATCH_PINNED="\
 crates/whipplescript-cli/src/main.rs|run_reserved_boundary_promotion_generic|1
 crates/whipplescript-host-do/src/do_workstreams.rs|run_reserved_boundary_promotion_generic|1
+crates/whipplescript-kernel/src/effect_handlers.rs|run_reserved_boundary_promotion_generic|11
+crates/whipplescript-kernel/tests/mtarget_receipt_upgrade.rs|run_reserved_boundary_promotion_generic|1
+crates/whipplescript-kernel/src/effect_handlers.rs|release_reserved_boundary_generic|9
+crates/whipplescript-host-do/src/do_workstreams.rs|release_reserved_boundary_generic|6
 crates/whipplescript-cli/src/main.rs|run_selective_verb_generic|1
 crates/whipplescript-host-do/src/do_workstreams.rs|run_selective_verb_generic|1
 crates/whipplescript-kernel/src/effect_handlers.rs|run_selective_verb_generic|7

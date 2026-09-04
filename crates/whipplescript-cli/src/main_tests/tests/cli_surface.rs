@@ -4,6 +4,238 @@
 //! fixtures and the crate-root imports in scope.
 
 use super::*;
+
+#[test]
+fn native_promotion_releases_both_reservations_after_proven_pre_cas_error() {
+    use whipplescript_store::branches::HeadReservationOutcome;
+    use whipplescript_store::workstreams::{
+        BoundaryReservation, ReserveBoundaryOutcome, StreamStatus, Workstreams,
+    };
+
+    let _guard = crate::env_lock();
+    let root = std::env::temp_dir().join(format!(
+        "whip-promotion-cleanup-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos(),
+    ));
+    std::fs::create_dir_all(&root).expect("mkdir");
+    let previous: Vec<(&str, Option<std::ffi::OsString>)> = [
+        "WHIPPLESCRIPT_BRANCH_STORE",
+        "WHIPPLESCRIPT_VCS_CONTENT_STORE",
+        "WHIPPLESCRIPT_WORKSTREAM_STORE",
+        "WHIPPLESCRIPT_COORDINATION_STORE",
+    ]
+    .into_iter()
+    .map(|key| (key, std::env::var_os(key)))
+    .collect();
+    std::env::set_var("WHIPPLESCRIPT_BRANCH_STORE", root.join("branches.sqlite"));
+    std::env::set_var(
+        "WHIPPLESCRIPT_VCS_CONTENT_STORE",
+        root.join("content.sqlite"),
+    );
+    std::env::set_var(
+        "WHIPPLESCRIPT_WORKSTREAM_STORE",
+        root.join("workstreams.sqlite"),
+    );
+    std::env::set_var(
+        "WHIPPLESCRIPT_COORDINATION_STORE",
+        root.join("coordination.sqlite"),
+    );
+
+    let mut vcs = open_vcs().expect("vcs");
+    vcs.init("t0").expect("init");
+    vcs.write("main", "base.md", Some("base"), "main-1", "t1")
+        .expect("main seed");
+    vcs.create_branch("line-pre-cas", None, "main", "t1")
+        .expect("line");
+    vcs.write(
+        "line-pre-cas",
+        "feature.md",
+        Some("stream work"),
+        "line-1",
+        "t2",
+    )
+    .expect("line write");
+    vcs.create_branch("unrelated", None, "main", "t2")
+        .expect("unrelated");
+    vcs.write(
+        "unrelated",
+        "unrelated.md",
+        Some("occupy immutable cut id"),
+        "occupied-cut",
+        "t2",
+    )
+    .expect("occupy proposed cut identity");
+
+    let mut streams =
+        whipplescript_store::workstreams::WorkstreamStore::open(root.join("workstreams.sqlite"))
+            .expect("streams");
+    streams
+        .create_stream("pre-cas", None, "line-pre-cas", "t1", None)
+        .expect("create stream");
+    assert!(matches!(
+        streams
+            .reserve_boundary(
+                "pre-cas",
+                BoundaryReservation {
+                    reservation_id: "first-attempt",
+                    expected_line_cut: "line-1",
+                    expected_main_cut: "main-1",
+                    proposed_main_cut: "occupied-cut",
+                    at: "t2",
+                },
+            )
+            .expect("reserve boundary"),
+        ReserveBoundaryOutcome::Reserved(_)
+    ));
+
+    let error = run_reserved_boundary_promotion(
+        &mut streams,
+        &mut vcs,
+        "pre-cas",
+        "ignored-retry-seed",
+        "holder",
+        "t3",
+    )
+    .expect_err("conflicting immutable cut identity must fail");
+    assert!(error.contains("reservations released"), "{error}");
+    assert_eq!(
+        streams
+            .get_stream("pre-cas")
+            .expect("stream read")
+            .expect("stream")
+            .status,
+        StreamStatus::Active
+    );
+    assert_eq!(
+        vcs.reserve_branch_head("line-pre-cas", "next-attempt", "t4")
+            .expect("line can be reserved again"),
+        HeadReservationOutcome::Reserved
+    );
+    vcs.release_branch_head_reservation("line-pre-cas", "next-attempt")
+        .expect("release probe");
+    vcs.write(
+        "line-pre-cas",
+        "feature.md",
+        Some("later work"),
+        "line-2",
+        "t4",
+    )
+    .expect("a later write is admitted");
+    assert_eq!(
+        vcs.get_branch("main")
+            .expect("main")
+            .expect("main")
+            .head_cut_id
+            .as_deref(),
+        Some("main-1")
+    );
+
+    for (stream_id, lose_cut) in [("post-cas", false), ("missing-evidence", true)] {
+        let line = format!("line-{stream_id}");
+        let line_cut = format!("cut-{stream_id}");
+        let proposed_main = format!("main-{stream_id}");
+        let main_before = vcs
+            .get_branch("main")
+            .expect("main")
+            .expect("main")
+            .head_cut_id;
+        vcs.create_branch(&line, None, "main", "t5").expect("line");
+        vcs.write(&line, "next.md", Some(stream_id), &line_cut, "t5")
+            .expect("line write");
+        streams
+            .create_stream(stream_id, None, &line, "t5", None)
+            .expect("stream");
+        streams
+            .reserve_boundary(
+                stream_id,
+                BoundaryReservation {
+                    reservation_id: stream_id,
+                    expected_line_cut: &line_cut,
+                    expected_main_cut: main_before.as_deref().unwrap_or_default(),
+                    proposed_main_cut: &proposed_main,
+                    at: "t5",
+                },
+            )
+            .expect("boundary");
+        let db =
+            rusqlite::Connection::open(root.join("branches.sqlite")).expect("fault connection");
+        // RAISE(FAIL) preserves the earlier CAS (and the deliberate cut loss),
+        // unlike ABORT which would roll the trigger's own changes back.
+        let lose_evidence = if lose_cut {
+            format!("DELETE FROM cuts WHERE cut_id = '{proposed_main}';")
+        } else {
+            String::new()
+        };
+        db.execute_batch(&format!(
+            "CREATE TRIGGER fail_promotion_log BEFORE INSERT ON ops
+             WHEN NEW.kind = 'promote-boundary' BEGIN
+             {lose_evidence} SELECT RAISE(FAIL, 'injected post-CAS failure'); END;"
+        ))
+        .expect("inject post-CAS fault");
+        let result = run_reserved_boundary_promotion(
+            &mut streams,
+            &mut vcs,
+            stream_id,
+            stream_id,
+            "holder",
+            "t6",
+        );
+        db.execute_batch("DROP TRIGGER fail_promotion_log;")
+            .expect("remove fault");
+        assert_eq!(
+            vcs.get_branch("main")
+                .expect("main")
+                .expect("main")
+                .head_cut_id
+                .as_deref(),
+            Some(proposed_main.as_str()),
+            "the fault was after the Main CAS"
+        );
+        let row = streams
+            .get_stream(stream_id)
+            .expect("read stream")
+            .expect("stream");
+        if lose_cut {
+            let error = result.expect_err("missing cut evidence is indeterminate, not pre-CAS");
+            assert!(error.contains("reservations retained"), "{error}");
+            assert_eq!(row.status, StreamStatus::BoundaryReserved);
+            let error = vcs
+                .write(&line, "next.md", Some("not allowed"), "cut-forbidden", "t7")
+                .expect_err("line remains frozen");
+            assert!(format!("{error:?}").contains("reserved"));
+        } else {
+            assert!(
+                matches!(result, Ok(BoundaryRunOutcome::Promoted { .. })),
+                "{result:?}"
+            );
+            assert_eq!(row.status, StreamStatus::Archived);
+            assert!(matches!(
+                run_reserved_boundary_promotion(
+                    &mut streams,
+                    &mut vcs,
+                    stream_id,
+                    stream_id,
+                    "holder",
+                    "t7"
+                ),
+                Ok(BoundaryRunOutcome::Promoted { .. })
+            ));
+        }
+    }
+
+    for (key, value) in previous {
+        match value {
+            Some(value) => std::env::set_var(key, value),
+            None => std::env::remove_var(key),
+        }
+    }
+    let _ = std::fs::remove_dir_all(root);
+}
+
 /// The `whip mcp` subcommands are the only writers of trust evidence — the
 /// pin, the attestation, the role file — so they are exactly the surface
 /// that should not be hand-validated only. Driven sequentially in one test

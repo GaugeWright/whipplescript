@@ -24,7 +24,7 @@
       "enum": ["active", "boundary_reserved", "ref_advanced", "archived", null]
     },
     "authority_position": { "type": "integer", "minimum": 0 },
-    "evidence_handle": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+    "evidence_handle": { "type": "string", "description": "Frozen v1 evidence identifier: SHA-256 truncated to 128 bits; not an authorization proof.", "pattern": "^sha256:[0-9a-f]{32}$" },
     "recorded_at": { "type": ["string", "null"], "minLength": 1 }
   },
   "allOf": [

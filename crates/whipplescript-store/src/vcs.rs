@@ -702,15 +702,46 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
                 format!(
                     "workstream-boundary-v1|{stream_line_id}|{}|{proposed_main_cut}|{manifest_hash}|{ref_position}",
                     expected_main_cut.unwrap_or("")
-                )
-                .as_bytes()
+                ).as_bytes()
             )
         )
     }
 
-    /// Recover the evidence for an already-landed DR-0078 Main cut without
-    /// issuing another CAS. `None` means Main does not currently name that cut
-    /// or the immutable cut record is unavailable.
+    fn main_cut_lineage(
+        &self,
+        head: Option<&str>,
+        checked: &BTreeSet<String>,
+    ) -> StoreResult<Vec<CutRow>> {
+        let mut lineage = Vec::new();
+        let mut seen: BTreeSet<String> = BTreeSet::new();
+        let mut cursor = head.map(str::to_owned);
+        while let Some(id) = cursor {
+            if checked.contains(&id) {
+                break;
+            }
+            if !seen.insert(id.clone()) {
+                return Err(StoreError::Conflict(
+                    "Main cut lineage contains a cycle".to_owned(),
+                ));
+            }
+            let cut = self.branches.get_cut(&id)?.ok_or_else(|| {
+                StoreError::Conflict(format!("Main cut lineage is missing `{id}`"))
+            })?;
+            if cut.branch_id != MAINLINE_BRANCH_ID {
+                return Err(StoreError::Conflict(format!(
+                    "Main cut lineage names a non-Main cut `{id}`"
+                )));
+            }
+            cursor = cut.parent_cut_id.clone();
+            lineage.push(cut);
+        }
+        Ok(lineage)
+    }
+
+    /// Recover an already-landed DR-0078 Main cut from accepted head history,
+    /// without another CAS. Later advances or an explicit undo cannot change
+    /// its ancestry position. A stored, unreferenced proposal is not proof.
+    /// Missing/corrupt accepted history errors rather than proving non-acceptance.
     ///
     /// Governed write surface (DR-0091): every call site is pinned by
     /// `scripts/check-governed-doors.sh` — a new caller belongs behind a
@@ -724,18 +755,52 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
         let Some(main) = self.branches.get_branch(MAINLINE_BRANCH_ID)? else {
             return Ok(None);
         };
-        if main.head_cut_id.as_deref() != Some(proposed_main_cut) {
-            return Ok(None);
+        let mut lineage = self.main_cut_lineage(main.head_cut_id.as_deref(), &BTreeSet::new())?;
+        if !lineage.iter().any(|cut| cut.cut_id == proposed_main_cut) {
+            // undo-op may repoint Main away from this ancestry, but its
+            // append-only before/after heads retain the acceptance evidence.
+            let mut checked = lineage
+                .iter()
+                .map(|cut| cut.cut_id.clone())
+                .collect::<BTreeSet<_>>();
+            'history: for op in self.branches.list_ops(usize::MAX)? {
+                for delta in op
+                    .deltas
+                    .into_iter()
+                    .filter(|delta| delta.branch_id == MAINLINE_BRANCH_ID)
+                {
+                    for state in delta.before.into_iter().chain(std::iter::once(delta.after)) {
+                        let Some(head) = state.head_cut_id else {
+                            continue;
+                        };
+                        // Each nonmatching ancestor is walked at most once,
+                        // even when thousands of operations share that tail.
+                        let previous = self.main_cut_lineage(Some(&head), &checked)?;
+                        if previous.iter().any(|cut| cut.cut_id == proposed_main_cut) {
+                            lineage =
+                                self.main_cut_lineage(Some(proposed_main_cut), &BTreeSet::new())?;
+                            break 'history;
+                        }
+                        checked.extend(previous.into_iter().map(|cut| cut.cut_id));
+                    }
+                }
+            }
         }
-        let Some(cut) = self.branches.get_cut(proposed_main_cut)? else {
+        let Some(index) = lineage
+            .iter()
+            .position(|cut| cut.cut_id == proposed_main_cut)
+        else {
             return Ok(None);
         };
-        let ref_position = u64::try_from(
-            self.branches
-                .list_cuts(MAINLINE_BRANCH_ID, usize::MAX)?
-                .len(),
-        )
-        .unwrap_or(u64::MAX);
+        let cut = &lineage[index];
+        Self::verify_recorded_promotion_cut(
+            Some(cut),
+            proposed_main_cut,
+            expected_main_cut,
+            &cut.manifest_hash,
+            &format!("promote:{stream_line_id}"),
+        )?;
+        let ref_position = (lineage.len() - index) as u64;
         Ok(Some((
             ref_position,
             self.boundary_receipt_handle(
@@ -2350,12 +2415,9 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
             Some(&origin),
             at,
         )?;
-        let ref_position = u64::try_from(
-            self.branches
-                .list_cuts(MAINLINE_BRANCH_ID, usize::MAX)?
-                .len(),
-        )
-        .unwrap_or(u64::MAX);
+        let ref_position = self
+            .main_cut_lineage(Some(proposed_main_cut), &BTreeSet::new())?
+            .len() as u64;
         let ref_receipt_handle = self.boundary_receipt_handle(
             stream_line_id,
             expected_main_cut,
@@ -4046,6 +4108,10 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
             .release_head_reservation(branch_id, reservation_id)
     }
 
+    pub fn branch_head_reservation(&self, branch_id: &str) -> StoreResult<Option<String>> {
+        self.branches.head_reservation(branch_id)
+    }
+
     /// The branch half of a chat fork (chat-fork.maude): give the forked
     /// instance its OWN line — a fresh branch forked at the source line's
     /// current head, bound to the target at birth. Never rebinds the fork
@@ -4161,11 +4227,7 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
                 },
             ));
         }
-        if let Some(branch_id) = self.instance_branch(target_instance)? {
-            return Ok(ExactInstanceForkPreflight::Refused(
-                ExactInstanceForkBinding::TargetAlreadyBound { branch_id },
-            ));
-        }
+        let target_branch_id = self.instance_branch(target_instance)?;
         if let Some(row) = self.get_branch(fork_branch_id)? {
             if row.status != BranchStatus::Active
                 || row.parent_branch_id.as_deref() != Some(source_branch_id.as_str())
@@ -4177,17 +4239,31 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
                     },
                 ));
             }
-        } else if let Some(name) = name {
-            if let Some(holder) = self
-                .list_branches(Some(BranchStatus::Active))?
-                .into_iter()
-                .find(|row| row.name.as_deref() == Some(name))
-            {
+            if let Some(branch_id) = target_branch_id {
+                if branch_id != fork_branch_id {
+                    return Ok(ExactInstanceForkPreflight::Refused(
+                        ExactInstanceForkBinding::TargetAlreadyBound { branch_id },
+                    ));
+                }
+            }
+        } else {
+            if let Some(branch_id) = target_branch_id {
                 return Ok(ExactInstanceForkPreflight::Refused(
-                    ExactInstanceForkBinding::ForkBranchIdTaken {
-                        branch_id: holder.branch_id,
-                    },
+                    ExactInstanceForkBinding::TargetAlreadyBound { branch_id },
                 ));
+            }
+            if let Some(name) = name {
+                if let Some(holder) = self
+                    .list_branches(Some(BranchStatus::Active))?
+                    .into_iter()
+                    .find(|row| row.name.as_deref() == Some(name))
+                {
+                    return Ok(ExactInstanceForkPreflight::Refused(
+                        ExactInstanceForkBinding::ForkBranchIdTaken {
+                            branch_id: holder.branch_id,
+                        },
+                    ));
+                }
             }
         }
         Ok(ExactInstanceForkPreflight::Ready)
@@ -4238,7 +4314,9 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
             });
         }
         if let Some(branch_id) = self.instance_branch(target_instance)? {
-            return Ok(ExactInstanceForkBinding::TargetAlreadyBound { branch_id });
+            if branch_id != fork_branch_id {
+                return Ok(ExactInstanceForkBinding::TargetAlreadyBound { branch_id });
+            }
         }
         let fork_branch = match self.fork_with_lineage(
             fork_branch_id,
@@ -6533,6 +6611,304 @@ mod tests {
             Some("historical".to_owned())
         );
         assert!(evidence_handle.starts_with("sha256:"));
+        assert_eq!(
+            evidence_handle.len(),
+            39,
+            "v1 fork evidence retains its shipped SHA-256/128 identity"
+        );
+
+        let replay = vcs
+            .fork_binding_for_instance_at_cut("source", "chat-1", "child", "chat-child", None, "t5")
+            .expect("lost-response retry");
+        let ExactInstanceForkBinding::Forked {
+            fork_branch: replayed_branch,
+            evidence_handle: replayed_evidence,
+            ..
+        } = replay
+        else {
+            panic!("the exact compatible fork must replay as success");
+        };
+        assert_eq!(replayed_branch.branch_id, "chat-child");
+        assert_eq!(
+            replayed_branch.branch_point_cut_id.as_deref(),
+            Some("chat-1")
+        );
+        assert_eq!(replayed_evidence, evidence_handle);
+        assert_eq!(
+            vcs.fork_binding_for_instance_at_cut(
+                "source",
+                "chat-1",
+                "child",
+                "different-child",
+                None,
+                "t6",
+            )
+            .expect("different binding"),
+            ExactInstanceForkBinding::TargetAlreadyBound {
+                branch_id: "chat-child".to_owned(),
+            }
+        );
+        assert!(vcs.get_branch("different-child").expect("lookup").is_none());
+        assert_eq!(
+            vcs.fork_binding_for_instance_at_cut(
+                "source",
+                "chat-2",
+                "child",
+                "chat-child",
+                None,
+                "t6",
+            )
+            .expect("different cut"),
+            ExactInstanceForkBinding::ForkBranchIdTaken {
+                branch_id: "chat-child".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn exact_fork_preflight_refuses_other_target_binding_before_any_mutation() {
+        for existing_fork in [false, true] {
+            let mut vcs = vcs();
+            vcs.init("t0").expect("init");
+            vcs.create_branch("chat", None, MAINLINE_BRANCH_ID, "t1")
+                .expect("source branch");
+            vcs.bind_instance("source", "chat", "t1")
+                .expect("source binding");
+            vcs.write("chat", "answer.md", Some("historical"), "chat-1", "t2")
+                .expect("source cut");
+            vcs.create_branch("other", None, MAINLINE_BRANCH_ID, "t2")
+                .expect("other branch");
+            vcs.bind_instance("target", "other", "t2")
+                .expect("target bound elsewhere");
+            if existing_fork {
+                vcs.fork_with_lineage("child", None, "chat", Some("chat-1"), "t3")
+                    .expect("otherwise compatible fork");
+            }
+            let before = vcs.list_branches(None).expect("branches before");
+            // Test the preflight itself: the operation also checks the binding,
+            // but a coordinator can change topology between these two calls.
+            assert_eq!(
+                vcs.preflight_fork_binding_for_instance_at_cut(
+                    "source", "chat-1", "target", "child", None,
+                )
+                .expect("preflight"),
+                ExactInstanceForkPreflight::Refused(ExactInstanceForkBinding::TargetAlreadyBound {
+                    branch_id: "other".to_owned(),
+                }),
+                "existing_fork={existing_fork}",
+            );
+            assert_eq!(vcs.list_branches(None).expect("branches after"), before);
+            assert_eq!(
+                vcs.instance_branch("target").expect("target binding"),
+                Some("other".to_owned()),
+            );
+            assert_eq!(
+                vcs.instance_branch("source").expect("source binding"),
+                Some("chat".to_owned()),
+            );
+        }
+    }
+
+    #[test]
+    fn exact_fork_preflight_refuses_a_name_held_by_another_active_branch() {
+        let mut vcs = vcs();
+        vcs.init("t0").expect("init");
+        vcs.create_branch("chat", None, MAINLINE_BRANCH_ID, "t1")
+            .expect("source");
+        vcs.bind_instance("source", "chat", "t1").expect("binding");
+        vcs.write("chat", "answer.md", Some("historical"), "chat-1", "t2")
+            .expect("source cut");
+        vcs.create_branch("name-holder", Some("occupied"), MAINLINE_BRANCH_ID, "t2")
+            .expect("name holder");
+        let before = vcs.list_branches(None).expect("before");
+        assert_eq!(
+            vcs.preflight_fork_binding_for_instance_at_cut(
+                "source",
+                "chat-1",
+                "target",
+                "child",
+                Some("occupied")
+            )
+            .expect("preflight"),
+            ExactInstanceForkPreflight::Refused(ExactInstanceForkBinding::ForkBranchIdTaken {
+                branch_id: "name-holder".to_owned(),
+            }),
+        );
+        assert_eq!(vcs.list_branches(None).expect("after"), before);
+        assert_eq!(vcs.instance_branch("target").expect("still unbound"), None);
+    }
+
+    #[test]
+    fn boundary_evidence_is_stable_after_later_main_cuts_and_orphan_proposals() {
+        let mut vcs = vcs();
+        vcs.init("t0").expect("init");
+        vcs.write(MAINLINE_BRANCH_ID, "base.md", Some("base"), "main-1", "t1")
+            .expect("main");
+        vcs.create_branch("line", None, MAINLINE_BRANCH_ID, "t2")
+            .expect("line");
+        vcs.write("line", "work.md", Some("work"), "line-1", "t3")
+            .expect("work");
+        vcs.reserve_branch_head("line", "reservation", "t4")
+            .expect("reserve");
+        let BoundaryPromotionOutcome::Promoted {
+            ref_position,
+            ref_receipt_handle,
+            manifest_hash,
+            ..
+        } = vcs
+            .promote_line_exact(
+                "line",
+                "reservation",
+                Some("line-1"),
+                Some("main-1"),
+                "main-2",
+                "t4",
+            )
+            .expect("promote")
+        else {
+            panic!("promotion must land");
+        };
+        let original = Some((ref_position, ref_receipt_handle));
+        // A proposal recorded before a losing CAS is not a Main advance, and
+        // must not change an already-issued receipt's position or digest.
+        vcs.branches
+            .record_cut(CutRecord {
+                cut_id: "orphan",
+                change_id: "orphan",
+                branch_id: MAINLINE_BRANCH_ID,
+                manifest_hash: &manifest_hash,
+                parent_cut_id: Some("main-1"),
+                origin: Some("promote:other"),
+                actor: None,
+                intent: None,
+                recorded_at: "t5",
+            })
+            .expect("unpublished proposal");
+        assert_eq!(
+            vcs.boundary_ref_evidence("line", Some("main-1"), "main-2")
+                .expect("current evidence"),
+            original,
+            "an unrelated recorded proposal must not renumber Main evidence",
+        );
+        vcs.write(
+            MAINLINE_BRANCH_ID,
+            "later.md",
+            Some("later"),
+            "main-3",
+            "t6",
+        )
+        .expect("later accepted work");
+        assert_eq!(
+            vcs.boundary_ref_evidence("line", Some("main-1"), "main-2")
+                .expect("historical evidence"),
+            original,
+            "later Main work cannot erase or renumber an earlier promotion",
+        );
+        assert_eq!(
+            vcs.boundary_ref_evidence("other", Some("main-1"), "orphan")
+                .expect("unlanded proposal"),
+            None,
+            "a recorded proposal alone is not evidence of a successful CAS",
+        );
+        vcs.undo_op("op-main-3", "undo-later", "t7")
+            .expect("undo later work");
+        vcs.undo_op("op-main-2", "undo-promotion", "t8")
+            .expect("explicitly undo Main projection");
+        assert_eq!(
+            vcs.get_branch(MAINLINE_BRANCH_ID)
+                .unwrap()
+                .unwrap()
+                .head_cut_id
+                .as_deref(),
+            Some("main-1"),
+        );
+        assert_eq!(
+            vcs.boundary_ref_evidence("line", Some("main-1"), "main-2")
+                .expect("accepted historical evidence"),
+            original,
+            "undo is later work, not erasure of the original acceptance",
+        );
+    }
+
+    #[test]
+    fn boundary_evidence_refuses_damaged_ancestry_and_wrong_provenance() {
+        // Removing the cycle refusal must fail this test, not hang the sweep.
+        // The worker normally terminates immediately; the test process bounds
+        // the deliberately broken implementation without weakening the walk.
+        let (done, finished) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for mode in [
+                "missing",
+                "cycle",
+                "other-branch",
+                "wrong-origin",
+                "wrong-parent",
+            ] {
+                let mut vcs = vcs();
+                vcs.init("t0").expect("init");
+                vcs.write(MAINLINE_BRANCH_ID, "base.md", Some("base"), "main-1", "t1")
+                    .expect("base");
+                let manifest = vcs
+                    .get_branch(MAINLINE_BRANCH_ID)
+                    .unwrap()
+                    .unwrap()
+                    .head_manifest_hash
+                    .unwrap();
+                if mode != "missing" {
+                    vcs.branches
+                        .record_cut(CutRecord {
+                            cut_id: "bad",
+                            change_id: "bad",
+                            branch_id: if mode == "other-branch" {
+                                "other"
+                            } else {
+                                MAINLINE_BRANCH_ID
+                            },
+                            manifest_hash: &manifest,
+                            parent_cut_id: if mode == "cycle" {
+                                Some("bad")
+                            } else {
+                                Some("main-1")
+                            },
+                            origin: Some(if mode == "wrong-origin" {
+                                "promote:other"
+                            } else {
+                                "promote:line"
+                            }),
+                            actor: None,
+                            intent: None,
+                            recorded_at: "t2",
+                        })
+                        .expect("damaged record");
+                }
+                vcs.branches
+                    .advance_head(MAINLINE_BRANCH_ID, Some("main-1"), "bad", &manifest, "t2")
+                    .expect("simulate damaged Main");
+                let error = vcs
+                    .boundary_ref_evidence(
+                        "line",
+                        if mode == "wrong-parent" {
+                            None
+                        } else {
+                            Some("main-1")
+                        },
+                        "bad",
+                    )
+                    .expect_err("damaged evidence cannot certify or reopen a boundary");
+                let message = format!("{error:?}");
+                let expected = match mode {
+                    "missing" => "Main cut lineage is missing",
+                    "cycle" => "Main cut lineage contains a cycle",
+                    "other-branch" => "Main cut lineage names a non-Main cut",
+                    _ => "different immutable content or provenance",
+                };
+                assert!(message.contains(expected), "{mode}: {message}");
+            }
+            done.send(()).expect("test receiver");
+        });
+        finished
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("receipt validation must terminate and pass");
     }
 
     #[test]
@@ -6573,6 +6949,11 @@ mod tests {
         assert_eq!(main_cut_id, "main-2");
         assert!(ref_position >= 2);
         assert!(ref_receipt_handle.starts_with("sha256:"));
+        assert_eq!(
+            ref_receipt_handle.len(),
+            39,
+            "v1 boundary evidence retains its shipped SHA-256/128 identity"
+        );
         assert_eq!(
             vcs.boundary_ref_evidence("line-ws", Some("main-1"), "main-2")
                 .expect("recover landed ref"),

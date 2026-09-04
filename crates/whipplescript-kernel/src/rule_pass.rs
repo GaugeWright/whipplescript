@@ -810,6 +810,23 @@ pub fn step_instance_generic<S: RuntimeStore + Coordination + WorkItems + Fronti
                         .facts
                         .retain(|fact| !recorded.fact_ids.contains(&fact.fact_id));
                 }
+                // A rule can commit again as each continuation settles. Its
+                // first commit alone does not cover assertions made by those
+                // later commits: re-lowering a nested continuation must not
+                // re-emit an earlier after block's assertion. The union is
+                // scoped to this exact firing/admission, never global content.
+                // Views intentionally re-derive; retain their existing policy.
+                if rule.kind == whipplescript_parser::RuleKind::Rule {
+                    if let Some(recorded) = firing_recorded_facts.get(&(
+                        rule.name.clone(),
+                        context.identity.clone(),
+                        context.trigger_event_id.clone(),
+                    )) {
+                        lowering
+                            .facts
+                            .retain(|fact| !recorded.contains(&fact.fact_id));
+                    }
+                }
                 // DR-0083 Decision 4: a view's derived fact SUPERSEDES its
                 // predecessor, keyed by firing identity. Anything surviving the
                 // suppression above is a derivation that MOVED, so the value

@@ -3164,8 +3164,8 @@ impl SqliteStore {
             ],
         )?;
         tx.execute(
-            "UPDATE effects SET status = ?1, updated_at = CURRENT_TIMESTAMP WHERE effect_id = ?2 AND instance_id = ?3",
-            params![completion.status, completion.effect_id, completion.instance_id],
+            "UPDATE effects SET status = ?1, updated_at = (SELECT occurred_at FROM events WHERE event_id = ?4) WHERE effect_id = ?2 AND instance_id = ?3",
+            params![completion.status, completion.effect_id, completion.instance_id, event.event_id],
         )?;
         mark_cancellation_requests_terminal_on(
             &tx,
@@ -8425,9 +8425,13 @@ fn insert_effect(
             idempotency_key,
             required_capabilities,
             profile,
-            timeout_seconds
+            timeout_seconds,
+            created_at,
+            updated_at
         )
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
+                (SELECT occurred_at FROM events WHERE event_id = ?8),
+                (SELECT occurred_at FROM events WHERE event_id = ?8))
         "#,
         params![
             effect.effect_id,
@@ -11734,11 +11738,11 @@ fn replay_effect_terminal(
         r#"
         UPDATE effects
         SET status = ?1,
-            updated_at = CURRENT_TIMESTAMP
+            updated_at = (SELECT occurred_at FROM events WHERE event_id = ?4)
         WHERE effect_id = ?2
           AND instance_id = ?3
         "#,
-        params![status, effect_id, instance_id],
+        params![status, effect_id, instance_id, event_id],
     )?;
     mark_cancellation_requests_terminal_on(connection, instance_id, effect_id, event_id)?;
     satisfy_dependencies_on(connection, instance_id)?;
