@@ -11691,6 +11691,358 @@ fn merging_passes_keeps_distinct_findings_and_order() {
     assert_eq!(diagnostics, labelled, "a related label was collapsed away");
 }
 
+/// The syntax layer's refusals, from a mutation sweep of `syntax.rs` on
+/// 2026-09-03: 16 of its 58 refusal sites were unexercised by the whole
+/// workspace suite — 27.6%, against 6.9% for `lib.rs` and 6.8% for
+/// `lowering.rs`.
+///
+/// The rate is four times the semantic layers', and the shape of what was
+/// uncovered says why. A refusal in `lib.rs` encodes a design decision, and
+/// gets a test because the decision is what its author was thinking about. A
+/// refusal here encodes WHAT A TYPO LOOKS LIKE — an unclosed brace, a misspelt
+/// unit, an option with no name — and nobody writes those on purpose. Tests are
+/// written by people who know the grammar, against programs they mean to be
+/// valid.
+///
+/// Grouped by mechanism rather than by site: three unterminated constructs are
+/// one question asked of three constructs, not three questions.
+#[test]
+fn an_unterminated_construct_says_which_one_it_could_not_close() {
+    let cases: &[(&str, &str)] = &[
+        (
+            "unterminated table row",
+            r#"
+workflow T
+output result R
+class R { v string }
+class Row { id string }
+table rows as Row [
+  { id "a"
+]
+rule j
+  when Row as r
+=> { complete result { v r.id } }
+"#,
+        ),
+        (
+            "unterminated grouped `when` block",
+            r#"
+workflow W
+output result R
+class R { v string }
+class Row { id string }
+rule j
+  when {
+    Row as r
+=> { complete result { v r.id } }
+"#,
+        ),
+        (
+            "unterminated block",
+            r#"
+workflow B
+output result R
+class R { v string }
+class Row { id string }
+rule j
+  when Row as r
+=> {
+  complete result { v r.id }
+"#,
+        ),
+    ];
+    for (expected, source) in cases {
+        let compiled = compile_program(source);
+        assert!(
+            compiled.diagnostics.iter().any(|d| {
+                d.code.as_str() == "parse.unclosed_delimiter" && d.message == *expected
+            }),
+            "expected `{expected}`, got {:?}",
+            compiled
+                .diagnostics
+                .iter()
+                .map(|d| d.message.as_str())
+                .collect::<Vec<_>>()
+        );
+    }
+}
+
+/// A clock source's vocabulary is closed, and every way of getting it wrong was
+/// unexercised. `std.time` reads a recurrence out of source text, so these are
+/// the refusals that stand between a misspelt schedule and a workflow that
+/// silently never fires.
+#[test]
+fn a_clock_source_refuses_a_schedule_it_cannot_read() {
+    let program = |recurrence: &str| {
+        format!(
+            r#"
+@service
+workflow ClockProbe
+use std.time
+use std.ingress
+
+signal tick.now {{
+  scheduled_at time
+  observed_at time
+  occurrence_id string
+  missed_count int
+}}
+
+source clock as daily {{
+{recurrence}
+  observe as tick
+  emit tick.now {{
+    scheduled_at tick.scheduled_at
+    observed_at tick.observed_at
+    occurrence_id tick.occurrence_id
+    missed_count tick.missed_count
+  }}
+}}
+
+rule r
+  when tick.now as t
+=> {{
+  record Seen {{ at t.scheduled_at }}
+}}
+
+class Seen {{ at time }}
+"#
+        )
+    };
+    let cases: &[(&str, &str, &str)] = &[
+        (
+            "  timezone \"UTC\"",
+            "construct.missing_requirement",
+            "clock source `daily` must declare a recurrence",
+        ),
+        (
+            "  every 5 fortnights",
+            "construct.unknown_option",
+            "unknown duration unit `fortnights`",
+        ),
+        (
+            "  every blursday at 09:00",
+            "construct.unknown_option",
+            "unknown calendar pattern `blursday`",
+        ),
+        (
+            "  every weekday at 25:00",
+            "type.invalid_literal",
+            "invalid time of day `25:00`",
+        ),
+    ];
+    for (recurrence, code, expected) in cases {
+        let compiled = compile_program(&program(recurrence));
+        assert!(
+            compiled
+                .diagnostics
+                .iter()
+                .any(|d| d.code.as_str() == *code && d.message == *expected),
+            "expected `{expected}`, got {:?}",
+            compiled
+                .diagnostics
+                .iter()
+                .map(|d| d.message.as_str())
+                .collect::<Vec<_>>()
+        );
+    }
+}
+
+/// A gauge bar is either chance-shaped or stat-shaped, and at most one of them.
+#[test]
+fn a_gauge_bar_is_checked_for_its_statistic_and_its_cardinality() {
+    let program = |bars: &str| {
+        format!(
+            r#"
+workflow G
+output result R
+class R {{ v string }}
+class Ticket {{ title string }}
+gauge g {{
+  judge via exec "score"
+{bars}
+}}
+rule j
+  when Ticket as t
+=> {{ complete result {{ v t.title }} }}
+"#
+        )
+    };
+    let unknown = compile_program(&program("  expect median(latency) at most 3"));
+    assert!(
+        unknown.diagnostics.iter().any(|d| {
+            d.code.as_str() == "construct.unknown_option"
+                && d.message == "unknown bar statistic `median`"
+        }),
+        "{:?}",
+        unknown
+            .diagnostics
+            .iter()
+            .map(|d| d.message.as_str())
+            .collect::<Vec<_>>()
+    );
+
+    let two = compile_program(&program(
+        "  expect P(ok) at least 0.9\n  expect P(ok) at least 0.5",
+    ));
+    assert!(
+        two.diagnostics.iter().any(|d| {
+            d.code.as_str() == "construct.cardinality_conflict"
+                && d.message == "gauge declares more than one bar"
+        }),
+        "{:?}",
+        two.diagnostics
+            .iter()
+            .map(|d| d.message.as_str())
+            .collect::<Vec<_>>()
+    );
+}
+
+/// The remaining syntax refusals: a character the lexer has no rule for, a
+/// description orphaned by a second one, a declaration the language REMOVED, a
+/// clause connective left out, and a grouped `when` that groups nothing.
+#[test]
+fn the_syntax_layer_refuses_what_it_cannot_read() {
+    let cases: &[(&str, &str, &str)] = &[
+        (
+            "parse.unexpected_character",
+            "unexpected character `$`",
+            r#"
+workflow L
+output result R
+class R { v string }
+class Odd { v $ }
+"#,
+        ),
+        (
+            "parse.misplaced_annotation",
+            "description is not attached to a declaration",
+            r#"
+workflow D
+
+output result R
+class R { v string }
+
+description "the first description"
+description "the second, which orphans the first"
+class Ticket { title string }
+
+rule j
+  when Ticket as t
+=> { complete result { v t.title } }
+"#,
+        ),
+        (
+            "parse.unsupported_syntax",
+            "the `flow` declaration was removed",
+            r#"
+workflow L
+flow main {
+  step one
+}
+"#,
+        ),
+        (
+            "parse.unexpected_token",
+            "expected `by` after `partition`",
+            r#"
+workflow L
+use std.coord
+
+output result R
+class R { v string }
+class Decision { area string }
+
+ledger decisions {
+  entry Decision
+  partition area
+  retain 90d
+}
+
+rule j
+  when Decision as d
+=> { complete result { v d.area } }
+"#,
+        ),
+        (
+            "construct.missing_requirement",
+            "grouped `when` block has no readiness clauses",
+            r#"
+workflow E
+use std.ingress
+
+output result R
+class R { v string }
+signal go.now { x string }
+
+rule j
+  when {
+  }
+=> { complete result { v "ok" } }
+"#,
+        ),
+    ];
+    for (code, expected, source) in cases {
+        let compiled = compile_program(source);
+        assert!(
+            compiled
+                .diagnostics
+                .iter()
+                .any(|d| d.code.as_str() == *code && d.message == *expected),
+            "expected `{expected}`, got {:?}",
+            compiled
+                .diagnostics
+                .iter()
+                .map(|d| d.message.as_str())
+                .collect::<Vec<_>>()
+        );
+    }
+}
+
+/// A `stub` naming only a surface. Its sibling — a stub naming both — is
+/// exercised all over the test-scenario suite, which is how this arm survived:
+/// the two differ only in whether the second segment was written.
+///
+/// The clause has to come FIRST in the block. In any later position the parser
+/// loses its closing brace and reports that instead, which is a recovery
+/// weakness worth knowing about and not what this pins.
+#[test]
+fn a_stub_naming_only_a_surface_is_refused() {
+    let compiled = compile_program(
+        r#"
+workflow S
+
+output result R
+class R { v string }
+class Ticket { title string }
+
+rule j
+  when Ticket as t
+=> { complete result { v t.title } }
+
+test "a stub naming only a surface" {
+  workflow S
+  stub agent
+  given fact Ticket { title "t" }
+  run until idle
+  expect workflow completed
+}
+"#,
+    );
+    assert!(
+        compiled.diagnostics.iter().any(|d| {
+            d.code.as_str() == "construct.missing_requirement"
+                && d.message.starts_with("stub needs a surface and an outcome")
+        }),
+        "{:?}",
+        compiled
+            .diagnostics
+            .iter()
+            .map(|d| d.message.as_str())
+            .collect::<Vec<_>>()
+    );
+}
+
 /// Refusals that a mutation sweep found nothing exercised: disabling each one
 /// left the whole workspace suite green, so the compiler advertised a rule no
 /// test proved it applies. They are grouped because they share that provenance,
@@ -22597,6 +22949,37 @@ fn an_error_inside_a_closed_block_gets_no_note() {
             .any(|related| related.span.start == workflow_opener)),
         "the genuinely unclosed bracket went unnamed: {:?}",
         parsed.diagnostics
+    );
+}
+
+/// The third guard, and the one nothing reached: a note that would land on the
+/// diagnostic's OWN caret is not added at all.
+///
+/// When the unclosed bracket is the very thing the error points at, the note
+/// says "this `{` is still open here" beneath a caret already sitting on that
+/// `{`. It tells the reader to look where they are looking. The suppression
+/// survived a mutation sweep untouched until 2026-09-03, so the compiler could
+/// have started repeating itself and no test would have said so.
+#[test]
+fn a_note_that_would_repeat_its_own_caret_is_not_added() {
+    let source = "workflow N\noutput result R\nclass R { v string }\nclass Row { id string }\n\nrule j\n  when Row as r\n=> {\n  complete result { v r.id }\n";
+    let parsed = crate::parse_program(source);
+    let unclosed = parsed
+        .diagnostics
+        .iter()
+        .find(|d| d.code.as_str() == "parse.unclosed_delimiter")
+        .unwrap_or_else(|| {
+            panic!(
+                "the fixture stopped producing an unclosed-delimiter error, so it proves nothing: {:?}",
+                parsed.diagnostics
+            )
+        });
+    assert!(
+        !unclosed
+            .related
+            .iter()
+            .any(|related| related.span.start == unclosed.span.start),
+        "the note points at the caret the diagnostic already sits on: {unclosed:?}"
     );
 }
 
