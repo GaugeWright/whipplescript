@@ -21495,7 +21495,7 @@ fn effect_policy_block_json(
     category_column: Option<&str>,
 ) -> Value {
     let category = match status {
-        "blocked" => category_column,
+        "blocked" | "blocked_by_admission" => category_column,
         "blocked_by_capability" => Some("capability"),
         "blocked_by_profile" => Some("profile"),
         "blocked_by_capacity" => Some("capacity"),
@@ -36245,7 +36245,8 @@ fn push_trace_record(records: &mut Vec<TraceRecord>, event: TraceEvent) {
 
 fn trace_effect_status(status: &str) -> EffectStatus {
     match status {
-        "blocked_by_dependency"
+        "blocked_by_admission"
+        | "blocked_by_dependency"
         | "blocked_by_capability"
         | "blocked_by_profile"
         | "blocked_by_capacity" => EffectStatus::Blocked,

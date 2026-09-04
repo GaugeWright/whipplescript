@@ -1379,6 +1379,29 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
         Ok(event)
     }
 
+    /// Record an admission gate's refusal, durably and recoverably. The trace
+    /// event carries `blocked_by_admission`, which `check_trace` does NOT list as
+    /// a non-denial block -- so `DenialEvidenceNamesItsSubject` applies and the
+    /// reason MUST name what was refused. That is the point of the separate
+    /// status: a refusal is held to the denial invariant, a binding block is not.
+    pub fn deny_effect_admission(
+        &mut self,
+        instance_id: &str,
+        effect_id: &str,
+        category: &str,
+        detail: &str,
+    ) -> StoreResult<StoredEvent> {
+        let event = self
+            .store
+            .deny_effect_admission(instance_id, effect_id, category, detail)?;
+        self.emit(TraceEvent::EffectBlocked {
+            effect_id: effect_id.to_owned(),
+            status: Some("blocked_by_admission".to_owned()),
+            reason: format!("{category}: {detail}"),
+        });
+        Ok(event)
+    }
+
     pub fn complete_run(&mut self, completion: EffectCompletion<'_>) -> StoreResult<StoredEvent> {
         let completion = EffectCompletion {
             status: "completed",
@@ -3362,6 +3385,7 @@ fn failure_error_kind(metadata_json: &str) -> Option<String> {
 fn effect_status(status: &str) -> EffectStatus {
     match status {
         "blocked"
+        | "blocked_by_admission"
         | "blocked_by_dependency"
         | "blocked_by_capability"
         | "blocked_by_profile"

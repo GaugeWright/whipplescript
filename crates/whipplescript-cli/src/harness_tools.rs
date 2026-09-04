@@ -3693,6 +3693,7 @@ fn effect_state_for_agent(effects: &[EffectView], agent: &str) -> (AgentState, O
         (AgentState::Starting, Some(effect))
     } else if let Some(effect) = select(&[
         "blocked",
+        "blocked_by_admission",
         "blocked_by_dependency",
         "blocked_by_capacity",
         "blocked_by_policy",
@@ -4925,6 +4926,49 @@ fn resolve_harness_model_config() -> Result<Option<HarnessModelConfig>, String> 
     }))
 }
 
+/// What a turn does about an MCP resolution that did not succeed.
+///
+/// `Fail` carries the FINISHED error rather than a string for the caller to
+/// wrap. The words an operator reads are then written and tested in one place,
+/// and the call site returns what it was handed instead of making a second
+/// refusal decision two frames from the one that was actually made.
+#[derive(Debug)]
+enum McpFailureAction {
+    /// A gate refused: record it against the effect, recoverably.
+    Deny { category: String, message: String },
+    /// Something else went wrong: fail the turn.
+    Fail(StoreError),
+}
+
+/// The routing decision, kept pure so it can be tested without standing up a
+/// turn. It holds two rules that are easy to get wrong and invisible from the
+/// call site.
+///
+/// The denial's category is per SERVER, not a constant. The block is idempotent
+/// per (effect, category), so a constant category would hand back the FIRST
+/// server's event unchanged when a second server denies after the first is
+/// repaired -- leaving the operator reading a stale reason naming the wrong
+/// server.
+///
+/// And the server's dots are stripped. The kernel renders a block reason as
+/// `{category}: {detail}`, and the trace checker reads a dotted `<id>: ` prefix
+/// as a diagnostic code; a server called `acme.tools` would otherwise make the
+/// category parse as the unregistered code `mcp:acme.tools`, and `check_trace`
+/// would refuse a denial that is perfectly well formed.
+fn mcp_failure_action(error: crate::mcp_tools::McpResolveError) -> McpFailureAction {
+    match error {
+        crate::mcp_tools::McpResolveError::Denied { server, message } => McpFailureAction::Deny {
+            category: format!("mcp:{}", server.replace('.', "_")),
+            message,
+        },
+        crate::mcp_tools::McpResolveError::Failed(message) => {
+            McpFailureAction::Fail(StoreError::Conflict(format!(
+                "this turn could not be given its MCP tool surface: {message}"
+            )))
+        }
+    }
+}
+
 /// Run one owned/brokered agent turn: file tools over the workspace root, settled
 /// to a single terminal fact. Uses the live provider model client when
 /// `WHIPPLESCRIPT_HARNESS_PROVIDER` is set (credential-gated), else the
@@ -5030,12 +5074,32 @@ pub fn run_owned_agent_turn(
     let mut mcp_trust: Vec<(String, whipplescript_kernel::mcp::McpRung, Vec<String>)> = Vec::new();
     if !turn_tool_access.mcp.is_empty() {
         let registry = crate::mcp_tools::load_registry().map_err(StoreError::Conflict)?;
-        let (mcp_specs, mcp_runtime) = crate::mcp_tools::resolve_turn_mcp_tools(
+        let resolved = crate::mcp_tools::resolve_turn_mcp_tools(
             &turn_tool_access.mcp,
             &registry,
             envelope_mcp_min_rung().map_err(StoreError::Conflict)?,
-        )
-        .map_err(StoreError::Conflict)?;
+        );
+        let (mcp_specs, mcp_runtime) = match resolved {
+            Ok(resolved) => resolved,
+            // An admission gate refused. This used to be a `StoreError::Conflict`
+            // that the worker printed to stderr and dropped, leaving the effect
+            // untouched -- so the refusal repeated every pass and was recorded
+            // nowhere, despite carrying a message that names the server and the
+            // repair. Record it against the effect instead: durable, recoverable
+            // (re-pin and the next pass admits), and held to the D12 denial
+            // invariant because `blocked_by_admission` is not a non-denial block.
+            Err(error) => match mcp_failure_action(error) {
+                McpFailureAction::Deny { category, message } => {
+                    return kernel.deny_effect_admission(
+                        instance_id,
+                        effect_id,
+                        &category,
+                        &message,
+                    );
+                }
+                McpFailureAction::Fail(error) => return Err(error),
+            },
+        };
         tools.extend(mcp_specs);
         mcp_trust = mcp_runtime.trust_summary();
         executor = executor.with_mcp(mcp_runtime);
@@ -8799,5 +8863,60 @@ mod tests {
         assert_eq!(r.status, ToolStatus::Error);
         assert!(r.content.contains("command not found"));
         std::fs::remove_dir_all(&root).ok();
+    }
+}
+
+#[cfg(test)]
+mod mcp_failure_action_tests {
+    use super::{mcp_failure_action, McpFailureAction};
+    use crate::mcp_tools::McpResolveError;
+
+    /// A gate's refusal and a turn going wrong are routed differently, and the
+    /// denial's category carries two rules worth pinning where they are written.
+    #[test]
+    fn a_refusal_is_denied_per_server_and_anything_else_fails_the_turn() {
+        let category_of = |server: &str| {
+            let action = mcp_failure_action(McpResolveError::Denied {
+                server: server.to_owned(),
+                message: format!("denied MCP access to `{server}` for this turn"),
+            });
+            let McpFailureAction::Deny { category, message } = action else {
+                panic!("a gate's refusal must be denied, not failed");
+            };
+            assert!(message.contains(server), "the reason must name the server");
+            category
+        };
+        assert_eq!(category_of("acme"), "mcp:acme");
+
+        // Per server: two servers must not share a category, or the block's
+        // idempotency hands back the first one's event and the operator reads a
+        // reason naming a server that is no longer the blocker.
+        assert_ne!(
+            category_of("acme"),
+            category_of("other"),
+            "two servers must not share a category"
+        );
+
+        // Dots stripped: `mcp:acme.tools` would parse as a dotted diagnostic
+        // code, and check_trace would refuse a well-formed denial for carrying an
+        // unregistered one.
+        let dotted = category_of("acme.tools");
+        assert_eq!(dotted, "mcp:acme_tools");
+        assert!(!dotted.contains('.'), "a dot would read as a code prefix");
+
+        // Anything else fails the turn, and says where it failed: the message is
+        // the refusal's own, not the inner error passed through unlabelled.
+        let failed = mcp_failure_action(McpResolveError::Failed(
+            "server `acme` did not answer".to_owned(),
+        ));
+        let McpFailureAction::Fail(error) = failed else {
+            panic!("a non-denial must fail the turn");
+        };
+        let message = format!("{error:?}");
+        assert!(
+            message.contains("could not be given its MCP tool surface"),
+            "unexpected error: {message}"
+        );
+        assert!(message.contains("server `acme` did not answer"));
     }
 }

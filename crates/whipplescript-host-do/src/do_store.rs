@@ -3804,6 +3804,91 @@ impl<Sql: DoSql> DoSqliteStore<Sql> {
 #[allow(unused_variables, clippy::todo, clippy::too_many_arguments)]
 /// DR-0067's append surface, so this host runs the same conformance driver the
 /// native store does rather than a mirrored copy of its assertions.
+impl<Sql: DoSql> DoSqliteStore<Sql> {
+    /// Shared body for the two recoverable pre-run blocks. `key_prefix` is passed
+    /// rather than derived from `status`: the binding block's key is already
+    /// `binding-block:...` in live stores, and re-keying it would make a still
+    /// blocked effect append a second event instead of the intended no-op.
+    fn block_effect_with_status(
+        &mut self,
+        instance_id: &str,
+        effect_id: &str,
+        status: &str,
+        key_prefix: &str,
+        category: &str,
+        detail: &str,
+    ) -> StoreResult<StoredEvent> {
+        let current = self
+            .sql
+            .query(
+                "SELECT status, policy_block_category FROM effects \
+                 WHERE instance_id = ?1 AND effect_id = ?2",
+                &[text(instance_id), text(effect_id)],
+            )
+            .map_err(sql_err)?;
+        let already_blocked = current.first().is_some_and(|r| {
+            as_text(&r[0]) == status && as_opt_text(&r[1]).as_deref() == Some(category)
+        });
+        if already_blocked {
+            // Return the existing block event without recording a new one.
+            let rows = self
+                .sql
+                .query(
+                    "SELECT event_id, sequence FROM events \
+                     WHERE instance_id = ?1 AND event_type = 'effect.blocked' AND causation_id = ?2 \
+                     ORDER BY sequence DESC LIMIT 1",
+                    &[text(instance_id), text(effect_id)],
+                )
+                .map_err(sql_err)?;
+            let row = rows
+                .first()
+                .ok_or_else(|| sql_err("missing prior block event".to_string()))?;
+            return Ok(StoredEvent {
+                event_id: as_text(&row[0]),
+                sequence: as_i64(&row[1]),
+            });
+        }
+        let payload = serde_json::json!({
+            "effect_id": effect_id,
+            "status": status,
+            "category": category,
+            "reason": detail,
+        })
+        .to_string();
+        let event = do_append_event(
+            &self.sql,
+            NewEvent {
+                instance_id,
+                event_type: "effect.blocked",
+                payload_json: &payload,
+                source: "kernel",
+                causation_id: Some(effect_id),
+                correlation_id: None,
+                idempotency_key: Some(&format!(
+                    "{key_prefix}:{instance_id}:{effect_id}:{category}"
+                )),
+            },
+        )?;
+        self.sql
+            .execute(
+                "UPDATE effects SET status = ?1, policy_block_reason = ?2, \
+                 policy_block_category = ?3, updated_at = CURRENT_TIMESTAMP \
+                 WHERE instance_id = ?4 AND effect_id = ?5 \
+                 AND status IN ('queued', 'blocked', 'blocked_by_admission', \
+                                'blocked_by_dependency', 'blocked_by_capacity')",
+                &[
+                    text(status),
+                    text(detail),
+                    text(category),
+                    text(instance_id),
+                    text(effect_id),
+                ],
+            )
+            .map_err(sql_err)?;
+        Ok(event)
+    }
+}
+
 impl<Sql: DoSql> whipplescript_store::log_append::LogAppend for DoSqliteStore<Sql> {
     fn chain_head(&self, instance_id: &str) -> StoreResult<event_chain::ChainHead> {
         Self::chain_head(self, instance_id)
@@ -4973,7 +5058,7 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
                  ON effect_versions.version_id = candidate.program_version_id \
                  WHERE candidate.instance_id = ?1 AND candidate.kind != 'timer.wait' \
                  AND ( \
-                   candidate.status IN ('queued', 'blocked', 'blocked_by_dependency', 'blocked_by_capacity', 'blocked_by_capability', 'blocked_by_profile') \
+                   candidate.status IN ('queued', 'blocked', 'blocked_by_admission', 'blocked_by_dependency', 'blocked_by_capacity', 'blocked_by_capability', 'blocked_by_profile') \
                    OR candidate.status = 'running' \
                  ) AND NOT EXISTS ( \
                    SELECT 1 FROM effect_cancellation_requests AS request \
@@ -6518,7 +6603,7 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
                 .execute(
                     "UPDATE effects SET status = ?1, policy_block_reason = ?2, \
                      updated_at = CURRENT_TIMESTAMP WHERE instance_id = ?3 AND effect_id = ?4 \
-                     AND status IN ('queued', 'blocked', 'blocked_by_dependency', 'blocked_by_capacity', 'blocked_by_capability', 'blocked_by_profile')",
+                     AND status IN ('queued', 'blocked', 'blocked_by_admission', 'blocked_by_dependency', 'blocked_by_capacity', 'blocked_by_capability', 'blocked_by_profile')",
                     &[
                         text(block.status),
                         text(&block.reason),
@@ -6601,7 +6686,7 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
                 .execute(
                     "UPDATE effects SET status = 'blocked_by_capacity', policy_block_reason = ?1, \
                      updated_at = CURRENT_TIMESTAMP WHERE instance_id = ?2 AND effect_id = ?3 \
-                     AND status IN ('queued', 'blocked', 'blocked_by_dependency', 'blocked_by_capacity')",
+                     AND status IN ('queued', 'blocked', 'blocked_by_admission', 'blocked_by_dependency', 'blocked_by_capacity')",
                     &[text(&reason), text(run.instance_id), text(run.effect_id)],
                 )
                 .map_err(sql_err)?;
@@ -6632,7 +6717,7 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
                 "UPDATE effects SET status = 'running', policy_block_reason = NULL, \
                  policy_block_category = NULL, updated_at = CURRENT_TIMESTAMP \
                  WHERE instance_id = ?1 AND effect_id = ?2 \
-                 AND status IN ('queued', 'blocked', 'blocked_by_dependency', 'blocked_by_capacity', 'blocked_by_capability', 'blocked_by_profile')",
+                 AND status IN ('queued', 'blocked', 'blocked_by_admission', 'blocked_by_dependency', 'blocked_by_capacity', 'blocked_by_capability', 'blocked_by_profile')",
                 &[text(run.instance_id), text(run.effect_id)],
             )
             .map_err(sql_err)?;
@@ -6677,67 +6762,31 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
         category: &str,
         detail: &str,
     ) -> StoreResult<StoredEvent> {
-        let current = self
-            .sql
-            .query(
-                "SELECT status, policy_block_category FROM effects \
-                 WHERE instance_id = ?1 AND effect_id = ?2",
-                &[text(instance_id), text(effect_id)],
-            )
-            .map_err(sql_err)?;
-        let already_blocked = current.first().is_some_and(|r| {
-            as_text(&r[0]) == "blocked" && as_opt_text(&r[1]).as_deref() == Some(category)
-        });
-        if already_blocked {
-            // Return the existing block event without recording a new one.
-            let rows = self
-                .sql
-                .query(
-                    "SELECT event_id, sequence FROM events \
-                     WHERE instance_id = ?1 AND event_type = 'effect.blocked' AND causation_id = ?2 \
-                     ORDER BY sequence DESC LIMIT 1",
-                    &[text(instance_id), text(effect_id)],
-                )
-                .map_err(sql_err)?;
-            let row = rows
-                .first()
-                .ok_or_else(|| sql_err("missing prior block event".to_string()))?;
-            return Ok(StoredEvent {
-                event_id: as_text(&row[0]),
-                sequence: as_i64(&row[1]),
-            });
-        }
-        let payload = serde_json::json!({
-            "effect_id": effect_id,
-            "status": "blocked",
-            "category": category,
-            "reason": detail,
-        })
-        .to_string();
-        let event = do_append_event(
-            &self.sql,
-            NewEvent {
-                instance_id,
-                event_type: "effect.blocked",
-                payload_json: &payload,
-                source: "kernel",
-                causation_id: Some(effect_id),
-                correlation_id: None,
-                idempotency_key: Some(&format!(
-                    "binding-block:{instance_id}:{effect_id}:{category}"
-                )),
-            },
-        )?;
-        self.sql
-            .execute(
-                "UPDATE effects SET status = 'blocked', policy_block_reason = ?1, \
-                 policy_block_category = ?2, updated_at = CURRENT_TIMESTAMP \
-                 WHERE instance_id = ?3 AND effect_id = ?4 \
-                 AND status IN ('queued', 'blocked', 'blocked_by_dependency', 'blocked_by_capacity')",
-                &[text(detail), text(category), text(instance_id), text(effect_id)],
-            )
-            .map_err(sql_err)?;
-        Ok(event)
+        self.block_effect_with_status(
+            instance_id,
+            effect_id,
+            "blocked",
+            "binding-block",
+            category,
+            detail,
+        )
+    }
+
+    fn deny_effect_admission(
+        &mut self,
+        instance_id: &str,
+        effect_id: &str,
+        category: &str,
+        detail: &str,
+    ) -> StoreResult<StoredEvent> {
+        self.block_effect_with_status(
+            instance_id,
+            effect_id,
+            "blocked_by_admission",
+            "admission-denial",
+            category,
+            detail,
+        )
     }
 
     fn transition_instance(

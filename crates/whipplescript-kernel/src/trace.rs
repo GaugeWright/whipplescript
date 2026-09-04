@@ -1708,6 +1708,54 @@ mod tests {
         assert_eq!(check_trace(&named), Ok(()));
     }
 
+    /// An admission denial is a DENIAL: `blocked_by_admission` is not in
+    /// `NON_DENIAL_BLOCK_STATUSES`, so the exclusion classification holds it to
+    /// `DenialEvidenceNamesItsSubject` with no change to this checker. That is
+    /// the property the inversion was for, exercised by the first new denial
+    /// status to arrive since.
+    #[test]
+    fn an_admission_denial_is_held_to_the_denial_invariant() {
+        let denial = |reason: &str| TraceRecord {
+            sequence: 2,
+            event: TraceEvent::EffectBlocked {
+                effect_id: "e".to_owned(),
+                status: Some("blocked_by_admission".to_owned()),
+                reason: reason.to_owned(),
+            },
+        };
+
+        // What the runtime writes: `{category}: {message}`, the message naming
+        // the refused server.
+        let named = vec![
+            effect_created(1, "e"),
+            denial(
+                "mcp:acme: denied MCP access to `acme` for this turn: the active \
+                 governance envelope requires trust rung `r2` and the server is `r0`",
+            ),
+        ];
+        assert_eq!(check_trace(&named), Ok(()));
+
+        // A server whose id carries a dot must not make the CATEGORY parse as a
+        // dotted diagnostic code -- `mcp:acme.tools` is not a registered code, and
+        // reading it as one would refuse a legitimate denial. The runtime strips
+        // the dot for exactly this reason; this pins that it must.
+        let dotted = vec![
+            effect_created(1, "e"),
+            denial("mcp:acme_tools: denied MCP access to `acme.tools` for this turn"),
+        ];
+        assert_eq!(check_trace(&dotted), Ok(()));
+
+        // And the invariant still bites: a denial that names nothing is refused.
+        let anonymous = vec![effect_created(1, "e"), denial("admission refused")];
+        let violation = check_trace(&anonymous).expect_err("an unnamed denial is a violation");
+        assert!(
+            violation
+                .message
+                .contains("does not name the denied subject"),
+            "unexpected violation: {violation:?}"
+        );
+    }
+
     /// The second half of a failing assertion's evidence. `richer_invariants_have
     /// _bite` covers the clause the TLA model shares (the evidence NAMES its
     /// assertion); this covers the clause it does not model, because

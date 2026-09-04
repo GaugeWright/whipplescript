@@ -3249,7 +3249,7 @@ impl SqliteStore {
             WHERE candidate.instance_id = ?1
               AND candidate.kind != 'timer.wait'
               AND (
-                  candidate.status IN ('queued', 'blocked', 'blocked_by_dependency', 'blocked_by_capacity', 'blocked_by_capability', 'blocked_by_profile')
+                  candidate.status IN ('queued', 'blocked', 'blocked_by_admission', 'blocked_by_dependency', 'blocked_by_capacity', 'blocked_by_capability', 'blocked_by_profile')
                   OR (candidate.kind = 'workflow.invoke' AND candidate.status = 'running')
               )
               AND NOT EXISTS (
@@ -5506,7 +5506,7 @@ impl SqliteStore {
                     updated_at = CURRENT_TIMESTAMP
                 WHERE instance_id = ?3
                   AND effect_id = ?4
-                  AND status IN ('queued', 'blocked', 'blocked_by_dependency', 'blocked_by_capacity', 'blocked_by_capability', 'blocked_by_profile')
+                  AND status IN ('queued', 'blocked', 'blocked_by_admission', 'blocked_by_dependency', 'blocked_by_capacity', 'blocked_by_capability', 'blocked_by_profile')
                 "#,
                 params![block.status, block.reason, run.instance_id, run.effect_id],
             )?;
@@ -5585,7 +5585,8 @@ impl SqliteStore {
                     updated_at = CURRENT_TIMESTAMP
                 WHERE instance_id = ?2
                   AND effect_id = ?3
-                  AND status IN ('queued', 'blocked', 'blocked_by_dependency', 'blocked_by_capacity')
+                  AND status IN ('queued', 'blocked', 'blocked_by_admission',
+                                 'blocked_by_dependency', 'blocked_by_capacity')
                 "#,
                 params![reason, run.instance_id, run.effect_id],
             )?;
@@ -5626,7 +5627,7 @@ impl SqliteStore {
                 updated_at = CURRENT_TIMESTAMP
             WHERE instance_id = ?1
               AND effect_id = ?2
-              AND status IN ('queued', 'blocked', 'blocked_by_dependency', 'blocked_by_capacity', 'blocked_by_capability', 'blocked_by_profile')
+              AND status IN ('queued', 'blocked', 'blocked_by_admission', 'blocked_by_dependency', 'blocked_by_capacity', 'blocked_by_capability', 'blocked_by_profile')
             "#,
             params![run.instance_id, run.effect_id],
         )?;
@@ -5700,6 +5701,58 @@ impl SqliteStore {
         category: &str,
         detail: &str,
     ) -> StoreResult<StoredEvent> {
+        self.block_effect_with_status(
+            instance_id,
+            effect_id,
+            "blocked",
+            "binding-block",
+            category,
+            detail,
+        )
+    }
+
+    /// Record an ADMISSION denial found at worker time: a gate refused the
+    /// effect before any provider ran, and the refusal is the operator's to act
+    /// on. Same recoverable machinery as `block_effect_binding` -- idempotent
+    /// per (effect, category), re-claimed each pass, cleared by `start_run` when
+    /// the gate lets it through -- and a DIFFERENT status on purpose.
+    ///
+    /// `blocked` says the worker could not bind a provider, which owes no named
+    /// subject. `blocked_by_admission` says something was REFUSED, and the trace
+    /// checker holds every status it does not recognise as a non-denial to
+    /// `DenialEvidenceNamesItsSubject`: the reason must name what it refused.
+    /// That is why this is a separate status rather than another category.
+    pub fn deny_effect_admission(
+        &mut self,
+        instance_id: &str,
+        effect_id: &str,
+        category: &str,
+        detail: &str,
+    ) -> StoreResult<StoredEvent> {
+        self.block_effect_with_status(
+            instance_id,
+            effect_id,
+            "blocked_by_admission",
+            "admission-denial",
+            category,
+            detail,
+        )
+    }
+
+    /// `key_prefix` is passed rather than derived from `status` because the
+    /// binding block's key is already written into live stores as
+    /// `binding-block:...`. Deriving it would re-key those, and an effect that
+    /// stayed blocked would append a second event instead of being the no-op the
+    /// idempotency is there to guarantee.
+    fn block_effect_with_status(
+        &mut self,
+        instance_id: &str,
+        effect_id: &str,
+        status: &str,
+        key_prefix: &str,
+        category: &str,
+        detail: &str,
+    ) -> StoreResult<StoredEvent> {
         let tx = self
             .connection
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -5713,7 +5766,8 @@ impl SqliteStore {
             .optional()?;
         let already_blocked = matches!(
             &current,
-            Some((status, cat)) if status == "blocked" && cat.as_deref() == Some(category)
+            Some((current_status, cat))
+                if current_status == status && cat.as_deref() == Some(category)
         );
         if already_blocked {
             // Return the existing block event without recording a new one.
@@ -5734,7 +5788,7 @@ impl SqliteStore {
         }
         let payload = json!({
             "effect_id": effect_id,
-            "status": "blocked",
+            "status": status,
             "category": category,
             "reason": detail,
         })
@@ -5749,22 +5803,23 @@ impl SqliteStore {
                 causation_id: Some(effect_id),
                 correlation_id: None,
                 idempotency_key: Some(&format!(
-                    "binding-block:{instance_id}:{effect_id}:{category}"
+                    "{key_prefix}:{instance_id}:{effect_id}:{category}"
                 )),
             },
         )?;
         tx.execute(
             r#"
             UPDATE effects
-            SET status = 'blocked',
-                policy_block_reason = ?1,
-                policy_block_category = ?2,
+            SET status = ?1,
+                policy_block_reason = ?2,
+                policy_block_category = ?3,
                 updated_at = CURRENT_TIMESTAMP
-            WHERE instance_id = ?3
-              AND effect_id = ?4
-              AND status IN ('queued', 'blocked', 'blocked_by_dependency', 'blocked_by_capacity')
+            WHERE instance_id = ?4
+              AND effect_id = ?5
+              AND status IN ('queued', 'blocked', 'blocked_by_admission',
+                             'blocked_by_dependency', 'blocked_by_capacity')
             "#,
-            params![detail, category, instance_id, effect_id],
+            params![status, detail, category, instance_id, effect_id],
         )?;
         tx.commit()?;
         Ok(event)
@@ -7194,6 +7249,15 @@ pub trait RuntimeStore {
         category: &str,
         detail: &str,
     ) -> StoreResult<StoredEvent>;
+    /// Record an admission gate's refusal. See `SqliteStore::deny_effect_admission`
+    /// for why this carries a different status from a binding block.
+    fn deny_effect_admission(
+        &mut self,
+        instance_id: &str,
+        effect_id: &str,
+        category: &str,
+        detail: &str,
+    ) -> StoreResult<StoredEvent>;
     fn transition_instance(
         &mut self,
         transition: InstanceTransition<'_>,
@@ -7640,6 +7704,15 @@ impl RuntimeStore for SqliteStore {
         detail: &str,
     ) -> StoreResult<StoredEvent> {
         self.block_effect_binding(instance_id, effect_id, category, detail)
+    }
+    fn deny_effect_admission(
+        &mut self,
+        instance_id: &str,
+        effect_id: &str,
+        category: &str,
+        detail: &str,
+    ) -> StoreResult<StoredEvent> {
+        self.deny_effect_admission(instance_id, effect_id, category, detail)
     }
     fn transition_instance(
         &mut self,
@@ -14561,6 +14634,114 @@ mod tests {
                 .any(|c| c.effect_id == "tell"),
             "blocked effect is re-claimable"
         );
+    }
+
+    /// An admission denial is durable, idempotent per refusing gate, and
+    /// recoverable. Before this it was a `StoreError::Conflict` the worker
+    /// printed to stderr and dropped: the effect was untouched, so the refusal
+    /// repeated every pass and left no record of itself anywhere.
+    #[test]
+    fn an_admission_denial_is_durable_idempotent_and_recoverable() {
+        let mut store = SqliteStore::open_in_memory().expect("store opens");
+        store
+            .commit_rule(RuleCommit {
+                instance_id: "instance-a",
+                rule: "start",
+                trigger_event_id: None,
+                facts: &[],
+                consumed_fact_ids: &[],
+                effects: &[test_effect("tell", "agent.tell", "rule=start;effect=tell")],
+                dependencies: &[],
+                terminal: None,
+                idempotency_key: Some("commit-start"),
+                marks: &[],
+                context_json: None,
+            })
+            .expect("rule commit succeeds");
+        let effect = |store: &SqliteStore| {
+            store
+                .list_effects("instance-a")
+                .expect("effects list")
+                .into_iter()
+                .find(|e| e.effect_id == "tell")
+                .expect("tell effect")
+        };
+        let blocked_event_count = |store: &SqliteStore| -> i64 {
+            store
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM events WHERE instance_id = 'instance-a' \
+                     AND event_type = 'effect.blocked'",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("count")
+        };
+
+        let first = store
+            .deny_effect_admission("instance-a", "tell", "mcp:acme", "pin drifted for `acme`")
+            .expect("denial recorded");
+        let e = effect(&store);
+        // A DIFFERENT status from a binding block, which is what puts the denial
+        // under the trace checker's DenialEvidenceNamesItsSubject.
+        assert_eq!(e.status, "blocked_by_admission");
+        assert_eq!(e.policy_block_category.as_deref(), Some("mcp:acme"));
+        assert_eq!(
+            e.policy_block_reason.as_deref(),
+            Some("pin drifted for `acme`")
+        );
+        assert_eq!(blocked_event_count(&store), 1);
+
+        // Same gate refusing again on the next pass writes nothing new.
+        let second = store
+            .deny_effect_admission("instance-a", "tell", "mcp:acme", "pin drifted for `acme`")
+            .expect("re-denial");
+        assert_eq!(first.event_id, second.event_id);
+        assert_eq!(blocked_event_count(&store), 1, "re-denial adds no event");
+
+        // A DIFFERENT server refusing does write, and updates the reason: a
+        // constant category would leave the operator reading the repaired
+        // server's message while a second one is the actual blocker.
+        store
+            .deny_effect_admission(
+                "instance-a",
+                "tell",
+                "mcp:other",
+                "rung too low for `other`",
+            )
+            .expect("second server denial");
+        assert_eq!(blocked_event_count(&store), 2);
+        assert_eq!(
+            effect(&store).policy_block_reason.as_deref(),
+            Some("rung too low for `other`")
+        );
+
+        // Recoverable: the effect is re-offered so the gate is re-evaluated, and
+        // starting a run clears the block.
+        assert!(
+            store
+                .claimable_effects("instance-a")
+                .expect("claimable")
+                .iter()
+                .any(|c| c.effect_id == "tell"),
+            "a denied effect is re-claimable"
+        );
+        store
+            .start_run(RunStart {
+                instance_id: "instance-a",
+                effect_id: "tell",
+                run_id: "run-1",
+                provider: "owned",
+                worker_id: "worker-1",
+                lease_id: "lease-1",
+                lease_expires_at: "2030-01-01T00:00:00Z",
+                metadata_json: "{}",
+            })
+            .expect("run starts once the gate admits");
+        let cleared = effect(&store);
+        assert_eq!(cleared.status, "running");
+        assert_eq!(cleared.policy_block_reason, None);
+        assert_eq!(cleared.policy_block_category, None);
     }
 
     #[test]

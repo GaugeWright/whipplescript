@@ -359,6 +359,36 @@ def variant_is_refusal(line: str) -> bool:
 REFUSAL_MARKER = re.compile(r"^\s*//\s*REFUSAL\b:?\s*(.*)$")
 
 
+# A refusal is where the DECISION is made. `.map_err(|e| Denied { .. })` is not
+# that: `admit_tools` already decided to refuse, and this closure re-labels its
+# error for a caller that needs a different type. There is nothing here that
+# could "stop refusing" -- delete the closure and the code stops COMPILING, which
+# no test needs to catch.
+#
+# Narrow twice over. It applies only to a `.map_err(` on the site's own line, and
+# only when that closure carries NO text of its own: a `.map_err(|e|
+# StoreError::Conflict(format!("could not read config: {e}")))` writes the words
+# an operator reads, so it stays a site and its message stays mutable. Without
+# the second half this would silence real refusals that merely happen to be
+# written as a map.
+#
+# Measured before it was written: across the workspace exactly ONE site is a
+# textless `map_err` closure, and 2230 others are untouched.
+MAP_ERR_RELABEL = re.compile(r"\.map_err\s*\(")
+
+
+def is_error_relabel(lines: list[str], index: int) -> bool:
+    """True when the site is a `map_err` closure carrying no message of its own."""
+    if not MAP_ERR_RELABEL.search(lines[index]):
+        return False
+    for offset in range(0, 6):
+        if index + offset >= len(lines):
+            break
+        if MESSAGE.search(lines[index + offset]):
+            return False
+    return True
+
+
 def find_sites(lines: list[str]) -> list[Site]:
     """Every refusal site outside the file's own test-only items.
 
@@ -406,6 +436,8 @@ def find_sites(lines: list[str]) -> list[Site]:
         if declared and UNIT_VALUE.search(line):
             is_site = True
         if is_site and is_refusal_constructor(lines, index):
+            continue
+        if is_site and is_error_relabel(lines, index):
             continue
         if not is_site and OK_OR_OPEN.search(line):
             # Joined only for THIS rule. Running the `Err(` rule over a joined
@@ -730,14 +762,8 @@ def apply_mutation(lines: list[str], site: Site) -> list[str] | None:
     return None
 
 
-def run_suite(filter_expr: str) -> str:
-    """PASSED when nothing caught the mutation, CAUGHT when a test failed.
-
-    BUILD_FAILED when the mutated tree does not compile. That third case must not
-    collapse into CAUGHT: a mutation that fails to build never ran, so reading
-    cargo's nonzero status as "a test caught this refusal" invents coverage that
-    does not exist.
-    """
+def run_suite_once(filter_expr: str) -> str:
+    """One run of the suite against whatever is on disk."""
     # A flag-style filter is a cargo argument LIST (`-p whipplescript-parser`)
     # and has to be split: passed whole, cargo receives one argv element
     # containing a space and rejects it, which reads as BUILD_FAILED for every
@@ -754,6 +780,53 @@ def run_suite(filter_expr: str) -> str:
     if "could not compile" in result.stdout + result.stderr:
         return BUILD_FAILED
     return CAUGHT
+
+
+def run_suite(filter_expr: str) -> str:
+    """PASSED when nothing caught the mutation, CAUGHT when a test failed.
+
+    BUILD_FAILED when the mutated tree does not compile. That third case must not
+    collapse into CAUGHT: a mutation that fails to build never ran, so reading
+    cargo's nonzero status as "a test caught this refusal" invents coverage that
+    does not exist.
+
+    A FAILING TEST IS NOT YET A CAUGHT MUTATION. `cargo test` exits nonzero for
+    any failure, including one that has nothing to do with the mutation, and this
+    function used to read every such exit as "a test caught this refusal" -- the
+    same invented coverage the BUILD_FAILED case exists to prevent, arriving
+    through a different door. The filter here is a whole package, so it carries
+    integration tests that contend for SQLite write locks; under the load of a
+    sweep one can fail with `database is locked` while the mutation it was
+    supposedly catching is unreachable code.
+
+    The consequences ran both ways. On a real site a flake invented coverage for
+    a refusal nothing tests. On the self-test, whose plants are unreachable BY
+    CONSTRUCTION, a flake reported one as exercised and aborted the whole file's
+    measurement -- which is how `new-refusals` came to fail on three of five
+    local runs with the file that failed ALTERNATING, since the flake follows the
+    load rather than the code.
+
+    So a failure has to repeat before it counts. The mutated tree is already
+    built, so a second run costs test execution and no compile -- cheap next to
+    the rebuild each mutation already pays. A flake does not reproduce; a real
+    catch always does.
+    """
+    outcome = run_suite_once(filter_expr)
+    if outcome != CAUGHT:
+        return outcome
+    confirm = run_suite_once(filter_expr)
+    if confirm == CAUGHT:
+        return CAUGHT
+    # The failure did not repeat, so the mutation did not reliably cause it.
+    # Conservative on purpose: report the refusal as NOT caught. Claiming a catch
+    # on one flaky failure is the invented coverage this whole gate exists to
+    # refuse.
+    print(
+        "       note: a test failure did not reproduce on re-run; "
+        "not counting it as a catch",
+        flush=True,
+    )
+    return confirm
 
 
 def sweep(

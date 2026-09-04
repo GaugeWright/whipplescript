@@ -935,11 +935,50 @@ impl McpTurnRuntime {
 ///
 /// `min_rung` is the signed envelope's requirement (design note §6), passed in
 /// by the caller so this function stays testable without an envelope on disk.
+/// Why a turn could not be given its MCP tool surface.
+///
+/// The two are acted on differently and must not be one `String`. A DENIAL is an
+/// admission gate refusing — the envelope's rung bar, a drifted pin, a role with
+/// no admitted meaning. It is the operator's to act on, it is recoverable (re-pin
+/// and the next pass admits), and it is recorded durably against the effect. Any
+/// other failure is the turn going wrong: a malformed registry, a server that
+/// will not answer, a tool name the provider cannot represent.
+///
+/// Before this split both arrived as `StoreError::Conflict`, which the worker
+/// printed to stderr and dropped — so a governance refusal with a precise,
+/// actionable message was announced once per pass to a stream nobody keeps, and
+/// left no trace on the effect it refused.
+#[derive(Debug)]
+pub enum McpResolveError {
+    Denied { server: String, message: String },
+    Failed(String),
+}
+
+impl From<String> for McpResolveError {
+    fn from(message: String) -> Self {
+        Self::Failed(message)
+    }
+}
+
+impl std::fmt::Display for McpResolveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.message())
+    }
+}
+
+impl McpResolveError {
+    pub fn message(&self) -> &str {
+        match self {
+            Self::Denied { message, .. } | Self::Failed(message) => message,
+        }
+    }
+}
+
 pub fn resolve_turn_mcp_tools(
     access: &McpTurnAccess,
     registry: &BTreeMap<String, McpServerConfig>,
     min_rung: Option<McpRung>,
-) -> Result<(Vec<ToolSpec>, McpTurnRuntime), String> {
+) -> Result<(Vec<ToolSpec>, McpTurnRuntime), McpResolveError> {
     let mut specs = Vec::new();
     let mut runtime = McpTurnRuntime::default();
     for (server_name, grant) in access {
@@ -956,11 +995,14 @@ pub fn resolve_turn_mcp_tools(
         // means not running its command.
         if let Some(required) = min_rung {
             if rung < required {
-                return Err(whipplescript_kernel::mcp::McpDenial::EnvelopeRung {
-                    required,
-                    actual: rung,
-                }
-                .message(server_name));
+                return Err(McpResolveError::Denied {
+                    server: server_name.to_owned(),
+                    message: whipplescript_kernel::mcp::McpDenial::EnvelopeRung {
+                        required,
+                        actual: rung,
+                    }
+                    .message(server_name),
+                });
             }
         }
         let mut client = McpClient::connect(config)?;
@@ -998,7 +1040,10 @@ pub fn resolve_turn_mcp_tools(
             profile_permitted: None,
         };
         let admitted =
-            admit_tools(rung, min_rung, &input).map_err(|denial| denial.message(server_name))?;
+            admit_tools(rung, min_rung, &input).map_err(|denial| McpResolveError::Denied {
+                server: server_name.to_owned(),
+                message: denial.message(server_name),
+            })?;
 
         for tool in &live {
             if !admitted.iter().any(|name| name == &tool.name) {
@@ -1009,14 +1054,17 @@ pub fn resolve_turn_mcp_tools(
             // cannot be represented is REFUSED, not mangled: a rewritten name
             // would no longer match the grant or the pin that admitted it.
             let Some(name) = namespaced_tool_name(server_name, &tool.name) else {
-                return Err(format!(
+                // A configuration fault, not a governance refusal: no gate
+                // decided this, so it fails the turn rather than blocking on a
+                // condition an operator could clear by re-pinning.
+                return Err(McpResolveError::Failed(format!(
                     "MCP server `{server_name}` offers granted tool `{}`, whose namespaced name \
                      is not representable to the model provider (names must match \
                      [A-Za-z0-9_-] and the composed `mcp__server__tool` must be at most 64 \
                      characters). Rename the server with a shorter id, or drop the tool from \
                      the grant.",
                     tool.name
-                ));
+                )));
             };
             specs.push(ToolSpec {
                 name,
@@ -1431,17 +1479,145 @@ for line in sys.stdin:
             Ok(_) => panic!("a drifted pin must fail turn setup"),
         };
         assert!(
-            error.contains("pinned manifest no longer matches"),
+            error
+                .message()
+                .contains("pinned manifest no longer matches"),
             "{error}"
         );
-        assert!(error.contains("get_issue (changed)"), "{error}");
-        assert!(error.contains("whip mcp sync"), "{error}");
+        assert!(error.message().contains("get_issue (changed)"), "{error}");
+        assert!(error.message().contains("whip mcp sync"), "{error}");
 
         std::env::remove_var(declared_var("drift"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The envelope's minimum rung denies before any tool is considered, and the
+    /// A granted tool whose namespaced name will not fit the provider's rules is
+    /// REFUSED, never mangled: a rewritten name would no longer match the grant
+    /// or the pin that admitted it. `mcp__<server>__<tool>` must be at most 64
+    /// characters, so a long enough server id makes an otherwise fine tool
+    /// unrepresentable.
+    #[test]
+    fn an_unrepresentable_tool_name_fails_the_turn_rather_than_being_rewritten() {
+        if !have_python() {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        // `mcp` + `__` + server + `__` + `get_issue` must exceed 64.
+        let server = "a".repeat(50);
+        assert!(
+            format!("mcp__{server}__get_issue").len() > 64,
+            "the server id must be long enough to overflow the name"
+        );
+
+        let dir = std::env::temp_dir().join(format!("whip-mcp-longname-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let script = fake_server_script(&dir, false);
+        std::env::set_var(declared_var(&server), "declared-value");
+
+        let mut registry = BTreeMap::new();
+        registry.insert(server.clone(), stdio_config(&server, &script));
+        let mut access = McpTurnAccess::new();
+        access.insert(
+            server.clone(),
+            McpServerGrant {
+                operations: vec!["get_issue".to_owned()],
+            },
+        );
+
+        let error = match resolve_turn_mcp_tools(&access, &registry, None) {
+            Err(error) => error,
+            Ok(_) => panic!("an unrepresentable tool name must fail the turn"),
+        };
+        assert!(
+            error
+                .message()
+                .contains("is not representable to the model provider"),
+            "unexpected message: {}",
+            error.message()
+        );
+        // A configuration fault, not a governance refusal: nothing gated it, so
+        // it must not be routed to a recoverable admission denial.
+        assert!(
+            matches!(error, McpResolveError::Failed(_)),
+            "an unrepresentable name is not a denial: {error:?}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The envelope gate runs BEFORE the server is contacted, and that ordering
+    /// is the whole point: a below-bar server must not be executed at all, which
+    /// for stdio means its command never runs.
+    ///
+    /// `envelope_minimum_rung_denies_a_live_server` below does NOT pin this.
+    /// Disabling the early gate leaves that test passing, because `admit_tools`
+    /// refuses the same server a moment later -- after the process has been
+    /// spawned. The denial is identical; what differs is whether an untrusted
+    /// binary ran first, and only a marker the server itself writes can tell the
+    /// two apart.
+    #[test]
+    fn a_below_bar_server_is_never_executed() {
+        if !have_python() {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("whip-mcp-noexec-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let marker = dir.join("server-ran");
+        std::fs::remove_file(&marker).ok();
+
+        // Writes the marker on the FIRST line it executes, so any spawn at all
+        // leaves evidence -- the path is baked in rather than passed through the
+        // environment, which this transport deliberately scrubs.
+        let script = dir.join("noexec-server.py");
+        std::fs::write(
+            &script,
+            format!(
+                // Writes the marker and exits at once. Lingering would make a
+                // gate-less run hang on the client's 60s read timeout, and the
+                // test would then report THAT rather than the spawn.
+                "open(r\"{}\", \"w\").close()\n",
+                marker.display()
+            ),
+        )
+        .expect("write server script");
+
+        // Set so resolution would get all the way to a spawn if the gate were
+        // gone. Without this the test still fails when the gate is removed, but
+        // on a missing-env message rather than on the marker -- proving only that
+        // SOMETHING changed, not that the server ran.
+        std::env::set_var(declared_var("noexec"), "declared-value");
+
+        let mut registry = BTreeMap::new();
+        registry.insert("noexec".to_owned(), stdio_config("noexec", &script));
+        let mut access = McpTurnAccess::new();
+        access.insert(
+            "noexec".to_owned(),
+            McpServerGrant {
+                operations: vec!["get_issue".to_owned()],
+            },
+        );
+
+        let error = match resolve_turn_mcp_tools(&access, &registry, Some(McpRung::Attested)) {
+            Err(error) => error,
+            Ok(_) => panic!("a server below the envelope bar must be denied"),
+        };
+        // The marker FIRST: without the early gate the resolution proceeds and
+        // the denial arrives from `admit_tools` with a different message, so
+        // asserting the message first would report the wrong failure.
+        assert!(
+            !marker.exists(),
+            "the server's command ran before it was denied: {}",
+            marker.display()
+        );
+        assert!(
+            error.message().contains("requires trust rung `attested`"),
+            "unexpected message: {}",
+            error.message()
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// message tells the operator which lever to pull.
     #[test]
     fn envelope_minimum_rung_denies_a_live_server() {
@@ -1468,7 +1644,10 @@ for line in sys.stdin:
             Err(error) => error,
             Ok(_) => panic!("a server below the envelope bar must be denied"),
         };
-        assert!(error.contains("requires trust rung `attested`"), "{error}");
+        assert!(
+            error.message().contains("requires trust rung `attested`"),
+            "{error}"
+        );
 
         std::env::remove_var(declared_var("envbar"));
         let _ = std::fs::remove_dir_all(&dir);

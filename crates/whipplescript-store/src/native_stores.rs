@@ -608,6 +608,17 @@ impl RuntimeStore for NativeStores {
             .block_effect_binding(instance_id, effect_id, category, detail)
     }
 
+    fn deny_effect_admission(
+        &mut self,
+        instance_id: &str,
+        effect_id: &str,
+        category: &str,
+        detail: &str,
+    ) -> StoreResult<StoredEvent> {
+        self.runtime
+            .deny_effect_admission(instance_id, effect_id, category, detail)
+    }
+
     fn transition_instance(
         &mut self,
         transition: InstanceTransition<'_>,
