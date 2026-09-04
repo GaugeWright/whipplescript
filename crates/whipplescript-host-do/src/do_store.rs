@@ -1619,24 +1619,23 @@ fn do_append_event_chained<Sql: DoSql>(
         .map_err(|error| {
             // Name the colliding event (native `append_event_on` parity). Two
             // distinct collisions live here since DR-0067 moved sequence
-            // assignment out of the INSERT, and they mean opposite things.
-            if error.contains("UNIQUE") {
-                if error.contains("events.sequence") {
-                    StoreError::Conflict(format!(
-                        "event-log sequence {sequence} is already taken for instance `{}`: \
-                         another writer appended concurrently. Re-read the head and retry.",
-                        event.instance_id
-                    ))
-                } else {
-                    StoreError::Conflict(format!(
-                        "duplicate event idempotency key for `{}` (key {:?}): a second \
-                         distinct commit produced an already-used key",
-                        event.event_type, event.idempotency_key
-                    ))
-                }
-            } else {
-                sql_err(error)
-            }
+            // assignment out of the INSERT, and they mean OPPOSITE things: one
+            // says "re-read the head and retry", the other says "this key is
+            // spent".
+            //
+            // Which one is asked of the DATABASE, not of the error text. The
+            // text was `error.contains("UNIQUE")` over `format!("{error:?}")`
+            // of a JsValue thrown by the Cloudflare SQL API -- a Debug
+            // rendering, which is not a specified format and is not obliged to
+            // match rusqlite's phrasing. The only `DoSql` under test is
+            // `RusqliteDoSql`, so a production mismatch was unobservable here:
+            // a real concurrent append would have surfaced as `Io`, and every
+            // caller keyed on `Conflict` would have treated a retryable race as
+            // a hard failure.
+            //
+            // A row that exists answers the same question without depending on
+            // anyone's wording, and it answers it on both backends.
+            classify_append_collision(sql, &event, sequence, error)
         })?;
     let row = rows
         .first()
@@ -1645,6 +1644,49 @@ fn do_append_event_chained<Sql: DoSql>(
         event_id: as_text(&row[0]),
         sequence: as_i64(&row[1]),
     })
+}
+
+/// Why an event INSERT failed, decided by reading the rows rather than the
+/// error text.
+///
+/// The two collisions this can be are both observable as facts: the sequence is
+/// taken, or the idempotency key is spent. Anything else is not a collision this
+/// layer recognises and stays the transport error it was, so a genuine failure
+/// is never laundered into a retryable one.
+fn classify_append_collision<Sql: DoSql>(
+    sql: &Sql,
+    event: &NewEvent<'_>,
+    sequence: i64,
+    error: String,
+) -> StoreError {
+    let taken = |clause: &str, params: &[SqlValue]| -> bool {
+        sql.query(clause, params)
+            .map(|rows| !rows.is_empty())
+            .unwrap_or(false)
+    };
+    if taken(
+        "SELECT 1 FROM events WHERE instance_id = ?1 AND sequence = ?2",
+        &[text(event.instance_id), int(sequence)],
+    ) {
+        return StoreError::Conflict(format!(
+            "event-log sequence {sequence} is already taken for instance `{}`: \
+             another writer appended concurrently. Re-read the head and retry.",
+            event.instance_id
+        ));
+    }
+    if let Some(key) = event.idempotency_key {
+        if taken(
+            "SELECT 1 FROM events WHERE instance_id = ?1 AND idempotency_key = ?2",
+            &[text(event.instance_id), text(key)],
+        ) {
+            return StoreError::Conflict(format!(
+                "duplicate event idempotency key for `{}` (key {:?}): a second \
+                 distinct commit produced an already-used key",
+                event.event_type, event.idempotency_key
+            ));
+        }
+    }
+    sql_err(error)
 }
 
 /// RC-4c: the LIVE `fact.derived` payloads for an instance with the
@@ -9246,6 +9288,22 @@ pub mod test_support {
         }
     }
 
+    #[cfg(test)]
+    impl OpaqueErrorSql {
+        pub(crate) fn wrapping(inner: RusqliteDoSql) -> Self {
+            Self(inner)
+        }
+    }
+
+    #[cfg(test)]
+    impl RusqliteDoSql {
+        /// A handle over the same schema `store()` builds, for a test that needs
+        /// the raw `DoSql` rather than the store wrapper around it.
+        pub(crate) fn from_store_schema() -> Self {
+            store().sql
+        }
+    }
+
     fn to_value(v: &SqlValue) -> Value {
         match v {
             SqlValue::Null => Value::Null,
@@ -9290,6 +9348,39 @@ pub mod test_support {
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|e| e.to_string())?;
             Ok(rows)
+        }
+    }
+
+    /// A backend whose errors say nothing recognisable — the production case.
+    ///
+    /// `DoSql` returns `Result<_, String>`, and on the edge that string is
+    /// `format!("{error:?}")` of a JsValue the Cloudflare SQL API threw: a Debug
+    /// rendering, not a specified format, under no obligation to phrase a
+    /// constraint violation the way rusqlite does. The only `DoSql` under test
+    /// was `RusqliteDoSql`, so a mismatch could not be observed here at all.
+    ///
+    /// This one delegates every statement and then replaces the error text, so
+    /// a test can ask what happens when the wording is not the wording.
+    #[cfg(test)]
+    #[derive(Clone)]
+    pub(crate) struct OpaqueErrorSql(RusqliteDoSql);
+
+    #[cfg(test)]
+    impl DoSql for OpaqueErrorSql {
+        fn execute(&self, sql: &str, params: &[SqlValue]) -> Result<u64, String> {
+            self.0
+                .execute(sql, params)
+                .map_err(|_| "JsValue(Object)".to_owned())
+        }
+
+        fn query(&self, sql: &str, params: &[SqlValue]) -> Result<Vec<Vec<SqlValue>>, String> {
+            self.0
+                .query(sql, params)
+                .map_err(|_| "JsValue(Object)".to_owned())
+        }
+
+        fn activity(&self, kind: &str, detail: Option<&str>) {
+            self.0.activity(kind, detail);
         }
     }
 
@@ -9834,6 +9925,72 @@ pub(crate) mod tests {
     /// Backs `DoSql` with real in-memory SQLite, so the ported store SQL is
     /// checked against an actual engine.
     use super::test_support::store;
+
+    /// The append collision is classified by the ROWS, not by the error text.
+    ///
+    /// It used to read `error.contains("UNIQUE")` over `format!("{error:?}")` of
+    /// a JsValue the Cloudflare SQL API threw — a Debug rendering, not a
+    /// specified format, under no obligation to phrase a constraint violation
+    /// the way rusqlite does. On the edge a real concurrent append would have
+    /// fallen through to `Io`, and every caller keyed on `Conflict` would have
+    /// treated a race it should retry as a hard failure. Unobservable in tests,
+    /// because the only `DoSql` under test phrased its errors as the match
+    /// expected.
+    ///
+    /// Every case here runs over `OpaqueErrorSql`, whose errors say nothing at
+    /// all, which is the whole point: the verdict must not depend on wording.
+    #[test]
+    fn an_append_collision_is_classified_by_the_rows_not_the_error_text() {
+        let sql = test_support::OpaqueErrorSql::wrapping(
+            test_support::RusqliteDoSql::from_store_schema(),
+        );
+        let event = NewEvent {
+            instance_id: "i1",
+            event_type: "rule.committed",
+            payload_json: "{}",
+            source: "kernel",
+            causation_id: None,
+            correlation_id: None,
+            idempotency_key: Some("k1"),
+        };
+        do_append_event_chained(&sql, None, event).expect("the first append lands");
+
+        // A taken sequence is a RETRYABLE race: another writer got there.
+        match classify_append_collision(&sql, &event, 1, "JsValue(Object)".to_owned()) {
+            StoreError::Conflict(message) => assert!(
+                message.contains("already taken") && message.contains("retry"),
+                "a taken sequence is the retryable case: {message}"
+            ),
+            other => panic!("expected a Conflict for a taken sequence, got {other:?}"),
+        }
+
+        // A spent idempotency key is PERMANENT: the same key, a free sequence.
+        match classify_append_collision(&sql, &event, 99, "JsValue(Object)".to_owned()) {
+            StoreError::Conflict(message) => assert!(
+                message.contains("already-used key"),
+                "a spent key is the permanent case: {message}"
+            ),
+            other => panic!("expected a Conflict for a spent key, got {other:?}"),
+        }
+
+        // And a failure that is NEITHER stays the transport error it was. This
+        // is the half that keeps the repair honest: reading rows must not
+        // launder a genuine fault into a retryable one.
+        let unrelated = NewEvent {
+            instance_id: "i2",
+            idempotency_key: Some("never-used"),
+            ..event
+        };
+        match classify_append_collision(&sql, &unrelated, 1, "JsValue(Object)".to_owned()) {
+            StoreError::Conflict(message) => {
+                panic!("a genuine failure must not become a Conflict: {message}")
+            }
+            other => assert!(
+                format!("{other:?}").contains("JsValue"),
+                "the transport error survives: {other:?}"
+            ),
+        }
+    }
 
     /// P1: the production `DoSqlStorage` drives the file plane over REAL DO
     /// SQLite (the `files` table) through the `FileStore` seam — write, read,
