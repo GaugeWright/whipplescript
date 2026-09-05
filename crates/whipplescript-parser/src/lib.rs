@@ -14748,7 +14748,27 @@ fn ir_access_grants_for_body(kind: &body::BodyEffectKind) -> Vec<IrAccessGrant> 
                     .collect(),
             })
             .collect(),
-        _ => Vec::new(),
+        body::BodyEffectKind::Prompt { .. }
+        | body::BodyEffectKind::Decide { .. }
+        | body::BodyEffectKind::Call { .. }
+        | body::BodyEffectKind::ConstructCapabilityCall { .. }
+        | body::BodyEffectKind::Timer { .. }
+        | body::BodyEffectKind::HttpRequest { .. }
+        | body::BodyEffectKind::MintCredential { .. }
+        | body::BodyEffectKind::ObtainCredential { .. }
+        | body::BodyEffectKind::TrackerFile { .. }
+        | body::BodyEffectKind::TrackerClaim { .. }
+        | body::BodyEffectKind::TrackerRelease { .. }
+        | body::BodyEffectKind::TrackerFinish { .. }
+        | body::BodyEffectKind::LeaseAcquire { .. }
+        | body::BodyEffectKind::LeaseRenew { .. }
+        | body::BodyEffectKind::LedgerAppend { .. }
+        | body::BodyEffectKind::CounterConsume { .. }
+        | body::BodyEffectKind::Notify { .. }
+        | body::BodyEffectKind::FileRead { .. }
+        | body::BodyEffectKind::FileWrite { .. }
+        | body::BodyEffectKind::FileImport { .. }
+        | body::BodyEffectKind::FileExport { .. } => Vec::new(),
     }
 }
 
@@ -14790,7 +14810,30 @@ fn ir_effect_kind_for_body(kind: &body::BodyEffectKind) -> IrEffectKind {
 fn agent_for_body(kind: &body::BodyEffectKind) -> Option<String> {
     match kind {
         body::BodyEffectKind::Tell { target, .. } => Some(target.clone()),
-        _ => None,
+        body::BodyEffectKind::Coerce { .. }
+        | body::BodyEffectKind::Prompt { .. }
+        | body::BodyEffectKind::Decide { .. }
+        | body::BodyEffectKind::Call { .. }
+        | body::BodyEffectKind::ConstructCapabilityCall { .. }
+        | body::BodyEffectKind::Invoke { .. }
+        | body::BodyEffectKind::Timer { .. }
+        | body::BodyEffectKind::HttpRequest { .. }
+        | body::BodyEffectKind::MintCredential { .. }
+        | body::BodyEffectKind::Exec { .. }
+        | body::BodyEffectKind::ObtainCredential { .. }
+        | body::BodyEffectKind::TrackerFile { .. }
+        | body::BodyEffectKind::TrackerClaim { .. }
+        | body::BodyEffectKind::TrackerRelease { .. }
+        | body::BodyEffectKind::TrackerFinish { .. }
+        | body::BodyEffectKind::LeaseAcquire { .. }
+        | body::BodyEffectKind::LeaseRenew { .. }
+        | body::BodyEffectKind::LedgerAppend { .. }
+        | body::BodyEffectKind::CounterConsume { .. }
+        | body::BodyEffectKind::Notify { .. }
+        | body::BodyEffectKind::FileRead { .. }
+        | body::BodyEffectKind::FileWrite { .. }
+        | body::BodyEffectKind::FileImport { .. }
+        | body::BodyEffectKind::FileExport { .. } => None,
     }
 }
 
@@ -14800,7 +14843,30 @@ fn agent_for_body(kind: &body::BodyEffectKind) -> Option<String> {
 fn coerce_target_for_body(kind: &body::BodyEffectKind) -> Option<String> {
     match kind {
         body::BodyEffectKind::Coerce { name, .. } => Some(name.clone()),
-        _ => None,
+        body::BodyEffectKind::Tell { .. }
+        | body::BodyEffectKind::Prompt { .. }
+        | body::BodyEffectKind::Decide { .. }
+        | body::BodyEffectKind::Call { .. }
+        | body::BodyEffectKind::ConstructCapabilityCall { .. }
+        | body::BodyEffectKind::Invoke { .. }
+        | body::BodyEffectKind::Timer { .. }
+        | body::BodyEffectKind::HttpRequest { .. }
+        | body::BodyEffectKind::MintCredential { .. }
+        | body::BodyEffectKind::Exec { .. }
+        | body::BodyEffectKind::ObtainCredential { .. }
+        | body::BodyEffectKind::TrackerFile { .. }
+        | body::BodyEffectKind::TrackerClaim { .. }
+        | body::BodyEffectKind::TrackerRelease { .. }
+        | body::BodyEffectKind::TrackerFinish { .. }
+        | body::BodyEffectKind::LeaseAcquire { .. }
+        | body::BodyEffectKind::LeaseRenew { .. }
+        | body::BodyEffectKind::LedgerAppend { .. }
+        | body::BodyEffectKind::CounterConsume { .. }
+        | body::BodyEffectKind::Notify { .. }
+        | body::BodyEffectKind::FileRead { .. }
+        | body::BodyEffectKind::FileWrite { .. }
+        | body::BodyEffectKind::FileImport { .. }
+        | body::BodyEffectKind::FileExport { .. } => None,
     }
 }
 
@@ -14808,7 +14874,30 @@ fn coerce_target_for_body(kind: &body::BodyEffectKind) -> Option<String> {
 fn turn_skills_for_body(kind: &body::BodyEffectKind) -> Vec<String> {
     match kind {
         body::BodyEffectKind::Tell { skills, .. } => skills.clone(),
-        _ => Vec::new(),
+        body::BodyEffectKind::Coerce { .. }
+        | body::BodyEffectKind::Prompt { .. }
+        | body::BodyEffectKind::Decide { .. }
+        | body::BodyEffectKind::Call { .. }
+        | body::BodyEffectKind::ConstructCapabilityCall { .. }
+        | body::BodyEffectKind::Invoke { .. }
+        | body::BodyEffectKind::Timer { .. }
+        | body::BodyEffectKind::HttpRequest { .. }
+        | body::BodyEffectKind::MintCredential { .. }
+        | body::BodyEffectKind::Exec { .. }
+        | body::BodyEffectKind::ObtainCredential { .. }
+        | body::BodyEffectKind::TrackerFile { .. }
+        | body::BodyEffectKind::TrackerClaim { .. }
+        | body::BodyEffectKind::TrackerRelease { .. }
+        | body::BodyEffectKind::TrackerFinish { .. }
+        | body::BodyEffectKind::LeaseAcquire { .. }
+        | body::BodyEffectKind::LeaseRenew { .. }
+        | body::BodyEffectKind::LedgerAppend { .. }
+        | body::BodyEffectKind::CounterConsume { .. }
+        | body::BodyEffectKind::Notify { .. }
+        | body::BodyEffectKind::FileRead { .. }
+        | body::BodyEffectKind::FileWrite { .. }
+        | body::BodyEffectKind::FileImport { .. }
+        | body::BodyEffectKind::FileExport { .. } => Vec::new(),
     }
 }
 
@@ -14816,18 +14905,67 @@ fn turn_skills_for_body(kind: &body::BodyEffectKind) -> Vec<String> {
 fn on_stream_for_body(kind: &body::BodyEffectKind) -> Option<String> {
     match kind {
         body::BodyEffectKind::Tell { on_stream, .. } => on_stream.clone(),
-        _ => None,
+        body::BodyEffectKind::Coerce { .. }
+        | body::BodyEffectKind::Prompt { .. }
+        | body::BodyEffectKind::Decide { .. }
+        | body::BodyEffectKind::Call { .. }
+        | body::BodyEffectKind::ConstructCapabilityCall { .. }
+        | body::BodyEffectKind::Invoke { .. }
+        | body::BodyEffectKind::Timer { .. }
+        | body::BodyEffectKind::HttpRequest { .. }
+        | body::BodyEffectKind::MintCredential { .. }
+        | body::BodyEffectKind::Exec { .. }
+        | body::BodyEffectKind::ObtainCredential { .. }
+        | body::BodyEffectKind::TrackerFile { .. }
+        | body::BodyEffectKind::TrackerClaim { .. }
+        | body::BodyEffectKind::TrackerRelease { .. }
+        | body::BodyEffectKind::TrackerFinish { .. }
+        | body::BodyEffectKind::LeaseAcquire { .. }
+        | body::BodyEffectKind::LeaseRenew { .. }
+        | body::BodyEffectKind::LedgerAppend { .. }
+        | body::BodyEffectKind::CounterConsume { .. }
+        | body::BodyEffectKind::Notify { .. }
+        | body::BodyEffectKind::FileRead { .. }
+        | body::BodyEffectKind::FileWrite { .. }
+        | body::BodyEffectKind::FileImport { .. }
+        | body::BodyEffectKind::FileExport { .. } => None,
     }
 }
 
 /// The std.vcs selective verbs' statically-checkable pieces (DR-0052
 /// R4): the raw selection-slot source, and transport's `onto` target.
 fn vcs_selective_for_body(kind: &body::BodyEffectKind) -> (Option<String>, Option<String>) {
-    let body::BodyEffectKind::ConstructCapabilityCall {
-        keyword, fields, ..
-    } = kind
-    else {
-        return (None, None);
+    // Named rather than `else`: a variant added to `BodyEffectKind` should have
+    // to say it carries no selection, not inherit that by falling past a
+    // one-variant binding.
+    let (keyword, fields) = match kind {
+        body::BodyEffectKind::ConstructCapabilityCall {
+            keyword, fields, ..
+        } => (keyword, fields),
+        body::BodyEffectKind::Tell { .. }
+        | body::BodyEffectKind::Coerce { .. }
+        | body::BodyEffectKind::Prompt { .. }
+        | body::BodyEffectKind::Decide { .. }
+        | body::BodyEffectKind::Call { .. }
+        | body::BodyEffectKind::Invoke { .. }
+        | body::BodyEffectKind::Timer { .. }
+        | body::BodyEffectKind::HttpRequest { .. }
+        | body::BodyEffectKind::MintCredential { .. }
+        | body::BodyEffectKind::Exec { .. }
+        | body::BodyEffectKind::ObtainCredential { .. }
+        | body::BodyEffectKind::TrackerFile { .. }
+        | body::BodyEffectKind::TrackerClaim { .. }
+        | body::BodyEffectKind::TrackerRelease { .. }
+        | body::BodyEffectKind::TrackerFinish { .. }
+        | body::BodyEffectKind::LeaseAcquire { .. }
+        | body::BodyEffectKind::LeaseRenew { .. }
+        | body::BodyEffectKind::LedgerAppend { .. }
+        | body::BodyEffectKind::CounterConsume { .. }
+        | body::BodyEffectKind::Notify { .. }
+        | body::BodyEffectKind::FileRead { .. }
+        | body::BodyEffectKind::FileWrite { .. }
+        | body::BodyEffectKind::FileImport { .. }
+        | body::BodyEffectKind::FileExport { .. } => return (None, None),
     };
     if keyword != "undo" && keyword != "transport" {
         return (None, None);
@@ -14845,7 +14983,30 @@ fn vcs_selective_for_body(kind: &body::BodyEffectKind) -> (Option<String>, Optio
 fn workflow_target_for_body(kind: &body::BodyEffectKind) -> Option<String> {
     match kind {
         body::BodyEffectKind::Invoke { workflow, .. } => Some(workflow.clone()),
-        _ => None,
+        body::BodyEffectKind::Tell { .. }
+        | body::BodyEffectKind::Coerce { .. }
+        | body::BodyEffectKind::Prompt { .. }
+        | body::BodyEffectKind::Decide { .. }
+        | body::BodyEffectKind::Call { .. }
+        | body::BodyEffectKind::ConstructCapabilityCall { .. }
+        | body::BodyEffectKind::Timer { .. }
+        | body::BodyEffectKind::HttpRequest { .. }
+        | body::BodyEffectKind::MintCredential { .. }
+        | body::BodyEffectKind::Exec { .. }
+        | body::BodyEffectKind::ObtainCredential { .. }
+        | body::BodyEffectKind::TrackerFile { .. }
+        | body::BodyEffectKind::TrackerClaim { .. }
+        | body::BodyEffectKind::TrackerRelease { .. }
+        | body::BodyEffectKind::TrackerFinish { .. }
+        | body::BodyEffectKind::LeaseAcquire { .. }
+        | body::BodyEffectKind::LeaseRenew { .. }
+        | body::BodyEffectKind::LedgerAppend { .. }
+        | body::BodyEffectKind::CounterConsume { .. }
+        | body::BodyEffectKind::Notify { .. }
+        | body::BodyEffectKind::FileRead { .. }
+        | body::BodyEffectKind::FileWrite { .. }
+        | body::BodyEffectKind::FileImport { .. }
+        | body::BodyEffectKind::FileExport { .. } => None,
     }
 }
 
@@ -15284,21 +15445,90 @@ fn validate_http_request(
 }
 
 fn mint_credential_for_body(kind: &body::BodyEffectKind) -> Option<IrMintCredential> {
-    let body::BodyEffectKind::MintCredential {
-        parent,
-        method,
-        url,
-        headers,
-        body,
-        token_path,
-        public_paths,
-    } = kind
-    else {
-        return None;
-    };
-    Some(IrMintCredential {
-        parent: parent.clone(),
-        exchange: IrHttpRequest {
+    // Named rather than `else`: a variant added to `BodyEffectKind`
+    // should have to say it carries none, not inherit that by falling
+    // past a one-variant binding.
+    match kind {
+        body::BodyEffectKind::MintCredential {
+            parent,
+            method,
+            url,
+            headers,
+            body,
+            token_path,
+            public_paths,
+        } => {
+            Some(IrMintCredential {
+                parent: parent.clone(),
+                exchange: IrHttpRequest {
+                    method: method.clone(),
+                    url: url.clone(),
+                    headers: headers
+                        .iter()
+                        .map(|header| IrRequestHeader {
+                            name: header.name.clone(),
+                            value: match &header.value {
+                                body::RequestHeaderValue::Credential {
+                                    presentation,
+                                    handle,
+                                } => IrRequestHeaderValue::Credential {
+                                    presentation: presentation.as_str().to_owned(),
+                                    handle: handle.clone(),
+                                },
+                                body::RequestHeaderValue::Expr { source, .. } => {
+                                    IrRequestHeaderValue::Expr(source.clone())
+                                }
+                            },
+                        })
+                        .collect(),
+                    body: body.as_ref().map(|(source, _)| source.clone()),
+                    // A mint's exchange is never `signed with`: it presents the parent
+                    // at a marked slot, which is what spending a credential means here.
+                    signed_with: None,
+                },
+                token_path: token_path.clone(),
+                public_paths: public_paths.clone(),
+            })
+        }
+        body::BodyEffectKind::Tell { .. }
+        | body::BodyEffectKind::Coerce { .. }
+        | body::BodyEffectKind::Prompt { .. }
+        | body::BodyEffectKind::Decide { .. }
+        | body::BodyEffectKind::Call { .. }
+        | body::BodyEffectKind::ConstructCapabilityCall { .. }
+        | body::BodyEffectKind::Invoke { .. }
+        | body::BodyEffectKind::Timer { .. }
+        | body::BodyEffectKind::HttpRequest { .. }
+        | body::BodyEffectKind::Exec { .. }
+        | body::BodyEffectKind::ObtainCredential { .. }
+        | body::BodyEffectKind::TrackerFile { .. }
+        | body::BodyEffectKind::TrackerClaim { .. }
+        | body::BodyEffectKind::TrackerRelease { .. }
+        | body::BodyEffectKind::TrackerFinish { .. }
+        | body::BodyEffectKind::LeaseAcquire { .. }
+        | body::BodyEffectKind::LeaseRenew { .. }
+        | body::BodyEffectKind::LedgerAppend { .. }
+        | body::BodyEffectKind::CounterConsume { .. }
+        | body::BodyEffectKind::Notify { .. }
+        | body::BodyEffectKind::FileRead { .. }
+        | body::BodyEffectKind::FileWrite { .. }
+        | body::BodyEffectKind::FileImport { .. }
+        | body::BodyEffectKind::FileExport { .. } => None,
+    }
+}
+
+fn http_request_for_body(kind: &body::BodyEffectKind) -> Option<IrHttpRequest> {
+    // Named rather than `else`: a variant added to `BodyEffectKind`
+    // should have to say it carries none, not inherit that by falling
+    // past a one-variant binding.
+    match kind {
+        body::BodyEffectKind::HttpRequest {
+            method,
+            url,
+            headers,
+            body,
+            signed_with,
+        } => Some(IrHttpRequest {
             method: method.clone(),
             url: url.clone(),
             headers: headers
@@ -15306,6 +15536,9 @@ fn mint_credential_for_body(kind: &body::BodyEffectKind) -> Option<IrMintCredent
                 .map(|header| IrRequestHeader {
                     name: header.name.clone(),
                     value: match &header.value {
+                        body::RequestHeaderValue::Expr { source, .. } => {
+                            IrRequestHeaderValue::Expr(source.clone())
+                        }
                         body::RequestHeaderValue::Credential {
                             presentation,
                             handle,
@@ -15313,57 +15546,37 @@ fn mint_credential_for_body(kind: &body::BodyEffectKind) -> Option<IrMintCredent
                             presentation: presentation.as_str().to_owned(),
                             handle: handle.clone(),
                         },
-                        body::RequestHeaderValue::Expr { source, .. } => {
-                            IrRequestHeaderValue::Expr(source.clone())
-                        }
                     },
                 })
                 .collect(),
             body: body.as_ref().map(|(source, _)| source.clone()),
-            // A mint's exchange is never `signed with`: it presents the parent
-            // at a marked slot, which is what spending a credential means here.
-            signed_with: None,
-        },
-        token_path: token_path.clone(),
-        public_paths: public_paths.clone(),
-    })
-}
-
-fn http_request_for_body(kind: &body::BodyEffectKind) -> Option<IrHttpRequest> {
-    let body::BodyEffectKind::HttpRequest {
-        method,
-        url,
-        headers,
-        body,
-        signed_with,
-    } = kind
-    else {
-        return None;
-    };
-    Some(IrHttpRequest {
-        method: method.clone(),
-        url: url.clone(),
-        headers: headers
-            .iter()
-            .map(|header| IrRequestHeader {
-                name: header.name.clone(),
-                value: match &header.value {
-                    body::RequestHeaderValue::Expr { source, .. } => {
-                        IrRequestHeaderValue::Expr(source.clone())
-                    }
-                    body::RequestHeaderValue::Credential {
-                        presentation,
-                        handle,
-                    } => IrRequestHeaderValue::Credential {
-                        presentation: presentation.as_str().to_owned(),
-                        handle: handle.clone(),
-                    },
-                },
-            })
-            .collect(),
-        body: body.as_ref().map(|(source, _)| source.clone()),
-        signed_with: signed_with.clone(),
-    })
+            signed_with: signed_with.clone(),
+        }),
+        body::BodyEffectKind::Tell { .. }
+        | body::BodyEffectKind::Coerce { .. }
+        | body::BodyEffectKind::Prompt { .. }
+        | body::BodyEffectKind::Decide { .. }
+        | body::BodyEffectKind::Call { .. }
+        | body::BodyEffectKind::ConstructCapabilityCall { .. }
+        | body::BodyEffectKind::Invoke { .. }
+        | body::BodyEffectKind::Timer { .. }
+        | body::BodyEffectKind::MintCredential { .. }
+        | body::BodyEffectKind::Exec { .. }
+        | body::BodyEffectKind::ObtainCredential { .. }
+        | body::BodyEffectKind::TrackerFile { .. }
+        | body::BodyEffectKind::TrackerClaim { .. }
+        | body::BodyEffectKind::TrackerRelease { .. }
+        | body::BodyEffectKind::TrackerFinish { .. }
+        | body::BodyEffectKind::LeaseAcquire { .. }
+        | body::BodyEffectKind::LeaseRenew { .. }
+        | body::BodyEffectKind::LedgerAppend { .. }
+        | body::BodyEffectKind::CounterConsume { .. }
+        | body::BodyEffectKind::Notify { .. }
+        | body::BodyEffectKind::FileRead { .. }
+        | body::BodyEffectKind::FileWrite { .. }
+        | body::BodyEffectKind::FileImport { .. }
+        | body::BodyEffectKind::FileExport { .. } => None,
+    }
 }
 
 fn exec_target_for_body(kind: &body::BodyEffectKind) -> Option<IrExecTarget> {
@@ -15374,7 +15587,30 @@ fn exec_target_for_body(kind: &body::BodyEffectKind) -> Option<IrExecTarget> {
                 IrExecTarget::Capability { name: name.clone() }
             }
         }),
-        _ => None,
+        body::BodyEffectKind::Tell { .. }
+        | body::BodyEffectKind::Coerce { .. }
+        | body::BodyEffectKind::Prompt { .. }
+        | body::BodyEffectKind::Decide { .. }
+        | body::BodyEffectKind::Call { .. }
+        | body::BodyEffectKind::ConstructCapabilityCall { .. }
+        | body::BodyEffectKind::Invoke { .. }
+        | body::BodyEffectKind::Timer { .. }
+        | body::BodyEffectKind::HttpRequest { .. }
+        | body::BodyEffectKind::MintCredential { .. }
+        | body::BodyEffectKind::ObtainCredential { .. }
+        | body::BodyEffectKind::TrackerFile { .. }
+        | body::BodyEffectKind::TrackerClaim { .. }
+        | body::BodyEffectKind::TrackerRelease { .. }
+        | body::BodyEffectKind::TrackerFinish { .. }
+        | body::BodyEffectKind::LeaseAcquire { .. }
+        | body::BodyEffectKind::LeaseRenew { .. }
+        | body::BodyEffectKind::LedgerAppend { .. }
+        | body::BodyEffectKind::CounterConsume { .. }
+        | body::BodyEffectKind::Notify { .. }
+        | body::BodyEffectKind::FileRead { .. }
+        | body::BodyEffectKind::FileWrite { .. }
+        | body::BodyEffectKind::FileImport { .. }
+        | body::BodyEffectKind::FileExport { .. } => None,
     }
 }
 
@@ -15477,7 +15713,17 @@ fn resource_for_body(
         // identity — the child does not exist yet, and the checker guarantees
         // the exchange presents exactly the parent.
         body::BodyEffectKind::MintCredential { parent, .. } => Some(parent.clone()),
-        _ => None,
+        // The `send` arm above is GUARDED on its keyword, so a construct
+        // call with any other keyword lands here rather than falling out
+        // of the match.
+        body::BodyEffectKind::ConstructCapabilityCall { .. }
+        | body::BodyEffectKind::Tell { .. }
+        | body::BodyEffectKind::Coerce { .. }
+        | body::BodyEffectKind::Prompt { .. }
+        | body::BodyEffectKind::Decide { .. }
+        | body::BodyEffectKind::Call { .. }
+        | body::BodyEffectKind::Timer { .. }
+        | body::BodyEffectKind::ObtainCredential { .. } => None,
     }
 }
 
@@ -15511,7 +15757,30 @@ fn construct_use_for_body(kind: &body::BodyEffectKind) -> Option<IrConstructUse>
             lowering_target: "capability_call".to_owned(),
             target_capability: target_capability.clone(),
         }),
-        _ => None,
+        body::BodyEffectKind::Tell { .. }
+        | body::BodyEffectKind::Coerce { .. }
+        | body::BodyEffectKind::Prompt { .. }
+        | body::BodyEffectKind::Decide { .. }
+        | body::BodyEffectKind::Call { .. }
+        | body::BodyEffectKind::Invoke { .. }
+        | body::BodyEffectKind::Timer { .. }
+        | body::BodyEffectKind::HttpRequest { .. }
+        | body::BodyEffectKind::MintCredential { .. }
+        | body::BodyEffectKind::Exec { .. }
+        | body::BodyEffectKind::ObtainCredential { .. }
+        | body::BodyEffectKind::TrackerFile { .. }
+        | body::BodyEffectKind::TrackerClaim { .. }
+        | body::BodyEffectKind::TrackerRelease { .. }
+        | body::BodyEffectKind::TrackerFinish { .. }
+        | body::BodyEffectKind::LeaseAcquire { .. }
+        | body::BodyEffectKind::LeaseRenew { .. }
+        | body::BodyEffectKind::LedgerAppend { .. }
+        | body::BodyEffectKind::CounterConsume { .. }
+        | body::BodyEffectKind::Notify { .. }
+        | body::BodyEffectKind::FileRead { .. }
+        | body::BodyEffectKind::FileWrite { .. }
+        | body::BodyEffectKind::FileImport { .. }
+        | body::BodyEffectKind::FileExport { .. } => None,
     }
 }
 
