@@ -62,6 +62,58 @@ pub type StoreResult<T> = result::Result<T, StoreError>;
 /// beyond it instead of silently misreading a newer layout.
 pub const SUPPORTED_SCHEMA_VERSION: i64 = 2;
 
+/// Stamp a satellite store's schema generation, and refuse one stamped beyond
+/// what this build understands.
+///
+/// `SqliteStore` has had this since DR-0054 Phase B. The other eight durable
+/// SQLite stores — coordination, work items, branches, content, workstreams,
+/// incidents, memory, improve — had NEITHER a stamp nor a guard, so an older
+/// binary opening a file a newer one had written read the newer layout as
+/// whatever it happened to parse. The runtime store refused; the other eight
+/// carried on.
+///
+/// These stores have no migration list: they build their schema with
+/// `CREATE TABLE IF NOT EXISTS`, so a NEWER build simply ensures what it needs.
+/// The direction that cannot be repaired by ensuring is DOWNGRADE, and that is
+/// the one this refuses.
+///
+/// The name is recorded beside the version so the row says which store wrote
+/// it. It is deliberately not enforced: two stores pointed at one file is an
+/// operational mistake worth being able to SEE in the file, and turning it into
+/// a refusal today would break anyone who is somehow living with it.
+#[cfg(feature = "native")]
+pub(crate) fn stamp_satellite_schema(
+    connection: &Connection,
+    name: &str,
+    supported: i64,
+) -> StoreResult<()> {
+    connection.execute_batch(
+        "CREATE TABLE IF NOT EXISTS schema_migrations (
+            version INTEGER PRIMARY KEY,
+            name TEXT NOT NULL
+        );",
+    )?;
+    let stamped: i64 = connection.query_row(
+        "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
+        [],
+        |row| row.get(0),
+    )?;
+    if stamped > supported {
+        return Err(StoreError::UnsupportedVersion {
+            subject: format!("{name} store schema (schema_migrations)"),
+            found: stamped,
+            supported,
+        });
+    }
+    if stamped < supported {
+        connection.execute(
+            "INSERT OR IGNORE INTO schema_migrations (version, name) VALUES (?1, ?2)",
+            params![supported, name],
+        )?;
+    }
+    Ok(())
+}
+
 /// DR-0054 Phase B: the `events.format_version` this build stamps on every
 /// new row and the highest it will fold. Legacy rows carry NULL and read as
 /// version 1; a row stamped beyond this fails the fold closed with its row
@@ -17435,6 +17487,77 @@ mod tests {
             completed, None,
             "`completed_at` outlived a rebuild that predates the terminal that set it"
         );
+    }
+
+    /// Every satellite store stamps its file, and refuses one from a newer build.
+    ///
+    /// `SqliteStore` has refused this since DR-0054 Phase B. The other eight
+    /// durable stores had neither a stamp nor a guard, so an older binary
+    /// opening a file a newer one wrote read the newer layout as whatever it
+    /// happened to parse — silently, and on durable data.
+    ///
+    /// The stamping half is proven through the real `open` against a real file,
+    /// then read back with a plain connection: no test-only accessor, and no
+    /// claim that rests on one.
+    #[test]
+    fn a_satellite_store_stamps_its_file_and_refuses_a_newer_one() {
+        let dir = std::env::temp_dir().join(format!(
+            "whip-satellite-stamp-{}-{}",
+            std::process::id(),
+            SUPPORTED_SCHEMA_VERSION
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("coordination.sqlite");
+
+        {
+            let _store =
+                crate::coordination::CoordinationStore::open(&path).expect("a fresh store opens");
+        }
+        let connection = Connection::open(&path).expect("reopen the file directly");
+        let (version, name): (i64, String) = connection
+            .query_row(
+                "SELECT version, name FROM schema_migrations ORDER BY version DESC LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("the store stamped its generation");
+        assert_eq!(version, 1);
+        assert_eq!(name, "coordination", "the row says which store wrote it");
+
+        // Reopening is idempotent: the same generation, not a second row.
+        {
+            let _again = crate::coordination::CoordinationStore::open(&path).expect("reopen");
+        }
+        let rows: i64 = connection
+            .query_row("SELECT COUNT(*) FROM schema_migrations", [], |row| {
+                row.get(0)
+            })
+            .expect("count");
+        assert_eq!(rows, 1, "reopening stamps nothing further");
+
+        // A file written by a newer build is REFUSED, not parsed.
+        connection
+            .execute(
+                "INSERT INTO schema_migrations (version, name) VALUES (?1, 'from-the-future')",
+                params![99],
+            )
+            .expect("stamp a newer generation");
+        // The store is not `Debug`, so this matches on the result rather than
+        // unwrapping it.
+        match crate::coordination::CoordinationStore::open(&path) {
+            Err(StoreError::UnsupportedVersion {
+                found, supported, ..
+            }) => {
+                assert_eq!((found, supported), (99, 1));
+            }
+            Err(other) => {
+                panic!("a newer file is UnsupportedVersion, never another error: {other:?}")
+            }
+            Ok(_) => panic!("a file from a newer build must be refused, not parsed"),
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The projection must be a FUNCTION OF THE LOG: folding the log has to

@@ -158,6 +158,12 @@ pub struct SqliteMemoryStore {
 }
 
 #[cfg(feature = "native")]
+/// This store's schema generation. Bumped when its `CREATE TABLE` set changes
+/// in a way an older build cannot read.
+const SATELLITE_SCHEMA_VERSION: i64 = 1;
+
+#[cfg(feature = "native")]
+#[cfg(feature = "native")]
 impl SqliteMemoryStore {
     pub fn open(path: impl AsRef<Path>) -> StoreResult<Self> {
         if let Some(parent) = path.as_ref().parent() {
@@ -181,6 +187,10 @@ impl SqliteMemoryStore {
 
     fn bootstrap(connection: Connection) -> StoreResult<Self> {
         crate::establish_wal(&connection)?;
+        // DR-0054 Phase B parity: this store had no schema stamp and no
+        // downgrade guard, so an older binary read a newer file as whatever
+        // it parsed. `SqliteStore` has refused that since Phase B.
+        crate::stamp_satellite_schema(&connection, "memory", SATELLITE_SCHEMA_VERSION)?;
         connection
             .execute_batch(
                 "CREATE TABLE IF NOT EXISTS memory_entries (

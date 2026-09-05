@@ -536,7 +536,16 @@ impl ContentBlobs for ContentStore {
 }
 
 #[cfg(feature = "native")]
+/// This store's schema generation. Bumped when its `CREATE TABLE` set
+/// changes in a way an older build cannot read.
+const SATELLITE_SCHEMA_VERSION: i64 = 1;
+
+#[cfg(feature = "native")]
 fn ensure_content_schema(connection: &Connection) -> StoreResult<()> {
+    // DR-0054 Phase B parity: this store had no schema stamp and no
+    // downgrade guard, so an older binary read a newer file as whatever it
+    // parsed. `SqliteStore` has refused that since Phase B.
+    crate::stamp_satellite_schema(connection, "content", SATELLITE_SCHEMA_VERSION)?;
     connection.execute_batch(
         r#"
         CREATE TABLE IF NOT EXISTS content_blobs (

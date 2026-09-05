@@ -219,6 +219,11 @@ pub struct IssueConflicts {
     pub field_conflicts: Vec<FieldConflict>,
 }
 
+#[cfg(feature = "native")]
+/// This store's schema generation. Bumped when its `CREATE TABLE` set changes
+/// in a way an older build cannot read.
+const SATELLITE_SCHEMA_VERSION: i64 = 1;
+
 impl IssueConflicts {
     #[must_use]
     pub fn conflicted(&self) -> bool {
@@ -309,6 +314,10 @@ impl WorkItemStore {
 
     fn from_connection(connection: Connection) -> StoreResult<Self> {
         connection.execute_batch(TRACKER_SCHEMA_SQL)?;
+        // DR-0054 Phase B parity: this store had no schema stamp and no
+        // downgrade guard, so an older binary read a newer file as whatever
+        // it parsed. `SqliteStore` has refused that since Phase B.
+        crate::stamp_satellite_schema(&connection, "work-item", SATELLITE_SCHEMA_VERSION)?;
         // Self-heal a pre-phase-B `tracker_events` (the ADR-0002 v1 linear log
         // had neither column): `CREATE TABLE IF NOT EXISTS` never alters an
         // existing table, so add the Merkle-DAG columns before the unique index

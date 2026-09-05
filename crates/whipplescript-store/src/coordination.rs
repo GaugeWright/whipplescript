@@ -983,7 +983,16 @@ fn normalized_owner(owner: &str) -> &str {
 }
 
 #[cfg(feature = "native")]
+/// This store's schema generation. Bumped when its `CREATE TABLE` set
+/// changes in a way an older build cannot read.
+const SATELLITE_SCHEMA_VERSION: i64 = 1;
+
+#[cfg(feature = "native")]
 fn ensure_partitioned_schema(connection: &Connection) -> StoreResult<()> {
+    // DR-0054 Phase B parity: this store had no schema stamp and no
+    // downgrade guard, so an older binary read a newer file as whatever it
+    // parsed. `SqliteStore` has refused that since Phase B.
+    crate::stamp_satellite_schema(connection, "coordination", SATELLITE_SCHEMA_VERSION)?;
     if !table_exists(connection, "leases")? {
         create_leases_table(connection)?;
     } else if !column_exists(connection, "leases", "owner")? {
