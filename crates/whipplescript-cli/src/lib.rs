@@ -6,6 +6,9 @@
 
 pub use whipplescript_kernel::{gov, host_policy, host_protocol, ifc, principal};
 pub mod host_runtime;
+/// The workspace `grep` tool's matching semantics, shared by both
+/// implementations of that tool (see the module docs for why there are two).
+pub mod workspace_grep;
 
 /// The std package manifests shipped with this crate.
 ///

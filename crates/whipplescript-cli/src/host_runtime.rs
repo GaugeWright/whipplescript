@@ -675,24 +675,45 @@ impl NativeWorkspaceResolver {
         let resolved = self.resolve_admitted(path, false, scopes)?;
         self.witness_read(path);
         let pattern = string_argument(arguments, "pattern")?;
-        let matcher = regex::Regex::new(pattern).ok();
+        // `ignoreCase`, `context` and `limit` are all declared by the schema
+        // this tool advertises, and this implementation read NONE of them: a
+        // caller asking for a case-insensitive search got a case-sensitive one,
+        // a context window got no context, and a limit of ten got up to five
+        // thousand — each silently. The defaults below are the ones the schema
+        // states and the ones the other implementation of this tool uses.
+        let ignore_case = arguments
+            .get("ignoreCase")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let limit = arguments
+            .get("limit")
+            .and_then(Value::as_u64)
+            .map_or(100, |limit| limit as usize);
+        let context = arguments
+            .get("context")
+            .and_then(Value::as_u64)
+            .map_or(0, |context| context as usize);
+        // Shared with the binary's copy of this tool via the library module;
+        // a second implementation is what let these diverge.
+        let matcher = crate::workspace_grep::GrepMatcher::new(pattern, ignore_case);
         let mut matches = Vec::new();
+        let mut matches_found = 0usize;
         walk_workspace(&self.root, &resolved, &mut |relative, absolute| {
+            if matches_found >= limit {
+                return false;
+            }
             let Ok(text) = fs::read_to_string(absolute) else {
                 return true;
             };
-            for (line, content) in text.lines().enumerate() {
-                let hit = matcher
-                    .as_ref()
-                    .map(|regex| regex.is_match(content))
-                    .unwrap_or_else(|| content.contains(pattern));
-                if hit {
-                    matches.push(format!("{relative}:{}:{content}", line + 1));
-                    if matches.len() >= 5_000 {
-                        return false;
-                    }
-                }
-            }
+            crate::workspace_grep::grep_file_into(
+                relative,
+                &text,
+                &matcher,
+                context,
+                limit,
+                &mut matches_found,
+                &mut matches,
+            );
             true
         })?;
         Ok(self.cap(matches.join("\n")))
@@ -4721,6 +4742,74 @@ workflow UnsafeHostChat {
             "secret"
         );
         let _ = fs::remove_dir_all(root);
+    }
+
+    /// The native workspace `grep` honours the schema it advertises.
+    ///
+    /// It read only `pattern` and `path`. `ignoreCase`, `context` and `limit`
+    /// are all declared by its own tool spec and all three were ignored, so a
+    /// caller asking for a case-insensitive search got a case-sensitive one, a
+    /// context window got no context, and a limit of one got up to five
+    /// thousand — each silently, because a tool that ignores an argument has no
+    /// way to say so.
+    #[test]
+    fn native_grep_honours_ignore_case_context_and_limit() {
+        let root = std::env::temp_dir().join(format!(
+            "whip-native-grep-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).expect("dirs");
+        fs::write(root.join("a.txt"), "alpha\nNEEDLE\nomega\nneedle\n").expect("fixture");
+        let resolver = NativeWorkspaceResolver::new(&root).expect("resolver");
+        let admitted = [ResourceRef {
+            handle: "project".to_owned(),
+            kind: "file_store".to_owned(),
+            selector: None,
+            writable: None,
+        }];
+        let grep = |arguments: Value| {
+            resolver
+                .execute_tool(
+                    &admitted,
+                    &ToolCall {
+                        id: "grep-1".to_owned(),
+                        name: "grep".to_owned(),
+                        arguments,
+                    },
+                )
+                .expect("grep runs")
+        };
+
+        // Case sensitivity is the default, and `ignoreCase` changes it.
+        assert_eq!(grep(json!({"pattern": "needle"})).lines().count(), 1);
+        assert_eq!(
+            grep(json!({"pattern": "needle", "ignoreCase": true}))
+                .lines()
+                .count(),
+            2
+        );
+
+        // `limit` caps the MATCHES.
+        assert_eq!(
+            grep(json!({"pattern": "needle", "ignoreCase": true, "limit": 1}))
+                .lines()
+                .count(),
+            1
+        );
+
+        // `context` brings neighbouring lines, marked `-` rather than `:`.
+        let with_context = grep(json!({"pattern": "NEEDLE", "context": 1}));
+        assert_eq!(with_context.lines().count(), 3, "{with_context}");
+        assert!(
+            with_context.contains("a.txt-1-alpha") && with_context.contains("a.txt:2:NEEDLE"),
+            "a context line is `-`, the match is `:`: {with_context}"
+        );
+
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

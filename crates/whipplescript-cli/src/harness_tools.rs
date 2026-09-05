@@ -149,8 +149,6 @@ pub fn tracker_tool_specs() -> Vec<ToolSpec> {
 const DEFAULT_MAX_BYTES: usize = 50_000;
 /// Bound on files visited by `find`/`grep` so a huge tree cannot stall a turn.
 const MAX_FILES_WALKED: usize = 5_000;
-/// Cap on a single emitted `grep` line (pi-conformance §1).
-const GREP_MAX_LINE_CHARS: usize = 500;
 /// How many leading bytes of a file are sniffed for a NUL byte to refuse
 /// reading binary content as text (pi-conformance §1 binary guard).
 const BINARY_SNIFF_BYTES: usize = 8_192;
@@ -1902,7 +1900,7 @@ impl FileToolExecutor {
             .unwrap_or(false);
         let limit = usize_arg(args, "limit").unwrap_or(100);
         let context = usize_arg(args, "context").unwrap_or(0);
-        let matcher = GrepMatcher::new(pattern, ignore_case);
+        let matcher = whipplescript::workspace_grep::GrepMatcher::new(pattern, ignore_case);
         let mut hits: Vec<String> = Vec::new();
         let mut matches_found = 0usize;
         let root = self.root.clone();
@@ -1916,48 +1914,15 @@ impl FileToolExecutor {
             let Ok(content) = std::fs::read_to_string(root.join(rel)) else {
                 return ControlFlow::Continue(());
             };
-            if context == 0 {
-                // No window to merge, so matches stream straight out: no
-                // per-file line vector, match vector, or ordered set.
-                for (index, line) in content.lines().enumerate() {
-                    if matches_found >= limit {
-                        break;
-                    }
-                    if !matcher.is_match(line) {
-                        continue;
-                    }
-                    matches_found += 1;
-                    hits.push(format!("{rel}:{}:{}", index + 1, cap_grep_line(line)));
-                }
-                return ControlFlow::Continue(());
-            }
-            let lines: Vec<&str> = content.lines().collect();
-            // Match pass first so a context line that is itself a match keeps
-            // the match (`:`) format even past the match limit.
-            let matched: Vec<bool> = lines.iter().map(|line| matcher.is_match(line)).collect();
-            // The match limit counts matches; context lines ride along free.
-            // Overlapping context windows are merged (each line emitted once).
-            let mut emit: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
-            for (index, &hit) in matched.iter().enumerate() {
-                if !hit {
-                    continue;
-                }
-                if matches_found >= limit {
-                    break;
-                }
-                matches_found += 1;
-                let from = index.saturating_sub(context);
-                let to = (index + context).min(lines.len().saturating_sub(1));
-                emit.extend(from..=to);
-            }
-            for index in emit {
-                let line = cap_grep_line(lines[index]);
-                if matched[index] {
-                    hits.push(format!("{rel}:{}:{line}", index + 1));
-                } else {
-                    hits.push(format!("{rel}-{}-{line}", index + 1));
-                }
-            }
+            whipplescript::workspace_grep::grep_file_into(
+                rel,
+                &content,
+                &matcher,
+                context,
+                limit,
+                &mut matches_found,
+                &mut hits,
+            );
             ControlFlow::Continue(())
         });
         if hits.is_empty() {
@@ -3232,59 +3197,6 @@ fn usize_arg(args: &Value, key: &str) -> Option<usize> {
     args.get(key)
         .and_then(Value::as_u64)
         .map(|value| value as usize)
-}
-
-/// Pattern matcher for `grep`: a real regex when the pattern compiles, else a
-/// literal substring. An invalid regex is deliberately NOT an error — pi users
-/// paste literal code fragments (`foo(`, `a[0]`) as patterns and expect a
-/// lenient literal search, so compile failure degrades to substring matching.
-enum GrepMatcher {
-    Regex(regex::Regex),
-    Literal { needle: String, ignore_case: bool },
-}
-
-impl GrepMatcher {
-    fn new(pattern: &str, ignore_case: bool) -> Self {
-        match regex::RegexBuilder::new(pattern)
-            .case_insensitive(ignore_case)
-            .build()
-        {
-            Ok(re) => GrepMatcher::Regex(re),
-            Err(_) => GrepMatcher::Literal {
-                needle: if ignore_case {
-                    pattern.to_lowercase()
-                } else {
-                    pattern.to_string()
-                },
-                ignore_case,
-            },
-        }
-    }
-
-    fn is_match(&self, line: &str) -> bool {
-        match self {
-            GrepMatcher::Regex(re) => re.is_match(line),
-            GrepMatcher::Literal {
-                needle,
-                ignore_case,
-            } => {
-                if *ignore_case {
-                    line.to_lowercase().contains(needle)
-                } else {
-                    line.contains(needle)
-                }
-            }
-        }
-    }
-}
-
-/// Cap a single grep output line at [`GREP_MAX_LINE_CHARS`] characters
-/// (char-boundary safe), marking the cut.
-fn cap_grep_line(line: &str) -> String {
-    match line.char_indices().nth(GREP_MAX_LINE_CHARS) {
-        Some((byte_index, _)) => format!("{}... [truncated]", &line[..byte_index]),
-        None => line.to_string(),
-    }
 }
 
 /// Sniff the leading [`BINARY_SNIFF_BYTES`] bytes for a NUL and refuse the read

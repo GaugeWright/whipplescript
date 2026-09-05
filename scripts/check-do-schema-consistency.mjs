@@ -183,6 +183,62 @@ export function fixtureDrift(rustTables, workerTables) {
   return findings;
 }
 
+/// Every column an `INSERT INTO <table> (…)` names, per table.
+///
+/// Deliberately only the explicit column list. A `SELECT` names columns through
+/// aliases, expressions, joins and `*`, and a rule that tried to read those
+/// would report columns nobody wrote — which is how a checker earns being
+/// ignored. An INSERT's column list is unambiguous: it is written out, it is
+/// exactly the columns the statement supplies, and it is the shape that has
+/// already gone wrong here (`register_skill` inserting into `skills(body)`
+/// while the production schema never declared the column, so the write could
+/// only ever have failed on a real object).
+export function insertColumnRefs(source) {
+  const refs = new Map();
+  const statement = /INSERT\s+(?:OR\s+\w+\s+)?INTO\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(([^)]*)\)/gis;
+  let match;
+  while ((match = statement.exec(source)) !== null) {
+    const table = match[1];
+    const columns = match[2]
+      // Rust string literals wrap a long statement with a trailing backslash.
+      .replace(/\\\s*\n/g, " ")
+      .split(",")
+      .map((column) => column.trim().replace(/"/g, ""))
+      // `VALUES`-side expressions and anything not a bare identifier are not
+      // column names; a list that yields none is not a column list at all.
+      .filter((column) => BARE_IDENTIFIER.test(column));
+    if (!columns.length) continue;
+    if (!refs.has(table)) refs.set(table, new Set());
+    for (const column of columns) refs.get(table).add(column);
+  }
+  return refs;
+}
+
+/// Rule 3. A statement may only name a column the schema declares.
+///
+/// Rules 1 and 2 compare DECLARATIONS with declarations. Nothing read the
+/// statements, so a write naming a column no schema has was caught only if some
+/// test happened to run it — and on the DO the failure surfaces in production,
+/// against a real object, as a query error naming nothing the reader recognises.
+export function undeclaredInserts(refs, workerTables) {
+  const findings = [];
+  for (const [table, columns] of refs) {
+    // A table the production schema does not declare at all is Rule 1's
+    // finding, reported there with its own wording; saying it twice would make
+    // one drift read as two.
+    if (!workerTables.has(table)) continue;
+    const declared = workerTables.get(table);
+    for (const column of columns) {
+      if (declared.has(column)) continue;
+      findings.push(
+        `\`${table}.${column}\` is written by ${RUST_STORE} but ${WORKER_SCHEMA} never ` +
+          `declares it: the statement can only fail against a real object`,
+      );
+    }
+  }
+  return findings;
+}
+
 /// Rule 2. What this change adds to the production schema must also reach an
 /// object an earlier deploy created.
 export function upgradeGaps(baseTables, headTables, adds, createdLazily) {
@@ -302,6 +358,44 @@ function selftest() {
     [],
   );
 
+  // Rule 3's parser: the column list, not the VALUES side; a backslash-wrapped
+  // Rust literal; and a statement with no column list is not one.
+  const refs = insertColumnRefs(
+    'let a = "INSERT INTO t (a, b) VALUES (?1, ?2)";\n' +
+      'let b = "INSERT OR REPLACE INTO t (c) VALUES (?1)";\n' +
+      'let c = "INSERT INTO t VALUES (?1, ?2)";\n' +
+      'let d = "INSERT INTO u (x, \\\n             y) VALUES (?1, ?2)";\n',
+  );
+  check(
+    "insertColumnRefs reads the column list only",
+    [...refs].map(([t, c]) => [t, [...c].sort()]).sort(),
+    [
+      ["t", ["a", "b", "c"]],
+      ["u", ["x", "y"]],
+    ],
+  );
+  check(
+    "undeclaredInserts names a column the schema lacks",
+    undeclaredInserts(
+      new Map([["t", new Set(["a", "gone"])]]),
+      new Map([["t", new Set(["a"])]]),
+    ).length,
+    1,
+  );
+  check(
+    "undeclaredInserts stays quiet when every column is declared",
+    undeclaredInserts(
+      new Map([["t", new Set(["a", "b"])]]),
+      new Map([["t", new Set(["a", "b"])]]),
+    ),
+    [],
+  );
+  check(
+    "a table production does not declare is Rule 1's finding, not Rule 3's",
+    undeclaredInserts(new Map([["missing", new Set(["a"])]]), new Map()),
+    [],
+  );
+
   const base = new Map([["t", new Set(["a"])]]);
   const head = new Map([["t", new Set(["a", "b"])], ["u", new Set(["a"])]]);
   check(
@@ -350,6 +444,25 @@ const indexSource = readFileSync(WORKER_INDEX, "utf8");
 
 const findings = fixtureDrift(rustTables, workerTables);
 
+// Rule 3 reads the whole Rust store, not the bootstrap block: the statements
+// live throughout the file, and it is the statements this rule is about.
+const inserts = insertColumnRefs(rustSource);
+findings.push(
+  ...undeclaredInserts(
+    inserts,
+    // A lazily added column IS declared for an upgraded object, so the union is
+    // what a live object actually has.
+    (() => {
+      const live = new Map([...workerTables].map(([t, c]) => [t, new Set(c)]));
+      for (const [table, columns] of lazyColumnAdds(readFileSync(WORKER_INDEX, "utf8"))) {
+        if (!live.has(table)) live.set(table, new Set());
+        for (const column of columns) live.get(table).add(column);
+      }
+      return live;
+    })(),
+  ),
+);
+
 const baseSchema = mergeBaseSchema();
 let differential;
 if (baseSchema === null) {
@@ -374,5 +487,7 @@ if (findings.length) {
 
 console.log(
   `durable object schema: ${workerTables.size} tables in the production schema, ` +
-    `${rustTables.size} in the Rust fixture, all present; lazy upgrades ${differential}`,
+    `${rustTables.size} in the Rust fixture, all present; ` +
+    `${[...inserts.values()].reduce((n, c) => n + c.size, 0)} inserted columns declared; ` +
+    `lazy upgrades ${differential}`,
 );
