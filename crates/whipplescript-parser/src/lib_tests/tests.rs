@@ -11691,6 +11691,193 @@ fn merging_passes_keeps_distinct_findings_and_order() {
     assert_eq!(diagnostics, labelled, "a related label was collapsed away");
 }
 
+/// The lowering layer's refusals, from a mutation sweep of `lowering.rs` on
+/// 2026-09-03: 5 of its 74 refusal sites were unexercised — 6.8%, in line with
+/// `lib.rs` and nothing like the syntax layer's 27.6%.
+///
+/// Three are reachable and covered here. The two that are not are recorded in
+/// the test below rather than left for the next sweep to rediscover.
+#[test]
+fn the_lowering_layer_refuses_a_second_declaration_and_a_misplaced_clause() {
+    let cases: &[(&str, &str, &str)] = &[
+        (
+            "construct.duplicate_declaration",
+            "gauge `g` is declared more than once",
+            r#"
+workflow G
+output result R
+class R { v string }
+class Ticket { title string }
+gauge g { judge via exec "score" }
+gauge g { judge via exec "score" }
+rule j
+  when Ticket as t
+=> { complete result { v t.title } }
+"#,
+        ),
+        (
+            "construct.duplicate_declaration",
+            "campaign `c` is declared more than once",
+            r#"
+workflow C
+output result R
+class R { v string }
+class Ticket { title string }
+gauge g { judge via exec "score" }
+campaign c { ascend g }
+campaign c { ascend g }
+rule j
+  when Ticket as t
+=> { complete result { v t.title } }
+"#,
+        ),
+        (
+            "construct.incompatible_clause",
+            "source `daily` declares a `path` clause but its provider is `clock`, not `file`",
+            r#"
+@service
+workflow P
+use std.time
+use std.ingress
+
+signal tick.now {
+  scheduled_at time
+  observed_at time
+  occurrence_id string
+  missed_count int
+}
+
+source clock as daily {
+  every weekday at 09:00
+  missed coalesce
+  path "./inbox.txt"
+
+  observe as tick
+  emit tick.now {
+    scheduled_at tick.scheduled_at
+    observed_at tick.observed_at
+    occurrence_id tick.occurrence_id
+    missed_count tick.missed_count
+  }
+}
+
+rule r
+  when tick.now as t
+=> { record Seen { at t.scheduled_at } }
+
+class Seen { at time }
+"#,
+        ),
+    ];
+    for (code, expected, source) in cases {
+        let compiled = compile_program(source);
+        assert!(
+            compiled
+                .diagnostics
+                .iter()
+                .any(|d| d.code.as_str() == *code && d.message == *expected),
+            "expected `{expected}`, got {:?}",
+            compiled
+                .diagnostics
+                .iter()
+                .map(|d| d.message.as_str())
+                .collect::<Vec<_>>()
+        );
+    }
+}
+
+/// The other two `lowering.rs` findings are SHADOWED, and this records the
+/// evidence so the next sweep does not spend the search again.
+///
+/// `lower_program`'s item loop refuses `Item::Pattern` ("not allowed inside this
+/// declaration scope") and `Item::Apply` ("was not expanded"). Neither is
+/// reachable from source: every route into them is intercepted earlier by a
+/// more precise diagnostic.
+///
+///   * a `pattern` at top level is parsed into `program.patterns`, a separate
+///     field, and never becomes an item at all;
+///   * a `pattern` inside a braced workflow is a parse error before lowering;
+///   * a `pattern` nested in a pattern BODY has its own message, "nested pattern
+///     declarations are not supported in pattern bodies";
+///   * an `apply` naming a pattern that does not exist is refused as
+///     `type.unknown_pattern` and then DROPPED by the expander, so no
+///     unexpanded application survives.
+///
+/// They are the invariant's last line, not a rule a program can break. What is
+/// pinned here is the INTERCEPTIONS: if one stops firing, the arms become
+/// reachable and want tests of their own.
+#[test]
+fn a_pattern_never_reaches_lowering_as_an_item() {
+    let in_workflow = compile_program(
+        r#"
+workflow Outer {
+  output result R
+  class R { v string }
+  class Ticket { title string }
+
+  pattern Inner<A, B> {
+    rule r
+      when A as a
+    => { complete result { v a.title } }
+  }
+
+  rule j
+    when Ticket as t
+  => { complete result { v t.title } }
+}
+"#,
+    );
+    assert!(
+        in_workflow.diagnostics.iter().any(|d| {
+            d.code.as_str() == "parse.unexpected_token"
+                && d.message.contains("expected workflow body declaration")
+        }),
+        "a pattern in a braced workflow must be refused by the PARSER: {:?}",
+        in_workflow
+            .diagnostics
+            .iter()
+            .map(|d| d.message.as_str())
+            .collect::<Vec<_>>()
+    );
+
+    let unknown = compile_program(
+        r#"
+workflow A
+output result R
+class R { v string }
+class Ticket { title string }
+class Reviewed { id string }
+
+apply Ghost<Ticket, Reviewed> as g {
+  reviewer worker
+}
+
+rule j
+  when Ticket as t
+=> { complete result { v t.title } }
+"#,
+    );
+    assert!(
+        unknown
+            .diagnostics
+            .iter()
+            .any(|d| d.code.as_str() == "type.unknown_pattern"),
+        "an apply naming no pattern must be refused BEFORE lowering: {:?}",
+        unknown
+            .diagnostics
+            .iter()
+            .map(|d| d.message.as_str())
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        !unknown
+            .diagnostics
+            .iter()
+            .any(|d| d.code.as_str() == "lowering.unexpanded_pattern_application"),
+        "the expander dropped nothing: an unexpanded application reached lowering"
+    );
+}
+
 /// The syntax layer's refusals, from a mutation sweep of `syntax.rs` on
 /// 2026-09-03: 16 of its 58 refusal sites were unexercised by the whole
 /// workspace suite — 27.6%, against 6.9% for `lib.rs` and 6.8% for
