@@ -21,27 +21,66 @@ run_whip() {
 }
 
 # Examples that a no-`--input`, no-`--root`, single-workflow fixture run cannot
-# drive are exercised elsewhere; everything else must reach full rule coverage
-# here. Categories:
-#   - multiple workflows (need `--root`): the docs-examples gate checks these with
-#     the right root. (coord-acquire-wait, coordination-partition-shared,
-#     least-privilege-subagent, parent-child-outcomes, private-workflow-wrapper,
-#     typed-invoke-result, revision-*).
-#   - `given input` (need `--input`): covered by `whip test` blocks.
-#     (tested-agent-turn, coerce-enum, subworkflow-tool-consumer, compact-contract,
-#     echo-text-tool, improve-triage, include-audit, include-triage,
-#     pattern-consumer-audit, pattern-consumer-triage, redact-projection,
-#     scalar-terminal).
-#   - non-`std.` package import (need a `whip.lock`): package-memory, package-notes;
-#     covered by the `dev_capability_call_*` / `check_discovers_*` tests.
-#   - externally triggered `@service` workflows: the only rule fires on
-#     something a no-signal, no-message fixture run never produces, so the run
-#     records nothing at all. event-bridge (injected signal), clock-source (a
-#     `source clock` tick), ingress-file-source / ingress-http-source (a `source
-#     file` / `source http` feed), messaging-demo / messaging-inbound-local (an
-#     inbound `when message from <channel>`), terminal-output-union (a
-#     `WorkItem` no table seeds and no tracker projects).
-SKIP="terminal-output-union clock-source ingress-file-source ingress-http-source messaging-demo messaging-inbound-local revision-parent-child revision-validation-approval revision-repair-planner revision-running-cancel revision-ticket-v1 revision-ticket-v2 tested-agent-turn coerce-enum subworkflow-tool-consumer package-memory package-notes event-bridge coord-acquire-wait coordination-partition-shared least-privilege-subagent parent-child-outcomes private-workflow-wrapper typed-invoke-result compact-contract echo-text-tool improve-triage include-audit include-triage pattern-consumer-audit pattern-consumer-triage redact-projection scalar-terminal"
+# drive. Every one is exercised elsewhere; everything else must reach full rule
+# coverage here.
+#
+# ONE NAME, ONE REASON, ONE LINE. This was a single shell word matched by
+# substring, with the reasons grouped in a comment above it — and the grouping
+# was wrong. It said the multi-workflow examples are "checked by the
+# docs-examples gate with the right root", which was true of
+# `parent-child-outcomes` and `typed-invoke-result` and false of four others:
+# they appeared in this list and NOWHERE ELSE in the tree, so the exclusion
+# cited a gate that was not checking them. Three are now in
+# `check-docs-examples.sh`; the fourth is below with the reason it cannot be.
+#
+# A reason per entry is what makes that visible: a claim attached to one name
+# can be checked against that name.
+SKIP_TABLE="
+terminal-output-union|@service: its only rule fires on a WorkItem no table seeds and no tracker projects
+clock-source|@service: needs a \`source clock\` tick
+ingress-file-source|@service: needs a \`source file\` feed
+ingress-http-source|@service: needs a \`source http\` feed
+messaging-demo|@service: needs an inbound \`when message from <channel>\`
+messaging-inbound-local|@service: needs an inbound \`when message from <channel>\`
+event-bridge|@service: needs an injected signal
+revision-parent-child|multi-workflow: needs --root
+revision-validation-approval|multi-workflow: needs --root
+revision-repair-planner|multi-workflow: needs --root
+revision-running-cancel|multi-workflow: needs --root
+revision-ticket-v1|multi-workflow: needs --root
+revision-ticket-v2|multi-workflow: needs --root
+coord-acquire-wait|multi-workflow: checked by check-docs-examples.sh --root Holder
+least-privilege-subagent|multi-workflow: checked by check-docs-examples.sh --root ParentReview
+private-workflow-wrapper|multi-workflow: checked by check-docs-examples.sh --root PublicAudit
+parent-child-outcomes|multi-workflow: checked by check-docs-examples.sh --root Parent
+typed-invoke-result|multi-workflow: checked by check-docs-examples.sh --root Router
+coordination-partition-shared|multi-workflow, and NOT lint-clean under any single root: it declares two leases, one per pair of workflows, so whichever root is chosen the other lints unused. Exercised by nothing until that is resolved
+tested-agent-turn|given input: covered by \`whip test\` blocks
+coerce-enum|given input: covered by \`whip test\` blocks
+subworkflow-tool-consumer|given input: covered by \`whip test\` blocks
+compact-contract|given input: covered by \`whip test\` blocks
+echo-text-tool|given input: covered by \`whip test\` blocks
+improve-triage|given input: covered by \`whip test\` blocks
+include-audit|given input: covered by \`whip test\` blocks
+include-triage|given input: covered by \`whip test\` blocks
+pattern-consumer-audit|given input: covered by \`whip test\` blocks
+pattern-consumer-triage|given input: covered by \`whip test\` blocks
+redact-projection|given input: covered by \`whip test\` blocks
+scalar-terminal|given input: covered by \`whip test\` blocks
+package-memory|non-std package import: needs a whip.lock; covered by the dev_capability_call_* tests
+package-notes|non-std package import: needs a whip.lock; covered by the check_discovers_* tests
+"
+
+# A name with no reason is an exclusion nobody stated, so it is not one.
+while IFS='|' read -r skip_name skip_why; do
+  [ -n "$skip_name" ] || continue
+  if [ -z "$skip_why" ]; then
+    echo "SKIP entry \`$skip_name\` carries no reason; state why this harness cannot drive it" >&2
+    exit 2
+  fi
+done <<EOF
+$SKIP_TABLE
+EOF
 
 # Script hard-off Layer 2 (spec/std-script.md): raw `exec` seeds `script.raw`
 # only under dev profile + a non-empty WHIPPLESCRIPT_EXEC_ALLOW, and ungranted
@@ -55,7 +94,7 @@ export WHIPPLESCRIPT_EXEC_ALLOW="sh -c *:printf *"
 failures=0
 for workflow in "$ROOT"/examples/*.whip; do
   name="$(basename "$workflow" .whip)"
-  case " $SKIP " in *" $name "*) continue ;; esac
+  if printf '%s' "$SKIP_TABLE" | grep -q "^$name|"; then continue; fi
   store="$WORK_DIR/$name.sqlite"
   items="$WORK_DIR/$name-items.sqlite"
   rm -f "$store" "$items"

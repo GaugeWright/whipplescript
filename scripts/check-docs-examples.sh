@@ -35,6 +35,14 @@ check_example examples/file-store-demo.whip
 check_example examples/include-triage.whip
 check_example examples/include-audit.whip
 check_example examples/parent-child-outcomes.whip --root Parent
+# The multi-workflow examples `check-rule-coverage.sh` SKIPs on the grounds that
+# "the docs-examples gate checks these with the right root". Until 2026-09-04
+# that was true of `parent-child-outcomes` and `typed-invoke-result` and FALSE of
+# these three: they appeared in that SKIP list and nowhere else in the tree, so
+# the exclusion cited a gate that was not checking them.
+check_example examples/coord-acquire-wait.whip --root Holder
+check_example examples/least-privilege-subagent.whip --root ParentReview
+check_example examples/private-workflow-wrapper.whip --root PublicAudit
 check_example examples/compact-contract.whip
 check_example examples/scalar-terminal.whip
 check_example examples/typed-invoke-result.whip --root Router
