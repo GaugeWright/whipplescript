@@ -878,6 +878,10 @@ pub struct McpServerRuntime {
     pub rung: McpRung,
     client: Mutex<McpClient>,
     admitted: Vec<String>,
+    /// What this server's grant asked for that did not arrive. Recorded, not
+    /// enforced: a drop narrows the surface and never widens it, so it has no
+    /// part in `call`'s authority check below.
+    dropped: Vec<whipplescript_kernel::mcp::McpDrop>,
 }
 
 impl McpServerRuntime {
@@ -922,12 +926,27 @@ impl McpTurnRuntime {
     /// turn's durable provenance answers "which third parties could this turn
     /// reach, and how much had anyone vouched for them?" — the tagging half of
     /// progressive rigor, which is what makes rung 0 honest rather than silent.
-    pub fn trust_summary(&self) -> Vec<(String, McpRung, Vec<String>)> {
+    pub fn trust_summary(&self) -> Vec<McpServerTrust> {
         self.servers
             .iter()
-            .map(|runtime| (runtime.name.clone(), runtime.rung, runtime.admitted.clone()))
+            .map(|runtime| McpServerTrust {
+                server: runtime.name.clone(),
+                rung: runtime.rung,
+                admitted: runtime.admitted.clone(),
+                dropped: runtime.dropped.clone(),
+            })
             .collect()
     }
+}
+
+/// One server's line in the turn's trust bundle: what it ran at, what it gave
+/// the model, and what the grant asked for that did not arrive.
+#[derive(Clone, Debug)]
+pub struct McpServerTrust {
+    pub server: String,
+    pub rung: McpRung,
+    pub admitted: Vec<String>,
+    pub dropped: Vec<whipplescript_kernel::mcp::McpDrop>,
 }
 
 /// Connect every granted server, admit its tools, and build the model-facing
@@ -1039,11 +1058,12 @@ pub fn resolve_turn_mcp_tools(
             classified: classified_tools(config, &live),
             profile_permitted: None,
         };
-        let admitted =
+        let admission =
             admit_tools(rung, min_rung, &input).map_err(|denial| McpResolveError::Denied {
                 server: server_name.to_owned(),
                 message: denial.message(server_name),
             })?;
+        let (admitted, dropped) = (admission.exposed, admission.dropped);
 
         for tool in &live {
             if !admitted.iter().any(|name| name == &tool.name) {
@@ -1077,6 +1097,7 @@ pub fn resolve_turn_mcp_tools(
             rung,
             client: Mutex::new(client),
             admitted,
+            dropped,
         });
     }
     Ok((specs, runtime))

@@ -68,6 +68,7 @@ mod WHIPPLESCRIPT-MCP-ADMISSION is
   op names : ToolSet -> Cfg [ctor] .        --- enumerated-name grant, still to process
   op role : ToolSet -> Cfg [ctor] .         --- role-shaped grant: the role's member tools
   op exposed : ToolSet -> Cfg [ctor] .      --- computed tool surface for this turn
+  op dropped : ToolSet -> Cfg [ctor] .      --- granted tools the intersection did not admit
   op denied : Reason -> Cfg [ctor] .
 
   --- Pin drift bites only once a pin exists: at r0 there is nothing to drift from.
@@ -122,8 +123,11 @@ mod WHIPPLESCRIPT-MCP-ADMISSION is
       => phase(admitting) role(S) names(T ; G) classified(C)
       if member(T, C) = true .
 
-  crl [role-drop] : phase(admitting) role(T ; S) classified(C)
-      => phase(admitting) role(S) classified(C)
+  --- The drop is RECORDED. It was a silent discard, which made a role reaching
+  --- for a tool nobody classified indistinguishable from a role that never named
+  --- it -- the turn simply had a smaller surface and no account of why.
+  crl [role-drop] : phase(admitting) role(T ; S) classified(C) dropped(D)
+      => phase(admitting) role(S) classified(C) dropped(T ; D)
       if member(T, C) = false .
 
   --- The intersection proper.
@@ -131,8 +135,10 @@ mod WHIPPLESCRIPT-MCP-ADMISSION is
       => phase(admitting) names(G) exposed(T ; E) offered(O) profile(P)
       if admissible(T, O, P) = true .
 
-  crl [refuse] : phase(admitting) names(T ; G) offered(O) profile(P)
-      => phase(admitting) names(G) offered(O) profile(P)
+  --- Recorded for the same reason, and still not a refusal: the turn proceeds
+  --- with what the server and profile do allow.
+  crl [refuse] : phase(admitting) names(T ; G) offered(O) profile(P) dropped(D)
+      => phase(admitting) names(G) offered(O) profile(P) dropped(T ; D)
       if admissible(T, O, P) = false .
 
   rl [finish] : phase(admitting) names(mt) role(mt)

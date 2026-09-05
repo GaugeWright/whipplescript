@@ -478,13 +478,65 @@ pub struct McpAdmissionInput {
     pub profile_permitted: Option<Vec<String>>,
 }
 
+/// Why a granted tool did not reach the model. Not a refusal: a gate refused
+/// nothing here, and the turn proceeds with a smaller surface. It is a MISMATCH
+/// between what a grant asked for and what the server and profile actually
+/// offer, which is the operator's to reconcile and was previously invisible --
+/// the tool simply vanished between the grant and the prompt.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum McpDropReason {
+    /// Reached through a role, but nobody classified it, so the role has no
+    /// admitted claim on it.
+    Unclassified { role: String },
+    /// The grant names it and the server does not serve it.
+    NotOffered,
+    /// The server serves it and the profile does not permit it.
+    ProfileForbids,
+}
+
+impl McpDropReason {
+    /// Operator-facing phrase, read after "`tool` ".
+    pub fn as_phrase(&self) -> String {
+        match self {
+            Self::Unclassified { role } => {
+                format!("is reached through role `{role}` but carries no admitted classification")
+            }
+            Self::NotOffered => "is granted but the server does not offer it".to_owned(),
+            Self::ProfileForbids => "is offered but the profile does not permit it".to_owned(),
+        }
+    }
+}
+
+/// A granted tool that did not reach the model, and why.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct McpDrop {
+    pub tool: String,
+    pub reason: McpDropReason,
+}
+
+/// The admitted surface, and what a grant asked for that did not make it.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct McpAdmission {
+    /// Tools the model is given, sorted and deduplicated.
+    pub exposed: Vec<String>,
+    /// Tools a grant named that did not arrive, sorted by tool name. Empty for
+    /// a grant the server and profile satisfy completely.
+    pub dropped: Vec<McpDrop>,
+}
+
 /// Decide the exposed tool set. Mirrors the Maude model's rule order exactly:
 /// envelope gate, then drift, then role availability, then the intersection.
+///
+/// The intersection's three exclusions are RECORDED rather than silent. Each was
+/// a bare `continue`, so a grant naming a tool the server had renamed, or a role
+/// reaching a tool nobody classified, produced a quietly smaller tool surface
+/// and no account of itself anywhere. The turn still proceeds -- these are
+/// mismatches, not refusals -- but `dropped` now says what did not arrive.
 pub fn admit_tools(
     rung: McpRung,
     min_rung: Option<McpRung>,
     input: &McpAdmissionInput,
-) -> Result<Vec<String>, McpDenial> {
+) -> Result<McpAdmission, McpDenial> {
     // Precheck 1 — the envelope's minimum rung (design note §6). Runs before
     // any tool is considered, so a below-bar server exposes nothing at all.
     if let Some(required) = min_rung {
@@ -524,11 +576,17 @@ pub fn admit_tools(
     // tool nobody classified, so a server that grows a tool cannot grow the
     // meaning of an existing role.
     let classified: HashSet<&str> = input.classified.iter().map(String::as_str).collect();
+    let mut dropped: Vec<McpDrop> = Vec::new();
     let mut requested: Vec<String> = input.granted_names.clone();
-    for (_, tools) in &input.granted_roles {
+    for (role, tools) in &input.granted_roles {
         for tool in tools {
             if classified.contains(tool.as_str()) {
                 requested.push(tool.clone());
+            } else {
+                dropped.push(McpDrop {
+                    tool: tool.clone(),
+                    reason: McpDropReason::Unclassified { role: role.clone() },
+                });
             }
         }
     }
@@ -544,16 +602,34 @@ pub fn admit_tools(
     let mut exposed = BTreeSet::new();
     for tool in requested {
         if !offered.contains(tool.as_str()) {
+            dropped.push(McpDrop {
+                tool,
+                reason: McpDropReason::NotOffered,
+            });
             continue;
         }
         if let Some(permitted) = &permitted {
             if !permitted.contains(tool.as_str()) {
+                dropped.push(McpDrop {
+                    tool,
+                    reason: McpDropReason::ProfileForbids,
+                });
                 continue;
             }
         }
         exposed.insert(tool);
     }
-    Ok(exposed.into_iter().collect())
+    // Sorted and deduplicated for the same reason `exposed` is: a grant that
+    // names one tool twice, or reaches it through two roles, describes one
+    // mismatch and should read as one.
+    dropped.sort_by(|left, right| {
+        (&left.tool, left.reason.as_phrase()).cmp(&(&right.tool, right.reason.as_phrase()))
+    });
+    dropped.dedup();
+    Ok(McpAdmission {
+        exposed: exposed.into_iter().collect(),
+        dropped,
+    })
 }
 
 /// Compare a live manifest against pinned digests, returning the drifted tool
@@ -669,7 +745,8 @@ mod tests {
                 &["get_issue", "create_issue", "merge_pull_request"],
             ),
         )
-        .expect("admitted");
+        .expect("admitted")
+        .exposed;
         assert_eq!(exposed, vec!["create_issue", "get_issue"]);
         assert!(!exposed.iter().any(|tool| tool == "merge_pull_request"));
     }
@@ -682,7 +759,8 @@ mod tests {
             None,
             &input(&["get_issue"], &["get_issue"]),
         )
-        .expect("admitted");
+        .expect("admitted")
+        .exposed;
         assert_eq!(exposed, vec!["get_issue"]);
     }
 
@@ -695,7 +773,9 @@ mod tests {
             &["get_issue", "create_issue"],
         );
         with_profile.profile_permitted = Some(vec!["get_issue".to_owned()]);
-        let exposed = admit_tools(McpRung::Unattested, None, &with_profile).expect("admitted");
+        let exposed = admit_tools(McpRung::Unattested, None, &with_profile)
+            .expect("admitted")
+            .exposed;
         assert_eq!(exposed, vec!["get_issue"]);
     }
 
@@ -709,7 +789,9 @@ mod tests {
         assert!(matches!(denial, McpDenial::PinDrift { .. }));
         // ... and the SAME configuration at rung 0 exposes the tool, proving the
         // denial comes from the pin and not from the grant.
-        let exposed = admit_tools(McpRung::Unattested, None, &drifting).expect("admitted");
+        let exposed = admit_tools(McpRung::Unattested, None, &drifting)
+            .expect("admitted")
+            .exposed;
         assert_eq!(exposed, vec!["get_issue"]);
     }
 
@@ -729,7 +811,9 @@ mod tests {
             other => panic!("expected RoleUnavailable, got {other:?}"),
         }
         // At rung 2 the same grant resolves.
-        let exposed = admit_tools(McpRung::Attested, None, &roled).expect("admitted");
+        let exposed = admit_tools(McpRung::Attested, None, &roled)
+            .expect("admitted")
+            .exposed;
         assert_eq!(exposed, vec!["get_issue"]);
     }
 
@@ -744,9 +828,82 @@ mod tests {
             vec!["get_issue".to_owned(), "get_env".to_owned()],
         )];
         roled.classified = vec!["get_issue".to_owned()];
-        let exposed = admit_tools(McpRung::Classified, None, &roled).expect("admitted");
+        let exposed = admit_tools(McpRung::Classified, None, &roled)
+            .expect("admitted")
+            .exposed;
         assert_eq!(exposed, vec!["get_issue"]);
         assert!(!exposed.iter().any(|tool| tool == "get_env"));
+    }
+
+    /// The intersection's three exclusions used to be bare `continue`s: a
+    /// granted tool that did not reach the model left no account of itself
+    /// anywhere, so an operator whose grant named a renamed tool saw a smaller
+    /// surface and no reason for it. Each is recorded now.
+    ///
+    /// Recorded, NOT refused. Every case here still admits what it can and
+    /// returns `Ok`: these are mismatches between a grant and what a server and
+    /// profile actually offer, and turning one into a denial would fail turns
+    /// that are working as intended.
+    #[test]
+    fn a_granted_tool_that_does_not_arrive_says_why() {
+        // Granted by name, not served.
+        let mut renamed = input(&["get_issue", "fetch_issue"], &["get_issue"]);
+        renamed.classified = vec!["get_issue".to_owned()];
+        let admission = admit_tools(McpRung::Attested, None, &renamed).expect("admitted");
+        assert_eq!(admission.exposed, vec!["get_issue"]);
+        assert_eq!(
+            admission.dropped,
+            vec![McpDrop {
+                tool: "fetch_issue".to_owned(),
+                reason: McpDropReason::NotOffered,
+            }]
+        );
+
+        // Reached through a role, classified by nobody. The role is named,
+        // because "which role reached for it" is the thing an operator fixes.
+        let mut roled = input(&[], &["get_issue", "get_env"]);
+        roled.granted_roles = vec![(
+            "read".to_owned(),
+            vec!["get_issue".to_owned(), "get_env".to_owned()],
+        )];
+        roled.classified = vec!["get_issue".to_owned()];
+        let admission = admit_tools(McpRung::Classified, None, &roled).expect("admitted");
+        assert_eq!(admission.exposed, vec!["get_issue"]);
+        assert_eq!(
+            admission.dropped,
+            vec![McpDrop {
+                tool: "get_env".to_owned(),
+                reason: McpDropReason::Unclassified {
+                    role: "read".to_owned()
+                },
+            }]
+        );
+        assert!(admission.dropped[0].reason.as_phrase().contains("`read`"));
+
+        // Served, and the profile does not permit it.
+        let mut profiled = input(
+            &["get_issue", "create_issue"],
+            &["get_issue", "create_issue"],
+        );
+        profiled.classified = vec!["get_issue".to_owned(), "create_issue".to_owned()];
+        profiled.profile_permitted = Some(vec!["get_issue".to_owned()]);
+        let admission = admit_tools(McpRung::Attested, None, &profiled).expect("admitted");
+        assert_eq!(admission.exposed, vec!["get_issue"]);
+        assert_eq!(
+            admission.dropped,
+            vec![McpDrop {
+                tool: "create_issue".to_owned(),
+                reason: McpDropReason::ProfileForbids,
+            }]
+        );
+
+        // A grant the server satisfies drops nothing, so a healthy turn's
+        // bundle stays silent rather than carrying an empty section.
+        let mut clean = input(&["get_issue"], &["get_issue"]);
+        clean.classified = vec!["get_issue".to_owned()];
+        let admission = admit_tools(McpRung::Attested, None, &clean).expect("admitted");
+        assert_eq!(admission.exposed, vec!["get_issue"]);
+        assert!(admission.dropped.is_empty());
     }
 
     /// Invariant 5: name-grant rung-invariance. With nothing drifted, the same
@@ -766,7 +923,7 @@ mod tests {
             McpRung::Classified,
         ] {
             assert_eq!(
-                admit_tools(rung, None, &base).expect("admitted"),
+                admit_tools(rung, None, &base).expect("admitted").exposed,
                 expected,
                 "rung {} changed the meaning of a name grant",
                 rung.as_str()
@@ -790,7 +947,9 @@ mod tests {
         }
         // Meeting the bar admits normally.
         assert_eq!(
-            admit_tools(McpRung::Attested, Some(McpRung::Attested), &granted).expect("admitted"),
+            admit_tools(McpRung::Attested, Some(McpRung::Attested), &granted)
+                .expect("admitted")
+                .exposed,
             vec!["get_issue"]
         );
     }

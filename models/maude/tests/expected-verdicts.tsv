@@ -75,7 +75,7 @@ invoke-result-typing.maude	SSSSNNSSSN
 ledger-freshness.maude	SNNSSNNSSNSS
 lowering-class-lifecycle.maude	SSSSSSSSSSSNNNNNNNNNNNNNNN
 lowering-runtime-handoff.maude	SSSSSNNNNNNNNNNNNN
-mcp-admission.maude	SSSSSSNNNNNN
+mcp-admission.maude	SSSSSSSNNNNNNN
 merge-confluence.maude	SNSNNN
 merge-slice.maude	SSNSNSNSNS
 messaging-capability-report.maude	SSSSNNNN
