@@ -1,7 +1,7 @@
 {
   "schema": "whipplescript.workstream_host_contract_pin.v1",
-  "contract_revision": "whipplescript-workstream-host/v1.0.2",
-  "contract_digest": "a6ac1ea8be061c728c89dd2b4b005f206e604a151260ae329f34bd1bdbcdc5b0",
+  "contract_revision": "whipplescript-workstream-host/v1.0.3",
+  "contract_digest": "079c53e8953a43c890267a6a0ad330f5b3947b973a974ae60820132c2c95d244",
   "authority": "WhippleScript DR-0078",
   "normative_surface": "std.vcs durable boundary protocol",
   "operations": [
@@ -43,7 +43,7 @@
   ],
   "fixtures": {
     "path": "spec/workstream-host-contract-fixtures-v1.json",
-    "sha256": "9e7aab63622f40bf3777f971256210b2fe7f61e4082625068a24f58806b70068"
+    "sha256": "0e48cf1fb0e9c1140f0f8e1149461d55aacb9860d24ee4ad0c69e438b5df6fa9"
   },
   "compatibility": {
     "earlier_revision_accepted": false,

@@ -1,6 +1,6 @@
 {
   "schema": "whipplescript.workstream_host_contract_fixtures.v1",
-  "contract_revision": "whipplescript-workstream-host/v1.0.2",
+  "contract_revision": "whipplescript-workstream-host/v1.0.3",
   "cases": [
     {
       "id": "cancelled_boundary_cleanup_survives_each_crash",
@@ -266,6 +266,23 @@
         "home_stream_id": "live",
         "authority_position_changed": false,
         "evidence_changed": false
+      },
+      "coverage": "workstreams::tests::exact_fork_admission_keeps_source_content_and_rejects_closed_home_first"
+    },
+    {
+      "id": "exact_fork_retry_refuses_a_changed_destination",
+      "given": {
+        "source_cut": "chat-1",
+        "target_instance": "child",
+        "fork_branch_id": "chat-child",
+        "existing_home": "live",
+        "requested_homes": ["retry-other", "main"]
+      },
+      "when": "fork_at_cut_and_admit",
+      "expect": {
+        "outcome": "destination_changed",
+        "final_home": "live",
+        "authority_position_changed": false
       },
       "coverage": "workstreams::tests::exact_fork_admission_keeps_source_content_and_rejects_closed_home_first"
     },

@@ -496,6 +496,17 @@ where
     }
 
     let prior_home = streams.home_of(fork_branch_id)?;
+    let replays_existing_fork =
+        vcs.instance_branch(target_instance)?.as_deref() == Some(fork_branch_id);
+    if replays_existing_fork && prior_home.as_deref() != destination_stream {
+        return Ok(ExactForkAdmissionOutcome::DestinationChanged {
+            detail: format!(
+                "exact fork `{fork_branch_id}` is already homed at {:?}, not requested destination {:?}",
+                prior_home.as_deref(),
+                destination_stream
+            ),
+        });
+    }
     let admitted_stream = match destination_stream {
         None => None,
         Some(stream_id) => match streams.transfer(fork_branch_id, stream_id, at)? {
@@ -1497,6 +1508,45 @@ mod tests {
             home_before_retry,
             "an exact retry must not advance topology authority"
         );
+
+        vcs.create_branch(
+            "line-retry-other",
+            None,
+            crate::branches::MAINLINE_BRANCH_ID,
+            "t5-other",
+        )
+        .expect("other retry line");
+        streams
+            .create_stream("retry-other", None, "line-retry-other", "t5-other", None)
+            .expect("other retry stream");
+        for changed_destination in [
+            ExactForkDestination::Workstream("retry-other"),
+            ExactForkDestination::Main,
+        ] {
+            let changed = fork_at_cut_and_admit(
+                &mut streams,
+                &mut vcs,
+                "parent",
+                "chat-1",
+                "child",
+                "chat-child",
+                None,
+                changed_destination,
+                "t5-changed-destination",
+            )
+            .expect("changed destination refusal");
+            assert!(matches!(
+                changed,
+                ExactForkAdmissionOutcome::DestinationChanged { .. }
+            ));
+            assert_eq!(
+                streams
+                    .home_receipt("chat-child")
+                    .expect("home after changed destination"),
+                home_before_retry,
+                "a changed destination must not move an existing exact fork"
+            );
+        }
 
         streams
             .create_stream("closed", None, "line-closed", "t6", None)

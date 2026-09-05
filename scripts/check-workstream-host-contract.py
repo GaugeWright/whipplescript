@@ -24,7 +24,7 @@ def fail(message: str) -> None:
 pin = json.loads(PIN.read_text(encoding="utf-8"))
 if pin.get("schema") != "whipplescript.workstream_host_contract_pin.v1":
     fail("wrong pin schema")
-if pin.get("contract_revision") != "whipplescript-workstream-host/v1.0.2":
+if pin.get("contract_revision") != "whipplescript-workstream-host/v1.0.3":
     fail("the current published v1 revision drifted")
 
 claimed_digest = pin.get("contract_digest")
@@ -114,6 +114,7 @@ required_cases = {
     "proposal_record_failure_precedes_main_publication",
     "fork_identity_refusal_preserves_existing_home",
     "exact_fork_lost_response_retry_replays_success",
+    "exact_fork_retry_refuses_a_changed_destination",
     "native_pre_cas_error_releases_both_reservations",
     "hosted_pre_cas_error_releases_both_reservations",
     "native_post_cas_error_recovers_or_retains",
