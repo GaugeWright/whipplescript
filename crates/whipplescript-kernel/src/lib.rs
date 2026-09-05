@@ -3396,6 +3396,20 @@ fn effect_status(status: &str) -> EffectStatus {
         "failed" => EffectStatus::Failed,
         "timed_out" => EffectStatus::TimedOut,
         "cancelled" => EffectStatus::Cancelled,
+        "queued" => EffectStatus::Queued,
+        // `queued` is named above rather than served by this arm, so what
+        // reaches here is a status the store writes and the kernel does not
+        // know. It kept mapping to `Queued` -- claimable, healthy, nothing to
+        // see -- so a typo in one of the store's hand-written status literals,
+        // or a status added on one side only, would have made the trace say the
+        // effect was fine.
+        //
+        // The trace model has no variant for "I do not know", and inventing one
+        // would change a wire vocabulary the conformance suite checks. So the
+        // mapping stays total and the DEFENCE is
+        // `every_effect_status_the_store_writes_maps`: a status the store can
+        // write that is not named above fails that test rather than arriving
+        // here.
         _ => EffectStatus::Queued,
     }
 }
@@ -4536,6 +4550,7 @@ pub fn kernel_stage() -> &'static str {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
     use coerce::{CoerceRequest, FakeCoerceClient};
     use harness::{ClaudeCodeAgentHarness, CodexAgentHarness, CommandLaunchPlan, MockAgentHarness};
@@ -4552,6 +4567,43 @@ mod tests {
         NewFact, RetryEffect, RevisionActivation, RuleCommit, RunStart, SkillRegistration,
     };
 
+    /// Every effect status the STORE can write is named by `effect_status`.
+    ///
+    /// The function is total -- it must be, because the trace vocabulary has no
+    /// "unknown" variant and adding one would change a wire format the
+    /// conformance suite checks. Totality is exactly what makes a missing
+    /// status invisible: it would map to `Queued`, and the trace would report a
+    /// healthy, claimable effect. So the vocabulary is asserted HERE instead,
+    /// and a status added to the store without a mapping fails this rather than
+    /// arriving at the fall-through.
+    ///
+    /// The list is the one the store's own SQL writes. `uncertain` is
+    /// deliberately absent: it is a RUN status -- `resolve_effect_uncertain`
+    /// records it while the effect itself becomes `failed` -- so it never
+    /// reaches an effect row.
+    #[test]
+    fn every_effect_status_the_store_writes_maps() {
+        for (status, expected) in [
+            ("queued", EffectStatus::Queued),
+            ("blocked", EffectStatus::Blocked),
+            ("blocked_by_dependency", EffectStatus::Blocked),
+            ("blocked_by_capability", EffectStatus::Blocked),
+            ("blocked_by_profile", EffectStatus::Blocked),
+            ("blocked_by_capacity", EffectStatus::Blocked),
+            ("claimed", EffectStatus::Claimed),
+            ("running", EffectStatus::Running),
+            ("completed", EffectStatus::Completed),
+            ("failed", EffectStatus::Failed),
+            ("timed_out", EffectStatus::TimedOut),
+            ("cancelled", EffectStatus::Cancelled),
+        ] {
+            assert_eq!(
+                effect_status(status),
+                expected,
+                "`{status}` is written by the store and must map deliberately"
+            );
+        }
+    }
     #[test]
     fn every_new_model_visible_plane_maps_to_hash_or_derivative_evidence() {
         let (world_kind, world) =

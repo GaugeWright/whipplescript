@@ -5294,7 +5294,25 @@ pub fn parsed_effect_input_json(
                 "rule": rule.name,
             })
         }
-        _ => json!({"rule": rule.name}),
+        // Every kind this lowering mints has an arm above; nothing reaches
+        // here today. It stays a fall-through rather than becoming a refusal
+        // because the RUNTIME kind vocabulary is a `String`, so the compiler
+        // cannot check this match the way it checks one over `IrEffectKind` --
+        // a new kind would simply arrive, lower to an input carrying only its
+        // rule name, and queue normally with everything the effect needed
+        // missing.
+        //
+        // So it reports itself. Behaviour is unchanged for anything that
+        // reaches it, which is nothing, and a kind added without an arm here
+        // now says so instead of running with an empty input.
+        unhandled => {
+            errors.push(format!(
+                "effect kind `{unhandled}` has no input lowering: it would queue \
+                 with an input carrying only its rule name. Add an arm to \
+                 `parsed_effect_input_json`."
+            ));
+            json!({"rule": rule.name})
+        }
     };
     if let Some(after) = &effect.after {
         if let Some(upstream_effect_id) = effect_bindings.get(&after.binding) {
@@ -7222,6 +7240,86 @@ rule relay
             &facts,
             "emit signal of undeclared signal `task.done`",
             |ir| ir.events.clear(),
+        );
+    }
+
+    /// An effect kind with no input lowering REPORTS itself.
+    ///
+    /// The runtime kind vocabulary is a `String`, so this match cannot be
+    /// checked by the compiler the way one over `IrEffectKind` is. Every kind
+    /// the lowering mints has an arm today -- which is exactly what made the
+    /// fall-through invisible, and is why this calls the function DIRECTLY:
+    /// there is no IR that reaches the arm, because every `IrEffectKind` maps
+    /// to a handled string. A kind added on the runtime side without an arm
+    /// here would have lowered to an input carrying only its rule name and
+    /// queued normally, with everything the effect needed missing.
+    #[test]
+    fn an_effect_kind_with_no_input_lowering_is_reported() {
+        let ir = ir_of(
+            r#"workflow Relay
+
+output result Done
+
+class Done {
+  note string
+}
+
+class Task {
+  id string
+}
+
+table tasks as Task [
+  { id "t1" }
+]
+
+rule relay
+  when Task as t
+=> {
+  complete result {
+    note "done"
+  }
+}
+"#,
+        );
+        let facts = vec![fact("Task", "Task:t1", r#"{"id":"t1"}"#)];
+        let rule = ir
+            .rules
+            .iter()
+            .find(|rule| rule.name == "relay")
+            .expect("fixture rule");
+        let ready = super::ready_contexts(&ir, rule, &facts, &[], None);
+        let context = ready.contexts.first().expect("the rule is ready once");
+
+        let effect = super::ParsedEffect {
+            kind: "not.a.kind".to_owned(),
+            target: None,
+            name: None,
+            binding: None,
+            args: Vec::new(),
+            prompt: None,
+            prompt_content_type: None,
+            prompt_template: None,
+            required_capabilities: Vec::new(),
+            after: None,
+            timeout_seconds: None,
+        };
+        let mut errors = Vec::new();
+        super::parsed_effect_input_json(
+            &ir,
+            rule,
+            &effect,
+            context,
+            &std::collections::BTreeMap::new(),
+            &mut errors,
+            &facts,
+            &[],
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("no input lowering")),
+            "a kind with no arm must say so rather than lower to an empty \
+             input: {errors:?}"
         );
     }
 

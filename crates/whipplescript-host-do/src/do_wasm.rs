@@ -666,35 +666,6 @@ fn params_to_json(params: &[SqlValue]) -> String {
     serde_json::Value::from(values).to_string()
 }
 
-fn parse_rows(rows_json: &str) -> Result<Vec<Vec<SqlValue>>, String> {
-    let rows: serde_json::Value =
-        serde_json::from_str(rows_json).map_err(|error| error.to_string())?;
-    let rows = rows
-        .as_array()
-        .ok_or("DoSqlBridge.query must return a JSON array of rows")?;
-    rows.iter()
-        .map(|row| {
-            let cells = row
-                .as_array()
-                .ok_or("each row must be a JSON array".to_owned())?;
-            Ok(cells
-                .iter()
-                .map(|cell| {
-                    if cell.is_null() {
-                        SqlValue::Null
-                    } else if let Some(number) = cell.as_i64() {
-                        SqlValue::Int(number)
-                    } else if let Some(number) = cell.as_f64() {
-                        SqlValue::Int(number as i64)
-                    } else {
-                        SqlValue::Text(cell.as_str().map(str::to_owned).unwrap_or_default())
-                    }
-                })
-                .collect())
-        })
-        .collect()
-}
-
 impl DoSql for JsDoSql {
     fn execute(&self, sql: &str, params: &[SqlValue]) -> Result<u64, String> {
         let count = self
@@ -709,7 +680,7 @@ impl DoSql for JsDoSql {
             .bridge
             .query(sql, &params_to_json(params))
             .map_err(|error| format!("{error:?}"))?;
-        parse_rows(&rows_json)
+        crate::do_store::parse_sql_rows(&rows_json)
     }
 
     fn activity(&self, kind: &str, detail: Option<&str>) {

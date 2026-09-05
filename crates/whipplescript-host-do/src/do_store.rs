@@ -1366,6 +1366,60 @@ fn skill_to_json(skill: &SkillView) -> StoreResult<Value> {
     }))
 }
 
+/// Decode the DO SQL bridge's JSON result rows.
+///
+/// Lives HERE rather than in `do_wasm` because `do_wasm` is
+/// `#[cfg(target_arch = "wasm32")]`: a pure function on the path every DO read
+/// takes into the store was, there, unreachable by any host test and not even
+/// compiled by `cargo check --all-targets`. Its refusal below could not be
+/// exercised, which `check-new-refusals.sh` reported as a defect — correctly.
+///
+/// `pub` rather than `pub(crate)` because on a non-wasm build its only caller is
+/// gone, and the crate already exposes the `SqlValue` it produces and the
+/// `DoSql` it decodes for: this is the counterpart to both, not an internal
+/// detail kept visible to dodge a dead-code lint.
+pub fn parse_sql_rows(rows_json: &str) -> Result<Vec<Vec<SqlValue>>, String> {
+    let rows: serde_json::Value =
+        serde_json::from_str(rows_json).map_err(|error| error.to_string())?;
+    let rows = rows
+        .as_array()
+        .ok_or("DoSqlBridge.query must return a JSON array of rows")?;
+    rows.iter()
+        .map(|row| {
+            let cells = row
+                .as_array()
+                .ok_or("each row must be a JSON array".to_owned())?;
+            cells
+                .iter()
+                .map(|cell| {
+                    if cell.is_null() {
+                        Ok(SqlValue::Null)
+                    } else if let Some(number) = cell.as_i64() {
+                        Ok(SqlValue::Int(number))
+                    } else if let Some(number) = cell.as_f64() {
+                        Ok(SqlValue::Int(number as i64))
+                    } else if let Some(text) = cell.as_str() {
+                        Ok(SqlValue::Text(text.to_owned()))
+                    } else {
+                        // A cell that is none of those -- an object, an array, a
+                        // bool, a BLOB marshalled as a byte array -- used to
+                        // become `Text("")`, because the string branch ended in
+                        // `unwrap_or_default()`. That is a row the caller reads
+                        // as an empty string it never wrote, at the boundary
+                        // where every DO read enters the store. A value this
+                        // layer cannot represent is a fault to report, not an
+                        // empty string to invent.
+                        Err(format!(
+                            "DoSqlBridge.query returned a cell this bridge cannot \
+                             represent: {cell}"
+                        ))
+                    }
+                })
+                .collect()
+        })
+        .collect()
+}
+
 /// Appends an event with a per-instance monotonic sequence, returning its id +
 /// sequence. Shared by the `append_event` trait method and the lifecycle methods
 /// (which the native store threads through a transaction). Mirrors
@@ -10038,6 +10092,41 @@ pub(crate) mod tests {
                 format!("{other:?}").contains("JsValue"),
                 "the transport error survives: {other:?}"
             ),
+        }
+    }
+
+    /// A cell this bridge cannot represent is a FAULT, not an empty string.
+    ///
+    /// The string branch used to end in `unwrap_or_default()`, so an object, an
+    /// array, a bool or a BLOB marshalled as a byte array became `Text("")` --
+    /// a value the caller reads as an empty string it never wrote, at the
+    /// boundary every DO read takes into the store.
+    ///
+    /// This test exists at all because the function MOVED. It lived in
+    /// `do_wasm`, which is `#[cfg(target_arch = "wasm32")]`: not compiled by
+    /// `cargo check --all-targets` on the host, unreachable by any host test,
+    /// and so its refusal was unexercisable. `check-new-refusals.sh` reported
+    /// exactly that and was right to.
+    #[test]
+    fn a_cell_the_bridge_cannot_represent_is_refused() {
+        let ok = parse_sql_rows(r#"[[null, 7, 1.5, "text"]]"#).expect("the four known shapes");
+        assert_eq!(
+            ok,
+            vec![vec![
+                SqlValue::Null,
+                SqlValue::Int(7),
+                SqlValue::Int(1),
+                SqlValue::Text("text".to_owned()),
+            ]]
+        );
+
+        for unrepresentable in [r#"[[{"a":1}]]"#, r#"[[[1,2]]]"#, "[[true]]"] {
+            let error = parse_sql_rows(unrepresentable)
+                .expect_err("a cell of an unknown shape is a fault, not an empty string");
+            assert!(
+                error.contains("cannot"),
+                "the refusal names what it could not represent: {error}"
+            );
         }
     }
 
