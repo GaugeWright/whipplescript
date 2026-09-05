@@ -33,13 +33,43 @@ class TypedRefusalTests(unittest.TestCase):
     def test_every_unreachable_plant_is_discovered_and_mutable(self):
         source = sweep.PLANT.splitlines()
         sites = sweep.find_sites(source)
-        self.assertEqual(len(sites), 16)
+        self.assertEqual(len(sites), 17)
         self.assertEqual(len(sites), sweep.PLANT_COUNT)
         for site in sites:
             with self.subTest(site=site):
                 mutation = sweep.apply_mutation(source, site)
                 self.assertIsNotNone(mutation)
                 self.assertNotEqual(source, mutation)
+
+    def test_a_declared_success_expression_replaces_the_whole_returned_value(self):
+        # The shape the bare `MUTATION-SUCCESS` form cannot reach: a unit
+        # refusal WRAPPED in another enum, where the first `Ident::Ident` on the
+        # line is the wrapper and carries a payload. Substituting a path inside
+        # the expression would leave the wrapper's argument list behind, so this
+        # form replaces the returned expression entire.
+        source = ['let Some(route) = route else {',
+                  '    // MUTATION-SUCCESS-EXPR: Outcome::Served { fact: String::new() }',
+                  '    return Outcome::Refused(Refusal::UnknownPath);', '};']
+        [site] = sweep.find_sites(source)
+        mutated = sweep.apply_mutation(source, site)
+        self.assertEqual(
+            mutated,
+            [*source[:2], '    return Outcome::Served { fact: String::new() };', '};'],
+        )
+
+    def test_a_declared_success_expression_is_taken_only_from_the_line_above(self):
+        # The expression is arbitrary by design, which is exactly why it may
+        # never be inferred: it is read from a comment a human wrote directly
+        # above the refusal, and nowhere else.
+        source = ['// MUTATION-SUCCESS-EXPR: Outcome::Served { fact: String::new() }',
+                  'let x = 1;',
+                  'return Outcome::Refused(Refusal::UnknownPath);']
+        [site] = sweep.find_sites(source)
+        # No mutation rather than a distant one: the site reports UNMEASURED,
+        # which is the honest answer. Reaching further up the file for a success
+        # expression would let a comment written about one refusal silently
+        # govern another.
+        self.assertIsNone(sweep.apply_mutation(source, site))
 
     def test_false_success_preserves_a_let_else_return(self):
         source = ['let Some(stream) = stream else {',

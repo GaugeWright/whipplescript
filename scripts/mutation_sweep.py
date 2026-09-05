@@ -104,6 +104,25 @@ MUTATION_SUCCESS = re.compile(
     r"^\s*// MUTATION-SUCCESS: ([A-Z][A-Za-z0-9_]*::[A-Z][A-Za-z0-9_]*)\s*$"
 )
 UNIT_VALUE = re.compile(r"\b[A-Z][A-Za-z0-9_]*::[A-Z][A-Za-z0-9_]*\b")
+
+# The same escape hatch for a success the type system will not let the author
+# spell as a bare path.
+#
+# `MUTATION-SUCCESS` above substitutes one unit value for another, which cannot
+# reach two shapes that occur throughout this codebase: a WRAPPED unit refusal
+# (`Outcome::Refused(Refusal::UnknownPath)`, where the first `Ident::Ident` on
+# the line is the wrapper and carries a payload), and an enum whose only
+# non-refusing variants carry fields. Both read as "no mutation applied", which
+# the sweep reports as UNMEASURED — unknown rather than covered — so a refusal
+# nothing exercises hides in the same bucket as one nothing CAN exercise.
+#
+# This form replaces the whole returned expression instead of a path inside it,
+# so the author writes the success as it must actually be constructed. It is
+# deliberately more explicit than the bare form and not a superset of it: an
+# arbitrary expression is exactly the injection the unit rule refuses to guess,
+# so it is only ever taken from a comment a human wrote and a reviewer read.
+MUTATION_SUCCESS_EXPR = re.compile(r"^\s*// MUTATION-SUCCESS-EXPR: (\S.*?)\s*$")
+RETURNED_EXPR = re.compile(r"^(\s*return\s+)(.+)(;\s*)$")
 TEST_CFG = re.compile(r'^#\[cfg\((?:test|all\(test,\s*[^()]*\))\)\]$')
 
 # The brace form is a PATTERN, not a construction, when it binds rather than
@@ -724,6 +743,15 @@ def apply_mutation(lines: list[str], site: Site) -> list[str] | None:
     mutated = list(lines)
     index = site.line - 1
     if index > 0:
+        # The author-supplied success EXPRESSION, tried before the unit form
+        # because it is the more specific instruction: a line carrying it says
+        # what this refusal's absence looks like, and guessing would be worse.
+        declared = MUTATION_SUCCESS_EXPR.match(lines[index - 1])
+        returned = RETURNED_EXPR.match(lines[index])
+        if declared and returned:
+            mutated[index] = returned.group(1) + declared.group(1) + returned.group(3)
+            return mutated
+    if index > 0:
         success = MUTATION_SUCCESS.match(lines[index - 1])
         refusal = UNIT_VALUE.search(lines[index])
         if success and refusal:
@@ -1104,6 +1132,33 @@ fn mutation_sweep_self_test_declared_unit() -> MutationSweepTypedOutcome {
     // MUTATION-SUCCESS: MutationSweepTypedOutcome::Admitted
     MutationSweepTypedOutcome::BoundaryReserved
 }
+
+#[allow(dead_code)]
+enum MutationSweepWrapped {
+    Refused(MutationSweepTypedOutcome),
+    Served { fact: String },
+}
+
+/// The shape `MUTATION-SUCCESS` alone cannot reach, and the reason the
+/// expression form exists.
+///
+/// The refusal is a unit variant WRAPPED in another enum, returned from a
+/// `let`-else that must diverge, and the success carries a field. So there is
+/// no bare path to substitute: the first `Ident::Ident` on the line is the
+/// wrapper and takes a payload, the inner value has no unit sibling to swap
+/// for, and the success cannot be spelled without constructing its field.
+/// Before the expression form this site reported "no mutation applied" —
+/// UNMEASURED, which is unknown rather than covered.
+#[allow(dead_code)]
+fn mutation_sweep_self_test_wrapped_unit(route: Option<u8>) -> MutationSweepWrapped {
+    let Some(_) = route else {
+        // MUTATION-SUCCESS-EXPR: MutationSweepWrapped::Served { fact: String::new() }
+        return MutationSweepWrapped::Refused(MutationSweepTypedOutcome::StreamMissing);
+    };
+    MutationSweepWrapped::Served {
+        fact: String::new(),
+    }
+}
 """
 
 # How many refusals `PLANT` contains. Asserted rather than counted so that
@@ -1113,7 +1168,12 @@ fn mutation_sweep_self_test_declared_unit() -> MutationSweepTypedOutcome {
 # the scanner could not see at all before, so a plant that reports "caught"
 # means the new rule found a site the mutator cannot actually falsify — which
 # is the failure mode this count exists to make loud.
-PLANT_COUNT = 16
+#
+# One more was added 2026-09-05 with the expression form: a WRAPPED unit
+# refusal in a diverging `let`-else whose success carries a field. The self
+# test already fails on any plant it cannot measure, so this plant is what
+# proves the new form actually applies rather than merely parsing.
+PLANT_COUNT = 17
 
 
 def self_test(target: str, filter_expr: str, backup: str) -> bool:

@@ -195,10 +195,19 @@ jobs:
       contents: read
       checks: read
       pull-requests: read
-    # The observed ceiling is 41 minutes on a twelve-site sweep; 45 left four
-    # minutes of headroom, and a slow sweep read as a timeout would eject a
-    # queue entry that deserved an answer.
-    timeout-minutes: 55
+    # Raised from 55 on 2026-09-05, after a run was killed at 55m16s mid-sweep.
+    #
+    # The cost is dominated by per-FILE overhead rather than per-refusal: the
+    # sweep re-runs its eight-mutation self test for every file it touches, and
+    # a CLI-crate rebuild is ~1.9 minutes against ~0.4 for the parser. A change
+    # touching two CLI files and two parser files therefore pays roughly
+    # 32 self-test cycles before it measures a single refusal — about 52
+    # minutes for twelve sites, which is what overran.
+    #
+    # 75 is headroom for that shape rather than a new ceiling to grow into. The
+    # real repair is to stop paying the self test once per file, and it is
+    # tracked rather than done here.
+    timeout-minutes: 75
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
