@@ -16,6 +16,7 @@ use std::{fs, path::Path, process::Command};
 use whipplescript_core::{
     CONSTRUCT_GRAMMAR_BINDING_MODES, CONSTRUCT_GRAMMAR_CLAUSE_CONNECTIVES,
     CONSTRUCT_GRAMMAR_CLAUSE_KINDS, CONSTRUCT_GRAMMAR_CONNECTIVES, CONSTRUCT_GRAMMAR_SLOT_KINDS,
+    PLATFORM_CONSTRUCT_CATALOG,
 };
 
 // Written by `emit_build_script_probe` in build.rs: the vocabulary that run
@@ -131,6 +132,83 @@ fn the_manifest_schema_mirrors_cores_vocabulary() {
     assert_eq!(
         connectives, CONSTRUCT_GRAMMAR_CONNECTIVES,
         "the manifest schema's slot connectives must be core's, in core's order"
+    );
+}
+
+/// The manifest schema's construct vocabulary is the PACKAGE-AUTHORABLE slice
+/// of core's catalog, and stays that slice.
+///
+/// This schema is the contract external package authors pin, and it is
+/// projected to the public mirror. Its `lowering_target` enum is exactly the
+/// lowerings core marks `package_authorable`, and its `construct_family` enum
+/// is exactly the families those lowerings are compatible with. The kernel
+/// enforces the same line: a construct naming an internal lowering is refused
+/// unless the manifest is a byte-identical embedded std copy or holds a
+/// platform-catalog privilege tuple.
+///
+/// So the schema rejecting `resource_effect`, `signal_source`, `signal_emit`
+/// and `source_declaration` is the contract working. Two shipped std manifests
+/// -- `coord.json` and `ingress.json` -- fail validation for exactly that
+/// reason and are supposed to: they are platform-internal and hold a key no
+/// third party has. Widening these enums to make them validate would publish
+/// permission the kernel refuses, which is the one direction a change here
+/// must never go.
+///
+/// The pin is two-way. If core ever makes an internal lowering authorable, the
+/// schema must gain it, and this fails until it does.
+#[test]
+fn the_manifest_schema_publishes_exactly_the_package_authorable_vocabulary() {
+    let schema_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../spec/report-schemas/package_manifest_v0.schema.json");
+    let schema: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(&schema_path).expect("the package manifest schema is readable"),
+    )
+    .expect("the package manifest schema is JSON");
+
+    let enum_at = |pointer: &str| -> Vec<String> {
+        schema
+            .pointer(pointer)
+            .and_then(serde_json::Value::as_array)
+            .unwrap_or_else(|| panic!("the schema states a vocabulary at {pointer}"))
+            .iter()
+            .map(|value| {
+                value
+                    .as_str()
+                    .expect("a vocabulary entry is a string")
+                    .to_owned()
+            })
+            .collect()
+    };
+
+    let authorable = PLATFORM_CONSTRUCT_CATALOG
+        .lowerings
+        .iter()
+        .filter(|lowering| lowering.package_authorable)
+        .collect::<Vec<_>>();
+
+    let mut expected_lowerings = authorable
+        .iter()
+        .map(|lowering| lowering.id.to_owned())
+        .collect::<Vec<_>>();
+    expected_lowerings.sort();
+    let mut published_lowerings = enum_at("/$defs/construct/properties/lowering_target/enum");
+    published_lowerings.sort();
+    assert_eq!(
+        published_lowerings, expected_lowerings,
+        "the schema's lowering_target enum must be core's package-authorable lowerings"
+    );
+
+    let mut expected_families = authorable
+        .iter()
+        .flat_map(|lowering| lowering.compatible_families.iter().map(|f| (*f).to_owned()))
+        .collect::<Vec<_>>();
+    expected_families.sort();
+    expected_families.dedup();
+    let mut published_families = enum_at("/$defs/construct/properties/construct_family/enum");
+    published_families.sort();
+    assert_eq!(
+        published_families, expected_families,
+        "the schema's construct_family enum must be the families those lowerings accept"
     );
 }
 

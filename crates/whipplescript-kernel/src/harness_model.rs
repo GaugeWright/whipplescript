@@ -416,6 +416,21 @@ impl<T: CoerceTransport + ?Sized> HttpModelClient for RealHarnessModelClient<'_,
         if self.xai_subscription {
             apply_xai_subscription_headers(&mut request, &self.model);
         }
+        // The same per-round key the streaming client sets, for the same
+        // reason and on the same terms. This client retries too --
+        // `harness_loop` re-issues the round on a retryable provider error, up
+        // to `MAX_PROVIDER_RETRIES` -- and without the key a retried round is a
+        // second model call the provider has no way to recognise as the first
+        // one. The key is derived from the scope plus the exact messages and
+        // tools, so a retry of the SAME round carries the same key and a
+        // genuinely different round does not.
+        //
+        // The codex path returns above and keeps its own request shape, which
+        // is why this sits after that early return rather than around it.
+        set_round_idempotency_key(
+            &mut request,
+            round_idempotency_key(self.cache_key.as_deref(), messages, tools),
+        );
         request
     }
 
@@ -2870,6 +2885,64 @@ mod tests {
         assert_eq!(reply.tool_calls.len(), 1);
         assert_eq!(reply.tool_calls[0].id, "c9");
         assert_eq!(reply.tool_calls[0].arguments, json!({ "path": "." }));
+    }
+
+    /// The native client carries the same per-round `Idempotency-Key` the
+    /// streaming one does.
+    ///
+    /// It did not, and it retries: `harness_loop` re-issues the round on a
+    /// retryable provider error up to `MAX_PROVIDER_RETRIES`. Without the key a
+    /// retried round is a second model call the provider has no way to
+    /// recognise as the first — a duplicate turn, and a duplicate charge.
+    ///
+    /// The key must also be STABLE for the same round and DIFFERENT for a
+    /// different one; a constant would suppress duplicates that are not
+    /// duplicates.
+    #[test]
+    fn the_native_client_keys_its_round_for_retry() {
+        let key_for = |scope: Option<&str>, messages: &[ChatMessage]| -> Option<String> {
+            let transport = FakeTransport {
+                response: Ok(HttpResponse {
+                    status: 200,
+                    body: json!({ "content": [] }),
+                }),
+                seen: RefCell::new(None),
+            };
+            let client = RealHarnessModelClient::new(
+                &transport,
+                CoerceProvider::Anthropic,
+                "k",
+                "m",
+                "https://api.anthropic.com",
+                4096,
+                scope.map(str::to_owned),
+            );
+            let request = client.build_request(messages, &tool_specs());
+            request
+                .headers
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case("idempotency-key"))
+                .map(|(_, value)| value.clone())
+        };
+
+        let first = key_for(Some("effect-1"), &convo()).expect("a scoped round carries a key");
+        assert_eq!(
+            key_for(Some("effect-1"), &convo()).as_deref(),
+            Some(first.as_str()),
+            "the same round retried must present the same key"
+        );
+
+        let mut moved_on = convo();
+        moved_on.push(ChatMessage::user_text("and one more thing"));
+        assert_ne!(
+            key_for(Some("effect-1"), &moved_on).as_deref(),
+            Some(first.as_str()),
+            "a different round is not the same call"
+        );
+
+        // No scope, no key: an unscoped caller has nothing stable to key on,
+        // and inventing one would make two unrelated turns collide.
+        assert_eq!(key_for(None, &convo()), None);
     }
 
     #[test]

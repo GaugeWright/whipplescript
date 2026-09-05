@@ -2006,7 +2006,6 @@ pairs = [
     ("spec/report-schemas/local_trace_v0.schema.json", tmp_dir / "trace.json"),
     ("spec/report-schemas/acceptance_fixture_v0.schema.json", Path("examples/provider-language-e2e.accept.json")),
     ("spec/report-schemas/acceptance_report_v0.schema.json", tmp_dir / "acceptance.json"),
-    ("spec/report-schemas/package_manifest_v0.schema.json", Path("std/manifests/memory.json")),
     ("spec/report-schemas/package_check_v0.schema.json", tmp_dir / "package-check.json"),
     ("spec/report-schemas/platform_construct_catalog_v0.schema.json", tmp_dir / "platform-construct-catalog.json"),
     ("spec/report-schemas/package_lock_v0.schema.json", tmp_dir / "package-lock.json"),
@@ -2050,6 +2049,66 @@ assert_schema_rejects(
     with_duplicate_package_manifest_string_array(package_manifest, "package manifest"),
     "package manifest with duplicate string-array value",
 )
+# Every shipped std manifest validates against the published package-manifest
+# contract, EXCEPT where it uses construct vocabulary no third party may author.
+#
+# This binding was `std/manifests/memory.json` ALONE, and memory.json happens to
+# conform, so one manifest answered a fifteen-manifest question. Five others
+# carried a `plane: operator` provider row the schema rejected outright while
+# demanding the `capability` the registry FORBIDS on such a row -- so an author
+# following the published contract could not write one at all -- and std.agent
+# ships six profiles whose `enforcement_mode: audit` was missing from the
+# published enum, the one value both hosts actually branch on.
+#
+# The exemption is DERIVED from the catalog, never written down here: an error
+# passes only when it is a construct_family/lowering_target enum failure whose
+# value core marks `package_authorable: false`. `coord.json` and `ingress.json`
+# fail for exactly that reason and are SUPPOSED to -- they are platform-internal
+# and hold the embedded-copy key a third party does not. Widening the schema to
+# admit them would publish permission the kernel refuses. Any other failure, in
+# any manifest, is a real one.
+catalog = json.loads((tmp_dir / "platform-construct-catalog.json").read_text())
+internal_lowerings = {
+    lowering["id"] for lowering in catalog["lowerings"] if not lowering["package_authorable"]
+}
+authorable_families = {
+    family
+    for lowering in catalog["lowerings"]
+    if lowering["package_authorable"]
+    for family in lowering["compatible_families"]
+}
+internal_families = {family["id"] for family in catalog["families"]} - authorable_families
+exempt_values_by_field = {
+    "lowering_target": internal_lowerings,
+    "construct_family": internal_families,
+}
+std_manifest_paths = sorted(Path("std/manifests").glob("*.json"))
+if not std_manifest_paths:
+    fail("no std manifests found to validate against package_manifest_v0.schema.json")
+exempted = set()
+for manifest_path in std_manifest_paths:
+    manifest = json.loads(manifest_path.read_text())
+    for error in package_manifest_validator.iter_errors(manifest):
+        field = error.absolute_path[-1] if error.absolute_path else None
+        if error.validator == "enum" and error.instance in exempt_values_by_field.get(field, set()):
+            exempted.add(manifest_path.name)
+            continue
+        location = "/".join(str(part) for part in error.absolute_path) or "<root>"
+        fail(
+            f"{manifest_path} fails package_manifest_v0.schema.json at {location}: "
+            f"{error.message}"
+        )
+print(
+    f"validated {len(std_manifest_paths)} std manifests against "
+    f"package_manifest_v0.schema.json"
+    + (
+        f" ({', '.join(sorted(exempted))} exempt only where they use platform-internal"
+        " construct vocabulary)"
+        if exempted
+        else ""
+    )
+)
+
 package_lock_schema = json.loads(Path("spec/report-schemas/package_lock_v0.schema.json").read_text())
 package_lock_validator = Draft202012Validator(package_lock_schema)
 package_lock = json.loads((tmp_dir / "package-lock.json").read_text())

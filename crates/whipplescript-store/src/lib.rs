@@ -125,6 +125,30 @@ pub const SUPPORTED_EVENT_FORMAT_VERSION: i64 = 1;
 /// last wrote this?") without guessing from its contents.
 pub const WRITER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// The effect statuses that are still PENDING: claimed by nothing, settled as
+/// nothing, and therefore still the claim filter's to hand back on a later
+/// worker pass. Every block is a statement about an effect in one of these,
+/// which is why one list serves the claim filter, the claim itself, and every
+/// site that moves a pending effect into or between blocks.
+///
+/// It is one list because it was seven, and they disagreed. Three spellings
+/// were live at once: the claim filter and the claim named all seven statuses,
+/// the capacity block and `block_effect_with_status` named five, and
+/// `persist_policy_block_on` and `revision_policy_effects_on` named six. A
+/// status missing from one of those `WHERE` clauses does not raise anything --
+/// the `UPDATE` matches no row and reports success -- so an effect the claim
+/// filter had just handed out could be blocked, have the `effect.blocked` event
+/// appended, and keep the status it arrived with. The event log and the
+/// projection then said different things about the same effect, which is the
+/// one thing this store exists to prevent.
+///
+/// Interpolated rather than parameterised because SQLite binds values, not list
+/// literals, and the alternative is seven copies again. The text is a
+/// compile-time constant with no caller input anywhere near it.
+const PENDING_EFFECT_STATUSES: &str = "('queued', 'blocked', 'blocked_by_admission', \
+     'blocked_by_dependency', 'blocked_by_capacity', 'blocked_by_capability', \
+     'blocked_by_profile')";
+
 /// Which of the log's guards refused a write (DR-0067 §2/§3, DR-0073 §2).
 ///
 /// A kind rather than a message, because the caller's *response* differs and a
@@ -3282,7 +3306,7 @@ impl SqliteStore {
             }
         }
         let mut statement = self.connection.prepare(
-            r#"
+            &format!(r#"
             SELECT
                 candidate.effect_id,
                 candidate.kind,
@@ -3301,7 +3325,7 @@ impl SqliteStore {
             WHERE candidate.instance_id = ?1
               AND candidate.kind != 'timer.wait'
               AND (
-                  candidate.status IN ('queued', 'blocked', 'blocked_by_admission', 'blocked_by_dependency', 'blocked_by_capacity', 'blocked_by_capability', 'blocked_by_profile')
+                  candidate.status IN {PENDING_EFFECT_STATUSES}
                   OR (candidate.kind = 'workflow.invoke' AND candidate.status = 'running')
               )
               AND NOT EXISTS (
@@ -3328,7 +3352,7 @@ impl SqliteStore {
                     )
               )
             ORDER BY candidate.created_at, candidate.effect_id
-            "#,
+            "#),
         )?;
         let effects = statement
             .query_map([instance_id], |row| {
@@ -5551,15 +5575,17 @@ impl SqliteStore {
                 },
             )?;
             tx.execute(
-                r#"
+                &format!(
+                    r#"
                 UPDATE effects
                 SET status = ?1,
                     policy_block_reason = ?2,
                     updated_at = CURRENT_TIMESTAMP
                 WHERE instance_id = ?3
                   AND effect_id = ?4
-                  AND status IN ('queued', 'blocked', 'blocked_by_admission', 'blocked_by_dependency', 'blocked_by_capacity', 'blocked_by_capability', 'blocked_by_profile')
-                "#,
+                  AND status IN {PENDING_EFFECT_STATUSES}
+                "#
+                ),
                 params![block.status, block.reason, run.instance_id, run.effect_id],
             )?;
             tx.commit()?;
@@ -5630,16 +5656,17 @@ impl SqliteStore {
                 },
             )?;
             tx.execute(
-                r#"
+                &format!(
+                    r#"
                 UPDATE effects
                 SET status = 'blocked_by_capacity',
                     policy_block_reason = ?1,
                     updated_at = CURRENT_TIMESTAMP
                 WHERE instance_id = ?2
                   AND effect_id = ?3
-                  AND status IN ('queued', 'blocked', 'blocked_by_admission',
-                                 'blocked_by_dependency', 'blocked_by_capacity')
-                "#,
+                  AND status IN {PENDING_EFFECT_STATUSES}
+                "#
+                ),
                 params![reason, run.instance_id, run.effect_id],
             )?;
             tx.commit()?;
@@ -5671,7 +5698,8 @@ impl SqliteStore {
             },
         )?;
         let changed = tx.execute(
-            r#"
+            &format!(
+                r#"
             UPDATE effects
             SET status = 'running',
                 policy_block_reason = NULL,
@@ -5679,8 +5707,9 @@ impl SqliteStore {
                 updated_at = CURRENT_TIMESTAMP
             WHERE instance_id = ?1
               AND effect_id = ?2
-              AND status IN ('queued', 'blocked', 'blocked_by_admission', 'blocked_by_dependency', 'blocked_by_capacity', 'blocked_by_capability', 'blocked_by_profile')
-            "#,
+              AND status IN {PENDING_EFFECT_STATUSES}
+            "#
+            ),
             params![run.instance_id, run.effect_id],
         )?;
         if changed != 1 {
@@ -5860,7 +5889,8 @@ impl SqliteStore {
             },
         )?;
         tx.execute(
-            r#"
+            &format!(
+                r#"
             UPDATE effects
             SET status = ?1,
                 policy_block_reason = ?2,
@@ -5868,9 +5898,9 @@ impl SqliteStore {
                 updated_at = CURRENT_TIMESTAMP
             WHERE instance_id = ?4
               AND effect_id = ?5
-              AND status IN ('queued', 'blocked', 'blocked_by_admission',
-                             'blocked_by_dependency', 'blocked_by_capacity')
-            "#,
+              AND status IN {PENDING_EFFECT_STATUSES}
+            "#
+            ),
             params![status, detail, category, instance_id, effect_id],
         )?;
         tx.commit()?;
@@ -5910,11 +5940,6 @@ impl SqliteStore {
                 idempotency_key: transition.idempotency_key,
             },
         )?;
-        // The projection mutation is stated ONCE, by the fold `rebuild_projections`
-        // replays. The forward path appends the event and then applies it, so the
-        // two cannot say different things -- they did: this UPDATE carried
-        // `'failed'` and its replay twin did not, so rebuilding an instance that
-        // failed silently dropped its `completed_at`.
         // The projection mutation is stated ONCE, by the fold `rebuild_projections`
         // replays. The forward path appends the event and then applies it, so the
         // two cannot say different things -- they did: this carried `'failed'`
@@ -9130,7 +9155,8 @@ fn persist_policy_block_on(
     block: &PolicyBlock,
 ) -> StoreResult<()> {
     let changed = connection.execute(
-        r#"
+        &format!(
+            r#"
         UPDATE effects
         SET status = ?1,
             policy_block_reason = ?2,
@@ -9138,8 +9164,9 @@ fn persist_policy_block_on(
         WHERE instance_id = ?3
           AND effect_id = ?4
           AND (status != ?1 OR policy_block_reason IS NOT ?2)
-          AND status IN ('queued', 'blocked', 'blocked_by_dependency', 'blocked_by_capacity', 'blocked_by_capability', 'blocked_by_profile')
-        "#,
+          AND status IN {PENDING_EFFECT_STATUSES}
+        "#
+        ),
         params![block.status, block.reason, instance_id, effect_id],
     )?;
     if changed == 1 {
@@ -10423,9 +10450,9 @@ fn revision_policy_effects_on(
     running: bool,
 ) -> StoreResult<Vec<String>> {
     let predicate = if running {
-        "status = 'running'"
+        "status = 'running'".to_owned()
     } else {
-        "status IN ('queued', 'blocked', 'blocked_by_dependency', 'blocked_by_capacity', 'blocked_by_capability', 'blocked_by_profile')"
+        format!("status IN {PENDING_EFFECT_STATUSES}")
     };
     let mut statement = connection.prepare(&format!(
         r#"
@@ -14686,6 +14713,91 @@ mod tests {
                 .any(|c| c.effect_id == "tell"),
             "blocked effect is re-claimable"
         );
+    }
+
+    /// A block must move the effect out of WHATEVER pending status it is in.
+    ///
+    /// Every block appends `effect.blocked` unconditionally and then updates the
+    /// row under a status filter. When the filter omitted a status the effect
+    /// could actually be in, the `UPDATE` matched nothing and reported success:
+    /// the log said the effect was blocked and the projection said it was still
+    /// capability-blocked, from a gate that had since let it through.
+    ///
+    /// `blocked_by_capability` is reachable here rather than hypothetical, which
+    /// the first assertion is: the claim filter hands out a capability-blocked
+    /// effect, because a persisted policy block is re-evaluated each pass and
+    /// clears itself when the gate opens. So the worker gets the effect, binding
+    /// fails, and `block_effect_binding` is called on a row in exactly this
+    /// status. The raw update stands in for the earlier pass that wrote it.
+    #[test]
+    fn a_block_moves_an_effect_out_of_any_pending_status() {
+        type Block = fn(&mut SqliteStore) -> StoreResult<StoredEvent>;
+        let cases: [(&str, Block); 2] = [
+            ("blocked_by_capability", |store| {
+                store.block_effect_binding("instance-a", "tell", "credentials", "no binding")
+            }),
+            ("blocked_by_profile", |store| {
+                store.deny_effect_admission("instance-a", "tell", "mcp:acme", "pin drifted")
+            }),
+        ];
+        for (stale, block) in cases {
+            let mut store = SqliteStore::open_in_memory().expect("store opens");
+            store
+                .commit_rule(RuleCommit {
+                    instance_id: "instance-a",
+                    rule: "start",
+                    trigger_event_id: None,
+                    facts: &[],
+                    consumed_fact_ids: &[],
+                    effects: &[test_effect("tell", "agent.tell", "rule=start;effect=tell")],
+                    dependencies: &[],
+                    terminal: None,
+                    idempotency_key: Some("commit-start"),
+                    marks: &[],
+                    context_json: None,
+                })
+                .expect("rule commit succeeds");
+            store
+                .connection
+                .execute(
+                    "UPDATE effects SET status = ?1, policy_block_reason = 'earlier pass' \
+                     WHERE instance_id = 'instance-a' AND effect_id = 'tell'",
+                    params![stale],
+                )
+                .expect("stale block applies");
+
+            assert!(
+                store
+                    .claimable_effects("instance-a")
+                    .expect("claimable")
+                    .iter()
+                    .any(|c| c.effect_id == "tell"),
+                "a {stale} effect is still claimable, so a worker still reaches it"
+            );
+
+            let event = block(&mut store).expect("block records");
+            let status = effect_status(&store, "tell");
+            assert_ne!(
+                status, stale,
+                "the row still says {stale} after a block that appended {}",
+                event.event_id
+            );
+
+            let recorded: String = store
+                .connection
+                .query_row(
+                    "SELECT json_extract(payload_json, '$.status') FROM events \
+                     WHERE instance_id = 'instance-a' AND event_type = 'effect.blocked' \
+                     ORDER BY sequence DESC LIMIT 1",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("blocked event payload");
+            assert_eq!(
+                status, recorded,
+                "the projection and the log must agree on the effect's status"
+            );
+        }
     }
 
     /// An admission denial is durable, idempotent per refusing gate, and

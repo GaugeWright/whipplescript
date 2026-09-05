@@ -469,10 +469,24 @@
       }
     },
     "provider": {
+      "comment": "`plane` and `capability` are mutually exclusive, mirroring the package registry's own rule (whipplescript-kernel/src/package_registry.rs). A `plane: operator` row is capability-FREE by definition (spec/std-telemetry.md T3): it configures an operator CLI surface and the effect admission gate never consults it, so a capability on such a row would be the decorative admission row the honesty audit forbids. Every other row still requires one. This schema stated neither half, so it rejected the operator-plane rows five shipped manifests carry AND demanded a capability the registry refuses on them -- an external author following the published contract could not write an operator-plane provider at all.",
       "type": "object",
       "additionalProperties": false,
-      "required": ["id", "provider_kind", "capability"],
+      "required": ["id", "provider_kind"],
+      "if": {
+        "properties": {"plane": {"const": "operator"}},
+        "required": ["plane"]
+      },
+      "then": {
+        "not": {"required": ["capability"]}
+      },
+      "else": {
+        "required": ["capability"]
+      },
       "properties": {
+        "plane": {
+          "enum": ["operator"]
+        },
         "id": {
           "type": "string",
           "minLength": 1
@@ -515,7 +529,8 @@
           "type": "string"
         },
         "enforcement_mode": {
-          "enum": ["enforce", "warn", "off"]
+          "comment": "`audit` is the value that CHANGES behaviour: both hosts branch on it and on nothing else (`!= \"audit\"` in whipplescript-host-do/src/do_store.rs, `== \"audit\"` in whipplescript-cli/src/harness_tools.rs), and std.agent ships six profiles carrying it. It was missing here. `warn` and `off` are kept because they are already published, but nothing implements them: a profile declaring either is ENFORCED, which is worth knowing before writing one.",
+          "enum": ["enforce", "audit", "warn", "off"]
         },
         "allowed_capabilities": {
           "$ref": "#/$defs/stringArray"
