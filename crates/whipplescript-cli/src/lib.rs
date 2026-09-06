@@ -6,6 +6,12 @@
 
 pub use whipplescript_kernel::{gov, host_policy, host_protocol, ifc, principal};
 pub mod host_runtime;
+/// The instance view model (spec/instance-view-model-research-note.md): one
+/// instance's runtime state joined to the program structure each firing ran
+/// under. In the library rather than the binary for the same reason as
+/// everything above it — a host that draws an instance must not reimplement
+/// the join, and GaugeDesk draws one.
+pub mod instance_view;
 /// The workspace `grep` tool's matching semantics, shared by both
 /// implementations of that tool (see the module docs for why there are two).
 pub mod workspace_grep;

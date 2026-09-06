@@ -30,7 +30,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde_json::{json, Map, Value};
 use whipplescript_kernel::idempotency_key;
 use whipplescript_parser::snapshot;
-use whipplescript_store::{EffectView, EventView, InstanceView, RunView};
+use whipplescript_store::{EffectView, EventView, InstanceView, RunView, SqliteStore, StoreResult};
 
 pub const INSTANCE_VIEW_SCHEMA: &str = "whipplescript.instance_view.v0";
 
@@ -139,6 +139,110 @@ fn runs_for<'a>(runs: &'a [RunView], effect_id: &str) -> Vec<&'a RunView> {
 pub struct VersionSnapshot {
     pub ir_hash: String,
     pub snapshot: Option<String>,
+}
+
+/// Read everything `project` needs and project it, in one call.
+///
+/// `None` when the instance does not exist. This is the entry point a host
+/// uses — `whip view` and GaugeDesk's Instances tab both come through here —
+/// so the join has one implementation and the two cannot drift.
+pub fn load(store: &SqliteStore, instance_id: &str) -> StoreResult<Option<Value>> {
+    let Some(instance) = store.get_instance(instance_id)? else {
+        return Ok(None);
+    };
+    let events = store.list_events(instance_id)?;
+    let effects = store.list_effects(instance_id)?;
+    let runs = store.list_runs(instance_id)?;
+    let versions = version_snapshots(store, &instance, &events)?;
+    Ok(Some(project(
+        &instance, &versions, &events, &effects, &runs,
+    )))
+}
+
+/// Every program version the instance's firings ran under, with the stored
+/// `.ir` each version's `ir_hash` names.
+///
+/// A revision moves a live instance between program versions, so its firings
+/// can belong to more than one (the view-model note's G3). Load every version
+/// the commits name, not just the current one, or older firings get drawn
+/// against a structure they never ran under. The snapshot rides under the
+/// version's own `ir_hash` (G1), so there is no second pointer to follow.
+fn version_snapshots(
+    store: &SqliteStore,
+    instance: &InstanceView,
+    events: &[EventView],
+) -> StoreResult<BTreeMap<String, VersionSnapshot>> {
+    let mut version_ids: Vec<String> = vec![instance.version_id.clone()];
+    for event in events {
+        if event.event_type != "rule.committed" {
+            continue;
+        }
+        if let Ok(payload) = serde_json::from_str::<Value>(&event.payload_json) {
+            if let Some(id) = payload.get("program_version_id").and_then(Value::as_str) {
+                if !version_ids.iter().any(|seen| seen == id) {
+                    version_ids.push(id.to_owned());
+                }
+            }
+        }
+    }
+    let mut versions = BTreeMap::new();
+    for version_id in version_ids {
+        let Some(version) = store.get_program_version(&version_id)? else {
+            continue;
+        };
+        let snapshot = store.get_content(&version.ir_hash)?;
+        versions.insert(
+            version_id,
+            VersionSnapshot {
+                ir_hash: version.ir_hash,
+                snapshot,
+            },
+        );
+    }
+    Ok(versions)
+}
+
+/// The structure half of the view, from a parsed snapshot.
+///
+/// Shared by `project`, which draws it under an instance, and by `structure`,
+/// which draws it for a program that has no instance yet — a `.whip` file is a
+/// program before anything runs it, and the Structure tab must not be empty
+/// until something does.
+fn structure_value(view: &snapshot::SnapshotView, version_id: &str, ir_hash: &str) -> Value {
+    json!({
+        "available": true,
+        "program_version_id": version_id,
+        "ir_hash": ir_hash,
+        "workflow": view.workflow,
+        "rules": view.rules.iter().map(|rule| json!({
+            "name": rule.name,
+            "whens": rule.whens,
+            "effects": rule.effects.iter().map(|effect| json!({
+                "node": effect.id,
+                "kind": effect.kind,
+                "binding": effect.binding,
+            })).collect::<Vec<_>>(),
+            "dependencies": rule.dependencies.iter().map(|(upstream, predicate, downstream)| json!({
+                "upstream": upstream,
+                "predicate": predicate,
+                "downstream": downstream,
+            })).collect::<Vec<_>>(),
+        })).collect::<Vec<_>>(),
+        "rule_edges": view.rule_dependencies.iter().map(|(producer, fact, consumer)| json!({
+            "producer": producer,
+            "fact": fact,
+            "consumer": consumer,
+        })).collect::<Vec<_>>(),
+    })
+}
+
+/// The structure of a program from its `.ir` snapshot alone, with no instance.
+///
+/// `program_version_id` is empty because there is no version: this is what a
+/// host shows for a `.whip` file that nothing has run yet. The shape is the
+/// `structure` member of the instance view, so one renderer draws both.
+pub fn structure(snapshot: &str, ir_hash: &str) -> Value {
+    structure_value(&snapshot::parse(snapshot), "", ir_hash)
 }
 
 /// Project one instance into the view model.
@@ -323,31 +427,11 @@ pub fn project(
         // structure would be reading some of them against the wrong graph.
         "program_versions_seen": versions_seen,
         "structure": match structure {
-            Some(view) => json!({
-                "available": true,
-                "program_version_id": instance.version_id,
-                "ir_hash": current.map(|version| version.ir_hash.clone()).unwrap_or_default(),
-                "workflow": view.workflow,
-                "rules": view.rules.iter().map(|rule| json!({
-                    "name": rule.name,
-                    "whens": rule.whens,
-                    "effects": rule.effects.iter().map(|effect| json!({
-                        "node": effect.id,
-                        "kind": effect.kind,
-                        "binding": effect.binding,
-                    })).collect::<Vec<_>>(),
-                    "dependencies": rule.dependencies.iter().map(|(upstream, predicate, downstream)| json!({
-                        "upstream": upstream,
-                        "predicate": predicate,
-                        "downstream": downstream,
-                    })).collect::<Vec<_>>(),
-                })).collect::<Vec<_>>(),
-                "rule_edges": view.rule_dependencies.iter().map(|(producer, fact, consumer)| json!({
-                    "producer": producer,
-                    "fact": fact,
-                    "consumer": consumer,
-                })).collect::<Vec<_>>(),
-            }),
+            Some(view) => structure_value(
+                view,
+                &instance.version_id,
+                current.map(|version| version.ir_hash.as_str()).unwrap_or_default(),
+            ),
             // Honest rather than empty: the structure is missing, so absence is
             // not computable and the firings below carry no slots.
             None => json!({
@@ -403,6 +487,38 @@ mod tests {
         effects\n      \
         first kind=exec.command binding=first key=k1\n      \
         second kind=exec.command binding=second key=k2 arm=first:succeeds\n";
+
+    #[test]
+    fn structure_alone_is_the_view_s_structure_member_with_no_version() {
+        // A `.whip` file is a program before anything runs it. A host draws
+        // its Structure tab from this, and the shape must be exactly what the
+        // instance view carries under `structure`, or the renderer needs two
+        // code paths for one picture.
+        let alone = structure(SNAPSHOT, "ir-x");
+        assert_eq!(alone["available"], true);
+        assert_eq!(alone["program_version_id"], "");
+        assert_eq!(alone["ir_hash"], "ir-x");
+        assert_eq!(alone["workflow"], "Demo");
+        assert_eq!(alone["rules"][0]["name"], "work");
+        assert_eq!(
+            alone["rules"][0]["effects"].as_array().map(Vec::len),
+            Some(2)
+        );
+
+        let under_instance = project(
+            &instance(),
+            &versions(&[("ver_1", Some(SNAPSHOT))]),
+            &[],
+            &[],
+            &[],
+        );
+        let mut from_instance = under_instance["structure"].clone();
+        // Only the version differs: an instance has one, a bare program does not.
+        assert_eq!(from_instance["program_version_id"], "ver_1");
+        from_instance["program_version_id"] = json!("");
+        from_instance["ir_hash"] = json!("ir-x");
+        assert_eq!(from_instance, alone);
+    }
 
     fn commit_event(identity: &str, created: &[&str]) -> EventView {
         EventView {

@@ -137,7 +137,7 @@ mod harness_tools;
 mod improve;
 mod ingress_listener;
 mod injected_secrets;
-mod instance_view;
+use whipplescript::instance_view;
 mod lsp_server;
 mod maude_model;
 mod mcp_cli;
@@ -31795,72 +31795,28 @@ fn view(options: &CliOptions) -> ExitCode {
         Ok(store) => store,
         Err(code) => return code,
     };
-    let instance = match store.get_instance(instance_id) {
-        Ok(Some(instance)) => instance,
+    let view = match instance_view::load(&store, instance_id) {
+        Ok(Some(view)) => view,
         Ok(None) => {
             eprintln!("instance {instance_id} does not exist");
             return ExitCode::from(1);
         }
-        Err(error) => return report_store_error("failed to load instance", error),
+        Err(error) => return report_store_error("failed to load the instance view", error),
     };
-    let events = match store.list_events(instance_id) {
-        Ok(events) => events,
-        Err(error) => return report_store_error("failed to load events", error),
-    };
-    let effects = match store.list_effects(instance_id) {
-        Ok(effects) => effects,
-        Err(error) => return report_store_error("failed to load effects", error),
-    };
-    let runs = match store.list_runs(instance_id) {
-        Ok(runs) => runs,
-        Err(error) => return report_store_error("failed to load runs", error),
-    };
-
-    // A revision moves a live instance between program versions, so its firings
-    // can belong to more than one (the view-model note's G3). Load every version
-    // the commits name, not just the current one, or older firings get drawn
-    // against a structure they never ran under.
-    let mut version_ids: Vec<String> = vec![instance.version_id.clone()];
-    for event in &events {
-        if event.event_type != "rule.committed" {
-            continue;
-        }
-        if let Ok(payload) = serde_json::from_str::<Value>(&event.payload_json) {
-            if let Some(id) = payload.get("program_version_id").and_then(Value::as_str) {
-                if !version_ids.iter().any(|seen| seen == id) {
-                    version_ids.push(id.to_owned());
-                }
-            }
-        }
-    }
-    let mut versions = std::collections::BTreeMap::new();
-    for version_id in version_ids {
-        let ir_hash = match store.get_program_version(&version_id) {
-            Ok(Some(version)) => version.ir_hash,
-            Ok(None) => continue,
-            Err(error) => return report_store_error("failed to load program version", error),
-        };
-        // The snapshot rides under the version's own `ir_hash` (G1), so there
-        // is no second pointer to follow.
-        let snapshot = match store.get_content(&ir_hash) {
-            Ok(snapshot) => snapshot,
-            Err(error) => return report_store_error("failed to load the program snapshot", error),
-        };
-        versions.insert(
-            version_id,
-            instance_view::VersionSnapshot { ir_hash, snapshot },
-        );
-    }
-
-    let view = instance_view::project(&instance, &versions, &events, &effects, &runs);
 
     if options.json {
         return emit_json(view);
     }
 
+    // The loader owns the store reads now, so the headline comes from the
+    // projection it returned rather than from a second read of the row.
+    let header = &view["instance"];
     println!(
         "{} {} version={} epoch={}",
-        instance.instance_id, instance.status, instance.version_id, instance.revision_epoch
+        header["instance_id"].as_str().unwrap_or(instance_id),
+        header["status"].as_str().unwrap_or("unknown"),
+        header["program_version_id"].as_str().unwrap_or(""),
+        header["revision_epoch"],
     );
     if view["structure"]["available"] == serde_json::Value::Bool(false) {
         println!(
