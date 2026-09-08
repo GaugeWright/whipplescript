@@ -86,6 +86,24 @@ pub enum TraceEvent {
         code: String,
         message: String,
     },
+    /// The store refused a terminal as stale -- the run already had one, or
+    /// was not running -- and RECORDED the refusal rather than only rolling it
+    /// back. Never a terminal event: it is the evidence of the absent second
+    /// terminal, not a second terminal.
+    TerminalRefused {
+        run_id: String,
+        effect_id: String,
+        attempted_status: String,
+        reason: String,
+    },
+    /// A diagnostic no event pointed at, carried inline by `diagnostic.recorded`
+    /// so the log can be asked what it explains without a side-table join.
+    OrphanDiagnostic {
+        diagnostic_id: String,
+        code: Option<String>,
+        subject_type: Option<String>,
+        subject_id: Option<String>,
+    },
     EffectBlocked {
         effect_id: String,
         status: Option<String>,
@@ -652,28 +670,92 @@ fn check_record(state: &mut TraceState, record: &TraceRecord) -> Result<(), Trac
         // no effect, run or terminal state is touched here, which is the "no
         // user fact/effect mutation" half of the same obligation.
         //
-        // It deliberately does NOT check the diagnostic CODE, though the TLA
-        // side can. The reconstructor has only the event log, and the log does
-        // not carry the code: `reconstruct_trace_records` sets it from the event
-        // TYPE it just matched, and that arm accepts only the two spellings that
-        // are already registered. A check over it could not fail on any store,
-        // which is a tautology wearing a proof's clothes. The store DOES write
-        // the code, on the paired `diagnostics` row, and the event payload's
-        // `diagnostic_ids` is hardcoded empty -- so nothing links the two. See
-        // tracker row D12: carrying the code (or the link) in the event payload
-        // is the runtime change that would let this plane pin it.
+        // And `AssertionFailureCarriesRegisteredCode`: the evidence carries one
+        // of the two REGISTERED assertion codes. The store inlines the code into
+        // the event now, so this reads a value the store writes and could get
+        // wrong. It was removed once as a tautology, when the reconstructor
+        // manufactured the code from the event type it had matched (#401).
         TraceEvent::AssertionFailed {
             assertion_id,
-            code: _,
+            code,
             message,
         } => {
             if assertion_id.trim().is_empty() {
                 return violation(record, "assertion failure evidence names no assertion");
             }
+            // REFUSAL: an assertion's evidence carrying a code no register holds
+            if !REGISTERED_ASSERTION_DIAGNOSTIC_CODES.contains(&code.as_str()) {
+                return violation(
+                    record,
+                    format!(
+                        "assertion {assertion_id} carries unregistered assertion diagnostic \
+                         code `{code}`"
+                    ),
+                );
+            }
             if message.trim().is_empty() {
                 return violation(
                     record,
                     format!("assertion {assertion_id} failure evidence carries no message"),
+                );
+            }
+        }
+        // D12 shared claim with ControlPlaneLifecycle.tla
+        // `RefusedTerminalWasNotRunning`: a terminal the store refused as stale
+        // was refused for a run that was NOT running. The refusal is what the
+        // log keeps of a stale worker's attempt; if the run it names is live,
+        // the store refused a terminal it should have taken.
+        TraceEvent::TerminalRefused {
+            run_id,
+            effect_id,
+            attempted_status,
+            reason,
+        } => {
+            // REFUSAL: a terminal refused for a run that is still running
+            if state.live_runs.contains(run_id) {
+                return violation(
+                    record,
+                    format!(
+                        "refused a terminal for a run that is still running: run {run_id} \
+                         ({attempted_status}) on effect {effect_id}: {reason:?}"
+                    ),
+                );
+            }
+            // REFUSAL: a terminal refusal that gives no reason
+            if reason.trim().is_empty() {
+                return violation(
+                    record,
+                    format!("terminal refusal for run {run_id} gives no reason"),
+                );
+            }
+        }
+        // D12 shared claim with ControlPlaneLifecycle.tla
+        // `OrphanDiagnosticCarriesCode`: a diagnostic that reaches the log with
+        // no event of its own still carries a CODE and names a subject --
+        // otherwise making it reachable made a row the operator can find and
+        // still cannot read.
+        TraceEvent::OrphanDiagnostic {
+            diagnostic_id,
+            code,
+            subject_type,
+            subject_id,
+        } => {
+            // REFUSAL: an orphan diagnostic carrying no code
+            if !code.as_deref().is_some_and(is_code_identifier) {
+                return violation(
+                    record,
+                    format!(
+                        "orphan diagnostic {diagnostic_id} carries no diagnostic code: {code:?}"
+                    ),
+                );
+            }
+            let named =
+                |value: &Option<String>| value.as_deref().is_some_and(|v| !v.trim().is_empty());
+            // REFUSAL: an orphan diagnostic naming no subject
+            if !named(subject_type) || !named(subject_id) {
+                return violation(
+                    record,
+                    format!("orphan diagnostic {diagnostic_id} names no subject"),
                 );
             }
         }
@@ -744,13 +826,11 @@ const SCRIPT_DISABLED_DIAGNOSTIC_CODE: &str = "security.script_disabled";
 /// same string, and two copies of it could drift apart silently.
 const REGISTERED_DENIAL_DIAGNOSTIC_CODES: [&str; 1] = [SCRIPT_DISABLED_DIAGNOSTIC_CODE];
 
-/// The two runtime codes a failing assertion's `diagnostics` row may carry.
-/// The trace plane cannot check an assertion against these -- the event log
-/// carries no code, only the event TYPE, so see `TraceEvent::AssertionFailed`
-/// above. What is checkable, and what the test below checks, is that both
-/// spellings stay registered in `spec/diagnostic-codes-runtime.txt`: deleting
-/// one there turns a store's runtime diagnostic into an unregistered code.
-#[cfg(test)]
+/// The two runtime codes a failing assertion's evidence may carry
+/// (`spec/diagnostic-codes-runtime.txt`). The event payload carries the code
+/// now, so this is a real check over a value the store writes and could get
+/// wrong -- it was a tautology when the reconstructor derived the code from the
+/// event type it had just matched, and was removed as one (#401).
 const REGISTERED_ASSERTION_DIAGNOSTIC_CODES: [&str; 2] = ["assertion.failed", "assertion.errored"];
 
 /// A denial reason NAMES its subject when it backtick-quotes a non-empty name:
@@ -902,16 +982,20 @@ mod tests {
         }
     }
 
-    /// A failing assertion's evidence, parameterised on the two things the
-    /// checker reads. It is deliberately NOT parameterised on the code: the
-    /// event log carries none, so a trace varying it would be a state the
-    /// runtime cannot reach (see `TraceEvent::AssertionFailed` in check_record).
-    fn assertion_failed(sequence: u64, assertion_id: &str, message: &str) -> TraceRecord {
+    /// A failing assertion's evidence. Parameterised on the code again: the
+    /// store writes it into the event now, so a trace varying it is a state a
+    /// store can reach.
+    fn assertion_failed(
+        sequence: u64,
+        assertion_id: &str,
+        code: &str,
+        message: &str,
+    ) -> TraceRecord {
         TraceRecord {
             sequence,
             event: TraceEvent::AssertionFailed {
                 assertion_id: assertion_id.to_owned(),
-                code: "assertion.failed".to_owned(),
+                code: code.to_owned(),
                 message: message.to_owned(),
             },
         }
@@ -1553,9 +1637,43 @@ mod tests {
                 effect_created(1, "e"),
                 capability_denial(2, "e", "capability `script.raw` is not bound for program p"),
             ],
+            "terminal_refusal_names_a_settled_run" => vec![
+                effect_created(1, "e"),
+                claim(2, "e"),
+                start_run_id(3, "e", "r1"),
+                // A refusal recorded against a run that is still running.
+                TraceRecord {
+                    sequence: 4,
+                    event: TraceEvent::TerminalRefused {
+                        run_id: "r1".to_owned(),
+                        effect_id: "e".to_owned(),
+                        attempted_status: "failed".to_owned(),
+                        reason: "run already has a terminal completion".to_owned(),
+                    },
+                },
+            ],
+            "orphan_diagnostic_carries_code" => vec![TraceRecord {
+                sequence: 1,
+                event: TraceEvent::OrphanDiagnostic {
+                    diagnostic_id: "dia_x".to_owned(),
+                    // Reachable, and unreadable: no code.
+                    code: None,
+                    subject_type: Some("effect".to_owned()),
+                    subject_id: Some("e".to_owned()),
+                },
+            }],
+            "assertion_failure_carries_code" => vec![
+                // Evidence whose code is a spelling no register holds.
+                assertion_failed(1, "key_assertion", "assertion.rejected", "assertion failed"),
+            ],
             "assertion_failure_evidence" => vec![
                 // Evidence that a named assertion failed -- without naming it.
-                assertion_failed(1, "  ", "assertion failed: count(Scored) == 99"),
+                assertion_failed(
+                    1,
+                    "  ",
+                    "assertion.failed",
+                    "assertion failed: count(Scored) == 99",
+                ),
             ],
             "terminal_diagnostic_carries_code" => vec![
                 effect_created(1, "e"),
@@ -1648,6 +1766,9 @@ mod tests {
             "denial_diagnostic_code_registered",
             "script_denial_carries_disabled_code",
             "assertion_failure_evidence",
+            "assertion_failure_carries_code",
+            "terminal_refusal_names_a_settled_run",
+            "orphan_diagnostic_carries_code",
             "terminal_diagnostic_carries_code",
             "terminal_diagnostic_names_effect",
         ] {
@@ -1756,6 +1877,72 @@ mod tests {
         );
     }
 
+    /// The two clauses of the new evidence records that the correspondence
+    /// corpus does not reach: a refusal must say why, and an orphan diagnostic
+    /// must name what it is about. Reachable, and unreadable, is not evidence.
+    #[test]
+    fn a_refusal_gives_a_reason_and_an_orphan_names_its_subject() {
+        // A refusal for a run that was never started -- so the live-run clause
+        // is satisfied -- that gives no reason.
+        let silent_refusal = vec![
+            effect_created(1, "e"),
+            TraceRecord {
+                sequence: 2,
+                event: TraceEvent::TerminalRefused {
+                    run_id: "r1".to_owned(),
+                    effect_id: "e".to_owned(),
+                    attempted_status: "failed".to_owned(),
+                    reason: "   ".to_owned(),
+                },
+            },
+        ];
+        let violation = check_trace(&silent_refusal).expect_err("a silent refusal is refused");
+        assert!(
+            violation
+                .message
+                .contains("terminal refusal for run r1 gives no reason"),
+            "unexpected violation: {violation:?}"
+        );
+
+        // The same refusal with its reason is fine.
+        let mut explained = silent_refusal.clone();
+        explained[1].event = TraceEvent::TerminalRefused {
+            run_id: "r1".to_owned(),
+            effect_id: "e".to_owned(),
+            attempted_status: "failed".to_owned(),
+            reason: "run is not running".to_owned(),
+        };
+        assert_eq!(check_trace(&explained), Ok(()));
+
+        // An orphan with a code and no subject.
+        let orphan = |subject_type: Option<&str>, subject_id: Option<&str>| {
+            vec![TraceRecord {
+                sequence: 1,
+                event: TraceEvent::OrphanDiagnostic {
+                    diagnostic_id: "dia_x".to_owned(),
+                    code: Some("cancel.noop".to_owned()),
+                    subject_type: subject_type.map(str::to_owned),
+                    subject_id: subject_id.map(str::to_owned),
+                },
+            }]
+        };
+        for (kind, id) in [
+            (None, Some("e")),
+            (Some("effect"), None),
+            (Some("effect"), Some("  ")),
+        ] {
+            let violation =
+                check_trace(&orphan(kind, id)).expect_err("an unaddressed orphan is refused");
+            assert!(
+                violation
+                    .message
+                    .contains("orphan diagnostic dia_x names no subject"),
+                "unexpected violation for ({kind:?}, {id:?}): {violation:?}"
+            );
+        }
+        assert_eq!(check_trace(&orphan(Some("effect"), Some("e"))), Ok(()));
+    }
+
     /// The second half of a failing assertion's evidence. `richer_invariants_have
     /// _bite` covers the clause the TLA model shares (the evidence NAMES its
     /// assertion); this covers the clause it does not model, because
@@ -1767,11 +1954,17 @@ mod tests {
         let named_and_explained = vec![assertion_failed(
             1,
             "key_assertion",
+            "assertion.failed",
             "assertion failed: count(Scored) == 99",
         )];
         assert_eq!(check_trace(&named_and_explained), Ok(()));
 
-        let named_but_silent = vec![assertion_failed(1, "key_assertion", "   ")];
+        let named_but_silent = vec![assertion_failed(
+            1,
+            "key_assertion",
+            "assertion.failed",
+            "   ",
+        )];
         let violation = check_trace(&named_but_silent).expect_err("silent evidence is a violation");
         assert!(
             violation

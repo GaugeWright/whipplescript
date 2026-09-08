@@ -475,3 +475,70 @@ fn renders_effect_harness_provider_selection_json() {
         Some("codex")
     );
 }
+
+/// D12 runtime evidence: the two records that used to have no event at all --
+/// a terminal the store refused as stale, and a diagnostic no event pointed at
+/// -- are reconstructed from the log with what the checker reads.
+#[test]
+fn reconstructs_the_two_new_evidence_records_from_their_events() {
+    let events = vec![
+        event_view(
+            1,
+            "run.terminal_refused",
+            json!({
+                "run_id": "run_send",
+                "effect_id": "send",
+                "attempted_status": "failed",
+                "reason": "run already has a terminal completion"
+            }),
+        ),
+        event_view(
+            2,
+            "diagnostic.recorded",
+            json!({
+                "diagnostic_id": "dia_1",
+                "effect_id": "send",
+                "run_id": null,
+                "diagnostic": {
+                    "code": "cancel.noop",
+                    "severity": "info",
+                    "message": "rule `r` cancelled effect `send` after it reached a terminal status",
+                    "subject_type": "effect",
+                    "subject_id": "send"
+                }
+            }),
+        ),
+    ];
+    let records = reconstruct_trace_records(&events);
+    assert!(
+        matches!(
+            &records[0].event,
+            TraceEvent::TerminalRefused { run_id, effect_id, attempted_status, reason }
+                if run_id == "run_send"
+                    && effect_id == "send"
+                    && attempted_status == "failed"
+                    && reason == "run already has a terminal completion"
+        ),
+        "{:?}",
+        records[0].event
+    );
+    assert!(
+        matches!(
+            &records[1].event,
+            TraceEvent::OrphanDiagnostic { diagnostic_id, code, subject_type, subject_id }
+                if diagnostic_id == "dia_1"
+                    && code.as_deref() == Some("cancel.noop")
+                    && subject_type.as_deref() == Some("effect")
+                    && subject_id.as_deref() == Some("send")
+        ),
+        "{:?}",
+        records[1].event
+    );
+    // And the JSON projection names them, so `whip trace --json` shows what
+    // `check_trace` reads.
+    let rendered = trace_record_to_json(&records[0]);
+    assert_eq!(rendered["event"]["type"], "terminal_refused");
+    let rendered = trace_record_to_json(&records[1]);
+    assert_eq!(rendered["event"]["type"], "orphan_diagnostic");
+    assert_eq!(rendered["event"]["code"], "cancel.noop");
+}

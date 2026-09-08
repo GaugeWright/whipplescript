@@ -1,0 +1,6 @@
+error[type.unknown_binding]: rule `start` has unknown binding `nosuchbinding`
+   --> examples/invalid/prompt-unknown-binding.whip:22:21
+   |
+22 |   Please look at {{ nosuchbinding.field }} and report.
+   |                     ^^^^^^^^^^^^^
+   = help: reference a binding from a `when ... as name` clause, an effect `as` binding, or a `case` pattern

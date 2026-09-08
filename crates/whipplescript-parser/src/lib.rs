@@ -2698,6 +2698,12 @@ struct SemanticContext {
     counters: BTreeSet<String>,
     /// Declared `channel` names (std.messaging); `send via <channel>` must name one.
     channels: BTreeSet<String>,
+    /// The short name each `use` brings into scope -- `use std.memory` makes
+    /// `memory` a namespace, so `call memory.query` is a construct target and
+    /// not a read of a binding called `memory`. The scanned-body pass reports a
+    /// dangling root now (D14) and needs this to tell the two apart; before it
+    /// reported nothing, so the confusion never surfaced.
+    use_names: BTreeSet<String>,
     /// Declared channel providers by channel name (std.messaging): the
     /// capability-report-conditioned checks (send requires outbound-capable,
     /// `when message from` requires inbound-capable) resolve the report
@@ -7507,6 +7513,7 @@ impl SemanticContext {
         let mut ledgers = BTreeSet::new();
         let mut counters = BTreeSet::new();
         let mut channels = BTreeSet::new();
+        let mut use_names = BTreeSet::new();
         let mut channel_providers = BTreeMap::new();
         let mut credentials = BTreeMap::new();
         let mut credential_allow: BTreeMap<String, Vec<String>> = BTreeMap::new();
@@ -7573,6 +7580,11 @@ impl SemanticContext {
                 Item::Tracker(queue) => {
                     trackers.insert(queue.name.name.clone());
                 }
+                Item::Use(use_decl) => {
+                    let name = use_decl.name.value.as_str();
+                    let short = name.rsplit('.').next().unwrap_or(name);
+                    use_names.insert(short.to_owned());
+                }
                 _ => {}
             }
         }
@@ -7584,6 +7596,7 @@ impl SemanticContext {
                 .map(|workflow| workflow.name.clone()),
             schemas,
             agents,
+            use_names,
             agent_capabilities,
             coerce_outputs,
             coerce_params,
@@ -12495,6 +12508,25 @@ fn analyze_rule(
             }
         }
     }
+    // Built here, before the body scans, because the scanned-body pass reports
+    // a dangling root now (D14) and needs the rule's known roots to tell one
+    // from a special root. Every `binding_types` insert is above this line.
+    let mut known_roots: BTreeSet<String> = binding_types.keys().cloned().collect();
+    collect_all_binding_names(&body_ast.statements, &mut known_roots);
+    // The roots a BODY scan may meet that are namespaces rather than bindings:
+    // a `use`'s short name (`call memory.query`) and a declared signal's family
+    // (`emit signal deploy.acknowledged`). A value-position validator never
+    // meets these, which is why `known_roots` itself stays free of them and the
+    // set is widened only for the scans of raw body text.
+    let mut body_roots: BTreeSet<String> = known_roots.clone();
+    body_roots.extend(semantic.use_names.iter().cloned());
+    body_roots.extend(
+        semantic
+            .schemas
+            .events
+            .iter()
+            .filter_map(|event| event.split_once('.').map(|(family, _)| family.to_owned())),
+    );
     for when in &rule.whens {
         if let (_, Some(guard)) = split_when_guard(&when.text) {
             // The guard is a slice of the `when` clause, and the clause is a
@@ -12518,6 +12550,7 @@ fn analyze_rule(
                 guard_anchor,
                 semantic,
                 &binding_types,
+                &body_roots,
                 diagnostics,
             );
             if let Some(expr) = lower_expression(guard, when.span) {
@@ -12540,11 +12573,12 @@ fn analyze_rule(
     // deduplicating the finished list.
     let mut passes = RuleBodyPasses::default();
     passes.run(diagnostics, |diagnostics| {
-        validate_case_blocks(rule, semantic, &binding_types, diagnostics)
+        validate_case_blocks(rule, semantic, &binding_types, &body_roots, diagnostics)
     });
     let mut case_branches = Vec::new();
     passes.run(diagnostics, |diagnostics| {
-        case_branches = collect_rule_case_metadata(rule, semantic, &binding_types, diagnostics);
+        case_branches =
+            collect_rule_case_metadata(rule, semantic, &binding_types, &body_roots, diagnostics);
     });
     metadata.case_branches = case_branches;
     let mut terminal_metadata = TerminalMetadata::default();
@@ -12554,14 +12588,13 @@ fn analyze_rule(
             semantic,
             &binding_types,
             &effect_payload_types,
+            &body_roots,
             diagnostics,
         );
     });
     // Complete value-position root set: typed bindings plus every binding NAME
     // the body introduces (AST-collected, so multi-line-prompt `tell`/`exec`
     // results and `case` payloads are covered, which `binding_types` omits).
-    let mut known_roots: BTreeSet<String> = binding_types.keys().cloned().collect();
-    collect_all_binding_names(&body_ast.statements, &mut known_roots);
     passes.run(diagnostics, |diagnostics| {
         validate_record_blocks(rule, semantic, &binding_types, &known_roots, diagnostics)
     });
@@ -12746,6 +12779,7 @@ fn analyze_rule(
                 semantic,
                 &binding_types,
                 &foreign_schemas,
+                &body_roots,
                 diagnostics,
             );
             continue;
@@ -12767,6 +12801,7 @@ fn analyze_rule(
             semantic,
             &binding_types,
             &foreign_schemas,
+            &body_roots,
             diagnostics,
         );
 
@@ -13006,6 +13041,7 @@ fn analyze_rule(
             &binding_types,
             &foreign_schemas,
             &effect_payload_types,
+            &body_roots,
             diagnostics,
         );
         // The arm's RECORDS, for the same reason and from the same text. The
@@ -14094,6 +14130,7 @@ fn collect_rule_case_metadata(
     rule: &RuleDecl,
     semantic: &SemanticContext,
     binding_types: &BTreeMap<String, String>,
+    known_roots: &BTreeSet<String>,
     diagnostics: &mut Vec<Diagnostic>,
 ) -> Vec<IrRuleCaseBranch> {
     let mut branches = Vec::new();
@@ -14126,6 +14163,11 @@ fn collect_rule_case_metadata(
                 guard_anchor,
                 semantic,
                 &branch_scope,
+                &known_roots
+                    .iter()
+                    .cloned()
+                    .chain(branch_scope.keys().cloned())
+                    .collect::<BTreeSet<String>>(),
                 diagnostics,
             );
         }
@@ -14142,6 +14184,11 @@ fn collect_rule_case_metadata(
             branch_anchor(rule, branch.body_at.clone(), branch.pattern_span),
             semantic,
             &branch_scope,
+            &known_roots
+                .iter()
+                .cloned()
+                .chain(branch_scope.keys().cloned())
+                .collect::<BTreeSet<String>>(),
             diagnostics,
         );
         if let Some(pattern) = lower_case_pattern(&branch.pattern, &branch.scrutinee_type, semantic)
@@ -14291,6 +14338,7 @@ fn collect_terminal_case_metadata(
     semantic: &SemanticContext,
     binding_types: &BTreeMap<String, String>,
     effect_payload_types: &BTreeMap<String, IrType>,
+    known_roots: &BTreeSet<String>,
     diagnostics: &mut Vec<Diagnostic>,
 ) -> TerminalMetadata {
     let mut metadata = TerminalMetadata::default();
@@ -14350,6 +14398,11 @@ fn collect_terminal_case_metadata(
                 guard_anchor,
                 semantic,
                 &branch_scope,
+                &known_roots
+                    .iter()
+                    .cloned()
+                    .chain(branch_scope.keys().cloned())
+                    .collect::<BTreeSet<String>>(),
                 diagnostics,
             );
         }
@@ -14362,6 +14415,11 @@ fn collect_terminal_case_metadata(
             branch_anchor(rule, branch.body_at.clone(), branch.pattern_span),
             semantic,
             &branch_scope,
+            &known_roots
+                .iter()
+                .cloned()
+                .chain(branch_scope.keys().cloned())
+                .collect::<BTreeSet<String>>(),
             diagnostics,
         );
         metadata.branches.push(IrTerminalCaseBranch {
@@ -18686,6 +18744,7 @@ fn validate_case_blocks(
     rule: &RuleDecl,
     semantic: &SemanticContext,
     binding_types: &BTreeMap<String, String>,
+    known_roots: &BTreeSet<String>,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
     let scan = BraceScan::new(&rule.body.text);
@@ -18790,6 +18849,13 @@ fn validate_case_blocks(
                             at,
                             semantic,
                             &branch_scope,
+                            // The branch's payload binding is a root the rule-level
+                            // set does not hold.
+                            &known_roots
+                                .iter()
+                                .cloned()
+                                .chain(branch_scope.keys().cloned())
+                                .collect::<BTreeSet<String>>(),
                             diagnostics,
                         );
                     }
@@ -23314,6 +23380,7 @@ const PROGRESS_VIEW_NAMESPACE: &str = "region";
 /// The same splice hid the arm from Family B read-narrowing, so the arm is walked
 /// with that pass too: an arm is an egress position like any other, and the region
 /// it belongs to may itself sit inside a `case` arm whose allowances the arm keeps.
+#[allow(clippy::too_many_arguments)]
 fn validate_lapse_arm(
     rule: &RuleDecl,
     region: &IrRegion,
@@ -23321,6 +23388,7 @@ fn validate_lapse_arm(
     binding_types: &BTreeMap<String, String>,
     foreign_schemas: &BTreeMap<String, String>,
     effect_payload_types: &BTreeMap<String, IrType>,
+    known_roots: &BTreeSet<String>,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
     let mut schemas = semantic.schemas.clone();
@@ -23377,6 +23445,13 @@ fn validate_lapse_arm(
     // `analyze_rule`'s loop gives: a line inside a `"""` prompt body carries no
     // quote of its own. The anchor here is the rule, so no offset in the mask
     // is a caret — only which bytes are source.
+    // The arm's view binding is a root here that the rule-level set does not
+    // hold; without it every read of the view would report as unknown.
+    let arm_roots: BTreeSet<String> = known_roots
+        .iter()
+        .cloned()
+        .chain(arm_bindings.keys().cloned())
+        .collect();
     let arm_scan = source_scan_text(&region.arm_content);
     for line in arm_scan.lines() {
         let line = line.trim();
@@ -23396,6 +23471,7 @@ fn validate_lapse_arm(
                 workflows: &semantic.workflow_inputs,
             },
             &arm_bindings,
+            &arm_roots,
             diagnostics,
         );
     }
@@ -23488,6 +23564,7 @@ fn validate_known_field_paths(
     anchor: BodyAnchor,
     semantic: &SemanticContext,
     binding_types: &BTreeMap<String, String>,
+    known_roots: &BTreeSet<String>,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
     validate_known_field_paths_in_index(
@@ -23496,6 +23573,7 @@ fn validate_known_field_paths(
         anchor,
         SchemaScopes::local(&semantic.schemas),
         binding_types,
+        known_roots,
         diagnostics,
     );
 }
@@ -23507,6 +23585,7 @@ fn validate_known_field_paths(
 /// walk a body LINE BY LINE, and a line inside a `"""` prompt body carries no
 /// quote of its own — the mask has to be computed over the whole body and
 /// sliced. See [`source_scan_text`].
+#[allow(clippy::too_many_arguments)]
 fn validate_known_field_paths_scoped(
     rule: &RuleDecl,
     scan: &str,
@@ -23514,6 +23593,7 @@ fn validate_known_field_paths_scoped(
     semantic: &SemanticContext,
     binding_types: &BTreeMap<String, String>,
     foreign: &BTreeMap<String, String>,
+    known_roots: &BTreeSet<String>,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
     validate_known_field_paths_in_index(
@@ -23526,6 +23606,7 @@ fn validate_known_field_paths_scoped(
             workflows: &semantic.workflow_inputs,
         },
         binding_types,
+        known_roots,
         diagnostics,
     );
 }
@@ -23624,16 +23705,115 @@ fn check_field_path(
 /// bytes, same length, with string prose and comments blanked and `{{ … }}`
 /// interpolations left standing (see [`source_scan_text`]). Offsets in it are
 /// offsets in the fragment, which is what lets the caret stay on the field.
+/// The scanned-body pass is the GENERAL producer of `type.unknown_binding`:
+/// it walks every line of raw body text and names the root and nothing else.
+/// A value-position validator is a SPECIFIC one: it names the record field or
+/// the payload the read sits in. When both report one mistake -- and they do,
+/// because a record field's `"{{ nosuchbinding.field }}"` is also a line of
+/// body text -- the general finding's span sits inside the specific one's, and
+/// a reader sees the same missing binding twice at two carets. `RuleBodyPasses`
+/// collapses only identical findings, which these are not.
+///
+/// So the general finding yields to a specific one that contains it. Kept when
+/// nothing contains it, which is the case the pass exists for: a prompt's prose
+/// is a value position nobody else walks.
+fn collapse_general_unknown_bindings(diagnostics: &mut Vec<Diagnostic>, from: usize) {
+    let is_unknown_binding = |d: &Diagnostic| d.code.as_str() == "type.unknown_binding";
+    // The general form ends right after the backticked root; every specific
+    // form goes on to say where the read sits.
+    let is_general = |d: &Diagnostic| {
+        let Some((_, rest)) = d.message.split_once("` has unknown binding `") else {
+            return false;
+        };
+        rest.ends_with('`') && !rest[..rest.len() - 1].contains('`')
+    };
+    let mut drop = Vec::new();
+    for (i, general) in diagnostics.iter().enumerate().skip(from) {
+        if !is_unknown_binding(general) || !is_general(general) {
+            continue;
+        }
+        let contained = diagnostics
+            .iter()
+            .enumerate()
+            .skip(from)
+            .any(|(j, specific)| {
+                j != i
+                    && is_unknown_binding(specific)
+                    && !is_general(specific)
+                    && specific.span.start <= general.span.start
+                    && general.span.end <= specific.span.end
+            });
+        if contained {
+            drop.push(i);
+        }
+    }
+    let mut index = 0;
+    diagnostics.retain(|_| {
+        let keep = !drop.contains(&index);
+        index += 1;
+        keep
+    });
+}
+
+/// A coerce prompt's `{{ root.field }}` reads one of the coerce's parameters or
+/// a special root, and nothing else. This is the D14 hole as it was actually
+/// reported: `{{ nosuchbinding.field }}` in a `prompt """..."""` compiled clean.
+/// The rule-body scanners never see a coerce declaration -- it is a top-level
+/// item, lowered by `lower_coerce` -- and `validate_coerce_body_fields` checks
+/// only that the clauses are the right clauses. So the prompt's reads were
+/// checked by nobody, and a model was sent the literal text of a read from a
+/// binding that does not exist.
+fn validate_coerce_prompt_reads(
+    coerce: &CoerceDecl,
+    params: &BTreeSet<String>,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    // Masked so prose in the prompt is not read as code, with `{{ ... }}`
+    // interpolations left standing -- the same mask the rule-body scans use,
+    // and for the same reason.
+    let scan = source_scan_text(&coerce.body.text);
+    let anchor = BodyAnchor::text(&coerce.body, 0, &coerce.body.text);
+    let mut reported: BTreeSet<String> = BTreeSet::new();
+    for dotted in dotted_paths(&scan) {
+        let Some(root) = dangling_path_root(&dotted, params) else {
+            continue;
+        };
+        if !reported.insert(root.clone()) {
+            continue;
+        }
+        let root_range = dotted.root_at..dotted.root_at + dotted.root.len();
+        diagnostics.push(Diagnostic {
+            code: diagnostic_code!("type.unknown_binding"),
+            severity: Severity::Error,
+            related: Vec::new(),
+            fixits: Vec::new(),
+            span: anchor.at(root_range),
+            message: format!(
+                "coerce `{}` has unknown binding `{root}` in its prompt",
+                coerce.name.name
+            ),
+            suggestion: Some(suggest_binding_root(
+                &root,
+                params,
+                "reference one of the coerce's parameters, or `ctx`",
+            )),
+        });
+    }
+}
+
 fn validate_known_field_paths_in_index(
     rule: &RuleDecl,
     scan: &str,
     anchor: BodyAnchor,
     scopes: SchemaScopes,
     binding_types: &BTreeMap<String, String>,
+    known_roots: &BTreeSet<String>,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
+    // One body naming one missing binding twice is one mistake.
+    let mut reported: BTreeSet<String> = BTreeSet::new();
     for dotted in dotted_paths(scan) {
-        check_field_path(
+        let check = check_field_path(
             rule,
             &dotted.root,
             &dotted.path(),
@@ -23642,6 +23822,36 @@ fn validate_known_field_paths_in_index(
             binding_types,
             diagnostics,
         );
+        // `Unbound` says the root is no typed binding here and leaves the
+        // caller to decide whether that is a dangling reference. This caller
+        // decided nothing: it discarded the answer, so a prompt reading
+        // `{{ nosuchbinding.field }}` compiled clean and shipped the text of a
+        // read from a binding that does not exist. The record-field and
+        // terminal-payload passes already treat it as dangling (D14); this is
+        // the third reader of the same answer, deciding the same way.
+        if check != FieldPathCheck::Unbound {
+            continue;
+        }
+        let Some(root) = dangling_path_root(&dotted, known_roots) else {
+            continue;
+        };
+        if !reported.insert(root.clone()) {
+            continue;
+        }
+        let root_range = dotted.root_at..dotted.root_at + dotted.root.len();
+        diagnostics.push(Diagnostic {
+            code: diagnostic_code!("type.unknown_binding"),
+            severity: Severity::Error,
+            related: Vec::new(),
+            fixits: Vec::new(),
+            span: anchor.at(root_range),
+            message: format!("rule `{}` has unknown binding `{root}`", rule.name.name),
+            suggestion: Some(suggest_binding_root(
+                &root,
+                known_roots,
+                BINDING_ROOT_FALLBACK,
+            )),
+        });
     }
 }
 

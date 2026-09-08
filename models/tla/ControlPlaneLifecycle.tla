@@ -34,7 +34,11 @@ CONSTANTS
   \* @type: Set(Str);
   AssertionCodeDomain,
   \* @type: Set(Str);
-  TerminalDiagnosticCodeDomain
+  TerminalDiagnosticCodeDomain,
+  \* @type: Set(Str);
+  OrphanDiagnostics,
+  \* @type: Set(Str);
+  OrphanCodeDomain
 
 VARIABLES
   \* @type: Seq(Str);
@@ -92,6 +96,10 @@ VARIABLES
   \* <<run, effect, code>>.
   \* @type: Seq(<<Str, Str, Str>>);
   terminalDiagnostics,
+  \* @type: Seq(<<Str, Str>>);
+  refusedTerminals,
+  \* @type: Seq(<<Str, Str>>);
+  orphanDiagnostics,
   \* The set of effects `denialEvidence` carries a record for. A projection of
   \* the sequence, kept as its own variable only because Apalache cannot
   \* evaluate an existential over a sequence index range (`\E i \in 1..Len(s)`).
@@ -108,7 +116,8 @@ vars ==
      terminalDiagnostics, deniedEffects >>
 
 EvidenceVars ==
-  << denialEvidence, assertionEvidence, terminalDiagnostics, deniedEffects >>
+  << denialEvidence, assertionEvidence, terminalDiagnostics, deniedEffects,
+     refusedTerminals, orphanDiagnostics >>
 
 RevisionVars ==
   << activeVersion, revisionEpoch, effectVersion, cancelRequested,
@@ -165,6 +174,12 @@ RegisteredDenialCodes ==
 RegisteredAssertionCodes ==
   {"assertionFailed", "assertionErrored"}
 
+\* The registered runtime codes a diagnostic that reaches the log with no event
+\* of its own may carry. `cancel.noop` and the `revision.*` family were durable
+\* rows no event pointed at; `diagnostic.recorded` carries them inline now.
+RegisteredOrphanCodes ==
+  {"cancelNoop", "revisionTerminalInstance"}
+
 \* A terminal diagnostic carries a CODE -- an identifier, not prose. When a
 \* terminal records a diagnostic at all, the runtime passes either the provider's
 \* own failure kind (`nonzero_exit`) or a registered runtime code
@@ -212,6 +227,8 @@ Init ==
   /\ denialEvidence = << >>
   /\ assertionEvidence = << >>
   /\ terminalDiagnostics = << >>
+  /\ refusedTerminals = << >>
+  /\ orphanDiagnostics = << >>
   /\ deniedEffects = {}
 
 InstanceRunning ==
@@ -345,7 +362,7 @@ PolicyDenyEffect(e, ev, reason, code) ==
   /\ UNCHANGED << recoveryLog, runs, runEffect, leases, terminalEffects,
                   projectionCursor, terminalRunEvents, terminalControlEvents,
                   paused, cancelled, completed, failed, recovering, RevisionVars,
-                  assertionEvidence, terminalDiagnostics >>
+                  assertionEvidence, terminalDiagnostics, refusedTerminals, orphanDiagnostics >>
 
 \* The binding prerequisite becomes available: a blocked effect returns to
 \* `queued` and is claimable again, so a fixed config/credential resumes work
@@ -409,7 +426,8 @@ FailRun(r, ev, code) ==
                   completed, failed, recovering, activeVersion, revisionEpoch,
                   effectVersion, cancelRequested, cancelAcknowledged,
                   revisionPolicy, revisionEvents, terminalControlEvents,
-                  denialEvidence, assertionEvidence, deniedEffects >>
+                  denialEvidence, assertionEvidence, deniedEffects,
+                  refusedTerminals, orphanDiagnostics >>
 
 CancelAcknowledgedRun(r, ev) ==
   /\ r \in Runs
@@ -450,7 +468,8 @@ TimeoutRun(r, ev, code) ==
                   completed, failed, recovering, activeVersion, revisionEpoch,
                   effectVersion, cancelRequested, cancelAcknowledged,
                   revisionPolicy, revisionEvents, terminalControlEvents,
-                  denialEvidence, assertionEvidence, deniedEffects >>
+                  denialEvidence, assertionEvidence, deniedEffects,
+                  refusedTerminals, orphanDiagnostics >>
 
 ExpireLease(r, ev) ==
   /\ r \in Runs
@@ -684,7 +703,7 @@ ResolveUncertainRun(r, ev, code) ==
                   failed, recovering, activeVersion, revisionEpoch, effectVersion,
                   cancelRequested, cancelAcknowledged, revisionPolicy,
                   revisionEvents, terminalControlEvents, denialEvidence,
-                  assertionEvidence, deniedEffects >>
+                  assertionEvidence, deniedEffects, refusedTerminals, orphanDiagnostics >>
 
 \* D12 (assertion failure -> diagnostic/evidence, no user fact/effect mutation).
 \* A failing assertion appends the evidence that explains it -- the assertion it
@@ -706,7 +725,49 @@ FailAssertion(a, code, ev) ==
   /\ UNCHANGED << recoveryLog, effects, runs, runEffect, leases, terminalEffects,
                   projectionCursor, terminalRunEvents, terminalControlEvents,
                   paused, cancelled, completed, failed, recovering, RevisionVars,
-                  denialEvidence, terminalDiagnostics, deniedEffects >>
+                  denialEvidence, terminalDiagnostics, deniedEffects,
+                  refusedTerminals, orphanDiagnostics >>
+
+\* D12 (stale completion -> refusal recorded). The store refuses a terminal for
+\* a run that is not running -- already terminal, or never started -- and used
+\* to roll the refusal back with the transaction, leaving no record. It records
+\* the refusal now, OUTSIDE that transaction and NOT as a terminal event:
+\* `TerminaledRunStaysTerminal` and `NoDuplicateTerminalRunEvents` assert the
+\* second terminal's absence, and this is the evidence of that absence. The
+\* entry keeps the run's status AT the refusal, so the claim is local to that
+\* moment and a later run on the same row cannot make it retroactively false.
+RefuseTerminal(r, ev) ==
+  /\ r \in Runs
+  /\ ev \in Events
+  /\ ~recovering
+  /\ runs[r] /= "running"  \* THE REFUSAL NAMES A SETTLED RUN
+  /\ refusedTerminals' = Append(refusedTerminals, <<r, runs[r]>>)
+  /\ eventLog' = Append(eventLog, ev)
+  /\ UNCHANGED << recoveryLog, effects, runs, runEffect, leases, terminalEffects,
+                  projectionCursor, terminalRunEvents, terminalControlEvents,
+                  paused, cancelled, completed, failed, recovering, RevisionVars,
+                  denialEvidence, assertionEvidence, terminalDiagnostics,
+                  deniedEffects, orphanDiagnostics >>
+
+\* D12 (cancel/revision -> evidence reachable). A diagnostic a rule or an
+\* operator command recorded with no event to link to was a side-table row the
+\* log could not reach. `diagnostic.recorded` carries it inline now, and the
+\* claim is that what it carries is a CODE -- making the row reachable made it
+\* readable. `OrphanCodeDomain` carries a spelling no register holds, so the
+\* guard is load-bearing.
+RecordOrphanDiagnostic(d, code, ev) ==
+  /\ d \in OrphanDiagnostics
+  /\ code \in OrphanCodeDomain
+  /\ ev \in Events
+  /\ ~recovering
+  /\ code \in RegisteredOrphanCodes  \* THE ORPHAN CARRIES A CODE
+  /\ orphanDiagnostics' = Append(orphanDiagnostics, <<d, code>>)
+  /\ eventLog' = Append(eventLog, ev)
+  /\ UNCHANGED << recoveryLog, effects, runs, runEffect, leases, terminalEffects,
+                  projectionCursor, terminalRunEvents, terminalControlEvents,
+                  paused, cancelled, completed, failed, recovering, RevisionVars,
+                  denialEvidence, assertionEvidence, terminalDiagnostics,
+                  deniedEffects, refusedTerminals >>
 
 Next ==
   \/ \E ev \in Events : AppendEvent(ev)
@@ -742,6 +803,9 @@ Next ==
        ResolveUncertainRun(r, ev, code)
   \/ \E a \in AssertionSubjectDomain, code \in AssertionCodeDomain, ev \in Events :
        FailAssertion(a, code, ev)
+  \/ \E r \in Runs, ev \in Events : RefuseTerminal(r, ev)
+  \/ \E d \in OrphanDiagnostics, code \in OrphanCodeDomain, ev \in Events :
+       RecordOrphanDiagnostic(d, code, ev)
 
 Spec ==
   Init /\ [][Next]_vars
@@ -928,6 +992,18 @@ TerminalDiagnosticSeqOk(seq) ==
     /\ seq[i][2] \in Effects
     /\ seq[i][3] \in TerminalDiagnosticCodeDomain
 
+\* @type: (Seq(<<Str, Str>>)) => Bool;
+RefusedTerminalSeqOk(seq) ==
+  \A i \in 1..Len(seq) :
+    /\ seq[i][1] \in Runs
+    /\ seq[i][2] \in RunStatuses
+
+\* @type: (Seq(<<Str, Str>>)) => Bool;
+OrphanDiagnosticSeqOk(seq) ==
+  \A i \in 1..Len(seq) :
+    /\ seq[i][1] \in OrphanDiagnostics
+    /\ seq[i][2] \in OrphanCodeDomain
+
 TypeOk ==
   /\ EventSeqOk(eventLog)
   /\ EventSeqOk(recoveryLog)
@@ -937,6 +1013,8 @@ TypeOk ==
   /\ DenialEvidenceSeqOk(denialEvidence)
   /\ AssertionEvidenceSeqOk(assertionEvidence)
   /\ TerminalDiagnosticSeqOk(terminalDiagnostics)
+  /\ RefusedTerminalSeqOk(refusedTerminals)
+  /\ OrphanDiagnosticSeqOk(orphanDiagnostics)
   /\ deniedEffects \subseteq Effects
   /\ RequestableEffects \subseteq Effects
   /\ effects \in [Effects -> EffectStatuses]
@@ -1044,19 +1122,13 @@ AssertionFailureNamesItsAssertion ==
   \A i \in 1..Len(assertionEvidence) :
     assertionEvidence[i][1] \in Assertions
 
-\* TLA-ONLY (no correspondence row, deliberately): that same evidence carries one
-\* of the two registered assertion diagnostic codes. There is no Rust counterpart
-\* because there is nothing in the store log for one to read: the
-\* `assertion.failed`/`assertion.errored` event payload carries no code field and
-\* its `diagnostic_ids` is hardcoded `[]`, so the registered code lives only in
-\* the `diagnostics` side table, which no event points into. A trace checker
-\* could only re-derive the code from the event type it just matched -- a check
-\* no runtime state could ever fail, which is why `check_record` deliberately
-\* ignores the code and the corresponding conjunct was removed rather than kept
-\* as a tautology. The runtime behaviour is held instead by store-level tests
-\* that assert the persisted diagnostic's code. Carrying the code (or the
-\* diagnostic link) in the event payload is the runtime change that would let the
-\* trace plane pin it; see spec/error-handling.md for the recorded gap.
+\* SHARED CLAIM (tsv row `assertion_failure_carries_code`): that same evidence
+\* carries one of the two registered assertion diagnostic codes. This was
+\* TLA-ONLY: the event log carried no code, so a Rust check could only re-derive
+\* it from the event type it had matched -- unfalsifiable, and removed for that
+\* (#401). The store inlines the registered code into the `assertion.failed` /
+\* `assertion.errored` payload now, so the Rust counterpart reads a value the
+\* store writes and could get wrong, and the claim is shared again.
 AssertionFailureCarriesRegisteredCode ==
   \A i \in 1..Len(assertionEvidence) :
     assertionEvidence[i][2] \in RegisteredAssertionCodes
@@ -1082,6 +1154,22 @@ TerminalDiagnosticNamesItsRunEffect ==
   \A i \in 1..Len(terminalDiagnostics) :
     terminalDiagnostics[i][2] = runEffect[terminalDiagnostics[i][1]]
 
+\* SHARED CLAIM (tsv row `terminal_refusal_names_a_settled_run`): a terminal the
+\* store refused as stale was refused for a run that was NOT running at that
+\* moment. Rust counterpart: trace.rs rejects a `TerminalRefused` naming a run
+\* the checker still holds as live.
+RefusedTerminalWasNotRunning ==
+  \A i \in 1..Len(refusedTerminals) :
+    refusedTerminals[i][2] /= "running"
+
+\* SHARED CLAIM (tsv row `orphan_diagnostic_carries_code`): a diagnostic that
+\* reaches the log with no event of its own carries a registered CODE. Rust
+\* counterpart: trace.rs rejects an `OrphanDiagnostic` whose code is missing or
+\* prose-shaped.
+OrphanDiagnosticCarriesCode ==
+  \A i \in 1..Len(orphanDiagnostics) :
+    orphanDiagnostics[i][2] \in RegisteredOrphanCodes
+
 \* -- Vacuity witnesses (scripts/check-tla-models.sh) --------------------------
 \*
 \* These three are DELIBERATELY FALSE of the model and are never conjoined into
@@ -1098,6 +1186,12 @@ NoAssertionEvidenceWitness ==
 
 NoTerminalDiagnosticWitness ==
   Len(terminalDiagnostics) = 0
+
+NoRefusedTerminalWitness ==
+  Len(refusedTerminals) = 0
+
+NoOrphanDiagnosticWitness ==
+  Len(orphanDiagnostics) = 0
 
 ConstInit ==
   /\ Effects = {"effectA", "effectB"}
@@ -1128,6 +1222,10 @@ ConstInit ==
   \* shapes it must reject.
   /\ TerminalDiagnosticCodeDomain = {"nonzeroExit", "schemaCoerceFailed", "",
                                      "proseDiagnostic", "noDiagnostic"}
+  /\ OrphanDiagnostics = {"diagA"}
+  \* Two registered orphan codes and one spelling no register holds.
+  /\ OrphanCodeDomain = {"cancelNoop", "revisionTerminalInstance",
+                         "unregisteredOrphanCode"}
 
 SafetyInvariants ==
   /\ TypeOk
@@ -1162,5 +1260,7 @@ SafetyInvariants ==
   /\ AssertionFailureCarriesRegisteredCode
   /\ TerminalDiagnosticCarriesCode
   /\ TerminalDiagnosticNamesItsRunEffect
+  /\ RefusedTerminalWasNotRunning
+  /\ OrphanDiagnosticCarriesCode
 
 ====

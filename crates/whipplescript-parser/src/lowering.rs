@@ -2613,6 +2613,7 @@ fn lower_coerce(
         }
         validate_type_refs(&param.ty, schema_names, agent_names, diagnostics);
     }
+    super::validate_coerce_prompt_reads(&coerce, &params, diagnostics);
     validate_type_refs(&coerce.output, schema_names, agent_names, diagnostics);
     validate_coerce_prompt_content_type_annotations(&coerce, diagnostics);
     validate_coerce_body_fields(&coerce, diagnostics);
@@ -2676,6 +2677,9 @@ fn lower_rule(
         return;
     }
     rule_names.insert(rule.name.name.clone(), rule.name.span);
+    // Everything this rule reports lands after here; the collapse below reads
+    // only that.
+    let unknown_binding_mark = diagnostics.len();
     validate_canonical_rule_body_syntax(&rule, diagnostics);
     // Statement-form gate: every body must parse into the body AST. Unknown
     // statements, malformed modifiers, and unclosed blocks are spanned errors
@@ -2711,6 +2715,7 @@ fn lower_rule(
     // and put the caret on a statement that performs no write. Position cannot
     // collide.
     rule_bodies.push(rule.body.clone());
+    super::collapse_general_unknown_bindings(diagnostics, unknown_binding_mark);
     ir.rules.push(IrRule {
         name: rule.name.name,
         kind: rule.kind,

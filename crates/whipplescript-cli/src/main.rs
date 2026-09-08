@@ -30024,6 +30024,14 @@ fn trace_event_mentions_effect(event: &TraceEvent, effect_id: &str) -> bool {
             effect_id: candidate,
             ..
         } => candidate == effect_id,
+        // A refused terminal is about the effect whose run it names.
+        TraceEvent::TerminalRefused {
+            effect_id: candidate,
+            ..
+        } => candidate == effect_id,
+        // An orphan diagnostic's subject is whatever it names; it is not
+        // attributed to an effect by this projection.
+        TraceEvent::OrphanDiagnostic { .. } => false,
         TraceEvent::DependencyCreated(edge) => {
             edge.upstream_effect_id == effect_id || edge.downstream_effect_id == effect_id
         }
@@ -30922,7 +30930,19 @@ fn persist_assertion_events(
             "read_set": read_set.clone(),
             "actual_json": assertion.actual,
             "expected_json": assertion.expected,
-            "error_code": assertion.error.as_ref().map(|_| "assertion.eval_error"),
+            // The registered code, inlined so the event carries what its paired
+            // `diagnostics` row carries and the trace plane can read it back
+            // (D12). This field was `error_code`, set to `assertion.eval_error`
+            // -- a spelling in neither register, which nothing read.
+            "code": match assertion.status {
+                AssertionStatus::Failed => Some(
+                    whipplescript_core::runtime_diagnostic_code!("assertion.failed").as_str(),
+                ),
+                AssertionStatus::Error => Some(
+                    whipplescript_core::runtime_diagnostic_code!("assertion.errored").as_str(),
+                ),
+                AssertionStatus::Passed => None,
+            },
             "message": assertion.failure_reason,
             "diagnostic_ids": [],
             "evidence_ids": [],
@@ -36014,24 +36034,81 @@ fn reconstruct_trace_records(events: &[EventView]) -> Vec<TraceRecord> {
                 );
             }
             // D12 runtime evidence: a failing assertion's record. The code is
-            // the event type, which IS the registered code spelling
-            // (`assertion.failed` / `assertion.errored`, both in
-            // spec/diagnostic-codes-runtime.txt) and the code the paired
-            // `diagnostics` row carries.
+            // READ from the payload, where the store now writes it, and not
+            // derived from the event type this arm matched -- deriving it made
+            // `AssertionFailureCarriesRegisteredCode` a check no store could
+            // fail, and it was removed for that (#401). A store that writes an
+            // unregistered code, or none, is now a store the checker refuses.
             event_type @ ("assertion.failed" | "assertion.errored") => {
                 let Some(assertion_id) = payload.get("assertion_id").and_then(Value::as_str) else {
                     continue;
                 };
+                let _ = event_type;
                 push_trace_record(
                     &mut records,
                     TraceEvent::AssertionFailed {
                         assertion_id: assertion_id.to_owned(),
-                        code: event_type.to_owned(),
+                        code: payload
+                            .get("code")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_owned(),
                         message: payload
                             .get("message")
                             .and_then(Value::as_str)
                             .unwrap_or_default()
                             .to_owned(),
+                    },
+                );
+            }
+            // D12 runtime evidence: the record of a terminal the store refused
+            // as stale. Written outside the rolled-back transaction, so this is
+            // the first the log has ever said of a stale worker's attempt.
+            "run.terminal_refused" => {
+                let (Some(run_id), Some(effect_id)) = (
+                    payload.get("run_id").and_then(Value::as_str),
+                    payload.get("effect_id").and_then(Value::as_str),
+                ) else {
+                    continue;
+                };
+                let text = |key: &str| {
+                    payload
+                        .get(key)
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned()
+                };
+                push_trace_record(
+                    &mut records,
+                    TraceEvent::TerminalRefused {
+                        run_id: run_id.to_owned(),
+                        effect_id: effect_id.to_owned(),
+                        attempted_status: text("attempted_status"),
+                        reason: text("reason"),
+                    },
+                );
+            }
+            // D12 runtime evidence: a diagnostic no event pointed at, carried
+            // inline the way `effect.terminal` carries its own.
+            "diagnostic.recorded" => {
+                let Some(diagnostic_id) = payload.get("diagnostic_id").and_then(Value::as_str)
+                else {
+                    continue;
+                };
+                let diagnostic = payload.get("diagnostic").cloned().unwrap_or(Value::Null);
+                let field = |key: &str| {
+                    diagnostic
+                        .get(key)
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                };
+                push_trace_record(
+                    &mut records,
+                    TraceEvent::OrphanDiagnostic {
+                        diagnostic_id: diagnostic_id.to_owned(),
+                        code: field("code"),
+                        subject_type: field("subject_type"),
+                        subject_id: field("subject_id"),
                     },
                 );
             }
@@ -43576,6 +43653,30 @@ fn trace_event_to_json(event: &TraceEvent) -> Value {
             "assertion_id": assertion_id,
             "code": code,
             "message": message,
+        }),
+        TraceEvent::TerminalRefused {
+            run_id,
+            effect_id,
+            attempted_status,
+            reason,
+        } => json!({
+            "type": "terminal_refused",
+            "run_id": run_id,
+            "effect_id": effect_id,
+            "attempted_status": attempted_status,
+            "reason": reason,
+        }),
+        TraceEvent::OrphanDiagnostic {
+            diagnostic_id,
+            code,
+            subject_type,
+            subject_id,
+        } => json!({
+            "type": "orphan_diagnostic",
+            "diagnostic_id": diagnostic_id,
+            "code": code,
+            "subject_type": subject_type,
+            "subject_id": subject_id,
         }),
         TraceEvent::EffectBlocked {
             effect_id,

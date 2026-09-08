@@ -3067,9 +3067,37 @@ fn do_insert_diagnostic<Sql: DoSql>(
             ],
         )
         .map_err(sql_err)?;
-    rows.first()
+    let diagnostic_id = rows
+        .first()
         .map(|r| as_text(&r[0]))
-        .ok_or_else(|| sql_err("insert_diagnostic returned no row".to_string()))
+        .ok_or_else(|| sql_err("insert_diagnostic returned no row".to_string()))?;
+    // Mirror of the native store: an instance-scoped diagnostic with no event
+    // to link to gets a `diagnostic.recorded` event carrying it inline.
+    if diagnostic.instance_id.is_some() && diagnostic.event_id.is_none() {
+        let Some(instance_id) = diagnostic.instance_id else {
+            return Ok(diagnostic_id);
+        };
+        let payload = serde_json::json!({
+            "diagnostic_id": diagnostic_id,
+            "effect_id": diagnostic.effect_id,
+            "run_id": diagnostic.run_id,
+            "diagnostic": whipplescript_store::diagnostic_record_payload(&diagnostic)?,
+        })
+        .to_string();
+        do_append_event(
+            sql,
+            NewEvent {
+                instance_id,
+                event_type: "diagnostic.recorded",
+                payload_json: &payload,
+                source: "kernel",
+                causation_id: diagnostic.causation_id,
+                correlation_id: diagnostic.correlation_id,
+                idempotency_key: Some(&format!("diagnostic-recorded:{diagnostic_id}")),
+            },
+        )?;
+    }
+    Ok(diagnostic_id)
 }
 
 // ---------------------------------------------------------------------------
@@ -3940,6 +3968,50 @@ impl<Sql: DoSql> DoSqliteStore<Sql> {
             )
             .map_err(sql_err)?;
         Ok(event)
+    }
+}
+
+impl<Sql: DoSql> DoSqliteStore<Sql> {
+    /// Mirror of the native store's `record_terminal_refusal`: a stale terminal
+    /// the inner function refused with a `Conflict` -- rolled back, so recorded
+    /// nowhere -- leaves a `run.terminal_refused` event outside that
+    /// transaction. Not a terminal event, and idempotent per (run, attempted
+    /// status, reason).
+    fn record_terminal_refusal(
+        &mut self,
+        completion: EffectCompletion<'_>,
+        attempted_status: &str,
+        outcome: StoreResult<StoredEvent>,
+    ) -> StoreResult<StoredEvent> {
+        // Borrowed, so the original error is what gets returned: nothing is
+        // re-constructed here, and the caller sees exactly the refusal the
+        // inner function produced.
+        let Err(StoreError::Conflict(reason)) = &outcome else {
+            return outcome;
+        };
+        let payload = serde_json::json!({
+            "run_id": completion.run_id,
+            "effect_id": completion.effect_id,
+            "attempted_status": attempted_status,
+            "reason": reason,
+        })
+        .to_string();
+        do_append_event(
+            &self.sql,
+            NewEvent {
+                instance_id: completion.instance_id,
+                event_type: "run.terminal_refused",
+                payload_json: &payload,
+                source: "kernel",
+                causation_id: Some(completion.effect_id),
+                correlation_id: Some(completion.run_id),
+                idempotency_key: Some(&format!(
+                    "terminal-refused:{}:{}:{}",
+                    completion.run_id, attempted_status, reason
+                )),
+            },
+        )?;
+        outcome
     }
 }
 
@@ -5072,7 +5144,8 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
         diagnostic: Option<TerminalDiagnosticRecord>,
     ) -> StoreResult<StoredEvent> {
         let run_status = completion.status;
-        self.complete_effect_terminal_inner(completion, diagnostic, run_status)
+        let outcome = self.complete_effect_terminal_inner(completion, diagnostic, run_status);
+        self.record_terminal_refusal(completion, run_status, outcome)
     }
 
     fn resolve_effect_uncertain(
@@ -5080,7 +5153,8 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
         completion: EffectCompletion<'_>,
         diagnostic: Option<TerminalDiagnosticRecord>,
     ) -> StoreResult<StoredEvent> {
-        self.complete_effect_terminal_inner(completion, diagnostic, "uncertain")
+        let outcome = self.complete_effect_terminal_inner(completion, diagnostic, "uncertain");
+        self.record_terminal_refusal(completion, "uncertain", outcome)
     }
 
     fn claimable_effects(&self, instance_id: &str) -> StoreResult<Vec<ClaimableEffect>> {
@@ -6173,7 +6247,8 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
             .sql
             .query(
                 "SELECT event_id, payload_json, occurred_at FROM events \
-                 WHERE instance_id = ?1 AND event_type = 'effect.terminal' ORDER BY sequence",
+                 WHERE instance_id = ?1 AND event_type IN ('effect.terminal', 'diagnostic.recorded') \
+                 ORDER BY sequence",
                 &[text(instance_id)],
             )
             .map_err(sql_err)?;

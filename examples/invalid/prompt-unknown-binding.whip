@@ -1,0 +1,25 @@
+// Invalid: a `tell` prompt inside a rule body interpolates a binding that does
+// not exist. The value-position validators never see a prompt's prose, and the
+// scanned-body pass that does used to discard `Unbound` — the one answer that
+// says the root is nothing — so `{{ nosuchbinding.field }}` shipped as the
+// literal text of a read from nothing. D14, spec/diagnostic-quality-tracker.md.
+workflow PromptUnknownBinding
+
+output result Outcome
+
+class Outcome {
+  note string
+}
+
+agent worker {
+  provider fixture
+}
+
+rule start
+  when started
+=> {
+  tell worker """
+  Please look at {{ nosuchbinding.field }} and report.
+  """
+  complete result { note "ok" }
+}

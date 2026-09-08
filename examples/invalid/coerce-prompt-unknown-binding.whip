@@ -1,0 +1,53 @@
+// Invalid: a coerce prompt interpolates a binding that does not exist. A
+// coerce is a top-level item, so neither rule-body scanner ever saw its
+// prompt, and `validate_coerce_body_fields` checks only that the clauses are
+// the right clauses — the prompt's reads were checked by nobody, and a model
+// was sent the literal text of a read from nothing. `{{ ctx.output_format }}`
+// beside it is fine: `ctx` is a special root. D14,
+// spec/diagnostic-quality-tracker.md.
+use std.coercion
+use std.tracker
+
+@service
+workflow CoerceBranch
+
+# Work that needs a human is filed into the tracker; an operator picks it up
+# with `whip issue`. (Human review is the tracker, not a language construct.)
+tracker review {
+  provider builtin
+}
+
+
+# `coerce` turns unstructured work into typed schema-coercion output with failure handling.
+enum Priority {
+  Low
+  Normal
+  Urgent
+}
+
+class MessageClassification {
+  priority Priority
+  summary string
+  confidence float
+}
+
+class ClassifiedMessage {
+  request WorkItem
+  classification MessageClassification
+}
+
+coerce classifyMessage(title string, body string) -> MessageClassification {
+  prompt """markdown
+  Classify this work request.
+
+  Title:
+  {{ title }} {{ nosuchbinding.field }}
+
+  Body:
+  {{ body }}
+
+  Return a priority, summary, and confidence.
+
+  {{ ctx.output_format }}
+  """
+}

@@ -3133,7 +3133,68 @@ impl SqliteStore {
         diagnostic: Option<TerminalDiagnosticRecord>,
     ) -> StoreResult<StoredEvent> {
         let run_status = completion.status;
-        self.complete_effect_terminal_inner(completion, diagnostic, run_status)
+        let outcome = self.complete_effect_terminal_inner(completion, diagnostic, run_status);
+        self.record_terminal_refusal(completion, run_status, outcome)
+    }
+
+    /// A terminal the store REFUSED leaves a record of the refusal.
+    ///
+    /// `complete_effect_terminal_inner` refuses a stale completion -- the run
+    /// already has a terminal, or is not running -- with a `Conflict` returned
+    /// BEFORE `tx.commit()`, so its own append rolls back: no event, no
+    /// `diagnostics` row, nothing. The worker's `absorb_conflict` then prints
+    /// the message to stderr and continues, which is the right liveness call
+    /// (DR-0073 §2: a semantic refusal must not wedge the pass) and the wrong
+    /// evidence call: a worker that tried to complete a run someone else had
+    /// already settled is exactly the event an operator reading the log wants
+    /// to see, and it was recorded nowhere. This was the one D12 case with no
+    /// evidence to model, because the runtime wrote none.
+    ///
+    /// Recorded here, outside the rolled-back transaction, and NOT a terminal
+    /// event: `TerminaledRunStaysTerminal` and `NoDuplicateTerminalRunEvents`
+    /// assert the absence of a second terminal, and a refusal record is the
+    /// evidence of that absence rather than a violation of it. Idempotent per
+    /// (run, attempted status, reason), so a stale worker retrying each pass
+    /// does not grow the log.
+    ///
+    /// The inner function's ONLY `Conflict` returns are the two stale guards --
+    /// every other failure is a store error -- which is what lets a `Conflict`
+    /// here mean "refused as stale" without matching on message text.
+    fn record_terminal_refusal(
+        &mut self,
+        completion: EffectCompletion<'_>,
+        attempted_status: &str,
+        outcome: StoreResult<StoredEvent>,
+    ) -> StoreResult<StoredEvent> {
+        // Borrowed, so the original error is what gets returned: nothing is
+        // re-constructed here, and the caller sees exactly the refusal the
+        // inner function produced.
+        let Err(StoreError::Conflict(reason)) = &outcome else {
+            return outcome;
+        };
+        let payload = json!({
+            "run_id": completion.run_id,
+            "effect_id": completion.effect_id,
+            "attempted_status": attempted_status,
+            "reason": reason,
+        })
+        .to_string();
+        append_event_on(
+            &self.connection,
+            NewEvent {
+                instance_id: completion.instance_id,
+                event_type: "run.terminal_refused",
+                payload_json: &payload,
+                source: "kernel",
+                causation_id: Some(completion.effect_id),
+                correlation_id: Some(completion.run_id),
+                idempotency_key: Some(&format!(
+                    "terminal-refused:{}:{}:{}",
+                    completion.run_id, attempted_status, reason
+                )),
+            },
+        )?;
+        outcome
     }
 
     /// Recovery resolution: record a distinct `uncertain` run status while the
@@ -3146,7 +3207,8 @@ impl SqliteStore {
         completion: EffectCompletion<'_>,
         diagnostic: Option<TerminalDiagnosticRecord>,
     ) -> StoreResult<StoredEvent> {
-        self.complete_effect_terminal_inner(completion, diagnostic, "uncertain")
+        let outcome = self.complete_effect_terminal_inner(completion, diagnostic, "uncertain");
+        self.record_terminal_refusal(completion, "uncertain", outcome)
     }
 
     fn complete_effect_terminal_inner(
@@ -4750,7 +4812,7 @@ impl SqliteStore {
             SELECT event_id, payload_json, occurred_at
             FROM events
             WHERE instance_id = ?1
-              AND event_type = 'effect.terminal'
+              AND event_type IN ('effect.terminal', 'diagnostic.recorded')
             ORDER BY sequence
             "#,
         )?;
@@ -8785,6 +8847,41 @@ fn insert_evidence_link_on(connection: &Connection, link: EvidenceLink<'_>) -> S
 }
 
 #[cfg(feature = "native")]
+/// Append the `diagnostic.recorded` event that makes an orphan diagnostic
+/// reachable from the instance log. Carries the diagnostic inline, the way
+/// `effect.terminal` carries its own, so `list_diagnostics_from_events` and the
+/// trace reconstructor read it with no side-table join.
+fn record_orphan_diagnostic_event(
+    connection: &Connection,
+    diagnostic: &DiagnosticRecord<'_>,
+    diagnostic_id: &str,
+) -> StoreResult<()> {
+    let Some(instance_id) = diagnostic.instance_id else {
+        return Ok(());
+    };
+    let payload = json!({
+        "diagnostic_id": diagnostic_id,
+        "effect_id": diagnostic.effect_id,
+        "run_id": diagnostic.run_id,
+        "diagnostic": diagnostic_record_payload(diagnostic)?,
+    })
+    .to_string();
+    append_event_on(
+        connection,
+        NewEvent {
+            instance_id,
+            event_type: "diagnostic.recorded",
+            payload_json: &payload,
+            source: "kernel",
+            causation_id: diagnostic.causation_id,
+            correlation_id: diagnostic.correlation_id,
+            idempotency_key: Some(&format!("diagnostic-recorded:{diagnostic_id}")),
+        },
+    )?;
+    Ok(())
+}
+
+#[cfg(feature = "native")]
 fn insert_diagnostic_on(
     connection: &Connection,
     diagnostic: DiagnosticRecord<'_>,
@@ -8799,9 +8896,8 @@ fn insert_diagnostic_on(
         return Ok(existing_id);
     }
 
-    connection
-        .query_row(
-            r#"
+    let diagnostic_id: String = connection.query_row(
+        r#"
             INSERT INTO diagnostics (
                 diagnostic_id,
                 instance_id,
@@ -8846,29 +8942,40 @@ fn insert_diagnostic_on(
             )
             RETURNING diagnostic_id
             "#,
-            params![
-                diagnostic.instance_id,
-                diagnostic.program_id,
-                diagnostic.program_version_id,
-                diagnostic.severity.as_str(),
-                diagnostic.code.map(DurableDiagnosticCode::text),
-                diagnostic.message,
-                diagnostic.source_span_json,
-                diagnostic.subject_type,
-                diagnostic.subject_id,
-                diagnostic.event_id,
-                diagnostic.effect_id,
-                diagnostic.run_id,
-                diagnostic.assertion_id,
-                diagnostic.evidence_ids_json,
-                diagnostic.artifact_ids_json,
-                diagnostic.causation_id,
-                diagnostic.correlation_id,
-                diagnostic.idempotency_key,
-            ],
-            |row| row.get::<_, String>(0),
-        )
-        .map_err(Into::into)
+        params![
+            diagnostic.instance_id,
+            diagnostic.program_id,
+            diagnostic.program_version_id,
+            diagnostic.severity.as_str(),
+            diagnostic.code.map(DurableDiagnosticCode::text),
+            diagnostic.message,
+            diagnostic.source_span_json,
+            diagnostic.subject_type,
+            diagnostic.subject_id,
+            diagnostic.event_id,
+            diagnostic.effect_id,
+            diagnostic.run_id,
+            diagnostic.assertion_id,
+            diagnostic.evidence_ids_json,
+            diagnostic.artifact_ids_json,
+            diagnostic.causation_id,
+            diagnostic.correlation_id,
+            diagnostic.idempotency_key,
+        ],
+        |row| row.get::<_, String>(0),
+    )?;
+    // A diagnostic no event points at is reachable from the log now. `event_id`
+    // is the link that runs event <- diagnostic; when a caller has none to give,
+    // the row was a side-table orphan the trace plane could not see -- the
+    // `cancel.noop` a rule writes on settled work, the `revision.*` refusals --
+    // and D12's "the log explains the denial" could not be stated over it.
+    // Instance-scoped only: a program-level diagnostic has no instance log to
+    // join. The idempotent early return above means a re-recorded diagnostic
+    // appends no second event.
+    if diagnostic.instance_id.is_some() && diagnostic.event_id.is_none() {
+        record_orphan_diagnostic_event(connection, &diagnostic, &diagnostic_id)?;
+    }
+    Ok(diagnostic_id)
 }
 
 #[cfg(feature = "native")]
@@ -11161,6 +11268,29 @@ fn effect_completion_payload(
         "diagnostic": diagnostic.map(terminal_diagnostic_payload).transpose()?,
     })
     .to_string())
+}
+
+/// The inline form of a diagnostic no event points at, in the shape
+/// `list_diagnostics_from_events` already reads for `effect.terminal`. Not
+/// `native`-gated: the durable-object mirror builds the same payload.
+pub fn diagnostic_record_payload(diagnostic: &DiagnosticRecord<'_>) -> StoreResult<Value> {
+    let source_span = diagnostic
+        .source_span_json
+        .map(serde_json::from_str::<Value>)
+        .transpose()?;
+    Ok(json!({
+        "program_id": diagnostic.program_id,
+        "program_version_id": diagnostic.program_version_id,
+        "severity": diagnostic.severity.as_str(),
+        "code": diagnostic.code.as_ref().map(DurableDiagnosticCode::as_str),
+        "message": diagnostic.message,
+        "source_span": source_span,
+        "subject_type": diagnostic.subject_type,
+        "subject_id": diagnostic.subject_id,
+        "assertion_id": diagnostic.assertion_id,
+        "evidence_ids": serde_json::from_str::<Value>(diagnostic.evidence_ids_json)?,
+        "artifact_ids": serde_json::from_str::<Value>(diagnostic.artifact_ids_json)?,
+    }))
 }
 
 #[cfg(feature = "native")]
@@ -14908,6 +15038,226 @@ mod tests {
         assert_eq!(cleared.policy_block_category, None);
     }
 
+    /// A stale completion used to be refused inside a transaction that then
+    /// rolled back, so the refusal left nothing: no event, no row, one line on
+    /// the worker's stderr. It is recorded now, outside that transaction, as
+    /// `run.terminal_refused` -- never a terminal event, and idempotent per
+    /// (run, attempted status, reason) so a stale worker retrying each pass
+    /// does not grow the log.
+    #[test]
+    fn a_stale_terminal_is_refused_and_the_refusal_is_recorded() {
+        let mut store = SqliteStore::open_in_memory().expect("store opens");
+        store
+            .commit_rule(RuleCommit {
+                instance_id: "instance-a",
+                rule: "start",
+                trigger_event_id: None,
+                facts: &[],
+                consumed_fact_ids: &[],
+                effects: &[test_effect("tell", "agent.tell", "rule=start;effect=tell")],
+                dependencies: &[],
+                terminal: None,
+                idempotency_key: Some("commit-start"),
+                marks: &[],
+                context_json: None,
+            })
+            .expect("rule commit succeeds");
+        store
+            .start_run(RunStart {
+                instance_id: "instance-a",
+                effect_id: "tell",
+                run_id: "run-1",
+                provider: "test",
+                worker_id: "w",
+                lease_id: "lease-1",
+                lease_expires_at: "2030-01-01T00:00:00Z",
+                metadata_json: "{}",
+            })
+            .expect("run starts");
+        let completion = EffectCompletion {
+            instance_id: "instance-a",
+            effect_id: "tell",
+            run_id: "run-1",
+            provider: "test",
+            worker_id: "w",
+            status: "completed",
+            exit_code: Some(0),
+            summary: None,
+            metadata_json: "{}",
+            idempotency_key: Some("terminal-1"),
+        };
+        store
+            .complete_effect_with_terminal_diagnostic(completion, None)
+            .expect("first terminal lands");
+
+        // The stale worker's second attempt is REFUSED ...
+        let failed = EffectCompletion {
+            status: "failed",
+            idempotency_key: Some("terminal-2"),
+            ..completion
+        };
+        let refused = store.complete_effect_with_terminal_diagnostic(failed, None);
+        assert!(
+            matches!(refused, Err(StoreError::Conflict(_))),
+            "a second terminal must be refused: {refused:?}"
+        );
+        let refusals = |store: &SqliteStore| -> Vec<String> {
+            store
+                .connection
+                .prepare(
+                    "SELECT payload_json FROM events WHERE instance_id = 'instance-a' \
+                     AND event_type = 'run.terminal_refused' ORDER BY sequence",
+                )
+                .expect("prepare")
+                .query_map([], |row| row.get::<_, String>(0))
+                .expect("query")
+                .collect::<Result<Vec<_>, _>>()
+                .expect("rows")
+        };
+        // ... and RECORDED, naming the run, what was attempted, and why.
+        let recorded = refusals(&store);
+        assert_eq!(recorded.len(), 1, "one refusal recorded: {recorded:?}");
+        let payload: serde_json::Value = serde_json::from_str(&recorded[0]).expect("json");
+        assert_eq!(payload["run_id"], "run-1");
+        assert_eq!(payload["attempted_status"], "failed");
+        assert_eq!(payload["reason"], "run already has a terminal completion");
+
+        // Never a terminal event: exactly one `effect.terminal` stands.
+        let terminals: i64 = store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE instance_id = 'instance-a' \
+                 AND event_type = 'effect.terminal'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count");
+        assert_eq!(terminals, 1);
+
+        // Retrying the same stale attempt writes nothing new.
+        let again = store.complete_effect_with_terminal_diagnostic(failed, None);
+        assert!(matches!(again, Err(StoreError::Conflict(_))));
+        assert_eq!(
+            refusals(&store).len(),
+            1,
+            "a retried refusal is not a second record"
+        );
+    }
+
+    /// A diagnostic recorded with no event to link to was a side-table row the
+    /// instance log could not reach -- `cancel.noop`, the `revision.*` family.
+    /// It gets a `diagnostic.recorded` event now, carrying it inline, so
+    /// `list_diagnostics_from_events` finds it beside the terminal diagnostics
+    /// it already reads. A diagnostic that HAS an event to link to gets none:
+    /// the link already runs the other way.
+    #[test]
+    fn an_orphan_diagnostic_is_reachable_from_the_log() {
+        let mut store = SqliteStore::open_in_memory().expect("store opens");
+        store
+            .commit_rule(RuleCommit {
+                instance_id: "instance-a",
+                rule: "start",
+                trigger_event_id: None,
+                facts: &[],
+                consumed_fact_ids: &[],
+                effects: &[test_effect("tell", "agent.tell", "rule=start;effect=tell")],
+                dependencies: &[],
+                terminal: None,
+                idempotency_key: Some("commit-start"),
+                marks: &[],
+                context_json: None,
+            })
+            .expect("rule commit succeeds");
+        fn record<'a>(event_id: Option<&'a str>, key: &'a str) -> DiagnosticRecord<'a> {
+            DiagnosticRecord {
+                instance_id: Some("instance-a"),
+                program_id: None,
+                program_version_id: None,
+                severity: Severity::Info,
+                code: Some(DurableDiagnosticCode::Registered(
+                    whipplescript_core::runtime_diagnostic_code!("cancel.noop"),
+                )),
+                message: "rule `start` cancelled effect `tell` after it reached a terminal status",
+                source_span_json: None,
+                subject_type: Some("effect"),
+                subject_id: Some("tell"),
+                event_id,
+                effect_id: Some("tell"),
+                run_id: None,
+                assertion_id: None,
+                evidence_ids_json: "[]",
+                artifact_ids_json: "[]",
+                causation_id: None,
+                correlation_id: None,
+                idempotency_key: Some(key),
+            }
+        }
+
+        // An orphan: reachable from the log, inline, with its code.
+        let orphan_id = store
+            .record_diagnostic(record(None, "noop-1"))
+            .expect("recorded");
+        let from_events = store
+            .list_diagnostics_from_events("instance-a")
+            .expect("readable from events");
+        let reached = from_events
+            .iter()
+            .find(|view| view.code.as_deref() == Some("cancel.noop"))
+            .expect("the orphan is reachable from the instance log");
+        assert_eq!(reached.subject_id.as_deref(), Some("tell"));
+        let events: i64 = store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE instance_id = 'instance-a' \
+                 AND event_type = 'diagnostic.recorded'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count");
+        assert_eq!(events, 1);
+
+        // Recording the same diagnostic again is the idempotent no-op it always
+        // was, and appends no second event.
+        let again = store
+            .record_diagnostic(record(None, "noop-1"))
+            .expect("re-recorded");
+        assert_eq!(again, orphan_id);
+        let events_after: i64 = store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE instance_id = 'instance-a' \
+                 AND event_type = 'diagnostic.recorded'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count");
+        assert_eq!(events_after, 1, "a re-recorded diagnostic appends no event");
+
+        // A diagnostic that already links to an event gets no event of its own.
+        let linked_event = store
+            .connection
+            .query_row(
+                "SELECT event_id FROM events WHERE instance_id = 'instance-a' \
+                 ORDER BY sequence LIMIT 1",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .expect("an event to link to");
+        store
+            .record_diagnostic(record(Some(&linked_event), "noop-2"))
+            .expect("linked diagnostic recorded");
+        let events_linked: i64 = store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE instance_id = 'instance-a' \
+                 AND event_type = 'diagnostic.recorded'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count");
+        assert_eq!(events_linked, 1, "a linked diagnostic is not an orphan");
+    }
+
     #[test]
     fn replay_reconstructs_facts_effects_and_dependencies_from_events() {
         let mut store = SqliteStore::open_in_memory().expect("store opens");
@@ -15094,7 +15444,11 @@ mod tests {
         let duplicate = store.complete_effect(test_completion("run-1"));
 
         assert!(duplicate.is_err());
-        assert_eq!(row_count(&store, "events"), 3);
+        // The duplicate's own terminal rolled back, and the refusal is recorded
+        // (D12): one more event than before, and it is not a terminal.
+        assert_eq!(row_count(&store, "events"), 4);
+        assert_eq!(events_of(&store, "effect.terminal"), 1);
+        assert_eq!(events_of(&store, "run.terminal_refused"), 1);
         assert_eq!(row_count(&store, "runs"), 1);
     }
 
@@ -15295,7 +15649,10 @@ mod tests {
         });
 
         assert!(contradictory.is_err());
-        assert_eq!(row_count(&store, "events"), 3);
+        // Rolled back, and the refusal recorded (D12): not a second terminal.
+        assert_eq!(row_count(&store, "events"), 4);
+        assert_eq!(events_of(&store, "effect.terminal"), 1);
+        assert_eq!(events_of(&store, "run.terminal_refused"), 1);
         let runs = store.list_runs("instance-a").expect("runs list");
         assert_eq!(runs[0].status, "completed");
         let terminal_events = store
@@ -15336,7 +15693,11 @@ mod tests {
         let completion = store.complete_effect(test_completion("run-1"));
 
         assert!(completion.is_err());
-        assert_eq!(row_count(&store, "events"), 1);
+        // No run, so no terminal -- and the refusal is recorded (D12), which is
+        // the one event this leaves beyond the commit.
+        assert_eq!(row_count(&store, "events"), 2);
+        assert_eq!(events_of(&store, "effect.terminal"), 0);
+        assert_eq!(events_of(&store, "run.terminal_refused"), 1);
         assert_eq!(row_count(&store, "runs"), 0);
         assert_eq!(effect_status(&store, "tell"), "queued");
     }
@@ -21847,6 +22208,20 @@ mod tests {
             metadata_json: "{}",
             idempotency_key: None,
         }
+    }
+
+    /// Events of one type, for the assertions below that say what a refused
+    /// terminal leaves: one `run.terminal_refused` and never a second
+    /// `effect.terminal`. Counting the whole table hid the distinction.
+    fn events_of(store: &SqliteStore, event_type: &str) -> i64 {
+        store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE event_type = ?1",
+                [event_type],
+                |row| row.get(0),
+            )
+            .expect("count")
     }
 
     fn row_count(store: &SqliteStore, table: &str) -> i64 {

@@ -7283,6 +7283,128 @@ agent worker {
 /// same mistake and now draw the same diagnostic. The prose the guard was
 /// standing in for is asserted in the same breath, because deleting it must not
 /// bring the false positive back. D14, spec/diagnostic-quality-tracker.md.
+/// D14, the hole as reported: `{{ nosuchbinding.field }}` in a coerce's
+/// `prompt """..."""` compiled clean. A coerce is a top-level item the rule-body
+/// scanners never see, and its own validator checked only the clauses, so the
+/// D14: a `tell` prompt inside a rule body reads a binding or nothing. The
+/// scanned-body pass is the ONLY producer for a prompt's interpolations -- the
+/// value-position validators never see prose -- and it used to discard
+/// `Unbound`, so this compiled clean. Disabling that arm again is what makes
+/// this test go green for the wrong reason, which is the mutation
+/// `check-new-refusals` asks.
+#[test]
+fn a_rule_body_prompt_reads_a_binding_or_nothing() {
+    let program = |prompt_line: &str| {
+        format!(
+            r#"workflow W
+
+output result Outcome
+
+class Outcome {{
+  note string
+}}
+
+agent worker {{
+  provider fixture
+}}
+
+rule start
+  when started
+=> {{
+  tell worker """
+  {prompt_line}
+  """
+  complete result {{ note "ok" }}
+}}
+"#
+        )
+    };
+    let unknown = |prompt_line: &str| -> Vec<String> {
+        compile_program(&program(prompt_line))
+            .diagnostics
+            .iter()
+            .filter(|d| d.code.as_str() == "type.unknown_binding")
+            .map(|d| d.message.clone())
+            .collect()
+    };
+    let refused = unknown("Look at {{ nosuchbinding.field }} and report.");
+    assert_eq!(refused.len(), 1, "{refused:?}");
+    assert_eq!(
+        refused[0],
+        "rule `start` has unknown binding `nosuchbinding`"
+    );
+    // One missing root read twice is one mistake.
+    assert_eq!(
+        unknown("{{ nosuchbinding.a }} then {{ nosuchbinding.b }}").len(),
+        1
+    );
+    // A special root is not a binding and is not refused.
+    assert!(unknown("Format: {{ ctx.output_format }}").is_empty());
+}
+
+/// prompt's reads were checked by nobody.
+#[test]
+fn a_coerce_prompt_reads_only_its_parameters_and_special_roots() {
+    let program = |prompt_line: &str| {
+        format!(
+            r#"workflow W
+
+output result Outcome
+
+class Outcome {{
+  note string
+}}
+
+class Verdict {{
+  summary string
+}}
+
+coerce classify(title string, body string) -> Verdict {{
+  prompt """markdown
+  Classify this request.
+  {{{{ title }}}}
+  {prompt_line}
+  {{{{ body }}}}
+  {{{{ ctx.output_format }}}}
+  """
+}}
+
+rule start
+  when started
+=> {{
+  succeed result {{ note "ok" }}
+}}
+"#
+        )
+    };
+    let unknown = |prompt_line: &str| -> Vec<String> {
+        compile_program(&program(prompt_line))
+            .diagnostics
+            .iter()
+            .filter(|d| d.code.as_str() == "type.unknown_binding")
+            .map(|d| d.message.clone())
+            .collect()
+    };
+
+    // A read from a binding that does not exist is refused, and the message
+    // names the coerce and the root.
+    let refused = unknown("Priority: {{ nosuchbinding.field }}");
+    assert_eq!(refused.len(), 1, "{refused:?}");
+    assert!(
+        refused[0].contains("coerce `classify` has unknown binding `nosuchbinding` in its prompt")
+    );
+
+    // One missing root read twice is one mistake.
+    assert_eq!(
+        unknown("{{ nosuchbinding.a }} and {{ nosuchbinding.b }}").len(),
+        1
+    );
+
+    // A parameter and a special root are not.
+    assert!(unknown("Body again: {{ body }}").is_empty());
+    assert!(unknown("Format: {{ ctx.output_format }}").is_empty());
+}
+
 #[test]
 fn a_quoted_value_is_still_checked_for_its_bindings() {
     const PRELUDE: &str = r#"workflow W
@@ -10712,6 +10834,14 @@ fn invalid_fixtures_have_actionable_diagnostics() {
         (
             "prompt-body-field-paths",
             include_str!("../../../../examples/invalid/prompt-body-field-paths.whip"),
+        ),
+        (
+            "prompt-unknown-binding",
+            include_str!("../../../../examples/invalid/prompt-unknown-binding.whip"),
+        ),
+        (
+            "coerce-prompt-unknown-binding",
+            include_str!("../../../../examples/invalid/coerce-prompt-unknown-binding.whip"),
         ),
     ];
 

@@ -14,7 +14,7 @@
 #     actually checks it). Removing it from the model fails the gate.
 # A row can only be added/removed by changing all three in lockstep.
 #
-# The last six rows are the D12 RUNTIME EVIDENCE half (spec/error-handling.md
+# The last nine rows are the D12 RUNTIME EVIDENCE half (spec/error-handling.md
 # "Runtime And TLA+/Trace Obligations"). The rows above them say the denied work
 # does not happen; these say the log explains why it did not. Their TLA
 # counterparts are additionally guarded against vacuity: three witness
@@ -38,5 +38,8 @@ capability_denial_names_subject	denial reason does not name the denied subject	D
 denial_diagnostic_code_registered	unregistered denial diagnostic code	DenialEvidenceCodeIsRegistered
 script_denial_carries_disabled_code	denies a script capability without the	ScriptDenialCarriesItsDiagnosticId
 assertion_failure_evidence	assertion failure evidence names no assertion	AssertionFailureNamesItsAssertion
+assertion_failure_carries_code	unregistered assertion diagnostic code	AssertionFailureCarriesRegisteredCode
 terminal_diagnostic_carries_code	carries no diagnostic code	TerminalDiagnosticCarriesCode
 terminal_diagnostic_names_effect	provider diagnostic subject	TerminalDiagnosticNamesItsRunEffect
+terminal_refusal_names_a_settled_run	refused a terminal for a run that is still running	RefusedTerminalWasNotRunning
+orphan_diagnostic_carries_code	carries no diagnostic code: None	OrphanDiagnosticCarriesCode

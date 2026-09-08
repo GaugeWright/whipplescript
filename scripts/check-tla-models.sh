@@ -255,6 +255,8 @@ evidence_witness() {
 evidence_witness NoDenialEvidenceWitness      "denial evidence"
 evidence_witness NoAssertionEvidenceWitness   "assertion failure evidence"
 evidence_witness NoTerminalDiagnosticWitness  "terminal diagnostics"
+evidence_witness NoRefusedTerminalWitness    "refused terminals"
+evidence_witness NoOrphanDiagnosticWitness   "orphan diagnostics"
 
 # Delete the guard line carrying MARKER and require the NAMED invariant to break.
 evidence_bite() {
@@ -290,6 +292,8 @@ evidence_bite 'THE EVIDENCE NAMES ITS ASSERTION'      AssertionFailureNamesItsAs
 evidence_bite 'THE ASSERTION CODE IS REGISTERED'      AssertionFailureCarriesRegisteredCode
 evidence_bite 'THE SCRIPT DENIAL CARRIES ITS ID'     ScriptDenialCarriesItsDiagnosticId
 evidence_bite 'THE TERMINAL DIAGNOSTIC CARRIES A CODE' TerminalDiagnosticCarriesCode
+evidence_bite 'THE REFUSAL NAMES A SETTLED RUN'      RefusedTerminalWasNotRunning
+evidence_bite 'THE ORPHAN CARRIES A CODE'           OrphanDiagnosticCarriesCode
 
 # The two denial guards sit in one action and write one record; if either could
 # stand in for the other the pair would really be one invariant. It cannot:
