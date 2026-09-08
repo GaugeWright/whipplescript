@@ -4,8 +4,9 @@
 //! The distinction is the whole of DR-0066's content-plane argument, and it is
 //! easy to lose in implementation. A *replica* has an independent write path,
 //! so it can diverge and a reader cannot tell which copy is right. A *cache*
-//! holds `hash → bytes` entries that can never change, so it has nothing to
-//! diverge about — it can be colder or slower than the authority, never wrong.
+//! holds `hash → bytes` entries whose identity cannot change. Availability can
+//! change: an authority may erase or collect content after the cache warmed.
+//! Hash verification proves identity, not current availability (DR-0099).
 //!
 //! One rule makes the difference, and it is the rule this type exists to
 //! enforce: **a cache may never answer "I don't have it" on its own.** A miss
@@ -35,8 +36,8 @@ use crate::StoreResult;
 
 /// An authority with a cache in front of it.
 ///
-/// Reads consult the cache, fall through to the authority on a miss, and
-/// populate on the way back. Writes go to the authority — a cache is never a
+/// Reads check cached identity and authoritative availability, fall through on
+/// a miss, and populate on the way back. Writes go to the authority — a cache is never a
 /// place where content originates, because content that exists only in a cache
 /// is content the authority cannot serve to anyone else.
 pub struct ReadThrough<C, A> {
@@ -76,14 +77,12 @@ impl<C: ContentBlobs, A: ContentBlobs> ContentBlobs for ReadThrough<C, A> {
 
     fn get(&self, id: &str) -> StoreResult<Option<String>> {
         if let Some(body) = self.cache.get(id)? {
-            // THE VERIFICATION (DR-0066 §3). This is the boundary the whole
-            // cache-is-not-a-replica argument rests on: a cache "can never be
-            // wrong, only colder", and that is a property of content addressing
-            // only if somebody actually checks. Unverified, this line hands the
-            // caller whatever the cache said — which is the silent-wrong-bytes
-            // failure the substrate exists to exclude, reached through the one
-            // component added for speed.
+            // Identity verification never substitutes for the subsequent
+            // authority check: correctly hashed bytes may have been erased.
             crate::content::verify_body(id, &body, "read-through cache")?;
+            if !self.authority.cached_read_available(id)? {
+                return Ok(None);
+            }
             return Ok(Some(body));
         }
         // THE PULL-THROUGH. Without this the cache's emptiness would be
@@ -99,18 +98,15 @@ impl<C: ContentBlobs, A: ContentBlobs> ContentBlobs for ReadThrough<C, A> {
         Ok(Some(body))
     }
 
-    /// Status is answered by the AUTHORITY whenever the cache does not hold the
-    /// bytes, and this is the clause that keeps a cache from becoming a replica.
-    ///
-    /// A cache holding the bytes proves `Live`; that much it may answer alone.
-    /// It can never prove `Erased` or `Unknown` — those are statements about
-    /// what the authority knows, and a cache asserting them from its own
-    /// emptiness would report content as gone that is merely elsewhere.
+    /// Status is always the authority's observation. A cache copy proves neither
+    /// current availability nor erasure. Chunk-root status describes the root
+    /// record; `get` additionally proves that its payload can be reassembled.
     fn status(&self, id: &str) -> StoreResult<BlobStatus> {
-        if let BlobStatus::Live { byte_len } = self.cache.status(id)? {
-            return Ok(BlobStatus::Live { byte_len });
-        }
         self.authority.status(id)
+    }
+
+    fn cached_read_available(&self, id: &str) -> StoreResult<bool> {
+        self.authority.cached_read_available(id)
     }
 
     /// Erasure must remove the bytes, so it reaches the authority — and then
@@ -124,10 +120,7 @@ impl<C: ContentBlobs, A: ContentBlobs> ContentBlobs for ReadThrough<C, A> {
     }
 
     fn chunk_ids(&self, id: &str) -> StoreResult<Option<Vec<String>>> {
-        match self.cache.chunk_ids(id)? {
-            Some(ids) => Ok(Some(ids)),
-            None => self.authority.chunk_ids(id),
-        }
+        self.authority.chunk_ids(id)
     }
 
     fn put_chunk_root(
@@ -140,6 +133,52 @@ impl<C: ContentBlobs, A: ContentBlobs> ContentBlobs for ReadThrough<C, A> {
             .put_chunk_root(root_id, chunk_ids, byte_len)?;
         let _ = self.cache.put_chunk_root(root_id, chunk_ids, byte_len);
         Ok(())
+    }
+}
+
+/// Both real content authorities run the same warm-cache erasure obligation.
+#[doc(hidden)]
+pub mod conformance {
+    use super::*;
+    use std::{cell::RefCell, collections::BTreeMap};
+
+    /// Deliberately cannot erase: authority erasure must still stop its reads.
+    #[derive(Default)]
+    struct RetainingCache(RefCell<BTreeMap<String, String>>);
+    impl ContentBlobs for RetainingCache {
+        fn put(&self, body: &str) -> StoreResult<String> {
+            let id = crate::stable_hash_hex(body);
+            self.0.borrow_mut().insert(id.clone(), body.to_owned());
+            Ok(id)
+        }
+        fn get(&self, id: &str) -> StoreResult<Option<String>> {
+            Ok(self.0.borrow().get(id).cloned())
+        }
+    }
+
+    pub fn check(authority: impl ContentBlobs) {
+        let layered = ReadThrough::new(RetainingCache::default(), authority);
+        for (body, direct) in [("erased at authority", true), ("cache cannot erase", false)] {
+            let id = layered.put(body).expect("prepare");
+            assert_eq!(layered.get(&id).expect("warm read").as_deref(), Some(body));
+            let outcome = if direct {
+                layered.authority().erase(&id, "2026-09-08T00:00:00Z")
+            } else {
+                layered.erase(&id, "2026-09-08T00:00:00Z")
+            }
+            .expect("erase");
+            assert!(matches!(outcome, EraseOutcome::Erased { .. }));
+            assert!(layered
+                .cache
+                .get(&id)
+                .expect("cache retained bytes")
+                .is_some());
+            assert_eq!(layered.get(&id).expect("read after erasure"), None);
+            assert!(matches!(
+                layered.status(&id).expect("status"),
+                BlobStatus::Erased { .. }
+            ));
+        }
     }
 }
 
@@ -156,6 +195,8 @@ mod tests {
         stored: RefCell<BTreeMap<String, String>>,
         erased: RefCell<BTreeMap<String, u64>>,
         gets: RefCell<usize>,
+        statuses: RefCell<usize>,
+        unavailable: std::cell::Cell<bool>,
     }
 
     impl CountingBlobs {
@@ -184,9 +225,16 @@ mod tests {
         }
         fn get(&self, id: &str) -> StoreResult<Option<String>> {
             *self.gets.borrow_mut() += 1;
+            if self.unavailable.get() {
+                return Err(crate::StoreError::Conflict("authority unavailable".into()));
+            }
             Ok(self.stored.borrow().get(id).cloned())
         }
         fn status(&self, id: &str) -> StoreResult<BlobStatus> {
+            *self.statuses.borrow_mut() += 1;
+            if self.unavailable.get() {
+                return Err(crate::StoreError::Conflict("authority unavailable".into()));
+            }
             if let Some(body) = self.stored.borrow().get(id) {
                 return Ok(BlobStatus::Live {
                     byte_len: body.len() as u64,
@@ -245,6 +293,54 @@ mod tests {
         fn status(&self, _id: &str) -> StoreResult<BlobStatus> {
             Ok(BlobStatus::Live { byte_len: 29 })
         }
+        fn chunk_ids(&self, _id: &str) -> StoreResult<Option<Vec<String>>> {
+            Ok(Some(vec!["invented cache structure".into()]))
+        }
+    }
+
+    #[test]
+    fn chunk_structure_comes_from_the_authority() {
+        let layered = ReadThrough::new(LyingBlobs, CountingBlobs::default());
+        assert_eq!(layered.chunk_ids("unknown").expect("structure"), None);
+    }
+
+    #[test]
+    fn a_plain_authority_cannot_acknowledge_chunk_structure_it_does_not_store() {
+        let layered = layered();
+        let chunk = layered.put("chunk").expect("prepare chunk");
+        let root = crate::stable_hash_hex("chunkchunk");
+        let error = layered
+            .put_chunk_root(&root, &[chunk.clone(), chunk], 10)
+            .expect_err("an authority without a chunk tier must refuse the root");
+        assert!(matches!(error, crate::StoreError::Conflict(message)
+            if message == "this content store has no chunk tier"));
+        assert_eq!(layered.get(&root).expect("no root published"), None);
+    }
+
+    #[test]
+    fn root_metadata_cannot_substitute_for_an_availability_observation() {
+        // A root whose payload was already unavailable is observed as live;
+        // its structure then disappears under collection. Two separate
+        // metadata reads would misclassify it as an available plain blob.
+        struct VanishingRoot;
+        impl ContentBlobs for VanishingRoot {
+            fn put(&self, body: &str) -> StoreResult<String> {
+                Ok(crate::stable_hash_hex(body))
+            }
+            fn get(&self, _: &str) -> StoreResult<Option<String>> {
+                Ok(None)
+            }
+            fn status(&self, _: &str) -> StoreResult<BlobStatus> {
+                Ok(BlobStatus::Live { byte_len: 6 })
+            }
+            fn chunk_ids(&self, _: &str) -> StoreResult<Option<Vec<String>>> {
+                Ok(None)
+            }
+        }
+        let layered = ReadThrough::new(CountingBlobs::default(), VanishingRoot);
+        let id = layered.put("cached").expect("warm");
+        assert!(layered.cache.get(&id).expect("cache").is_some());
+        assert_eq!(layered.get(&id).expect("unavailable root"), None);
     }
 
     /// DR-0066 §3 on the cache side: the substrate's most emphatic obligation,
@@ -318,12 +414,12 @@ mod tests {
 
         assert_eq!(layered.get(&id).expect("get").as_deref(), Some("body"));
         let after_first = layered.authority().gets();
-        // Second read is served by the cache: the authority is not touched.
+        // This opaque backend uses the conservative availability default.
         assert_eq!(layered.get(&id).expect("get").as_deref(), Some("body"));
         assert_eq!(
             layered.authority().gets(),
-            after_first,
-            "a populated cache must not re-ask the authority"
+            after_first + 1,
+            "an opaque authority must prove full payload availability"
         );
     }
 
@@ -346,13 +442,13 @@ mod tests {
         assert!(layered.get(&id).expect("get").is_some());
     }
 
-    /// A cache may prove `Live` on its own — it is holding the bytes — but the
-    /// asymmetry is deliberate: presence is self-evident, absence never is.
+    /// Holding bytes does not prove the authority still permits availability.
     #[test]
-    fn a_warm_cache_answers_live_without_the_authority() {
+    fn a_warm_cache_checks_authoritative_status_without_refetching_bytes() {
         let layered = layered();
         let id = layered.put("cached").expect("put");
         let before = layered.authority().gets();
+        let statuses = *layered.authority().statuses.borrow();
         assert!(matches!(
             layered.status(&id).expect("status"),
             BlobStatus::Live { .. }
@@ -360,7 +456,62 @@ mod tests {
         assert_eq!(
             layered.authority().gets(),
             before,
-            "a cache holding the bytes need not ask"
+            "status does not need a payload fetch"
+        );
+        assert_eq!(*layered.authority().statuses.borrow(), statuses + 1);
+    }
+
+    #[test]
+    fn warm_bytes_cannot_override_absence_or_failed_authority_checks() {
+        let layered = layered();
+        let id = layered.put("cached private payload").expect("put");
+        layered.authority().unavailable.set(true);
+        assert!(layered.get(&id).is_err());
+        assert!(layered.status(&id).is_err());
+        layered.authority().unavailable.set(false);
+        layered.authority().stored.borrow_mut().remove(&id);
+        assert_eq!(layered.get(&id).expect("missing at authority"), None);
+        assert_eq!(layered.status(&id).expect("status"), BlobStatus::Unknown);
+    }
+
+    #[cfg(feature = "native")]
+    #[test]
+    fn native_authority_erasure_overrides_a_retaining_cache() {
+        conformance::check(crate::content::ContentStore::open(":memory:").expect("store"));
+    }
+
+    #[cfg(feature = "native")]
+    #[test]
+    fn a_warm_chunk_root_cannot_hide_an_erased_child() {
+        let authority = crate::content::ContentStore::open(":memory:").expect("store");
+        let chunk = authority.put("private chunk").expect("chunk");
+        let body = "private chunkprivate chunk";
+        let root = crate::stable_hash_hex(body);
+        authority
+            .put_chunk_root(&root, &[chunk.clone(), chunk.clone()], body.len() as u64)
+            .expect("root");
+        let layered = ReadThrough::new(CountingBlobs::default(), authority);
+        assert_eq!(layered.get(&root).expect("warm").as_deref(), Some(body));
+        assert_eq!(
+            layered.chunk_ids(&root).expect("structure"),
+            Some(vec![chunk.clone(), chunk.clone()])
+        );
+        layered
+            .authority()
+            .erase(&chunk, "2026-09-08T00:00:00Z")
+            .expect("erase child");
+        assert!(matches!(
+            layered.authority().status(&root).expect("root metadata"),
+            BlobStatus::Live { .. }
+        ));
+        assert!(layered
+            .cache
+            .get(&root)
+            .expect("warm body remains")
+            .is_some());
+        assert_eq!(
+            layered.get(&root).expect("authority cannot reassemble"),
+            None
         );
     }
 
@@ -408,7 +559,8 @@ mod tests {
     /// Content written straight to the authority — by another cache's peer, or
     /// by a warm-up — is visible here without any invalidation step. That is
     /// the property that makes this a cache and not a replica: there is no
-    /// coherence protocol because immutability leaves nothing to cohere.
+    /// new-content invalidation step. Erasure still requires the authority
+    /// check on every warm read.
     #[test]
     fn content_written_behind_the_cache_is_still_visible() {
         let authority = CountingBlobs::default();

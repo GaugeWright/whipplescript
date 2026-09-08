@@ -170,8 +170,12 @@ mod tests {
         let id = authority.put("protected").expect("prepare");
         cache.put("protected").expect("cache");
         authority.erase(&id, "t1").expect("erase authority");
+        assert!(cache
+            .get(&id)
+            .expect("physical cache retains the copy")
+            .is_some());
         let cached = crate::read_through::ReadThrough::new(cache, authority);
-        assert!(cached.get(&id).expect("cached read").is_some());
+        assert_eq!(cached.get(&id).expect("erasure-aware read"), None);
         let called = Cell::new(false);
         let error = cached
             .publish_retained(&[id], || {

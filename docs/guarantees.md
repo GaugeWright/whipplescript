@@ -160,7 +160,7 @@ resources that it holds, and its place in the program are what they were. The
 is a run that pauses. It is never a run that the runtime decided was wrong.
 *Carried by:* the step budget of the instance, in the rule pass of the kernel,
 so a hosted run and a local run answer alike. Refer to
-[DR-0082](../spec/decision-records/0082-the-instance-step-budget.md). The
+DR-0082. The
 fixture is `crates/whipplescript-cli/tests/step_budget.rs`.
 
 ## Typing

@@ -119,6 +119,15 @@ pub trait ContentBlobs {
     fn put(&self, body: &str) -> crate::StoreResult<String>;
     /// Read the full stored bytes for a content id, or `None` if unknown.
     fn get(&self, id: &str) -> crate::StoreResult<Option<String>>;
+    /// Whether a correctly hashed cached body may still be served. This must
+    /// prove current payload availability, including a chunk root's children;
+    /// combining independent status/type observations is insufficient. It is
+    /// not policy authorization or proof that every physical cache was erased.
+    /// Backends may optimize only when one authoritative observation proves
+    /// availability. The default reads and verifies the full payload.
+    fn cached_read_available(&self, id: &str) -> crate::StoreResult<bool> {
+        fetched_content_available(self, id)
+    }
     /// Verify durable preparation under the authority's collection/erasure
     /// exclusion and hold it while `publish` commits references, exactly once.
     /// The callback must not prepare payloads or perform external work.
@@ -172,6 +181,17 @@ pub trait ContentBlobs {
             "this content store has no chunk tier".to_owned(),
         ))
     }
+}
+
+fn fetched_content_available<C: ContentBlobs + ?Sized>(
+    content: &C,
+    id: &str,
+) -> crate::StoreResult<bool> {
+    let Some(body) = content.get(id)? else {
+        return Ok(false);
+    };
+    verify_body(id, &body, "content authority")?;
+    Ok(true)
 }
 
 /// The content plane's executable conformance driver, shipped with the trait so
@@ -370,6 +390,22 @@ impl ContentStore {
 
 #[cfg(feature = "native")]
 impl ContentBlobs for ContentStore {
+    fn cached_read_available(&self, id: &str) -> StoreResult<bool> {
+        // One SQLite observation proves a plain payload exists. In particular,
+        // do not observe a live root and then infer "plain" from missing chunk
+        // metadata after another connection has collected that root.
+        let plain: bool = self
+            .connection
+            .prepare_cached("SELECT EXISTS(SELECT 1 FROM content_blobs WHERE id = ?1)")?
+            .query_row(params![id], |row| row.get(0))?;
+        if plain {
+            return Ok(true);
+        }
+        // Packed content and chunk roots use the full read path, including
+        // erasure, missing-child, decoding and reassembly-size refusals.
+        fetched_content_available(self, id)
+    }
+
     fn publish_retained<T>(
         &self,
         ids: &[String],

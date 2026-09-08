@@ -163,6 +163,14 @@ mod tests {
         .expect("suite runs");
     }
 
+    #[test]
+    fn do_authority_erasure_overrides_a_retaining_cache() {
+        whipplescript_store::read_through::conformance::check(
+            crate::do_branches::DoContentBlobs::new(RusqliteDoSql::in_memory())
+                .expect("content blobs open"),
+        );
+    }
+
     /// **DR-0071 §5 across the seam.** Both hosts must record the same erasure
     /// as the same chained entry, or the ledger is two ledgers.
     ///
