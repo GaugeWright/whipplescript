@@ -7,9 +7,13 @@ pub mod content;
 pub mod coordination;
 pub mod dependency_graph;
 pub mod diff;
+pub mod dispatch_definition;
+pub mod effect_recovery;
 pub mod erasure_ledger;
 pub mod event_chain;
+pub mod file_settlement;
 pub mod files;
+pub mod host_actions;
 pub mod improve;
 pub mod incidents;
 pub mod items;
@@ -36,6 +40,7 @@ pub mod stat_cache;
 pub mod text_merge;
 pub mod transfer;
 pub mod vcs;
+pub mod vcs_file_save;
 pub mod working_set;
 pub mod workspace_api;
 pub mod workstreams;
@@ -1859,83 +1864,11 @@ impl SqliteStore {
         instance: NewInstance<'_>,
         authority: NewInstanceAuthority<'_>,
     ) -> StoreResult<InstanceRecord> {
-        let tx = self.connection.unchecked_transaction()?;
-        let (record, created) = tx.query_row(
-            r#"
-                INSERT INTO instances (
-                    instance_id,
-                    program_id,
-                    version_id,
-                    workflow_principal,
-                    effective_authority,
-                    status,
-                    input_json,
-                    started_at
-                )
-                VALUES (
-                    'ins_' || lower(hex(randomblob(16))),
-                    ?1,
-                    ?2,
-                    ?3,
-                    ?4,
-                    'running',
-                    ?5,
-                    CURRENT_TIMESTAMP
-                )
-                RETURNING
-                    instance_id,
-                    status,
-                    program_id,
-                    version_id,
-                    revision_epoch,
-                    workflow_principal,
-                    effective_authority,
-                    input_json,
-                    created_at,
-                    started_at
-                "#,
-            params![
-                instance.program_id,
-                instance.version_id,
-                authority.workflow_principal,
-                authority.effective_authority_json,
-                instance.input_json,
-            ],
-            |row| {
-                Ok((
-                    InstanceRecord {
-                        instance_id: row.get(0)?,
-                        status: row.get(1)?,
-                    },
-                    // The timestamps are read back rather than recomputed: the
-                    // fold has to reproduce what the INSERT actually wrote, and
-                    // a second `CURRENT_TIMESTAMP` is a different instant.
-                    CreatedInstance {
-                        program_id: row.get::<_, String>(2)?,
-                        version_id: row.get::<_, String>(3)?,
-                        revision_epoch: row.get::<_, i64>(4)?,
-                        workflow_principal: row.get::<_, String>(5)?,
-                        effective_authority: row.get::<_, String>(6)?,
-                        input_json: row.get::<_, String>(7)?,
-                        created_at: row.get::<_, String>(8)?,
-                        started_at: row.get::<_, Option<String>>(9)?,
-                        status: row.get::<_, String>(1)?,
-                    },
-                ))
-            },
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.connection,
+            rusqlite::TransactionBehavior::Immediate,
         )?;
-        append_event_on(
-            &tx,
-            NewEvent {
-                instance_id: &record.instance_id,
-                event_type: "instance.created",
-                payload_json: &created.to_payload(),
-                source: "kernel",
-                causation_id: None,
-                correlation_id: None,
-                idempotency_key: None,
-            },
-        )?;
+        let record = host_actions::create_instance_on(&tx, instance, authority, None)?;
         tx.commit()?;
         Ok(record)
     }
@@ -3133,7 +3066,7 @@ impl SqliteStore {
         diagnostic: Option<TerminalDiagnosticRecord>,
     ) -> StoreResult<StoredEvent> {
         let run_status = completion.status;
-        let outcome = self.complete_effect_terminal_inner(completion, diagnostic, run_status);
+        let outcome = self.complete_effect_terminal_inner(completion, diagnostic, run_status, None);
         self.record_terminal_refusal(completion, run_status, outcome)
     }
 
@@ -3157,9 +3090,10 @@ impl SqliteStore {
     /// (run, attempted status, reason), so a stale worker retrying each pass
     /// does not grow the log.
     ///
-    /// The inner function's ONLY `Conflict` returns are the two stale guards --
-    /// every other failure is a store error -- which is what lets a `Conflict`
-    /// here mean "refused as stale" without matching on message text.
+    /// Ordinary completion can refuse a stale run or an append collision.
+    /// Atomic file settlement can also refuse a conflicting continuation fact.
+    /// All are refused terminal attempts; the original reason is retained
+    /// without classifying every conflict as a stale run.
     fn record_terminal_refusal(
         &mut self,
         completion: EffectCompletion<'_>,
@@ -3207,8 +3141,25 @@ impl SqliteStore {
         completion: EffectCompletion<'_>,
         diagnostic: Option<TerminalDiagnosticRecord>,
     ) -> StoreResult<StoredEvent> {
-        let outcome = self.complete_effect_terminal_inner(completion, diagnostic, "uncertain");
+        let outcome =
+            self.complete_effect_terminal_inner(completion, diagnostic, "uncertain", None);
         self.record_terminal_refusal(completion, "uncertain", outcome)
+    }
+
+    pub fn settle_file_effect(
+        &mut self,
+        completion: EffectCompletion<'_>,
+        diagnostic: Option<TerminalDiagnosticRecord>,
+        fact: file_settlement::FileSettlementFact<'_>,
+    ) -> StoreResult<StoredEvent> {
+        fact.validate(completion)?;
+        let outcome = self.complete_effect_terminal_inner(
+            completion,
+            diagnostic,
+            completion.status,
+            Some(fact),
+        );
+        self.record_terminal_refusal(completion, completion.status, outcome)
     }
 
     fn complete_effect_terminal_inner(
@@ -3216,8 +3167,9 @@ impl SqliteStore {
         completion: EffectCompletion<'_>,
         diagnostic: Option<TerminalDiagnosticRecord>,
         run_status: &str,
+        fact: Option<file_settlement::FileSettlementFact<'_>>,
     ) -> StoreResult<StoredEvent> {
-        let payload = effect_completion_payload(completion, diagnostic.as_ref())?;
+        let payload = effect_completion_payload(completion, diagnostic.as_ref(), run_status)?;
         let tx = self
             .connection
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -3341,6 +3293,9 @@ impl SqliteStore {
             )?;
         }
 
+        if let Some(fact) = fact {
+            file_settlement::append_fact(&tx, completion, &event, fact)?;
+        }
         tx.commit()?;
         Ok(event)
     }
@@ -5604,9 +5559,20 @@ impl SqliteStore {
     }
 
     pub fn start_run(&mut self, run: RunStart<'_>) -> StoreResult<StoredEvent> {
+        self.start_run_observed(run, None)
+    }
+
+    fn start_run_observed(
+        &mut self,
+        run: RunStart<'_>,
+        expected: Option<&ClaimableEffect>,
+    ) -> StoreResult<StoredEvent> {
         let tx = self
             .connection
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        if let Some(expected) = expected {
+            dispatch_definition::native(&tx, run.instance_id, run.effect_id, expected)?;
+        }
         if let Some(status) = instance_status_on(&tx, run.instance_id)? {
             if status != "running" {
                 return Err(StoreError::Conflict(format!(
@@ -5739,6 +5705,11 @@ impl SqliteStore {
         }
 
         let fingerprint_salt = fingerprint_salt_from_metadata(run.metadata_json);
+        effect_recovery::require_proved_absence(&effect_recovery::native_attempts(
+            &tx,
+            run.instance_id,
+            run.effect_id,
+        )?)?;
         let fingerprint = execution_fingerprint_on(
             &tx,
             run.instance_id,
@@ -5746,7 +5717,8 @@ impl SqliteStore {
             fingerprint_salt.as_deref(),
         )?;
         let run_metadata = inject_execution_fingerprint(&run, run.metadata_json, &fingerprint)?;
-        let payload = run_start_payload(run, &run_metadata)?;
+        let dispatch = effect_recovery::native_dispatch_marker(&tx, run, &fingerprint)?;
+        let payload = run_start_payload(run, &run_metadata, &dispatch)?;
         let event = append_event_on(
             &tx,
             NewEvent {
@@ -6434,6 +6406,7 @@ impl SqliteStore {
                 "run_id": lease.run_id,
                 "effect_id": lease.effect_id,
                 "expired_at": now,
+                "effect_status": "failed",
             })
             .to_string();
             append_event_on(
@@ -6470,7 +6443,7 @@ impl SqliteStore {
             tx.execute(
                 r#"
                 UPDATE effects
-                SET status = 'queued',
+                SET status = 'failed',
                     updated_at = CURRENT_TIMESTAMP
                 WHERE instance_id = ?1
                   AND effect_id = ?2
@@ -6493,6 +6466,11 @@ impl SqliteStore {
         let tx = self
             .connection
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        effect_recovery::require_proved_absence(&effect_recovery::native_attempts(
+            &tx,
+            retry.instance_id,
+            retry.effect_id,
+        )?)?;
         let event = append_event_on(
             &tx,
             NewEvent {
@@ -7132,6 +7110,10 @@ impl SqliteStore {
 /// directory. Excluded: `load_package_manifests_from_dir`.
 #[allow(clippy::too_many_arguments)]
 pub trait RuntimeStore {
+    fn admit_host_action(
+        &mut self,
+        action: host_actions::HostActionStart<'_>,
+    ) -> StoreResult<host_actions::HostActionAdmission>;
     fn schema_version(&self) -> StoreResult<i64>;
     fn append_event(&self, event: NewEvent<'_>) -> StoreResult<StoredEvent>;
     fn create_program_version(
@@ -7208,6 +7190,16 @@ pub trait RuntimeStore {
     fn derive_fact(&mut self, derived: DerivedFact<'_>) -> StoreResult<StoredEvent>;
     fn admit_fact_batch(&mut self, batch: FactBatch<'_>) -> StoreResult<FactBatchOutcome>;
     fn complete_effect(&mut self, completion: EffectCompletion<'_>) -> StoreResult<StoredEvent>;
+
+    /// Atomically commit a file terminal, its projections/diagnostic and its
+    /// ordinary workflow fact. No default can split these across transactions.
+    fn settle_file_effect(
+        &mut self,
+        completion: EffectCompletion<'_>,
+        diagnostic: Option<TerminalDiagnosticRecord>,
+        fact: file_settlement::FileSettlementFact<'_>,
+    ) -> StoreResult<StoredEvent>;
+
     fn complete_effect_with_terminal_diagnostic(
         &mut self,
         completion: EffectCompletion<'_>,
@@ -7381,6 +7373,19 @@ pub trait RuntimeStore {
     fn status(&self, instance_id: &str) -> StoreResult<Option<StatusView>>;
     fn satisfy_dependencies(&self, instance_id: &str) -> StoreResult<usize>;
     fn start_run(&mut self, run: RunStart<'_>) -> StoreResult<StoredEvent>;
+    /// Admit new sink I/O exactly once for this run identity. Returning an
+    /// existing run-start event is forbidden here, even on a host where
+    /// `start_run` supports reattaching a provider's existing execution.
+    /// The fresh check and ordinary run admission share one transaction.
+    fn start_dispatch(&mut self, run: RunStart<'_>) -> StoreResult<StoredEvent>;
+    /// Claim fresh I/O only if the complete effect definition still equals the
+    /// observation the caller authorized. Comparison and dispatch share a
+    /// transaction; this is a CAS primitive, not an authentication boundary.
+    fn start_dispatch_observed(
+        &mut self,
+        run: RunStart<'_>,
+        expected: &ClaimableEffect,
+    ) -> StoreResult<StoredEvent>;
     fn block_effect_binding(
         &mut self,
         instance_id: &str,
@@ -7434,6 +7439,12 @@ pub trait RuntimeStore {
 #[allow(clippy::too_many_arguments)]
 #[cfg(feature = "native")]
 impl RuntimeStore for SqliteStore {
+    fn admit_host_action(
+        &mut self,
+        action: host_actions::HostActionStart<'_>,
+    ) -> StoreResult<host_actions::HostActionAdmission> {
+        self.admit_host_action(action)
+    }
     fn schema_version(&self) -> StoreResult<i64> {
         self.schema_version()
     }
@@ -7553,6 +7564,15 @@ impl RuntimeStore for SqliteStore {
     fn admit_fact_batch(&mut self, batch: FactBatch<'_>) -> StoreResult<FactBatchOutcome> {
         self.admit_fact_batch(batch)
     }
+    fn settle_file_effect(
+        &mut self,
+        completion: EffectCompletion<'_>,
+        diagnostic: Option<TerminalDiagnosticRecord>,
+        fact: file_settlement::FileSettlementFact<'_>,
+    ) -> StoreResult<StoredEvent> {
+        self.settle_file_effect(completion, diagnostic, fact)
+    }
+
     fn complete_effect(&mut self, completion: EffectCompletion<'_>) -> StoreResult<StoredEvent> {
         self.complete_effect(completion)
     }
@@ -7834,6 +7854,18 @@ impl RuntimeStore for SqliteStore {
     }
     fn start_run(&mut self, run: RunStart<'_>) -> StoreResult<StoredEvent> {
         self.start_run(run)
+    }
+    fn start_dispatch(&mut self, run: RunStart<'_>) -> StoreResult<StoredEvent> {
+        // Native start_run already uses strict inserts and refuses every
+        // previously dispatched attempt inside its admission transaction.
+        self.start_run(run)
+    }
+    fn start_dispatch_observed(
+        &mut self,
+        run: RunStart<'_>,
+        expected: &ClaimableEffect,
+    ) -> StoreResult<StoredEvent> {
+        self.start_run_observed(run, Some(expected))
     }
     fn block_effect_binding(
         &mut self,
@@ -11246,6 +11278,7 @@ fn workflow_terminal_payload(
 fn effect_completion_payload(
     completion: EffectCompletion<'_>,
     diagnostic: Option<&TerminalDiagnosticRecord>,
+    run_status: &str,
 ) -> StoreResult<String> {
     // DR-0054 Phase C: unreadable completion metadata surfaces with the run
     // identity instead of writing `null` into the canonical `effect.terminal`
@@ -11262,6 +11295,7 @@ fn effect_completion_payload(
         "provider": completion.provider,
         "worker_id": completion.worker_id,
         "status": completion.status,
+        "run_status": run_status,
         "exit_code": completion.exit_code,
         "summary": completion.summary,
         "metadata": metadata,
@@ -11330,7 +11364,11 @@ fn terminal_diagnostic_payload(diagnostic: &TerminalDiagnosticRecord) -> StoreRe
 }
 
 #[cfg(feature = "native")]
-fn run_start_payload(run: RunStart<'_>, metadata_json: &str) -> StoreResult<String> {
+fn run_start_payload(
+    run: RunStart<'_>,
+    metadata_json: &str,
+    dispatch: &effect_recovery::DispatchMarker,
+) -> StoreResult<String> {
     // DR-0054 Phase C: unreadable run metadata surfaces with the run identity
     // instead of recording `null` in the canonical `effect.run_started` event.
     let metadata = serde_json::from_str::<Value>(metadata_json).map_err(|error| {
@@ -11347,6 +11385,7 @@ fn run_start_payload(run: RunStart<'_>, metadata_json: &str) -> StoreResult<Stri
         "lease_id": run.lease_id,
         "lease_expires_at": run.lease_expires_at,
         "metadata": metadata,
+        "external_dispatch": dispatch,
     })
     .to_string())
 }
@@ -11997,7 +12036,7 @@ fn replay_effect_terminal(
                 instance_id,
                 provider,
                 worker_id,
-                status,
+                effect_recovery::terminal_run_status(&payload),
                 payload.get("exit_code").and_then(Value::as_i64),
                 payload.get("summary").and_then(Value::as_str),
                 metadata_json,
@@ -12103,13 +12142,20 @@ fn replay_lease_expired(
     connection.execute(
         r#"
         UPDATE effects
-        SET status = 'queued',
+        SET status = ?3,
             updated_at = CURRENT_TIMESTAMP
         WHERE instance_id = ?1
           AND effect_id = ?2
           AND status = 'running'
         "#,
-        params![instance_id, effect_id],
+        params![
+            instance_id,
+            effect_id,
+            payload
+                .get("effect_status")
+                .and_then(Value::as_str)
+                .unwrap_or("queued")
+        ],
     )?;
     Ok(())
 }
@@ -16681,7 +16727,7 @@ mod tests {
         store
             .expire_leases(&instance.instance_id, "2030-01-02T00:00:00Z")
             .expect("lease expires");
-        assert_eq!(effect_status(&store, "running-effect"), "queued");
+        assert_eq!(effect_status(&store, "running-effect"), "failed");
         assert!(
             store
                 .claimable_effects(&instance.instance_id)
@@ -19082,7 +19128,7 @@ mod tests {
             .rebuild_projections(&instance.instance_id)
             .expect("live projections rebuild");
 
-        assert_eq!(effect_status(&store, "tell"), "queued");
+        assert_eq!(effect_status(&store, "tell"), "failed");
         assert_eq!(lease_status(&store, "lease-lease-replay"), "expired");
         let runs = store
             .list_runs(&instance.instance_id)
@@ -19282,12 +19328,12 @@ mod tests {
             .expect("lease expires");
         assert_eq!(expired.len(), 1);
         assert_eq!(expired[0].run_id, "run-tell");
-        assert_eq!(effect_status(&store, "tell"), "queued");
+        assert_eq!(effect_status(&store, "tell"), "failed");
         assert_eq!(lease_status(&store, "lease-tell"), "expired");
     }
 
     #[test]
-    fn retries_failed_effects_through_backoff_gate() {
+    fn failed_attempt_without_absence_cannot_retry() {
         let mut store = SqliteStore::open_in_memory().expect("store opens");
         let effects = [test_effect("tell", "agent.tell", "rule=start;effect=tell")];
         store
@@ -19332,44 +19378,20 @@ mod tests {
             })
             .expect("effect fails");
         assert_eq!(effect_status(&store, "tell"), "failed");
-
-        store
+        let before = store.list_events("instance-a").expect("terminal history");
+        assert!(store
             .retry_effect(RetryEffect {
                 instance_id: "instance-a",
                 effect_id: "tell",
-                retry_after: Some("2030-01-01T00:00:00Z"),
+                retry_after: None,
                 idempotency_key: Some("retry-tell"),
             })
-            .expect("effect retries");
-        assert_eq!(effect_status(&store, "tell"), "queued");
-
-        store
-            .start_run(RunStart {
-                instance_id: "instance-a",
-                effect_id: "tell",
-                run_id: "run-tell-2",
-                provider: "test",
-                worker_id: "worker-1",
-                lease_id: "lease-tell-2",
-                lease_expires_at: "2030-01-02T00:00:00Z",
-                metadata_json: "{}",
-            })
-            .expect("retry run starts");
-        store
-            .complete_effect(EffectCompletion {
-                instance_id: "instance-a",
-                effect_id: "tell",
-                run_id: "run-tell-2",
-                provider: "test",
-                worker_id: "worker-1",
-                status: "completed",
-                exit_code: Some(0),
-                summary: Some("retry completed"),
-                metadata_json: "{}",
-                idempotency_key: Some("complete-tell-2"),
-            })
-            .expect("retry run completes");
-        assert_eq!(effect_status(&store, "tell"), "completed");
+            .is_err());
+        assert_eq!(
+            store.list_events("instance-a").expect("unchanged history"),
+            before
+        );
+        assert_eq!(effect_status(&store, "tell"), "failed");
     }
 
     #[test]

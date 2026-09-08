@@ -1,5 +1,10 @@
 """Cheap scanner/mutator contracts; Rust compilation plants stay in the deep sweep."""
+import contextlib
+import io
+from pathlib import Path
+import tempfile
 import unittest
+from unittest import mock
 
 import mutation_sweep as sweep
 
@@ -113,6 +118,102 @@ class TypedRefusalTests(unittest.TestCase):
         [site] = sweep.find_sites(source)
         self.assertEqual(sweep.apply_mutation(source, site)[1],
                          'return Ok(Outcome::AlreadyArchived)')
+
+
+class CalibrationTests(unittest.TestCase):
+    def test_all_seventeen_edits_combine_without_line_offset_interference(self):
+        source = ["// original source boundary"] + sweep.PLANT.split("\n")
+        sites = sweep.find_sites(source)
+        combined = sweep.batch_unreachable_mutations(source, sites, 1)
+        # Reverse-position individual application is an independent oracle for
+        # the simultaneous edits, including mutations that insert/delete lines.
+        sequential = source
+        for site in reversed(sites):
+            sequential = sweep.apply_mutation(sequential, site)
+            self.assertIsNotNone(sequential)
+        self.assertEqual(combined, sequential)
+        self.assertEqual(combined[0], source[0])
+        self.assertEqual(len(sites), 17)
+
+    def test_absent_or_noop_mutation_cannot_calibrate(self):
+        source = ["real", "plant"]
+        for result in (None, source):
+            with self.subTest(result=result), mock.patch.object(sweep, "apply_mutation", return_value=result):
+                with self.assertRaisesRegex(ValueError, "no calibration mutation"):
+                    sweep.batch_unreachable_mutations(source, [sweep.Site(2, "plant")], 1)
+
+    def test_calibration_cannot_modify_real_source_or_overlap_another_mutation(self):
+        source = ["real", "first", "second"]
+        with mock.patch.object(sweep, "apply_mutation", return_value=["changed", "first", "second"]):
+            with self.assertRaisesRegex(ValueError, "real source"):
+                sweep.batch_unreachable_mutations(source, [sweep.Site(2, "plant")], 1)
+        with mock.patch.object(sweep, "apply_mutation", return_value=["real", "changed", "second"]):
+            with self.assertRaisesRegex(ValueError, "overlap"):
+                sweep.batch_unreachable_mutations(source, [sweep.Site(2, "first"), sweep.Site(3, "second")], 1)
+
+    def test_calibration_still_uses_the_actual_target_and_filter_once(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "target.rs"
+            backup = Path(directory) / "original.rs"
+            source = "// original, deliberately without a final newline"
+            backup.write_text(source)
+            observed = []
+            def trial(filter_expr):
+                observed.append((filter_expr, target.read_text()))
+                return sweep.PASSED
+            with mock.patch.object(sweep, "run_suite", side_effect=trial), contextlib.redirect_stdout(io.StringIO()):
+                self.assertTrue(sweep.self_test(str(target), "-p actual-package", str(backup)))
+            self.assertEqual(len(observed), 1)
+            self.assertEqual(observed[0][0], "-p actual-package")
+            self.assertTrue(observed[0][1].startswith(source + "\n"))
+            expected = sweep.batch_unreachable_mutations(
+                source.split("\n") + sweep.PLANT.split("\n"),
+                sweep.find_sites(source.split("\n") + sweep.PLANT.split("\n")),
+                1,
+            )
+            self.assertEqual(observed[0][1], "\n".join(expected))
+            self.assertEqual(backup.read_text(), source)
+
+    def test_bad_discovery_build_failure_or_caught_calibration_refuses(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "target.rs"
+            backup = Path(directory) / "original.rs"
+            backup.write_text("// original\n")
+            with mock.patch.object(sweep, "find_sites", return_value=[]), mock.patch.object(sweep, "run_suite") as trial, contextlib.redirect_stderr(io.StringIO()):
+                self.assertFalse(sweep.self_test(str(target), "filter", str(backup)))
+                trial.assert_not_called()
+            for outcome in (sweep.BUILD_FAILED, sweep.CAUGHT):
+                with self.subTest(outcome=outcome), mock.patch.object(sweep, "run_suite", return_value=outcome), contextlib.redirect_stderr(io.StringIO()):
+                    self.assertFalse(sweep.self_test(str(target), "filter", str(backup)))
+
+    def test_failed_calibration_restores_the_original_source(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "target.rs"
+            original = "// original bytes\n"
+            target.write_text(original)
+            args = ["mutation_sweep.py", "--target", str(target), "--filter", "named-test"]
+            with mock.patch("sys.argv", args), mock.patch.object(sweep, "run_suite", return_value=sweep.BUILD_FAILED), contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(sweep.main(), 1)
+            self.assertEqual(target.read_text(), original)
+            self.assertFalse(Path(str(target) + ".sweepbak").exists())
+
+    def test_real_refusals_are_still_mutated_one_at_a_time(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "target.rs"
+            backup = Path(directory) / "original.rs"
+            original = 'errors.push("first");\nerrors.push("second");'
+            backup.write_text(original)
+            observed = []
+            def trial(_filter):
+                observed.append(target.read_text())
+                return sweep.PASSED
+            with mock.patch.object(sweep, "run_suite", side_effect=trial), contextlib.redirect_stdout(io.StringIO()):
+                survivors, unmeasured = sweep.sweep(str(target), "filter", sweep.find_sites(original.split("\n")), str(backup))
+            self.assertEqual(len(survivors), 2)
+            self.assertEqual(unmeasured, [])
+            self.assertEqual(len(observed), 2)
+            self.assertTrue(all(value.count("errors.push") == 1 for value in observed))
+            self.assertNotEqual(observed[0], observed[1])
 
 
 if __name__ == '__main__':

@@ -396,36 +396,100 @@ fn settle_failed_file_effect<S: RuntimeStore>(
     terminal_key: &str,
     fact_key: &str,
 ) -> Result<StoredEvent, StoreError> {
-    let terminal = kernel.fail_run(EffectCompletion {
+    settle_failed_file_effect_with_evidence(
+        kernel,
         instance_id,
-        effect_id: &effect.effect_id,
+        effect,
+        kind,
+        reason,
         run_id,
-        provider: "files",
-        worker_id: "whip-files",
-        status: "failed",
-        exit_code: None,
-        summary: Some(reason),
-        metadata_json:
-            &json!({ "failure": { "error_kind": "file_effect_failed", "message": reason } })
-                .to_string(),
-        idempotency_key: Some(terminal_key),
-    })?;
-    kernel.derive_fact(
-        instance_id,
+        terminal_key,
+        fact_key,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn settle_failed_file_effect_with_evidence<S: RuntimeStore>(
+    kernel: &mut RuntimeKernel<S>,
+    instance_id: &str,
+    effect: &ClaimableEffect,
+    kind: &str,
+    reason: &str,
+    run_id: &str,
+    terminal_key: &str,
+    fact_key: &str,
+    evidence: Option<Value>,
+) -> Result<StoredEvent, StoreError> {
+    let mut value = effect_failure_base(kind, reason, reason, &effect.effect_id, run_id);
+    let mut metadata =
+        json!({ "failure": { "error_kind": "file_effect_failed", "message": reason } });
+    if let Some(evidence) = evidence {
+        value["receipt"] = evidence.clone();
+        metadata["failure"]["receipt"] = evidence;
+    }
+    kernel.settle_file_run(
+        EffectCompletion {
+            instance_id,
+            effect_id: &effect.effect_id,
+            run_id,
+            provider: "files",
+            worker_id: "whip-files",
+            status: "failed",
+            exit_code: None,
+            summary: Some(reason),
+            metadata_json: &metadata.to_string(),
+            idempotency_key: Some(terminal_key),
+        },
         &format!("{kind}.failed"),
-        &effect.effect_id,
         &json!({
             "effect_id": effect.effect_id,
             "run_id": run_id,
             "status": "failed",
-            "value": effect_failure_base(kind, reason, reason, &effect.effect_id, run_id),
+            "value": value,
             "error": { "message": reason },
         })
         .to_string(),
-        Some(&terminal.event_id),
-        Some(fact_key),
-    )?;
-    Ok(terminal)
+        fact_key,
+    )
+}
+
+struct FileAttemptKeys {
+    run_id: String,
+    lease_id: String,
+    terminal_key: String,
+    fact_key: String,
+}
+
+fn file_attempt_keys<S: RuntimeStore>(
+    kernel: &RuntimeKernel<S>,
+    instance_id: &str,
+    effect_id: &str,
+) -> Result<FileAttemptKeys, StoreError> {
+    let count = kernel
+        .store()
+        .list_runs(instance_id)?
+        .iter()
+        .filter(|run| run.effect_id == effect_id)
+        .count();
+    let ordinal = count.to_string();
+    let key = |purpose| {
+        if count == 0 {
+            // Preserve the shipped first-attempt coordinates. A later
+            // authorized retry must not collide with that attempt's terminal.
+            idempotency_key(&[instance_id, effect_id, purpose])
+        } else {
+            idempotency_key(&[instance_id, effect_id, purpose, "attempt", &ordinal])
+        }
+    };
+    // This read selects identities, not authority. The atomic start_dispatch
+    // still rejects reuse, a non-claimable effect or any unresolved attempt.
+    Ok(FileAttemptKeys {
+        run_id: key("file-run"),
+        lease_id: key("file-lease"),
+        terminal_key: key("terminal"),
+        fact_key: key("file-fact"),
+    })
 }
 
 /// Host-agnostic core (DR-0033 chunk 3): read a file through the `FileStore` seam
@@ -456,20 +520,25 @@ pub fn run_file_effect_generic<S: RuntimeStore>(
         .and_then(Value::as_str)
         .unwrap_or_default();
     let full = Path::new(root).join(path);
-    let run_id = idempotency_key(&[instance_id, &effect.effect_id, "file-run"]);
-    let lease_id = idempotency_key(&[instance_id, &effect.effect_id, "file-lease"]);
-    kernel.start_run(RunStart {
-        instance_id,
-        effect_id: &effect.effect_id,
-        run_id: &run_id,
-        provider: "files",
-        worker_id: "whip-files",
-        lease_id: &lease_id,
-        lease_expires_at: "2030-01-01T00:00:00Z",
-        metadata_json: &json!({ "path": full.display().to_string() }).to_string(),
-    })?;
-    let terminal_key = idempotency_key(&[instance_id, &effect.effect_id, "terminal"]);
-    let fact_key = idempotency_key(&[instance_id, &effect.effect_id, "file-fact"]);
+    let FileAttemptKeys {
+        run_id,
+        lease_id,
+        terminal_key,
+        fact_key,
+    } = file_attempt_keys(kernel, instance_id, &effect.effect_id)?;
+    kernel.start_dispatch_observed(
+        RunStart {
+            instance_id,
+            effect_id: &effect.effect_id,
+            run_id: &run_id,
+            provider: "files",
+            worker_id: "whip-files",
+            lease_id: &lease_id,
+            lease_expires_at: "2030-01-01T00:00:00Z",
+            metadata_json: &json!({ "path": full.display().to_string() }).to_string(),
+        },
+        effect,
+    )?;
     // The `file store` root + `allow read` policy is the scope boundary
     // (spec/files.md), checked before any disk access.
     let allow = effect_allow_globs(&input);
@@ -498,29 +567,24 @@ pub fn run_file_effect_generic<S: RuntimeStore>(
                 // content half was otherwise unaddressable.
                 "content_hash": stable_hash_hex(&content),
             });
-            let terminal = kernel.complete_run(EffectCompletion {
-                instance_id,
-                effect_id: &effect.effect_id,
-                run_id: &run_id,
-                provider: "files",
-                worker_id: "whip-files",
-                status: "completed",
-                exit_code: Some(0),
-                summary: Some(&format!(
-                    "read {} bytes from {}",
-                    content.len(),
-                    full.display()
-                )),
-                metadata_json: &json!({ "value": value }).to_string(),
-                idempotency_key: Some(&terminal_key),
-            })?;
-            // The settled effect becomes a `file.read.completed` fact (keyed by
-            // effect id) so `after <binding> succeeds as r` can bind `r.content`.
-            // Mirrors run_exec_effect's `exec.command.completed` projection.
-            kernel.derive_fact(
-                instance_id,
+            kernel.settle_file_run(
+                EffectCompletion {
+                    instance_id,
+                    effect_id: &effect.effect_id,
+                    run_id: &run_id,
+                    provider: "files",
+                    worker_id: "whip-files",
+                    status: "completed",
+                    exit_code: Some(0),
+                    summary: Some(&format!(
+                        "read {} bytes from {}",
+                        content.len(),
+                        full.display()
+                    )),
+                    metadata_json: &json!({ "value": value }).to_string(),
+                    idempotency_key: Some(&terminal_key),
+                },
                 "file.read.completed",
-                &effect.effect_id,
                 &json!({
                     "effect_id": effect.effect_id,
                     "run_id": run_id,
@@ -528,10 +592,8 @@ pub fn run_file_effect_generic<S: RuntimeStore>(
                     "value": value,
                 })
                 .to_string(),
-                Some(&terminal.event_id),
-                Some(&fact_key),
-            )?;
-            Ok(terminal)
+                &fact_key,
+            )
         }
         Err(reason) => settle_failed_file_effect(
             kernel,
@@ -583,22 +645,28 @@ pub fn run_file_write_effect_generic<S: RuntimeStore>(
         .unwrap_or_default()
         .to_owned();
     let full = Path::new(root).join(path);
-    let run_id = idempotency_key(&[instance_id, &effect.effect_id, "file-run"]);
-    let lease_id = idempotency_key(&[instance_id, &effect.effect_id, "file-lease"]);
-    kernel.start_run(RunStart {
-        instance_id,
-        effect_id: &effect.effect_id,
-        run_id: &run_id,
-        provider: "files",
-        worker_id: "whip-files",
-        lease_id: &lease_id,
-        lease_expires_at: "2030-01-01T00:00:00Z",
-        metadata_json: &json!({ "path": full.display().to_string(), "mode": mode }).to_string(),
-    })?;
-    let terminal_key = idempotency_key(&[instance_id, &effect.effect_id, "terminal"]);
-    let fact_key = idempotency_key(&[instance_id, &effect.effect_id, "file-fact"]);
+    let FileAttemptKeys {
+        run_id,
+        lease_id,
+        terminal_key,
+        fact_key,
+    } = file_attempt_keys(kernel, instance_id, &effect.effect_id)?;
+    let started = kernel.start_dispatch_observed(
+        RunStart {
+            instance_id,
+            effect_id: &effect.effect_id,
+            run_id: &run_id,
+            provider: "files",
+            worker_id: "whip-files",
+            lease_id: &lease_id,
+            lease_expires_at: "2030-01-01T00:00:00Z",
+            metadata_json: &json!({ "path": full.display().to_string(), "mode": mode }).to_string(),
+        },
+        effect,
+    )?;
+    let mut operation_evidence = None;
     let allow = effect_allow_globs(&input);
-    let write_outcome: Result<(), String> = if let Some(reason) =
+    let write_outcome: Result<String, String> = if let Some(reason) =
         file_path_policy_error(path, store_name, &allow, "write").or_else(|| {
             files.path_policy_error(Path::new(root), Path::new(path), store_name, "write")
         }) {
@@ -612,15 +680,48 @@ pub fn run_file_write_effect_generic<S: RuntimeStore>(
                     .map_err(|error| format!("create parent of `{path}`: {error}"))?;
             }
             let result = if mode == "append" {
-                files.append(&full, body.as_bytes())
+                files
+                    .append(&full, body.as_bytes())
+                    .map(|()| whipplescript_store::files::FileWriteAccepted {
+                        content: body.clone(),
+                        evidence: None,
+                    })
+                    .map_err(whipplescript_store::files::FileWriteFailure::from)
             } else {
-                files.write(&full, body.as_bytes())
+                files.write_text_with_context(
+                    &full,
+                    &body,
+                    whipplescript_store::files::FileWriteContext {
+                        instance_id,
+                        effect_id: &effect.effect_id,
+                        run_id: &run_id,
+                        started_event_id: &started.event_id,
+                    },
+                )
             };
-            result.map_err(|error| format!("write of `{}` failed: {error}", full.display()))
+            match result {
+                Ok(accepted) => {
+                    operation_evidence = accepted.evidence;
+                    Ok(accepted.content)
+                }
+                Err(failed) => {
+                    operation_evidence = failed.evidence;
+                    Err(format!(
+                        "write of `{}` failed: {}",
+                        full.display(),
+                        failed.error
+                    ))
+                }
+            }
         })
     };
+    let evidence = operation_evidence.map(|evidence| {
+        kernel.store().put_content(&evidence.content).map(|content_hash| json!({
+            "schema_ref": evidence.schema_ref, "label_ref": evidence.label_ref, "content_hash": content_hash,
+        }))
+    }).transpose()?;
     match write_outcome {
-        Ok(()) => {
+        Ok(body) => {
             // Restorable-context RC-1: capture the written body content-addressed
             // into the runtime store's file-history blob table, keyed by the SAME
             // `stable_hash_hex` the `file.write.completed` fact records below. The
@@ -632,7 +733,7 @@ pub fn run_file_write_effect_generic<S: RuntimeStore>(
             // capture failure aborts before the fact, never leaving a dangling
             // hash. Identical bytes dedupe; an overwrite keeps both versions.
             kernel.store().put_content(&body)?;
-            let value = json!({
+            let mut value = json!({
                 "store": store_name,
                 "path": path,
                 // RC-5: the full resolved path (root-joined) so restore is
@@ -644,22 +745,23 @@ pub fn run_file_write_effect_generic<S: RuntimeStore>(
                 "bytes": body.len(),
                 "content_hash": stable_hash_hex(&body),
             });
-            let terminal = kernel.complete_run(EffectCompletion {
-                instance_id,
-                effect_id: &effect.effect_id,
-                run_id: &run_id,
-                provider: "files",
-                worker_id: "whip-files",
-                status: "completed",
-                exit_code: Some(0),
-                summary: Some(&format!("wrote {} bytes to {}", body.len(), full.display())),
-                metadata_json: &json!({ "value": value }).to_string(),
-                idempotency_key: Some(&terminal_key),
-            })?;
-            kernel.derive_fact(
-                instance_id,
+            if let Some(evidence) = &evidence {
+                value["receipt"] = evidence.clone();
+            }
+            kernel.settle_file_run(
+                EffectCompletion {
+                    instance_id,
+                    effect_id: &effect.effect_id,
+                    run_id: &run_id,
+                    provider: "files",
+                    worker_id: "whip-files",
+                    status: "completed",
+                    exit_code: Some(0),
+                    summary: Some(&format!("wrote {} bytes to {}", body.len(), full.display())),
+                    metadata_json: &json!({ "value": value }).to_string(),
+                    idempotency_key: Some(&terminal_key),
+                },
                 "file.write.completed",
-                &effect.effect_id,
                 &json!({
                     "effect_id": effect.effect_id,
                     "run_id": run_id,
@@ -667,12 +769,10 @@ pub fn run_file_write_effect_generic<S: RuntimeStore>(
                     "value": value,
                 })
                 .to_string(),
-                Some(&terminal.event_id),
-                Some(&fact_key),
-            )?;
-            Ok(terminal)
+                &fact_key,
+            )
         }
-        Err(reason) => settle_failed_file_effect(
+        Err(reason) => settle_failed_file_effect_with_evidence(
             kernel,
             instance_id,
             effect,
@@ -681,6 +781,7 @@ pub fn run_file_write_effect_generic<S: RuntimeStore>(
             &run_id,
             &terminal_key,
             &fact_key,
+            evidence,
         ),
     }
 }
@@ -815,20 +916,26 @@ pub fn run_file_import_effect_generic<S: RuntimeStore>(
         .unwrap_or_default()
         .to_owned();
     let full = Path::new(root).join(path);
-    let run_id = idempotency_key(&[instance_id, &effect.effect_id, "file-run"]);
-    let lease_id = idempotency_key(&[instance_id, &effect.effect_id, "file-lease"]);
-    kernel.start_run(RunStart {
-        instance_id,
-        effect_id: &effect.effect_id,
-        run_id: &run_id,
-        provider: "files",
-        worker_id: "whip-files",
-        lease_id: &lease_id,
-        lease_expires_at: "2030-01-01T00:00:00Z",
-        metadata_json: &json!({ "path": full.display().to_string(), "schema": schema }).to_string(),
-    })?;
-    let terminal_key = idempotency_key(&[instance_id, &effect.effect_id, "terminal"]);
-    let fact_key = idempotency_key(&[instance_id, &effect.effect_id, "file-fact"]);
+    let FileAttemptKeys {
+        run_id,
+        lease_id,
+        terminal_key,
+        fact_key,
+    } = file_attempt_keys(kernel, instance_id, &effect.effect_id)?;
+    kernel.start_dispatch_observed(
+        RunStart {
+            instance_id,
+            effect_id: &effect.effect_id,
+            run_id: &run_id,
+            provider: "files",
+            worker_id: "whip-files",
+            lease_id: &lease_id,
+            lease_expires_at: "2030-01-01T00:00:00Z",
+            metadata_json: &json!({ "path": full.display().to_string(), "schema": schema })
+                .to_string(),
+        },
+        effect,
+    )?;
 
     // Decode + validate every row before admitting any (all-or-nothing).
     let decoded: Result<Vec<Value>, String> = (|| {
@@ -915,26 +1022,24 @@ pub fn run_file_import_effect_generic<S: RuntimeStore>(
                 "admitted": admitted.admitted,
                 "skipped": admitted.skipped,
             });
-            let terminal = kernel.complete_run(EffectCompletion {
-                instance_id,
-                effect_id: &effect.effect_id,
-                run_id: &run_id,
-                provider: "files",
-                worker_id: "whip-files",
-                status: "completed",
-                exit_code: Some(0),
-                summary: Some(&format!(
-                    "imported {} rows from {}",
-                    rows.len(),
-                    full.display()
-                )),
-                metadata_json: &json!({ "value": value }).to_string(),
-                idempotency_key: Some(&terminal_key),
-            })?;
-            kernel.derive_fact(
-                instance_id,
+            kernel.settle_file_run(
+                EffectCompletion {
+                    instance_id,
+                    effect_id: &effect.effect_id,
+                    run_id: &run_id,
+                    provider: "files",
+                    worker_id: "whip-files",
+                    status: "completed",
+                    exit_code: Some(0),
+                    summary: Some(&format!(
+                        "imported {} rows from {}",
+                        rows.len(),
+                        full.display()
+                    )),
+                    metadata_json: &json!({ "value": value }).to_string(),
+                    idempotency_key: Some(&terminal_key),
+                },
                 "file.import.completed",
-                &effect.effect_id,
                 &json!({
                     "effect_id": effect.effect_id,
                     "run_id": run_id,
@@ -942,10 +1047,8 @@ pub fn run_file_import_effect_generic<S: RuntimeStore>(
                     "value": value,
                 })
                 .to_string(),
-                Some(&terminal.event_id),
-                Some(&fact_key),
-            )?;
-            Ok(terminal)
+                &fact_key,
+            )
         }
         Err(reason) => settle_failed_file_effect(
             kernel,
@@ -1109,20 +1212,26 @@ pub fn run_file_export_effect_generic<S: RuntimeStore>(
         })
         .unwrap_or_default();
     let full = Path::new(root).join(path);
-    let run_id = idempotency_key(&[instance_id, &effect.effect_id, "file-run"]);
-    let lease_id = idempotency_key(&[instance_id, &effect.effect_id, "file-lease"]);
-    kernel.start_run(RunStart {
-        instance_id,
-        effect_id: &effect.effect_id,
-        run_id: &run_id,
-        provider: "files",
-        worker_id: "whip-files",
-        lease_id: &lease_id,
-        lease_expires_at: "2030-01-01T00:00:00Z",
-        metadata_json: &json!({ "path": full.display().to_string(), "schema": schema }).to_string(),
-    })?;
-    let terminal_key = idempotency_key(&[instance_id, &effect.effect_id, "terminal"]);
-    let fact_key = idempotency_key(&[instance_id, &effect.effect_id, "file-fact"]);
+    let FileAttemptKeys {
+        run_id,
+        lease_id,
+        terminal_key,
+        fact_key,
+    } = file_attempt_keys(kernel, instance_id, &effect.effect_id)?;
+    kernel.start_dispatch_observed(
+        RunStart {
+            instance_id,
+            effect_id: &effect.effect_id,
+            run_id: &run_id,
+            provider: "files",
+            worker_id: "whip-files",
+            lease_id: &lease_id,
+            lease_expires_at: "2030-01-01T00:00:00Z",
+            metadata_json: &json!({ "path": full.display().to_string(), "schema": schema })
+                .to_string(),
+        },
+        effect,
+    )?;
 
     let outcome: Result<(usize, String), String> = (|| {
         if let Some(reason) =
@@ -1177,22 +1286,20 @@ pub fn run_file_export_effect_generic<S: RuntimeStore>(
                 "row_count": row_count,
                 "content_hash": content_hash,
             });
-            let terminal = kernel.complete_run(EffectCompletion {
-                instance_id,
-                effect_id: &effect.effect_id,
-                run_id: &run_id,
-                provider: "files",
-                worker_id: "whip-files",
-                status: "completed",
-                exit_code: Some(0),
-                summary: Some(&format!("exported {row_count} rows to {}", full.display())),
-                metadata_json: &json!({ "value": value }).to_string(),
-                idempotency_key: Some(&terminal_key),
-            })?;
-            kernel.derive_fact(
-                instance_id,
+            kernel.settle_file_run(
+                EffectCompletion {
+                    instance_id,
+                    effect_id: &effect.effect_id,
+                    run_id: &run_id,
+                    provider: "files",
+                    worker_id: "whip-files",
+                    status: "completed",
+                    exit_code: Some(0),
+                    summary: Some(&format!("exported {row_count} rows to {}", full.display())),
+                    metadata_json: &json!({ "value": value }).to_string(),
+                    idempotency_key: Some(&terminal_key),
+                },
                 "file.export.completed",
-                &effect.effect_id,
                 &json!({
                     "effect_id": effect.effect_id,
                     "run_id": run_id,
@@ -1200,10 +1307,8 @@ pub fn run_file_export_effect_generic<S: RuntimeStore>(
                     "value": value,
                 })
                 .to_string(),
-                Some(&terminal.event_id),
-                Some(&fact_key),
-            )?;
-            Ok(terminal)
+                &fact_key,
+            )
         }
         Err(reason) => settle_failed_file_effect(
             kernel,

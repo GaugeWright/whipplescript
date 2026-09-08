@@ -24,11 +24,11 @@ search [1] in WHIPPLESCRIPT-KERNEL :
   =>*
   effect(e1, running) capacityAvailable(e1) .
 
---- A running effect with an active lease can expire and become queued again.
+--- Lease expiry releases the worker and holds the failed effect for recovery.
 search [1] in WHIPPLESCRIPT-KERNEL :
   effect(e1, running) lease(e1, leaseActive)
   =>*
-  effect(e1, queued) lease(e1, leaseExpired) event(leaseExpiredEvt) .
+  effect(e1, failed) lease(e1, leaseExpired) event(leaseExpiredEvt) .
 
 --- Retry reuses the same effect identity after failure.
 search [1] in WHIPPLESCRIPT-KERNEL :

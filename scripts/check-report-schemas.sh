@@ -28,6 +28,10 @@ PY
 cargo run --quiet -p whipplescript-store --example workstream_receipt_reports \
   | python3 scripts/check-workstream-receipt-reports.py
 
+# The action schema is checked against the real Rust codecs and messages
+# emitted by human/agent journeys on native and deployed DO SQL stores.
+scripts/check-host-action-contract.sh
+
 TMP_DIR="$(mktemp -d)"
 TMP_STORE="$TMP_DIR/dev.sqlite"
 TMP_STREAM_STORE="$TMP_DIR/dev-stream.sqlite"

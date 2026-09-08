@@ -124,6 +124,31 @@ The isolate is sans-IO. Its only async primitive is `fetch`, and each effect tha
 uses HTTP is a step machine that can resume after an eviction. The `whip deploy`
 command deploys a workflow to a Worker and a Durable Object in one operation.
 
+## Embedding human and agent actions
+
+`GovernedHostFacade` admits a `CompiledHostAction` into an ordinary workflow.
+The same operation can serve a human command or an agent tool call, with each
+caller's independently verified authority and provenance. The action itself
+does not require a model or conversation. Admission has a stable request
+identity; execution, result inspection and target reconciliation each require
+their own current authorization.
+
+The source distribution carries `spec/host-action-contract-v1.json`, revision
+`whipplescript-host-action/v1.0.0`. Pin its bundle digest together with the
+runtime source revision. The bundle identifies the nine message schemas, the
+adversarial fixtures and the executable Rust codec harness. Run
+`scripts/check-host-action-contract.sh` for codec/schema correspondence and
+messages produced by native and deployed DO SQL fixtures. Those fixtures use
+synthetic authority; an embedding must supply its authenticated verifier and
+transport.
+
+A schema-valid command is not authorized. A receipt handle grants no read
+permission, and a retained save receipt can contain protected file text.
+Reconciliation records what happened to a particular external attempt; it does
+not rerun the effect or change a workflow that already consumed its failure.
+The current action execution door covers file read, write, import and export.
+Product migrations and other effect families remain separate work.
+
 ## Reading paths
 
 | Goal | Read |

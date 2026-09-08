@@ -15,6 +15,9 @@
 //! terminal — the record is immutable history, never rewritten (the
 //! no-destructive-verbs surface).
 
+pub mod write_commit;
+pub mod write_evidence;
+
 #[cfg(feature = "native")]
 use std::path::Path;
 
@@ -371,6 +374,22 @@ pub enum ClosurePinState {
 /// Object-safe branch-tier seam, mirroring `Coordination`/`WorkItems`: the
 /// DO host supplies its own implementation over `DoSql`.
 pub trait Branches {
+    /// Commit a fresh write's exact head CAS, immutable cut and operation
+    /// receipt together. A reused cut/operation id refuses; recovery reads the
+    /// original receipt instead of issuing the write again. No non-atomic
+    /// default is permitted for a branch backend.
+    fn commit_write(&mut self, cut: CutRecord<'_>) -> StoreResult<AdvanceOutcome> {
+        self.commit_write_with_evidence(cut, None)
+    }
+    /// Commit the optional retained result in the same branch transaction.
+    fn commit_write_with_evidence(
+        &mut self,
+        cut: CutRecord<'_>,
+        evidence: Option<&write_evidence::WriteEvidenceRef>,
+    ) -> StoreResult<AdvanceOutcome>;
+    fn write_evidence(&self, cut_id: &str)
+        -> StoreResult<Option<write_evidence::WriteEvidenceRef>>;
+
     fn ensure_mainline(&mut self, created_at: &str) -> StoreResult<BranchRow>;
     fn create_branch(&mut self, request: CreateBranch<'_>) -> StoreResult<CreateBranchOutcome>;
     fn get_branch(&self, branch_id: &str) -> StoreResult<Option<BranchRow>>;
@@ -695,6 +714,7 @@ impl BranchStore {
         let mut roots = std::collections::BTreeSet::new();
         for sql in [
             "SELECT manifest_hash FROM cuts",
+            "SELECT content_hash FROM cut_evidence",
             "SELECT head_manifest_hash FROM branches",
             "SELECT branch_point_manifest_hash FROM branches",
             "SELECT resolution FROM resolution_memory",
@@ -777,7 +797,7 @@ fn map_op_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoreResult<OpRow>> {
 #[cfg(feature = "native")]
 /// This store's schema generation. Bumped when its `CREATE TABLE` set
 /// changes in a way an older build cannot read.
-const SATELLITE_SCHEMA_VERSION: i64 = 1;
+const SATELLITE_SCHEMA_VERSION: i64 = 2;
 
 #[cfg(feature = "native")]
 fn ensure_branch_schema(connection: &Connection) -> StoreResult<()> {
@@ -785,6 +805,7 @@ fn ensure_branch_schema(connection: &Connection) -> StoreResult<()> {
     // downgrade guard, so an older binary read a newer file as whatever it
     // parsed. `SqliteStore` has refused that since Phase B.
     crate::stamp_satellite_schema(connection, "branch", SATELLITE_SCHEMA_VERSION)?;
+    connection.execute_batch(write_evidence::CREATE)?;
     connection.execute_batch(
         r#"
         CREATE TABLE IF NOT EXISTS branches (
@@ -916,6 +937,20 @@ fn ensure_column(connection: &Connection, table: &str, column: &str) -> StoreRes
 
 #[cfg(feature = "native")]
 impl Branches for BranchStore {
+    fn commit_write_with_evidence(
+        &mut self,
+        cut: CutRecord<'_>,
+        evidence: Option<&write_evidence::WriteEvidenceRef>,
+    ) -> StoreResult<AdvanceOutcome> {
+        write_commit::native(self, cut, evidence)
+    }
+    fn write_evidence(
+        &self,
+        cut_id: &str,
+    ) -> StoreResult<Option<write_evidence::WriteEvidenceRef>> {
+        write_evidence::native_read(self, cut_id)
+    }
+
     fn ensure_mainline(&mut self, created_at: &str) -> StoreResult<BranchRow> {
         let tx = self
             .connection

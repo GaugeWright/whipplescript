@@ -1,0 +1,93 @@
+--- Terminal worker status is independent of external disposition. A frame
+--- binds effect/attempt/target/input. Proof authentication is abstracted as Bool.
+mod WHIPPLESCRIPT-HOST-ACTION-RECOVERY is
+  protecting BOOL .
+  sorts Key Attempt Target Input Frame Disposition Terminal Evidence Cfg .
+  ops k1 k2 : -> Key [ctor] .
+  ops a1 a2 : -> Attempt [ctor] .
+  ops t1 t2 : -> Target [ctor] .
+  ops i1 i2 : -> Input [ctor] .
+  op frame : Key Attempt Target Input -> Frame [ctor] .
+  ops unknown applied absent : -> Disposition [ctor] .
+  ops completed failed timedOut cancelled : -> Terminal [ctor] .
+  ops e1 e2 : -> Evidence [ctor] .
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+  op state : Frame Disposition -> Cfg [ctor] .
+  op terminal : Frame Terminal -> Cfg [ctor] .
+  op proof : Frame Disposition Evidence Bool -> Cfg [ctor] .
+  op recorded : Frame Disposition Evidence -> Cfg [ctor] .
+  op consistent : Frame -> Cfg [ctor] .
+  op contradiction : Frame Evidence Evidence -> Cfg [ctor] .
+  op refused : Frame -> Cfg [ctor] .
+  op retry : Frame Bool -> Cfg [ctor] .
+  op invoke : Frame -> Cfg [ctor] .
+  op compensate : Key Key Bool -> Cfg [ctor] .
+  op authorizedCompensation : Key Key -> Cfg [ctor] .
+  op compensationRefused : Key -> Cfg [ctor] .
+  vars F : Frame .
+  vars D G : Disposition .
+  vars E H : Evidence .
+  vars K L : Key .
+  vars A : Attempt .
+  vars T : Target .
+  vars I : Input .
+  --- No rule consumes terminal: late evidence can settle a failed attempt.
+  crl [resolve] : state(F, unknown) proof(F, D, E, true)
+    => state(F, D) recorded(F, D, E) if D =/= unknown .
+  rl [reject-forged-evidence] : proof(F, D, E, false) => refused(F) .
+  rl [duplicate-evidence] : state(F, D) recorded(F, D, E) proof(F, D, E, true)
+    => state(F, D) recorded(F, D, E) .
+  crl [retain-corroboration] : state(F, D) recorded(F, D, E) proof(F, D, H, true)
+    => state(F, D) recorded(F, D, E) recorded(F, D, H) if E =/= H .
+  crl [retain-contradiction] : state(F, D) recorded(F, D, E) consistent(F) proof(F, G, H, true)
+    => state(F, D) recorded(F, D, E) recorded(F, G, H) contradiction(F, E, H)
+    if D =/= G /\ D =/= unknown /\ G =/= unknown .
+  --- This sink is unverifiable; only uncontradicted absence allows resubmission.
+  rl [retry-after-absence] : state(frame(K, a1, T, I), absent)
+      consistent(frame(K, a1, T, I)) recorded(frame(K, a1, T, I), absent, E)
+      retry(frame(K, a1, T, I), true)
+    => state(frame(K, a1, T, I), absent) consistent(frame(K, a1, T, I))
+      recorded(frame(K, a1, T, I), absent, E)
+      state(frame(K, a2, T, I), unknown) invoke(frame(K, a2, T, I)) .
+  rl [retry-requires-authority] : retry(F, false) => refused(F) .
+  --- Compensation has a distinct key and fresh authority, preserving the original.
+  crl [admit-compensation] : state(frame(K, A, T, I), applied) compensate(K, L, true)
+    => state(frame(K, A, T, I), applied) authorizedCompensation(L, K) if K =/= L .
+  rl [refuse-compensation] : compensate(K, L, false) => compensationRefused(L) .
+endm
+mod WHIPPLESCRIPT-HOST-ACTION-RECOVERY-TERMINAL is
+  including WHIPPLESCRIPT-HOST-ACTION-RECOVERY .
+  rl [pretend-failure-is-absence] : state(F:Frame, unknown) terminal(F:Frame, failed)
+    => state(F:Frame, absent) terminal(F:Frame, failed) .
+endm
+mod WHIPPLESCRIPT-HOST-ACTION-RECOVERY-FORGED is
+  including WHIPPLESCRIPT-HOST-ACTION-RECOVERY .
+  rl [believe-caller-label] : state(F:Frame, unknown) proof(F:Frame, applied, E:Evidence, false)
+    => state(F:Frame, applied) recorded(F:Frame, applied, E:Evidence) .
+endm
+mod WHIPPLESCRIPT-HOST-ACTION-RECOVERY-FRAME is
+  including WHIPPLESCRIPT-HOST-ACTION-RECOVERY .
+  rl [ignore-attempt-coordinate] : state(frame(K:Key, a1, T:Target, I:Input), unknown)
+      proof(frame(K:Key, a2, T:Target, I:Input), applied, E:Evidence, true)
+    => state(frame(K:Key, a1, T:Target, I:Input), applied) .
+endm
+mod WHIPPLESCRIPT-HOST-ACTION-RECOVERY-OVERWRITE is
+  including WHIPPLESCRIPT-HOST-ACTION-RECOVERY .
+  crl [overwrite-settled-evidence] : state(F:Frame, D:Disposition) recorded(F:Frame, D:Disposition, E:Evidence)
+      proof(F:Frame, G:Disposition, H:Evidence, true)
+    => state(F:Frame, G:Disposition) recorded(F:Frame, G:Disposition, H:Evidence)
+    if D:Disposition =/= G:Disposition .
+endm
+mod WHIPPLESCRIPT-HOST-ACTION-RECOVERY-CONFLICT is
+  including WHIPPLESCRIPT-HOST-ACTION-RECOVERY .
+  rl [retry-despite-contradiction] : state(frame(K:Key, a1, T:Target, I:Input), absent)
+      contradiction(frame(K:Key, a1, T:Target, I:Input), E:Evidence, H:Evidence)
+      retry(frame(K:Key, a1, T:Target, I:Input), true)
+    => invoke(frame(K:Key, a2, T:Target, I:Input)) .
+endm
+mod WHIPPLESCRIPT-HOST-ACTION-RECOVERY-COMPENSATION is
+  including WHIPPLESCRIPT-HOST-ACTION-RECOVERY .
+  rl [borrow-original-authority] : compensate(K:Key, L:Key, false)
+    => authorizedCompensation(L:Key, K:Key) .
+endm

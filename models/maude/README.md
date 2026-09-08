@@ -1,5 +1,20 @@
 # Maude Models
 
+`host-actions.maude` models atomic admission, authenticated provenance,
+request/fingerprint conflict, dispatch intent, replay and remote uncertainty
+for [governed host actions](../../spec/host-actions.md). Its test file pairs
+seven forbidden transitions with reachable negative controls. The model
+abstracts cryptographic verification and SQL transactions; runtime and host
+conformance tests must establish those implementation boundaries.
+
+`host-action-recovery.maude` adds exact attempt/target/input evidence binding,
+late evidence after terminal failure, preserved contradictory evidence,
+suspension of disputed recovery, and fresh authorization for compensation.
+Its 16 searches include six reachable negative controls. The model's sink is
+unverifiable; stronger adapter recovery ceilings and correspondence to the
+store/executor implementation remain separate obligations.
+
+
 Maude is the primary executable-spec target for the WhippleScript kernel and
 for the package/library lowering pipeline.
 

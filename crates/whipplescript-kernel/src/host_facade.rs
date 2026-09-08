@@ -105,6 +105,171 @@ impl<S: RuntimeStore> GovernedHostFacade<S> {
         self.kernel
     }
 
+    /// Admit deterministic human, agent or system work without a conversation.
+    /// Authentication, immutable program identity and IFC all precede storage.
+    pub fn admit_action(
+        &mut self,
+        command: crate::host_protocol::action::HostActionCommand,
+        action: &crate::host_action::CompiledHostAction,
+        verifier: &dyn crate::host_protocol::action::ActionAdmissionVerifier,
+        proof: &[u8],
+    ) -> Result<crate::host_protocol::action::ActionAdmissionReceipt, HostFacadeError>
+    where
+        S: whipplescript_store::log_append::LogAppend,
+    {
+        self.require_policy(&command.policy)?;
+        let admission = crate::host_protocol::action::VerifiedActionAdmission::verify(
+            command,
+            &self.envelope,
+            verifier,
+            proof,
+        )?;
+        for input in admission.command().inputs.values() {
+            self.require_governed(&input.handle)?;
+        }
+        for resource in admission.command().resources.values() {
+            self.require_governed(&resource.resource.handle)?;
+        }
+        self.check_program_ifc(action.program())?;
+        self.kernel.admit_compiled_host_action(action, &admission)
+    }
+
+    /// Execute one ordinary file effect under freshly verified current authority.
+    /// The trusted host supplies the exact, confined file binding authorized by
+    /// its verifier. Product bindings must resolve the original immutable inputs
+    /// and resource bases; a raw ambient filesystem is not such a binding.
+    pub fn execute_action_file_effect(
+        &mut self,
+        request: crate::host_protocol::execution::ExecuteActionEffect,
+        action: &crate::host_action::CompiledHostAction,
+        verifier: &dyn crate::host_protocol::execution::ActionExecutionVerifier,
+        proof: &[u8],
+        files: &dyn whipplescript_store::files::FileStore,
+    ) -> Result<whipplescript_store::StoredEvent, HostFacadeError>
+    where
+        S: whipplescript_store::log_append::LogAppend,
+    {
+        self.require_policy(&request.policy)?;
+        let authenticated = crate::host_protocol::execution::AuthenticatedActionExecution::verify(
+            request,
+            &self.envelope,
+            verifier,
+            proof,
+        )?;
+        let request = authenticated.request();
+        let prefix = self
+            .kernel
+            .store()
+            .chain_prefix(&request.admission.instance_ref)
+            .map_err(HostFacadeError::Store)?;
+        let (original, _) = crate::host_action::recorded_action_command(
+            &request.admission,
+            &request.issuer,
+            &request.scope,
+            &prefix,
+        )?;
+        action.validate_command(&original)?;
+        for input in original.inputs.values() {
+            self.require_governed(&input.handle)?;
+        }
+        for resource in original.resources.values() {
+            self.require_governed(&resource.resource.handle)?;
+        }
+        self.check_program_ifc(action.program())?;
+        let effect = self
+            .kernel
+            .claimable_effects(&request.admission.instance_ref)
+            .map_err(HostFacadeError::Store)?
+            .into_iter()
+            .find(|effect| effect.effect_id == request.effect_id)
+            .ok_or(ProtocolError::Mismatch("execution effect is not claimable"))?;
+        let verified = authenticated.authorize(&original, effect, verifier)?;
+        self.kernel
+            .execute_verified_file_effect(verified, files)
+            .map_err(HostFacadeError::Store)
+    }
+
+    /// Retrieve recorded action evidence under current read authority. This
+    /// projection never re-admits the action or resumes its execution.
+    pub fn read_action_result(
+        &self,
+        request: crate::host_protocol::action_result::ReadActionResult,
+        verifier: &dyn crate::host_protocol::action_result::ActionResultVerifier,
+        proof: &[u8],
+    ) -> Result<crate::host_protocol::action_result::ActionResultSnapshot, HostFacadeError>
+    where
+        S: whipplescript_store::log_append::LogAppend,
+    {
+        self.require_policy(&request.policy)?;
+        let verified = crate::host_protocol::action_result::VerifiedResultRead::verify(
+            request,
+            &self.envelope,
+            verifier,
+            proof,
+        )?;
+        self.require_governed(&verified.request().evidence_handle)?;
+        self.kernel.read_recorded_action_result(&verified)
+    }
+
+    /// Verify the actual retained versioned save under current authority, then
+    /// record its applied disposition through the ordinary reconciliation door.
+    pub fn reconcile_versioned_save<B, C>(
+        &mut self,
+        command: crate::host_protocol::recovery::ReconcileEffectCommand,
+        owner_epoch: i64,
+        source: &crate::save_reconciliation::VersionedSaveEvidenceSource<'_, B, C>,
+        authority: &dyn crate::save_reconciliation::SaveReconciliationAuthority,
+        proof: &[u8],
+    ) -> Result<crate::host_protocol::recovery::ReconciliationReceipt, HostFacadeError>
+    where
+        S: whipplescript_store::log_append::LogAppend,
+        B: whipplescript_store::branches::Branches,
+        C: whipplescript_store::content::ContentBlobs,
+    {
+        self.require_policy(&command.policy)?;
+        authority.authenticate(&command, &command.signing_bytes()?, proof)?;
+        self.require_governed(&command.evidence.evidence_ref)?;
+        let prefix = self
+            .kernel
+            .store()
+            .chain_prefix(&command.evidence.frame.instance_id)
+            .map_err(HostFacadeError::Store)?;
+        let verified =
+            crate::save_reconciliation::prepare(&command, source, &prefix, authority, proof)?;
+        self.reconcile_effect(
+            command,
+            owner_epoch,
+            &verified,
+            proof,
+            verified.target_proof(),
+        )
+    }
+
+    /// Record authenticated target evidence without executing or retrying a sink.
+    /// The embedding host supplies its already-held log ownership fence.
+    pub fn reconcile_effect(
+        &mut self,
+        command: crate::host_protocol::recovery::ReconcileEffectCommand,
+        owner_epoch: i64,
+        verifier: &dyn crate::host_protocol::recovery::EffectEvidenceVerifier,
+        authorization_proof: &[u8],
+        target_proof: &[u8],
+    ) -> Result<crate::host_protocol::recovery::ReconciliationReceipt, HostFacadeError>
+    where
+        S: whipplescript_store::log_append::LogAppend,
+    {
+        self.require_policy(&command.policy)?;
+        let verified = crate::host_protocol::recovery::VerifiedReconciliation::verify(
+            command,
+            &self.envelope,
+            verifier,
+            authorization_proof,
+            target_proof,
+        )?;
+        self.require_governed(&verified.command().evidence.evidence_ref)?;
+        self.kernel.record_reconciliation(&verified, owner_epoch)
+    }
+
     /// Create or replay the placement's durable runtime instance for a product
     /// engagement. The registered program is the exact pinned package IR, so a
     /// DO driver can reattach after eviction without recompiling a different
@@ -393,7 +558,14 @@ impl<S: RuntimeStore> GovernedHostFacade<S> {
     }
 
     fn check_package_ifc(&self, package: &ResolvedPackage) -> Result<(), HostFacadeError> {
-        let diagnostics = crate::ifc::check_with_envelope(&package.program, &self.envelope);
+        self.check_program_ifc(&package.program)
+    }
+
+    fn check_program_ifc(
+        &self,
+        program: &whipplescript_parser::IrProgram,
+    ) -> Result<(), HostFacadeError> {
+        let diagnostics = crate::ifc::check_with_envelope(program, &self.envelope);
         if diagnostics.is_empty() {
             Ok(())
         } else {
@@ -558,7 +730,7 @@ impl From<ProtocolError> for HostFacadeError {
     }
 }
 
-fn positive_sequence(sequence: i64) -> Result<u64, HostFacadeError> {
+pub(crate) fn positive_sequence(sequence: i64) -> Result<u64, HostFacadeError> {
     u64::try_from(sequence)
         .ok()
         .filter(|sequence| *sequence > 0)

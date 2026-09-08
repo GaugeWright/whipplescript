@@ -8,11 +8,14 @@
 //! Schema and semantics mirror the native store exactly: O(1) pointer
 //! creation, pinned branch points, optimistic head guards, fail-closed
 //! terminal statuses, write-once instance binding. The DO is
-//! single-writer, so the native store's transactions collapse to plain
-//! statement sequences here (the same posture the coordination parity
-//! impl takes). Content blobs share the DO's existing `content_blobs`
+//! single-writer. File writes still need a transaction around head, cut and
+//! operation receipt: a failed SQL statement must roll the whole write back.
+//! Content blobs share the DO's existing `content_blobs`
 //! table (the one checkpoint manifests already live in), created
 //! defensively for stores that predate it.
+
+#[cfg(test)]
+mod write_tests;
 
 use std::collections::BTreeSet;
 
@@ -41,6 +44,9 @@ impl<S: DoSql> DoBranches<S> {
     }
 
     fn ensure_schema(&self) -> StoreResult<()> {
+        self.sql
+            .execute(whipplescript_store::branches::write_evidence::CREATE, &[])
+            .map_err(sql_err)?;
         for statement in [
             "CREATE TABLE IF NOT EXISTS branches (
                 branch_id TEXT PRIMARY KEY,
@@ -215,6 +221,89 @@ impl<S: DoSql> DoBranches<S> {
 }
 
 impl<S: DoSql> Branches for DoBranches<S> {
+    fn write_evidence(
+        &self,
+        cut_id: &str,
+    ) -> StoreResult<Option<whipplescript_store::branches::write_evidence::WriteEvidenceRef>> {
+        use whipplescript_store::branches::write_evidence::{WriteEvidenceRef, SELECT};
+        let rows = self.sql.query(SELECT, &[text(cut_id)]).map_err(sql_err)?;
+        Ok(rows.first().map(|row| WriteEvidenceRef {
+            schema_ref: as_text(&row[0]),
+            label_ref: as_text(&row[1]),
+            content_hash: as_text(&row[2]),
+        }))
+    }
+    fn commit_write_with_evidence(
+        &mut self,
+        cut: CutRecord<'_>,
+        evidence: Option<&whipplescript_store::branches::write_evidence::WriteEvidenceRef>,
+    ) -> StoreResult<AdvanceOutcome> {
+        use whipplescript_store::branches::write_commit::{self, WritePreparation};
+        if let Some(evidence) = evidence {
+            evidence.validate()?;
+        }
+        crate::do_store::recovery::atomic_result(&self.sql, false, &mut || {
+            let row = self.row_by_id(cut.branch_id)?;
+            let reservation = self.head_reservation(cut.branch_id)?;
+            let (after, deltas) = match write_commit::prepare(row, reservation, cut)? {
+                WritePreparation::Ready { after, deltas } => (after, deltas),
+                WritePreparation::Refused(outcome) => return Ok(outcome),
+            };
+            self.sql
+                .execute(
+                    write_commit::INSERT_CUT,
+                    &[
+                        text(cut.cut_id),
+                        text(cut.change_id),
+                        text(cut.branch_id),
+                        text(cut.manifest_hash),
+                        opt_text(cut.parent_cut_id),
+                        opt_text(cut.origin),
+                        opt_text(cut.actor),
+                        opt_text(cut.intent),
+                        text(cut.recorded_at),
+                    ],
+                )
+                .map_err(sql_err)?;
+            self.sql
+                .execute(
+                    write_commit::ADVANCE_HEAD,
+                    &[
+                        text(cut.branch_id),
+                        text(cut.cut_id),
+                        text(cut.manifest_hash),
+                        text(cut.recorded_at),
+                    ],
+                )
+                .map_err(sql_err)?;
+            self.sql
+                .execute(
+                    write_commit::INSERT_OP,
+                    &[
+                        text(&format!("op-{}", cut.cut_id)),
+                        text(&deltas),
+                        opt_text(cut.origin),
+                        text(cut.recorded_at),
+                    ],
+                )
+                .map_err(sql_err)?;
+            if let Some(evidence) = evidence {
+                self.sql
+                    .execute(
+                        whipplescript_store::branches::write_evidence::INSERT,
+                        &[
+                            text(cut.cut_id),
+                            text(&evidence.schema_ref),
+                            text(&evidence.label_ref),
+                            text(&evidence.content_hash),
+                        ],
+                    )
+                    .map_err(sql_err)?;
+            }
+            Ok(AdvanceOutcome::Advanced(after))
+        })
+    }
+
     fn ensure_mainline(&mut self, created_at: &str) -> StoreResult<BranchRow> {
         self.sql
             .execute(

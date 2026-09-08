@@ -6,10 +6,11 @@ time and runs the suite. If the suite still passes, nothing was exercising that
 refusal, and the compiler is free to stop refusing without any gate noticing.
 
 The sweep is itself an instrument that can fail silently — a mutation that never
-lands reports every refusal as covered. So it self-tests first: it plants
-refusals nothing can reach and requires the sweep to report them as
-unexercised. If a planted refusal comes back "caught", the sweep is broken and
-the run fails before reporting anything about real code.
+lands reports every refusal as covered. So it self-tests first: it combines
+independent mutations of unreachable calibration functions and runs the same
+suite. Every mutation must apply without touching real code or another edit,
+and the combined trial must compile and pass. A calibration failure refuses
+qualification before the one-at-a-time trials of actual refusals.
 
 Usage:
     mutation_sweep.py --target <file> --filter <cargo test filter> [--limit N]
@@ -21,12 +22,14 @@ a dispatch-only deep suite and not part of the green bar.
 from __future__ import annotations
 
 import argparse
+import difflib
 import os
 import re
 import shlex
 import shutil
 import subprocess
 import sys
+from pathlib import Path
 from dataclasses import dataclass
 
 # A refusal is either pushed onto a diagnostic list or returned as an error.
@@ -863,14 +866,14 @@ def sweep(
     """Returns (unexercised refusals, sites the sweep could not measure)."""
     survivors: list[Site] = []
     unmeasured: list[Site] = []
-    source = open(backup).read().split("\n")
+    source = Path(backup).read_text().split("\n")
     for number, site in enumerate(sites, 1):
         mutated = apply_mutation(source, site)
         if mutated is None:
             print(f"  {number:4d}/{len(sites)}  SKIP (no mutation)  {site.label}", flush=True)
             unmeasured.append(site)
             continue
-        open(target, "w").write("\n".join(mutated))
+        Path(target).write_text("\n".join(mutated))
         outcome = run_suite(filter_expr)
         if outcome == PASSED:
             survivors.append(site)
@@ -1176,22 +1179,55 @@ fn mutation_sweep_self_test_wrapped_unit(route: Option<u8>) -> MutationSweepWrap
 PLANT_COUNT = 17
 
 
-def self_test(target: str, filter_expr: str, backup: str) -> bool:
-    """Plant refusals nothing can reach, and require the sweep to find them.
+def batch_unreachable_mutations(lines: list[str], sites: list[Site], start: int) -> list[str]:
+    """Combine independent edits to synthetic, unreachable calibration code only.
 
-    This is the sweep's own bite test. Its failure mode — a mutation that never
-    lands, so every refusal reports as covered — looks exactly like a clean
-    result, and would turn this script into the thing it exists to detect.
+    Every mutation is computed against the SAME source, just as a real sweep
+    computes each trial against its backup. Refuse no-ops, edits to real code,
+    and overlapping edits: one calibration mutation must not erase another.
+    Real refusal trials continue to use `sweep`, one mutation at a time.
     """
-    source = open(backup).read()
-    # Plants are selected by POSITION, not by their message. The fifth plant is
-    # a message-less guarded refusal — the shape `neutralise_guard` exists for —
-    # so a marker match would silently drop the one plant whose whole point is
-    # having no text, and the self test would keep reporting four of four.
-    original_lines = len(source.split("\n"))
-    open(target, "w").write(source + PLANT)
-    planted = find_sites(open(target).read().split("\n"))
-    matching = [site for site in planted if site.line >= original_lines]
+    edits: list[tuple[int, int, list[str]]] = []
+    for site in sites:
+        mutated = apply_mutation(lines, site)
+        if mutated is None or mutated == lines:
+            raise ValueError(f"no calibration mutation applied at {site.line}: {site.label}")
+        for tag, first, last, new_first, new_last in difflib.SequenceMatcher(
+            a=lines, b=mutated, autojunk=False
+        ).get_opcodes():
+            if tag == "equal":
+                continue
+            if first < start:
+                raise ValueError("calibration mutation changed the real source")
+            # Inclusive endpoints also reject two insertions at one offset or
+            # an insertion at another mutation's replacement boundary.
+            if any(first <= old_last and old_first <= last for old_first, old_last, _ in edits):
+                raise ValueError("calibration mutations overlap")
+            edits.append((first, last, mutated[new_first:new_last]))
+    result = list(lines)
+    for first, last, replacement in sorted(edits, reverse=True):
+        result[first:last] = replacement
+    return result
+
+
+def self_test(target: str, filter_expr: str, backup: str) -> bool:
+    """Compile every calibration mutation together, then run the actual suite.
+
+    The plants are unreachable functions with independent edits. Running the
+    entire package once per plant measured the same unaffected tests 17 times
+    per file: PR #428 spent 75 minutes here and timed out after only eight real
+    refusals. One combined trial proves all those edits compile in this file's
+    real context and the selected package/filter runs without reporting a catch.
+    A malformed or interfering edit, build failure, or
+    reproducible test failure still refuses qualification. Actual refusals are
+    never batched, and no verdict is reused across files or invocations.
+    """
+    source = Path(backup).read_text()
+    # Select by position, including message-less guarded/typed refusals.
+    original = source.split("\n")
+    first_plant = len(original)
+    lines = original + PLANT.split("\n")
+    matching = [site for site in find_sites(lines) if site.line > first_plant]
     if len(matching) != PLANT_COUNT:
         print(
             f"SELF TEST FAILED: the site scanner found {len(matching)} of the "
@@ -1199,21 +1235,18 @@ def self_test(target: str, filter_expr: str, backup: str) -> bool:
             file=sys.stderr,
         )
         return False
-    survivors, unmeasured = sweep(target, filter_expr, matching, target)
-    if unmeasured:
-        print(
-            "SELF TEST FAILED: the sweep could not measure a planted refusal, so "
-            "its mutations do not compile",
-            file=sys.stderr,
-        )
+    try:
+        mutated = batch_unreachable_mutations(lines, matching, first_plant)
+    except ValueError as error:
+        print(f"SELF TEST FAILED: {error}", file=sys.stderr)
         return False
-    if len(survivors) != PLANT_COUNT:
-        print(
-            "SELF TEST FAILED: the sweep reported an unreachable planted refusal "
-            "as exercised, so its mutations are not landing",
-            file=sys.stderr,
-        )
+    Path(target).write_text("\n".join(mutated))
+    outcome = run_suite(filter_expr)
+    if outcome != PASSED:
+        detail = "calibration did not compile/run" if outcome == BUILD_FAILED else "unreachable calibration was reported caught"
+        print(f"SELF TEST FAILED: {detail}", file=sys.stderr)
         return False
+    print(f"self test: all {len(matching)} independent calibration mutations compile; suite passes", flush=True)
     return True
 
 
@@ -1247,7 +1280,7 @@ def main() -> int:
         return 2
 
     if args.list_sites:
-        for site in find_sites(open(target).read().split("\n")):
+        for site in find_sites(Path(target).read_text().split("\n")):
             print(f"{site.line}\t{site.label}")
         return 0
 
@@ -1260,7 +1293,7 @@ def main() -> int:
             return 1
         shutil.copy(backup, target)
 
-        sites = find_sites(open(backup).read().split("\n"))
+        sites = find_sites(Path(backup).read_text().split("\n"))
         if args.only_lines:
             wanted = {int(part) for part in args.only_lines.split(",") if part.strip()}
             sites = [site for site in sites if site.line in wanted]

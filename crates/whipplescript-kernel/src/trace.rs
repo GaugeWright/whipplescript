@@ -235,8 +235,8 @@ fn check_record(state: &mut TraceState, record: &TraceRecord) -> Result<(), Trac
             // (policy/capacity/dependency block). The store's `start_run` re-checks
             // the block condition and, if it now clears, transitions the effect
             // straight to `running` in one atomic step — there is no separate
-            // observable "unblock" event to re-queue first (unlike lease expiry,
-            // which does emit one). So the claim absorbs the store's unblock: this
+            // observable "unblock" event to re-queue first. Lease expiry instead
+            // holds a failed effect for recovery. The claim absorbs the store's unblock: this
             // is the folded refinement of the lifecycle models' explicit
             // `blocked -> queued -> claimed` (see models/trace-conformance.md,
             // kernel.maude `policy-release`/`capacity-release`, and
@@ -318,9 +318,10 @@ fn check_record(state: &mut TraceState, record: &TraceRecord) -> Result<(), Trac
                 );
             }
             state.stale_runs.insert(run_id.clone());
+            state.terminal_effects.insert(effect_id.clone());
             state
                 .effects
-                .insert(effect_id.clone(), EffectStatus::Queued);
+                .insert(effect_id.clone(), EffectStatus::Failed);
         }
         TraceEvent::EffectTerminal {
             run_id,
@@ -339,12 +340,6 @@ fn check_record(state: &mut TraceState, record: &TraceRecord) -> Result<(), Trac
                     format!("terminal event for unknown effect {effect_id}"),
                 );
             }
-            if state.terminal_effects.contains(effect_id) {
-                return violation(
-                    record,
-                    format!("duplicate terminal event for effect {effect_id}"),
-                );
-            }
             let Some(run_effect_id) = state.run_effects.get(run_id) else {
                 return violation(record, format!("terminal event for unknown run {run_id}"));
             };
@@ -356,6 +351,12 @@ fn check_record(state: &mut TraceState, record: &TraceRecord) -> Result<(), Trac
             }
             if state.stale_runs.contains(run_id) {
                 return violation(record, format!("terminal event from stale run {run_id}"));
+            }
+            if state.terminal_effects.contains(effect_id) {
+                return violation(
+                    record,
+                    format!("duplicate terminal event for effect {effect_id}"),
+                );
             }
             if !state.live_runs.remove(run_id) {
                 return violation(record, format!("terminal event for non-live run {run_id}"));
@@ -2100,7 +2101,8 @@ mod tests {
             start(3, "a"),
             cancellation_request(4, "a"),
             expire_lease(5, "a"),
-            claim(6, "a"),
+            retried(6, "a"),
+            claim(7, "a"),
         ];
 
         let violation = check_trace(&trace).expect_err("cancel-requested effect claim fails");

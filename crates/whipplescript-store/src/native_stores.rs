@@ -108,7 +108,40 @@ impl crate::vcs::FrontierRead for NativeStores {
     }
 }
 
+impl crate::log_append::LogAppend for NativeStores {
+    fn chain_head(&self, instance_id: &str) -> StoreResult<crate::event_chain::ChainHead> {
+        self.runtime.chain_head(instance_id)
+    }
+    fn instance_owner_epoch(&self, instance_id: &str) -> StoreResult<i64> {
+        self.runtime.instance_owner_epoch(instance_id)
+    }
+    fn claim_instance_ownership(&mut self, instance_id: &str) -> StoreResult<i64> {
+        self.runtime.claim_instance_ownership(instance_id)
+    }
+    fn append_event_fenced(
+        &mut self,
+        owner_epoch: i64,
+        expected_head: &str,
+        event: NewEvent<'_>,
+    ) -> StoreResult<StoredEvent> {
+        self.runtime
+            .append_event_fenced(owner_epoch, expected_head, event)
+    }
+    fn chain_prefix(
+        &self,
+        instance_id: &str,
+    ) -> StoreResult<Vec<crate::event_chain::OwnedChainEntry>> {
+        crate::log_append::LogAppend::chain_prefix(&self.runtime, instance_id)
+    }
+}
+
 impl RuntimeStore for NativeStores {
+    fn admit_host_action(
+        &mut self,
+        action: crate::host_actions::HostActionStart<'_>,
+    ) -> StoreResult<crate::host_actions::HostActionAdmission> {
+        self.runtime.admit_host_action(action)
+    }
     fn schema_version(&self) -> StoreResult<i64> {
         self.runtime.schema_version()
     }
@@ -257,6 +290,16 @@ impl RuntimeStore for NativeStores {
 
     fn admit_fact_batch(&mut self, batch: FactBatch<'_>) -> StoreResult<FactBatchOutcome> {
         self.runtime.admit_fact_batch(batch)
+    }
+
+    fn settle_file_effect(
+        &mut self,
+        completion: EffectCompletion<'_>,
+        diagnostic: Option<TerminalDiagnosticRecord>,
+        fact: crate::file_settlement::FileSettlementFact<'_>,
+    ) -> StoreResult<StoredEvent> {
+        self.runtime
+            .settle_file_effect(completion, diagnostic, fact)
     }
 
     fn complete_effect(&mut self, completion: EffectCompletion<'_>) -> StoreResult<StoredEvent> {
@@ -595,6 +638,18 @@ impl RuntimeStore for NativeStores {
 
     fn start_run(&mut self, run: RunStart<'_>) -> StoreResult<StoredEvent> {
         self.runtime.start_run(run)
+    }
+
+    fn start_dispatch(&mut self, run: RunStart<'_>) -> StoreResult<StoredEvent> {
+        RuntimeStore::start_dispatch(&mut self.runtime, run)
+    }
+
+    fn start_dispatch_observed(
+        &mut self,
+        run: RunStart<'_>,
+        expected: &ClaimableEffect,
+    ) -> StoreResult<StoredEvent> {
+        RuntimeStore::start_dispatch_observed(&mut self.runtime, run, expected)
     }
 
     fn block_effect_binding(
@@ -986,6 +1041,26 @@ impl WorkItems for NativeStores {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_stores_log_append_conformance() {
+        crate::log_append::conformance::run_suite(
+            || {
+                let mut stores = NativeStores::open_in_memory().unwrap();
+                let version = crate::host_actions::conformance::register(&mut stores);
+                let instance = stores
+                    .create_instance(NewInstance {
+                        program_id: &version.program_id,
+                        version_id: &version.version_id,
+                        input_json: "{}",
+                    })
+                    .unwrap();
+                (stores, instance.instance_id)
+            },
+            0..64,
+        )
+        .unwrap();
+    }
 
     fn temp(label: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!(

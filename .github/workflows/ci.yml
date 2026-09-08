@@ -195,18 +195,11 @@ jobs:
       contents: read
       checks: read
       pull-requests: read
-    # Raised from 55 on 2026-09-05, after a run was killed at 55m16s mid-sweep.
-    #
-    # The cost is dominated by per-FILE overhead rather than per-refusal: the
-    # sweep re-runs its eight-mutation self test for every file it touches, and
-    # a CLI-crate rebuild is ~1.9 minutes against ~0.4 for the parser. A change
-    # touching two CLI files and two parser files therefore pays roughly
-    # 32 self-test cycles before it measures a single refusal — about 52
-    # minutes for twelve sites, which is what overran.
-    #
-    # 75 is headroom for that shape rather than a new ceiling to grow into. The
-    # real repair is to stop paying the self test once per file, and it is
-    # tracked rather than done here.
+    # Calibration compiles the 17 independent, unreachable plant mutations
+    # together and runs the real package suite once per file. Actual refusal
+    # trials remain separate. Re-running that whole suite 17 times per file
+    # exhausted this limit on PR #428 before it reached its ninth real site.
+    # Keep the existing limit; reducing repeated calibration is the repair.
     timeout-minutes: 75
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7

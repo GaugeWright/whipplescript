@@ -439,6 +439,41 @@ fn e2e_concurrent_instances_do_not_cross_contaminate_facts() {
 
 #[test]
 fn e2e_lease_expiry_and_retry_recover_effects() {
+    // This kernel/storage journey supplies a verified-evidence fixture. Target
+    // authentication belongs to the separate public reconciliation boundary.
+    let absent = |kernel: &RuntimeKernel<NativeStores>, instance_id: &str, run_id: &str| {
+        use whipplescript_store::effect_recovery::{
+            fold_attempts, DispositionEvidence, EvidenceDisposition,
+        };
+        let events = kernel
+            .store()
+            .list_events(instance_id)
+            .expect("dispatch history");
+        let attempt = fold_attempts(instance_id, "tell", &events)
+            .expect("fold attempts")
+            .into_iter()
+            .find(|attempt| attempt.run_id == run_id)
+            .expect("the exact attempt");
+        let evidence = DispositionEvidence {
+            frame: attempt.dispatch.expect("recorded coordinates").frame,
+            disposition: EvidenceDisposition::NotApplied,
+            evidence_ref: format!("fixture:{run_id}"),
+            evidence_digest: "fixture:digest".into(),
+            authority_ref: "fixture:target".into(),
+        };
+        kernel
+            .store()
+            .append_event(whipplescript_store::NewEvent {
+                instance_id,
+                event_type: "effect.disposition.recorded",
+                source: "kernel",
+                payload_json: &serde_json::to_string(&evidence).expect("fixture evidence"),
+                causation_id: Some(run_id),
+                correlation_id: None,
+                idempotency_key: Some(&evidence.evidence_ref),
+            })
+            .expect("record verified evidence fixture");
+    };
     let source = include_str!("../../../examples/ralph.whip");
     let (mut kernel, instance_id) = kernel_from_source("Ralph", source);
     commit_single_effect(
@@ -464,6 +499,21 @@ fn e2e_lease_expiry_and_retry_recover_effects() {
         .expire_leases(&instance_id, "2030-01-02T00:00:00Z")
         .expect("lease expires");
     assert_eq!(expired.len(), 1);
+
+    let first_retry = whipplescript_store::RetryEffect {
+        instance_id: &instance_id,
+        effect_id: "tell",
+        retry_after: None,
+        idempotency_key: Some("retry-after-expiry"),
+    };
+    assert!(
+        kernel.retry_effect(first_retry).is_err(),
+        "expiry is not proof of absence"
+    );
+    absent(&kernel, &instance_id, "run-tell-1");
+    kernel
+        .retry_effect(first_retry)
+        .expect("retry after proved absence");
 
     kernel
         .start_run(RunStart {
@@ -491,14 +541,18 @@ fn e2e_lease_expiry_and_retry_recover_effects() {
             idempotency_key: Some("fail-run-tell-2"),
         })
         .expect("second run fails");
-    kernel
-        .retry_effect(whipplescript_store::RetryEffect {
-            instance_id: &instance_id,
-            effect_id: "tell",
-            retry_after: None,
-            idempotency_key: Some("retry-tell"),
-        })
-        .expect("effect retries");
+    let second_retry = whipplescript_store::RetryEffect {
+        instance_id: &instance_id,
+        effect_id: "tell",
+        retry_after: None,
+        idempotency_key: Some("retry-tell"),
+    };
+    assert!(
+        kernel.retry_effect(second_retry).is_err(),
+        "first attempt evidence cannot settle the second"
+    );
+    absent(&kernel, &instance_id, "run-tell-2");
+    kernel.retry_effect(second_retry).expect("effect retries");
 
     // Re-run the retried effect to completion. This exercises the recovery
     // transition `failed -> queued -> claimed -> running -> completed`; before the

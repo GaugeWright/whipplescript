@@ -72,6 +72,25 @@ pub enum SaveWithBaseOutcome {
     UnknownBaseCut,
 }
 
+/// Exact inputs and output of one candidate save, before its head CAS. A
+/// retry computes a new plan; only the winning cut publishes its result ref.
+pub struct SaveCommitPlan<'a> {
+    pub branch_id: &'a str,
+    pub path: &'a str,
+    pub base_cut_id: &'a str,
+    pub parent_cut_id: Option<&'a str>,
+    pub cut_id: &'a str,
+    pub draft: &'a str,
+    pub accepted: &'a str,
+    pub pieces: Option<&'a [MergePiece]>,
+}
+
+/// Pure result construction. The VCS retains the returned bytes, then commits
+/// their labeled reference with the cut. Implementations do not dispatch I/O.
+pub trait SaveResultEvidenceBuilder {
+    fn prepare(&self, plan: &SaveCommitPlan<'_>) -> StoreResult<crate::files::FileWriteEvidence>;
+}
+
 /// A read-only merge preview (spec §12.1): exactly what `save_with_base`
 /// would compute, without writing — the editor's live fold.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1029,6 +1048,32 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
         self.branches.get_cut(cut_id)
     }
 
+    pub fn write_evidence(
+        &self,
+        cut_id: &str,
+    ) -> StoreResult<Option<crate::branches::write_evidence::WriteEvidenceRef>> {
+        self.branches.write_evidence(cut_id)
+    }
+
+    fn prepare_save_evidence(
+        &self,
+        builder: Option<&dyn SaveResultEvidenceBuilder>,
+        plan: SaveCommitPlan<'_>,
+    ) -> StoreResult<Option<crate::branches::write_evidence::WriteEvidenceRef>> {
+        builder
+            .map(|builder| {
+                let payload = builder.prepare(&plan)?;
+                let reference = crate::branches::write_evidence::WriteEvidenceRef {
+                    schema_ref: payload.schema_ref,
+                    label_ref: payload.label_ref,
+                    content_hash: self.content.put(&payload.content)?,
+                };
+                reference.validate()?;
+                Ok(reference)
+            })
+            .transpose()
+    }
+
     pub fn list_cuts(&self, branch_id: &str, limit: usize) -> StoreResult<Vec<CutRow>> {
         self.branches.list_cuts(branch_id, limit)
     }
@@ -1244,6 +1289,33 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
         let Some(row) = self.branches.get_branch(branch_id)? else {
             return Ok(VcsWriteOutcome::BranchMissing);
         };
+        self.write_from(row, path, body, cut_id, at)
+    }
+
+    /// Preserve the exact head used to calculate a write or merge. Reading a
+    /// newer head here would turn a stale save into an unguarded overwrite.
+    fn write_from(
+        &mut self,
+        row: BranchRow,
+        path: &str,
+        body: Option<&str>,
+        cut_id: &str,
+        at: &str,
+    ) -> StoreResult<VcsWriteOutcome> {
+        self.write_from_with_evidence(row, path, body, cut_id, at, None)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn write_from_with_evidence(
+        &mut self,
+        row: BranchRow,
+        path: &str,
+        body: Option<&str>,
+        cut_id: &str,
+        at: &str,
+        evidence: Option<&crate::branches::write_evidence::WriteEvidenceRef>,
+    ) -> StoreResult<VcsWriteOutcome> {
+        let branch_id = row.branch_id.as_str();
         if row.status != BranchStatus::Active {
             return Ok(VcsWriteOutcome::BranchNotActive);
         }
@@ -1263,35 +1335,22 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
         }
         let manifest_hash =
             self.advance_manifest(row.head_manifest_hash.as_deref(), &working_set.changes())?;
-        match self.branches.advance_head(
-            branch_id,
-            row.head_cut_id.as_deref(),
-            cut_id,
-            &manifest_hash,
-            at,
+        let origin = format!("write:{path}");
+        match self.branches.commit_write_with_evidence(
+            CutRecord {
+                cut_id,
+                change_id: cut_id,
+                branch_id,
+                manifest_hash: &manifest_hash,
+                parent_cut_id: row.head_cut_id.as_deref(),
+                origin: Some(&origin),
+                actor: self.actor.as_deref(),
+                intent: self.intent.as_deref(),
+                recorded_at: at,
+            },
+            evidence,
         )? {
-            AdvanceOutcome::Advanced(advanced) => {
-                // A write is a NEW intent: the change id is born equal to
-                // the cut id and survives every later rewrite of the cut.
-                let origin = format!("write:{path}");
-                self.branches.record_cut(CutRecord {
-                    cut_id,
-                    change_id: cut_id,
-                    branch_id,
-                    manifest_hash: &manifest_hash,
-                    parent_cut_id: row.head_cut_id.as_deref(),
-                    origin: Some(&origin),
-                    actor: self.actor.as_deref(),
-                    intent: self.intent.as_deref(),
-                    recorded_at: at,
-                })?;
-                self.log_op(
-                    &format!("op-{cut_id}"),
-                    "write",
-                    vec![Self::op_delta(Some(&row), &advanced)],
-                    Some(&origin),
-                    at,
-                )?;
+            AdvanceOutcome::Advanced(_) => {
                 self.note_fact(
                     "vcs.cut.recorded",
                     branch_id,
@@ -1532,16 +1591,20 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
         Ok(TextMergeOutcome::from_pieces(refined))
     }
 
-    /// A path's body at a specific recorded cut (the editor's read base).
-    fn body_at_cut(&self, cut_id: &str, path: &str) -> StoreResult<Option<String>> {
-        let Some(cut) = self.branches.get_cut(cut_id)? else {
+    /// Read one path at an exact immutable cut by keyed manifest descent.
+    /// An absent path is `None`; an unavailable cut or retained blob refuses.
+    /// Erasure must not be interpreted as a concurrent deletion during merge.
+    pub fn read_at_cut(&self, cut_id: &str, path: &str) -> StoreResult<Option<String>> {
+        let cut = self
+            .branches
+            .get_cut(cut_id)?
+            .ok_or_else(|| StoreError::Conflict("save evidence cut is unavailable".into()))?;
+        let Some(id) = self.manifest_entry(Some(&cut.manifest_hash), path)? else {
             return Ok(None);
         };
-        let manifest = self.load_manifest(Some(&cut.manifest_hash))?;
-        let Some(id) = manifest.get(path) else {
-            return Ok(None);
-        };
-        self.content.get(id)
+        self.content.get(&id)?.map(Some).ok_or_else(|| {
+            StoreError::Conflict("save evidence content is unavailable or erased".into())
+        })
     }
 
     /// The base-carrying editor save (spec §12.1). `resolutions` from a
@@ -1564,6 +1627,32 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
         cut_id: &str,
         at: &str,
     ) -> StoreResult<SaveWithBaseOutcome> {
+        self.save_with_base_recorded(
+            branch_id,
+            path,
+            draft,
+            base_cut_id,
+            resolutions,
+            cut_id,
+            at,
+            None,
+        )
+    }
+
+    /// Base-aware save with a result retained at the winning cut's atomic
+    /// commit. Prepared results for losing head races remain unreferenced.
+    #[allow(clippy::too_many_arguments)]
+    pub fn save_with_base_recorded(
+        &mut self,
+        branch_id: &str,
+        path: &str,
+        draft: &str,
+        base_cut_id: &str,
+        resolutions: &[RegionResolution],
+        cut_id: &str,
+        at: &str,
+        builder: Option<&dyn SaveResultEvidenceBuilder>,
+    ) -> StoreResult<SaveWithBaseOutcome> {
         self.record_region_resolutions(resolutions, at)?;
         if self.branches.get_cut(base_cut_id)?.is_none() {
             return Ok(SaveWithBaseOutcome::UnknownBaseCut);
@@ -1573,18 +1662,45 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
                 return Ok(SaveWithBaseOutcome::BranchMissing);
             };
             let head_cut = branch.head_cut_id.clone();
-            let base_body = self.body_at_cut(base_cut_id, path)?;
-            let head_body = self.read(branch_id, path)?;
+            let base_body = self.read_at_cut(base_cut_id, path)?;
+            let head_body = match Self::cut_ref(&head_cut) {
+                Some(cut) => self.read_at_cut(cut, path)?,
+                None => None,
+            };
             if Self::cut_ref(&head_cut) == Some(base_cut_id) || head_body == base_body {
-                return Ok(
-                    match self.write(branch_id, path, Some(draft), cut_id, at)? {
-                        VcsWriteOutcome::Written { cut_id, .. } => {
-                            SaveWithBaseOutcome::Written { cut_id }
-                        }
-                        VcsWriteOutcome::BranchMissing => SaveWithBaseOutcome::BranchMissing,
-                        VcsWriteOutcome::BranchNotActive => SaveWithBaseOutcome::BranchNotActive,
+                let evidence = self.prepare_save_evidence(
+                    builder,
+                    SaveCommitPlan {
+                        branch_id,
+                        path,
+                        base_cut_id,
+                        parent_cut_id: head_cut.as_deref(),
+                        cut_id,
+                        draft,
+                        accepted: draft,
+                        pieces: None,
                     },
-                );
+                )?;
+                match self.write_from_with_evidence(
+                    branch,
+                    path,
+                    Some(draft),
+                    cut_id,
+                    at,
+                    evidence.as_ref(),
+                ) {
+                    Ok(VcsWriteOutcome::Written { cut_id, .. }) => {
+                        return Ok(SaveWithBaseOutcome::Written { cut_id });
+                    }
+                    Ok(VcsWriteOutcome::BranchMissing) => {
+                        return Ok(SaveWithBaseOutcome::BranchMissing)
+                    }
+                    Ok(VcsWriteOutcome::BranchNotActive) => {
+                        return Ok(SaveWithBaseOutcome::BranchNotActive)
+                    }
+                    Err(StoreError::Conflict(_)) => continue,
+                    Err(other) => return Err(other),
+                }
             }
             let config = crate::text_merge::TextMergeConfig::from_env();
             let outcome = match (&base_body, &head_body) {
@@ -1604,7 +1720,27 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
             };
             match self.apply_region_memory(outcome)? {
                 TextMergeOutcome::Clean { merged, pieces } => {
-                    match self.write(branch_id, path, Some(&merged), cut_id, at) {
+                    let evidence = self.prepare_save_evidence(
+                        builder,
+                        SaveCommitPlan {
+                            branch_id,
+                            path,
+                            base_cut_id,
+                            parent_cut_id: head_cut.as_deref(),
+                            cut_id,
+                            draft,
+                            accepted: &merged,
+                            pieces: Some(&pieces),
+                        },
+                    )?;
+                    match self.write_from_with_evidence(
+                        branch,
+                        path,
+                        Some(&merged),
+                        cut_id,
+                        at,
+                        evidence.as_ref(),
+                    ) {
                         Ok(VcsWriteOutcome::Written { cut_id, .. }) => {
                             return Ok(SaveWithBaseOutcome::Merged {
                                 cut_id,
@@ -1654,7 +1790,7 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
             return Ok(None);
         };
         let head_cut = branch.head_cut_id.clone();
-        let base_body = self.body_at_cut(base_cut_id, path)?;
+        let base_body = self.read_at_cut(base_cut_id, path)?;
         let head_body = self.read(branch_id, path)?;
         if Self::cut_ref(&head_cut) == Some(base_cut_id) || head_body == base_body {
             return Ok(Some(MergePreview {
@@ -5619,6 +5755,121 @@ mod tests {
             Some("The swift grey fox jumps over the lazy dog tomorrow.".to_owned()),
             "a conflicted save writes NOTHING"
         );
+    }
+
+    #[test]
+    fn save_with_base_rechecks_the_head_used_for_its_calculation() {
+        struct RaceOnRead {
+            content: ContentStore,
+            race: std::cell::RefCell<Option<Box<dyn FnOnce()>>>,
+        }
+        impl ContentBlobs for RaceOnRead {
+            fn put(&self, body: &str) -> StoreResult<String> {
+                self.content.put(body)
+            }
+            fn get(&self, id: &str) -> StoreResult<Option<String>> {
+                let body = self.content.get(id)?;
+                if let Some(race) = self.race.borrow_mut().take() {
+                    race();
+                }
+                Ok(body)
+            }
+        }
+        let conformance_root = vcs();
+        let counter = std::cell::Cell::new(0);
+        crate::content::conformance::run_suite(|| {
+            counter.set(counter.get() + 1);
+            RaceOnRead {
+                content: ContentStore::open(
+                    conformance_root
+                        .dir
+                        .join(format!("race-{}.sqlite", counter.get())),
+                )
+                .unwrap(),
+                race: std::cell::RefCell::new(Some(Box::new(|| {}))),
+            }
+        })
+        .unwrap();
+        let base = "The quick brown fox jumps over the lazy dog tonight.";
+        let draft = "The quick brown fox jumps over the lazy dog today.";
+        for (competing, expected) in [
+            (
+                "The quick grey fox jumps over the lazy dog tonight.",
+                Some("The quick grey fox jumps over the lazy dog today."),
+            ),
+            (
+                "The quick brown fox jumps over the lazy dog tomorrow.",
+                None,
+            ),
+        ] {
+            let mut original = vcs();
+            original.init("t0").unwrap();
+            original
+                .write(MAINLINE_BRANCH_ID, "note.txt", Some(base), "base", "t1")
+                .unwrap();
+            let branches = original.dir.join("branches.sqlite");
+            let content = original.dir.join("content.sqlite");
+            let mut competitor = WorkspaceVcs::open(&branches, &content).unwrap();
+            let racing = RaceOnRead {
+                content: ContentStore::open(&content).unwrap(),
+                race: std::cell::RefCell::new(Some(Box::new(move || {
+                    // A genuinely separate connection moves the head after
+                    // save captures it, before save commits its calculation.
+                    competitor
+                        .write(
+                            MAINLINE_BRANCH_ID,
+                            "note.txt",
+                            Some(competing),
+                            "competitor",
+                            "t2",
+                        )
+                        .unwrap();
+                }))),
+            };
+            let mut saving =
+                WorkspaceVcs::from_parts(BranchStore::open(&branches).unwrap(), racing);
+            let outcome = saving
+                .save_with_base(
+                    MAINLINE_BRANCH_ID,
+                    "note.txt",
+                    draft,
+                    "base",
+                    &[],
+                    "saved",
+                    "t3",
+                )
+                .unwrap();
+            if let Some(expected) = expected {
+                assert!(matches!(outcome, SaveWithBaseOutcome::Merged { .. }));
+                assert_eq!(
+                    saving
+                        .read(MAINLINE_BRANCH_ID, "note.txt")
+                        .unwrap()
+                        .as_deref(),
+                    Some(expected)
+                );
+                assert_eq!(
+                    saving
+                        .get_cut("saved")
+                        .unwrap()
+                        .unwrap()
+                        .parent_cut_id
+                        .as_deref(),
+                    Some("competitor")
+                );
+            } else {
+                assert!(matches!(outcome, SaveWithBaseOutcome::Conflicted { .. }));
+                assert_eq!(
+                    saving
+                        .read(MAINLINE_BRANCH_ID, "note.txt")
+                        .unwrap()
+                        .as_deref(),
+                    Some(competing)
+                );
+                assert!(saving.get_cut("saved").unwrap().is_none());
+                assert!(saving.get_op("op-saved").unwrap().is_none());
+            }
+        }
     }
 
     /// merge_preview computes the fold without writing, and an unknown

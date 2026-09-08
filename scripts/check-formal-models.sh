@@ -103,6 +103,8 @@ else:
 PY
 
 declare -A EXPECTED_NO_SOLUTION=(
+  ["save-result-retention.maude"]=5
+  ["file-settlement.maude"]=4
   ["trace-lifecycle-conformance.maude"]=3
   ["action-expansion.maude"]=3
   ["effect-key.maude"]=4
@@ -145,6 +147,8 @@ declare -A EXPECTED_NO_SOLUTION=(
   ["script-hard-off.maude"]=5
   ["turn-access-grant.maude"]=2
   ["admission.maude"]=11
+  ["host-actions.maude"]=14
+  ["host-action-recovery.maude"]=6
   ["clock-source.maude"]=4
   ["coerce-branches.maude"]=1
   ["construct-graph.maude"]=21
@@ -240,6 +244,8 @@ declare -A EXPECTED_NO_SOLUTION=(
 )
 
 declare -A EXPECTED_SOLUTION=(
+  ["save-result-retention.maude"]=7
+  ["file-settlement.maude"]=6
   ["trace-lifecycle-conformance.maude"]=10
   ["action-expansion.maude"]=2
   ["effect-key.maude"]=4
@@ -282,6 +288,8 @@ declare -A EXPECTED_SOLUTION=(
   ["script-hard-off.maude"]=3
   ["turn-access-grant.maude"]=2
   ["admission.maude"]=8
+  ["host-actions.maude"]=16
+  ["host-action-recovery.maude"]=10
   ["clock-source.maude"]=5
   ["coerce-branches.maude"]=3
   ["construct-graph.maude"]=11

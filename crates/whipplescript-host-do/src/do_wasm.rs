@@ -642,6 +642,9 @@ extern "C" {
     #[wasm_bindgen(method, catch)]
     fn query(this: &DoSqlBridge, sql: &str, params_json: &str) -> Result<String, JsValue>;
 
+    #[wasm_bindgen(method, catch, js_name = atomic)]
+    fn atomic_bridge(this: &DoSqlBridge, callback: &JsValue) -> Result<(), JsValue>;
+
     /// Publish one ephemeral live-turn observation. The shell always defines
     /// this (a no-op when the caller wired no observer), and a failure is
     /// swallowed by design: a dropped projection must never fail a turn.
@@ -667,6 +670,30 @@ fn params_to_json(params: &[SqlValue]) -> String {
 }
 
 impl DoSql for JsDoSql {
+    fn atomic(
+        &self,
+        body: &mut dyn FnMut() -> whipplescript_store::StoreResult<()>,
+    ) -> whipplescript_store::StoreResult<()> {
+        let mut failure = None;
+        let result = {
+            let mut callback = || {
+                // The shared callback adapter turns a Rust refusal into an
+                // exception so transactionSync rolls back. Only its static
+                // error marker crosses JS; the typed failure stays in Rust.
+                crate::do_store::transaction::invoke_body(body, &mut failure)
+                    .map_err(JsValue::from_str)
+            };
+            let closure = wasm_bindgen::closure::ScopedClosure::borrow_mut_aborting(&mut callback);
+            self.bridge.atomic_bridge(closure.as_js_value())
+        };
+        if let Some(error) = failure {
+            return Err(error);
+        }
+        result.map_err(|_| {
+            whipplescript_store::StoreError::Conflict("host action transaction failed".into())
+        })
+    }
+
     fn execute(&self, sql: &str, params: &[SqlValue]) -> Result<u64, String> {
         let count = self
             .bridge

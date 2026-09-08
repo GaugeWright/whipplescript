@@ -76,8 +76,8 @@ use whipplescript_parser::{
     EffectStatus as TestEffectStatus, ExpectTarget, Expr, ExprLiteral, ExprObjectField, Fixit,
     FixitEdit, FormatOutput, GivenClause, HarnessClass, IrConstructUse, IrEffectDependency,
     IrEffectKind, IrEffectNode, IrExecTarget, IrInclude, IrProgram, IrProjectionRead, IrRule,
-    IrSchema, IrTest, IrType, IrWorkflowContract, IrWorkflowContractKind, Item, ProjQueryKind,
-    QueryKind, RuleStatus, RunKind, SourceSpan, StubPayload, TestClause, TestField, UnaryOp,
+    IrSchema, IrTest, IrType, IrWorkflowContractKind, Item, ProjQueryKind, QueryKind, RuleStatus,
+    RunKind, SourceSpan, StubPayload, TestClause, TestField, UnaryOp,
 };
 #[cfg(feature = "claude")]
 use whipplescript_provider_claude::{
@@ -19595,88 +19595,7 @@ fn start_workflow_instance(
     })
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct WorkflowInputFact {
-    name: String,
-    key: String,
-    value_json: String,
-}
-
-fn validate_workflow_start_input(
-    ir: &IrProgram,
-    input: &Value,
-) -> Result<Vec<WorkflowInputFact>, String> {
-    let contracts = ir
-        .workflow_contracts
-        .iter()
-        .filter(|contract| contract.kind == IrWorkflowContractKind::Input)
-        .collect::<Vec<_>>();
-    if contracts.is_empty() {
-        return Ok(Vec::new());
-    }
-    // A readable shape hint, e.g. `{ "ticket": <ref<TicketRequest>> }`, so a caller
-    // who omits the input-name nesting can see the expected object at a glance.
-    let expected_shape = format!(
-        "{{ {} }}",
-        contracts
-            .iter()
-            .map(|contract| format!("\"{}\": <{}>", contract.name, contract.ty.display_label()))
-            .collect::<Vec<_>>()
-            .join(", ")
-    );
-    let Some(object) = input.as_object() else {
-        return Err(format!(
-            "workflow `{}` expects an input object keyed by declared input names: {expected_shape}",
-            ir.workflow,
-        ));
-    };
-
-    let mut errors = Vec::new();
-    let contracts_by_name = contracts
-        .iter()
-        .map(|contract| (contract.name.as_str(), *contract))
-        .collect::<BTreeMap<_, _>>();
-    for key in object.keys() {
-        if !contracts_by_name.contains_key(key.as_str()) {
-            errors.push(format!("unexpected workflow input `{key}`"));
-        }
-    }
-
-    let mut facts = Vec::new();
-    for contract in contracts {
-        let Some(value) = object.get(&contract.name) else {
-            errors.push(format!(
-                "missing workflow input `{}` (expected `{}`)",
-                contract.name,
-                contract.ty.display_label()
-            ));
-            continue;
-        };
-        validate_json_for_ir_type(ir, value, &contract.ty, &contract.name, &mut errors);
-        facts.push(WorkflowInputFact {
-            name: workflow_input_fact_name(contract),
-            key: contract.name.clone(),
-            value_json: value.to_string(),
-        });
-    }
-
-    if errors.is_empty() {
-        Ok(facts)
-    } else {
-        Err(format!(
-            "invalid workflow input for `{}`: {}; expected input object {expected_shape}",
-            ir.workflow,
-            errors.join("; "),
-        ))
-    }
-}
-
-fn workflow_input_fact_name(contract: &IrWorkflowContract) -> String {
-    match &contract.ty {
-        IrType::Ref(name) => name.clone(),
-        other => ir_type_name(other),
-    }
-}
+use whipplescript_kernel::workflow_input::validate_workflow_start_input;
 
 // IR-typed JSON validation moved KERNEL-side with the std.ingress admission
 // core (spec/std-ingress.md I3): every ingress driver validates payloads
@@ -44965,10 +44884,6 @@ mod artifact_metadata_refusal_tests;
 #[cfg(test)]
 #[path = "main_tests/artifact_shape_refusal.rs"]
 mod artifact_shape_refusal_tests;
-
-#[cfg(test)]
-#[path = "main_tests/start_input_refusal.rs"]
-mod start_input_refusal_tests;
 
 #[cfg(test)]
 #[path = "main_tests/package_set_semantic_refusal.rs"]

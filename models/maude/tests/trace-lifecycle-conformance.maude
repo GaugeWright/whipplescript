@@ -88,8 +88,8 @@ search [1] in WHIPPLESCRIPT-KERNEL :
   effect(e1, timedOut) retryAllowed(e1)
   =>* effect(e1, queued) retryUsed(e1) .
 
---- CORPUS: running lease_expire queued
---- Lease expiry returns a running effect to the ready set.
+--- CORPUS: running lease_expire failed
+--- Lease expiry holds a running effect for separately authorized recovery.
 search [1] in WHIPPLESCRIPT-KERNEL :
   effect(e1, running) lease(e1, leaseActive)
-  =>* effect(e1, queued) lease(e1, leaseExpired) event(leaseExpiredEvt) .
+  =>* effect(e1, failed) lease(e1, leaseExpired) event(leaseExpiredEvt) .

@@ -27,6 +27,11 @@
 //! actual Durable Object. The Rust side is complete and green (native tests +
 //! clippy + `wasm32-unknown-unknown`).
 
+mod dispatch;
+mod host_actions;
+pub(crate) mod recovery;
+pub(crate) mod transaction;
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::Value;
@@ -58,6 +63,17 @@ pub enum SqlValue {
 /// `state.storage.sql`; tests implement it over rusqlite so the ported SQL is
 /// verified against a real engine.
 pub trait DoSql {
+    /// A synchronous transaction with rollback on every returned error. Hosts
+    /// without this boundary refuse action admission before invoking its body.
+    // Explicit return lets the refusal sweep substitute a false success,
+    // rather than merely changing the error's diagnostic text.
+    #[allow(clippy::needless_return)]
+    fn atomic(&self, _body: &mut dyn FnMut() -> StoreResult<()>) -> StoreResult<()> {
+        let message: String = "SQL host does not support atomic action admission".into();
+        // MUTATION-SUCCESS-EXPR: Ok(())
+        return Err(StoreError::Conflict(message));
+    }
+
     /// Run one statement. `sql` must contain EXACTLY ONE — no semicolon-joined
     /// batch, even though the DO SQL API accepts one.
     ///
@@ -93,6 +109,9 @@ pub trait DoSql {
 /// `Connection`, so we share the handle via `Rc` rather than requiring `Clone`.
 /// `DoSql` methods are `&self`, so `Rc<T>` forwards them directly.
 impl<T: DoSql + ?Sized> DoSql for std::rc::Rc<T> {
+    fn atomic(&self, body: &mut dyn FnMut() -> StoreResult<()>) -> StoreResult<()> {
+        (**self).atomic(body)
+    }
     fn execute(&self, sql: &str, params: &[SqlValue]) -> Result<u64, String> {
         (**self).execute(sql, params)
     }
@@ -349,7 +368,9 @@ impl<Sql: DoSql> DoSqliteStore<Sql> {
         expected_head: &str,
         event: NewEvent<'_>,
     ) -> StoreResult<StoredEvent> {
-        do_append_event_fenced(&self.sql, owner_epoch, expected_head, event)
+        recovery::atomic_result(&self.sql, false, &mut || {
+            do_append_event_fenced(&self.sql, owner_epoch, expected_head, event)
+        })
     }
 
     /// The `capability_bindings.provider` name bound for `capability` visible to
@@ -819,7 +840,18 @@ impl<Sql: DoSql> DoSqliteStore<Sql> {
         diagnostic: Option<TerminalDiagnosticRecord>,
         run_status: &str,
     ) -> StoreResult<StoredEvent> {
-        let payload = effect_completion_payload(&completion, diagnostic.as_ref())?;
+        recovery::atomic_result(&self.sql, false, &mut || {
+            self.complete_effect_terminal_on(completion, diagnostic.clone(), run_status)
+        })
+    }
+
+    fn complete_effect_terminal_on(
+        &self,
+        completion: EffectCompletion<'_>,
+        diagnostic: Option<TerminalDiagnosticRecord>,
+        run_status: &str,
+    ) -> StoreResult<StoredEvent> {
+        let payload = effect_completion_payload(&completion, diagnostic.as_ref(), run_status)?;
         let event = do_append_event(
             &self.sql,
             NewEvent {
@@ -1773,6 +1805,7 @@ fn do_live_fact_payloads<Sql: DoSql>(sql: &Sql, instance_id: &str) -> StoreResul
 fn effect_completion_payload(
     completion: &EffectCompletion<'_>,
     diagnostic: Option<&TerminalDiagnosticRecord>,
+    run_status: &str,
 ) -> StoreResult<String> {
     let metadata = serde_json::from_str::<Value>(completion.metadata_json).map_err(|error| {
         StoreError::Conflict(format!(
@@ -1786,6 +1819,7 @@ fn effect_completion_payload(
         "provider": completion.provider,
         "worker_id": completion.worker_id,
         "status": completion.status,
+        "run_status": run_status,
         "exit_code": completion.exit_code,
         "summary": completion.summary,
         "metadata": metadata,
@@ -1883,7 +1917,11 @@ fn do_execution_fingerprint<Sql: DoSql>(
 /// The `effect.run_started` event payload, mirroring `run_start_payload`.
 /// Unreadable metadata surfaces with the run identity instead of recording
 /// `null` in the canonical event (native parity, DR-0054 Phase C).
-fn run_start_payload(run: &RunStart<'_>, metadata_json: &str) -> StoreResult<String> {
+fn run_start_payload(
+    run: &RunStart<'_>,
+    metadata_json: &str,
+    dispatch: &effect_recovery::DispatchMarker,
+) -> StoreResult<String> {
     let metadata = serde_json::from_str::<Value>(metadata_json).map_err(|error| {
         StoreError::Conflict(format!(
             "effect `{}` run `{}` start has unreadable metadata: {error}",
@@ -1898,6 +1936,7 @@ fn run_start_payload(run: &RunStart<'_>, metadata_json: &str) -> StoreResult<Str
         "lease_id": run.lease_id,
         "lease_expires_at": run.lease_expires_at,
         "metadata": metadata,
+        "external_dispatch": dispatch,
     })
     .to_string())
 }
@@ -2645,7 +2684,7 @@ fn do_replay_effect_terminal<Sql: DoSql>(
                 text(instance_id),
                 text(provider),
                 text(worker_id),
-                text(status),
+                text(effect_recovery::terminal_run_status(&payload)),
                 payload.get("exit_code").and_then(Value::as_i64).map_or(SqlValue::Null, int),
                 opt_text(payload.get("summary").and_then(Value::as_str)),
                 text(&metadata_json),
@@ -2726,9 +2765,18 @@ fn do_replay_lease_expired<Sql: DoSql>(
     )
     .map_err(sql_err)?;
     sql.execute(
-        "UPDATE effects SET status = 'queued', updated_at = CURRENT_TIMESTAMP \
+        "UPDATE effects SET status = ?3, updated_at = CURRENT_TIMESTAMP \
          WHERE instance_id = ?1 AND effect_id = ?2 AND status = 'running'",
-        &[text(instance_id), text(effect_id)],
+        &[
+            text(instance_id),
+            text(effect_id),
+            text(
+                payload
+                    .get("effect_status")
+                    .and_then(Value::as_str)
+                    .unwrap_or("queued"),
+            ),
+        ],
     )
     .map_err(sql_err)?;
     Ok(())
@@ -3972,8 +4020,8 @@ impl<Sql: DoSql> DoSqliteStore<Sql> {
 }
 
 impl<Sql: DoSql> DoSqliteStore<Sql> {
-    /// Mirror of the native store's `record_terminal_refusal`: a stale terminal
-    /// the inner function refused with a `Conflict` -- rolled back, so recorded
+    /// Mirror of the native store's `record_terminal_refusal`: a terminal
+    /// attempt refused with a `Conflict` -- rolled back, so recorded
     /// nowhere -- leaves a `run.terminal_refused` event outside that
     /// transaction. Not a terminal event, and idempotent per (run, attempted
     /// status, reason).
@@ -4134,6 +4182,12 @@ fn do_insert_program_version<Sql: DoSql>(
 }
 
 impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
+    fn admit_host_action(
+        &mut self,
+        action: whipplescript_store::host_actions::HostActionStart<'_>,
+    ) -> StoreResult<whipplescript_store::host_actions::HostActionAdmission> {
+        self.admit_host_action_atomic(action)
+    }
     fn schema_version(&self) -> StoreResult<i64> {
         let rows = self
             .sql
@@ -4280,63 +4334,7 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
         instance: NewInstance<'_>,
         authority: NewInstanceAuthority<'_>,
     ) -> StoreResult<InstanceRecord> {
-        let rows = self
-            .sql
-            .query(
-                "INSERT INTO instances (instance_id, program_id, version_id, workflow_principal, \
-                 effective_authority, status, input_json, started_at) VALUES \
-                 ('ins_' || lower(hex(randomblob(16))), ?1, ?2, ?3, ?4, 'running', ?5, \
-                 CURRENT_TIMESTAMP) RETURNING instance_id, status, program_id, version_id, \
-                 revision_epoch, workflow_principal, effective_authority, input_json, \
-                 created_at, started_at",
-                &[
-                    text(instance.program_id),
-                    text(instance.version_id),
-                    text(authority.workflow_principal),
-                    text(authority.effective_authority_json),
-                    text(instance.input_json),
-                ],
-            )
-            .map_err(sql_err)?;
-        let row = rows
-            .first()
-            .ok_or_else(|| sql_err("create_instance returned no row".to_string()))?;
-        let record = InstanceRecord {
-            instance_id: as_text(&row[0]),
-            status: as_text(&row[1]),
-        };
-        // DR-0094 parity: creation is an event on this host too, so the DO's
-        // rebuild folds the same identity the native store's does. Without it
-        // the two hosts would disagree about what a rebuilt instance row is.
-        let started_at = match &row[9] {
-            SqlValue::Null => serde_json::Value::Null,
-            other => serde_json::Value::String(as_text(other)),
-        };
-        let payload = serde_json::json!({
-            "program_id": as_text(&row[2]),
-            "version_id": as_text(&row[3]),
-            "revision_epoch": as_opt_i64(&row[4]).unwrap_or(0),
-            "workflow_principal": as_text(&row[5]),
-            "effective_authority": as_text(&row[6]),
-            "input_json": as_text(&row[7]),
-            "created_at": as_text(&row[8]),
-            "started_at": started_at,
-            "status": record.status,
-        })
-        .to_string();
-        do_append_event(
-            &self.sql,
-            NewEvent {
-                instance_id: &record.instance_id,
-                event_type: "instance.created",
-                payload_json: &payload,
-                source: "kernel",
-                causation_id: None,
-                correlation_id: None,
-                idempotency_key: None,
-            },
-        )?;
-        Ok(record)
+        host_actions::create_instance_on(&self.sql, instance, authority, None)
     }
 
     fn list_instance_revisions(&self, instance_id: &str) -> StoreResult<Vec<WorkflowRevisionView>> {
@@ -5132,6 +5130,62 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
             admitted += 1;
         }
         Ok(FactBatchOutcome { admitted, skipped })
+    }
+
+    fn settle_file_effect(
+        &mut self,
+        completion: EffectCompletion<'_>,
+        diagnostic: Option<TerminalDiagnosticRecord>,
+        fact: whipplescript_store::file_settlement::FileSettlementFact<'_>,
+    ) -> StoreResult<StoredEvent> {
+        fact.validate(completion)?;
+        let outcome = recovery::atomic_result(&self.sql, false, &mut || {
+            let terminal = self.complete_effect_terminal_on(
+                completion,
+                diagnostic.clone(),
+                completion.status,
+            )?;
+            let kinds = self
+                .sql
+                .query(
+                    "SELECT kind FROM effects WHERE instance_id = ?1 AND effect_id = ?2",
+                    &[text(completion.instance_id), text(completion.effect_id)],
+                )
+                .map_err(sql_err)?;
+            let kind = kinds.first().map(|row| as_text(&row[0]));
+            fact.check_kind(completion.status, kind.as_deref())?;
+            let active = self.sql.query(
+                "SELECT 1 FROM facts WHERE instance_id = ?1 AND name = ?2 AND key = ?3 AND consumed_at IS NULL",
+                &[text(completion.instance_id), text(fact.name), text(completion.effect_id)],
+            ).map_err(sql_err)?;
+            fact.require_fresh_fact(!active.is_empty())?;
+
+            let payload = fact.payload(completion.effect_id)?;
+            let event = do_append_event(
+                &self.sql,
+                NewEvent {
+                    instance_id: completion.instance_id,
+                    event_type: "fact.derived",
+                    payload_json: &payload,
+                    source: "kernel",
+                    causation_id: Some(&terminal.event_id),
+                    correlation_id: None,
+                    idempotency_key: Some(fact.event_key),
+                },
+            )?;
+            let (version, epoch) = do_active_revision(&self.sql, completion.instance_id)?;
+            do_insert_fact(
+                &self.sql,
+                completion.instance_id,
+                "kernel",
+                &event.event_id,
+                version.as_deref(),
+                epoch,
+                &fact.fact(completion.effect_id),
+            )?;
+            Ok(terminal)
+        });
+        self.record_terminal_refusal(completion, completion.status, outcome)
     }
 
     fn complete_effect(&mut self, completion: EffectCompletion<'_>) -> StoreResult<StoredEvent> {
@@ -6659,229 +6713,19 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
     }
 
     fn start_run(&mut self, run: RunStart<'_>) -> StoreResult<StoredEvent> {
-        // A host reattachment after `NeedsIo` re-enters the exact running
-        // effect with the same deterministic run/lease ids. Treat that as the
-        // same run, not a second claim. Any identity drift fails closed.
-        let existing = self
-            .sql
-            .query(
-                "SELECT runs.effect_id, runs.instance_id, runs.provider, runs.worker_id, \
-                 runs.status, leases.lease_id, leases.status \
-                 FROM runs JOIN leases ON leases.run_id = runs.run_id \
-                 WHERE runs.run_id = ?1 LIMIT 1",
-                &[text(run.run_id)],
-            )
-            .map_err(sql_err)?;
-        if let Some(row) = existing.first() {
-            let matches = as_text(&row[0]) == run.effect_id
-                && as_text(&row[1]) == run.instance_id
-                && as_text(&row[2]) == run.provider
-                && as_text(&row[3]) == run.worker_id
-                && as_text(&row[4]) == "running"
-                && as_text(&row[5]) == run.lease_id
-                && as_text(&row[6]) == "active";
-            if !matches {
-                return Err(StoreError::Conflict(
-                    "run id was reused with different active run identity".to_owned(),
-                ));
-            }
-            return self
-                .event_by_idempotency_key(run.instance_id, run.run_id)?
-                .ok_or_else(|| {
-                    StoreError::Conflict("active run has no durable run-start event".to_owned())
-                });
-        }
-        let status_rows = self
-            .sql
-            .query(
-                "SELECT status FROM instances WHERE instance_id = ?1",
-                &[text(run.instance_id)],
-            )
-            .map_err(sql_err)?;
-        if let Some(row) = status_rows.first() {
-            let status = as_text(&row[0]);
-            if status != "running" {
-                return Err(StoreError::Conflict(format!(
-                    "instance is {status}; provider runs require a running instance"
-                )));
-            }
-        }
-        if let Some(block) = do_policy_block(&self.sql, run.instance_id, run.effect_id)? {
-            let payload = serde_json::json!({
-                "effect_id": run.effect_id,
-                "status": block.status,
-                "reason": block.reason,
-            })
-            .to_string();
-            do_append_event(
-                &self.sql,
-                NewEvent {
-                    instance_id: run.instance_id,
-                    event_type: "effect.blocked",
-                    payload_json: &payload,
-                    source: "kernel",
-                    causation_id: Some(run.effect_id),
-                    correlation_id: None,
-                    idempotency_key: Some(&format!(
-                        "policy-block:{}:{}",
-                        run.effect_id, run.run_id
-                    )),
-                },
-            )?;
-            self.sql
-                .execute(
-                    "UPDATE effects SET status = ?1, policy_block_reason = ?2, \
-                     updated_at = CURRENT_TIMESTAMP WHERE instance_id = ?3 AND effect_id = ?4 \
-                     AND status IN ('queued', 'blocked', 'blocked_by_admission', 'blocked_by_dependency', 'blocked_by_capacity', 'blocked_by_capability', 'blocked_by_profile')",
-                    &[
-                        text(block.status),
-                        text(&block.reason),
-                        text(run.instance_id),
-                        text(run.effect_id),
-                    ],
-                )
-                .map_err(sql_err)?;
-            return Err(StoreError::PolicyBlocked {
-                effect_id: run.effect_id.to_owned(),
-                reason: block.reason,
-            });
-        }
-        // Dependency gate: NOT EXISTS an unsatisfied dependency.
-        let claimable_rows = self
-            .sql
-            .query(
-                "SELECT NOT EXISTS (SELECT 1 FROM effect_dependencies AS dependency \
-                 JOIN effects AS upstream ON upstream.effect_id = dependency.upstream_effect_id \
-                  AND upstream.instance_id = dependency.instance_id \
-                 WHERE dependency.instance_id = ?1 AND dependency.downstream_effect_id = ?2 \
-                 AND NOT ( \
-                   (dependency.predicate = 'succeeds' AND upstream.status = 'completed') \
-                   OR (dependency.predicate = 'fails' AND upstream.status IN ('failed', 'timed_out')) \
-                   OR (dependency.predicate = 'timed_out' AND upstream.status = 'timed_out') \
-                   OR (dependency.predicate = 'cancelled' AND upstream.status = 'cancelled') \
-                   OR (dependency.predicate = 'completes' AND upstream.status IN ('completed', 'failed', 'timed_out', 'cancelled')) \
-                 ))",
-                &[text(run.instance_id), text(run.effect_id)],
-            )
-            .map_err(sql_err)?;
-        let claimable = claimable_rows
-            .first()
-            .map(|r| as_i64(&r[0]) != 0)
-            .unwrap_or(true);
-        if !claimable {
-            self.sql
-                .execute(
-                    "UPDATE effects SET status = 'blocked_by_dependency', \
-                     updated_at = CURRENT_TIMESTAMP \
-                     WHERE instance_id = ?1 AND effect_id = ?2 AND status = 'queued'",
-                    &[text(run.instance_id), text(run.effect_id)],
-                )
-                .map_err(sql_err)?;
-            return Err(StoreError::Conflict(
-                "effect dependencies are not satisfied".to_owned(),
-            ));
-        }
-        if self.effect_has_open_cancellation_request(run.instance_id, run.effect_id)? {
-            return Err(StoreError::Conflict(
-                "effect cancellation has been requested".to_owned(),
-            ));
-        }
-        if let Some(reason) = do_capacity_block(&self.sql, run.instance_id, run.effect_id)? {
-            let payload = serde_json::json!({
-                "effect_id": run.effect_id,
-                "status": "blocked_by_capacity",
-                "reason": reason,
-            })
-            .to_string();
-            // Idempotent: the same (effect, run) can be capacity-blocked again
-            // on a later worker pass after an interleaved unblock — the same
-            // durable statement, not a second event.
-            do_append_event_idempotent(
-                &self.sql,
-                NewEvent {
-                    instance_id: run.instance_id,
-                    event_type: "effect.blocked",
-                    payload_json: &payload,
-                    source: "kernel",
-                    causation_id: Some(run.effect_id),
-                    correlation_id: None,
-                    idempotency_key: Some(&format!(
-                        "capacity-block:{}:{}",
-                        run.effect_id, run.run_id
-                    )),
-                },
-            )?;
-            self.sql
-                .execute(
-                    "UPDATE effects SET status = 'blocked_by_capacity', policy_block_reason = ?1, \
-                     updated_at = CURRENT_TIMESTAMP WHERE instance_id = ?2 AND effect_id = ?3 \
-                     AND status IN ('queued', 'blocked', 'blocked_by_admission', 'blocked_by_dependency', 'blocked_by_capacity')",
-                    &[text(&reason), text(run.instance_id), text(run.effect_id)],
-                )
-                .map_err(sql_err)?;
-            return Err(StoreError::CapacityBlocked {
-                effect_id: run.effect_id.to_owned(),
-                reason,
-            });
-        }
+        recovery::atomic_result(&self.sql, true, &mut || self.start_run_on(run))
+    }
 
-        let fingerprint = do_execution_fingerprint(&self.sql, run.instance_id, run.effect_id)?;
-        let run_metadata = inject_execution_fingerprint(&run, run.metadata_json, &fingerprint)?;
-        let payload = run_start_payload(&run, &run_metadata)?;
-        let event = do_append_event(
-            &self.sql,
-            NewEvent {
-                instance_id: run.instance_id,
-                event_type: "effect.run_started",
-                payload_json: &payload,
-                source: "kernel",
-                causation_id: Some(run.effect_id),
-                correlation_id: None,
-                idempotency_key: Some(run.run_id),
-            },
-        )?;
-        let changed = self
-            .sql
-            .execute(
-                "UPDATE effects SET status = 'running', policy_block_reason = NULL, \
-                 policy_block_category = NULL, updated_at = CURRENT_TIMESTAMP \
-                 WHERE instance_id = ?1 AND effect_id = ?2 \
-                 AND status IN ('queued', 'blocked', 'blocked_by_admission', 'blocked_by_dependency', 'blocked_by_capacity', 'blocked_by_capability', 'blocked_by_profile')",
-                &[text(run.instance_id), text(run.effect_id)],
-            )
-            .map_err(sql_err)?;
-        if changed != 1 {
-            return Err(StoreError::Conflict("effect is not claimable".to_owned()));
-        }
-        self.sql
-            .execute(
-                "INSERT INTO runs (run_id, effect_id, instance_id, provider, worker_id, status, \
-                 metadata_json) VALUES (?1, ?2, ?3, ?4, ?5, 'running', ?6)",
-                &[
-                    text(run.run_id),
-                    text(run.effect_id),
-                    text(run.instance_id),
-                    text(run.provider),
-                    text(run.worker_id),
-                    text(&run_metadata),
-                ],
-            )
-            .map_err(sql_err)?;
-        self.sql
-            .execute(
-                "INSERT INTO leases (lease_id, run_id, effect_id, instance_id, worker_id, status, \
-                 expires_at) VALUES (?1, ?2, ?3, ?4, ?5, 'active', ?6)",
-                &[
-                    text(run.lease_id),
-                    text(run.run_id),
-                    text(run.effect_id),
-                    text(run.instance_id),
-                    text(run.worker_id),
-                    text(run.lease_expires_at),
-                ],
-            )
-            .map_err(sql_err)?;
-        Ok(event)
+    fn start_dispatch(&mut self, run: RunStart<'_>) -> StoreResult<StoredEvent> {
+        dispatch::start(self, run, None)
+    }
+
+    fn start_dispatch_observed(
+        &mut self,
+        run: RunStart<'_>,
+        expected: &ClaimableEffect,
+    ) -> StoreResult<StoredEvent> {
+        dispatch::start(self, run, Some(expected))
     }
 
     fn block_effect_binding(
@@ -7216,98 +7060,13 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
     }
 
     fn expire_leases(&mut self, instance_id: &str, now: &str) -> StoreResult<Vec<ExpiredLease>> {
-        let rows = self
-            .sql
-            .query(
-                "SELECT lease_id, run_id, effect_id FROM leases \
-                 WHERE instance_id = ?1 AND status = 'active' AND expires_at <= ?2 \
-                 ORDER BY expires_at, lease_id",
-                &[text(instance_id), text(now)],
-            )
-            .map_err(sql_err)?;
-        let expired: Vec<ExpiredLease> = rows
-            .iter()
-            .map(|r| ExpiredLease {
-                lease_id: as_text(&r[0]),
-                run_id: as_text(&r[1]),
-                effect_id: as_text(&r[2]),
-            })
-            .collect();
-        for lease in &expired {
-            let payload = serde_json::json!({
-                "lease_id": lease.lease_id,
-                "run_id": lease.run_id,
-                "effect_id": lease.effect_id,
-                "expired_at": now,
-            })
-            .to_string();
-            do_append_event(
-                &self.sql,
-                NewEvent {
-                    instance_id,
-                    event_type: "lease.expired",
-                    payload_json: &payload,
-                    source: "kernel",
-                    causation_id: Some(&lease.run_id),
-                    correlation_id: None,
-                    idempotency_key: Some(&format!("lease-expired:{}", lease.lease_id)),
-                },
-            )?;
-            self.sql
-                .execute(
-                    "UPDATE leases SET status = 'expired', released_at = CURRENT_TIMESTAMP \
-                     WHERE lease_id = ?1",
-                    &[text(&lease.lease_id)],
-                )
-                .map_err(sql_err)?;
-            self.sql
-                .execute(
-                    "UPDATE runs SET status = 'lease_expired', completed_at = CURRENT_TIMESTAMP \
-                     WHERE run_id = ?1 AND status = 'running'",
-                    &[text(&lease.run_id)],
-                )
-                .map_err(sql_err)?;
-            self.sql
-                .execute(
-                    "UPDATE effects SET status = 'queued', updated_at = CURRENT_TIMESTAMP \
-                     WHERE instance_id = ?1 AND effect_id = ?2 AND status = 'running'",
-                    &[text(instance_id), text(&lease.effect_id)],
-                )
-                .map_err(sql_err)?;
-        }
-        Ok(expired)
+        recovery::atomic_result(&self.sql, false, &mut || {
+            self.expire_leases_on(instance_id, now)
+        })
     }
 
     fn retry_effect(&mut self, retry: RetryEffect<'_>) -> StoreResult<StoredEvent> {
-        let payload = serde_json::json!({
-            "effect_id": retry.effect_id,
-            "retry_after": retry.retry_after,
-        })
-        .to_string();
-        let event = do_append_event(
-            &self.sql,
-            NewEvent {
-                instance_id: retry.instance_id,
-                event_type: "effect.retried",
-                payload_json: &payload,
-                source: "kernel",
-                causation_id: Some(retry.effect_id),
-                correlation_id: None,
-                idempotency_key: retry.idempotency_key,
-            },
-        )?;
-        let changed = self
-            .sql
-            .execute(
-                "UPDATE effects SET status = 'queued', updated_at = CURRENT_TIMESTAMP \
-                 WHERE instance_id = ?1 AND effect_id = ?2 AND status IN ('failed', 'timed_out')",
-                &[text(retry.instance_id), text(retry.effect_id)],
-            )
-            .map_err(sql_err)?;
-        if changed != 1 {
-            return Err(StoreError::Conflict("effect is not retryable".to_owned()));
-        }
-        Ok(event)
+        recovery::atomic_result(&self.sql, false, &mut || self.retry_effect_on(retry))
     }
 
     fn rebuild_projections(&mut self, instance_id: &str) -> StoreResult<()> {
@@ -9464,6 +9223,15 @@ pub mod test_support {
                 conn: std::rc::Rc::new(Connection::open_in_memory().expect("sqlite")),
             }
         }
+
+        /// The deployed Worker schema, for shared runtime conformance fixtures.
+        pub fn with_runtime_schema() -> Self {
+            let sql = Self::in_memory();
+            sql.conn
+                .execute_batch(include_str!("../worker/do_schema.sql"))
+                .expect("deployed runtime schema");
+            sql
+        }
     }
 
     #[cfg(test)]
@@ -9501,6 +9269,28 @@ pub mod test_support {
     }
 
     impl DoSql for RusqliteDoSql {
+        fn atomic(&self, body: &mut dyn FnMut() -> StoreResult<()>) -> StoreResult<()> {
+            self.conn
+                .execute_batch("SAVEPOINT host_action_admission")
+                .map_err(|error| sql_err(error.to_string()))?;
+            match body() {
+                Ok(()) => {
+                    self.conn
+                        .execute_batch("RELEASE host_action_admission")
+                        .map_err(|error| sql_err(error.to_string()))?;
+                    Ok(())
+                }
+                Err(error) => {
+                    self.conn
+                        .execute_batch("ROLLBACK TO host_action_admission")
+                        .map_err(|error| sql_err(error.to_string()))?;
+                    self.conn
+                        .execute_batch("RELEASE host_action_admission")
+                        .map_err(|error| sql_err(error.to_string()))?;
+                    Err(error)
+                }
+            }
+        }
         fn execute(&self, sql: &str, params: &[SqlValue]) -> Result<u64, String> {
             self.conn
                 .execute(sql, rusqlite::params_from_iter(params.iter().map(to_value)))
@@ -9573,6 +9363,7 @@ pub mod test_support {
             CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, name TEXT);
             INSERT INTO schema_migrations (version, name) VALUES (1, 'init');
             INSERT INTO schema_migrations (version, name) VALUES (2, 'provider-trust-evidence');
+            INSERT INTO schema_migrations (version, name) VALUES (3, 'retained-write-results');
             CREATE TABLE events (
                 event_id TEXT PRIMARY KEY, instance_id TEXT NOT NULL, sequence INTEGER NOT NULL,
                 event_type TEXT NOT NULL, payload_json TEXT NOT NULL, occurred_at TEXT NOT NULL,
@@ -10096,9 +9887,445 @@ impl<Sql: DoSql + Clone> DoSqliteStore<Sql> {
     }
 }
 
+impl<Sql: DoSql> DoSqliteStore<Sql> {
+    fn start_run_on(&self, run: RunStart<'_>) -> StoreResult<StoredEvent> {
+        // A host reattachment after `NeedsIo` re-enters the exact running
+        // effect with the same deterministic run/lease ids. Treat that as the
+        // same run, not a second claim. Any identity drift fails closed.
+        let existing = self
+            .sql
+            .query(
+                "SELECT runs.effect_id, runs.instance_id, runs.provider, runs.worker_id, \
+                 runs.status, leases.lease_id, leases.status \
+                 FROM runs JOIN leases ON leases.run_id = runs.run_id \
+                 WHERE runs.run_id = ?1 LIMIT 1",
+                &[text(run.run_id)],
+            )
+            .map_err(sql_err)?;
+        if let Some(row) = existing.first() {
+            let matches = as_text(&row[0]) == run.effect_id
+                && as_text(&row[1]) == run.instance_id
+                && as_text(&row[2]) == run.provider
+                && as_text(&row[3]) == run.worker_id
+                && as_text(&row[4]) == "running"
+                && as_text(&row[5]) == run.lease_id
+                && as_text(&row[6]) == "active";
+            if !matches {
+                return Err(StoreError::Conflict(
+                    "run id was reused with different active run identity".to_owned(),
+                ));
+            }
+            return recovery::reattach_run(&self.sql, run);
+        }
+        let status_rows = self
+            .sql
+            .query(
+                "SELECT status FROM instances WHERE instance_id = ?1",
+                &[text(run.instance_id)],
+            )
+            .map_err(sql_err)?;
+        if let Some(row) = status_rows.first() {
+            let status = as_text(&row[0]);
+            if status != "running" {
+                return Err(StoreError::Conflict(format!(
+                    "instance is {status}; provider runs require a running instance"
+                )));
+            }
+        }
+        if let Some(block) = do_policy_block(&self.sql, run.instance_id, run.effect_id)? {
+            let payload = serde_json::json!({
+                "effect_id": run.effect_id,
+                "status": block.status,
+                "reason": block.reason,
+            })
+            .to_string();
+            do_append_event(
+                &self.sql,
+                NewEvent {
+                    instance_id: run.instance_id,
+                    event_type: "effect.blocked",
+                    payload_json: &payload,
+                    source: "kernel",
+                    causation_id: Some(run.effect_id),
+                    correlation_id: None,
+                    idempotency_key: Some(&format!(
+                        "policy-block:{}:{}",
+                        run.effect_id, run.run_id
+                    )),
+                },
+            )?;
+            self.sql
+                .execute(
+                    "UPDATE effects SET status = ?1, policy_block_reason = ?2, \
+                     updated_at = CURRENT_TIMESTAMP WHERE instance_id = ?3 AND effect_id = ?4 \
+                     AND status IN ('queued', 'blocked', 'blocked_by_admission', 'blocked_by_dependency', 'blocked_by_capacity', 'blocked_by_capability', 'blocked_by_profile')",
+                    &[
+                        text(block.status),
+                        text(&block.reason),
+                        text(run.instance_id),
+                        text(run.effect_id),
+                    ],
+                )
+                .map_err(sql_err)?;
+            let effect_id = run.effect_id.to_owned();
+            let reason = block.reason;
+            // MUTATION-SUCCESS-EXPR: Ok(StoredEvent { event_id: String::new(), sequence: 0 })
+            return Err(StoreError::PolicyBlocked { effect_id, reason });
+        }
+        // Dependency gate: NOT EXISTS an unsatisfied dependency.
+        let claimable_rows = self
+            .sql
+            .query(
+                "SELECT NOT EXISTS (SELECT 1 FROM effect_dependencies AS dependency \
+                 JOIN effects AS upstream ON upstream.effect_id = dependency.upstream_effect_id \
+                  AND upstream.instance_id = dependency.instance_id \
+                 WHERE dependency.instance_id = ?1 AND dependency.downstream_effect_id = ?2 \
+                 AND NOT ( \
+                   (dependency.predicate = 'succeeds' AND upstream.status = 'completed') \
+                   OR (dependency.predicate = 'fails' AND upstream.status IN ('failed', 'timed_out')) \
+                   OR (dependency.predicate = 'timed_out' AND upstream.status = 'timed_out') \
+                   OR (dependency.predicate = 'cancelled' AND upstream.status = 'cancelled') \
+                   OR (dependency.predicate = 'completes' AND upstream.status IN ('completed', 'failed', 'timed_out', 'cancelled')) \
+                 ))",
+                &[text(run.instance_id), text(run.effect_id)],
+            )
+            .map_err(sql_err)?;
+        let claimable = claimable_rows
+            .first()
+            .map(|r| as_i64(&r[0]) != 0)
+            .unwrap_or(true);
+        if !claimable {
+            self.sql
+                .execute(
+                    "UPDATE effects SET status = 'blocked_by_dependency', \
+                     updated_at = CURRENT_TIMESTAMP \
+                     WHERE instance_id = ?1 AND effect_id = ?2 AND status = 'queued'",
+                    &[text(run.instance_id), text(run.effect_id)],
+                )
+                .map_err(sql_err)?;
+            return Err(StoreError::Conflict(
+                "effect dependencies are not satisfied".to_owned(),
+            ));
+        }
+        if self.effect_has_open_cancellation_request(run.instance_id, run.effect_id)? {
+            return Err(StoreError::Conflict(
+                "effect cancellation has been requested".to_owned(),
+            ));
+        }
+        if let Some(reason) = do_capacity_block(&self.sql, run.instance_id, run.effect_id)? {
+            let payload = serde_json::json!({
+                "effect_id": run.effect_id,
+                "status": "blocked_by_capacity",
+                "reason": reason,
+            })
+            .to_string();
+            // Idempotent: the same (effect, run) can be capacity-blocked again
+            // on a later worker pass after an interleaved unblock — the same
+            // durable statement, not a second event.
+            do_append_event_idempotent(
+                &self.sql,
+                NewEvent {
+                    instance_id: run.instance_id,
+                    event_type: "effect.blocked",
+                    payload_json: &payload,
+                    source: "kernel",
+                    causation_id: Some(run.effect_id),
+                    correlation_id: None,
+                    idempotency_key: Some(&format!(
+                        "capacity-block:{}:{}",
+                        run.effect_id, run.run_id
+                    )),
+                },
+            )?;
+            self.sql
+                .execute(
+                    "UPDATE effects SET status = 'blocked_by_capacity', policy_block_reason = ?1, \
+                     updated_at = CURRENT_TIMESTAMP WHERE instance_id = ?2 AND effect_id = ?3 \
+                     AND status IN ('queued', 'blocked', 'blocked_by_admission', 'blocked_by_dependency', 'blocked_by_capacity')",
+                    &[text(&reason), text(run.instance_id), text(run.effect_id)],
+                )
+                .map_err(sql_err)?;
+            let effect_id = run.effect_id.to_owned();
+            // MUTATION-SUCCESS-EXPR: Ok(StoredEvent { event_id: String::new(), sequence: 0 })
+            return Err(StoreError::CapacityBlocked { effect_id, reason });
+        }
+
+        let fingerprint = do_execution_fingerprint(&self.sql, run.instance_id, run.effect_id)?;
+        recovery::require_proved_absence(&self.sql, run.instance_id, run.effect_id)?;
+        let run_metadata = inject_execution_fingerprint(&run, run.metadata_json, &fingerprint)?;
+        let dispatch = recovery::dispatch_marker(&self.sql, run, &fingerprint)?;
+        let payload = run_start_payload(&run, &run_metadata, &dispatch)?;
+        let event = do_append_event(
+            &self.sql,
+            NewEvent {
+                instance_id: run.instance_id,
+                event_type: "effect.run_started",
+                payload_json: &payload,
+                source: "kernel",
+                causation_id: Some(run.effect_id),
+                correlation_id: None,
+                idempotency_key: Some(run.run_id),
+            },
+        )?;
+        let changed = self
+            .sql
+            .execute(
+                "UPDATE effects SET status = 'running', policy_block_reason = NULL, \
+                 policy_block_category = NULL, updated_at = CURRENT_TIMESTAMP \
+                 WHERE instance_id = ?1 AND effect_id = ?2 \
+                 AND status IN ('queued', 'blocked', 'blocked_by_admission', 'blocked_by_dependency', 'blocked_by_capacity', 'blocked_by_capability', 'blocked_by_profile')",
+                &[text(run.instance_id), text(run.effect_id)],
+            )
+            .map_err(sql_err)?;
+        if changed != 1 {
+            return Err(StoreError::Conflict("effect is not claimable".to_owned()));
+        }
+        self.sql
+            .execute(
+                "INSERT INTO runs (run_id, effect_id, instance_id, provider, worker_id, status, \
+                 metadata_json) VALUES (?1, ?2, ?3, ?4, ?5, 'running', ?6)",
+                &[
+                    text(run.run_id),
+                    text(run.effect_id),
+                    text(run.instance_id),
+                    text(run.provider),
+                    text(run.worker_id),
+                    text(&run_metadata),
+                ],
+            )
+            .map_err(sql_err)?;
+        self.sql
+            .execute(
+                "INSERT INTO leases (lease_id, run_id, effect_id, instance_id, worker_id, status, \
+                 expires_at) VALUES (?1, ?2, ?3, ?4, ?5, 'active', ?6)",
+                &[
+                    text(run.lease_id),
+                    text(run.run_id),
+                    text(run.effect_id),
+                    text(run.instance_id),
+                    text(run.worker_id),
+                    text(run.lease_expires_at),
+                ],
+            )
+            .map_err(sql_err)?;
+        Ok(event)
+    }
+}
+
+impl<Sql: DoSql> DoSqliteStore<Sql> {
+    fn expire_leases_on(&self, instance_id: &str, now: &str) -> StoreResult<Vec<ExpiredLease>> {
+        let rows = self
+            .sql
+            .query(
+                "SELECT lease_id, run_id, effect_id FROM leases \
+                 WHERE instance_id = ?1 AND status = 'active' AND expires_at <= ?2 \
+                 ORDER BY expires_at, lease_id",
+                &[text(instance_id), text(now)],
+            )
+            .map_err(sql_err)?;
+        let expired: Vec<ExpiredLease> = rows
+            .iter()
+            .map(|r| ExpiredLease {
+                lease_id: as_text(&r[0]),
+                run_id: as_text(&r[1]),
+                effect_id: as_text(&r[2]),
+            })
+            .collect();
+        for lease in &expired {
+            let payload = serde_json::json!({
+                "lease_id": lease.lease_id,
+                "run_id": lease.run_id,
+                "effect_id": lease.effect_id,
+                "expired_at": now,
+                "effect_status": "failed",
+            })
+            .to_string();
+            do_append_event(
+                &self.sql,
+                NewEvent {
+                    instance_id,
+                    event_type: "lease.expired",
+                    payload_json: &payload,
+                    source: "kernel",
+                    causation_id: Some(&lease.run_id),
+                    correlation_id: None,
+                    idempotency_key: Some(&format!("lease-expired:{}", lease.lease_id)),
+                },
+            )?;
+            self.sql
+                .execute(
+                    "UPDATE leases SET status = 'expired', released_at = CURRENT_TIMESTAMP \
+                     WHERE lease_id = ?1",
+                    &[text(&lease.lease_id)],
+                )
+                .map_err(sql_err)?;
+            self.sql
+                .execute(
+                    "UPDATE runs SET status = 'lease_expired', completed_at = CURRENT_TIMESTAMP \
+                     WHERE run_id = ?1 AND status = 'running'",
+                    &[text(&lease.run_id)],
+                )
+                .map_err(sql_err)?;
+            self.sql
+                .execute(
+                    "UPDATE effects SET status = 'failed', updated_at = CURRENT_TIMESTAMP \
+                     WHERE instance_id = ?1 AND effect_id = ?2 AND status = 'running'",
+                    &[text(instance_id), text(&lease.effect_id)],
+                )
+                .map_err(sql_err)?;
+        }
+        Ok(expired)
+    }
+}
+
+impl<Sql: DoSql> DoSqliteStore<Sql> {
+    fn retry_effect_on(&self, retry: RetryEffect<'_>) -> StoreResult<StoredEvent> {
+        recovery::require_proved_absence(&self.sql, retry.instance_id, retry.effect_id)?;
+        let payload = serde_json::json!({
+            "effect_id": retry.effect_id,
+            "retry_after": retry.retry_after,
+        })
+        .to_string();
+        let event = do_append_event(
+            &self.sql,
+            NewEvent {
+                instance_id: retry.instance_id,
+                event_type: "effect.retried",
+                payload_json: &payload,
+                source: "kernel",
+                causation_id: Some(retry.effect_id),
+                correlation_id: None,
+                idempotency_key: retry.idempotency_key,
+            },
+        )?;
+        let changed = self
+            .sql
+            .execute(
+                "UPDATE effects SET status = 'queued', updated_at = CURRENT_TIMESTAMP \
+                 WHERE instance_id = ?1 AND effect_id = ?2 AND status IN ('failed', 'timed_out')",
+                &[text(retry.instance_id), text(retry.effect_id)],
+            )
+            .map_err(sql_err)?;
+        if changed != 1 {
+            return Err(StoreError::Conflict("effect is not retryable".to_owned()));
+        }
+        Ok(event)
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn do_file_settlement_and_replay() {
+        for kind in ["file.read", "file.write", "file.import", "file.export"] {
+            for status in ["completed", "failed"] {
+                let mut store =
+                    DoSqliteStore::new(test_support::RusqliteDoSql::with_runtime_schema());
+                whipplescript_store::file_settlement::conformance::run_suite(
+                    &mut store, kind, status,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn do_file_settlement_rolls_back_every_sql_boundary() {
+        use whipplescript_store::file_settlement::conformance;
+        for status in ["completed", "failed"] {
+            let mut finished = false;
+            for fail_at in 1..=100 {
+                let mut base =
+                    DoSqliteStore::new(test_support::RusqliteDoSql::with_runtime_schema());
+                let fixture = conformance::setup(&mut base, "file.write", status);
+                let snapshot = |sql: &dyn DoSql| {
+                    [
+                        "events",
+                        "instances",
+                        "effects",
+                        "runs",
+                        "leases",
+                        "facts",
+                        "diagnostics",
+                        "effect_dependencies",
+                    ]
+                    .map(|table| {
+                        sql.query(&format!("SELECT * FROM {table} ORDER BY rowid"), &[])
+                            .unwrap()
+                    })
+                };
+                let before = snapshot(&base.sql);
+                let mut store = DoSqliteStore::new(FaultySql::new(base.sql, fail_at));
+                let outcome = store.settle_file_effect(
+                    fixture.completion(),
+                    fixture.diagnostic(),
+                    fixture.fact(),
+                );
+                let seen = store.sql.seen.get();
+                store.sql.disarm();
+                if outcome.is_ok() {
+                    assert!(fail_at > seen, "{status}: swallowed SQL failure {fail_at}");
+                    assert!(seen > 10, "exercise the complete transaction");
+                    assert_eq!(store.list_facts(&fixture.instance).unwrap().len(), 1);
+                    finished = true;
+                    break;
+                }
+                assert_eq!(
+                    snapshot(&store.sql),
+                    before,
+                    "{status}: SQL failure {fail_at}"
+                );
+                assert!(format!("{:?}", outcome.unwrap_err()).contains("injected fault"));
+            }
+            assert!(
+                finished,
+                "must reach a successful {status} settlement after all SQL failures"
+            );
+        }
+    }
+
+    #[test]
+    fn host_action_do_admission_conformance() {
+        whipplescript_store::host_actions::conformance::check(&mut store());
+    }
+
+    #[test]
+    fn host_action_do_rolls_back_every_sql_failure() {
+        use whipplescript_store::host_actions::conformance;
+        let mut finished = false;
+        for fail_at in 1..=250 {
+            let mut base = store();
+            let version = conformance::register(&mut base);
+            let action = conformance::action(&version);
+            let mut injected = DoSqliteStore::new(FaultySql::new(base.sql, fail_at));
+            let outcome = injected.admit_host_action(action);
+            let seen = injected.sql.seen.get();
+            injected.sql.disarm();
+            if outcome.is_ok() {
+                assert!(fail_at > seen, "faults must propagate");
+                finished = true;
+                break;
+            }
+            assert!(
+                injected.list_instances().unwrap().is_empty(),
+                "instance survived fault {fail_at}"
+            );
+            assert!(
+                injected.list_events(action.instance_id).unwrap().is_empty(),
+                "event survived fault {fail_at}"
+            );
+            assert!(
+                injected.list_facts(action.instance_id).unwrap().is_empty(),
+                "input survived fault {fail_at}"
+            );
+            assert!(!injected.admit_host_action(action).unwrap().replayed);
+        }
+        assert!(
+            finished,
+            "fixture must reach a successful admission after sweeping every SQL boundary"
+        );
+    }
 
     /// Backs `DoSql` with real in-memory SQLite, so the ported store SQL is
     /// checked against an actual engine.
@@ -11073,6 +11300,499 @@ pub(crate) mod tests {
         );
     }
 
+    fn recovery_fixture() -> (DoSqliteStore<test_support::RusqliteDoSql>, String) {
+        let mut base = DoSqliteStore::new(test_support::RusqliteDoSql::with_runtime_schema());
+        let version = whipplescript_store::host_actions::conformance::register(&mut base);
+        let instance = base
+            .create_instance(NewInstance {
+                program_id: &version.program_id,
+                version_id: &version.version_id,
+                input_json: "{}",
+            })
+            .unwrap();
+        let id = &instance.instance_id;
+        base.commit_rule(RuleCommit {
+            instance_id: id,
+            rule: "fixture",
+            trigger_event_id: None,
+            facts: &[],
+            consumed_fact_ids: &[],
+            effects: &[NewEffect {
+                effect_id: "atomic-effect",
+                kind: "timer.wait",
+                target: None,
+                input_json: "{}",
+                status: "queued",
+                idempotency_key: "atomic-effect",
+                required_capabilities_json: "[]",
+                profile: None,
+                correlation_id: None,
+                source_span_json: None,
+                timeout_seconds: None,
+            }],
+            dependencies: &[],
+            terminal: None,
+            idempotency_key: Some("atomic-rule"),
+            marks: &[],
+            context_json: None,
+        })
+        .unwrap();
+        (base, instance.instance_id)
+    }
+
+    fn recovery_run(id: &str) -> RunStart<'_> {
+        RunStart {
+            instance_id: id,
+            effect_id: "atomic-effect",
+            run_id: "atomic-run",
+            provider: "builtin",
+            worker_id: "worker",
+            lease_id: "atomic-lease",
+            lease_expires_at: "2030-01-01T00:00:00Z",
+            metadata_json: "{}",
+        }
+    }
+
+    #[test]
+    fn external_recovery_active_run_reattachment_requires_exact_identity_and_durable_event() {
+        let (mut store, id) = recovery_fixture();
+        let run = recovery_run(&id);
+        let first = store.start_run(run).unwrap();
+        let before = store.list_events(&id).unwrap();
+        assert_eq!(store.start_run(run).unwrap(), first);
+        for changed in [
+            RunStart {
+                instance_id: "other",
+                ..run
+            },
+            RunStart {
+                effect_id: "other",
+                ..run
+            },
+            RunStart {
+                provider: "other",
+                ..run
+            },
+            RunStart {
+                worker_id: "other",
+                ..run
+            },
+            RunStart {
+                lease_id: "other",
+                ..run
+            },
+        ] {
+            assert!(store.start_run(changed).is_err());
+            assert_eq!(store.list_events(&id).unwrap(), before);
+        }
+        for (table, key) in [("runs", "run_id"), ("leases", "lease_id")] {
+            let identity = if table == "runs" {
+                run.run_id
+            } else {
+                run.lease_id
+            };
+            store
+                .sql
+                .execute(
+                    &format!("UPDATE {table} SET status = 'invalid' WHERE {key} = ?1"),
+                    &[text(identity)],
+                )
+                .unwrap();
+            assert!(store.start_run(run).is_err());
+            store
+                .sql
+                .execute(
+                    &format!("UPDATE {table} SET status = ?1 WHERE {key} = ?2"),
+                    &[
+                        text(if table == "runs" { "running" } else { "active" }),
+                        text(identity),
+                    ],
+                )
+                .unwrap();
+        }
+        // A damaged legacy projection is not evidence of a recorded dispatch.
+        store
+            .sql
+            .execute(
+                "DELETE FROM events WHERE event_id = ?1",
+                &[text(&first.event_id)],
+            )
+            .unwrap();
+        let error = store.start_run(run).unwrap_err();
+        assert!(format!("{error:?}").contains("active run has no durable run-start event"));
+    }
+
+    #[test]
+    fn external_recovery_new_run_respects_instance_cancel_and_effect_gates() {
+        for state in ["paused", "completed", "failed", "cancelled"] {
+            let (mut store, id) = recovery_fixture();
+            store
+                .sql
+                .execute(
+                    "UPDATE instances SET status = ?1 WHERE instance_id = ?2",
+                    &[text(state), text(&id)],
+                )
+                .unwrap();
+            let before = store.list_events(&id).unwrap();
+            assert!(store.start_run(recovery_run(&id)).is_err(), "{state}");
+            assert_eq!(store.list_events(&id).unwrap(), before);
+        }
+        let (mut store, id) = recovery_fixture();
+        store.start_run(recovery_run(&id)).unwrap();
+        store
+            .request_effect_cancellation(EffectCancellationRequest {
+                instance_id: &id,
+                effect_id: "atomic-effect",
+                revision_id: None,
+                reason: None,
+                requested_by: "fixture",
+                causation_event_id: None,
+                idempotency_key: Some("cancel"),
+            })
+            .unwrap();
+        store.expire_leases(&id, "2031-01-01T00:00:00Z").unwrap();
+        // Verified absence can permit a new attempt, but does not cancel a
+        // still-open cancellation request or supply renewed intent to execute.
+        let attempts =
+            effect_recovery::fold_attempts(&id, "atomic-effect", &store.list_events(&id).unwrap())
+                .unwrap();
+        let evidence = effect_recovery::DispositionEvidence {
+            frame: attempts[0].dispatch.as_ref().unwrap().frame.clone(),
+            disposition: effect_recovery::EvidenceDisposition::NotApplied,
+            evidence_ref: "fixture:absence".into(),
+            evidence_digest: "fixture-digest".into(),
+            authority_ref: "verified-storage-fixture".into(),
+        };
+        store
+            .append_event(NewEvent {
+                instance_id: &id,
+                event_type: "effect.disposition.recorded",
+                source: "kernel",
+                payload_json: &serde_json::to_string(&evidence).unwrap(),
+                causation_id: None,
+                correlation_id: None,
+                idempotency_key: Some("fixture-absence"),
+            })
+            .unwrap();
+        store
+            .retry_effect(RetryEffect {
+                instance_id: &id,
+                effect_id: "atomic-effect",
+                retry_after: None,
+                idempotency_key: Some("retry"),
+            })
+            .unwrap();
+        let before = store.list_events(&id).unwrap();
+        assert!(store
+            .start_run(RunStart {
+                run_id: "new-run",
+                lease_id: "new-lease",
+                ..recovery_run(&id)
+            })
+            .is_err());
+        assert_eq!(store.list_events(&id).unwrap(), before);
+        for state in ["completed", "failed", "cancelled", "running"] {
+            let (mut store, id) = recovery_fixture();
+            store
+                .sql
+                .execute(
+                    "UPDATE effects SET status = ?1 WHERE instance_id = ?2",
+                    &[text(state), text(&id)],
+                )
+                .unwrap();
+            let before = store.list_events(&id).unwrap();
+            assert!(store.start_run(recovery_run(&id)).is_err(), "{state}");
+            assert_eq!(store.list_events(&id).unwrap(), before);
+            assert!(store.list_runs(&id).unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn external_recovery_active_reattachment_refuses_changed_execution() {
+        for (column, value) in [
+            ("input_json", r#"{"changed":true}"#),
+            ("kind", "file.write"),
+            ("target", "another-target"),
+            ("idempotency_key", "another-key"),
+        ] {
+            let (mut store, id) = recovery_fixture();
+            let run = recovery_run(&id);
+            store.start_run(run).unwrap();
+            store.sql.execute(&format!("UPDATE effects SET {column} = ?1 WHERE instance_id = ?2 AND effect_id = ?3"), &[text(value), text(&id), text(run.effect_id)]).unwrap();
+            let before = store.list_events(&id).unwrap();
+            let error = store.start_run(run).unwrap_err();
+            assert!(
+                format!("{error:?}").contains("active run reattachment changed recorded execution"),
+                "{column}: {error:?}"
+            );
+            assert_eq!(store.list_events(&id).unwrap(), before);
+        }
+        let (mut store, id) = recovery_fixture();
+        let run = recovery_run(&id);
+        let original = store.start_run(run).unwrap();
+        assert_eq!(
+            store
+                .start_run(RunStart {
+                    metadata_json: "{ }",
+                    ..run
+                })
+                .unwrap(),
+            original
+        );
+        for changed in [
+            RunStart {
+                metadata_json: r#"{"path":"another"}"#,
+                ..run
+            },
+            RunStart {
+                lease_expires_at: "2040-01-01T00:00:00Z",
+                ..run
+            },
+        ] {
+            assert!(store.start_run(changed).is_err());
+        }
+        for (column, value) in [("source", "external"), ("event_type", "external.started")] {
+            store
+                .sql
+                .execute(
+                    &format!("UPDATE events SET {column} = ?1 WHERE event_id = ?2"),
+                    &[text(value), text(&original.event_id)],
+                )
+                .unwrap();
+            assert!(store.start_run(run).is_err());
+            store
+                .sql
+                .execute(
+                    &format!("UPDATE events SET {column} = ?1 WHERE event_id = ?2"),
+                    &[
+                        text(if column == "source" {
+                            "kernel"
+                        } else {
+                            "effect.run_started"
+                        }),
+                        text(&original.event_id),
+                    ],
+                )
+                .unwrap();
+        }
+        assert_eq!(store.start_run(run).unwrap(), original);
+    }
+
+    #[test]
+    fn external_recovery_capacity_denial_commits_only_block_evidence() {
+        let (mut store, id) = recovery_fixture();
+        store
+            .register_capability_schema(CapabilitySchemaRegistration {
+                capability: "agent.tell",
+                description: "capacity fixture",
+                schema_json: "{}",
+                registered_by_package_id: None,
+            })
+            .unwrap();
+        store
+            .bind_capability(CapabilityBinding {
+                binding_id: "fixture",
+                program_id: None,
+                capability: "agent.tell",
+                provider: "builtin",
+                config_json: "{}",
+            })
+            .unwrap();
+        store
+            .register_effect_provider(EffectProviderRegistration {
+                provider_id: "fixture",
+                effect_kind: "agent.tell",
+                provider: "builtin",
+                capability: "agent.tell",
+                config_json: "{}",
+                registered_by_package_id: None,
+            })
+            .unwrap();
+        store
+            .sql
+            .execute(
+                "UPDATE program_versions SET declared_profiles = ?1",
+                &[text(
+                    r#"{"agents":[{"name":"worker","capacity":1,"capabilities":["agent.tell"]}]}"#,
+                )],
+            )
+            .unwrap();
+        store.sql.execute("UPDATE effects SET kind = 'agent.tell', target = 'worker' WHERE effect_id = 'atomic-effect'", &[]).unwrap();
+        store.sql.execute("INSERT INTO effects (effect_id, instance_id, kind, target, status, input_json, idempotency_key, created_by_rule) VALUES ('other-effect', ?1, 'agent.tell', 'worker', 'running', '{}', 'other-effect', 'fixture')", &[text(&id)]).unwrap();
+        let before = store.list_events(&id).unwrap();
+        let result = store.start_run(recovery_run(&id));
+        assert!(
+            matches!(result, Err(StoreError::CapacityBlocked { .. })),
+            "{result:?}"
+        );
+        let events = store.list_events(&id).unwrap();
+        assert_eq!(events.len(), before.len() + 1);
+        assert_eq!(events.last().unwrap().event_type, "effect.blocked");
+        assert!(store.list_runs(&id).unwrap().is_empty());
+        assert!(store
+            .sql
+            .query(
+                "SELECT lease_id FROM leases WHERE instance_id = ?1",
+                &[text(&id)]
+            )
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            as_text(
+                &store
+                    .sql
+                    .query(
+                        "SELECT status FROM effects WHERE effect_id = 'atomic-effect'",
+                        &[]
+                    )
+                    .unwrap()[0][0]
+            ),
+            "blocked_by_capacity"
+        );
+    }
+
+    #[test]
+    fn hosted_dispatch_observation_conformance() {
+        whipplescript_store::dispatch_definition::conformance::run_suite(&mut store());
+    }
+
+    #[test]
+    fn external_recovery_transitions_roll_back_every_sql_failure() {
+        use whipplescript_store::effect_recovery::{
+            fold_attempts, DispositionEvidence, EvidenceDisposition,
+        };
+        for operation in [
+            "start",
+            "dispatch",
+            "dispatch-observed",
+            "complete",
+            "expire",
+            "retry",
+            "fenced",
+        ] {
+            let mut finished = false;
+            for fail_at in 1..=150 {
+                let (mut base, instance_id) = recovery_fixture();
+                let id = &instance_id;
+                let run = RunStart {
+                    instance_id: id,
+                    effect_id: "atomic-effect",
+                    run_id: "atomic-run",
+                    provider: "builtin",
+                    worker_id: "worker",
+                    lease_id: "atomic-lease",
+                    lease_expires_at: "2030-01-01T00:00:00Z",
+                    metadata_json: "{}",
+                };
+                let completion = EffectCompletion {
+                    instance_id: id,
+                    effect_id: "atomic-effect",
+                    run_id: "atomic-run",
+                    provider: "builtin",
+                    worker_id: "worker",
+                    status: "failed",
+                    exit_code: None,
+                    summary: None,
+                    metadata_json: "{}",
+                    idempotency_key: Some("atomic-terminal"),
+                };
+                if matches!(operation, "complete" | "expire" | "retry") {
+                    base.start_run(run).unwrap();
+                }
+                if operation == "retry" {
+                    base.complete_effect(completion).unwrap();
+                    let attempts =
+                        fold_attempts(id, "atomic-effect", &base.list_events(id).unwrap()).unwrap();
+                    let evidence = DispositionEvidence {
+                        frame: attempts[0].dispatch.as_ref().unwrap().frame.clone(),
+                        disposition: EvidenceDisposition::NotApplied,
+                        evidence_ref: "fixture:receipt".into(),
+                        evidence_digest: "fixture-digest".into(),
+                        authority_ref: "verified-storage-fixture".into(),
+                    };
+                    base.append_event(NewEvent {
+                        instance_id: id,
+                        event_type: "effect.disposition.recorded",
+                        payload_json: &serde_json::to_string(&evidence).unwrap(),
+                        source: "kernel",
+                        causation_id: None,
+                        correlation_id: None,
+                        idempotency_key: None,
+                    })
+                    .unwrap();
+                }
+                let epoch = base.instance_owner_epoch(id).unwrap();
+                let head = base.chain_head(id).unwrap();
+                let snapshot = |sql: &dyn DoSql| {
+                    ["events", "instances", "effects", "runs", "leases"].map(|table| {
+                        sql.query(&format!("SELECT * FROM {table} ORDER BY rowid"), &[])
+                            .unwrap()
+                    })
+                };
+                let before = snapshot(&base.sql);
+                let observed = dispatch::observe(&base, run)
+                    .expect("observe fixture effect")
+                    .expect("fixture effect exists");
+                let mut injected = DoSqliteStore::new(FaultySql::new(base.sql, fail_at));
+                let outcome = match operation {
+                    "start" => injected.start_run(run).map(|_| ()),
+                    "dispatch" => injected.start_dispatch(run).map(|_| ()),
+                    "dispatch-observed" => {
+                        injected.start_dispatch_observed(run, &observed).map(|_| ())
+                    }
+                    "complete" => injected.complete_effect(completion).map(|_| ()),
+                    "expire" => injected
+                        .expire_leases(id, "2031-01-01T00:00:00Z")
+                        .map(|_| ()),
+                    "retry" => injected
+                        .retry_effect(RetryEffect {
+                            instance_id: id,
+                            effect_id: "atomic-effect",
+                            retry_after: None,
+                            idempotency_key: Some("atomic-retry"),
+                        })
+                        .map(|_| ()),
+                    "fenced" => injected
+                        .append_event_fenced(
+                            epoch,
+                            &head.digest,
+                            NewEvent {
+                                instance_id: id,
+                                event_type: "fixture.reconciled",
+                                payload_json: "{}",
+                                source: "kernel",
+                                causation_id: None,
+                                correlation_id: None,
+                                idempotency_key: None,
+                            },
+                        )
+                        .map(|_| ()),
+                    _ => unreachable!(),
+                };
+                let seen = injected.sql.seen.get();
+                injected.sql.disarm();
+                if outcome.is_ok() {
+                    assert!(
+                        fail_at > seen,
+                        "{operation} swallowed SQL failure {fail_at}"
+                    );
+                    assert_ne!(before, snapshot(&injected.sql));
+                    finished = true;
+                    break;
+                }
+                assert_eq!(
+                    before,
+                    snapshot(&injected.sql),
+                    "{operation} left partial state after SQL failure {fail_at}"
+                );
+            }
+            assert!(
+                finished,
+                "{operation} must reach success after every SQL boundary"
+            );
+        }
+    }
+
     /// A `DoSql` that fails the Nth statement, deterministically.
     ///
     /// The `DoSql` trait is already the fault-injection seam this host needs —
@@ -11086,7 +11806,7 @@ pub(crate) mod tests {
     }
 
     impl<S: DoSql> FaultySql<S> {
-        fn new(inner: S, fail_at: usize) -> Self {
+        pub(crate) fn new(inner: S, fail_at: usize) -> Self {
             Self {
                 inner,
                 fail_at: std::cell::Cell::new(fail_at),
@@ -11094,12 +11814,15 @@ pub(crate) mod tests {
             }
         }
         /// Stop injecting, so a checker can read the wreckage.
-        fn disarm(&self) {
+        pub(crate) fn disarm(&self) {
             self.fail_at.set(usize::MAX);
         }
     }
 
     impl<S: DoSql> DoSql for FaultySql<S> {
+        fn atomic(&self, body: &mut dyn FnMut() -> StoreResult<()>) -> StoreResult<()> {
+            self.inner.atomic(body)
+        }
         fn execute(&self, sql: &str, params: &[SqlValue]) -> Result<u64, String> {
             self.seen.set(self.seen.get() + 1);
             if self.seen.get() == self.fail_at.get() {
@@ -11296,7 +12019,7 @@ pub(crate) mod tests {
     fn do_store_core_methods_run_real_sql() {
         let store = store();
 
-        assert_eq!(store.schema_version().expect("version"), 2);
+        assert_eq!(store.schema_version().expect("version"), 3);
         assert!(!store.fact_exists("i1", "ready").expect("fact"));
 
         let event = store
@@ -12896,7 +13619,7 @@ pub(crate) mod tests {
                 &[text("eff_1")],
             )
             .expect("read effect");
-        assert_eq!(as_text(&effect_status[0][0]), "queued");
+        assert_eq!(as_text(&effect_status[0][0]), "failed");
         let run_status = store
             .sql
             .query(

@@ -1,0 +1,57 @@
+--- Retained target result, spec/files.md. F abstracts the complete immutable
+--- binding/result; the host's current read authorization is a precondition.
+--- Publication commits cut/link/op together. Content preparation is a separate
+--- store: collection may remove an unrooted candidate before publication.
+--- That case is honest unavailability, never a fabricated recovered result.
+mod WHIPPLESCRIPT-SAVE-RESULT is
+  sorts Key Result Cfg .
+  op k : -> Key [ctor] .
+  ops f g : -> Result [ctor] .
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+  op free : Key -> Cfg [ctor] .
+  op candidate : Key Result -> Cfg [ctor] .
+  op blob : Result -> Cfg [ctor] .
+  op cut : Key Result -> Cfg [ctor] .
+  op link : Key Result -> Cfg [ctor] .
+  op operation : Key -> Cfg [ctor] .
+  op read : Key Result -> Cfg [ctor] .
+  op recovered : Key Result -> Cfg [ctor] .
+  op unavailable : Key -> Cfg [ctor] .
+  op collect : -> Cfg [ctor] .
+  op erase : Result -> Cfg [ctor] .
+  ops erased collected : Result -> Cfg [ctor] .
+  var K : Key .
+  vars F G : Result .
+  rl [commit] : free(K) candidate(K, F) => cut(K, F) link(K, F) operation(K) .
+  rl [read-result] : read(K, F) cut(K, F) link(K, F) operation(K) blob(F)
+    => recovered(K, F) cut(K, F) link(K, F) operation(K) blob(F) .
+  rl [collect-prepared] : collect free(K) candidate(K, F) blob(F)
+    => free(K) candidate(K, F) collected(F) .
+  rl [explicit-erasure] : erase(F) blob(F) => erased(F) .
+  rl [read-erased] : read(K, F) cut(K, F) link(K, F) erased(F)
+    => unavailable(K) cut(K, F) link(K, F) erased(F) .
+  rl [read-collected] : read(K, F) cut(K, F) link(K, F) collected(F)
+    => unavailable(K) cut(K, F) link(K, F) collected(F) .
+endm
+
+mod WHIPPLESCRIPT-SAVE-RESULT-SPLIT is
+  including WHIPPLESCRIPT-SAVE-RESULT .
+  rl [split-publication] : free(K:Key) candidate(K:Key, F:Result)
+    => cut(K:Key, F:Result) operation(K:Key) .
+endm
+mod WHIPPLESCRIPT-SAVE-RESULT-REPEATED is
+  including WHIPPLESCRIPT-SAVE-RESULT .
+  rl [repeat-without-key] : candidate(K:Key, F:Result)
+    => cut(K:Key, F:Result) link(K:Key, F:Result) operation(K:Key) .
+endm
+mod WHIPPLESCRIPT-SAVE-RESULT-UNROOTED is
+  including WHIPPLESCRIPT-SAVE-RESULT .
+  rl [ignore-root] : collect cut(K:Key, F:Result) link(K:Key, F:Result) blob(F:Result)
+    => cut(K:Key, F:Result) link(K:Key, F:Result) .
+endm
+mod WHIPPLESCRIPT-SAVE-RESULT-REBOUND is
+  including WHIPPLESCRIPT-SAVE-RESULT .
+  rl [ignore-binding] : read(K:Key, G:Result) cut(K:Key, F:Result) link(K:Key, F:Result) operation(K:Key) blob(F:Result)
+    => recovered(K:Key, G:Result) cut(K:Key, F:Result) link(K:Key, F:Result) operation(K:Key) blob(F:Result) .
+endm

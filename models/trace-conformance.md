@@ -21,7 +21,7 @@ effects are not claimed while paused or cancelled
 effects are not claimed before dependency predicates are satisfied
 effects may be claimed from queued OR from a blocked status (see below)
 runs start only for claimed effects
-lease expiry marks the active run stale and makes the effect queueable again
+lease expiry marks the active run stale and holds the effect failed for recovery
 a policy/capacity/dependency block does not strand an effect: it can still be claimed
 `whip retry` re-queues a failed/timed-out effect (EffectRetried) so it can run again
 retry is legal only from a failed/timed-out status
@@ -40,8 +40,7 @@ as an explicit `blocked -> queued` re-queue (`kernel.maude`
 The store, however, folds that unblock into the next claim: `start_run` re-checks
 the policy/capacity/dependency condition inside one transaction and, if it now
 clears, moves the effect straight from its blocked status to `running`. There is no
-separate observable "unblock" event to reconstruct (unlike lease expiry, which does
-emit `lease.expired`). The trace checker therefore accepts a claim directly from
+separate observable "unblock" event to reconstruct. The trace checker accepts a claim directly from
 `Blocked` — the coarser but faithful observation of the models' two-step recovery.
 The dependency-ordering invariant (a claim is illegal while an upstream predicate is
 unsatisfied) is what keeps this rule's bite; capacity/policy are re-verified by the
@@ -52,6 +51,14 @@ modeled directly as `TraceEvent::EffectRetried`: a `failed`/`timed_out` effect
 returns to `queued` (matching `retry_effect`'s `WHERE status IN ('failed','timed_out')`
 and the models' `retry-failed`/`retry-timeout` rules), clearing its terminal mark so
 a fresh claim/run/terminal is legal.
+
+Lease expiry instead emits `lease.expired`, releases the lease and marks the
+effect failed. It does not authorize a new attempt. The trace checks status
+transitions; the shared recovery fold additionally requires proof of absence
+for every prior attempt before ordinary resubmission. Target-specific recovery
+contracts and current authority remain separate prerequisites. Historical
+expiry records without the new `effect_status` field retain their recorded
+queued projection, but their unknown disposition still blocks dispatch.
 
 This checker is intentionally abstract. It does not know SQL table names,
 provider-specific payloads, or source-language syntax. Runtime code should

@@ -1,6 +1,7 @@
             CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, name TEXT);
             INSERT INTO schema_migrations (version, name) VALUES (1, 'init');
             INSERT INTO schema_migrations (version, name) VALUES (2, 'provider-trust-evidence');
+            INSERT INTO schema_migrations (version, name) VALUES (3, 'retained-write-results');
             CREATE TABLE events (
                 event_id TEXT PRIMARY KEY, instance_id TEXT NOT NULL, sequence INTEGER NOT NULL,
                 event_type TEXT NOT NULL, payload_json TEXT NOT NULL, occurred_at TEXT NOT NULL,

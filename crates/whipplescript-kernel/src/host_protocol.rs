@@ -11,6 +11,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::ifc::VerifiedEnvelope;
 
+pub mod action;
+pub mod action_result;
+mod action_wire;
+pub mod execution;
+pub mod recovery;
+
 pub const HOST_PROTOCOL: &str = "whipplescript.host.v1";
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

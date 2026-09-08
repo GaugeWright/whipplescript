@@ -39,7 +39,7 @@ blocked	block	blocked	no
 claimed	block	blocked	no
 failed	retry	queued	yes
 timed_out	retry	queued	yes
-running	lease_expire	queued	yes
+running	lease_expire	failed	yes
 queued	cancel	cancelled	no
 blocked	cancel	cancelled	no
 claimed	cancel	cancelled	no

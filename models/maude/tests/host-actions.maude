@@ -1,0 +1,107 @@
+load ../host-actions.maude
+
+--- Normal admission reaches the external sink and retains the exact input.
+search [1] in WHIPPLESCRIPT-HOST-ACTIONS :
+  request(k1, f1, true, live) free(k1)
+  =>* admitted(k1, f1) input(k1, f1) external(k1) work(k1, applied) C:Cfg .
+--- Concurrent duplicate delivery creates one instance/start input.
+search [1] in WHIPPLESCRIPT-HOST-ACTIONS :
+  request(k1, f1, true, live) request(k1, f1, true, live) free(k1)
+  =>* input(k1, f1) input(k1, f1) C:Cfg .
+--- Changed meaning cannot replace the input under an existing request.
+search [1] in WHIPPLESCRIPT-HOST-ACTIONS :
+  request(k1, f2, true, live) admitted(k1, f1) input(k1, f1)
+  =>* input(k1, f2) C:Cfg .
+search [1] in WHIPPLESCRIPT-HOST-ACTIONS-REBOUND :
+  request(k1, f2, true, live) admitted(k1, f1) input(k1, f1)
+  =>* input(k1, f2) C:Cfg .
+--- A forged principal gets no attributed instance, regardless of origin.
+search [1] in WHIPPLESCRIPT-HOST-ACTIONS :
+  request(k1, f1, false, live) free(k1)
+  =>* admitted(k1, f1) C:Cfg .
+search [1] in WHIPPLESCRIPT-HOST-ACTIONS-FORGED :
+  request(k1, f1, false, live) free(k1)
+  =>* admitted(k1, f1) C:Cfg .
+--- Historical inspection has no effect sink access.
+search [1] in WHIPPLESCRIPT-HOST-ACTIONS :
+  request(k1, f1, true, replay) admitted(k1, f1)
+  =>* external(k1) C:Cfg .
+search [1] in WHIPPLESCRIPT-HOST-ACTIONS-REPLAY :
+  request(k1, f1, true, replay) admitted(k1, f1)
+  =>* external(k1) C:Cfg .
+--- After remote application, a missing callback leaves UNKNOWN, never absence.
+search [1] in WHIPPLESCRIPT-HOST-ACTIONS :
+  work(k1, ready) retry(k1)
+  =>* work(k1, unknown) external(k1) marker(k1) retry(k1) .
+search [1] in WHIPPLESCRIPT-HOST-ACTIONS :
+  work(k1, ready) retry(k1)
+  =>* external(k1) external(k1) C:Cfg .
+search [1] in WHIPPLESCRIPT-HOST-ACTIONS-RETRY :
+  work(k1, ready) retry(k1)
+  =>* external(k1) external(k1) C:Cfg .
+--- Atomic admission never leaves dispatchable work without its input.
+search [1] in WHIPPLESCRIPT-HOST-ACTIONS :
+  request(k1, f1, true, live) free(k1)
+  =>* admitted(k1, f1) work(k1, ready) .
+search [1] in WHIPPLESCRIPT-HOST-ACTIONS-PARTIAL :
+  request(k1, f1, true, live) free(k1)
+  =>* admitted(k1, f1) work(k1, ready) .
+--- Authoritative absence permits a new attempt, authenticated application does
+--- not. A proof for another operation cannot resolve this one.
+search [1] in WHIPPLESCRIPT-HOST-ACTIONS :
+  work(k1, unknown) absenceProof(k1) retry(k1)
+  =>* external(k1) C:Cfg .
+search [1] in WHIPPLESCRIPT-HOST-ACTIONS :
+  work(k1, unknown) applicationProof(k1) retry(k1)
+  =>* external(k1) C:Cfg .
+search [1] in WHIPPLESCRIPT-HOST-ACTIONS :
+  work(k1, unknown) absenceProof(k2) retry(k1)
+  =>* external(k1) C:Cfg .
+search [1] in WHIPPLESCRIPT-HOST-ACTIONS-DUPLICATE :
+  request(k1, f1, true, live) request(k1, f1, true, live) free(k1)
+  =>* input(k1, f1) input(k1, f1) C:Cfg .
+--- A sink result is unreachable without its durable dispatch marker.
+search [1] in WHIPPLESCRIPT-HOST-ACTIONS :
+  work(k1, ready)
+  =>* work(k1, applied) external(k1) .
+search [1] in WHIPPLESCRIPT-HOST-ACTIONS-UNLOGGED :
+  work(k1, ready)
+  =>* work(k1, applied) external(k1) .
+
+--- An unchanged observation dispatches; a previously changed one cannot.
+search [1] in WHIPPLESCRIPT-HOST-ACTION-OBSERVATION :
+  current(f1) observed(f1) pending
+  =>* sent(f1, f1) C:Cfg .
+search [1] in WHIPPLESCRIPT-HOST-ACTION-OBSERVATION :
+  current(f2) observed(f1) pending
+  =>* sent(f1, f2) C:Cfg .
+--- The racing edit is reachable, but cannot separate check from dispatch.
+search [1] in WHIPPLESCRIPT-HOST-ACTION-OBSERVATION :
+  current(f1) observed(f1) pending changeOnce
+  =>* current(f2) observed(f1) pending .
+search [1] in WHIPPLESCRIPT-HOST-ACTION-OBSERVATION :
+  current(f1) observed(f1) pending changeOnce
+  =>* sent(f1, f2) C:Cfg .
+search [1] in WHIPPLESCRIPT-HOST-ACTION-OBSERVATION-SPLIT :
+  current(f1) observed(f1) pending changeOnce
+  =>* sent(f1, f2) C:Cfg .
+
+search [1] in WHIPPLESCRIPT-HOST-ACTION-EXECUTION :
+  original(f1) permission(true) request(f1) pending(f1)
+  =>* recorded(f1) sent(f1) C:Cfg .
+search [1] in WHIPPLESCRIPT-HOST-ACTION-EXECUTION :
+  original(f1) recorded(f1) pending(f1)
+  =>* sent(f1) C:Cfg .
+search [1] in WHIPPLESCRIPT-HOST-ACTION-EXECUTION :
+  permission(true) request(f1) pending(f1) pending(f1)
+  =>* sent(f1) sent(f1) C:Cfg .
+search [1] in WHIPPLESCRIPT-HOST-ACTION-EXECUTION-REHYDRATE :
+  permission(true) request(f1) pending(f1) pending(f1)
+  =>* sent(f1) sent(f1) C:Cfg .
+search [1] in WHIPPLESCRIPT-HOST-ACTION-EXECUTION :
+  original(f1) permission(false) request(f1) pending(f1)
+  =>* sent(f1) C:Cfg .
+search [1] in WHIPPLESCRIPT-HOST-ACTION-EXECUTION-REVOKED :
+  original(f1) permission(false) request(f1) pending(f1)
+  =>* sent(f1) C:Cfg .
+quit

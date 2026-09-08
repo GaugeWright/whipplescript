@@ -283,7 +283,7 @@ const BUILTIN_SEEDS = [
 // understands. A rolled-back worker attached to an object stamped past this
 // must refuse rather than misread (or "lazily upgrade") a layout it has never
 // seen. Keep in step with the version rows `do_schema.sql` inserts.
-const SUPPORTED_DO_SCHEMA_VERSION = 2;
+const SUPPORTED_DO_SCHEMA_VERSION = 3;
 
 /**
  * DR-0054 Phase B: the object's durable schema is stamped with a version newer
@@ -324,6 +324,11 @@ function ensureSchema(sql: SqlStorage): void {
   if (found > SUPPORTED_DO_SCHEMA_VERSION) {
     throw new UnsupportedSchemaVersionError(found);
   }
+  // A prior deploy does not understand retained write-result references.
+  // Stamp the upgrade before exposing this object to the new branch adapter;
+  // an older worker's existing downgrade guard then refuses this generation.
+  sql.exec(`INSERT OR IGNORE INTO schema_migrations (version, name)
+    VALUES (3, 'retained-write-results')`);
   // Existing placement objects predate GaugeDesk's writer profile. Keep
   // additive runtime policy seeds outside the first-touch branch so a deploy
   // upgrades those objects lazily without rewriting operator-owned rows.
@@ -632,10 +637,14 @@ function rowsToPositionalJson(cursor: Iterable<Record<string, unknown>>): string
  * probe for it.
  */
 function makeBridge(
-  sql: SqlStorage,
+  storage: DurableObjectStorage,
   onActivity?: (kind: string, detail?: string) => void,
 ) {
+  const sql = storage.sql;
   return {
+    atomic(body: () => void): void {
+      storage.transactionSync(body);
+    },
     activity(kind: string, detail?: string): void {
       onActivity?.(kind, detail);
     },
@@ -1285,7 +1294,7 @@ export class WorkflowInstance implements DurableObject {
       try {
         const receipt = JSON.parse(
           hostFunctions.host_cancel_turn(
-            makeBridge(this.ctx.storage.sql),
+            makeBridge(this.ctx.storage),
             decodeURIComponent(cancel[1]),
             decodeURIComponent(cancel[2]),
             "gaugedesk-control-plane",
@@ -1701,7 +1710,7 @@ export class WorkflowInstance implements DurableObject {
       try {
         runtimeProjection = JSON.parse(
           hostFunctions.host_project_turn(
-            makeBridge(this.ctx.storage.sql),
+            makeBridge(this.ctx.storage),
             instanceId,
             commandId,
           ),
@@ -1728,7 +1737,7 @@ export class WorkflowInstance implements DurableObject {
       }
       try {
         return Response.json(JSON.parse(hostFunctions.host_current_position(
-          makeBridge(this.ctx.storage.sql),
+          makeBridge(this.ctx.storage),
           instanceId,
         )));
       } catch (error) {
@@ -1804,7 +1813,7 @@ export class WorkflowInstance implements DurableObject {
       // unreachable: nothing on the wire ever emitted a digest.
       const position = JSON.parse(
         hostFunctions.host_current_position(
-          makeBridge(this.ctx.storage.sql),
+          makeBridge(this.ctx.storage),
           instanceId,
         ),
       );
@@ -2316,7 +2325,7 @@ export class WorkflowInstance implements DurableObject {
         this.publishPublicActivity(commandId, "stopping");
         const receipt = JSON.parse(
           hostFunctions.host_cancel_turn(
-            makeBridge(this.ctx.storage.sql),
+            makeBridge(this.ctx.storage),
             instanceId,
             commandId,
             "public-audience",
@@ -3503,7 +3512,7 @@ export class WorkflowInstance implements DurableObject {
     if (!packageDocs) return Response.json({ error: "host package not found" }, { status: 404 });
     try {
       const instance = WasmDurableInstance.attach_host(
-        makeBridge(this.ctx.storage.sql),
+        makeBridge(this.ctx.storage),
         instanceId,
         packageDocs.manifest,
         packageDocs.source,
@@ -3859,7 +3868,7 @@ export class WorkflowInstance implements DurableObject {
     try {
       opened = JSON.parse(
         hostFunctions.host_open_instance(
-          makeBridge(this.ctx.storage.sql),
+          makeBridge(this.ctx.storage),
           policy.signed_envelope,
           policy.expected_signer,
           policy.signer_public_key_hex,
@@ -4071,7 +4080,7 @@ export class WorkflowInstance implements DurableObject {
     try {
       const opened = JSON.parse(
         hostFunctions.host_open_instance(
-          makeBridge(this.ctx.storage.sql),
+          makeBridge(this.ctx.storage),
           policy.signed_envelope,
           root.signer,
           root.key,
@@ -4174,7 +4183,7 @@ export class WorkflowInstance implements DurableObject {
       // Phase 1 crosses no credential boundary. Only after WhippleScript has
       // returned these exact opaque ids may this Worker invoke the broker.
       const admission = JSON.parse(
-        hostFunctions.host_validate_turn(makeBridge(this.ctx.storage.sql), ...common),
+        hostFunctions.host_validate_turn(makeBridge(this.ctx.storage), ...common),
       ) as HostTurnAdmission;
       const admittedBinding = this.resolveAdmittedProvider(
         admission,
@@ -4189,7 +4198,7 @@ export class WorkflowInstance implements DurableObject {
       const imageError = this.storeAdmittedImages(request);
       if (imageError) return imageError;
       const created = hostFunctions.host_begin_turn(
-        makeBridge(this.ctx.storage.sql),
+        makeBridge(this.ctx.storage),
         ...common,
         binding.provider,
         binding.model,
@@ -4202,7 +4211,7 @@ export class WorkflowInstance implements DurableObject {
       const commandId = String(request.command.command_id ?? "");
       const instance = WasmDurableInstance.attach_host(
         makeBridge(
-          this.ctx.storage.sql,
+          this.ctx.storage,
           (kind, detail) => this.publishKernelActivity(commandId, kind, detail),
         ),
         instanceId,
@@ -4239,7 +4248,7 @@ export class WorkflowInstance implements DurableObject {
       );
       const runtimeProjection = JSON.parse(
         hostFunctions.host_project_turn(
-          makeBridge(this.ctx.storage.sql),
+          makeBridge(this.ctx.storage),
           instanceId,
           commandId,
         ),
@@ -4378,7 +4387,7 @@ export class WorkflowInstance implements DurableObject {
     if (root instanceof Response) return root;
     try {
       return Response.json(JSON.parse(hostFunctions.host_export_thread(
-        makeBridge(this.ctx.storage.sql),
+        makeBridge(this.ctx.storage),
         policy.signed_envelope,
         root.signer,
         root.key,
@@ -4406,7 +4415,7 @@ export class WorkflowInstance implements DurableObject {
     ensureSchema(this.ctx.storage.sql);
     try {
       const forked = JSON.parse(hostFunctions.host_import_fork(
-        makeBridge(this.ctx.storage.sql),
+        makeBridge(this.ctx.storage),
           policy.signed_envelope,
         root.signer,
         root.key,
@@ -4445,7 +4454,7 @@ export class WorkflowInstance implements DurableObject {
     ensureSchema(this.ctx.storage.sql);
     try {
       const discarded = JSON.parse(hostFunctions.host_discard_instance(
-        makeBridge(this.ctx.storage.sql),
+        makeBridge(this.ctx.storage),
         policy.signed_envelope,
         root.signer,
         root.key,
@@ -4577,7 +4586,7 @@ export class WorkflowInstance implements DurableObject {
   // and the operator command path (checkpoint/restore).
   private makeInstance(bootstrap: Bootstrap): WasmDurableInstance {
     ensureSchema(this.ctx.storage.sql);
-    const bridge = makeBridge(this.ctx.storage.sql);
+    const bridge = makeBridge(this.ctx.storage);
     // Provider creds from DO secrets (optional; store-only workflows omit both).
     // Same JSON shape for coerce and agent turns; a live agent turn with tools
     // also needs a tool-executor sidecar (the remaining async-tool seam).

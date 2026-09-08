@@ -1,0 +1,33 @@
+--- spec/files.md: the synchronous runtime settlement transaction. Target I/O
+--- and recovery authority are outside this model. F binds the exact outcome;
+--- pending abstracts the store's running-run guard. Ordinary replay reads the
+--- two durable events, and consumed facts cannot be recreated by redelivery.
+mod WHIPPLESCRIPT-FILE-SETTLEMENT is
+  sorts Result Cfg .
+  ops f g : -> Result [ctor] .
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+  op pending : -> Cfg [ctor] .
+  ops request terminal fact consumed : Result -> Cfg [ctor] .
+  op consume : -> Cfg [ctor] .
+  vars F G : Result .
+  rl [commit] : pending request(F) => terminal(F) fact(F) .
+  rl [consume] : consume fact(F) => consumed(F) .
+endm
+
+mod WHIPPLESCRIPT-FILE-SETTLEMENT-SPLIT is
+  including WHIPPLESCRIPT-FILE-SETTLEMENT .
+  rl [terminal-before-fact] : pending request(F:Result) => terminal(F:Result) .
+endm
+mod WHIPPLESCRIPT-FILE-SETTLEMENT-ORPHAN is
+  including WHIPPLESCRIPT-FILE-SETTLEMENT .
+  rl [fact-before-terminal] : pending request(F:Result) => fact(F:Result) .
+endm
+mod WHIPPLESCRIPT-FILE-SETTLEMENT-REBOUND is
+  including WHIPPLESCRIPT-FILE-SETTLEMENT .
+  rl [different-outcomes] : pending request(F:Result) => terminal(F:Result) fact(g) .
+endm
+mod WHIPPLESCRIPT-FILE-SETTLEMENT-REVIVE is
+  including WHIPPLESCRIPT-FILE-SETTLEMENT .
+  rl [redelivery-revives] : request(F:Result) consumed(F:Result) => fact(F:Result) .
+endm

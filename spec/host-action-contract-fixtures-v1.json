@@ -1,0 +1,1250 @@
+{
+  "schema": "whipplescript.host_action_contract_fixtures.v1",
+  "contract_revision": "whipplescript-host-action/v1.0.0",
+  "description": "Synthetic codec and canonical-identity vectors. Valid syntax does not assert authenticated authority, retained evidence or successful execution. Negative cases name a positive base and JSON-pointer edits; the Rust harness materializes them.",
+  "cases": [
+    {
+      "id": "human-save",
+      "message_type": "HostActionCommand",
+      "value": {
+        "protocol": "whipplescript.host-action.v1",
+        "issuer": "fixture-product",
+        "scope": "workspace:fixture",
+        "request_id": "human-save",
+        "operation": "save-file",
+        "program_version_ref": "fixture-program@1",
+        "input_schema_ref": "fixture-input@1",
+        "policy": {
+          "epoch": 7,
+          "envelope_hash": "fixture-envelope",
+          "signer": "fixture-signer",
+          "key_id": "fixture-key"
+        },
+        "provenance": {
+          "initiator": "human:fixture",
+          "executor": "human:fixture",
+          "delegation": [],
+          "origin": "editor",
+          "causes": [
+            {
+              "authority": "fixture-product",
+              "record_ref": "prior-command",
+              "digest": "prior-digest"
+            }
+          ]
+        },
+        "inputs": {
+          "content": {
+            "handle": "draft:fixture",
+            "version_ref": "draft-hash",
+            "label_ref": "private"
+          }
+        },
+        "resources": {
+          "target": {
+            "resource": {
+              "handle": "target:fixture",
+              "kind": "file_store",
+              "selector": "mainline:example.txt",
+              "writable": true
+            },
+            "basis": {
+              "kind": "version",
+              "version_ref": "cut:base"
+            },
+            "label_ref": "private"
+          }
+        }
+      },
+      "wire_valid": true,
+      "schema_valid": true,
+      "syntax_valid": true,
+      "fingerprint": "2bc6dc3dbb1b27cb30cea76814ca6c6cb24ab9e9d3e9f02630df5e0da36c61f6",
+      "identity": "ins_action_86cc666a81e99a3f8981e583d2341b66c5c532507b6ea80f153836ac91d27592"
+    },
+    {
+      "id": "delegated-agent-save",
+      "message_type": "HostActionCommand",
+      "value": {
+        "protocol": "whipplescript.host-action.v1",
+        "issuer": "fixture-product",
+        "scope": "workspace:fixture",
+        "request_id": "agent-save",
+        "operation": "save-file",
+        "program_version_ref": "fixture-program@1",
+        "input_schema_ref": "fixture-input@1",
+        "policy": {
+          "epoch": 7,
+          "envelope_hash": "fixture-envelope",
+          "signer": "fixture-signer",
+          "key_id": "fixture-key"
+        },
+        "provenance": {
+          "initiator": "human:fixture",
+          "executor": "agent:fixture",
+          "delegation": [
+            {
+              "grant_ref": "fixture-grant",
+              "delegator": "human:fixture",
+              "delegate": "agent:fixture"
+            }
+          ],
+          "origin": "agent-tool",
+          "causes": [
+            {
+              "authority": "fixture-product",
+              "record_ref": "prior-command",
+              "digest": "prior-digest"
+            }
+          ]
+        },
+        "inputs": {
+          "content": {
+            "handle": "draft:fixture",
+            "version_ref": "draft-hash",
+            "label_ref": "private"
+          }
+        },
+        "resources": {
+          "target": {
+            "resource": {
+              "handle": "target:fixture",
+              "kind": "file_store",
+              "selector": "mainline:example.txt",
+              "writable": true
+            },
+            "basis": {
+              "kind": "version",
+              "version_ref": "cut:base"
+            },
+            "label_ref": "private"
+          }
+        }
+      },
+      "wire_valid": true,
+      "schema_valid": true,
+      "syntax_valid": true,
+      "fingerprint": "05e63d2f3bbb98235c5c8888b548af4ad866e9c9e27eb7894029f73a733b4a9e",
+      "identity": "ins_action_4112750d47903dce92e55d1d0240cea8b926618e4d95bd5da2e2dc571e089ff1"
+    },
+    {
+      "id": "unicode-and-full-u64",
+      "message_type": "HostActionCommand",
+      "value": {
+        "protocol": "whipplescript.host-action.v1",
+        "issuer": "fixture-product",
+        "scope": "workspace:fixture",
+        "request_id": "unicode/é/雪/\"/\\/\n",
+        "operation": "save-file",
+        "program_version_ref": "fixture-program@1",
+        "input_schema_ref": "fixture-input@1",
+        "policy": {
+          "epoch": 18446744073709551615,
+          "envelope_hash": "fixture-envelope",
+          "signer": "fixture-signer",
+          "key_id": "fixture-key"
+        },
+        "provenance": {
+          "initiator": "human:fixture",
+          "executor": "human:fixture",
+          "delegation": [],
+          "origin": "editor",
+          "causes": [
+            {
+              "authority": "fixture-product",
+              "record_ref": "prior-command",
+              "digest": "prior-digest"
+            }
+          ]
+        },
+        "inputs": {
+          "content": {
+            "handle": "draft:fixture",
+            "version_ref": "draft-hash",
+            "label_ref": "private"
+          },
+          "": {
+            "handle": "draft:fixture",
+            "version_ref": "draft-hash",
+            "label_ref": "private"
+          },
+          "𐀀": {
+            "handle": "draft:fixture",
+            "version_ref": "draft-hash",
+            "label_ref": "private"
+          }
+        },
+        "resources": {
+          "target": {
+            "resource": {
+              "handle": "target:fixture",
+              "kind": "file_store",
+              "selector": "mainline:example.txt",
+              "writable": true
+            },
+            "basis": {
+              "kind": "version",
+              "version_ref": "cut:base"
+            },
+            "label_ref": "private"
+          }
+        }
+      },
+      "wire_valid": true,
+      "schema_valid": true,
+      "syntax_valid": true,
+      "fingerprint": "72fd086778c0c710dbc96b0e3839917d0593d67d3ee92b05025ed29b22eef7e8",
+      "identity": "ins_action_d59fadbabfa25396b0fc12a68b31a965fb5c9cb604ed2b78b466e2a61678f0f6"
+    },
+    {
+      "id": "admitted-save",
+      "message_type": "ActionAdmissionReceipt",
+      "value": {
+        "protocol": "whipplescript.host-action.v1",
+        "fingerprint": "2bc6dc3dbb1b27cb30cea76814ca6c6cb24ab9e9d3e9f02630df5e0da36c61f6",
+        "instance_ref": "ins_action_86cc666a81e99a3f8981e583d2341b66c5c532507b6ea80f153836ac91d27592",
+        "admitted_at": {
+          "instance_ref": "ins_action_86cc666a81e99a3f8981e583d2341b66c5c532507b6ea80f153836ac91d27592",
+          "sequence": 3,
+          "head_digest": "fixture-prefix"
+        }
+      },
+      "wire_valid": true,
+      "schema_valid": true,
+      "syntax_valid": null
+    },
+    {
+      "id": "renewed-execution",
+      "message_type": "ExecuteActionEffect",
+      "value": {
+        "protocol": "whipplescript.action-execution.v1",
+        "issuer": "fixture-product",
+        "scope": "workspace:fixture",
+        "admission": {
+          "protocol": "whipplescript.host-action.v1",
+          "fingerprint": "2bc6dc3dbb1b27cb30cea76814ca6c6cb24ab9e9d3e9f02630df5e0da36c61f6",
+          "instance_ref": "ins_action_86cc666a81e99a3f8981e583d2341b66c5c532507b6ea80f153836ac91d27592",
+          "admitted_at": {
+            "instance_ref": "ins_action_86cc666a81e99a3f8981e583d2341b66c5c532507b6ea80f153836ac91d27592",
+            "sequence": 3,
+            "head_digest": "fixture-prefix"
+          }
+        },
+        "policy": {
+          "epoch": 8,
+          "envelope_hash": "fixture-envelope",
+          "signer": "fixture-signer",
+          "key_id": "fixture-key"
+        },
+        "provenance": {
+          "initiator": "human:fixture",
+          "executor": "human:fixture",
+          "delegation": [],
+          "origin": "editor",
+          "causes": [
+            {
+              "authority": "fixture-product",
+              "record_ref": "prior-command",
+              "digest": "prior-digest"
+            }
+          ]
+        },
+        "effect_id": "effect:save",
+        "effect_fingerprint": "observed-effect"
+      },
+      "wire_valid": true,
+      "schema_valid": true,
+      "syntax_valid": true
+    },
+    {
+      "id": "pinned-read",
+      "message_type": "ReadActionResult",
+      "value": {
+        "protocol": "whipplescript.action-result.v1",
+        "issuer": "fixture-product",
+        "scope": "workspace:fixture",
+        "policy": {
+          "epoch": 8,
+          "envelope_hash": "fixture-envelope",
+          "signer": "fixture-signer",
+          "key_id": "fixture-key"
+        },
+        "provenance": {
+          "initiator": "human:fixture",
+          "executor": "human:fixture",
+          "delegation": [],
+          "origin": "editor",
+          "causes": [
+            {
+              "authority": "fixture-product",
+              "record_ref": "prior-command",
+              "digest": "prior-digest"
+            }
+          ]
+        },
+        "admission": {
+          "protocol": "whipplescript.host-action.v1",
+          "fingerprint": "2bc6dc3dbb1b27cb30cea76814ca6c6cb24ab9e9d3e9f02630df5e0da36c61f6",
+          "instance_ref": "ins_action_86cc666a81e99a3f8981e583d2341b66c5c532507b6ea80f153836ac91d27592",
+          "admitted_at": {
+            "instance_ref": "ins_action_86cc666a81e99a3f8981e583d2341b66c5c532507b6ea80f153836ac91d27592",
+            "sequence": 3,
+            "head_digest": "fixture-prefix"
+          }
+        },
+        "evidence_handle": "action-history",
+        "evidence_label_ref": "private",
+        "through": {
+          "instance_ref": "ins_action_86cc666a81e99a3f8981e583d2341b66c5c532507b6ea80f153836ac91d27592",
+          "sequence": 12,
+          "head_digest": "later-prefix"
+        }
+      },
+      "wire_valid": true,
+      "schema_valid": true,
+      "syntax_valid": true
+    },
+    {
+      "id": "failed-after-apply",
+      "message_type": "ActionResultSnapshot",
+      "value": {
+        "protocol": "whipplescript.action-result.v1",
+        "admission": {
+          "protocol": "whipplescript.host-action.v1",
+          "fingerprint": "2bc6dc3dbb1b27cb30cea76814ca6c6cb24ab9e9d3e9f02630df5e0da36c61f6",
+          "instance_ref": "ins_action_86cc666a81e99a3f8981e583d2341b66c5c532507b6ea80f153836ac91d27592",
+          "admitted_at": {
+            "instance_ref": "ins_action_86cc666a81e99a3f8981e583d2341b66c5c532507b6ea80f153836ac91d27592",
+            "sequence": 3,
+            "head_digest": "fixture-prefix"
+          }
+        },
+        "command": {
+          "protocol": "whipplescript.host-action.v1",
+          "issuer": "fixture-product",
+          "scope": "workspace:fixture",
+          "request_id": "human-save",
+          "operation": "save-file",
+          "program_version_ref": "fixture-program@1",
+          "input_schema_ref": "fixture-input@1",
+          "policy": {
+            "epoch": 7,
+            "envelope_hash": "fixture-envelope",
+            "signer": "fixture-signer",
+            "key_id": "fixture-key"
+          },
+          "provenance": {
+            "initiator": "human:fixture",
+            "executor": "human:fixture",
+            "delegation": [],
+            "origin": "editor",
+            "causes": [
+              {
+                "authority": "fixture-product",
+                "record_ref": "prior-command",
+                "digest": "prior-digest"
+              }
+            ]
+          },
+          "inputs": {
+            "content": {
+              "handle": "draft:fixture",
+              "version_ref": "draft-hash",
+              "label_ref": "private"
+            }
+          },
+          "resources": {
+            "target": {
+              "resource": {
+                "handle": "target:fixture",
+                "kind": "file_store",
+                "selector": "mainline:example.txt",
+                "writable": true
+              },
+              "basis": {
+                "kind": "version",
+                "version_ref": "cut:base"
+              },
+              "label_ref": "private"
+            }
+          }
+        },
+        "read_policy": {
+          "epoch": 8,
+          "envelope_hash": "fixture-envelope",
+          "signer": "fixture-signer",
+          "key_id": "fixture-key"
+        },
+        "evidence_handle": "action-history",
+        "evidence_label_ref": "private",
+        "observed_at": {
+          "instance_ref": "ins_action_86cc666a81e99a3f8981e583d2341b66c5c532507b6ea80f153836ac91d27592",
+          "sequence": 12,
+          "head_digest": "later-prefix"
+        },
+        "instance_status": "failed",
+        "status_evidence": {
+          "event_id": "workflow-terminal",
+          "sequence": 12,
+          "kind": "workflow.failed"
+        },
+        "terminal": {
+          "status": "failed",
+          "recorded_at": {
+            "instance_ref": "ins_action_86cc666a81e99a3f8981e583d2341b66c5c532507b6ea80f153836ac91d27592",
+            "sequence": 12,
+            "head_digest": "later-prefix"
+          },
+          "evidence": {
+            "event_id": "workflow-terminal",
+            "sequence": 12,
+            "kind": "workflow.failed"
+          }
+        },
+        "effects": [
+          {
+            "effect_id": "effect:save",
+            "attempts": [
+              {
+                "run_id": "run:save",
+                "dispatch": {
+                  "frame": {
+                    "protocol": "whipplescript.effect-recovery.v1",
+                    "instance_id": "ins_action_86cc666a81e99a3f8981e583d2341b66c5c532507b6ea80f153836ac91d27592",
+                    "effect_id": "effect:save",
+                    "run_id": "run:save",
+                    "idempotency_key": "effect-key",
+                    "kind": "file.write",
+                    "target": "target:fixture",
+                    "provider": "files",
+                    "input_fingerprint": "observed-input",
+                    "execution_fingerprint": "observed-execution",
+                    "action_admission": {
+                      "sequence": 3,
+                      "head_digest": "fixture-prefix",
+                      "fingerprint": "2bc6dc3dbb1b27cb30cea76814ca6c6cb24ab9e9d3e9f02630df5e0da36c61f6"
+                    }
+                  },
+                  "ceiling": "reconcilable"
+                },
+                "terminal_status": "failed",
+                "disposition": "applied",
+                "evidence": [
+                  {
+                    "frame": {
+                      "protocol": "whipplescript.effect-recovery.v1",
+                      "instance_id": "ins_action_86cc666a81e99a3f8981e583d2341b66c5c532507b6ea80f153836ac91d27592",
+                      "effect_id": "effect:save",
+                      "run_id": "run:save",
+                      "idempotency_key": "effect-key",
+                      "kind": "file.write",
+                      "target": "target:fixture",
+                      "provider": "files",
+                      "input_fingerprint": "observed-input",
+                      "execution_fingerprint": "observed-execution",
+                      "action_admission": {
+                        "sequence": 3,
+                        "head_digest": "fixture-prefix",
+                        "fingerprint": "2bc6dc3dbb1b27cb30cea76814ca6c6cb24ab9e9d3e9f02630df5e0da36c61f6"
+                      }
+                    },
+                    "disposition": "applied",
+                    "evidence_ref": "save-result",
+                    "evidence_digest": "target-proof-digest",
+                    "authority_ref": "fixture-target"
+                  }
+                ],
+                "disputed": false
+              }
+            ]
+          }
+        ],
+        "evidence": [
+          {
+            "event_id": "workflow-terminal",
+            "sequence": 12,
+            "kind": "workflow.failed"
+          }
+        ]
+      },
+      "wire_valid": true,
+      "schema_valid": true,
+      "syntax_valid": null
+    },
+    {
+      "id": "unknown-after-failure",
+      "message_type": "ActionResultSnapshot",
+      "value": {
+        "protocol": "whipplescript.action-result.v1",
+        "admission": {
+          "protocol": "whipplescript.host-action.v1",
+          "fingerprint": "2bc6dc3dbb1b27cb30cea76814ca6c6cb24ab9e9d3e9f02630df5e0da36c61f6",
+          "instance_ref": "ins_action_86cc666a81e99a3f8981e583d2341b66c5c532507b6ea80f153836ac91d27592",
+          "admitted_at": {
+            "instance_ref": "ins_action_86cc666a81e99a3f8981e583d2341b66c5c532507b6ea80f153836ac91d27592",
+            "sequence": 3,
+            "head_digest": "fixture-prefix"
+          }
+        },
+        "command": {
+          "protocol": "whipplescript.host-action.v1",
+          "issuer": "fixture-product",
+          "scope": "workspace:fixture",
+          "request_id": "human-save",
+          "operation": "save-file",
+          "program_version_ref": "fixture-program@1",
+          "input_schema_ref": "fixture-input@1",
+          "policy": {
+            "epoch": 7,
+            "envelope_hash": "fixture-envelope",
+            "signer": "fixture-signer",
+            "key_id": "fixture-key"
+          },
+          "provenance": {
+            "initiator": "human:fixture",
+            "executor": "human:fixture",
+            "delegation": [],
+            "origin": "editor",
+            "causes": [
+              {
+                "authority": "fixture-product",
+                "record_ref": "prior-command",
+                "digest": "prior-digest"
+              }
+            ]
+          },
+          "inputs": {
+            "content": {
+              "handle": "draft:fixture",
+              "version_ref": "draft-hash",
+              "label_ref": "private"
+            }
+          },
+          "resources": {
+            "target": {
+              "resource": {
+                "handle": "target:fixture",
+                "kind": "file_store",
+                "selector": "mainline:example.txt",
+                "writable": true
+              },
+              "basis": {
+                "kind": "version",
+                "version_ref": "cut:base"
+              },
+              "label_ref": "private"
+            }
+          }
+        },
+        "read_policy": {
+          "epoch": 8,
+          "envelope_hash": "fixture-envelope",
+          "signer": "fixture-signer",
+          "key_id": "fixture-key"
+        },
+        "evidence_handle": "action-history",
+        "evidence_label_ref": "private",
+        "observed_at": {
+          "instance_ref": "ins_action_86cc666a81e99a3f8981e583d2341b66c5c532507b6ea80f153836ac91d27592",
+          "sequence": 12,
+          "head_digest": "later-prefix"
+        },
+        "instance_status": "failed",
+        "status_evidence": {
+          "event_id": "workflow-terminal",
+          "sequence": 12,
+          "kind": "workflow.failed"
+        },
+        "terminal": {
+          "status": "failed",
+          "recorded_at": {
+            "instance_ref": "ins_action_86cc666a81e99a3f8981e583d2341b66c5c532507b6ea80f153836ac91d27592",
+            "sequence": 12,
+            "head_digest": "later-prefix"
+          },
+          "evidence": {
+            "event_id": "workflow-terminal",
+            "sequence": 12,
+            "kind": "workflow.failed"
+          }
+        },
+        "effects": [
+          {
+            "effect_id": "effect:save",
+            "attempts": [
+              {
+                "run_id": "run:save",
+                "dispatch": {
+                  "frame": {
+                    "protocol": "whipplescript.effect-recovery.v1",
+                    "instance_id": "ins_action_86cc666a81e99a3f8981e583d2341b66c5c532507b6ea80f153836ac91d27592",
+                    "effect_id": "effect:save",
+                    "run_id": "run:save",
+                    "idempotency_key": "effect-key",
+                    "kind": "file.write",
+                    "target": "target:fixture",
+                    "provider": "files",
+                    "input_fingerprint": "observed-input",
+                    "execution_fingerprint": "observed-execution",
+                    "action_admission": {
+                      "sequence": 3,
+                      "head_digest": "fixture-prefix",
+                      "fingerprint": "2bc6dc3dbb1b27cb30cea76814ca6c6cb24ab9e9d3e9f02630df5e0da36c61f6"
+                    }
+                  },
+                  "ceiling": "reconcilable"
+                },
+                "terminal_status": "failed",
+                "disposition": "unknown",
+                "evidence": [],
+                "disputed": false
+              }
+            ]
+          }
+        ],
+        "evidence": [
+          {
+            "event_id": "workflow-terminal",
+            "sequence": 12,
+            "kind": "workflow.failed"
+          }
+        ]
+      },
+      "wire_valid": true,
+      "schema_valid": true,
+      "syntax_valid": null
+    },
+    {
+      "id": "legacy-attempt-without-dispatch",
+      "message_type": "ActionResultSnapshot",
+      "value": {
+        "protocol": "whipplescript.action-result.v1",
+        "admission": {
+          "protocol": "whipplescript.host-action.v1",
+          "fingerprint": "2bc6dc3dbb1b27cb30cea76814ca6c6cb24ab9e9d3e9f02630df5e0da36c61f6",
+          "instance_ref": "ins_action_86cc666a81e99a3f8981e583d2341b66c5c532507b6ea80f153836ac91d27592",
+          "admitted_at": {
+            "instance_ref": "ins_action_86cc666a81e99a3f8981e583d2341b66c5c532507b6ea80f153836ac91d27592",
+            "sequence": 3,
+            "head_digest": "fixture-prefix"
+          }
+        },
+        "command": {
+          "protocol": "whipplescript.host-action.v1",
+          "issuer": "fixture-product",
+          "scope": "workspace:fixture",
+          "request_id": "human-save",
+          "operation": "save-file",
+          "program_version_ref": "fixture-program@1",
+          "input_schema_ref": "fixture-input@1",
+          "policy": {
+            "epoch": 7,
+            "envelope_hash": "fixture-envelope",
+            "signer": "fixture-signer",
+            "key_id": "fixture-key"
+          },
+          "provenance": {
+            "initiator": "human:fixture",
+            "executor": "human:fixture",
+            "delegation": [],
+            "origin": "editor",
+            "causes": [
+              {
+                "authority": "fixture-product",
+                "record_ref": "prior-command",
+                "digest": "prior-digest"
+              }
+            ]
+          },
+          "inputs": {
+            "content": {
+              "handle": "draft:fixture",
+              "version_ref": "draft-hash",
+              "label_ref": "private"
+            }
+          },
+          "resources": {
+            "target": {
+              "resource": {
+                "handle": "target:fixture",
+                "kind": "file_store",
+                "selector": "mainline:example.txt",
+                "writable": true
+              },
+              "basis": {
+                "kind": "version",
+                "version_ref": "cut:base"
+              },
+              "label_ref": "private"
+            }
+          }
+        },
+        "read_policy": {
+          "epoch": 8,
+          "envelope_hash": "fixture-envelope",
+          "signer": "fixture-signer",
+          "key_id": "fixture-key"
+        },
+        "evidence_handle": "action-history",
+        "evidence_label_ref": "private",
+        "observed_at": {
+          "instance_ref": "ins_action_86cc666a81e99a3f8981e583d2341b66c5c532507b6ea80f153836ac91d27592",
+          "sequence": 12,
+          "head_digest": "later-prefix"
+        },
+        "instance_status": "failed",
+        "status_evidence": {
+          "event_id": "workflow-terminal",
+          "sequence": 12,
+          "kind": "workflow.failed"
+        },
+        "terminal": {
+          "status": "failed",
+          "recorded_at": {
+            "instance_ref": "ins_action_86cc666a81e99a3f8981e583d2341b66c5c532507b6ea80f153836ac91d27592",
+            "sequence": 12,
+            "head_digest": "later-prefix"
+          },
+          "evidence": {
+            "event_id": "workflow-terminal",
+            "sequence": 12,
+            "kind": "workflow.failed"
+          }
+        },
+        "effects": [
+          {
+            "effect_id": "effect:save",
+            "attempts": [
+              {
+                "run_id": "run:save",
+                "dispatch": null,
+                "terminal_status": "failed",
+                "disposition": "unknown",
+                "evidence": [],
+                "disputed": false
+              }
+            ]
+          }
+        ],
+        "evidence": [
+          {
+            "event_id": "workflow-terminal",
+            "sequence": 12,
+            "kind": "workflow.failed"
+          }
+        ]
+      },
+      "wire_valid": true,
+      "schema_valid": true,
+      "syntax_valid": null
+    },
+    {
+      "id": "reconcile-applied",
+      "message_type": "ReconcileEffectCommand",
+      "value": {
+        "protocol": "whipplescript.effect-reconciliation.v1",
+        "issuer": "fixture-product",
+        "scope": "workspace:fixture",
+        "request_id": "recover-save",
+        "policy": {
+          "epoch": 8,
+          "envelope_hash": "fixture-envelope",
+          "signer": "fixture-signer",
+          "key_id": "fixture-key"
+        },
+        "provenance": {
+          "initiator": "human:fixture",
+          "executor": "human:fixture",
+          "delegation": [],
+          "origin": "editor",
+          "causes": [
+            {
+              "authority": "fixture-product",
+              "record_ref": "prior-command",
+              "digest": "prior-digest"
+            }
+          ]
+        },
+        "evidence": {
+          "frame": {
+            "protocol": "whipplescript.effect-recovery.v1",
+            "instance_id": "ins_action_86cc666a81e99a3f8981e583d2341b66c5c532507b6ea80f153836ac91d27592",
+            "effect_id": "effect:save",
+            "run_id": "run:save",
+            "idempotency_key": "effect-key",
+            "kind": "file.write",
+            "target": "target:fixture",
+            "provider": "files",
+            "input_fingerprint": "observed-input",
+            "execution_fingerprint": "observed-execution",
+            "action_admission": {
+              "sequence": 3,
+              "head_digest": "fixture-prefix",
+              "fingerprint": "2bc6dc3dbb1b27cb30cea76814ca6c6cb24ab9e9d3e9f02630df5e0da36c61f6"
+            }
+          },
+          "disposition": "applied",
+          "evidence_ref": "save-result",
+          "evidence_digest": "target-proof-digest",
+          "authority_ref": "fixture-target"
+        },
+        "evidence_label_ref": "private"
+      },
+      "wire_valid": true,
+      "schema_valid": true,
+      "syntax_valid": true,
+      "fingerprint": "7755c382e7cf68a03c63c7dc9e6ecad03d6094ff575d50e6618720cdce539665",
+      "identity": "reconciliation:f96e6e6354006d7aedc2f017aa2da5b48d4a38189147316122f38fe320666ce9"
+    },
+    {
+      "id": "reconciled-receipt",
+      "message_type": "ReconciliationReceipt",
+      "value": {
+        "protocol": "whipplescript.effect-reconciliation.v1",
+        "request_key": "reconciliation:f96e6e6354006d7aedc2f017aa2da5b48d4a38189147316122f38fe320666ce9",
+        "fingerprint": "7755c382e7cf68a03c63c7dc9e6ecad03d6094ff575d50e6618720cdce539665",
+        "recorded_at": {
+          "instance_ref": "ins_action_86cc666a81e99a3f8981e583d2341b66c5c532507b6ea80f153836ac91d27592",
+          "sequence": 12,
+          "head_digest": "later-prefix"
+        }
+      },
+      "wire_valid": true,
+      "schema_valid": true,
+      "syntax_valid": null
+    },
+    {
+      "id": "save-written",
+      "message_type": "SaveReceipt",
+      "value": {
+        "protocol": "whipplescript.vcs-save-result.v1",
+        "branch_id": "mainline",
+        "path": "example.txt",
+        "base_cut_id": "cut:base",
+        "draft_hash": "draft-hash",
+        "executing_principal": "human:fixture",
+        "attempt": {
+          "instance_id": "ins_action_86cc666a81e99a3f8981e583d2341b66c5c532507b6ea80f153836ac91d27592",
+          "effect_id": "effect:save",
+          "run_id": "run:save",
+          "started_event_id": "dispatch:save"
+        },
+        "result": {
+          "status": "written",
+          "cut_id": "cut:save",
+          "parent_cut_id": "cut:base",
+          "operation_id": "op-cut:save",
+          "accepted_content_hash": "accepted-hash"
+        }
+      },
+      "wire_valid": true,
+      "schema_valid": true,
+      "syntax_valid": null
+    },
+    {
+      "id": "save-merged",
+      "message_type": "SaveReceipt",
+      "value": {
+        "protocol": "whipplescript.vcs-save-result.v1",
+        "branch_id": "mainline",
+        "path": "example.txt",
+        "base_cut_id": "cut:base",
+        "draft_hash": "draft-hash",
+        "executing_principal": "human:fixture",
+        "attempt": {
+          "instance_id": "ins_action_86cc666a81e99a3f8981e583d2341b66c5c532507b6ea80f153836ac91d27592",
+          "effect_id": "effect:save",
+          "run_id": "run:save",
+          "started_event_id": "dispatch:save"
+        },
+        "result": {
+          "status": "merged",
+          "cut_id": "cut:save",
+          "parent_cut_id": "cut:base",
+          "operation_id": "op-cut:save",
+          "accepted_content_hash": "accepted-hash",
+          "pieces": [
+            {
+              "kind": "merged",
+              "text": "fixture text",
+              "provenance": "ours"
+            }
+          ]
+        }
+      },
+      "wire_valid": true,
+      "schema_valid": true,
+      "syntax_valid": null
+    },
+    {
+      "id": "save-conflicted",
+      "message_type": "SaveReceipt",
+      "value": {
+        "protocol": "whipplescript.vcs-save-result.v1",
+        "branch_id": "mainline",
+        "path": "example.txt",
+        "base_cut_id": "cut:base",
+        "draft_hash": "draft-hash",
+        "executing_principal": "human:fixture",
+        "attempt": {
+          "instance_id": "ins_action_86cc666a81e99a3f8981e583d2341b66c5c532507b6ea80f153836ac91d27592",
+          "effect_id": "effect:save",
+          "run_id": "run:save",
+          "started_event_id": "dispatch:save"
+        },
+        "result": {
+          "status": "conflicted",
+          "head_cut_id": "cut:other",
+          "head_content": "fixture other text",
+          "pieces": [
+            {
+              "kind": "conflict",
+              "base_text": "base",
+              "ours_text": "ours",
+              "theirs_text": "theirs"
+            }
+          ]
+        }
+      },
+      "wire_valid": true,
+      "schema_valid": true,
+      "syntax_valid": null
+    },
+    {
+      "id": "write-evidence",
+      "message_type": "WriteEvidenceRef",
+      "value": {
+        "schema_ref": "whipplescript.vcs-save-result.v1",
+        "label_ref": "private",
+        "content_hash": "retained-result"
+      },
+      "wire_valid": true,
+      "schema_valid": true,
+      "syntax_valid": true
+    },
+    {
+      "id": "unknown-policy-constraint",
+      "message_type": "HostActionCommand",
+      "base": "human-save",
+      "set": [
+        {
+          "pointer": "/policy/unsupported_constraint",
+          "value": "deny all"
+        }
+      ],
+      "remove": [],
+      "wire_valid": false,
+      "schema_valid": false,
+      "syntax_valid": null
+    },
+    {
+      "id": "unknown-resource-constraint",
+      "message_type": "HostActionCommand",
+      "base": "human-save",
+      "set": [
+        {
+          "pointer": "/resources/target/resource/unsupported_constraint",
+          "value": "deny all"
+        }
+      ],
+      "remove": [],
+      "wire_valid": false,
+      "schema_valid": false,
+      "syntax_valid": null
+    },
+    {
+      "id": "unknown-admission-pin",
+      "message_type": "ActionAdmissionReceipt",
+      "base": "admitted-save",
+      "set": [
+        {
+          "pointer": "/admitted_at/unsupported_constraint",
+          "value": "deny all"
+        }
+      ],
+      "remove": [],
+      "wire_valid": false,
+      "schema_valid": false,
+      "syntax_valid": null
+    },
+    {
+      "id": "unknown-result-pin",
+      "message_type": "ReadActionResult",
+      "base": "pinned-read",
+      "set": [
+        {
+          "pointer": "/through/unsupported_constraint",
+          "value": "deny all"
+        }
+      ],
+      "remove": [],
+      "wire_valid": false,
+      "schema_valid": false,
+      "syntax_valid": null
+    },
+    {
+      "id": "unknown-execution-policy",
+      "message_type": "ExecuteActionEffect",
+      "base": "renewed-execution",
+      "set": [
+        {
+          "pointer": "/policy/unsupported_constraint",
+          "value": "deny all"
+        }
+      ],
+      "remove": [],
+      "wire_valid": false,
+      "schema_valid": false,
+      "syntax_valid": null
+    },
+    {
+      "id": "unknown-recovery-policy",
+      "message_type": "ReconcileEffectCommand",
+      "base": "reconcile-applied",
+      "set": [
+        {
+          "pointer": "/policy/unsupported_constraint",
+          "value": "deny all"
+        }
+      ],
+      "remove": [],
+      "wire_valid": false,
+      "schema_valid": false,
+      "syntax_valid": null
+    },
+    {
+      "id": "unknown-snapshot-policy",
+      "message_type": "ActionResultSnapshot",
+      "base": "failed-after-apply",
+      "set": [
+        {
+          "pointer": "/read_policy/unsupported_constraint",
+          "value": "deny all"
+        }
+      ],
+      "remove": [],
+      "wire_valid": false,
+      "schema_valid": false,
+      "syntax_valid": null
+    },
+    {
+      "id": "unknown-snapshot-position",
+      "message_type": "ActionResultSnapshot",
+      "base": "failed-after-apply",
+      "set": [
+        {
+          "pointer": "/observed_at/unsupported_constraint",
+          "value": "deny all"
+        }
+      ],
+      "remove": [],
+      "wire_valid": false,
+      "schema_valid": false,
+      "syntax_valid": null
+    },
+    {
+      "id": "unknown-recovery-frame",
+      "message_type": "ReconcileEffectCommand",
+      "base": "reconcile-applied",
+      "set": [
+        {
+          "pointer": "/evidence/frame/unsupported_constraint",
+          "value": "deny all"
+        }
+      ],
+      "remove": [],
+      "wire_valid": false,
+      "schema_valid": false,
+      "syntax_valid": null
+    },
+    {
+      "id": "unknown-save-result",
+      "message_type": "SaveReceipt",
+      "base": "save-written",
+      "set": [
+        {
+          "pointer": "/result/unsupported",
+          "value": "value"
+        }
+      ],
+      "remove": [],
+      "wire_valid": false,
+      "schema_valid": false,
+      "syntax_valid": null
+    },
+    {
+      "id": "unknown-evidence-reference",
+      "message_type": "WriteEvidenceRef",
+      "base": "write-evidence",
+      "set": [
+        {
+          "pointer": "/unverified",
+          "value": "value"
+        }
+      ],
+      "remove": [],
+      "wire_valid": false,
+      "schema_valid": false,
+      "syntax_valid": null
+    },
+    {
+      "id": "missing-action-program",
+      "message_type": "HostActionCommand",
+      "base": "human-save",
+      "set": [],
+      "remove": [
+        "/program_version_ref"
+      ],
+      "wire_valid": false,
+      "schema_valid": false,
+      "syntax_valid": null
+    },
+    {
+      "id": "unsupported-action-version",
+      "message_type": "HostActionCommand",
+      "base": "human-save",
+      "set": [
+        {
+          "pointer": "/protocol",
+          "value": "whipplescript.host-action.v2"
+        }
+      ],
+      "remove": [],
+      "wire_valid": true,
+      "schema_valid": false,
+      "syntax_valid": false
+    },
+    {
+      "id": "empty-action-issuer",
+      "message_type": "HostActionCommand",
+      "base": "human-save",
+      "set": [
+        {
+          "pointer": "/issuer",
+          "value": " "
+        }
+      ],
+      "remove": [],
+      "wire_valid": true,
+      "schema_valid": true,
+      "syntax_valid": false
+    },
+    {
+      "id": "zero-policy-epoch",
+      "message_type": "HostActionCommand",
+      "base": "human-save",
+      "set": [
+        {
+          "pointer": "/policy/epoch",
+          "value": 0
+        }
+      ],
+      "remove": [],
+      "wire_valid": true,
+      "schema_valid": true,
+      "syntax_valid": false
+    },
+    {
+      "id": "negative-policy-epoch",
+      "message_type": "HostActionCommand",
+      "base": "human-save",
+      "set": [
+        {
+          "pointer": "/policy/epoch",
+          "value": -1
+        }
+      ],
+      "remove": [],
+      "wire_valid": false,
+      "schema_valid": false,
+      "syntax_valid": null
+    },
+    {
+      "id": "broken-delegation",
+      "message_type": "HostActionCommand",
+      "base": "delegated-agent-save",
+      "set": [
+        {
+          "pointer": "/provenance/delegation/0/delegator",
+          "value": "unrelated"
+        }
+      ],
+      "remove": [],
+      "wire_valid": true,
+      "schema_valid": true,
+      "syntax_valid": false
+    },
+    {
+      "id": "unsigned-executor-change",
+      "message_type": "HostActionCommand",
+      "base": "human-save",
+      "set": [
+        {
+          "pointer": "/provenance/executor",
+          "value": "agent:other"
+        }
+      ],
+      "remove": [],
+      "wire_valid": true,
+      "schema_valid": true,
+      "syntax_valid": false
+    },
+    {
+      "id": "wrong-recovery-version",
+      "message_type": "ReconcileEffectCommand",
+      "base": "reconcile-applied",
+      "set": [
+        {
+          "pointer": "/evidence/frame/protocol",
+          "value": "wrong"
+        }
+      ],
+      "remove": [],
+      "wire_valid": true,
+      "schema_valid": false,
+      "syntax_valid": false
+    },
+    {
+      "id": "missing-optional-read-pin",
+      "message_type": "ReadActionResult",
+      "base": "pinned-read",
+      "set": [],
+      "remove": [
+        "/through"
+      ],
+      "wire_valid": true,
+      "schema_valid": true,
+      "syntax_valid": true
+    },
+    {
+      "id": "null-optional-read-pin",
+      "message_type": "ReadActionResult",
+      "base": "pinned-read",
+      "set": [
+        {
+          "pointer": "/through",
+          "value": null
+        }
+      ],
+      "remove": [],
+      "wire_valid": true,
+      "schema_valid": true,
+      "syntax_valid": true
+    },
+    {
+      "id": "null-optional-policy-key",
+      "message_type": "HostActionCommand",
+      "base": "human-save",
+      "set": [
+        {
+          "pointer": "/policy/key_id",
+          "value": null
+        }
+      ],
+      "remove": [],
+      "wire_valid": true,
+      "schema_valid": true,
+      "syntax_valid": true
+    }
+  ]
+}

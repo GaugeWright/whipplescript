@@ -1400,28 +1400,38 @@ impl GovernedHostRuntime {
         &self.policy
     }
 
-    /// The latest durable coordinate for an instance. Hosts use this to bind a
-    /// fork to one explicit source point rather than an implicit moving head.
-    /// The newest instance this store records, with its recorded package
+    /// The newest chat instance this store records, with its recorded package
     /// reference — the adoption seam's source lookup for an embedding host
     /// whose authored package identity has drifted past what a replayed open
     /// can reproduce (see [`Self::adopt_instance_from`]). `None` for a store
-    /// that has never opened an instance.
+    /// that has never opened a chat. Ordinary host actions have their own
+    /// admitted command and are not candidates for chat adoption.
     pub fn newest_recorded_instance(&self) -> Result<Option<RecordedInstance>, HostRuntimeError> {
         let mut instances = self
             .kernel
             .store()
             .list_instances()
             .map_err(HostRuntimeError::Store)?;
-        let Some(instance) = instances.pop() else {
-            return Ok(None);
-        };
-        let metadata: InstanceMetadata =
-            serde_json::from_str(&instance.input_json).map_err(HostRuntimeError::Json)?;
-        Ok(Some(RecordedInstance {
-            instance_ref: instance.instance_id,
-            package_version_ref: metadata.package_version_ref,
-        }))
+        while let Some(instance) = instances.pop() {
+            if self
+                .kernel
+                .store()
+                .event_by_idempotency_key(&instance.instance_id, "host-action-admission")
+                .map_err(HostRuntimeError::Store)?
+                .is_some()
+            {
+                continue;
+            }
+            // Preserve the refusal for malformed legacy chat metadata. Only a
+            // durably identified action is excluded from the chat lookup.
+            let metadata: InstanceMetadata =
+                serde_json::from_str(&instance.input_json).map_err(HostRuntimeError::Json)?;
+            return Ok(Some(RecordedInstance {
+                instance_ref: instance.instance_id,
+                package_version_ref: metadata.package_version_ref,
+            }));
+        }
+        Ok(None)
     }
 
     /// Where this instance's log currently is.
@@ -4124,6 +4134,61 @@ workflow UnsafeHostChat {
             },
             placement_ceiling_ref: "local".to_owned(),
         }
+    }
+
+    #[test]
+    fn host_action_instances_do_not_replace_the_latest_recoverable_chat() {
+        use whipplescript_store::host_actions::conformance;
+        let path = temp_store();
+        let mut runtime = GovernedHostRuntime::open(&path, 7, &signed_policy()).unwrap();
+        let version = conformance::register(runtime.kernel.store_mut());
+        let mut action = conformance::action(&version);
+        // The deterministic suffix sorts after the chat when timestamps tie.
+        action.instance_id = "ins_zz_action";
+        runtime
+            .kernel
+            .store_mut()
+            .admit_host_action(action)
+            .unwrap();
+        assert!(runtime.newest_recorded_instance().unwrap().is_none());
+        let chat = runtime
+            .open_instance(
+                &OpenInstanceCommand {
+                    protocol: HOST_PROTOCOL.into(),
+                    request_id: "chat-after-action".into(),
+                    package_version_ref: "package:v1".into(),
+                    policy: runtime.policy_ref().clone(),
+                },
+                &Packages,
+            )
+            .unwrap();
+        action.instance_id = "ins_zzz_later_action";
+        action.input_facts = &[];
+        runtime
+            .kernel
+            .store_mut()
+            .admit_host_action(action)
+            .unwrap();
+        assert_eq!(
+            runtime
+                .newest_recorded_instance()
+                .unwrap()
+                .unwrap()
+                .instance_ref,
+            chat.instance_ref
+        );
+        drop(runtime);
+        let reopened = GovernedHostRuntime::open(&path, 7, &signed_policy()).unwrap();
+        assert_eq!(
+            reopened
+                .newest_recorded_instance()
+                .unwrap()
+                .unwrap()
+                .instance_ref,
+            chat.instance_ref
+        );
+        drop(reopened);
+        fs::remove_file(path).unwrap();
     }
 
     #[test]

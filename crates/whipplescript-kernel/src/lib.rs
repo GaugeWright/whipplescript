@@ -1,5 +1,7 @@
 //! Deterministic runtime kernel scaffold.
 
+mod action_execution;
+mod action_result;
 pub mod agent_profile;
 pub mod artifact_manifest;
 pub mod coerce;
@@ -7,11 +9,14 @@ pub mod coerce_native;
 pub mod context_assembly;
 pub mod effect_config;
 pub mod effect_handlers;
+pub mod effect_reconciliation;
 pub mod exec_http;
+mod file_settlement;
 pub mod gov;
 pub mod harness;
 pub mod harness_loop;
 pub mod harness_model;
+pub mod host_action;
 pub mod host_facade;
 pub mod host_package;
 pub mod host_policy;
@@ -31,10 +36,12 @@ pub mod rule_correspondence;
 pub mod rule_lowering;
 pub mod rule_pass;
 pub mod sansio;
+pub mod save_reconciliation;
 pub mod source_merge;
 pub mod time_pass;
 pub mod trace;
 pub mod whip_shell;
+pub mod workflow_input;
 pub mod world_state;
 
 use artifact_manifest::{
@@ -93,6 +100,8 @@ pub struct RuntimeKernel<S: RuntimeStore = SqliteStore> {
     /// The host's door to the custodian, for reaping at instance terminal.
     /// `None` reaps nothing, which is what every host did before this existed.
     credential_reaper: Option<std::sync::Arc<dyn crate::rule_pass::CredentialReaper>>,
+    /// Transient current authority; never reconstructed from runtime metadata.
+    action_execution: Option<host_protocol::execution::VerifiedActionExecution>,
 }
 
 /// wasm / no-native form: no default backend (rusqlite `SqliteStore` is absent).
@@ -106,6 +115,8 @@ pub struct RuntimeKernel<S: RuntimeStore> {
     /// The host's door to the custodian, for reaping at instance terminal.
     /// `None` reaps nothing, which is what every host did before this existed.
     credential_reaper: Option<std::sync::Arc<dyn crate::rule_pass::CredentialReaper>>,
+    /// Transient current authority; never reconstructed from runtime metadata.
+    action_execution: Option<host_protocol::execution::VerifiedActionExecution>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -425,6 +436,7 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
             trace: Vec::new(),
             coercion_config_fingerprint: "fixture".to_owned(),
             credential_reaper: None,
+            action_execution: None,
         }
     }
 
@@ -1335,7 +1347,41 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
     }
 
     pub fn start_run(&mut self, run: RunStart<'_>) -> StoreResult<StoredEvent> {
-        let event = match self.store.start_run(run) {
+        self.refuse_unverified_action_dispatch(run)?;
+        let result = self.store.start_run(run);
+        self.record_run_start(run, result)
+    }
+
+    /// New sink I/O requires fresh admission; reattaching a recorded run is
+    /// deliberately a different operation, even on resumable provider hosts.
+    pub fn start_dispatch(&mut self, run: RunStart<'_>) -> StoreResult<StoredEvent> {
+        self.refuse_unverified_action_dispatch(run)?;
+        let result = self.store.start_dispatch(run);
+        self.record_run_start(run, result)
+    }
+
+    /// Bind fresh dispatch to the complete effect definition the handler read.
+    /// The store compares it inside the same transaction that claims the run.
+    pub fn start_dispatch_observed(
+        &mut self,
+        run: RunStart<'_>,
+        expected: &ClaimableEffect,
+    ) -> StoreResult<StoredEvent> {
+        let metadata = self.action_dispatch_metadata(run, expected)?;
+        let run = RunStart {
+            metadata_json: metadata.as_deref().unwrap_or(run.metadata_json),
+            ..run
+        };
+        let result = self.store.start_dispatch_observed(run, expected);
+        self.record_run_start(run, result)
+    }
+
+    fn record_run_start(
+        &mut self,
+        run: RunStart<'_>,
+        result: StoreResult<StoredEvent>,
+    ) -> StoreResult<StoredEvent> {
+        let event = match result {
             Ok(event) => event,
             Err(StoreError::PolicyBlocked { effect_id, reason })
             | Err(StoreError::CapacityBlocked { effect_id, reason }) => {
@@ -5875,7 +5921,7 @@ rule wait
     }
 
     #[test]
-    fn kernel_expires_leases_and_retries_failed_effects() {
+    fn kernel_expires_leases_without_resubmitting_unknown_effects() {
         let store = SqliteStore::open_in_memory().expect("store opens");
         let mut kernel = RuntimeKernel::new(store);
         let effects = [NewEffect {
@@ -5944,8 +5990,11 @@ rule wait
             idempotency_key: Some("late-complete"),
         });
         assert!(stale_completion.is_err());
-
-        kernel
+        let before = kernel
+            .store()
+            .list_events("instance-a")
+            .expect("expired history");
+        assert!(kernel
             .start_run(RunStart {
                 instance_id: "instance-a",
                 effect_id: "tell",
@@ -5956,30 +6005,22 @@ rule wait
                 lease_expires_at: "2030-01-04T00:00:00Z",
                 metadata_json: "{}",
             })
-            .expect("retry run starts after lease expiry");
-        kernel
-            .fail_run(EffectCompletion {
-                instance_id: "instance-a",
-                effect_id: "tell",
-                run_id: "run-tell-2",
-                provider: "test",
-                worker_id: "worker-1",
-                status: "ignored",
-                exit_code: Some(1),
-                summary: Some("failed"),
-                metadata_json: "{}",
-                idempotency_key: Some("fail-tell"),
-            })
-            .expect("run fails");
-        kernel
+            .is_err());
+        assert!(kernel
             .retry_effect(RetryEffect {
                 instance_id: "instance-a",
                 effect_id: "tell",
-                retry_after: Some("2030-01-05T00:00:00Z"),
+                retry_after: None,
                 idempotency_key: Some("retry-tell"),
             })
-            .expect("effect retries");
-
+            .is_err());
+        assert_eq!(
+            kernel
+                .store()
+                .list_events("instance-a")
+                .expect("inert refusal"),
+            before
+        );
         check_trace(kernel.trace()).expect("kernel trace conforms");
     }
 

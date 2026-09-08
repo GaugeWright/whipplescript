@@ -1,0 +1,45 @@
+load ../save-result-retention.maude
+--- Exact recovery needs no second write, including after a lost callback.
+search [1] in WHIPPLESCRIPT-SAVE-RESULT :
+  free(k) candidate(k, f) blob(f) read(k, f)
+  =>* recovered(k, f) cut(k, f) link(k, f) operation(k) blob(f) .
+--- Publication cannot expose a cut without its result link.
+search [1] in WHIPPLESCRIPT-SAVE-RESULT :
+  free(k) candidate(k, f) blob(f)
+  =>* cut(k, f) operation(k) blob(f) .
+search [1] in WHIPPLESCRIPT-SAVE-RESULT-SPLIT :
+  free(k) candidate(k, f) blob(f)
+  =>* cut(k, f) operation(k) blob(f) .
+--- Reusing an effect identity cannot publish another cut.
+search [1] in WHIPPLESCRIPT-SAVE-RESULT :
+  free(k) candidate(k, f) candidate(k, f) blob(f)
+  =>* cut(k, f) cut(k, f) C:Cfg .
+search [1] in WHIPPLESCRIPT-SAVE-RESULT-REPEATED :
+  free(k) candidate(k, f) candidate(k, f) blob(f)
+  =>* cut(k, f) cut(k, f) C:Cfg .
+--- A committed result is a collection root, independently of current head.
+search [1] in WHIPPLESCRIPT-SAVE-RESULT :
+  cut(k, f) link(k, f) operation(k) blob(f) collect
+  =>* cut(k, f) link(k, f) operation(k) .
+search [1] in WHIPPLESCRIPT-SAVE-RESULT-UNROOTED :
+  cut(k, f) link(k, f) operation(k) blob(f) collect
+  =>* cut(k, f) link(k, f) operation(k) .
+--- A different immutable binding cannot borrow this result.
+search [1] in WHIPPLESCRIPT-SAVE-RESULT :
+  cut(k, f) link(k, f) operation(k) blob(f) read(k, g)
+  =>* recovered(k, g) C:Cfg .
+search [1] in WHIPPLESCRIPT-SAVE-RESULT-REBOUND :
+  cut(k, f) link(k, f) operation(k) blob(f) read(k, g)
+  =>* recovered(k, g) C:Cfg .
+--- Erasure preserves permitted metadata and reports unavailable bytes.
+search [1] in WHIPPLESCRIPT-SAVE-RESULT :
+  cut(k, f) link(k, f) operation(k) blob(f) erase(f) read(k, f)
+  =>* unavailable(k) cut(k, f) link(k, f) operation(k) erased(f) .
+--- Collection during preparation is not silently assumed impossible.
+search [1] in WHIPPLESCRIPT-SAVE-RESULT :
+  free(k) candidate(k, f) blob(f) collect read(k, f)
+  =>* unavailable(k) cut(k, f) link(k, f) operation(k) collected(f) .
+--- Missing payloads never manufacture a recovered result.
+search [1] in WHIPPLESCRIPT-SAVE-RESULT :
+  cut(k, f) link(k, f) operation(k) collected(f) read(k, f)
+  =>* recovered(k, f) C:Cfg .

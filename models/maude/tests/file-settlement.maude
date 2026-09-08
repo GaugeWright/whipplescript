@@ -1,0 +1,21 @@
+load ../file-settlement.maude
+search [1] in WHIPPLESCRIPT-FILE-SETTLEMENT : pending request(f)
+  =>* terminal(f) fact(f) .
+search [1] in WHIPPLESCRIPT-FILE-SETTLEMENT : pending request(f)
+  =>* terminal(f) .
+search [1] in WHIPPLESCRIPT-FILE-SETTLEMENT-SPLIT : pending request(f)
+  =>* terminal(f) .
+search [1] in WHIPPLESCRIPT-FILE-SETTLEMENT : pending request(f)
+  =>* fact(f) .
+search [1] in WHIPPLESCRIPT-FILE-SETTLEMENT-ORPHAN : pending request(f)
+  =>* fact(f) .
+search [1] in WHIPPLESCRIPT-FILE-SETTLEMENT : pending request(f)
+  =>* terminal(f) fact(g) .
+search [1] in WHIPPLESCRIPT-FILE-SETTLEMENT-REBOUND : pending request(f)
+  =>* terminal(f) fact(g) .
+search [1] in WHIPPLESCRIPT-FILE-SETTLEMENT : pending request(f) consume
+  =>* terminal(f) consumed(f) .
+search [1] in WHIPPLESCRIPT-FILE-SETTLEMENT : terminal(f) consumed(f) request(f)
+  =>* terminal(f) fact(f) .
+search [1] in WHIPPLESCRIPT-FILE-SETTLEMENT-REVIVE : terminal(f) consumed(f) request(f)
+  =>* terminal(f) fact(f) .

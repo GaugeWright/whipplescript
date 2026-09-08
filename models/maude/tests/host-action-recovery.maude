@@ -1,0 +1,67 @@
+load ../host-action-recovery.maude
+--- Late evidence survives worker failure.
+search [1] in WHIPPLESCRIPT-HOST-ACTION-RECOVERY :
+  state(frame(k1, a1, t1, i1), unknown) terminal(frame(k1, a1, t1, i1), failed)
+  proof(frame(k1, a1, t1, i1), applied, e1, true)
+  =>* state(frame(k1, a1, t1, i1), applied) terminal(frame(k1, a1, t1, i1), failed) C:Cfg .
+--- Failure is not absence; the unsafe transition must be detectable.
+search [1] in WHIPPLESCRIPT-HOST-ACTION-RECOVERY :
+  state(frame(k1, a1, t1, i1), unknown) terminal(frame(k1, a1, t1, i1), failed)
+  =>* state(frame(k1, a1, t1, i1), absent) C:Cfg .
+search [1] in WHIPPLESCRIPT-HOST-ACTION-RECOVERY-TERMINAL :
+  state(frame(k1, a1, t1, i1), unknown) terminal(frame(k1, a1, t1, i1), failed)
+  =>* state(frame(k1, a1, t1, i1), absent) C:Cfg .
+--- Unauthenticated success labels settle nothing.
+search [1] in WHIPPLESCRIPT-HOST-ACTION-RECOVERY :
+  state(frame(k1, a1, t1, i1), unknown) proof(frame(k1, a1, t1, i1), applied, e1, false)
+  =>* state(frame(k1, a1, t1, i1), applied) C:Cfg .
+search [1] in WHIPPLESCRIPT-HOST-ACTION-RECOVERY-FORGED :
+  state(frame(k1, a1, t1, i1), unknown) proof(frame(k1, a1, t1, i1), applied, e1, false)
+  =>* state(frame(k1, a1, t1, i1), applied) C:Cfg .
+--- A different attempt, target or input is a different claim.
+search [1] in WHIPPLESCRIPT-HOST-ACTION-RECOVERY :
+  state(frame(k1, a1, t1, i1), unknown) proof(frame(k1, a2, t1, i1), applied, e1, true)
+  proof(frame(k1, a1, t2, i1), applied, e1, true) proof(frame(k1, a1, t1, i2), applied, e1, true)
+  =>* state(frame(k1, a1, t1, i1), applied) C:Cfg .
+search [1] in WHIPPLESCRIPT-HOST-ACTION-RECOVERY-FRAME :
+  state(frame(k1, a1, t1, i1), unknown) proof(frame(k1, a2, t1, i1), applied, e1, true)
+  =>* state(frame(k1, a1, t1, i1), applied) C:Cfg .
+--- Retain both contradictory evidence records and the original disposition.
+search [1] in WHIPPLESCRIPT-HOST-ACTION-RECOVERY :
+  state(frame(k1, a1, t1, i1), applied) recorded(frame(k1, a1, t1, i1), applied, e1)
+  consistent(frame(k1, a1, t1, i1)) proof(frame(k1, a1, t1, i1), absent, e2, true)
+  =>* state(frame(k1, a1, t1, i1), applied) recorded(frame(k1, a1, t1, i1), applied, e1)
+      recorded(frame(k1, a1, t1, i1), absent, e2) contradiction(frame(k1, a1, t1, i1), e1, e2) .
+search [1] in WHIPPLESCRIPT-HOST-ACTION-RECOVERY :
+  state(frame(k1, a1, t1, i1), applied) recorded(frame(k1, a1, t1, i1), applied, e1)
+  consistent(frame(k1, a1, t1, i1)) proof(frame(k1, a1, t1, i1), absent, e2, true)
+  =>* state(frame(k1, a1, t1, i1), absent) C:Cfg .
+search [1] in WHIPPLESCRIPT-HOST-ACTION-RECOVERY-OVERWRITE :
+  state(frame(k1, a1, t1, i1), applied) recorded(frame(k1, a1, t1, i1), applied, e1)
+  consistent(frame(k1, a1, t1, i1)) proof(frame(k1, a1, t1, i1), absent, e2, true)
+  =>* state(frame(k1, a1, t1, i1), absent) C:Cfg .
+--- A known contradiction suspends automatic recovery.
+search [1] in WHIPPLESCRIPT-HOST-ACTION-RECOVERY :
+  state(frame(k1, a1, t1, i1), absent) contradiction(frame(k1, a1, t1, i1), e1, e2)
+  retry(frame(k1, a1, t1, i1), true)
+  =>* invoke(frame(k1, a2, t1, i1)) C:Cfg .
+search [1] in WHIPPLESCRIPT-HOST-ACTION-RECOVERY-CONFLICT :
+  state(frame(k1, a1, t1, i1), absent) contradiction(frame(k1, a1, t1, i1), e1, e2)
+  retry(frame(k1, a1, t1, i1), true)
+  =>* invoke(frame(k1, a2, t1, i1)) C:Cfg .
+--- Uncontradicted absence and current authority permit a new attempt.
+search [1] in WHIPPLESCRIPT-HOST-ACTION-RECOVERY :
+  state(frame(k1, a1, t1, i1), absent) consistent(frame(k1, a1, t1, i1))
+  recorded(frame(k1, a1, t1, i1), absent, e1) retry(frame(k1, a1, t1, i1), true)
+  =>* invoke(frame(k1, a2, t1, i1)) C:Cfg .
+--- Compensation needs fresh authority and leaves the original intact.
+search [1] in WHIPPLESCRIPT-HOST-ACTION-RECOVERY :
+  state(frame(k1, a1, t1, i1), applied) compensate(k1, k2, true)
+  =>* state(frame(k1, a1, t1, i1), applied) authorizedCompensation(k2, k1) .
+search [1] in WHIPPLESCRIPT-HOST-ACTION-RECOVERY :
+  state(frame(k1, a1, t1, i1), applied) compensate(k1, k2, false)
+  =>* authorizedCompensation(k2, k1) C:Cfg .
+search [1] in WHIPPLESCRIPT-HOST-ACTION-RECOVERY-COMPENSATION :
+  state(frame(k1, a1, t1, i1), applied) compensate(k1, k2, false)
+  =>* authorizedCompensation(k2, k1) C:Cfg .
+quit

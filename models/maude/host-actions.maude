@@ -1,0 +1,147 @@
+--- Host-action safety boundary, spec/host-actions.md. Fingerprints abstract
+--- all semantic fields; free(K) is the store uniqueness/transaction boundary.
+--- Admission atomically creates an ordinary instance plus its starting input.
+--- The two remote steps deliberately expose crash-after-apply-before-receipt.
+mod WHIPPLESCRIPT-HOST-ACTIONS is
+  protecting BOOL .
+  sorts Key Fingerprint Mode Disposition Cfg .
+  ops k1 k2 : -> Key [ctor] .
+  ops f1 f2 : -> Fingerprint [ctor] .
+  ops live replay : -> Mode [ctor] .
+  ops ready unknown applied absent : -> Disposition [ctor] .
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+  op free : Key -> Cfg [ctor] .
+  op request : Key Fingerprint Bool Mode -> Cfg [ctor] .
+  op admitted : Key Fingerprint -> Cfg [ctor] .
+  op input : Key Fingerprint -> Cfg [ctor] .
+  op work : Key Disposition -> Cfg [ctor] .
+  op receipt : Key Fingerprint -> Cfg [ctor] .
+  op rejected : Key -> Cfg [ctor] .
+  op marker : Key -> Cfg [ctor] .
+  op invoke : Key -> Cfg [ctor] .
+  op callback : Key -> Cfg [ctor] .
+  op external : Key -> Cfg [ctor] .
+  op retry : Key -> Cfg [ctor] .
+  op absenceProof : Key -> Cfg [ctor] .
+  op applicationProof : Key -> Cfg [ctor] .
+  op inspected : Key Fingerprint -> Cfg [ctor] .
+  vars K : Key .
+  vars F G : Fingerprint .
+  var M : Mode .
+
+  rl [admit] : request(K, F, true, live) free(K)
+    => admitted(K, F) input(K, F) work(K, ready) receipt(K, F) .
+  rl [reattach] : request(K, F, true, live) admitted(K, F)
+    => admitted(K, F) receipt(K, F) .
+  crl [conflict] : request(K, F, true, live) admitted(K, G)
+    => admitted(K, G) rejected(K) if F =/= G .
+  rl [refuse-forged] : request(K, F, false, M) => rejected(K) .
+  rl [inspect] : request(K, F, true, replay) admitted(K, F)
+    => admitted(K, F) inspected(K, F) .
+  rl [dispatch-intent] : work(K, ready)
+    => work(K, unknown) marker(K) invoke(K) .
+  rl [remote-apply] : invoke(K) => external(K) callback(K) .
+  rl [crash-before-send] : invoke(K) => none .
+  rl [drop-callback] : callback(K) => none .
+  rl [acknowledge] : callback(K) work(K, unknown) => work(K, applied) .
+  --- Unverifiable unknown has no retry rule. An authoritative proof is distinct
+  --- from a timeout/failure. Each proof is bound to the recorded operation K.
+  rl [reconcile-applied] : work(K, unknown) applicationProof(K) => work(K, applied) .
+  rl [reconcile-absent] : work(K, unknown) absenceProof(K) => work(K, absent) .
+  rl [retry-proved-absence] : retry(K) work(K, absent) => work(K, ready) .
+endm
+
+--- Negative controls add precisely the forbidden transition. Their witnesses
+--- must be reachable, proving the searches can see each kind of violation.
+mod WHIPPLESCRIPT-HOST-ACTIONS-FORGED is
+  including WHIPPLESCRIPT-HOST-ACTIONS .
+  rl [bypass-auth] : request(K:Key, F:Fingerprint, false, live) free(K:Key)
+    => admitted(K:Key, F:Fingerprint) input(K:Key, F:Fingerprint) work(K:Key, ready) .
+endm
+mod WHIPPLESCRIPT-HOST-ACTIONS-REBOUND is
+  including WHIPPLESCRIPT-HOST-ACTIONS .
+  rl [bypass-fingerprint] : request(K:Key, F:Fingerprint, true, live) admitted(K:Key, G:Fingerprint)
+    => admitted(K:Key, G:Fingerprint) input(K:Key, F:Fingerprint) .
+endm
+mod WHIPPLESCRIPT-HOST-ACTIONS-REPLAY is
+  including WHIPPLESCRIPT-HOST-ACTIONS .
+  rl [bypass-replay] : request(K:Key, F:Fingerprint, true, replay) admitted(K:Key, F:Fingerprint)
+    => admitted(K:Key, F:Fingerprint) invoke(K:Key) .
+endm
+mod WHIPPLESCRIPT-HOST-ACTIONS-RETRY is
+  including WHIPPLESCRIPT-HOST-ACTIONS .
+  rl [bypass-unknown] : retry(K:Key) work(K:Key, unknown)
+    => work(K:Key, unknown) invoke(K:Key) .
+endm
+mod WHIPPLESCRIPT-HOST-ACTIONS-PARTIAL is
+  including WHIPPLESCRIPT-HOST-ACTIONS .
+  rl [bypass-atomic] : request(K:Key, F:Fingerprint, true, live) free(K:Key)
+    => admitted(K:Key, F:Fingerprint) work(K:Key, ready) .
+endm
+mod WHIPPLESCRIPT-HOST-ACTIONS-DUPLICATE is
+  including WHIPPLESCRIPT-HOST-ACTIONS .
+  rl [bypass-reattach] : request(K:Key, F:Fingerprint, true, live) admitted(K:Key, F:Fingerprint)
+    => admitted(K:Key, F:Fingerprint) input(K:Key, F:Fingerprint) .
+endm
+mod WHIPPLESCRIPT-HOST-ACTIONS-UNLOGGED is
+  including WHIPPLESCRIPT-HOST-ACTIONS .
+  rl [bypass-intent] : work(K:Key, ready) => work(K:Key, applied) external(K:Key) .
+endm
+
+--- Dispatch observation CAS. Fingerprints stand for the complete effect row.
+--- `changeOnce` is a competing edit after the handler inspected its snapshot.
+--- Comparison and `sent` are one store transition; this supplies no grant.
+mod WHIPPLESCRIPT-HOST-ACTION-OBSERVATION is
+  sorts Fingerprint Cfg .
+  ops f1 f2 : -> Fingerprint [ctor] .
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+  ops pending changeOnce : -> Cfg [ctor] .
+  ops current observed : Fingerprint -> Cfg [ctor] .
+  op sent : Fingerprint Fingerprint -> Cfg [ctor] .
+  var F : Fingerprint .
+  rl [competing-change] : current(f1) changeOnce => current(f2) .
+  rl [compare-and-dispatch] : current(F) observed(F) pending
+    => current(F) sent(F, F) .
+endm
+
+--- Negative control: a successful check is detached from dispatch, admitting
+--- the race the native Immediate transaction and hosted atomic callback exclude.
+mod WHIPPLESCRIPT-HOST-ACTION-OBSERVATION-SPLIT is
+  including WHIPPLESCRIPT-HOST-ACTION-OBSERVATION .
+  op checked : Fingerprint -> Cfg [ctor] .
+  vars F G : Fingerprint .
+  rl [check-before-transaction] : current(F) observed(F) pending
+    => current(F) checked(F) .
+  rl [dispatch-later] : current(G) checked(F) => current(G) sent(F, G) .
+endm
+
+--- Invocation-scoped current execution authority. Authorization is a current
+--- decision before dispatch, not a promise to undo an already authorized sink
+--- operation if policy changes in flight. Original admission and recorded grant
+--- metadata cannot supply a fresh, single-use grant after restart.
+mod WHIPPLESCRIPT-HOST-ACTION-EXECUTION is
+  protecting BOOL .
+  sorts Fingerprint Cfg .
+  ops f1 f2 : -> Fingerprint [ctor] .
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+  op permission : Bool -> Cfg [ctor] .
+  ops original request grant pending recorded sent : Fingerprint -> Cfg [ctor] .
+  var F : Fingerprint .
+  rl [current-verification] : permission(true) request(F)
+    => permission(true) grant(F) .
+  rl [consume-grant] : grant(F) pending(F) => recorded(F) sent(F) .
+  rl [scope-exit] : grant(F) => none .
+endm
+mod WHIPPLESCRIPT-HOST-ACTION-EXECUTION-REHYDRATE is
+  including WHIPPLESCRIPT-HOST-ACTION-EXECUTION .
+  rl [reuse-recorded-metadata] : recorded(F:Fingerprint)
+    => recorded(F:Fingerprint) grant(F:Fingerprint) .
+endm
+mod WHIPPLESCRIPT-HOST-ACTION-EXECUTION-REVOKED is
+  including WHIPPLESCRIPT-HOST-ACTION-EXECUTION .
+  rl [ignore-current-revocation] : permission(false) request(F:Fingerprint)
+    => permission(false) grant(F:Fingerprint) .
+endm

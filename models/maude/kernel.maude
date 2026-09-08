@@ -859,10 +859,11 @@ mod WHIPPLESCRIPT-KERNEL is
     effect(E, blockedByCapacity) capacityAvailable(E)
     => effect(E, queued) capacityAvailable(E) .
 
-  --- Lease expiry and retry reuse effect identity in this abstract model.
+  --- Lease expiry releases the worker but supplies no proof of absence.
+  --- retryAllowed represents separately verified recovery authority/evidence.
   rl [expire-lease] :
     effect(E, running) lease(E, leaseActive)
-    => effect(E, queued) lease(E, leaseExpired) event(leaseExpiredEvt) .
+    => effect(E, failed) lease(E, leaseExpired) event(leaseExpiredEvt) .
 
   rl [retry-failed] :
     effect(E, failed) retryAllowed(E)

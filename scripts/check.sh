@@ -184,6 +184,10 @@ node scripts/check-do-schema-consistency.mjs
 echo "== workstream host contract =="
 python3 scripts/check-workstream-host-contract.py
 
+echo "== host action contract =="
+python3 scripts/check-host-action-contract.py
+python3 scripts/test-host-action-contract.py
+
 echo "== refusal scanner contracts =="
 python3 scripts/test-mutation-sweep.py
 

@@ -15,6 +15,47 @@
 use std::io;
 use std::path::{Path, PathBuf};
 
+/// Durable dispatch coordinates supplied by the governed handler after its
+/// run-start commit. These locate evidence; possession is not authorization.
+#[derive(Clone, Copy, Debug)]
+pub struct FileWriteContext<'a> {
+    pub instance_id: &'a str,
+    pub effect_id: &'a str,
+    pub run_id: &'a str,
+    pub started_event_id: &'a str,
+}
+
+/// A structured operation result awaiting content-addressed retention by the
+/// handler. Bodies stay behind the resulting labeled reference in run/fact
+/// metadata; this payload is never copied into an action command.
+#[derive(Clone, Debug)]
+pub struct FileWriteEvidence {
+    pub schema_ref: String,
+    pub label_ref: String,
+    pub content: String,
+}
+
+#[derive(Debug)]
+pub struct FileWriteAccepted {
+    pub content: String,
+    pub evidence: Option<FileWriteEvidence>,
+}
+
+#[derive(Debug)]
+pub struct FileWriteFailure {
+    pub error: io::Error,
+    pub evidence: Option<FileWriteEvidence>,
+}
+
+impl From<io::Error> for FileWriteFailure {
+    fn from(error: io::Error) -> Self {
+        Self {
+            error,
+            evidence: None,
+        }
+    }
+}
+
 /// The byte-I/O operations a file effect performs, abstracted over the physical
 /// backing. Object-safe so a durable-object backend can be used as `&dyn`.
 pub trait FileStore {
@@ -29,6 +70,34 @@ pub trait FileStore {
 
     /// Write `bytes` to `path`, replacing any existing contents.
     fn write(&self, path: &Path, bytes: &[u8]) -> io::Result<()>;
+
+    /// Write text and return the exact text accepted by this operation. A
+    /// merge-aware backend overrides this so runtime evidence captures the
+    /// merged result, rather than incorrectly hashing the submitted draft.
+    /// The replacement default matches the existing byte-write contract.
+    /// Returning text supplies content evidence, not proof of external
+    /// disposition or permission to retry an uncertain operation.
+    fn write_text(&self, path: &Path, content: &str) -> io::Result<String> {
+        self.write(path, content.as_bytes())?;
+        Ok(content.to_owned())
+    }
+
+    /// A versioned binding can return its accepted cut or structured conflict
+    /// and bind that result to the exact dispatch. Legacy byte stores retain
+    /// their existing semantics and make no operation-receipt claim.
+    fn write_text_with_context(
+        &self,
+        path: &Path,
+        content: &str,
+        _context: FileWriteContext<'_>,
+    ) -> Result<FileWriteAccepted, FileWriteFailure> {
+        self.write_text(path, content)
+            .map(|content| FileWriteAccepted {
+                content,
+                evidence: None,
+            })
+            .map_err(Into::into)
+    }
 
     /// Append `bytes` to `path`, creating it if absent.
     fn append(&self, path: &Path, bytes: &[u8]) -> io::Result<()>;

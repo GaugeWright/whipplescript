@@ -479,13 +479,14 @@ ExpireLease(r, ev) ==
   /\ effects[runEffect[r]] = "running"
   /\ leases[r] = "active"
   /\ runEffect[r] \notin terminalEffects
-  /\ effects' = [effects EXCEPT ![runEffect[r]] = "queued"]
+  /\ effects' = [effects EXCEPT ![runEffect[r]] = "failed"]
+  /\ terminalEffects' = terminalEffects \cup {runEffect[r]}
   /\ runs' = [runs EXCEPT ![r] = "lease_expired"]
   /\ leases' = [leases EXCEPT ![r] = "expired"]
   /\ terminalRunEvents' = Append(terminalRunEvents, <<r, runEffect[r], "lease_expired">>)
   /\ eventLog' = Append(eventLog, ev)
   /\ cancelAcknowledged' = cancelAcknowledged \ {runEffect[r]}
-  /\ UNCHANGED << recoveryLog, runEffect, terminalEffects, projectionCursor,
+  /\ UNCHANGED << recoveryLog, runEffect, projectionCursor,
                   terminalControlEvents, paused, cancelled, completed, failed,
                   recovering, activeVersion, revisionEpoch, effectVersion,
                   cancelRequested, revisionPolicy, revisionEvents, EvidenceVars >>

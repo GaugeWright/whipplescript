@@ -22,6 +22,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
 METHODS=(
+    admit_host_action
     apply_undo_selection
     transport_selection
     promote_line_exact
@@ -36,7 +37,17 @@ METHODS=(
 )
 
 # file|method|count — every call site of the governed write surface.
+# The action admission primitive is a storage API, so cross-crate visibility
+# cannot reserve it to the verified kernel facade. The other pinned callers are
+# store delegation or explicit conformance/recovery fixtures, never host doors.
 PINNED="\
+crates/whipplescript-kernel/src/host_action.rs|admit_host_action|1
+crates/whipplescript-store/src/host_actions.rs|admit_host_action|9
+crates/whipplescript-store/src/lib.rs|admit_host_action|1
+crates/whipplescript-store/src/native_stores.rs|admit_host_action|1
+crates/whipplescript-host-do/src/do_store.rs|admit_host_action|2
+crates/whipplescript-host-do/src/do_store/host_actions.rs|admit_host_action|1
+crates/whipplescript-cli/src/host_runtime.rs|admit_host_action|2
 crates/whipplescript-store/src/vcs.rs|apply_undo_selection|3
 crates/whipplescript-kernel/src/effect_handlers.rs|apply_undo_selection|1
 crates/whipplescript-cli/src/main.rs|apply_undo_selection|2
