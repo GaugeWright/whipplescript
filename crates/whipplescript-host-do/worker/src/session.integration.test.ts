@@ -188,6 +188,24 @@ async function bootstrapSession(
 }
 
 describe("real WorkflowInstance hibernation", () => {
+  it("nests synchronous publication transactions and rolls back the outer failure", async () => {
+    const namespace = (env as unknown as TestEnv).WORKFLOW_INSTANCE;
+    const stub = namespace.get(namespace.idFromName("retained-publication-transactions"));
+    await runInDurableObject(stub, async (_instance, state) => {
+      const sql = state.storage.sql;
+      sql.exec("CREATE TABLE publication_probe (id INTEGER PRIMARY KEY)");
+      state.storage.transactionSync(() => {
+        sql.exec("INSERT INTO publication_probe VALUES (1)");
+        state.storage.transactionSync(() => sql.exec("INSERT INTO publication_probe VALUES (2)"));
+      });
+      expect(() => state.storage.transactionSync(() => {
+        state.storage.transactionSync(() => sql.exec("INSERT INTO publication_probe VALUES (3)"));
+        throw new Error("outer publication failure");
+      })).toThrow("outer publication failure");
+      expect(sql.exec("SELECT id FROM publication_probe ORDER BY id").toArray()).toEqual([{ id: 1 }, { id: 2 }]);
+    });
+  });
+
   it("does not echo a browser's reserved no-status close code", async () => {
     const namespace = (env as unknown as TestEnv).WORKFLOW_INSTANCE;
     const stub = namespace.get(namespace.idFromName("session-browser-close-without-status"));

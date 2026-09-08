@@ -1,0 +1,25 @@
+load ../prepared-publication.maude
+--- Publication followed by collection retains the complete prepared set.
+search [1] in WHIPPLESCRIPT-PREPARED-PUBLICATION :
+  s(live, absent, free, staged, want) =>* s(live, pinned, free, done, collected) .
+--- No newly published reference may lose its bytes to collection.
+search [1] in WHIPPLESCRIPT-PREPARED-PUBLICATION :
+  s(live, absent, free, staged, want) =>* s(missing, pinned, G:Guard, W:Writer, C:Collector) .
+--- Collection can win before verification; publication must then refuse.
+search [1] in WHIPPLESCRIPT-PREPARED-PUBLICATION :
+  s(live, absent, free, staged, want) =>* s(missing, absent, free, refused, collected) .
+--- Each weakened protocol exposes a dangling published reference.
+search [1] in WHIPPLESCRIPT-PUBLICATION-NO-VERIFY :
+  s(live, absent, free, staged, want) =>* s(missing, pinned, G:Guard, W:Writer, C:Collector) .
+search [1] in WHIPPLESCRIPT-PUBLICATION-EARLY-UNLOCK :
+  s(live, absent, free, staged, want) =>* s(missing, pinned, G:Guard, W:Writer, C:Collector) .
+search [1] in WHIPPLESCRIPT-PUBLICATION-STALE-ROOTS :
+  s(live, absent, free, staged, want) =>* s(missing, pinned, G:Guard, W:Writer, C:Collector) .
+search [1] in WHIPPLESCRIPT-PUBLICATION-UNCOMMITTED-BLOBS :
+  s(live, absent, free, staged, want) =>* s(missing, pinned, G:Guard, W:Writer, C:Collector) .
+--- Later explicit erasure remains possible and distinguishable.
+search [1] in WHIPPLESCRIPT-PREPARED-PUBLICATION :
+  s(live, absent, free, staged, want) =>* s(erased, pinned, free, done, collected) .
+--- Erased preparation cannot originate a new publication.
+search [1] in WHIPPLESCRIPT-PREPARED-PUBLICATION :
+  s(erased, absent, free, staged, want) =>* s(B:Blob, pinned, G:Guard, W:Writer, C:Collector) .

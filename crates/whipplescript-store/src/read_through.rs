@@ -57,6 +57,14 @@ impl<C: ContentBlobs, A: ContentBlobs> ReadThrough<C, A> {
 }
 
 impl<C: ContentBlobs, A: ContentBlobs> ContentBlobs for ReadThrough<C, A> {
+    fn publish_retained<T>(
+        &self,
+        ids: &[String],
+        publish: impl FnOnce() -> StoreResult<T>,
+    ) -> StoreResult<T> {
+        self.authority.publish_retained(ids, publish)
+    }
+
     /// Writes reach the authority. The cache is populated as a side effect,
     /// which is an optimization rather than part of the write: a cache that
     /// failed to accept the copy would not make the write less durable.

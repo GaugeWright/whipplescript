@@ -646,31 +646,34 @@ impl NativeWorkspaceVcs {
     /// (research note §15) begins pruning recorded cuts: the guard exists
     /// before the thing that needs it, rather than being remembered afterwards.
     pub fn purge_unreachable(&mut self, now: &str) -> StoreResult<crate::content::PurgeOutcome> {
-        let mut roots = self.branches.reachability_roots()?;
-        for cut_id in self.branches.pinned_cuts(now)? {
-            if let Some(manifest_hash) = self.branches.cut_manifest_hash(&cut_id)? {
-                roots.insert(manifest_hash);
-            }
-        }
-        // A root that is a MANIFEST names content ids: expand it.
-        //
-        // A TREE manifest (DR-0070 §1) must be walked WHOLE, not one level:
-        // interior nodes and the leaves under them would otherwise look
-        // unreachable, and the sweep would delete content a recorded cut still
-        // names. A flat manifest keeps the old one-level expansion.
-        // (Non-manifest roots that happen to parse as a string map add only
-        // phantom ids — retention noise, never a wrong delete.)
-        for hash in roots.clone() {
-            if let Some(body) = self.content.get(&hash)? {
-                if crate::manifest_tree::is_node(&body) {
-                    roots.extend(crate::manifest_tree::reachable_ids(&self.content, &hash)?);
-                } else if let Ok(manifest) = serde_json::from_str::<BTreeMap<String, String>>(&body)
-                {
-                    roots.extend(manifest.into_values());
+        self.content.purge_unreachable(|| {
+            let mut roots = self.branches.reachability_roots()?;
+            for cut_id in self.branches.pinned_cuts(now)? {
+                if let Some(manifest_hash) = self.branches.cut_manifest_hash(&cut_id)? {
+                    roots.insert(manifest_hash);
                 }
             }
-        }
-        self.content.purge_unreachable(&roots)
+            // A root that is a MANIFEST names content ids: expand it.
+            //
+            // A TREE manifest (DR-0070 §1) must be walked WHOLE, not one level:
+            // interior nodes and the leaves under them would otherwise look
+            // unreachable, and the sweep would delete content a recorded cut still
+            // names. A flat manifest keeps the old one-level expansion.
+            // (Non-manifest roots that happen to parse as a string map add only
+            // phantom ids — retention noise, never a wrong delete.)
+            for hash in roots.clone() {
+                if let Some(body) = self.content.get(&hash)? {
+                    if crate::manifest_tree::is_node(&body) {
+                        roots.extend(crate::manifest_tree::reachable_ids(&self.content, &hash)?);
+                    } else if let Ok(manifest) =
+                        serde_json::from_str::<BTreeMap<String, String>>(&body)
+                    {
+                        roots.extend(manifest.into_values());
+                    }
+                }
+            }
+            Ok(roots)
+        })
     }
 }
 
@@ -1144,22 +1147,29 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
         base_hash: Option<&str>,
         changes: &BTreeMap<String, Option<String>>,
     ) -> StoreResult<String> {
+        self.advance_manifest_using(&self.content, base_hash, changes)
+    }
+
+    fn advance_manifest_using(
+        &self,
+        content: &impl ContentBlobs,
+        base_hash: Option<&str>,
+        changes: &BTreeMap<String, Option<String>>,
+    ) -> StoreResult<String> {
         let base = match base_hash {
             Some(hash) => self.load_manifest_opt_raw(hash)?,
             None => None,
         };
         match base {
-            Some(RawManifest::Tree(root)) => {
-                crate::manifest_tree::apply(&self.content, &root, changes)
-            }
+            Some(RawManifest::Tree(root)) => crate::manifest_tree::apply(content, &root, changes),
             Some(RawManifest::Flat(mut manifest)) => {
                 fold_changes(&mut manifest, changes);
-                self.store_manifest(&manifest)
+                crate::manifest_tree::build(content, &manifest)
             }
             None => {
                 let mut manifest = BTreeMap::new();
                 fold_changes(&mut manifest, changes);
-                self.store_manifest(&manifest)
+                crate::manifest_tree::build(content, &manifest)
             }
         }
     }
@@ -1324,7 +1334,8 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
         // one entry was the read half of refusal 2 — a one-file edit paid for
         // the whole workspace before it paid for the whole workspace again on
         // the way out.
-        let working_set = VirtualWorkingSet::detached(&self.content);
+        let prepared = crate::content::publication::PreparedBlobs::new(&self.content);
+        let working_set = VirtualWorkingSet::detached(&prepared);
         match body {
             Some(body) => working_set
                 .write(Path::new(path), body.as_bytes())
@@ -1333,23 +1344,34 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
                 .remove(Path::new(path))
                 .map_err(|error| StoreError::Conflict(error.to_string()))?,
         }
-        let manifest_hash =
-            self.advance_manifest(row.head_manifest_hash.as_deref(), &working_set.changes())?;
+        let manifest_hash = self.advance_manifest_using(
+            &prepared,
+            row.head_manifest_hash.as_deref(),
+            &working_set.changes(),
+        )?;
+        let mut prepared_ids = prepared.ids();
+        if let Some(evidence) = evidence {
+            prepared_ids.push(evidence.content_hash.clone());
+        }
         let origin = format!("write:{path}");
-        match self.branches.commit_write_with_evidence(
-            CutRecord {
-                cut_id,
-                change_id: cut_id,
-                branch_id,
-                manifest_hash: &manifest_hash,
-                parent_cut_id: row.head_cut_id.as_deref(),
-                origin: Some(&origin),
-                actor: self.actor.as_deref(),
-                intent: self.intent.as_deref(),
-                recorded_at: at,
-            },
-            evidence,
-        )? {
+        let branches = &mut self.branches;
+        let outcome = self.content.publish_retained(&prepared_ids, || {
+            branches.commit_write_with_evidence(
+                CutRecord {
+                    cut_id,
+                    change_id: cut_id,
+                    branch_id,
+                    manifest_hash: &manifest_hash,
+                    parent_cut_id: row.head_cut_id.as_deref(),
+                    origin: Some(&origin),
+                    actor: self.actor.as_deref(),
+                    intent: self.intent.as_deref(),
+                    recorded_at: at,
+                },
+                evidence,
+            )
+        })?;
+        match outcome {
             AdvanceOutcome::Advanced(_) => {
                 self.note_fact(
                     "vcs.cut.recorded",
@@ -4698,6 +4720,146 @@ mod tests {
         TempVcs { dir, inner }
     }
 
+    #[test]
+    fn collected_write_body_manifest_or_result_refuses_before_cut_publication() {
+        use std::cell::{Cell, RefCell};
+        struct CollectBeforePublication {
+            inner: ContentStore,
+            all_ids: RefCell<BTreeSet<String>>,
+            selected: RefCell<Option<String>>,
+            kind: Cell<Option<&'static str>>,
+            calls: Cell<usize>,
+        }
+        impl CollectBeforePublication {
+            fn new() -> Self {
+                Self {
+                    inner: ContentStore::open(":memory:").expect("content"),
+                    all_ids: Default::default(),
+                    selected: Default::default(),
+                    kind: Cell::new(None),
+                    calls: Cell::new(0),
+                }
+            }
+        }
+        impl ContentBlobs for CollectBeforePublication {
+            fn put(&self, body: &str) -> StoreResult<String> {
+                let id = self.inner.put(body)?;
+                self.all_ids.borrow_mut().insert(id.clone());
+                let selected = match self.kind.get() {
+                    Some("body") => body == "new file body",
+                    Some("result") => body == "retained result",
+                    Some("manifest") => crate::manifest_tree::is_node(body),
+                    _ => false,
+                };
+                if selected {
+                    *self.selected.borrow_mut() = Some(id.clone());
+                }
+                Ok(id)
+            }
+            fn get(&self, id: &str) -> StoreResult<Option<String>> {
+                self.inner.get(id)
+            }
+            fn publish_retained<T>(
+                &self,
+                ids: &[String],
+                publish: impl FnOnce() -> StoreResult<T>,
+            ) -> StoreResult<T> {
+                self.calls.set(self.calls.get() + 1);
+                if self.kind.get().is_some() {
+                    let selected = self
+                        .selected
+                        .borrow()
+                        .clone()
+                        .expect("selected preparation");
+                    let mut roots = self.all_ids.borrow().clone();
+                    roots.remove(&selected);
+                    assert_eq!(
+                        self.inner
+                            .purge_unreachable(|| Ok(roots))
+                            .expect("collect prepared blob")
+                            .purged,
+                        1
+                    );
+                    assert!(self.inner.get(&selected).expect("collected").is_none());
+                }
+                self.inner.publish_retained(ids, publish)
+            }
+        }
+        crate::content::conformance::run_suite(CollectBeforePublication::new)
+            .expect("content conformance");
+        for kind in ["body", "manifest", "result"] {
+            let mut workspace = WorkspaceVcs::from_parts(
+                BranchStore::open_in_memory().expect("branches"),
+                CollectBeforePublication::new(),
+            );
+            workspace.init("t0").expect("init");
+            workspace
+                .write(MAINLINE_BRANCH_ID, "file.txt", Some("base"), "base", "t0")
+                .expect("base write");
+            let before = workspace
+                .branches
+                .get_branch(MAINLINE_BRANCH_ID)
+                .expect("branch")
+                .expect("present");
+            workspace.content.kind.set(Some(kind));
+            let reference = crate::branches::write_evidence::WriteEvidenceRef {
+                schema_ref: "fixture.result.v1".into(),
+                label_ref: "private".into(),
+                content_hash: workspace
+                    .content
+                    .put("retained result")
+                    .expect("prepare result"),
+            };
+            let error = workspace
+                .write_from_with_evidence(
+                    before.clone(),
+                    "file.txt",
+                    Some("new file body"),
+                    "candidate",
+                    "t1",
+                    Some(&reference),
+                )
+                .expect_err("collected preparation");
+            let selected = workspace
+                .content
+                .selected
+                .borrow()
+                .clone()
+                .expect("selected");
+            assert!(
+                format!("{error:?}").contains(&format!(
+                    "prepared publication content is unavailable: {selected}"
+                )),
+                "{kind}: {error:?}"
+            );
+            assert_eq!(
+                workspace.content.calls.get(),
+                2,
+                "base and candidate both use publication authority"
+            );
+            assert_eq!(
+                workspace
+                    .branches
+                    .get_branch(MAINLINE_BRANCH_ID)
+                    .expect("branch"),
+                Some(before)
+            );
+            assert!(workspace.get_cut("candidate").expect("cut").is_none());
+            assert!(workspace.get_op("op-candidate").expect("op").is_none());
+            assert!(workspace
+                .write_evidence("candidate")
+                .expect("result ref")
+                .is_none());
+            assert_eq!(
+                workspace
+                    .read_at_cut("base", "file.txt")
+                    .expect("old cut")
+                    .as_deref(),
+                Some("base")
+            );
+        }
+    }
+
     /// DR-0052 A1: cuts carry the handle's acting principal; attribution
     /// and change-units surface it; an un-attributed handle records
     /// `None` (the honest pre-actor reading, same as migrated rows).
@@ -5764,6 +5926,13 @@ mod tests {
             race: std::cell::RefCell<Option<Box<dyn FnOnce()>>>,
         }
         impl ContentBlobs for RaceOnRead {
+            fn publish_retained<T>(
+                &self,
+                ids: &[String],
+                publish: impl FnOnce() -> StoreResult<T>,
+            ) -> StoreResult<T> {
+                self.content.publish_retained(ids, publish)
+            }
             fn put(&self, body: &str) -> StoreResult<String> {
                 self.content.put(body)
             }

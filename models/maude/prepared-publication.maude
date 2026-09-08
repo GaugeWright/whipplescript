@@ -1,0 +1,50 @@
+--- spec/files.md: one prepared set abstracts the changed file/manifest blobs
+--- and retained result. Payload preparation is already committed. The content
+--- exclusion covers verification through reference commit; collection acquires
+--- it BEFORE reading roots. Authority and exact branch CAS are other models.
+mod WHIPPLESCRIPT-PREPARED-PUBLICATION is
+  sorts Blob Ref Guard Writer Collector State .
+  ops live missing erased : -> Blob [ctor] .
+  ops absent pinned : -> Ref [ctor] .
+  ops free writing collecting : -> Guard [ctor] .
+  ops staged verified committed done refused : -> Writer [ctor] .
+  ops want seen-none seen-root collected : -> Collector [ctor] .
+  op s : Blob Ref Guard Writer Collector -> State [ctor] .
+  var B : Blob . var R : Ref . var G : Guard .
+  var W : Writer . var C : Collector .
+  rl [begin-publication] : s(B, R, free, staged, C) => s(B, R, writing, staged, C) .
+  rl [verify-live] : s(live, R, writing, staged, C) => s(live, R, writing, verified, C) .
+  rl [refuse-missing] : s(missing, R, writing, staged, C) => s(missing, R, free, refused, C) .
+  rl [refuse-erased] : s(erased, R, writing, staged, C) => s(erased, R, free, refused, C) .
+  --- The branch authority does not independently inspect the content lock.
+  rl [publish-reference] : s(B, absent, G, verified, C) => s(B, pinned, G, committed, C) .
+  --- Return or lost callback: neither undoes previously committed payloads.
+  rl [release-publication] : s(B, R, writing, committed, C) => s(B, R, free, done, C) .
+  rl [begin-collection] : s(B, R, free, W, want) => s(B, R, collecting, W, want) .
+  rl [snapshot-absent] : s(B, absent, collecting, W, want) => s(B, absent, collecting, W, seen-none) .
+  rl [snapshot-pinned] : s(B, pinned, collecting, W, want) => s(B, pinned, collecting, W, seen-root) .
+  rl [collect-unrooted] : s(live, R, collecting, W, seen-none) => s(missing, R, free, W, collected) .
+  rl [nothing-to-collect] : s(missing, R, collecting, W, seen-none) => s(missing, R, free, W, collected) .
+  rl [keep-erasure] : s(erased, R, collecting, W, seen-none) => s(erased, R, free, W, collected) .
+  rl [retain-root] : s(B, R, collecting, W, seen-root) => s(B, R, free, W, collected) .
+  --- Explicit later erasure is permitted and is not collection or absence.
+  rl [authorized-erasure] : s(live, pinned, free, done, C) => s(erased, pinned, free, done, C) .
+endm
+
+mod WHIPPLESCRIPT-PUBLICATION-NO-VERIFY is
+  including WHIPPLESCRIPT-PREPARED-PUBLICATION .
+  rl [skip-live-check] : s(B:Blob, R:Ref, writing, staged, C:Collector) => s(B:Blob, R:Ref, writing, verified, C:Collector) .
+endm
+mod WHIPPLESCRIPT-PUBLICATION-EARLY-UNLOCK is
+  including WHIPPLESCRIPT-PREPARED-PUBLICATION .
+  rl [unlock-before-publish] : s(B:Blob, R:Ref, writing, verified, C:Collector) => s(B:Blob, R:Ref, free, verified, C:Collector) .
+endm
+mod WHIPPLESCRIPT-PUBLICATION-STALE-ROOTS is
+  including WHIPPLESCRIPT-PREPARED-PUBLICATION .
+  rl [snapshot-before-lock] : s(B:Blob, absent, free, W:Writer, want) => s(B:Blob, absent, free, W:Writer, seen-none) .
+  rl [lock-after-snapshot] : s(B:Blob, R:Ref, free, W:Writer, seen-none) => s(B:Blob, R:Ref, collecting, W:Writer, seen-none) .
+endm
+mod WHIPPLESCRIPT-PUBLICATION-UNCOMMITTED-BLOBS is
+  including WHIPPLESCRIPT-PREPARED-PUBLICATION .
+  rl [rollback-preparation-after-reference] : s(live, pinned, writing, committed, C:Collector) => s(missing, pinned, free, done, C:Collector) .
+endm

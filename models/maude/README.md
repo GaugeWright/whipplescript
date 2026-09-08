@@ -1,5 +1,13 @@
 # Maude Models
 
+`prepared-publication.maude` models protection of already-durable write blobs
+through reference publication, with collection taking the same exclusion
+before reading roots. Nine searches include four negative controls: omitted
+availability verification, early unlock, a stale collection snapshot, and
+preparation rolled back after a reference commits. It abstracts the complete
+set of newly prepared blobs; runtime tests must prove tracking that set and
+the native/hosted exclusion boundaries.
+
 `host-actions.maude` models atomic admission, authenticated provenance,
 request/fingerprint conflict, dispatch intent, replay and remote uncertainty
 for [governed host actions](../../spec/host-actions.md). Its test file pairs

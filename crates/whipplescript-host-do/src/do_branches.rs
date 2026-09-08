@@ -1451,6 +1451,20 @@ impl<S: DoSql> DoContentBlobs<S> {
 }
 
 impl<S: DoSql> ContentBlobs for DoContentBlobs<S> {
+    fn publish_retained<T>(
+        &self,
+        ids: &[String],
+        publish: impl FnOnce() -> StoreResult<T>,
+    ) -> StoreResult<T> {
+        let mut publish = Some(publish);
+        crate::do_store::recovery::atomic_result(&self.sql, false, &mut || {
+            whipplescript_store::content::publication::verify_prepared(self, ids)?;
+            publish.take().ok_or_else(|| {
+                StoreError::Conflict("SQL host repeated retained publication".into())
+            })?()
+        })
+    }
+
     fn put(&self, body: &str) -> StoreResult<String> {
         let id = stable_hash_hex(body);
         self.sql

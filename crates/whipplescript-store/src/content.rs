@@ -17,6 +17,8 @@
 #[cfg(feature = "native")]
 use std::path::Path;
 
+pub mod publication;
+
 #[cfg(feature = "native")]
 use rusqlite::{params, Connection, OptionalExtension};
 
@@ -117,6 +119,24 @@ pub trait ContentBlobs {
     fn put(&self, body: &str) -> crate::StoreResult<String>;
     /// Read the full stored bytes for a content id, or `None` if unknown.
     fn get(&self, id: &str) -> crate::StoreResult<Option<String>>;
+    /// Verify durable preparation under the authority's collection/erasure
+    /// exclusion and hold it while `publish` commits references, exactly once.
+    /// The callback must not prepare payloads or perform external work.
+    /// Cache availability is insufficient; the content authority owns this.
+    #[allow(clippy::needless_return)]
+    fn publish_retained<T>(
+        &self,
+        _ids: &[String],
+        _publish: impl FnOnce() -> crate::StoreResult<T>,
+    ) -> crate::StoreResult<T>
+    where
+        Self: Sized,
+    {
+        // MUTATION-SUCCESS-EXPR: _publish()
+        return Err(crate::StoreError::Conflict(
+            "content authority does not support retained publication".into(),
+        ));
+    }
     /// What the store knows about an id. The default derives Live/Unknown
     /// from `get`; stores with erasure override to report tombstones.
     fn status(&self, id: &str) -> crate::StoreResult<BlobStatus> {
@@ -303,16 +323,21 @@ impl ContentStore {
         ContentBlobs::put(self, body)
     }
 
-    /// Conservative orphan sweep: delete plain blob rows unreachable from
-    /// `roots`. Deliberately narrow so a wrong root set can only RETAIN
-    /// too much, never break a readable id: erasure tombstones are a
+    /// Load authoritative roots and collect under the publication exclusion.
+    /// A caller-supplied earlier snapshot could miss a newly published cut.
+    /// Erasure tombstones are a
     /// different honesty plane (never touched), and the whole chunk tier
     /// — chunk payloads, roots, refs, pack payloads — is left to its own
     /// erasure discipline.
-    pub fn purge_unreachable(
+    pub(crate) fn purge_unreachable(
         &self,
-        roots: &std::collections::BTreeSet<String>,
+        load_roots: impl FnOnce() -> StoreResult<std::collections::BTreeSet<String>>,
     ) -> StoreResult<PurgeOutcome> {
+        let transaction = rusqlite::Transaction::new_unchecked(
+            &self.connection,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
+        let roots = load_roots()?;
         self.connection.execute_batch(
             "CREATE TEMP TABLE IF NOT EXISTS gc_roots (id TEXT PRIMARY KEY); \
              DELETE FROM gc_roots;",
@@ -333,6 +358,7 @@ impl ContentStore {
         )?;
         self.connection
             .execute_batch("DROP TABLE IF EXISTS gc_roots;")?;
+        transaction.commit()?;
         Ok(PurgeOutcome { purged })
     }
 
@@ -344,6 +370,14 @@ impl ContentStore {
 
 #[cfg(feature = "native")]
 impl ContentBlobs for ContentStore {
+    fn publish_retained<T>(
+        &self,
+        ids: &[String],
+        publish: impl FnOnce() -> StoreResult<T>,
+    ) -> StoreResult<T> {
+        publication::native_publish(self, ids, publish)
+    }
+
     /// The per-blob statements here are `prepare_cached`: the manifest tree
     /// stores and reads one blob per NODE, so re-parsing the same one-line SQL
     /// per node was a real share of the cost of a cut. The SQL, the rows, and
@@ -538,7 +572,9 @@ impl ContentBlobs for ContentStore {
 #[cfg(feature = "native")]
 /// This store's schema generation. Bumped when its `CREATE TABLE` set
 /// changes in a way an older build cannot read.
-const SATELLITE_SCHEMA_VERSION: i64 = 1;
+// Generation 2 also fences the collection protocol: an older collector takes
+// its root snapshot before excluding publication, even with identical tables.
+const SATELLITE_SCHEMA_VERSION: i64 = 2;
 
 #[cfg(feature = "native")]
 fn ensure_content_schema(connection: &Connection) -> StoreResult<()> {

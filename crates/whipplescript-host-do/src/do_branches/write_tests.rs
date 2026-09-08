@@ -3,6 +3,120 @@ use crate::do_store::{test_support::RusqliteDoSql, tests::FaultySql};
 use whipplescript_store::branches::write_commit::conformance;
 
 #[test]
+fn hosted_authority_obeys_retained_publication() {
+    whipplescript_store::content::publication::conformance::check(|| {
+        DoContentBlobs::new(RusqliteDoSql::with_runtime_schema()).expect("content authority")
+    });
+}
+
+#[test]
+fn hosted_retained_publication_rolls_back_every_sql_boundary() {
+    use std::rc::Rc;
+    let mut refused = 0;
+    let mut completed = false;
+    for fail_at in 1..24 {
+        let sql = Rc::new(RusqliteDoSql::with_runtime_schema());
+        let content = DoContentBlobs::new(sql.clone()).expect("content");
+        let payload = content.put("retained payload").expect("prepare");
+        let manifest = content.put("prepared manifest").expect("prepare");
+        let mut branches = DoBranches::new(sql.clone()).expect("branches");
+        let before = branches.ensure_mainline("t0").expect("init");
+        let injected = Rc::new(FaultySql::new(sql, fail_at));
+        let content = DoContentBlobs {
+            sql: injected.clone(),
+        };
+        let mut branches = DoBranches {
+            sql: injected.clone(),
+        };
+        let reference = whipplescript_store::branches::write_evidence::WriteEvidenceRef {
+            schema_ref: "fixture.result.v1".into(),
+            label_ref: "private".into(),
+            content_hash: payload.clone(),
+        };
+        let mut cut = conformance::cut("candidate", None);
+        cut.manifest_hash = &manifest;
+        let outcome = content.publish_retained(&[payload.clone(), manifest.clone()], || {
+            branches.commit_write_with_evidence(cut, Some(&reference))
+        });
+        injected.disarm();
+        if let Ok(AdvanceOutcome::Advanced(_)) = outcome {
+            assert_eq!(
+                branches.write_evidence("candidate").expect("evidence"),
+                Some(reference)
+            );
+            completed = true;
+            break;
+        }
+        assert!(outcome.is_err(), "{fail_at}: SQL failure must propagate");
+        refused += 1;
+        assert_eq!(
+            branches.get_branch(MAINLINE_BRANCH_ID).expect("branch"),
+            Some(before)
+        );
+        assert!(branches.get_cut("candidate").expect("cut").is_none());
+        assert!(branches.get_op("op-candidate").expect("op").is_none());
+        assert!(branches
+            .write_evidence("candidate")
+            .expect("evidence")
+            .is_none());
+        assert_eq!(
+            content
+                .get(&payload)
+                .expect("durable preparation")
+                .as_deref(),
+            Some("retained payload")
+        );
+    }
+    assert!(completed);
+    assert_eq!(
+        refused, 8,
+        "two availability reads and all six branch publication statements"
+    );
+}
+
+#[test]
+fn a_sql_host_cannot_invoke_retained_publication_twice() {
+    use std::rc::Rc;
+    struct Repeated(Rc<RusqliteDoSql>);
+    impl DoSql for Repeated {
+        fn atomic(&self, body: &mut dyn FnMut() -> StoreResult<()>) -> StoreResult<()> {
+            self.0.atomic(&mut || {
+                body()?;
+                body()
+            })
+        }
+        fn execute(&self, sql: &str, params: &[SqlValue]) -> Result<u64, String> {
+            self.0.execute(sql, params)
+        }
+        fn query(&self, sql: &str, params: &[SqlValue]) -> Result<Vec<Vec<SqlValue>>, String> {
+            self.0.query(sql, params)
+        }
+    }
+    let sql = Rc::new(RusqliteDoSql::with_runtime_schema());
+    let content = DoContentBlobs::new(sql.clone()).expect("content");
+    let id = content.put("prepared").expect("prepare");
+    let mut branches = DoBranches::new(sql.clone()).expect("branches");
+    let before = branches.ensure_mainline("t0").expect("init");
+    let broken = DoContentBlobs { sql: Repeated(sql) };
+    let error = broken
+        .publish_retained(std::slice::from_ref(&id), || {
+            branches.commit_write(conformance::cut("candidate", None))
+        })
+        .expect_err("duplicate callback");
+    assert!(format!("{error:?}").contains("SQL host repeated retained publication"));
+    assert_eq!(
+        branches.get_branch(MAINLINE_BRANCH_ID).expect("branch"),
+        Some(before)
+    );
+    assert!(branches.get_cut("candidate").expect("cut").is_none());
+    assert!(branches.get_op("op-candidate").expect("op").is_none());
+    assert_eq!(
+        broken.get(&id).expect("durable preparation").as_deref(),
+        Some("prepared")
+    );
+}
+
+#[test]
 fn hosted_write_commit_conformance() {
     conformance::check(&mut DoBranches::new(RusqliteDoSql::with_runtime_schema()).unwrap());
 }
