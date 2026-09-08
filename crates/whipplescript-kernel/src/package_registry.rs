@@ -34,7 +34,7 @@ use whipplescript_core::{
     CONSTRUCT_GRAMMAR_SLOT_KINDS, CONSTRUCT_INTERFACE_CAPABILITY,
     CONSTRUCT_INTERFACE_CARDINALITY_EXACTLY_ONE, CONSTRUCT_INTERFACE_PHASE_COMPILE_RUNTIME,
     CONSTRUCT_LOWERING_CAPABILITY_CALL, CONSTRUCT_LOWERING_METADATA_ONLY,
-    PLATFORM_CONSTRUCT_CATALOG,
+    PLATFORM_CONSTRUCT_CATALOG, PROFILE_ENFORCEMENT_MODES,
 };
 
 pub fn verify_contract_registry_platform_vocabulary(
@@ -1298,6 +1298,18 @@ pub fn validate_package_manifest_closed_shape(path: &Path, value: &Value) -> Res
                 &["allowed_capabilities"],
                 problems,
             );
+            // Refused rather than defaulted. Both hosts branch on `audit` and
+            // on nothing else, so a value outside the list -- `off`, `warn`, a
+            // typo -- silently took the ENFORCING branch, and with an empty
+            // `allowed_capabilities` denied every turn the profile governed.
+            if let Some(mode) = profile.get("enforcement_mode").and_then(Value::as_str) {
+                if !PROFILE_ENFORCEMENT_MODES.contains(&mode) {
+                    problems.push(format!(
+                        "{label}.enforcement_mode `{mode}` is not an enforcement mode; the only \
+                         recognized values are `enforce` and `audit`"
+                    ));
+                }
+            }
         },
     );
     validate_manifest_array_objects(

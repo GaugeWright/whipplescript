@@ -148,6 +148,25 @@ pub const CONSTRUCT_GRAMMAR_SHAPE_DECLARATION_BLOCK: &str = "declaration_block";
 pub const CONSTRUCT_GRAMMAR_CONNECTIVES: &[&str] =
     &["from", "for", "into", "to", "via", "onto", "with"];
 pub const CONSTRUCT_GRAMMAR_SLOT_KINDS: &[&str] = &["identifier", "expression"];
+
+/// The `enforcement_mode` a package profile row may declare. This crate owns
+/// the list: the package registry refuses a row outside it, and the manifest
+/// schema's enum is pinned to it by test. The hosts branch on `audit` and on
+/// nothing else, which is what makes a two-value list the whole truth.
+///
+/// Two values because two behaviours exist. `enforce` narrows a turn to the
+/// row's `allowed_capabilities`; `audit` abstains from narrowing and leaves it
+/// to the compiled preset leg (spec/std-agent.md, "Profile rows are
+/// audit-mode"). Nothing is logged under either. The published schema also
+/// admitted `warn` and `off`, which nothing implemented: every value that was
+/// not `audit` took the enforcing branch, so `off` with an empty
+/// `allowed_capabilities` denied every turn. A word here that no host branches
+/// on is a word that lies, so the registry refuses it instead of enforcing it
+/// silently.
+pub const PROFILE_ENFORCEMENT_ENFORCE: &str = "enforce";
+pub const PROFILE_ENFORCEMENT_AUDIT: &str = "audit";
+pub const PROFILE_ENFORCEMENT_MODES: &[&str] =
+    &[PROFILE_ENFORCEMENT_ENFORCE, PROFILE_ENFORCEMENT_AUDIT];
 pub const CONSTRUCT_GRAMMAR_BINDING_MODES: &[&str] = &["required", "optional", "none"];
 /// `declaration_block` clause value kinds (DR-0011 Shape 1). This crate owns
 /// the list; the parser's build script reads it from here.

@@ -529,8 +529,8 @@
           "type": "string"
         },
         "enforcement_mode": {
-          "comment": "`audit` is the value that CHANGES behaviour: both hosts branch on it and on nothing else (`!= \"audit\"` in whipplescript-host-do/src/do_store.rs, `== \"audit\"` in whipplescript-cli/src/harness_tools.rs), and std.agent ships six profiles carrying it. It was missing here. `warn` and `off` are kept because they are already published, but nothing implements them: a profile declaring either is ENFORCED, which is worth knowing before writing one.",
-          "enum": ["enforce", "audit", "warn", "off"]
+          "comment": "Pinned to whipplescript-core's PROFILE_ENFORCEMENT_MODES by test, and the package registry refuses any other value. `enforce` narrows a turn to the row's allowed_capabilities; `audit` abstains and leaves narrowing to the compiled preset leg (spec/std-agent.md). This enum once also published `warn` and `off`, which nothing implemented: every value that was not `audit` took the enforcing branch, so `off` with an empty allowed_capabilities denied everything. They were removed rather than documented, because a comment is not a refusal.",
+          "enum": ["enforce", "audit"]
         },
         "allowed_capabilities": {
           "$ref": "#/$defs/stringArray"

@@ -16,7 +16,7 @@ use std::{fs, path::Path, process::Command};
 use whipplescript_core::{
     CONSTRUCT_GRAMMAR_BINDING_MODES, CONSTRUCT_GRAMMAR_CLAUSE_CONNECTIVES,
     CONSTRUCT_GRAMMAR_CLAUSE_KINDS, CONSTRUCT_GRAMMAR_CONNECTIVES, CONSTRUCT_GRAMMAR_SLOT_KINDS,
-    PLATFORM_CONSTRUCT_CATALOG,
+    PLATFORM_CONSTRUCT_CATALOG, PROFILE_ENFORCEMENT_MODES,
 };
 
 // Written by `emit_build_script_probe` in build.rs: the vocabulary that run
@@ -209,6 +209,31 @@ fn the_manifest_schema_publishes_exactly_the_package_authorable_vocabulary() {
     assert_eq!(
         published_families, expected_families,
         "the schema's construct_family enum must be the families those lowerings accept"
+    );
+}
+
+/// The schema's `enforcement_mode` enum is core's list, in core's order. The
+/// schema once published `warn` and `off` on its own authority, and nothing
+/// implemented them; a value this enum admits that no host branches on is the
+/// registry's to refuse, and the two lists must be one list for that to hold.
+#[test]
+fn the_manifest_schema_publishes_cores_enforcement_modes() {
+    let schema_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../spec/report-schemas/package_manifest_v0.schema.json");
+    let schema: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(&schema_path).expect("the package manifest schema is readable"),
+    )
+    .expect("the package manifest schema is JSON");
+    let modes = schema
+        .pointer("/$defs/profile/properties/enforcement_mode/enum")
+        .and_then(serde_json::Value::as_array)
+        .expect("the schema states an enforcement-mode vocabulary")
+        .iter()
+        .map(|value| value.as_str().expect("a mode is a string").to_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        modes, PROFILE_ENFORCEMENT_MODES,
+        "the manifest schema's enforcement modes must be core's, in core's order"
     );
 }
 

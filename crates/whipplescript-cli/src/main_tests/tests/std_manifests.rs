@@ -1033,6 +1033,37 @@ fn operator_plane_provider_rows_are_shape_checked() {
     assert!(error.contains("unknown plane"), "{error}");
 }
 
+/// An enforcement mode outside `enforce`/`audit` is refused at the manifest,
+/// not defaulted at the host. Both hosts branch on `audit` alone, so `off`
+/// used to take the ENFORCING branch and, with an empty `allowed_capabilities`,
+/// deny every turn -- the word meaning "no enforcement" producing the most.
+#[test]
+fn unknown_profile_enforcement_modes_are_refused() {
+    for mode in ["off", "warn", "enforced"] {
+        let manifest = format!(
+            r#"{{
+                "schema": "whipplescript.package_manifest.v0",
+                "package_id": "p", "name": "p", "version": "0.1.0",
+                "profiles": [{{"id": "x", "name": "x", "enforcement_mode": "{mode}", "allowed_capabilities": []}}]
+            }}"#
+        );
+        let error = package_manifest_from_json(Path::new("p.json"), manifest)
+            .expect_err("a mode no host branches on is refused");
+        assert!(error.contains("is not an enforcement mode"), "{error}");
+    }
+    for mode in ["enforce", "audit"] {
+        let manifest = format!(
+            r#"{{
+                "schema": "whipplescript.package_manifest.v0",
+                "package_id": "p", "name": "p", "version": "0.1.0",
+                "profiles": [{{"id": "x", "name": "x", "enforcement_mode": "{mode}", "allowed_capabilities": []}}]
+            }}"#
+        );
+        package_manifest_from_json(Path::new("p.json"), manifest)
+            .unwrap_or_else(|error| panic!("`{mode}` is a real mode: {error}"));
+    }
+}
+
 #[test]
 fn std_manifests_all_embedded() {
     // Blocker B1 door mirror: `scripts/artifact_admission.py`
