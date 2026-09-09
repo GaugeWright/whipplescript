@@ -552,6 +552,17 @@ pub enum BodyEffectKind {
     /// there is deliberately no `scope` and no `ttl`: both are vendor protocol,
     /// both belong in the body that goes on the wire, and a clause beside the
     /// body duplicating it is the separate modifier §5 refuses for credentials.
+    /// `rotate <credential> as <binding>` (DR-0053 §12 Amendment).
+    RotateCredential {
+        /// The entry gaining a successor. Both versions are valid afterwards,
+        /// which is the whole point: the predecessor keeps verifying every
+        /// signature already made under it.
+        credential: String,
+    },
+    /// `revoke <credential>` (DR-0053 §12 Amendment).
+    RevokeCredential {
+        credential: String,
+    },
     MintCredential {
         /// The credential the exchange presents — the one being spent to get a
         /// child, and the one whose egress ceiling the child inherits.
@@ -1844,6 +1855,8 @@ impl<'a> BodyParser<'a> {
             "call" => self.parse_call(),
             "request" => self.parse_http_request(),
             "mint" => self.parse_mint_credential(),
+            "rotate" => self.parse_rotate_credential(),
+            "revoke" => self.parse_revoke_credential(),
             "invoke" => self.parse_invoke(),
             "read" => self.parse_read(),
             "write" => self.parse_write(),
@@ -2744,6 +2757,84 @@ impl<'a> BodyParser<'a> {
 
     /// `mint credential from <parent> { at <METHOD> "<url>" … } as <binding>`
     /// (DR-0053 §5 as amended 2026-08-27).
+    /// `rotate <credential> as <binding>` (DR-0053 §12 Amendment).
+    ///
+    /// The binding is REQUIRED. A rotation returns the version the successor
+    /// took, and that number is how the workflow's half — deliver, verify
+    /// consumers, cut over — knows which key it is cutting to. A rotation
+    /// whose result nobody names is one that cannot be finished, so refusing
+    /// it here is cheaper than a workflow that rotates and then guesses.
+    fn parse_rotate_credential(&mut self) -> Option<BodyStmt> {
+        let start = self.pos;
+        self.pos += 1; // rotate
+        let credential = self.ident_text("credential name after `rotate`")?;
+        let mut binding = None;
+        let mut requires = Vec::new();
+        let mut timeout_seconds = None;
+        if !self.parse_effect_modifiers(&mut binding, &mut requires, &mut timeout_seconds) {
+            return None;
+        }
+        if binding.is_none() {
+            let span = self.span_from(start);
+            self.error(
+                diagnostic_code!("construct.missing_requirement"),
+                span,
+                format!(
+                    "`rotate {credential}` names no binding, so the version the successor took \
+                     reaches nothing"
+                ),
+                Some("write `rotate <credential> as <binding>`".to_owned()),
+            );
+            return None;
+        }
+        Some(BodyStmt::Effect(EffectStmt {
+            kind: BodyEffectKind::RotateCredential { credential },
+            binding,
+            requires,
+            timeout_seconds,
+            prompt: None,
+            span: self.span_from(start),
+        }))
+    }
+
+    /// `revoke <credential>` (DR-0053 §12 Amendment).
+    ///
+    /// Bare, with no binding: ending a credential answers nothing the workflow
+    /// needs to branch on. Whether an entry existed to end is recorded, but a
+    /// rotation that has just cut its consumers over does not ask.
+    fn parse_revoke_credential(&mut self) -> Option<BodyStmt> {
+        let start = self.pos;
+        self.pos += 1; // revoke
+        let credential = self.ident_text("credential name after `revoke`")?;
+        let mut binding = None;
+        let mut requires = Vec::new();
+        let mut timeout_seconds = None;
+        if !self.parse_effect_modifiers(&mut binding, &mut requires, &mut timeout_seconds) {
+            return None;
+        }
+        if binding.is_some() {
+            let span = self.span_from(start);
+            self.error(
+                diagnostic_code!("construct.incompatible_clause"),
+                span,
+                format!(
+                    "`revoke {credential}` binds a result, but ending a credential answers \
+                     nothing a workflow branches on"
+                ),
+                Some("write `revoke <credential>` with no `as`".to_owned()),
+            );
+            return None;
+        }
+        Some(BodyStmt::Effect(EffectStmt {
+            kind: BodyEffectKind::RevokeCredential { credential },
+            binding,
+            requires,
+            timeout_seconds,
+            prompt: None,
+            span: self.span_from(start),
+        }))
+    }
+
     fn parse_mint_credential(&mut self) -> Option<BodyStmt> {
         let start = self.pos;
         self.pos += 1; // mint
@@ -5257,6 +5348,8 @@ pub(crate) const RULE_BODY_STATEMENT_KEYWORDS: &[&str] = &[
     "call",
     "request",
     "mint",
+    "rotate",
+    "revoke",
     "invoke",
     "read",
     "write",

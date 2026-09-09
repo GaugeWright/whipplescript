@@ -642,8 +642,9 @@ mod tests {
             identity_hash(&snapshot_of("terminal-output-union", source)),
             identity_hash(&snapshot_of("reformatted", &reformatted)),
             "`body_hash` stopped being whitespace-sensitive: identity now ignores \
-             text inside a rule body, which is a RULING, not a refactor — update \
-             DR-0095 and row D13 rather than this assertion"
+             text inside a rule body, which DR-0106 rules it must not until a \
+             position-accurate prose mask exists — supersede that record rather \
+             than this assertion"
         );
     }
 

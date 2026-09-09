@@ -2587,6 +2587,22 @@ pub enum IrEffectKind {
     /// DR-0053 §5 as amended: a credential exchange, custodian-executed so the
     /// minted token never enters this process.
     MintCredential,
+    /// DR-0053 §12 as amended: a successor under the SAME entry, both valid.
+    ///
+    /// A statement rather than a call because rotation is planned — you know
+    /// which entry, which consumers, which window — so there is a rule to
+    /// write. The orchestration around it stays a workflow, which is what
+    /// "resumable, auditable, dry-runnable" describes; only this one
+    /// indivisible step belongs to the custodian, because generating a
+    /// successor and binding it are two acts with a window between them where
+    /// the entry has a successor nobody can reach.
+    RotateCredential,
+    /// DR-0053 §12 as amended: end a credential's validity.
+    ///
+    /// A statement for the same reason `rotate` is: ending the overlap is a
+    /// decision the workflow makes, and a rotation that cannot end its own
+    /// overlap is half-automated.
+    RevokeCredential,
     TrackerFile,
     TrackerClaim,
     TrackerRenew,
@@ -5096,6 +5112,30 @@ fn effect_contract_for_kind(
             strings(&["effect.output"]),
             TypedOutputValidation::RuntimeBoundary,
         ),
+        // DR-0053 §12 as amended. Both are custodian transactions on the
+        // sealed store, so both take the `custodian` provider and neither
+        // carries material: `rotate` returns the successor's VERSION and
+        // `revoke` returns whether an entry existed to end.
+        IrEffectKind::RotateCredential => (
+            "std.custody",
+            strings(&["rotate"]),
+            Some("custody.rotate.input"),
+            Some("custody.rotate.output"),
+            strings(&["custody.rotate"]),
+            strings(&["custodian"]),
+            strings(&["effect.output"]),
+            TypedOutputValidation::RuntimeBoundary,
+        ),
+        IrEffectKind::RevokeCredential => (
+            "std.custody",
+            strings(&["revoke"]),
+            Some("custody.revoke.input"),
+            Some("custody.revoke.output"),
+            strings(&["custody.revoke"]),
+            strings(&["custodian"]),
+            strings(&["effect.output"]),
+            TypedOutputValidation::RuntimeBoundary,
+        ),
         IrEffectKind::TrackerFile => (
             "std.tracker",
             strings(&["file"]),
@@ -5277,6 +5317,8 @@ impl IrEffectKind {
             Self::ExecCommand => "exec.command",
             Self::HttpRequest => "custody.request",
             Self::MintCredential => "custody.mint",
+            Self::RotateCredential => "custody.rotate",
+            Self::RevokeCredential => "custody.revoke",
             Self::TrackerFile => "tracker.file",
             Self::TrackerClaim => "tracker.claim",
             Self::TrackerRenew => "tracker.renew",
@@ -14154,6 +14196,8 @@ fn terminal_completed_payload_type(
         IrEffectKind::CapabilityCall
         | IrEffectKind::HttpRequest
         | IrEffectKind::MintCredential
+        | IrEffectKind::RotateCredential
+        | IrEffectKind::RevokeCredential
         | IrEffectKind::EventEmit
         | IrEffectKind::WorkflowInvoke
         | IrEffectKind::TimerWait
@@ -14862,6 +14906,8 @@ fn ir_access_grants_for_body(kind: &body::BodyEffectKind) -> Vec<IrAccessGrant> 
         | body::BodyEffectKind::Timer { .. }
         | body::BodyEffectKind::HttpRequest { .. }
         | body::BodyEffectKind::MintCredential { .. }
+        | body::BodyEffectKind::RotateCredential { .. }
+        | body::BodyEffectKind::RevokeCredential { .. }
         | body::BodyEffectKind::ObtainCredential { .. }
         | body::BodyEffectKind::TrackerFile { .. }
         | body::BodyEffectKind::TrackerClaim { .. }
@@ -14892,6 +14938,8 @@ fn ir_effect_kind_for_body(kind: &body::BodyEffectKind) -> IrEffectKind {
         body::BodyEffectKind::Exec { .. } => IrEffectKind::ExecCommand,
         body::BodyEffectKind::HttpRequest { .. } => IrEffectKind::HttpRequest,
         body::BodyEffectKind::MintCredential { .. } => IrEffectKind::MintCredential,
+        body::BodyEffectKind::RotateCredential { .. } => IrEffectKind::RotateCredential,
+        body::BodyEffectKind::RevokeCredential { .. } => IrEffectKind::RevokeCredential,
         // DR-0053 §11 files a tracker item; it is not a custody OPERATION, so
         // it lowers onto the tracker-file effect kind rather than minting a
         // kind whose only difference is which fields the handler adds.
@@ -14926,6 +14974,8 @@ fn agent_for_body(kind: &body::BodyEffectKind) -> Option<String> {
         | body::BodyEffectKind::Timer { .. }
         | body::BodyEffectKind::HttpRequest { .. }
         | body::BodyEffectKind::MintCredential { .. }
+        | body::BodyEffectKind::RotateCredential { .. }
+        | body::BodyEffectKind::RevokeCredential { .. }
         | body::BodyEffectKind::Exec { .. }
         | body::BodyEffectKind::ObtainCredential { .. }
         | body::BodyEffectKind::TrackerFile { .. }
@@ -14959,6 +15009,8 @@ fn coerce_target_for_body(kind: &body::BodyEffectKind) -> Option<String> {
         | body::BodyEffectKind::Timer { .. }
         | body::BodyEffectKind::HttpRequest { .. }
         | body::BodyEffectKind::MintCredential { .. }
+        | body::BodyEffectKind::RotateCredential { .. }
+        | body::BodyEffectKind::RevokeCredential { .. }
         | body::BodyEffectKind::Exec { .. }
         | body::BodyEffectKind::ObtainCredential { .. }
         | body::BodyEffectKind::TrackerFile { .. }
@@ -14990,6 +15042,8 @@ fn turn_skills_for_body(kind: &body::BodyEffectKind) -> Vec<String> {
         | body::BodyEffectKind::Timer { .. }
         | body::BodyEffectKind::HttpRequest { .. }
         | body::BodyEffectKind::MintCredential { .. }
+        | body::BodyEffectKind::RotateCredential { .. }
+        | body::BodyEffectKind::RevokeCredential { .. }
         | body::BodyEffectKind::Exec { .. }
         | body::BodyEffectKind::ObtainCredential { .. }
         | body::BodyEffectKind::TrackerFile { .. }
@@ -15021,6 +15075,8 @@ fn on_stream_for_body(kind: &body::BodyEffectKind) -> Option<String> {
         | body::BodyEffectKind::Timer { .. }
         | body::BodyEffectKind::HttpRequest { .. }
         | body::BodyEffectKind::MintCredential { .. }
+        | body::BodyEffectKind::RotateCredential { .. }
+        | body::BodyEffectKind::RevokeCredential { .. }
         | body::BodyEffectKind::Exec { .. }
         | body::BodyEffectKind::ObtainCredential { .. }
         | body::BodyEffectKind::TrackerFile { .. }
@@ -15058,6 +15114,8 @@ fn vcs_selective_for_body(kind: &body::BodyEffectKind) -> (Option<String>, Optio
         | body::BodyEffectKind::Timer { .. }
         | body::BodyEffectKind::HttpRequest { .. }
         | body::BodyEffectKind::MintCredential { .. }
+        | body::BodyEffectKind::RotateCredential { .. }
+        | body::BodyEffectKind::RevokeCredential { .. }
         | body::BodyEffectKind::Exec { .. }
         | body::BodyEffectKind::ObtainCredential { .. }
         | body::BodyEffectKind::TrackerFile { .. }
@@ -15099,6 +15157,8 @@ fn workflow_target_for_body(kind: &body::BodyEffectKind) -> Option<String> {
         | body::BodyEffectKind::Timer { .. }
         | body::BodyEffectKind::HttpRequest { .. }
         | body::BodyEffectKind::MintCredential { .. }
+        | body::BodyEffectKind::RotateCredential { .. }
+        | body::BodyEffectKind::RevokeCredential { .. }
         | body::BodyEffectKind::Exec { .. }
         | body::BodyEffectKind::ObtainCredential { .. }
         | body::BodyEffectKind::TrackerFile { .. }
@@ -15556,6 +15616,11 @@ fn mint_credential_for_body(kind: &body::BodyEffectKind) -> Option<IrMintCredent
     // should have to say it carries none, not inherit that by falling
     // past a one-variant binding.
     match kind {
+        // Custody statements that carry no exchange: a rotation and a
+        // revocation are transactions on the sealed store, with no request to
+        // make and no reply to project.
+        body::BodyEffectKind::RotateCredential { .. }
+        | body::BodyEffectKind::RevokeCredential { .. } => None,
         body::BodyEffectKind::MintCredential {
             parent,
             method,
@@ -15668,6 +15733,8 @@ fn http_request_for_body(kind: &body::BodyEffectKind) -> Option<IrHttpRequest> {
         | body::BodyEffectKind::Invoke { .. }
         | body::BodyEffectKind::Timer { .. }
         | body::BodyEffectKind::MintCredential { .. }
+        | body::BodyEffectKind::RotateCredential { .. }
+        | body::BodyEffectKind::RevokeCredential { .. }
         | body::BodyEffectKind::Exec { .. }
         | body::BodyEffectKind::ObtainCredential { .. }
         | body::BodyEffectKind::TrackerFile { .. }
@@ -15704,6 +15771,8 @@ fn exec_target_for_body(kind: &body::BodyEffectKind) -> Option<IrExecTarget> {
         | body::BodyEffectKind::Timer { .. }
         | body::BodyEffectKind::HttpRequest { .. }
         | body::BodyEffectKind::MintCredential { .. }
+        | body::BodyEffectKind::RotateCredential { .. }
+        | body::BodyEffectKind::RevokeCredential { .. }
         | body::BodyEffectKind::ObtainCredential { .. }
         | body::BodyEffectKind::TrackerFile { .. }
         | body::BodyEffectKind::TrackerClaim { .. }
@@ -15815,6 +15884,13 @@ fn resource_for_body(
             signed_with,
             ..
         } => request_credential_handle(headers, signed_with.as_deref()).map(str::to_owned),
+        // A rotation and a revocation NAME the credential they act on, so the
+        // resource is that credential and nothing has to be inferred. This is
+        // the function whose `None` once made `request` invisible to the flow
+        // checker; a custody statement that returned `None` here would repeat
+        // it exactly.
+        body::BodyEffectKind::RotateCredential { credential }
+        | body::BodyEffectKind::RevokeCredential { credential } => Some(credential.clone()),
         // A mint spends its parent at a token endpoint, which is an egress
         // under that credential like any other. The PARENT is the sink
         // identity — the child does not exist yet, and the checker guarantees
@@ -15873,6 +15949,8 @@ fn construct_use_for_body(kind: &body::BodyEffectKind) -> Option<IrConstructUse>
         | body::BodyEffectKind::Timer { .. }
         | body::BodyEffectKind::HttpRequest { .. }
         | body::BodyEffectKind::MintCredential { .. }
+        | body::BodyEffectKind::RotateCredential { .. }
+        | body::BodyEffectKind::RevokeCredential { .. }
         | body::BodyEffectKind::Exec { .. }
         | body::BodyEffectKind::ObtainCredential { .. }
         | body::BodyEffectKind::TrackerFile { .. }
@@ -15909,6 +15987,8 @@ fn is_ast_only_effect_kind(kind: &body::BodyEffectKind) -> bool {
             | body::BodyEffectKind::HttpRequest { .. }
             // `mint credential from … { … } as x` closes the same way.
             | body::BodyEffectKind::MintCredential { .. }
+        | body::BodyEffectKind::RotateCredential { .. }
+        | body::BodyEffectKind::RevokeCredential { .. }
             | body::BodyEffectKind::Decide { .. }
             | body::BodyEffectKind::TrackerFile { .. }
             | body::BodyEffectKind::ObtainCredential { .. }
@@ -20214,6 +20294,8 @@ fn effect_binding_schema(
         | IrEffectKind::CapabilityCall
         | IrEffectKind::HttpRequest
         | IrEffectKind::MintCredential
+        | IrEffectKind::RotateCredential
+        | IrEffectKind::RevokeCredential
         | IrEffectKind::EventEmit
         | IrEffectKind::WorkflowInvoke
         | IrEffectKind::TimerWait
@@ -21154,6 +21236,9 @@ fn collect_effect_expression_sources(kind: &body::BodyEffectKind, out: &mut Vec<
         }
     };
     match kind {
+        // A credential NAME, not an expression: nothing here reads a binding.
+        body::BodyEffectKind::RotateCredential { .. }
+        | body::BodyEffectKind::RevokeCredential { .. } => {}
         // A turn carries its prompt (collected by the caller from
         // `EffectStmt::prompt`) and its target; the target is an agent name,
         // not a binding.
@@ -22792,6 +22877,10 @@ fn check_conditioned_effect_reads(
     }
 
     match &effect.kind {
+        // Neither carries an expression to validate — a credential name is an
+        // identifier the declaration check owns.
+        body::BodyEffectKind::RotateCredential { .. }
+        | body::BodyEffectKind::RevokeCredential { .. } => {}
         body::BodyEffectKind::Coerce { args, .. } => {
             for arg in args {
                 expression(arg, diagnostics);

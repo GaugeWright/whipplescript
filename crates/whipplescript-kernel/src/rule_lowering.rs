@@ -3194,6 +3194,33 @@ pub fn parse_effect_statements(
                 required_capabilities: Vec::new(),
                 after: current_after,
             });
+        } else if trimmed.starts_with("rotate ") || trimmed.starts_with("revoke ") {
+            // `rotate <credential> as <b>` / `revoke <credential>` (DR-0053 §12
+            // Amendment). Single-line, so no brace balancing.
+            let rotating = trimmed.starts_with("rotate ");
+            let credential = trimmed
+                .split_whitespace()
+                .nth(1)
+                .unwrap_or_default()
+                .to_owned();
+            let kind = if rotating {
+                "custody.rotate"
+            } else {
+                "custody.revoke"
+            };
+            effects.push(ParsedEffect {
+                timeout_seconds: parse_timeout_clause_seconds(trimmed),
+                kind: kind.to_owned(),
+                target: None,
+                name: None,
+                binding: binding_after_as(trimmed),
+                args: vec![credential],
+                prompt: None,
+                prompt_content_type: None,
+                prompt_template: None,
+                required_capabilities: vec![kind.to_owned()],
+                after: current_after,
+            });
         } else if trimmed.starts_with("mint credential ") {
             // mint credential from <parent> { at … } as <binding> (DR-0053 §5
             // as amended). Same shape as `request` below: the text scan finds
@@ -5097,6 +5124,17 @@ pub fn parsed_effect_input_json(
                 "bindings": context_bindings_json(context),
                 "rule": rule.name,
             })
+        }
+        // DR-0053 §12 as amended. Both carry one thing — which entry the
+        // custodian is to act on — and it comes from the lowered node rather
+        // than from the effect's `resource`, which never reaches the runtime.
+        // The credential comes off the statement's own args, so there is no
+        // node to lose and no impossible-state arm to leave untestable. Args
+        // rather than a node lookup for a stronger reason too: two `revoke`s
+        // in one rule share a kind and BOTH have no binding, so a lookup keyed
+        // on those would hand the second the first's credential.
+        "custody.rotate" | "custody.revoke" => {
+            json!({ "credential": effect.args.first().cloned().unwrap_or_default() })
         }
         // DR-0053 §5 as amended. A mint's exchange is a request, so its input
         // is built the same way; what it adds is where the token is.
@@ -8004,6 +8042,51 @@ release slot
     /// T3 renew disambiguation (mirroring `release`): a `renew <binding>`
     /// naming a same-parse `claim ... as <binding>` CLAIM binding flips from the
     /// parser's default `lease.renew` to `tracker.renew`.
+    /// Two revocations in one rule name two credentials, and each carries its
+    /// own (DR-0053 §12 Amendment).
+    ///
+    /// `revoke` binds nothing, so both effects share a kind AND an empty
+    /// binding. An input builder that looked the credential up on the IR node
+    /// by those two fields would hand the second revocation the first's
+    /// credential — a rotation that ended the wrong key and reported success.
+    /// The credential travels on the statement's own args for exactly this
+    /// reason, and this is the case that proves it.
+    #[test]
+    fn each_revocation_in_a_rule_carries_the_credential_it_named() {
+        let body = "rotate key_a as successor\nrevoke key_a\nrevoke key_b\n";
+        let effects =
+            parse_effect_statements(body, &RuleContext::default(), &[], &[], &empty_ir_program());
+        let custody: Vec<(&str, &str)> = effects
+            .iter()
+            .filter(|effect| effect.kind.starts_with("custody."))
+            .map(|effect| {
+                (
+                    effect.kind.as_str(),
+                    effect.args.first().map(String::as_str).unwrap_or_default(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            custody,
+            vec![
+                ("custody.rotate", "key_a"),
+                ("custody.revoke", "key_a"),
+                ("custody.revoke", "key_b"),
+            ],
+        );
+        // And the rotation keeps its binding while the revocations have none,
+        // which is the surface distinction the parser refuses to blur.
+        let rotate = effects
+            .iter()
+            .find(|effect| effect.kind == "custody.rotate")
+            .expect("a rotation");
+        assert_eq!(rotate.binding.as_deref(), Some("successor"));
+        assert!(effects
+            .iter()
+            .filter(|effect| effect.kind == "custody.revoke")
+            .all(|effect| effect.binding.is_none()));
+    }
+
     #[test]
     fn renew_of_parsed_claim_binding_becomes_tracker_renew() {
         let body = r#"

@@ -111,6 +111,10 @@ pub(crate) fn print_effect(
         .map(|seconds| format!(" timeout {seconds}s"))
         .unwrap_or_default();
     let header = match &effect.kind {
+        // The binding is appended by the caller, as it is for every other
+        // effect, so `rotate` renders without its `as` here.
+        BodyEffectKind::RotateCredential { credential } => format!("rotate {credential}"),
+        BodyEffectKind::RevokeCredential { credential } => format!("revoke {credential}"),
         BodyEffectKind::HttpRequest {
             method,
             url,

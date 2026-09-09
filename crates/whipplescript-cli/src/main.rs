@@ -20539,6 +20539,9 @@ fn run_claimable_effect(
         ),
         "custody.request" => run_custody_request_effect(store_path, instance_id, effect, options),
         "custody.mint" => run_custody_mint_effect(store_path, instance_id, effect, options),
+        "custody.rotate" | "custody.revoke" => {
+            run_custody_lifecycle_effect(store_path, instance_id, effect, options)
+        }
         "exec.command" => run_exec_effect(
             store_path,
             instance_id,
@@ -25986,6 +25989,134 @@ pub(crate) fn custody_egress_transport(
 /// The child is registered as `{parent}/mint-{fingerprint}` and therefore
 /// inherits the parent's egress ceiling by name — which is what bounds a mint,
 /// since whip does not model the vendor scope the exchange requests.
+/// `rotate <credential> as <b>` and `revoke <credential>` (DR-0053 §12
+/// Amendment).
+///
+/// One handler for both because they are the same shape: name an entry, ask
+/// the custodian, record what it answered. Neither carries material in either
+/// direction — a rotation returns the version the successor took and a
+/// revocation returns whether there was an entry to end.
+fn run_custody_lifecycle_effect(
+    store_path: &Path,
+    instance_id: &str,
+    effect: &ClaimableEffect,
+    options: &WorkerOptions,
+) -> Result<whipplescript_store::StoredEvent, StoreError> {
+    use whipplescript_custody::{
+        CredentialName, CustodyCall, CustodyOk, CustodyOp, UseAttribution,
+    };
+
+    let rotating = effect.kind == "custody.rotate";
+    let verb = if rotating { "rotate" } else { "revoke" };
+    let mut kernel = RuntimeKernel::new(SqliteStore::open(store_path)?);
+    let config = options.effect_config();
+    let input: Value = serde_json::from_str(&effect.input_json).unwrap_or_else(|_| json!({}));
+    let run_id = idempotency_key(&[instance_id, &effect.effect_id, "custody-lifecycle-run"]);
+    let lease_id = idempotency_key(&[instance_id, &effect.effect_id, "custody-lifecycle-lease"]);
+
+    kernel.start_run(RunStart {
+        instance_id,
+        effect_id: &effect.effect_id,
+        run_id: &run_id,
+        provider: &config.provider,
+        worker_id: "whip-worker",
+        lease_id: &lease_id,
+        lease_expires_at: "2030-01-01T00:00:00Z",
+        metadata_json: &json!({ "input": input }).to_string(),
+    })?;
+
+    let fail = |kernel: &mut RuntimeKernel<SqliteStore>, summary: &str| {
+        kernel.fail_run(EffectCompletion {
+            instance_id,
+            effect_id: &effect.effect_id,
+            run_id: &run_id,
+            provider: &config.provider,
+            worker_id: "whip-worker",
+            status: "failed",
+            exit_code: Some(1),
+            summary: Some(summary),
+            metadata_json: &json!({
+                "error": summary,
+                "failure": {
+                    "error_kind": if rotating { "custody_rotate_failed" } else { "custody_revoke_failed" },
+                    "message": summary,
+                },
+            })
+            .to_string(),
+            idempotency_key: None,
+        })
+    };
+
+    let Some(credential) = input.get("credential").and_then(Value::as_str) else {
+        return fail(
+            &mut kernel,
+            &format!("a `{verb}` reached the runtime naming no credential"),
+        );
+    };
+    let name = match CredentialName::new(credential) {
+        Ok(name) => name,
+        Err(err) => return fail(&mut kernel, &format!("credential name: {err}")),
+    };
+    let transport = match custody_egress_transport() {
+        Ok(Some(transport)) => transport,
+        Ok(None) => {
+            return fail(
+                &mut kernel,
+                &format!(
+                    "no custodian socket (WHIPPLESCRIPT_CUSTODIAN_SOCKET): a {verb} is a \
+                     transaction on the sealed store and cannot be done without one"
+                ),
+            )
+        }
+        Err(detail) => return fail(&mut kernel, &detail),
+    };
+
+    let op = if rotating {
+        CustodyOp::Rotate { credential: name }
+    } else {
+        CustodyOp::Revoke { credential: name }
+    };
+    let call = CustodyCall::new(
+        UseAttribution {
+            run_id: instance_id.to_owned(),
+            actor: Some("workflow".to_owned()),
+            effect_key: Some(effect.effect_id.clone()),
+        },
+        op,
+    );
+    let reply = match transport.call(call) {
+        Ok(reply) => reply,
+        Err(error) => return fail(&mut kernel, &format!("custodian unreachable: {error:?}")),
+    };
+    let output = match reply.outcome {
+        Ok(CustodyOk::Rotated {
+            credential,
+            version,
+        }) => json!({ "credential": credential.as_str(), "version": version }),
+        Ok(CustodyOk::Revoked { existed }) => json!({ "existed": existed }),
+        Ok(other) => {
+            return fail(
+                &mut kernel,
+                &format!("custodian answered a {verb} with {other:?}"),
+            )
+        }
+        Err(refusal) => return fail(&mut kernel, &format!("custodian refused: {refusal:?}")),
+    };
+
+    kernel.complete_run(EffectCompletion {
+        instance_id,
+        effect_id: &effect.effect_id,
+        run_id: &run_id,
+        provider: &config.provider,
+        worker_id: "whip-worker",
+        status: "succeeded",
+        exit_code: Some(0),
+        summary: Some(verb),
+        metadata_json: &json!({ "output": output }).to_string(),
+        idempotency_key: None,
+    })
+}
+
 fn run_custody_mint_effect(
     store_path: &Path,
     instance_id: &str,

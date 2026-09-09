@@ -2720,6 +2720,14 @@ fn effect_flow(kind: &IrEffectKind) -> EffectFlow {
         // egress under that credential and the reply comes back in — the same
         // reading as `request`, for the same reason.
         IrEffectKind::MintCredential => EffectFlow::BOTH,
+        // A rotation WRITES the entry — a successor now sits beside the
+        // predecessor — and its binding READS one fact back out, the version
+        // the successor took. Both directions are real, so both are declared.
+        IrEffectKind::RotateCredential => EffectFlow::BOTH,
+        // A revocation only writes. It binds nothing (DR-0053 §12 spells it
+        // bare), so there is no channel out of the resource and calling it
+        // BOTH would claim a read the statement cannot perform.
+        IrEffectKind::RevokeCredential => EffectFlow::WRITE,
         // An exec sends its argv and stdin out to a process and reads its
         // stdout back. Both directions, and the resource is the script
         // capability or `exec:raw`.
@@ -4293,6 +4301,8 @@ fn output_tokens_for_root(
         | IrEffectKind::TimerWait
         | IrEffectKind::HttpRequest
         | IrEffectKind::MintCredential
+        | IrEffectKind::RotateCredential
+        | IrEffectKind::RevokeCredential
         | IrEffectKind::TrackerFile
         | IrEffectKind::TrackerClaim
         | IrEffectKind::TrackerRenew
