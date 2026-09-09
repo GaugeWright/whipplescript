@@ -31,9 +31,15 @@ use whipplescript_custody::{CredentialKind, CredentialName};
 
 const USAGE: &str = "usage:
   whip-custodian init   --store <path>
-  whip-custodian import --store <path> --name <credential> --kind <kind> [--budget <n>] [--from-env <VAR> | --from-file <path> | --from-stdin | --remote-transit <key_name> | --tpm-pcr <0,7> | --pkcs11-module <so> --pkcs11-token <label> --pkcs11-key <label>]
+  whip-custodian import --store <path> --name <credential> --kind <kind> [--socket <path>] [--budget <n>] [--from-env <VAR> | --from-file <path> | --from-stdin | --remote-transit <key_name> | --tpm-pcr <0,7> | --pkcs11-module <so> --pkcs11-token <label> --pkcs11-key <label>]
   whip-custodian list   --store <path>
-  whip-custodian revoke --store <path> --name <credential>
+  whip-custodian revoke --store <path> --name <credential> [--socket <path>]
+
+`import` and `revoke` take --socket (unix only, as the socket is) to go through
+a RUNNING custodian. Without
+it they edit the store file directly, which is a lost update while a custodian
+serves that store — it holds the store open and its next write restores its own
+copy. They refuse rather than race, and name the socket to use.
   whip-custodian serve  --store <path> --socket <path> [--egress-allow <host,host,*.suffix>]
                         [--sign-prefix <cred>=<entry>[,<entry>][;<cred>=<entry>]]
 
@@ -252,6 +258,180 @@ fn remote_transit_excludes_local_material(args: &Args) -> Result<(), String> {
     Ok(())
 }
 
+/// The file a serving custodian leaves beside its store, naming its pid and
+/// socket.
+///
+/// It exists because a direct-store write is a LOST UPDATE while a custodian
+/// serves. `serve` opens the store once and holds it, and every mutation
+/// rewrites the whole file from that in-memory map — so an `import` that edits
+/// the file underneath it survives only until the daemon's next write, and then
+/// vanishes with no error on either side. The marker is what lets the direct
+/// commands see the daemon they would otherwise silently race.
+fn serving_marker(store_path: &std::path::Path) -> PathBuf {
+    let mut marker = store_path.as_os_str().to_owned();
+    marker.push(".serving");
+    PathBuf::from(marker)
+}
+
+/// The socket of a custodian currently serving `store_path`, if one is.
+///
+/// A marker whose process is gone is STALE rather than authoritative — a
+/// custodian killed with SIGKILL leaves one behind, and treating that as "a
+/// daemon is running" would lock an operator out of their own store. The pid is
+/// checked, so recovery needs no cleanup step a person has to remember.
+fn serving_socket(store_path: &std::path::Path) -> Option<String> {
+    let text = std::fs::read_to_string(serving_marker(store_path)).ok()?;
+    let (pid, socket) = text.trim().split_once('\t')?;
+    let alive = std::path::Path::new("/proc").join(pid).exists();
+    alive.then(|| socket.to_owned())
+}
+
+/// Refuse a direct-store mutation while a custodian serves that store.
+///
+/// Fail-closed and ACTIONABLE: the refusal names the socket to use instead,
+/// because the operator's next move is the same command with `--socket`.
+fn refuse_if_serving(store_path: &std::path::Path, command: &str) -> Result<(), String> {
+    let Some(socket) = serving_socket(store_path) else {
+        return Ok(());
+    };
+    Err(format!(
+        "a custodian is serving {} on {socket}, and a direct `{command}` would be lost: it \
+         rewrites the store file, and the daemon's next write restores its own copy over it.\n\
+         run `whip-custodian {command} --socket {socket} …` to go through the custodian",
+        store_path.display()
+    ))
+}
+
+/// Send one admin operation to a serving custodian and report what it said.
+///
+/// Shared by `import` and `revoke` because the difference between them is the
+/// operation, not the conversation. `CustodyOp::Register` and
+/// `CustodyOp::Revoke` had no caller at all before this — the wire operations
+/// existed, and nothing in the product could reach them.
+/// The socket path exists only where the socket does. `client` is
+/// `cfg(target_family = "unix")` because a Unix domain socket with mode 0o600
+/// IS the custody boundary (DR-0053 §4), so there is nothing to talk to
+/// elsewhere.
+#[cfg(target_family = "unix")]
+fn admin_over_socket(
+    socket: &str,
+    op: whipplescript_custody::CustodyOp,
+    what: &str,
+) -> Result<whipplescript_custody::CustodyOk, String> {
+    use whipplescript_custody::{client::UnixSocketTransport, CustodyCall, CustodyTransport};
+
+    let transport = UnixSocketTransport::new(PathBuf::from(socket));
+    let call = CustodyCall::new(
+        whipplescript_custody::UseAttribution {
+            run_id: "whip-custodian".to_owned(),
+            actor: Some("operator".to_owned()),
+            effect_key: None,
+        },
+        op,
+    );
+    let reply = transport
+        .call(call)
+        .map_err(|error| format!("custodian on {socket} unreachable: {error:?}"))?;
+    reply
+        .outcome
+        .map_err(|refusal| format!("custodian refused the {what}: {refusal:?}"))
+}
+
+/// Whether the wire `register` can carry the options this import was given.
+///
+/// It cannot carry `--budget` or `--lease`, and silently dropping them would be
+/// worse than refusing: an operator who asked for a bounded credential and got
+/// an unbounded one has the opposite of what they typed, and nothing says so.
+fn wire_register_admits(budget: Option<u64>, lease_expires_at: Option<u64>) -> Result<(), String> {
+    if budget.is_some() || lease_expires_at.is_some() {
+        return Err(
+            "--budget and --lease are direct-store options; the wire `register` carries \
+             neither, so run them against a stopped custodian"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+/// What an `import` over the socket means, as a pure function.
+///
+/// Extracted for the reason its siblings in the CLI were: an arm reachable only
+/// through a live custodian socket is an arm no test can fail, and the sweep
+/// counts that as a refusal nothing gates.
+fn imported_reply(
+    outcome: whipplescript_custody::CustodyOk,
+    socket: &str,
+    kind: CredentialKind,
+    resource: &str,
+) -> Result<String, String> {
+    match outcome {
+        whipplescript_custody::CustodyOk::Registered { credential, .. } => Ok(format!(
+            "imported {} (kind {kind}) via {socket}",
+            credential.as_str()
+        )),
+        other => Err(format!(
+            "custodian answered an import of {resource} with {other:?}"
+        )),
+    }
+}
+
+/// What a `revoke` over the socket means, as a pure function.
+fn revoked_reply(
+    outcome: whipplescript_custody::CustodyOk,
+    socket: &str,
+    resource: &str,
+) -> Result<String, String> {
+    match outcome {
+        // `existed: false` is a SUCCESSFUL call whose answer is "there was
+        // nothing to revoke". The operator is told which it was rather than
+        // left to read silence as success.
+        whipplescript_custody::CustodyOk::Revoked { existed: true } => {
+            Ok(format!("revoked {resource} via {socket}"))
+        }
+        whipplescript_custody::CustodyOk::Revoked { existed: false } => {
+            Err(format!("no credential named {resource}"))
+        }
+        other => Err(format!(
+            "custodian answered a revoke of {resource} with {other:?}"
+        )),
+    }
+}
+
+#[cfg(target_family = "unix")]
+fn register_over_socket(
+    socket: &str,
+    name: CredentialName,
+    kind: CredentialKind,
+    material: &[u8],
+) -> Result<(), String> {
+    use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+
+    let resource = name.resource_id();
+    let outcome = admin_over_socket(
+        socket,
+        whipplescript_custody::CustodyOp::Register {
+            credential: name,
+            kind,
+            material_b64: B64.encode(material),
+        },
+        "import",
+    )?;
+    println!("{}", imported_reply(outcome, socket, kind, &resource)?);
+    Ok(())
+}
+
+#[cfg(target_family = "unix")]
+fn revoke_over_socket(socket: &str, name: CredentialName) -> Result<(), String> {
+    let resource = name.resource_id();
+    let outcome = admin_over_socket(
+        socket,
+        whipplescript_custody::CustodyOp::Revoke { credential: name },
+        "revoke",
+    )?;
+    println!("{}", revoked_reply(outcome, socket, &resource)?);
+    Ok(())
+}
+
 fn run() -> Result<(), String> {
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let Some((command, rest)) = argv.split_first() else {
@@ -371,6 +551,24 @@ fn run() -> Result<(), String> {
                         .to_string(),
                 );
             };
+            // `--socket` is the path that works while a custodian serves: the
+            // material goes to the daemon holding the store, which is the one
+            // process that can write it without losing anyone's update. This is
+            // the operator half of DR-0053 §15's ruling — material enters
+            // custody deliberately, and never through the ingress door.
+            // Unix-only because the socket is: `serve` refuses on every other
+            // platform, so no daemon can be holding the store and the direct
+            // path below is both the only one and a safe one. Refusing
+            // `--socket` there would mean a refusal the sweep cannot reach on
+            // the platform that runs it, and a gate taught to skip code this
+            // host does not compile would pass every platform-specific refusal
+            // in the repository — a weaker gate bought for a message.
+            #[cfg(target_family = "unix")]
+            if let Some(socket) = args.flags.get("socket") {
+                wire_register_admits(budget, lease_expires_at)?;
+                return register_over_socket(socket, name, kind, &material);
+            }
+            refuse_if_serving(&store_path, "import")?;
             let mut store = SealedStore::open(&store_path, &pass).map_err(|e| e.to_string())?;
             store
                 .register(name.clone(), kind, material, budget, lease_expires_at)
@@ -392,6 +590,11 @@ fn run() -> Result<(), String> {
         }
         "revoke" => {
             let name = CredentialName::new(args.need("name")?)?;
+            #[cfg(target_family = "unix")]
+            if let Some(socket) = args.flags.get("socket") {
+                return revoke_over_socket(socket, name);
+            }
+            refuse_if_serving(&store_path, "revoke")?;
             let mut store = SealedStore::open(&store_path, &pass).map_err(|e| e.to_string())?;
             if store.revoke(&name).map_err(|e| e.to_string())? {
                 println!("revoked {}", name.resource_id());
@@ -415,6 +618,13 @@ fn serve_command(
 ) -> Result<(), String> {
     let socket = PathBuf::from(args.need("socket")?);
     let store = SealedStore::open(store_path, pass).map_err(|e| e.to_string())?;
+    // Written before the first request is served, so a direct-store command
+    // cannot slip in during startup and be lost.
+    std::fs::write(
+        serving_marker(store_path),
+        format!("{}\t{}", std::process::id(), socket.display()),
+    )
+    .map_err(|e| format!("cannot record that this store is being served: {e}"))?;
     // Egress is deny-by-default (DR-0053 §9 / the mTLS-concentration
     // bound): without --egress-allow the custodian refuses every
     // request/mint at the network layer, loudly.
@@ -542,6 +752,155 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn marker_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "whip-custodian-marker-{}-{tag}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        dir
+    }
+
+    /// A direct-store write is a LOST UPDATE while a custodian serves, so it is
+    /// refused — and the refusal names the socket, because that is the
+    /// operator's next command.
+    #[test]
+    fn a_direct_write_is_refused_while_a_custodian_serves_that_store() {
+        let store = marker_dir("live").join("s.json");
+        std::fs::write(
+            serving_marker(&store),
+            format!("{}\t/run/whip.sock", std::process::id()),
+        )
+        .expect("write marker");
+
+        assert_eq!(serving_socket(&store).as_deref(), Some("/run/whip.sock"));
+        let refused = refuse_if_serving(&store, "import").expect_err("must refuse");
+        assert!(
+            refused.contains("would be lost")
+                && refused.contains("/run/whip.sock")
+                && refused.contains("--socket"),
+            "the refusal says what is at stake and what to run instead: {refused}"
+        );
+        // `revoke` is the same hazard and gets the same answer, named for
+        // itself rather than for `import`.
+        let refused = refuse_if_serving(&store, "revoke").expect_err("must refuse");
+        assert!(refused.contains("`revoke`"), "{refused}");
+    }
+
+    /// A marker whose process is gone is STALE, not authoritative.
+    ///
+    /// A custodian killed with SIGKILL leaves one behind, and reading it as "a
+    /// daemon is running" would lock an operator out of their own store with no
+    /// way back that does not involve deleting a file nobody documented.
+    #[test]
+    fn a_marker_left_by_a_dead_custodian_does_not_lock_the_store() {
+        let store = marker_dir("stale").join("s.json");
+        // A pid that cannot be running: 0 is never a live process.
+        std::fs::write(serving_marker(&store), "0\t/run/whip.sock").expect("write marker");
+
+        assert_eq!(serving_socket(&store), None);
+        refuse_if_serving(&store, "import").expect("a stale marker admits the direct path");
+    }
+
+    /// No marker at all is the ordinary case: no custodian, no refusal.
+    #[test]
+    fn a_store_no_one_serves_takes_a_direct_write() {
+        let store = marker_dir("absent").join("s.json");
+        let _ = std::fs::remove_file(serving_marker(&store));
+        assert_eq!(serving_socket(&store), None);
+        refuse_if_serving(&store, "import").expect("an unserved store admits the direct path");
+    }
+
+    fn name(s: &str) -> CredentialName {
+        CredentialName::new(s).expect("valid name")
+    }
+
+    /// The wire `register` carries no budget and no lease, and says so rather
+    /// than dropping them. An operator who asked for a bounded credential and
+    /// silently got an unbounded one has the opposite of what they typed.
+    #[test]
+    fn a_bounded_import_over_the_socket_is_refused_rather_than_unbounded() {
+        wire_register_admits(None, None).expect("a plain import goes over the wire");
+
+        for (budget, lease) in [(Some(10), None), (None, Some(99)), (Some(10), Some(99))] {
+            let refused = wire_register_admits(budget, lease).expect_err("must refuse");
+            assert!(
+                refused.contains("--budget and --lease are direct-store options")
+                    && refused.contains("stopped custodian"),
+                "the refusal says why and what to do instead: {refused}"
+            );
+        }
+    }
+
+    /// The two socket replies, as pure functions. Both were reachable only
+    /// through a live custodian before, which is a refusal no test can fail.
+    #[test]
+    fn an_import_reply_is_a_receipt_or_a_named_refusal() {
+        let ok = imported_reply(
+            whipplescript_custody::CustodyOk::Registered {
+                credential: name("v/one"),
+            },
+            "/run/whip.sock",
+            CredentialKind::Bearer,
+            "credential:v/one",
+        )
+        .expect("a registered reply is a receipt");
+        assert!(
+            ok.contains("v/one") && ok.contains("/run/whip.sock"),
+            "{ok}"
+        );
+
+        let wrong = imported_reply(
+            whipplescript_custody::CustodyOk::Revoked { existed: true },
+            "/run/whip.sock",
+            CredentialKind::Bearer,
+            "credential:v/one",
+        )
+        .expect_err("another outcome is not an import");
+        assert!(wrong.contains("answered an import of"), "{wrong}");
+    }
+
+    #[test]
+    fn a_revoke_reply_distinguishes_ending_one_from_finding_none() {
+        let ok = revoked_reply(
+            whipplescript_custody::CustodyOk::Revoked { existed: true },
+            "/run/whip.sock",
+            "credential:v/one",
+        )
+        .expect("an entry that existed is revoked");
+        assert!(ok.contains("revoked credential:v/one"), "{ok}");
+
+        // The distinction that earns the line: `existed: false` is a successful
+        // CALL, and reporting it as success would tell an operator they ended
+        // something they never had.
+        let absent = revoked_reply(
+            whipplescript_custody::CustodyOk::Revoked { existed: false },
+            "/run/whip.sock",
+            "credential:v/gone",
+        )
+        .expect_err("nothing to revoke is not a revocation");
+        assert!(
+            absent.contains("no credential named credential:v/gone"),
+            "{absent}"
+        );
+
+        let wrong = revoked_reply(
+            whipplescript_custody::CustodyOk::Revoked { existed: true },
+            "/run/whip.sock",
+            "credential:v/one",
+        );
+        assert!(wrong.is_ok());
+        let other = revoked_reply(
+            whipplescript_custody::CustodyOk::Reaped {
+                revoked: Vec::new(),
+            },
+            "/run/whip.sock",
+            "credential:v/one",
+        )
+        .expect_err("another outcome is not a revocation");
+        assert!(other.contains("answered a revoke of"), "{other}");
+    }
 
     fn parsed(argv: &[&str]) -> Args {
         let owned: Vec<String> = argv.iter().map(|a| a.to_string()).collect();
