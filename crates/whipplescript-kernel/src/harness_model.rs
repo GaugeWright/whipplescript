@@ -249,6 +249,156 @@ impl ModelWire {
     pub fn uses_native_tools(self) -> bool {
         !matches!(self, ModelWire::CoercedTools)
     }
+
+    /// Every dialect, so a caller listing the vocabulary reads it from here
+    /// rather than keeping a copy that a new variant would leave stale.
+    pub const ALL: &'static [ModelWire] = &[
+        ModelWire::AnthropicMessages,
+        ModelWire::OpenAiResponses,
+        ModelWire::OpenAiChatCompat,
+        ModelWire::CoercedTools,
+    ];
+
+    /// The request surface this dialect speaks.
+    fn surface(self) -> ModelSurface {
+        match self {
+            ModelWire::AnthropicMessages => ModelSurface::Anthropic,
+            ModelWire::OpenAiResponses | ModelWire::OpenAiChatCompat | ModelWire::CoercedTools => {
+                ModelSurface::OpenAi
+            }
+        }
+    }
+
+    /// Whether this dialect can be spoken to that provider identity at all.
+    ///
+    /// Not a question of preference. `coerced-tools` on a provider with native
+    /// tool calling is a WORSE turn and admitted (DR-0064 says so in as many
+    /// words); a wire from the other surface is a request the endpoint cannot
+    /// read, because the wire picks the URL path and the authentication header
+    /// shape. `anthropic-messages` posts to `/v1/messages` with `x-api-key`;
+    /// every OpenAI dialect posts under a `Bearer` token.
+    pub fn admits_provider(self, provider: CoerceProvider) -> bool {
+        self.surface() == ModelSurface::of_provider(provider)
+    }
+
+    /// The wire for a binding that names a provider identity: what the binding
+    /// DECLARED, else what the identity implies.
+    ///
+    /// A declared wire wins because it is the one fact a publisher can check
+    /// before publication; the identity's default is a statement about the
+    /// endpoint that identity usually means. An unknown name is refused rather
+    /// than defaulted, because "the wire that has always worked" is the guess
+    /// DR-0064 exists to remove -- and a mismatched one is refused here rather
+    /// than at the provider, which answers a wire it cannot read with a 4xx
+    /// naming something else.
+    pub fn declared_or_provider_default(
+        declared: Option<&str>,
+        provider: CoerceProvider,
+    ) -> Result<Self, String> {
+        let Some(name) = declared.map(str::trim).filter(|name| !name.is_empty()) else {
+            return Ok(ModelWire::of_provider(provider));
+        };
+        let wire = ModelWire::parse(name).ok_or_else(|| {
+            let known = ModelWire::ALL
+                .iter()
+                .map(|wire| format!("`{}`", wire.as_str()))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("unknown model wire `{name}`; expected one of {known}")
+        })?;
+        if !wire.admits_provider(provider) {
+            return Err(format!(
+                "provider `{}` speaks the {} surface and model wire `{name}` is a {} dialect; \
+                 a wire chooses the request path and the credential header, so this pairing \
+                 cannot be sent",
+                provider.as_str(),
+                ModelSurface::of_provider(provider).name(),
+                wire.surface().name(),
+            ));
+        }
+        Ok(wire)
+    }
+}
+
+/// The wire for one agent-model config naming a provider identity this runtime
+/// knows: what the config DECLARED, else what the identity implies.
+///
+/// `Ok(None)` means the id is not one of these, so a host that fronts further
+/// identities -- the metered Cloudflare gateway, whose surface is recovered
+/// from its base URL -- resolves its own rather than having this function
+/// pretend to know them. Both hosts call this, because both read the same
+/// `{provider, model, base_url, wire?}` config: the Durable Object parses it at
+/// the wasm boundary, and the turn container is handed the very same object
+/// verbatim over `whip-turn/1`.
+///
+/// Until this existed, five of the six identities hard-mapped provider to wire
+/// and DISCARDED a declared one; only the gateway read the field. So a binding
+/// that declared `coerced-tools` for a local endpoint without native tool
+/// calling -- the case DR-0064 admits the dialect FOR -- was answered on the
+/// chat-completions wire carrying a `tools[]` array such an endpoint refuses.
+pub fn agent_config_wire(
+    provider_id: Option<&str>,
+    declared: Option<&str>,
+) -> Result<Option<ModelWire>, String> {
+    let provider = match provider_id {
+        Some("anthropic") => CoerceProvider::Anthropic,
+        Some("openai") => CoerceProvider::OpenAi,
+        Some("openai-generic") => CoerceProvider::OpenAiCompat,
+        Some("xai") => CoerceProvider::Xai,
+        // The codex backend builds its own request and never consults a wire,
+        // so a declaration here would be read and thrown away. Refused rather
+        // than ignored: a field that silently does nothing is worse than one
+        // that is not accepted, because the host believes it took effect.
+        Some("openai-codex") => {
+            // Hoisted into a name so the guard is ONE line: the refusal
+            // sweep falsifies a guard it can read, and a wrapped condition
+            // gives it nothing to rewrite -- this refusal reported
+            // `SKIP (no mutation)`, which is unknown rather than covered.
+            let declares_a_wire = declared
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .is_some();
+            if declares_a_wire {
+                return Err(
+                    "the `openai-codex` backend carries its own request shape and takes no \
+                     `wire` declaration; remove the field or name a different provider"
+                        .to_owned(),
+                );
+            }
+            return Ok(Some(ModelWire::OpenAiResponses));
+        }
+        _ => return Ok(None),
+    };
+    ModelWire::declared_or_provider_default(declared, provider).map(Some)
+}
+
+/// The request surface a provider identity and a dialect must share.
+///
+/// Two surfaces because there are two request shapes, not because there are two
+/// vendors: the split is the URL path plus the credential header, which is what
+/// makes a crossed pairing unsendable rather than merely ill-advised.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ModelSurface {
+    Anthropic,
+    OpenAi,
+}
+
+impl ModelSurface {
+    fn of_provider(provider: CoerceProvider) -> Self {
+        match provider {
+            CoerceProvider::Anthropic => ModelSurface::Anthropic,
+            CoerceProvider::OpenAi | CoerceProvider::OpenAiCompat | CoerceProvider::Xai => {
+                ModelSurface::OpenAi
+            }
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            ModelSurface::Anthropic => "Anthropic Messages",
+            ModelSurface::OpenAi => "OpenAI",
+        }
+    }
 }
 
 impl From<CoerceProvider> for ModelWire {
@@ -2210,17 +2360,149 @@ mod tests {
         }]
     }
 
+    /// The config door both hosts read: identities it knows, the one dialect
+    /// rule that is about the BACKEND rather than the surface, and the honest
+    /// `None` for an identity a host may know and this does not.
+    #[test]
+    fn an_agent_config_wire_is_declared_defaulted_or_refused() {
+        for (id, expected) in [
+            ("anthropic", ModelWire::AnthropicMessages),
+            ("openai", ModelWire::OpenAiResponses),
+            ("openai-generic", ModelWire::OpenAiChatCompat),
+            ("xai", ModelWire::OpenAiChatCompat),
+            ("openai-codex", ModelWire::OpenAiResponses),
+        ] {
+            assert_eq!(
+                agent_config_wire(Some(id), None),
+                Ok(Some(expected)),
+                "{id}"
+            );
+        }
+
+        // The DR-0064 floor, declared on the endpoint that needs it.
+        assert_eq!(
+            agent_config_wire(Some("openai-generic"), Some("coerced-tools")),
+            Ok(Some(ModelWire::CoercedTools))
+        );
+
+        // Codex builds its own request and never consults a wire, so a
+        // declaration would be read and discarded. Refused only when present.
+        let error = agent_config_wire(Some("openai-codex"), Some("openai-responses"))
+            .expect_err("a declaration that would do nothing is refused");
+        assert!(error.contains("takes no `wire` declaration"), "{error}");
+        for blank in [None, Some(""), Some("   ")] {
+            assert_eq!(
+                agent_config_wire(Some("openai-codex"), blank),
+                Ok(Some(ModelWire::OpenAiResponses)),
+                "an absent declaration is not a declaration"
+            );
+        }
+
+        // An identity this door does not know is `None`, not a guess and not a
+        // refusal: a host may front more than these.
+        assert_eq!(
+            agent_config_wire(Some("cloudflare-ai-gateway"), None),
+            Ok(None)
+        );
+        assert_eq!(agent_config_wire(None, None), Ok(None));
+
+        // The surface rule still applies through this door.
+        assert!(agent_config_wire(Some("anthropic"), Some("coerced-tools")).is_err());
+    }
+
+    /// A declared wire is believed, a crossed one is refused, and a merely
+    /// WORSE one is not.
+    ///
+    /// The distinction is the whole point of the check. `coerced-tools` on a
+    /// provider that has native tool calling is a deliberate downgrade and
+    /// DR-0064 admits it in as many words. A wire from the other surface is not
+    /// a downgrade: the wire picks the URL path and the credential header, so
+    /// the request cannot be sent at all. Refusing at the binding says which
+    /// pairing is wrong; the provider answers it with a 4xx naming something
+    /// else, which is how the sniff this replaced went wrong in production.
+    #[test]
+    fn a_wire_from_another_surface_is_refused_and_a_worse_one_is_not() {
+        let resolve = ModelWire::declared_or_provider_default;
+
+        // Absent, empty, and whitespace all mean "the identity's default".
+        for declared in [None, Some(""), Some("   ")] {
+            assert_eq!(
+                resolve(declared, CoerceProvider::Anthropic),
+                Ok(ModelWire::AnthropicMessages)
+            );
+            assert_eq!(
+                resolve(declared, CoerceProvider::OpenAi),
+                Ok(ModelWire::OpenAiResponses)
+            );
+        }
+
+        // Declared wins over the default, including the DR-0064 floor on an
+        // endpoint whose identity would otherwise imply a native dialect.
+        assert_eq!(
+            resolve(Some("coerced-tools"), CoerceProvider::OpenAiCompat),
+            Ok(ModelWire::CoercedTools)
+        );
+        assert_eq!(
+            resolve(Some("coerced-tools"), CoerceProvider::OpenAi),
+            Ok(ModelWire::CoercedTools),
+            "a worse turn is a choice a host is allowed to make"
+        );
+        assert_eq!(
+            resolve(Some("openai-chat-compat"), CoerceProvider::OpenAi),
+            Ok(ModelWire::OpenAiChatCompat)
+        );
+
+        // Crossed surfaces, in both directions, including the floor -- which
+        // rides chat completions and so is an OpenAI dialect, not a universal
+        // one.
+        for wire in ["openai-responses", "openai-chat-compat", "coerced-tools"] {
+            let error = resolve(Some(wire), CoerceProvider::Anthropic)
+                .expect_err("an OpenAI dialect cannot be sent to the Anthropic surface");
+            assert!(
+                error.contains("provider `anthropic` speaks the Anthropic Messages surface")
+                    && error.contains(&format!("model wire `{wire}` is a OpenAI dialect"))
+                    && error.contains("cannot be sent"),
+                "{error}"
+            );
+        }
+        for provider in [
+            CoerceProvider::OpenAi,
+            CoerceProvider::OpenAiCompat,
+            CoerceProvider::Xai,
+        ] {
+            let error = resolve(Some("anthropic-messages"), provider)
+                .expect_err("the Anthropic dialect cannot be sent to an OpenAI surface");
+            assert!(
+                error.contains(&format!(
+                    "provider `{}` speaks the OpenAI surface",
+                    provider.as_str()
+                )) && error.contains("`anthropic-messages` is a Anthropic Messages dialect"),
+                "{error}"
+            );
+        }
+
+        // An unknown name names the vocabulary rather than falling back.
+        let error = resolve(Some("openai-realtime"), CoerceProvider::OpenAi)
+            .expect_err("an unknown wire is refused, never defaulted");
+        assert!(
+            error.contains("unknown model wire `openai-realtime`"),
+            "{error}"
+        );
+        for &wire in ModelWire::ALL {
+            assert!(
+                error.contains(&format!("`{}`", wire.as_str())),
+                "the refusal must name {}: {error}",
+                wire.as_str()
+            );
+        }
+    }
+
     /// The dialect a provider identity implies, and the round trip through its
     /// declared name. A name that does not round-trip is a name a host could
     /// write into a policy envelope and a runtime would then refuse to read.
     #[test]
     fn every_wire_round_trips_through_its_declared_name() {
-        for wire in [
-            ModelWire::AnthropicMessages,
-            ModelWire::OpenAiResponses,
-            ModelWire::OpenAiChatCompat,
-            ModelWire::CoercedTools,
-        ] {
+        for &wire in ModelWire::ALL {
             assert_eq!(ModelWire::parse(wire.as_str()), Some(wire));
         }
         assert_eq!(ModelWire::parse("openai-realtime"), None);

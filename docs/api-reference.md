@@ -1755,7 +1755,13 @@ resolved credentials to whip in the profiles of the providers. The
 writes. The file maps the name of a profile to a set of values. The name of the
 profile is the declared `profile` of the agent, and `default` is the value for
 each other profile. The values are
-`{ provider, model, api_key | api_key_env, base_url?, max_tokens?, timeout_secs? }`.
+`{ provider, model, api_key | api_key_env, base_url?, max_tokens?, timeout_secs?, wire? }`.
+`provider` says who pays and how the credential resolves; `wire` names the
+request dialect, and is omitted unless the endpoint needs one other than the
+provider's usual. A local endpoint that serves no native function calling needs
+`"wire": "coerced-tools"`, or its first tool call fails. The equivalent for the
+environment door is `WHIPPLESCRIPT_HARNESS_WIRE`. See
+[Providers](providers.md#when-the-endpoint-has-no-tool-vocabulary).
 When an entry matches, an owned turn uses the entry, and whip acquires no
 credential. The sequence of the resolver above then becomes the fallback for a
 standalone whip. An entry that a person configured but that is broken fails the

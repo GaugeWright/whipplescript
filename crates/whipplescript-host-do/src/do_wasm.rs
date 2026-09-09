@@ -848,21 +848,14 @@ fn parse_coerce_config(json: &str) -> Result<ResolvedCoercionConfig, String> {
 fn parse_agent_config(json: &str) -> Result<MessagesApiClient, String> {
     let value: serde_json::Value = serde_json::from_str(json).map_err(|error| error.to_string())?;
     let provider_id = value.get("provider").and_then(serde_json::Value::as_str);
-    let wire = match provider_id {
-        Some("anthropic") => ModelWire::AnthropicMessages,
-        Some("openai") => ModelWire::OpenAiResponses,
-        Some("openai-generic") => ModelWire::OpenAiChatCompat,
-        Some("xai") => ModelWire::OpenAiChatCompat,
-        Some("openai-codex") => ModelWire::OpenAiResponses,
-        // Same reasoning as the coerce parser above: distinct as an id because
-        // the id is what says who pays. A declared wire is believed over the
-        // surface, because it is the one that was checked before publication.
-        Some("cloudflare-ai-gateway") => crate::host_projection::declared_or_inferred_wire(
-            value.get("wire").and_then(serde_json::Value::as_str),
-            value.get("base_url").and_then(serde_json::Value::as_str),
-        )?,
-        other => return Err(format!("unknown agent provider: {other:?}")),
-    };
+    // The decision itself lives in `host_projection`, which compiles on the
+    // host: this module is wasm32-only, and a refusal here could be reached by
+    // no test the gate runs.
+    let wire = crate::host_projection::agent_config_wire(
+        provider_id,
+        value.get("wire").and_then(serde_json::Value::as_str),
+        value.get("base_url").and_then(serde_json::Value::as_str),
+    )?;
     let field = |name: &str| {
         value
             .get(name)

@@ -38,6 +38,19 @@ pub enum CoerceProvider {
 }
 
 impl CoerceProvider {
+    /// The identity's canonical config name -- the word an operator writes in
+    /// a provider profile, a `whip auth` entry, or a DO provider config, and so
+    /// the word a refusal must say back to them. Exhaustive rather than a
+    /// wildcard: a new backend has to name itself here.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CoerceProvider::OpenAi => "openai",
+            CoerceProvider::OpenAiCompat => "openai-generic",
+            CoerceProvider::Anthropic => "anthropic",
+            CoerceProvider::Xai => "xai",
+        }
+    }
+
     /// Default API base URL (overridable for the Codex backend or a mock).
     pub fn default_base_url(self) -> &'static str {
         match self {

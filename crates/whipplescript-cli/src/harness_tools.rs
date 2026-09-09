@@ -28,7 +28,7 @@ use whipplescript_kernel::harness_loop::{
     BrokeredTurnInput, ChatMessage, HarnessModelClient, HarnessModelError, HttpModelClient,
     MediaInput, ModelReply, ToolCall, ToolExecutor, ToolOutcome, ToolSpec, ToolStatus,
 };
-use whipplescript_kernel::harness_model::RealHarnessModelClient;
+use whipplescript_kernel::harness_model::{ModelWire, RealHarnessModelClient};
 use whipplescript_kernel::host_package::{edits_argument, read_line_window, slice_lines};
 use whipplescript_kernel::sansio::{HostDriver, IoRequest, IoResult};
 use whipplescript_kernel::whip_shell::{ShellFile, ShellRequest, WhipShell};
@@ -4696,7 +4696,12 @@ fn required_capabilities_from_json(
 /// Resolved configuration for the live owned-harness model client. Mirrors the
 /// coerce knobs but in the independent `WHIPPLESCRIPT_HARNESS_*` namespace.
 struct HarnessModelConfig {
-    provider: CoerceProvider,
+    /// The request dialect (DR-0064), which the binding may DECLARE rather than
+    /// inherit from the payer identity. An `openai-generic` endpoint without
+    /// native tool calling -- the local models `docs/providers.md` shows -- can
+    /// only drive the loop on `coerced-tools`, and until this field existed no
+    /// native door could ask for it.
+    wire: ModelWire,
     api_key: String,
     model: String,
     base_url: String,
@@ -4777,7 +4782,10 @@ fn profile_config_from_value(
         return Err(format!("provider profile `{name}` needs a `model`"));
     };
     Ok(Some(HarnessModelConfig {
-        provider,
+        wire: ModelWire::declared_or_provider_default(
+            entry.get("wire").and_then(Value::as_str),
+            provider,
+        )?,
         api_key,
         model: model.to_owned(),
         base_url: entry
@@ -4843,8 +4851,9 @@ fn resolve_harness_model_config() -> Result<Option<HarnessModelConfig>, String> 
             .and_then(|value| value.parse().ok())
             .unwrap_or(120),
     );
+    let declared_wire = std::env::var("WHIPPLESCRIPT_HARNESS_WIRE").ok();
     Ok(Some(HarnessModelConfig {
-        provider,
+        wire: ModelWire::declared_or_provider_default(declared_wire.as_deref(), provider)?,
         api_key,
         model,
         base_url,
@@ -5260,7 +5269,7 @@ pub fn run_owned_agent_turn(
             let transport = UreqCoerceTransport::new(config.timeout);
             let client = RealHarnessModelClient::new(
                 &transport,
-                config.provider,
+                config.wire,
                 config.api_key,
                 config.model,
                 config.base_url,
@@ -5390,7 +5399,7 @@ mod tests {
         let config = profile_config_from_value(&document, Some("repo-writer"))
             .expect("valid entry")
             .expect("profile entry");
-        assert!(matches!(config.provider, CoerceProvider::Anthropic));
+        assert_eq!(config.wire, ModelWire::AnthropicMessages);
         assert_eq!(config.api_key, "host-resolved-key");
         assert_eq!(config.model, "claude-sonnet-5");
         assert_eq!(config.max_tokens, 2048);
@@ -5455,7 +5464,7 @@ mod tests {
         let config = profile_config_from_value(&document, None)
             .expect("valid entry")
             .expect("profile entry");
-        assert!(matches!(config.provider, CoerceProvider::OpenAiCompat));
+        assert_eq!(config.wire, ModelWire::OpenAiChatCompat);
         assert_eq!(config.base_url, "http://localhost:11434/v1");
         // With base_url omitted, the (fixed) OpenAiCompat default carries `/v1`.
         let defaulted = serde_json::json!({
@@ -5465,6 +5474,109 @@ mod tests {
             .expect("valid")
             .expect("entry");
         assert_eq!(config.base_url, "https://api.openai.com/v1");
+    }
+
+    /// A profile entry missing the fields an owned turn cannot invent is
+    /// refused, and says which one.
+    ///
+    /// The host writes this file, so a typo here is a turn that would otherwise
+    /// fail somewhere downstream with a message about something else. Found
+    /// unexercised by the refusal sweep when a neighbouring change pulled it
+    /// into scope.
+    #[test]
+    fn a_provider_profile_missing_a_required_field_is_refused() {
+        let entry = |extra: serde_json::Value| {
+            let mut default = serde_json::json!({"provider": "openai-generic"});
+            for (key, value) in extra.as_object().expect("object") {
+                default[key] = value.clone();
+            }
+            serde_json::json!({ "default": default })
+        };
+
+        let error =
+            match profile_config_from_value(&entry(serde_json::json!({"api_key": "k"})), None) {
+                Err(error) => error,
+                Ok(_) => panic!("an entry with no model must be refused"),
+            };
+        assert!(error.contains("needs a `model`"), "{error}");
+
+        let error = match profile_config_from_value(&entry(serde_json::json!({"model": "m"})), None)
+        {
+            Err(error) => error,
+            Ok(_) => panic!("an entry with no resolvable credential must be refused"),
+        };
+        assert!(error.contains("no resolvable credential"), "{error}");
+
+        // Both present is admitted, so the refusals above are about the missing
+        // field rather than the shape as a whole.
+        profile_config_from_value(
+            &entry(serde_json::json!({"model": "m", "api_key": "k"})),
+            None,
+        )
+        .expect("a complete entry is admitted")
+        .expect("profile entry");
+    }
+
+    /// Both native doors carry a DECLARED wire, not just the identity's
+    /// default.
+    ///
+    /// The wiring checklist in `spec/std-coercion.md` is explicit that a
+    /// dialect the kernel speaks must be reachable through every config door or
+    /// it is code-complete and unusable -- `openai-generic` shipped exactly that
+    /// way once. `coerced-tools` was in that state for the whole native side:
+    /// the client could speak it and no config could ask for it, which is the
+    /// dialect DR-0064 admits for precisely the local endpoints
+    /// `docs/providers.md` tells people to point the owned harness at.
+    #[test]
+    fn both_native_doors_carry_a_declared_wire() {
+        let document = serde_json::json!({
+            "default": {
+                "provider": "openai-generic",
+                "model": "llama3.1:8b",
+                "api_key": "k",
+                "base_url": "http://localhost:11434/v1",
+                "wire": "coerced-tools",
+            }
+        });
+        let config = profile_config_from_value(&document, None)
+            .expect("valid entry")
+            .expect("profile entry");
+        assert_eq!(
+            config.wire,
+            ModelWire::CoercedTools,
+            "the profiles file must be able to ask for the floor"
+        );
+
+        // A crossed pairing is refused at the door rather than sent.
+        let crossed = serde_json::json!({
+            "default": {
+                "provider": "anthropic",
+                "model": "claude-sonnet-5",
+                "api_key": "k",
+                "wire": "coerced-tools",
+            }
+        });
+        // Matched rather than `expect_err`, which would need `Debug` on a
+        // config holding a resolved API key -- a panic message is not a place
+        // to print one.
+        let error = match profile_config_from_value(&crossed, None) {
+            Err(error) => error,
+            Ok(_) => panic!("a crossed pairing must be refused at the door"),
+        };
+        assert!(error.contains("cannot be sent"), "{error}");
+
+        // The default is still the identity's, so an entry that declares
+        // nothing is unchanged.
+        let plain = serde_json::json!({
+            "default": {"provider": "anthropic", "model": "claude-sonnet-5", "api_key": "k"}
+        });
+        assert_eq!(
+            profile_config_from_value(&plain, None)
+                .expect("valid")
+                .expect("entry")
+                .wire,
+            ModelWire::AnthropicMessages
+        );
     }
 
     #[test]
@@ -5482,7 +5594,7 @@ mod tests {
         let config = profile_config_from_value(&document, None)
             .expect("valid entry")
             .expect("profile entry");
-        assert!(matches!(config.provider, CoerceProvider::Xai));
+        assert_eq!(config.wire, ModelWire::OpenAiChatCompat);
         assert_eq!(config.base_url, "https://api.x.ai/v1");
     }
 

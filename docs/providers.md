@@ -555,6 +555,44 @@ quality of the use of a tool follows the model. A small local model uses a tool
 poorly. But the path on the wire is identical to the path of a hosted model that
 is compatible with OpenAI.
 
+### When the endpoint has no tool vocabulary
+
+Many local models serve no native function calling at all. Such an endpoint
+refuses the `tools` array outright, so the loop above never starts. Declare the
+`wire` for that binding and the tools travel as structured output instead:
+
+```json
+{
+  "default": {
+    "provider": "openai-generic",
+    "model": "llama3.1:8b",
+    "base_url": "http://localhost:11434/v1",
+    "api_key_env": "OPENAI_API_KEY",
+    "wire": "coerced-tools"
+  }
+}
+```
+
+`wire` names the request dialect, which is a separate thing from `provider`:
+the provider says who pays and how the credential resolves, the wire says what
+shape the request takes. The four dialects are `anthropic-messages`,
+`openai-responses`, `openai-chat-compat` and `coerced-tools`. Omit the field and
+the provider's usual dialect is used, which is what every binding did before the
+field existed.
+
+`coerced-tools` asks the model for a JSON object naming the tool it wants, and
+whip reads the call back out and runs it under the same lease, policy and
+capability gate as a native one. Nothing about brokering changes. What changes
+is that the request is off the format the model was trained on, so tool
+selection is measurably weaker. It is the floor that makes a model usable, not a
+setting to reach for on a model whose endpoint calls tools natively.
+
+The same field is read in a provider profile, in `WHIPPLESCRIPT_HARNESS_WIRE`,
+and in a Durable Object provider config. A dialect crossed with a provider from
+another surface is refused when the config is read, rather than sent: the wire
+picks the request path and the credential header, so `anthropic-messages` on an
+OpenAI provider is not a worse turn but an unsendable one.
+
 > **On the host of a Durable Object**, an outbound call to a model must use
 > HTTPS. The loopback interface is the exception. A hosted compatible endpoint
 > such as OpenRouter or Together operates with no change. The host refuses a

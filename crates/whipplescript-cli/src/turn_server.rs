@@ -29,7 +29,6 @@ use std::sync::{Mutex, OnceLock};
 use serde_json::{json, Value};
 use sha1::{Digest, Sha1};
 
-use whipplescript_kernel::coerce_native::CoerceProvider;
 use whipplescript_kernel::harness_loop::{
     compactor_for_strategy, run_brokered_turn_http, BrokeredTurnInput, BrokeredTurnOutcome,
     ImageBlock, MediaInput, TurnStatus,
@@ -486,21 +485,26 @@ pub fn run_turn_in_workspace(
             None,
         );
     }
-    let coerce_provider = match provider_name {
-        "anthropic" => CoerceProvider::Anthropic,
-        "openai" | "openai-codex" => CoerceProvider::OpenAi,
-        "openai-generic" => CoerceProvider::OpenAiCompat,
-        "xai" => CoerceProvider::Xai,
-        other => {
-            return BrokeredTurnOutcome {
-                status: TurnStatus::Failed,
-                summary: format!("unknown provider `{other}`"),
-                steps: 0,
-                observations: Vec::new(),
-                usage: json!({"input_tokens": 0, "output_tokens": 0}),
-                last_input_tokens: 0,
-            }
-        }
+    let refused = |summary: String| BrokeredTurnOutcome {
+        status: TurnStatus::Failed,
+        summary,
+        steps: 0,
+        observations: Vec::new(),
+        usage: json!({"input_tokens": 0, "output_tokens": 0}),
+        last_input_tokens: 0,
+    };
+    // The container is handed the DO's provider object VERBATIM, so a `wire`
+    // the binding declared arrives here intact -- and was read by nothing,
+    // which made the declaration a property of the config that stopped being
+    // true at the hop. Same kernel door the Durable Object reads, so the two
+    // cannot disagree about the dialect for one binding.
+    let wire = match whipplescript_kernel::harness_model::agent_config_wire(
+        Some(provider_name),
+        provider.get("wire").and_then(Value::as_str),
+    ) {
+        Ok(Some(wire)) => wire,
+        Ok(None) => return refused(format!("unknown provider `{provider_name}`")),
+        Err(message) => return refused(message),
     };
     let field = |name: &str| {
         provider
@@ -543,7 +547,7 @@ pub fn run_turn_in_workspace(
     }
     let client = RealHarnessModelClient::new(
         &transport,
-        coerce_provider,
+        wire,
         field("api_key"),
         field("model"),
         field("base_url"),

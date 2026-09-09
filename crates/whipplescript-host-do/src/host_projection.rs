@@ -442,6 +442,33 @@ pub fn declared_or_inferred_wire(
     })
 }
 
+/// The wire for one agent-model config on THIS host.
+///
+/// The shared decision -- declared beats default, an unknown name is refused,
+/// a crossed surface is refused, codex takes no declaration -- belongs to the
+/// kernel, which both hosts share. What this host adds is the one identity only
+/// it fronts: the metered gateway is a single provider id over several
+/// surfaces, so an undeclared wire is recovered from the admitted base URL.
+///
+/// It lives here rather than at the `wasm_bindgen` boundary because that module
+/// is wasm32-only, and a refusal no host test can reach is a refusal no gate
+/// can measure.
+pub fn agent_config_wire(
+    provider_id: Option<&str>,
+    declared: Option<&str>,
+    base_url: Option<&str>,
+) -> Result<ModelWire, String> {
+    if let Some(wire) =
+        whipplescript_kernel::harness_model::agent_config_wire(provider_id, declared)?
+    {
+        return Ok(wire);
+    }
+    match provider_id {
+        Some("cloudflare-ai-gateway") => declared_or_inferred_wire(declared, base_url),
+        other => Err(format!("unknown agent provider: {other:?}")),
+    }
+}
+
 fn project_usage(
     metadata_json: &str,
     usage_ref: &str,
@@ -740,6 +767,78 @@ mod tests {
             )),
             Some(ModelWire::OpenAiChatCompat)
         );
+    }
+
+    /// Every agent provider identity now reads a declared wire, and the one
+    /// that cannot use one refuses it.
+    ///
+    /// Five of the six used to hard-map identity to dialect and discard the
+    /// field: only the gateway read it. The `openai-generic` case below is the
+    /// one that was broken in practice -- a local endpoint without native tool
+    /// calling is exactly what DR-0064 admits `coerced-tools` for, and it was
+    /// unreachable, so the turn went out on the chat-completions wire carrying a
+    /// `tools[]` array the endpoint refuses.
+    #[test]
+    fn an_agent_config_reads_its_declared_wire_and_codex_refuses_one() {
+        // The identity's default, unchanged from the hard map this replaced.
+        for (provider, expected) in [
+            ("anthropic", ModelWire::AnthropicMessages),
+            ("openai", ModelWire::OpenAiResponses),
+            ("openai-generic", ModelWire::OpenAiChatCompat),
+            ("xai", ModelWire::OpenAiChatCompat),
+            ("openai-codex", ModelWire::OpenAiResponses),
+        ] {
+            assert_eq!(
+                agent_config_wire(Some(provider), None, None),
+                Ok(expected),
+                "{provider} default"
+            );
+        }
+
+        // The case this exists for: the floor, declared on the endpoint that
+        // needs it.
+        assert_eq!(
+            agent_config_wire(Some("openai-generic"), Some("coerced-tools"), None),
+            Ok(ModelWire::CoercedTools)
+        );
+
+        // A crossed surface is refused rather than sent.
+        let error = agent_config_wire(Some("anthropic"), Some("coerced-tools"), None)
+            .expect_err("an OpenAI dialect cannot be sent to the Anthropic surface");
+        assert!(error.contains("cannot be sent"), "{error}");
+
+        // Codex carries its own request shape, so a declaration would be read
+        // and thrown away. Refused, and only when actually present.
+        let error = agent_config_wire(Some("openai-codex"), Some("openai-responses"), None)
+            .expect_err("a field that would do nothing is refused");
+        assert!(error.contains("takes no `wire` declaration"), "{error}");
+        for blank in [None, Some(""), Some("   ")] {
+            assert_eq!(
+                agent_config_wire(Some("openai-codex"), blank, None),
+                Ok(ModelWire::OpenAiResponses),
+                "an absent declaration is not a declaration"
+            );
+        }
+
+        // The gateway keeps its surface inference, and still prefers a
+        // declaration over it.
+        let compat = "https://gateway.ai.cloudflare.com/v1/abc/gw/compat";
+        assert_eq!(
+            agent_config_wire(Some("cloudflare-ai-gateway"), None, Some(compat)),
+            Ok(ModelWire::OpenAiChatCompat)
+        );
+        assert_eq!(
+            agent_config_wire(
+                Some("cloudflare-ai-gateway"),
+                Some("coerced-tools"),
+                Some(compat)
+            ),
+            Ok(ModelWire::CoercedTools)
+        );
+
+        let error = agent_config_wire(Some("openai-realtime"), None, None)
+            .expect_err("an unknown identity is refused");
+        assert!(error.contains("unknown agent provider"), "{error}");
     }
 
     /// A declared wire is believed; an undeclared one falls back to the surface;
