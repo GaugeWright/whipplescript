@@ -74,9 +74,31 @@ impl<B: Branches, C: ContentBlobs> FileStore for SaveFiles<B, C> {
         result
     }
 }
+fn input_version(binding: &VersionedSaveBinding, enveloped: bool) -> String {
+    if enveloped {
+        whipplescript_store::stable_hash_hex(
+            &json!({
+                "scope": "fixture-input-authority",
+                "label": binding.input_label,
+                "content": binding.draft,
+            })
+            .to_string(),
+        )
+    } else {
+        binding.draft_hash.clone()
+    }
+}
+fn target_selector(binding: &VersionedSaveBinding, enveloped: bool) -> String {
+    if enveloped {
+        json!(["fixture-target", binding.branch_id, binding.path]).to_string()
+    } else {
+        format!("{}:{}", binding.branch_id, binding.path)
+    }
+}
 struct BoundAuthority<'a> {
     proof: FixtureAuthority,
     binding: &'a VersionedSaveBinding,
+    enveloped: bool,
 }
 impl ActionExecutionVerifier for BoundAuthority<'_> {
     fn authenticate(
@@ -93,9 +115,14 @@ impl ActionExecutionVerifier for BoundAuthority<'_> {
         original: &HostActionCommand,
         effect: &ClaimableEffect,
     ) -> Result<(), ProtocolError> {
-        self.proof.authorize(request, original, effect)?;
+        if self.proof.revoked.get()
+            || request.provenance.initiator != original.provenance.initiator
+            || !matches!(effect.kind.as_str(), "file.read" | "file.write")
+        {
+            return Err(ProtocolError::Mismatch("fixture current execution ceiling"));
+        }
         let target = &original.resources["target"];
-        let expected_selector = format!("{}:{}", self.binding.branch_id, self.binding.path);
+        let expected_selector = target_selector(self.binding, self.enveloped);
         let input: Value = serde_json::from_str(&effect.input_json).expect("effect input");
         let expected_path = if effect.kind == "file.read" {
             ("/action/input", "content")
@@ -108,7 +135,7 @@ impl ActionExecutionVerifier for BoundAuthority<'_> {
                     version_ref: self.binding.base_cut_id.clone(),
                 })
             || target.label_ref != self.binding.evidence_label
-            || original.inputs["content"].version_ref != self.binding.draft_hash
+            || original.inputs["content"].version_ref != input_version(self.binding, self.enveloped)
             || original.inputs["content"].label_ref != self.binding.input_label
             || request.provenance.executor != self.binding.executing_principal
             || input["root"] != expected_path.0
@@ -190,7 +217,8 @@ fn run<S, B, C>(
         evidence_label: "private".into(),
         recorded_at: "2026-09-06T00:00:00Z".into(),
     };
-    let source = if codec == "reference" {
+    let enveloped = codec == "enveloped-reference";
+    let source = if codec != "text" {
         SOURCE
             .replace("read text", "read reference")
             .replace("write text", "write reference")
@@ -222,7 +250,7 @@ fn run<S, B, C>(
             "content".into(),
             ActionInput {
                 handle: "admitted_input".into(),
-                version_ref: binding.draft_hash.clone(),
+                version_ref: input_version(&binding, enveloped),
                 label_ref: binding.input_label.clone(),
             },
         )]),
@@ -232,7 +260,7 @@ fn run<S, B, C>(
                 resource: ResourceRef {
                     handle: "admitted_target".into(),
                     kind: "file_store".into(),
-                    selector: Some(format!("{}:{}", binding.branch_id, binding.path)),
+                    selector: Some(target_selector(&binding, enveloped)),
                     writable: Some(true),
                 },
                 basis: ActionBasis::Version {
@@ -242,6 +270,13 @@ fn run<S, B, C>(
             },
         )]),
     };
+    if enveloped {
+        assert_ne!(command.inputs["content"].version_ref, binding.draft_hash);
+        assert_ne!(
+            command.resources["target"].resource.selector,
+            Some(format!("{}:{}", binding.branch_id, binding.path)),
+        );
+    }
     let admission = facade
         .admit_action(
             command.clone(),
@@ -303,12 +338,28 @@ fn run<S, B, C>(
             let verifier = BoundAuthority {
                 proof: authority(request.signing_bytes().expect("sign")),
                 binding: &binding,
+                enveloped,
             };
+            verifier
+                .authenticate(
+                    &request,
+                    &request.signing_bytes().expect("execution signing bytes"),
+                    b"execution",
+                )
+                .expect("authenticate before current permission changes");
+            verifier.proof.revoked.set(true);
+            assert_eq!(
+                verifier.authorize(&request, &command, &effect),
+                Err(ProtocolError::Mismatch("fixture current execution ceiling")),
+                "revocation between authentication and authorization must refuse",
+            );
+            verifier.proof.revoked.set(false);
             let mut wrong = binding.clone();
             wrong.path = "other.txt".into();
             let wrong_verifier = BoundAuthority {
                 proof: authority(request.signing_bytes().expect("sign")),
                 binding: &wrong,
+                enveloped,
             };
             assert!(
                 facade
@@ -323,7 +374,7 @@ fn run<S, B, C>(
                 "authority must bind the actual target descriptor"
             );
             if effect.kind == "file.write" {
-                if codec == "reference" {
+                if codec != "text" {
                     let input: Value = serde_json::from_str(&effect.input_json).expect("input");
                     assert_eq!(input["body_ref"]["content_hash"], binding.draft_hash);
                     assert_eq!(input["body_ref"]["label_ref"], binding.input_label);
@@ -400,7 +451,7 @@ fn run<S, B, C>(
         }
     }
     let write_deadline = write_deadline.expect("write has a bounded recorded lease");
-    if codec == "reference" {
+    if codec != "text" {
         for event in &events {
             assert!(
                 !event.payload_json.contains(BODY),
@@ -571,6 +622,7 @@ fn run<S, B, C>(
     let verifier = BoundAuthority {
         proof: authority(request.signing_bytes().expect("sign")),
         binding: &binding,
+        enveloped,
     };
     assert!(facade
         .execute_action_file_effect(request, &action, &verifier, b"execution", &files)
@@ -668,7 +720,7 @@ fn run<S, B, C>(
             },
             |attempt| attempt.effect_id.clone(),
         ),
-        &command.provenance,
+        &command,
         mode,
     );
     assert_eq!(files.calls.get(), 1, "reconciliation never writes");
@@ -676,7 +728,7 @@ fn run<S, B, C>(
 
 #[test]
 fn admitted_versioned_save_survives_target_commit_and_retains_conflicts_on_both_hosts() {
-    for codec in ["text", "reference"] {
+    for codec in ["text", "reference", "enveloped-reference"] {
         for actor in ["person:one", "agent:one"] {
             for mode in ["saved", "conflict", "interrupted", "failed-after-apply"] {
                 let dir = std::env::temp_dir().join(format!(

@@ -691,7 +691,9 @@ describe("real WorkflowInstance hibernation", () => {
       request_id: "turn-stop",
       text: "start",
     }));
-    await vi.waitFor(() => expect(providerFetch).toHaveBeenCalledOnce());
+    // workerd must resume this wait in the test's I/O context. Allow startup
+    // the enclosing test's budget instead of waitFor's one-second default.
+    await vi.waitFor(() => expect(providerFetch).toHaveBeenCalledOnce(), { timeout: 5_000 });
     socket.send(JSON.stringify({ type: "stop", request_id: "turn-stop" }));
 
     const observed: Record<string, unknown>[] = [];

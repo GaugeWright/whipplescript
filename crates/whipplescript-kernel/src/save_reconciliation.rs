@@ -10,7 +10,9 @@ use whipplescript_store::vcs::WorkspaceVcs;
 use whipplescript_store::vcs_file_save::{read_committed_save, SaveAttempt, SaveResultBinding};
 
 use crate::host_facade::HostFacadeError;
-use crate::host_protocol::action::{ActionAdmissionReceipt, HostActionCommand};
+use crate::host_protocol::action::{
+    ActionAdmissionReceipt, ActionBasis, ActionInput, ActionResource, HostActionCommand,
+};
 use crate::host_protocol::execution::ExecuteActionEffect;
 use crate::host_protocol::recovery::{EffectEvidenceVerifier, ReconcileEffectCommand};
 use crate::host_protocol::ProtocolError;
@@ -40,7 +42,11 @@ pub trait SaveReconciliationAuthority {
 
     /// Authorize current reconciliation and receipt access (including the
     /// evidence label, target authority and store binding) within the original
-    /// command's ceiling. Original admission or execution is not current access.
+    /// command's ceiling. Resolve the original opaque selector to the actual
+    /// branch/path and its immutable input version to `binding.draft_hash`; an
+    /// input version may identify a labeled envelope rather than its raw bytes.
+    /// Verify these exact mappings before target content is read. Original
+    /// admission or execution is not current access.
     fn authorize(
         &self,
         command: &ReconcileEffectCommand,
@@ -82,6 +88,56 @@ impl EffectEvidenceVerifier for VerifiedSaveEvidence {
         }
         Ok(())
     }
+}
+
+// The original admission and dispatch have already been verified. This is
+// the runtime-owned ceiling; opaque identity interpretation remains the host's
+// current-authority obligation before any retained target content is read.
+fn require_original_save_ceiling(
+    input: Option<&ActionInput>,
+    target: Option<&ActionResource>,
+    binding: &SaveResultBinding,
+    evidence_ref: &str,
+) -> Result<(), ProtocolError> {
+    let target_matches = target.is_some_and(|target| {
+        target.resource.handle == evidence_ref
+            && target.resource.kind == "file_store"
+            && target.resource.writable == Some(true)
+            && target.label_ref == binding.evidence_label
+            && target.basis
+                == ActionBasis::Version {
+                    version_ref: binding.base_cut_id.clone(),
+                }
+    });
+    if !target_matches || input.is_none() {
+        return Err(ProtocolError::Mismatch(
+            "versioned save original resource and input ceiling",
+        ));
+    }
+    Ok(())
+}
+
+fn require_original_save_execution(
+    execution: &ExecuteActionEffect,
+    original: &HostActionCommand,
+    admission: &ActionAdmissionReceipt,
+    effect_id: &str,
+    executing_principal: &str,
+    fingerprint: &str,
+    recorded_fingerprint: &Value,
+) -> Result<(), ProtocolError> {
+    if execution.admission != *admission
+        || execution.effect_id != effect_id
+        || execution.issuer != original.issuer
+        || execution.scope != original.scope
+        || execution.provenance.executor != executing_principal
+        || recorded_fingerprint != fingerprint
+    {
+        return Err(ProtocolError::Mismatch(
+            "versioned save original executing authority",
+        ));
+    }
+    Ok(())
 }
 
 pub(crate) fn prepare<B: Branches, C: ContentBlobs>(
@@ -141,35 +197,21 @@ pub(crate) fn prepare<B: Branches, C: ContentBlobs>(
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
-    if execution.admission != *source.admission
-        || execution.effect_id != frame.effect_id
-        || execution.issuer != original.issuer
-        || execution.scope != original.scope
-        || execution.provenance.executor != source.binding.executing_principal
-        || payload["metadata"]["action_execution"]["fingerprint"] != fingerprint
-    {
-        return Err(ProtocolError::Mismatch("versioned save original executing authority").into());
-    }
-    let target = original.resources.get(source.resource_name);
-    let input = original.inputs.get(source.input_name);
-    let selector = format!("{}:{}", source.binding.branch_id, source.binding.path);
-    let target_matches = target.is_some_and(|target| {
-        target.resource.handle == command.evidence.evidence_ref
-            && target.resource.kind == "file_store"
-            && target.resource.writable == Some(true)
-            && target.resource.selector.as_deref() == Some(selector.as_str())
-            && target.label_ref == source.binding.evidence_label
-            && target.basis
-                == crate::host_protocol::action::ActionBasis::Version {
-                    version_ref: source.binding.base_cut_id.clone(),
-                }
-    });
-    let input_matches = input.is_some_and(|input| input.version_ref == source.binding.draft_hash);
-    if !target_matches || !input_matches {
-        return Err(
-            ProtocolError::Mismatch("versioned save original resource and input ceiling").into(),
-        );
-    }
+    require_original_save_execution(
+        &execution,
+        &original,
+        source.admission,
+        &frame.effect_id,
+        &source.binding.executing_principal,
+        &fingerprint,
+        &payload["metadata"]["action_execution"]["fingerprint"],
+    )?;
+    require_original_save_ceiling(
+        original.inputs.get(source.input_name),
+        original.resources.get(source.resource_name),
+        source.binding,
+        &command.evidence.evidence_ref,
+    )?;
     authority.authorize(command, &original, &execution, source.binding)?;
     let attempt = SaveAttempt {
         instance_id: frame.instance_id.clone(),
@@ -281,5 +323,121 @@ pub mod conformance {
             Ok(_) => panic!("duplicate start must refuse"),
         };
         assert!(format!("{error:?}").contains("versioned save exact recorded dispatch"));
+    }
+}
+
+#[cfg(test)]
+mod ceiling_tests {
+    use super::*;
+    use crate::host_protocol::ResourceRef;
+
+    #[test]
+    fn original_save_execution_requires_exact_admission_scope_actor_and_fingerprint() {
+        let (execution, original, effect) =
+            crate::host_protocol::execution::tests::fixture("file.write");
+        let fingerprint = "recorded-execution-fingerprint";
+        let recorded = Value::String(fingerprint.into());
+        let check = |request: &ExecuteActionEffect, recorded: &Value| {
+            require_original_save_execution(
+                request,
+                &original,
+                &execution.admission,
+                &effect.effect_id,
+                &execution.provenance.executor,
+                fingerprint,
+                recorded,
+            )
+        };
+        check(&execution, &recorded).expect("exact original executing authority");
+        let expected = ProtocolError::Mismatch("versioned save original executing authority");
+        for field in ["admission", "effect", "issuer", "scope", "executor"] {
+            let mut changed = execution.clone();
+            match field {
+                "admission" => changed.admission.fingerprint.push_str("-other"),
+                "effect" => changed.effect_id.push_str("-other"),
+                "issuer" => changed.issuer.push_str("-other"),
+                "scope" => changed.scope.push_str("-other"),
+                "executor" => changed.provenance.executor.push_str("-other"),
+                _ => unreachable!(),
+            }
+            assert_eq!(check(&changed, &recorded), Err(expected.clone()), "{field}");
+        }
+        for recorded in [Value::Null, Value::String("other-fingerprint".into())] {
+            assert_eq!(check(&execution, &recorded), Err(expected.clone()));
+        }
+    }
+
+    #[test]
+    fn original_save_ceiling_requires_its_input_and_exact_writable_target() {
+        let binding = SaveResultBinding {
+            branch_id: "branch".into(),
+            path: "note.txt".into(),
+            base_cut_id: "base".into(),
+            draft_hash: "raw-draft-hash".into(),
+            executing_principal: "actor".into(),
+            evidence_label: "private".into(),
+        };
+        let input = ActionInput {
+            handle: "admitted_input".into(),
+            version_ref: "labeled-envelope-version".into(),
+            label_ref: "input-private".into(),
+        };
+        let target = ActionResource {
+            resource: ResourceRef {
+                handle: "admitted_target".into(),
+                kind: "file_store".into(),
+                selector: Some(r#"["target", "branch", "note.txt"]"#.into()),
+                writable: Some(true),
+            },
+            basis: ActionBasis::Version {
+                version_ref: "base".into(),
+            },
+            label_ref: "private".into(),
+        };
+        require_original_save_ceiling(Some(&input), Some(&target), &binding, "admitted_target")
+            .expect("opaque input and selector have host-owned interpretations");
+        let expected =
+            ProtocolError::Mismatch("versioned save original resource and input ceiling");
+        assert_eq!(
+            require_original_save_ceiling(None, Some(&target), &binding, "admitted_target"),
+            Err(expected.clone())
+        );
+        assert_eq!(
+            require_original_save_ceiling(Some(&input), None, &binding, "admitted_target"),
+            Err(expected.clone())
+        );
+        for field in [
+            "handle",
+            "kind",
+            "read-only",
+            "unspecified-write",
+            "label",
+            "base",
+        ] {
+            let mut changed = target.clone();
+            match field {
+                "handle" => changed.resource.handle = "other".into(),
+                "kind" => changed.resource.kind = "other".into(),
+                "read-only" => changed.resource.writable = Some(false),
+                "unspecified-write" => changed.resource.writable = None,
+                "label" => changed.label_ref = "other".into(),
+                "base" => {
+                    changed.basis = ActionBasis::Version {
+                        version_ref: "other".into(),
+                    }
+                }
+                _ => unreachable!(),
+            }
+            assert_eq!(
+                require_original_save_ceiling(
+                    Some(&input),
+                    Some(&changed),
+                    &binding,
+                    "admitted_target"
+                ),
+                Err(expected.clone()),
+                "{field}"
+            );
+        }
     }
 }

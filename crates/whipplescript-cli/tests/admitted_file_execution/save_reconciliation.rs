@@ -18,6 +18,9 @@ struct RecoveryAuthority {
     signing: Vec<u8>,
     revoked: Cell<bool>,
     denied: Cell<bool>,
+    input: ActionInput,
+    resource: ActionResource,
+    binding: SaveResultBinding,
 }
 impl SaveReconciliationAuthority for RecoveryAuthority {
     fn authenticate(
@@ -40,6 +43,13 @@ impl SaveReconciliationAuthority for RecoveryAuthority {
     ) -> Result<(), ProtocolError> {
         if self.denied.get()
             || command.provenance.initiator != original.provenance.initiator
+            || original.inputs.get("content") != Some(&self.input)
+            || original.resources.get("target") != Some(&self.resource)
+            || binding.branch_id != self.binding.branch_id
+            || binding.path != self.binding.path
+            || binding.base_cut_id != self.binding.base_cut_id
+            || binding.draft_hash != self.binding.draft_hash
+            || binding.evidence_label != self.binding.evidence_label
             || binding.executing_principal != execution.provenance.executor
         {
             return Err(ProtocolError::Mismatch("fixture current recovery ceiling"));
@@ -54,13 +64,14 @@ pub(super) fn check<S, B, C>(
     binding: &VersionedSaveBinding,
     admission: &ActionAdmissionReceipt,
     effect_id: &str,
-    provenance: &ActionProvenance,
+    original: &HostActionCommand,
     mode: &str,
 ) where
     S: RuntimeStore + LogAppend,
     B: Branches,
     C: ContentBlobs,
 {
+    let provenance = &original.provenance;
     let instance = &admission.instance_ref;
     let before = facade
         .kernel()
@@ -107,6 +118,9 @@ pub(super) fn check<S, B, C>(
         signing: command.signing_bytes().expect("signing"),
         revoked: Cell::new(false),
         denied: Cell::new(false),
+        input: original.inputs["content"].clone(),
+        resource: original.resources["target"].clone(),
+        binding: SaveResultBinding::from(binding),
     };
     let expected_binding = SaveResultBinding::from(binding);
     let source = VersionedSaveEvidenceSource {
@@ -149,6 +163,43 @@ pub(super) fn check<S, B, C>(
             format!("{error:?}").contains(diagnostic),
             "{case}: {error:?}"
         );
+    }
+    for case in ["input-version", "target-selector"] {
+        let mut auth = authority(&command);
+        if case == "input-version" {
+            auth.input.version_ref.push_str("-substituted");
+        } else {
+            auth.resource.resource.selector = Some("substituted".into());
+        }
+        let error = facade
+            .reconcile_versioned_save(command.clone(), epoch, &source, &auth, b"recovery")
+            .expect_err("a host mapping must bind the original admitted identities");
+        assert!(format!("{error:?}").contains("fixture current recovery ceiling"));
+    }
+    for case in ["input", "resource"] {
+        let changed = VersionedSaveEvidenceSource {
+            input_name: if case == "input" {
+                "missing"
+            } else {
+                "content"
+            },
+            resource_name: if case == "resource" {
+                "missing"
+            } else {
+                "target"
+            },
+            ..source
+        };
+        let error = facade
+            .reconcile_versioned_save(
+                command.clone(),
+                epoch,
+                &changed,
+                &authority(&command),
+                b"recovery",
+            )
+            .expect_err("the runtime independently requires both original ceilings");
+        assert!(format!("{error:?}").contains("versioned save original resource and input ceiling"));
     }
     for case in [
         "absence",
