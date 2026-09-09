@@ -17,6 +17,7 @@ import {
   type TestEnv,
 } from "./integration-helpers";
 import { canonicalJson, sha256Hex } from "./private-home-protocol";
+import { canonicalCredentialClassRef } from "./credential-class-ref";
 
 const RELEASE_ID = `sha256:${"a".repeat(64)}`;
 
@@ -36,6 +37,7 @@ async function mintSignedEnvelope(
     bindings?: Record<string, string>;
     resources?: Record<string, unknown>;
     epoch?: number;
+    credentialRef?: string;
   } = {},
 ) {
   const epoch = extra.epoch ?? 1;
@@ -73,7 +75,7 @@ async function mintSignedEnvelope(
     provider_bindings: {
       model: {
         base_url: "https://api.openai.com/v1/responses",
-        credential_ref: "managed-openai",
+        credential_ref: extra.credentialRef ?? "managed-openai",
         model: "gpt-test",
         provider: "openai",
       },
@@ -324,7 +326,8 @@ describe("real WorkflowInstance hibernation", () => {
     resumedSocket.close(1000, "done");
   });
 
-  it("streams one direct-provider image turn with canonical command correlation", async () => {
+  it.each(["legacy", "canonical"])("streams a %s-class direct-provider image turn with canonical command correlation", async (spelling) => {
+    const sessionId = `session-protocol-${spelling}`;
     const providerFetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       // This historical signed-policy fixture names the full Responses path;
       // production AgentRelease builders name the provider origin. The
@@ -351,8 +354,13 @@ describe("real WorkflowInstance hibernation", () => {
     vi.stubGlobal("fetch", providerFetch);
 
     const namespace = (env as unknown as TestEnv).WORKFLOW_INSTANCE;
-    const stub = namespace.get(namespace.idFromName("session-protocol"));
-    await bootstrapSession(stub, "session-protocol");
+    const stub = namespace.get(namespace.idFromName(sessionId));
+    const envelope = await mintSignedEnvelope([], {
+      credentialRef: spelling === "canonical"
+        ? canonicalCredentialClassRef("managed-openai")
+        : "managed-openai",
+    });
+    await bootstrapSession(stub, sessionId, false, undefined, envelope);
     const socket = await openSocket(stub);
     expect(await nextMessage(socket)).toMatchObject({
       type: "session_ready",
@@ -376,11 +384,11 @@ describe("real WorkflowInstance hibernation", () => {
 
     expect(observed.find(({ type }) => type === "message_accepted")).toMatchObject({
       request_id: "turn-1",
-      command_id: "public:session-protocol:turn-1",
+      command_id: `public:${sessionId}:turn-1`,
     });
     expect(observed.find(({ type }) => type === "text_delta")).toMatchObject({
       request_id: "turn-1",
-      command_id: "public:session-protocol:turn-1",
+      command_id: `public:${sessionId}:turn-1`,
       delta: "direct",
     });
     expect(

@@ -1,4 +1,5 @@
 import { MODEL_AUTH_SENTINEL } from "./model-broker.ts";
+import { canonicalCredentialClassRef } from "./credential-class-ref.ts";
 
 export type HostedProvider =
   | "openai"
@@ -157,11 +158,13 @@ export function resolveAdmittedProvider(
 }
 
 /** Bind the deployment's exact public lookup reference after signed-policy
- * admission. The admitted credential id becomes the immutable class
- * constraint; it is never used as a registry fallback. */
+ * admission. The closure's raw registry class must name the admitted id,
+ * either verbatim for legacy releases or in its canonical custody spelling.
+ * Neither spelling is ever used as a registry lookup fallback. */
 export function bindExactPublicCredential(
   binding: ResolvedHostProviderBinding,
   exactCredentialRef: string,
+  credentialClass: string,
 ): ResolvedHostProviderBinding {
   if (
     binding.execution !== "direct" ||
@@ -169,9 +172,16 @@ export function bindExactPublicCredential(
   ) {
     throw new Error("public credential binding requires an exact deployment reference");
   }
+  if (
+    !credentialClass.trim() ||
+    (binding.credential_id !== credentialClass &&
+      binding.credential_id !== canonicalCredentialClassRef(credentialClass))
+  ) {
+    throw new Error("public credential class does not match the signed admission");
+  }
   return {
     ...binding,
     credential_id: exactCredentialRef,
-    credential_class: binding.credential_id,
+    credential_class: credentialClass,
   };
 }

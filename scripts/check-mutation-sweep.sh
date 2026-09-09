@@ -53,6 +53,11 @@ FILTER="$2"
 LIMIT="${3:-0}"
 # Optional 4th argument: confirm only these lines (see --only-lines).
 ONLY_LINES="${4:-}"
+# Set by a caller that already ran the self test for THIS cargo filter in this
+# invocation. Never set it by hand for a one-off sweep: the self test is what
+# tells you the mutator is landing, and a sweep without one reports "nothing
+# unexercised" identically whether that is true or whether no mutation applied.
+SKIP_SELF_TEST="${WHIPPLESCRIPT_SWEEP_SELF_TESTED:-}"
 
 # A sweep leaves the tree mutated if it is killed mid-run, and a stale mutation
 # reads as a broken build rather than an interrupted sweep. Refuse to start on a
@@ -76,6 +81,7 @@ python3 scripts/mutation_sweep.py \
   --target "$TARGET" \
   --filter "$FILTER" \
   --limit "$LIMIT" \
+  ${SKIP_SELF_TEST:+--skip-self-test} \
   --only-lines "$ONLY_LINES" || STATUS=$?
 
 case "$STATUS" in

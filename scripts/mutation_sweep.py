@@ -1264,6 +1264,15 @@ def main() -> int:
         "two-phase shape is that the expensive phase is small.",
     )
     parser.add_argument(
+        "--skip-self-test",
+        action="store_true",
+        help="do not plant and sweep the self test before the real sites. Only "
+        "safe when a self test for THIS cargo filter already ran in the same "
+        "invocation of the caller: the self test proves the mutator lands "
+        "against a crate's build and suite, which is a property of the crate "
+        "rather than of the file, and it costs one full rebuild per plant.",
+    )
+    parser.add_argument(
         "--list-sites",
         action="store_true",
         help="print the refusal sites as `<line>\\t<label>` and exit, mutating "
@@ -1288,10 +1297,20 @@ def main() -> int:
     missing: set[int] = set()
     shutil.copy(target, backup)
     try:
-        print("== self test ==", flush=True)
-        if not self_test(target, args.filter, backup):
-            return 1
-        shutil.copy(backup, target)
+        if args.skip_self_test:
+            # Said out loud, every time. A run that skipped its own bite test
+            # and does not say so is exactly the silent degradation this script
+            # exists to refuse — the caller's claim has to be visible in the
+            # log a reader actually has.
+            print(
+                "== self test SKIPPED (the caller ran one for this filter) ==",
+                flush=True,
+            )
+        else:
+            print("== self test ==", flush=True)
+            if not self_test(target, args.filter, backup):
+                return 1
+            shutil.copy(backup, target)
 
         sites = find_sites(Path(backup).read_text().split("\n"))
         if args.only_lines:

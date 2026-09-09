@@ -72,6 +72,11 @@ several. The manual steps, for reference:
    resolves the exact credential ref admitted by the deployment through the
    `PUBLIC_CREDENTIALS` Durable Object binding and verifies its provider and
    non-secret credential class before replacing the authentication sentinel.
+   The registry class remains raw, as declared in the release closure. Before
+   binding an exact registry reference, the Worker checks that this class equals
+   the signed admission's credential id or derives its exact canonical custody
+   spelling. The canonical spelling belongs to policy resolution; it is never
+   substituted for the raw registry class or used as a fallback lookup.
    There is no static credential map or `OPENAI_API_KEY`/`ANTHROPIC_API_KEY`
    fallback.
 

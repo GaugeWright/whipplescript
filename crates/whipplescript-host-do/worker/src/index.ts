@@ -2824,7 +2824,10 @@ export class WorkflowInstance implements DurableObject {
       },
       package: session.package,
       image_bodies: imageBodies,
-    }, session.credential_ref);
+    }, session.credential_ref ? {
+      ref: session.credential_ref,
+      credentialClass: session.host_policy.credential_class,
+    } : undefined);
     traceBoundary("runtime_turn_complete");
     const turnBody = (await turn.clone().json()) as {
       outcome?: unknown;
@@ -4161,7 +4164,7 @@ export class WorkflowInstance implements DurableObject {
 
   private async beginHostTurn(
     parsed: Record<string, unknown>,
-    exactPublicCredentialRef?: string,
+    publicCredential?: { ref: string; credentialClass: string },
   ): Promise<Response> {
     const request = this.hostCommandRequest(parsed);
     if (request instanceof Response) return request;
@@ -4187,11 +4190,15 @@ export class WorkflowInstance implements DurableObject {
       ) as HostTurnAdmission;
       const admittedBinding = this.resolveAdmittedProvider(
         admission,
-        exactPublicCredentialRef,
+        publicCredential?.ref,
       );
       if (admittedBinding instanceof Response) return admittedBinding;
-      const binding = exactPublicCredentialRef
-        ? bindExactPublicCredential(admittedBinding, exactPublicCredentialRef)
+      const binding = publicCredential
+        ? bindExactPublicCredential(
+          admittedBinding,
+          publicCredential.ref,
+          publicCredential.credentialClass,
+        )
         : admittedBinding;
       // Resolve image bodies only after WhippleScript admits their opaque refs
       // and the corresponding provider capability is available.

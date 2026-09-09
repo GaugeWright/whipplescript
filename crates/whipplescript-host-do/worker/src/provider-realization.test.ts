@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { MODEL_AUTH_SENTINEL } from "./model-broker.ts";
+import { MODEL_AUTH_SENTINEL, performDirectProviderFetch } from "./model-broker.ts";
+import { canonicalCredentialClassRef } from "./credential-class-ref.ts";
 import {
   bindExactPublicCredential,
   type HostTurnAdmission,
@@ -86,6 +87,7 @@ test("public session preserves the signed class while binding the exact deployme
   const resolved = bindExactPublicCredential(
     admitted,
     "credential:deployment:theory-a:openai:v3",
+    admission.credential_id,
   );
   assert.equal(resolved.credential_class, admission.credential_id);
   assert.equal(
@@ -93,7 +95,7 @@ test("public session preserves the signed class while binding the exact deployme
     "credential:deployment:theory-a:openai:v3",
   );
   assert.throws(
-    () => bindExactPublicCredential(admitted, ""),
+    () => bindExactPublicCredential(admitted, "", admission.credential_id),
     /requires an exact deployment reference/,
   );
 });
@@ -179,7 +181,81 @@ test("the gateway is not silently usable as a BYOK direct provider", () => {
         "managed",
       ),
       "credential:public:abc:openai:def",
+      gatewayAdmission.credential_id,
     ),
     /requires an exact deployment reference/,
   );
+});
+
+
+for (const canonical of [false, true]) {
+  test(`public ${canonical ? "canonical" : "legacy"} class reaches the exact registry credential`, async () => {
+    const credentialClass = "openai-api-key";
+    const exactRef = `credential:public:${"a".repeat(64)}:openai:${"b".repeat(32)}`;
+    const admitted = resolveAdmittedProvider({
+      ...admission,
+      credential_id: canonical ? canonicalCredentialClassRef(credentialClass) : credentialClass,
+    }, {}, "direct");
+    const bound = bindExactPublicCredential(admitted, exactRef, credentialClass);
+    const lookups: string[] = [];
+    let fetched = 0;
+    const request = {
+      url: "https://api.openai.com/v1/responses",
+      headers: [["authorization", `Bearer ${MODEL_AUTH_SENTINEL}`]] as [string, string][],
+      body: { model: "gpt-5" },
+    };
+    const fetcher = async (_url: string, init: RequestInit) => {
+      fetched += 1;
+      assert.equal(new Headers(init.headers).get("authorization"), "Bearer synthetic-registry-key");
+      return Response.json({ output: [] });
+    };
+    // The registry retains the raw class; it never returns the signed
+    // envelope's canonical credential reference as a class.
+    const result = await performDirectProviderFetch(request, bound, {
+      resolve: async (ref) => {
+        lookups.push(ref);
+        return { provider: "openai", credential_class: credentialClass, api_key: "synthetic-registry-key" };
+      },
+    }, fetcher);
+    assert.equal(JSON.parse(result).status, 200);
+    assert.deepEqual(lookups, [exactRef]);
+    assert.equal(fetched, 1);
+    assert.equal(bound.credential_class, credentialClass);
+    assert.equal(admitted.credential_id, canonical ? canonicalCredentialClassRef(credentialClass) : credentialClass);
+
+    for (const entry of [
+      { provider: "anthropic", credential_class: credentialClass },
+      { provider: "openai", credential_class: "another-openai-key" },
+      { provider: "openai", credential_class: canonicalCredentialClassRef(credentialClass) },
+    ]) {
+      await assert.rejects(performDirectProviderFetch(request, bound, {
+        resolve: async (ref) => {
+          assert.equal(ref, exactRef);
+          return { ...entry, api_key: "wrong-key" };
+        },
+      }, fetcher), /does not match the admitted provider and class/);
+    }
+    assert.equal(fetched, 1, "mismatched registry metadata must refuse before egress");
+  });
+}
+
+test("public class binding refuses unrelated and empty closure classes", () => {
+  for (const credentialId of ["openai-api-key", canonicalCredentialClassRef("openai-api-key")]) {
+    const admitted = resolveAdmittedProvider({ ...admission, credential_id: credentialId }, {}, "direct");
+    for (const rawClass of ["", " ", "anthropic-api-key", "OPENAI-API-KEY", "openai-api-key "]) {
+      assert.throws(
+        () => bindExactPublicCredential(admitted, "credential:deployment:exact", rawClass),
+        /does not match the signed admission/,
+      );
+    }
+  }
+  // Even a syntactically canonical ref is not authority to substitute a
+  // different class or to treat malformed encoding as equivalent.
+  for (const credentialId of [canonicalCredentialClassRef("anthropic-api-key"), "credential:gaugedesk/class/xyz"]) {
+    const admitted = resolveAdmittedProvider({ ...admission, credential_id: credentialId }, {}, "direct");
+    assert.throws(
+      () => bindExactPublicCredential(admitted, "credential:deployment:exact", "openai-api-key"),
+      /does not match the signed admission/,
+    );
+  }
 });
