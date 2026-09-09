@@ -478,6 +478,7 @@ rule run
 #[test]
 fn coerce_json_schema_maps_types_to_strict_structured_output() {
     let source = r#"
+use std.ingress
 @service
 workflow SchemaShape
 
@@ -821,6 +822,7 @@ rule start
 #[test]
 fn agent_tell_input_json_carries_turn_access_grants() {
     let source = r#"
+use std.files
 workflow OwnedGrantInput
 
 agent coder {

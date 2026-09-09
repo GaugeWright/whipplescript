@@ -375,6 +375,7 @@ fn signal_source_construct_graph_and_lowered_report_for_test() -> (Value, Value)
     // A `signal {}` declaration is a typed schema with no construct-graph node;
     // the `signal_source` node comes from a generic (non-clock) `source` block.
     let source = r#"
+use std.ingress
 @service
 workflow EventIngress
 
@@ -401,6 +402,7 @@ source webhook as deploy_events {
 
 fn clock_source_construct_graph_and_lowered_report_for_test() -> (Value, Value) {
     let source = r#"
+use std.ingress
 @service
 workflow ClockIngress
 

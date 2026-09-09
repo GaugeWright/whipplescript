@@ -22,6 +22,7 @@ fn package_child_start_persists_package_workflow_principal() {
     let store_path = unique_test_path("package-child-authority", "sqlite");
     let program_path = unique_test_path("package-child-authority", "whip");
     let source = r#"
+use std.files
 workflow Tool {
   file store project_files {
     root "."
@@ -230,6 +231,7 @@ fn delegating_child_start_persists_start_grant_narrowed_authority() {
     let store_path = unique_test_path("start-grant-authority", "sqlite");
     let program_path = unique_test_path("start-grant-authority", "whip");
     let source = r#"
+use std.files
 workflow Parent {
   file store project_files {
     root "."
@@ -309,6 +311,7 @@ fn delegating_child_start_without_grant_persists_automatic_cap() {
     let store_path = unique_test_path("automatic-cap-authority", "sqlite");
     let program_path = unique_test_path("automatic-cap-authority", "whip");
     let source = r#"
+use std.files
 workflow Parent {
   file store project_files {
     root "."
@@ -466,6 +469,7 @@ fn workflow_invoke_without_grant_starts_child_under_automatic_cap() {
     let store_path = unique_test_path("invoke-automatic-cap-authority", "sqlite");
     let program_path = unique_test_path("invoke-automatic-cap-authority", "whip");
     let source = r#"
+use std.files
 workflow Parent {
   file store project_files {
     root "."
@@ -547,6 +551,7 @@ fn workflow_invoke_preserves_parent_package_identity_for_child_start() {
     let store_path = unique_test_path("invoke-package-authority", "sqlite");
     let program_path = unique_test_path("invoke-package-authority", "whip");
     let source = r#"
+use std.files
 workflow Parent {
   file store project_files {
     root "."
@@ -641,10 +646,10 @@ fn delegating_workflow_invoke_refuses_child_ifc_violation() {
     let program_path = unique_test_path("invoke-child-ifc-admission", "whip");
     let envelope_path = unique_test_path("invoke-child-ifc-admission-envelope", "json");
     let source = r#"
+use std.files
 workflow Parent {
 }
 
-@service
 workflow Child {
   output result R
   class R { ok bool }

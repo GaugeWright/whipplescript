@@ -153,11 +153,6 @@ const MAX_FILES_WALKED: usize = 5_000;
 /// reading binary content as text (pi-conformance §1 binary guard).
 const BINARY_SNIFF_BYTES: usize = 8_192;
 
-pub(crate) fn file_tool_specs_for_profile(profile: Option<&str>) -> Vec<ToolSpec> {
-    let policy = HarnessProfilePolicy::for_profile(profile);
-    file_tool_specs_for_policy(&policy)
-}
-
 fn file_tool_specs_for_policy(policy: &HarnessProfilePolicy) -> Vec<ToolSpec> {
     whipplescript_kernel::host_package::workspace_tool_specs_from_registry(true, true, true)
         .into_iter()
@@ -165,7 +160,7 @@ fn file_tool_specs_for_policy(policy: &HarnessProfilePolicy) -> Vec<ToolSpec> {
         .collect()
 }
 
-fn file_tool_specs_for_turn(
+pub(crate) fn file_tool_specs_for_turn(
     policy: &HarnessProfilePolicy,
     access: &TurnToolAccess,
 ) -> Vec<ToolSpec> {
@@ -674,7 +669,7 @@ impl TurnFileAccess {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct TurnToolAccess {
+pub(crate) struct TurnToolAccess {
     file: TurnFileAccess,
     file_resources: Vec<String>,
     command_run: bool,
@@ -964,7 +959,7 @@ impl TurnTrackerAccess {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct HarnessProfilePolicy {
+pub(crate) struct HarnessProfilePolicy {
     profile: Option<String>,
     read_files: bool,
     write_files: bool,
@@ -977,7 +972,7 @@ struct HarnessProfilePolicy {
 }
 
 impl HarnessProfilePolicy {
-    fn permissive() -> Self {
+    pub(crate) fn permissive() -> Self {
         Self {
             profile: None,
             read_files: true,
@@ -1432,9 +1427,34 @@ impl FileToolExecutor {
         self
     }
 
+    /// Real process spawn, from OPERATOR configuration only.
+    ///
+    /// This used to be set from a field on the `/turn` request body, which is
+    /// to say by whoever could reach the port. It switches `bash` from the
+    /// governed virtual shell to `/bin/sh -lc` as the invoking user, and
+    /// DR-0039 says in as many words that `command.run` does not authorize
+    /// that: "Arbitrary native subprocess execution ... is a different
+    /// placement capability and cannot satisfy this contract by name alone."
+    /// Nothing in this repository ever sent the field, and `whip executor` on
+    /// its default loopback bind takes no token, so any local process could
+    /// have asked for it.
+    ///
+    /// The switch survives because the batch scheduler seam genuinely wants it;
+    /// the authority moved to the process, where the caller cannot reach.
     pub fn with_native_processes(mut self, enabled: bool) -> Self {
         self.native_processes = enabled;
         self
+    }
+
+    /// Whether this process is configured to allow real process spawn:
+    /// `WHIPPLESCRIPT_NATIVE_PROCESSES=1`, set by whoever started the binary.
+    pub(crate) fn native_processes_permitted_by_operator() -> bool {
+        matches!(
+            std::env::var("WHIPPLESCRIPT_NATIVE_PROCESSES")
+                .unwrap_or_default()
+                .trim(),
+            "1" | "true" | "yes"
+        )
     }
 
     #[cfg(test)]
@@ -1446,7 +1466,7 @@ impl FileToolExecutor {
         self
     }
 
-    fn with_turn_tool_access(mut self, access: TurnToolAccess) -> Self {
+    pub(crate) fn with_turn_tool_access(mut self, access: TurnToolAccess) -> Self {
         self.file_policy = Some(access.file.scopes);
         self.command_run_granted = Some(access.command_run);
         self.web_search_granted = access.web_search;
@@ -4290,7 +4310,7 @@ fn turn_media_from_input(input_json: &str) -> Vec<MediaInput> {
         .unwrap_or_default()
 }
 
-fn turn_tool_access_from_input(input_json: &str) -> Result<TurnToolAccess, String> {
+pub(crate) fn turn_tool_access_from_input(input_json: &str) -> Result<TurnToolAccess, String> {
     let input = serde_json::from_str::<Value>(input_json)
         .map_err(|error| format!("owned turn input is not valid JSON: {error}"))?;
     let Some(grants) = input.get("access_grants").and_then(Value::as_array) else {
@@ -8246,7 +8266,7 @@ mod tests {
     #[test]
     fn profile_policy_filters_model_facing_file_tools() {
         let names = |profile| {
-            file_tool_specs_for_profile(profile)
+            file_tool_specs_for_policy(&HarnessProfilePolicy::for_profile(profile))
                 .into_iter()
                 .map(|spec| spec.name)
                 .collect::<Vec<_>>()
@@ -8757,6 +8777,79 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(root.join(".agent-config.json")).unwrap(),
             "protected"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Real process spawn is enabled by the OPERATOR, never by a caller.
+    #[test]
+    fn native_process_spawn_reads_only_the_operator_environment() {
+        // Unset is the default posture, and anything the operator did not
+        // affirmatively write is off.
+        for value in ["", "0", "false", "no", "maybe", " "] {
+            std::env::set_var("WHIPPLESCRIPT_NATIVE_PROCESSES", value);
+            assert!(
+                !FileToolExecutor::native_processes_permitted_by_operator(),
+                "`{value}` must not enable native process spawn"
+            );
+        }
+        for value in ["1", "true", "yes", " true "] {
+            std::env::set_var("WHIPPLESCRIPT_NATIVE_PROCESSES", value);
+            assert!(
+                FileToolExecutor::native_processes_permitted_by_operator(),
+                "`{value}` is an affirmative operator setting"
+            );
+        }
+        std::env::remove_var("WHIPPLESCRIPT_NATIVE_PROCESSES");
+        assert!(!FileToolExecutor::native_processes_permitted_by_operator());
+    }
+
+    /// The container turn's shape: permissive profile, NO grant.
+    ///
+    /// This is the case the sibling test above did not cover, and the gap it
+    /// left is exactly where the container path lived. `run_turn_in_workspace`
+    /// built its executor bare, so `command_run_granted` stayed `None`, the
+    /// guard that tests `== Some(false)` never fired, and bash was both offered
+    /// and executed on every container turn with nothing behind it. The profile
+    /// was permissive only because that is the constructor default -- the path
+    /// never read `profile` or `access_grants` from the wire at all.
+    ///
+    /// `spec/capability-registry.md` requires `command.run` plus an explicit
+    /// `with access to command { run }` turn grant with no placement carve-out,
+    /// and DR-0039 lists "OS shell by default on native" among its REJECTED
+    /// alternatives, so this was a divergence from the stated posture rather
+    /// than an exemption the container had earned.
+    #[test]
+    fn bash_is_refused_and_unoffered_when_a_turn_carries_no_grant_at_all() {
+        let root = temp_root();
+        // Exactly what the container path now builds: absent grants read as
+        // deny-all, against the permissive profile it has always used.
+        let no_grants = turn_tool_access_from_input(&json!({}).to_string())
+            .expect("a request with no grants parses");
+        let policy = HarnessProfilePolicy::permissive();
+        let exec = FileToolExecutor::new(&root).with_turn_tool_access(no_grants.clone());
+
+        let denied = exec.execute(&call(TOOL_BASH, json!({ "command": "echo hello" })));
+        assert_eq!(
+            denied.status,
+            ToolStatus::Error,
+            "ungranted bash must not execute: {}",
+            denied.content
+        );
+        assert!(
+            denied.content.contains("command { run }"),
+            "and must say which grant is missing: {}",
+            denied.content
+        );
+
+        // Not offered either: a tool the model can see is a tool it will try,
+        // and a refusal it meets only after choosing is a worse turn than one
+        // that was never on the list.
+        let offered = file_tool_specs_for_turn(&policy, &no_grants);
+        assert!(
+            !offered.iter().any(|spec| spec.name == TOOL_BASH),
+            "bash must not be offered without a grant: {:?}",
+            offered.iter().map(|spec| &spec.name).collect::<Vec<_>>()
         );
         std::fs::remove_dir_all(&root).ok();
     }

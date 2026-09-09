@@ -962,7 +962,8 @@ fn coercion_manifest_agrees_with_migration_seeded_rows() {
 /// manifest and parser would instead surface as `effect_contract_duplicate`.
 #[test]
 fn coercion_manifest_contract_folds_against_the_parser_compiled_one() {
-    let source = r#"use std.coercion
+    let source = r#"use std.ingress
+use std.coercion
 
 @service
 workflow CoercionImport

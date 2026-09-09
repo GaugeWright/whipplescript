@@ -19486,14 +19486,14 @@ fn start_workflow_instance(
         }
     };
     let input_json = input_value.to_string();
-    let (source, ir) = match compile_source_path_with_root(path, root) {
+    let (source, ir) = match compile_source_path_for_execution(path, root) {
         Ok(compiled) => compiled,
         Err(error) => return Err(report_compile_failure(path, error)),
     };
     let input_facts = match validate_workflow_start_input(&ir, &input_value) {
         Ok(facts) => facts,
         Err(message) => {
-            eprintln!("{message}");
+            eprintln!("cannot start {path}: {message}");
             return Err(ExitCode::from(2));
         }
     };
@@ -19617,7 +19617,9 @@ fn step(options: &CliOptions) -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let (source, ir) = match compile_source_path_with_root(
+    // Same battery as `start`: a program refused at check must not advance an
+    // instance either, or the refusal is one `step` away from being optional.
+    let (source, ir) = match compile_source_path_for_execution(
         &step_options.program_path,
         step_options.root.as_deref(),
     ) {
@@ -26703,7 +26705,7 @@ fn run_workflow_invoke_effect(
         invocation_store.get_workflow_invocation(instance_id, &effect.effect_id)?;
     let (child_instance_id, child_ir, start_event) = match existing_invocation {
         Some(invocation) => {
-            let (_source, child_ir) = compile_source_path_with_root(
+            let (_source, child_ir) = compile_source_path_for_execution(
                 program_path.to_str().unwrap_or_default(),
                 Some(&invocation.target_workflow),
             )
@@ -27181,8 +27183,11 @@ fn start_child_workflow_instance_in_package(
 ) -> Result<(StartedWorkflow, IrProgram), StoreError> {
     let input_value = serde_json::from_str::<Value>(input_json)?;
     let input_json = input_value.to_string();
+    // A child is an execution door too, and the one where skipping the battery
+    // would be worst: a parent could invoke authority its own program was
+    // refused for.
     let (source, ir) =
-        compile_source_path_with_root(program_path.to_str().unwrap_or_default(), Some(root))
+        compile_source_path_for_execution(program_path.to_str().unwrap_or_default(), Some(root))
             .map_err(|error| StoreError::Conflict(child_compile_error(root, error)))?;
     let input_facts = validate_workflow_start_input(&ir, &input_value).map_err(|message| {
         StoreError::Conflict(format!("invalid child workflow input: {message}"))
@@ -40626,24 +40631,64 @@ fn check_sibling_workflows(
     diagnostics
 }
 
-fn compile_source_path_for_validation(
+/// The AUTHORITY battery: the refusals that say what a program may TOUCH.
+///
+/// Every execution door runs these, because for two of the three there is no
+/// runtime backstop and the check-time refusal IS the enforcement. A `file
+/// store` with no `use std.files` ran to completion under `whip run` and wrote
+/// its file, while `whip check` refused it, because the doors compiled through
+/// different functions.
+///
+/// The SHAPE lints stay at `check` deliberately, which is a stated divergence
+/// rather than the accidental one above. Liveness asks whether a workflow can
+/// reach a terminal, and `@service` is how an author says "it is not meant to";
+/// nothing about it decides what a program is permitted to do, so refusing an
+/// already-running instance for it trades a real behaviour change against no
+/// authority. `whip check` remains the gate that asks the whole question, and
+/// a program that fails it should not be run.
+fn compile_source_path_for_execution(
     path: &str,
     root: Option<&str>,
 ) -> Result<(String, IrProgram), CompileFailure> {
     let (source, ir) = compile_source_path_with_root(path, root)?;
+    // DQ-1: `use std.<pkg>` is LOAD-BEARING for the authority-bearing packages
+    // (files, messaging, ingress). NOTHING backstops these at runtime, which is
+    // the whole reason they must run here.
+    //
+    // The script hard-off deliberately does NOT run here, though it is the same
+    // ladder. It is the one member with a real Layer-2 backstop -- the
+    // import-conditional two-key seeding leaves every `exec.command` blocked at
+    // the store admission gate, and `exec_without_import_blocks_even_with_allowlist`
+    // pins exactly that. Refusing at this door instead would be a better
+    // diagnostic and would make that property unobservable, trading a real
+    // runtime guarantee for a message.
+    let blocking = check_authority_imports(&ir);
+    if !blocking.is_empty() {
+        return Err(CompileFailure::Diagnostics {
+            source,
+            segments: Vec::new(),
+            diagnostics: blocking,
+        });
+    }
+    Ok((source, ir))
+}
+
+fn compile_source_path_for_validation(
+    path: &str,
+    root: Option<&str>,
+) -> Result<(String, IrProgram), CompileFailure> {
+    let (source, ir) = compile_source_path_for_execution(path, root)?;
     let mut blocking = lint_workflow_liveness(&ir);
+    // Script hard-off (M5 import ladder, Layer 1): the author-facing consent
+    // surface. It lives HERE rather than in the execution battery above because
+    // Layer 2 -- import-conditional two-key seeding plus the store admission
+    // gate -- is the load-bearing half, and a test pins an unimported `exec`
+    // reaching that gate rather than being refused at the door.
+    blocking.extend(check_script_hard_off(&ir));
     // Script hard-off (M5 import ladder, Layer 1): `exec` is a check error unless
     // the program imports `std.script`. This is the author-facing consent surface;
     // the load-bearing runtime backstop is Layer 2 (S6d-6): import-conditional
     // two-key capability seeding + the store admission gate (`policy_block_on`).
-    blocking.extend(check_script_hard_off(&ir));
-    // DQ-1 (language-refinement campaign): `use std.<pkg>` is uniformly
-    // LOAD-BEARING where present — the authority-bearing packages (files,
-    // messaging, ingress; script above) hard-error when their constructs
-    // appear without the import, and the capability-neutral packages (agent,
-    // coercion, coord, tracker, time, workflow, memory) are ambient and need
-    // no import at all.
-    blocking.extend(check_authority_imports(&ir));
     if !blocking.is_empty() {
         // Workflow-level diagnostics (span 0 for liveness) render against the root
         // path; the hard-off carries the offending `exec` effect's own span.

@@ -126,6 +126,25 @@ UNIT_VALUE = re.compile(r"\b[A-Z][A-Za-z0-9_]*::[A-Z][A-Za-z0-9_]*\b")
 # so it is only ever taken from a comment a human wrote and a reviewer read.
 MUTATION_SUCCESS_EXPR = re.compile(r"^\s*// MUTATION-SUCCESS-EXPR: (\S.*?)\s*$")
 RETURNED_EXPR = re.compile(r"^(\s*return\s+)(.+)(;\s*)$")
+
+# A DIVERGING ARM prints its words and then returns a unit value:
+#
+#     Err(error) => {
+#         eprintln!("invalid `--input` JSON: {error}");
+#         return Err(ExitCode::from(2));
+#     }
+#
+# The site is the `return`, and the message is ABOVE it, so the downward search
+# walks past it and finds nothing. This is the CLI's commonest refusal shape and
+# every instance reported `SKIP (no mutation)` -- unmeasurable, which reads in
+# the report exactly like untested, and which is the bucket this whole script
+# exists to keep small.
+#
+# Bounded hard, because an upward search is the one that can wander: at most
+# three lines, never past the line that opens the arm, and only a print macro's
+# own literal.
+PRINT_MACRO = re.compile(r"\b(?:eprintln|println|eprint|print)!\s*\(")
+ARM_BOUNDARY = re.compile(r"=>\s*\{\s*$|^\s*\}")
 TEST_CFG = re.compile(r'^#\[cfg\((?:test|all\(test,\s*[^()]*\))\)\]$')
 
 # The brace form is a PATTERN, not a construction, when it binds rather than
@@ -790,6 +809,20 @@ def apply_mutation(lines: list[str], site: Site) -> list[str] | None:
         wrapped = mutate_wrapped_message(mutated, index + offset)
         if wrapped is not None:
             return wrapped
+    # Nothing at or below the site. Look UP for a diverging arm's message: see
+    # `PRINT_MACRO`.
+    for offset in range(1, 4):
+        above = index - offset
+        if above < 0:
+            break
+        if ARM_BOUNDARY.search(mutated[above]):
+            break
+        if not PRINT_MACRO.search(mutated[above]):
+            continue
+        replaced = mutate_message(mutated[above])
+        if replaced is not None:
+            mutated[above] = replaced
+            return mutated
     return None
 
 
@@ -917,6 +950,19 @@ PLANT = """
 fn mutation_sweep_self_test_refusal(diagnostics: &mut Vec<String>, reached: bool) {
     if reached {
         diagnostics.push("mutation sweep self test refusal".to_owned());
+    }
+}
+
+// A diverging arm whose message sits ABOVE the return it belongs to. Before the
+// upward search this reported SKIP: no literal at or below the site.
+#[allow(dead_code)]
+fn mutation_sweep_self_test_diverging_arm(reached: Result<(), String>) -> Result<(), u8> {
+    match reached {
+        Ok(()) => Ok(()),
+        Err(detail) => {
+            eprintln!("mutation sweep self test diverging arm: {detail}");
+            return Err(2);
+        }
     }
 }
 
@@ -1176,7 +1222,13 @@ fn mutation_sweep_self_test_wrapped_unit(route: Option<u8>) -> MutationSweepWrap
 # refusal in a diverging `let`-else whose success carries a field. The self
 # test already fails on any plant it cannot measure, so this plant is what
 # proves the new form actually applies rather than merely parsing.
-PLANT_COUNT = 17
+#
+# The eighteenth, 2026-09-09, is the diverging arm: a message printed ABOVE the
+# return it belongs to. Planted with the rule that finds it, because a detection
+# rule with nothing planted against it is this script's own failure mode one
+# level up -- it could stop matching and every sweep would still come back
+# clean.
+PLANT_COUNT = 18
 
 
 def batch_unreachable_mutations(lines: list[str], sites: list[Site], start: int) -> list[str]:

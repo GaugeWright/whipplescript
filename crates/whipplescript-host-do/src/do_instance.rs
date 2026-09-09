@@ -957,6 +957,22 @@ impl<Sql: DoSql + Clone> InstanceDriver for DoInstanceDriver<'_, Sql> {
                                 "media": user_media,
                                 "world": world,
                                 "tools": "file",
+                                // The container gates its tools on the turn
+                                // grant, so the grant has to travel. It did
+                                // not: the container built its executor with
+                                // no access at all, which is why bash ran
+                                // there with nothing behind it. Both admitted
+                                // `agent.tell` shapes are checked, the
+                                // workflow one at the top level and the
+                                // governed-host one nested under `input`, the
+                                // same pair `refuse_mcp_grants_on_this_placement`
+                                // reads. Absent stays absent, and the far side
+                                // reads absence as deny-all.
+                                "access_grants": input
+                                    .pointer("/access_grants")
+                                    .or_else(|| input.pointer("/input/access_grants"))
+                                    .cloned()
+                                    .unwrap_or(serde_json::Value::Array(Vec::new())),
                                 "max_steps": cfg.max_steps,
                                 "compaction_strategy": "turn_summary",
                             }),

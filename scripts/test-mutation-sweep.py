@@ -38,7 +38,6 @@ class TypedRefusalTests(unittest.TestCase):
     def test_every_unreachable_plant_is_discovered_and_mutable(self):
         source = sweep.PLANT.splitlines()
         sites = sweep.find_sites(source)
-        self.assertEqual(len(sites), 17)
         self.assertEqual(len(sites), sweep.PLANT_COUNT)
         for site in sites:
             with self.subTest(site=site):
@@ -121,7 +120,7 @@ class TypedRefusalTests(unittest.TestCase):
 
 
 class CalibrationTests(unittest.TestCase):
-    def test_all_seventeen_edits_combine_without_line_offset_interference(self):
+    def test_all_plant_edits_combine_without_line_offset_interference(self):
         source = ["// original source boundary"] + sweep.PLANT.split("\n")
         sites = sweep.find_sites(source)
         combined = sweep.batch_unreachable_mutations(source, sites, 1)
@@ -133,7 +132,7 @@ class CalibrationTests(unittest.TestCase):
             self.assertIsNotNone(sequential)
         self.assertEqual(combined, sequential)
         self.assertEqual(combined[0], source[0])
-        self.assertEqual(len(sites), 17)
+        self.assertEqual(len(sites), sweep.PLANT_COUNT)
 
     def test_absent_or_noop_mutation_cannot_calibrate(self):
         source = ["real", "plant"]

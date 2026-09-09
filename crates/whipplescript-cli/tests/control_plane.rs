@@ -413,6 +413,7 @@ fn dev_file_read_binds_content_and_completes() {
         &source_path,
         format!(
             r#"
+use std.files
 workflow FileRead
 
 output result Result
@@ -532,6 +533,7 @@ fn dev_file_source_admits_one_signal_per_line_idempotently() {
         &source_path,
         format!(
             r#"
+use std.ingress
 @service
 workflow IngressFileSource
 
@@ -748,6 +750,7 @@ fn dev_http_source_admits_one_signal_per_array_element_idempotently() {
         &source_path,
         format!(
             r#"
+use std.ingress
 @service
 workflow IngressHttpSource
 
@@ -913,6 +916,7 @@ rule record_item
         &dead_source,
         format!(
             r#"
+use std.ingress
 @service
 workflow IngressHttpDead
 
@@ -1006,6 +1010,7 @@ fn dev_file_watch_source_admits_per_content_occurrence() {
         &source_path,
         format!(
             r#"
+use std.ingress
 @service
 workflow IngressWatchSource
 
@@ -1167,6 +1172,7 @@ fn ingress_serve_stdio_admits_absorbs_duplicates_and_rejects_malformed() {
     fs::write(
         &source_path,
         r#"
+use std.ingress
 @service
 workflow IngressStdio
 
@@ -1325,6 +1331,7 @@ fn signal_rejects_a_program_that_is_not_the_instances_committed_version() {
     let committed = temp_workflow_path("signal-committed");
     let tampered = temp_workflow_path("signal-tampered");
     let committed_src = r#"
+use std.ingress
 @service
 workflow SigGuard
 
@@ -1448,6 +1455,7 @@ fn dev_file_write_renders_body_and_enforces_mode() {
         &create_src,
         format!(
             r#"
+use std.files
 workflow WriteCreate
 
 output result Result
@@ -1526,6 +1534,7 @@ rule pick
         &mv_src,
         format!(
             r#"
+use std.files
 workflow WriteMode
 
 output result Result
@@ -1635,6 +1644,7 @@ fn dev_file_write_captures_content_addressed_history_that_survives_overwrite() {
             &src,
             format!(
                 r#"
+use std.files
 workflow WriteHistory
 
 output result Result
@@ -1753,6 +1763,7 @@ fn checkpoint_then_restore_reverts_the_file_plane() {
         &src,
         format!(
             r#"
+use std.files
 workflow RestoreWrite
 
 output result Result
@@ -1894,6 +1905,7 @@ fn dev_file_store_allow_policy_scopes_read_paths() {
         &source_path,
         format!(
             r#"
+use std.files
 workflow Allow
 
 output result Result
@@ -2004,6 +2016,7 @@ fn dev_file_import_jsonl_admits_typed_rows_and_is_atomic() {
     let ok_workflow = |path: &str| {
         format!(
             r#"
+use std.files
 @service
 workflow Importer
 
@@ -2096,6 +2109,7 @@ rule fan_out
     let bad_workflow = |path: &str| {
         format!(
             r#"
+use std.files
 workflow Importer
 
 output result Result
@@ -2225,6 +2239,7 @@ fn dev_file_export_serializes_filtered_collection() {
         &source_path,
         format!(
             r#"
+use std.files
 @service
 workflow RoundTrip
 
@@ -2313,6 +2328,7 @@ fn dev_file_read_refuses_path_escaping_store_root() {
         &source_path,
         format!(
             r#"
+use std.files
 workflow FileReadEscape
 
 output result Result
@@ -5724,7 +5740,8 @@ fn dev_owned_harness_offers_available_skills_catalogue() {
     let workflow = ws.join("catalogue.whip");
     fs::write(
         &workflow,
-        r#"class Done { note string }
+        r#"use std.files
+class Done { note string }
 
 file store workspace_files {
   root "."
@@ -5965,7 +5982,8 @@ fn owned_harness_injects_project_context_from_agents_md() {
     let workflow = ws.join("ctx.whip");
     fs::write(
         &workflow,
-        r#"class Done { note string }
+        r#"use std.files
+class Done { note string }
 
 file store workspace_files {
   root "."
@@ -7750,6 +7768,7 @@ fn region_lapses_once_cancels_in_flight_and_pins_the_progress_view() {
     fs::write(
         &workflow_path,
         r#"
+use std.ingress
 workflow Deploy
 
 output result Done
@@ -10649,6 +10668,7 @@ fn test_harness_seeds_file_fixtures() {
     fs::write(
         &wf,
         r#"
+use std.files
 workflow FileReadTest
 
 output result Result
@@ -11411,7 +11431,8 @@ fn interval_clock_source_fires_occurrences_at_runtime() {
     let wf = dir.join("clock_interval.whip");
     fs::write(
         &wf,
-        r#"@service
+        r#"use std.ingress
+@service
 workflow ClockInterval
 
 signal heartbeat.tick {
@@ -11517,7 +11538,8 @@ fn calendar_clock_source_fires_occurrences_at_runtime() {
     let wf = dir.join("clock_calendar.whip");
     fs::write(
         &wf,
-        r#"@service
+        r#"use std.ingress
+@service
 workflow ClockCalendar
 
 signal triage.tick {
@@ -13071,7 +13093,8 @@ fn lint_flags_broad_file_grant() {
 
     let program = |glob: &str| {
         format!(
-            r#"workflow FileRead
+            r#"use std.files
+workflow FileRead
 
 output result Result
 
@@ -16370,6 +16393,38 @@ workflow WorkflowInput {
     assert!(
         stderr.contains("invalid workflow input") && stderr.contains("phase.title is required"),
         "{stderr}"
+    );
+    // The refusal's OWN words, not only the validator's. A site whose whole
+    // message is `{message}` cannot be measured: the sweep rewrites text and
+    // KEEPS placeholders, so the mutation is a no-op and the site reports as
+    // untested however well the validator is covered.
+    assert!(
+        stderr.contains("cannot start "),
+        "the refusal must name the program it would not start: {stderr}"
+    );
+
+    // MALFORMED `--input`, which is a different refusal from input that parses
+    // and does not fit: this one is the JSON itself. Nothing asserted its words
+    // until the sweep learned to measure a message printed above its return and
+    // reported the site untested rather than unmeasurable.
+    let malformed = whip(bin, &store_path)
+        .args([
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "--input",
+            r#"{"phase":"#,
+            "run",
+            workflow_path.to_str().expect("utf-8 workflow path"),
+            "--until",
+            "idle",
+        ])
+        .output()
+        .expect("command runs");
+    assert!(!malformed.status.success());
+    let malformed_stderr = String::from_utf8_lossy(&malformed.stderr);
+    assert!(
+        malformed_stderr.contains("invalid `--input` JSON"),
+        "malformed input is refused in its own words: {malformed_stderr}"
     );
 
     // A missing input names the expected type and shows the expected object shape, so
@@ -22872,6 +22927,7 @@ fn dev_branch_dispatches_file_effects_onto_the_branch_working_set() {
         &src,
         format!(
             r#"
+use std.files
 workflow BranchDispatch
 
 output result Result
@@ -23166,6 +23222,7 @@ fn handles_expose_pointers_and_checkpoint_records_position_pair() {
         &src,
         format!(
             r#"
+use std.files
 workflow SeamHandles
 
 output result Result
@@ -23346,6 +23403,8 @@ fn fork_seeds_thread_and_mints_own_branch_line() {
         &src,
         format!(
             r#"
+use std.files
+use std.ingress
 workflow ChatForkSmoke
 
 signal user.message {{

@@ -38,7 +38,8 @@ use whipplescript_kernel::world_state::WorldSnapshot;
 
 use crate::coerce_runtime::UreqCoerceTransport;
 use crate::harness_tools::{
-    file_tool_specs_for_profile, FileToolExecutor, FixtureHost, FixtureModelClient,
+    file_tool_specs_for_turn, turn_tool_access_from_input, FileToolExecutor, FixtureHost,
+    FixtureModelClient,
 };
 use whipplescript::host_runtime::AuthoredAgentPackage;
 
@@ -341,16 +342,42 @@ pub fn run_turn_in_workspace(
                 .collect()
         })
         .unwrap_or_default();
+    // The turn GRANT is read here, not assumed.
+    //
+    // This path built its executor bare, so `command_run_granted` stayed `None`
+    // and the guard that refuses ungranted bash -- which tests
+    // `== Some(false)` -- never fired. Bash was offered and executed on every
+    // container turn, with no `with access to command { run }` behind it. The
+    // native path has always required one, and `spec/capability-registry.md`
+    // states the requirement with no placement carve-out; DR-0039 explicitly
+    // REJECTED "OS shell by default on native", so this was a divergence from
+    // the stated posture rather than an intended exemption for the container.
+    //
+    // Absent grants mean `deny_all`, the same as the native door. The profile
+    // stays permissive: the container's own confinement is what that expresses,
+    // and it is the missing GRANT this closes, not the profile.
+    let access = match turn_tool_access_from_input(&request.to_string()) {
+        Ok(access) => access,
+        Err(error) => {
+            return BrokeredTurnOutcome {
+                status: TurnStatus::Failed,
+                summary: format!("turn access grants are not readable: {error}"),
+                steps: 0,
+                observations: Vec::new(),
+                usage: json!({"input_tokens": 0, "output_tokens": 0}),
+                last_input_tokens: 0,
+            };
+        }
+    };
+    let profile_policy = crate::harness_tools::HarnessProfilePolicy::permissive();
     let executor = FileToolExecutor::new(workspace)
         .with_protected_write_paths(protected_write_paths)
-        .with_native_processes(
-            request
-                .get("native_processes")
-                .and_then(Value::as_bool)
-                .unwrap_or(false),
-        );
+        .with_turn_tool_access(access.clone())
+        // Operator configuration, never the request body: see
+        // `with_native_processes`.
+        .with_native_processes(FileToolExecutor::native_processes_permitted_by_operator());
     let mut tools = if use_file_tools {
-        file_tool_specs_for_profile(None)
+        file_tool_specs_for_turn(&profile_policy, &access)
     } else {
         Vec::new()
     };
@@ -685,6 +712,8 @@ fn write_frame(stream: &mut TcpStream, opcode: u8, payload: &[u8]) -> std::io::R
 mod tests {
     use super::*;
     use std::net::TcpListener;
+    use whipplescript_kernel::harness_loop::LoopObservation;
+    use whipplescript_kernel::harness_loop::ToolStatus;
 
     // A client-supplied turn_id cannot escape temp_dir: the scratch dir name
     // is a single safe segment (no `/`, `\`, or `..`), and distinct ids never
@@ -862,6 +891,124 @@ mod tests {
         assert_eq!(outcome.status, TurnStatus::Failed);
         assert!(outcome.summary.contains("pinned version"));
         std::fs::remove_dir_all(workspace).ok();
+    }
+
+    /// A container turn with no grant does not get bash.
+    ///
+    /// Driven through `run_turn_in_workspace` itself rather than through a
+    /// hand-built executor, because the defect was never in the guard -- the
+    /// guard was correct and the container simply never armed it. A test that
+    /// builds its own executor passes with the door wide open, which is exactly
+    /// what happened on the first attempt at pinning this.
+    ///
+    /// The fixture model is scripted to call bash on its first step, so the
+    /// turn asks for the tool the way a real model would.
+    #[test]
+    fn a_container_turn_without_a_grant_does_not_get_bash() {
+        let workspace = std::env::temp_dir().join(format!(
+            "whipple-ungranted-bash-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        std::env::set_var(
+            "WHIPPLESCRIPT_OWNED_FIXTURE_TOOL",
+            format!("bash:{}", json!({"command": "echo GRANTLESSBASHRAN"})),
+        );
+
+        let request = json!({
+            "turn_id": "ungranted-bash",
+            "user": "run the command",
+            "tools": "file",
+            "provider": {"provider": "fixture"},
+        });
+        let outcome = run_turn_in_workspace("ungranted-bash", &request, &workspace);
+        std::env::remove_var("WHIPPLESCRIPT_OWNED_FIXTURE_TOOL");
+
+        // The marker is not the evidence: with no operator opt-in, bash runs in
+        // the in-memory virtual shell, so an executed `touch` leaves no real
+        // file either way. What separates the two worlds is the tool RESULT --
+        // `Ok` when the ungranted call ran, `Error` when it was refused.
+        let bash_results: Vec<&ToolStatus> = outcome
+            .observations
+            .iter()
+            .filter_map(|observation| match observation {
+                LoopObservation::ToolResult { name, status, .. } if name == "bash" => Some(status),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !bash_results.is_empty(),
+            "the fixture model must have called bash: {outcome:?}"
+        );
+        assert!(
+            bash_results
+                .iter()
+                .all(|status| matches!(status, ToolStatus::Error)),
+            "ungranted bash must be refused, not executed: {outcome:?}"
+        );
+        std::fs::remove_dir_all(&workspace).ok();
+    }
+
+    /// `native_processes` is not a field the caller can set.
+    ///
+    /// It switched `bash` from the governed virtual shell to `/bin/sh -lc` as
+    /// the invoking user, and it was read straight off the request body with no
+    /// grant, profile, capability or envelope behind it. DR-0039 says
+    /// `command.run` cannot authorize native subprocess execution "by name
+    /// alone", so there was no grant that COULD have carried it. Nothing in
+    /// this repository ever sent the field, and `whip executor` on its default
+    /// loopback bind takes no token, so any local process could ask for it.
+    ///
+    /// The authority now lives on the process. This pins the wire's half: a
+    /// request asking for it is not honoured.
+    #[test]
+    fn a_request_cannot_ask_for_native_processes() {
+        let workspace = std::env::temp_dir().join(format!(
+            "whipple-native-processes-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&workspace).expect("workspace");
+
+        // The executor the container path builds, with the field set on the
+        // wire and the operator having said nothing.
+        assert!(
+            !crate::harness_tools::FileToolExecutor::native_processes_permitted_by_operator(),
+            "this test requires WHIPPLESCRIPT_NATIVE_PROCESSES unset"
+        );
+        let request = json!({
+            "turn_id": "native-processes",
+            "user": "run something",
+            "native_processes": true,
+            "provider": {"provider": "not-a-provider"},
+        });
+        // The turn fails on the provider, which is fine: what is being pinned
+        // is that the request's `native_processes` never reaches the executor,
+        // and the only authority that can enable it is the process env.
+        let outcome = run_turn_in_workspace("native-processes", &request, &workspace);
+        assert_eq!(outcome.status, TurnStatus::Failed);
+        assert_eq!(outcome.summary, "unknown provider `not-a-provider`");
+
+        // The wire's door is closed, and stays closed: this module must not
+        // read the field off the request at all. The needle is assembled at
+        // runtime so this assertion cannot match its own source.
+        let needle = format!("get(\"native{}processes\")", "_");
+        let source = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/turn_server.rs"),
+        )
+        .expect("read this module");
+        assert!(
+            !source.contains(&needle),
+            "the request body must not be read for native process spawn"
+        );
+        std::fs::remove_dir_all(&workspace).ok();
     }
 
     #[test]

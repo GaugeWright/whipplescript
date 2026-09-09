@@ -4915,6 +4915,7 @@ fn otel_export_no_allowlist_is_byte_identical_structural() {
 }
 
 const EVENT_SOURCE: &str = r#"
+use std.ingress
 workflow EventDemo
 
 output result Done
@@ -5194,6 +5195,7 @@ fn signal_delivery_id_admits_once_across_process_runs() {
 }
 
 const FAMILY_B_SIGNAL_SOURCE: &str = r#"
+use std.ingress
 workflow FamilyBSignal
 
 output result Done
