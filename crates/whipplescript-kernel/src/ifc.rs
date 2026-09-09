@@ -3570,7 +3570,7 @@ pub fn check_ifc_program_with_imports(ir: &IrProgram, imports: &[IrProgram]) -> 
             severity: Severity::Error,
             span: whipplescript_parser::SourceSpan { start: 0, end: 0 },
             message: format!("governance envelope rejected: {message}"),
-            suggestion: Some(
+            suggestion: whipplescript_parser::suggest(
                 "re-sign the envelope with `whip gov sign` after editing it".to_owned(),
             ),
             related: Vec::new(),
@@ -3638,7 +3638,7 @@ pub fn check_imported_tool_surfaces(imported: &[(String, Vec<String>)]) -> Vec<D
                  cannot see into the package (DR-0029 X1/X8)",
                 doors.join(", ")
             ),
-            suggestion: Some(format!(
+            suggestion: whipplescript_parser::suggest(format!(
                 "govern these resources in the envelope (or bind them as resource params), or do \
                  not import `{tool}`"
             )),
@@ -4424,7 +4424,7 @@ fn flag_redacted_egress_projections(
                     proj = label_text(&projected),
                     have = envelope.reader_label(sink),
                 ),
-                suggestion: Some(suggestion),
+                suggestion: whipplescript_parser::suggest(suggestion),
                 related: Vec::new(),
                 fixits: Vec::new(),
             });
@@ -4589,7 +4589,7 @@ pub fn check_with_envelope_imports(
                      agent could file its own issue and claim it",
                     rule = rule.name,
                 ),
-                suggestion: Some(format!(
+                suggestion: whipplescript_parser::suggest(format!(
                     "name who may file into it: `grant tracker {tracker} -> \
                      tracker:/{tracker} from <Role>`. if this claim is not an integrity \
                      crossing, drop the `endorsed` marker instead"
@@ -4649,7 +4649,7 @@ pub fn check_with_envelope_imports(
                              launders whatever the endorser quoted from the untrusted item",
                             rule = rule.name,
                         ),
-                        suggestion: Some(format!(
+                        suggestion: whipplescript_parser::suggest(format!(
                             "declare `{field_name}` as a closed union of literals (e.g. \
                              `\"keep\" | \"flag\"`) or another type that cannot hold a sentence \
                              — a number or a bool. to keep the endorser's prose, record it in a \
@@ -4699,7 +4699,7 @@ pub fn check_with_envelope_imports(
                                         "denied egress in rule `{}`: {problem}",
                                         rule.name
                                     ),
-                                    suggestion: Some(format!(
+                                    suggestion: whipplescript_parser::suggest(format!(
                                         "add `grant request {resource} for {} {}` to the \
                                          policy, or point the request inside the scope it \
                                          already grants",
@@ -4763,7 +4763,7 @@ pub fn check_with_envelope_imports(
                                     rr = envelope.reader_label(resource),
                                     pr = envelope.reader_label(provider),
                                 ),
-                                suggestion: Some(format!(
+                                suggestion: whipplescript_parser::suggest(format!(
                                     "bind the agent to a provider cleared for `{resource}`, or \
                                      declassify before the turn"
                                 )),
@@ -4843,7 +4843,7 @@ pub fn check_with_envelope_imports(
                             rr = envelope.reader_label(resource),
                             pr = envelope.reader_label(principal),
                         ),
-                        suggestion: Some(format!(
+                        suggestion: whipplescript_parser::suggest(format!(
                             "clear this endpoint for the resource (`grant provider {principal} -> \
                              … readable by <role>`), or declassify before the coerce"
                         )),
@@ -4969,7 +4969,7 @@ pub fn check_with_envelope_imports(
                     proj = label_text(&projected),
                     have = envelope.reader_label(&bounded.sink),
                 ),
-                suggestion: Some(format!(
+                suggestion: whipplescript_parser::suggest(format!(
                     "remove the field(s) `{dropped}` from the target type, or clear the sink with \
                      `grant … -> {sink} readable by <role>`",
                     dropped = offending.join(", "),
@@ -5034,7 +5034,7 @@ pub fn check_with_envelope_imports(
                                         rr = envelope.reader_label(resource),
                                         pr = envelope.reader_label(provider),
                                     ),
-                                    suggestion: Some(format!(
+                                    suggestion: whipplescript_parser::suggest(format!(
                                         "bind `{agent_name}` to a provider cleared for \
                                          `{resource}`, or declassify before the tool result \
                                          reaches the turn"
@@ -5300,7 +5300,7 @@ pub fn check_with_envelope_imports(
                     provided = envelope.integrity_label(&handle),
                     required = envelope.integrity_label(&sink),
                 ),
-                suggestion: Some(format!(
+                suggestion: whipplescript_parser::suggest(format!(
                     "escalate (needs governance): vouch the executor's outputs with `grant … -> … \
                      from <role>` on `{handle}`, or route the value through a `coerce … endorsed` \
                      judgment under `grant endorse {handle} to <role vouched for {sink}>`"
@@ -5328,7 +5328,7 @@ pub fn check_with_envelope_imports(
                     src_reader = envelope.reader_label(&src),
                     sink_reader = envelope.reader_label(&sink),
                 ),
-                suggestion: Some(format!(
+                suggestion: whipplescript_parser::suggest(format!(
                     "self-serve (no grant needed): separate the contexts — read `{src}` in a \
                      distinct turn and pass only a bounded result. escalate (needs governance): \
                      route the release through a `coerce … declassified` whose output is the \
@@ -5357,7 +5357,7 @@ pub fn check_with_envelope_imports(
                     rule = rule.name,
                     sink_int = envelope.integrity_label(&sink),
                 ),
-                suggestion: Some(format!(
+                suggestion: whipplescript_parser::suggest(format!(
                     "self-serve (no grant needed): do not let `{src}` influence `{sink}` — gate \
                      the sink on trusted data. escalate (needs governance): route the influence \
                      through a `coerce … endorsed` whose output is the sink's whole payload, \
@@ -5435,7 +5435,7 @@ pub fn check_with_envelope_imports(
                          selected by untrusted data; NMIF-on-the-selector)",
                         rule = rule.name,
                     ),
-                    suggestion: Some(format!(
+                    suggestion: whipplescript_parser::suggest(format!(
                         "do not branch a crossing on untrusted `{scrutinee}`; gate the `case` on \
                          high-integrity data, or endorse `{root}` before the `case`"
                     )),
@@ -5466,7 +5466,7 @@ pub fn check_with_envelope_imports(
                         rule = rule.name,
                         sink_int = envelope.integrity_label(&sink),
                     ),
-                    suggestion: Some(format!(
+                    suggestion: whipplescript_parser::suggest(format!(
                         "do not let `{scrutinee}` select a higher-integrity effect; vouch the \
                          inbound invoke port `{invoke_selector_port}` with `grant invoke ... from \
                          <role>`, or move the effect outside the untrusted `case`"
@@ -5538,7 +5538,7 @@ fn check_turn_unwrap_scoping(
                              `{credential}`, which governance grants to nobody for that type",
                             rule = rule.name,
                         ),
-                        suggestion: Some(if available.is_empty() {
+                        suggestion: whipplescript_parser::suggest(if available.is_empty() {
                             format!(
                                 "governance grants no unwrap at all on `{credential}`; add \
                                  `grant unwrap {credential} for {payload_type} to <Role>` to the \
@@ -5622,7 +5622,7 @@ pub fn check_principal_ceiling(
                          above the user's clearance (DR-0028 D3)",
                         rule = rule.name,
                     ),
-                    suggestion: Some(format!(
+                    suggestion: whipplescript_parser::suggest(format!(
                         "the principal role `{principal_role}` is not cleared for `{src}`; serve a user \
                          whose role acts-for {required}, or do not read `{src}`"
                     )),
@@ -12622,7 +12622,7 @@ rule seed
         let suggestions: Vec<String> =
             check_with_envelope(&ir, &VerifiedEnvelope::for_test(envelope))
                 .into_iter()
-                .filter_map(|d| d.suggestion)
+                .filter_map(|d| d.suggestion.map(|s| s.message))
                 .collect();
         assert!(
             suggestions
@@ -12646,7 +12646,7 @@ rule seed
             let envelope = Envelope::from_dsl(bare).expect("valid policy");
             check_with_envelope(&ir, &VerifiedEnvelope::for_test(envelope))
                 .into_iter()
-                .filter_map(|d| d.suggestion)
+                .filter_map(|d| d.suggestion.map(|s| s.message))
                 .collect()
         };
         assert!(

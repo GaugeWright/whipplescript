@@ -1226,7 +1226,7 @@ fn lex_body(source: &str, base: BodyBase<'_>, diagnostics: &mut Vec<Diagnostic>)
                     fixits: Vec::new(),
                     span: base.span(start, source.len()),
                     message: "unterminated multiline string".to_owned(),
-                    suggestion: Some("close the prompt with `\"\"\"`".to_owned()),
+                    suggestion: crate::suggest("close the prompt with `\"\"\"`".to_owned()),
                 });
                 break;
             };
@@ -1270,7 +1270,7 @@ fn lex_body(source: &str, base: BodyBase<'_>, diagnostics: &mut Vec<Diagnostic>)
                     fixits: Vec::new(),
                     span: base.span(start, j),
                     message: "unterminated string".to_owned(),
-                    suggestion: Some("close the string with `\"`".to_owned()),
+                    suggestion: crate::suggest("close the string with `\"`".to_owned()),
                 });
                 i = j;
                 continue;
@@ -1631,7 +1631,7 @@ impl<'a> BodyParser<'a> {
             fixits: Vec::new(),
             span,
             message: message.into(),
-            suggestion,
+            suggestion: suggestion.map(crate::Suggestion::manual),
         });
     }
 
@@ -1671,7 +1671,7 @@ impl<'a> BodyParser<'a> {
             fixits: Vec::new(),
             span,
             message: message.into(),
-            suggestion,
+            suggestion: suggestion.map(crate::Suggestion::manual),
         };
         if opened_at.start != span.start {
             diagnostic = diagnostic.with_related(opened_at, label);

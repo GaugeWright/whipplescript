@@ -11751,7 +11751,7 @@ fn merging_passes_keeps_distinct_findings_and_order() {
         fixits: Vec::new(),
         span: span(start, end),
         message: message.to_owned(),
-        suggestion: suggestion.map(str::to_owned),
+        suggestion: suggestion.map(Suggestion::manual),
     };
     // One pass, and nothing it said is dropped. Two DIFFERENT findings at one
     // span is the case that makes a span-only key a lie —
@@ -12005,6 +12005,49 @@ rule j
             .iter()
             .any(|d| d.code.as_str() == "lowering.unexpanded_pattern_application"),
         "the expander dropped nothing: an unexpanded application reached lowering"
+    );
+}
+
+/// The refusal the `Item::Apply` arm would emit, pinned at the seam the arm
+/// delegates to. `lower_program` cannot reach the arm — the test above pins
+/// the interceptions that keep it unreachable — so the diagnostic's code,
+/// span, and message are exercised here, where a sweep that neutralised the
+/// push would be caught.
+#[test]
+fn an_unexpanded_application_is_refused_by_name() {
+    let parsed = parse_program(
+        r#"
+workflow A
+
+apply Ghost<Ticket> as g {
+  reviewer worker
+}
+"#,
+    );
+    let apply = parsed
+        .program
+        .items
+        .iter()
+        .find_map(|item| match item {
+            Item::Apply(apply) => Some(apply),
+            _ => None,
+        })
+        .expect("the parser keeps a top-level apply as an item");
+    let mut diagnostics = Vec::new();
+    lowering::refuse_unexpanded_application(apply, &mut diagnostics);
+    let [refusal] = diagnostics.as_slice() else {
+        panic!("one refusal expected, got {diagnostics:?}");
+    };
+    assert_eq!(
+        refusal.code.as_str(),
+        "lowering.unexpanded_pattern_application"
+    );
+    assert_eq!(refusal.severity, Severity::Error);
+    assert_eq!(refusal.span, apply.span);
+    assert_eq!(refusal.message, "pattern application `g` was not expanded");
+    assert_eq!(
+        refusal.suggestion.as_deref(),
+        Some("ensure the applied pattern is declared at source top level")
     );
 }
 
@@ -23181,7 +23224,8 @@ rule triage
         .diagnostics
         .iter()
         .filter_map(|diagnostic| diagnostic.suggestion.clone())
-        .collect::<Vec<_>>()
+        .map(|suggestion| suggestion.to_string())
+        .collect::<Vec<String>>()
         .join("\n");
     assert!(
         help.contains("did you mean `priority`?"),
@@ -23919,7 +23963,8 @@ rule triage
         .diagnostics
         .iter()
         .filter_map(|diagnostic| diagnostic.suggestion.clone())
-        .collect::<Vec<_>>()
+        .map(|suggestion| suggestion.to_string())
+        .collect::<Vec<String>>()
         .join(
             "
 ",
@@ -23970,7 +24015,8 @@ rule triage
         .diagnostics
         .iter()
         .filter_map(|diagnostic| diagnostic.suggestion.clone())
-        .collect::<Vec<_>>()
+        .map(|suggestion| suggestion.to_string())
+        .collect::<Vec<String>>()
         .join(
             "
 ",

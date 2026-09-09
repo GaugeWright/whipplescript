@@ -4719,7 +4719,7 @@ fn lint_hosted_exec(
                     fixits: Vec::new(),
                     span: effect.span,
                     message: "raw `exec \"...\"` is not allowed in hosted exec profile".to_owned(),
-                    suggestion: Some(
+                    suggestion: whipplescript_parser::suggest(
                         "use `exec <capability> with <record> -> <Type> as <binding>` from the script manifest"
                             .to_owned(),
                     ),
@@ -4743,7 +4743,7 @@ fn lint_hosted_exec(
                         message: format!(
                             "exec capability `{name}` is not declared in the script manifest"
                         ),
-                        suggestion: Some(declared),
+                        suggestion: whipplescript_parser::suggest(declared),
                     });
                 }
                 _ => {}
@@ -11822,7 +11822,13 @@ fn parser_diagnostic_to_json(diagnostic: &Diagnostic) -> Value {
         "code": diagnostic.code.as_str(),
         "severity": diagnostic.severity.as_str(),
         "message": diagnostic.message,
-        "suggestion": diagnostic.suggestion,
+        // The report's `suggestion` stays the message string: the
+        // `whipplescript.check_report.v0` schema types it `string | null` and
+        // its readers take it as prose. The applicability rung lives on the
+        // in-process `Suggestion` and reaches the wire through `fixits`, which
+        // already carry one; widening the report is a schema change, not part
+        // of giving the struct its field.
+        "suggestion": diagnostic.suggestion.as_ref().map(|suggestion| suggestion.message.as_str()),
         "source_span": source_span_to_json(diagnostic.span),
     });
     // Related information (secondary spans) is omitted when empty so existing
@@ -40686,7 +40692,9 @@ fn check_authority_imports(ir: &IrProgram) -> Vec<Diagnostic> {
                 "{construct} requires `use {package}`: \
                  the import is the program's explicit opt-in to this authority"
             ),
-            suggestion: Some(format!("add `use {package}` at the top of the program")),
+            suggestion: whipplescript_parser::suggest(format!(
+                "add `use {package}` at the top of the program"
+            )),
         });
     };
     if !has_use("std.files") && !ir.file_stores.is_empty() {
@@ -40726,7 +40734,7 @@ fn check_script_hard_off(ir: &IrProgram) -> Vec<Diagnostic> {
                     message: "`exec` requires `use std.script`: script \
                          execution is disabled unless the program imports the std.script package"
                         .to_owned(),
-                    suggestion: Some(
+                    suggestion: whipplescript_parser::suggest(
                         "add `use std.script` at the top of the program to enable script execution"
                             .to_owned(),
                     ),
@@ -40792,7 +40800,7 @@ fn lint_workflow_liveness(ir: &IrProgram) -> Vec<Diagnostic> {
                 "workflow `{}` has no rule that reaches `complete` or `fail`",
                 ir.workflow
             ),
-            suggestion: Some(
+            suggestion: whipplescript_parser::suggest(
                 "add a rule that runs `complete <output> { ... }` or `fail <failure> { ... }`, or tag the workflow `@service` if it intentionally runs forever"
                     .to_owned(),
             ),
@@ -40847,7 +40855,7 @@ fn lint_workflow_liveness(ir: &IrProgram) -> Vec<Diagnostic> {
                 "workflow `{}` is both `@bounded` and `@service`; the two tags make opposite promises about termination",
                 ir.workflow
             ),
-            suggestion: Some(
+            suggestion: whipplescript_parser::suggest(
                 "keep `@service` for a workflow that runs for as long as the world gives it work, or `@bounded` for one that settles in a number of steps the program fixes — never both"
                     .to_owned(),
             ),
@@ -40870,7 +40878,7 @@ fn lint_workflow_liveness(ir: &IrProgram) -> Vec<Diagnostic> {
                     "workflow `{}` is both `@tool` and `@service`; a `@tool` workflow must terminate",
                     ir.workflow
                 ),
-                suggestion: Some(
+                suggestion: whipplescript_parser::suggest(
                     "remove `@service` — non-termination is a root-only privilege, not for an invokable sub-workflow"
                         .to_owned(),
                 ),
@@ -40893,7 +40901,7 @@ fn lint_workflow_liveness(ir: &IrProgram) -> Vec<Diagnostic> {
                     "`@tool` workflow `{}` invokes a sub-workflow; v1 `@tool` workflows must be leaves",
                     ir.workflow
                 ),
-                suggestion: Some(
+                suggestion: whipplescript_parser::suggest(
                     "a `@tool` workflow may not `invoke` another workflow yet; nested tool composition (with the acyclic-invoke-graph check) is a later refinement"
                         .to_owned(),
                 ),
@@ -40920,7 +40928,7 @@ fn lint_workflow_liveness(ir: &IrProgram) -> Vec<Diagnostic> {
                         "`@tool` workflow `{}` rule `{}` is `@external`; a `@tool` workflow may not depend on external arrival",
                         ir.workflow, rule.name
                     ),
-                    suggestion: Some(
+                    suggestion: whipplescript_parser::suggest(
                         "a `@tool` sub-workflow must be satisfiable from its own inputs and effects; external-event coordination belongs at the root"
                             .to_owned(),
                     ),
@@ -40938,7 +40946,7 @@ fn lint_workflow_liveness(ir: &IrProgram) -> Vec<Diagnostic> {
                             "`@tool` workflow `{}` rule `{}` awaits an inbound message; a `@tool` workflow may not consume external signals",
                             ir.workflow, rule.name
                         ),
-                        suggestion: Some(
+                        suggestion: whipplescript_parser::suggest(
                             "inbound messaging / signals belong at the root workflow".to_owned(),
                         ),
                     });
@@ -40979,7 +40987,7 @@ fn lint_workflow_liveness(ir: &IrProgram) -> Vec<Diagnostic> {
                                 "rule `{}` can never fire: nothing produces `{name}`",
                                 rule.name
                             ),
-                            suggestion: Some(format!(
+                            suggestion: whipplescript_parser::suggest(format!(
                                 "seed `{name}` from a table, record it in another rule, declare it as a workflow input, or tag the rule `@external` if it arrives from an external system"
                             )),
                         });
@@ -41000,7 +41008,7 @@ fn lint_workflow_liveness(ir: &IrProgram) -> Vec<Diagnostic> {
                             "rule `{}` can never fire: no rule creates an agent turn",
                             rule.name
                         ),
-                        suggestion: Some(
+                        suggestion: whipplescript_parser::suggest(
                             "add a `tell` effect, or tag the rule `@external` if turns arrive from outside this workflow"
                                 .to_owned(),
                         ),
@@ -41039,7 +41047,7 @@ fn lint_workflow_liveness(ir: &IrProgram) -> Vec<Diagnostic> {
                     "rule `{}` can never fire: nothing produces `{first}`",
                     rule.name
                 ),
-                suggestion: Some(format!(
+                suggestion: whipplescript_parser::suggest(format!(
                     "seed `{first}` from a table, record it in another rule, declare it as a workflow input, or tag the rule `@external` if it arrives from an external system"
                 )),
             });
@@ -41199,7 +41207,7 @@ fn agent_provider_kind_diagnostics(
                 "{owner} uses unknown provider kind `{kind}`: no known package \
                  manifest contributes it"
             ),
-            suggestion: Some(suggest_then_keyword(
+            suggestion: whipplescript_parser::suggest(suggest_then_keyword(
                 &kind,
                 known.keys(),
                 "provider kinds are contributed by package manifests (embedded std \
@@ -41269,7 +41277,7 @@ fn agent_requires_diagnostics(ir: &IrProgram) -> Vec<Diagnostic> {
                     "agent `{}` requires feature class `{class}`, but {stated}",
                     agent.name
                 ),
-                suggestion: Some(
+                suggestion: whipplescript_parser::suggest(
                     "a required class must be stated `native` or `emulated` by the selected \
                      provider's accepted feature report (DR-0015); pick a provider that \
                      supports it or drop the requirement"
@@ -41336,7 +41344,7 @@ fn lint_agent_tool_grants(
                     fixits: Vec::new(),
                     span: SourceSpan { start: 0, end: 0 },
                     message: format!("agent `{}` is granted `{tool}`: {reason}", agent.name),
-                    suggestion: Some(
+                    suggestion: whipplescript_parser::suggest(
                         "a granted tool must be a `@tool` workflow that passes the convergence check (same program or a `use`d package)"
                             .to_owned(),
                     ),
@@ -41515,7 +41523,9 @@ impl SourceBundleResolver {
                     fixits: Vec::new(),
                     span: SourceSpan { start: 0, end: 0 },
                     message: format!("include cycle through `{}`", path.display()),
-                    suggestion: Some("remove the recursive include".to_owned()),
+                    suggestion: whipplescript_parser::suggest(
+                        "remove the recursive include".to_owned(),
+                    ),
                 }],
             });
         }
@@ -41564,7 +41574,9 @@ impl SourceBundleResolver {
                         fixits: Vec::new(),
                         span: include.path.span,
                         message: format!("duplicate include `{}`", include.path.value),
-                        suggestion: Some("remove the duplicate include".to_owned()),
+                        suggestion: whipplescript_parser::suggest(
+                            "remove the duplicate include".to_owned(),
+                        ),
                     }],
                 });
             }
@@ -41584,7 +41596,7 @@ impl SourceBundleResolver {
                         fixits: Vec::new(),
                         span: include.path.span,
                         message: "include paths must be relative".to_owned(),
-                        suggestion: Some(
+                        suggestion: whipplescript_parser::suggest(
                             "write an include path relative to the current file".to_owned(),
                         ),
                     }],
@@ -41605,7 +41617,9 @@ impl SourceBundleResolver {
                         fixits: Vec::new(),
                         span: include.path.span,
                         message: "only `.whip` includes are supported right now".to_owned(),
-                        suggestion: Some("include a `.whip` source library file".to_owned()),
+                        suggestion: whipplescript_parser::suggest(
+                            "include a `.whip` source library file".to_owned(),
+                        ),
                     }],
                 });
             }
@@ -42064,7 +42078,7 @@ fn run_expected_model_searches(
                 actual.len(),
                 expected.len()
             ),
-            suggestion: Some(
+            suggestion: whipplescript_parser::suggest(
                 "inspect the generated model checks or rerun with Maude available".to_owned(),
             ),
         });
@@ -42088,7 +42102,7 @@ fn run_expected_model_searches(
                 fixits: Vec::new(),
                 span: expected.span,
                 message: format!("model-search counterexample for {}", expected.description),
-                suggestion: Some(format!(
+                suggestion: whipplescript_parser::suggest(format!(
                     "expected {}, got {}; inspect generated check {} {} {}",
                     expected.outcome.label(),
                     actual.label(),

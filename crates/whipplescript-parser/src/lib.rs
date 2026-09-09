@@ -68,7 +68,7 @@ pub struct Diagnostic {
     pub severity: Severity,
     pub span: SourceSpan,
     pub message: String,
-    pub suggestion: Option<String>,
+    pub suggestion: Option<Suggestion>,
     /// Secondary spans carrying supporting context (spec/error-handling.md "Spans
     /// And Labels"): a `note`-style related-information label pointing at a
     /// definition, prior claim, or other related site. Empty for most
@@ -104,24 +104,90 @@ pub struct RelatedInfo {
 /// produce a program without the diagnostic it is attached to — which
 /// `fixits_repair_the_program_over_the_example_corpus` proves by applying every
 /// one of them and recompiling.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
 pub enum Applicability {
-    /// The compiler knows the whole edit. Safe for an editor to apply on a
-    /// keystroke, and for a `--fix` mode to apply unattended.
-    Exact,
+    /// Human guidance with no edit behind it. The only rung a SUGGESTION starts
+    /// at, and a rung no FIXIT may carry: a fixit is an edit by definition.
+    /// Declared first so the derived order runs Manual < Likely < Exact and
+    /// "the strongest rung any fixit reached" is a plain `max`.
+    #[default]
+    Manual,
     /// The edit is the likely repair but the author may have meant something
     /// else. Offer it; do not apply it unattended.
     Likely,
+    /// The compiler knows the whole edit. Safe for an editor to apply on a
+    /// keystroke, and for a `--fix` mode to apply unattended.
+    Exact,
 }
 
 impl Applicability {
     /// The wire spelling used in JSON reports.
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::Manual => "manual",
             Self::Exact => "exact",
             Self::Likely => "likely",
         }
     }
+}
+
+/// Human guidance attached to a diagnostic: what to do about it, and how far
+/// the compiler stands behind that. `spec/error-handling.md` "Suggestions And
+/// Fixits" gives a suggestion a message and an applicability; this carried
+/// the message alone as a bare `String` at some four hundred sites (D15).
+///
+/// A suggestion is minted MANUAL. It is promoted to `Likely` or `Exact` only
+/// by the fixit derivation, when the compiler turns the sentence into an edit
+/// it can apply -- so the two agree by construction rather than by reading the
+/// sentence back a second time.
+///
+/// Derefs to its message, so every reader that treated the suggestion as text
+/// -- `as_deref()`, `format!`, `contains` -- reads the message unchanged.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub struct Suggestion {
+    pub message: String,
+    pub applicability: Applicability,
+}
+
+impl Suggestion {
+    pub fn manual(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            applicability: Applicability::Manual,
+        }
+    }
+}
+
+impl std::ops::Deref for Suggestion {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.message
+    }
+}
+
+impl std::fmt::Display for Suggestion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl From<String> for Suggestion {
+    fn from(message: String) -> Self {
+        Self::manual(message)
+    }
+}
+
+impl From<&str> for Suggestion {
+    fn from(message: &str) -> Self {
+        Self::manual(message)
+    }
+}
+
+/// The construction-site spelling: `suggestion: suggest(text)` where
+/// `suggestion: Some(text)` stood. The same closing parenthesis, so the rewrite
+/// of the existing sites was a token swap and nothing else.
+pub fn suggest(message: impl Into<String>) -> Option<Suggestion> {
+    Some(Suggestion::manual(message))
 }
 
 /// One replacement in a [`Fixit`]: the bytes to replace, and what to put there.
@@ -220,7 +286,7 @@ impl Diagnostic {
 
     /// Attaches the `= help:` line (builder style).
     pub fn with_suggestion(mut self, suggestion: impl Into<String>) -> Self {
-        self.suggestion = Some(suggestion.into());
+        self.suggestion = suggest(suggestion);
         self
     }
 
@@ -3223,7 +3289,7 @@ type DiagnosticKey = (
     usize,
     usize,
     String,
-    Option<String>,
+    Option<Suggestion>,
     Vec<(usize, usize, String)>,
 );
 
@@ -4074,7 +4140,7 @@ fn select_root_workflow(
             fixits: Vec::new(),
             span: SourceSpan { start: 0, end: 0 },
             message: "program declares no `workflow`".to_owned(),
-            suggestion: Some(
+            suggestion: suggest(
                 "add an explicit `workflow Name { ... }` declaration; a runnable \
                  program requires at least one workflow (files that only declare \
                  shared types or patterns are libraries, meant to be `include`d)"
@@ -4095,7 +4161,7 @@ fn select_root_workflow(
                         fixits: Vec::new(),
                         span: workflow.span,
                         message: format!("root workflow `{root}` was not found"),
-                        suggestion: Some(format!("available workflow: `{}`", workflow.name)),
+                        suggestion: suggest(format!("available workflow: `{}`", workflow.name)),
                     }]);
                 }
                 None => {
@@ -4106,7 +4172,7 @@ fn select_root_workflow(
                         fixits: Vec::new(),
                         span: SourceSpan { start: 0, end: 0 },
                         message: format!("root workflow `{root}` was not found"),
-                        suggestion: Some(
+                        suggestion: suggest(
                             "add an explicit `workflow Name { ... }` declaration".to_owned(),
                         ),
                     }]);
@@ -4137,7 +4203,7 @@ fn select_root_workflow(
                     fixits: Vec::new(),
                     span: SourceSpan { start: 0, end: 0 },
                     message: format!("root workflow `{root}` was not found"),
-                    suggestion: Some(format!("available workflows: {names}")),
+                    suggestion: suggest(format!("available workflows: {names}")),
                 }]);
             }
         },
@@ -4156,7 +4222,7 @@ fn select_root_workflow(
                 fixits: Vec::new(),
                 span: SourceSpan { start: 0, end: 0 },
                 message: "multiple workflow declarations require an explicit root".to_owned(),
-                suggestion: Some(format!(
+                suggestion: suggest(format!(
                     "pass `--root <name>`; available workflows: {names}"
                 )),
             }]);
@@ -5476,7 +5542,7 @@ fn validate_turn_access_grant_file_operations(ir: &IrProgram, diagnostics: &mut 
                                 "rule `{}` grants `{}` on file store `{}`, which is not a file operation",
                                 rule.name, op.operation, grant.resource
                             ),
-                            suggestion: Some(suggest_then_keyword(
+                            suggestion: suggest(suggest_then_keyword(
                                 &op.operation,
                                 FILE_OPERATIONS.iter().copied(),
                                 "file-store grants allow `read`, `write`, `import`, or `export`",
@@ -5522,7 +5588,7 @@ fn validate_turn_access_grant_memory_operations(ir: &IrProgram, diagnostics: &mu
                                 "rule `{}` grants `{}` on memory pool `{}`, which is not a memory operation",
                                 rule.name, op.operation, grant.resource
                             ),
-                            suggestion: Some(suggest_then_keyword(
+                            suggestion: suggest(suggest_then_keyword(
                                 &op.operation,
                                 MEMORY_OPERATIONS.iter().copied(),
                                 "memory-pool grants allow `recall`, `learn`, or `curate`",
@@ -5581,7 +5647,7 @@ fn validate_turn_access_grant_vaults(ir: &IrProgram, diagnostics: &mut Vec<Diagn
                             "rule `{}` grants access to undeclared vault `{name}`",
                             rule.name
                         ),
-                        suggestion: Some(format!(
+                        suggestion: suggest(format!(
                             "declare it with `vault {name} {{ kind <kind>  allow [<op>, ...] }}`"
                         )),
                     });
@@ -5599,7 +5665,7 @@ fn validate_turn_access_grant_vaults(ir: &IrProgram, diagnostics: &mut Vec<Diagn
                                 "rule `{}` grants unknown operation `{}` on vault `{name}`",
                                 rule.name, op.operation
                             ),
-                            suggestion: Some(format!(
+                            suggestion: suggest(format!(
                                 "a vault grant names container operations: {}",
                                 Operation::CONTAINER
                                     .iter()
@@ -5623,7 +5689,7 @@ fn validate_turn_access_grant_vaults(ir: &IrProgram, diagnostics: &mut Vec<Diagn
                                 rule.name,
                                 operation.as_str()
                             ),
-                            suggestion: Some(format!(
+                            suggestion: suggest(format!(
                                 "a vault grant names what may be done TO the container ({}); what \
                                  its members may do is the vault's own `allow` list",
                                 Operation::CONTAINER
@@ -5683,7 +5749,7 @@ fn validate_turn_access_grant_credential_kinds(ir: &IrProgram, diagnostics: &mut
                              cannot perform it",
                             rule.name, op.operation
                         ),
-                        suggestion: Some(format!(
+                        suggestion: suggest(format!(
                             "`{}` needs a credential of kind {}",
                             op.operation,
                             able.join(" or ")
@@ -5755,7 +5821,7 @@ fn validate_file_store_write_policy(
                                     "rule `{rule_name}` writes to store `{store}`, which permits \
                                      no writes — stores are read-only by default"
                                 ),
-                                suggestion: Some(format!(
+                                suggestion: suggest(format!(
                                     "declare `allow write [\"<glob>\", …]` on `file store {store}` \
                                      to permit (and bound) writes"
                                 )),
@@ -5831,7 +5897,7 @@ fn expand_source_emit_from(ir: &mut IrProgram, diagnostics: &mut Vec<Diagnostic>
                     "source `{}` emits `from {from}`, but the only binding in scope is the observe binding `{}`",
                     source.name, source.observe_binding
                 ),
-                suggestion: Some(format!("write `emit {} from {}`", source.emit_signal, source.observe_binding)),
+                suggestion: suggest(format!("write `emit {} from {}`", source.emit_signal, source.observe_binding)),
             });
             continue;
         }
@@ -5936,7 +6002,7 @@ fn warn_unhandled_effect_failures(ir: &IrProgram, warnings: &mut Vec<Diagnostic>
                      times out, the instance will auto-fail with a generic reason",
                     rule.name
                 ),
-                suggestion: Some(format!(
+                suggestion: suggest(format!(
                     "handle it with `after {binding} fails {{ … }}` (typed failure or recovery) \
                      or observe every outcome with `after {binding} completes`"
                 )),
@@ -6041,7 +6107,7 @@ fn warn_near_miss_semantic_tags(ir: &IrProgram, warnings: &mut Vec<Diagnostic>) 
                 "tag `@{}` is not a semantic tag, and looks like `@{candidate}`",
                 tag.name
             ),
-            suggestion: Some(format!(
+            suggestion: suggest(format!(
                 "write `@{candidate}` if that is what you meant — a tag the language does not know is kept as metadata and changes nothing, so a misspelled one silently drops the behaviour it was declaring"
             )),
         });
@@ -6064,7 +6130,7 @@ fn warn_counter_without_timezone(ir: &IrProgram, warnings: &mut Vec<Diagnostic>)
                     "counter `{}` declares no `timezone`; its `{}` reset boundary anchors to UTC",
                     counter.name, counter.reset
                 ),
-                suggestion: Some(
+                suggestion: suggest(
                     "declare `timezone \"<IANA zone>\"` (e.g. `timezone \"America/New_York\"`) to anchor the period locally"
                         .to_owned(),
                 ),
@@ -6124,7 +6190,7 @@ fn warn_inert_memory_grant_on_native_adapter(ir: &IrProgram, warnings: &mut Vec<
                              take effect on the owned harness, so this grant is inert",
                             rule.name, grant.resource
                         ),
-                        suggestion: Some(
+                        suggestion: suggest(
                             "target an owned-harness agent, or drop the memory grant".to_owned(),
                         ),
                     });
@@ -6227,7 +6293,7 @@ fn detect_pattern_recursion(
                     "recursive pattern application is not allowed: expansion cycle {}",
                     cycle.join(" -> ")
                 ),
-                suggestion: Some(
+                suggestion: suggest(
                     "break the cycle: pattern expansion must elaborate into a finite program"
                         .to_owned(),
                 ),
@@ -6338,7 +6404,7 @@ fn detect_workflow_invoke_recursion(program: &Program, diagnostics: &mut Vec<Dia
                     "recursive workflow invocation is not allowed: invocation cycle {}",
                     cycle.join(" -> ")
                 ),
-                suggestion: Some(
+                suggestion: suggest(
                     "break the cycle: a runtime `invoke` cycle has no compile-time convergence proof; route the recurrence through an external event, clock, or durable boundary instead"
                         .to_owned(),
                 ),
@@ -6375,7 +6441,7 @@ fn detect_private_workflow_invocations(program: &Program, diagnostics: &mut Vec<
                         "rule `{}` invokes private workflow `{target}`",
                         rule.name.name
                     ),
-                    suggestion: Some(
+                    suggestion: suggest(
                         "remove `@private` from the target workflow or expose a public wrapper workflow"
                             .to_owned(),
                     ),
@@ -6472,7 +6538,7 @@ fn detect_service_workflow_invocations(program: &Program, diagnostics: &mut Vec<
                         "rule `{}` invokes `{target}`, which is tagged `@service`: `@service` declares that a workflow need not terminate, and an invocation awaits its terminal output",
                         rule.name.name
                     ),
-                    suggestion: Some(
+                    suggestion: suggest(
                         "remove `@service` from the target if it does terminate — non-termination is a root-only privilege, not for an awaited sub-workflow; to hand work to a genuinely long-running service, emit a signal or event it observes instead of awaiting it"
                             .to_owned(),
                     ),
@@ -6697,7 +6763,7 @@ fn detect_agent_tool_grant_recursion(program: &Program, diagnostics: &mut Vec<Di
                     "recursive agent tool grant is not allowed: invoke-tool cycle {}",
                     cycle.join(" -> ")
                 ),
-                suggestion: Some(
+                suggestion: suggest(
                     "break the cycle: an agent may call a granted `@tool` workflow synchronously, so a cycle in the grant graph has unbounded recursion depth and no compile-time convergence proof"
                         .to_owned(),
                 ),
@@ -6723,7 +6789,7 @@ fn expand_pattern_applications(
                     fixits: Vec::new(),
                     span: pattern.name.span,
                     message: format!("pattern `{}` is declared more than once", pattern.name.name),
-                    suggestion: Some("rename one pattern declaration".to_owned()),
+                    suggestion: suggest("rename one pattern declaration".to_owned()),
                 }
                 .with_related(prior.name.span, "first declared here"),
             );
@@ -6753,7 +6819,7 @@ fn expand_pattern_applications(
                 fixits: Vec::new(),
                 span: apply.pattern.span,
                 message: format!("pattern `{}` was not found", apply.pattern.name),
-                suggestion: Some("declare the pattern before applying it".to_owned()),
+                suggestion: suggest("declare the pattern before applying it".to_owned()),
             });
             continue;
         };
@@ -6770,7 +6836,7 @@ fn expand_pattern_applications(
                     pattern.type_params.len(),
                     apply.type_args.len()
                 ),
-                suggestion: Some("match the pattern type parameter list".to_owned()),
+                suggestion: suggest("match the pattern type parameter list".to_owned()),
             });
             continue;
         }
@@ -6895,7 +6961,7 @@ fn parse_pattern_value_arguments(
                     "pattern application `{}` has malformed argument `{line}`",
                     apply.alias.name
                 ),
-                suggestion: Some("write pattern arguments as `name value`".to_owned()),
+                suggestion: suggest("write pattern arguments as `name value`".to_owned()),
             });
             continue;
         };
@@ -6914,7 +6980,7 @@ fn parse_pattern_value_arguments(
                     "pattern application `{}` argument `{name}` is missing a value",
                     apply.alias.name
                 ),
-                suggestion: Some("write pattern arguments as `name value`".to_owned()),
+                suggestion: suggest("write pattern arguments as `name value`".to_owned()),
             });
             continue;
         };
@@ -6929,7 +6995,7 @@ fn parse_pattern_value_arguments(
                     "pattern application `{}` passes argument `{name}` more than once",
                     apply.alias.name
                 ),
-                suggestion: Some("remove the duplicate pattern argument".to_owned()),
+                suggestion: suggest("remove the duplicate pattern argument".to_owned()),
             });
         }
     }
@@ -6962,7 +7028,7 @@ fn pattern_body_admission(
             fixits: Vec::new(),
             span: contract.span,
             message: "workflow contracts are not allowed in pattern bodies".to_owned(),
-            suggestion: Some(
+            suggestion: suggest(
                 "declare workflow inputs, outputs, and failures on the workflow".to_owned(),
             ),
         }),
@@ -6973,7 +7039,7 @@ fn pattern_body_admission(
             fixits: Vec::new(),
             span: pattern.span,
             message: "nested pattern declarations are not supported in pattern bodies".to_owned(),
-            suggestion: Some("declare reusable patterns at source top level".to_owned()),
+            suggestion: suggest("declare reusable patterns at source top level".to_owned()),
         }),
         // A recursive nested apply was already rejected with the precise
         // graph.unbounded_pattern_recursion diagnostic by detect_pattern_recursion;
@@ -6985,7 +7051,7 @@ fn pattern_body_admission(
             fixits: Vec::new(),
             span: apply.span,
             message: "pattern applications inside pattern bodies are not supported yet".to_owned(),
-            suggestion: Some(
+            suggestion: suggest(
                 "apply patterns from workflow bodies only in this implementation slice".to_owned(),
             ),
         }),
@@ -6999,7 +7065,7 @@ fn pattern_body_admission(
             fixits: Vec::new(),
             span: gauge.span,
             message: "gauge declarations are not allowed in pattern bodies".to_owned(),
-            suggestion: Some("declare gauges at source top level".to_owned()),
+            suggestion: suggest("declare gauges at source top level".to_owned()),
         }),
         Item::Campaign(campaign) => Some(Diagnostic {
             code: diagnostic_code!("construct.forbidden_pattern_item"),
@@ -7008,7 +7074,7 @@ fn pattern_body_admission(
             fixits: Vec::new(),
             span: campaign.span,
             message: "campaign declarations are not allowed in pattern bodies".to_owned(),
-            suggestion: Some("declare campaigns at source top level".to_owned()),
+            suggestion: suggest("declare campaigns at source top level".to_owned()),
         }),
         Item::Mark(mark) => Some(Diagnostic {
             code: diagnostic_code!("construct.forbidden_pattern_item"),
@@ -7017,7 +7083,7 @@ fn pattern_body_admission(
             fixits: Vec::new(),
             span: mark.span,
             message: "mark declarations are not allowed in pattern bodies".to_owned(),
-            suggestion: Some("declare marks at source top level".to_owned()),
+            suggestion: suggest("declare marks at source top level".to_owned()),
         }),
         Item::Rule(rule) => pattern_rule_terminal_span(rule).map(|span| Diagnostic {
             code: diagnostic_code!("construct.pattern_terminal_action"),
@@ -7029,7 +7095,7 @@ fn pattern_body_admission(
                 "rule `{}` in a pattern body cannot reach a workflow terminal (`complete`/`fail`)",
                 rule.name.name
             ),
-            suggestion: Some(
+            suggestion: suggest(
                 "record a fact in the pattern rule and let a workflow rule decide the terminal outcome"
                     .to_owned(),
             ),
@@ -7463,7 +7529,7 @@ fn collect_schema_names(program: &Program, diagnostics: &mut Vec<Diagnostic>) ->
                 fixits: Vec::new(),
                 span: name.span,
                 message: format!("schema `{}` is declared more than once", name.name),
-                suggestion: Some("rename one declaration or merge the schemas".to_owned()),
+                suggestion: suggest("rename one declaration or merge the schemas".to_owned()),
             };
             if let Some(first) = first_spans.get(&name.name) {
                 diagnostic = diagnostic.with_related(*first, "first declared here");
@@ -7497,7 +7563,7 @@ fn collect_harness_kinds(
                     fixits: Vec::new(),
                     span: harness.name.span,
                     message: format!("harness `{}` is declared more than once", harness.name.name),
-                    suggestion: Some(
+                    suggestion: suggest(
                         "rename one harness declaration or merge the harness settings".to_owned(),
                     ),
                 }
@@ -7533,7 +7599,9 @@ fn collect_agent_names(program: &Program, diagnostics: &mut Vec<Diagnostic>) -> 
                 fixits: Vec::new(),
                 span: agent.name.span,
                 message: format!("agent `{}` is declared more than once", agent.name.name),
-                suggestion: Some("rename one agent declaration or merge the settings".to_owned()),
+                suggestion: suggest(
+                    "rename one agent declaration or merge the settings".to_owned(),
+                ),
             };
             if let Some(first) = first_spans.get(&agent.name.name) {
                 diagnostic = diagnostic.with_related(*first, "first declared here");
@@ -7585,7 +7653,7 @@ fn collect_workflow_contract_names(
                     contract.kind.as_str(),
                     contract.name.name
                 ),
-                suggestion: Some("remove the duplicate workflow contract".to_owned()),
+                suggestion: suggest("remove the duplicate workflow contract".to_owned()),
             };
             let key = (contract.kind.as_str(), contract.name.name.clone());
             if let Some(first) = first_spans.get(&key) {
@@ -7902,7 +7970,7 @@ fn validate_milestone_statements(
                     "rule `{}` emits milestone `{name}` with unknown payload class `{class}`",
                     rule.name.name
                 ),
-                suggestion: Some(suggest_otherwise(
+                suggestion: suggest(suggest_otherwise(
                     &class,
                     semantic.schemas.classes.keys(),
                     format!("declare `class {class}` before projecting it"),
@@ -7925,7 +7993,7 @@ fn validate_milestone_statements(
                     "rule `{}` has `after {binding} reaches \"{milestone}\"` for `{binding}`, which is not a workflow-invoke binding in this rule",
                     rule.name.name
                 ),
-                suggestion: Some(
+                suggestion: suggest(
                     "`reaches` observes a child workflow milestone; bind the child with `invoke W { ... } as <binding>` first"
                         .to_owned(),
                 ),
@@ -7965,7 +8033,7 @@ fn validate_milestone_statements(
                     "rule `{}` reaches milestone `{milestone}` that workflow `{workflow}` does not declare",
                     rule.name.name
                 ),
-                suggestion: Some(suggestion),
+                suggestion: suggest(suggestion),
             });
         }
     }
@@ -8722,7 +8790,7 @@ fn validate_streams(ir: &IrProgram, diagnostics: &mut Vec<Diagnostic>) {
                         "stream `{}` member `{}` is not a declared agent",
                         stream.name, member
                     ),
-                    suggestion: Some(suggest_otherwise(
+                    suggestion: suggest(suggest_otherwise(
                         member,
                         ir.agents.iter().map(|agent| agent.name.as_str()),
                         "stream members are agent declarations; declare the agent \
@@ -8744,7 +8812,7 @@ fn validate_streams(ir: &IrProgram, diagnostics: &mut Vec<Diagnostic>) {
                         message: format!(
                             "agent `{member}` is already a member of stream `{holder}`",
                         ),
-                        suggestion: Some(
+                        suggestion: suggest(
                             "membership is single-valued (the sync topology stays a \
                              tree): an agent homes to exactly one stream"
                                 .to_owned(),
@@ -8770,7 +8838,7 @@ fn validate_streams(ir: &IrProgram, diagnostics: &mut Vec<Diagnostic>) {
                         fixits: Vec::new(),
                         span: effect.span,
                         message: format!("`on stream {target}` names an undeclared stream"),
-                        suggestion: Some(suggest_otherwise(
+                        suggestion: suggest(suggest_otherwise(
                             target,
                             ir.streams.iter().map(|stream| stream.name.as_str()),
                             "declare the stream at top level: `stream <name> { members [...] }`",
@@ -8795,7 +8863,7 @@ fn validate_streams(ir: &IrProgram, diagnostics: &mut Vec<Diagnostic>) {
                                 fixits: Vec::new(),
                                 span: effect.span,
                                 message: format!("the selection does not parse: {error}"),
-                                suggestion: Some(
+                                suggestion: suggest(
                                     "selections compose atoms like `path(<glob>)`, `by(<prefix>)`, \
                                      `intent(<prefix>)`, `cut(<id>)`, `region(<name>)` with `|`, \
                                      `&`, `~`, and `dependents-of(...)`"
@@ -8836,7 +8904,7 @@ fn validate_streams(ir: &IrProgram, diagnostics: &mut Vec<Diagnostic>) {
                                                     message: format!(
                                                         "`region({name})` names no declared region"
                                                     ),
-                                                    suggestion: Some(
+                                                    suggestion: suggest(
                                                         "declare it at top level: `region <name> \
                                                          { select \"<selection>\" }`"
                                                             .to_owned(),
@@ -8872,7 +8940,7 @@ fn validate_streams(ir: &IrProgram, diagnostics: &mut Vec<Diagnostic>) {
                         fixits: Vec::new(),
                         span: effect.span,
                         message: "a `vcs` access grant rides an `invoke` only".to_owned(),
-                        suggestion: Some(
+                        suggestion: suggest(
                             "repair authority is orchestration: grant it to a repair \
                              workflow via `invoke ... with access to vcs { repair for \
                              <binding> }`; agents never receive it"
@@ -8890,7 +8958,7 @@ fn validate_streams(ir: &IrProgram, diagnostics: &mut Vec<Diagnostic>) {
                             fixits: Vec::new(),
                             span: effect.span,
                             message: format!("unknown `vcs` grant operation `{}`", op.operation),
-                            suggestion: Some(suggest_then_keyword(
+                            suggestion: suggest(suggest_then_keyword(
                                 &op.operation,
                                 ["repair"],
                                 "the vcs resource grants `repair for <binding>`",
@@ -8906,7 +8974,7 @@ fn validate_streams(ir: &IrProgram, diagnostics: &mut Vec<Diagnostic>) {
                             fixits: Vec::new(),
                             span: effect.span,
                             message: "`repair` names no binding".to_owned(),
-                            suggestion: Some(
+                            suggestion: suggest(
                                 "write `repair for <binding>` where the binding is a \
                                  vcs arming fact this rule matched (e.g. `when reconcile \
                                  stalled as r`)"
@@ -8926,7 +8994,7 @@ fn validate_streams(ir: &IrProgram, diagnostics: &mut Vec<Diagnostic>) {
                             fixits: Vec::new(),
                             span: effect.span,
                             message: format!("`repair for {target}` names no binding of this rule"),
-                            suggestion: Some(
+                            suggestion: suggest(
                                 "bind the arming fact first: `when reconcile stalled as \
                                  <binding>` (or the dotted `when fact vcs.* as <binding>` \
                                  form)"
@@ -8949,7 +9017,7 @@ fn validate_streams(ir: &IrProgram, diagnostics: &mut Vec<Diagnostic>) {
                         message: format!(
                             "`onto {target}` names neither `mainline` nor a declared stream"
                         ),
-                        suggestion: Some(
+                        suggestion: suggest(
                             "transport targets are the nameable tiers: `onto mainline`, or \
                              `onto <stream>` for a declared stream's line"
                                 .to_owned(),
@@ -8981,7 +9049,7 @@ fn validate_regions(ir: &IrProgram, diagnostics: &mut Vec<Diagnostic>) {
                         "region `{}`: the selection does not parse: {error}",
                         region.name
                     ),
-                    suggestion: Some(
+                    suggestion: suggest(
                         "a region composes `path(<glob>)` and `decl(<identity-glob>)` atoms \
                          with `|`, `&`, `~`, and parens"
                             .to_owned(),
@@ -9003,7 +9071,7 @@ fn validate_regions(ir: &IrProgram, diagnostics: &mut Vec<Diagnostic>) {
                             region.name,
                             violations.join(", ")
                         ),
-                        suggestion: Some(
+                        suggestion: suggest(
                             "keep only `path(...)`/`decl(...)` atoms in a region; temporal and \
                              attribution atoms belong in the selective verbs' selections, where \
                              they can compose with `region(<name>)`"
@@ -9126,7 +9194,7 @@ fn validate_improve_declarations(ir: &IrProgram, diagnostics: &mut Vec<Diagnosti
                 fixits: Vec::new(),
                 span: mark.span,
                 message: format!("mark `{}` rides unknown site `{}`", mark.name, mark.site),
-                suggestion: Some(suggest_then(
+                suggestion: suggest(suggest_then(
                     &mark.site,
                     ir.rules.iter().map(|rule| rule.name.as_str()),
                     format!(
@@ -9151,7 +9219,7 @@ fn validate_improve_declarations(ir: &IrProgram, diagnostics: &mut Vec<Diagnosti
             fixits: Vec::new(),
             span,
             message: format!("unknown gauge `{name}`"),
-            suggestion: Some(suggest_otherwise(
+            suggestion: suggest(suggest_otherwise(
                 name,
                 gauge_names
                     .iter()
@@ -9182,7 +9250,7 @@ fn validate_improve_declarations(ir: &IrProgram, diagnostics: &mut Vec<Diagnosti
                             "gauge `{}` judges via undeclared coerce `{}`",
                             gauge.name, gauge.judge_target
                         ),
-                        suggestion: Some(suggest_otherwise(
+                        suggestion: suggest(suggest_otherwise(
                             &gauge.judge_target,
                             ir.coerces.iter().map(|coerce| coerce.name.as_str()),
                             "declare the coerce this gauge judges with",
@@ -9213,7 +9281,7 @@ fn validate_improve_declarations(ir: &IrProgram, diagnostics: &mut Vec<Diagnosti
                                     gauge.judge_target,
                                     coerce.params.len()
                                 ),
-                                suggestion: Some(
+                                suggestion: suggest(
                                     "give the coerce one record-shaped parameter, or bind each \
                                      parameter to an explicit path"
                                         .to_owned(),
@@ -9241,7 +9309,7 @@ fn validate_improve_declarations(ir: &IrProgram, diagnostics: &mut Vec<Diagnosti
                                          path",
                                         gauge.name
                                     ),
-                                    suggestion: Some(
+                                    suggestion: suggest(
                                         "arguments are `input.<path>`, \
                                          `facts.<Class>.<field...>`, or the single reserved \
                                          `record`"
@@ -9266,7 +9334,7 @@ fn validate_improve_declarations(ir: &IrProgram, diagnostics: &mut Vec<Diagnosti
                                     gauge.judge_target,
                                     coerce.params.len()
                                 ),
-                                suggestion: Some(
+                                suggestion: suggest(
                                     "bind one path per coerce parameter, in order".to_owned(),
                                 ),
                             });
@@ -9287,7 +9355,7 @@ fn validate_improve_declarations(ir: &IrProgram, diagnostics: &mut Vec<Diagnosti
                     "derived gauge `{}` must judge via exec (its judge receives the input score vector)",
                     gauge.name
                 ),
-                suggestion: Some("use `judge via exec \"<validator>\"`".to_owned()),
+                suggestion: suggest("use `judge via exec \"<validator>\"`".to_owned()),
             });
         }
         for input in &gauge.inputs {
@@ -9344,7 +9412,7 @@ fn validate_improve_declarations(ir: &IrProgram, diagnostics: &mut Vec<Diagnosti
                     fixits: Vec::new(),
                     span: campaign.span,
                     message,
-                    suggestion: Some("name each gauge once, in at most one clause".to_owned()),
+                    suggestion: suggest("name each gauge once, in at most one clause".to_owned()),
                 });
             }
         }
@@ -9415,7 +9483,7 @@ fn validate_test_expr_source(
             fixits: Vec::new(),
             span,
             message: format!("{label} is empty"),
-            suggestion: Some("provide an expression".to_owned()),
+            suggestion: suggest("provide an expression".to_owned()),
         });
         return;
     }
@@ -9480,7 +9548,7 @@ fn validate_presence_conditions(
                 // offering one as a did-you-mean would send the reader from one
                 // error to a different one. `literal_union_values` is that
                 // filter, applied before the suggestion rather than after it.
-                suggestion: Some(suggest_then(
+                suggestion: suggest(suggest_then(
                     disc,
                     fields
                         .iter()
@@ -9503,7 +9571,7 @@ fn validate_presence_conditions(
                     "`{container}` field `{}` is conditioned on `{disc} is \"{literal}\"`, which is not a value of `{disc}`",
                     field.name.name
                 ),
-                suggestion: Some(suggest_then(
+                suggestion: suggest(suggest_then(
                     literal,
                     values.iter(),
                     format!("use one of: {}", values.join(", ")),
@@ -9519,7 +9587,7 @@ fn validate_presence_conditions(
                     "`{container}` field `{}` is conditioned on `{disc}`, which is not a string-literal discriminant",
                     field.name.name
                 ),
-                suggestion: Some(
+                suggestion: suggest(
                     "the discriminant must be a string-literal union, e.g. `kind \"a\" | \"b\"`"
                         .to_owned(),
                 ),
@@ -9648,7 +9716,7 @@ fn validate_coerce_body_fields(coerce: &CoerceDecl, diagnostics: &mut Vec<Diagno
                         "coerce `{}` has a malformed `provider` clause: `{trimmed}`",
                         coerce.name.name
                     ),
-                    suggestion: Some("write `provider <name>`".to_owned()),
+                    suggestion: suggest("write `provider <name>`".to_owned()),
                 });
             }
             continue;
@@ -9664,7 +9732,7 @@ fn validate_coerce_body_fields(coerce: &CoerceDecl, diagnostics: &mut Vec<Diagno
                 "unknown coerce field `{field}` on coerce `{}`",
                 coerce.name.name
             ),
-            suggestion: Some(suggest_then_keyword(
+            suggestion: suggest(suggest_then_keyword(
                 field,
                 ["prompt", "provider"],
                 "supported coerce fields are `prompt` and `provider`",
@@ -9710,7 +9778,7 @@ fn validate_type_refs(
                     fixits: Vec::new(),
                     span: kind.span,
                     message: format!("`secret` names unknown credential kind `{}`", kind.name),
-                    suggestion: Some(suggest_then_keyword(
+                    suggestion: suggest(suggest_then_keyword(
                         &kind.name,
                         credential_kind_spellings(),
                         format!("name one of: {}", credential_kind_spellings().join(", ")),
@@ -9728,7 +9796,7 @@ fn validate_type_refs(
                     fixits: Vec::new(),
                     span: name.span,
                     message: format!("unknown schema reference `{}`", name.name),
-                    suggestion: Some(suggest_otherwise(
+                    suggestion: suggest(suggest_otherwise(
                         &name.name,
                         schema_names
                             .iter()
@@ -9757,7 +9825,7 @@ fn validate_type_refs(
                                 "AgentRef lists agent `{}` more than once",
                                 agent.name
                             ),
-                            suggestion: Some(
+                            suggestion: suggest(
                                 "remove the duplicate agent from the AgentRef domain".to_owned(),
                             ),
                         }
@@ -9774,7 +9842,7 @@ fn validate_type_refs(
                         fixits: Vec::new(),
                         span: agent.span,
                         message: format!("AgentRef references unknown agent `{}`", agent.name),
-                        suggestion: Some(suggest_otherwise(
+                        suggestion: suggest(suggest_otherwise(
                             &agent.name,
                             agent_names.iter(),
                             format!("declare `agent {}` before using it in AgentRef", agent.name),
@@ -9887,7 +9955,7 @@ fn validate_canonical_rule_body_syntax(rule: &RuleDecl, diagnostics: &mut Vec<Di
                     "rule `{}` uses unsupported `then` sequencing",
                     rule.name.name
                 ),
-                suggestion: Some(
+                suggestion: suggest(
                     "use `after <effect> succeeds { ... }` blocks for effect sequencing".to_owned(),
                 ),
             });
@@ -9903,7 +9971,7 @@ fn validate_canonical_rule_body_syntax(rule: &RuleDecl, diagnostics: &mut Vec<Di
                     "rule `{}` uses unsupported `after ... =>` sequencing",
                     rule.name.name
                 ),
-                suggestion: Some("write `after <effect> succeeds { ... }`".to_owned()),
+                suggestion: suggest("write `after <effect> succeeds { ... }`".to_owned()),
             });
         }
     }
@@ -9941,7 +10009,7 @@ fn validate_measure_declarations(
                 fixits: Vec::new(),
                 span: declaration.span,
                 message: format!("`measure` names unknown class `{}`", declaration.class),
-                suggestion: Some(format!(
+                suggestion: suggest(format!(
                     "declare `class {}` before measuring a field of it",
                     declaration.class
                 )),
@@ -9965,7 +10033,9 @@ fn validate_measure_declarations(
                     "`measure` names field `{}`, which class `{}` does not declare",
                     declaration.field, declaration.class
                 ),
-                suggestion: Some("measure a field the class carries around the cycle".to_owned()),
+                suggestion: suggest(
+                    "measure a field the class carries around the cycle".to_owned(),
+                ),
             });
             continue;
         }
@@ -9980,7 +10050,7 @@ fn validate_measure_declarations(
                     "`measure` names field `{}.{}`, which is not an `int`",
                     declaration.class, declaration.field
                 ),
-                suggestion: Some(
+                suggestion: suggest(
                     "a measure descends over whole numbers: a `float` field can approach a bound forever without reaching it, and `duration` has no literal in the expression grammar yet"
                         .to_owned(),
                 ),
@@ -9999,7 +10069,7 @@ fn validate_measure_declarations(
                         "`measure` bound `{}.{bound}` is not an `int` field of the class",
                         declaration.class
                     ),
-                    suggestion: Some(
+                    suggestion: suggest(
                         "the bound travels with the fact, so it must be a whole-number field the class declares"
                             .to_owned(),
                     ),
@@ -10018,7 +10088,7 @@ fn validate_measure_declarations(
                     "`measure {}.{}` is declared more than once",
                     declaration.class, declaration.field
                 ),
-                suggestion: Some(
+                suggestion: suggest(
                     "one measure per class field; two claims about the same field cannot both govern its cycle"
                         .to_owned(),
                 ),
@@ -10036,7 +10106,7 @@ fn validate_measure_declarations(
                     "`measure {}.{}` governs no cycle",
                     declaration.class, declaration.field
                 ),
-                suggestion: Some(
+                suggestion: suggest(
                     "no effect-bearing cycle carries this class, so the declaration states nothing the compiler can check — remove it, or keep it if the cycle is coming"
                         .to_owned(),
                 ),
@@ -10307,7 +10377,7 @@ fn validate_effectful_rule_recursion(
                     "declared measure is not honoured: `measure {class}.{field}` states that the cycle {} ends, and {reason}",
                     names.join(" -> ")
                 ),
-                suggestion: Some(
+                suggestion: suggest(
                     "a `measure` declaration is verified, not taken: bring the code back to the claim, correct the claim, or remove it"
                         .to_owned(),
                 ),
@@ -10362,7 +10432,7 @@ fn validate_effectful_rule_recursion(
                         // name the field. Nothing else does, and telling the
                         // author of a channel loop to bound `issue.releases`
                         // sends them looking for a tracker they do not have.
-                        suggestion: Some(if kind == "tracker" {
+                        suggestion: suggest(if kind == "tracker" {
                             "if it is meant to run for as long as work arrives, nothing is wrong. If it is meant to stop after a fixed number of tries, bound the tracker's own count of them — `where issue.releases < 3` on the `when` that matches the item"
                                 .to_owned()
                         } else {
@@ -10515,7 +10585,7 @@ fn validate_effectful_rule_recursion(
         // DR-0081 §8: when the analysis nearly had a measure, the suggestion
         // leads with which half was missing rather than restating the rule.
         let with_miss = |text: &str| {
-            Some(match &nearest_miss {
+            suggest(match &nearest_miss {
                 Some(miss) => format!("{miss}; {text}"),
                 None => text.to_owned(),
             })
@@ -10837,7 +10907,7 @@ fn validate_message_from_channels(
                 fixits: Vec::new(),
                 span: when.span,
                 message: format!("`when message from {channel}` names an unknown channel"),
-                suggestion: Some(suggest_otherwise(
+                suggestion: suggest(suggest_otherwise(
                     channel,
                     semantic.channels.iter(),
                     "declare it with `channel <name> { provider … }`, or correct the channel name",
@@ -10867,7 +10937,7 @@ fn validate_message_from_channels(
                         "`when message from {channel}` observes a channel whose provider `{}` is outbound-only (its capability report cannot deliver inbound messages)",
                         report.short_name
                     ),
-                    suggestion: Some(
+                    suggestion: suggest(
                         "route inbound observation through an inbound-capable provider (`local`, `stdio`, `fixture`)"
                             .to_owned(),
                     ),
@@ -10909,7 +10979,7 @@ fn validate_send_channels(
                                             "`send via {}` names an unknown channel",
                                             channel.source
                                         ),
-                                        suggestion: Some(suggest_otherwise(
+                                        suggestion: suggest(suggest_otherwise(
                                             &channel.source,
                                             semantic.channels.iter(),
                                             "declare it with `channel <name> { provider … }`, or correct the channel name",
@@ -10940,7 +11010,7 @@ fn validate_send_channels(
                                                 "`send via {}` targets a channel whose provider `{}` is inbound-only (its capability report cannot accept outbound sends)",
                                                 channel.source, report.short_name
                                             ),
-                                            suggestion: Some(
+                                            suggestion: suggest(
                                                 "send through an outbound-capable provider (`local`, `desktop`, `stdio`, `fixture`)"
                                                     .to_owned(),
                                             ),
@@ -10964,7 +11034,7 @@ fn validate_send_channels(
                                             "`{keyword}` names unknown memory pool `{}`",
                                             pool.source
                                         ),
-                                        suggestion: Some(suggest_otherwise(
+                                        suggestion: suggest(suggest_otherwise(
                                             &pool.source,
                                             semantic.memory_pools.iter(),
                                             "declare it with `memory pool <name> { … }`, or correct the pool name",
@@ -11028,7 +11098,7 @@ fn validate_turn_access_grants(
                         "rule `{}` has a `with access to {}` grant that grants no operations",
                         rule.name.name, grant.resource
                     ),
-                    suggestion: Some(
+                    suggestion: suggest(
                         "list at least one operation in the grant block, or drop the grant"
                             .to_owned(),
                     ),
@@ -11046,7 +11116,7 @@ fn validate_turn_access_grants(
                         "rule `{}` lists access resource `{}` more than once on one effect",
                         rule.name.name, grant.resource
                     ),
-                    suggestion: Some(
+                    suggestion: suggest(
                         "merge the grant clauses for a resource into a single block".to_owned(),
                     ),
                 });
@@ -11105,7 +11175,7 @@ fn validate_credential_grant_classes(
                 op.operation,
                 class.requirement()
             ),
-            suggestion: Some(match class {
+            suggestion: suggest(match class {
                 GrantClass::Narrowable => format!(
                     "narrow it, as in `{} [\"host/path/*\"]`",
                     op.operation
@@ -11143,7 +11213,7 @@ fn validate_evidence_fact_not_matched(rule: &RuleDecl, diagnostics: &mut Vec<Dia
                     "rule `{}` matches evidence-only fact `{name}`: in-turn observations are evidence, not rule-matchable facts",
                     rule.name.name
                 ),
-                suggestion: Some(
+                suggestion: suggest(
                     "match a lifecycle fact (`agent.turn.completed`/`failed`/`timed_out`/`cancelled`) and read in-turn detail from its evidence".to_owned(),
                 ),
             });
@@ -11211,7 +11281,7 @@ fn extract_rule_regions(
                     "rule `{}` declares more than one `during`/`until` region",
                     rule.name.name
                 ),
-                suggestion: Some(
+                suggestion: suggest(
                     "v1 supports one region per rule (including nested regions); split the \
                      rule or merge the conditions"
                         .to_owned(),
@@ -11232,7 +11302,7 @@ fn extract_rule_regions(
                     if region.until { "until" } else { "during" },
                     rule.name.name
                 ),
-                suggestion: Some(
+                suggestion: suggest(
                     "a region around purely-atomic actions commits with admission and can \
                      never lapse between steps; it needs at least one effect with a \
                      continuation"
@@ -11265,7 +11335,7 @@ fn extract_rule_regions(
                          region introduces — it may not exist when the arm runs",
                         rule.name.name
                     ),
-                    suggestion: Some(
+                    suggestion: suggest(
                         "reference only bindings from before the region, or bind the \
                          progress view (`on lapse as got`) and read `got.<binding>` — its \
                          fields are present exactly if that step settled"
@@ -11618,7 +11688,7 @@ fn validate_effectful_self_trigger(
                     "effectful rule `{}` preserves trigger fact `{written_fact}`",
                     rule.name.name
                 ),
-                suggestion: Some(
+                suggestion: suggest(
                     "consume or advance the triggering fact, or move the next effect behind an external completion event"
                         .to_owned(),
                 ),
@@ -11689,7 +11759,7 @@ fn validate_workflow_terminal_actions(
                             "rule `{}` {action}s unknown workflow terminal `{name}`",
                             rule.name.name
                         ),
-                        suggestion: Some(suggest_otherwise(
+                        suggestion: suggest(suggest_otherwise(
                             name,
                             declared.keys(),
                             format!(
@@ -11746,7 +11816,7 @@ fn validate_workflow_terminal_actions(
                 fixits: Vec::new(),
                 span: BodyAnchor::text(&rule.body, head, line).whole(),
                 message: format!("rule `{}` has malformed `{action}` action", rule.name.name),
-                suggestion: Some(format!(
+                suggestion: suggest(format!(
                     "{action} a declared workflow terminal with a payload block"
                 )),
             });
@@ -11763,7 +11833,7 @@ fn validate_workflow_terminal_actions(
                     "rule `{}` {action}s unknown workflow terminal `{name}`",
                     rule.name.name
                 ),
-                suggestion: Some(suggest_otherwise(
+                suggestion: suggest(suggest_otherwise(
                     name,
                     declared.keys(),
                     format!(
@@ -11883,7 +11953,7 @@ pub(crate) fn validate_declared_terminal_payload_contract(
             "workflow terminal `{name}` declares an unsupported payload contract type `{}`",
             ty.to_source()
         ),
-        suggestion: Some(format!(
+        suggestion: suggest(format!(
             "declare the payload as a class (field block) or a scalar type: `{keyword} {name} <Class>` or `{keyword} {name} string`"
         )),
     });
@@ -11926,7 +11996,7 @@ fn validate_workflow_terminal_payload(
                 message: format!(
                     "workflow terminal `{terminal_name}` has a scalar payload contract but is given a field block"
                 ),
-                suggestion: Some(format!(
+                suggestion: suggest(format!(
                     "write a bare scalar value: `{action} {terminal_name} <value>`"
                 )),
             });
@@ -11988,7 +12058,7 @@ fn validate_scalar_terminal_payload(
                     "workflow terminal `{terminal_name}` has a class payload contract `{}` but is given a bare scalar value",
                     name.name
                 ),
-                suggestion: Some(format!("write a field block: `{action} {terminal_name} {{ … }}`")),
+                suggestion: suggest(format!("write a field block: `{action} {terminal_name} {{ … }}`")),
             });
             return;
         }
@@ -12001,7 +12071,7 @@ fn validate_scalar_terminal_payload(
             fixits: Vec::new(),
             span: site.field.whole(),
             message: format!("workflow terminal `{terminal_name}` is missing its scalar value"),
-            suggestion: Some(format!("write `{action} {terminal_name} <value>`")),
+            suggestion: suggest(format!("write `{action} {terminal_name} <value>`")),
         });
         return;
     }
@@ -12046,7 +12116,7 @@ fn validate_scalar_terminal_payload(
                 "rule `{}` has unknown binding `{root}` in `{action} {terminal_name}` value",
                 rule.name.name
             ),
-            suggestion: Some(suggest_binding_root(
+            suggestion: suggest(suggest_binding_root(
                 &root,
                 known_roots,
                 BINDING_ROOT_FALLBACK,
@@ -12086,7 +12156,7 @@ fn validate_required_terminal_fields(
             message: format!(
                 "workflow terminal `{terminal_name}` is missing required field `{schema}.{required}`"
             ),
-            suggestion: Some(format!("add `{required}` to the `{terminal_name}` payload")),
+            suggestion: suggest(format!("add `{required}` to the `{terminal_name}` payload")),
         });
     }
 }
@@ -12279,7 +12349,7 @@ fn analyze_rule(
                     "rule `{}` has unknown readiness pattern `{pattern_text}`",
                     rule.name.name
                 ),
-                suggestion: Some(
+                suggestion: suggest(
                     "match a class (`when Class as x`) or a runtime fact (`when fact <name> as x`)"
                         .to_owned(),
                 ),
@@ -12300,7 +12370,7 @@ fn analyze_rule(
                     fixits: Vec::new(),
                     span: when.span,
                     message: format!("rule `{}` matches unknown class `{schema}`", rule.name.name),
-                    suggestion: Some(suggestion),
+                    suggestion: suggest(suggestion),
                 });
             }
             // The bare dotted form is the typed signal reaction
@@ -12320,7 +12390,7 @@ fn analyze_rule(
                         "rule `{}` reacts to undeclared signal `{schema}`",
                         rule.name.name
                     ),
-                    suggestion: Some(suggest_otherwise(
+                    suggestion: suggest(suggest_otherwise(
                         &schema,
                         semantic.schemas.events.iter(),
                         format!(
@@ -12457,7 +12527,7 @@ fn analyze_rule(
                          matches a {negative} outcome (the op completes either way)",
                         rule.name.name
                     ),
-                    suggestion: Some(format!(
+                    suggestion: suggest(format!(
                         "use `after {binding} {positive}` / `after {binding} {negative_arm}` \
                          for the outcome variants, or `after {binding} completes` for any \
                          settled outcome"
@@ -12479,7 +12549,7 @@ fn analyze_rule(
                              matches a Contended outcome (the acquire op completes either way)",
                             rule.name.name
                         ),
-                        suggestion: Some(format!(
+                        suggestion: suggest(format!(
                             "use `after {binding} held` / `after {binding} contended` for the \
                              outcome variants, or `after {binding} completes` for any settled \
                              outcome"
@@ -12499,7 +12569,7 @@ fn analyze_rule(
                              either way)",
                             rule.name.name
                         ),
-                        suggestion: Some(format!(
+                        suggestion: suggest(format!(
                             "use `after {binding} ok` / `after {binding} over` for the outcome \
                              variants, or `after {binding} completes` for any settled outcome"
                         )),
@@ -12860,7 +12930,7 @@ fn analyze_rule(
                     "rule `{}` places effect binding `{binding}` after a multiline string delimiter",
                     rule.name.name
                 ),
-                suggestion: Some(format!(
+                suggestion: suggest(format!(
                     "move `as {binding}` onto the effect line, before the multiline string body"
                 )),
             });
@@ -12923,7 +12993,7 @@ fn analyze_rule(
                         "rule `{}` consumes unknown fact binding `{binding}`",
                         rule.name.name
                     ),
-                    suggestion: Some(suggest_otherwise(
+                    suggestion: suggest(suggest_otherwise(
                         &binding,
                         binding_types.keys(),
                         "consume a binding introduced by a `when Class as binding` clause",
@@ -14166,7 +14236,7 @@ fn collect_effect_payload_types(
                         "rule `{}` reuses effect binding `{binding}` for effects with conflicting result types",
                         rule.name.name
                     ),
-                    suggestion: Some(format!(
+                    suggestion: suggest(format!(
                         "give each effect a distinct binding — `as {binding}` is reused with a different result type, so `after {binding} …` is ambiguous"
                     )),
                 });
@@ -15218,7 +15288,7 @@ fn validate_mint_credential(
                 "rule `{}` mints from undeclared credential `{parent}`",
                 rule.name.name
             ),
-            suggestion: Some(suggest_otherwise(
+            suggestion: suggest(suggest_otherwise(
                 parent,
                 declared_credentials.iter().copied(),
                 format!("declare it: `credential {parent} {{ kind bearer }}`"),
@@ -15246,7 +15316,7 @@ fn validate_mint_credential(
                 "rule `{}` mints from `{parent}` without presenting it",
                 rule.name.name
             ),
-            suggestion: Some(format!(
+            suggestion: suggest(format!(
                 "present the parent at a marked slot: `header \"Authorization\" basic {parent}`"
             )),
         });
@@ -15267,7 +15337,7 @@ fn validate_mint_credential(
                     "rule `{}` mints from `{parent}` but the exchange presents `{handle}`",
                     rule.name.name
                 ),
-                suggestion: Some(
+                suggestion: suggest(
                     "a mint spends exactly the credential it mints from — the child inherits \
                      that parent's egress ceiling through its name"
                         .to_owned(),
@@ -15319,7 +15389,7 @@ fn validate_credential_allow(
                             rule.name.name,
                             allowed.join(", ")
                         ),
-                        suggestion: Some(format!(
+                        suggestion: suggest(format!(
                             "add `{operation}` to the credential's `allow` list, or use a \
                              credential declared for it"
                         )),
@@ -15454,7 +15524,7 @@ fn validate_obtain_credential(
             "rule `{}` escalates for undeclared credential `{credential}`",
             rule.name.name
         ),
-        suggestion: Some(suggest_otherwise(
+        suggestion: suggest(suggest_otherwise(
             credential,
             declared_credentials.iter().copied(),
             format!(
@@ -15531,7 +15601,7 @@ fn validate_no_raw_authorization_header(
                 "rule `{}` writes a raw `Authorization` header in a `{construct}`",
                 rule.name.name
             ),
-            suggestion: Some(
+            suggestion: suggest(
                 "present a declared credential instead — `header \"Authorization\" bearer \
                  <handle>`, `basic`, or `raw` — or sign the request with `signed with <handle>`. \
                  a raw value here puts authentication on the wire that the checker never read"
@@ -15564,7 +15634,7 @@ fn validate_http_request(
                     "rule `{}` presents undeclared credential `{handle}` in a `request`",
                     rule.name.name
                 ),
-                suggestion: Some(suggest_otherwise(
+                suggestion: suggest(suggest_otherwise(
                     handle,
                     declared_credentials.iter().copied(),
                     format!("declare it with `credential {handle} {{ kind bearer }}`"),
@@ -15592,7 +15662,7 @@ fn validate_http_request(
                 names.len(),
                 names.join(", ")
             ),
-            suggestion: Some(
+            suggestion: suggest(
                 "a request carries one credential: split it, or present the same handle in \
                  every slot"
                     .to_owned(),
@@ -15614,7 +15684,7 @@ fn validate_http_request(
                 "rule `{}` has a `request` that authenticates nothing",
                 rule.name.name
             ),
-            suggestion: Some(
+            suggestion: suggest(
                 "present a credential — `header \"Authorization\" bearer <handle>` — or sign the \
                  request with `signed with <handle>`"
                     .to_owned(),
@@ -16081,7 +16151,7 @@ fn validate_after_bindings(
                             "rule `{}` has `after` block for unknown effect binding `{binding}`",
                             rule.name.name
                         ),
-                        suggestion: Some(suggestion),
+                        suggestion: suggest(suggestion),
                     });
                 }
                 // An `after … as <alias>` introduces the alias for the block's
@@ -16459,7 +16529,7 @@ fn validate_coerce_call(
             fixits: Vec::new(),
             span: at.whole(),
             message: format!("rule `{}` has malformed coerce call", rule.name.name),
-            suggestion: Some("write `coerce functionName(arg, ...) as name`".to_owned()),
+            suggestion: suggest("write `coerce functionName(arg, ...) as name`".to_owned()),
         });
         return;
     };
@@ -16474,7 +16544,7 @@ fn validate_coerce_call(
                 "rule `{}` calls unknown coerce function `{function_name}`",
                 rule.name.name
             ),
-            suggestion: Some(suggest_otherwise(
+            suggestion: suggest(suggest_otherwise(
                 function_name,
                 semantic.coerce_params.keys(),
                 format!(
@@ -16497,7 +16567,7 @@ fn validate_coerce_call(
                 args.len(),
                 params.len()
             ),
-            suggestion: Some("pass one argument for each declared coerce parameter".to_owned()),
+            suggestion: suggest("pass one argument for each declared coerce parameter".to_owned()),
         });
         return;
     }
@@ -16517,7 +16587,7 @@ fn validate_coerce_call(
                     "rule `{}` has unknown binding `{root}` in coerce `{function_name}` argument",
                     rule.name.name
                 ),
-                suggestion: Some(suggest_binding_root(
+                suggestion: suggest(suggest_binding_root(
                     &root,
                     known_roots,
                     BINDING_ROOT_FALLBACK,
@@ -16582,7 +16652,9 @@ fn validate_workflow_invocations(
                     "rule `{}` has malformed workflow invocation",
                     rule.name.name
                 ),
-                suggestion: Some("write `invoke Workflow { input value } as binding`".to_owned()),
+                suggestion: suggest(
+                    "write `invoke Workflow { input value } as binding`".to_owned(),
+                ),
             });
             continue;
         };
@@ -16597,7 +16669,7 @@ fn validate_workflow_invocations(
                     "rule `{}` recursively invokes workflow `{target}`",
                     rule.name.name
                 ),
-                suggestion: Some(
+                suggestion: suggest(
                     "split recursive orchestration into an explicit bounded scheduler workflow"
                         .to_owned(),
                 ),
@@ -16615,7 +16687,7 @@ fn validate_workflow_invocations(
                     "rule `{}` invokes unknown workflow `{target}`",
                     rule.name.name
                 ),
-                suggestion: Some(suggest_otherwise(
+                suggestion: suggest(suggest_otherwise(
                     target,
                     semantic.workflow_inputs.keys(),
                     "invoke a workflow declared in this source bundle",
@@ -16641,7 +16713,7 @@ fn validate_workflow_invocations(
                     fixits: Vec::new(),
                     span: at.whole(),
                     message: format!("workflow invocation `{target}` repeats input `{field}`"),
-                    suggestion: Some("remove the duplicate invocation input".to_owned()),
+                    suggestion: suggest("remove the duplicate invocation input".to_owned()),
                 });
                 continue;
             }
@@ -16659,7 +16731,7 @@ fn validate_workflow_invocations(
                     fixits: Vec::new(),
                     span: at.whole(),
                     message: format!("workflow `{target}` has no input `{field}`"),
-                    suggestion: Some(if known.is_empty() {
+                    suggestion: suggest(if known.is_empty() {
                         "remove the invocation payload; the target declares no inputs".to_owned()
                     } else {
                         suggest_then(
@@ -16682,7 +16754,7 @@ fn validate_workflow_invocations(
                         "rule `{}` has unknown binding `{root}` in `invoke {target}` input `{field}`",
                         rule.name.name
                     ),
-                    suggestion: Some(suggest_binding_root(&root, known_roots, BINDING_ROOT_FALLBACK)),
+                    suggestion: suggest(suggest_binding_root(&root, known_roots, BINDING_ROOT_FALLBACK)),
                 });
             }
             validate_expr_source_against_type(
@@ -16709,7 +16781,7 @@ fn validate_workflow_invocations(
                 fixits: Vec::new(),
                 span: at.whole(),
                 message: format!("workflow invocation `{target}` is missing input `{input}`"),
-                suggestion: Some(format!(
+                suggestion: suggest(format!(
                     "add `{input}` to the `{target}` invocation payload"
                 )),
             });
@@ -16739,7 +16811,9 @@ fn validate_agent_tell_target(
             fixits: Vec::new(),
             span: at.whole(),
             message: format!("rule `{}` has malformed tell target", rule.name.name),
-            suggestion: Some("write `tell agentName ...` or `tell task.agentRef ...`".to_owned()),
+            suggestion: suggest(
+                "write `tell agentName ...` or `tell task.agentRef ...`".to_owned(),
+            ),
         });
         return;
     };
@@ -16754,7 +16828,7 @@ fn validate_agent_tell_target(
                 "rule `{}` uses a string literal as a tell target",
                 rule.name.name
             ),
-            suggestion: Some("use a declared agent name or an AgentRef field".to_owned()),
+            suggestion: suggest("use a declared agent name or an AgentRef field".to_owned()),
         });
         return;
     }
@@ -16775,7 +16849,7 @@ fn validate_agent_tell_target(
                         "rule `{}` has unknown binding `{root}` in tell target `{target}`",
                         rule.name.name
                     ),
-                    suggestion: Some(suggest_binding_root(
+                    suggestion: suggest(suggest_binding_root(
                         &root,
                         known_roots,
                         "reference a binding from a `when ... as name` clause or an effect `as` binding",
@@ -16806,7 +16880,7 @@ fn validate_agent_tell_target(
                     "rule `{}` uses non-AgentRef dynamic tell target `{target}`",
                     rule.name.name
                 ),
-                suggestion: Some(
+                suggestion: suggest(
                     "declare the field as `AgentRef<...>` before using it as a tell target"
                         .to_owned(),
                 ),
@@ -16822,7 +16896,7 @@ fn validate_agent_tell_target(
             fixits: Vec::new(),
             span: at.whole(),
             message: format!("rule `{}` tells unknown agent `{target}`", rule.name.name),
-            suggestion: Some(suggest_otherwise(
+            suggestion: suggest(suggest_otherwise(
                 target,
                 semantic.agents.iter(),
                 "declare the target agent before telling it",
@@ -16868,7 +16942,7 @@ fn validate_agent_capabilities(
                     "rule `{}` tells agent `{agent}` requiring undeclared capability `{capability}`",
                     rule.name.name
                 ),
-                suggestion: Some(suggest_otherwise(
+                suggestion: suggest(suggest_otherwise(
                     capability,
                     declared.iter(),
                     format!(
@@ -16907,7 +16981,7 @@ fn validate_availability_when(
                     "rule `{}` checks availability for non-AgentRef `{target}`",
                     rule.name.name
                 ),
-                suggestion: Some(
+                suggestion: suggest(
                     "availability checks must name a declared agent or an AgentRef field"
                         .to_owned(),
                 ),
@@ -16923,7 +16997,7 @@ fn validate_availability_when(
             fixits: Vec::new(),
             span: at,
             message: format!("rule `{}` checks unknown agent `{target}`", rule.name.name),
-            suggestion: Some(suggest_otherwise(
+            suggestion: suggest(suggest_otherwise(
                 target,
                 semantic.agents.iter(),
                 "declare the target agent before checking availability",
@@ -17153,7 +17227,7 @@ fn validate_expression(
             // expression.
             span: error.range.map_or_else(|| at.whole(), |range| at.at(range)),
             message: format!("rule `{}` has invalid {label} expression: {}", rule.name.name, error.message),
-            suggestion: Some("use deterministic field paths, literals, boolean operators, comparisons, membership, count, or exists".to_owned()),
+            suggestion: suggest("use deterministic field paths, literals, boolean operators, comparisons, membership, count, or exists".to_owned()),
         }),
     }
 }
@@ -17188,7 +17262,7 @@ fn validate_parsed_expression(
             // that is not a bool.
             span: context.span(),
             message: format!("{} has non-boolean {label} expression", context.subject),
-            suggestion: Some(format!("{label} expressions must evaluate to bool")),
+            suggestion: suggest(format!("{label} expressions must evaluate to bool")),
         });
     }
 }
@@ -17234,7 +17308,7 @@ fn validate_expr_node(
                                 context.subject,
                                 path.join(".")
                             ),
-                            suggestion: Some(optional_presence_repair(&unproven)),
+                            suggestion: suggest(optional_presence_repair(&unproven)),
                         });
                         return;
                     }
@@ -17254,7 +17328,7 @@ fn validate_expr_node(
                                 context.subject,
                                 path.join(".")
                             ),
-                            suggestion: Some(suggestion),
+                            suggestion: suggest(suggestion),
                         };
                         diagnostics.push(match &failed_on {
                             Some(failed_on) => {
@@ -17272,7 +17346,7 @@ fn validate_expr_node(
                     fixits: Vec::new(),
                     span: at,
                     message: format!("{} has unknown expression root `{root}`", context.subject),
-                    suggestion: Some(suggest_otherwise(
+                    suggestion: suggest(suggest_otherwise(
                         root,
                         scope.binding_types.keys(),
                         "use a binding introduced by a `when ... as name` clause",
@@ -17299,7 +17373,7 @@ fn validate_expr_node(
                         context.subject,
                         path.join(".")
                     ),
-                    suggestion: Some(optional_presence_repair(&unproven)),
+                    suggestion: suggest(optional_presence_repair(&unproven)),
                 });
                 return;
             }
@@ -17318,7 +17392,7 @@ fn validate_expr_node(
                         context.subject,
                         path.join(".")
                     ),
-                    suggestion: Some(suggestion),
+                    suggestion: suggest(suggestion),
                 };
                 diagnostics.push(match &failed_on {
                     Some(failed_on) => declared_here(diagnostic, failed_on, &semantic.schemas),
@@ -17356,7 +17430,7 @@ fn validate_expr_node(
                     // The key is the operand the message is about.
                     span: context.node(spans.child(1)),
                     message: format!("{} indexes a map with a non-string key", context.subject),
-                    suggestion: Some(
+                    suggestion: suggest(
                         "use a string literal or string expression as the map key".to_owned(),
                     ),
                 });
@@ -17388,7 +17462,7 @@ fn validate_expr_node(
                     "{} uses an object literal without an expected object or map type",
                     context.subject
                 ),
-                suggestion: Some(
+                suggestion: suggest(
                     "use object literals only in typed record fields or typed effect arguments"
                         .to_owned(),
                 ),
@@ -17589,7 +17663,7 @@ fn validate_unknown_implicit_ident(
             "{} fact query `{schema}` has unknown field `{name}`",
             context.subject
         ),
-        suggestion: Some(suggest_otherwise(
+        suggestion: suggest(suggest_otherwise(
             name,
             semantic
                 .schemas
@@ -17644,7 +17718,7 @@ fn validate_function_call(
                         context.subject,
                         args.len()
                     ),
-                    suggestion: Some(
+                    suggestion: suggest(
                         "call `count` with exactly one array, map, fact query, or effect query argument"
                             .to_owned(),
                     ),
@@ -17671,7 +17745,7 @@ fn validate_function_call(
                         context.subject,
                         expr_type_label(&ty)
                     ),
-                    suggestion: Some(
+                    suggestion: suggest(
                         "use `count` only with arrays, maps, fact queries, or effect queries"
                             .to_owned(),
                     ),
@@ -17691,7 +17765,7 @@ fn validate_function_call(
                         context.subject,
                         args.len()
                     ),
-                    suggestion: Some("call `exists` with exactly one argument".to_owned()),
+                    suggestion: suggest("call `exists` with exactly one argument".to_owned()),
                 });
                 return;
             }
@@ -17715,7 +17789,7 @@ fn validate_function_call(
                         context.subject,
                         expr_type_label(&ty)
                     ),
-                    suggestion: Some(
+                    suggestion: suggest(
                         "use `exists path` for optional/map presence checks or pass an array, map, fact query, or effect query"
                             .to_owned(),
                     ),
@@ -17735,7 +17809,7 @@ fn validate_function_call(
                         context.subject,
                         args.len()
                     ),
-                    suggestion: Some(
+                    suggestion: suggest(
                         "call `empty` with exactly one array, map, string, fact query, or effect query argument"
                             .to_owned(),
                     ),
@@ -17767,7 +17841,7 @@ fn validate_function_call(
                         if optional { "optional " } else { "" },
                         expr_type_label(&ty)
                     ),
-                    suggestion: Some(
+                    suggestion: suggest(
                         "use `empty` only with arrays, maps, strings, fact queries, effect queries, null, or supported optional values"
                             .to_owned(),
                     ),
@@ -17803,7 +17877,7 @@ fn validate_query_expr(
                     context.subject,
                     head.trim()
                 ),
-                suggestion: Some(suggest_otherwise(
+                suggestion: suggest(suggest_otherwise(
                     head.trim(),
                     semantic.schemas.classes.keys(),
                     "use a declared class name in fact queries",
@@ -17834,7 +17908,9 @@ fn validate_query_expr(
                         context.subject,
                         head.trim()
                     ),
-                    suggestion: Some("query `where` expressions must evaluate to bool".to_owned()),
+                    suggestion: suggest(
+                        "query `where` expressions must evaluate to bool".to_owned(),
+                    ),
                 });
             }
         }
@@ -18055,7 +18131,7 @@ fn infer_expr_type(
                     // The key.
                     span: context.node(spans.child(1)),
                     message: format!("{} indexes a map with a non-string key", context.subject),
-                    suggestion: Some(
+                    suggestion: suggest(
                         "use a string literal or string expression as the map key".to_owned(),
                     ),
                 });
@@ -18073,7 +18149,7 @@ fn infer_expr_type(
                         // map — not the `[…]` around it, and not the clause.
                         span: context.node(spans.child(0)),
                         message: format!("{} indexes a non-map expression", context.subject),
-                        suggestion: Some("use indexing only on map values".to_owned()),
+                        suggestion: suggest("use indexing only on map values".to_owned()),
                     });
                     ExprType::Unknown
                 }
@@ -18111,7 +18187,7 @@ fn infer_expr_type(
                         "{} applies `!` to a non-boolean expression",
                         context.subject
                     ),
-                    suggestion: Some("use `!` only with boolean expressions".to_owned()),
+                    suggestion: suggest("use `!` only with boolean expressions".to_owned()),
                 });
             }
             ExprType::Bool
@@ -18145,7 +18221,7 @@ fn infer_expr_type(
                         "{} calls unsupported expression function `{name}`",
                         context.subject
                     ),
-                    suggestion: Some("use `count`, `exists`, or `empty`".to_owned()),
+                    suggestion: suggest("use `count`, `exists`, or `empty`".to_owned()),
                 });
                 for (index, arg) in args.iter().enumerate() {
                     infer_expr_type(
@@ -18221,7 +18297,7 @@ fn infer_binary_type(
                             "{} uses boolean operator with non-boolean operand",
                             context.subject
                         ),
-                        suggestion: Some(
+                        suggestion: suggest(
                             "use `&&` and `||` only with boolean expressions".to_owned(),
                         ),
                     });
@@ -18239,7 +18315,7 @@ fn infer_binary_type(
                     fixits: Vec::new(),
                     span: relation,
                     message: format!("{} compares incompatible expression types", context.subject),
-                    suggestion: Some(
+                    suggestion: suggest(
                         "compare values with compatible scalar or finite-domain types".to_owned(),
                     ),
                 });
@@ -18255,7 +18331,7 @@ fn infer_binary_type(
                     fixits: Vec::new(),
                     span: relation,
                     message: format!("{} orders non-orderable expression values", context.subject),
-                    suggestion: Some(
+                    suggestion: suggest(
                         "use ordering only with int, float, duration, or time values".to_owned(),
                     ),
                 });
@@ -18276,7 +18352,7 @@ fn infer_binary_type(
                                 "{} uses membership with incompatible item type",
                                 context.subject
                             ),
-                            suggestion: Some(
+                            suggestion: suggest(
                                 "make the left value compatible with the array item type"
                                     .to_owned(),
                             ),
@@ -18296,7 +18372,7 @@ fn infer_binary_type(
                                 "{} uses map membership with a non-string key",
                                 context.subject
                             ),
-                            suggestion: Some(
+                            suggestion: suggest(
                                 "use a string value on the left side of map membership".to_owned(),
                             ),
                         });
@@ -18314,7 +18390,7 @@ fn infer_binary_type(
                         "{} uses membership against a non-array/non-map expression",
                         context.subject
                     ),
-                    suggestion: Some(
+                    suggestion: suggest(
                         "use `in` with an array literal, array value, or map value".to_owned(),
                     ),
                 }),
@@ -18345,7 +18421,9 @@ fn infer_binary_type(
                             "{} uses arithmetic with a non-numeric operand",
                             context.subject
                         ),
-                        suggestion: Some("use `+ - * /` only with int or float values".to_owned()),
+                        suggestion: suggest(
+                            "use `+ - * /` only with int or float values".to_owned(),
+                        ),
                     });
                     break;
                 }
@@ -18395,7 +18473,9 @@ fn infer_array_type(
                     // not wrong, it is wrong beside the others.
                     span: context.node(spans),
                     message: format!("{} has mixed-type array literal", context.subject),
-                    suggestion: Some("use array literals whose elements share one type".to_owned()),
+                    suggestion: suggest(
+                        "use array literals whose elements share one type".to_owned(),
+                    ),
                 });
                 return ExprType::Array(Box::new(ExprType::Unknown));
             }
@@ -18658,7 +18738,7 @@ fn validate_finite_domain_expr(
                     "{} compares finite-domain value to unknown `{literal}`",
                     context.subject
                 ),
-                suggestion: Some(suggest_then(
+                suggestion: suggest(suggest_then(
                     &literal,
                     domain.iter(),
                     format!("use one of: {}", domain.join(", ")),
@@ -18702,7 +18782,7 @@ fn validate_finite_domain_relation(
                         "{} has statically unsatisfiable finite-domain equality",
                         context.subject
                     ),
-                    suggestion: Some(format!(
+                    suggestion: suggest(format!(
                         "compare domains with at least one shared value; left: {}, right: {}",
                         left_domain.join(", "),
                         right_domain.join(", ")
@@ -18731,7 +18811,7 @@ fn validate_finite_domain_relation(
                         "{} has statically unsatisfiable finite-domain membership",
                         context.subject
                     ),
-                    suggestion: Some(format!("use one of: {}", domain.join(", "))),
+                    suggestion: suggest(format!("use one of: {}", domain.join(", "))),
                 });
             }
         }
@@ -18757,7 +18837,7 @@ fn validate_finite_domain_relation(
                         "{} has statically unsatisfiable finite-domain exclusion",
                         context.subject
                     ),
-                    suggestion: Some(
+                    suggestion: suggest(
                         "leave at least one domain value outside the exclusion set".to_owned(),
                     ),
                 });
@@ -18912,7 +18992,7 @@ fn validate_case_blocks(
                     "rule `{}` has case scrutinee `{scrutinee}` that is not a typed path",
                     rule.name.name
                 ),
-                suggestion: Some("match on a bound field such as `task.provider`".to_owned()),
+                suggestion: suggest("match on a bound field such as `task.provider`".to_owned()),
             });
         }
         let Some((start, mut depth)) = case_block_start(&lines, &scan, index) else {
@@ -19524,7 +19604,7 @@ fn validate_case_pattern(
                     "rule `{}` uses `None` for a non-optional case",
                     rule.name.name
                 ),
-                suggestion: Some("use `None` only when matching an optional field".to_owned()),
+                suggestion: suggest("use `None` only when matching an optional field".to_owned()),
             });
         }
         return;
@@ -19541,7 +19621,9 @@ fn validate_case_pattern(
                     "rule `{}` uses `Some` for a non-optional case",
                     rule.name.name
                 ),
-                suggestion: Some("use `Some name` only when matching an optional field".to_owned()),
+                suggestion: suggest(
+                    "use `Some name` only when matching an optional field".to_owned(),
+                ),
             });
         }
         return;
@@ -19563,7 +19645,7 @@ fn validate_case_pattern(
                     fixits: Vec::new(),
                     span,
                     message: format!("enum `{}` has no variant `{variant}`", name.name),
-                    suggestion: Some(suggest_then(
+                    suggestion: suggest(suggest_then(
                         variant,
                         variants.iter(),
                         format!(
@@ -19591,7 +19673,7 @@ fn validate_case_pattern(
                         "variant `{variant}` of enum `{}` carries no payload to bind",
                         name.name
                     ),
-                    suggestion: Some(format!("write `{variant} => {{ ... }}` without `as`")),
+                    suggestion: suggest(format!("write `{variant} => {{ ... }}` without `as`")),
                 });
             }
         }
@@ -19607,7 +19689,7 @@ fn validate_case_pattern(
                         "rule `{}` has unsupported case pattern `{pattern}`",
                         rule.name.name
                     ),
-                    suggestion: Some("use a literal branch value or `_`".to_owned()),
+                    suggestion: suggest("use a literal branch value or `_`".to_owned()),
                 });
                 return;
             };
@@ -19625,7 +19707,7 @@ fn validate_case_pattern(
                         "rule `{}` has unsupported AgentRef case pattern `{pattern}`",
                         rule.name.name
                     ),
-                    suggestion: Some(
+                    suggestion: suggest(
                         "use a declared agent name, a string literal, or `_`".to_owned(),
                     ),
                 });
@@ -19650,7 +19732,7 @@ fn validate_case_pattern(
                         "rule `{}` has case pattern `{pattern}` that is not a `bool` value",
                         rule.name.name
                     ),
-                    suggestion: Some("match `true`, `false`, or `_`".to_owned()),
+                    suggestion: suggest("match `true`, `false`, or `_`".to_owned()),
                 });
             }
         }
@@ -19665,7 +19747,7 @@ fn validate_case_pattern(
                     "rule `{}` cannot pattern-match this scrutinee type",
                     rule.name.name
                 ),
-                suggestion: Some(
+                suggestion: suggest(
                     "match an enum, literal union, optional, or tagged output union".to_owned(),
                 ),
             });
@@ -19709,7 +19791,7 @@ fn validate_terminal_case_pattern(
                 "rule `{}` has malformed terminal-output case pattern `{pattern}`",
                 rule.name.name
             ),
-            suggestion: Some("write `Completed as result`, `Failed as failure`, `TimedOut as timeout`, or `Cancelled as cancel` (the `as` is required)".to_owned()),
+            suggestion: suggest("write `Completed as result`, `Failed as failure`, `TimedOut as timeout`, or `Cancelled as cancel` (the `as` is required)".to_owned()),
         });
         return;
     }
@@ -19725,7 +19807,7 @@ fn validate_terminal_case_pattern(
                 "rule `{}` terminal-output case pattern cannot be `{tag}`",
                 rule.name.name
             ),
-            suggestion: Some(format!("use one of: {}", tags.join(", "))),
+            suggestion: suggest(format!("use one of: {}", tags.join(", "))),
         });
     }
 }
@@ -19767,7 +19849,7 @@ fn validate_terminal_case_coverage(
                 rule.name.name,
                 missing.join(", ")
             ),
-            suggestion: Some(
+            suggestion: suggest(
                 "add terminal branches for every value or add `_ => { ... }`".to_owned(),
             ),
         });
@@ -19799,7 +19881,7 @@ fn validate_duplicate_terminal_case_patterns(
                         "rule `{}` has duplicate unguarded terminal-output case pattern `{pattern}`",
                         rule.name.name
                     ),
-                    suggestion: Some(
+                    suggestion: suggest(
                         "remove the duplicate branch or add mutually exclusive `where` guards"
                             .to_owned(),
                     ),
@@ -19855,7 +19937,7 @@ fn validate_case_coverage(
                 rule.name.name,
                 missing.join(", ")
             ),
-            suggestion: Some("add branches for every value or add `_ => { ... }`".to_owned()),
+            suggestion: suggest("add branches for every value or add `_ => { ... }`".to_owned()),
         });
     }
 }
@@ -19882,7 +19964,7 @@ fn validate_duplicate_case_patterns(
                         "rule `{}` has duplicate unguarded case pattern `{pattern}`",
                         rule.name.name
                     ),
-                    suggestion: Some(
+                    suggestion: suggest(
                         "remove the duplicate branch or add mutually exclusive `where` guards"
                             .to_owned(),
                     ),
@@ -19921,7 +20003,7 @@ fn validate_unreachable_after_fallback(
                         "rule `{}` has an unreachable case branch after the `_` wildcard",
                         rule.name.name
                     ),
-                    suggestion: Some(
+                    suggestion: suggest(
                         "move this branch before the wildcard, or remove it".to_owned(),
                     ),
                 }
@@ -20040,7 +20122,7 @@ fn validate_union_case_pattern(
                 "rule `{}` case pattern must be one of its literal variants",
                 rule.name.name
             ),
-            suggestion: Some(format!("use one of: {}", allowed.join(", "))),
+            suggestion: suggest(format!("use one of: {}", allowed.join(", "))),
         });
         return;
     };
@@ -20052,7 +20134,7 @@ fn validate_union_case_pattern(
             fixits: Vec::new(),
             span,
             message: format!("rule `{}` case pattern cannot be `{value}`", rule.name.name),
-            suggestion: Some(suggest_then(
+            suggestion: suggest(suggest_then(
                 value,
                 allowed.iter(),
                 format!("use one of: {}", allowed.join(", ")),
@@ -20080,7 +20162,7 @@ fn validate_agent_ref_case_pattern(
             fixits: Vec::new(),
             span,
             message: format!("rule `{}` has non-agent case pattern", rule.name.name),
-            suggestion: Some(format!("use one of: {}", allowed.join(", "))),
+            suggestion: suggest(format!("use one of: {}", allowed.join(", "))),
         });
         return;
     };
@@ -20092,7 +20174,7 @@ fn validate_agent_ref_case_pattern(
             fixits: Vec::new(),
             span,
             message: format!("AgentRef has no agent `{value}`"),
-            suggestion: Some(suggest_then(
+            suggestion: suggest(suggest_then(
                 value,
                 allowed.iter(),
                 format!("use one of: {}", allowed.join(", ")),
@@ -20127,7 +20209,7 @@ fn validate_binding_uses(
                 "rule `{}` uses effect output `{root}` outside a matching `after {root} ...` block",
                 rule.name.name
             ),
-            suggestion: Some(format!(
+            suggestion: suggest(format!(
                 "move this use into `after {root} succeeds {{ ... }}` or another matching terminal branch"
             )),
         });
@@ -20898,7 +20980,7 @@ fn validate_redactions(
                     "rule `{}` redacts `{source}`, which has no known schema",
                     rule.name.name
                 ),
-                suggestion: Some(
+                suggestion: suggest(
                     "redact a binding with a known record type — a matched `when Class as x`, or a \
                      coerce/decide/exec result"
                         .to_owned(),
@@ -20921,7 +21003,7 @@ fn validate_redactions(
                         "rule `{}` redacts `{source}` keeping unknown field `{field}` of `{schema}`",
                         rule.name.name
                     ),
-                    suggestion: Some(suggest_otherwise(
+                    suggestion: suggest(suggest_otherwise(
                         field,
                         src_fields.keys(),
                         format!("keep a field declared on `{schema}`"),
@@ -21161,7 +21243,7 @@ fn refuse_confined_crossing(
              sealed or declassified first)",
             rule.name.name
         ),
-        suggestion: Some(
+        suggestion: suggest(
             "confine the work to the region and let only a converted value out: `seal` it \
              back to a `sealed<T>` and record that, or `declassify` it into a bounded type. \
              A value derived from opened plaintext is itself confined (§6)"
@@ -21503,7 +21585,7 @@ fn validate_seal_storage(
                             field.name,
                             expected
                         ),
-                        suggestion: Some(
+                        suggestion: suggest(
                             "seal the value the field's payload type names; `open` later trusts \
                              that declaration to choose the unwrap grant (DR-0074 §2)"
                                 .to_owned(),
@@ -21611,7 +21693,7 @@ fn validate_declassify_projection(
                              declared class",
                             rule.name.name
                         ),
-                        suggestion: Some(
+                        suggestion: suggest(
                             "declare the bounded type the release is narrowed to".to_owned(),
                         ),
                     });
@@ -21649,7 +21731,7 @@ fn validate_declassify_projection(
                                  declares `{field}` — a field `{}` does not have",
                                 rule.name.name, from.name
                             ),
-                            suggestion: Some(format!(
+                            suggestion: suggest(format!(
                                 "`declassify` projects onto the target type's fields, so every \
                                  field of `{target_type}` must exist on `{}`; the target type is \
                                  the bound on what is released",
@@ -21768,7 +21850,7 @@ fn validate_open_type_agreement(
                             "rule `{}` opens `{envelope}`, which is not a sealed value",
                             rule.name.name
                         ),
-                        suggestion: Some(
+                        suggestion: suggest(
                             "`open` takes a `sealed<T>`; seal the value first, or read the field \
                              that holds the envelope"
                                 .to_owned(),
@@ -21793,7 +21875,7 @@ fn validate_open_type_agreement(
                          `sealed<{}>`",
                         rule.name.name, sealed_type.name
                     ),
-                    suggestion: Some(format!(
+                    suggestion: suggest(format!(
                         "open it into `{}`; `into` names the type the envelope already holds, \
                          and it is what the unwrap grant is narrowed by (DR-0074 §2)",
                         sealed_type.name
@@ -22059,7 +22141,7 @@ fn validate_observer_schema_not_redeclared(
                 "rule `{}` reads `{schema}` from a provider, and this program declares a class of that name",
                 rule.name.name
             ),
-            suggestion: Some(format!(
+            suggestion: suggest(format!(
                 "the provider fills `{schema}` with its own fields, so the two shapes cannot both be `{schema}`: rename the declared class"
             )),
             // Empty is the honest default: `attach_fixits` is the one place that
@@ -22106,7 +22188,7 @@ fn validate_recorded_schemas(
                         "rule `{}` cannot record kernel-owned terminal schema `{schema}`",
                         rule.name.name
                     ),
-                    suggestion: Some(
+                    suggestion: suggest(
                         "the terminal family (`TerminalFailed`/`TerminalTimedOut`/`TerminalCancelled`) is produced only by the kernel; to fail this workflow use `fail <failure> { ... }`, and to react to an effect terminal use `after <effect> fails/times out/cancels as f`"
                             .to_owned(),
                     ),
@@ -22119,7 +22201,7 @@ fn validate_recorded_schemas(
                     fixits: Vec::new(),
                     span: record.span,
                     message: format!("rule `{}` records unknown class `{schema}`", rule.name.name),
-                    suggestion: Some(suggest_otherwise(
+                    suggestion: suggest(suggest_otherwise(
                         schema,
                         semantic.schemas.classes.keys(),
                         format!("declare `class {schema}` before recording it"),
@@ -22240,7 +22322,7 @@ fn validate_coordination_discipline(
                         "rule `{}` does not handle the `{required}` outcome of {verb} `{binding}`",
                         rule.name.name
                     ),
-                    suggestion: Some(format!(
+                    suggestion: suggest(format!(
                         "{verb} outcomes are exhaustive: add `after {binding} {required} {{ ... }}`"
                     )),
                 });
@@ -22281,7 +22363,7 @@ fn validate_coordination_discipline(
                             "rule `{}` renews unbound coordination binding `{}`",
                             rule.name.name, acquire_binding
                         ),
-                        suggestion: Some(format!(
+                        suggestion: suggest(format!(
                             "`renew {acquire_binding}` must name a lease acquired here (`acquire ... as {acquire_binding}`) or an issue claimed here (`claim ... as {acquire_binding}`)"
                         )),
                     });
@@ -22325,7 +22407,7 @@ fn validate_coordination_discipline(
                             "rule `{}` releases unbound coordination item `{}`",
                             rule.name.name, item
                         ),
-                        suggestion: Some(format!(
+                        suggestion: suggest(format!(
                             "`release {item}` must name a lease acquired here (`acquire ... as {item}`), an item claimed here (`claim {item} as ...`), or a work item bound by a `when <queue> has ready ... as {item}` reaction"
                         )),
                     });
@@ -22345,7 +22427,7 @@ fn validate_coordination_discipline(
                 "rule `{}` acquires more than one lease in a single progression",
                 rule.name.name
             ),
-            suggestion: Some(
+            suggestion: suggest(
                 "the hard default is at most one held lease per progression (it breaks hold-and-wait); restructure into separate rules"
                     .to_owned(),
             ),
@@ -22369,7 +22451,7 @@ fn validate_coordination_discipline(
                         "rule `{}` does not handle the `{required}` outcome of lease `{binding}`",
                         rule.name.name
                     ),
-                    suggestion: Some(format!(
+                    suggestion: suggest(format!(
                         "coordination outcomes are exhaustive: add `after {binding} {required} {{ ... }}`"
                     )),
                 });
@@ -22387,7 +22469,7 @@ fn validate_coordination_discipline(
                         "rule `{}` can hold lease `{binding}` forever: the `held` branch neither releases it nor reaches a workflow terminal",
                         rule.name.name
                     ),
-                    suggestion: Some(format!(
+                    suggestion: suggest(format!(
                         "add `release {binding}` on every non-terminal path, or use `acquire ... until ttl` for fire-and-forget"
                     )),
                 });
@@ -22409,7 +22491,7 @@ fn validate_coordination_discipline(
                         "rule `{}` does not handle the `{required}` outcome of counter consume `{binding}`",
                         rule.name.name
                     ),
-                    suggestion: Some(format!(
+                    suggestion: suggest(format!(
                         "coordination outcomes are exhaustive: add `after {binding} {required} {{ ... }}`"
                     )),
                 });
@@ -22617,7 +22699,7 @@ fn check_conditioned_read(
             "rule `{}` reads conditional field `{root}.{field}` outside a matching `case {root}.{disc}` arm",
             rule.name.name
         ),
-        suggestion: Some(format!(
+        suggestion: suggest(format!(
             "read `{root}.{field}` inside `case {root}.{disc} {{ \"...\" => ... }}` — it is present only for a specific `{disc}`"
         )),
     });
@@ -23231,7 +23313,7 @@ fn validate_body_effect_operands(
                                 "rule `{}` acquires undeclared lease `{resource}`",
                                 rule.name.name
                             ),
-                            suggestion: Some(suggest_otherwise(
+                            suggestion: suggest(suggest_otherwise(
                                 resource,
                                 semantic.leases.iter(),
                                 format!(
@@ -23252,7 +23334,7 @@ fn validate_body_effect_operands(
                                     "rule `{}` appends to undeclared ledger `{ledger}`",
                                     rule.name.name
                                 ),
-                                suggestion: Some(suggest_otherwise(
+                                suggestion: suggest(suggest_otherwise(
                                     ledger,
                                     semantic.ledgers.iter(),
                                     format!(
@@ -23272,7 +23354,7 @@ fn validate_body_effect_operands(
                                     "rule `{}` appends unknown entry class `{schema}`",
                                     rule.name.name
                                 ),
-                                suggestion: Some(suggest_otherwise(
+                                suggestion: suggest(suggest_otherwise(
                                     schema,
                                     semantic.schemas.classes.keys(),
                                     format!("declare `class {schema}` first"),
@@ -23293,7 +23375,7 @@ fn validate_body_effect_operands(
                                 "rule `{}` consumes undeclared counter `{counter}`",
                                 rule.name.name
                             ),
-                            suggestion: Some(suggest_otherwise(
+                            suggestion: suggest(suggest_otherwise(
                                 counter,
                                 semantic.counters.iter(),
                                 format!(
@@ -23329,7 +23411,7 @@ fn validate_body_effect_operands(
                                     "rule `{}` uses unknown binding `{stdin_binding}` in `exec {name} with {stdin_binding}` — `with` requires a typed record binding",
                                     rule.name.name
                                 ),
-                                suggestion: Some(suggest_otherwise(
+                                suggestion: suggest(suggest_otherwise(
                                     stdin_binding,
                                     binding_types.keys(),
                                     format!(
@@ -23356,7 +23438,7 @@ fn validate_body_effect_operands(
                                     "rule `{}` passes untyped fact binding `{stdin_binding}` to `exec {name} with` — `with` requires a typed record binding",
                                     rule.name.name
                                 ),
-                                suggestion: Some(format!(
+                                suggestion: suggest(format!(
                                     "declare `signal {schema} {{ ... }}` for a typed reaction, or bind a declared class and pass that to `with`"
                                 )),
                             });
@@ -23385,7 +23467,7 @@ fn validate_body_effect_operands(
                                 "rule `{}` parses exec output into unknown schema `{}`",
                                 rule.name.name, parse.schema
                             ),
-                            suggestion: Some(suggestion),
+                            suggestion: suggest(suggestion),
                         });
                     }
                 }
@@ -23412,7 +23494,7 @@ fn validate_body_effect_operands(
                             "rule `{}` uses unknown binding `{root}` in `timer until {until}`",
                             rule.name.name
                         ),
-                        suggestion: Some(suggest_otherwise(
+                        suggestion: suggest(suggest_otherwise(
                             root,
                             binding_types.keys(),
                             "bind a fact in `when` and reference a `time` field on it, or use an ISO-8601 literal",
@@ -23446,7 +23528,7 @@ fn validate_body_effect_operands(
                                 "rule `{}` uses non-time operand `{until}` in `timer until`",
                                 rule.name.name
                             ),
-                            suggestion: Some(format!(
+                            suggestion: suggest(format!(
                                 "declare the field as `time` on `{schema}` or use an ISO-8601 literal"
                             )),
                         });
@@ -23467,7 +23549,7 @@ fn validate_body_effect_operands(
                                 "rule `{}` has invalid `timer until` operand `{until}`: {message}",
                                 rule.name.name
                             ),
-                            suggestion: Some(suggestion),
+                            suggestion: suggest(suggestion),
                         };
                         diagnostics.push(match &failed_on {
                             Some(failed_on) => {
@@ -23838,7 +23920,7 @@ fn check_field_path(
                 rule.name.name,
                 path.join(".")
             ),
-            suggestion: Some(suggestion),
+            suggestion: suggest(suggestion),
         };
         // The class named in the message is the one whose fields the reader has
         // to consult, and for a nested path it is NOT the one they can see at
@@ -23942,7 +24024,7 @@ fn validate_coerce_prompt_reads(
                 "coerce `{}` has unknown binding `{root}` in its prompt",
                 coerce.name.name
             ),
-            suggestion: Some(suggest_binding_root(
+            suggestion: suggest(suggest_binding_root(
                 &root,
                 params,
                 "reference one of the coerce's parameters, or `ctx`",
@@ -23996,7 +24078,7 @@ fn validate_known_field_paths_in_index(
             fixits: Vec::new(),
             span: anchor.at(root_range),
             message: format!("rule `{}` has unknown binding `{root}`", rule.name.name),
-            suggestion: Some(suggest_binding_root(
+            suggestion: suggest(suggest_binding_root(
                 &root,
                 known_roots,
                 BINDING_ROOT_FALLBACK,
@@ -24193,7 +24275,7 @@ fn validate_sealed_effect_inputs(
                              grant — the provider would receive ciphertext",
                             rule.name.name
                         ),
-                        suggestion: Some(format!(
+                        suggestion: suggest(format!(
                             "grant the turn worker-side opening: `with access to credential \
                              <cred> {{ unwrap for {payload} }}`, or send a value the provider \
                              can read — `redact` drops a sealed field"
@@ -24752,7 +24834,7 @@ fn validate_binding_name(
                 "rule `{}` binds reserved keyword `{binding}`",
                 rule.name.name
             ),
-            suggestion: Some(format!(
+            suggestion: suggest(format!(
                 "`{binding}` is a rule body keyword; choose another binding name"
             )),
         });
@@ -25294,7 +25376,7 @@ fn validate_record_field(
                 "rule `{}` has malformed field assignment in `record {record_schema}`",
                 rule.name.name
             ),
-            suggestion: Some("write record fields as `field value`".to_owned()),
+            suggestion: suggest("write record fields as `field value`".to_owned()),
         });
         return;
     };
@@ -25311,7 +25393,7 @@ fn validate_record_field(
                 fixits: Vec::new(),
                 span: site.field.whole(),
                 message: format!("class `{record_schema}` has no field `{field}`"),
-                suggestion: Some(suggest_otherwise(
+                suggestion: suggest(suggest_otherwise(
                     field,
                     fields.keys(),
                     format!("add `{field}` to `class {record_schema}` or record an existing field"),
@@ -25360,7 +25442,7 @@ fn validate_record_field(
                             "rule `{}` has unknown binding `{root}` in `record {record_schema}` field `{field}`",
                             rule.name.name
                         ),
-                        suggestion: Some(suggest_binding_root(
+                        suggestion: suggest(suggest_binding_root(
                             &root,
                             known_roots,
                             BINDING_ROOT_FALLBACK,
@@ -25517,7 +25599,7 @@ fn validate_source_verified_credential(
                 "source `{}` verifies with undeclared credential `{name}`",
                 source.name.name
             ),
-            suggestion: Some(suggestion),
+            suggestion: suggest(suggestion),
         });
         return;
     };
@@ -25545,7 +25627,7 @@ fn validate_source_verified_credential(
              verify a signature",
             source.name.name
         ),
-        suggestion: Some(format!(
+        suggestion: suggest(format!(
             "verification needs a credential of kind {}",
             able.join(" or ")
         )),
@@ -25574,7 +25656,7 @@ fn validate_source_emit_signal_declared(
                 "source `{}` emits undeclared signal `{}`",
                 source.name.name, signal
             ),
-            suggestion: Some(suggestion),
+            suggestion: suggest(suggestion),
         });
     }
 
@@ -25627,7 +25709,7 @@ fn validate_source_emit_signal_declared(
                         source.provider.name,
                         field.name
                     ),
-                    suggestion: Some(suggest_then_keyword(
+                    suggestion: suggest(suggest_then_keyword(
                         &field.name,
                         fields.iter().copied(),
                         format!("available observation fields: {}", fields.join(", ")),
@@ -25658,7 +25740,7 @@ fn validate_source_emit_signal_declared(
                         "source `{}` emit reads unknown binding `{}`",
                         source.name.name, binding.name
                     ),
-                    suggestion: Some(format!(
+                    suggestion: suggest(format!(
                         "the source's observation binding is `{observe}` (declared by `observe as {observe}`)"
                     )),
                 });
@@ -25676,7 +25758,7 @@ fn validate_source_emit_signal_declared(
                             "source `{}` emit reads `{}.{}`, but a `{}` source's observation has no field `{}`",
                             source.name.name, observe, obs_field.name, source.provider.name, obs_field.name
                         ),
-                        suggestion: Some(suggest_then_keyword(
+                        suggestion: suggest(suggest_then_keyword(
                             &obs_field.name,
                             fields.iter().copied(),
                             format!("available observation fields: {}", fields.join(", ")),
@@ -25717,7 +25799,7 @@ fn validate_emit_signal_declarations(
                                 "rule `{}` emits undeclared signal `{event}`",
                                 rule.name.name
                             ),
-                            suggestion: Some(suggest_otherwise(
+                            suggestion: suggest(suggest_otherwise(
                                 event,
                                 declared_signals.iter(),
                                 format!(
@@ -25948,7 +26030,7 @@ fn check_operand_root(
                 "rule `{}` has unknown binding `{root}` in {context} `{operand}`",
                 rule.name.name
             ),
-            suggestion: Some(suggest_binding_root(
+            suggestion: suggest(suggest_binding_root(
                 &root,
                 known_roots,
                 BINDING_ROOT_FALLBACK,
@@ -25978,7 +26060,7 @@ fn check_field_value_roots(
                             "rule `{}` has unknown binding `{root}` in {context} field `{}`",
                             rule.name.name, field.name
                         ),
-                        suggestion: Some(suggest_binding_root(
+                        suggestion: suggest(suggest_binding_root(
                             &root,
                             known_roots,
                             BINDING_ROOT_FALLBACK,
@@ -26030,7 +26112,7 @@ fn validate_record_blocks(
                     "rule `{}` has a value with no field name in `record {schema}`: `{stray}`",
                     rule.name.name
                 ),
-                suggestion: Some(format!(
+                suggestion: suggest(format!(
                     "give it a field name (`<field> {stray}`), or remove it"
                 )),
             });
@@ -26388,7 +26470,7 @@ fn validate_literal_assignment_inner(
                     message: format!(
                         "field `{record_schema}.{field}` expects literal string `{value}`"
                     ),
-                    suggestion: Some(format!("record `{field} {value:?}`")),
+                    suggestion: suggest(format!("record `{field} {value:?}`")),
                 });
             }
         }
@@ -26446,7 +26528,7 @@ fn validate_literal_assignment_inner(
                         "field `{record_schema}.{field}` expects `{}`, which has no literal form",
                         field_ty.to_source()
                     ),
-                    suggestion: Some(format!(
+                    suggestion: suggest(format!(
                         "seal a value first: `seal <value> with <credential> as v`, then use \
                          `v` — a `{}` arises only from `seal`",
                         field_ty.to_source()
@@ -26468,7 +26550,7 @@ fn validate_literal_assignment_inner(
                     "field `{record_schema}.{field}` is `{}`: secrets have no literal form",
                     field_ty.to_source()
                 ),
-                suggestion: Some(
+                suggestion: suggest(
                     "reference a declared credential; material lives with the custodian, never \
                      in source"
                         .to_owned(),
@@ -26533,7 +26615,7 @@ fn validate_expr_source_against_type(
                         fixits: Vec::new(),
                         span: at.whole(),
                         message: format!("field `{record_schema}.{field}` expects a map literal"),
-                        suggestion: Some(format!("record `{field} {{ key value }}`")),
+                        suggestion: suggest(format!("record `{field} {{ key value }}`")),
                     });
                     return;
                 }
@@ -26547,7 +26629,7 @@ fn validate_expr_source_against_type(
                         message: format!(
                             "field `{record_schema}.{field}` expects a map literal: {message}"
                         ),
-                        suggestion: Some(format!("record `{field} {{ key value }}`")),
+                        suggestion: suggest(format!("record `{field} {{ key value }}`")),
                     });
                     return;
                 }
@@ -26790,7 +26872,7 @@ fn push_invalid_assignment_expr(
             "rule `{}` has invalid expression for field `{record_schema}.{field}`: {message}",
             rule.name.name
         ),
-        suggestion: Some(
+        suggestion: suggest(
             "use array literals or expected-schema object literals for collection fields"
                 .to_owned(),
         ),
@@ -26825,7 +26907,7 @@ fn validate_object_literal_fields(
                     "field `{record_schema}.{field}` repeats object field `{}`",
                     object_field.key
                 ),
-                suggestion: Some("remove the duplicate object field".to_owned()),
+                suggestion: suggest("remove the duplicate object field".to_owned()),
             });
             continue;
         }
@@ -26841,7 +26923,7 @@ fn validate_object_literal_fields(
                         "class `{object_schema}` has no field `{}`",
                         object_field.key
                     ),
-                    suggestion: Some(suggest_otherwise(
+                    suggestion: suggest(suggest_otherwise(
                         &object_field.key,
                         schema_fields.keys(),
                         format!(
@@ -26882,7 +26964,7 @@ fn validate_object_literal_fields(
             message: format!(
                 "field `{record_schema}.{field}` is missing required object field `{object_schema}.{required}`"
             ),
-            suggestion: Some(format!("add `{required}` to the `{field}` object literal")),
+            suggestion: suggest(format!("add `{required}` to the `{field}` object literal")),
         });
     }
 }
@@ -26941,7 +27023,7 @@ fn validate_inferred_assignment_type(
                 message: format!(
                     "field `{record_schema}.{field}` receives incompatible expression type"
                 ),
-                suggestion: Some(format!(
+                suggestion: suggest(format!(
                     "record a value compatible with `{}`",
                     expected_ty.to_source()
                 )),
@@ -27011,7 +27093,7 @@ fn validate_literal_against_type_inner(
                     message: format!(
                         "field `{record_schema}.{field}` expects literal string `{value}`"
                     ),
-                    suggestion: Some(format!("record `{field} {value:?}`")),
+                    suggestion: suggest(format!("record `{field} {value:?}`")),
                 });
             }
         }
@@ -27062,7 +27144,7 @@ fn validate_literal_against_type_inner(
                     "field `{record_schema}.{field}` expects `{}`, which has no literal form",
                     field_ty.to_source()
                 ),
-                suggestion: Some(format!(
+                suggestion: suggest(format!(
                     "seal a value first: `seal <value> as {} with <credential> -> v`, then use `v`",
                     field_ty.to_source()
                 )),
@@ -27082,7 +27164,7 @@ fn validate_literal_against_type_inner(
                     "field `{record_schema}.{field}` is `{}`: secrets have no literal form",
                     field_ty.to_source()
                 ),
-                suggestion: Some(
+                suggestion: suggest(
                     "reference a declared credential; material lives with the custodian, never \
                      in source"
                         .to_owned(),
@@ -27126,7 +27208,7 @@ fn validate_agent_ref_literal(
             message: format!(
                 "field `{record_schema}.{field}` expects an AgentRef value, not string `{value}`"
             ),
-            suggestion: Some(format!(
+            suggestion: suggest(format!(
                 "use an unquoted declared agent name: {}",
                 allowed.join(", ")
             )),
@@ -27141,7 +27223,7 @@ fn validate_agent_ref_literal(
             fixits: Vec::new(),
             span: at.whole(),
             message: format!("field `{record_schema}.{field}` expects an AgentRef value"),
-            suggestion: Some(format!("use one of: {}", allowed.join(", "))),
+            suggestion: suggest(format!("use one of: {}", allowed.join(", "))),
         });
         return;
     };
@@ -27153,7 +27235,7 @@ fn validate_agent_ref_literal(
             fixits: Vec::new(),
             span: at.whole(),
             message: format!("field `{record_schema}.{field}` cannot reference agent `{value}`"),
-            suggestion: Some(suggest_then(
+            suggestion: suggest(suggest_then(
                 value,
                 allowed.iter(),
                 format!("use one of: {}", allowed.join(", ")),
@@ -28005,7 +28087,7 @@ fn validate_primitive_literal(
             fixits: Vec::new(),
             span: at.whole(),
             message: format!("field `{record_schema}.{field}` expects `{primitive}`"),
-            suggestion: Some(format!("record a value compatible with `{primitive}`")),
+            suggestion: suggest(format!("record a value compatible with `{primitive}`")),
         });
         return;
     }
@@ -28018,7 +28100,7 @@ fn validate_primitive_literal(
                 fixits: Vec::new(),
                 span: at.whole(),
                 message: format!("field `{record_schema}.{field}` has invalid duration literal"),
-                suggestion: Some("use an ISO-8601 duration such as `\"PT30M\"`".to_owned()),
+                suggestion: suggest("use an ISO-8601 duration such as `\"PT30M\"`".to_owned()),
             });
         }
         ("time", LiteralExpr::String(value)) if parse_time_epoch_seconds(value).is_none() => {
@@ -28029,7 +28111,7 @@ fn validate_primitive_literal(
                 fixits: Vec::new(),
                 span: at.whole(),
                 message: format!("field `{record_schema}.{field}` has invalid time literal"),
-                suggestion: Some(
+                suggestion: suggest(
                     "use an RFC3339 timestamp such as `\"2026-05-29T10:00:00Z\"`".to_owned(),
                 ),
             });
@@ -28058,7 +28140,7 @@ fn validate_enum_literal(
             fixits: Vec::new(),
             span: at.whole(),
             message: format!("field `{record_schema}.{field}` expects enum `{schema}`"),
-            suggestion: Some(format!(
+            suggestion: suggest(format!(
                 "use one of: {}",
                 variants.iter().cloned().collect::<Vec<_>>().join(", ")
             )),
@@ -28073,7 +28155,7 @@ fn validate_enum_literal(
             fixits: Vec::new(),
             span: at.whole(),
             message: format!("enum `{schema}` has no variant `{variant}`"),
-            suggestion: Some(suggest_then(
+            suggestion: suggest(suggest_then(
                 variant,
                 variants.iter(),
                 format!(
@@ -28111,7 +28193,7 @@ fn validate_union_literal(
             fixits: Vec::new(),
             span: at.whole(),
             message: format!("field `{record_schema}.{field}` expects one of its literal variants"),
-            suggestion: Some(format!("use one of: {}", allowed.join(", "))),
+            suggestion: suggest(format!("use one of: {}", allowed.join(", "))),
         });
         return;
     };
@@ -28123,7 +28205,7 @@ fn validate_union_literal(
             fixits: Vec::new(),
             span: at.whole(),
             message: format!("field `{record_schema}.{field}` cannot be `{value}`"),
-            suggestion: Some(suggest_then(
+            suggestion: suggest(suggest_then(
                 value,
                 allowed.iter(),
                 format!("use one of: {}", allowed.join(", ")),
@@ -28224,7 +28306,7 @@ fn validate_rule_prompt_content_type_annotation(
             "rule `{}` has malformed multiline prompt content type `{annotation}`",
             rule.name.name
         ),
-        suggestion: Some(
+        suggestion: suggest(
             "write a supported token such as `\"\"\"markdown` or put prompt text on the next line"
                 .to_owned(),
         ),
@@ -28252,7 +28334,7 @@ fn validate_coerce_prompt_content_type_annotations(
                 "coerce `{}` has malformed multiline prompt content type `{annotation}`",
                 coerce.name.name
             ),
-            suggestion: Some(
+            suggestion: suggest(
                 "write a supported token such as `\"\"\"markdown` or put prompt text on the next line"
                     .to_owned(),
             ),

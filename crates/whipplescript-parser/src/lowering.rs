@@ -209,22 +209,9 @@ pub(crate) fn lower_program(
                     "pattern `{}` is not allowed inside this declaration scope",
                     pattern.name.name
                 ),
-                suggestion: Some("declare patterns at source top level".to_owned()),
+                suggestion: suggest("declare patterns at source top level".to_owned()),
             }),
-            Item::Apply(apply) => diagnostics.push(Diagnostic {
-                code: diagnostic_code!("lowering.unexpanded_pattern_application"),
-                severity: Severity::Error,
-                related: Vec::new(),
-                fixits: Vec::new(),
-                span: apply.span,
-                message: format!(
-                    "pattern application `{}` was not expanded",
-                    apply.alias.name
-                ),
-                suggestion: Some(
-                    "ensure the applied pattern is declared at source top level".to_owned(),
-                ),
-            }),
+            Item::Apply(apply) => refuse_unexpanded_application(&apply, &mut diagnostics),
             Item::Harness(harness) => lower_harness(harness, &mut ir, &mut diagnostics),
             Item::Tracker(queue) => lower_tracker(queue, &mut ir, &mut diagnostics),
             Item::Channel(channel) => lower_channel(channel, &mut ir, &mut diagnostics),
@@ -257,7 +244,7 @@ pub(crate) fn lower_program(
                                 "file store `{}` names unknown provider `{}`",
                                 file_store.name.name, provider.name
                             ),
-                            suggestion: Some(crate::suggest_then_keyword(
+                            suggestion: suggest(crate::suggest_then_keyword(
                                 &provider.name,
                                 FILE_STORE_PROVIDERS.iter().copied(),
                                 format!(
@@ -316,7 +303,7 @@ pub(crate) fn lower_program(
                             "lease `{}` keys on undeclared type `{}`",
                             lease.name.name, lease.key_type.name
                         ),
-                        suggestion: Some(crate::suggest_otherwise(
+                        suggestion: suggest(crate::suggest_otherwise(
                             &lease.key_type.name,
                             schema_names.iter(),
                             "key a lease on an entity class the workflow already models",
@@ -344,7 +331,7 @@ pub(crate) fn lower_program(
                             "ledger `{}` records undeclared entry type `{}`",
                             ledger.name.name, ledger.entry_schema.name
                         ),
-                        suggestion: Some(crate::suggest_otherwise(
+                        suggestion: suggest(crate::suggest_otherwise(
                             &ledger.entry_schema.name,
                             schema_names.iter(),
                             "declare the entry class before the ledger",
@@ -372,7 +359,7 @@ pub(crate) fn lower_program(
                             "counter `{}` keys on undeclared type `{}`",
                             counter.name.name, counter.key_type.name
                         ),
-                        suggestion: Some(crate::suggest_otherwise(
+                        suggestion: suggest(crate::suggest_otherwise(
                             &counter.key_type.name,
                             schema_names.iter(),
                             "key a counter on an entity class the workflow already models",
@@ -485,6 +472,30 @@ pub(crate) fn lower_program(
     }
 }
 
+/// The refusal for a pattern application that reached the lowering loop
+/// unexpanded. Through `lower_program` this cannot happen — the expander
+/// consumes every `apply`, expanding it or refusing it with its own code and
+/// dropping it — and the test `a_pattern_never_reaches_lowering_as_an_item`
+/// pins those interceptions. The refusal itself is pinned here, at the one
+/// seam a test can reach: the loop's arm delegates so that what it would say
+/// is exercised even though the arm is the invariant's last line.
+pub(crate) fn refuse_unexpanded_application(apply: &ApplyDecl, diagnostics: &mut Vec<Diagnostic>) {
+    diagnostics.push(Diagnostic {
+        code: diagnostic_code!("lowering.unexpanded_pattern_application"),
+        severity: Severity::Error,
+        related: Vec::new(),
+        fixits: Vec::new(),
+        span: apply.span,
+        message: format!(
+            "pattern application `{}` was not expanded",
+            apply.alias.name
+        ),
+        suggestion: suggest(
+            "ensure the applied pattern is declared at source top level".to_owned(),
+        ),
+    });
+}
+
 fn lower_source_tags(tags: &[TagDecl], target_kind: &str, target: &str, ir: &mut IrProgram) {
     for tag in tags {
         ir.source_tags.push(IrSourceTag {
@@ -553,7 +564,7 @@ fn lower_assert(
             fixits: Vec::new(),
             span: error.range.map_or_else(|| at.whole(), |range| at.at(range)),
             message: format!("invalid assertion expression: {}", error.message),
-            suggestion: Some(
+            suggestion: suggest(
                 "use a deterministic expression such as `count(Fact) == 1`".to_owned(),
             ),
         }),
@@ -625,7 +636,7 @@ fn lower_use(use_decl: UseDecl, ir: &mut IrProgram, diagnostics: &mut Vec<Diagno
             fixits: Vec::new(),
             span: use_decl.name.span,
             message: format!("unknown standard package `{}`", use_decl.name.value),
-            suggestion: Some(crate::suggest_then_keyword(
+            suggestion: suggest(crate::suggest_then_keyword(
                 &use_decl.name.value,
                 STD_PACKAGE_IDS.iter().copied(),
                 format!("standard packages are {}", STD_PACKAGE_IDS.join(", ")),
@@ -658,7 +669,7 @@ fn lower_tracker(tracker: TrackerDecl, ir: &mut IrProgram, diagnostics: &mut Vec
                 "tracker `{}` uses unavailable provider `{}`",
                 tracker.name.name, tracker.provider.name
             ),
-            suggestion: Some(
+            suggestion: suggest(
                 "`builtin` is the available provider; github/linear/jira are deferred bindings"
                     .to_owned(),
             ),
@@ -686,7 +697,7 @@ fn lower_region(region: RegionDecl, ir: &mut IrProgram, diagnostics: &mut Vec<Di
             fixits: Vec::new(),
             span: region.name.span,
             message: format!("duplicate region `{}`", region.name.name),
-            suggestion: Some(
+            suggestion: suggest(
                 "give each region a unique name; compose overlapping regions in the \
                  selection with `|` instead of redeclaring"
                     .to_owned(),
@@ -717,7 +728,7 @@ fn lower_stream(stream: StreamDecl, ir: &mut IrProgram, diagnostics: &mut Vec<Di
                 fixits: Vec::new(),
                 span: stream.name.span,
                 message: format!("duplicate stream `{}`", stream.name.name),
-                suggestion: Some(format!(
+                suggestion: suggest(format!(
                     "stream `{}` is already declared with members [{}]",
                     existing.name,
                     existing.members.join(", ")
@@ -756,7 +767,7 @@ fn lower_channel(channel: ChannelDecl, ir: &mut IrProgram, diagnostics: &mut Vec
                 fixits: Vec::new(),
                 span: channel.name.span,
                 message: format!("channel `{}` is declared more than once", channel.name.name),
-                suggestion: Some("give each channel a unique name".to_owned()),
+                suggestion: suggest("give each channel a unique name".to_owned()),
             }
             .with_related(existing.span, "first declared here"),
         );
@@ -783,7 +794,7 @@ fn lower_channel(channel: ChannelDecl, ir: &mut IrProgram, diagnostics: &mut Vec
                 "channel `{}` names unknown messaging provider `{}`",
                 channel.name.name, channel.provider.name
             ),
-            suggestion: Some(crate::suggest_then_keyword(
+            suggestion: suggest(crate::suggest_then_keyword(
                 &channel.provider.name,
                 CHANNEL_PROVIDER_REPORTS
                     .iter()
@@ -826,7 +837,7 @@ fn lower_vault(vault: VaultDecl, ir: &mut IrProgram, diagnostics: &mut Vec<Diagn
                 fixits: Vec::new(),
                 span: vault.span,
                 message: format!("vault `{}` is declared more than once", vault.name.name),
-                suggestion: Some("give each vault a unique name".to_owned()),
+                suggestion: suggest("give each vault a unique name".to_owned()),
             }
             .with_related(existing.span, "first declared here"),
         );
@@ -848,7 +859,7 @@ fn lower_vault(vault: VaultDecl, ir: &mut IrProgram, diagnostics: &mut Vec<Diagn
                 "vault `{}` names unknown kind `{}`",
                 vault.name.name, vault.kind.name
             ),
-            suggestion: Some(format!(
+            suggestion: suggest(format!(
                 "declare one of: {}",
                 crate::credential_kind_spellings().join(", ")
             )),
@@ -868,7 +879,7 @@ fn lower_vault(vault: VaultDecl, ir: &mut IrProgram, diagnostics: &mut Vec<Diagn
                     "vault `{}` allows unknown operation `{}`",
                     vault.name.name, entry.name
                 ),
-                suggestion: Some(format!(
+                suggestion: suggest(format!(
                     "name one of: {}",
                     whipplescript_custody::Operation::ALL
                         .iter()
@@ -897,7 +908,7 @@ fn lower_vault(vault: VaultDecl, ir: &mut IrProgram, diagnostics: &mut Vec<Diagn
                         vault.name.name,
                         operation.as_str()
                     ),
-                    suggestion: Some(if able.is_empty() {
+                    suggestion: suggest(if able.is_empty() {
                         "no declared kind performs that operation".to_owned()
                     } else {
                         format!("kinds that can: {}", able.join(", "))
@@ -925,7 +936,7 @@ fn lower_vault(vault: VaultDecl, ir: &mut IrProgram, diagnostics: &mut Vec<Diagn
                     "vault `{}` names unknown retention `{}`",
                     vault.name.name, policy.name
                 ),
-                suggestion: Some(format!(
+                suggestion: suggest(format!(
                     "declare one of: {}",
                     VAULT_RETAIN_POLICIES.join(", ")
                 )),
@@ -965,7 +976,7 @@ fn lower_credential(
                     "credential `{}` is declared more than once",
                     credential.name.name
                 ),
-                suggestion: Some("give each credential a unique name".to_owned()),
+                suggestion: suggest("give each credential a unique name".to_owned()),
             }
             .with_related(existing.span, "first declared here"),
         );
@@ -988,7 +999,7 @@ fn lower_credential(
                 "credential `{}` names unknown kind `{}`",
                 credential.name.name, credential.kind.name
             ),
-            suggestion: Some(crate::suggest_then_keyword(
+            suggestion: suggest(crate::suggest_then_keyword(
                 &credential.kind.name,
                 crate::credential_kind_spellings(),
                 format!(
@@ -1021,7 +1032,7 @@ fn lower_credential(
                     "credential `{}` allows unknown operation `{}`",
                     credential.name.name, entry.name
                 ),
-                suggestion: Some(format!(
+                suggestion: suggest(format!(
                     "name one of: {}",
                     whipplescript_custody::Operation::ALL
                         .iter()
@@ -1050,7 +1061,7 @@ fn lower_credential(
                         credential.name.name,
                         operation.as_str()
                     ),
-                    suggestion: Some(if able.is_empty() {
+                    suggestion: suggest(if able.is_empty() {
                         "no declared kind performs that operation".to_owned()
                     } else {
                         format!("kinds that can: {}", able.join(", "))
@@ -1081,7 +1092,7 @@ fn lower_gauge(gauge: GaugeDecl, ir: &mut IrProgram, diagnostics: &mut Vec<Diagn
                 fixits: Vec::new(),
                 span: gauge.name.span,
                 message: format!("gauge `{}` is declared more than once", gauge.name.name),
-                suggestion: Some("give each gauge a unique name".to_owned()),
+                suggestion: suggest("give each gauge a unique name".to_owned()),
             }
             .with_related(existing.span, "first declared here"),
         );
@@ -1127,7 +1138,7 @@ fn lower_mark(mark: MarkDecl, ir: &mut IrProgram, diagnostics: &mut Vec<Diagnost
                 fixits: Vec::new(),
                 span: mark.name.span,
                 message: format!("mark `{}` is declared more than once", mark.name.value),
-                suggestion: Some("give each mark a unique name".to_owned()),
+                suggestion: suggest("give each mark a unique name".to_owned()),
             }
             .with_related(existing.span, "first declared here"),
         );
@@ -1157,7 +1168,7 @@ fn lower_campaign(campaign: CampaignDecl, ir: &mut IrProgram, diagnostics: &mut 
                     "campaign `{}` is declared more than once",
                     campaign.name.name
                 ),
-                suggestion: Some("give each campaign a unique name".to_owned()),
+                suggestion: suggest("give each campaign a unique name".to_owned()),
             }
             .with_related(existing.span, "first declared here"),
         );
@@ -1248,7 +1259,7 @@ fn lower_agent(
                     "agent `{}` uses unknown harness `{}`",
                     agent.name.name, harness.name
                 ),
-                suggestion: Some(crate::suggest_otherwise(
+                suggestion: suggest(crate::suggest_otherwise(
                     &harness.name,
                     harness_kinds.keys(),
                     format!(
@@ -1277,7 +1288,7 @@ fn lower_agent(
                     "agent `{}` delegates to `{}`, which is a managed kind",
                     agent.name.name, delegate.name
                 ),
-                suggestion: Some(
+                suggestion: suggest(
                     "a plain `agent name { ... }` is managed by default; `delegated to` names a foreign runtime"
                         .to_owned(),
                 ),
@@ -1305,7 +1316,7 @@ fn lower_agent(
                             "agent `{}` declares provider more than once",
                             agent.name.name
                         ),
-                        suggestion: Some(
+                        suggestion: suggest(
                             "keep exactly one `provider` field in the agent block".to_owned(),
                         ),
                     });
@@ -1321,7 +1332,7 @@ fn lower_agent(
                             "agent `{}` declares both `using` harness and direct provider `{}`",
                             agent.name.name, provider.name
                         ),
-                        suggestion: Some(
+                        suggestion: suggest(
                             "use either `agent name using harness { ... }` or `provider codex`, not both"
                                 .to_owned(),
                         ),
@@ -1338,7 +1349,7 @@ fn lower_agent(
                             "agent `{}` declares both `delegated to` and direct provider `{}`",
                             agent.name.name, provider.name
                         ),
-                        suggestion: Some(
+                        suggestion: suggest(
                             "use either `agent name delegated to <provider> { ... }` or a `provider` field, not both"
                                 .to_owned(),
                         ),
@@ -1362,7 +1373,7 @@ fn lower_agent(
                             "agent `{}` capacity must be greater than zero",
                             agent.name.name
                         ),
-                        suggestion: Some("use `capacity 1` or a larger integer".to_owned()),
+                        suggestion: suggest("use `capacity 1` or a larger integer".to_owned()),
                     });
                 }
                 lowered.capacity = Some(capacity);
@@ -1381,7 +1392,7 @@ fn lower_agent(
                                 "agent `{}` attaches skill `{}` more than once",
                                 agent.name.name, skill.value
                             ),
-                            suggestion: Some("remove the duplicate skill entry".to_owned()),
+                            suggestion: suggest("remove the duplicate skill entry".to_owned()),
                         });
                     }
                     lowered.skills.push(skill.value);
@@ -1401,7 +1412,7 @@ fn lower_agent(
                                 "agent `{}` declares capability `{}` more than once",
                                 agent.name.name, capability.value
                             ),
-                            suggestion: Some("remove the duplicate capability entry".to_owned()),
+                            suggestion: suggest("remove the duplicate capability entry".to_owned()),
                         });
                     }
                     lowered.capabilities.push(capability.value);
@@ -1428,7 +1439,7 @@ fn lower_agent(
                                 "agent `{}` requires unknown feature class `{}`",
                                 agent.name.name, class.name
                             ),
-                            suggestion: Some(crate::suggest_then_keyword(
+                            suggestion: suggest(crate::suggest_then_keyword(
                                 &class.name,
                                 whipplescript_core::AGENT_FEATURE_CLASS_TAXONOMY
                                     .iter()
@@ -1451,7 +1462,7 @@ fn lower_agent(
                                 "agent `{}` requires feature class `{}` more than once",
                                 agent.name.name, class.name
                             ),
-                            suggestion: Some("remove the duplicate requires entry".to_owned()),
+                            suggestion: suggest("remove the duplicate requires entry".to_owned()),
                         });
                     }
                     lowered.requires.push(class.name);
@@ -1471,7 +1482,7 @@ fn lower_agent(
                                 "agent `{}` grants tool `{}` more than once",
                                 agent.name.name, tool.name
                             ),
-                            suggestion: Some("remove the duplicate tool entry".to_owned()),
+                            suggestion: suggest("remove the duplicate tool entry".to_owned()),
                         });
                     }
                     lowered.tools.push(tool.name);
@@ -1490,7 +1501,7 @@ fn lower_agent(
                             "agent `{}` declares compaction more than once",
                             agent.name.name
                         ),
-                        suggestion: Some("keep exactly one `compaction` field".to_owned()),
+                        suggestion: suggest("keep exactly one `compaction` field".to_owned()),
                     });
                 }
                 if !STRATEGIES.contains(&strategy.name.as_str()) {
@@ -1504,7 +1515,7 @@ fn lower_agent(
                             "agent `{}` uses unknown compaction strategy `{}`",
                             agent.name.name, strategy.name
                         ),
-                        suggestion: Some(crate::suggest_then_keyword(
+                        suggestion: suggest(crate::suggest_then_keyword(
                             &strategy.name,
                             STRATEGIES.iter().copied(),
                             "supported strategies are `summarize`, `hard_reset`, `tool_results`, and `none`",
@@ -1527,7 +1538,7 @@ fn lower_agent(
                             "agent `{}` declares thread more than once",
                             agent.name.name
                         ),
-                        suggestion: Some("keep exactly one `thread` field".to_owned()),
+                        suggestion: suggest("keep exactly one `thread` field".to_owned()),
                     });
                 }
                 if !MODES.contains(&mode.name.as_str()) {
@@ -1541,7 +1552,7 @@ fn lower_agent(
                             "agent `{}` uses unknown thread mode `{}`",
                             agent.name.name, mode.name
                         ),
-                        suggestion: Some(crate::suggest_then_keyword(
+                        suggestion: suggest(crate::suggest_then_keyword(
                             &mode.name,
                             MODES.iter().copied(),
                             "supported thread modes are `continue` and `fresh`",
@@ -1564,7 +1575,7 @@ fn lower_agent(
                             "agent `{}` declares settings more than once",
                             agent.name.name
                         ),
-                        suggestion: Some("keep exactly one `settings` field".to_owned()),
+                        suggestion: suggest("keep exactly one `settings` field".to_owned()),
                     });
                 }
                 if !SOURCES.contains(&sources.name.as_str()) {
@@ -1578,7 +1589,7 @@ fn lower_agent(
                             "agent `{}` uses unknown settings source `{}`",
                             agent.name.name, sources.name
                         ),
-                        suggestion: Some(crate::suggest_then_keyword(
+                        suggestion: suggest(crate::suggest_then_keyword(
                             &sources.name,
                             SOURCES.iter().copied(),
                             "supported settings sources are `project`, `user`, and `none`",
@@ -1605,7 +1616,7 @@ fn lower_agent(
                     // the parser has accepted for as long as they have existed.
                     // It also read as English, with a closing `and`, and the
                     // generated list keeps that: see `prose_list`.
-                    suggestion: Some(crate::suggest_then_keyword(
+                    suggestion: suggest(crate::suggest_then_keyword(
                         &name.name,
                         crate::syntax::AGENT_BLOCK_FIELDS.iter().copied(),
                         format!(
@@ -1667,7 +1678,7 @@ fn lower_agent(
                         "agent `{}` is delegated; `compaction` is a managed-harness knob",
                         agent.name.name
                     ),
-                    suggestion: Some(
+                    suggestion: suggest(
                         "remove `compaction` — a delegated harness compacts its own context"
                             .to_owned(),
                     ),
@@ -1684,7 +1695,7 @@ fn lower_agent(
                         "agent `{}` is delegated; `thread` is a managed-harness knob",
                         agent.name.name
                     ),
-                    suggestion: Some(
+                    suggestion: suggest(
                         "remove `thread` — a delegated harness owns its own conversation state"
                             .to_owned(),
                     ),
@@ -1701,7 +1712,7 @@ fn lower_agent(
                     "agent `{}` is managed; `settings` is a delegated-harness knob",
                     agent.name.name
                 ),
-                suggestion: Some(
+                suggestion: suggest(
                     "remove `settings` — WhippleScript assembles a managed agent's context"
                         .to_owned(),
                 ),
@@ -1739,7 +1750,7 @@ fn lower_enum(enum_decl: EnumDecl, ir: &mut IrProgram, diagnostics: &mut Vec<Dia
                     "enum `{}` declares variant `{}` more than once",
                     enum_decl.name.name, variant.name.name
                 ),
-                suggestion: Some(
+                suggestion: suggest(
                     "remove the duplicate variant or give it a distinct name".to_owned(),
                 ),
             });
@@ -1758,7 +1769,7 @@ fn lower_enum(enum_decl: EnumDecl, ir: &mut IrProgram, diagnostics: &mut Vec<Dia
                         "variant `{}` of enum `{}` declares reserved field `variant`",
                         variant.name.name, enum_decl.name.name
                     ),
-                    suggestion: Some(
+                    suggestion: suggest(
                         "the discriminant is synthesized from the variant name; rename the field"
                             .to_owned(),
                     ),
@@ -1820,7 +1831,7 @@ fn lower_test(test: TestDecl, ir: &mut IrProgram, diagnostics: &mut Vec<Diagnost
                 fixits: Vec::new(),
                 span: test.name.span,
                 message: format!("test `{}` is declared more than once", test.name.value),
-                suggestion: Some("give each test scenario a distinct name".to_owned()),
+                suggestion: suggest("give each test scenario a distinct name".to_owned()),
             }
             .with_related(existing.span, "first declared here"),
         );
@@ -1837,7 +1848,7 @@ fn lower_test(test: TestDecl, ir: &mut IrProgram, diagnostics: &mut Vec<Diagnost
             fixits: Vec::new(),
             span: test.span,
             message: format!("test `{}` has no `expect` clause", test.name.value),
-            suggestion: Some("a test must assert at least one expected outcome".to_owned()),
+            suggestion: suggest("a test must assert at least one expected outcome".to_owned()),
         });
     }
     // Validate that captured expression source (given field values, projection
@@ -1902,7 +1913,7 @@ fn lower_source(
                 fixits: Vec::new(),
                 span: source.name.span,
                 message: format!("source `{}` is declared more than once", source.name.name),
-                suggestion: Some("remove the duplicate source declaration".to_owned()),
+                suggestion: suggest("remove the duplicate source declaration".to_owned()),
             }
             .with_related(existing.span, "first declared here"),
         );
@@ -1923,7 +1934,7 @@ fn lower_source(
                     "recurring source `{}` must declare a `missed` policy",
                     source.name.name
                 ),
-                suggestion: Some(
+                suggestion: suggest(
                     "add `missed skip`, `missed coalesce`, or `missed catch_up limit N`".to_owned(),
                 ),
             });
@@ -1954,7 +1965,7 @@ fn lower_source(
                     "calendar source `{}` should declare a `timezone`",
                     source.name.name
                 ),
-                suggestion: Some(
+                suggestion: suggest(
                     "add `timezone \"America/New_York\"`; a calendar schedule without one defaults to UTC".to_owned(),
                 ),
             });
@@ -1977,7 +1988,7 @@ fn lower_source(
                 "`file` source `{}` requires a `path` or `watch` clause",
                 source.name.name
             ),
-            suggestion: Some(
+            suggestion: suggest(
                 "add `path \"./inbox.txt\"` (one signal per line) or `watch \"./drops/*.json\"` \
                  (one signal per new file-content occurrence)"
                     .to_owned(),
@@ -1999,7 +2010,7 @@ fn lower_source(
                 "`file` source `{}` declares both `path` and `watch`; the modes are exclusive",
                 source.name.name
             ),
-            suggestion: Some(
+            suggestion: suggest(
                 "keep `path` for line-by-line admission or `watch` for per-file-content \
                  occurrences, not both"
                     .to_owned(),
@@ -2018,7 +2029,7 @@ fn lower_source(
                     "source `{}` declares a `path` clause but its provider is `{}`, not `file`",
                     source.name.name, source.provider.name
                 ),
-                suggestion: Some(
+                suggestion: suggest(
                     "use `source file as ...` for a `path`, or remove the clause".to_owned(),
                 ),
             });
@@ -2034,7 +2045,7 @@ fn lower_source(
                     "source `{}` declares a `watch` clause but its provider is `{}`, not `file`",
                     source.name.name, source.provider.name
                 ),
-                suggestion: Some(
+                suggestion: suggest(
                     "use `source file as ...` for a `watch` glob, or remove the clause".to_owned(),
                 ),
             });
@@ -2060,7 +2071,7 @@ fn lower_source(
                  nor serves",
                 source.name.name
             ),
-            suggestion: Some(
+            suggestion: suggest(
                 "add `url \"https://example.com/feed.json\"` to POLL, or `path \"/hooks/x\"` \
                  to SERVE"
                     .to_owned(),
@@ -2084,7 +2095,7 @@ fn lower_source(
                         "`http` source `{}` url `{}` is not an absolute http(s) URL",
                         source.name.name, url.value
                     ),
-                    suggestion: Some(
+                    suggestion: suggest(
                         "use an absolute `http://` or `https://` URL the runtime can GET"
                             .to_owned(),
                     ),
@@ -2104,7 +2115,7 @@ fn lower_source(
                     "source `{}` declares a `url` clause but its provider is `{}`, not `http`",
                     source.name.name, source.provider.name
                 ),
-                suggestion: Some(
+                suggestion: suggest(
                     "use `source http as ...` for a `url`, or remove the clause".to_owned(),
                 ),
             });
@@ -2144,7 +2155,7 @@ fn lower_source(
                         "; `dedup` applies to `file` (line mode) and `http` sources"
                     }
                 ),
-                suggestion: Some("remove the `dedup` clause".to_owned()),
+                suggestion: suggest("remove the `dedup` clause".to_owned()),
             });
         } else {
             match dedup {
@@ -2165,7 +2176,7 @@ fn lower_source(
                              `observe` binding (e.g. `dedup {}.line`)",
                             source.name.name, source.observe_binding.name
                         ),
-                        suggestion: Some(format!(
+                        suggestion: suggest(format!(
                             "the observation binding is `{}` (declared by `observe as {}`)",
                             source.observe_binding.name, source.observe_binding.name
                         )),
@@ -2190,7 +2201,7 @@ fn lower_source(
                  listening",
                 source.name.name
             ),
-            suggestion: Some(
+            suggestion: suggest(
                 "keep `url` to POLL an endpoint, or `path` to SERVE one — a source is one \
                  direction or the other"
                     .to_owned(),
@@ -2212,7 +2223,7 @@ fn lower_source(
                  that can reach the listener could inject its signal",
                 source.name.name
             ),
-            suggestion: Some(
+            suggestion: suggest(
                 "add `verified with <credential>` (the custodian holds the material), or \
                  `auth hmac secret <reference>`"
                     .to_owned(),
@@ -2237,7 +2248,7 @@ fn lower_source(
                  to how one delivery proves itself",
                 source.name.name
             ),
-            suggestion: Some(
+            suggestion: suggest(
                 "keep `verified with <credential>`, whose material the custodian holds, and \
                  remove `auth`"
                     .to_owned(),
@@ -2257,7 +2268,7 @@ fn lower_source(
                      is no delivery to verify",
                     source.name.name
                 ),
-                suggestion: Some(
+                suggestion: suggest(
                     "add `path \"<endpoint>\"`, or remove the `verified with` clause".to_owned(),
                 ),
             });
@@ -2276,7 +2287,7 @@ fn lower_source(
                      delivery to authenticate",
                     source.name.name
                 ),
-                suggestion: Some(
+                suggestion: suggest(
                     "add `path \"<endpoint>\"`, or remove the `auth` clause".to_owned(),
                 ),
             });
@@ -2301,7 +2312,7 @@ fn lower_source(
                      source already knows which instance it runs for",
                     source.name.name
                 ),
-                suggestion: Some("remove the `correlate` clause".to_owned()),
+                suggestion: suggest("remove the `correlate` clause".to_owned()),
             });
         } else {
             match correlate {
@@ -2333,7 +2344,7 @@ fn lower_source(
                              binding (e.g. `correlate {}.body.instance`)",
                             source.name.name, source.observe_binding.name
                         ),
-                        suggestion: Some(format!(
+                        suggestion: suggest(format!(
                             "the observation binding is `{}` (declared by `observe as {}`)",
                             source.observe_binding.name, source.observe_binding.name
                         )),
@@ -2409,7 +2420,7 @@ fn lower_event(event: EventDecl, ir: &mut IrProgram, diagnostics: &mut Vec<Diagn
                 fixits: Vec::new(),
                 span: event.name_span,
                 message: format!("signal `{}` is declared more than once", event.name),
-                suggestion: Some("remove the duplicate signal declaration".to_owned()),
+                suggestion: suggest("remove the duplicate signal declaration".to_owned()),
             }
             .with_related(existing.span, "first declared here"),
         );
@@ -2427,7 +2438,7 @@ fn lower_event(event: EventDecl, ir: &mut IrProgram, diagnostics: &mut Vec<Diagn
                     "signal `{}` declares field `{}` more than once",
                     event.name, field.name.name
                 ),
-                suggestion: Some(
+                suggestion: suggest(
                     "remove the duplicate field or give it a distinct name".to_owned(),
                 ),
             });
@@ -2472,7 +2483,7 @@ fn lower_class(
                     "class `{}` declares field `{}` more than once",
                     class_decl.name.name, field.name.name
                 ),
-                suggestion: Some(
+                suggestion: suggest(
                     "remove the duplicate field or give it a distinct name".to_owned(),
                 ),
             });
@@ -2498,7 +2509,7 @@ fn lower_class(
                     "class `{}` declares more than one `@key` field",
                     class_decl.name.name
                 ),
-                suggestion: Some("a class has at most one `@key` natural key in v0".to_owned()),
+                suggestion: suggest("a class has at most one `@key` natural key in v0".to_owned()),
             });
         }
     }
@@ -2542,7 +2553,7 @@ fn lower_table(
                 "table `{}` targets unknown class `{}`",
                 table.name.name, table.schema.name
             ),
-            suggestion: Some(crate::suggest_otherwise(
+            suggestion: suggest(crate::suggest_otherwise(
                 &table.schema.name,
                 semantic.schemas.classes.keys(),
                 "declare the class before seeding rows for it",
@@ -2559,7 +2570,7 @@ fn lower_table(
             fixits: Vec::new(),
             span: table.span,
             message: format!("table `{}` has no rows", table.name.name),
-            suggestion: Some("add at least one `{ ... }` row".to_owned()),
+            suggestion: suggest("add at least one `{ ... }` row".to_owned()),
         });
         return;
     }
@@ -2661,7 +2672,7 @@ fn lower_coerce(
                     "coerce `{}` declares parameter `{}` more than once",
                     coerce.name.name, param.name.name
                 ),
-                suggestion: Some(
+                suggestion: suggest(
                     "remove the duplicate parameter or give it a distinct name".to_owned(),
                 ),
             });
@@ -2722,7 +2733,7 @@ fn lower_rule(
                 fixits: Vec::new(),
                 span: rule.name.span,
                 message: format!("rule `{}` is declared more than once", rule.name.name),
-                suggestion: Some(
+                suggestion: suggest(
                     "give each rule a unique name; the name is what the effect graph, `mark` sites and the run record address it by"
                         .to_owned(),
                 ),

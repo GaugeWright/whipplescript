@@ -439,7 +439,7 @@ pub(crate) fn lex_string(source: &str, start: usize) -> (Token, usize, Option<Di
                 end: source.len(),
             },
             message: "unterminated string literal".to_owned(),
-            suggestion: Some("close the string literal".to_owned()),
+            suggestion: suggest("close the string literal".to_owned()),
         }),
     )
 }
@@ -701,7 +701,7 @@ impl Parser<'_> {
                                 span: parsed_workflow.decl.name.span,
                                 message: "multiple implicit workflow headers are not supported"
                                     .to_owned(),
-                                suggestion: Some(
+                                suggestion: suggest(
                                     "use explicit `workflow Name { ... }` declarations with `--root`"
                                         .to_owned(),
                                 ),
@@ -957,7 +957,7 @@ impl Parser<'_> {
                 fixits: Vec::new(),
                 span,
                 message: "tag is missing a name".to_owned(),
-                suggestion: Some("write a tag such as `@fixture`".to_owned()),
+                suggestion: suggest("write a tag such as `@fixture`".to_owned()),
             });
             return None;
         }
@@ -972,7 +972,7 @@ impl Parser<'_> {
                 fixits: Vec::new(),
                 span,
                 message: format!("tag `@{name}` contains unsupported characters"),
-                suggestion: Some(
+                suggestion: suggest(
                     "use letters, digits, `_`, `-`, `.`, or `:` in tag names".to_owned(),
                 ),
             });
@@ -990,7 +990,7 @@ impl Parser<'_> {
                 fixits: Vec::new(),
                 span: tag.span,
                 message: format!("tag `@{}` cannot be attached to {target}", tag.name),
-                suggestion: Some(
+                suggestion: suggest(
                     "place tags on workflows, matrices, assertions, or rules".to_owned(),
                 ),
             });
@@ -1009,7 +1009,7 @@ impl Parser<'_> {
                 fixits: Vec::new(),
                 span: previous.span,
                 message: "description is not attached to a declaration".to_owned(),
-                suggestion: Some(
+                suggestion: suggest(
                     "place only one `description \"...\"` immediately before the target declaration"
                         .to_owned(),
                 ),
@@ -1041,7 +1041,7 @@ impl Parser<'_> {
                 fixits: Vec::new(),
                 span: description.span,
                 message: format!("description cannot be attached to {target}"),
-                suggestion: Some(
+                suggestion: suggest(
                     "place descriptions on workflows, matrices, assertions, or rules".to_owned(),
                 ),
             });
@@ -1068,7 +1068,7 @@ impl Parser<'_> {
             message: format!(
                 "Gherkin keyword `{keyword}` is not WhippleScript workflow syntax"
             ),
-            suggestion: Some(
+            suggestion: suggest(
                 "use `workflow`, `table`, `rule ... when ... => { ... }`, and `assert` instead of free-text Given/When/Then steps"
                     .to_owned(),
             ),
@@ -1144,7 +1144,7 @@ impl Parser<'_> {
                 fixits: Vec::new(),
                 span,
                 message: "the `flow` declaration was removed".to_owned(),
-                suggestion: Some(
+                suggestion: suggest(
                     "write a `rule` and chain sequential steps with `then <binding> <- <effect>`"
                         .to_owned(),
                 ),
@@ -1359,7 +1359,7 @@ impl Parser<'_> {
                     fixits: Vec::new(),
                     span: first_word_span,
                     message: format!("unknown {} field `{}`", spec.keyword, written),
-                    suggestion,
+                    suggestion: suggestion.map(crate::Suggestion::manual),
                 });
                 self.synchronize_to_block_item();
                 continue;
@@ -1375,7 +1375,10 @@ impl Parser<'_> {
                         fixits: Vec::new(),
                         span: first_word_span,
                         message: format!("expected `{connective}` after `{}`", clause.name),
-                        suggestion: Some(format!("write `{} {connective} <field>`", clause.name)),
+                        suggestion: suggest(format!(
+                            "write `{} {connective} <field>`",
+                            clause.name
+                        )),
                     });
                     self.synchronize_to_block_item();
                     continue;
@@ -1490,7 +1493,7 @@ impl Parser<'_> {
                         fixits: Vec::new(),
                         span,
                         message: format!("credential `{}` must declare its kind", name.name),
-                        suggestion: Some(format!(
+                        suggestion: suggest(format!(
                             "add `kind <kind>` inside the credential block ({})",
                             crate::credential_kind_spellings().join(" | ")
                         )),
@@ -1513,7 +1516,7 @@ impl Parser<'_> {
                         fixits: Vec::new(),
                         span,
                         message: format!("vault `{}` must declare its kind", name.name),
-                        suggestion: Some(format!(
+                        suggestion: suggest(format!(
                             "add `kind <kind>` inside the vault block ({})",
                             crate::credential_kind_spellings().join(" | ")
                         )),
@@ -1535,7 +1538,7 @@ impl Parser<'_> {
                             "vault `{}` must declare the operations it allows",
                             name.name
                         ),
-                        suggestion: Some(
+                        suggestion: suggest(
                             "add `allow [<operation>, ...]` inside the vault block — a container \
                              of dynamically-named credentials has to say what its members may do"
                                 .to_owned(),
@@ -1562,7 +1565,7 @@ impl Parser<'_> {
                         fixits: Vec::new(),
                         span,
                         message: format!("stream `{}` must declare its members", name.name),
-                        suggestion: Some(
+                        suggestion: suggest(
                             "a stream is a declared collaboration: name its member \
                              agents with `members [<agent>, ...]`"
                                 .to_owned(),
@@ -1594,7 +1597,7 @@ impl Parser<'_> {
                             fixits: Vec::new(),
                             span: period.span,
                             message: format!("unknown reset period `{}`", period.name),
-                            suggestion: Some(crate::suggest_then_keyword(
+                            suggestion: suggest(crate::suggest_then_keyword(
                                 &period.name,
                                 ["hourly", "daily", "weekly", "monthly"],
                                 "use `hourly`, `daily`, `weekly`, or `monthly`",
@@ -1615,7 +1618,7 @@ impl Parser<'_> {
                             "counter `{}` must declare `key`, `cap`, and `reset`",
                             name.name
                         ),
-                        suggestion: Some(
+                        suggestion: suggest(
                             "every counter is bounded: declare all three fields".to_owned(),
                         ),
                     });
@@ -1647,7 +1650,7 @@ impl Parser<'_> {
                             "lease `{}` must declare a `key` type and a `ttl` backstop",
                             name.name
                         ),
-                        suggestion: Some(
+                        suggestion: suggest(
                             "every lease is bounded: declare `key <Type>` and `ttl <duration>`"
                                 .to_owned(),
                         ),
@@ -1681,7 +1684,7 @@ impl Parser<'_> {
                             "ledger `{}` must declare `entry`, `partition by`, and `retain`",
                             name.name
                         ),
-                        suggestion: Some(
+                        suggestion: suggest(
                             "every ledger is bounded and partitioned: declare all three fields"
                                 .to_owned(),
                         ),
@@ -1713,7 +1716,7 @@ impl Parser<'_> {
                         fixits: Vec::new(),
                         span,
                         message: format!("file store `{}` is missing a root", name.name),
-                        suggestion: Some(
+                        suggestion: suggest(
                             "add `root \"<dir>\"` inside the file store block".to_owned(),
                         ),
                     });
@@ -1892,7 +1895,7 @@ impl Parser<'_> {
                     fixits: Vec::new(),
                     span: direction.span,
                     message: format!("`measure` takes `up to` or `down to`, not `{other} to`"),
-                    suggestion: Some(
+                    suggestion: suggest(
                         "write `measure <Class>.<field> up to <bound>` when the field rises toward the bound, `down to` when it falls"
                             .to_owned(),
                     ),
@@ -1914,7 +1917,7 @@ impl Parser<'_> {
                         fixits: Vec::new(),
                         span: keyword.span,
                         message: format!("`measure` bound `{literal}` is not a whole number"),
-                        suggestion: Some(
+                        suggestion: suggest(
                             "a measure descends over whole numbers; a fractional bound cannot be reached by a whole step"
                                 .to_owned(),
                         ),
@@ -1937,7 +1940,7 @@ impl Parser<'_> {
                         "`measure` bound names class `{}`, but the measured field is on `{}`",
                         bound_class.name, class.name
                     ),
-                    suggestion: Some(
+                    suggestion: suggest(
                         "the bound must be carried by the same fact the ring passes around, so it travels with the measure"
                             .to_owned(),
                     ),
@@ -2059,7 +2062,7 @@ impl Parser<'_> {
                 fixits: Vec::new(),
                 span: removed_kind.span,
                 message: format!("`use {removed_label}` is no longer supported"),
-                suggestion: Some(
+                suggestion: suggest(
                     "write `use std.memory` for package libraries; attach skills with `agent { skills [...] }`"
                         .to_owned(),
                 ),
@@ -2085,7 +2088,7 @@ impl Parser<'_> {
                     fixits: Vec::new(),
                     span: span.join(unit.span),
                     message: format!("invalid duration `{value}{}`", unit.name),
-                    suggestion: Some("use `<n><unit>` with unit s, m, h, or d".to_owned()),
+                    suggestion: suggest("use `<n><unit>` with unit s, m, h, or d".to_owned()),
                 });
                 None
             }
@@ -2282,7 +2285,7 @@ impl Parser<'_> {
                             "enum `{}` declares variant `{}` on the same line as the previous variant",
                             name.name, variant.name
                         ),
-                        suggestion: Some("write one enum variant per line".to_owned()),
+                        suggestion: suggest("write one enum variant per line".to_owned()),
                     });
                 }
             }
@@ -2363,7 +2366,7 @@ impl Parser<'_> {
                 fixits: Vec::new(),
                 span: name_span,
                 message: format!("signal name `{name}` must be dotted lowercase"),
-                suggestion: Some(
+                suggestion: suggest(
                     "use a dotted lowercase name such as `deploy.finished`".to_owned(),
                 ),
             });
@@ -2496,7 +2499,7 @@ impl Parser<'_> {
                 end: gap_end.max(gap_start),
             },
             message: format!("expected `at least` or `at most` in {label}"),
-            suggestion,
+            suggestion: suggestion.map(crate::Suggestion::manual),
         });
         None
     }
@@ -2553,7 +2556,7 @@ impl Parser<'_> {
                 fixits: Vec::new(),
                 span,
                 message: format!("region `{}` must declare its selection", name.name),
-                suggestion: Some(
+                suggestion: suggest(
                     "a region is a named part of the artifact world: add \
                      `select \"<selection>\"` composing `path(...)`/`decl(...)` atoms"
                         .to_owned(),
@@ -2624,7 +2627,7 @@ impl Parser<'_> {
                         fixits: Vec::new(),
                         span: keyword.span,
                         message: "unknown judge form".to_owned(),
-                        suggestion: Some(crate::suggest_then_keyword(
+                        suggestion: suggest(crate::suggest_then_keyword(
                             &match self.peek().map(|token| &token.kind) {
                                 Some(TokenKind::Ident(word)) => word.clone(),
                                 _ => String::new(),
@@ -2648,7 +2651,7 @@ impl Parser<'_> {
                         fixits: Vec::new(),
                         span: keyword.span,
                         message: "gauge declares more than one judge".to_owned(),
-                        suggestion: Some("a gauge has exactly one judge".to_owned()),
+                        suggestion: suggest("a gauge has exactly one judge".to_owned()),
                     });
                 } else {
                     judge = Some(form);
@@ -2689,7 +2692,7 @@ impl Parser<'_> {
                             // `mean` is the whole closed half of the vocabulary;
                             // the quantile half is a SHAPE (`p<N>`), not a set,
                             // so there is nothing there to be close to.
-                            suggestion: Some(crate::suggest_then_keyword(
+                            suggestion: suggest(crate::suggest_then_keyword(
                                 stat,
                                 ["mean"],
                                 "bars are chance-shaped (`P(<field>)`) or stat-shaped \
@@ -2719,7 +2722,7 @@ impl Parser<'_> {
                         fixits: Vec::new(),
                         span: keyword.span,
                         message: "gauge declares more than one bar".to_owned(),
-                        suggestion: Some("a gauge has at most one `expect` bar".to_owned()),
+                        suggestion: suggest("a gauge has at most one `expect` bar".to_owned()),
                     });
                 } else {
                     expect = Some(GaugeBar {
@@ -2753,7 +2756,7 @@ impl Parser<'_> {
                     fixits: Vec::new(),
                     span,
                     message: "unknown gauge clause".to_owned(),
-                    suggestion: Some(crate::suggest_then_keyword(
+                    suggestion: suggest(crate::suggest_then_keyword(
                         &written,
                         ["judge", "expect", "inputs"],
                         "gauge clauses are `judge via`, `expect`, and `inputs`",
@@ -2774,7 +2777,7 @@ impl Parser<'_> {
                 fixits: Vec::new(),
                 span: name.span,
                 message: format!("gauge `{}` declares no judge", name.name),
-                suggestion: Some(
+                suggestion: suggest(
                     "add `judge via coerce <Name>`, `judge via prompt \"<template>\"`, \
                      `judge via exec \"<command>\"`, or `judge via labels \"<source>\"`"
                         .to_owned(),
@@ -2901,7 +2904,7 @@ impl Parser<'_> {
                     message: "unknown campaign clause".to_owned(),
                     // Same shape as the gauge clause above: the message does not
                     // carry the word, so it is peeked purely to measure it.
-                    suggestion: Some(crate::suggest_then_keyword(
+                    suggestion: suggest(crate::suggest_then_keyword(
                         &match self.peek().map(|token| &token.kind) {
                             Some(TokenKind::Ident(word)) => word.clone(),
                             _ => String::new(),
@@ -2926,7 +2929,7 @@ impl Parser<'_> {
                 fixits: Vec::new(),
                 span: name.span,
                 message: format!("campaign `{}` names nothing to improve", name.name),
-                suggestion: Some("add an `ascend` or `reach` clause".to_owned()),
+                suggestion: suggest("add an `ascend` or `reach` clause".to_owned()),
             });
         }
         Some(CampaignDecl {
@@ -3022,7 +3025,7 @@ impl Parser<'_> {
                                 fixits: Vec::new(),
                                 span: name.span,
                                 message: "a test scenario binds at most one `workflow`".to_owned(),
-                                suggestion: Some(
+                                suggestion: suggest(
                                     "remove the extra `workflow <Name>` header".to_owned(),
                                 ),
                             });
@@ -3190,7 +3193,7 @@ impl Parser<'_> {
                 },
                 message: "stub needs a surface and an outcome (e.g. `stub agent triager succeeds`)"
                     .to_owned(),
-                suggestion: Some("write `stub <surface...> <outcome> [payload]`".to_owned()),
+                suggestion: suggest("write `stub <surface...> <outcome> [payload]`".to_owned()),
             });
             return None;
         }
@@ -3457,7 +3460,7 @@ impl Parser<'_> {
                     fixits: Vec::new(),
                     span,
                     message: format!("source `{}` must declare `observe as <binding>`", name.name),
-                    suggestion: Some("add `observe as tick`".to_owned()),
+                    suggestion: suggest("add `observe as tick`".to_owned()),
                 });
                 return None;
             }
@@ -3475,7 +3478,7 @@ impl Parser<'_> {
                         "source `{}` must declare `emit <signal> {{ ... }}`",
                         name.name
                     ),
-                    suggestion: Some("add `emit triage.tick { ... }`".to_owned()),
+                    suggestion: suggest("add `emit triage.tick { ... }`".to_owned()),
                 });
                 return None;
             }
@@ -3492,7 +3495,7 @@ impl Parser<'_> {
                         fixits: Vec::new(),
                         span,
                         message: format!("clock source `{}` must declare a recurrence", name.name),
-                        suggestion: Some(
+                        suggestion: suggest(
                             "add `every weekday at 09:00`, `every 5m`, or `at 09:00`".to_owned(),
                         ),
                     });
@@ -3517,7 +3520,7 @@ impl Parser<'_> {
                         "source `{}` uses clock-only clauses but its provider is `{}`, not `clock`",
                         name.name, provider.name
                     ),
-                    suggestion: Some(
+                    suggestion: suggest(
                         "use `source clock as ...` for recurrence, timezone, or missed clauses"
                             .to_owned(),
                     ),
@@ -3565,7 +3568,7 @@ impl Parser<'_> {
                 related: Vec::new(),
                 span: mode_token.span,
                 message: format!("unknown auth mode `{}`", mode_token.name),
-                suggestion: Some("auth modes are `hmac`, `bearer` and `shared`".to_owned()),
+                suggestion: suggest("auth modes are `hmac`, `bearer` and `shared`".to_owned()),
             });
             return None;
         };
@@ -3582,7 +3585,7 @@ impl Parser<'_> {
                 related: Vec::new(),
                 span,
                 message: "a source may not carry a secret literal".to_owned(),
-                suggestion: Some(
+                suggestion: suggest(
                     "name a secret REFERENCE the runtime resolves, e.g. `auth hmac secret \
                      github_webhook`"
                         .to_owned(),
@@ -3633,7 +3636,7 @@ impl Parser<'_> {
                         // Every unit is one character, so the length ceiling
                         // leaves only a case difference reachable — `30S` is
                         // named, `30sec` is correctly not.
-                        suggestion: Some(crate::suggest_then_keyword(
+                        suggestion: suggest(crate::suggest_then_keyword(
                             other,
                             ["s", "m", "h", "d"],
                             "use `s`, `m`, `h`, or `d`",
@@ -3670,7 +3673,7 @@ impl Parser<'_> {
                     fixits: Vec::new(),
                     span: pattern_ident.span,
                     message: format!("unknown calendar pattern `{other}`"),
-                    suggestion: Some(crate::suggest_then_keyword(
+                    suggestion: suggest(crate::suggest_then_keyword(
                         other,
                         CALENDAR_PATTERNS.iter().copied(),
                         "use `day`, `weekday`, or a weekday such as `monday`",
@@ -3703,7 +3706,7 @@ impl Parser<'_> {
                 fixits: Vec::new(),
                 span: hour_span.join(minute_span),
                 message: format!("invalid time of day `{hour:02}:{minute:02}`"),
-                suggestion: Some("use a 24-hour `hh:mm` such as `09:00`".to_owned()),
+                suggestion: suggest("use a 24-hour `hh:mm` such as `09:00`".to_owned()),
             });
             return None;
         }
@@ -3866,7 +3869,7 @@ impl Parser<'_> {
                             fixits: Vec::new(),
                             span: tag.span,
                             message: format!("unknown field tag `@{}`", tag.name),
-                            suggestion: Some(crate::suggest_then_keyword(
+                            suggestion: suggest(crate::suggest_then_keyword(
                                 &tag.name,
                                 ["key"],
                                 "the only field tag is `@key` (the class natural key)",
@@ -3980,7 +3983,7 @@ impl Parser<'_> {
                     end: body_end,
                 },
                 message: "unterminated table row".to_owned(),
-                suggestion: Some("close the table row with `}`".to_owned()),
+                suggestion: suggest("close the table row with `}`".to_owned()),
             });
             return None;
         }
@@ -4141,7 +4144,7 @@ impl Parser<'_> {
                     fixits: Vec::new(),
                     span,
                     message: "`with` is not a rule readiness clause".to_owned(),
-                    suggestion: Some("use `when` for rule conditions".to_owned()),
+                    suggestion: suggest("use `when` for rule conditions".to_owned()),
                 });
                 self.advance();
             } else {
@@ -4314,7 +4317,7 @@ impl Parser<'_> {
                     end: body_end,
                 },
                 message: "unterminated grouped `when` block".to_owned(),
-                suggestion: Some("close the grouped readiness block with `}`".to_owned()),
+                suggestion: suggest("close the grouped readiness block with `}`".to_owned()),
             });
             return Some(Vec::new());
         }
@@ -4359,7 +4362,7 @@ impl Parser<'_> {
                     end: close_end,
                 },
                 message: "grouped `when` block has no readiness clauses".to_owned(),
-                suggestion: Some(
+                suggestion: suggest(
                     "add one condition per line, such as `started` or `Class as binding`"
                         .to_owned(),
                 ),
@@ -4419,7 +4422,7 @@ impl Parser<'_> {
                 end: body_end,
             },
             message: "unterminated block".to_owned(),
-            suggestion: Some("add a closing `}`".to_owned()),
+            suggestion: suggest("add a closing `}`".to_owned()),
         });
         let content = SourceSpan {
             start: body_start,
@@ -4750,7 +4753,7 @@ impl Parser<'_> {
                         fixits: Vec::new(),
                         span,
                         message: format!("{label} must fit in u32"),
-                        suggestion: Some("use a non-negative integer such as `1`".to_owned()),
+                        suggestion: suggest("use a non-negative integer such as `1`".to_owned()),
                     });
                     None
                 }
@@ -4849,7 +4852,7 @@ impl Parser<'_> {
             fixits: Vec::new(),
             span,
             message: format!("expected {expected}, found {found}"),
-            suggestion: suggestion_for_expected(&expected),
+            suggestion: suggestion_for_expected(&expected).map(crate::Suggestion::manual),
         };
         self.push_with_open_block(diagnostic);
     }
@@ -4877,7 +4880,7 @@ impl Parser<'_> {
         // The site's own advice wins when it has any: it knows what this
         // particular parse wanted, and the note already carries the location.
         if diagnostic.suggestion.is_none() {
-            diagnostic.suggestion = Some(match &open.what {
+            diagnostic.suggestion = suggest(match &open.what {
                 Some(what) => format!("add the `{closer}` that closes `{what}`"),
                 None => format!("add the `{closer}` that closes this `{}`", open.bracket),
             });
@@ -4997,7 +5000,9 @@ impl Parser<'_> {
             fixits: Vec::new(),
             span,
             message: format!("expected {expected}, found {found}"),
-            suggestion: suggestion.or_else(|| suggestion_for_expected(&expected)),
+            suggestion: suggestion
+                .or_else(|| suggestion_for_expected(&expected))
+                .map(crate::Suggestion::manual),
         };
         self.push_with_open_block(diagnostic);
     }

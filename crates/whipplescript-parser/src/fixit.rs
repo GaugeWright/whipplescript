@@ -246,6 +246,20 @@ pub(crate) fn fixits_for(diagnostic: &Diagnostic, source: &str) -> Vec<Fixit> {
 pub(crate) fn attach_fixits(output: &mut CompileOutput, source: &str) {
     for diagnostic in output.diagnostics.iter_mut().chain(&mut output.warnings) {
         diagnostic.fixits = fixits_for(diagnostic, source);
+        // The suggestion's rung is the strongest rung any fixit derived from
+        // it reached. Set here, at the one place the sentence becomes an edit,
+        // so a suggestion and its fixits cannot disagree about how far the
+        // compiler stands behind them.
+        if let Some(best) = diagnostic
+            .fixits
+            .iter()
+            .map(|fixit| fixit.applicability)
+            .max()
+        {
+            if let Some(suggestion) = &mut diagnostic.suggestion {
+                suggestion.applicability = suggestion.applicability.max(best);
+            }
+        }
     }
 }
 

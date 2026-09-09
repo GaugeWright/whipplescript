@@ -1356,7 +1356,7 @@ fn renders_source_span_diagnostic() {
         fixits: Vec::new(),
         span: SourceSpan { start: 25, end: 27 },
         message: "expected profile string, found number literal".to_owned(),
-        suggestion: Some("write `profile \"profile-name\"`".to_owned()),
+        suggestion: whipplescript_parser::suggest("write `profile \"profile-name\"`".to_owned()),
     };
 
     let expected = concat!(

@@ -258,7 +258,7 @@ fn diag(span: SourceSpan, message: String, suggestion: &str) -> Diagnostic {
         fixits: Vec::new(),
         span,
         message,
-        suggestion: Some(suggestion.to_owned()),
+        suggestion: crate::suggest(suggestion.to_owned()),
     }
 }
 
