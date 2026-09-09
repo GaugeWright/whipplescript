@@ -11,6 +11,7 @@ pub mod effect_config;
 pub mod effect_handlers;
 pub mod effect_reconciliation;
 pub mod exec_http;
+pub mod file_lease;
 mod file_settlement;
 pub mod gov;
 pub mod harness;
@@ -102,6 +103,7 @@ pub struct RuntimeKernel<S: RuntimeStore = SqliteStore> {
     credential_reaper: Option<std::sync::Arc<dyn crate::rule_pass::CredentialReaper>>,
     /// Transient current authority; never reconstructed from runtime metadata.
     action_execution: Option<host_protocol::execution::VerifiedActionExecution>,
+    file_lease_policy: file_lease::FileLeasePolicy,
 }
 
 /// wasm / no-native form: no default backend (rusqlite `SqliteStore` is absent).
@@ -117,6 +119,7 @@ pub struct RuntimeKernel<S: RuntimeStore> {
     credential_reaper: Option<std::sync::Arc<dyn crate::rule_pass::CredentialReaper>>,
     /// Transient current authority; never reconstructed from runtime metadata.
     action_execution: Option<host_protocol::execution::VerifiedActionExecution>,
+    file_lease_policy: file_lease::FileLeasePolicy,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -437,6 +440,7 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
             coercion_config_fingerprint: "fixture".to_owned(),
             credential_reaper: None,
             action_execution: None,
+            file_lease_policy: file_lease::FileLeasePolicy::default(),
         }
     }
 

@@ -368,3 +368,6 @@ fn file_dispatch_and_accepted_content_have_native_hosted_parity() {
         assert_eq!(native, hosted);
     }
 }
+
+#[path = "support/file_lease_conformance.rs"]
+mod file_lease_conformance;

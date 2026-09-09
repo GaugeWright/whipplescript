@@ -526,6 +526,7 @@ pub fn run_file_effect_generic<S: RuntimeStore>(
         terminal_key,
         fact_key,
     } = file_attempt_keys(kernel, instance_id, &effect.effect_id)?;
+    let lease_expires_at = kernel.file_lease_deadline()?;
     kernel.start_dispatch_observed(
         RunStart {
             instance_id,
@@ -534,7 +535,7 @@ pub fn run_file_effect_generic<S: RuntimeStore>(
             provider: "files",
             worker_id: "whip-files",
             lease_id: &lease_id,
-            lease_expires_at: "2030-01-01T00:00:00Z",
+            lease_expires_at: &lease_expires_at,
             metadata_json: &json!({ "path": full.display().to_string() }).to_string(),
         },
         effect,
@@ -669,6 +670,7 @@ pub fn run_file_write_effect_generic<S: RuntimeStore>(
         terminal_key,
         fact_key,
     } = file_attempt_keys(kernel, instance_id, &effect.effect_id)?;
+    let lease_expires_at = kernel.file_lease_deadline()?;
     let started = kernel.start_dispatch_observed(
         RunStart {
             instance_id,
@@ -677,7 +679,7 @@ pub fn run_file_write_effect_generic<S: RuntimeStore>(
             provider: "files",
             worker_id: "whip-files",
             lease_id: &lease_id,
-            lease_expires_at: "2030-01-01T00:00:00Z",
+            lease_expires_at: &lease_expires_at,
             metadata_json: &json!({ "path": full.display().to_string(), "mode": mode }).to_string(),
         },
         effect,
@@ -994,6 +996,7 @@ pub fn run_file_import_effect_generic<S: RuntimeStore>(
         terminal_key,
         fact_key,
     } = file_attempt_keys(kernel, instance_id, &effect.effect_id)?;
+    let lease_expires_at = kernel.file_lease_deadline()?;
     kernel.start_dispatch_observed(
         RunStart {
             instance_id,
@@ -1002,7 +1005,7 @@ pub fn run_file_import_effect_generic<S: RuntimeStore>(
             provider: "files",
             worker_id: "whip-files",
             lease_id: &lease_id,
-            lease_expires_at: "2030-01-01T00:00:00Z",
+            lease_expires_at: &lease_expires_at,
             metadata_json: &json!({ "path": full.display().to_string(), "schema": schema })
                 .to_string(),
         },
@@ -1290,6 +1293,7 @@ pub fn run_file_export_effect_generic<S: RuntimeStore>(
         terminal_key,
         fact_key,
     } = file_attempt_keys(kernel, instance_id, &effect.effect_id)?;
+    let lease_expires_at = kernel.file_lease_deadline()?;
     kernel.start_dispatch_observed(
         RunStart {
             instance_id,
@@ -1298,7 +1302,7 @@ pub fn run_file_export_effect_generic<S: RuntimeStore>(
             provider: "files",
             worker_id: "whip-files",
             lease_id: &lease_id,
-            lease_expires_at: "2030-01-01T00:00:00Z",
+            lease_expires_at: &lease_expires_at,
             metadata_json: &json!({ "path": full.display().to_string(), "schema": schema })
                 .to_string(),
         },

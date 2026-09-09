@@ -2836,6 +2836,8 @@ export class WorkflowInstance implements DurableObject {
       };
       usage?: {
         usage_ref?: unknown;
+        provider?: unknown;
+        model?: unknown;
         input_tokens?: unknown;
         cached_input_tokens?: unknown;
         output_tokens?: unknown;
@@ -2869,6 +2871,11 @@ export class WorkflowInstance implements DurableObject {
     const usage = turnBody.usage;
     const hasExactUsage =
       typeof usage?.usage_ref === "string" &&
+      usage.usage_ref.trim() !== "" &&
+      typeof usage.provider === "string" &&
+      usage.provider.trim() !== "" &&
+      typeof usage.model === "string" &&
+      usage.model.trim() !== "" &&
       Number.isSafeInteger(usage.input_tokens) &&
       Number(usage.input_tokens) >= 0 &&
       Number.isSafeInteger(usage.cached_input_tokens) &&
@@ -2910,6 +2917,8 @@ export class WorkflowInstance implements DurableObject {
           ? {
               usage: {
                 usage_ref: usage.usage_ref,
+                provider: usage.provider,
+                model: usage.model,
                 input_tokens: usage.input_tokens,
                 cached_input_tokens: usage.cached_input_tokens,
                 output_tokens: usage.output_tokens,
@@ -4313,6 +4322,12 @@ export class WorkflowInstance implements DurableObject {
             ? {
                 usage: {
                   usage_ref: durableUsage.usage_ref,
+                  // Provider and model are the exact binding WhippleScript
+                  // admitted for this turn. They are host-owned dimensions of
+                  // the narrow usage projection, not fields reconstructed by
+                  // the settlement or account services.
+                  provider: binding.provider,
+                  model: binding.model,
                   input_tokens: durableUsage.input_tokens,
                   cached_input_tokens:
                     durableUsage.cached_input_tokens,

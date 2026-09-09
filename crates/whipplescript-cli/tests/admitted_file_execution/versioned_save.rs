@@ -260,6 +260,18 @@ fn run<S, B, C>(
         failed_after_apply: mode == "failed-after-apply",
         calls: Cell::new(0),
     };
+    let lease_seconds = if actor.starts_with("agent:") { 90 } else { 60 };
+    if actor.starts_with("agent:") {
+        facade.kernel_mut().set_file_lease_policy(
+            whipplescript_kernel::file_lease::FileLeasePolicy::new(lease_seconds)
+                .expect("valid file lease policy"),
+        );
+    }
+    let clock_before = facade
+        .kernel()
+        .store()
+        .resolve_clock("now")
+        .expect("clock before dispatch");
     let mut written_request = None;
     'drive: for _ in 0..8 {
         whipplescript_kernel::rule_pass::step_instance_generic(
@@ -363,6 +375,31 @@ fn run<S, B, C>(
         .store()
         .list_events(&admission.instance_ref)
         .expect("events");
+    let clock_after = facade
+        .kernel()
+        .store()
+        .resolve_clock("now")
+        .expect("clock after dispatch");
+    let parse =
+        |value: &str| chrono::DateTime::parse_from_rfc3339(value).expect("valid recorded clock");
+    let lifetime = chrono::Duration::seconds(i64::from(lease_seconds));
+    let mut write_deadline = None;
+    for event in events
+        .iter()
+        .filter(|event| event.event_type == "effect.run_started")
+    {
+        let payload: Value =
+            serde_json::from_str(&event.payload_json).expect("recorded file start payload");
+        let deadline = payload["lease_expires_at"]
+            .as_str()
+            .expect("recorded lease deadline");
+        assert!(parse(deadline) >= parse(&clock_before) + lifetime);
+        assert!(parse(deadline) <= parse(&clock_after) + lifetime);
+        if payload["effect_id"] == request.effect_id {
+            write_deadline = Some(deadline.to_owned());
+        }
+    }
+    let write_deadline = write_deadline.expect("write has a bounded recorded lease");
     if codec == "reference" {
         for event in &events {
             assert!(
@@ -557,6 +594,63 @@ fn run<S, B, C>(
     let mut facade =
         GovernedHostFacade::from_verified_store(facade.into_kernel().into_store(), 8, envelope(8))
             .expect("renewed recovery policy");
+    // Reconfiguration after restart applies only to new attempts. The exact
+    // recorded deadline still expires an interrupted write, without a retry or
+    // claiming that its target application did not happen.
+    facade.kernel_mut().set_file_lease_policy(
+        whipplescript_kernel::file_lease::FileLeasePolicy::new(3600)
+            .expect("valid replacement lease policy"),
+    );
+    let just_before = (parse(&write_deadline) - chrono::Duration::seconds(1))
+        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    assert!(facade
+        .kernel_mut()
+        .expire_leases(&admission.instance_ref, &just_before)
+        .expect("observe before lease deadline")
+        .is_empty());
+    let expired = facade
+        .kernel_mut()
+        .expire_leases(&admission.instance_ref, &write_deadline)
+        .expect("expire at recorded deadline");
+    assert_eq!(expired.len(), usize::from(mode == "interrupted"));
+    let after_expiry = facade
+        .kernel()
+        .store()
+        .list_events(&admission.instance_ref)
+        .expect("history after expiry");
+    assert_eq!(after_expiry.len(), events.len() + expired.len());
+    let expired_attempts = whipplescript_store::effect_recovery::fold_attempts(
+        &admission.instance_ref,
+        &attempts[0]
+            .dispatch
+            .as_ref()
+            .expect("recorded dispatch frame")
+            .frame
+            .effect_id,
+        &after_expiry,
+    )
+    .expect("fold expired attempt");
+    assert_eq!(
+        expired_attempts[0].disposition,
+        whipplescript_store::effect_recovery::ExternalDisposition::Unknown
+    );
+    if mode == "interrupted" {
+        assert_eq!(
+            expired_attempts[0].terminal_status.as_deref(),
+            Some("lease_expired")
+        );
+        assert!(facade
+            .kernel()
+            .claimable_effects(&admission.instance_ref)
+            .expect("claimable effects after expiry")
+            .is_empty());
+    }
+    assert!(facade
+        .kernel_mut()
+        .expire_leases(&admission.instance_ref, &write_deadline)
+        .expect("redeliver expiry")
+        .is_empty());
+    assert_eq!(files.calls.get(), 1, "expiry never repeats a write");
     super::save_reconciliation::check(
         &mut facade,
         &observe,
