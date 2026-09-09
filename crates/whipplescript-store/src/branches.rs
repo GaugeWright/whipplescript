@@ -654,6 +654,17 @@ pub struct BranchStore {
 
 #[cfg(feature = "native")]
 impl BranchStore {
+    /// Open an existing store without creating directories, initializing or
+    /// migrating its schema. Missing or incompatible records fail when read.
+    /// SQLite enforces read-only access even through this type's write methods;
+    /// WAL reads still observe other connections' committed changes.
+    pub fn open_read_only(path: impl AsRef<Path>) -> StoreResult<Self> {
+        let connection =
+            Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        connection.busy_timeout(crate::STORE_BUSY_TIMEOUT)?;
+        Ok(Self { connection })
+    }
+
     pub fn open(path: impl AsRef<Path>) -> StoreResult<Self> {
         if let Some(parent) = path.as_ref().parent() {
             if !parent.as_os_str().is_empty() {

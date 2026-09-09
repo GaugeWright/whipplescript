@@ -616,6 +616,19 @@ fn fold_changes(
 
 #[cfg(feature = "native")]
 impl NativeWorkspaceVcs {
+    /// Observe already recorded cuts without creating or migrating either
+    /// store. This grants no host access authority, imports no filesystem state,
+    /// and provides no additional content retention or erasure guarantee.
+    pub fn open_read_only(
+        branches_path: impl AsRef<Path>,
+        content_path: impl AsRef<Path>,
+    ) -> StoreResult<Self> {
+        Ok(Self::from_parts(
+            BranchStore::open_read_only(branches_path)?,
+            ContentStore::open_read_only(content_path)?,
+        ))
+    }
+
     pub fn open(
         branches_path: impl AsRef<Path>,
         content_path: impl AsRef<Path>,
