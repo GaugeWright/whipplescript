@@ -7432,6 +7432,20 @@ mod tests {
         // Removing the cycle refusal must fail this test, not hang the sweep.
         // The worker normally terminates immediately; the test process bounds
         // the deliberately broken implementation without weakening the walk.
+        //
+        // The bound below separates "terminates" from "hangs", and nothing
+        // else. It is deliberately far larger than the work needs, because it
+        // is wall time on a machine this test does not have to itself. Each of
+        // the five modes opens two on-disk SQLite databases and commits
+        // through them, so the loop spends about 284 fsyncs; the walk under
+        // test never shows up in the profile. Against a tmpfs the whole loop
+        // takes 0.03s, and it took 0.03s on every run. Against the real disk
+        // while other gates were running, fsync averaged 184ms and 99.99% of
+        // the elapsed time was blocked in it, putting the identical work
+        // between 0.45s and 20.1s. The variance is the disk's queue, not this
+        // code, so a bound tight enough to read as a performance budget just
+        // reports the machine's load as a lineage defect. Only an
+        // implementation that never returns should exceed this.
         let (done, finished) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             for mode in [
@@ -7504,7 +7518,7 @@ mod tests {
             done.send(()).expect("test receiver");
         });
         finished
-            .recv_timeout(std::time::Duration::from_secs(10))
+            .recv_timeout(std::time::Duration::from_secs(120))
             .expect("receipt validation must terminate and pass");
     }
 
