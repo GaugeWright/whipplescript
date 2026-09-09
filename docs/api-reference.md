@@ -1996,10 +1996,10 @@ the constructs of the source.
 | Harness | `harness coder: codex` | A named family of endpoints of a provider that `agent ... using coder` uses. |
 | Agent | `agent name { profile "..."; capacity N; skills [...] }` | The logical target of a provider, and the metadata of the policy. |
 | Coerce | `coerce fn(args...) -> Type { prompt """markdown ... """ }` | A declared effect that a coercion backend supports. |
-| Channel | `channel name { provider local destination "#ops" }` | A named endpoint for messages. The endpoint supports the inbound `when message from` clause and the outbound `send via` statement. The provider must be `local`, `desktop`, `stdio`, or `fixture`. |
+| Channel | `channel name { destination "#ops" }` | A named endpoint for messages. The endpoint supports the inbound `when message from` clause and the outbound `send via` statement. The provider must be `local`, `desktop`, `stdio`, or `fixture`; it defaults to `local`, so a channel on the default states no `provider` clause. |
 | Source | `source clock\|file\|http as name { ... observe as obs emit <signal> { ... } }` | An ingress source. The forms are a clock schedule, the lines of a `path` file, the occurrences of content of a `watch` file, and a GET-only http fetch. The optional `dedup <obs>.<field>` clause applies. The `emit` clause admits the observed input as a typed signal through the core for admission. An embedded manifest or a locked manifest of a package must contribute the kind of the provider. |
 | File store | `file store name { root "..." allow read [...] allow write [...] }` | A policy boundary over a root of documents that a provider supports. The boundary applies to `read text`, `write text`, `import`, and `export`. |
-| Tracker | `tracker name { provider builtin }` | A declared backlog of work items that is independent of a vendor. |
+| Tracker | `tracker name` | A declared backlog of work items that is independent of a vendor. |
 | Lease | `lease name { key Type slots N ttl 10m }` | A mutex or a semaphore with a limit. The scope is the workspace. |
 | Ledger | `ledger name { entry Type partition by field retain 90d }` | A log that permits append only. A typed field partitions the log. The scope is the workspace. |
 | Counter | `counter name { key Type cap N reset daily }` | A budget that a program consumes. The reset occurs at the boundary and not before. The scope is the workspace. |

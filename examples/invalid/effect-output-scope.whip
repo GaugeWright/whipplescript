@@ -1,8 +1,6 @@
 workflow EffectOutputScope
 
-tracker backlog {
-  provider builtin
-}
+tracker backlog
 
 agent worker {
   provider fixture

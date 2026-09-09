@@ -25052,3 +25052,161 @@ rule r
     assert_eq!(twice.len(), 2, "a distinct finding was hidden: {twice:?}");
     assert_ne!(twice[0], twice[1]);
 }
+
+/// Canonical form says nothing when it means the default. An omitted `provider`
+/// clause already lowered to `builtin` on a tracker and `local` on a channel,
+/// and a memory pool's only clause is optional — so the formatter printed the
+/// default back and left an empty brace block behind, which taught every
+/// example that the ceremony was required. It is not: the bare declaration is
+/// what `whip fmt` now produces, and it lowers to exactly the same thing.
+#[test]
+fn fmt_drops_a_clause_that_only_states_the_default() {
+    let source = r#"@service
+workflow FmtDefaults
+
+use std.memory
+use std.messaging
+use std.tracker
+
+memory pool scratch {
+}
+
+channel ops {
+  provider local
+}
+
+tracker backlog {
+  provider builtin
+}
+"#;
+    let formatted = format_program(source).formatted.expect("formats");
+    for bare in ["memory pool scratch", "channel ops", "tracker backlog"] {
+        assert!(
+            formatted.contains(&format!("{bare}\n")),
+            "`{bare}` must print bare:\n{formatted}"
+        );
+    }
+    for ceremony in ["provider local", "provider builtin", "{\n}"] {
+        assert!(
+            !formatted.contains(ceremony),
+            "`{ceremony}` states only the default and must not be printed:\n{formatted}"
+        );
+    }
+    assert_eq!(
+        format_program(&formatted).formatted.expect("re-formats"),
+        formatted,
+        "formatting must be idempotent"
+    );
+}
+
+/// The converse of `fmt_drops_a_clause_that_only_states_the_default`: a clause
+/// that says something other than the default is not ceremony, so it survives.
+/// A tracker naming an unavailable provider still parses (lowering is what
+/// refuses it), and the formatter must not silently rewrite it to the one that
+/// is available.
+#[test]
+fn fmt_keeps_a_clause_that_states_something_other_than_the_default() {
+    let source = r##"@service
+workflow FmtNonDefaults
+
+use std.memory
+use std.messaging
+use std.tracker
+
+memory pool scratch {
+  context limit 4
+}
+
+channel ops {
+  provider slack
+  workspace acme
+  destination "#ops"
+}
+
+tracker backlog {
+  provider github
+}
+"##;
+    let formatted = format_program(source).formatted.expect("formats");
+    for clause in [
+        "context limit 4",
+        "provider slack",
+        "workspace acme",
+        "destination \"#ops\"",
+        "provider github",
+    ] {
+        assert!(
+            formatted.contains(clause),
+            "`{clause}` must survive formatting:\n{formatted}"
+        );
+    }
+    assert_eq!(
+        format_program(&formatted).formatted.expect("re-formats"),
+        formatted,
+        "formatting must be idempotent"
+    );
+}
+
+/// Dropping the default clause would take the brace block with it, and a comment
+/// written inside that block has nowhere left to go. So the block survives when
+/// it holds a comment — the author's words outrank the shorter spelling.
+#[test]
+fn fmt_keeps_a_defaulted_tracker_block_that_holds_a_comment() {
+    let source = r#"@service
+workflow FmtCommentedTracker
+
+use std.tracker
+
+tracker backlog {
+  # the backend
+  provider builtin
+}
+"#;
+    // `whip fmt` routes a file that carries comments through the
+    // comment-preserving formatter; `format_program` is the no-comment path.
+    let formatted = format_program_preserving_comments(source).expect("formats");
+    for kept in ["# the backend", "provider builtin"] {
+        assert!(
+            formatted.contains(kept),
+            "`{kept}` must survive formatting:\n{formatted}"
+        );
+    }
+    assert_eq!(
+        format_program_preserving_comments(&formatted).expect("re-formats"),
+        formatted,
+        "formatting must be idempotent"
+    );
+}
+
+/// The bare and block spellings are one program: the formatter's shorter output
+/// is not a different declaration. Both lower to the same provider.
+#[test]
+fn the_bare_and_block_spellings_lower_to_the_same_provider() {
+    let program = |declarations: &str| {
+        format!(
+            "@service\nworkflow Spellings\n\nuse std.messaging\nuse std.tracker\n\n{declarations}\n"
+        )
+    };
+    let block = compile_program(&program(
+        "tracker backlog {\n  provider builtin\n}\n\nchannel ops {\n  provider local\n}",
+    ));
+    let bare = compile_program(&program("tracker backlog\n\nchannel ops"));
+    let providers = |output: CompileOutput| {
+        let ir = output.ir.expect("compiles");
+        (
+            ir.trackers
+                .iter()
+                .map(|tracker| tracker.provider.clone())
+                .collect::<Vec<_>>(),
+            ir.channels
+                .iter()
+                .map(|channel| channel.provider.clone())
+                .collect::<Vec<_>>(),
+        )
+    };
+    assert_eq!(
+        providers(block),
+        providers(bare),
+        "the bare spelling must lower to the block form's providers"
+    );
+}

@@ -6,9 +6,7 @@ workflow CoerceBranch
 
 # Work that needs a human is filed into the tracker; an operator picks it up
 # with `whip issue`. (Human review is the tracker, not a language construct.)
-tracker review {
-  provider builtin
-}
+tracker review
 
 
 # `coerce` turns unstructured work into typed schema-coercion output with failure handling.

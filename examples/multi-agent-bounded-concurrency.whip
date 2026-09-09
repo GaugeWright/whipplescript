@@ -7,9 +7,7 @@ description "Two agents with bounded capacity handing work to each other through
 workflow MultiAgentBoundedConcurrency
 
 # Agent capacity is part of matching, so dispatch naturally back-pressures.
-tracker backlog {
-  provider builtin
-}
+tracker backlog
 
 # Optional-provider exhibit: this example deliberately binds the Codex and Claude
 # delegating providers (opt-in Cargo features) to show two distinct agent families

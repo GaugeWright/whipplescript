@@ -288,9 +288,9 @@ agent claude {
 failure error Failed
 class Failed { reason string }
 
-tracker backlog { provider builtin }
-tracker triage { provider builtin }
-tracker escalations { provider builtin }
+tracker backlog
+tracker triage
+tracker escalations
 ```
 
 Agent work with explicit sequencing:
@@ -397,9 +397,7 @@ Track work (the `std.tracker` backlog):
 ```whip
 use std.tracker
 
-tracker backlog {
-  provider builtin
-}
+tracker backlog
 
 rule work_ready_issue
   when backlog has ready issue as issue

@@ -460,6 +460,13 @@ pub(crate) enum ClauseKind {
     Flag,
 }
 
+/// The provider an omitted `provider` clause lowers to. Named rather than
+/// spelled twice because the parser applies the default and the formatter reads
+/// it back to decide that the clause is ceremony and prints the bare form; two
+/// literals would let those two answers drift apart.
+pub(crate) const TRACKER_DEFAULT_PROVIDER: &str = "builtin";
+pub(crate) const CHANNEL_DEFAULT_PROVIDER: &str = "local";
+
 /// The typed AST node a migrated declaration lowers to — the one hand-written
 /// seam of the otherwise data-driven Shape 1 pipeline. `effect_operation`
 /// lowers to a uniform node, but the seven decls each build a distinct typed
@@ -1451,7 +1458,7 @@ impl Parser<'_> {
                 // S1: `tracker <name>` bare — provider defaults to `builtin`,
                 // today's only provider.
                 let provider = bag.ident("provider").unwrap_or_else(|| Ident {
-                    name: "builtin".to_owned(),
+                    name: TRACKER_DEFAULT_PROVIDER.to_owned(),
                     span,
                 });
                 Some(Item::Tracker(TrackerDecl {
@@ -1463,7 +1470,7 @@ impl Parser<'_> {
             DeclAstKind::Channel => {
                 // S2: `channel <name>` bare — provider defaults to `local`.
                 let provider = bag.ident("provider").unwrap_or_else(|| Ident {
-                    name: "local".to_owned(),
+                    name: CHANNEL_DEFAULT_PROVIDER.to_owned(),
                     span,
                 });
                 Some(Item::Channel(ChannelDecl {

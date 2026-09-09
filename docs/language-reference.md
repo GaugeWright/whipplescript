@@ -1717,8 +1717,10 @@ tracker backlog
 ```
 
 The bare form gives the provider the default value `builtin`. Today `builtin`
-is the only provider. The block form `tracker backlog { provider builtin }`
-states the provider explicitly. The scope of the `builtin` tracker is the
+is the only provider, so the bare form is the canonical spelling and `whip fmt`
+produces it: a `provider builtin` clause states only the default and the
+formatter drops it. Write the block form to name a provider other than the
+default. The scope of the `builtin` tracker is the
 workspace. The tracker stores its issues in `.whipplescript/items.sqlite`.
 Override the path with the `WHIPPLESCRIPT_ITEMS_STORE` variable. The tracker
 gives sequential identifiers: `WS-1`, `WS-2`, and so on. The durable status of
@@ -2143,14 +2145,15 @@ guarantees.
 use std.messaging
 
 channel release_room {
-  provider local
   workspace ops
   destination "#release"
 }
 ```
 
-The `provider` value defaults to `local` when you omit the clause. Thus the
-bare `channel release_room` declaration is sufficient for a local mailbox. The
+The `provider` value defaults to `local` when you omit the clause, which is why
+the example above names none; `whip fmt` drops a `provider local` clause for the
+same reason. Thus the bare `channel release_room` declaration is sufficient for
+a local mailbox. The
 value must name one of the v1 messaging providers. The providers are `local`, a
 mailbox in a file that operates in the two directions; `desktop`, a native
 notification that is outbound only; `stdio`, which operates in the two

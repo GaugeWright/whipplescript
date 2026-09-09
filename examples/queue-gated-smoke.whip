@@ -5,9 +5,7 @@ use std.agent.codex
 description "The agent turn only runs after the work-item claim succeeds"
 workflow QueueGatedSmoke
 
-tracker backlog {
-  provider builtin
-}
+tracker backlog
 
 class QueueGatedResult {
   itemId string

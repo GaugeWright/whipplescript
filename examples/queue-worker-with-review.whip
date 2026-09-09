@@ -7,9 +7,7 @@ description "Claim ready work items, implement them, review each turn, and escal
 workflow QueueWorkerWithReview
 
 # Queues make work ownership explicit: claim before turn, finish or release after review.
-tracker backlog {
-  provider builtin
-}
+tracker backlog
 
 enum ReviewStatus {
   Accept

@@ -40,7 +40,7 @@ rules
     writes
       schema:WorkspaceReady
     record_sources
-      schema:WorkspaceReady construct=table_row span=946..985
+      schema:WorkspaceReady construct=table_row span=923..962
     body_hash bfd2f6ca2d247b96c0d0d1e60c19be7b
   rule file_ticket
     when started
@@ -79,9 +79,9 @@ rules
       log_entry --succeeds--> effect8
       log_entry --succeeds--> effect9
     case_branches
-      case decision.verdict type=union<literal<"merge"> | literal<"revise"> | literal<"blocked">> pattern=literal:"merge" guard=- body_hash=46c8bd9b93a57f4ec41bfcb56bd31ff3 span=2224..2231
-      case decision.verdict type=union<literal<"merge"> | literal<"revise"> | literal<"blocked">> pattern=literal:"revise" guard=- body_hash=7131ffc41c4190ff0d03d76828c6707e span=2408..2416
-      case decision.verdict type=union<literal<"merge"> | literal<"revise"> | literal<"blocked">> pattern=literal:"blocked" guard=- body_hash=7131ffc41c4190ff0d03d76828c6707e span=2458..2467
+      case decision.verdict type=union<literal<"merge"> | literal<"revise"> | literal<"blocked">> pattern=literal:"merge" guard=- body_hash=46c8bd9b93a57f4ec41bfcb56bd31ff3 span=2201..2208
+      case decision.verdict type=union<literal<"merge"> | literal<"revise"> | literal<"blocked">> pattern=literal:"revise" guard=- body_hash=7131ffc41c4190ff0d03d76828c6707e span=2385..2393
+      case decision.verdict type=union<literal<"merge"> | literal<"revise"> | literal<"blocked">> pattern=literal:"blocked" guard=- body_hash=7131ffc41c4190ff0d03d76828c6707e span=2435..2444
     body_hash 02c957e883c9a832daf0dfbfbbab9259
 rule_dependencies
   file_ticket --tracker:backlog--> implement_ready_ticket

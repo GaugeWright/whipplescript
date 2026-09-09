@@ -4,15 +4,13 @@ workflow MessagingInboundLocal
 
 use std.messaging
 
-# A `channel` declaring `provider local` selects the native, file-backed local
+# A `channel` that names no provider gets `local`: the native, file-backed local
 # provider behind the S5 CapabilityProvider seam. On the RECEIVE side the worker
 # polls a per-channel inbox at `<store>.inbox.<channel>.jsonl` and admits each
 # JSON line as a `Message` on `message.<channel>` — byte-for-byte the same fact
 # `whip message` injects — so a `when message from <channel>` rule fires
 # autonomously, one firing per received message.
-channel inbox {
-  provider local
-}
+channel inbox
 
 class Received {
   text string

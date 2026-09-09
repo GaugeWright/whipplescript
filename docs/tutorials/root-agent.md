@@ -28,9 +28,7 @@ use std.messaging
 description "A root agent loop: every operator message becomes a governed turn"
 workflow RootLoop
 
-channel operator {
-  provider local
-}
+channel operator
 
 file store project {
   root "."
@@ -67,7 +65,8 @@ class TurnDone { note string }
 Read the source as a contract. Do not read it as a script:
 
 - `@service` — the loop never completes. The loop continues while you keep it.
-- `channel operator { provider local }` — this is an inbound channel. Each
+- `channel operator` — this is an inbound channel. The provider defaults to
+  `local`, so the declaration states nothing. Each
   message on the channel fires the `instruct` rule. The `whip message` command
   injects the message through the fixture path. Thus the recorded fact contains
   `"provider":"fixture"`. The rule fires in the same manner in the two

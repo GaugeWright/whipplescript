@@ -6,13 +6,11 @@ workflow MessagingLocalDemo
 # authorizes it with no package lock.
 use std.messaging
 
-# A `channel` declaring `provider local` selects the native, file-backed local
+# A `channel` that names no provider gets `local`: the native, file-backed local
 # mailbox provider behind the S5 CapabilityProvider seam: outbound `send`
 # appends a JSON line to a mailbox file derived from the store path. Every other
 # provider (e.g. `slack`) stays on the fixture provider.
-channel alerts {
-  provider local
-}
+channel alerts
 
 output result Done
 

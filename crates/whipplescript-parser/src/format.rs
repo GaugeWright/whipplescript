@@ -269,9 +269,16 @@ pub(crate) fn format_item(item: Item, formatted: &mut String) {
             );
         }
         Item::Tracker(queue) => {
-            push_line(formatted, format!("tracker {} {{", queue.name.name));
-            push_line(formatted, format!("  provider {}", queue.provider.name));
-            push_line(formatted, "}");
+            // Canonical form says nothing when it means the default: an omitted
+            // `provider` lowers to `builtin`, so printing it back is ceremony.
+            // A named provider still states itself.
+            if queue.provider.name == TRACKER_DEFAULT_PROVIDER {
+                push_line(formatted, format!("tracker {}", queue.name.name));
+            } else {
+                push_line(formatted, format!("tracker {} {{", queue.name.name));
+                push_line(formatted, format!("  provider {}", queue.provider.name));
+                push_line(formatted, "}");
+            }
         }
         Item::Stream(stream) => {
             push_line(formatted, format!("stream {} {{", stream.name.name));
@@ -394,15 +401,28 @@ pub(crate) fn format_item(item: Item, formatted: &mut String) {
             push_line(formatted, "}");
         }
         Item::Channel(channel) => {
-            push_line(formatted, format!("channel {} {{", channel.name.name));
-            push_line(formatted, format!("  provider {}", channel.provider.name));
+            // Same rule as the tracker: `local` is what an omitted `provider`
+            // lowers to, so it is not printed. With every clause defaulted the
+            // block itself is ceremony too, and the bare declaration is canonical.
+            let mut fields = Vec::new();
+            if channel.provider.name != CHANNEL_DEFAULT_PROVIDER {
+                fields.push(format!("  provider {}", channel.provider.name));
+            }
             if let Some(workspace) = &channel.workspace {
-                push_line(formatted, format!("  workspace {}", workspace.name));
+                fields.push(format!("  workspace {}", workspace.name));
             }
             if let Some(destination) = &channel.destination {
-                push_line(formatted, format!("  destination {:?}", destination.value));
+                fields.push(format!("  destination {:?}", destination.value));
             }
-            push_line(formatted, "}");
+            if fields.is_empty() {
+                push_line(formatted, format!("channel {}", channel.name.name));
+            } else {
+                push_line(formatted, format!("channel {} {{", channel.name.name));
+                for field in fields {
+                    push_line(formatted, field);
+                }
+                push_line(formatted, "}");
+            }
         }
         Item::Vault(vault) => {
             push_line(formatted, format!("vault {} {{", vault.name.name));
@@ -467,11 +487,15 @@ pub(crate) fn format_item(item: Item, formatted: &mut String) {
             push_line(formatted, "}");
         }
         Item::MemoryPool(pool) => {
-            push_line(formatted, format!("memory pool {} {{", pool.name.name));
+            // A memory pool has one optional clause, so an absent limit left an
+            // empty brace block behind. Print the bare declaration instead.
             if let Some(limit) = pool.context_limit {
+                push_line(formatted, format!("memory pool {} {{", pool.name.name));
                 push_line(formatted, format!("  context limit {limit}"));
+                push_line(formatted, "}");
+            } else {
+                push_line(formatted, format!("memory pool {}", pool.name.name));
             }
-            push_line(formatted, "}");
         }
         Item::Action(action) => {
             let params = action

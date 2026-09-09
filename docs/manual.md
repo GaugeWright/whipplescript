@@ -302,9 +302,7 @@ In this condition, declare a `tracker`. The rules then claim from the tracker:
 
 <!-- check: skip — excerpt; the surrounding program's declarations are not shown -->
 ```whip
-tracker backlog {
-  provider builtin
-}
+tracker backlog
 
 rule pick_up
   when backlog has ready issue as issue

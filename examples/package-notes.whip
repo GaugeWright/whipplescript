@@ -12,9 +12,7 @@ workflow PackageNotes
 use notes
 use std.tracker
 
-tracker backlog {
-  provider builtin
-}
+tracker backlog
 
 agent worker {
   provider codex

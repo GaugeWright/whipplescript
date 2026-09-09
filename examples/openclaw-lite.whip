@@ -23,9 +23,7 @@ class Plan {
   status "ready"
 }
 
-tracker backlog {
-  provider builtin
-}
+tracker backlog
 
 agent planner {
   provider codex

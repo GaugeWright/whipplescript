@@ -20,9 +20,7 @@ use std.tracker
 output result Report
 class Report { seen int }
 
-tracker backlog {
-  provider builtin
-}
+tracker backlog
 
 rule seed
   when started

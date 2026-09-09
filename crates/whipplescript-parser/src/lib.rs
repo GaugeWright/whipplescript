@@ -3706,6 +3706,18 @@ fn try_format_tracker_with_comments(
     comments: &[Comment],
     formatted: &mut String,
 ) -> bool {
+    // The default provider is not printed (see `format_item`), which would take
+    // the block with it — and any comment written inside the block would have
+    // nowhere left to go. So the bare form is canonical only when the block
+    // holds no comment; a commented block keeps its shape and its `provider`
+    // line rather than losing the author's words.
+    let holds_comment = comments.iter().any(|comment| {
+        queue.span.start < comment.span.start && comment.span.start < queue.span.end
+    });
+    if queue.provider.name == TRACKER_DEFAULT_PROVIDER && !holds_comment {
+        push_line(formatted, format!("tracker {}", queue.name.name));
+        return true;
+    }
     let members: Vec<(SourceSpan, Vec<String>)> = vec![(
         queue.provider.span,
         vec![format!("  provider {}", queue.provider.name)],

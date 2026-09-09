@@ -11,7 +11,7 @@
 workflow MeasuredReleaseRing
 use std.tracker
 
-tracker backlog { provider builtin }
+tracker backlog
 
 agent reviewer { provider fixture  profile "repo-writer"  capacity 1 }
 

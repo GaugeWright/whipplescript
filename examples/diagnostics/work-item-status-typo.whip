@@ -5,7 +5,7 @@
 workflow WorkItemStatusTypo
 use std.tracker
 
-tracker backlog { provider builtin }
+tracker backlog
 
 rule r
   when backlog has ready issue as issue where issue.status == "cancelled"

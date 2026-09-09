@@ -47,9 +47,7 @@ ledger review_log {
   retain 30d
 }
 
-tracker backlog {
-  provider builtin
-}
+tracker backlog
 
 agent frontend {
   provider owned
