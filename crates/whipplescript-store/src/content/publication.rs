@@ -3,6 +3,33 @@
 use super::ContentBlobs;
 use crate::{StoreError, StoreResult};
 
+#[cfg(feature = "native")]
+impl super::ContentStore {
+    /// Open an existing current-generation content authority for retained
+    /// publication, without creating files, initializing or migrating schema.
+    /// The host must authorize access before opening this writable connection.
+    pub fn open_for_retained_publication(path: impl AsRef<std::path::Path>) -> StoreResult<Self> {
+        let connection = rusqlite::Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
+        )?;
+        connection.busy_timeout(crate::STORE_BUSY_TIMEOUT)?;
+        let version: i64 = connection.query_row(
+            "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
+            [],
+            |row| row.get(0),
+        )?;
+        if version != super::SATELLITE_SCHEMA_VERSION {
+            return Err(StoreError::UnsupportedVersion {
+                subject: "existing content publication schema".into(),
+                found: version,
+                supported: super::SATELLITE_SCHEMA_VERSION,
+            });
+        }
+        Ok(Self { connection })
+    }
+}
+
 pub fn verify_prepared(store: &(impl ContentBlobs + ?Sized), ids: &[String]) -> StoreResult<()> {
     for id in ids {
         if store.get(id)?.is_none() {
@@ -20,6 +47,13 @@ pub(super) fn native_publish<T>(
     ids: &[String],
     publish: impl FnOnce() -> StoreResult<T>,
 ) -> StoreResult<T> {
+    // SQLite accepts BEGIN IMMEDIATE on a read-only WAL connection without
+    // reserving the writer. Such a snapshot cannot exclude another eraser.
+    if store.connection.is_readonly(rusqlite::MAIN_DB)? {
+        return Err(StoreError::Conflict(
+            "retained publication requires a writable content authority".into(),
+        ));
+    }
     // No content is written in this transaction. A branch commit can survive
     // its rollback because the prepared bytes committed before we entered it.
     let transaction = rusqlite::Transaction::new_unchecked(
@@ -121,6 +155,114 @@ mod tests {
 
     fn content() -> ContentStore {
         ContentStore::open(":memory:").expect("content")
+    }
+
+    fn with_native_path(run: impl FnOnce(&std::path::Path)) {
+        struct Directory(std::path::PathBuf);
+        impl Drop for Directory {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let directory = Directory(std::env::temp_dir().join(format!(
+            "whip-publication-access-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        )));
+        std::fs::create_dir_all(&directory.0).expect("fixture directory");
+        run(&directory.0.join("content.sqlite"));
+    }
+
+    #[test]
+    fn read_only_wal_observation_cannot_publish_retained_content() {
+        with_native_path(|path| {
+            let authority = ContentStore::open(path).expect("content authority");
+            authority
+                .connection
+                .busy_timeout(std::time::Duration::ZERO)
+                .unwrap();
+            let id = authority.put(b"retained result\0\xff").expect("prepare");
+            let reader = ContentStore::open_read_only(path).expect("observer");
+            let called = Cell::new(false);
+            let result = reader.publish_retained(std::slice::from_ref(&id), || {
+                called.set(true);
+                // Without the access-mode guard this erasure commits despite
+                // the reader's nominal IMMEDIATE transaction.
+                authority.erase(&id, "competing erasure")?;
+                Ok(())
+            });
+            assert!(matches!(result, Err(StoreError::Conflict(reason))
+                if reason == "retained publication requires a writable content authority"));
+            assert!(!called.get());
+            assert_eq!(
+                authority.get(&id).unwrap().as_deref(),
+                Some(&b"retained result\0\xff"[..])
+            );
+
+            let publisher = ContentStore::open_for_retained_publication(path)
+                .expect("existing publication authority");
+            publisher
+                .publish_retained(std::slice::from_ref(&id), || {
+                    assert!(authority.erase(&id, "competing erasure").is_err());
+                    assert_eq!(
+                        publisher.get(&id)?.as_deref(),
+                        Some(&b"retained result\0\xff"[..])
+                    );
+                    Ok(())
+                })
+                .expect("publication holds real exclusion");
+            assert!(matches!(
+                authority.erase(&id, "after publication").unwrap(),
+                crate::content::EraseOutcome::Erased { .. }
+            ));
+        });
+    }
+
+    #[test]
+    fn publication_open_never_initializes_or_migrates_a_store() {
+        with_native_path(|path| {
+            assert!(ContentStore::open_for_retained_publication(path).is_err());
+            assert!(!path.exists());
+            let nested = path.parent().unwrap().join("missing/content.sqlite");
+            assert!(ContentStore::open_for_retained_publication(&nested).is_err());
+            assert!(!nested.parent().unwrap().exists());
+            let database = rusqlite::Connection::open(path).expect("empty database");
+            assert!(ContentStore::open_for_retained_publication(path).is_err());
+            let tables: i64 = database
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_schema WHERE type = 'table'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(tables, 0);
+            database.execute_batch("CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, name TEXT NOT NULL)").unwrap();
+            for version in [1, super::super::SATELLITE_SCHEMA_VERSION + 1] {
+                database
+                    .execute("DELETE FROM schema_migrations", [])
+                    .unwrap();
+                database
+                    .execute(
+                        "INSERT INTO schema_migrations VALUES (?1, 'content')",
+                        [version],
+                    )
+                    .unwrap();
+                assert!(matches!(ContentStore::open_for_retained_publication(path),
+                    Err(StoreError::UnsupportedVersion { found, .. }) if found == version));
+                let retained: i64 = database
+                    .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
+                        row.get(0)
+                    })
+                    .unwrap();
+                assert_eq!(
+                    retained, version,
+                    "opening must not change the schema stamp"
+                );
+            }
+        });
     }
 
     #[test]
