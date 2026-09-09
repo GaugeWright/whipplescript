@@ -3260,7 +3260,7 @@ fn diagnostic_key_without_related(diagnostic: &Diagnostic) -> (usize, usize, Str
 /// whole list cannot tell that from a re-report; this can, because it knows
 /// which pass said what.
 #[derive(Default)]
-struct RuleBodyPasses {
+pub(crate) struct RuleBodyPasses {
     /// For each finding, the most copies any single pass produced of it.
     said: BTreeMap<DiagnosticKey, usize>,
 }
@@ -3274,6 +3274,25 @@ impl RuleBodyPasses {
     /// hidden — it simply does not participate, which is the safe direction: an
     /// unregistered overlap shows up as a duplicate a reader can see, never as
     /// a finding that silently went missing.
+    /// Start with what was ALREADY SAID before this merger existed. The
+    /// terminal-payload walk runs from `lowering.rs` AFTER `analyze_rule`
+    /// returns, so a misspelled field in a multi-line `complete` payload was
+    /// reported by the line-wise scan inside `analyze_rule` and again by that
+    /// walk -- same span, same message -- and no `merge` could bracket the
+    /// pair: the first report was never a pass over the walk's list. Seeding
+    /// `said` from the diagnostics already present carries the merger across
+    /// that boundary. Only a byte-identical key at the same span is ever
+    /// absorbed, so a distinct finding cannot be hidden by this. (The tracker
+    /// had the phases the other way round; the test that pins this is what
+    /// settled it.)
+    pub(crate) fn seeded(already: &[Diagnostic]) -> Self {
+        let mut said: BTreeMap<DiagnosticKey, usize> = BTreeMap::new();
+        for diagnostic in already {
+            *said.entry(diagnostic_key(diagnostic)).or_default() += 1;
+        }
+        Self { said }
+    }
+
     fn merge(&mut self, diagnostics: &mut Vec<Diagnostic>, mark: usize) {
         let produced = diagnostics.split_off(mark);
         let mut budget = self.said.clone();
@@ -3293,7 +3312,11 @@ impl RuleBodyPasses {
     }
 
     /// `merge` around a pass that appends to `diagnostics` itself.
-    fn run(&mut self, diagnostics: &mut Vec<Diagnostic>, pass: impl FnOnce(&mut Vec<Diagnostic>)) {
+    pub(crate) fn run(
+        &mut self,
+        diagnostics: &mut Vec<Diagnostic>,
+        pass: impl FnOnce(&mut Vec<Diagnostic>),
+    ) {
         let mark = diagnostics.len();
         pass(diagnostics);
         self.merge(diagnostics, mark);

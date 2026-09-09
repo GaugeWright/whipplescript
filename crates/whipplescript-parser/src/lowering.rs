@@ -2745,14 +2745,20 @@ fn lower_rule(
         body::parse_rule_body(&rule.body.text, rule.body.body_base());
     diagnostics.extend(body_diagnostics);
     let metadata = analyze_rule(&rule, &body_ast, semantic, diagnostics);
-    validate_workflow_terminal_actions(
-        &rule,
-        semantic,
-        &binding_types_for_rule(&rule),
-        &known_roots_for_rule(&rule, &body_ast),
-        workflow_contract_names,
-        diagnostics,
-    );
+    // The walk below reports a payload's bad field paths after `analyze_rule`'s
+    // line-wise scan already has, at the same span with the same message
+    // (D6's fifth duplicate producer). Absorb what was already said; a
+    // distinct finding at another span or with other words is untouched.
+    super::RuleBodyPasses::seeded(diagnostics).run(diagnostics, |diagnostics| {
+        validate_workflow_terminal_actions(
+            &rule,
+            semantic,
+            &binding_types_for_rule(&rule),
+            &known_roots_for_rule(&rule, &body_ast),
+            workflow_contract_names,
+            diagnostics,
+        );
+    });
     validate_effectful_self_trigger(&rule, &metadata, diagnostics);
     validate_send_channels(&body_ast, semantic, diagnostics);
     validate_message_from_channels(&rule, semantic, diagnostics);

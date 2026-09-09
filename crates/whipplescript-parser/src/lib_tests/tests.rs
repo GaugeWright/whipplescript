@@ -24989,3 +24989,66 @@ rule finish
          computed offset past it; got {underlined:?}"
     );
 }
+
+/// D6's fifth duplicate producer: a misspelled field read in a MULTI-LINE
+/// `complete` payload was reported twice, at the same span with the same
+/// message. The terminal-payload walk runs from `lowering.rs` in an earlier
+/// phase and the line-wise scan runs in `analyze_rule`, so `RuleBodyPasses`
+/// could not bracket the pair -- it merges passes over one list, and the first
+/// report was never a pass over that list. `RuleBodyPasses::seeded` now starts
+/// from what the earlier phase already said.
+///
+/// Only a byte-identical key at the same span is absorbed, which the second
+/// half checks: two DIFFERENT misspellings in one payload are still two
+/// findings, because collapsing on message alone was rejected for exactly that
+/// program.
+#[test]
+fn a_misspelled_field_in_a_multi_line_payload_is_reported_once() {
+    let program = |payload_lines: &str| {
+        format!(
+            r#"workflow W
+
+input ticket Ticket
+
+output result Outcome
+
+class Ticket {{
+  title string
+  body string
+}}
+
+class Outcome {{
+  note string
+  detail string
+}}
+
+rule r
+  when Ticket as ticket
+=> {{
+  complete result {{
+{payload_lines}
+  }}
+}}
+"#
+        )
+    };
+    let unknown_fields = |payload_lines: &str| -> Vec<(usize, usize, String)> {
+        compile_program(&program(payload_lines))
+            .diagnostics
+            .iter()
+            .filter(|d| d.code.as_str() == "type.unknown_field")
+            .map(|d| (d.span.start, d.span.end, d.message.clone()))
+            .collect()
+    };
+
+    // One misspelling, one finding.
+    let once = unknown_fields("    note ticket.titel\n    detail ticket.body");
+    assert_eq!(once.len(), 1, "reported more than once: {once:?}");
+    assert!(once[0].2.contains("titel"), "{once:?}");
+
+    // Two misspellings are two findings: the merger keys on span and message,
+    // not on message alone, so genuinely distinct mistakes both survive.
+    let twice = unknown_fields("    note ticket.titel\n    detail ticket.bodyy");
+    assert_eq!(twice.len(), 2, "a distinct finding was hidden: {twice:?}");
+    assert_ne!(twice[0], twice[1]);
+}
