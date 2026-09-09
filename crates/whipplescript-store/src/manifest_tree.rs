@@ -158,12 +158,12 @@ fn store_node<B: ContentBlobs + ?Sized>(
         entries,
     };
     let body = serde_json::to_string(&node)?;
-    let id = blobs.put(&body)?;
+    let id = blobs.put_text(&body)?;
     Ok((last_key, id))
 }
 
 fn load_node<B: ContentBlobs + ?Sized>(blobs: &B, id: &str) -> StoreResult<Node> {
-    let Some(body) = blobs.get(id)? else {
+    let Some(body) = blobs.get_text(id)?.text() else {
         return Err(StoreError::Conflict(format!(
             "manifest tree node `{id}` is absent from the content store"
         )));
@@ -173,7 +173,7 @@ fn load_node<B: ContentBlobs + ?Sized>(blobs: &B, id: &str) -> StoreResult<Node>
     // of the manifest — and this walker cannot know whether the `blobs` it was
     // handed verifies (the read-through cache does; a bare store does not).
     // Cheap relative to the parse that follows: a node holds ~16 entries.
-    crate::content::verify_body(id, &body, "manifest tree node")?;
+    crate::content::verify_body(id, body.as_bytes(), "manifest tree node")?;
     let node: Node = serde_json::from_str(&body)?;
     if !is_known_tag(&node.tag) {
         return Err(StoreError::Conflict(format!(
@@ -692,20 +692,20 @@ mod tests {
     /// assert on how much a change actually costs.
     #[derive(Default)]
     struct CountingBlobs {
-        stored: RefCell<BTreeMap<String, String>>,
+        stored: RefCell<BTreeMap<String, Vec<u8>>>,
         writes: RefCell<Vec<String>>,
     }
 
     impl ContentBlobs for CountingBlobs {
         /// `stable_hash_hex`, matching `ContentStore::put`. Said `sha256_hex`
         /// until 2026-08-25 — a 256-bit id where the real store mints 128.
-        fn put(&self, body: &str) -> StoreResult<String> {
-            let id = crate::stable_hash_hex(body);
+        fn put(&self, body: &[u8]) -> StoreResult<String> {
+            let id = crate::stable_hash_bytes_hex(body);
             self.writes.borrow_mut().push(id.clone());
-            self.stored.borrow_mut().insert(id.clone(), body.to_owned());
+            self.stored.borrow_mut().insert(id.clone(), body.to_vec());
             Ok(id)
         }
-        fn get(&self, id: &str) -> StoreResult<Option<String>> {
+        fn get(&self, id: &str) -> StoreResult<Option<Vec<u8>>> {
             Ok(self.stored.borrow().get(id).cloned())
         }
     }
@@ -723,7 +723,7 @@ mod tests {
             self.writes.borrow_mut().clear();
         }
         /// Bodies written that the store did not already hold.
-        fn novel_writes(&self, before: &BTreeMap<String, String>) -> usize {
+        fn novel_writes(&self, before: &BTreeMap<String, Vec<u8>>) -> usize {
             self.writes
                 .borrow()
                 .iter()
@@ -731,9 +731,19 @@ mod tests {
                 .collect::<std::collections::BTreeSet<_>>()
                 .len()
         }
-        fn snapshot(&self) -> BTreeMap<String, String> {
+        fn snapshot(&self) -> BTreeMap<String, Vec<u8>> {
             self.stored.borrow().clone()
         }
+    }
+
+    /// A stored node's body as text. Manifest nodes are JSON this module
+    /// wrote, so a node that is not text is a bug in the test, not a case.
+    fn text_of<B: ContentBlobs + ?Sized>(blobs: &B, id: &str) -> String {
+        blobs
+            .get_text(id)
+            .expect("reads")
+            .text()
+            .expect("a manifest node is text")
     }
 
     /// Counts node READS, as `CountingBlobs` counts writes. A cost claim about
@@ -744,10 +754,10 @@ mod tests {
     }
 
     impl ContentBlobs for ReadCounting<'_> {
-        fn put(&self, body: &str) -> StoreResult<String> {
+        fn put(&self, body: &[u8]) -> StoreResult<String> {
             self.inner.put(body)
         }
-        fn get(&self, id: &str) -> StoreResult<Option<String>> {
+        fn get(&self, id: &str) -> StoreResult<Option<Vec<u8>>> {
             self.reads.set(self.reads.get() + 1);
             self.inner.get(id)
         }
@@ -1002,10 +1012,10 @@ mod tests {
             reads: &'a std::cell::Cell<usize>,
         }
         impl ContentBlobs for Counting<'_> {
-            fn put(&self, body: &str) -> StoreResult<String> {
+            fn put(&self, body: &[u8]) -> StoreResult<String> {
                 self.inner.put(body)
             }
-            fn get(&self, id: &str) -> StoreResult<Option<String>> {
+            fn get(&self, id: &str) -> StoreResult<Option<Vec<u8>>> {
                 self.reads.set(self.reads.get() + 1);
                 self.inner.get(id)
             }
@@ -1294,8 +1304,7 @@ mod tests {
     fn a_node_absent_from_the_store_is_refused_by_name() {
         let blobs = CountingBlobs::default();
         let root = build(&blobs, &manifest(240)).expect("tree builds");
-        let parsed =
-            parse_node(&blobs.get(&root).expect("reads").expect("live")).expect("root parses");
+        let parsed = parse_node(&text_of(&blobs, &root)).expect("root parses");
         assert!(
             parsed.level > 0,
             "the fixture must have interior nodes, or removing one removes the root"
@@ -1315,8 +1324,7 @@ mod tests {
     fn a_node_whose_bytes_do_not_match_its_id_is_refused_on_load() {
         let blobs = CountingBlobs::default();
         let root = build(&blobs, &manifest(240)).expect("tree builds");
-        let parsed =
-            parse_node(&blobs.get(&root).expect("reads").expect("live")).expect("root parses");
+        let parsed = parse_node(&text_of(&blobs, &root)).expect("root parses");
         assert!(
             parsed.level > 0,
             "the fixture must produce interior nodes, or this substitutes nothing"
@@ -1343,7 +1351,7 @@ mod tests {
     fn a_foreign_node_refuses() {
         let blobs = CountingBlobs::default();
         let id = blobs
-            .put("{\"tag\":\"something.else\",\"level\":0,\"entries\":[]}")
+            .put_text("{\"tag\":\"something.else\",\"level\":0,\"entries\":[]}")
             .expect("put");
         assert!(matches!(load(&blobs, &id), Err(StoreError::Conflict(_))));
         assert!(matches!(

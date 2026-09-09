@@ -678,7 +678,7 @@ pub mod conformance {
                 .expect("head");
             let hash = workspace
                 .content_store()
-                .put(if erased == "base" { BASE } else { HEAD })
+                .put_text(if erased == "base" { BASE } else { HEAD })
                 .expect("content id");
             assert!(matches!(
                 workspace.content_store().erase(&hash, "t2").expect("erase"),

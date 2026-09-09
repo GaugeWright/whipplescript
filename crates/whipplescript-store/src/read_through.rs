@@ -69,13 +69,13 @@ impl<C: ContentBlobs, A: ContentBlobs> ContentBlobs for ReadThrough<C, A> {
     /// Writes reach the authority. The cache is populated as a side effect,
     /// which is an optimization rather than part of the write: a cache that
     /// failed to accept the copy would not make the write less durable.
-    fn put(&self, body: &str) -> StoreResult<String> {
+    fn put(&self, body: &[u8]) -> StoreResult<String> {
         let id = self.authority.put(body)?;
         let _ = self.cache.put(body);
         Ok(id)
     }
 
-    fn get(&self, id: &str) -> StoreResult<Option<String>> {
+    fn get(&self, id: &str) -> StoreResult<Option<Vec<u8>>> {
         if let Some(body) = self.cache.get(id)? {
             // Identity verification never substitutes for the subsequent
             // authority check: correctly hashed bytes may have been erased.
@@ -144,14 +144,14 @@ pub mod conformance {
 
     /// Deliberately cannot erase: authority erasure must still stop its reads.
     #[derive(Default)]
-    struct RetainingCache(RefCell<BTreeMap<String, String>>);
+    struct RetainingCache(RefCell<BTreeMap<String, Vec<u8>>>);
     impl ContentBlobs for RetainingCache {
-        fn put(&self, body: &str) -> StoreResult<String> {
-            let id = crate::stable_hash_hex(body);
-            self.0.borrow_mut().insert(id.clone(), body.to_owned());
+        fn put(&self, body: &[u8]) -> StoreResult<String> {
+            let id = crate::stable_hash_bytes_hex(body);
+            self.0.borrow_mut().insert(id.clone(), body.to_vec());
             Ok(id)
         }
-        fn get(&self, id: &str) -> StoreResult<Option<String>> {
+        fn get(&self, id: &str) -> StoreResult<Option<Vec<u8>>> {
             Ok(self.0.borrow().get(id).cloned())
         }
     }
@@ -159,8 +159,11 @@ pub mod conformance {
     pub fn check(authority: impl ContentBlobs) {
         let layered = ReadThrough::new(RetainingCache::default(), authority);
         for (body, direct) in [("erased at authority", true), ("cache cannot erase", false)] {
-            let id = layered.put(body).expect("prepare");
-            assert_eq!(layered.get(&id).expect("warm read").as_deref(), Some(body));
+            let id = layered.put(body.as_bytes()).expect("prepare");
+            assert_eq!(
+                layered.get(&id).expect("warm read").as_deref(),
+                Some(body.as_bytes())
+            );
             let outcome = if direct {
                 layered.authority().erase(&id, "2026-09-08T00:00:00Z")
             } else {
@@ -192,7 +195,7 @@ mod tests {
     /// pull-through rather than inferring it.
     #[derive(Default)]
     struct CountingBlobs {
-        stored: RefCell<BTreeMap<String, String>>,
+        stored: RefCell<BTreeMap<String, Vec<u8>>>,
         erased: RefCell<BTreeMap<String, u64>>,
         gets: RefCell<usize>,
         statuses: RefCell<usize>,
@@ -218,12 +221,12 @@ mod tests {
         /// produces, and nothing noticed because no reader verified. Adding
         /// DR-0066 §3's check broke five tests immediately, which is the check
         /// doing precisely its job on its first outing.
-        fn put(&self, body: &str) -> StoreResult<String> {
-            let id = crate::stable_hash_hex(body);
-            self.stored.borrow_mut().insert(id.clone(), body.to_owned());
+        fn put(&self, body: &[u8]) -> StoreResult<String> {
+            let id = crate::stable_hash_bytes_hex(body);
+            self.stored.borrow_mut().insert(id.clone(), body.to_vec());
             Ok(id)
         }
-        fn get(&self, id: &str) -> StoreResult<Option<String>> {
+        fn get(&self, id: &str) -> StoreResult<Option<Vec<u8>>> {
             *self.gets.borrow_mut() += 1;
             if self.unavailable.get() {
                 return Err(crate::StoreError::Conflict("authority unavailable".into()));
@@ -284,11 +287,11 @@ mod tests {
     struct LyingBlobs;
 
     impl ContentBlobs for LyingBlobs {
-        fn put(&self, body: &str) -> StoreResult<String> {
-            Ok(crate::stable_hash_hex(body))
+        fn put(&self, body: &[u8]) -> StoreResult<String> {
+            Ok(crate::stable_hash_bytes_hex(body))
         }
-        fn get(&self, _id: &str) -> StoreResult<Option<String>> {
-            Ok(Some("not the bytes you asked for".to_owned()))
+        fn get(&self, _id: &str) -> StoreResult<Option<Vec<u8>>> {
+            Ok(Some(b"not the bytes you asked for".to_vec()))
         }
         fn status(&self, _id: &str) -> StoreResult<BlobStatus> {
             Ok(BlobStatus::Live { byte_len: 29 })
@@ -307,7 +310,7 @@ mod tests {
     #[test]
     fn a_plain_authority_cannot_acknowledge_chunk_structure_it_does_not_store() {
         let layered = layered();
-        let chunk = layered.put("chunk").expect("prepare chunk");
+        let chunk = layered.put_text("chunk").expect("prepare chunk");
         let root = crate::stable_hash_hex("chunkchunk");
         let error = layered
             .put_chunk_root(&root, &[chunk.clone(), chunk], 10)
@@ -324,10 +327,10 @@ mod tests {
         // metadata reads would misclassify it as an available plain blob.
         struct VanishingRoot;
         impl ContentBlobs for VanishingRoot {
-            fn put(&self, body: &str) -> StoreResult<String> {
-                Ok(crate::stable_hash_hex(body))
+            fn put(&self, body: &[u8]) -> StoreResult<String> {
+                Ok(crate::stable_hash_bytes_hex(body))
             }
-            fn get(&self, _: &str) -> StoreResult<Option<String>> {
+            fn get(&self, _: &str) -> StoreResult<Option<Vec<u8>>> {
                 Ok(None)
             }
             fn status(&self, _: &str) -> StoreResult<BlobStatus> {
@@ -338,7 +341,7 @@ mod tests {
             }
         }
         let layered = ReadThrough::new(CountingBlobs::default(), VanishingRoot);
-        let id = layered.put("cached").expect("warm");
+        let id = layered.put_text("cached").expect("warm");
         assert!(layered.cache.get(&id).expect("cache").is_some());
         assert_eq!(layered.get(&id).expect("unavailable root"), None);
     }
@@ -351,7 +354,7 @@ mod tests {
     fn a_lying_cache_is_refused_rather_than_returned() {
         let layered = ReadThrough::new(LyingBlobs, CountingBlobs::default());
         let id = layered
-            .put("the real body")
+            .put_text("the real body")
             .expect("put reaches the authority");
 
         let read = layered.get(&id);
@@ -409,13 +412,19 @@ mod tests {
     #[test]
     fn a_miss_pulls_through_and_populates() {
         let authority = CountingBlobs::default();
-        let id = authority.put("body").expect("authority holds it");
+        let id = authority.put_text("body").expect("authority holds it");
         let layered = ReadThrough::new(CountingBlobs::default(), authority);
 
-        assert_eq!(layered.get(&id).expect("get").as_deref(), Some("body"));
+        assert_eq!(
+            layered.get(&id).expect("get").as_deref(),
+            Some(&b"body"[..])
+        );
         let after_first = layered.authority().gets();
         // This opaque backend uses the conservative availability default.
-        assert_eq!(layered.get(&id).expect("get").as_deref(), Some("body"));
+        assert_eq!(
+            layered.get(&id).expect("get").as_deref(),
+            Some(&b"body"[..])
+        );
         assert_eq!(
             layered.authority().gets(),
             after_first + 1,
@@ -429,7 +438,7 @@ mod tests {
     #[test]
     fn a_cold_cache_never_reports_content_as_missing() {
         let authority = CountingBlobs::default();
-        let id = authority.put("only at the authority").expect("put");
+        let id = authority.put_text("only at the authority").expect("put");
         let layered = ReadThrough::new(CountingBlobs::default(), authority);
 
         assert!(
@@ -446,7 +455,7 @@ mod tests {
     #[test]
     fn a_warm_cache_checks_authoritative_status_without_refetching_bytes() {
         let layered = layered();
-        let id = layered.put("cached").expect("put");
+        let id = layered.put_text("cached").expect("put");
         let before = layered.authority().gets();
         let statuses = *layered.authority().statuses.borrow();
         assert!(matches!(
@@ -464,7 +473,7 @@ mod tests {
     #[test]
     fn warm_bytes_cannot_override_absence_or_failed_authority_checks() {
         let layered = layered();
-        let id = layered.put("cached private payload").expect("put");
+        let id = layered.put_text("cached private payload").expect("put");
         layered.authority().unavailable.set(true);
         assert!(layered.get(&id).is_err());
         assert!(layered.status(&id).is_err());
@@ -484,14 +493,17 @@ mod tests {
     #[test]
     fn a_warm_chunk_root_cannot_hide_an_erased_child() {
         let authority = crate::content::ContentStore::open(":memory:").expect("store");
-        let chunk = authority.put("private chunk").expect("chunk");
+        let chunk = authority.put_text("private chunk").expect("chunk");
         let body = "private chunkprivate chunk";
         let root = crate::stable_hash_hex(body);
         authority
             .put_chunk_root(&root, &[chunk.clone(), chunk.clone()], body.len() as u64)
             .expect("root");
         let layered = ReadThrough::new(CountingBlobs::default(), authority);
-        assert_eq!(layered.get(&root).expect("warm").as_deref(), Some(body));
+        assert_eq!(
+            layered.get(&root).expect("warm").as_deref(),
+            Some(body.as_bytes())
+        );
         assert_eq!(
             layered.chunk_ids(&root).expect("structure"),
             Some(vec![chunk.clone(), chunk.clone()])
@@ -520,7 +532,7 @@ mod tests {
     #[test]
     fn an_erased_blob_reads_as_erased_through_a_cold_cache() {
         let authority = CountingBlobs::default();
-        let id = authority.put("doomed").expect("put");
+        let id = authority.put_text("doomed").expect("put");
         authority.erase_locally(&id);
         let layered = ReadThrough::new(CountingBlobs::default(), authority);
 
@@ -538,7 +550,7 @@ mod tests {
     #[test]
     fn erasure_reaches_the_cached_copy() {
         let layered = layered();
-        let id = layered.put("doomed").expect("put");
+        let id = layered.put_text("doomed").expect("put");
         assert!(layered.get(&id).expect("get").is_some());
 
         assert!(matches!(
@@ -566,10 +578,10 @@ mod tests {
         let authority = CountingBlobs::default();
         let layered = ReadThrough::new(CountingBlobs::default(), authority);
 
-        let id = layered.authority().put("written behind").expect("put");
+        let id = layered.authority().put_text("written behind").expect("put");
         assert_eq!(
             layered.get(&id).expect("get").as_deref(),
-            Some("written behind"),
+            Some(&b"written behind"[..]),
             "no invalidation is needed, because a hash never means new bytes"
         );
     }
@@ -579,10 +591,10 @@ mod tests {
     #[test]
     fn a_write_reaches_the_authority() {
         let layered = layered();
-        let id = layered.put("durable").expect("put");
+        let id = layered.put_text("durable").expect("put");
         assert_eq!(
             layered.authority().get(&id).expect("get").as_deref(),
-            Some("durable")
+            Some(&b"durable"[..])
         );
     }
 }

@@ -675,7 +675,7 @@ impl NativeWorkspaceVcs {
             // (Non-manifest roots that happen to parse as a string map add only
             // phantom ids — retention noise, never a wrong delete.)
             for hash in roots.clone() {
-                if let Some(body) = self.content.get(&hash)? {
+                if let Some(body) = self.content.get_text(&hash)?.text() {
                     if crate::manifest_tree::is_node(&body) {
                         roots.extend(crate::manifest_tree::reachable_ids(&self.content, &hash)?);
                     } else if let Ok(manifest) =
@@ -1082,7 +1082,7 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
                 let reference = crate::branches::write_evidence::WriteEvidenceRef {
                     schema_ref: payload.schema_ref,
                     label_ref: payload.label_ref,
-                    content_hash: self.content.put(&payload.content)?,
+                    content_hash: self.content.put_text(&payload.content)?,
                 };
                 reference.validate()?;
                 Ok(reference)
@@ -1126,7 +1126,7 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
     /// through to the flat path exactly as before — including a malformed body,
     /// which still surfaces as the flat parse's error.
     fn load_manifest_opt(&self, hash: &str) -> StoreResult<Option<BTreeMap<String, String>>> {
-        let Some(body) = self.content.get(hash)? else {
+        let Some(body) = self.content.get_text(hash)?.text() else {
             return Ok(None);
         };
         if let Some(root) = crate::manifest_tree::parse_node(&body) {
@@ -1205,7 +1205,7 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
 
     /// Recognize a stored manifest without materializing a tree one.
     fn load_manifest_opt_raw(&self, hash: &str) -> StoreResult<Option<RawManifest>> {
-        let Some(body) = self.content.get(hash)? else {
+        let Some(body) = self.content.get_text(hash)?.text() else {
             return Ok(None);
         };
         if crate::manifest_tree::is_node(&body) {
@@ -1247,8 +1247,9 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
             let Some(canonicalizer) = self.decl_canonicalizer.as_deref() else {
                 continue;
             };
-            let Some(text) = self.content.get(content_id)? else {
-                continue; // unreadable blob: path entry only, fail closed
+            let Some(text) = self.content.get_text(content_id)?.text() else {
+                // Unreadable OR not text: path entry only, fail closed.
+                continue;
             };
             let Some(decls) = canonicalizer.canonical_declarations(&text) else {
                 continue; // no canonical form: path entry only, fail closed
@@ -1269,13 +1270,52 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
     /// manifest to look up one path until 2026-08-26, so reading one file cost
     /// the workspace (DR-0066 §8 refusal 2).
     pub fn read(&self, branch_id: &str, path: &str) -> StoreResult<Option<String>> {
-        let Some(row) = self.branches.get_branch(branch_id)? else {
+        let Some(id) = self.content_id_at(branch_id, path)? else {
             return Ok(None);
         };
-        let Some(id) = self.manifest_entry(row.head_manifest_hash.as_deref(), path)? else {
+        match self.content.get_text(&id)? {
+            crate::content::TextBlob::Text(body) => Ok(Some(body)),
+            crate::content::TextBlob::Missing => Ok(None),
+            // Present and not text. `Ok(None)` here would say "no such file"
+            // about a file the branch is holding, so this is an error and
+            // `read_bytes` is the way to ask for it.
+            crate::content::TextBlob::Binary { byte_len } => Err(StoreError::Conflict(format!(
+                "`{path}` holds {byte_len} bytes that are not text; read it with read_bytes"
+            ))),
+        }
+    }
+
+    /// One side of a conflicted path, as the text the resolve write needs.
+    ///
+    /// A side that is not text refuses by name. Taking a side on a binary path
+    /// is a legitimate resolution and needs a byte-capable `write`, which is
+    /// its own change; until then this says so rather than returning `None`,
+    /// which the caller reads as an absent side and materializes as a
+    /// deletion.
+    fn take_side_text(&self, path: &str, hash: &str) -> StoreResult<Option<String>> {
+        match self.content.get_text(hash)? {
+            crate::content::TextBlob::Text(body) => Ok(Some(body)),
+            crate::content::TextBlob::Missing => Ok(None),
+            crate::content::TextBlob::Binary { byte_len } => Err(StoreError::Conflict(format!(
+                "resolving `{path}` by taking a side needs a byte-capable write; that side \
+                 holds {byte_len} bytes that are not text"
+            ))),
+        }
+    }
+
+    /// The same read, kept as bytes — a picture, a PDF, a compiled artifact.
+    pub fn read_bytes(&self, branch_id: &str, path: &str) -> StoreResult<Option<Vec<u8>>> {
+        let Some(id) = self.content_id_at(branch_id, path)? else {
             return Ok(None);
         };
         self.content.get(&id)
+    }
+
+    fn content_id_at(&self, branch_id: &str, path: &str) -> StoreResult<Option<String>> {
+        let Some(row) = self.branches.get_branch(branch_id)? else {
+            return Ok(None);
+        };
+        self.manifest_entry(row.head_manifest_hash.as_deref(), path)
     }
 
     /// Cut references normalize the empty-string sentinel (a rebase onto
@@ -1470,21 +1510,27 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
                     continue;
                 }
                 let base_body = match conflict.base.as_deref() {
-                    Some(hash) => self.content.get(hash)?,
+                    Some(hash) => self.content.get_text(hash)?.text(),
                     None => None,
                 };
+                // A body that is not text escalates here exactly as an
+                // unreadable one does — `spec/text-merge-spec.md` §3: binary
+                // blobs keep the path-level escalation. No new branch is
+                // needed; `TextBlob::Binary` simply is not text.
                 let (Some(ours_body), Some(theirs_body)) = (
                     self.content
-                        .get(conflict.ours.as_deref().expect("present"))?,
+                        .get_text(conflict.ours.as_deref().expect("present"))?
+                        .text(),
                     self.content
-                        .get(conflict.theirs.as_deref().expect("present"))?,
+                        .get_text(conflict.theirs.as_deref().expect("present"))?
+                        .text(),
                 ) else {
                     remaining.push(conflict);
                     continue;
                 };
                 match merger.merge_source(base_body.as_deref(), &ours_body, &theirs_body) {
                     SourceMergeVerdict::Certified { merged } => {
-                        let hash = self.content.put(&merged)?;
+                        let hash = self.content.put_text(&merged)?;
                         resolved.insert(conflict.path.clone(), hash);
                     }
                     SourceMergeVerdict::Conflict => remaining.push(conflict),
@@ -1506,13 +1552,18 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
                 still_conflicted.push(conflict);
                 continue;
             }
+            // Same escalation for the text tier: three readable text bodies
+            // or the path conflicts, which is what a picture gets.
             let (Some(base_body), Some(ours_body), Some(theirs_body)) = (
                 self.content
-                    .get(conflict.base.as_deref().expect("present"))?,
+                    .get_text(conflict.base.as_deref().expect("present"))?
+                    .text(),
                 self.content
-                    .get(conflict.ours.as_deref().expect("present"))?,
+                    .get_text(conflict.ours.as_deref().expect("present"))?
+                    .text(),
                 self.content
-                    .get(conflict.theirs.as_deref().expect("present"))?,
+                    .get_text(conflict.theirs.as_deref().expect("present"))?
+                    .text(),
             ) else {
                 still_conflicted.push(conflict);
                 continue;
@@ -1525,7 +1576,7 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
                 crate::text_merge::text_merge(&base_body, &ours_body, &theirs_body, &text_config);
             match self.apply_region_memory(outcome)? {
                 TextMergeOutcome::Clean { merged, .. } => {
-                    let hash = self.content.put(&merged)?;
+                    let hash = self.content.put_text(&merged)?;
                     resolved.insert(conflict.path.clone(), hash);
                 }
                 TextMergeOutcome::Conflicted { .. } => still_conflicted.push(conflict),
@@ -1558,7 +1609,7 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
         at: &str,
     ) -> StoreResult<()> {
         for resolution in resolutions {
-            let payload = self.content.put(&resolution.resolution_text)?;
+            let payload = self.content.put_text(&resolution.resolution_text)?;
             self.branches.record_resolution_memory(
                 &Self::region_key(
                     &resolution.base_text,
@@ -1605,7 +1656,7 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
                             self.content.status(&payload)?,
                             crate::content::BlobStatus::Live { .. }
                         ) {
-                            applied = self.content.get(&payload)?;
+                            applied = self.content.get_text(&payload)?.text();
                         }
                     }
                     refined.push(match applied {
@@ -1637,7 +1688,7 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
         let Some(id) = self.manifest_entry(Some(&cut.manifest_hash), path)? else {
             return Ok(None);
         };
-        self.content.get(&id)?.map(Some).ok_or_else(|| {
+        self.content.get_text(&id)?.text().map(Some).ok_or_else(|| {
             StoreError::Conflict("save evidence content is unavailable or erased".into())
         })
     }
@@ -1944,11 +1995,11 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
         };
         let body = match choice {
             ResolutionChoice::TakeOurs => match conflict.ours.as_deref() {
-                Some(hash) => self.content.get(hash)?,
+                Some(hash) => self.take_side_text(path, hash)?,
                 None => None,
             },
             ResolutionChoice::TakeTheirs => match conflict.theirs.as_deref() {
-                Some(hash) => self.content.get(hash)?,
+                Some(hash) => self.take_side_text(path, hash)?,
                 None => None,
             },
             ResolutionChoice::Body(body) => Some(body.to_owned()),
@@ -1981,7 +2032,7 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
             VcsWriteOutcome::BranchMissing => return Ok(ResolveOutcome::BranchMissing),
             VcsWriteOutcome::BranchNotActive => return Ok(ResolveOutcome::BranchNotActive),
         }
-        let resolution_hash = self.content.put(&body)?;
+        let resolution_hash = self.content.put_text(&body)?;
         self.branches.set_conflict_state(
             &conflict.conflict_id,
             "resolved",
@@ -2809,7 +2860,11 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
         let head_change_id = self.change_of(branch.head_cut_id.as_deref())?;
         let cuts = self.branches.list_cuts(branch_id, i64::MAX as usize)?;
         Ok(Some(crate::bundle::WorkspaceBundle {
-            format: crate::bundle::BUNDLE_FORMAT.to_owned(),
+            // A workspace with no binary content still exports as v1, so every
+            // existing peer keeps reading it. One picture makes it v2, which a
+            // v1 reader refuses by name — the alternative was a v1 bundle that
+            // claims completeness while the pictures are silently gone.
+            format: crate::bundle::bundle_format_for(&blobs).to_owned(),
             branch,
             head_change_id,
             manifest,
@@ -3110,8 +3165,9 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
             let Some(hash) = hash else {
                 return Ok(Some(Vec::new())); // absent side: no declarations
             };
-            let Some(text) = self.content.get(hash)? else {
-                return Ok(None); // unreadable blob: fail closed
+            let Some(text) = self.content.get_text(hash)?.text() else {
+                // Unreadable OR not text: fail closed.
+                return Ok(None);
             };
             Ok(canonicalizer.canonical_declarations(&text))
         };
@@ -3681,7 +3737,9 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
         at: &str,
     ) -> StoreResult<crate::bundle::BundleImportOutcome> {
         use crate::bundle::BundleImportOutcome;
-        if bundle.format != crate::bundle::BUNDLE_FORMAT {
+        if bundle.format != crate::bundle::BUNDLE_FORMAT
+            && bundle.format != crate::bundle::BUNDLE_FORMAT_BINARY
+        {
             return Err(StoreError::Conflict(format!(
                 "unknown bundle format `{}`",
                 bundle.format
@@ -3749,7 +3807,7 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
                 }
                 continue;
             }
-            if let Some(body) = &blob.body {
+            if let Some(body) = blob.carried_bytes()? {
                 if matches!(
                     self.content.status(&blob.id)?,
                     crate::content::BlobStatus::Erased { .. }
@@ -3768,7 +3826,7 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
                 // can craft colliding bytes. Bundle import is only forgery-safe
                 // from a mutually-trusted sender until the id primitive is
                 // re-keyed to SHA-256 (tracked, deferred).
-                let stored = self.content.put(body)?;
+                let stored = self.content.put(&body)?;
                 if stored != blob.id {
                     return Err(StoreError::Conflict(format!(
                         "bundle blob id `{}` does not match its content (hashes to `{stored}`)",
@@ -4755,13 +4813,15 @@ mod tests {
             }
         }
         impl ContentBlobs for CollectBeforePublication {
-            fn put(&self, body: &str) -> StoreResult<String> {
+            fn put(&self, body: &[u8]) -> StoreResult<String> {
                 let id = self.inner.put(body)?;
                 self.all_ids.borrow_mut().insert(id.clone());
                 let selected = match self.kind.get() {
-                    Some("body") => body == "new file body",
-                    Some("result") => body == "retained result",
-                    Some("manifest") => crate::manifest_tree::is_node(body),
+                    Some("body") => body == b"new file body",
+                    Some("result") => body == b"retained result",
+                    Some("manifest") => {
+                        std::str::from_utf8(body).is_ok_and(crate::manifest_tree::is_node)
+                    }
                     _ => false,
                 };
                 if selected {
@@ -4769,7 +4829,7 @@ mod tests {
                 }
                 Ok(id)
             }
-            fn get(&self, id: &str) -> StoreResult<Option<String>> {
+            fn get(&self, id: &str) -> StoreResult<Option<Vec<u8>>> {
                 self.inner.get(id)
             }
             fn publish_retained<T>(
@@ -4820,7 +4880,7 @@ mod tests {
                 label_ref: "private".into(),
                 content_hash: workspace
                     .content
-                    .put("retained result")
+                    .put_text("retained result")
                     .expect("prepare result"),
             };
             let error = workspace
@@ -5367,7 +5427,10 @@ mod tests {
         )
         .expect("record");
         // A stray blob nothing names — the one thing the sweep may take.
-        let orphan = vcs.content_store().put("orphaned residue").expect("put");
+        let orphan = vcs
+            .content_store()
+            .put_text("orphaned residue")
+            .expect("put");
         let outcome = vcs.purge_unreachable("t9").expect("purge");
         assert!(outcome.purged >= 1, "the orphan was reclaimed: {outcome:?}");
         assert_eq!(
@@ -5387,7 +5450,7 @@ mod tests {
         let old_id = old_manifest.get("a.md").expect("entry");
         assert_eq!(
             vcs.content_store().get(old_id).expect("get"),
-            Some("first body".to_owned()),
+            Some(b"first body".to_vec()),
             "archaeology intact"
         );
         // The remembered payload still applies: the same divergence folds
@@ -5827,7 +5890,7 @@ mod tests {
         let flat: BTreeMap<String, String> =
             BTreeMap::from([("legacy/a.txt".to_owned(), "hash-a".to_owned())]);
         let body = serde_json::to_string(&flat).expect("encodes");
-        let hash = vcs.content.put(&body).expect("legacy manifest stores");
+        let hash = vcs.content.put_text(&body).expect("legacy manifest stores");
 
         assert!(
             !crate::manifest_tree::is_node(&body),
@@ -5946,10 +6009,10 @@ mod tests {
             ) -> StoreResult<T> {
                 self.content.publish_retained(ids, publish)
             }
-            fn put(&self, body: &str) -> StoreResult<String> {
+            fn put(&self, body: &[u8]) -> StoreResult<String> {
                 self.content.put(body)
             }
-            fn get(&self, id: &str) -> StoreResult<Option<String>> {
+            fn get(&self, id: &str) -> StoreResult<Option<Vec<u8>>> {
                 let body = self.content.get(id)?;
                 if let Some(race) = self.race.borrow_mut().take() {
                     race();
@@ -6269,11 +6332,11 @@ mod tests {
         let mut changed = BTreeMap::new();
         changed.insert(
             "out.md".to_owned(),
-            vcs.content.put("produced").expect("put"),
+            vcs.content.put_text("produced").expect("put"),
         );
         changed.insert(
             "a.md".to_owned(),
-            vcs.content.put("A modified").expect("put"),
+            vcs.content.put_text("A modified").expect("put"),
         );
         let removed = Vec::new();
         let first = vcs
@@ -6304,7 +6367,10 @@ mod tests {
         );
         // Removals fold in the same atomic step.
         let mut second_changed = BTreeMap::new();
-        second_changed.insert("b.md".to_owned(), vcs.content.put("B new").expect("put"));
+        second_changed.insert(
+            "b.md".to_owned(),
+            vcs.content.put_text("B new").expect("put"),
+        );
         let outcome = vcs
             .import_diff(
                 "draft_a",
@@ -6466,7 +6532,10 @@ mod tests {
         // Divergence: force the transported-then-edited shape — the same
         // change id on both heads with different content — and the sync
         // DETECTS it instead of merging.
-        let forged = vcs.content.put("forged divergent manifest").expect("put");
+        let forged = vcs
+            .content
+            .put_text("forged divergent manifest")
+            .expect("put");
         vcs.branches
             .advance_head("draft_a", Some("sync_a1"), "cut_a2", &forged, "t6")
             .expect("advance");
@@ -7260,6 +7329,101 @@ mod tests {
                 .expect("accepted historical evidence"),
             original,
             "undo is later work, not erasure of the original acceptance",
+        );
+    }
+
+    /// The two refusals the byte seam adds to this layer, pinned.
+    ///
+    /// `read` is named for text and cannot answer for a picture, so it errors
+    /// rather than returning `Ok(None)` — which would claim the branch has no
+    /// such file while it is holding one. `read_bytes` beside it returns the
+    /// bytes. Neither is a hypothetical: both are what a worktree holding a
+    /// screenshot now hits.
+    #[test]
+    fn reading_a_binary_path_as_text_refuses_by_name_and_read_bytes_serves_it() {
+        let mut vcs = vcs();
+        vcs.init("t0").expect("init");
+        vcs.write(
+            MAINLINE_BRANCH_ID,
+            "notes.md",
+            Some("prose"),
+            "main-1",
+            "t1",
+        )
+        .expect("write text");
+
+        // Put a picture on the branch through the content seam and point the
+        // manifest at it, which is what an import does.
+        let picture: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x00];
+        let picture_id = vcs.content.put(&picture).expect("store the picture");
+        let mut changed = BTreeMap::new();
+        changed.insert("shot.png".to_owned(), picture_id.clone());
+        vcs.import_diff(MAINLINE_BRANCH_ID, &changed, &[], "main-2", "t2")
+            .expect("import the picture");
+
+        let error = vcs
+            .read(MAINLINE_BRANCH_ID, "shot.png")
+            .expect_err("a text read cannot answer for a picture");
+        let message = format!("{error:?}");
+        assert!(
+            message.contains("not text") && message.contains("read_bytes"),
+            "the refusal names the problem and the way round it: {message}"
+        );
+
+        assert_eq!(
+            vcs.read_bytes(MAINLINE_BRANCH_ID, "shot.png")
+                .expect("read_bytes")
+                .as_deref(),
+            Some(&picture[..]),
+            "the bytes are right there"
+        );
+
+        // Text on the same branch still reads as text, and an absent path is
+        // still absent rather than an error.
+        assert_eq!(
+            vcs.read(MAINLINE_BRANCH_ID, "notes.md").expect("read"),
+            Some("prose".to_owned())
+        );
+        assert_eq!(
+            vcs.read(MAINLINE_BRANCH_ID, "no-such-file.md")
+                .expect("absent is not an error"),
+            None
+        );
+    }
+
+    /// Taking a side on a conflicted binary path refuses by name.
+    ///
+    /// The write this resolution feeds is text-only, so the side cannot be
+    /// materialized yet. Returning `None` would have been the quiet failure:
+    /// the caller reads an absent side as a deletion and resolves the conflict
+    /// by deleting the file.
+    #[test]
+    fn taking_a_binary_side_refuses_instead_of_resembling_a_deletion() {
+        let mut vcs = vcs();
+        vcs.init("t0").expect("init");
+        let picture: [u8; 6] = [0x89, b'P', b'N', b'G', 0x0d, 0x00];
+        let picture_id = vcs.content.put(&picture).expect("store");
+
+        let error = vcs
+            .take_side_text("shot.png", &picture_id)
+            .expect_err("a binary side cannot be taken through a text write");
+        let message = format!("{error:?}");
+        assert!(
+            message.contains("byte-capable write"),
+            "the refusal names what is missing: {message}"
+        );
+
+        // A text side still resolves, and an unknown hash is still an absent
+        // side rather than a refusal.
+        let text_id = vcs.content.put_text("their version").expect("store");
+        assert_eq!(
+            vcs.take_side_text("notes.md", &text_id).expect("text side"),
+            Some("their version".to_owned())
+        );
+        assert_eq!(
+            vcs.take_side_text("gone.md", "never-stored")
+                .expect("absent side"),
+            None
         );
     }
 

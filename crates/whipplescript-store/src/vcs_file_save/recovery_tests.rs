@@ -64,7 +64,7 @@ fn committed_save_result_survives_collection_and_reopen_but_not_explicit_erasure
     let mut reopened = fixture.open();
     let orphan = reopened
         .content_store()
-        .put("uncommitted candidate result")
+        .put_text("uncommitted candidate result")
         .expect("prepare orphan");
     reopened
         .write(
@@ -223,7 +223,7 @@ fn recovery_refuses_every_broken_cut_result_link() {
                     .workspace
                     .borrow()
                     .content_store()
-                    .put("{}")
+                    .put_text("{}")
                     .expect("empty manifest");
                 let op_id = format!("op-{cut}");
                 let mut op = files
@@ -287,7 +287,7 @@ fn recovery_refuses_every_broken_cut_result_link() {
                     .workspace
                     .borrow()
                     .content_store()
-                    .put(&serde_json::to_string(&receipt).expect("changed receipt"))
+                    .put_text(&serde_json::to_string(&receipt).expect("changed receipt"))
                     .expect("store changed evidence");
                 connection
                     .execute(

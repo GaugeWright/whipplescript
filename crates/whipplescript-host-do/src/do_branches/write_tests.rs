@@ -17,8 +17,8 @@ fn hosted_retained_publication_rolls_back_every_sql_boundary() {
     for fail_at in 1..24 {
         let sql = Rc::new(RusqliteDoSql::with_runtime_schema());
         let content = DoContentBlobs::new(sql.clone()).expect("content");
-        let payload = content.put("retained payload").expect("prepare");
-        let manifest = content.put("prepared manifest").expect("prepare");
+        let payload = content.put_text("retained payload").expect("prepare");
+        let manifest = content.put_text("prepared manifest").expect("prepare");
         let mut branches = DoBranches::new(sql.clone()).expect("branches");
         let before = branches.ensure_mainline("t0").expect("init");
         let injected = Rc::new(FaultySql::new(sql, fail_at));
@@ -64,7 +64,7 @@ fn hosted_retained_publication_rolls_back_every_sql_boundary() {
                 .get(&payload)
                 .expect("durable preparation")
                 .as_deref(),
-            Some("retained payload")
+            Some(&b"retained payload"[..])
         );
     }
     assert!(completed);
@@ -94,7 +94,7 @@ fn a_sql_host_cannot_invoke_retained_publication_twice() {
     }
     let sql = Rc::new(RusqliteDoSql::with_runtime_schema());
     let content = DoContentBlobs::new(sql.clone()).expect("content");
-    let id = content.put("prepared").expect("prepare");
+    let id = content.put_text("prepared").expect("prepare");
     let mut branches = DoBranches::new(sql.clone()).expect("branches");
     let before = branches.ensure_mainline("t0").expect("init");
     let broken = DoContentBlobs { sql: Repeated(sql) };
@@ -112,7 +112,7 @@ fn a_sql_host_cannot_invoke_retained_publication_twice() {
     assert!(branches.get_op("op-candidate").expect("op").is_none());
     assert_eq!(
         broken.get(&id).expect("durable preparation").as_deref(),
-        Some("prepared")
+        Some(&b"prepared"[..])
     );
 }
 

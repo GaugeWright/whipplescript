@@ -35,8 +35,7 @@ const MAX_REASSEMBLE_PREALLOC: usize = 8 * 1024 * 1024;
 /// deduped repetitive content, but also the lever for an amplification bomb
 /// (a tiny bundle whose root reassembles to gigabytes from one shared chunk).
 /// There is no structural way to tell the two apart, so an absolute size
-/// ceiling is the only real defense. Content-store bodies are UTF-8 text, so
-/// this is generous for real files. Override with `WHIPPLESCRIPT_MAX_BLOB_BYTES`.
+/// ceiling is the only real defense. Generous for real files, text or not. Override with `WHIPPLESCRIPT_MAX_BLOB_BYTES`.
 const DEFAULT_MAX_BLOB_BYTES: u64 = 256 * 1024 * 1024;
 
 /// The active per-blob size ceiling, read from `WHIPPLESCRIPT_MAX_BLOB_BYTES`
@@ -49,6 +48,28 @@ pub(crate) fn max_blob_bytes() -> u64 {
         .and_then(|raw| raw.trim().parse::<u64>().ok())
         .filter(|&bytes| bytes > 0)
         .unwrap_or(DEFAULT_MAX_BLOB_BYTES)
+}
+
+/// A read taken by a caller that wants text. `Binary` is not an error and
+/// not an absence: the blob is present and readable, and simply is not text.
+/// Callers that cannot act on bytes escalate on this arm rather than
+/// pretending the content is missing or decoding it lossily.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TextBlob {
+    Missing,
+    Text(String),
+    Binary { byte_len: u64 },
+}
+
+impl TextBlob {
+    /// The text, or `None` for both absence and non-text content. Only for
+    /// callers where those two genuinely lead to the same behaviour.
+    pub fn text(self) -> Option<String> {
+        match self {
+            TextBlob::Text(text) => Some(text),
+            TextBlob::Missing | TextBlob::Binary { .. } => None,
+        }
+    }
 }
 
 /// What the store knows about a content id: alive with payload, erased
@@ -97,8 +118,8 @@ pub enum EraseOutcome {
 ///
 /// That is narrower than §3 reads, and `spec/remote-substrate-conformance.md`
 /// records the narrowing rather than leaving it implied.
-pub fn verify_body(id: &str, body: &str, source: &'static str) -> crate::StoreResult<()> {
-    let actual = crate::stable_hash_hex(body);
+pub fn verify_body(id: &str, body: &[u8], source: &'static str) -> crate::StoreResult<()> {
+    let actual = crate::stable_hash_bytes_hex(body);
     if actual == id {
         return Ok(());
     }
@@ -116,9 +137,40 @@ pub fn verify_body(id: &str, body: &str, source: &'static str) -> crate::StoreRe
 pub trait ContentBlobs {
     /// Store `body`, returning its content id (a stable hash of the
     /// bytes). Idempotent.
-    fn put(&self, body: &str) -> crate::StoreResult<String>;
+    ///
+    /// The seam is **bytes**, not text. A workspace holds whatever the work
+    /// puts in it — a screenshot the agent produced, a PDF a person dropped
+    /// in — and a store that could only hold UTF-8 made those files
+    /// unimportable, which took the branch's diff and cut down with them.
+    /// Ids are unchanged for text: the digest was always taken over
+    /// `as_bytes()`.
+    fn put(&self, body: &[u8]) -> crate::StoreResult<String>;
     /// Read the full stored bytes for a content id, or `None` if unknown.
-    fn get(&self, id: &str) -> crate::StoreResult<Option<String>>;
+    fn get(&self, id: &str) -> crate::StoreResult<Option<Vec<u8>>>;
+    /// Store UTF-8 text. The text tier over the byte seam.
+    fn put_text(&self, body: &str) -> crate::StoreResult<String> {
+        self.put(body.as_bytes())
+    }
+    /// Read a blob that the caller intends to treat as text.
+    ///
+    /// The third answer is the point: a stored blob may be bytes that are not
+    /// text, and every text operation — merge, diff, an editor's read — has to
+    /// say what it does about that rather than decode lossily or fail as if
+    /// the file were missing. `spec/text-merge-spec.md` already names the
+    /// answer for merge (path-level escalation); this is the seam that lets a
+    /// caller take it.
+    fn get_text(&self, id: &str) -> crate::StoreResult<TextBlob> {
+        Ok(match self.get(id)? {
+            None => TextBlob::Missing,
+            Some(bytes) => {
+                let byte_len = bytes.len() as u64;
+                match String::from_utf8(bytes) {
+                    Ok(text) => TextBlob::Text(text),
+                    Err(_) => TextBlob::Binary { byte_len },
+                }
+            }
+        })
+    }
     /// Whether a correctly hashed cached body may still be served. This must
     /// prove current payload availability, including a chunk root's children;
     /// combining independent status/type observations is insufficient. It is
@@ -202,7 +254,7 @@ fn fetched_content_available<C: ContentBlobs + ?Sized>(
 /// exists in the defining crate's tests cannot be run by an implementation in
 /// another crate, which is exactly the case it exists for.
 pub mod conformance {
-    use super::{BlobStatus, ContentBlobs, EraseOutcome};
+    use super::{BlobStatus, ContentBlobs, EraseOutcome, TextBlob};
     use crate::StoreResult;
 
     /// Check the obligations DR-0066 places on any content store.
@@ -218,12 +270,12 @@ pub mod conformance {
         // Identical bytes dedupe to one id — the property every other
         // conclusion about content addressing rests on.
         let blobs = make();
-        let first = blobs.put("the same bytes")?;
-        let second = blobs.put("the same bytes")?;
+        let first = blobs.put(b"the same bytes")?;
+        let second = blobs.put(b"the same bytes")?;
         assert_eq!(first, second, "identical bytes must dedupe to one id");
         assert_ne!(
             first,
-            blobs.put("different bytes")?,
+            blobs.put(b"different bytes")?,
             "different bytes must not share an id"
         );
         // ...and distinctness must not come from LENGTH. Added 2026-08-25,
@@ -235,8 +287,8 @@ pub mod conformance {
         //
         // This is the case that costs nothing and closes the coincidence: two
         // distinct bodies of EQUAL length must still differ.
-        let same_length_a = blobs.put("aaaa")?;
-        let same_length_b = blobs.put("bbbb")?;
+        let same_length_a = blobs.put(b"aaaa")?;
+        let same_length_b = blobs.put(b"bbbb")?;
         assert_ne!(
             same_length_a, same_length_b,
             "two distinct bodies of the same length must not share an id — an \
@@ -245,12 +297,46 @@ pub mod conformance {
 
         // What was stored is what comes back.
         let blobs = make();
-        let id = blobs.put("round trip")?;
+        let id = blobs.put(b"round trip")?;
         assert_eq!(
             blobs.get(&id)?.as_deref(),
-            Some("round trip"),
+            Some(&b"round trip"[..]),
             "a stored blob must read back byte-identical"
         );
+
+        // Content that is not text. A store that can only hold UTF-8 makes a
+        // worktree holding a PNG unimportable, which takes the branch's diff
+        // and its cuts down with it — the failure this suite now refuses to
+        // let a store have. The bytes below are a PNG signature: a NUL, a
+        // lone 0x89, and a byte sequence that is not valid UTF-8.
+        // A host may genuinely lack a byte-capable value on its SQL seam —
+        // the durable object's `SqlValue` is Null/Int/Text today. As with
+        // erasure above, the obligation is HONESTY, not capability: refuse by
+        // error, or hold the bytes exactly. What no store may do is accept
+        // the write and hand back something else.
+        // Deliberately the SAME store and a distinct binding: rebinding
+        // `blobs` here would hand the checks below a fresh store and the
+        // earlier id, which is a test that proves nothing.
+        let picture = [0x89u8, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x00];
+        match blobs.put(&picture) {
+            Err(_) => {}
+            Ok(picture_id) => {
+                assert_eq!(
+                    blobs.get(&picture_id)?.as_deref(),
+                    Some(&picture[..]),
+                    "a store that accepts bytes that are not text must return them \
+                     byte-identical"
+                );
+                assert!(
+                    matches!(
+                        blobs.get_text(&picture_id)?,
+                        TextBlob::Binary { byte_len } if byte_len == 8
+                    ),
+                    "a text read of non-text content reports Binary — never Missing, \
+                     never a lossy decode"
+                );
+            }
+        }
 
         // status and get must agree. Two functions disagreeing about whether a
         // blob exists reads as a successful erasure to everything downstream —
@@ -273,7 +359,7 @@ pub mod conformance {
         // rather than pretending, and the suite honours that instead of
         // failing it — fail-honest is the contract, not erasure itself.
         let blobs = make();
-        let doomed = blobs.put("doomed")?;
+        let doomed = blobs.put_text("doomed")?;
         match blobs.erase(&doomed, "2026-08-24T00:00:00Z")? {
             EraseOutcome::Unsupported => {}
             EraseOutcome::Erased { .. } | EraseOutcome::AlreadyErased => {
@@ -317,6 +403,23 @@ pub mod conformance {
 
 use crate::StoreResult;
 
+/// A `body` column as bytes, whichever way it is stored.
+///
+/// rusqlite refuses a `Vec<u8>` read of a TEXT column, and this column holds
+/// both: TEXT for text (every row written before the byte seam, and every text
+/// row since) and BLOB for content that is not text. Reading through the
+/// dynamic value is what lets one store hold both without a migration.
+#[cfg(feature = "native")]
+fn body_bytes(value: rusqlite::types::Value) -> Option<Vec<u8>> {
+    match value {
+        rusqlite::types::Value::Text(text) => Some(text.into_bytes()),
+        rusqlite::types::Value::Blob(bytes) => Some(bytes),
+        rusqlite::types::Value::Null => None,
+        // An integer or float in a content body is a corrupt row, not content.
+        rusqlite::types::Value::Integer(_) | rusqlite::types::Value::Real(_) => None,
+    }
+}
+
 #[cfg(feature = "native")]
 pub struct ContentStore {
     connection: Connection,
@@ -350,8 +453,13 @@ impl ContentStore {
 
     /// Store `body`, returning its content id (a stable hash of the bytes).
     /// Idempotent: identical bytes dedupe to the same id and one row.
-    pub fn put(&self, body: &str) -> StoreResult<String> {
+    pub fn put(&self, body: &[u8]) -> StoreResult<String> {
         ContentBlobs::put(self, body)
+    }
+
+    /// Store UTF-8 text through the byte seam.
+    pub fn put_text(&self, body: &str) -> StoreResult<String> {
+        ContentBlobs::put(self, body.as_bytes())
     }
 
     /// Load authoritative roots and collect under the publication exclusion.
@@ -394,8 +502,13 @@ impl ContentStore {
     }
 
     /// Read the full stored bytes for a content id, or `None` if unknown.
-    pub fn get(&self, id: &str) -> StoreResult<Option<String>> {
+    pub fn get(&self, id: &str) -> StoreResult<Option<Vec<u8>>> {
         ContentBlobs::get(self, id)
+    }
+
+    /// Read a blob the caller intends to treat as text.
+    pub fn get_text(&self, id: &str) -> StoreResult<TextBlob> {
+        ContentBlobs::get_text(self, id)
     }
 }
 
@@ -429,13 +542,21 @@ impl ContentBlobs for ContentStore {
     /// stores and reads one blob per NODE, so re-parsing the same one-line SQL
     /// per node was a real share of the cost of a cut. The SQL, the rows, and
     /// the error paths are unchanged — only where the compiled statement lives.
-    fn put(&self, body: &str) -> StoreResult<String> {
-        let id = crate::stable_hash_hex(body);
+    fn put(&self, body: &[u8]) -> StoreResult<String> {
+        let id = crate::stable_hash_bytes_hex(body);
         let mut insert = self.connection.prepare_cached(
             "INSERT OR IGNORE INTO content_blobs (id, body, byte_len, created_at) \
              VALUES (?1, ?2, ?3, datetime('now'))",
         )?;
-        insert.execute(params![id, body, body.len() as i64])?;
+        // Text is bound as TEXT; only genuinely non-text content becomes a
+        // BLOB. Binding everything as bytes would have been one line shorter
+        // and would have rewritten the on-disk representation of every file in
+        // every existing store — a `.dump` of a source tree turning into hex,
+        // for no gain. Reads take bytes either way, so both live side by side.
+        match std::str::from_utf8(body) {
+            Ok(text) => insert.execute(params![id, text, body.len() as i64])?,
+            Err(_) => insert.execute(params![id, body, body.len() as i64])?,
+        };
         Ok(id)
     }
 
@@ -443,7 +564,7 @@ impl ContentBlobs for ContentStore {
     /// chunk packed into a pack object, or a chunk ROOT (reassembled) all
     /// answer to their id — callers (working sets, bundles, diff) never
     /// see the tiering.
-    fn get(&self, id: &str) -> StoreResult<Option<String>> {
+    fn get(&self, id: &str) -> StoreResult<Option<Vec<u8>>> {
         // Each cached statement is scoped so it returns to the cache before the
         // next step — `get` recurses through `reassemble_root`.
         {
@@ -451,8 +572,9 @@ impl ContentBlobs for ContentStore {
                 .connection
                 .prepare_cached("SELECT body FROM content_blobs WHERE id = ?1")?;
             if let Some(body) = loose
-                .query_row(params![id], |row| row.get::<_, String>(0))
+                .query_row(params![id], |row| row.get::<_, rusqlite::types::Value>(0))
                 .optional()?
+                .and_then(body_bytes)
             {
                 return Ok(Some(body));
             }
@@ -833,11 +955,11 @@ impl ContentStore {
     ) -> StoreResult<String> {
         let tree = crate::chunking::chunk_str(body, config);
         if tree.is_whole_blob() {
-            return self.put(body);
+            return self.put(body.as_bytes());
         }
         for chunk in &tree.chunks {
             let piece = &body[chunk.offset..chunk.offset + chunk.len];
-            let stored = self.put(piece)?;
+            let stored = self.put(piece.as_bytes())?;
             debug_assert_eq!(stored, chunk.hash);
         }
         self.connection.execute(
@@ -857,7 +979,7 @@ impl ContentStore {
     /// root (consult `chunk_root_info` for the retained identity).
     /// Kept as the tier's named entry point; `get` itself is transparent
     /// over roots and packs, so this simply delegates.
-    pub fn get_chunked(&self, id: &str) -> StoreResult<Option<String>> {
+    pub fn get_chunked(&self, id: &str) -> StoreResult<Option<Vec<u8>>> {
         self.get(id)
     }
 
@@ -871,16 +993,17 @@ impl ContentStore {
         id: &str,
         info: &ChunkRootInfo,
         cap: u64,
-    ) -> StoreResult<Option<String>> {
+    ) -> StoreResult<Option<Vec<u8>>> {
         // Never pre-allocate the claimed `byte_len` (attacker-controlled and
         // uncommitted by the verified root id); reserve a small window and let
-        // the string grow to the real size under the running cap.
-        let mut body = String::with_capacity((info.byte_len as usize).min(MAX_REASSEMBLE_PREALLOC));
+        // the buffer grow to the real size under the running cap.
+        let mut body: Vec<u8> =
+            Vec::with_capacity((info.byte_len as usize).min(MAX_REASSEMBLE_PREALLOC));
         for chunk_id in &info.chunk_ids {
             let Some(piece) = self.get(chunk_id)? else {
                 return Ok(None);
             };
-            body.push_str(&piece);
+            body.extend_from_slice(&piece);
             if body.len() as u64 > cap {
                 return Err(crate::StoreError::Conflict(format!(
                     "content `{id}` reassembles beyond the {cap}-byte blob ceiling \
@@ -980,7 +1103,7 @@ impl ContentStore {
 
     /// Read a chunk that lives inside a pack object. Offsets are byte
     /// positions at chunk boundaries (UTF-8-snapped by construction).
-    fn read_packed(&self, chunk_id: &str) -> StoreResult<Option<String>> {
+    fn read_packed(&self, chunk_id: &str) -> StoreResult<Option<Vec<u8>>> {
         let entry: Option<(String, i64, i64)> = self
             .connection
             .prepare_cached(
@@ -993,21 +1116,27 @@ impl ContentStore {
         let Some((pack_id, offset, len)) = entry else {
             return Ok(None);
         };
-        let pack: Option<String> = self
+        let pack: Option<Vec<u8>> = self
             .connection
             .prepare_cached("SELECT body FROM content_blobs WHERE id = ?1")?
-            .query_row(params![pack_id], |row| row.get(0))
-            .optional()?;
+            .query_row(params![pack_id], |row| {
+                row.get::<_, rusqlite::types::Value>(0)
+            })
+            .optional()?
+            .and_then(body_bytes);
         let Some(pack) = pack else {
             return Ok(None);
         };
         let (start, end) = (offset as usize, (offset + len) as usize);
-        if end > pack.len() || !pack.is_char_boundary(start) || !pack.is_char_boundary(end) {
+        // Byte offsets into byte content: the char-boundary check the string
+        // slice needed has no equivalent obligation here, and bounds are the
+        // whole of it.
+        if end > pack.len() || start > end {
             return Err(crate::StoreError::Conflict(format!(
                 "pack {pack_id} entry for {chunk_id} is out of bounds"
             )));
         }
-        Ok(Some(pack[start..end].to_owned()))
+        Ok(Some(pack[start..end].to_vec()))
     }
 
     /// Object-tier chunk packing (vw note §10.1; internal optimization,
@@ -1052,7 +1181,7 @@ impl ContentStore {
             entries.push((chunk_id.clone(), pack_body.len() as i64, body.len() as i64));
             pack_body.push_str(body);
         }
-        let pack_id = self.put(&pack_body)?;
+        let pack_id = self.put(pack_body.as_bytes())?;
         for (chunk_id, offset, len) in &entries {
             self.connection.execute(
                 "INSERT OR IGNORE INTO content_pack_entries (chunk_id, pack_id, offset, len) \
@@ -1242,7 +1371,7 @@ mod tests {
     #[test]
     fn an_erasure_is_recorded_in_the_ledger_and_the_ledger_is_what_status_reads() {
         let (_path, store) = ledger_store("records");
-        let id = store.put("bytes to drop").expect("stores");
+        let id = store.put_text("bytes to drop").expect("stores");
         assert!(matches!(
             store.status(&id).expect("status"),
             BlobStatus::Live { .. }
@@ -1281,7 +1410,7 @@ mod tests {
     fn the_ledger_folds_to_its_stored_head_and_notices_a_rewrite() {
         let (_path, store) = ledger_store("chain");
         for index in 0..3 {
-            let id = store.put(&format!("body {index}")).expect("stores");
+            let id = store.put_text(&format!("body {index}")).expect("stores");
             store
                 .erase(&id, &format!("2026-08-30T00:00:0{index}Z"))
                 .expect("erases");
@@ -1401,7 +1530,7 @@ mod tests {
                 .reassemble_root(&root, &info, 1_000_000)
                 .expect("ok")
                 .as_deref(),
-            Some(body.as_str())
+            Some(body.as_bytes())
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1413,15 +1542,15 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let store = ContentStore::open(&path).expect("open");
 
-        let id1 = store.put("hello world").expect("put");
-        let id2 = store.put("hello world").expect("put again");
+        let id1 = store.put_text("hello world").expect("put");
+        let id2 = store.put_text("hello world").expect("put again");
         assert_eq!(id1, id2, "identical bytes dedupe to one id");
         assert_eq!(
             store.get(&id1).expect("get").as_deref(),
-            Some("hello world")
+            Some(&b"hello world"[..])
         );
 
-        let other = store.put("different").expect("put other");
+        let other = store.put_text("different").expect("put other");
         assert_ne!(id1, other);
         assert_eq!(store.get("nonexistent").expect("get missing"), None);
 
@@ -1558,10 +1687,10 @@ mod tests {
 
         // Small bodies keep their plain content identity: put_chunked IS put.
         let small = store.put_chunked("tiny", &config).expect("put small");
-        assert_eq!(small, store.put("tiny").expect("put"));
+        assert_eq!(small, store.put_text("tiny").expect("put"));
         assert_eq!(
             store.get_chunked(&small).expect("get").as_deref(),
-            Some("tiny")
+            Some(&b"tiny"[..])
         );
 
         // A large body (with multi-byte chars to exercise the UTF-8
@@ -1571,12 +1700,12 @@ mod tests {
         let root = store.put_chunked(&big, &config).expect("put big");
         assert_ne!(
             root,
-            store.put(&big).expect("plain put"),
+            store.put_text(&big).expect("plain put"),
             "chunked identity"
         );
         assert_eq!(
             store.get_chunked(&root).expect("get").as_deref(),
-            Some(big.as_str())
+            Some(big.as_bytes())
         );
         let info = store.chunk_root_info(&root).expect("info").expect("root");
         assert!(info.chunk_ids.len() > 1);
@@ -1607,7 +1736,7 @@ mod tests {
         assert_eq!(info_after.byte_len, big.len() as u64);
         assert_eq!(
             store.get_chunked(&sibling_root).expect("get").as_deref(),
-            Some(sibling.as_str()),
+            Some(sibling.as_bytes()),
             "the sibling sharing chunks still reads whole"
         );
 
@@ -1619,6 +1748,57 @@ mod tests {
     /// AND the reassembled root), status stays Live — and erasure of a
     /// packed root still removes the bytes (packs dissolve, survivors
     /// return to loose rows, shared chunks live on).
+    /// A pack entry whose span leaves its pack body is refused, not sliced.
+    ///
+    /// The index and the body are two rows that can disagree — a truncated
+    /// pack, a bad migration, a corrupted write — and a slice taken on the
+    /// index's word would either panic or hand back a neighbouring chunk's
+    /// bytes under this chunk's id, which every later reader verifies as
+    /// correct. Nothing exercised this until now.
+    #[test]
+    fn a_pack_entry_pointing_outside_its_pack_is_refused() {
+        use crate::chunking::ChunkingConfig;
+        let dir = std::env::temp_dir().join(format!(
+            "whip-pack-bounds-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos(),
+        ));
+        let store = ContentStore::open(dir.join("content.db")).expect("open");
+        let config = ChunkingConfig {
+            whole_blob_threshold: 256,
+            min_size: 64,
+            avg_size: 256,
+            max_size: 1024,
+        };
+        let big = "abcdefghij-0123456789=".repeat(500);
+        let root = store.put_chunked(&big, &config).expect("put");
+        assert!(store.pack_root(&root).expect("pack") > 1, "chunks packed");
+        let info = store.chunk_root_info(&root).expect("info").expect("root");
+        let victim = info.chunk_ids.first().expect("a packed chunk").clone();
+        assert!(store.get(&victim).expect("read").is_some(), "reads first");
+
+        // The index now claims a span the pack body does not have.
+        store
+            .connection
+            .execute(
+                "UPDATE content_pack_entries SET len = len + 1000000 WHERE chunk_id = ?1",
+                params![victim],
+            )
+            .expect("corrupt the entry");
+
+        let error = store
+            .get(&victim)
+            .expect_err("a span outside the pack is refused rather than sliced");
+        assert!(
+            format!("{error:?}").contains("out of bounds"),
+            "the refusal names the disagreement: {error:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn pack_root_is_read_transparent_and_erasure_safe() {
         use crate::chunking::ChunkingConfig;
@@ -1658,11 +1838,11 @@ mod tests {
         }
         assert_eq!(
             store.get(&root).expect("get").as_deref(),
-            Some(big.as_str())
+            Some(big.as_bytes())
         );
         assert_eq!(
             store.get(&sibling_root).expect("get").as_deref(),
-            Some(sibling.as_str()),
+            Some(sibling.as_bytes()),
             "the sibling reads through the pack for shared chunks"
         );
 
@@ -1672,7 +1852,7 @@ mod tests {
         assert_eq!(store.get(&root).expect("get"), None);
         assert_eq!(
             store.get(&sibling_root).expect("get").as_deref(),
-            Some(sibling.as_str()),
+            Some(sibling.as_bytes()),
             "the live sibling still reads whole after the pack dissolved"
         );
 

@@ -23,6 +23,17 @@ use crate::StoreResult;
 
 pub const BUNDLE_FORMAT: &str = "whipplescript.bundle.v1";
 
+/// The format a bundle declares once it carries content that is not text.
+///
+/// A v1 bundle's `body` is a JSON string, which can only hold text, so a
+/// workspace containing a picture or a PDF cannot travel as v1. Rather than
+/// leave those bytes out of a bundle that still claims to be complete, such a
+/// bundle declares v2 and carries them base64 in `body_b64`. A reader that
+/// predates v2 already refuses an unrecognised format, so it says so instead
+/// of importing a workspace with the binary files silently missing — and a
+/// text-only workspace still exports as v1, readable by every existing peer.
+pub const BUNDLE_FORMAT_BINARY: &str = "whipplescript.bundle.v2";
+
 /// One blob in the bundle. `body: None` + `erased: true` is the
 /// tombstone shape — identity travels, payload does not. A chunk ROOT
 /// entry carries its ordered chunk ids instead of a body (the chunks
@@ -34,6 +45,10 @@ pub struct BundleBlob {
     pub id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub body: Option<String>,
+    /// Content that is not UTF-8, base64. Mutually exclusive with `body`;
+    /// its presence is what makes a bundle declare `BUNDLE_FORMAT_BINARY`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body_b64: Option<String>,
     pub byte_len: u64,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub erased: bool,
@@ -88,6 +103,7 @@ pub fn collect_blobs_delta(
             blobs.push(BundleBlob {
                 id: id.clone(),
                 body: None,
+                body_b64: None,
                 byte_len,
                 erased,
                 chunk_ids: Some(chunk_ids.clone()),
@@ -111,6 +127,124 @@ pub fn collect_blobs_delta(
     Ok(blobs)
 }
 
+/// Base64 (RFC 4648, padded), written out here rather than pulled in.
+///
+/// This crate's dependency list is deliberately short — it compiles for the
+/// durable-object host with `--no-default-features`, and the comment beside
+/// `sha2` records that discipline. The workspace already hand-rolls this codec
+/// in the kernel and the CLI for the same reason. Round-tripped by a test
+/// below over every byte value, since a silent codec bug here corrupts content
+/// that its own hash would then reject at the far end.
+const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+fn encode_base64(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0] as usize;
+        let b1 = chunk.get(1).copied().unwrap_or(0) as usize;
+        let b2 = chunk.get(2).copied().unwrap_or(0) as usize;
+        out.push(B64[b0 >> 2] as char);
+        out.push(B64[((b0 & 0b11) << 4) | (b1 >> 4)] as char);
+        out.push(if chunk.len() > 1 {
+            B64[((b1 & 0b1111) << 2) | (b2 >> 6)] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            B64[b2 & 0b111111] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
+fn decode_base64(encoded: &str) -> Result<Vec<u8>, String> {
+    fn value(byte: u8) -> Result<u32, String> {
+        match byte {
+            b'A'..=b'Z' => Ok((byte - b'A') as u32),
+            b'a'..=b'z' => Ok((byte - b'a') as u32 + 26),
+            b'0'..=b'9' => Ok((byte - b'0') as u32 + 52),
+            b'+' => Ok(62),
+            b'/' => Ok(63),
+            other => Err(format!("`{}` is not a base64 digit", other as char)),
+        }
+    }
+    let raw = encoded.as_bytes();
+    if !raw.len().is_multiple_of(4) {
+        return Err("length is not a multiple of four".to_owned());
+    }
+    let mut out = Vec::with_capacity(raw.len() / 4 * 3);
+    for quad in raw.chunks(4) {
+        let padding = quad.iter().filter(|&&byte| byte == b'=').count();
+        if padding > 2 || (padding > 0 && quad[..4 - padding].contains(&b'=')) {
+            return Err("misplaced padding".to_owned());
+        }
+        let mut packed = 0u32;
+        for &byte in &quad[..4 - padding] {
+            packed = (packed << 6) | value(byte)?;
+        }
+        packed <<= 6 * padding;
+        for shift in [16, 8, 0].iter().take(3 - padding) {
+            out.push(((packed >> shift) & 0xff) as u8);
+        }
+    }
+    Ok(out)
+}
+
+/// The format a set of blobs requires: v1 unless one of them carries content
+/// that a JSON string cannot hold.
+pub fn bundle_format_for(blobs: &[BundleBlob]) -> &'static str {
+    if blobs.iter().any(|blob| blob.body_b64.is_some()) {
+        BUNDLE_FORMAT_BINARY
+    } else {
+        BUNDLE_FORMAT
+    }
+}
+
+/// A blob whose payload travels, in the lane its content allows: text as a
+/// JSON string, anything else base64. `None` bytes mean the store answered
+/// `Live` and then did not serve, which the receiver reads as a tombstone.
+fn carried_entry(id: String, bytes: Option<Vec<u8>>, byte_len: u64) -> BundleBlob {
+    let (body, body_b64) = match bytes {
+        None => (None, None),
+        Some(bytes) => match String::from_utf8(bytes) {
+            Ok(text) => (Some(text), None),
+            Err(not_text) => (None, Some(encode_base64(not_text.as_bytes()))),
+        },
+    };
+    BundleBlob {
+        id,
+        body,
+        body_b64,
+        byte_len,
+        erased: false,
+        chunk_ids: None,
+        omitted: false,
+    }
+}
+
+impl BundleBlob {
+    /// The payload this entry carries, decoded. `Ok(None)` is an entry that
+    /// carries no bytes (omitted, erased, or unknown).
+    pub fn carried_bytes(&self) -> StoreResult<Option<Vec<u8>>> {
+        match (&self.body, &self.body_b64) {
+            (Some(_), Some(_)) => Err(crate::StoreError::Conflict(format!(
+                "bundle blob `{}` carries both a text and a binary body",
+                self.id
+            ))),
+            (Some(text), None) => Ok(Some(text.as_bytes().to_vec())),
+            (None, Some(encoded)) => decode_base64(encoded).map(Some).map_err(|error| {
+                crate::StoreError::Conflict(format!(
+                    "bundle blob `{}` has an undecodable binary body: {error}",
+                    self.id
+                ))
+            }),
+            (None, None) => Ok(None),
+        }
+    }
+}
+
 /// One transferable unit (plain blob or chunk), honoring the have-set
 /// and erasure.
 fn unit_entry(
@@ -124,25 +258,20 @@ fn unit_entry(
                 BundleBlob {
                     id: id.to_owned(),
                     body: None,
+                    body_b64: None,
                     byte_len,
                     erased: false,
                     chunk_ids: None,
                     omitted: true,
                 }
             } else {
-                BundleBlob {
-                    id: id.to_owned(),
-                    body: content.get(id)?,
-                    byte_len,
-                    erased: false,
-                    chunk_ids: None,
-                    omitted: false,
-                }
+                carried_entry(id.to_owned(), content.get(id)?, byte_len)
             }
         }
         BlobStatus::Erased { byte_len } => BundleBlob {
             id: id.to_owned(),
             body: None,
+            body_b64: None,
             byte_len,
             erased: true,
             chunk_ids: None,
@@ -154,6 +283,7 @@ fn unit_entry(
         BlobStatus::Unknown => BundleBlob {
             id: id.to_owned(),
             body: None,
+            body_b64: None,
             byte_len: 0,
             erased: false,
             chunk_ids: None,
@@ -216,6 +346,148 @@ pub enum BundleImportOutcome {
         branch_id: String,
         local_head_manifest_hash: Option<String>,
     },
+}
+
+#[cfg(test)]
+mod carried_body_tests {
+    use super::*;
+
+    fn blob(body: Option<&str>, body_b64: Option<&str>) -> BundleBlob {
+        BundleBlob {
+            id: "an-id".to_owned(),
+            body: body.map(str::to_owned),
+            body_b64: body_b64.map(str::to_owned),
+            byte_len: 0,
+            erased: false,
+            chunk_ids: None,
+            omitted: false,
+        }
+    }
+
+    #[test]
+    fn a_blob_carrying_both_lanes_is_refused() {
+        let error = blob(Some("text"), Some("dGV4dA=="))
+            .carried_bytes()
+            .expect_err("two bodies is not a choice the reader may make for the sender");
+        assert!(format!("{error:?}").contains("both a text and a binary body"));
+    }
+
+    #[test]
+    fn an_undecodable_binary_body_is_refused_rather_than_guessed() {
+        let error = blob(None, Some("not base64 at all!"))
+            .carried_bytes()
+            .expect_err("a body that does not decode is not a body");
+        assert!(format!("{error:?}").contains("undecodable binary body"));
+    }
+
+    #[test]
+    fn each_lane_alone_carries_its_bytes_and_neither_is_an_absence() {
+        assert_eq!(
+            blob(Some("text"), None).carried_bytes().expect("text lane"),
+            Some(b"text".to_vec())
+        );
+        assert_eq!(
+            blob(None, Some("AAEC"))
+                .carried_bytes()
+                .expect("binary lane"),
+            Some(vec![0x00, 0x01, 0x02])
+        );
+        assert_eq!(
+            blob(None, None).carried_bytes().expect("no body"),
+            None,
+            "omitted, erased and unknown entries carry nothing, and that is not an error"
+        );
+    }
+
+    #[test]
+    fn the_format_follows_the_content() {
+        assert_eq!(
+            bundle_format_for(&[blob(Some("text"), None)]),
+            BUNDLE_FORMAT,
+            "an all-text bundle stays readable by every existing peer"
+        );
+        assert_eq!(
+            bundle_format_for(&[blob(Some("text"), None), blob(None, Some("AAEC"))]),
+            BUNDLE_FORMAT_BINARY,
+            "one binary body makes the whole bundle declare v2"
+        );
+    }
+}
+
+#[cfg(test)]
+mod base64_tests {
+    use super::{decode_base64, encode_base64};
+
+    /// Every byte value, at every length remainder, so the padding arms are
+    /// all exercised. A silent codec bug here corrupts content whose own hash
+    /// then rejects it at the far end, which is a confusing way to learn about
+    /// a shift.
+    #[test]
+    fn round_trips_every_byte_at_every_padding() {
+        let all: Vec<u8> = (0..=255u8).collect();
+        for len in 0..=all.len() {
+            let slice = &all[..len];
+            let encoded = encode_base64(slice);
+            assert!(encoded.len().is_multiple_of(4), "padded to a quad: {len}");
+            assert_eq!(
+                decode_base64(&encoded).expect("decodes"),
+                slice,
+                "round trip at length {len}"
+            );
+        }
+    }
+
+    /// Known vectors, so a self-consistent-but-wrong alphabet cannot pass.
+    #[test]
+    fn matches_the_rfc_4648_vectors() {
+        for (raw, encoded) in [
+            ("", ""),
+            ("f", "Zg=="),
+            ("fo", "Zm8="),
+            ("foo", "Zm9v"),
+            ("foob", "Zm9vYg=="),
+            ("fooba", "Zm9vYmE="),
+            ("foobar", "Zm9vYmFy"),
+        ] {
+            assert_eq!(encode_base64(raw.as_bytes()), encoded, "encode {raw:?}");
+            assert_eq!(decode_base64(encoded).expect("decodes"), raw.as_bytes());
+        }
+        assert_eq!(encode_base64(&[0xfb, 0xff]), "+/8=", "the + and / digits");
+        assert_eq!(decode_base64("+/8=").expect("decodes"), [0xfb, 0xff]);
+    }
+
+    /// Each refusal reached on its own terms. Written first with inputs that
+    /// were all the wrong LENGTH, so every one of them tripped the quad check
+    /// and the digit and padding arms were never reached — a test that refused
+    /// everything for one reason and looked like it covered three.
+    #[test]
+    fn refuses_a_length_that_is_not_a_quad() {
+        for bad in ["Zg=", "Zg===", "Zm9vY"] {
+            let error = decode_base64(bad).expect_err("{bad:?} must be refused");
+            assert!(error.contains("multiple of four"), "{bad:?}: {error}");
+        }
+    }
+
+    #[test]
+    fn refuses_a_character_that_is_not_a_base64_digit() {
+        // Four characters, so the length check passes and the digit check is
+        // what answers.
+        // ASCII only, deliberately: a non-ASCII character is more than one
+        // byte, so it fails the quad check instead and would have repeated
+        // the mistake this test was written to correct.
+        for bad in ["Zm9!", "Z m8", "..AA", "Zm9-"] {
+            let error = decode_base64(bad).expect_err("must be refused");
+            assert!(error.contains("not a base64 digit"), "{bad:?}: {error}");
+        }
+    }
+
+    #[test]
+    fn refuses_padding_that_is_not_at_the_end() {
+        for bad in ["=AAA", "A=AA", "AA=A", "===A"] {
+            let error = decode_base64(bad).expect_err("must be refused");
+            assert!(error.contains("padding"), "{bad:?}: {error}");
+        }
+    }
 }
 
 #[cfg(all(test, feature = "native"))]

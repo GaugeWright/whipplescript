@@ -49,7 +49,10 @@ pub struct BlobRead {
     /// `None` when the store does not hold it — the batch does not fail as a
     /// whole, because a caller reading fifty blobs wants the forty-nine it can
     /// have plus an honest account of the one it cannot.
-    pub body: Option<String>,
+    ///
+    /// Bytes: a blob read moves content of any kind, and a picture must
+    /// survive the trip that a source file survives.
+    pub body: Option<Vec<u8>>,
 }
 
 /// The want/have half of the seam.
@@ -130,7 +133,7 @@ pub fn missing_for_manifest<B: ContentBlobs + ?Sized>(
         }
         BlobStatus::Live { .. } => {}
     }
-    let Some(body) = blobs.get(manifest_root)? else {
+    let Some(body) = blobs.get_text(manifest_root)?.text() else {
         return Ok(MissingBlobs {
             absent: vec![manifest_root.to_owned()],
             erased: Vec::new(),
@@ -186,7 +189,7 @@ fn walk_for_transfer<B: ContentBlobs + ?Sized>(blobs: &B, root: &str) -> StoreRe
             }
             BlobStatus::Live { .. } => {}
         }
-        let Some(body) = blobs.get(&id)? else {
+        let Some(body) = blobs.get_text(&id)?.text() else {
             missing.absent.push(id);
             continue;
         };
@@ -220,19 +223,19 @@ mod tests {
 
     #[derive(Default)]
     struct FakeBlobs {
-        live: RefCell<BTreeMap<String, String>>,
+        live: RefCell<BTreeMap<String, Vec<u8>>>,
         erased: RefCell<BTreeMap<String, u64>>,
     }
 
     impl ContentBlobs for FakeBlobs {
         /// `stable_hash_hex`, matching `ContentStore::put`. Said `sha256_hex`
         /// until 2026-08-25 — a 256-bit id where the real store mints 128.
-        fn put(&self, body: &str) -> StoreResult<String> {
-            let id = crate::stable_hash_hex(body);
-            self.live.borrow_mut().insert(id.clone(), body.to_owned());
+        fn put(&self, body: &[u8]) -> StoreResult<String> {
+            let id = crate::stable_hash_bytes_hex(body);
+            self.live.borrow_mut().insert(id.clone(), body.to_vec());
             Ok(id)
         }
-        fn get(&self, id: &str) -> StoreResult<Option<String>> {
+        fn get(&self, id: &str) -> StoreResult<Option<Vec<u8>>> {
             Ok(self.live.borrow().get(id).cloned())
         }
         fn status(&self, id: &str) -> StoreResult<BlobStatus> {
@@ -265,8 +268,8 @@ mod tests {
     #[test]
     fn find_missing_splits_absent_from_erased() {
         let blobs = FakeBlobs::default();
-        let here = blobs.put("present").expect("put");
-        let gone = blobs.put("doomed").expect("put");
+        let here = blobs.put_text("present").expect("put");
+        let gone = blobs.put_text("doomed").expect("put");
         blobs.erase(&gone);
 
         let missing = find_missing(
@@ -288,7 +291,7 @@ mod tests {
     #[test]
     fn an_erased_blob_is_never_offered_as_fetchable() {
         let blobs = FakeBlobs::default();
-        let gone = blobs.put("doomed").expect("put");
+        let gone = blobs.put_text("doomed").expect("put");
         blobs.erase(&gone);
         let missing = find_missing(&blobs, std::slice::from_ref(&gone)).expect("find_missing");
         assert!(missing.absent.is_empty());
@@ -307,10 +310,10 @@ mod tests {
     #[test]
     fn batch_read_returns_holes_rather_than_failing() {
         let blobs = FakeBlobs::default();
-        let here = blobs.put("present").expect("put");
+        let here = blobs.put_text("present").expect("put");
         let reads = batch_read(&blobs, &[here.clone(), "absent".to_owned()]).expect("batch");
         assert_eq!(reads.len(), 2);
-        assert_eq!(reads[0].body.as_deref(), Some("present"));
+        assert_eq!(reads[0].body.as_deref(), Some(&b"present"[..]));
         assert_eq!(reads[1].body, None);
     }
 
@@ -333,7 +336,7 @@ mod tests {
         let manifest: BTreeMap<String, String> = (0..200)
             .map(|i| {
                 let body = format!("body_{i}");
-                let id = source.put(&body).expect("put");
+                let id = source.put_text(&body).expect("put");
                 (format!("src/f_{i:04}.txt"), id)
             })
             .collect();
@@ -390,7 +393,7 @@ mod tests {
         let blobs = FakeBlobs::default();
         let manifest: BTreeMap<String, String> = (0..50)
             .map(|i| {
-                let id = blobs.put(&format!("body_{i}")).expect("put");
+                let id = blobs.put_text(&format!("body_{i}")).expect("put");
                 (format!("src/f_{i:04}.txt"), id)
             })
             .collect();
@@ -416,7 +419,7 @@ mod tests {
         let flat: BTreeMap<String, String> =
             BTreeMap::from([("a".to_owned(), "missing-blob".to_owned())]);
         let root = blobs
-            .put(&serde_json::to_string(&flat).expect("encodes"))
+            .put_text(&serde_json::to_string(&flat).expect("encodes"))
             .expect("put");
         let missing = missing_for_manifest(&blobs, &root).expect("missing computed");
         assert_eq!(missing.absent, vec!["missing-blob".to_owned()]);

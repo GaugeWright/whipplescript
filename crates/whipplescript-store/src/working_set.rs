@@ -117,9 +117,20 @@ impl FileStore for VirtualWorkingSet<'_> {
                 format!("no file at {} on this branch", path.display()),
             ));
         };
-        match self.content.get(&id).map_err(store_error)? {
-            Some(body) => Ok(body),
-            None => Err(io::Error::new(
+        match self.content.get_text(&id).map_err(store_error)? {
+            crate::content::TextBlob::Text(body) => Ok(body),
+            // Readable, and not text. `read_to_string` cannot answer for a
+            // picture, and saying so is not the same as saying the file is
+            // absent — a caller that conflates them concludes the store lost
+            // something it is holding.
+            crate::content::TextBlob::Binary { byte_len } => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "{} holds {byte_len} bytes that are not text; read it as bytes",
+                    path.display()
+                ),
+            )),
+            crate::content::TextBlob::Missing => Err(io::Error::new(
                 io::ErrorKind::NotFound,
                 format!(
                     "manifest names content {id} for {} but the blob is absent",
@@ -140,13 +151,11 @@ impl FileStore for VirtualWorkingSet<'_> {
     }
 
     fn write(&self, path: &Path, bytes: &[u8]) -> io::Result<()> {
-        let body = std::str::from_utf8(bytes).map_err(|error| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("non-UTF-8 write to {}: {error}", path.display()),
-            )
-        })?;
-        let id = self.content.put(body).map_err(store_error)?;
+        // Whatever the tool wrote. This seam used to refuse anything that was
+        // not UTF-8, so a turn that produced an image could not put it in the
+        // working set at all — the same gap as the scratch import, one layer
+        // up. `spec/files.md` has carried a `bytes` codec since v0.
+        let id = self.content.put(bytes).map_err(store_error)?;
         self.overlay.borrow_mut().insert(Self::key(path), Some(id));
         Ok(())
     }
@@ -228,9 +237,65 @@ mod tests {
 
     fn seeded_base(content: &ContentStore) -> BTreeMap<String, String> {
         let mut base = BTreeMap::new();
-        base.insert("notes/a.md".to_owned(), content.put("base A").expect("put"));
-        base.insert("notes/b.md".to_owned(), content.put("base B").expect("put"));
+        base.insert(
+            "notes/a.md".to_owned(),
+            content.put_text("base A").expect("put"),
+        );
+        base.insert(
+            "notes/b.md".to_owned(),
+            content.put_text("base B").expect("put"),
+        );
         base
+    }
+
+    /// A tool writes a picture, and the working set holds it.
+    ///
+    /// This seam used to refuse anything that did not decode as UTF-8, so a
+    /// turn that produced an image could not put it in the working set at all.
+    /// It also pins the refusal on the other side: `read_to_string` cannot
+    /// answer for a picture and says so as `InvalidData`, which is not the
+    /// same claim as `NotFound` — a caller told "not found" about a file the
+    /// branch is holding concludes the store lost it.
+    #[test]
+    fn bytes_that_are_not_text_write_and_read_back_without_pretending_to_be_text() {
+        let content = content();
+        let set = VirtualWorkingSet::new(&*content, seeded_base(&content));
+        let picture: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x00];
+
+        set.write(Path::new("shot.png"), &picture)
+            .expect("a picture is writable");
+
+        let error = set
+            .read_to_string(Path::new("shot.png"))
+            .expect_err("read_to_string cannot answer for a picture");
+        assert_eq!(
+            error.kind(),
+            io::ErrorKind::InvalidData,
+            "present and not text is InvalidData, never NotFound: {error}"
+        );
+        assert!(
+            error.to_string().contains("not text"),
+            "the refusal says why: {error}"
+        );
+
+        // The bytes are genuinely there, byte-identical, under the manifest
+        // entry the write minted.
+        let id = set
+            .manifest()
+            .get("shot.png")
+            .expect("the write is in the manifest")
+            .clone();
+        assert_eq!(
+            content.get(&id).expect("read").as_deref(),
+            Some(&picture[..]),
+            "the working set held the bytes it was given"
+        );
+
+        // And a missing path is still NotFound — the two refusals stay apart.
+        let absent = set
+            .read_to_string(Path::new("nothing-here.md"))
+            .expect_err("absent");
+        assert_eq!(absent.kind(), io::ErrorKind::NotFound);
     }
 
     /// Reads resolve through the manifest; writes land copy-on-write:
@@ -355,14 +420,14 @@ mod tests {
                 .get(manifest.get("notes/a.md").expect("a"))
                 .expect("get")
                 .as_deref(),
-            Some("ours A")
+            Some(&b"ours A"[..])
         );
         assert_eq!(
             content
                 .get(manifest.get("notes/b.md").expect("b"))
                 .expect("get")
                 .as_deref(),
-            Some("theirs B")
+            Some(&b"theirs B"[..])
         );
 
         // Same-path divergence escalates instead.

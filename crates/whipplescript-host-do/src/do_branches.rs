@@ -1465,7 +1465,23 @@ impl<S: DoSql> ContentBlobs for DoContentBlobs<S> {
         })
     }
 
-    fn put(&self, body: &str) -> StoreResult<String> {
+    /// Text only, and it says so.
+    ///
+    /// `SqlValue` carries Null, Int and Text — there is no blob variant, and
+    /// adding one crosses the JS binding in `do_wasm.rs` into the Worker's
+    /// `state.storage.sql`. So this host cannot yet hold the bytes the native
+    /// store now holds, and the honest thing is to refuse content it would
+    /// have to mangle rather than store a lossy transcription under a hash
+    /// that no longer describes it. A workspace with a picture in it does not
+    /// sync here until `SqlValue` grows a blob variant.
+    fn put(&self, body: &[u8]) -> StoreResult<String> {
+        let Ok(body) = std::str::from_utf8(body) else {
+            return Err(StoreError::Conflict(
+                "this host stores text only; content that is not text needs a blob-capable \
+                 SQL value (SqlValue has no blob variant yet)"
+                    .to_owned(),
+            ));
+        };
         let id = stable_hash_hex(body);
         self.sql
             .execute(
@@ -1476,12 +1492,12 @@ impl<S: DoSql> ContentBlobs for DoContentBlobs<S> {
         Ok(id)
     }
 
-    fn get(&self, id: &str) -> StoreResult<Option<String>> {
+    fn get(&self, id: &str) -> StoreResult<Option<Vec<u8>>> {
         let rows = self
             .sql
             .query("SELECT body FROM content_blobs WHERE id = ?1", &[text(id)])
             .map_err(sql_err)?;
-        Ok(rows.first().map(|row| as_text(&row[0])))
+        Ok(rows.first().map(|row| as_text(&row[0]).into_bytes()))
     }
 
     /// Native parity for DR-0066 §5. Live from the blob row, else the

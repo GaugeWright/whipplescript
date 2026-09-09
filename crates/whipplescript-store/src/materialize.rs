@@ -227,7 +227,7 @@ pub fn materialize_manifest_subset(
                 )));
             }
         }
-        std::fs::write(&target, body.as_bytes())
+        std::fs::write(&target, &body)
             .map_err(|error| StoreError::Conflict(format!("materialize {relative}: {error}")))?;
         let metadata = std::fs::metadata(&target)
             .map_err(|error| StoreError::Conflict(format!("stat {relative}: {error}")))?;
@@ -268,12 +268,16 @@ pub fn import_scratch(
     let outcome = scan_dir(root, &scratch.cache, now_unix_nanos)?;
     let mut changed = BTreeMap::new();
     for (relative, hash) in &outcome.changed {
+        // Bytes, not text. A worktree holds whatever the work put in it: a
+        // screenshot a turn produced, a PDF a person dropped in, a compiled
+        // artifact. Refusing to import those did not keep them out of the
+        // worktree — it only made the branch unable to record them, and a
+        // single non-UTF-8 file failed the whole import, taking the diff and
+        // the cut with it. Text keeps its identity: the digest was always
+        // taken over the bytes.
         let bytes = std::fs::read(root.join(relative))
             .map_err(|error| StoreError::Conflict(format!("read back {relative}: {error}")))?;
-        let body = String::from_utf8(bytes).map_err(|error| {
-            StoreError::Conflict(format!("non-UTF-8 import of {relative}: {error}"))
-        })?;
-        let stored = content.put(&body)?;
+        let stored = content.put(&bytes)?;
         if &stored != hash {
             return Err(StoreError::Conflict(format!(
                 "content moved under the import of {relative}; retry"
@@ -344,8 +348,8 @@ mod tests {
     #[test]
     fn an_erased_input_refuses_as_erased_not_as_absent() {
         let store = content("erased-input");
-        let kept = store.put("kept").expect("stores");
-        let doomed = store.put("dropped by policy").expect("stores");
+        let kept = store.put_text("kept").expect("stores");
+        let doomed = store.put_text("dropped by policy").expect("stores");
         store
             .erase(&doomed, "2026-08-30T00:00:00Z")
             .expect("erasure records");
@@ -390,7 +394,7 @@ mod tests {
     #[test]
     fn every_unservable_input_is_named_not_only_the_first() {
         let store = content("missing-inputs");
-        let kept = store.put("kept").expect("stores");
+        let kept = store.put_text("kept").expect("stores");
         let manifest = BTreeMap::from([
             ("/ws/a.txt".to_owned(), "never-stored-a".to_owned()),
             ("/ws/b.txt".to_owned(), kept),
@@ -417,7 +421,7 @@ mod tests {
     #[test]
     fn a_subset_preflights_only_what_it_will_project() {
         let store = content("subset-preflight");
-        let kept = store.put("kept").expect("stores");
+        let kept = store.put_text("kept").expect("stores");
         let manifest = BTreeMap::from([
             ("/ws/needed.txt".to_owned(), kept),
             ("/ws/untouched.txt".to_owned(), "never-stored".to_owned()),
@@ -435,6 +439,132 @@ mod tests {
         .expect("a subset whose own inputs resolve materializes");
     }
 
+    /// The symlink escape. A manifest key is a path inside the scratch, and a
+    /// symlinked parent directory is how one stops being that — materializing
+    /// through it would write the run's inputs somewhere on the host that no
+    /// caller named. Nothing exercised this refusal until now, which means it
+    /// was free to stop refusing.
+    #[test]
+    fn a_manifest_key_reaching_outside_the_scratch_through_a_symlink_is_refused() {
+        let content = content("symlink-escape");
+        let root = scratch_root("symlink-escape-dir");
+        let outside = scratch_root("symlink-escape-target");
+        std::fs::create_dir_all(&outside).expect("the directory to escape into");
+        std::fs::create_dir_all(&root).expect("scratch root");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&outside, root.join("ws")).expect("symlink the parent");
+
+        let mut manifest = BTreeMap::new();
+        manifest.insert(
+            "/ws/escaped.md".to_owned(),
+            content.put_text("payload").expect("put"),
+        );
+
+        #[cfg(unix)]
+        {
+            let error = materialize_manifest(&manifest, &content, &root, now_nanos())
+                .expect_err("a key that leaves the scratch is refused");
+            assert!(
+                format!("{error:?}").contains("symlink escape"),
+                "the refusal names what happened: {error:?}"
+            );
+            assert!(
+                !outside.join("escaped.md").exists(),
+                "and nothing was written outside the scratch"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    /// The import's identity check. `import_scratch` scans for changed files,
+    /// then reads and stores each one; if the stored id is not the id the scan
+    /// computed, the file moved in between and the import is describing a
+    /// state that no longer exists. A store that returns a different id
+    /// standing in for that race, since the race itself is not schedulable.
+    #[test]
+    fn content_that_moves_under_the_import_is_refused_rather_than_recorded() {
+        struct MovedUnderUs<'a>(&'a ContentStore);
+        impl ContentBlobs for MovedUnderUs<'_> {
+            fn put(&self, body: &[u8]) -> StoreResult<String> {
+                // Store honestly, then answer with someone else's id — the
+                // shape of "the bytes changed between the scan and the read".
+                self.0.put(body)?;
+                Ok("an-id-from-a-different-body".to_owned())
+            }
+            fn get(&self, id: &str) -> StoreResult<Option<Vec<u8>>> {
+                self.0.get(id)
+            }
+        }
+
+        let content = content("moved-under-import");
+        let root = scratch_root("moved-under-import-dir");
+        let mut manifest = BTreeMap::new();
+        manifest.insert(
+            "/ws/in.md".to_owned(),
+            content.put_text("input").expect("put"),
+        );
+        let scratch =
+            materialize_manifest(&manifest, &content, &root, now_nanos()).expect("materialize");
+        std::fs::write(root.join("ws/in.md"), "edited").expect("the tool edits it");
+
+        let moved = MovedUnderUs(&content);
+        let error = import_scratch(&root, &scratch, &moved, now_nanos() + 2_000_000_000)
+            .expect_err("an id that does not match the scan is refused");
+        assert!(
+            format!("{error:?}").contains("content moved under the import"),
+            "the refusal names the race and asks for a retry: {error:?}"
+        );
+    }
+
+    /// A turn that produces a picture. This is the failure the byte seam
+    /// exists for: `import_scratch` decoded every changed file as UTF-8, so a
+    /// single PNG in a worktree failed the whole import — and because the diff
+    /// and the cut both run through it, the branch could not be read at all
+    /// while that file sat there. The bytes go in and come back byte-identical.
+    #[test]
+    fn a_scratch_holding_bytes_that_are_not_text_imports() {
+        let content = content("binary-import");
+        let root = scratch_root("binary-import-dir");
+        let mut manifest = BTreeMap::new();
+        manifest.insert(
+            "/ws/notes.md".to_owned(),
+            content.put_text("notes").expect("put"),
+        );
+        let scratch =
+            materialize_manifest(&manifest, &content, &root, now_nanos()).expect("materialize");
+
+        // A PNG header: a lone 0x89, a NUL, and a sequence no UTF-8 decoder
+        // accepts.
+        let picture: [u8; 12] = [
+            0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 0x0d,
+        ];
+        std::fs::write(root.join("ws/shot.png"), picture).expect("write the picture");
+        std::fs::write(root.join("ws/notes.md"), "notes v2").expect("and edit the text");
+
+        let import =
+            import_scratch(&root, &scratch, &content, now_nanos() + 2_000_000_000).expect("import");
+        assert_eq!(import.changed.len(), 2, "both files import");
+        let picture_id = import
+            .changed
+            .get("ws/shot.png")
+            .expect("the picture is in the import");
+        assert_eq!(
+            content.get(picture_id).expect("read").as_deref(),
+            Some(&picture[..]),
+            "the picture reads back byte-identical"
+        );
+        // And the text beside it is untouched, still stored as text.
+        let notes_id = import.changed.get("/ws/notes.md").expect("the text too");
+        assert!(matches!(
+            content.get_text(notes_id).expect("read"),
+            crate::content::TextBlob::Text(ref body) if body == "notes v2"
+        ));
+        assert!(matches!(
+            content.get_text(picture_id).expect("read"),
+            crate::content::TextBlob::Binary { byte_len: 12 }
+        ));
+    }
+
     /// The projection round-trip: absolute-keyed manifest materializes to
     /// relative scratch entries with real bytes; a tool run (one modify,
     /// one add, one delete) imports back as a diff in ORIGINAL keys with
@@ -445,8 +575,14 @@ mod tests {
         let content = content("roundtrip");
         let root = scratch_root("roundtrip-dir");
         let mut manifest = BTreeMap::new();
-        manifest.insert("/ws/in.md".to_owned(), content.put("input").expect("put"));
-        manifest.insert("/ws/keep.md".to_owned(), content.put("kept").expect("put"));
+        manifest.insert(
+            "/ws/in.md".to_owned(),
+            content.put_text("input").expect("put"),
+        );
+        manifest.insert(
+            "/ws/keep.md".to_owned(),
+            content.put_text("kept").expect("put"),
+        );
         let scratch =
             materialize_manifest(&manifest, &content, &root, now_nanos()).expect("materialize");
         assert_eq!(
@@ -473,7 +609,7 @@ mod tests {
                 )
                 .expect("get")
                 .as_deref(),
-            Some("input v2"),
+            Some(&b"input v2"[..]),
             "modified content is stored and keyed by the ORIGINAL manifest key"
         );
         assert_eq!(
@@ -486,7 +622,7 @@ mod tests {
                 )
                 .expect("get")
                 .as_deref(),
-            Some("produced")
+            Some(&b"produced"[..])
         );
         assert_eq!(import.removed, vec!["/ws/keep.md".to_owned()]);
 
@@ -515,10 +651,13 @@ mod tests {
         let content = content("subset");
         let root = scratch_root("subset-dir");
         let mut manifest = BTreeMap::new();
-        manifest.insert("/ws/in.md".to_owned(), content.put("input").expect("put"));
+        manifest.insert(
+            "/ws/in.md".to_owned(),
+            content.put_text("input").expect("put"),
+        );
         manifest.insert(
             "/ws/huge.md".to_owned(),
-            content.put(&"X".repeat(4096)).expect("put"),
+            content.put_text(&"X".repeat(4096)).expect("put"),
         );
         let mut closure = std::collections::BTreeSet::new();
         closure.insert("/ws/in.md".to_owned());
@@ -577,7 +716,7 @@ mod tests {
     fn materialize_refuses_traversal_keys() {
         let content = content("traversal");
         let root = scratch_root("traversal-dir");
-        let payload = content.put("pwned").expect("put");
+        let payload = content.put_text("pwned").expect("put");
 
         // `..` traversal is refused, nothing written outside the root.
         let mut evil = BTreeMap::new();

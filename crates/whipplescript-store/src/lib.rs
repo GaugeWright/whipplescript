@@ -11047,6 +11047,13 @@ fn skill_to_json(skill: &SkillView) -> StoreResult<Value> {
 /// it cannot check. `sha2` is pure-Rust and wasm-safe, so the gate was
 /// incidental rather than load-bearing.
 pub fn stable_hash_hex(value: &str) -> String {
+    stable_hash_bytes_hex(value.as_bytes())
+}
+
+/// The same digest over bytes that are not necessarily text. Text hashes
+/// through this too — `stable_hash_bytes` always covered `as_bytes()` — so a
+/// file's content id is unchanged by the store learning to hold bytes.
+pub fn stable_hash_bytes_hex(value: &[u8]) -> String {
     let mut hex = String::with_capacity(32);
     for byte in stable_hash_bytes(value) {
         hex.push_str(&format!("{byte:02x}"));
@@ -11116,14 +11123,14 @@ fn fingerprint_salt_from_metadata(metadata_json: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
-fn stable_hash_bytes(value: &str) -> [u8; 16] {
+fn stable_hash_bytes(value: &[u8]) -> [u8; 16] {
     // SHA-256/128 (the FNV-collision hardening swap): these digests cover
     // user-authored content — file bodies (`file.write.completed`
     // content_hash), skill bodies, manifests — where a crafted collision
     // aliases two contents. The DO mirror in do_store.rs must stay
     // byte-identical.
     use sha2::Digest;
-    let digest = sha2::Sha256::digest(value.as_bytes());
+    let digest = sha2::Sha256::digest(value);
     let mut out = [0u8; 16];
     out.copy_from_slice(&digest[..16]);
     out
@@ -18652,7 +18659,7 @@ mod tests {
 
     // RC-4c helper: record a mediated file write — put the body content-addressed
     // (so `plan_restore` can read it back) and derive the matching
-    // file.write.completed fact with `content_hash = stable_hash_hex(body)`.
+    // file.write.completed fact with `content_hash = stable_hash_bytes_hex(body)`.
     #[cfg(test)]
     fn record_file_write(
         store: &mut SqliteStore,

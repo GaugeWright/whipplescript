@@ -1683,7 +1683,7 @@ impl FileToolExecutor {
                 None,
             );
         };
-        match ContentStore::open(path).and_then(|store| store.put(&full)) {
+        match ContentStore::open(path).and_then(|store| store.put_text(&full)) {
             Ok(id) => whipplescript_kernel::harness_loop::truncate_tool_output(
                 tool,
                 &full,
@@ -1712,8 +1712,9 @@ impl FileToolExecutor {
         let store =
             ContentStore::open(path).map_err(|e| format!("recall failed to open store: {e:?}"))?;
         let body = store
-            .get(id)
+            .get_text(id)
             .map_err(|e| format!("recall failed: {e:?}"))?
+            .text()
             .ok_or_else(|| format!("no stored output with id `{id}`"))?;
         let offset = usize_arg(args, "offset");
         let limit = usize_arg(args, "limit");

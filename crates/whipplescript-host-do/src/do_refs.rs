@@ -154,6 +154,37 @@ mod tests {
     /// It lives beside the ref tests rather than in `do_branches` only because
     /// that module has no test harness of its own; the suite it runs is the
     /// shared one either way.
+    /// This host stores text only, and the way it says so is the point.
+    ///
+    /// `SqlValue` carries Null, Int and Text; there is no blob variant, and
+    /// adding one crosses the JS binding into the Worker's `state.storage.sql`.
+    /// So the refusal is deliberate — the alternative was storing a lossy
+    /// transcription of a picture under a hash that no longer describes it,
+    /// which every later reader would then verify as correct.
+    #[test]
+    fn content_that_is_not_text_is_refused_rather_than_transcribed() {
+        use whipplescript_store::content::ContentBlobs;
+        let blobs = crate::do_branches::DoContentBlobs::new(RusqliteDoSql::in_memory())
+            .expect("content blobs open");
+
+        let picture: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x00];
+        let error = blobs
+            .put(&picture)
+            .expect_err("this host cannot hold bytes that are not text");
+        let message = format!("{error:?}");
+        assert!(
+            message.contains("text only") && message.contains("blob"),
+            "the refusal says what is missing rather than failing vaguely: {message}"
+        );
+
+        // Text is unaffected, and round-trips as bytes through the same seam.
+        let id = blobs.put_text("prose").expect("text is fine here");
+        assert_eq!(
+            blobs.get(&id).expect("read").as_deref(),
+            Some(&b"prose"[..])
+        );
+    }
+
     #[test]
     fn do_content_blobs_passes_the_content_conformance_suite() {
         whipplescript_store::content::conformance::run_suite(|| {
@@ -184,7 +215,7 @@ mod tests {
 
         let hosted = crate::do_branches::DoContentBlobs::new(RusqliteDoSql::in_memory())
             .expect("content blobs open");
-        let id = hosted.put("bytes to drop").expect("stores");
+        let id = hosted.put_text("bytes to drop").expect("stores");
         assert!(matches!(
             hosted.erase(&id, "2026-08-30T00:00:00Z").expect("erases"),
             EraseOutcome::Erased { .. }
@@ -405,7 +436,7 @@ mod tests {
 
         let blobs = crate::do_branches::DoContentBlobs::new(RusqliteDoSql::in_memory())
             .expect("content blobs open");
-        let id = blobs.put("bytes that will be erased").expect("put");
+        let id = blobs.put_text("bytes that will be erased").expect("put");
 
         assert!(
             matches!(blobs.status(&id).expect("status"), BlobStatus::Live { .. }),

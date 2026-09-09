@@ -89,8 +89,9 @@ pub fn read_committed_save<B: Branches, C: ContentBlobs>(
     }
     let receipt_json = workspace
         .content_store()
-        .get(&reference.content_hash)
+        .get_text(&reference.content_hash)
         .map_err(io_error)?
+        .text()
         .ok_or_else(|| io_error("committed save result content is unavailable or erased"))?;
     if crate::stable_hash_hex(&receipt_json) != reference.content_hash {
         return Err(io_error(

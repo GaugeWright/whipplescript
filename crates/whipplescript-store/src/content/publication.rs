@@ -50,12 +50,12 @@ impl<'a, C: ContentBlobs> PreparedBlobs<'a, C> {
     }
 }
 impl<C: ContentBlobs> ContentBlobs for PreparedBlobs<'_, C> {
-    fn put(&self, body: &str) -> StoreResult<String> {
+    fn put(&self, body: &[u8]) -> StoreResult<String> {
         let id = self.inner.put(body)?;
         self.ids.borrow_mut().insert(id.clone());
         Ok(id)
     }
-    fn get(&self, id: &str) -> StoreResult<Option<String>> {
+    fn get(&self, id: &str) -> StoreResult<Option<Vec<u8>>> {
         self.inner.get(id)
     }
 }
@@ -68,7 +68,7 @@ pub mod conformance {
 
     pub fn check<C: ContentBlobs>(make: impl Fn() -> C) {
         let store = make();
-        let id = store.put("durable preparation").expect("prepare");
+        let id = store.put_text("durable preparation").expect("prepare");
         let calls = Cell::new(0);
         assert_eq!(
             store
@@ -81,7 +81,7 @@ pub mod conformance {
         );
         assert_eq!(calls.get(), 1);
         for missing in ["missing".to_owned(), {
-            let erased = store.put("erased preparation").expect("prepare");
+            let erased = store.put_text("erased preparation").expect("prepare");
             assert!(matches!(
                 store.erase(&erased, "t1").expect("erase"),
                 crate::content::EraseOutcome::Erased { .. }
@@ -105,7 +105,7 @@ pub mod conformance {
         assert!(format!("{error:?}").contains("publication refused"));
         assert_eq!(
             store.get(&id).expect("durable payload").as_deref(),
-            Some("durable preparation")
+            Some(&b"durable preparation"[..])
         );
         store
             .publish_retained(&[id], || Ok(()))
@@ -143,10 +143,10 @@ mod tests {
         .expect("content conformance");
         let store = content();
         let prepared = PreparedBlobs::new(&store);
-        let first = prepared.put("first").expect("put");
-        let second = prepared.put("second").expect("put");
-        prepared.put("first").expect("deduplicated put");
-        let read_only = store.put("only read").expect("external put");
+        let first = prepared.put_text("first").expect("put");
+        let second = prepared.put_text("second").expect("put");
+        prepared.put_text("first").expect("deduplicated put");
+        let read_only = store.put_text("only read").expect("external put");
         prepared.get(&read_only).expect("read");
         let mut expected = vec![first, second];
         expected.sort();
@@ -167,8 +167,8 @@ mod tests {
     fn a_cached_copy_cannot_publish_erased_authority_content() {
         let cache = content();
         let authority = content();
-        let id = authority.put("protected").expect("prepare");
-        cache.put("protected").expect("cache");
+        let id = authority.put_text("protected").expect("prepare");
+        cache.put_text("protected").expect("cache");
         authority.erase(&id, "t1").expect("erase authority");
         assert!(cache
             .get(&id)
@@ -236,7 +236,7 @@ mod tests {
                 .busy_timeout(std::time::Duration::ZERO)
                 .expect("nonblocking competitor");
             let id = content
-                .put("durably prepared before publication")
+                .put_text("durably prepared before publication")
                 .expect("prepare body");
             let manifest = crate::manifest_tree::build(
                 &content,

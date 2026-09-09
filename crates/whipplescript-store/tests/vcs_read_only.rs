@@ -129,7 +129,7 @@ fn observer_reads_committed_wal_and_exact_cuts_but_cannot_write_or_erase() {
     assert!(observer
         .create_branch("unlogged-branch", None, MAINLINE_BRANCH_ID, "t3")
         .is_err());
-    assert!(observer.content_store().put("forbidden").is_err());
+    assert!(observer.content_store().put_text("forbidden").is_err());
     let original_hash = whipplescript_store::stable_hash_hex("original");
     assert!(observer
         .content_store()

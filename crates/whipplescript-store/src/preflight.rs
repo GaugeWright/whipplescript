@@ -189,6 +189,14 @@ pub fn preflight_manifest<B: ContentBlobs + ?Sized>(
     // manifest silently redefines the whole run's inputs, and every per-input
     // check that follows would then be checking the wrong things and passing.
     crate::content::verify_body(manifest_hash, &manifest_body, "manifest")?;
+    // A manifest is JSON the store wrote. Bytes that are not text at this id
+    // are a corrupt manifest, not a file the run might want — and the id was
+    // just verified, so this is the store contradicting its own write.
+    let manifest_body = String::from_utf8(manifest_body).map_err(|_| {
+        crate::StoreError::Conflict(format!(
+            "manifest `{manifest_hash}` is not text; it cannot be a manifest"
+        ))
+    })?;
     // A manifest is a `manifest_tree` root (DR-0070 §1) or, for cuts written
     // before it, a flat map. This read parsed ONLY the flat map until
     // 2026-08-26, so against every manifest production has written since the
@@ -268,7 +276,7 @@ fn resolve_tree<B: ContentBlobs + ?Sized>(
             return Ok(TreeResolution::Resolved(out));
         };
         let body = match blobs.status(&id)? {
-            BlobStatus::Live { .. } => blobs.get(&id)?,
+            BlobStatus::Live { .. } => blobs.get_text(&id)?.text(),
             BlobStatus::Erased { byte_len } => {
                 return Ok(TreeResolution::Unreadable {
                     blob_id: id,
@@ -295,7 +303,7 @@ fn resolve_tree<B: ContentBlobs + ?Sized>(
         // check makes applies to all of them: a substituted node redefines a
         // whole subtree of the run's inputs, and every per-input check below
         // would then check the wrong things and pass.
-        crate::content::verify_body(&id, &body, "manifest tree node")?;
+        crate::content::verify_body(&id, body.as_bytes(), "manifest tree node")?;
         node = crate::manifest_tree::parse_node(&body).ok_or_else(|| {
             crate::StoreError::Conflict(format!(
                 "manifest tree node `{id}` is not a node; the manifest is not the shape its \
@@ -314,7 +322,7 @@ mod tests {
     /// A blob seam whose contents and tombstones the test controls directly.
     #[derive(Default)]
     struct FakeBlobs {
-        live: RefCell<BTreeMap<String, String>>,
+        live: RefCell<BTreeMap<String, Vec<u8>>>,
         erased: RefCell<BTreeMap<String, u64>>,
     }
 
@@ -326,14 +334,12 @@ mod tests {
         /// the manifest `"m"`, which no store could ever mint — the fixture was
         /// asserting on a manifest that could not exist.
         fn put_manifest(&self, body: &str) -> String {
-            let id = crate::stable_hash_hex(body);
-            self.put_at(&id, body);
+            let id = crate::stable_hash_bytes_hex(body.as_bytes());
+            self.put_at(&id, body.as_bytes());
             id
         }
-        fn put_at(&self, id: &str, body: &str) {
-            self.live
-                .borrow_mut()
-                .insert(id.to_owned(), body.to_owned());
+        fn put_at(&self, id: &str, body: &[u8]) {
+            self.live.borrow_mut().insert(id.to_owned(), body.to_vec());
         }
         fn erase_at(&self, id: &str, byte_len: u64) {
             self.live.borrow_mut().remove(id);
@@ -347,12 +353,12 @@ mod tests {
         /// This minted `format!("blob_{}", body.len())` until 2026-08-25, so
         /// two distinct bodies of equal length shared an id — a double that
         /// contradicted the one property the content plane is built on.
-        fn put(&self, body: &str) -> StoreResult<String> {
-            let id = crate::stable_hash_hex(body);
+        fn put(&self, body: &[u8]) -> StoreResult<String> {
+            let id = crate::stable_hash_bytes_hex(body);
             self.put_at(&id, body);
             Ok(id)
         }
-        fn get(&self, id: &str) -> StoreResult<Option<String>> {
+        fn get(&self, id: &str) -> StoreResult<Option<Vec<u8>>> {
             Ok(self.live.borrow().get(id).cloned())
         }
         fn status(&self, id: &str) -> StoreResult<BlobStatus> {
@@ -410,8 +416,8 @@ mod tests {
     #[test]
     fn a_complete_closure_is_ready() {
         let blobs = FakeBlobs::default();
-        blobs.put_at("b1", "one");
-        blobs.put_at("b2", "two");
+        blobs.put_at("b1", b"one");
+        blobs.put_at("b2", b"two");
         let m = put_tree_manifest(&blobs, &[("a.txt", "b1"), ("b.txt", "b2")]);
 
         assert_eq!(
@@ -425,7 +431,7 @@ mod tests {
     #[test]
     fn absent_and_erased_are_reported_apart() {
         let blobs = FakeBlobs::default();
-        blobs.put_at("b1", "one");
+        blobs.put_at("b1", b"one");
         blobs.erase_at("b2", 3);
         let m = put_tree_manifest(&blobs, &[("a.txt", "b1"), ("b.txt", "b2"), ("c.txt", "b3")]);
 
@@ -515,8 +521,8 @@ mod tests {
         ));
         let store = ContentStore::open(dir.join("content.sqlite")).expect("content store opens");
 
-        let live = store.put("kept").expect("live blob stores");
-        let doomed = store.put("erased later").expect("doomed blob stores");
+        let live = store.put_text("kept").expect("live blob stores");
+        let doomed = store.put_text("erased later").expect("doomed blob stores");
         let manifest_id = crate::manifest_tree::build(
             &store,
             &BTreeMap::from([
@@ -592,20 +598,23 @@ mod tests {
     #[test]
     fn a_child_that_is_not_a_node_is_refused_by_name() {
         let blobs = FakeBlobs::default();
-        blobs.put_at("b1", "one");
+        blobs.put_at("b1", b"one");
         let leaf_root = put_tree_manifest(&blobs, &[("a.txt", "b1")]);
         let leaf_body = blobs.get(&leaf_root).expect("reads").expect("live");
-        let leaf = crate::manifest_tree::parse_node(&leaf_body).expect("parses");
+        let leaf = crate::manifest_tree::parse_node(std::str::from_utf8(&leaf_body).expect("text"))
+            .expect("parses");
 
         // Honest bytes at an honest id — and not a node.
-        let impostor = blobs.put("plainly not a manifest node").expect("stores");
+        let impostor = blobs
+            .put_text("plainly not a manifest node")
+            .expect("stores");
         let parent = crate::manifest_tree::Node {
             tag: leaf.tag,
             level: 1,
             entries: vec![("zzz".to_owned(), impostor.clone())],
         };
         let parent_id = blobs
-            .put(&serde_json::to_string(&parent).expect("encodes"))
+            .put_text(&serde_json::to_string(&parent).expect("encodes"))
             .expect("stores");
 
         let error =
@@ -623,7 +632,7 @@ mod tests {
     #[test]
     fn a_legacy_flat_manifest_still_preflights() {
         let blobs = FakeBlobs::default();
-        blobs.put_at("b1", "one");
+        blobs.put_at("b1", b"one");
         let m = blobs.put_manifest(&manifest_of(&[("a.txt", "b1")]));
         assert_eq!(
             preflight_manifest(&blobs, &m).expect("preflight runs"),
@@ -642,7 +651,7 @@ mod tests {
             .map(|index| (format!("file-{index:04}.txt"), format!("blob-{index:04}")))
             .collect();
         for (_, blob) in &pairs {
-            blobs.put_at(blob, "body");
+            blobs.put_at(blob, b"body");
         }
         let map: BTreeMap<String, String> = pairs.into_iter().collect();
         let root_id = crate::manifest_tree::build(blobs, &map).expect("manifest tree builds");
@@ -650,7 +659,8 @@ mod tests {
             .get(&root_id)
             .expect("root reads")
             .expect("root is live");
-        let root = crate::manifest_tree::parse_node(&root_body).expect("root parses as a node");
+        let root = crate::manifest_tree::parse_node(std::str::from_utf8(&root_body).expect("text"))
+            .expect("root parses as a node");
         assert!(
             root.level > 0,
             "the fixture must produce a root ABOVE level 0, or these tests walk no interior node"

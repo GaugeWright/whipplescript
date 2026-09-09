@@ -13,7 +13,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::content::ContentBlobs;
+use crate::content::{ContentBlobs, TextBlob};
 use crate::StoreResult;
 
 /// How one path changed between the two sides.
@@ -66,6 +66,13 @@ pub struct DiffEntry {
     pub hunks: Vec<DiffHunk>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub payload_unavailable: bool,
+    /// The change is real and its payload is readable — it simply is not
+    /// text, so there are no line hunks to show. Deliberately distinct from
+    /// `payload_unavailable`, which says the bytes are gone: a reader told
+    /// "unavailable" about a picture that is sitting right there would draw
+    /// exactly the wrong conclusion about the store.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub binary: bool,
 }
 
 impl DiffEntry {
@@ -81,6 +88,10 @@ impl DiffEntry {
         out.push_str(&format!("--- {from}\n+++ {to}\n"));
         if self.payload_unavailable {
             out.push_str("(payload unavailable: hashes only)\n");
+            return out;
+        }
+        if self.binary {
+            out.push_str("(binary file; content changed)\n");
             return out;
         }
         for hunk in &self.hunks {
@@ -121,20 +132,28 @@ pub fn diff_manifests(
         let (kind, base_body, target_body) = match (base_hash, target_hash) {
             (None, None) => continue,
             (Some(b), Some(t)) if b == t => continue,
-            (None, Some(t)) => (DiffKind::Added, None, content.get(t)?),
-            (Some(b), None) => (DiffKind::Removed, content.get(b)?, None),
-            (Some(b), Some(t)) => (DiffKind::Modified, content.get(b)?, content.get(t)?),
+            (None, Some(t)) => (DiffKind::Added, TextBlob::Missing, content.get_text(t)?),
+            (Some(b), None) => (DiffKind::Removed, content.get_text(b)?, TextBlob::Missing),
+            (Some(b), Some(t)) => (
+                DiffKind::Modified,
+                content.get_text(b)?,
+                content.get_text(t)?,
+            ),
         };
         // A side that SHOULD have a payload but doesn't is the honest
         // degradation; a side absent from the manifest is simply empty.
-        let payload_unavailable = (base_hash.is_some() && base_body.is_none())
-            || (target_hash.is_some() && target_body.is_none());
-        let hunks = if payload_unavailable {
+        let payload_unavailable = (base_hash.is_some() && matches!(base_body, TextBlob::Missing))
+            || (target_hash.is_some() && matches!(target_body, TextBlob::Missing));
+        // Either side being bytes rather than text settles the whole entry:
+        // there is no line diff between a picture and anything.
+        let binary = matches!(base_body, TextBlob::Binary { .. })
+            || matches!(target_body, TextBlob::Binary { .. });
+        let hunks = if payload_unavailable || binary {
             Vec::new()
         } else {
             hunks_between(
-                base_body.as_deref().unwrap_or(""),
-                target_body.as_deref().unwrap_or(""),
+                base_body.text().as_deref().unwrap_or(""),
+                target_body.text().as_deref().unwrap_or(""),
                 context,
             )
         };
@@ -145,6 +164,7 @@ pub fn diff_manifests(
             target_hash: target_hash.cloned(),
             hunks,
             payload_unavailable,
+            binary,
         });
     }
     Ok(entries)
@@ -489,9 +509,9 @@ mod tests {
         ));
         let content = crate::content::ContentStore::open(dir.join("content.sqlite"))
             .expect("open content store");
-        let old_hash = content.put("line one\nline two\n").expect("put");
-        let new_hash = content.put("line one\nline 2\n").expect("put");
-        let added_hash = content.put("brand new\n").expect("put");
+        let old_hash = content.put_text("line one\nline two\n").expect("put");
+        let new_hash = content.put_text("line one\nline 2\n").expect("put");
+        let added_hash = content.put_text("brand new\n").expect("put");
         let mut base = BTreeMap::new();
         base.insert("mod.md".to_owned(), old_hash.clone());
         base.insert("gone.md".to_owned(), old_hash.clone());
@@ -516,5 +536,60 @@ mod tests {
         assert!(unified.contains("--- a/mod.md"));
         assert!(unified.contains("-line two"));
         assert!(unified.contains("+line 2"));
+    }
+}
+
+#[cfg(test)]
+mod binary_tests {
+    use super::*;
+    use crate::content::ContentStore;
+
+    /// A changed picture is a change with no line diff — and saying so is not
+    /// the same as saying its payload is gone, which is what
+    /// `payload_unavailable` means and what a reader would otherwise conclude
+    /// about a file sitting right there.
+    #[test]
+    fn a_changed_binary_file_reports_binary_rather_than_unavailable() {
+        let dir = std::env::temp_dir().join(format!("whip-diff-binary-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = ContentStore::open(dir.join("content.db")).expect("open");
+        let before = store.put(&[0x89, b'P', b'N', b'G', 0x0d]).expect("put");
+        let after = store.put(&[0x89, b'P', b'N', b'G', 0x0a]).expect("put");
+
+        let base = BTreeMap::from([("shot.png".to_owned(), before)]);
+        let target = BTreeMap::from([("shot.png".to_owned(), after)]);
+        let entries = diff_manifests(&base, &target, &store, 3).expect("diff");
+
+        assert_eq!(entries.len(), 1);
+        let entry = &entries[0];
+        assert_eq!(entry.kind, DiffKind::Modified);
+        assert!(entry.binary, "a picture that changed is a binary change");
+        assert!(
+            !entry.payload_unavailable,
+            "its bytes are right there; only the line diff is missing"
+        );
+        assert!(entry.hunks.is_empty());
+        assert!(entry.to_unified().contains("binary file; content changed"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Text beside it still diffs, line by line.
+    #[test]
+    fn text_still_diffs_beside_it() {
+        let dir = std::env::temp_dir().join(format!("whip-diff-text-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = ContentStore::open(dir.join("content.db")).expect("open");
+        let before = store.put_text("one\ntwo\n").expect("put");
+        let after = store.put_text("one\ntwo point five\n").expect("put");
+        let entries = diff_manifests(
+            &BTreeMap::from([("notes.md".to_owned(), before)]),
+            &BTreeMap::from([("notes.md".to_owned(), after)]),
+            &store,
+            3,
+        )
+        .expect("diff");
+        assert!(!entries[0].binary);
+        assert!(!entries[0].hunks.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
