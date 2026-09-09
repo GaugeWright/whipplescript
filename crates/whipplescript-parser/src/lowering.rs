@@ -296,6 +296,11 @@ pub(crate) fn lower_program(
                     &semantic.schemas.events,
                     &mut diagnostics,
                 );
+                validate_source_verified_credential(
+                    &source,
+                    &semantic.credentials,
+                    &mut diagnostics,
+                );
                 lower_source(*source, &mut ir, &mut diagnostics, &mut warnings)
             }
             Item::Test(test) => lower_test(test, &mut ir, &mut diagnostics),
@@ -2195,7 +2200,7 @@ fn lower_source(
     // Fail-closed by construction: an inbound endpoint with no `auth` has no
     // unauthenticated mode to fall into, so the refusal is at the declaration
     // rather than at the first forged delivery.
-    if inbound && source.auth.is_none() {
+    if inbound && source.auth.is_none() && source.verified.is_none() {
         diagnostics.push(Diagnostic {
             fixits: Vec::new(),
             code: diagnostic_code!("construct.missing_requirement"),
@@ -2203,14 +2208,60 @@ fn lower_source(
             related: Vec::new(),
             span: source.span,
             message: format!(
-                "inbound source `{}` declares no `auth`, so anything that can reach the \
-                 listener could inject its signal",
+                "inbound source `{}` declares neither `auth` nor `verified with`, so anything \
+                 that can reach the listener could inject its signal",
                 source.name.name
             ),
             suggestion: Some(
-                "add `auth hmac secret <reference>` (or `bearer`/`shared`)".to_owned(),
+                "add `verified with <credential>` (the custodian holds the material), or \
+                 `auth hmac secret <reference>`"
+                    .to_owned(),
             ),
         });
+    }
+    // Two answers to one question is worse than either: whichever the listener
+    // consulted, the other would be a stated requirement that never ran, and an
+    // author reading the declaration could not tell which door was guarding.
+    if let (Some(auth), Some(verified)) = (&source.auth, &source.verified) {
+        diagnostics.push(Diagnostic {
+            fixits: Vec::new(),
+            code: diagnostic_code!("construct.incompatible_clause"),
+            severity: Severity::Error,
+            related: vec![RelatedInfo {
+                span: auth.span,
+                message: "`auth` is declared here".to_owned(),
+            }],
+            span: verified.span,
+            message: format!(
+                "source `{}` declares both `auth` and `verified with`, which are two answers \
+                 to how one delivery proves itself",
+                source.name.name
+            ),
+            suggestion: Some(
+                "keep `verified with <credential>`, whose material the custodian holds, and \
+                 remove `auth`"
+                    .to_owned(),
+            ),
+        });
+    }
+    if let Some(verified) = &source.verified {
+        if !inbound {
+            diagnostics.push(Diagnostic {
+                fixits: Vec::new(),
+                code: diagnostic_code!("construct.incompatible_clause"),
+                severity: Severity::Error,
+                related: Vec::new(),
+                span: verified.span,
+                message: format!(
+                    "source `{}` declares `verified with` but serves no endpoint, so there \
+                     is no delivery to verify",
+                    source.name.name
+                ),
+                suggestion: Some(
+                    "add `path \"<endpoint>\"`, or remove the `verified with` clause".to_owned(),
+                ),
+            });
+        }
     }
     if let Some(auth) = &source.auth {
         if !inbound {
@@ -2322,6 +2373,10 @@ fn lower_source(
             .as_ref()
             .map(|auth| auth.mode.as_str().to_owned()),
         auth_secret: source.auth.as_ref().map(|auth| auth.secret.clone()),
+        verified_credential: source
+            .verified
+            .as_ref()
+            .map(|verified| verified.credential.name.clone()),
         correlate_field,
         observe_binding: source.observe_binding.name,
         emit_signal: source.emit.signal,

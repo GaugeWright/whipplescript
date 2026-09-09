@@ -3368,6 +3368,7 @@ impl Parser<'_> {
         let mut url: Option<StringLiteral> = None;
         let mut dedup: Option<SourceValue> = None;
         let mut auth: Option<SourceAuth> = None;
+        let mut verified: Option<SourceVerified> = None;
         let mut correlate: Option<SourceValue> = None;
         let mut observe_binding: Option<Ident> = None;
         let mut emit: Option<SourceEmit> = None;
@@ -3394,6 +3395,19 @@ impl Parser<'_> {
             } else if self.at_ident("dedup") {
                 self.advance();
                 dedup = self.parse_source_value();
+            } else if self.at_ident("verified") {
+                let start = self.peek().map(|t| t.span.start).unwrap_or_default();
+                self.advance();
+                if !self.consume_ident("with") {
+                    self.expected("`with <credential>` after `verified`");
+                    return None;
+                }
+                let credential = self.expect_ident("credential name after `verified with`")?;
+                let span = SourceSpan {
+                    start,
+                    end: credential.span.end,
+                };
+                verified = Some(SourceVerified { credential, span });
             } else if self.at_ident("auth") {
                 self.advance();
                 auth = self.parse_source_auth();
@@ -3415,7 +3429,7 @@ impl Parser<'_> {
                 emit = self.parse_source_emit();
             } else {
                 self.unexpected(
-                    "a source clause (`every`/`at`, `timezone`, `path`, `watch`, `url`, `dedup`, `auth`, `correlate`, `missed`, `observe`, `emit`)",
+                    "a source clause (`every`/`at`, `timezone`, `path`, `watch`, `url`, `dedup`, `auth`, `verified with`, `correlate`, `missed`, `observe`, `emit`)",
                 );
                 self.synchronize_to_block_item();
             }
@@ -3520,6 +3534,7 @@ impl Parser<'_> {
             dedup,
             endpoint,
             auth,
+            verified,
             correlate,
             observe_binding,
             emit,

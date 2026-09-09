@@ -67,10 +67,114 @@ fn an_endpoint_without_auth_is_refused_at_the_declaration() {
   emit s.x { a observation.path }
 }"#,
     );
-    assert!(said.contains("declares no `auth`"), "{said}");
+    assert!(
+        said.contains("declares neither `auth` nor `verified with`"),
+        "{said}"
+    );
     assert!(
         said.contains("could inject its signal"),
         "the refusal says what is at stake: {said}"
+    );
+}
+
+/// `verified with <credential>` is the custody-backed door (DR-0053 §6
+/// Amendment 2026-09-03): it satisfies the same requirement `auth` does, and
+/// the custodian holds the material rather than this process.
+#[test]
+fn verified_with_satisfies_the_inbound_requirement_that_auth_does() {
+    let found = errors(
+        r#"credential hook_key { kind hmac-sha256 }
+
+source http as inb {
+  path "/hooks/github"
+  verified with hook_key
+  observe as observation
+  emit s.x { a observation.path }
+}"#,
+    );
+    assert!(
+        found.is_empty(),
+        "a verified source needs no `auth`: {found:#?}"
+    );
+}
+
+#[test]
+fn declaring_both_auth_and_verified_with_is_refused() {
+    // Two answers to one question. Whichever the listener consulted, the other
+    // would be a stated requirement that never ran, and the declaration would
+    // not say which door was guarding.
+    let said = only_error(
+        r#"credential hook_key { kind hmac-sha256 }
+
+source http as inb {
+  path "/hooks/github"
+  auth hmac secret github_webhook
+  verified with hook_key
+  observe as observation
+  emit s.x { a observation.path }
+}"#,
+    );
+    assert!(
+        said.contains("declares both `auth` and `verified with`") && said.contains("two answers"),
+        "{said}"
+    );
+}
+
+#[test]
+fn verified_with_on_an_outbound_source_is_refused() {
+    // A polling source has no delivery to verify, so the clause would be a
+    // stated guarantee nothing enforces.
+    let said = only_error(
+        r#"credential hook_key { kind hmac-sha256 }
+
+source http as inb {
+  url "https://example.com/feed"
+  verified with hook_key
+  observe as observation
+  emit s.x { a observation.url }
+}"#,
+    );
+    assert!(
+        said.contains("serves no endpoint") && said.contains("no delivery to verify"),
+        "{said}"
+    );
+}
+
+#[test]
+fn verified_with_an_undeclared_credential_is_refused() {
+    let said = only_error(
+        r#"source http as inb {
+  path "/hooks/github"
+  verified with nowhere_key
+  observe as observation
+  emit s.x { a observation.path }
+}"#,
+    );
+    assert!(
+        said.contains("verifies with undeclared credential `nowhere_key`"),
+        "{said}"
+    );
+}
+
+#[test]
+fn verified_with_a_kind_that_cannot_verify_is_refused() {
+    // A static fact the custodian would otherwise discover at the first real
+    // delivery -- which is to say, at the moment a genuine webhook is wrongly
+    // turned away.
+    let said = only_error(
+        r#"credential hook_key { kind bearer }
+
+source http as inb {
+  path "/hooks/github"
+  verified with hook_key
+  observe as observation
+  emit s.x { a observation.path }
+}"#,
+    );
+    assert!(
+        said.contains("whose kind `bearer` cannot verify a signature")
+            && said.contains("hmac-sha256"),
+        "the refusal names the kinds that can: {said}"
     );
 }
 

@@ -25880,6 +25880,59 @@ fn floor_from_envelope(
     }
 }
 
+/// Ask the custodian whether a delivery's signature is valid (DR-0053 §6
+/// Amendment 2026-09-03).
+///
+/// Takes the transport rather than opening one, so all three of its refusals
+/// are ordinary tests: an absent socket is `None`, and the two reply arms need
+/// only a fake transport. Inline in the serve command they were reachable
+/// solely from a live custodian, and a refusal reachable only from an
+/// environment the suite does not have is a refusal nothing gates — the same
+/// move `generated_reply` and `delivered_reply` needed for the same reason.
+///
+/// Every `Err` here means whip could not ASK. The caller turns that into a
+/// retryable 503 rather than a 401, because a custodian outage is not a bad
+/// signature.
+pub(crate) fn verify_under_custodian(
+    transport: Option<Box<dyn whipplescript_custody::CustodyTransport>>,
+    run_id: &str,
+    credential: &str,
+    payload: &[u8],
+    signature: &[u8],
+) -> Result<bool, String> {
+    let name = whipplescript_custody::CredentialName::new(credential)
+        .map_err(|error| format!("credential name: {error}"))?;
+    let Some(transport) = transport else {
+        return Err(
+            "no custodian socket (WHIPPLESCRIPT_CUSTODIAN_SOCKET): a delivery cannot be \
+             verified without one"
+                .to_owned(),
+        );
+    };
+    let call = whipplescript_custody::CustodyCall::new(
+        whipplescript_custody::UseAttribution {
+            run_id: run_id.to_owned(),
+            actor: Some("ingress".to_owned()),
+            effect_key: None,
+        },
+        whipplescript_custody::CustodyOp::Verify {
+            credential: name,
+            alg: whipplescript_custody::SignatureAlg::HmacSha256,
+            payload_b64: whipplescript_custody::encode_body_b64(payload),
+            signature_b64: whipplescript_custody::encode_body_b64(signature),
+            key_version: None,
+        },
+    );
+    let reply = transport
+        .call(call)
+        .map_err(|error| format!("custodian unreachable: {error:?}"))?;
+    match reply.outcome {
+        Ok(whipplescript_custody::CustodyOk::Verified { valid }) => Ok(valid),
+        Ok(other) => Err(format!("custodian answered a verify with {other:?}")),
+        Err(refusal) => Err(format!("custodian refused: {refusal:?}")),
+    }
+}
+
 #[cfg(target_family = "unix")]
 pub(crate) fn custody_egress_transport(
 ) -> Result<Option<Box<dyn whipplescript_custody::CustodyTransport>>, String> {
@@ -34371,10 +34424,31 @@ fn ingress_serve_http<S: whipplescript_store::RuntimeStore>(
         }
     };
     let secret_for = |reference: &str| std::env::var(secret_env_var(reference)).ok();
+    // `verified with` asks the CUSTODIAN, which is the whole point of the
+    // clause: whip sends the signed bytes and the presented signature and is
+    // told yes or no, so the material never enters this process (DR-0053 §6
+    // Amendment 2026-09-03).
+    //
+    // The transport is opened per delivery rather than held, because a
+    // custodian restart must not strand a long-running listener on a dead
+    // socket — the same reason the egress paths reopen. `Err` here means whip
+    // could not ASK, which the caller turns into a retryable 503 rather than a
+    // 401: a custodian outage is not a bad signature.
+    let verify_with =
+        |credential: &str, payload: &[u8], signature: &[u8]| -> Result<bool, String> {
+            verify_under_custodian(
+                custody_egress_transport()?,
+                &default_instance,
+                credential,
+                payload,
+                signature,
+            )
+        };
     let result = serve_on(listener, |delivery| {
         decide(
             &routes,
             &secret_for,
+            &verify_with,
             delivery,
             &default_instance,
             // The MAPPING lives in the listener module, where both of its
@@ -44904,3 +44978,92 @@ mod sibling_workflow_refusal_tests;
 #[cfg(test)]
 #[path = "main_tests/tests.rs"]
 mod tests;
+
+/// `verify_under_custodian`'s three refusals (DR-0053 §6 Amendment
+/// 2026-09-03). All three mean "whip could not ASK", which the listener turns
+/// into a retryable 503 rather than a 401 — so each must say what actually
+/// failed, and none of them may be mistaken for a bad signature.
+#[cfg(test)]
+mod verify_under_custodian_tests {
+    use super::verify_under_custodian;
+
+    struct Answers(Result<whipplescript_custody::CustodyOk, whipplescript_custody::CustodyError>);
+
+    impl whipplescript_custody::CustodyTransport for Answers {
+        fn call(
+            &self,
+            _call: whipplescript_custody::CustodyCall,
+        ) -> Result<whipplescript_custody::CustodyReply, whipplescript_custody::TransportError>
+        {
+            Ok(whipplescript_custody::CustodyReply {
+                use_id: "use-1".to_owned(),
+                rung: whipplescript_custody::Rung::Process,
+                degraded: false,
+                outcome: match &self.0 {
+                    Ok(ok) => Ok(ok.clone()),
+                    Err(error) => Err(error.clone()),
+                },
+            })
+        }
+    }
+
+    fn answering(
+        outcome: Result<whipplescript_custody::CustodyOk, whipplescript_custody::CustodyError>,
+    ) -> Option<Box<dyn whipplescript_custody::CustodyTransport>> {
+        Some(Box::new(Answers(outcome)))
+    }
+
+    #[test]
+    fn a_verdict_is_returned_and_every_other_answer_is_a_refusal() {
+        // The two verdicts. `false` is a SUCCESSFUL call whose answer is "not
+        // valid" — the listener turns that into a 401, and only that.
+        for valid in [true, false] {
+            let answer = verify_under_custodian(
+                answering(Ok(whipplescript_custody::CustodyOk::Verified { valid })),
+                "run-1",
+                "hook_key",
+                b"body",
+                b"sig",
+            )
+            .expect("a verdict is not a failure");
+            assert_eq!(answer, valid);
+        }
+
+        // No socket: whip cannot ask at all.
+        let absent = verify_under_custodian(None, "run-1", "hook_key", b"body", b"sig")
+            .expect_err("no custodian socket must refuse");
+        assert!(
+            absent.contains("no custodian socket") && absent.contains("cannot be"),
+            "the refusal says what could not happen: {absent}"
+        );
+
+        // The custodian answered, but not about a verification.
+        let wrong = verify_under_custodian(
+            answering(Ok(whipplescript_custody::CustodyOk::Revoked {
+                existed: true,
+            })),
+            "run-1",
+            "hook_key",
+            b"body",
+            b"sig",
+        )
+        .expect_err("another outcome is not a verdict");
+        assert!(wrong.contains("answered a verify with"), "{wrong}");
+
+        // The custodian refused the call.
+        let refused = verify_under_custodian(
+            answering(Err(whipplescript_custody::CustodyError::Backend {
+                detail: "no such key version".to_owned(),
+            })),
+            "run-1",
+            "hook_key",
+            b"body",
+            b"sig",
+        )
+        .expect_err("a custodian refusal stays a refusal");
+        assert!(
+            refused.contains("custodian refused") && refused.contains("no such key version"),
+            "{refused}"
+        );
+    }
+}

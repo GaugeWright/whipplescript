@@ -949,6 +949,11 @@ pub struct SourceDecl {
     /// Required on an inbound source. Fail-closed by construction rather than
     /// by default: there is no unauthenticated mode to omit it into.
     pub auth: Option<SourceAuth>,
+    /// `verified with <credential>` — the custody-backed alternative to `auth`
+    /// (DR-0053 §6 Amendment 2026-09-03). Exactly one of the two is required on
+    /// an inbound source: both would be two answers to one question, and
+    /// neither leaves the door open.
+    pub verified: Option<SourceVerified>,
     /// `correlate <observe>.<field>` — the observation field carrying the
     /// instance id a delivery belongs to. A listener serves one endpoint for
     /// many instances, so something in the delivery has to say which.
@@ -1485,6 +1490,22 @@ pub struct SourceAuth {
     pub span: SourceSpan,
 }
 
+/// `verified with <credential>` on an inbound source (DR-0053 §6 Amendment
+/// 2026-09-03).
+///
+/// The custody-backed sibling of `auth`. Where `auth` names a secret the
+/// RUNTIME resolves — today from the environment, into whip's own process —
+/// this names a declared `credential`, and the custodian holds the material:
+/// whip sends the signed bytes and the presented signature and is told yes or
+/// no. §5's rule that the language cannot name a secret's bytes therefore holds
+/// at the inbound door as it does at the outbound one.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SourceVerified {
+    /// The declared credential whose material verifies the delivery.
+    pub credential: Ident,
+    pub span: SourceSpan,
+}
+
 /// How an inbound delivery authenticates (spec/std-ingress.md Surface).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SourceAuthMode {
@@ -1859,6 +1880,11 @@ pub struct IrSource {
     /// `auth <mode> secret <ident>`: the mode and the secret REFERENCE.
     pub auth_mode: Option<String>,
     pub auth_secret: Option<String>,
+    /// `verified with <credential>`: the declared credential whose material the
+    /// CUSTODIAN holds (DR-0053 §6 Amendment 2026-09-03). Carried as the
+    /// credential NAME rather than any secret, which is the whole point — whip
+    /// sends the signed bytes and the presented signature and is told yes or no.
+    pub verified_credential: Option<String>,
     /// `correlate <observe>.<field>`: the observation field naming the instance
     /// a delivery belongs to.
     pub correlate_field: Option<String>,
@@ -25333,6 +25359,75 @@ fn collect_all_binding_names(statements: &[body::BodyStmt], out: &mut BTreeSet<S
 /// so ingested data is dropped with no diagnostic — this lifts the guarantee to
 /// static `whip check`, symmetric with the clock/file/http source runtime that
 /// admits `emit_signal`.
+/// `verified with <credential>` names a DECLARED credential of a kind that can
+/// verify (DR-0053 §6 Amendment 2026-09-03).
+///
+/// Both refusals are static facts the custodian would otherwise discover at the
+/// first delivery — which is to say, at the moment a real webhook arrives and
+/// is wrongly refused. An undeclared name is a typo or a missing declaration;
+/// a kind that cannot verify is a design error that no runtime state changes.
+fn validate_source_verified_credential(
+    source: &SourceDecl,
+    declared_credentials: &BTreeMap<String, String>,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    use whipplescript_custody::{CredentialKind, Operation};
+
+    let Some(verified) = &source.verified else {
+        return;
+    };
+    let name = &verified.credential.name;
+    let Some(declared) = declared_credentials.get(name) else {
+        let suggestion = suggest_otherwise(
+            name,
+            declared_credentials.keys(),
+            format!("declare `credential {name} {{ kind hmac-sha256 }}` before verifying with it"),
+        );
+        diagnostics.push(Diagnostic {
+            code: diagnostic_code!("type.unknown_credential"),
+            severity: Severity::Error,
+            related: Vec::new(),
+            fixits: Vec::new(),
+            span: verified.span,
+            message: format!(
+                "source `{}` verifies with undeclared credential `{name}`",
+                source.name.name
+            ),
+            suggestion: Some(suggestion),
+        });
+        return;
+    };
+    // An unparseable kind is the credential declaration's own error; reporting
+    // it again from here would say nothing new.
+    let Ok(kind) = CredentialKind::parse(declared) else {
+        return;
+    };
+    if kind.supports(Operation::Verify) {
+        return;
+    }
+    let able: Vec<&str> = CredentialKind::ALL
+        .into_iter()
+        .filter(|candidate| candidate.supports(Operation::Verify))
+        .map(|candidate| candidate.as_str())
+        .collect();
+    diagnostics.push(Diagnostic {
+        code: diagnostic_code!("capability.credential_kind_mismatch"),
+        severity: Severity::Error,
+        related: Vec::new(),
+        fixits: Vec::new(),
+        span: verified.span,
+        message: format!(
+            "source `{}` verifies with credential `{name}`, whose kind `{declared}` cannot \
+             verify a signature",
+            source.name.name
+        ),
+        suggestion: Some(format!(
+            "verification needs a credential of kind {}",
+            able.join(" or ")
+        )),
+    });
+}
+
 fn validate_source_emit_signal_declared(
     source: &SourceDecl,
     declared_signals: &BTreeSet<String>,

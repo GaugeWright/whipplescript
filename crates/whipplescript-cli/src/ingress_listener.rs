@@ -166,6 +166,52 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 /// source did not declare, and a wrong secret all refuse. There is no path
 /// through this function that admits without a match, which is the property the
 /// model's `AuthenticatedBeforeAdmitted` states.
+/// Ask the custodian whether `signature` is valid over `payload` under a
+/// credential, by NAME.
+///
+/// A function rather than a transport so this module stays a set of decisions
+/// over values: the socket, the rung floor and the protocol live on the caller's
+/// side of it. `Ok(false)` is a successful call whose answer is "not valid";
+/// `Err` means whip could not ASK, which is a different outcome entirely.
+pub type VerifyWith<'a> = &'a dyn Fn(&str, &[u8], &[u8]) -> Result<bool, String>;
+
+/// Verify a delivery under a credential the CUSTODIAN holds (DR-0053 §6
+/// Amendment 2026-09-03).
+///
+/// The signature travels in the same `sha256=<hex>` header `auth hmac` uses, so
+/// a sender that already signs for this listener needs no change — what moves
+/// is where the key lives, not what crosses the wire.
+///
+/// Three outcomes, and the third is the one worth separating. A missing or
+/// malformed header and a signature that does not match are both the sender's
+/// problem: 401. A custodian that cannot answer is NOT — calling that
+/// `Unauthenticated` would tell an honest sender their signature was rejected
+/// and send them into their own signing code, when the truth is that whip
+/// could not ask. `Unavailable` says retry, which the delivery key makes safe.
+pub fn verify_delivery(
+    credential: &str,
+    delivery: &RawDelivery,
+    verify_with: VerifyWith<'_>,
+) -> Result<(), DeliveryRefusal> {
+    let unauthenticated = |detail: &str| Err(DeliveryRefusal::Unauthenticated(detail.to_owned()));
+    let Some(presented) = delivery.headers.get(SIGNATURE_HEADER) else {
+        return unauthenticated("no signature header");
+    };
+    let Some(hex) = presented.strip_prefix("sha256=") else {
+        return unauthenticated("signature is not `sha256=<hex>`");
+    };
+    let Ok(signature) = decode_hex(hex) else {
+        return unauthenticated("signature is not hex");
+    };
+    match verify_with(credential, &delivery.body, &signature) {
+        Ok(true) => Ok(()),
+        Ok(false) => unauthenticated("the custodian did not verify the signature over the body"),
+        Err(detail) => Err(DeliveryRefusal::Unavailable(format!(
+            "the custodian could not verify under `{credential}`: {detail}"
+        ))),
+    }
+}
+
 pub fn authenticate(
     mode: &str,
     secret: &str,
@@ -475,6 +521,7 @@ pub fn write_response(
 pub fn decide<F>(
     routes: &BTreeMap<String, &IrSource>,
     secret_for: &dyn Fn(&str) -> Option<String>,
+    verify_with: VerifyWith<'_>,
     delivery: &RawDelivery,
     default_instance: &str,
     mut admit: F,
@@ -488,27 +535,45 @@ where
         return DeliveryOutcome::Refused(DeliveryRefusal::UnknownPath);
     }
     let Some(source) = routes.get(delivery.path.as_str()) else {
+        // The success is spelled out because it cannot be inferred: this is a
+        // message-free unit refusal wrapped in another enum, returned from a
+        // `let`-else that must diverge, so there is no path to swap and no text
+        // to rewrite. Without it the sweep reports the site as UNMEASURED —
+        // unknown rather than covered — and `an_unknown_path_and_a_get_are_both
+        // _refused_before_auth` would stop meaning anything without saying so.
+        // MUTATION-SUCCESS-EXPR: DeliveryOutcome::Admitted { instance: String::new(), fact: String::new() }
         return DeliveryOutcome::Refused(DeliveryRefusal::UnknownPath);
     };
-    let (Some(mode), Some(reference)) = (&source.auth_mode, &source.auth_secret) else {
-        // The parser requires `auth` on an endpoint, so an inbound source
-        // without one means the IR and that check disagree. Refusing is the
-        // only safe reading.
-        return DeliveryOutcome::Refused(DeliveryRefusal::Unauthenticated(
-            "the source declares no auth".to_owned(),
-        ));
-    };
-    let Some(secret) = secret_for(reference) else {
-        // A configured secret that is absent is NOT an open door: the operator
-        // meant to authenticate and the environment does not let them, so the
-        // delivery is refused and the log says which variable is missing.
-        return DeliveryOutcome::Refused(DeliveryRefusal::Unauthenticated(format!(
-            "{} is not set, so `{reference}` resolves to nothing",
-            secret_env_var(reference)
-        )));
-    };
-    if let Err(refusal) = authenticate(mode, &secret, &delivery.headers, &delivery.body) {
-        return DeliveryOutcome::Refused(refusal);
+    // `verified with` takes precedence when both are somehow present. The
+    // parser refuses that pair, so reaching here with both means the IR and
+    // that check disagree — and the custody-backed answer is the safer of the
+    // two to trust.
+    if let Some(credential) = &source.verified_credential {
+        if let Err(refusal) = verify_delivery(credential, delivery, verify_with) {
+            return DeliveryOutcome::Refused(refusal);
+        }
+    } else {
+        let (Some(mode), Some(reference)) = (&source.auth_mode, &source.auth_secret) else {
+            // The parser requires one of `auth` and `verified with` on an
+            // endpoint, so a source with neither means the IR and that check
+            // disagree. Refusing is the only safe reading.
+            return DeliveryOutcome::Refused(DeliveryRefusal::Unauthenticated(
+                "the source declares neither auth nor verification".to_owned(),
+            ));
+        };
+        let Some(secret) = secret_for(reference) else {
+            // A configured secret that is absent is NOT an open door: the
+            // operator meant to authenticate and the environment does not let
+            // them, so the delivery is refused and the log says which variable
+            // is missing.
+            return DeliveryOutcome::Refused(DeliveryRefusal::Unauthenticated(format!(
+                "{} is not set, so `{reference}` resolves to nothing",
+                secret_env_var(reference)
+            )));
+        };
+        if let Err(refusal) = authenticate(mode, &secret, &delivery.headers, &delivery.body) {
+            return DeliveryOutcome::Refused(refusal);
+        }
     }
 
     // Only now is the body parsed. An unauthenticated peer never reaches the
@@ -888,6 +953,33 @@ mod tests {
         inbound_source_with("")
     }
 
+    /// A source whose door is `verified with`, so the custodian answers and no
+    /// environment variable is consulted.
+    fn verified_source() -> IrSource {
+        let program = "@service\nworkflow W\n\nuse std.ingress\nuse std.custody\n\ncredential hook_key { kind hmac-sha256 }\n\nsignal github.push { repo string }\n\noutput result R\nclass R { v string }\n\nsource http as pushes {\n  path \"/hooks/github\"\n  verified with hook_key\n  observe as observation\n  emit github.push { repo observation.path }\n}\n\nrule r\n  when github.push as p\n=> {\n  complete result { v p.repo }\n}\n";
+        let compiled = whipplescript_parser::compile_program(program);
+        assert!(
+            compiled.diagnostics.is_empty(),
+            "fixture must compile: {:#?}",
+            compiled
+                .diagnostics
+                .iter()
+                .map(|d| &d.message)
+                .collect::<Vec<_>>()
+        );
+        compiled
+            .ir
+            .expect("ir")
+            .sources
+            .into_iter()
+            .next()
+            .expect("one source")
+    }
+
+    fn signed(body: &str, hex_sig: &str) -> RawDelivery {
+        post("/hooks/github", &[(SIGNATURE_HEADER, hex_sig)], body)
+    }
+
     fn post(path: &str, headers: &[(&str, &str)], body: &str) -> RawDelivery {
         RawDelivery {
             method: "POST".to_owned(),
@@ -900,8 +992,175 @@ mod tests {
         }
     }
 
+    /// The custody-backed door: the custodian answers, and the environment is
+    /// never consulted. The secret resolver PANICS here, so a regression that
+    /// silently fell back to the env-var path fails rather than passing.
+    #[test]
+    fn a_verified_source_asks_the_custodian_and_never_the_environment() {
+        let source = verified_source();
+        let routes = routes(std::slice::from_ref(&source)).expect("routes");
+        let asked: std::cell::RefCell<Vec<String>> = std::cell::RefCell::new(Vec::new());
+        let mut reached = 0;
+        let outcome = decide(
+            &routes,
+            &|_| panic!("a `verified with` source must not read an environment secret"),
+            &|credential, payload, signature| {
+                asked.borrow_mut().push(format!(
+                    "{credential}:{}:{}",
+                    String::from_utf8_lossy(payload),
+                    signature.len()
+                ));
+                Ok(true)
+            },
+            &signed(r#"{"repo":"w"}"#, "sha256=00ff"),
+            "inst-1",
+            |_source, instance, observed, key| {
+                reached += 1;
+                assert_eq!(instance, "inst-1");
+                assert!(observed.get("body").is_some(), "{observed}");
+                assert!(!key.is_empty());
+                Ok(AdmitOutcome::Admitted {
+                    fact: "fact-1".to_owned(),
+                })
+            },
+        );
+        assert!(
+            matches!(outcome, DeliveryOutcome::Admitted { .. }),
+            "{outcome:?}"
+        );
+        assert_eq!(reached, 1);
+        // The custodian is asked about the DECLARED credential, over the raw
+        // body — not a projection of it, which is what makes the signature
+        // mean anything.
+        assert_eq!(
+            asked.into_inner(),
+            vec!["hook_key:{\"repo\":\"w\"}:2".to_owned()]
+        );
+    }
+
+    /// The three ways a verified delivery is turned away, and the one that is
+    /// deliberately not a 401.
+    #[test]
+    fn a_verified_delivery_is_refused_by_signature_and_unavailable_by_outage() {
+        let source = verified_source();
+        let routes = routes(std::slice::from_ref(&source)).expect("routes");
+        let never_admits =
+            |_: &IrSource, _: &str, _: &Value, _: &str| -> Result<AdmitOutcome, DeliveryRefusal> {
+                panic!("a refused delivery must not reach admission")
+            };
+
+        // No signature header at all.
+        let bare = decide(
+            &routes,
+            &|_| None,
+            &|_, _, _| Ok(true),
+            &post("/hooks/github", &[], "{}"),
+            "inst-1",
+            never_admits,
+        );
+        let DeliveryOutcome::Refused(refusal) = bare else {
+            panic!("an unsigned delivery must be refused: {bare:?}");
+        };
+        assert_eq!(refusal.status(), 401);
+        // The LITERAL, not only the status: a mutation sweep rewrites the
+        // message and leaves the status alone, so a test that read the code
+        // alone would pass with the refusal saying anything at all.
+        let DeliveryRefusal::Unauthenticated(detail) = &refusal else {
+            panic!("an unsigned delivery is unauthenticated: {refusal:?}");
+        };
+        assert!(detail.contains("no signature header"), "{detail}");
+
+        // A signature the custodian does not accept.
+        let forged = decide(
+            &routes,
+            &|_| None,
+            &|_, _, _| Ok(false),
+            &signed("{}", "sha256=00ff"),
+            "inst-1",
+            never_admits,
+        );
+        let DeliveryOutcome::Refused(refusal) = forged else {
+            panic!("a forged delivery must be refused: {forged:?}");
+        };
+        assert_eq!(refusal.status(), 401);
+        assert_eq!(refusal.public_reason(), "unauthenticated");
+
+        // The custodian could not be ASKED. This is the distinction worth the
+        // test: 503 and retry, not 401 — telling an honest sender their
+        // signature was rejected sends them into their own signing code while
+        // the truth is that whip could not reach the custodian.
+        let outage = decide(
+            &routes,
+            &|_| None,
+            &|_, _, _| Err("custodian unreachable: ConnectionRefused".to_owned()),
+            &signed("{}", "sha256=00ff"),
+            "inst-1",
+            never_admits,
+        );
+        let DeliveryOutcome::Refused(refusal) = outage else {
+            panic!("an unreachable custodian must refuse: {outage:?}");
+        };
+        assert_eq!(refusal.status(), 503);
+        let DeliveryRefusal::Unavailable(detail) = &refusal else {
+            panic!("an outage is unavailable, not unauthenticated: {refusal:?}");
+        };
+        assert!(
+            detail.contains("could not verify under") && detail.contains("hook_key"),
+            "the operator's detail names the credential and what failed: {detail}"
+        );
+        // And the sender is not told what broke — that detail is the operator's.
+        assert!(
+            !refusal.public_reason().contains("ConnectionRefused"),
+            "the outage detail must not reach the sender: {}",
+            refusal.public_reason()
+        );
+    }
+
+    /// The arm that fires when the IR and the parser's check disagree.
+    ///
+    /// The parser requires one of `auth` and `verified with` on an endpoint, so
+    /// no program produces this source — but a listener reading an IR it did not
+    /// compile can meet one, and the only safe reading of "no door declared" is
+    /// to refuse. Reachable here because the IR is a value this test can build.
+    #[test]
+    fn a_source_declaring_no_door_at_all_is_refused_rather_than_admitted() {
+        let mut source = verified_source();
+        source.verified_credential = None;
+        source.auth_mode = None;
+        source.auth_secret = None;
+        let routes = routes(std::slice::from_ref(&source)).expect("routes");
+
+        let outcome = decide(
+            &routes,
+            &|_| Some("s3cret".to_owned()),
+            &|_, _, _| Ok(true),
+            &post("/hooks/github", &[], "{}"),
+            "inst-1",
+            |_, _, _, _| panic!("a source with no door must not reach admission"),
+        );
+        let DeliveryOutcome::Refused(DeliveryRefusal::Unauthenticated(detail)) = outcome else {
+            panic!("a source with no declared door must refuse: {outcome:?}");
+        };
+        assert!(
+            detail.contains("declares neither auth nor verification"),
+            "{detail}"
+        );
+    }
+
     fn secret_is(value: &'static str) -> impl Fn(&str) -> Option<String> {
         move |_| Some(value.to_owned())
+    }
+
+    /// The verifier the `auth` tests hand in. None of them declares
+    /// `verified with`, so reaching this would mean the branch chose the wrong
+    /// door — and a verifier that refuses makes that a failure rather than a
+    /// pass, which a permissive stub would hide.
+    fn never_verifies(
+        _credential: &str,
+        _payload: &[u8],
+        _signature: &[u8],
+    ) -> Result<bool, String> {
+        panic!("an `auth` source must not reach the custodian")
     }
 
     #[test]
@@ -912,6 +1171,7 @@ mod tests {
         let outcome = decide(
             &routes,
             &secret_is("s3cret"),
+            &never_verifies,
             &post(
                 "/hooks/github",
                 &[(SHARED_HEADER, "s3cret")],
@@ -947,6 +1207,7 @@ mod tests {
         let outcome = decide(
             &routes,
             &secret_is("s3cret"),
+            &never_verifies,
             &post(
                 "/hooks/github",
                 &[(SHARED_HEADER, "wrong")],
@@ -976,6 +1237,7 @@ mod tests {
         let outcome = decide(
             &routes,
             &|_| None,
+            &never_verifies,
             &post("/hooks/github", &[(SHARED_HEADER, "s3cret")], "{}"),
             "inst-1",
             |_, _, _, _| {
@@ -987,6 +1249,18 @@ mod tests {
         );
         assert_eq!(reached, 0);
         assert_eq!(outcome.status(), 401);
+        // The LITERAL, and it earns the line: an operator staring at a 401 they
+        // did not expect needs to be told WHICH variable is unset, and a status
+        // assertion alone passes with the message saying anything at all.
+        let DeliveryOutcome::Refused(DeliveryRefusal::Unauthenticated(detail)) = &outcome else {
+            panic!("a missing secret is an authentication failure: {outcome:?}");
+        };
+        assert!(
+            detail.contains("is not set, so")
+                && detail.contains("github_webhook")
+                && detail.contains(&secret_env_var("github_webhook")),
+            "the refusal names the environment variable the operator must set: {detail}"
+        );
     }
 
     #[test]
@@ -997,6 +1271,7 @@ mod tests {
             decide(
                 &routes,
                 &secret_is("s3cret"),
+                &never_verifies,
                 &delivery,
                 "inst-1",
                 |_, _, _, _| panic!("must not reach admission"),
@@ -1017,6 +1292,7 @@ mod tests {
         let outcome = decide(
             &routes,
             &secret_is("s3cret"),
+            &never_verifies,
             &post(
                 "/hooks/github",
                 &[(SHARED_HEADER, "s3cret")],
@@ -1042,6 +1318,7 @@ mod tests {
         let outcome = decide(
             &routes,
             &secret_is("s3cret"),
+            &never_verifies,
             &post(
                 "/hooks/github",
                 &[(SHARED_HEADER, "s3cret")],
@@ -1063,6 +1340,7 @@ mod tests {
         let outcome = decide(
             &routes,
             &secret_is("s3cret"),
+            &never_verifies,
             &post("/hooks/github", &[(SHARED_HEADER, "s3cret")], "{}"),
             "inst-1",
             |_, _, _, _| {
