@@ -6929,6 +6929,9 @@ impl SqliteStore {
     /// Both the current file plane and the cut manifest are folded marker-aware
     /// (RC-4c), so a prior restore's abandoned writes never enter the diff.
     pub fn plan_restore(&self, instance_id: &str, cut_id: &str) -> StoreResult<RestoreDecision> {
+        // Refuse unsupported authority domains before resolving any bare hash.
+        let current_payloads = live_fact_payloads_on(&self.connection, instance_id)?;
+        let (_, current_manifest) = fold_file_manifest(&current_payloads)?;
         let checkpoint = {
             let mut statement = self.connection.prepare(
                 r#"
@@ -7003,8 +7006,6 @@ impl SqliteStore {
         }
         // Full reconcile: mediated paths live now but absent from the cut are
         // removed so the file plane equals exactly the cut manifest.
-        let current_payloads = live_fact_payloads_on(&self.connection, instance_id)?;
-        let (_, current_manifest) = fold_file_manifest(&current_payloads)?;
         let removes: Vec<String> = current_manifest
             .keys()
             .filter(|path| !cut_manifest.contains_key(*path))
@@ -7065,6 +7066,8 @@ impl SqliteStore {
         let tx = self
             .connection
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let fact_payloads = live_fact_payloads_on(&tx, instance_id)?;
+        fold_file_manifest(&fact_payloads)?;
         let marker = append_event_cas_on(
             &tx,
             expected_head,
@@ -8139,6 +8142,42 @@ fn workspace_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkspaceView
     })
 }
 
+/// The legacy file manifest cannot represent product authority or a reference
+/// compartment. Check immutable intent as well as outcomes: a failed or
+/// cancelled write does not prove that its target stayed unchanged.
+pub fn validate_legacy_file_context_event(event_type: &str, payload_json: &str) -> StoreResult<()> {
+    let host_bound = match event_type {
+        "host.action.admitted" => true,
+        "fact.derived" => {
+            // Validate before restore markers can trim an old result away.
+            fold_file_manifest(&[payload_json.to_owned()])?;
+            false
+        }
+        "rule.committed" => {
+            let payload: Value = serde_json::from_str(payload_json)?;
+            payload
+                .get("effects")
+                .and_then(Value::as_array)
+                .is_some_and(|effects| {
+                    effects.iter().any(|effect| {
+                        effect.get("kind").and_then(Value::as_str) == Some("file.write")
+                            && effect.get("input").is_some_and(|input| {
+                                input.get("format").and_then(Value::as_str) == Some("reference")
+                                    || input.get("body_ref").is_some()
+                            })
+                    })
+                })
+        }
+        _ => false,
+    };
+    if host_bound {
+        return Err(StoreError::Conflict(
+            "legacy context restore requires host-bound recovery".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Restorable-context RC-3: fold the file-store manifest at a cut from the
 /// sequence-ordered `fact.derived` event payloads of an instance. Only
 /// `file.write.completed` facts contribute; the RC-1 write value they carry
@@ -8159,6 +8198,19 @@ pub fn fold_file_manifest(
             continue;
         }
         let descriptor = payload.get("value").and_then(|fact| fact.get("value"));
+        if descriptor.is_some_and(|value| {
+            value.get("format").and_then(Value::as_str) == Some("reference")
+                || value.get("content_reference").is_some()
+                || value
+                    .get("receipt")
+                    .and_then(|receipt| receipt.get("schema_ref"))
+                    .and_then(Value::as_str)
+                    == Some(crate::vcs_file_save::SAVE_RECEIPT_SCHEMA)
+        }) {
+            return Err(StoreError::Conflict(
+                "legacy file manifest cannot erase a host binding or label".into(),
+            ));
+        }
         // Prefer the full resolved path (RC-5) so restore is self-contained and
         // writes back to the exact location; fall back to the relative `path`
         // for facts recorded before RC-5 (and synthetic test facts).
@@ -8187,7 +8239,7 @@ fn live_fact_payloads_on(connection: &Connection, instance_id: &str) -> StoreRes
         r#"
         SELECT event_type, payload_json, sequence
         FROM events
-        WHERE instance_id = ?1 AND event_type IN ('fact.derived', 'context.restored')
+        WHERE instance_id = ?1 AND event_type IN ('fact.derived', 'context.restored', 'rule.committed', 'host.action.admitted')
         ORDER BY sequence
         "#,
     )?;
@@ -8205,11 +8257,12 @@ fn live_fact_payloads_on(connection: &Connection, instance_id: &str) -> StoreRes
     };
     let mut live: Vec<(String, i64)> = Vec::new();
     for (event_type, payload_json, sequence) in rows {
+        validate_legacy_file_context_event(&event_type, &payload_json)?;
         if event_type == "context.restored" {
             if let Some(target) = restore_marker_target(&payload_json) {
                 live.retain(|(_, seq)| *seq <= target);
             }
-        } else {
+        } else if event_type == "fact.derived" {
             live.push((payload_json, sequence));
         }
     }
@@ -13013,6 +13066,62 @@ fn column_exists(connection: &Connection, table: &str, column: &str) -> StoreRes
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_file_context_preserves_host_authority_boundaries() {
+        for (kind, input, refused) in [
+            (
+                "file.write",
+                json!({"format":"text", "body":"draft"}),
+                false,
+            ),
+            ("file.read", json!({"format":"reference"}), false),
+            ("file.write", json!({"format":"reference"}), true),
+            ("file.write", json!({"body_ref":null}), true),
+        ] {
+            let payload = json!({"effects":[{"kind":kind,"input":input}]}).to_string();
+            let result = validate_legacy_file_context_event("rule.committed", &payload);
+            assert_eq!(result.is_err(), refused, "{payload}");
+            if let Err(error) = result {
+                assert!(format!("{error:?}")
+                    .contains("legacy context restore requires host-bound recovery"));
+            }
+        }
+        assert!(validate_legacy_file_context_event("host.action.admitted", "{}").is_err());
+        assert!(validate_legacy_file_context_event("context.restored", "{}").is_ok());
+    }
+
+    #[test]
+    fn legacy_file_manifest_refuses_to_strip_reference_labels_or_host_receipts() {
+        let ordinary = json!({"name":"file.write.completed", "value":{"value":{
+            "format":"text", "path":"note.txt", "content_hash":"old"
+        }}});
+        let (_, manifest) = fold_file_manifest(&[ordinary.to_string()]).expect("legacy manifest");
+        assert_eq!(manifest.get("note.txt").map(String::as_str), Some("old"));
+        for binding in [
+            json!({"format":"reference"}),
+            json!({"content_reference":null}),
+            json!({"receipt":{"schema_ref":crate::vcs_file_save::SAVE_RECEIPT_SCHEMA}}),
+        ] {
+            let mut bound = ordinary.clone();
+            bound["value"]["value"]
+                .as_object_mut()
+                .expect("descriptor")
+                .extend(binding.as_object().expect("binding").clone());
+            let error = fold_file_manifest(&[ordinary.to_string(), bound.to_string()])
+                .expect_err("never silently retain an earlier unlabelled write");
+            assert!(format!("{error:?}")
+                .contains("legacy file manifest cannot erase a host binding or label"));
+            assert!(
+                validate_legacy_file_context_event("fact.derived", &bound.to_string()).is_err()
+            );
+            bound["name"] = json!("file.read.completed");
+            assert!(fold_file_manifest(&[bound.to_string()])
+                .expect("read is not a write")
+                .1
+                .is_empty());
+        }
+    }
 
     #[test]
     fn store_scaffold_links_to_core() {

@@ -410,7 +410,10 @@ else
     [ -d "$worker/node_modules" ] || npm --prefix "$worker" ci
     npm --prefix "$worker" test
     (cd "$worker" && npx tsc --noEmit)
-    (cd "$worker" && npx wrangler deploy --config wrangler.public.toml --dry-run --outdir dist-ci)
+    # Cosmetic requests must not hold the gate open after the dry-run. Wrangler's
+    # banner stops waiting for its update lookup without cancelling the request.
+    (cd "$worker" && WRANGLER_HIDE_BANNER=true WRANGLER_SEND_METRICS=false \
+        npx wrangler deploy --config wrangler.public.toml --dry-run --outdir dist-ci)
 fi
 
 echo "== whipplescript green bar PASSED =="

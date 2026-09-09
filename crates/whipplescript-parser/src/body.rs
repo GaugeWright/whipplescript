@@ -691,7 +691,7 @@ pub enum BodyEffectKind {
     },
     /// `write <format> to <store> at <path> { body <expr> mode <mode> } as
     /// <binding>` (std.files): a typed file write lowering through
-    /// `typed_effect_call`. v0 formats are `text`/`markdown` body codecs; the
+    /// `typed_effect_call`. Formats are text/markdown bodies or host references; the
     /// `mode` (create/replace/upsert/append) is required (no silent overwrite),
     /// and `body` is an expression resolved at effect-input time.
     FileWrite {
@@ -3397,18 +3397,18 @@ impl<'a> BodyParser<'a> {
         self.pos += 1; // read
         let usage = "write `read <format> from <store> at <path> as <binding>`".to_owned();
         let format = self.ident_text("file format after `read`")?;
-        // v0 `read` is a body read: `text`/`markdown` decode to a UTF-8 content
+        // `reference` preserves a host-bound descriptor; `text`/`markdown` decode to a UTF-8 content
         // body. Structured codecs (json/jsonl/csv) are typed row/value data —
         // that is the `import` surface (fact-batch admission), not `read`; and
         // `bytes` (an artifact with a content hash) is a deferred read codec.
         // Reject anything else here so `read <format>` is honest rather than
         // silently decoding every format as text.
-        if !matches!(format.as_str(), "text" | "markdown") {
+        if !matches!(format.as_str(), "text" | "markdown" | "reference") {
             let span = self.span_from(start);
             self.error(diagnostic_code!("construct.unknown_option"), 
                 span,
                 format!(
-                    "`read {format}` is not supported in v0 — `read` decodes only `text` or `markdown` bodies"
+                    "`read {format}` is not supported in v0 — `read` supports `text`, `markdown`, or host-bound `reference`"
                 ),
                 Some(
                     "use `read text`/`read markdown` for a body, `import <format> <Schema>` for structured rows, or `read text` + `coerce` to interpret structured content".to_owned(),
@@ -3475,14 +3475,14 @@ impl<'a> BodyParser<'a> {
             "write `write <format> to <store> at <path> { body <expr> mode <mode> } as <binding>`"
                 .to_owned();
         let format = self.ident_text("file format after `write`")?;
-        // v0 `write` renders the `text`/`markdown` body codecs (UTF-8 bodies).
+        // `write` renders text/markdown bodies or passes a host-bound reference.
         // Rendering typed values as json/csv is `export` (deferred, fact-batch).
-        if !matches!(format.as_str(), "text" | "markdown") {
+        if !matches!(format.as_str(), "text" | "markdown" | "reference") {
             let span = self.span_from(start);
             self.error(diagnostic_code!("construct.unknown_option"), 
                 span,
                 format!(
-                    "`write {format}` is not supported in v0 — `write` renders only `text` or `markdown` bodies"
+                    "`write {format}` is not supported in v0 — `write` supports `text`, `markdown`, or host-bound `reference`"
                 ),
                 Some(
                     "use `write text`/`write markdown` for a body; structured `export <format> <Schema>` is deferred".to_owned(),

@@ -1781,18 +1781,22 @@ fn do_live_fact_payloads<Sql: DoSql>(sql: &Sql, instance_id: &str) -> StoreResul
     let rows = sql
         .query(
             "SELECT event_type, payload_json, sequence FROM events \
-             WHERE instance_id = ?1 AND event_type IN ('fact.derived', 'context.restored') \
+             WHERE instance_id = ?1 AND event_type IN ('fact.derived', 'context.restored', 'rule.committed', 'host.action.admitted') \
              ORDER BY sequence",
             &[text(instance_id)],
         )
         .map_err(sql_err)?;
     let mut live: Vec<(String, i64)> = Vec::new();
     for row in &rows {
+        whipplescript_store::validate_legacy_file_context_event(
+            &as_text(&row[0]),
+            &as_text(&row[1]),
+        )?;
         if as_text(&row[0]) == "context.restored" {
             if let Some(target) = restore_marker_target(&as_text(&row[1])) {
                 live.retain(|(_, seq)| *seq <= target);
             }
-        } else {
+        } else if as_text(&row[0]) == "fact.derived" {
             live.push((as_text(&row[1]), as_i64(&row[2])));
         }
     }
@@ -5772,6 +5776,8 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
     }
 
     fn plan_restore(&self, instance_id: &str, cut_id: &str) -> StoreResult<RestoreDecision> {
+        let current_payloads = do_live_fact_payloads(&self.sql, instance_id)?;
+        let (_, current_manifest) = fold_file_manifest(&current_payloads)?;
         // Resolve the checkpoint by cut id (latest first).
         let checkpoint_rows = self
             .sql
@@ -5824,8 +5830,6 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
             }
         }
         // Full reconcile: mediated paths live now but absent from the cut.
-        let current_payloads = do_live_fact_payloads(&self.sql, instance_id)?;
-        let (_, current_manifest) = fold_file_manifest(&current_payloads)?;
         let removes: Vec<String> = current_manifest
             .keys()
             .filter(|path| !cut_manifest.contains_key(*path))
@@ -5861,6 +5865,8 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
             "restored_to_sequence": restored_to_sequence,
         })
         .to_string();
+        let fact_payloads = do_live_fact_payloads(&self.sql, instance_id)?;
+        fold_file_manifest(&fact_payloads)?;
         let marker = do_append_event_cas(
             &self.sql,
             expected_head,

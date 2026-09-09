@@ -542,59 +542,72 @@ pub fn run_file_effect_generic<S: RuntimeStore>(
     // The `file store` root + `allow read` policy is the scope boundary
     // (spec/files.md), checked before any disk access.
     let allow = effect_allow_globs(&input);
-    let read_outcome = match file_path_policy_error(path, store_name, &allow, "read")
-        .or_else(|| files.path_policy_error(Path::new(root), Path::new(path), store_name, "read"))
-    {
-        Some(reason) => Err(reason),
-        None => files
-            .read_to_string(&full)
-            .map_err(|error| format!("read of `{}` failed: {error}", full.display())),
-    };
-    match read_outcome {
-        Ok(content) => {
-            let value = json!({
-                "store": store_name,
-                "path": path,
-                "format": format,
-                "content": content,
-                "bytes": content.len(),
-                // G4 of spec/output-attribution-research-note.md: the identity
-                // of what this read OBSERVED. `file.write.completed` has always
-                // carried the same digest under the same key, and until now a
-                // read recorded only the bytes, so nothing could say which write
-                // produced what a reader saw. Same construction, so the two join
-                // — and it is the `FileContent` locator coordinate (§8.2), whose
-                // content half was otherwise unaddressable.
-                "content_hash": stable_hash_hex(&content),
-            });
-            kernel.settle_file_run(
-                EffectCompletion {
-                    instance_id,
-                    effect_id: &effect.effect_id,
-                    run_id: &run_id,
-                    provider: "files",
-                    worker_id: "whip-files",
-                    status: "completed",
-                    exit_code: Some(0),
-                    summary: Some(&format!(
-                        "read {} bytes from {}",
-                        content.len(),
-                        full.display()
-                    )),
-                    metadata_json: &json!({ "value": value }).to_string(),
-                    idempotency_key: Some(&terminal_key),
-                },
-                "file.read.completed",
-                &json!({
-                    "effect_id": effect.effect_id,
-                    "run_id": run_id,
-                    "status": "completed",
-                    "value": value,
+    let read_outcome =
+        match file_path_policy_error(path, store_name, &allow, "read").or_else(|| {
+            files
+                .path_policy_error(Path::new(root), Path::new(path), store_name, "read")
+                .map(|reason| {
+                    if format == "reference" {
+                        "file reference read refused by host path policy".to_owned()
+                    } else {
+                        reason
+                    }
                 })
-                .to_string(),
-                &fact_key,
-            )
-        }
+        }) {
+            Some(reason) => Err(reason),
+            None if format == "reference" => files
+                .read_content_reference(&full)
+                .map_err(|error| format!("file reference read failed: {:?}", error.kind()))
+                .and_then(|reference| {
+                    reference.validate().map_err(str::to_owned)?;
+                    Ok((
+                        json!({
+                            "store": store_name, "path": path, "format": format,
+                            "content_hash": reference.content_hash,
+                            "content_reference": reference,
+                        }),
+                        format!("read content reference from {}", full.display()),
+                    ))
+                }),
+            None => files
+                .read_to_string(&full)
+                .map_err(|error| format!("read of `{}` failed: {error}", full.display()))
+                .map(|content| {
+                    let summary = format!("read {} bytes from {}", content.len(), full.display());
+                    (
+                        json!({
+                            "store": store_name, "path": path, "format": format,
+                            "content": content, "bytes": content.len(),
+                            "content_hash": stable_hash_hex(&content),
+                        }),
+                        summary,
+                    )
+                }),
+        };
+    match read_outcome {
+        Ok((value, summary)) => kernel.settle_file_run(
+            EffectCompletion {
+                instance_id,
+                effect_id: &effect.effect_id,
+                run_id: &run_id,
+                provider: "files",
+                worker_id: "whip-files",
+                status: "completed",
+                exit_code: Some(0),
+                summary: Some(&summary),
+                metadata_json: &json!({ "value": value }).to_string(),
+                idempotency_key: Some(&terminal_key),
+            },
+            "file.read.completed",
+            &json!({
+                "effect_id": effect.effect_id,
+                "run_id": run_id,
+                "status": "completed",
+                "value": value,
+            })
+            .to_string(),
+            &fact_key,
+        ),
         Err(reason) => settle_failed_file_effect(
             kernel,
             instance_id,
@@ -606,6 +619,11 @@ pub fn run_file_effect_generic<S: RuntimeStore>(
             &fact_key,
         ),
     }
+}
+
+enum FileWriteContent {
+    Inline(String),
+    Reference(whipplescript_store::files::FileContentReference, usize),
 }
 
 /// Host-agnostic core (DR-0033 chunk 3): write/append a file through the
@@ -666,14 +684,64 @@ pub fn run_file_write_effect_generic<S: RuntimeStore>(
     )?;
     let mut operation_evidence = None;
     let allow = effect_allow_globs(&input);
-    let write_outcome: Result<String, String> = if let Some(reason) =
+    let write_outcome: Result<FileWriteContent, String> = if let Some(reason) =
         file_path_policy_error(path, store_name, &allow, "write").or_else(|| {
-            files.path_policy_error(Path::new(root), Path::new(path), store_name, "write")
+            files
+                .path_policy_error(Path::new(root), Path::new(path), store_name, "write")
+                .map(|reason| {
+                    if format == "reference" {
+                        "file reference write refused by host path policy".to_owned()
+                    } else {
+                        reason
+                    }
+                })
         }) {
         Err(reason)
     } else {
         let exists = files.exists(&full);
         write_mode_policy(&mode, path, exists).and_then(|()| {
+            if format == "reference" {
+                if mode == "append"
+                    || input.get("body").is_some()
+                    || input.get("body_expr").is_some()
+                {
+                    return Err(
+                        "file reference write refuses append and inline body fields".to_owned()
+                    );
+                }
+                let reference: whipplescript_store::files::FileContentReference =
+                    serde_json::from_value(input.get("body_ref").cloned().unwrap_or(Value::Null))
+                        .map_err(|_| {
+                        "file reference write requires an exact content reference".to_owned()
+                    })?;
+                reference.validate().map_err(str::to_owned)?;
+                return match files.write_content_reference(
+                    &full,
+                    &reference,
+                    whipplescript_store::files::FileWriteContext {
+                        instance_id,
+                        effect_id: &effect.effect_id,
+                        run_id: &run_id,
+                        started_event_id: &started.event_id,
+                    },
+                ) {
+                    Ok(accepted) => {
+                        operation_evidence = accepted.evidence;
+                        accepted.reference.validate().map_err(str::to_owned)?;
+                        Ok(FileWriteContent::Reference(
+                            accepted.reference,
+                            accepted.byte_len,
+                        ))
+                    }
+                    Err(failed) => {
+                        operation_evidence = failed.evidence;
+                        Err(format!(
+                            "file reference write failed: {:?}",
+                            failed.error.kind()
+                        ))
+                    }
+                };
+            }
             if let Some(parent) = full.parent() {
                 files
                     .create_dir_all(parent)
@@ -702,7 +770,7 @@ pub fn run_file_write_effect_generic<S: RuntimeStore>(
             match result {
                 Ok(accepted) => {
                     operation_evidence = accepted.evidence;
-                    Ok(accepted.content)
+                    Ok(FileWriteContent::Inline(accepted.content))
                 }
                 Err(failed) => {
                     operation_evidence = failed.evidence;
@@ -721,18 +789,19 @@ pub fn run_file_write_effect_generic<S: RuntimeStore>(
         }))
     }).transpose()?;
     match write_outcome {
-        Ok(body) => {
-            // Restorable-context RC-1: capture the written body content-addressed
-            // into the runtime store's file-history blob table, keyed by the SAME
-            // `stable_hash_hex` the `file.write.completed` fact records below. The
-            // live path->bytes store overwrites in place; this sidecar preserves
-            // the superseded version so a later restore slice can `get_content`
-            // the bytes back. Captured BEFORE the fact commits (and, natively, in
-            // the same SQLite as the fact), so no committed manifest hash is ever
-            // referenced without its bytes present (restorable-context INV-4). A
-            // capture failure aborts before the fact, never leaving a dangling
-            // hash. Identical bytes dedupe; an overwrite keeps both versions.
-            kernel.store().put_content(&body)?;
+        Ok(content) => {
+            let (byte_len, content_hash, reference) = match content {
+                FileWriteContent::Inline(body) => {
+                    // Legacy text history remains restorable in the runtime's
+                    // content store. Reference bodies stay in their host-bound
+                    // compartment and never cross this capture path.
+                    kernel.store().put_content(&body)?;
+                    (body.len(), stable_hash_hex(&body), None)
+                }
+                FileWriteContent::Reference(reference, byte_len) => {
+                    (byte_len, reference.content_hash.clone(), Some(reference))
+                }
+            };
             let mut value = json!({
                 "store": store_name,
                 "path": path,
@@ -742,9 +811,12 @@ pub fn run_file_write_effect_generic<S: RuntimeStore>(
                 "full_path": full.display().to_string(),
                 "format": format,
                 "mode": mode,
-                "bytes": body.len(),
-                "content_hash": stable_hash_hex(&body),
+                "bytes": byte_len,
+                "content_hash": content_hash,
             });
+            if let Some(reference) = reference {
+                value["content_reference"] = json!(reference);
+            }
             if let Some(evidence) = &evidence {
                 value["receipt"] = evidence.clone();
             }
@@ -757,7 +829,7 @@ pub fn run_file_write_effect_generic<S: RuntimeStore>(
                     worker_id: "whip-files",
                     status: "completed",
                     exit_code: Some(0),
-                    summary: Some(&format!("wrote {} bytes to {}", body.len(), full.display())),
+                    summary: Some(&format!("wrote {} bytes to {}", byte_len, full.display())),
                     metadata_json: &json!({ "value": value }).to_string(),
                     idempotency_key: Some(&terminal_key),
                 },
@@ -6174,4 +6246,17 @@ mod selective_door_tests {
         .expect_err("broken store fails transport");
         assert!(failed.starts_with("transport failed:"), "{failed}");
     }
+}
+
+#[cfg(all(test, feature = "native"))]
+#[path = "effect_handlers/reference_conformance.rs"]
+mod reference_conformance;
+
+#[cfg(all(test, feature = "native"))]
+#[test]
+fn reference_codec_refusals_and_outcomes() {
+    reference_conformance::check(|| {
+        whipplescript_store::native_stores::NativeStores::open_in_memory()
+            .expect("native reference fixture")
+    });
 }

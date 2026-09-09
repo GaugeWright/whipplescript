@@ -5020,8 +5020,8 @@ rule pick
 }
 
 #[test]
-fn read_accepts_text_and_markdown_body_codecs() {
-    for format in ["text", "markdown"] {
+fn read_accepts_body_and_reference_codecs() {
+    for format in ["text", "markdown", "reference"] {
         let compiled = compile_program(&read_codec_program(format));
         assert_eq!(
             compiled.diagnostics,
@@ -5083,8 +5083,8 @@ rule pick
 }
 
 #[test]
-fn write_accepts_text_and_markdown_with_explicit_mode() {
-    for format in ["text", "markdown"] {
+fn write_accepts_body_and_reference_codecs_with_explicit_mode() {
+    for format in ["text", "markdown", "reference"] {
         let compiled = compile_program(&write_program(format, "mode create"));
         assert_eq!(
             compiled.diagnostics,

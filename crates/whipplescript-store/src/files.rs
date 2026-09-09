@@ -15,6 +15,43 @@
 use std::io;
 use std::path::{Path, PathBuf};
 
+/// Exact content identity within a host-verified compartment. This descriptor
+/// carries no bytes and grants no access to a store merely by naming a hash.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FileContentReference {
+    pub content_hash: String,
+    pub label_ref: String,
+}
+
+impl FileContentReference {
+    /// Validate descriptor syntax only. Current compartment access remains a
+    /// host obligation; diagnostics must never echo untrusted descriptor data.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.content_hash.len() != 32
+            || !self
+                .content_hash
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
+            return Err("file content reference requires a canonical content-store hash");
+        }
+        if self.label_ref.trim().is_empty() {
+            return Err("file content reference requires a nonblank label");
+        }
+        Ok(())
+    }
+}
+
+/// The exact result accepted by a reference-based write. Structured operation
+/// evidence is retained separately under its own label, as for text writes.
+#[derive(Debug)]
+pub struct FileReferenceWriteAccepted {
+    pub reference: FileContentReference,
+    pub byte_len: usize,
+    pub evidence: Option<FileWriteEvidence>,
+}
+
 /// Durable dispatch coordinates supplied by the governed handler after its
 /// run-start commit. These locate evidence; possession is not authorization.
 #[derive(Clone, Copy, Debug)]
@@ -59,6 +96,31 @@ impl From<io::Error> for FileWriteFailure {
 /// The byte-I/O operations a file effect performs, abstracted over the physical
 /// backing. Object-safe so a durable-object backend can be used as `&dyn`.
 pub trait FileStore {
+    /// Resolve an admitted immutable input without passing its body through an
+    /// effect value. Unsupported stores must not fall back to an inline read.
+    fn read_content_reference(&self, _path: &Path) -> io::Result<FileContentReference> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "file store does not support content-reference reads",
+        ))
+    }
+
+    /// Apply an exact host-bound reference using the ordinary governed write
+    /// coordinates. Possession of this descriptor is not permission to resolve
+    /// it, and an unsupported store cannot substitute an ambient CAS lookup.
+    fn write_content_reference(
+        &self,
+        _path: &Path,
+        _reference: &FileContentReference,
+        _context: FileWriteContext<'_>,
+    ) -> Result<FileReferenceWriteAccepted, FileWriteFailure> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "file store does not support content-reference writes",
+        )
+        .into())
+    }
+
     /// Read the whole file at `path` as UTF-8 text.
     fn read_to_string(&self, path: &Path) -> io::Result<String>;
 
@@ -210,6 +272,79 @@ fn nearest_existing_ancestor(mut path: PathBuf) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unimplemented_content_references_refuse_without_text_fallback() {
+        let files: &dyn FileStore = &NativeFileStore;
+        let reference = FileContentReference {
+            content_hash: crate::stable_hash_hex("protected"),
+            label_ref: "private".into(),
+        };
+        let path = Path::new("/not-an-admitted-reference");
+        let read = files.read_content_reference(path).unwrap_err();
+        assert_eq!(read.kind(), io::ErrorKind::Unsupported);
+        assert_eq!(
+            read.to_string(),
+            "file store does not support content-reference reads"
+        );
+        let write = files
+            .write_content_reference(
+                path,
+                &reference,
+                FileWriteContext {
+                    instance_id: "instance",
+                    effect_id: "effect",
+                    run_id: "attempt",
+                    started_event_id: "start",
+                },
+            )
+            .unwrap_err()
+            .error;
+        assert_eq!(write.kind(), io::ErrorKind::Unsupported);
+        assert_eq!(
+            write.to_string(),
+            "file store does not support content-reference writes"
+        );
+        let mut value = serde_json::to_value(&reference).expect("serialize");
+        value["body"] = serde_json::json!("protected");
+        assert!(serde_json::from_value::<FileContentReference>(value).is_err());
+    }
+
+    #[test]
+    fn content_reference_requires_canonical_hash_and_nonblank_label() {
+        let reference = FileContentReference {
+            content_hash: crate::stable_hash_hex("protected"),
+            label_ref: "input-private".into(),
+        };
+        assert_eq!(reference.validate(), Ok(()));
+        for hash in [
+            "".to_owned(),
+            "a".repeat(31),
+            "a".repeat(33),
+            "G".repeat(32),
+            "A".repeat(32),
+            "é".repeat(16),
+        ] {
+            assert_eq!(
+                FileContentReference {
+                    content_hash: hash,
+                    ..reference.clone()
+                }
+                .validate(),
+                Err("file content reference requires a canonical content-store hash")
+            );
+        }
+        for label in ["", " ", "\t\n", "\u{2003}"] {
+            assert_eq!(
+                FileContentReference {
+                    label_ref: label.into(),
+                    ..reference.clone()
+                }
+                .validate(),
+                Err("file content reference requires a nonblank label")
+            );
+        }
+    }
 
     /// Drive the native store through `&dyn FileStore`: proves object-safety (a
     /// boxed durable-object backend is legal) and that write / read / append /

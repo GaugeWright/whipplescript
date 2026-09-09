@@ -14,7 +14,8 @@ use serde::{Deserialize, Serialize};
 use crate::branches::Branches;
 use crate::content::ContentBlobs;
 use crate::files::{
-    FileStore, FileWriteAccepted, FileWriteContext, FileWriteEvidence, FileWriteFailure,
+    FileContentReference, FileReferenceWriteAccepted, FileStore, FileWriteAccepted,
+    FileWriteContext, FileWriteEvidence, FileWriteFailure,
 };
 use crate::text_merge::MergePiece;
 use crate::vcs::{SaveWithBaseOutcome, WorkspaceVcs};
@@ -32,6 +33,7 @@ pub struct VersionedSaveBinding {
     pub base_cut_id: String,
     pub draft: String,
     pub draft_hash: String,
+    pub input_label: String,
     pub executing_principal: String,
     pub evidence_label: String,
     pub recorded_at: String,
@@ -123,6 +125,7 @@ impl<B: Branches, C: ContentBlobs> VersionedSaveFileStore<B, C> {
             &binding.branch_id,
             &binding.base_cut_id,
             &binding.executing_principal,
+            &binding.input_label,
             &binding.evidence_label,
             &binding.recorded_at,
         ]
@@ -176,6 +179,38 @@ impl<B: Branches, C: ContentBlobs> VersionedSaveFileStore<B, C> {
 }
 
 impl<B: Branches, C: ContentBlobs> FileStore for VersionedSaveFileStore<B, C> {
+    fn read_content_reference(&self, path: &Path) -> io::Result<FileContentReference> {
+        if path != Path::new(SAVE_INPUT_PATH) {
+            return Err(denied("save reference reads only its immutable input"));
+        }
+        Ok(FileContentReference {
+            content_hash: self.binding.draft_hash.clone(),
+            label_ref: self.binding.input_label.clone(),
+        })
+    }
+
+    fn write_content_reference(
+        &self,
+        path: &Path,
+        reference: &FileContentReference,
+        context: FileWriteContext<'_>,
+    ) -> Result<FileReferenceWriteAccepted, FileWriteFailure> {
+        if reference.content_hash != self.binding.draft_hash
+            || reference.label_ref != self.binding.input_label
+        {
+            return Err(denied("save reference differs from its admitted input").into());
+        }
+        let accepted = self.write_text_with_context(path, &self.binding.draft, context)?;
+        Ok(FileReferenceWriteAccepted {
+            reference: FileContentReference {
+                content_hash: crate::stable_hash_hex(&accepted.content),
+                label_ref: self.binding.evidence_label.clone(),
+            },
+            byte_len: accepted.content.len(),
+            evidence: accepted.evidence,
+        })
+    }
+
     fn read_to_string(&self, path: &Path) -> io::Result<String> {
         if path != Path::new(SAVE_INPUT_PATH) {
             return Err(denied("save binding reads only its immutable input"));
@@ -337,6 +372,7 @@ pub mod conformance {
             base_cut_id: "base".into(),
             draft: draft.into(),
             draft_hash: crate::stable_hash_hex(draft),
+            input_label: "input-private".into(),
             executing_principal: "worker:verified".into(),
             evidence_label: "workspace-private".into(),
             recorded_at: "2026-09-06T00:00:00Z".into(),
@@ -369,7 +405,121 @@ pub mod conformance {
         receipt
     }
 
+    fn check_content_references<B: Branches, C: ContentBlobs>(
+        make: &mut impl FnMut() -> WorkspaceVcs<B, C>,
+    ) {
+        for mode in ["written", "merged", "conflicted"] {
+            let mut workspace = make();
+            seed(&mut workspace);
+            if mode != "written" {
+                workspace
+                    .write(
+                        MAINLINE_BRANCH_ID,
+                        "docs/test.txt",
+                        Some(HEAD),
+                        "head",
+                        "t1",
+                    )
+                    .expect("advance");
+            }
+            let draft = if mode == "conflicted" {
+                "DRAFT one two three four five six seven eight nine end\n"
+            } else {
+                DRAFT
+            };
+            let files = VersionedSaveFileStore::new(workspace, binding(draft)).expect("binding");
+            let input = files
+                .read_content_reference(Path::new(SAVE_INPUT_PATH))
+                .expect("reference");
+            assert_eq!(input.content_hash, crate::stable_hash_hex(draft));
+            assert_eq!(input.label_ref, "input-private");
+            assert!(!serde_json::to_string(&input)
+                .expect("serialize")
+                .contains(draft));
+            assert!(files
+                .read_content_reference(Path::new("/unadmitted"))
+                .is_err());
+            let result =
+                files.write_content_reference(Path::new(SAVE_OUTPUT_PATH), &input, context());
+            if mode == "conflicted" {
+                let failed = result.expect_err("conflict");
+                assert!(matches!(
+                    receipt(failed.evidence.expect("evidence")).result,
+                    SaveResult::Conflicted { .. }
+                ));
+                assert!(files
+                    .workspace
+                    .borrow()
+                    .get_cut(&save_cut_id(context().instance_id, context().effect_id))
+                    .expect("query")
+                    .is_none());
+            } else {
+                let accepted = result.expect("save reference");
+                let expected = if mode == "written" { DRAFT } else { MERGED };
+                assert_eq!(
+                    accepted.reference.content_hash,
+                    crate::stable_hash_hex(expected)
+                );
+                assert_eq!(accepted.reference.label_ref, "workspace-private");
+                assert_eq!(accepted.byte_len, expected.len());
+                let retained = receipt(accepted.evidence.expect("receipt"));
+                assert!(matches!(
+                    retained.result,
+                    SaveResult::Written { .. } | SaveResult::Merged { .. }
+                ));
+                assert_eq!(
+                    files
+                        .workspace
+                        .borrow()
+                        .read(MAINLINE_BRANCH_ID, "docs/test.txt")
+                        .expect("read")
+                        .as_deref(),
+                    Some(expected)
+                );
+                assert!(files
+                    .write_content_reference(Path::new(SAVE_OUTPUT_PATH), &input, context())
+                    .is_err());
+            }
+        }
+        for changed in ["hash", "label", "path", "context"] {
+            let mut workspace = make();
+            seed(&mut workspace);
+            let files = VersionedSaveFileStore::new(workspace, binding(DRAFT)).expect("binding");
+            let mut input = files
+                .read_content_reference(Path::new(SAVE_INPUT_PATH))
+                .expect("reference");
+            let mut path = SAVE_OUTPUT_PATH;
+            let mut attempt = context();
+            match changed {
+                "hash" => input.content_hash = crate::stable_hash_hex("foreign input"),
+                "label" => input.label_ref = "workspace-private".into(),
+                "path" => path = "/unadmitted",
+                "context" => attempt.started_event_id = "",
+                _ => unreachable!(),
+            }
+            assert!(
+                files
+                    .write_content_reference(Path::new(path), &input, attempt)
+                    .is_err(),
+                "{changed}"
+            );
+            let workspace = files.workspace.borrow();
+            assert_eq!(
+                workspace
+                    .read(MAINLINE_BRANCH_ID, "docs/test.txt")
+                    .expect("read")
+                    .as_deref(),
+                Some(BASE)
+            );
+            assert!(workspace
+                .get_cut(&save_cut_id(context().instance_id, context().effect_id))
+                .expect("query")
+                .is_none());
+        }
+    }
+
     pub fn check<B: Branches, C: ContentBlobs>(mut make: impl FnMut() -> WorkspaceVcs<B, C>) {
+        check_content_references(&mut make);
         assert_ne!(save_cut_id("a:b", "c"), save_cut_id("a", "b:c"));
         assert_ne!(save_cut_id("a", "b"), save_cut_id("b", "a"));
         for mode in ["written", "merged", "conflicted"] {
@@ -584,12 +734,21 @@ pub mod conformance {
                 .is_none());
         }
 
-        for field in ["branch", "base", "principal", "label", "time", "hash"] {
+        for field in [
+            "branch",
+            "base",
+            "principal",
+            "input-label",
+            "label",
+            "time",
+            "hash",
+        ] {
             let mut request = binding(DRAFT);
             match field {
                 "branch" => request.branch_id.clear(),
                 "base" => request.base_cut_id.clear(),
                 "principal" => request.executing_principal.clear(),
+                "input-label" => request.input_label.clear(),
                 "label" => request.evidence_label.clear(),
                 "time" => request.recorded_at.clear(),
                 "hash" => request.draft_hash = "wrong".into(),

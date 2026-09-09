@@ -4451,21 +4451,35 @@ pub fn parsed_effect_input_json(
             // rendered as its JSON text.
             let body_value =
                 parse_field_value_scoped(&body_expr, context, live_facts, live_effects, live_ir);
-            let body = match &body_value {
-                Value::String(text) => text.clone(),
-                other => other.to_string(),
-            };
-            json!({
+            let mut input = json!({
                 "format": format,
                 "store": store,
                 "path": path,
                 "root": root,
                 "allow": allow,
                 "mode": mode,
-                "body": body,
-                "body_expr": body_expr,
                 "rule": rule.name,
-            })
+            });
+            if format == "reference" {
+                match serde_json::from_value::<whipplescript_store::files::FileContentReference>(
+                    body_value,
+                ) {
+                    Ok(reference) => match reference.validate() {
+                        Ok(()) => input["body_ref"] = json!(reference),
+                        Err(reason) => errors.push(reason.to_owned()),
+                    },
+                    Err(_) => errors.push(
+                        "file reference write requires an exact content reference".to_owned(),
+                    ),
+                }
+            } else {
+                input["body"] = match body_value {
+                    Value::String(text) => Value::String(text),
+                    other => Value::String(other.to_string()),
+                };
+                input["body_expr"] = Value::String(body_expr);
+            }
+            input
         }
         "file.import" => {
             let format = effect
@@ -7223,6 +7237,69 @@ mod ir_reference_admission_tests {
             None,
         )
         .errors
+    }
+
+    #[test]
+    fn file_reference_lowering_never_serializes_an_invalid_body_or_expression() {
+        let ir = ir_of(
+            r#"use std.files
+workflow ReferenceWrite
+output result Done
+class Done { content_hash string }
+class Draft { content_hash string label_ref string }
+file store target { root "/action/output" allow write ["target"] }
+rule save when Draft as draft => {
+    write reference to target at "target" { body draft mode upsert } as written
+    after written succeeds as saved { complete result { content_hash saved.content_hash } }
+}
+"#,
+        );
+        let valid = serde_json::json!({
+            "content_hash": whipplescript_store::stable_hash_hex("protected draft"),
+            "label_ref": "input-private",
+        });
+        for case in ["valid", "hash", "label", "body", "string"] {
+            let mut value = valid.clone();
+            match case {
+                "hash" => value["content_hash"] = serde_json::json!("protected draft"),
+                "label" => value["label_ref"] = serde_json::json!(" "),
+                "body" => value["body"] = serde_json::json!("protected draft"),
+                "string" => value = serde_json::json!("protected draft"),
+                _ => {}
+            }
+            let facts = vec![fact("Draft", "draft", &value.to_string())];
+            let rule = &ir.rules[0];
+            let ready = ready_contexts(&ir, rule, &facts, &[], None);
+            let lowered = lower_rule(
+                "ins_test",
+                "ver_test",
+                "0",
+                "fixture",
+                &ir,
+                rule,
+                &ready.contexts[0],
+                &facts,
+                &[],
+                None,
+            );
+            assert_eq!(
+                lowered.errors.is_empty(),
+                case == "valid",
+                "{case}: {:?}",
+                lowered.errors
+            );
+            assert!(!lowered.errors.join(" ").contains("protected draft"));
+            let input: serde_json::Value =
+                serde_json::from_str(&lowered.effects[0].input_json).expect("lowered file input");
+            assert!(input.get("body").is_none());
+            assert!(input.get("body_expr").is_none());
+            assert!(!input.to_string().contains("protected draft"));
+            if case == "valid" {
+                assert_eq!(input["body_ref"], valid);
+            } else {
+                assert!(input.get("body_ref").is_none());
+            }
+        }
     }
 
     fn assert_only_after_deleting(

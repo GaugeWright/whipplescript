@@ -4,7 +4,10 @@
 use super::*;
 use whipplescript_store::branches::{BranchStore, Branches, MAINLINE_BRANCH_ID};
 use whipplescript_store::content::{ContentBlobs, ContentStore};
-use whipplescript_store::files::{FileWriteAccepted, FileWriteContext, FileWriteFailure};
+use whipplescript_store::files::{
+    FileContentReference, FileReferenceWriteAccepted, FileWriteAccepted, FileWriteContext,
+    FileWriteFailure,
+};
 use whipplescript_store::vcs::{NativeWorkspaceVcs, WorkspaceVcs};
 use whipplescript_store::vcs_file_save::*;
 
@@ -15,6 +18,26 @@ struct SaveFiles<B: Branches, C: ContentBlobs> {
     calls: Cell<usize>,
 }
 impl<B: Branches, C: ContentBlobs> FileStore for SaveFiles<B, C> {
+    fn read_content_reference(&self, path: &Path) -> io::Result<FileContentReference> {
+        self.inner.read_content_reference(path)
+    }
+    fn write_content_reference(
+        &self,
+        path: &Path,
+        reference: &FileContentReference,
+        context: FileWriteContext<'_>,
+    ) -> Result<FileReferenceWriteAccepted, FileWriteFailure> {
+        self.calls.set(self.calls.get() + 1);
+        let result = self.inner.write_content_reference(path, reference, context);
+        assert!(
+            !self.interrupted,
+            "interrupted after versioned target application"
+        );
+        if self.failed_after_apply && result.is_ok() {
+            return Err(io::Error::other("lost success after target application").into());
+        }
+        result
+    }
     fn read_to_string(&self, path: &Path) -> io::Result<String> {
         self.inner.read_to_string(path)
     }
@@ -86,6 +109,7 @@ impl ActionExecutionVerifier for BoundAuthority<'_> {
                 })
             || target.label_ref != self.binding.evidence_label
             || original.inputs["content"].version_ref != self.binding.draft_hash
+            || original.inputs["content"].label_ref != self.binding.input_label
             || request.provenance.executor != self.binding.executing_principal
             || input["root"] != expected_path.0
             || input["path"] != expected_path.1
@@ -97,12 +121,37 @@ impl ActionExecutionVerifier for BoundAuthority<'_> {
     }
 }
 
+fn refuse_legacy_host_restore<S: RuntimeStore + LogAppend>(store: &mut S, id: &str) {
+    let head = store.chain_head(id).expect("host action head");
+    assert!(store
+        .capture_checkpoint(whipplescript_store::CheckpointCapture {
+            instance_id: id,
+            cut_id: "legacy-host",
+            transcript_ref: None,
+            idempotency_key: Some("legacy-host"),
+        })
+        .is_err());
+    // An unsupported authority domain is refused before a bare cut/hash lookup.
+    assert!(store.plan_restore(id, "legacy-host").is_err());
+    assert!(
+        store
+            .commit_restore(id, 0, "legacy-host", &head.digest, Some("legacy-host"))
+            .is_err(),
+        "a restore marker must not abandon admitted target effects"
+    );
+    assert_eq!(
+        store.chain_head(id).expect("unchanged host action head"),
+        head
+    );
+}
+
 fn run<S, B, C>(
     store: S,
     mut target: WorkspaceVcs<B, C>,
     mut observe: WorkspaceVcs<B, C>,
     actor: &str,
     mode: &str,
+    codec: &str,
 ) where
     S: RuntimeStore + LogAppend + Coordination + WorkItems + FrontierRead,
     B: Branches,
@@ -136,12 +185,21 @@ fn run<S, B, C>(
         base_cut_id: "base".into(),
         draft: BODY.into(),
         draft_hash: whipplescript_store::stable_hash_hex(BODY),
+        input_label: "input-private".into(),
         executing_principal: actor.into(),
         evidence_label: "private".into(),
         recorded_at: "2026-09-06T00:00:00Z".into(),
     };
+    let source = if codec == "reference" {
+        SOURCE
+            .replace("read text", "read reference")
+            .replace("write text", "write reference")
+            .replace("body draft.content", "body draft.content_reference")
+    } else {
+        SOURCE.to_owned()
+    };
     let action =
-        CompiledHostAction::compile("file.save", SOURCE, None).expect("compile ordinary workflow");
+        CompiledHostAction::compile("file.save", &source, None).expect("compile ordinary workflow");
     let mut facade =
         GovernedHostFacade::from_verified_store(store, 7, envelope(7)).expect("facade");
     let command = HostActionCommand {
@@ -165,7 +223,7 @@ fn run<S, B, C>(
             ActionInput {
                 handle: "admitted_input".into(),
                 version_ref: binding.draft_hash.clone(),
-                label_ref: "private".into(),
+                label_ref: binding.input_label.clone(),
             },
         )]),
         resources: BTreeMap::from([(
@@ -192,7 +250,8 @@ fn run<S, B, C>(
             b"admission",
         )
         .expect("admit save");
-    let scenario = format!("{actor}/{mode}");
+    refuse_legacy_host_restore(facade.kernel_mut().store_mut(), &admission.instance_ref);
+    let scenario = format!("{actor}/{mode}/{codec}");
     host_action_contract_reports::record::<S, _>(&scenario, "HostActionCommand", &command);
     host_action_contract_reports::record::<S, _>(&scenario, "ActionAdmissionReceipt", &admission);
     let files = SaveFiles {
@@ -252,6 +311,13 @@ fn run<S, B, C>(
                 "authority must bind the actual target descriptor"
             );
             if effect.kind == "file.write" {
+                if codec == "reference" {
+                    let input: Value = serde_json::from_str(&effect.input_json).expect("input");
+                    assert_eq!(input["body_ref"]["content_hash"], binding.draft_hash);
+                    assert_eq!(input["body_ref"]["label_ref"], binding.input_label);
+                    assert!(input.get("body").is_none());
+                    assert!(input.get("body_expr").is_none());
+                }
                 written_request = Some(request.clone());
             }
             host_action_contract_reports::record::<S, _>(
@@ -278,7 +344,12 @@ fn run<S, B, C>(
                 .expect("execute authorized effect");
         }
     }
-    assert_eq!(files.calls.get(), 1);
+    assert_eq!(
+        files.calls.get(),
+        1,
+        "{scenario}: {:?}",
+        facade.kernel().store().list_events(&admission.instance_ref)
+    );
     let request = written_request.expect("write dispatched");
     let cut_id = save_cut_id(&admission.instance_ref, &request.effect_id);
     let cut = observe.get_cut(&cut_id).expect("independent target query");
@@ -286,11 +357,47 @@ fn run<S, B, C>(
         serde_json::from_str::<SaveAttempt>(cut.intent.as_deref().expect("committed attempt"))
             .expect("attempt")
     });
+    refuse_legacy_host_restore(facade.kernel_mut().store_mut(), &admission.instance_ref);
     let events = facade
         .kernel()
         .store()
         .list_events(&admission.instance_ref)
         .expect("events");
+    if codec == "reference" {
+        for event in &events {
+            assert!(
+                !event.payload_json.contains(BODY),
+                "protected draft in {}",
+                event.event_type
+            );
+            assert!(
+                !event.payload_json.contains("competing"),
+                "protected conflict body in {}",
+                event.event_type
+            );
+        }
+        assert!(
+            facade
+                .kernel()
+                .store()
+                .get_content(&binding.draft_hash)
+                .expect("runtime body query")
+                .is_none(),
+            "reference saves must not copy the body into runtime content storage"
+        );
+        let read = events
+            .iter()
+            .find(|e| {
+                e.event_type == "effect.terminal" && e.payload_json.contains("content_reference")
+            })
+            .expect("reference read terminal");
+        let read: Value = serde_json::from_str(&read.payload_json).expect("terminal");
+        assert_eq!(
+            read["metadata"]["value"]["content_reference"]["label_ref"],
+            "input-private"
+        );
+        assert!(read["metadata"]["value"].get("content").is_none());
+    }
     let attempts = whipplescript_store::effect_recovery::fold_attempts(
         &admission.instance_ref,
         &request.effect_id,
@@ -475,39 +582,44 @@ fn run<S, B, C>(
 
 #[test]
 fn admitted_versioned_save_survives_target_commit_and_retains_conflicts_on_both_hosts() {
-    for actor in ["person:one", "agent:one"] {
-        for mode in ["saved", "conflict", "interrupted", "failed-after-apply"] {
-            let dir = std::env::temp_dir().join(format!(
-                "whip-admitted-vcs-{}-{}-{mode}",
-                std::process::id(),
-                actor.replace(':', "-")
-            ));
-            std::fs::create_dir_all(&dir).expect("fixture directory");
-            let make = || {
-                NativeWorkspaceVcs::from_parts(
-                    BranchStore::open(dir.join("branches.sqlite")).expect("branches"),
-                    ContentStore::open(dir.join("content.sqlite")).expect("content"),
-                )
-            };
-            run(
-                NativeStores::open_in_memory().expect("runtime"),
-                make(),
-                make(),
-                actor,
-                mode,
-            );
-            std::fs::remove_dir_all(&dir).expect("clean fixture");
-            let sql = RusqliteDoSql::with_runtime_schema();
-            let make = || {
-                whipplescript_host_do::do_branches::compose_vcs_shared(&sql).expect("hosted target")
-            };
-            run(
-                DoSqliteStore::new(RusqliteDoSql::with_runtime_schema()),
-                make(),
-                make(),
-                actor,
-                mode,
-            );
+    for codec in ["text", "reference"] {
+        for actor in ["person:one", "agent:one"] {
+            for mode in ["saved", "conflict", "interrupted", "failed-after-apply"] {
+                let dir = std::env::temp_dir().join(format!(
+                    "whip-admitted-vcs-{}-{}-{mode}-{codec}",
+                    std::process::id(),
+                    actor.replace(':', "-")
+                ));
+                std::fs::create_dir_all(&dir).expect("fixture directory");
+                let make = || {
+                    NativeWorkspaceVcs::from_parts(
+                        BranchStore::open(dir.join("branches.sqlite")).expect("branches"),
+                        ContentStore::open(dir.join("content.sqlite")).expect("content"),
+                    )
+                };
+                run(
+                    NativeStores::open_in_memory().expect("runtime"),
+                    make(),
+                    make(),
+                    actor,
+                    mode,
+                    codec,
+                );
+                std::fs::remove_dir_all(&dir).expect("clean fixture");
+                let sql = RusqliteDoSql::with_runtime_schema();
+                let make = || {
+                    whipplescript_host_do::do_branches::compose_vcs_shared(&sql)
+                        .expect("hosted target")
+                };
+                run(
+                    DoSqliteStore::new(RusqliteDoSql::with_runtime_schema()),
+                    make(),
+                    make(),
+                    actor,
+                    mode,
+                    codec,
+                );
+            }
         }
     }
 }

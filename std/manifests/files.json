@@ -104,11 +104,11 @@
   "capabilities": [
     {
       "id": "file.read",
-      "description": "Read a text/markdown body from a declared file store, path-policy checked."
+      "description": "Read a text/markdown body or a host-bound content reference from a declared file store, path-policy checked."
     },
     {
       "id": "file.write",
-      "description": "Write a text/markdown body into a declared file store with an explicit mode."
+      "description": "Write a text/markdown body or a host-bound content reference into a declared file store with an explicit mode."
     },
     {
       "id": "file.import",
