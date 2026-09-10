@@ -17,6 +17,7 @@ fn checks_all_example_workflows() {
     let stores = temp_store_path();
     let examples = [
         "minimal-noop.whip",
+        "gaugedesk-basics.whip",
         "ralph.whip",
         "queue-worker-with-review.whip",
         "queue-gated-smoke.whip",
@@ -24839,4 +24840,50 @@ fn a_carry_that_lands_on_no_rule_is_refused() {
             "`--carry {carry}` said: {stderr}"
         );
     }
+}
+
+#[test]
+fn basics_runs_through_real_cli_worker_restarts_without_a_model() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let stores = temp_store_path();
+    let source = example_path("gaugedesk-basics.whip");
+    let source = source.to_str().expect("source path");
+    let started = run_json_isolated(
+        bin,
+        &stores,
+        &[
+            "--json",
+            "run",
+            source,
+            "--input",
+            r#"{"learner":{"authority":"person:learner"}}"#,
+            "--until",
+            "idle",
+        ],
+    );
+    let id = started["instance_id"].as_str().expect("instance identity");
+    for step in 0..4 {
+        let items = run_json_isolated(
+            bin,
+            &stores,
+            &["--json", "issue", "list", "--tracker", "tutorials"],
+        );
+        let items = items.as_array().expect("issue list");
+        assert_eq!(items.len(), step + 1);
+        let open: Vec<_> = items
+            .iter()
+            .filter(|item| item["status"] == "open")
+            .collect();
+        assert_eq!(open.len(), 1);
+        assert_eq!(open[0]["assigned_to"], "person:learner");
+        let issue = open[0]["id"].as_str().expect("issue id");
+        run_json_isolated(bin, &stores, &["--json", "issue", "finish", issue]);
+        // Every pass is a new process using only retained source and stores.
+        for _ in 0..3 {
+            run_json_isolated(bin, &stores, &["--json", "step", id, "--program", source]);
+            run_json_isolated(bin, &stores, &["--json", "worker", id, "--program", source]);
+        }
+    }
+    let status = run_json_isolated(bin, &stores, &["--json", "status", id]);
+    assert_eq!(status["instance"]["status"], "completed", "{status}");
 }

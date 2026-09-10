@@ -1,0 +1,46 @@
+# An ordinary tutorial in the learner's workspace. Every closure is explicitly
+# self-reported by the learner. `then`'s failure net terminates the run on a
+# filing failure, cancellation or expired wait instead of advancing the lesson.
+use std.tracker
+
+workflow Basics(learner: Learner) -> bool
+
+class Learner {
+  authority string
+}
+
+tracker tutorials
+
+rule begin
+  when Learner as learner
+=> {
+  then chat <- file issue into tutorials {
+    title "Create a chat in Personal"
+    body "Open Personal and create a new chat, then mark this task complete."
+    assigned_to learner.authority
+  }
+  then chat_done <- call tracker.wait_closed for chat timeout 30d
+
+  then assistant <- file issue into tutorials {
+    title "Make your personal assistant"
+    body "Create an Agent in your Library, name it, and describe how it should help you. Save it, then mark this task complete."
+    assigned_to learner.authority
+  }
+  then assistant_done <- call tracker.wait_closed for assistant timeout 30d
+
+  then project <- file issue into tutorials {
+    title "Create a project"
+    body "Create and name a project for something you are working on, then mark this task complete."
+    assigned_to learner.authority
+  }
+  then project_done <- call tracker.wait_closed for project timeout 30d
+
+  then invitation <- file issue into tutorials {
+    title "Invite a colleague"
+    body "Create an invitation to your new project and share its link with a colleague, then mark this task complete. You do not need to wait for acceptance."
+    assigned_to learner.authority
+  }
+  then invitation_done <- call tracker.wait_closed for invitation timeout 30d
+
+  complete result true
+}

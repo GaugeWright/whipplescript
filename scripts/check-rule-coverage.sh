@@ -20,9 +20,9 @@ run_whip() {
   $WHIP "$@"
 }
 
-# Examples that a no-`--input`, no-`--root`, single-workflow fixture run cannot
-# drive. Every one is exercised elsewhere; everything else must reach full rule
-# coverage here.
+# Examples that the fixed inputs and single-workflow fixture run below cannot
+# drive. Every exclusion states its other evidence or the remaining gap.
+# Everything else must reach rule coverage here.
 #
 # ONE NAME, ONE REASON, ONE LINE. This was a single shell word matched by
 # substring, with the reasons grouped in a comment above it — and the grouping
@@ -36,6 +36,7 @@ run_whip() {
 # A reason per entry is what makes that visible: a claim attached to one name
 # can be checked against that name.
 SKIP_TABLE="
+gaugedesk-basics|human closure round trips: all four tasks run in control_plane::basics_runs_through_real_cli_worker_restarts_without_a_model, kernel/tests/tracker_tutorial.rs, and the DO/workerd tutorial tests
 terminal-output-union|@service: its only rule fires on a WorkItem no table seeds and no tracker projects
 clock-source|@service: needs a \`source clock\` tick
 ingress-file-source|@service: needs a \`source file\` feed
@@ -108,8 +109,16 @@ for workflow in "$ROOT"/examples/*.whip; do
     run_whip issue new --tracker "$tracker_queue" --title "Coverage item" --body "seeded" >/dev/null
   fi
 
+  # Caller-shaped examples need their declared input to enter any rule. Keep
+  # the finite budget small while exercising both the loop and its terminal.
+  input_args=()
+  case "$name" in
+    measured-budget-from-input) input_args=(--input '{"request":{"budget":2}}') ;;
+    tracker-assigned-sequence) input_args=(--input '{"learner":{"authority":"person:coverage"}}') ;;
+  esac
+
   report="$WORK_DIR/$name.json"
-  if ! run_whip --store "$store" --json run "$workflow" --provider fixture --until idle >"$report" 2>"$WORK_DIR/$name.err"; then
+  if ! run_whip --store "$store" --json run "$workflow" "${input_args[@]}" --provider fixture --until idle >"$report" 2>"$WORK_DIR/$name.err"; then
     echo "FAIL (run errored): $name"
     sed -n 1p "$WORK_DIR/$name.err"
     failures=1

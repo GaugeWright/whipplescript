@@ -19999,6 +19999,9 @@ impl InstanceDriver for NativeInstanceDriver<'_> {
             "event.emit" => run_event_effect_generic(kernel, id, effect, &config)?,
             // Local mailbox is a native-only, file-based provider; the DO/sans-IO
             // InstanceStepMachine path stays on the fixture provider (out of scope).
+            "capability.call" if whipplescript_kernel::tracker_wait::is_tracker_wait(effect) => {
+                whipplescript_kernel::tracker_wait::run(kernel, id, effect, &config)?
+            }
             "capability.call" => run_capability_effect_generic(
                 kernel,
                 id,
@@ -20448,7 +20451,17 @@ fn run_worker_once(store_path: &Path, options: &WorkerOptions) -> Result<WorkerR
         }
     }
     register_locked_packages(&store, package_lock.as_ref())?;
-    let mut claimable = store.claimable_effects(&options.instance_id)?;
+    let mut claimable = store
+        .claimable_effects(&options.instance_id)?
+        .into_iter()
+        .filter_map(|effect| {
+            match whipplescript_kernel::tracker_wait::ready(&store, &options.instance_id, &effect) {
+                Ok(true) => Some(Ok(effect)),
+                Ok(false) => None,
+                Err(error) => Some(Err(error)),
+            }
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     let mut seen_claimable = claimable
         .iter()
         .map(|effect| effect.effect_id.clone())
@@ -23743,6 +23756,14 @@ fn run_capability_effect(
     };
     let mut kernel = RuntimeKernel::new(store);
     let contract = PackageLockCapabilityContract(package_lock);
+    if whipplescript_kernel::tracker_wait::is_tracker_wait(effect) {
+        return whipplescript_kernel::tracker_wait::run(
+            &mut kernel,
+            instance_id,
+            effect,
+            &options.effect_config(),
+        );
+    }
     // Provider map: messaging.send routes by resolved binding provider id;
     // a `memory-provider` binding (memory.query/memory.write) routes to the
     // file-backed MemoryCapabilityProvider. Every unbound capability falls

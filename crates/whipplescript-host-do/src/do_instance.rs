@@ -730,6 +730,14 @@ impl<Sql: DoSql + Clone> InstanceDriver for DoInstanceDriver<'_, Sql> {
                 effect,
                 &DoDeliveryGovernance,
             )?,
+            "capability.call" if whipplescript_kernel::tracker_wait::is_tracker_wait(effect) => {
+                whipplescript_kernel::tracker_wait::run(
+                    &mut self.kernel,
+                    self.instance_id,
+                    effect,
+                    &config,
+                )?
+            }
             "capability.call" => {
                 // Binding-driven provider selection (spec/std-memory.md; the DO
                 // package bootstrap seeds the std.memory binding): a
@@ -2094,6 +2102,101 @@ mod tests {
             }] }
         });
         assert!(resolve_host_images(&store.sql, "instance-1", "turn-1", &wrong).is_err());
+    }
+
+    #[test]
+    fn basics_uses_the_same_closure_wait_on_the_do_driver() {
+        use whipplescript_kernel::workflow_input::validate_workflow_start_input;
+        use whipplescript_store::items::WorkItems;
+        let source = include_str!("../../../examples/gaugedesk-basics.whip");
+        let compiled = whipplescript_parser::compile_program(source);
+        assert!(
+            compiled.diagnostics.is_empty(),
+            "{:?}",
+            compiled.diagnostics
+        );
+        let ir = compiled.ir.unwrap();
+        let mut kernel = RuntimeKernel::new(store());
+        crate::do_packages::register_embedded_std_packages(kernel.store()).unwrap();
+        let version = kernel
+            .create_program_version_for_program(
+                ProgramVersionInput {
+                    program_name: &ir.workflow,
+                    source_hash: "basics",
+                    ir_hash: "basics",
+                    compiler_version: "test",
+                    ir_snapshot: None,
+                },
+                &ir,
+            )
+            .unwrap();
+        let input = serde_json::json!({"learner": {"authority": "person:learner"}});
+        let instance_id = kernel
+            .create_instance(&version, &input.to_string())
+            .unwrap();
+        kernel
+            .ingest_external_event(&instance_id, "external.started", "{}", Some("start"))
+            .unwrap();
+        for fact in validate_workflow_start_input(&ir, &input).unwrap() {
+            kernel
+                .derive_fact(
+                    &instance_id,
+                    &fact.name,
+                    &fact.key,
+                    &fact.value_json,
+                    None,
+                    None,
+                )
+                .unwrap();
+        }
+        for step in 0..=4 {
+            let driver = DoInstanceDriver {
+                kernel,
+                files: &NoFiles,
+                coerce: None,
+                agent_model: None,
+                agent_tools: &NoTools,
+                agent_tool_specs: None,
+                agent_workspace_resources: None,
+                exec: None,
+                turn: None,
+                ir: &ir,
+                instance_id: &instance_id,
+                system_prompt: "No model is used.",
+                max_steps: 8,
+            };
+            let mut machine = InstanceStepMachine::new(driver);
+            let outcome = run_to_completion(&mut machine, &RefuseIoHost);
+            kernel = machine.into_driver().kernel;
+            if step == 4 {
+                assert!(matches!(outcome, InstanceOutcome::Terminal), "{outcome:?}");
+                assert_eq!(
+                    kernel
+                        .store()
+                        .get_instance(&instance_id)
+                        .unwrap()
+                        .unwrap()
+                        .status,
+                    "completed"
+                );
+                break;
+            }
+            assert!(matches!(outcome, InstanceOutcome::Parked), "{outcome:?}");
+            let items = kernel.store().list_items(Some("tutorials"), None).unwrap();
+            assert_eq!(items.len(), step + 1);
+            let item = items.iter().find(|item| item.status == "open").unwrap();
+            assert_eq!(item.assigned_to.as_deref(), Some("person:learner"));
+            assert_eq!(
+                kernel.store().list_runs(&instance_id).unwrap().len(),
+                step * 2 + 1
+            );
+            kernel
+                .store_mut()
+                .finish_item(&item.id, Some("human completed"), None)
+                .unwrap();
+            // Reconstruct the scheduler every time: no listener or pending
+            // provider object survives between visits, just the durable stores.
+        }
     }
 
     // The DO drives an effect-free workflow's rule pass to its terminal through the

@@ -42,6 +42,7 @@ pub mod save_reconciliation;
 pub mod source_merge;
 pub mod time_pass;
 pub mod trace;
+pub mod tracker_wait;
 pub mod whip_shell;
 pub mod workflow_input;
 pub mod world_state;
@@ -1344,7 +1345,17 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
     }
 
     pub fn claimable_effects(&self, instance_id: &str) -> StoreResult<Vec<ClaimableEffect>> {
-        self.store.claimable_effects(instance_id)
+        self.store
+            .claimable_effects(instance_id)?
+            .into_iter()
+            .filter_map(
+                |effect| match tracker_wait::ready(&self.store, instance_id, &effect) {
+                    Ok(true) => Some(Ok(effect)),
+                    Ok(false) => None,
+                    Err(error) => Some(Err(error)),
+                },
+            )
+            .collect()
     }
 
     pub fn satisfy_dependencies(&self, instance_id: &str) -> StoreResult<usize> {

@@ -2484,6 +2484,9 @@ pub struct IrEffectNode {
     pub after_arm: Option<(String, String)>,
     pub required_capabilities: Vec<String>,
     pub construct_use: Option<IrConstructUse>,
+    /// Ordinary package call and candidate tracker references, for IFC analysis.
+    /// No new source form; includes package-provided construct calls.
+    pub package_call: Option<IrPackageCall>,
     pub idempotency_key: String,
     pub span: SourceSpan,
     /// Creation-anchored deadline from a `timeout <duration>` clause.
@@ -2553,6 +2556,17 @@ pub struct IrEffectNode {
     pub http_request: Option<IrHttpRequest>,
     /// Present exactly on `IrEffectKind::MintCredential`.
     pub mint_credential: Option<IrMintCredential>,
+}
+
+/// Analysis metadata for an ordinary `call <capability> for <binding>`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IrPackageCall {
+    pub target: String,
+    pub argument: Option<String>,
+    /// The referenced tracker, or every declared tracker when the argument's
+    /// provenance is dynamic. A package observing projected tracker facts can
+    /// read only these resources; dynamic references must not erase their labels.
+    pub tracker_resources: Vec<String>,
 }
 
 /// The two `exec` source forms (spec/std-script.md): a raw command string
@@ -13237,6 +13251,7 @@ fn analyze_rule(
                 after_arm,
                 required_capabilities: parse_required_capabilities(line),
                 construct_use: None,
+                package_call: None,
                 idempotency_key,
                 span: rule.body.span,
                 timeout_seconds: None,
@@ -13266,8 +13281,12 @@ fn analyze_rule(
     // walk and the payload-reads walk so the two cannot disagree about which
     // queue a `finish` lands in.
     let resolved_bindings = binding_resources(rule, &body_ast.statements, &semantic.trackers);
-    let (ast_effects, ast_dependencies) =
-        collect_effects_from_ast(&body_ast.statements, &rule.name.name, &resolved_bindings);
+    let (ast_effects, ast_dependencies) = collect_effects_from_ast(
+        &body_ast.statements,
+        &rule.name.name,
+        &resolved_bindings,
+        &semantic.trackers,
+    );
     metadata.effects = ast_effects;
     metadata.dependencies = ast_dependencies;
 
@@ -16511,6 +16530,7 @@ fn collect_effects_from_ast(
     statements: &[body::BodyStmt],
     rule_name: &str,
     binding_resources: &BTreeMap<String, String>,
+    trackers: &BTreeSet<String>,
 ) -> (Vec<IrEffectNode>, Vec<IrEffectDependency>) {
     let mut effects = Vec::new();
     let mut dependencies = Vec::new();
@@ -16534,6 +16554,25 @@ fn collect_effects_from_ast(
         &mut effects,
         &mut dependencies,
     );
+    let mut aliases = BTreeMap::new();
+    collect_provenance_metadata(statements, &mut BTreeMap::new(), &mut aliases);
+    for effect in &mut effects {
+        if let Some(call) = &mut effect.package_call {
+            let resolved = call.argument.as_deref().and_then(|argument| {
+                let binding = aliases
+                    .get(argument)
+                    .map(String::as_str)
+                    .unwrap_or(argument);
+                binding_resources
+                    .get(binding)
+                    .filter(|resource| trackers.contains(*resource))
+            });
+            call.tracker_resources = match resolved {
+                Some(resource) => vec![resource.clone()],
+                None => trackers.iter().cloned().collect(),
+            };
+        }
+    }
     (effects, dependencies)
 }
 
@@ -16628,6 +16667,24 @@ fn walk_effects(
                         .map(|(binding, _, arm)| (binding.clone(), arm.clone())),
                     required_capabilities,
                     construct_use,
+                    package_call: match &effect.kind {
+                        body::BodyEffectKind::Call {
+                            capability,
+                            argument,
+                        } => Some(IrPackageCall {
+                            target: capability.clone(),
+                            argument: argument.clone(),
+                            tracker_resources: Vec::new(),
+                        }),
+                        body::BodyEffectKind::ConstructCapabilityCall {
+                            target_capability, ..
+                        } => Some(IrPackageCall {
+                            target: target_capability.clone(),
+                            argument: None,
+                            tracker_resources: Vec::new(),
+                        }),
+                        _ => None,
+                    },
                     idempotency_key,
                     span: effect.span,
                     timeout_seconds: effect.timeout_seconds,

@@ -4273,7 +4273,11 @@ pub fn parse_effect_statements(
                 target: Some(target.clone()),
                 name: Some("call".to_owned()),
                 binding: binding_after_as(trimmed),
-                args: Vec::new(),
+                args: rest
+                    .split_once(" for ")
+                    .and_then(|(_, tail)| tail.split_whitespace().next())
+                    .map(|binding| vec![binding.to_owned()])
+                    .unwrap_or_default(),
                 prompt: None,
                 prompt_content_type: None,
                 prompt_template: None,
@@ -5327,11 +5331,22 @@ pub fn parsed_effect_input_json(
             "bindings": context_bindings_json(context),
             "rule": rule.name,
         }),
-        "capability.call" => json!({
-            "target": effect.target,
-            "bindings": context_bindings_json(context),
-            "rule": rule.name,
-        }),
+        "capability.call" => {
+            let mut input = json!({
+                "target": effect.target,
+                "bindings": context_bindings_json(context),
+                "rule": rule.name,
+            });
+            if !effect.args.is_empty() {
+                input["argument_exprs"] = json!(effect.args);
+                input["arguments"] = json!({
+                    "arg0": parse_field_value_scoped(
+                        &effect.args[0], context, live_facts, live_effects, live_ir,
+                    ),
+                });
+            }
+            input
+        }
         "event.emit" => json!({
             "event_type": effect.target,
             "payload": {

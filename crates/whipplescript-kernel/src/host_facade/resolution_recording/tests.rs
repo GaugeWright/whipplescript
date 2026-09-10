@@ -626,12 +626,28 @@ fn recording_profile_checks_the_actual_lowered_reference_and_capability() {
         .claimable_effects(&f.request.admission.instance_ref)
         .expect("effects")
         .remove(0);
+    resources(original, &f.request, &effect, f.target.binding()).expect("current call");
+    let mut legacy = effect.clone();
+    let mut legacy_input: Value = serde_json::from_str(&legacy.input_json).expect("input");
+    legacy_input
+        .as_object_mut()
+        .expect("object")
+        .remove("argument_exprs");
+    legacy_input
+        .as_object_mut()
+        .expect("object")
+        .remove("arguments");
+    legacy.input_json = legacy_input.to_string();
+    resources(original, &f.request, &legacy, f.target.binding()).expect("retained legacy call");
     for case in [
         "kind",
         "target",
         "capabilities",
         "reference",
         "extra-binding",
+        "argument-expression",
+        "argument-value",
+        "partial-arguments",
     ] {
         let mut changed = effect.clone();
         let mut input: Value = serde_json::from_str(&changed.input_json).expect("input");
@@ -641,6 +657,11 @@ fn recording_profile_checks_the_actual_lowered_reference_and_capability() {
             "capabilities" => changed.required_capabilities_json = "[]".into(),
             "reference" => input["bindings"]["reference"]["version_ref"] = json!("other"),
             "extra-binding" => input["bindings"]["extra"] = json!("unexamined"),
+            "argument-expression" => input["argument_exprs"] = json!(["other"]),
+            "argument-value" => input["arguments"]["arg0"]["version_ref"] = json!("other"),
+            "partial-arguments" => {
+                input.as_object_mut().expect("object").remove("arguments");
+            }
             _ => unreachable!(),
         }
         changed.input_json = input.to_string();

@@ -442,25 +442,46 @@ impl<Sql: DoSql + 'static> DurableInstance<Sql> {
                 instance.instance_id
             }
             None => {
-                let instance_id = kernel
-                    .create_instance_with_authority(
+                let input = serde_json::from_str(input_json)
+                    .map_err(|error| format!("invalid workflow input JSON: {error}"))?;
+                let input_facts =
+                    whipplescript_kernel::workflow_input::validate_workflow_start_input(
+                        &ir, &input,
+                    )?;
+                let mut created = String::new();
+                // An eviction must see either the whole birth or none of it.
+                // Input facts are part of birth, not a fresh admission on every
+                // reattach (which would revive consumed inputs and repeat work).
+                sql.atomic(&mut || {
+                    let instance_id = kernel.create_instance_with_authority(
                         &version,
                         input_json,
                         NewInstanceAuthority {
                             workflow_principal,
                             effective_authority_json: "{}",
                         },
-                    )
-                    .map_err(|error| format!("{error:?}"))?;
-                kernel
-                    .ingest_external_event(
+                    )?;
+                    let started = kernel.ingest_external_event(
                         &instance_id,
                         "external.started",
                         input_json,
                         Some("started"),
-                    )
-                    .map_err(|error| format!("{error:?}"))?;
-                instance_id
+                    )?;
+                    for fact in &input_facts {
+                        kernel.derive_fact(
+                            &instance_id,
+                            &fact.name,
+                            &fact.key,
+                            &fact.value_json,
+                            Some(&started.event_id),
+                            None,
+                        )?;
+                    }
+                    created = instance_id;
+                    Ok(())
+                })
+                .map_err(|error| format!("{error:?}"))?;
+                created
             }
         };
         // Per-instance branch dispatch, DO parity (untie-substrate P1): an
@@ -1688,5 +1709,84 @@ mod branch_dispatch_tests {
             .map(|row| crate::do_store::as_text(&row[0]))
             .expect("exported file exists");
         assert_eq!(content, "{\"id\":\"a\"}\n");
+    }
+}
+
+#[cfg(test)]
+mod tutorial_tests {
+    use super::*;
+    use crate::do_store::test_support::store;
+    use whipplescript_store::items::WorkItems;
+
+    const SOURCE: &str = include_str!("../../../examples/gaugedesk-basics.whip");
+    const INPUT: &str = r#"{"learner":{"authority":"person:learner"}}"#;
+    const NOW: i64 = 1_767_225_600_000;
+
+    #[test]
+    fn basics_starts_from_inputs_and_reattaches_without_refiling() {
+        let sql = Rc::new(store().sql);
+        let mut identity = None;
+        for step in 0..=4 {
+            let mut instance = DurableInstance::create(
+                Rc::clone(&sql),
+                SOURCE,
+                INPUT,
+                "person:learner",
+                DurableEffectPorts::default(),
+                &[],
+                &[],
+            )
+            .expect("create or reattach");
+            match &identity {
+                None => identity = Some(instance.instance_id.clone()),
+                Some(id) => assert_eq!(id, &instance.instance_id),
+            }
+            let outcome = instance.step(None, NOW);
+            if step == 4 {
+                assert!(matches!(outcome, DurableStepOutcome::Terminal));
+                assert_eq!(
+                    instance.status().expect("status").as_deref(),
+                    Some("completed")
+                );
+                break;
+            }
+            assert!(matches!(outcome, DurableStepOutcome::Parked { .. }));
+            let kernel = instance.kernel.as_mut().expect("kernel");
+            let items = kernel
+                .store()
+                .list_items(Some("tutorials"), None)
+                .expect("issues");
+            assert_eq!(items.len(), step + 1);
+            let issue = items
+                .iter()
+                .find(|issue| issue.status == "open")
+                .expect("one open issue");
+            assert_eq!(issue.assigned_to.as_deref(), Some("person:learner"));
+            kernel
+                .store_mut()
+                .finish_item(&issue.id, Some("self-reported"), None)
+                .expect("close");
+            // Drop the whole worker, not just its scheduler: the next create
+            // must recover both the input admission and the parked continuation.
+        }
+    }
+
+    #[test]
+    fn malformed_inputs_do_not_create_a_hosted_instance() {
+        let sql = Rc::new(store().sql);
+        let result = DurableInstance::create(
+            Rc::clone(&sql),
+            SOURCE,
+            r#"{"learner":{"authority":42}}"#,
+            "person:learner",
+            DurableEffectPorts::default(),
+            &[],
+            &[],
+        );
+        assert!(result.is_err());
+        assert!(DoSqliteStore::new(sql)
+            .list_instances()
+            .expect("instances")
+            .is_empty());
     }
 }

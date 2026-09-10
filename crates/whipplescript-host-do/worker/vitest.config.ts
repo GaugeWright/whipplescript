@@ -11,6 +11,7 @@ export default defineConfig({
   test: {
     include: [
       "src/session.integration.test.ts",
+      "src/tracker-tutorial.integration.test.ts",
       "src/executor-broker.integration.test.ts",
       "src/object-store.integration.test.ts",
     ],

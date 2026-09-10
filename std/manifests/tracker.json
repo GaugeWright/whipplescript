@@ -55,6 +55,24 @@
           "required_capabilities": ["tracker.finish"],
           "provider_kinds": ["builtin-tracker"],
           "validation": "none"
+        },
+        {
+          "id": "tracker.wait_closed",
+          "effect_kind": "capability.call",
+          "source_forms": ["call tracker.wait_closed for <issue> timeout <duration>"],
+          "input_schema": {
+            "id": "string",
+            "queue": "string"
+          },
+          "output_schema": {
+            "id": "string",
+            "queue": "string",
+            "event": "string",
+            "closed_at": "string"
+          },
+          "required_capabilities": ["tracker.wait_closed"],
+          "provider_kinds": ["builtin-tracker"],
+          "validation": "runtime_boundary"
         }
       ],
       "constructs": [
@@ -137,6 +155,10 @@
     {
       "id": "tracker.finish",
       "description": "Close a claimed issue with a completion summary."
+    },
+    {
+      "id": "tracker.wait_closed",
+      "description": "Observe one recorded issue closure within a mandatory effect deadline, without claiming the issue or holding a worker."
     }
   ],
   "providers": [
@@ -181,6 +203,13 @@
       "capability": "tracker.finish",
       "effect_kind": "tracker.finish",
       "config": {}
+    },
+    {
+      "id": "builtin-tracker-wait-closed",
+      "provider_kind": "builtin-tracker",
+      "capability": "tracker.wait_closed",
+      "effect_kind": "capability.call",
+      "config": {}
     }
   ],
   "profiles": [
@@ -195,7 +224,8 @@
         "tracker.renew",
         "tracker.release",
         "tracker.release_count",
-        "tracker.finish"
+        "tracker.finish",
+        "tracker.wait_closed"
       ],
       "config": {}
     }
@@ -240,6 +270,13 @@
       "id": "binding-tracker-finish",
       "program_id": null,
       "capability": "tracker.finish",
+      "provider": "builtin-tracker",
+      "config": {}
+    },
+    {
+      "id": "binding-tracker-wait-closed",
+      "program_id": null,
+      "capability": "tracker.wait_closed",
       "provider": "builtin-tracker",
       "config": {}
     }

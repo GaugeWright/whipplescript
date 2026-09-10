@@ -90,8 +90,9 @@ fn a_runaway_rule_fixpoint_stops_the_pass_instead_of_hanging_it() {
     let program = dir.join("runaway.whip");
     fs::write(&program, RUNAWAY).expect("write program");
 
-    // A low bound keeps the test quick; the shipped default is 10_000, and the
-    // most any example in the repository needs is SIX.
+    // Eight rounds exercise repeated growth and the bound without turning the
+    // 60-second hang detector into a disk-throughput requirement. The shipped
+    // default remains 10_000; removing the bound still hangs this same program.
     let child = Command::new(env!("CARGO_BIN_EXE_whip"))
         .args([
             "run",
@@ -99,7 +100,7 @@ fn a_runaway_rule_fixpoint_stops_the_pass_instead_of_hanging_it() {
             "--max-iterations",
             "1",
         ])
-        .env("WHIPPLESCRIPT_MAX_ROUNDS", "50")
+        .env("WHIPPLESCRIPT_MAX_ROUNDS", "8")
         .current_dir(&dir)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

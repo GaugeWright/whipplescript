@@ -2405,11 +2405,11 @@ fn rule_read_resources(
 ) -> Vec<String> {
     let mut reads: Vec<String> = Vec::new();
     for effect in &rule.metadata.effects {
-        if let Some(resource) = ifc_resource_for_effect(effect, shared_coordination) {
-            if effect_flow(&effect.kind).reads_resource {
-                reads.push(resource.to_owned());
-            }
-        }
+        reads.extend(
+            effect_read_resources(effect, shared_coordination)
+                .into_iter()
+                .map(str::to_owned),
+        );
         for grant in &effect.access_grants {
             if grant.operations.iter().any(|op| is_read_op(&op.operation)) {
                 reads.push(grant.resource.clone());
@@ -2864,6 +2864,27 @@ fn ifc_resource_for_effect<'a>(
         return None;
     }
     Some(resource)
+}
+
+/// Package observations read the same tracker labels as a `has closed issue`
+/// trigger. Dynamic issue references conservatively carry every declared queue:
+/// projection admits no others. Ordinary sends retain their outbound-only flow.
+fn effect_read_resources<'a>(
+    effect: &'a IrEffectNode,
+    shared_coordination: &BTreeSet<String>,
+) -> Vec<&'a str> {
+    if let Some(call) = &effect.package_call {
+        if call.target == crate::tracker_wait::CAPABILITY {
+            return call.tracker_resources.iter().map(String::as_str).collect();
+        }
+    }
+    if effect_flow(&effect.kind).reads_resource {
+        ifc_resource_for_effect(effect, shared_coordination)
+            .into_iter()
+            .collect()
+    } else {
+        Vec::new()
+    }
 }
 
 fn selected_effect_integrity_sinks(
@@ -4041,11 +4062,11 @@ fn fact_reach_map(
             // own(r): the producer's non-fact sources.
             let mut own: BTreeSet<String> = BTreeSet::new();
             for effect in &rule.metadata.effects {
-                if let Some(resource) = ifc_resource_for_effect(effect, &shared_coordination) {
-                    if effect_flow(&effect.kind).reads_resource {
-                        own.insert(resource.to_owned());
-                    }
-                }
+                own.extend(
+                    effect_read_resources(effect, &shared_coordination)
+                        .into_iter()
+                        .map(str::to_owned),
+                );
                 for grant in &effect.access_grants {
                     if grant.operations.iter().any(|op| is_read_op(&op.operation)) {
                         own.insert(grant.resource.clone());
@@ -4229,6 +4250,11 @@ fn resolve_root_sources(
         return Some(carried);
     }
     if let Some(effect) = effect_by_binding.get(base) {
+        if let Some(call) = &effect.package_call {
+            if call.target == crate::tracker_wait::CAPABILITY {
+                return Some(call.tracker_resources.iter().cloned().collect());
+            }
+        }
         if !effect_flow(&effect.kind).resource_is_output_provenance {
             return None;
         }
@@ -4725,15 +4751,15 @@ pub fn check_with_envelope_imports(
         let mut writes: Vec<&str> = Vec::new();
         let mut span = None;
         for effect in &rule.metadata.effects {
+            for resource in effect_read_resources(effect, &shared_coordination) {
+                reads.push(resource);
+                span.get_or_insert(effect.span);
+            }
             if let Some(resource) = ifc_resource_for_effect(effect, &shared_coordination) {
                 // The audit of which kinds read and which write lives in
                 // `effect_flow`, so this join box and the five other flow sites
                 // cannot disagree about a kind.
                 let flow = effect_flow(&effect.kind);
-                if flow.reads_resource {
-                    reads.push(resource);
-                    span.get_or_insert(effect.span);
-                }
                 if flow.writes_resource {
                     writes.push(resource);
                     span.get_or_insert(effect.span);
@@ -5718,11 +5744,11 @@ pub fn check_principal_ceiling(
     for rule in &ir.rules {
         let mut reads: Vec<(String, whipplescript_parser::SourceSpan)> = Vec::new();
         for effect in &rule.metadata.effects {
-            if let Some(resource) = ifc_resource_for_effect(effect, &shared_coordination) {
-                if effect_flow(&effect.kind).reads_resource {
-                    reads.push((resource.to_owned(), effect.span));
-                }
-            }
+            reads.extend(
+                effect_read_resources(effect, &shared_coordination)
+                    .into_iter()
+                    .map(|resource| (resource.to_owned(), effect.span)),
+            );
             for grant in &effect.access_grants {
                 if grant.operations.iter().any(|op| is_read_op(&op.operation)) {
                     reads.push((grant.resource.clone(), effect.span));

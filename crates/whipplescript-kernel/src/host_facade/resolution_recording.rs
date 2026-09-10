@@ -94,12 +94,18 @@ fn resources<'a>(
         .map_err(|_| ProtocolError::Mismatch("recording effect reference payload"))?;
     let capabilities: Vec<String> = serde_json::from_str(&effect.required_capabilities_json)
         .map_err(|_| ProtocolError::Mismatch("recording effect capabilities"))?;
+    // Earlier compilers retained the complete reference in `bindings` but
+    // dropped the ordinary call's `for` argument. Both exact shapes identify
+    // the same admitted reference; old pending effects must remain executable.
+    let legacy = json!({"target": RESOLUTION_RECORDING_CAPABILITY,
+        "bindings": {"reference": original.inputs["corrections"]}, "rule": "record_corrections"});
+    let mut current = legacy.clone();
+    current["argument_exprs"] = json!(["reference"]);
+    current["arguments"] = json!({"arg0": original.inputs["corrections"]});
     if effect.kind != "capability.call"
         || effect.target.as_deref() != Some(RESOLUTION_RECORDING_CAPABILITY)
         || capabilities != [RESOLUTION_RECORDING_CAPABILITY]
-        || input_value
-            != json!({"target": RESOLUTION_RECORDING_CAPABILITY,
-            "bindings": {"reference": original.inputs["corrections"]}, "rule": "record_corrections"})
+        || (input_value != current && input_value != legacy)
     {
         return Err(ProtocolError::Mismatch(
             "recording effect differs from its admitted reference",
