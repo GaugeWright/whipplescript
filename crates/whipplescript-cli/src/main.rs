@@ -31994,16 +31994,26 @@ fn view(options: &CliOptions) -> ExitCode {
                 .as_str()
                 .map(|arm| format!(" after {arm}"))
                 .unwrap_or_default();
+            // The `case` arm, which is most of the point for an absent line: an
+            // arm nothing requested reads as unexplained without the branch that
+            // decided against it.
+            let case = match (
+                slot["case"]["scrutinee"].as_str(),
+                slot["case"]["pattern"].as_str(),
+            ) {
+                (Some(scrutinee), Some(pattern)) => format!(" case {scrutinee} {pattern}"),
+                _ => String::new(),
+            };
             if slot["absent"] == serde_json::Value::Bool(true) {
                 // Not a status: there is no row. That distinction is the view.
-                println!("    {node:<14} {verb:<10} not requested{arm}");
+                println!("    {node:<14} {verb:<10} not requested{arm}{case}");
             } else {
                 let reason = slot["block_reason"]
                     .as_str()
                     .map(|reason| format!(" ({reason})"))
                     .unwrap_or_default();
                 println!(
-                    "    {node:<14} {verb:<10} {}{reason}{arm}",
+                    "    {node:<14} {verb:<10} {}{reason}{arm}{case}",
                     slot["status"].as_str().unwrap_or("?")
                 );
             }

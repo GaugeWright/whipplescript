@@ -78,6 +78,10 @@ rules
       log_entry --succeeds--> effect7
       log_entry --succeeds--> effect8
       log_entry --succeeds--> effect9
+    selectors
+      effect7 "decision.verdict" "\"merge\""
+      effect8 "decision.verdict" "\"revise\""
+      effect9 "decision.verdict" "\"blocked\""
     case_branches
       case decision.verdict type=union<literal<"merge"> | literal<"revise"> | literal<"blocked">> pattern=literal:"merge" guard=- body_hash=46c8bd9b93a57f4ec41bfcb56bd31ff3 span=2201..2208
       case decision.verdict type=union<literal<"merge"> | literal<"revise"> | literal<"blocked">> pattern=literal:"revise" guard=- body_hash=7131ffc41c4190ff0d03d76828c6707e span=2385..2393

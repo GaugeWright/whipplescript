@@ -2528,7 +2528,12 @@ pub struct IrEffectNode {
     /// as `(scrutinee, pattern)` — the discriminated-families *selector*. Lets the
     /// IFC checker apply NMIF-on-the-selector: a crossing (`endorsed`/`declassified`)
     /// selected by a low-integrity discriminant is rejected (DR §5.6 / §7.4). `None`
-    /// for effects outside any `case`. Not part of the `.ir` snapshot.
+    /// for effects outside any `case`.
+    ///
+    /// In the `.ir` snapshot since DR-0111, as the rule's `selectors` block: a
+    /// view drawing a firing has to say which arm an effect belonged to, or
+    /// three arms of one `case` are three identical nodes and an arm that was
+    /// never requested shows nothing that explains what decided it.
     pub selected_by: Option<(String, String)>,
     /// The `exec` surface form — raw command string vs manifest capability
     /// (spec/std-script.md "Static checks" item 2) — surfaced so check-time
@@ -4930,6 +4935,38 @@ impl IrProgram {
                                 dependency.predicate.as_str(),
                                 dependency.downstream
                             ),
+                        );
+                    }
+                }
+                // Which `case` arm each effect sits in, keyed by node id.
+                //
+                // A sub-block rather than a field on the effect line because a
+                // scrutinee and a pattern are both free text — `case status {
+                // "in progress" => …` is a legal program — and the effect line
+                // is whitespace-delimited. Both values are quoted here for the
+                // same reason `source_descriptions` quotes author text.
+                //
+                // Keyed off `selected_by`, which the lowering already computes
+                // for every `case`, so this covers the outcome form
+                // (`case answer { Completed as … }`) that `case_branches` below
+                // deliberately leaves to the terminal collector.
+                let selectors = rule
+                    .metadata
+                    .effects
+                    .iter()
+                    .filter_map(|effect| {
+                        effect
+                            .selected_by
+                            .as_ref()
+                            .map(|(scrutinee, pattern)| (&effect.id, scrutinee, pattern))
+                    })
+                    .collect::<Vec<_>>();
+                if !selectors.is_empty() {
+                    push_line(&mut snapshot, "    selectors");
+                    for (id, scrutinee, pattern) in selectors {
+                        push_line(
+                            &mut snapshot,
+                            format!("      {id} {scrutinee:?} {pattern:?}"),
                         );
                     }
                 }

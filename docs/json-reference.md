@@ -257,6 +257,12 @@ offering that as a name would be inventing one. A `then` chain's handle reads as
 the word the author wrote: `then plan <- tell …` labels `plan`, not
 `__then_plan`.
 
+An effect that sits in a `case` arm carries `case`, the `scrutinee` and `pattern`
+of the innermost arm it is in; `null` for an effect outside any `case`. It is what
+makes an absent arm explicable: three arms of one `case` are otherwise three
+interchangeable nodes hanging off one edge, and the arm nothing requested shows
+nothing that says what decided against it.
+
 Each rule also carries `records`: the schemas it records, with the construct that
 wrote each one. A `table` declaration lowers to a rule, so `table_row` there is
 how a reader tells a table of data from behaviour someone wrote.

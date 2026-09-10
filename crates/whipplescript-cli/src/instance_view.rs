@@ -236,6 +236,16 @@ fn structure_value(view: &snapshot::SnapshotView, version_id: &str, ir_hash: &st
                 "verb": effect.verb(),
                 "label": effect.label(),
                 "binding": effect.binding,
+                // The `case` arm, so three arms of one `case` are not three
+                // identical nodes and an arm nothing requested says what
+                // decided it.
+                "case": match &effect.case_arm {
+                    Some((scrutinee, pattern)) => json!({
+                        "scrutinee": scrutinee,
+                        "pattern": pattern,
+                    }),
+                    None => Value::Null,
+                },
             })).collect::<Vec<_>>(),
             "dependencies": rule.dependencies.iter().map(|(upstream, predicate, downstream)| json!({
                 "upstream": upstream,
@@ -353,6 +363,16 @@ pub fn project(
                 slot.insert("kind".to_owned(), json!(node.kind));
                 slot.insert("verb".to_owned(), json!(node.verb()));
                 slot.insert("label".to_owned(), json!(node.label()));
+                slot.insert(
+                    "case".to_owned(),
+                    match &node.case_arm {
+                        Some((scrutinee, pattern)) => json!({
+                            "scrutinee": scrutinee,
+                            "pattern": pattern,
+                        }),
+                        None => Value::Null,
+                    },
+                );
                 slot.insert("binding".to_owned(), json!(node.binding));
                 slot.insert(
                     "arm".to_owned(),
@@ -590,6 +610,48 @@ mod tests {
         assert_eq!(slots[0]["status"], "completed");
         assert_eq!(slots[1]["verb"], "timer");
         assert_eq!(slots[1]["absent"], true);
+    }
+
+    /// The `case` arm reaches both halves of the view.
+    ///
+    /// It matters most on the absent side: an arm a firing never requested is
+    /// the one thing this view offers over a log, and without the branch that
+    /// decided against it the reader is told something is missing and not why.
+    #[test]
+    fn an_effects_case_arm_reaches_the_structure_and_the_firing() {
+        const ARMED: &str = "workflow Armed\n\
+            rules\n  \
+            rule work\n    \
+            when started\n    \
+            effects\n      \
+            first kind=exec.command binding=first key=k1\n      \
+            second kind=tracker.release binding=- key=k2 arm=first:succeeds\n    \
+            selectors\n      \
+            second \"decision.verdict\" \"\\\"revise\\\"\"\n";
+
+        let alone = structure(ARMED, "ir-x");
+        let nodes = alone["rules"][0]["effects"].as_array().expect("effects");
+        assert_eq!(
+            nodes[0]["case"],
+            Value::Null,
+            "a top-level effect has no arm"
+        );
+        assert_eq!(nodes[1]["case"]["scrutinee"], "decision.verdict");
+        assert_eq!(nodes[1]["case"]["pattern"], "\"revise\"");
+
+        let first = id_for("first", None, "id-1");
+        let view = project(
+            &instance(),
+            &versions(&[("ver_1", Some(ARMED))]),
+            &[commit_event("id-1", &[&first])],
+            &[effect(&first, "completed")],
+            &[],
+        );
+        let slots = view["firings"][0]["effects"].as_array().expect("slots");
+        assert_eq!(slots[0]["case"], Value::Null);
+        // The absent one, which is the reason to carry this at all.
+        assert_eq!(slots[1]["absent"], true);
+        assert_eq!(slots[1]["case"]["pattern"], "\"revise\"");
     }
 
     fn commit_event(identity: &str, created: &[&str]) -> EventView {

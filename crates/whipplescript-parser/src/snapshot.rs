@@ -52,6 +52,14 @@ pub struct SnapshotEffect {
     /// keyword is read: the target capability is in the snapshot and still has no
     /// caller.
     pub construct: Option<String>,
+    /// DR-0111: the `case` arm this effect sits in, as `(scrutinee, pattern)`,
+    /// or `None` for an effect outside any `case`.
+    ///
+    /// Read from the rule's `selectors` block rather than from `case_branches`,
+    /// which records only the value form: the outcome form
+    /// (`case answer { Completed as … }`) is left to the terminal collector and
+    /// never appears there, while its effects are as much in an arm as any other.
+    pub case_arm: Option<(String, String)>,
     /// DR-0090: the enclosing `after` arm as `(binding, predicate)`, or `None`
     /// for an effect at the rule's top level.
     ///
@@ -186,6 +194,9 @@ fn parse_effect(line: &str) -> Option<SnapshotEffect> {
             .get("key")
             .map(|k| (*k).to_string())
             .unwrap_or_default(),
+        // Filled from the rule's `selectors` block, which is written after this
+        // line and read against the node id.
+        case_arm: None,
         construct: fields
             .get("construct")
             .and_then(|value| value.split_once("->"))
@@ -196,6 +207,44 @@ fn parse_effect(line: &str) -> Option<SnapshotEffect> {
                 .map(|(binding, predicate)| (binding.to_owned(), predicate.to_owned()))
         }),
     })
+}
+
+/// One `{:?}`-quoted value and whatever follows it.
+///
+/// The writer quotes with Rust's `Debug`, which escapes only `"`, `\\` and the
+/// control characters, so undoing it needs exactly this much: copy until an
+/// unescaped closing quote. A scrutinee and a pattern are both free text, which
+/// is why they are quoted at all.
+fn read_quoted(text: &str) -> Option<(String, &str)> {
+    let rest = text.strip_prefix('"')?;
+    let mut value = String::new();
+    let mut chars = rest.char_indices();
+    while let Some((index, character)) = chars.next() {
+        match character {
+            '"' => return Some((value, rest[index + 1..].trim_start())),
+            '\\' => {
+                let (_, escaped) = chars.next()?;
+                value.push(match escaped {
+                    'n' => '\n',
+                    't' => '\t',
+                    'r' => '\r',
+                    '0' => '\0',
+                    other => other,
+                });
+            }
+            other => value.push(other),
+        }
+    }
+    None
+}
+
+/// `effect8 "decision.verdict" "\"revise\""` — a node id, then the `case` arm
+/// it sits in.
+fn parse_selector(line: &str) -> Option<(String, (String, String))> {
+    let (id, rest) = line.split_once(' ')?;
+    let (scrutinee, rest) = read_quoted(rest.trim_start())?;
+    let (pattern, _) = read_quoted(rest)?;
+    Some((id.to_owned(), (scrutinee, pattern)))
 }
 
 /// `schema:Ticket construct=table_row span=736..848`
@@ -271,6 +320,18 @@ pub fn parse(snapshot: &str) -> SnapshotView {
                     "record_sources" => {
                         if let Some(source) = parse_record_source(trimmed) {
                             rule.records.push(source);
+                        }
+                    }
+                    // Attached by node id rather than by position: the block is
+                    // written after `effects`, and only the effects that sit in
+                    // an arm appear in it.
+                    "selectors" => {
+                        if let Some((id, arm)) = parse_selector(trimmed) {
+                            if let Some(effect) =
+                                rule.effects.iter_mut().find(|effect| effect.id == id)
+                            {
+                                effect.case_arm = Some(arm);
+                            }
                         }
                     }
                     _ => {}
@@ -1071,5 +1132,103 @@ mod tests {
         // is the only thing that says which construct the author reached for.
         assert_eq!(sent.construct.as_deref(), Some("send"));
         assert_eq!(sent.verb(), "send");
+    }
+
+    /// Both halves of a selector are free text, which is why they are quoted.
+    #[test]
+    fn a_selector_survives_a_pattern_with_a_space_and_a_quote() {
+        let view = parse(
+            "workflow Quoting\n\
+             rules\n  \
+             rule work\n    \
+             effects\n      \
+             effect1 kind=tracker.release binding=- key=a1\n    \
+             selectors\n      \
+             effect1 \"order[\\\"status key\\\"]\" \"\\\"in progress\\\"\"\n",
+        );
+        assert_eq!(
+            view.rules[0].effects[0].case_arm,
+            Some((
+                "order[\"status key\"]".to_owned(),
+                "\"in progress\"".to_owned()
+            )),
+            "a whitespace-delimited field could not have carried either half"
+        );
+    }
+
+    /// The reason the block reads `selected_by` rather than `case_branches`: the
+    /// outcome form of `case` never reaches `case_branches`, and its effects sit
+    /// in an arm exactly as much as any other effect does.
+    ///
+    /// Built from a real example rather than a hand-written program, with one
+    /// effect added inside an arm — the corpus has outcome cases but none with
+    /// an effect in them, which is why the gap went unnoticed.
+    #[test]
+    fn an_outcome_case_records_its_arm_though_it_has_no_branch_block() {
+        let source = include_str!("../../../examples/scheduled-escalation.whip").replace(
+            "      Completed as decided => {\n        done review",
+            "      Completed as decided => {\n        timer 1h as grace\n        done review",
+        );
+        let ir = crate::compile_program(&source)
+            .ir
+            .expect("the outcome-case program compiles");
+        let snapshot = ir.to_snapshot();
+        // The premise: nothing about this case reaches `case_branches`.
+        assert!(
+            !snapshot.contains("case_branches"),
+            "an outcome case is not a value case; this test's premise is gone"
+        );
+        let view = parse(&snapshot);
+        let grace = view
+            .rules
+            .iter()
+            .flat_map(|rule| rule.effects.iter())
+            .find(|effect| effect.label() == Some("grace"))
+            .expect("the timer inside the Completed arm");
+        assert_eq!(
+            grace.case_arm,
+            Some(("answer".to_owned(), "Completed".to_owned()))
+        );
+    }
+
+    /// The real program the arm was missing from, read back from what the
+    /// compiler actually emits.
+    #[test]
+    fn a_real_case_arm_reads_back_from_the_compilers_own_output() {
+        let ir = crate::compile_program(include_str!("../../../examples/gastown-lite.whip"))
+            .ir
+            .expect("gastown-lite compiles");
+        let view = parse(&ir.to_snapshot());
+        let rule = view.rule("implement_ready_ticket").expect("the rule");
+        let arms: Vec<Option<&str>> = rule
+            .effects
+            .iter()
+            .map(|effect| {
+                effect
+                    .case_arm
+                    .as_ref()
+                    .map(|(_, pattern)| pattern.as_str())
+            })
+            .collect();
+        // Three arms of one `case`, which used to draw as three identical
+        // `release`/`finish` nodes hanging off one edge.
+        assert_eq!(
+            arms,
+            vec![
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some("\"merge\""),
+                Some("\"revise\""),
+                Some("\"blocked\"")
+            ]
+        );
+        assert_eq!(
+            rule.effects[7].case_arm.as_ref().map(|(s, _)| s.as_str()),
+            Some("decision.verdict")
+        );
     }
 }
