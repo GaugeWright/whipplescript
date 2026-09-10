@@ -154,13 +154,277 @@ mod tests {
     /// It lives beside the ref tests rather than in `do_branches` only because
     /// that module has no test harness of its own; the suite it runs is the
     /// shared one either way.
+    /// An in-memory object store, standing in for the platform bucket the
+    /// deployment binds. The tier's contract is put/get/delete by key; where
+    /// those bytes actually live is not this seam's business.
+    #[derive(Default)]
+    struct MemObjects {
+        blobs: std::cell::RefCell<std::collections::HashMap<String, Vec<u8>>>,
+    }
+
+    impl crate::ObjectStore for MemObjects {
+        fn put(&self, key: &str, bytes: &[u8]) -> std::io::Result<()> {
+            self.blobs
+                .borrow_mut()
+                .insert(key.to_owned(), bytes.to_vec());
+            Ok(())
+        }
+        fn get(&self, key: &str) -> std::io::Result<Option<Vec<u8>>> {
+            Ok(self.blobs.borrow().get(key).cloned())
+        }
+        fn delete(&self, key: &str) -> std::io::Result<()> {
+            self.blobs.borrow_mut().remove(key);
+            Ok(())
+        }
+        fn exists(&self, key: &str) -> bool {
+            self.blobs.borrow().contains_key(key)
+        }
+    }
+
+    /// The synchronous-store path, run against the shared suite.
+    ///
+    /// Deliberately NOT the durable object's deployed shape: that host records
+    /// handles and cannot move bytes, so it declines the suite's byte property
+    /// as it always has. This covers the configuration where a host genuinely
+    /// can drive a synchronous object store — natively, and here — and proves
+    /// the tier's own logic under the property rather than under our reading
+    /// of it.
+    #[test]
+    fn a_synchronous_object_store_carries_the_suite_holding_bytes() {
+        whipplescript_store::content::conformance::run_suite(|| {
+            crate::do_branches::DoContentBlobs::with_external_bytes(
+                RusqliteDoSql::in_memory(),
+                Box::new(MemObjects::default()),
+            )
+            .expect("content blobs open")
+        })
+        .expect("suite runs");
+    }
+
+    /// The round trip the parity gap was about, spelled out: a picture goes in,
+    /// the same picture comes out, and the tier it used is invisible.
+    #[test]
+    fn a_picture_round_trips_through_the_external_tier() {
+        use whipplescript_store::content::{BlobStatus, ContentBlobs};
+        let blobs = crate::do_branches::DoContentBlobs::with_external_bytes(
+            RusqliteDoSql::in_memory(),
+            Box::new(MemObjects::default()),
+        )
+        .expect("open");
+
+        let picture: [u8; 12] = [
+            0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 0x0d,
+        ];
+        let id = blobs.put(&picture).expect("a picture is storable now");
+        assert_eq!(
+            blobs.get(&id).expect("read").as_deref(),
+            Some(&picture[..]),
+            "byte-identical, or the id is a lie"
+        );
+        assert!(
+            matches!(blobs.status(&id).expect("status"), BlobStatus::Live { byte_len } if byte_len == 12),
+            "status and get must agree about a spilled blob"
+        );
+
+        // Text beside it still takes the inline tier and is unaffected.
+        let text_id = blobs.put_text("prose").expect("text");
+        assert_eq!(
+            blobs.get(&text_id).expect("read").as_deref(),
+            Some(&b"prose"[..])
+        );
+        assert_ne!(id, text_id);
+    }
+
+    /// Text too large for a SQLite value spills as well, so the tier boundary
+    /// is about what a value can hold, not only about what decodes.
+    #[test]
+    fn text_past_the_threshold_spills_and_still_reads_as_text() {
+        use whipplescript_store::content::{ContentBlobs, TextBlob};
+        let mut blobs = crate::do_branches::DoContentBlobs::with_external_bytes(
+            RusqliteDoSql::in_memory(),
+            Box::new(MemObjects::default()),
+        )
+        .expect("open");
+        blobs.set_threshold_bytes(64);
+
+        let big = "prose ".repeat(200); // 1200 bytes, all of it text
+        let id = blobs.put_text(&big).expect("stores");
+        assert!(
+            matches!(
+                blobs.get_text(&id).expect("read"),
+                TextBlob::Text(ref body) if *body == big
+            ),
+            "spilled text is still text on the way back"
+        );
+    }
+
+    /// Erasure spans the tiers. Without this, whether a blob could be erased
+    /// would depend on which side of the threshold it landed — and an id whose
+    /// bytes are gone would answer *absent*, the substitution DR-0066 §5
+    /// exists to refuse.
+    #[test]
+    fn erasing_a_spilled_blob_removes_the_bytes_and_says_erased() {
+        use whipplescript_store::content::{BlobStatus, ContentBlobs, EraseOutcome};
+        let objects = MemObjects::default();
+        let seen = std::rc::Rc::new(std::cell::RefCell::new(Vec::<u8>::new()));
+        let _ = &seen;
+        let blobs = crate::do_branches::DoContentBlobs::with_external_bytes(
+            RusqliteDoSql::in_memory(),
+            Box::new(objects),
+        )
+        .expect("open");
+
+        let picture: [u8; 6] = [0x89, b'P', b'N', b'G', 0xff, 0xfe];
+        let id = blobs.put(&picture).expect("store");
+        assert!(matches!(
+            blobs.erase(&id, "2026-09-09T00:00:00Z").expect("erase"),
+            EraseOutcome::Erased { byte_len: 6 }
+        ));
+        assert_eq!(blobs.get(&id).expect("read"), None, "the bytes are gone");
+        assert!(
+            matches!(
+                blobs.status(&id).expect("status"),
+                BlobStatus::Erased { byte_len: 6 }
+            ),
+            "erased, not absent — a caller must not retry forever for bytes by decision gone"
+        );
+        assert!(matches!(
+            blobs.erase(&id, "2026-09-09T00:01:00Z").expect("retry"),
+            EraseOutcome::AlreadyErased
+        ));
+    }
+
     /// This host stores text only, and the way it says so is the point.
     ///
-    /// `SqlValue` carries Null, Int and Text; there is no blob variant, and
-    /// adding one crosses the JS binding into the Worker's `state.storage.sql`.
-    /// So the refusal is deliberate — the alternative was storing a lossy
-    /// transcription of a picture under a hash that no longer describes it,
-    /// which every later reader would then verify as correct.
+    /// The handle path: this host records that content exists on the object
+    /// plane and never sees a byte of it.
+    ///
+    /// A durable object's Rust is synchronous throughout — DO SQLite is, and
+    /// there is no await point anywhere in the surface — while R2 is async
+    /// only. So the isolate cannot fetch spilled bytes, and the three answers
+    /// it gives have to stay distinguishable: present-but-unreachable, erased,
+    /// and never-seen are three different facts and a caller acts differently
+    /// on each.
+    #[test]
+    fn a_registered_handle_is_live_unreadable_here_and_erasable() {
+        use whipplescript_store::content::{BlobStatus, ContentBlobs, EraseOutcome};
+        let blobs =
+            crate::do_branches::DoContentBlobs::new(RusqliteDoSql::in_memory()).expect("open");
+        // The plane placed and verified these bytes; only the fact reaches us.
+        let id = "89504e470d0a1a0a0000000d0000000d";
+        blobs
+            .register_external(id, 4096)
+            .expect("register the handle");
+
+        assert!(
+            matches!(blobs.status(id).expect("status"), BlobStatus::Live { byte_len } if byte_len == 4096),
+            "the content exists, and status is where that is said"
+        );
+        let error = blobs
+            .get(id)
+            .expect_err("this isolate cannot materialize what it did not move");
+        let message = format!("{error:?}");
+        assert!(
+            message.contains("object plane") && message.contains("cannot materialize"),
+            "the refusal says why and where to read it instead: {message}"
+        );
+
+        // Erasure is durable here and collected there.
+        assert!(matches!(
+            blobs.erase(id, "2026-09-10T00:00:00Z").expect("erase"),
+            EraseOutcome::Erased { byte_len: 4096 }
+        ));
+        assert!(
+            matches!(
+                blobs.status(id).expect("status"),
+                BlobStatus::Erased { byte_len: 4096 }
+            ),
+            "erased, not absent — the decision is durable before the bytes are gone"
+        );
+        assert_eq!(
+            blobs.pending_external_deletes(16).expect("queue"),
+            vec![id.to_owned()],
+            "and the bytes are queued for the plane to collect"
+        );
+
+        blobs.external_delete_collected(id).expect("collected");
+        assert!(blobs
+            .pending_external_deletes(16)
+            .expect("queue")
+            .is_empty());
+        assert!(
+            matches!(blobs.status(id).expect("status"), BlobStatus::Erased { .. }),
+            "collection does not un-erase it"
+        );
+    }
+
+    /// Every shape a JS number can arrive in that is not a length.
+    ///
+    /// The wasm boundary passes numbers as `f64`, so this is the only place
+    /// "whole and non-negative" is enforced — and a length that slipped through
+    /// would register a handle claiming a size the bytes do not have, which
+    /// `status` would then report as fact.
+    #[test]
+    fn a_byte_length_must_be_a_non_negative_whole_number() {
+        use crate::do_branches::checked_byte_len;
+        assert_eq!(checked_byte_len(0.0), Ok(0));
+        assert_eq!(checked_byte_len(4096.0), Ok(4096));
+        for bad in [
+            -1.0,
+            -0.5,
+            0.5,
+            4096.5,
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+        ] {
+            assert!(checked_byte_len(bad).is_err(), "{bad} is not a byte length");
+        }
+    }
+
+    /// An id that is not a content id would be a row no object could answer.
+    #[test]
+    fn a_handle_must_name_a_content_id() {
+        let blobs =
+            crate::do_branches::DoContentBlobs::new(RusqliteDoSql::in_memory()).expect("open");
+        for bad in [
+            "",
+            "not-a-hash",
+            &"0".repeat(31),
+            &"0".repeat(33),
+            &"A".repeat(32),
+        ] {
+            assert!(
+                blobs.register_external(bad, 1).is_err(),
+                "{bad:?} must be refused"
+            );
+        }
+        assert!(blobs.register_external(&"a1".repeat(16), 1).is_ok());
+    }
+
+    /// Absence still reads as absence. The handle path adds a third answer; it
+    /// must not blur the two that were already there.
+    #[test]
+    fn an_unregistered_id_is_still_simply_absent() {
+        use whipplescript_store::content::{BlobStatus, ContentBlobs};
+        let blobs =
+            crate::do_branches::DoContentBlobs::new(RusqliteDoSql::in_memory()).expect("open");
+        assert_eq!(blobs.get(&"f".repeat(32)).expect("read"), None);
+        assert!(matches!(
+            blobs.status(&"f".repeat(32)).expect("status"),
+            BlobStatus::Unknown
+        ));
+    }
+
+    /// A store built without an external tier still refuses, and that is the
+    /// remaining honest case rather than a leftover: `SqlValue` carries Null,
+    /// Int and Text, so a host with no object store bound has genuinely
+    /// nowhere to put bytes. The alternative was a lossy transcription of a
+    /// picture under a hash that no longer describes it, which every later
+    /// reader would then verify as correct.
+    ///
+    /// The refusal now names the way out, because there is one — see
+    /// `with_an_external_tier_the_do_store_passes_the_suite_holding_bytes`.
     #[test]
     fn content_that_is_not_text_is_refused_rather_than_transcribed() {
         use whipplescript_store::content::ContentBlobs;
@@ -173,8 +437,8 @@ mod tests {
             .expect_err("this host cannot hold bytes that are not text");
         let message = format!("{error:?}");
         assert!(
-            message.contains("text only") && message.contains("blob"),
-            "the refusal says what is missing rather than failing vaguely: {message}"
+            message.contains("text only") && message.contains("external byte tier"),
+            "the refusal names what is missing and how to supply it: {message}"
         );
 
         // Text is unaffected, and round-trips as bytes through the same seam.

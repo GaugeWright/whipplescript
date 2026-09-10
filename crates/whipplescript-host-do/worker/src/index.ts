@@ -135,6 +135,10 @@ const hostFunctions = bindings as unknown as {
     bridge: unknown,
     instanceId: string,
   ) => string;
+  // The handle surface (DR-0113). Bytes never come through here: the isolate
+  // is synchronous and R2 is not, so the object plane moves them and this
+  // records only that they exist.
+  host_register_external_object: (bridge: unknown, id: string, byteLen: number) => void;
   host_export_thread: (
     bridge: unknown,
     signedEnvelope: string,
@@ -166,8 +170,13 @@ function publicRequestId(commandId: string): string {
   return commandId.split(":").slice(2).join(":");
 }
 
+import { handleObjectPlane } from "./object-store";
+
 export interface Env {
   WORKFLOW_INSTANCE: DurableObjectNamespace;
+  // The external byte tier (DR-0113). Optional: a deployment without it keeps
+  // the text-only behaviour and says so rather than pretending otherwise.
+  WHIP_OBJECTS?: R2Bucket;
   // Private/legacy workflow credentials. Public sessions never consult these.
   ANTHROPIC_API_KEY?: string;
   OPENAI_API_KEY?: string;
@@ -1325,6 +1334,23 @@ export class WorkflowInstance implements DurableObject {
     }
     if (url.pathname === "/host/policy") {
       return this.bootstrapHostPolicy(parsed);
+    }
+    // Registering a handle, not uploading bytes. The object plane is
+    // placement-agnostic on purpose — content-addressed bytes serve every
+    // placement that names the same id — so which placement holds a handle is
+    // said here, through the authenticated route, rather than in the key.
+    if (url.pathname === "/host/objects/register") {
+      const id = typeof parsed?.id === "string" ? parsed.id : "";
+      const byteLen = typeof parsed?.byte_len === "number" ? parsed.byte_len : Number.NaN;
+      if (!Number.isInteger(byteLen) || byteLen < 0) {
+        return Response.json({ error: "byte_len must be a non-negative whole number" }, { status: 400 });
+      }
+      try {
+        hostFunctions.host_register_external_object(makeBridge(this.ctx.storage), id, byteLen);
+      } catch (error) {
+        return Response.json({ error: String(error) }, { status: 400 });
+      }
+      return Response.json({ registered: id, byte_len: byteLen });
     }
     if (url.pathname === "/host/instances/open") {
       return this.openHostInstance(parsed);
@@ -4919,7 +4945,19 @@ export default {
     if (url.pathname === "/healthz") {
       return Response.json({ ok: true });
     }
-    const authError = controlAuthError(request, env) ?? requestBodyTooLarge(request);
+    // Authorised like every other control-plane route, but deliberately ahead
+    // of `requestBodyTooLarge`: that cap exists for JSON control bodies the
+    // isolate parses, and the object plane is the one route whose whole job is
+    // bytes too large to hold. It streams rather than buffers, so the cap would
+    // reject exactly the traffic this tier exists to carry.
+    const objectAuthError = controlAuthError(request, env);
+    if (!objectAuthError) {
+      const object = await handleObjectPlane(request, env);
+      if (object) {
+        return object;
+      }
+    }
+    const authError = objectAuthError ?? requestBodyTooLarge(request);
     if (authError) {
       return authError;
     }

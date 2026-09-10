@@ -542,19 +542,28 @@ impl<S: DoStorage, O: ObjectStore> FileStore for TieredFileStore<S, O> {
 
     fn write(&self, path: &Path, bytes: &[u8]) -> io::Result<()> {
         let key = storage_key(path);
-        if bytes.len() >= self.threshold_bytes {
-            // Large tier: spill to the object store, drop any inline copy.
+        // Size is not the only thing that decides the tier: the inline tier is
+        // a SQLite TEXT value, so content that is not text cannot live there
+        // at any size. This used to inline it through `from_utf8_lossy`, which
+        // does not fail — it substitutes U+FFFD and reports success, so a
+        // 100 KiB picture was silently replaced with replacement characters
+        // while a 200 KiB one round-tripped intact. A corruption that depends
+        // on a file's size is worse than a refusal, because the small case
+        // looks like it worked.
+        let inlines = bytes.len() < self.threshold_bytes && std::str::from_utf8(bytes).is_ok();
+        if !inlines {
+            // Object tier: exact bytes, and drop any inline copy.
             if self.storage.file_exists(&key) {
                 self.storage.write_file(&key, "")?;
             }
             self.objects.put(&key, bytes)
         } else {
-            // Small tier: inline in SQLite, drop any spilled copy.
+            // Inline tier: text in SQLite, and drop any spilled copy.
             if self.objects.exists(&key) {
                 self.objects.delete(&key)?;
             }
-            self.storage
-                .write_file(&key, &String::from_utf8_lossy(bytes))
+            let text = std::str::from_utf8(bytes).expect("checked just above");
+            self.storage.write_file(&key, text)
         }
     }
 
@@ -746,6 +755,53 @@ mod tests {
         assert!(store.storage.file_exists("b.bin"));
         assert!(!store.objects.exists("b.bin"));
         assert_eq!(store.read_to_string(big).expect("read shrunk"), "tiny");
+    }
+
+    /// A small file that is not text takes the object tier, not a lossy
+    /// transcription of itself.
+    ///
+    /// Until 2026-09-09 the inline arm wrote `String::from_utf8_lossy(bytes)`,
+    /// which does not fail — it substitutes U+FFFD and reports success. So a
+    /// picture under the threshold was silently replaced with replacement
+    /// characters while an identical picture over the threshold round-tripped
+    /// intact: a corruption whose presence depended on the file's size, and
+    /// whose small case looked like it had worked.
+    #[test]
+    fn a_small_file_that_is_not_text_keeps_its_bytes() {
+        let store = TieredFileStore {
+            storage: MemStorage::default(),
+            objects: MemObjects::default(),
+            threshold_bytes: 1024,
+        };
+        let shot = Path::new("shot.png");
+        // Well under the threshold, and not decodable as UTF-8.
+        let picture: [u8; 12] = [
+            0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 0xff, 0xfe, 0x00, 0x0d,
+        ];
+
+        store.write(shot, &picture).expect("a picture is writable");
+        assert!(
+            store.objects.exists("shot.png"),
+            "content that is not text takes the object tier whatever its size"
+        );
+        assert!(
+            !store.storage.file_exists("shot.png"),
+            "and not the inline tier"
+        );
+        assert_eq!(
+            store.objects.get("shot.png").expect("read").as_deref(),
+            Some(&picture[..]),
+            "byte-identical: the lossy inline path would have returned U+FFFD here"
+        );
+        assert!(store.exists(shot));
+
+        // Small text still inlines — the rule added a reason to spill, it did
+        // not move the size boundary.
+        store
+            .write(Path::new("n.md"), b"notes")
+            .expect("text write");
+        assert!(store.storage.file_exists("n.md"));
+        assert!(!store.objects.exists("n.md"));
     }
 
     #[test]

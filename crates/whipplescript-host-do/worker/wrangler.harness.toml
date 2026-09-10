@@ -25,6 +25,14 @@ rules = [{ type = "Text", globs = ["**/*.sql"] }]
 
 # The Durable Object holding one workflow instance. `new_sqlite_classes` gives it
 # the SQLite-backed storage the runtime store is ported to (do_store.rs / DoSql).
+# The external byte tier (DR-0113): content that cannot live in a DO SQLite
+# value — anything that is not text, and text past the value ceiling — is held
+# here under its own content id, streamed through the Worker's `/v1/objects`
+# plane so the isolate never buffers it.
+[[r2_buckets]]
+binding = "WHIP_OBJECTS"
+bucket_name = "whip-objects-harness"
+
 [[durable_objects.bindings]]
 name = "WORKFLOW_INSTANCE"
 class_name = "WorkflowInstance"

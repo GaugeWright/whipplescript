@@ -255,6 +255,42 @@
       }
     },
     {
+      "id": "runtime.host.objects.register",
+      "jurisdiction": "managed-workflow-placement",
+      "transport": "http-json",
+      "method": "POST",
+      "path": "/host/objects/register",
+      "producer": "whipplescript-host-worker",
+      "consumer": "WhippleScript host protocol client",
+      "authentication": "runtime-control-bearer",
+      "scope": "tenant-placement",
+      "capability": "workflow-control",
+      "requestSchema": "typescript:whipplescript-runtime/runtime.host.objects.register/request",
+      "responseSchema": "typescript:whipplescript-runtime/runtime.host.objects.register/response",
+      "sideEffect": "mutation",
+      "risk": "important",
+      "compatibility": {
+        "contractVersion": 1,
+        "minimumConsumer": 1,
+        "maximumConsumer": null
+      },
+      "evidence": {
+        "contract": [
+          "src/authenticated-host.integration.test.ts#declared-route-surface"
+        ],
+        "authority": [
+          "src/authenticated-host.integration.test.ts#declared-route-surface"
+        ],
+        "journey": [
+          "src/authenticated-host.integration.test.ts#authenticated-placement-journey"
+        ],
+        "deployed": [],
+        "property": [
+          "src/authenticated-host.integration.test.ts#declared-route-surface"
+        ]
+      }
+    },
+    {
       "id": "runtime.host.instance.open",
       "jurisdiction": "managed-workflow-placement",
       "transport": "http-json",

@@ -24,6 +24,8 @@ fn hosted_retained_publication_rolls_back_every_sql_boundary() {
         let injected = Rc::new(FaultySql::new(sql, fail_at));
         let content = DoContentBlobs {
             sql: injected.clone(),
+            external: None,
+            threshold_bytes: crate::DEFAULT_TIER_THRESHOLD_BYTES,
         };
         let mut branches = DoBranches {
             sql: injected.clone(),
@@ -97,7 +99,11 @@ fn a_sql_host_cannot_invoke_retained_publication_twice() {
     let id = content.put_text("prepared").expect("prepare");
     let mut branches = DoBranches::new(sql.clone()).expect("branches");
     let before = branches.ensure_mainline("t0").expect("init");
-    let broken = DoContentBlobs { sql: Repeated(sql) };
+    let broken = DoContentBlobs {
+        sql: Repeated(sql),
+        external: None,
+        threshold_bytes: crate::DEFAULT_TIER_THRESHOLD_BYTES,
+    };
     let error = broken
         .publish_retained(std::slice::from_ref(&id), || {
             branches.commit_write(conformance::cut("candidate", None))

@@ -338,6 +338,50 @@ pub fn host_current_position(bridge: DoSqlBridge, instance_id: &str) -> Result<S
     serde_json::to_string(&position).map_err(|error| JsValue::from_str(&error.to_string()))
 }
 
+/// Record that content of this id and length lives on the object plane.
+///
+/// The byte path does not come through here and cannot: this isolate is
+/// synchronous throughout and R2 is not, which is why the plane is a Worker
+/// route. By the time this is called the plane has streamed the bytes to the
+/// bucket under a server-side checksum, so the id provably describes them and
+/// all that is left is the durable fact — a small synchronous write.
+#[wasm_bindgen]
+pub fn host_register_external_object(
+    bridge: DoSqlBridge,
+    id: &str,
+    byte_len: f64,
+) -> Result<(), JsValue> {
+    let byte_len =
+        crate::do_branches::checked_byte_len(byte_len).map_err(|e| JsValue::from_str(&e))?;
+    let blobs = crate::do_branches::DoContentBlobs::new(std::rc::Rc::new(JsDoSql { bridge }))
+        .map_err(|error| JsValue::from_str(&format!("{error:?}")))?;
+    blobs
+        .register_external(id, byte_len)
+        .map_err(|error| JsValue::from_str(&format!("{error:?}")))
+}
+
+/// Ids whose bytes are erased by decision and await collection from the bucket,
+/// as a JSON array. The plane drains this; the isolate cannot delete from R2.
+#[wasm_bindgen]
+pub fn host_pending_external_deletes(bridge: DoSqlBridge, limit: u32) -> Result<String, JsValue> {
+    let blobs = crate::do_branches::DoContentBlobs::new(std::rc::Rc::new(JsDoSql { bridge }))
+        .map_err(|error| JsValue::from_str(&format!("{error:?}")))?;
+    let pending = blobs
+        .pending_external_deletes(limit)
+        .map_err(|error| JsValue::from_str(&format!("{error:?}")))?;
+    serde_json::to_string(&pending).map_err(|error| JsValue::from_str(&error.to_string()))
+}
+
+/// Forget a pending deletion once the plane reports the bytes actually gone.
+#[wasm_bindgen]
+pub fn host_external_delete_collected(bridge: DoSqlBridge, id: &str) -> Result<(), JsValue> {
+    let blobs = crate::do_branches::DoContentBlobs::new(std::rc::Rc::new(JsDoSql { bridge }))
+        .map_err(|error| JsValue::from_str(&format!("{error:?}")))?;
+    blobs
+        .external_delete_collected(id)
+        .map_err(|error| JsValue::from_str(&format!("{error:?}")))
+}
+
 /// Export the source agent's live thread at one exact event coordinate. The
 /// source package/policy binding and quiescence are revalidated before any
 /// transcript projection leaves its placement.

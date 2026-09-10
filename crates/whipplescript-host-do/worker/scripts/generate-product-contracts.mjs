@@ -16,6 +16,10 @@ const publicOperations = [
 
 const hostOperations = [
   ["runtime.host.policy", "POST", "/host/policy", "http-json", "mutation", "critical"],
+  // A handle, not bytes: the object plane streams the content and this records
+  // that it exists (DR-0113). Important rather than critical — it asserts a fact
+  // about content already placed and verified, and cannot itself move any.
+  ["runtime.host.objects.register", "POST", "/host/objects/register", "http-json", "mutation", "important"],
   ["runtime.host.instance.open", "POST", "/host/instances/open", "http-json", "session", "critical"],
   ["runtime.host.turn.begin", "POST", "/host/turns", "http-json", "mutation", "critical"],
   ["runtime.host.fork.import", "POST", "/host/forks/import", "http-json", "mutation", "critical"],

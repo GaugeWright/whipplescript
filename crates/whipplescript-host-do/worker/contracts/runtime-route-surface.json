@@ -80,6 +80,17 @@
       "authentication": "runtime-control-bearer"
     },
     {
+      "id": "runtime.host.objects.register",
+      "method": "POST",
+      "path": "/host/objects/register",
+      "samplePath": "/host/objects/register",
+      "transport": "http-json",
+      "sideEffect": "mutation",
+      "risk": "important",
+      "producer": "whipplescript-host-worker",
+      "authentication": "runtime-control-bearer"
+    },
+    {
       "id": "runtime.host.instance.open",
       "method": "POST",
       "path": "/host/instances/open",

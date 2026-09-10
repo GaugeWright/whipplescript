@@ -1309,8 +1309,44 @@ fn decode_op_row(row: &[SqlValue]) -> StoreResult<OpRow> {
 /// Content blobs over the DO's `content_blobs` table — the same table
 /// checkpoint manifests live in, so branch manifests and cut manifests
 /// share one blob space (exactly as native).
+/// A content id is `stable_hash_bytes_hex`: SHA-256 truncated to sixteen bytes,
+/// hex. The object plane keys on exactly this, so a registration naming
+/// anything else would put a row here that no object can ever answer.
+fn is_content_id(id: &str) -> bool {
+    id.len() == 32
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
+/// A JS number as a byte length, or a refusal naming why it is not one.
+///
+/// The wasm boundary hands every number across as `f64`, so "non-negative whole
+/// number" is a real check rather than a type. It lives here, apart from the
+/// export, because a refusal reachable only through a `DoSqlBridge` is a
+/// refusal no test can pin.
+pub fn checked_byte_len(value: f64) -> Result<u64, String> {
+    if !value.is_finite() || value < 0.0 || value.fract() != 0.0 {
+        return Err("byte_len must be a non-negative whole number".to_owned());
+    }
+    Ok(value as u64)
+}
+
 pub struct DoContentBlobs<S: DoSql> {
     sql: S,
+    /// This host records handles; it does not move bytes.
+    ///
+    /// A durable object's Rust surface is synchronous throughout, because DO
+    /// SQLite is — there is no await point anywhere in it. R2 is async only,
+    /// so no synchronous `put` here can reach an object store at any size.
+    /// Bytes travel on the Worker's object plane and this isolate learns only
+    /// that they exist, which is what DR-0033 Decision 4 meant by "the isolate
+    /// touches only handle + metadata".
+    external: Option<Box<dyn crate::ObjectStore>>,
+    /// Content at or above this size spills even when it is text: DO SQLite
+    /// caps a stored value around 2 MiB, and a large inline body bloats the
+    /// row cache and the write-amplified transaction it rides in.
+    threshold_bytes: usize,
 }
 
 impl<S: DoSql> DoContentBlobs<S> {
@@ -1361,9 +1397,118 @@ impl<S: DoSql> DoContentBlobs<S> {
             &[],
         )
         .map_err(sql_err)?;
-        let store = Self { sql };
+        // The external tier's index. A separate table rather than a column on
+        // `content_blobs`, for the reason the erasure ledger is separate: it is
+        // purely additive, so a store written by an older build gains it with a
+        // CREATE and needs no ALTER on a live durable object.
+        sql.execute(
+            "CREATE TABLE IF NOT EXISTS content_external_blobs (
+                id TEXT PRIMARY KEY,
+                byte_len INTEGER NOT NULL
+            )",
+            &[],
+        )
+        .map_err(sql_err)?;
+        // Erasure is two acts on this host: the isolate can drop the record
+        // synchronously, but only the object plane can delete from the bucket.
+        // The queue is what makes the second half findable after the first.
+        sql.execute(
+            "CREATE TABLE IF NOT EXISTS content_external_pending_delete (
+                id TEXT PRIMARY KEY
+            )",
+            &[],
+        )
+        .map_err(sql_err)?;
+        let store = Self {
+            sql,
+            external: None,
+            threshold_bytes: crate::DEFAULT_TIER_THRESHOLD_BYTES,
+        };
         store.backfill_erasure_ledger()?;
         Ok(store)
+    }
+
+    /// The same store with a **synchronous** object store bound.
+    ///
+    /// For hosts that can actually drive one — native stores, and tests. Not
+    /// the durable object: see the note on `external`, and use
+    /// [`register_external`] there instead.
+    ///
+    /// [`register_external`]: Self::register_external
+    pub fn with_external_bytes(sql: S, external: Box<dyn crate::ObjectStore>) -> StoreResult<Self> {
+        let mut blobs = Self::new(sql)?;
+        blobs.external = Some(external);
+        Ok(blobs)
+    }
+
+    /// Override the spill threshold (tests, and any host whose value ceiling
+    /// differs from the durable object's).
+    pub fn set_threshold_bytes(&mut self, bytes: usize) {
+        self.threshold_bytes = bytes;
+    }
+
+    /// Whether this body can live in a SQLite text value.
+    fn inlines(&self, body: &[u8]) -> bool {
+        body.len() < self.threshold_bytes && std::str::from_utf8(body).is_ok()
+    }
+
+    /// Record that content of this id and length exists on the object plane.
+    ///
+    /// The plane has already placed and verified the bytes — it streams them to
+    /// the bucket under a server-side checksum, so by the time this is called
+    /// the id provably describes them. All that is left is the durable fact
+    /// that they are there, which is a small synchronous write this isolate can
+    /// make.
+    pub fn register_external(&self, id: &str, byte_len: u64) -> StoreResult<()> {
+        if !is_content_id(id) {
+            return Err(StoreError::Conflict(format!(
+                "`{id}` is not a content id; the object plane keys on the hash of the bytes"
+            )));
+        }
+        self.sql
+            .execute(
+                "INSERT OR IGNORE INTO content_external_blobs (id, byte_len) VALUES (?1, ?2)",
+                &[text(id), SqlValue::Int(byte_len as i64)],
+            )
+            .map_err(sql_err)?;
+        Ok(())
+    }
+
+    /// Ids whose bytes are erased by decision and still await collection from
+    /// the bucket. The object plane drains this; the isolate cannot delete
+    /// from R2 itself.
+    pub fn pending_external_deletes(&self, limit: u32) -> StoreResult<Vec<String>> {
+        let rows = self
+            .sql
+            .query(
+                "SELECT id FROM content_external_pending_delete ORDER BY id LIMIT ?1",
+                &[SqlValue::Int(i64::from(limit))],
+            )
+            .map_err(sql_err)?;
+        Ok(rows.iter().map(|row| as_text(&row[0])).collect())
+    }
+
+    /// Forget a pending deletion once the bytes are actually gone.
+    pub fn external_delete_collected(&self, id: &str) -> StoreResult<()> {
+        self.sql
+            .execute(
+                "DELETE FROM content_external_pending_delete WHERE id = ?1",
+                &[text(id)],
+            )
+            .map_err(sql_err)?;
+        Ok(())
+    }
+
+    /// The recorded length of a spilled blob, if this id is one.
+    fn external_len(&self, id: &str) -> StoreResult<Option<u64>> {
+        let rows = self
+            .sql
+            .query(
+                "SELECT byte_len FROM content_external_blobs WHERE id = ?1",
+                &[text(id)],
+            )
+            .map_err(sql_err)?;
+        Ok(rows.first().map(|row| as_i64(&row[0]) as u64))
     }
 }
 
@@ -1478,28 +1623,49 @@ impl<S: DoSql> ContentBlobs for DoContentBlobs<S> {
         })
     }
 
-    /// Text only, and it says so.
+    /// Two tiers, one id.
     ///
     /// `SqlValue` carries Null, Int and Text — there is no blob variant, and
     /// adding one crosses the JS binding in `do_wasm.rs` into the Worker's
-    /// `state.storage.sql`. So this host cannot yet hold the bytes the native
-    /// store now holds, and the honest thing is to refuse content it would
-    /// have to mangle rather than store a lossy transcription under a hash
-    /// that no longer describes it. A workspace with a picture in it does not
-    /// sync here until `SqlValue` grows a blob variant.
+    /// `state.storage.sql`. So text small enough for a SQLite value inlines
+    /// here as it always has, and everything else — content that is not text,
+    /// and text past the value ceiling — goes to the object store bound by
+    /// `with_external_bytes`. The id is the hash of the exact bytes in both
+    /// cases, so nothing above this seam can tell which tier answered.
+    ///
+    /// Without an object store the old refusal stands, because a host with
+    /// nowhere to put bytes should say so rather than store a lossy
+    /// transcription under a hash that no longer describes it.
     fn put(&self, body: &[u8]) -> StoreResult<String> {
-        let Ok(body) = std::str::from_utf8(body) else {
+        if self.inlines(body) {
+            let text_body = std::str::from_utf8(body).expect("checked by `inlines`");
+            let id = stable_hash_hex(text_body);
+            self.sql
+                .execute(
+                    "INSERT OR IGNORE INTO content_blobs (id, body, byte_len) VALUES (?1, ?2, ?3)",
+                    &[text(&id), text(text_body), SqlValue::Int(body.len() as i64)],
+                )
+                .map_err(sql_err)?;
+            return Ok(id);
+        }
+        let Some(external) = self.external.as_ref() else {
             return Err(StoreError::Conflict(
-                "this host stores text only; content that is not text needs a blob-capable \
-                 SQL value (SqlValue has no blob variant yet)"
+                "this host stores text only; content that is not text needs an external byte \
+                 tier (build the store with `with_external_bytes`)"
                     .to_owned(),
             ));
         };
-        let id = stable_hash_hex(body);
+        let id = whipplescript_store::stable_hash_bytes_hex(body);
+        // Bytes first, then the row that claims they exist. The other order
+        // leaves an index entry pointing at nothing after a failed write, and
+        // `get` would report absent for content `status` calls Live.
+        external
+            .put(&id, body)
+            .map_err(|error| StoreError::Conflict(format!("external byte tier: {error}")))?;
         self.sql
             .execute(
-                "INSERT OR IGNORE INTO content_blobs (id, body, byte_len) VALUES (?1, ?2, ?3)",
-                &[text(&id), text(body), SqlValue::Int(body.len() as i64)],
+                "INSERT OR IGNORE INTO content_external_blobs (id, byte_len) VALUES (?1, ?2)",
+                &[text(&id), SqlValue::Int(body.len() as i64)],
             )
             .map_err(sql_err)?;
         Ok(id)
@@ -1510,7 +1676,26 @@ impl<S: DoSql> ContentBlobs for DoContentBlobs<S> {
             .sql
             .query("SELECT body FROM content_blobs WHERE id = ?1", &[text(id)])
             .map_err(sql_err)?;
-        Ok(rows.first().map(|row| as_text(&row[0]).into_bytes()))
+        if let Some(row) = rows.first() {
+            return Ok(Some(as_text(&row[0]).into_bytes()));
+        }
+        if let Some(byte_len) = self.external_len(id)? {
+            // A host that can drive a synchronous store fetches it.
+            if let Some(external) = self.external.as_ref() {
+                return external
+                    .get(id)
+                    .map_err(|error| StoreError::Conflict(format!("external byte tier: {error}")));
+            }
+            // Otherwise the content exists and this isolate cannot reach it.
+            // Saying so is the only honest answer: `None` would mean absent,
+            // which is the substitution DR-0066 §5 refuses, and there are no
+            // bytes to return because there is no await point to fetch them.
+            return Err(StoreError::Conflict(format!(
+                "`{id}` holds {byte_len} bytes on the object plane; this host records the \
+                 handle and cannot materialize it — read it through the object route"
+            )));
+        }
+        Ok(None)
     }
 
     /// Native parity for DR-0066 §5. Live from the blob row, else the
@@ -1531,6 +1716,12 @@ impl<S: DoSql> ContentBlobs for DoContentBlobs<S> {
             return Ok(BlobStatus::Live {
                 byte_len: as_i64(&row[0]) as u64,
             });
+        }
+        // Spilled content is just as Live. `status` and `get` must agree about
+        // whether a blob exists — a disagreement reads to everything above as
+        // a successful erasure.
+        if let Some(byte_len) = self.external_len(id)? {
+            return Ok(BlobStatus::Live { byte_len });
         }
         let erased = self
             .sql
@@ -1570,9 +1761,16 @@ impl<S: DoSql> ContentBlobs for DoContentBlobs<S> {
                 &[text(id)],
             )
             .map_err(sql_err)?;
-        let Some(row) = live.first() else {
-            // Not live. Either it was already erased — an idempotent retry,
-            // which must not read as "never existed" — or nothing was stored.
+        let inline_len = live.first().map(|row| as_i64(&row[0]));
+        // Spilled content is erasable too, and by the same promise: an id whose
+        // bytes are gone must answer *erased*, never *absent*. Leaving the
+        // external tier out here would have made erasure silently depend on
+        // which side of the threshold a blob happened to land.
+        let external_len = self.external_len(id)?.map(|len| len as i64);
+        let Some(byte_len) = inline_len.or(external_len) else {
+            // Not live in either tier. Either it was already erased — an
+            // idempotent retry, which must not read as "never existed" — or
+            // nothing was stored.
             let tombstoned = self
                 .sql
                 .query(
@@ -1586,7 +1784,6 @@ impl<S: DoSql> ContentBlobs for DoContentBlobs<S> {
                 None => EraseOutcome::Unknown,
             });
         };
-        let byte_len = as_i64(&row[0]);
         // Tombstone BEFORE the delete. The other order has a crash window that
         // produces exactly the *absent*-for-*erased* substitution §5 refuses,
         // and it is the same bottom-up discipline DR-0066 §4 applies to
@@ -1601,6 +1798,36 @@ impl<S: DoSql> ContentBlobs for DoContentBlobs<S> {
         self.sql
             .execute("DELETE FROM content_blobs WHERE id = ?1", &[text(id)])
             .map_err(sql_err)?;
+        // Drop the index row before the object: while the row is gone and the
+        // bytes are not, the blob reads as erased, which is true. The reverse
+        // window would have `status` claim Live over bytes already deleted.
+        if external_len.is_some() {
+            self.sql
+                .execute(
+                    "DELETE FROM content_external_blobs WHERE id = ?1",
+                    &[text(id)],
+                )
+                .map_err(sql_err)?;
+            match self.external.as_ref() {
+                // A synchronous store is deleted from here and now.
+                Some(external) => external.delete(id).map_err(|error| {
+                    StoreError::Conflict(format!("external byte tier: {error}"))
+                })?,
+                // Otherwise the bytes are forfeit by decision and collected
+                // later. The id already answers *erased* from its tombstone,
+                // which is the honest answer while collection is pending: the
+                // decision is durable even though the payload has not gone yet.
+                None => {
+                    self.sql
+                        .execute(
+                            "INSERT OR IGNORE INTO content_external_pending_delete (id) \
+                             VALUES (?1)",
+                            &[text(id)],
+                        )
+                        .map_err(sql_err)?;
+                }
+            }
+        }
         Ok(EraseOutcome::Erased {
             byte_len: byte_len as u64,
         })

@@ -1615,7 +1615,10 @@ describe("real WorkflowInstance hibernation", () => {
       || path.startsWith("/host/")
       || path.startsWith("/public/session/")
     );
-    expect(operations.length).toBe(28);
+    // Bumped with `runtime.host.objects.register` (DR-0113). The count is a
+    // tripwire: a route added to the surface without a thought about this
+    // suite trips it, and every operation below is then exercised for real.
+    expect(operations.length).toBe(29);
 
     for (const operation of operations) {
       for (const authorization of [undefined, "Bearer wrong-control-token"]) {

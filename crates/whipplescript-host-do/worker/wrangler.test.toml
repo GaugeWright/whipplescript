@@ -34,6 +34,17 @@ new_sqlite_classes = ["WorkflowInstance", "TestDeployment", "TestCredentialRegis
 tag = "v2"
 new_sqlite_classes = ["WorkspaceBroker", "TestExecutor"]
 
+# The external byte tier (DR-0113). The workers pool simulates R2 locally, so
+# the streaming data plane is exercised against a real bucket API rather than a
+# double.
+[[r2_buckets]]
+binding = "WHIP_OBJECTS"
+bucket_name = "whip-objects-test"
+
 [vars]
 WHIP_SESSION_TOKEN = "session-token"
+# The host control-plane credential. The existing suites only exercise
+# `/public/session/*`, which authenticates with WHIP_SESSION_TOKEN, so this had
+# no reason to exist here until the object plane — a `/v1/...` route — needed it.
+WHIP_CONTROL_TOKEN = "control-token"
 WHIP_PUBLIC_CONTROL_TOKEN = "public-control-secret"
