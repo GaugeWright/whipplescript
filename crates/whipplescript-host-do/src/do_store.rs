@@ -7724,6 +7724,7 @@ impl<Sql: DoSql> WorkItems for DoSqliteStore<Sql> {
         labels: &[String],
         metadata: &serde_json::Value,
         filed_by: Option<&str>,
+        assigned_to: Option<&str>,
     ) -> StoreResult<WorkItem> {
         let now = do_now(&self.sql)?;
         // Mint the next sequential id (`WS-1`, `WS-2`, …); single-writer per
@@ -7750,6 +7751,7 @@ impl<Sql: DoSql> WorkItems for DoSqliteStore<Sql> {
             "labels": labels,
             "metadata": metadata,
             "filed_by": filed_by,
+            "assigned_to": assigned_to,
         });
         // Opaque merge identity = the content-hash of the creation event; WS-N
         // is only a local alias for it. The event log is keyed by content_id.
@@ -7781,8 +7783,8 @@ impl<Sql: DoSql> WorkItems for DoSqliteStore<Sql> {
         self.sql
             .execute(
                 "INSERT INTO tracker_issues \
-                 (issue_id, queue, title, body, status, labels_json, metadata_json, filed_by, created_at, updated_at) \
-                 VALUES (?1, ?2, ?3, ?4, 'open', ?5, ?6, ?7, ?8, ?8)",
+                 (issue_id, queue, title, body, status, labels_json, metadata_json, filed_by, assigned_to, created_at, updated_at) \
+                 VALUES (?1, ?2, ?3, ?4, 'open', ?5, ?6, ?7, ?8, ?9, ?9)",
                 &[
                     text(&item_id),
                     text(queue),
@@ -7791,6 +7793,7 @@ impl<Sql: DoSql> WorkItems for DoSqliteStore<Sql> {
                     text(&labels_json),
                     text(&metadata.to_string()),
                     opt_text(filed_by),
+                    opt_text(assigned_to),
                     text(&now),
                 ],
             )
@@ -10465,6 +10468,7 @@ pub(crate) mod tests {
             &[],
             &serde_json::json!({}),
             None,
+            None,
         )
         .expect("file");
         assert!(WorkItems::subscribe_events(&mut store, "agent:a", "triage").expect("subscribe"));
@@ -10543,6 +10547,7 @@ pub(crate) mod tests {
             &[],
             &serde_json::json!({}),
             None,
+            None,
         )
         .expect("file");
         assert_eq!(
@@ -10589,6 +10594,7 @@ pub(crate) mod tests {
             &[],
             &serde_json::json!({}),
             Some("f"),
+            None,
         )
         .expect("file a");
         let b = WorkItems::file_item(
@@ -10598,6 +10604,7 @@ pub(crate) mod tests {
             "",
             &[],
             &serde_json::json!({}),
+            None,
             None,
         )
         .expect("file b");
@@ -10685,6 +10692,7 @@ pub(crate) mod tests {
             &[],
             &serde_json::json!({}),
             Some("s:a"),
+            None,
         )
         .expect("file");
         store
@@ -10706,6 +10714,7 @@ pub(crate) mod tests {
             &[],
             &serde_json::json!({}),
             Some("s:a"),
+            None,
         )
         .expect("file");
         store.claim_item(&second.id, "ins-x", None).expect("claim");
@@ -10737,6 +10746,7 @@ pub(crate) mod tests {
             &[],
             &serde_json::json!({}),
             Some("s:a"),
+            None,
         )
         .expect("file");
         let content_id = WorkItems::subject_content_id(&store, &issue.id)
@@ -10971,9 +10981,17 @@ pub(crate) mod tests {
     #[test]
     fn do_tracker_is_content_addressed_and_merges_to_a_conflict() {
         let mut a = store();
-        let issue =
-            WorkItems::file_item(&mut a, "q", "Shared", "", &[], &serde_json::json!({}), None)
-                .expect("file");
+        let issue = WorkItems::file_item(
+            &mut a,
+            "q",
+            "Shared",
+            "",
+            &[],
+            &serde_json::json!({}),
+            None,
+            None,
+        )
+        .expect("file");
         assert_eq!(issue.id, "WS-1");
 
         // Identity = content hash; no event is keyed by the WS-N alias.
@@ -15299,7 +15317,7 @@ pub(crate) mod tests {
         // that threaded a parameter past them.
         let mut store = store();
         let real = store
-            .file_item("q", "t", "", &[], &serde_json::json!({}), None)
+            .file_item("q", "t", "", &[], &serde_json::json!({}), None, None)
             .expect("file");
 
         let message = |error: StoreError| -> String {
@@ -15336,7 +15354,7 @@ pub(crate) mod tests {
         // performing them; this pins that the DO write path consults the scope.
         let mut store = store();
         let filed = store
-            .file_item("q", "t", "", &[], &serde_json::json!({}), None)
+            .file_item("q", "t", "", &[], &serde_json::json!({}), None, None)
             .expect("file");
         store.set_event_effect_id(Some("eff-claim"));
         store

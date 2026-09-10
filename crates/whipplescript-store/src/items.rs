@@ -369,6 +369,26 @@ impl WorkItemStore {
     /// speakable to an agent, and byte-identical items get distinct ids.
     /// Appends `issue.created` and folds it into the issue projection in one
     /// transaction.
+    /// Files an issue, optionally already assigned (DR-0110).
+    ///
+    /// `assigned_to` is who *should* act. It is a string and deliberately
+    /// nothing more: this crate has no authority model, so it does not resolve
+    /// the name, check that the party exists, or gate `claim`/`finish` on it
+    /// (DR-0002 — a claim is the lease, assignment is metadata beside it). A
+    /// host that can authenticate a person resolves the name before it reaches
+    /// here.
+    ///
+    /// It goes into the `issue.created` payload, not only the row, for the
+    /// reason the module header gives: the row is a projection, and an
+    /// assignment that lived only in the row would vanish on
+    /// `rebuild_projection`. Being in the payload puts it inside the event's
+    /// content id, so an issue filed assigned and the same issue filed
+    /// unassigned are different creation facts — which is correct, because
+    /// they are.
+    // A filing is eight facts about one issue; grouping them into a struct
+    // would name the same eight in a second place. The sibling handlers here
+    // take the same allow.
+    #[allow(clippy::too_many_arguments)]
     pub fn file_item(
         &mut self,
         queue: &str,
@@ -377,6 +397,7 @@ impl WorkItemStore {
         labels: &[String],
         metadata: &Value,
         filed_by: Option<&str>,
+        assigned_to: Option<&str>,
     ) -> StoreResult<WorkItem> {
         let tx = self
             .connection
@@ -397,6 +418,7 @@ impl WorkItemStore {
             "labels": labels,
             "metadata": metadata,
             "filed_by": filed_by,
+            "assigned_to": assigned_to,
         });
         let payload_json = payload.to_string();
         // The issue's opaque MERGE identity = the content-hash of its creation
@@ -420,9 +442,11 @@ impl WorkItemStore {
         )?;
         tx.execute(
             "INSERT INTO tracker_issues \
-             (issue_id, queue, title, body, status, labels_json, metadata_json, filed_by, created_at, updated_at) \
-             VALUES (?1, ?2, ?3, ?4, 'open', ?5, ?6, ?7, ?8, ?8)",
-            params![item_id, queue, title, body, labels_json, metadata_json, filed_by, now],
+             (issue_id, queue, title, body, status, labels_json, metadata_json, filed_by, assigned_to, created_at, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, 'open', ?5, ?6, ?7, ?8, ?9, ?9)",
+            params![
+                item_id, queue, title, body, labels_json, metadata_json, filed_by, assigned_to, now
+            ],
         )?;
         tx.commit()?;
         self.get_item(&item_id)?
@@ -2846,8 +2870,8 @@ fn fold_event(
                 .map_or_else(|| "{}".to_owned(), std::string::ToString::to_string);
             tx.execute(
                 "INSERT INTO tracker_issues \
-                 (issue_id, queue, title, body, status, labels_json, metadata_json, filed_by, created_at, updated_at) \
-                 VALUES (?1, ?2, ?3, ?4, 'open', ?5, ?6, ?7, ?8, ?8)",
+                 (issue_id, queue, title, body, status, labels_json, metadata_json, filed_by, assigned_to, created_at, updated_at) \
+                 VALUES (?1, ?2, ?3, ?4, 'open', ?5, ?6, ?7, ?8, ?9, ?9)",
                 params![
                     issue_id,
                     payload.get("queue").and_then(Value::as_str).unwrap_or_default(),
@@ -2856,6 +2880,9 @@ fn fold_event(
                     labels_json,
                     metadata_json,
                     payload.get("filed_by").and_then(Value::as_str),
+                    // DR-0110: fold it here too, or a rebuild silently unassigns
+                    // every issue that was filed assigned.
+                    payload.get("assigned_to").and_then(Value::as_str),
                     created_at,
                 ],
             )?;
@@ -3166,6 +3193,7 @@ pub trait WorkItems {
         queue: &str,
         position: i64,
     ) -> StoreResult<()>;
+    #[allow(clippy::too_many_arguments)]
     fn file_item(
         &mut self,
         queue: &str,
@@ -3174,6 +3202,7 @@ pub trait WorkItems {
         labels: &[String],
         metadata: &Value,
         filed_by: Option<&str>,
+        assigned_to: Option<&str>,
     ) -> StoreResult<WorkItem>;
 
     fn get_item(&self, item_id: &str) -> StoreResult<Option<WorkItem>>;
@@ -3337,8 +3366,9 @@ impl WorkItems for WorkItemStore {
         labels: &[String],
         metadata: &Value,
         filed_by: Option<&str>,
+        assigned_to: Option<&str>,
     ) -> StoreResult<WorkItem> {
-        self.file_item(queue, title, body, labels, metadata, filed_by)
+        self.file_item(queue, title, body, labels, metadata, filed_by, assigned_to)
     }
 
     fn get_item(&self, item_id: &str) -> StoreResult<Option<WorkItem>> {
@@ -3675,7 +3705,7 @@ mod tests {
     fn active_claim_subjects_track_the_holder() {
         let mut store = WorkItemStore::open_in_memory().expect("store");
         let issue = store
-            .file_item("q", "work", "", &[], &json!({}), Some("s:a"))
+            .file_item("q", "work", "", &[], &json!({}), Some("s:a"), None)
             .expect("file");
         assert!(!store.was_ever_claimed(&issue.id).expect("gate"));
         assert!(matches!(
@@ -3709,7 +3739,15 @@ mod tests {
     fn anchors_bind_merge_and_remove_as_recorded_acts() {
         let mut a = WorkItemStore::open_in_memory().expect("store a");
         let issue = a
-            .file_item("q", "close the loop", "", &[], &json!({}), Some("s:a"))
+            .file_item(
+                "q",
+                "close the loop",
+                "",
+                &[],
+                &json!({}),
+                Some("s:a"),
+                None,
+            )
             .expect("file");
         let assertion = a
             .create_assertion("custody verified", "", Some("s:a"))
@@ -3754,7 +3792,7 @@ mod tests {
     fn attest_records_the_validity_key_and_merges() {
         let mut a = WorkItemStore::open_in_memory().expect("store a");
         let issue = a
-            .file_item("q", "verify", "", &[], &json!({}), Some("s:a"))
+            .file_item("q", "verify", "", &[], &json!({}), Some("s:a"), None)
             .expect("file");
         a.add_evidence(&issue.id, Some("note"), None, Some("unkeyed"), Some("s:a"))
             .expect("evidence");
@@ -3837,7 +3875,15 @@ mod tests {
     fn files_items_with_sequential_speakable_ids() {
         let mut store = open_memory();
         let first = store
-            .file_item("backlog", "Fix login", "repro...", &[], &json!({}), None)
+            .file_item(
+                "backlog",
+                "Fix login",
+                "repro...",
+                &[],
+                &json!({}),
+                None,
+                None,
+            )
             .expect("files");
         let second = store
             .file_item(
@@ -3847,6 +3893,7 @@ mod tests {
                 &[],
                 &json!({}),
                 Some("turn-1"),
+                None,
             )
             .expect("files");
         assert_eq!(first.id, "WS-1");
@@ -3882,7 +3929,7 @@ mod tests {
     fn events_form_a_content_hash_chain() {
         let mut store = open_memory();
         let filed = store
-            .file_item("backlog", "Fix login", "repro", &[], &json!({}), None)
+            .file_item("backlog", "Fix login", "repro", &[], &json!({}), None, None)
             .expect("files");
         // A second event on the same issue (claim), so we have a chain to check.
         assert_eq!(
@@ -3917,7 +3964,7 @@ mod tests {
     fn events_are_keyed_by_opaque_content_id_not_alias() {
         let mut store = open_memory();
         let filed = store
-            .file_item("backlog", "Fix login", "repro", &[], &json!({}), None)
+            .file_item("backlog", "Fix login", "repro", &[], &json!({}), None, None)
             .expect("files");
         assert_eq!(filed.id, "WS-1");
 
@@ -3983,7 +4030,7 @@ mod tests {
         // Opening adds the Merkle-DAG columns + index rather than erroring.
         let mut store = WorkItemStore::open(&path).expect("open self-heals old schema");
         let filed = store
-            .file_item("q", "t", "", &[], &json!({}), None)
+            .file_item("q", "t", "", &[], &json!({}), None, None)
             .expect("files on the healed store");
         assert_eq!(filed.id, "WS-1");
         let _ = std::fs::remove_file(&path);
@@ -3996,10 +4043,10 @@ mod tests {
     fn rebuild_reproduces_projection_through_the_alias_bridge() {
         let mut store = open_memory();
         let a = store
-            .file_item("q", "A title", "", &[], &json!({}), None)
+            .file_item("q", "A title", "", &[], &json!({}), None, None)
             .expect("files");
         let b = store
-            .file_item("q", "B title", "", &[], &json!({}), None)
+            .file_item("q", "B title", "", &[], &json!({}), None, None)
             .expect("files");
         store.set_field(&a.id, "title", "A retitled").expect("set");
         store.add_blocks(&b.id, &a.id).expect("dep"); // b blocks a
@@ -4083,7 +4130,7 @@ mod tests {
     fn a_relation_refuses_an_alias_that_names_no_issue() {
         let mut store = open_memory();
         let real = store
-            .file_item("q", "t", "", &[], &json!({}), None)
+            .file_item("q", "t", "", &[], &json!({}), None, None)
             .unwrap();
 
         let from_missing = conflict_message(
@@ -4111,7 +4158,7 @@ mod tests {
     fn removing_a_relation_refuses_an_alias_that_names_no_issue() {
         let mut store = open_memory();
         let real = store
-            .file_item("q", "t", "", &[], &json!({}), None)
+            .file_item("q", "t", "", &[], &json!({}), None, None)
             .unwrap();
 
         let from_missing = conflict_message(
@@ -4144,7 +4191,7 @@ mod tests {
         // which is the only way a defensive refusal can be pinned at all.
         let mut store = open_memory();
         let filed = store
-            .file_item("q", "t", "", &[], &json!({}), None)
+            .file_item("q", "t", "", &[], &json!({}), None, None)
             .unwrap();
         assert_eq!(
             store
@@ -4179,7 +4226,7 @@ mod tests {
         // "which effect wrote this tracker value" is a join and not a search.
         let mut store = open_memory();
         let filed = store
-            .file_item("q", "t", "", &[], &json!({}), None)
+            .file_item("q", "t", "", &[], &json!({}), None, None)
             .unwrap();
 
         store.set_event_effect_id(Some("eff-claim"));
@@ -4210,7 +4257,7 @@ mod tests {
     fn clearing_the_scope_stops_attributing_later_writes() {
         let mut store = open_memory();
         let filed = store
-            .file_item("q", "t", "", &[], &json!({}), None)
+            .file_item("q", "t", "", &[], &json!({}), None, None)
             .unwrap();
         store.set_event_effect_id(Some("eff-claim"));
         store.claim_item(&filed.id, "instance-a", None).unwrap();
@@ -4239,7 +4286,7 @@ mod tests {
         let mut store = open_memory();
         store.set_event_effect_id(Some("eff-1"));
         let filed = store
-            .file_item("q", "t", "", &[], &json!({}), None)
+            .file_item("q", "t", "", &[], &json!({}), None, None)
             .unwrap();
         store.claim_item(&filed.id, "instance-a", None).unwrap();
 
@@ -4274,7 +4321,7 @@ mod tests {
     fn linear_field_history_never_conflicts() {
         let mut store = open_memory();
         let it = store
-            .file_item("q", "t", "", &[], &json!({}), None)
+            .file_item("q", "t", "", &[], &json!({}), None, None)
             .expect("files");
         assert!(store.set_field(&it.id, "title", "A").expect("set"));
         assert!(store.set_field(&it.id, "title", "B").expect("set"));
@@ -4292,7 +4339,7 @@ mod tests {
     fn disagreeing_fork_conflicts_and_is_not_ready() {
         let mut store = open_memory();
         let it = store
-            .file_item("q", "t", "", &[], &json!({}), None)
+            .file_item("q", "t", "", &[], &json!({}), None, None)
             .expect("files");
         let base = heads_of(&store, &it.id);
         insert_event(
@@ -4329,7 +4376,7 @@ mod tests {
     fn agreeing_fork_converges() {
         let mut store = open_memory();
         let it = store
-            .file_item("q", "t", "", &[], &json!({}), None)
+            .file_item("q", "t", "", &[], &json!({}), None, None)
             .expect("files");
         let base = heads_of(&store, &it.id);
         insert_event(
@@ -4360,7 +4407,7 @@ mod tests {
     fn different_fields_fork_does_not_conflict() {
         let mut store = open_memory();
         let it = store
-            .file_item("q", "t", "", &[], &json!({}), None)
+            .file_item("q", "t", "", &[], &json!({}), None, None)
             .expect("files");
         let base = heads_of(&store, &it.id);
         insert_event(
@@ -4391,7 +4438,7 @@ mod tests {
     fn merge_resolution_clears_conflict() {
         let mut store = open_memory();
         let it = store
-            .file_item("q", "t", "", &[], &json!({}), None)
+            .file_item("q", "t", "", &[], &json!({}), None, None)
             .expect("files");
         let base = heads_of(&store, &it.id);
         insert_event(
@@ -4442,7 +4489,7 @@ mod tests {
 
         // A creates the issue; B imports it and re-aliases it locally.
         let issue = a
-            .file_item("q", "Shared", "", &[], &json!({}), None)
+            .file_item("q", "Shared", "", &[], &json!({}), None, None)
             .expect("files");
         let report = b.import_events(&a.export_events().unwrap()).unwrap();
         assert_eq!(report.new_issues, 1, "B re-aliased A's issue");
@@ -4480,7 +4527,7 @@ mod tests {
         let mut a = open_memory();
         let mut b = open_memory();
         let issue = a
-            .file_item("q", "Shared", "", &[], &json!({}), None)
+            .file_item("q", "Shared", "", &[], &json!({}), None, None)
             .expect("files");
         b.import_events(&a.export_events().unwrap()).unwrap();
         let b_alias = "WS-1";
@@ -4508,7 +4555,7 @@ mod tests {
         let mut a = open_memory();
         let mut b = open_memory();
         let issue = a
-            .file_item("q", "Shared", "", &[], &json!({}), None)
+            .file_item("q", "Shared", "", &[], &json!({}), None, None)
             .expect("files");
         b.import_events(&a.export_events().unwrap()).unwrap();
         a.set_field(&issue.id, "status", "closed").expect("set A");
@@ -4530,7 +4577,7 @@ mod tests {
         let mut a = open_memory();
         let mut b = open_memory();
         let issue = a
-            .file_item("q", "Shared", "", &[], &json!({}), None)
+            .file_item("q", "Shared", "", &[], &json!({}), None, None)
             .expect("files");
         b.import_events(&a.export_events().unwrap()).unwrap();
 
@@ -4639,10 +4686,10 @@ mod tests {
     fn relation_kinds_gate_readiness_only_for_blocks() {
         let mut store = open_memory();
         let a = store
-            .file_item("q", "A", "", &[], &json!({}), None)
+            .file_item("q", "A", "", &[], &json!({}), None, None)
             .expect("files");
         let b = store
-            .file_item("q", "B", "", &[], &json!({}), None)
+            .file_item("q", "B", "", &[], &json!({}), None, None)
             .expect("files");
 
         // A non-blocking relation does not affect readiness.
@@ -4713,7 +4760,7 @@ mod tests {
         let mut a = open_memory();
         let mut b = open_memory();
         let issue = a
-            .file_item("q", "Shared", "", &[], &json!({}), None)
+            .file_item("q", "Shared", "", &[], &json!({}), None, None)
             .expect("files");
 
         // Seed B with A's issue through the shared directory.
@@ -4751,7 +4798,7 @@ mod tests {
     fn comments_and_evidence_attach_and_merge_once() {
         let mut a = open_memory();
         let issue = a
-            .file_item("q", "Task", "", &[], &json!({}), None)
+            .file_item("q", "Task", "", &[], &json!({}), None, None)
             .expect("files");
         a.add_comment(&issue.id, Some("worker-1"), "looks done")
             .expect("comment");
@@ -4798,9 +4845,9 @@ mod tests {
     fn reimport_is_a_silent_idempotent_resync() {
         let mut a = open_memory();
         let mut b = open_memory();
-        a.file_item("q", "One", "", &[], &json!({}), None)
+        a.file_item("q", "One", "", &[], &json!({}), None, None)
             .expect("files");
-        a.file_item("q", "Two", "", &[], &json!({}), None)
+        a.file_item("q", "Two", "", &[], &json!({}), None, None)
             .expect("files");
         let events = a.export_events().unwrap();
 
@@ -4829,7 +4876,7 @@ mod tests {
     fn projection_converges_across_import_orders() {
         let mut source = open_memory();
         let it = source
-            .file_item("q", "orig", "", &[], &json!({}), None)
+            .file_item("q", "orig", "", &[], &json!({}), None, None)
             .expect("file");
         source.set_field(&it.id, "title", "A").expect("set A");
         source.set_field(&it.id, "title", "B").expect("set B");
@@ -4862,7 +4909,7 @@ mod tests {
     fn import_rejects_events_whose_id_does_not_match_their_content() {
         let mut a = open_memory();
         let it = a
-            .file_item("q", "Original", "", &[], &json!({}), Some("ann"))
+            .file_item("q", "Original", "", &[], &json!({}), Some("ann"), None)
             .expect("files");
         a.set_field(&it.id, "title", "Legit").expect("set");
         let events = a.export_events().unwrap();
@@ -4901,9 +4948,9 @@ mod tests {
         let mut a = open_memory();
         let mut b = open_memory();
         // Two clones each file "Fix login" into queue q — same work, filed twice.
-        a.file_item("q", "Fix login", "", &[], &json!({}), Some("ann"))
+        a.file_item("q", "Fix login", "", &[], &json!({}), Some("ann"), None)
             .expect("files");
-        b.file_item("q", "Fix login", "", &[], &json!({}), Some("bob"))
+        b.file_item("q", "Fix login", "", &[], &json!({}), Some("bob"), None)
             .expect("files");
         let a_events = a.export_events().unwrap();
         let b_events = b.export_events().unwrap();
@@ -4923,7 +4970,7 @@ mod tests {
         assert_eq!(a.list_items(Some("q"), None).unwrap().len(), 2);
         // A different title in the same queue is NOT flagged.
         let mut c = open_memory();
-        c.file_item("q", "Other work", "", &[], &json!({}), None)
+        c.file_item("q", "Other work", "", &[], &json!({}), None, None)
             .expect("files");
         let clean = c.import_events(&a_events).unwrap();
         assert!(clean.duplicate_submissions.is_empty());
@@ -4936,7 +4983,7 @@ mod tests {
     fn optimistic_set_guards_on_state_token() {
         let mut store = open_memory();
         let it = store
-            .file_item("q", "t", "", &[], &json!({}), None)
+            .file_item("q", "t", "", &[], &json!({}), None, None)
             .expect("files");
         let token0 = store.issue_conflicts(&it.id).unwrap().unwrap().state_token;
 
@@ -4988,6 +5035,7 @@ mod tests {
                 &[],
                 &json!({}),
                 Some("turn-1"),
+                None,
             )
             .expect("file");
         assert_eq!(filed.id, "WS-1");
@@ -5028,7 +5076,7 @@ mod tests {
     fn ready_means_open_and_unclaimed() {
         let mut store = open_memory();
         let item = store
-            .file_item("backlog", "a", "", &[], &json!({}), None)
+            .file_item("backlog", "a", "", &[], &json!({}), None, None)
             .expect("files");
         assert_eq!(store.ready_items("backlog").expect("ready").len(), 1);
         assert_eq!(
@@ -5044,7 +5092,7 @@ mod tests {
     fn double_claim_is_branchable_not_an_error() {
         let mut store = open_memory();
         let item = store
-            .file_item("backlog", "a", "", &[], &json!({}), None)
+            .file_item("backlog", "a", "", &[], &json!({}), None, None)
             .expect("files");
         assert_eq!(
             store
@@ -5069,7 +5117,7 @@ mod tests {
     fn an_issue_files_unassigned() {
         let mut store = open_memory();
         let item = store
-            .file_item("backlog", "a", "", &[], &json!({}), None)
+            .file_item("backlog", "a", "", &[], &json!({}), None, None)
             .expect("files");
         assert_eq!(item.assigned_to, None);
         assert_eq!(
@@ -5082,7 +5130,7 @@ mod tests {
     fn assignment_round_trips_and_clears() {
         let mut store = open_memory();
         let item = store
-            .file_item("backlog", "a", "", &[], &json!({}), None)
+            .file_item("backlog", "a", "", &[], &json!({}), None, None)
             .expect("files");
         assert!(store.assign_item(&item.id, Some("alice")).expect("assigns"));
         assert_eq!(
@@ -5109,7 +5157,7 @@ mod tests {
     fn assignment_does_not_restrict_who_may_claim() {
         let mut store = open_memory();
         let item = store
-            .file_item("backlog", "a", "", &[], &json!({}), None)
+            .file_item("backlog", "a", "", &[], &json!({}), None, None)
             .expect("files");
         store.assign_item(&item.id, Some("alice")).expect("assigns");
         assert!(matches!(
@@ -5127,7 +5175,7 @@ mod tests {
     fn assigning_does_not_claim() {
         let mut store = open_memory();
         let item = store
-            .file_item("backlog", "a", "", &[], &json!({}), None)
+            .file_item("backlog", "a", "", &[], &json!({}), None, None)
             .expect("files");
         store.assign_item(&item.id, Some("alice")).expect("assigns");
         let held = store.get_item(&item.id).expect("gets").unwrap();
@@ -5140,7 +5188,7 @@ mod tests {
     fn a_closed_issue_is_not_reassigned() {
         let mut store = open_memory();
         let item = store
-            .file_item("backlog", "a", "", &[], &json!({}), None)
+            .file_item("backlog", "a", "", &[], &json!({}), None, None)
             .expect("files");
         store
             .finish_item(&item.id, Some("done"), None)
@@ -5214,7 +5262,7 @@ mod tests {
     fn release_returns_item_to_ready() {
         let mut store = open_memory();
         let item = store
-            .file_item("backlog", "a", "", &[], &json!({}), None)
+            .file_item("backlog", "a", "", &[], &json!({}), None, None)
             .expect("files");
         store.claim_item(&item.id, "w", None).expect("claims");
         assert_eq!(
@@ -5259,7 +5307,7 @@ mod tests {
     fn releases_counts_every_return_to_ready_and_survives_a_rebuild() {
         let mut store = open_memory();
         let item = store
-            .file_item("backlog", "a", "", &[], &json!({}), None)
+            .file_item("backlog", "a", "", &[], &json!({}), None, None)
             .expect("files");
         assert_eq!(
             store.get_item(&item.id).expect("gets").unwrap().releases,
@@ -5306,6 +5354,7 @@ mod tests {
                     &[],
                     &json!({}),
                     None,
+                    None,
                 )
                 .expect("files");
             ids.push(item.id);
@@ -5336,7 +5385,7 @@ mod tests {
     fn release_then_reclaim_preserves_single_holder() {
         let mut store = open_memory();
         let item = store
-            .file_item("backlog", "a", "", &[], &json!({}), None)
+            .file_item("backlog", "a", "", &[], &json!({}), None, None)
             .expect("files");
         assert_eq!(
             store.claim_item(&item.id, "w1", None).expect("claims"),
@@ -5365,10 +5414,10 @@ mod tests {
     fn release_claims_for_holder_frees_only_that_holders_in_progress_items() {
         let mut store = open_memory();
         let mine = store
-            .file_item("backlog", "mine", "", &[], &json!({}), None)
+            .file_item("backlog", "mine", "", &[], &json!({}), None, None)
             .expect("files");
         let theirs = store
-            .file_item("backlog", "theirs", "", &[], &json!({}), None)
+            .file_item("backlog", "theirs", "", &[], &json!({}), None, None)
             .expect("files");
         store.claim_item(&mine.id, "w1", None).expect("claims mine");
         store
@@ -5401,7 +5450,7 @@ mod tests {
     fn finish_records_summary_and_leaves_done() {
         let mut store = open_memory();
         let item = store
-            .file_item("backlog", "a", "", &[], &json!({}), None)
+            .file_item("backlog", "a", "", &[], &json!({}), None, None)
             .expect("files");
         store.claim_item(&item.id, "w", None).expect("claims");
         assert_eq!(
@@ -5421,7 +5470,7 @@ mod tests {
     fn renew_is_holder_only_and_monotonic() {
         let mut store = open_memory();
         let item = store
-            .file_item("backlog", "a", "", &[], &json!({}), None)
+            .file_item("backlog", "a", "", &[], &json!({}), None, None)
             .expect("files");
         store.claim_item(&item.id, "w1", None).expect("claims");
 
@@ -5464,7 +5513,7 @@ mod tests {
     fn a_non_holder_cannot_release_or_finish_a_held_item() {
         let mut store = open_memory();
         let item = store
-            .file_item("backlog", "a", "", &[], &json!({}), None)
+            .file_item("backlog", "a", "", &[], &json!({}), None, None)
             .expect("files");
         assert_eq!(
             store.claim_item(&item.id, "agent:a", None).expect("claims"),
@@ -5513,7 +5562,7 @@ mod tests {
     fn an_unheld_item_is_not_a_holder_conflict() {
         let mut store = open_memory();
         let item = store
-            .file_item("backlog", "a", "", &[], &json!({}), None)
+            .file_item("backlog", "a", "", &[], &json!({}), None, None)
             .expect("files");
         assert_eq!(
             store
@@ -5536,7 +5585,7 @@ mod tests {
     fn an_unscoped_release_still_clears_another_actors_lease() {
         let mut store = open_memory();
         let item = store
-            .file_item("backlog", "a", "", &[], &json!({}), None)
+            .file_item("backlog", "a", "", &[], &json!({}), None, None)
             .expect("files");
         store.claim_item(&item.id, "agent:a", None).expect("claims");
         assert_eq!(
@@ -5553,7 +5602,7 @@ mod tests {
     fn subscribing_starts_at_the_head_and_delivers_only_what_follows() {
         let mut store = open_memory();
         let before = store
-            .file_item("backlog", "already here", "", &[], &json!({}), None)
+            .file_item("backlog", "already here", "", &[], &json!({}), None, None)
             .expect("files");
         assert!(store
             .subscribe_events("agent:a", "backlog")
@@ -5600,7 +5649,7 @@ mod tests {
             .subscribe_events("agent:a", "backlog")
             .expect("subscribes"));
         let item = store
-            .file_item("backlog", "a", "", &[], &json!({}), None)
+            .file_item("backlog", "a", "", &[], &json!({}), None, None)
             .expect("files");
         let events = store.poll_subscribed_events("agent:a", 50).expect("poll");
         let last = events.iter().map(|e| e.position).max().expect("position");
@@ -5628,7 +5677,7 @@ mod tests {
 
         // A queue nobody subscribed to delivers nothing.
         store
-            .file_item("other", "elsewhere", "", &[], &json!({}), None)
+            .file_item("other", "elsewhere", "", &[], &json!({}), None, None)
             .expect("files");
         store.claim_item(&item.id, "agent:b", None).expect("claim");
         let events = store.poll_subscribed_events("agent:a", 50).expect("poll");
@@ -5648,7 +5697,7 @@ mod tests {
     fn claim_with_ttl_records_a_finite_expiry() {
         let mut store = open_memory();
         let item = store
-            .file_item("backlog", "a", "", &[], &json!({}), None)
+            .file_item("backlog", "a", "", &[], &json!({}), None, None)
             .expect("files");
         // A far-future TTL: the claim is held, so the issue is not ready.
         assert_eq!(
@@ -5671,7 +5720,7 @@ mod tests {
         // A past TTL is expired-on-arrival: it never blocks readiness, and the
         // lazy expiry sweep lets a fresh claim win.
         let stale = store
-            .file_item("backlog", "b", "", &[], &json!({}), None)
+            .file_item("backlog", "b", "", &[], &json!({}), None, None)
             .expect("files");
         assert_eq!(
             store
@@ -5701,7 +5750,7 @@ mod tests {
     fn expired_lease_frees_the_issue() {
         let mut store = open_memory();
         let item = store
-            .file_item("backlog", "a", "", &[], &json!({}), None)
+            .file_item("backlog", "a", "", &[], &json!({}), None, None)
             .expect("files");
         store.claim_item(&item.id, "w1", None).expect("claims");
         // Set the holder's own lease to a past deadline (NULL -> finite is
@@ -5728,10 +5777,10 @@ mod tests {
     fn active_blocker_gates_readiness() {
         let mut store = open_memory();
         let blocker = store
-            .file_item("backlog", "blocker", "", &[], &json!({}), None)
+            .file_item("backlog", "blocker", "", &[], &json!({}), None, None)
             .expect("files");
         let blocked = store
-            .file_item("backlog", "blocked", "", &[], &json!({}), None)
+            .file_item("backlog", "blocked", "", &[], &json!({}), None, None)
             .expect("files");
         store
             .add_blocks(&blocker.id, &blocked.id)
@@ -5770,13 +5819,14 @@ mod tests {
                 &["x".to_owned()],
                 &json!({"k": 1}),
                 Some("f"),
+                None,
             )
             .expect("files a");
         let b = store
-            .file_item("backlog", "b", "", &[], &json!({}), None)
+            .file_item("backlog", "b", "", &[], &json!({}), None, None)
             .expect("files b");
         let c = store
-            .file_item("backlog", "c", "", &[], &json!({}), None)
+            .file_item("backlog", "c", "", &[], &json!({}), None, None)
             .expect("files c");
         store.add_blocks(&a.id, &b.id).expect("blocks");
         store.claim_item(&c.id, "w1", None).expect("claims c");

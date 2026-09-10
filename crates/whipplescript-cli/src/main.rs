@@ -12978,7 +12978,15 @@ fn execute_scenario(
                     whipplescript_store::items::WorkItemStore::open(&items_store_path)
                         .map_err(store_error)?;
                 tracker_store
-                    .file_item(tracker, title, body, &labels, &value, Some("test-fixture"))
+                    .file_item(
+                        tracker,
+                        title,
+                        body,
+                        &labels,
+                        &value,
+                        Some("test-fixture"),
+                        None,
+                    )
                     .map_err(store_error)?;
             }
             _ => {}
@@ -33447,6 +33455,7 @@ fn issue(options: &CliOptions) -> ExitCode {
                 &labels,
                 &json!({}),
                 filed_by.as_deref(),
+                None,
             ) {
                 Ok(item) => {
                     if options.json {

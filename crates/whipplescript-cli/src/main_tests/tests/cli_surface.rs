@@ -462,7 +462,7 @@ fn anchor_door_refuses_change_set_atoms() {
     let mut store =
         whipplescript_store::items::WorkItemStore::open(items_store_path()).expect("items");
     let issue = store
-        .file_item("q", "anchored", "", &[], &json!({}), Some("s:a"))
+        .file_item("q", "anchored", "", &[], &json!({}), Some("s:a"), None)
         .expect("file");
     let options = CliOptions {
         command: Some("issue".to_owned()),
@@ -562,7 +562,7 @@ fn kernel_finish_auto_attests_keyed_on_the_native_facade() {
 
     let claimed = stores
         .items
-        .file_item("q", "worked", "", &[], &json!({}), Some("s:a"))
+        .file_item("q", "worked", "", &[], &json!({}), Some("s:a"), None)
         .expect("file");
     stores
         .items
@@ -575,7 +575,7 @@ fn kernel_finish_auto_attests_keyed_on_the_native_facade() {
         .expect("claim");
     let unclaimed = stores
         .items
-        .file_item("q", "untouched", "", &[], &json!({}), Some("s:a"))
+        .file_item("q", "untouched", "", &[], &json!({}), Some("s:a"), None)
         .expect("file");
 
     whipplescript_kernel::effect_handlers::auto_attest_finish_generic(
@@ -651,7 +651,7 @@ fn agent_door_claims_stamp_cut_intent() {
     let mut items =
         whipplescript_store::items::WorkItemStore::open(items_store_path()).expect("items");
     let issue = items
-        .file_item("q", "turn work", "", &[], &json!({}), Some("s:a"))
+        .file_item("q", "turn work", "", &[], &json!({}), Some("s:a"), None)
         .expect("file");
     // The AGENT door's holder spelling, exactly as update_todo claims.
     items
@@ -689,7 +689,7 @@ fn agent_door_claims_stamp_cut_intent() {
     let mut items =
         whipplescript_store::items::WorkItemStore::open(items_store_path()).expect("items");
     let second = items
-        .file_item("q", "second", "", &[], &json!({}), Some("s:a"))
+        .file_item("q", "second", "", &[], &json!({}), Some("s:a"), None)
         .expect("file");
     items
         .claim_item(&second.id, "ins-join", None)
@@ -745,10 +745,10 @@ fn finish_auto_attests_the_cut_trail() {
     let mut store =
         whipplescript_store::items::WorkItemStore::open(items_store_path()).expect("items");
     let claimed = store
-        .file_item("q", "worked", "", &[], &json!({}), Some("s:a"))
+        .file_item("q", "worked", "", &[], &json!({}), Some("s:a"), None)
         .expect("file");
     let unclaimed = store
-        .file_item("q", "untouched", "", &[], &json!({}), Some("s:a"))
+        .file_item("q", "untouched", "", &[], &json!({}), Some("s:a"), None)
         .expect("file");
     store.claim_item(&claimed.id, "ins-9", None).expect("claim");
     store.finish_item(&claimed.id, None, None).expect("finish");
@@ -785,13 +785,21 @@ fn staleness_facts_classify_stale_subjects_only() {
     use std::collections::BTreeMap;
     let mut items = whipplescript_store::items::WorkItemStore::open_in_memory().expect("items");
     let stale_issue = items
-        .file_item("q", "stale one", "", &[], &json!({}), Some("s:a"))
+        .file_item("q", "stale one", "", &[], &json!({}), Some("s:a"), None)
         .expect("file");
     let fresh_issue = items
-        .file_item("q", "fresh one", "", &[], &json!({}), Some("s:a"))
+        .file_item("q", "fresh one", "", &[], &json!({}), Some("s:a"), None)
         .expect("file");
     let unkeyed_issue = items
-        .file_item("q", "unverified one", "", &[], &json!({}), Some("s:a"))
+        .file_item(
+            "q",
+            "unverified one",
+            "",
+            &[],
+            &json!({}),
+            Some("s:a"),
+            None,
+        )
         .expect("file");
     let assertion = items
         .create_assertion("stale claim", "", Some("s:a"))

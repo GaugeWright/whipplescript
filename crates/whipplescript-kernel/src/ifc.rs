@@ -4481,6 +4481,26 @@ pub fn check_with_envelope_imports(
     // internal flows propagate the emitter's trust automatically.
     let programs: Vec<&IrProgram> = std::iter::once(ir).chain(imports.iter()).collect();
     let derived = derived_signal_integrity(&programs, envelope);
+    // DR-0051 §5, live under DR-0110: which trackers does this program draw an
+    // endorsed claim out of? Collected across EVERY rule, because the rule that
+    // files an issue is normally not the rule that later claims it endorsed —
+    // which is exactly why the §5 obligation could not be a local check on the
+    // filing site alone.
+    let endorsed_claim_trackers: BTreeSet<&str> = ir
+        .rules
+        .iter()
+        .flat_map(|rule| {
+            let names = &tracker_names;
+            rule.whens.iter().filter_map(move |when| {
+                let tracker = tracker_trigger_handle(&when.pattern, names)?;
+                let bound = binding_after_as(&when.pattern)?;
+                rule.metadata
+                    .endorsed_claim_items
+                    .contains(bound)
+                    .then_some(tracker)
+            })
+        })
+        .collect();
     // A `@tool` workflow's `complete result` crosses a PACKAGE boundary: its invoker
     // is a future consumer whose clearance is party-relative and unknown at the
     // producer, so the result is governed CONSUMER-side by the flow signature
@@ -5396,6 +5416,83 @@ pub fn check_with_envelope_imports(
                 None
             })
             .collect();
+        // DR-0051 §5, live under DR-0110: assignment is a SECOND steering
+        // surface. NMIF-on-the-selector stops an attacker choosing *which*
+        // crossing runs; without this it could still choose *who performs* one,
+        // by steering the assignee of an issue that is later claimed endorsed.
+        // Choosing the endorser is part of the crossing, not setup for it.
+        //
+        // Scoped to trackers this program actually claims endorsed out of: a
+        // filing into a queue nobody endorses steers no crossing, and refusing
+        // it would be a check that fights the writing rather than one that
+        // catches an attack.
+        //
+        // The untrusted set here is wider than the selector check's, and
+        // deliberately: an assignee read out of an UNVOUCHED tracker is the
+        // laundering path §5 describes almost verbatim — file your own issue,
+        // name your own reviewer, claim it endorsed. §3 already refuses the
+        // claim side of that when the queue is unvouched; this refuses the
+        // steering side.
+        let assignee_untrusted: BTreeSet<&str> = low_integrity_bindings
+            .iter()
+            .copied()
+            .chain(rule.whens.iter().filter_map(|when| {
+                let tracker = tracker_trigger_handle(&when.pattern, &tracker_names)?;
+                envelope
+                    .integrity_set(tracker)
+                    .is_empty()
+                    .then(|| binding_after_as(&when.pattern))
+                    .flatten()
+            }))
+            .collect();
+        for (tracker, per_field) in &rule.metadata.tracker_file_field_reads {
+            if !endorsed_claim_trackers.contains(tracker.as_str()) {
+                continue;
+            }
+            let Some(roots) = per_field.get("assigned_to") else {
+                continue;
+            };
+            let mut tainted: Vec<&str> = roots
+                .iter()
+                .map(String::as_str)
+                .filter(|root| assignee_untrusted.contains(root))
+                .collect();
+            tainted.sort_unstable();
+            let Some(&first) = tainted.first() else {
+                continue;
+            };
+            // Point at the filing, not at the trigger: the filing is what the
+            // author changes. Falls back to the rule's first trigger when the
+            // effect carries no resource to match on; a rule with neither
+            // cannot fire, so there is nothing to refuse.
+            let Some(span) = rule
+                .metadata
+                .effects
+                .iter()
+                .find(|effect| {
+                    matches!(effect.kind, IrEffectKind::TrackerFile)
+                        && effect.resource.as_deref() == Some(tracker.as_str())
+                })
+                .map(|effect| effect.span)
+                .or_else(|| rule.whens.first().map(|when| when.span))
+            else {
+                continue;
+            };
+            diagnostics.push(Diagnostic {
+                code: diagnostic_code!("security.untrusted_selector"),
+                severity: Severity::Error,
+                span,
+                message: format!(
+                    "denied influence in rule `{rule}`: the low-integrity value `{first}` may                      not choose `assigned_to` on an issue filed into tracker `{tracker}`, which                      this program claims endorsed — an attacker could choose its own endorser                      (choosing who performs a crossing is part of the crossing;                      NMIF-on-the-assignee, DR-0051 §5)",
+                    rule = rule.name,
+                ),
+                suggestion: whipplescript_parser::suggest(format!(
+                    "assign from high-integrity data, drop `assigned_to` and let whoever has                      access claim it, or vouch the source `{first}` came from — a `grant                      tracker … from <Role>` on the queue it was read out of, or an `endorsed`                      crossing before the filing"
+                )),
+                related: Vec::new(),
+                fixits: Vec::new(),
+            });
+        }
         let input_roots: BTreeSet<&str> = ir
             .workflow_contracts
             .iter()
@@ -14434,6 +14531,128 @@ rule consume
                 .any(|m| m.contains("denied influence in rule `consume`") && m.contains("ledger")),
             "a signal emitted by a rule that ran a command must not read as trusted: \
              {messages:#?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod nmif_assignee_refusal_tests {
+    //! NMIF-on-the-assignee (DR-0051 §5, live under DR-0110). The refusal that
+    //! stops untrusted data from choosing WHO performs a crossing.
+    //!
+    //! Its sibling above stops an attacker picking which crossing opens. This
+    //! one closes the other half of the same hole: leave the crossing where it
+    //! is and pick the person who walks through it. DR-0051 recorded this check
+    //! while it was vacuous — the surface had no assignee to steer — and named
+    //! the field's arrival as the moment it goes live. This is that moment, so
+    //! the refusal ships in the same change as the field it guards.
+    //!
+    //! The scoping is the interesting half and gets its own control below: the
+    //! refusal fires only for trackers this program actually claims endorsed
+    //! out of. A filing into a queue nobody endorses steers no crossing, and a
+    //! check that refused it would fight the writing rather than catch an
+    //! attack.
+
+    use super::{check_with_envelope, Envelope, VerifiedEnvelope};
+    use whipplescript_parser::compile_program;
+
+    /// `assignee` is the attacker-chosen field: an unvouched inbound signal
+    /// names who should review, and a second rule claims that queue endorsed.
+    fn program(assignee_expr: &str, endorse_the_claim: bool) -> String {
+        let marker = if endorse_the_claim { " endorsed" } else { "" };
+        format!(
+            r#"@service
+workflow NmifAssignee
+
+output result R
+class R {{ ok bool }}
+
+signal inbound.received {{
+  content string
+  who string
+}}
+
+tracker reviews
+
+rule intake
+  when inbound.received as inbound
+=> {{
+  file issue into reviews {{
+    title "review this"
+    body inbound.content
+    assigned_to {assignee_expr}
+  }} as filed
+  after filed succeeds {{ complete result {{ ok true }} }}
+}}
+
+rule adjudicate
+  when reviews has ready issue as issue
+=> {{
+  claim issue as held{marker}
+  after held succeeds {{ complete result {{ ok true }} }}
+}}
+"#
+        )
+    }
+
+    const POLICY: &str = "\
+grant provider fixture -> selfhost:llama readable by Operator from Operator\n\
+grant tracker reviews -> tracker:/reviews readable by Operator from Operator\n";
+
+    fn messages(source: &str) -> Vec<String> {
+        let compiled = compile_program(source);
+        assert!(
+            compiled.diagnostics.is_empty(),
+            "fixture must compile: {:?}",
+            compiled
+                .diagnostics
+                .iter()
+                .map(|d| d.message.as_str())
+                .collect::<Vec<_>>()
+        );
+        let ir = compiled.ir.expect("ir");
+        let envelope = Envelope::from_dsl(POLICY).expect("valid policy");
+        check_with_envelope(&ir, &VerifiedEnvelope::for_test(envelope))
+            .into_iter()
+            .map(|d| d.message)
+            .collect()
+    }
+
+    fn refused(messages: &[String]) -> bool {
+        messages.iter().any(|m| m.contains("NMIF-on-the-assignee"))
+    }
+
+    #[test]
+    fn untrusted_data_may_not_choose_the_endorser() {
+        let denied = messages(&program("inbound.who", true));
+        assert!(
+            refused(&denied),
+            "an unvouched signal choosing the assignee of an endorsed queue must be \
+             refused: {denied:?}"
+        );
+    }
+
+    #[test]
+    fn a_trusted_assignee_is_admitted() {
+        // The control that keeps the refusal from being a blanket ban on the
+        // field: same program, same endorsed claim, assignee the author wrote.
+        let denied = messages(&program("\"ops::reviewer\"", true));
+        assert!(
+            !refused(&denied),
+            "a literal assignee steers nothing and must be admitted: {denied:?}"
+        );
+    }
+
+    #[test]
+    fn an_unendorsed_queue_is_admitted() {
+        // The scoping control. Identical steering, and no crossing to steer,
+        // because nothing claims this queue endorsed. If this ever starts
+        // failing, the refusal has widened into every `file issue` and the
+        // reason it was narrow has been lost.
+        let denied = messages(&program("inbound.who", false));
+        assert!(
+            !refused(&denied),
+            "no endorsed claim on the queue means no crossing to steer: {denied:?}"
         );
     }
 }

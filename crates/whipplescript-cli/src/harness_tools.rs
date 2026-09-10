@@ -1347,6 +1347,7 @@ impl FileToolExecutor {
                     }
                 }),
                 Some(&holder),
+                None,
             )
             .map_err(|error| format!("file_item: {error:?}"))?;
         Ok(json!({ "id": item.id, "target": target }).to_string())
@@ -2468,7 +2469,7 @@ impl FileToolExecutor {
         let (mut store, queue) = self.tracker()?;
         let holder = format!("agent:{}", self.holder);
         let item = store
-            .file_item(&queue, content, "", &[], &json!({}), Some(&holder))
+            .file_item(&queue, content, "", &[], &json!({}), Some(&holder), None)
             .map_err(|error| format!("file_item: {error:?}"))?;
         Ok(json!({ "id": item.id }).to_string())
     }
@@ -7549,6 +7550,7 @@ mod tests {
                 &[],
                 &json!({ "secret": "SENTINEL-META-must-not-be-delivered" }),
                 None,
+                None,
             )
             .expect("files");
         store
@@ -7588,7 +7590,15 @@ mod tests {
         // Bob's private queue, with a title Alice must not be able to watch.
         let mut store = WorkItemStore::open(&store_path).expect("store");
         store
-            .file_item("bob-queue", "bob's private work", "", &[], &json!({}), None)
+            .file_item(
+                "bob-queue",
+                "bob's private work",
+                "",
+                &[],
+                &json!({}),
+                None,
+                None,
+            )
             .expect("files");
 
         let alice = FileToolExecutor::new(&root)
@@ -7616,6 +7626,7 @@ mod tests {
                 "",
                 &[],
                 &json!({}),
+                None,
                 None,
             )
             .expect("files");

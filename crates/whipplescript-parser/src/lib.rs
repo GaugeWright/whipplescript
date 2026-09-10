@@ -2323,6 +2323,15 @@ pub struct IrRuleMetadata {
     /// marker whose tracker nobody vouched. IFC-only (NOT in the `.ir`
     /// snapshot).
     pub endorsed_claim_items: BTreeSet<String>,
+    /// DR-0110: per-field binding roots for each `file issue into <tracker>`,
+    /// keyed by tracker name and then by field name.
+    ///
+    /// `egress_payload_reads` already collapses a filing's roots to one set,
+    /// which answers "what of the run reaches this queue". This answers the
+    /// narrower question DR-0051 §5 asks: what reaches *the assignee field*,
+    /// because choosing who endorses is part of the crossing and the rest of
+    /// the payload is not. IFC-only (NOT in the `.ir` snapshot).
+    pub tracker_file_field_reads: BTreeMap<String, BTreeMap<String, BTreeSet<String>>>,
     /// DR-0051 §4: per-field binding roots for each `record <Schema> { … }`
     /// egress — the same shape as `complete_field_reads`, keyed by
     /// `fact:<Schema>` and then by field name.
@@ -8355,6 +8364,11 @@ impl SchemaIndex {
                 // loop: `where issue.releases < 3` is a termination measure the
                 // author cannot forget to advance.
                 ("releases", int_ty()),
+                // Who should act (DR-0110). Optional because unassigned is a
+                // real state meaning "whoever has access" — not an empty string
+                // standing in for one, which is the conflation a finite domain
+                // exists to refuse.
+                ("assigned_to", optional_ty(string_ty())),
             ],
         );
         // std.vcs observer schemas (DR-0052 grammar pass): the readiness
@@ -13331,6 +13345,7 @@ fn analyze_rule(
     }
     collect_complete_field_reads(&body_ast.statements, &mut metadata.complete_field_reads);
     collect_record_field_reads(&body_ast.statements, &mut metadata.record_field_reads);
+    collect_tracker_file_field_reads(&body_ast.statements, &mut metadata.tracker_file_field_reads);
     collect_milestone_field_reads(&body_ast.statements, &mut metadata.milestone_field_reads);
     collect_crossing_roots(
         &body_ast.statements,
@@ -14174,6 +14189,52 @@ fn send_payload_reads(fields: &[body::ConstructUseField]) -> Option<(String, BTr
 /// DR-0051 §4: per-field binding roots for every `record <Schema> { … }` in a
 /// rule body, recursing into nested blocks. Mirrors
 /// `collect_complete_field_reads`; see `record_field_reads`.
+/// Per-field binding roots for every `file issue into <tracker> { … }`, keyed
+/// by tracker and then field (DR-0110). The shape mirrors
+/// `collect_record_field_reads`; see `tracker_file_field_reads`.
+fn collect_tracker_file_field_reads(
+    statements: &[body::BodyStmt],
+    out: &mut BTreeMap<String, BTreeMap<String, BTreeSet<String>>>,
+) {
+    for statement in statements {
+        match statement {
+            body::BodyStmt::Effect(body::EffectStmt {
+                kind: body::BodyEffectKind::TrackerFile { queue, fields },
+                ..
+            }) => {
+                let per_field = out.entry(queue.clone()).or_default();
+                for field in fields {
+                    let mut roots = BTreeSet::new();
+                    match &field.value {
+                        // A shorthand in a `file issue` block has no `from`
+                        // subject to copy, so it references nothing.
+                        body::FieldValue::Shorthand => {}
+                        body::FieldValue::Expr { expr, .. } => {
+                            collect_expr_binding_roots(expr, &mut roots);
+                        }
+                        body::FieldValue::Nested { fields, .. } => {
+                            collect_payload_field_roots(fields, None, &mut roots);
+                        }
+                    }
+                    per_field
+                        .entry(field.name.clone())
+                        .or_default()
+                        .extend(roots);
+                }
+            }
+            body::BodyStmt::After(after) => {
+                collect_tracker_file_field_reads(&after.body, out);
+            }
+            body::BodyStmt::Case(case) => {
+                for branch in &case.branches {
+                    collect_tracker_file_field_reads(&branch.body, out);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 fn collect_record_field_reads(
     statements: &[body::BodyStmt],
     out: &mut BTreeMap<String, BTreeMap<String, BTreeSet<String>>>,

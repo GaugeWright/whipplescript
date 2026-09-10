@@ -654,6 +654,7 @@ impl<Sql: DoSql> DoToolExecutor<Sql> {
                 &[],
                 &json!({}),
                 Some(&holder),
+                None,
             )
             .map_err(|error| format!("file_item: {error:?}"))?;
         Ok(json!({ "id": item.id }).to_string())

@@ -1758,6 +1758,7 @@ pub fn project_tracker_issues<S: RuntimeStore + WorkItems>(
                 "labels": item.labels,
                 "releases": item.releases,
                 "metadata": item.metadata,
+                "assigned_to": item.assigned_to,
             })
             .to_string();
             // Salt with updated_at: a released item re-projects as a fresh

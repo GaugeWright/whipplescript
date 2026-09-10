@@ -2222,10 +2222,27 @@ pub fn run_queue_effect_generic<S: RuntimeStore + WorkItems + FrontierRead>(
                 })
                 .unwrap_or_default();
             let metadata = item.get("metadata").cloned().unwrap_or_else(|| json!({}));
+            // DR-0110: who *should* act on this, if the author said. Advisory —
+            // it gates no claim and confers no authority, and an absent or
+            // empty field is unassigned ("whoever has access"), never the
+            // filing instance standing in for a missing answer.
+            let assigned_to = item
+                .get("assigned_to")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|assignee| !assignee.is_empty());
             let filed_by = format!("workflow:{instance_id}");
             kernel
                 .store_mut()
-                .file_item(&queue, title, body, &labels, &metadata, Some(&filed_by))
+                .file_item(
+                    &queue,
+                    title,
+                    body,
+                    &labels,
+                    &metadata,
+                    Some(&filed_by),
+                    assigned_to,
+                )
                 .map(|filed| {
                     json!({
                         "queue": filed.queue,
@@ -4811,7 +4828,7 @@ mod queue_effect_refusal_tests {
         let mut kernel = RuntimeKernel::new(stores);
         let filed = kernel
             .store_mut()
-            .file_item("q", "t", "", &[], &serde_json::json!({}), None)
+            .file_item("q", "t", "", &[], &serde_json::json!({}), None, None)
             .expect("file an item");
 
         rusqlite::Connection::open(&items)

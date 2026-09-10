@@ -41,6 +41,7 @@ fn build(items: usize, events_per_item: usize) -> (tempdir::Guard, WorkItemStore
                 &[],
                 &json!({}),
                 Some("filer"),
+                None,
             )
             .expect("file");
         // `issue.created` is one event; the rest accumulate as field sets, the

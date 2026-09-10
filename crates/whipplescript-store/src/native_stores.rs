@@ -948,9 +948,10 @@ impl WorkItems for NativeStores {
         labels: &[String],
         metadata: &Value,
         filed_by: Option<&str>,
+        assigned_to: Option<&str>,
     ) -> StoreResult<WorkItem> {
         self.items
-            .file_item(queue, title, body, labels, metadata, filed_by)
+            .file_item(queue, title, body, labels, metadata, filed_by, assigned_to)
     }
 
     fn get_item(&self, item_id: &str) -> StoreResult<Option<WorkItem>> {
