@@ -10286,6 +10286,16 @@ impl<Sql: DoSql> DoSqliteStore<Sql> {
 pub(crate) mod tests {
     use super::*;
 
+    /// DR-0110: the Durable Object half of the closings contract, the same
+    /// suite the native store runs. `closings` is implemented separately on
+    /// each host — different SQL surface, different row bridge — so agreement
+    /// is executed here rather than asserted in a comment.
+    #[test]
+    fn do_satisfies_the_closings_contract() {
+        let mut store = DoSqliteStore::new(test_support::RusqliteDoSql::with_runtime_schema());
+        whipplescript_store::items::conformance::run_closings_suite(&mut store);
+    }
+
     #[test]
     fn do_recording_settlement_and_replay() {
         use whipplescript_store::file_settlement::recording_conformance;

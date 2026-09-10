@@ -3619,6 +3619,87 @@ pub struct TrackerSubscription {
     pub position: i64,
 }
 
+/// The DR-0110 contract both hosts must satisfy, run against any `WorkItems`.
+///
+/// Native and Durable Object implement `closings` separately — different SQL
+/// surfaces, different row bridges — so "both agree" has to be executed rather
+/// than asserted. This is the executable half.
+///
+/// **What it deliberately does NOT cover, and why.** The second door to closed
+/// (`set_field(id, "status", "closed")`) and the reopen-then-reclose
+/// distinction both need `set_field`, which is not on the `WorkItems` trait:
+/// the DO reaches that state only through event import. Those stay native-only
+/// tests. The recorded deviation is that the DO's second door and reopen path
+/// are exercised through the fold, not through this suite.
+pub mod conformance {
+    use super::*;
+
+    /// Files, closes, and checks what `closings` reports at each step.
+    pub fn run_closings_suite<S: WorkItems>(store: &mut S) {
+        // Nothing has closed, so nothing is reported. An implementation that
+        // returned rows here would make a wait release immediately.
+        let issue = store
+            .file_item(
+                "q",
+                "review this",
+                "body",
+                &[],
+                &serde_json::json!({}),
+                Some("workflow:test"),
+                Some("person:jack"),
+            )
+            .expect("filed");
+        assert_eq!(
+            issue.assigned_to.as_deref(),
+            Some("person:jack"),
+            "DR-0110: the assignee reaches the row on this host"
+        );
+        assert!(
+            store.closings("q").expect("closings").is_empty(),
+            "an open issue has not closed"
+        );
+
+        store.finish_item(&issue.id, None, None).expect("finished");
+        let closings = store.closings("q").expect("closings");
+        assert_eq!(closings.len(), 1, "one closing: {closings:?}");
+        assert_eq!(closings[0].issue, issue.id);
+        assert_eq!(closings[0].queue, "q");
+        assert!(
+            !closings[0].event_id.is_empty(),
+            "the closing event's id is the fact's identity; an empty one would \
+             collide with the next closing"
+        );
+
+        // Finishing an already-closed issue is not a second closing. The count
+        // is what a rule fires on, so a spurious one is a spurious firing.
+        store
+            .finish_item(&issue.id, None, None)
+            .expect("second finish is a no-op");
+        assert_eq!(
+            store.closings("q").expect("closings").len(),
+            1,
+            "finishing twice closed once"
+        );
+
+        // Queues do not leak into each other.
+        let other = store
+            .file_item(
+                "other",
+                "not mine",
+                "",
+                &[],
+                &serde_json::json!({}),
+                None,
+                None,
+            )
+            .expect("filed");
+        store.finish_item(&other.id, None, None).expect("finished");
+        let mine = store.closings("q").expect("closings");
+        assert_eq!(mine.len(), 1, "still one: {mine:?}");
+        assert_eq!(mine[0].issue, issue.id);
+    }
+}
+
 /// One closing of one issue (DR-0110).
 ///
 /// A *closing*, not a closed issue: an issue closed, reopened and closed again
@@ -3970,6 +4051,14 @@ mod tests {
     }
 
     // ---- DR-0110: closings are read off the log, not off the status column ----
+
+    /// The native half of the two-host contract. Its Durable Object twin runs
+    /// the same suite in `whipplescript-host-do`, so a divergence fails on one
+    /// side and not the other rather than passing quietly on both.
+    #[test]
+    fn native_satisfies_the_closings_contract() {
+        conformance::run_closings_suite(&mut open_memory());
+    }
 
     /// The property the whole design turns on: a closing that happened before
     /// anybody looked is still there to be found. A status column would answer

@@ -1,0 +1,57 @@
+// DR-0110: hand a person a piece of work, then continue when they have done it.
+//
+// The shape gaugedesk-src ADR 0165's Basics tutorial is written in, reduced to
+// its two mechanisms. It needs no waiting form and no deadline: a closing is a
+// fact, so continuing is ordinary rule matching.
+//
+// `assigned_to` says who *should* act. It is advisory — it gates no claim and
+// grants nobody anything — and the host that can authenticate a person resolves
+// the name before it reaches the effect.
+//
+// The join in `step_two` is the whole sequencing story: the filing records the
+// issue it created, and the rule fires when the closing names that same issue.
+// A closing older than this instance still matches, because the fact is a fold
+// over the durable log rather than a listener.
+use std.tracker
+
+@service
+workflow AssignedSequence(learner: Learner) -> Done
+
+class Learner {
+  authority string
+}
+
+class Done {
+  ok bool
+}
+
+class Step {
+  issue string
+}
+
+tracker tutorials
+
+rule begin
+  when Learner as learner
+=> {
+  file issue into tutorials {
+    title "Create a chat"
+    body "Create a chat, then mark this task complete."
+    assigned_to learner.authority
+  } as first
+  after first succeeds as filed {
+    record Step {
+      issue filed.id
+    }
+  }
+}
+
+rule step_two
+  when Step as step
+  when tutorials has closed issue as closing
+  where step.issue == closing.id
+=> {
+  complete result {
+    ok true
+  }
+}

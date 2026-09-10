@@ -66,6 +66,11 @@ check_example examples/revision-parent-child.whip --root ParentRevisionExample
 check_example examples/revision-validation-approval.whip --root RevisionValidation
 check_example examples/revision-running-cancel.whip
 check_example examples/revision-repair-planner.whip
+# DR-0110: an assigned filing sequenced by its own closing. Gated because it is
+# the shipped shape of gaugedesk-src ADR 0165's tutorial — if the surface it
+# uses regresses, the product's onboarding stops compiling and this says so
+# first.
+check_example examples/tracker-assigned-sequence.whip
 
 # The governance tutorial's programs are checked for their *outcome*, not merely
 # for compiling: docs/tutorials/governance.md teaches that the same whip passes
