@@ -313,8 +313,7 @@ impl<S: DoSql> Branches for DoBranches<S> {
                 &[text(MAINLINE_BRANCH_ID), text(created_at)],
             )
             .map_err(sql_err)?;
-        self.row_by_id(MAINLINE_BRANCH_ID)?
-            .ok_or_else(|| StoreError::Conflict("mainline row missing after insert".to_owned()))
+        StoreError::written_row(self.row_by_id(MAINLINE_BRANCH_ID)?, "branch mainline row")
     }
 
     fn create_branch(&mut self, request: CreateBranch<'_>) -> StoreResult<CreateBranchOutcome> {
@@ -383,9 +382,8 @@ impl<S: DoSql> Branches for DoBranches<S> {
                 ],
             )
             .map_err(sql_err)?;
-        let row = self
-            .row_by_id(request.branch_id)?
-            .ok_or_else(|| StoreError::Conflict("created row missing".to_owned()))?;
+        let row =
+            StoreError::written_row(self.row_by_id(request.branch_id)?, "created branch row")?;
         Ok(CreateBranchOutcome::Created(row))
     }
 
@@ -493,9 +491,7 @@ impl<S: DoSql> Branches for DoBranches<S> {
                 &[text(branch_id), text(new_parent_branch_id), text(at)],
             )
             .map_err(sql_err)?;
-        let row = self
-            .row_by_id(branch_id)?
-            .ok_or_else(|| StoreError::Conflict("retargeted row missing".to_owned()))?;
+        let row = StoreError::written_row(self.row_by_id(branch_id)?, "retargeted branch row")?;
         Ok(RetargetOutcome::Retargeted(Box::new(row)))
     }
 
@@ -530,9 +526,7 @@ impl<S: DoSql> Branches for DoBranches<S> {
                 &[text(branch_id), text(cut_id), text(manifest_hash), text(at)],
             )
             .map_err(sql_err)?;
-        let row = self
-            .row_by_id(branch_id)?
-            .ok_or_else(|| StoreError::Conflict("advanced row missing".to_owned()))?;
+        let row = StoreError::written_row(self.row_by_id(branch_id)?, "advanced branch row")?;
         Ok(AdvanceOutcome::Advanced(Box::new(row)))
     }
 
@@ -641,9 +635,7 @@ impl<S: DoSql> Branches for DoBranches<S> {
                 ],
             )
             .map_err(sql_err)?;
-        let row = self
-            .row_by_id(branch_id)?
-            .ok_or_else(|| StoreError::Conflict("rebased row missing".to_owned()))?;
+        let row = StoreError::written_row(self.row_by_id(branch_id)?, "rebased branch row")?;
         Ok(AdvanceOutcome::Advanced(Box::new(row)))
     }
 
@@ -661,9 +653,7 @@ impl<S: DoSql> Branches for DoBranches<S> {
                 &[text(branch_id), text(at)],
             )
             .map_err(sql_err)?;
-        let row = self
-            .row_by_id(branch_id)?
-            .ok_or_else(|| StoreError::Conflict("discarded row missing".to_owned()))?;
+        let row = StoreError::written_row(self.row_by_id(branch_id)?, "discarded branch row")?;
         Ok(StatusOutcome::Done(Box::new(row)))
     }
 
@@ -686,9 +676,7 @@ impl<S: DoSql> Branches for DoBranches<S> {
                 &[text(branch_id), text(merge_cut_id), text(at)],
             )
             .map_err(sql_err)?;
-        let row = self
-            .row_by_id(branch_id)?
-            .ok_or_else(|| StoreError::Conflict("adopted row missing".to_owned()))?;
+        let row = StoreError::written_row(self.row_by_id(branch_id)?, "adopted branch row")?;
         Ok(StatusOutcome::Done(Box::new(row)))
     }
 
@@ -1095,9 +1083,7 @@ impl<S: DoSql> Branches for DoBranches<S> {
                 ],
             )
             .map_err(sql_err)?;
-        let row = self
-            .row_by_id(branch_id)?
-            .ok_or_else(|| StoreError::Conflict("restored row missing".to_owned()))?;
+        let row = StoreError::written_row(self.row_by_id(branch_id)?, "restored branch row")?;
         Ok(AdvanceOutcome::Advanced(Box::new(row)))
     }
 

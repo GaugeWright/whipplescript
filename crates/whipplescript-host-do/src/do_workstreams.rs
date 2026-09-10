@@ -225,9 +225,10 @@ impl<S: DoSql> Workstreams for DoWorkstreams<S> {
                 .map_err(sql_err)?;
             if let Some(row) = rows.first() {
                 let existing_id = as_text(&row[0]);
-                let row = self
-                    .row_by_id(&existing_id)?
-                    .ok_or_else(|| StoreError::Conflict("row for key vanished".to_owned()))?;
+                let row = StoreError::written_row(
+                    self.row_by_id(&existing_id)?,
+                    "workstream row an idempotency key selected",
+                )?;
                 return Ok(CreateStreamOutcome::Existing(row));
             }
         }
@@ -629,7 +630,10 @@ impl<S: DoSql> Workstreams for DoWorkstreams<S> {
             return Ok(RecordRefAdvancedOutcome::NotReserved);
         }
         let position = i64::try_from(ref_position).map_err(|_| {
-            StoreError::Conflict("ref authority position exceeds SQLite range".to_owned())
+            StoreError::fault(
+                "ref authority position",
+                "the stored value does not fit the integer it is read into",
+            )
         })?;
         self.sql
             .execute(
@@ -1009,6 +1013,80 @@ mod tests {
                 .release_boundary("missing", "reservation", "t1")
                 .unwrap(),
             ReleaseBoundaryOutcome::StreamMissing
+        );
+    }
+
+    /// Re-recording an advance that already happened is idempotent only if it
+    /// says the SAME thing.
+    ///
+    /// The retry path returns `Existing` when the position and receipt handle
+    /// match, and refuses otherwise -- a second advance under the same
+    /// reservation naming a DIFFERENT position is not a repeat of the first, it
+    /// is a second advance, and admitting it would move a ref the caller
+    /// already believes is somewhere else. Nothing exercised that arm until the
+    /// refusal sweep asked.
+    #[test]
+    fn re_recording_an_advance_with_a_different_position_is_refused() {
+        use crate::do_branches::{DoBranches, DoContentBlobs};
+        use whipplescript_store::vcs::WorkspaceVcs;
+
+        let sql = sql();
+        let mut streams = DoWorkstreams::new(Rc::clone(&sql)).unwrap();
+        let mut vcs = WorkspaceVcs::from_parts(
+            DoBranches::new(Rc::clone(&sql)).unwrap(),
+            DoContentBlobs::new(Rc::clone(&sql)).unwrap(),
+        );
+        vcs.init("t0").unwrap();
+        vcs.create_branch("line", None, "main", "t0").unwrap();
+        streams
+            .create_stream("ws", None, "line", "t0", None)
+            .unwrap();
+        streams
+            .reserve_boundary(
+                "ws",
+                BoundaryReservation {
+                    reservation_id: "r1",
+                    expected_line_cut: "",
+                    expected_main_cut: "",
+                    proposed_main_cut: "proposed",
+                    at: "t1",
+                },
+            )
+            .unwrap();
+
+        let recorded = streams
+            .record_ref_advanced("ws", "r1", 7, "handle-a", "t2")
+            .unwrap();
+        assert!(
+            matches!(recorded, RecordRefAdvancedOutcome::Recorded(_)),
+            "{recorded:?}"
+        );
+
+        // The same advance again: idempotent.
+        assert!(
+            matches!(
+                streams
+                    .record_ref_advanced("ws", "r1", 7, "handle-a", "t3")
+                    .unwrap(),
+                RecordRefAdvancedOutcome::Existing(_)
+            ),
+            "an identical re-record is the same advance"
+        );
+
+        // A different position under the same reservation: refused.
+        assert_eq!(
+            streams
+                .record_ref_advanced("ws", "r1", 9, "handle-a", "t4")
+                .unwrap(),
+            RecordRefAdvancedOutcome::ReservationMismatch,
+            "a different position is a second advance, not a retry"
+        );
+        // And a different receipt handle at the same position.
+        assert_eq!(
+            streams
+                .record_ref_advanced("ws", "r1", 7, "handle-b", "t5")
+                .unwrap(),
+            RecordRefAdvancedOutcome::ReservationMismatch
         );
     }
 

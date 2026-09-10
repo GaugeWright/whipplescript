@@ -124,7 +124,9 @@ pub(crate) fn atomic_result<T>(
         }
         Ok(())
     })?;
-    outcome.ok_or_else(|| StoreError::Conflict("recovery transaction did not execute".into()))?
+    outcome.ok_or_else(|| {
+        StoreError::fault("recovery transaction", "reported success without executing")
+    })?
 }
 
 #[cfg(test)]
@@ -153,7 +155,13 @@ mod tests {
         })
         .unwrap_err();
         assert!(!called);
-        assert!(format!("{error:?}").contains("recovery transaction did not execute"));
+        // Matched on the VARIANT, not on a substring of the message: this is
+        // a fault rather than a conflict now, and that distinction is the point
+        // of the change -- a fault is not absorbed by the worker pass.
+        assert!(
+            matches!(&error, StoreError::Fault { subject, .. } if subject == "recovery transaction"),
+            "{error:?}"
+        );
     }
 
     #[test]
@@ -171,7 +179,10 @@ mod tests {
                             reason: "policy".into(),
                         })
                     } else {
-                        Err(StoreError::Conflict("storage failure".into()))
+                        Err(StoreError::fault(
+                            "durable object storage",
+                            "the read failed",
+                        ))
                     }
                 });
                 assert!(result.is_err());

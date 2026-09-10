@@ -14,7 +14,12 @@ impl<Sql: DoSql> DoSqliteStore<Sql> {
             result = Some(admitted);
             Ok(())
         })?;
-        result.ok_or_else(|| StoreError::Conflict("host action transaction did not execute".into()))
+        result.ok_or_else(|| {
+            StoreError::fault(
+                "host action transaction",
+                "reported success without executing",
+            )
+        })
     }
 }
 
@@ -222,6 +227,9 @@ mod tests {
         let error = faulty
             .admit_host_action(conformance::action(&version))
             .expect_err("no admission occurred");
-        assert!(format!("{error:?}").contains("did not execute"));
+        assert!(
+            matches!(&error, StoreError::Fault { subject, .. } if subject == "host action transaction"),
+            "{error:?}"
+        );
     }
 }

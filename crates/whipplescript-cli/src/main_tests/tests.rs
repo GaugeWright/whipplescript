@@ -1588,6 +1588,24 @@ fn a_guard_refusal_aborts_the_pass_while_a_semantic_conflict_is_absorbed() {
         panic!("a guard refusal must abort the pass, got {refused:?}");
     };
     assert_eq!(guard, GuardKind::OwnershipFence);
+
+    // Nor is a FAULT absorbed. These were `Conflict` too -- a row the store had
+    // just written and could not read back, a transaction that reported success
+    // without executing -- so a data-integrity failure reached an operator as
+    // one line on a stream nobody keeps, and repeated on every pass, because
+    // the effect is re-claimed and fails identically. Retrying is not a remedy
+    // for a store that contradicts itself, which is the whole reason absorbing
+    // one is wrong where absorbing "run is not running" is right.
+    let faulted = super::run_claimable_effects_bounded(&effects, 1, |_effect| {
+        Err(StoreError::fault(
+            "branch mainline row",
+            "missing immediately after the insert that created it",
+        ))
+    });
+    let Err(StoreError::Fault { subject, .. }) = faulted else {
+        panic!("a store fault must abort the pass, got {faulted:?}");
+    };
+    assert_eq!(subject, "branch mainline row");
 }
 
 /// DR-0091 W1: the adoption-lease serialization's one hard failure — the

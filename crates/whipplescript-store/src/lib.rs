@@ -190,7 +190,46 @@ pub enum StoreError {
     #[cfg(feature = "native")]
     Sqlite(rusqlite::Error),
     Json(serde_json::Error),
+    /// Someone got there first at the level of this operation: look again and
+    /// you may proceed.
+    ///
+    /// Four other variants define themselves against this one and it had no
+    /// definition of its own, which is how it came to mean everything. It is
+    /// the variant `absorb_conflict` swallows -- one poisoned effect must not
+    /// wedge a worker pass -- so anything routed here is a thing the worker
+    /// will print once to stderr and carry on past. That is right for a race
+    /// and for a per-attempt refusal like "run is not running". It is wrong for
+    /// a failure that is not a refusal at all, which is what
+    /// [`StoreError::Invariant`] now carries.
     Conflict(String),
+    /// Something broke. This is not a refusal, and looking again will not help.
+    ///
+    /// Three shapes, all of which used to be [`StoreError::Conflict`]: the store
+    /// contradicting itself (a row this transaction just wrote is not there, a
+    /// transaction that reported success and did not execute), a value the store
+    /// wrote and cannot read back (a JSON blob, an integer out of SQLite range),
+    /// and an IO failure while doing the store's own bookkeeping.
+    ///
+    /// Distinct from `Conflict` on the same grounds as
+    /// [`StoreError::GuardRefused`]. A conflict means someone got there first
+    /// and looking again may let you proceed, which is why `absorb_conflict`
+    /// swallows it and carries the worker pass on. None of these is that:
+    /// looking again reproduces them, because nothing about the caller's timing
+    /// was wrong. Routed through `Conflict` they reached an operator as one line
+    /// on a stream nobody keeps, and repeated on every pass, because the effect
+    /// is re-claimed and fails identically.
+    ///
+    /// It carries `subject` as well as `detail` because these sites are the ones
+    /// whose context is the whole diagnosis -- WHICH row vanished, WHICH path
+    /// would not read. Collapsing them onto the bare [`StoreError::Io`] and
+    /// [`StoreError::Json`] variants would stop them being absorbed and throw
+    /// that away in the same move.
+    Fault {
+        /// What the store was doing: the row, the path, the field.
+        subject: String,
+        /// What went wrong, for an operator.
+        detail: String,
+    },
     PolicyBlocked {
         effect_id: String,
         reason: String,
@@ -199,14 +238,6 @@ pub enum StoreError {
         effect_id: String,
         reason: String,
     },
-    /// DR-0066 §3: bytes fetched by a content hash did not hash to it.
-    ///
-    /// Distinct from [`StoreError::Conflict`] on purpose. `Conflict` means
-    /// someone else got there first and the caller should look again; this
-    /// means a store answered with bytes that are not the bytes asked for, and
-    /// looking again at the same store is not a remedy. Collapsing the two
-    /// would let a `Conflict(_)` assertion pass on silent corruption, which is
-    /// the failure this variant exists to make loud.
     /// DR-0067 §2/§3: one of the log's guards refused this write.
     ///
     /// Distinct from [`StoreError::Conflict`], which means "someone got there
@@ -219,6 +250,20 @@ pub enum StoreError {
         /// What was expected versus what is there, for an operator.
         detail: String,
     },
+    /// DR-0066 §3: bytes fetched by a content hash did not hash to it.
+    ///
+    /// Distinct from [`StoreError::Conflict`] on purpose. `Conflict` means
+    /// someone else got there first and the caller should look again; this
+    /// means a store answered with bytes that are not the bytes asked for, and
+    /// looking again at the same store is not a remedy. Collapsing the two
+    /// would let a `Conflict(_)` assertion pass on silent corruption, which is
+    /// the failure this variant exists to make loud.
+    ///
+    /// This block sat directly against `GuardRefused`'s with no blank line
+    /// between them, so BOTH attached to `GuardRefused` and this variant
+    /// rendered with no documentation at all -- the DR-0066 rationale filed
+    /// against the wrong variant, in the enum whose whole subject is not
+    /// collapsing distinct failures together.
     ContentMismatch {
         /// The id the bytes were fetched by.
         id: String,
@@ -254,6 +299,45 @@ pub enum StoreError {
         /// somewhere to look that is not the graph.
         rule: String,
     },
+}
+
+impl StoreError {
+    /// A row this transaction just wrote, read back.
+    ///
+    /// `None` here is the store contradicting itself, so it is a
+    /// [`StoreError::Fault`] rather than a [`StoreError::Conflict`]: nothing
+    /// about the caller's timing was wrong, and looking again reproduces it.
+    ///
+    /// One function rather than the fourteen separate sites it replaces, for
+    /// two reasons. The invariant is ONE invariant -- a write that reported
+    /// success is readable -- and stating it fourteen times is how fourteen
+    /// copies come to disagree. And a refusal unreachable BY CONSTRUCTION
+    /// cannot be pinned where it sits: no test can make a row vanish between
+    /// its own insert and the read that follows, so every one of those sites
+    /// was unexercised and unpinnable, which the refusal sweep reports as
+    /// untested because it cannot tell that apart from untested. Here it is an
+    /// ordinary function with an ordinary test.
+    pub fn written_row<T>(row: Option<T>, subject: &str) -> StoreResult<T> {
+        row.ok_or_else(|| {
+            StoreError::fault(
+                subject,
+                "missing immediately after the write that should have created it",
+            )
+        })
+    }
+
+    /// A fault, not a refusal: see [`StoreError::Fault`].
+    ///
+    /// A constructor because these sites read better as one line, and because
+    /// every one of them used to be `StoreError::Conflict(...)` -- a shape that
+    /// made routing a fault into the concurrency variant the path of least
+    /// resistance, and absorbing it the default.
+    pub fn fault(subject: impl Into<String>, detail: impl Into<String>) -> Self {
+        StoreError::Fault {
+            subject: subject.into(),
+            detail: detail.into(),
+        }
+    }
 }
 
 impl From<std::io::Error> for StoreError {
@@ -2398,8 +2482,8 @@ impl SqliteStore {
                 },
             )?;
         }
-        let view = revision_by_id_on(&tx, &revision_id)?
-            .ok_or_else(|| StoreError::Conflict("revision was not recorded".to_owned()))?;
+        let view =
+            StoreError::written_row(revision_by_id_on(&tx, &revision_id)?, "instance revision")?;
         tx.commit()?;
         Ok(view)
     }
@@ -10906,8 +10990,10 @@ fn insert_effect_cancellation_request_on(
             },
         )?;
     }
-    cancellation_request_by_id_on(connection, &request_id)?
-        .ok_or_else(|| StoreError::Conflict("cancellation request was not recorded".to_owned()))
+    StoreError::written_row(
+        cancellation_request_by_id_on(connection, &request_id)?,
+        "effect cancellation request",
+    )
 }
 
 #[cfg(feature = "native")]
@@ -13073,6 +13159,35 @@ fn column_exists(connection: &Connection, table: &str, column: &str) -> StoreRes
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A row a write just created, read back and missing.
+    ///
+    /// Unreachable by construction, which is why it lives in one function
+    /// rather than at the fourteen sites that ask it: no test can make a row
+    /// vanish between its own insert and the read after it, so each of those
+    /// sites was unexercised AND unpinnable, and the refusal sweep cannot tell
+    /// "no test reaches this" from "no test COULD". Asked here it is an ordinary
+    /// function with an ordinary test -- and the test has to live in THIS crate,
+    /// because the sweep runs `-p <crate-of-the-file>` and a pin anywhere else
+    /// is invisible to it.
+    #[test]
+    fn a_row_that_a_write_just_created_must_be_readable() {
+        assert_eq!(
+            StoreError::written_row(Some(7_u8), "branch mainline row").expect("present"),
+            7
+        );
+
+        let missing = StoreError::written_row(None::<u8>, "branch mainline row")
+            .expect_err("a row that is not there is a fault");
+        let StoreError::Fault { subject, detail } = missing else {
+            panic!("a missing written row is a fault, not a conflict: {missing:?}");
+        };
+        assert_eq!(subject, "branch mainline row");
+        assert!(
+            detail.contains("missing immediately after the write"),
+            "{detail}"
+        );
+    }
 
     #[test]
     fn legacy_file_context_preserves_host_authority_boundaries() {

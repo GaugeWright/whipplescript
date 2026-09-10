@@ -1217,7 +1217,10 @@ impl Workstreams for WorkstreamStore {
             return Ok(RecordRefAdvancedOutcome::NotReserved);
         }
         let ref_position = i64::try_from(ref_position).map_err(|_| {
-            StoreError::Conflict("ref authority position exceeds SQLite range".to_owned())
+            StoreError::fault(
+                "ref authority position",
+                "the stored value does not fit the integer it is read into",
+            )
         })?;
         tx.execute(
             "UPDATE workstreams SET status = 'ref_advanced', ref_position = ?3, \
@@ -1813,6 +1816,34 @@ mod tests {
             panic!("ref advance was not recorded");
         };
         assert_eq!(advanced.status, StreamStatus::RefAdvanced);
+        // Re-recording is idempotent only when it says the SAME thing. A second
+        // advance under the same reservation naming a different position is not
+        // a retry of the first: admitting it would move a ref the caller
+        // already believes is elsewhere. Nothing exercised this arm on the
+        // NATIVE store -- the Durable Object has its own copy, and covering one
+        // says nothing about the other.
+        assert!(
+            matches!(
+                store
+                    .record_ref_advanced("ws", "reservation-1", 7, "sha256:receipt", "t4")
+                    .expect("identical re-record"),
+                RecordRefAdvancedOutcome::Existing(_)
+            ),
+            "an identical re-record is the same advance"
+        );
+        assert_eq!(
+            store
+                .record_ref_advanced("ws", "reservation-1", 9, "sha256:receipt", "t4")
+                .expect("different position"),
+            RecordRefAdvancedOutcome::ReservationMismatch,
+            "a different position is a second advance, not a retry"
+        );
+        assert_eq!(
+            store
+                .record_ref_advanced("ws", "reservation-1", 7, "sha256:other", "t4")
+                .expect("different handle"),
+            RecordRefAdvancedOutcome::ReservationMismatch
+        );
         assert_eq!(
             store
                 .release_boundary("ws", "reservation-1", "t5")

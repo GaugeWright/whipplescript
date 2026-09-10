@@ -60,7 +60,7 @@ crates/whipplescript-store/src/vcs.rs|boundary_ref_evidence|6
 crates/whipplescript-kernel/src/effect_handlers.rs|boundary_ref_evidence|3
 crates/whipplescript-store/src/workstreams.rs|reserve_boundary|7
 crates/whipplescript-kernel/src/effect_handlers.rs|reserve_boundary|6
-crates/whipplescript-store/src/workstreams.rs|record_ref_advanced|1
+crates/whipplescript-store/src/workstreams.rs|record_ref_advanced|4
 crates/whipplescript-kernel/src/effect_handlers.rs|record_ref_advanced|3
 crates/whipplescript-store/src/workstreams.rs|close_promoted|2
 crates/whipplescript-kernel/src/effect_handlers.rs|close_promoted|3
@@ -75,7 +75,8 @@ crates/whipplescript-kernel/src/effect_handlers.rs|release_branch_head_reservati
 crates/whipplescript-cli/src/main_tests/tests/cli_surface.rs|reserve_boundary|2
 crates/whipplescript-cli/src/main_tests/tests/cli_surface.rs|reserve_branch_head|1
 crates/whipplescript-cli/src/main_tests/tests/cli_surface.rs|release_branch_head_reservation|1
-crates/whipplescript-host-do/src/do_workstreams.rs|reserve_boundary|4
+crates/whipplescript-host-do/src/do_workstreams.rs|reserve_boundary|5
+crates/whipplescript-host-do/src/do_workstreams.rs|record_ref_advanced|4
 crates/whipplescript-host-do/src/do_workstreams.rs|release_boundary|4
 crates/whipplescript-host-do/src/do_workstreams.rs|reserve_branch_head|4
 crates/whipplescript-host-do/src/do_workstreams.rs|release_branch_head_reservation|3

@@ -598,10 +598,12 @@ impl<Sql: DoSql> DoSqliteStore<Sql> {
                 &[text(&request_id)],
             )
             .map_err(sql_err)?;
-        recorded
-            .first()
-            .map(|r| effect_cancellation_request_from_row(r))
-            .ok_or_else(|| StoreError::Conflict("cancellation request was not recorded".to_owned()))
+        StoreError::written_row(
+            recorded
+                .first()
+                .map(|r| effect_cancellation_request_from_row(r)),
+            "effect cancellation request",
+        )
     }
 
     /// Shared rule-commit path for `commit_rule` /
@@ -4779,8 +4781,10 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
             link("effect", effect_id, "cancellation_requested")?;
             link("effect_cancellation_request", request_id, "created")?;
         }
-        do_revision_by_id(&self.sql, &revision_id)?
-            .ok_or_else(|| StoreError::Conflict("revision was not recorded".to_owned()))
+        StoreError::written_row(
+            do_revision_by_id(&self.sql, &revision_id)?,
+            "instance revision",
+        )
     }
 
     fn request_effect_cancellation(
@@ -7732,10 +7736,10 @@ impl<Sql: DoSql> WorkItems for DoSqliteStore<Sql> {
                 &[],
             )
             .map_err(sql_err)?;
-        let next = bumped
-            .first()
-            .map(|row| as_i64(&row[0]))
-            .ok_or_else(|| StoreError::Conflict("tracker_counter row missing".to_owned()))?;
+        let next = StoreError::written_row(
+            bumped.first().map(|row| as_i64(&row[0])),
+            "tracker_counter row",
+        )?;
         let item_id = format!("WS-{next}");
         let labels_json =
             serde_json::to_string(labels).map_err(|error| sql_err(error.to_string()))?;
@@ -9051,10 +9055,10 @@ impl<Sql: DoSql> Coordination for DoSqliteStore<Sql> {
                 &[text(owner), text(ledger)],
             )
             .map_err(sql_err)?;
-        let seq = bumped
-            .first()
-            .map(|row| as_i64(&row[0]))
-            .ok_or_else(|| StoreError::Conflict("coord_ledger_seq row missing".to_owned()))?;
+        let seq = StoreError::written_row(
+            bumped.first().map(|row| as_i64(&row[0])),
+            "coord_ledger_seq row",
+        )?;
         self.sql
             .execute(
                 "INSERT INTO coord_ledger_entries (owner, ledger, partition, seq, payload_json, appended_by) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",

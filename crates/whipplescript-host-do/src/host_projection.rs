@@ -88,7 +88,7 @@ pub fn pinned_position<Sql: DoSql>(
         // An empty log sits at 0 with the genesis digest, so "nothing yet" is
         // still a pin rather than an absence a reader has to special-case.
         sequence: u64::try_from(head.sequence.unwrap_or(0)).map_err(|_| {
-            StoreError::Conflict("runtime event position cannot be negative".to_owned())
+            StoreError::fault("runtime event position", "the stored value is negative")
         })?,
         head_digest: head.digest,
     })
@@ -110,7 +110,7 @@ pub fn current_position<Sql: DoSql>(
     Ok(EventPosition {
         instance_ref: instance_id.to_owned(),
         sequence: u64::try_from(sequence).map_err(|_| {
-            StoreError::Conflict("runtime event position cannot be negative".to_owned())
+            StoreError::fault("runtime event position", "the stored value is negative")
         })?,
     })
 }

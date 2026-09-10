@@ -43616,6 +43616,13 @@ fn store_error(error: StoreError) -> String {
             "internal store error (malformed stored JSON: {error}); this is a whip bug, please report it"
         ),
         StoreError::Conflict(message) => message,
+        // Not a refusal: the store contradicted itself, or could not read back
+        // something it wrote. Say so, rather than rendering it as the operator's
+        // problem to retry -- these were `Conflict`, so they printed as a bare
+        // message and the worker carried on past them.
+        StoreError::Fault { subject, detail } => format!(
+            "internal store error ({subject}: {detail}); this is a whip bug, please report it"
+        ),
         StoreError::PolicyBlocked { reason, .. } => reason,
         StoreError::CapacityBlocked { reason, .. } => reason,
         // DR-0067 §2/§3: a guard refused the write. Never say "try again" — a
