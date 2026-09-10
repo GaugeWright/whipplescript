@@ -2283,6 +2283,10 @@ pub struct IrRuleMetadata {
     /// IFC-only — deliberately NOT rendered in the `.ir` snapshot, so it adds no
     /// golden/hash churn.
     pub terminal_completes: Vec<String>,
+    /// Declared failure bindings are data-bearing invoker egresses too.
+    /// Collected through the same nested statements as terminal_completes.
+    /// IFC-only, not rendered in the .ir snapshot.
+    pub terminal_failures: Vec<String>,
     /// The `redact <source> keep [..] as <out>` projections in this rule body
     /// (recursing into after/case/branch/handler blocks). Surfaced for the
     /// information-flow value-flow engine: a redaction is the explicit crossing at
@@ -2358,7 +2362,7 @@ pub struct IrRuleMetadata {
     /// Per egress sink, the binding roots of every enclosing `case` scrutinee
     /// (DR-0046): a sink inside a `case` arm is INFLUENCED by the scrutinee —
     /// branching on model output and recording per-arm constants is the
-    /// classic implicit channel. Covers record/complete/milestone/send/write
+    /// classic implicit channel. Covers record/complete/fail/milestone/send/write
     /// uniformly. IFC-only (NOT in the `.ir` snapshot).
     pub egress_case_influence: BTreeMap<String, BTreeSet<String>>,
     /// Per `complete <binding>` egress, the binding roots each RESULT FIELD
@@ -2370,6 +2374,10 @@ pub struct IrRuleMetadata {
     /// snapshot). Union across branches; a `Shorthand` field resolves to the
     /// terminal's `from` binding.
     pub complete_field_reads: BTreeMap<String, BTreeMap<String, BTreeSet<String>>>,
+    /// Per-field dependencies of declared failure outcomes. These participate
+    /// in imported-tool audit signatures without being mistaken for success.
+    /// IFC-only, not rendered in the .ir snapshot.
+    pub failure_field_reads: BTreeMap<String, BTreeMap<String, BTreeSet<String>>>,
     /// Per `emit milestone "<name>"` egress, the binding roots each MILESTONE FIELD
     /// references — same shape and purpose as `complete_field_reads`, but keyed by
     /// milestone name. Milestone payloads are child-to-parent egresses, so IFC needs
@@ -13358,9 +13366,20 @@ fn analyze_rule(
         );
         validate_recorded_schemas(rule, &arm_ast.statements, semantic, diagnostics);
     }
-    collect_terminal_complete_bindings(&body_ast.statements, &mut metadata.terminal_completes);
+    collect_terminal_bindings(
+        &body_ast.statements,
+        body::TerminalKind::Complete,
+        &mut metadata.terminal_completes,
+    );
     metadata.terminal_completes.sort();
     metadata.terminal_completes.dedup();
+    collect_terminal_bindings(
+        &body_ast.statements,
+        body::TerminalKind::Fail,
+        &mut metadata.terminal_failures,
+    );
+    metadata.terminal_failures.sort();
+    metadata.terminal_failures.dedup();
     collect_redaction_metadata(
         &body_ast.statements,
         &binding_types,
@@ -13380,7 +13399,16 @@ fn analyze_rule(
             .or_default()
             .extend(roots);
     }
-    collect_complete_field_reads(&body_ast.statements, &mut metadata.complete_field_reads);
+    collect_terminal_field_reads(
+        &body_ast.statements,
+        body::TerminalKind::Complete,
+        &mut metadata.complete_field_reads,
+    );
+    collect_terminal_field_reads(
+        &body_ast.statements,
+        body::TerminalKind::Fail,
+        &mut metadata.failure_field_reads,
+    );
     collect_record_field_reads(&body_ast.statements, &mut metadata.record_field_reads);
     collect_tracker_file_field_reads(&body_ast.statements, &mut metadata.tracker_file_field_reads);
     collect_milestone_field_reads(&body_ast.statements, &mut metadata.milestone_field_reads);
@@ -13451,7 +13479,7 @@ fn collect_egress_case_influence(
     };
     for statement in statements {
         match statement {
-            body::BodyStmt::Terminal(terminal) if terminal.kind == body::TerminalKind::Complete => {
+            body::BodyStmt::Terminal(terminal) => {
                 record_sink(terminal.name.clone(), active, out);
             }
             body::BodyStmt::Record(record) => {
@@ -13735,20 +13763,21 @@ fn collect_crossing_roots(
     }
 }
 
-/// For each `complete <binding> { field: <expr>, … }` egress in a rule body
+/// For each terminal of the requested kind in a rule body
 /// (recursing into nested blocks), the binding roots EACH result field references,
 /// as `binding -> field -> {roots}`. A `Shorthand` field (`complete result from src
 /// { f }`) resolves to the terminal's `from` binding. Unlike
 /// `collect_egress_payload_reads` (which joins a sink's fields), this keeps fields
 /// separate so the IFC engine can compute a per-field flow signature (DR-0030 X2
 /// v2). Union across branches (a field completed in two arms references the union).
-fn collect_complete_field_reads(
+fn collect_terminal_field_reads(
     statements: &[body::BodyStmt],
+    terminal_kind: body::TerminalKind,
     out: &mut BTreeMap<String, BTreeMap<String, BTreeSet<String>>>,
 ) {
     for statement in statements {
         match statement {
-            body::BodyStmt::Terminal(terminal) if terminal.kind == body::TerminalKind::Complete => {
+            body::BodyStmt::Terminal(terminal) if terminal.kind == terminal_kind => {
                 let per_field = out.entry(terminal.name.clone()).or_default();
                 for field in &terminal.fields {
                     let mut roots = BTreeSet::new();
@@ -13773,10 +13802,12 @@ fn collect_complete_field_reads(
                         .extend(roots);
                 }
             }
-            body::BodyStmt::After(after) => collect_complete_field_reads(&after.body, out),
+            body::BodyStmt::After(after) => {
+                collect_terminal_field_reads(&after.body, terminal_kind, out)
+            }
             body::BodyStmt::Case(case) => {
                 for branch in &case.branches {
-                    collect_complete_field_reads(&branch.body, out);
+                    collect_terminal_field_reads(&branch.body, terminal_kind, out);
                 }
             }
             _ => {}
@@ -13786,7 +13817,7 @@ fn collect_complete_field_reads(
 
 /// For each `emit milestone "<name>" { field: <expr>, … }` egress in a rule body
 /// (recursing into nested blocks), collect the binding roots EACH milestone field
-/// references. This mirrors `collect_complete_field_reads`: the IFC checker uses it
+/// references. This mirrors `collect_terminal_field_reads`: the IFC checker uses it
 /// to expose and gate a child-to-parent milestone payload with a per-field flow
 /// signature (D3′).
 fn collect_milestone_field_reads(
@@ -14048,7 +14079,7 @@ fn collect_payload_field_roots(
 
 /// For each egress sink in a rule body (recursing into nested blocks), the set of
 /// binding roots its payload references, keyed by the sink string the IFC engine
-/// uses: a `complete <binding>` by its binding, a `record <Schema>` by
+/// uses: a `complete` or `fail` terminal by its binding, a `record <Schema>` by
 /// `fact:<Schema>`. Surfaced so the engine can recognize a FULLY-REDACTED egress —
 /// one whose payload references only redaction outputs (and constants) — and
 /// govern it by the projection's per-field label instead of the rule's whole read
@@ -14061,7 +14092,7 @@ fn collect_egress_payload_reads(
 ) {
     for statement in statements {
         match statement {
-            body::BodyStmt::Terminal(terminal) if terminal.kind == body::TerminalKind::Complete => {
+            body::BodyStmt::Terminal(terminal) => {
                 let mut roots = BTreeSet::new();
                 collect_payload_field_roots(&terminal.fields, None, &mut roots);
                 // A bare scalar payload's value expression is the whole egress
@@ -14225,7 +14256,7 @@ fn send_payload_reads(fields: &[body::ConstructUseField]) -> Option<(String, BTr
 /// copied-from binding `b`.
 /// DR-0051 §4: per-field binding roots for every `record <Schema> { … }` in a
 /// rule body, recursing into nested blocks. Mirrors
-/// `collect_complete_field_reads`; see `record_field_reads`.
+/// `collect_terminal_field_reads`; see `record_field_reads`.
 /// Per-field binding roots for every `file issue into <tracker> { … }`, keyed
 /// by tracker and then field (DR-0110). The shape mirrors
 /// `collect_record_field_reads`; see `tracker_file_field_reads`.
@@ -16372,21 +16403,27 @@ fn seed_ast_only_effect_bindings(
 /// Derives effect nodes and dependency edges from the body AST, in document
 /// order, with ids and idempotency keys identical to the historical
 /// line-scanner derivation.
-/// Collect the output bindings a rule `complete`s, recursing through the body's
+/// Collect bindings for one terminal kind, recursing through the body's
 /// nested blocks (after / case / branch / handler). A `complete <binding> {…}` is the
 /// workflow's output to its invoker; the IFC checker treats it as an egress sink at
-/// the invoker boundary (DR-0030 X2). `fail` terminals are NOT collected —
-/// they carry an error to the runtime, not a value to the invoker.
-fn collect_terminal_complete_bindings(statements: &[body::BodyStmt], out: &mut Vec<String>) {
+/// the invoker boundary (DR-0030 X2). Declared failures carry data too, so
+/// the caller collects each terminal kind into its own metadata field.
+fn collect_terminal_bindings(
+    statements: &[body::BodyStmt],
+    terminal_kind: body::TerminalKind,
+    out: &mut Vec<String>,
+) {
     for statement in statements {
         match statement {
-            body::BodyStmt::Terminal(terminal) if terminal.kind == body::TerminalKind::Complete => {
+            body::BodyStmt::Terminal(terminal) if terminal.kind == terminal_kind => {
                 out.push(terminal.name.clone());
             }
-            body::BodyStmt::After(after) => collect_terminal_complete_bindings(&after.body, out),
+            body::BodyStmt::After(after) => {
+                collect_terminal_bindings(&after.body, terminal_kind, out)
+            }
             body::BodyStmt::Case(case) => {
                 for branch in &case.branches {
-                    collect_terminal_complete_bindings(&branch.body, out);
+                    collect_terminal_bindings(&branch.body, terminal_kind, out);
                 }
             }
             _ => {}

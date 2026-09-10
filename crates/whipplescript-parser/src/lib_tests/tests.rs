@@ -900,8 +900,12 @@ fn accepted_rule_body_matrix_has_no_silent_noops() {
         .terminal_completes
         .contains(&"result".to_owned()));
 
-    let fail = b1g_probe_rule("fail", r#"    fail error { reason "bad" }"#);
+    let fail = b1g_probe_rule("fail", r#"    fail error { reason ticket.title }"#);
     assert_eq!(fail.metadata.effects, Vec::new());
+    assert_eq!(fail.metadata.terminal_failures, vec!["error".to_owned()]);
+    assert!(fail.metadata.terminal_completes.is_empty());
+    assert!(fail.metadata.failure_field_reads["error"]["reason"].contains("ticket"));
+    assert!(fail.metadata.egress_payload_reads["error"].contains("ticket"));
 
     let exec_each = b1g_probe_rule("exec_each", r#"    exec "printf '{}'" -> each Row"#);
     b1g_effect(&exec_each, IrEffectKind::ExecCommand, None, "exec_each");

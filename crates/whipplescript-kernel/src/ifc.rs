@@ -28,6 +28,8 @@ use whipplescript_parser::{
 
 use crate::host_policy::{PlacementPolicy, ProviderBindingPolicy};
 
+#[cfg(test)]
+mod failure_egress;
 mod resource_flow;
 
 /// The bottom reader-authority: data readable by `public` is readable by anyone,
@@ -3714,17 +3716,20 @@ fn program_read_resources(ir: &IrProgram) -> Vec<String> {
 /// Direction A, the reach refinement — computed consumer-side from the pinned tool
 /// source, since structural reach is label-agnostic and the consumer recompiles the
 /// source anyway). The result depends only on the reads of the rules that **reach a
-/// completing rule** — itself plus every transitive upstream rule whose recorded fact
-/// it consumes. A resource read ONLY by rules that never feed a `complete` is
+/// completing or failing rule** — itself plus every transitive upstream rule whose recorded fact
+/// it consumes. A resource read ONLY by rules that never feed either terminal is
 /// `independent_of` the result (a proven non-interference, `noReach`) and is dropped,
 /// so the result carries a smaller join than the whole-tool baseline. Whole-result v1:
 /// reads are attributed at rule granularity (no per-field value-flow), so the cut is
-/// the rule-dependency graph. Falls back to all reads if the tool never completes.
+/// the rule-dependency graph. Falls back to all reads if the tool has no terminal.
 fn result_dependency_reads(tool: &IrProgram) -> Vec<String> {
     let completing: BTreeSet<&str> = tool
         .rules
         .iter()
-        .filter(|rule| !rule.metadata.terminal_completes.is_empty())
+        .filter(|rule| {
+            !rule.metadata.terminal_completes.is_empty()
+                || !rule.metadata.terminal_failures.is_empty()
+        })
         .map(|rule| rule.name.as_str())
         .collect();
     if completing.is_empty() {
@@ -3850,7 +3855,22 @@ fn field_dependency_reads(
 
 fn result_field_dependency_reads(tool: &IrProgram) -> Vec<(String, String, Vec<String>)> {
     let whole: BTreeSet<String> = result_dependency_reads(tool).into_iter().collect();
-    field_dependency_reads(tool, whole, |rule| &rule.metadata.complete_field_reads)
+    let mut fields = field_dependency_reads(tool, whole.clone(), |rule| {
+        &rule.metadata.complete_field_reads
+    });
+    fields.extend(field_dependency_reads(tool, whole, |rule| {
+        &rule.metadata.failure_field_reads
+    }));
+    // Output and failure contracts may share a name. The audit format keys by
+    // binding and field, so retain the union rather than duplicate signatures.
+    let mut merged: BTreeMap<(String, String), BTreeSet<String>> = BTreeMap::new();
+    for (binding, field, reads) in fields {
+        merged.entry((binding, field)).or_default().extend(reads);
+    }
+    merged
+        .into_iter()
+        .map(|((binding, field), reads)| (binding, field, reads.into_iter().collect()))
+        .collect()
 }
 
 fn milestone_field_dependency_reads(tool: &IrProgram) -> Vec<(String, String, Vec<String>)> {
@@ -4920,7 +4940,7 @@ pub fn check_with_envelope_imports(
             .iter()
             .map(|write| format!("fact:{}", write.strip_prefix("schema:").unwrap_or(write)))
             .collect();
-        // `complete result {…}` returns a value to the workflow's invoker — an egress
+        // Both complete and fail return data to the workflow's invoker — an egress
         // sink at the invoker boundary (DR-0030 X2, top-level half). For a
         // `@service`/top-level workflow the invoker is the operator in the same
         // governance domain, so the result is a local confidentiality sink named by the
@@ -4939,7 +4959,12 @@ pub fn check_with_envelope_imports(
         let result_sinks: Vec<String> = if is_tool {
             Vec::new()
         } else {
-            rule.metadata.terminal_completes.clone()
+            rule.metadata
+                .terminal_completes
+                .iter()
+                .chain(&rule.metadata.terminal_failures)
+                .cloned()
+                .collect()
         };
         let record_sinks = record_candidates;
         let milestone_sinks: Vec<String> = rule
@@ -5019,7 +5044,7 @@ pub fn check_with_envelope_imports(
         // shared governance envelope) become read SOURCES of the turn's rule, and a
         // tool whose result then flows to a consumer sink is caught on both axes.
         // `result_dependency_reads` is the Direction-A reach refinement: only the reads
-        // that reach a completing rule (the rest are `independent_of` the result and
+        // that reach a completing or failing rule (the rest are independent of the outcome and
         // dropped). It degrades to the whole-tool join box when the tool's result
         // depends on everything. Imported tools are matched to the agent's `tools` list
         // by workflow name.
