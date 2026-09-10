@@ -1,5 +1,7 @@
-//! File terminal and its ordinary workflow fact are one transaction. Target
-//! application remains a separate boundary; this primitive never repeats I/O.
+//! A local effect terminal and its ordinary workflow fact are one transaction.
+//! File APIs retain their shipped names; resolution recording shares this
+//! transaction with an exact provider/target profile. Target application remains
+//! a separate boundary; this primitive never repeats I/O.
 use crate::{EffectCompletion, NewFact, StoreError, StoreResult};
 
 #[derive(Clone, Copy, Debug)]
@@ -10,14 +12,26 @@ pub struct FileSettlementFact<'a> {
     pub value_json: &'a str,
 }
 
+/// Shared local settlement descriptor. The file name is retained for source
+/// compatibility; the provider and recorded effect determine the allowed profile.
+pub type LocalEffectSettlementFact<'a> = FileSettlementFact<'a>;
+
+pub const RESOLUTION_RECORDING_PROVIDER: &str = "resolution-memory";
+pub const RESOLUTION_RECORDING_CAPABILITY: &str = "vcs.record_resolutions";
+
 impl<'a> FileSettlementFact<'a> {
     pub fn validate(&self, completion: EffectCompletion<'_>) -> StoreResult<()> {
         let value: serde_json::Value = serde_json::from_str(self.value_json)?;
         let metadata: serde_json::Value = serde_json::from_str(completion.metadata_json)?;
-        let valid_name = ["file.read", "file.write", "file.import", "file.export"]
-            .iter()
-            .any(|kind| self.name == format!("{kind}.{}", completion.status));
-        if completion.provider != "files"
+        let recording = completion.provider == RESOLUTION_RECORDING_PROVIDER;
+        let valid_name = if recording {
+            self.name == format!("capability.call.{}", completion.status)
+        } else {
+            ["file.read", "file.write", "file.import", "file.export"]
+                .iter()
+                .any(|kind| self.name == format!("{kind}.{}", completion.status))
+        };
+        if (!recording && completion.provider != "files")
             || !matches!(completion.status, "completed" | "failed")
             || !valid_name
             || self.fact_id.trim().is_empty()
@@ -29,7 +43,7 @@ impl<'a> FileSettlementFact<'a> {
                 != Some(completion.effect_id)
             || value.get("run_id").and_then(serde_json::Value::as_str) != Some(completion.run_id)
             || value.get("status").and_then(serde_json::Value::as_str) != Some(completion.status)
-            || (completion.status == "completed"
+            || ((completion.status == "completed" || recording)
                 && (value.get("value").is_none() || value.get("value") != metadata.get("value")))
         {
             return Err(StoreError::Conflict(
@@ -43,6 +57,27 @@ impl<'a> FileSettlementFact<'a> {
         if recorded_kind.is_none_or(|kind| self.name != format!("{kind}.{status}")) {
             return Err(StoreError::Conflict(
                 "file settlement fact differs from the recorded effect kind".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Checked inside settlement's transaction against the actual queued effect
+    /// and running attempt, never against a caller's claimed capability/provider.
+    pub fn check_effect(
+        &self,
+        completion: EffectCompletion<'_>,
+        recorded_kind: Option<&str>,
+        recorded_target: Option<&str>,
+        recorded_provider: Option<&str>,
+    ) -> StoreResult<()> {
+        self.check_kind(completion.status, recorded_kind)?;
+        if recorded_provider != Some(completion.provider)
+            || (completion.provider == RESOLUTION_RECORDING_PROVIDER
+                && recorded_target != Some(RESOLUTION_RECORDING_CAPABILITY))
+        {
+            return Err(StoreError::Conflict(
+                "local settlement differs from the recorded target or run provider".into(),
             ));
         }
         Ok(())
@@ -92,14 +127,27 @@ pub(crate) fn append_fact(
     fact: FileSettlementFact<'_>,
 ) -> StoreResult<()> {
     use rusqlite::OptionalExtension;
-    let kind: Option<String> = connection
+    let recorded: Option<(String, Option<String>, String)> = connection
         .query_row(
-            "SELECT kind FROM effects WHERE instance_id = ?1 AND effect_id = ?2",
-            [completion.instance_id, completion.effect_id],
-            |row| row.get(0),
+            "SELECT e.kind, e.target, r.provider FROM effects e JOIN runs r \
+             ON r.instance_id = e.instance_id AND r.effect_id = e.effect_id \
+             WHERE e.instance_id = ?1 AND e.effect_id = ?2 AND r.run_id = ?3",
+            [
+                completion.instance_id,
+                completion.effect_id,
+                completion.run_id,
+            ],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .optional()?;
-    fact.check_kind(completion.status, kind.as_deref())?;
+    fact.check_effect(
+        completion,
+        recorded.as_ref().map(|(kind, _, _)| kind.as_str()),
+        recorded
+            .as_ref()
+            .and_then(|(_, target, _)| target.as_deref()),
+        recorded.as_ref().map(|(_, _, provider)| provider.as_str()),
+    )?;
     let active = connection.query_row(
         "SELECT 1 FROM facts WHERE instance_id = ?1 AND name = ?2 AND key = ?3 AND consumed_at IS NULL",
         [completion.instance_id, fact.name, completion.effect_id], |_| Ok(()),
@@ -141,6 +189,7 @@ pub mod conformance {
         pub name: String,
         pub status: String,
         pub value: String,
+        pub provider: String,
     }
 
     impl Fixture {
@@ -149,7 +198,7 @@ pub mod conformance {
                 instance_id: &self.instance,
                 effect_id: "settle-effect",
                 run_id: "settle-run",
-                provider: "files",
+                provider: &self.provider,
                 worker_id: "fixture",
                 status: &self.status,
                 exit_code: Some(0),
@@ -187,10 +236,30 @@ pub mod conformance {
     }
 
     pub fn setup(store: &mut impl RuntimeStore, kind: &str, status: &str) -> Fixture {
+        setup_profile(store, kind, status, "files", None)
+    }
+
+    pub fn setup_recording(
+        store: &mut impl RuntimeStore,
+        status: &str,
+        provider: &str,
+        target: Option<&str>,
+    ) -> Fixture {
+        setup_profile(store, "capability.call", status, provider, target)
+    }
+
+    fn setup_profile(
+        store: &mut impl RuntimeStore,
+        kind: &str,
+        status: &str,
+        provider: &str,
+        target: Option<&str>,
+    ) -> Fixture {
+        let capability = target.unwrap_or(kind);
         let version = host_actions::conformance::register(store);
         store
             .register_capability_schema(CapabilitySchemaRegistration {
-                capability: kind,
+                capability,
                 description: "settlement",
                 schema_json: "{}",
                 registered_by_package_id: None,
@@ -200,8 +269,8 @@ pub mod conformance {
             .bind_capability(CapabilityBinding {
                 binding_id: "settle-files",
                 program_id: Some(&version.program_id),
-                capability: kind,
-                provider: "files",
+                capability,
+                provider,
                 config_json: "{}",
             })
             .expect("settlement fixture operation");
@@ -209,8 +278,8 @@ pub mod conformance {
             .register_effect_provider(EffectProviderRegistration {
                 provider_id: "settle-files",
                 effect_kind: kind,
-                provider: "files",
-                capability: kind,
+                provider,
+                capability,
                 config_json: "{}",
                 registered_by_package_id: None,
             })
@@ -233,11 +302,11 @@ pub mod conformance {
                 effects: &[NewEffect {
                     effect_id: "settle-effect",
                     kind,
-                    target: None,
+                    target,
                     input_json: "{}",
                     status: "queued",
                     idempotency_key: "settle-effect",
-                    required_capabilities_json: "[]",
+                    required_capabilities_json: &serde_json::json!([capability]).to_string(),
                     profile: None,
                     correlation_id: None,
                     source_span_json: None,
@@ -255,14 +324,14 @@ pub mod conformance {
                 instance_id: &instance,
                 effect_id: "settle-effect",
                 run_id: "settle-run",
-                provider: "files",
+                provider,
                 worker_id: "fixture",
                 lease_id: "settle-lease",
                 lease_expires_at: "2030-01-01T00:00:00Z",
                 metadata_json: "{}",
             })
             .expect("settlement fixture operation");
-        Fixture { instance, name: format!("{kind}.{status}"), status: status.into(),
+        Fixture { instance, provider: provider.into(), name: format!("{kind}.{status}"), status: status.into(),
             value: serde_json::json!({"effect_id":"settle-effect", "run_id":"settle-run", "status":status,
                 "value":{"bytes":4}}).to_string() }
     }
@@ -538,6 +607,9 @@ pub mod conformance {
             .is_empty());
     }
 }
+
+#[doc(hidden)]
+pub mod recording_conformance;
 
 #[cfg(all(test, feature = "native"))]
 mod tests;

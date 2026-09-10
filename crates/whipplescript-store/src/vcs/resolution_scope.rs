@@ -136,11 +136,29 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
         ours: &str,
         theirs: &str,
     ) -> StoreResult<String> {
-        let legacy_key = Self::region_key(base, ours, theirs);
-        match scope {
-            Some(scope) => scope.key(&legacy_key),
-            None => Ok(legacy_key),
-        }
+        region_key_in_scope(scope, base, ours, theirs)
+    }
+}
+
+pub(super) fn region_key(base: &str, ours: &str, theirs: &str) -> String {
+    format!(
+        "rk|{}|{}|{}",
+        crate::chunking::content_hash_hex(base.as_bytes()),
+        crate::chunking::content_hash_hex(ours.as_bytes()),
+        crate::chunking::content_hash_hex(theirs.as_bytes())
+    )
+}
+
+pub(crate) fn region_key_in_scope(
+    scope: Option<&ResolutionMemoryScope>,
+    base: &str,
+    ours: &str,
+    theirs: &str,
+) -> StoreResult<String> {
+    let legacy_key = region_key(base, ours, theirs);
+    match scope {
+        Some(scope) => scope.key(&legacy_key),
+        None => Ok(legacy_key),
     }
 }
 

@@ -37,32 +37,14 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
         at: &str,
         scope: Option<&super::resolution_scope::ResolutionMemoryScope>,
     ) -> StoreResult<ResolutionMemoryReceipt> {
-        let mut entries = Vec::with_capacity(resolutions.len().saturating_mul(2));
-        for resolution in resolutions {
-            let identity = crate::chunking::content_hash_hex(resolution.resolution_text.as_bytes());
-            for (ours, theirs) in [
-                (&resolution.ours_text, &resolution.theirs_text),
-                (&resolution.theirs_text, &resolution.ours_text),
-            ] {
-                entries.push(ResolutionMemoryEntry {
-                    triple_key: Self::region_key_in_scope(
-                        scope,
-                        &resolution.base_text,
-                        ours,
-                        theirs,
-                    )?,
-                    resolution: identity.clone(),
-                });
-            }
-        }
-        let request = ResolutionMemoryBatch {
-            operation_id: operation_id.into(),
-            actor: self.actor.clone().unwrap_or_default(),
-            intent: self.intent.clone().unwrap_or_default(),
-            recorded_at: at.into(),
-            entries,
-        };
-        request.validate()?;
+        let request = prepare_batch(
+            scope,
+            operation_id,
+            resolutions,
+            self.actor.as_deref().unwrap_or_default(),
+            self.intent.as_deref().unwrap_or_default(),
+            at,
+        )?;
         // Recover before touching content: erased bodies stay erased and an
         // uncertain recording is never replaced by a fresh recording.
         if let Some(receipt) = self.resolution_receipt(operation_id)? {
@@ -84,6 +66,44 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
             self.branches.record_resolution_batch(&request)
         })
     }
+}
+
+/// One pure construction shared by bound host recording and the storage verb.
+pub(crate) fn prepare_batch(
+    scope: Option<&super::resolution_scope::ResolutionMemoryScope>,
+    operation_id: &str,
+    resolutions: &[RegionResolution],
+    actor: &str,
+    intent: &str,
+    at: &str,
+) -> StoreResult<ResolutionMemoryBatch> {
+    let mut entries = Vec::with_capacity(resolutions.len().saturating_mul(2));
+    for resolution in resolutions {
+        let identity = crate::chunking::content_hash_hex(resolution.resolution_text.as_bytes());
+        for (ours, theirs) in [
+            (&resolution.ours_text, &resolution.theirs_text),
+            (&resolution.theirs_text, &resolution.ours_text),
+        ] {
+            entries.push(ResolutionMemoryEntry {
+                triple_key: super::resolution_scope::region_key_in_scope(
+                    scope,
+                    &resolution.base_text,
+                    ours,
+                    theirs,
+                )?,
+                resolution: identity.clone(),
+            });
+        }
+    }
+    let request = ResolutionMemoryBatch {
+        operation_id: operation_id.into(),
+        actor: actor.into(),
+        intent: intent.into(),
+        recorded_at: at.into(),
+        entries,
+    };
+    request.validate()?;
+    Ok(request)
 }
 
 /// Shared fixtures execute the same VCS operation on real native/DO stores.

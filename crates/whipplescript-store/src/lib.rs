@@ -41,6 +41,7 @@ pub mod text_merge;
 pub mod transfer;
 pub mod vcs;
 pub mod vcs_file_save;
+pub mod vcs_resolution_recording;
 pub mod working_set;
 pub mod workspace_api;
 pub mod workstreams;
@@ -7286,6 +7287,17 @@ pub trait RuntimeStore {
         diagnostic: Option<TerminalDiagnosticRecord>,
         fact: file_settlement::FileSettlementFact<'_>,
     ) -> StoreResult<StoredEvent>;
+
+    /// Atomically settle a supported local effect and its continuation through
+    /// the same backend transaction as the source-compatible file entry point.
+    fn settle_local_effect(
+        &mut self,
+        completion: EffectCompletion<'_>,
+        diagnostic: Option<TerminalDiagnosticRecord>,
+        fact: file_settlement::LocalEffectSettlementFact<'_>,
+    ) -> StoreResult<StoredEvent> {
+        self.settle_file_effect(completion, diagnostic, fact)
+    }
 
     fn complete_effect_with_terminal_diagnostic(
         &mut self,

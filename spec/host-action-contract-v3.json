@@ -1,0 +1,85 @@
+{
+  "schema": "whipplescript.host_action_contract_pin.v3",
+  "contract_revision": "whipplescript-host-action/v3.0.0",
+  "authority": "WhippleScript DR-0099",
+  "operations": [
+    "admit_action",
+    "execute_action_file_effect",
+    "read_action_result",
+    "reconcile_effect",
+    "reconcile_versioned_save",
+    "execute_scoped_save_file_effect",
+    "reconcile_scoped_versioned_save",
+    "execute_resolution_recording",
+    "reconcile_resolution_recording"
+  ],
+  "dispatch_kinds": [
+    "file.read",
+    "file.write",
+    "file.import",
+    "file.export",
+    "capability.call"
+  ],
+  "message_types": [
+    "HostActionCommand",
+    "ActionAdmissionReceipt",
+    "ExecuteActionEffect",
+    "ReadActionResult",
+    "ActionResultSnapshot",
+    "ReconcileEffectCommand",
+    "ReconciliationReceipt",
+    "SaveReceipt",
+    "WriteEvidenceRef",
+    "ResolutionMemoryReceipt",
+    "ResolutionMemoryScope",
+    "ScopedSaveReceipt",
+    "ResolutionRecordingBinding",
+    "ResolutionRecordingInput"
+  ],
+  "compatibility": {
+    "schema_validity_grants_authority": false,
+    "receipt_handles_grant_authority": false,
+    "reconciliation_advances_workflow": false,
+    "legacy_turn_decoding_changed": false,
+    "save_receipts_may_contain_protected_content": true,
+    "complete_product_mediation": false,
+    "namespace_identity_grants_authority": false,
+    "resolution_receipt_authorizes_recording": false,
+    "recording_inputs_may_contain_protected_content": true,
+    "recording_binding_grants_authority": false,
+    "batch_receipt_proves_input_serialization": false,
+    "reconciliation_rehydrates_content": false
+  },
+  "canonicalization": {
+    "encoding": "UTF-8",
+    "object_key_order": "Unicode scalar order; not UTF-16 or RFC 8785",
+    "integers": "Exact u64/i64 JSON integers; do not normalize through binary floating point",
+    "optional_fields": "Normalize with the pinned Rust codec before signing; absent and explicit null optional fields share its typed meaning",
+    "signing_domain_terminator": "NUL byte; domains are defined by the pinned runtime protocol"
+  },
+  "base_contract": {
+    "path": "spec/host-action-contract-v2.json",
+    "sha256": "9abd1443bf20655821210bcc4266a061e418f077f0c02c26607891598822369f",
+    "contract_digest": "538cb089bc1cc564610c2fa3786837a7a0aa3037018e88cb10e63ae57f4926ca"
+  },
+  "wire_schema": {
+    "path": "spec/report-schemas/host_action_v3.schema.json",
+    "sha256": "45fb35b1ffcd029dbe444caaa0abf9d1eeb7d084c1a76c805fa8a8cf39faff36"
+  },
+  "fixtures": {
+    "path": "spec/host-action-contract-fixtures-v3.json",
+    "sha256": "6c348bacf20264fb6a8c3c7425f8234fd3f68854793cfcdb00149cba9dc437a4"
+  },
+  "codec_harness": {
+    "path": "crates/whipplescript-kernel/examples/host_action_contract_v3.rs",
+    "sha256": "77cf3a17c27db06f75f167382ad9c76debc1270e4783883dbc1036895cbd0030"
+  },
+  "recording_profile": {
+    "operation": "resolution.record",
+    "capability": "vcs.record_resolutions",
+    "provider": "resolution-memory",
+    "workflow_source": "runtime-owned",
+    "caller_supplied_source": false
+  },
+  "contract_digest": "00e082316c68f5c696663cfaef2ad6f9e4488b707d172ba4f0c1829e02877e63"
+}

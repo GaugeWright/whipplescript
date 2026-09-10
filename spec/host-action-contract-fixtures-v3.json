@@ -1,0 +1,532 @@
+{
+  "schema": "whipplescript.host_action_contract_fixtures.v3",
+  "contract_revision": "whipplescript-host-action/v3.0.0",
+  "description": "Synthetic strict recording inputs and coordinates. Shape grants no authority and does not prove that an input serialization matches its supplied hash.",
+  "cases": [
+    {
+      "id": "recording-input",
+      "message_type": "ResolutionRecordingInput",
+      "value": {
+        "protocol": "whipplescript.resolution-recording-input.v1",
+        "resolutions": [
+          {
+            "base_text": "base",
+            "ours_text": "ours",
+            "theirs_text": "theirs",
+            "resolution_text": "correction"
+          }
+        ]
+      },
+      "wire_valid": true,
+      "syntax_valid": true,
+      "schema_valid": true
+    },
+    {
+      "id": "recording-deletion",
+      "message_type": "ResolutionRecordingInput",
+      "value": {
+        "protocol": "whipplescript.resolution-recording-input.v1",
+        "resolutions": [
+          {
+            "base_text": "",
+            "ours_text": "",
+            "theirs_text": "",
+            "resolution_text": ""
+          }
+        ]
+      },
+      "wire_valid": true,
+      "syntax_valid": true,
+      "schema_valid": true
+    },
+    {
+      "id": "recording-binding",
+      "message_type": "ResolutionRecordingBinding",
+      "value": {
+        "protocol": "whipplescript.resolution-recording-binding.v1",
+        "input_hash": "11111111111111111111111111111111",
+        "input_label": "label:corrections",
+        "scope": {
+          "authority": "home:fixture",
+          "resource": "path:fixture",
+          "compartment": "private"
+        },
+        "batch": {
+          "operation_id": "recording:fixture",
+          "actor": "human:fixture",
+          "intent": "intent:fixture",
+          "recorded_at": "2026-09-10T12:00:00Z",
+          "entries": [
+            {
+              "triple_key": "rks1|2222222222222222222222222222222222222222222222222222222222222222",
+              "resolution": "33333333333333333333333333333333"
+            }
+          ]
+        }
+      },
+      "wire_valid": true,
+      "syntax_valid": true,
+      "schema_valid": true
+    },
+    {
+      "id": "recording-input-protocol",
+      "message_type": "ResolutionRecordingInput",
+      "base": "recording-input",
+      "wire_valid": false,
+      "syntax_valid": null,
+      "schema_valid": false,
+      "set": [
+        {
+          "pointer": "/protocol",
+          "value": "future"
+        }
+      ]
+    },
+    {
+      "id": "recording-input-empty",
+      "message_type": "ResolutionRecordingInput",
+      "base": "recording-input",
+      "wire_valid": false,
+      "syntax_valid": null,
+      "schema_valid": false,
+      "set": [
+        {
+          "pointer": "/resolutions",
+          "value": []
+        }
+      ]
+    },
+    {
+      "id": "recording-input-extra",
+      "message_type": "ResolutionRecordingInput",
+      "base": "recording-input",
+      "wire_valid": false,
+      "syntax_valid": null,
+      "schema_valid": false,
+      "set": [
+        {
+          "pointer": "/authorization",
+          "value": "grant"
+        }
+      ]
+    },
+    {
+      "id": "recording-region-extra",
+      "message_type": "ResolutionRecordingInput",
+      "base": "recording-input",
+      "wire_valid": false,
+      "syntax_valid": null,
+      "schema_valid": false,
+      "set": [
+        {
+          "pointer": "/resolutions/0/authorization",
+          "value": "grant"
+        }
+      ]
+    },
+    {
+      "id": "recording-region-type",
+      "message_type": "ResolutionRecordingInput",
+      "base": "recording-input",
+      "wire_valid": false,
+      "syntax_valid": null,
+      "schema_valid": false,
+      "set": [
+        {
+          "pointer": "/resolutions/0/resolution_text",
+          "value": null
+        }
+      ]
+    },
+    {
+      "id": "recording-binding-protocol",
+      "message_type": "ResolutionRecordingBinding",
+      "base": "recording-binding",
+      "wire_valid": false,
+      "syntax_valid": null,
+      "schema_valid": false,
+      "set": [
+        {
+          "pointer": "/protocol",
+          "value": "future"
+        }
+      ]
+    },
+    {
+      "id": "recording-binding-extra",
+      "message_type": "ResolutionRecordingBinding",
+      "base": "recording-binding",
+      "wire_valid": false,
+      "syntax_valid": null,
+      "schema_valid": false,
+      "set": [
+        {
+          "pointer": "/authorization",
+          "value": "grant"
+        }
+      ]
+    },
+    {
+      "id": "recording-input-hash-short",
+      "message_type": "ResolutionRecordingBinding",
+      "base": "recording-binding",
+      "wire_valid": false,
+      "syntax_valid": null,
+      "schema_valid": false,
+      "set": [
+        {
+          "pointer": "/input_hash",
+          "value": "1111111111111111111111111111111"
+        }
+      ]
+    },
+    {
+      "id": "recording-input-hash-upper",
+      "message_type": "ResolutionRecordingBinding",
+      "base": "recording-binding",
+      "wire_valid": false,
+      "syntax_valid": null,
+      "schema_valid": false,
+      "set": [
+        {
+          "pointer": "/input_hash",
+          "value": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        }
+      ]
+    },
+    {
+      "id": "recording-label-blank",
+      "message_type": "ResolutionRecordingBinding",
+      "base": "recording-binding",
+      "wire_valid": false,
+      "syntax_valid": null,
+      "schema_valid": false,
+      "set": [
+        {
+          "pointer": "/input_label",
+          "value": " "
+        }
+      ]
+    },
+    {
+      "id": "recording-scope-extra",
+      "message_type": "ResolutionRecordingBinding",
+      "base": "recording-binding",
+      "wire_valid": false,
+      "syntax_valid": null,
+      "schema_valid": false,
+      "set": [
+        {
+          "pointer": "/scope/authorization",
+          "value": "grant"
+        }
+      ]
+    },
+    {
+      "id": "recording-scope-blank",
+      "message_type": "ResolutionRecordingBinding",
+      "base": "recording-binding",
+      "wire_valid": false,
+      "syntax_valid": null,
+      "schema_valid": false,
+      "set": [
+        {
+          "pointer": "/scope/compartment",
+          "value": " "
+        }
+      ]
+    },
+    {
+      "id": "recording-batch-extra",
+      "message_type": "ResolutionRecordingBinding",
+      "base": "recording-binding",
+      "wire_valid": false,
+      "syntax_valid": null,
+      "schema_valid": false,
+      "set": [
+        {
+          "pointer": "/batch/authorization",
+          "value": "grant"
+        }
+      ]
+    },
+    {
+      "id": "recording-batch-empty",
+      "message_type": "ResolutionRecordingBinding",
+      "base": "recording-binding",
+      "wire_valid": false,
+      "syntax_valid": null,
+      "schema_valid": false,
+      "set": [
+        {
+          "pointer": "/batch/entries",
+          "value": []
+        }
+      ]
+    },
+    {
+      "id": "recording-batch-actor-blank",
+      "message_type": "ResolutionRecordingBinding",
+      "base": "recording-binding",
+      "wire_valid": false,
+      "syntax_valid": null,
+      "schema_valid": false,
+      "set": [
+        {
+          "pointer": "/batch/actor",
+          "value": " "
+        }
+      ]
+    },
+    {
+      "id": "recording-entry-extra",
+      "message_type": "ResolutionRecordingBinding",
+      "base": "recording-binding",
+      "wire_valid": false,
+      "syntax_valid": null,
+      "schema_valid": false,
+      "set": [
+        {
+          "pointer": "/batch/entries/0/authorization",
+          "value": "grant"
+        }
+      ]
+    },
+    {
+      "id": "recording-key-unscoped",
+      "message_type": "ResolutionRecordingBinding",
+      "base": "recording-binding",
+      "wire_valid": false,
+      "syntax_valid": null,
+      "schema_valid": false,
+      "set": [
+        {
+          "pointer": "/batch/entries/0/triple_key",
+          "value": "2222222222222222222222222222222222222222222222222222222222222222"
+        }
+      ]
+    },
+    {
+      "id": "recording-key-short",
+      "message_type": "ResolutionRecordingBinding",
+      "base": "recording-binding",
+      "wire_valid": false,
+      "syntax_valid": null,
+      "schema_valid": false,
+      "set": [
+        {
+          "pointer": "/batch/entries/0/triple_key",
+          "value": "rks1|222222222222222222222222222222222222222222222222222222222222222"
+        }
+      ]
+    },
+    {
+      "id": "recording-key-upper",
+      "message_type": "ResolutionRecordingBinding",
+      "base": "recording-binding",
+      "wire_valid": false,
+      "syntax_valid": null,
+      "schema_valid": false,
+      "set": [
+        {
+          "pointer": "/batch/entries/0/triple_key",
+          "value": "rks1|AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        }
+      ]
+    },
+    {
+      "id": "recording-resolution-short",
+      "message_type": "ResolutionRecordingBinding",
+      "base": "recording-binding",
+      "wire_valid": false,
+      "syntax_valid": null,
+      "schema_valid": false,
+      "set": [
+        {
+          "pointer": "/batch/entries/0/resolution",
+          "value": "3333333333333333333333333333333"
+        }
+      ]
+    },
+    {
+      "id": "recording-resolution-upper",
+      "message_type": "ResolutionRecordingBinding",
+      "base": "recording-binding",
+      "wire_valid": false,
+      "syntax_valid": null,
+      "schema_valid": false,
+      "set": [
+        {
+          "pointer": "/batch/entries/0/resolution",
+          "value": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        }
+      ]
+    },
+    {
+      "id": "recording-label-control-separator",
+      "message_type": "ResolutionRecordingBinding",
+      "base": "recording-binding",
+      "wire_valid": true,
+      "syntax_valid": true,
+      "schema_valid": true,
+      "set": [
+        {
+          "pointer": "/input_label",
+          "value": "\u001c"
+        }
+      ]
+    },
+    {
+      "id": "recording-input-missing-protocol",
+      "message_type": "ResolutionRecordingInput",
+      "base": "recording-input",
+      "wire_valid": false,
+      "syntax_valid": null,
+      "schema_valid": false,
+      "remove": [
+        "/protocol"
+      ]
+    },
+    {
+      "id": "recording-input-missing-resolutions",
+      "message_type": "ResolutionRecordingInput",
+      "base": "recording-input",
+      "wire_valid": false,
+      "syntax_valid": null,
+      "schema_valid": false,
+      "remove": [
+        "/resolutions"
+      ]
+    },
+    {
+      "id": "recording-input-missing-resolutions-0-base_text",
+      "message_type": "ResolutionRecordingInput",
+      "base": "recording-input",
+      "wire_valid": false,
+      "syntax_valid": null,
+      "schema_valid": false,
+      "remove": [
+        "/resolutions/0/base_text"
+      ]
+    },
+    {
+      "id": "recording-input-missing-resolutions-0-resolution_text",
+      "message_type": "ResolutionRecordingInput",
+      "base": "recording-input",
+      "wire_valid": false,
+      "syntax_valid": null,
+      "schema_valid": false,
+      "remove": [
+        "/resolutions/0/resolution_text"
+      ]
+    },
+    {
+      "id": "recording-binding-missing-input_hash",
+      "message_type": "ResolutionRecordingBinding",
+      "base": "recording-binding",
+      "wire_valid": false,
+      "syntax_valid": null,
+      "schema_valid": false,
+      "remove": [
+        "/input_hash"
+      ]
+    },
+    {
+      "id": "recording-binding-missing-input_label",
+      "message_type": "ResolutionRecordingBinding",
+      "base": "recording-binding",
+      "wire_valid": false,
+      "syntax_valid": null,
+      "schema_valid": false,
+      "remove": [
+        "/input_label"
+      ]
+    },
+    {
+      "id": "recording-binding-missing-scope",
+      "message_type": "ResolutionRecordingBinding",
+      "base": "recording-binding",
+      "wire_valid": false,
+      "syntax_valid": null,
+      "schema_valid": false,
+      "remove": [
+        "/scope"
+      ]
+    },
+    {
+      "id": "recording-binding-missing-batch",
+      "message_type": "ResolutionRecordingBinding",
+      "base": "recording-binding",
+      "wire_valid": false,
+      "syntax_valid": null,
+      "schema_valid": false,
+      "remove": [
+        "/batch"
+      ]
+    },
+    {
+      "id": "recording-binding-missing-batch-intent",
+      "message_type": "ResolutionRecordingBinding",
+      "base": "recording-binding",
+      "wire_valid": false,
+      "syntax_valid": null,
+      "schema_valid": false,
+      "remove": [
+        "/batch/intent"
+      ]
+    },
+    {
+      "id": "recording-binding-missing-batch-entries-0-triple_key",
+      "message_type": "ResolutionRecordingBinding",
+      "base": "recording-binding",
+      "wire_valid": false,
+      "syntax_valid": null,
+      "schema_valid": false,
+      "remove": [
+        "/batch/entries/0/triple_key"
+      ]
+    },
+    {
+      "id": "recording-input-hash-newline",
+      "message_type": "ResolutionRecordingBinding",
+      "base": "recording-binding",
+      "set": [
+        {
+          "pointer": "/input_hash",
+          "value": "11111111111111111111111111111111\n"
+        }
+      ],
+      "wire_valid": false,
+      "syntax_valid": null,
+      "schema_valid": false
+    },
+    {
+      "id": "recording-key-newline",
+      "message_type": "ResolutionRecordingBinding",
+      "base": "recording-binding",
+      "set": [
+        {
+          "pointer": "/batch/entries/0/triple_key",
+          "value": "rks1|2222222222222222222222222222222222222222222222222222222222222222\n"
+        }
+      ],
+      "wire_valid": false,
+      "syntax_valid": null,
+      "schema_valid": false
+    },
+    {
+      "id": "recording-resolution-newline",
+      "message_type": "ResolutionRecordingBinding",
+      "base": "recording-binding",
+      "set": [
+        {
+          "pointer": "/batch/entries/0/resolution",
+          "value": "33333333333333333333333333333333\n"
+        }
+      ],
+      "wire_valid": false,
+      "syntax_valid": null,
+      "schema_valid": false
+    }
+  ]
+}

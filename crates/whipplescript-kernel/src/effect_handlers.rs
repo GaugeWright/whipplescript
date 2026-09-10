@@ -454,18 +454,33 @@ fn settle_failed_file_effect_with_evidence<S: RuntimeStore>(
     )
 }
 
-struct FileAttemptKeys {
-    run_id: String,
-    lease_id: String,
-    terminal_key: String,
-    fact_key: String,
+pub(crate) struct LocalAttemptKeys {
+    pub run_id: String,
+    pub lease_id: String,
+    pub terminal_key: String,
+    pub fact_key: String,
 }
+type FileAttemptKeys = LocalAttemptKeys;
 
 fn file_attempt_keys<S: RuntimeStore>(
     kernel: &RuntimeKernel<S>,
     instance_id: &str,
     effect_id: &str,
 ) -> Result<FileAttemptKeys, StoreError> {
+    local_attempt_keys(
+        kernel,
+        instance_id,
+        effect_id,
+        ["file-run", "file-lease", "file-fact"],
+    )
+}
+
+pub(crate) fn local_attempt_keys<S: RuntimeStore>(
+    kernel: &RuntimeKernel<S>,
+    instance_id: &str,
+    effect_id: &str,
+    purposes: [&str; 3],
+) -> Result<LocalAttemptKeys, StoreError> {
     let count = kernel
         .store()
         .list_runs(instance_id)?
@@ -485,10 +500,10 @@ fn file_attempt_keys<S: RuntimeStore>(
     // This read selects identities, not authority. The atomic start_dispatch
     // still rejects reuse, a non-claimable effect or any unresolved attempt.
     Ok(FileAttemptKeys {
-        run_id: key("file-run"),
-        lease_id: key("file-lease"),
+        run_id: key(purposes[0]),
+        lease_id: key(purposes[1]),
         terminal_key: key("terminal"),
-        fact_key: key("file-fact"),
+        fact_key: key(purposes[2]),
     })
 }
 

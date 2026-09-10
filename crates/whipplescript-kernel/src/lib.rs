@@ -33,6 +33,7 @@ pub mod package_registry;
 pub mod principal;
 pub mod provider;
 pub mod provider_trust;
+pub mod resolution_recording;
 pub mod rule_correspondence;
 pub mod rule_lowering;
 pub mod rule_pass;

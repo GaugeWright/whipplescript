@@ -1,5 +1,5 @@
 use super::*;
-use crate::SqliteStore;
+use crate::{RuntimeStore, SqliteStore};
 
 #[test]
 fn native_file_settlement_and_replay() {
@@ -109,6 +109,17 @@ fn snapshot(store: &SqliteStore) -> Vec<Vec<Vec<rusqlite::types::Value>>> {
 
 #[test]
 fn native_file_settlement_rolls_back_every_write_boundary() {
+    native_settlement_faults(false, "failed");
+}
+
+#[test]
+fn native_recording_settlement_rolls_back_every_write_boundary() {
+    for status in ["completed", "failed"] {
+        native_settlement_faults(true, status);
+    }
+}
+
+fn native_settlement_faults(recording: bool, status: &str) {
     for timing in ["BEFORE", "AFTER"] {
         for (table, action, predicate) in [
             ("events", "INSERT", "NEW.event_type = 'effect.terminal'"),
@@ -120,7 +131,24 @@ fn native_file_settlement_rolls_back_every_write_boundary() {
             ("facts", "INSERT", "1"),
         ] {
             let mut store = SqliteStore::open_in_memory().expect("settlement fixture operation");
-            let fixture = conformance::setup(&mut store, "file.write", "failed");
+            let fixture = if recording {
+                recording_conformance::setup(&mut store, status)
+            } else {
+                conformance::setup(&mut store, "file.write", status)
+            };
+            // A completed result has no diagnostic INSERT to interrupt.
+            if table == "diagnostics" && status == "completed" {
+                continue;
+            }
+            let metadata = if recording {
+                recording_conformance::metadata(status)
+            } else {
+                fixture.completion().metadata_json.to_owned()
+            };
+            let completion = crate::EffectCompletion {
+                metadata_json: &metadata,
+                ..fixture.completion()
+            };
             let before = snapshot(&store);
             store
                 .connection
@@ -130,7 +158,7 @@ fn native_file_settlement_rolls_back_every_write_boundary() {
             ))
                 .expect("settlement fixture operation");
             let error = store
-                .settle_file_effect(fixture.completion(), fixture.diagnostic(), fixture.fact())
+                .settle_local_effect(completion, fixture.diagnostic(), fixture.fact())
                 .expect_err("invalid settlement must refuse");
             assert!(
                 format!("{error:?}").contains("injected settlement fault"),
@@ -142,7 +170,7 @@ fn native_file_settlement_rolls_back_every_write_boundary() {
                 .execute_batch("DROP TRIGGER settlement_fault")
                 .expect("settlement fixture operation");
             store
-                .settle_file_effect(fixture.completion(), fixture.diagnostic(), fixture.fact())
+                .settle_local_effect(completion, fixture.diagnostic(), fixture.fact())
                 .expect("settlement fixture operation");
             assert_eq!(
                 store
@@ -152,5 +180,21 @@ fn native_file_settlement_rolls_back_every_write_boundary() {
                 1
             );
         }
+    }
+}
+
+#[test]
+fn native_recording_settlement_and_replay() {
+    for status in ["completed", "failed"] {
+        recording_conformance::run_suite(
+            &mut SqliteStore::open_in_memory().expect("store"),
+            status,
+        );
+    }
+    for case in ["missing-target", "foreign-target", "foreign-provider"] {
+        recording_conformance::refuse_foreign_profile(
+            &mut SqliteStore::open_in_memory().expect("store"),
+            case,
+        );
     }
 }

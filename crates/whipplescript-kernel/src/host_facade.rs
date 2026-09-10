@@ -21,6 +21,12 @@ use crate::host_protocol::{
 use crate::ifc::VerifiedEnvelope;
 use crate::{idempotency_key, ProgramVersionInput, RuntimeKernel};
 
+mod resolution_recording;
+pub use resolution_recording::{
+    ResolutionRecordingAuthority, ResolutionRecordingEvidenceSource,
+    ResolutionRecordingReconciliationAuthority,
+};
+
 mod scoped_save;
 pub use scoped_save::ScopedSaveExecutionAuthority;
 
@@ -152,7 +158,7 @@ impl<S: RuntimeStore> GovernedHostFacade<S> {
     where
         S: whipplescript_store::log_append::LogAppend,
     {
-        let (verified, _) = self.prepare_file_action_execution(request, action, verifier, proof)?;
+        let (verified, _) = self.prepare_action_execution(request, action, verifier, proof)?;
         if files.scoped_save_binding().is_some() {
             return Err(ProtocolError::Mismatch(
                 "scoped save requires verified memory execution authority",
@@ -164,7 +170,7 @@ impl<S: RuntimeStore> GovernedHostFacade<S> {
             .map_err(HostFacadeError::Store)
     }
 
-    fn prepare_file_action_execution(
+    fn prepare_action_execution(
         &self,
         request: crate::host_protocol::execution::ExecuteActionEffect,
         action: &crate::host_action::CompiledHostAction,

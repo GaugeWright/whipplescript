@@ -1596,12 +1596,7 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
     /// the three region texts under a prefix distinct from the path-level
     /// triple key.
     fn region_key(base_text: &str, ours_text: &str, theirs_text: &str) -> String {
-        format!(
-            "rk|{}|{}|{}",
-            crate::chunking::content_hash_hex(base_text.as_bytes()),
-            crate::chunking::content_hash_hex(ours_text.as_bytes()),
-            crate::chunking::content_hash_hex(theirs_text.as_bytes()),
-        )
+        resolution_scope::region_key(base_text, ours_text, theirs_text)
     }
 
     /// Record the region resolutions a resolved save carries (spec §12.2).

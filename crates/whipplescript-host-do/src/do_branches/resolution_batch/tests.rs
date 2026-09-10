@@ -250,3 +250,12 @@ fn hosted_resolution_observation_verifies_the_consumed_bytes() {
         },
     );
 }
+
+#[cfg(test)]
+#[test]
+fn hosted_bound_resolution_recording_conformance() {
+    whipplescript_store::vcs_resolution_recording::conformance::check(
+        crate::do_branches::compose_vcs(&RusqliteDoSql::with_runtime_schema())
+            .expect("hosted workspace"),
+    );
+}

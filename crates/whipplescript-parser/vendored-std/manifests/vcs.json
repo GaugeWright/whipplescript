@@ -5,6 +5,14 @@
   "version": "0.1.0",
   "capabilities": [
     {
+      "id": "vcs.record_resolutions",
+      "description": "Record an independently receipted correction batch through the governed resolution.record host action; requires an explicit confined host binding.",
+      "schema": {
+        "input": { "bindings": { "reference": { "handle": "string", "version_ref": "string", "label_ref": "string" } } },
+        "output": { "operation_id": "string", "receipt_hash": "string" }
+      }
+    },
+    {
       "id": "vcs.promote",
       "description": "Promote a stream's shared line to mainline through the gated boundary (adoption lease; refusal is data).",
       "schema": {
@@ -134,6 +142,19 @@
       "id": "std.vcs",
       "version": "0.1.0",
       "effect_contracts": [
+        {
+          "id": "vcs.record_resolutions",
+          "effect_kind": "capability.call",
+          "source_forms": ["call vcs.record_resolutions"],
+          "input_schema": {
+            "bindings": { "reference": { "handle": "string", "version_ref": "string", "label_ref": "string" } }
+          },
+          "output_schema": { "operation_id": "string", "receipt_hash": "string" },
+          "required_capabilities": ["vcs.record_resolutions"],
+          "provider_kinds": ["resolution-memory"],
+          "projected_facts": ["effect.output"],
+          "validation": "runtime_boundary"
+        },
         {
           "id": "vcs.promote",
           "effect_kind": "capability.call",

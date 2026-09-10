@@ -145,7 +145,7 @@ impl<S: RuntimeStore + LogAppend> GovernedHostFacade<S> {
         files: &dyn FileStore,
     ) -> Result<StoredEvent, HostFacadeError> {
         let (verified, original) =
-            self.prepare_file_action_execution(request, action, authority, proof)?;
+            self.prepare_action_execution(request, action, authority, proof)?;
         let (binding, scope) = files.scoped_save_binding().ok_or(ProtocolError::Mismatch(
             "scoped save execution requires a scoped adapter",
         ))?;

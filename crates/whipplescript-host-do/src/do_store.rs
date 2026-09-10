@@ -5153,15 +5153,28 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
                 diagnostic.clone(),
                 completion.status,
             )?;
-            let kinds = self
+            let recorded = self
                 .sql
                 .query(
-                    "SELECT kind FROM effects WHERE instance_id = ?1 AND effect_id = ?2",
-                    &[text(completion.instance_id), text(completion.effect_id)],
+                    "SELECT e.kind, e.target, r.provider FROM effects e JOIN runs r \
+                 ON r.instance_id = e.instance_id AND r.effect_id = e.effect_id \
+                 WHERE e.instance_id = ?1 AND e.effect_id = ?2 AND r.run_id = ?3",
+                    &[
+                        text(completion.instance_id),
+                        text(completion.effect_id),
+                        text(completion.run_id),
+                    ],
                 )
                 .map_err(sql_err)?;
-            let kind = kinds.first().map(|row| as_text(&row[0]));
-            fact.check_kind(completion.status, kind.as_deref())?;
+            let kind = recorded.first().map(|row| as_text(&row[0]));
+            let target = recorded.first().and_then(|row| as_opt_text(&row[1]));
+            let provider = recorded.first().map(|row| as_text(&row[2]));
+            fact.check_effect(
+                completion,
+                kind.as_deref(),
+                target.as_deref(),
+                provider.as_deref(),
+            )?;
             let active = self.sql.query(
                 "SELECT 1 FROM facts WHERE instance_id = ?1 AND name = ?2 AND key = ?3 AND consumed_at IS NULL",
                 &[text(completion.instance_id), text(fact.name), text(completion.effect_id)],
@@ -10274,6 +10287,17 @@ pub(crate) mod tests {
     use super::*;
 
     #[test]
+    fn do_recording_settlement_and_replay() {
+        use whipplescript_store::file_settlement::recording_conformance;
+        for status in ["completed", "failed"] {
+            recording_conformance::run_suite(&mut store(), status);
+        }
+        for case in ["missing-target", "foreign-target", "foreign-provider"] {
+            recording_conformance::refuse_foreign_profile(&mut store(), case);
+        }
+    }
+
+    #[test]
     fn do_file_settlement_and_replay() {
         for kind in ["file.read", "file.write", "file.import", "file.export"] {
             for status in ["completed", "failed"] {
@@ -10288,13 +10312,35 @@ pub(crate) mod tests {
 
     #[test]
     fn do_file_settlement_rolls_back_every_sql_boundary() {
-        use whipplescript_store::file_settlement::conformance;
+        local_settlement_sql_faults(false);
+    }
+
+    #[test]
+    fn do_recording_settlement_rolls_back_every_sql_boundary() {
+        local_settlement_sql_faults(true);
+    }
+
+    fn local_settlement_sql_faults(recording: bool) {
+        use whipplescript_store::file_settlement::{conformance, recording_conformance};
         for status in ["completed", "failed"] {
             let mut finished = false;
             for fail_at in 1..=100 {
                 let mut base =
                     DoSqliteStore::new(test_support::RusqliteDoSql::with_runtime_schema());
-                let fixture = conformance::setup(&mut base, "file.write", status);
+                let fixture = if recording {
+                    recording_conformance::setup(&mut base, status)
+                } else {
+                    conformance::setup(&mut base, "file.write", status)
+                };
+                let metadata = if recording {
+                    recording_conformance::metadata(status)
+                } else {
+                    fixture.completion().metadata_json.to_owned()
+                };
+                let completion = EffectCompletion {
+                    metadata_json: &metadata,
+                    ..fixture.completion()
+                };
                 let snapshot = |sql: &dyn DoSql| {
                     [
                         "events",
@@ -10313,11 +10359,8 @@ pub(crate) mod tests {
                 };
                 let before = snapshot(&base.sql);
                 let mut store = DoSqliteStore::new(FaultySql::new(base.sql, fail_at));
-                let outcome = store.settle_file_effect(
-                    fixture.completion(),
-                    fixture.diagnostic(),
-                    fixture.fact(),
-                );
+                let outcome =
+                    store.settle_local_effect(completion, fixture.diagnostic(), fixture.fact());
                 let seen = store.sql.seen.get();
                 store.sql.disarm();
                 if outcome.is_ok() {

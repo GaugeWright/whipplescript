@@ -10,6 +10,16 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
         fact_value: &str,
         fact_event_key: &str,
     ) -> StoreResult<StoredEvent> {
+        self.settle_local_run(completion, fact_name, fact_value, fact_event_key)
+    }
+
+    pub(crate) fn settle_local_run(
+        &mut self,
+        completion: EffectCompletion<'_>,
+        fact_name: &str,
+        fact_value: &str,
+        fact_event_key: &str,
+    ) -> StoreResult<StoredEvent> {
         let status = match completion.status {
             "completed" => EffectStatus::Completed,
             "failed" => EffectStatus::Failed,
@@ -28,10 +38,10 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
             fact_name,
             completion.effect_id,
         ]);
-        let event = self.store.settle_file_effect(
+        let event = self.store.settle_local_effect(
             completion,
             diagnostic,
-            whipplescript_store::file_settlement::FileSettlementFact {
+            whipplescript_store::file_settlement::LocalEffectSettlementFact {
                 fact_id: &fact_id,
                 event_key: fact_event_key,
                 name: fact_name,

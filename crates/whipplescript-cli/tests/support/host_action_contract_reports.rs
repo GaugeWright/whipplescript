@@ -1,6 +1,7 @@
 //! Optional deep-check reports from synthetic fixtures, never from user stores.
 use serde::Serialize;
 
+#[allow(dead_code)] // The recording-only journey also compiles this shared helper.
 pub fn record<S, T: Serialize>(scenario: &str, message_type: &str, value: &T) {
     record_into::<S, T>(
         "WHIPPLESCRIPT_ACTION_REPORT_DIR",
@@ -14,6 +15,16 @@ pub fn record<S, T: Serialize>(scenario: &str, message_type: &str, value: &T) {
 pub fn record_scoped<S, T: Serialize>(scenario: &str, message_type: &str, value: &T) {
     record_into::<S, T>(
         "WHIPPLESCRIPT_SCOPED_ACTION_REPORT_DIR",
+        scenario,
+        message_type,
+        value,
+    );
+}
+
+#[allow(dead_code)] // Older journeys do not emit independent recording messages.
+pub fn record_recording<S, T: Serialize>(scenario: &str, message_type: &str, value: &T) {
+    record_into::<S, T>(
+        "WHIPPLESCRIPT_RECORDING_ACTION_REPORT_DIR",
         scenario,
         message_type,
         value,

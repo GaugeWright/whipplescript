@@ -67,6 +67,21 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
         Ok(Some(serde_json::to_string(&metadata)?))
     }
 
+    pub(crate) fn execute_verified_resolution_recording<
+        B: whipplescript_store::branches::Branches,
+        C: whipplescript_store::content::ContentBlobs,
+    >(
+        &mut self,
+        verified: VerifiedActionExecution,
+        target: &mut whipplescript_store::vcs_resolution_recording::BoundResolutionRecording<B, C>,
+    ) -> StoreResult<StoredEvent> {
+        let instance = verified.request().admission.instance_ref.clone();
+        let effect = verified.observed().clone();
+        self.action_execution = Some(verified);
+        let mut scope = ExecutionScope(self);
+        crate::resolution_recording::run(&mut scope, &instance, &effect, target)
+    }
+
     pub(crate) fn execute_verified_file_effect(
         &mut self,
         verified: VerifiedActionExecution,

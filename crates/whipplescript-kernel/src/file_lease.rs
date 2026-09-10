@@ -1,4 +1,4 @@
-//! Bounded worker leases for synchronous file operations. A deadline describes
+//! Bounded worker leases for synchronous local operations. A deadline describes
 //! the worker attempt; it is neither target authority nor proof of cancellation.
 use chrono::{DateTime, Datelike, Duration, SecondsFormat, Utc};
 use whipplescript_store::{RuntimeStore, StoreError, StoreResult};
@@ -14,6 +14,9 @@ pub const MAX_FILE_LEASE_SECONDS: u32 = 3600;
 pub struct FileLeasePolicy {
     seconds: u32,
 }
+/// Shared local-operation policy; the original file API remains source compatible.
+pub type LocalEffectLeasePolicy = FileLeasePolicy;
+
 impl Default for FileLeasePolicy {
     fn default() -> Self {
         Self {
@@ -51,10 +54,19 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
     /// Configure future synchronous file attempts. Current execution authority
     /// and the recorded leases of existing attempts remain independent.
     pub fn set_file_lease_policy(&mut self, policy: FileLeasePolicy) {
+        self.set_local_effect_lease_policy(policy);
+    }
+
+    /// Configure future synchronous file and resolution-recording attempts.
+    pub fn set_local_effect_lease_policy(&mut self, policy: LocalEffectLeasePolicy) {
         self.file_lease_policy = policy;
     }
 
     pub(crate) fn file_lease_deadline(&self) -> StoreResult<String> {
+        self.local_effect_lease_deadline()
+    }
+
+    pub(crate) fn local_effect_lease_deadline(&self) -> StoreResult<String> {
         self.file_lease_policy
             .deadline(&self.store.resolve_clock("now")?)
     }
