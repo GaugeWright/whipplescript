@@ -46,6 +46,7 @@ envelope-composition.maude	SNSSNSSNSNSNSSSNSSNSNSNSNSNNSSNN
 envelope-minting.maude	SSNNSNSNSNNSSS
 expression-kernel.maude	NNSSNNSNSSNSSSSSNNSNSNSSNNSSNSNSNS
 external-event-loop.maude	NSS
+file-settlement.maude	SNSNSNSSNS
 flow-classification.maude	SSSSSNNN
 guard-commit-bite.maude	NNSS
 harness-class.maude	SSNN
@@ -67,8 +68,8 @@ infoflow-integrity.maude	SSSSNNNN
 infoflow-output-integrity.maude	SSSNNN
 infoflow-package.maude	SSSNN
 infoflow-reader-sets.maude	SSSSNNNN
-infoflow-redaction.maude	SSNNN
 infoflow-redact-provenance.maude	SSNN
+infoflow-redaction.maude	SSNNN
 infoflow-signal-carriage.maude	SSSSNNNNN
 infoflow-signature.maude	SSNNNSNNN
 infoflow-staging.maude	SSNN
@@ -98,6 +99,7 @@ pattern-recursion.maude	SSSNN
 pinned-progressions.maude	SSSSSSNNNNNS
 policy-capacity-retry.maude	NSNSSS
 prefix-replay.maude	NSNSS
+prepared-publication.maude	SNSSSSSSN
 provenance-completeness.maude	SSN
 repair-containment.maude	SSNNSSNSNS
 resolution-memory.maude	SNSSN
@@ -105,14 +107,17 @@ restorable-context.maude	SSSNNNN
 restore-replay.maude	SNSN
 revision-rule-correspondence.maude	SNSSSSSNNNSN
 rule-autofail.maude	SSSSNNNNN
+save-result-retention.maude	SNSNSNSNSSSN
+scoped-save-reconciliation.maude	SNSNSNSNSNSNSNSS
 script-capability-seeding.maude	SNN
 script-hard-off.maude	SNNNNNSS
 seam-crossing.maude	SSNNSS
 selective-undo.maude	SNSSN
-settled-firing-closure.maude	SSSNNNS
 settle-stopping.maude	NSSSN
+settled-firing-closure.maude	SSSNNNS
 skills-never-grant.maude	SSNN
 stat-cache.maude	SNSNSSNS
+stats-fold.maude	SSNSSNSSN
 std-construct-authorization.maude	SSSNNNNSNSNN
 subworkflow-attestation.maude	SSNSN
 subworkflow-convergence.maude	SSSSNNN
@@ -123,8 +128,8 @@ termination-measure.maude	SSNNNNNNSSSNNN
 text-merge-compose.maude	SSSSSNNNSSN
 trace-lifecycle-conformance.maude	SSSNNSSSSSNSS
 tracker-claim-turn.maude	NSNS
-tracker-lease.maude	SSSSSNNNN
 tracker-lease-merge.maude	SSSNNS
+tracker-lease.maude	SSSSSNNNN
 tracker-merge.maude	SSSSSNNNS
 tracker-projection.maude	SSNNN
 tracker-readiness.maude	SSSNNNN
@@ -139,7 +144,3 @@ workflow-runtime-marker-reresolution.maude	SSSNNN
 workflow-scoping.maude	SSSSSSNNN
 workstream-boundary.maude	SNSNSNSNSNSNSNSNSNSNSNSNSNSNSN
 workstream.maude	SSSNNNNN
-save-result-retention.maude	SNSNSNSNSSSN
-prepared-publication.maude	SNSSSSSSN
-file-settlement.maude	SNSNSNSSNS
-scoped-save-reconciliation.maude	SNSNSNSNSNSNSNSS

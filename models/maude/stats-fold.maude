@@ -1,0 +1,77 @@
+--- The stats fold's three asserted properties, modelled before any Rust exists.
+--- Companion to spec/whip-stats-tracker.md S0 and to DR-0112 (an aggregate is a
+--- projection of the log) and DR-0114 (an aggregate never renders unrecorded as
+--- zero).
+---
+--- Three properties, each with a rule that could violate it if written the
+--- obvious way, so the bite searches are not vacuous:
+---
+---   1. GRAIN IS IN THE GROUP KEY. Rows merge only when the WHOLE key matches,
+---      grain included. Two runs of the same grain under one rule fold to one
+---      row; two runs of different grain fold to two. Drop grain from the merge
+---      condition and the third search finds a solution.
+---   2. COMPLETENESS PROPAGATES PER MEASURE. A folded measure absorbing an
+---      unrecorded contribution becomes unrecorded. Unrecorded is not zero and
+---      is not absorbed away. Let a recorded fold swallow an unrecorded one and
+---      the sixth search finds a solution.
+---   3. NO DOUBLE COUNT. A run carrying per-call rows is folded through the
+---      per-call path, which consumes its turn sum too; a run carrying only a
+---      turn sum is folded through the sum path. Neither run is counted twice.
+---      Add a rule letting per-call rows fold on their own and the ninth search
+---      finds a solution.
+mod WHIPPLESCRIPT-STATS-FOLD is
+  sorts Cfg Key Grain Meas .
+
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+
+  --- Two group keys, standing for two rules to group by.
+  ops r1 r2 : -> Key [ctor] .
+
+  --- DR-0114 clause 2: grain is part of the group key of every query, whether
+  --- or not the caller names it. Three values: the two model-call populations,
+  --- and the effects that make no model call at all.
+  ops gcall gturn gnone : -> Grain [ctor] .
+
+  --- DR-0114 clause 1: a measure is either recorded or unrecorded. `nul` is
+  --- unrecorded, which is NOT the number zero.
+  ops val nul : -> Meas [ctor] .
+
+  --- A run the fold reads, and the row its group key lands in.
+  op run : Key Grain -> Cfg [ctor] .
+  op rowFor : Key Grain -> Cfg [ctor] .
+
+  --- One folded measure absorbing the contributions of individual calls.
+  op contrib : Meas -> Cfg [ctor] .
+  op folded : Meas -> Cfg [ctor] .
+
+  --- The two folding paths a run can take. `callRows` is the per-call evidence
+  --- DR-0113 records; `turnSum` is the run-level summed usage that stays.
+  op callRows : -> Cfg [ctor] .
+  op turnSum : -> Cfg [ctor] .
+  op counted : -> Cfg [ctor] .
+
+  var K : Key .
+  var G : Grain .
+
+  --- Each run emits into the row for its whole key.
+  rl [emit] : run(K, G) => rowFor(K, G) .
+
+  --- Rows merge only when the whole key matches. Both K and G are the SAME
+  --- variable on both sides: that is the property. Writing G and G' here is the
+  --- mutation the third search catches.
+  rl [merge] : rowFor(K, G) rowFor(K, G) => rowFor(K, G) .
+
+  --- Completeness propagates. Once a contribution is unrecorded, the folded
+  --- measure stays unrecorded however many recorded contributions follow.
+  rl [absorb-val] : folded(val) contrib(val) => folded(val) .
+  rl [absorb-into-nul] : folded(nul) contrib(val) => folded(nul) .
+  rl [absorb-nul] : folded(val) contrib(nul) => folded(nul) .
+  rl [absorb-nul-into-nul] : folded(nul) contrib(nul) => folded(nul) .
+
+  --- A run carrying per-call rows folds through the per-call path, which
+  --- consumes the turn sum with them. There is deliberately NO rule folding
+  --- `callRows` alone, because that rule is exactly the double count.
+  rl [fold-calls] : callRows turnSum => counted .
+  rl [fold-sum] : turnSum => counted .
+endm

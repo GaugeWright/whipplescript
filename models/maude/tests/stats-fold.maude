@@ -1,0 +1,57 @@
+load ../stats-fold.maude
+
+--- Coverage: two runs of the SAME grain under one key fold to ONE row. This is
+--- the search that makes the bite below non-vacuous — merging is a rule that
+--- really fires, so the third search failing is a property and not an absence.
+search [1] in WHIPPLESCRIPT-STATS-FOLD :
+  run(r1, gcall) run(r1, gcall)
+  =>! rowFor(r1, gcall) .
+
+--- Coverage: two runs of DIFFERENT grain under one key fold to TWO rows,
+--- because grain is part of the group key (DR-0114 clause 2).
+search [1] in WHIPPLESCRIPT-STATS-FOLD :
+  run(r1, gcall) run(r1, gturn)
+  =>! rowFor(r1, gcall) rowFor(r1, gturn) .
+
+--- Bite: grouping by rule alone can NEVER collapse two grains into one row.
+--- Relax the merge rule to match two different grains and this finds a solution.
+search [1] in WHIPPLESCRIPT-STATS-FOLD :
+  run(r1, gcall) run(r1, gturn)
+  =>! rowFor(r1, gcall) .
+
+--- Coverage: recorded contributions fold to a recorded measure.
+search [1] in WHIPPLESCRIPT-STATS-FOLD :
+  folded(val) contrib(val) contrib(val)
+  =>! folded(val) .
+
+--- Coverage: one unrecorded contribution makes the folded measure unrecorded,
+--- however many recorded ones accompany it (DR-0114 clause 1).
+search [1] in WHIPPLESCRIPT-STATS-FOLD :
+  folded(val) contrib(val) contrib(nul)
+  =>! folded(nul) .
+
+--- Bite: an unrecorded contribution can never leave the folded measure
+--- recorded. This is the per-measure clause, which population tagging alone
+--- does not reach: both contributions here sit in ONE row at one grain.
+search [1] in WHIPPLESCRIPT-STATS-FOLD :
+  folded(val) contrib(val) contrib(nul)
+  =>! folded(val) .
+
+--- Coverage: a run carrying per-call rows is counted once, through the
+--- per-call path, which consumes its turn sum with it.
+search [1] in WHIPPLESCRIPT-STATS-FOLD :
+  callRows turnSum
+  =>* counted RESIDUAL:Cfg .
+
+--- Coverage: a run carrying only a turn sum is counted through the sum path.
+search [1] in WHIPPLESCRIPT-STATS-FOLD :
+  turnSum
+  =>! counted .
+
+--- Bite: a run is never counted twice. The RESIDUAL soup variable means a
+--- second `counted` in ANY reachable state is a solution, so No solution proves
+--- the two folding paths cannot both claim one run. Add a rule folding
+--- `callRows` on its own and this finds a solution.
+search [1] in WHIPPLESCRIPT-STATS-FOLD :
+  callRows turnSum
+  =>* counted counted RESIDUAL:Cfg .
