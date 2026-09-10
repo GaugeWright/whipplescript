@@ -91,6 +91,28 @@
       "authentication": "runtime-control-bearer"
     },
     {
+      "id": "runtime.private-home.object.place",
+      "method": "POST",
+      "path": "/v1/homes/:home/tenants/:tenant/projects/:project/commands/:command/attempts/:epoch/host/objects/:object",
+      "samplePath": "/v1/homes/home-canary/tenants/tenant-canary/projects/project-canary/commands/command-canary/attempts/1/host/objects/:object",
+      "transport": "http-stream",
+      "sideEffect": "mutation",
+      "risk": "critical",
+      "producer": "whipplescript-private-home-worker",
+      "authentication": "signed-home-execution-grant-and-internal-control-token"
+    },
+    {
+      "id": "runtime.private-home.object.read",
+      "method": "GET",
+      "path": "/v1/homes/:home/tenants/:tenant/projects/:project/commands/:command/attempts/:epoch/host/objects/:object",
+      "samplePath": "/v1/homes/home-canary/tenants/tenant-canary/projects/project-canary/commands/command-canary/attempts/1/host/objects/:object",
+      "transport": "http-stream",
+      "sideEffect": "none",
+      "risk": "important",
+      "producer": "whipplescript-private-home-worker",
+      "authentication": "signed-home-execution-grant-and-internal-control-token"
+    },
+    {
       "id": "runtime.host.instance.open",
       "method": "POST",
       "path": "/host/instances/open",

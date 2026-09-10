@@ -56,6 +56,29 @@ function contentIdOf(digest: ArrayBuffer): string {
         .join("");
 }
 
+/**
+ * The declared body length, or `null` when there is not one to trust.
+ *
+ * Shared by both byte routes because both owe the same promise: a stream is
+ * stored against a length known before it starts, and reading the body to
+ * discover its size is the one thing neither may do.
+ *
+ * `Number("")` is 0, not NaN, so an absent header must be rejected before it is
+ * parsed — otherwise a missing length reads as a zero-length body and every
+ * byte that follows overruns the stream.
+ */
+export function declaredLength(headers: Headers): number | null {
+    const raw = headers.get("content-length");
+    if (raw === null) return null;
+    // Decimal digits only, matched before parsing. `Number` is far more
+    // generous than HTTP is — it reads "0x10" as 16, and " 12 " as 12 — and a
+    // length that disagrees with the bytes it describes is exactly what this
+    // function exists to refuse.
+    if (!/^[0-9]+$/.test(raw.trim())) return null;
+    const value = Number(raw.trim());
+    return Number.isSafeInteger(value) ? value : null;
+}
+
 /** `/v1/objects/:id`, or undefined for a path this plane does not own. */
 export function objectPlaneRoute(pathname: string): string | undefined {
     const match = pathname.match(/^\/v1\/objects\/([^/]+)$/);
@@ -154,9 +177,8 @@ async function putObject(request: Request, bucket: R2Bucket, id: string): Promis
     // `Number("")` is 0, not NaN, so an absent header must be rejected before
     // it is parsed — otherwise a missing length reads as a zero-length body and
     // every byte that follows overruns the stream.
-    const lengthHeader = request.headers.get("content-length");
-    const declared = lengthHeader === null ? Number.NaN : Number(lengthHeader);
-    if (!Number.isInteger(declared) || declared < 0) {
+    const declared = declaredLength(request.headers);
+    if (declared === null) {
         return Response.json(
             {
                 error:

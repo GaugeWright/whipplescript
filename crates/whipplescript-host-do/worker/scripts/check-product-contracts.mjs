@@ -50,6 +50,10 @@ const validTransports = new Set([
   "sse",
   "websocket",
   "internal-callback",
+  // An octet-stream body that is never buffered — the Home's byte route. Its
+  // responses are JSON, but calling the operation `http-json` would describe
+  // the half that does not matter and hide the half that does.
+  "http-stream",
 ]);
 
 if (contracts.schemaVersion !== 1 || contracts.owner !== "whipplescript-src") {

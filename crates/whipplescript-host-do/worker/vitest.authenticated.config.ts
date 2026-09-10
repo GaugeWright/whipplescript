@@ -9,7 +9,10 @@ export default defineConfig({
     }),
   ],
   test: {
-    include: ["src/authenticated-host.integration.test.ts"],
+    include: [
+      "src/authenticated-host.integration.test.ts",
+      "src/private-home-objects.integration.test.ts",
+    ],
     // Bounds a hang, not the machine's load. See `src/test-bounds.ts`.
     testTimeout: WORKERD_TEST_TIMEOUT_MS,
   },

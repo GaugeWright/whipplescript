@@ -20,6 +20,13 @@ const hostOperations = [
   // that it exists (DR-0113). Important rather than critical — it asserts a fact
   // about content already placed and verified, and cannot itself move any.
   ["runtime.host.objects.register", "POST", "/host/objects/register", "http-json", "mutation", "important"],
+  // The Home's mediated byte route (DR-0112). Declared at the OUTER shape,
+  // like the private-home forwards beside it, because that is the URL the Home
+  // actually routes on — the bytes never reach an instance to have an inner
+  // path. Critical where registration is important: this one places durable
+  // content, and a grant admits it.
+  ["runtime.private-home.object.place", "POST", "/v1/homes/:home/tenants/:tenant/projects/:project/commands/:command/attempts/:epoch/host/objects/:object", "http-stream", "mutation", "critical"],
+  ["runtime.private-home.object.read", "GET", "/v1/homes/:home/tenants/:tenant/projects/:project/commands/:command/attempts/:epoch/host/objects/:object", "http-stream", "none", "important"],
   ["runtime.host.instance.open", "POST", "/host/instances/open", "http-json", "session", "critical"],
   ["runtime.host.turn.begin", "POST", "/host/turns", "http-json", "mutation", "critical"],
   ["runtime.host.fork.import", "POST", "/host/forks/import", "http-json", "mutation", "critical"],

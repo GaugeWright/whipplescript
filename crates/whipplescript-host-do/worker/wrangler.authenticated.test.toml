@@ -4,6 +4,12 @@ compatibility_date = "2026-07-24"
 
 rules = [{ type = "Text", globs = ["**/*.sql"] }]
 
+# The Home's external byte tier (DR-0113). The workers pool simulates R2, so
+# the mediated route is exercised against a real bucket API.
+[[r2_buckets]]
+binding = "WHIP_OBJECTS"
+bucket_name = "whip-objects-home-test"
+
 [[durable_objects.bindings]]
 name = "WORKFLOW_INSTANCE"
 class_name = "WorkflowInstance"

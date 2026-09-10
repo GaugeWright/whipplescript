@@ -12,6 +12,13 @@ rules = [{ type = "Text", globs = ["**/*.sql"] }]
 [build]
 command = "npm run build:wasm"
 
+# The external byte tier (DR-0113). The Home streams content that cannot live
+# in a DO SQLite value straight to this bucket under its own content id, and
+# forwards only the handle to the instance.
+[[r2_buckets]]
+binding = "WHIP_OBJECTS"
+bucket_name = "whip-objects-home-staging"
+
 [[durable_objects.bindings]]
 name = "WORKFLOW_INSTANCE"
 class_name = "WorkflowInstance"

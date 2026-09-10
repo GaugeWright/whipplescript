@@ -291,6 +291,84 @@
       }
     },
     {
+      "id": "runtime.private-home.object.place",
+      "jurisdiction": "private-home-command",
+      "transport": "http-stream",
+      "method": "POST",
+      "path": "/v1/homes/:home/tenants/:tenant/projects/:project/commands/:command/attempts/:epoch/host/objects/:object",
+      "producer": "whipplescript-private-home-worker",
+      "consumer": "GaugeDesk Home durable workflow client",
+      "authentication": "signed-home-execution-grant-and-internal-control-token",
+      "scope": "home-tenant-project-command",
+      "capability": "workflow-control",
+      "requestSchema": "typescript:whipplescript-runtime/runtime.private-home.object.place/request",
+      "responseSchema": "typescript:whipplescript-runtime/runtime.private-home.object.place/response",
+      "sideEffect": "mutation",
+      "risk": "critical",
+      "compatibility": {
+        "contractVersion": 1,
+        "minimumConsumer": 1,
+        "maximumConsumer": null
+      },
+      "evidence": {
+        "contract": [
+          "src/authenticated-host.integration.test.ts#signed-private-home-journey"
+        ],
+        "authority": [
+          "src/authenticated-host.integration.test.ts#signed-private-home-journey"
+        ],
+        "journey": [
+          "src/authenticated-host.integration.test.ts#signed-private-home-journey"
+        ],
+        "deployed": [
+          "contracts/deployed-evidence.json#private-home-forwarding-2026-08-03T23:13:55Z"
+        ],
+        "property": [
+          "src/private-home-protocol.test.ts#grant-field-mutations",
+          "src/authenticated-host.integration.test.ts#signed-private-home-journey"
+        ]
+      }
+    },
+    {
+      "id": "runtime.private-home.object.read",
+      "jurisdiction": "private-home-command",
+      "transport": "http-stream",
+      "method": "GET",
+      "path": "/v1/homes/:home/tenants/:tenant/projects/:project/commands/:command/attempts/:epoch/host/objects/:object",
+      "producer": "whipplescript-private-home-worker",
+      "consumer": "GaugeDesk Home durable workflow client",
+      "authentication": "signed-home-execution-grant-and-internal-control-token",
+      "scope": "home-tenant-project-command",
+      "capability": "workflow-control",
+      "requestSchema": "typescript:whipplescript-runtime/runtime.private-home.object.read/request",
+      "responseSchema": "typescript:whipplescript-runtime/runtime.private-home.object.read/response",
+      "sideEffect": "none",
+      "risk": "important",
+      "compatibility": {
+        "contractVersion": 1,
+        "minimumConsumer": 1,
+        "maximumConsumer": null
+      },
+      "evidence": {
+        "contract": [
+          "src/authenticated-host.integration.test.ts#signed-private-home-journey"
+        ],
+        "authority": [
+          "src/authenticated-host.integration.test.ts#signed-private-home-journey"
+        ],
+        "journey": [
+          "src/authenticated-host.integration.test.ts#signed-private-home-journey"
+        ],
+        "deployed": [
+          "contracts/deployed-evidence.json#private-home-forwarding-2026-08-03T23:13:55Z"
+        ],
+        "property": [
+          "src/private-home-protocol.test.ts#grant-field-mutations",
+          "src/authenticated-host.integration.test.ts#signed-private-home-journey"
+        ]
+      }
+    },
+    {
       "id": "runtime.host.instance.open",
       "jurisdiction": "managed-workflow-placement",
       "transport": "http-json",
