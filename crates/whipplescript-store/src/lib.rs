@@ -29,6 +29,7 @@ pub mod preflight;
 pub mod read_through;
 pub mod reconcile;
 pub mod ref_authority;
+pub mod tracker_filing;
 /// Relocated to `whipplescript-core` (DR-0052 R4.2: one selection
 /// grammar validates statically in the parser and dynamically at the
 /// seams — no mirror to drift). Re-exported here so every existing
@@ -1561,6 +1562,37 @@ impl SqliteStore {
         let connection =
             Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         connection.busy_timeout(STORE_BUSY_TIMEOUT)?;
+        Ok(Self { connection })
+    }
+
+    /// Reopen a runtime which the coordinator already initialized. This is a
+    /// writable connection, but opening it performs no schema or journal-mode
+    /// changes. Concurrent workers must not acquire a migration writer lock
+    /// simply to connect to the same current database.
+    pub fn open_initialized(path: impl AsRef<Path>) -> StoreResult<Self> {
+        let connection =
+            Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+        connection.busy_timeout(STORE_BUSY_TIMEOUT)?;
+        connection.pragma_update(None, "foreign_keys", "ON")?;
+        let stamped: i64 = connection.query_row(
+            "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
+            [],
+            |row| row.get(0),
+        )?;
+        if stamped != SUPPORTED_SCHEMA_VERSION {
+            return Err(StoreError::UnsupportedVersion {
+                subject: "initialized runtime schema".into(),
+                found: stamped,
+                supported: SUPPORTED_SCHEMA_VERSION,
+            });
+        }
+        let mode: String = connection.query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
+        if !mode.eq_ignore_ascii_case("wal") {
+            return Err(StoreError::fault(
+                "initialized runtime journal",
+                "coordinator has not established WAL",
+            ));
+        }
         Ok(Self { connection })
     }
 

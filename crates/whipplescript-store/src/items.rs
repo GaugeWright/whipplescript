@@ -38,6 +38,9 @@ use serde_json::Value;
 use crate::StoreError;
 use crate::StoreResult;
 
+#[cfg(feature = "native")]
+mod filing;
+
 /// The active-lease predicate, shared by every readiness/overlay query: a lease
 /// is active while it has not been released and has not expired. A NULL
 /// `expires_at` models a lease with no TTL (the old builtin "no TTL backstop"
@@ -222,7 +225,7 @@ pub struct IssueConflicts {
 #[cfg(feature = "native")]
 /// This store's schema generation. Bumped when its `CREATE TABLE` set changes
 /// in a way an older build cannot read.
-const SATELLITE_SCHEMA_VERSION: i64 = 1;
+const SATELLITE_SCHEMA_VERSION: i64 = 2;
 
 impl IssueConflicts {
     #[must_use]
@@ -314,6 +317,7 @@ impl WorkItemStore {
 
     fn from_connection(connection: Connection) -> StoreResult<Self> {
         connection.execute_batch(TRACKER_SCHEMA_SQL)?;
+        connection.execute_batch(crate::tracker_filing::SCHEMA)?;
         // DR-0054 Phase B parity: this store had no schema stamp and no
         // downgrade guard, so an older binary read a newer file as whatever
         // it parsed. `SqliteStore` has refused that since Phase B.
@@ -402,51 +406,17 @@ impl WorkItemStore {
         let tx = self
             .connection
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let now = tx_now(&tx)?;
-        let next: i64 = tx.query_row(
-            "UPDATE tracker_counter SET next_id = next_id + 1 WHERE singleton = 1 RETURNING next_id - 1",
-            [],
-            |row| row.get(0),
-        )?;
-        let item_id = format!("WS-{next}");
-        let labels_json = serde_json::to_string(labels)?;
-        let metadata_json = metadata.to_string();
-        let payload = json!({
-            "queue": queue,
-            "title": title,
-            "body": body,
-            "labels": labels,
-            "metadata": metadata,
-            "filed_by": filed_by,
-            "assigned_to": assigned_to,
-        });
-        let payload_json = payload.to_string();
-        // The issue's opaque MERGE identity = the content-hash of its creation
-        // event (issue_id excluded — it derives FROM this). WS-N is only a local
-        // alias for it; the event log is keyed by content_id.
-        let content_id =
-            event_content_id("issue.created", None, &payload_json, filed_by, &[], &now);
-        tx.execute(
-            "INSERT INTO tracker_aliases (content_id, alias) VALUES (?1, ?2)",
-            params![content_id, item_id],
-        )?;
-        tx_append_raw(
+        let (item_id, _) = tx_file_item(
             &tx,
-            Some(&content_id),
-            Some(&content_id),
-            "issue.created",
-            &payload_json,
+            queue,
+            title,
+            body,
+            labels,
+            metadata,
             filed_by,
+            assigned_to,
             self.event_effect_id.as_deref(),
-            &now,
-        )?;
-        tx.execute(
-            "INSERT INTO tracker_issues \
-             (issue_id, queue, title, body, status, labels_json, metadata_json, filed_by, assigned_to, created_at, updated_at) \
-             VALUES (?1, ?2, ?3, ?4, 'open', ?5, ?6, ?7, ?8, ?9, ?9)",
-            params![
-                item_id, queue, title, body, labels_json, metadata_json, filed_by, assigned_to, now
-            ],
+            None,
         )?;
         tx.commit()?;
         self.get_item(&item_id)?
@@ -2160,6 +2130,71 @@ impl WorkItemStore {
             .collect::<Result<std::collections::HashMap<String, String>, _>>()?;
         Ok(rows)
     }
+}
+
+#[cfg(feature = "native")]
+#[allow(clippy::too_many_arguments)]
+fn tx_file_item(
+    tx: &Transaction<'_>,
+    queue: &str,
+    title: &str,
+    body: &str,
+    labels: &[String],
+    metadata: &Value,
+    filed_by: Option<&str>,
+    assigned_to: Option<&str>,
+    effect_id: Option<&str>,
+    filing_fingerprint: Option<&str>,
+) -> StoreResult<(String, String)> {
+    let now = tx_now(tx)?;
+    let next: i64 = tx.query_row(
+            "UPDATE tracker_counter SET next_id = next_id + 1 WHERE singleton = 1 RETURNING next_id - 1",
+            [],
+            |row| row.get(0),
+        )?;
+    let item_id = format!("WS-{next}");
+    let labels_json = serde_json::to_string(labels)?;
+    let metadata_json = metadata.to_string();
+    let mut payload = json!({
+        "queue": queue,
+        "title": title,
+        "body": body,
+        "labels": labels,
+        "metadata": metadata,
+        "filed_by": filed_by,
+        "assigned_to": assigned_to,
+    });
+    if let Some(fingerprint) = filing_fingerprint {
+        payload["filing_fingerprint"] = Value::String(fingerprint.into());
+    }
+    let payload_json = payload.to_string();
+    // The issue's opaque MERGE identity = the content-hash of its creation
+    // event (issue_id excluded — it derives FROM this). WS-N is only a local
+    // alias for it; the event log is keyed by content_id.
+    let content_id = event_content_id("issue.created", None, &payload_json, filed_by, &[], &now);
+    tx.execute(
+        "INSERT INTO tracker_aliases (content_id, alias) VALUES (?1, ?2)",
+        params![content_id, item_id],
+    )?;
+    tx_append_raw(
+        tx,
+        Some(&content_id),
+        Some(&content_id),
+        "issue.created",
+        &payload_json,
+        filed_by,
+        effect_id,
+        &now,
+    )?;
+    tx.execute(
+            "INSERT INTO tracker_issues \
+             (issue_id, queue, title, body, status, labels_json, metadata_json, filed_by, assigned_to, created_at, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, 'open', ?5, ?6, ?7, ?8, ?9, ?9)",
+            params![
+                item_id, queue, title, body, labels_json, metadata_json, filed_by, assigned_to, now
+            ],
+        )?;
+    Ok((item_id, content_id))
 }
 
 /// The append-only tracker schema (native file and the DO share this shape).

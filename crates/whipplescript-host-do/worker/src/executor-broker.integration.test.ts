@@ -31,13 +31,11 @@ function execRequest(extra: Record<string, unknown> = {}, priority?: string) {
   };
 }
 
-// Generous per-test budget: these go through the real runtime, and the first
-// request pays the module's cold start (the bundled wasm import alone can
-// cross vitest's 5s default when the machine is busy).
-const TEST_TIMEOUT_MS = 30_000;
+// Use the shared workerd bound from vitest.config.ts / test-bounds.ts. The
+// first request pays the module's cold start, including the bundled wasm.
 
 describe("workspace broker", () => {
-  it("routes an exec round to the pool with getRandom-compatible naming and forwards the request whole", { timeout: TEST_TIMEOUT_MS }, async () => {
+  it("routes an exec round to the pool with getRandom-compatible naming and forwards the request whole", async () => {
     const response = await brokerStub().fetch(
       "http://executor/exec",
       execRequest({ marker: "round-trip" }, "working"),
@@ -56,7 +54,7 @@ describe("workspace broker", () => {
     expect(body.body.marker).toBe("round-trip");
   });
 
-  it("places overlapping rounds on distinct instances and frees slots afterwards", { timeout: TEST_TIMEOUT_MS }, async () => {
+  it("places overlapping rounds on distinct instances and frees slots afterwards", async () => {
     const overlapping = await Promise.all([
       brokerStub().fetch("http://executor/exec", execRequest({ delay_ms: 300 })),
       brokerStub().fetch("http://executor/exec", execRequest({ delay_ms: 300 })),

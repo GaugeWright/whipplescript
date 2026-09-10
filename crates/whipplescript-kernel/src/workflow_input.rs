@@ -80,7 +80,7 @@ pub fn validate_workflow_start_input(
     }
 }
 
-fn workflow_input_fact_name(contract: &IrWorkflowContract) -> String {
+pub(crate) fn workflow_input_fact_name(contract: &IrWorkflowContract) -> String {
     match &contract.ty {
         IrType::Ref(name) => name.clone(),
         other => ir_type_name(other),

@@ -21521,7 +21521,9 @@ fn run_agent_effect(
     let config_paths = provider_config_paths_with_env(&options.provider_config_paths);
     let provider_selection =
         agent_provider_selection_with_config_paths(effect, &options.provider, &config_paths)?;
-    let store = SqliteStore::open(store_path)?;
+    // The coordinator migrated the store before scheduling these concurrent
+    // effects. Reopening must not compete for its schema writer lock again.
+    let store = SqliteStore::open_initialized(store_path)?;
     let mut kernel = RuntimeKernel::new(store);
     let run_id = idempotency_key(&[instance_id, &effect.effect_id, "run"]);
     let lease_id = idempotency_key(&[instance_id, &effect.effect_id, "lease"]);
@@ -23751,7 +23753,7 @@ fn resolve_effect_input_after_bindings(
     effect: &ClaimableEffect,
 ) -> Result<String, StoreError> {
     resolve_effect_input_after_bindings_generic(
-        &SqliteStore::open(store_path)?,
+        &SqliteStore::open_read_only(store_path)?,
         instance_id,
         effect,
     )

@@ -30,6 +30,7 @@
 mod dispatch;
 mod host_actions;
 pub(crate) mod recovery;
+mod tracker_filing;
 pub(crate) mod transaction;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -7506,6 +7507,93 @@ fn do_live_event_ids<S: DoSql>(
     ))
 }
 
+#[allow(clippy::too_many_arguments)]
+fn do_file_item_on(
+    sql: &impl DoSql,
+    queue: &str,
+    title: &str,
+    body: &str,
+    labels: &[String],
+    metadata: &serde_json::Value,
+    filed_by: Option<&str>,
+    assigned_to: Option<&str>,
+    effect_id: Option<&str>,
+    filing_fingerprint: Option<&str>,
+) -> StoreResult<(String, String)> {
+    let now = do_now(sql)?;
+    // The caller owns the transaction spanning counter, event and projection.
+    let bumped = sql
+        .query(
+            "UPDATE tracker_counter SET next_id = next_id + 1 WHERE singleton = 1 \
+                 RETURNING next_id - 1",
+            &[],
+        )
+        .map_err(sql_err)?;
+    let next = StoreError::written_row(
+        bumped.first().map(|row| as_i64(&row[0])),
+        "tracker_counter row",
+    )?;
+    let item_id = format!("WS-{next}");
+    let labels_json = serde_json::to_string(labels).map_err(|error| sql_err(error.to_string()))?;
+    let mut payload = serde_json::json!({
+        "queue": queue,
+        "title": title,
+        "body": body,
+        "labels": labels,
+        "metadata": metadata,
+        "filed_by": filed_by,
+        "assigned_to": assigned_to,
+    });
+    // Opaque merge identity = the content-hash of the creation event; WS-N
+    // is only a local alias for it. The event log is keyed by content_id.
+    if let Some(fingerprint) = filing_fingerprint {
+        payload["filing_fingerprint"] = serde_json::Value::String(fingerprint.into());
+    }
+    let payload_json = payload.to_string();
+    let content_id = whipplescript_store::items::event_content_id(
+        "issue.created",
+        None,
+        &payload_json,
+        filed_by,
+        &[],
+        &now,
+    );
+    sql.execute(
+        "INSERT INTO tracker_aliases (content_id, alias) VALUES (?1, ?2)",
+        &[text(&content_id), text(&item_id)],
+    )
+    .map_err(sql_err)?;
+    do_tracker_append_raw(
+        sql,
+        Some(&content_id),
+        Some(&content_id),
+        "issue.created",
+        &payload_json,
+        filed_by,
+        effect_id,
+        &now,
+    )?;
+    sql
+            .execute(
+                "INSERT INTO tracker_issues \
+                 (issue_id, queue, title, body, status, labels_json, metadata_json, filed_by, assigned_to, created_at, updated_at) \
+                 VALUES (?1, ?2, ?3, ?4, 'open', ?5, ?6, ?7, ?8, ?9, ?9)",
+                &[
+                    text(&item_id),
+                    text(queue),
+                    text(title),
+                    text(body),
+                    text(&labels_json),
+                    text(&metadata.to_string()),
+                    opt_text(filed_by),
+                    opt_text(assigned_to),
+                    text(&now),
+                ],
+            )
+            .map_err(sql_err)?;
+    Ok((item_id, content_id))
+}
+
 impl<Sql: DoSql> WorkItems for DoSqliteStore<Sql> {
     fn subject_content_id(&self, id: &str) -> StoreResult<Option<String>> {
         do_content_id(&self.sql, id)
@@ -7739,80 +7827,19 @@ impl<Sql: DoSql> WorkItems for DoSqliteStore<Sql> {
         filed_by: Option<&str>,
         assigned_to: Option<&str>,
     ) -> StoreResult<WorkItem> {
-        let now = do_now(&self.sql)?;
-        // Mint the next sequential id (`WS-1`, `WS-2`, …); single-writer per
-        // invocation makes the counter bump + append + project atomic.
-        let bumped = self
-            .sql
-            .query(
-                "UPDATE tracker_counter SET next_id = next_id + 1 WHERE singleton = 1 \
-                 RETURNING next_id - 1",
-                &[],
-            )
-            .map_err(sql_err)?;
-        let next = StoreError::written_row(
-            bumped.first().map(|row| as_i64(&row[0])),
-            "tracker_counter row",
-        )?;
-        let item_id = format!("WS-{next}");
-        let labels_json =
-            serde_json::to_string(labels).map_err(|error| sql_err(error.to_string()))?;
-        let payload = serde_json::json!({
-            "queue": queue,
-            "title": title,
-            "body": body,
-            "labels": labels,
-            "metadata": metadata,
-            "filed_by": filed_by,
-            "assigned_to": assigned_to,
-        });
-        // Opaque merge identity = the content-hash of the creation event; WS-N
-        // is only a local alias for it. The event log is keyed by content_id.
-        let payload_json = payload.to_string();
-        let content_id = whipplescript_store::items::event_content_id(
-            "issue.created",
-            None,
-            &payload_json,
-            filed_by,
-            &[],
-            &now,
-        );
-        self.sql
-            .execute(
-                "INSERT INTO tracker_aliases (content_id, alias) VALUES (?1, ?2)",
-                &[text(&content_id), text(&item_id)],
-            )
-            .map_err(sql_err)?;
-        do_tracker_append_raw(
+        let (item_id, _) = do_file_item_on(
             &self.sql,
-            Some(&content_id),
-            Some(&content_id),
-            "issue.created",
-            &payload_json,
+            queue,
+            title,
+            body,
+            labels,
+            metadata,
             filed_by,
+            assigned_to,
             self.event_effect_id.as_deref(),
-            &now,
+            None,
         )?;
-        self.sql
-            .execute(
-                "INSERT INTO tracker_issues \
-                 (issue_id, queue, title, body, status, labels_json, metadata_json, filed_by, assigned_to, created_at, updated_at) \
-                 VALUES (?1, ?2, ?3, ?4, 'open', ?5, ?6, ?7, ?8, ?9, ?9)",
-                &[
-                    text(&item_id),
-                    text(queue),
-                    text(title),
-                    text(body),
-                    text(&labels_json),
-                    text(&metadata.to_string()),
-                    opt_text(filed_by),
-                    opt_text(assigned_to),
-                    text(&now),
-                ],
-            )
-            .map_err(sql_err)?;
-        self.get_item(&item_id)?
-            .ok_or_else(|| StoreError::Conflict("filed item missing".to_owned()))
+        StoreError::written_row(self.get_item(&item_id)?, "filed tracker issue")
     }
 
     fn get_item(&self, item_id: &str) -> StoreResult<Option<WorkItem>> {
@@ -9433,6 +9460,7 @@ pub mod test_support {
             INSERT INTO schema_migrations (version, name) VALUES (1, 'init');
             INSERT INTO schema_migrations (version, name) VALUES (2, 'provider-trust-evidence');
             INSERT INTO schema_migrations (version, name) VALUES (3, 'retained-write-results');
+            INSERT INTO schema_migrations (version, name) VALUES (4, 'tracker-filing-receipts');
             CREATE TABLE events (
                 event_id TEXT PRIMARY KEY, instance_id TEXT NOT NULL, sequence INTEGER NOT NULL,
                 event_type TEXT NOT NULL, payload_json TEXT NOT NULL, occurred_at TEXT NOT NULL,
@@ -9731,6 +9759,8 @@ pub mod test_support {
             "#,
         )
         .expect("schema");
+        conn.execute_batch(whipplescript_store::tracker_filing::SCHEMA)
+            .expect("tracker filing schema");
         DoSqliteStore::new(RusqliteDoSql {
             conn: std::rc::Rc::new(conn),
         })
@@ -12143,7 +12173,7 @@ pub(crate) mod tests {
     fn do_store_core_methods_run_real_sql() {
         let store = store();
 
-        assert_eq!(store.schema_version().expect("version"), 3);
+        assert_eq!(store.schema_version().expect("version"), 4);
         assert!(!store.fact_exists("i1", "ready").expect("fact"));
 
         let event = store

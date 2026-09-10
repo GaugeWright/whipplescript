@@ -30,6 +30,9 @@ pub use resolution_recording::{
 mod scoped_save;
 pub use scoped_save::ScopedSaveExecutionAuthority;
 
+mod materialized_inputs;
+pub use materialized_inputs::ActionInputResolver;
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 struct InstanceMetadata {
     protocol: String,
@@ -212,6 +215,7 @@ impl<S: RuntimeStore> GovernedHostFacade<S> {
         for resource in original.resources.values() {
             self.require_governed(&resource.resource.handle)?;
         }
+        self.check_materialized_action_inputs(action, &original, &request.provenance.executor)?;
         self.check_program_ifc(action.program())?;
         let effect = self
             .kernel

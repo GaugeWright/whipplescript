@@ -2,6 +2,40 @@
 use super::VerifiedEnvelope;
 
 impl VerifiedEnvelope {
+    /// Preserve an immutable input's classification when it becomes a workflow
+    /// fact. This query grants no body access: the host separately authenticates
+    /// the exact input version and its label binding before materialization.
+    pub fn check_materialized_input(
+        &self,
+        source: &str,
+        fact: &str,
+        executor: &str,
+    ) -> Result<(), String> {
+        self.check_resource_flow(source, fact)?;
+        let envelope = self.envelope();
+        let role = envelope.role_for_principal(executor);
+        if ![source, fact].iter().all(|resource| {
+            envelope
+                .reader_set(resource)
+                .iter()
+                .all(|reader| envelope.can_act(role, reader))
+        }) {
+            return Err("materialized input exceeds executor clearance".into());
+        }
+        // Directional sinks may accept data which their read side is not
+        // allowed to disclose or vouch for. Check the subsequent fact read too.
+        if !envelope.dominates(&envelope.reader_set(fact), &envelope.reader_set(source)) {
+            return Err("materialized fact loses input confidentiality".into());
+        }
+        if !envelope.dominates(
+            &envelope.integrity_set(source),
+            &envelope.integrity_set(fact),
+        ) {
+            return Err("materialized fact elevates input integrity".into());
+        }
+        Ok(())
+    }
+
     /// Check a raw resource flow using this envelope's existing confidentiality
     /// and integrity algebra. Both handles must resolve to governed resources;
     /// explicit public grants are allowed, unknown resources are not.

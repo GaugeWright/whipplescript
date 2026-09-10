@@ -22,10 +22,30 @@ pub struct CompiledHostAction {
     identity: String,
     version_ref: String,
     input_schema_ref: String,
+    materialized_inputs: bool,
 }
 
 impl CompiledHostAction {
     pub fn compile(operation: &str, source: &str, root: Option<&str>) -> Result<Self, String> {
+        Self::compile_inputs(operation, source, root, false)
+    }
+
+    /// Compile unchanged workflow source whose declared inputs receive values
+    /// from governed immutable custody during admission.
+    pub fn compile_materialized_inputs(
+        operation: &str,
+        source: &str,
+        root: Option<&str>,
+    ) -> Result<Self, String> {
+        Self::compile_inputs(operation, source, root, true)
+    }
+
+    fn compile_inputs(
+        operation: &str,
+        source: &str,
+        root: Option<&str>,
+        materialized_inputs: bool,
+    ) -> Result<Self, String> {
         if operation.trim().is_empty() {
             return Err("host action operation is empty".into());
         }
@@ -51,22 +71,28 @@ impl CompiledHostAction {
             return Err("host action requires a declared terminal output schema".into());
         }
         let identity = whipplescript_parser::snapshot::identity_projection(&program.to_snapshot());
+        let mut registration = vec![
+            json!(HOST_ACTION_PROTOCOL),
+            json!(operation),
+            json!(source),
+            json!(identity),
+            json!(whipplescript_core::version()),
+        ];
+        if materialized_inputs {
+            registration.push(json!("materialized-inputs.v1"));
+        }
         let version_ref = format!(
             "action:{}",
-            crate::gov::hash_hex(
-                &json!([
-                    HOST_ACTION_PROTOCOL,
-                    operation,
-                    source,
-                    identity,
-                    whipplescript_core::version()
-                ])
-                .to_string()
-            )
+            crate::gov::hash_hex(&json!(registration).to_string())
         );
         // The compiled identity includes every referenced class, not just the
         // top-level input name. Editing a nested type changes this schema ref.
-        let input_schema_ref = format!("action-input:{}", crate::gov::hash_hex(&identity));
+        let schema_identity = if materialized_inputs {
+            json!(["materialized-inputs.v1", identity]).to_string()
+        } else {
+            identity.clone()
+        };
+        let input_schema_ref = format!("action-input:{}", crate::gov::hash_hex(&schema_identity));
         Ok(Self {
             operation: operation.into(),
             source: source.into(),
@@ -74,6 +100,7 @@ impl CompiledHostAction {
             identity,
             version_ref,
             input_schema_ref,
+            materialized_inputs,
         })
     }
 
@@ -85,6 +112,10 @@ impl CompiledHostAction {
     }
     pub fn input_schema_ref(&self) -> &str {
         &self.input_schema_ref
+    }
+
+    pub fn has_materialized_inputs(&self) -> bool {
+        self.materialized_inputs
     }
 
     pub(crate) fn validate_command(
@@ -109,6 +140,12 @@ impl CompiledHostAction {
     ) -> Result<Vec<WorkflowInputFact>, HostFacadeError> {
         let command = admission.command();
         self.validate_command(command)?;
+        if self.materialized_inputs {
+            return Err(ProtocolError::Invalid(
+                "materialized workflow requires governed input custody",
+            )
+            .into());
+        }
         // Untyped legacy workflows may accept an arbitrary external.started
         // payload; this versioned protocol locks even the empty input schema.
         if !command.inputs.is_empty()
@@ -140,6 +177,15 @@ impl<S: RuntimeStore + LogAppend> RuntimeKernel<S> {
         admission: &VerifiedActionAdmission,
     ) -> Result<ActionAdmissionReceipt, HostFacadeError> {
         let facts = action.validate_inputs(admission)?;
+        self.admit_host_action_inputs(action, admission, facts)
+    }
+
+    pub(crate) fn admit_host_action_inputs(
+        &mut self,
+        action: &CompiledHostAction,
+        admission: &VerifiedActionAdmission,
+        facts: Vec<WorkflowInputFact>,
+    ) -> Result<ActionAdmissionReceipt, HostFacadeError> {
         let source_hash = self
             .store()
             .put_content(&action.source)
@@ -224,6 +270,36 @@ impl<S: RuntimeStore + LogAppend> RuntimeKernel<S> {
         };
         receipt.validate_for(command)?;
         Ok(receipt)
+    }
+
+    /// Recover before body reads; consumed or erased inputs cannot be reseeded.
+    pub(crate) fn existing_action_admission(
+        &self,
+        admission: &VerifiedActionAdmission,
+    ) -> Result<Option<ActionAdmissionReceipt>, HostFacadeError> {
+        let Some(stored) = self
+            .store()
+            .event_by_idempotency_key(admission.instance_ref(), "host-action-admission")
+            .map_err(HostFacadeError::Store)?
+        else {
+            return Ok(None);
+        };
+        let mut prefix = self
+            .store()
+            .chain_prefix(admission.instance_ref())
+            .map_err(HostFacadeError::Store)?;
+        prefix.retain(|event| event.sequence <= stored.sequence);
+        let receipt = ActionAdmissionReceipt {
+            protocol: HOST_ACTION_PROTOCOL.into(),
+            fingerprint: admission.fingerprint().into(),
+            instance_ref: admission.instance_ref().into(),
+            admitted_at: admission_pin(admission.instance_ref(), &stored, &prefix)?,
+        };
+        let command = admission.command();
+        // This validates the recorded command against the authenticated
+        // fingerprint as well as its complete original admission prefix.
+        recorded_action_command(&receipt, &command.issuer, &command.scope, &prefix)?;
+        Ok(Some(receipt))
     }
 }
 

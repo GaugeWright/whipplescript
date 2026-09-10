@@ -292,7 +292,7 @@ const BUILTIN_SEEDS = [
 // understands. A rolled-back worker attached to an object stamped past this
 // must refuse rather than misread (or "lazily upgrade") a layout it has never
 // seen. Keep in step with the version rows `do_schema.sql` inserts.
-const SUPPORTED_DO_SCHEMA_VERSION = 3;
+const SUPPORTED_DO_SCHEMA_VERSION = 4;
 
 /**
  * DR-0054 Phase B: the object's durable schema is stamped with a version newer
@@ -338,6 +338,12 @@ function ensureSchema(sql: SqlStorage): void {
   // an older worker's existing downgrade guard then refuses this generation.
   sql.exec(`INSERT OR IGNORE INTO schema_migrations (version, name)
     VALUES (3, 'retained-write-results')`);
+  sql.exec(`CREATE TABLE IF NOT EXISTS tracker_filing_receipts (
+    operation_id TEXT PRIMARY KEY, fingerprint TEXT NOT NULL,
+    item_id TEXT NOT NULL, event_id TEXT NOT NULL
+  )`);
+  sql.exec(`INSERT OR IGNORE INTO schema_migrations (version, name)
+    VALUES (4, 'tracker-filing-receipts')`);
   // Existing placement objects predate GaugeDesk's writer profile. Keep
   // additive runtime policy seeds outside the first-touch branch so a deploy
   // upgrades those objects lazily without rewriting operator-owned rows.

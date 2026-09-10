@@ -1626,14 +1626,15 @@ describe("real WorkflowInstance hibernation", () => {
     });
   });
 
-  it("upgrades legacy objects to retained-result generation without rewriting history", async () => {
+  it("upgrades legacy objects to retained-result and tracker-receipt generations without rewriting history", async () => {
     const sessionId = "session-retained-result-upgrade";
     const namespace = (env as unknown as TestEnv).WORKFLOW_INSTANCE;
     const stub = namespace.get(namespace.idFromName(sessionId));
     await bootstrapSession(stub, sessionId);
     let history = "";
     await runInDurableObject(stub, async (_instance, state) => {
-      state.storage.sql.exec("DELETE FROM schema_migrations WHERE version = 3");
+      state.storage.sql.exec("DELETE FROM schema_migrations WHERE version >= 3");
+      state.storage.sql.exec("DROP TABLE tracker_filing_receipts");
       const stamp = state.storage.sql.exec("SELECT MAX(version) AS version FROM schema_migrations").toArray() as { version: number }[];
       expect(stamp[0].version).toBe(2);
       history = JSON.stringify(state.storage.sql.exec("SELECT event_id, payload_json FROM events ORDER BY sequence").toArray());
@@ -1645,7 +1646,8 @@ describe("real WorkflowInstance hibernation", () => {
     expect(response.status).toBe(200);
     await runInDurableObject(stub, async (_instance, state) => {
       const stamp = state.storage.sql.exec("SELECT MAX(version) AS version FROM schema_migrations").toArray() as { version: number }[];
-      expect(stamp[0].version).toBe(3);
+      expect(stamp[0].version).toBe(4);
+      expect(state.storage.sql.exec("SELECT operation_id FROM tracker_filing_receipts").toArray()).toEqual([]);
       expect(JSON.stringify(state.storage.sql.exec("SELECT event_id, payload_json FROM events ORDER BY sequence").toArray())).toBe(history);
     });
   });

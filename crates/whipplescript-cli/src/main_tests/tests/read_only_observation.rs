@@ -166,3 +166,26 @@ fn read_only_observation_commands_read_real_workflow_without_changing_evidence()
         }
     }
 }
+
+#[test]
+fn worker_input_read_connects_without_a_migration_lock_or_database_creation() {
+    let fixture = ObservationFixture::new();
+    let path = fixture.database();
+    let effect = ClaimableEffect {
+        effect_id: "following".into(), kind: "agent.tell".into(), target: Some("worker".into()), profile: None,
+        input_json: json!({"after": {"binding": "prior", "predicate": "succeeds", "upstream_effect_id": "prior"}}).to_string(),
+        required_capabilities_json: "[]".into(), declared_profiles_json: "[]".into(),
+    };
+    assert!(resolve_effect_input_after_bindings(&path, "instance", &effect).is_err());
+    assert!(!path.exists());
+    drop(SqliteStore::open(&path).unwrap());
+    let mut writer = rusqlite::Connection::open(&path).unwrap();
+    let tx = writer
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .unwrap();
+    assert_eq!(
+        resolve_effect_input_after_bindings(&path, "instance", &effect).unwrap(),
+        effect.input_json
+    );
+    tx.commit().unwrap();
+}
