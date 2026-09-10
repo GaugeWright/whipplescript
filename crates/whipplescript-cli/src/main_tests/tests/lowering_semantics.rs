@@ -1058,6 +1058,83 @@ rule claim_ready
     assert_eq!(ready.contexts[0].bindings[0].1.key, "backlog:WS-1:gen");
 }
 
+/// DR-0110: `when <tracker> has closed issue as c` matches that tracker's
+/// closings and no other's.
+///
+/// The queue gate is the assertion that matters. One instance projects every
+/// declared tracker's closings into the same fact set, and every pattern the
+/// gate does not recognise falls through to "matches" — so a `closed` pattern
+/// it had not been taught would silently take another queue's closings, which
+/// is a leak rather than a missing feature.
+#[test]
+fn a_closed_issue_trigger_matches_only_its_own_tracker() {
+    let source = r#"use std.tracker
+
+@service
+workflow ClosedTrigger
+
+output result R
+class R { ok bool }
+
+tracker backlog
+tracker other
+
+rule on_close
+  when backlog has closed issue as closing
+=> {
+  complete result { ok true }
+}
+"#;
+    let ir = whipplescript_parser::compile_program(source)
+        .ir
+        .expect("compile");
+    // Two closings of the SAME issue: distinct events, so distinct facts. An
+    // issue-keyed fact would be one of these, and the second continuation it
+    // should have released would never arrive.
+    let first = FactView {
+        fact_id: "fact-close-1".to_owned(),
+        program_version_id: None,
+        revision_epoch: 0,
+        name: "tracker.issue.closed".to_owned(),
+        key: "backlog:WS-1:event-aaa".to_owned(),
+        value_json:
+            r#"{"queue":"backlog","id":"WS-1","title":"Done","closed_at":"t1","event":"event-aaa"}"#
+                .to_owned(),
+        provenance_class: "queue".to_owned(),
+        source_span_json: None,
+        source_event_id: String::new(),
+    };
+    let second = FactView {
+        key: "backlog:WS-1:event-bbb".to_owned(),
+        fact_id: "fact-close-2".to_owned(),
+        value_json:
+            r#"{"queue":"backlog","id":"WS-1","title":"Done","closed_at":"t2","event":"event-bbb"}"#
+                .to_owned(),
+        ..first.clone()
+    };
+    let elsewhere = FactView {
+        key: "other:WS-9:event-ccc".to_owned(),
+        fact_id: "fact-close-3".to_owned(),
+        value_json: r#"{"queue":"other","id":"WS-9","title":"Not mine","closed_at":"t3","event":"event-ccc"}"#
+            .to_owned(),
+        ..first.clone()
+    };
+    let facts = vec![first, second, elsewhere];
+    let effects = Vec::new();
+    let ready = ready_contexts(&ir, &ir.rules[0], &facts, &effects, None);
+
+    let keys: Vec<&str> = ready
+        .contexts
+        .iter()
+        .map(|context| context.bindings[0].1.key.as_str())
+        .collect();
+    assert_eq!(
+        keys,
+        vec!["backlog:WS-1:event-aaa", "backlog:WS-1:event-bbb"],
+        "both closings of the backlog issue match, and the other queue's does not"
+    );
+}
+
 /// DR-0052 grammar pass slice 2: the std.vcs readiness sugar — each
 /// phrase lowers to its `vcs.*` fact; the stream guard filters by the
 /// leading word; `by others` excludes exactly the matching instance's

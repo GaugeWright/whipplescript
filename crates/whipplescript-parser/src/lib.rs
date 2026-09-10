@@ -8465,6 +8465,21 @@ impl SchemaIndex {
         // never construct. One schema for both nouns — the fact NAME
         // (`tracker.issue.stale` / `tracker.assertion.stale`) already
         // discriminates, and the payload shape is identical.
+        // DR-0110: what `when <tracker> has closed issue as c` binds. A
+        // closing, not a work item — it names the issue that closed and the
+        // event that closed it, which is the identity the fact is keyed by.
+        // Observer-origin, like the staleness pair below: the mediator emits
+        // it and user rules eliminate it, never construct it.
+        index.insert_class(
+            "IssueClosing",
+            [
+                ("id", string_ty()),
+                ("queue", string_ty()),
+                ("title", string_ty()),
+                ("closed_at", string_ty()),
+                ("event", string_ty()),
+            ],
+        );
         index.insert_class(
             "TrackerStale",
             [
@@ -10865,8 +10880,11 @@ fn tracker_resource_reads(rule: &RuleDecl, semantic: &SemanticContext) -> Vec<St
     for when in &rule.whens {
         let (pattern, _) = split_when_guard(&when.text);
         let words: Vec<&str> = pattern.split_whitespace().collect();
-        if let ["has", "ready", "issue"] = &words[1..words.len().min(4)] {
-            if semantic.trackers.contains(words[0]) {
+        // `ready` and `closed` (DR-0110) are both observations of the queue, so
+        // both are reads of it. Missing the second would let a closure escape
+        // the labelling DR-0051 §1 put on tracker reads.
+        if let ["has", state, "issue"] = &words[1..words.len().min(4)] {
+            if matches!(*state, "ready" | "closed") && semantic.trackers.contains(words[0]) {
                 reads.insert(format!("tracker:{}", words[0]));
             }
         }
@@ -16453,10 +16471,10 @@ fn binding_resources(
         let pattern = when.text.split(" where ").next().unwrap_or(&when.text);
         let words: Vec<&str> = pattern.split_whitespace().collect();
         // `<tracker> has ready issue as <binding>`
-        if let ([handle, "has", "ready", "issue"], Some(binding)) =
+        if let ([handle, "has", state, "issue"], Some(binding)) =
             (&words[..words.len().min(4)], binding_after_as(pattern))
         {
-            if trackers.contains(*handle) {
+            if matches!(*state, "ready" | "closed") && trackers.contains(*handle) {
                 resolved.insert(binding.to_owned(), (*handle).to_owned());
             }
         }
@@ -20491,11 +20509,17 @@ pub fn runtime_fact_name_for_pattern(pattern: &str) -> Option<String> {
     {
         let mut words = pattern.split_whitespace();
         let _tracker = words.next();
-        if words.next() == Some("has")
-            && words.next() == Some("ready")
-            && words.next() == Some("issue")
-        {
-            return Some("tracker.issue.ready".to_owned());
+        if words.next() == Some("has") {
+            let state = words.next();
+            if words.next() == Some("issue") {
+                match state {
+                    Some("ready") => return Some("tracker.issue.ready".to_owned()),
+                    // DR-0110. A closing, not a closed issue: the fact is keyed
+                    // by the closing event.
+                    Some("closed") => return Some("tracker.issue.closed".to_owned()),
+                    _ => {}
+                }
+            }
         }
     }
     if first.chars().next().is_some_and(char::is_uppercase) {
@@ -20516,12 +20540,27 @@ fn binding_from_when(when: &str) -> Option<(String, String)> {
         words.next();
         words.next() == Some("completed") && words.next() == Some("turn")
     };
-    let has_ready_issue = {
+    // `ready` binds the work item; `closed` binds the CLOSING, which is a
+    // different shape and gets a different class. Declaring both `WorkItem`
+    // would typecheck `c.labels` against a fact that carries no labels —
+    // exactly the compiles-and-matches-nothing failure DR-0096 refuses.
+    let issue_trigger_schema = {
         let mut words = pattern.split_whitespace();
         words.next();
-        words.next() == Some("has")
-            && words.next() == Some("ready")
-            && words.next() == Some("issue")
+        if words.next() == Some("has") {
+            let state = words.next();
+            if words.next() == Some("issue") {
+                match state {
+                    Some("ready") => Some("WorkItem"),
+                    Some("closed") => Some("IssueClosing"),
+                    _ => None,
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        }
     };
     let schema = if let Some(rest) = pattern.strip_prefix("fact ") {
         rest.split_whitespace().next()?.to_owned()
@@ -20534,8 +20573,8 @@ fn binding_from_when(when: &str) -> Option<(String, String)> {
         first.to_owned()
     } else if completed_turn {
         "AgentTurn".to_owned()
-    } else if has_ready_issue {
-        "WorkItem".to_owned()
+    } else if let Some(schema) = issue_trigger_schema {
+        schema.to_owned()
     } else if pattern.starts_with("message from ") {
         // Inbound messaging (spec/messaging.md): `when message from <channel> as
         // msg` binds the generic `Message` envelope, never a domain type.

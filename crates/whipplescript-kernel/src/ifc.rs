@@ -2797,8 +2797,13 @@ fn shared_coordination_resources(ir: &IrProgram) -> BTreeSet<String> {
         .collect()
 }
 
-/// The tracker handle a `when <tracker> has ready issue as <binding>` trigger
-/// reads, or `None` for every other `when` pattern (DR-0051 §1).
+/// The tracker handle a `when <tracker> has ready issue as <binding>` or
+/// `has closed issue` trigger reads, or `None` for every other `when` pattern
+/// (DR-0051 §1, extended by DR-0110).
+///
+/// Both states are observations OF THE QUEUE, so both are reads of it. Adding
+/// the fact without adding it here would have let a closure arrive unlabelled
+/// through a door §1 had already closed for readiness.
 ///
 /// Matched against the program's declared trackers rather than on the shape of
 /// the words alone, so a fact class that happens to be followed by `has ready
@@ -2808,7 +2813,7 @@ fn tracker_trigger_handle<'a>(pattern: &'a str, trackers: &BTreeSet<&str>) -> Op
     let mut words = pattern.split_whitespace();
     let handle = words.next()?;
     (words.next() == Some("has")
-        && words.next() == Some("ready")
+        && matches!(words.next(), Some("ready" | "closed"))
         && words.next() == Some("issue")
         && trackers.contains(handle))
     .then_some(handle)

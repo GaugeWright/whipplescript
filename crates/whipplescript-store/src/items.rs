@@ -792,6 +792,71 @@ impl WorkItemStore {
         Ok(rows)
     }
 
+    /// Every closing of every issue in `queue`, oldest first (DR-0110).
+    ///
+    /// Read off `tracker_events`, not off `tracker_issues.status`, and that is
+    /// the whole design. A status column answers "is it closed *now*", which
+    /// cannot distinguish one closing from a later one and cannot be seen by a
+    /// rule that started after the fact. The event log answers "what closings
+    /// happened", which is what a fold needs and what makes a closure older
+    /// than its observer still observable.
+    ///
+    /// **Two doors close an issue and both count.** `finish_item` appends
+    /// `issue.closed`; `set_field(id, "status", "closed")` appends an
+    /// `issue.field_set` that the same fold turns into the same status. Reading
+    /// only the first would leave a real closing invisible, so this matches
+    /// both. `issue.canceled` is deliberately absent: cancellation is not
+    /// closure, and DR-0093's finite status domain is what lets that be a
+    /// decision rather than an oversight.
+    pub fn closings(&self, queue: &str) -> StoreResult<Vec<IssueClosing>> {
+        // The alias join is INNER for the reason `poll_subscribed_events` gives:
+        // `tracker_events.issue_id` is the opaque content id and
+        // `tracker_issues.issue_id` is the local `WS-N`, so `tracker_aliases` is
+        // the only bridge and an unaliased event has no knowable queue.
+        let mut statement = self.connection.prepare(
+            "SELECT e.event_seq, e.event_id, a.alias, i.queue, i.title, e.kind, \
+                    e.payload_json, e.created_at \
+             FROM tracker_events e \
+             JOIN tracker_aliases a ON a.content_id = e.issue_id \
+             JOIN tracker_issues i ON i.issue_id = a.alias \
+             WHERE i.queue = ?1 AND e.kind IN ('issue.closed', 'issue.field_set') \
+             ORDER BY e.event_seq",
+        )?;
+        let rows = statement
+            .query_map(params![queue], |row| {
+                let kind: String = row.get(5)?;
+                let payload: String = row.get(6)?;
+                Ok((
+                    IssueClosing {
+                        event_id: row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                        position: row.get(0)?,
+                        queue: row.get(3)?,
+                        issue: row.get(2)?,
+                        title: row.get(4)?,
+                        closed_at: row.get(7)?,
+                    },
+                    kind,
+                    payload,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        // The `field_set` half is filtered here rather than in SQL so the query
+        // stays the same shape on every host: the DO's SQL surface is not the
+        // place to discover a JSON function is missing.
+        Ok(rows
+            .into_iter()
+            .filter(|(_, kind, payload)| {
+                if kind == "issue.closed" {
+                    return true;
+                }
+                let value: Value = serde_json::from_str(payload).unwrap_or(Value::Null);
+                value.get("field").and_then(Value::as_str) == Some("status")
+                    && value.get("value").and_then(Value::as_str) == Some("closed")
+            })
+            .map(|(closing, _, _)| closing)
+            .collect())
+    }
+
     /// See `WorkItems::advance_subscription`.
     pub fn advance_subscription(
         &mut self,
@@ -3218,6 +3283,14 @@ pub trait WorkItems {
 
     fn ready_items(&self, queue: &str) -> StoreResult<Vec<WorkItem>>;
 
+    /// Every closing of every issue in `queue`, oldest first (DR-0110).
+    ///
+    /// Deliberately has NO default. A default returning an empty list would let
+    /// a host that cannot answer read as a host where nothing has ever closed,
+    /// which is the failure mode this whole fact exists to avoid — a wait that
+    /// never releases and cannot say why.
+    fn closings(&self, queue: &str) -> StoreResult<Vec<IssueClosing>>;
+
     /// Atomic claim with an optional absolute expiry (`None` = no TTL). The
     /// T3 claim-TTL half: the caller computes `now + ttl` and passes it here.
     fn claim_item(
@@ -3377,6 +3450,10 @@ impl WorkItems for WorkItemStore {
 
     fn assign_item(&mut self, item_id: &str, assignee: Option<&str>) -> StoreResult<bool> {
         self.assign_item(item_id, assignee)
+    }
+
+    fn closings(&self, queue: &str) -> StoreResult<Vec<IssueClosing>> {
+        self.closings(queue)
     }
 
     fn list_items(&self, queue: Option<&str>, status: Option<&str>) -> StoreResult<Vec<WorkItem>> {
@@ -3540,6 +3617,27 @@ pub struct TrackerSubscription {
     /// The last `event_seq` delivered to this subscriber. Local append order,
     /// deliberately — see `poll_subscribed_events`.
     pub position: i64,
+}
+
+/// One closing of one issue (DR-0110).
+///
+/// A *closing*, not a closed issue: an issue closed, reopened and closed again
+/// yields two of these. That is the point — the fact derived from it is keyed
+/// by `event_id`, so the second closing cannot re-release a continuation the
+/// first already released, and a rule that has never run still sees closings
+/// that happened before it existed.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IssueClosing {
+    /// The closing event's content id. The fact's identity, and why a reopen
+    /// and re-close is a different observation rather than the same one twice.
+    pub event_id: String,
+    /// Append order, for stable ordering across a queue.
+    pub position: i64,
+    pub queue: String,
+    /// The human-facing alias (`WS-12`), reached through the alias bridge.
+    pub issue: String,
+    pub title: String,
+    pub closed_at: String,
 }
 
 /// One event a subscription is delivering, with the issue's local alias and
@@ -3869,6 +3967,114 @@ mod tests {
 
     fn open_memory() -> WorkItemStore {
         WorkItemStore::open(":memory:").expect("opens")
+    }
+
+    // ---- DR-0110: closings are read off the log, not off the status column ----
+
+    /// The property the whole design turns on: a closing that happened before
+    /// anybody looked is still there to be found. A status column would answer
+    /// this too — the next two tests are the ones a column cannot pass.
+    #[test]
+    fn a_closing_outlives_the_moment_it_happened() {
+        let mut store = open_memory();
+        let issue = store
+            .file_item("q", "review", "", &[], &json!({}), None, None)
+            .expect("filed");
+        store.finish_item(&issue.id, None, None).expect("finished");
+
+        let closings = store.closings("q").expect("closings");
+        assert_eq!(closings.len(), 1, "one closing: {closings:?}");
+        assert_eq!(closings[0].issue, issue.id);
+        assert!(
+            !closings[0].event_id.is_empty(),
+            "the closing event's id is the fact's identity and must be present"
+        );
+    }
+
+    /// Keyed by the closing EVENT, not the issue. This is the mistake the
+    /// tracker calls out as failing silently and only in production: with an
+    /// issue-keyed fact these two closings are one, and the second one silently
+    /// re-releases whatever the first released.
+    #[test]
+    fn reopening_and_closing_again_is_a_second_closing() {
+        let mut store = open_memory();
+        let issue = store
+            .file_item("q", "review", "", &[], &json!({}), None, None)
+            .expect("filed");
+        store.finish_item(&issue.id, None, None).expect("first");
+        store
+            .set_field(&issue.id, "status", "open")
+            .expect("reopened");
+        store.finish_item(&issue.id, None, None).expect("second");
+
+        let closings = store.closings("q").expect("closings");
+        assert_eq!(closings.len(), 2, "two closings: {closings:?}");
+        assert_ne!(
+            closings[0].event_id, closings[1].event_id,
+            "two closings of one issue are two events, or the second cannot be \
+             told from the first"
+        );
+    }
+
+    /// The second door. `finish_item` appends `issue.closed`; setting the
+    /// status field appends an `issue.field_set` that the same fold turns into
+    /// the same status. Reading only the first leaves a real closure invisible.
+    #[test]
+    fn setting_the_status_field_closes_too() {
+        let mut store = open_memory();
+        let issue = store
+            .file_item("q", "review", "", &[], &json!({}), None, None)
+            .expect("filed");
+        store
+            .set_field(&issue.id, "status", "closed")
+            .expect("closed by field");
+
+        let closings = store.closings("q").expect("closings");
+        assert_eq!(
+            closings.len(),
+            1,
+            "a status field_set closes the issue and must count: {closings:?}"
+        );
+    }
+
+    /// Cancelling is not closing. A string comparison somebody forgot to update
+    /// is exactly what DR-0093's finite status domain exists to prevent, and
+    /// this is that domain being load-bearing rather than decorative.
+    #[test]
+    fn cancelling_is_not_closing() {
+        let mut store = open_memory();
+        let issue = store
+            .file_item("q", "review", "", &[], &json!({}), None, None)
+            .expect("filed");
+        store
+            .set_field(&issue.id, "status", "canceled")
+            .expect("cancelled");
+
+        assert!(
+            store.closings("q").expect("closings").is_empty(),
+            "a cancelled issue never closed"
+        );
+    }
+
+    /// Closings do not leak across queues. The alias join is the only bridge
+    /// from an event to its queue, and joining the two id spaces directly
+    /// matches nothing — so this would fail loudly rather than quietly if the
+    /// join were wrong.
+    #[test]
+    fn closings_are_scoped_to_their_queue() {
+        let mut store = open_memory();
+        let mine = store
+            .file_item("mine", "a", "", &[], &json!({}), None, None)
+            .expect("filed");
+        let theirs = store
+            .file_item("theirs", "b", "", &[], &json!({}), None, None)
+            .expect("filed");
+        store.finish_item(&mine.id, None, None).expect("closed");
+        store.finish_item(&theirs.id, None, None).expect("closed");
+
+        let closings = store.closings("mine").expect("closings");
+        assert_eq!(closings.len(), 1);
+        assert_eq!(closings[0].issue, mine.id);
     }
 
     #[test]

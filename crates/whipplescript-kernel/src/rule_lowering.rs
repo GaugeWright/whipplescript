@@ -478,15 +478,20 @@ fn filter_bindingless_guard(
     kept
 }
 
-/// For `<tracker> has ready issue` patterns, only the named tracker's projected
-/// issues match.
+/// For `<tracker> has ready issue` and `<tracker> has closed issue` patterns,
+/// only the named tracker's projected issues match.
+///
+/// The `closed` half is not optional (DR-0110). Every unrecognised pattern
+/// falls through to `true`, so a closed pattern that was not recognised here
+/// would match every queue's closings at once — one instance projects them all,
+/// so the leak would be immediate and silent.
 pub fn pattern_tracker_matches(pattern: &str, fact: &FactView) -> bool {
     let mut words = pattern.split_whitespace();
     let Some(tracker) = words.next() else {
         return true;
     };
     if !(words.next() == Some("has")
-        && words.next() == Some("ready")
+        && matches!(words.next(), Some("ready" | "closed"))
         && words.next() == Some("issue"))
     {
         return true;

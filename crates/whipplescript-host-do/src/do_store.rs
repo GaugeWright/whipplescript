@@ -41,8 +41,8 @@ use whipplescript_store::coordination::{
 use whipplescript_store::dependency_graph;
 use whipplescript_store::event_chain;
 use whipplescript_store::items::{
-    apply_overlay, ClaimOutcome, FinishOutcome, ReleaseOutcome, RenewOutcome, SubscribedEvent,
-    TrackerSubscription, WorkItem, WorkItems,
+    apply_overlay, ClaimOutcome, FinishOutcome, IssueClosing, ReleaseOutcome, RenewOutcome,
+    SubscribedEvent, TrackerSubscription, WorkItem, WorkItems,
 };
 use whipplescript_store::{NewEvent, RuntimeStore, StoreError, StoreResult, StoredEvent};
 // The remaining ported methods reference the full set of store data types.
@@ -7842,6 +7842,49 @@ impl<Sql: DoSql> WorkItems for DoSqliteStore<Sql> {
             })
             .filter(|item| status.is_none_or(|want| item.status == want))
             .collect())
+    }
+
+    fn closings(&self, queue: &str) -> StoreResult<Vec<IssueClosing>> {
+        // Same query as the native store, and the same two doors: `issue.closed`
+        // from `finish_item`, and an `issue.field_set` that sets status to
+        // closed. The `field_set` half is filtered in Rust rather than with a
+        // JSON function so both hosts run the same shape of query.
+        let rows = self
+            .sql
+            .query(
+                "SELECT e.event_seq, e.event_id, a.alias, i.queue, i.title, e.kind, \
+                        e.payload_json, e.created_at \
+                 FROM tracker_events e \
+                 JOIN tracker_aliases a ON a.content_id = e.issue_id \
+                 JOIN tracker_issues i ON i.issue_id = a.alias \
+                 WHERE i.queue = ?1 AND e.kind IN ('issue.closed', 'issue.field_set') \
+                 ORDER BY e.event_seq",
+                &[text(queue)],
+            )
+            .map_err(sql_err)?;
+        let mut out = Vec::new();
+        for row in rows {
+            let kind = as_text(&row[5]);
+            if kind != "issue.closed" {
+                let payload: serde_json::Value =
+                    serde_json::from_str(&as_text(&row[6])).unwrap_or(serde_json::Value::Null);
+                let is_close = payload.get("field").and_then(serde_json::Value::as_str)
+                    == Some("status")
+                    && payload.get("value").and_then(serde_json::Value::as_str) == Some("closed");
+                if !is_close {
+                    continue;
+                }
+            }
+            out.push(IssueClosing {
+                event_id: as_text(&row[1]),
+                position: as_i64(&row[0]),
+                queue: as_text(&row[3]),
+                issue: as_text(&row[2]),
+                title: as_text(&row[4]),
+                closed_at: as_text(&row[7]),
+            });
+        }
+        Ok(out)
     }
 
     fn ready_items(&self, queue: &str) -> StoreResult<Vec<WorkItem>> {

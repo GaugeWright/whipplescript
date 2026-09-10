@@ -1785,6 +1785,75 @@ pub fn project_tracker_issues<S: RuntimeStore + WorkItems>(
                 kernel.store_mut().retire_fact(instance_id, &fact.fact_id)?;
             }
         }
+        project_tracker_closings(kernel, instance_id, &queue.name)?;
+    }
+    Ok(())
+}
+
+/// Projects each closing of each issue in `queue` into an instance-local
+/// `tracker.issue.closed` fact (DR-0110).
+///
+/// Three differences from the readiness projection above, all of them the point:
+///
+/// 1. **Keyed by the closing event, not the issue.** A reopen and a second
+///    close is a second closing under its own key, so it cannot re-release a
+///    continuation the first already released — and cannot be mistaken for it.
+/// 2. **Never retired.** Readiness is a current-state projection and retires
+///    when an item stops being ready. A closing is something that HAPPENED; a
+///    later reopen does not unmake it, and retiring the fact would make a rule
+///    that already fired look like it never should have.
+/// 3. **Derived from the log, so it is visible in arrears.** An instance whose
+///    first evaluation comes after the closing still sees it. That is what a
+///    live subscription cannot do and why this is a fact.
+fn project_tracker_closings<S: RuntimeStore + WorkItems>(
+    kernel: &mut RuntimeKernel<S>,
+    instance_id: &str,
+    queue: &str,
+) -> Result<(), StoreError> {
+    let closings = WorkItems::closings(kernel.store(), queue)?;
+    if closings.is_empty() {
+        return Ok(());
+    }
+    let seen: std::collections::BTreeSet<String> = kernel
+        .store()
+        .list_facts_including_consumed(instance_id)?
+        .into_iter()
+        .filter(|fact| fact.name == "tracker.issue.closed")
+        .map(|fact| fact.key)
+        .collect();
+    for closing in closings {
+        // The event id IS the identity. An event with no content id cannot be
+        // told apart from the next one, so it is skipped rather than projected
+        // under a key that would collide with a different closing.
+        if closing.event_id.is_empty() {
+            continue;
+        }
+        let key = format!("{queue}:{}:{}", closing.issue, closing.event_id);
+        // Consumed counts as seen: a rule that already took this closing must
+        // not receive it again on the next pass.
+        if seen.contains(&key) {
+            continue;
+        }
+        let value_json = json!({
+            "queue": closing.queue,
+            "id": closing.issue,
+            "title": closing.title,
+            "closed_at": closing.closed_at,
+            "event": closing.event_id,
+        })
+        .to_string();
+        kernel.derive_fact(
+            instance_id,
+            "tracker.issue.closed",
+            &key,
+            &value_json,
+            None,
+            Some(&idempotency_key(&[
+                instance_id,
+                "tracker.issue.closed",
+                &key,
+            ])),
+        )?;
     }
     Ok(())
 }

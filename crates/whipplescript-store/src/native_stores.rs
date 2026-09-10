@@ -966,6 +966,10 @@ impl WorkItems for NativeStores {
         self.items.ready_items(queue)
     }
 
+    fn closings(&self, queue: &str) -> StoreResult<Vec<crate::items::IssueClosing>> {
+        self.items.closings(queue)
+    }
+
     fn claim_item(
         &mut self,
         item_id: &str,
