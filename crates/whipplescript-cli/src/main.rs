@@ -12536,12 +12536,13 @@ fn run_test_scenario(test: &IrTest, source: &str, ir: &IrProgram, path: &str) ->
             // than silently completing those (a lie) the harness reports them
             // unsupported.
             TestClause::Stub(stub) => {
-                let coerce_returns = stub.surface.first().map(String::as_str) == Some("coerce")
-                    && stub.outcome == "returns";
+                let surface = stub.surface.first().map(String::as_str);
+                let returns_output =
+                    matches!(surface, Some("coerce") | Some("agent")) && stub.outcome == "returns";
                 match stub.outcome.as_str() {
                     "succeeds" | "fails" => None,
-                    _ if coerce_returns => None,
-                    _ => Some("stub outcome other than succeeds/fails (times_out/cancels not simulatable; only `coerce … returns { … }` injects output)"),
+                    _ if returns_output => None,
+                    _ => Some("stub outcome other than succeeds/fails (times_out/cancels not simulatable; only `coerce`/`agent` … `returns { … }` inject output)"),
                 }
             }
             TestClause::Given(GivenClause::Signal { .. })
@@ -13020,6 +13021,7 @@ fn execute_scenario(
         max_child_iterations: 8,
         agent_outcomes: scenario_agent_outcomes(&test.clauses),
         coerce_outputs: scenario_coerce_outputs(&test.clauses),
+        agent_results: scenario_agent_results(&test.clauses),
         virtual_now: scenario_virtual_now(&test.clauses),
         work_unit_root: None,
         side_stores: None,
@@ -13153,6 +13155,33 @@ fn scenario_coerce_outputs(clauses: &[TestClause]) -> std::collections::BTreeMap
         }
     }
     outputs
+}
+
+/// Asserted turn results from `stub agent <name> returns { … }` clauses, keyed by
+/// agent name. A subprocess fixture cannot call the terminal tool an agent's
+/// `returns <Class>` contract settles on, so this supplies what that call would
+/// have produced -- letting a scenario drive the rule that reads the result.
+///
+/// Evaluated through the same expression kernel `given` and `stub coerce` use, so
+/// the payload is written the way every other test record is.
+fn scenario_agent_results(clauses: &[TestClause]) -> std::collections::BTreeMap<String, String> {
+    let mut results = std::collections::BTreeMap::new();
+    for clause in clauses {
+        if let TestClause::Stub(stub) = clause {
+            if stub.surface.first().map(String::as_str) == Some("agent")
+                && stub.outcome == "returns"
+            {
+                if let (Some(name), Some(StubPayload::Record(fields))) =
+                    (stub.surface.get(1), stub.payload.as_ref())
+                {
+                    if let Ok(object) = eval_given_record(fields, &format!("stub agent {name}")) {
+                        results.insert(name.clone(), Value::Object(object).to_string());
+                    }
+                }
+            }
+        }
+    }
+    results
 }
 
 /// The virtual evaluation clock set by `given clock at "…"`, or `None` to use
@@ -20143,6 +20172,10 @@ struct WorkerOptions {
     /// `stub coerce <fn> returns { … }` clauses, so a test controls the typed
     /// result a fixture coerce returns instead of the generated placeholder.
     coerce_outputs: std::collections::BTreeMap<String, String>,
+    /// Asserted turn results (keyed by agent name) as JSON, from `stub agent
+    /// <name> returns { … }` clauses -- what the terminal tool would have
+    /// produced for an agent that declares `returns <Class>`.
+    agent_results: std::collections::BTreeMap<String, String>,
     /// Virtual evaluation clock for timer/deadline firing (a timestamp string),
     /// set by `given clock at "…"`. `None` uses the wall clock (`'now'`), so
     /// `dev`/`worker` behavior is unchanged.
@@ -20288,6 +20321,7 @@ impl WorkerOptions {
             max_child_iterations,
             agent_outcomes: std::collections::BTreeMap::new(),
             coerce_outputs: std::collections::BTreeMap::new(),
+            agent_results: std::collections::BTreeMap::new(),
             virtual_now: None,
             work_unit_root: None,
             side_stores: None,
@@ -21753,7 +21787,10 @@ fn run_agent_effect(
             &metadata_json,
         );
     }
-    let harness = fixture_harness(&provider_selection.provider_id, outcome.is_failed());
+    let mut harness = fixture_harness(&provider_selection.provider_id, outcome.is_failed());
+    if let Some(result) = options.agent_results.get(execution.agent) {
+        harness = harness.asserting(result.clone());
+    }
     let metadata_json = agent_provider_selection_metadata_json(&provider_selection);
     kernel.run_agent_turn_with_metadata(execution, &harness, &metadata_json)
 }
@@ -26880,6 +26917,7 @@ fn run_workflow_invoke_effect(
             max_child_iterations: options.max_child_iterations,
             agent_outcomes: options.agent_outcomes.clone(),
             coerce_outputs: options.coerce_outputs.clone(),
+            agent_results: options.agent_results.clone(),
             virtual_now: options.virtual_now.clone(),
             work_unit_root: options.work_unit_root.clone(),
             side_stores: None,
@@ -27402,6 +27440,7 @@ struct SubworkflowProviderContext {
     provider_config_paths: Vec<PathBuf>,
     agent_outcomes: std::collections::BTreeMap<String, FixtureOutcome>,
     coerce_outputs: std::collections::BTreeMap<String, String>,
+    agent_results: std::collections::BTreeMap<String, String>,
     virtual_now: Option<String>,
     side_stores: Option<SideStorePaths>,
 }
@@ -27416,6 +27455,7 @@ impl SubworkflowProviderContext {
             provider_config_paths: options.provider_config_paths.clone(),
             agent_outcomes: options.agent_outcomes.clone(),
             coerce_outputs: options.coerce_outputs.clone(),
+            agent_results: options.agent_results.clone(),
             virtual_now: options.virtual_now.clone(),
             side_stores: options.side_stores.clone(),
         }
@@ -27466,6 +27506,7 @@ fn drive_subworkflow_tool(
             max_child_iterations: iterations,
             agent_outcomes: provider_ctx.agent_outcomes.clone(),
             coerce_outputs: provider_ctx.coerce_outputs.clone(),
+            agent_results: provider_ctx.agent_results.clone(),
             virtual_now: provider_ctx.virtual_now.clone(),
             // Descendants of the brokered turn share the work-unit root's
             // workspace lease (DR-0025), so a nested owned turn re-enters the
@@ -27960,6 +28001,7 @@ fn run(options: &CliOptions) -> ExitCode {
                 max_child_iterations: 8,
                 agent_outcomes: std::collections::BTreeMap::new(),
                 coerce_outputs: std::collections::BTreeMap::new(),
+                agent_results: std::collections::BTreeMap::new(),
                 virtual_now: None,
                 work_unit_root: None,
                 side_stores: None,
@@ -28914,6 +28956,7 @@ fn acceptance_dev_report(
                 max_child_iterations: 8,
                 agent_outcomes: std::collections::BTreeMap::new(),
                 coerce_outputs: std::collections::BTreeMap::new(),
+                agent_results: std::collections::BTreeMap::new(),
                 virtual_now: None,
                 work_unit_root: None,
                 side_stores: None,

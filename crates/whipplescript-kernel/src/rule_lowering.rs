@@ -1309,13 +1309,7 @@ pub fn unwrap_optional_type(ty: &IrType) -> Option<&IrType> {
 }
 
 fn is_media_primitive(primitive: &IrPrimitiveType) -> bool {
-    matches!(
-        primitive,
-        IrPrimitiveType::Image
-            | IrPrimitiveType::Pdf
-            | IrPrimitiveType::Audio
-            | IrPrimitiveType::Video
-    )
+    primitive.is_media()
 }
 
 fn media_input_json(value: &Value, primitive: &IrPrimitiveType) -> Value {
@@ -1325,13 +1319,7 @@ fn media_input_json(value: &Value, primitive: &IrPrimitiveType) -> Value {
         }
     }
     let raw = value.as_str().unwrap_or_default();
-    let default_type = match primitive {
-        IrPrimitiveType::Image => "image/*",
-        IrPrimitiveType::Pdf => "application/pdf",
-        IrPrimitiveType::Audio => "audio/*",
-        IrPrimitiveType::Video => "video/*",
-        _ => "application/octet-stream",
-    };
+    let default_type = primitive.media_mime().unwrap_or("application/octet-stream");
     if let Some(rest) = raw.strip_prefix("data:") {
         if let Some((header, data)) = rest.split_once(',') {
             if let Some(media_type) = header.strip_suffix(";base64") {

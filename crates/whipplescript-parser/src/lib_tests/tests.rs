@@ -24026,7 +24026,7 @@ rule triage
 ",
         );
     assert!(
-        help.contains("`compaction`, `thread`, and `settings`"),
+        help.contains("`thread`, `settings`, and `returns`"),
         "the agent-field list lost its conjunction: {help}"
     );
     assert!(
@@ -25308,4 +25308,260 @@ fn a_source_keyword_is_not_the_kind_strings_last_segment() {
     assert_eq!(IrEffectKind::TrackerRelease.source_keyword(), "release");
     // One kind, several spellings: the canonical one.
     assert_eq!(IrEffectKind::SchemaCoerce.source_keyword(), "coerce");
+}
+/// The four opaque multimodal boundary types (`spec/type-system.md` "Type
+/// Universe") parsed in source and lowered to `IrPrimitiveType`, but
+/// `expr_type_from_type_syntax` mapped them to `ExprType::Unknown` -- which,
+/// as the comment on `ExprType::Secret` says, type-checks everywhere. So
+/// `image > 3` and `image == string` were both ACCEPTED while the identical
+/// construct on a `string` field was refused as `expr.unorderable_types`.
+///
+/// The last probe is the no-over-rejection control: comparing two references
+/// of the SAME kind is the one operation the spec permits ("may compare media
+/// references for identity"), so refusing it would be its own defect.
+#[test]
+fn media_types_do_not_unify_with_values_or_with_each_other() {
+    let program = |guard: &str| {
+        format!(
+            "workflow MediaProbe(shot: Shot) -> string ! string\n\n\
+             class Shot {{\n  \
+               id string\n  \
+               picture image\n  \
+               thumbnail image\n  \
+               clip video\n\
+             }}\n\n\
+             rule pass\n  \
+               when Shot as shot\n  \
+               where {guard}\n\
+             => {{\n  \
+               complete result shot.id\n\
+             }}\n"
+        )
+    };
+    let error_codes = |guard: &str| {
+        compile_program(&program(guard))
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.severity == Severity::Error)
+            .map(|diagnostic| diagnostic.code.as_str().to_owned())
+            .collect::<Vec<_>>()
+    };
+
+    assert_eq!(
+        error_codes("shot.picture > 3"),
+        vec!["expr.unorderable_types"],
+        "a media reference has no ordering"
+    );
+    assert_eq!(
+        error_codes("shot.picture == shot.id"),
+        vec!["expr.incomparable_types"],
+        "a media reference is not a string"
+    );
+    assert_eq!(
+        error_codes("shot.picture == shot.clip"),
+        vec!["expr.incomparable_types"],
+        "the kind is carried, so image and video do not unify"
+    );
+    assert_eq!(
+        error_codes("shot.picture == shot.thumbnail"),
+        Vec::<String>::new(),
+        "two references of the same kind still compare for identity"
+    );
+}
+
+/// `agent … { returns <Class> }` (spec/agent-harness.md's unbuilt
+/// `structured_result_json`): the declared shape of a turn's result. The class
+/// is resolved against the program's declarations, so the compiler refuses a
+/// name nothing declares rather than discovering it at the provider.
+///
+/// The enum arm exists because the terminal tool's input is an OBJECT of the
+/// class's fields; an enum is a bare tag with no shape to offer, and saying so
+/// beats "undeclared class" for a name that is plainly declared.
+#[test]
+fn returns_resolves_against_the_declared_classes() {
+    let program = |agent_body: &str| {
+        format!(
+            "use std.agent\n\n\
+             workflow W\n\n\
+             output result Outcome\n\n\
+             class Outcome {{\n  note string\n}}\n\n\
+             enum Verdict {{\n  Keep\n  Drop\n}}\n\n\
+             agent worker {{\n{agent_body}}}\n\n\
+             rule r\n  when Outcome as outcome\n=> {{\n  \
+               complete result {{ note outcome.note }}\n\
+             }}\n"
+        )
+    };
+    let error_codes = |agent_body: &str| {
+        compile_program(&program(agent_body))
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.severity == Severity::Error)
+            .map(|diagnostic| diagnostic.code.as_str().to_owned())
+            .collect::<Vec<_>>()
+    };
+
+    assert_eq!(
+        error_codes("  provider fixture\n  returns Outcome\n"),
+        Vec::<String>::new(),
+        "a declared class is the working case"
+    );
+    assert_eq!(
+        error_codes("  provider fixture\n  returns Nowhere\n"),
+        vec!["type.unknown_schema"],
+        "a name nothing declares is refused here, not at the provider"
+    );
+    assert_eq!(
+        error_codes("  provider fixture\n  returns Verdict\n"),
+        vec!["type.unknown_schema"],
+        "an enum has no fields for a terminal tool to take"
+    );
+    assert_eq!(
+        error_codes("  provider fixture\n  returns Outcome\n  returns Outcome\n"),
+        vec!["construct.duplicate_field"],
+        "one result shape per agent"
+    );
+    // DR-0034 Decision 3: each harness class admits only its own knobs, and the
+    // other rejects them rather than silently ignoring them. A delegated harness
+    // settles its own turn, so there is no terminal tool of ours to offer it.
+    assert_eq!(
+        error_codes("  provider codex\n  returns Outcome\n"),
+        vec!["construct.incompatible_clause"],
+        "`returns` is a managed-harness knob"
+    );
+}
+
+/// `returns` reaches the `.ir` snapshot, so it is part of the compiled identity
+/// `ir_hash` folds in -- a program whose declared result shape changes is not
+/// the same program. It appends only when set, so no existing agent's snapshot
+/// moves (the same discipline `requires`/`compaction`/`thread` follow).
+#[test]
+fn returns_appends_to_the_ir_agent_line_only_when_declared() {
+    let program = |returns: &str| {
+        format!(
+            "use std.agent\n\nworkflow W\n\noutput result Outcome\n\n\
+             class Outcome {{\n  note string\n}}\n\n\
+             agent worker {{\n  provider fixture\n{returns}}}\n\n\
+             rule r\n  when Outcome as outcome\n=> {{\n  \
+               complete result {{ note outcome.note }}\n\
+             }}\n"
+        )
+    };
+    let snapshot = |returns: &str| {
+        compile_program(&program(returns))
+            .ir
+            .expect("program compiles")
+            .to_snapshot()
+            .lines()
+            .find(|line| line.trim_start().starts_with("agent worker"))
+            .expect("the agent reaches the snapshot")
+            .to_owned()
+    };
+
+    assert!(
+        !snapshot("").contains("returns="),
+        "an agent without `returns` keeps an unchanged .ir line: {:?}",
+        snapshot("")
+    );
+    assert!(
+        snapshot("  returns Outcome\n").ends_with(" returns=Outcome"),
+        "a declared result shape reaches the snapshot: {:?}",
+        snapshot("  returns Outcome\n")
+    );
+}
+
+/// A turn's completed payload is the result it ASSERTED, so `after t succeeds
+/// as r` types `r` against the agent's declared class -- the step that makes a
+/// result contract worth having, because until now a rule could only squint at
+/// `summary`.
+///
+/// The two negative probes are the point; the two positives are the
+/// no-over-rejection controls, and the uncontracted probe pins the degradation
+/// that keeps every existing program compiling: with no `returns`, the binding
+/// still projects the whole envelope and `r.summary` still reads.
+#[test]
+fn a_declared_result_types_the_binding_an_after_succeeds_gives_it() {
+    let program = |agent: &str, field: &str| {
+        format!(
+            "workflow W\n\n\
+             output result Done\n\n\
+             class Done {{\n  note string\n}}\n\n\
+             class ReviewResult {{\n  verdict string\n  findings int\n}}\n\n\
+             agent reviewer {{\n  provider fixture\n  returns ReviewResult\n}}\n\n\
+             agent plain {{\n  provider fixture\n}}\n\n\
+             rule go\n  when started\n=> {{\n  \
+               tell {agent} as reply \"\"\"\n  Do it.\n  \"\"\"\n\n  \
+               after reply succeeds as r {{\n    complete result {{ note {field} }}\n  }}\n\n  \
+               after reply fails {{\n    complete result {{ note \"no\" }}\n  }}\n}}\n"
+        )
+    };
+    let error_codes = |agent: &str, field: &str| {
+        compile_program(&program(agent, field))
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.severity == Severity::Error)
+            .map(|diagnostic| diagnostic.code.as_str().to_owned())
+            .collect::<Vec<_>>()
+    };
+
+    assert_eq!(
+        error_codes("reviewer", "r.verdict"),
+        Vec::<String>::new(),
+        "a declared field of the result class reads"
+    );
+    assert_eq!(
+        error_codes("reviewer", "r.nope"),
+        vec!["type.unknown_field"],
+        "a field the result class does not declare is refused"
+    );
+    assert_eq!(
+        error_codes("reviewer", "r.summary"),
+        vec!["type.unknown_field"],
+        "the binding is the RESULT, not the envelope: `summary` reaches a rule \
+         through `after reply completes as o` instead"
+    );
+    assert_eq!(
+        error_codes("plain", "r.summary"),
+        Vec::<String>::new(),
+        "an agent with no `returns` keeps the open envelope shape, so every \
+         program written before result contracts still compiles"
+    );
+}
+
+/// `collect_body_statements` consumed any line containing `\"\"\"` as string
+/// scaffolding BEFORE offering it to `statement_balance`, so a statement head
+/// that opens a multi-line prompt -- `tell w as r \"\"\"`, the ordinary way to
+/// write one -- reached no collector at all. The single-line form worked and
+/// the multi-line form silently did not, which is the worse half to lose.
+#[test]
+fn a_statement_head_that_opens_a_prompt_still_reaches_the_collector() {
+    let program = |prompt: &str| {
+        format!(
+            "workflow W\n\n\
+             output result Done\n\n\
+             class Done {{\n  note string\n}}\n\n\
+             class ReviewResult {{\n  verdict string\n  findings int\n}}\n\n\
+             agent reviewer {{\n  provider fixture\n  returns ReviewResult\n}}\n\n\
+             rule go\n  when started\n=> {{\n  \
+               tell reviewer as reply {prompt}\n\n  \
+               after reply succeeds as r {{\n    complete result {{ note r.nope }}\n  }}\n\n  \
+               after reply fails {{\n    complete result {{ note \"no\" }}\n  }}\n}}\n"
+        )
+    };
+    for (label, prompt) in [
+        ("single-line", "\"Do it.\""),
+        ("multi-line", "\"\"\"\n  Do it.\n  \"\"\""),
+    ] {
+        let codes = compile_program(&program(prompt))
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.severity == Severity::Error)
+            .map(|diagnostic| diagnostic.code.as_str().to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            codes,
+            vec!["type.unknown_field"],
+            "{label}: the head is collected whether or not it opens a prompt"
+        );
+    }
 }

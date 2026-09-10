@@ -456,6 +456,7 @@ fn queued_invoke_child(
         max_child_iterations: 0,
         agent_outcomes: BTreeMap::new(),
         coerce_outputs: BTreeMap::new(),
+        agent_results: BTreeMap::new(),
         virtual_now: None,
         work_unit_root: None,
         side_stores: None,

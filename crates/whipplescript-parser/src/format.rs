@@ -739,6 +739,9 @@ fn format_agent(agent: AgentDecl, formatted: &mut String) {
             AgentField::Settings(sources) => {
                 push_line(formatted, format!("  settings {}", sources.name));
             }
+            AgentField::Returns(class) => {
+                push_line(formatted, format!("  returns {}", class.name));
+            }
             AgentField::Unknown { name, .. } => {
                 push_line(formatted, format!("  {}", name.name));
             }

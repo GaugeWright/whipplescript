@@ -91,6 +91,16 @@ pub trait ToolExecutor {
     fn take_workspace_reads(&self) -> Vec<crate::whip_shell::ShellRead> {
         Vec::new()
     }
+
+    /// Install the turn's result contract, for an agent that declares `returns
+    /// <Class>`. Defaulted for the same reason as the two above: an executor
+    /// that never offers the terminal tool has no contract to hold.
+    ///
+    /// It takes `&self` because a host may build ONE executor for an instance
+    /// and run several agents' turns through it, and the contract belongs to
+    /// the TURN, not to the executor. A host that builds an executor per turn
+    /// (the native CLI) sets the contract at construction and never calls this.
+    fn install_result_contract(&self, _contract: Option<crate::result_contract::ResultContract>) {}
 }
 
 /// One inline image attached to a user message (pi-conformance §6, v1 scope:
@@ -390,6 +400,10 @@ pub struct BrokeredTurnOutcome {
     /// no main reply reported it (an error before the first reply, or a settle
     /// straight after a compaction reset).
     pub last_input_tokens: u64,
+    /// The result the turn asserted, as the terminal tool's validated arguments.
+    /// `Some` only on a `Completed` turn of an agent that declares `returns`;
+    /// every other turn settles with the free-text `summary` alone.
+    pub structured_result_json: Option<String>,
 }
 
 /// Project a finished [`BrokeredTurnOutcome`] onto the [`ProviderRunResult`] the
@@ -445,6 +459,7 @@ pub fn provider_result_from_brokered_turn(outcome: &BrokeredTurnOutcome) -> Prov
         usage_json: usage_with_context(&outcome.usage, outcome.last_input_tokens).to_string(),
         artifacts: Vec::new(),
         failure,
+        structured_result_json: outcome.structured_result_json.clone(),
     }
 }
 
@@ -484,6 +499,16 @@ pub struct BrokeredTurnInput {
     /// start only), like `context_bundles`. Provenance only — the discover-all
     /// catalogue is unchanged. Empty for turns with no pin.
     pub pinned_skills: Vec<String>,
+    /// The tool whose SUCCEEDING call settles this turn, when the agent declares
+    /// `returns <Class>`. It is an ordinary entry in `tools`, so the loop needs
+    /// only its name: the host builds its input schema from the class and its
+    /// executor validates the arguments, which keeps this driver schema-free.
+    ///
+    /// `None` (the default) is the historical shape: the turn completes when the
+    /// model stops requesting tools. With a contract that is no longer a
+    /// completion, because completing MEANS asserting a result of the declared
+    /// shape -- so a final reply without the call is nudged rather than settled.
+    pub result_tool: Option<String>,
 }
 
 /// The governed-workspace files one tool call read, drained from the executor
@@ -516,6 +541,30 @@ fn execute_offered_tool<E: ToolExecutor + ?Sized>(
         };
     }
     executor.execute(call)
+}
+
+/// Whether this call is the turn's declared result, successfully asserted.
+///
+/// The terminal tool is an ordinary offered tool, so the executor runs it like
+/// any other: it validates the arguments against the declared class and returns
+/// [`ToolStatus::Error`] with the validation failures when they do not match. A
+/// failing call is therefore informative to the model and it retries -- the
+/// loop's ordinary anti-idempotence -- and only a SUCCEEDING call settles.
+fn settles_turn(input: &BrokeredTurnInput, call: &ToolCall, outcome: &ToolOutcome) -> bool {
+    input.result_tool.as_deref() == Some(call.name.as_str())
+        && matches!(outcome.status, ToolStatus::Ok)
+}
+
+/// What a model is told when it stops requesting tools without asserting the
+/// result its agent declares. Under a contract, "the model stopped talking" is
+/// not a completion, so this is appended and the loop continues; an agent that
+/// never complies runs out its step bound, which is an EXISTING terminal
+/// (`TimedOut`) rather than a new one.
+fn missing_result_nudge(tool: &str) -> String {
+    format!(
+        "This turn has not produced its result yet. Call the `{tool}` tool with the \
+         result of your work; the turn is not finished until you do."
+    )
 }
 
 /// Drive a brokered tool-use loop to a single terminal.
@@ -604,6 +653,7 @@ where
                     observations,
                     usage,
                     last_input_tokens,
+                    structured_result_json: None,
                 };
             }
         };
@@ -617,7 +667,20 @@ where
                 text: reply.text.clone(),
                 tool_calls: Vec::new(),
             });
+            // Checkpointed here, BEFORE any nudge, because the stepped machine
+            // persists the final assistant reply on its own (a `thread continue`
+            // follow-up seeds from it). The two loops are proven checkpoint-for-
+            // checkpoint identical, so the nudge is a second checkpoint in both.
             checkpoint(&messages);
+            if let Some(tool) = input.result_tool.as_deref() {
+                messages.push(ChatMessage::User {
+                    text: missing_result_nudge(tool),
+                    images: Vec::new(),
+                });
+                checkpoint(&messages);
+                step += 1;
+                continue;
+            }
             return BrokeredTurnOutcome {
                 status: TurnStatus::Completed,
                 summary: reply.text,
@@ -625,6 +688,7 @@ where
                 observations,
                 usage,
                 last_input_tokens,
+                structured_result_json: None,
             };
         }
 
@@ -635,6 +699,7 @@ where
             tool_calls: reply.tool_calls.clone(),
         });
         let mut results = Vec::with_capacity(reply.tool_calls.len());
+        let mut asserted_result: Option<String> = None;
         for call in &reply.tool_calls {
             observations.push(LoopObservation::ToolRequested {
                 call_id: call.id.clone(),
@@ -644,6 +709,9 @@ where
                 observations.push(observation);
             }
             let outcome = execute_offered_tool(executor, &input.tools, call);
+            if asserted_result.is_none() && settles_turn(input, call, &outcome) {
+                asserted_result = Some(outcome.content.clone());
+            }
             observations.push(LoopObservation::ToolResult {
                 call_id: call.id.clone(),
                 name: call.name.clone(),
@@ -677,6 +745,19 @@ where
         // Persist the transcript after the step so a crash mid-turn leaves a
         // projection to resume from (DR-0024 resume-from-projection).
         checkpoint(&messages);
+        // Settled AFTER the checkpoint, so the transcript a resume would read
+        // already contains the call that ended the turn.
+        if let Some(result) = asserted_result {
+            return BrokeredTurnOutcome {
+                status: TurnStatus::Completed,
+                summary: reply.text.clone(),
+                steps: step + 1,
+                observations,
+                usage,
+                last_input_tokens,
+                structured_result_json: Some(result),
+            };
+        }
         step += 1;
     }
 
@@ -687,6 +768,7 @@ where
         observations,
         usage,
         last_input_tokens,
+        structured_result_json: None,
     }
 }
 
@@ -1002,6 +1084,7 @@ where
                     observations: std::mem::take(&mut self.observations),
                     usage: std::mem::take(&mut self.usage),
                     last_input_tokens: self.last_input_tokens,
+                    structured_result_json: None,
                 });
             }
         };
@@ -1083,6 +1166,7 @@ where
                 observations: std::mem::take(&mut self.observations),
                 usage: std::mem::take(&mut self.usage),
                 last_input_tokens: self.last_input_tokens,
+                structured_result_json: None,
             });
         }
         if let Err(error) = self.project_current_world() {
@@ -1093,6 +1177,7 @@ where
                 observations: std::mem::take(&mut self.observations),
                 usage: std::mem::take(&mut self.usage),
                 last_input_tokens: self.last_input_tokens,
+                structured_result_json: None,
             });
         }
         // Pi-style steering joins the current run after the preceding
@@ -1106,6 +1191,7 @@ where
                 observations: std::mem::take(&mut self.observations),
                 usage: std::mem::take(&mut self.usage),
                 last_input_tokens: self.last_input_tokens,
+                structured_result_json: None,
             });
         }
         self.awaiting = Awaiting::Main;
@@ -1128,6 +1214,7 @@ where
             observations: std::mem::take(&mut self.observations),
             usage: std::mem::take(&mut self.usage),
             last_input_tokens: self.last_input_tokens,
+            structured_result_json: None,
         }
     }
 }
@@ -1199,6 +1286,7 @@ where
                                 observations: std::mem::take(&mut self.observations),
                                 usage: std::mem::take(&mut self.usage),
                                 last_input_tokens: self.last_input_tokens,
+                                structured_result_json: None,
                             });
                         };
                         self.model.build_request(&compaction.request_messages, &[])
@@ -1286,6 +1374,7 @@ where
                     observations: std::mem::take(&mut self.observations),
                     usage: std::mem::take(&mut self.usage),
                     last_input_tokens: self.last_input_tokens,
+                    structured_result_json: None,
                 });
             }
         };
@@ -1317,6 +1406,7 @@ where
                 observations: std::mem::take(&mut self.observations),
                 usage: std::mem::take(&mut self.usage),
                 last_input_tokens: self.last_input_tokens,
+                structured_result_json: None,
             });
         }
 
@@ -1349,10 +1439,23 @@ where
                         observations: std::mem::take(&mut self.observations),
                         usage: std::mem::take(&mut self.usage),
                         last_input_tokens: self.last_input_tokens,
+                        structured_result_json: None,
                     });
                 }
             };
             if continued {
+                return self.decide_next_call();
+            }
+            // A declared result is not optional: settling without asserting one
+            // is a turn that did not do what it was asked. Say so and let the
+            // model try again -- an agent that never complies runs out its step
+            // bound, which is an existing terminal, not a new one.
+            if let Some(tool) = self.input.result_tool.as_deref() {
+                self.messages.push(ChatMessage::User {
+                    text: missing_result_nudge(tool),
+                    images: Vec::new(),
+                });
+                (self.checkpoint)(&self.messages);
                 return self.decide_next_call();
             }
             return Outcome::Settle(BrokeredTurnOutcome {
@@ -1362,6 +1465,7 @@ where
                 observations: std::mem::take(&mut self.observations),
                 usage: std::mem::take(&mut self.usage),
                 last_input_tokens: self.last_input_tokens,
+                structured_result_json: None,
             });
         }
 
@@ -1373,6 +1477,7 @@ where
             tool_calls: reply.tool_calls.clone(),
         });
         let mut results = Vec::with_capacity(reply.tool_calls.len());
+        let mut asserted_result: Option<String> = None;
         for call in &reply.tool_calls {
             self.observations.push(LoopObservation::ToolRequested {
                 call_id: call.id.clone(),
@@ -1382,6 +1487,9 @@ where
                 self.observations.push(observation);
             }
             let outcome = execute_offered_tool(self.executor, &self.input.tools, call);
+            if asserted_result.is_none() && settles_turn(self.input, call, &outcome) {
+                asserted_result = Some(outcome.content.clone());
+            }
             self.observations.push(LoopObservation::ToolResult {
                 call_id: call.id.clone(),
                 name: call.name.clone(),
@@ -1414,6 +1522,20 @@ where
         }
         self.messages.push(ChatMessage::ToolResults(results));
         (self.checkpoint)(&self.messages);
+        // Settled AFTER the checkpoint, so the transcript a resume would read
+        // already contains the call that ended the turn (mirrors the reference
+        // loop byte-for-byte; they are proven equivalent in tests).
+        if let Some(result) = asserted_result {
+            return Outcome::Settle(BrokeredTurnOutcome {
+                status: TurnStatus::Completed,
+                summary: reply.text.clone(),
+                steps: self.step + 1,
+                observations: std::mem::take(&mut self.observations),
+                usage: std::mem::take(&mut self.usage),
+                last_input_tokens: self.last_input_tokens,
+                structured_result_json: Some(result),
+            });
+        }
         self.step += 1;
         self.decide_next_call()
     }
@@ -2408,7 +2530,23 @@ mod tests {
             world: None,
             context_bundles: Vec::new(),
             pinned_skills: Vec::new(),
+            result_tool: None,
         }
+    }
+
+    /// `input`, plus the terminal tool an agent that declares `returns` is
+    /// offered. The kernel loop validates nothing about the payload -- the
+    /// executor that runs the tool does -- so a test drives the two answers
+    /// (`Ok`/`Error`) straight through `RecordingExecutor`.
+    fn contract_input(max_steps: usize) -> BrokeredTurnInput {
+        let mut input = input(max_steps);
+        input.tools.push(ToolSpec {
+            name: "submit_result".to_string(),
+            description: "submit the result".to_string(),
+            input_schema: json!({ "type": "object" }),
+        });
+        input.result_tool = Some("submit_result".to_string());
+        input
     }
 
     #[test]
@@ -2808,6 +2946,13 @@ mod tests {
         build_replies: impl Fn() -> Vec<Result<ModelReply, HarnessModelError>>,
         max_steps: usize,
     ) {
+        assert_loops_equivalent_with(build_replies, || input(max_steps));
+    }
+
+    fn assert_loops_equivalent_with(
+        build_replies: impl Fn() -> Vec<Result<ModelReply, HarnessModelError>>,
+        build_input: impl Fn() -> BrokeredTurnInput,
+    ) {
         let tool_outcome = ToolOutcome {
             status: ToolStatus::Ok,
             content: "R".to_string(),
@@ -2818,7 +2963,7 @@ mod tests {
         let mut cp1: Vec<Value> = Vec::new();
         let out1 = {
             let mut record = |messages: &[ChatMessage]| cp1.push(chat_messages_to_json(messages));
-            run_brokered_loop(&client, &exec1, &input(max_steps), &mut record)
+            run_brokered_loop(&client, &exec1, &build_input(), &mut record)
         };
 
         let http = ScriptedHttpClient::new(build_replies());
@@ -2829,7 +2974,7 @@ mod tests {
             run_brokered_turn_http(
                 &http,
                 &exec2,
-                &input(max_steps),
+                &build_input(),
                 &mut record,
                 &DummyHost,
                 &NoopCompactor,
@@ -2847,8 +2992,106 @@ mod tests {
             out1.last_input_tokens, out2.last_input_tokens,
             "context reading"
         );
+        assert_eq!(
+            out1.structured_result_json, out2.structured_result_json,
+            "asserted result"
+        );
         assert_eq!(*exec1.calls.borrow(), *exec2.calls.borrow(), "tool calls");
         assert_eq!(cp1, cp2, "checkpoint sequence");
+    }
+
+    /// `agent … { returns <Class> }` makes completing mean ASSERTING a result.
+    /// The terminal tool is an ordinary offered tool, so the executor decides
+    /// whether the payload was acceptable and the loop settles only on its
+    /// success -- which is why all three of these run the same reply script and
+    /// differ only in what the executor answered.
+    #[test]
+    fn a_declared_result_settles_the_turn_only_when_it_is_asserted() {
+        let settle = |outcome: ToolOutcome, replies: Vec<Result<ModelReply, HarnessModelError>>| {
+            let client = ScriptedClient::new(replies);
+            let executor = RecordingExecutor::new(outcome);
+            let mut record = |_: &[ChatMessage]| {};
+            run_brokered_loop(&client, &executor, &contract_input(1), &mut record)
+        };
+
+        let asserted = settle(
+            ToolOutcome {
+                status: ToolStatus::Ok,
+                content: r#"{"note":"done"}"#.to_owned(),
+            },
+            vec![Ok(tool_reply("call-1", "submit_result"))],
+        );
+        assert_eq!(asserted.status, TurnStatus::Completed);
+        assert_eq!(
+            asserted.structured_result_json.as_deref(),
+            Some(r#"{"note":"done"}"#),
+            "the validated arguments ARE the result"
+        );
+
+        // A payload the executor rejected is a tool error, not a completion: the
+        // model gets to correct it, and the step bound is what ends a turn that
+        // never does.
+        let rejected = settle(
+            ToolOutcome {
+                status: ToolStatus::Error,
+                content: "result does not match `Outcome`: result.note must be string".to_owned(),
+            },
+            vec![Ok(tool_reply("call-1", "submit_result"))],
+        );
+        assert_eq!(rejected.status, TurnStatus::TimedOut);
+        assert_eq!(rejected.structured_result_json, None);
+
+        // And a model that simply stops talking has not produced a result. Under
+        // a contract that is not a completion -- it is nudged and retried.
+        let silent = settle(
+            ToolOutcome {
+                status: ToolStatus::Ok,
+                content: "unused".to_owned(),
+            },
+            vec![Ok(final_reply("I think that is everything"))],
+        );
+        assert_eq!(
+            silent.status,
+            TurnStatus::TimedOut,
+            "a final reply is not an asserted result"
+        );
+        assert_eq!(silent.structured_result_json, None);
+    }
+
+    /// Without a contract the turn is exactly what it always was: the model
+    /// stopping IS the completion, and nothing is asserted. The control that
+    /// keeps the two behaviours from being confused.
+    #[test]
+    fn a_turn_without_a_declared_result_still_completes_on_a_final_reply() {
+        let client = ScriptedClient::new(vec![Ok(final_reply("done"))]);
+        let executor = RecordingExecutor::new(ToolOutcome {
+            status: ToolStatus::Ok,
+            content: "unused".to_owned(),
+        });
+        let mut record = |_: &[ChatMessage]| {};
+        let outcome = run_brokered_loop(&client, &executor, &input(4), &mut record);
+        assert_eq!(outcome.status, TurnStatus::Completed);
+        assert_eq!(outcome.summary, "done");
+        assert_eq!(outcome.structured_result_json, None);
+    }
+
+    /// The stepped machine is the thing production drives, so the settle path a
+    /// contract introduces has to be the reference loop's byte-for-byte too --
+    /// including the nudge round, which changes the checkpoint sequence.
+    #[test]
+    fn brokered_turn_machine_matches_loop_asserting_a_result() {
+        assert_loops_equivalent_with(
+            || vec![Ok(tool_reply("call-1", "submit_result"))],
+            || contract_input(4),
+        );
+    }
+
+    #[test]
+    fn brokered_turn_machine_matches_loop_nudging_an_unasserted_result() {
+        assert_loops_equivalent_with(
+            || vec![Ok(final_reply("all done")), Ok(final_reply("really done"))],
+            || contract_input(2),
+        );
     }
 
     #[test]

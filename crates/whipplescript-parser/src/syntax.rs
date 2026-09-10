@@ -25,6 +25,7 @@ pub(crate) const AGENT_BLOCK_FIELDS: &[&str] = &[
     "compaction",
     "thread",
     "settings",
+    "returns",
 ];
 
 /// Every top-level declaration head the parser dispatches by hand, so a
@@ -2221,6 +2222,13 @@ impl Parser<'_> {
                 "settings" => {
                     if let Some(sources) = self.expect_ident("settings source") {
                         fields.push(AgentField::Settings(sources));
+                    } else {
+                        self.synchronize_to_block_item();
+                    }
+                }
+                "returns" => {
+                    if let Some(class) = self.expect_ident("result class name") {
+                        fields.push(AgentField::Returns(class));
                     } else {
                         self.synchronize_to_block_item();
                     }

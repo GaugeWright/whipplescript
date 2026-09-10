@@ -62,6 +62,11 @@ pub const TOOL_LS: &str = "ls";
 pub const TOOL_BASH: &str = "bash";
 pub const TOOL_RECALL: &str = "recall";
 pub const TOOL_CHANGES: &str = "changes";
+/// The terminal tool an agent that declares `returns <Class>` is offered. Its
+/// input schema IS the class, so the turn settles on the model asserting a
+/// result of the declared shape rather than on it merely stopping.
+use whipplescript_kernel::result_contract::{ResultContract, TOOL_SUBMIT_RESULT};
+
 pub const TOOL_RAISE: &str = "raise";
 pub const TOOL_LIST_TODOS: &str = "list_todos";
 pub const TOOL_ADD_TODO: &str = "add_todo";
@@ -552,6 +557,11 @@ pub struct FileToolExecutor {
     /// `Some` denies all file tools (no store granted this turn).
     file_policy: Option<Vec<FileStoreScope>>,
     profile_policy: HarnessProfilePolicy,
+    /// `Some` when this turn's agent declares `returns`: the executor validates
+    /// the terminal tool's arguments against that class, so a payload that does
+    /// not match comes back as a tool ERROR the model can correct rather than
+    /// completing the turn with the wrong shape.
+    result_contract: Option<ResultContract>,
     tracker_queue: Option<String>,
     /// The work-item store backing the tracker tools. `None` = the ambient
     /// workspace store (`crate::items_store_path()`, i.e. the env-discovered
@@ -1208,6 +1218,7 @@ impl FileToolExecutor {
     /// (DR-0039), gated by the harness profile + `command { run }` grant.
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Self {
+            result_contract: None,
             workspace_reads: std::sync::Mutex::new(Vec::new()),
             root: root.into(),
             protected_write_paths: Vec::new(),
@@ -1490,6 +1501,23 @@ impl FileToolExecutor {
         self
     }
 
+    pub fn with_result_contract(mut self, contract: Option<ResultContract>) -> Self {
+        self.result_contract = contract;
+        self
+    }
+
+    /// Validate the asserted result against the declared class and echo it back
+    /// canonically. `Err` is not a turn failure: it becomes a tool error, and
+    /// the model gets another round to produce the shape it was asked for. The
+    /// rule itself lives in the kernel, so the durable object applies the same
+    /// one.
+    fn submit_result(&self, args: &serde_json::Value) -> Result<String, String> {
+        self.result_contract
+            .as_ref()
+            .ok_or_else(|| "this turn declares no result contract".to_owned())?
+            .validate(args)
+    }
+
     fn policy(&self, path: &str, op: &str) -> Option<String> {
         if op == "write"
             && self.protected_write_paths.iter().any(|protected| {
@@ -1610,6 +1638,9 @@ impl FileToolExecutor {
             TOOL_RECALL => self.recall(args),
             TOOL_CHANGES => self.changes(args),
             TOOL_RAISE => self.raise(args),
+            // Guarded, so a turn with no contract has no such tool and the name
+            // stays ordinary.
+            TOOL_SUBMIT_RESULT if self.result_contract.is_some() => self.submit_result(args),
             other => {
                 // MCP tools are always namespaced `mcp__<server>__<tool>`, so they
                 // can never collide with a native governed tool of the same
@@ -5014,10 +5045,31 @@ pub fn run_owned_agent_turn(
     {
         profile_policy = profile_policy.intersect(&required_policy);
     }
+    // The turn's declared result contract (`agent … { returns <Class> }`). The
+    // compiler has already refused a name that is not a declared class, so a
+    // resolved `returns` is one the schema lookup below can always satisfy.
+    let result_contract = program_path
+        .and_then(|path| path.to_str())
+        .and_then(|path| crate::compile_source_path_with_root(path, root).ok())
+        .and_then(|(_, ir)| {
+            let class = ir
+                .agents
+                .iter()
+                .find(|declared| declared.name == agent)
+                .and_then(|declared| declared.returns.clone())?;
+            Some(ResultContract { class, ir })
+        });
     let mut executor = FileToolExecutor::new(&workspace)
         .with_turn_tool_access(turn_tool_access.clone())
-        .with_resolved_profile_policy(profile_policy.clone());
+        .with_resolved_profile_policy(profile_policy.clone())
+        .with_result_contract(result_contract.clone());
     let mut tools = file_tool_specs_for_turn(&profile_policy, &turn_tool_access);
+    // The terminal tool is offered like any other, so the loop needs only its
+    // name and the provider enforces its schema on the way in. It is added
+    // BEFORE the granted workflow tools so a program cannot shadow it.
+    if let Some(contract) = result_contract.as_ref() {
+        tools.push(contract.tool_spec());
+    }
     // Web tools (accepted 2026-07-07 design notes): granted-only egress doors.
     tools.extend(web_tool_specs_for_turn(&turn_tool_access));
     tools.extend(credential_tool_specs_for_turn(&turn_tool_access));
@@ -5216,6 +5268,9 @@ pub fn run_owned_agent_turn(
         user: input_json.to_string(),
         tools,
         max_steps,
+        result_tool: result_contract
+            .as_ref()
+            .map(|_| TOOL_SUBMIT_RESULT.to_owned()),
         // The runner populates resume_from from any persisted transcript on
         // crash recovery (slice 6); a fresh turn starts empty.
         resume_from: Vec::new(),
@@ -9076,6 +9131,65 @@ mod tests {
         ));
         assert_eq!(r.status, ToolStatus::Error);
         assert!(r.content.contains("command not found"));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// `submit_result` is what makes a declared `returns` mean anything: the
+    /// turn settles on this call SUCCEEDING, so a payload that does not match
+    /// the class must come back as a tool error and buy the model another
+    /// round -- never settle the turn on a shape nobody asked for.
+    ///
+    /// The accepting probe is the no-over-rejection control, and the
+    /// contract-less probe covers the arm that fires when a turn declares no
+    /// result at all.
+    #[test]
+    fn submit_result_refuses_a_payload_that_is_not_the_declared_class() {
+        let source = "workflow W\n\n\
+             output result Done\n\n\
+             class Done {\n  ok int\n}\n\n\
+             class ReviewResult {\n  verdict string\n  findings int\n}\n\n\
+             rule go\n  when started\n=> {\n  complete result { ok 1 }\n}\n";
+        let ir = whipplescript_parser::compile_program(source)
+            .ir
+            .expect("the contract program compiles");
+        let root = temp_root();
+        let executor = FileToolExecutor::new(&root).with_result_contract(Some(ResultContract {
+            class: "ReviewResult".to_owned(),
+            ir,
+        }));
+
+        let wrong_type = executor
+            .submit_result(&json!({ "verdict": "keep", "findings": "many" }))
+            .expect_err("`findings` is an int, and `\"many\"` is not one");
+        assert!(
+            wrong_type.contains("the result does not match `ReviewResult`"),
+            "the error names the class the turn declared: {wrong_type}"
+        );
+
+        let missing_field = executor
+            .submit_result(&json!({ "verdict": "keep" }))
+            .expect_err("a declared field is absent");
+        assert!(
+            missing_field.contains("the result does not match `ReviewResult`"),
+            "an absent field is as unacceptable as a mistyped one: {missing_field}"
+        );
+
+        let accepted = executor
+            .submit_result(&json!({ "verdict": "keep", "findings": 2 }))
+            .expect("the declared shape is accepted");
+        assert!(
+            accepted.contains("keep"),
+            "the asserted result is returned canonically: {accepted}"
+        );
+
+        let uncontracted = FileToolExecutor::new(&root)
+            .submit_result(&json!({ "verdict": "keep", "findings": 2 }))
+            .expect_err("a turn with no `returns` has nothing to submit against");
+        assert!(
+            uncontracted.contains("declares no result contract"),
+            "{uncontracted}"
+        );
+
         std::fs::remove_dir_all(&root).ok();
     }
 }

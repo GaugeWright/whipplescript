@@ -15,4 +15,4 @@ error[construct.unknown_clause]: unknown agent field `mystery` on agent `worker`
   |
 7 |   mystery "field"
   |   ^^^^^^^
-  = help: supported agent fields are `provider`, `profile`, `capacity`, `skills`, `capabilities`, `requires`, `tools`, `compaction`, `thread`, and `settings`
+  = help: supported agent fields are `provider`, `profile`, `capacity`, `skills`, `capabilities`, `requires`, `tools`, `compaction`, `thread`, `settings`, and `returns`

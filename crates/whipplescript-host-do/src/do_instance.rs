@@ -1006,6 +1006,7 @@ impl<Sql: DoSql + Clone> InstanceDriver for DoInstanceDriver<'_, Sql> {
                                     _ => TurnStatus::Failed,
                                 };
                                 BrokeredTurnOutcome {
+                                    structured_result_json: None,
                                     status,
                                     summary: outcome
                                         .get("summary")
@@ -1048,6 +1049,7 @@ impl<Sql: DoSql + Clone> InstanceDriver for DoInstanceDriver<'_, Sql> {
                                 observations: Vec::new(),
                                 usage: serde_json::json!({}),
                                 last_input_tokens: 0,
+                                structured_result_json: None,
                             },
                             Err(transport) => BrokeredTurnOutcome {
                                 status: TurnStatus::Failed,
@@ -1056,6 +1058,7 @@ impl<Sql: DoSql + Clone> InstanceDriver for DoInstanceDriver<'_, Sql> {
                                 observations: Vec::new(),
                                 usage: serde_json::json!({}),
                                 last_input_tokens: 0,
+                                structured_result_json: None,
                             },
                         };
                         let result = provider_result_from_brokered_turn(&outcome);
@@ -1171,7 +1174,7 @@ impl<Sql: DoSql + Clone> InstanceDriver for DoInstanceDriver<'_, Sql> {
                         ));
                     }
                 }
-                let tools = self
+                let mut tools = self
                     .agent_tool_specs
                     .map(<[_]>::to_vec)
                     .unwrap_or_else(crate::do_tools::do_tool_specs);
@@ -1210,6 +1213,32 @@ impl<Sql: DoSql + Clone> InstanceDriver for DoInstanceDriver<'_, Sql> {
                     &topology,
                 )
                 .map_err(StoreError::Conflict)?;
+                // `returns <Class>`: the terminal tool is offered like any other
+                // and the executor validates it against the class, so this host
+                // settles the turn on the same assertion the native one does.
+                // Installed on the executor rather than built into it because
+                // one executor serves an instance's turns and the contract
+                // belongs to this one.
+                let result_contract = self
+                    .ir
+                    .agents
+                    .iter()
+                    .find(|declared| declared.name == agent)
+                    .and_then(|declared| declared.returns.as_deref())
+                    .map(|class| {
+                        whipplescript_kernel::result_contract::ResultContract::new(
+                            class,
+                            self.ir.clone(),
+                        )
+                    });
+                self.agent_tools
+                    .install_result_contract(result_contract.clone());
+                let result_tool = result_contract.as_ref().map(|contract| {
+                    // Offered BEFORE any program-granted tool, so a program
+                    // cannot shadow the call its own contract settles on.
+                    tools.insert(0, contract.tool_spec());
+                    whipplescript_kernel::result_contract::TOOL_SUBMIT_RESULT.to_owned()
+                });
                 let turn_input = BrokeredTurnInput {
                     system: assembled.system_prompt,
                     user: prompt,
@@ -1221,6 +1250,7 @@ impl<Sql: DoSql + Clone> InstanceDriver for DoInstanceDriver<'_, Sql> {
                     resume_from,
                     user_images,
                     user_media: Vec::new(),
+                    result_tool,
                     world: Some(world),
                     context_bundles: assembled.contributions,
                     pinned_skills: Vec::new(),
@@ -2616,6 +2646,40 @@ mod tests {
     }
 
     /// A fake HTTP agent model: one round, a final reply with no tool calls.
+    /// Asserts a result through the terminal tool on its first round, which is
+    /// how a contracted turn settles.
+    struct SubmitsResultModel;
+    impl HttpModelClient for SubmitsResultModel {
+        fn build_request(
+            &self,
+            _messages: &[ChatMessage],
+            _tools: &[whipplescript_kernel::harness_loop::ToolSpec],
+        ) -> whipplescript_kernel::sansio::HttpRequest {
+            whipplescript_kernel::sansio::HttpRequest {
+                url: "https://provider/agent".to_owned(),
+                headers: Vec::new(),
+                body: serde_json::json!({}),
+            }
+        }
+        fn parse_response(
+            &self,
+            _response: Result<HttpResponse, TransportError>,
+        ) -> Result<
+            whipplescript_kernel::harness_loop::ModelReply,
+            whipplescript_kernel::harness_loop::HarnessModelError,
+        > {
+            Ok(whipplescript_kernel::harness_loop::ModelReply {
+                text: String::new(),
+                tool_calls: vec![whipplescript_kernel::harness_loop::ToolCall {
+                    id: "call-1".to_owned(),
+                    name: whipplescript_kernel::result_contract::TOOL_SUBMIT_RESULT.to_owned(),
+                    arguments: serde_json::json!({ "verdict": "keep", "findings": 2 }),
+                }],
+                usage: serde_json::json!({ "input_tokens": 1, "output_tokens": 1 }),
+            })
+        }
+    }
+
     struct FinalReplyModel;
     impl HttpModelClient for FinalReplyModel {
         fn build_request(
@@ -3120,6 +3184,113 @@ mod tests {
             .find(|run| run.worker_id == "whip-turn-container")
             .expect("class-B run row");
         assert_eq!(run.status, "completed");
+    }
+
+    /// The durable object runs a declared result contract, rather than refusing
+    /// it. It used to fail closed: `DoToolExecutor` offered no terminal tool, so
+    /// a contracted turn would have settled here on "the model stopped talking"
+    /// and natively on an asserted result -- one program meaning two things on
+    /// two hosts.
+    ///
+    /// So the parity IS the test: the same asserted result reaches the same
+    /// `value` on the same fact, through the kernel's one contract.
+    #[test]
+    fn the_durable_object_settles_a_contracted_turn_on_the_asserted_result() {
+        let source = "workflow AgentDemo\n\noutput result Done\n\n\
+             class Done {\n  ok int\n}\n\n\
+             class ReviewResult {\n  verdict string\n  findings int\n}\n\n\
+             agent helper {\n  provider owned\n  profile \"repo-reader\"\n  capacity 1\n  returns ReviewResult\n}\n\n\
+             rule go\n  when started\n=> {\n  tell helper as reply \"\"\"\n  Do the thing.\n  \"\"\"\n\n\
+             \x20 after reply succeeds {\n    complete result { ok 1 }\n  }\n\n\
+             \x20 after reply fails {\n    complete result { ok 0 }\n  }\n}\n";
+        let ir = whipplescript_parser::compile_program(source)
+            .ir
+            .expect("an agent declaring `returns` compiles");
+
+        let store = store();
+        for stmt in [
+            "INSERT INTO capability_schemas (capability, description, schema_json) \
+             VALUES ('agent.tell', 'Run an agent turn.', '{}')",
+            "INSERT INTO effect_providers (provider_id, effect_kind, provider, capability, config_json) \
+             VALUES ('provider_agent_tell_builtin', 'agent.tell', 'builtin-agent-harness', 'agent.tell', '{}')",
+            "INSERT INTO capability_bindings (binding_id, program_id, capability, provider, config_json) \
+             VALUES ('binding_agent_tell_builtin', NULL, 'agent.tell', 'builtin-agent-harness', '{}')",
+            "INSERT INTO profiles (profile_id, name, description, enforcement_mode, allowed_capabilities, config_json) \
+             VALUES ('profile_repo_reader', 'repo-reader', 'reads', 'enforce', '[\"agent.tell\"]', '{}')",
+        ] {
+            store.sql.execute(stmt, &[]).expect("seed agent provider");
+        }
+        let mut kernel = RuntimeKernel::new(store);
+        let version = kernel
+            .create_program_version_for_program(
+                ProgramVersionInput {
+                    program_name: &ir.workflow,
+                    source_hash: "src",
+                    ir_hash: "ir",
+                    compiler_version: "test",
+                    ir_snapshot: None,
+                },
+                &ir,
+            )
+            .expect("program version");
+        let instance_id = kernel
+            .create_instance_with_authority(
+                &version,
+                "{}",
+                NewInstanceAuthority {
+                    workflow_principal: "local/AgentDemo",
+                    effective_authority_json: "{}",
+                },
+            )
+            .expect("instance");
+        kernel
+            .ingest_external_event(&instance_id, "external.started", "{}", Some("started"))
+            .expect("start event");
+
+        let model = SubmitsResultModel;
+        let tools = crate::do_tools::DoToolExecutor::for_instance(
+            std::rc::Rc::new(crate::do_store::test_support::store().sql),
+            &instance_id,
+        );
+        let driver = DoInstanceDriver {
+            kernel,
+            files: &NoFiles,
+            coerce: None,
+            agent_model: Some(&model),
+            agent_tools: &tools,
+            agent_tool_specs: None,
+            agent_workspace_resources: None,
+            exec: None,
+            turn: None,
+            ir: &ir,
+            instance_id: &instance_id,
+            system_prompt: "You are the package persona.",
+            max_steps: 8,
+        };
+        let mut machine = InstanceStepMachine::new(driver);
+        let outcome = run_to_completion(&mut machine, &OkHost);
+        assert!(
+            matches!(outcome, InstanceOutcome::Terminal),
+            "the DO drives the contracted turn to a terminal: {outcome:?}"
+        );
+
+        let driver = machine.into_driver();
+        let facts = driver
+            .kernel
+            .store()
+            .list_facts(&instance_id)
+            .expect("facts list");
+        let completed = facts
+            .iter()
+            .find(|fact| fact.name == "agent.turn.completed")
+            .expect("the turn settled with a completion fact");
+        let payload: serde_json::Value =
+            serde_json::from_str(&completed.value_json).expect("fact payload is JSON");
+        assert_eq!(
+            payload.get("value"),
+            Some(&serde_json::json!({ "verdict": "keep", "findings": 2 })),
+            "the DO's fact carries the asserted result, exactly as the native host's does"
+        );
     }
 }
 

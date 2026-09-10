@@ -2004,6 +2004,7 @@ fn drive_to_idle(
                 max_child_iterations: 8,
                 agent_outcomes: BTreeMap::new(),
                 coerce_outputs: BTreeMap::new(),
+                agent_results: BTreeMap::new(),
                 virtual_now: None,
                 work_unit_root: None,
                 side_stores: Some(side_stores.clone()),

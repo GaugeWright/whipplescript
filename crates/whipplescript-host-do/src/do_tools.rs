@@ -38,6 +38,7 @@ use whipplescript_kernel::host_package::{
     edits_argument, read_line_window, slice_lines, workspace_tool_specs_from_registry,
 };
 use whipplescript_kernel::host_protocol::ResourceRef;
+use whipplescript_kernel::result_contract::{ResultContract, TOOL_SUBMIT_RESULT};
 use whipplescript_kernel::whip_shell::{ShellFile, ShellRequest, WhipShell};
 use whipplescript_store::items::{ClaimOutcome, FinishOutcome, ReleaseOutcome, WorkItems};
 use whipplescript_store::RuntimeStore;
@@ -139,6 +140,10 @@ pub struct DoToolExecutor<Sql: DoSql> {
     sql: Rc<Sql>,
     key_prefix: String,
     file_scopes: Option<Vec<DoFileScope>>,
+    /// The running turn's result contract, installed by the host before the
+    /// turn. Behind a lock because one executor serves an instance's turns and
+    /// the tool surface takes `&self`.
+    result_contract: std::sync::Mutex<Option<ResultContract>>,
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -154,6 +159,7 @@ impl<Sql: DoSql> DoToolExecutor<Sql> {
             sql,
             key_prefix: String::new(),
             file_scopes: None,
+            result_contract: std::sync::Mutex::new(None),
         }
     }
 
@@ -163,6 +169,7 @@ impl<Sql: DoSql> DoToolExecutor<Sql> {
             sql,
             key_prefix: format!("{instance_id}/"),
             file_scopes: None,
+            result_contract: std::sync::Mutex::new(None),
         }
     }
 
@@ -241,6 +248,7 @@ impl<Sql: DoSql> DoToolExecutor<Sql> {
             TOOL_ADD_TODO => self.add_todo(args),
             TOOL_UPDATE_TODO => self.update_todo(args),
             TOOL_BASH => self.bash(args),
+            TOOL_SUBMIT_RESULT => self.submit_result(args),
             other => Err(format!("unknown tool `{other}`")),
         }
     }
@@ -769,7 +777,29 @@ impl<Sql: DoSql> DoToolExecutor<Sql> {
     }
 }
 
+impl<Sql: DoSql> DoToolExecutor<Sql> {
+    /// Validate the asserted result against the turn's declared class. The rule
+    /// is the kernel's, so this host and the native one accept and reject
+    /// exactly the same payloads -- which is what lets the same program run on
+    /// both and mean one thing.
+    fn submit_result(&self, args: &serde_json::Value) -> Result<String, String> {
+        self.result_contract
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .ok_or_else(|| "this turn declares no result contract".to_owned())?
+            .validate(args)
+    }
+}
+
 impl<Sql: DoSql> ToolExecutor for DoToolExecutor<Sql> {
+    fn install_result_contract(&self, contract: Option<ResultContract>) {
+        *self
+            .result_contract
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = contract;
+    }
+
     fn take_workspace_reads(&self) -> Vec<whipplescript_kernel::whip_shell::ShellRead> {
         std::mem::take(
             &mut *self
@@ -1629,5 +1659,35 @@ mod tests {
         ] {
             assert!(names.contains(&expected.to_string()), "missing {expected}");
         }
+    }
+    /// The dispatch's fall-through. A model can name anything, and every tool
+    /// this executor does NOT offer has to come back as a tool error the model
+    /// can correct -- not as a silent success, and not as a panic. Reached here
+    /// because `submit_result` joined the match beside it.
+    #[test]
+    fn a_tool_this_executor_does_not_offer_is_refused_by_name() {
+        let executor = executor();
+        let outcome = executor.execute(&ToolCall {
+            id: "call-1".to_owned(),
+            name: "definitely_not_a_tool".to_owned(),
+            arguments: serde_json::json!({}),
+        });
+        assert_eq!(outcome.status, ToolStatus::Error);
+        assert!(
+            outcome
+                .content
+                .contains("unknown tool `definitely_not_a_tool`"),
+            "the refusal names what was asked for: {}",
+            outcome.content
+        );
+
+        // The control: a dispatch that refused everything would pass the above
+        // and break every turn.
+        let known = executor.execute(&ToolCall {
+            id: "call-2".to_owned(),
+            name: TOOL_LS.to_owned(),
+            arguments: serde_json::json!({}),
+        });
+        assert_eq!(known.status, ToolStatus::Ok, "{}", known.content);
     }
 }

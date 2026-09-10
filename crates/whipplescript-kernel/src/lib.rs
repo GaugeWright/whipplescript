@@ -34,6 +34,7 @@ pub mod principal;
 pub mod provider;
 pub mod provider_trust;
 pub mod resolution_recording;
+pub mod result_contract;
 pub mod rule_correspondence;
 pub mod rule_lowering;
 pub mod rule_pass;
@@ -787,6 +788,24 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
                     );
                 }
                 object.insert("value".to_owned(), base);
+            }
+        }
+        // The asserted result, under the SAME `value` key the failure base uses
+        // above: `after <turn> succeeds as r` binds the RESULT, the way it does
+        // for every other effect, while the envelope keeps its own alias
+        // (`after <turn> completes as o`). A turn that declared no contract
+        // inserts nothing, so its binding still projects the whole envelope --
+        // which is why `r.summary` goes on reading for an uncontracted agent
+        // and stops compiling for a contracted one.
+        if matches!(outcome.status, TurnStatus::Completed) {
+            if let Some(result) = outcome
+                .structured_result_json
+                .as_deref()
+                .and_then(|json| serde_json::from_str::<Value>(json).ok())
+            {
+                if let Some(object) = fact_payload_value.as_object_mut() {
+                    object.insert("value".to_owned(), result);
+                }
             }
         }
         let fact_payload = fact_payload_value.to_string();
@@ -2310,6 +2329,7 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
             usage_json: "{}".to_owned(),
             artifacts: Vec::new(),
             failure,
+            structured_result_json: None,
         };
         let artifact_ids = metadata
             .get("artifact_ids")
@@ -3082,8 +3102,20 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
         });
         // DR-0032: a failed turn carries the EffectError base under `value` (what
         // `after turn fails as f` binds); the rich provider blob stays under
-        // `failure`. Success has no `value` here (the turn output is read via the
-        // whole payload), so we add `value` only on failure to avoid a null shadow.
+        // `failure`. A SUCCESS carries `value` only when the turn asserted a
+        // result -- an uncontracted turn still has none, so its binding keeps
+        // projecting the whole payload rather than a null shadow, exactly as it
+        // did before result contracts existed. Mirrors the brokered settle path.
+        if let Some(asserted) = result
+            .structured_result_json
+            .as_deref()
+            .filter(|_| result.failure.is_none())
+            .and_then(|json| serde_json::from_str::<Value>(json).ok())
+        {
+            if let Some(object) = payload_value.as_object_mut() {
+                object.insert("value".to_owned(), asserted);
+            }
+        }
         if let Some(failure) = result.failure.as_ref() {
             let reason = provider_failure_summary_message(&failure.message);
             if let Some(object) = payload_value.as_object_mut() {
@@ -6643,6 +6675,7 @@ rule wait
             fn run(&self, _request: AgentTurnRequest) -> ProviderRunResult {
                 let secret = "sk-test-secret-token-1234567890";
                 ProviderRunResult {
+                    structured_result_json: None,
                     status: ProviderRunStatus::Failed,
                     summary: format!("provider failed with token={secret}"),
                     stdout: format!("stdout {secret}\n"),
@@ -7110,6 +7143,7 @@ rule wait
         impl AgentHarness for CompletedWithArtifactFailureHarness {
             fn run(&self, _request: AgentTurnRequest) -> ProviderRunResult {
                 ProviderRunResult {
+                    structured_result_json: None,
                     status: ProviderRunStatus::Completed,
                     summary: "provider completed before required artifact capture failed"
                         .to_owned(),
@@ -8926,5 +8960,120 @@ rule wait
         ] {
             assert_eq!(kind(absent), None, "should read as absent: {absent}");
         }
+    }
+
+    /// The payoff for a declared `returns`: the asserted result reaches the
+    /// COMPLETION FACT, under the same `value` key a failure's base uses, so a
+    /// rule downstream binds the result instead of squinting at free text.
+    ///
+    /// The uncontracted half is the compatibility pin. A turn that asserted
+    /// nothing must carry NO `value`, because the binding projection falls back
+    /// to the whole payload when the key is absent -- writing `value: null`
+    /// there would blank `reply.summary` for every agent program that predates
+    /// result contracts.
+    #[test]
+    fn an_asserted_result_reaches_the_completion_fact_and_nothing_else_does() {
+        let turn_fact = |harness: &MockAgentHarness| {
+            let store = SqliteStore::open_in_memory().expect("store opens");
+            let mut kernel = RuntimeKernel::new(store);
+            let version = kernel
+                .create_program_version(ProgramVersionInput {
+                    program_name: "Harness",
+                    source_hash: "source",
+                    ir_hash: "ir",
+                    compiler_version: "test",
+                    ir_snapshot: None,
+                })
+                .expect("program version creates");
+            let instance_id = kernel
+                .create_instance(&version, "{}")
+                .expect("instance creates");
+            kernel
+                .commit_rule(RuleCommit {
+                    instance_id: &instance_id,
+                    rule: "start",
+                    trigger_event_id: None,
+                    facts: &[],
+                    consumed_fact_ids: &[],
+                    effects: &[NewEffect {
+                        timeout_seconds: None,
+                        effect_id: "tell",
+                        kind: "agent.tell",
+                        target: Some("worker"),
+                        input_json: r#"{"prompt":"go"}"#,
+                        status: "queued",
+                        idempotency_key: "rule=start;effect=tell",
+                        required_capabilities_json: "[]",
+                        profile: None,
+                        correlation_id: None,
+                        source_span_json: None,
+                    }],
+                    dependencies: &[],
+                    terminal: None,
+                    idempotency_key: Some("commit-start"),
+                    marks: &[],
+                    context_json: None,
+                })
+                .expect("rule commits");
+            kernel
+                .run_agent_turn_with_metadata(
+                    AgentTurnExecution {
+                        instance_id: &instance_id,
+                        effect_id: "tell",
+                        run_id: "run-tell",
+                        provider: "mock",
+                        worker_id: "worker-1",
+                        lease_id: "lease-tell",
+                        lease_expires_at: "2030-01-01T00:00:00Z",
+                        agent: "worker",
+                        profile: None,
+                        input_json: r#"{"prompt":"go"}"#,
+                        skill_names: &[],
+                    },
+                    harness,
+                    "{}",
+                )
+                .expect("mock turn runs");
+            let store = kernel.into_store();
+            store.list_facts(&instance_id).expect("facts list")
+        };
+        let completed_payload = |facts: &[whipplescript_store::FactView]| {
+            let fact = facts
+                .iter()
+                .find(|fact| fact.name == "agent.turn.completed")
+                .expect("the turn settled with a completion fact");
+            serde_json::from_str::<Value>(&fact.value_json).expect("fact payload is JSON")
+        };
+        // What `after tell succeeds as r` actually binds at runtime.
+        let bound = |facts: &[whipplescript_store::FactView]| {
+            crate::rule_lowering::effect_binding_value(facts, "tell", "succeeds")
+                .expect("a completed turn binds a value")
+        };
+
+        let asserted = turn_fact(
+            &MockAgentHarness::completed("done").asserting(r#"{"verdict":"keep","findings":2}"#),
+        );
+        assert_eq!(
+            completed_payload(&asserted).get("value"),
+            Some(&json!({ "verdict": "keep", "findings": 2 })),
+            "the asserted result reaches the fact"
+        );
+        assert_eq!(
+            bound(&asserted),
+            json!({ "verdict": "keep", "findings": 2 }),
+            "and the binding IS that result, so `r.verdict` resolves"
+        );
+
+        let uncontracted = turn_fact(&MockAgentHarness::completed("done"));
+        let payload = completed_payload(&uncontracted);
+        assert!(
+            payload.get("value").is_none(),
+            "a turn that asserted nothing carries no `value`: {payload}"
+        );
+        assert_eq!(
+            bound(&uncontracted).get("summary"),
+            Some(&json!("done")),
+            "so its binding still projects the envelope and `r.summary` reads"
+        );
     }
 }

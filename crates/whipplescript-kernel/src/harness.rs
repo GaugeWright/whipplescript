@@ -116,6 +116,14 @@ pub struct ProviderRunResult {
     pub usage_json: String,
     pub artifacts: Vec<ProviderArtifact>,
     pub failure: Option<ProviderFailure>,
+    /// The result the turn ASSERTED, when its agent declares `returns <Class>`:
+    /// the terminal tool's arguments, already validated against that class by
+    /// the executor that ran it. `None` for every turn without a contract, whose
+    /// result is the free-text `summary` it has always been.
+    ///
+    /// Named for the field `spec/agent-harness.md` has carried in the normalized
+    /// provider result since before there was anything to put in it.
+    pub structured_result_json: Option<String>,
 }
 
 pub trait AgentHarness {
@@ -198,11 +206,27 @@ impl CommandLaunchPlan {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CommandAgentHarness {
     plan: CommandLaunchPlan,
+    /// A result the turn is to have ASSERTED, for a fixture standing in for an
+    /// agent that declares `returns <Class>`. A subprocess cannot call the
+    /// terminal tool, so `whip test` supplies through this what the tool would
+    /// otherwise have produced; a real command provider leaves it `None`.
+    asserted_result: Option<String>,
 }
 
 impl CommandAgentHarness {
     pub fn new(plan: CommandLaunchPlan) -> Self {
-        Self { plan }
+        Self {
+            plan,
+            asserted_result: None,
+        }
+    }
+
+    /// The result this fixture turn asserts. Only a COMPLETED turn carries it:
+    /// a failed turn asserted nothing, and stamping a result onto a failure
+    /// would put a `value` on a fact whose binding is the failure base.
+    pub fn asserting(mut self, result_json: impl Into<String>) -> Self {
+        self.asserted_result = Some(result_json.into());
+        self
     }
 
     fn request_payload(&self, request: &AgentTurnRequest) -> String {
@@ -285,6 +309,7 @@ impl AgentHarness for CommandAgentHarness {
                 let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
                 let artifacts = command_output_artifacts(&self.plan, &request, &stdout, &stderr);
                 return ProviderRunResult {
+                    structured_result_json: None,
                     status: ProviderRunStatus::TimedOut,
                     summary: format!(
                         "{} timed out after {}ms",
@@ -384,6 +409,9 @@ impl AgentHarness for CommandAgentHarness {
             .recoverable(true)
         });
 
+        let asserted = matches!(status, ProviderRunStatus::Completed)
+            .then(|| self.asserted_result.clone())
+            .flatten();
         ProviderRunResult {
             status,
             summary,
@@ -394,6 +422,7 @@ impl AgentHarness for CommandAgentHarness {
             usage_json: "{}".to_owned(),
             artifacts,
             failure,
+            structured_result_json: asserted,
         }
     }
 }
@@ -548,14 +577,24 @@ impl MockAgentHarness {
                     mime_type: Some("text/plain".to_owned()),
                 }],
                 failure: None,
+                structured_result_json: None,
             },
         }
+    }
+
+    /// The same completed turn, with a result ASSERTED through the terminal
+    /// tool -- what an agent declaring `returns <Class>` produces, and the only
+    /// thing that puts a `value` on a successful turn's fact.
+    pub fn asserting(mut self, result_json: impl Into<String>) -> Self {
+        self.result.structured_result_json = Some(result_json.into());
+        self
     }
 
     pub fn failed(summary: impl Into<String>) -> Self {
         let summary = summary.into();
         Self {
             result: ProviderRunResult {
+                structured_result_json: None,
                 status: ProviderRunStatus::Failed,
                 summary: summary.clone(),
                 stdout: String::new(),
@@ -618,6 +657,7 @@ fn command_failure_result(failure: CommandFailure<'_>) -> ProviderRunResult {
         failure.stderr,
     );
     ProviderRunResult {
+        structured_result_json: None,
         status: ProviderRunStatus::Failed,
         summary: failure.summary.clone(),
         stdout: failure.stdout.to_owned(),

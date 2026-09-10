@@ -283,6 +283,11 @@ pub struct ResolvedPackage {
     pub capabilities: Vec<String>,
     pub max_steps: usize,
     pub program: IrProgram,
+    /// The terminal tool's name when the package's agent declares `returns
+    /// <Class>`, so a host running this package settles the turn on the
+    /// assertion rather than on the model falling silent. `None` when the agent
+    /// declares no result contract.
+    pub result_tool: Option<String>,
 }
 
 impl ResolvedPackage {
@@ -330,6 +335,18 @@ impl ResolvedPackage {
         })?;
         let agent = agent.into();
         let system_prompt = system_prompt.into();
+        // A declared result contract is part of the package's tool surface, so
+        // the terminal tool is offered here and rides into `source_hash` below
+        // with every other tool -- which is right: an agent that gained a
+        // `returns` IS a different authored program.
+        let result_contract = result_contract_for(&program, &agent);
+        let mut tools = tools;
+        let result_tool = result_contract.as_ref().map(|contract| {
+            // Before the package's own tools, so a package cannot shadow the
+            // call its contract settles on.
+            tools.insert(0, contract.tool_spec());
+            crate::result_contract::TOOL_SUBMIT_RESULT.to_owned()
+        });
         let tool_identity = tools
             .iter()
             .map(|tool| {
@@ -365,7 +382,32 @@ impl ResolvedPackage {
             capabilities,
             max_steps,
             program,
+            result_tool,
         })
+    }
+}
+
+/// The result contract an agent in this program declares, if any. One
+/// definition, used both when the package is compiled (to offer the terminal
+/// tool and fold it into `source_hash`) and when a host later needs the
+/// contract itself to validate against.
+fn result_contract_for(
+    program: &IrProgram,
+    agent: &str,
+) -> Option<crate::result_contract::ResultContract> {
+    program
+        .agents
+        .iter()
+        .find(|declared| declared.name == agent)
+        .and_then(|declared| declared.returns.as_deref())
+        .map(|class| crate::result_contract::ResultContract::new(class, program.clone()))
+}
+
+impl ResolvedPackage {
+    /// The contract behind [`Self::result_tool`], for a host that must validate
+    /// the assertion rather than merely name the call that carries it.
+    pub fn result_contract(&self) -> Option<crate::result_contract::ResultContract> {
+        result_contract_for(&self.program, &self.agent)
     }
 }
 

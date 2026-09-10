@@ -847,6 +847,12 @@ pub enum AgentField {
     /// read when assembling its own context (DR-0034 Decision 4). One of `project`,
     /// `user`, `none`. Unset means the provider's own default.
     Settings(Ident),
+    /// `returns <Class>`: the declared shape of the turn's result. A managed
+    /// agent that declares one is offered a terminal tool whose input schema is
+    /// that class, and the turn settles when the model calls it — so completing
+    /// means the model asserted a result of the declared shape, rather than the
+    /// weaker "the model stopped requesting tools".
+    Returns(Ident),
     Unknown {
         name: Ident,
         span: SourceSpan,
@@ -2072,6 +2078,36 @@ pub enum IrPrimitiveType {
     Secret(Option<whipplescript_custody::CredentialKind>),
 }
 
+impl IrPrimitiveType {
+    /// Whether this is one of the opaque multimodal boundary types
+    /// (`spec/type-system.md` "Type Universe"). Exhaustive on purpose: adding a
+    /// fifth kind must not be able to leave it silently non-media, which is
+    /// what a `matches!` list in a consumer allows.
+    pub fn is_media(&self) -> bool {
+        self.media_mime().is_some()
+    }
+
+    /// The default mime type for a reference of this kind, or `None` when the
+    /// type is not media at all. One table, so "which primitives are media" and
+    /// "what mime does each carry" cannot disagree.
+    pub fn media_mime(&self) -> Option<&'static str> {
+        match self {
+            IrPrimitiveType::Image => Some("image/*"),
+            IrPrimitiveType::Audio => Some("audio/*"),
+            IrPrimitiveType::Video => Some("video/*"),
+            IrPrimitiveType::Pdf => Some("application/pdf"),
+            IrPrimitiveType::String
+            | IrPrimitiveType::Int
+            | IrPrimitiveType::Float
+            | IrPrimitiveType::Bool
+            | IrPrimitiveType::Null
+            | IrPrimitiveType::Duration
+            | IrPrimitiveType::Time
+            | IrPrimitiveType::Secret(_) => None,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct IrAgent {
     pub name: String,
@@ -2106,6 +2142,12 @@ pub struct IrAgent {
     /// `project`, `user`, or `none`. `None` means the provider's own default —
     /// deliberately NOT the crippled empty set.
     pub settings: Option<String>,
+    /// The declared result shape (`returns <Class>`): the class the turn's
+    /// terminal tool takes as its input, and therefore the shape a completion
+    /// carries. `None` leaves the turn's result the free-text summary it has
+    /// always been. Managed-only — a delegated harness settles its own turn, so
+    /// there is no tool of ours for it to call.
+    pub returns: Option<String>,
     /// The harness class (DR-0034): `Managed` (WhippleScript is the runtime) vs
     /// `Delegated` (a foreign runtime that assembles its own context). Derived from
     /// the resolved provider/harness kind at lowering.
@@ -2833,6 +2875,10 @@ struct SemanticContext {
     schemas: SchemaIndex,
     agents: BTreeSet<String>,
     agent_capabilities: BTreeMap<String, BTreeSet<String>>,
+    /// The result class an agent declares with `returns` (the turn's result
+    /// contract). ABSENT means the agent declared none, which is what keeps an
+    /// uncontracted turn's binding projecting the whole envelope.
+    agent_returns: BTreeMap<String, String>,
     coerce_outputs: BTreeMap<String, TypeSyntax>,
     coerce_params: BTreeMap<String, Vec<ParamDecl>>,
     workflow_inputs: BTreeMap<String, WorkflowInputSurface>,
@@ -2943,8 +2989,57 @@ enum LiteralExpr<'a> {
     Duration(i64),
 }
 
+/// Which opaque multimodal boundary type an [`ExprType::Media`] carries. The
+/// set is closed: these are the four in `spec/type-system.md` "Type Universe",
+/// mirroring the `IrPrimitiveType` variants they lower to.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MediaKind {
+    Image,
+    Audio,
+    Pdf,
+    Video,
+}
+
+impl MediaKind {
+    /// The source keyword, which is also how a diagnostic names the type. The
+    /// four names are listed here ONCE, in both directions, so a fifth kind
+    /// cannot be added to one direction alone.
+    fn label(self) -> &'static str {
+        match self {
+            MediaKind::Image => "image",
+            MediaKind::Audio => "audio",
+            MediaKind::Pdf => "pdf",
+            MediaKind::Video => "video",
+        }
+    }
+
+    fn from_type_name(name: &str) -> Option<Self> {
+        [
+            MediaKind::Image,
+            MediaKind::Audio,
+            MediaKind::Pdf,
+            MediaKind::Video,
+        ]
+        .into_iter()
+        .find(|kind| kind.label() == name)
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum ExprType {
+    /// The opaque multimodal boundary types (`spec/type-system.md` "Media
+    /// Boundary Values"). Distinct from `String` for the same reason `Secret`
+    /// is: a media reference has no prose meaning, so no ordering, arithmetic,
+    /// or cross-type comparison should accept one where a value is expected.
+    /// Deliberately NOT `Unknown`, which type-checks everywhere -- which is
+    /// what all four of these were until this variant existed.
+    ///
+    /// The kind is carried rather than erased, so `image` and `video` do not
+    /// unify. `types_comparable` falls through to equality, which therefore
+    /// admits comparing two references of the SAME kind -- the one operation
+    /// the spec permits ("may compare media references for identity") -- and
+    /// rejects every cross-kind pair.
+    Media(MediaKind),
     Bool,
     Int,
     Float,
@@ -3932,6 +4027,7 @@ fn agent_field_span(field: &AgentField) -> SourceSpan {
         AgentField::Compaction(strategy) => strategy.span,
         AgentField::Thread(mode) => mode.span,
         AgentField::Settings(sources) => sources.span,
+        AgentField::Returns(class) => class.span,
         AgentField::Unknown { span, .. } => *span,
     }
 }
@@ -3976,6 +4072,7 @@ fn agent_field_line(field: &AgentField) -> String {
         AgentField::Compaction(strategy) => format!("  compaction {}", strategy.name),
         AgentField::Thread(mode) => format!("  thread {}", mode.name),
         AgentField::Settings(sources) => format!("  settings {}", sources.name),
+        AgentField::Returns(class) => format!("  returns {}", class.name),
         AgentField::Unknown { name, .. } => format!("  {}", name.name),
     }
 }
@@ -4774,11 +4871,20 @@ impl IrProgram {
                     HarnessClass::Delegated => " class=delegated",
                     HarnessClass::Managed => "",
                 };
+                // The declared result shape likewise appends only when set, so no
+                // existing agent's .ir moves. It MUST appear when set: `returns`
+                // changes what a completion carries, so it belongs to the
+                // compiled identity `ir_hash` folds in.
+                let returns = agent
+                    .returns
+                    .as_deref()
+                    .map(|class| format!(" returns={class}"))
+                    .unwrap_or_default();
                 push_line(
                     &mut snapshot,
                     format!(
-                        "  agent {} harness={} provider={} profile={} capacity={} skills={} capabilities={} tools={}{}{}{}{}{}",
-                        agent.name, harness, provider, profile, capacity, skills, capabilities, tools, requires, compaction, settings, thread, class
+                        "  agent {} harness={} provider={} profile={} capacity={} skills={} capabilities={} tools={}{}{}{}{}{}{}",
+                        agent.name, harness, provider, profile, capacity, skills, capabilities, tools, requires, compaction, settings, thread, class, returns
                     ),
                 );
             }
@@ -7816,6 +7922,7 @@ impl SemanticContext {
         let mut schemas = SchemaIndex::with_builtins();
         let mut agents = BTreeSet::new();
         let mut agent_capabilities = BTreeMap::new();
+        let mut agent_returns = BTreeMap::new();
         let mut coerce_outputs = BTreeMap::new();
         let mut coerce_params = BTreeMap::new();
         let mut leases = BTreeSet::new();
@@ -7848,6 +7955,12 @@ impl SemanticContext {
                         })
                         .unwrap_or_default();
                     agent_capabilities.insert(agent.name.name.clone(), capabilities);
+                    if let Some(class) = agent.fields.iter().find_map(|field| match field {
+                        AgentField::Returns(class) => Some(class.name.clone()),
+                        _ => None,
+                    }) {
+                        agent_returns.insert(agent.name.name.clone(), class);
+                    }
                 }
                 Item::Coerce(coerce) => {
                     coerce_outputs.insert(coerce.name.name.clone(), coerce.output.clone());
@@ -7907,6 +8020,7 @@ impl SemanticContext {
             agents,
             use_names,
             agent_capabilities,
+            agent_returns,
             coerce_outputs,
             coerce_params,
             workflow_inputs,
@@ -8764,6 +8878,15 @@ impl SchemaIndex {
 
     fn class_exists(&self, name: &str) -> bool {
         self.classes.contains_key(name)
+    }
+
+    fn enum_exists(&self, name: &str) -> bool {
+        self.enums.contains_key(name)
+    }
+
+    /// The declared class names, for a diagnostic that has to suggest one.
+    fn class_names(&self) -> impl Iterator<Item = &String> {
+        self.classes.keys()
     }
 
     fn resolve_field_path(
@@ -14505,12 +14628,17 @@ fn terminal_completed_payload_type(
         // is a runtime boundary — not the `AgentTurn` envelope, whose fields
         // reach a rule through the `after … completes as o` alias instead.
         //
-        // This arm read `Ref("AgentTurn")` and was unreachable:
-        // `effect_payload_statements` admits only `coerce` and `claim` lines,
-        // so a `tell` never arrives here. Left correct rather than removed, so
-        // that widening the collection later cannot quietly assert the
-        // envelope's shape onto the payload.
-        IrEffectKind::AgentTell => terminal_unknown_payload_type(),
+        // This arm was unreachable until `effect_payload_statements` admitted
+        // `tell` lines: it read `Ref("AgentTurn")`, and the note left here said
+        // widening the collection must not quietly assert the ENVELOPE's shape
+        // onto the payload. It does not. A turn's completed payload is the
+        // result it asserted, so an agent that declares `returns` resolves to
+        // THAT class, and one that declares none keeps the open shape -- which
+        // is what leaves `reply.summary` reading on an uncontracted turn.
+        IrEffectKind::AgentTell => tell_agent_name(line)
+            .and_then(|agent| semantic.agent_returns.get(agent))
+            .map(|class| IrType::Ref(class.clone()))
+            .unwrap_or_else(terminal_unknown_payload_type),
         IrEffectKind::CapabilityCall
         | IrEffectKind::HttpRequest
         | IrEffectKind::MintCredential
@@ -15181,6 +15309,15 @@ fn terminal_cancelled_payload_type() -> IrType {
 /// carry `summary`/`effect_id`/`run_id` at runtime, because
 /// `terminal_payload_for_tag` lifts them into those payloads. Only the
 /// `Completed` side was fiction.
+/// The agent a `tell <agent> [as <binding>] …` line addresses. Positional, like
+/// every other line parser here: the verb is fixed and the agent is the word
+/// after it.
+fn tell_agent_name(line: &str) -> Option<&str> {
+    let rest = line.trim().strip_prefix("tell ")?;
+    let agent = rest.split_whitespace().next()?;
+    (!agent.is_empty()).then_some(agent)
+}
+
 fn terminal_unknown_payload_type() -> IrType {
     IrType::Object(Vec::new())
 }
@@ -18803,7 +18940,7 @@ fn expr_type_from_type_syntax(ty: &TypeSyntax, semantic: &SemanticContext) -> Ex
             "string" => ExprType::String,
             "duration" => ExprType::Duration,
             "time" => ExprType::Time,
-            _ => ExprType::Unknown,
+            name => MediaKind::from_type_name(name).map_or(ExprType::Unknown, ExprType::Media),
         },
         TypeSyntax::Secret { kind, .. } => ExprType::Secret(kind.as_ref().and_then(|kind| {
             // An unknown kind is reported by `validate_secret_kinds`; here it
@@ -18964,6 +19101,7 @@ fn expr_type_label(ty: &ExprType) -> String {
         ExprType::Finite { label, values } => format!("{label}<{}>", values.join(" | ")),
         ExprType::Duration => "duration".to_owned(),
         ExprType::Time => "time".to_owned(),
+        ExprType::Media(kind) => kind.label().to_owned(),
         ExprType::Secret(None) => "secret".to_owned(),
         ExprType::Secret(Some(kind)) => format!("secret<{}>", kind.as_str().replace('-', "_")),
         ExprType::Null => "null".to_owned(),
@@ -20824,6 +20962,16 @@ fn collect_body_statements(
             continue;
         }
         if trimmed.contains("\"\"\"") {
+            // A statement HEAD can open a multi-line string -- `tell w as r """`
+            // is the ordinary way to write a prompt -- and this branch used to
+            // consume the line as string scaffolding before `statement_balance`
+            // ever saw it, so those heads reached no collector at all. Only a
+            // `None`-balanced head is safe to take from this one line; a paren-
+            // or brace-balanced one needs the lines this branch is about to
+            // skip, so it stays exactly as it was.
+            if matches!(statement_balance(trimmed), Some(StatementBalance::None)) {
+                statements.push((trimmed.to_owned(), head_range(index)));
+            }
             multiline_string = trimmed.matches("\"\"\"").count() % 2 == 1;
             index += 1;
             continue;
@@ -20855,7 +21003,7 @@ fn collect_body_statements(
 fn effect_payload_statement_balance(trimmed: &str) -> Option<StatementBalance> {
     if trimmed.starts_with("coerce ") {
         Some(StatementBalance::Parens)
-    } else if trimmed.starts_with("claim ") {
+    } else if trimmed.starts_with("claim ") || trimmed.starts_with("tell ") {
         Some(StatementBalance::None)
     } else {
         None

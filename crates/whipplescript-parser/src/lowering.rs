@@ -274,7 +274,13 @@ pub(crate) fn lower_program(
                     context_limit: pool.context_limit,
                 });
             }
-            Item::Agent(agent) => lower_agent(agent, &mut ir, &harness_kinds, &mut diagnostics),
+            Item::Agent(agent) => lower_agent(
+                agent,
+                &mut ir,
+                &harness_kinds,
+                &semantic.schemas,
+                &mut diagnostics,
+            ),
             Item::Enum(enum_decl) => lower_enum(enum_decl, &mut ir, &mut diagnostics),
             Item::Event(event) => lower_event(event, &mut ir, &mut diagnostics),
             Item::Source(source) => {
@@ -1227,6 +1233,7 @@ fn lower_agent(
     agent: AgentDecl,
     ir: &mut IrProgram,
     harness_kinds: &BTreeMap<String, String>,
+    schemas: &SchemaIndex,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
     let mut lowered = IrAgent {
@@ -1243,6 +1250,7 @@ fn lower_agent(
         compaction: None,
         thread: None,
         settings: None,
+        returns: None,
         // Filled after the field loop, once provider/harness are resolved.
         harness_class: HarnessClass::Managed,
     };
@@ -1300,6 +1308,7 @@ fn lower_agent(
     // the class is only resolved after the field loop.
     let mut compaction_span: Option<SourceSpan> = None;
     let mut thread_span: Option<SourceSpan> = None;
+    let mut returns_span: Option<SourceSpan> = None;
     let mut settings_span: Option<SourceSpan> = None;
 
     for field in agent.fields {
@@ -1599,6 +1608,62 @@ fn lower_agent(
                 settings_span = Some(sources.span);
                 lowered.settings = Some(sources.name);
             }
+            AgentField::Returns(class) => {
+                if lowered.returns.is_some() {
+                    diagnostics.push(Diagnostic {
+                        code: diagnostic_code!("construct.duplicate_field"),
+                        severity: Severity::Error,
+                        related: Vec::new(),
+                        fixits: Vec::new(),
+                        span: class.span,
+                        message: format!(
+                            "agent `{}` declares returns more than once",
+                            agent.name.name
+                        ),
+                        suggestion: Some(Suggestion::manual("keep exactly one `returns` field")),
+                    });
+                }
+                // A result shape must be a CLASS: the terminal tool's input is an
+                // object of its fields, so an enum (a bare tag) has no shape to
+                // offer. `class Verdict { outcome Outcome }` is the spelling for
+                // an enum-valued result.
+                if !schemas.class_exists(&class.name) {
+                    let enum_declared = schemas.enum_exists(&class.name);
+                    diagnostics.push(Diagnostic {
+                        code: diagnostic_code!("type.unknown_schema"),
+                        severity: Severity::Error,
+                        related: Vec::new(),
+                        fixits: Vec::new(),
+                        span: class.span,
+                        message: if enum_declared {
+                            format!(
+                                "agent `{}` returns `{}`, which is an enum, not a class",
+                                agent.name.name, class.name
+                            )
+                        } else {
+                            format!(
+                                "agent `{}` returns undeclared class `{}`",
+                                agent.name.name, class.name
+                            )
+                        },
+                        suggestion: Some(Suggestion::manual(if enum_declared {
+                            format!(
+                                "wrap it in a class — `class {}Result {{ value {} }}` — so the \
+                                 result has named fields the turn can fill",
+                                class.name, class.name
+                            )
+                        } else {
+                            crate::suggest_otherwise(
+                                &class.name,
+                                schemas.class_names(),
+                                "declare the class the turn's result should take",
+                            )
+                        })),
+                    });
+                }
+                returns_span = Some(class.span);
+                lowered.returns = Some(class.name);
+            }
             AgentField::Unknown { name, .. } => {
                 diagnostics.push(Diagnostic {
                     code: diagnostic_code!("construct.unknown_clause"),
@@ -1682,6 +1747,23 @@ fn lower_agent(
                         "remove `compaction` — a delegated harness compacts its own context"
                             .to_owned(),
                     ),
+                });
+            }
+            if let Some(span) = returns_span {
+                diagnostics.push(Diagnostic {
+                    code: diagnostic_code!("construct.incompatible_clause"),
+                    severity: Severity::Error,
+                    related: Vec::new(),
+                    fixits: Vec::new(),
+                    span,
+                    message: format!(
+                        "agent `{}` is delegated; `returns` is a managed-harness knob",
+                        agent.name.name
+                    ),
+                    suggestion: Some(Suggestion::manual(
+                        "remove `returns` — a delegated harness settles its own turn, so there \
+                         is no terminal tool of ours for it to call",
+                    )),
                 });
             }
             if let Some(span) = thread_span {

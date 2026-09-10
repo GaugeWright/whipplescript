@@ -2819,14 +2819,21 @@ fn tracker_trigger_handle<'a>(pattern: &'a str, trackers: &BTreeSet<&str>) -> Op
     .then_some(handle)
 }
 
-/// Whether a type can carry prose — arbitrary author-authored text — as opposed
-/// to a bounded value (DR-0051 §4).
+/// Whether an endorser can put an attacker-chosen value into this type and have
+/// something downstream READ it (DR-0051 §4; the name is the DR's vocabulary,
+/// the test below is what it settled on).
 ///
-/// The line is not "is it a string" but "can an attacker put a sentence in it".
-/// A number cannot instruct a downstream reader; a union of string literals
-/// cannot either, because its variants are declared in the class rather than
-/// chosen by whoever filled the field in. A bare `string`, a map, or an object
-/// with a prose field can.
+/// The line is not "is it a string". A type says no in one of three ways, and
+/// each arm here is one of them:
+///
+/// - CLOSED: the possible values are declared in the class rather than chosen
+///   by whoever filled the field in — a union of string literals.
+/// - NON-INSTRUCTING: unbounded, but nothing downstream can act on it — a
+///   number, a bool.
+/// - NO ELIMINATOR: a handle whose material nothing in the language or runtime
+///   yields — a `secret`.
+///
+/// A bare `string`, a map, or an object with such a field is none of the three.
 fn carries_prose(ty: &whipplescript_parser::IrType) -> bool {
     use whipplescript_parser::{IrPrimitiveType, IrType};
     match ty {
@@ -2836,6 +2843,14 @@ fn carries_prose(ty: &whipplescript_parser::IrType) -> bool {
         // (DR-0053 §5). Stated explicitly so the default below is a decision,
         // not an accident.
         IrType::Primitive(IrPrimitiveType::Secret(_)) => false,
+        // Media is a handle like a `secret`, and that analogy is exactly what
+        // fails: a `secret` is safe because it has NO ELIMINATOR, and a media
+        // reference's eliminator is the whole reason the type exists. Attach one
+        // to a turn and a model reads it — a vision model reads the text in an
+        // image — so an endorser who chooses which artifact rides in this field
+        // launders whatever it depicts, one level removed. Neither closed nor
+        // non-instructing, so it does not cross.
+        IrType::Primitive(primitive) if primitive.is_media() => true,
         IrType::Primitive(_) => false,
         IrType::LiteralString(_) => false,
         // A union is closed exactly when every arm is a declared literal. One
@@ -11739,6 +11754,83 @@ rule settle
             }),
             "an endorsed claim should surface and name its queue: {:?}",
             report.trusted_surface
+        );
+    }
+
+    /// What may cross a human-endorsement boundary (DR-0051 §4). Nothing reached
+    /// `security.endorsed_prose_field` before this: the whole refusal was
+    /// unmeasured, prose arm included.
+    ///
+    /// The media arm is the one that needed a ruling. A media reference is a
+    /// handle like a `secret`, and `secret` crosses because it has NO
+    /// ELIMINATOR. A media reference's eliminator is the reason the type exists
+    /// — attach it to a turn and a model reads it — so an endorser choosing
+    /// which artifact rides in the field launders what it depicts, exactly as
+    /// quoting the untrusted item into a prose field would.
+    #[test]
+    fn an_endorsed_claim_may_shape_a_closed_field_but_not_prose_or_media() {
+        let program = |field: &str| {
+            format!(
+                r#"@service
+workflow ClaimSurface
+
+class Pending {{ request string }}
+class Screening {{ {field} }}
+class Ticket {{ id string  status "open" }}
+
+tracker verdicts
+
+table seed as Ticket [ {{ id "T1"  status "open" }} ]
+
+rule ask
+  when Ticket as ticket where ticket.status == "open"
+=> {{
+  record Pending {{ request ticket.id }}
+}}
+
+rule settle
+  when Pending as p
+  when verdicts has ready issue as v where v.body == p.request
+=> {{
+  claim v as hold endorsed
+  after hold succeeds {{
+    record Screening {{ verdict v.title }}
+  }}
+}}
+"#
+            )
+        };
+        let refusals = |field: &str| {
+            let ir = compile_program(&program(field)).ir.expect("compiles");
+            let envelope = Envelope::from_json(
+                r#"{ "resources": { "tracker:/verdicts": { "integrity": ["Operator"] } },
+                     "endorsements": [{ "resource": "verdicts", "role": "Operator" }] }"#,
+            )
+            .expect("valid");
+            check_with_envelope(&ir, &VerifiedEnvelope::for_test(envelope))
+                .into_iter()
+                .filter(|d| d.code.as_str() == "security.endorsed_prose_field")
+                .count()
+        };
+
+        // CLOSED: the values are declared in the class, so the endorser chooses
+        // among them rather than supplying one. This is the control -- a check
+        // that refused every shape would pass the two below for free.
+        assert_eq!(
+            refusals(r#"verdict "keep" | "flag""#),
+            0,
+            "a closed union is what an endorsement is FOR"
+        );
+        // Neither closed nor non-instructing.
+        assert_eq!(
+            refusals("verdict string"),
+            1,
+            "prose launders the quotation"
+        );
+        assert_eq!(
+            refusals("verdict image"),
+            1,
+            "and so does an artifact a model will read"
         );
     }
 

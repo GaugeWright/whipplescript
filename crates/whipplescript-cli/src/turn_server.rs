@@ -320,9 +320,13 @@ pub fn run_turn_in_workspace(
         .and_then(Value::as_u64)
         .unwrap_or(30) as usize;
     let use_file_tools = request.get("tools").and_then(Value::as_str) != Some("none");
+    // A bare turn names its own tools and has no `.whip` agent, so it declares
+    // no contract; a packaged turn takes its agent's, resolved below.
+    let mut result_tool: Option<String> = None;
 
     if let Err(error) = std::fs::create_dir_all(workspace) {
         return BrokeredTurnOutcome {
+            structured_result_json: None,
             status: TurnStatus::Failed,
             summary: format!("could not open workspace: {error}"),
             steps: 0,
@@ -360,6 +364,7 @@ pub fn run_turn_in_workspace(
         Ok(access) => access,
         Err(error) => {
             return BrokeredTurnOutcome {
+                structured_result_json: None,
                 status: TurnStatus::Failed,
                 summary: format!("turn access grants are not readable: {error}"),
                 steps: 0,
@@ -370,7 +375,7 @@ pub fn run_turn_in_workspace(
         }
     };
     let profile_policy = crate::harness_tools::HarnessProfilePolicy::permissive();
-    let executor = FileToolExecutor::new(workspace)
+    let mut executor = FileToolExecutor::new(workspace)
         .with_protected_write_paths(protected_write_paths)
         .with_turn_tool_access(access.clone())
         // Operator configuration, never the request body: see
@@ -396,6 +401,10 @@ pub fn run_turn_in_workspace(
                 Ok(resolved) => resolved,
                 Err(error) => return failed_outcome(&error),
             };
+            // Before the moves out of `resolved`: the contract reads the
+            // program the package compiled, so it has to be taken first.
+            result_tool = resolved.result_tool.clone();
+            executor = executor.with_result_contract(resolved.result_contract());
             system = resolved.system_prompt;
             max_steps = resolved.max_steps;
             tools = resolved.tools;
@@ -425,41 +434,53 @@ pub fn run_turn_in_workspace(
                 Ok(resolved) => resolved,
                 Err(error) => return failed_outcome(&error),
             };
+            // Before the moves out of `resolved`: the contract reads the
+            // program the package compiled, so it has to be taken first.
+            result_tool = resolved.result_tool.clone();
+            executor = executor.with_result_contract(resolved.result_contract());
             system = resolved.system_prompt;
             max_steps = resolved.max_steps;
             tools = resolved.tools;
         }
     }
-    let decode_array = |name: &str| -> Result<Vec<Value>, BrokeredTurnOutcome> {
+    // Boxed: the `Err` here is a whole settled turn, which these closures use to
+    // short-circuit. It crossed clippy's `result_large_err` threshold when turns
+    // gained an asserted result, and a boxed error is the fix rather than a
+    // silenced lint.
+    let decode_array = |name: &str| -> Result<Vec<Value>, Box<BrokeredTurnOutcome>> {
         match request.get(name) {
             None => Ok(Vec::new()),
             Some(Value::Array(values)) => Ok(values.clone()),
-            Some(_) => Err(failed_outcome(&format!("turn `{name}` must be an array"))),
+            Some(_) => Err(Box::new(failed_outcome(&format!(
+                "turn `{name}` must be an array"
+            )))),
         }
     };
     let user_images = match decode_array("images").and_then(|items| {
         items
             .into_iter()
             .map(|item| {
-                serde_json::from_value::<ImageBlock>(item)
-                    .map_err(|error| failed_outcome(&format!("invalid turn image: {error}")))
+                serde_json::from_value::<ImageBlock>(item).map_err(|error| {
+                    Box::new(failed_outcome(&format!("invalid turn image: {error}")))
+                })
             })
             .collect()
     }) {
         Ok(images) => images,
-        Err(outcome) => return outcome,
+        Err(outcome) => return *outcome,
     };
     let user_media = match decode_array("media").and_then(|items| {
         items
             .into_iter()
             .map(|item| {
-                serde_json::from_value::<MediaInput>(item)
-                    .map_err(|error| failed_outcome(&format!("invalid turn media: {error}")))
+                serde_json::from_value::<MediaInput>(item).map_err(|error| {
+                    Box::new(failed_outcome(&format!("invalid turn media: {error}")))
+                })
             })
             .collect()
     }) {
         Ok(media) => media,
-        Err(outcome) => return outcome,
+        Err(outcome) => return *outcome,
     };
     let world = match request.get("world") {
         None | Some(Value::Null) => None,
@@ -479,6 +500,7 @@ pub fn run_turn_in_workspace(
         world,
         context_bundles: Vec::new(),
         pinned_skills: Vec::new(),
+        result_tool,
     };
     let progress_turn_id = turn_id.to_owned();
     let mut checkpoint = move |messages: &[whipplescript_kernel::harness_loop::ChatMessage]| {
@@ -513,6 +535,7 @@ pub fn run_turn_in_workspace(
         );
     }
     let refused = |summary: String| BrokeredTurnOutcome {
+        structured_result_json: None,
         status: TurnStatus::Failed,
         summary,
         steps: 0,
@@ -595,6 +618,7 @@ pub fn run_turn_in_workspace(
 
 fn failed_outcome(reason: &str) -> BrokeredTurnOutcome {
     BrokeredTurnOutcome {
+        structured_result_json: None,
         status: TurnStatus::Failed,
         summary: reason.to_owned(),
         steps: 0,
@@ -1081,5 +1105,36 @@ mod tests {
             serde_json::from_str(&client_read_text(&mut unknown).expect("error frame"))
                 .expect("error json");
         assert_eq!(error["kind"], json!("error"));
+    }
+
+    /// A turn's `images`/`media` are decoded before any model call, so a
+    /// malformed request settles as a failed turn rather than reaching the
+    /// provider. The refusal reads back through `run_turn_in_workspace`'s
+    /// outcome because the decode closure short-circuits the whole turn.
+    #[test]
+    fn a_turn_whose_media_is_not_an_array_settles_without_calling_a_model() {
+        let workspace = std::env::temp_dir().join(scratch_dir_name("decode-array-probe"));
+        std::fs::remove_dir_all(&workspace).ok();
+
+        for name in ["images", "media"] {
+            let outcome = run_turn_in_workspace(
+                "decode-array-probe",
+                &json!({ "user": "hello", "tools": "none", name: "not-an-array" }),
+                &workspace,
+            );
+            assert!(
+                matches!(outcome.status, TurnStatus::Failed),
+                "a malformed `{name}` fails the turn: {:?}",
+                outcome.status
+            );
+            assert_eq!(
+                outcome.summary,
+                format!("turn `{name}` must be an array"),
+                "the refusal names the field the caller got wrong"
+            );
+            assert_eq!(outcome.steps, 0, "no model round was spent on `{name}`");
+        }
+
+        std::fs::remove_dir_all(&workspace).ok();
     }
 }

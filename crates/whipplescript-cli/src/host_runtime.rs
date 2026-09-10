@@ -2263,6 +2263,10 @@ impl GovernedHostRuntime {
             max_steps: package.max_steps,
             resume_from: Vec::new(),
             user_images: Vec::new(),
+            // The authored agent-package manifest has no result contract of its
+            // own; `returns` is declared on a `.whip` agent, which this hosted
+            // path does not read.
+            result_tool: None,
             user_media: media,
             world: Some(world),
             context_bundles: Vec::new(),

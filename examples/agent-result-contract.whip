@@ -1,0 +1,108 @@
+use std.agent
+
+# An agent that declares `returns <Class>` settles its turn by ASSERTING a
+# result of that shape, so the rule downstream binds the result itself rather
+# than reading prose out of the turn's summary.
+workflow ReviewContract
+
+input ticket Ticket
+output result Verdict
+failure error ReviewStopped
+
+class Ticket {
+  title string
+}
+
+class ReviewResult {
+  verdict string
+  findings int
+}
+
+class Verdict {
+  verdict string
+  findings int
+}
+
+class ReviewStopped {
+  reason string
+}
+
+class Reviewed {
+  verdict string
+  findings int
+}
+
+agent reviewer {
+  provider fixture
+  profile "repo-writer"
+  capacity 1
+  returns ReviewResult
+}
+
+rule begin
+  when started
+  when reviewer is available
+=> {
+  tell reviewer as reply """
+  Review the ticket and submit a verdict.
+  """
+
+  # `r` IS the declared result: `r.verdict` and `r.findings` are checked
+  # against ReviewResult. The turn envelope keeps its own alias, so a rule that
+  # wants `summary` or `run_id` asks for `completes as` instead.
+  after reply succeeds as r {
+    record Reviewed {
+      verdict r.verdict
+      findings r.findings
+    }
+
+    complete result {
+      verdict r.verdict
+      findings r.findings
+    }
+  }
+
+  after reply fails {
+    fail error { reason "the review turn did not settle" }
+  }
+}
+
+test "an asserted result reaches the rule that reads it" {
+  workflow ReviewContract
+
+  given input {
+    ticket { title "Crash on startup" }
+  }
+
+  # What the terminal tool would have produced. A subprocess fixture cannot
+  # call it, so the scenario supplies the assertion directly.
+  stub agent reviewer returns {
+    verdict "keep"
+    findings 2
+  }
+
+  run until idle
+
+  expect rule begin fired
+  expect effect agent.tell completed
+  # The assertion itself, read back through the binding: had the result not
+  # reached the fact, `r.verdict` would bind null and this would not match.
+  expect Reviewed where verdict == "keep"
+  expect Reviewed where findings == 2
+  expect workflow completed
+}
+
+test "a turn that never settles leaves the result unbound" {
+  workflow ReviewContract
+
+  given input {
+    ticket { title "Crash on startup" }
+  }
+
+  stub agent reviewer fails
+
+  run until idle
+
+  expect effect agent.tell failed
+  expect workflow failed
+}
