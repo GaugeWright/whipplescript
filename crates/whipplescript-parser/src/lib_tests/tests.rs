@@ -25256,3 +25256,52 @@ fn the_bare_and_block_spellings_lower_to_the_same_provider() {
         "the bare spelling must lower to the block form's providers"
     );
 }
+
+#[test]
+fn every_effect_kind_round_trips_through_its_kind_string() {
+    // `from_kind_str` is derived from `as_str` rather than written backwards, so
+    // this is a guard on `ALL` being complete: a variant missing from it becomes
+    // a kind string no snapshot reader can resolve.
+    for kind in IrEffectKind::ALL {
+        assert_eq!(
+            IrEffectKind::from_kind_str(kind.as_str()).as_ref(),
+            Some(kind),
+            "{} does not round-trip",
+            kind.as_str()
+        );
+    }
+    assert_eq!(IrEffectKind::ALL.len(), 23);
+    assert_eq!(IrEffectKind::from_kind_str("nothing.here"), None);
+}
+
+#[test]
+fn an_effect_kinds_source_keyword_is_one_its_contract_declares() {
+    // The keyword comes from the contract's `source_forms`, which is what keeps
+    // one table. If it ever stopped doing so, a view would name effects in a
+    // vocabulary nothing else in the system uses.
+    for kind in IrEffectKind::ALL {
+        let contract = effect_contract_for_kind(kind.clone(), Vec::new());
+        assert!(
+            contract.source_forms.contains(&kind.source_keyword()),
+            "{}: source keyword {:?} is not among its contract's forms {:?}",
+            kind.as_str(),
+            kind.source_keyword(),
+            contract.source_forms
+        );
+    }
+}
+
+#[test]
+fn a_source_keyword_is_not_the_kind_strings_last_segment() {
+    // The two cases that make this a map rather than a string split. A renderer
+    // splitting `timer.wait` on the dot shows `wait`, which is a modifier on
+    // `acquire` and not a statement at all; `exec.command` shows `command`,
+    // which is a provider kind.
+    assert_eq!(IrEffectKind::TimerWait.source_keyword(), "timer");
+    assert_eq!(IrEffectKind::ExecCommand.source_keyword(), "exec");
+    // And the ordinary cases still read as themselves.
+    assert_eq!(IrEffectKind::AgentTell.source_keyword(), "tell");
+    assert_eq!(IrEffectKind::TrackerRelease.source_keyword(), "release");
+    // One kind, several spellings: the canonical one.
+    assert_eq!(IrEffectKind::SchemaCoerce.source_keyword(), "coerce");
+}

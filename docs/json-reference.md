@@ -246,6 +246,21 @@ have had. That distinction is the reason this command exists: a `case` arm never
 requested leaves no record at all, so the event log cannot tell it apart from an
 arm that does not exist in the program.
 
+Every effect entry — in `structure` and in a firing alike — carries four names
+for the one effect. `node` and `kind` are the machinery: the id an edge names,
+and the contract the runtime holds. `verb` and `label` are the same effect in the
+author's words: the source keyword it was written with (`timer`, not
+`timer.wait`; `exec`, not `exec.command`; a construct's own keyword rather than
+`capability.call`), and the name the author gave it. `label` is `null` when they
+gave none — an unbound effect is `effect4`, numbered by lowering position, and
+offering that as a name would be inventing one. A `then` chain's handle reads as
+the word the author wrote: `then plan <- tell …` labels `plan`, not
+`__then_plan`.
+
+Each rule also carries `records`: the schemas it records, with the construct that
+wrote each one. A `table` declaration lowers to a rule, so `table_row` there is
+how a reader tells a table of data from behaviour someone wrote.
+
 `unattributed_effects` is the view's own self-check. It lists effects the
 instance created that no static node accounts for, which means the projection is
 keyed differently than the run was — a branched or restored instance, or a

@@ -44,6 +44,14 @@ pub struct SnapshotEffect {
     /// The derived effect key. Static per program version; a firing's actual
     /// effect id is not this.
     pub key: String,
+    /// The construct keyword this effect was written with, when a construct
+    /// lowered it (`construct=<keyword>-><capability>` in the snapshot).
+    ///
+    /// Every construct lowers to `capability.call`, so the kind alone cannot say
+    /// what the author wrote — `fetch` and `notify` are one kind. Only the
+    /// keyword is read: the target capability is in the snapshot and still has no
+    /// caller.
+    pub construct: Option<String>,
     /// DR-0090: the enclosing `after` arm as `(binding, predicate)`, or `None`
     /// for an effect at the rule's top level.
     ///
@@ -52,6 +60,64 @@ pub struct SnapshotEffect {
     /// records the completion-shaped predicate, so a lease arm reads
     /// `completes` there and `held` here, and only the latter is in the key.
     pub arm: Option<(String, String)>,
+}
+
+impl SnapshotEffect {
+    /// The author's own name for this effect, or `None` when they gave it none.
+    ///
+    /// Two of the names in a snapshot were written by nobody. An unbound effect
+    /// is `effect4`, numbered by its position in lowering, and a `then` chain's
+    /// handle is `__then_plan` — a reserved namespace an author is refused if
+    /// they spell it themselves. Forwarding either as though it were authored is
+    /// how `__then_req` reached a Structure view: the projection had no other
+    /// human handle to offer, so it offered the compiler's.
+    ///
+    /// The binding is the only candidate, with that prefix removed — `then plan
+    /// <- tell …` is an author writing `plan`, and the prefix is machinery
+    /// between them and it. An unbound effect has no name at all and says so,
+    /// rather than putting a number nobody chose where a name goes.
+    pub fn label(&self) -> Option<&str> {
+        let binding = self.binding.as_deref()?;
+        Some(
+            binding
+                .strip_prefix(crate::then_expand::THEN_BINDING_PREFIX)
+                .unwrap_or(binding),
+        )
+    }
+
+    /// The source keyword this effect was written with.
+    ///
+    /// The kind is the compiler's word for an effect, and no string operation
+    /// turns it into the author's: `timer.wait` was written `timer`,
+    /// `exec.command` was written `exec`, and every construct — `notify`,
+    /// `fetch` — lowers to the single kind `capability.call`. So a construct
+    /// answers with its own keyword, and everything else with the canonical
+    /// source form of its kind.
+    ///
+    /// The kind string is the fallback, for a snapshot written by a compiler
+    /// NEWER than this build. [`parse`] is deliberately total for that same
+    /// reason: a reader that refused an unknown kind would turn a supported
+    /// condition into an error.
+    pub fn verb(&self) -> String {
+        if let Some(keyword) = &self.construct {
+            return keyword.clone();
+        }
+        crate::IrEffectKind::from_kind_str(&self.kind)
+            .map(|kind| kind.source_keyword())
+            .unwrap_or_else(|| self.kind.clone())
+    }
+}
+
+/// One schema a rule records, and the construct that wrote the `record`.
+///
+/// A `table` declaration lowers to a rule — `table_tickets`, `when started`,
+/// one `record` per row — so from the rules alone a table is indistinguishable
+/// from behaviour someone wrote. The construct is what tells them apart:
+/// `table_row` for a row of a declared table.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct SnapshotRecordSource {
+    pub schema: String,
+    pub construct: String,
 }
 
 /// One rule's structure.
@@ -63,6 +129,9 @@ pub struct SnapshotRule {
     pub effects: Vec<SnapshotEffect>,
     /// `(upstream_effect_id, predicate, downstream_effect_id)` within this rule.
     pub dependencies: Vec<(String, String, String)>,
+    /// The `record` statements in this rule that a construct wrote, with the
+    /// construct that wrote each one.
+    pub records: Vec<SnapshotRecordSource>,
 }
 
 /// A program's structure, read back from its `.ir` snapshot.
@@ -94,7 +163,8 @@ fn parse_edge(line: &str) -> Option<(String, String, String)> {
     ))
 }
 
-/// `turn kind=agent.tell binding=turn key=703a…`
+/// `turn kind=agent.tell binding=turn key=703a…`, and with a construct
+/// `sent kind=capability.call binding=sent construct=notify->slack.post key=…`
 fn parse_effect(line: &str) -> Option<SnapshotEffect> {
     let mut parts = line.split_whitespace();
     let id = parts.next()?.to_owned();
@@ -116,11 +186,26 @@ fn parse_effect(line: &str) -> Option<SnapshotEffect> {
             .get("key")
             .map(|k| (*k).to_string())
             .unwrap_or_default(),
+        construct: fields
+            .get("construct")
+            .and_then(|value| value.split_once("->"))
+            .map(|(keyword, _capability)| keyword.to_owned()),
         arm: fields.get("arm").and_then(|value| {
             value
                 .split_once(':')
                 .map(|(binding, predicate)| (binding.to_owned(), predicate.to_owned()))
         }),
+    })
+}
+
+/// `schema:Ticket construct=table_row span=736..848`
+fn parse_record_source(line: &str) -> Option<SnapshotRecordSource> {
+    let mut parts = line.split_whitespace();
+    let schema = parts.next()?.strip_prefix("schema:")?.to_owned();
+    let construct = parts.find_map(|part| part.strip_prefix("construct="))?;
+    Some(SnapshotRecordSource {
+        schema,
+        construct: construct.to_owned(),
     })
 }
 
@@ -181,6 +266,11 @@ pub fn parse(snapshot: &str) -> SnapshotView {
                     "dependencies" => {
                         if let Some(edge) = parse_edge(trimmed) {
                             rule.dependencies.push(edge);
+                        }
+                    }
+                    "record_sources" => {
+                        if let Some(source) = parse_record_source(trimmed) {
+                            rule.records.push(source);
                         }
                     }
                     _ => {}
@@ -849,5 +939,137 @@ mod tests {
         assert_eq!(view.workflow, "Demo");
         assert_eq!(view.rules.len(), 1);
         assert_eq!(view.rules[0].whens, vec!["started".to_owned()]);
+    }
+
+    /// The `then` sugar's whole point is that the author never writes the
+    /// handle, so a view that shows it shows them a name they did not choose.
+    #[test]
+    fn a_then_chains_synthetic_handle_reads_as_the_word_the_author_wrote() {
+        let view = parse(
+            "workflow TriageChain\n\
+             rules\n  \
+             rule triage_ticket\n    \
+             when Ticket as ticket\n    \
+             effects\n      \
+             __then_plan kind=agent.tell binding=__then_plan key=b2f4\n      \
+             __then_signoff kind=schema.coerce binding=__then_signoff key=1b7b \
+             arm=__then_plan:succeeds\n",
+        );
+        let effects = &view.rules[0].effects;
+        assert_eq!(effects[0].label(), Some("plan"));
+        assert_eq!(effects[1].label(), Some("signoff"));
+        // The binding itself is untouched: it is the join key the arm names, and
+        // the graph's edges are drawn from it.
+        assert_eq!(effects[1].arm.as_ref().unwrap().0, "__then_plan");
+        assert_eq!(effects[0].binding.as_deref(), Some("__then_plan"));
+    }
+
+    /// An unbound effect answers `None` rather than offering `effect4`. The
+    /// number is a lowering position, and a renderer that receives it as a label
+    /// has no way to know it is not a name.
+    #[test]
+    fn an_unbound_effect_offers_no_label_at_all() {
+        let view = parse(
+            "workflow Gastown\n\
+             rules\n  \
+             rule implement\n    \
+             effects\n      \
+             effect4 kind=tracker.release binding=- key=7743 arm=slot:contended\n      \
+             claimed kind=tracker.claim binding=claimed key=ea89\n",
+        );
+        assert_eq!(view.rules[0].effects[0].label(), None);
+        assert_eq!(view.rules[0].effects[1].label(), Some("claimed"));
+    }
+
+    /// The two kinds whose source keyword is not the kind string's last segment,
+    /// read through a snapshot rather than through the enum.
+    #[test]
+    fn an_effects_verb_is_the_keyword_its_author_typed() {
+        let view = parse(
+            "workflow Verbs\n\
+             rules\n  \
+             rule act\n    \
+             effects\n      \
+             deadline kind=timer.wait binding=deadline key=a1\n      \
+             built kind=exec.command binding=built key=a2\n      \
+             turn kind=agent.tell binding=turn key=a3\n      \
+             later kind=nothing.invented binding=later key=a4\n",
+        );
+        let effects = &view.rules[0].effects;
+        assert_eq!(effects[0].verb(), "timer");
+        assert_eq!(effects[1].verb(), "exec");
+        assert_eq!(effects[2].verb(), "tell");
+        // A kind this build does not know keeps its kind string. A snapshot from
+        // a newer compiler is a supported condition, not an error.
+        assert_eq!(effects[3].verb(), "nothing.invented");
+    }
+
+    /// Every construct lowers to `capability.call`, so the kind cannot name what
+    /// the author wrote and the construct keyword is read for it.
+    #[test]
+    fn a_construct_effect_reads_as_its_own_keyword() {
+        let view = parse(
+            "workflow Constructs\n\
+             rules\n  \
+             rule act\n    \
+             effects\n      \
+             sent kind=capability.call binding=sent construct=notify->slack.post key=a1\n      \
+             plain kind=capability.call binding=plain key=a2\n",
+        );
+        let effects = &view.rules[0].effects;
+        assert_eq!(effects[0].construct.as_deref(), Some("notify"));
+        assert_eq!(effects[0].verb(), "notify");
+        // No construct: the kind's own canonical source form.
+        assert_eq!(effects[1].construct, None);
+        assert_eq!(effects[1].verb(), "call");
+    }
+
+    /// The same three questions, asked of what the compiler actually emits
+    /// rather than of lines typed into a test. `triage-chain` is the program
+    /// whose `then` chain put `__then_req` on a screen, and `messaging-demo`
+    /// carries a real construct effect.
+    #[test]
+    fn real_compiler_output_reads_back_in_the_authors_words() {
+        let chain = crate::compile_program(include_str!("../../../examples/triage-chain.whip"))
+            .ir
+            .expect("triage-chain compiles")
+            .to_snapshot();
+        let view = parse(&chain);
+        let rule = view.rule("triage_ticket").expect("the chained rule");
+        let labels: Vec<Option<&str>> = rule.effects.iter().map(SnapshotEffect::label).collect();
+        assert_eq!(labels, vec![Some("plan"), Some("signoff")]);
+        let verbs: Vec<String> = rule.effects.iter().map(SnapshotEffect::verb).collect();
+        assert_eq!(verbs, vec!["tell".to_owned(), "coerce".to_owned()]);
+        // The prefix is still on the binding the arm names, which is what the
+        // graph's edges are resolved through.
+        assert_eq!(rule.effects[0].binding.as_deref(), Some("__then_plan"));
+
+        // The table declaration in the same program lowers to a rule, and only
+        // its record sources say it is data rather than behaviour.
+        let table = view.rule("table_tickets").expect("the table seeder");
+        assert!(table.effects.is_empty());
+        assert_eq!(table.records.len(), 1);
+        assert_eq!(table.records[0].schema, "Ticket");
+        assert_eq!(table.records[0].construct, "table_row");
+        assert!(
+            rule.records.is_empty(),
+            "a hand-written rule is not a table"
+        );
+
+        let messaging =
+            crate::compile_program(include_str!("../../../examples/messaging-demo.whip"))
+                .ir
+                .expect("messaging-demo compiles")
+                .to_snapshot();
+        let sent = parse(&messaging)
+            .rules
+            .iter()
+            .flat_map(|rule| rule.effects.clone())
+            .find(|effect| effect.kind == "capability.call")
+            .expect("a construct effect");
+        // Not `call`: every construct lowers to that one kind, and the keyword
+        // is the only thing that says which construct the author reached for.
+        assert_eq!(sent.construct.as_deref(), Some("send"));
+        assert_eq!(sent.verb(), "send");
     }
 }

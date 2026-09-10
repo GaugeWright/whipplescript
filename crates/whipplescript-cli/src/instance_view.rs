@@ -19,6 +19,14 @@
 //! knows the others were there to not happen — which is why `absent` exists and
 //! why it is the one thing this view offers over `whip log`.
 //!
+//! **An effect is named in the author's words, not the compiler's.** Every node
+//! carries `verb` and `label` beside `kind` and `node`. The snapshot's own names
+//! are not all authored — an unbound effect is `effect4`, a `then` chain's handle
+//! is `__then_plan` — and a view that forwards those asks a reader to recognise
+//! their own program in a vocabulary they never used. `label` is `null` where the
+//! author named nothing, so a renderer shows the verb rather than inventing a
+//! name from a lowering position.
+//!
 //! **No payload bytes cross this boundary.** Identifiers, statuses, reasons and
 //! spans only: no fact values, no effect input, no turn output. A projection
 //! that emitted them would make every consumer an egress and push the leak
@@ -217,15 +225,29 @@ fn structure_value(view: &snapshot::SnapshotView, version_id: &str, ir_hash: &st
         "rules": view.rules.iter().map(|rule| json!({
             "name": rule.name,
             "whens": rule.whens,
+            // `node` and `kind` are the machinery — the id an edge names and the
+            // contract the runtime holds — and `verb` and `label` are the same
+            // effect in the author's own words. A renderer draws the second pair
+            // and keeps the first for joining, because a program's picture
+            // should be readable by whoever wrote the program.
             "effects": rule.effects.iter().map(|effect| json!({
                 "node": effect.id,
                 "kind": effect.kind,
+                "verb": effect.verb(),
+                "label": effect.label(),
                 "binding": effect.binding,
             })).collect::<Vec<_>>(),
             "dependencies": rule.dependencies.iter().map(|(upstream, predicate, downstream)| json!({
                 "upstream": upstream,
                 "predicate": predicate,
                 "downstream": downstream,
+            })).collect::<Vec<_>>(),
+            // What this rule records, and which construct wrote it. A `table`
+            // declaration lowers to a rule, so without this a reader draws a
+            // table of data as though it were behaviour someone wrote.
+            "records": rule.records.iter().map(|source| json!({
+                "schema": source.schema,
+                "construct": source.construct,
             })).collect::<Vec<_>>(),
         })).collect::<Vec<_>>(),
         "rule_edges": view.rule_dependencies.iter().map(|(producer, fact, consumer)| json!({
@@ -329,6 +351,8 @@ pub fn project(
                 let mut slot = Map::new();
                 slot.insert("node".to_owned(), json!(node.id));
                 slot.insert("kind".to_owned(), json!(node.kind));
+                slot.insert("verb".to_owned(), json!(node.verb()));
+                slot.insert("label".to_owned(), json!(node.label()));
                 slot.insert("binding".to_owned(), json!(node.binding));
                 slot.insert(
                     "arm".to_owned(),
@@ -518,6 +542,54 @@ mod tests {
         from_instance["program_version_id"] = json!("");
         from_instance["ir_hash"] = json!("ir-x");
         assert_eq!(from_instance, alone);
+    }
+
+    /// The names a reader sees are the author's, on both sides of the view.
+    ///
+    /// Structure and a firing's slots are drawn by ONE renderer, so a label that
+    /// reached only one of them would make the same effect read as `plan` in the
+    /// program and `__then_plan` in the run — which is worse than either name
+    /// alone, because now the reader has to work out that they are one effect.
+    #[test]
+    fn an_effect_is_named_in_the_authors_words_in_structure_and_in_a_firing() {
+        const CHAINED: &str = "workflow TriageChain\n\
+            rules\n  \
+            rule work\n    \
+            when started\n    \
+            effects\n      \
+            __then_plan kind=agent.tell binding=__then_plan key=k1\n      \
+            effect2 kind=timer.wait binding=- key=k2 arm=__then_plan:succeeds\n";
+
+        let alone = structure(CHAINED, "ir-x");
+        let nodes = alone["rules"][0]["effects"].as_array().expect("effects");
+        assert_eq!(nodes[0]["label"], "plan");
+        assert_eq!(nodes[0]["verb"], "tell");
+        // The binding stays exactly as the snapshot wrote it: the arm below names
+        // it, and every edge in the graph is resolved through it.
+        assert_eq!(nodes[0]["binding"], "__then_plan");
+        assert_eq!(nodes[0]["node"], "__then_plan");
+        // Unbound, so there is no author name and the verb is what gets drawn.
+        assert_eq!(nodes[1]["label"], Value::Null);
+        assert_eq!(nodes[1]["verb"], "timer");
+
+        let plan = id_for("__then_plan", None, "id-1");
+        let view = project(
+            &instance(),
+            &versions(&[("ver_1", Some(CHAINED))]),
+            &[commit_event("id-1", &[&plan])],
+            &[effect(&plan, "completed")],
+            &[],
+        );
+        let slots = view["firings"][0]["effects"].as_array().expect("slots");
+        assert_eq!(slots.len(), nodes.len());
+        for (slot, node) in slots.iter().zip(nodes) {
+            assert_eq!(slot["label"], node["label"], "{}", node["node"]);
+            assert_eq!(slot["verb"], node["verb"], "{}", node["node"]);
+        }
+        assert_eq!(slots[0]["label"], "plan");
+        assert_eq!(slots[0]["status"], "completed");
+        assert_eq!(slots[1]["verb"], "timer");
+        assert_eq!(slots[1]["absent"], true);
     }
 
     fn commit_event(identity: &str, created: &[&str]) -> EventView {

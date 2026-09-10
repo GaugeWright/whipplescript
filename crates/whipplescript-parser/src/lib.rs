@@ -5413,6 +5413,76 @@ impl IrEffectKind {
             Self::FileExport => "file.export",
         }
     }
+
+    /// Every variant, in declaration order.
+    ///
+    /// A map keyed on this enum can then be checked over the whole set rather
+    /// than over the cases someone remembered, and a reader holding only a kind
+    /// STRING can reach the variant without a second copy of `as_str` written
+    /// backwards.
+    pub const ALL: &'static [Self] = &[
+        Self::AgentTell,
+        Self::SchemaCoerce,
+        Self::CapabilityCall,
+        Self::EventEmit,
+        Self::WorkflowInvoke,
+        Self::TimerWait,
+        Self::ExecCommand,
+        Self::HttpRequest,
+        Self::MintCredential,
+        Self::TrackerFile,
+        Self::TrackerClaim,
+        Self::TrackerRenew,
+        Self::TrackerRelease,
+        Self::TrackerFinish,
+        Self::LeaseAcquire,
+        Self::LeaseRenew,
+        Self::LedgerAppend,
+        Self::CounterConsume,
+        Self::SignalEmit,
+        Self::FileRead,
+        Self::FileWrite,
+        Self::FileImport,
+        Self::FileExport,
+    ];
+
+    /// The inverse of [`as_str`](Self::as_str): an effect-kind string back to
+    /// its variant.
+    ///
+    /// A reader of a stored `.ir` snapshot holds the string and not the IR — the
+    /// snapshot became durable state with readers that never compiled the
+    /// program — so this is how such a reader reaches anything keyed on the kind.
+    /// `None` for a kind this build does not know, which a snapshot written by a
+    /// NEWER compiler can legitimately carry.
+    pub fn from_kind_str(kind: &str) -> Option<Self> {
+        Self::ALL
+            .iter()
+            .find(|candidate| candidate.as_str() == kind)
+            .cloned()
+    }
+
+    /// The source keyword an author writes to produce this effect.
+    ///
+    /// A view that names an effect by its KIND names it in the compiler's
+    /// vocabulary rather than the author's, and the two differ in ways no string
+    /// operation recovers: `timer.wait` is a line written `timer 24h`, and
+    /// `exec.command` is written `exec`. Splitting the kind on its dot yields
+    /// `wait` and `command`, both of which are words the author did not write.
+    ///
+    /// So this reads the `source_forms` of the effect contract — the same table
+    /// the contract registry publishes — rather than introducing a second map
+    /// that could disagree with it. A kind with several spellings reports the
+    /// canonical (first) one: `decide` and `prompt` both read as `coerce`,
+    /// because the snapshot does not record which the author typed.
+    pub fn source_keyword(&self) -> String {
+        effect_contract_for_kind(self.clone(), Vec::new())
+            .source_forms
+            .into_iter()
+            .next()
+            // A contract with no source form is a table defect rather than a
+            // condition to model, and the kind string is the honest fallback.
+            .unwrap_or_else(|| self.as_str().to_owned())
+    }
 }
 
 impl DependencyPredicate {

@@ -31968,22 +31968,34 @@ fn view(options: &CliOptions) -> ExitCode {
             if commits == 1 { "" } else { "s" }
         );
         for slot in firing["effects"].as_array().into_iter().flatten() {
-            let node = slot["node"].as_str().unwrap_or("?");
-            let kind = slot["kind"].as_str().unwrap_or("?");
+            // The author's name where they gave one, and the node id where they
+            // did not: an unbound effect's `effect4` is still the only handle
+            // that tells two `release` lines apart, so it stays rather than
+            // being replaced by a word that reads the same for both.
+            let node = slot["label"]
+                .as_str()
+                .or_else(|| slot["node"].as_str())
+                .unwrap_or("?");
+            // The verb, not the kind. `timer 24h` is a line the author wrote;
+            // `timer.wait` is what the compiler called it.
+            let verb = slot["verb"]
+                .as_str()
+                .or_else(|| slot["kind"].as_str())
+                .unwrap_or("?");
             let arm = slot["arm"]
                 .as_str()
                 .map(|arm| format!(" after {arm}"))
                 .unwrap_or_default();
             if slot["absent"] == serde_json::Value::Bool(true) {
                 // Not a status: there is no row. That distinction is the view.
-                println!("    {node:<14} {kind:<18} not requested{arm}");
+                println!("    {node:<14} {verb:<10} not requested{arm}");
             } else {
                 let reason = slot["block_reason"]
                     .as_str()
                     .map(|reason| format!(" ({reason})"))
                     .unwrap_or_default();
                 println!(
-                    "    {node:<14} {kind:<18} {}{reason}{arm}",
+                    "    {node:<14} {verb:<10} {}{reason}{arm}",
                     slot["status"].as_str().unwrap_or("?")
                 );
             }
