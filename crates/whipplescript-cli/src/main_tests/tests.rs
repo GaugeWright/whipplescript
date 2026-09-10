@@ -77,6 +77,8 @@ mod model_search;
 mod packages;
 #[path = "tests/provider_and_doctor.rs"]
 mod provider_and_doctor;
+#[path = "tests/read_only_observation.rs"]
+mod read_only_observation;
 #[path = "tests/std_manifests.rs"]
 mod std_manifests;
 #[path = "tests/trace_and_log.rs"]

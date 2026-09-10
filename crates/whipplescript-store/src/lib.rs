@@ -1550,6 +1550,20 @@ pub fn store_stage() -> &'static str {
 
 #[cfg(feature = "native")]
 impl SqliteStore {
+    /// Open an existing runtime store without initializing or migrating it,
+    /// changing its journal mode, repairing it, or changing file permissions.
+    /// Missing databases fail to open; queries requiring unavailable schema
+    /// fail instead of repairing it. SQLite enforces read-only database access;
+    /// ordinary WAL reads still observe other
+    /// connections' committed changes. This is not an access grant or a pinned
+    /// historical snapshot.
+    pub fn open_read_only(path: impl AsRef<Path>) -> StoreResult<Self> {
+        let connection =
+            Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        connection.busy_timeout(STORE_BUSY_TIMEOUT)?;
+        Ok(Self { connection })
+    }
+
     pub fn open(path: impl AsRef<Path>) -> StoreResult<Self> {
         let path = path.as_ref();
         let mut connection = Connection::open(path)?;
@@ -13167,6 +13181,9 @@ fn column_exists(connection: &Connection, table: &str, column: &str) -> StoreRes
         .collect::<result::Result<Vec<_>, _>>()?;
     Ok(columns.iter().any(|name| name == column))
 }
+
+#[cfg(all(test, feature = "native"))]
+mod read_only_tests;
 
 #[cfg(test)]
 mod tests {

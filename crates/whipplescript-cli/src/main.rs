@@ -31674,7 +31674,7 @@ fn recover_report_to_json(report: &RecoverReport) -> Value {
 }
 
 fn instances(options: &CliOptions) -> ExitCode {
-    let store = match open_store_or_exit(options) {
+    let store = match open_observation_store_or_exit(options) {
         Ok(store) => store,
         Err(code) => return code,
     };
@@ -31709,7 +31709,7 @@ fn status(options: &CliOptions) -> ExitCode {
     let Some(instance_id) = single_arg(options, "usage: whip status <instance>") else {
         return ExitCode::from(2);
     };
-    let store = match open_store_or_exit(options) {
+    let store = match open_observation_store_or_exit(options) {
         Ok(store) => store,
         Err(code) => return code,
     };
@@ -31816,7 +31816,7 @@ fn log(options: &CliOptions) -> ExitCode {
     let Some(instance_id) = single_arg(options, "usage: whip log <instance>") else {
         return ExitCode::from(2);
     };
-    let store = match open_store_or_exit(options) {
+    let store = match open_observation_store_or_exit(options) {
         Ok(store) => store,
         Err(code) => return code,
     };
@@ -31901,7 +31901,7 @@ fn facts(options: &CliOptions) -> ExitCode {
     let Some(instance_id) = single_arg(options, "usage: whip facts <instance>") else {
         return ExitCode::from(2);
     };
-    let store = match open_store_or_exit(options) {
+    let store = match open_observation_store_or_exit(options) {
         Ok(store) => store,
         Err(code) => return code,
     };
@@ -31933,7 +31933,7 @@ fn view(options: &CliOptions) -> ExitCode {
     let Some(instance_id) = single_arg(options, "usage: whip [--json] view <instance>") else {
         return ExitCode::from(2);
     };
-    let store = match open_store_or_exit(options) {
+    let store = match open_observation_store_or_exit(options) {
         Ok(store) => store,
         Err(code) => return code,
     };
@@ -32041,7 +32041,7 @@ fn effects(options: &CliOptions) -> ExitCode {
     let Some(instance_id) = single_arg(options, "usage: whip effects <instance>") else {
         return ExitCode::from(2);
     };
-    let store = match open_store_or_exit(options) {
+    let store = match open_observation_store_or_exit(options) {
         Ok(store) => store,
         Err(code) => return code,
     };
@@ -32325,7 +32325,7 @@ fn progressions(options: &CliOptions) -> ExitCode {
     let Some(instance_id) = single_arg(options, "usage: whip progressions <instance>") else {
         return ExitCode::from(2);
     };
-    let store = match open_store_or_exit(options) {
+    let store = match open_observation_store_or_exit(options) {
         Ok(store) => store,
         Err(code) => return code,
     };
@@ -32610,7 +32610,7 @@ fn runs(options: &CliOptions) -> ExitCode {
     let Some(instance_id) = single_arg(options, "usage: whip runs <instance>") else {
         return ExitCode::from(2);
     };
-    let store = match open_store_or_exit(options) {
+    let store = match open_observation_store_or_exit(options) {
         Ok(store) => store,
         Err(code) => return code,
     };
@@ -32660,7 +32660,7 @@ fn artifacts(options: &CliOptions) -> ExitCode {
     let Some(run_id) = single_arg(options, "usage: whip artifacts <run-id>") else {
         return ExitCode::from(2);
     };
-    let store = match open_store_or_exit(options) {
+    let store = match open_observation_store_or_exit(options) {
         Ok(store) => store,
         Err(code) => return code,
     };
@@ -35796,7 +35796,7 @@ fn evidence(options: &CliOptions) -> ExitCode {
     else {
         return ExitCode::from(2);
     };
-    let store = match open_store_or_exit(options) {
+    let store = match open_observation_store_or_exit(options) {
         Ok(store) => store,
         Err(code) => return code,
     };
@@ -35845,7 +35845,7 @@ fn diagnostics(options: &CliOptions) -> ExitCode {
         return ExitCode::from(2);
     };
     let instance_id = instance_id.as_str();
-    let store = match open_store_or_exit(options) {
+    let store = match open_observation_store_or_exit(options) {
         Ok(store) => store,
         Err(code) => return code,
     };
@@ -35889,7 +35889,7 @@ fn trace(options: &CliOptions) -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let store = match open_store_or_exit(options) {
+    let store = match open_observation_store_or_exit(options) {
         Ok(store) => store,
         Err(code) => return code,
     };
@@ -40445,6 +40445,18 @@ fn open_native_stores_or_exit(
     };
     opened.map_err(|error| {
         eprintln!("{}", store_error(error));
+        ExitCode::FAILURE
+    })
+}
+
+/// Observation never bootstraps or repairs the runtime being investigated.
+fn open_observation_store_or_exit(options: &CliOptions) -> Result<SqliteStore, ExitCode> {
+    SqliteStore::open_read_only(&options.store_path).map_err(|error| {
+        eprintln!(
+            "failed to open existing store `{}` for observation: {}",
+            options.store_path.display(),
+            store_error(error)
+        );
         ExitCode::FAILURE
     })
 }
