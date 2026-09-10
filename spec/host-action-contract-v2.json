@@ -1,0 +1,69 @@
+{
+  "schema": "whipplescript.host_action_contract_pin.v2",
+  "contract_revision": "whipplescript-host-action/v2.0.0",
+  "authority": "WhippleScript DR-0099",
+  "operations": [
+    "admit_action",
+    "execute_action_file_effect",
+    "read_action_result",
+    "reconcile_effect",
+    "reconcile_versioned_save",
+    "execute_scoped_save_file_effect",
+    "reconcile_scoped_versioned_save"
+  ],
+  "dispatch_kinds": [
+    "file.read",
+    "file.write",
+    "file.import",
+    "file.export"
+  ],
+  "message_types": [
+    "HostActionCommand",
+    "ActionAdmissionReceipt",
+    "ExecuteActionEffect",
+    "ReadActionResult",
+    "ActionResultSnapshot",
+    "ReconcileEffectCommand",
+    "ReconciliationReceipt",
+    "SaveReceipt",
+    "WriteEvidenceRef",
+    "ResolutionMemoryReceipt",
+    "ResolutionMemoryScope",
+    "ScopedSaveReceipt"
+  ],
+  "compatibility": {
+    "schema_validity_grants_authority": false,
+    "receipt_handles_grant_authority": false,
+    "reconciliation_advances_workflow": false,
+    "legacy_turn_decoding_changed": false,
+    "save_receipts_may_contain_protected_content": true,
+    "complete_product_mediation": false,
+    "namespace_identity_grants_authority": false,
+    "resolution_receipt_authorizes_recording": false
+  },
+  "canonicalization": {
+    "encoding": "UTF-8",
+    "object_key_order": "Unicode scalar order; not UTF-16 or RFC 8785",
+    "integers": "Exact u64/i64 JSON integers; do not normalize through binary floating point",
+    "optional_fields": "Normalize with the pinned Rust codec before signing; absent and explicit null optional fields share its typed meaning",
+    "signing_domain_terminator": "NUL byte; domains are defined by the pinned runtime protocol"
+  },
+  "base_contract": {
+    "path": "spec/host-action-contract-v1.json",
+    "sha256": "85f732c4d2803ca487ef6204d39cab8854157661274e77bc586953c5033e615c",
+    "contract_digest": "17575ebb1b477d939a2bfc71bb07d866ba2ac45b4230f2b36ac6221a0886685e"
+  },
+  "wire_schema": {
+    "path": "spec/report-schemas/host_action_v2.schema.json",
+    "sha256": "8cc020f3039eb2b9107ee44f4ccecd8588397d5a79994d15f33657b27bc40496"
+  },
+  "fixtures": {
+    "path": "spec/host-action-contract-fixtures-v2.json",
+    "sha256": "c58c7ac71f4e1947e10b5700d377d4beba32301e29c87a830bfe657284f282cd"
+  },
+  "codec_harness": {
+    "path": "crates/whipplescript-kernel/examples/host_action_contract_v2.rs",
+    "sha256": "9c48857e52136bb1252b8505db99a0042a77ad3e19bc074647dbb545a1eef94d"
+  },
+  "contract_digest": "538cb089bc1cc564610c2fa3786837a7a0aa3037018e88cb10e63ae57f4926ca"
+}

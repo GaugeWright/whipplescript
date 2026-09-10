@@ -20,6 +20,9 @@
 //! head guards make a racing writer a refused normal outcome rather
 //! than a lost update.
 
+pub mod resolution_recording;
+pub mod resolution_scope;
+
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 
@@ -83,6 +86,8 @@ pub struct SaveCommitPlan<'a> {
     pub draft: &'a str,
     pub accepted: &'a str,
     pub pieces: Option<&'a [MergePiece]>,
+    pub resolution_scope: Option<&'a resolution_scope::ResolutionMemoryScope>,
+    pub resolution_observations: &'a [resolution_scope::ResolutionLookup],
 }
 
 /// Pure result construction. The VCS retains the returned bytes, then commits
@@ -1365,7 +1370,7 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
         cut_id: &str,
         at: &str,
     ) -> StoreResult<VcsWriteOutcome> {
-        self.write_from_with_evidence(row, path, body, cut_id, at, None)
+        self.write_from_with_evidence(row, path, body, cut_id, at, None, &[])
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1377,6 +1382,7 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
         cut_id: &str,
         at: &str,
         evidence: Option<&crate::branches::write_evidence::WriteEvidenceRef>,
+        retained_inputs: &[String],
     ) -> StoreResult<VcsWriteOutcome> {
         let branch_id = row.branch_id.as_str();
         if row.status != BranchStatus::Active {
@@ -1403,6 +1409,7 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
             &working_set.changes(),
         )?;
         let mut prepared_ids = prepared.ids();
+        prepared_ids.extend(retained_inputs.iter().cloned());
         if let Some(evidence) = evidence {
             prepared_ids.push(evidence.content_hash.clone());
         }
@@ -1638,6 +1645,15 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
     /// stays honestly Conflicted (`TextMergeOutcome::from_pieces`, the
     /// invariant pinned in text-merge-compose.maude's memory tier).
     fn apply_region_memory(&self, outcome: TextMergeOutcome) -> StoreResult<TextMergeOutcome> {
+        self.apply_region_memory_in_scope(outcome, None, &mut Vec::new())
+    }
+
+    fn apply_region_memory_in_scope(
+        &self,
+        outcome: TextMergeOutcome,
+        scope: Option<&resolution_scope::ResolutionMemoryScope>,
+        observations: &mut Vec<resolution_scope::ResolutionLookup>,
+    ) -> StoreResult<TextMergeOutcome> {
         let TextMergeOutcome::Conflicted { pieces } = outcome else {
             return Ok(outcome);
         };
@@ -1649,9 +1665,12 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
                     ours_text,
                     theirs_text,
                 } => {
-                    let key = Self::region_key(&base_text, &ours_text, &theirs_text);
+                    let key =
+                        Self::region_key_in_scope(scope, &base_text, &ours_text, &theirs_text)?;
                     let mut applied = None;
-                    if let Some(payload) = self.branches.resolution_memory(&key)? {
+                    if scope.is_some() {
+                        applied = self.observe_resolution_payload(key, observations)?;
+                    } else if let Some(payload) = self.branches.resolution_memory(&key)? {
                         if matches!(
                             self.content.status(&payload)?,
                             crate::content::BlobStatus::Live { .. }
@@ -1740,10 +1759,38 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
         builder: Option<&dyn SaveResultEvidenceBuilder>,
     ) -> StoreResult<SaveWithBaseOutcome> {
         self.record_region_resolutions(resolutions, at)?;
+        self.save_with_base_using_memory(
+            branch_id,
+            path,
+            draft,
+            base_cut_id,
+            cut_id,
+            at,
+            builder,
+            None,
+            &mut Vec::new(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn save_with_base_using_memory(
+        &mut self,
+        branch_id: &str,
+        path: &str,
+        draft: &str,
+        base_cut_id: &str,
+        cut_id: &str,
+        at: &str,
+        builder: Option<&dyn SaveResultEvidenceBuilder>,
+        scope: Option<&resolution_scope::ResolutionMemoryScope>,
+        observations: &mut Vec<resolution_scope::ResolutionLookup>,
+    ) -> StoreResult<SaveWithBaseOutcome> {
         if self.branches.get_cut(base_cut_id)?.is_none() {
             return Ok(SaveWithBaseOutcome::UnknownBaseCut);
         }
         for _ in 0..3 {
+            // A losing candidate's lookups cannot describe the next candidate.
+            observations.clear();
             let Some(branch) = self.branches.get_branch(branch_id)? else {
                 return Ok(SaveWithBaseOutcome::BranchMissing);
             };
@@ -1765,6 +1812,8 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
                         draft,
                         accepted: draft,
                         pieces: None,
+                        resolution_scope: scope,
+                        resolution_observations: observations,
                     },
                 )?;
                 match self.write_from_with_evidence(
@@ -1774,6 +1823,7 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
                     cut_id,
                     at,
                     evidence.as_ref(),
+                    &[],
                 ) {
                     Ok(VcsWriteOutcome::Written { cut_id, .. }) => {
                         return Ok(SaveWithBaseOutcome::Written { cut_id });
@@ -1804,7 +1854,7 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
                     }])
                 }
             };
-            match self.apply_region_memory(outcome)? {
+            match self.apply_region_memory_in_scope(outcome, scope, observations)? {
                 TextMergeOutcome::Clean { merged, pieces } => {
                     let evidence = self.prepare_save_evidence(
                         builder,
@@ -1817,6 +1867,8 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
                             draft,
                             accepted: &merged,
                             pieces: Some(&pieces),
+                            resolution_scope: scope,
+                            resolution_observations: observations,
                         },
                     )?;
                     match self.write_from_with_evidence(
@@ -1826,6 +1878,7 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
                         cut_id,
                         at,
                         evidence.as_ref(),
+                        &resolution_scope::applied_ids(observations),
                     ) {
                         Ok(VcsWriteOutcome::Written { cut_id, .. }) => {
                             return Ok(SaveWithBaseOutcome::Merged {
@@ -4891,6 +4944,7 @@ mod tests {
                     "candidate",
                     "t1",
                     Some(&reference),
+                    &[],
                 )
                 .expect_err("collected preparation");
             let selected = workspace

@@ -21,6 +21,9 @@ use crate::host_protocol::{
 use crate::ifc::VerifiedEnvelope;
 use crate::{idempotency_key, ProgramVersionInput, RuntimeKernel};
 
+mod scoped_save;
+pub use scoped_save::ScopedSaveExecutionAuthority;
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 struct InstanceMetadata {
     protocol: String,
@@ -149,6 +152,34 @@ impl<S: RuntimeStore> GovernedHostFacade<S> {
     where
         S: whipplescript_store::log_append::LogAppend,
     {
+        let (verified, _) = self.prepare_file_action_execution(request, action, verifier, proof)?;
+        if files.scoped_save_binding().is_some() {
+            return Err(ProtocolError::Mismatch(
+                "scoped save requires verified memory execution authority",
+            )
+            .into());
+        }
+        self.kernel
+            .execute_verified_file_effect(verified, files)
+            .map_err(HostFacadeError::Store)
+    }
+
+    fn prepare_file_action_execution(
+        &self,
+        request: crate::host_protocol::execution::ExecuteActionEffect,
+        action: &crate::host_action::CompiledHostAction,
+        verifier: &dyn crate::host_protocol::execution::ActionExecutionVerifier,
+        proof: &[u8],
+    ) -> Result<
+        (
+            crate::host_protocol::execution::VerifiedActionExecution,
+            crate::host_protocol::action::HostActionCommand,
+        ),
+        HostFacadeError,
+    >
+    where
+        S: whipplescript_store::log_append::LogAppend,
+    {
         self.require_policy(&request.policy)?;
         let authenticated = crate::host_protocol::execution::AuthenticatedActionExecution::verify(
             request,
@@ -184,9 +215,7 @@ impl<S: RuntimeStore> GovernedHostFacade<S> {
             .find(|effect| effect.effect_id == request.effect_id)
             .ok_or(ProtocolError::Mismatch("execution effect is not claimable"))?;
         let verified = authenticated.authorize(&original, effect, verifier)?;
-        self.kernel
-            .execute_verified_file_effect(verified, files)
-            .map_err(HostFacadeError::Store)
+        Ok((verified, original))
     }
 
     /// Retrieve recorded action evidence under current read authority. This
@@ -236,6 +265,41 @@ impl<S: RuntimeStore> GovernedHostFacade<S> {
             .map_err(HostFacadeError::Store)?;
         let verified =
             crate::save_reconciliation::prepare(&command, source, &prefix, authority, proof)?;
+        self.reconcile_effect(
+            command,
+            owner_epoch,
+            &verified,
+            proof,
+            verified.target_proof(),
+        )
+    }
+
+    /// Reconcile a v2 result only after the host verifies the original and
+    /// current knowledge scope. A legacy save verifier cannot grant this read.
+    pub fn reconcile_scoped_versioned_save<B, C>(
+        &mut self,
+        command: crate::host_protocol::recovery::ReconcileEffectCommand,
+        owner_epoch: i64,
+        source: &crate::save_reconciliation::ScopedVersionedSaveEvidenceSource<'_, B, C>,
+        authority: &dyn crate::save_reconciliation::ScopedSaveReconciliationAuthority,
+        proof: &[u8],
+    ) -> Result<crate::host_protocol::recovery::ReconciliationReceipt, HostFacadeError>
+    where
+        S: whipplescript_store::log_append::LogAppend,
+        B: whipplescript_store::branches::Branches,
+        C: whipplescript_store::content::ContentBlobs,
+    {
+        self.require_policy(&command.policy)?;
+        authority.authenticate(&command, &command.signing_bytes()?, proof)?;
+        self.require_governed(&command.evidence.evidence_ref)?;
+        let prefix = self
+            .kernel
+            .store()
+            .chain_prefix(&command.evidence.frame.instance_id)
+            .map_err(HostFacadeError::Store)?;
+        let verified = crate::save_reconciliation::prepare_scoped(
+            &command, source, &prefix, authority, proof,
+        )?;
         self.reconcile_effect(
             command,
             owner_epoch,

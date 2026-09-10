@@ -93,5 +93,24 @@ class BundleIntegrity(unittest.TestCase):
         contract.check_revision(self.pin, None)
 
 
+class JourneyCoverage(unittest.TestCase):
+    def test_every_actor_placement_mode_and_codec_is_required(self):
+        coverage = set()
+        for placement in ('native', 'hosted'):
+            for actor in ('person', 'agent'):
+                coverage.update((placement, f'{actor}:1', name) for name in ('ReadActionResult', 'ActionResultSnapshot'))
+                for mode in ('saved', 'conflict', 'interrupted', 'failed-after-apply'):
+                    names = {'HostActionCommand', 'ActionAdmissionReceipt', 'ExecuteActionEffect', 'SaveReceipt'}
+                    if mode != 'conflict':
+                        names |= {'WriteEvidenceRef', 'ReconcileEffectCommand', 'ReconciliationReceipt'}
+                    for codec in ('text', 'reference', 'enveloped-reference'):
+                        coverage.update((placement, f'{actor}:one/{mode}/{codec}', name) for name in names)
+        contract.check_journey_coverage(coverage)
+        for placement, scenario, name in sorted(coverage):
+            with self.subTest(placement=placement, scenario=scenario, name=name):
+                with self.assertRaises(SystemExit):
+                    contract.check_journey_coverage(coverage - {(placement, scenario, name)})
+
+
 if __name__ == "__main__":
     unittest.main()

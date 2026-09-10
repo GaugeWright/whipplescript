@@ -15,6 +15,8 @@
 //! terminal — the record is immutable history, never rewritten (the
 //! no-destructive-verbs surface).
 
+pub mod resolution_batch;
+pub mod resolution_origin;
 pub mod write_commit;
 pub mod write_evidence;
 
@@ -635,6 +637,22 @@ pub trait Branches {
         resolution: Option<&str>,
         at: &str,
     ) -> StoreResult<bool>;
+    /// Commit all first-wins memory entries and their immutable receipt together.
+    /// Same operation and meaning recovers the original outcome; changed meaning refuses.
+    fn record_resolution_batch(
+        &mut self,
+        request: &resolution_batch::ResolutionMemoryBatch,
+    ) -> StoreResult<resolution_batch::ResolutionMemoryReceipt>;
+    /// Read evidence without executing the recording again.
+    fn resolution_batch(
+        &self,
+        operation_id: &str,
+    ) -> StoreResult<Option<resolution_batch::ResolutionMemoryReceipt>>;
+    /// Atomically observe the value and its exact inserting receipt, if indexed.
+    fn resolution_observation(
+        &self,
+        triple_key: &str,
+    ) -> StoreResult<resolution_origin::ResolutionObservation>;
     /// The stored resolution for a content triple, if any.
     fn resolution_memory(&self, triple_key: &str) -> StoreResult<Option<String>>;
     /// Store a resolution keyed by its content triple (first one wins;
@@ -736,6 +754,34 @@ impl BranchStore {
         ] {
             collect(&self.connection, sql, &mut roots)?;
         }
+        let mut statement = self
+            .connection
+            .prepare("SELECT operation_id, receipt_json, receipt_hash FROM resolution_batches")?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        for row in rows {
+            let (operation_id, json, digest) = row?;
+            let receipt =
+                resolution_batch::ResolutionMemoryReceipt::decode(&operation_id, &json, &digest)?;
+            roots.extend(
+                receipt
+                    .request
+                    .entries
+                    .into_iter()
+                    .map(|entry| entry.resolution)
+                    .chain(
+                        receipt
+                            .outcomes
+                            .into_iter()
+                            .map(|outcome| outcome.resolution),
+                    ),
+            );
+        }
         Ok(roots)
     }
 }
@@ -808,7 +854,7 @@ fn map_op_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoreResult<OpRow>> {
 #[cfg(feature = "native")]
 /// This store's schema generation. Bumped when its `CREATE TABLE` set
 /// changes in a way an older build cannot read.
-const SATELLITE_SCHEMA_VERSION: i64 = 2;
+const SATELLITE_SCHEMA_VERSION: i64 = 4;
 
 #[cfg(feature = "native")]
 fn ensure_branch_schema(connection: &Connection) -> StoreResult<()> {
@@ -817,6 +863,8 @@ fn ensure_branch_schema(connection: &Connection) -> StoreResult<()> {
     // parsed. `SqliteStore` has refused that since Phase B.
     crate::stamp_satellite_schema(connection, "branch", SATELLITE_SCHEMA_VERSION)?;
     connection.execute_batch(write_evidence::CREATE)?;
+    connection.execute_batch(resolution_batch::CREATE)?;
+    connection.execute_batch(resolution_origin::CREATE)?;
     connection.execute_batch(
         r#"
         CREATE TABLE IF NOT EXISTS branches (
@@ -1781,6 +1829,27 @@ impl Branches for BranchStore {
             params![conflict_id, state, resolution, at],
         )?;
         Ok(changed > 0)
+    }
+
+    fn record_resolution_batch(
+        &mut self,
+        request: &resolution_batch::ResolutionMemoryBatch,
+    ) -> StoreResult<resolution_batch::ResolutionMemoryReceipt> {
+        resolution_batch::native_record(self, request)
+    }
+
+    fn resolution_batch(
+        &self,
+        operation_id: &str,
+    ) -> StoreResult<Option<resolution_batch::ResolutionMemoryReceipt>> {
+        resolution_batch::native_read(&self.connection, operation_id)
+    }
+
+    fn resolution_observation(
+        &self,
+        triple_key: &str,
+    ) -> StoreResult<resolution_origin::ResolutionObservation> {
+        resolution_origin::native_read(&self.connection, triple_key)
     }
 
     fn resolution_memory(&self, triple_key: &str) -> StoreResult<Option<String>> {

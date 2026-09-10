@@ -192,7 +192,7 @@ mod tests {
         assert!(matches!(
             crate::stamp_satellite_schema(&store.connection, "branch", 1),
             Err(StoreError::UnsupportedVersion {
-                found: 2,
+                found: 4,
                 supported: 1,
                 ..
             })

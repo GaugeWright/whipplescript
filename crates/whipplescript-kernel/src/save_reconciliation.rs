@@ -1,5 +1,9 @@
 //! Current authority plus the actual retained target result, over the existing
 //! reconciliation protocol. This door never writes a target or advances rules.
+mod scoped;
+pub(crate) use scoped::prepare_scoped;
+pub use scoped::{ScopedSaveReconciliationAuthority, ScopedVersionedSaveEvidenceSource};
+
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use whipplescript_store::branches::Branches;
@@ -147,6 +151,37 @@ pub(crate) fn prepare<B: Branches, C: ContentBlobs>(
     authority: &dyn SaveReconciliationAuthority,
     authorization: &[u8],
 ) -> Result<VerifiedSaveEvidence, HostFacadeError> {
+    prepare_target(
+        command,
+        source,
+        prefix,
+        authority,
+        authorization,
+        |_, _, attempt| {
+            read_committed_save(source.workspace, source.binding, attempt)
+                .map(|result| result.map(|saved| saved.receipt_json))
+                .map_err(|_| {
+                    ProtocolError::Mismatch(
+                        "versioned save retained target evidence is unavailable",
+                    )
+                    .into()
+                })
+        },
+    )
+}
+
+fn prepare_target<B: Branches, C: ContentBlobs>(
+    command: &ReconcileEffectCommand,
+    source: &VersionedSaveEvidenceSource<'_, B, C>,
+    prefix: &[OwnedChainEntry],
+    authority: &dyn SaveReconciliationAuthority,
+    authorization: &[u8],
+    read_target: impl FnOnce(
+        &HostActionCommand,
+        &ExecuteActionEffect,
+        &SaveAttempt,
+    ) -> Result<Option<String>, HostFacadeError>,
+) -> Result<VerifiedSaveEvidence, HostFacadeError> {
     let frame = &command.evidence.frame;
     let (original, admission_index) = crate::host_action::recorded_action_command(
         source.admission,
@@ -219,20 +254,24 @@ pub(crate) fn prepare<B: Branches, C: ContentBlobs>(
         run_id: frame.run_id.clone(),
         started_event_id: event.event_id.clone(),
     };
-    let result = read_committed_save(source.workspace, source.binding, &attempt).map_err(|_| {
-        ProtocolError::Mismatch("versioned save retained target evidence is unavailable")
-    })?;
+    let result = require_committed_target(read_target(&original, &execution, &attempt)?)?;
+    Ok(VerifiedSaveEvidence {
+        command: command.clone(),
+        signing: command.signing_bytes()?,
+        authorization: authorization.to_vec(),
+        target: result,
+    })
+}
+
+// Absence is an observation, never application evidence. Keep this check
+// shared by legacy and scoped readers before constructing a verified context.
+fn require_committed_target(result: Option<String>) -> Result<String, HostFacadeError> {
     let Some(result) = result else {
         return Err(
             ProtocolError::Mismatch("versioned save target has no committed result").into(),
         );
     };
-    Ok(VerifiedSaveEvidence {
-        command: command.clone(),
-        signing: command.signing_bytes()?,
-        authorization: authorization.to_vec(),
-        target: result.receipt_json,
-    })
+    Ok(result)
 }
 
 /// Read-only negative controls over a fixture's actual retained target and
@@ -441,3 +480,7 @@ mod ceiling_tests {
         }
     }
 }
+
+#[cfg(all(test, feature = "native"))]
+#[path = "save_reconciliation/target_result_tests.rs"]
+mod target_result_tests;

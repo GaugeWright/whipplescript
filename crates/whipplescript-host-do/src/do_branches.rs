@@ -14,6 +14,9 @@
 //! table (the one checkpoint manifests already live in), created
 //! defensively for stores that predate it.
 
+mod resolution_batch;
+mod resolution_origin;
+
 #[cfg(test)]
 mod write_tests;
 
@@ -48,6 +51,8 @@ impl<S: DoSql> DoBranches<S> {
             .execute(whipplescript_store::branches::write_evidence::CREATE, &[])
             .map_err(sql_err)?;
         for statement in [
+            whipplescript_store::branches::resolution_batch::CREATE,
+            whipplescript_store::branches::resolution_origin::CREATE,
             "CREATE TABLE IF NOT EXISTS branches (
                 branch_id TEXT PRIMARY KEY,
                 name TEXT,
@@ -1201,6 +1206,28 @@ impl<S: DoSql> Branches for DoBranches<S> {
             )
             .map_err(sql_err)?;
         Ok(!rows.is_empty())
+    }
+
+    fn record_resolution_batch(
+        &mut self,
+        request: &whipplescript_store::branches::resolution_batch::ResolutionMemoryBatch,
+    ) -> StoreResult<whipplescript_store::branches::resolution_batch::ResolutionMemoryReceipt> {
+        resolution_batch::record(&self.sql, request)
+    }
+
+    fn resolution_batch(
+        &self,
+        operation_id: &str,
+    ) -> StoreResult<Option<whipplescript_store::branches::resolution_batch::ResolutionMemoryReceipt>>
+    {
+        resolution_batch::read(&self.sql, operation_id)
+    }
+
+    fn resolution_observation(
+        &self,
+        triple_key: &str,
+    ) -> StoreResult<whipplescript_store::branches::resolution_origin::ResolutionObservation> {
+        resolution_origin::read(&self.sql, triple_key)
     }
 
     fn resolution_memory(&self, triple_key: &str) -> StoreResult<Option<String>> {

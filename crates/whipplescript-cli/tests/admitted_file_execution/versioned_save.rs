@@ -16,9 +16,19 @@ struct SaveFiles<B: Branches, C: ContentBlobs> {
     interrupted: bool,
     failed_after_apply: bool,
     calls: Cell<usize>,
+    reads: Cell<usize>,
 }
 impl<B: Branches, C: ContentBlobs> FileStore for SaveFiles<B, C> {
+    fn scoped_save_binding(
+        &self,
+    ) -> Option<(
+        &VersionedSaveBinding,
+        &whipplescript_store::vcs::resolution_scope::ResolutionMemoryScope,
+    )> {
+        self.inner.scoped_save_binding()
+    }
     fn read_content_reference(&self, path: &Path) -> io::Result<FileContentReference> {
+        self.reads.set(self.reads.get() + 1);
         self.inner.read_content_reference(path)
     }
     fn write_content_reference(
@@ -39,6 +49,7 @@ impl<B: Branches, C: ContentBlobs> FileStore for SaveFiles<B, C> {
         result
     }
     fn read_to_string(&self, path: &Path) -> io::Result<String> {
+        self.reads.set(self.reads.get() + 1);
         self.inner.read_to_string(path)
     }
     fn exists(&self, path: &Path) -> bool {
@@ -294,6 +305,7 @@ fn run<S, B, C>(
         interrupted: mode == "interrupted",
         failed_after_apply: mode == "failed-after-apply",
         calls: Cell::new(0),
+        reads: Cell::new(0),
     };
     let lease_seconds = if actor.starts_with("agent:") { 90 } else { 60 };
     if actor.starts_with("agent:") {
@@ -722,6 +734,7 @@ fn run<S, B, C>(
         ),
         &command,
         mode,
+        &scenario,
     );
     assert_eq!(files.calls.get(), 1, "reconciliation never writes");
 }
@@ -769,3 +782,6 @@ fn admitted_versioned_save_survives_target_commit_and_retains_conflicts_on_both_
         }
     }
 }
+
+#[path = "versioned_save/scoped_reconciliation.rs"]
+mod scoped_reconciliation;

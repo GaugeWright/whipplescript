@@ -96,6 +96,18 @@ impl From<io::Error> for FileWriteFailure {
 /// The byte-I/O operations a file effect performs, abstracted over the physical
 /// backing. Object-safe so a durable-object backend can be used as `&dyn`.
 pub trait FileStore {
+    /// Pure declaration of a scoped versioned-save realization. Wrappers must
+    /// forward it unchanged. It describes the actual binding used by their I/O;
+    /// neither the descriptor nor this query grants authority to access it.
+    fn scoped_save_binding(
+        &self,
+    ) -> Option<(
+        &crate::vcs_file_save::VersionedSaveBinding,
+        &crate::vcs::resolution_scope::ResolutionMemoryScope,
+    )> {
+        None
+    }
+
     /// Resolve an admitted immutable input without passing its body through an
     /// effect value. Unsupported stores must not fall back to an inline read.
     fn read_content_reference(&self, _path: &Path) -> io::Result<FileContentReference> {

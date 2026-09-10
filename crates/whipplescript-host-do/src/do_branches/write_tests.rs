@@ -231,3 +231,10 @@ fn hosted_write_evidence_rolls_back_every_sql_boundary() {
         "two reads and all four writes must be exercised"
     );
 }
+
+#[test]
+fn hosted_scoped_save_adapter_preserves_original_evidence() {
+    whipplescript_store::vcs_file_save::scoped_conformance::check(|| {
+        super::compose_vcs(&RusqliteDoSql::with_runtime_schema()).expect("hosted workspace")
+    });
+}

@@ -187,6 +187,8 @@ python3 scripts/check-workstream-host-contract.py
 echo "== host action contract =="
 python3 scripts/check-host-action-contract.py
 python3 scripts/test-host-action-contract.py
+python3 scripts/check-host-action-contract-v2.py
+python3 scripts/test-host-action-contract-v2.py
 
 echo "== refusal scanner contracts =="
 python3 scripts/test-mutation-sweep.py

@@ -977,8 +977,8 @@ describe("real WorkflowInstance hibernation", () => {
     expect(state.status, await state.clone().text()).toBe(409);
   });
 
-  it("re-arms collection when a request first observes expiry", async () => {
-    const sessionId = "session-request-observed-expiry";
+  it.each([false, true])("collects after request-observed expiry, alarm already fired: %s", async (alreadyFired) => {
+    const sessionId = `session-request-observed-expiry-${alreadyFired}`;
     const namespace = (env as unknown as TestEnv).WORKFLOW_INSTANCE;
     const stub = namespace.get(namespace.idFromName(sessionId));
     await bootstrapSession(stub, sessionId, false, {
@@ -1005,17 +1005,21 @@ describe("real WorkflowInstance hibernation", () => {
       headers: { authorization: "Bearer session-token" },
     });
     expect(observed.status, await observed.clone().text()).toBe(410);
-    expect(await runInDurableObject(stub, async (_instance, state) =>
-      state.storage.getAlarm()
-    )).not.toBeNull();
-    expect(await runDurableObjectAlarm(stub)).toBe(true);
-
     const deployments = (env as unknown as TestEnv).SESSION_ADMISSION;
     const deployment = deployments.get(deployments.idFromName("theory-a-test"));
-    expect(await runInDurableObject(deployment, async (_instance, state) =>
-      state.storage.get<number>(`operation:${sessionId}:deposit`)
-    )).toBe(1);
-  });
+    const depositedOnce = async () => {
+      expect(await runInDurableObject(deployment, async (_instance, state) =>
+        state.storage.get<number>(`operation:${sessionId}:deposit`)
+      )).toBe(1);
+    };
+    // A past deadline is armed one second out. Under load the real alarm can
+    // finish before the test inspects it: null then means completed, not lost.
+    // Exercise both observation orders; manual delivery cannot invent an alarm
+    // when the request failed to schedule one, so removing re-arming still fails.
+    if (alreadyFired) await vi.waitFor(depositedOnce, { timeout: 5_000 });
+    await runDurableObjectAlarm(stub);
+    await vi.waitFor(depositedOnce, { timeout: 5_000 });
+  }, 10_000);
 
 
   it("emits only declared paths, seals to the admitted recipient, and deposits once", async ({

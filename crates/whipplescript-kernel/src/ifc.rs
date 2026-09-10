@@ -28,6 +28,8 @@ use whipplescript_parser::{
 
 use crate::host_policy::{PlacementPolicy, ProviderBindingPolicy};
 
+mod resource_flow;
+
 /// The bottom reader-authority: data readable by `public` is readable by anyone,
 /// and `public` itself holds no authority above itself.
 const PUBLIC: &str = "public";
@@ -592,6 +594,19 @@ impl Envelope {
                 {
                     principals.insert(name.clone());
                 }
+                for field in ["reader_sink", "writer_sink"] {
+                    let valid = match label.get(field) {
+                        None => true,
+                        Some(serde_json::Value::String(role)) => !role.trim().is_empty(),
+                        Some(serde_json::Value::Array(roles)) => roles
+                            .iter()
+                            .all(|role| role.as_str().is_some_and(|role| !role.trim().is_empty())),
+                        _ => false,
+                    };
+                    if !valid {
+                        return Err("invalid IFC envelope: directional labels must be nonblank roles or arrays of nonblank roles".into());
+                    }
+                }
                 let mut reader_set =
                     qualify_role_set(parse_role_set(label, "reader"), authority_ref);
                 // back-compat: `confidential: true` is the single-compartment label
@@ -604,34 +619,32 @@ impl Envelope {
                 {
                     reader_set.insert("confidential".to_owned());
                 }
-                if !reader_set.is_empty() {
-                    let sink =
-                        qualify_role_set(parse_role_set(label, "reader_sink"), authority_ref);
+                let reader_sink = if label.get("reader_sink").is_some() {
+                    qualify_role_set(parse_role_set(label, "reader_sink"), authority_ref)
+                } else {
+                    reader_set.clone()
+                };
+                if !reader_set.is_empty() || !reader_sink.is_empty() {
                     readers.insert(
                         name.clone(),
-                        if sink.is_empty() {
-                            DualLabel::both(reader_set)
-                        } else {
-                            DualLabel {
-                                source: reader_set,
-                                sink,
-                            }
+                        DualLabel {
+                            source: reader_set,
+                            sink: reader_sink,
                         },
                     );
                 }
                 let writer_set = qualify_role_set(parse_role_set(label, "writer"), authority_ref);
-                if !writer_set.is_empty() {
-                    let sink =
-                        qualify_role_set(parse_role_set(label, "writer_sink"), authority_ref);
+                let writer_sink = if label.get("writer_sink").is_some() {
+                    qualify_role_set(parse_role_set(label, "writer_sink"), authority_ref)
+                } else {
+                    writer_set.clone()
+                };
+                if !writer_set.is_empty() || !writer_sink.is_empty() {
                     integrity.insert(
                         name.clone(),
-                        if sink.is_empty() {
-                            DualLabel::both(writer_set)
-                        } else {
-                            DualLabel {
-                                source: writer_set,
-                                sink,
-                            }
+                        DualLabel {
+                            source: writer_set,
+                            sink: writer_sink,
                         },
                     );
                 }

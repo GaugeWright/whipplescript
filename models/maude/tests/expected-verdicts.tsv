@@ -142,3 +142,4 @@ workstream.maude	SSSNNNNN
 save-result-retention.maude	SNSNSNSNSSSN
 prepared-publication.maude	SNSSSSSSN
 file-settlement.maude	SNSNSNSSNS
+scoped-save-reconciliation.maude	SNSNSNSNSNSNSNSS

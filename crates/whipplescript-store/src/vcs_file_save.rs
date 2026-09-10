@@ -3,7 +3,10 @@
 //! adapter neither authenticates a caller nor turns dispatch coordinates into
 //! a grant. It preserves the existing merge engine and atomic write receipt.
 mod recovery;
+mod scoped;
 pub use recovery::{read_committed_save, RecoveredSave, SaveResultBinding};
+pub use scoped::conformance as scoped_conformance;
+pub use scoped::{read_committed_scoped_save, ScopedSaveReceipt, SCOPED_SAVE_RECEIPT_SCHEMA};
 
 use std::cell::RefCell;
 use std::io;
@@ -18,6 +21,7 @@ use crate::files::{
     FileWriteContext, FileWriteEvidence, FileWriteFailure,
 };
 use crate::text_merge::MergePiece;
+use crate::vcs::resolution_scope::{ResolutionLookup, ResolutionMemoryScope};
 use crate::vcs::{SaveWithBaseOutcome, WorkspaceVcs};
 
 pub const SAVE_RECEIPT_SCHEMA: &str = "whipplescript.vcs-save-result.v1";
@@ -109,6 +113,7 @@ pub fn save_cut_id(instance_id: &str, effect_id: &str) -> String {
 pub struct VersionedSaveFileStore<B: Branches, C: ContentBlobs> {
     workspace: RefCell<WorkspaceVcs<B, C>>,
     binding: VersionedSaveBinding,
+    resolution_scope: Option<ResolutionMemoryScope>,
 }
 
 fn io_error(error: impl std::fmt::Debug) -> io::Error {
@@ -150,6 +155,7 @@ impl<B: Branches, C: ContentBlobs> VersionedSaveFileStore<B, C> {
         Ok(Self {
             workspace: RefCell::new(workspace),
             binding,
+            resolution_scope: None,
         })
     }
 
@@ -159,7 +165,15 @@ impl<B: Branches, C: ContentBlobs> VersionedSaveFileStore<B, C> {
             .map_err(io_error)
     }
 
-    fn evidence(&self, attempt: SaveAttempt, result: SaveResult) -> io::Result<FileWriteEvidence> {
+    fn evidence(
+        &self,
+        attempt: SaveAttempt,
+        result: SaveResult,
+        observations: Vec<ResolutionLookup>,
+    ) -> io::Result<FileWriteEvidence> {
+        if let Some(scope) = &self.resolution_scope {
+            return scoped::evidence(&self.binding, scope, attempt, result, observations);
+        }
         let receipt = SaveReceipt {
             protocol: SAVE_RECEIPT_SCHEMA.into(),
             branch_id: self.binding.branch_id.clone(),
@@ -179,6 +193,12 @@ impl<B: Branches, C: ContentBlobs> VersionedSaveFileStore<B, C> {
 }
 
 impl<B: Branches, C: ContentBlobs> FileStore for VersionedSaveFileStore<B, C> {
+    fn scoped_save_binding(&self) -> Option<(&VersionedSaveBinding, &ResolutionMemoryScope)> {
+        self.resolution_scope
+            .as_ref()
+            .map(|scope| (&self.binding, scope))
+    }
+
     fn read_content_reference(&self, path: &Path) -> io::Result<FileContentReference> {
         if path != Path::new(SAVE_INPUT_PATH) {
             return Err(denied("save reference reads only its immutable input"));
@@ -290,21 +310,42 @@ impl<B: Branches, C: ContentBlobs> FileStore for VersionedSaveFileStore<B, C> {
         self.body_at(&workspace, &self.binding.base_cut_id)?;
         workspace.set_actor(Some(self.binding.executing_principal.clone()));
         workspace.set_intent(Some(serde_json::to_string(&attempt).map_err(io_error)?));
-        let outcome = workspace
-            .save_with_base_recorded(
-                &self.binding.branch_id,
-                &self.binding.path,
-                content,
-                &self.binding.base_cut_id,
-                &[],
-                &cut_id,
-                &self.binding.recorded_at,
-                Some(&recovery::SaveEvidenceBuilder {
-                    binding: &self.binding,
-                    attempt: &attempt,
-                }),
+        let builder = recovery::SaveEvidenceBuilder {
+            binding: &self.binding,
+            attempt: &attempt,
+            resolution_scope: self.resolution_scope.as_ref(),
+        };
+        let (outcome, observations) = if let Some(scope) = &self.resolution_scope {
+            let saved = workspace
+                .save_with_base_in_resolution_scope(
+                    scope,
+                    &self.binding.branch_id,
+                    &self.binding.path,
+                    content,
+                    &self.binding.base_cut_id,
+                    &cut_id,
+                    &self.binding.recorded_at,
+                    Some(&builder),
+                )
+                .map_err(io_error)?;
+            (saved.outcome, saved.observations)
+        } else {
+            (
+                workspace
+                    .save_with_base_recorded(
+                        &self.binding.branch_id,
+                        &self.binding.path,
+                        content,
+                        &self.binding.base_cut_id,
+                        &[],
+                        &cut_id,
+                        &self.binding.recorded_at,
+                        Some(&builder),
+                    )
+                    .map_err(io_error)?,
+                Vec::new(),
             )
-            .map_err(io_error)?;
+        };
         match outcome {
             SaveWithBaseOutcome::Written { .. } | SaveWithBaseOutcome::Merged { .. } => (),
             SaveWithBaseOutcome::Conflicted {
@@ -325,23 +366,21 @@ impl<B: Branches, C: ContentBlobs> FileStore for VersionedSaveFileStore<B, C> {
                             head_content,
                             pieces,
                         },
+                        observations,
                     )?),
                 });
             }
-            refused => return Err(io_error(refused).into()),
+            refused => return Err(io_error(format!("versioned save refused: {refused:?}")).into()),
         };
         drop(workspace);
-        let recovered = self
-            .recover_result(&attempt)?
-            .ok_or_else(|| io_error("accepted save cut is unavailable"))?;
-        Ok(FileWriteAccepted {
-            content: recovered.accepted_content,
-            evidence: Some(FileWriteEvidence {
-                schema_ref: recovered.reference.schema_ref,
-                label_ref: recovered.reference.label_ref,
-                content: recovered.receipt_json,
-            }),
-        })
+        if self.resolution_scope.is_some() {
+            self.recover_scoped_result(&attempt)?
+                .map(recovery::RecoveredSave::into_accepted)
+        } else {
+            self.recover_result(&attempt)?
+                .map(recovery::RecoveredSave::into_accepted)
+        }
+        .ok_or_else(|| io_error("accepted save cut is unavailable").into())
     }
 }
 

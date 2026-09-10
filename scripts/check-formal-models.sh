@@ -103,6 +103,7 @@ else:
 PY
 
 declare -A EXPECTED_NO_SOLUTION=(
+  ["scoped-save-reconciliation.maude"]=7
   ["prepared-publication.maude"]=2
   ["save-result-retention.maude"]=5
   ["file-settlement.maude"]=4
@@ -245,6 +246,7 @@ declare -A EXPECTED_NO_SOLUTION=(
 )
 
 declare -A EXPECTED_SOLUTION=(
+  ["scoped-save-reconciliation.maude"]=9
   ["prepared-publication.maude"]=7
   ["save-result-retention.maude"]=7
   ["file-settlement.maude"]=6

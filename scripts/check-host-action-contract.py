@@ -112,7 +112,8 @@ def check_bundle():
     return pin, schema, cases
 
 
-def check_reports(schema, cases, reports):
+def check_reports(schema, cases, reports, types=None):
+    types = TYPES if types is None else types
     from jsonschema import Draft202012Validator
     Draft202012Validator.check_schema(schema)
     expected = {case["id"]: case for case in cases}
@@ -120,7 +121,7 @@ def check_reports(schema, cases, reports):
     require(set(ids) == set(expected) and len(ids) == len(expected), "emitter omitted or duplicated vectors")
     validators = {name: Draft202012Validator({
         "$schema": schema["$schema"], "$defs": schema["$defs"], "$ref": f"#/$defs/{name}",
-    }) for name in TYPES}
+    }) for name in types}
     for report in reports:
         case = expected[report["id"]]
         require(report["message_type"] == case["message_type"], f"{case['id']}: wrong emitted type")
@@ -135,7 +136,7 @@ def check_reports(schema, cases, reports):
             errors = list(validator.iter_errors(value))
             require((not errors) == case["schema_valid"],
                     f"{case['id']}: schema disagrees: " + "; ".join(error.message for error in errors))
-    print(f"host action schemas: {len(reports)} executed vectors, {len(TYPES)} message types")
+    print(f"host action schemas: {len(reports)} executed vectors, {len(types)} message types")
 
 
 
@@ -180,6 +181,11 @@ def check_journey_reports(schema, directory):
         require(not errors, f"{placement}/{scenario}/{name}: " + "; ".join(e.message for e in errors))
         coverage.add((placement, scenario, name))
         count += 1
+    check_journey_coverage(coverage)
+    print(f"host action schemas: {count} actual journey messages, native and deployed DO schema")
+
+
+def check_journey_coverage(coverage):
     for placement in ("native", "hosted"):
         require({name for place, _, name in coverage if place == placement} == TYPES,
                 f"{placement}: journey omitted a message type")
@@ -188,13 +194,13 @@ def check_journey_reports(schema, directory):
                 required = {"HostActionCommand", "ActionAdmissionReceipt", "ExecuteActionEffect", "SaveReceipt"}
                 if mode != "conflict":
                     required |= {"WriteEvidenceRef", "ReconcileEffectCommand", "ReconciliationReceipt"}
-                observed = {name for place, scenario, name in coverage
-                            if place == placement and scenario == f"{actor}:one/{mode}"}
-                require(required <= observed, f"{placement}/{actor}/{mode}: missing {sorted(required - observed)}")
+                for codec in ("text", "reference", "enveloped-reference"):
+                    observed = {name for place, scenario, name in coverage
+                                if place == placement and scenario == f"{actor}:one/{mode}/{codec}"}
+                    require(required <= observed, f"{placement}/{actor}/{mode}/{codec}: missing {sorted(required - observed)}")
             for name in ("ReadActionResult", "ActionResultSnapshot"):
                 require((placement, f"{actor}:1", name) in coverage,
                         f"{placement}/{actor}: missing result journey {name}")
-    print(f"host action schemas: {count} actual journey messages, native and deployed DO schema")
 
 
 def main():

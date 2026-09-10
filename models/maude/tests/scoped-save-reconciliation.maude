@@ -1,0 +1,59 @@
+load ../scoped-save-reconciliation.maude
+--- Positive: late exact evidence records application without changing failure.
+search [1] in WHIPPLESCRIPT-SCOPED-SAVE-RECOVERY :
+  request(a, true) original(a) current(a) receipt(a, live) journal(empty) failed
+  =>* journal(recorded(a)) delivered(a) failed C:Cfg .
+--- Authorization precedes a target read, not merely the eventual append.
+search [1] in WHIPPLESCRIPT-SCOPED-SAVE-RECOVERY :
+  request(a, false) original(a) current(a) receipt(a, live) journal(empty)
+  =>* observed(a) C:Cfg .
+search [1] in WHIPPLESCRIPT-SCOPED-SAVE-READ-FIRST :
+  request(a, false) original(a) current(a) receipt(a, live) journal(empty)
+  =>* observed(a) C:Cfg .
+--- Today's broader grant cannot redefine the original scope.
+search [1] in WHIPPLESCRIPT-SCOPED-SAVE-RECOVERY :
+  request(b, true) original(a) current(b) receipt(b, live) journal(empty)
+  =>* observed(b) C:Cfg .
+search [1] in WHIPPLESCRIPT-SCOPED-SAVE-TODAY-ONLY :
+  request(b, true) original(a) current(b) receipt(b, live) journal(empty)
+  =>* observed(b) C:Cfg .
+--- Original permission cannot substitute for current access.
+search [1] in WHIPPLESCRIPT-SCOPED-SAVE-RECOVERY :
+  request(a, true) original(a) current(b) receipt(a, live) journal(empty)
+  =>* observed(a) C:Cfg .
+search [1] in WHIPPLESCRIPT-SCOPED-SAVE-ORIGINAL-ONLY :
+  request(a, true) original(a) current(b) receipt(a, live) journal(empty)
+  =>* observed(a) C:Cfg .
+--- An authorizer cannot replace the runtime's independent target comparison.
+search [1] in WHIPPLESCRIPT-SCOPED-SAVE-RECOVERY :
+  request(a, true) original(a) current(a) receipt(b, live) journal(empty)
+  =>* delivered(a) C:Cfg .
+search [1] in WHIPPLESCRIPT-SCOPED-SAVE-REBOUND :
+  request(a, true) original(a) current(a) receipt(b, live) journal(empty)
+  =>* delivered(a) C:Cfg .
+--- Erasure reports unavailability, never manufactured application evidence.
+search [1] in WHIPPLESCRIPT-SCOPED-SAVE-RECOVERY :
+  request(a, true) original(a) current(a) receipt(a, erased) journal(empty)
+  =>* delivered(a) C:Cfg .
+search [1] in WHIPPLESCRIPT-SCOPED-SAVE-RECOVERY :
+  request(a, true) original(a) current(a) receipt(a, erased) journal(empty)
+  =>* unavailable(a) journal(empty) C:Cfg .
+--- An old reconciliation is not a grant to redeliver after revocation.
+search [1] in WHIPPLESCRIPT-SCOPED-SAVE-RECOVERY :
+  request(a, false) original(a) current(a) receipt(a, live) journal(recorded(a))
+  =>* delivered(a) C:Cfg .
+search [1] in WHIPPLESCRIPT-SCOPED-SAVE-OLD-PROOF :
+  request(a, false) original(a) current(a) receipt(a, live) journal(recorded(a))
+  =>* delivered(a) C:Cfg .
+--- Reconciliation must not take a success continuation after failure.
+search [1] in WHIPPLESCRIPT-SCOPED-SAVE-RECOVERY :
+  request(a, true) original(a) current(a) receipt(a, live) journal(empty) failed
+  =>* resumed C:Cfg .
+search [1] in WHIPPLESCRIPT-SCOPED-SAVE-RESUME :
+  request(a, true) original(a) current(a) receipt(a, live) journal(empty) failed
+  =>* resumed C:Cfg .
+--- Positive: authorized redelivery reuses the one journal record.
+search [1] in WHIPPLESCRIPT-SCOPED-SAVE-RECOVERY :
+  request(a, true) original(a) current(a) receipt(a, live) journal(recorded(a))
+  =>* delivered(a) journal(recorded(a)) C:Cfg .
+quit

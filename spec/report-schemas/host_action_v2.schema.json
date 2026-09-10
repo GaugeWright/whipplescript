@@ -1,0 +1,1442 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://whipplescript.dev/schemas/host_action_v2.schema.json",
+  "title": "WhippleScript host action contract v1",
+  "description": "Wire shapes and supported protocol versions. Schema validity neither authenticates a principal nor verifies delegation, command identity, policy, log pins, target evidence or authorization. Those checks remain mandatory runtime/host obligations. SaveReceipt is a protected payload and must not be copied to general history.",
+  "oneOf": [
+    {
+      "$ref": "#/$defs/HostActionCommand"
+    },
+    {
+      "$ref": "#/$defs/ActionAdmissionReceipt"
+    },
+    {
+      "$ref": "#/$defs/ExecuteActionEffect"
+    },
+    {
+      "$ref": "#/$defs/ReadActionResult"
+    },
+    {
+      "$ref": "#/$defs/ActionResultSnapshot"
+    },
+    {
+      "$ref": "#/$defs/ReconcileEffectCommand"
+    },
+    {
+      "$ref": "#/$defs/ReconciliationReceipt"
+    },
+    {
+      "$ref": "#/$defs/SaveReceipt"
+    },
+    {
+      "$ref": "#/$defs/WriteEvidenceRef"
+    },
+    {
+      "$ref": "#/$defs/ResolutionMemoryScope"
+    },
+    {
+      "$ref": "#/$defs/ScopedSaveReceipt"
+    },
+    {
+      "$ref": "#/$defs/ResolutionMemoryReceipt"
+    }
+  ],
+  "$defs": {
+    "PolicyEpochRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "epoch",
+        "envelope_hash",
+        "signer"
+      ],
+      "properties": {
+        "epoch": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 18446744073709551615
+        },
+        "envelope_hash": {
+          "type": "string"
+        },
+        "signer": {
+          "type": "string"
+        },
+        "key_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "ResourceRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "handle",
+        "kind"
+      ],
+      "properties": {
+        "handle": {
+          "type": "string"
+        },
+        "kind": {
+          "type": "string"
+        },
+        "selector": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "writable": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "PinnedPosition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "instance_ref",
+        "sequence",
+        "head_digest"
+      ],
+      "properties": {
+        "instance_ref": {
+          "type": "string"
+        },
+        "sequence": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 18446744073709551615
+        },
+        "head_digest": {
+          "type": "string"
+        }
+      }
+    },
+    "ActionBasis": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "version_ref"
+          ],
+          "properties": {
+            "kind": {
+              "const": "version"
+            },
+            "version_ref": {
+              "type": "string"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kind"
+          ],
+          "properties": {
+            "kind": {
+              "const": "absent"
+            }
+          }
+        }
+      ]
+    },
+    "ActionResource": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "resource",
+        "basis",
+        "label_ref"
+      ],
+      "properties": {
+        "resource": {
+          "$ref": "#/$defs/ResourceRef"
+        },
+        "basis": {
+          "$ref": "#/$defs/ActionBasis"
+        },
+        "label_ref": {
+          "type": "string"
+        }
+      }
+    },
+    "ActionInput": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "handle",
+        "version_ref",
+        "label_ref"
+      ],
+      "properties": {
+        "handle": {
+          "type": "string"
+        },
+        "version_ref": {
+          "type": "string"
+        },
+        "label_ref": {
+          "type": "string"
+        }
+      }
+    },
+    "ActionDelegation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "grant_ref",
+        "delegator",
+        "delegate"
+      ],
+      "properties": {
+        "grant_ref": {
+          "type": "string"
+        },
+        "delegator": {
+          "type": "string"
+        },
+        "delegate": {
+          "type": "string"
+        }
+      }
+    },
+    "ActionCause": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "authority",
+        "record_ref",
+        "digest"
+      ],
+      "properties": {
+        "authority": {
+          "type": "string"
+        },
+        "record_ref": {
+          "type": "string"
+        },
+        "digest": {
+          "type": "string"
+        }
+      }
+    },
+    "ActionProvenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "initiator",
+        "executor",
+        "delegation",
+        "origin",
+        "causes"
+      ],
+      "properties": {
+        "initiator": {
+          "type": "string"
+        },
+        "executor": {
+          "type": "string"
+        },
+        "delegation": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ActionDelegation"
+          }
+        },
+        "origin": {
+          "type": "string"
+        },
+        "causes": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ActionCause"
+          }
+        }
+      }
+    },
+    "HostActionCommand": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "protocol",
+        "issuer",
+        "scope",
+        "request_id",
+        "operation",
+        "program_version_ref",
+        "input_schema_ref",
+        "policy",
+        "provenance",
+        "inputs",
+        "resources"
+      ],
+      "properties": {
+        "protocol": {
+          "const": "whipplescript.host-action.v1"
+        },
+        "issuer": {
+          "type": "string"
+        },
+        "scope": {
+          "type": "string"
+        },
+        "request_id": {
+          "type": "string"
+        },
+        "operation": {
+          "type": "string"
+        },
+        "program_version_ref": {
+          "type": "string"
+        },
+        "input_schema_ref": {
+          "type": "string"
+        },
+        "policy": {
+          "$ref": "#/$defs/PolicyEpochRef"
+        },
+        "provenance": {
+          "$ref": "#/$defs/ActionProvenance"
+        },
+        "inputs": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/ActionInput"
+          }
+        },
+        "resources": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/ActionResource"
+          }
+        }
+      }
+    },
+    "ActionAdmissionReceipt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "protocol",
+        "fingerprint",
+        "instance_ref",
+        "admitted_at"
+      ],
+      "properties": {
+        "protocol": {
+          "const": "whipplescript.host-action.v1"
+        },
+        "fingerprint": {
+          "type": "string"
+        },
+        "instance_ref": {
+          "type": "string"
+        },
+        "admitted_at": {
+          "$ref": "#/$defs/PinnedPosition"
+        }
+      }
+    },
+    "ExecuteActionEffect": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "protocol",
+        "issuer",
+        "scope",
+        "admission",
+        "policy",
+        "provenance",
+        "effect_id",
+        "effect_fingerprint"
+      ],
+      "properties": {
+        "protocol": {
+          "const": "whipplescript.action-execution.v1"
+        },
+        "issuer": {
+          "type": "string"
+        },
+        "scope": {
+          "type": "string"
+        },
+        "admission": {
+          "$ref": "#/$defs/ActionAdmissionReceipt"
+        },
+        "policy": {
+          "$ref": "#/$defs/PolicyEpochRef"
+        },
+        "provenance": {
+          "$ref": "#/$defs/ActionProvenance"
+        },
+        "effect_id": {
+          "type": "string"
+        },
+        "effect_fingerprint": {
+          "type": "string"
+        }
+      }
+    },
+    "ReadActionResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "protocol",
+        "issuer",
+        "scope",
+        "policy",
+        "provenance",
+        "admission",
+        "evidence_handle",
+        "evidence_label_ref"
+      ],
+      "properties": {
+        "protocol": {
+          "const": "whipplescript.action-result.v1"
+        },
+        "issuer": {
+          "type": "string"
+        },
+        "scope": {
+          "type": "string"
+        },
+        "policy": {
+          "$ref": "#/$defs/PolicyEpochRef"
+        },
+        "provenance": {
+          "$ref": "#/$defs/ActionProvenance"
+        },
+        "admission": {
+          "$ref": "#/$defs/ActionAdmissionReceipt"
+        },
+        "evidence_handle": {
+          "type": "string"
+        },
+        "evidence_label_ref": {
+          "type": "string"
+        },
+        "through": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PinnedPosition"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "ActionEvidenceRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "event_id",
+        "sequence",
+        "kind"
+      ],
+      "properties": {
+        "event_id": {
+          "type": "string"
+        },
+        "sequence": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 18446744073709551615
+        },
+        "kind": {
+          "type": "string"
+        }
+      }
+    },
+    "ActionTerminalEvidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status",
+        "recorded_at",
+        "evidence"
+      ],
+      "properties": {
+        "status": {
+          "enum": [
+            "completed",
+            "failed"
+          ]
+        },
+        "recorded_at": {
+          "$ref": "#/$defs/PinnedPosition"
+        },
+        "evidence": {
+          "$ref": "#/$defs/ActionEvidenceRef"
+        }
+      }
+    },
+    "ActionAdmissionBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "fingerprint",
+        "sequence",
+        "head_digest"
+      ],
+      "properties": {
+        "fingerprint": {
+          "type": "string"
+        },
+        "sequence": {
+          "type": "integer",
+          "minimum": -9223372036854775808,
+          "maximum": 9223372036854775807
+        },
+        "head_digest": {
+          "type": "string"
+        }
+      }
+    },
+    "DispatchFrame": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "protocol",
+        "instance_id",
+        "effect_id",
+        "run_id",
+        "idempotency_key",
+        "kind",
+        "provider",
+        "input_fingerprint",
+        "execution_fingerprint"
+      ],
+      "properties": {
+        "protocol": {
+          "const": "whipplescript.effect-recovery.v1"
+        },
+        "instance_id": {
+          "type": "string"
+        },
+        "effect_id": {
+          "type": "string"
+        },
+        "run_id": {
+          "type": "string"
+        },
+        "idempotency_key": {
+          "type": "string"
+        },
+        "kind": {
+          "type": "string"
+        },
+        "provider": {
+          "type": "string"
+        },
+        "input_fingerprint": {
+          "type": "string"
+        },
+        "execution_fingerprint": {
+          "type": "string"
+        },
+        "target": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "action_admission": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ActionAdmissionBinding"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "DispatchMarker": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "frame",
+        "ceiling"
+      ],
+      "properties": {
+        "frame": {
+          "$ref": "#/$defs/DispatchFrame"
+        },
+        "ceiling": {
+          "enum": [
+            "repeatable_read",
+            "transactional",
+            "deduplicated",
+            "reconcilable",
+            "unverifiable"
+          ]
+        }
+      }
+    },
+    "DispositionEvidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "frame",
+        "disposition",
+        "evidence_ref",
+        "evidence_digest",
+        "authority_ref"
+      ],
+      "properties": {
+        "frame": {
+          "$ref": "#/$defs/DispatchFrame"
+        },
+        "disposition": {
+          "enum": [
+            "applied",
+            "not_applied"
+          ]
+        },
+        "evidence_ref": {
+          "type": "string"
+        },
+        "evidence_digest": {
+          "type": "string"
+        },
+        "authority_ref": {
+          "type": "string"
+        }
+      }
+    },
+    "AttemptDisposition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "run_id",
+        "disposition",
+        "evidence",
+        "disputed"
+      ],
+      "properties": {
+        "run_id": {
+          "type": "string"
+        },
+        "dispatch": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DispatchMarker"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "terminal_status": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "disposition": {
+          "enum": [
+            "not_dispatched",
+            "unknown",
+            "applied",
+            "not_applied"
+          ]
+        },
+        "evidence": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/DispositionEvidence"
+          }
+        },
+        "disputed": {
+          "type": "boolean"
+        }
+      }
+    },
+    "ActionEffectEvidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "effect_id",
+        "attempts"
+      ],
+      "properties": {
+        "effect_id": {
+          "type": "string"
+        },
+        "attempts": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/AttemptDisposition"
+          }
+        }
+      }
+    },
+    "ActionResultSnapshot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "protocol",
+        "admission",
+        "command",
+        "read_policy",
+        "evidence_handle",
+        "evidence_label_ref",
+        "observed_at",
+        "instance_status",
+        "status_evidence",
+        "effects",
+        "evidence"
+      ],
+      "properties": {
+        "protocol": {
+          "const": "whipplescript.action-result.v1"
+        },
+        "admission": {
+          "$ref": "#/$defs/ActionAdmissionReceipt"
+        },
+        "command": {
+          "$ref": "#/$defs/HostActionCommand"
+        },
+        "read_policy": {
+          "$ref": "#/$defs/PolicyEpochRef"
+        },
+        "evidence_handle": {
+          "type": "string"
+        },
+        "evidence_label_ref": {
+          "type": "string"
+        },
+        "observed_at": {
+          "$ref": "#/$defs/PinnedPosition"
+        },
+        "instance_status": {
+          "enum": [
+            "running",
+            "paused",
+            "completed",
+            "failed",
+            "cancelled"
+          ]
+        },
+        "status_evidence": {
+          "$ref": "#/$defs/ActionEvidenceRef"
+        },
+        "terminal": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ActionTerminalEvidence"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "effects": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ActionEffectEvidence"
+          }
+        },
+        "evidence": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ActionEvidenceRef"
+          }
+        }
+      }
+    },
+    "ReconcileEffectCommand": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "protocol",
+        "issuer",
+        "scope",
+        "request_id",
+        "policy",
+        "provenance",
+        "evidence",
+        "evidence_label_ref"
+      ],
+      "properties": {
+        "protocol": {
+          "const": "whipplescript.effect-reconciliation.v1"
+        },
+        "issuer": {
+          "type": "string"
+        },
+        "scope": {
+          "type": "string"
+        },
+        "request_id": {
+          "type": "string"
+        },
+        "policy": {
+          "$ref": "#/$defs/PolicyEpochRef"
+        },
+        "provenance": {
+          "$ref": "#/$defs/ActionProvenance"
+        },
+        "evidence": {
+          "$ref": "#/$defs/DispositionEvidence"
+        },
+        "evidence_label_ref": {
+          "type": "string"
+        }
+      }
+    },
+    "ReconciliationReceipt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "protocol",
+        "request_key",
+        "fingerprint",
+        "recorded_at"
+      ],
+      "properties": {
+        "protocol": {
+          "const": "whipplescript.effect-reconciliation.v1"
+        },
+        "request_key": {
+          "type": "string"
+        },
+        "fingerprint": {
+          "type": "string"
+        },
+        "recorded_at": {
+          "$ref": "#/$defs/PinnedPosition"
+        }
+      }
+    },
+    "SaveAttempt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "instance_id",
+        "effect_id",
+        "run_id",
+        "started_event_id"
+      ],
+      "properties": {
+        "instance_id": {
+          "type": "string"
+        },
+        "effect_id": {
+          "type": "string"
+        },
+        "run_id": {
+          "type": "string"
+        },
+        "started_event_id": {
+          "type": "string"
+        }
+      }
+    },
+    "MergePiece": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": true,
+          "required": [
+            "kind",
+            "text",
+            "provenance"
+          ],
+          "properties": {
+            "kind": {
+              "const": "merged"
+            },
+            "text": {
+              "type": "string"
+            },
+            "provenance": {
+              "enum": [
+                "base",
+                "ours",
+                "theirs",
+                "both",
+                "resolved"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": true,
+          "required": [
+            "kind",
+            "base_text",
+            "ours_text",
+            "theirs_text"
+          ],
+          "properties": {
+            "kind": {
+              "const": "conflict"
+            },
+            "base_text": {
+              "type": "string"
+            },
+            "ours_text": {
+              "type": "string"
+            },
+            "theirs_text": {
+              "type": "string"
+            }
+          }
+        }
+      ],
+      "description": "Existing merge payloads retain their extensible decoding; these are labeled payload bytes, not authority references."
+    },
+    "SaveResult": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "status",
+            "cut_id",
+            "operation_id",
+            "accepted_content_hash"
+          ],
+          "properties": {
+            "status": {
+              "const": "written"
+            },
+            "cut_id": {
+              "type": "string"
+            },
+            "parent_cut_id": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "operation_id": {
+              "type": "string"
+            },
+            "accepted_content_hash": {
+              "type": "string"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "status",
+            "cut_id",
+            "operation_id",
+            "accepted_content_hash",
+            "pieces"
+          ],
+          "properties": {
+            "status": {
+              "const": "merged"
+            },
+            "cut_id": {
+              "type": "string"
+            },
+            "parent_cut_id": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "operation_id": {
+              "type": "string"
+            },
+            "accepted_content_hash": {
+              "type": "string"
+            },
+            "pieces": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/MergePiece"
+              }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "status",
+            "pieces"
+          ],
+          "properties": {
+            "status": {
+              "const": "conflicted"
+            },
+            "head_cut_id": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "head_content": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "pieces": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/MergePiece"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "SaveReceipt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "protocol",
+        "branch_id",
+        "path",
+        "base_cut_id",
+        "draft_hash",
+        "executing_principal",
+        "attempt",
+        "result"
+      ],
+      "properties": {
+        "protocol": {
+          "const": "whipplescript.vcs-save-result.v1"
+        },
+        "branch_id": {
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        },
+        "base_cut_id": {
+          "type": "string"
+        },
+        "draft_hash": {
+          "type": "string"
+        },
+        "executing_principal": {
+          "type": "string"
+        },
+        "attempt": {
+          "$ref": "#/$defs/SaveAttempt"
+        },
+        "result": {
+          "$ref": "#/$defs/SaveResult"
+        }
+      }
+    },
+    "WriteEvidenceRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_ref",
+        "label_ref",
+        "content_hash"
+      ],
+      "properties": {
+        "schema_ref": {
+          "type": "string"
+        },
+        "label_ref": {
+          "type": "string"
+        },
+        "content_hash": {
+          "type": "string"
+        }
+      }
+    },
+    "ResolutionMemoryScope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "authority",
+        "resource",
+        "compartment"
+      ],
+      "properties": {
+        "authority": {
+          "type": "string",
+          "pattern": "[^\\u0009-\\u000D\\u0020\\u0085\\u00A0\\u1680\\u2000-\\u200A\\u2028\\u2029\\u202F\\u205F\\u3000]"
+        },
+        "resource": {
+          "type": "string",
+          "pattern": "[^\\u0009-\\u000D\\u0020\\u0085\\u00A0\\u1680\\u2000-\\u200A\\u2028\\u2029\\u202F\\u205F\\u3000]"
+        },
+        "compartment": {
+          "type": "string",
+          "pattern": "[^\\u0009-\\u000D\\u0020\\u0085\\u00A0\\u1680\\u2000-\\u200A\\u2028\\u2029\\u202F\\u205F\\u3000]"
+        }
+      }
+    },
+    "SaveResultBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "branch_id",
+        "path",
+        "base_cut_id",
+        "draft_hash",
+        "executing_principal",
+        "evidence_label"
+      ],
+      "properties": {
+        "branch_id": {
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        },
+        "base_cut_id": {
+          "type": "string"
+        },
+        "draft_hash": {
+          "type": "string"
+        },
+        "executing_principal": {
+          "type": "string"
+        },
+        "evidence_label": {
+          "type": "string"
+        }
+      }
+    },
+    "ResolutionOrigin": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "operation_id",
+        "receipt_hash",
+        "outcome_index"
+      ],
+      "properties": {
+        "operation_id": {
+          "type": "string"
+        },
+        "receipt_hash": {
+          "type": "string"
+        },
+        "outcome_index": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 18446744073709551615
+        }
+      }
+    },
+    "ResolutionObservation": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "status"
+          ],
+          "properties": {
+            "status": {
+              "const": "missing"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "status",
+            "content_hash"
+          ],
+          "properties": {
+            "status": {
+              "const": "origin_unavailable"
+            },
+            "content_hash": {
+              "type": "string"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "status",
+            "content_hash",
+            "origin"
+          ],
+          "properties": {
+            "status": {
+              "const": "recorded"
+            },
+            "content_hash": {
+              "type": "string"
+            },
+            "origin": {
+              "$ref": "#/$defs/ResolutionOrigin"
+            }
+          }
+        }
+      ]
+    },
+    "ResolutionLookup": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "triple_key",
+        "observed",
+        "payload_use"
+      ],
+      "properties": {
+        "triple_key": {
+          "type": "string"
+        },
+        "observed": {
+          "$ref": "#/$defs/ResolutionObservation"
+        },
+        "payload_use": {
+          "enum": [
+            "not_read",
+            "unavailable",
+            "non_text",
+            "applied"
+          ]
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "observed": {
+                "properties": {
+                  "status": {
+                    "const": "recorded"
+                  }
+                }
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "payload_use": {
+                "enum": [
+                  "unavailable",
+                  "non_text",
+                  "applied"
+                ]
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "payload_use": {
+                "const": "not_read"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "ScopedSaveReceipt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "protocol",
+        "binding",
+        "attempt",
+        "result",
+        "resolution_scope",
+        "observations"
+      ],
+      "properties": {
+        "protocol": {
+          "const": "whipplescript.vcs-save-result.v2"
+        },
+        "binding": {
+          "$ref": "#/$defs/SaveResultBinding"
+        },
+        "attempt": {
+          "$ref": "#/$defs/SaveAttempt"
+        },
+        "result": {
+          "$ref": "#/$defs/SaveResult"
+        },
+        "resolution_scope": {
+          "$ref": "#/$defs/ResolutionMemoryScope"
+        },
+        "observations": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ResolutionLookup"
+          }
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "result": {
+                "properties": {
+                  "status": {
+                    "const": "written"
+                  }
+                }
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "observations": {
+                "maxItems": 0
+              }
+            }
+          }
+        }
+      ]
+    },
+    "ResolutionMemoryEntry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "triple_key",
+        "resolution"
+      ],
+      "properties": {
+        "triple_key": {
+          "type": "string",
+          "pattern": "[^\\u0009-\\u000D\\u0020\\u0085\\u00A0\\u1680\\u2000-\\u200A\\u2028\\u2029\\u202F\\u205F\\u3000]"
+        },
+        "resolution": {
+          "type": "string",
+          "pattern": "[^\\u0009-\\u000D\\u0020\\u0085\\u00A0\\u1680\\u2000-\\u200A\\u2028\\u2029\\u202F\\u205F\\u3000]"
+        }
+      }
+    },
+    "ResolutionMemoryBatch": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "operation_id",
+        "actor",
+        "intent",
+        "recorded_at",
+        "entries"
+      ],
+      "properties": {
+        "operation_id": {
+          "type": "string",
+          "pattern": "[^\\u0009-\\u000D\\u0020\\u0085\\u00A0\\u1680\\u2000-\\u200A\\u2028\\u2029\\u202F\\u205F\\u3000]"
+        },
+        "actor": {
+          "type": "string",
+          "pattern": "[^\\u0009-\\u000D\\u0020\\u0085\\u00A0\\u1680\\u2000-\\u200A\\u2028\\u2029\\u202F\\u205F\\u3000]"
+        },
+        "intent": {
+          "type": "string",
+          "pattern": "[^\\u0009-\\u000D\\u0020\\u0085\\u00A0\\u1680\\u2000-\\u200A\\u2028\\u2029\\u202F\\u205F\\u3000]"
+        },
+        "recorded_at": {
+          "type": "string",
+          "pattern": "[^\\u0009-\\u000D\\u0020\\u0085\\u00A0\\u1680\\u2000-\\u200A\\u2028\\u2029\\u202F\\u205F\\u3000]"
+        },
+        "entries": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ResolutionMemoryEntry"
+          },
+          "minItems": 1
+        }
+      }
+    },
+    "ResolutionMemoryOutcome": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "triple_key",
+        "resolution",
+        "inserted"
+      ],
+      "properties": {
+        "triple_key": {
+          "type": "string"
+        },
+        "resolution": {
+          "type": "string",
+          "pattern": "[^\\u0009-\\u000D\\u0020\\u0085\\u00A0\\u1680\\u2000-\\u200A\\u2028\\u2029\\u202F\\u205F\\u3000]"
+        },
+        "inserted": {
+          "type": "boolean"
+        }
+      }
+    },
+    "ResolutionMemoryReceipt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "request",
+        "outcomes"
+      ],
+      "properties": {
+        "request": {
+          "$ref": "#/$defs/ResolutionMemoryBatch"
+        },
+        "outcomes": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ResolutionMemoryOutcome"
+          }
+        }
+      }
+    }
+  }
+}

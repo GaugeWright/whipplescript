@@ -383,3 +383,132 @@ fn recovery_requires_the_original_binding_and_attempt_and_preserves_legacy_limit
         .to_string()
         .contains("result reference is unavailable"));
 }
+
+#[test]
+fn scoped_save_recovery_survives_reopen_without_current_knowledge_tables() {
+    let fixture = Fixture::new();
+    let mut workspace = fixture.open();
+    workspace.init("t0").unwrap();
+    workspace
+        .write(
+            MAINLINE_BRANCH_ID,
+            "docs/test.txt",
+            Some("dog"),
+            "base",
+            "t0",
+        )
+        .unwrap();
+    workspace
+        .write(
+            MAINLINE_BRANCH_ID,
+            "docs/test.txt",
+            Some("tiger"),
+            "head",
+            "t1",
+        )
+        .unwrap();
+    let scope = scoped_conformance::scope();
+    workspace.set_actor(Some("original-human".into()));
+    workspace.set_intent(Some("human-correction".into()));
+    workspace
+        .record_region_resolutions_in_scope(
+            &scope,
+            "original-knowledge",
+            &[crate::vcs::resolution_recording::conformance::resolution(
+                "remembered correction",
+            )],
+            "t2",
+        )
+        .unwrap();
+    let expected = SaveResultBinding::from(&binding("lion"));
+    let files =
+        VersionedSaveFileStore::new_in_resolution_scope(workspace, binding("lion"), scope.clone())
+            .unwrap();
+    let accepted = files
+        .write_text_with_context(Path::new(SAVE_OUTPUT_PATH), "lion", context())
+        .unwrap();
+    let original = accepted.evidence.unwrap();
+    drop(files);
+    let reopened = fixture.open();
+    // Remove every lookup door, rather than leaving a miss that an accidental
+    // re-query could mistake for the original candidate's observations.
+    fixture.branches().execute_batch("DROP TABLE resolution_memory; DROP TABLE resolution_origins; DROP TABLE resolution_batches;").unwrap();
+    let attempt = SaveAttempt::from(context());
+    let recovered = read_committed_scoped_save(&reopened, &expected, &scope, &attempt)
+        .unwrap()
+        .unwrap();
+    assert_eq!(recovered.receipt_json, original.content);
+    assert_eq!(recovered.accepted_content, "remembered correction");
+    assert!(matches!(&recovered.receipt.observations[0].observed,
+        crate::branches::resolution_origin::ResolutionObservation::Recorded { origin, .. }
+        if origin.operation_id == "original-knowledge"));
+    reopened
+        .content_store()
+        .erase(&recovered.reference.content_hash, "t3")
+        .unwrap();
+    assert!(
+        read_committed_scoped_save(&reopened, &expected, &scope, &attempt)
+            .expect_err("erased receipt cannot be reconstructed")
+            .to_string()
+            .contains("unavailable or erased")
+    );
+}
+
+#[test]
+fn scoped_save_recovery_refuses_changed_retained_constraints() {
+    for fault in ["scope", "evidence-label", "protocol", "plain-observations"] {
+        let fixture = Fixture::new();
+        let mut workspace = fixture.open();
+        seed(&mut workspace);
+        let scope = scoped_conformance::scope();
+        let files = VersionedSaveFileStore::new_in_resolution_scope(
+            workspace,
+            binding(DRAFT),
+            scope.clone(),
+        )
+        .unwrap();
+        files
+            .write_text_with_context(Path::new(SAVE_OUTPUT_PATH), DRAFT, context())
+            .unwrap();
+        let attempt = SaveAttempt::from(context());
+        let recovered = files.recover_scoped_result(&attempt).unwrap().unwrap();
+        let mut changed = recovered.receipt;
+        match fault {
+            "scope" => {
+                changed.resolution_scope = ResolutionMemoryScope::new(
+                    "other".into(),
+                    "resource/path".into(),
+                    "compartment".into(),
+                )
+                .unwrap()
+            }
+            "evidence-label" => changed.binding.evidence_label = "other".into(),
+            "protocol" => changed.protocol = SAVE_RECEIPT_SCHEMA.into(),
+            _ => changed.observations.push(ResolutionLookup {
+                triple_key: "rks1|fabricated".into(),
+                observed: crate::branches::resolution_origin::ResolutionObservation::Missing,
+                payload_use: crate::vcs::resolution_scope::ResolutionPayloadUse::NotRead,
+            }),
+        }
+        let hash = files
+            .workspace
+            .borrow()
+            .content_store()
+            .put_text(&serde_json::to_string(&changed).unwrap())
+            .unwrap();
+        fixture
+            .branches()
+            .execute(
+                "UPDATE cut_evidence SET content_hash = ?1 WHERE cut_id = ?2",
+                params![hash, save_cut_id(&attempt.instance_id, &attempt.effect_id)],
+            )
+            .unwrap();
+        let error = files.recover_scoped_result(&attempt).expect_err(fault);
+        let diagnostic = if matches!(fault, "scope" | "evidence-label") {
+            "differs from its expected scope and binding"
+        } else {
+            "inconsistent memory evidence"
+        };
+        assert!(error.to_string().contains(diagnostic), "{fault}: {error}");
+    }
+}

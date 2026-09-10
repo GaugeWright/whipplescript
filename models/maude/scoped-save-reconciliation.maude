@@ -1,0 +1,74 @@
+--- The scope-specific part of retained-save reconciliation. The Bool abstracts
+--- successful authentication and target authorization; scope identities abstract
+--- the host's verified original/current authority, resource and compartment.
+--- Cryptography, opaque product mappings and IFC execution remain separate.
+mod WHIPPLESCRIPT-SCOPED-SAVE-RECOVERY is
+  protecting BOOL .
+  sorts Scope BodyState Journal Cfg .
+  ops a b : -> Scope [ctor] .
+  ops live erased : -> BodyState [ctor] .
+  op empty : -> Journal [ctor] .
+  op recorded : Scope -> Journal [ctor] .
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+  op request : Scope Bool -> Cfg [ctor] .
+  ops original current readAllowed observed delivered unavailable : Scope -> Cfg [ctor] .
+  op receipt : Scope BodyState -> Cfg [ctor] .
+  op loaded : Scope Scope -> Cfg [ctor] .
+  op journal : Journal -> Cfg [ctor] .
+  ops failed resumed : -> Cfg [ctor] .
+  vars S T U : Scope .
+  var B : Bool .
+  var J : Journal .
+  rl [authorize-original-and-current] : request(S, true) original(S) current(S)
+    => readAllowed(S) original(S) current(S) .
+  rl [read-retained-result] : readAllowed(S) receipt(T, live)
+    => observed(S) loaded(S, T) receipt(T, live) .
+  rl [report-erasure] : readAllowed(S) receipt(T, erased)
+    => observed(S) unavailable(S) receipt(T, erased) .
+  rl [append-exact-result] : loaded(S, S) journal(empty)
+    => journal(recorded(S)) delivered(S) .
+  rl [redeliver-exact-result] : loaded(S, S) journal(recorded(S))
+    => journal(recorded(S)) delivered(S) .
+  --- No rule consumes failed, invokes a sink, or resumes workflow execution.
+endm
+mod WHIPPLESCRIPT-SCOPED-SAVE-READ-FIRST is
+  including WHIPPLESCRIPT-SCOPED-SAVE-RECOVERY .
+  vars S T : Scope .
+  var B : Bool .
+  rl [read-before-authorization] : request(S, B) => readAllowed(S) .
+endm
+mod WHIPPLESCRIPT-SCOPED-SAVE-TODAY-ONLY is
+  including WHIPPLESCRIPT-SCOPED-SAVE-RECOVERY .
+  vars S T : Scope .
+  var B : Bool .
+  rl [broaden-original-scope] : request(S, true) original(T) current(S)
+    => readAllowed(S) original(T) current(S) .
+endm
+mod WHIPPLESCRIPT-SCOPED-SAVE-ORIGINAL-ONLY is
+  including WHIPPLESCRIPT-SCOPED-SAVE-RECOVERY .
+  vars S T : Scope .
+  var B : Bool .
+  rl [ignore-current-scope] : request(S, true) original(S) current(T)
+    => readAllowed(S) original(S) current(T) .
+endm
+mod WHIPPLESCRIPT-SCOPED-SAVE-REBOUND is
+  including WHIPPLESCRIPT-SCOPED-SAVE-RECOVERY .
+  vars S T : Scope .
+  var B : Bool .
+  rl [ignore-retained-scope] : loaded(S, T) journal(empty)
+    => journal(recorded(S)) delivered(S) .
+endm
+mod WHIPPLESCRIPT-SCOPED-SAVE-OLD-PROOF is
+  including WHIPPLESCRIPT-SCOPED-SAVE-RECOVERY .
+  vars S T : Scope .
+  var B : Bool .
+  rl [borrow-earlier-reconciliation] : request(S, B) journal(recorded(S))
+    => journal(recorded(S)) delivered(S) .
+endm
+mod WHIPPLESCRIPT-SCOPED-SAVE-RESUME is
+  including WHIPPLESCRIPT-SCOPED-SAVE-RECOVERY .
+  vars S T : Scope .
+  var B : Bool .
+  rl [take-success-after-failure] : delivered(S) failed => delivered(S) resumed .
+endm

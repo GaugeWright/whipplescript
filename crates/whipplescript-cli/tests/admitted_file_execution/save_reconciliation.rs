@@ -58,6 +58,7 @@ impl SaveReconciliationAuthority for RecoveryAuthority {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn check<S, B, C>(
     facade: &mut GovernedHostFacade<S>,
     target: &WorkspaceVcs<B, C>,
@@ -66,6 +67,7 @@ pub(super) fn check<S, B, C>(
     effect_id: &str,
     original: &HostActionCommand,
     mode: &str,
+    scenario: &str,
 ) where
     S: RuntimeStore + LogAppend,
     B: Branches,
@@ -310,9 +312,8 @@ pub(super) fn check<S, B, C>(
         b"recovery",
     );
     let receipt = outcome.expect("actual target result reconciles");
-    let scenario = format!("{}/{mode}", provenance.initiator);
-    host_action_contract_reports::record::<S, _>(&scenario, "ReconcileEffectCommand", &command);
-    host_action_contract_reports::record::<S, _>(&scenario, "ReconciliationReceipt", &receipt);
+    host_action_contract_reports::record::<S, _>(scenario, "ReconcileEffectCommand", &command);
+    host_action_contract_reports::record::<S, _>(scenario, "ReconciliationReceipt", &receipt);
     let after = facade
         .kernel()
         .store()

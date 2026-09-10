@@ -2,7 +2,26 @@
 use serde::Serialize;
 
 pub fn record<S, T: Serialize>(scenario: &str, message_type: &str, value: &T) {
-    let Some(directory) = std::env::var_os("WHIPPLESCRIPT_ACTION_REPORT_DIR") else {
+    record_into::<S, T>(
+        "WHIPPLESCRIPT_ACTION_REPORT_DIR",
+        scenario,
+        message_type,
+        value,
+    );
+}
+
+#[allow(dead_code)] // The legacy-only journey also compiles this shared helper.
+pub fn record_scoped<S, T: Serialize>(scenario: &str, message_type: &str, value: &T) {
+    record_into::<S, T>(
+        "WHIPPLESCRIPT_SCOPED_ACTION_REPORT_DIR",
+        scenario,
+        message_type,
+        value,
+    );
+}
+
+fn record_into<S, T: Serialize>(variable: &str, scenario: &str, message_type: &str, value: &T) {
+    let Some(directory) = std::env::var_os(variable) else {
         return;
     };
     let store = std::any::type_name::<S>();

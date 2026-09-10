@@ -1,0 +1,941 @@
+{
+  "schema": "whipplescript.host_action_contract_fixtures.v2",
+  "contract_revision": "whipplescript-host-action/v2.0.0",
+  "description": "Scoped evidence codec vectors. Dependency v1 vectors run unchanged. Schema and internal consistency never establish authority, actual application or retained availability. Cross-entry equality is checked by the typed receipt decoder.",
+  "cases": [
+    {
+      "id": "scope-identity",
+      "message_type": "ResolutionMemoryScope",
+      "value": {
+        "authority": "a",
+        "resource": "b",
+        "compartment": "c"
+      },
+      "wire_valid": true,
+      "schema_valid": true,
+      "syntax_valid": true,
+      "identity": "resolution-scope:v1:0fbfd3e6f1a136e5acdb0a8bdf61701560636f49f16cdd2063e29dc0cf06bcba"
+    },
+    {
+      "id": "scope-control-separator",
+      "message_type": "ResolutionMemoryScope",
+      "value": {
+        "authority": "\u001c",
+        "resource": "b",
+        "compartment": "c"
+      },
+      "wire_valid": true,
+      "schema_valid": true,
+      "syntax_valid": true
+    },
+    {
+      "id": "scope-blank-authority",
+      "message_type": "ResolutionMemoryScope",
+      "base": "scope-identity",
+      "wire_valid": false,
+      "schema_valid": false,
+      "syntax_valid": null,
+      "set": [
+        {
+          "pointer": "/authority",
+          "value": " \t\n"
+        }
+      ]
+    },
+    {
+      "id": "scope-blank-resource",
+      "message_type": "ResolutionMemoryScope",
+      "base": "scope-identity",
+      "wire_valid": false,
+      "schema_valid": false,
+      "syntax_valid": null,
+      "set": [
+        {
+          "pointer": "/resource",
+          "value": " \t\n"
+        }
+      ]
+    },
+    {
+      "id": "scope-blank-compartment",
+      "message_type": "ResolutionMemoryScope",
+      "base": "scope-identity",
+      "wire_valid": false,
+      "schema_valid": false,
+      "syntax_valid": null,
+      "set": [
+        {
+          "pointer": "/compartment",
+          "value": " \t\n"
+        }
+      ]
+    },
+    {
+      "id": "scope-unknown-field",
+      "message_type": "ResolutionMemoryScope",
+      "base": "scope-identity",
+      "wire_valid": false,
+      "schema_valid": false,
+      "syntax_valid": null,
+      "set": [
+        {
+          "pointer": "/actor",
+          "value": "caller"
+        }
+      ]
+    },
+    {
+      "id": "scoped-recorded-applied",
+      "message_type": "ScopedSaveReceipt",
+      "value": {
+        "protocol": "whipplescript.vcs-save-result.v2",
+        "binding": {
+          "branch_id": "mainline",
+          "path": "example.txt",
+          "base_cut_id": "cut:base",
+          "draft_hash": "draft-hash",
+          "executing_principal": "human:fixture",
+          "evidence_label": "private"
+        },
+        "attempt": {
+          "instance_id": "ins_action_86cc666a81e99a3f8981e583d2341b66c5c532507b6ea80f153836ac91d27592",
+          "effect_id": "effect:save",
+          "run_id": "run:save",
+          "started_event_id": "dispatch:save"
+        },
+        "result": {
+          "status": "merged",
+          "cut_id": "cut:save",
+          "parent_cut_id": "cut:base",
+          "operation_id": "op-cut:save",
+          "accepted_content_hash": "accepted-hash",
+          "pieces": [
+            {
+              "kind": "merged",
+              "text": "fixture text",
+              "provenance": "ours"
+            }
+          ]
+        },
+        "resolution_scope": {
+          "authority": "a",
+          "resource": "b",
+          "compartment": "c"
+        },
+        "observations": [
+          {
+            "triple_key": "rks1|fixture",
+            "observed": {
+              "status": "recorded",
+              "content_hash": "fixture-content",
+              "origin": {
+                "operation_id": "fixture-original",
+                "receipt_hash": "fixture-receipt",
+                "outcome_index": 18446744073709551615
+              }
+            },
+            "payload_use": "applied"
+          }
+        ]
+      },
+      "wire_valid": true,
+      "schema_valid": true,
+      "syntax_valid": true
+    },
+    {
+      "id": "scoped-recorded-unavailable",
+      "message_type": "ScopedSaveReceipt",
+      "value": {
+        "protocol": "whipplescript.vcs-save-result.v2",
+        "binding": {
+          "branch_id": "mainline",
+          "path": "example.txt",
+          "base_cut_id": "cut:base",
+          "draft_hash": "draft-hash",
+          "executing_principal": "human:fixture",
+          "evidence_label": "private"
+        },
+        "attempt": {
+          "instance_id": "ins_action_86cc666a81e99a3f8981e583d2341b66c5c532507b6ea80f153836ac91d27592",
+          "effect_id": "effect:save",
+          "run_id": "run:save",
+          "started_event_id": "dispatch:save"
+        },
+        "result": {
+          "status": "merged",
+          "cut_id": "cut:save",
+          "parent_cut_id": "cut:base",
+          "operation_id": "op-cut:save",
+          "accepted_content_hash": "accepted-hash",
+          "pieces": [
+            {
+              "kind": "merged",
+              "text": "fixture text",
+              "provenance": "ours"
+            }
+          ]
+        },
+        "resolution_scope": {
+          "authority": "a",
+          "resource": "b",
+          "compartment": "c"
+        },
+        "observations": [
+          {
+            "triple_key": "rks1|fixture",
+            "observed": {
+              "status": "recorded",
+              "content_hash": "fixture-content",
+              "origin": {
+                "operation_id": "fixture-original",
+                "receipt_hash": "fixture-receipt",
+                "outcome_index": 18446744073709551615
+              }
+            },
+            "payload_use": "unavailable"
+          }
+        ]
+      },
+      "wire_valid": true,
+      "schema_valid": true,
+      "syntax_valid": true
+    },
+    {
+      "id": "scoped-recorded-non_text",
+      "message_type": "ScopedSaveReceipt",
+      "value": {
+        "protocol": "whipplescript.vcs-save-result.v2",
+        "binding": {
+          "branch_id": "mainline",
+          "path": "example.txt",
+          "base_cut_id": "cut:base",
+          "draft_hash": "draft-hash",
+          "executing_principal": "human:fixture",
+          "evidence_label": "private"
+        },
+        "attempt": {
+          "instance_id": "ins_action_86cc666a81e99a3f8981e583d2341b66c5c532507b6ea80f153836ac91d27592",
+          "effect_id": "effect:save",
+          "run_id": "run:save",
+          "started_event_id": "dispatch:save"
+        },
+        "result": {
+          "status": "merged",
+          "cut_id": "cut:save",
+          "parent_cut_id": "cut:base",
+          "operation_id": "op-cut:save",
+          "accepted_content_hash": "accepted-hash",
+          "pieces": [
+            {
+              "kind": "merged",
+              "text": "fixture text",
+              "provenance": "ours"
+            }
+          ]
+        },
+        "resolution_scope": {
+          "authority": "a",
+          "resource": "b",
+          "compartment": "c"
+        },
+        "observations": [
+          {
+            "triple_key": "rks1|fixture",
+            "observed": {
+              "status": "recorded",
+              "content_hash": "fixture-content",
+              "origin": {
+                "operation_id": "fixture-original",
+                "receipt_hash": "fixture-receipt",
+                "outcome_index": 18446744073709551615
+              }
+            },
+            "payload_use": "non_text"
+          }
+        ]
+      },
+      "wire_valid": true,
+      "schema_valid": true,
+      "syntax_valid": true
+    },
+    {
+      "id": "scoped-missing",
+      "message_type": "ScopedSaveReceipt",
+      "value": {
+        "protocol": "whipplescript.vcs-save-result.v2",
+        "binding": {
+          "branch_id": "mainline",
+          "path": "example.txt",
+          "base_cut_id": "cut:base",
+          "draft_hash": "draft-hash",
+          "executing_principal": "human:fixture",
+          "evidence_label": "private"
+        },
+        "attempt": {
+          "instance_id": "ins_action_86cc666a81e99a3f8981e583d2341b66c5c532507b6ea80f153836ac91d27592",
+          "effect_id": "effect:save",
+          "run_id": "run:save",
+          "started_event_id": "dispatch:save"
+        },
+        "result": {
+          "status": "merged",
+          "cut_id": "cut:save",
+          "parent_cut_id": "cut:base",
+          "operation_id": "op-cut:save",
+          "accepted_content_hash": "accepted-hash",
+          "pieces": [
+            {
+              "kind": "merged",
+              "text": "fixture text",
+              "provenance": "ours"
+            }
+          ]
+        },
+        "resolution_scope": {
+          "authority": "a",
+          "resource": "b",
+          "compartment": "c"
+        },
+        "observations": [
+          {
+            "triple_key": "rks1|fixture",
+            "observed": {
+              "status": "missing"
+            },
+            "payload_use": "not_read"
+          }
+        ]
+      },
+      "wire_valid": true,
+      "schema_valid": true,
+      "syntax_valid": true
+    },
+    {
+      "id": "scoped-origin_unavailable",
+      "message_type": "ScopedSaveReceipt",
+      "value": {
+        "protocol": "whipplescript.vcs-save-result.v2",
+        "binding": {
+          "branch_id": "mainline",
+          "path": "example.txt",
+          "base_cut_id": "cut:base",
+          "draft_hash": "draft-hash",
+          "executing_principal": "human:fixture",
+          "evidence_label": "private"
+        },
+        "attempt": {
+          "instance_id": "ins_action_86cc666a81e99a3f8981e583d2341b66c5c532507b6ea80f153836ac91d27592",
+          "effect_id": "effect:save",
+          "run_id": "run:save",
+          "started_event_id": "dispatch:save"
+        },
+        "result": {
+          "status": "merged",
+          "cut_id": "cut:save",
+          "parent_cut_id": "cut:base",
+          "operation_id": "op-cut:save",
+          "accepted_content_hash": "accepted-hash",
+          "pieces": [
+            {
+              "kind": "merged",
+              "text": "fixture text",
+              "provenance": "ours"
+            }
+          ]
+        },
+        "resolution_scope": {
+          "authority": "a",
+          "resource": "b",
+          "compartment": "c"
+        },
+        "observations": [
+          {
+            "triple_key": "rks1|fixture",
+            "observed": {
+              "status": "origin_unavailable",
+              "content_hash": "old-content"
+            },
+            "payload_use": "not_read"
+          }
+        ]
+      },
+      "wire_valid": true,
+      "schema_valid": true,
+      "syntax_valid": true
+    },
+    {
+      "id": "scoped-written",
+      "message_type": "ScopedSaveReceipt",
+      "value": {
+        "protocol": "whipplescript.vcs-save-result.v2",
+        "binding": {
+          "branch_id": "mainline",
+          "path": "example.txt",
+          "base_cut_id": "cut:base",
+          "draft_hash": "draft-hash",
+          "executing_principal": "human:fixture",
+          "evidence_label": "private"
+        },
+        "attempt": {
+          "instance_id": "ins_action_86cc666a81e99a3f8981e583d2341b66c5c532507b6ea80f153836ac91d27592",
+          "effect_id": "effect:save",
+          "run_id": "run:save",
+          "started_event_id": "dispatch:save"
+        },
+        "result": {
+          "status": "written",
+          "cut_id": "cut:save",
+          "parent_cut_id": "cut:base",
+          "operation_id": "op-cut:save",
+          "accepted_content_hash": "accepted-hash"
+        },
+        "resolution_scope": {
+          "authority": "a",
+          "resource": "b",
+          "compartment": "c"
+        },
+        "observations": []
+      },
+      "wire_valid": true,
+      "schema_valid": true,
+      "syntax_valid": true
+    },
+    {
+      "id": "scoped-conflicted",
+      "message_type": "ScopedSaveReceipt",
+      "value": {
+        "protocol": "whipplescript.vcs-save-result.v2",
+        "binding": {
+          "branch_id": "mainline",
+          "path": "example.txt",
+          "base_cut_id": "cut:base",
+          "draft_hash": "draft-hash",
+          "executing_principal": "human:fixture",
+          "evidence_label": "private"
+        },
+        "attempt": {
+          "instance_id": "ins_action_86cc666a81e99a3f8981e583d2341b66c5c532507b6ea80f153836ac91d27592",
+          "effect_id": "effect:save",
+          "run_id": "run:save",
+          "started_event_id": "dispatch:save"
+        },
+        "result": {
+          "status": "conflicted",
+          "head_cut_id": "cut:other",
+          "head_content": "fixture other text",
+          "pieces": [
+            {
+              "kind": "conflict",
+              "base_text": "base",
+              "ours_text": "ours",
+              "theirs_text": "theirs"
+            }
+          ]
+        },
+        "resolution_scope": {
+          "authority": "a",
+          "resource": "b",
+          "compartment": "c"
+        },
+        "observations": [
+          {
+            "triple_key": "rks1|fixture",
+            "observed": {
+              "status": "missing"
+            },
+            "payload_use": "not_read"
+          }
+        ]
+      },
+      "wire_valid": true,
+      "schema_valid": true,
+      "syntax_valid": true
+    },
+    {
+      "id": "scoped-unknown-receipt",
+      "message_type": "ScopedSaveReceipt",
+      "base": "scoped-recorded-applied",
+      "wire_valid": false,
+      "schema_valid": false,
+      "syntax_valid": null,
+      "set": [
+        {
+          "pointer": "/future_constraint",
+          "value": true
+        }
+      ]
+    },
+    {
+      "id": "scoped-unknown-binding",
+      "message_type": "ScopedSaveReceipt",
+      "base": "scoped-recorded-applied",
+      "wire_valid": false,
+      "schema_valid": false,
+      "syntax_valid": null,
+      "set": [
+        {
+          "pointer": "/binding/future_constraint",
+          "value": true
+        }
+      ]
+    },
+    {
+      "id": "scoped-unknown-attempt",
+      "message_type": "ScopedSaveReceipt",
+      "base": "scoped-recorded-applied",
+      "wire_valid": false,
+      "schema_valid": false,
+      "syntax_valid": null,
+      "set": [
+        {
+          "pointer": "/attempt/future_constraint",
+          "value": true
+        }
+      ]
+    },
+    {
+      "id": "scoped-unknown-scope",
+      "message_type": "ScopedSaveReceipt",
+      "base": "scoped-recorded-applied",
+      "wire_valid": false,
+      "schema_valid": false,
+      "syntax_valid": null,
+      "set": [
+        {
+          "pointer": "/resolution_scope/future_constraint",
+          "value": true
+        }
+      ]
+    },
+    {
+      "id": "scoped-unknown-lookup",
+      "message_type": "ScopedSaveReceipt",
+      "base": "scoped-recorded-applied",
+      "wire_valid": false,
+      "schema_valid": false,
+      "syntax_valid": null,
+      "set": [
+        {
+          "pointer": "/observations/0/future_constraint",
+          "value": true
+        }
+      ]
+    },
+    {
+      "id": "scoped-unknown-observation",
+      "message_type": "ScopedSaveReceipt",
+      "base": "scoped-recorded-applied",
+      "wire_valid": false,
+      "schema_valid": false,
+      "syntax_valid": null,
+      "set": [
+        {
+          "pointer": "/observations/0/observed/future_constraint",
+          "value": true
+        }
+      ]
+    },
+    {
+      "id": "scoped-unknown-origin",
+      "message_type": "ScopedSaveReceipt",
+      "base": "scoped-recorded-applied",
+      "wire_valid": false,
+      "schema_valid": false,
+      "syntax_valid": null,
+      "set": [
+        {
+          "pointer": "/observations/0/observed/origin/future_constraint",
+          "value": true
+        }
+      ]
+    },
+    {
+      "id": "scoped-missing-observation-unknown",
+      "message_type": "ScopedSaveReceipt",
+      "base": "scoped-missing",
+      "wire_valid": false,
+      "schema_valid": false,
+      "syntax_valid": null,
+      "set": [
+        {
+          "pointer": "/observations/0/observed/future_constraint",
+          "value": true
+        }
+      ]
+    },
+    {
+      "id": "scoped-negative-origin-index",
+      "message_type": "ScopedSaveReceipt",
+      "base": "scoped-recorded-applied",
+      "wire_valid": false,
+      "schema_valid": false,
+      "syntax_valid": null,
+      "set": [
+        {
+          "pointer": "/observations/0/observed/origin/outcome_index",
+          "value": -1
+        }
+      ]
+    },
+    {
+      "id": "scoped-overflow-origin-index",
+      "message_type": "ScopedSaveReceipt",
+      "base": "scoped-recorded-applied",
+      "wire_valid": false,
+      "schema_valid": false,
+      "syntax_valid": null,
+      "set": [
+        {
+          "pointer": "/observations/0/observed/origin/outcome_index",
+          "value": 18446744073709551616
+        }
+      ]
+    },
+    {
+      "id": "scoped-unknown-payload-use",
+      "message_type": "ScopedSaveReceipt",
+      "base": "scoped-recorded-applied",
+      "wire_valid": false,
+      "schema_valid": false,
+      "syntax_valid": null,
+      "set": [
+        {
+          "pointer": "/observations/0/payload_use",
+          "value": "invented"
+        }
+      ]
+    },
+    {
+      "id": "scoped-wrong-protocol",
+      "message_type": "ScopedSaveReceipt",
+      "base": "scoped-recorded-applied",
+      "wire_valid": true,
+      "schema_valid": false,
+      "syntax_valid": false,
+      "set": [
+        {
+          "pointer": "/protocol",
+          "value": "whipplescript.vcs-save-result.v1"
+        }
+      ]
+    },
+    {
+      "id": "scoped-missing-applied",
+      "message_type": "ScopedSaveReceipt",
+      "base": "scoped-missing",
+      "wire_valid": true,
+      "schema_valid": false,
+      "syntax_valid": false,
+      "set": [
+        {
+          "pointer": "/observations/0/payload_use",
+          "value": "applied"
+        }
+      ]
+    },
+    {
+      "id": "scoped-recorded-not-read",
+      "message_type": "ScopedSaveReceipt",
+      "base": "scoped-recorded-applied",
+      "wire_valid": true,
+      "schema_valid": false,
+      "syntax_valid": false,
+      "set": [
+        {
+          "pointer": "/observations/0/payload_use",
+          "value": "not_read"
+        }
+      ]
+    },
+    {
+      "id": "scoped-written-observations",
+      "message_type": "ScopedSaveReceipt",
+      "base": "scoped-written",
+      "wire_valid": true,
+      "schema_valid": false,
+      "syntax_valid": false,
+      "set": [
+        {
+          "pointer": "/observations",
+          "value": [
+            {
+              "triple_key": "rks1|fixture",
+              "observed": {
+                "status": "recorded",
+                "content_hash": "fixture-content",
+                "origin": {
+                  "operation_id": "fixture-original",
+                  "receipt_hash": "fixture-receipt",
+                  "outcome_index": 18446744073709551615
+                }
+              },
+              "payload_use": "applied"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "scoped-missing-scope",
+      "message_type": "ScopedSaveReceipt",
+      "base": "scoped-recorded-applied",
+      "wire_valid": false,
+      "schema_valid": false,
+      "syntax_valid": null,
+      "remove": [
+        "/resolution_scope"
+      ]
+    },
+    {
+      "id": "memory-inserted",
+      "message_type": "ResolutionMemoryReceipt",
+      "value": {
+        "request": {
+          "operation_id": "fixture-original",
+          "actor": "human:fixture",
+          "intent": "correction",
+          "recorded_at": "t1",
+          "entries": [
+            {
+              "triple_key": "rks1|fixture",
+              "resolution": "fixture-content"
+            }
+          ]
+        },
+        "outcomes": [
+          {
+            "triple_key": "rks1|fixture",
+            "resolution": "fixture-content",
+            "inserted": true
+          }
+        ]
+      },
+      "wire_valid": true,
+      "schema_valid": true,
+      "syntax_valid": true
+    },
+    {
+      "id": "memory-existing-winner",
+      "message_type": "ResolutionMemoryReceipt",
+      "value": {
+        "request": {
+          "operation_id": "fixture-original",
+          "actor": "human:fixture",
+          "intent": "correction",
+          "recorded_at": "t1",
+          "entries": [
+            {
+              "triple_key": "rks1|fixture",
+              "resolution": "losing-content"
+            }
+          ]
+        },
+        "outcomes": [
+          {
+            "triple_key": "rks1|fixture",
+            "resolution": "fixture-content",
+            "inserted": false
+          }
+        ]
+      },
+      "wire_valid": true,
+      "schema_valid": true,
+      "syntax_valid": true
+    },
+    {
+      "id": "memory-unknown-receipt",
+      "message_type": "ResolutionMemoryReceipt",
+      "base": "memory-inserted",
+      "wire_valid": false,
+      "schema_valid": false,
+      "syntax_valid": null,
+      "set": [
+        {
+          "pointer": "/future_constraint",
+          "value": true
+        }
+      ]
+    },
+    {
+      "id": "memory-unknown-request",
+      "message_type": "ResolutionMemoryReceipt",
+      "base": "memory-inserted",
+      "wire_valid": false,
+      "schema_valid": false,
+      "syntax_valid": null,
+      "set": [
+        {
+          "pointer": "/request/future_constraint",
+          "value": true
+        }
+      ]
+    },
+    {
+      "id": "memory-unknown-entry",
+      "message_type": "ResolutionMemoryReceipt",
+      "base": "memory-inserted",
+      "wire_valid": false,
+      "schema_valid": false,
+      "syntax_valid": null,
+      "set": [
+        {
+          "pointer": "/request/entries/0/future_constraint",
+          "value": true
+        }
+      ]
+    },
+    {
+      "id": "memory-unknown-outcome",
+      "message_type": "ResolutionMemoryReceipt",
+      "base": "memory-inserted",
+      "wire_valid": false,
+      "schema_valid": false,
+      "syntax_valid": null,
+      "set": [
+        {
+          "pointer": "/outcomes/0/future_constraint",
+          "value": true
+        }
+      ]
+    },
+    {
+      "id": "memory-empty-batch",
+      "message_type": "ResolutionMemoryReceipt",
+      "base": "memory-inserted",
+      "wire_valid": true,
+      "schema_valid": false,
+      "syntax_valid": false,
+      "set": [
+        {
+          "pointer": "/request/entries",
+          "value": []
+        }
+      ]
+    },
+    {
+      "id": "memory-wrong-count",
+      "message_type": "ResolutionMemoryReceipt",
+      "base": "memory-inserted",
+      "wire_valid": true,
+      "schema_valid": true,
+      "syntax_valid": false,
+      "set": [
+        {
+          "pointer": "/outcomes",
+          "value": []
+        }
+      ]
+    },
+    {
+      "id": "memory-wrong-key",
+      "message_type": "ResolutionMemoryReceipt",
+      "base": "memory-inserted",
+      "wire_valid": true,
+      "schema_valid": true,
+      "syntax_valid": false,
+      "set": [
+        {
+          "pointer": "/outcomes/0/triple_key",
+          "value": "foreign-key"
+        }
+      ]
+    },
+    {
+      "id": "memory-blank-actor",
+      "message_type": "ResolutionMemoryReceipt",
+      "base": "memory-inserted",
+      "wire_valid": true,
+      "schema_valid": false,
+      "syntax_valid": false,
+      "set": [
+        {
+          "pointer": "/request/actor",
+          "value": " "
+        }
+      ]
+    },
+    {
+      "id": "memory-duplicate-key",
+      "message_type": "ResolutionMemoryReceipt",
+      "value": {
+        "request": {
+          "operation_id": "fixture-original",
+          "actor": "human:fixture",
+          "intent": "correction",
+          "recorded_at": "t1",
+          "entries": [
+            {
+              "triple_key": "rks1|fixture",
+              "resolution": "fixture-content"
+            },
+            {
+              "triple_key": "rks1|fixture",
+              "resolution": "losing-content"
+            }
+          ]
+        },
+        "outcomes": [
+          {
+            "triple_key": "rks1|fixture",
+            "resolution": "fixture-content",
+            "inserted": true
+          },
+          {
+            "triple_key": "rks1|fixture",
+            "resolution": "fixture-content",
+            "inserted": false
+          }
+        ]
+      },
+      "wire_valid": true,
+      "schema_valid": true,
+      "syntax_valid": true
+    },
+    {
+      "id": "memory-inserted-content",
+      "message_type": "ResolutionMemoryReceipt",
+      "base": "memory-inserted",
+      "set": [
+        {
+          "pointer": "/outcomes/0/resolution",
+          "value": "different-content"
+        }
+      ],
+      "wire_valid": true,
+      "schema_valid": true,
+      "syntax_valid": false
+    },
+    {
+      "id": "memory-duplicate-winner",
+      "message_type": "ResolutionMemoryReceipt",
+      "base": "memory-duplicate-key",
+      "set": [
+        {
+          "pointer": "/outcomes/1/resolution",
+          "value": "different-content"
+        }
+      ],
+      "wire_valid": true,
+      "schema_valid": true,
+      "syntax_valid": false
+    },
+    {
+      "id": "memory-duplicate-insert",
+      "message_type": "ResolutionMemoryReceipt",
+      "base": "memory-duplicate-key",
+      "set": [
+        {
+          "pointer": "/request/entries/1/resolution",
+          "value": "fixture-content"
+        },
+        {
+          "pointer": "/outcomes/1/inserted",
+          "value": true
+        }
+      ],
+      "wire_valid": true,
+      "schema_valid": true,
+      "syntax_valid": false
+    }
+  ]
+}
