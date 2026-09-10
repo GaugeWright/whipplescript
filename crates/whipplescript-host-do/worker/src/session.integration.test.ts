@@ -18,6 +18,7 @@ import {
 } from "./integration-helpers";
 import { canonicalJson, sha256Hex } from "./private-home-protocol";
 import { canonicalCredentialClassRef } from "./credential-class-ref";
+import { SETTLES_WITHIN_MS } from "./test-bounds";
 
 const RELEASE_ID = `sha256:${"a".repeat(64)}`;
 
@@ -484,7 +485,9 @@ describe("real WorkflowInstance hibernation", () => {
       request_id: "turn-live",
       text: "start",
     }));
-    await vi.waitFor(() => expect(providerFetch).toHaveBeenCalledTimes(1));
+    await vi.waitFor(() => expect(providerFetch).toHaveBeenCalledTimes(1), {
+      timeout: SETTLES_WITHIN_MS,
+    });
     socket.send(JSON.stringify({
       type: "follow_up",
       operation_id: "op-follow",
@@ -594,7 +597,9 @@ describe("real WorkflowInstance hibernation", () => {
       request_id: "turn-compact",
       text: "start",
     }));
-    await vi.waitFor(() => expect(providerFetch).toHaveBeenCalledOnce());
+    await vi.waitFor(() => expect(providerFetch).toHaveBeenCalledOnce(), {
+      timeout: SETTLES_WITHIN_MS,
+    });
     const compact = {
       type: "compact",
       request_id: "compact-1",
@@ -626,7 +631,7 @@ describe("real WorkflowInstance hibernation", () => {
           .toArray(),
       );
       expect(queued).toHaveLength(1);
-    });
+    }, { timeout: SETTLES_WITHIN_MS });
     releaseFirst();
 
     const observed: Record<string, unknown>[] = [];
@@ -691,9 +696,12 @@ describe("real WorkflowInstance hibernation", () => {
       request_id: "turn-stop",
       text: "start",
     }));
-    // workerd must resume this wait in the test's I/O context. Allow startup
-    // the enclosing test's budget instead of waitFor's one-second default.
-    await vi.waitFor(() => expect(providerFetch).toHaveBeenCalledOnce(), { timeout: 5_000 });
+    // workerd must resume this wait in the test's I/O context, so the wait is
+    // for a scheduling decision on a shared machine rather than for work this
+    // test controls. waitFor's one-second default is a budget it cannot keep.
+    await vi.waitFor(() => expect(providerFetch).toHaveBeenCalledOnce(), {
+      timeout: SETTLES_WITHIN_MS,
+    });
     socket.send(JSON.stringify({ type: "stop", request_id: "turn-stop" }));
 
     const observed: Record<string, unknown>[] = [];
@@ -1016,10 +1024,12 @@ describe("real WorkflowInstance hibernation", () => {
     // finish before the test inspects it: null then means completed, not lost.
     // Exercise both observation orders; manual delivery cannot invent an alarm
     // when the request failed to schedule one, so removing re-arming still fails.
-    if (alreadyFired) await vi.waitFor(depositedOnce, { timeout: 5_000 });
+    if (alreadyFired) {
+      await vi.waitFor(depositedOnce, { timeout: SETTLES_WITHIN_MS });
+    }
     await runDurableObjectAlarm(stub);
-    await vi.waitFor(depositedOnce, { timeout: 5_000 });
-  }, 10_000);
+    await vi.waitFor(depositedOnce, { timeout: SETTLES_WITHIN_MS });
+  });
 
 
   it("emits only declared paths, seals to the admitted recipient, and deposits once", async ({

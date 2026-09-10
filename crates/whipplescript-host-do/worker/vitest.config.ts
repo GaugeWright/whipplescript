@@ -1,5 +1,6 @@
 import { cloudflareTest } from "@cloudflare/vitest-pool-workers";
 import { defineConfig } from "vitest/config";
+import { WORKERD_TEST_TIMEOUT_MS } from "./src/test-bounds.ts";
 
 export default defineConfig({
   plugins: [
@@ -13,6 +14,8 @@ export default defineConfig({
       "src/executor-broker.integration.test.ts",
       "src/object-store.integration.test.ts",
     ],
+    // Bounds a hang, not the machine's load. See `src/test-bounds.ts`.
+    testTimeout: WORKERD_TEST_TIMEOUT_MS,
     // Restore `vi.stubGlobal` globals before every test. The suite stubs
     // `fetch` in nine tests and unstubbed it by hand in seven; the two that
     // were missed leaked a mock provider into every test that followed, which

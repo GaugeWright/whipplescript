@@ -87,8 +87,9 @@ describe("the object plane", () => {
      *  cap sits after this route for that reason. */
     it("carries a body larger than the control-plane body cap", async () => {
         // MAX_BOOTSTRAP_BYTES is 1 MiB; this is comfortably past it. The
-        // simulated bucket is slower than a real one, so this needs more than
-        // the default 5s — the size is the point of the test and stays.
+        // simulated bucket is slower than a real one, and the size is the
+        // point of the test, so it stays; the suite-wide bound in
+        // `src/test-bounds.ts` is what gives it room.
         const big = new Uint8Array(3 * 1024 * 1024);
         crypto.getRandomValues(big.subarray(0, 65536));
         for (let at = 65536; at < big.length; at += 65536) {
@@ -102,7 +103,7 @@ describe("the object plane", () => {
 
         const read = await SELF.fetch(`https://host/v1/objects/${id}`, authed());
         expect(new Uint8Array(await read.arrayBuffer())).toEqual(big);
-    }, 60_000);
+    });
 
     /** A streamed body is carried when its length is declared, and refused
      *  when it is not. R2 can only store a stream against a length known
