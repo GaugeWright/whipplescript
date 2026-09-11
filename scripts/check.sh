@@ -95,6 +95,7 @@ if [ -f AGENTS.md ]; then
 
     echo "== governed doors =="
     scripts/check-governed-doors.sh
+    python3 scripts/test-governed-doors.py
 
     # A conformance suite is worth what it is pointed at. `ContentBlobs` had
     # seven implementations and three ran its suite, and two of the four that

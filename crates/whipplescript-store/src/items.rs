@@ -40,6 +40,10 @@ use crate::StoreResult;
 
 #[cfg(feature = "native")]
 mod filing;
+#[cfg(feature = "native")]
+mod protection;
+#[cfg(feature = "native")]
+pub use protection::TrackerEventMetadata;
 
 #[cfg(feature = "native")]
 mod closure;
@@ -228,7 +232,7 @@ pub struct IssueConflicts {
 #[cfg(feature = "native")]
 /// This store's schema generation. Bumped when its `CREATE TABLE` set changes
 /// in a way an older build cannot read.
-const SATELLITE_SCHEMA_VERSION: i64 = 3;
+const SATELLITE_SCHEMA_VERSION: i64 = 4;
 
 impl IssueConflicts {
     #[must_use]
@@ -290,6 +294,7 @@ pub struct ImportReport {
 #[cfg(feature = "native")]
 pub struct WorkItemStore {
     connection: Connection,
+    protection: Option<crate::payload_protection::PayloadProtection>,
     /// The effect currently writing, set by the queue-effect dispatch around the
     /// whole of its work and cleared after (G3). Scoped rather than passed
     /// through every mutation because the alternative is a parameter on a
@@ -306,10 +311,7 @@ impl WorkItemStore {
     pub fn open_existing(path: impl AsRef<Path>) -> StoreResult<Self> {
         let connection =
             crate::native_existing::open(path.as_ref(), "work-item", SATELLITE_SCHEMA_VERSION)?;
-        Ok(Self {
-            connection,
-            event_effect_id: None,
-        })
+        Self::from_existing_connection(connection, None)
     }
 
     pub fn open(path: impl AsRef<Path>) -> StoreResult<Self> {
@@ -331,46 +333,52 @@ impl WorkItemStore {
     }
 
     fn from_connection(connection: Connection) -> StoreResult<Self> {
+        Self::require_plain_before_initialize(&connection)?;
+        Self::initialize_schema(&connection)?;
+        Self::from_existing_connection(connection, None)
+    }
+
+    fn initialize_schema(connection: &Connection) -> StoreResult<()> {
         connection.execute_batch(TRACKER_SCHEMA_SQL)?;
         connection.execute_batch(crate::tracker_filing::SCHEMA)?;
         // DR-0054 Phase B parity: this store had no schema stamp and no
         // downgrade guard, so an older binary read a newer file as whatever
         // it parsed. `SqliteStore` has refused that since Phase B.
-        crate::stamp_satellite_schema(&connection, "work-item", SATELLITE_SCHEMA_VERSION)?;
+        crate::stamp_satellite_schema(connection, "work-item", SATELLITE_SCHEMA_VERSION)?;
         connection.execute_batch(crate::tracker_closure::SCHEMA)?;
         // Self-heal a pre-phase-B `tracker_events` (the ADR-0002 v1 linear log
         // had neither column): `CREATE TABLE IF NOT EXISTS` never alters an
         // existing table, so add the Merkle-DAG columns before the unique index
         // over `event_id` (which would otherwise fail on the old shape).
-        tx_ensure_column(&connection, "tracker_events", "event_id", "TEXT")?;
+        tx_ensure_column(connection, "tracker_events", "event_id", "TEXT")?;
         tx_ensure_column(
-            &connection,
+            connection,
             "tracker_events",
             "parents_json",
             "TEXT NOT NULL DEFAULT '[]'",
         )?;
         // Self-heal a pre-0.2.2 `tracker_issues`, which had no assignment.
-        tx_ensure_column(&connection, "tracker_issues", "assigned_to", "TEXT")?;
+        tx_ensure_column(connection, "tracker_issues", "assigned_to", "TEXT")?;
         // Existing stores start every item at zero rather than replaying
         // `claim.released` out of the event log. A count that begins now is
         // still monotone, which is all the measure needs; a replay would be
         // reconstructing history the projection never claimed to hold.
         tx_ensure_column(
-            &connection,
+            connection,
             "tracker_issues",
             "releases",
             "INTEGER NOT NULL DEFAULT 0",
         )?;
         // Self-heal a tracker written before write-attribution (G3).
-        tx_ensure_column(&connection, "tracker_events", "effect_id", "TEXT")?;
+        tx_ensure_column(connection, "tracker_events", "effect_id", "TEXT")?;
         // Self-heal a tracker written before the knowledge plane's validity
         // keys (DR-0084 Decision 3): keyed evidence carries its at-cut, its
         // basis region text, and the resolved basis fingerprint. Absent on
         // old rows = unkeyed evidence, which makes no freshness claim.
-        tx_ensure_column(&connection, "tracker_evidence", "at_cut", "TEXT")?;
-        tx_ensure_column(&connection, "tracker_evidence", "basis", "TEXT")?;
+        tx_ensure_column(connection, "tracker_evidence", "at_cut", "TEXT")?;
+        tx_ensure_column(connection, "tracker_evidence", "basis", "TEXT")?;
         tx_ensure_column(
-            &connection,
+            connection,
             "tracker_evidence",
             "basis_fingerprint_json",
             "TEXT",
@@ -378,10 +386,12 @@ impl WorkItemStore {
         connection.execute_batch(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_tracker_events_id ON tracker_events(event_id);",
         )?;
-        Ok(Self {
-            connection,
-            event_effect_id: None,
-        })
+        connection.execute_batch(
+            "CREATE TABLE IF NOT EXISTS tracker_payload_protection (
+                singleton INTEGER PRIMARY KEY CHECK(singleton = 1), domain TEXT
+             ); INSERT OR IGNORE INTO tracker_payload_protection VALUES (1, NULL);",
+        )?;
+        Ok(())
     }
 
     /// Files an item, minting a sequential human-speakable id (`WS-1`,
@@ -755,7 +765,7 @@ impl WorkItemStore {
             // The alias join is therefore INNER, not LEFT: without an alias
             // there is no way to learn the event's queue, and an event that
             // cannot be attributed to a subscribed queue must not be delivered.
-            "SELECT e.event_seq, i.queue, a.alias, e.kind, e.actor, i.title \
+            "SELECT e.event_seq, i.queue, a.alias, e.kind, e.actor, whip_payload_open('tracker.issue.title', i.issue_id, i.title) \
              FROM tracker_events e \
              JOIN tracker_aliases a ON a.content_id = e.issue_id \
              JOIN tracker_issues i ON i.issue_id = a.alias \
@@ -800,8 +810,8 @@ impl WorkItemStore {
         // `tracker_issues.issue_id` is the local `WS-N`, so `tracker_aliases` is
         // the only bridge and an unaliased event has no knowable queue.
         let mut statement = self.connection.prepare(
-            "SELECT e.event_seq, e.event_id, a.alias, i.queue, i.title, e.kind, \
-                    e.payload_json, e.created_at \
+            "SELECT e.event_seq, e.event_id, a.alias, i.queue, whip_payload_open('tracker.issue.title', i.issue_id, i.title), e.kind, \
+                    whip_tracker_event_open(e.event_id, e.kind, e.payload_json), e.created_at \
              FROM tracker_events e \
              JOIN tracker_aliases a ON a.content_id = e.issue_id \
              JOIN tracker_issues i ON i.issue_id = a.alias \
@@ -931,7 +941,7 @@ impl WorkItemStore {
             &now,
         )?;
         tx.execute(
-            "UPDATE tracker_issues SET status = 'closed', claim_summary = ?2, updated_at = ?3 \
+            "UPDATE tracker_issues SET status = 'closed', claim_summary = whip_payload_seal('tracker.issue.claim_summary', ?1, ?2), updated_at = ?3 \
              WHERE issue_id = ?1",
             params![item_id, summary, now],
         )?;
@@ -1138,7 +1148,7 @@ impl WorkItemStore {
         )?;
         tx.execute(
             "INSERT OR IGNORE INTO tracker_comments (comment_id, issue_id, author, body, created_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5)",
+             VALUES (?1, ?2, ?3, whip_payload_seal('tracker.comment.body', ?1, ?4), ?5)",
             params![comment_id, item_id, author, body, now],
         )?;
         tx.commit()?;
@@ -1148,7 +1158,7 @@ impl WorkItemStore {
     /// An issue's comments in chronological order.
     pub fn comments(&self, item_id: &str) -> StoreResult<Vec<Comment>> {
         let mut statement = self.connection.prepare(
-            "SELECT comment_id, author, body, created_at FROM tracker_comments \
+            "SELECT comment_id, author, whip_payload_open('tracker.comment.body', comment_id, body), created_at FROM tracker_comments \
              WHERE issue_id = ?1 ORDER BY created_at, comment_id",
         )?;
         let rows = statement
@@ -1199,7 +1209,7 @@ impl WorkItemStore {
         tx.execute(
             "INSERT OR IGNORE INTO tracker_evidence \
              (evidence_id, issue_id, kind, reference, note, added_by, created_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+             VALUES (?1, ?2, whip_payload_seal('tracker.evidence.kind', ?1, ?3), whip_payload_seal('tracker.evidence.reference', ?1, ?4), whip_payload_seal('tracker.evidence.note', ?1, ?5), ?6, ?7)",
             params![evidence_id, item_id, kind, reference, note, added_by, now],
         )?;
         tx.commit()?;
@@ -1291,7 +1301,7 @@ impl WorkItemStore {
             "INSERT OR IGNORE INTO tracker_evidence \
              (evidence_id, issue_id, kind, reference, note, added_by, created_at, \
               at_cut, basis, basis_fingerprint_json) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+             VALUES (?1, ?2, whip_payload_seal('tracker.evidence.kind', ?1, ?3), whip_payload_seal('tracker.evidence.reference', ?1, ?4), whip_payload_seal('tracker.evidence.note', ?1, ?5), ?6, ?7, ?8, whip_payload_seal('tracker.evidence.basis', ?1, ?9), whip_payload_seal('tracker.evidence.basis_fingerprint_json', ?1, ?10))",
             params![
                 evidence_id,
                 item_id,
@@ -1342,7 +1352,7 @@ impl WorkItemStore {
         tx.execute(
             "INSERT OR IGNORE INTO tracker_anchors \
              (anchor_id, subject, region, role, added_by, created_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+             VALUES (?1, ?2, whip_payload_seal('tracker.anchor.region', ?1, ?3), ?4, ?5, ?6)",
             params![anchor_id, item_id, region, role, added_by, now],
         )?;
         tx.commit()?;
@@ -1397,7 +1407,7 @@ impl WorkItemStore {
     /// A subject's current anchors, in creation order.
     pub fn anchors(&self, item_id: &str) -> StoreResult<Vec<Anchor>> {
         let mut statement = self.connection.prepare(
-            "SELECT anchor_id, subject, region, role, added_by, created_at \
+            "SELECT anchor_id, subject, whip_payload_open('tracker.anchor.region', anchor_id, region), role, added_by, created_at \
              FROM tracker_anchors WHERE subject = ?1 ORDER BY created_at, anchor_id",
         )?;
         let rows = statement
@@ -1418,8 +1428,8 @@ impl WorkItemStore {
     /// An issue's attached evidence in chronological order.
     pub fn evidence(&self, item_id: &str) -> StoreResult<Vec<Evidence>> {
         let mut statement = self.connection.prepare(
-            "SELECT evidence_id, kind, reference, note, added_by, created_at, \
-                    at_cut, basis, basis_fingerprint_json \
+            "SELECT evidence_id, whip_payload_open('tracker.evidence.kind', evidence_id, kind), whip_payload_open('tracker.evidence.reference', evidence_id, reference), whip_payload_open('tracker.evidence.note', evidence_id, note), added_by, created_at, \
+                    at_cut, whip_payload_open('tracker.evidence.basis', evidence_id, basis), whip_payload_open('tracker.evidence.basis_fingerprint_json', evidence_id, basis_fingerprint_json) \
              FROM tracker_evidence WHERE issue_id = ?1 ORDER BY created_at, evidence_id",
         )?;
         let rows = statement
@@ -1600,7 +1610,7 @@ impl WorkItemStore {
         tx.execute(
             "INSERT INTO tracker_assertions \
              (assertion_id, title, body, status, created_by, created_at, updated_at) \
-             VALUES (?1, ?2, ?3, 'active', ?4, ?5, ?5)",
+             VALUES (?1, whip_payload_seal('tracker.assertion.title', ?1, ?2), whip_payload_seal('tracker.assertion.body', ?1, ?3), 'active', ?4, ?5, ?5)",
             params![alias, title, body, created_by, now],
         )?;
         tx.commit()?;
@@ -1637,7 +1647,7 @@ impl WorkItemStore {
         let row = self
             .connection
             .query_row(
-                "SELECT a.assertion_id, l.content_id, a.title, a.body, a.status, \
+                "SELECT a.assertion_id, l.content_id, whip_payload_open('tracker.assertion.title', a.assertion_id, a.title), whip_payload_open('tracker.assertion.body', a.assertion_id, a.body), a.status, \
                         a.created_by, a.created_at, a.updated_at \
                  FROM tracker_assertions a JOIN tracker_aliases l ON l.alias = a.assertion_id \
                  WHERE a.assertion_id = ?1",
@@ -1669,7 +1679,7 @@ impl WorkItemStore {
             "WHERE a.status = 'active'"
         };
         let mut statement = self.connection.prepare(&format!(
-            "SELECT a.assertion_id, l.content_id, a.title, a.body, a.status, \
+            "SELECT a.assertion_id, l.content_id, whip_payload_open('tracker.assertion.title', a.assertion_id, a.title), whip_payload_open('tracker.assertion.body', a.assertion_id, a.body), a.status, \
                     a.created_by, a.created_at, a.updated_at \
              FROM tracker_assertions a JOIN tracker_aliases l ON l.alias = a.assertion_id \
              {filter} ORDER BY a.created_at DESC, a.assertion_id DESC"
@@ -1766,7 +1776,7 @@ impl WorkItemStore {
         type ProjectionEventRow = (String, Option<String>, String, String, String, Vec<String>);
         let events: Vec<ProjectionEventRow> = tx
             .prepare(
-                "SELECT event_id, issue_id, kind, payload_json, created_at, parents_json \
+                "SELECT event_id, issue_id, kind, whip_tracker_event_open(event_id, kind, payload_json), created_at, parents_json \
                  FROM tracker_events ORDER BY event_seq",
             )?
             .query_map([], |row| {
@@ -1835,7 +1845,7 @@ impl WorkItemStore {
 
     pub fn export_events(&self) -> StoreResult<Vec<TrackerEvent>> {
         let mut statement = self.connection.prepare(
-            "SELECT event_id, parents_json, issue_id, kind, payload_json, actor, created_at \
+            "SELECT event_id, parents_json, issue_id, kind, whip_tracker_event_open(event_id, kind, payload_json), actor, created_at \
              FROM tracker_events ORDER BY event_seq",
         )?;
         let rows = statement
@@ -1910,7 +1920,7 @@ impl WorkItemStore {
                 let changes = tx.execute(
                     "INSERT OR IGNORE INTO tracker_events \
                      (event_id, parents_json, issue_id, kind, payload_json, actor, created_at) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                     VALUES (?1, ?2, ?3, ?4, whip_tracker_event_seal(?1, ?4, ?5), ?6, ?7)",
                     params![
                         event.event_id,
                         parents_json,
@@ -1993,7 +2003,7 @@ impl WorkItemStore {
             if !unaliased.is_empty() {
                 let created: Vec<(String, String)> = tx
                     .prepare(
-                        "SELECT issue_id, payload_json FROM tracker_events \
+                        "SELECT issue_id, whip_tracker_event_open(event_id, kind, payload_json) FROM tracker_events \
                          WHERE kind = 'issue.created' AND issue_id IS NOT NULL",
                     )?
                     .query_map([], |row| {
@@ -2205,7 +2215,7 @@ fn tx_file_item(
     tx.execute(
             "INSERT INTO tracker_issues \
              (issue_id, queue, title, body, status, labels_json, metadata_json, filed_by, assigned_to, created_at, updated_at) \
-             VALUES (?1, ?2, ?3, ?4, 'open', ?5, ?6, ?7, ?8, ?9, ?9)",
+             VALUES (?1, ?2, whip_payload_seal('tracker.issue.title', ?1, ?3), whip_payload_seal('tracker.issue.body', ?1, ?4), 'open', whip_payload_seal('tracker.issue.labels_json', ?1, ?5), whip_payload_seal('tracker.issue.metadata_json', ?1, ?6), ?7, ?8, ?9, ?9)",
             params![
                 item_id, queue, title, body, labels_json, metadata_json, filed_by, assigned_to, now
             ],
@@ -2356,8 +2366,8 @@ fn tx_ensure_column(conn: &Connection, table: &str, column: &str, decl: &str) ->
 
 /// Projection columns in `WorkItem` order (see `row_to_item`).
 #[cfg(feature = "native")]
-const ISSUE_COLS: &str = "issue_id, queue, title, body, status, labels_json, releases, \
-     metadata_json, assigned_to, filed_by, created_at, updated_at";
+const ISSUE_COLS: &str = "issue_id, queue, whip_payload_open('tracker.issue.title', issue_id, title), whip_payload_open('tracker.issue.body', issue_id, body), status, whip_payload_open('tracker.issue.labels_json', issue_id, labels_json), releases, \
+     whip_payload_open('tracker.issue.metadata_json', issue_id, metadata_json), assigned_to, filed_by, created_at, updated_at";
 
 /// Capture a single now-timestamp for one mutating op; every event + projection
 /// field derived from this op uses it, so a rebuild reproduces the same values.
@@ -2479,7 +2489,7 @@ fn tx_append_raw(
     tx.execute(
         "INSERT OR IGNORE INTO tracker_events \
          (event_id, parents_json, issue_id, kind, payload_json, actor, effect_id, created_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+         VALUES (?1, ?2, ?3, ?4, whip_tracker_event_seal(?1, ?4, ?5), ?6, ?7, ?8)",
         params![
             event_id,
             parents_json,
@@ -2731,7 +2741,7 @@ fn tx_apply_field_set(
     if let Some(column) = projection_column(field) {
         tx.execute(
             &format!(
-                "UPDATE tracker_issues SET {column} = ?2, updated_at = ?3 WHERE issue_id = ?1"
+                "UPDATE tracker_issues SET {column} = CASE WHEN '{column}' = 'status' THEN ?2 ELSE whip_payload_seal('tracker.issue.{column}', ?1, ?2) END, updated_at = ?3 WHERE issue_id = ?1"
             ),
             params![item_id, value, now],
         )?;
@@ -2790,7 +2800,7 @@ pub struct IssueEvent {
 #[cfg(feature = "native")]
 fn load_issue_events(conn: &Connection, issue_id: &str) -> StoreResult<Vec<IssueEvent>> {
     let mut statement = conn.prepare(
-        "SELECT event_id, parents_json, kind, payload_json FROM tracker_events \
+        "SELECT event_id, parents_json, kind, whip_tracker_event_open(event_id, kind, payload_json) FROM tracker_events \
          WHERE issue_id = ?1 ORDER BY event_seq",
     )?;
     let rows = statement
@@ -3014,7 +3024,7 @@ fn fold_event(
             tx.execute(
                 "INSERT INTO tracker_issues \
                  (issue_id, queue, title, body, status, labels_json, metadata_json, filed_by, assigned_to, created_at, updated_at) \
-                 VALUES (?1, ?2, ?3, ?4, 'open', ?5, ?6, ?7, ?8, ?9, ?9)",
+                 VALUES (?1, ?2, whip_payload_seal('tracker.issue.title', ?1, ?3), whip_payload_seal('tracker.issue.body', ?1, ?4), 'open', whip_payload_seal('tracker.issue.labels_json', ?1, ?5), whip_payload_seal('tracker.issue.metadata_json', ?1, ?6), ?7, ?8, ?9, ?9)",
                 params![
                     issue_id,
                     payload.get("queue").and_then(Value::as_str).unwrap_or_default(),
@@ -3043,7 +3053,7 @@ fn fold_event(
                 };
                 tx.execute(
                     &format!(
-                        "UPDATE tracker_issues SET {column} = ?2, updated_at = ?3 WHERE issue_id = ?1"
+                        "UPDATE tracker_issues SET {column} = CASE WHEN '{column}' = 'status' THEN ?2 ELSE whip_payload_seal('tracker.issue.{column}', ?1, ?2) END, updated_at = ?3 WHERE issue_id = ?1"
                     ),
                     params![id, value, created_at],
                 )?;
@@ -3097,7 +3107,7 @@ fn fold_event(
                 tx.execute(
                     "INSERT OR IGNORE INTO tracker_comments \
                      (comment_id, issue_id, author, body, created_at) \
-                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                     VALUES (?1, ?2, ?3, whip_payload_seal('tracker.comment.body', ?1, ?4), ?5)",
                     params![
                         comment_id,
                         issue,
@@ -3120,7 +3130,7 @@ fn fold_event(
                     "INSERT OR IGNORE INTO tracker_evidence \
                      (evidence_id, issue_id, kind, reference, note, added_by, created_at, \
                       at_cut, basis, basis_fingerprint_json) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                     VALUES (?1, ?2, whip_payload_seal('tracker.evidence.kind', ?1, ?3), whip_payload_seal('tracker.evidence.reference', ?1, ?4), whip_payload_seal('tracker.evidence.note', ?1, ?5), ?6, ?7, ?8, whip_payload_seal('tracker.evidence.basis', ?1, ?9), whip_payload_seal('tracker.evidence.basis_fingerprint_json', ?1, ?10))",
                     params![
                         evidence_id,
                         issue,
@@ -3141,7 +3151,7 @@ fn fold_event(
                 tx.execute(
                     "INSERT OR IGNORE INTO tracker_anchors \
                      (anchor_id, subject, region, role, added_by, created_at) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                     VALUES (?1, ?2, whip_payload_seal('tracker.anchor.region', ?1, ?3), ?4, ?5, ?6)",
                     params![
                         anchor_id,
                         subject,
@@ -3168,7 +3178,7 @@ fn fold_event(
                 tx.execute(
                     "INSERT OR IGNORE INTO tracker_assertions \
                      (assertion_id, title, body, status, created_by, created_at, updated_at) \
-                     VALUES (?1, ?2, ?3, 'active', ?4, ?5, ?5)",
+                     VALUES (?1, whip_payload_seal('tracker.assertion.title', ?1, ?2), whip_payload_seal('tracker.assertion.body', ?1, ?3), 'active', ?4, ?5, ?5)",
                     params![
                         alias,
                         str_of("title").unwrap_or_default(),
@@ -3250,7 +3260,7 @@ fn fold_set_status(
     if let Some(id) = issue_id {
         let summary = payload.get("summary").and_then(Value::as_str);
         tx.execute(
-            "UPDATE tracker_issues SET status = ?2, claim_summary = COALESCE(?3, claim_summary), \
+            "UPDATE tracker_issues SET status = ?2, claim_summary = COALESCE(whip_payload_seal('tracker.issue.claim_summary', ?1, ?3), claim_summary), \
              updated_at = ?4 WHERE issue_id = ?1",
             params![id, status, summary, created_at],
         )?;

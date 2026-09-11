@@ -85,7 +85,9 @@ pub(crate) fn native_dispatch_admission_binding(
                 event_id: row.get(0)?,
                 sequence: row.get(1)?,
                 event_type: row.get(2)?,
-                payload_json: row.get(3)?,
+                payload_json: crate::runtime_protection::read_event_payload(
+                    connection, row, 0, 2, 3,
+                )?,
                 occurred_at: row.get(4)?,
                 source: row.get(5)?,
                 causation_id: row.get(6)?,
@@ -580,6 +582,14 @@ impl crate::SqliteStore {
         &mut self,
         action: HostActionStart<'_>,
     ) -> crate::StoreResult<HostActionAdmission> {
+        self.retained_publication()
+            .run(|| self.admit_host_action_retained(action))
+    }
+
+    fn admit_host_action_retained(
+        &mut self,
+        action: HostActionStart<'_>,
+    ) -> crate::StoreResult<HostActionAdmission> {
         use crate::{append_event_on, insert_fact, NewEvent, StoreError};
         use rusqlite::OptionalExtension;
 
@@ -588,7 +598,7 @@ impl crate::SqliteStore {
             .connection
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let existing = tx.query_row(
-            "SELECT event_id, sequence, payload_json FROM events WHERE instance_id = ?1 AND idempotency_key = 'host-action-admission'",
+            "SELECT event_id, sequence, whip_runtime_event_open(event_id, event_type, payload_json) FROM events WHERE instance_id = ?1 AND idempotency_key = 'host-action-admission'",
             [action.instance_id],
             |row| Ok((StoredEvent { event_id: row.get(0)?, sequence: row.get(1)? }, row.get::<_, String>(2)?)),
         ).optional()?;
@@ -686,24 +696,16 @@ pub(super) fn create_instance_on(
     use rusqlite::params;
     let (record, created) = connection.query_row(
         r#"
-                INSERT INTO instances (
-                    instance_id,
-                    program_id,
-                    version_id,
-                    workflow_principal,
-                    effective_authority,
-                    status,
-                    input_json,
-                    started_at
-                )
+                WITH payload_identity(id) AS MATERIALIZED (SELECT COALESCE(?6, 'ins_' || lower(hex(randomblob(16)))))
+                INSERT INTO instances (instance_id, program_id, version_id, workflow_principal, effective_authority, status, input_json, started_at)
                 VALUES (
-                    COALESCE(?6, 'ins_' || lower(hex(randomblob(16)))),
+                    (SELECT id FROM payload_identity),
                     ?1,
                     ?2,
                     ?3,
                     ?4,
                     'running',
-                    ?5,
+                    whip_payload_seal('runtime.instances.input_json', (SELECT id FROM payload_identity), ?5),
                     CURRENT_TIMESTAMP
                 )
                 RETURNING
@@ -714,7 +716,7 @@ pub(super) fn create_instance_on(
                     revision_epoch,
                     workflow_principal,
                     effective_authority,
-                    input_json,
+                    whip_payload_open('runtime.instances.input_json', instances.instance_id, input_json),
                     created_at,
                     started_at
                 "#,

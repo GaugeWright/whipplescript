@@ -206,6 +206,17 @@ mod native {
             expected_head: &str,
             delivery: &DeliveredTrackerResult,
         ) -> StoreResult<StoredEvent> {
+            self.retained_publication().run(|| {
+                self.publish_tracker_delivery_retained(owner_epoch, expected_head, delivery)
+            })
+        }
+
+        fn publish_tracker_delivery_retained(
+            &mut self,
+            owner_epoch: i64,
+            expected_head: &str,
+            delivery: &DeliveredTrackerResult,
+        ) -> StoreResult<StoredEvent> {
             delivery.validate()?;
             let tx = self
                 .connection
@@ -224,7 +235,7 @@ mod native {
             }
             let key = delivery.event_key();
             let existing: Option<(StoredEvent, String, String, Option<String>)> = tx.query_row(
-                "SELECT event_id, sequence, event_type, payload_json, source FROM events WHERE instance_id=?1 AND idempotency_key=?2",
+                "SELECT event_id, sequence, event_type, whip_runtime_event_open(event_id, event_type, payload_json), source FROM events WHERE instance_id=?1 AND idempotency_key=?2",
                 [delivery.instance_id(), &key], |row| Ok((StoredEvent { event_id: row.get(0)?, sequence: row.get(1)? }, row.get(2)?, row.get(3)?, row.get(4)?)))
                 .optional()?;
             if let Some((event, kind, payload, source)) = existing {
@@ -265,11 +276,11 @@ mod native {
                 ));
             }
             let (started_at, start): (i64, String) = tx.query_row(
-                "SELECT sequence, payload_json FROM events WHERE instance_id=?1 AND source='kernel' AND event_type='effect.run_started' AND json_extract(payload_json,'$.run_id')=?2",
+                "SELECT sequence, whip_runtime_event_open(event_id, event_type, payload_json) FROM events WHERE instance_id=?1 AND source='kernel' AND event_type='effect.run_started' AND json_extract(whip_runtime_event_open(event_id, event_type, payload_json),'$.run_id')=?2",
                 [delivery.instance_id(), delivery.run_id()], |row| Ok((row.get(0)?, row.get(1)?)))?;
             let evidence = delivery.application_evidence(&serde_json::from_str(&start)?)?;
             let later_attempt: bool = tx.query_row(
-                "SELECT EXISTS(SELECT 1 FROM events WHERE instance_id=?1 AND source='kernel' AND event_type='effect.run_started' AND sequence>?2 AND json_extract(payload_json,'$.effect_id')=?3)",
+                "SELECT EXISTS(SELECT 1 FROM events WHERE instance_id=?1 AND source='kernel' AND event_type='effect.run_started' AND sequence>?2 AND json_extract(whip_runtime_event_open(event_id, event_type, payload_json),'$.effect_id')=?3)",
                 params![delivery.instance_id(), started_at, delivery.effect_id()], |row| row.get(0))?;
             if later_attempt {
                 return Err(StoreError::Conflict(
@@ -280,10 +291,10 @@ mod native {
             // its exact observation dependencies can be proved, a post-terminal
             // rule commit is insufficient evidence of an unhandled failure.
             let handled: bool = tx.query_row(
-                "SELECT EXISTS(SELECT 1 FROM events WHERE instance_id=?1 AND source='kernel' AND event_type='rule.committed' AND sequence > (SELECT MIN(sequence) FROM events WHERE instance_id=?1 AND source='kernel' AND event_type IN ('effect.terminal','lease.expired') AND json_extract(payload_json,'$.run_id')=?2))",
+                "SELECT EXISTS(SELECT 1 FROM events WHERE instance_id=?1 AND source='kernel' AND event_type='rule.committed' AND sequence > (SELECT MIN(sequence) FROM events WHERE instance_id=?1 AND source='kernel' AND event_type IN ('effect.terminal','lease.expired') AND json_extract(whip_runtime_event_open(event_id, event_type, payload_json),'$.run_id')=?2))",
                 [delivery.instance_id(), delivery.run_id()], |row| row.get(0))?;
             let settled_fact: bool = tx.query_row(
-                "SELECT EXISTS(SELECT 1 FROM facts WHERE instance_id=?1 AND key=?2 AND (name=?3 OR (name=?4 AND consumed_at IS NOT NULL)))",
+                "SELECT EXISTS(SELECT 1 FROM facts WHERE instance_id=?1 AND key=whip_runtime_fact_key(?2) AND (name=?3 OR (name=?4 AND consumed_at IS NOT NULL)))",
                 [delivery.instance_id(), delivery.effect_id(), delivery.success_name(), delivery.failure_name()], |row| row.get(0))?;
             if handled || settled_fact {
                 return Err(StoreError::Conflict(
@@ -291,7 +302,7 @@ mod native {
                 ));
             }
             let failures = {
-                let mut query = tx.prepare("SELECT fact_id FROM facts WHERE instance_id=?1 AND name=?3 AND key=?2 AND consumed_at IS NULL ORDER BY fact_id")?;
+                let mut query = tx.prepare("SELECT fact_id FROM facts WHERE instance_id=?1 AND name=?3 AND key=whip_runtime_fact_key(?2) AND consumed_at IS NULL ORDER BY fact_id")?;
                 let rows = query
                     .query_map(
                         [

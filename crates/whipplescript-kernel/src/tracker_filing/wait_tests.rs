@@ -113,9 +113,16 @@ fn close_and_project(f: &mut Fixture, issue: &str) {
 
 #[test]
 fn governed_tracker_wait_parks_then_consumes_closure_with_a_read_only_binding() {
-    for actor in ["person:learner", "agent:assistant"] {
-        let (mut f, issue) =
-            wait_fixture(actor, |id| json!({"id": id, "queue": "tutorials"}), |_| {});
+    for (protected, actor) in [false, true]
+        .into_iter()
+        .flat_map(|protected| ["person:learner", "agent:assistant"].map(|actor| (protected, actor)))
+    {
+        let (mut f, issue) = wait_fixture_in(
+            protected_stores::memory(protected),
+            actor,
+            |id| json!({"id": id, "queue": "tutorials"}),
+            |_| {},
+        );
         let mut authority = Authority::new(&f);
         let instance = f.request.admission.instance_ref.clone();
         let before = f.facade.kernel().store().chain_head(&instance).unwrap();
@@ -404,7 +411,10 @@ fn governed_tracker_wait_refuses_foreign_resources_and_reference_redirects() {
 
 #[test]
 fn governed_tracker_wait_interruption_leaves_no_run_and_retries_after_disk_reopen() {
-    for actor in ["person:learner", "agent:assistant"] {
+    for (protected, actor) in [false, true]
+        .into_iter()
+        .flat_map(|protected| ["person:learner", "agent:assistant"].map(|actor| (protected, actor)))
+    {
         for event_type in ["effect.terminal", "fact.derived"] {
             let root = std::env::temp_dir().join(format!(
                 "whip-wait-atomic-{}-{}",
@@ -415,21 +425,15 @@ fn governed_tracker_wait_interruption_leaves_no_run_and_retries_after_disk_reope
                     .as_nanos()
             ));
             std::fs::create_dir_all(&root).unwrap();
-            let open = || {
-                NativeStores::open(
-                    root.join("runtime.sqlite"),
-                    root.join("coord.sqlite"),
-                    root.join("items.sqlite"),
-                )
-                .unwrap()
-            };
+            let open = || protected_stores::reopen(&root, protected);
             let (mut f, issue) = wait_fixture_in(
-                open(),
+                protected_stores::create(&root, protected),
                 actor,
                 |id| json!({"id": id, "queue": "tutorials"}),
                 |_| {},
             );
             close_and_project(&mut f, &issue);
+            protected_stores::assert_sealed(&root, protected);
             let authority = Authority::new(&f);
             let instance = f.request.admission.instance_ref.clone();
             let before = f.facade.kernel().store().chain_prefix(&instance).unwrap();
@@ -539,6 +543,7 @@ fn governed_tracker_wait_interruption_leaves_no_run_and_retries_after_disk_reope
                 "completed"
             );
             drop(f);
+            protected_stores::assert_sealed(&root, protected);
             std::fs::remove_dir_all(root).unwrap();
         }
     }

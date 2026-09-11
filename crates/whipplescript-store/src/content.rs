@@ -18,6 +18,8 @@
 use std::path::Path;
 
 pub mod preparation;
+#[cfg(feature = "native")]
+mod protection;
 pub mod publication;
 
 #[cfg(feature = "native")]
@@ -436,6 +438,7 @@ fn body_bytes(value: rusqlite::types::Value) -> Option<Vec<u8>> {
 #[cfg(feature = "native")]
 pub struct ContentStore {
     connection: Connection,
+    protection: Option<crate::payload_protection::PayloadProtection>,
 }
 
 #[cfg(feature = "native")]
@@ -446,7 +449,7 @@ impl ContentStore {
     pub fn open_existing(path: impl AsRef<Path>) -> StoreResult<Self> {
         let connection =
             crate::native_existing::open(path.as_ref(), "content", SATELLITE_SCHEMA_VERSION)?;
-        Ok(Self { connection })
+        Self::from_connection(connection, None)
     }
 
     /// Open an existing store without creating directories, initializing or
@@ -457,7 +460,7 @@ impl ContentStore {
         let connection =
             Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         connection.busy_timeout(crate::STORE_BUSY_TIMEOUT)?;
-        Ok(Self { connection })
+        Self::from_connection(connection, None)
     }
 
     /// Open (creating if needed) the content-addressed store at `path`.
@@ -469,8 +472,9 @@ impl ContentStore {
         }
         let connection = Connection::open(path)?;
         crate::establish_wal(&connection)?;
+        Self::require_plain_before_initialize(&connection)?;
         ensure_content_schema(&connection)?;
-        Ok(Self { connection })
+        Self::from_connection(connection, None)
     }
 
     /// Store `body`, returning its content id (a stable hash of the bytes).
@@ -548,7 +552,7 @@ impl ContentBlobs for ContentStore {
             .connection
             .prepare_cached("SELECT EXISTS(SELECT 1 FROM content_blobs WHERE id = ?1)")?
             .query_row(params![id], |row| row.get(0))?;
-        if plain {
+        if plain && self.protection.is_none() {
             return Ok(true);
         }
         // Packed content and chunk roots use the full read path, including
@@ -579,10 +583,15 @@ impl ContentBlobs for ContentStore {
         // and would have rewritten the on-disk representation of every file in
         // every existing store — a `.dump` of a source tree turning into hex,
         // for no gain. Reads take bytes either way, so both live side by side.
-        match std::str::from_utf8(body) {
-            Ok(text) => insert.execute(params![id, text, body.len() as i64])?,
-            Err(_) => insert.execute(params![id, body, body.len() as i64])?,
-        };
+        if let Some(protection) = &self.protection {
+            let sealed = protection.seal("content.blob", &id, body)?;
+            insert.execute(params![id, sealed, body.len() as i64])?;
+        } else {
+            match std::str::from_utf8(body) {
+                Ok(text) => insert.execute(params![id, text, body.len() as i64])?,
+                Err(_) => insert.execute(params![id, body, body.len() as i64])?,
+            };
+        }
         Ok(id)
     }
 
@@ -591,19 +600,8 @@ impl ContentBlobs for ContentStore {
     /// answer to their id — callers (working sets, bundles, diff) never
     /// see the tiering.
     fn get(&self, id: &str) -> StoreResult<Option<Vec<u8>>> {
-        // Each cached statement is scoped so it returns to the cache before the
-        // next step — `get` recurses through `reassemble_root`.
-        {
-            let mut loose = self
-                .connection
-                .prepare_cached("SELECT body FROM content_blobs WHERE id = ?1")?;
-            if let Some(body) = loose
-                .query_row(params![id], |row| row.get::<_, rusqlite::types::Value>(0))
-                .optional()?
-                .and_then(body_bytes)
-            {
-                return Ok(Some(body));
-            }
+        if let Some(body) = self.read_loose(id)? {
+            return Ok(Some(body));
         }
         if let Some(body) = self.read_packed(id)? {
             return Ok(Some(body));
@@ -769,7 +767,9 @@ impl ContentBlobs for ContentStore {
 /// changes in a way an older build cannot read.
 // Generation 2 also fences the collection protocol: an older collector takes
 // its root snapshot before excluding publication, even with identical tables.
-const SATELLITE_SCHEMA_VERSION: i64 = 2;
+// Generation 3 retains the native payload protection binding; older writable
+// openers must refuse the store rather than append plaintext to sealed content.
+const SATELLITE_SCHEMA_VERSION: i64 = 3;
 
 #[cfg(feature = "native")]
 fn ensure_content_schema(connection: &Connection) -> StoreResult<()> {
@@ -779,6 +779,11 @@ fn ensure_content_schema(connection: &Connection) -> StoreResult<()> {
     crate::stamp_satellite_schema(connection, "content", SATELLITE_SCHEMA_VERSION)?;
     connection.execute_batch(
         r#"
+        CREATE TABLE IF NOT EXISTS content_payload_protection (
+            singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+            domain TEXT
+        );
+        INSERT OR IGNORE INTO content_payload_protection(singleton, domain) VALUES (1, NULL);
         CREATE TABLE IF NOT EXISTS content_blobs (
             id         TEXT PRIMARY KEY,
             body       TEXT NOT NULL,
@@ -1108,15 +1113,8 @@ impl ContentStore {
             }
         }
         for (member, body) in &bodies {
-            self.connection.execute(
-                // `created_at` is NOT NULL, and `INSERT OR IGNORE` swallows a
-                // constraint violation — omitting it silently re-inlined
-                // nothing while reporting success. Every column the schema
-                // requires is named here for that reason.
-                "INSERT OR IGNORE INTO content_blobs (id, body, byte_len, created_at) \
-                 VALUES (?1, ?2, ?3, datetime('now'))",
-                params![member, body, body.len() as i64],
-            )?;
+            verify_body(member, body, "dissolve protected pack")?;
+            self.put(body)?;
         }
         self.connection.execute(
             "DELETE FROM content_pack_entries WHERE pack_id = ?1",
@@ -1142,14 +1140,7 @@ impl ContentStore {
         let Some((pack_id, offset, len)) = entry else {
             return Ok(None);
         };
-        let pack: Option<Vec<u8>> = self
-            .connection
-            .prepare_cached("SELECT body FROM content_blobs WHERE id = ?1")?
-            .query_row(params![pack_id], |row| {
-                row.get::<_, rusqlite::types::Value>(0)
-            })
-            .optional()?
-            .and_then(body_bytes);
+        let pack = self.read_loose(&pack_id)?;
         let Some(pack) = pack else {
             return Ok(None);
         };
@@ -1180,20 +1171,13 @@ impl ContentStore {
         // Only chunks that still live as loose rows move; chunks already
         // packed (or shared and packed by a sibling) are left where they
         // are — reads resolve either way.
-        let mut loose: Vec<(String, String)> = Vec::new();
+        let mut loose: Vec<(String, Vec<u8>)> = Vec::new();
         let mut seen = std::collections::BTreeSet::new();
         for chunk_id in &info.chunk_ids {
             if !seen.insert(chunk_id.clone()) {
                 continue;
             }
-            let body: Option<String> = self
-                .connection
-                .query_row(
-                    "SELECT body FROM content_blobs WHERE id = ?1",
-                    params![chunk_id],
-                    |row| row.get(0),
-                )
-                .optional()?;
+            let body = self.read_loose(chunk_id)?;
             if let Some(body) = body {
                 loose.push((chunk_id.clone(), body));
             }
@@ -1201,13 +1185,13 @@ impl ContentStore {
         if loose.is_empty() {
             return Ok(0);
         }
-        let mut pack_body = String::new();
+        let mut pack_body = Vec::new();
         let mut entries = Vec::new();
         for (chunk_id, body) in &loose {
             entries.push((chunk_id.clone(), pack_body.len() as i64, body.len() as i64));
-            pack_body.push_str(body);
+            pack_body.extend_from_slice(body);
         }
-        let pack_id = self.put(pack_body.as_bytes())?;
+        let pack_id = self.put(&pack_body)?;
         for (chunk_id, offset, len) in &entries {
             self.connection.execute(
                 "INSERT OR IGNORE INTO content_pack_entries (chunk_id, pack_id, offset, len) \
@@ -1248,11 +1232,8 @@ impl ContentStore {
                 .collect::<Result<_, _>>()?;
             for (chunk_id, _, _) in &entries {
                 if let Some(body) = self.read_packed(chunk_id)? {
-                    self.connection.execute(
-                        "INSERT OR IGNORE INTO content_blobs (id, body, byte_len, created_at) \
-                         VALUES (?1, ?2, ?3, datetime('now'))",
-                        params![chunk_id, body, body.len() as i64],
-                    )?;
+                    verify_body(chunk_id, &body, "unpack protected content")?;
+                    self.put(&body)?;
                 }
             }
             self.connection.execute(

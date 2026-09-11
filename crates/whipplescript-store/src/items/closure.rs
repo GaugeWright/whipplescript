@@ -20,6 +20,20 @@ impl TrackerClosures for WorkItemStore {
     }
 
     fn close_issue_once(&mut self, request: &TrackerClosure) -> StoreResult<TrackerClosureReceipt> {
+        let protection = self.protection.clone();
+        if let Some(protection) = protection {
+            protection.retain(|| self.close_issue_once_retained(request))
+        } else {
+            self.close_issue_once_retained(request)
+        }
+    }
+}
+
+impl WorkItemStore {
+    fn close_issue_once_retained(
+        &mut self,
+        request: &TrackerClosure,
+    ) -> StoreResult<TrackerClosureReceipt> {
         let fingerprint = request.fingerprint()?;
         let tx = self
             .connection
@@ -75,7 +89,7 @@ impl TrackerClosures for WorkItemStore {
             &now,
         )?;
         tx.execute(
-            "UPDATE tracker_issues SET status = 'closed', claim_summary = ?2, updated_at = ?3 WHERE issue_id = ?1",
+            "UPDATE tracker_issues SET status = 'closed', claim_summary = whip_payload_seal('tracker.issue.claim_summary', ?1, ?2), updated_at = ?3 WHERE issue_id = ?1",
             params![request.item_id, request.summary, now],
         )?;
         tx_release_active_lease_by(
@@ -182,7 +196,7 @@ mod tests {
                     row.get(0)
                 })
                 .unwrap();
-            assert_eq!(version, 3);
+            assert_eq!(version, SATELLITE_SCHEMA_VERSION);
             assert_eq!(store.closing_receipt(&request.operation_id).unwrap(), None);
             assert_eq!(WorkItems::event_position(&store).unwrap(), 2);
             assert_eq!(
@@ -204,7 +218,7 @@ mod tests {
             WorkItemStore::open(&path),
             Err(StoreError::UnsupportedVersion {
                 found: 999,
-                supported: 3,
+                supported: SATELLITE_SCHEMA_VERSION,
                 ..
             })
         ));

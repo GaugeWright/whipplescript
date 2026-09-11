@@ -150,8 +150,16 @@ fn fixture_close_in(
 
 #[test]
 fn governed_tracker_closure_uses_the_actual_actor_and_ordinary_continuation() {
-    for actor in ["person:learner", "agent:assistant"] {
-        let (mut f, binding, authority) = fixture_close(actor);
+    for (protected, actor) in [false, true]
+        .into_iter()
+        .flat_map(|protected| ["person:learner", "agent:assistant"].map(|actor| (protected, actor)))
+    {
+        let (mut f, binding, authority) = fixture_close_in(
+            actor,
+            CLOSE_SOURCE,
+            |_| {},
+            protected_stores::memory(protected),
+        );
         f.facade
             .execute_tracker_closure(
                 f.request.clone(),
@@ -521,7 +529,10 @@ fn governed_tracker_closure_target_refusals_have_fixed_body_free_failures() {
 
 #[test]
 fn governed_tracker_closure_recovers_its_committed_target_across_interrupted_publication() {
-    for expire in [false, true] {
+    for (protected, expire) in [false, true]
+        .into_iter()
+        .flat_map(|protected| [false, true].map(|expire| (protected, expire)))
+    {
         let root = std::env::temp_dir().join(format!(
             "whip-closure-interruption-{}-{}",
             std::process::id(),
@@ -531,16 +542,14 @@ fn governed_tracker_closure_recovers_its_committed_target_across_interrupted_pub
                 .as_nanos()
         ));
         std::fs::create_dir_all(&root).unwrap();
-        let open = || {
-            NativeStores::open(
-                root.join("runtime.sqlite"),
-                root.join("coord.sqlite"),
-                root.join("items.sqlite"),
-            )
-            .expect("disk closure stores")
-        };
-        let (mut f, binding, authority) =
-            fixture_close_in("person:learner", CLOSE_SOURCE, |_| {}, open());
+        let open = || protected_stores::reopen(&root, protected);
+        let (mut f, binding, authority) = fixture_close_in(
+            "person:learner",
+            CLOSE_SOURCE,
+            |_| {},
+            protected_stores::create(&root, protected),
+        );
+        protected_stores::assert_sealed(&root, protected);
         let fault = rusqlite::Connection::open(root.join("runtime.sqlite")).unwrap();
         fault.execute_batch("CREATE TRIGGER closure_settlement_fault AFTER INSERT ON events WHEN NEW.event_type = 'effect.terminal' BEGIN SELECT RAISE(ABORT, 'injected closure terminal fault'); END").unwrap();
         let error = f
@@ -644,6 +653,7 @@ fn governed_tracker_closure_recovers_its_committed_target_across_interrupted_pub
         );
         recovery::recover_and_continue(&mut f, &binding, expire);
         drop(f);
+        protected_stores::assert_sealed(&root, protected);
         std::fs::remove_dir_all(root).unwrap();
     }
 }

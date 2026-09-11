@@ -26,7 +26,7 @@ impl super::ContentStore {
                 supported: super::SATELLITE_SCHEMA_VERSION,
             });
         }
-        Ok(Self { connection })
+        Self::from_connection(connection, None)
     }
 }
 
@@ -60,8 +60,15 @@ pub(super) fn native_publish<T>(
         &store.connection,
         rusqlite::TransactionBehavior::Immediate,
     )?;
-    verify_prepared(store, ids)?;
-    let result = publish()?;
+    let publish = || {
+        verify_prepared(store, ids)?;
+        publish()
+    };
+    let result = if let Some(protection) = &store.protection {
+        protection.retain(publish)?
+    } else {
+        publish()?
+    };
     transaction.commit()?;
     Ok(result)
 }
@@ -330,12 +337,12 @@ mod tests {
     }
 
     #[test]
-    fn an_older_collector_cannot_reopen_content_generation_two() {
+    fn an_older_collector_cannot_reopen_current_content_generation() {
         let store = content();
         assert!(matches!(
             crate::stamp_satellite_schema(&store.connection, "content", 1),
             Err(StoreError::UnsupportedVersion {
-                found: 2,
+                found: super::super::SATELLITE_SCHEMA_VERSION,
                 supported: 1,
                 ..
             })

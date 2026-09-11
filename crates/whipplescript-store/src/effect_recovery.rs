@@ -160,7 +160,7 @@ pub(crate) fn native_dispatch_marker(
     fingerprint: &str,
 ) -> StoreResult<DispatchMarker> {
     let (kind, target, input, key): (String, Option<String>, String, String) = connection.query_row(
-        "SELECT kind, target, input_json, idempotency_key FROM effects WHERE instance_id = ?1 AND effect_id = ?2",
+        "SELECT kind, target, whip_payload_open('runtime.effects.input_json', effects.effect_id, input_json), idempotency_key FROM effects WHERE instance_id = ?1 AND effect_id = ?2",
         [run.instance_id, run.effect_id],
         |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
     )?;
@@ -184,7 +184,9 @@ pub(crate) fn native_attempts(
                 event_id: row.get(0)?,
                 sequence: row.get(1)?,
                 event_type: row.get(2)?,
-                payload_json: row.get(3)?,
+                payload_json: crate::runtime_protection::read_event_payload(
+                    connection, row, 0, 2, 3,
+                )?,
                 source: row.get(4)?,
                 occurred_at: row.get(5)?,
             })

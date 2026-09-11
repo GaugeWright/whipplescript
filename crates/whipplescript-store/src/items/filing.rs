@@ -18,6 +18,20 @@ impl TrackerFilings for WorkItemStore {
     }
 
     fn file_issue_once(&mut self, filing: &TrackerFiling) -> StoreResult<TrackerFilingReceipt> {
+        let protection = self.protection.clone();
+        if let Some(protection) = protection {
+            protection.retain(|| self.file_issue_once_retained(filing))
+        } else {
+            self.file_issue_once_retained(filing)
+        }
+    }
+}
+
+impl WorkItemStore {
+    fn file_issue_once_retained(
+        &mut self,
+        filing: &TrackerFiling,
+    ) -> StoreResult<TrackerFilingReceipt> {
         let fingerprint = filing.fingerprint()?;
         let tx = self
             .connection

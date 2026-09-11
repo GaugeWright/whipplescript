@@ -11,6 +11,8 @@ pub mod dispatch_definition;
 pub mod effect_recovery;
 pub mod erasure_ledger;
 pub mod event_chain;
+#[cfg(feature = "native")]
+mod event_payload_protection;
 pub mod file_settlement;
 pub mod files;
 pub mod host_actions;
@@ -27,10 +29,16 @@ pub mod merge;
 mod native_existing;
 #[cfg(feature = "native")]
 pub mod native_stores;
+#[cfg(feature = "native")]
+pub mod payload_protection;
 pub mod preflight;
 pub mod read_through;
 pub mod reconcile;
 pub mod ref_authority;
+#[cfg(feature = "native")]
+mod runtime_protection;
+#[cfg(feature = "native")]
+pub use runtime_protection::RuntimeEventMetadata;
 pub mod tracker_closure;
 pub mod tracker_filing;
 pub mod tracker_result;
@@ -71,7 +79,7 @@ pub type StoreResult<T> = result::Result<T, StoreError>;
 /// understands. Must stay equal to the highest version in `MIGRATIONS`
 /// (asserted by test); `apply_migrations` refuses to open a store stamped
 /// beyond it instead of silently misreading a newer layout.
-pub const SUPPORTED_SCHEMA_VERSION: i64 = 2;
+pub const SUPPORTED_SCHEMA_VERSION: i64 = 3;
 
 /// Stamp a satellite store's schema generation, and refuse one stamped beyond
 /// what this build understands.
@@ -368,6 +376,8 @@ impl From<serde_json::Error> for StoreError {
 #[cfg(feature = "native")]
 pub struct SqliteStore {
     connection: Connection,
+    protection: Option<payload_protection::PayloadProtection>,
+    retention_active: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1546,6 +1556,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "provider-trust-evidence",
         sql: include_str!("../migrations/0002_provider_trust_evidence.sql"),
     },
+    Migration {
+        version: 3,
+        name: "native-payload-protection",
+        sql: include_str!("../migrations/0003_native_payload_protection.sql"),
+    },
 ];
 
 /// Stage marker retained for the CLI/kernel scaffold.
@@ -1566,7 +1581,7 @@ impl SqliteStore {
         let connection =
             Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         connection.busy_timeout(STORE_BUSY_TIMEOUT)?;
-        Ok(Self { connection })
+        Self::from_existing_connection(connection, None)
     }
 
     /// Open a current existing runtime, including a native snapshot. Checks the
@@ -1578,7 +1593,7 @@ impl SqliteStore {
         let migration = MIGRATIONS.last().expect("runtime migrations exist");
         let connection = native_existing::open(path, migration.name, migration.version)?;
         harden_store_file_permissions(path)?;
-        Ok(Self { connection })
+        Self::from_existing_connection(connection, None)
     }
 
     /// Reopen a runtime which the coordinator already initialized. This is a
@@ -1586,6 +1601,10 @@ impl SqliteStore {
     /// changes. Concurrent workers must not acquire a migration writer lock
     /// simply to connect to the same current database.
     pub fn open_initialized(path: impl AsRef<Path>) -> StoreResult<Self> {
+        Self::from_existing_connection(Self::initialized_connection(path)?, None)
+    }
+
+    fn initialized_connection(path: impl AsRef<Path>) -> StoreResult<Connection> {
         let connection =
             Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)?;
         connection.busy_timeout(STORE_BUSY_TIMEOUT)?;
@@ -1609,7 +1628,7 @@ impl SqliteStore {
                 "coordinator has not established WAL",
             ));
         }
-        Ok(Self { connection })
+        Ok(connection)
     }
 
     pub fn open(path: impl AsRef<Path>) -> StoreResult<Self> {
@@ -1627,7 +1646,7 @@ impl SqliteStore {
         if path.to_string_lossy() != ":memory:" {
             harden_store_file_permissions(path)?;
         }
-        Ok(Self { connection })
+        Self::from_existing_connection(connection, None)
     }
 
     pub fn open_in_memory() -> StoreResult<Self> {
@@ -1636,7 +1655,7 @@ impl SqliteStore {
         // and keeps behavior uniform with the file-backed store.
         connection.busy_timeout(STORE_BUSY_TIMEOUT)?;
         apply_migrations(&mut connection)?;
-        Ok(Self { connection })
+        Self::from_existing_connection(connection, None)
     }
 
     pub fn schema_version(&self) -> StoreResult<i64> {
@@ -1650,6 +1669,11 @@ impl SqliteStore {
     }
 
     pub fn append_event(&self, event: NewEvent<'_>) -> StoreResult<StoredEvent> {
+        self.retained_publication()
+            .run(|| self.append_event_retained(event))
+    }
+
+    fn append_event_retained(&self, event: NewEvent<'_>) -> StoreResult<StoredEvent> {
         append_event_on(&self.connection, event)
     }
 
@@ -1673,6 +1697,11 @@ impl SqliteStore {
     /// # Errors
     /// Propagates store failures.
     pub fn repair_event_chain(&self) -> StoreResult<()> {
+        self.retained_publication()
+            .run(|| self.repair_event_chain_retained())
+    }
+
+    fn repair_event_chain_retained(&self) -> StoreResult<()> {
         backfill_event_chain(&self.connection)
     }
 
@@ -1696,6 +1725,15 @@ impl SqliteStore {
         expected_head: &str,
         event: NewEvent<'_>,
     ) -> StoreResult<StoredEvent> {
+        self.retained_publication()
+            .run(|| self.append_event_cas_retained(expected_head, event))
+    }
+
+    fn append_event_cas_retained(
+        &self,
+        expected_head: &str,
+        event: NewEvent<'_>,
+    ) -> StoreResult<StoredEvent> {
         append_event_cas_on(&self.connection, expected_head, event)
     }
 
@@ -1707,6 +1745,11 @@ impl SqliteStore {
     /// DR-0067 §3: take ownership of an instance's log, evicting the previous
     /// owner. Returns the epoch every subsequent append must present.
     pub fn claim_instance_ownership(&self, instance_id: &str) -> StoreResult<i64> {
+        self.retained_publication()
+            .run(|| self.claim_instance_ownership_retained(instance_id))
+    }
+
+    fn claim_instance_ownership_retained(&self, instance_id: &str) -> StoreResult<i64> {
         claim_instance_ownership_on(&self.connection, instance_id)
     }
 
@@ -1718,10 +1761,28 @@ impl SqliteStore {
         expected_head: &str,
         event: NewEvent<'_>,
     ) -> StoreResult<StoredEvent> {
+        self.retained_publication()
+            .run(|| self.append_event_fenced_retained(owner_epoch, expected_head, event))
+    }
+
+    fn append_event_fenced_retained(
+        &self,
+        owner_epoch: i64,
+        expected_head: &str,
+        event: NewEvent<'_>,
+    ) -> StoreResult<StoredEvent> {
         append_event_fenced_on(&self.connection, owner_epoch, expected_head, event)
     }
 
     pub fn create_program_version(
+        &mut self,
+        version: NewProgramVersion<'_>,
+    ) -> StoreResult<ProgramVersionRecord> {
+        self.retained_publication()
+            .run(|| self.create_program_version_retained(version))
+    }
+
+    fn create_program_version_retained(
         &mut self,
         version: NewProgramVersion<'_>,
     ) -> StoreResult<ProgramVersionRecord> {
@@ -1743,6 +1804,7 @@ impl SqliteStore {
         )?;
         tx.execute(
             r#"
+            WITH payload_identity(id) AS MATERIALIZED (SELECT 'ver_' || lower(hex(randomblob(16))))
             INSERT INTO program_versions (
                 version_id,
                 program_id,
@@ -1758,18 +1820,18 @@ impl SqliteStore {
                 artifact_root
             )
             VALUES (
-                'ver_' || lower(hex(randomblob(16))),
+                (SELECT id FROM payload_identity),
                 ?1,
                 ?2,
                 ?3,
                 ?4,
                 ?5,
-                ?6,
-                ?7,
-                ?8,
-                ?9,
-                ?10,
-                ?11
+                whip_payload_seal('runtime.program_versions.declared_profiles', (SELECT id FROM payload_identity), ?6),
+                whip_payload_seal('runtime.program_versions.declared_skills', (SELECT id FROM payload_identity), ?7),
+                whip_payload_seal('runtime.program_versions.declared_schemas', (SELECT id FROM payload_identity), ?8),
+                whip_payload_seal('runtime.program_versions.analysis_summary', (SELECT id FROM payload_identity), ?9),
+                whip_payload_seal('runtime.program_versions.generated_artifacts', (SELECT id FROM payload_identity), ?10),
+                whip_payload_seal('runtime.program_versions.artifact_root', (SELECT id FROM payload_identity), ?11)
             )
             ON CONFLICT(program_id, source_hash, ir_hash) DO NOTHING
             "#,
@@ -1811,7 +1873,7 @@ impl SqliteStore {
                 });
             }
             tx.execute(
-                "INSERT OR IGNORE INTO content_blobs (id, body, byte_len) VALUES (?1, ?2, ?3)",
+                "INSERT OR IGNORE INTO content_blobs (id, body, byte_len) VALUES (?1, whip_payload_seal('runtime.content', ?1, ?2), ?3)",
                 params![&actual, snapshot, snapshot.len() as i64],
             )?;
         }
@@ -1834,6 +1896,15 @@ impl SqliteStore {
     /// never a silent row edit. A differing `source_hash` is refused: that is
     /// different authored content, which replay must keep rejecting.
     pub fn reattest_instance_program(
+        &mut self,
+        instance_id: &str,
+        version: NewProgramVersion<'_>,
+    ) -> StoreResult<ProgramVersionRecord> {
+        self.retained_publication()
+            .run(|| self.reattest_instance_program_retained(instance_id, version))
+    }
+
+    fn reattest_instance_program_retained(
         &mut self,
         instance_id: &str,
         version: NewProgramVersion<'_>,
@@ -1883,6 +1954,7 @@ impl SqliteStore {
         }
         tx.execute(
             r#"
+            WITH payload_identity(id) AS MATERIALIZED (SELECT 'ver_' || lower(hex(randomblob(16))))
             INSERT INTO program_versions (
                 version_id,
                 program_id,
@@ -1898,8 +1970,18 @@ impl SqliteStore {
                 artifact_root
             )
             VALUES (
-                'ver_' || lower(hex(randomblob(16))),
-                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11
+                (SELECT id FROM payload_identity),
+                ?1,
+                ?2,
+                ?3,
+                ?4,
+                ?5,
+                whip_payload_seal('runtime.program_versions.declared_profiles', (SELECT id FROM payload_identity), ?6),
+                whip_payload_seal('runtime.program_versions.declared_skills', (SELECT id FROM payload_identity), ?7),
+                whip_payload_seal('runtime.program_versions.declared_schemas', (SELECT id FROM payload_identity), ?8),
+                whip_payload_seal('runtime.program_versions.analysis_summary', (SELECT id FROM payload_identity), ?9),
+                whip_payload_seal('runtime.program_versions.generated_artifacts', (SELECT id FROM payload_identity), ?10),
+                whip_payload_seal('runtime.program_versions.artifact_root', (SELECT id FROM payload_identity), ?11)
             )
             ON CONFLICT(program_id, source_hash, ir_hash) DO NOTHING
             "#,
@@ -1972,7 +2054,7 @@ impl SqliteStore {
                     program_versions.source_hash,
                     program_versions.ir_hash,
                     program_versions.compiler_version,
-                    program_versions.analysis_summary
+                    whip_payload_open('runtime.program_versions.analysis_summary', program_versions.version_id, program_versions.analysis_summary)
                 FROM program_versions
                 JOIN programs ON programs.program_id = program_versions.program_id
                 WHERE program_versions.version_id = ?1
@@ -2011,6 +2093,15 @@ impl SqliteStore {
         instance: NewInstance<'_>,
         authority: NewInstanceAuthority<'_>,
     ) -> StoreResult<InstanceRecord> {
+        self.retained_publication()
+            .run(|| self.create_instance_with_authority_retained(instance, authority))
+    }
+
+    fn create_instance_with_authority_retained(
+        &self,
+        instance: NewInstance<'_>,
+        authority: NewInstanceAuthority<'_>,
+    ) -> StoreResult<InstanceRecord> {
         let tx = rusqlite::Transaction::new_unchecked(
             &self.connection,
             rusqlite::TransactionBehavior::Immediate,
@@ -2033,9 +2124,9 @@ impl SqliteStore {
                 from_version_id,
                 to_version_id,
                 activated_by_event_id,
-                activation_policy_json,
+                whip_payload_open('runtime.instance_revisions.activation_policy_json', instance_revisions.revision_id, activation_policy_json),
                 cancellation_policy,
-                rule_carries_json,
+                whip_payload_open('runtime.instance_revisions.rule_carries_json', instance_revisions.revision_id, rule_carries_json),
                 status,
                 idempotency_key,
                 created_at,
@@ -2181,6 +2272,14 @@ impl SqliteStore {
     }
 
     pub fn activate_revision(
+        &mut self,
+        activation: RevisionActivation<'_>,
+    ) -> StoreResult<WorkflowRevisionView> {
+        self.retained_publication()
+            .run(|| self.activate_revision_retained(activation))
+    }
+
+    fn activate_revision_retained(
         &mut self,
         activation: RevisionActivation<'_>,
     ) -> StoreResult<WorkflowRevisionView> {
@@ -2350,7 +2449,19 @@ impl SqliteStore {
                 status,
                 idempotency_key
             )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'active', ?10)
+            VALUES (
+                ?1,
+                ?2,
+                ?3,
+                ?4,
+                ?5,
+                ?6,
+                whip_payload_seal('runtime.instance_revisions.activation_policy_json', ?1, ?7),
+                ?8,
+                whip_payload_seal('runtime.instance_revisions.rule_carries_json', ?1, ?9),
+                'active',
+                ?10
+            )
             "#,
             params![
                 &revision_id,
@@ -2555,6 +2666,14 @@ impl SqliteStore {
         &mut self,
         request: EffectCancellationRequest<'_>,
     ) -> StoreResult<EffectCancellationRequestView> {
+        self.retained_publication()
+            .run(|| self.request_effect_cancellation_retained(request))
+    }
+
+    fn request_effect_cancellation_retained(
+        &mut self,
+        request: EffectCancellationRequest<'_>,
+    ) -> StoreResult<EffectCancellationRequestView> {
         let tx = self
             .connection
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -2595,7 +2714,7 @@ impl SqliteStore {
                 instance_id,
                 effect_id,
                 revision_id,
-                reason,
+                whip_payload_open('runtime.effect_cancellation_requests.reason', effect_cancellation_requests.request_id, reason),
                 requested_by,
                 causation_event_id,
                 status,
@@ -2615,6 +2734,14 @@ impl SqliteStore {
     }
 
     pub fn record_workflow_invocation(
+        &self,
+        invocation: NewWorkflowInvocation<'_>,
+    ) -> StoreResult<()> {
+        self.retained_publication()
+            .run(|| self.record_workflow_invocation_retained(invocation))
+    }
+
+    fn record_workflow_invocation_retained(
         &self,
         invocation: NewWorkflowInvocation<'_>,
     ) -> StoreResult<()> {
@@ -2666,7 +2793,20 @@ impl SqliteStore {
                 source_span_json,
                 idempotency_key
             )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+            VALUES (
+                ?1,
+                ?2,
+                ?3,
+                ?4,
+                ?5,
+                ?6,
+                ?7,
+                ?8,
+                ?9,
+                whip_payload_seal('runtime.workflow_invocations.input_json', ?1, ?10),
+                whip_payload_seal('runtime.workflow_invocations.source_span_json', ?1, ?11),
+                ?12
+            )
             ON CONFLICT(idempotency_key) DO NOTHING
             "#,
             params![
@@ -2762,6 +2902,15 @@ impl SqliteStore {
         commit: RuleCommit<'_>,
         guard: Option<RuleCommitRevisionGuard<'_>>,
     ) -> StoreResult<StoredEvent> {
+        self.retained_publication()
+            .run(|| self.commit_rule_inner_retained(commit, guard))
+    }
+
+    fn commit_rule_inner_retained(
+        &mut self,
+        commit: RuleCommit<'_>,
+        guard: Option<RuleCommitRevisionGuard<'_>>,
+    ) -> StoreResult<StoredEvent> {
         let tx = self
             .connection
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -2795,7 +2944,7 @@ impl SqliteStore {
         if let Some(key) = commit.idempotency_key {
             if let Some((event_id, sequence, stored_payload)) = tx
                 .query_row(
-                    "SELECT event_id, sequence, payload_json FROM events \
+                    "SELECT event_id, sequence, whip_runtime_event_open(event_id, event_type, payload_json) FROM events \
                      WHERE instance_id = ?1 AND idempotency_key = ?2",
                     params![commit.instance_id, key],
                     |row| {
@@ -3026,6 +3175,11 @@ impl SqliteStore {
     }
 
     pub fn derive_fact(&mut self, derived: DerivedFact<'_>) -> StoreResult<StoredEvent> {
+        self.retained_publication()
+            .run(|| self.derive_fact_retained(derived))
+    }
+
+    fn derive_fact_retained(&mut self, derived: DerivedFact<'_>) -> StoreResult<StoredEvent> {
         let payload = json!({
             "fact_id": derived.fact.fact_id,
             "name": derived.fact.name,
@@ -3080,7 +3234,7 @@ impl SqliteStore {
         let fact_row_exists = replayed
             && tx
                 .query_row(
-                    "SELECT 1 FROM facts WHERE instance_id = ?1 AND name = ?2 AND key = ?3",
+                    "SELECT 1 FROM facts WHERE instance_id = ?1 AND name = ?2 AND key = whip_runtime_fact_key(?3)",
                     params![derived.instance_id, derived.fact.name, derived.fact.key],
                     |_| Ok(()),
                 )
@@ -3112,6 +3266,11 @@ impl SqliteStore {
     /// unit, so a mid-batch failure admits nothing. Realizes the Maude
     /// `importRow` admission model (models/maude/admission.maude).
     pub fn admit_fact_batch(&mut self, batch: FactBatch<'_>) -> StoreResult<FactBatchOutcome> {
+        self.retained_publication()
+            .run(|| self.admit_fact_batch_retained(batch))
+    }
+
+    fn admit_fact_batch_retained(&mut self, batch: FactBatch<'_>) -> StoreResult<FactBatchOutcome> {
         let tx = self
             .connection
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -3143,7 +3302,7 @@ impl SqliteStore {
             let live_conflict = tx
                 .query_row(
                     "SELECT 1 FROM facts WHERE instance_id = ?1 AND name = ?2 \
-                     AND key = ?3 AND consumed_at IS NULL",
+                     AND key = whip_runtime_fact_key(?3) AND consumed_at IS NULL",
                     params![batch.instance_id, batch.schema_name, row.key],
                     |_| Ok(()),
                 )
@@ -3212,6 +3371,15 @@ impl SqliteStore {
         completion: EffectCompletion<'_>,
         diagnostic: Option<TerminalDiagnosticRecord>,
     ) -> StoreResult<StoredEvent> {
+        self.retained_publication()
+            .run(|| self.complete_effect_with_terminal_diagnostic_retained(completion, diagnostic))
+    }
+
+    fn complete_effect_with_terminal_diagnostic_retained(
+        &mut self,
+        completion: EffectCompletion<'_>,
+        diagnostic: Option<TerminalDiagnosticRecord>,
+    ) -> StoreResult<StoredEvent> {
         let run_status = completion.status;
         let outcome = self.complete_effect_terminal_inner(completion, diagnostic, run_status, None);
         self.record_terminal_refusal(completion, run_status, outcome)
@@ -3269,10 +3437,13 @@ impl SqliteStore {
                 source: "kernel",
                 causation_id: Some(completion.effect_id),
                 correlation_id: Some(completion.run_id),
-                idempotency_key: Some(&format!(
-                    "terminal-refused:{}:{}:{}",
-                    completion.run_id, attempted_status, reason
-                )),
+                idempotency_key: Some(&runtime_protection::metadata_key(
+                    &self.connection,
+                    &format!(
+                        "terminal-refused:{}:{}:{}",
+                        completion.run_id, attempted_status, reason
+                    ),
+                )?),
             },
         )?;
         outcome
@@ -3288,12 +3459,31 @@ impl SqliteStore {
         completion: EffectCompletion<'_>,
         diagnostic: Option<TerminalDiagnosticRecord>,
     ) -> StoreResult<StoredEvent> {
+        self.retained_publication()
+            .run(|| self.resolve_effect_uncertain_retained(completion, diagnostic))
+    }
+
+    fn resolve_effect_uncertain_retained(
+        &mut self,
+        completion: EffectCompletion<'_>,
+        diagnostic: Option<TerminalDiagnosticRecord>,
+    ) -> StoreResult<StoredEvent> {
         let outcome =
             self.complete_effect_terminal_inner(completion, diagnostic, "uncertain", None);
         self.record_terminal_refusal(completion, "uncertain", outcome)
     }
 
     pub fn settle_file_effect(
+        &mut self,
+        completion: EffectCompletion<'_>,
+        diagnostic: Option<TerminalDiagnosticRecord>,
+        fact: file_settlement::FileSettlementFact<'_>,
+    ) -> StoreResult<StoredEvent> {
+        self.retained_publication()
+            .run(|| self.settle_file_effect_retained(completion, diagnostic, fact))
+    }
+
+    fn settle_file_effect_retained(
         &mut self,
         completion: EffectCompletion<'_>,
         diagnostic: Option<TerminalDiagnosticRecord>,
@@ -3352,8 +3542,8 @@ impl SqliteStore {
             SET status = ?1,
                 completed_at = (SELECT occurred_at FROM events WHERE event_id = ?8),
                 exit_code = ?2,
-                summary = ?3,
-                metadata_json = ?4
+                summary = whip_payload_seal('runtime.runs.summary', run_id, ?3),
+                metadata_json = whip_payload_seal('runtime.runs.metadata_json', run_id, ?4)
             WHERE run_id = ?5
               AND effect_id = ?6
               AND instance_id = ?7
@@ -3477,6 +3667,11 @@ impl SqliteStore {
     }
 
     pub fn claimable_effects(&self, instance_id: &str) -> StoreResult<Vec<ClaimableEffect>> {
+        self.retained_publication()
+            .run(|| self.claimable_effects_retained(instance_id))
+    }
+
+    fn claimable_effects_retained(&self, instance_id: &str) -> StoreResult<Vec<ClaimableEffect>> {
         if let Some(status) = instance_status_on(&self.connection, instance_id)? {
             if status != "running" {
                 return Ok(Vec::new());
@@ -3489,9 +3684,9 @@ impl SqliteStore {
                 candidate.kind,
                 candidate.target,
                 candidate.profile,
-                candidate.input_json,
+                whip_payload_open('runtime.effects.input_json', candidate.effect_id, candidate.input_json),
                 candidate.required_capabilities,
-                COALESCE(effect_versions.declared_profiles, active_versions.declared_profiles, '[]'),
+                COALESCE(whip_payload_open('runtime.program_versions.declared_profiles', effect_versions.version_id, effect_versions.declared_profiles), whip_payload_open('runtime.program_versions.declared_profiles', active_versions.version_id, active_versions.declared_profiles), '[]'),
                 candidate.created_by_event_id
             FROM effects AS candidate
             LEFT JOIN instances ON instances.instance_id = candidate.instance_id
@@ -3596,9 +3791,9 @@ impl SqliteStore {
                 candidate.kind,
                 candidate.target,
                 candidate.profile,
-                candidate.input_json,
+                whip_payload_open('runtime.effects.input_json', candidate.effect_id, candidate.input_json),
                 candidate.required_capabilities,
-                COALESCE(effect_versions.declared_profiles, active_versions.declared_profiles, '[]'),
+                COALESCE(whip_payload_open('runtime.program_versions.declared_profiles', effect_versions.version_id, effect_versions.declared_profiles), whip_payload_open('runtime.program_versions.declared_profiles', active_versions.version_id, active_versions.declared_profiles), '[]'),
                 candidate.created_by_event_id
             FROM effects AS candidate
             LEFT JOIN instances ON instances.instance_id = candidate.instance_id
@@ -3609,7 +3804,7 @@ impl SqliteStore {
             WHERE candidate.instance_id = ?1
               AND candidate.kind = 'exec.command'
               AND candidate.status = 'queued'
-              AND candidate.policy_block_reason IS NULL
+              AND whip_payload_open('runtime.effects.policy_block_reason', candidate.effect_id, candidate.policy_block_reason) IS NULL
               AND NOT EXISTS (
                   SELECT 1
                   FROM effect_cancellation_requests AS request
@@ -3663,11 +3858,16 @@ impl SqliteStore {
     }
 
     pub fn register_package(&self, package: PackageRegistration<'_>) -> StoreResult<()> {
+        self.retained_publication()
+            .run(|| self.register_package_retained(package))
+    }
+
+    fn register_package_retained(&self, package: PackageRegistration<'_>) -> StoreResult<()> {
         serde_json::from_str::<Value>(package.manifest_json)?;
         self.connection.execute(
             r#"
             INSERT INTO package_registrations (package_id, name, version, manifest_json)
-            VALUES (?1, ?2, ?3, ?4)
+            VALUES (?1, ?2, ?3, whip_payload_seal('runtime.package_registrations.manifest_json', ?1, ?4))
             ON CONFLICT(package_id) DO UPDATE SET
                 name = excluded.name,
                 version = excluded.version,
@@ -3702,6 +3902,14 @@ impl SqliteStore {
     where
         I: IntoIterator<Item = &'a str>,
     {
+        self.retained_publication()
+            .run(|| self.register_package_manifests_retained(manifests))
+    }
+
+    fn register_package_manifests_retained<'a, I>(&self, manifests: I) -> StoreResult<Vec<String>>
+    where
+        I: IntoIterator<Item = &'a str>,
+    {
         // `Immediate` matches every other write batch in this store: a deferred
         // transaction that upgrades on its first write can fail with
         // SQLITE_BUSY_SNAPSHOT, which `busy_timeout` does not retry.
@@ -3718,6 +3926,11 @@ impl SqliteStore {
     }
 
     pub fn register_package_manifest(&self, manifest_json: &str) -> StoreResult<String> {
+        self.retained_publication()
+            .run(|| self.register_package_manifest_retained(manifest_json))
+    }
+
+    fn register_package_manifest_retained(&self, manifest_json: &str) -> StoreResult<String> {
         let manifest: Value = serde_json::from_str(manifest_json)?;
         let package_id = required_manifest_string(&manifest, &["package_id", "plugin_id"])?;
         let name = required_manifest_string(&manifest, &["name"])?;
@@ -3840,6 +4053,14 @@ impl SqliteStore {
         &self,
         directory: impl AsRef<Path>,
     ) -> StoreResult<Vec<String>> {
+        self.retained_publication()
+            .run(|| self.load_package_manifests_from_dir_retained(directory))
+    }
+
+    fn load_package_manifests_from_dir_retained(
+        &self,
+        directory: impl AsRef<Path>,
+    ) -> StoreResult<Vec<String>> {
         let mut loaded = Vec::new();
         for entry in fs::read_dir(directory)? {
             let path = entry?.path();
@@ -3858,16 +4079,24 @@ impl SqliteStore {
         &self,
         capability: CapabilitySchemaRegistration<'_>,
     ) -> StoreResult<()> {
+        self.retained_publication()
+            .run(|| self.register_capability_schema_retained(capability))
+    }
+
+    fn register_capability_schema_retained(
+        &self,
+        capability: CapabilitySchemaRegistration<'_>,
+    ) -> StoreResult<()> {
         serde_json::from_str::<Value>(capability.schema_json)?;
         self.connection.execute(
             r#"
-            INSERT INTO capability_schemas (
-                capability,
-                description,
-                schema_json,
-                registered_by_package_id
+            INSERT INTO capability_schemas (capability, description, schema_json, registered_by_package_id)
+            VALUES (
+                ?1,
+                whip_payload_seal('runtime.capability_schemas.description', ?1, ?2),
+                whip_payload_seal('runtime.capability_schemas.schema_json', ?1, ?3),
+                ?4
             )
-            VALUES (?1, ?2, ?3, ?4)
             ON CONFLICT(capability) DO UPDATE SET
                 description = excluded.description,
                 schema_json = excluded.schema_json,
@@ -3887,18 +4116,19 @@ impl SqliteStore {
         &self,
         provider: EffectProviderRegistration<'_>,
     ) -> StoreResult<()> {
+        self.retained_publication()
+            .run(|| self.register_effect_provider_retained(provider))
+    }
+
+    fn register_effect_provider_retained(
+        &self,
+        provider: EffectProviderRegistration<'_>,
+    ) -> StoreResult<()> {
         serde_json::from_str::<Value>(provider.config_json)?;
         self.connection.execute(
             r#"
-            INSERT INTO effect_providers (
-                provider_id,
-                effect_kind,
-                provider,
-                capability,
-                config_json,
-                registered_by_package_id
-            )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            INSERT INTO effect_providers (provider_id, effect_kind, provider, capability, config_json, registered_by_package_id)
+            VALUES (?1, ?2, ?3, ?4, whip_payload_seal('runtime.effect_providers.config_json', json_array(?2, ?3), ?5), ?6)
             ON CONFLICT(effect_kind, provider) DO UPDATE SET
                 capability = excluded.capability,
                 config_json = excluded.config_json,
@@ -3961,6 +4191,16 @@ impl SqliteStore {
         provider: &str,
         digest: &str,
     ) -> StoreResult<()> {
+        self.retained_publication()
+            .run(|| self.pin_provider_endpoint_retained(effect_kind, provider, digest))
+    }
+
+    fn pin_provider_endpoint_retained(
+        &self,
+        effect_kind: &str,
+        provider: &str,
+        digest: &str,
+    ) -> StoreResult<()> {
         self.connection.execute(
             r#"
             INSERT INTO provider_trust_evidence (effect_kind, provider, pinned_digest)
@@ -3977,6 +4217,14 @@ impl SqliteStore {
     /// File a signed custody claim. `expires_at` is mandatory because `c1`-`c3`
     /// are testimony, and testimony with no end date is the thing that rots.
     pub fn file_provider_custody_claim(&self, claim: ProviderCustodyClaim<'_>) -> StoreResult<()> {
+        self.retained_publication()
+            .run(|| self.file_provider_custody_claim_retained(claim))
+    }
+
+    fn file_provider_custody_claim_retained(
+        &self,
+        claim: ProviderCustodyClaim<'_>,
+    ) -> StoreResult<()> {
         self.connection.execute(
             r#"
             INSERT INTO provider_trust_evidence (
@@ -4006,6 +4254,16 @@ impl SqliteStore {
     /// Mark whether whip supervises this endpoint — the one self-checkable
     /// class, so it carries no signer and no term.
     pub fn set_provider_operator_run(
+        &self,
+        effect_kind: &str,
+        provider: &str,
+        operator_run: bool,
+    ) -> StoreResult<()> {
+        self.retained_publication()
+            .run(|| self.set_provider_operator_run_retained(effect_kind, provider, operator_run))
+    }
+
+    fn set_provider_operator_run_retained(
         &self,
         effect_kind: &str,
         provider: &str,
@@ -4057,19 +4315,24 @@ impl SqliteStore {
     }
 
     pub fn register_profile(&self, profile: ProfileRegistration<'_>) -> StoreResult<()> {
+        self.retained_publication()
+            .run(|| self.register_profile_retained(profile))
+    }
+
+    fn register_profile_retained(&self, profile: ProfileRegistration<'_>) -> StoreResult<()> {
         serde_json::from_str::<Value>(profile.allowed_capabilities_json)?;
         serde_json::from_str::<Value>(profile.config_json)?;
         self.connection.execute(
             r#"
-            INSERT INTO profiles (
-                profile_id,
-                name,
-                description,
-                enforcement_mode,
-                allowed_capabilities,
-                config_json
+            INSERT INTO profiles (profile_id, name, description, enforcement_mode, allowed_capabilities, config_json)
+            VALUES (
+                ?1,
+                ?2,
+                whip_payload_seal('runtime.profiles.description', ?2, ?3),
+                ?4,
+                ?5,
+                whip_payload_seal('runtime.profiles.config_json', ?2, ?6)
             )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6)
             ON CONFLICT(name) DO UPDATE SET
                 description = excluded.description,
                 enforcement_mode = excluded.enforcement_mode,
@@ -4146,7 +4409,12 @@ impl SqliteStore {
             .unwrap_or_default();
         let mut statement = self.connection.prepare(
             r#"
-            SELECT binding_id, program_id, capability, provider, config_json
+            SELECT
+                binding_id,
+                program_id,
+                capability,
+                provider,
+                whip_payload_open('runtime.capability_bindings.config_json', capability_bindings.binding_id, config_json)
             FROM capability_bindings
             WHERE capability = ?1
               AND (program_id = ?2 OR program_id IS NULL)
@@ -4179,7 +4447,7 @@ impl SqliteStore {
     ) -> StoreResult<Option<String>> {
         self.connection
             .query_row(
-                "SELECT config_json FROM effect_providers WHERE effect_kind = ?1 AND provider = ?2",
+                "SELECT whip_payload_open('runtime.effect_providers.config_json', json_array(effect_providers.effect_kind, effect_providers.provider), config_json) FROM effect_providers WHERE effect_kind = ?1 AND provider = ?2",
                 params![effect_kind, provider],
                 |row| row.get::<_, String>(0),
             )
@@ -4188,17 +4456,16 @@ impl SqliteStore {
     }
 
     pub fn bind_capability(&self, binding: CapabilityBinding<'_>) -> StoreResult<()> {
+        self.retained_publication()
+            .run(|| self.bind_capability_retained(binding))
+    }
+
+    fn bind_capability_retained(&self, binding: CapabilityBinding<'_>) -> StoreResult<()> {
         serde_json::from_str::<Value>(binding.config_json)?;
         self.connection.execute(
             r#"
-            INSERT INTO capability_bindings (
-                binding_id,
-                program_id,
-                capability,
-                provider,
-                config_json
-            )
-            VALUES (?1, ?2, ?3, ?4, ?5)
+            INSERT INTO capability_bindings (binding_id, program_id, capability, provider, config_json)
+            VALUES (?1, ?2, ?3, ?4, whip_payload_seal('runtime.capability_bindings.config_json', ?1, ?5))
             ON CONFLICT(binding_id) DO UPDATE SET
                 program_id = excluded.program_id,
                 capability = excluded.capability,
@@ -4217,6 +4484,11 @@ impl SqliteStore {
     }
 
     pub fn register_skill(&self, skill: SkillRegistration<'_>) -> StoreResult<()> {
+        self.retained_publication()
+            .run(|| self.register_skill_retained(skill))
+    }
+
+    fn register_skill_retained(&self, skill: SkillRegistration<'_>) -> StoreResult<()> {
         serde_json::from_str::<Value>(skill.required_capabilities_json)?;
         serde_json::from_str::<Value>(skill.metadata_json)?;
         // Content-address the body (Decision 3): the hash tracks the exact bytes
@@ -4236,7 +4508,18 @@ impl SqliteStore {
                 required_capabilities,
                 metadata_json
             )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+            VALUES (
+                ?1,
+                ?2,
+                ?3,
+                whip_payload_seal('runtime.skills.source', ?2, ?4),
+                whip_payload_seal('runtime.skills.source_path', ?2, ?5),
+                ?6,
+                whip_payload_seal('runtime.skills.body', ?2, ?7),
+                whip_payload_seal('runtime.skills.description', ?2, ?8),
+                ?9,
+                whip_payload_seal('runtime.skills.metadata_json', ?2, ?10)
+            )
             ON CONFLICT(name) DO UPDATE SET
                 version = excluded.version,
                 source = excluded.source,
@@ -4264,6 +4547,11 @@ impl SqliteStore {
     }
 
     pub fn attach_skill(&self, attachment: SkillAttachment<'_>) -> StoreResult<()> {
+        self.retained_publication()
+            .run(|| self.attach_skill_retained(attachment))
+    }
+
+    fn attach_skill_retained(&self, attachment: SkillAttachment<'_>) -> StoreResult<()> {
         let skill_id = self.connection.query_row(
             "SELECT skill_id FROM skills WHERE name = ?1",
             [attachment.skill_name],
@@ -4297,7 +4585,7 @@ impl SqliteStore {
     pub fn skill_body(&self, source_path: &str) -> StoreResult<Option<String>> {
         let mut statement = self
             .connection
-            .prepare("SELECT body FROM skills WHERE source_path = ?1")?;
+            .prepare("SELECT whip_payload_open('runtime.skills.body', skills.name, body) FROM skills WHERE whip_payload_open('runtime.skills.source_path', skills.name, source_path) = ?1")?;
         let mut rows = statement.query(params![source_path])?;
         match rows.next()? {
             Some(row) => Ok(Some(row.get::<_, String>(0)?)),
@@ -4309,6 +4597,16 @@ impl SqliteStore {
     /// (context-assembly Phase 3 item 4). Content-addressed like skills: the
     /// stored hash is the body's hash.
     pub fn register_project_context_doc(
+        &self,
+        position: i64,
+        path: &str,
+        body: &str,
+    ) -> StoreResult<()> {
+        self.retained_publication()
+            .run(|| self.register_project_context_doc_retained(position, path, body))
+    }
+
+    fn register_project_context_doc_retained(
         &self,
         position: i64,
         path: &str,
@@ -4326,7 +4624,7 @@ impl SqliteStore {
     /// The registered project-instruction documents in injection order.
     pub fn list_project_context_docs(&self) -> StoreResult<Vec<ProjectContextDoc>> {
         let mut statement = self.connection.prepare(
-            "SELECT position, path, content_hash, body FROM project_context_docs \
+            "SELECT position, whip_payload_open('runtime.project_context_docs.path', json_array(project_context_docs.position), path), content_hash, whip_payload_open('runtime.project_context_docs.body', json_array(project_context_docs.position), body) FROM project_context_docs \
              ORDER BY position",
         )?;
         let rows = statement.query_map([], |row| {
@@ -4345,6 +4643,14 @@ impl SqliteStore {
     /// caller is responsible for verifying `body` hashes to `sha256` before
     /// registering; the store records what it is given.
     pub fn register_script_capability(
+        &self,
+        registration: ScriptCapabilityRegistration<'_>,
+    ) -> StoreResult<()> {
+        self.retained_publication()
+            .run(|| self.register_script_capability_retained(registration))
+    }
+
+    fn register_script_capability_retained(
         &self,
         registration: ScriptCapabilityRegistration<'_>,
     ) -> StoreResult<()> {
@@ -4368,7 +4674,7 @@ impl SqliteStore {
     pub fn get_script_capability(&self, name: &str) -> StoreResult<Option<ScriptCapabilityRecord>> {
         self.connection
             .query_row(
-                "SELECT name, argv_json, sha256, env_json, hermetic, body \
+                "SELECT name, whip_payload_open('runtime.script_capabilities.argv_json', script_capabilities.name, argv_json), sha256, whip_payload_open('runtime.script_capabilities.env_json', script_capabilities.name, env_json), hermetic, whip_payload_open('runtime.script_capabilities.body', script_capabilities.name, body) \
                  FROM script_capabilities WHERE name = ?1",
                 params![name],
                 |row| {
@@ -4394,6 +4700,14 @@ impl SqliteStore {
         &self,
         registration: ComputeResultRegistration<'_>,
     ) -> StoreResult<bool> {
+        self.retained_publication()
+            .run(|| self.record_compute_result_retained(registration))
+    }
+
+    fn record_compute_result_retained(
+        &self,
+        registration: ComputeResultRegistration<'_>,
+    ) -> StoreResult<bool> {
         let inserted = self.connection.execute(
             "INSERT OR IGNORE INTO compute_result_cache \
              (content_key, effect_kind, result_json, source_instance_id, source_effect_id) \
@@ -4416,7 +4730,7 @@ impl SqliteStore {
     ) -> StoreResult<Option<ComputeCachedResult>> {
         self.connection
             .query_row(
-                "SELECT content_key, effect_kind, result_json, source_instance_id, \
+                "SELECT content_key, effect_kind, whip_payload_open('runtime.compute_result_cache.result_json', compute_result_cache.content_key, result_json), source_instance_id, \
                  source_effect_id, created_at FROM compute_result_cache WHERE content_key = ?1",
                 params![content_key],
                 |row| {
@@ -4443,9 +4757,14 @@ impl SqliteStore {
     /// before that fact commits, so no manifest hash is ever referenced without
     /// its bytes present (restorable-context INV-4 coherence).
     pub fn put_content(&self, body: &str) -> StoreResult<String> {
+        self.retained_publication()
+            .run(|| self.put_content_retained(body))
+    }
+
+    fn put_content_retained(&self, body: &str) -> StoreResult<String> {
         let id = stable_hash_hex(body);
         self.connection.execute(
-            "INSERT OR IGNORE INTO content_blobs (id, body, byte_len) VALUES (?1, ?2, ?3)",
+            "INSERT OR IGNORE INTO content_blobs (id, body, byte_len) VALUES (?1, whip_payload_seal('runtime.content', ?1, ?2), ?3)",
             params![id, body, body.len() as i64],
         )?;
         Ok(id)
@@ -4455,14 +4774,27 @@ impl SqliteStore {
     /// blob store never held it. The restore write-back slice (RC-4) reads through
     /// this to reconstruct a superseded file body.
     pub fn get_content(&self, id: &str) -> StoreResult<Option<String>> {
-        Ok(self
+        let body = self
             .connection
             .query_row(
-                "SELECT body FROM content_blobs WHERE id = ?1",
+                "SELECT whip_payload_open('runtime.content', id, body) FROM content_blobs WHERE id = ?1",
                 params![id],
                 |row| row.get::<_, String>(0),
             )
-            .optional()?)
+            .optional()?;
+        if self.protection.is_some() {
+            if let Some(body) = &body {
+                let actual = stable_hash_hex(body);
+                if actual != id {
+                    return Err(StoreError::ContentMismatch {
+                        id: id.to_owned(),
+                        actual,
+                        source: "protected runtime content",
+                    });
+                }
+            }
+        }
+        Ok(body)
     }
 
     pub fn list_skills(&self) -> StoreResult<Vec<SkillView>> {
@@ -4472,10 +4804,10 @@ impl SqliteStore {
                 skill_id,
                 name,
                 version,
-                source,
-                source_path,
+                whip_payload_open('runtime.skills.source', skills.name, source),
+                whip_payload_open('runtime.skills.source_path', skills.name, source_path),
                 content_hash,
-                description,
+                whip_payload_open('runtime.skills.description', skills.name, description),
                 required_capabilities
             FROM skills
             ORDER BY name
@@ -4501,10 +4833,10 @@ impl SqliteStore {
                 skill.skill_id,
                 skill.name,
                 skill.version,
-                skill.source,
-                skill.source_path,
+                whip_payload_open('runtime.skills.source', skill.name, skill.source),
+                whip_payload_open('runtime.skills.source_path', skill.name, skill.source_path),
                 skill.content_hash,
-                skill.description,
+                whip_payload_open('runtime.skills.description', skill.name, skill.description),
                 skill.required_capabilities
             FROM skill_attachments AS attachment
             JOIN skills AS skill ON skill.skill_id = attachment.skill_id
@@ -4536,10 +4868,23 @@ impl SqliteStore {
     }
 
     pub fn record_evidence(&self, evidence: EvidenceRecord<'_>) -> StoreResult<String> {
+        self.retained_publication()
+            .run(|| self.record_evidence_retained(evidence))
+    }
+
+    fn record_evidence_retained(&self, evidence: EvidenceRecord<'_>) -> StoreResult<String> {
         insert_evidence_on(&self.connection, evidence)
     }
 
     pub fn record_provider_validation_evidence(
+        &self,
+        evidence: ProviderValidationEvidence<'_>,
+    ) -> StoreResult<String> {
+        self.retained_publication()
+            .run(|| self.record_provider_validation_evidence_retained(evidence))
+    }
+
+    fn record_provider_validation_evidence_retained(
         &self,
         evidence: ProviderValidationEvidence<'_>,
     ) -> StoreResult<String> {
@@ -4601,6 +4946,14 @@ impl SqliteStore {
         &self,
         evidence: CodexAppServerEvidence<'_>,
     ) -> StoreResult<String> {
+        self.retained_publication()
+            .run(|| self.record_codex_app_server_evidence_retained(evidence))
+    }
+
+    fn record_codex_app_server_evidence_retained(
+        &self,
+        evidence: CodexAppServerEvidence<'_>,
+    ) -> StoreResult<String> {
         let metadata = serde_json::from_str::<Value>(evidence.metadata_json)?;
         let metadata = json!({
             "provider_id": evidence.provider_id,
@@ -4653,6 +5006,14 @@ impl SqliteStore {
         &self,
         evidence: ClaudeAgentSdkEvidence<'_>,
     ) -> StoreResult<String> {
+        self.retained_publication()
+            .run(|| self.record_claude_agent_sdk_evidence_retained(evidence))
+    }
+
+    fn record_claude_agent_sdk_evidence_retained(
+        &self,
+        evidence: ClaudeAgentSdkEvidence<'_>,
+    ) -> StoreResult<String> {
         let metadata = serde_json::from_str::<Value>(evidence.metadata_json)?;
         let metadata = json!({
             "provider_id": evidence.provider_id,
@@ -4702,26 +5063,30 @@ impl SqliteStore {
     }
 
     pub fn link_evidence(&self, link: EvidenceLink<'_>) -> StoreResult<()> {
+        self.retained_publication()
+            .run(|| self.link_evidence_retained(link))
+    }
+
+    fn link_evidence_retained(&self, link: EvidenceLink<'_>) -> StoreResult<()> {
         insert_evidence_link_on(&self.connection, link)
     }
 
     pub fn record_artifact(&self, artifact: ArtifactRecord<'_>) -> StoreResult<String> {
+        self.retained_publication()
+            .run(|| self.record_artifact_retained(artifact))
+    }
+
+    fn record_artifact_retained(&self, artifact: ArtifactRecord<'_>) -> StoreResult<String> {
         self.connection
             .query_row(
                 r#"
-                INSERT INTO artifacts (
-                    artifact_id,
-                    run_id,
-                    kind,
-                    path,
-                    content_hash,
-                    mime_type
-                )
+                WITH payload_identity(id) AS MATERIALIZED (SELECT 'art_' || lower(hex(randomblob(16))))
+                INSERT INTO artifacts (artifact_id, run_id, kind, path, content_hash, mime_type)
                 VALUES (
-                    'art_' || lower(hex(randomblob(16))),
+                    (SELECT id FROM payload_identity),
                     ?1,
                     ?2,
-                    ?3,
+                    whip_payload_seal('runtime.artifacts.path', (SELECT id FROM payload_identity), ?3),
                     ?4,
                     ?5
                 )
@@ -4746,7 +5111,7 @@ impl SqliteStore {
                 artifact_id,
                 run_id,
                 kind,
-                path,
+                whip_payload_open('runtime.artifacts.path', artifacts.artifact_id, path),
                 content_hash,
                 mime_type,
                 created_at
@@ -4772,6 +5137,11 @@ impl SqliteStore {
     }
 
     pub fn record_workspace(&self, workspace: WorkspaceRecord<'_>) -> StoreResult<String> {
+        self.retained_publication()
+            .run(|| self.record_workspace_retained(workspace))
+    }
+
+    fn record_workspace_retained(&self, workspace: WorkspaceRecord<'_>) -> StoreResult<String> {
         validate_workspace_policy(workspace.policy)?;
         validate_workspace_status(workspace.status)?;
         serde_json::from_str::<Value>(workspace.metadata_json)?;
@@ -4797,9 +5167,9 @@ impl SqliteStore {
                     ?3,
                     ?4,
                     ?5,
-                    ?6,
+                    whip_payload_seal('runtime.workspaces.uri', json_array(?1, ?2, ?3, ?5), ?6),
                     ?7,
-                    ?8,
+                    whip_payload_seal('runtime.workspaces.metadata_json', json_array(?1, ?2, ?3, ?5), ?8),
                     CURRENT_TIMESTAMP
                 )
                 ON CONFLICT(instance_id, effect_id, run_id, policy)
@@ -4847,6 +5217,11 @@ impl SqliteStore {
     }
 
     pub fn record_diagnostic(&self, diagnostic: DiagnosticRecord<'_>) -> StoreResult<String> {
+        self.retained_publication()
+            .run(|| self.record_diagnostic_retained(diagnostic))
+    }
+
+    fn record_diagnostic_retained(&self, diagnostic: DiagnosticRecord<'_>) -> StoreResult<String> {
         insert_diagnostic_on(&self.connection, diagnostic)
     }
 
@@ -4859,8 +5234,8 @@ impl SqliteStore {
                 program_version_id,
                 severity,
                 code,
-                message,
-                source_span_json,
+                whip_payload_open('runtime.diagnostics.message', diagnostics.diagnostic_id, message),
+                whip_payload_open('runtime.diagnostics.source_span_json', diagnostics.diagnostic_id, source_span_json),
                 subject_type,
                 subject_id,
                 event_id,
@@ -4924,7 +5299,7 @@ impl SqliteStore {
     ) -> StoreResult<Vec<DiagnosticView>> {
         let mut statement = self.connection.prepare(
             r#"
-            SELECT event_id, payload_json, occurred_at
+            SELECT event_id, whip_runtime_event_open(event_id, event_type, payload_json), occurred_at
             FROM events
             WHERE instance_id = ?1
               AND event_type IN ('effect.terminal', 'diagnostic.recorded')
@@ -4997,7 +5372,7 @@ impl SqliteStore {
             .connection
             .query_row(
                 r#"
-                SELECT events.payload_json
+                SELECT whip_runtime_event_open(events.event_id, events.event_type, events.payload_json)
                 FROM effects
                 JOIN events ON events.event_id = effects.created_by_event_id
                 WHERE effects.instance_id = ?1
@@ -5027,6 +5402,11 @@ impl SqliteStore {
     }
 
     pub fn record_skill_evidence(&self, evidence: SkillEvidence<'_>) -> StoreResult<String> {
+        self.retained_publication()
+            .run(|| self.record_skill_evidence_retained(evidence))
+    }
+
+    fn record_skill_evidence_retained(&self, evidence: SkillEvidence<'_>) -> StoreResult<String> {
         let skills = self.skills_by_name(evidence.skill_names)?;
         let metadata = json!({
             "effect_id": evidence.effect_id,
@@ -5068,8 +5448,8 @@ impl SqliteStore {
                 subject_id,
                 causation_id,
                 correlation_id,
-                summary,
-                metadata_json,
+                whip_payload_open('runtime.evidence.summary', evidence.evidence_id, summary),
+                whip_payload_open('runtime.evidence.metadata_json', evidence.evidence_id, metadata_json),
                 created_at
             FROM evidence
             WHERE instance_id = ?1
@@ -5110,8 +5490,8 @@ impl SqliteStore {
                 subject_id,
                 causation_id,
                 correlation_id,
-                summary,
-                metadata_json,
+                whip_payload_open('runtime.evidence.summary', evidence.evidence_id, summary),
+                whip_payload_open('runtime.evidence.metadata_json', evidence.evidence_id, metadata_json),
                 created_at
             FROM evidence
             WHERE subject_type = ?1
@@ -5170,10 +5550,10 @@ impl SqliteStore {
                     skill_id,
                     name,
                     version,
-                    source,
-                    source_path,
+                    whip_payload_open('runtime.skills.source', skills.name, source),
+                    whip_payload_open('runtime.skills.source_path', skills.name, source_path),
                     content_hash,
-                    description,
+                    whip_payload_open('runtime.skills.description', skills.name, description),
                     required_capabilities
                 FROM skills
                 WHERE name = ?1
@@ -5198,7 +5578,7 @@ impl SqliteStore {
                 workflow_principal,
                 effective_authority,
                 status,
-                input_json,
+                whip_payload_open('runtime.instances.input_json', instances.instance_id, input_json),
                 created_at,
                 updated_at
             FROM instances
@@ -5237,11 +5617,31 @@ impl SqliteStore {
         slice_expr: &str,
         source_ref: &str,
     ) -> StoreResult<()> {
+        self.retained_publication().run(|| {
+            self.record_repair_scope_retained(instance_id, branch_id, slice_expr, source_ref)
+        })
+    }
+
+    fn record_repair_scope_retained(
+        &mut self,
+        instance_id: &str,
+        branch_id: &str,
+        slice_expr: &str,
+        source_ref: &str,
+    ) -> StoreResult<()> {
         self.connection.execute(
-            "INSERT INTO repair_scopes (instance_id, branch_id, slice_expr, source_ref) \
-             VALUES (?1, ?2, ?3, ?4) \
-             ON CONFLICT(instance_id) DO UPDATE SET branch_id = ?2, slice_expr = ?3, \
-             source_ref = ?4",
+            r#"
+            INSERT INTO repair_scopes (instance_id, branch_id, slice_expr, source_ref)
+            VALUES (
+                ?1, ?2,
+                whip_payload_seal('runtime.repair_scopes.slice_expr', ?1, ?3),
+                whip_payload_seal('runtime.repair_scopes.source_ref', ?1, ?4)
+            )
+            ON CONFLICT(instance_id) DO UPDATE SET
+                branch_id = excluded.branch_id,
+                slice_expr = excluded.slice_expr,
+                source_ref = excluded.source_ref
+            "#,
             rusqlite::params![instance_id, branch_id, slice_expr, source_ref],
         )?;
         Ok(())
@@ -5254,8 +5654,12 @@ impl SqliteStore {
         let row = self
             .connection
             .query_row(
-                "SELECT branch_id, slice_expr, source_ref FROM repair_scopes \
-                 WHERE instance_id = ?1",
+                r#"
+                SELECT branch_id,
+                    whip_payload_open('runtime.repair_scopes.slice_expr', instance_id, slice_expr),
+                    whip_payload_open('runtime.repair_scopes.source_ref', instance_id, source_ref)
+                FROM repair_scopes WHERE instance_id = ?1
+                "#,
                 rusqlite::params![instance_id],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
@@ -5275,7 +5679,7 @@ impl SqliteStore {
                     workflow_principal,
                     effective_authority,
                     status,
-                    input_json,
+                    whip_payload_open('runtime.instances.input_json', instances.instance_id, input_json),
                     created_at,
                     updated_at
                 FROM instances
@@ -5304,7 +5708,7 @@ impl SqliteStore {
     pub fn list_events(&self, instance_id: &str) -> StoreResult<Vec<EventView>> {
         let mut statement = self.connection.prepare(
             r#"
-            SELECT event_id, sequence, event_type, payload_json, source, occurred_at
+            SELECT event_id, sequence, event_type, whip_runtime_event_open(event_id, event_type, payload_json), source, occurred_at
             FROM events
             WHERE instance_id = ?1
             ORDER BY sequence
@@ -5344,7 +5748,7 @@ impl SqliteStore {
     ) -> StoreResult<Vec<EventView>> {
         let upto = pinned.sequence.unwrap_or(0);
         let mut statement = self.connection.prepare(
-            "SELECT event_id, sequence, event_type, payload_json, occurred_at, source, \
+            "SELECT event_id, sequence, event_type, whip_runtime_event_open(event_id, event_type, payload_json), occurred_at, source, \
              causation_id, correlation_id, idempotency_key, format_version \
              FROM events WHERE instance_id = ?1 AND sequence <= ?2 ORDER BY sequence ASC",
         )?;
@@ -5436,10 +5840,19 @@ impl SqliteStore {
     ) -> StoreResult<Vec<FactView>> {
         let mut statement = self.connection.prepare(&format!(
             r#"
-            SELECT fact_id, program_version_id, revision_epoch, name, key, value_json, provenance_class, source_span_json, source_event_id
+            SELECT
+                fact_id,
+                program_version_id,
+                revision_epoch,
+                name,
+                whip_payload_open('runtime.facts.key', json_array(facts.instance_id, facts.name, facts.key), COALESCE(key_payload, key)) AS natural_key,
+                whip_payload_open('runtime.facts.value_json', json_array(facts.instance_id, facts.name, facts.key), value_json),
+                provenance_class,
+                whip_payload_open('runtime.facts.source_span_json', json_array(facts.instance_id, facts.name, facts.key), source_span_json),
+                source_event_id
             FROM facts
             WHERE instance_id = ?1{consumed_clause}
-            ORDER BY name, key
+            ORDER BY name, natural_key
             "#
         ))?;
         let rows = statement
@@ -5467,16 +5880,16 @@ impl SqliteStore {
                 effects.effect_id,
                 effects.kind,
                 effects.target,
-                effects.input_json,
+                whip_payload_open('runtime.effects.input_json', effects.effect_id, effects.input_json),
                 effects.status,
                 effects.created_by_rule,
                 effects.program_version_id,
                 effects.revision_epoch,
                 effects.profile,
                 effects.required_capabilities,
-                effects.policy_block_reason,
+                whip_payload_open('runtime.effects.policy_block_reason', effects.effect_id, effects.policy_block_reason),
                 effects.policy_block_category,
-                COALESCE(effect_versions.declared_profiles, active_versions.declared_profiles, '[]'),
+                COALESCE(whip_payload_open('runtime.program_versions.declared_profiles', effect_versions.version_id, effect_versions.declared_profiles), whip_payload_open('runtime.program_versions.declared_profiles', active_versions.version_id, active_versions.declared_profiles), '[]'),
                 EXISTS (
                     SELECT 1
                     FROM effect_cancellation_requests AS request
@@ -5544,7 +5957,7 @@ impl SqliteStore {
                 status,
                 started_at,
                 completed_at,
-                metadata_json,
+                whip_payload_open('runtime.runs.metadata_json', runs.run_id, metadata_json),
                 EXISTS (
                     SELECT 1
                     FROM effect_cancellation_requests AS request
@@ -5595,7 +6008,7 @@ impl SqliteStore {
                 status,
                 started_at,
                 completed_at,
-                metadata_json,
+                whip_payload_open('runtime.runs.metadata_json', runs.run_id, metadata_json),
                 EXISTS (
                     SELECT 1
                     FROM effect_cancellation_requests AS request
@@ -5673,7 +6086,13 @@ impl SqliteStore {
         let mut recent_events = {
             let mut statement = self.connection.prepare(
                 r#"
-                SELECT event_id, sequence, event_type, payload_json, source, occurred_at
+                SELECT
+                    event_id,
+                    sequence,
+                    event_type,
+                    whip_runtime_event_open(event_id, event_type, payload_json),
+                    source,
+                    occurred_at
                 FROM events
                 WHERE instance_id = ?1
                 ORDER BY sequence DESC
@@ -5715,6 +6134,11 @@ impl SqliteStore {
     }
 
     pub fn satisfy_dependencies(&self, instance_id: &str) -> StoreResult<usize> {
+        self.retained_publication()
+            .run(|| self.satisfy_dependencies_retained(instance_id))
+    }
+
+    fn satisfy_dependencies_retained(&self, instance_id: &str) -> StoreResult<usize> {
         satisfy_dependencies_on(&self.connection, instance_id)
     }
 
@@ -5723,6 +6147,16 @@ impl SqliteStore {
     }
 
     fn start_run_observed(
+        &mut self,
+        run: RunStart<'_>,
+        expected: Option<&ClaimableEffect>,
+        settlement: Option<file_settlement::TrackerWaitSettlement<'_>>,
+    ) -> StoreResult<StoredEvent> {
+        self.retained_publication()
+            .run(|| self.start_run_observed_retained(run, expected, settlement))
+    }
+
+    fn start_run_observed_retained(
         &mut self,
         run: RunStart<'_>,
         expected: Option<&ClaimableEffect>,
@@ -5768,7 +6202,7 @@ impl SqliteStore {
                     r#"
                 UPDATE effects
                 SET status = ?1,
-                    policy_block_reason = ?2,
+                    policy_block_reason = whip_payload_seal('runtime.effects.policy_block_reason', effect_id, ?2),
                     updated_at = CURRENT_TIMESTAMP
                 WHERE instance_id = ?3
                   AND effect_id = ?4
@@ -5849,7 +6283,7 @@ impl SqliteStore {
                     r#"
                 UPDATE effects
                 SET status = 'blocked_by_capacity',
-                    policy_block_reason = ?1,
+                    policy_block_reason = whip_payload_seal('runtime.effects.policy_block_reason', effect_id, ?1),
                     updated_at = CURRENT_TIMESTAMP
                 WHERE instance_id = ?2
                   AND effect_id = ?3
@@ -5897,7 +6331,7 @@ impl SqliteStore {
                 r#"
             UPDATE effects
             SET status = 'running',
-                policy_block_reason = NULL,
+                policy_block_reason = whip_payload_seal('runtime.effects.policy_block_reason', effect_id, NULL),
                 policy_block_category = NULL,
                 updated_at = CURRENT_TIMESTAMP
             WHERE instance_id = ?1
@@ -5912,18 +6346,17 @@ impl SqliteStore {
         }
         tx.execute(
             r#"
-            INSERT INTO runs (
-                run_id,
-                effect_id,
-                instance_id,
-                provider,
-                worker_id,
-                status,
-                metadata_json,
-                started_at
+            INSERT INTO runs (run_id, effect_id, instance_id, provider, worker_id, status, metadata_json, started_at)
+            VALUES (
+                ?1,
+                ?2,
+                ?3,
+                ?4,
+                ?5,
+                'running',
+                whip_payload_seal('runtime.runs.metadata_json', ?1, ?6),
+                (SELECT occurred_at FROM events WHERE event_id = ?7)
             )
-            VALUES (?1, ?2, ?3, ?4, ?5, 'running', ?6,
-                (SELECT occurred_at FROM events WHERE event_id = ?7))
             "#,
             params![
                 run.run_id,
@@ -6043,6 +6476,27 @@ impl SqliteStore {
         category: &str,
         detail: &str,
     ) -> StoreResult<StoredEvent> {
+        self.retained_publication().run(|| {
+            self.block_effect_with_status_retained(
+                instance_id,
+                effect_id,
+                status,
+                key_prefix,
+                category,
+                detail,
+            )
+        })
+    }
+
+    fn block_effect_with_status_retained(
+        &mut self,
+        instance_id: &str,
+        effect_id: &str,
+        status: &str,
+        key_prefix: &str,
+        category: &str,
+        detail: &str,
+    ) -> StoreResult<StoredEvent> {
         let tx = self
             .connection
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -6102,7 +6556,7 @@ impl SqliteStore {
                 r#"
             UPDATE effects
             SET status = ?1,
-                policy_block_reason = ?2,
+                policy_block_reason = whip_payload_seal('runtime.effects.policy_block_reason', effect_id, ?2),
                 policy_block_category = ?3,
                 updated_at = CURRENT_TIMESTAMP
             WHERE instance_id = ?4
@@ -6117,6 +6571,14 @@ impl SqliteStore {
     }
 
     pub fn transition_instance(
+        &mut self,
+        transition: InstanceTransition<'_>,
+    ) -> StoreResult<StoredEvent> {
+        self.retained_publication()
+            .run(|| self.transition_instance_retained(transition))
+    }
+
+    fn transition_instance_retained(
         &mut self,
         transition: InstanceTransition<'_>,
     ) -> StoreResult<StoredEvent> {
@@ -6179,10 +6641,11 @@ impl SqliteStore {
                   AND timeout_seconds IS NOT NULL
                   AND status NOT IN ('completed', 'failed', 'timed_out', 'cancelled')
                 UNION ALL
-                SELECT CAST(strftime('%s', json_extract(input_json, '$.deadline_at')) AS INTEGER)
+                SELECT
+                    CAST(strftime('%s', json_extract(whip_payload_open('runtime.effects.input_json', effects.effect_id, input_json), '$.deadline_at')) AS INTEGER)
                 FROM effects
                 WHERE instance_id = ?1
-                  AND json_extract(input_json, '$.deadline_at') IS NOT NULL
+                  AND json_extract(whip_payload_open('runtime.effects.input_json', effects.effect_id, input_json), '$.deadline_at') IS NOT NULL
                   AND status NOT IN ('completed', 'failed', 'timed_out', 'cancelled')
             )
             "#,
@@ -6216,9 +6679,9 @@ impl SqliteStore {
                   -- absolute deadline (timer until): input_json.deadline_at
                   -- (cast to integer: strftime returns text, and `>=` on text
                   -- compares lexicographically)
-                  OR (json_extract(candidate.input_json, '$.deadline_at') IS NOT NULL
+                  OR (json_extract(whip_payload_open('runtime.effects.input_json', candidate.effect_id, candidate.input_json), '$.deadline_at') IS NOT NULL
                       AND CAST(strftime('%s', ?2) AS INTEGER)
-                          >= CAST(strftime('%s', json_extract(candidate.input_json, '$.deadline_at')) AS INTEGER))
+                          >= CAST(strftime('%s', json_extract(whip_payload_open('runtime.effects.input_json', candidate.effect_id, candidate.input_json), '$.deadline_at')) AS INTEGER))
               )
               AND (
                   candidate.kind != 'timer.wait'
@@ -6321,7 +6784,7 @@ impl SqliteStore {
         let latest: Option<String> = self
             .connection
             .query_row(
-                "SELECT MAX(json_extract(payload_json, '$.scheduled_at')) \
+                "SELECT MAX(json_extract(whip_runtime_event_open(event_id, event_type, payload_json), '$.scheduled_at')) \
                  FROM events WHERE instance_id = ?1 AND event_type = ?2",
                 params![instance_id, signal],
                 |row| row.get(0),
@@ -6361,6 +6824,16 @@ impl SqliteStore {
     /// deadline expires. Running effects go through run-level timeout plus a
     /// cancellation request instead.
     pub fn expire_effect(
+        &mut self,
+        instance_id: &str,
+        effect_id: &str,
+        idempotency_key: Option<&str>,
+    ) -> StoreResult<StoredEvent> {
+        self.retained_publication()
+            .run(|| self.expire_effect_retained(instance_id, effect_id, idempotency_key))
+    }
+
+    fn expire_effect_retained(
         &mut self,
         instance_id: &str,
         effect_id: &str,
@@ -6421,6 +6894,11 @@ impl SqliteStore {
     /// (a `facts` liveness read), which sees this UPDATE directly and needs no
     /// event. Do NOT add a log-join detector for this class; use liveness.
     pub fn retire_fact(&mut self, instance_id: &str, fact_id: &str) -> StoreResult<()> {
+        self.retained_publication()
+            .run(|| self.retire_fact_retained(instance_id, fact_id))
+    }
+
+    fn retire_fact_retained(&mut self, instance_id: &str, fact_id: &str) -> StoreResult<()> {
         self.connection.execute(
             r#"
             UPDATE facts
@@ -6436,6 +6914,11 @@ impl SqliteStore {
     /// state is ready again under an unchanged generation. Same DR-0044
     /// ruling — a raw overlay UPDATE, no event.
     pub fn revive_fact(&mut self, instance_id: &str, fact_id: &str) -> StoreResult<()> {
+        self.retained_publication()
+            .run(|| self.revive_fact_retained(instance_id, fact_id))
+    }
+
+    fn revive_fact_retained(&mut self, instance_id: &str, fact_id: &str) -> StoreResult<()> {
         self.connection.execute(
             r#"
             UPDATE facts
@@ -6448,6 +6931,14 @@ impl SqliteStore {
     }
 
     pub fn cancel_effect(
+        &mut self,
+        cancellation: EffectCancellation<'_>,
+    ) -> StoreResult<StoredEvent> {
+        self.retained_publication()
+            .run(|| self.cancel_effect_retained(cancellation))
+    }
+
+    fn cancel_effect_retained(
         &mut self,
         cancellation: EffectCancellation<'_>,
     ) -> StoreResult<StoredEvent> {
@@ -6500,6 +6991,11 @@ impl SqliteStore {
     }
 
     pub fn renew_lease(&mut self, renewal: LeaseRenewal<'_>) -> StoreResult<StoredEvent> {
+        self.retained_publication()
+            .run(|| self.renew_lease_retained(renewal))
+    }
+
+    fn renew_lease_retained(&mut self, renewal: LeaseRenewal<'_>) -> StoreResult<StoredEvent> {
         let payload = json!({
             "lease_id": renewal.lease_id,
             "run_id": renewal.run_id,
@@ -6545,6 +7041,15 @@ impl SqliteStore {
     }
 
     pub fn expire_leases(
+        &mut self,
+        instance_id: &str,
+        now: &str,
+    ) -> StoreResult<Vec<ExpiredLease>> {
+        self.retained_publication()
+            .run(|| self.expire_leases_retained(instance_id, now))
+    }
+
+    fn expire_leases_retained(
         &mut self,
         instance_id: &str,
         now: &str,
@@ -6633,6 +7138,11 @@ impl SqliteStore {
     }
 
     pub fn retry_effect(&mut self, retry: RetryEffect<'_>) -> StoreResult<StoredEvent> {
+        self.retained_publication()
+            .run(|| self.retry_effect_retained(retry))
+    }
+
+    fn retry_effect_retained(&mut self, retry: RetryEffect<'_>) -> StoreResult<StoredEvent> {
         let payload = json!({
             "effect_id": retry.effect_id,
             "retry_after": retry.retry_after,
@@ -6701,6 +7211,15 @@ impl SqliteStore {
         instance_id: &str,
         cut_sequence: i64,
     ) -> StoreResult<u64> {
+        self.retained_publication()
+            .run(|| self.truncate_instance_events_after_retained(instance_id, cut_sequence))
+    }
+
+    fn truncate_instance_events_after_retained(
+        &mut self,
+        instance_id: &str,
+        cut_sequence: i64,
+    ) -> StoreResult<u64> {
         let dropped = self
             .connection
             .execute(
@@ -6729,6 +7248,16 @@ impl SqliteStore {
     /// AFTER the cut stamped the row with a version the truncated log no
     /// longer contains (only replayed activation events restore it).
     pub fn set_instance_version(
+        &mut self,
+        instance_id: &str,
+        version_id: &str,
+        revision_epoch: i64,
+    ) -> StoreResult<()> {
+        self.retained_publication()
+            .run(|| self.set_instance_version_retained(instance_id, version_id, revision_epoch))
+    }
+
+    fn set_instance_version_retained(
         &mut self,
         instance_id: &str,
         version_id: &str,
@@ -6768,6 +7297,15 @@ impl SqliteStore {
     }
 
     fn rebuild_projections_impl(
+        &mut self,
+        instance_id: &str,
+        up_to_sequence: Option<i64>,
+    ) -> StoreResult<()> {
+        self.retained_publication()
+            .run(|| self.rebuild_projections_impl_retained(instance_id, up_to_sequence))
+    }
+
+    fn rebuild_projections_impl_retained(
         &mut self,
         instance_id: &str,
         up_to_sequence: Option<i64>,
@@ -6845,7 +7383,7 @@ impl SqliteStore {
             UPDATE instances
             SET status = 'running',
                 last_event_id = NULL,
-                last_error = NULL,
+                last_error = whip_payload_seal('runtime.instances.last_error', instance_id, NULL),
                 completed_at = NULL
             WHERE instance_id = ?1
             "#,
@@ -6867,7 +7405,15 @@ impl SqliteStore {
             };
             let mut statement = tx.prepare(&format!(
                 r#"
-                SELECT event_id, event_type, payload_json, idempotency_key, causation_id, source, sequence, format_version
+                SELECT
+                    event_id,
+                    event_type,
+                    whip_runtime_event_open(event_id, event_type, payload_json),
+                    idempotency_key,
+                    causation_id,
+                    source,
+                    sequence,
+                    format_version
                 FROM events
                 WHERE instance_id = ?1
                   AND event_type IN (
@@ -7068,6 +7614,14 @@ impl SqliteStore {
         &mut self,
         capture: CheckpointCapture<'_>,
     ) -> StoreResult<CapturedCheckpoint> {
+        self.retained_publication()
+            .run(|| self.capture_checkpoint_retained(capture))
+    }
+
+    fn capture_checkpoint_retained(
+        &mut self,
+        capture: CheckpointCapture<'_>,
+    ) -> StoreResult<CapturedCheckpoint> {
         let tx = self
             .connection
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -7088,7 +7642,7 @@ impl SqliteStore {
         let (manifest_json, manifest) = fold_file_manifest(&fact_payloads)?;
         let manifest_hash = stable_hash_hex(&manifest_json);
         tx.execute(
-            "INSERT OR IGNORE INTO content_blobs (id, body, byte_len) VALUES (?1, ?2, ?3)",
+            "INSERT OR IGNORE INTO content_blobs (id, body, byte_len) VALUES (?1, whip_payload_seal('runtime.content', ?1, ?2), ?3)",
             params![manifest_hash, manifest_json, manifest_json.len() as i64],
         )?;
         let payload = json!({
@@ -7139,7 +7693,7 @@ impl SqliteStore {
         let checkpoint = {
             let mut statement = self.connection.prepare(
                 r#"
-                SELECT payload_json, sequence
+                SELECT whip_runtime_event_open(event_id, event_type, payload_json), sequence
                 FROM events
                 WHERE instance_id = ?1 AND event_type = 'context.checkpoint'
                 ORDER BY sequence DESC
@@ -7252,6 +7806,25 @@ impl SqliteStore {
     /// sequence 55 while a restore planned at 40 is in flight passes quiescence
     /// and loses the signal. Two shipped features, used exactly as designed.
     pub fn commit_restore(
+        &mut self,
+        instance_id: &str,
+        restored_to_sequence: i64,
+        cut_id: &str,
+        expected_head: &str,
+        idempotency_key: Option<&str>,
+    ) -> StoreResult<StoredEvent> {
+        self.retained_publication().run(|| {
+            self.commit_restore_retained(
+                instance_id,
+                restored_to_sequence,
+                cut_id,
+                expected_head,
+                idempotency_key,
+            )
+        })
+    }
+
+    fn commit_restore_retained(
         &mut self,
         instance_id: &str,
         restored_to_sequence: i64,
@@ -8348,9 +8921,9 @@ fn workspace_select_sql(predicate: &str) -> String {
             run_id,
             provider,
             policy,
-            uri,
+            whip_payload_open('runtime.workspaces.uri', json_array(workspaces.instance_id, workspaces.effect_id, workspaces.run_id, workspaces.policy), uri),
             status,
-            metadata_json,
+            whip_payload_open('runtime.workspaces.metadata_json', json_array(workspaces.instance_id, workspaces.effect_id, workspaces.run_id, workspaces.policy), metadata_json),
             created_at,
             updated_at
         FROM workspaces
@@ -8471,7 +9044,7 @@ pub fn fold_file_manifest(
 fn live_fact_payloads_on(connection: &Connection, instance_id: &str) -> StoreResult<Vec<String>> {
     let mut statement = connection.prepare(
         r#"
-        SELECT event_type, payload_json, sequence
+        SELECT event_type, whip_runtime_event_open(event_id, event_type, payload_json), sequence
         FROM events
         WHERE instance_id = ?1 AND event_type IN ('fact.derived', 'context.restored', 'rule.committed', 'host.action.admitted')
         ORDER BY sequence
@@ -8551,7 +9124,7 @@ fn live_event_ids_on(
         return Ok(None);
     }
     let mut statement = connection.prepare(
-        "SELECT event_id, sequence, event_type, payload_json FROM events \
+        "SELECT event_id, sequence, event_type, whip_runtime_event_open(event_id, event_type, payload_json) FROM events \
          WHERE instance_id = ?1 ORDER BY sequence",
     )?;
     let rows = statement
@@ -8753,7 +9326,7 @@ fn append_event_chained_on(
                 prev_digest,
                 entry_digest
             )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+            VALUES (?1, ?2, ?3, ?4, whip_runtime_event_seal(?1, ?4, ?5), ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
             RETURNING event_id, sequence
             "#,
             params![
@@ -8861,21 +9434,20 @@ fn insert_fact(
     connection.execute(
         r#"
         INSERT INTO facts (
-            fact_id,
-            instance_id,
-            program_version_id,
-            revision_epoch,
-            name,
-            key,
-            value_json,
-            source_event_id,
-            source_rule,
-            schema_id,
-            provenance_class,
-            correlation_id,
-            source_span_json
+            fact_id, instance_id, program_version_id, revision_epoch, name, key,
+            value_json, source_event_id, source_rule, schema_id, provenance_class,
+            correlation_id, source_span_json, key_payload
         )
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+        VALUES (
+            ?1, ?2, ?3, ?4, ?5, whip_runtime_fact_key(?6),
+            whip_payload_seal('runtime.facts.value_json',
+                json_array(?2, ?5, whip_runtime_fact_key(?6)), ?7),
+            ?8, ?9, ?10, ?11, ?12,
+            whip_payload_seal('runtime.facts.source_span_json',
+                json_array(?2, ?5, whip_runtime_fact_key(?6)), ?13),
+            whip_payload_seal('runtime.facts.key',
+                json_array(?2, ?5, whip_runtime_fact_key(?6)), ?6)
+        )
         ON CONFLICT(instance_id, name, key) DO UPDATE SET
             consumed_at = NULL,
             fact_id = excluded.fact_id,
@@ -8960,9 +9532,25 @@ fn insert_effect(
             created_at,
             updated_at
         )
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
-                (SELECT occurred_at FROM events WHERE event_id = ?8),
-                (SELECT occurred_at FROM events WHERE event_id = ?8))
+        VALUES (
+            ?1,
+            ?2,
+            ?3,
+            ?4,
+            whip_payload_seal('runtime.effects.input_json', ?1, ?5),
+            ?6,
+            ?7,
+            ?8,
+            ?9,
+            ?10,
+            ?11,
+            ?12,
+            ?13,
+            ?14,
+            ?15,
+            (SELECT occurred_at FROM events WHERE event_id = ?8),
+            (SELECT occurred_at FROM events WHERE event_id = ?8)
+        )
         "#,
         params![
             effect.effect_id,
@@ -9059,27 +9647,18 @@ fn insert_evidence_on(
     serde_json::from_str::<Value>(evidence.metadata_json)?;
     let evidence_id = connection.query_row(
         r#"
-        INSERT INTO evidence (
-            evidence_id,
-            instance_id,
-            kind,
-            subject_type,
-            subject_id,
-            causation_id,
-            correlation_id,
-            summary,
-            metadata_json
-        )
+        WITH payload_identity(id) AS MATERIALIZED (SELECT 'evd_' || lower(hex(randomblob(16))))
+        INSERT INTO evidence (evidence_id, instance_id, kind, subject_type, subject_id, causation_id, correlation_id, summary, metadata_json)
         VALUES (
-            'evd_' || lower(hex(randomblob(16))),
+            (SELECT id FROM payload_identity),
             ?1,
             ?2,
             ?3,
             ?4,
             ?5,
             ?6,
-            ?7,
-            ?8
+            whip_payload_seal('runtime.evidence.summary', (SELECT id FROM payload_identity), ?7),
+            whip_payload_seal('runtime.evidence.metadata_json', (SELECT id FROM payload_identity), ?8)
         )
         RETURNING evidence_id
         "#,
@@ -9217,6 +9796,7 @@ fn insert_diagnostic_on(
 
     let diagnostic_id: String = connection.query_row(
         r#"
+            WITH payload_identity(id) AS MATERIALIZED (SELECT 'dia_' || lower(hex(randomblob(16))))
             INSERT INTO diagnostics (
                 diagnostic_id,
                 instance_id,
@@ -9239,14 +9819,14 @@ fn insert_diagnostic_on(
                 idempotency_key
             )
             VALUES (
-                'dia_' || lower(hex(randomblob(16))),
+                (SELECT id FROM payload_identity),
                 ?1,
                 ?2,
                 ?3,
                 ?4,
                 ?5,
-                ?6,
-                ?7,
+                whip_payload_seal('runtime.diagnostics.message', (SELECT id FROM payload_identity), ?6),
+                whip_payload_seal('runtime.diagnostics.source_span_json', (SELECT id FROM payload_identity), ?7),
                 ?8,
                 ?9,
                 ?10,
@@ -9439,7 +10019,7 @@ fn policy_block_on(
                 effects.required_capabilities,
                 effects.profile,
                 COALESCE(effect_versions.program_id, instances.program_id),
-                COALESCE(effect_versions.declared_profiles, active_versions.declared_profiles)
+                COALESCE(whip_payload_open('runtime.program_versions.declared_profiles', effect_versions.version_id, effect_versions.declared_profiles), whip_payload_open('runtime.program_versions.declared_profiles', active_versions.version_id, active_versions.declared_profiles))
             FROM effects
             JOIN instances ON instances.instance_id = effects.instance_id
             JOIN program_versions AS active_versions
@@ -9585,11 +10165,11 @@ fn persist_policy_block_on(
             r#"
         UPDATE effects
         SET status = ?1,
-            policy_block_reason = ?2,
+            policy_block_reason = whip_payload_seal('runtime.effects.policy_block_reason', effect_id, ?2),
             updated_at = CURRENT_TIMESTAMP
         WHERE instance_id = ?3
           AND effect_id = ?4
-          AND (status != ?1 OR policy_block_reason IS NOT ?2)
+          AND (status != ?1 OR whip_payload_open('runtime.effects.policy_block_reason', effect_id, policy_block_reason) IS NOT ?2)
           AND status IN {PENDING_EFFECT_STATUSES}
         "#
         ),
@@ -9611,7 +10191,10 @@ fn persist_policy_block_on(
                 source: "kernel",
                 causation_id: Some(effect_id),
                 correlation_id: None,
-                idempotency_key: Some(&format!("policy-block:{effect_id}:{}", block.reason)),
+                idempotency_key: Some(&runtime_protection::metadata_key(
+                    connection,
+                    &format!("policy-block:{effect_id}:{}", block.reason),
+                )?),
             },
         )?;
     }
@@ -9726,7 +10309,7 @@ fn capacity_block_on(
             r#"
             SELECT effects.kind,
                    effects.target,
-                   COALESCE(effect_versions.declared_profiles, active_versions.declared_profiles)
+                   COALESCE(whip_payload_open('runtime.program_versions.declared_profiles', effect_versions.version_id, effect_versions.declared_profiles), whip_payload_open('runtime.program_versions.declared_profiles', active_versions.version_id, active_versions.declared_profiles))
             FROM effects
             JOIN instances ON instances.instance_id = effects.instance_id
             JOIN program_versions AS active_versions
@@ -10183,7 +10766,9 @@ fn program_version_analysis_on(
     let (program_id, analysis_summary_json) = connection
         .query_row(
             r#"
-            SELECT program_id, analysis_summary
+            SELECT
+                program_id,
+                whip_payload_open('runtime.program_versions.analysis_summary', program_versions.version_id, analysis_summary)
             FROM program_versions
             WHERE version_id = ?1
             "#,
@@ -10320,7 +10905,11 @@ fn add_active_fact_schema_diagnostics(
 
     let mut statement = connection.prepare(
         r#"
-        SELECT fact_id, name, schema_id, value_json
+        SELECT
+            fact_id,
+            name,
+            schema_id,
+            whip_payload_open('runtime.facts.value_json', json_array(facts.instance_id, facts.name, facts.key), value_json)
         FROM facts
         WHERE instance_id = ?1
           AND consumed_at IS NULL
@@ -10786,9 +11375,9 @@ fn revision_by_id_on(
                 from_version_id,
                 to_version_id,
                 activated_by_event_id,
-                activation_policy_json,
+                whip_payload_open('runtime.instance_revisions.activation_policy_json', instance_revisions.revision_id, activation_policy_json),
                 cancellation_policy,
-                rule_carries_json,
+                whip_payload_open('runtime.instance_revisions.rule_carries_json', instance_revisions.revision_id, rule_carries_json),
                 status,
                 idempotency_key,
                 created_at,
@@ -10819,9 +11408,9 @@ fn revision_by_idempotency_on(
                 from_version_id,
                 to_version_id,
                 activated_by_event_id,
-                activation_policy_json,
+                whip_payload_open('runtime.instance_revisions.activation_policy_json', instance_revisions.revision_id, activation_policy_json),
                 cancellation_policy,
-                rule_carries_json,
+                whip_payload_open('runtime.instance_revisions.rule_carries_json', instance_revisions.revision_id, rule_carries_json),
                 status,
                 idempotency_key,
                 created_at,
@@ -10953,7 +11542,7 @@ fn cancellation_request_by_idempotency_on(
                 instance_id,
                 effect_id,
                 revision_id,
-                reason,
+                whip_payload_open('runtime.effect_cancellation_requests.reason', effect_cancellation_requests.request_id, reason),
                 requested_by,
                 causation_event_id,
                 status,
@@ -10985,7 +11574,7 @@ fn cancellation_request_by_id_on(
                 instance_id,
                 effect_id,
                 revision_id,
-                reason,
+                whip_payload_open('runtime.effect_cancellation_requests.reason', effect_cancellation_requests.request_id, reason),
                 requested_by,
                 causation_event_id,
                 status,
@@ -11058,7 +11647,7 @@ fn insert_effect_cancellation_request_on(
             status,
             idempotency_key
         )
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'requested', ?8)
+        VALUES (?1, ?2, ?3, ?4, whip_payload_seal('runtime.effect_cancellation_requests.reason', ?1, ?5), ?6, ?7, 'requested', ?8)
         "#,
         params![
             request_id,
@@ -11314,7 +11903,7 @@ fn execution_fingerprint_on(
 ) -> StoreResult<String> {
     let input_json: String = connection
         .query_row(
-            "SELECT input_json FROM effects WHERE instance_id = ?1 AND effect_id = ?2",
+            "SELECT whip_payload_open('runtime.effects.input_json', effects.effect_id, input_json) FROM effects WHERE instance_id = ?1 AND effect_id = ?2",
             params![instance_id, effect_id],
             |row| row.get(0),
         )
@@ -11410,14 +11999,14 @@ const WORKFLOW_INVOCATION_SELECT: &str = r#"
         child_instance.version_id,
         child_instance.revision_epoch,
         workflow_invocations.target_workflow,
-        workflow_invocations.input_json,
+        whip_payload_open('runtime.workflow_invocations.input_json', workflow_invocations.invocation_id, workflow_invocations.input_json),
         CASE
             WHEN parent_effect.status IN ('completed', 'failed', 'timed_out', 'cancelled')
             THEN parent_effect.status
             ELSE workflow_invocations.status
         END,
         workflow_invocations.terminal_event_id,
-        workflow_invocations.source_span_json,
+        whip_payload_open('runtime.workflow_invocations.source_span_json', workflow_invocations.invocation_id, workflow_invocations.source_span_json),
         workflow_invocations.created_at,
         COALESCE(workflow_invocations.updated_at, workflow_invocations.created_at)
     FROM workflow_invocations
@@ -12000,7 +12589,7 @@ fn apply_instance_created(
             revision_epoch = ?3,
             workflow_principal = ?4,
             effective_authority = ?5,
-            input_json = ?6,
+            input_json = whip_payload_seal('runtime.instances.input_json', instance_id, ?6),
             created_at = ?7,
             started_at = ?8,
             status = ?9
@@ -12053,7 +12642,7 @@ fn apply_instance_transitioned(
         UPDATE instances
         SET status = ?1,
             last_event_id = ?2,
-            last_error = ?3,
+            last_error = whip_payload_seal('runtime.instances.last_error', instance_id, ?3),
             updated_at = CURRENT_TIMESTAMP,
             completed_at = CASE
                 WHEN ?1 IN ('completed', 'cancelled', 'failed') THEN CURRENT_TIMESTAMP
@@ -12130,7 +12719,19 @@ fn replay_revision_activation(
             status,
             idempotency_key
         )
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'active', ?10)
+        VALUES (
+            ?1,
+            ?2,
+            ?3,
+            ?4,
+            ?5,
+            ?6,
+            whip_payload_seal('runtime.instance_revisions.activation_policy_json', ?1, ?7),
+            ?8,
+            whip_payload_seal('runtime.instance_revisions.rule_carries_json', ?1, ?9),
+            'active',
+            ?10
+        )
         ON CONFLICT(revision_id) DO NOTHING
         "#,
         params![
@@ -12201,7 +12802,7 @@ fn replay_run_started(
         r#"
         UPDATE effects
         SET status = 'running',
-            policy_block_reason = NULL,
+            policy_block_reason = whip_payload_seal('runtime.effects.policy_block_reason', effect_id, NULL),
             updated_at = CURRENT_TIMESTAMP
         WHERE instance_id = ?1
           AND effect_id = ?2
@@ -12211,18 +12812,17 @@ fn replay_run_started(
     )?;
     connection.execute(
         r#"
-        INSERT INTO runs (
-            run_id,
-            effect_id,
-            instance_id,
-            provider,
-            worker_id,
-            status,
-            metadata_json,
-            started_at
+        INSERT INTO runs (run_id, effect_id, instance_id, provider, worker_id, status, metadata_json, started_at)
+        VALUES (
+            ?1,
+            ?2,
+            ?3,
+            ?4,
+            ?5,
+            'running',
+            whip_payload_seal('runtime.runs.metadata_json', ?1, ?6),
+            (SELECT occurred_at FROM events WHERE event_id = ?7)
         )
-        VALUES (?1, ?2, ?3, ?4, ?5, 'running', ?6,
-            (SELECT occurred_at FROM events WHERE event_id = ?7))
         ON CONFLICT(run_id) DO UPDATE SET
             effect_id = excluded.effect_id,
             instance_id = excluded.instance_id,
@@ -12326,9 +12926,19 @@ fn replay_effect_terminal(
                 summary,
                 metadata_json
             )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6,
+            VALUES (
+                ?1,
+                ?2,
+                ?3,
+                ?4,
+                ?5,
+                ?6,
                 (SELECT occurred_at FROM events WHERE event_id = ?10),
-                (SELECT occurred_at FROM events WHERE event_id = ?10), ?7, ?8, ?9)
+                (SELECT occurred_at FROM events WHERE event_id = ?10),
+                ?7,
+                whip_payload_seal('runtime.runs.summary', ?1, ?8),
+                whip_payload_seal('runtime.runs.metadata_json', ?1, ?9)
+            )
             ON CONFLICT(run_id) DO UPDATE SET
                 effect_id = excluded.effect_id,
                 instance_id = excluded.instance_id,
@@ -12521,7 +13131,7 @@ fn replay_cancellation_request(
             status,
             idempotency_key
         )
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'requested', ?8)
+        VALUES (?1, ?2, ?3, ?4, whip_payload_seal('runtime.effect_cancellation_requests.reason', ?1, ?5), ?6, ?7, 'requested', ?8)
         ON CONFLICT(request_id) DO NOTHING
         "#,
         params![
@@ -12543,6 +13153,17 @@ fn replay_cancellation_request(
 
 #[cfg(feature = "native")]
 fn apply_migrations(connection: &mut Connection) -> StoreResult<()> {
+    SqliteStore::require_plain_before_initialize(connection)?;
+    runtime_protection::register(connection, None)?;
+    connection.pragma_update(None, "foreign_keys", "ON")?;
+    let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    initialize_runtime_schema_on(&tx)?;
+    tx.commit()?;
+    Ok(())
+}
+
+#[cfg(feature = "native")]
+fn initialize_runtime_schema_on(connection: &Connection) -> StoreResult<()> {
     connection.execute_batch(
         r#"
         PRAGMA foreign_keys = ON;
@@ -12573,10 +13194,8 @@ fn apply_migrations(connection: &mut Connection) -> StoreResult<()> {
         });
     }
 
-    let transaction =
-        connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     for migration in MIGRATIONS {
-        let applied = transaction
+        let applied = connection
             .query_row(
                 "SELECT 1 FROM schema_migrations WHERE version = ?1",
                 [migration.version],
@@ -12588,13 +13207,12 @@ fn apply_migrations(connection: &mut Connection) -> StoreResult<()> {
             continue;
         }
 
-        transaction.execute_batch(migration.sql)?;
-        transaction.execute(
+        connection.execute_batch(migration.sql)?;
+        connection.execute(
             "INSERT INTO schema_migrations (version, name) VALUES (?1, ?2)",
             params![migration.version, migration.name],
         )?;
     }
-    transaction.commit()?;
     ensure_fact_schema(connection)?;
     ensure_diagnostics_schema(connection)?;
     ensure_workflow_invocation_schema(connection)?;
@@ -12743,7 +13361,7 @@ fn backfill_event_chain(connection: &Connection) -> StoreResult<()> {
         .collect::<result::Result<Vec<_>, _>>()?;
     for instance_id in instance_ids {
         let mut rows = connection.prepare(
-            "SELECT event_id, sequence, event_type, payload_json, occurred_at, source, \
+            "SELECT event_id, sequence, event_type, whip_runtime_event_open(event_id, event_type, payload_json), occurred_at, source, \
              causation_id, correlation_id, idempotency_key, format_version \
              FROM events WHERE instance_id = ?1 ORDER BY sequence ASC",
         )?;
@@ -12802,7 +13420,7 @@ impl crate::log_append::LogAppend for SqliteStore {
 
     fn chain_prefix(&self, instance_id: &str) -> StoreResult<Vec<event_chain::OwnedChainEntry>> {
         let mut statement = self.connection.prepare(
-            "SELECT event_id, sequence, event_type, payload_json, occurred_at, source, \
+            "SELECT event_id, sequence, event_type, whip_runtime_event_open(event_id, event_type, payload_json), occurred_at, source, \
              causation_id, correlation_id, idempotency_key, format_version \
              FROM events WHERE instance_id = ?1 ORDER BY sequence ASC",
         )?;
@@ -13628,7 +14246,7 @@ mod tests {
             .expect("query")
             .collect::<Result<Vec<_>, _>>()
             .expect("rows");
-        assert_eq!(versions, vec![1, 2]);
+        assert_eq!(versions, vec![1, 2, 3]);
     }
 
     /// Drive the store through the `RuntimeStore` trait as a `&dyn` object:
@@ -18441,7 +19059,7 @@ mod tests {
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .expect("the store stamped its generation");
-        assert_eq!(version, 1);
+        assert_eq!(version, 2);
         assert_eq!(name, "coordination", "the row says which store wrote it");
 
         // Reopening is idempotent: the same generation, not a second row.
@@ -18468,7 +19086,7 @@ mod tests {
             Err(StoreError::UnsupportedVersion {
                 found, supported, ..
             }) => {
-                assert_eq!((found, supported), (99, 1));
+                assert_eq!((found, supported), (99, 2));
             }
             Err(other) => {
                 panic!("a newer file is UnsupportedVersion, never another error: {other:?}")
@@ -20404,6 +21022,10 @@ mod tests {
                         instance_id TEXT PRIMARY KEY,
                         version_id TEXT
                     );
+                    CREATE TABLE facts (
+                        fact_id TEXT PRIMARY KEY,
+                        instance_id TEXT, name TEXT, key TEXT, value_json TEXT
+                    );
                     CREATE TABLE effects (
                         effect_id TEXT PRIMARY KEY,
                         instance_id TEXT
@@ -20613,6 +21235,10 @@ mod tests {
                     CREATE TABLE instances (
                         instance_id TEXT PRIMARY KEY,
                         version_id TEXT
+                    );
+                    CREATE TABLE facts (
+                        fact_id TEXT PRIMARY KEY,
+                        instance_id TEXT, name TEXT, key TEXT, value_json TEXT
                     );
                     CREATE TABLE effects (
                         effect_id TEXT PRIMARY KEY,

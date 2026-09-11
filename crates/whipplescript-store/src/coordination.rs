@@ -18,6 +18,9 @@ use serde_json::Value;
 use crate::StoreError;
 use crate::StoreResult;
 
+#[cfg(feature = "native")]
+mod protection;
+
 pub const DEFAULT_COORDINATION_OWNER: &str = "shared";
 
 /// Outcome of one atomic lease-acquire attempt. `Contended` is a normal,
@@ -91,6 +94,7 @@ pub struct CounterRow {
 #[cfg(feature = "native")]
 pub struct CoordinationStore {
     connection: Connection,
+    protection: Option<crate::payload_protection::PayloadProtection>,
 }
 
 #[cfg(feature = "native")]
@@ -101,7 +105,7 @@ impl CoordinationStore {
     pub fn open_existing(path: impl AsRef<Path>) -> StoreResult<Self> {
         let connection =
             crate::native_existing::open(path.as_ref(), "coordination", SATELLITE_SCHEMA_VERSION)?;
-        Ok(Self { connection })
+        Self::from_existing_connection(connection, None)
     }
 
     pub fn open(path: impl AsRef<Path>) -> StoreResult<Self> {
@@ -111,6 +115,7 @@ impl CoordinationStore {
             }
         }
         let connection = Connection::open(path)?;
+        Self::require_plain_before_initialize(&connection)?;
         // Several workers open one shared coordination store, and the first of
         // them to arrive at a fresh file has to establish WAL against the
         // others. `establish_wal` is what survives that race.
@@ -126,9 +131,15 @@ impl CoordinationStore {
     }
 
     fn from_connection(connection: Connection) -> StoreResult<Self> {
+        Self::require_plain_before_initialize(&connection)?;
         connection.execute_batch("PRAGMA foreign_keys = ON;")?;
+        let tx = rusqlite::Transaction::new_unchecked(
+            &connection,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
         ensure_partitioned_schema(&connection)?;
-        Ok(Self { connection })
+        tx.commit()?;
+        Self::from_existing_connection(connection, None)
     }
 
     /// One atomic attempt: expire stale holders (TTL crash net), then either
@@ -161,45 +172,51 @@ impl CoordinationStore {
         ttl_seconds: i64,
         holder: &str,
     ) -> StoreResult<AcquireOutcome> {
-        let owner = normalized_owner(owner);
-        let tx = self
-            .connection
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        tx.execute(
-            "DELETE FROM leases WHERE owner = ?1 AND resource = ?2 AND key = ?3 AND expires_at <= datetime('now')",
-            params![owner, resource, key],
-        )?;
-        let already_held: i64 = tx.query_row(
-            "SELECT COUNT(*) FROM leases WHERE owner = ?1 AND resource = ?2 AND key = ?3 AND holder = ?4",
-            params![owner, resource, key, holder],
-            |row| row.get(0),
-        )?;
-        if already_held > 0 {
-            tx.commit()?;
-            return Ok(AcquireOutcome::Held);
-        }
-        let holders: i64 = tx.query_row(
-            "SELECT COUNT(*) FROM leases WHERE owner = ?1 AND resource = ?2 AND key = ?3",
-            params![owner, resource, key],
-            |row| row.get(0),
-        )?;
-        if holders < slots {
+        self.retained(|store| {
+            let owner = normalized_owner(owner);
+            let protection = store.protection.clone();
+            let index = protection::key_index(protection.as_ref(), "coord.lease.key", owner, resource, key)?;
+            let key_payload = protection::seal(protection.as_ref(), "coord.lease.key", &[owner, resource, &index, holder], key)?;
+            let key = index.as_str();
+            let tx = store
+                .connection
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
             tx.execute(
-                "INSERT INTO leases (owner, resource, key, holder, expires_at) VALUES (?1, ?2, ?3, ?4, datetime('now', ?5))",
-                params![owner, resource, key, holder, format!("+{ttl_seconds} seconds")],
+                "DELETE FROM leases WHERE owner = ?1 AND resource = ?2 AND key = ?3 AND expires_at <= datetime('now')",
+                params![owner, resource, key],
             )?;
+            let already_held: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM leases WHERE owner = ?1 AND resource = ?2 AND key = ?3 AND holder = ?4",
+                params![owner, resource, key, holder],
+                |row| row.get(0),
+            )?;
+            if already_held > 0 {
+                tx.commit()?;
+                return Ok(AcquireOutcome::Held);
+            }
+            let holders: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM leases WHERE owner = ?1 AND resource = ?2 AND key = ?3",
+                params![owner, resource, key],
+                |row| row.get(0),
+            )?;
+            if holders < slots {
+                tx.execute(
+                    "INSERT INTO leases (owner, resource, key, holder, expires_at, key_payload) VALUES (?1, ?2, ?3, ?4, datetime('now', ?5), ?6)",
+                    params![owner, resource, key, holder, format!("+{ttl_seconds} seconds"), key_payload],
+                )?;
+                tx.commit()?;
+                return Ok(AcquireOutcome::Held);
+            }
+            let mut statement = tx.prepare(
+                "SELECT holder FROM leases WHERE owner = ?1 AND resource = ?2 AND key = ?3 ORDER BY acquired_at",
+            )?;
+            let current = statement
+                .query_map(params![owner, resource, key], |row| row.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?;
+            drop(statement);
             tx.commit()?;
-            return Ok(AcquireOutcome::Held);
-        }
-        let mut statement = tx.prepare(
-            "SELECT holder FROM leases WHERE owner = ?1 AND resource = ?2 AND key = ?3 ORDER BY acquired_at",
-        )?;
-        let current = statement
-            .query_map(params![owner, resource, key], |row| row.get::<_, String>(0))?
-            .collect::<Result<Vec<_>, _>>()?;
-        drop(statement);
-        tx.commit()?;
-        Ok(AcquireOutcome::Contended { holders: current })
+            Ok(AcquireOutcome::Contended { holders: current })
+        })
     }
 
     pub fn release(&mut self, resource: &str, key: &str, holder: &str) -> StoreResult<bool> {
@@ -213,12 +230,23 @@ impl CoordinationStore {
         key: &str,
         holder: &str,
     ) -> StoreResult<bool> {
-        let owner = normalized_owner(owner);
-        let changed = self.connection.execute(
+        self.retained(|store| {
+            let owner = normalized_owner(owner);
+            let protection = store.protection.clone();
+            let index = protection::key_index(
+                protection.as_ref(),
+                "coord.lease.key",
+                owner,
+                resource,
+                key,
+            )?;
+            let key = index.as_str();
+            let changed = store.connection.execute(
             "DELETE FROM leases WHERE owner = ?1 AND resource = ?2 AND key = ?3 AND holder = ?4",
             params![owner, resource, key, holder],
         )?;
-        Ok(changed >= 1)
+            Ok(changed >= 1)
+        })
     }
 
     /// Extend a held lease's TTL before it expires (spec/coordination.md,
@@ -234,33 +262,46 @@ impl CoordinationStore {
         ttl_seconds: i64,
         holder: &str,
     ) -> StoreResult<Option<String>> {
-        let owner = normalized_owner(owner);
-        let expires_at = self
-            .connection
-            .query_row(
-                "UPDATE leases SET expires_at = datetime('now', ?5) \
+        self.retained(|store| {
+            let owner = normalized_owner(owner);
+            let protection = store.protection.clone();
+            let index = protection::key_index(
+                protection.as_ref(),
+                "coord.lease.key",
+                owner,
+                resource,
+                key,
+            )?;
+            let key = index.as_str();
+            let expires_at = store
+                .connection
+                .query_row(
+                    "UPDATE leases SET expires_at = datetime('now', ?5) \
                  WHERE owner = ?1 AND resource = ?2 AND key = ?3 AND holder = ?4 \
                  AND expires_at > datetime('now') RETURNING expires_at",
-                params![
-                    owner,
-                    resource,
-                    key,
-                    holder,
-                    format!("+{ttl_seconds} seconds")
-                ],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()?;
-        Ok(expires_at)
+                    params![
+                        owner,
+                        resource,
+                        key,
+                        holder,
+                        format!("+{ttl_seconds} seconds")
+                    ],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?;
+            Ok(expires_at)
+        })
     }
 
     /// Instance-terminal release: a holder reaching a workflow terminal drops
     /// everything it held (principle 3).
     pub fn release_all_for_holder(&mut self, holder: &str) -> StoreResult<usize> {
-        let changed = self
-            .connection
-            .execute("DELETE FROM leases WHERE holder = ?1", params![holder])?;
-        Ok(changed)
+        self.retained(|store| {
+            let changed = store
+                .connection
+                .execute("DELETE FROM leases WHERE holder = ?1", params![holder])?;
+            Ok(changed)
+        })
     }
 
     /// Appends commute — there is no contention to resolve. `retain_seconds`
@@ -340,52 +381,59 @@ impl CoordinationStore {
         retain_seconds: i64,
         effect_id: Option<&str>,
     ) -> StoreResult<i64> {
-        let owner = normalized_owner(owner);
-        let tx = self
-            .connection
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        if let Some(effect_id) = effect_id {
-            if let Some(recorded) = tx
-                .query_row(
-                    "SELECT outcome_json FROM coord_applied WHERE owner = ?1 AND effect_id = ?2",
-                    params![owner, effect_id],
-                    |row| row.get::<_, String>(0),
-                )
-                .optional()?
-            {
-                tx.commit()?;
-                return recorded.parse::<i64>().map_err(|_| {
-                    StoreError::Conflict(format!(
-                        "corrupt coord_applied outcome for effect `{effect_id}`: `{recorded}`"
-                    ))
-                });
+        self.retained(|store| {
+            let owner = normalized_owner(owner);
+            let protection = store.protection.clone();
+            let partition_index = protection::key_index(protection.as_ref(), "coord.ledger.partition", owner, ledger, partition)?;
+            let tx = store
+                .connection
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            if let Some(effect_id) = effect_id {
+                if let Some(recorded) = tx
+                    .query_row(
+                        "SELECT outcome_json FROM coord_applied WHERE owner = ?1 AND effect_id = ?2",
+                        params![owner, effect_id],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()?
+                {
+                    tx.commit()?;
+                    return recorded.parse::<i64>().map_err(|_| {
+                        StoreError::Conflict(format!(
+                            "corrupt coord_applied outcome for effect `{effect_id}`: `{recorded}`"
+                        ))
+                    });
+                }
             }
-        }
-        tx.execute(
-            "INSERT OR IGNORE INTO ledger_seq (owner, ledger, next_seq) VALUES (?1, ?2, 1)",
-            params![owner, ledger],
-        )?;
-        let seq: i64 = tx.query_row(
-            "UPDATE ledger_seq SET next_seq = next_seq + 1 WHERE owner = ?1 AND ledger = ?2 RETURNING next_seq - 1",
-            params![owner, ledger],
-            |row| row.get(0),
-        )?;
-        tx.execute(
-            "INSERT INTO ledger_entries (owner, ledger, partition, seq, payload_json, appended_by) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![owner, ledger, partition, seq, payload_json, appended_by],
-        )?;
-        tx.execute(
-            "DELETE FROM ledger_entries WHERE owner = ?1 AND ledger = ?2 AND appended_at <= datetime('now', ?3)",
-            params![owner, ledger, format!("-{retain_seconds} seconds")],
-        )?;
-        if let Some(effect_id) = effect_id {
             tx.execute(
-                "INSERT INTO coord_applied (owner, effect_id, outcome_json) VALUES (?1, ?2, ?3)",
-                params![owner, effect_id, seq.to_string()],
+                "INSERT OR IGNORE INTO ledger_seq (owner, ledger, next_seq) VALUES (?1, ?2, 1)",
+                params![owner, ledger],
             )?;
-        }
-        tx.commit()?;
-        Ok(seq)
+            let seq: i64 = tx.query_row(
+                "UPDATE ledger_seq SET next_seq = next_seq + 1 WHERE owner = ?1 AND ledger = ?2 RETURNING next_seq - 1",
+                params![owner, ledger],
+                |row| row.get(0),
+            )?;
+            let coordinate = [owner, ledger, &seq.to_string()];
+            let partition_payload = protection::seal(protection.as_ref(), "coord.ledger.partition", &coordinate, partition)?;
+            let payload = protection::seal(protection.as_ref(), "coord.ledger.body", &coordinate, payload_json)?;
+            tx.execute(
+                "INSERT INTO ledger_entries (owner, ledger, partition, seq, payload_json, appended_by, partition_payload) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![owner, ledger, partition_index, seq, payload, appended_by, partition_payload],
+            )?;
+            tx.execute(
+                "DELETE FROM ledger_entries WHERE owner = ?1 AND ledger = ?2 AND appended_at <= datetime('now', ?3)",
+                params![owner, ledger, format!("-{retain_seconds} seconds")],
+            )?;
+            if let Some(effect_id) = effect_id {
+                tx.execute(
+                    "INSERT INTO coord_applied (owner, effect_id, outcome_json) VALUES (?1, ?2, ?3)",
+                    params![owner, effect_id, seq.to_string()],
+                )?;
+            }
+            tx.commit()?;
+            Ok(seq)
+        })
     }
 
     /// One atomic consume with lazy reset (spec/coordination.md): the caller
@@ -450,67 +498,74 @@ impl CoordinationStore {
         period: &str,
         effect_id: Option<&str>,
     ) -> StoreResult<ConsumeOutcome> {
-        let owner = normalized_owner(owner);
-        let tx = self
-            .connection
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        if let Some(effect_id) = effect_id {
-            if let Some(recorded) = tx
-                .query_row(
-                    "SELECT outcome_json FROM coord_applied WHERE owner = ?1 AND effect_id = ?2",
-                    params![owner, effect_id],
-                    |row| row.get::<_, String>(0),
-                )
-                .optional()?
-            {
-                tx.commit()?;
-                return parse_consume_outcome(&recorded).ok_or_else(|| {
-                    StoreError::Conflict(format!(
-                        "corrupt coord_applied outcome for effect `{effect_id}`: `{recorded}`"
-                    ))
-                });
-            }
-        }
-        tx.execute(
-            "INSERT OR IGNORE INTO counters (owner, counter, key, consumed, period) VALUES (?1, ?2, ?3, 0, ?4)",
-            params![owner, counter, key, period],
-        )?;
-        tx.execute(
-            "UPDATE counters SET consumed = 0, period = ?4 WHERE owner = ?1 AND counter = ?2 AND key = ?3 AND period != ?4",
-            params![owner, counter, key, period],
-        )?;
-        let consumed: i64 = tx.query_row(
-            "SELECT consumed FROM counters WHERE owner = ?1 AND counter = ?2 AND key = ?3",
-            params![owner, counter, key],
-            |row| row.get(0),
-        )?;
-        // `amount` is workflow-authored, so guard the cap check against i64
-        // overflow: a near-MAX amount would wrap `consumed + amount` negative,
-        // passing the check and driving `consumed` negative — an unbounded
-        // counter (silent cap bypass in release, panic in debug). checked_add
-        // fails closed to `Over` (denied), never charging.
-        let outcome = match consumed.checked_add(amount) {
-            Some(total) if amount >= 0 && total <= cap => {
-                tx.execute(
-                    "UPDATE counters SET consumed = consumed + ?4 WHERE owner = ?1 AND counter = ?2 AND key = ?3",
-                    params![owner, counter, key, amount],
-                )?;
-                ConsumeOutcome::Ok {
-                    remaining: cap - total,
+        self.retained(|store| {
+            let owner = normalized_owner(owner);
+            let protection = store.protection.clone();
+            let index = protection::key_index(protection.as_ref(), "coord.counter.key", owner, counter, key)?;
+            let key_payload = protection::seal(protection.as_ref(), "coord.counter.key", &[owner, counter, &index], key)?;
+            let key = index.as_str();
+            let tx = store
+                .connection
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            if let Some(effect_id) = effect_id {
+                if let Some(recorded) = tx
+                    .query_row(
+                        "SELECT outcome_json FROM coord_applied WHERE owner = ?1 AND effect_id = ?2",
+                        params![owner, effect_id],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()?
+                {
+                    let outcome = parse_consume_outcome(&recorded).ok_or_else(|| {
+                        StoreError::Conflict(format!(
+                            "corrupt coord_applied outcome for effect `{effect_id}`: `{recorded}`"
+                        ))
+                    })?;
+                    tx.commit()?;
+                    return Ok(outcome);
                 }
             }
-            _ => ConsumeOutcome::Over {
-                remaining: (cap - consumed).max(0),
-            },
-        };
-        if let Some(effect_id) = effect_id {
             tx.execute(
-                "INSERT INTO coord_applied (owner, effect_id, outcome_json) VALUES (?1, ?2, ?3)",
-                params![owner, effect_id, format_consume_outcome(&outcome)],
+                "INSERT OR IGNORE INTO counters (owner, counter, key, consumed, period, key_payload) VALUES (?1, ?2, ?3, 0, ?4, ?5)",
+                params![owner, counter, key, period, key_payload],
             )?;
-        }
-        tx.commit()?;
-        Ok(outcome)
+            tx.execute(
+                "UPDATE counters SET consumed = 0, period = ?4 WHERE owner = ?1 AND counter = ?2 AND key = ?3 AND period != ?4",
+                params![owner, counter, key, period],
+            )?;
+            let consumed: i64 = tx.query_row(
+                "SELECT consumed FROM counters WHERE owner = ?1 AND counter = ?2 AND key = ?3",
+                params![owner, counter, key],
+                |row| row.get(0),
+            )?;
+            // `amount` is workflow-authored, so guard the cap check against i64
+            // overflow: a near-MAX amount would wrap `consumed + amount` negative,
+            // passing the check and driving `consumed` negative — an unbounded
+            // counter (silent cap bypass in release, panic in debug). checked_add
+            // fails closed to `Over` (denied), never charging.
+            let outcome = match consumed.checked_add(amount) {
+                Some(total) if amount >= 0 && total <= cap => {
+                    tx.execute(
+                        "UPDATE counters SET consumed = consumed + ?4 WHERE owner = ?1 AND counter = ?2 AND key = ?3",
+                        params![owner, counter, key, amount],
+                    )?;
+                    ConsumeOutcome::Ok {
+                        remaining: cap - total,
+                    }
+                }
+                _ => ConsumeOutcome::Over {
+                    remaining: (cap - consumed).max(0),
+                },
+            };
+            if let Some(effect_id) = effect_id {
+                tx.execute(
+                    "INSERT INTO coord_applied (owner, effect_id, outcome_json) VALUES (?1, ?2, ?3)",
+                    params![owner, effect_id, format_consume_outcome(&outcome)],
+                )?;
+            }
+            tx.commit()?;
+            Ok(outcome)
+        })
     }
 
     /// The current reset-period identifier, read from the store's clock at
@@ -544,20 +599,43 @@ impl CoordinationStore {
         resource: Option<&str>,
     ) -> StoreResult<Vec<LeaseRow>> {
         let mut statement = self.connection.prepare(
-            "SELECT owner, resource, key, holder, acquired_at, expires_at FROM leases WHERE (?1 IS NULL OR owner = ?1) AND (?2 IS NULL OR resource = ?2) ORDER BY owner, resource, key, acquired_at",
+            "SELECT owner, resource, key, holder, acquired_at, expires_at, key_payload FROM leases WHERE (?1 IS NULL OR owner = ?1) AND (?2 IS NULL OR resource = ?2) ORDER BY owner, resource, key, acquired_at",
         )?;
-        let rows = statement
-            .query_map(params![owner.map(normalized_owner), resource], |row| {
-                Ok(LeaseRow {
+        let raw = statement.query_map(params![owner.map(normalized_owner), resource], |row| {
+            Ok((
+                LeaseRow {
                     owner: row.get(0)?,
                     resource: row.get(1)?,
                     key: row.get(2)?,
                     holder: row.get(3)?,
                     acquired_at: row.get(4)?,
                     expires_at: row.get(5)?,
-                })
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
+                },
+                row.get::<_, rusqlite::types::Value>(6)?,
+            ))
+        })?;
+        let mut rows = Vec::new();
+        for row in raw {
+            let (mut row, value) = row?;
+            row.key = protection::open_key(
+                self.protection.as_ref(),
+                "coord.lease.key",
+                &row.owner,
+                &row.resource,
+                &row.key,
+                &[&row.owner, &row.resource, &row.key, &row.holder],
+                value,
+            )?;
+            rows.push(row);
+        }
+        rows.sort_by(|a, b| {
+            (&a.owner, &a.resource, &a.key, &a.acquired_at).cmp(&(
+                &b.owner,
+                &b.resource,
+                &b.key,
+                &b.acquired_at,
+            ))
+        });
         Ok(rows)
     }
 
@@ -576,24 +654,59 @@ impl CoordinationStore {
         partition: Option<&str>,
     ) -> StoreResult<Vec<LedgerEntry>> {
         let mut statement = self.connection.prepare(
-            "SELECT owner, ledger, partition, seq, payload_json, appended_by, appended_at FROM ledger_entries WHERE (?1 IS NULL OR owner = ?1) AND (?2 IS NULL OR ledger = ?2) AND (?3 IS NULL OR partition = ?3) ORDER BY owner, ledger, seq",
+            "SELECT owner, ledger, partition, seq, payload_json, appended_by, appended_at, partition_payload FROM ledger_entries WHERE (?1 IS NULL OR owner = ?1) AND (?2 IS NULL OR ledger = ?2) ORDER BY owner, ledger, seq",
         )?;
-        let rows = statement
-            .query_map(
-                params![owner.map(normalized_owner), ledger, partition],
-                |row| {
-                    Ok(LedgerEntry {
-                        owner: row.get(0)?,
-                        ledger: row.get(1)?,
-                        partition: row.get(2)?,
-                        seq: row.get(3)?,
-                        payload_json: row.get(4)?,
-                        appended_by: row.get(5)?,
-                        appended_at: row.get(6)?,
-                    })
+        let raw = statement.query_map(params![owner.map(normalized_owner), ledger], |row| {
+            Ok((
+                LedgerEntry {
+                    owner: row.get(0)?,
+                    ledger: row.get(1)?,
+                    partition: row.get(2)?,
+                    seq: row.get(3)?,
+                    payload_json: String::new(),
+                    appended_by: row.get(5)?,
+                    appended_at: row.get(6)?,
                 },
-            )?
-            .collect::<Result<Vec<_>, _>>()?;
+                row.get::<_, rusqlite::types::Value>(4)?,
+                row.get::<_, rusqlite::types::Value>(7)?,
+            ))
+        })?;
+        let mut rows = Vec::new();
+        for row in raw {
+            let (mut row, payload, partition_payload) = row?;
+            // Filter using the equality index before opening any other
+            // partition's content, including when owner/ledger are omitted.
+            if let Some(partition) = partition {
+                if protection::key_index(
+                    self.protection.as_ref(),
+                    "coord.ledger.partition",
+                    &row.owner,
+                    &row.ledger,
+                    partition,
+                )? != row.partition
+                {
+                    continue;
+                }
+            }
+            let sequence = row.seq.to_string();
+            let coordinate = [&*row.owner, &*row.ledger, &sequence];
+            row.partition = protection::open_key(
+                self.protection.as_ref(),
+                "coord.ledger.partition",
+                &row.owner,
+                &row.ledger,
+                &row.partition,
+                &coordinate,
+                partition_payload,
+            )?;
+            row.payload_json = protection::open(
+                self.protection.as_ref(),
+                "coord.ledger.body",
+                &coordinate,
+                payload,
+            )?;
+            rows.push(row);
+        }
         Ok(rows)
     }
 
@@ -607,19 +720,35 @@ impl CoordinationStore {
         counter: Option<&str>,
     ) -> StoreResult<Vec<CounterRow>> {
         let mut statement = self.connection.prepare(
-            "SELECT owner, counter, key, consumed, period FROM counters WHERE (?1 IS NULL OR owner = ?1) AND (?2 IS NULL OR counter = ?2) ORDER BY owner, counter, key",
+            "SELECT owner, counter, key, consumed, period, key_payload FROM counters WHERE (?1 IS NULL OR owner = ?1) AND (?2 IS NULL OR counter = ?2) ORDER BY owner, counter, key",
         )?;
-        let rows = statement
-            .query_map(params![owner.map(normalized_owner), counter], |row| {
-                Ok(CounterRow {
+        let raw = statement.query_map(params![owner.map(normalized_owner), counter], |row| {
+            Ok((
+                CounterRow {
                     owner: row.get(0)?,
                     counter: row.get(1)?,
                     key: row.get(2)?,
                     consumed: row.get(3)?,
                     period: row.get(4)?,
-                })
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
+                },
+                row.get::<_, rusqlite::types::Value>(5)?,
+            ))
+        })?;
+        let mut rows = Vec::new();
+        for row in raw {
+            let (mut row, payload) = row?;
+            row.key = protection::open_key(
+                self.protection.as_ref(),
+                "coord.counter.key",
+                &row.owner,
+                &row.counter,
+                &row.key,
+                &[&row.owner, &row.counter, &row.key],
+                payload,
+            )?;
+            rows.push(row);
+        }
+        rows.sort_by(|a, b| (&a.owner, &a.counter, &a.key).cmp(&(&b.owner, &b.counter, &b.key)));
         Ok(rows)
     }
 }
@@ -994,7 +1123,7 @@ fn normalized_owner(owner: &str) -> &str {
 #[cfg(feature = "native")]
 /// This store's schema generation. Bumped when its `CREATE TABLE` set
 /// changes in a way an older build cannot read.
-const SATELLITE_SCHEMA_VERSION: i64 = 1;
+const SATELLITE_SCHEMA_VERSION: i64 = 2;
 
 #[cfg(feature = "native")]
 fn ensure_partitioned_schema(connection: &Connection) -> StoreResult<()> {
@@ -1025,6 +1154,8 @@ fn ensure_partitioned_schema(connection: &Connection) -> StoreResult<()> {
     } else if !column_exists(connection, "counters", "owner")? {
         migrate_counters_table(connection)?;
     }
+
+    protection::initialize_payload_schema(connection)?;
 
     // Crash-atomicity marker (idempotent counter.consume / ledger.append). The
     // native coordination store is a physically separate SQLite database from

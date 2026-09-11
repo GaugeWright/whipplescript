@@ -10,6 +10,15 @@ use crate::{StoreError, StoreResult, STORE_BUSY_TIMEOUT};
 pub(crate) fn open(path: &Path, name: &str, version: i64) -> StoreResult<Connection> {
     let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
     connection.busy_timeout(STORE_BUSY_TIMEOUT)?;
+    validate(&connection, name, version)?;
+    connection.pragma_update(None, "foreign_keys", "ON")?;
+    // VACUUM INTO snapshots may use a rollback journal. Restoring the ordinary
+    // native WAL posture changes no logical records and creates no schema.
+    crate::establish_wal(&connection)?;
+    Ok(connection)
+}
+
+pub(crate) fn validate(connection: &Connection, name: &str, version: i64) -> StoreResult<()> {
     let (found, owner): (i64, String) = connection.query_row(
         "SELECT version, name FROM schema_migrations ORDER BY version DESC LIMIT 1",
         [],
@@ -31,11 +40,7 @@ pub(crate) fn open(path: &Path, name: &str, version: i64) -> StoreResult<Connect
     if integrity != "ok" {
         return Err(StoreError::fault("existing native store", integrity));
     }
-    connection.pragma_update(None, "foreign_keys", "ON")?;
-    // VACUUM INTO snapshots may use a rollback journal. Restoring the ordinary
-    // native WAL posture changes no logical records and creates no schema.
-    crate::establish_wal(&connection)?;
-    Ok(connection)
+    Ok(())
 }
 
 #[cfg(test)]

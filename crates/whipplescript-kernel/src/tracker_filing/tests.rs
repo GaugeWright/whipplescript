@@ -23,6 +23,9 @@ use crate::{
 use std::{cell::Cell, collections::BTreeMap};
 use whipplescript_store::{items::WorkItems, log_append::LogAppend, native_stores::NativeStores};
 
+#[path = "protected_stores.rs"]
+mod protected_stores;
+
 const SOURCE: &str = r#"
 workflow FileTask(learner: Learner) -> string
 class Learner { authority string }
@@ -403,8 +406,11 @@ impl TrackerExecutionAuthority for Authority {
 
 #[test]
 fn governed_tracker_filing_attributes_the_actor_and_settles_the_ordinary_continuation() {
-    for actor in ["person:learner", "agent:assistant"] {
-        let mut f = fixture(actor);
+    for (protected, actor) in [false, true]
+        .into_iter()
+        .flat_map(|protected| ["person:learner", "agent:assistant"].map(|actor| (protected, actor)))
+    {
+        let mut f = fixture_in(actor, protected_stores::memory(protected), |_| {});
         let authority = Authority::new(&f);
         let terminal = f
             .facade
@@ -760,7 +766,9 @@ fn governed_tracker_requires_a_writable_tracker_with_the_declared_selector() {
 
 #[test]
 fn governed_tracker_target_commit_recovers_after_restart_without_redispatch() {
-    for scenario in ["running", "expired", "absent", "disputed"] {
+    for (protected, scenario) in [false, true].into_iter().flat_map(|protected| {
+        ["running", "expired", "absent", "disputed"].map(|scenario| (protected, scenario))
+    }) {
         let expire = scenario != "running";
         let root = std::env::temp_dir().join(format!(
             "whip-tracker-interruption-{}-{}",
@@ -771,15 +779,13 @@ fn governed_tracker_target_commit_recovers_after_restart_without_redispatch() {
                 .as_nanos()
         ));
         std::fs::create_dir_all(&root).unwrap();
-        let open = || {
-            NativeStores::open(
-                root.join("runtime.sqlite"),
-                root.join("coord.sqlite"),
-                root.join("items.sqlite"),
-            )
-            .unwrap()
-        };
-        let mut f = fixture_in("person:learner", open(), |_| {});
+        let open = || protected_stores::reopen(&root, protected);
+        let mut f = fixture_in(
+            "person:learner",
+            protected_stores::create(&root, protected),
+            |_| {},
+        );
+        protected_stores::assert_sealed(&root, protected);
         let authority = Authority::new(&f);
         let fault = rusqlite::Connection::open(root.join("runtime.sqlite")).unwrap();
         fault
@@ -1041,6 +1047,7 @@ fn governed_tracker_target_commit_recovers_after_restart_without_redispatch() {
                 .iter()
                 .any(|fact| fact.name == "tracker.file.completed"));
             drop(f);
+            protected_stores::assert_sealed(&root, protected);
             std::fs::remove_dir_all(root).unwrap();
             continue;
         }
@@ -1181,6 +1188,7 @@ fn governed_tracker_target_commit_recovers_after_restart_without_redispatch() {
             after
         );
         drop(f);
+        protected_stores::assert_sealed(&root, protected);
         std::fs::remove_dir_all(root).unwrap();
     }
 }

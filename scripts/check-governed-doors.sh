@@ -14,7 +14,8 @@
 # that removes the caller.
 #
 # The pin is `file method expected-count` over `git grep -c "\.<method>("`
-# on tracked *.rs files under crates/. Method definitions (`fn <method>`)
+# on tracked and nonignored untracked *.rs files under crates/. New source
+# must be checked before its first commit too. Method definitions (`fn <method>`)
 # do not match the pattern, so trait declarations and impls stay free.
 set -Eeuo pipefail
 
@@ -45,6 +46,7 @@ crates/whipplescript-kernel/src/host_action.rs|admit_host_action|1
 crates/whipplescript-store/src/host_actions.rs|admit_host_action|9
 crates/whipplescript-store/src/lib.rs|admit_host_action|1
 crates/whipplescript-store/src/native_stores.rs|admit_host_action|1
+crates/whipplescript-store/src/runtime_protection/tests.rs|admit_host_action|5
 crates/whipplescript-host-do/src/do_store.rs|admit_host_action|2
 crates/whipplescript-host-do/src/do_store/host_actions.rs|admit_host_action|1
 crates/whipplescript-cli/src/host_runtime.rs|admit_host_action|2
@@ -89,6 +91,8 @@ crates/whipplescript-store/tests/mtarget_receipt_upgrade.rs|boundary_ref_evidenc
 
 # workstream_receipt_reports is a schema-test emitter over in-memory/fixture
 # stores only: no user-store argument, credentials, or additional host door.
+# runtime_protection/tests.rs is cfg(test) storage conformance: retained action
+# admission, erasure refusal, transaction failure, and repeated admission.
 
 # The DISPATCH half (DR-0091 W4): each host door must reach the kernel's one
 # choreography and one renderer. These are free functions, so the pattern has
@@ -127,7 +131,7 @@ for method in "${METHODS[@]}"; do
     while IFS=: read -r file count; do
         [ -n "$file" ] || continue
         observed+="${file}|${method}|${count}"$'\n'
-    done < <(git grep -c "\.${method}(" -- 'crates/*.rs' 2>/dev/null || true)
+    done < <(git grep --untracked --exclude-standard -c "\.${method}(" -- 'crates/*.rs' 2>/dev/null || true)
 done
 
 dispatch_observed=""
@@ -135,7 +139,7 @@ for name in "${DISPATCH[@]}"; do
     while IFS=: read -r file count; do
         [ -n "$file" ] || continue
         dispatch_observed+="${file}|${name}|${count}"$'\n'
-    done < <(git grep -c "${name}(" -- 'crates/*.rs' 2>/dev/null || true)
+    done < <(git grep --untracked --exclude-standard -c "${name}(" -- 'crates/*.rs' 2>/dev/null || true)
 done
 
 dispatch_expected_sorted="$(printf '%s\n' "$DISPATCH_PINNED" | sort)"

@@ -31,8 +31,25 @@ pub(crate) fn native(
     expected: &ClaimableEffect,
 ) -> StoreResult<()> {
     use rusqlite::OptionalExtension;
+    // The hosted projection remains plain SQL. Native payloads must be opened
+    // with the coordinate of the version that supplied each optional profile.
+    let select = r#"
+        SELECT candidate.effect_id, candidate.kind, candidate.target, candidate.profile,
+            whip_payload_open('runtime.effects.input_json', candidate.effect_id, candidate.input_json),
+            candidate.required_capabilities,
+            COALESCE(
+                whip_payload_open('runtime.program_versions.declared_profiles', effect_versions.version_id, effect_versions.declared_profiles),
+                whip_payload_open('runtime.program_versions.declared_profiles', active_versions.version_id, active_versions.declared_profiles),
+                '[]'
+            ) AS declared_profiles
+        FROM effects AS candidate
+        LEFT JOIN instances ON instances.instance_id = candidate.instance_id
+        LEFT JOIN program_versions AS active_versions ON active_versions.version_id = instances.version_id
+        LEFT JOIN program_versions AS effect_versions ON effect_versions.version_id = candidate.program_version_id
+        WHERE candidate.instance_id = ?1 AND candidate.effect_id = ?2
+    "#;
     let observed = connection
-        .query_row(SELECT, [instance, effect_id], |row| {
+        .query_row(select, [instance, effect_id], |row| {
             Ok(ClaimableEffect {
                 effect_id: row.get(0)?,
                 kind: row.get(1)?,

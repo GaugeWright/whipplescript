@@ -215,7 +215,7 @@ pub(crate) fn append_fact(
         recorded.as_ref().map(|(_, _, provider)| provider.as_str()),
     )?;
     let active = connection.query_row(
-        "SELECT 1 FROM facts WHERE instance_id = ?1 AND name = ?2 AND key = ?3 AND consumed_at IS NULL",
+        "SELECT 1 FROM facts WHERE instance_id = ?1 AND name = ?2 AND key = whip_runtime_fact_key(?3) AND consumed_at IS NULL",
         [completion.instance_id, fact.name, completion.effect_id], |_| Ok(()),
     ).optional()?.is_some();
     fact.require_fresh_fact(active)?;
