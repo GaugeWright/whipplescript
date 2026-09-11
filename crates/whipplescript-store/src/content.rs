@@ -17,6 +17,7 @@
 #[cfg(feature = "native")]
 use std::path::Path;
 
+pub mod preparation;
 pub mod publication;
 
 #[cfg(feature = "native")]
@@ -145,6 +146,18 @@ pub trait ContentBlobs {
     /// Ids are unchanged for text: the digest was always taken over
     /// `as_bytes()`.
     fn put(&self, body: &[u8]) -> crate::StoreResult<String>;
+    /// Prepare derived bytes only if their identity has never been erased in
+    /// this authority. The erasure check and durable put share one exclusion.
+    /// This is preparation, not publication, authorization or an erasure bypass.
+    /// An adapter must implement this atomically or refuse; checking `status`
+    /// before ordinary `put` is insufficient because an eraser can intervene.
+    #[allow(clippy::needless_return)]
+    fn put_unerased(&self, _body: &[u8]) -> crate::StoreResult<String> {
+        const UNSUPPORTED: &str = "content authority does not support erasure-aware preparation";
+        // MUTATION-SUCCESS-EXPR: Ok(crate::stable_hash_bytes_hex(_body))
+        return Err(crate::StoreError::Conflict(UNSUPPORTED.into()));
+    }
+
     /// Read the full stored bytes for a content id, or `None` if unknown.
     fn get(&self, id: &str) -> crate::StoreResult<Option<Vec<u8>>>;
     /// Store UTF-8 text. The text tier over the byte seam.
@@ -514,6 +527,10 @@ impl ContentStore {
 
 #[cfg(feature = "native")]
 impl ContentBlobs for ContentStore {
+    fn put_unerased(&self, body: &[u8]) -> StoreResult<String> {
+        preparation::native_prepare(self, body)
+    }
+
     fn cached_read_available(&self, id: &str) -> StoreResult<bool> {
         // One SQLite observation proves a plain payload exists. In particular,
         // do not observe a live root and then infer "plain" from missing chunk

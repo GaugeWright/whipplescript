@@ -181,6 +181,19 @@ mod tests {
         }
     }
 
+    #[test]
+    fn external_byte_preparation_preserves_erasure() {
+        whipplescript_store::content::preparation::conformance::check(|| {
+            let mut content = crate::do_branches::DoContentBlobs::with_external_bytes(
+                RusqliteDoSql::in_memory(),
+                Box::new(MemObjects::default()),
+            )
+            .unwrap();
+            content.set_threshold_bytes(0);
+            content
+        });
+    }
+
     /// The synchronous-store path, run against the shared suite.
     ///
     /// Deliberately NOT the durable object's deployed shape: that host records

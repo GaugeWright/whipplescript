@@ -1609,6 +1609,18 @@ impl<S: DoSql> DoContentBlobs<S> {
 }
 
 impl<S: DoSql> ContentBlobs for DoContentBlobs<S> {
+    fn put_unerased(&self, body: &[u8]) -> StoreResult<String> {
+        crate::do_store::recovery::atomic_result(&self.sql, false, &mut || {
+            let id = whipplescript_store::stable_hash_bytes_hex(body);
+            let erased = self.sql.query(
+                "SELECT byte_len FROM content_erasure_ledger WHERE id = ?1 ORDER BY sequence LIMIT 1",
+                &[text(&id)],
+            ).map_err(sql_err)?;
+            whipplescript_store::content::preparation::require_unerased(!erased.is_empty())?;
+            self.put(body)
+        })
+    }
+
     fn publish_retained<T>(
         &self,
         ids: &[String],

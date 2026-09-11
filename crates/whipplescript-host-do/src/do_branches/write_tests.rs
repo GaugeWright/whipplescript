@@ -244,3 +244,56 @@ fn hosted_scoped_save_adapter_preserves_original_evidence() {
         super::compose_vcs(&RusqliteDoSql::with_runtime_schema()).expect("hosted workspace")
     });
 }
+
+#[test]
+fn hosted_preparation_preserves_erasure() {
+    whipplescript_store::content::preparation::conformance::check(|| {
+        DoContentBlobs::new(RusqliteDoSql::with_runtime_schema()).expect("content authority")
+    });
+}
+
+#[test]
+fn hosted_preparation_rolls_back_failed_sql_before_publication() {
+    use std::rc::Rc;
+    let mut refusals = 0;
+    let mut completed = false;
+    for fail_at in 1..24 {
+        let sql = Rc::new(RusqliteDoSql::with_runtime_schema());
+        let content = DoContentBlobs::new(sql.clone()).unwrap();
+        let injected = Rc::new(FaultySql::new(sql, fail_at));
+        let preparing = DoContentBlobs {
+            sql: injected.clone(),
+            external: None,
+            threshold_bytes: crate::DEFAULT_TIER_THRESHOLD_BYTES,
+        };
+        let result = preparing.put_unerased(b"derived input");
+        injected.disarm();
+        match result {
+            Ok(id) => {
+                assert_eq!(
+                    content.get(&id).unwrap().as_deref(),
+                    Some(b"derived input".as_slice())
+                );
+                completed = true;
+                break;
+            }
+            Err(_) => {
+                refusals += 1;
+                assert!(content
+                    .get(&whipplescript_store::stable_hash_bytes_hex(
+                        b"derived input"
+                    ))
+                    .unwrap()
+                    .is_none());
+            }
+        }
+    }
+    assert!(
+        refusals >= 2,
+        "exercise both the erasure query and byte insert"
+    );
+    assert!(
+        completed,
+        "fault sweep must reach a real successful preparation"
+    );
+}
