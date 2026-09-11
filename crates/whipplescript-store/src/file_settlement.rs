@@ -1,6 +1,7 @@
 //! A local effect terminal and its ordinary workflow fact are one transaction.
 //! File APIs retain their shipped names; resolution recording shares this
-//! transaction with an exact provider/target profile. Target application remains
+//! transaction with an exact provider/target profile. Tracker filing uses its
+//! existing queue provider. Target application remains
 //! a separate boundary; this primitive never repeats I/O.
 use crate::{EffectCompletion, NewFact, StoreError, StoreResult};
 
@@ -18,20 +19,69 @@ pub type LocalEffectSettlementFact<'a> = FileSettlementFact<'a>;
 
 pub const RESOLUTION_RECORDING_PROVIDER: &str = "resolution-memory";
 pub const RESOLUTION_RECORDING_CAPABILITY: &str = "vcs.record_resolutions";
+pub const TRACKER_PROVIDER: &str = "queue";
+pub const TRACKER_WAIT_PROVIDER: &str = "builtin-tracker";
+pub const TRACKER_WAIT_CAPABILITY: &str = "tracker.wait_closed";
+
+/// A fixed, local closure observation. This cannot wrap arbitrary provider I/O.
+/// The kernel supplies its current observed-execution grant separately at dispatch.
+pub struct TrackerWaitSettlement<'a> {
+    pub completion: EffectCompletion<'a>,
+    pub diagnostic: Option<crate::TerminalDiagnosticRecord>,
+    pub fact: LocalEffectSettlementFact<'a>,
+}
+
+impl TrackerWaitSettlement<'_> {
+    pub fn validate(
+        &self,
+        run: crate::RunStart<'_>,
+        expected: &crate::ClaimableEffect,
+    ) -> StoreResult<()> {
+        self.fact.validate(self.completion)?;
+        if expected.kind != "capability.call"
+            || expected.target.as_deref() != Some(TRACKER_WAIT_CAPABILITY)
+            || run.provider != TRACKER_WAIT_PROVIDER
+            || self.completion.provider != run.provider
+            || self.completion.instance_id != run.instance_id
+            || self.completion.effect_id != run.effect_id
+            || expected.effect_id != run.effect_id
+            || self.completion.run_id != run.run_id
+            || self.completion.worker_id != run.worker_id
+        {
+            return Err(StoreError::Conflict(
+                "atomic tracker wait does not bind its dispatch".into(),
+            ));
+        }
+        Ok(())
+    }
+}
 
 impl<'a> FileSettlementFact<'a> {
     pub fn validate(&self, completion: EffectCompletion<'_>) -> StoreResult<()> {
         let value: serde_json::Value = serde_json::from_str(self.value_json)?;
         let metadata: serde_json::Value = serde_json::from_str(completion.metadata_json)?;
         let recording = completion.provider == RESOLUTION_RECORDING_PROVIDER;
-        let valid_name = if recording {
+        let tracker = completion.provider == TRACKER_PROVIDER;
+        let tracker_wait = completion.provider == TRACKER_WAIT_PROVIDER;
+        let valid_name = if tracker_wait {
+            self.name
+                == if completion.status == "completed" {
+                    "capability.call.succeeded"
+                } else {
+                    "capability.call.failed"
+                }
+        } else if recording {
             self.name == format!("capability.call.{}", completion.status)
+        } else if tracker {
+            ["tracker.file", "tracker.finish"]
+                .iter()
+                .any(|kind| self.name == format!("{kind}.{}", completion.status))
         } else {
             ["file.read", "file.write", "file.import", "file.export"]
                 .iter()
                 .any(|kind| self.name == format!("{kind}.{}", completion.status))
         };
-        if (!recording && completion.provider != "files")
+        if (!recording && !tracker && !tracker_wait && completion.provider != "files")
             || !matches!(completion.status, "completed" | "failed")
             || !valid_name
             || self.fact_id.trim().is_empty()
@@ -43,7 +93,7 @@ impl<'a> FileSettlementFact<'a> {
                 != Some(completion.effect_id)
             || value.get("run_id").and_then(serde_json::Value::as_str) != Some(completion.run_id)
             || value.get("status").and_then(serde_json::Value::as_str) != Some(completion.status)
-            || ((completion.status == "completed" || recording)
+            || ((completion.status == "completed" || recording || tracker || tracker_wait)
                 && (value.get("value").is_none() || value.get("value") != metadata.get("value")))
         {
             return Err(StoreError::Conflict(
@@ -71,10 +121,26 @@ impl<'a> FileSettlementFact<'a> {
         recorded_target: Option<&str>,
         recorded_provider: Option<&str>,
     ) -> StoreResult<()> {
-        self.check_kind(completion.status, recorded_kind)?;
+        let fact_status =
+            if completion.provider == TRACKER_WAIT_PROVIDER && completion.status == "completed" {
+                "succeeded"
+            } else {
+                completion.status
+            };
+        self.check_kind(fact_status, recorded_kind)?;
         if recorded_provider != Some(completion.provider)
             || (completion.provider == RESOLUTION_RECORDING_PROVIDER
                 && recorded_target != Some(RESOLUTION_RECORDING_CAPABILITY))
+            || (completion.provider == TRACKER_PROVIDER
+                && !match recorded_kind {
+                    Some("tracker.file") => {
+                        recorded_target.is_some_and(|queue| !queue.trim().is_empty())
+                    }
+                    Some("tracker.finish") => recorded_target.is_none(),
+                    _ => false,
+                })
+            || (completion.provider == TRACKER_WAIT_PROVIDER
+                && recorded_target != Some(TRACKER_WAIT_CAPABILITY))
         {
             return Err(StoreError::Conflict(
                 "local settlement differs from the recorded target or run provider".into(),
@@ -193,6 +259,19 @@ pub mod conformance {
     }
 
     impl Fixture {
+        pub fn run(&self) -> crate::RunStart<'_> {
+            crate::RunStart {
+                instance_id: &self.instance,
+                effect_id: "settle-effect",
+                run_id: "settle-run",
+                provider: &self.provider,
+                worker_id: "fixture",
+                lease_id: "settle-lease",
+                lease_expires_at: "2030-01-01T00:00:00Z",
+                metadata_json: "{}",
+            }
+        }
+
         pub fn completion(&self) -> EffectCompletion<'_> {
             EffectCompletion {
                 instance_id: &self.instance,
@@ -248,7 +327,34 @@ pub mod conformance {
         setup_profile(store, "capability.call", status, provider, target)
     }
 
-    fn setup_profile(
+    pub(super) fn setup_profile(
+        store: &mut impl RuntimeStore,
+        kind: &str,
+        status: &str,
+        provider: &str,
+        target: Option<&str>,
+    ) -> Fixture {
+        setup_profile_metadata(store, kind, status, provider, target, "{}")
+    }
+
+    pub(crate) fn setup_profile_metadata(
+        store: &mut impl RuntimeStore,
+        kind: &str,
+        status: &str,
+        provider: &str,
+        target: Option<&str>,
+        metadata: &str,
+    ) -> Fixture {
+        let fixture = setup_profile_queued(store, kind, status, provider, target);
+        let mut run = fixture.run();
+        run.metadata_json = metadata;
+        store
+            .start_dispatch(run)
+            .expect("settlement fixture dispatch");
+        fixture
+    }
+
+    pub(crate) fn setup_profile_queued(
         store: &mut impl RuntimeStore,
         kind: &str,
         status: &str,
@@ -319,24 +425,12 @@ pub mod conformance {
                 context_json: None,
             })
             .expect("settlement fixture operation");
-        store
-            .start_dispatch(RunStart {
-                instance_id: &instance,
-                effect_id: "settle-effect",
-                run_id: "settle-run",
-                provider,
-                worker_id: "fixture",
-                lease_id: "settle-lease",
-                lease_expires_at: "2030-01-01T00:00:00Z",
-                metadata_json: "{}",
-            })
-            .expect("settlement fixture operation");
         Fixture { instance, provider: provider.into(), name: format!("{kind}.{status}"), status: status.into(),
             value: serde_json::json!({"effect_id":"settle-effect", "run_id":"settle-run", "status":status,
                 "value":{"bytes":4}}).to_string() }
     }
 
-    fn assert_refusal_evidence(
+    pub(super) fn assert_refusal_evidence(
         store: &impl RuntimeStore,
         fixture: &Fixture,
         before: &[EventView],
@@ -610,6 +704,12 @@ pub mod conformance {
 
 #[doc(hidden)]
 pub mod recording_conformance;
+
+#[doc(hidden)]
+pub mod tracker_conformance;
+
+#[doc(hidden)]
+pub mod wait_conformance;
 
 #[cfg(all(test, feature = "native"))]
 mod tests;

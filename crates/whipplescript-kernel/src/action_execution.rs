@@ -33,6 +33,51 @@ fn is_action(instance: &str) -> bool {
 }
 
 impl<S: RuntimeStore> RuntimeKernel<S> {
+    pub(crate) fn execute_verified_tracker_closure(
+        &mut self,
+        verified: VerifiedActionExecution,
+        closure: &whipplescript_store::tracker_closure::TrackerClosure,
+        binding: &crate::tracker_closure::TrackerClosureBinding,
+    ) -> StoreResult<StoredEvent>
+    where
+        S: whipplescript_store::tracker_closure::TrackerClosures
+            + whipplescript_store::items::WorkItems
+            + whipplescript_store::vcs::FrontierRead,
+    {
+        let instance = verified.request().admission.instance_ref.clone();
+        let effect = verified.observed().clone();
+        self.action_execution = Some(verified);
+        let mut scope = ExecutionScope(self);
+        crate::tracker_closure::run(&mut scope, &instance, &effect, closure, binding)
+    }
+
+    pub(crate) fn execute_verified_tracker_wait(
+        &mut self,
+        verified: VerifiedActionExecution,
+    ) -> StoreResult<StoredEvent> {
+        let instance = verified.request().admission.instance_ref.clone();
+        let effect = verified.observed().clone();
+        self.action_execution = Some(verified);
+        let mut scope = ExecutionScope(self);
+        crate::tracker_wait::run_governed(&mut scope, &instance, &effect)
+    }
+
+    pub(crate) fn execute_verified_tracker_filing(
+        &mut self,
+        verified: VerifiedActionExecution,
+        filing: &whipplescript_store::tracker_filing::TrackerFiling,
+        binding: &crate::tracker_filing::TrackerBinding,
+    ) -> StoreResult<StoredEvent>
+    where
+        S: whipplescript_store::tracker_filing::TrackerFilings,
+    {
+        let instance = verified.request().admission.instance_ref.clone();
+        let effect = verified.observed().clone();
+        self.action_execution = Some(verified);
+        let mut scope = ExecutionScope(self);
+        crate::tracker_filing::run(&mut scope, &instance, &effect, filing, binding)
+    }
+
     pub(crate) fn refuse_unverified_action_dispatch(&self, run: RunStart<'_>) -> StoreResult<()> {
         if is_action(run.instance_id) {
             return Err(StoreError::Conflict(

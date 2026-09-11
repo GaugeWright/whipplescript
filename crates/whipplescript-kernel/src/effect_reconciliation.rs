@@ -144,7 +144,7 @@ fn receipt(
     })
 }
 
-fn checked_prefix(
+pub(crate) fn checked_prefix(
     instance: &str,
     prefix: &[OwnedChainEntry],
 ) -> Result<whipplescript_store::event_chain::ChainHead, HostFacadeError> {

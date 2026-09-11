@@ -41,6 +41,9 @@ use crate::StoreResult;
 #[cfg(feature = "native")]
 mod filing;
 
+#[cfg(feature = "native")]
+mod closure;
+
 /// The active-lease predicate, shared by every readiness/overlay query: a lease
 /// is active while it has not been released and has not expired. A NULL
 /// `expires_at` models a lease with no TTL (the old builtin "no TTL backstop"
@@ -225,7 +228,7 @@ pub struct IssueConflicts {
 #[cfg(feature = "native")]
 /// This store's schema generation. Bumped when its `CREATE TABLE` set changes
 /// in a way an older build cannot read.
-const SATELLITE_SCHEMA_VERSION: i64 = 2;
+const SATELLITE_SCHEMA_VERSION: i64 = 3;
 
 impl IssueConflicts {
     #[must_use]
@@ -297,6 +300,18 @@ pub struct WorkItemStore {
 
 #[cfg(feature = "native")]
 impl WorkItemStore {
+    /// Open only a current existing work-item store. Checks its owning stamp and
+    /// SQLite integrity, establishes WAL, and never creates or repairs schema.
+    /// Missing schema required by an operation remains an error when used.
+    pub fn open_existing(path: impl AsRef<Path>) -> StoreResult<Self> {
+        let connection =
+            crate::native_existing::open(path.as_ref(), "work-item", SATELLITE_SCHEMA_VERSION)?;
+        Ok(Self {
+            connection,
+            event_effect_id: None,
+        })
+    }
+
     pub fn open(path: impl AsRef<Path>) -> StoreResult<Self> {
         if let Some(parent) = path.as_ref().parent() {
             if !parent.as_os_str().is_empty() {
@@ -322,6 +337,7 @@ impl WorkItemStore {
         // downgrade guard, so an older binary read a newer file as whatever
         // it parsed. `SqliteStore` has refused that since Phase B.
         crate::stamp_satellite_schema(&connection, "work-item", SATELLITE_SCHEMA_VERSION)?;
+        connection.execute_batch(crate::tracker_closure::SCHEMA)?;
         // Self-heal a pre-phase-B `tracker_events` (the ADR-0002 v1 linear log
         // had neither column): `CREATE TABLE IF NOT EXISTS` never alters an
         // existing table, so add the Merkle-DAG columns before the unique index
@@ -2601,6 +2617,17 @@ fn tx_release_active_lease(
     effect_id: Option<&str>,
     now: &str,
 ) -> StoreResult<bool> {
+    tx_release_active_lease_by(tx, item_id, effect_id, None, now)
+}
+
+#[cfg(feature = "native")]
+fn tx_release_active_lease_by(
+    tx: &Transaction<'_>,
+    item_id: &str,
+    effect_id: Option<&str>,
+    event_actor: Option<&str>,
+    now: &str,
+) -> StoreResult<bool> {
     let lease: Option<(String, String)> = tx
         .query_row(
             &format!(
@@ -2614,12 +2641,13 @@ fn tx_release_active_lease(
     match lease {
         None => Ok(false),
         Some((lease_id, actor)) => {
-            tx_mark_lease_released(
+            tx_mark_lease_released_by(
                 tx,
                 &lease_id,
                 item_id,
                 "claim.released",
                 &actor,
+                event_actor.unwrap_or(&actor),
                 effect_id,
                 now,
             )?;
@@ -2639,13 +2667,28 @@ fn tx_mark_lease_released(
     effect_id: Option<&str>,
     now: &str,
 ) -> StoreResult<()> {
+    tx_mark_lease_released_by(tx, lease_id, item_id, kind, actor, actor, effect_id, now)
+}
+
+#[cfg(feature = "native")]
+#[allow(clippy::too_many_arguments)]
+fn tx_mark_lease_released_by(
+    tx: &Transaction<'_>,
+    lease_id: &str,
+    item_id: &str,
+    kind: &str,
+    actor: &str,
+    event_actor: &str,
+    effect_id: Option<&str>,
+    now: &str,
+) -> StoreResult<()> {
     let payload = json!({"lease_id": lease_id, "actor": actor, "released_at": now});
     tx_append_event(
         tx,
         Some(item_id),
         kind,
         &payload,
-        Some(actor),
+        Some(event_actor),
         effect_id,
         now,
     )?;

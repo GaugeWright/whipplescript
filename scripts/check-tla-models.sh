@@ -4,6 +4,8 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 LENGTH="${WHIPPLESCRIPT_TLA_LENGTH:-6}"
 
+python3 "$ROOT/scripts/check-tracker-result-delivery.py"
+
 if command -v apalache-mc >/dev/null 2>&1; then
   APALACHE=(apalache-mc)
 else

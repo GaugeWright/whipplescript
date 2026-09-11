@@ -30,7 +30,9 @@
 mod dispatch;
 mod host_actions;
 pub(crate) mod recovery;
+mod tracker_closure;
 mod tracker_filing;
+mod tracker_result;
 pub(crate) mod transaction;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -870,7 +872,7 @@ impl<Sql: DoSql> DoSqliteStore<Sql> {
         let updated_run = self
             .sql
             .execute(
-                "UPDATE runs SET status = ?1, completed_at = CURRENT_TIMESTAMP, exit_code = ?2, \
+                "UPDATE runs SET status = ?1, completed_at = (SELECT occurred_at FROM events WHERE event_id = ?8), exit_code = ?2, \
                  summary = ?3, metadata_json = ?4 \
                  WHERE run_id = ?5 AND effect_id = ?6 AND instance_id = ?7 AND status = 'running'",
                 &[
@@ -881,6 +883,7 @@ impl<Sql: DoSql> DoSqliteStore<Sql> {
                     text(completion.run_id),
                     text(completion.effect_id),
                     text(completion.instance_id),
+                    text(&event.event_id),
                 ],
             )
             .map_err(sql_err)?;
@@ -2291,7 +2294,7 @@ fn do_replay_rule_commit<Sql: DoSql>(
             .and_then(Value::as_i64)
             .unwrap_or(commit_revision_epoch);
         let new_effect = NewEffect {
-            timeout_seconds: None,
+            timeout_seconds: effect.get("timeout_seconds").and_then(Value::as_i64),
             effect_id: effect
                 .get("effect_id")
                 .and_then(Value::as_str)
@@ -2586,6 +2589,7 @@ fn do_replay_revision_activation<Sql: DoSql>(
 fn do_replay_run_started<Sql: DoSql>(
     sql: &Sql,
     instance_id: &str,
+    event_id: &str,
     payload_json: &str,
 ) -> StoreResult<()> {
     let payload: Value = serde_json::from_str(payload_json)?;
@@ -2626,11 +2630,12 @@ fn do_replay_run_started<Sql: DoSql>(
     .map_err(sql_err)?;
     sql.execute(
         "INSERT INTO runs (run_id, effect_id, instance_id, provider, worker_id, status, \
-         metadata_json) VALUES (?1, ?2, ?3, ?4, ?5, 'running', ?6) ON CONFLICT(run_id) DO UPDATE SET \
+         metadata_json, started_at) VALUES (?1, ?2, ?3, ?4, ?5, 'running', ?6, \
+         (SELECT occurred_at FROM events WHERE event_id = ?7)) ON CONFLICT(run_id) DO UPDATE SET \
          effect_id = excluded.effect_id, instance_id = excluded.instance_id, \
          provider = excluded.provider, worker_id = excluded.worker_id, status = 'running', \
-         completed_at = NULL, exit_code = NULL, summary = NULL, metadata_json = excluded.metadata_json",
-        &[text(run_id), text(effect_id), text(instance_id), text(provider), text(worker_id), text(&metadata_json)],
+         started_at = excluded.started_at, completed_at = NULL, exit_code = NULL, summary = NULL, metadata_json = excluded.metadata_json",
+        &[text(run_id), text(effect_id), text(instance_id), text(provider), text(worker_id), text(&metadata_json), text(event_id)],
     )
     .map_err(sql_err)?;
     sql.execute(
@@ -2679,11 +2684,13 @@ fn do_replay_effect_terminal<Sql: DoSql>(
     if !run_id.is_empty() {
         sql.execute(
             "INSERT INTO runs (run_id, effect_id, instance_id, provider, worker_id, status, \
-             completed_at, exit_code, summary, metadata_json) VALUES \
-             (?1, ?2, ?3, ?4, ?5, ?6, CURRENT_TIMESTAMP, ?7, ?8, ?9) ON CONFLICT(run_id) DO UPDATE SET \
+             started_at, completed_at, exit_code, summary, metadata_json) VALUES \
+             (?1, ?2, ?3, ?4, ?5, ?6, \
+             (SELECT occurred_at FROM events WHERE event_id = ?10), \
+             (SELECT occurred_at FROM events WHERE event_id = ?10), ?7, ?8, ?9) ON CONFLICT(run_id) DO UPDATE SET \
              effect_id = excluded.effect_id, instance_id = excluded.instance_id, \
              provider = excluded.provider, worker_id = excluded.worker_id, status = excluded.status, \
-             completed_at = CURRENT_TIMESTAMP, exit_code = excluded.exit_code, \
+             completed_at = excluded.completed_at, exit_code = excluded.exit_code, \
              summary = excluded.summary, metadata_json = excluded.metadata_json",
             &[
                 text(run_id),
@@ -2695,6 +2702,7 @@ fn do_replay_effect_terminal<Sql: DoSql>(
                 payload.get("exit_code").and_then(Value::as_i64).map_or(SqlValue::Null, int),
                 opt_text(payload.get("summary").and_then(Value::as_str)),
                 text(&metadata_json),
+                text(event_id),
             ],
         )
         .map_err(sql_err)?;
@@ -2745,6 +2753,7 @@ fn do_replay_effect_cancelled<Sql: DoSql>(
 fn do_replay_lease_expired<Sql: DoSql>(
     sql: &Sql,
     instance_id: &str,
+    event_id: &str,
     payload_json: &str,
 ) -> StoreResult<()> {
     let payload: Value = serde_json::from_str(payload_json)?;
@@ -2766,9 +2775,9 @@ fn do_replay_lease_expired<Sql: DoSql>(
     )
     .map_err(sql_err)?;
     sql.execute(
-        "UPDATE runs SET status = 'lease_expired', completed_at = CURRENT_TIMESTAMP \
+        "UPDATE runs SET status = 'lease_expired', completed_at = (SELECT occurred_at FROM events WHERE event_id = ?2) \
          WHERE run_id = ?1 AND status = 'running'",
-        &[text(run_id)],
+        &[text(run_id), text(event_id)],
     )
     .map_err(sql_err)?;
     sql.execute(
@@ -2900,7 +2909,7 @@ fn rule_commit_payload(
             if let Some(source_span_json) = effect.source_span_json {
                 serde_json::from_str::<Value>(source_span_json)?;
             }
-            Ok(serde_json::json!({
+            let mut recorded = serde_json::json!({
                 "effect_id": effect.effect_id,
                 "kind": effect.kind,
                 "target": effect.target,
@@ -2916,7 +2925,13 @@ fn rule_commit_payload(
                     .map(serde_json::from_str::<Value>)
                     .transpose()?
                     .unwrap_or(Value::Null),
-            }))
+            });
+            // Omit absent timeouts to preserve existing untimed commit identities.
+            // A timed effect must carry its bound in the authoritative event.
+            if let Some(timeout) = effect.timeout_seconds {
+                recorded["timeout_seconds"] = serde_json::json!(timeout);
+            }
+            Ok(recorded)
         })
         .collect::<StoreResult<Vec<_>>>()?;
     let dependencies = commit
@@ -3821,7 +3836,7 @@ impl<Sql: DoSql> DoSqliteStore<Sql> {
                      'workflow.failed', \
                      'instance.transitioned', 'workflow.revision_activated', 'effect.run_started', \
                      'effect.terminal', 'effect.cancelled', 'effect.cancellation_requested', \
-                     'lease.expired', 'context.restored'){bound_clause} ORDER BY sequence"
+                     'lease.expired', 'tracker.filing.result_delivered', 'tracker.closing.result_delivered', 'context.restored'){bound_clause} ORDER BY sequence"
                 ),
                 &[text(instance_id)],
             )
@@ -3902,10 +3917,36 @@ impl<Sql: DoSql> DoSqliteStore<Sql> {
                     idempotency_key.as_deref(),
                 )?,
                 "effect.run_started" => {
-                    do_replay_run_started(&self.sql, instance_id, &payload_json)?
+                    do_replay_run_started(&self.sql, instance_id, &event_id, &payload_json)?
                 }
                 "effect.terminal" => {
                     do_replay_effect_terminal(&self.sql, instance_id, &event_id, &payload_json)?
+                }
+                whipplescript_store::tracker_result::DELIVERY_EVENT if source == "kernel" => {
+                    tracker_result::apply_result(
+                        &self.sql,
+                        instance_id,
+                        &event_id,
+                        &serde_json::from_str::<
+                            whipplescript_store::tracker_result::RecordedTrackerResult,
+                        >(&payload_json)?
+                        .into_delivered(),
+                    )?
+                }
+                whipplescript_store::tracker_result::CLOSING_DELIVERY_EVENT
+                    if source == "kernel" =>
+                {
+                    tracker_result::apply_result(
+                        &self.sql,
+                        instance_id,
+                        &event_id,
+                        &serde_json::from_str::<
+                            whipplescript_store::tracker_result::RecordedTrackerResult<
+                                whipplescript_store::tracker_result::TrackerClosureResultDelivery,
+                            >,
+                        >(&payload_json)?
+                        .into_delivered(),
+                    )?
                 }
                 "effect.cancelled" => {
                     do_replay_effect_cancelled(&self.sql, instance_id, &event_id, &payload_json)?
@@ -3918,7 +3959,9 @@ impl<Sql: DoSql> DoSqliteStore<Sql> {
                     idempotency_key.as_deref(),
                     causation_id.as_deref(),
                 )?,
-                "lease.expired" => do_replay_lease_expired(&self.sql, instance_id, &payload_json)?,
+                "lease.expired" => {
+                    do_replay_lease_expired(&self.sql, instance_id, &event_id, &payload_json)?
+                }
                 _ => {}
             }
         }
@@ -4186,6 +4229,70 @@ fn do_insert_program_version<Sql: DoSql>(
         .first()
         .map(|r| as_text(&r[0]))
         .ok_or_else(|| sql_err("program_version row missing after insert".to_string()))
+}
+
+impl<Sql: DoSql> DoSqliteStore<Sql> {
+    fn settle_local_effect_on(
+        &self,
+        completion: EffectCompletion<'_>,
+        diagnostic: Option<TerminalDiagnosticRecord>,
+        fact: whipplescript_store::file_settlement::FileSettlementFact<'_>,
+    ) -> StoreResult<StoredEvent> {
+        let terminal =
+            self.complete_effect_terminal_on(completion, diagnostic.clone(), completion.status)?;
+        let recorded = self
+            .sql
+            .query(
+                "SELECT e.kind, e.target, r.provider FROM effects e JOIN runs r \
+             ON r.instance_id = e.instance_id AND r.effect_id = e.effect_id \
+             WHERE e.instance_id = ?1 AND e.effect_id = ?2 AND r.run_id = ?3",
+                &[
+                    text(completion.instance_id),
+                    text(completion.effect_id),
+                    text(completion.run_id),
+                ],
+            )
+            .map_err(sql_err)?;
+        let kind = recorded.first().map(|row| as_text(&row[0]));
+        let target = recorded.first().and_then(|row| as_opt_text(&row[1]));
+        let provider = recorded.first().map(|row| as_text(&row[2]));
+        fact.check_effect(
+            completion,
+            kind.as_deref(),
+            target.as_deref(),
+            provider.as_deref(),
+        )?;
+        let active = self.sql.query(
+            "SELECT 1 FROM facts WHERE instance_id = ?1 AND name = ?2 AND key = ?3 AND consumed_at IS NULL",
+            &[text(completion.instance_id), text(fact.name), text(completion.effect_id)],
+        ).map_err(sql_err)?;
+        fact.require_fresh_fact(!active.is_empty())?;
+
+        let payload = fact.payload(completion.effect_id)?;
+        let event = do_append_event(
+            &self.sql,
+            NewEvent {
+                instance_id: completion.instance_id,
+                event_type: "fact.derived",
+                payload_json: &payload,
+                source: "kernel",
+                causation_id: Some(&terminal.event_id),
+                correlation_id: None,
+                idempotency_key: Some(fact.event_key),
+            },
+        )?;
+        let (version, epoch) = do_active_revision(&self.sql, completion.instance_id)?;
+        do_insert_fact(
+            &self.sql,
+            completion.instance_id,
+            "kernel",
+            &event.event_id,
+            version.as_deref(),
+            epoch,
+            &fact.fact(completion.effect_id),
+        )?;
+        Ok(terminal)
+    }
 }
 
 impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
@@ -5149,65 +5256,26 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
     ) -> StoreResult<StoredEvent> {
         fact.validate(completion)?;
         let outcome = recovery::atomic_result(&self.sql, false, &mut || {
-            let terminal = self.complete_effect_terminal_on(
-                completion,
-                diagnostic.clone(),
-                completion.status,
-            )?;
-            let recorded = self
-                .sql
-                .query(
-                    "SELECT e.kind, e.target, r.provider FROM effects e JOIN runs r \
-                 ON r.instance_id = e.instance_id AND r.effect_id = e.effect_id \
-                 WHERE e.instance_id = ?1 AND e.effect_id = ?2 AND r.run_id = ?3",
-                    &[
-                        text(completion.instance_id),
-                        text(completion.effect_id),
-                        text(completion.run_id),
-                    ],
-                )
-                .map_err(sql_err)?;
-            let kind = recorded.first().map(|row| as_text(&row[0]));
-            let target = recorded.first().and_then(|row| as_opt_text(&row[1]));
-            let provider = recorded.first().map(|row| as_text(&row[2]));
-            fact.check_effect(
-                completion,
-                kind.as_deref(),
-                target.as_deref(),
-                provider.as_deref(),
-            )?;
-            let active = self.sql.query(
-                "SELECT 1 FROM facts WHERE instance_id = ?1 AND name = ?2 AND key = ?3 AND consumed_at IS NULL",
-                &[text(completion.instance_id), text(fact.name), text(completion.effect_id)],
-            ).map_err(sql_err)?;
-            fact.require_fresh_fact(!active.is_empty())?;
-
-            let payload = fact.payload(completion.effect_id)?;
-            let event = do_append_event(
-                &self.sql,
-                NewEvent {
-                    instance_id: completion.instance_id,
-                    event_type: "fact.derived",
-                    payload_json: &payload,
-                    source: "kernel",
-                    causation_id: Some(&terminal.event_id),
-                    correlation_id: None,
-                    idempotency_key: Some(fact.event_key),
-                },
-            )?;
-            let (version, epoch) = do_active_revision(&self.sql, completion.instance_id)?;
-            do_insert_fact(
-                &self.sql,
-                completion.instance_id,
-                "kernel",
-                &event.event_id,
-                version.as_deref(),
-                epoch,
-                &fact.fact(completion.effect_id),
-            )?;
-            Ok(terminal)
+            self.settle_local_effect_on(completion, diagnostic.clone(), fact)
         });
         self.record_terminal_refusal(completion, completion.status, outcome)
+    }
+
+    fn settle_tracker_wait(
+        &mut self,
+        run: RunStart<'_>,
+        expected: &ClaimableEffect,
+        settlement: whipplescript_store::file_settlement::TrackerWaitSettlement<'_>,
+    ) -> StoreResult<StoredEvent> {
+        settlement.validate(run, expected)?;
+        recovery::atomic_result(&self.sql, true, &mut || {
+            dispatch::start_on(self, run, Some(expected))?;
+            self.settle_local_effect_on(
+                settlement.completion,
+                settlement.diagnostic.clone(),
+                settlement.fact,
+            )
+        })
     }
 
     fn complete_effect(&mut self, completion: EffectCompletion<'_>) -> StoreResult<StoredEvent> {
@@ -7392,6 +7460,16 @@ fn do_release_active_lease(
     effect_id: Option<&str>,
     now: &str,
 ) -> StoreResult<bool> {
+    do_release_active_lease_by(sql, item_id, effect_id, None, now)
+}
+
+fn do_release_active_lease_by(
+    sql: &impl DoSql,
+    item_id: &str,
+    effect_id: Option<&str>,
+    event_actor: Option<&str>,
+    now: &str,
+) -> StoreResult<bool> {
     let rows = sql
         .query(
             &format!(
@@ -7406,12 +7484,13 @@ fn do_release_active_lease(
         Some(row) => {
             let lease_id = as_text(&row[0]);
             let actor = as_text(&row[1]);
-            do_mark_lease_released(
+            do_mark_lease_released_by(
                 sql,
                 &lease_id,
                 item_id,
                 "claim.released",
                 &actor,
+                event_actor.unwrap_or(&actor),
                 effect_id,
                 now,
             )?;
@@ -7430,13 +7509,27 @@ fn do_mark_lease_released(
     effect_id: Option<&str>,
     now: &str,
 ) -> StoreResult<()> {
+    do_mark_lease_released_by(sql, lease_id, item_id, kind, actor, actor, effect_id, now)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn do_mark_lease_released_by(
+    sql: &impl DoSql,
+    lease_id: &str,
+    item_id: &str,
+    kind: &str,
+    actor: &str,
+    event_actor: &str,
+    effect_id: Option<&str>,
+    now: &str,
+) -> StoreResult<()> {
     let payload = serde_json::json!({"lease_id": lease_id, "actor": actor, "released_at": now});
     do_tracker_append(
         sql,
         Some(item_id),
         kind,
         &payload,
-        Some(actor),
+        Some(event_actor),
         effect_id,
         now,
     )?;
@@ -9461,6 +9554,7 @@ pub mod test_support {
             INSERT INTO schema_migrations (version, name) VALUES (2, 'provider-trust-evidence');
             INSERT INTO schema_migrations (version, name) VALUES (3, 'retained-write-results');
             INSERT INTO schema_migrations (version, name) VALUES (4, 'tracker-filing-receipts');
+            INSERT INTO schema_migrations (version, name) VALUES (5, 'tracker-closure-receipts');
             CREATE TABLE events (
                 event_id TEXT PRIMARY KEY, instance_id TEXT NOT NULL, sequence INTEGER NOT NULL,
                 event_type TEXT NOT NULL, payload_json TEXT NOT NULL, occurred_at TEXT NOT NULL,
@@ -9761,6 +9855,8 @@ pub mod test_support {
         .expect("schema");
         conn.execute_batch(whipplescript_store::tracker_filing::SCHEMA)
             .expect("tracker filing schema");
+        conn.execute_batch(whipplescript_store::tracker_closure::SCHEMA)
+            .expect("tracker closure schema");
         DoSqliteStore::new(RusqliteDoSql {
             conn: std::rc::Rc::new(conn),
         })
@@ -10182,7 +10278,8 @@ impl<Sql: DoSql> DoSqliteStore<Sql> {
         self.sql
             .execute(
                 "INSERT INTO runs (run_id, effect_id, instance_id, provider, worker_id, status, \
-                 metadata_json) VALUES (?1, ?2, ?3, ?4, ?5, 'running', ?6)",
+                 metadata_json, started_at) VALUES (?1, ?2, ?3, ?4, ?5, 'running', ?6, \
+                 (SELECT occurred_at FROM events WHERE event_id = ?7))",
                 &[
                     text(run.run_id),
                     text(run.effect_id),
@@ -10190,6 +10287,7 @@ impl<Sql: DoSql> DoSqliteStore<Sql> {
                     text(run.provider),
                     text(run.worker_id),
                     text(&run_metadata),
+                    text(&event.event_id),
                 ],
             )
             .map_err(sql_err)?;
@@ -10239,7 +10337,7 @@ impl<Sql: DoSql> DoSqliteStore<Sql> {
                 "effect_status": "failed",
             })
             .to_string();
-            do_append_event(
+            let event = do_append_event(
                 &self.sql,
                 NewEvent {
                     instance_id,
@@ -10260,9 +10358,9 @@ impl<Sql: DoSql> DoSqliteStore<Sql> {
                 .map_err(sql_err)?;
             self.sql
                 .execute(
-                    "UPDATE runs SET status = 'lease_expired', completed_at = CURRENT_TIMESTAMP \
+                    "UPDATE runs SET status = 'lease_expired', completed_at = (SELECT occurred_at FROM events WHERE event_id = ?2) \
                      WHERE run_id = ?1 AND status = 'running'",
-                    &[text(&lease.run_id)],
+                    &[text(&lease.run_id), text(&event.event_id)],
                 )
                 .map_err(sql_err)?;
             self.sql
@@ -10316,6 +10414,22 @@ impl<Sql: DoSql> DoSqliteStore<Sql> {
 pub(crate) mod tests {
     use super::*;
 
+    #[test]
+    fn do_tracker_recovery_preserves_historical_run_timestamps() {
+        for status in ["running", "failed", "lease_expired"] {
+            whipplescript_store::tracker_result::closing_conformance::run_historical_timestamps(
+                &mut store(),
+                status,
+                |store, entry, previous, digest| {
+                    store.sql.execute(
+                        "UPDATE events SET occurred_at=?1, prev_digest=?2, entry_digest=?3 WHERE event_id=?4",
+                        &[text(&entry.occurred_at), text(previous), text(digest), text(&entry.event_id)],
+                    ).unwrap();
+                },
+            );
+        }
+    }
+
     /// DR-0110: the Durable Object half of the closings contract, the same
     /// suite the native store runs. `closings` is implemented separately on
     /// each host — different SQL surface, different row bridge — so agreement
@@ -10351,28 +10465,87 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn do_tracker_settlement_and_replay() {
+        use whipplescript_store::file_settlement::tracker_conformance;
+        for status in ["completed", "failed"] {
+            tracker_conformance::run_suite(&mut store(), status);
+        }
+        for case in ["kind", "provider", "missing-queue", "empty-queue"] {
+            tracker_conformance::refuse_foreign_profile(&mut store(), case);
+        }
+    }
+
+    #[test]
     fn do_file_settlement_rolls_back_every_sql_boundary() {
-        local_settlement_sql_faults(false);
+        local_settlement_sql_faults("files");
     }
 
     #[test]
     fn do_recording_settlement_rolls_back_every_sql_boundary() {
-        local_settlement_sql_faults(true);
+        local_settlement_sql_faults("recording");
     }
 
-    fn local_settlement_sql_faults(recording: bool) {
-        use whipplescript_store::file_settlement::{conformance, recording_conformance};
+    #[test]
+    fn do_tracker_wait_settlement_and_replay() {
+        use whipplescript_store::file_settlement::tracker_conformance;
+        for status in ["completed", "failed"] {
+            tracker_conformance::run_wait_suite(&mut store(), status);
+        }
+        for case in ["kind", "provider", "missing-target", "foreign-target"] {
+            tracker_conformance::refuse_foreign_wait_profile(&mut store(), case);
+        }
+        local_settlement_sql_faults("wait");
+    }
+
+    #[test]
+    fn do_atomic_tracker_wait_settlement_and_replay() {
+        for state in ["paused", "cancelled", "effect-cancelled"] {
+            whipplescript_store::file_settlement::wait_conformance::refuse_stopped(
+                &mut store(),
+                state,
+            );
+        }
+        for status in ["completed", "failed"] {
+            whipplescript_store::file_settlement::wait_conformance::run_suite(&mut store(), status);
+        }
+        local_settlement_sql_faults("atomic-wait");
+    }
+
+    #[test]
+    fn do_tracker_closure_settlement_and_replay() {
+        use whipplescript_store::file_settlement::tracker_conformance;
+        for status in ["completed", "failed"] {
+            tracker_conformance::run_closure_suite(&mut store(), status);
+        }
+        for case in ["kind", "provider", "target", "empty-target"] {
+            tracker_conformance::refuse_foreign_closure_profile(&mut store(), case);
+        }
+        local_settlement_sql_faults("closure");
+    }
+
+    fn local_settlement_sql_faults(profile: &str) {
+        use whipplescript_store::file_settlement::{
+            conformance, recording_conformance, tracker_conformance,
+        };
         for status in ["completed", "failed"] {
             let mut finished = false;
             for fail_at in 1..=100 {
                 let mut base =
                     DoSqliteStore::new(test_support::RusqliteDoSql::with_runtime_schema());
-                let fixture = if recording {
+                let fixture = if profile == "atomic-wait" {
+                    tracker_conformance::setup_wait_queued(&mut base, status)
+                } else if profile == "closure" {
+                    tracker_conformance::setup_closure(&mut base, status)
+                } else if profile == "wait" {
+                    tracker_conformance::setup_wait(&mut base, status)
+                } else if profile == "recording" {
                     recording_conformance::setup(&mut base, status)
                 } else {
                     conformance::setup(&mut base, "file.write", status)
                 };
-                let metadata = if recording {
+                let metadata = if matches!(profile, "wait" | "atomic-wait" | "closure") {
+                    tracker_conformance::wait_metadata(&fixture)
+                } else if profile == "recording" {
                     recording_conformance::metadata(status)
                 } else {
                     fixture.completion().metadata_json.to_owned()
@@ -10397,10 +10570,24 @@ pub(crate) mod tests {
                             .unwrap()
                     })
                 };
+                let expected = base
+                    .claimable_effects(&fixture.instance)
+                    .expect("queued wait");
                 let before = snapshot(&base.sql);
                 let mut store = DoSqliteStore::new(FaultySql::new(base.sql, fail_at));
-                let outcome =
-                    store.settle_local_effect(completion, fixture.diagnostic(), fixture.fact());
+                let outcome = if profile == "atomic-wait" {
+                    store.settle_tracker_wait(
+                        fixture.run(),
+                        &expected[0],
+                        whipplescript_store::file_settlement::TrackerWaitSettlement {
+                            completion,
+                            diagnostic: fixture.diagnostic(),
+                            fact: fixture.fact(),
+                        },
+                    )
+                } else {
+                    store.settle_local_effect(completion, fixture.diagnostic(), fixture.fact())
+                };
                 let seen = store.sql.seen.get();
                 store.sql.disarm();
                 if outcome.is_ok() {
@@ -11971,6 +12158,9 @@ pub(crate) mod tests {
         pub(crate) fn disarm(&self) {
             self.fail_at.set(usize::MAX);
         }
+        pub(crate) fn statements_seen(&self) -> usize {
+            self.seen.get()
+        }
     }
 
     impl<S: DoSql> DoSql for FaultySql<S> {
@@ -12173,7 +12363,7 @@ pub(crate) mod tests {
     fn do_store_core_methods_run_real_sql() {
         let store = store();
 
-        assert_eq!(store.schema_version().expect("version"), 4);
+        assert_eq!(store.schema_version().expect("version"), 5);
         assert!(!store.fact_exists("i1", "ready").expect("fact"));
 
         let event = store

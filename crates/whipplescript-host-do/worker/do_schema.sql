@@ -3,6 +3,7 @@
             INSERT INTO schema_migrations (version, name) VALUES (2, 'provider-trust-evidence');
             INSERT INTO schema_migrations (version, name) VALUES (3, 'retained-write-results');
             INSERT INTO schema_migrations (version, name) VALUES (4, 'tracker-filing-receipts');
+            INSERT INTO schema_migrations (version, name) VALUES (5, 'tracker-closure-receipts');
             CREATE TABLE events (
                 event_id TEXT PRIMARY KEY, instance_id TEXT NOT NULL, sequence INTEGER NOT NULL,
                 event_type TEXT NOT NULL, payload_json TEXT NOT NULL, occurred_at TEXT NOT NULL,
@@ -346,4 +347,8 @@
 CREATE TABLE IF NOT EXISTS tracker_filing_receipts (
     operation_id TEXT PRIMARY KEY, fingerprint TEXT NOT NULL,
     item_id TEXT NOT NULL, event_id TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS tracker_closure_receipts (
+    operation_id TEXT PRIMARY KEY, receipt_json TEXT NOT NULL
 );

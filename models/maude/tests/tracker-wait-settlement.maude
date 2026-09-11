@@ -1,0 +1,27 @@
+load ../tracker-wait-settlement.maude
+search [1] in WHIPPLESCRIPT-TRACKER-WAIT-SETTLEMENT : queued ready request(f)
+  =>* ready started(f) terminal(f) fact(f) .
+search [1] in WHIPPLESCRIPT-TRACKER-WAIT-SETTLEMENT : queued ready request(f)
+  =>* ready started(f) .
+search [1] in WHIPPLESCRIPT-TRACKER-WAIT-SPLIT-START : queued ready request(f)
+  =>* ready started(f) .
+search [1] in WHIPPLESCRIPT-TRACKER-WAIT-SETTLEMENT : queued ready request(f)
+  =>* ready started(f) terminal(f) .
+search [1] in WHIPPLESCRIPT-TRACKER-WAIT-SPLIT-FACT : queued ready request(f)
+  =>* ready started(f) terminal(f) .
+search [1] in WHIPPLESCRIPT-TRACKER-WAIT-SETTLEMENT : queued ready request(f)
+  =>* ready started(f) terminal(g) fact(g) .
+search [1] in WHIPPLESCRIPT-TRACKER-WAIT-REBOUND : queued ready request(f)
+  =>* ready started(f) terminal(g) fact(g) .
+search [1] in WHIPPLESCRIPT-TRACKER-WAIT-SETTLEMENT : queued ready interrupted(f)
+  =>* queued ready .
+search [1] in WHIPPLESCRIPT-TRACKER-WAIT-SETTLEMENT : queued ready interrupted(f)
+  =>* ready started(f) .
+search [1] in WHIPPLESCRIPT-TRACKER-WAIT-PARTIAL-ROLLBACK : queued ready interrupted(f)
+  =>* ready started(f) .
+search [1] in WHIPPLESCRIPT-TRACKER-WAIT-SETTLEMENT : ready started(f) terminal(f) consumed(f) request(f)
+  =>* ready started(f) terminal(f) fact(f) .
+search [1] in WHIPPLESCRIPT-TRACKER-WAIT-REVIVE : ready started(f) terminal(f) consumed(f) request(f)
+  =>* ready started(f) terminal(f) fact(f) .
+search [1] in WHIPPLESCRIPT-TRACKER-WAIT-SETTLEMENT : queued ready request(f) consume
+  =>* ready started(f) terminal(f) consumed(f) .

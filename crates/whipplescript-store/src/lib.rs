@@ -24,12 +24,16 @@ pub mod materialize;
 pub mod memory;
 pub mod merge;
 #[cfg(feature = "native")]
+mod native_existing;
+#[cfg(feature = "native")]
 pub mod native_stores;
 pub mod preflight;
 pub mod read_through;
 pub mod reconcile;
 pub mod ref_authority;
+pub mod tracker_closure;
 pub mod tracker_filing;
+pub mod tracker_result;
 /// Relocated to `whipplescript-core` (DR-0052 R4.2: one selection
 /// grammar validates statically in the parser and dynamically at the
 /// seams — no mirror to drift). Re-exported here so every existing
@@ -1562,6 +1566,18 @@ impl SqliteStore {
         let connection =
             Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         connection.busy_timeout(STORE_BUSY_TIMEOUT)?;
+        Ok(Self { connection })
+    }
+
+    /// Open a current existing runtime, including a native snapshot. Checks the
+    /// owning schema stamp and SQLite integrity without creating, migrating or
+    /// repairing schema. WAL and file permissions are established for use at
+    /// the receiving location. Damaged schema fails when its operations read it.
+    pub fn open_existing(path: impl AsRef<Path>) -> StoreResult<Self> {
+        let path = path.as_ref();
+        let migration = MIGRATIONS.last().expect("runtime migrations exist");
+        let connection = native_existing::open(path, migration.name, migration.version)?;
+        harden_store_file_permissions(path)?;
         Ok(Self { connection })
     }
 
@@ -3300,12 +3316,25 @@ impl SqliteStore {
         run_status: &str,
         fact: Option<file_settlement::FileSettlementFact<'_>>,
     ) -> StoreResult<StoredEvent> {
-        let payload = effect_completion_payload(completion, diagnostic.as_ref(), run_status)?;
         let tx = self
             .connection
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let event =
+            Self::complete_effect_terminal_on(&tx, completion, diagnostic, run_status, fact)?;
+        tx.commit()?;
+        Ok(event)
+    }
+
+    fn complete_effect_terminal_on(
+        tx: &rusqlite::Connection,
+        completion: EffectCompletion<'_>,
+        diagnostic: Option<TerminalDiagnosticRecord>,
+        run_status: &str,
+        fact: Option<file_settlement::FileSettlementFact<'_>>,
+    ) -> StoreResult<StoredEvent> {
+        let payload = effect_completion_payload(completion, diagnostic.as_ref(), run_status)?;
         let event = append_event_on(
-            &tx,
+            tx,
             NewEvent {
                 instance_id: completion.instance_id,
                 event_type: "effect.terminal",
@@ -3321,7 +3350,7 @@ impl SqliteStore {
             r#"
             UPDATE runs
             SET status = ?1,
-                completed_at = CURRENT_TIMESTAMP,
+                completed_at = (SELECT occurred_at FROM events WHERE event_id = ?8),
                 exit_code = ?2,
                 summary = ?3,
                 metadata_json = ?4
@@ -3338,6 +3367,7 @@ impl SqliteStore {
                 completion.run_id,
                 completion.effect_id,
                 completion.instance_id,
+                event.event_id,
             ],
         )?;
         if updated_run == 0 {
@@ -3389,15 +3419,15 @@ impl SqliteStore {
             params![completion.status, completion.effect_id, completion.instance_id, event.event_id],
         )?;
         mark_cancellation_requests_terminal_on(
-            &tx,
+            tx,
             completion.instance_id,
             completion.effect_id,
             &event.event_id,
         )?;
-        satisfy_dependencies_on(&tx, completion.instance_id)?;
+        satisfy_dependencies_on(tx, completion.instance_id)?;
         if let Some(diagnostic) = diagnostic {
             insert_diagnostic_on(
-                &tx,
+                tx,
                 DiagnosticRecord {
                     instance_id: Some(completion.instance_id),
                     program_id: diagnostic.program_id.as_deref(),
@@ -3425,9 +3455,8 @@ impl SqliteStore {
         }
 
         if let Some(fact) = fact {
-            file_settlement::append_fact(&tx, completion, &event, fact)?;
+            file_settlement::append_fact(tx, completion, &event, fact)?;
         }
-        tx.commit()?;
         Ok(event)
     }
 
@@ -5690,13 +5719,14 @@ impl SqliteStore {
     }
 
     pub fn start_run(&mut self, run: RunStart<'_>) -> StoreResult<StoredEvent> {
-        self.start_run_observed(run, None)
+        self.start_run_observed(run, None, None)
     }
 
     fn start_run_observed(
         &mut self,
         run: RunStart<'_>,
         expected: Option<&ClaimableEffect>,
+        settlement: Option<file_settlement::TrackerWaitSettlement<'_>>,
     ) -> StoreResult<StoredEvent> {
         let tx = self
             .connection
@@ -5889,9 +5919,11 @@ impl SqliteStore {
                 provider,
                 worker_id,
                 status,
-                metadata_json
+                metadata_json,
+                started_at
             )
-            VALUES (?1, ?2, ?3, ?4, ?5, 'running', ?6)
+            VALUES (?1, ?2, ?3, ?4, ?5, 'running', ?6,
+                (SELECT occurred_at FROM events WHERE event_id = ?7))
             "#,
             params![
                 run.run_id,
@@ -5900,6 +5932,7 @@ impl SqliteStore {
                 run.provider,
                 run.worker_id,
                 run_metadata,
+                event.event_id,
             ],
         )?;
         tx.execute(
@@ -5925,6 +5958,17 @@ impl SqliteStore {
             ],
         )?;
 
+        let event = if let Some(settlement) = settlement {
+            Self::complete_effect_terminal_on(
+                &tx,
+                settlement.completion,
+                settlement.diagnostic,
+                settlement.completion.status,
+                Some(settlement.fact),
+            )?
+        } else {
+            event
+        };
         tx.commit()?;
         Ok(event)
     }
@@ -6540,7 +6584,7 @@ impl SqliteStore {
                 "effect_status": "failed",
             })
             .to_string();
-            append_event_on(
+            let event = append_event_on(
                 &tx,
                 NewEvent {
                     instance_id,
@@ -6565,11 +6609,11 @@ impl SqliteStore {
                 r#"
                 UPDATE runs
                 SET status = 'lease_expired',
-                    completed_at = CURRENT_TIMESTAMP
+                    completed_at = (SELECT occurred_at FROM events WHERE event_id = ?2)
                 WHERE run_id = ?1
                   AND status = 'running'
                 "#,
-                [&lease.run_id],
+                params![lease.run_id, event.event_id],
             )?;
             tx.execute(
                 r#"
@@ -6836,6 +6880,7 @@ impl SqliteStore {
                       'workflow.revision_activated',
                       'effect.run_started',
                       'effect.terminal',
+                      'tracker.filing.result_delivered', 'tracker.closing.result_delivered',
                       'effect.cancelled',
                       'effect.cancellation_requested',
                       'lease.expired',
@@ -6937,9 +6982,35 @@ impl SqliteStore {
                     &payload_json,
                     idempotency_key.as_deref(),
                 )?,
-                "effect.run_started" => replay_run_started(&tx, instance_id, &payload_json)?,
+                "effect.run_started" => {
+                    replay_run_started(&tx, instance_id, &event_id, &payload_json)?
+                }
                 "effect.terminal" => {
                     replay_effect_terminal(&tx, instance_id, &event_id, &payload_json)?
+                }
+                tracker_result::DELIVERY_EVENT if source == "kernel" => {
+                    tracker_result::apply_result(
+                        &tx,
+                        instance_id,
+                        &event_id,
+                        &serde_json::from_str::<tracker_result::RecordedTrackerResult>(
+                            &payload_json,
+                        )?
+                        .into_delivered(),
+                    )?
+                }
+                tracker_result::CLOSING_DELIVERY_EVENT if source == "kernel" => {
+                    tracker_result::apply_result(
+                        &tx,
+                        instance_id,
+                        &event_id,
+                        &serde_json::from_str::<
+                            tracker_result::RecordedTrackerResult<
+                                tracker_result::TrackerClosureResultDelivery,
+                            >,
+                        >(&payload_json)?
+                        .into_delivered(),
+                    )?
                 }
                 "effect.cancelled" => {
                     replay_effect_cancelled(&tx, instance_id, &event_id, &payload_json)?
@@ -6952,7 +7023,9 @@ impl SqliteStore {
                     idempotency_key.as_deref(),
                     causation_id.as_deref(),
                 )?,
-                "lease.expired" => replay_lease_expired(&tx, instance_id, &payload_json)?,
+                "lease.expired" => {
+                    replay_lease_expired(&tx, instance_id, &event_id, &payload_json)?
+                }
                 _ => {}
             }
         }
@@ -7332,6 +7405,15 @@ pub trait RuntimeStore {
         completion: EffectCompletion<'_>,
         diagnostic: Option<TerminalDiagnosticRecord>,
         fact: file_settlement::FileSettlementFact<'_>,
+    ) -> StoreResult<StoredEvent>;
+
+    /// Admit and settle a ready builtin closure observation in one transaction.
+    /// This performs no external I/O; interrupted publication leaves no run.
+    fn settle_tracker_wait(
+        &mut self,
+        run: RunStart<'_>,
+        expected: &ClaimableEffect,
+        settlement: file_settlement::TrackerWaitSettlement<'_>,
     ) -> StoreResult<StoredEvent>;
 
     /// Atomically settle a supported local effect and its continuation through
@@ -7718,6 +7800,16 @@ impl RuntimeStore for SqliteStore {
         self.settle_file_effect(completion, diagnostic, fact)
     }
 
+    fn settle_tracker_wait(
+        &mut self,
+        run: RunStart<'_>,
+        expected: &ClaimableEffect,
+        settlement: file_settlement::TrackerWaitSettlement<'_>,
+    ) -> StoreResult<StoredEvent> {
+        settlement.validate(run, expected)?;
+        self.start_run_observed(run, Some(expected), Some(settlement))
+    }
+
     fn complete_effect(&mut self, completion: EffectCompletion<'_>) -> StoreResult<StoredEvent> {
         self.complete_effect(completion)
     }
@@ -8010,7 +8102,7 @@ impl RuntimeStore for SqliteStore {
         run: RunStart<'_>,
         expected: &ClaimableEffect,
     ) -> StoreResult<StoredEvent> {
-        self.start_run_observed(run, Some(expected))
+        self.start_run_observed(run, Some(expected), None)
     }
     fn block_effect_binding(
         &mut self,
@@ -11406,7 +11498,7 @@ fn rule_commit_payload(
             if let Some(source_span_json) = effect.source_span_json {
                 serde_json::from_str::<Value>(source_span_json)?;
             }
-            Ok(json!({
+            let mut recorded = json!({
                 "effect_id": effect.effect_id,
                 "kind": effect.kind,
                 "target": effect.target,
@@ -11423,7 +11515,13 @@ fn rule_commit_payload(
                     .map(serde_json::from_str::<Value>)
                     .transpose()?
                     .unwrap_or(Value::Null),
-            }))
+            });
+            // Omit absent timeouts to preserve existing untimed commit identities.
+            // A timed effect must carry its bound in the authoritative event.
+            if let Some(timeout) = effect.timeout_seconds {
+                recorded["timeout_seconds"] = json!(timeout);
+            }
+            Ok(recorded)
         })
         .collect::<StoreResult<Vec<_>>>()?;
     let dependencies = commit
@@ -11731,7 +11829,7 @@ fn replay_rule_commit(
             .and_then(Value::as_i64)
             .unwrap_or(commit_revision_epoch);
         let new_effect = NewEffect {
-            timeout_seconds: None,
+            timeout_seconds: effect.get("timeout_seconds").and_then(Value::as_i64),
             effect_id,
             kind,
             target: effect.get("target").and_then(Value::as_str),
@@ -12066,6 +12164,7 @@ fn replay_revision_activation(
 fn replay_run_started(
     connection: &Connection,
     instance_id: &str,
+    event_id: &str,
     payload_json: &str,
 ) -> StoreResult<()> {
     let payload: Value = serde_json::from_str(payload_json)?;
@@ -12119,15 +12218,18 @@ fn replay_run_started(
             provider,
             worker_id,
             status,
-            metadata_json
+            metadata_json,
+            started_at
         )
-        VALUES (?1, ?2, ?3, ?4, ?5, 'running', ?6)
+        VALUES (?1, ?2, ?3, ?4, ?5, 'running', ?6,
+            (SELECT occurred_at FROM events WHERE event_id = ?7))
         ON CONFLICT(run_id) DO UPDATE SET
             effect_id = excluded.effect_id,
             instance_id = excluded.instance_id,
             provider = excluded.provider,
             worker_id = excluded.worker_id,
             status = 'running',
+            started_at = excluded.started_at,
             completed_at = NULL,
             exit_code = NULL,
             summary = NULL,
@@ -12140,6 +12242,7 @@ fn replay_run_started(
             provider,
             worker_id,
             metadata_json,
+            event_id,
         ],
     )?;
     connection.execute(
@@ -12217,19 +12320,22 @@ fn replay_effect_terminal(
                 provider,
                 worker_id,
                 status,
+                started_at,
                 completed_at,
                 exit_code,
                 summary,
                 metadata_json
             )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, CURRENT_TIMESTAMP, ?7, ?8, ?9)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6,
+                (SELECT occurred_at FROM events WHERE event_id = ?10),
+                (SELECT occurred_at FROM events WHERE event_id = ?10), ?7, ?8, ?9)
             ON CONFLICT(run_id) DO UPDATE SET
                 effect_id = excluded.effect_id,
                 instance_id = excluded.instance_id,
                 provider = excluded.provider,
                 worker_id = excluded.worker_id,
                 status = excluded.status,
-                completed_at = CURRENT_TIMESTAMP,
+                completed_at = excluded.completed_at,
                 exit_code = excluded.exit_code,
                 summary = excluded.summary,
                 metadata_json = excluded.metadata_json
@@ -12244,6 +12350,7 @@ fn replay_effect_terminal(
                 payload.get("exit_code").and_then(Value::as_i64),
                 payload.get("summary").and_then(Value::as_str),
                 metadata_json,
+                event_id,
             ],
         )?;
         connection.execute(
@@ -12309,6 +12416,7 @@ fn replay_effect_cancelled(
 fn replay_lease_expired(
     connection: &Connection,
     instance_id: &str,
+    event_id: &str,
     payload_json: &str,
 ) -> StoreResult<()> {
     let payload: Value = serde_json::from_str(payload_json)?;
@@ -12337,11 +12445,11 @@ fn replay_lease_expired(
         r#"
         UPDATE runs
         SET status = 'lease_expired',
-            completed_at = CURRENT_TIMESTAMP
+            completed_at = (SELECT occurred_at FROM events WHERE event_id = ?2)
         WHERE run_id = ?1
           AND status = 'running'
         "#,
-        [run_id],
+        params![run_id, event_id],
     )?;
     connection.execute(
         r#"

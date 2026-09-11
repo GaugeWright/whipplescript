@@ -33,6 +33,18 @@ pub use scoped_save::ScopedSaveExecutionAuthority;
 mod materialized_inputs;
 pub use materialized_inputs::ActionInputResolver;
 
+mod tracker;
+pub use tracker::TrackerExecutionAuthority;
+mod tracker_closure;
+mod tracker_closure_recovery;
+pub use tracker_closure::TrackerClosureAuthority;
+pub use tracker_closure_recovery::TrackerClosureRecoveryAuthority;
+mod tracker_recovery;
+pub use tracker_recovery::TrackerRecoveryAuthority;
+
+mod tracker_wait;
+pub use tracker_wait::TrackerWaitAuthority;
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 struct InstanceMetadata {
     protocol: String,
@@ -196,6 +208,24 @@ impl<S: RuntimeStore> GovernedHostFacade<S> {
             verifier,
             proof,
         )?;
+        self.prepare_authenticated_action_execution(authenticated, action, verifier)
+    }
+
+    fn prepare_authenticated_action_execution(
+        &self,
+        authenticated: crate::host_protocol::execution::AuthenticatedActionExecution,
+        action: &crate::host_action::CompiledHostAction,
+        verifier: &dyn crate::host_protocol::execution::ActionExecutionVerifier,
+    ) -> Result<
+        (
+            crate::host_protocol::execution::VerifiedActionExecution,
+            crate::host_protocol::action::HostActionCommand,
+        ),
+        HostFacadeError,
+    >
+    where
+        S: whipplescript_store::log_append::LogAppend,
+    {
         let request = authenticated.request();
         let prefix = self
             .kernel

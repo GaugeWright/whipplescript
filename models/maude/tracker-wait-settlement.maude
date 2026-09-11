@@ -1,0 +1,36 @@
+--- spec/host-actions.md: a ready closure observation has no external I/O.
+--- Current authority and the observed definition are preconditions. Queued
+--- differs from file-settlement's already-running `pending`: start, terminal
+--- and continuation become durable together, or no attempt becomes durable.
+mod WHIPPLESCRIPT-TRACKER-WAIT-SETTLEMENT is
+  sorts Result Cfg .
+  ops f g : -> Result [ctor] .
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+  ops queued ready consume : -> Cfg [ctor] .
+  ops request interrupted started terminal fact consumed : Result -> Cfg [ctor] .
+  var F : Result .
+  rl [commit] : queued ready request(F) => ready started(F) terminal(F) fact(F) .
+  rl [rollback] : queued ready interrupted(F) => queued ready .
+  rl [consume] : consume fact(F) => consumed(F) .
+endm
+mod WHIPPLESCRIPT-TRACKER-WAIT-SPLIT-START is
+  including WHIPPLESCRIPT-TRACKER-WAIT-SETTLEMENT .
+  rl [start-first] : queued ready request(F:Result) => ready started(F:Result) .
+endm
+mod WHIPPLESCRIPT-TRACKER-WAIT-SPLIT-FACT is
+  including WHIPPLESCRIPT-TRACKER-WAIT-SETTLEMENT .
+  rl [terminal-first] : queued ready request(F:Result) => ready started(F:Result) terminal(F:Result) .
+endm
+mod WHIPPLESCRIPT-TRACKER-WAIT-REBOUND is
+  including WHIPPLESCRIPT-TRACKER-WAIT-SETTLEMENT .
+  rl [different-result] : queued ready request(F:Result) => ready started(F:Result) terminal(g) fact(g) .
+endm
+mod WHIPPLESCRIPT-TRACKER-WAIT-PARTIAL-ROLLBACK is
+  including WHIPPLESCRIPT-TRACKER-WAIT-SETTLEMENT .
+  rl [keep-start] : queued ready interrupted(F:Result) => ready started(F:Result) .
+endm
+mod WHIPPLESCRIPT-TRACKER-WAIT-REVIVE is
+  including WHIPPLESCRIPT-TRACKER-WAIT-SETTLEMENT .
+  rl [redelivery-revives] : consumed(F:Result) request(F:Result) => fact(F:Result) .
+endm

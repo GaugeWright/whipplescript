@@ -1,0 +1,1168 @@
+{
+  "schema": "whipplescript.host_action_contract_fixtures.v4",
+  "contract_revision": "whipplescript-host-action/v4.0.0",
+  "description": "Native tracker wire codecs and syntax checks; synthetic values carry no grants and do not prove any actual target mutation. Existing v1-v3 vectors are inherited unchanged.",
+  "cases": [
+    {
+      "id": "TrackerBinding",
+      "message_type": "TrackerBinding",
+      "value": {
+        "scope": "workspace:fixture",
+        "queue": "tutorials",
+        "resource": {
+          "resource": {
+            "handle": "tracker:workspace:fixture/tutorials",
+            "kind": "tracker",
+            "selector": "tutorials",
+            "writable": true
+          },
+          "basis": {
+            "kind": "version",
+            "version_ref": "cut:base"
+          },
+          "label_ref": "private"
+        }
+      },
+      "wire_valid": true,
+      "schema_valid": true,
+      "syntax_valid": true
+    },
+    {
+      "id": "TrackerBinding-extra",
+      "message_type": "TrackerBinding",
+      "base": "TrackerBinding",
+      "set": [
+        {
+          "pointer": "/unknown",
+          "value": true
+        }
+      ],
+      "wire_valid": false,
+      "schema_valid": false,
+      "syntax_valid": null
+    },
+    {
+      "id": "TrackerBinding-missing-scope",
+      "message_type": "TrackerBinding",
+      "base": "TrackerBinding",
+      "remove": [
+        "/scope"
+      ],
+      "wire_valid": false,
+      "schema_valid": false,
+      "syntax_valid": null
+    },
+    {
+      "id": "TrackerBinding-missing-queue",
+      "message_type": "TrackerBinding",
+      "base": "TrackerBinding",
+      "remove": [
+        "/queue"
+      ],
+      "wire_valid": false,
+      "schema_valid": false,
+      "syntax_valid": null
+    },
+    {
+      "id": "TrackerBinding-missing-resource",
+      "message_type": "TrackerBinding",
+      "base": "TrackerBinding",
+      "remove": [
+        "/resource"
+      ],
+      "wire_valid": false,
+      "schema_valid": false,
+      "syntax_valid": null
+    },
+    {
+      "id": "TrackerClosureBinding",
+      "message_type": "TrackerClosureBinding",
+      "value": {
+        "tracker": {
+          "scope": "workspace:fixture",
+          "queue": "tutorials",
+          "resource": {
+            "resource": {
+              "handle": "tracker:workspace:fixture/tutorials",
+              "kind": "tracker",
+              "selector": "tutorials",
+              "writable": true
+            },
+            "basis": {
+              "kind": "version",
+              "version_ref": "cut:base"
+            },
+            "label_ref": "private"
+          }
+        },
+        "item_id": "WS-1",
+        "subject_id": "subject:one",
+        "expected_holder": "workflow:holder"
+      },
+      "wire_valid": true,
+      "schema_valid": true,
+      "syntax_valid": true
+    },
+    {
+      "id": "TrackerClosureBinding-extra",
+      "message_type": "TrackerClosureBinding",
+      "base": "TrackerClosureBinding",
+      "set": [
+        {
+          "pointer": "/unknown",
+          "value": true
+        }
+      ],
+      "wire_valid": false,
+      "schema_valid": false,
+      "syntax_valid": null
+    },
+    {
+      "id": "TrackerClosureBinding-missing-tracker",
+      "message_type": "TrackerClosureBinding",
+      "base": "TrackerClosureBinding",
+      "remove": [
+        "/tracker"
+      ],
+      "wire_valid": false,
+      "schema_valid": false,
+      "syntax_valid": null
+    },
+    {
+      "id": "TrackerClosureBinding-missing-item_id",
+      "message_type": "TrackerClosureBinding",
+      "base": "TrackerClosureBinding",
+      "remove": [
+        "/item_id"
+      ],
+      "wire_valid": false,
+      "schema_valid": false,
+      "syntax_valid": null
+    },
+    {
+      "id": "TrackerClosureBinding-missing-subject_id",
+      "message_type": "TrackerClosureBinding",
+      "base": "TrackerClosureBinding",
+      "remove": [
+        "/subject_id"
+      ],
+      "wire_valid": false,
+      "schema_valid": false,
+      "syntax_valid": null
+    },
+    {
+      "id": "TrackerClosureBinding-absent-expected_holder",
+      "message_type": "TrackerClosureBinding",
+      "base": "TrackerClosureBinding",
+      "remove": [
+        "/expected_holder"
+      ],
+      "wire_valid": true,
+      "schema_valid": true,
+      "syntax_valid": true
+    },
+    {
+      "id": "TrackerClosureBinding-null-expected_holder",
+      "message_type": "TrackerClosureBinding",
+      "base": "TrackerClosureBinding",
+      "set": [
+        {
+          "pointer": "/expected_holder",
+          "value": null
+        }
+      ],
+      "wire_valid": true,
+      "schema_valid": true,
+      "syntax_valid": true
+    },
+    {
+      "id": "TrackerFiling",
+      "message_type": "TrackerFiling",
+      "value": {
+        "operation_id": "filing:one",
+        "instance_id": "ins_action_86cc666a81e99a3f8981e583d2341b66c5c532507b6ea80f153836ac91d27592",
+        "effect_id": "effect:file",
+        "actor": "human:fixture",
+        "queue": "tutorials",
+        "title": "Create a chat",
+        "body": "Self-reported tutorial completion",
+        "labels": [],
+        "metadata": {},
+        "assigned_to": "human:fixture"
+      },
+      "wire_valid": true,
+      "schema_valid": true,
+      "syntax_valid": true
+    },
+    {
+      "id": "TrackerFiling-extra",
+      "message_type": "TrackerFiling",
+      "base": "TrackerFiling",
+      "set": [
+        {
+          "pointer": "/unknown",
+          "value": true
+        }
+      ],
+      "wire_valid": false,
+      "schema_valid": false,
+      "syntax_valid": null
+    },
+    {
+      "id": "TrackerFiling-missing-operation_id",
+      "message_type": "TrackerFiling",
+      "base": "TrackerFiling",
+      "remove": [
+        "/operation_id"
+      ],
+      "wire_valid": false,
+      "schema_valid": false,
+      "syntax_valid": null
+    },
+    {
+      "id": "TrackerFiling-missing-instance_id",
+      "message_type": "TrackerFiling",
+      "base": "TrackerFiling",
+      "remove": [
+        "/instance_id"
+      ],
+      "wire_valid": false,
+      "schema_valid": false,
+      "syntax_valid": null
+    },
+    {
+      "id": "TrackerFiling-missing-effect_id",
+      "message_type": "TrackerFiling",
+      "base": "TrackerFiling",
+      "remove": [
+        "/effect_id"
+      ],
+      "wire_valid": false,
+      "schema_valid": false,
+      "syntax_valid": null
+    },
+    {
+      "id": "TrackerFiling-missing-actor",
+      "message_type": "TrackerFiling",
+      "base": "TrackerFiling",
+      "remove": [
+        "/actor"
+      ],
+      "wire_valid": false,
+      "schema_valid": false,
+      "syntax_valid": null
+    },
+    {
+      "id": "TrackerFiling-missing-queue",
+      "message_type": "TrackerFiling",
+      "base": "TrackerFiling",
+      "remove": [
+        "/queue"
+      ],
+      "wire_valid": false,
+      "schema_valid": false,
+      "syntax_valid": null
+    },
+    {
+      "id": "TrackerFiling-missing-title",
+      "message_type": "TrackerFiling",
+      "base": "TrackerFiling",
+      "remove": [
+        "/title"
+      ],
+      "wire_valid": false,
+      "schema_valid": false,
+      "syntax_valid": null
+    },
+    {
+      "id": "TrackerFiling-missing-body",
+      "message_type": "TrackerFiling",
+      "base": "TrackerFiling",
+      "remove": [
+        "/body"
+      ],
+      "wire_valid": false,
+      "schema_valid": false,
+      "syntax_valid": null
+    },
+    {
+      "id": "TrackerFiling-missing-labels",
+      "message_type": "TrackerFiling",
+      "base": "TrackerFiling",
+      "remove": [
+        "/labels"
+      ],
+      "wire_valid": false,
+      "schema_valid": false,
+      "syntax_valid": null
+    },
+    {
+      "id": "TrackerFiling-missing-metadata",
+      "message_type": "TrackerFiling",
+      "base": "TrackerFiling",
+      "remove": [
+        "/metadata"
+      ],
+      "wire_valid": false,
+      "schema_valid": false,
+      "syntax_valid": null
+    },
+    {
+      "id": "TrackerFiling-absent-assigned_to",
+      "message_type": "TrackerFiling",
+      "base": "TrackerFiling",
+      "remove": [
+        "/assigned_to"
+      ],
+      "wire_valid": true,
+      "schema_valid": true,
+      "syntax_valid": true
+    },
+    {
+      "id": "TrackerFiling-null-assigned_to",
+      "message_type": "TrackerFiling",
+      "base": "TrackerFiling",
+      "set": [
+        {
+          "pointer": "/assigned_to",
+          "value": null
+        }
+      ],
+      "wire_valid": true,
+      "schema_valid": true,
+      "syntax_valid": true
+    },
+    {
+      "id": "TrackerFiling-blank-coordinate",
+      "message_type": "TrackerFiling",
+      "base": "TrackerFiling",
+      "set": [
+        {
+          "pointer": "/actor",
+          "value": "   "
+        }
+      ],
+      "wire_valid": true,
+      "schema_valid": true,
+      "syntax_valid": false
+    },
+    {
+      "id": "TrackerClosure",
+      "message_type": "TrackerClosure",
+      "value": {
+        "operation_id": "closing:one",
+        "instance_id": "ins_action_86cc666a81e99a3f8981e583d2341b66c5c532507b6ea80f153836ac91d27592",
+        "effect_id": "effect:close",
+        "actor": "human:fixture",
+        "queue": "tutorials",
+        "item_id": "WS-1",
+        "subject_id": "subject:one",
+        "summary": "Created a chat",
+        "expected_holder": "workflow:holder"
+      },
+      "wire_valid": true,
+      "schema_valid": true,
+      "syntax_valid": true
+    },
+    {
+      "id": "TrackerClosure-extra",
+      "message_type": "TrackerClosure",
+      "base": "TrackerClosure",
+      "set": [
+        {
+          "pointer": "/unknown",
+          "value": true
+        }
+      ],
+      "wire_valid": false,
+      "schema_valid": false,
+      "syntax_valid": null
+    },
+    {
+      "id": "TrackerClosure-missing-operation_id",
+      "message_type": "TrackerClosure",
+      "base": "TrackerClosure",
+      "remove": [
+        "/operation_id"
+      ],
+      "wire_valid": false,
+      "schema_valid": false,
+      "syntax_valid": null
+    },
+    {
+      "id": "TrackerClosure-missing-instance_id",
+      "message_type": "TrackerClosure",
+      "base": "TrackerClosure",
+      "remove": [
+        "/instance_id"
+      ],
+      "wire_valid": false,
+      "schema_valid": false,
+      "syntax_valid": null
+    },
+    {
+      "id": "TrackerClosure-missing-effect_id",
+      "message_type": "TrackerClosure",
+      "base": "TrackerClosure",
+      "remove": [
+        "/effect_id"
+      ],
+      "wire_valid": false,
+      "schema_valid": false,
+      "syntax_valid": null
+    },
+    {
+      "id": "TrackerClosure-missing-actor",
+      "message_type": "TrackerClosure",
+      "base": "TrackerClosure",
+      "remove": [
+        "/actor"
+      ],
+      "wire_valid": false,
+      "schema_valid": false,
+      "syntax_valid": null
+    },
+    {
+      "id": "TrackerClosure-missing-queue",
+      "message_type": "TrackerClosure",
+      "base": "TrackerClosure",
+      "remove": [
+        "/queue"
+      ],
+      "wire_valid": false,
+      "schema_valid": false,
+      "syntax_valid": null
+    },
+    {
+      "id": "TrackerClosure-missing-item_id",
+      "message_type": "TrackerClosure",
+      "base": "TrackerClosure",
+      "remove": [
+        "/item_id"
+      ],
+      "wire_valid": false,
+      "schema_valid": false,
+      "syntax_valid": null
+    },
+    {
+      "id": "TrackerClosure-missing-subject_id",
+      "message_type": "TrackerClosure",
+      "base": "TrackerClosure",
+      "remove": [
+        "/subject_id"
+      ],
+      "wire_valid": false,
+      "schema_valid": false,
+      "syntax_valid": null
+    },
+    {
+      "id": "TrackerClosure-absent-expected_holder",
+      "message_type": "TrackerClosure",
+      "base": "TrackerClosure",
+      "remove": [
+        "/expected_holder"
+      ],
+      "wire_valid": true,
+      "schema_valid": true,
+      "syntax_valid": true
+    },
+    {
+      "id": "TrackerClosure-null-expected_holder",
+      "message_type": "TrackerClosure",
+      "base": "TrackerClosure",
+      "set": [
+        {
+          "pointer": "/expected_holder",
+          "value": null
+        }
+      ],
+      "wire_valid": true,
+      "schema_valid": true,
+      "syntax_valid": true
+    },
+    {
+      "id": "TrackerClosure-absent-summary",
+      "message_type": "TrackerClosure",
+      "base": "TrackerClosure",
+      "remove": [
+        "/summary"
+      ],
+      "wire_valid": true,
+      "schema_valid": true,
+      "syntax_valid": true
+    },
+    {
+      "id": "TrackerClosure-null-summary",
+      "message_type": "TrackerClosure",
+      "base": "TrackerClosure",
+      "set": [
+        {
+          "pointer": "/summary",
+          "value": null
+        }
+      ],
+      "wire_valid": true,
+      "schema_valid": true,
+      "syntax_valid": true
+    },
+    {
+      "id": "TrackerClosure-blank-coordinate",
+      "message_type": "TrackerClosure",
+      "base": "TrackerClosure",
+      "set": [
+        {
+          "pointer": "/actor",
+          "value": "   "
+        }
+      ],
+      "wire_valid": true,
+      "schema_valid": true,
+      "syntax_valid": false
+    },
+    {
+      "id": "TrackerFilingReceipt",
+      "message_type": "TrackerFilingReceipt",
+      "value": {
+        "operation_id": "filing:one",
+        "fingerprint": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "item_id": "WS-1",
+        "event_id": "creation:one"
+      },
+      "wire_valid": true,
+      "schema_valid": true,
+      "syntax_valid": true
+    },
+    {
+      "id": "TrackerFilingReceipt-extra",
+      "message_type": "TrackerFilingReceipt",
+      "base": "TrackerFilingReceipt",
+      "set": [
+        {
+          "pointer": "/unknown",
+          "value": true
+        }
+      ],
+      "wire_valid": false,
+      "schema_valid": false,
+      "syntax_valid": null
+    },
+    {
+      "id": "TrackerFilingReceipt-missing-operation_id",
+      "message_type": "TrackerFilingReceipt",
+      "base": "TrackerFilingReceipt",
+      "remove": [
+        "/operation_id"
+      ],
+      "wire_valid": false,
+      "schema_valid": false,
+      "syntax_valid": null
+    },
+    {
+      "id": "TrackerFilingReceipt-missing-fingerprint",
+      "message_type": "TrackerFilingReceipt",
+      "base": "TrackerFilingReceipt",
+      "remove": [
+        "/fingerprint"
+      ],
+      "wire_valid": false,
+      "schema_valid": false,
+      "syntax_valid": null
+    },
+    {
+      "id": "TrackerFilingReceipt-missing-item_id",
+      "message_type": "TrackerFilingReceipt",
+      "base": "TrackerFilingReceipt",
+      "remove": [
+        "/item_id"
+      ],
+      "wire_valid": false,
+      "schema_valid": false,
+      "syntax_valid": null
+    },
+    {
+      "id": "TrackerFilingReceipt-missing-event_id",
+      "message_type": "TrackerFilingReceipt",
+      "base": "TrackerFilingReceipt",
+      "remove": [
+        "/event_id"
+      ],
+      "wire_valid": false,
+      "schema_valid": false,
+      "syntax_valid": null
+    },
+    {
+      "id": "TrackerClosureReceipt",
+      "message_type": "TrackerClosureReceipt",
+      "value": {
+        "operation_id": "closing:one",
+        "fingerprint": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "queue": "tutorials",
+        "item_id": "WS-1",
+        "subject_id": "subject:one",
+        "actor": "human:fixture",
+        "event_id": "closing:one",
+        "closed_at": "2026-09-11T00:00:00Z"
+      },
+      "wire_valid": true,
+      "schema_valid": true,
+      "syntax_valid": true
+    },
+    {
+      "id": "TrackerClosureReceipt-extra",
+      "message_type": "TrackerClosureReceipt",
+      "base": "TrackerClosureReceipt",
+      "set": [
+        {
+          "pointer": "/unknown",
+          "value": true
+        }
+      ],
+      "wire_valid": false,
+      "schema_valid": false,
+      "syntax_valid": null
+    },
+    {
+      "id": "TrackerClosureReceipt-missing-operation_id",
+      "message_type": "TrackerClosureReceipt",
+      "base": "TrackerClosureReceipt",
+      "remove": [
+        "/operation_id"
+      ],
+      "wire_valid": false,
+      "schema_valid": false,
+      "syntax_valid": null
+    },
+    {
+      "id": "TrackerClosureReceipt-missing-fingerprint",
+      "message_type": "TrackerClosureReceipt",
+      "base": "TrackerClosureReceipt",
+      "remove": [
+        "/fingerprint"
+      ],
+      "wire_valid": false,
+      "schema_valid": false,
+      "syntax_valid": null
+    },
+    {
+      "id": "TrackerClosureReceipt-missing-queue",
+      "message_type": "TrackerClosureReceipt",
+      "base": "TrackerClosureReceipt",
+      "remove": [
+        "/queue"
+      ],
+      "wire_valid": false,
+      "schema_valid": false,
+      "syntax_valid": null
+    },
+    {
+      "id": "TrackerClosureReceipt-missing-item_id",
+      "message_type": "TrackerClosureReceipt",
+      "base": "TrackerClosureReceipt",
+      "remove": [
+        "/item_id"
+      ],
+      "wire_valid": false,
+      "schema_valid": false,
+      "syntax_valid": null
+    },
+    {
+      "id": "TrackerClosureReceipt-missing-subject_id",
+      "message_type": "TrackerClosureReceipt",
+      "base": "TrackerClosureReceipt",
+      "remove": [
+        "/subject_id"
+      ],
+      "wire_valid": false,
+      "schema_valid": false,
+      "syntax_valid": null
+    },
+    {
+      "id": "TrackerClosureReceipt-missing-actor",
+      "message_type": "TrackerClosureReceipt",
+      "base": "TrackerClosureReceipt",
+      "remove": [
+        "/actor"
+      ],
+      "wire_valid": false,
+      "schema_valid": false,
+      "syntax_valid": null
+    },
+    {
+      "id": "TrackerClosureReceipt-missing-event_id",
+      "message_type": "TrackerClosureReceipt",
+      "base": "TrackerClosureReceipt",
+      "remove": [
+        "/event_id"
+      ],
+      "wire_valid": false,
+      "schema_valid": false,
+      "syntax_valid": null
+    },
+    {
+      "id": "TrackerClosureReceipt-missing-closed_at",
+      "message_type": "TrackerClosureReceipt",
+      "base": "TrackerClosureReceipt",
+      "remove": [
+        "/closed_at"
+      ],
+      "wire_valid": false,
+      "schema_valid": false,
+      "syntax_valid": null
+    },
+    {
+      "id": "FilingDispatch",
+      "message_type": "FilingDispatch",
+      "value": {
+        "binding": {
+          "scope": "workspace:fixture",
+          "queue": "tutorials",
+          "resource": {
+            "resource": {
+              "handle": "tracker:workspace:fixture/tutorials",
+              "kind": "tracker",
+              "selector": "tutorials",
+              "writable": true
+            },
+            "basis": {
+              "kind": "version",
+              "version_ref": "cut:base"
+            },
+            "label_ref": "private"
+          }
+        },
+        "operation_id": "filing:one",
+        "fingerprint": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "queue": "tutorials",
+        "title": "Create a chat"
+      },
+      "wire_valid": true,
+      "schema_valid": true,
+      "syntax_valid": true
+    },
+    {
+      "id": "FilingDispatch-extra",
+      "message_type": "FilingDispatch",
+      "base": "FilingDispatch",
+      "set": [
+        {
+          "pointer": "/unknown",
+          "value": true
+        }
+      ],
+      "wire_valid": false,
+      "schema_valid": false,
+      "syntax_valid": null
+    },
+    {
+      "id": "FilingDispatch-missing-binding",
+      "message_type": "FilingDispatch",
+      "base": "FilingDispatch",
+      "remove": [
+        "/binding"
+      ],
+      "wire_valid": false,
+      "schema_valid": false,
+      "syntax_valid": null
+    },
+    {
+      "id": "FilingDispatch-missing-operation_id",
+      "message_type": "FilingDispatch",
+      "base": "FilingDispatch",
+      "remove": [
+        "/operation_id"
+      ],
+      "wire_valid": false,
+      "schema_valid": false,
+      "syntax_valid": null
+    },
+    {
+      "id": "FilingDispatch-missing-fingerprint",
+      "message_type": "FilingDispatch",
+      "base": "FilingDispatch",
+      "remove": [
+        "/fingerprint"
+      ],
+      "wire_valid": false,
+      "schema_valid": false,
+      "syntax_valid": null
+    },
+    {
+      "id": "FilingDispatch-missing-queue",
+      "message_type": "FilingDispatch",
+      "base": "FilingDispatch",
+      "remove": [
+        "/queue"
+      ],
+      "wire_valid": false,
+      "schema_valid": false,
+      "syntax_valid": null
+    },
+    {
+      "id": "FilingDispatch-missing-title",
+      "message_type": "FilingDispatch",
+      "base": "FilingDispatch",
+      "remove": [
+        "/title"
+      ],
+      "wire_valid": false,
+      "schema_valid": false,
+      "syntax_valid": null
+    },
+    {
+      "id": "ClosureDispatch",
+      "message_type": "ClosureDispatch",
+      "value": {
+        "binding": {
+          "tracker": {
+            "scope": "workspace:fixture",
+            "queue": "tutorials",
+            "resource": {
+              "resource": {
+                "handle": "tracker:workspace:fixture/tutorials",
+                "kind": "tracker",
+                "selector": "tutorials",
+                "writable": true
+              },
+              "basis": {
+                "kind": "version",
+                "version_ref": "cut:base"
+              },
+              "label_ref": "private"
+            }
+          },
+          "item_id": "WS-1",
+          "subject_id": "subject:one",
+          "expected_holder": "workflow:holder"
+        },
+        "operation_id": "closing:one",
+        "fingerprint": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "summary": "Created a chat"
+      },
+      "wire_valid": true,
+      "schema_valid": true,
+      "syntax_valid": true
+    },
+    {
+      "id": "ClosureDispatch-extra",
+      "message_type": "ClosureDispatch",
+      "base": "ClosureDispatch",
+      "set": [
+        {
+          "pointer": "/unknown",
+          "value": true
+        }
+      ],
+      "wire_valid": false,
+      "schema_valid": false,
+      "syntax_valid": null
+    },
+    {
+      "id": "ClosureDispatch-missing-binding",
+      "message_type": "ClosureDispatch",
+      "base": "ClosureDispatch",
+      "remove": [
+        "/binding"
+      ],
+      "wire_valid": false,
+      "schema_valid": false,
+      "syntax_valid": null
+    },
+    {
+      "id": "ClosureDispatch-missing-operation_id",
+      "message_type": "ClosureDispatch",
+      "base": "ClosureDispatch",
+      "remove": [
+        "/operation_id"
+      ],
+      "wire_valid": false,
+      "schema_valid": false,
+      "syntax_valid": null
+    },
+    {
+      "id": "ClosureDispatch-missing-fingerprint",
+      "message_type": "ClosureDispatch",
+      "base": "ClosureDispatch",
+      "remove": [
+        "/fingerprint"
+      ],
+      "wire_valid": false,
+      "schema_valid": false,
+      "syntax_valid": null
+    },
+    {
+      "id": "ClosureDispatch-absent-summary",
+      "message_type": "ClosureDispatch",
+      "base": "ClosureDispatch",
+      "remove": [
+        "/summary"
+      ],
+      "wire_valid": true,
+      "schema_valid": true,
+      "syntax_valid": true
+    },
+    {
+      "id": "ClosureDispatch-null-summary",
+      "message_type": "ClosureDispatch",
+      "base": "ClosureDispatch",
+      "set": [
+        {
+          "pointer": "/summary",
+          "value": null
+        }
+      ],
+      "wire_valid": true,
+      "schema_valid": true,
+      "syntax_valid": true
+    },
+    {
+      "id": "RecoverTrackerResult",
+      "message_type": "RecoverTrackerResult",
+      "value": {
+        "protocol": "whipplescript.tracker-result-delivery.v1",
+        "issuer": "fixture-product",
+        "scope": "workspace:fixture",
+        "admission": {
+          "protocol": "whipplescript.host-action.v1",
+          "fingerprint": "2bc6dc3dbb1b27cb30cea76814ca6c6cb24ab9e9d3e9f02630df5e0da36c61f6",
+          "instance_ref": "ins_action_86cc666a81e99a3f8981e583d2341b66c5c532507b6ea80f153836ac91d27592",
+          "admitted_at": {
+            "instance_ref": "ins_action_86cc666a81e99a3f8981e583d2341b66c5c532507b6ea80f153836ac91d27592",
+            "sequence": 3,
+            "head_digest": "fixture-prefix"
+          }
+        },
+        "policy": {
+          "epoch": 7,
+          "envelope_hash": "fixture-envelope",
+          "signer": "fixture-signer",
+          "key_id": "fixture-key"
+        },
+        "provenance": {
+          "initiator": "human:fixture",
+          "executor": "human:fixture",
+          "delegation": [],
+          "origin": "editor",
+          "causes": [
+            {
+              "authority": "fixture-product",
+              "record_ref": "prior-command",
+              "digest": "prior-digest"
+            }
+          ]
+        },
+        "effect_id": "effect:close",
+        "run_id": "run:one"
+      },
+      "wire_valid": true,
+      "schema_valid": true,
+      "syntax_valid": true
+    },
+    {
+      "id": "RecoverTrackerResult-extra",
+      "message_type": "RecoverTrackerResult",
+      "base": "RecoverTrackerResult",
+      "set": [
+        {
+          "pointer": "/unknown",
+          "value": true
+        }
+      ],
+      "wire_valid": false,
+      "schema_valid": false,
+      "syntax_valid": null
+    },
+    {
+      "id": "RecoverTrackerResult-missing-protocol",
+      "message_type": "RecoverTrackerResult",
+      "base": "RecoverTrackerResult",
+      "remove": [
+        "/protocol"
+      ],
+      "wire_valid": false,
+      "schema_valid": false,
+      "syntax_valid": null
+    },
+    {
+      "id": "RecoverTrackerResult-missing-issuer",
+      "message_type": "RecoverTrackerResult",
+      "base": "RecoverTrackerResult",
+      "remove": [
+        "/issuer"
+      ],
+      "wire_valid": false,
+      "schema_valid": false,
+      "syntax_valid": null
+    },
+    {
+      "id": "RecoverTrackerResult-missing-scope",
+      "message_type": "RecoverTrackerResult",
+      "base": "RecoverTrackerResult",
+      "remove": [
+        "/scope"
+      ],
+      "wire_valid": false,
+      "schema_valid": false,
+      "syntax_valid": null
+    },
+    {
+      "id": "RecoverTrackerResult-missing-admission",
+      "message_type": "RecoverTrackerResult",
+      "base": "RecoverTrackerResult",
+      "remove": [
+        "/admission"
+      ],
+      "wire_valid": false,
+      "schema_valid": false,
+      "syntax_valid": null
+    },
+    {
+      "id": "RecoverTrackerResult-missing-policy",
+      "message_type": "RecoverTrackerResult",
+      "base": "RecoverTrackerResult",
+      "remove": [
+        "/policy"
+      ],
+      "wire_valid": false,
+      "schema_valid": false,
+      "syntax_valid": null
+    },
+    {
+      "id": "RecoverTrackerResult-missing-provenance",
+      "message_type": "RecoverTrackerResult",
+      "base": "RecoverTrackerResult",
+      "remove": [
+        "/provenance"
+      ],
+      "wire_valid": false,
+      "schema_valid": false,
+      "syntax_valid": null
+    },
+    {
+      "id": "RecoverTrackerResult-missing-effect_id",
+      "message_type": "RecoverTrackerResult",
+      "base": "RecoverTrackerResult",
+      "remove": [
+        "/effect_id"
+      ],
+      "wire_valid": false,
+      "schema_valid": false,
+      "syntax_valid": null
+    },
+    {
+      "id": "RecoverTrackerResult-missing-run_id",
+      "message_type": "RecoverTrackerResult",
+      "base": "RecoverTrackerResult",
+      "remove": [
+        "/run_id"
+      ],
+      "wire_valid": false,
+      "schema_valid": false,
+      "syntax_valid": null
+    },
+    {
+      "id": "RecoverTrackerResult-blank-coordinate",
+      "message_type": "RecoverTrackerResult",
+      "base": "RecoverTrackerResult",
+      "set": [
+        {
+          "pointer": "/issuer",
+          "value": "   "
+        }
+      ],
+      "wire_valid": true,
+      "schema_valid": true,
+      "syntax_valid": false
+    },
+    {
+      "id": "TrackerClosureBinding-holder-type",
+      "message_type": "TrackerClosureBinding",
+      "base": "TrackerClosureBinding",
+      "set": [
+        {
+          "pointer": "/expected_holder",
+          "value": 7
+        }
+      ],
+      "wire_valid": false,
+      "schema_valid": false,
+      "syntax_valid": null
+    },
+    {
+      "id": "TrackerBinding-resource-extra",
+      "message_type": "TrackerBinding",
+      "base": "TrackerBinding",
+      "set": [
+        {
+          "pointer": "/resource/unknown",
+          "value": true
+        }
+      ],
+      "wire_valid": false,
+      "schema_valid": false,
+      "syntax_valid": null
+    },
+    {
+      "id": "TrackerFiling-labels-type",
+      "message_type": "TrackerFiling",
+      "base": "TrackerFiling",
+      "set": [
+        {
+          "pointer": "/labels",
+          "value": [
+            7
+          ]
+        }
+      ],
+      "wire_valid": false,
+      "schema_valid": false,
+      "syntax_valid": null
+    },
+    {
+      "id": "RecoverTrackerResult-wrong-protocol",
+      "message_type": "RecoverTrackerResult",
+      "base": "RecoverTrackerResult",
+      "set": [
+        {
+          "pointer": "/protocol",
+          "value": "whipplescript.tracker-result-delivery.v2"
+        }
+      ],
+      "wire_valid": true,
+      "schema_valid": false,
+      "syntax_valid": false
+    },
+    {
+      "id": "RecoverTrackerResult-foreign-admission-position",
+      "message_type": "RecoverTrackerResult",
+      "base": "RecoverTrackerResult",
+      "set": [
+        {
+          "pointer": "/admission/admitted_at/instance_ref",
+          "value": "another-instance"
+        }
+      ],
+      "wire_valid": true,
+      "schema_valid": true,
+      "syntax_valid": false
+    },
+    {
+      "id": "TrackerFiling-unicode-integers",
+      "message_type": "TrackerFiling",
+      "base": "TrackerFiling",
+      "set": [
+        {
+          "pointer": "/metadata",
+          "value": {
+            "": "first",
+            "𐀀": "second",
+            "max": 18446744073709551615,
+            "min": -9223372036854775808
+          }
+        }
+      ],
+      "wire_valid": true,
+      "schema_valid": true,
+      "syntax_valid": true
+    }
+  ]
+}

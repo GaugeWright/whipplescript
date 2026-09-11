@@ -95,6 +95,15 @@ pub struct CoordinationStore {
 
 #[cfg(feature = "native")]
 impl CoordinationStore {
+    /// Open only a current existing coordination store. Checks its owning stamp and
+    /// SQLite integrity, establishes WAL, and never creates or repairs schema.
+    /// Missing schema required by an operation remains an error when used.
+    pub fn open_existing(path: impl AsRef<Path>) -> StoreResult<Self> {
+        let connection =
+            crate::native_existing::open(path.as_ref(), "coordination", SATELLITE_SCHEMA_VERSION)?;
+        Ok(Self { connection })
+    }
+
     pub fn open(path: impl AsRef<Path>) -> StoreResult<Self> {
         if let Some(parent) = path.as_ref().parent() {
             if !parent.as_os_str().is_empty() {

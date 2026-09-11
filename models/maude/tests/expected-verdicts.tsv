@@ -144,3 +144,4 @@ workflow-runtime-marker-reresolution.maude	SSSNNN
 workflow-scoping.maude	SSSSSSNNN
 workstream-boundary.maude	SNSNSNSNSNSNSNSNSNSNSNSNSNSNSN
 workstream.maude	SSSNNNNN
+tracker-wait-settlement.maude	SNSNSNSSNSNSS

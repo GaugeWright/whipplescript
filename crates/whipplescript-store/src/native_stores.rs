@@ -63,6 +63,22 @@ impl NativeStores {
         })
     }
 
+    /// Open a complete existing runtime/coordination/tracker set without
+    /// initializing or repairing any schema. Each owner checks its current
+    /// stamp and SQLite integrity; missing stores never become empty authority.
+    pub fn open_existing(
+        runtime: impl AsRef<Path>,
+        coord: impl AsRef<Path>,
+        items: impl AsRef<Path>,
+    ) -> StoreResult<Self> {
+        Ok(Self {
+            runtime: SqliteStore::open_existing(runtime)?,
+            coord: CoordinationStore::open_existing(coord)?,
+            items: WorkItemStore::open_existing(items)?,
+            frontier: None,
+        })
+    }
+
     /// Consume the facade, returning the three underlying stores. The
     /// frontier member, if any, is dropped — it is a read view, not a
     /// fourth owned plane.
@@ -300,6 +316,15 @@ impl RuntimeStore for NativeStores {
     ) -> StoreResult<StoredEvent> {
         self.runtime
             .settle_file_effect(completion, diagnostic, fact)
+    }
+
+    fn settle_tracker_wait(
+        &mut self,
+        run: RunStart<'_>,
+        expected: &ClaimableEffect,
+        settlement: crate::file_settlement::TrackerWaitSettlement<'_>,
+    ) -> StoreResult<StoredEvent> {
+        self.runtime.settle_tracker_wait(run, expected, settlement)
     }
 
     fn complete_effect(&mut self, completion: EffectCompletion<'_>) -> StoreResult<StoredEvent> {
@@ -892,6 +917,10 @@ impl Coordination for NativeStores {
 }
 
 impl WorkItems for NativeStores {
+    fn set_event_effect_id(&mut self, effect_id: Option<&str>) {
+        self.items.set_event_effect_id(effect_id);
+    }
+
     fn subject_content_id(&self, id: &str) -> StoreResult<Option<String>> {
         WorkItems::subject_content_id(&self.items, id)
     }

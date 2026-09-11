@@ -153,6 +153,75 @@ pub fn run<S: RuntimeStore>(
     run_capability_effect_generic(kernel, instance_id, effect, config, &observed, &observed)
 }
 
+/// The governed path is a fixed builtin observation, never an arbitrary
+/// capability provider. The private execution grant is consumed at run start.
+pub(crate) fn run_governed<S: RuntimeStore>(
+    kernel: &mut RuntimeKernel<S>,
+    instance_id: &str,
+    effect: &ClaimableEffect,
+) -> StoreResult<StoredEvent> {
+    use whipplescript_store::file_settlement::TRACKER_WAIT_PROVIDER;
+    use whipplescript_store::{EffectCompletion, RunStart};
+    let observation = observe(kernel.store(), instance_id, effect)?;
+    if matches!(observation, Observation::Pending) {
+        return Err(StoreError::Conflict("tracker closure is not ready".into()));
+    }
+    let keys = crate::effect_handlers::local_attempt_keys(
+        kernel,
+        instance_id,
+        &effect.effect_id,
+        ["capability-run", "capability-lease", "tracker-wait-fact"],
+    )?;
+    let (status, suffix, value, failure) = match observation {
+        Observation::Closed(value) => ("completed", "succeeded", value, Value::Null),
+        Observation::Invalid(message) => (
+            "failed",
+            "failed",
+            crate::effect_handlers::effect_failure_base(
+                "capability.call",
+                message,
+                message,
+                &effect.effect_id,
+                &keys.run_id,
+            ),
+            json!({"error_kind": "tracker_wait_input", "message": message}),
+        ),
+        Observation::Pending => unreachable!("pending observations do not dispatch"),
+    };
+    let lease = kernel.local_effect_lease_deadline()?;
+    let metadata = json!({"target": effect.target, "value": value, "failure": failure}).to_string();
+    kernel.settle_tracker_wait_observed(
+        RunStart {
+            instance_id,
+            effect_id: &effect.effect_id,
+            run_id: &keys.run_id,
+            provider: TRACKER_WAIT_PROVIDER,
+            worker_id: "whip-tracker-wait",
+            lease_id: &keys.lease_id,
+            lease_expires_at: &lease,
+            metadata_json: "{}",
+        },
+        effect,
+        EffectCompletion {
+            instance_id,
+            effect_id: &effect.effect_id,
+            run_id: &keys.run_id,
+            provider: TRACKER_WAIT_PROVIDER,
+            worker_id: "whip-tracker-wait",
+            status,
+            exit_code: Some(if status == "completed" { 0 } else { 1 }),
+            summary: None,
+            metadata_json: &metadata,
+            idempotency_key: Some(&keys.terminal_key),
+        },
+        &format!("capability.call.{suffix}"),
+        &json!({"effect_id": effect.effect_id, "run_id": keys.run_id, "target": effect.target,
+            "status": status, "value": value, "error": failure})
+        .to_string(),
+        &keys.fact_key,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

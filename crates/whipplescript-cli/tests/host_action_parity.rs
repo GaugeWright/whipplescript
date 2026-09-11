@@ -7,6 +7,8 @@ use serde_json::{json, Value};
 mod host_action_contract_reports;
 #[path = "support/materialized_action_parity.rs"]
 mod materialized_action_parity;
+#[path = "support/tracker_action_parity.rs"]
+mod tracker_action_parity;
 use std::collections::BTreeMap;
 use whipplescript_host_do::do_store::{test_support::RusqliteDoSql, DoSqliteStore};
 use whipplescript_kernel::gov::{

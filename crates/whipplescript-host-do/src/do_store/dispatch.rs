@@ -6,26 +6,33 @@ pub(super) fn start<S: DoSql>(
     run: RunStart<'_>,
     expected: Option<&ClaimableEffect>,
 ) -> StoreResult<StoredEvent> {
-    recovery::atomic_result(&store.sql, true, &mut || {
-        if let Some(expected) = expected {
-            let observed = observe(store, run)?;
-            whipplescript_store::dispatch_definition::check(expected, observed.as_ref())?;
-        }
-        let existing = store
-            .sql
-            .query(
-                "SELECT 1 FROM runs WHERE run_id = ?1 UNION ALL \
-             SELECT 1 FROM events WHERE instance_id = ?2 AND idempotency_key = ?1 LIMIT 1",
-                &[text(run.run_id), text(run.instance_id)],
-            )
-            .map_err(sql_err)?;
-        if !existing.is_empty() {
-            return Err(StoreError::Conflict(
-                "run already dispatched; reattachment cannot authorize new I/O".into(),
-            ));
-        }
-        store.start_run_on(run)
-    })
+    recovery::atomic_result(&store.sql, true, &mut || start_on(store, run, expected))
+}
+
+/// Caller owns the transaction, including ordinary policy/capacity denials.
+pub(super) fn start_on<S: DoSql>(
+    store: &DoSqliteStore<S>,
+    run: RunStart<'_>,
+    expected: Option<&ClaimableEffect>,
+) -> StoreResult<StoredEvent> {
+    if let Some(expected) = expected {
+        let observed = observe(store, run)?;
+        whipplescript_store::dispatch_definition::check(expected, observed.as_ref())?;
+    }
+    let existing = store
+        .sql
+        .query(
+            "SELECT 1 FROM runs WHERE run_id = ?1 UNION ALL \
+         SELECT 1 FROM events WHERE instance_id = ?2 AND idempotency_key = ?1 LIMIT 1",
+            &[text(run.run_id), text(run.instance_id)],
+        )
+        .map_err(sql_err)?;
+    if !existing.is_empty() {
+        return Err(StoreError::Conflict(
+            "run already dispatched; reattachment cannot authorize new I/O".into(),
+        ));
+    }
+    store.start_run_on(run)
 }
 
 pub(super) fn observe<S: DoSql>(

@@ -1,0 +1,117 @@
+{
+  "schema": "whipplescript.host_action_contract_pin.v4",
+  "contract_revision": "whipplescript-host-action/v4.0.0",
+  "authority": "WhippleScript DR-0099",
+  "operations": [
+    "admit_action",
+    "execute_action_file_effect",
+    "read_action_result",
+    "reconcile_effect",
+    "reconcile_versioned_save",
+    "execute_scoped_save_file_effect",
+    "reconcile_scoped_versioned_save",
+    "execute_resolution_recording",
+    "reconcile_resolution_recording",
+    "admit_action_with_inputs",
+    "execute_tracker_filing",
+    "execute_tracker_wait",
+    "execute_tracker_closure",
+    "recover_tracker_filing",
+    "recover_tracker_closure"
+  ],
+  "dispatch_kinds": [
+    "file.read",
+    "file.write",
+    "file.import",
+    "file.export",
+    "capability.call",
+    "tracker.file",
+    "tracker.finish"
+  ],
+  "message_types": [
+    "HostActionCommand",
+    "ActionAdmissionReceipt",
+    "ExecuteActionEffect",
+    "ReadActionResult",
+    "ActionResultSnapshot",
+    "ReconcileEffectCommand",
+    "ReconciliationReceipt",
+    "SaveReceipt",
+    "WriteEvidenceRef",
+    "ResolutionMemoryReceipt",
+    "ResolutionMemoryScope",
+    "ScopedSaveReceipt",
+    "ResolutionRecordingBinding",
+    "ResolutionRecordingInput",
+    "ClosureDispatch",
+    "FilingDispatch",
+    "RecoverTrackerResult",
+    "TrackerBinding",
+    "TrackerClosure",
+    "TrackerClosureBinding",
+    "TrackerClosureReceipt",
+    "TrackerFiling",
+    "TrackerFilingReceipt"
+  ],
+  "type_aliases": {
+    "RecoverTrackerFiling": "RecoverTrackerResult",
+    "RecoverTrackerClosure": "RecoverTrackerResult"
+  },
+  "compatibility": {
+    "schema_validity_grants_authority": false,
+    "receipt_handles_grant_authority": false,
+    "reconciliation_advances_workflow": false,
+    "legacy_turn_decoding_changed": false,
+    "save_receipts_may_contain_protected_content": true,
+    "complete_product_mediation": false,
+    "namespace_identity_grants_authority": false,
+    "resolution_receipt_authorizes_recording": false,
+    "recording_inputs_may_contain_protected_content": true,
+    "recording_binding_grants_authority": false,
+    "batch_receipt_proves_input_serialization": false,
+    "reconciliation_rehydrates_content": false,
+    "tracker_requests_may_contain_protected_content": true,
+    "tracker_assignment_grants_authority": false,
+    "tracker_receipt_grants_authority": false,
+    "claim_holder_identifies_closing_actor": false,
+    "tracker_result_delivery_may_advance_workflow": true,
+    "recovery_reopens_expired_attempts": false,
+    "typed_input_materialization_grants_authority": false
+  },
+  "canonicalization": {
+    "encoding": "UTF-8",
+    "object_key_order": "Unicode scalar order; not UTF-16 or RFC 8785",
+    "integers": "Exact u64/i64 JSON integers; do not normalize through binary floating point",
+    "optional_fields": "Normalize with the pinned Rust codec before signing; absent and explicit null optional fields share its typed meaning",
+    "signing_domain_terminator": "NUL byte; domains are defined by the pinned runtime protocol"
+  },
+  "base_contract": {
+    "path": "spec/host-action-contract-v3.json",
+    "sha256": "a0fe26819e2f8ca29159995738064390597e0ec3260eeddf04009ae650dfb06b",
+    "contract_digest": "00e082316c68f5c696663cfaef2ad6f9e4488b707d172ba4f0c1829e02877e63"
+  },
+  "wire_schema": {
+    "path": "spec/report-schemas/host_action_v4.schema.json",
+    "sha256": "4f75aa948a633cf9e7486c2535d616a6db4dcb0248d7f7239917a617526ac2a7"
+  },
+  "fixtures": {
+    "path": "spec/host-action-contract-fixtures-v4.json",
+    "sha256": "abf191ec73540fb57248c8ff6f1db330daca4bebf7136175288af3da175ebff4"
+  },
+  "codec_harness": {
+    "path": "crates/whipplescript-kernel/examples/host_action_contract_v4.rs",
+    "sha256": "1ef5f16af856a0937a3988c55ae1f356249dfa9c56074bef2b7c2f652c0b8cd5"
+  },
+  "tracker_profile": {
+    "provider": "builtin",
+    "filing": "tracker.file",
+    "closing": "tracker.finish",
+    "wait_capability": "tracker.wait_closed",
+    "recovery_protocol": "whipplescript.tracker-result-delivery.v1",
+    "source": "registered ordinary workflow",
+    "original_inputs": "immutable labeled references",
+    "assignment": "advisory; no read grant",
+    "claim_holder": "independent of closing actor"
+  },
+  "contract_digest": "b468641c9ccb6d41482c2f9c5a2c5f49258611a90fd9776dec87c39546d06370"
+}

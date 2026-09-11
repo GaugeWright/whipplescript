@@ -442,6 +442,40 @@ pub fn step_instance_generic<S: RuntimeStore + Coordination + WorkItems + Fronti
             }
             let mut recorded = Vec::new();
             for event in live {
+                // A proved result can arrive after the original run expired.
+                // Its run terminal stays final, but the firing still owes its
+                // ordinary continuation after this newer result publication.
+                if matches!(
+                    event.event_type.as_str(),
+                    whipplescript_store::tracker_result::DELIVERY_EVENT
+                        | whipplescript_store::tracker_result::CLOSING_DELIVERY_EVENT
+                ) && event.source == "kernel"
+                {
+                    use whipplescript_store::tracker_result::{
+                        RecordedTrackerResult, TrackerClosureResultDelivery,
+                    };
+                    let record = if event.event_type
+                        == whipplescript_store::tracker_result::DELIVERY_EVENT
+                    {
+                        serde_json::from_str::<RecordedTrackerResult>(&event.payload_json)?
+                            .into_delivered()
+                    } else {
+                        serde_json::from_str::<RecordedTrackerResult<TrackerClosureResultDelivery>>(
+                            &event.payload_json,
+                        )?
+                        .into_delivered()
+                    };
+                    if record.delivery.instance_id() != instance_id {
+                        return Err(StoreError::Conflict(
+                            "tracker result wake belongs to another instance".into(),
+                        ));
+                    }
+                    let slot = effect_terminal_sequence
+                        .entry(record.delivery.effect_id().to_owned())
+                        .or_insert(0);
+                    *slot = (*slot).max(event.sequence);
+                    continue;
+                }
                 if event.event_type == "effect.terminal" {
                     if let Some(effect_id) = serde_json::from_str::<Value>(&event.payload_json)
                         .ok()

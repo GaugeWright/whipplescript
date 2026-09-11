@@ -2,6 +2,20 @@
 use super::VerifiedEnvelope;
 
 impl VerifiedEnvelope {
+    /// Verify that a program's alias and an adapter's resource identify the
+    /// same governed object. Equal labels alone do not establish that binding.
+    /// This query grants neither access nor execution authority.
+    pub fn check_resource_binding(&self, alias: &str, resource: &str) -> Result<(), String> {
+        let envelope = self.envelope();
+        if !envelope.governs(alias) || !envelope.governs(resource) {
+            return Err("resource binding is not governed".into());
+        }
+        if envelope.resolve(alias) != envelope.resolve(resource) {
+            return Err("resource binding names a different object".into());
+        }
+        Ok(())
+    }
+
     /// Preserve an immutable input's classification when it becomes a workflow
     /// fact. This query grants no body access: the host separately authenticates
     /// the exact input version and its label binding before materialization.
@@ -90,6 +104,39 @@ mod tests {
             },
             "bindings": {"remembered": "memory:resolutions", "target": "file:/target"}
         })
+    }
+
+    #[test]
+    fn resource_binding_requires_one_governed_identity_not_just_equal_labels() {
+        let mut document = policy(json!([]), json!([]), json!([]), json!([]));
+        document["bindings"]["another_alias"] = json!("memory:resolutions");
+        let envelope = verified(document);
+        assert_eq!(
+            envelope.check_resource_binding("remembered", "memory:resolutions"),
+            Ok(())
+        );
+        assert_eq!(
+            envelope.check_resource_binding("remembered", "another_alias"),
+            Ok(())
+        );
+        assert_eq!(
+            envelope.check_resource_binding("target", "file:/target"),
+            Ok(())
+        );
+        assert_eq!(
+            envelope.check_resource_binding("remembered", "target"),
+            Err("resource binding names a different object".into())
+        );
+        for (alias, target) in [
+            ("missing", "target"),
+            ("remembered", "missing"),
+            ("missing", "missing"),
+        ] {
+            assert_eq!(
+                envelope.check_resource_binding(alias, target),
+                Err("resource binding is not governed".into())
+            );
+        }
     }
 
     #[test]

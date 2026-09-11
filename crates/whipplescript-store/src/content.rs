@@ -440,6 +440,15 @@ pub struct ContentStore {
 
 #[cfg(feature = "native")]
 impl ContentStore {
+    /// Open only a current existing content store. Checks its owning stamp and
+    /// SQLite integrity, establishes WAL, and never creates or repairs schema.
+    /// Missing schema required by an operation remains an error when used.
+    pub fn open_existing(path: impl AsRef<Path>) -> StoreResult<Self> {
+        let connection =
+            crate::native_existing::open(path.as_ref(), "content", SATELLITE_SCHEMA_VERSION)?;
+        Ok(Self { connection })
+    }
+
     /// Open an existing store without creating directories, initializing or
     /// migrating its schema. Missing or incompatible records fail when read.
     /// SQLite enforces read-only access even through this type's write methods;

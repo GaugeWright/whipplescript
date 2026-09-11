@@ -31,6 +31,16 @@ pub fn record_recording<S, T: Serialize>(scenario: &str, message_type: &str, val
     );
 }
 
+#[allow(dead_code)] // Other contract generations compile this shared helper.
+pub fn record_tracker<S, T: Serialize>(scenario: &str, message_type: &str, value: &T) {
+    record_into::<S, T>(
+        "WHIPPLESCRIPT_TRACKER_ACTION_REPORT_DIR",
+        scenario,
+        message_type,
+        value,
+    );
+}
+
 fn record_into<S, T: Serialize>(variable: &str, scenario: &str, message_type: &str, value: &T) {
     let Some(directory) = std::env::var_os(variable) else {
         return;

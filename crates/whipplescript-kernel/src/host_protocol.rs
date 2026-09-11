@@ -16,6 +16,7 @@ pub mod action_result;
 mod action_wire;
 pub mod execution;
 pub mod recovery;
+pub mod tracker_recovery;
 
 pub const HOST_PROTOCOL: &str = "whipplescript.host.v1";
 

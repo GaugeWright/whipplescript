@@ -109,19 +109,22 @@ fn snapshot(store: &SqliteStore) -> Vec<Vec<Vec<rusqlite::types::Value>>> {
 
 #[test]
 fn native_file_settlement_rolls_back_every_write_boundary() {
-    native_settlement_faults(false, "failed");
+    native_settlement_faults("files", "failed");
 }
 
 #[test]
 fn native_recording_settlement_rolls_back_every_write_boundary() {
     for status in ["completed", "failed"] {
-        native_settlement_faults(true, status);
+        native_settlement_faults("recording", status);
     }
 }
 
-fn native_settlement_faults(recording: bool, status: &str) {
+fn native_settlement_faults(profile: &str, status: &str) {
     for timing in ["BEFORE", "AFTER"] {
         for (table, action, predicate) in [
+            ("events", "INSERT", "NEW.event_type = 'effect.run_started'"),
+            ("runs", "INSERT", "1"),
+            ("leases", "INSERT", "1"),
             ("events", "INSERT", "NEW.event_type = 'effect.terminal'"),
             ("runs", "UPDATE", "1"),
             ("leases", "UPDATE", "1"),
@@ -130,8 +133,20 @@ fn native_settlement_faults(recording: bool, status: &str) {
             ("events", "INSERT", "NEW.event_type = 'fact.derived'"),
             ("facts", "INSERT", "1"),
         ] {
+            if profile != "atomic-wait"
+                && (predicate.contains("effect.run_started")
+                    || (action == "INSERT" && matches!(table, "runs" | "leases")))
+            {
+                continue;
+            }
             let mut store = SqliteStore::open_in_memory().expect("settlement fixture operation");
-            let fixture = if recording {
+            let fixture = if profile == "atomic-wait" {
+                tracker_conformance::setup_wait_queued(&mut store, status)
+            } else if profile == "closure" {
+                tracker_conformance::setup_closure(&mut store, status)
+            } else if profile == "wait" {
+                tracker_conformance::setup_wait(&mut store, status)
+            } else if profile == "recording" {
                 recording_conformance::setup(&mut store, status)
             } else {
                 conformance::setup(&mut store, "file.write", status)
@@ -140,7 +155,9 @@ fn native_settlement_faults(recording: bool, status: &str) {
             if table == "diagnostics" && status == "completed" {
                 continue;
             }
-            let metadata = if recording {
+            let metadata = if matches!(profile, "wait" | "atomic-wait" | "closure") {
+                tracker_conformance::wait_metadata(&fixture)
+            } else if profile == "recording" {
                 recording_conformance::metadata(status)
             } else {
                 fixture.completion().metadata_json.to_owned()
@@ -148,6 +165,24 @@ fn native_settlement_faults(recording: bool, status: &str) {
             let completion = crate::EffectCompletion {
                 metadata_json: &metadata,
                 ..fixture.completion()
+            };
+            let expected = store
+                .claimable_effects(&fixture.instance)
+                .expect("queued effect");
+            let settle = |store: &mut SqliteStore| {
+                if profile == "atomic-wait" {
+                    store.settle_tracker_wait(
+                        fixture.run(),
+                        &expected[0],
+                        TrackerWaitSettlement {
+                            completion,
+                            diagnostic: fixture.diagnostic(),
+                            fact: fixture.fact(),
+                        },
+                    )
+                } else {
+                    store.settle_local_effect(completion, fixture.diagnostic(), fixture.fact())
+                }
             };
             let before = snapshot(&store);
             store
@@ -157,9 +192,7 @@ fn native_settlement_faults(recording: bool, status: &str) {
                  BEGIN SELECT RAISE(ABORT, 'injected settlement fault'); END"
             ))
                 .expect("settlement fixture operation");
-            let error = store
-                .settle_local_effect(completion, fixture.diagnostic(), fixture.fact())
-                .expect_err("invalid settlement must refuse");
+            let error = settle(&mut store).expect_err("invalid settlement must refuse");
             assert!(
                 format!("{error:?}").contains("injected settlement fault"),
                 "{timing} {table}: {error:?}"
@@ -169,9 +202,7 @@ fn native_settlement_faults(recording: bool, status: &str) {
                 .connection
                 .execute_batch("DROP TRIGGER settlement_fault")
                 .expect("settlement fixture operation");
-            store
-                .settle_local_effect(completion, fixture.diagnostic(), fixture.fact())
-                .expect("settlement fixture operation");
+            settle(&mut store).expect("settlement fixture operation");
             assert_eq!(
                 store
                     .list_facts(&fixture.instance)
@@ -193,6 +224,64 @@ fn native_recording_settlement_and_replay() {
     }
     for case in ["missing-target", "foreign-target", "foreign-provider"] {
         recording_conformance::refuse_foreign_profile(
+            &mut SqliteStore::open_in_memory().expect("store"),
+            case,
+        );
+    }
+}
+
+#[test]
+fn native_tracker_settlement_and_replay() {
+    for status in ["completed", "failed"] {
+        tracker_conformance::run_suite(&mut SqliteStore::open_in_memory().expect("store"), status);
+    }
+    for case in ["kind", "provider", "missing-queue", "empty-queue"] {
+        tracker_conformance::refuse_foreign_profile(
+            &mut SqliteStore::open_in_memory().expect("store"),
+            case,
+        );
+    }
+}
+
+#[test]
+fn native_tracker_wait_settlement_and_replay() {
+    for status in ["completed", "failed"] {
+        tracker_conformance::run_wait_suite(
+            &mut SqliteStore::open_in_memory().expect("store"),
+            status,
+        );
+        native_settlement_faults("wait", status);
+    }
+    for case in ["kind", "provider", "missing-target", "foreign-target"] {
+        tracker_conformance::refuse_foreign_wait_profile(
+            &mut SqliteStore::open_in_memory().expect("store"),
+            case,
+        );
+    }
+}
+
+#[test]
+fn native_atomic_tracker_wait_settlement_and_replay() {
+    for state in ["paused", "cancelled", "effect-cancelled"] {
+        wait_conformance::refuse_stopped(&mut SqliteStore::open_in_memory().expect("store"), state);
+    }
+    for status in ["completed", "failed"] {
+        wait_conformance::run_suite(&mut SqliteStore::open_in_memory().expect("store"), status);
+        native_settlement_faults("atomic-wait", status);
+    }
+}
+
+#[test]
+fn native_tracker_closure_settlement_and_replay() {
+    for status in ["completed", "failed"] {
+        tracker_conformance::run_closure_suite(
+            &mut SqliteStore::open_in_memory().expect("store"),
+            status,
+        );
+        native_settlement_faults("closure", status);
+    }
+    for case in ["kind", "provider", "target", "empty-target"] {
+        tracker_conformance::refuse_foreign_closure_profile(
             &mut SqliteStore::open_in_memory().expect("store"),
             case,
         );

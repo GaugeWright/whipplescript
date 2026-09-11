@@ -43,6 +43,8 @@ pub mod save_reconciliation;
 pub mod source_merge;
 pub mod time_pass;
 pub mod trace;
+pub mod tracker_closure;
+pub mod tracker_filing;
 pub mod tracker_wait;
 pub mod whip_shell;
 pub mod workflow_input;
