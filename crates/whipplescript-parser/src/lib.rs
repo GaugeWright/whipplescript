@@ -5604,6 +5604,8 @@ impl IrEffectKind {
         Self::ExecCommand,
         Self::HttpRequest,
         Self::MintCredential,
+        Self::RotateCredential,
+        Self::RevokeCredential,
         Self::TrackerFile,
         Self::TrackerClaim,
         Self::TrackerRenew,
@@ -5619,6 +5621,48 @@ impl IrEffectKind {
         Self::FileImport,
         Self::FileExport,
     ];
+
+    /// Whether an effect of this kind reaches a language model.
+    ///
+    /// Exactly two do. This is the predicate DR-0116's `grain` turns on: an
+    /// effect that cannot make a model call has a call count of `0` that is
+    /// COMPLETE, while a model-calling effect whose usage the log does not
+    /// carry has a call count that is UNRECORDED, and rendering the second as
+    /// the first is the defect that record exists to prevent.
+    ///
+    /// The match is exhaustive with no wildcard on purpose: a new effect kind
+    /// does not compile until someone decides which side it falls on. A
+    /// wildcard here would silently classify a future model-calling kind as
+    /// making none, which is the failure mode `check_with_envelope`'s
+    /// `_ => {}` already produced once for information flow.
+    pub fn makes_model_call(&self) -> bool {
+        match self {
+            Self::AgentTell | Self::SchemaCoerce => true,
+            Self::CapabilityCall
+            | Self::EventEmit
+            | Self::WorkflowInvoke
+            | Self::TimerWait
+            | Self::ExecCommand
+            | Self::HttpRequest
+            | Self::MintCredential
+            | Self::RotateCredential
+            | Self::RevokeCredential
+            | Self::TrackerFile
+            | Self::TrackerClaim
+            | Self::TrackerRenew
+            | Self::TrackerRelease
+            | Self::TrackerFinish
+            | Self::LeaseAcquire
+            | Self::LeaseRenew
+            | Self::LedgerAppend
+            | Self::CounterConsume
+            | Self::SignalEmit
+            | Self::FileRead
+            | Self::FileWrite
+            | Self::FileImport
+            | Self::FileExport => false,
+        }
+    }
 
     /// The inverse of [`as_str`](Self::as_str): an effect-kind string back to
     /// its variant.

@@ -110,6 +110,9 @@ DEV_INSTANCE_ID="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]
 cargo run --quiet -p whipplescript -- --store "$TMP_STORE" --json trace \
   "$DEV_INSTANCE_ID" --check \
   > "$TMP_DIR/trace.json"
+cargo run --quiet -p whipplescript -- --store "$TMP_STORE" --json stats \
+  --by rule,model \
+  > "$TMP_DIR/stats.json"
 cargo run --quiet -p whipplescript -- --store "$TMP_STREAM_STORE" run \
   examples/provider-language-e2e.whip --provider fixture --until idle --stream ndjson \
   > "$TMP_DIR/dev-stream.ndjson"
@@ -2008,6 +2011,7 @@ pairs = [
     ("spec/report-schemas/dev_report_v0.schema.json", tmp_dir / "dev.json"),
     ("spec/report-schemas/test_report_v0.schema.json", tmp_dir / "test.json"),
     ("spec/report-schemas/local_trace_v0.schema.json", tmp_dir / "trace.json"),
+    ("spec/report-schemas/stats_report_v0.schema.json", tmp_dir / "stats.json"),
     ("spec/report-schemas/acceptance_fixture_v0.schema.json", Path("examples/provider-language-e2e.accept.json")),
     ("spec/report-schemas/acceptance_report_v0.schema.json", tmp_dir / "acceptance.json"),
     ("spec/report-schemas/package_check_v0.schema.json", tmp_dir / "package-check.json"),

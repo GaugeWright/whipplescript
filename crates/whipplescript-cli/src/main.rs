@@ -137,6 +137,7 @@ mod harness_tools;
 mod improve;
 mod ingress_listener;
 mod injected_secrets;
+mod stats_report;
 use whipplescript::instance_view;
 mod lsp_server;
 mod maude_model;
@@ -1145,6 +1146,12 @@ const COMMANDS: &[CommandSpec] = &[
         group: "inspect",
         usage: "usage: whip trace <instance> [--check]",
         run: trace,
+    },
+    CommandSpec {
+        name: "stats",
+        group: "inspect",
+        usage: "usage: whip [--store path] [--json] stats [<instance>] [--program <id>] [--since <rfc3339>] [--until <rfc3339>] [--by <dim>[,<dim>...]]\n  a fold over the durable log: token, call and retry measures grouped by structural\n  identifiers only — never a fact value, an effect target, or effect input (DR-0117).\n  `grain` is always in the group key, so a row never mixes a population where a measure\n  is recorded with one where it is not, and `-`/null is UNRECORDED rather than zero (DR-0116)",
+        run: stats_report::stats,
     },
     CommandSpec {
         name: "view",

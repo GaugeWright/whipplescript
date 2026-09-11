@@ -1,0 +1,83 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://whipplescript.local/schemas/stats_report_v0.schema.json",
+  "title": "WhippleScript stats report v0",
+  "description": "A fold over the durable log (DR-0114). Every dimension is a structural identifier, a status, or a derived bucket, and the schema has no free-text property, so conformance to it IS the DR-0117 content check. A measure is an integer or null; null means UNRECORDED and is never zero (DR-0116).",
+  "type": "object",
+  "required": ["schema", "rows"],
+  "properties": {
+    "schema": {"const": "whipplescript.stats_report.v0"},
+    "rows": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/row"}
+    }
+  },
+  "additionalProperties": true,
+  "$defs": {
+    "measure": {
+      "description": "An integer the log establishes, or null when the log does not carry it. Null is not zero: an effect that cannot make a model call has 0 calls and that 0 is complete, while a model-calling run whose usage the log lacks has null.",
+      "type": ["integer", "null"]
+    },
+    "dimension_value": {
+      "description": "A structural identifier, status, or derived bucket. Never a fact value, an effect target, effect input, or free text.",
+      "type": ["string", "null"]
+    },
+    "key": {
+      "description": "The group key. `grain` is always present, whether or not the caller asked for it, so a row can never mix a population where a measure is recorded with one where it is not.",
+      "type": "object",
+      "required": ["grain"],
+      "properties": {
+        "program_id": {"$ref": "#/$defs/dimension_value"},
+        "program_version_id": {"$ref": "#/$defs/dimension_value"},
+        "instance_id": {"$ref": "#/$defs/dimension_value"},
+        "revision_epoch": {"$ref": "#/$defs/dimension_value"},
+        "rule": {"$ref": "#/$defs/dimension_value"},
+        "effect_kind": {"$ref": "#/$defs/dimension_value"},
+        "effect_id": {"$ref": "#/$defs/dimension_value"},
+        "run_id": {"$ref": "#/$defs/dimension_value"},
+        "agent": {"$ref": "#/$defs/dimension_value"},
+        "profile": {"$ref": "#/$defs/dimension_value"},
+        "provider": {"$ref": "#/$defs/dimension_value"},
+        "model": {"$ref": "#/$defs/dimension_value"},
+        "status": {"$ref": "#/$defs/dimension_value"},
+        "block_category": {"$ref": "#/$defs/dimension_value"},
+        "step": {"$ref": "#/$defs/dimension_value"},
+        "day": {"$ref": "#/$defs/dimension_value"},
+        "grain": {"enum": ["call", "turn", "none"]}
+      },
+      "additionalProperties": false
+    },
+    "measures": {
+      "type": "object",
+      "required": ["effects", "runs", "retries", "calls", "output"],
+      "properties": {
+        "effects": {"$ref": "#/$defs/measure"},
+        "runs": {"$ref": "#/$defs/measure"},
+        "retries": {"$ref": "#/$defs/measure"},
+        "turns": {"$ref": "#/$defs/measure"},
+        "calls": {"$ref": "#/$defs/measure"},
+        "steps": {"$ref": "#/$defs/measure"},
+        "input_uncached": {"$ref": "#/$defs/measure"},
+        "input_cache_read": {"$ref": "#/$defs/measure"},
+        "input_cache_write": {"$ref": "#/$defs/measure"},
+        "output": {"$ref": "#/$defs/measure"},
+        "completed": {"$ref": "#/$defs/measure"},
+        "failed": {"$ref": "#/$defs/measure"},
+        "timed_out": {"$ref": "#/$defs/measure"},
+        "cancelled": {"$ref": "#/$defs/measure"},
+        "blocked": {"$ref": "#/$defs/measure"},
+        "last_input_tokens": {"$ref": "#/$defs/measure"}
+      },
+      "additionalProperties": true
+    },
+    "row": {
+      "type": "object",
+      "required": ["key", "measures"],
+      "properties": {
+        "key": {"$ref": "#/$defs/key"},
+        "measures": {"$ref": "#/$defs/measures"}
+      },
+      "additionalProperties": false
+    }
+  }
+}

@@ -122,7 +122,9 @@ struct TurnUsage {
 impl TurnUsage {
     /// Normalize a provider `usage` object by FIELD SHAPE, not provider name,
     /// so future OpenAI-compatible / self-hosted engines that mimic either
-    /// wire family work without a whip change:
+    /// wire family work without a whip change. The shape rule itself lives in
+    /// `whipplescript_kernel::stats::UsageBuckets`; this adds only the
+    /// pricing-side identity (provider, model) and the provider's own total:
     /// - Anthropic shape: `input_tokens` EXCLUDES cache traffic;
     ///   `cache_read_input_tokens` / `cache_creation_input_tokens` are separate.
     /// - OpenAI shape: `prompt_tokens` (chat) / `input_tokens` (responses)
@@ -130,45 +132,21 @@ impl TurnUsage {
     ///   `input_tokens_details.cached_tokens` is the cached subset (no
     ///   write-side field — OpenAI cache writes are automatic and unbilled).
     fn from_usage_json(provider: &str, model: &str, usage: &Value) -> Self {
-        let raw_input = usage
-            .get("input_tokens")
-            .or_else(|| usage.get("prompt_tokens"))
+        // ONE implementation of the wire rule, in the kernel, which the stats
+        // fold also reads (DR-0118). Keeping a second copy here is what let the
+        // hosted `project_usage` drift to the opposite convention.
+        let buckets = whipplescript_kernel::stats::UsageBuckets::from_usage_json(usage);
+        let total_tokens = usage
+            .get("total_tokens")
             .and_then(Value::as_i64)
-            .unwrap_or(0);
-        let output_tokens = usage
-            .get("output_tokens")
-            .or_else(|| usage.get("completion_tokens"))
-            .and_then(Value::as_i64)
-            .unwrap_or(0);
-        // Anthropic-shape cache fields: input is already exclusive of these.
-        let anthropic_read = usage.get("cache_read_input_tokens").and_then(Value::as_i64);
-        let cache_write_tokens = usage
-            .get("cache_creation_input_tokens")
-            .and_then(Value::as_i64);
-        // OpenAI-shape cached subset: input INCLUDES it, so subtract below.
-        let openai_cached = usage
-            .get("prompt_tokens_details")
-            .or_else(|| usage.get("input_tokens_details"))
-            .and_then(|details| details.get("cached_tokens"))
-            .and_then(Value::as_i64);
-        let (input_tokens, cache_read_tokens) = match (anthropic_read, openai_cached) {
-            (Some(read), _) => (raw_input, Some(read)),
-            (None, Some(cached)) => ((raw_input - cached).max(0), Some(cached)),
-            (None, None) => (raw_input, None),
-        };
-        let total_tokens = usage.get("total_tokens").and_then(Value::as_i64).unwrap_or(
-            input_tokens
-                + cache_read_tokens.unwrap_or(0)
-                + cache_write_tokens.unwrap_or(0)
-                + output_tokens,
-        );
+            .unwrap_or_else(|| buckets.input_side() + buckets.output);
         Self {
             provider: provider.to_owned(),
             model: model.to_owned(),
-            input_tokens,
-            output_tokens,
-            cache_read_tokens,
-            cache_write_tokens,
+            input_tokens: buckets.input_uncached,
+            output_tokens: buckets.output,
+            cache_read_tokens: buckets.cache_read,
+            cache_write_tokens: buckets.cache_write,
             total_tokens,
         }
     }

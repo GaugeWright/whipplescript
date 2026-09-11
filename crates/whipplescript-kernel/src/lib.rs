@@ -41,6 +41,7 @@ pub mod rule_pass;
 pub mod sansio;
 pub mod save_reconciliation;
 pub mod source_merge;
+pub mod stats;
 pub mod time_pass;
 pub mod trace;
 pub mod tracker_closure;

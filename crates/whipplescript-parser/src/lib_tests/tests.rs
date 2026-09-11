@@ -25264,8 +25264,14 @@ fn the_bare_and_block_spellings_lower_to_the_same_provider() {
 #[test]
 fn every_effect_kind_round_trips_through_its_kind_string() {
     // `from_kind_str` is derived from `as_str` rather than written backwards, so
-    // this is a guard on `ALL` being complete: a variant missing from it becomes
-    // a kind string no snapshot reader can resolve.
+    // this LOOKS like a guard on `ALL` being complete. It is not, and it could
+    // not be: iterating `ALL` can only reach the variants already in it, and the
+    // frozen length below froze the gap in place. `RotateCredential` and
+    // `RevokeCredential` were missing for exactly that reason, so
+    // `from_kind_str("custody.rotate")` returned `None` for a kind this build
+    // knows. The real guard is
+    // `all_lists_every_effect_kind_and_every_kind_round_trips`, whose exhaustive
+    // match does not compile when a variant is added.
     for kind in IrEffectKind::ALL {
         assert_eq!(
             IrEffectKind::from_kind_str(kind.as_str()).as_ref(),
@@ -25274,7 +25280,7 @@ fn every_effect_kind_round_trips_through_its_kind_string() {
             kind.as_str()
         );
     }
-    assert_eq!(IrEffectKind::ALL.len(), 23);
+    assert_eq!(IrEffectKind::ALL.len(), 25);
     assert_eq!(IrEffectKind::from_kind_str("nothing.here"), None);
 }
 
@@ -25564,4 +25570,108 @@ fn a_statement_head_that_opens_a_prompt_still_reaches_the_collector() {
             "{label}: the head is collected whether or not it opens a prompt"
         );
     }
+}
+
+/// `IrEffectKind::ALL` claims "every variant, in declaration order", and
+/// `from_kind_str` finds a variant by scanning it — so a variant missing from
+/// `ALL` makes a kind this build DOES know read back as unknown. Two were
+/// missing (`custody.rotate`, `custody.revoke`) and nothing noticed, because
+/// the only check on `ALL` was the comment.
+///
+/// The match below is the check the list needed: it is exhaustive with no
+/// wildcard, so a new variant does not compile until it is added here, and the
+/// assertion then forces it into `ALL` as well.
+#[test]
+fn all_lists_every_effect_kind_and_every_kind_round_trips() {
+    use crate::IrEffectKind as K;
+    fn every_variant() -> Vec<K> {
+        // Adding a variant fails to compile here before it can go missing
+        // from `ALL`.
+        let exhaustive = |kind: K| match kind {
+            K::AgentTell
+            | K::SchemaCoerce
+            | K::CapabilityCall
+            | K::EventEmit
+            | K::WorkflowInvoke
+            | K::TimerWait
+            | K::ExecCommand
+            | K::HttpRequest
+            | K::MintCredential
+            | K::RotateCredential
+            | K::RevokeCredential
+            | K::TrackerFile
+            | K::TrackerClaim
+            | K::TrackerRenew
+            | K::TrackerRelease
+            | K::TrackerFinish
+            | K::LeaseAcquire
+            | K::LeaseRenew
+            | K::LedgerAppend
+            | K::CounterConsume
+            | K::SignalEmit
+            | K::FileRead
+            | K::FileWrite
+            | K::FileImport
+            | K::FileExport => kind,
+        };
+        vec![
+            K::AgentTell,
+            K::SchemaCoerce,
+            K::CapabilityCall,
+            K::EventEmit,
+            K::WorkflowInvoke,
+            K::TimerWait,
+            K::ExecCommand,
+            K::HttpRequest,
+            K::MintCredential,
+            K::RotateCredential,
+            K::RevokeCredential,
+            K::TrackerFile,
+            K::TrackerClaim,
+            K::TrackerRenew,
+            K::TrackerRelease,
+            K::TrackerFinish,
+            K::LeaseAcquire,
+            K::LeaseRenew,
+            K::LedgerAppend,
+            K::CounterConsume,
+            K::SignalEmit,
+            K::FileRead,
+            K::FileWrite,
+            K::FileImport,
+            K::FileExport,
+        ]
+        .into_iter()
+        .map(exhaustive)
+        .collect()
+    }
+
+    for kind in every_variant() {
+        assert!(
+            K::ALL.contains(&kind),
+            "{kind:?} is missing from IrEffectKind::ALL, so from_kind_str(\"{}\") reads a known kind as unknown",
+            kind.as_str()
+        );
+        let round_tripped = K::from_kind_str(kind.as_str());
+        assert_eq!(
+            round_tripped.as_ref(),
+            Some(&kind),
+            "{kind:?} does not round-trip through its kind string"
+        );
+    }
+    assert_eq!(K::ALL.len(), every_variant().len());
+}
+
+/// The `grain` predicate DR-0116 turns on: exactly the two model-calling kinds
+/// answer true, and the answer is a property of the kind rather than of what a
+/// particular run happened to record.
+#[test]
+fn exactly_the_two_model_calling_kinds_make_model_calls() {
+    use crate::IrEffectKind as K;
+    let calling: Vec<&str> = K::ALL
+        .iter()
+        .filter(|kind| kind.makes_model_call())
+        .map(|kind| kind.as_str())
+        .collect();
+    assert_eq!(calling, vec!["agent.tell", "schema.coerce"]);
 }
