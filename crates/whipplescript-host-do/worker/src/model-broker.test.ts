@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  boundManagedProviderBody,
   performDirectProviderFetch,
   MODEL_AUTH_SENTINEL,
   MODEL_EGRESS_PROTOCOL,
@@ -554,6 +555,50 @@ test("broker configuration and protocol failures are fail-closed", async () => {
 
 // ---- managed gateway funding (ADR 0085 §3/§6, FUND-1) --------------------
 
+test("a managed request reserves a conservative total and caps provider output", () => {
+  const bounded = boundManagedProviderBody(
+    {
+      model: "openai/gpt-4.1",
+      messages: [{ role: "user", content: "hello" }],
+      max_completion_tokens: 10_000,
+    },
+    5_000,
+  );
+  assert.equal(
+    (bounded.body as Record<string, unknown>).max_completion_tokens,
+    4_096,
+  );
+  assert.equal(
+    bounded.reserved_tokens,
+    bounded.input_upper_bound + bounded.output_limit,
+  );
+  assert.ok(bounded.reserved_tokens <= 5_000);
+});
+
+test("a managed request whose input upper bound consumes the allowance never reaches egress", () => {
+  assert.throws(
+    () => boundManagedProviderBody(
+      {
+        model: "openai/gpt-4.1",
+        messages: [{ role: "user", content: "x".repeat(1_000) }],
+        max_completion_tokens: 1,
+      },
+      500,
+    ),
+    /input exceeds the turn token allowance/,
+  );
+});
+
+test("a managed request must name exactly one provider output ceiling", () => {
+  assert.throws(
+    () => boundManagedProviderBody(
+      { max_tokens: 10, max_completion_tokens: 10 },
+      1_000,
+    ),
+    /conflicting output token limits/,
+  );
+});
+
 const gatewayBinding = {
   credential_id: "gaugedesk:managed-plan:v1:74656e616e74:73747269706500",
   credential_class: "managed-openai",
@@ -606,6 +651,60 @@ test("a managed round spends the gateway token and no customer credential", asyn
   assert.ok(!capturedAuthorization.includes(MODEL_AUTH_SENTINEL));
   assert.equal(capturedUrl, `${gatewayBinding.base_url}/chat/completions`);
   assert.equal(capturedByokAlias, "primary");
+});
+
+test("managed token admission runs before egress and controls the sent limit", async () => {
+  let reached = false;
+  let sent: Record<string, unknown> = {};
+  await performManagedGatewayFetch(
+    {
+      url: `${gatewayBinding.base_url}/chat/completions`,
+      headers: [
+        ["authorization", `Bearer ${MODEL_AUTH_SENTINEL}`],
+        ["idempotency-key", "round-1"],
+      ],
+      body: { model: gatewayBinding.model, messages: [] },
+    },
+    gatewayBinding,
+    { token: () => "cf-gateway-token" },
+    async (_url, init) => {
+      reached = true;
+      sent = JSON.parse(String(init.body)) as Record<string, unknown>;
+      return Response.json({ choices: [] });
+    },
+    undefined,
+    undefined,
+    undefined,
+    async (_target, body) => boundManagedProviderBody(body, 1_000).body,
+  );
+  assert.equal(reached, true);
+  assert.ok(Number(sent.max_completion_tokens) > 0);
+  assert.ok(Number(sent.max_completion_tokens) < 1_000);
+});
+
+test("failed managed token admission performs no provider request", async () => {
+  let reached = false;
+  await assert.rejects(
+    () => performManagedGatewayFetch(
+      {
+        url: `${gatewayBinding.base_url}/chat/completions`,
+        headers: [["authorization", `Bearer ${MODEL_AUTH_SENTINEL}`]],
+        body: { model: gatewayBinding.model, messages: [] },
+      },
+      gatewayBinding,
+      { token: () => "cf-gateway-token" },
+      async () => {
+        reached = true;
+        return Response.json({});
+      },
+      undefined,
+      undefined,
+      undefined,
+      async () => { throw new Error("allowance exhausted"); },
+    ),
+    /allowance exhausted/,
+  );
+  assert.equal(reached, false);
 });
 
 for (const retryableStatus of [401, 403, 408, 425, 429, 500, 503]) {

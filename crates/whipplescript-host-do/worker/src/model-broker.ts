@@ -59,6 +59,87 @@ export interface ManagedGatewaySecret {
   token: () => string | undefined;
 }
 
+/** Server-owned admission invoked immediately before one managed provider
+ * egress. It receives the exact normalized provider body and must return the
+ * body whose output ceiling was durably charged against the turn reservation.
+ * A rejected promise means no provider request is made. */
+export type ManagedProviderTokenAdmission = (
+  targetUrl: string,
+  body: unknown,
+) => Promise<unknown>;
+
+const MANAGED_PROVIDER_INPUT_FRAMING_TOKENS = 256;
+const MANAGED_PROVIDER_MAX_OUTPUT_TOKENS_PER_ROUND = 4_096;
+const MANAGED_OUTPUT_LIMIT_FIELDS = [
+  "max_tokens",
+  "max_output_tokens",
+  "max_completion_tokens",
+] as const;
+
+export interface ManagedProviderBound {
+  body: unknown;
+  input_upper_bound: number;
+  output_limit: number;
+  reserved_tokens: number;
+}
+
+/**
+ * Conservatively bound one managed-provider request before egress.
+ *
+ * The supported managed surfaces use byte-tokenized text protocols. The UTF-8
+ * byte length of the complete JSON request is therefore an upper bound on the
+ * submitted input token count; the additional framing reserve covers provider
+ * message sentinels which are not literal request bytes. Images and tools stay
+ * inside that JSON, so neither can disappear from the bound. The provider's
+ * own output-limit field then makes `input + output <= availableTokens` for the
+ * request. The caller durably charges `reserved_tokens` before fetch and never
+ * releases it inside the turn, so retries/fallbacks and later rounds must fit
+ * in the same original reservation.
+ */
+export function boundManagedProviderBody(
+  body: unknown,
+  availableTokens: number,
+): ManagedProviderBound {
+  if (!Number.isSafeInteger(availableTokens) || availableTokens <= 0) {
+    throw new Error("managed provider token allowance is exhausted");
+  }
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    throw new Error("managed provider request body must be an object");
+  }
+  const fields = body as Record<string, unknown>;
+  const presentLimits = MANAGED_OUTPUT_LIMIT_FIELDS.filter((field) => field in fields);
+  if (presentLimits.length > 1) {
+    throw new Error("managed provider request has conflicting output token limits");
+  }
+  const limitField = presentLimits[0];
+  if (!limitField) {
+    throw new Error("managed provider request has no output token limit field");
+  }
+  const declared = fields[limitField];
+  if (!Number.isSafeInteger(declared) || Number(declared) <= 0) {
+    throw new Error("managed provider output token limit is invalid");
+  }
+  const canonicalForMeasurement = { ...fields, [limitField]: 0 };
+  const encoded = JSON.stringify(canonicalForMeasurement);
+  const inputUpperBound = new TextEncoder().encode(encoded).byteLength
+    + MANAGED_PROVIDER_INPUT_FRAMING_TOKENS;
+  const outputAvailable = availableTokens - inputUpperBound;
+  if (outputAvailable <= 0) {
+    throw new Error("managed provider request input exceeds the turn token allowance");
+  }
+  const outputLimit = Math.min(
+    Number(declared),
+    MANAGED_PROVIDER_MAX_OUTPUT_TOKENS_PER_ROUND,
+    outputAvailable,
+  );
+  return {
+    body: { ...fields, [limitField]: outputLimit },
+    input_upper_bound: inputUpperBound,
+    output_limit: outputLimit,
+    reserved_tokens: inputUpperBound + outputLimit,
+  };
+}
+
 const MANAGED_BYOK_ALIAS = "primary";
 const MANAGED_GATEWAY_RETRYABLE_STATUSES = new Set([401, 403, 408, 425, 429]);
 
@@ -436,6 +517,7 @@ export async function performManagedGatewayFetch(
   onTextDelta?: (delta: string) => void,
   onTiming?: ModelBrokerTimingSink,
   onGatewayLog?: (gatewayLogId: string) => void,
+  tokenAdmission?: ManagedProviderTokenAdmission,
 ): Promise<string> {
   if (binding.provider !== "cloudflare-ai-gateway") {
     throw new Error(
@@ -483,6 +565,7 @@ export async function performManagedGatewayFetch(
       },
       onTiming,
       onGatewayLog,
+      tokenAdmission,
     );
   } catch (error) {
     // Admission/endpoint/auth-sentinel failures occur before egress and remain
@@ -538,6 +621,7 @@ export async function performManagedGatewayFetch(
     onTextDelta,
     onTiming,
     onGatewayLog,
+    tokenAdmission,
   );
 }
 
@@ -550,6 +634,9 @@ export async function performDirectProviderFetch(
   onTiming?: ModelBrokerTimingSink,
   /** Each metered round's gateway log id, reported as soon as it is seen. */
   onGatewayLog?: (gatewayLogId: string) => void,
+  /** Present only for managed funding. The callback durably consumes the
+   * request's conservative total-token bound before fetch. */
+  tokenAdmission?: ManagedProviderTokenAdmission,
 ): Promise<string> {
   const startedAt = performance.now();
   const mark = (event: string) => onTiming?.(event, performance.now() - startedAt);
@@ -601,16 +688,38 @@ export async function performDirectProviderFetch(
   } else {
     headers.set("authorization", `Bearer ${credential}`);
   }
+  let providerBody = directProviderBody(
+    request.body,
+    binding.provider,
+    anthropicWire,
+    openAiResponsesWire,
+  );
+  if (tokenAdmission) {
+    if (
+      providerBody
+      && typeof providerBody === "object"
+      && !Array.isArray(providerBody)
+      && !MANAGED_OUTPUT_LIMIT_FIELDS.some((field) =>
+        field in (providerBody as Record<string, unknown>)
+      )
+    ) {
+      const limitField = anthropicWire
+        ? "max_tokens"
+        : openAiResponsesWire
+          ? "max_output_tokens"
+          : "max_completion_tokens";
+      providerBody = {
+        ...(providerBody as Record<string, unknown>),
+        [limitField]: MANAGED_PROVIDER_MAX_OUTPUT_TOKENS_PER_ROUND,
+      };
+    }
+    providerBody = await tokenAdmission(request.url, providerBody);
+  }
   mark("direct_provider_fetch_start");
   const response = await fetcher(request.url, {
     method: "POST",
     headers,
-    body: JSON.stringify(directProviderBody(
-      request.body,
-      binding.provider,
-      anthropicWire,
-      openAiResponsesWire,
-    )),
+    body: JSON.stringify(providerBody),
   });
   mark("direct_provider_headers");
   if (!response.body) throw new Error("direct provider response had no body");

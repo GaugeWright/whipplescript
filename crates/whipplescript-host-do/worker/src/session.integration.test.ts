@@ -209,6 +209,74 @@ describe("real WorkflowInstance hibernation", () => {
     });
   });
 
+  it("durably bounds every distinct managed-provider target within one turn reservation", async () => {
+    const namespace = (env as unknown as TestEnv).WORKFLOW_INSTANCE;
+    const stub = namespace.get(namespace.idFromName("managed-provider-token-bounds"));
+    await runInDurableObject(stub, async (instance, state) => {
+      const observed = instance as unknown as {
+        admitManagedProviderRequest: (
+          commandId: string,
+          maximumTokens: number,
+          request: { headers: [string, string][] },
+          targetUrl: string,
+          body: unknown,
+        ) => { max_completion_tokens: number };
+      };
+      const request = { headers: [["idempotency-key", "round-1"]] as [string, string][] };
+      const body = {
+        model: "managed-model",
+        messages: [{ role: "user", content: "bounded managed request" }],
+        max_completion_tokens: 500,
+      };
+      const maximumTokens = 1_800;
+      const primary = observed.admitManagedProviderRequest(
+        "command-1",
+        maximumTokens,
+        request,
+        "https://gateway.ai.cloudflare.com/v1/account/gateway/compat",
+        body,
+      );
+      const replay = observed.admitManagedProviderRequest(
+        "command-1",
+        maximumTokens,
+        request,
+        "https://gateway.ai.cloudflare.com/v1/account/gateway/compat",
+        body,
+      );
+      expect(replay).toEqual(primary);
+      expect(primary.max_completion_tokens).toBe(500);
+      expect(state.storage.sql.exec(
+        "SELECT count(*) AS total FROM public_managed_provider_bounds",
+      ).one().total).toBe(1);
+
+      const fallback = observed.admitManagedProviderRequest(
+        "command-1",
+        maximumTokens,
+        request,
+        "https://api.cloudflare.com/client/v4/accounts/account/ai/v1/chat/completions",
+        body,
+      );
+      expect(fallback.max_completion_tokens).toBe(500);
+      const retained = state.storage.sql.exec(
+        `SELECT count(*) AS total, SUM(reserved_tokens) AS reserved
+         FROM public_managed_provider_bounds WHERE command_id = 'command-1'`,
+      ).one();
+      expect(retained.total).toBe(2);
+      expect(Number(retained.reserved)).toBeLessThanOrEqual(maximumTokens);
+
+      expect(() => observed.admitManagedProviderRequest(
+        "command-1",
+        maximumTokens,
+        { headers: [["idempotency-key", "round-2"]] },
+        "https://gateway.ai.cloudflare.com/v1/account/gateway/compat",
+        body,
+      )).toThrow("managed provider request input exceeds the turn token allowance");
+      expect(state.storage.sql.exec(
+        "SELECT count(*) AS total FROM public_managed_provider_bounds",
+      ).one().total).toBe(2);
+    });
+  });
+
   it("does not echo a browser's reserved no-status close code", async () => {
     const namespace = (env as unknown as TestEnv).WORKFLOW_INSTANCE;
     const stub = namespace.get(namespace.idFromName("session-browser-close-without-status"));

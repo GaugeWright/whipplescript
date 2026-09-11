@@ -39,7 +39,7 @@ export class TestDeployment implements DurableObject {
         existing ?? `reservation:${sessionId}:${requestId}`;
       if (!existing) await this.state.storage.put(key, reservationRef);
       return Response.json(
-        { reservation_ref: reservationRef },
+        { reservation_ref: reservationRef, maximum_tokens: 32_768 },
         { status: existing ? 200 : 201 },
       );
     }

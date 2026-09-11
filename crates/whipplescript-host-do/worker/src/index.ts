@@ -50,6 +50,7 @@ import {
   type LifecycleState,
 } from "./session-lifecycle";
 import {
+  boundManagedProviderBody,
   performDirectProviderFetch,
   performManagedGatewayFetch,
   performModelBrokerFetch,
@@ -2819,6 +2820,7 @@ export class WorkflowInstance implements DurableObject {
       typeof reservation.reservation_ref === "string"
         ? reservation.reservation_ref
         : "";
+    const maximumManagedTokens = reservation.maximum_tokens;
     traceBoundary("runtime_turn_start");
     const turn = await this.beginHostTurn({
       command: {
@@ -2859,7 +2861,7 @@ export class WorkflowInstance implements DurableObject {
     }, session.credential_ref ? {
       ref: session.credential_ref,
       credentialClass: session.host_policy.credential_class,
-    } : undefined);
+    } : undefined, maximumManagedTokens);
     traceBoundary("runtime_turn_complete");
     const turnBody = (await turn.clone().json()) as {
       outcome?: unknown;
@@ -3406,6 +3408,7 @@ export class WorkflowInstance implements DurableObject {
       "host_turn_images",
       "host_turn_deltas",
       "public_provider_chunks",
+      "public_managed_provider_bounds",
       "public_session_events",
       "events",
       "facts",
@@ -4206,6 +4209,7 @@ export class WorkflowInstance implements DurableObject {
   private async beginHostTurn(
     parsed: Record<string, unknown>,
     publicCredential?: { ref: string; credentialClass: string },
+    maximumManagedTokens?: unknown,
   ): Promise<Response> {
     const request = this.hostCommandRequest(parsed);
     if (request instanceof Response) return request;
@@ -4241,6 +4245,18 @@ export class WorkflowInstance implements DurableObject {
           publicCredential.credentialClass,
         )
         : admittedBinding;
+      const managedTokenLimit = binding.execution === "managed"
+        ? Number(maximumManagedTokens)
+        : undefined;
+      if (
+        binding.execution === "managed"
+        && (!Number.isSafeInteger(managedTokenLimit) || Number(managedTokenLimit) <= 0)
+      ) {
+        return Response.json(
+          { error: "managed funding reservation has no provider token bound" },
+          { status: 503 },
+        );
+      }
       // Resolve image bodies only after WhippleScript admits their opaque refs
       // and the corresponding provider capability is available.
       const imageError = this.storeAdmittedImages(request);
@@ -4293,6 +4309,7 @@ export class WorkflowInstance implements DurableObject {
         (delta) => this.publishHostTurnDelta(instanceId, commandId, delta),
         commandId,
         (activity) => this.publishPublicActivity(commandId, activity),
+        managedTokenLimit,
       );
       const runtimeProjection = JSON.parse(
         hostFunctions.host_project_turn(
@@ -4704,6 +4721,96 @@ export class WorkflowInstance implements DurableObject {
     return this.driveInstance(this.makeInstance(bootstrap));
   }
 
+  /**
+   * Charge one conservative provider-request bound before managed egress.
+   * Only numeric bounds and the already non-secret provider request identity
+   * are retained; prompt/tool bytes never enter the shell's budget record.
+   * The target is part of the key because the managed fallback is a second
+   * possible provider spend, not a free retry of the primary request.
+   */
+  private admitManagedProviderRequest(
+    commandId: string,
+    maximumTokens: number,
+    request: { headers: [string, string][] },
+    targetUrl: string,
+    body: unknown,
+  ): unknown {
+    const requestIdentity = request.headers.find(
+      ([name]) => name.toLowerCase() === "idempotency-key",
+    )?.[1]?.trim() ?? "";
+    if (!requestIdentity || requestIdentity.length > 256) {
+      throw new Error("managed provider request has no stable identity");
+    }
+    const target = new URL(targetUrl);
+    if (target.search || target.hash || target.username || target.password) {
+      throw new Error("managed provider request target is not canonical");
+    }
+    const targetIdentity = `${target.origin}${target.pathname}`;
+    this.ctx.storage.sql.exec(
+      `CREATE TABLE IF NOT EXISTS public_managed_provider_bounds (
+        command_id TEXT NOT NULL,
+        request_identity TEXT NOT NULL,
+        target_identity TEXT NOT NULL,
+        maximum_tokens INTEGER NOT NULL,
+        input_upper_bound INTEGER NOT NULL,
+        output_limit INTEGER NOT NULL,
+        reserved_tokens INTEGER NOT NULL,
+        PRIMARY KEY (command_id, request_identity, target_identity)
+      )`,
+    );
+    const existing = this.ctx.storage.sql.exec(
+      `SELECT maximum_tokens, input_upper_bound, output_limit, reserved_tokens
+       FROM public_managed_provider_bounds
+       WHERE command_id = ?1 AND request_identity = ?2 AND target_identity = ?3`,
+      commandId,
+      requestIdentity,
+      targetIdentity,
+    ).toArray() as {
+      maximum_tokens: number;
+      input_upper_bound: number;
+      output_limit: number;
+      reserved_tokens: number;
+    }[];
+    if (existing.length === 1) {
+      const retained = existing[0]!;
+      if (retained.maximum_tokens !== maximumTokens) {
+        throw new Error("managed provider token reservation changed on replay");
+      }
+      const bounded = boundManagedProviderBody(body, retained.reserved_tokens);
+      if (
+        bounded.input_upper_bound !== retained.input_upper_bound
+        || bounded.output_limit !== retained.output_limit
+      ) {
+        throw new Error("managed provider request changed under its stable identity");
+      }
+      return bounded.body;
+    }
+    const totals = this.ctx.storage.sql.exec(
+      `SELECT COALESCE(SUM(reserved_tokens), 0) AS reserved_tokens
+       FROM public_managed_provider_bounds WHERE command_id = ?1`,
+      commandId,
+    ).toArray() as { reserved_tokens: number }[];
+    const alreadyReserved = Number(totals[0]?.reserved_tokens ?? 0);
+    if (!Number.isSafeInteger(alreadyReserved) || alreadyReserved < 0) {
+      throw new Error("managed provider token reservation is invalid");
+    }
+    const bounded = boundManagedProviderBody(body, maximumTokens - alreadyReserved);
+    this.ctx.storage.sql.exec(
+      `INSERT INTO public_managed_provider_bounds
+       (command_id, request_identity, target_identity, maximum_tokens,
+        input_upper_bound, output_limit, reserved_tokens)
+       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)`,
+      commandId,
+      requestIdentity,
+      targetIdentity,
+      maximumTokens,
+      bounded.input_upper_bound,
+      bounded.output_limit,
+      bounded.reserved_tokens,
+    );
+    return bounded.body;
+  }
+
   private async driveInstance(
     instance: WasmDurableInstance,
     hostedInstanceId?: string,
@@ -4716,6 +4823,7 @@ export class WorkflowInstance implements DurableObject {
     onActivity?: (
       activity: "streaming_output" | "retrying" | "settling",
     ) => void,
+    maximumManagedTokens?: number,
   ): Promise<{
     status: string;
     outcome: string;
@@ -4811,6 +4919,9 @@ export class WorkflowInstance implements DurableObject {
           }
         } else if (providerBinding?.execution === "managed") {
           try {
+            if (!maximumManagedTokens || !traceId) {
+              throw new Error("managed provider egress has no turn token reservation");
+            }
             const replay = providerBinding.credential_class
               ? this.publicProviderRoundReplay(
                   hostedInstanceId ?? "",
@@ -4830,6 +4941,13 @@ export class WorkflowInstance implements DurableObject {
               },
               (event, _elapsedMs) => mark(event),
               observeGatewayLog,
+              async (targetUrl, body) => this.admitManagedProviderRequest(
+                traceId,
+                maximumManagedTokens,
+                outcome.request,
+                targetUrl,
+                body,
+              ),
             );
             replay?.complete();
             transportFailures = 0;
