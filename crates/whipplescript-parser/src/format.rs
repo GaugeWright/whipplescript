@@ -567,6 +567,9 @@ pub(crate) fn format_item(item: Item, formatted: &mut String) {
             push_line(formatted, format!("  key {}", counter.key_type.name));
             push_line(formatted, format!("  cap {}", counter.cap));
             push_line(formatted, format!("  reset {}", counter.reset));
+            if let Some(timezone) = &counter.timezone {
+                push_line(formatted, format!("  timezone {timezone:?}"));
+            }
             push_line(formatted, "}");
         }
         Item::Class(class_decl) => format_class(class_decl, formatted),
@@ -1031,13 +1034,28 @@ fn format_source(source: SourceDecl, formatted: &mut String) {
     push_line(formatted, "}");
 }
 
+/// One member line of a `class` or `signal` body: the field, its type, the
+/// `@key` tag when it is the natural key, and the Family B presence condition
+/// (`when <disc> is "<lit>"`) when the field is conditionally present. Every
+/// place that renders a `ClassField` goes through here so no clause is dropped
+/// on one path and kept on another.
+pub(crate) fn class_field_line(field: &ClassField) -> String {
+    let key = if field.is_key { " @key" } else { "" };
+    let presence = match &field.presence_condition {
+        Some((discriminant, literal)) => format!(" when {discriminant} is {literal:?}"),
+        None => String::new(),
+    };
+    format!(
+        "  {} {}{key}{presence}",
+        field.name.name,
+        field.ty.to_source()
+    )
+}
+
 fn format_event(event: EventDecl, formatted: &mut String) {
     push_line(formatted, format!("signal {} {{", event.name));
     for field in event.fields {
-        push_line(
-            formatted,
-            format!("  {} {}", field.name.name, field.ty.to_source()),
-        );
+        push_line(formatted, class_field_line(&field));
     }
     push_line(formatted, "}");
 }
@@ -1045,11 +1063,7 @@ fn format_event(event: EventDecl, formatted: &mut String) {
 fn format_class(class_decl: ClassDecl, formatted: &mut String) {
     push_line(formatted, format!("class {} {{", class_decl.name.name));
     for field in class_decl.fields {
-        let key = if field.is_key { " @key" } else { "" };
-        push_line(
-            formatted,
-            format!("  {} {}{key}", field.name.name, field.ty.to_source()),
-        );
+        push_line(formatted, class_field_line(&field));
     }
     push_line(formatted, "}");
 }

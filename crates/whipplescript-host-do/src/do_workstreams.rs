@@ -118,12 +118,23 @@ impl<S: DoSql> DoWorkstreams<S> {
         staleness_seconds, reservation_id, expected_line_cut, expected_main_cut, \
         proposed_main_cut, ref_position, ref_receipt_handle, created_at, updated_at";
 
-    fn decode_row(row: &[SqlValue]) -> WorkstreamRow {
-        WorkstreamRow {
-            stream_id: as_text(&row[0]),
+    fn decode_row(row: &[SqlValue]) -> StoreResult<WorkstreamRow> {
+        let stream_id = as_text(&row[0]);
+        let status_text = as_text(&row[3]);
+        // Mirrors the native decoder: an unknown status text is a fault, not
+        // `Active` -- the state `join`, `reserve_boundary` and
+        // `archive_stream` proceed under.
+        let status = StreamStatus::parse(&status_text).ok_or_else(|| {
+            StoreError::fault(
+                format!("stream `{stream_id}`"),
+                format!("unreadable status `{status_text}`"),
+            )
+        })?;
+        Ok(WorkstreamRow {
+            stream_id,
             name: as_opt_text(&row[1]),
             line_branch_id: as_text(&row[2]),
-            status: StreamStatus::parse(&as_text(&row[3])).unwrap_or(StreamStatus::Active),
+            status,
             staleness_seconds: match &row[4] {
                 SqlValue::Int(value) => Some(*value),
                 _ => None,
@@ -139,7 +150,7 @@ impl<S: DoSql> DoWorkstreams<S> {
             ref_receipt_handle: as_opt_text(&row[10]),
             created_at: as_text(&row[11]),
             updated_at: as_text(&row[12]),
-        }
+        })
     }
 
     fn row_by_id(&self, stream_id: &str) -> StoreResult<Option<WorkstreamRow>> {
@@ -153,7 +164,7 @@ impl<S: DoSql> DoWorkstreams<S> {
                 &[text(stream_id)],
             )
             .map_err(sql_err)?;
-        Ok(rows.first().map(|row| Self::decode_row(row)))
+        rows.first().map(|row| Self::decode_row(row)).transpose()
     }
 
     fn record_home_position(
@@ -295,7 +306,7 @@ impl<S: DoSql> Workstreams for DoWorkstreams<S> {
                 )
                 .map_err(sql_err)?,
         };
-        Ok(rows.iter().map(|row| Self::decode_row(row)).collect())
+        rows.iter().map(|row| Self::decode_row(row)).collect()
     }
 
     fn join(&mut self, branch_id: &str, stream_id: &str, at: &str) -> StoreResult<JoinOutcome> {
@@ -341,7 +352,7 @@ impl<S: DoSql> Workstreams for DoWorkstreams<S> {
         })
     }
 
-    fn leave(&mut self, branch_id: &str) -> StoreResult<Option<String>> {
+    fn leave(&mut self, branch_id: &str, at: &str) -> StoreResult<Option<String>> {
         let previous = self.home_of(branch_id)?;
         if let Some(previous_id) = previous.as_deref() {
             if let Some(source) = self.row_by_id(previous_id)? {
@@ -362,7 +373,7 @@ impl<S: DoSql> Workstreams for DoWorkstreams<S> {
             )
             .map_err(sql_err)?;
         if previous.is_some() {
-            self.record_home_position(branch_id, None, "leave")?;
+            self.record_home_position(branch_id, None, at)?;
         }
         Ok(previous)
     }
@@ -1322,6 +1333,34 @@ mod tests {
         assert_eq!(main_home.stream_id, None);
     }
 
+    /// Parity with native `leave_rehomes_to_mainline`: the re-home a leave
+    /// writes is host evidence (DR-0078 section 6) dated by the caller's
+    /// clock, not by the verb's name.
+    #[test]
+    fn do_leave_dates_the_home_position_by_the_clock() {
+        let sql = sql();
+        let mut streams = DoWorkstreams::new(Rc::clone(&sql)).expect("open");
+        streams
+            .create_stream("triage", None, "line-triage", "t0", None)
+            .expect("create");
+        streams.join("member-1", "triage", "t1").expect("join");
+        assert_eq!(
+            streams
+                .home_receipt("member-1")
+                .expect("joined receipt")
+                .recorded_at
+                .as_deref(),
+            Some("t1")
+        );
+        assert_eq!(
+            streams.leave("member-1", "t2").expect("leave"),
+            Some("triage".to_owned())
+        );
+        let left = streams.home_receipt("member-1").expect("left receipt");
+        assert_eq!(left.stream_id, None);
+        assert_eq!(left.recorded_at.as_deref(), Some("t2"));
+    }
+
     /// DR-0052 R4 (DO parity): the selective verbs over the instance's
     /// own bound line — undo applies as a proposal cut and refuses as
     /// Stranded when a retained later write consumed the undone output;
@@ -1785,5 +1824,64 @@ mod tests {
                 ));
             }
         }
+    }
+
+    /// **The hosted decoder fails closed on a status text it cannot read.**
+    ///
+    /// Parity with the native `map_stream_row`: both folded an unrecognised
+    /// status to `StreamStatus::Active`, the state `join`,
+    /// `reserve_boundary` and `archive_stream` all proceed under.
+    #[test]
+    fn a_hosted_stream_status_this_build_cannot_read_is_refused_rather_than_read_as_active() {
+        let sql = sql();
+        let mut streams = DoWorkstreams::new(Rc::clone(&sql)).expect("open streams");
+        streams
+            .create_stream("ws_1", None, "line_ws_1", "t0", None)
+            .expect("create stream");
+        sql.execute(
+            "UPDATE workstreams SET status = 'frozen' WHERE stream_id = ?1",
+            &[text("ws_1")],
+        )
+        .expect("stamp a status this build does not know");
+
+        let read = streams.get_stream("ws_1");
+        let message = format!("{:?}", read.as_ref().err());
+        assert!(
+            read.is_err() && message.contains("unreadable status"),
+            "a status this build cannot read must surface AS unreadable, got {read:?}"
+        );
+        assert!(
+            message.contains("frozen"),
+            "the refusal must name the text it could not read, got {message}"
+        );
+        // And WHICH stream could not be read: the subject is its own
+        // message, and one that is only its interpolated id would still read
+        // correctly with its words replaced.
+        assert!(
+            message.contains("stream `ws_1`"),
+            "the refusal must name the stream it could not read, got {message}"
+        );
+
+        let joined = streams.join("branch_a", "ws_1", "t1");
+        assert!(
+            joined.is_err(),
+            "a stream whose status this build cannot read must admit no member, got {joined:?}"
+        );
+
+        // The accepting case: a status this build DOES know reads back as
+        // itself.
+        sql.execute(
+            "UPDATE workstreams SET status = 'archived' WHERE stream_id = ?1",
+            &[text("ws_1")],
+        )
+        .expect("stamp a known status");
+        assert_eq!(
+            streams
+                .get_stream("ws_1")
+                .expect("known status reads")
+                .expect("stream row")
+                .status,
+            StreamStatus::Archived
+        );
     }
 }

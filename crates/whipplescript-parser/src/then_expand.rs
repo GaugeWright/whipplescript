@@ -395,6 +395,51 @@ mod tests {
         );
     }
 
+    /// Every effect statement is chainable (spec/language.md "Sequencing
+    /// sugar": `then <binding> <- <effect statement>`). The sugar supplies the
+    /// binding AFTER the statement parses, so a parser that returns `None`
+    /// when the `as` is absent makes its verb unchainable — `prompt`, `read`,
+    /// `write`, `import`, `export` and every package effect verb did, while
+    /// `timer`/`acquire`/`renew`/`consume`/`decide` returned the effect.
+    #[test]
+    fn then_chains_every_effect_verb_that_requires_a_binding() {
+        for (chained, expected) in [
+            // The binding has to land on the `prompt` LINE: an `as` after a
+            // closing `"""` is refused (`parse.misplaced_binding`), so a
+            // one-line prompt reprinted as a block would chain into a rule
+            // nothing can compile.
+            (
+                "prompt \"Summarize this\"",
+                "prompt \"Summarize this\" as __then_v",
+            ),
+            (
+                "read text from notes_store at \"notes/hello.txt\"",
+                "read text from notes_store at \"notes/hello.txt\" as __then_v",
+            ),
+            (
+                "write text to notes_store at \"notes/hello.txt\" {\n    body \"hi\"\n    mode replace\n  }",
+                "} as __then_v",
+            ),
+            (
+                "recall project_memory for ticket.title",
+                "recall project_memory for ticket.title as __then_v",
+            ),
+        ] {
+            let (out, diagnostics) = expand(&format!(
+                "  then v <- {chained}\n  complete result {{ note \"ok\" }}"
+            ));
+            assert_eq!(diagnostics, Vec::new(), "chaining `{chained}`");
+            assert!(
+                out.contains(expected),
+                "chaining `{chained}` must print `{expected}`: {out}"
+            );
+            assert!(
+                out.contains("after __then_v succeeds as v {"),
+                "chaining `{chained}` must wrap the rest: {out}"
+            );
+        }
+    }
+
     #[test]
     fn then_of_a_non_effect_is_rejected() {
         let (_, diagnostics) = expand("  then v <- record Seen { note \"x\" }\n");

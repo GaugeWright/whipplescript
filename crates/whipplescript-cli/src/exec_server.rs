@@ -207,16 +207,48 @@ pub fn serve_on(listener: TcpListener) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Read one line of the PRE-AUTH header phase under the phase's wall-clock
+/// budget.
+///
+/// `set_read_timeout` bounds each `recv`, not the phase, so a peer dribbling
+/// one byte per timeout would hold the thread forever with the option set:
+/// shrink the socket timeout toward the phase deadline before every read, and
+/// refuse to read at all once the budget is spent.
+fn read_header_line(
+    stream: &TcpStream,
+    deadline: Instant,
+    reader: &mut impl BufRead,
+    line: &mut String,
+) -> std::io::Result<()> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "pre-auth header read exceeded its budget",
+        ));
+    }
+    stream.set_read_timeout(Some(remaining))?;
+    reader.read_line(line)?;
+    Ok(())
+}
+
 fn handle_connection(stream: TcpStream) -> std::io::Result<()> {
     let local_addr = stream.local_addr().ok();
     // Bound the PRE-AUTH header read: a peer that opens a connection and
     // never finishes (or dribbles) the header block is dropped when the
-    // timeout fires instead of pinning this thread forever. The socket
+    // budget is spent instead of pinning this thread forever. The socket
     // option is shared with the try_clone below.
+    let header_deadline = Instant::now() + HEADER_READ_TIMEOUT;
     stream.set_read_timeout(Some(HEADER_READ_TIMEOUT))?;
     let mut reader = BufReader::new(stream.try_clone()?);
+    // `read_line` grows its buffer until a newline arrives, so the byte cap
+    // has to bound the READ rather than be checked once the line has landed —
+    // otherwise a peer sending a header line it never terminates is buffered
+    // in full before it authenticates. One `take` spans the whole header
+    // phase, the request line included.
+    let mut headers = (&mut reader).take(MAX_HEADER_BYTES as u64 + 1);
     let mut request_line = String::new();
-    reader.read_line(&mut request_line)?;
+    read_header_line(&stream, header_deadline, &mut headers, &mut request_line)?;
     let mut parts = request_line.split_whitespace();
     let method = parts.next().unwrap_or_default().to_owned();
     let path = parts.next().unwrap_or_default().to_owned();
@@ -226,12 +258,10 @@ fn handle_connection(stream: TcpStream) -> std::io::Result<()> {
     let mut wants_upgrade = false;
     let mut authorization = None;
     let mut executor_token_header = None;
-    let mut header_bytes = request_line.len();
     loop {
         let mut line = String::new();
-        reader.read_line(&mut line)?;
-        header_bytes = header_bytes.saturating_add(line.len());
-        if header_bytes > MAX_HEADER_BYTES {
+        read_header_line(&stream, header_deadline, &mut headers, &mut line)?;
+        if headers.limit() == 0 {
             return write_json_response(stream, 431, json!({"error": "request headers too large"}));
         }
         let line = line.trim_end();
@@ -254,6 +284,11 @@ fn handle_connection(stream: TcpStream) -> std::io::Result<()> {
             }
         }
     }
+
+    // The pre-auth phase is over: the byte cap ends with the last read
+    // through `headers`, and the body read gets back the plain per-read
+    // budget that the header deadline had been shrinking.
+    stream.set_read_timeout(Some(HEADER_READ_TIMEOUT))?;
 
     if content_length > MAX_REQUEST_BODY_BYTES {
         return write_json_response(stream, 413, json!({"error": "request body too large"}));
@@ -616,15 +651,27 @@ fn cap_stream(stream: String) -> (String, bool) {
     (stream[..end].to_owned(), true)
 }
 
-/// Stage the verified bytes under a content-addressed temp path and make the
-/// file executable (argv may invoke it directly).
+/// Stage the verified bytes under a temp path private to THIS request and
+/// make the file executable (argv may invoke it directly).
+///
+/// The name carries the verified sha for legibility but must not be the sha
+/// alone: identical scripts run concurrently as a matter of course (mass
+/// regeneration, design note §6), and a shared path lets one request truncate
+/// a file another is reading, or remove — after its own run — the script a
+/// request still parked at the admission gate is about to spawn.
 fn stage_verified_script(sha256: &str, bytes: &[u8], extension: &str) -> std::io::Result<PathBuf> {
+    static STAGE_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
     let suffix = if extension.is_empty() {
         String::new()
     } else {
         format!(".{extension}")
     };
-    let path = std::env::temp_dir().join(format!("whip-executor-{sha256}{suffix}"));
+    let unique = STAGE_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let path = std::env::temp_dir().join(format!(
+        "whip-executor-{sha256}-{}-{unique}{suffix}",
+        std::process::id()
+    ));
     std::fs::write(&path, bytes)?;
     #[cfg(unix)]
     {
@@ -855,5 +902,169 @@ mod tests {
             response.contains(" 431 "),
             "oversized headers must be rejected with 431: {response:?}"
         );
+    }
+
+    // The byte cap has to bound the READ, not be checked once the line has
+    // landed: a peer that never sends the terminator would otherwise have its
+    // whole line buffered before it authenticates.
+    #[test]
+    fn an_unterminated_header_line_is_cut_off_at_the_cap() {
+        use std::io::{Read, Write};
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral");
+        let address = listener.local_addr().expect("local addr");
+        std::thread::spawn(move || {
+            let _ = serve_on(listener);
+        });
+
+        let mut stream = std::net::TcpStream::connect(address).expect("connect");
+        stream
+            .write_all(b"GET /healthz HTTP/1.1\r\n")
+            .expect("request line");
+        let mut headers = b"X-Pad: ".to_vec();
+        headers.resize(headers.len() + MAX_HEADER_BYTES + 64, b'a');
+        // No terminator, and the peer keeps the connection open: the 431 has
+        // to arrive while the line is still unfinished.
+        stream.write_all(&headers).expect("unterminated header");
+        stream.flush().ok();
+
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("read timeout");
+        let mut response = String::new();
+        let _ = stream.read_to_string(&mut response);
+        assert!(
+            response.contains(" 431 ") && response.contains("request headers too large"),
+            "an unterminated header line must be cut off at the cap: {response:?}"
+        );
+    }
+
+    // The cap covers the request line as well as the header lines: it is read
+    // pre-auth too, and it is the first thing an attacking peer can grow.
+    #[test]
+    fn an_oversized_request_line_is_cut_off_at_the_cap() {
+        use std::io::{Read, Write};
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral");
+        let address = listener.local_addr().expect("local addr");
+        std::thread::spawn(move || {
+            let _ = serve_on(listener);
+        });
+
+        let mut stream = std::net::TcpStream::connect(address).expect("connect");
+        let mut request_line = b"GET /".to_vec();
+        request_line.resize(request_line.len() + MAX_HEADER_BYTES + 64, b'a');
+        stream
+            .write_all(&request_line)
+            .expect("oversized request line");
+        stream.flush().ok();
+
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("read timeout");
+        let mut response = String::new();
+        let _ = stream.read_to_string(&mut response);
+        assert!(
+            response.contains(" 431 ") && response.contains("request headers too large"),
+            "an oversized request line must be rejected with 431: {response:?}"
+        );
+    }
+
+    // The pre-auth budget is wall-clock for the whole header phase, not a
+    // fresh allowance per recv: once it is spent, a peer still dribbling
+    // bytes gets no further read.
+    #[test]
+    fn the_header_budget_belongs_to_the_phase_not_to_each_read() {
+        use std::io::Write;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral");
+        let address = listener.local_addr().expect("local addr");
+        let mut client = std::net::TcpStream::connect(address).expect("connect");
+        let (server, _) = listener.accept().expect("accept");
+        client
+            .write_all(b"X-Dribble: a\r\n")
+            .expect("the peer is still sending");
+        client.flush().ok();
+
+        let mut reader = BufReader::new(server.try_clone().expect("clone"));
+        let mut line = String::new();
+        let error = read_header_line(&server, Instant::now(), &mut reader, &mut line)
+            .expect_err("a spent budget ends the header phase");
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert!(
+            line.is_empty(),
+            "no further bytes are read once the budget is spent"
+        );
+    }
+
+    fn staged_paths_with_prefix(prefix: &str) -> Vec<PathBuf> {
+        let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else {
+            return Vec::new();
+        };
+        entries
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with(prefix))
+            })
+            .collect()
+    }
+
+    // Two in-flight requests for the SAME script must not share one staged
+    // file: each request removes its staged script when it finishes, and a
+    // request still waiting for an exec slot would then spawn on a path that
+    // no longer exists.
+    #[test]
+    fn a_duplicate_request_cannot_unstage_a_waiting_request() {
+        struct HeldSlots(usize);
+        impl Drop for HeldSlots {
+            fn drop(&mut self) {
+                for _ in 0..self.0 {
+                    exec_gate().release();
+                }
+            }
+        }
+
+        let script = "echo not-unstaged\n";
+        let sha = sha256_hex(script.as_bytes());
+        let prefix = format!("whip-executor-{sha}");
+        // A crashed earlier run can leave a file under this prefix behind.
+        for stale in staged_paths_with_prefix(&prefix) {
+            let _ = std::fs::remove_file(stale);
+        }
+
+        // Hold every exec slot so the request below parks between staging its
+        // script and spawning it.
+        let gate = exec_gate();
+        for _ in 0..EXEC_SLOTS {
+            gate.acquire(0);
+        }
+        let held = HeldSlots(EXEC_SLOTS);
+
+        let parked =
+            std::thread::spawn(move || handle_exec_request(&exec_request(script, Value::Null)));
+        // Staging happens before the slot is requested, so the staged file
+        // appearing means the request is parked at the gate.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while staged_paths_with_prefix(&prefix).is_empty() {
+            assert!(Instant::now() < deadline, "the parked request never staged");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        // A second request for the same script stages it, runs, and removes
+        // its own staged file while the first request is still parked.
+        let duplicate =
+            stage_verified_script(&sha, script.as_bytes(), "sh").expect("stage duplicate");
+        std::fs::remove_file(&duplicate).expect("the duplicate removes its own staged script");
+
+        drop(held);
+        let response = parked
+            .join()
+            .expect("parked request joins")
+            .expect("parked request runs");
+        assert_eq!(response["exit_code"], json!(0));
+        assert_eq!(response["stdout"], json!("not-unstaged\n"));
     }
 }

@@ -557,7 +557,10 @@ mod tests {
         assert_eq!(merge_op.deltas.len(), 2);
         assert_eq!(merge_op.deltas[0].branch_id, "main");
         assert_eq!(merge_op.deltas[1].branch_id, "draft_a");
-        assert_eq!(merge_op.deltas[1].after.status, "adopted");
+        assert_eq!(
+            merge_op.deltas[1].after.status,
+            crate::branches::BranchStatus::Adopted
+        );
         // The write op's before/after pin the exact head movement.
         let write_op = ops.iter().find(|op| op.kind == "write").expect("write op");
         let before = write_op.deltas[0].before.as_ref().expect("before");

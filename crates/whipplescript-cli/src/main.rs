@@ -34669,10 +34669,11 @@ fn signal(options: &CliOptions) -> ExitCode {
 /// `models/tla/IngressDeliveryLifecycle.tla`: route, AUTHENTICATE, validate,
 /// admit — and every stage refuses rather than falling through.
 ///
-/// Deliveries are handled one at a time on the accept thread. The kernel and
+/// Deliveries are DECIDED one at a time on the serving thread. The kernel and
 /// the store are not `Sync`, and an admission path whose job is a serialized
 /// append gains nothing from concurrency — it would need a lock around the
-/// store anyway. The connection cap bounds peers waiting, not work in flight.
+/// store anyway. The pre-auth READ is not on that thread, because its duration
+/// is the peer's to choose; the connection cap bounds those reads.
 fn ingress_serve_http<S: whipplescript_store::RuntimeStore>(
     kernel: &mut RuntimeKernel<S>,
     ir: &whipplescript_parser::IrProgram,
@@ -37574,7 +37575,7 @@ fn stream_command(options: &CliOptions) -> ExitCode {
                 eprintln!("{STREAM_USAGE}");
                 return ExitCode::from(2);
             };
-            match streams.leave(branch_id) {
+            match streams.leave(branch_id, &at) {
                 Ok(left) => emit_json(json!({"left": branch_id, "stream_id": left})),
                 Err(error) => {
                     eprintln!("leave failed: {error:?}");

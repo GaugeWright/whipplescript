@@ -198,13 +198,22 @@ fn normalize_chunk(chunk: &str) -> String {
     normalized
 }
 
+/// The lines the printer emits ABOVE a declaration's header: `@tag` lines
+/// and the `description "…"` line (`format_description`). Merge's block
+/// starts at the declaration keyword itself, so neither ever carries
+/// identity — and no declaration keyword is `description`, which the
+/// grammar reserves.
+fn is_pre_header_line(line: &str) -> bool {
+    line.starts_with('@') || line.starts_with("description ") || line.starts_with('"')
+}
+
 /// The identity is the declaration's header line: the first canonical line
 /// that is not a tag or description, with any trailing `{` normalized away —
 /// byte-compatible with merge's `DeclBlock.identity`.
 fn identity_of(canonical: &str) -> Option<String> {
     canonical
         .lines()
-        .find(|line| !line.starts_with('@') && !line.starts_with('"'))
+        .find(|line| !is_pre_header_line(line))
         .map(|line| line.trim_end().trim_end_matches('{').trim_end().to_owned())
 }
 
@@ -222,7 +231,7 @@ fn name_normalized(canonical: &str, identity: &str) -> String {
     for (index, line) in canonical.lines().enumerate() {
         let is_header = canonical
             .lines()
-            .position(|candidate| !candidate.starts_with('@') && !candidate.starts_with('"'))
+            .position(|candidate| !is_pre_header_line(candidate))
             == Some(index);
         if is_header {
             if let Some(position) = line.rfind(name) {
@@ -556,5 +565,73 @@ mod tests {
             .find(|declaration| declaration.identity == "rule close")
             .unwrap();
         assert!(!rule.alpha);
+    }
+
+    /// A `description "…"` line prints ABOVE the declaration header, exactly
+    /// as a `@tag` does, and merge's block starts at the declaration keyword.
+    /// Identity is the header (DR-0054 Decision 2, `kind + name`); the
+    /// description is CONTENT, so editing it moves the canon hash and leaves
+    /// the identity — and the rename key — where they were.
+    #[test]
+    fn a_described_declaration_is_identified_by_its_header() {
+        let described = BASE.replace(
+            "rule close\n",
+            "description \"closes a triaged ticket\"\nrule close\n",
+        );
+        let declarations = canonical_declarations(&described).expect("canonical");
+        let identities: Vec<&str> = declarations
+            .iter()
+            .map(|declaration| declaration.identity.as_str())
+            .collect();
+        assert!(
+            identities.contains(&"rule close"),
+            "a described rule keeps its header identity: {identities:?}"
+        );
+
+        let find = |declarations: &[DeclCanon], identity: &str| {
+            declarations
+                .iter()
+                .find(|declaration| declaration.identity == identity)
+                .cloned()
+                .expect("declaration present")
+        };
+        let plain = canonical_declarations(BASE).expect("canonical");
+        assert_ne!(
+            find(&declarations, "rule close").canon_hash,
+            find(&plain, "rule close").canon_hash,
+            "the description text is content"
+        );
+
+        // A pure rename of a described rule is still one rename.
+        let renamed = described.replace("rule close\n", "rule closed_out\n");
+        let after = canonical_declarations(&renamed).expect("canonical");
+        assert_eq!(
+            find(&declarations, "rule close").rename_hash,
+            find(&after, "rule closed_out").rename_hash
+        );
+    }
+
+    /// Two declarations may legitimately carry the SAME description prose.
+    /// Descriptions are not identities, so that is not an ambiguity and the
+    /// whole source keeps a canonical form.
+    #[test]
+    fn declarations_sharing_a_description_still_canonicalize() {
+        let shared = BASE
+            .replace(
+                "rule triage\n",
+                "description \"ticket bookkeeping\"\nrule triage\n",
+            )
+            .replace(
+                "rule close\n",
+                "description \"ticket bookkeeping\"\nrule close\n",
+            );
+        let declarations =
+            canonical_declarations(&shared).expect("one prose line, two distinct declarations");
+        let identities: Vec<&str> = declarations
+            .iter()
+            .map(|declaration| declaration.identity.as_str())
+            .collect();
+        assert!(identities.contains(&"rule triage"), "{identities:?}");
+        assert!(identities.contains(&"rule close"), "{identities:?}");
     }
 }

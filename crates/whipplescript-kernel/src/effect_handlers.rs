@@ -4970,7 +4970,7 @@ mod promote_door_tests {
         forward_stream! {
             create_stream(id: &str, name: Option<&str>, line: &str, at: &str, key: Option<&str>) -> ws::CreateStreamOutcome;
             join(branch: &str, stream: &str, at: &str) -> ws::JoinOutcome;
-            leave(branch: &str) -> Option<String>;
+            leave(branch: &str, at: &str) -> Option<String>;
             archive_stream(id: &str, at: &str) -> ws::ArchiveOutcome;
             reserve_boundary(id: &str, reservation: ws::BoundaryReservation<'_>) -> ws::ReserveBoundaryOutcome;
             release_boundary(id: &str, token: &str, at: &str) -> ws::ReleaseBoundaryOutcome;
@@ -5012,7 +5012,7 @@ mod promote_door_tests {
         forward_stream! {
             create_stream(id: &str, name: Option<&str>, line: &str, at: &str, key: Option<&str>) -> ws::CreateStreamOutcome;
             join(branch: &str, stream: &str, at: &str) -> ws::JoinOutcome;
-            leave(branch: &str) -> Option<String>;
+            leave(branch: &str, at: &str) -> Option<String>;
             archive_stream(id: &str, at: &str) -> ws::ArchiveOutcome;
             record_ref_advanced(id: &str, token: &str, position: u64, handle: &str, at: &str) -> ws::RecordRefAdvancedOutcome;
         }

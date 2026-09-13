@@ -20,6 +20,16 @@
 //!   position is not a valid implementation of this trait — that disclosure is
 //!   what makes lag something a caller can reason about instead of a hazard,
 //!   and what makes DR-0068's pinning enforceable rather than merely polite.
+//!   The position is a claim **about the value it is returned with**, so the
+//!   pair must be one that existed: an implementation must produce value and
+//!   position from a single snapshot. A pair that never existed — a value from
+//!   before an advance carrying the position from after it — sends its caller
+//!   to poll [`RefAuthority::changes_since`] from past a change it was never
+//!   shown, and the change is then never reported to it at all. An
+//!   implementation may discharge this either by reading atomically or by
+//!   being single-writer, so that no advance can commit between two reads: the
+//!   native host relies on the first, the durable-object host on the second,
+//!   and a FoundationDB or etcd swap owes it by one route or the other.
 //! - **Compare-and-set** ([`RefAuthority::advance`]). A blind write would let
 //!   two writers lose each other's updates, which is precisely the multi-master
 //!   behaviour DR-0066 §2 refuses.
@@ -71,6 +81,11 @@ impl AdvanceOutcome {
 pub trait RefAuthority {
     /// Read a name and the authority's position.
     ///
+    /// The returned value and position must come from **one snapshot**: the
+    /// position is what the caller is told to poll [`Self::changes_since`]
+    /// from, so a pair that never existed hides from it exactly the change it
+    /// was not shown. Read atomically, or be single-writer.
+    ///
     /// # Errors
     /// Propagates store failures. An unset name is `Ok` with a `None` value,
     /// not an error — never having been set is a normal state.
@@ -99,6 +114,11 @@ pub trait RefAuthority {
     /// open in DR-0069 until the first real consumer; this is the leaning it
     /// records, and it ships in v1 because retrofitting a change feed means
     /// unwinding a polling loop from every consumer that grew one.
+    ///
+    /// A report owes the same single-snapshot pairing [`Self::read`] does, and
+    /// for the same reason: the position it discloses is where the caller's
+    /// next poll starts, so a report pairing a pre-advance value with a
+    /// post-advance position ends the feed for a name that is still moving.
     ///
     /// # Errors
     /// Propagates store failures.
@@ -294,29 +314,31 @@ mod sqlite {
             Ok(())
         }
 
-        fn position(&self) -> StoreResult<u64> {
-            let position: i64 = self.connection.query_row(
-                "SELECT position FROM ref_position WHERE id = 0",
-                [],
-                |row| row.get(0),
-            )?;
-            Ok(position as u64)
+        /// The connection, so a test can install a hook on it and commit a
+        /// competing advance from inside a reading statement.
+        #[cfg(test)]
+        pub(super) fn connection(&self) -> &Connection {
+            &self.connection
         }
     }
 
     impl RefAuthority for SqliteRefAuthority {
         fn read(&self, name: &str) -> StoreResult<RefRead> {
-            let value: Option<String> = self
-                .connection
-                .query_row(
-                    "SELECT value FROM refs WHERE name = ?1",
-                    params![name],
-                    |row| row.get(0),
-                )
-                .optional()?;
+            // ONE statement, because the position is a claim about the value it
+            // comes with. Read as two, the value could come from before a
+            // concurrent `advance` and the position from after it — and a
+            // caller polling `changes_since` from that position is then never
+            // told about the advance it was not shown. A single statement runs
+            // in a single read snapshot, so the pair always existed.
+            let (position, value): (i64, Option<String>) = self.connection.query_row(
+                "SELECT p.position, r.value FROM ref_position p \
+                 LEFT JOIN refs r ON r.name = ?1 WHERE p.id = 0",
+                params![name],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
             Ok(RefRead {
                 value,
-                position: self.position()?,
+                position: position as u64,
             })
         }
 
@@ -369,14 +391,19 @@ mod sqlite {
         }
 
         fn changes_since(&self, name: &str, position: u64) -> StoreResult<Option<RefRead>> {
-            let row: Option<(String, i64)> = self
-                .connection
-                .query_row(
-                    "SELECT value, position FROM refs WHERE name = ?1",
-                    params![name],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                )
-                .optional()?;
+            // One statement, for the reason `read` gives: a report whose value
+            // and position came from different snapshots sends the caller on to
+            // poll from past a change it was never shown.
+            let (overall, row): (i64, Option<(String, i64)>) = self.connection.query_row(
+                "SELECT p.position, r.value, r.position FROM ref_position p \
+                 LEFT JOIN refs r ON r.name = ?1 WHERE p.id = 0",
+                params![name],
+                |row| {
+                    let value: Option<String> = row.get(1)?;
+                    let moved_at: Option<i64> = row.get(2)?;
+                    Ok((row.get(0)?, value.zip(moved_at)))
+                },
+            )?;
             let Some((value, moved_at)) = row else {
                 return Ok(None);
             };
@@ -385,7 +412,7 @@ mod sqlite {
             }
             Ok(Some(RefRead {
                 value: Some(value),
-                position: self.position()?,
+                position: overall as u64,
             }))
         }
     }
@@ -635,5 +662,123 @@ mod tests {
             None,
             "another name moving is not this name moving"
         );
+    }
+
+    /// A reader with a competing `advance` committed from *inside* its next
+    /// statement: a progress handler on the reading connection fires once that
+    /// statement is already running and commits `cut_2` from a second
+    /// connection. The flag says the interleave actually happened, so a test
+    /// cannot pass by having raced nothing.
+    ///
+    /// Forced rather than raced, because the window is one statement wide.
+    fn reader_racing_one_advance() -> (
+        std::path::PathBuf,
+        SqliteRefAuthority,
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        let dir = std::env::temp_dir().join(format!(
+            "whip-ref-snapshot-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let path = dir.join("refs.sqlite");
+        SqliteRefAuthority::open(&path)
+            .expect("authority initialises")
+            .advance("mainline", None, "cut_1")
+            .expect("the name is claimed");
+
+        let reader = SqliteRefAuthority::open(&path).expect("reader opens");
+        let interleaved = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let fired = std::sync::Arc::clone(&interleaved);
+        let mut interloper = SqliteRefAuthority::open(&path).expect("interloper opens");
+        reader
+            .connection()
+            .progress_handler(
+                1,
+                Some(move || {
+                    if !fired.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                        assert!(
+                            interloper
+                                .advance("mainline", Some("cut_1"), "cut_2")
+                                .expect("the interloper's advance returns an outcome")
+                                .advanced(),
+                            "the interloper must commit while the reading statement runs"
+                        );
+                    }
+                    false
+                }),
+            )
+            .expect("progress handler installs");
+        (dir, reader, interleaved)
+    }
+
+    /// **Position disclosure is a claim about the value it came with.**
+    ///
+    /// The module contract says a read states where it is so a caller can poll
+    /// `changes_since` from there. That is only true if the value and the
+    /// position come from one snapshot: a read that returns the pre-advance
+    /// value with a post-advance position tells the caller to poll from beyond
+    /// the change it was never shown, and the change is then never reported.
+    ///
+    /// A read issued as one statement lands wholly on one side of the
+    /// interleaved commit, whichever side that is; a read issued as two
+    /// statements straddles it, and it is the straddle this checks for.
+    #[test]
+    fn a_read_states_the_position_its_value_was_read_at() {
+        let (dir, reader, interleaved) = reader_racing_one_advance();
+
+        let read = reader.read("mainline").expect("read");
+        assert!(
+            interleaved.load(std::sync::atomic::Ordering::SeqCst),
+            "no advance was interleaved with the read, so this test checked nothing"
+        );
+        let change = reader
+            .changes_since("mainline", read.position)
+            .expect("watch");
+        let held = change.and_then(|change| change.value).or(read.value);
+        assert_eq!(
+            held.as_deref(),
+            Some("cut_2"),
+            "the read returned a value from before the advance and a position from \
+             after it, so a caller polling from the position it was given is never \
+             told the name moved"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The change feed owes the same thing, and for the same reason: it reports
+    /// a value *and* the position to poll from next, so a report that pairs a
+    /// pre-advance value with a post-advance position leaves the caller holding
+    /// a superseded value it will never be told about.
+    #[test]
+    fn a_change_report_states_the_position_its_value_was_read_at() {
+        let (dir, reader, interleaved) = reader_racing_one_advance();
+
+        let report = reader
+            .changes_since("mainline", 0)
+            .expect("watch")
+            .expect("the name has moved since the authority was empty");
+        assert!(
+            interleaved.load(std::sync::atomic::Ordering::SeqCst),
+            "no advance was interleaved with the report, so this test checked nothing"
+        );
+        let next = reader
+            .changes_since("mainline", report.position)
+            .expect("watch");
+        let held = next.and_then(|next| next.value).or(report.value);
+        assert_eq!(
+            held.as_deref(),
+            Some("cut_2"),
+            "the report returned a value from before the advance and a position from \
+             after it, so a caller polling from the position it was given is never \
+             told the name moved again"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

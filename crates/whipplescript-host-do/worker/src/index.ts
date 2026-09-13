@@ -3415,6 +3415,15 @@ export class WorkflowInstance implements DurableObject {
       "public_provider_chunks",
       "public_managed_provider_bounds",
       "public_session_events",
+      // The visitor's own words, and the media they attached, live outside the
+      // runtime tables above: the agent conversation in `agent_turn_snapshots`,
+      // and every steer/follow-up/compaction command in its own queue table
+      // (`text` plus base64 `images_json` bodies, retained after it applies).
+      // Teardown that swept only the runtime tables left the whole conversation
+      // resolvable on a tombstoned object, against DR-0049 §7.
+      "agent_turn_snapshots",
+      "public_turn_commands",
+      "public_compaction_commands",
       "events",
       "facts",
       "artifacts",
@@ -3448,6 +3457,18 @@ export class WorkflowInstance implements DurableObject {
         WHERE status = 'running'`,
       `UPDATE leases SET status = 'tombstoned', released_at = COALESCE(released_at, CURRENT_TIMESTAMP)
         WHERE released_at IS NULL`,
+      // The same rule applied to the rows teardown deliberately KEEPS. A
+      // retained handle is audit metadata only while it stops resolving its
+      // payload: `effects.input_json` is the visitor's own turn text, and the
+      // run/evidence summaries are the agent's answer. They are overwritten in
+      // place rather than dropped, which is the bundle format's shape — the
+      // handle survives, the bytes do not.
+      `UPDATE instances SET input_json = '{}', updated_at = CURRENT_TIMESTAMP`,
+      `UPDATE effects SET input_json = '{}', updated_at = CURRENT_TIMESTAMP`,
+      `UPDATE runs SET summary = 'retention tombstone (DR-0054): payload removed'
+        WHERE summary IS NOT NULL`,
+      `UPDATE evidence SET summary = 'retention tombstone (DR-0054): payload removed'
+        WHERE summary IS NOT NULL`,
     ]) {
       try {
         this.ctx.storage.sql.exec(statement);
@@ -3471,6 +3492,11 @@ export class WorkflowInstance implements DurableObject {
     const keys = [...(await this.ctx.storage.list()).keys()].filter(
       (key) =>
         key === "public-session-state" ||
+        // The projected conversation and its per-segment apply-once markers.
+        // `public-transcript` is the visitor's and the agent's text in full, so
+        // leaving it behind resolves the payload the tables above just erased.
+        key === "public-transcript" ||
+        key.startsWith("public-transcript-") ||
         key.startsWith("host-package:") ||
         key.startsWith("host-policy:") ||
         key.startsWith("public-turn-result:"),

@@ -768,4 +768,34 @@ mod glued_declaration_tests {
             ]
         );
     }
+
+    /// Merge keys a block by its first line, and a block starts at the
+    /// declaration KEYWORD — so a `description "…"` line above a rule stays
+    /// with the previous block and merge's identity is `rule close`. The
+    /// canonical identity must agree line for line: the two are one
+    /// identity answer (DR-0054), and a disagreement silently orphans a
+    /// described declaration's canonical entry at lookup.
+    #[test]
+    fn a_described_rule_has_one_identity_on_both_sides() {
+        let described = COORD_BASE.replace(
+            "rule close\n",
+            "description \"closes a triaged ticket\"\nrule close\n",
+        );
+        let block_identities: Vec<String> = split_declarations(&described)
+            .expect("the described base splits")
+            .into_iter()
+            .map(|block| block.identity)
+            .collect();
+        assert!(
+            block_identities.contains(&"rule close".to_owned()),
+            "merge keys the described rule by its header: {block_identities:?}"
+        );
+        for declaration in canonical_declarations(&described).expect("canonical") {
+            assert!(
+                block_identities.contains(&declaration.identity),
+                "canonical identity {} has no merge block",
+                declaration.identity
+            );
+        }
+    }
 }

@@ -72,6 +72,12 @@ impl<S: DoSql> DoRefAuthority<S> {
 
 impl<S: DoSql> RefAuthority for DoRefAuthority<S> {
     fn read(&self, name: &str) -> StoreResult<RefRead> {
+        // Value and position are read in two queries, where the native host
+        // needs one: the trait's single-snapshot pairing is discharged here by
+        // being single-writer rather than by reading atomically. One active
+        // instance per id is the platform's guarantee, so no second writer can
+        // commit an advance between these two queries — the same reason
+        // `advance` below runs without a transaction.
         Ok(RefRead {
             value: self.current(name)?,
             position: self.position()?,
@@ -118,6 +124,9 @@ impl<S: DoSql> RefAuthority for DoRefAuthority<S> {
     }
 
     fn changes_since(&self, name: &str, position: u64) -> StoreResult<Option<RefRead>> {
+        // Two queries again, single-writer again: the reported value and the
+        // position the caller will poll from next cannot straddle an advance,
+        // because no second writer exists to commit one between them.
         let rows = self
             .sql
             .query(

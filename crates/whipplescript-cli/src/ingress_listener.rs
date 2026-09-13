@@ -655,44 +655,66 @@ impl Drop for ConnPermit {
 /// Serve deliveries on an already-bound listener until killed.
 ///
 /// `handle` is the caller's: it owns the kernel and the store, which are not
-/// `Sync`, so deliveries are handled ONE AT A TIME on the accept thread. That is
-/// the honest shape for an admission path whose whole job is a serialized
-/// append — concurrency here would buy nothing and would need a lock around the
-/// store anyway. The connection cap still applies: it bounds peers waiting, not
-/// work in flight.
+/// `Sync`, so DECISIONS are made one at a time, on this thread. That is the
+/// honest shape for an admission path whose whole job is a serialized append —
+/// concurrency there would buy nothing and would need a lock around the store
+/// anyway.
+///
+/// The BYTES are a different matter. An unauthenticated peer chooses how long
+/// its own pre-auth read takes, up to [HEADER_READ_TIMEOUT], so reading on the
+/// deciding thread would let one peer that opens a connection and says nothing
+/// stall every other sender for that budget at a time. Each accepted connection
+/// therefore reads on its own thread — bounded by [MAX_CONNECTIONS], which is
+/// what the cap was written for — and hands the parsed delivery and its socket
+/// to this loop, which decides and answers. Deliveries are then ordered by when
+/// their bytes ARRIVED rather than by when their connection was accepted, which
+/// is the only order a peer cannot choose for everyone else.
 pub fn serve_on<F>(listener: std::net::TcpListener, mut handle: F) -> std::io::Result<()>
 where
     F: FnMut(&RawDelivery) -> DeliveryOutcome,
 {
     eprintln!("whip ingress listening on {}", listener.local_addr()?);
-    let limiter = std::sync::Arc::new(ConnLimiter::new(MAX_CONNECTIONS));
-    for stream in listener.incoming() {
-        let stream = match stream {
-            Ok(stream) => stream,
-            Err(error) => {
-                eprintln!("ingress: accept failed: {error}");
-                continue;
-            }
-        };
-        let _permit = limiter.acquire();
-        let delivery = match read_request(&stream) {
-            Ok(Some(delivery)) => delivery,
-            // A request whose head could not be read at all: closed early, over
-            // the header cap, or over the body cap. Nothing to answer, and
-            // nothing reached the store.
-            Ok(None) => {
-                let _ = write_response(
-                    stream,
-                    413,
-                    &serde_json::json!({"status": "refused", "reason": "delivery too large"}),
-                );
-                continue;
-            }
-            Err(error) => {
-                eprintln!("ingress: reading a delivery failed: {error}");
-                continue;
-            }
-        };
+    let (read_deliveries, deciding) =
+        std::sync::mpsc::sync_channel::<(RawDelivery, std::net::TcpStream)>(MAX_CONNECTIONS);
+    std::thread::spawn(move || {
+        let limiter = std::sync::Arc::new(ConnLimiter::new(MAX_CONNECTIONS));
+        for stream in listener.incoming() {
+            let stream = match stream {
+                Ok(stream) => stream,
+                Err(error) => {
+                    eprintln!("ingress: accept failed: {error}");
+                    continue;
+                }
+            };
+            // Acquired BEFORE spawning: at the cap the accept loop blocks and
+            // new peers queue in the OS backlog, which is what bounds the
+            // reader threads an unauthenticated peer can hold open.
+            let permit = limiter.acquire();
+            let read_deliveries = read_deliveries.clone();
+            std::thread::spawn(move || {
+                let _permit = permit; // released when this read is over
+                match read_request(&stream) {
+                    Ok(Some(delivery)) => {
+                        let _ = read_deliveries.send((delivery, stream));
+                    }
+                    // A request whose head could not be read at all: closed
+                    // early, over the header cap, or over the body cap. Nothing
+                    // to answer, and nothing reached the store.
+                    Ok(None) => {
+                        let _ = write_response(
+                            stream,
+                            413,
+                            &serde_json::json!({
+                                "status": "refused", "reason": "delivery too large"
+                            }),
+                        );
+                    }
+                    Err(error) => eprintln!("ingress: reading a delivery failed: {error}"),
+                }
+            });
+        }
+    });
+    for (delivery, stream) in deciding {
         let outcome = handle(&delivery);
         // The operator's log carries the DETAIL the response withholds.
         match &outcome {
@@ -1492,5 +1514,45 @@ mod tests {
             "no such endpoint"
         );
         assert_eq!(DeliveryRefusal::UnknownPath.status(), 404);
+    }
+
+    // The PRE-AUTH read is the part of a delivery an unauthenticated peer
+    // controls the duration of. It must not be serialized with admission: a
+    // peer that opens a connection and says nothing occupies its read for the
+    // whole HEADER_READ_TIMEOUT budget, and every other sender has to be
+    // answered while that is still running.
+    #[test]
+    fn a_peer_that_sends_nothing_does_not_hold_the_next_senders_delivery() {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral");
+        let address = listener.local_addr().expect("local addr");
+        std::thread::spawn(move || {
+            let _ = serve_on(listener, |delivery| DeliveryOutcome::Admitted {
+                instance: "instance".to_owned(),
+                fact: delivery.path.clone(),
+            });
+        });
+
+        // Connected FIRST, so the accept loop meets it first, and it never
+        // sends a byte.
+        let silent = std::net::TcpStream::connect(address).expect("connect the silent peer");
+        std::thread::sleep(std::time::Duration::from_millis(200));
+
+        let mut sender = std::net::TcpStream::connect(address).expect("connect the sender");
+        sender
+            .write_all(b"POST /hook HTTP/1.1\r\ncontent-length: 2\r\n\r\n{}")
+            .expect("deliver");
+        sender.flush().ok();
+        sender
+            .set_read_timeout(Some(std::time::Duration::from_secs(3)))
+            .expect("read timeout");
+        let mut response = String::new();
+        let _ = sender.read_to_string(&mut response);
+        drop(silent);
+        assert!(
+            response.contains("200 OK"),
+            "the sender must be answered while the silent peer is still being read, got {response:?}"
+        );
     }
 }

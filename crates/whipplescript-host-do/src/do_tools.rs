@@ -320,11 +320,18 @@ impl<Sql: DoSql> DoToolExecutor<Sql> {
     }
 
     /// All `files` rows as `(key, content)`, sorted and capped exactly as
-    /// [`Self::all_keys`]. A caller that needs every body — `bash` hydrates the
-    /// whole workspace before executing — pays one storage round-trip here
-    /// instead of one per file.
-    fn all_files(&self) -> Result<Vec<(String, String)>, String> {
-        let rows = if self.key_prefix.is_empty() {
+    /// [`Self::all_keys`], narrowed to the directory prefix `under` when one is
+    /// given. A caller that needs every body — `bash` hydrates the whole
+    /// workspace before executing, `grep` searches every file in a directory —
+    /// pays one storage round-trip here instead of one per file.
+    ///
+    /// `under` narrows the statement; it does not decide the answer. SQLite's
+    /// `LIKE` ignores ASCII case and reads `_`/`%` in a caller's directory name
+    /// as wildcards, so a caller that passes `under` still tests each returned
+    /// key against the prefix itself.
+    fn all_files(&self, under: Option<&str>) -> Result<Vec<(String, String)>, String> {
+        let scope = format!("{}{}", self.key_prefix, under.unwrap_or(""));
+        let rows = if scope.is_empty() {
             self.sql.query(
                 "SELECT key, content FROM files ORDER BY key LIMIT ?1",
                 &[SqlValue::Int((MAX_FILES_WALKED + 1) as i64)],
@@ -332,9 +339,10 @@ impl<Sql: DoSql> DoToolExecutor<Sql> {
         } else {
             self.sql.query(
                 "SELECT substr(key, length(?1) + 1), content FROM files \
-                 WHERE key LIKE ?1 || '%' ORDER BY key LIMIT ?2",
+                 WHERE key LIKE ?2 || '%' ORDER BY key LIMIT ?3",
                 &[
                     SqlValue::Text(self.key_prefix.clone()),
+                    SqlValue::Text(scope),
                     SqlValue::Int((MAX_FILES_WALKED + 1) as i64),
                 ],
             )
@@ -359,7 +367,7 @@ impl<Sql: DoSql> DoToolExecutor<Sql> {
             .and_then(Value::as_u64)
             .unwrap_or(30)
             .clamp(1, 30);
-        let workspace = self.all_files()?;
+        let workspace = self.all_files(None)?;
         let mut before = BTreeMap::new();
         let mut files = Vec::with_capacity(workspace.len());
         for (key, content) in workspace {
@@ -586,20 +594,25 @@ impl<Sql: DoSql> DoToolExecutor<Sql> {
         let limit = usize_arg(args, "limit").unwrap_or(100);
         let context = usize_arg(args, "context").unwrap_or(0);
         let matcher = GrepMatcher::new(pattern, ignore_case);
-        let keys: Vec<String> = self
+        // The walk bound is a property of the workspace, which is why `find`
+        // and `ls` refuse an oversized one before they list it; keys alone are
+        // cheap. The bodies then come back in a single round-trip, because in
+        // the live isolate a per-file read is a separate bridge crossing that
+        // JSON-marshals params and rows each time.
+        let keys: BTreeSet<String> = self
             .all_keys()?
             .into_iter()
             .filter(|key| key.starts_with(&prefix))
             .collect();
         let mut hits: Vec<String> = Vec::new();
         let mut matches_found = 0usize;
-        for key in keys {
+        for (key, content) in self.all_files(Some(&prefix))? {
             if matches_found >= limit {
                 break;
             }
-            let Some(content) = self.file_content(&key)? else {
+            if !keys.contains(&key) {
                 continue;
-            };
+            }
             let lines: Vec<&str> = content.lines().collect();
             let matched: Vec<bool> = lines.iter().map(|line| matcher.is_match(line)).collect();
             // The match limit counts matches; context lines ride along free.
@@ -988,11 +1001,32 @@ mod tests {
         }
     }
 
-    /// A `DoSql` that records the live-turn observations published through it,
-    /// forwarding the SQL itself to a real handle so tools still run.
+    /// A `DoSql` that records the live-turn observations published through it
+    /// and the statements it was asked to run, forwarding the SQL itself to a
+    /// real handle so tools still run.
     struct RecordingSql {
         inner: crate::do_store::test_support::RusqliteDoSql,
         activity: std::cell::RefCell<Vec<(String, Option<String>)>>,
+        queries: std::cell::RefCell<Vec<String>>,
+    }
+
+    impl RecordingSql {
+        fn new() -> Self {
+            Self {
+                inner: store().sql,
+                activity: std::cell::RefCell::new(Vec::new()),
+                queries: std::cell::RefCell::new(Vec::new()),
+            }
+        }
+
+        /// How many `files` reads have been issued since the last reset.
+        fn file_reads(&self) -> usize {
+            self.queries
+                .borrow()
+                .iter()
+                .filter(|sql| sql.contains("FROM files"))
+                .count()
+        }
     }
 
     impl DoSql for RecordingSql {
@@ -1000,6 +1034,7 @@ mod tests {
             self.inner.execute(sql, params)
         }
         fn query(&self, sql: &str, params: &[SqlValue]) -> Result<Vec<Vec<SqlValue>>, String> {
+            self.queries.borrow_mut().push(sql.to_owned());
             self.inner.query(sql, params)
         }
         fn activity(&self, kind: &str, detail: Option<&str>) {
@@ -1011,10 +1046,7 @@ mod tests {
 
     #[test]
     fn every_dispatched_tool_announces_itself_by_name_before_it_runs() {
-        let sql = Rc::new(RecordingSql {
-            inner: store().sql,
-            activity: std::cell::RefCell::new(Vec::new()),
-        });
+        let sql = Rc::new(RecordingSql::new());
         let executor = DoToolExecutor::new(Rc::clone(&sql));
 
         executor.execute(&call(
@@ -1105,6 +1137,18 @@ mod tests {
                 .content,
             "b",
         );
+        // A directory-scoped search narrows on the storage key, which carries
+        // the instance prefix; the hit it reports is the path this instance
+        // wrote, and the other instance's identical path is not one.
+        for instance in [&first, &second] {
+            instance.execute(&call(
+                "write",
+                json!({ "path": "src/hit.txt", "content": "needle" }),
+            ));
+        }
+        let scoped = first.execute(&call("grep", json!({ "pattern": "needle", "path": "src" })));
+        assert_eq!(scoped.status, ToolStatus::Ok);
+        assert_eq!(scoped.content, "src/hit.txt:1:needle");
     }
 
     #[test]
@@ -1221,6 +1265,18 @@ mod tests {
         let result = exec.execute(&call("find", json!({ "pattern": "*.md" })));
         assert_eq!(result.status, ToolStatus::Error);
         assert!(result.content.contains("supported 5000 files"));
+        // `grep` walks the same workspace, so it says the same thing rather
+        // than searching a silently truncated one — including when a `path`
+        // narrows the search, since the bound is the workspace's.
+        let searched = exec.execute(&call("grep", json!({ "pattern": "x", "path": "docs" })));
+        assert_eq!(searched.status, ToolStatus::Error);
+        assert!(
+            searched
+                .content
+                .contains("workspace contains more than the supported"),
+            "grep said: {}",
+            searched.content,
+        );
     }
 
     #[test]
@@ -1296,6 +1352,52 @@ mod tests {
         let hits = exec.execute(&call("grep", json!({ "pattern": "value[0" })));
         assert_eq!(hits.status, ToolStatus::Ok);
         assert_eq!(hits.content, "code.md:1:Use value[0] exactly.");
+    }
+
+    /// Every SQL call a tool makes crosses the wasm-bindgen bridge with its
+    /// params and rows marshalled as JSON, so what a search costs is round
+    /// trips, not rows. Reading each candidate body with its own `SELECT`
+    /// makes `grep` — the model's primary search tool — pay one crossing per
+    /// file in the searched directory.
+    #[test]
+    fn grep_pays_the_same_storage_round_trips_however_many_files_it_searches() {
+        let sql = Rc::new(RecordingSql::new());
+        let exec = DoToolExecutor::new(Rc::clone(&sql));
+        let search = json!({ "pattern": "needle", "path": "src" });
+
+        for index in 0..3 {
+            exec.execute(&call(
+                "write",
+                json!({ "path": format!("src/{index}.rs"), "content": "fn needle() {}" }),
+            ));
+        }
+        sql.queries.borrow_mut().clear();
+        let few = exec.execute(&call("grep", search.clone()));
+        assert_eq!(few.status, ToolStatus::Ok);
+        assert_eq!(few.content.lines().count(), 3);
+        let few_reads = sql.file_reads();
+
+        for index in 3..9 {
+            exec.execute(&call(
+                "write",
+                json!({ "path": format!("src/{index}.rs"), "content": "fn needle() {}" }),
+            ));
+        }
+        sql.queries.borrow_mut().clear();
+        let many = exec.execute(&call("grep", search));
+        assert_eq!(many.status, ToolStatus::Ok);
+        assert_eq!(many.content.lines().count(), 9);
+
+        assert_eq!(
+            sql.file_reads(),
+            few_reads,
+            "a grep over nine files must cost what a grep over three costs: a \
+             per-file read is one bridge crossing per file",
+        );
+        assert!(
+            few_reads <= 2,
+            "grep read the `files` table {few_reads} times for three files",
+        );
     }
 
     #[test]

@@ -765,7 +765,9 @@ where
             if let Some(observation) = workspace_read_observation(executor, call) {
                 observations.push(observation);
             }
-            if let Some((original_bytes, recall_id)) = truncation_metadata(&outcome.content) {
+            if let Some((original_bytes, recall_id)) =
+                truncation_metadata(&outcome.content, tool_output_retention(&call.name))
+            {
                 observations.push(LoopObservation::ToolOutputTruncated {
                     call_id: call.id.clone(),
                     tool_name: call.name.clone(),
@@ -1239,6 +1241,23 @@ where
                 structured_result_json: None,
             });
         }
+        // Mid-turn delivery (DR-0052 Decision 7), at the same point the
+        // reference loop drains it: notices arrive as ordinary inbound context
+        // — one model call of latency instead of a whole turn — appended before
+        // the request and checkpointed, so a resumed turn keeps what it was
+        // told. An executor with nothing to deliver (the DO's, a delegated
+        // harness's) keeps the trait default and this is a no-op, which is the
+        // turn-boundary degradation the decision documents.
+        let notices = self.executor.poll_notices();
+        if !notices.is_empty() {
+            for notice in notices {
+                self.messages.push(ChatMessage::User {
+                    text: notice,
+                    images: Vec::new(),
+                });
+            }
+            (self.checkpoint)(&self.messages);
+        }
         self.awaiting = Awaiting::Main;
         self.observations
             .push(LoopObservation::ModelRequest { step: self.step });
@@ -1567,7 +1586,9 @@ where
             if let Some(observation) = workspace_read_observation(self.executor, call) {
                 self.observations.push(observation);
             }
-            if let Some((original_bytes, recall_id)) = truncation_metadata(&outcome.content) {
+            if let Some((original_bytes, recall_id)) =
+                truncation_metadata(&outcome.content, tool_output_retention(&call.name))
+            {
                 self.observations
                     .push(LoopObservation::ToolOutputTruncated {
                         call_id: call.id.clone(),
@@ -1639,7 +1660,44 @@ fn recall_request_observation(call: &ToolCall) -> Option<LoopObservation> {
     })
 }
 
-fn truncation_metadata(content: &str) -> Option<(usize, Option<String>)> {
+/// The bracket a class-aware truncation marker is written inside, native
+/// (`[... 3000 of 4000 bytes omitted from the end; retained head ...]`) and
+/// hosted (`[... 500 of 1000 bytes elided; recall id=blob123 ... ...]`) alike.
+const TRUNCATION_MARKER_OPEN: &str = "[... ";
+const TRUNCATION_MARKER_CLOSE: &str = " ...]";
+
+/// The direction words the producer writes into its OWN marker, and the reason
+/// an anchored position alone cannot identify it.
+///
+/// `truncate_tool_output` writes `{marker}\n{retained}` when it retains the
+/// tail and `{retained}\n{marker}` when it retains the head, so the producer's
+/// marker sits at index 0 in the first case and closes the content in the
+/// second. Either position on its own is also reachable by the TOOL'S OWN
+/// OUTPUT -- a command that echoes an earlier truncation opens the result with
+/// a bracket it did not write -- and trusting the position alone lets that
+/// quoted bracket outrank the producer's. Each anchor is therefore gated on the
+/// words only the producer puts there for that direction: a marker at index 0
+/// is the producer's only when it says the beginning was omitted, and one that
+/// closes the content only when it says the end was.
+///
+/// The hosted marker says `elided` rather than either, so it matches neither
+/// gate and reaches the interior scan below, which is where it sits anyway --
+/// between a retained head and a retained tail.
+const TRUNCATION_OMITTED_BEGINNING: &str = "omitted from the beginning";
+const TRUNCATION_OMITTED_END: &str = "omitted from the end";
+
+/// The hosted marker's recall-id introducer.
+const HOSTED_RECALL_MARKER: &str = "recall id=";
+
+/// The original byte length and recall id a truncated tool result carries, or
+/// `None` when it was not truncated.
+///
+/// Two shapes say a result was cut: the [`recall_footer`] appended when the
+/// full bytes were captured, and the class-aware marker [`truncate_tool_output`]
+/// writes. The marker is a BRACKETED sentence, and this reads only inside that
+/// bracket -- a tool result whose own text says "one of 12 apples" is untrusted
+/// workspace content, not evidence that an output was truncated from 12 bytes.
+fn truncation_metadata(content: &str, retention: &str) -> Option<(usize, Option<String>)> {
     if let Some(marker) = content.rfind("[full `") {
         let footer = &content[marker..];
         let bytes_at = footer.find(" output: ")? + " output: ".len();
@@ -1651,12 +1709,78 @@ fn truncation_metadata(content: &str) -> Option<(usize, Option<String>)> {
             .map(str::to_owned);
         return Some((bytes, recall_id));
     }
-    let marker = content.find(" of ")?;
-    let tail = &content[marker + " of ".len()..];
-    let bytes = tail.split_whitespace().next()?.parse().ok()?;
-    let recall_id = content
-        .find("recall id=")
-        .map(|start| &content[start + "recall id=".len()..])
+    // The producer's OWN anchor first -- exactly one position, decided by the
+    // retention this tool class gets rather than by what the content looks
+    // like. `truncate_tool_output` writes `{marker}\n{retained}` for tail
+    // retention and `{retained}\n{marker}` for head, so only one end can carry
+    // the loop's own word; the other is the first or last bytes of untrusted
+    // tool output. Position alone is forgeable -- a command echoes a truncation
+    // it read -- and so is the wording, so neither identifies the producer on
+    // its own. The caller's knowledge of the tool does, and both call sites
+    // already have it.
+    if retention == "tail" {
+        if let Some(parsed) = truncation_marker_at(content, 0, TRUNCATION_OMITTED_BEGINNING) {
+            return Some(parsed);
+        }
+    } else {
+        let end_anchored = content.trim_end();
+        if let Some(open) = end_anchored.rfind(TRUNCATION_MARKER_OPEN) {
+            if end_anchored[open..].ends_with(TRUNCATION_MARKER_CLOSE) {
+                if let Some(parsed) =
+                    truncation_marker_at(end_anchored, open, TRUNCATION_OMITTED_END)
+                {
+                    return Some(parsed);
+                }
+            }
+        }
+    }
+    // Only then the interior, nearest bracket first: the hosted marker sits
+    // between a retained head and tail rather than at either edge, so a body
+    // that opens a bracket of its own costs a parse attempt rather than the
+    // answer.
+    let mut head = content;
+    while let Some(open) = head.rfind(TRUNCATION_MARKER_OPEN) {
+        let inside = &head[open + TRUNCATION_MARKER_OPEN.len()..];
+        if let Some(close) = inside.find(TRUNCATION_MARKER_CLOSE) {
+            if let Some(parsed) = truncation_marker(&inside[..close]) {
+                return Some(parsed);
+            }
+        }
+        head = &head[..open];
+    }
+    None
+}
+
+/// The bracket that OPENS at `at` in `content`, read as a truncation marker.
+/// `None` when nothing opens there, the bracket never closes, or its interior is
+/// some other sentence.
+fn truncation_marker_at(
+    content: &str,
+    at: usize,
+    written_by_the_producer: &str,
+) -> Option<(usize, Option<String>)> {
+    let inside = content.get(at..)?.strip_prefix(TRUNCATION_MARKER_OPEN)?;
+    let close = inside.find(TRUNCATION_MARKER_CLOSE)?;
+    let marker = &inside[..close];
+    if !marker.contains(written_by_the_producer) {
+        return None;
+    }
+    truncation_marker(marker)
+}
+
+/// One bracket's interior read as a truncation marker: the byte count after
+/// ` of ` -- the ORIGINAL length, since the omitted count comes first -- and the
+/// recall id when the marker names one. `None` when the bracket is some other
+/// sentence.
+fn truncation_marker(marker: &str) -> Option<(usize, Option<String>)> {
+    if !marker.contains(" bytes") {
+        return None;
+    }
+    let after = marker.find(" of ")? + " of ".len();
+    let bytes = marker[after..].split_whitespace().next()?.parse().ok()?;
+    let recall_id = marker
+        .find(HOSTED_RECALL_MARKER)
+        .map(|start| &marker[start + HOSTED_RECALL_MARKER.len()..])
         .and_then(|tail| tail.split_whitespace().next())
         .map(|id| {
             id.trim_end_matches(|ch: char| !ch.is_ascii_alphanumeric())
@@ -3389,6 +3513,102 @@ mod tests {
         ));
     }
 
+    /// DR-0052 Decision 7 mid-turn delivery is the OWNED harness's advantage
+    /// over a delegated one, so the driver every native turn actually runs --
+    /// the stepped machine -- has to drain `poll_notices` before each model
+    /// call, not just the reference loop. A notice raised while the first tool
+    /// ran therefore reaches the SECOND model round, appended as inbound
+    /// context and checkpointed so a resumed turn keeps what it was told.
+    #[test]
+    fn a_notice_raised_mid_turn_reaches_the_next_model_round() {
+        struct NoticingExecutor {
+            batches: RefCell<std::collections::VecDeque<Vec<String>>>,
+            polls: std::cell::Cell<usize>,
+        }
+
+        impl ToolExecutor for NoticingExecutor {
+            fn execute(&self, _call: &ToolCall) -> ToolOutcome {
+                ToolOutcome {
+                    status: ToolStatus::Ok,
+                    content: "R".to_owned(),
+                }
+            }
+
+            fn poll_notices(&self) -> Vec<String> {
+                self.polls.set(self.polls.get() + 1);
+                self.batches.borrow_mut().pop_front().unwrap_or_default()
+            }
+        }
+
+        const NOTICE: &str = "raise from alice: the branch you are reading moved";
+        let http = ScriptedHttpClient::new(vec![
+            Ok(tool_reply("c1", "read")),
+            Ok(final_reply("acknowledged")),
+        ]);
+        // Nothing to say before the first round; the notice arrives while the
+        // tool runs, which is the case a turn-boundary-only channel loses.
+        let exec = NoticingExecutor {
+            batches: RefCell::new(
+                vec![Vec::new(), vec![NOTICE.to_owned()]]
+                    .into_iter()
+                    .collect(),
+            ),
+            polls: std::cell::Cell::new(0),
+        };
+        let turn_input = input(8);
+        let mut checkpointed: Vec<String> = Vec::new();
+        {
+            let mut checkpoint = |messages: &[ChatMessage]| {
+                checkpointed.push(chat_messages_to_json(messages).to_string());
+            };
+            let mut machine = BrokeredTurnMachine::new(
+                &http,
+                &exec,
+                &turn_input,
+                &mut checkpoint,
+                &NoopCompactor,
+            );
+
+            assert!(matches!(machine.step(None), Outcome::NeedsIo(_)));
+            assert!(matches!(
+                machine.step(Some(DummyHost.fulfill(&IoRequest::Http(HttpRequest {
+                    url: "https://fake/model".to_owned(),
+                    headers: Vec::new(),
+                    body: json!({}),
+                })))),
+                Outcome::NeedsIo(_)
+            ));
+            let snapshot = machine.snapshot();
+            assert!(
+                matches!(
+                    snapshot.messages.last(),
+                    Some(ChatMessage::User { text, .. }) if text == NOTICE
+                ),
+                "the notice is the last thing the second round sees: {:?}",
+                snapshot.messages.last()
+            );
+            assert!(matches!(
+                machine.step(Some(DummyHost.fulfill(&IoRequest::Http(HttpRequest {
+                    url: "https://fake/model".to_owned(),
+                    headers: Vec::new(),
+                    body: json!({}),
+                })))),
+                Outcome::Settle(BrokeredTurnOutcome {
+                    status: TurnStatus::Completed,
+                    ..
+                })
+            ));
+        }
+
+        assert_eq!(exec.polls.get(), 2, "drained once per model round");
+        assert!(
+            checkpointed
+                .iter()
+                .any(|transcript| transcript.contains(NOTICE)),
+            "a resumed turn keeps what it was told: {checkpointed:?}"
+        );
+    }
+
     #[test]
     fn follow_up_continues_only_when_the_agent_would_finish() {
         let http = ScriptedHttpClient::new(vec![
@@ -4077,13 +4297,13 @@ mod tests {
     fn truncation_and_recall_observations_capture_policy_and_ranges() {
         let native = "head\n[full `read` output: 90000 bytes, id sha256:abc — call `recall`]";
         assert_eq!(
-            truncation_metadata(native),
+            truncation_metadata(native, "head"),
             Some((90_000, Some("sha256:abc".to_owned())))
         );
         let hosted =
             "head\n[... 500 of 1000 bytes elided; recall id=blob123 for the full output ...]\ntail";
         assert_eq!(
-            truncation_metadata(hosted),
+            truncation_metadata(hosted, "head"),
             Some((1_000, Some("blob123".to_owned())))
         );
         assert!(matches!(
@@ -4098,6 +4318,84 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    /// A truncation marker is a bracketed sentence the loop itself wrote, so
+    /// the evidence keys on THAT bracket. Ordinary tool output that happens to
+    /// count things -- a file saying "one of 12 apples", a log saying "Chapter
+    /// 3 of 7" -- is untrusted workspace text, and recording it as an output
+    /// truncated from 12 bytes would be a fabricated row in the turn's
+    /// evidence. A marker inside such a body still parses, and it is the
+    /// marker's number that counts.
+    #[test]
+    fn counting_prose_in_a_tool_result_is_not_truncation_evidence() {
+        assert_eq!(truncation_metadata("one of 12 apples", "head"), None);
+        assert_eq!(truncation_metadata("Chapter 3 of 7\n", "head"), None);
+        assert_eq!(
+            truncation_metadata("a total of 40 rows; see recall id=nothing", "head"),
+            None
+        );
+
+        // The producer's own output is read back, body and all.
+        let produced = truncate_tool_output("read", &"a".repeat(2_000), 1_000, None);
+        assert_eq!(truncation_metadata(&produced, "head"), Some((2_000, None)));
+        let counted =
+            "one of 12 apples\n[... 3000 of 4000 bytes omitted from the end; retained head ...]";
+        assert_eq!(truncation_metadata(counted, "head"), Some((4_000, None)));
+    }
+
+    /// A tail-retaining tool class -- `bash` and the other command/log streams --
+    /// gets its marker written at the START of the result, ahead of the retained
+    /// tail. That tail is the last bytes of untrusted command output, and command
+    /// output quotes truncation markers all the time (a build log echoing an
+    /// earlier tool result, a test that prints one). The producer's own anchor
+    /// has to outrank anything in the body, or the decoy's number lands in the
+    /// `context.tool_output_truncated` row as `original_bytes` for exactly the
+    /// tool class most likely to carry one.
+    #[test]
+    fn a_marker_quoted_by_command_output_does_not_outrank_the_producers_own() {
+        let decoy = "[... 9 of 99 bytes omitted from the end; retained head ...]";
+        let text = format!(
+            "{}{decoy}{}",
+            "a".repeat(3_082 - decoy.len() - 200),
+            "b".repeat(200)
+        );
+        assert_eq!(text.len(), 3_082);
+
+        let produced = truncate_tool_output("bash", &text, 1_000, None);
+        // Tail retention: the producer's marker opens the result, and the decoy
+        // survives inside the retained tail.
+        assert!(produced.starts_with("[... 2"), "produced: {produced}");
+        assert!(produced.contains(decoy));
+        assert_eq!(truncation_metadata(&produced, "tail"), Some((3_082, None)));
+
+        // And the MIRROR, which is why neither anchor may be trusted on
+        // position alone. A head-retaining class writes its marker at the END,
+        // so index 0 is the FIRST bytes of untrusted output -- and a body that
+        // opens with a quoted marker puts a decoy exactly there. The decoy says
+        // the END was omitted, which only a closing marker can say, so it is
+        // not mistaken for the producer's.
+        let opens_with_decoy = format!("{decoy}{}", "a".repeat(3_082 - decoy.len()));
+        assert_eq!(opens_with_decoy.len(), 3_082);
+        let produced = truncate_tool_output("read", &opens_with_decoy, 1_000, None);
+        assert!(produced.starts_with(decoy), "produced: {produced}");
+        assert!(produced.trim_end().ends_with(" ...]"));
+        assert_eq!(truncation_metadata(&produced, "head"), Some((3_082, None)));
+
+        // A decoy claiming the BEGINNING was omitted, sitting where only a
+        // tail-retaining producer writes one, is still outranked when the
+        // producer's own marker closes the result.
+        let beginning_decoy = "[... 9 of 99 bytes omitted from the beginning; retained tail ...]";
+        let opens_with_beginning_decoy = format!(
+            "{beginning_decoy}{}",
+            "a".repeat(3_082 - beginning_decoy.len())
+        );
+        let produced = truncate_tool_output("read", &opens_with_beginning_decoy, 1_000, None);
+        assert_eq!(
+            truncation_metadata(&produced, "head"),
+            Some((3_082, None)),
+            "the producer retained the head, so its own marker is the closing one"
+        );
     }
 
     #[test]

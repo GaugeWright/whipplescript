@@ -220,6 +220,13 @@ pub fn token_admitted(expected: &str, headers: &[(String, String)]) -> bool {
 const MAX_CONNECTIONS: usize = 64;
 const HEADER_READ_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// Cap on the pre-auth header block, for `exec_server`'s reason again: the
+/// read budget bounds a peer that goes SILENT, not one that keeps bytes
+/// flowing, so without a byte cap an unauthenticated peer can grow this
+/// process's memory on a credential-spending endpoint before the token is
+/// ever looked at.
+const MAX_HEADER_BYTES: usize = 64 * 1024;
+
 /// Serve until killed, translating sidecar HTTP into custody egress.
 pub fn serve(listener: TcpListener, binding: ProxyBinding, token: String) -> std::io::Result<()> {
     eprintln!(
@@ -252,10 +259,24 @@ fn handle(mut stream: TcpStream, binding: &ProxyBinding, token: &str) -> std::io
     stream.set_read_timeout(Some(HEADER_READ_BUDGET))?;
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut head = String::new();
+    let mut header_bytes = 0usize;
     loop {
         let mut line = String::new();
-        if reader.read_line(&mut line)? == 0 {
+        // Read the line through a `take` bounded by what is left of the cap:
+        // `read_line` on its own reads to the next newline, however far away
+        // the peer chooses to put it, so one newline-less line would outgrow
+        // the cap before the cap could be consulted.
+        let remaining = MAX_HEADER_BYTES.saturating_sub(header_bytes);
+        if (&mut reader)
+            .take(remaining as u64 + 1)
+            .read_line(&mut line)?
+            == 0
+        {
             break;
+        }
+        header_bytes = header_bytes.saturating_add(line.len());
+        if header_bytes > MAX_HEADER_BYTES {
+            return respond(&mut stream, 431, "request headers too large");
         }
         if line == "\r\n" || line == "\n" {
             break;
@@ -903,6 +924,45 @@ mod turn_lifecycle_tests {
         assert!(
             response.starts_with("HTTP/1.1 401"),
             "an unauthorized peer must be turned away: {response}"
+        );
+    }
+
+    #[test]
+    fn a_header_block_over_the_cap_is_refused_before_it_is_buffered() {
+        // The read budget bounds a SILENT peer, not a talkative one: a peer
+        // that keeps bytes flowing never trips it, so without a byte cap the
+        // head grows without bound before the token is ever checked. The
+        // token here is the RIGHT one, so a 431 cannot be a disguised 401.
+        let proxy = TurnProxy::start(binding(), "the-turn-token".to_owned()).expect("starts");
+        let url = proxy.base_url().expect("serving").to_owned();
+        let port: u16 = url.rsplit(':').next().expect("port").parse().expect("u16");
+        let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connects");
+
+        let request_line = "GET /v1/messages HTTP/1.1\r\n";
+        stream
+            .write_all(request_line.as_bytes())
+            .expect("request line");
+        // One newline-less header line that takes the block exactly one byte
+        // past the cap, and nothing after it: the proxy must answer from what
+        // it has read rather than wait for a terminator that never comes.
+        let mut line = b"x-whip-proxy-token: the-turn-token\r\nx-pad: ".to_vec();
+        line.resize(MAX_HEADER_BYTES + 1 - request_line.len(), b'a');
+        stream.write_all(&line).expect("oversized header line");
+        stream.flush().ok();
+
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(30)))
+            .expect("timeout");
+        let mut response = String::new();
+        use std::io::Read;
+        let _ = stream.read_to_string(&mut response);
+        assert!(
+            response.starts_with("HTTP/1.1 431"),
+            "an oversized header block must be refused, not buffered: {response:?}"
+        );
+        assert!(
+            response.contains("request headers too large"),
+            "the refusal must say what was wrong: {response:?}"
         );
     }
 }

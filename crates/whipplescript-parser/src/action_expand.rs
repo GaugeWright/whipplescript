@@ -223,20 +223,17 @@ fn expand_one_call(
         .collect();
     rename_bindings(&mut ast.statements, &hygiene);
 
-    // The renamer applies hygiene (for value-position binding uses) then
-    // parameter substitution. The two name sets are disjoint (checked above), so
-    // the sequential application is collision-free.
+    // Hygiene (for value-position binding uses) and parameter substitution are
+    // one table, applied in a single simultaneous scan. The two name sets are
+    // disjoint (checked above) and every name is matched whole-word, so at most
+    // one entry applies at any position; and because a substituted argument is
+    // never rescanned, an argument whose root spells ANOTHER parameter reaches
+    // the body as the caller wrote it.
     let mut renames = hygiene;
     for (param, arg) in action.params.iter().zip(args) {
         renames.push((param.name.name.clone(), arg.clone()));
     }
-    let renamer = move |text: &str| {
-        let mut current = text.to_owned();
-        for (from, to) in &renames {
-            current = rename_text(&current, Some(from), to);
-        }
-        current
-    };
+    let renamer = move |text: &str| rename_text(text, &renames);
 
     let mut serialized = String::new();
     for statement in &ast.statements {
@@ -576,6 +573,28 @@ mod tests {
         assert!(
             body.contains("status \"x\""),
             "the parameter in value position is substituted: {body}"
+        );
+    }
+
+    #[test]
+    fn an_argument_naming_a_later_parameter_is_substituted_only_once() {
+        // Substitution ran one parameter at a time over the previous pass's
+        // output, so an argument whose ROOT spells a later parameter was
+        // rewritten a second time: `file_note(ticket.title, ticket.id)` on
+        // `file_note(note, ticket)` put `ticket.title` in for `note` and then
+        // the `ticket` pass rewrote that root, yielding `ticket.id.title`.
+        // Arguments are caller-scope text; one call substitutes every
+        // parameter simultaneously (DR-0023 "substitution is by parameter
+        // name"), so an inserted argument is never a substitution site.
+        let source = "@service\nworkflow SwapDemo\n\nclass Ticket { id string  title string }\nclass Note { provider string  status string }\n\nagent reviewer { provider fixture  profile \"r\"  capacity 1 }\n\naction file_note(note string, ticket string) {\n  record Note { provider note  status ticket }\n}\n\nrule route\n  when Ticket as ticket\n=> {\n  file_note(ticket.title, ticket.id)\n}\n";
+        let body = route_body(source);
+        assert!(
+            body.contains("provider ticket.title"),
+            "the first argument must reach the body unchanged: {body}"
+        );
+        assert!(
+            body.contains("status ticket.id"),
+            "the second argument is substituted for its own parameter: {body}"
         );
     }
 

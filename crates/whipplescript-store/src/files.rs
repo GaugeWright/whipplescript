@@ -217,7 +217,13 @@ impl FileStore for NativeFileStore {
             Err(_) => return None,
         };
         let full = root_path.join(relative_path);
-        let anchor = if full.exists() {
+        // `Path::exists` is a `stat`, which FOLLOWS symlinks: a link whose
+        // target does not exist reports absent, which anchored the check on the
+        // link's parent instead of on the link. The host's own `open(O_CREAT)`
+        // follows that link, so the write landed wherever it pointed. Anchor on
+        // the link itself (`symlink_metadata` does not follow) and let the
+        // containment question be about what the link resolves to.
+        let anchor = if full.symlink_metadata().is_ok() {
             Some(full)
         } else {
             full.parent()
@@ -231,7 +237,14 @@ impl FileStore for NativeFileStore {
                 "path `{}` escapes the `{store_name}` store root",
                 relative_path.display()
             )),
-            Err(_) => None,
+            // The anchor exists but does not resolve — a dangling or looping
+            // symlink. Containment cannot be established, and the operation
+            // that would follow resolves the link itself, so fail closed
+            // (spec/files.md: "fail-closed, no disk content touched").
+            Err(_) => Some(format!(
+                "path `{}` cannot be resolved inside the `{store_name}` store root",
+                relative_path.display()
+            )),
         }
     }
 
@@ -272,7 +285,10 @@ impl FileStore for NativeFileStore {
 
 fn nearest_existing_ancestor(mut path: PathBuf) -> Option<PathBuf> {
     loop {
-        if path.exists() {
+        // `symlink_metadata`, not `exists`: a dangling symlink component IS an
+        // existing entry, and the containment check must see it rather than
+        // walk past it to the directory that holds it.
+        if path.symlink_metadata().is_ok() {
             return Some(path);
         }
         if !path.pop() {
@@ -410,6 +426,49 @@ mod tests {
             .path_policy_error(&root, Path::new("link/secret.txt"), "workspace", "read")
             .expect("symlink escapes root");
         assert!(reason.contains("escapes"), "{reason}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A symlink inside the root whose target does NOT exist yet. `Path::exists`
+    /// is a `stat`, which follows the link, so such a link reported "absent",
+    /// the check anchored on the in-root parent directory and admitted the
+    /// path — and the write that followed (`open(O_CREAT)`, which also follows
+    /// the link) created the file OUTSIDE the root.
+    #[cfg(unix)]
+    #[test]
+    fn native_file_store_refuses_a_path_through_an_unresolvable_symlink() {
+        let dir = std::env::temp_dir().join(format!(
+            "whipplescript-filestore-dangling-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos(),
+        ));
+        let root = dir.join("root");
+        let outside = dir.join("outside");
+        std::fs::create_dir_all(root.join("notes")).expect("root");
+        std::fs::create_dir_all(&outside).expect("outside");
+        let planted = outside.join("planted.txt");
+        std::os::unix::fs::symlink(&planted, root.join("link")).expect("symlink");
+        // The final component of the path, and an intermediate one.
+        std::os::unix::fs::symlink(outside.join("missing"), root.join("dir")).expect("symlink");
+
+        let files = NativeFileStore;
+        for relative in ["link", "dir/note.txt"] {
+            let reason = files
+                .path_policy_error(&root, Path::new(relative), "workspace", "write")
+                .expect("a link the host cannot resolve is not a path inside the root");
+            assert!(reason.contains("cannot be resolved inside"), "{reason}");
+        }
+        // Refused before any disk access: nothing was created outside the root.
+        assert!(!planted.exists(), "the write escaped the store root");
+        // An ordinary not-yet-existing file under the root is still admitted.
+        assert_eq!(
+            files.path_policy_error(&root, Path::new("notes/new.txt"), "workspace", "write"),
+            None
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

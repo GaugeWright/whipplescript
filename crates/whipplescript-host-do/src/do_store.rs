@@ -10828,9 +10828,11 @@ pub(crate) mod tests {
     /// append, overwrite-replaces, exists, and missing-errors.
     /// Data-layer parity for tracker-event subscriptions.
     ///
-    /// The DO deliberately does NOT deliver notices mid-turn — `poll_notices`
-    /// returns nothing on the stepped machine, where the turn boundary is the
-    /// atom (DR-0052: coordination granularity is a property of the harness),
+    /// The DO deliberately does NOT deliver notices mid-turn — the stepped
+    /// machine drains `poll_notices` before each model call, but the DO's
+    /// executor keeps the trait default and answers nothing, so the turn
+    /// boundary stays the atom here (DR-0052: coordination granularity is a
+    /// property of the harness),
     /// so there is no `subscribe_todos` tool here. The STORE half still has to
     /// agree with native: both hosts implement one `WorkItems` trait over one
     /// schema, and a subscription must not be corrupted by the host that is not
@@ -14201,6 +14203,92 @@ pub(crate) mod tests {
         }
         // Idempotent: a re-attach re-seeding is a no-op, not an error.
         crate::do_packages::register_embedded_std_packages(&store).expect("re-bootstrap");
+    }
+
+    /// DO-parity for the std.vcs dispatch arms (DR-0052 R4, DR-0074 §12): a
+    /// `capability.call` naming `vcs.promote` must reach the DO provider, which
+    /// it only does when the bootstrap seeded std.vcs's capability and binding
+    /// rows. Without them the gate refuses at the door — `capability
+    /// `vcs.promote` is not registered` — and the DoVcsPromoteCapabilityProvider
+    /// arm is unreachable on a bootstrapped DO even though it is reachable
+    /// natively. The refusing half beside it keeps the gate honest: an
+    /// unseeded capability still blocks.
+    #[test]
+    fn do_package_bootstrap_admits_a_vcs_capability_call() {
+        let store = store();
+        let seed = |sql: &str, params: &[SqlValue]| store.sql.execute(sql, params).expect(sql);
+        seed(
+            "INSERT INTO programs (program_id, name) VALUES (?1, ?2)",
+            &[text("prog_1"), text("streams")],
+        );
+        seed(
+            "INSERT INTO program_versions (version_id, program_id, declared_profiles) \
+             VALUES (?1, ?2, ?3)",
+            &[text("ver_1"), text("prog_1"), text("[]")],
+        );
+        seed(
+            "INSERT INTO instances (instance_id, program_id, version_id, workflow_principal, \
+             effective_authority, status, input_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            &[
+                text("i1"),
+                text("prog_1"),
+                text("ver_1"),
+                text("root"),
+                text("{}"),
+                text("running"),
+                text("{}"),
+            ],
+        );
+        let queue_capability_call = |effect_id: &str, target: &str| {
+            seed(
+                "INSERT INTO effects (effect_id, instance_id, kind, target, status, input_json, \
+                 required_capabilities, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                &[
+                    text(effect_id),
+                    text("i1"),
+                    text("capability.call"),
+                    text(target),
+                    text("queued"),
+                    text("{}"),
+                    text("[]"),
+                    text("2026-01-01T00:00:00Z"),
+                ],
+            );
+        };
+        queue_capability_call("eff_promote", "vcs.promote");
+        queue_capability_call("eff_unknown", "vcs.not_a_capability");
+
+        // Before the bootstrap the gate refuses BOTH: no manifest has been seeded.
+        let block = do_policy_block(&store.sql, "i1", "eff_promote")
+            .expect("policy")
+            .expect("unbootstrapped store has no vcs rows");
+        assert_eq!(block.status, "blocked_by_capability");
+        assert!(
+            block.reason.contains("is not registered"),
+            "unexpected reason: {}",
+            block.reason
+        );
+
+        crate::do_packages::register_embedded_std_packages(&store).expect("bootstrap");
+
+        // After: the declared capability is admitted, so the effect reaches the
+        // DO vcs provider instead of being refused at the door.
+        assert!(
+            do_policy_block(&store.sql, "i1", "eff_promote")
+                .expect("policy")
+                .is_none(),
+            "a bootstrapped DO must admit a `vcs.promote` capability.call"
+        );
+        // And the gate is still REAL: a capability no manifest declares blocks.
+        let block = do_policy_block(&store.sql, "i1", "eff_unknown")
+            .expect("policy")
+            .expect("an undeclared capability must still block");
+        assert_eq!(block.status, "blocked_by_capability");
+        assert!(
+            block.reason.contains("is not registered"),
+            "unexpected reason: {}",
+            block.reason
+        );
     }
 
     /// renew_lease extends an active lease (guarded); expire_leases sweeps expired

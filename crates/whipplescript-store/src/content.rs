@@ -1298,10 +1298,42 @@ impl ContentStore {
     /// payload and replay are honestly gone. Returns how many chunk
     /// bodies were erased.
     pub fn erase_chunks(&self, root_id: &str, at: &str) -> StoreResult<usize> {
+        // Unpack, record and delete are ONE step. Spread across statements,
+        // a crash between them leaves a root `status` still calls Live whose
+        // chunks are gone — the *absent*-for-*erased* substitution DR-0066 §5
+        // refuses, arrived at from the other side.
+        let transaction = rusqlite::Transaction::new_unchecked(
+            &self.connection,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
         // Packed chunks first: dissolve their packs back to loose rows so
         // the erasure below actually removes bytes (a pack is one blob —
         // deleting an index entry alone would leave the payload inside).
         self.unpack_for_erasure(root_id)?;
+        // The root's own byte length is retained identity, so it is recorded
+        // with the erasure rather than looked up afterwards from a table this
+        // no longer trusts.
+        let byte_len: i64 = self
+            .connection
+            .query_row(
+                "SELECT byte_len FROM content_chunk_roots WHERE root_id = ?1",
+                params![root_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .unwrap_or(0);
+        // Record BEFORE the delete, as the plain-blob path does and DR-0071 §6
+        // requires: the record that makes an absence honest must be durable
+        // before the bytes stop being there. The survivor test below reads the
+        // ledger for OTHER roots (`ledger.id = other.root_id`), never this one,
+        // so recording first keeps exactly the same chunks.
+        append_erasure_entry(
+            &self.connection,
+            root_id,
+            crate::erasure_ledger::ErasedKind::ChunkRoot,
+            byte_len,
+            at,
+        )?;
         let erased = self.connection.execute(
             "DELETE FROM content_blobs WHERE id IN (
                  SELECT refs.chunk_id FROM content_chunk_refs AS refs
@@ -1318,25 +1350,7 @@ impl ContentStore {
              )",
             params![root_id],
         )?;
-        // The root's own byte length is retained identity, so it is recorded
-        // with the erasure rather than looked up afterwards from a table this
-        // no longer trusts.
-        let byte_len: i64 = self
-            .connection
-            .query_row(
-                "SELECT byte_len FROM content_chunk_roots WHERE root_id = ?1",
-                params![root_id],
-                |row| row.get(0),
-            )
-            .optional()?
-            .unwrap_or(0);
-        append_erasure_entry(
-            &self.connection,
-            root_id,
-            crate::erasure_ledger::ErasedKind::ChunkRoot,
-            byte_len,
-            at,
-        )?;
+        transaction.commit()?;
         Ok(erased)
     }
 }
@@ -1861,6 +1875,90 @@ mod tests {
             store.get(&sibling_root).expect("get").as_deref(),
             Some(sibling.as_bytes()),
             "the live sibling still reads whole after the pack dissolved"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// DR-0071 §6: the ledger entry is durable BEFORE the bytes go, because
+    /// the other order has a crash window that leaves a root the store still
+    /// calls live with no payload to serve — the *absent*-for-*erased*
+    /// substitution DR-0066 §5 refuses.
+    ///
+    /// A failing ledger append stands in for the crash: whatever the erasure
+    /// managed to do before it must not survive it.
+    #[test]
+    fn a_chunk_root_erasure_that_cannot_be_recorded_keeps_its_bytes() {
+        use crate::chunking::ChunkingConfig;
+        let dir = std::env::temp_dir().join(format!(
+            "whip-erase-record-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos(),
+        ));
+        let store = ContentStore::open(dir.join("content.db")).expect("open");
+        let config = ChunkingConfig {
+            whole_blob_threshold: 256,
+            min_size: 64,
+            avg_size: 256,
+            max_size: 1024,
+        };
+        let big = "abcdefghij-0123456789=".repeat(500);
+        let root = store.put_chunked(&big, &config).expect("put");
+        assert!(store.pack_root(&root).expect("pack") > 1, "chunks packed");
+        let packed = |store: &ContentStore| -> i64 {
+            store
+                .connection
+                .query_row("SELECT count(*) FROM content_pack_entries", [], |row| {
+                    row.get(0)
+                })
+                .expect("pack entries")
+        };
+        let packed_before = packed(&store);
+
+        // The append that makes the absence honest fails.
+        store
+            .connection
+            .execute_batch(
+                "CREATE TRIGGER refuse_erasure_record \
+                 BEFORE INSERT ON content_erasure_ledger \
+                 BEGIN SELECT RAISE(ABORT, 'ledger append unavailable'); END",
+            )
+            .expect("arm the failing append");
+        let error = store
+            .erase_chunks(&root, "t1")
+            .expect_err("an erasure that cannot be recorded is not an erasure");
+        assert!(
+            format!("{error:?}").contains("ledger append unavailable"),
+            "the failure is the ledger append: {error:?}"
+        );
+        store
+            .connection
+            .execute_batch("DROP TRIGGER refuse_erasure_record")
+            .expect("disarm");
+
+        assert!(
+            store.erasure_ledger().expect("ledger").is_empty(),
+            "nothing was recorded, so nothing was erased"
+        );
+        assert!(
+            matches!(
+                store.status(&root).expect("status"),
+                BlobStatus::Live { .. }
+            ),
+            "an unrecorded erasure leaves the root live"
+        );
+        assert_eq!(
+            store.get(&root).expect("get").as_deref(),
+            Some(big.as_bytes()),
+            "a root the store still calls live must still have its bytes"
+        );
+        assert_eq!(
+            packed(&store),
+            packed_before,
+            "an erasure that did not happen leaves nothing of itself behind"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

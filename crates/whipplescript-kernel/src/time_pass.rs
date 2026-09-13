@@ -5,7 +5,7 @@
 //! it honors both the native virtual clock and the DO's host-supplied instant.
 
 use serde_json::json;
-use whipplescript_store::{EffectCancellationRequest, EffectCompletion, RunStart, StoreResult};
+use whipplescript_store::{EffectCompletion, RunStart, StoreResult};
 
 use crate::{idempotency_key, RuntimeKernel};
 use whipplescript_store::RuntimeStore;
@@ -96,8 +96,24 @@ pub fn resolve_due_time_effects<S: RuntimeStore>(
             report.terminal_events.push(terminal.event_id);
             continue;
         }
-        // Deadline expiry: running effects time out at the run level and get
-        // a cancellation request; never-run effects expire directly.
+        // Deadline expiry: a running effect times out at the run level;
+        // a never-run effect expires directly.
+        //
+        // The running work itself is NOT signalled to stop, and this pass
+        // cannot signal it. A durable cancellation request is the only stop
+        // signal the runtime has: `request_effect_cancellation` takes only a
+        // `running` effect, and `complete_effect` resolves every open request
+        // on the terminal it writes. So a request asked for after the terminal
+        // below is refused ("effect is timed_out; cancellation requests
+        // require running work") and one asked for before it is closed by that
+        // same terminal — either way no mid-run consumer of
+        // `effect_has_open_cancellation_request` ever observes one. The
+        // provider runs on at full cost and its late completion is then
+        // refused. Stopping the work means not terminalizing it here and
+        // letting the acknowledgement settle it, which changes the terminal a
+        // program observes (`times out` becomes `cancelled`) — a decision for
+        // a record, not for this pass. Open row in
+        // `spec/survey-residue-tracker.md`.
         let running_run = kernel
             .store()
             .running_run_for_effect(instance_id, &effect.effect_id)?;
@@ -131,21 +147,6 @@ pub fn resolve_due_time_effects<S: RuntimeStore>(
                         "deadline-terminal",
                     ])),
                 })?;
-                let _ = kernel
-                    .store_mut()
-                    .request_effect_cancellation(EffectCancellationRequest {
-                        instance_id,
-                        effect_id: &effect.effect_id,
-                        revision_id: None,
-                        reason: Some("deadline exceeded"),
-                        requested_by: "deadline",
-                        causation_event_id: Some(&terminal.event_id),
-                        idempotency_key: Some(&idempotency_key(&[
-                            instance_id,
-                            &effect.effect_id,
-                            "deadline-cancel-request",
-                        ])),
-                    });
                 terminal.event_id
             }
             None => {
@@ -561,4 +562,157 @@ fn next_calendar_occurrence(
         date = date.succ_opt()?;
     }
     None
+}
+
+#[cfg(all(test, feature = "native"))]
+mod deadline_tests {
+    use super::*;
+    use whipplescript_store::{
+        EffectCancellationRequest, NewEffect, RuleCommit, SqliteStore, StoreError,
+    };
+
+    use crate::{ProgramVersionInput, RuntimeKernel};
+    use whipplescript_parser::compile_program;
+
+    const PROGRAM: &str = r#"
+workflow DeadlineOnRunningWork
+
+agent worker {
+  provider fixture
+  profile "repo-writer"
+  capacity 1
+  capabilities ["agent.tell"]
+}
+
+rule start
+  when started
+=> {
+  tell worker "go"
+}
+"#;
+
+    /// One effect with a deadline, past the provider boundary: a run is open,
+    /// so the pass takes its `Some(run)` branch.
+    fn kernel_with_running_effect() -> (RuntimeKernel<SqliteStore>, String) {
+        let program = compile_program(PROGRAM).ir.expect("program compiles");
+        let store = SqliteStore::open_in_memory().expect("store opens");
+        let mut kernel = RuntimeKernel::new(store);
+        let version = kernel
+            .create_program_version_for_program(
+                ProgramVersionInput {
+                    program_name: &program.workflow,
+                    source_hash: "source",
+                    ir_hash: "ir",
+                    compiler_version: "test",
+                    ir_snapshot: None,
+                },
+                &program,
+            )
+            .expect("program version creates");
+        let instance_id = kernel
+            .create_instance(&version, "{}")
+            .expect("instance creates");
+        let effects = [NewEffect {
+            timeout_seconds: Some(60),
+            effect_id: "tell",
+            kind: "agent.tell",
+            target: Some("worker"),
+            input_json: r#"{"prompt":"go"}"#,
+            status: "queued",
+            idempotency_key: "rule=start;effect=tell",
+            required_capabilities_json: "[]",
+            profile: Some("repo-writer"),
+            correlation_id: None,
+            source_span_json: None,
+        }];
+        kernel
+            .commit_rule(RuleCommit {
+                instance_id: &instance_id,
+                rule: "start",
+                trigger_event_id: None,
+                facts: &[],
+                consumed_fact_ids: &[],
+                effects: &effects,
+                dependencies: &[],
+                terminal: None,
+                idempotency_key: Some("commit-start"),
+                marks: &[],
+                context_json: None,
+            })
+            .expect("rule commits");
+        kernel
+            .start_run(RunStart {
+                instance_id: &instance_id,
+                effect_id: "tell",
+                run_id: "run-tell",
+                provider: "test",
+                worker_id: "worker-1",
+                lease_id: "lease-tell",
+                lease_expires_at: "2030-01-01T00:00:00Z",
+                metadata_json: "{}",
+            })
+            .expect("run starts");
+        (kernel, instance_id)
+    }
+
+    /// The accepting case: while the work is still running, the runtime's one
+    /// stop signal is available and a request is admitted.
+    #[test]
+    fn running_work_admits_a_cancellation_request() {
+        let (mut kernel, instance_id) = kernel_with_running_effect();
+        kernel
+            .store_mut()
+            .request_effect_cancellation(EffectCancellationRequest {
+                instance_id: &instance_id,
+                effect_id: "tell",
+                revision_id: None,
+                reason: Some("operator asked"),
+                requested_by: "operator",
+                causation_event_id: None,
+                idempotency_key: Some("cancel-tell"),
+            })
+            .expect("running work admits a cancellation request");
+        assert!(kernel
+            .store()
+            .effect_has_open_cancellation_request(&instance_id, "tell")
+            .unwrap());
+    }
+
+    /// The refusing case, and the reason the deadline pass writes no request:
+    /// the pass terminalizes the run, and the terminal takes the effect out of
+    /// `running`, which is the only state a stop signal can be asked for. The
+    /// pass used to ask anyway and discard the refusal, so the comment above it
+    /// described a signal no consumer could ever observe.
+    #[test]
+    fn a_deadline_leaves_the_running_work_unsignalled() {
+        let (mut kernel, instance_id) = kernel_with_running_effect();
+        let report =
+            resolve_due_time_effects(&mut kernel, &instance_id, "2030-01-01T00:00:00Z").unwrap();
+        assert_eq!(report.deadlines_expired, 1);
+        assert!(
+            kernel
+                .store()
+                .list_effect_cancellation_requests(&instance_id)
+                .unwrap()
+                .is_empty(),
+            "a deadline cannot ask a terminal effect to stop"
+        );
+        let refused = kernel
+            .store_mut()
+            .request_effect_cancellation(EffectCancellationRequest {
+                instance_id: &instance_id,
+                effect_id: "tell",
+                revision_id: None,
+                reason: Some("deadline exceeded"),
+                requested_by: "deadline",
+                causation_event_id: None,
+                idempotency_key: Some("cancel-tell"),
+            })
+            .expect_err("a timed-out effect refuses a cancellation request");
+        assert!(
+            matches!(&refused, StoreError::Conflict(reason)
+                if reason.contains("cancellation requests require running work")),
+            "unexpected refusal: {refused:?}"
+        );
+    }
 }

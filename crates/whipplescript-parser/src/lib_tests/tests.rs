@@ -19289,6 +19289,59 @@ rule j
     );
 }
 
+/// A counter's `timezone` clause anchors its reset-period boundary (std.coord
+/// slice 3). Dropping it while formatting would move the boundary to UTC and
+/// draw the default-UTC warning on a program whose author named a zone.
+#[test]
+fn fmt_round_trips_a_counter_timezone() {
+    let source = r#"workflow FmtCounterTimezone
+
+use std.coord
+
+output result R
+class R {
+  ok bool
+}
+
+class Ticket {
+  id string
+  status "open"
+}
+
+counter request_budget {
+  key Ticket
+  cap 10
+  reset daily
+  timezone "America/New_York"
+}
+
+table seed as Ticket [
+  {
+    id "T1"
+    status "open"
+  }
+]
+
+rule j
+  when Ticket as t where t.status == "open"
+=> {
+  complete result {
+    ok true
+  }
+}
+"#;
+    let formatted = format_program(source).formatted.expect("formats");
+    assert!(
+        formatted.contains("timezone \"America/New_York\""),
+        "`timezone` must survive formatting:\n{formatted}"
+    );
+    assert_eq!(
+        format_program(&formatted).formatted.expect("re-formats"),
+        formatted,
+        "formatting must be idempotent"
+    );
+}
+
 /// `allow [<op>, ...]` (DR-0053 §14 Amendment 2026-08-29) is the author-side
 /// ceiling: which operations this declaration admits. Governance's grants stay
 /// the operator-side ceiling beneath it.
@@ -25854,6 +25907,63 @@ tracker backlog {
         format_program_preserving_comments(&formatted).expect("re-formats"),
         formatted,
         "formatting must be idempotent"
+    );
+}
+
+/// Family B (`<field> <Type> when <disc> is "<lit>"`) makes a field present only
+/// when the discriminant holds the literal. Dropping the suffix while formatting
+/// would turn a conditionally-present field into an unconditional one — a
+/// type-discipline change the author never wrote — so both fmt paths keep it.
+#[test]
+fn fmt_round_trips_a_field_presence_condition() {
+    let source = r#"@service
+workflow FmtPresence
+
+use std.ingress
+
+signal issue.filed {
+  kind "bug" | "task"
+  severity string when kind is "bug"
+}
+
+class Ticket {
+  id string @key
+  kind "bug" | "task"
+  severity string when kind is "bug"
+}
+"#;
+    let formatted = format_program(source).formatted.expect("formats");
+    assert_eq!(
+        formatted
+            .matches("severity string when kind is \"bug\"")
+            .count(),
+        2,
+        "the signal field and the class field must both keep their presence condition:\n{formatted}"
+    );
+    assert!(
+        formatted.contains("id string @key"),
+        "`@key` must survive beside a presence condition:\n{formatted}"
+    );
+    assert_eq!(
+        format_program(&formatted).formatted.expect("re-formats"),
+        formatted,
+        "formatting must be idempotent"
+    );
+
+    // A file that carries a comment routes through the comment-preserving
+    // formatter instead, which builds the member lines itself.
+    let commented = source.replace("class Ticket {", "class Ticket {\n  # the ticket as filed");
+    let preserved = format_program_preserving_comments(&commented).expect("formats");
+    assert_eq!(
+        preserved
+            .matches("severity string when kind is \"bug\"")
+            .count(),
+        2,
+        "the comment-preserving path must keep both presence conditions:\n{preserved}"
+    );
+    assert!(
+        preserved.contains("# the ticket as filed"),
+        "the comment must survive:\n{preserved}"
     );
 }
 

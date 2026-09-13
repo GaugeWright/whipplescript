@@ -194,9 +194,21 @@ impl<S: DoSql> DoBranches<S> {
         head_manifest_hash, adopted_merge_cut_id, status, created_at, \
         updated_at";
 
-    fn decode_row(row: &[SqlValue]) -> BranchRow {
-        BranchRow {
-            branch_id: as_text(&row[0]),
+    fn decode_row(row: &[SqlValue]) -> StoreResult<BranchRow> {
+        let branch_id = as_text(&row[0]);
+        let status_text = as_text(&row[8]);
+        // Mirrors the native decoder: a status text this build does not know
+        // is a fault, not `Active`. `Active` is the state every status-gated
+        // verb proceeds under, and no `CREATE TABLE` changes when a status
+        // value is added, so the schema stamp never catches it.
+        let status = BranchStatus::parse(&status_text).ok_or_else(|| {
+            StoreError::fault(
+                format!("branch `{branch_id}`"),
+                format!("unreadable status `{status_text}`"),
+            )
+        })?;
+        Ok(BranchRow {
+            branch_id,
             name: as_opt_text(&row[1]),
             parent_branch_id: as_opt_text(&row[2]),
             branch_point_cut_id: as_opt_text(&row[3]),
@@ -204,10 +216,10 @@ impl<S: DoSql> DoBranches<S> {
             head_cut_id: as_opt_text(&row[5]),
             head_manifest_hash: as_opt_text(&row[6]),
             adopted_merge_cut_id: as_opt_text(&row[7]),
-            status: BranchStatus::parse(&as_text(&row[8])).unwrap_or(BranchStatus::Active),
+            status,
             created_at: as_text(&row[9]),
             updated_at: as_text(&row[10]),
-        }
+        })
     }
 
     fn row_by_id(&self, branch_id: &str) -> StoreResult<Option<BranchRow>> {
@@ -221,7 +233,7 @@ impl<S: DoSql> DoBranches<S> {
                 &[text(branch_id)],
             )
             .map_err(sql_err)?;
-        Ok(rows.first().map(|row| Self::decode_row(row)))
+        rows.first().map(|row| Self::decode_row(row)).transpose()
     }
 }
 
@@ -419,7 +431,7 @@ impl<S: DoSql> Branches for DoBranches<S> {
                 )
                 .map_err(sql_err)?,
         };
-        Ok(rows.iter().map(|row| Self::decode_row(row)).collect())
+        rows.iter().map(|row| Self::decode_row(row)).collect()
     }
 
     fn list_children(&self, parent_branch_id: &str) -> StoreResult<Vec<BranchRow>> {
@@ -433,7 +445,7 @@ impl<S: DoSql> Branches for DoBranches<S> {
                 &[text(parent_branch_id)],
             )
             .map_err(sql_err)?;
-        Ok(rows.iter().map(|row| Self::decode_row(row)).collect())
+        rows.iter().map(|row| Self::decode_row(row)).collect()
     }
 
     fn lineage(&self, branch_id: &str) -> StoreResult<Vec<BranchRow>> {
@@ -1083,7 +1095,7 @@ impl<S: DoSql> Branches for DoBranches<S> {
                     opt_text(state.head_manifest_hash.as_deref()),
                     opt_text(state.branch_point_cut_id.as_deref()),
                     opt_text(state.branch_point_manifest_hash.as_deref()),
-                    text(&state.status),
+                    text(state.status.as_str()),
                     text(at),
                 ],
             )
@@ -1878,4 +1890,80 @@ pub(crate) fn compose_vcs<Sql: crate::do_store::DoSql + Clone>(
         whipplescript_kernel::source_merge::WhipDeclCanonicalizer,
     ));
     Ok(vcs)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::do_store::test_support::RusqliteDoSql;
+    use std::rc::Rc;
+
+    /// **The hosted decoder fails closed on a status text it cannot read.**
+    ///
+    /// Parity with the native `map_branch_row`: both folded an unrecognised
+    /// status to `BranchStatus::Active`, the one state `advance_head`,
+    /// `rebase_branch`, `reserve_head` and the parent check in
+    /// `create_branch` all proceed under.
+    #[test]
+    fn a_hosted_branch_status_this_build_cannot_read_is_refused_rather_than_read_as_active() {
+        let sql = Rc::new(RusqliteDoSql::in_memory());
+        let mut branches = DoBranches::new(Rc::clone(&sql)).expect("open branches");
+        branches.ensure_mainline("t0").expect("mainline");
+        branches
+            .create_branch(CreateBranch {
+                branch_id: "feature",
+                name: None,
+                parent_branch_id: MAINLINE_BRANCH_ID,
+                at_cut: None,
+                created_at: "t0",
+                idempotency_key: None,
+            })
+            .expect("create branch");
+        sql.execute(
+            "UPDATE branches SET status = 'frozen' WHERE branch_id = ?1",
+            &[text("feature")],
+        )
+        .expect("stamp a status this build does not know");
+
+        let read = branches.get_branch("feature");
+        let message = format!("{:?}", read.as_ref().err());
+        assert!(
+            read.is_err() && message.contains("unreadable status"),
+            "a status this build cannot read must surface AS unreadable, got {read:?}"
+        );
+        assert!(
+            message.contains("frozen"),
+            "the refusal must name the text it could not read, got {message}"
+        );
+        // And WHICH branch could not be read. The subject is a separate
+        // message from the detail above, so asserting only the detail leaves
+        // the subject unexercised -- and a subject that is nothing but its
+        // interpolated id would still read correctly with its words replaced.
+        assert!(
+            message.contains("branch `feature`"),
+            "the refusal must name the branch it could not read, got {message}"
+        );
+
+        let advanced = branches.advance_head("feature", None, "cut_1", "manifest_a", "t1");
+        assert!(
+            advanced.is_err(),
+            "a branch whose status this build cannot read must not advance, got {advanced:?}"
+        );
+
+        // The accepting case: a status this build DOES know reads back as
+        // itself, terminal states included.
+        sql.execute(
+            "UPDATE branches SET status = 'adopted' WHERE branch_id = ?1",
+            &[text("feature")],
+        )
+        .expect("stamp a known status");
+        assert_eq!(
+            branches
+                .get_branch("feature")
+                .expect("known status reads")
+                .expect("branch row")
+                .status,
+            BranchStatus::Adopted
+        );
+    }
 }

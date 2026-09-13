@@ -2170,18 +2170,24 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
         let point = self.load_manifest(branch.branch_point_manifest_hash.as_deref())?;
         let head = self.load_manifest(branch.head_manifest_hash.as_deref())?;
         let target = self.load_manifest(parent.head_manifest_hash.as_deref())?;
-        let new_head = match plan_rebase_down(
+        let plan = plan_rebase_down(
             &point,
             &head,
             &target,
             &branch_side,
             &parent_side,
             quiescent,
-        ) {
-            RebaseDownPlan::UpToDate => {
-                self.supersede_open_conflicts(branch_id, at)?;
-                return Ok(ReconcileOutcome::UpToDate);
-            }
+        );
+        let new_head = match plan {
+            // Identical manifests on both sides of a cut the parent has
+            // since moved past: there is no delta to fold down, but the
+            // branch point still re-points at the parent's current head,
+            // exactly as the model's rebase-down advances a lagging base
+            // whatever the content (ReconciliationDaemonLifecycle.tla,
+            // RebaseDisjoint). Leaving it behind would strand the branch:
+            // the merge-up's staleness bound would refuse on a base no
+            // reconcile could ever discharge.
+            RebaseDownPlan::UpToDate => head,
             RebaseDownPlan::Silent { new_head_manifest } => new_head_manifest,
             RebaseDownPlan::DeferredMidRun => return Ok(ReconcileOutcome::DeferredMidRun),
             RebaseDownPlan::AskAtQuiescence {
@@ -5735,6 +5741,73 @@ mod tests {
         assert_eq!(
             vcs.read(MAINLINE_BRANCH_ID, "b.md").expect("read"),
             Some("B1".to_owned())
+        );
+    }
+
+    /// A parent advance that leaves the CONTENT unchanged still re-points
+    /// the branch point. Merging an untouched sibling mints a new mainline
+    /// cut carrying mainline's own manifest; if the rebase-down called that
+    /// "up to date" and left the branch point behind, every branch forked
+    /// at the old cut would refuse to merge forever on a stale base.
+    #[test]
+    fn merge_survives_a_same_content_parent_advance() {
+        let mut vcs = vcs();
+        vcs.init("t0").expect("init");
+        vcs.write(MAINLINE_BRANCH_ID, "a.md", Some("A0"), "cut_m1", "t1")
+            .expect("write");
+        vcs.create_branch("sibling", None, MAINLINE_BRANCH_ID, "t2")
+            .expect("create sibling");
+        vcs.create_branch("draft_a", None, MAINLINE_BRANCH_ID, "t2")
+            .expect("create draft");
+        // The untouched sibling lands: mainline advances to a NEW cut
+        // carrying the SAME manifest.
+        assert!(matches!(
+            vcs.merge("sibling", "cut_merge_sib", "t3").expect("merge"),
+            VcsMergeOutcome::Adopted { .. }
+        ));
+        vcs.write("draft_a", "a.md", Some("A1"), "cut_d1", "t4")
+            .expect("write");
+        assert!(matches!(
+            vcs.merge("draft_a", "cut_merge_1", "t5").expect("merge"),
+            VcsMergeOutcome::Adopted { .. }
+        ));
+        assert_eq!(
+            vcs.read(MAINLINE_BRANCH_ID, "a.md").expect("read"),
+            Some("A1".to_owned())
+        );
+    }
+
+    /// The same shape at the stream seam: a line that advanced without
+    /// changing content still admits a member's contribution.
+    #[test]
+    fn sync_survives_a_same_content_line_advance() {
+        let mut vcs = vcs();
+        vcs.init("t0").expect("init");
+        vcs.write(MAINLINE_BRANCH_ID, "a.md", Some("A0"), "cut_m1", "t1")
+            .expect("write");
+        vcs.create_branch("line_ws", None, MAINLINE_BRANCH_ID, "t2")
+            .expect("line");
+        vcs.write("line_ws", "l.md", Some("L0"), "cut_l1", "t3")
+            .expect("write");
+        vcs.create_branch("sibling", None, "line_ws", "t4")
+            .expect("sibling");
+        vcs.create_branch("member", None, "line_ws", "t4")
+            .expect("member");
+        // The untouched sibling lands on the line: same manifest, new cut.
+        assert!(matches!(
+            vcs.merge("sibling", "cut_line_2", "t5").expect("merge"),
+            VcsMergeOutcome::Adopted { .. }
+        ));
+        vcs.write("member", "m.md", Some("M0"), "cut_mem1", "t6")
+            .expect("write");
+        assert!(matches!(
+            vcs.sync_to_line("member", "line_ws", "sync_1", "t7")
+                .expect("sync"),
+            SyncOutcome::Synced { .. }
+        ));
+        assert_eq!(
+            vcs.read("line_ws", "m.md").expect("read").as_deref(),
+            Some("M0")
         );
     }
 

@@ -362,3 +362,106 @@ fn every_ledger_code_is_well_formed_and_in_a_reserved_namespace() {
         }
     }
 }
+
+const SPEC: &str = "spec/error-handling.md";
+
+/// The backticked names of the spec sentence that starts at `marker` and ends at
+/// the first `.` after it.
+///
+/// The prose is READ rather than restated, for the same reason the emitted codes
+/// are read out of the sources: a restatement here would be a second copy of the
+/// thing under test, free to drift exactly as the list it guards would.
+fn reserved_namespaces_in_spec(marker: &str) -> BTreeSet<String> {
+    let path = workspace_root().join(SPEC);
+    let text = fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("cannot read {}: {error}", path.display()));
+    assert_eq!(
+        text.matches(marker).count(),
+        1,
+        "`{marker}` must name exactly one sentence in {SPEC}"
+    );
+    let (_, rest) = text
+        .split_once(marker)
+        .expect("the marker was just counted in the text");
+    let sentence = rest.split_once('.').map_or(rest, |(sentence, _)| sentence);
+    let names: BTreeSet<String> = sentence
+        .split('`')
+        .skip(1)
+        .step_by(2)
+        .map(str::to_owned)
+        .collect();
+    assert!(
+        names.len() > 5,
+        "read only {names:?} out of the `{marker}` sentence in {SPEC}"
+    );
+    names
+}
+
+fn reserved(list: &[&str]) -> BTreeSet<String> {
+    list.iter().map(|name| (*name).to_owned()).collect()
+}
+
+/// Whether this tree is the published projection, which withholds `SPEC`.
+///
+/// `scripts/check.sh` runs `cargo test --workspace` on BOTH repositories, and
+/// the mirror is default-deny: of `spec/` it publishes the report schemas, the
+/// host contract JSONs and the three code registers, never the prose. So a test
+/// that reads the prose has to say the absent case out loud instead of dying on
+/// it — the precedent is `scripts/check-report-schemas.sh`'s `spec/reporting.md`
+/// skip, whose absence killed the mirror's green bar on every sync until it was
+/// written.
+///
+/// The absence has to be PROVED to be the projection, or deleting the document
+/// in whipplescript-src would quietly retire this check instead of failing it.
+/// `AGENTS.md` is withheld from the mirror too, and is the guard `check.sh`
+/// itself uses for its -src-only blocks: absent beside `SPEC` it is the
+/// projection, present beside a missing `SPEC` it is an -src tree that has lost
+/// a document this test requires.
+fn spec_is_withheld_by_the_projection() -> bool {
+    let root = workspace_root();
+    if root.join(SPEC).exists() {
+        return false;
+    }
+    assert!(
+        !root.join("AGENTS.md").exists(),
+        "{SPEC} is required in this tree and is not there: AGENTS.md is present, \
+         so this is whipplescript-src rather than the published projection, and \
+         the two reserved-namespace sentences this test reads against \
+         DIAGNOSTIC_NAMESPACES and RUNTIME_DIAGNOSTIC_NAMESPACES are gone"
+    );
+    eprintln!(
+        "skipped: {SPEC} is not in this tree, so the reserved-namespace sentences \
+         cannot be read here. The mirror withholds spec/ prose by design; this \
+         assertion belongs to whipplescript-src, where the document lives."
+    );
+    true
+}
+
+/// The namespaces the compiler reserves are the ones the spec reserves.
+///
+/// Both constants say in their doc comments that the list is the spec's and not
+/// the module's, and nothing checked it:
+/// `every_ledger_code_is_well_formed_and_in_a_reserved_namespace` validates the
+/// ledger against the CODE's list, so a namespace that reaches the code and
+/// never the prose drifts indefinitely under a green gate. `instance` did,
+/// from the run-wide `instance.step_budget.parked` (DR-0082) until this test.
+#[test]
+fn the_reserved_namespaces_are_the_ones_the_spec_reserves() {
+    if spec_is_withheld_by_the_projection() {
+        return;
+    }
+    assert_eq!(
+        reserved_namespaces_in_spec("reserved top-level namespaces are:"),
+        reserved(crate::DIAGNOSTIC_NAMESPACES),
+        "{SPEC} \"## Codes\" and DIAGNOSTIC_NAMESPACES reserve different check-plane \
+         namespaces; spec/ is canonical, so the prose says what is reserved and the \
+         constant follows it"
+    );
+    assert_eq!(
+        reserved_namespaces_in_spec("own reserved namespaces:"),
+        reserved(crate::RUNTIME_DIAGNOSTIC_NAMESPACES),
+        "{SPEC} \"### Runtime Plane Codes\" and RUNTIME_DIAGNOSTIC_NAMESPACES reserve \
+         different runtime-plane namespaces; spec/ is canonical, so the prose says what \
+         is reserved and the constant follows it"
+    );
+}

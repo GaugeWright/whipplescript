@@ -263,7 +263,12 @@ pub struct OpBranchState {
     pub head_manifest_hash: Option<String>,
     pub branch_point_cut_id: Option<String>,
     pub branch_point_manifest_hash: Option<String>,
-    pub status: String,
+    /// Typed, not a free string: `restore_branch_state` writes this value
+    /// straight into the `status` column, and the column's readers fail
+    /// closed on a text they cannot parse. `rename_all = "lowercase"` makes
+    /// the serialized form identical to the column vocabulary, so a recorded
+    /// op still encodes byte for byte as it did.
+    pub status: BranchStatus,
 }
 
 impl OpBranchState {
@@ -273,7 +278,7 @@ impl OpBranchState {
             head_manifest_hash: row.head_manifest_hash.clone(),
             branch_point_cut_id: row.branch_point_cut_id.clone(),
             branch_point_manifest_hash: row.branch_point_manifest_hash.clone(),
-            status: row.status.as_str().to_owned(),
+            status: row.status,
         }
     }
 }
@@ -788,9 +793,23 @@ impl BranchStore {
 
 #[cfg(feature = "native")]
 fn map_branch_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<BranchRow> {
+    let branch_id: String = row.get(0)?;
     let status_text: String = row.get(8)?;
+    // A status text this build does not know (one written by a newer build,
+    // say) surfaces with its row identity instead of folding to `Active` --
+    // the one state under which every status-gated verb here proceeds, so
+    // reading it as `Active` would advance the head of a line this build
+    // cannot reason about. The schema stamp does not cover it: adding a
+    // status value changes no `CREATE TABLE`.
+    let status = BranchStatus::parse(&status_text).ok_or_else(|| {
+        rusqlite::Error::FromSqlConversionFailure(
+            8,
+            rusqlite::types::Type::Text,
+            format!("branch `{branch_id}` has an unreadable status `{status_text}`").into(),
+        )
+    })?;
     Ok(BranchRow {
-        branch_id: row.get(0)?,
+        branch_id,
         name: row.get(1)?,
         parent_branch_id: row.get(2)?,
         branch_point_cut_id: row.get(3)?,
@@ -798,7 +817,7 @@ fn map_branch_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<BranchRow> {
         head_cut_id: row.get(5)?,
         head_manifest_hash: row.get(6)?,
         adopted_merge_cut_id: row.get(7)?,
-        status: BranchStatus::parse(&status_text).unwrap_or(BranchStatus::Active),
+        status,
         created_at: row.get(9)?,
         updated_at: row.get(10)?,
     })
@@ -1726,7 +1745,7 @@ impl Branches for BranchStore {
                 state.head_manifest_hash,
                 state.branch_point_cut_id,
                 state.branch_point_manifest_hash,
-                state.status,
+                state.status.as_str(),
                 at
             ],
         )?;
@@ -2789,6 +2808,67 @@ mod tests {
             waited + SLACK >= HELD,
             "the write returned after {waited:?}, so the holder never really held the lock \
              and this test proved nothing"
+        );
+    }
+
+    /// **A status this build cannot read is not `active`.**
+    ///
+    /// `map_branch_row` folded every unrecognised status text to
+    /// `BranchStatus::Active` — the one state under which `advance_head`,
+    /// `rebase_branch`, the parent check in `create_branch`, `reserve_head`
+    /// and `bind_instance` all proceed. The satellite schema stamp does not
+    /// catch it: adding a status value changes no `CREATE TABLE`, so a store
+    /// written by a newer build reads here as a live branch and gets its head
+    /// advanced. Fail closed like the module's own statuses do, and say which
+    /// text could not be read.
+    #[test]
+    fn an_unreadable_branch_status_is_refused_rather_than_read_as_active() {
+        let mut store = store();
+        seed_cut(&mut store, "cut_1");
+        store
+            .create_branch(create("feature", MAINLINE_BRANCH_ID))
+            .expect("create branch");
+        store
+            .connection
+            .execute(
+                "UPDATE branches SET status = 'frozen' WHERE branch_id = ?1",
+                params!["feature"],
+            )
+            .expect("stamp a status this build does not know");
+
+        let read = store.get_branch("feature");
+        let message = format!("{:?}", read.as_ref().err());
+        assert!(
+            read.is_err() && message.contains("unreadable status"),
+            "a status this build cannot read must surface AS unreadable, got {read:?}"
+        );
+        assert!(
+            message.contains("frozen"),
+            "the refusal must name the text it could not read, got {message}"
+        );
+
+        let advanced = store.advance_head("feature", None, "cut_1", "manifest_a", "t2");
+        assert!(
+            advanced.is_err(),
+            "a branch whose status this build cannot read must not advance, got {advanced:?}"
+        );
+
+        // The accepting case: a status this build DOES know still reads back
+        // as itself, terminal states included.
+        store
+            .connection
+            .execute(
+                "UPDATE branches SET status = 'adopted' WHERE branch_id = ?1",
+                params!["feature"],
+            )
+            .expect("stamp a known status");
+        assert_eq!(
+            store
+                .get_branch("feature")
+                .expect("known status reads")
+                .expect("branch row")
+                .status,
+            BranchStatus::Adopted
         );
     }
 }

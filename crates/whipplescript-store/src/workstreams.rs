@@ -282,8 +282,9 @@ pub trait Workstreams {
         self.join(branch_id, stream_id, at)
     }
     /// Leave = re-home to mainline (drop the membership row). Returns the
-    /// stream left, if any.
-    fn leave(&mut self, branch_id: &str) -> StoreResult<Option<String>>;
+    /// stream left, if any. `at` dates the new home position, exactly as
+    /// `join` and `archive_stream` date theirs.
+    fn leave(&mut self, branch_id: &str, at: &str) -> StoreResult<Option<String>>;
     /// The stream a branch homes to; `None` = mainline (a workstream of
     /// one).
     fn home_of(&self, branch_id: &str) -> StoreResult<Option<String>>;
@@ -541,7 +542,7 @@ where
                     JoinOutcome::Joined { .. }
                 ),
                 None => {
-                    streams.leave(fork_branch_id)?;
+                    streams.leave(fork_branch_id, at)?;
                     true
                 }
             };
@@ -615,12 +616,26 @@ impl WorkstreamStore {
 
 #[cfg(feature = "native")]
 fn map_stream_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkstreamRow> {
+    let stream_id: String = row.get(0)?;
     let status_text: String = row.get(3)?;
+    // Fail closed on a status text this build does not know, exactly as the
+    // branch decoder does: `Active` is the state `join`, `reserve_boundary`
+    // and `archive_stream` all proceed under, so folding an unknown text to
+    // it would run those verbs against a stream this build cannot reason
+    // about. No `CREATE TABLE` changes when a status value is added, so the
+    // schema stamp never sees it.
+    let status = StreamStatus::parse(&status_text).ok_or_else(|| {
+        rusqlite::Error::FromSqlConversionFailure(
+            3,
+            rusqlite::types::Type::Text,
+            format!("stream `{stream_id}` has an unreadable status `{status_text}`").into(),
+        )
+    })?;
     Ok(WorkstreamRow {
-        stream_id: row.get(0)?,
+        stream_id,
         name: row.get(1)?,
         line_branch_id: row.get(2)?,
-        status: StreamStatus::parse(&status_text).unwrap_or(StreamStatus::Active),
+        status,
         staleness_seconds: row.get(4)?,
         reservation_id: row.get(5)?,
         expected_line_cut: row.get(6)?,
@@ -903,7 +918,7 @@ impl Workstreams for WorkstreamStore {
         })
     }
 
-    fn leave(&mut self, branch_id: &str) -> StoreResult<Option<String>> {
+    fn leave(&mut self, branch_id: &str, at: &str) -> StoreResult<Option<String>> {
         let tx = self
             .connection
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -931,7 +946,7 @@ impl Workstreams for WorkstreamStore {
             params![branch_id],
         )?;
         if previous.is_some() {
-            Self::record_home_position(&tx, branch_id, None, "leave")?;
+            Self::record_home_position(&tx, branch_id, None, at)?;
         }
         tx.commit()?;
         Ok(previous)
@@ -1676,9 +1691,24 @@ mod tests {
             .create_stream("ws_1", None, "line_1", "t0", None)
             .expect("op");
         store.join("draft_a", "ws_1", "t1").expect("op");
-        assert_eq!(store.leave("draft_a").expect("op"), Some("ws_1".to_owned()));
+        assert_eq!(
+            store.home_receipt("draft_a").expect("op").recorded_at,
+            Some("t1".to_owned()),
+            "a join records the position at the time it happened"
+        );
+        assert_eq!(
+            store.leave("draft_a", "t2").expect("op"),
+            Some("ws_1".to_owned())
+        );
         assert_eq!(store.home_of("draft_a").expect("op"), None);
-        assert_eq!(store.leave("draft_a").expect("op"), None);
+        // The re-home is host evidence (DR-0078 §6): it carries the clock of
+        // the leave, exactly as join and archive do -- not the verb's name.
+        assert_eq!(
+            store.home_receipt("draft_a").expect("op").recorded_at,
+            Some("t2".to_owned()),
+            "a leave records the position at the time it happened"
+        );
+        assert_eq!(store.leave("draft_a", "t3").expect("op"), None);
     }
 
     fn reservation<'a>(id: &'a str) -> BoundaryReservation<'a> {
@@ -1713,7 +1743,7 @@ mod tests {
                 stream_id: "source".to_owned()
             }
         );
-        assert!(store.leave("branch").is_err());
+        assert!(store.leave("branch", "t3").is_err());
         assert_eq!(
             store.archive_stream("source", "t3").expect("archive"),
             ArchiveOutcome::BoundaryReserved
@@ -2012,5 +2042,62 @@ mod tests {
             .expect("migrated home receipt");
         assert_eq!(home.authority_position, 1);
         assert_eq!(home.stream_id.as_deref(), Some("active"));
+    }
+
+    /// **A stream status this build cannot read is not `active`.**
+    ///
+    /// The mirror of the branch decoder's fail-open: `map_stream_row` folded
+    /// every unrecognised status text to `StreamStatus::Active`, the state
+    /// `join`, `reserve_boundary` and `archive_stream` all proceed under. A
+    /// status value added by a newer build changes no `CREATE TABLE`, so the
+    /// schema stamp never sees the skew.
+    #[test]
+    fn an_unreadable_stream_status_is_refused_rather_than_read_as_active() {
+        let mut store = store();
+        store
+            .create_stream("ws_1", None, "line_ws_1", "t0", None)
+            .expect("create stream");
+        store
+            .connection
+            .execute(
+                "UPDATE workstreams SET status = 'frozen' WHERE stream_id = ?1",
+                params!["ws_1"],
+            )
+            .expect("stamp a status this build does not know");
+
+        let read = store.get_stream("ws_1");
+        let message = format!("{:?}", read.as_ref().err());
+        assert!(
+            read.is_err() && message.contains("unreadable status"),
+            "a status this build cannot read must surface AS unreadable, got {read:?}"
+        );
+        assert!(
+            message.contains("frozen"),
+            "the refusal must name the text it could not read, got {message}"
+        );
+
+        let joined = store.join("branch_a", "ws_1", "t1");
+        assert!(
+            joined.is_err(),
+            "a stream whose status this build cannot read must admit no member, got {joined:?}"
+        );
+
+        // The accepting case: a status this build DOES know reads back as
+        // itself.
+        store
+            .connection
+            .execute(
+                "UPDATE workstreams SET status = 'archived' WHERE stream_id = ?1",
+                params!["ws_1"],
+            )
+            .expect("stamp a known status");
+        assert_eq!(
+            store
+                .get_stream("ws_1")
+                .expect("known status reads")
+                .expect("stream row")
+                .status,
+            StreamStatus::Archived
+        );
     }
 }

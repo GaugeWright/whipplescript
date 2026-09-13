@@ -1348,6 +1348,135 @@ describe("real WorkflowInstance hibernation", () => {
     ).toBe(1);
   });
 
+  it("erases the visitor conversation and queued turn payload at teardown", async () => {
+    // DR-0049 §7: terminal teardown removes payload resolution and preserves
+    // handles, lifecycle events, and audit metadata. The conversation the
+    // visitor typed, and a queued steering message with its image bodies, are
+    // payload — not handles, not lifecycle events, not audit metadata. Teardown
+    // swept the runtime tables and the session key and left them behind, so a
+    // tombstoned object still resolved the whole transcript and every byte of a
+    // steered image.
+    let releaseFirst!: () => void;
+    const firstRoundGate = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+    let round = 0;
+    const providerFetch = vi.fn(async () => {
+      round += 1;
+      if (round === 1) {
+        // Parked mid-turn: a steering command is only admitted while a turn is
+        // bound, and a queued command is exactly the payload under test.
+        await firstRoundGate;
+        return new Response(
+          [
+            `data: ${JSON.stringify({
+              type: "response.output_item.done",
+              item: {
+                type: "function_call",
+                call_id: "tool-before-steer",
+                name: "read",
+                arguments: JSON.stringify({ path: "README.md" }),
+              },
+            })}`,
+            `data: ${JSON.stringify({
+              type: "response.completed",
+              response: { output: [], usage: { input_tokens: 3, output_tokens: 1 } },
+            })}`,
+            "",
+          ].join("\n"),
+          { headers: { "content-type": "text/event-stream" } },
+        );
+      }
+      return new Response(
+        [
+          `data: ${JSON.stringify({
+            type: "response.output_text.delta",
+            delta: "canary-assistant-answer",
+          })}`,
+          `data: ${JSON.stringify({
+            type: "response.completed",
+            response: { output: [], usage: { input_tokens: 3, output_tokens: 1 } },
+          })}`,
+          "",
+        ].join("\n"),
+        { headers: { "content-type": "text/event-stream" } },
+      );
+    });
+    vi.stubGlobal("fetch", providerFetch);
+
+    const sessionId = "session-retention-payload";
+    const namespace = (env as unknown as TestEnv).WORKFLOW_INSTANCE;
+    const stub = namespace.get(namespace.idFromName(sessionId));
+    await bootstrapSession(stub, sessionId);
+    const socket = await openSocket(stub);
+    expect(await nextMessage(socket)).toMatchObject({ type: "session_ready" });
+    socket.send(JSON.stringify({
+      type: "send_message",
+      request_id: "turn-retention",
+      text: "canary-visitor-question",
+    }));
+    await vi.waitFor(() => expect(providerFetch).toHaveBeenCalledTimes(1), {
+      timeout: SETTLES_WITHIN_MS,
+    });
+    const imageBase64 = btoa("canary-visitor-image-body");
+    socket.send(JSON.stringify({
+      type: "steer",
+      request_id: "steer-retention",
+      text: "canary-visitor-steer",
+      images: [{ media_type: "image/png", data_base64: imageBase64 }],
+    }));
+    const observed: Record<string, unknown>[] = [];
+    while (observed.filter(({ type }) => type === "turn_queue_changed").length < 1) {
+      observed.push(await nextMessage(socket));
+    }
+    releaseFirst();
+    for (let index = 0; index < 120; index += 1) {
+      const message = await nextMessage(socket);
+      observed.push(message);
+      if (message.type === "turn_terminal" || message.type === "error") break;
+    }
+    expect(observed.at(-1)).toMatchObject({
+      type: "turn_terminal",
+      request_id: "turn-retention",
+    });
+
+    const canaries = [
+      "canary-visitor-question",
+      "canary-visitor-steer",
+      "canary-assistant-answer",
+      imageBase64,
+    ];
+    // Resolvable while the session lives: this is what teardown must remove,
+    // and asserting it here keeps the erasure assertion from passing vacuously.
+    const live = (await durableStringValues(stub)).join("\n");
+    for (const canary of canaries) {
+      expect(live, `payload never reached durable storage: ${canary}`)
+        .toContain(canary);
+    }
+
+    await runInDurableObject(stub, async (_instance, state) => {
+      const session = await state.storage.get<Record<string, unknown>>(
+        "public-session-state",
+      );
+      await state.storage.put("public-session-state", {
+        ...session,
+        retention: { idle_ttl_seconds: 0, absolute_ttl_seconds: 0 },
+      });
+    });
+    expect(await runDurableObjectAlarm(stub)).toBe(true);
+
+    const remaining = (await durableStringValues(stub)).join("\n");
+    expect(
+      canaries.filter((canary) => remaining.includes(canary)),
+      "teardown left visitor payload resolvable on the tombstoned object",
+    ).toEqual([]);
+    // The audit half of the same rule: the lifecycle log still shows the session
+    // terminated, so this is erasure of payload rather than of the object.
+    expect(remaining).toContain('"tornDown"');
+    vi.unstubAllGlobals();
+    socket.close(1000, "done");
+  });
+
   it("schedules the retention alarm at bootstrap so expiry needs no visitor", async () => {
     // Every other retention test collapses the TTLs and calls
     // `runDurableObjectAlarm` by hand, which proves what the handler does once

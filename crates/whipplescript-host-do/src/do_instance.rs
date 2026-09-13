@@ -1070,7 +1070,12 @@ impl<Sql: DoSql + Clone> InstanceDriver for DoInstanceDriver<'_, Sql> {
                             worker_id: "whip-turn-container",
                             lease_id: &lease_id,
                             lease_expires_at: "2030-01-01T00:00:00Z",
-                            agent: "agent",
+                            // The DECLARED agent, exactly as the in-DO arm
+                            // settles it: `when <agent> completed turn`, the
+                            // durable thread reader and `whip fork` all key on
+                            // this field, so a placeholder here makes them all
+                            // read a turn nobody declared.
+                            agent,
                             profile: None,
                             input_json: &effect.input_json,
                             skill_names: &[],
@@ -3184,6 +3189,118 @@ mod tests {
             .find(|run| run.worker_id == "whip-turn-container")
             .expect("class-B run row");
         assert_eq!(run.status, "completed");
+    }
+
+    // A container turn settles under the DECLARED agent's name, so the fact it
+    // leaves is the one `when helper completed turn` reads. The settle used to
+    // stamp the literal "agent" here while the in-DO arm stamped the declared
+    // target, which made that rule pattern silently dead on a placement with a
+    // turn container configured.
+    #[test]
+    fn a_turn_container_settle_names_the_declared_agent() {
+        let source = "workflow AgentDemo\n\noutput result Done\n\n\
+             class Done {\n  ok int\n}\n\n\
+             agent helper {\n  provider owned\n  profile \"repo-reader\"\n  capacity 1\n}\n\n\
+             rule go\n  when started\n=> {\n  tell helper \"\"\"\n  Do the thing.\n  \"\"\"\n}\n\n\
+             rule finish\n  when helper completed turn\n=> {\n  complete result { ok 1 }\n}\n";
+        let ir = whipplescript_parser::compile_program(source)
+            .ir
+            .expect("agent program compiles");
+        let store = store();
+        for stmt in [
+            "INSERT INTO capability_schemas (capability, description, schema_json) \
+             VALUES ('agent.tell', 'Run an agent turn.', '{}')",
+            "INSERT INTO effect_providers (provider_id, effect_kind, provider, capability, config_json) \
+             VALUES ('provider_agent_tell_builtin', 'agent.tell', 'builtin-agent-harness', 'agent.tell', '{}')",
+            "INSERT INTO capability_bindings (binding_id, program_id, capability, provider, config_json) \
+             VALUES ('binding_agent_tell_builtin', NULL, 'agent.tell', 'builtin-agent-harness', '{}')",
+            "INSERT INTO profiles (profile_id, name, description, enforcement_mode, allowed_capabilities, config_json) \
+             VALUES ('profile_repo_reader', 'repo-reader', 'reads', 'enforce', '[\"agent.tell\"]', '{}')",
+        ] {
+            store.sql.execute(stmt, &[]).expect("seed agent provider");
+        }
+        let mut kernel = RuntimeKernel::new(store);
+        let version = kernel
+            .create_program_version_for_program(
+                ProgramVersionInput {
+                    program_name: &ir.workflow,
+                    source_hash: "src-turn-agent",
+                    ir_hash: "ir-turn-agent",
+                    compiler_version: "test",
+                    ir_snapshot: None,
+                },
+                &ir,
+            )
+            .expect("program version");
+        let instance_id = kernel
+            .create_instance_with_authority(
+                &version,
+                "{}",
+                NewInstanceAuthority {
+                    workflow_principal: "local/AgentDemo",
+                    effective_authority_json: "{}",
+                },
+            )
+            .expect("instance");
+        kernel
+            .ingest_external_event(&instance_id, "external.started", "{}", Some("started"))
+            .expect("start event");
+
+        let turn_cfg = TurnContainerConfig {
+            base_url: "http://turn".to_owned(),
+            provider: serde_json::json!({"provider": "fixture"}),
+            max_steps: 8,
+            auth_token: None,
+        };
+        let driver = DoInstanceDriver {
+            kernel,
+            files: &NoFiles,
+            coerce: None,
+            agent_model: None,
+            agent_tools: &NoTools,
+            agent_tool_specs: None,
+            agent_workspace_resources: None,
+            exec: None,
+            turn: Some(&turn_cfg),
+            ir: &ir,
+            instance_id: &instance_id,
+            system_prompt: "You are a WhippleScript agent.",
+            max_steps: 8,
+        };
+        let mut machine = InstanceStepMachine::new(driver);
+        let outcome = run_to_completion(&mut machine, &TurnContainerHost);
+        let driver = machine.into_driver();
+
+        let facts = driver
+            .kernel
+            .store()
+            .list_facts_including_consumed(&instance_id)
+            .expect("facts list");
+        let completed = facts
+            .iter()
+            .find(|fact| fact.name == "agent.turn.completed")
+            .expect("the container turn settled with a completion fact");
+        let payload: serde_json::Value =
+            serde_json::from_str(&completed.value_json).expect("fact payload is JSON");
+        assert_eq!(
+            payload.get("agent"),
+            Some(&serde_json::json!("helper")),
+            "the container settle names the declared agent, not a placeholder"
+        );
+
+        // ... which is the whole point: `when helper completed turn` matches
+        // only that agent's turns, so the rule fires and the instance settles.
+        assert!(
+            matches!(outcome, InstanceOutcome::Terminal),
+            "the rule keyed on the declared agent fires: {outcome:?}"
+        );
+        let status = driver
+            .kernel
+            .store()
+            .status(&instance_id)
+            .expect("status")
+            .expect("instance row");
+        assert_eq!(status.instance.status, "completed");
     }
 
     /// The durable object runs a declared result contract, rather than refusing

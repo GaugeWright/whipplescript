@@ -651,6 +651,116 @@ rule pipeline
     let _ = fs::remove_file(source);
 }
 
+/// `then` sugar (R2) over a WHOLE program, not just the expander's output
+/// text: `then <b> <- <effect statement>` is defined over any effect
+/// statement, so a chained `prompt` and a chained `read` must reach `whip
+/// check` clean. The sugar reprints the statement it chained, and a `prompt`
+/// binding is legal only on the effect line — an `as` after a closing `"""`
+/// is refused — so a prompt reprinted as a `"""` block chained into a rule
+/// nothing could compile. The `"""` prompt keeps that refusal: its authored
+/// shape is what the misplaced-binding rule is about, and only a decision
+/// record may legalize it.
+#[test]
+fn then_chains_a_prompt_and_a_read_through_whip_check() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let store = temp_path("then-verbs", "sqlite");
+    let store_str = store.to_str().expect("utf-8").to_owned();
+    let check = |source_text: &str, tag: &str| -> String {
+        let source = temp_path(tag, "whip");
+        fs::write(&source, source_text).expect("write source");
+        let output = Command::new(bin)
+            .args([
+                "--store",
+                store_str.as_str(),
+                "check",
+                source.to_str().expect("utf-8"),
+            ])
+            .output()
+            .expect("check runs");
+        let _ = fs::remove_file(&source);
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )
+    };
+
+    let accepted = check(
+        r#"use std.files
+
+workflow ThenVerbs
+
+output result Done
+
+class Done {
+  note string
+}
+
+class Ticket {
+  title string
+}
+
+file store notes { root "./notes"  allow read ["**"] }
+
+table seed as Ticket [
+  { title "t" }
+]
+
+rule summarize
+  when Ticket as ticket
+=> {
+  then summary <- prompt "Summarize {{ ticket.title }}"
+  then loaded <- read text from notes at "notes/hello.txt"
+  complete result {
+    note summary.text
+  }
+}
+"#,
+        "then-verbs-ok",
+    );
+    assert!(
+        !accepted.contains("error["),
+        "a chained `prompt` and `read` must check clean:\n{accepted}"
+    );
+
+    let refused = check(
+        r#"workflow ThenBlockPrompt
+
+output result Done
+
+class Done {
+  note string
+}
+
+class Ticket {
+  title string
+}
+
+table seed as Ticket [
+  { title "t" }
+]
+
+rule summarize
+  when Ticket as ticket
+=> {
+  then summary <- prompt """
+  Summarize {{ ticket.title }}
+  """
+  complete result {
+    note summary.text
+  }
+}
+"#,
+        "then-verbs-block",
+    );
+    assert!(
+        refused.contains("after a multiline string delimiter"),
+        "a chained `\"\"\"` prompt stays refused:\n{refused}"
+    );
+
+    let _ = fs::remove_file(store);
+}
+
 /// Auto-fail (R1) at RULE level: an effect whose failure has no observing
 /// `after` block in a plain rule of a self-terminating workflow drives the
 /// instance to `failed` with the generic reason, instead of stalling forever.

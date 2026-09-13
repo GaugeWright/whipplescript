@@ -57,10 +57,17 @@ pub fn parse(entry: &str) -> Result<Vec<u8>, String> {
                 "hex sign prefix must be an even number of digits: {entry:?}"
             ));
         }
-        return (0..digits.len())
-            .step_by(2)
-            .map(|i| {
-                u8::from_str_radix(&digits[i..i + 2], 16)
+        // Chunked over BYTES and read back to text, rather than `&digits[..]`
+        // at even byte offsets: this parser is the door for operator-authored
+        // entries, and a multibyte character straddling an even offset makes
+        // `str` indexing PANIC where the contract promises a refusal.
+        return digits
+            .as_bytes()
+            .chunks(2)
+            .map(|pair| {
+                let pair = std::str::from_utf8(pair)
+                    .map_err(|_| format!("bad hex in sign prefix: {entry:?}"))?;
+                u8::from_str_radix(pair, 16)
                     .map_err(|_| format!("bad hex in sign prefix: {entry:?}"))
             })
             .collect();
@@ -138,6 +145,27 @@ mod tests {
         for bad in ["hex:", "hex:abc", "hex:zz", "not-a-name"] {
             assert!(parse(bad).is_err(), "`{bad}` must not parse");
         }
+    }
+
+    /// `hex:` digits are operator-authored text: the envelope reader parses
+    /// every `sign_prefixes` entry of a document a human may have written by
+    /// hand, under `.ok()`. A non-ASCII entry must therefore REFUSE — slicing
+    /// it two bytes at a time panicked instead, and a panic is not a refusal
+    /// `.ok()` can catch.
+    #[test]
+    fn a_non_ascii_hex_entry_is_refused_rather_than_panicking() {
+        for bad in ["hex:aéb", "hex:65aéb", "hex:é"] {
+            let problem = parse(bad).expect_err("a non-ASCII hex entry must refuse");
+            assert!(problem.contains("bad hex in sign prefix"), "{problem}");
+        }
+        // The list door reaches the same refusal, and a well-formed entry
+        // beside it still parses.
+        let listed = parse_list("hex:65794a, hex:aéb").expect_err("the list must refuse too");
+        assert!(listed.contains("bad hex in sign prefix"), "{listed}");
+        assert_eq!(
+            parse_list("hex:65794a").expect("a well-formed list parses"),
+            vec![b"eyJ".to_vec()]
+        );
     }
 
     /// The TLS context is the protocol's, byte for byte — a value that drifted

@@ -32,9 +32,12 @@ native = ["dep:rusqlite"]
 [dev-dependencies]
 # `functions` lets a test override a built-in SQL function with a counting
 # copy, which is how the tracker's append path proves it no longer
-# string-scans the event log for an issue's heads. Test-only: the production
-# feature set above is unchanged.
-rusqlite = { version = "0.40.1", features = ["bundled", "functions"] }
+# string-scans the event log for an issue's heads. `hooks` lets a test commit
+# a competing write from inside a reading statement, which is how the ref
+# authority proves a read states the position its value was read at rather
+# than racing a concurrent advance. Test-only: the production feature set
+# above is unchanged.
+rusqlite = { version = "0.40.1", features = ["bundled", "functions", "hooks"] }
 
 [lints]
 workspace = true

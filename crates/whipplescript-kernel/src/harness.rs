@@ -2,7 +2,7 @@
 
 use std::{
     collections::BTreeMap,
-    io::Write,
+    io::{Read, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
     time::{Duration, Instant},
@@ -714,19 +714,57 @@ fn wait_with_optional_timeout(
     timeout: Option<Duration>,
 ) -> std::io::Result<WaitOutcome> {
     let Some(timeout) = timeout else {
+        // `wait_with_output` reads both pipes while it waits, so the untimed
+        // path drains as it goes.
         return child.wait_with_output().map(WaitOutcome::Completed);
     };
+    // A timeout bounds how long the provider may take, never how much it may
+    // say. Polling for exit while nothing reads the pipes wedges any provider
+    // that writes more than the pipe buffer (64 KiB on Linux): the child
+    // blocks in `write(2)`, never exits, and the turn settles `TimedOut` on
+    // output volume rather than on time. So drain both pipes on their own
+    // threads for the whole wait, as the exec sandbox does.
+    let stdout = child.stdout.take().map(spawn_pipe_drain);
+    let stderr = child.stderr.take().map(spawn_pipe_drain);
     let deadline = Instant::now() + timeout;
-    loop {
-        if child.try_wait()?.is_some() {
-            return child.wait_with_output().map(WaitOutcome::Completed);
+    let (status, timed_out) = loop {
+        if let Some(status) = child.try_wait()? {
+            break (status, false);
         }
         if Instant::now() >= deadline {
             terminate_process_tree(&mut child);
-            return child.wait_with_output().map(WaitOutcome::TimedOut);
+            break (child.wait()?, true);
         }
         std::thread::sleep(Duration::from_millis(10));
+    };
+    let output = std::process::Output {
+        status,
+        stdout: join_pipe_drain(stdout),
+        stderr: join_pipe_drain(stderr),
+    };
+    if timed_out {
+        Ok(WaitOutcome::TimedOut(output))
+    } else {
+        Ok(WaitOutcome::Completed(output))
     }
+}
+
+/// Read one of the child's pipes to EOF on its own thread, so waiting for the
+/// child never blocks the child's writing.
+fn spawn_pipe_drain<R: Read + Send + 'static>(mut source: R) -> std::thread::JoinHandle<Vec<u8>> {
+    std::thread::spawn(move || {
+        let mut buffer = Vec::new();
+        let _ = source.read_to_end(&mut buffer);
+        buffer
+    })
+}
+
+/// The bytes a drain thread collected. A drain that panicked or a pipe the
+/// child never had reports nothing rather than failing the turn.
+fn join_pipe_drain(handle: Option<std::thread::JoinHandle<Vec<u8>>>) -> Vec<u8> {
+    handle
+        .and_then(|handle| handle.join().ok())
+        .unwrap_or_default()
 }
 
 fn command_exists(command: &str) -> bool {
@@ -1299,6 +1337,33 @@ mod tests {
             gone,
             "timed-out command left descendant process {pid} alive"
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn command_harness_timeout_bounds_time_not_output_volume() {
+        // A timeout bounds how long a provider may take, never how much it may
+        // say. Polling for exit while nothing reads stdout/stderr wedges any
+        // provider that writes more than the pipe buffer (64 KiB on Linux):
+        // the child blocks in `write(2)`, never exits, and the turn settles
+        // `TimedOut` on output volume rather than on time.
+        let harness = CommandAgentHarness::new(
+            CommandLaunchPlan::new("fixture", "sh")
+                .arg("-c")
+                .arg(
+                    "cat >/dev/null; head -c 200000 /dev/zero | tr '\\0' o; \
+                     head -c 200000 /dev/zero | tr '\\0' e >&2",
+                )
+                .timeout(Duration::from_secs(10)),
+        );
+
+        let result = harness.run(test_request());
+
+        assert_eq!(result.status, ProviderRunStatus::Completed);
+        assert_eq!(result.exit_code, Some(0));
+        assert_eq!(result.stdout.matches('o').count(), 200_000);
+        assert_eq!(result.stderr.matches('e').count(), 200_000);
+        assert!(result.failure.is_none());
     }
 
     #[test]

@@ -231,14 +231,40 @@ pub(crate) fn print_effect(
                 .as_ref()
                 .map(|provider| format!(" using {provider}"))
                 .unwrap_or_default();
-            let (text, content_type) = effect
+            let (text, content_type, triple_quoted) = effect
                 .prompt
                 .as_ref()
-                .map(|prompt| (prompt.text.as_str(), prompt.content_type.as_deref()))
-                .unwrap_or(("", None));
+                .map(|prompt| {
+                    (
+                        prompt.text.as_str(),
+                        prompt.content_type.as_deref(),
+                        prompt.triple_quoted,
+                    )
+                })
+                .unwrap_or(("", None, true));
+            let renamed = rename_in_templates(text, rn);
+            // A `prompt` binding is legal only on the effect line: an `as`
+            // after a closing `"""` is refused (`parse.misplaced_binding`), and
+            // `prompt` also REQUIRES a binding. So a one-line `prompt "…"` that
+            // came back as a `"""` block was a rule nothing could compile —
+            // which is what made `then v <- prompt "…"` unchainable, since the
+            // sugar reprints the statement it chained. Reproduce the spelling
+            // the author wrote: a `"""` prompt keeps its block form, because
+            // legalizing THAT shape is the misplaced-binding rule's business,
+            // not the printer's.
+            if !triple_quoted {
+                if let Some(literal) = single_line_prompt_literal(&renamed) {
+                    push_stmt_line(
+                        out,
+                        indent,
+                        &format!("prompt {literal}{using}{requires}{binding}{timeout}"),
+                    );
+                    return;
+                }
+            }
             let annotation = content_type.unwrap_or_default();
             push_stmt_line(out, indent, &format!("prompt \"\"\"{annotation}"));
-            for line in rename_in_templates(text, rn).lines() {
+            for line in renamed.lines() {
                 push_stmt_line(out, indent, line);
             }
             push_stmt_line(
@@ -585,7 +611,11 @@ pub(crate) fn print_effect(
         }
     };
     match &effect.prompt {
-        Some(Prompt { text, content_type }) => {
+        Some(Prompt {
+            text,
+            content_type,
+            triple_quoted: _,
+        }) => {
             let annotation = content_type.clone().unwrap_or_default();
             push_stmt_line(out, indent, &format!("{header} \"\"\"{annotation}"));
             for line in rename_in_templates(text, rn).lines() {
@@ -595,6 +625,27 @@ pub(crate) fn print_effect(
         }
         None => push_stmt_line(out, indent, &header),
     }
+}
+
+/// Re-encode prompt text as the one-line `"…"` literal the body lexer decodes
+/// back to exactly this text. That lexer reads `\X` as `X` for every `X`, so
+/// only `"` and `\` need escaping — and a control character (a newline above
+/// all) has no one-line spelling that survives the round trip, so it gets
+/// `None` and the caller keeps the `"""` block form.
+fn single_line_prompt_literal(text: &str) -> Option<String> {
+    if text.chars().any(char::is_control) {
+        return None;
+    }
+    let mut literal = String::with_capacity(text.len() + 2);
+    literal.push('"');
+    for ch in text.chars() {
+        if ch == '"' || ch == '\\' {
+            literal.push('\\');
+        }
+        literal.push(ch);
+    }
+    literal.push('"');
+    Some(literal)
 }
 
 /// Applies `rn` to each `{{ … }}` interpolation of prompt text and copies the
@@ -623,21 +674,29 @@ fn rename_in_templates(text: &str, rn: &dyn Fn(&str) -> String) -> String {
     out
 }
 
-/// Rewrites references to `binding` (paths and bare uses) to `replacement`,
-/// as whole-word matches. String-literal content is preserved EXCEPT inside
-/// `{{ ... }}` template interpolations, where bindings are real references
-/// that must be renamed. This prevents corrupting a literal value like
-/// `event_type "ticket"` while still rewriting `"... {{ ticket.title }} ..."`.
+/// Rewrites references named on the left of `renames` (paths and bare uses) to
+/// their replacements, as whole-word matches. String-literal content is
+/// preserved EXCEPT inside `{{ ... }}` template interpolations, where bindings
+/// are real references that must be renamed. This prevents corrupting a literal
+/// value like `event_type "ticket"` while still rewriting
+/// `"... {{ ticket.title }} ..."`.
+///
+/// The whole table is applied in ONE scan, and a replacement it emits is never
+/// re-examined, so every name is substituted SIMULTANEOUSLY. Renaming one pair
+/// at a time over the previous pair's output rewrote an already-substituted
+/// argument whose root spelled a later parameter (`file_note(ticket.title,
+/// ticket.id)` on `file_note(note, ticket)` produced `ticket.id.title`), and a
+/// `(a, b)` / `(b, a)` swap made both parameters name one value. The names are
+/// matched whole-word, so at most one entry can match at a given position.
 ///
 /// `pub(crate)` so `action_expand` reuses the exact same reference-renaming
 /// semantics for parameter substitution and binding hygiene.
-pub(crate) fn rename_text(source: &str, binding: Option<&str>, replacement: &str) -> String {
-    let Some(binding) = binding else {
+pub(crate) fn rename_text(source: &str, renames: &[(String, String)]) -> String {
+    if renames.is_empty() {
         return source.to_owned();
-    };
+    }
     let mut out = String::with_capacity(source.len());
     let bytes = source.as_bytes();
-    let needle = binding.as_bytes();
     let mut index = 0;
     let mut in_string = false;
     let mut in_template = false; // inside `{{ ... }}`, even within a string
@@ -670,19 +729,23 @@ pub(crate) fn rename_text(source: &str, binding: Option<&str>, replacement: &str
             || !(bytes[index - 1].is_ascii_alphanumeric()
                 || bytes[index - 1] == b'_'
                 || bytes[index - 1] == b'.');
-        if renameable
-            && at_word_start
-            && bytes[index..].starts_with(needle)
-            && !bytes
-                .get(index + needle.len())
-                .is_some_and(|next| next.is_ascii_alphanumeric() || *next == b'_')
-        {
-            out.push_str(replacement);
-            index += needle.len();
-            continue;
+        if renameable && at_word_start {
+            let matched = renames.iter().find(|(from, _)| {
+                let needle = from.as_bytes();
+                !needle.is_empty()
+                    && bytes[index..].starts_with(needle)
+                    && !bytes
+                        .get(index + needle.len())
+                        .is_some_and(|next| next.is_ascii_alphanumeric() || *next == b'_')
+            });
+            if let Some((from, to)) = matched {
+                out.push_str(to);
+                index += from.len();
+                continue;
+            }
         }
         // Copy a whole character, not a byte re-encoded as one: every other
-        // advance above is over ASCII (`{{`, `}}`, `"`, the needle), so
+        // advance above is over ASCII (`{{`, `}}`, `"`, a needle), so
         // `index` is always on a char boundary here.
         let Some(ch) = source[index..].chars().next() else {
             break;

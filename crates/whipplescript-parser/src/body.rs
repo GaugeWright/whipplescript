@@ -839,6 +839,14 @@ pub struct ExecParse {
 pub struct Prompt {
     pub text: String,
     pub content_type: Option<String>,
+    /// Whether the author wrote a `"""` block rather than a one-line `"…"`
+    /// literal. The two decode to the same text, so only this says which
+    /// spelling the source used — and the printer must reproduce THAT
+    /// spelling: a `prompt` binding is legal on the effect line and refused
+    /// after a closing `"""` (`parse.misplaced_binding`), so reprinting one
+    /// shape as the other either breaks a valid rule or legalizes a refused
+    /// one.
+    pub triple_quoted: bool,
 }
 
 /// DR-0043 Decision 5: a `during <cond> { … } on lapse [as x] { … }` region
@@ -2304,8 +2312,13 @@ impl<'a> BodyParser<'a> {
             Some(Tok::Str(text)) => Some(Prompt {
                 text,
                 content_type: None,
+                triple_quoted: false,
             }),
-            Some(Tok::TripleStr { text, content_type }) => Some(Prompt { text, content_type }),
+            Some(Tok::TripleStr { text, content_type }) => Some(Prompt {
+                text,
+                content_type,
+                triple_quoted: true,
+            }),
             _ => {
                 let span = self.span_here();
                 self.error(
@@ -2683,6 +2696,12 @@ impl<'a> BodyParser<'a> {
         if !self.parse_effect_modifiers(&mut binding, &mut requires, &mut timeout_seconds) {
             return None;
         }
+        // A missing `as` is refused above, but the effect is still RETURNED
+        // with `binding: None` — as `timer`/`acquire`/`renew`/`consume`/
+        // `decide` do — because `then <b> <- <effect statement>` parses the
+        // statement WITHOUT its `as` and supplies the binding afterwards
+        // (spec/language.md "Sequencing sugar"). Returning `None` here left
+        // the verb unchainable.
         if binding.is_none() {
             let span = self.span_from(start);
             self.error(
@@ -2691,7 +2710,6 @@ impl<'a> BodyParser<'a> {
                 "`prompt` requires an `as` binding".to_owned(),
                 Some("write `prompt \"Summarize this\" as summary`".to_owned()),
             );
-            return None;
         }
         Some(BodyStmt::Effect(EffectStmt {
             kind: BodyEffectKind::Prompt { provider },
@@ -3367,6 +3385,8 @@ impl<'a> BodyParser<'a> {
         }
         match spec.binding {
             BindingMode::Required if binding.is_none() => {
+                // Returned bindingless so `then` can supply the binding; see
+                // `parse_prompt_effect`.
                 let span = self.span_from(start);
                 self.error(
                     diagnostic_code!("construct.missing_requirement"),
@@ -3374,7 +3394,6 @@ impl<'a> BodyParser<'a> {
                     format!("`{}` requires an `as` binding", spec.keyword),
                     None,
                 );
-                return None;
             }
             BindingMode::None if binding.is_some() => {
                 let span = self.span_from(start);
@@ -3454,6 +3473,8 @@ impl<'a> BodyParser<'a> {
         if !self.parse_effect_modifiers(&mut binding, &mut requires, &mut timeout_seconds) {
             return None;
         }
+        // Returned bindingless so `then` can supply the binding; see
+        // `parse_prompt_effect`.
         if binding.is_none() {
             let span = self.span_from(start);
             self.error(
@@ -3462,7 +3483,6 @@ impl<'a> BodyParser<'a> {
                 "`read` requires an `as` binding".to_owned(),
                 Some(usage),
             );
-            return None;
         }
         Some(BodyStmt::Effect(EffectStmt {
             kind: BodyEffectKind::FileRead {
@@ -3594,6 +3614,8 @@ impl<'a> BodyParser<'a> {
         if !self.parse_effect_modifiers(&mut binding, &mut requires, &mut timeout_seconds) {
             return None;
         }
+        // Returned bindingless so `then` can supply the binding; see
+        // `parse_prompt_effect`.
         if binding.is_none() {
             let span = self.span_from(start);
             self.error(
@@ -3602,7 +3624,6 @@ impl<'a> BodyParser<'a> {
                 "`write` requires an `as` binding".to_owned(),
                 Some(usage),
             );
-            return None;
         }
         Some(BodyStmt::Effect(EffectStmt {
             kind: BodyEffectKind::FileWrite {
@@ -3667,6 +3688,8 @@ impl<'a> BodyParser<'a> {
         if !self.parse_effect_modifiers(&mut binding, &mut requires, &mut timeout_seconds) {
             return None;
         }
+        // Returned bindingless so `then` can supply the binding; see
+        // `parse_prompt_effect`.
         if binding.is_none() {
             let span = self.span_from(start);
             self.error(
@@ -3675,7 +3698,6 @@ impl<'a> BodyParser<'a> {
                 "`import` requires an `as` binding".to_owned(),
                 Some(usage),
             );
-            return None;
         }
         Some(BodyStmt::Effect(EffectStmt {
             kind: BodyEffectKind::FileImport {
@@ -3821,6 +3843,8 @@ impl<'a> BodyParser<'a> {
         if !self.parse_effect_modifiers(&mut binding, &mut requires, &mut timeout_seconds) {
             return None;
         }
+        // Returned bindingless so `then` can supply the binding; see
+        // `parse_prompt_effect`.
         if binding.is_none() {
             let span = self.span_from(start);
             self.error(
@@ -3829,7 +3853,6 @@ impl<'a> BodyParser<'a> {
                 "`export` requires an `as` binding".to_owned(),
                 Some(usage),
             );
-            return None;
         }
         Some(BodyStmt::Effect(EffectStmt {
             kind: BodyEffectKind::FileExport {
@@ -5810,6 +5833,63 @@ mod tests {
         assert_eq!(prompt.text, "Summarize this.");
     }
 
+    /// The printer must reproduce the SPELLING of a prompt, not merely its
+    /// text. A `prompt` binding is legal on the effect line and refused after
+    /// a closing `"""` (`parse.misplaced_binding`), so a one-line prompt
+    /// reprinted as a block became a rule nothing could compile, and a `"""`
+    /// prompt reprinted on one line would legalize a shape that rule refuses.
+    #[test]
+    fn a_prompt_reprints_in_the_form_it_was_written() {
+        let reprint = |source: &str| {
+            let (ast, diagnostics) = parse_rule_body(source, 0);
+            assert!(diagnostics.is_empty(), "{diagnostics:?}");
+            let mut printed = String::new();
+            for statement in &ast.statements {
+                crate::body_print::print_statement_rn(
+                    statement,
+                    0,
+                    &|text: &str| text.to_owned(),
+                    &mut printed,
+                );
+            }
+            printed
+        };
+
+        let one_line = reprint("prompt \"Summarize {{ ticket.title }}\" as h\n");
+        assert!(
+            one_line.contains("prompt \"Summarize {{ ticket.title }}\" as h"),
+            "a one-line prompt keeps its binding on the effect line: {one_line}"
+        );
+        assert!(
+            !one_line.contains("\"\"\""),
+            "a one-line prompt must not become a block: {one_line}"
+        );
+
+        let block = reprint("prompt \"\"\"markdown\nSummarize it\n\"\"\" as h\n");
+        assert!(
+            block.contains("prompt \"\"\"markdown"),
+            "a `\"\"\"` prompt keeps its block form: {block}"
+        );
+
+        // A quote inside the text is escaped exactly as the body lexer decodes
+        // it, so the reprint re-lexes to the same prompt.
+        let quoted = reprint("prompt \"say \\\"hi\\\"\" as h\n");
+        assert!(
+            quoted.contains("prompt \"say \\\"hi\\\"\" as h"),
+            "a quote in prompt text is re-escaped: {quoted}"
+        );
+        let (again, diagnostics) = parse_rule_body(quoted.trim(), 0);
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let BodyStmt::Effect(effect) = &again.statements[0] else {
+            panic!("expected an effect, got {:?}", again.statements[0]);
+        };
+        assert_eq!(
+            effect.prompt.as_ref().expect("prompt").text,
+            "say \"hi\"",
+            "the reprint must re-lex to the same text"
+        );
+    }
+
     #[test]
     fn parses_tell_with_access_grants() {
         let ast = parse_ok(
@@ -6257,6 +6337,73 @@ mod tests {
         };
         assert_eq!(record.span.start, 100);
         assert!(record.span.end > 100);
+    }
+
+    /// Every one of these verbs requires its `as` binding, and each says so in
+    /// its own words. The refusal is what makes the binding required; the
+    /// statement is nevertheless RETURNED so `then <b> <- <effect statement>`
+    /// can supply the binding after the fact. Both halves are asserted here:
+    /// the diagnostic for the bindingless form, and the accepting case beside
+    /// it, so a parser that refused every one of them could not pass.
+    #[test]
+    fn an_effect_that_needs_a_binding_refuses_without_one_and_still_parses() {
+        for (bindingless, accepted, verb) in [
+            (
+                "prompt \"Summarize this\"",
+                "prompt \"Summarize this\" as s",
+                "prompt",
+            ),
+            (
+                "read text from notes at \"a.txt\"",
+                "read text from notes at \"a.txt\" as r",
+                "read",
+            ),
+            (
+                "write text to notes at \"a.txt\" { body \"hi\" mode replace }",
+                "write text to notes at \"a.txt\" { body \"hi\" mode replace } as w",
+                "write",
+            ),
+            (
+                "import json Row from notes at \"a.json\"",
+                "import json Row from notes at \"a.json\" as i",
+                "import",
+            ),
+            (
+                "export json Row to notes at \"a.json\" { mode replace }",
+                "export json Row to notes at \"a.json\" { mode replace } as e",
+                "export",
+            ),
+            // A package effect verb, parsed from the generated grammar table.
+            (
+                "recall project_memory for ticket.title",
+                "recall project_memory for ticket.title as h",
+                "recall",
+            ),
+        ] {
+            let (ast, diagnostics) = parse_rule_body(&format!("{bindingless}\n"), 0);
+            assert!(
+                diagnostics
+                    .iter()
+                    .any(|d| d.message == format!("`{verb}` requires an `as` binding")),
+                "`{verb}` without `as` is refused: {diagnostics:?}"
+            );
+            assert_eq!(
+                ast.statements.len(),
+                1,
+                "`{verb}` still yields the statement so `then` can bind it"
+            );
+            assert!(
+                matches!(&ast.statements[0], BodyStmt::Effect(effect) if effect.binding.is_none()),
+                "`{verb}` yields a bindingless effect"
+            );
+
+            let accepted = parse_ok(&format!("{accepted}\n"));
+            assert_eq!(
+                accepted.statements.len(),
+                1,
+                "`{verb}` with an `as` binding parses"
+            );
+        }
     }
 }
 

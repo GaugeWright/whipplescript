@@ -149,10 +149,12 @@ pub fn project_host_turn<S: RuntimeStore>(
     let mut pointers = events
         .iter()
         .zip(&mentions)
-        .filter(|(event, mentions)| {
-            event.sequence >= first_turn_event
-                && (**mentions || event.event_type == "host.turn.receipt")
-        })
+        // Naming the turn is the whole test. A hosted instance is reusable, so
+        // the log past this turn's first event also carries LATER turns, and a
+        // receipt admitted on its event type alone would be published as this
+        // turn's evidence under this turn's `command_id`. The turn's own receipt
+        // carries its `command_id` in the payload, so it is already mentioned.
+        .filter(|(event, mentions)| event.sequence >= first_turn_event && **mentions)
         .map(|(event, _)| {
             Ok(RuntimeEvidencePointer::Event(LabeledRuntimeEvent {
                 protocol: HOST_PROTOCOL.to_owned(),
@@ -1008,6 +1010,144 @@ mod tests {
                 result: Some("hello".to_owned()),
                 ok: Some(true),
             }]
+        );
+    }
+
+    /// **A later turn's receipt is not this turn's evidence.**
+    ///
+    /// A hosted instance is reusable: a turn settles and leaves it open for the
+    /// next one. The pointer filter kept any `host.turn.receipt` at or after the
+    /// projected turn's first event, so once turn B settled, projecting turn A
+    /// handed B's receipt back labeled `command_id: A`, and the Worker published
+    /// it as A's runtime evidence. A turn's own receipt names the turn in its
+    /// payload, so it needs no such blanket clause to be kept.
+    #[test]
+    fn a_turns_pointers_carry_its_own_receipt_and_not_a_later_turns() {
+        use whipplescript_kernel::host_protocol::{
+            CredentialRef, PolicyEpochRef, ProviderBindingRef, TurnInput,
+        };
+        use whipplescript_store::{NewEffect, NewInstance, RuleCommit};
+
+        fn turn_command(instance_id: &str, command_id: &str) -> StartTurnCommand {
+            StartTurnCommand {
+                protocol: HOST_PROTOCOL.to_owned(),
+                command_id: command_id.to_owned(),
+                run_ref: format!("gaugedesk:run:{command_id}"),
+                instance_ref: instance_id.to_owned(),
+                package_version_ref: "package:1".to_owned(),
+                policy: PolicyEpochRef {
+                    epoch: 7,
+                    envelope_hash: "envelope-hash".to_owned(),
+                    signer: "authority:gaugedesk".to_owned(),
+                    key_id: None,
+                },
+                actor_ref: "operator".to_owned(),
+                input: TurnInput {
+                    text: "hello".to_owned(),
+                    images: Vec::new(),
+                },
+                resources: Vec::new(),
+                provider_binding: ProviderBindingRef {
+                    binding_id: "model".to_owned(),
+                    credential: CredentialRef {
+                        credential_id: "credential:model".to_owned(),
+                    },
+                },
+                placement_ceiling_ref: "do".to_owned(),
+            }
+        }
+
+        let mut store = crate::do_store::test_support::store();
+        let version = whipplescript_store::host_actions::conformance::register(&mut store);
+        let instance = store
+            .create_instance(NewInstance {
+                program_id: &version.program_id,
+                version_id: &version.version_id,
+                input_json: "{}",
+            })
+            .expect("instance opens");
+        let instance_id = instance.instance_id.clone();
+
+        for command_id in ["turn-a", "turn-b"] {
+            let command_json =
+                serde_json::to_string(&turn_command(&instance_id, command_id)).expect("command");
+            store
+                .commit_rule(RuleCommit {
+                    instance_id: &instance_id,
+                    rule: "host.turn",
+                    trigger_event_id: None,
+                    facts: &[],
+                    consumed_fact_ids: &[],
+                    effects: &[NewEffect {
+                        effect_id: command_id,
+                        kind: "timer.wait",
+                        target: None,
+                        input_json: &command_json,
+                        status: "queued",
+                        idempotency_key: command_id,
+                        required_capabilities_json: "[]",
+                        profile: None,
+                        correlation_id: None,
+                        source_span_json: None,
+                        timeout_seconds: None,
+                    }],
+                    dependencies: &[],
+                    terminal: None,
+                    idempotency_key: Some(command_id),
+                    marks: &[],
+                    context_json: None,
+                })
+                .expect("turn effect commits");
+        }
+
+        let receipt_event = |command_id: &str| {
+            json!({
+                "command_id": command_id,
+                "run_ref": format!("gaugedesk:run:{command_id}"),
+                "status": "completed",
+            })
+            .to_string()
+        };
+        let own = store
+            .append_event(NewEvent {
+                instance_id: &instance_id,
+                event_type: "host.turn.receipt",
+                payload_json: &receipt_event("turn-a"),
+                source: "host-do",
+                causation_id: None,
+                correlation_id: Some("turn-a"),
+                idempotency_key: Some("receipt-a"),
+            })
+            .expect("the first turn's receipt appends");
+        let later = store
+            .append_event(NewEvent {
+                instance_id: &instance_id,
+                event_type: "host.turn.receipt",
+                payload_json: &receipt_event("turn-b"),
+                source: "host-do",
+                causation_id: None,
+                correlation_id: Some("turn-b"),
+                idempotency_key: Some("receipt-b"),
+            })
+            .expect("the second turn's receipt appends");
+
+        let projection =
+            project_host_turn(&mut store, &instance_id, "turn-a").expect("the first turn projects");
+        let evidence: Vec<&str> = projection
+            .runtime_evidence_pointers
+            .iter()
+            .filter_map(|pointer| match pointer {
+                RuntimeEvidencePointer::Event(event) => Some(event.evidence_ref.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            evidence.contains(&format!("whip:event:{}", own.event_id).as_str()),
+            "the turn's own receipt is its evidence, got {evidence:?}"
+        );
+        assert!(
+            !evidence.contains(&format!("whip:event:{}", later.event_id).as_str()),
+            "a later turn's receipt was published as this turn's evidence, got {evidence:?}"
         );
     }
 }

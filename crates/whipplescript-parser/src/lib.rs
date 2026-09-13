@@ -3871,17 +3871,7 @@ fn try_format_class_with_comments(
     let members: Vec<(SourceSpan, Vec<String>)> = class_decl
         .fields
         .iter()
-        .map(|field| {
-            let key = if field.is_key { " @key" } else { "" };
-            (
-                field.span,
-                vec![format!(
-                    "  {} {}{key}",
-                    field.name.name,
-                    field.ty.to_source()
-                )],
-            )
-        })
+        .map(|field| (field.span, vec![class_field_line(field)]))
         .collect();
     let Some((own_line, trailing)) =
         classify_body_comments(source, class_decl.span, &members, comments)
@@ -3998,12 +3988,7 @@ fn try_format_event_with_comments(
     let members: Vec<(SourceSpan, Vec<String>)> = event
         .fields
         .iter()
-        .map(|field| {
-            (
-                field.span,
-                vec![format!("  {} {}", field.name.name, field.ty.to_source())],
-            )
-        })
+        .map(|field| (field.span, vec![class_field_line(field)]))
         .collect();
     let Some((own_line, trailing)) = classify_body_comments(source, event.span, &members, comments)
     else {
