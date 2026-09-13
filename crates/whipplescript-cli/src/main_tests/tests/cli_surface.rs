@@ -1650,6 +1650,12 @@ fn instance_step_machine_drives_a_started_workflow_to_its_terminal() {
     use whipplescript_kernel::instance_machine::InstanceOutcome;
     let store_path = unique_test_path("instance-machine", "sqlite");
     let program_path = unique_test_path("instance-machine", "whip");
+    let coordination_path = unique_test_path("instance-machine-coordination", "sqlite");
+    let items_path = unique_test_path("instance-machine-items", "sqlite");
+    let side_stores = SideStorePaths {
+        coordination: coordination_path.to_path_buf(),
+        items: items_path.to_path_buf(),
+    };
     let source = "workflow ScoreTicket(ticket: Ticket) -> float ! string\n\n\
              class Ticket {\n  id string\n  title string\n}\n\n\
              rule score\n  when Ticket as ticket\n=> {\n  complete result 0.9\n}\n";
@@ -1678,8 +1684,16 @@ fn instance_step_machine_drives_a_started_workflow_to_its_terminal() {
     };
 
     // Drive the whole instance through the InstanceStepMachine (native binding).
-    let outcome = run_instance_via_machine(&store_path, &started.instance_id, &ir)
+    let outcome = run_instance_via_machine(&store_path, &started.instance_id, &ir, &side_stores)
         .expect("machine drives the instance");
+    assert!(
+        coordination_path.is_file(),
+        "the driver uses the fixture's coordination authority"
+    );
+    assert!(
+        items_path.is_file(),
+        "the driver uses the fixture's tracker authority"
+    );
     assert!(
         matches!(outcome, InstanceOutcome::Terminal),
         "the instance reaches a workflow terminal via the step machine: {outcome:?}"

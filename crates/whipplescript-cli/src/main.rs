@@ -20125,9 +20125,10 @@ fn run_instance_via_machine(
     store_path: &Path,
     instance_id: &str,
     ir: &IrProgram,
+    side_stores: &SideStorePaths,
 ) -> Result<whipplescript_kernel::instance_machine::InstanceOutcome, StoreError> {
     use whipplescript_kernel::instance_machine::InstanceStepMachine;
-    let stores = NativeStores::open(store_path, coordination_store_path(), items_store_path())?;
+    let stores = NativeStores::open(store_path, &side_stores.coordination, &side_stores.items)?;
     let driver = NativeInstanceDriver {
         kernel: RuntimeKernel::new(stores),
         ir,
