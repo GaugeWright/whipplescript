@@ -12,6 +12,7 @@ pub fn scope() -> ResolutionMemoryScope {
 }
 
 pub fn check<B: Branches, C: ContentBlobs>(mut make: impl FnMut() -> WorkspaceVcs<B, C>) {
+    check_version_read_denials(&mut make);
     for mode in ["plain", "remembered", "missing", "foreign"] {
         let mut workspace = make();
         workspace.init("t0").expect("workspace");
@@ -56,8 +57,13 @@ pub fn check<B: Branches, C: ContentBlobs>(mut make: impl FnMut() -> WorkspaceVc
         let binding = super::super::conformance::binding("lion");
         let expected = SaveResultBinding::from(&binding);
         let attempt = SaveAttempt::from(super::super::conformance::context());
-        let files = VersionedSaveFileStore::new_in_resolution_scope(workspace, binding, scope())
-            .expect("adapter");
+        let files = VersionedSaveFileStore::new_in_resolution_scope(
+            workspace,
+            binding,
+            scope(),
+            std::sync::Arc::new(|_: &str, _: &str, _: &str| Ok(())),
+        )
+        .expect("adapter");
         let result = files.write_text_with_context(
             Path::new(SAVE_OUTPUT_PATH),
             "lion",
@@ -161,7 +167,12 @@ pub fn check<B: Branches, C: ContentBlobs>(mut make: impl FnMut() -> WorkspaceVc
         let mut binding = super::super::conformance::binding(super::super::conformance::DRAFT);
         binding.branch_id = "missing-branch".into();
         let files = if scoped {
-            VersionedSaveFileStore::new_in_resolution_scope(workspace, binding, scope())
+            VersionedSaveFileStore::new_in_resolution_scope(
+                workspace,
+                binding,
+                scope(),
+                std::sync::Arc::new(|_: &str, _: &str, _: &str| Ok(())),
+            )
         } else {
             VersionedSaveFileStore::new(workspace, binding)
         }
@@ -199,4 +210,81 @@ pub fn check<B: Branches, C: ContentBlobs>(mut make: impl FnMut() -> WorkspaceVc
     assert!(files
         .recover_scoped_result(&SaveAttempt::from(super::super::conformance::context()))
         .is_err());
+}
+
+fn check_version_read_denials<B: Branches, C: ContentBlobs>(
+    make: &mut impl FnMut() -> WorkspaceVcs<B, C>,
+) {
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+    for (denied_cut, allowed_reads) in [("base", 0), ("head", 0), ("head", 1)] {
+        let mut workspace = make();
+        workspace.init("t0").expect("workspace");
+        workspace
+            .write(
+                MAINLINE_BRANCH_ID,
+                "docs/test.txt",
+                Some("dog"),
+                "base",
+                "t1",
+            )
+            .expect("base");
+        workspace
+            .write(
+                MAINLINE_BRANCH_ID,
+                "docs/test.txt",
+                Some("tiger"),
+                "head",
+                "t2",
+            )
+            .expect("head");
+        let reads = AtomicUsize::new(0);
+        let files = VersionedSaveFileStore::new_in_resolution_scope(
+            workspace,
+            super::super::conformance::binding("lion"),
+            scope(),
+            Arc::new(move |branch: &str, path: &str, cut: &str| {
+                assert_eq!((branch, path), (MAINLINE_BRANCH_ID, "docs/test.txt"));
+                if cut == denied_cut && reads.fetch_add(1, Ordering::SeqCst) >= allowed_reads {
+                    return Err(crate::StoreError::Conflict(
+                        "retained version read denied".into(),
+                    ));
+                }
+                Ok(())
+            }),
+        )
+        .expect("scoped adapter requires explicit authority");
+        let context = super::super::conformance::context();
+        let failure = files
+            .write_text_with_context(Path::new(SAVE_OUTPUT_PATH), "lion", context)
+            .expect_err("denied history cannot publish save or conflict content");
+        assert!(
+            failure
+                .error
+                .to_string()
+                .contains("retained version read denied"),
+            "{:?}",
+            failure.error
+        );
+        assert!(
+            failure.evidence.is_none(),
+            "revocation must not disclose conflict bodies"
+        );
+        let workspace = files.workspace.borrow();
+        assert!(workspace
+            .get_cut(&save_cut_id(context.instance_id, context.effect_id))
+            .expect("read")
+            .is_none());
+        assert_eq!(
+            workspace
+                .get_branch(MAINLINE_BRANCH_ID)
+                .expect("read")
+                .expect("branch")
+                .head_cut_id
+                .as_deref(),
+            Some("head")
+        );
+    }
 }

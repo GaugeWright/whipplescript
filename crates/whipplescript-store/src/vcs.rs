@@ -22,6 +22,8 @@
 
 pub mod resolution_recording;
 pub mod resolution_scope;
+pub mod version_origin;
+pub use version_origin::{FileVersionSource, RecordedFileVersion};
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
@@ -94,6 +96,22 @@ pub struct SaveCommitPlan<'a> {
 /// their labeled reference with the cut. Implementations do not dispatch I/O.
 pub trait SaveResultEvidenceBuilder {
     fn prepare(&self, plan: &SaveCommitPlan<'_>) -> StoreResult<crate::files::FileWriteEvidence>;
+}
+
+/// Trusted host authorization of the exact retained version about to be read.
+/// Implementations resolve inherited restrictions, current clearance and the
+/// admitted output ceiling. They do not mutate the target or grant dispatch.
+pub trait SaveVersionReadAuthority: Send + Sync {
+    fn authorize_read(&self, branch: &str, path: &str, cut: &str) -> StoreResult<()>;
+}
+
+impl<F> SaveVersionReadAuthority for F
+where
+    F: Fn(&str, &str, &str) -> StoreResult<()> + Send + Sync,
+{
+    fn authorize_read(&self, branch: &str, path: &str, cut: &str) -> StoreResult<()> {
+        self(branch, path, cut)
+    }
 }
 
 /// A read-only merge preview (spec §12.1): exactly what `save_with_base`
@@ -1699,12 +1717,14 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
             .branches
             .get_cut(cut_id)?
             .ok_or_else(|| StoreError::Conflict("save evidence cut is unavailable".into()))?;
-        let Some(id) = self.manifest_entry(Some(&cut.manifest_hash), path)? else {
+        let Some(id) = self.retained_manifest_entry(&cut.manifest_hash, path)? else {
             return Ok(None);
         };
-        self.content.get_text(&id)?.text().map(Some).ok_or_else(|| {
+        let body = self.content.get_text(&id)?.text().ok_or_else(|| {
             StoreError::Conflict("save evidence content is unavailable or erased".into())
-        })
+        })?;
+        crate::content::verify_body(&id, body.as_bytes(), "retained file body")?;
+        Ok(Some(body))
     }
 
     /// The base-carrying editor save (spec §12.1). `resolutions` from a
@@ -1764,6 +1784,7 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
             builder,
             None,
             &mut Vec::new(),
+            None,
         )
     }
 
@@ -1779,6 +1800,7 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
         builder: Option<&dyn SaveResultEvidenceBuilder>,
         scope: Option<&resolution_scope::ResolutionMemoryScope>,
         observations: &mut Vec<resolution_scope::ResolutionLookup>,
+        read_authority: Option<&dyn SaveVersionReadAuthority>,
     ) -> StoreResult<SaveWithBaseOutcome> {
         if self.branches.get_cut(base_cut_id)?.is_none() {
             return Ok(SaveWithBaseOutcome::UnknownBaseCut);
@@ -1790,6 +1812,12 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
                 return Ok(SaveWithBaseOutcome::BranchMissing);
             };
             let head_cut = branch.head_cut_id.clone();
+            if let Some(authority) = read_authority {
+                authority.authorize_read(branch_id, path, base_cut_id)?;
+                if let Some(cut) = Self::cut_ref(&head_cut) {
+                    authority.authorize_read(branch_id, path, cut)?;
+                }
+            }
             let base_body = self.read_at_cut(base_cut_id, path)?;
             let head_body = match Self::cut_ref(&head_cut) {
                 Some(cut) => self.read_at_cut(cut, path)?,
@@ -4806,8 +4834,8 @@ mod tests {
     ///
     /// Before this, every test left its directory behind — 200 of them had
     /// accumulated in the RAM-backed /tmp.
-    struct TempVcs {
-        dir: std::path::PathBuf,
+    pub(super) struct TempVcs {
+        pub(super) dir: std::path::PathBuf,
         inner: NativeWorkspaceVcs,
     }
 
@@ -4831,7 +4859,7 @@ mod tests {
         }
     }
 
-    fn vcs() -> TempVcs {
+    pub(super) fn vcs() -> TempVcs {
         let dir = std::env::temp_dir().join(format!(
             "whipplescript-vcs-{}-{}",
             std::process::id(),

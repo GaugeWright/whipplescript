@@ -421,9 +421,13 @@ fn scoped_save_recovery_survives_reopen_without_current_knowledge_tables() {
         )
         .unwrap();
     let expected = SaveResultBinding::from(&binding("lion"));
-    let files =
-        VersionedSaveFileStore::new_in_resolution_scope(workspace, binding("lion"), scope.clone())
-            .unwrap();
+    let files = VersionedSaveFileStore::new_in_resolution_scope(
+        workspace,
+        binding("lion"),
+        scope.clone(),
+        std::sync::Arc::new(|_: &str, _: &str, _: &str| Ok(())),
+    )
+    .unwrap();
     let accepted = files
         .write_text_with_context(Path::new(SAVE_OUTPUT_PATH), "lion", context())
         .unwrap();
@@ -465,6 +469,7 @@ fn scoped_save_recovery_refuses_changed_retained_constraints() {
             workspace,
             binding(DRAFT),
             scope.clone(),
+            std::sync::Arc::new(|_: &str, _: &str, _: &str| Ok(())),
         )
         .unwrap();
         files

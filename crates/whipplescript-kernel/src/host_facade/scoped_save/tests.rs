@@ -445,7 +445,12 @@ fn setup(
     let inner = if case == "unscoped-adapter" {
         VersionedSaveFileStore::new(workspace, binding)
     } else {
-        VersionedSaveFileStore::new_in_resolution_scope(workspace, binding, scope)
+        VersionedSaveFileStore::new_in_resolution_scope(
+            workspace,
+            binding,
+            scope,
+            std::sync::Arc::new(|_: &str, _: &str, _: &str| Ok(())),
+        )
     }
     .expect("construct file adapter");
     (

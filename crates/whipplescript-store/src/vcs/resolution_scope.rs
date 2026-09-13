@@ -122,6 +122,40 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
             builder,
             Some(scope),
             &mut observations,
+            None,
+        )?;
+        Ok(ScopedSaveOutcome {
+            outcome,
+            scope: scope.clone(),
+            observations,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn save_with_authorized_versions_in_resolution_scope(
+        &mut self,
+        scope: &ResolutionMemoryScope,
+        branch_id: &str,
+        path: &str,
+        draft: &str,
+        base_cut_id: &str,
+        cut_id: &str,
+        at: &str,
+        builder: Option<&dyn SaveResultEvidenceBuilder>,
+        authority: &dyn super::SaveVersionReadAuthority,
+    ) -> StoreResult<ScopedSaveOutcome> {
+        let mut observations = Vec::new();
+        let outcome = self.save_with_base_using_memory(
+            branch_id,
+            path,
+            draft,
+            base_cut_id,
+            cut_id,
+            at,
+            builder,
+            Some(scope),
+            &mut observations,
+            Some(authority),
         )?;
         Ok(ScopedSaveOutcome {
             outcome,

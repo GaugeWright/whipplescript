@@ -53,7 +53,12 @@ fn absent_save_targets_cannot_supply_application_proof_to_either_reader() {
             .expect_err("an absent target cannot settle a dispatch");
         assert!(format!("{error:?}").contains("versioned save target has no committed result"));
         let files = if scoped {
-            VersionedSaveFileStore::new_in_resolution_scope(workspace, binding, scope)
+            VersionedSaveFileStore::new_in_resolution_scope(
+                workspace,
+                binding,
+                scope,
+                std::sync::Arc::new(|_: &str, _: &str, _: &str| Ok(())),
+            )
         } else {
             VersionedSaveFileStore::new(workspace, binding)
         }

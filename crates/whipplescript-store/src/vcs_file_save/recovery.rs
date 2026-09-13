@@ -55,7 +55,7 @@ impl<B: Branches, C: ContentBlobs> VersionedSaveFileStore<B, C> {
     /// an earlier authorized writer may still commit. A cut without its result
     /// reference is unavailable evidence, including the legacy adapter shape.
     pub fn recover_result(&self, attempt: &SaveAttempt) -> io::Result<Option<RecoveredSave>> {
-        if self.resolution_scope.is_some() {
+        if self.scoped.is_some() {
             return Err(denied("scoped saves require scoped recovery"));
         }
         read_committed_save(

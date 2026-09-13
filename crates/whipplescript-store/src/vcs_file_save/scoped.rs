@@ -90,9 +90,13 @@ impl<B: Branches, C: ContentBlobs> VersionedSaveFileStore<B, C> {
         workspace: WorkspaceVcs<B, C>,
         binding: VersionedSaveBinding,
         scope: ResolutionMemoryScope,
+        read_authority: std::sync::Arc<dyn crate::vcs::SaveVersionReadAuthority>,
     ) -> io::Result<Self> {
         let mut files = Self::new(workspace, binding)?;
-        files.resolution_scope = Some(scope);
+        files.scoped = Some(ScopedVersionedSave {
+            scope,
+            read_authority,
+        });
         Ok(files)
     }
 
@@ -101,8 +105,9 @@ impl<B: Branches, C: ContentBlobs> VersionedSaveFileStore<B, C> {
         attempt: &SaveAttempt,
     ) -> io::Result<Option<RecoveredSave<ScopedSaveReceipt>>> {
         let scope = self
-            .resolution_scope
+            .scoped
             .as_ref()
+            .map(|scoped| &scoped.scope)
             .ok_or_else(|| denied("legacy saves have no scoped recovery binding"))?;
         read_committed_scoped_save(
             &self.workspace.borrow(),

@@ -297,3 +297,10 @@ fn hosted_preparation_rolls_back_failed_sql_before_publication() {
         "fault sweep must reach a real successful preparation"
     );
 }
+
+#[test]
+fn hosted_file_version_origin_preserves_immutable_history() {
+    whipplescript_store::vcs::version_origin::conformance::check(|| {
+        super::compose_vcs(&RusqliteDoSql::with_runtime_schema()).expect("hosted workspace")
+    });
+}

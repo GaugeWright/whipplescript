@@ -113,7 +113,12 @@ pub fn save_cut_id(instance_id: &str, effect_id: &str) -> String {
 pub struct VersionedSaveFileStore<B: Branches, C: ContentBlobs> {
     workspace: RefCell<WorkspaceVcs<B, C>>,
     binding: VersionedSaveBinding,
-    resolution_scope: Option<ResolutionMemoryScope>,
+    scoped: Option<ScopedVersionedSave>,
+}
+
+struct ScopedVersionedSave {
+    scope: ResolutionMemoryScope,
+    read_authority: std::sync::Arc<dyn crate::vcs::SaveVersionReadAuthority>,
 }
 
 fn io_error(error: impl std::fmt::Debug) -> io::Error {
@@ -155,11 +160,17 @@ impl<B: Branches, C: ContentBlobs> VersionedSaveFileStore<B, C> {
         Ok(Self {
             workspace: RefCell::new(workspace),
             binding,
-            resolution_scope: None,
+            scoped: None,
         })
     }
 
     fn body_at(&self, workspace: &WorkspaceVcs<B, C>, cut_id: &str) -> io::Result<Option<String>> {
+        if let Some(scoped) = &self.scoped {
+            scoped
+                .read_authority
+                .authorize_read(&self.binding.branch_id, &self.binding.path, cut_id)
+                .map_err(io_error)?;
+        }
         workspace
             .read_at_cut(cut_id, &self.binding.path)
             .map_err(io_error)
@@ -171,8 +182,8 @@ impl<B: Branches, C: ContentBlobs> VersionedSaveFileStore<B, C> {
         result: SaveResult,
         observations: Vec<ResolutionLookup>,
     ) -> io::Result<FileWriteEvidence> {
-        if let Some(scope) = &self.resolution_scope {
-            return scoped::evidence(&self.binding, scope, attempt, result, observations);
+        if let Some(scoped) = &self.scoped {
+            return scoped::evidence(&self.binding, &scoped.scope, attempt, result, observations);
         }
         let receipt = SaveReceipt {
             protocol: SAVE_RECEIPT_SCHEMA.into(),
@@ -194,9 +205,9 @@ impl<B: Branches, C: ContentBlobs> VersionedSaveFileStore<B, C> {
 
 impl<B: Branches, C: ContentBlobs> FileStore for VersionedSaveFileStore<B, C> {
     fn scoped_save_binding(&self) -> Option<(&VersionedSaveBinding, &ResolutionMemoryScope)> {
-        self.resolution_scope
+        self.scoped
             .as_ref()
-            .map(|scope| (&self.binding, scope))
+            .map(|scoped| (&self.binding, &scoped.scope))
     }
 
     fn read_content_reference(&self, path: &Path) -> io::Result<FileContentReference> {
@@ -313,11 +324,13 @@ impl<B: Branches, C: ContentBlobs> FileStore for VersionedSaveFileStore<B, C> {
         let builder = recovery::SaveEvidenceBuilder {
             binding: &self.binding,
             attempt: &attempt,
-            resolution_scope: self.resolution_scope.as_ref(),
+            resolution_scope: self.scoped.as_ref().map(|scoped| &scoped.scope),
         };
-        let (outcome, observations) = if let Some(scope) = &self.resolution_scope {
+        let (outcome, observations) = if let Some(scoped) = &self.scoped {
+            let scope = &scoped.scope;
+            let authority = scoped.read_authority.as_ref();
             let saved = workspace
-                .save_with_base_in_resolution_scope(
+                .save_with_authorized_versions_in_resolution_scope(
                     scope,
                     &self.binding.branch_id,
                     &self.binding.path,
@@ -326,6 +339,7 @@ impl<B: Branches, C: ContentBlobs> FileStore for VersionedSaveFileStore<B, C> {
                     &cut_id,
                     &self.binding.recorded_at,
                     Some(&builder),
+                    authority,
                 )
                 .map_err(io_error)?;
             (saved.outcome, saved.observations)
@@ -373,7 +387,7 @@ impl<B: Branches, C: ContentBlobs> FileStore for VersionedSaveFileStore<B, C> {
             refused => return Err(io_error(format!("versioned save refused: {refused:?}")).into()),
         };
         drop(workspace);
-        if self.resolution_scope.is_some() {
+        if self.scoped.is_some() {
             self.recover_scoped_result(&attempt)?
                 .map(recovery::RecoveredSave::into_accepted)
         } else {

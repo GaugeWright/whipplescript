@@ -286,6 +286,7 @@ fn run_scoped<S, B, C>(
             target,
             binding.clone(),
             scope.clone(),
+            std::sync::Arc::new(|_: &str, _: &str, _: &str| Ok(())),
         )
         .expect("scoped adapter"),
         interrupted: mode == "interrupted",
