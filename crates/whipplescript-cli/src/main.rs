@@ -12766,7 +12766,8 @@ fn execute_scenario(
     // same path via this env var.
     let items_store_path = scratch.items_store_path();
     env::set_var("WHIPPLESCRIPT_ITEMS_STORE", &items_store_path);
-    let store = SqliteStore::open(&store_path).map_err(store_error)?;
+    let store = SqliteStore::open(&store_path)
+        .map_err(|error| format!("open scenario store: {}", store_error(error)))?;
     let mut kernel = RuntimeKernel::new(store);
 
     // `given file <store> at <path> "<content>"` seeds deterministic fixture
@@ -13072,9 +13073,11 @@ fn execute_scenario(
             None,
             None,
         )
-        .map_err(store_error)?;
-        run_worker_once(&store_path, &worker_options).map_err(store_error)?;
-        let store = SqliteStore::open(&store_path).map_err(store_error)?;
+        .map_err(|error| format!("step scenario: {}", store_error(error)))?;
+        run_worker_once(&store_path, &worker_options)
+            .map_err(|error| format!("execute scenario effects: {}", store_error(error)))?;
+        let store = SqliteStore::open(&store_path)
+            .map_err(|error| format!("open scenario store: {}", store_error(error)))?;
         let status = store
             .status(&instance_id)
             .map_err(store_error)?
@@ -13095,7 +13098,8 @@ fn execute_scenario(
         previous_event_count = event_count;
     }
 
-    let store = SqliteStore::open(&store_path).map_err(store_error)?;
+    let store = SqliteStore::open(&store_path)
+        .map_err(|error| format!("open scenario store: {}", store_error(error)))?;
     let instance_status = store
         .status(&instance_id)
         .map_err(store_error)?

@@ -170,7 +170,23 @@ impl HostActionCommand {
     /// must collide at admission and be refused, never mint another action.
     pub fn instance_ref(&self) -> Result<String, ProtocolError> {
         self.validate()?;
-        let key = serde_json::to_vec(&[&self.issuer, &self.scope, &self.request_id])
+        Self::instance_ref_for_request(&self.issuer, &self.scope, &self.request_id)
+    }
+
+    /// Locate a request after a lost response without recreating its command.
+    ///
+    /// This pure address calculation proves no existence, admission, permission,
+    /// or outcome. A host must authorize inspection and verify retained evidence
+    /// independently. Strings are exact: no normalization or delimiter joining.
+    pub fn instance_ref_for_request(
+        issuer: &str,
+        scope: &str,
+        request_id: &str,
+    ) -> Result<String, ProtocolError> {
+        nonempty("action issuer", issuer)?;
+        nonempty("action scope", scope)?;
+        nonempty("action request id", request_id)?;
+        let key = serde_json::to_vec(&[issuer, scope, request_id])
             .map_err(|_| ProtocolError::Invalid("action key serialization"))?;
         let mut hash = Sha256::new();
         hash.update(b"whipplescript:host-action:instance:v1\0");
@@ -553,6 +569,83 @@ pub(crate) mod tests {
         right.issuer = "a".into();
         right.scope = "b:c".into();
         assert_ne!(left.instance_ref().unwrap(), right.instance_ref().unwrap());
+    }
+
+    #[test]
+    fn host_action_request_locator_preserves_published_instance_addresses() {
+        // Fixed v1 addresses also catch a simultaneous change to both entry points.
+        for (issuer, scope, request, expected) in [
+            (
+                "product",
+                "workspace:1",
+                "save:1",
+                "ins_action_ee44ca25e60a89ee862d45b297f29f0bc4f94829e5462e544d027804d8e72612",
+            ),
+            (
+                "a:b",
+                "c",
+                "d",
+                "ins_action_c7f12d699db1011d28fc3c9dde1bb9f186a9203f0428a0f6f29de670b206dce9",
+            ),
+            (
+                "a",
+                "b:c",
+                "d",
+                "ins_action_6c40ebd2a581189891eb62eb38c339d2620d65449cc493be825495dd7ffea532",
+            ),
+            (
+                "authority😀",
+                "scope\n\"\\",
+                "request:é",
+                "ins_action_81f9a4d0764418c06bf3dc250afe4cd2aaa0fe204c503f90b5fe6f1bd1fd9e4b",
+            ),
+        ] {
+            let located =
+                HostActionCommand::instance_ref_for_request(issuer, scope, request).unwrap();
+            assert_eq!(located, expected);
+            let mut cmd = command();
+            cmd.issuer = issuer.into();
+            cmd.scope = scope.into();
+            cmd.request_id = request.into();
+            assert_eq!(cmd.instance_ref().unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn host_action_request_locator_refuses_each_empty_identity_field() {
+        for invalid in ["", " \t\n"] {
+            for index in 0..3 {
+                let mut identity = ["product", "workspace:1", "save:1"];
+                identity[index] = invalid;
+                assert!(
+                    HostActionCommand::instance_ref_for_request(
+                        identity[0],
+                        identity[1],
+                        identity[2]
+                    )
+                    .is_err(),
+                    "accepted empty identity field {index}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn host_action_request_locator_does_not_relax_full_command_validation() {
+        let mut cmd = command();
+        let locator =
+            HostActionCommand::instance_ref_for_request(&cmd.issuer, &cmd.scope, &cmd.request_id)
+                .unwrap();
+        cmd.operation.clear();
+        assert!(cmd.instance_ref().is_err());
+        // A locator can still name this request; it cannot make the command valid.
+        assert_eq!(
+            HostActionCommand::instance_ref_for_request(&cmd.issuer, &cmd.scope, &cmd.request_id)
+                .unwrap(),
+            locator
+        );
+        assert!(cmd.signing_bytes().is_err());
+        assert!(cmd.fingerprint().is_err());
     }
 
     #[test]

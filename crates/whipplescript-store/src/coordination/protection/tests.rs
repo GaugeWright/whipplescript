@@ -5,6 +5,49 @@ use std::sync::{
     Arc, RwLock,
 };
 
+#[test]
+fn protection_probe_keeps_one_snapshot_across_concurrent_initialization() {
+    use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
+    use std::sync::atomic::AtomicUsize;
+    let fixture = Fixture::new();
+    let path = fixture.path();
+    let connection = Connection::open(&path).unwrap();
+    crate::establish_wal(&connection).unwrap();
+    let reads = Arc::new(AtomicUsize::new(0));
+    let opened = Arc::new(AtomicBool::new(false));
+    let initialized = opened.clone();
+    connection
+        .authorizer(Some(move |context: AuthContext<'_>| {
+            if matches!(
+                context.action,
+                AuthAction::Read {
+                    table_name: "sqlite_master",
+                    column_name: "name"
+                }
+            ) && reads.fetch_add(1, Ordering::SeqCst) == 1
+            {
+                // Commit schema and its protection binding between the two schema
+                // queries. WAL permits this while the observer retains its snapshot.
+                CoordinationStore::open(&path).unwrap();
+                initialized.store(true, Ordering::SeqCst);
+            }
+            Authorization::Allow
+        }))
+        .unwrap();
+    assert_eq!(
+        CoordinationStore::recorded_protection(&connection).unwrap(),
+        None
+    );
+    assert!(opened.load(Ordering::SeqCst));
+    connection
+        .authorizer(None::<fn(AuthContext<'_>) -> Authorization>)
+        .unwrap();
+    assert_eq!(
+        CoordinationStore::recorded_protection(&connection).unwrap(),
+        None
+    );
+}
+
 #[derive(Default)]
 struct Codec {
     erased: AtomicBool,

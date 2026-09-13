@@ -14788,6 +14788,58 @@ fn lsp_workspace_symbol_indexes_open_documents() {
 }
 
 #[test]
+fn test_harness_identifies_the_stage_of_a_store_lock_failure() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let stores = temp_store_path();
+    let workflow = stores.dir.join("locked-scenario.whip");
+    fs::write(
+        &workflow,
+        r#"
+workflow LockedScenario
+output result Finished
+class Finished { note string }
+rule finish
+  when started
+=> { complete result { note "ok" } }
+test "finishes" {
+  workflow LockedScenario
+  run until idle
+  expect workflow completed
+}
+"#,
+    )
+    .unwrap();
+    let path = stores.dir.join("coordination.sqlite");
+    drop(whipplescript_store::coordination::CoordinationStore::open(&path).unwrap());
+    let holder = rusqlite::Connection::open(path).unwrap();
+    holder.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let output = whip(bin, &stores)
+        .args(["--json", "test", workflow.to_str().unwrap()])
+        .output()
+        .unwrap();
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+        panic!(
+            "{error}; stdout: {}; stderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )
+    });
+    assert_eq!(report["status"], "invalid", "{report}");
+    let message = report["scenarios"][0]["diagnostics"][0]["message"]
+        .as_str()
+        .unwrap();
+    assert!(message.contains("step scenario:"), "{message}");
+    assert!(message.contains("database is locked"), "{message}");
+    holder.execute_batch("ROLLBACK").unwrap();
+    let recovered = run_json_isolated(
+        bin,
+        &stores,
+        &["--json", "test", workflow.to_str().unwrap()],
+    );
+    assert_eq!(recovered["status"], "passed", "{recovered}");
+}
+
+#[test]
 fn test_harness_supports_per_agent_stub_outcomes() {
     // One scenario can stub different agents differently: `alpha` succeeds while
     // `beta` fails. The succeeding agent's turn completes (its observing rule

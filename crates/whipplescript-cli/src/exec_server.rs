@@ -918,11 +918,12 @@ mod tests {
         });
 
         let mut stream = std::net::TcpStream::connect(address).expect("connect");
-        stream
-            .write_all(b"GET /healthz HTTP/1.1\r\n")
-            .expect("request line");
+        let request_line = b"GET /healthz HTTP/1.1\r\n";
+        stream.write_all(request_line).expect("request line");
         let mut headers = b"X-Pad: ".to_vec();
-        headers.resize(headers.len() + MAX_HEADER_BYTES + 64, b'a');
+        // Exactly the first refused byte, with no unread tail that could
+        // reset the socket on close and discard part of the 431 response.
+        headers.resize(MAX_HEADER_BYTES + 1 - request_line.len(), b'a');
         // No terminator, and the peer keeps the connection open: the 431 has
         // to arrive while the line is still unfinished.
         stream.write_all(&headers).expect("unterminated header");
@@ -932,7 +933,9 @@ mod tests {
             .set_read_timeout(Some(Duration::from_secs(5)))
             .expect("read timeout");
         let mut response = String::new();
-        let _ = stream.read_to_string(&mut response);
+        stream
+            .read_to_string(&mut response)
+            .expect("complete refusal response");
         assert!(
             response.contains(" 431 ") && response.contains("request headers too large"),
             "an unterminated header line must be cut off at the cap: {response:?}"
@@ -953,7 +956,9 @@ mod tests {
 
         let mut stream = std::net::TcpStream::connect(address).expect("connect");
         let mut request_line = b"GET /".to_vec();
-        request_line.resize(request_line.len() + MAX_HEADER_BYTES + 64, b'a');
+        // Avoid unread bytes after the bounded read: closing over such a
+        // tail may reset the connection before the refusal body is received.
+        request_line.resize(MAX_HEADER_BYTES + 1, b'a');
         stream
             .write_all(&request_line)
             .expect("oversized request line");
@@ -963,7 +968,9 @@ mod tests {
             .set_read_timeout(Some(Duration::from_secs(5)))
             .expect("read timeout");
         let mut response = String::new();
-        let _ = stream.read_to_string(&mut response);
+        stream
+            .read_to_string(&mut response)
+            .expect("complete refusal response");
         assert!(
             response.contains(" 431 ") && response.contains("request headers too large"),
             "an oversized request line must be rejected with 431: {response:?}"

@@ -6,6 +6,10 @@ use sha2::{Digest, Sha256};
 
 impl CoordinationStore {
     fn recorded_protection(connection: &Connection) -> StoreResult<Option<String>> {
+        // A concurrent first opener commits schema and its binding together.
+        // All probes must see one snapshot, or an old absent binding followed
+        // by the new schema stamp falsely looks like a damaged current store.
+        let _snapshot = connection.unchecked_transaction()?;
         if table_exists(connection, "coordination_payload_protection")? {
             return Ok(connection.query_row(
                 "SELECT domain FROM coordination_payload_protection WHERE singleton = 1",
