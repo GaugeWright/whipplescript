@@ -813,10 +813,19 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
                     ctx.effect_id,
                     &run_id,
                 );
+                // The same classification the durable object's brokered settle
+                // (`harness_loop::provider_result_from_brokered_turn`) and the
+                // native delegated-provider observation stamp, so
+                // `f.error_class == "timeout"` reads the same on every host.
+                let error_class = if matches!(outcome.status, TurnStatus::TimedOut) {
+                    "timeout"
+                } else {
+                    "provider_error"
+                };
                 if let Some(base_object) = base.as_object_mut() {
                     base_object.insert(
                         "error_class".to_owned(),
-                        Value::String("provider_error".to_owned()),
+                        Value::String(error_class.to_owned()),
                     );
                 }
                 object.insert("value".to_owned(), base);
@@ -1450,14 +1459,23 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
     ) -> StoreResult<StoredEvent> {
         let event = match result {
             Ok(event) => event,
-            Err(StoreError::PolicyBlocked { effect_id, reason })
-            | Err(StoreError::CapacityBlocked { effect_id, reason }) => {
-                self.emit(TraceEvent::EffectBlocked {
-                    effect_id: effect_id.clone(),
-                    status: None,
-                    reason: reason.clone(),
-                });
-                return Err(StoreError::PolicyBlocked { effect_id, reason });
+            // Both blocks emit the same trace, and the error goes back as the
+            // store typed it: a capacity block is a re-claimable deferral the
+            // worker must tell apart from a policy block, and the variant is
+            // what carries that -- never the wording of the reason.
+            Err(
+                error @ (StoreError::PolicyBlocked { .. } | StoreError::CapacityBlocked { .. }),
+            ) => {
+                if let StoreError::PolicyBlocked { effect_id, reason }
+                | StoreError::CapacityBlocked { effect_id, reason } = &error
+                {
+                    self.emit(TraceEvent::EffectBlocked {
+                        effect_id: effect_id.clone(),
+                        status: None,
+                        reason: reason.clone(),
+                    });
+                }
+                return Err(error);
             }
             Err(error) => return Err(error),
         };
@@ -3969,8 +3987,17 @@ fn dependency_edge(dependency: &NewEffectDependency<'_>) -> DependencyEdge {
     DependencyEdge {
         upstream_effect_id: dependency.upstream_effect_id.to_owned(),
         predicate: match dependency.predicate {
+            "succeeds" => trace::DependencyPredicate::Succeeds,
             "fails" => trace::DependencyPredicate::Fails,
+            "timed_out" => trace::DependencyPredicate::TimedOut,
+            "cancelled" => trace::DependencyPredicate::Cancelled,
             "completes" => trace::DependencyPredicate::Completes,
+            // `succeeds` is named above rather than served by this arm, so
+            // what reaches here is a predicate the lowering writes and the
+            // trace does not know. Folding it into `Succeeds` is what let
+            // `after x timed_out` be judged against the wrong terminal. The
+            // mapping stays total (see `effect_status`) and the DEFENCE is
+            // `every_dependency_predicate_the_lowering_writes_maps`.
             _ => trace::DependencyPredicate::Succeeds,
         },
         downstream_effect_id: dependency.downstream_effect_id.to_owned(),
@@ -4730,6 +4757,57 @@ mod tests {
             );
         }
     }
+
+    /// Every dependency predicate the LOWERING writes is named by
+    /// `dependency_edge`, and each reaches its own trace variant.
+    ///
+    /// Same shape as the status test above: the mapping is total, so a
+    /// predicate the language admits but the trace does not name would fold
+    /// into `Succeeds` and the checker would judge `after x timed_out` against
+    /// the wrong terminal. The list is the vocabulary
+    /// `rule_lowering::dependency_predicate_str` emits.
+    #[test]
+    fn every_dependency_predicate_the_lowering_writes_maps() {
+        let mut seen = std::collections::BTreeSet::new();
+        for (predicate, expected) in [
+            (
+                whipplescript_parser::DependencyPredicate::Succeeds,
+                trace::DependencyPredicate::Succeeds,
+            ),
+            (
+                whipplescript_parser::DependencyPredicate::Fails,
+                trace::DependencyPredicate::Fails,
+            ),
+            (
+                whipplescript_parser::DependencyPredicate::TimedOut,
+                trace::DependencyPredicate::TimedOut,
+            ),
+            (
+                whipplescript_parser::DependencyPredicate::Cancelled,
+                trace::DependencyPredicate::Cancelled,
+            ),
+            (
+                whipplescript_parser::DependencyPredicate::Completes,
+                trace::DependencyPredicate::Completes,
+            ),
+        ] {
+            let written = rule_lowering::dependency_predicate_str(&predicate);
+            let edge = dependency_edge(&NewEffectDependency {
+                dependency_id: "dep",
+                upstream_effect_id: "up",
+                downstream_effect_id: "down",
+                predicate: written,
+            });
+            assert_eq!(
+                edge.predicate, expected,
+                "`{written}` is written by the lowering and must map deliberately"
+            );
+            assert!(
+                seen.insert(format!("{:?}", edge.predicate)),
+                "`{written}` must reach a trace variant no other predicate reaches"
+            );
+        }
+    }
     #[test]
     fn every_new_model_visible_plane_maps_to_hash_or_derivative_evidence() {
         let (world_kind, world) =
@@ -5386,8 +5464,12 @@ rule start
             metadata_json: "{}",
         });
 
+        // The store's typed variant survives the kernel: a capacity deferral is
+        // re-claimable and the worker tells it apart from a policy block by the
+        // variant, never by the wording of the reason.
         assert!(
-            matches!(blocked, Err(StoreError::PolicyBlocked { reason, .. }) if reason.contains("capacity exhausted"))
+            matches!(&blocked, Err(StoreError::CapacityBlocked { effect_id, reason }) if effect_id == "tell-two" && reason.contains("capacity exhausted")),
+            "capacity exhaustion must surface as CapacityBlocked, got {blocked:?}"
         );
         assert!(kernel.trace().iter().any(|record| matches!(
             &record.event,
@@ -5673,6 +5755,114 @@ rule wait
 
         assert_eq!(started.sequence, 2);
         assert_eq!(completed.sequence, 3);
+        check_trace(kernel.trace()).expect("kernel trace conforms");
+    }
+
+    /// `after upstream timed_out` is released by the store on exactly that
+    /// terminal, and the kernel's trace must judge the release by the same
+    /// predicate. Folding the edge into `succeeds` made the checker report the
+    /// store's correct release as a claim before its dependency was satisfied.
+    #[test]
+    fn kernel_trace_accepts_release_on_timed_out_dependency() {
+        let store = SqliteStore::open_in_memory().expect("store opens");
+        let mut kernel = RuntimeKernel::new(store);
+        let effects = [
+            NewEffect {
+                timeout_seconds: None,
+                effect_id: "upstream",
+                kind: "agent.tell",
+                target: Some("worker"),
+                input_json: r#"{"prompt":"go"}"#,
+                status: "queued",
+                idempotency_key: "rule=start;effect=upstream",
+                required_capabilities_json: "[]",
+                profile: Some("repo-writer"),
+                correlation_id: None,
+                source_span_json: None,
+            },
+            NewEffect {
+                timeout_seconds: None,
+                effect_id: "downstream",
+                kind: "agent.tell",
+                target: Some("worker"),
+                input_json: r#"{"prompt":"retry"}"#,
+                status: "blocked_by_dependency",
+                idempotency_key: "rule=start;effect=downstream",
+                required_capabilities_json: "[]",
+                profile: Some("repo-writer"),
+                correlation_id: None,
+                source_span_json: None,
+            },
+        ];
+        let dependencies = [NewEffectDependency {
+            dependency_id: "dep-upstream-downstream",
+            upstream_effect_id: "upstream",
+            downstream_effect_id: "downstream",
+            predicate: "timed_out",
+        }];
+        kernel
+            .commit_rule(RuleCommit {
+                instance_id: "instance-a",
+                rule: "start",
+                trigger_event_id: None,
+                facts: &[],
+                consumed_fact_ids: &[],
+                effects: &effects,
+                dependencies: &dependencies,
+                terminal: None,
+                idempotency_key: Some("commit-start"),
+                marks: &[],
+                context_json: None,
+            })
+            .expect("rule commits");
+
+        let run = |effect_id: &'static str| RunStart {
+            instance_id: "instance-a",
+            effect_id,
+            run_id: match effect_id {
+                "upstream" => "run-upstream",
+                _ => "run-downstream",
+            },
+            provider: "test",
+            worker_id: "worker-1",
+            lease_id: match effect_id {
+                "upstream" => "lease-upstream",
+                _ => "lease-downstream",
+            },
+            lease_expires_at: "2030-01-01T00:00:00Z",
+            metadata_json: "{}",
+        };
+        kernel.start_run(run("upstream")).expect("upstream starts");
+        kernel
+            .timeout_run(EffectCompletion {
+                instance_id: "instance-a",
+                effect_id: "upstream",
+                run_id: "run-upstream",
+                provider: "test",
+                worker_id: "worker-1",
+                status: "timed_out",
+                exit_code: None,
+                summary: Some("no answer"),
+                metadata_json: "{}",
+                idempotency_key: Some("timeout-upstream"),
+            })
+            .expect("upstream times out");
+
+        let claimable = kernel
+            .claimable_effects("instance-a")
+            .expect("claimable effects load");
+        assert_eq!(
+            claimable
+                .iter()
+                .map(|e| e.effect_id.as_str())
+                .collect::<Vec<_>>(),
+            ["downstream"],
+            "the store releases the downstream on the upstream's timeout"
+        );
+        kernel
+            .start_run(run("downstream"))
+            .expect("downstream starts");
+
         check_trace(kernel.trace()).expect("kernel trace conforms");
     }
 

@@ -4314,6 +4314,66 @@ fn spawn_otel_collector() -> (
     (port, rx, handle)
 }
 
+/// A one-shot in-process listener that captures the raw request and answers
+/// `302 Found` to `location`. Returns (port, receiver, handle).
+///
+/// 302 rather than 307 on purpose: ureq 2.12 follows 301/302/303 for a POST
+/// (rewriting it to GET and replaying every header but `content-length`,
+/// `cookie` and `authorization`), while a 307/308 POST is never followed at
+/// all — so only a 302 exercises the header-replay hop the exporter refuses.
+#[allow(clippy::type_complexity)]
+fn spawn_otel_redirector(
+    location: String,
+) -> (
+    u16,
+    std::sync::mpsc::Receiver<String>,
+    std::thread::JoinHandle<()>,
+) {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind redirector");
+    let port = listener.local_addr().expect("addr").port();
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    let handle = std::thread::spawn(move || {
+        if let Ok((mut stream, _)) = listener.accept() {
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 4096];
+            loop {
+                let read = stream.read(&mut chunk).unwrap_or(0);
+                if read == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&chunk[..read]);
+                if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let headers = String::from_utf8_lossy(&buf[..pos]).to_string();
+                    let content_length = headers
+                        .to_lowercase()
+                        .lines()
+                        .find_map(|line| line.strip_prefix("content-length:"))
+                        .and_then(|value| value.trim().parse::<usize>().ok())
+                        .unwrap_or(0);
+                    let body_start = pos + 4;
+                    while buf.len() < body_start + content_length {
+                        let read = stream.read(&mut chunk).unwrap_or(0);
+                        if read == 0 {
+                            break;
+                        }
+                        buf.extend_from_slice(&chunk[..read]);
+                    }
+                    let _ = stream.write_all(
+                        format!(
+                            "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\n\r\n"
+                        )
+                        .as_bytes(),
+                    );
+                    let _ = tx.send(String::from_utf8_lossy(&buf).to_string());
+                    break;
+                }
+            }
+        }
+    });
+    (port, rx, handle)
+}
+
 /// Q2: `OTEL_EXPORTER_OTLP_PROTOCOL` validates before any socket — only the
 /// shipped `http/json` encoding is accepted; anything else is a config error.
 #[test]
@@ -4419,6 +4479,62 @@ fn otel_export_refuses_headers_over_plaintext_without_optin() {
     let _ = fs::remove_file(coordination);
 }
 
+/// Q2: the loopback exemption is an address check, not a hostname-prefix check.
+/// A DNS name that merely begins with `127.` names a remote host, so auth
+/// headers over plaintext to it are refused; every genuine loopback form
+/// (`127.0.0.1`, another `127.0.0.0/8` address, `[::1]`, `localhost`) passes.
+#[test]
+fn otel_export_loopback_exemption_is_an_address_not_a_name_prefix() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let (store, source, coordination, instance) = otel_export_fixture(bin, "otel-loop");
+    let store_str = store.to_str().expect("utf-8");
+    let secret = "super-secret-team-key";
+    let dry_run = |endpoint: &str| {
+        Command::new(bin)
+            .args(["--store", store_str, "otel-export", &instance, "--dry-run"])
+            .env("OTEL_EXPORTER_OTLP_ENDPOINT", endpoint)
+            .env(
+                "OTEL_EXPORTER_OTLP_HEADERS",
+                format!("x-honeycomb-team={secret}"),
+            )
+            .output()
+            .expect("otel-export runs")
+    };
+
+    let refused = dry_run("http://127.example.invalid:4318");
+    assert!(
+        !refused.status.success(),
+        "a hostname beginning with `127.` is not loopback and must be refused"
+    );
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        stderr.contains("refusing to send") && stderr.contains("loopback host"),
+        "expected the plaintext-headers refusal: {stderr}"
+    );
+    assert!(
+        !stderr.contains(secret),
+        "the header value must never be printed: {stderr}"
+    );
+
+    for endpoint in [
+        "http://127.0.0.1:4318",
+        "http://127.5.6.7:4318",
+        "http://[::1]:4318",
+        "http://localhost:4318",
+    ] {
+        let allowed = dry_run(endpoint);
+        assert!(
+            allowed.status.success(),
+            "{endpoint} is loopback and must carry headers: {}",
+            String::from_utf8_lossy(&allowed.stderr)
+        );
+    }
+
+    let _ = fs::remove_file(store);
+    let _ = fs::remove_file(source);
+    let _ = fs::remove_file(coordination);
+}
+
 /// Q2: `OTEL_RESOURCE_ATTRIBUTES` are parsed (percent-decoded) and merged onto
 /// the OTLP resource alongside `service.name`.
 #[test]
@@ -4509,6 +4625,203 @@ fn otel_export_attaches_parsed_headers_to_post() {
     assert!(
         lower.contains("x-tenant: acme"),
         "second header must ride the POST: {raw}"
+    );
+
+    let _ = fs::remove_file(store);
+    let _ = fs::remove_file(source);
+    let _ = fs::remove_file(coordination);
+}
+
+/// Q2: a collector that answers 3xx is a misconfiguration the operator sees,
+/// not a hop the exporter follows. OTLP auth is rarely the `Authorization`
+/// header (`x-honeycomb-team`, `api-key`, ...), and ureq replays every other
+/// header on a 301/302/303 redirect (the POST becomes a GET), so following
+/// would hand the key to whatever host the `Location` names. The redirector
+/// answers 302 because that is the status ureq actually follows for a POST;
+/// with `.redirects(0)` removed this test fails at the first assertion (the
+/// hop is taken, the target's 200 reads as success, and the key reaches the
+/// target). The accepting case is the 200 collector directly above.
+#[test]
+fn otel_export_refuses_a_redirecting_collector_and_replays_no_headers() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let (store, source, coordination, instance) = otel_export_fixture(bin, "otel-redir");
+    let store_str = store.to_str().expect("utf-8");
+    let (target_port, target_rx, _target) = spawn_otel_collector();
+    let target_url = format!("http://127.0.0.1:{target_port}/v1/traces");
+    let (port, rx, redirector) = spawn_otel_redirector(target_url.clone());
+
+    let export = Command::new(bin)
+        .args(["--store", store_str, "otel-export", &instance])
+        .env(
+            "OTEL_EXPORTER_OTLP_ENDPOINT",
+            format!("http://127.0.0.1:{port}"),
+        )
+        .env(
+            "OTEL_EXPORTER_OTLP_HEADERS",
+            "x-honeycomb-team=super-secret-team-key",
+        )
+        .output()
+        .expect("otel-export runs");
+    let stderr = String::from_utf8_lossy(&export.stderr);
+    assert!(
+        !export.status.success(),
+        "a redirecting collector must fail the export: {stderr}"
+    );
+    assert!(
+        stderr.contains("redirected") && stderr.contains("OTEL_EXPORTER_OTLP_ENDPOINT"),
+        "expected the redirect refusal naming the endpoint variable: {stderr}"
+    );
+    assert!(
+        stderr.contains(&target_url),
+        "the refusal names where the collector pointed: {stderr}"
+    );
+    assert!(
+        !stderr.contains("super-secret-team-key"),
+        "the header value must never be printed: {stderr}"
+    );
+
+    // The configured endpoint saw the POST (headers and all) ...
+    let first = rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("redirector received the POST");
+    redirector.join().ok();
+    assert!(
+        first
+            .to_lowercase()
+            .contains("x-honeycomb-team: super-secret-team-key"),
+        "the configured endpoint receives the auth header: {first}"
+    );
+    // ... and the host named by `Location` saw nothing at all.
+    assert!(
+        target_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .is_err(),
+        "no request may reach the redirect target"
+    );
+
+    let _ = fs::remove_file(store);
+    let _ = fs::remove_file(source);
+    let _ = fs::remove_file(coordination);
+}
+
+/// A one-shot in-process listener that answers `status` with an empty body and
+/// no `Location`, so the export sees a plain collector error rather than a hop.
+fn spawn_otel_status_collector(status: &'static str) -> (u16, std::thread::JoinHandle<()>) {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind status collector");
+    let port = listener.local_addr().expect("addr").port();
+    let handle = std::thread::spawn(move || {
+        if let Ok((mut stream, _)) = listener.accept() {
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 4096];
+            loop {
+                let read = stream.read(&mut chunk).unwrap_or(0);
+                if read == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&chunk[..read]);
+                if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                    let _ = stream.write_all(
+                        format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\n\r\n").as_bytes(),
+                    );
+                    break;
+                }
+            }
+        }
+    });
+    (port, handle)
+}
+
+/// A collector that answers 4xx/5xx fails the export and says which code came
+/// back. Without this the arm could stop reporting the status -- or stop
+/// failing at all -- and the accepting case below would still pass.
+#[test]
+fn otel_export_reports_the_collector_status_it_was_refused_with() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let (store, source, coordination, instance) = otel_export_fixture(bin, "otel-status");
+    let store_str = store.to_str().expect("utf-8");
+    let (port, listener) = spawn_otel_status_collector("503 Service Unavailable");
+
+    let export = Command::new(bin)
+        .args(["--store", store_str, "otel-export", &instance])
+        .env(
+            "OTEL_EXPORTER_OTLP_ENDPOINT",
+            format!("http://127.0.0.1:{port}"),
+        )
+        .output()
+        .expect("otel-export runs");
+    listener.join().ok();
+    let stderr = String::from_utf8_lossy(&export.stderr);
+    assert!(
+        !export.status.success(),
+        "a refusing collector must fail the export: {stderr}"
+    );
+    assert!(
+        stderr.contains("collector responded 503"),
+        "the refusal names the status the collector sent: {stderr}"
+    );
+
+    // The accepting case, so a arm that refused EVERY response could not pass:
+    // a 200 collector exports without error.
+    let (ok_port, _ok_rx, ok_listener) = spawn_otel_collector();
+    let accepted = Command::new(bin)
+        .args(["--store", store_str, "otel-export", &instance])
+        .env(
+            "OTEL_EXPORTER_OTLP_ENDPOINT",
+            format!("http://127.0.0.1:{ok_port}"),
+        )
+        .output()
+        .expect("otel-export runs");
+    ok_listener.join().ok();
+    assert!(
+        accepted.status.success(),
+        "a 200 collector exports cleanly: {}",
+        String::from_utf8_lossy(&accepted.stderr)
+    );
+
+    let _ = fs::remove_file(store);
+    let _ = fs::remove_file(source);
+    let _ = fs::remove_file(coordination);
+}
+
+/// A collector that cannot be reached at all fails the export and names the URL
+/// it tried, so an operator can tell "nothing is listening there" from "that
+/// collector said no" -- the two arms this and the test above pin apart.
+#[test]
+fn otel_export_names_the_url_when_the_transport_fails() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let (store, source, coordination, instance) = otel_export_fixture(bin, "otel-transport");
+    let store_str = store.to_str().expect("utf-8");
+    // Bind and drop, so the port is one nothing is listening on.
+    let port = {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        listener.local_addr().expect("addr").port()
+    };
+
+    let export = Command::new(bin)
+        .args(["--store", store_str, "otel-export", &instance])
+        .env(
+            "OTEL_EXPORTER_OTLP_ENDPOINT",
+            format!("http://127.0.0.1:{port}"),
+        )
+        .output()
+        .expect("otel-export runs");
+    let stderr = String::from_utf8_lossy(&export.stderr);
+    assert!(
+        !export.status.success(),
+        "an unreachable collector must fail the export: {stderr}"
+    );
+    assert!(
+        stderr.contains("cannot reach collector at"),
+        "the transport failure says the collector could not be reached: {stderr}"
+    );
+    assert!(
+        stderr.contains(&format!("http://127.0.0.1:{port}/v1/traces")),
+        "the transport failure names the URL it tried: {stderr}"
+    );
+    assert!(
+        !stderr.contains("collector responded"),
+        "a transport failure is not a status refusal: {stderr}"
     );
 
     let _ = fs::remove_file(store);

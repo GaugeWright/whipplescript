@@ -236,6 +236,80 @@ fn local_trace_conformance_rejects_reconstructed_bad_dependency_block() {
         .contains("without an unsatisfied dependency"));
 }
 
+/// `after prepare timed_out` on a real event log: the store released `send`
+/// on the timeout, and `whip trace --check` must read the edge by that
+/// predicate rather than fold it into `succeeds` and report a false claim
+/// before satisfaction.
+#[test]
+fn local_trace_conformance_accepts_reconstructed_timed_out_dependency_release() {
+    let events = vec![
+        event_view(
+            1,
+            "rule.committed",
+            json!({
+                "rule": "dispatch",
+                "facts": [],
+                "effects": [
+                    {"effect_id": "prepare", "status": "queued"},
+                    {"effect_id": "send", "status": "blocked_by_dependency"}
+                ],
+                "dependencies": [
+                    {
+                        "dependency_id": "dep_1",
+                        "upstream_effect_id": "prepare",
+                        "downstream_effect_id": "send",
+                        "predicate": "timed_out"
+                    }
+                ]
+            }),
+        ),
+        event_view(
+            2,
+            "effect.run_started",
+            json!({"effect_id": "prepare", "run_id": "run_prepare"}),
+        ),
+        event_view(
+            3,
+            "effect.terminal",
+            json!({
+                "effect_id": "prepare",
+                "run_id": "run_prepare",
+                "status": "timed_out"
+            }),
+        ),
+        event_view(
+            4,
+            "effect.run_started",
+            json!({"effect_id": "send", "run_id": "run_send"}),
+        ),
+    ];
+    let records = reconstruct_trace_records(&events);
+
+    assert_eq!(check_local_trace(&events, &records), Ok(()));
+    let edge = records
+        .iter()
+        .find_map(|record| match &record.event {
+            TraceEvent::DependencyCreated(edge) => Some(edge),
+            _ => None,
+        })
+        .expect("dependency edge reconstructed");
+    assert_eq!(trace_predicate_name(&edge.predicate), "timed_out");
+}
+
+/// Every predicate the lowering writes survives the log-to-trace-to-JSON
+/// round trip under its own name; a name the reader does not know would
+/// print as `succeeds` and lie about which terminal releases the edge.
+#[test]
+fn every_trace_predicate_round_trips() {
+    for name in ["succeeds", "fails", "timed_out", "cancelled", "completes"] {
+        assert_eq!(
+            trace_predicate_name(&trace_dependency_predicate(name)),
+            name,
+            "`{name}` is written by the lowering and must map deliberately"
+        );
+    }
+}
+
 #[test]
 fn reconstructs_revision_trace_records_from_store_events() {
     let events = vec![

@@ -164,9 +164,26 @@ pub const WRITER_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Interpolated rather than parameterised because SQLite binds values, not list
 /// literals, and the alternative is seven copies again. The text is a
 /// compile-time constant with no caller input anywhere near it.
-const PENDING_EFFECT_STATUSES: &str = "('queued', 'blocked', 'blocked_by_admission', \
+pub const PENDING_EFFECT_STATUSES: &str = "('queued', 'blocked', 'blocked_by_admission', \
      'blocked_by_dependency', 'blocked_by_capacity', 'blocked_by_capability', \
      'blocked_by_profile')";
+
+/// The SQL predicate that says a dependency edge (`dependency`) is satisfied by
+/// its upstream effect's row (`upstream`): each generic lifecycle predicate of
+/// spec/effects-and-capabilities.md matched to exactly the terminal tag it
+/// names -- `fails` is `Failed<E>`, and a `timed_out` upstream satisfies only
+/// `times out` and `completes`. Every clause that asks whether an effect's
+/// dependencies hold interpolates this one text, in both hosts: the sites once
+/// carried hand copies, and one copy learned that a timeout is not a failure
+/// while the others went on releasing the failure handler on a timeout.
+pub const DEPENDENCY_SATISFIED: &str = "( \
+     (dependency.predicate = 'succeeds' AND upstream.status = 'completed') \
+     OR (dependency.predicate = 'fails' AND upstream.status = 'failed') \
+     OR (dependency.predicate = 'timed_out' AND upstream.status = 'timed_out') \
+     OR (dependency.predicate = 'cancelled' AND upstream.status = 'cancelled') \
+     OR (dependency.predicate = 'completes' \
+         AND upstream.status IN ('completed', 'failed', 'timed_out', 'cancelled')) \
+     )";
 
 /// Which of the log's guards refused a write (DR-0067 §2/§3, DR-0073 §2).
 ///
@@ -1450,24 +1467,29 @@ pub struct InstanceTransition<'a> {
     pub idempotency_key: Option<&'a str>,
 }
 
-/// The instance status transitions the runtime admits. One table, so the native
-/// store and a store-trait host (the DO) cannot disagree about what a legal
-/// instance transition is.
+/// The instance status transitions the runtime admits, as (current, next)
+/// pairs. One table, so the native store and a store-trait host (the DO)
+/// cannot disagree about what a legal instance transition is -- and a table
+/// rather than a `matches!` so the replay-fold coverage test can enumerate
+/// it: a transition added here is exercised there the day it is added, with
+/// no hand list to extend. `completed` is deliberately absent: an instance
+/// completes through the workflow-terminal door, not through a transition.
+pub const INSTANCE_TRANSITIONS: &[(&str, &str)] = &[
+    ("running", "paused"),
+    ("paused", "running"),
+    ("running", "cancelled"),
+    ("paused", "cancelled"),
+    ("blocked", "cancelled"),
+    // Generic internal failure terminal (flow auto-fail): an unhandled
+    // effect failure fails the instance directly, without an
+    // author-typed `failure` payload.
+    ("running", "failed"),
+    ("paused", "failed"),
+    ("blocked", "failed"),
+];
+
 pub fn instance_transition_allowed(current: &str, next: &str) -> bool {
-    matches!(
-        (current, next),
-        ("running", "paused")
-            | ("paused", "running")
-            | ("running", "cancelled")
-            | ("paused", "cancelled")
-            | ("blocked", "cancelled")
-            // Generic internal failure terminal (flow auto-fail): an unhandled
-            // effect failure fails the instance directly, without an
-            // author-typed `failure` payload.
-            | ("running", "failed")
-            | ("paused", "failed")
-            | ("blocked", "failed")
-    )
+    INSTANCE_TRANSITIONS.contains(&(current, next))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2020,7 +2042,11 @@ impl SqliteStore {
         })
         .to_string();
         let idempotency = format!("reattest:{instance_id}:{from_version_id}:{to_version_id}");
-        append_event_on(
+        // Keyed on the pair: re-attesting it again (after a rebuild folded the
+        // instance back to its recorded version) is the same durable
+        // statement, so the append returns the existing event rather than
+        // tripping the UNIQUE index -- as the DO twin already does.
+        append_event_idempotent_on(
             &tx,
             NewEvent {
                 instance_id,
@@ -2515,21 +2541,16 @@ impl SqliteStore {
                 },
             )?;
             tx.execute(
-                r#"
+                &format!(
+                    r#"
                 UPDATE effects
                 SET status = 'cancelled',
                     updated_at = CURRENT_TIMESTAMP
                 WHERE instance_id = ?1
                   AND effect_id = ?2
-                  AND status IN (
-                      'queued',
-                      'blocked',
-                      'blocked_by_dependency',
-                      'blocked_by_capacity',
-                      'blocked_by_capability',
-                      'blocked_by_profile'
-                  )
-                "#,
+                  AND status IN {PENDING_EFFECT_STATUSES}
+                "#
+                ),
                 params![activation.instance_id, effect_id],
             )?;
             mark_cancellation_requests_terminal_on(
@@ -3715,13 +3736,7 @@ impl SqliteStore {
                    AND upstream.instance_id = dependency.instance_id
                   WHERE dependency.instance_id = candidate.instance_id
                     AND dependency.downstream_effect_id = candidate.effect_id
-                    AND NOT (
-                        (dependency.predicate = 'succeeds' AND upstream.status = 'completed')
-                        OR (dependency.predicate = 'fails' AND upstream.status = 'failed')
-                        OR (dependency.predicate = 'timed_out' AND upstream.status = 'timed_out')
-                        OR (dependency.predicate = 'cancelled' AND upstream.status = 'cancelled')
-                        OR (dependency.predicate = 'completes' AND upstream.status IN ('completed', 'failed', 'timed_out', 'cancelled'))
-                    )
+                    AND NOT {DEPENDENCY_SATISFIED}
               )
             ORDER BY candidate.created_at, candidate.effect_id
             "#),
@@ -6218,7 +6233,8 @@ impl SqliteStore {
             });
         }
         let claimable = tx.query_row(
-            r#"
+            &format!(
+                r#"
             SELECT NOT EXISTS (
                 SELECT 1
                 FROM effect_dependencies AS dependency
@@ -6227,15 +6243,10 @@ impl SqliteStore {
                  AND upstream.instance_id = dependency.instance_id
                 WHERE dependency.instance_id = ?1
                   AND dependency.downstream_effect_id = ?2
-                  AND NOT (
-                      (dependency.predicate = 'succeeds' AND upstream.status = 'completed')
-                      OR (dependency.predicate = 'fails' AND upstream.status IN ('failed', 'timed_out'))
-                      OR (dependency.predicate = 'timed_out' AND upstream.status = 'timed_out')
-                      OR (dependency.predicate = 'cancelled' AND upstream.status = 'cancelled')
-                      OR (dependency.predicate = 'completes' AND upstream.status IN ('completed', 'failed', 'timed_out', 'cancelled'))
-                  )
+                  AND NOT {DEPENDENCY_SATISFIED}
             )
-            "#,
+            "#
+            ),
             params![run.instance_id, run.effect_id],
             |row| row.get::<_, bool>(0),
         )?;
@@ -6660,7 +6671,7 @@ impl SqliteStore {
         instance_id: &str,
         now: &str,
     ) -> StoreResult<Vec<DueTimeEffect>> {
-        let mut statement = self.connection.prepare(
+        let mut statement = self.connection.prepare(&format!(
             r#"
             SELECT
                 candidate.effect_id,
@@ -6693,18 +6704,12 @@ impl SqliteStore {
                        AND upstream.instance_id = dependency.instance_id
                       WHERE dependency.instance_id = candidate.instance_id
                         AND dependency.downstream_effect_id = candidate.effect_id
-                        AND NOT (
-                            (dependency.predicate = 'succeeds' AND upstream.status = 'completed')
-                            OR (dependency.predicate = 'fails' AND upstream.status IN ('failed', 'timed_out'))
-                            OR (dependency.predicate = 'timed_out' AND upstream.status = 'timed_out')
-                            OR (dependency.predicate = 'cancelled' AND upstream.status = 'cancelled')
-                            OR (dependency.predicate = 'completes' AND upstream.status IN ('completed', 'failed', 'timed_out', 'cancelled'))
-                        )
+                        AND NOT {DEPENDENCY_SATISFIED}
                   )
               )
             ORDER BY candidate.created_at, candidate.effect_id
-            "#,
-        )?;
+            "#
+        ))?;
         let rows = statement
             .query_map([instance_id, now], |row| {
                 Ok(DueTimeEffect {
@@ -9953,7 +9958,8 @@ fn parse_json_array(json: &str) -> StoreResult<()> {
 fn satisfy_dependencies_on(connection: &Connection, instance_id: &str) -> StoreResult<usize> {
     connection
         .execute(
-            r#"
+            &format!(
+                r#"
             UPDATE effects
             SET status = 'queued',
                 updated_at = CURRENT_TIMESTAMP
@@ -9971,16 +9977,11 @@ fn satisfy_dependencies_on(connection: &Connection, instance_id: &str) -> StoreR
                          AND upstream.instance_id = dependency.instance_id
                         WHERE dependency.instance_id = candidate.instance_id
                           AND dependency.downstream_effect_id = candidate.effect_id
-                          AND NOT (
-                              (dependency.predicate = 'succeeds' AND upstream.status = 'completed')
-                              OR (dependency.predicate = 'fails' AND upstream.status IN ('failed', 'timed_out'))
-                              OR (dependency.predicate = 'timed_out' AND upstream.status = 'timed_out')
-                              OR (dependency.predicate = 'cancelled' AND upstream.status = 'cancelled')
-                              OR (dependency.predicate = 'completes' AND upstream.status IN ('completed', 'failed', 'timed_out', 'cancelled'))
-                          )
+                          AND NOT {DEPENDENCY_SATISFIED}
                     )
               )
-            "#,
+            "#
+            ),
             [instance_id],
         )
         .map_err(Into::into)
@@ -12099,6 +12100,10 @@ fn rule_commit_payload(
                 "required_capabilities": serde_json::from_str::<Value>(effect.required_capabilities_json)?,
                 "profile": effect.profile,
                 "correlation_id": effect.correlation_id,
+                // The relative deadline (`within <duration>`) is a column the
+                // INSERT writes and every deadline reader keys on; the log
+                // carries it so a rebuild reproduces it (DR-0094).
+                "timeout_seconds": effect.timeout_seconds,
                 "source_span": effect
                     .source_span_json
                     .map(serde_json::from_str::<Value>)
@@ -12418,6 +12423,8 @@ fn replay_rule_commit(
             .and_then(Value::as_i64)
             .unwrap_or(commit_revision_epoch);
         let new_effect = NewEffect {
+            // Events written before the payload carried the deadline fold to
+            // None, exactly as they did.
             timeout_seconds: effect.get("timeout_seconds").and_then(Value::as_i64),
             effect_id,
             kind,
@@ -16102,6 +16109,95 @@ mod tests {
         assert_eq!(cleared.policy_block_category, None);
     }
 
+    /// A revision that cancels pending effects cancels an admission-denied one
+    /// too. The selector that chose the effects to cancel read all seven
+    /// pending statuses, but the UPDATE that applied the cancellation named
+    /// six: it silently matched no row for `blocked_by_admission`, so the log
+    /// said `cancelled` while the projection still said the effect was waiting
+    /// on an operator -- until a rebuild folded the log and flipped it.
+    #[test]
+    fn a_revision_cancels_an_admission_denied_effect_in_row_and_log() {
+        let mut store = SqliteStore::open_in_memory().expect("store opens");
+        let version1 = store
+            .create_program_version(test_program_version("Revision", "source-1", "ir-1"))
+            .expect("first program version creates");
+        let version2 = store
+            .create_program_version(test_program_version("Revision", "source-2", "ir-2"))
+            .expect("second program version creates");
+        let instance = store
+            .create_instance(NewInstance {
+                program_id: &version1.program_id,
+                version_id: &version1.version_id,
+                input_json: "{}",
+            })
+            .expect("instance creates");
+        let instance_id = instance.instance_id.as_str();
+        store
+            .commit_rule(RuleCommit {
+                instance_id,
+                rule: "start",
+                trigger_event_id: None,
+                facts: &[],
+                consumed_fact_ids: &[],
+                effects: &[test_effect("tell", "agent.tell", "rule=start;effect=tell")],
+                dependencies: &[],
+                terminal: None,
+                idempotency_key: Some("commit-start"),
+                marks: &[],
+                context_json: None,
+            })
+            .expect("rule commit succeeds");
+        store
+            .deny_effect_admission(instance_id, "tell", "mcp:acme", "pin drifted for `acme`")
+            .expect("denial recorded");
+        let effect = |store: &SqliteStore| {
+            store
+                .list_effects(instance_id)
+                .expect("effects list")
+                .into_iter()
+                .find(|e| e.effect_id == "tell")
+                .expect("tell effect")
+        };
+        assert_eq!(effect(&store).status, "blocked_by_admission");
+
+        store
+            .activate_revision(RevisionActivation {
+                instance_id,
+                from_version_id: &version1.version_id,
+                to_version_id: &version2.version_id,
+                activation_policy_json: "{}",
+                cancellation_policy: "cancel_queued",
+                rule_carries_json: "[]",
+                rule_correspondence_json: "null",
+                idempotency_key: Some("revise-cancel"),
+            })
+            .expect("revision activates");
+
+        let recorded: String = store
+            .connection
+            .query_row(
+                "SELECT json_extract(payload_json, '$.status') FROM events \
+                 WHERE instance_id = ?1 AND event_type = 'effect.terminal' \
+                 AND json_extract(payload_json, '$.effect_id') = 'tell'",
+                params![instance_id],
+                |row| row.get(0),
+            )
+            .expect("the revision appended a terminal event for the denied effect");
+        assert_eq!(recorded, "cancelled");
+        let forward = effect(&store);
+        assert_eq!(
+            forward.status, recorded,
+            "the projection and the log must agree on the effect's status"
+        );
+
+        // The fold reaches the same status the forward path wrote, so a
+        // rebuild no longer flips a row the forward path had left behind.
+        store
+            .rebuild_projections(instance_id)
+            .expect("projections rebuild");
+        assert_eq!(effect(&store).status, forward.status);
+    }
+
     /// A stale completion used to be refused inside a transaction that then
     /// rolled back, so the refusal left nothing: no event, no row, one line on
     /// the worker's stderr. It is recorded now, outside that transaction, as
@@ -16322,6 +16418,74 @@ mod tests {
         assert_eq!(events_linked, 1, "a linked diagnostic is not an orphan");
     }
 
+    /// Re-attesting the same (from, to) pair again is the same durable
+    /// statement, not a second one: the event is idempotency-keyed on the
+    /// pair, and the append must honour the key the way the DO twin does. A
+    /// rebuild folds `instance.created` and nothing folds the re-attestation,
+    /// so the projection reverts to the recorded version and the next open
+    /// re-attests the identical pair -- which used to trip the events UNIQUE
+    /// index and fail the open.
+    #[test]
+    fn reattesting_the_same_pair_again_is_one_event_and_no_error() {
+        let mut store = SqliteStore::open_in_memory().expect("store opens");
+        let recorded = store
+            .create_program_version(test_program_version("Reattest", "source-1", "ir-1"))
+            .expect("recorded program version creates");
+        let instance = store
+            .create_instance(NewInstance {
+                program_id: &recorded.program_id,
+                version_id: &recorded.version_id,
+                input_json: "{}",
+            })
+            .expect("instance creates");
+        let instance_id = instance.instance_id.as_str();
+        let reattested = store
+            .reattest_instance_program(
+                instance_id,
+                test_program_version("Reattest", "source-1", "ir-2"),
+            )
+            .expect("the moved toolchain re-attests");
+        assert_ne!(reattested.version_id, recorded.version_id);
+
+        store
+            .rebuild_projections(instance_id)
+            .expect("projections rebuild");
+        let version_after = |store: &SqliteStore| -> String {
+            store
+                .connection
+                .query_row(
+                    "SELECT version_id FROM instances WHERE instance_id = ?1",
+                    params![instance_id],
+                    |row| row.get(0),
+                )
+                .expect("instance row")
+        };
+        assert_eq!(
+            version_after(&store),
+            recorded.version_id,
+            "the rebuild folds the instance back to its recorded version"
+        );
+
+        let again = store
+            .reattest_instance_program(
+                instance_id,
+                test_program_version("Reattest", "source-1", "ir-2"),
+            )
+            .expect("re-attesting the same pair again is the same durable statement");
+        assert_eq!(again.version_id, reattested.version_id);
+        assert_eq!(version_after(&store), reattested.version_id);
+        let reattestations: i64 = store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE instance_id = ?1 \
+                 AND event_type = 'instance.program.reattested'",
+                params![instance_id],
+                |row| row.get(0),
+            )
+            .expect("event count");
+        assert_eq!(reattestations, 1, "one pair, one event");
+    }
+
     #[test]
     fn replay_reconstructs_facts_effects_and_dependencies_from_events() {
         let mut store = SqliteStore::open_in_memory().expect("store opens");
@@ -16397,6 +16561,55 @@ mod tests {
                 && fact.name == "derived"
                 && fact.value_json.contains(r#""ok":true"#)
         }));
+    }
+
+    /// A `within <duration>` clause is the effect's `timeout_seconds` column,
+    /// and every deadline reader keys on that column. The forward INSERT wrote
+    /// it, but the `rule.committed` payload never carried it and the fold put
+    /// `None` back -- so after any rebuild a pending effect's relative deadline
+    /// was gone: it never timed out and no `times out` arm could fire. The
+    /// log records every column the INSERT wrote (DR-0094), so a rebuild
+    /// reproduces the deadline.
+    #[test]
+    fn a_rebuild_keeps_a_pending_effects_relative_deadline() {
+        let mut store = SqliteStore::open_in_memory().expect("store opens");
+        let effects = [NewEffect {
+            timeout_seconds: Some(60),
+            input_json: "{}",
+            ..test_effect("wait", "timer.wait", "rule=start;effect=wait")
+        }];
+        store
+            .commit_rule(RuleCommit {
+                instance_id: "instance-a",
+                rule: "start",
+                trigger_event_id: None,
+                facts: &[],
+                consumed_fact_ids: &[],
+                effects: &effects,
+                dependencies: &[],
+                terminal: None,
+                idempotency_key: Some("commit-start"),
+                marks: &[],
+                context_json: None,
+            })
+            .expect("rule commit succeeds");
+        let pending = store
+            .pending_time_effects("instance-a")
+            .expect("pending timers load");
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].timeout_seconds, 60);
+
+        store
+            .rebuild_projections("instance-a")
+            .expect("projections rebuild");
+
+        assert_eq!(
+            store
+                .pending_time_effects("instance-a")
+                .expect("pending timers reload"),
+            pending,
+            "the rebuilt effect keeps the relative deadline the forward path wrote"
+        );
     }
 
     #[test]
@@ -16919,6 +17132,149 @@ mod tests {
                 "instance {instance}: upstream `{upstream_status}` should{} release the `timed_out` downstream",
                 if expect_claimable { "" } else { " not" }
             );
+        }
+    }
+
+    /// `fails` is the `Failed<E>` tag (spec/effects-and-capabilities.md): a
+    /// `fails` dependency is satisfied by a failed upstream and by nothing
+    /// else. `claimable_effects` already said so, but the release UPDATE,
+    /// `start_run`'s admission check and the due-timer guard still read a
+    /// timed-out upstream as a failure -- so a timeout released the failure
+    /// handler, and `start_run` admitted it.
+    #[test]
+    fn fails_dependency_releases_on_failure_not_on_timeout() {
+        for (instance, upstream_status, expect_released) in [
+            ("fd-failed", "failed", true),
+            ("fd-timedout", "timed_out", false),
+        ] {
+            let mut store = SqliteStore::open_in_memory().expect("store opens");
+            let effects = [
+                test_effect("up", "agent.tell", "rule=start;effect=up"),
+                NewEffect {
+                    status: "blocked_by_dependency",
+                    ..test_effect("down", "agent.tell", "rule=start;effect=down")
+                },
+                NewEffect {
+                    status: "blocked_by_dependency",
+                    timeout_seconds: Some(1),
+                    input_json: "{}",
+                    ..test_effect("wait", "timer.wait", "rule=start;effect=wait")
+                },
+            ];
+            let dependencies = [
+                NewEffectDependency {
+                    dependency_id: "dep-up-down",
+                    upstream_effect_id: "up",
+                    downstream_effect_id: "down",
+                    predicate: "fails",
+                },
+                NewEffectDependency {
+                    dependency_id: "dep-up-wait",
+                    upstream_effect_id: "up",
+                    downstream_effect_id: "wait",
+                    predicate: "fails",
+                },
+            ];
+            store
+                .commit_rule(RuleCommit {
+                    instance_id: instance,
+                    rule: "start",
+                    trigger_event_id: None,
+                    facts: &[],
+                    consumed_fact_ids: &[],
+                    effects: &effects,
+                    dependencies: &dependencies,
+                    terminal: None,
+                    idempotency_key: Some("commit-start"),
+                    marks: &[],
+                    context_json: None,
+                })
+                .expect("rule commit succeeds");
+            store
+                .start_run(RunStart {
+                    instance_id: instance,
+                    effect_id: "up",
+                    run_id: "run-up",
+                    provider: "test",
+                    worker_id: "worker-1",
+                    lease_id: "lease-up",
+                    lease_expires_at: "2030-01-01T00:00:00Z",
+                    metadata_json: "{}",
+                })
+                .expect("upstream run starts");
+            if upstream_status == "timed_out" {
+                store
+                    .expire_effect(instance, "up", Some("expire-up"))
+                    .expect("upstream times out");
+            } else {
+                store
+                    .complete_effect(EffectCompletion {
+                        instance_id: instance,
+                        effect_id: "up",
+                        run_id: "run-up",
+                        provider: "test",
+                        worker_id: "worker-1",
+                        status: upstream_status,
+                        exit_code: None,
+                        summary: None,
+                        metadata_json: "{}",
+                        idempotency_key: Some("complete-up"),
+                    })
+                    .expect("upstream fails");
+            }
+            // The terminal itself already ran the release pass; running it
+            // again must reach the same answer.
+            store
+                .satisfy_dependencies(instance)
+                .expect("dependencies evaluate");
+            let expected_status = if expect_released {
+                "queued"
+            } else {
+                "blocked_by_dependency"
+            };
+            for downstream in ["down", "wait"] {
+                let status = store
+                    .list_effects(instance)
+                    .expect("effects list")
+                    .into_iter()
+                    .find(|effect| effect.effect_id == downstream)
+                    .expect("downstream effect")
+                    .status;
+                assert_eq!(
+                    status, expected_status,
+                    "instance {instance}: upstream `{upstream_status}` should{} release `{downstream}`",
+                    if expect_released { "" } else { " not" }
+                );
+            }
+            let due = store
+                .due_time_effects(instance, "2100-01-01T00:00:00Z")
+                .expect("due timers load");
+            assert_eq!(
+                due.iter().any(|effect| effect.effect_id == "wait"),
+                expect_released,
+                "instance {instance}: the `fails`-gated timer is due only once its upstream failed"
+            );
+            let started = store.start_run(RunStart {
+                instance_id: instance,
+                effect_id: "down",
+                run_id: "run-down",
+                provider: "test",
+                worker_id: "worker-1",
+                lease_id: "lease-down",
+                lease_expires_at: "2030-01-01T00:00:00Z",
+                metadata_json: "{}",
+            });
+            if expect_released {
+                started.expect("the failure handler starts after a failure");
+            } else {
+                match started {
+                    Err(StoreError::Conflict(message)) => assert!(
+                        message.contains("dependencies are not satisfied"),
+                        "unexpected conflict: {message}"
+                    ),
+                    other => panic!("a timeout must not admit the `fails` handler: {other:?}"),
+                }
+            }
         }
     }
 
@@ -19137,17 +19493,22 @@ mod tests {
                 .expect("the instance row reads back")
         };
 
-        // Every status the table could name, filtered by what it actually
-        // admits from `running`. `completed` is deliberately in the candidate
-        // set and is NOT admitted here -- an instance completes through the
-        // workflow-terminal door, not through a transition.
-        let admitted: Vec<&str> = ["paused", "cancelled", "failed", "completed", "blocked"]
-            .into_iter()
-            .filter(|next| instance_transition_allowed("running", next))
+        // Every transition the table admits from `running`, read from the
+        // table itself. `completed` is NOT among them -- an instance completes
+        // through the workflow-terminal door, not through a transition -- and
+        // the table is what says so.
+        let admitted: Vec<&str> = INSTANCE_TRANSITIONS
+            .iter()
+            .filter(|(current, _)| *current == "running")
+            .map(|(_, next)| *next)
             .collect();
         assert!(
             admitted.contains(&"failed"),
             "`running` -> `failed` is the flow auto-fail path and must be covered"
+        );
+        assert!(
+            !instance_transition_allowed("running", "completed"),
+            "completion is a workflow terminal, not a transition"
         );
 
         for next in admitted {

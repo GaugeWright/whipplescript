@@ -1971,7 +1971,7 @@ fn drive_to_idle(
             &crate::WorkerOptions {
                 instance_id: instance_id.to_owned(),
                 provider: provider.to_owned(),
-                exec_profile: crate::ExecProfile::from_env(),
+                exec_profile: crate::ExecProfile::from_env()?,
                 script_manifest_path: None,
                 package_lock_path: None,
                 outcome: crate::FixtureOutcome::default(),
@@ -3512,6 +3512,22 @@ fn run_improve(options: &CliOptions) -> Result<ExitCode, String> {
                 .to_owned(),
         );
     }
+    // Validate the ascend targets before any store access: a typo is not a
+    // campaign, and must not mint a C-id. A resumed campaign carries no
+    // inline targets (refused at parse time); its recorded gauges are
+    // pinned by the baseline-hash guard below.
+    for (name, _) in &args.spec.ascend {
+        if !specs.iter().any(|spec| &spec.name == name) {
+            return Err(format!(
+                "unknown gauge `{name}` (declared gauges: {})",
+                specs
+                    .iter()
+                    .map(|spec| spec.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+    }
     let baseline_hash = program_hash(&source);
     let mut store = open_improve_store()?;
     let scenarios = store
@@ -3580,18 +3596,6 @@ fn run_improve(options: &CliOptions) -> Result<ExitCode, String> {
                 .map_err(|error| format!("failed to open campaign: {error:?}"))?;
             (campaign_id, 0, args.spec.clone(), args.proposer.clone())
         };
-    for (name, _) in &campaign_spec.ascend {
-        if !specs.iter().any(|spec| &spec.name == name) {
-            return Err(format!(
-                "unknown gauge `{name}` (declared gauges: {})",
-                specs
-                    .iter()
-                    .map(|spec| spec.name.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ));
-        }
-    }
     let (open, sealed, sealing_engaged) = seal_scenarios(&campaign_id, &scenarios);
     let unheld_out = !sealing_engaged;
     contain_side_stores();

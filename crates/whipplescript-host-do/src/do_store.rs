@@ -20,8 +20,14 @@
 //! `insert_effect_cancellation_request`) live as inherent methods.
 //!
 //! The DO runs the *same* SQL the native `SqliteStore` does; the DO's single-writer
-//! per-invocation model provides the atomicity the native path gets from a rusqlite
-//! transaction (the store methods never yield mid-sequence). What remains before
+//! per-invocation model provides the CONCURRENCY atomicity the native path gets
+//! from a rusqlite transaction (the store methods never yield mid-sequence). It
+//! does not by itself provide ROLLBACK: a statement that lands stays landed when
+//! a later one refuses. A path that wants the native transaction's all-or-nothing
+//! has to say so -- `recovery::atomic_result` over `DoSql::atomic`, as the
+//! completion family does -- and a path that does not take that boundary must ask
+//! a guard's question BEFORE the append it would otherwise have to undo
+//! (`expire_effect`, `cancel_effect`). What remains before
 //! the Phase-5 store box closes is *live-DO* validation: a `DoSql` impl over the
 //! real `state.storage.sql` in the `worker` crate, exercised end-to-end against an
 //! actual Durable Object. The Rust side is complete and green (native tests +
@@ -423,19 +429,15 @@ impl<Sql: DoSql> DoSqliteStore<Sql> {
         // the re-drive re-parks with the same past due, and the alarm busy-loops
         // (billed, zero progress) until the dependency resolves. This is the same
         // guard `due_time_effects` applies (do_store.rs:6613); keep them in step.
-        let dependency_guard = "( e.kind != 'timer.wait' OR NOT EXISTS ( \
+        let dependency_guard = format!(
+            "( e.kind != 'timer.wait' OR NOT EXISTS ( \
              SELECT 1 FROM effect_dependencies AS dependency \
              JOIN effects AS upstream ON upstream.effect_id = dependency.upstream_effect_id \
               AND upstream.instance_id = dependency.instance_id \
              WHERE dependency.instance_id = e.instance_id \
-               AND dependency.downstream_effect_id = e.effect_id AND NOT ( \
-                 (dependency.predicate = 'succeeds' AND upstream.status = 'completed') \
-                 OR (dependency.predicate = 'fails' AND upstream.status IN ('failed', 'timed_out')) \
-                 OR (dependency.predicate = 'timed_out' AND upstream.status = 'timed_out') \
-                 OR (dependency.predicate = 'cancelled' AND upstream.status = 'cancelled') \
-                 OR (dependency.predicate = 'completes' AND upstream.status IN ('completed', 'failed', 'timed_out', 'cancelled')) \
-               ) \
-           ) )";
+               AND dependency.downstream_effect_id = e.effect_id AND NOT {DEPENDENCY_SATISFIED} \
+           ) )"
+        );
         let query = format!(
             "SELECT MIN(due_epoch) FROM ( \
                SELECT (CAST(strftime('%s', e.created_at) AS INTEGER) + e.timeout_seconds) \
@@ -1170,10 +1172,9 @@ fn do_revision_policy_effects<Sql: DoSql>(
     running: bool,
 ) -> StoreResult<Vec<String>> {
     let predicate = if running {
-        "status = 'running'"
+        "status = 'running'".to_owned()
     } else {
-        "status IN ('queued', 'blocked', 'blocked_by_dependency', 'blocked_by_capacity', \
-         'blocked_by_capability', 'blocked_by_profile')"
+        format!("status IN {PENDING_EFFECT_STATUSES}")
     };
     let rows = sql
         .query(
@@ -2166,7 +2167,8 @@ fn do_instance_dependency_edges<Sql: DoSql>(
 fn do_satisfy_dependencies<Sql: DoSql>(sql: &Sql, instance_id: &str) -> StoreResult<usize> {
     let updated = sql
         .execute(
-            "UPDATE effects SET status = 'queued', updated_at = CURRENT_TIMESTAMP \
+            &format!(
+                "UPDATE effects SET status = 'queued', updated_at = CURRENT_TIMESTAMP \
              WHERE instance_id = ?1 AND status = 'blocked_by_dependency' \
              AND effect_id IN ( \
                SELECT candidate.effect_id FROM effects AS candidate \
@@ -2175,15 +2177,10 @@ fn do_satisfy_dependencies<Sql: DoSql>(sql: &Sql, instance_id: &str) -> StoreRes
                  JOIN effects AS upstream ON upstream.effect_id = dependency.upstream_effect_id \
                   AND upstream.instance_id = dependency.instance_id \
                  WHERE dependency.instance_id = candidate.instance_id \
-                   AND dependency.downstream_effect_id = candidate.effect_id AND NOT ( \
-                     (dependency.predicate = 'succeeds' AND upstream.status = 'completed') \
-                     OR (dependency.predicate = 'fails' AND upstream.status IN ('failed', 'timed_out')) \
-                     OR (dependency.predicate = 'timed_out' AND upstream.status = 'timed_out') \
-                     OR (dependency.predicate = 'cancelled' AND upstream.status = 'cancelled') \
-                     OR (dependency.predicate = 'completes' AND upstream.status IN ('completed', 'failed', 'timed_out', 'cancelled')) \
-                   ) \
+                   AND dependency.downstream_effect_id = candidate.effect_id AND NOT {DEPENDENCY_SATISFIED} \
                ) \
-             )",
+             )"
+            ),
             &[text(instance_id)],
         )
         .map_err(sql_err)?;
@@ -2294,6 +2291,8 @@ fn do_replay_rule_commit<Sql: DoSql>(
             .and_then(Value::as_i64)
             .unwrap_or(commit_revision_epoch);
         let new_effect = NewEffect {
+            // Events written before the payload carried the deadline fold to
+            // None, exactly as they did.
             timeout_seconds: effect.get("timeout_seconds").and_then(Value::as_i64),
             effect_id: effect
                 .get("effect_id")
@@ -2921,6 +2920,10 @@ fn rule_commit_payload(
                 "required_capabilities": serde_json::from_str::<Value>(effect.required_capabilities_json)?,
                 "profile": effect.profile,
                 "correlation_id": effect.correlation_id,
+                // The relative deadline (`within <duration>`) is a column the
+                // INSERT writes and every deadline reader keys on; the log
+                // carries it so a rebuild reproduces it (DR-0094).
+                "timeout_seconds": effect.timeout_seconds,
                 "source_span": effect.source_span_json
                     .map(serde_json::from_str::<Value>)
                     .transpose()?
@@ -3514,10 +3517,12 @@ fn do_persist_policy_block<Sql: DoSql>(
 ) -> StoreResult<()> {
     let changed = sql
         .execute(
-            "UPDATE effects SET status = ?1, policy_block_reason = ?2, \
-             updated_at = CURRENT_TIMESTAMP WHERE instance_id = ?3 AND effect_id = ?4 \
-             AND (status != ?1 OR policy_block_reason IS NOT ?2) \
-             AND status IN ('queued', 'blocked', 'blocked_by_dependency', 'blocked_by_capacity', 'blocked_by_capability', 'blocked_by_profile')",
+            &format!(
+                "UPDATE effects SET status = ?1, policy_block_reason = ?2, \
+                 updated_at = CURRENT_TIMESTAMP WHERE instance_id = ?3 AND effect_id = ?4 \
+                 AND (status != ?1 OR policy_block_reason IS NOT ?2) \
+                 AND status IN {PENDING_EFFECT_STATUSES}"
+            ),
             &[
                 text(block.status),
                 text(&block.reason),
@@ -4051,11 +4056,12 @@ impl<Sql: DoSql> DoSqliteStore<Sql> {
         )?;
         self.sql
             .execute(
-                "UPDATE effects SET status = ?1, policy_block_reason = ?2, \
-                 policy_block_category = ?3, updated_at = CURRENT_TIMESTAMP \
-                 WHERE instance_id = ?4 AND effect_id = ?5 \
-                 AND status IN ('queued', 'blocked', 'blocked_by_admission', \
-                                'blocked_by_dependency', 'blocked_by_capacity')",
+                &format!(
+                    "UPDATE effects SET status = ?1, policy_block_reason = ?2, \
+                     policy_block_category = ?3, updated_at = CURRENT_TIMESTAMP \
+                     WHERE instance_id = ?4 AND effect_id = ?5 \
+                     AND status IN {PENDING_EFFECT_STATUSES}"
+                ),
                 &[
                     text(status),
                     text(detail),
@@ -4802,10 +4808,11 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
             )?;
             self.sql
                 .execute(
-                    "UPDATE effects SET status = 'cancelled', updated_at = CURRENT_TIMESTAMP \
-                     WHERE instance_id = ?1 AND effect_id = ?2 AND status IN ('queued', 'blocked', \
-                     'blocked_by_dependency', 'blocked_by_capacity', 'blocked_by_capability', \
-                     'blocked_by_profile')",
+                    &format!(
+                        "UPDATE effects SET status = 'cancelled', updated_at = CURRENT_TIMESTAMP \
+                         WHERE instance_id = ?1 AND effect_id = ?2 \
+                         AND status IN {PENDING_EFFECT_STATUSES}"
+                    ),
                     &[text(activation.instance_id), text(effect_id)],
                 )
                 .map_err(sql_err)?;
@@ -5318,37 +5325,33 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
         let rows = self
             .sql
             .query(
-                "SELECT candidate.effect_id, candidate.kind, candidate.target, candidate.profile, \
-                 candidate.input_json, candidate.required_capabilities, \
-                 COALESCE(effect_versions.declared_profiles, active_versions.declared_profiles, '[]'), \
-                 candidate.created_by_event_id, candidate.status \
-                 FROM effects AS candidate \
-                 LEFT JOIN instances ON instances.instance_id = candidate.instance_id \
-                 LEFT JOIN program_versions AS active_versions \
-                 ON active_versions.version_id = instances.version_id \
-                 LEFT JOIN program_versions AS effect_versions \
-                 ON effect_versions.version_id = candidate.program_version_id \
-                 WHERE candidate.instance_id = ?1 AND candidate.kind != 'timer.wait' \
-                 AND ( \
-                   candidate.status IN ('queued', 'blocked', 'blocked_by_admission', 'blocked_by_dependency', 'blocked_by_capacity', 'blocked_by_capability', 'blocked_by_profile') \
-                   OR candidate.status = 'running' \
-                 ) AND NOT EXISTS ( \
-                   SELECT 1 FROM effect_cancellation_requests AS request \
-                   WHERE request.instance_id = candidate.instance_id \
-                     AND request.effect_id = candidate.effect_id AND request.status = 'requested' \
-                 ) AND NOT EXISTS ( \
-                   SELECT 1 FROM effect_dependencies AS dependency \
-                   JOIN effects AS upstream ON upstream.effect_id = dependency.upstream_effect_id \
-                    AND upstream.instance_id = dependency.instance_id \
-                   WHERE dependency.instance_id = candidate.instance_id \
-                     AND dependency.downstream_effect_id = candidate.effect_id AND NOT ( \
-                       (dependency.predicate = 'succeeds' AND upstream.status = 'completed') \
-                       OR (dependency.predicate = 'fails' AND upstream.status IN ('failed', 'timed_out')) \
-                       OR (dependency.predicate = 'timed_out' AND upstream.status = 'timed_out') \
-                       OR (dependency.predicate = 'cancelled' AND upstream.status = 'cancelled') \
-                       OR (dependency.predicate = 'completes' AND upstream.status IN ('completed', 'failed', 'timed_out', 'cancelled')) \
-                     ) \
-                 ) ORDER BY candidate.created_at, candidate.effect_id",
+                &format!(
+                    "SELECT candidate.effect_id, candidate.kind, candidate.target, candidate.profile, \
+                     candidate.input_json, candidate.required_capabilities, \
+                     COALESCE(effect_versions.declared_profiles, active_versions.declared_profiles, '[]'), \
+                     candidate.created_by_event_id, candidate.status \
+                     FROM effects AS candidate \
+                     LEFT JOIN instances ON instances.instance_id = candidate.instance_id \
+                     LEFT JOIN program_versions AS active_versions \
+                     ON active_versions.version_id = instances.version_id \
+                     LEFT JOIN program_versions AS effect_versions \
+                     ON effect_versions.version_id = candidate.program_version_id \
+                     WHERE candidate.instance_id = ?1 AND candidate.kind != 'timer.wait' \
+                     AND ( \
+                       candidate.status IN {PENDING_EFFECT_STATUSES} \
+                       OR candidate.status = 'running' \
+                     ) AND NOT EXISTS ( \
+                       SELECT 1 FROM effect_cancellation_requests AS request \
+                       WHERE request.instance_id = candidate.instance_id \
+                         AND request.effect_id = candidate.effect_id AND request.status = 'requested' \
+                     ) AND NOT EXISTS ( \
+                       SELECT 1 FROM effect_dependencies AS dependency \
+                       JOIN effects AS upstream ON upstream.effect_id = dependency.upstream_effect_id \
+                        AND upstream.instance_id = dependency.instance_id \
+                       WHERE dependency.instance_id = candidate.instance_id \
+                         AND dependency.downstream_effect_id = candidate.effect_id AND NOT {DEPENDENCY_SATISFIED} \
+                     ) ORDER BY candidate.created_at, candidate.effect_id"
+                ),
                 &[text(instance_id)],
             )
             .map_err(sql_err)?;
@@ -6909,7 +6912,8 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
         let rows = self
             .sql
             .query(
-                "SELECT candidate.effect_id, candidate.kind, candidate.status, \
+                &format!(
+                    "SELECT candidate.effect_id, candidate.kind, candidate.status, \
                  COALESCE(candidate.timeout_seconds, 0) FROM effects AS candidate \
                  WHERE candidate.instance_id = ?1 \
                  AND candidate.status NOT IN ('completed', 'failed', 'timed_out', 'cancelled') \
@@ -6927,15 +6931,10 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
                      JOIN effects AS upstream ON upstream.effect_id = dependency.upstream_effect_id \
                       AND upstream.instance_id = dependency.instance_id \
                      WHERE dependency.instance_id = candidate.instance_id \
-                       AND dependency.downstream_effect_id = candidate.effect_id AND NOT ( \
-                         (dependency.predicate = 'succeeds' AND upstream.status = 'completed') \
-                         OR (dependency.predicate = 'fails' AND upstream.status IN ('failed', 'timed_out')) \
-                         OR (dependency.predicate = 'timed_out' AND upstream.status = 'timed_out') \
-                         OR (dependency.predicate = 'cancelled' AND upstream.status = 'cancelled') \
-                         OR (dependency.predicate = 'completes' AND upstream.status IN ('completed', 'failed', 'timed_out', 'cancelled')) \
-                       ) \
+                       AND dependency.downstream_effect_id = candidate.effect_id AND NOT {DEPENDENCY_SATISFIED} \
                    ) \
-                 ) ORDER BY candidate.created_at, candidate.effect_id",
+                 ) ORDER BY candidate.created_at, candidate.effect_id"
+                ),
                 &[text(instance_id), text(now)],
             )
             .map_err(sql_err)?;
@@ -7020,6 +7019,22 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
             "reason": "deadline exceeded",
         })
         .to_string();
+        // No rollback on the DO (see the module doc): a stale expiry of an
+        // already-terminal effect is refused below, and used to leave its
+        // `effect.terminal{timed_out}` behind for the rebuild to replay. Ask
+        // the UPDATE's own question before appending.
+        let expirable = !self
+            .sql
+            .query(
+                "SELECT 1 FROM effects WHERE instance_id = ?1 AND effect_id = ?2 \
+                 AND status NOT IN ('completed', 'failed', 'timed_out', 'cancelled')",
+                &[text(instance_id), text(effect_id)],
+            )
+            .map_err(sql_err)?
+            .is_empty();
+        if !expirable {
+            return Err(StoreError::Conflict("effect cannot expire".to_owned()));
+        }
         let event = do_append_event(
             &self.sql,
             NewEvent {
@@ -7077,6 +7092,24 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
             "reason": cancellation.reason,
         })
         .to_string();
+        // No rollback on the DO (see the module doc): a cancel of an
+        // already-terminal effect is refused below, and used to leave its
+        // `effect.terminal{cancelled}` behind for the rebuild to replay. Ask
+        // the UPDATE's own question before appending.
+        let cancellable = !self
+            .sql
+            .query(
+                "SELECT 1 FROM effects WHERE instance_id = ?1 AND effect_id = ?2 \
+                 AND status NOT IN ('completed', 'failed', 'timed_out', 'cancelled')",
+                &[text(cancellation.instance_id), text(cancellation.effect_id)],
+            )
+            .map_err(sql_err)?
+            .is_empty();
+        if !cancellable {
+            return Err(StoreError::Conflict(
+                "effect cannot be cancelled".to_owned(),
+            ));
+        }
         let event = do_append_event(
             &self.sql,
             NewEvent {
@@ -7243,19 +7276,28 @@ fn do_content_id(sql: &impl DoSql, alias: &str) -> StoreResult<Option<String>> {
 }
 
 /// The issue's current head event ids — events nothing lists as a parent.
+/// Mirrors `tx_issue_heads`: one indexed read, the frontier folded in Rust by
+/// the shared `dag_frontier`, and no ORDER BY for the same reason.
 fn do_issue_heads(sql: &impl DoSql, content_id: &str) -> StoreResult<Vec<String>> {
     let rows = sql
         .query(
-            "SELECT e.event_id FROM tracker_events e \
-             WHERE e.issue_id = ?1 AND e.event_id IS NOT NULL \
-               AND NOT EXISTS ( \
-                 SELECT 1 FROM tracker_events c \
-                 WHERE c.issue_id = ?1 \
-                   AND instr(c.parents_json, '\"' || e.event_id || '\"') > 0)",
+            "SELECT event_id, parents_json FROM tracker_events \
+             WHERE issue_id = ?1 AND event_id IS NOT NULL",
             &[text(content_id)],
         )
         .map_err(sql_err)?;
-    Ok(rows.iter().map(|row| as_text(&row[0])).collect())
+    let events: Vec<(String, Vec<String>)> = rows
+        .iter()
+        .map(|row| {
+            let parents: Vec<String> = serde_json::from_str(&as_text(&row[1])).unwrap_or_default();
+            (as_text(&row[0]), parents)
+        })
+        .collect();
+    Ok(whipplescript_store::items::dag_frontier(
+        events
+            .iter()
+            .map(|(id, parents)| (id.as_str(), parents.as_slice())),
+    ))
 }
 
 /// Append one immutable content-addressed tracker event (INSERT only), keyed by
@@ -8875,6 +8917,22 @@ fn do_fold_tracker_event(
                 .map_err(sql_err)?;
             }
         }
+        "issue.assigned" => {
+            // `assigned_to: null` is the clearing assignment, so the column is
+            // set from the payload unconditionally; `str_of` yields `None` for
+            // JSON null, matching the native store's live write.
+            if let Some(issue) = issue_id {
+                sql.execute(
+                    "UPDATE tracker_issues SET assigned_to = ?2, updated_at = ?3 WHERE issue_id = ?1",
+                    &[
+                        text(issue),
+                        opt_text(str_of("assigned_to").as_deref()),
+                        text(created_at),
+                    ],
+                )
+                .map_err(sql_err)?;
+            }
+        }
         "relation.added" => {
             if let (Some(from), Some(to)) = (alias_for(str_of("from")), alias_for(str_of("to"))) {
                 sql.execute(
@@ -10134,7 +10192,12 @@ impl<Sql: DoSql> DoSqliteStore<Sql> {
                 "reason": block.reason,
             })
             .to_string();
-            do_append_event(
+            // Idempotent, as native and the capacity branch below: run ids are
+            // deterministic per effect, so a still-blocked effect re-enters
+            // here with the same key on every worker pass -- the same durable
+            // statement, not a second event and not a duplicate-key Conflict
+            // standing in for the policy refusal.
+            do_append_event_idempotent(
                 &self.sql,
                 NewEvent {
                     instance_id: run.instance_id,
@@ -10151,9 +10214,11 @@ impl<Sql: DoSql> DoSqliteStore<Sql> {
             )?;
             self.sql
                 .execute(
-                    "UPDATE effects SET status = ?1, policy_block_reason = ?2, \
-                     updated_at = CURRENT_TIMESTAMP WHERE instance_id = ?3 AND effect_id = ?4 \
-                     AND status IN ('queued', 'blocked', 'blocked_by_admission', 'blocked_by_dependency', 'blocked_by_capacity', 'blocked_by_capability', 'blocked_by_profile')",
+                    &format!(
+                        "UPDATE effects SET status = ?1, policy_block_reason = ?2, \
+                         updated_at = CURRENT_TIMESTAMP WHERE instance_id = ?3 AND effect_id = ?4 \
+                         AND status IN {PENDING_EFFECT_STATUSES}"
+                    ),
                     &[
                         text(block.status),
                         text(&block.reason),
@@ -10171,17 +10236,13 @@ impl<Sql: DoSql> DoSqliteStore<Sql> {
         let claimable_rows = self
             .sql
             .query(
-                "SELECT NOT EXISTS (SELECT 1 FROM effect_dependencies AS dependency \
+                &format!(
+                    "SELECT NOT EXISTS (SELECT 1 FROM effect_dependencies AS dependency \
                  JOIN effects AS upstream ON upstream.effect_id = dependency.upstream_effect_id \
                   AND upstream.instance_id = dependency.instance_id \
                  WHERE dependency.instance_id = ?1 AND dependency.downstream_effect_id = ?2 \
-                 AND NOT ( \
-                   (dependency.predicate = 'succeeds' AND upstream.status = 'completed') \
-                   OR (dependency.predicate = 'fails' AND upstream.status IN ('failed', 'timed_out')) \
-                   OR (dependency.predicate = 'timed_out' AND upstream.status = 'timed_out') \
-                   OR (dependency.predicate = 'cancelled' AND upstream.status = 'cancelled') \
-                   OR (dependency.predicate = 'completes' AND upstream.status IN ('completed', 'failed', 'timed_out', 'cancelled')) \
-                 ))",
+                 AND NOT {DEPENDENCY_SATISFIED})"
+                ),
                 &[text(run.instance_id), text(run.effect_id)],
             )
             .map_err(sql_err)?;
@@ -10234,9 +10295,11 @@ impl<Sql: DoSql> DoSqliteStore<Sql> {
             )?;
             self.sql
                 .execute(
-                    "UPDATE effects SET status = 'blocked_by_capacity', policy_block_reason = ?1, \
-                     updated_at = CURRENT_TIMESTAMP WHERE instance_id = ?2 AND effect_id = ?3 \
-                     AND status IN ('queued', 'blocked', 'blocked_by_admission', 'blocked_by_dependency', 'blocked_by_capacity')",
+                    &format!(
+                        "UPDATE effects SET status = 'blocked_by_capacity', policy_block_reason = ?1, \
+                         updated_at = CURRENT_TIMESTAMP WHERE instance_id = ?2 AND effect_id = ?3 \
+                         AND status IN {PENDING_EFFECT_STATUSES}"
+                    ),
                     &[text(&reason), text(run.instance_id), text(run.effect_id)],
                 )
                 .map_err(sql_err)?;
@@ -10265,10 +10328,12 @@ impl<Sql: DoSql> DoSqliteStore<Sql> {
         let changed = self
             .sql
             .execute(
-                "UPDATE effects SET status = 'running', policy_block_reason = NULL, \
-                 policy_block_category = NULL, updated_at = CURRENT_TIMESTAMP \
-                 WHERE instance_id = ?1 AND effect_id = ?2 \
-                 AND status IN ('queued', 'blocked', 'blocked_by_admission', 'blocked_by_dependency', 'blocked_by_capacity', 'blocked_by_capability', 'blocked_by_profile')",
+                &format!(
+                    "UPDATE effects SET status = 'running', policy_block_reason = NULL, \
+                     policy_block_category = NULL, updated_at = CURRENT_TIMESTAMP \
+                     WHERE instance_id = ?1 AND effect_id = ?2 \
+                     AND status IN {PENDING_EFFECT_STATUSES}"
+                ),
                 &[text(run.instance_id), text(run.effect_id)],
             )
             .map_err(sql_err)?;
@@ -11158,6 +11223,94 @@ pub(crate) mod tests {
                 .iter()
                 .any(|unit| unit["cut"] == "cut_do_f5" && unit["actor"] == "s:editor"),
             "{witness:?}"
+        );
+    }
+
+    /// The DO never writes `issue.assigned` itself (its `assign_item` is the
+    /// trait no-op), so assignment reaches a DO only by transport — and every
+    /// import rebuilds the projection from the log. An `issue.assigned` a
+    /// native clone exported therefore has to fold on the DO, and a clearing
+    /// one (`null`) has to fold too, or a synced issue reads as "anyone".
+    #[test]
+    fn do_import_folds_issue_assigned_into_the_projection() {
+        use whipplescript_store::items::{event_content_id, TrackerEvent, WorkItems};
+
+        let mut store = store();
+        let issue = WorkItems::file_item(
+            &mut store,
+            "q",
+            "owned",
+            "",
+            &[],
+            &serde_json::json!({}),
+            Some("s:a"),
+            None,
+        )
+        .expect("file");
+        let content_id = WorkItems::subject_content_id(&store, &issue.id)
+            .expect("content id")
+            .expect("known");
+
+        let assign_payload = serde_json::json!({ "assigned_to": "alice" }).to_string();
+        let assigned_at = "2026-08-31 00:00:10".to_owned();
+        let assign_id = event_content_id(
+            "issue.assigned",
+            Some(&content_id),
+            &assign_payload,
+            Some("s:a"),
+            std::slice::from_ref(&content_id),
+            &assigned_at,
+        );
+        let report = store
+            .import_events(&[TrackerEvent {
+                event_id: assign_id.clone(),
+                parents: vec![content_id.clone()],
+                issue_id: Some(content_id.clone()),
+                kind: "issue.assigned".to_owned(),
+                payload_json: assign_payload,
+                actor: Some("s:a".to_owned()),
+                created_at: assigned_at,
+            }])
+            .expect("import");
+        assert_eq!(report.rejected, 0);
+        assert_eq!(
+            WorkItems::get_item(&store, &issue.id)
+                .expect("get")
+                .expect("present")
+                .assigned_to,
+            Some("alice".to_owned()),
+            "a transported assignment folds into the DO projection"
+        );
+
+        let clear_payload = serde_json::json!({ "assigned_to": null }).to_string();
+        let cleared_at = "2026-08-31 00:00:20".to_owned();
+        let clear_id = event_content_id(
+            "issue.assigned",
+            Some(&content_id),
+            &clear_payload,
+            Some("s:a"),
+            std::slice::from_ref(&assign_id),
+            &cleared_at,
+        );
+        let report = store
+            .import_events(&[TrackerEvent {
+                event_id: clear_id,
+                parents: vec![assign_id],
+                issue_id: Some(content_id),
+                kind: "issue.assigned".to_owned(),
+                payload_json: clear_payload,
+                actor: Some("s:a".to_owned()),
+                created_at: cleared_at,
+            }])
+            .expect("import");
+        assert_eq!(report.rejected, 0);
+        assert_eq!(
+            WorkItems::get_item(&store, &issue.id)
+                .expect("get")
+                .expect("present")
+                .assigned_to,
+            None,
+            "a transported clearing assignment folds too"
         );
     }
 
@@ -13414,6 +13567,174 @@ pub(crate) mod tests {
         );
     }
 
+    /// `fails` is the `Failed<E>` tag: a `fails` dependency is satisfied by a
+    /// failed upstream and by nothing else. Every DO dependency clause -- the
+    /// release UPDATE, the claimable listing, `start_run`'s admission, the
+    /// due-timer guard and the alarm scheduler -- read a timed-out upstream as
+    /// a failure, so a timeout released and ran the failure handler. Real SQL.
+    #[test]
+    fn do_store_fails_dependency_releases_on_failure_not_on_timeout() {
+        for (upstream_status, expect_released) in [("failed", true), ("timed_out", false)] {
+            let mut store = store();
+            for (sql, params) in [
+                (
+                    "INSERT INTO programs (program_id, name) VALUES (?1, ?2)",
+                    vec![text("prog_1"), text("orders")],
+                ),
+                (
+                    "INSERT INTO program_versions (version_id, program_id, declared_profiles) \
+                     VALUES (?1, ?2, ?3)",
+                    vec![text("ver_1"), text("prog_1"), text("[]")],
+                ),
+                (
+                    "INSERT INTO instances (instance_id, program_id, version_id, \
+                     workflow_principal, effective_authority, status, input_json) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    vec![
+                        text("i1"),
+                        text("prog_1"),
+                        text("ver_1"),
+                        text("root"),
+                        text("{}"),
+                        text("running"),
+                        text("{}"),
+                    ],
+                ),
+                (
+                    "INSERT INTO effect_providers (provider_id, effect_kind, provider, \
+                     capability, config_json) VALUES (?1, ?2, ?3, ?4, ?5)",
+                    vec![
+                        text("p_demo"),
+                        text("builtin.demo"),
+                        text("builtin"),
+                        text("builtin.demo"),
+                        text("{}"),
+                    ],
+                ),
+                (
+                    "INSERT INTO capability_schemas (capability, description, schema_json) \
+                     VALUES (?1, ?2, ?3)",
+                    vec![text("builtin.demo"), text(""), text("{}")],
+                ),
+                (
+                    "INSERT INTO capability_bindings (binding_id, program_id, capability, \
+                     provider, config_json) VALUES (?1, ?2, ?3, ?4, ?5)",
+                    vec![
+                        text("b_demo"),
+                        SqlValue::Null,
+                        text("builtin.demo"),
+                        text("builtin"),
+                        text("{}"),
+                    ],
+                ),
+                (
+                    "INSERT INTO effects (effect_id, instance_id, kind, status, input_json) \
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    vec![
+                        text("up"),
+                        text("i1"),
+                        text("builtin.demo"),
+                        text(upstream_status),
+                        text("{}"),
+                    ],
+                ),
+                (
+                    "INSERT INTO effects (effect_id, instance_id, kind, status, input_json) \
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    vec![
+                        text("down"),
+                        text("i1"),
+                        text("builtin.demo"),
+                        text("blocked_by_dependency"),
+                        text("{}"),
+                    ],
+                ),
+                (
+                    "INSERT INTO effects (effect_id, instance_id, kind, status, input_json, \
+                     timeout_seconds, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    vec![
+                        text("wait"),
+                        text("i1"),
+                        text("timer.wait"),
+                        text("blocked_by_dependency"),
+                        text("{}"),
+                        int(30),
+                        text("2026-01-01T00:00:00Z"),
+                    ],
+                ),
+                (
+                    "INSERT INTO effect_dependencies (instance_id, downstream_effect_id, \
+                     upstream_effect_id, predicate) VALUES (?1, ?2, ?3, ?4)",
+                    vec![text("i1"), text("down"), text("up"), text("fails")],
+                ),
+                (
+                    "INSERT INTO effect_dependencies (instance_id, downstream_effect_id, \
+                     upstream_effect_id, predicate) VALUES (?1, ?2, ?3, ?4)",
+                    vec![text("i1"), text("wait"), text("up"), text("fails")],
+                ),
+            ] {
+                store.sql.execute(sql, &params).expect(sql);
+            }
+            let should = if expect_released { "" } else { " not" };
+
+            // The listing, the timer guard and the alarm scheduler read the
+            // edge before anything is released.
+            assert_eq!(
+                store
+                    .claimable_effects("i1")
+                    .expect("claimable listing")
+                    .iter()
+                    .any(|effect| effect.effect_id == "down"),
+                expect_released,
+                "upstream `{upstream_status}` should{should} make the `fails` handler claimable"
+            );
+            assert_eq!(
+                store
+                    .due_time_effects("i1", "2026-01-01T00:05:00Z")
+                    .expect("due timers")
+                    .iter()
+                    .any(|effect| effect.effect_id == "wait"),
+                expect_released,
+                "upstream `{upstream_status}` should{should} make the `fails`-gated timer due"
+            );
+            assert_eq!(
+                store
+                    .next_effect_due_epoch_ms("i1")
+                    .expect("next due")
+                    .is_some(),
+                expect_released,
+                "upstream `{upstream_status}` should{should} schedule the `fails`-gated timer"
+            );
+
+            assert_eq!(
+                store.satisfy_dependencies("i1").expect("satisfy"),
+                if expect_released { 2 } else { 0 },
+                "upstream `{upstream_status}` should{should} release the `fails` downstreams"
+            );
+            let started = store.start_run(RunStart {
+                instance_id: "i1",
+                effect_id: "down",
+                run_id: "run_down",
+                provider: "builtin",
+                worker_id: "w1",
+                lease_id: "lse_down",
+                lease_expires_at: "2026-01-01T01:00:00Z",
+                metadata_json: "{}",
+            });
+            if expect_released {
+                started.expect("the failure handler starts after a failure");
+            } else {
+                match started {
+                    Err(StoreError::Conflict(message)) => assert!(
+                        message.contains("dependencies are not satisfied"),
+                        "unexpected conflict: {message}"
+                    ),
+                    other => panic!("a timeout must not admit the `fails` handler: {other:?}"),
+                }
+            }
+        }
+    }
+
     /// The event-plus-update lifecycle methods (transition_instance,
     /// block_effect_binding, expire_effect) run
     /// their real event-append + update SQL and enforce their guards.
@@ -15053,6 +15374,94 @@ pub(crate) mod tests {
             .is_err());
     }
 
+    /// A revision that cancels pending effects cancels an admission-denied one
+    /// too: the selector, the cancel UPDATE and every other pending-status
+    /// clause read the store's one `PENDING_EFFECT_STATUSES`, so the log's
+    /// `effect.terminal` and the row cannot disagree about which effects the
+    /// revision cancelled. Real SQL.
+    #[test]
+    fn do_store_activate_revision_cancels_an_admission_denied_effect() {
+        let mut store = store();
+        let summary = r#"{"workflow":"main","workflow_contracts":[],"schemas":[]}"#;
+        for (sql, params) in [
+            (
+                "INSERT INTO programs (program_id, name) VALUES (?1, ?2)",
+                vec![text("prog_1"), text("orders")],
+            ),
+            (
+                "INSERT INTO program_versions (version_id, program_id, source_hash, analysis_summary) \
+                 VALUES (?1, ?2, ?3, ?4)",
+                vec![text("ver_a"), text("prog_1"), text("sh_a"), text(summary)],
+            ),
+            (
+                "INSERT INTO program_versions (version_id, program_id, source_hash, analysis_summary) \
+                 VALUES (?1, ?2, ?3, ?4)",
+                vec![text("ver_b"), text("prog_1"), text("sh_b"), text(summary)],
+            ),
+            (
+                "INSERT INTO instances (instance_id, program_id, version_id, revision_epoch, \
+                 workflow_principal, effective_authority, status, input_json) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                vec![text("i1"), text("prog_1"), text("ver_a"), int(0), text("root"), text("{}"), text("running"), text("{}")],
+            ),
+            (
+                "INSERT INTO effects (effect_id, instance_id, kind, status, input_json) \
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                vec![text("eff_denied"), text("i1"), text("agent.tell"), text("queued"), text("{}")],
+            ),
+        ] {
+            store.sql.execute(sql, &params).expect("seed");
+        }
+        store
+            .deny_effect_admission("i1", "eff_denied", "mcp:acme", "pin drifted for `acme`")
+            .expect("denial recorded");
+        let status = |store: &DoSqliteStore<super::test_support::RusqliteDoSql>| {
+            let rows = store
+                .sql
+                .query(
+                    "SELECT status FROM effects WHERE effect_id = ?1",
+                    &[text("eff_denied")],
+                )
+                .expect("read");
+            as_text(&rows[0][0])
+        };
+        assert_eq!(status(&store), "blocked_by_admission");
+
+        store
+            .activate_revision(RevisionActivation {
+                instance_id: "i1",
+                from_version_id: "ver_a",
+                to_version_id: "ver_b",
+                activation_policy_json: "{}",
+                cancellation_policy: "cancel_queued",
+                rule_carries_json: "[]",
+                rule_correspondence_json: "null",
+                idempotency_key: Some("act-1"),
+            })
+            .expect("activate");
+
+        let recorded = store
+            .sql
+            .query(
+                "SELECT json_extract(payload_json, '$.status') FROM events \
+                 WHERE instance_id = ?1 AND event_type = 'effect.terminal' \
+                 AND json_extract(payload_json, '$.effect_id') = 'eff_denied'",
+                &[text("i1")],
+            )
+            .expect("terminal events");
+        assert_eq!(
+            recorded.len(),
+            1,
+            "the revision cancelled the denied effect in the log"
+        );
+        assert_eq!(as_text(&recorded[0][0]), "cancelled");
+        assert_eq!(
+            status(&store),
+            "cancelled",
+            "the projection and the log must agree on the effect's status"
+        );
+    }
+
     /// rebuild_projections deletes the projection tables and reconstructs them by
     /// replaying the event log: a corrupted fact/effect is restored, and a
     /// run-started + terminal pair rebuilds the run in its completed state.
@@ -15272,6 +15681,74 @@ pub(crate) mod tests {
                 scanned.map(|run| run.cancel_requested),
             );
         }
+    }
+
+    /// The `rule.committed` payload carries the effect's `timeout_seconds`
+    /// and the fold writes it back, so a rebuild keeps a pending effect's
+    /// relative deadline instead of silently dropping every `within` clause.
+    /// Real SQL; mirrors the native `a_rebuild_keeps_a_pending_effects_relative_deadline`.
+    #[test]
+    fn do_store_rebuild_keeps_a_pending_effects_relative_deadline() {
+        let mut store = store();
+        store
+            .sql
+            .execute(
+                "INSERT INTO instances (instance_id, program_id, version_id, revision_epoch, \
+                 workflow_principal, effective_authority, status, input_json) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                &[
+                    text("i1"),
+                    text("p"),
+                    text("ver_1"),
+                    int(0),
+                    text("root"),
+                    text("{}"),
+                    text("running"),
+                    text("{}"),
+                ],
+            )
+            .expect("seed instance");
+        let effects = [NewEffect {
+            effect_id: "wait",
+            kind: "timer.wait",
+            target: None,
+            input_json: "{}",
+            status: "queued",
+            idempotency_key: "e-wait",
+            required_capabilities_json: "[]",
+            profile: None,
+            correlation_id: None,
+            source_span_json: None,
+            timeout_seconds: Some(60),
+        }];
+        store
+            .commit_rule(RuleCommit {
+                instance_id: "i1",
+                rule: "start",
+                trigger_event_id: None,
+                facts: &[],
+                consumed_fact_ids: &[],
+                effects: &effects,
+                dependencies: &[],
+                terminal: None,
+                idempotency_key: Some("c1"),
+                marks: &[],
+                context_json: None,
+            })
+            .expect("commit");
+        let pending = store.pending_time_effects("i1").expect("pending timers");
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].timeout_seconds, 60);
+
+        store.rebuild_projections("i1").expect("rebuild");
+
+        assert_eq!(
+            store
+                .pending_time_effects("i1")
+                .expect("pending timers reload"),
+            pending,
+            "the rebuilt effect keeps the relative deadline the forward path wrote"
+        );
     }
 
     /// RC-2 Delta A (DO mirror): rebuild_projections_to reflects instance state
@@ -15912,6 +16389,320 @@ pub(crate) mod tests {
         assert!(
             effect_exists(&store, "eff_c"),
             "C (post-restore) stays live"
+        );
+    }
+
+    /// A store holding one effect (`eff_1`) whose run (`run_1`) has COMPLETED
+    /// through the live path: instance, committed rule, started run, terminal
+    /// completion. The fixture every refused-transition test below starts from.
+    fn store_with_completed_effect() -> DoSqliteStore<test_support::RusqliteDoSql> {
+        let mut store = store();
+        store
+            .sql
+            .execute(
+                "INSERT INTO instances (instance_id, program_id, version_id, revision_epoch, \
+                 workflow_principal, effective_authority, status, input_json) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                &[
+                    text("i1"),
+                    text("p"),
+                    text("ver_1"),
+                    int(0),
+                    text("root"),
+                    text("{}"),
+                    text("running"),
+                    text("{}"),
+                ],
+            )
+            .expect("seed instance");
+        let effects = [NewEffect {
+            effect_id: "eff_1",
+            kind: "tracker.push",
+            target: None,
+            input_json: "{}",
+            status: "queued",
+            idempotency_key: "e1",
+            required_capabilities_json: "[]",
+            profile: None,
+            correlation_id: None,
+            source_span_json: None,
+            timeout_seconds: None,
+        }];
+        store
+            .commit_rule(RuleCommit {
+                instance_id: "i1",
+                rule: "r.a",
+                trigger_event_id: None,
+                facts: &[],
+                consumed_fact_ids: &[],
+                effects: &effects,
+                dependencies: &[],
+                terminal: None,
+                idempotency_key: Some("c1"),
+                marks: &[],
+                context_json: None,
+            })
+            .expect("commit");
+        store
+            .start_run(RunStart {
+                instance_id: "i1",
+                effect_id: "eff_1",
+                run_id: "run_1",
+                provider: "builtin",
+                worker_id: "w1",
+                lease_id: "lse_1",
+                lease_expires_at: "2026-01-01T01:00:00Z",
+                metadata_json: "{}",
+            })
+            .expect("start");
+        // The accepting case: the FIRST terminal transition lands.
+        store
+            .complete_effect(EffectCompletion {
+                instance_id: "i1",
+                effect_id: "eff_1",
+                run_id: "run_1",
+                provider: "builtin",
+                worker_id: "w1",
+                status: "completed",
+                exit_code: Some(0),
+                summary: None,
+                metadata_json: "{}",
+                idempotency_key: Some("done"),
+            })
+            .expect("the first completion lands");
+        store
+    }
+
+    /// The `effect.terminal` events in `i1`'s log, oldest first, as their
+    /// payload `status`.
+    fn terminal_statuses(store: &DoSqliteStore<test_support::RusqliteDoSql>) -> Vec<String> {
+        store
+            .list_events("i1")
+            .expect("events")
+            .iter()
+            .filter(|event| event.event_type == "effect.terminal")
+            .map(|event| {
+                let payload: Value = serde_json::from_str(&event.payload_json).expect("payload");
+                payload["status"].as_str().expect("status").to_owned()
+            })
+            .collect()
+    }
+
+    fn status_of(
+        store: &DoSqliteStore<test_support::RusqliteDoSql>,
+        table: &str,
+        id: &str,
+    ) -> String {
+        let column = match table {
+            "runs" => "run_id",
+            _ => "effect_id",
+        };
+        let rows = store
+            .sql
+            .query(
+                &format!("SELECT status FROM {table} WHERE {column} = ?1"),
+                &[text(id)],
+            )
+            .expect(table);
+        as_text(&rows[0][0])
+    }
+
+    /// A refused terminal completion leaves no `effect.terminal` for the
+    /// rebuild to replay.
+    ///
+    /// Native runs the append and the guarded run UPDATE inside one rusqlite
+    /// transaction, so a refusal drops the event with the transaction. The DO
+    /// once appended first and refused second with nothing to undo it: a late
+    /// completion was correctly refused to the caller and still left an orphan
+    /// `effect.terminal` in the log, which `do_replay_effect_terminal` applies
+    /// with no status guard. The next `rebuild_projections` -- every
+    /// `commit_restore` -- then took the transition the live path had refused,
+    /// and a `succeeds` dependency downstream saw a status the run never had.
+    ///
+    /// `complete_effect_terminal_inner` now runs its body under
+    /// `recovery::atomic_result`, which rolls the append back on any refusal,
+    /// so this is the regression test for THAT boundary rather than for a
+    /// pre-append guard: inline the body past `atomic_result` and the log
+    /// carries `["completed", "failed", "completed"]` here. Its expiry and
+    /// cancel siblings below take no such boundary and guard instead.
+    #[test]
+    fn a_refused_late_completion_leaves_no_terminal_event_to_replay() {
+        let mut store = store_with_completed_effect();
+
+        let late = store.complete_effect(EffectCompletion {
+            instance_id: "i1",
+            effect_id: "eff_1",
+            run_id: "run_1",
+            provider: "builtin",
+            worker_id: "w1",
+            status: "failed",
+            exit_code: Some(1),
+            summary: Some("late failure"),
+            metadata_json: "{}",
+            idempotency_key: Some("late-failure"),
+        });
+        match late {
+            Err(StoreError::Conflict(message)) => assert!(
+                message.contains("already has a terminal completion"),
+                "a second terminal is refused as such: {message}"
+            ),
+            other => panic!("expected a Conflict for a second terminal, got {other:?}"),
+        }
+        // A run that never started is refused as not running, and just as
+        // silently in the log.
+        let never_started = store.complete_effect(EffectCompletion {
+            instance_id: "i1",
+            effect_id: "eff_1",
+            run_id: "run_never",
+            provider: "builtin",
+            worker_id: "w1",
+            status: "completed",
+            exit_code: Some(0),
+            summary: None,
+            metadata_json: "{}",
+            idempotency_key: Some("never-started"),
+        });
+        match never_started {
+            Err(StoreError::Conflict(message)) => assert!(
+                message.contains("is not running"),
+                "an unknown run is refused as not running: {message}"
+            ),
+            other => panic!("expected a Conflict for an unknown run, got {other:?}"),
+        }
+
+        assert_eq!(
+            terminal_statuses(&store),
+            vec!["completed".to_owned()],
+            "a refused completion leaves nothing behind in the log"
+        );
+        store.rebuild_projections("i1").expect("rebuild");
+        assert_eq!(status_of(&store, "effects", "eff_1"), "completed");
+        assert_eq!(status_of(&store, "runs", "run_1"), "completed");
+    }
+
+    /// Same defect, `expire_effect`: a stale expiry of an already-terminal
+    /// effect is refused, and must not leave `effect.terminal{timed_out}` for
+    /// the rebuild to flip the effect with.
+    #[test]
+    fn a_refused_stale_expiry_leaves_no_terminal_event_to_replay() {
+        let mut store = store_with_completed_effect();
+
+        match store.expire_effect("i1", "eff_1", Some("stale-expire")) {
+            Err(StoreError::Conflict(message)) => assert!(
+                message.contains("cannot expire"),
+                "an already-terminal effect cannot expire: {message}"
+            ),
+            other => panic!("expected a Conflict for a stale expiry, got {other:?}"),
+        }
+
+        assert_eq!(terminal_statuses(&store), vec!["completed".to_owned()]);
+        store.rebuild_projections("i1").expect("rebuild");
+        assert_eq!(status_of(&store, "effects", "eff_1"), "completed");
+    }
+
+    /// Same defect, `cancel_effect`: a cancel of an already-terminal effect is
+    /// refused, and must not leave `effect.terminal{cancelled}` behind.
+    #[test]
+    fn a_refused_cancel_of_a_terminal_effect_leaves_no_event_to_replay() {
+        let mut store = store_with_completed_effect();
+
+        match store.cancel_effect(EffectCancellation {
+            instance_id: "i1",
+            effect_id: "eff_1",
+            reason: Some("operator"),
+            idempotency_key: Some("late-cancel"),
+        }) {
+            Err(StoreError::Conflict(message)) => assert!(
+                message.contains("cannot be cancelled"),
+                "an already-terminal effect cannot be cancelled: {message}"
+            ),
+            other => panic!("expected a Conflict for a late cancel, got {other:?}"),
+        }
+
+        assert_eq!(terminal_statuses(&store), vec!["completed".to_owned()]);
+        store.rebuild_projections("i1").expect("rebuild");
+        assert_eq!(status_of(&store, "effects", "eff_1"), "completed");
+    }
+
+    /// A policy block is the same durable statement on every worker pass.
+    ///
+    /// Run ids are deterministic per effect (`idempotency_key(&[instance,
+    /// effect, "event-run"])` and its file/timer siblings), so a still-blocked
+    /// effect re-enters `start_run` with the SAME `policy-block:{effect}:{run}`
+    /// key each pass. Native appends that event idempotently, and so does the
+    /// DO's own capacity branch a few lines down; the DO's policy branch
+    /// appended plainly, so the first pass answered `PolicyBlocked` and every
+    /// later one answered `Conflict("duplicate event idempotency key ...")` --
+    /// a retryable-race error for a policy refusal, which the kernel does not
+    /// trace as a block.
+    #[test]
+    fn a_policy_block_is_reported_the_same_way_on_every_pass() {
+        let mut store = store();
+        let seed = |sql: &str, params: &[SqlValue]| store.sql.execute(sql, params).expect(sql);
+        seed(
+            "INSERT INTO programs (program_id, name) VALUES (?1, ?2)",
+            &[text("prog_1"), text("orders")],
+        );
+        seed(
+            "INSERT INTO program_versions (version_id, program_id, declared_profiles) \
+             VALUES (?1, ?2, ?3)",
+            &[text("ver_1"), text("prog_1"), text("[]")],
+        );
+        seed(
+            "INSERT INTO instances (instance_id, program_id, version_id, workflow_principal, \
+             effective_authority, status, input_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            &[
+                text("i1"),
+                text("prog_1"),
+                text("ver_1"),
+                text("root"),
+                text("{}"),
+                text("running"),
+                text("{}"),
+            ],
+        );
+        // A provider effect with no registered provider: policy-blocked.
+        seed(
+            "INSERT INTO effects (effect_id, instance_id, kind, status, input_json, \
+             required_capabilities) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            &[
+                text("eff_p"),
+                text("i1"),
+                text("schema.coerce"),
+                text("queued"),
+                text("{}"),
+                text("[]"),
+            ],
+        );
+        let run = RunStart {
+            instance_id: "i1",
+            effect_id: "eff_p",
+            run_id: "run_p",
+            provider: "x",
+            worker_id: "w1",
+            lease_id: "lse_p",
+            lease_expires_at: "2026-01-01T01:00:00Z",
+            metadata_json: "{}",
+        };
+
+        for pass in 1..=2 {
+            match store.start_run(run) {
+                Err(StoreError::PolicyBlocked { effect_id, .. }) => {
+                    assert_eq!(effect_id, "eff_p", "pass {pass}")
+                }
+                other => panic!("pass {pass}: expected PolicyBlocked, got {other:?}"),
+            }
+        }
+        let blocked: Vec<_> = store
+            .list_events("i1")
+            .expect("events")
+            .into_iter()
+            .filter(|event| event.event_type == "effect.blocked")
+            .collect();
+        assert_eq!(
+            blocked.len(),
+            1,
+            "one block, one durable statement of it: {blocked:?}"
         );
     }
 }

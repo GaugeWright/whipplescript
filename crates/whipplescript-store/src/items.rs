@@ -2430,18 +2430,29 @@ pub fn event_content_id(
 /// multiple heads arise. `None` (no prior event) roots the issue's history.
 #[cfg(feature = "native")]
 fn tx_issue_heads(tx: &Transaction<'_>, issue_id: &str) -> StoreResult<Vec<String>> {
-    let heads: Vec<String> = tx
+    // One indexed read of the issue's events, the frontier folded in Rust
+    // (`dag_frontier`). This replaced a correlated `NOT EXISTS ... instr(...)`
+    // that string-scanned every event's `parents_json` against every event —
+    // quadratic in the issue's history, on every append. No ORDER BY, on
+    // purpose: the order heads come back in is the order an append records
+    // them in `parents_json`, and this is the same outer scan the correlated
+    // query performed, so the bytes a fork's next append writes are unchanged.
+    let events: Vec<(String, Vec<String>)> = tx
         .prepare(
-            "SELECT e.event_id FROM tracker_events e \
-             WHERE e.issue_id = ?1 AND e.event_id IS NOT NULL \
-               AND NOT EXISTS ( \
-                 SELECT 1 FROM tracker_events c \
-                 WHERE c.issue_id = ?1 \
-                   AND instr(c.parents_json, '\"' || e.event_id || '\"') > 0)",
+            "SELECT event_id, parents_json FROM tracker_events \
+             WHERE issue_id = ?1 AND event_id IS NOT NULL",
         )?
-        .query_map(params![issue_id], |row| row.get(0))?
+        .query_map(params![issue_id], |row| {
+            let parents: Vec<String> =
+                serde_json::from_str(&row.get::<_, String>(1)?).unwrap_or_default();
+            Ok((row.get(0)?, parents))
+        })?
         .collect::<Result<Vec<_>, _>>()?;
-    Ok(heads)
+    Ok(dag_frontier(
+        events
+            .iter()
+            .map(|(id, parents)| (id.as_str(), parents.as_slice())),
+    ))
 }
 
 /// Resolve a human `WS-N` alias to its opaque `content_id` merge identity.
@@ -2823,6 +2834,26 @@ fn load_issue_events(conn: &Connection, issue_id: &str) -> StoreResult<Vec<Issue
         .collect())
 }
 
+/// The frontier of an issue's event DAG — the events nothing lists as a parent
+/// — from one pass over `(event_id, parents)` pairs. These are the heads an
+/// append chains on and the analysis's `heads`; an event with no id is never
+/// one. Order follows the input; a caller that needs a canonical order sorts.
+/// Backend-agnostic, and O(n) is the point: the append path is the runtime's
+/// hot path (every `tracker.renew` heartbeat appends), and the native store,
+/// the DO store and the analysis all answer this one question here.
+pub fn dag_frontier<'a>(
+    events: impl Iterator<Item = (&'a str, &'a [String])> + Clone,
+) -> Vec<String> {
+    let claimed: std::collections::HashSet<&str> = events
+        .clone()
+        .flat_map(|(_, parents)| parents.iter().map(String::as_str))
+        .collect();
+    events
+        .filter(|(id, _)| !id.is_empty() && !claimed.contains(id))
+        .map(|(id, _)| id.to_owned())
+        .collect()
+}
+
 /// The DAG conflict analysis (ADR-0002 phase B1 slice ii, realizing
 /// `tracker-merge.maude`): compute the frontier (`heads`), a content `state_token`
 /// over it, and any field whose `bef`-maximal `issue.field_set` setters disagree.
@@ -2832,18 +2863,14 @@ fn load_issue_events(conn: &Connection, issue_id: &str) -> StoreResult<Vec<Issue
 /// maximal setter) never is, and agreeing forks converge. Backend-agnostic —
 /// the native and DO stores share this exact analysis (DO parity).
 pub fn analyze_issue_dag(events: &[IssueEvent]) -> IssueConflicts {
-    use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+    use std::collections::{BTreeMap, BTreeSet, HashMap};
 
     // Frontier: an event that nothing else lists as a parent.
-    let claimed: HashSet<&str> = events
-        .iter()
-        .flat_map(|e| e.parents.iter().map(String::as_str))
-        .collect();
-    let mut heads: Vec<String> = events
-        .iter()
-        .filter(|e| !e.event_id.is_empty() && !claimed.contains(e.event_id.as_str()))
-        .map(|e| e.event_id.clone())
-        .collect();
+    let mut heads = dag_frontier(
+        events
+            .iter()
+            .map(|e| (e.event_id.as_str(), e.parents.as_slice())),
+    );
     heads.sort();
     heads.dedup();
     let state_token = sha256_hex(&heads.join("\n"));
@@ -3062,6 +3089,18 @@ fn fold_event(
         "issue.closed" => fold_set_status(tx, issue_id, payload, "closed", created_at)?,
         "issue.canceled" => fold_set_status(tx, issue_id, payload, "canceled", created_at)?,
         "issue.reopened" => fold_set_status(tx, issue_id, payload, "open", created_at)?,
+        "issue.assigned" => {
+            // `assigned_to: null` is the clearing assignment, so the column is
+            // set from the payload unconditionally rather than only when a
+            // string is present — `str_of` yields `None` for JSON null, which
+            // is exactly what the live path in `assign_item` writes.
+            if let Some(id) = issue_id {
+                tx.execute(
+                    "UPDATE tracker_issues SET assigned_to = ?2, updated_at = ?3 WHERE issue_id = ?1",
+                    params![id, str_of("assigned_to"), created_at],
+                )?;
+            }
+        }
         "relation.added" => {
             // The payload references issues by opaque content_id; the projection
             // is alias-keyed. Skip the edge if either endpoint has no local alias
@@ -4784,6 +4823,120 @@ mod tests {
         assert_eq!(store.ready_items("q").unwrap().len(), 1);
     }
 
+    /// An issue's heads are the parents of every append, and appends are the
+    /// runtime's hot path: every `tracker.renew` heartbeat appends a
+    /// `claim.renewed`, and so does every claim, release, comment and edit.
+    /// The heads used to come from a correlated `NOT EXISTS ... instr(...)`
+    /// over `parents_json` — one string scan per (event, event) pair, so an
+    /// issue with a thousand events paid a million scans inside the Immediate
+    /// write transaction on each heartbeat. The frontier is now one indexed
+    /// read folded in Rust, so an append never string-scans the log at all,
+    /// which this proves by replacing SQLite's built-in `instr` with a
+    /// counting copy for the duration of one append.
+    #[test]
+    fn an_append_never_string_scans_the_issue_log_for_its_heads() {
+        use rusqlite::functions::FunctionFlags;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let mut store = open_memory();
+        let it = store
+            .file_item("q", "t", "", &[], &json!({}), None, None)
+            .expect("files");
+        for n in 0..32 {
+            store
+                .add_comment(&it.id, Some("w"), &format!("c{n}"))
+                .expect("comments");
+        }
+        let head = heads_of(&store, &it.id);
+        assert_eq!(head.len(), 1, "single-writer appends keep one head");
+
+        let scans = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&scans);
+        store
+            .connection
+            .create_scalar_function(
+                "instr",
+                2,
+                FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+                move |ctx| {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    let haystack: String = ctx.get(0)?;
+                    let needle: String = ctx.get(1)?;
+                    // SQLite's `instr`: 1-based character index, 0 when absent.
+                    Ok(haystack
+                        .find(&needle)
+                        .map_or(0i64, |at| haystack[..at].chars().count() as i64 + 1))
+                },
+            )
+            .expect("overrides instr");
+
+        store
+            .add_comment(&it.id, Some("w"), "one more")
+            .expect("appends");
+
+        assert_eq!(
+            scans.load(Ordering::SeqCst),
+            0,
+            "computing an append's parents string-scans no parents_json against any event"
+        );
+        let last = store
+            .export_events()
+            .expect("exports")
+            .pop()
+            .expect("appended");
+        assert_eq!(last.kind, "comment.added");
+        assert_eq!(last.parents, head, "the append still chains on the head");
+    }
+
+    /// The frontier an append chains on is every head, not the latest event:
+    /// after a merge forks an issue's history, the next ordinary append lists
+    /// both tips as parents, which is what lets a resolve collapse them.
+    #[test]
+    fn an_append_after_a_fork_chains_on_every_head() {
+        let mut store = open_memory();
+        let it = store
+            .file_item("q", "t", "", &[], &json!({}), None, None)
+            .expect("files");
+        let base = heads_of(&store, &it.id);
+        let left = insert_event(
+            &store,
+            &it.id,
+            "issue.field_set",
+            &json!({"field": "title", "value": "A"}),
+            &base,
+            "2020-01-01 00:00:01",
+        );
+        let right = insert_event(
+            &store,
+            &it.id,
+            "issue.field_set",
+            &json!({"field": "body", "value": "B"}),
+            &base,
+            "2020-01-01 00:00:02",
+        );
+
+        store
+            .add_comment(&it.id, Some("w"), "after the fork")
+            .expect("appends");
+
+        let last = store
+            .export_events()
+            .expect("exports")
+            .pop()
+            .expect("appended");
+        let mut parents = last.parents.clone();
+        parents.sort();
+        let mut tips = vec![left, right];
+        tips.sort();
+        assert_eq!(parents, tips, "both fork tips are the append's parents");
+        assert_eq!(
+            heads_of(&store, &it.id),
+            vec![last.event_id],
+            "the append is now the single head"
+        );
+    }
+
     /// A fork that sets DIFFERENT fields is not a conflict (soundness bite):
     /// each field has a single maximal setter.
     #[test]
@@ -5533,6 +5686,49 @@ mod tests {
         );
     }
 
+    /// The projection is disposable: `import_events` rebuilds it from the log
+    /// on every sync, so an assignment only the projection knew would read
+    /// back as "anyone" after the next `whip issue sync`. The `issue.assigned`
+    /// event has to fold, and a clearing assignment (`null`) has to fold too.
+    #[test]
+    fn assignment_survives_a_rebuild_from_events() {
+        let mut store = open_memory();
+        let assigned = store
+            .file_item("backlog", "a", "", &[], &json!({}), None, None)
+            .expect("files a");
+        let cleared = store
+            .file_item("backlog", "b", "", &[], &json!({}), None, None)
+            .expect("files b");
+        assert!(store
+            .assign_item(&assigned.id, Some("alice"))
+            .expect("assigns a"));
+        assert!(store
+            .assign_item(&cleared.id, Some("bob"))
+            .expect("assigns b"));
+        assert!(store.assign_item(&cleared.id, None).expect("clears b"));
+
+        store.rebuild_projection().expect("rebuilds");
+
+        assert_eq!(
+            store
+                .get_item(&assigned.id)
+                .expect("gets")
+                .unwrap()
+                .assigned_to,
+            Some("alice".to_owned()),
+            "the assignment is derived from the event log, not held only in the projection"
+        );
+        assert_eq!(
+            store
+                .get_item(&cleared.id)
+                .expect("gets")
+                .unwrap()
+                .assigned_to,
+            None,
+            "a cleared assignment stays cleared after the rebuild"
+        );
+    }
+
     /// Assignment is advisory: it says who *should* act and never restricts who
     /// *may* claim. Enforcing it here would require an authority model this
     /// crate deliberately does not have.
@@ -6221,6 +6417,7 @@ mod tests {
         store
             .finish_item(&b.id, Some("done"), None)
             .expect("finish b");
+        store.assign_item(&a.id, Some("alice")).expect("assign a");
 
         let before = store.dump_projection().expect("dump before");
         store.rebuild_projection().expect("rebuild");
@@ -6235,14 +6432,16 @@ mod tests {
         /// rebuild-determinism assertion.
         fn dump_projection(&self) -> StoreResult<String> {
             let mut out = String::new();
+            // Every issue column the live path writes: a column left out here
+            // is a column a rebuild may silently lose without this test noticing.
             let mut issues = self.connection.prepare(
                 "SELECT issue_id, queue, title, body, status, labels_json, metadata_json, \
-                 claim_summary, filed_by, created_at, updated_at FROM tracker_issues \
-                 ORDER BY issue_id",
+                 claim_summary, filed_by, created_at, updated_at, assigned_to, releases \
+                 FROM tracker_issues ORDER BY issue_id",
             )?;
             let rows = issues.query_map([], |row| {
                 Ok(format!(
-                    "I {:?} {:?} {:?} {:?} {:?} {:?} {:?} {:?} {:?} {:?} {:?}",
+                    "I {:?} {:?} {:?} {:?} {:?} {:?} {:?} {:?} {:?} {:?} {:?} {:?} {:?}",
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
                     row.get::<_, String>(2)?,
@@ -6254,6 +6453,8 @@ mod tests {
                     row.get::<_, Option<String>>(8)?,
                     row.get::<_, String>(9)?,
                     row.get::<_, String>(10)?,
+                    row.get::<_, Option<String>>(11)?,
+                    row.get::<_, i64>(12)?,
                 ))
             })?;
             for row in rows {

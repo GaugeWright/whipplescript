@@ -1879,3 +1879,122 @@ fn parallel_evaluation_pairs_scenarios_and_records_judge_spend() {
         "baseline judge spend recorded: {spend_whats:?} {detail}"
     );
 }
+
+#[test]
+fn a_crashed_campaign_reads_failed_and_is_not_resumable() {
+    // The evaluation closure's Err path appends `campaign.failed` so a
+    // crashed campaign never lingers `open`; the listing and the resume
+    // refusal must project that record, not contradict it.
+    let env = Env::new("crashed");
+    write_judges(&env.dir);
+    let program_path = env.dir.join("triage.whip");
+    fs::write(&program_path, program("low", "ticket.id", &env.dir)).expect("write program");
+    let program_str = program_path.to_string_lossy().into_owned();
+    dev_and_pin(&env, &program_str);
+
+    // A fixture proposal path that does not exist crashes the campaign
+    // after it opened and evaluated the baseline.
+    let missing = env.dir.join("no-such-proposal.whip");
+    let mut command = env.command();
+    command
+        .args([
+            "improve",
+            "priority_correct",
+            "--program",
+            &program_str,
+            "--proposer",
+            "fixture",
+        ])
+        .env(
+            "WHIPPLESCRIPT_IMPROVE_PROPOSALS",
+            missing.to_string_lossy().as_ref(),
+        );
+    let output = command.output().expect("spawn whip");
+    assert!(
+        !output.status.success(),
+        "a crashed campaign exits non-zero"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("fixture proposal"),
+        "the crash names its cause: {stderr}"
+    );
+
+    let campaigns = env.run_json(&["--json", "campaigns"], &[]);
+    let rows = campaigns["campaigns"].as_array().expect("campaigns");
+    assert_eq!(rows.len(), 1, "{campaigns}");
+    assert_eq!(
+        rows[0]["status"].as_str(),
+        Some("failed"),
+        "a crashed campaign reads `failed`, not `open`: {campaigns}"
+    );
+    let campaign_id = rows[0]["campaign"].as_str().expect("id").to_owned();
+
+    // A failed campaign is not parked; the refusal names the status.
+    let stderr = env.run_expect_failure(&["improve", "--resume", &campaign_id]);
+    assert!(
+        stderr.contains("not parked (status: failed)"),
+        "refusal names the folded status: {stderr}"
+    );
+}
+
+#[test]
+fn an_unknown_gauge_is_refused_before_a_campaign_is_minted() {
+    // The refusal must come before any store write: a typo in the gauge
+    // name is not a campaign, and must not mint a C-id that sits `open`
+    // with one event and no closing record.
+    let env = Env::new("unknown-gauge");
+    write_judges(&env.dir);
+    let program_path = env.dir.join("triage.whip");
+    fs::write(&program_path, program("low", "ticket.id", &env.dir)).expect("write program");
+    let program_str = program_path.to_string_lossy().into_owned();
+    dev_and_pin(&env, &program_str);
+
+    let stderr = env.run_expect_failure(&[
+        "improve",
+        "priority_corect",
+        "--program",
+        &program_str,
+        "--proposer",
+        "fixture",
+    ]);
+    assert!(
+        stderr.contains("unknown gauge `priority_corect`"),
+        "the refusal names the typo: {stderr}"
+    );
+    assert!(
+        stderr.contains("declared gauges: priority_correct, ticket_echoed"),
+        "the refusal lists what is declared: {stderr}"
+    );
+
+    let campaigns = env.run_json(&["--json", "campaigns"], &[]);
+    let rows = campaigns["campaigns"].as_array().expect("campaigns");
+    assert!(
+        rows.is_empty(),
+        "a refused gauge name mints no campaign: {campaigns}"
+    );
+
+    // The accepting side: the declared name opens a campaign as before.
+    let candidate_path = env.dir.join("candidate.whip");
+    fs::write(&candidate_path, program("high", "ticket.id", &env.dir)).expect("write candidate");
+    let report = env.run_json(
+        &[
+            "--json",
+            "improve",
+            "priority_correct",
+            "--program",
+            &program_str,
+            "--proposer",
+            "fixture",
+        ],
+        &[(
+            "WHIPPLESCRIPT_IMPROVE_PROPOSALS",
+            &candidate_path.to_string_lossy(),
+        )],
+    );
+    assert_eq!(
+        report["campaign"].as_str(),
+        Some("C-1"),
+        "the first accepted campaign takes the first id: {report}"
+    );
+}

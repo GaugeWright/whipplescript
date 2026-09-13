@@ -434,15 +434,15 @@ function testTrackerSchemaParity() {
     ).get("content-1").evidence_id,
     "evd-1",
   );
-  const heads = db.prepare(
-    "SELECT e.event_id FROM tracker_events e \
-     WHERE e.issue_id = ? AND e.event_id IS NOT NULL \
-       AND NOT EXISTS ( \
-         SELECT 1 FROM tracker_events c \
-         WHERE c.issue_id = ? \
-           AND instr(c.parents_json, '\"' || e.event_id || '\"') > 0)",
-  ).all("content-1", "content-1");
-  assert.strictEqual(heads.length, 1, "head query walks event_id/parents_json");
+  // The head read (do_store.rs do_issue_heads): one pass over the issue's
+  // event_id/parents_json, the frontier folded outside SQL.
+  const issueEvents = db.prepare(
+    "SELECT event_id, parents_json FROM tracker_events \
+     WHERE issue_id = ? AND event_id IS NOT NULL",
+  ).all("content-1");
+  const claimed = new Set(issueEvents.flatMap((e) => JSON.parse(e.parents_json)));
+  const heads = issueEvents.filter((e) => !claimed.has(e.event_id));
+  assert.strictEqual(heads.length, 1, "head read walks event_id/parents_json");
   assert.strictEqual(heads[0].event_id, "ev-root");
   console.log("PASS  fresh DO schema supports every production tracker table and column");
 }

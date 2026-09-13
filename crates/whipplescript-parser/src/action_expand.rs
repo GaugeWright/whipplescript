@@ -544,6 +544,93 @@ mod tests {
     }
 
     #[test]
+    fn expansion_preserves_non_ascii_prompt_text() {
+        // The renamer walked the prompt byte by byte and re-encoded each byte
+        // as its own char, so every accented letter, curly quote, and em dash
+        // in an inlined action's prompt reached the model as mojibake.
+        let source = format!(
+            "{PRELUDE}\naction run_task(who string) {{\n  tell who as turn \"Résumé — “done”\"\n}}\n\nrule route\n  when Ticket as ticket\n=> {{\n  run_task(reviewer)\n}}\n"
+        );
+        let body = route_body(&source);
+        assert!(
+            body.contains("Résumé — “done”"),
+            "prompt text must survive expansion byte for byte: {body}"
+        );
+    }
+
+    #[test]
+    fn a_parameter_named_like_a_field_leaves_the_field_segment_alone() {
+        // `summary` is both a parameter and a field of the internal `turn`
+        // binding. The renamer took the identifier after `.` for a word start,
+        // so `turn.summary` came back as `turn__act0."x"` and the field access
+        // was destroyed. A segment after `.` is a field position, never a
+        // reference — the guard canonical.rs's sibling renamer already had.
+        let source = format!(
+            "{PRELUDE}\naction wrap(who string, summary string) {{\n  tell who as turn \"go\"\n  after turn succeeds {{\n    record Note {{ provider turn.summary  status summary }}\n  }}\n}}\n\nrule route\n  when Ticket as ticket\n=> {{\n  wrap(reviewer, \"x\")\n}}\n"
+        );
+        let body = route_body(&source);
+        assert!(
+            body.contains("provider turn__act0.summary"),
+            "the field segment must survive substitution: {body}"
+        );
+        assert!(
+            body.contains("status \"x\""),
+            "the parameter in value position is substituted: {body}"
+        );
+    }
+
+    #[test]
+    fn prompt_prose_is_not_renamed_but_its_interpolations_are() {
+        // The printer handed the renamer prompt CONTENT with its quotes
+        // already stripped, so every whole word of prose was a reference to
+        // it: `Take a turn.` reached the model as `Take a turn__act0.` and
+        // `Use provider tools` as `Use "codex" tools`. Inside a prompt only a
+        // `{{ … }}` interpolation is a reference position (DR-0023).
+        let source = format!(
+            "{PRELUDE}\naction run_task(who string, provider string) {{\n  tell who as turn \"Take a turn. Use provider tools.\"\n  after turn succeeds {{\n    tell who as second \"Take a turn. Report {{{{ turn.summary }}}} via {{{{ provider }}}}.\"\n  }}\n}}\n\nrule route\n  when Ticket as ticket\n=> {{\n  run_task(reviewer, \"codex\")\n}}\n"
+        );
+        let body = route_body(&source);
+        assert!(
+            body.contains("Take a turn. Use provider tools."),
+            "prose that spells a binding or parameter must survive verbatim: {body}"
+        );
+        assert!(
+            body.contains("Take a turn. Report {{ turn__act0.summary }} via {{ \"codex\" }}."),
+            "interpolations are still renamed and substituted: {body}"
+        );
+    }
+
+    #[test]
+    fn a_package_verb_operand_is_substituted_like_every_other_reference() {
+        // `recall`'s query is an expression operand (DR-0023's substitution
+        // list), but the printer copied every package-verb slot verbatim, so
+        // a parameter in that position reached the checker unsubstituted and
+        // the expansion was refused for an unknown binding `issue`.
+        let source = format!(
+            "{PRELUDE}\nuse memory\n\nmemory pool project_memory {{\n  context limit 8\n}}\n\naction remember(issue string) {{\n  recall project_memory for issue as hits\n}}\n\nrule route\n  when Ticket as ticket\n=> {{\n  remember(\"login\")\n}}\n"
+        );
+        let body = route_body(&source);
+        assert!(
+            body.contains("recall project_memory for \"login\" as hits__act0"),
+            "the query operand is substituted and the binding uniquified: {body}"
+        );
+    }
+
+    #[test]
+    fn an_exec_stdin_binding_follows_its_hygiene_rename() {
+        // `exec <capability> with <binding>` names a binding the action
+        // itself introduces; hygiene renames the `as staged` alias in the
+        // AST, but the printer emitted `with staged` verbatim, so the
+        // expansion referenced a name the rule no longer binds.
+        let source = "@service\nworkflow ExecInAction\n\nclass Request { text string }\nclass Report { message string }\n\naction relay(who string) {\n  exec fetch_request with request -> Request as fetched\n  after fetched succeeds as staged {\n    exec echo_report with staged -> Report as report\n  }\n}\n\nagent reviewer { provider fixture  profile \"r\"  capacity 1 }\n\nrule route\n  when Request as request\n=> {\n  relay(reviewer)\n}\n";
+        let body = route_body(source);
+        assert!(
+            body.contains("exec echo_report with staged__act0 -> Report as report__act0"),
+            "the stdin binding must follow the alias it names: {body}"
+        );
+    }
+
+    #[test]
     fn call_nested_inside_an_after_block_expands_in_place() {
         // A call is not always a top-level statement; it can sit inside a
         // rule-body `after` block. Expansion is line-based and brace-agnostic, so

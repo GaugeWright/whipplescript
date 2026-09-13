@@ -445,7 +445,7 @@ fn queued_invoke_child(
     let options = WorkerOptions {
         instance_id: parent_instance_id.to_owned(),
         provider: "fixture".to_owned(),
-        exec_profile: ExecProfile::from_env(),
+        exec_profile: ExecProfile::from_env().expect("exec profile"),
         script_manifest_path: None,
         package_lock_path: None,
         outcome: FixtureOutcome::Completed,

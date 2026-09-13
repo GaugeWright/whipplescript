@@ -7668,6 +7668,14 @@ fn substitute_pattern_type(
             )),
             span,
         },
+        TypeSyntax::Sealed { inner, span } => TypeSyntax::Sealed {
+            inner: Box::new(substitute_pattern_type(
+                *inner,
+                type_substitutions,
+                local_names,
+            )),
+            span,
+        },
         TypeSyntax::Union { variants, span } => TypeSyntax::Union {
             variants: variants
                 .into_iter()
@@ -7675,7 +7683,12 @@ fn substitute_pattern_type(
                 .collect(),
             span,
         },
-        other => other,
+        // Nothing inside these names a schema, so nothing to substitute. Listed
+        // rather than wildcarded so the next constructor with a payload type
+        // cannot fall through unsubstituted the way `sealed<T>` did.
+        other @ (TypeSyntax::Primitive { .. }
+        | TypeSyntax::LiteralString { .. }
+        | TypeSyntax::Secret { .. }) => other,
     }
 }
 
@@ -15676,10 +15689,6 @@ fn workflow_target_for_body(kind: &body::BodyEffectKind) -> Option<String> {
     }
 }
 
-/// The `exec` surface form (raw command vs manifest capability), surfaced so
-/// check-time gates classify exec effects without re-scanning rule-body text.
-/// Walk every `request` in a rule body, including inside `after` blocks and
-/// `case` arms — an unauthenticated request nested in a branch is still one.
 /// DR-0053 §5 as amended. Three refusals, and each closes a way the exchange
 /// could quietly not mean what it says.
 fn validate_mint_credential(
@@ -15774,7 +15783,7 @@ fn validate_mint_credential(
 ///
 /// Walks every nesting form rather than only `after`, because a `seal` inside a
 /// `case` arm is as much a use as one at the top of a rule body — the sibling
-/// `validate_http_requests` walker predates `case` and reaches less.
+/// `validate_http_requests` walker reaches the same forms.
 fn validate_credential_allow(
     rule: &RuleDecl,
     statements: &[body::BodyStmt],
@@ -15889,6 +15898,12 @@ fn credential_uses(effect: &body::EffectStmt) -> Vec<(String, &'static str, Sour
     uses
 }
 
+/// Walk every `request`, `obtain` and `mint` in a rule body, including inside
+/// `after` blocks, `case` arms and `during`/`until` regions — an unauthenticated
+/// request nested in a branch is still one. The runtime does not backstop
+/// these: the custodian refuses only when the slot count the program told it
+/// disagrees with what it finds, so a request that names no credential leaves
+/// the process authenticating nothing.
 fn validate_http_requests(
     rule: &RuleDecl,
     statements: &[body::BodyStmt],
@@ -15906,7 +15921,22 @@ fn validate_http_requests(
             body::BodyStmt::After(after) => {
                 validate_http_requests(rule, &after.body, declared_credentials, diagnostics)
             }
-            _ => {}
+            body::BodyStmt::Case(case) => {
+                for branch in &case.branches {
+                    validate_http_requests(rule, &branch.body, declared_credentials, diagnostics);
+                }
+            }
+            body::BodyStmt::Region(region) => {
+                validate_http_requests(rule, &region.body, declared_credentials, diagnostics);
+                validate_http_requests(rule, &region.lapse_body, declared_credentials, diagnostics);
+            }
+            body::BodyStmt::Record(_)
+            | body::BodyStmt::Done { .. }
+            | body::BodyStmt::Terminal(_)
+            | body::BodyStmt::Cancel { .. }
+            | body::BodyStmt::Milestone { .. }
+            | body::BodyStmt::Redact { .. }
+            | body::BodyStmt::Declassify { .. } => {}
         }
     }
 }
@@ -20093,9 +20123,34 @@ fn validate_case_pattern(
     let Some(scrutinee_ty) = scrutinee_ty else {
         return;
     };
+    // spec/type-system.md "Pattern Matching Types": the scrutinee is an enum, a
+    // literal union, an optional, or the tagged terminal-output union (which
+    // `validate_terminal_case_pattern` owns). Anything else has no pattern
+    // that can match it, and the arms would lower to nothing.
+    let unmatchable = |diagnostics: &mut Vec<Diagnostic>| {
+        diagnostics.push(Diagnostic {
+            code: diagnostic_code!("expr.unmatchable_scrutinee"),
+            severity: Severity::Error,
+            related: Vec::new(),
+            fixits: Vec::new(),
+            span,
+            message: format!(
+                "rule `{}` cannot pattern-match this scrutinee type",
+                rule.name.name
+            ),
+            suggestion: suggest(
+                "match an enum, literal union, optional, or tagged output union".to_owned(),
+            ),
+        });
+    };
     match scrutinee_ty {
         TypeSyntax::Ref { name } => {
             let Some(variants) = semantic.schemas.enums.get(&name.name) else {
+                // A class is a scrutinee no pattern can match. An unknown name
+                // is reported by the schema-reference check, not twice here.
+                if semantic.schemas.class_exists(&name.name) {
+                    unmatchable(diagnostics);
+                }
                 return;
             };
             let (variant, binding) = sum_case_pattern_parts(pattern);
@@ -20198,22 +20253,7 @@ fn validate_case_pattern(
                 });
             }
         }
-        _ => {
-            diagnostics.push(Diagnostic {
-                code: diagnostic_code!("expr.unmatchable_scrutinee"),
-                severity: Severity::Error,
-                related: Vec::new(),
-                fixits: Vec::new(),
-                span,
-                message: format!(
-                    "rule `{}` cannot pattern-match this scrutinee type",
-                    rule.name.name
-                ),
-                suggestion: suggest(
-                    "match an enum, literal union, optional, or tagged output union".to_owned(),
-                ),
-            });
-        }
+        _ => unmatchable(diagnostics),
     }
 }
 
@@ -22036,6 +22076,10 @@ fn collect_seal_payload_types(
 /// therefore asks the custodian for a grant on a type the bytes were never
 /// sealed as. The three-way agreement §2 depends on is only as good as the
 /// weakest of the three.
+///
+/// Three statement shapes store a value durably — a `record`, a terminal
+/// payload, and a milestone payload — the same crossings `validate_confinement`
+/// walks, and each is checked against the class its payload is declared at.
 fn validate_seal_storage(
     rule: &RuleDecl,
     statements: &[body::BodyStmt],
@@ -22045,47 +22089,46 @@ fn validate_seal_storage(
 ) {
     for statement in statements {
         match statement {
-            body::BodyStmt::Record(record) => {
-                for field in &record.fields {
-                    let body::FieldValue::Expr { source, .. } = &field.value else {
-                        continue;
-                    };
-                    let Some(sealed_as) = sealed_bindings.get(source.trim()) else {
-                        continue;
-                    };
-                    let Ok(TypeSyntax::Sealed { inner, .. }) = semantic
-                        .schemas
-                        .resolve_field_path(&record.schema, std::slice::from_ref(&field.name))
-                    else {
-                        continue;
-                    };
-                    let expected = inner.to_source();
-                    if expected == *sealed_as {
-                        continue;
-                    }
-                    diagnostics.push(Diagnostic {
-                        code: diagnostic_code!("security.seal_type_mismatch"),
-                        severity: Severity::Error,
-                        related: Vec::new(),
-                        fixits: Vec::new(),
-                        span: field.span,
-                        message: format!(
-                            "rule `{}` stores `{}` in `{}.{}`, which expects \
-                             `sealed<{}>` — it was sealed as `sealed<{sealed_as}>`",
-                            rule.name.name,
-                            source.trim(),
-                            record.schema,
-                            field.name,
-                            expected
-                        ),
-                        suggestion: suggest(
-                            "seal the value the field's payload type names; `open` later trusts \
-                             that declaration to choose the unwrap grant (DR-0074 §2)"
-                                .to_owned(),
-                        ),
+            body::BodyStmt::Record(record) => validate_seal_storage_fields(
+                rule,
+                &record.schema,
+                &record.fields,
+                semantic,
+                sealed_bindings,
+                diagnostics,
+            ),
+            body::BodyStmt::Terminal(terminal) => {
+                let contract = semantic
+                    .workflow
+                    .as_ref()
+                    .and_then(|workflow| semantic.workflow_inputs.get(workflow))
+                    .and_then(|surface| match terminal.kind {
+                        body::TerminalKind::Complete => surface.outputs.get(&terminal.name),
+                        body::TerminalKind::Fail => surface.failures.get(&terminal.name),
                     });
+                if let Some(TypeSyntax::Ref { name }) = contract {
+                    validate_seal_storage_fields(
+                        rule,
+                        &name.name,
+                        &terminal.fields,
+                        semantic,
+                        sealed_bindings,
+                        diagnostics,
+                    );
                 }
             }
+            body::BodyStmt::Milestone {
+                payload_class: Some(payload_class),
+                fields,
+                ..
+            } => validate_seal_storage_fields(
+                rule,
+                payload_class,
+                fields,
+                semantic,
+                sealed_bindings,
+                diagnostics,
+            ),
             body::BodyStmt::After(after) => {
                 validate_seal_storage(rule, &after.body, semantic, sealed_bindings, diagnostics)
             }
@@ -22113,6 +22156,160 @@ fn validate_seal_storage(
             _ => {}
         }
     }
+}
+
+/// One durable payload's fields against the class it is declared at: every
+/// field holding a `seal` binding must be a `sealed<T>` whose `T` is what the
+/// binding was sealed as. A nested payload — `inner Inner { … }` or an
+/// `inner { … }` object literal at a class-typed field — is walked at its own
+/// class, since a binding may land in a sealed field there as legally as at
+/// the top and `open` trusts that declaration just the same.
+fn validate_seal_storage_fields(
+    rule: &RuleDecl,
+    schema: &str,
+    fields: &[body::FieldAssign],
+    semantic: &SemanticContext,
+    sealed_bindings: &BTreeMap<String, String>,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    for field in fields {
+        match &field.value {
+            body::FieldValue::Nested {
+                schema: nested,
+                fields,
+            } => validate_seal_storage_fields(
+                rule,
+                nested,
+                fields,
+                semantic,
+                sealed_bindings,
+                diagnostics,
+            ),
+            body::FieldValue::Expr {
+                expr: Expr::Object(object_fields),
+                ..
+            } => {
+                let Ok(TypeSyntax::Ref { name: class }) = semantic
+                    .schemas
+                    .resolve_field_path(schema, std::slice::from_ref(&field.name))
+                else {
+                    continue;
+                };
+                validate_seal_storage_object(
+                    rule,
+                    &class.name,
+                    object_fields,
+                    field.span,
+                    semantic,
+                    sealed_bindings,
+                    diagnostics,
+                );
+            }
+            body::FieldValue::Expr { source, .. } => validate_seal_storage_binding(
+                rule,
+                schema,
+                &field.name,
+                source.trim(),
+                field.span,
+                semantic,
+                sealed_bindings,
+                diagnostics,
+            ),
+            body::FieldValue::Shorthand => {}
+        }
+    }
+}
+
+/// An `{ key value … }` object literal at a class-typed field, walked at that
+/// class: an identifier value is a binding reference and meets the same
+/// comparison as a top-level field, and a nested object literal at a
+/// class-typed key descends again.
+fn validate_seal_storage_object(
+    rule: &RuleDecl,
+    class: &str,
+    fields: &[ExprObjectField],
+    span: SourceSpan,
+    semantic: &SemanticContext,
+    sealed_bindings: &BTreeMap<String, String>,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    for field in fields {
+        match &field.value {
+            Expr::Object(nested) => {
+                let Ok(TypeSyntax::Ref { name: inner }) = semantic
+                    .schemas
+                    .resolve_field_path(class, std::slice::from_ref(&field.key))
+                else {
+                    continue;
+                };
+                validate_seal_storage_object(
+                    rule,
+                    &inner.name,
+                    nested,
+                    span,
+                    semantic,
+                    sealed_bindings,
+                    diagnostics,
+                );
+            }
+            Expr::Literal(ExprLiteral::Ident(binding)) => validate_seal_storage_binding(
+                rule,
+                class,
+                &field.key,
+                binding,
+                span,
+                semantic,
+                sealed_bindings,
+                diagnostics,
+            ),
+            _ => {}
+        }
+    }
+}
+
+/// The §10 comparison for one field: a `seal` binding stored at
+/// `schema.field` must meet a `sealed<T>` whose `T` is what it was sealed as.
+#[allow(clippy::too_many_arguments)]
+fn validate_seal_storage_binding(
+    rule: &RuleDecl,
+    schema: &str,
+    field: &str,
+    binding: &str,
+    span: SourceSpan,
+    semantic: &SemanticContext,
+    sealed_bindings: &BTreeMap<String, String>,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let Some(sealed_as) = sealed_bindings.get(binding) else {
+        return;
+    };
+    let Ok(TypeSyntax::Sealed { inner, .. }) = semantic
+        .schemas
+        .resolve_field_path(schema, &[field.to_owned()])
+    else {
+        return;
+    };
+    let expected = inner.to_source();
+    if expected == *sealed_as {
+        return;
+    }
+    diagnostics.push(Diagnostic {
+        code: diagnostic_code!("security.seal_type_mismatch"),
+        severity: Severity::Error,
+        related: Vec::new(),
+        fixits: Vec::new(),
+        span,
+        message: format!(
+            "rule `{}` stores `{binding}` in `{schema}.{field}`, which expects \
+             `sealed<{expected}>` — it was sealed as `sealed<{sealed_as}>`",
+            rule.name.name,
+        ),
+        suggestion: suggest(
+            "seal the value the field's payload type names; `open` later trusts that \
+             declaration to choose the unwrap grant (DR-0074 §2)"
+                .to_owned(),
+        ),
+    });
 }
 
 /// `declassify <source> into <Type> as <binding>` types `binding` at `<Type>`.
@@ -22351,10 +22548,12 @@ fn validate_open_type_agreement(
                     });
                     continue;
                 };
-                let TypeSyntax::Ref { name: sealed_type } = *inner else {
-                    continue;
-                };
-                if sealed_type.name == declared {
+                // Compared as SOURCE TEXT, the same way `collect_seal_payload_types`
+                // tracks the envelope: `sealed<string>` is as legal a payload as
+                // `sealed<PatientRecord>`, and opening it into a class asks for
+                // a grant on that class against bytes that never held one.
+                let sealed_as = inner.to_source();
+                if sealed_as == declared {
                     continue;
                 }
                 diagnostics.push(Diagnostic {
@@ -22365,13 +22564,12 @@ fn validate_open_type_agreement(
                     span: effect.span,
                     message: format!(
                         "rule `{}` opens `{envelope}` into `{declared}`, but it is sealed as \
-                         `sealed<{}>`",
-                        rule.name.name, sealed_type.name
+                         `sealed<{sealed_as}>`",
+                        rule.name.name
                     ),
                     suggestion: suggest(format!(
-                        "open it into `{}`; `into` names the type the envelope already holds, \
-                         and it is what the unwrap grant is narrowed by (DR-0074 §2)",
-                        sealed_type.name
+                        "open it into `{sealed_as}`; `into` names the type the envelope already \
+                         holds, and it is what the unwrap grant is narrowed by (DR-0074 §2)"
                     )),
                 });
             }
@@ -24230,6 +24428,97 @@ fn validate_lapse_arm(
         &allowed,
         &mut arm_diagnostics,
     );
+    // The arm's EFFECTS. The kernel lowers the lapsed variant at lapse time, so
+    // an arm acquires, emits, requests, opens and declassifies exactly as a body
+    // does — and the splice hid every one of those statements from the
+    // effect-level passes `analyze_rule` runs over the HOLDS body. An arm
+    // acquiring an undeclared lease, emitting an undeclared signal, or leaving a
+    // lease outcome unhandled compiled clean and failed at run time, at the
+    // moment the region broke. Same passes, same environment, same order as the
+    // body; only the walked statements differ.
+    let mut arm_roots: BTreeSet<String> = arm_bindings.keys().cloned().collect();
+    collect_all_binding_names(&arm_ast.statements, &mut arm_roots);
+    validate_effect_field_roots(rule, &arm_ast.statements, &arm_roots, &mut arm_diagnostics);
+    validate_emit_signal_declarations(
+        rule,
+        &arm_ast.statements,
+        &semantic.schemas.events,
+        &mut arm_diagnostics,
+    );
+    validate_credential_allow(rule, &arm_ast.statements, semantic, &mut arm_diagnostics);
+    validate_http_requests(
+        rule,
+        &arm_ast.statements,
+        &semantic.credentials.keys().map(String::as_str).collect(),
+        &mut arm_diagnostics,
+    );
+    validate_body_effect_operands(
+        rule,
+        &arm_ast.statements,
+        semantic,
+        &arm_bindings,
+        &mut arm_diagnostics,
+    );
+    validate_coordination_discipline(rule, &arm_ast.statements, &mut arm_diagnostics);
+    validate_redactions(
+        rule,
+        &arm_ast.statements,
+        semantic,
+        &arm_bindings,
+        &mut arm_diagnostics,
+    );
+    {
+        let mut open_bindings = BTreeSet::new();
+        collect_open_bindings(&arm_ast.statements, &mut open_bindings);
+        if !open_bindings.is_empty() {
+            validate_confinement(
+                rule,
+                &arm_ast.statements,
+                &open_bindings,
+                &BTreeSet::new(),
+                &mut arm_diagnostics,
+            );
+        }
+    }
+    validate_open_type_agreement(
+        rule,
+        &arm_ast.statements,
+        semantic,
+        &arm_bindings,
+        &mut arm_diagnostics,
+    );
+    validate_declassify_projection(
+        rule,
+        &arm_ast.statements,
+        semantic,
+        &arm_bindings,
+        &mut arm_diagnostics,
+    );
+    validate_sealed_effect_inputs(
+        rule,
+        &arm_ast.statements,
+        semantic,
+        &arm_bindings,
+        &mut arm_diagnostics,
+    );
+    {
+        let mut sealed_bindings = BTreeMap::new();
+        collect_seal_payload_types(
+            &arm_ast.statements,
+            semantic,
+            &arm_bindings,
+            &mut sealed_bindings,
+        );
+        if !sealed_bindings.is_empty() {
+            validate_seal_storage(
+                rule,
+                &arm_ast.statements,
+                semantic,
+                &sealed_bindings,
+                &mut arm_diagnostics,
+            );
+        }
+    }
     // `arm_content` is cut from the then-expanded body text, so offsets into it are
     // not source positions. Every arm diagnostic is reported at the body span, the
     // same span the field-path walk above uses.
@@ -27626,22 +27915,28 @@ fn validate_literal_against_type_inner(
         // DR-0074 §1: a sealed value has no literal form. It arises only from
         // `seal`, so a literal in this position is always wrong, and saying so
         // is more useful than the mismatch it would otherwise surface later.
+        // An identifier here is a binding reference, and a `seal` binding is the
+        // one value that can legally land in a sealed field — the same exemption
+        // the line-scanner twin `validate_literal_assignment_inner` makes.
         TypeSyntax::Sealed { .. } => {
-            diagnostics.push(Diagnostic {
-                code: diagnostic_code!("type.invalid_literal"),
-                severity: Severity::Error,
-                related: Vec::new(),
-                fixits: Vec::new(),
-                span: at.whole(),
-                message: format!(
-                    "field `{record_schema}.{field}` expects `{}`, which has no literal form",
-                    field_ty.to_source()
-                ),
-                suggestion: suggest(format!(
-                    "seal a value first: `seal <value> as {} with <credential> -> v`, then use `v`",
-                    field_ty.to_source()
-                )),
-            });
+            if !matches!(literal, LiteralExpr::Ident(_)) {
+                diagnostics.push(Diagnostic {
+                    code: diagnostic_code!("type.invalid_literal"),
+                    severity: Severity::Error,
+                    related: Vec::new(),
+                    fixits: Vec::new(),
+                    span: at.whole(),
+                    message: format!(
+                        "field `{record_schema}.{field}` expects `{}`, which has no literal form",
+                        field_ty.to_source()
+                    ),
+                    suggestion: suggest(format!(
+                        "seal a value first: `seal <value> with <credential> as v`, then use \
+                         `v` — a `{}` arises only from `seal`",
+                        field_ty.to_source()
+                    )),
+                });
+            }
         }
         // DR-0053 §5: a secret has no literal form either — a credential is
         // never a value in source. Reached directly now that `secret` is its

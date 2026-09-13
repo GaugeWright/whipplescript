@@ -3916,6 +3916,29 @@ workflow UnsafeHostChat {
         GovernedHostRuntime::open(&path, 1, &policy_text).expect("admissible now");
     }
 
+    /// The same refusal under `authority acme`: the delegation edge then names
+    /// `acme::Operator`, and the demand has to be found under that role. It
+    /// was stored bare, so every authority-qualified policy loaded as if it
+    /// had declared no demand at all.
+    #[test]
+    fn an_authority_qualified_policy_keeps_its_custody_demand() {
+        let path = temp_store();
+        let policy_text = SignedEnvelope::sign_for_test(
+            "authority acme\n\
+             delegate provider:builtin-agent-harness acts-for Operator for confidentiality\n\
+             require custody zero-retention for Operator\n",
+            "admin",
+        )
+        .to_json();
+
+        let error = GovernedHostRuntime::open(&path, 1, &policy_text)
+            .err()
+            .expect("an unattested endpoint must not carry acme::Operator data");
+        let message = format!("{error:?}");
+        assert!(message.contains("pinned endpoint"), "{message}");
+        assert!(message.contains("acme::Operator"), "{message}");
+    }
+
     /// DR-0062: `schema.coerce` is as real a model-egress door as `agent.tell`,
     /// so custody is demanded of a coerce backend too. This endpoint is
     /// registered only under `schema.coerce`, and the check has to find it there

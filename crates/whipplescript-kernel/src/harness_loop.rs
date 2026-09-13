@@ -4582,4 +4582,108 @@ mod tests {
         assert!(trims >= 1, "at least one recovery attempt");
         assert!(trims <= MAX_OVERFLOW_TRIMS, "trims are bounded");
     }
+
+    /// Drive one owned brokered turn through the kernel against a scripted
+    /// model and return the `value` the settled `agent.turn.<status>` fact
+    /// carries -- what `after helper fails as f` binds.
+    fn settled_brokered_turn_value(
+        replies: Vec<Result<ModelReply, HarnessModelError>>,
+        fact_name: &str,
+    ) -> Value {
+        use crate::{BrokeredTurnContext, RuntimeKernel};
+        use whipplescript_store::{NewEffect, RuleCommit, SqliteStore};
+
+        let store = SqliteStore::open_in_memory().expect("store opens");
+        let mut kernel = RuntimeKernel::new(store);
+        let effects = [NewEffect {
+            timeout_seconds: None,
+            effect_id: "turn",
+            kind: "agent.tell",
+            target: Some("helper"),
+            input_json: r#"{"prompt":"go"}"#,
+            status: "queued",
+            idempotency_key: "rule=start;effect=turn",
+            required_capabilities_json: "[]",
+            profile: None,
+            correlation_id: None,
+            source_span_json: None,
+        }];
+        kernel
+            .commit_rule(RuleCommit {
+                instance_id: "instance-a",
+                rule: "start",
+                trigger_event_id: None,
+                facts: &[],
+                consumed_fact_ids: &[],
+                effects: &effects,
+                dependencies: &[],
+                terminal: None,
+                idempotency_key: Some("commit-start"),
+                marks: &[],
+                context_json: None,
+            })
+            .expect("rule commits");
+
+        let http = ScriptedHttpClient::new(replies);
+        let exec = RecordingExecutor::new(ToolOutcome {
+            status: ToolStatus::Ok,
+            content: "R".to_string(),
+        });
+        kernel
+            .run_brokered_agent_turn(
+                &BrokeredTurnContext {
+                    instance_id: "instance-a",
+                    effect_id: "turn",
+                    agent: "helper",
+                    profile: None,
+                    thread_continue: false,
+                    stream_released: None,
+                },
+                &http,
+                &exec,
+                &DummyHost,
+                &NoopCompactor,
+                &input(5),
+            )
+            .expect("turn settles");
+
+        let facts = kernel.store().list_facts("instance-a").expect("facts load");
+        let fact = facts
+            .iter()
+            .find(|fact| fact.name == fact_name)
+            .unwrap_or_else(|| panic!("{fact_name} fact derived; have {facts:?}"));
+        serde_json::from_str(&fact.value_json).expect("fact value is JSON")
+    }
+
+    /// A timed-out owned turn carries `error_class: "timeout"` -- the same
+    /// value the durable object's brokered settle
+    /// (`provider_result_from_brokered_turn`) and the native delegated-provider
+    /// path stamp for that outcome, so a rule `after helper fails as f when
+    /// f.error_class == "timeout"` fires on every host.
+    #[test]
+    fn brokered_timed_out_turn_carries_the_timeout_error_class() {
+        let value = settled_brokered_turn_value(
+            vec![Err(HarnessModelError::Timeout)],
+            "agent.turn.timed_out",
+        );
+        assert_eq!(
+            value.pointer("/value/error_class").and_then(Value::as_str),
+            Some("timeout"),
+            "{value}"
+        );
+    }
+
+    /// A turn the provider FAILS keeps `error_class: "provider_error"`.
+    #[test]
+    fn brokered_failed_turn_carries_the_provider_error_class() {
+        let errors: Vec<Result<ModelReply, HarnessModelError>> = (0..4)
+            .map(|_| Err(HarnessModelError::Provider("Overloaded".to_string())))
+            .collect();
+        let value = settled_brokered_turn_value(errors, "agent.turn.failed");
+        assert_eq!(
+            value.pointer("/value/error_class").and_then(Value::as_str),
+            Some("provider_error"),
+            "{value}"
+        );
+    }
 }

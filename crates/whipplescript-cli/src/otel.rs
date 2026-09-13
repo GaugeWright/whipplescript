@@ -466,23 +466,19 @@ fn otel_endpoint_carries_headers_safely(endpoint: &str) -> bool {
 }
 
 /// True when the endpoint's host is loopback (`localhost`, `127.0.0.0/8`, `::1`).
+/// Decided on the parsed address, never on the hostname text: a DNS name that
+/// merely begins with `127.` is a remote host. An endpoint that does not parse
+/// is not loopback (fail closed).
 fn otel_endpoint_is_loopback(endpoint: &str) -> bool {
-    let authority = endpoint
-        .strip_prefix("http://")
-        .or_else(|| endpoint.strip_prefix("https://"))
-        .unwrap_or(endpoint);
-    let authority = authority.split(['/', '?', '#']).next().unwrap_or(authority);
-    let host = if let Some(rest) = authority.strip_prefix('[') {
-        // IPv6 literal, e.g. `[::1]:4318`.
-        rest.split(']').next().unwrap_or(rest)
-    } else {
-        authority
-            .rsplit_once(':')
-            .map(|(host, _)| host)
-            .unwrap_or(authority)
+    let Ok(url) = url::Url::parse(endpoint) else {
+        return false;
     };
-    let host = host.to_ascii_lowercase();
-    host == "localhost" || host == "::1" || host.starts_with("127.")
+    match url.host() {
+        Some(url::Host::Domain(domain)) => domain.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        None => false,
+    }
 }
 
 /// Parse an OTel comma-separated `key=value` list (headers or resource
@@ -555,18 +551,44 @@ pub(crate) fn read_otel_cursor_v2(path: &Path) -> Value {
 /// headers ride the request; the response body is ignored beyond status.
 fn otel_post(endpoint: &str, headers: &[(String, String)], body: &str) -> Result<(), String> {
     let url = otel_traces_url(endpoint)?;
+    // No redirects. The auth headers ride this request, and ureq replays every
+    // header except `authorization` on a redirect — OTLP auth is usually
+    // `x-honeycomb-team`, `api-key`, `DD-API-KEY` and the like — so a
+    // collector (or a hijacked DNS answer) that bounces the POST would collect
+    // the key at another origin, possibly over the plaintext the endpoint
+    // guard in `resolve_otel_config` never saw. A collector that redirects is a
+    // misconfiguration the operator should see, not a hop to follow silently.
     let agent = ureq::AgentBuilder::new()
         .timeout(std::time::Duration::from_secs(30))
         .user_agent("whipplescript-telemetry")
+        .redirects(0)
         .build();
     let mut request = agent.post(&url).set("Content-Type", "application/json");
     for (name, value) in headers {
         request = request.set(name, value);
     }
     match request.send_bytes(body.as_bytes()) {
+        // With redirects off, ureq hands a 3xx back as a plain response rather
+        // than an `Error::Status` (only 4xx/5xx become one).
+        Ok(response) if (300..400).contains(&response.status()) => {
+            let location = response
+                .header("Location")
+                .unwrap_or("<no Location header>");
+            Err(format!(
+                "collector redirected ({}) to `{location}`: the export does not follow redirects because its auth headers would be replayed to that host; set OTEL_EXPORTER_OTLP_ENDPOINT to the final URL",
+                response.status()
+            ))
+        }
         Ok(_) => Ok(()),
         Err(ureq::Error::Status(code, _)) => Err(format!("collector responded {code}")),
-        Err(ureq::Error::Transport(transport)) => Err(format!("{url}: {transport}")),
+        // Prose of its own, not only the two values: a message that is
+        // nothing but `{url}: {transport}` gives the mutation sweep no
+        // literal to rewrite, so a test asserting the URL passes whether or
+        // not the arm still refuses. It also reads better -- an operator can
+        // tell "nothing is listening there" from "that collector said no".
+        Err(ureq::Error::Transport(transport)) => {
+            Err(format!("cannot reach collector at {url}: {transport}"))
+        }
     }
 }
 

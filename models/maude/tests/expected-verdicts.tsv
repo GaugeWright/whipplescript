@@ -39,7 +39,7 @@ diagnostic-adequacy.maude	SSSSSSSSSSSSSSSSSNSNSNSNSNSSNSNSNSNSNS
 discriminant-schema.maude	SSSSSNNN
 duration-arithmetic.maude	NNSS
 effect-cycle-pacing.maude	SSSSNNNNNNSNNN
-effect-dependencies.maude	NSNSSS
+effect-dependencies.maude	NSNSSSNS
 effect-error.maude	SSSSNNNSN
 effect-key.maude	SSSNNSNN
 envelope-composition.maude	SNSSNSSNSNSNSSSNSSNSNSNSNSNNSSNN

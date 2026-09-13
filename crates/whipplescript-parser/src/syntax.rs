@@ -4336,7 +4336,16 @@ impl Parser<'_> {
         };
         let mut clauses = Vec::new();
         let mut offset = 0usize;
-        for line in self.source_text(body_span).split_inclusive('\n') {
+        // A whole-line `#`/`//` comment is not a readiness clause. The lexer
+        // already dropped those tokens, but this loop re-reads the RAW source
+        // between the braces, so it has to apply the same whole-line comment
+        // rule rule bodies get in `lowering.rs`. Blanking is byte-preserving,
+        // so the offsets below still index `self.source`, and a line that was
+        // only a comment trims to nothing and is skipped — leaving a block of
+        // nothing but comments to the `clauses.is_empty()` refusal below,
+        // exactly as an empty block is refused.
+        let body_text = body::blank_full_line_comments(self.source_text(body_span));
+        for line in body_text.split_inclusive('\n') {
             let line_without_newline = line.trim_end_matches('\n');
             let line_start = body_span.start + offset;
             offset += line.len();

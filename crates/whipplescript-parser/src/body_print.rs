@@ -238,7 +238,7 @@ pub(crate) fn print_effect(
                 .unwrap_or(("", None));
             let annotation = content_type.unwrap_or_default();
             push_stmt_line(out, indent, &format!("prompt \"\"\"{annotation}"));
-            for line in rn(text).lines() {
+            for line in rename_in_templates(text, rn).lines() {
                 push_stmt_line(out, indent, line);
             }
             push_stmt_line(
@@ -289,7 +289,7 @@ pub(crate) fn print_effect(
                 indent,
                 &format!(
                     "decide {:?} -> {{ {shape} }}{binding}{timeout}",
-                    rn(&prompt)
+                    rename_in_templates(&prompt, rn)
                 ),
             );
             return;
@@ -313,15 +313,18 @@ pub(crate) fn print_effect(
             keyword, fields, ..
         } => {
             if keyword == "recall" {
+                // Slots and payload fields are reference positions (an
+                // identifier or an expression operand), so they take the
+                // renamer like a `tell` target or a `call` argument does.
                 let pool = fields
                     .iter()
                     .find(|field| field.name == "pool")
-                    .map(|field| field.source.as_str())
+                    .map(|field| rn(&field.source))
                     .unwrap_or_default();
                 let query = fields
                     .iter()
                     .find(|field| field.name == "query")
-                    .map(|field| field.source.as_str())
+                    .map(|field| rn(&field.source))
                     .unwrap_or_default();
                 push_stmt_line(
                     out,
@@ -331,7 +334,7 @@ pub(crate) fn print_effect(
             } else {
                 let field_source = fields
                     .iter()
-                    .map(|field| field.source.as_str())
+                    .map(|field| rn(&field.source))
                     .collect::<Vec<_>>()
                     .join(" ");
                 push_stmt_line(
@@ -363,11 +366,21 @@ pub(crate) fn print_effect(
             ..
         } => {
             match until {
-                Some(deadline) => push_stmt_line(
-                    out,
-                    indent,
-                    &format!("timer until {:?}{binding}", rn(deadline)),
-                ),
+                Some(deadline) => {
+                    // The parser keeps a time literal and a time-typed path
+                    // in one string (`"2026-06-15T09:00:00Z"` unquoted,
+                    // `ticket.dueAt` bare). It validates literals with
+                    // `is_iso8601_instant`, which no path can satisfy, so the
+                    // same predicate says which spelling to print — the
+                    // re-parse refuses a quoted path as an invalid literal.
+                    let deadline = rn(deadline);
+                    let spelled = if body::is_iso8601_instant(&deadline) {
+                        format!("{deadline:?}")
+                    } else {
+                        deadline
+                    };
+                    push_stmt_line(out, indent, &format!("timer until {spelled}{binding}"))
+                }
                 None => push_stmt_line(out, indent, &format!("timer {duration_seconds}s{binding}")),
             }
             return;
@@ -387,7 +400,7 @@ pub(crate) fn print_effect(
                 crate::body::ExecTarget::Capability {
                     name,
                     stdin_binding,
-                } => format!("exec {name} with {stdin_binding}"),
+                } => format!("exec {name} with {}", rn(stdin_binding)),
             };
             let grants = format_access_grants(access_grants, rn);
             push_stmt_line(
@@ -575,13 +588,39 @@ pub(crate) fn print_effect(
         Some(Prompt { text, content_type }) => {
             let annotation = content_type.clone().unwrap_or_default();
             push_stmt_line(out, indent, &format!("{header} \"\"\"{annotation}"));
-            for line in rn(text).lines() {
+            for line in rename_in_templates(text, rn).lines() {
                 push_stmt_line(out, indent, line);
             }
             push_stmt_line(out, indent, "\"\"\"");
         }
         None => push_stmt_line(out, indent, &header),
     }
+}
+
+/// Applies `rn` to each `{{ … }}` interpolation of prompt text and copies the
+/// prose between them verbatim. The printer holds prompt CONTENT with its
+/// quotes already stripped, so handing the whole text to `rn` would make
+/// every word of prose a reference — `Take a turn.` became
+/// `Take a turn__act0.`. Inside a prompt only an interpolation is a reference
+/// position (DR-0023's substitution list; the predicate `rename_text` states).
+/// Each interpolation is passed fence-inclusive, so `rename_text` sees it as a
+/// template and an identity renamer copies it unchanged. An unterminated `{{`
+/// runs to the end of the text, as it does in `rename_text`.
+fn rename_in_templates(text: &str, rn: &dyn Fn(&str) -> String) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(open) = rest.find("{{") {
+        out.push_str(&rest[..open]);
+        let template = &rest[open..];
+        let Some(close) = template.find("}}") else {
+            out.push_str(&rn(template));
+            return out;
+        };
+        out.push_str(&rn(&template[..close + 2]));
+        rest = &template[close + 2..];
+    }
+    out.push_str(rest);
+    out
 }
 
 /// Rewrites references to `binding` (paths and bare uses) to `replacement`,
@@ -625,8 +664,12 @@ pub(crate) fn rename_text(source: &str, binding: Option<&str>, replacement: &str
         // Rename only where the token is a live reference: outside string
         // literals, or inside a `{{ }}` template.
         let renameable = !in_string || in_template;
-        let at_word_start =
-            index == 0 || !(bytes[index - 1].is_ascii_alphanumeric() || bytes[index - 1] == b'_');
+        // An identifier after `.` is a FIELD segment (`turn.summary`), never a
+        // reference: a parameter or binding can only stand at a path's root.
+        let at_word_start = index == 0
+            || !(bytes[index - 1].is_ascii_alphanumeric()
+                || bytes[index - 1] == b'_'
+                || bytes[index - 1] == b'.');
         if renameable
             && at_word_start
             && bytes[index..].starts_with(needle)
@@ -638,8 +681,14 @@ pub(crate) fn rename_text(source: &str, binding: Option<&str>, replacement: &str
             index += needle.len();
             continue;
         }
-        out.push(bytes[index] as char);
-        index += 1;
+        // Copy a whole character, not a byte re-encoded as one: every other
+        // advance above is over ASCII (`{{`, `}}`, `"`, the needle), so
+        // `index` is always on a char boundary here.
+        let Some(ch) = source[index..].chars().next() else {
+            break;
+        };
+        out.push(ch);
+        index += ch.len_utf8();
     }
     out
 }

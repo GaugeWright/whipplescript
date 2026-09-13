@@ -329,7 +329,7 @@ These are the usual repairs:
 | `blocked_by_capability` | The agent or the provider does not expose the necessary capability. | Correct the `capabilities` field or the configuration of the provider. |
 | `blocked_by_profile` | The policy of the profile denied the effect. | Use an effect with less authority, or bind a profile that permits the effect. |
 | A run of a provider has the `failed` status. | The adapter, the model, the script, or a boundary failed. | Read the `diagnostics` output and the `evidence` output. Then write a rule for the policy: a retry, an escalation, or a `fail` statement. |
-| A run of a provider has the `timed_out` status. | The timeout ended. | Add an `after x times out` branch or an `after x fails` branch. As an alternative, add a policy for a retry. |
+| A run of a provider has the `timed_out` status. | The timeout ended. | Add an `after x times out` branch or an `after x completes` branch. As an alternative, add a policy for a retry. |
 
 ## Revision Diagnostics
 

@@ -310,6 +310,30 @@ mod tests {
         assert!(out.contains("after __then_closed succeeds as closed {"));
     }
 
+    /// `timer until` takes a time literal or a time-typed path
+    /// (spec/scheduled-time.md), and the parser keeps both in one string.
+    /// The printer quoted whichever it held, so a chained path came back as
+    /// `timer until "ticket.dueAt"` and the re-parse refused it as an invalid
+    /// time literal.
+    #[test]
+    fn then_chained_timer_until_prints_a_path_bare_and_a_literal_quoted() {
+        let (out, diagnostics) =
+            expand("  then due <- timer until ticket.dueAt\n  complete result { note \"ok\" }");
+        assert_eq!(diagnostics, Vec::new());
+        assert!(
+            out.contains("timer until ticket.dueAt as __then_due"),
+            "a time-typed path must print unquoted: {out}"
+        );
+        let (out, diagnostics) = expand(
+            "  then due <- timer until \"2026-06-15T09:00:00Z\"\n  complete result { note \"ok\" }",
+        );
+        assert_eq!(diagnostics, Vec::new());
+        assert!(
+            out.contains("timer until \"2026-06-15T09:00:00Z\" as __then_due"),
+            "a time literal must stay quoted: {out}"
+        );
+    }
+
     #[test]
     fn chained_thens_nest() {
         let (out, diagnostics) = expand(

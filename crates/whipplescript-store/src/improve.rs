@@ -715,6 +715,7 @@ pub fn fold_campaign_event(summary: &mut CampaignSummary, event: &CampaignEventR
         "campaign.parked" => summary.status = "parked".to_owned(),
         "campaign.resumed" => summary.status = "open".to_owned(),
         "campaign.closed" => summary.status = "closed".to_owned(),
+        "campaign.failed" => summary.status = "failed".to_owned(),
         "candidate.adopted" => summary.status = "adopted".to_owned(),
         _ => {}
     }
@@ -847,6 +848,36 @@ mod tests {
         let events = store.list_campaign_events(&id).expect("events");
         assert_eq!(events.len(), 4);
         assert_eq!(events[0].event_type, "campaign.opened");
+    }
+
+    #[test]
+    fn campaign_failed_folds_to_failed() {
+        // `campaign.failed` is the terminal event a crashed invocation
+        // appends so the record never lingers `open`; the fold must read
+        // it, or `whip campaigns` contradicts the record it projects.
+        let mut store = ImproveStore::open_in_memory().expect("open");
+        let id = store
+            .open_campaign(&json!({"ascend": ["extract_quality"]}))
+            .expect("open campaign");
+        store
+            .append_campaign_event(&id, "campaign.failed", &json!({"reason": "judge died"}))
+            .expect("append");
+        let campaigns = store.list_campaigns().expect("list");
+        assert_eq!(campaigns.len(), 1);
+        assert_eq!(
+            campaigns[0].status, "failed",
+            "a crashed campaign folds to `failed`, not `open`"
+        );
+        // The accepting side: a campaign whose invocation ended on
+        // `campaign.closed` still folds to `closed`.
+        let closed = store
+            .open_campaign(&json!({"ascend": ["extract_quality"]}))
+            .expect("open campaign");
+        store
+            .append_campaign_event(&closed, "campaign.closed", &json!({"proposed": false}))
+            .expect("append");
+        let campaigns = store.list_campaigns().expect("list");
+        assert_eq!(campaigns[1].status, "closed");
     }
 
     #[test]

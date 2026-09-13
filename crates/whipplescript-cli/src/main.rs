@@ -4386,7 +4386,7 @@ impl CheckOptions {
     fn parse(args: &[String]) -> Result<Self, String> {
         let mut model_search = false;
         let mut root = None;
-        let mut exec_profile = ExecProfile::from_env();
+        let mut exec_profile = ExecProfile::from_env()?;
         let mut script_manifest_path = script_manifest_path_from_env();
         let mut package_lock_path = None;
         let mut paths = Vec::new();
@@ -4458,11 +4458,15 @@ impl ExecProfile {
         }
     }
 
-    fn from_env() -> Self {
-        env::var("WHIPPLESCRIPT_EXEC_PROFILE")
-            .ok()
-            .and_then(|value| Self::parse(&value).ok())
-            .unwrap_or(Self::Dev)
+    /// The environment door reads the same string as `--exec-profile` and
+    /// refuses the same values: an operator who misspells `hosted` on a worker
+    /// box must get an error, not the permissive dev profile with no message.
+    fn from_env() -> Result<Self, String> {
+        match env::var_os("WHIPPLESCRIPT_EXEC_PROFILE") {
+            None => Ok(Self::Dev),
+            Some(value) => Self::parse(&value.to_string_lossy())
+                .map_err(|error| format!("WHIPPLESCRIPT_EXEC_PROFILE: {error}")),
+        }
     }
 
     fn is_hosted(self) -> bool {
@@ -12204,22 +12208,27 @@ fn test_replay_command(options: &CliOptions, args: &[String]) -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    drop(original_store);
 
-    // Rebuild on a throwaway copy so the user's store is never mutated.
-    let temp = std::env::temp_dir().join(format!("whip-replay-{instance_id}.sqlite"));
-    if let Err(error) = fs::copy(&options.store_path, &temp) {
-        eprintln!("failed to copy store for replay: {error}");
-        return ExitCode::from(2);
-    }
+    // Rebuild on a throwaway snapshot so the user's store is never mutated.
+    // The snapshot is `VACUUM INTO`, not a file copy: the store runs in WAL
+    // mode, and while another connection holds it (a `whip dev`/`worker` on
+    // the instance being inspected) a closed connection cannot checkpoint,
+    // so a copy of the main file omits every un-checkpointed commit and the
+    // replay folds a truncated log — a false DIVERGED. The scratch directory
+    // is per-process and reclaims the `-wal`/`-shm` sidecars on every exit.
     let replayed = (|| -> Result<Value, String> {
+        let scratch = ScenarioScratch::new(&instance_id)?;
+        let temp = scratch.root.join("replay.sqlite");
+        original_store
+            .snapshot_to(&temp)
+            .map_err(|error| format!("failed to snapshot store for replay: {error:?}"))?;
         let mut temp_store = open_store(&temp)?;
         temp_store
             .rebuild_projections(&instance_id)
             .map_err(store_error)?;
         canonical_projection(&temp_store, &instance_id).map_err(store_error)
     })();
-    let _ = fs::remove_file(&temp);
+    drop(original_store);
     let replayed = match replayed {
         Ok(projection) => projection,
         Err(message) => {
@@ -12547,9 +12556,22 @@ fn run_test_scenario(test: &IrTest, source: &str, ir: &IrProgram, path: &str) ->
                 let returns_output =
                     matches!(surface, Some("coerce") | Some("agent")) && stub.outcome == "returns";
                 match stub.outcome.as_str() {
+                    // Turn-output injection (`succeeds { summary … }`) is deferred:
+                    // the fixture's turn output is a fixed generated schema, so the
+                    // record would be dropped and the expects judged against the
+                    // generic output. spec/workflow-testing.md says that is
+                    // reported `invalid`, not silently ignored.
+                    "succeeds" | "fails" if matches!(stub.payload, Some(StubPayload::Record(_))) => {
+                        Some(format!(
+                            "stub {} {} {{ … }} — turn-output injection is not simulated by the \
+                             fixture provider (a record payload on `succeeds`/`fails`)",
+                            stub.surface.join(" "),
+                            stub.outcome
+                        ))
+                    }
                     "succeeds" | "fails" => None,
                     _ if returns_output => None,
-                    _ => Some("stub outcome other than succeeds/fails (times_out/cancels not simulatable; only `coerce`/`agent` … `returns { … }` inject output)"),
+                    _ => Some("stub outcome other than succeeds/fails (times_out/cancels not simulatable; only `coerce`/`agent` … `returns { … }` inject output)".to_owned()),
                 }
             }
             TestClause::Given(GivenClause::Signal { .. })
@@ -12894,37 +12916,39 @@ fn execute_scenario(
 
     for clause in &test.clauses {
         match clause {
+            // `given` does not bypass package validation (spec/workflow-testing.md
+            // "given"): the signal enters through the same admission core as
+            // `whip signal`, so an undeclared name or a payload the declaration
+            // refuses cannot seed a fact no real delivery could produce — a
+            // scenario built on one would describe a run the runtime refuses.
             TestClause::Given(GivenClause::Signal { name, fields, .. }) => {
-                let payload_json =
-                    Value::Object(eval_given_record(fields, &format!("given signal {name}"))?)
-                        .to_string();
-                let received = kernel
-                    .ingest_external_event(
-                        &instance_id,
-                        name,
-                        &payload_json,
-                        Some(&idempotency_key(&[
-                            &instance_id,
-                            "signal",
-                            name,
-                            &payload_json,
-                        ])),
-                    )
-                    .map_err(store_error)?;
-                kernel
-                    .derive_fact(
-                        &instance_id,
-                        name,
-                        &received.event_id,
-                        &payload_json,
-                        Some(&received.event_id),
-                        Some(&idempotency_key(&[
-                            &instance_id,
-                            "signal-fact",
-                            &received.event_id,
-                        ])),
-                    )
-                    .map_err(store_error)?;
+                use whipplescript_kernel::ingress_pass::SignalAdmission;
+                let payload =
+                    Value::Object(eval_given_record(fields, &format!("given signal {name}"))?);
+                let delivery_key = whipplescript_kernel::ingress_pass::signal_delivery_key(
+                    &instance_id,
+                    name,
+                    &payload.to_string(),
+                    None,
+                );
+                let admission = whipplescript_kernel::ingress_pass::admit_external_signal(
+                    &mut kernel,
+                    &instance_id,
+                    ir,
+                    name,
+                    &payload,
+                    &delivery_key,
+                )
+                .map_err(store_error)?;
+                match admission {
+                    SignalAdmission::Admitted { .. } | SignalAdmission::Duplicate { .. } => {}
+                    SignalAdmission::Refused(refusal) => {
+                        return Err(format!(
+                            "`given signal {name}`: {}",
+                            whipplescript_kernel::ingress_pass::refusal_reason(&refusal)
+                        ));
+                    }
+                }
             }
             // `given fact` seeds a pre-existing fact (no triggering signal), so
             // rules with `when <Fact>` patterns see it on the first step. The
@@ -13017,7 +13041,7 @@ fn execute_scenario(
     let worker_options = WorkerOptions {
         instance_id: instance_id.clone(),
         provider: "fixture".to_owned(),
-        exec_profile: ExecProfile::from_env(),
+        exec_profile: ExecProfile::from_env()?,
         script_manifest_path: None,
         package_lock_path: None,
         outcome: scenario_fixture_outcome(&test.clauses),
@@ -13027,7 +13051,7 @@ fn execute_scenario(
         provider_config_paths: Vec::new(),
         max_child_iterations: 8,
         agent_outcomes: scenario_agent_outcomes(&test.clauses),
-        coerce_outputs: scenario_coerce_outputs(&test.clauses),
+        coerce_outputs: scenario_coerce_outputs(&test.clauses)?,
         agent_results: scenario_agent_results(&test.clauses),
         virtual_now: scenario_virtual_now(&test.clauses),
         work_unit_root: None,
@@ -13140,28 +13164,35 @@ fn scenario_agent_outcomes(
     outcomes
 }
 
-/// Injected coerce outputs from `stub coerce <fn> returns { … }` clauses, keyed by
-/// coerce function name. The record payload is evaluated through the expression
-/// kernel (the same evaluator `given` uses) into the JSON the fixture coerce will
-/// return, so a test controls the typed result a workflow branches on.
-fn scenario_coerce_outputs(clauses: &[TestClause]) -> std::collections::BTreeMap<String, String> {
+/// The typed outputs `stub coerce <fn> returns { … }` injects, keyed by
+/// function. A stub that cannot inject — a record that does not evaluate,
+/// a payload that is not a record, no function named — is a harness error,
+/// so the scenario reports `invalid`; dropping it would run the scenario on
+/// the fixture's generic value and call the result passed or failed.
+fn scenario_coerce_outputs(
+    clauses: &[TestClause],
+) -> Result<std::collections::BTreeMap<String, String>, String> {
     let mut outputs = std::collections::BTreeMap::new();
     for clause in clauses {
         if let TestClause::Stub(stub) = clause {
             if stub.surface.first().map(String::as_str) == Some("coerce")
                 && stub.outcome == "returns"
             {
-                if let (Some(name), Some(StubPayload::Record(fields))) =
-                    (stub.surface.get(1), stub.payload.as_ref())
-                {
-                    if let Ok(object) = eval_given_record(fields, &format!("stub coerce {name}")) {
-                        outputs.insert(name.clone(), Value::Object(object).to_string());
-                    }
-                }
+                let name = stub
+                    .surface
+                    .get(1)
+                    .ok_or("stub coerce returns names no coerce function")?;
+                let Some(StubPayload::Record(fields)) = stub.payload.as_ref() else {
+                    return Err(format!(
+                        "stub coerce {name} returns needs a record payload `{{ … }}` to inject"
+                    ));
+                };
+                let object = eval_given_record(fields, &format!("stub coerce {name}"))?;
+                outputs.insert(name.clone(), Value::Object(object).to_string());
             }
         }
     }
-    outputs
+    Ok(outputs)
 }
 
 /// Asserted turn results from `stub agent <name> returns { … }` clauses, keyed by
@@ -20213,7 +20244,7 @@ impl WorkerOptions {
     fn parse(args: &[String]) -> Result<Self, String> {
         let mut instance_id = None;
         let mut provider = "fixture".to_owned();
-        let mut exec_profile = ExecProfile::from_env();
+        let mut exec_profile = ExecProfile::from_env()?;
         let mut script_manifest_path = script_manifest_path_from_env();
         let mut package_lock_path = None;
         let mut outcome = FixtureOutcome::Completed;
@@ -20645,13 +20676,10 @@ fn run_claimable_effect(
         // runs in a later `dev`/worker pass once a slot frees. This is reachable
         // under concurrent dispatch (the worker may try to start more turns of one
         // agent than its `capacity` at once); the serial path never hit it. The
-        // kernel surfaces capacity as a `PolicyBlocked` carrying "capacity
-        // exhausted" (other policy blocks are pre-filtered by `claimable_effects`,
+        // store types it as `CapacityBlocked` and the kernel passes the variant
+        // through (other policy blocks are pre-filtered by `claimable_effects`,
         // so a non-capacity block reaching here is a real error worth surfacing).
         Err(StoreError::CapacityBlocked { .. }) => Ok(None),
-        Err(StoreError::PolicyBlocked { reason, .. }) if reason.contains("capacity exhausted") => {
-            Ok(None)
-        }
         // Script hard-off Layer 2 (spec/std-script.md): an exec.command effect
         // with no bound `script.*` capability blocks at admission —
         // `start_run` has already recorded the block (blocked_by_capability,
@@ -23614,12 +23642,27 @@ fn run_native_coerce_effect(
     let program_path = options.program_path.as_ref().ok_or_else(|| {
         StoreError::Conflict("native coerce requires the program path (--program)".to_owned())
     })?;
-    let text = std::fs::read_to_string(program_path).map_err(|error| {
-        StoreError::Conflict(format!("native coerce could not read the program: {error}"))
+    // The same door as the rest of the worker: the source bundle resolved
+    // (so a coerce declared in an `include` is found) and the worker's
+    // `--root` selected (a multi-workflow program has no root otherwise and
+    // does not compile), through the process compile cache.
+    let (_source, ir) = compile_source_path_with_root(
+        program_path.to_str().unwrap_or_default(),
+        options.root.as_deref(),
+    )
+    .map_err(|error| match error {
+        CompileFailure::Io(error) => {
+            StoreError::Conflict(format!("native coerce could not read the program: {error}"))
+        }
+        CompileFailure::Diagnostics { diagnostics, .. } => StoreError::Conflict(format!(
+            "native coerce: program did not compile: {}",
+            diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.message.as_str())
+                .collect::<Vec<_>>()
+                .join("; ")
+        )),
     })?;
-    let ir = whipplescript_parser::compile_program(&text)
-        .ir
-        .ok_or_else(|| StoreError::Conflict("native coerce: program did not compile".to_owned()))?;
     let arguments = json_from_str(&request.arguments_json);
     let media = input
         .get("media")
@@ -30698,7 +30741,7 @@ impl DevOptions {
         let mut root = None;
         let mut branch = None;
         let mut provider = "fixture".to_owned();
-        let mut exec_profile = ExecProfile::from_env();
+        let mut exec_profile = ExecProfile::from_env()?;
         let mut script_manifest_path = script_manifest_path_from_env();
         let mut package_lock_path = None;
         let mut provider_config_paths = Vec::new();
@@ -36534,8 +36577,14 @@ fn trace_effect_status(status: &str) -> EffectStatus {
 
 fn trace_dependency_predicate(predicate: &str) -> DependencyPredicate {
     match predicate {
+        "succeeds" => DependencyPredicate::Succeeds,
         "fails" => DependencyPredicate::Fails,
+        "timed_out" => DependencyPredicate::TimedOut,
+        "cancelled" => DependencyPredicate::Cancelled,
         "completes" => DependencyPredicate::Completes,
+        // Mirrors the kernel's `dependency_edge`: every predicate the lowering
+        // writes is named above, and `every_trace_predicate_round_trips`
+        // keeps this list and `trace_predicate_name` in step.
         _ => DependencyPredicate::Succeeds,
     }
 }
@@ -39102,14 +39151,17 @@ fn branch_command(options: &CliOptions) -> ExitCode {
                 if row.parent_branch_id.is_none() {
                     continue; // mainline has nothing to fold down from
                 }
+                // A bound instance whose row cannot be read is not known
+                // idle: it defers like a running one, the same way a store
+                // that will not open does — never fold or admit under a run
+                // the pass could not see.
                 let quiescent = match (&store, vcs.list_bound_instances_of(&row.branch_id)) {
-                    (Some(store), Ok(instances)) => instances.iter().all(|instance_id| {
-                        store
-                            .status(instance_id)
-                            .ok()
-                            .flatten()
-                            .map(|status| status.instance.status != "running")
-                            .unwrap_or(true)
+                    (Some(store), Ok(instances)) => instances.iter().all(|instance_id| match store
+                        .get_instance(instance_id)
+                    {
+                        Ok(Some(instance)) => instance.status != "running",
+                        Ok(None) => true,
+                        Err(_) => false,
                     }),
                     (None, _) | (_, Err(_)) => false,
                 };
@@ -44058,6 +44110,8 @@ fn trace_predicate_name(predicate: &DependencyPredicate) -> &'static str {
     match predicate {
         DependencyPredicate::Succeeds => "succeeds",
         DependencyPredicate::Fails => "fails",
+        DependencyPredicate::TimedOut => "timed_out",
+        DependencyPredicate::Cancelled => "cancelled",
         DependencyPredicate::Completes => "completes",
     }
 }

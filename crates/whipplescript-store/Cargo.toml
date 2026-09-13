@@ -29,5 +29,12 @@ sha2 = "0.11"
 default = ["native"]
 native = ["dep:rusqlite"]
 
+[dev-dependencies]
+# `functions` lets a test override a built-in SQL function with a counting
+# copy, which is how the tracker's append path proves it no longer
+# string-scans the event log for an issue's heads. Test-only: the production
+# feature set above is unchanged.
+rusqlite = { version = "0.40.1", features = ["bundled", "functions"] }
+
 [lints]
 workspace = true

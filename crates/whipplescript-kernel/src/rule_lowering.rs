@@ -1614,12 +1614,22 @@ pub fn lower_rule(
             input_json,
             status: "queued".to_owned(),
             idempotency_key: effect_idempotency_key,
-            required_capabilities_json: parsed.required_capabilities_json(),
+            required_capabilities_json: parsed.required_capabilities_json_with(
+                effect_node.map(|node| node.required_capabilities.as_slice()),
+            ),
             profile,
             correlation_id: context.identity.clone(),
             source_span_json: effect_node
                 .map(|effect| source_span_json(source_path, effect.span, "effect")),
-            timeout_seconds: parsed.timeout_seconds,
+            // The compiler's node is the authority for a `timeout` clause: the
+            // parser is newline-insensitive, the kernel's line scan reads the
+            // header only, and the row's deadline is what the driver reads.
+            // The scanned value stays as the fallback because `timer.wait`
+            // carries its duration there and nowhere on the node.
+            timeout_seconds: effect_node
+                .and_then(|node| node.timeout_seconds)
+                .map(|seconds| seconds as i64)
+                .or(parsed.timeout_seconds),
         });
     }
 
@@ -1882,12 +1892,17 @@ pub fn lower_rule(
                 input_json,
                 status: "queued".to_owned(),
                 idempotency_key: effect_idempotency_key,
-                required_capabilities_json: parsed.required_capabilities_json(),
+                required_capabilities_json: parsed.required_capabilities_json_with(
+                    effect_node.map(|node| node.required_capabilities.as_slice()),
+                ),
                 profile,
                 correlation_id: after_context.identity.clone(),
                 source_span_json: effect_node
                     .map(|effect| source_span_json(source_path, effect.span, "effect")),
-                timeout_seconds: parsed.timeout_seconds,
+                timeout_seconds: effect_node
+                    .and_then(|node| node.timeout_seconds)
+                    .map(|seconds| seconds as i64)
+                    .or(parsed.timeout_seconds),
             });
         }
         // NESTED after blocks inside this fired block (a chained pipeline —
@@ -2759,6 +2774,18 @@ pub fn append_workflow_terminal(
         return;
     };
     if !workflow_contract_exists(ir, terminal.kind, &terminal.name) {
+        // Refused, not skipped: the compiler already rejects this shape
+        // (`type.unknown_terminal`), so reaching it means the artifact lost
+        // the declaration after the compiler signed off. A silent return
+        // committed the rule with no terminal and left the instance running
+        // with nothing to progress it; an error here becomes the durable
+        // `rule.lowering.unresolved` diagnostic and refuses the commit, as
+        // the sibling re-checks in `parsed_effect_input_json` do.
+        lowering.errors.push(format!(
+            "{} of undeclared workflow contract `{}`",
+            terminal.kind.action(),
+            terminal.name
+        ));
         return;
     }
     let payload = if let Some(scalar_source) = &terminal.scalar {
@@ -2895,6 +2922,16 @@ pub struct ParsedEffect {
 
 impl ParsedEffect {
     pub fn required_capabilities_json(&self) -> String {
+        self.required_capabilities_json_with(None)
+    }
+
+    /// The row's capability list, unioned with what the compiler's effect
+    /// node DECLARES. The kernel's line scan reads `requires […]` from the
+    /// statement's header line, but the parser is newline-insensitive: a
+    /// `requires` on its own modifier line under a `tell` compiles, and the
+    /// row is what the claim gate reads. The node is the authority for the
+    /// author's `requires`; the scan still supplies the kind-derived entries.
+    pub fn required_capabilities_json_with(&self, declared: Option<&[String]>) -> String {
         let mut capabilities = match self.kind.as_str() {
             "schema.coerce" => vec!["schema.coerce".to_owned()],
             "capability.call" => Vec::new(),
@@ -2908,6 +2945,7 @@ impl ParsedEffect {
             _ => Vec::new(),
         };
         capabilities.extend(self.required_capabilities.iter().cloned());
+        capabilities.extend(declared.unwrap_or_default().iter().cloned());
         capabilities.sort();
         capabilities.dedup();
         serde_json::to_string(&capabilities).unwrap_or_else(|_| "[]".to_owned())
@@ -3131,6 +3169,13 @@ pub fn parse_effect_statements(
             continue;
         }
         let current_after = after_scopes.last().map(|scope| scope.scope.clone());
+        // Brace accounting for the enclosing after scopes counts what this
+        // iteration CONSUMED. A block branch swallows its statement through
+        // the line that closed it, so the header's `{` alone would leave every
+        // open scope one level deep for good; the joined statement is
+        // balanced. Heredoc branches (`tell`, `prompt`) keep the header delta:
+        // their interior lines are content.
+        let mut consumed_delta = brace_delta(trimmed);
         if let Some(rest) = trimmed.strip_prefix("invoke ") {
             let (statement, next_index) =
                 parse_statement_until_balanced_braces(&lines, index, trimmed);
@@ -3154,6 +3199,7 @@ pub fn parse_effect_statements(
                 required_capabilities: Vec::new(),
                 after: current_after,
             });
+            consumed_delta = brace_delta(&statement);
             index = next_index;
         } else if let Some(rest) = trimmed.strip_prefix("read ") {
             // read <format> from <store> at <path> as <binding> (std.files): the
@@ -3234,6 +3280,7 @@ pub fn parse_effect_statements(
                 required_capabilities: vec!["custody.mint".to_owned()],
                 after: current_after,
             });
+            consumed_delta = brace_delta(&statement);
             index = next_index;
         } else if trimmed.strip_prefix("request ").is_some() {
             // request <METHOD> "<url>" { header … body … } [signed with <h>]
@@ -3256,6 +3303,7 @@ pub fn parse_effect_statements(
                 required_capabilities: vec!["custody.request".to_owned()],
                 after: current_after,
             });
+            consumed_delta = brace_delta(&statement);
             index = next_index;
         } else if trimmed.strip_prefix("send ").is_some() {
             // send via <channel> { text <expr> [markdown <expr>] [thread_id <expr>] }
@@ -3314,6 +3362,7 @@ pub fn parse_effect_statements(
                 required_capabilities: vec![target],
                 after: current_after,
             });
+            consumed_delta = brace_delta(&statement);
             index = next_index;
         } else if trimmed.strip_prefix("write ").is_some() {
             // write <format> to <store> at <path> { body <expr> mode <mode> } as
@@ -3377,6 +3426,7 @@ pub fn parse_effect_statements(
                 required_capabilities: Vec::new(),
                 after: current_after,
             });
+            consumed_delta = brace_delta(&statement);
             index = next_index;
         } else if let Some(rest) = trimmed.strip_prefix("import ") {
             // import <format> <Schema> from <store> at <path> as <binding>
@@ -3469,6 +3519,7 @@ pub fn parse_effect_statements(
                 required_capabilities: Vec::new(),
                 after: current_after,
             });
+            consumed_delta = brace_delta(&statement);
             index = next_index;
         } else if let Some(rest) = trimmed.strip_prefix("timer until ") {
             // Absolute deadline (spec/scheduled-time.md): the operand is a
@@ -3563,6 +3614,7 @@ pub fn parse_effect_statements(
                 required_capabilities: Vec::new(),
                 after: current_after,
             });
+            consumed_delta = brace_delta(&statement);
             index = next_index;
         } else if let Some(rest) = trimmed.strip_prefix("file ") {
             let (statement, next_index) =
@@ -3587,6 +3639,7 @@ pub fn parse_effect_statements(
                 required_capabilities: Vec::new(),
                 after: current_after,
             });
+            consumed_delta = brace_delta(&statement);
             index = next_index;
         } else if trimmed.starts_with("claim ") && !trimmed.contains(" with ") {
             let rest = trimmed.strip_prefix("claim ").unwrap_or_default();
@@ -3695,6 +3748,7 @@ pub fn parse_effect_statements(
                 required_capabilities: Vec::new(),
                 after: current_after,
             });
+            consumed_delta = brace_delta(&statement);
             index = next_index;
         } else if let Some(rest) = trimmed.strip_prefix("decide ") {
             // Inline anonymous coercion: decide "<prompt>" -> { fields } as x.
@@ -3842,6 +3896,7 @@ pub fn parse_effect_statements(
                 required_capabilities: Vec::new(),
                 after: current_after,
             });
+            consumed_delta = brace_delta(&statement);
             index = next_index;
         } else if let Some(rest) = trimmed.strip_prefix("acquire ") {
             // acquire <lease> for <key-expr> [until ttl] [wait <duration>] as <slot>
@@ -3930,6 +3985,7 @@ pub fn parse_effect_statements(
                 required_capabilities: Vec::new(),
                 after: current_after,
             });
+            consumed_delta = brace_delta(&statement);
             index = next_index;
         } else if trimmed.starts_with("consume ")
             && trimmed.contains(" for ")
@@ -4075,6 +4131,7 @@ pub fn parse_effect_statements(
                 required_capabilities: Vec::new(),
                 after: current_after,
             });
+            consumed_delta = brace_delta(&statement);
             index = next_index;
         } else if let Some((pool, query)) = parse_recall_statement(trimmed) {
             let target = "memory.query".to_owned();
@@ -4135,6 +4192,7 @@ pub fn parse_effect_statements(
                 required_capabilities: vec![target],
                 after: current_after,
             });
+            consumed_delta = brace_delta(&statement);
             index = next_index;
         } else if trimmed.strip_prefix("curate ").is_some() {
             // curate <pool> [{ reason <expr> }] as <binding> (std.memory). The
@@ -4177,6 +4235,7 @@ pub fn parse_effect_statements(
                 required_capabilities: vec![target],
                 after: current_after,
             });
+            consumed_delta = brace_delta(&statement);
             index = next_index;
         } else if let Some(rest) = trimmed.strip_prefix("undo ") {
             // undo "<selection>" as <binding> (std.vcs, DR-0052 R4): a
@@ -4307,7 +4366,7 @@ pub fn parse_effect_statements(
                 after: current_after,
             });
         }
-        let delta = brace_delta(trimmed);
+        let delta = consumed_delta;
         for scope in &mut after_scopes {
             scope.depth += delta;
         }
@@ -7619,6 +7678,47 @@ rule strike
             |ir| ir.counters.clear(),
         );
     }
+
+    /// A terminal naming a contract the artifact no longer declares is
+    /// REFUSED, like every sibling re-check above. `append_workflow_terminal`
+    /// returned silently instead: the rule committed its facts and effects
+    /// with no terminal, the instance stayed `running` with nothing left to
+    /// progress it, and no diagnostic said why. The compiler refuses this
+    /// program shape first (`type.unknown_terminal`), so the only road here
+    /// is the deleted declaration this test models.
+    #[test]
+    fn complete_of_a_workflow_contract_the_artifact_no_longer_declares_is_refused() {
+        let mut ir = ir_of(
+            r#"workflow Finish
+
+output result Done
+
+class Done {
+  note string
+}
+
+class Task {
+  id string
+}
+
+rule finish
+  when Task as t
+=> {
+  complete result {
+    note t.id
+  }
+}
+"#,
+        );
+        let facts = vec![fact("Task", "Task:t1", r#"{"id":"t1"}"#)];
+        assert_only_after_deleting(
+            &mut ir,
+            "finish",
+            &facts,
+            "complete of undeclared workflow contract `result`",
+            |ir| ir.workflow_contracts.clear(),
+        );
+    }
 }
 
 #[cfg(test)]
@@ -8122,6 +8222,155 @@ release slot
         let own_only = lease_acquire_bindings(&unthreaded);
         rewrite_lease_releases(&mut unthreaded, &own_only);
         assert_eq!(unthreaded[0].kind, "tracker.release", "{unthreaded:?}");
+    }
+
+    /// A nested `after` block that holds a multi-line brace statement
+    /// (`finish c { ... }`) must close when its `}` arrives: the sibling
+    /// effect the author placed AFTER the nested block, at the enclosing
+    /// level, carries no nested scope. The scanner skips the consumed block's
+    /// lines, so its brace accounting must count what it consumed rather than
+    /// the header alone — otherwise the nested scope stayed open, and the
+    /// sibling `tell` was deferred until `t` settled (never, if `t` failed).
+    #[test]
+    fn nested_after_block_with_multi_line_statement_closes_its_scope() {
+        let body = r#"
+tell worker "do" as t
+after t succeeds {
+  finish c {
+    note "done"
+  }
+}
+tell auditor "audit" as a
+"#;
+        let effects =
+            parse_effect_statements(body, &RuleContext::default(), &[], &[], &empty_ir_program());
+        let finish = effects
+            .iter()
+            .find(|effect| effect.kind == "tracker.finish")
+            .expect("finish parses");
+        assert_eq!(
+            finish.after,
+            Some(AfterScope {
+                binding: "t".to_owned(),
+                predicate: "succeeds".to_owned(),
+            }),
+            "{effects:?}"
+        );
+        let auditor = effects
+            .iter()
+            .find(|effect| effect.binding.as_deref() == Some("a"))
+            .expect("trailing tell parses");
+        assert_eq!(
+            auditor.after, None,
+            "a sibling after the nested block is at the enclosing level: {effects:?}"
+        );
+    }
+
+    /// The parser is token-based and newline-insensitive: `requires […]` and
+    /// `timeout …` may sit on their own modifier lines under a `tell` (the
+    /// shipped least-privilege example already writes its `as`/`with access
+    /// to` that way). The durable effect row must carry what the compiler
+    /// accepted — the row is what the deadline driver and the claim gate
+    /// read — so a modifier the kernel's header-line scan never saw still
+    /// reaches `timeout_seconds` and `required_capabilities_json`. A tell
+    /// without either modifier keeps `None` and the bare list.
+    #[test]
+    fn modifier_lines_under_a_tell_reach_the_durable_effect_row() {
+        let src = r#"workflow Modifiers
+
+output result Done
+
+class Done {
+  ok bool
+}
+
+class Task {
+  id string
+}
+
+agent worker {
+  provider fixture
+  profile "code"
+  capacity 1
+  capabilities ["agent.tell", "repo.write"]
+}
+
+rule modified
+  when Task as t
+=> {
+  tell worker as turn
+    requires ["repo.write"]
+    timeout 10m
+  """markdown
+  Work on {{ t.id }}.
+  """
+  after turn completes { complete result { ok true } }
+}
+
+rule bare
+  when Task as t
+=> {
+  tell worker as plain
+  """markdown
+  Work on {{ t.id }}.
+  """
+  after plain completes { complete result { ok true } }
+}
+"#;
+        let compiled = whipplescript_parser::compile_program(src);
+        let ir = compiled
+            .ir
+            .unwrap_or_else(|| panic!("compiles: {:?}", compiled.diagnostics));
+        let facts = vec![fact("Task", "Task:t1", r#"{"id":"t1"}"#)];
+        let lowered_tell = |rule_name: &str| {
+            let rule = ir
+                .rules
+                .iter()
+                .find(|rule| rule.name == rule_name)
+                .expect("fixture rule");
+            let ready = ready_contexts(&ir, rule, &facts, &[], None);
+            assert_eq!(ready.contexts.len(), 1, "{rule_name} is ready once");
+            let lowering = lower_rule(
+                "ins_test",
+                "ver_test",
+                "0",
+                "fixture",
+                &ir,
+                rule,
+                &ready.contexts[0],
+                &facts,
+                &[],
+                None,
+            );
+            assert_eq!(lowering.errors, Vec::<String>::new());
+            lowering
+                .effects
+                .into_iter()
+                .find(|effect| effect.kind == "agent.tell")
+                .expect("the tell lowers")
+        };
+
+        let modified = lowered_tell("modified");
+        assert_eq!(
+            modified.timeout_seconds,
+            Some(600),
+            "a `timeout 10m` modifier line is the row's deadline"
+        );
+        assert!(
+            modified
+                .required_capabilities_json
+                .contains("\"repo.write\""),
+            "a `requires` modifier line reaches the row: {}",
+            modified.required_capabilities_json
+        );
+
+        let bare = lowered_tell("bare");
+        assert_eq!(bare.timeout_seconds, None, "no modifier, no deadline");
+        assert!(
+            !bare.required_capabilities_json.contains("repo.write"),
+            "no modifier, no requirement: {}",
+            bare.required_capabilities_json
+        );
     }
 
     /// T3 renew disambiguation (mirroring `release`): a `renew <binding>`

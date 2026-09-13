@@ -357,17 +357,28 @@ impl Envelope {
             .filter(|name| !name.is_empty())
             .map(str::to_owned);
         let authority_ref = authority.as_deref();
-        let requires_authority: BTreeSet<String> = value
-            .get("requires_authority")
-            .and_then(serde_json::Value::as_array)
-            .map(|items| {
-                items
-                    .iter()
-                    .filter_map(serde_json::Value::as_str)
-                    .map(str::to_owned)
-                    .collect()
-            })
-            .unwrap_or_default();
+        // Every arm here refuses what it cannot read rather than dropping it:
+        // a dropped requirement removes a presence check and a dropped
+        // attachment removes the compartments a counterparty meant to add,
+        // both fail-open, and the DSL arms refuse the same shapes.
+        let mut requires_authority: BTreeSet<String> = BTreeSet::new();
+        match value.get("requires_authority") {
+            None => {}
+            Some(serde_json::Value::Array(items)) => {
+                for item in items {
+                    let Some(name) = item.as_str() else {
+                        return Err(
+                            "invalid IFC envelope: requires_authority entries must be strings"
+                                .to_owned(),
+                        );
+                    };
+                    requires_authority.insert(name.to_owned());
+                }
+            }
+            Some(_) => {
+                return Err("invalid IFC envelope: requires_authority must be an array".to_owned())
+            }
+        }
         let policy_lifetime = value
             .get("policy_lifetime")
             .and_then(serde_json::Value::as_u64);
@@ -382,33 +393,49 @@ impl Envelope {
                     .collect()
             })
             .unwrap_or_default();
-        let mut attachments: Vec<Attachment> = value
-            .get("attachments")
-            .and_then(serde_json::Value::as_array)
-            .map(|items| {
-                items
-                    .iter()
-                    .filter_map(|item| {
-                        Some(Attachment {
-                            authority: item.get("authority")?.as_str()?.to_owned(),
-                            exposure: item.get("exposure")?.as_str()?.to_owned(),
-                            digest: item.get("digest")?.as_str()?.to_owned(),
-                            readers: item
-                                .get("reader")
-                                .and_then(serde_json::Value::as_array)
-                                .map(|roles| {
-                                    roles
-                                        .iter()
-                                        .filter_map(serde_json::Value::as_str)
-                                        .map(str::to_owned)
-                                        .collect()
-                                })
-                                .unwrap_or_default(),
-                        })
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
+        let mut attachments: Vec<Attachment> = Vec::new();
+        match value.get("attachments") {
+            None => {}
+            Some(serde_json::Value::Array(items)) => {
+                for item in items {
+                    let (Some(authority), Some(exposure), Some(digest)) = (
+                        item.get("authority").and_then(serde_json::Value::as_str),
+                        item.get("exposure").and_then(serde_json::Value::as_str),
+                        item.get("digest").and_then(serde_json::Value::as_str),
+                    ) else {
+                        return Err("invalid IFC envelope: an attachment needs `authority`, \
+                                    `exposure` and `digest`"
+                            .to_owned());
+                    };
+                    let mut readers = BTreeSet::new();
+                    match item.get("reader") {
+                        None => {}
+                        Some(serde_json::Value::Array(roles)) => {
+                            for role in roles {
+                                let Some(role) = role.as_str() else {
+                                    return Err("invalid IFC envelope: an attachment's \
+                                                `reader` must be an array of roles"
+                                        .to_owned());
+                                };
+                                readers.insert(role.to_owned());
+                            }
+                        }
+                        Some(_) => {
+                            return Err("invalid IFC envelope: an attachment's `reader` must \
+                                        be an array of roles"
+                                .to_owned())
+                        }
+                    }
+                    attachments.push(Attachment {
+                        authority: authority.to_owned(),
+                        exposure: exposure.to_owned(),
+                        digest: digest.to_owned(),
+                        readers,
+                    });
+                }
+            }
+            Some(_) => return Err("invalid IFC envelope: attachments must be an array".to_owned()),
+        }
         let mut readers = BTreeMap::new();
         let mut governed = BTreeSet::new();
         let mut deleg = Vec::new();
@@ -461,7 +488,7 @@ impl Envelope {
         let custodian_role: Option<String> = value
             .get("custodian_role")
             .and_then(serde_json::Value::as_str)
-            .map(str::to_owned);
+            .map(|role| qualify_role(role, authority_ref));
         let mut integrity = BTreeMap::new();
         let mut endorse = Vec::new();
         let mut principals = BTreeSet::new();
@@ -532,7 +559,9 @@ impl Envelope {
                                 crate::provider_trust::CustodyClass::NAMES
                             )
                         })?;
-                    custody_demand.insert(role.clone(), parsed);
+                    // Keyed by the role the delegation edge carries, which is
+                    // the qualified one under an authority (DR-0063 §2).
+                    custody_demand.insert(qualify_role(role, authority_ref), parsed);
                 }
             }
             Some(_) => return Err("custody_demand must be an object".to_owned()),
@@ -1101,7 +1130,9 @@ impl Envelope {
                         index + 1
                     ));
                 }
-                custodian_role = Some((*role).to_owned());
+                // Qualified like every other role in the policy, so a
+                // `delegate <Custodian> acts-for <Role>` line can clear it.
+                custodian_role = Some(qualify_role(role, authority_ref));
                 continue;
             }
             if tokens.first().copied() == Some("require") {
@@ -1149,7 +1180,10 @@ impl Envelope {
                     // `require custody <class> for <Role>` (DR-0062 §6): the
                     // minimum custody class an endpoint must reach before a
                     // delegation may grant it read-authority for that role.
-                    // Keyed by role so the check lands at the delegation edge.
+                    // Keyed by role so the check lands at the delegation edge —
+                    // the role as the edge stores it, qualified under an
+                    // authority, or `custody_demand_for` answers `None` for
+                    // every edge and the demand silently binds nothing.
                     (Some("custody"), Some(class)) => {
                         let parsed =
                             crate::provider_trust::CustodyClass::parse(class).ok_or_else(|| {
@@ -1165,7 +1199,7 @@ impl Envelope {
                         // an endpoint, so an unscoped one has no meaning.
                         match (tokens.get(3).copied(), tokens.get(4).copied()) {
                             (Some("for"), Some(role)) => {
-                                custody_demand.insert(role.to_owned(), parsed);
+                                custody_demand.insert(qualify_role(role, authority_ref), parsed);
                                 continue;
                             }
                             _ => {
@@ -1339,56 +1373,139 @@ impl Envelope {
                 principals.insert(address.clone());
             }
             let label = &tokens[arrow + 2..];
-            // `readable by <Role>[, <Role>...]` sets the reader-authority SET (E6):
-            // every compartment listed after `by`, up to the `from` keyword or the
-            // end. Roles may be comma- or space-separated; `public` is dropped.
-            if let Some(by) = label.iter().position(|tok| *tok == "by") {
-                let until = label
-                    .iter()
-                    .skip(by + 1)
-                    .position(|tok| *tok == "from")
-                    .map_or(label.len(), |rel| by + 1 + rel);
-                let roles =
-                    qualify_role_set(collect_role_set(&label[by + 1..until]), authority_ref);
-                if !roles.is_empty() {
-                    readers.insert(address.clone(), DualLabel::both(roles));
-                }
-            }
-            // `egress from workflow` (DR-0053 §9 Amendment 2026-08-29): the
-            // custodian signs the handshake and never sees the connection or
-            // the payload. `egress through custodian` is the default and needs
-            // no clause; naming it explicitly is accepted so a policy can say
-            // what it means.
-            if let Some(at) = label.iter().position(|tok| *tok == "egress") {
-                match (label.get(at + 1).copied(), label.get(at + 2).copied()) {
-                    (Some("from"), Some("workflow")) => {
-                        confined_egress.insert(address.clone());
+            // The label is a sequence of CLAUSES, walked in order: a role run
+            // ends where the next clause begins, so `readable by Clinician
+            // egress from workflow` names one reader and no voucher. Scanning
+            // for `by` and `from` by position instead read `egress` as a
+            // reader and `workflow` as a voucher, and signed both into the
+            // canonical form. A token that heads no clause is refused rather
+            // than absorbed as a compartment nobody named.
+            let mut at = 0;
+            while at < label.len() {
+                match label[at] {
+                    // `readable by <Role>[, <Role>...]` sets the reader-authority
+                    // SET (E6): every compartment listed after `by`, up to the
+                    // next clause. Roles may be comma- or space-separated;
+                    // `public` is dropped.
+                    "readable" => {
+                        if label.get(at + 1).copied() != Some("by") {
+                            return Err(format!(
+                                "line {}: readable needs `readable by <Role>[, <Role>...]`",
+                                index + 1
+                            ));
+                        }
+                        let end = label_clause_end(label, at + 2);
+                        let roles =
+                            qualify_role_set(collect_role_set(&label[at + 2..end]), authority_ref);
+                        if !roles.is_empty() {
+                            readers.insert(address.clone(), DualLabel::both(roles));
+                        }
+                        at = end;
                     }
-                    (Some("through"), Some("custodian")) => {}
-                    _ => {
+                    // `from <Role>[, <Role>...]` sets the integrity (vouching)
+                    // SET: the compartments after `from`, up to the next clause.
+                    "from" => {
+                        let end = label_clause_end(label, at + 1);
+                        let roles =
+                            qualify_role_set(collect_role_set(&label[at + 1..end]), authority_ref);
+                        if !roles.is_empty() {
+                            integrity.insert(address.clone(), DualLabel::both(roles));
+                        }
+                        at = end;
+                    }
+                    // `egress from workflow` (DR-0053 §9 Amendment 2026-08-29):
+                    // the custodian signs the handshake and never sees the
+                    // connection or the payload. `egress through custodian` is
+                    // the default and needs no clause; naming it explicitly is
+                    // accepted so a policy can say what it means.
+                    "egress" => {
+                        match (label.get(at + 1).copied(), label.get(at + 2).copied()) {
+                            (Some("from"), Some("workflow")) => {
+                                confined_egress.insert(address.clone());
+                            }
+                            (Some("through"), Some("custodian")) => {}
+                            _ => {
+                                return Err(format!(
+                                    "line {}: egress needs `egress from workflow` or \
+                                     `egress through custodian`",
+                                    index + 1
+                                ));
+                            }
+                        }
+                        at += 3;
+                    }
+                    // `internal` marks a signal an internal channel (H8 stage b):
+                    // its integrity is derived from its emitters, not the
+                    // external-entry low.
+                    "internal" => {
+                        if address.starts_with("invoke:") {
+                            internal_workflows.insert(address.clone());
+                        } else {
+                            internal_signals.insert(address.clone());
+                        }
+                        at += 1;
+                    }
+                    // `sealed at <rung>` (DR-0074 §2) declares the rung the
+                    // credential is sealed at. The rung a deployment demands is
+                    // `require credential <rung>`, judged against what the
+                    // custodian attests, so the declaration binds nothing here;
+                    // its shape is still checked so a misspelling cannot pass
+                    // as a role.
+                    "sealed" => {
+                        let (Some("at"), Some(rung)) =
+                            (label.get(at + 1).copied(), label.get(at + 2).copied())
+                        else {
+                            return Err(format!(
+                                "line {}: sealed needs `sealed at <rung>`",
+                                index + 1
+                            ));
+                        };
+                        whipplescript_custody::Rung::parse(rung).map_err(|_| {
+                            format!(
+                                "line {}: unknown sealing rung `{rung}` \
+                                 (process | os-keyring | hardware | remote)",
+                                index + 1
+                            )
+                        })?;
+                        at += 3;
+                    }
+                    // A bare `public` is the explicit bottom: no readers, no
+                    // vouchers, the same as writing no clause at all.
+                    PUBLIC => {
+                        at += 1;
+                    }
+                    // `audience { <Role>[, <Role>...] }` is the sink-audience
+                    // form `spec/information-flow-surface.md` documents. The
+                    // reader set is not derived from it (it is deferred, and
+                    // has been since the surface was written), so the clause
+                    // is consumed for its shape and binds nothing — exactly
+                    // what the position scan did with it — rather than
+                    // refused, which would reject the specification's own
+                    // example.
+                    "audience" => {
+                        let close = label
+                            .get(at + 1)
+                            .filter(|open| open.starts_with('{'))
+                            .and_then(|_| {
+                                label.iter().skip(at + 1).position(|tok| tok.ends_with('}'))
+                            });
+                        let Some(close) = close else {
+                            return Err(format!(
+                                "line {}: audience needs `audience {{ <Role>[, <Role>...] }}`",
+                                index + 1
+                            ));
+                        };
+                        at += close + 2;
+                    }
+                    other => {
                         return Err(format!(
-                            "line {}: egress needs `egress from workflow` or \
-                             `egress through custodian`",
+                            "line {}: `{other}` is not a label clause (a grant label is \
+                             `readable by <Role>`, `from <Role>`, `sealed at <rung>`, \
+                             `egress from workflow`, `egress through custodian`, \
+                             `internal`, `audience {{ <Role> }}` or `public`)",
                             index + 1
                         ));
                     }
-                }
-            }
-            // `internal` marks a signal an internal channel (H8 stage b): its
-            // integrity is derived from its emitters, not the external-entry low.
-            if label.contains(&"internal") {
-                if address.starts_with("invoke:") {
-                    internal_workflows.insert(address.clone());
-                } else {
-                    internal_signals.insert(address.clone());
-                }
-            }
-            // `from <Role>[, <Role>...]` sets the integrity (vouching) SET: the
-            // compartments after `from` to the end.
-            if let Some(from) = label.iter().position(|tok| *tok == "from") {
-                let roles = qualify_role_set(collect_role_set(&label[from + 1..]), authority_ref);
-                if !roles.is_empty() {
-                    integrity.insert(address, DualLabel::both(roles));
                 }
             }
         }
@@ -1792,30 +1909,49 @@ impl Envelope {
     /// The compartments a WRITE to this resource must be covered by — the
     /// `provider` side of a confidentiality crossing.
     ///
-    /// A credential sink gains the CUSTODIAN's role unless its grant confines
-    /// egress to the workflow (DR-0053 §9 Amendment 2026-08-29). The custodian
-    /// is a separate principal, so routing a payload through it to egress is a
-    /// disclosure to a second party — and a credential's `readable by` set
-    /// describes the ENDPOINT's clearance, saying nothing about the party in
-    /// between. Without this, a policy reading "PHI may reach the clinical API"
-    /// silently also permits "PHI may enter the custodian".
-    ///
-    /// Adding to the SINK makes the check strictly harder to satisfy, which is
-    /// the direction that refuses: the leak check denies a flow whose sink
-    /// readers are not all within the value's readers.
+    /// This is the ENDPOINT's clearance and nothing else. The custodian a
+    /// credential routes through is a second party that reads the payload,
+    /// and it is checked as one — see `custodian_reader_of` — never folded in
+    /// here: `dominates` quantifies `any` over this set, so one more
+    /// compartment on the sink covers more and can only ADMIT more.
     fn reader_sink(&self, resource: &str) -> BTreeSet<String> {
-        let address = self.resolve(resource);
-        let mut sink = self
-            .readers
-            .get(address)
+        self.readers
+            .get(self.resolve(resource))
             .map(|label| label.sink.clone())
-            .unwrap_or_default();
-        if let Some(role) = &self.custodian_role {
-            if address.starts_with("credential:") && !self.confined_egress.contains(address) {
-                sink.insert(role.clone());
-            }
-        }
-        sink
+            .unwrap_or_default()
+    }
+
+    /// The custodian's role when a write to `resource` discloses the payload
+    /// to it (DR-0053 §9 Amendment 2026-08-29): a policy names a custodian,
+    /// the sink is a credential, and its grant does not confine egress to the
+    /// workflow. The custodian is a separate principal, so routing a payload
+    /// through it to egress is a disclosure to a second party — and a
+    /// credential's `readable by` set describes the ENDPOINT's clearance,
+    /// saying nothing about the party in between. Without this, a policy
+    /// reading "PHI may reach the clinical API" silently also permits "PHI
+    /// may enter the custodian".
+    ///
+    /// Under `egress from workflow` the custodian receives a handshake hash
+    /// and never the payload, which is what entitles that sink to drop it.
+    fn custodian_reader_of(&self, resource: &str) -> Option<&str> {
+        let address = self.resolve(resource);
+        let role = self.custodian_role.as_deref()?;
+        (address.starts_with("credential:") && !self.confined_egress.contains(address))
+            .then_some(role)
+    }
+
+    /// The custodian that reads `sink` yet is not cleared for `source` — a
+    /// party the endpoint's clearance never mentioned, checked as its own
+    /// required clearance beside the sink's. `None` when no custodian reads
+    /// the sink, or when the one that does acts-for every compartment of the
+    /// source (a `delegate <Custodian> acts-for <Role>` line).
+    fn uncleared_custodian(&self, source: &str, sink: &str) -> Option<&str> {
+        let custodian = self.custodian_reader_of(sink)?;
+        (!self.dominates(
+            &BTreeSet::from([custodian.to_owned()]),
+            &self.reader_set(source),
+        ))
+        .then_some(custodian)
     }
 
     /// A reader label rendered for diagnostics: `public` for the empty set, else the
@@ -1956,6 +2092,7 @@ impl Envelope {
     /// applies `declassify_releases` to marked releases; nothing else crosses.
     fn leaks(&self, source: &str, sink: &str) -> bool {
         !self.dominates(&self.reader_sink(sink), &self.reader_set(source))
+            || self.uncleared_custodian(source, sink).is_some()
     }
 
     /// Whether an audited declassify grant releases `source` to an audience the
@@ -1968,10 +2105,19 @@ impl Envelope {
     /// world — covers no named role, so this is the only way it can arm).
     fn declassify_releases(&self, source: &str, sink: &str) -> bool {
         let sink_readers = self.reader_sink(sink);
+        // A release to an audience is still read by the custodian the sink
+        // routes through, so the custodian must be cleared for that audience
+        // exactly as the endpoint must.
+        let custodian = self
+            .custodian_reader_of(sink)
+            .map(|role| BTreeSet::from([role.to_owned()]));
         self.declassify.iter().any(|(resource, role)| {
             self.resolve(resource) == self.resolve(source)
                 && (role == PUBLIC
-                    || self.dominates(&sink_readers, &BTreeSet::from([role.clone()])))
+                    || (self.dominates(&sink_readers, &BTreeSet::from([role.clone()]))
+                        && custodian.as_ref().is_none_or(|custodian| {
+                            self.dominates(custodian, &BTreeSet::from([role.clone()]))
+                        })))
         })
     }
 
@@ -2355,6 +2501,21 @@ fn qualify_role_set(roles: BTreeSet<String>, authority: Option<&str>) -> BTreeSe
         .into_iter()
         .map(|role| qualify_role(&role, authority))
         .collect()
+}
+
+/// Where a role run starting at `start` ends: the index of the next token
+/// that heads a grant-label clause, or the end of the label.
+fn label_clause_end(label: &[&str], start: usize) -> usize {
+    label
+        .iter()
+        .skip(start)
+        .position(|tok| {
+            matches!(
+                *tok,
+                "readable" | "from" | "egress" | "internal" | "sealed" | "audience"
+            )
+        })
+        .map_or(label.len(), |rel| start + rel)
 }
 
 fn collect_role_set(tokens: &[&str]) -> BTreeSet<String> {
@@ -3270,6 +3431,21 @@ impl Composition {
     /// meet. A constituent that would refuse this flow makes the meet refuse it.
     pub fn leaks(&self, source: &str, sink: &str) -> bool {
         !self.dominates(&self.reader_sink(sink), &self.reader_source(source))
+            || self.uncleared_custodian(source, sink).is_some()
+    }
+
+    /// The custodian conjunct under the meet: any constituent whose custodian
+    /// reads `sink` makes that custodian a required clearance for the composed
+    /// source, judged over the unanimous edges. A constituent that would
+    /// refuse the disclosure makes the meet refuse it.
+    fn uncleared_custodian(&self, source: &str, sink: &str) -> Option<&str> {
+        let required = self.reader_source(source);
+        self.constituents
+            .iter()
+            .filter_map(|envelope| envelope.custodian_reader_of(sink))
+            .find(|custodian| {
+                !self.dominates(&BTreeSet::from([(*custodian).to_owned()]), &required)
+            })
     }
 
     /// Whether data read from `read` may drive `write`, under the meet.
@@ -3310,6 +3486,28 @@ pub struct CompositionProjection {
 /// this name to speak about "whatever backend the registry resolves"; naming a
 /// provider on the declaration is what buys per-endpoint governance.
 pub const UNNAMED_COERCE_BACKEND: &str = "model";
+
+/// The model endpoint an agent's turn ships its context to: a direct
+/// `provider <kind>` / `delegated to` binding (lowering also defaults a bare
+/// managed agent to `owned`), else the kind of the harness it is bound to
+/// `using`. The kind lives on the `harness` declaration in that case, so an
+/// agent read through `IrAgent::provider` alone has no provider door at all —
+/// no egress check, no endpoint in the surface — while it reaches the same
+/// model as one naming the kind directly. Every provider-principal site goes
+/// through here so they cannot disagree.
+fn agent_provider_kind<'a>(
+    ir: &'a IrProgram,
+    agent: &'a whipplescript_parser::IrAgent,
+) -> Option<&'a str> {
+    agent.provider.as_deref().or_else(|| {
+        agent.harness.as_deref().and_then(|name| {
+            ir.harnesses
+                .iter()
+                .find(|harness| harness.name == name)
+                .map(|harness| harness.kind.as_str())
+        })
+    })
+}
 
 /// The outcome of crossing the trust boundary.
 pub enum EnvelopeStatus {
@@ -4052,10 +4250,7 @@ fn fact_reach_map(
         .agents
         .iter()
         .filter_map(|agent| {
-            agent
-                .provider
-                .as_deref()
-                .map(|provider| (agent.name.as_str(), provider))
+            agent_provider_kind(ir, agent).map(|provider| (agent.name.as_str(), provider))
         })
         .collect();
     loop {
@@ -4842,7 +5037,7 @@ pub fn check_with_envelope_imports(
                     .agent
                     .as_deref()
                     .and_then(|name| ir.agents.iter().find(|a| a.name == name));
-                if let Some(provider) = declaration.and_then(|a| a.provider.as_deref()) {
+                if let Some(provider) = declaration.and_then(|a| agent_provider_kind(ir, a)) {
                     for grant in &effect.access_grants {
                         let resource = grant.resource.as_str();
                         let reads_resource =
@@ -5118,7 +5313,7 @@ pub fn check_with_envelope_imports(
                     // in the effects loop only inspects `effect.access_grants`
                     // and never sees these tool result reads, so check them
                     // against the provider here.
-                    if let Some(provider) = agent.provider.as_deref() {
+                    if let Some(provider) = agent_provider_kind(ir, agent) {
                         for resource in &reads {
                             if envelope.leaks(resource, provider) {
                                 diagnostics.push(Diagnostic {
@@ -5334,10 +5529,7 @@ pub fn check_with_envelope_imports(
             .agents
             .iter()
             .filter_map(|agent| {
-                agent
-                    .provider
-                    .as_deref()
-                    .map(|provider| (agent.name.as_str(), provider))
+                agent_provider_kind(ir, agent).map(|provider| (agent.name.as_str(), provider))
             })
             .collect();
         let mut output_inject: Option<(String, String, bool)> = None;
@@ -5419,6 +5611,19 @@ pub fn check_with_envelope_imports(
             } else {
                 ""
             };
+            // The endpoint's clearance can be in order while the party in
+            // between is not; say which one refused, or the two reader labels
+            // read as a contradiction.
+            let custodian_note = envelope
+                .uncleared_custodian(&src, &sink)
+                .map(|custodian| {
+                    format!(
+                        " — and `{sink}` routes its payload through custodian `{custodian}`, \
+                         which is not cleared for those readers (DR-0053 §9: confine the \
+                         credential with `egress from workflow`, or delegate the custodian)"
+                    )
+                })
+                .unwrap_or_default();
             diagnostics.push(Diagnostic {
                 code: diagnostic_code!("security.confidentiality_leak"),
                 severity: Severity::Error,
@@ -5427,7 +5632,8 @@ pub fn check_with_envelope_imports(
                     "denied flow in rule `{rule}`: `{src}` may be read by {src_reader} only — \
                      writing it to `{sink}` (readable by {sink_reader}) would expose it to parties \
                      outside its readers (the checker denies every flow from a value to a sink \
-                     whose readers are not all within the value's reader set){reach_note}",
+                     whose readers are not all within the value's reader set){reach_note}\
+                     {custodian_note}",
                     rule = rule.name,
                     src_reader = envelope.reader_label(&src),
                     sink_reader = envelope.reader_label(&sink),
@@ -5869,7 +6075,7 @@ pub fn ifc_surface(ir: &IrProgram) -> Vec<String> {
                     .agent
                     .as_deref()
                     .and_then(|name| ir.agents.iter().find(|a| a.name == name))
-                    .and_then(|a| a.provider.as_deref())
+                    .and_then(|a| agent_provider_kind(ir, a))
                 {
                     surface.insert(provider.to_owned());
                 }
@@ -6470,6 +6676,75 @@ rule work
         );
     }
 
+    /// An agent bound `using <harness>` reaches the same model endpoint as one
+    /// declaring `provider <kind>` directly: the kind lives on the harness
+    /// declaration and lowering leaves `IrAgent::provider` empty. The checker
+    /// read only that field, so a harness-bound turn had no provider door at
+    /// all — no egress check on its context, and no endpoint in the attested
+    /// surface — while the CLI's own `resolved_agent_provider_kind` knew the
+    /// answer.
+    #[test]
+    fn a_harness_bound_agent_egresses_to_the_harness_kind() {
+        let program = format!(
+            r#"@service
+workflow IfcTest
+
+output result R
+class R {{ ok bool }}
+class Ticket {{ id string  status "open" }}
+
+harness runner: fixture
+agent coder using runner {{ profile "repo-writer"  capacity 1 }}
+
+file store ledger {{ root "./ledger"  allow read ["**"] }}
+
+table seed as Ticket [ {{ id "T1"  status "open" }} ]
+
+rule work
+  when Ticket as ticket where ticket.status == "open"
+  when coder is available
+=> {{
+  tell coder as turn
+{READ_LEDGER}  "go"
+
+  after turn succeeds as outcome {{
+    complete result {{ ok true }}
+  }}
+}}
+"#
+        );
+        let compiled = compile_program(&program);
+        let ir = compiled.ir.unwrap_or_else(|| {
+            panic!(
+                "fixture should compile, diagnostics: {:?}",
+                compiled
+                    .diagnostics
+                    .iter()
+                    .map(|d| &d.message)
+                    .collect::<Vec<_>>()
+            )
+        });
+        assert!(
+            ifc_surface(&ir).iter().any(|door| door == "fixture"),
+            "the harness kind is the turn's provider door: {:?}",
+            ifc_surface(&ir)
+        );
+        let envelope =
+            Envelope::from_json(r#"{ "resources": { "ledger": { "confidential": true } } }"#)
+                .expect("valid envelope");
+        let denials: Vec<String> = check_with_envelope(&ir, &VerifiedEnvelope::for_test(envelope))
+            .into_iter()
+            .filter(|d| d.code.as_str() == "security.provider_egress_leak")
+            .map(|d| d.message)
+            .collect();
+        assert!(
+            denials
+                .iter()
+                .any(|m| m.contains("denied egress in rule `work`") && m.contains("`fixture`")),
+            "a harness-bound turn over confidential data egresses to the harness kind: {denials:#?}"
+        );
+    }
+
     /// The same sink could also hide in an `on lapse` arm.
     ///
     /// `extract_rule_regions` makes the canonical rule body the HOLDS variant —
@@ -6740,6 +7015,73 @@ party bob@acme.com : Requester\n";
                 "unexpected refusal for {envelope}: {error}"
             );
         }
+    }
+
+    /// A hand-written JSON envelope is a supported door, and its
+    /// `attachments` and `requires_authority` arms dropped what they could
+    /// not read: an attachment missing `digest` (or carrying a number there)
+    /// vanished, and with it the compartments a counterparty meant to add;
+    /// a non-string `requires_authority` entry removed a presence check; a
+    /// non-array under either key emptied it. Each is a fail-OPEN drop of
+    /// the kind `check_attachments_resolve` says §8 exists to make
+    /// impossible, and the DSL `attach` / `requires authority` arms and the
+    /// sibling `unwrap_grants` JSON arm refuse the same shapes.
+    #[test]
+    fn json_refuses_an_attachment_or_required_authority_it_cannot_read() {
+        for (envelope, prose) in [
+            (
+                r#"{ "resources": {}, "attachments": [{ "authority": "beta", "exposure": "res-3" }] }"#,
+                "an attachment needs",
+            ),
+            (
+                r#"{ "resources": {}, "attachments": [{ "authority": "beta", "exposure": "res-3", "digest": 7 }] }"#,
+                "an attachment needs",
+            ),
+            (
+                r#"{ "resources": {}, "attachments": [{ "authority": "beta", "exposure": "res-3", "digest": "deadbeef", "reader": "Auditor" }] }"#,
+                "must be an array of roles",
+            ),
+            (
+                r#"{ "resources": {}, "attachments": [{ "authority": "beta", "exposure": "res-3", "digest": "deadbeef", "reader": ["Auditor", 7] }] }"#,
+                "must be an array of roles",
+            ),
+            (
+                r#"{ "resources": {}, "attachments": {} }"#,
+                "attachments must be an array",
+            ),
+            (
+                r#"{ "resources": {}, "requires_authority": ["beta", 7] }"#,
+                "requires_authority entries must be strings",
+            ),
+            (
+                r#"{ "resources": {}, "requires_authority": "beta" }"#,
+                "requires_authority must be an array",
+            ),
+        ] {
+            let Err(error) = Envelope::from_json(envelope) else {
+                panic!("an unreadable arm is refused, not dropped: {envelope}");
+            };
+            assert!(
+                error.starts_with("invalid IFC envelope: ") && error.contains(prose),
+                "unexpected refusal for {envelope}: {error}"
+            );
+        }
+        let whole = Envelope::from_json(
+            r#"{ "resources": {},
+                 "attachments": [{ "authority": "beta", "exposure": "res-3",
+                                   "digest": "deadbeef", "reader": ["Auditor"] }],
+                 "requires_authority": ["beta"] }"#,
+        )
+        .expect("a well-formed attachment and requirement parse");
+        assert_eq!(whole.attachments.len(), 1);
+        assert_eq!(
+            whole.attachments[0].readers,
+            BTreeSet::from(["Auditor".to_owned()])
+        );
+        assert_eq!(
+            whole.requires_authority,
+            BTreeSet::from(["beta".to_owned()])
+        );
     }
 
     /// The refusal is scoped to resource identities. A `guarantee` line carries
@@ -12422,6 +12764,58 @@ rule settle
         );
     }
 
+    /// The demand is keyed by the role the delegation edge carries. Under
+    /// `authority acme` an edge stores `acme::Operator`, and the demand was
+    /// stored bare, so `custody_demand_for` answered `None` for every
+    /// qualified policy and the DR-0062 §4 load-time refusal took its
+    /// "unconstrained" branch — exactly the fail-open the demand exists to
+    /// prevent, and only for the policies careful enough to name an authority.
+    #[test]
+    fn a_custody_demand_is_keyed_by_the_role_the_delegation_edge_carries() {
+        let dsl = Envelope::from_dsl(
+            "authority acme\n\
+             delegate provider:onprem acts-for Operator for confidentiality\n\
+             require custody zero-retention for Operator\n",
+        )
+        .expect("parsed");
+        let edges: Vec<(&str, &str)> = dsl.provider_delegations().collect();
+        assert_eq!(edges, vec![("onprem", "acme::Operator")]);
+        for (_, role) in edges {
+            assert_eq!(
+                dsl.custody_demand_for(role),
+                Some(crate::provider_trust::CustodyClass::ZeroRetention),
+                "the demand must be found under the role the edge names"
+            );
+        }
+        let json = Envelope::from_json(
+            r#"{ "authority": "acme",
+                 "delegations": [["provider:onprem", "Operator"]],
+                 "custody_demand": { "Operator": "zero-retention" } }"#,
+        )
+        .expect("parsed");
+        assert_eq!(
+            json.custody_demand_for("acme::Operator"),
+            Some(crate::provider_trust::CustodyClass::ZeroRetention)
+        );
+        // The canonical form carries the qualified key and reparses to itself.
+        let round_trip = Envelope::from_json(&dsl.to_canonical_json()).expect("round trip");
+        assert!(
+            round_trip == dsl,
+            "the canonical form must reparse to the envelope it was emitted from: {}",
+            dsl.to_canonical_json()
+        );
+        // Without an authority nothing is qualified, and the bare key stands.
+        let bare = Envelope::from_dsl(
+            "delegate provider:onprem acts-for Operator\n\
+             require custody zero-retention for Operator\n",
+        )
+        .expect("parsed");
+        assert_eq!(
+            bare.custody_demand_for("Operator"),
+            Some(crate::provider_trust::CustodyClass::ZeroRetention)
+        );
+    }
+
     #[test]
     fn envelope_refuses_a_custody_demand_it_cannot_understand() {
         // A typo must never silently degrade to "no demand".
@@ -13647,51 +14041,100 @@ rule refund
     }
 
     /// The custodian is a READER of anything routed through it (DR-0053 §9
-    /// Amendment 2026-08-29).
+    /// Amendment 2026-08-29): data labelled `readable by Clinician` alone is
+    /// refused for a custodian-routed credential and admitted for a confined
+    /// one.
     ///
     /// A credential's `readable by` set describes the ENDPOINT's clearance and
-    /// says nothing about the party in between. Without this, a policy reading
-    /// "PHI may reach the clinical API" silently also permits "PHI may enter
-    /// the custodian" — which is the one thing a regulated boundary forbids,
-    /// and invisible because the crossing was never modelled.
+    /// says nothing about the party in between. The custodian is an
+    /// ADDITIONAL PARTY that reads the sink, so it is checked as its own
+    /// required clearance — never folded into the sink's compartment set,
+    /// where (the check being `dominates(sink, source)`, `any` over the sink)
+    /// one more compartment can only admit more. That fold is exactly what
+    /// this test's predecessor pinned: it asserted set membership and the
+    /// refusal it stood for never fired.
     #[test]
     fn the_custodian_is_a_reader_unless_egress_is_confined() {
-        let routed = Envelope::from_dsl(
+        let ir = program("charge.note");
+        let denials = |policy: &str| -> Vec<String> {
+            let envelope = Envelope::from_dsl(policy).expect("valid envelope");
+            check_with_envelope(&ir, &VerifiedEnvelope::for_test(envelope))
+                .into_iter()
+                .filter(|d| d.code.as_str() == "security.confidentiality_leak")
+                .map(|d| d.message)
+                .collect()
+        };
+        const GRANTS: &str =
+            "grant request stripe_api for POST https://api.stripe.com/v1/refunds\n\
+             grant signal charge.disputed -> signal:charge.disputed readable by Clinician\n";
+
+        // Routed through the custodian, which nothing clears for Clinician data.
+        let routed = denials(&format!(
             "authority acme\n\
              custodian CustodyHost\n\
-             grant credential ClinicalApi -> credential:clinical/api readable by Clinician\n",
-        )
-        .expect("valid envelope");
-        let sink = routed.reader_sink("ClinicalApi");
+             grant credential stripe_api -> credential:acme/stripe readable by Clinician\n\
+             {GRANTS}"
+        ));
         assert!(
-            sink.contains("acme/CustodyHost") || sink.contains("CustodyHost"),
-            "a custodian-routed credential must require the custodian's clearance: {sink:?}"
+            routed
+                .iter()
+                .any(|m| m.contains("routes its payload through custodian")
+                    && m.contains("acme::CustodyHost")
+                    && m.contains("stripe_api")),
+            "a custodian-routed credential must require the custodian's clearance: {routed:#?}"
         );
 
-        let confined = Envelope::from_dsl(
+        // Confined to the workflow: the custodian sees a handshake hash only.
+        let confined = denials(&format!(
             "authority acme\n\
              custodian CustodyHost\n\
-             grant credential ClinicalApi -> credential:clinical/api \
-                 readable by Clinician  egress from workflow\n",
-        )
-        .expect("valid envelope");
-        let sink = confined.reader_sink("ClinicalApi");
+             grant credential stripe_api -> credential:acme/stripe \
+                 readable by Clinician egress from workflow\n\
+             {GRANTS}"
+        ));
         assert!(
-            !sink.iter().any(|role| role.contains("CustodyHost")),
-            "a confined credential must NOT require the custodian: {sink:?}"
+            !confined.iter().any(|m| m.contains("custodian")),
+            "a confined credential must NOT require the custodian: {confined:#?}"
+        );
+
+        // Cleared: the custodian acts-for Clinician, under the same authority
+        // every other role in the policy is qualified against.
+        let cleared = denials(&format!(
+            "authority acme\n\
+             custodian CustodyHost\n\
+             delegate CustodyHost acts-for Clinician\n\
+             grant credential stripe_api -> credential:acme/stripe readable by Clinician\n\
+             {GRANTS}"
+        ));
+        assert!(
+            !cleared.iter().any(|m| m.contains("custodian")),
+            "a custodian cleared for the data admits the flow: {cleared:#?}"
         );
 
         // A policy naming no custodian behaves exactly as before, so the
         // modelling is opt-in rather than a change every deployment absorbs.
-        let unnamed = Envelope::from_dsl(
+        let unnamed = denials(&format!(
             "authority acme\n\
-             grant credential ClinicalApi -> credential:clinical/api readable by Clinician\n",
+             grant credential stripe_api -> credential:acme/stripe readable by Clinician\n\
+             {GRANTS}"
+        ));
+        assert!(
+            !unnamed.iter().any(|m| m.contains("custodian")),
+            "{unnamed:#?}"
+        );
+
+        // The sink's own compartment set is the ENDPOINT's clearance and stays
+        // exactly what the grant wrote: the custodian is a party, not a label.
+        let envelope = Envelope::from_dsl(
+            "authority acme\n\
+             custodian CustodyHost\n\
+             grant credential stripe_api -> credential:acme/stripe readable by Clinician\n",
         )
         .expect("valid envelope");
-        assert!(!unnamed
-            .reader_sink("ClinicalApi")
-            .iter()
-            .any(|role| role.contains("CustodyHost")));
+        assert_eq!(
+            envelope.reader_sink("stripe_api"),
+            BTreeSet::from(["acme::Clinician".to_owned()])
+        );
     }
 
     /// `require egress from workflow` is the regulated-boundary statement: a
@@ -13723,6 +14166,108 @@ rule refund
             "authority acme\n\
              grant credential ClinicalApi -> credential:clinical/api egress from workflow\n\
              require egress from workflow\n",
+        )
+        .is_ok());
+    }
+
+    /// A grant label is a sequence of clauses, and a role run ends where the
+    /// next clause begins. Before this was pinned, the reader run took every
+    /// token up to the first `from` and the integrity run every token after
+    /// it, so `readable by Clinician egress from workflow` labelled the
+    /// credential readable by `acme::egress` and vouched-for by
+    /// `acme::workflow`, and the DR-0053 §9 example line made every write to
+    /// the credential an integrity injection against `acme::from`. The bogus
+    /// compartments were signed into the canonical form and reported as the
+    /// resource's own clearance.
+    #[test]
+    fn a_role_run_ends_where_the_next_label_clause_begins() {
+        let envelope = Envelope::from_dsl(
+            "authority acme\n\
+             grant credential ClinicalApi -> credential:clinical/mtls \
+                 readable by Clinician from Clinician egress from workflow\n\
+             grant credential Confined -> credential:clinical/api \
+                 readable by Clinician egress from workflow\n\
+             grant signal work.done -> signal:work.done readable by Operator internal\n\
+             grant credential PHIKey -> credential:acme/phi-key \
+                 sealed at hardware readable by Operator\n",
+        )
+        .expect("valid envelope");
+        let clinician = BTreeSet::from(["acme::Clinician".to_owned()]);
+        let operator = BTreeSet::from(["acme::Operator".to_owned()]);
+        assert_eq!(envelope.reader_set("ClinicalApi"), clinician);
+        assert_eq!(envelope.integrity_set("ClinicalApi"), clinician);
+        assert!(envelope
+            .confined_egress
+            .contains("credential:clinical/mtls"));
+        assert_eq!(envelope.reader_set("Confined"), clinician);
+        assert!(envelope.integrity_set("Confined").is_empty());
+        assert!(envelope.confined_egress.contains("credential:clinical/api"));
+        assert_eq!(envelope.reader_set("work.done"), operator);
+        assert!(envelope.is_internal_signal("signal:work.done"));
+        assert_eq!(envelope.reader_set("PHIKey"), operator);
+
+        // A token that heads no clause is refused rather than passed over: a
+        // grant that forgot `readable by` used to label its resource public
+        // and say nothing.
+        let refused = Envelope::from_dsl(
+            "authority acme\n\
+             grant file_store crm -> file:/srv/crm.db Operator\n",
+        )
+        .err()
+        .expect("a stray token in label position must refuse");
+        assert!(refused.contains("`Operator`"), "{refused}");
+        assert!(refused.contains("is not a label clause"), "{refused}");
+        // The forms the surface documents with no roles to collect stay
+        // accepted: the explicit bottom and the sink-audience clause.
+        let bottom = Envelope::from_dsl(
+            "grant channel out -> smtp:out public\n\
+             grant channel reply -> smtp:reply audience { Requester }\n",
+        )
+        .expect("valid envelope");
+        assert!(bottom.reader_set("out").is_empty());
+        assert!(bottom.reader_set("reply").is_empty());
+        // A sink-audience clause ends the role run before it, on either axis:
+        // `audience`, `{` and `}` are not compartments anyone named.
+        let audienced = Envelope::from_dsl(
+            "authority acme\n\
+             grant channel reply -> smtp:reply readable by Operator audience { Requester }\n\
+             grant channel vouched -> smtp:vouched from Operator audience { Requester }\n",
+        )
+        .expect("valid envelope");
+        assert_eq!(audienced.reader_set("reply"), operator);
+        assert!(audienced.integrity_set("reply").is_empty());
+        assert!(audienced.reader_set("vouched").is_empty());
+        assert_eq!(audienced.integrity_set("vouched"), operator);
+        let refused = Envelope::from_dsl(
+            "grant credential PHIKey -> credential:acme/phi-key sealed at hardwear\n",
+        )
+        .err()
+        .expect("an unknown sealing rung must refuse");
+        assert!(refused.contains("unknown sealing rung"), "{refused}");
+        // Each clause has one shape, and a clause head with the wrong tail is
+        // refused where it is written.
+        let malformed = [
+            (
+                "grant file_store crm -> file:/srv/crm.db readable Operator\n",
+                "readable needs",
+            ),
+            (
+                "grant credential PHIKey -> credential:acme/phi-key sealed hardware\n",
+                "sealed needs",
+            ),
+            (
+                "grant channel reply -> smtp:reply audience Requester\n",
+                "audience needs",
+            ),
+        ];
+        for (policy, prose) in malformed {
+            let refused = Envelope::from_dsl(policy)
+                .err()
+                .unwrap_or_else(|| panic!("must refuse: {policy}"));
+            assert!(refused.contains(prose), "{policy}: {refused}");
+        }
+        assert!(Envelope::from_dsl(
+            "grant file_store crm -> file:/srv/crm.db readable by Operator from Operator\n"
         )
         .is_ok());
     }

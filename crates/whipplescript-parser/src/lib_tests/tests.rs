@@ -2132,6 +2132,81 @@ rule start
 }
 
 #[test]
+fn grouped_when_comment_lines_are_not_readiness_clauses() {
+    let source = r#"
+workflow GroupedWhenComments
+
+class Task {
+  status "queued"
+}
+
+agent worker {
+  provider fixture
+  profile "repo-writer"
+  capacity 1
+}
+
+rule start
+  when {
+    # the task must still be queued
+    Task as task where task.status == "queued"
+    // and a worker must be free
+    worker is available
+  }
+=> {
+  tell worker "do it"
+}
+"#;
+    let compiled = compile_program(source);
+    assert!(
+        compiled.diagnostics.is_empty(),
+        "unexpected diagnostics: {:?}",
+        compiled.diagnostics
+    );
+    let ir = compiled.ir.expect("program compiles");
+    let rule = &ir.rules[0];
+
+    assert_eq!(rule.whens.len(), 2);
+    assert_eq!(rule.whens[0].pattern, "Task as task");
+    assert_eq!(rule.whens[1].pattern, "worker is available");
+    let snapshot = ir.to_snapshot();
+    assert!(!snapshot.contains("when #"));
+    assert!(!snapshot.contains("when //"));
+    assert!(!snapshot.contains("must still be queued"));
+    assert!(!snapshot.contains("must be free"));
+}
+
+#[test]
+fn grouped_when_of_only_comment_lines_is_still_empty() {
+    let source = r#"
+workflow GroupedWhenOnlyComments
+
+class Task {
+  status "queued"
+}
+
+agent worker {
+  provider fixture
+  profile "repo-writer"
+  capacity 1
+}
+
+rule start
+  when {
+    # nothing here is a clause
+    // nor here
+  }
+=> {
+  tell worker "do it"
+}
+"#;
+    let compiled = compile_program(source);
+    assert!(compiled.diagnostics.iter().any(|diagnostic| diagnostic
+        .message
+        .contains("grouped `when` block has no readiness clauses")));
+}
+
+#[test]
 fn accepts_harness_declarations_and_agent_bindings() {
     let source = r#"
 workflow HarnessTopology
@@ -6760,6 +6835,68 @@ fn rule_body_refusals_fire() {
         missing.len(),
         cases.len(),
         missing.join("\n  ")
+    );
+}
+
+/// `validate_case_pattern`'s `Ref` arm handled the enum case and returned
+/// silently for any other name — which is every class. The `_` arm refuses a
+/// string or int scrutinee as `expr.unmatchable_scrutinee`, so the refusal was
+/// spelled but a class reference dodged it: the arms lowered to nothing and a
+/// rule whose every arm completed never completed.
+#[test]
+fn a_case_over_a_class_typed_scrutinee_is_refused_like_a_string_one() {
+    let source = |owner_type: &str| {
+        format!(
+            r#"workflow W
+output result R
+class R {{ ok bool }}
+enum Role {{
+  Lead
+  Member
+}}
+class Owner {{ name string }}
+class Issue {{ owner {owner_type} }}
+rule r
+  when Issue as issue
+=> {{
+  case issue.owner {{
+    Lead => {{ complete result {{ ok true }} }}
+    _ => {{ complete result {{ ok false }} }}
+  }}
+}}
+"#
+        )
+    };
+    let messages = |owner_type: &str| -> Vec<String> {
+        compile_program(&source(owner_type))
+            .diagnostics
+            .into_iter()
+            .map(|diagnostic| diagnostic.message)
+            .collect()
+    };
+
+    let class = messages("Owner");
+    assert!(
+        class
+            .iter()
+            .any(|message| message.contains("cannot pattern-match this scrutinee type")),
+        "a class-typed scrutinee is unmatchable: {class:?}"
+    );
+
+    let unmatchable = messages("string");
+    assert!(
+        unmatchable
+            .iter()
+            .any(|message| message.contains("cannot pattern-match this scrutinee type")),
+        "the string form the class one must match: {unmatchable:?}"
+    );
+
+    let matchable = messages("Role");
+    assert!(
+        !matchable
+            .iter()
+            .any(|message| message.contains("cannot pattern-match")),
+        "an enum scrutinee with the same arms is matched: {matchable:?}"
     );
 }
 
@@ -13588,6 +13725,85 @@ rule observe
             .contains(&"schema:FromLapse".to_owned()),
         "the arm is world-paced: {:?}",
         ship.metadata.immediate_fact_writes
+    );
+}
+
+/// The splice hid the arm's EFFECTS from every effect-level refusal too. The
+/// kernel lowers the lapsed variant at lapse time, so an arm acquiring a lease
+/// nobody declared, emitting a signal nobody declared, or leaving a lease
+/// outcome unhandled was accepted by `whip check` and failed at run time — at
+/// the moment the region broke. The same statements in the region BODY were
+/// refused. Both halves: the ill-formed arm draws the body's refusals, and a
+/// well-formed arm using the same constructs compiles clean.
+#[test]
+fn a_lapse_arm_effect_is_checked_like_a_body_effect() {
+    let program = |arm: &str| {
+        format!(
+            r#"
+use std.coord
+use std.ingress
+
+workflow LapseEffects
+output result R
+class R {{ v string }}
+class T {{ id string }}
+class Flag {{ on string }}
+lease slot {{ key T slots 1 ttl 10m }}
+signal go.now {{ x string }}
+signal lapse.noted {{ note string }}
+
+rule j
+  when go.now as g
+=> {{
+  during empty(Flag) {{
+    timer 1s as a
+    after a completes {{
+      record Flag {{ on "x" }}
+    }}
+  }} on lapse {{
+{arm}
+  }}
+  complete result {{ v "ok" }}
+}}
+"#
+        )
+    };
+
+    let refused = compile_program(&program(
+        r#"    acquire ghost_lease for g.x as l
+    emit signal unknown.sig to g.x { note "bad" } as b
+    after l held { complete result { v "lapsed" } }"#,
+    ));
+    let messages: Vec<&str> = refused
+        .diagnostics
+        .iter()
+        .map(|d| d.message.as_str())
+        .collect();
+    for expected in [
+        "acquires undeclared lease `ghost_lease`",
+        "emits undeclared signal `unknown.sig`",
+        "does not handle the `contended` outcome of lease `l`",
+    ] {
+        assert!(
+            messages.iter().any(|m| m.contains(expected)),
+            "the arm must be refused for `{expected}`: {messages:?}"
+        );
+    }
+
+    let admitted = compile_program(&program(
+        r#"    acquire slot for g.x as l
+    emit signal lapse.noted to g.x { note "lapsed" } as b
+    after l held { complete result { v "lapsed" } }
+    after l contended { complete result { v "busy" } }"#,
+    ));
+    assert!(
+        admitted.ir.is_some()
+            && !admitted
+                .diagnostics
+                .iter()
+                .any(|d| d.severity == Severity::Error),
+        "a well-formed arm compiles: {:?}",
+        admitted.diagnostics
     );
 }
 
@@ -20633,6 +20849,80 @@ fn a_request_that_authenticates_nothing_is_refused_but_signing_alone_suffices() 
     );
 }
 
+/// The walker that hosts every `request` credential refusal recursed through
+/// `after` only, so a `request` written inside a `case` arm was never visited:
+/// one authenticating nothing, or carrying a raw `Authorization` header,
+/// compiled clean while the same statement at the top of the rule was refused.
+/// The body parser admits the statement in an arm and it lowers to an effect,
+/// so the request left the process authenticating nothing.
+#[test]
+fn a_request_inside_a_case_arm_meets_the_same_credential_refusals() {
+    let program = |headers: &str| {
+        format!(
+            r#"@service
+workflow RequestTest
+
+output result R
+class R {{ ok bool }}
+class Ticket {{ id string  status "open" | "closed" }}
+
+credential stripe_api {{ kind bearer }}
+
+table seed as Ticket [ {{ id "T1"  status "open" }} ]
+
+rule pay
+  when Ticket as ticket
+=> {{
+  case ticket.status {{
+    "open" => {{
+      request POST "https://api.stripe.com/v1/refunds" {{
+{headers}
+        body ticket.id
+      }} as refund
+
+      after refund succeeds as reply {{
+        complete result {{ ok true }}
+      }}
+    }}
+    "closed" => {{
+      complete result {{ ok false }}
+    }}
+  }}
+}}
+"#
+        )
+    };
+    let messages = |headers: &str| -> Vec<String> {
+        compile_program(&program(headers))
+            .diagnostics
+            .into_iter()
+            .map(|d| d.message)
+            .collect()
+    };
+
+    let unauthenticated = messages(r#"        header "Idempotency-Key" ticket.id"#);
+    assert!(
+        unauthenticated
+            .iter()
+            .any(|m| m.contains("authenticates nothing")),
+        "a credential-less request in a `case` arm must be refused: {unauthenticated:?}"
+    );
+
+    let raw = messages(r#"        header "Authorization" "Bearer {{ ticket.id }}""#);
+    assert!(
+        raw.iter().any(|m| m.contains("raw `Authorization` header")),
+        "a raw header in a `case` arm must be refused: {raw:?}"
+    );
+
+    let presented = messages(r#"        header "Authorization" bearer stripe_api"#);
+    assert!(
+        !presented
+            .iter()
+            .any(|m| m.contains("authenticates nothing") || m.contains("raw `Authorization`")),
+        "a presented credential in a `case` arm is accepted: {presented:?}"
+    );
+}
+
 /// One `CustodyOp::Request` carries one credential's material, so a request
 /// naming two is not expressible at the custodian. The sentinel format supports
 /// several handles; the operation does not, and the author should learn that
@@ -20708,6 +20998,73 @@ rule seed
         format!("{:?}", body.ty),
         "Sealed(Ref(\"PatientRecord\"))",
         "sealed<T> must carry T into the IR"
+    );
+}
+
+/// `substitute_pattern_type` recursed into `optional`, `array`, `map` and
+/// unions but let `sealed<...>` fall through unchanged, so a pattern's type
+/// parameter or a pattern-local class named inside `sealed<>` was never
+/// substituted: the expanded class kept `sealed<Input>` and `sealed<Note>`,
+/// which either failed as an unknown schema on a program the author wrote
+/// correctly or silently captured a top-level class of the same name.
+#[test]
+fn a_sealed_field_in_a_pattern_is_substituted_like_any_other() {
+    let source = r#"
+pattern Wrap<Input> {
+  class Note {
+    text string
+  }
+
+  class Envelope {
+    payload sealed<Input>
+    aside sealed<Note>
+    plain Input
+  }
+
+  rule seed
+    when Input as item
+  => {
+  }
+}
+
+workflow Root {
+  class Task {
+    title string
+  }
+
+  apply Wrap<Task> as wrapped {
+  }
+}
+"#;
+    let compiled = compile_program(source);
+    assert_eq!(compiled.diagnostics, Vec::new());
+    let ir = compiled.ir.expect("source compiles");
+    let envelope = ir
+        .schemas
+        .iter()
+        .find_map(|schema| match schema {
+            IrSchema::Class(class) if class.name == "wrapped_Envelope" => Some(class),
+            _ => None,
+        })
+        .expect("expanded Envelope schema");
+    let field_type = |name: &str| {
+        envelope
+            .fields
+            .iter()
+            .find(|field| field.name == name)
+            .map(|field| format!("{:?}", field.ty))
+            .unwrap_or_else(|| panic!("{name} field"))
+    };
+    assert_eq!(field_type("plain"), "Ref(\"Task\")");
+    assert_eq!(
+        field_type("payload"),
+        "Sealed(Ref(\"Task\"))",
+        "the type parameter inside sealed<> is substituted"
+    );
+    assert_eq!(
+        field_type("aside"),
+        "Sealed(Ref(\"wrapped_Note\"))",
+        "the pattern-local class inside sealed<> takes its hygienic name"
     );
 }
 
@@ -21534,6 +21891,48 @@ fn opening_into_the_wrong_type_is_refused() {
     );
 }
 
+/// The agreement check compared only when the sealed payload was a class
+/// reference and `continue`d past everything else, so a field declared
+/// `sealed<string>` — a shape `collect_seal_payload_types` deliberately
+/// tracks — could be opened `into PatientRecord` with no diagnostic, and the
+/// runtime asked for an unwrap grant on `PatientRecord` against bytes sealed
+/// as a string.
+#[test]
+fn opening_a_sealed_primitive_into_a_class_is_refused() {
+    let source = |body: &str| open_source(body).replace("id string", "id sealed<string>");
+    let messages = |body: &str| -> Vec<String> {
+        compile_program(&source(body))
+            .diagnostics
+            .into_iter()
+            .map(|diagnostic| diagnostic.message)
+            .collect()
+    };
+
+    let mismatched = messages(
+        "  open claim.id into PatientRecord with phi_key as opening\n\
+         \x20 after opening succeeds as patient {\n\
+         \x20 }",
+    );
+    assert!(
+        mismatched
+            .iter()
+            .any(|message| message.contains("but it is sealed as `sealed<string>`")),
+        "diagnostics were: {mismatched:?}"
+    );
+
+    let agreeing = messages(
+        "  open claim.id into string with phi_key as opening\n\
+         \x20 after opening succeeds as text {\n\
+         \x20 }",
+    );
+    assert!(
+        !agreeing
+            .iter()
+            .any(|message| message.contains("but it is sealed as")),
+        "an `into` that names the sealed primitive agrees: {agreeing:?}"
+    );
+}
+
 #[test]
 fn opening_something_that_is_not_sealed_is_refused() {
     // `open claim.id` names a plain string. Left unchecked it would reach the
@@ -22058,6 +22457,161 @@ fn a_literal_in_an_array_of_sealed_is_refused_by_the_other_site() {
     );
 }
 
+/// The nested-value site had no binding exemption, so a `seal` binding written
+/// inside a `{ … }` object literal was refused as having "no literal form" —
+/// the only value that can legally land in a sealed field — with a suggestion
+/// spelled in the pre-Slice-1 syntax. The line-scanner twin exempts the
+/// identifier and prints the current spelling.
+#[test]
+fn a_seal_binding_in_a_nested_object_literal_is_admitted() {
+    let source = |inner_body: &str| {
+        format!(
+            r#"
+use std.custody
+@service
+workflow NestedSeal
+
+class PatientRecord {{
+  notes string
+}}
+
+class Claim {{
+  id string
+  rec PatientRecord
+}}
+
+class Inner {{
+  body sealed<PatientRecord>
+}}
+
+class Stored {{
+  id string
+  inner Inner
+}}
+
+credential phi_key {{ kind raw }}
+
+@external
+rule keep
+  when Claim as claim
+=> {{
+  seal claim.rec with phi_key as sealing
+  after sealing succeeds as envelope {{
+    record Stored {{ id claim.id  inner {{ body {inner_body} }} }}
+  }}
+}}
+"#
+        )
+    };
+    let messages = |inner_body: &str| -> Vec<String> {
+        compile_program(&source(inner_body))
+            .diagnostics
+            .into_iter()
+            .map(|diagnostic| diagnostic.message)
+            .collect()
+    };
+
+    let binding = messages("envelope");
+    assert!(
+        !binding
+            .iter()
+            .any(|message| message.contains("has no literal form")),
+        "a seal binding in a nested object literal is admitted: {binding:?}"
+    );
+
+    let literal = messages("\"ciphertext\"");
+    assert!(
+        literal.iter().any(|message| {
+            message == "field `Inner.body` expects `sealed<PatientRecord>`, which has no literal form"
+        }),
+        "a literal in the same nested position is still refused: {literal:?}"
+    );
+    let suggestion = compile_program(&source("\"ciphertext\""))
+        .diagnostics
+        .into_iter()
+        .find_map(|diagnostic| diagnostic.suggestion)
+        .unwrap_or_default();
+    assert!(
+        suggestion.contains("`seal <value> with <credential> as v`"),
+        "the suggestion spells the current `seal` form: {suggestion:?}"
+    );
+}
+
+/// The exemption above admits a binding into a nested sealed field, so the
+/// DR-0074 §10 comparison has to reach that field too: a `sealed<PatientRecord>`
+/// envelope landing in a nested `sealed<string>` would otherwise compile clean,
+/// and `open` later trusts that declaration to choose the unwrap grant. Both
+/// nested spellings — `inner { … }` and `inner Inner { … }` — are checked.
+#[test]
+fn a_seal_binding_in_a_nested_payload_meets_the_storage_check() {
+    let source = |inner_body_type: &str, inner: &str| {
+        format!(
+            r#"
+use std.custody
+@service
+workflow NestedSealStorage
+
+class PatientRecord {{
+  notes string
+}}
+
+class Claim {{
+  id string
+  rec PatientRecord
+}}
+
+class Inner {{
+  body {inner_body_type}
+}}
+
+class Stored {{
+  id string
+  inner Inner
+}}
+
+credential phi_key {{ kind raw }}
+
+@external
+rule keep
+  when Claim as claim
+=> {{
+  seal claim.rec with phi_key as sealing
+  after sealing succeeds as envelope {{
+    record Stored {{ id claim.id  inner {inner} }}
+  }}
+}}
+"#
+        )
+    };
+    let messages = |inner_body_type: &str, inner: &str| -> Vec<String> {
+        compile_program(&source(inner_body_type, inner))
+            .diagnostics
+            .into_iter()
+            .map(|diagnostic| diagnostic.message)
+            .collect()
+    };
+    for inner in ["{ body envelope }", "Inner { body envelope }"] {
+        let mismatched = messages("sealed<string>", inner);
+        assert!(
+            mismatched.iter().any(|message| {
+                message
+                    .contains("stores `envelope` in `Inner.body`, which expects `sealed<string>`")
+                    && message.contains("it was sealed as `sealed<PatientRecord>`")
+            }),
+            "`inner {inner}` must refuse a PatientRecord envelope in a nested sealed<string> \
+             field: {mismatched:?}"
+        );
+        let agreeing = messages("sealed<PatientRecord>", inner);
+        assert!(
+            !agreeing
+                .iter()
+                .any(|message| message.contains("it was sealed as")),
+            "`inner {inner}` stores a PatientRecord envelope in a nested sealed<PatientRecord> \
+             field: {agreeing:?}"
+        );
+    }
+}
+
 #[test]
 fn a_literal_in_a_sealed_field_is_still_refused() {
     // The exemption above is for BINDINGS. A literal still has no sealed form,
@@ -22098,6 +22652,81 @@ fn a_sealed_value_may_not_be_stored_at_the_wrong_payload_type() {
             .map(|diagnostic| &diagnostic.message)
             .collect::<Vec<_>>()
     );
+}
+
+/// §10's storage check walked `record` only. A terminal payload and a
+/// milestone payload write durably too — `validate_confinement` names all
+/// three crossings — so a string-sealed envelope completed or emitted into a
+/// `sealed<PatientRecord>` field compiled clean, and `open` would later
+/// trust that declaration to choose the unwrap grant.
+#[test]
+fn a_sealed_value_may_not_cross_a_terminal_or_milestone_at_the_wrong_payload_type() {
+    let source = |field_type: &str, write: &str| {
+        format!(
+            r#"
+use std.custody
+@service
+workflow SealStorage
+
+output result Stored
+failure rejected Stored
+
+class PatientRecord {{
+  notes string
+}}
+
+class Claim {{
+  id string
+}}
+
+class Stored {{
+  id string
+  body {field_type}
+}}
+
+credential phi_key {{ kind raw }}
+
+@external
+rule keep
+  when Claim as claim
+=> {{
+  seal claim.id with phi_key as sealing
+  after sealing succeeds as envelope {{
+    {write}
+  }}
+}}
+"#
+        )
+    };
+    let messages = |field_type: &str, write: &str| -> Vec<String> {
+        compile_program(&source(field_type, write))
+            .diagnostics
+            .into_iter()
+            .map(|diagnostic| diagnostic.message)
+            .collect()
+    };
+    let writes = [
+        "complete result { id claim.id  body envelope }",
+        "fail rejected { id claim.id  body envelope }",
+        "emit milestone \"kept\" of Stored { id claim.id  body envelope }",
+    ];
+    for write in writes {
+        let mismatched = messages("sealed<PatientRecord>", write);
+        assert!(
+            mismatched
+                .iter()
+                .any(|message| message.contains("it was sealed as `sealed<string>`")),
+            "`{write}` must refuse a string envelope in a sealed<PatientRecord> field: \
+             {mismatched:?}"
+        );
+        let agreeing = messages("sealed<string>", write);
+        assert!(
+            !agreeing
+                .iter()
+                .any(|message| message.contains("it was sealed as")),
+            "`{write}` stores a string envelope in a sealed<string> field: {agreeing:?}"
+        );
+    }
 }
 
 // --- DR-0074 §12: `seal` as a std.custody construct instance -----------------

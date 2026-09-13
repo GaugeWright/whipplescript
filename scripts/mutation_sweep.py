@@ -418,6 +418,56 @@ REFUSAL_MARKER = re.compile(r"^\s*//\s*REFUSAL\b:?\s*(.*)$")
 MAP_ERR_RELABEL = re.compile(r"\.map_err\s*\(")
 
 
+# How far a wrapped match-arm pattern may reach before its arrow. rustfmt puts
+# the bound pattern on its own line and the `) =>` on the next, so two is the
+# shape; a little slack covers an alternation spread over several lines.
+MATCH_ARM_WINDOW = 6
+
+
+def is_match_arm_pattern(lines: list[str], index: int) -> bool:
+    """True when a WRAPPED `Err(` is a match pattern rather than a construction.
+
+    `err_is_refusal` already skips `Err(e) => ...`, but it reads one line and so
+    only sees the arrow when the arm fits on that line. rustfmt breaks a long
+    pattern across lines:
+
+        Err(
+            error @ (StoreError::PolicyBlocked { .. } | StoreError::CapacityBlocked { .. }),
+        ) => {
+
+    which puts the arrow two lines below the `Err(`. The re-raise then read as a
+    refusal the mutator could not touch -- no message to rewrite, no `if` to
+    falsify -- and the sweep reported `SKIP (no mutation)`, which fails the gate
+    exactly as an unexercised refusal does. A pattern is not a refusal: the
+    decision was made wherever the error was constructed.
+
+    Narrow on purpose: only an `Err(` the line does not close is read ahead
+    from, because the single-line case is already decided and reading ahead from
+    it would cross into the following arm.
+    """
+    line = lines[index]
+    found = ERR_CALL.search(line)
+    if found is None:
+        return False
+    open_paren = found.end() - 1
+    if err_payload(line, open_paren) is not None:
+        return False
+    depth = 0
+    for offset in range(MATCH_ARM_WINDOW):
+        if index + offset >= len(lines):
+            return False
+        text = lines[index + offset]
+        start = open_paren if offset == 0 else 0
+        for position in range(start, len(text)):
+            if text[position] == "(":
+                depth += 1
+            elif text[position] == ")":
+                depth -= 1
+                if depth == 0:
+                    return "=>" in text[position + 1 :]
+    return False
+
+
 def is_error_relabel(lines: list[str], index: int) -> bool:
     """True when the site is a `map_err` closure carrying no message of its own."""
     if not MAP_ERR_RELABEL.search(lines[index]):
@@ -479,6 +529,8 @@ def find_sites(lines: list[str]) -> list[Site]:
         if is_site and is_refusal_constructor(lines, index):
             continue
         if is_site and is_error_relabel(lines, index):
+            continue
+        if is_site and is_match_arm_pattern(lines, index):
             continue
         if not is_site and OK_OR_OPEN.search(line):
             # Joined only for THIS rule. Running the `Err(` rule over a joined

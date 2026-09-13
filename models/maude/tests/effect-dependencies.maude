@@ -35,3 +35,15 @@ search [1] in WHIPPLESCRIPT-KERNEL :
   effect(e1, queued) providerRun(e1) dep(e1, completes, e2) effect(e2, blocked)
   =>*
   effect(e1, completed) providerRun(e1) dep(e1, completes, e2) effect(e2, running) .
+
+--- A timeout is not a failure: fails is the Failed<E> tag, so a timed-out upstream never releases a fails-dependent downstream.
+search [1] in WHIPPLESCRIPT-KERNEL :
+  effect(e1, queued) providerRun(e1) dep(e1, fails, e2) effect(e2, blocked)
+  =>*
+  effect(e1, timedOut) providerRun(e1) dep(e1, fails, e2) effect(e2, running) .
+
+--- A timeout does satisfy a completes dependency.
+search [1] in WHIPPLESCRIPT-KERNEL :
+  effect(e1, queued) providerRun(e1) dep(e1, completes, e2) effect(e2, blocked)
+  =>*
+  effect(e1, timedOut) providerRun(e1) dep(e1, completes, e2) effect(e2, running) .

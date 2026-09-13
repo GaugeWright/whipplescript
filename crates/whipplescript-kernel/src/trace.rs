@@ -6,6 +6,8 @@ use std::collections::{BTreeMap, BTreeSet};
 pub enum DependencyPredicate {
     Succeeds,
     Fails,
+    TimedOut,
+    Cancelled,
     Completes,
 }
 
@@ -789,9 +791,11 @@ fn dependency_satisfied(state: &TraceState, edge: &DependencyEdge) -> bool {
 
     match edge.predicate {
         DependencyPredicate::Succeeds => *status == EffectStatus::Completed,
-        DependencyPredicate::Fails => {
-            matches!(status, EffectStatus::Failed | EffectStatus::TimedOut)
-        }
+        // `fails` is the `Failed<E>` tag; a timeout satisfies only `times
+        // out` and `completes` (spec/effects-and-capabilities.md).
+        DependencyPredicate::Fails => *status == EffectStatus::Failed,
+        DependencyPredicate::TimedOut => *status == EffectStatus::TimedOut,
+        DependencyPredicate::Cancelled => *status == EffectStatus::Cancelled,
         DependencyPredicate::Completes => status.is_terminal(),
     }
 }
@@ -1185,6 +1189,148 @@ mod tests {
         assert!(violation
             .message
             .contains("without an unsatisfied dependency"));
+    }
+
+    // `after x timed_out` and `after x cancelled` are their own predicates: the
+    // store releases the downstream on exactly that terminal and on no other.
+    // The checker must judge them against the same terminal, or a downstream the
+    // store correctly released reads as "claimed before dependency was
+    // satisfied", and one the store correctly held reads as satisfied.
+
+    #[test]
+    fn accepts_claim_after_timed_out_dependency_times_out() {
+        let trace = vec![
+            effect_created(1, "upstream"),
+            effect_created(2, "downstream"),
+            TraceRecord {
+                sequence: 3,
+                event: TraceEvent::DependencyCreated(DependencyEdge {
+                    upstream_effect_id: "upstream".to_owned(),
+                    predicate: DependencyPredicate::TimedOut,
+                    downstream_effect_id: "downstream".to_owned(),
+                }),
+            },
+            claim(4, "upstream"),
+            start(5, "upstream"),
+            terminal(6, "upstream", EffectStatus::TimedOut),
+            claim(7, "downstream"),
+        ];
+
+        assert_eq!(check_trace(&trace), Ok(()));
+    }
+
+    #[test]
+    fn rejects_claim_on_timed_out_dependency_whose_upstream_completed() {
+        let trace = vec![
+            effect_created(1, "upstream"),
+            effect_created(2, "downstream"),
+            TraceRecord {
+                sequence: 3,
+                event: TraceEvent::DependencyCreated(DependencyEdge {
+                    upstream_effect_id: "upstream".to_owned(),
+                    predicate: DependencyPredicate::TimedOut,
+                    downstream_effect_id: "downstream".to_owned(),
+                }),
+            },
+            claim(4, "upstream"),
+            start(5, "upstream"),
+            terminal(6, "upstream", EffectStatus::Completed),
+            claim(7, "downstream"),
+        ];
+
+        let violation = check_trace(&trace)
+            .expect_err("a timed_out dependency is not satisfied by a completed upstream");
+        assert!(violation
+            .message
+            .contains("claimed before dependency on upstream was satisfied"));
+    }
+
+    #[test]
+    fn accepts_claim_after_cancelled_dependency_is_cancelled() {
+        let trace = vec![
+            effect_created(1, "upstream"),
+            effect_created(2, "downstream"),
+            TraceRecord {
+                sequence: 3,
+                event: TraceEvent::DependencyCreated(DependencyEdge {
+                    upstream_effect_id: "upstream".to_owned(),
+                    predicate: DependencyPredicate::Cancelled,
+                    downstream_effect_id: "downstream".to_owned(),
+                }),
+            },
+            claim(4, "upstream"),
+            start(5, "upstream"),
+            terminal(6, "upstream", EffectStatus::Cancelled),
+            claim(7, "downstream"),
+        ];
+
+        assert_eq!(check_trace(&trace), Ok(()));
+    }
+
+    #[test]
+    fn rejects_claim_on_cancelled_dependency_whose_upstream_timed_out() {
+        let trace = vec![
+            effect_created(1, "upstream"),
+            effect_created(2, "downstream"),
+            TraceRecord {
+                sequence: 3,
+                event: TraceEvent::DependencyCreated(DependencyEdge {
+                    upstream_effect_id: "upstream".to_owned(),
+                    predicate: DependencyPredicate::Cancelled,
+                    downstream_effect_id: "downstream".to_owned(),
+                }),
+            },
+            claim(4, "upstream"),
+            start(5, "upstream"),
+            terminal(6, "upstream", EffectStatus::TimedOut),
+            claim(7, "downstream"),
+        ];
+
+        let violation = check_trace(&trace)
+            .expect_err("a cancelled dependency is not satisfied by a timed-out upstream");
+        assert!(violation
+            .message
+            .contains("claimed before dependency on upstream was satisfied"));
+    }
+
+    /// `fails` is `Failed<E>`: a timed-out upstream leaves a `fails`
+    /// downstream unsatisfied, so claiming it is a violation and blocking it
+    /// on the dependency is legitimate -- the same answer the store's
+    /// `DEPENDENCY_SATISFIED` predicate gives.
+    #[test]
+    fn a_timed_out_upstream_does_not_satisfy_a_fails_dependency() {
+        let prefix = |predicate: DependencyPredicate| {
+            vec![
+                effect_created(1, "upstream"),
+                effect_created(2, "downstream"),
+                TraceRecord {
+                    sequence: 3,
+                    event: TraceEvent::DependencyCreated(DependencyEdge {
+                        upstream_effect_id: "upstream".to_owned(),
+                        predicate,
+                        downstream_effect_id: "downstream".to_owned(),
+                    }),
+                },
+                claim(4, "upstream"),
+                start(5, "upstream"),
+                terminal(6, "upstream", EffectStatus::TimedOut),
+            ]
+        };
+
+        let mut claimed_after_timeout = prefix(DependencyPredicate::Fails);
+        claimed_after_timeout.push(claim(7, "downstream"));
+        let violation = check_trace(&claimed_after_timeout)
+            .expect_err("a timeout must not release the `fails` downstream");
+        assert!(violation.message.contains("before dependency"));
+
+        let mut blocked_after_timeout = prefix(DependencyPredicate::Fails);
+        blocked_after_timeout.push(dependency_block(7, "downstream"));
+        assert_eq!(check_trace(&blocked_after_timeout), Ok(()));
+
+        // `completes` still admits the timeout, so the same claim is legal.
+        let mut completes_after_timeout = prefix(DependencyPredicate::Completes);
+        completes_after_timeout.push(claim(7, "downstream"));
+        assert_eq!(check_trace(&completes_after_timeout), Ok(()));
     }
 
     // Recovery-from-block coverage. The store re-checks the block condition on the

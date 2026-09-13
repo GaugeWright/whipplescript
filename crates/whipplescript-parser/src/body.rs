@@ -1245,22 +1245,32 @@ fn lex_body(source: &str, base: BodyBase<'_>, diagnostics: &mut Vec<Diagnostic>)
             let mut j = i + 1;
             let mut value = String::new();
             let mut closed = false;
+            // `j` only ever advances by whole characters from the opening
+            // quote, so it stays on a char boundary; the ASCII discriminators
+            // below are compared as bytes, and every other character is copied
+            // whole — a byte re-encoded as a char turned `é` into `Ã©`.
             while j < bytes.len() {
-                let cj = bytes[j] as char;
-                if cj == '\\' && j + 1 < bytes.len() {
-                    value.push(bytes[j + 1] as char);
-                    j += 2;
+                let cj = bytes[j];
+                if cj == b'\\' && j + 1 < bytes.len() {
+                    let Some(escaped) = source[j + 1..].chars().next() else {
+                        break;
+                    };
+                    value.push(escaped);
+                    j += 1 + escaped.len_utf8();
                     continue;
                 }
-                if cj == '"' {
+                if cj == b'"' {
                     closed = true;
                     break;
                 }
-                if cj == '\n' {
+                if cj == b'\n' {
                     break;
                 }
-                value.push(cj);
-                j += 1;
+                let Some(ch) = source[j..].chars().next() else {
+                    break;
+                };
+                value.push(ch);
+                j += ch.len_utf8();
             }
             if !closed {
                 diagnostics.push(Diagnostic {
@@ -5557,6 +5567,40 @@ mod tests {
             "# leading comment\nrecord Done {\n  note \"x\"\n}\n  # indented comment with braces { } and \"quotes\"\n// slash comments match the top-level lexer\ndone item\n",
         );
         assert_eq!(ast.statements.len(), 2, "comments contribute no statements");
+    }
+
+    /// A `"` the line never closes is refused, and says so. Both string forms
+    /// carry their own refusal and their own wording -- a single-quoted string
+    /// and a `"""` prompt fail differently and an author needs to know which --
+    /// so each is asserted here, including that the other's wording is absent.
+    /// The accepting case sits beside them: a closed string of the same shape
+    /// parses, so a lexer that refused every string could not pass this.
+    #[test]
+    fn an_unterminated_string_is_refused_and_names_which_form_it_was() {
+        let closed = parse_ok("record Done {\n  note \"still open\"\n}\n");
+        assert_eq!(closed.statements.len(), 1, "a closed string parses");
+
+        let (_, single) = parse_rule_body("record Done {\n  note \"still open\n}\n", 0);
+        assert!(
+            single
+                .iter()
+                .any(|diagnostic| diagnostic.message == "unterminated string"),
+            "a single-quoted string that never closes is refused: {single:?}"
+        );
+        assert!(
+            !single
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("multiline")),
+            "a single-quoted string is not reported as a multiline one: {single:?}"
+        );
+
+        let (_, triple) = parse_rule_body("tell worker \"\"\"markdown\nstill open\n", 0);
+        assert!(
+            triple
+                .iter()
+                .any(|diagnostic| diagnostic.message == "unterminated multiline string"),
+            "a `\"\"\"` prompt that never closes is refused: {triple:?}"
+        );
     }
 
     #[test]

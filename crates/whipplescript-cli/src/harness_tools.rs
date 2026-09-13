@@ -542,6 +542,16 @@ pub struct WorkflowToolEntry {
     package_id: String,
 }
 
+/// What a native command pass sees of the workspace: regular files by content
+/// (the diff that becomes the proposal) and the symlinks present, recorded
+/// by path AND target so a link the workspace already had is told apart from
+/// one the command created or retargeted.
+#[derive(Default)]
+struct NativeWorkspaceSnapshot {
+    files: std::collections::BTreeMap<String, Vec<u8>>,
+    symlinks: std::collections::BTreeMap<String, std::path::PathBuf>,
+}
+
 /// Executes the slice-1 file tools against a single workspace root, enforcing the
 /// `file store` path policy (no absolute/`..` escape; optional read/write globs).
 pub struct FileToolExecutor {
@@ -594,13 +604,16 @@ pub struct FileToolExecutor {
     mcp: Option<crate::mcp_tools::McpTurnRuntime>,
     /// Registered `@tool` sub-workflows (DR-0025), dispatched synchronously.
     workflow_tools: Vec<WorkflowToolEntry>,
-    /// Run-store path the sub-workflow child instances are created in. Set
-    /// together with `workflow_tools`; `None` disables workflow-tool dispatch.
+    /// The turn's run-store path (`with_run_context`): the memory tools write
+    /// beside it (`<store>.memory.sqlite`) and sub-workflow child instances are
+    /// created in it. `None` on direct/test executors, which have no run.
     store_path: Option<PathBuf>,
     /// Per-child iteration bound for the synchronous sub-workflow drive.
     max_child_iterations: usize,
-    /// Work-unit root (DR-0025): the lease holder this turn runs under. Sub-workflow
-    /// children inherit it so they share the root's workspace lease re-entrantly.
+    /// Work-unit root (DR-0025): the lease holder this turn runs under
+    /// (`with_run_context`). Custody calls and learned memories are attributed
+    /// to it, and sub-workflow children inherit it so they share the root's
+    /// workspace lease re-entrantly. Empty on direct/test executors.
     work_unit: String,
     /// The parent turn's provider configuration, carried into sub-workflow drives
     /// so a `@tool` workflow's own effects run under the same provider (DR-0025).
@@ -1372,22 +1385,34 @@ impl FileToolExecutor {
         self
     }
 
+    /// Bind the executor to the run it serves: the run store (memory tools
+    /// write beside it; sub-workflow children are created in it) and the
+    /// work-unit root every custody call and learned memory is attributed to.
+    /// A live turn sets this unconditionally — a granted memory tool must bite
+    /// (MEM-5) whether or not the turn also registers `@tool` workflows.
+    pub fn with_run_context(
+        mut self,
+        store_path: impl Into<PathBuf>,
+        work_unit: impl Into<String>,
+    ) -> Self {
+        self.store_path = Some(store_path.into());
+        self.work_unit = work_unit.into();
+        self
+    }
+
     /// Register `@tool` sub-workflows (DR-0025) for synchronous dispatch. The
-    /// child instances are created in `store_path`; each tool call drives one
-    /// child to its terminal (bounded by `max_child_iterations`) and returns its
-    /// output payload. Without this, a workflow-tool call is an unknown tool.
+    /// child instances are created in the `with_run_context` store; each tool
+    /// call drives one child to its terminal (bounded by `max_child_iterations`)
+    /// and returns its output payload. Without this, a workflow-tool call is an
+    /// unknown tool.
     pub fn with_workflow_tools(
         mut self,
         workflow_tools: Vec<WorkflowToolEntry>,
-        store_path: impl Into<PathBuf>,
         max_child_iterations: usize,
-        work_unit: impl Into<String>,
         provider_ctx: crate::SubworkflowProviderContext,
     ) -> Self {
         self.workflow_tools = workflow_tools;
-        self.store_path = Some(store_path.into());
         self.max_child_iterations = max_child_iterations.max(1);
-        self.work_unit = work_unit.into();
         self.provider_ctx = Some(provider_ctx);
         self
     }
@@ -1926,7 +1951,7 @@ impl FileToolExecutor {
         let limit = usize_arg(args, "limit").unwrap_or(1000);
         let mut hits = Vec::new();
         let mut walked = 0usize;
-        walk(&self.root, &self.root.join(base), &mut walked, &mut |rel| {
+        let cut_short = walk(&self.root, &self.root.join(base), &mut walked, &mut |rel| {
             if crate::glob_match(pattern, rel) {
                 hits.push(rel.to_string());
             }
@@ -1934,6 +1959,10 @@ impl FileToolExecutor {
         });
         hits.sort();
         hits.truncate(limit);
+        if cut_short {
+            // An unfinished walk is not an empty one: say what was not read.
+            hits.push(walk_bound_notice(base));
+        }
         if hits.is_empty() {
             Ok("No files found".to_string())
         } else {
@@ -1958,7 +1987,7 @@ impl FileToolExecutor {
         let mut matches_found = 0usize;
         let root = self.root.clone();
         let mut walked = 0usize;
-        walk(&root, &root.join(base), &mut walked, &mut |rel| {
+        let cut_short = walk(&root, &root.join(base), &mut walked, &mut |rel| {
             if matches_found >= limit {
                 // Nothing further can be emitted, so stop the walk rather than
                 // stat the rest of the tree for results that are discarded.
@@ -1978,6 +2007,10 @@ impl FileToolExecutor {
             );
             ControlFlow::Continue(())
         });
+        if cut_short {
+            // An unfinished walk is not a matchless one: say what was not read.
+            hits.push(walk_bound_notice(base));
+        }
         if hits.is_empty() {
             Ok("No matches".to_string())
         } else {
@@ -2201,10 +2234,18 @@ impl FileToolExecutor {
         }
     }
 
+    /// The native workspace's regular files by content, plus the symlinks it
+    /// holds, each with its target. `preexisting` is `None` for the
+    /// pre-command pass, which records every symlink it meets (a link the
+    /// workspace already had is not the command's doing); the post-command
+    /// pass passes the pre-command links and refuses any the command added or
+    /// retargeted, because neither can be represented in the returned
+    /// proposal. Pre-existing links are not followed or diffed by content.
     fn native_workspace_snapshot(
         &self,
-    ) -> Result<std::collections::BTreeMap<String, Vec<u8>>, String> {
-        let mut snapshot = std::collections::BTreeMap::new();
+        preexisting: Option<&std::collections::BTreeMap<String, std::path::PathBuf>>,
+    ) -> Result<NativeWorkspaceSnapshot, String> {
+        let mut snapshot = NativeWorkspaceSnapshot::default();
         let mut pending = vec![self.root.clone()];
         while let Some(directory) = pending.pop() {
             for entry in std::fs::read_dir(&directory)
@@ -2216,10 +2257,21 @@ impl FileToolExecutor {
                 let kind = entry
                     .file_type()
                     .map_err(|error| format!("cannot inspect native workspace: {error}"))?;
+                let relative = path
+                    .strip_prefix(&self.root)
+                    .map_err(|_| "native workspace traversal escaped its root".to_owned())?
+                    .to_string_lossy()
+                    .replace('\\', "/");
                 if kind.is_symlink() {
-                    return Err(
-                        "native command produced an unsupported workspace symlink".to_owned()
-                    );
+                    let target = std::fs::read_link(&path)
+                        .map_err(|error| format!("cannot read native workspace: {error}"))?;
+                    if preexisting.is_some_and(|links| links.get(&relative) != Some(&target)) {
+                        return Err(format!(
+                            "native command produced an unsupported workspace symlink `{relative}`"
+                        ));
+                    }
+                    snapshot.symlinks.insert(relative, target);
+                    continue;
                 }
                 if kind.is_dir() {
                     pending.push(path);
@@ -2228,17 +2280,12 @@ impl FileToolExecutor {
                 if !kind.is_file() {
                     continue;
                 }
-                if snapshot.len() >= MAX_FILES_WALKED {
+                if snapshot.files.len() >= MAX_FILES_WALKED {
                     return Err(format!(
                         "native workspace contains more than {MAX_FILES_WALKED} files"
                     ));
                 }
-                let relative = path
-                    .strip_prefix(&self.root)
-                    .map_err(|_| "native workspace traversal escaped its root".to_owned())?
-                    .to_string_lossy()
-                    .replace('\\', "/");
-                snapshot.insert(
+                snapshot.files.insert(
                     relative,
                     std::fs::read(path)
                         .map_err(|error| format!("cannot read native workspace: {error}"))?,
@@ -2249,7 +2296,7 @@ impl FileToolExecutor {
     }
 
     fn native_bash(&self, command: &str, timeout: Duration) -> Result<String, String> {
-        let before = self.native_workspace_snapshot()?;
+        let before = self.native_workspace_snapshot(None)?;
         let path = std::env::var("PATH").unwrap_or_else(|_| "/usr/local/bin:/usr/bin:/bin".into());
         let output = std::process::Command::new("timeout")
             .arg("--signal=KILL")
@@ -2264,14 +2311,29 @@ impl FileToolExecutor {
             .env("TMPDIR", "/tmp")
             .output()
             .map_err(|error| format!("cannot start native command: {error}"))?;
-        let after = match self.native_workspace_snapshot() {
+        let after = match self.native_workspace_snapshot(Some(&before.symlinks)) {
             Ok(after) => after,
             Err(error) => {
-                // A symlink cannot be represented in the returned proposal.
-                // The Sandbox is destroyed after this turn, so fail closed.
+                // A symlink the command created or retargeted cannot be
+                // represented in the returned proposal. The Sandbox is
+                // destroyed after this turn, so fail closed.
                 return Err(error);
             }
         };
+        // A pre-existing link the command removed, or replaced with a regular
+        // file or directory, cannot be represented either: the proposal would
+        // apply the replacement THROUGH the link on the real workspace.
+        if let Some(removed) = before
+            .symlinks
+            .keys()
+            .find(|path| !after.symlinks.contains_key(*path))
+        {
+            return Err(format!(
+                "native command removed or replaced workspace symlink `{removed}`"
+            ));
+        }
+        let before = before.files;
+        let after = after.files;
         let paths = before
             .keys()
             .chain(after.keys())
@@ -3276,21 +3338,42 @@ fn refuse_binary_read(path: &str, full: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Why a walk ended before the tree did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WalkStop {
+    /// [`MAX_FILES_WALKED`] files were visited; the rest of the tree was never
+    /// read, so the visitor's picture of it is incomplete.
+    FileBound,
+    /// The visitor returned [`ControlFlow::Break`]: it has what it needs.
+    Visitor,
+}
+
 /// Recursively walk `dir` (under `root`), invoking `visit` with each file's
 /// root-relative slash path. Bounded by [`MAX_FILES_WALKED`]; a `visit` that
-/// returns [`ControlFlow::Break`] ends the traversal there.
+/// returns [`ControlFlow::Break`] ends the traversal there. Returns `true`
+/// when the file bound, not the visitor, cut the walk short — the caller
+/// must then say the tree was not finished rather than report an empty one.
 fn walk(
     root: &Path,
     dir: &Path,
     walked: &mut usize,
     visit: &mut dyn FnMut(&str) -> ControlFlow<()>,
-) {
+) -> bool {
     // `root` is invariant across the recursion, so it resolves once for the whole
     // traversal and every containment check below is made against that one root.
     let Ok(canonical_root) = root.canonicalize() else {
-        return;
+        return false;
     };
-    let _ = walk_under(root, &canonical_root, dir, walked, visit);
+    walk_under(root, &canonical_root, dir, walked, visit) == ControlFlow::Break(WalkStop::FileBound)
+}
+
+/// The line `find`/`grep` end with when [`walk`] hit its file bound under
+/// `base`: what was searched is only part of the tree, and a narrower `path`
+/// reaches the rest.
+fn walk_bound_notice(base: &str) -> String {
+    format!(
+        "[walk stopped after {MAX_FILES_WALKED} files under \"{base}\"; narrow \"path\" to search the rest]"
+    )
 }
 
 fn walk_under(
@@ -3299,7 +3382,7 @@ fn walk_under(
     dir: &Path,
     walked: &mut usize,
     visit: &mut dyn FnMut(&str) -> ControlFlow<()>,
-) -> ControlFlow<()> {
+) -> ControlFlow<WalkStop> {
     let Ok(canonical_dir) = dir.canonicalize() else {
         return ControlFlow::Continue(());
     };
@@ -3313,7 +3396,7 @@ fn walk_under(
     children.sort();
     for path in children {
         if *walked >= MAX_FILES_WALKED {
-            return ControlFlow::Break(());
+            return ControlFlow::Break(WalkStop::FileBound);
         }
         let Ok(canonical_path) = path.canonicalize() else {
             continue;
@@ -3329,7 +3412,9 @@ fn walk_under(
             *walked += 1;
             if let Ok(rel) = path.strip_prefix(root) {
                 let rel = rel.to_string_lossy().replace('\\', "/");
-                visit(&rel)?;
+                if visit(&rel).is_break() {
+                    return ControlFlow::Break(WalkStop::Visitor);
+                }
             }
         }
     }
@@ -5062,7 +5147,10 @@ pub fn run_owned_agent_turn(
     let mut executor = FileToolExecutor::new(&workspace)
         .with_turn_tool_access(turn_tool_access.clone())
         .with_resolved_profile_policy(profile_policy.clone())
-        .with_result_contract(result_contract.clone());
+        .with_result_contract(result_contract.clone())
+        // Every live turn has a run store and a work unit; the memory tools and
+        // custody attribution need them whether or not `@tool` workflows follow.
+        .with_run_context(store_path, work_unit);
     let mut tools = file_tool_specs_for_turn(&profile_policy, &turn_tool_access);
     // The terminal tool is offered like any other, so the loop needs only its
     // name and the provider enforces its schema on the way in. It is added
@@ -5176,13 +5264,7 @@ pub fn run_owned_agent_turn(
     // Sub-workflow tools (DR-0025): curated, convergence-checked workflows the
     // model may invoke synchronously as typed tools.
     if !workflow_tools.is_empty() {
-        executor = executor.with_workflow_tools(
-            workflow_tools,
-            store_path,
-            max_child_iterations,
-            work_unit,
-            provider_ctx,
-        );
+        executor = executor.with_workflow_tools(workflow_tools, max_child_iterations, provider_ctx);
         tools.extend(workflow_tool_specs_for_policy(
             &profile_policy,
             workflow_tool_specs,
@@ -7401,6 +7483,63 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// MEM-5 says a memory grant either bites or is refused, never silently
+    /// dropped. A live turn hands the executor its run store and work unit
+    /// whether or not it registers `@tool` workflows, so a granted turn with
+    /// no sub-workflows still learns into `<store>.memory.sqlite` — and the
+    /// entry is attributed to the work unit, not to nobody.
+    #[test]
+    fn memory_tools_bite_from_the_run_context_without_workflow_tools() {
+        use whipplescript_store::memory::MemoryStore;
+        // Reads `MEMORY_STORE_ENV` (to make sure it is NOT the route here): one
+        // process-wide slot, so this shares the binary's env lock.
+        let _guard = crate::env_lock();
+        std::env::remove_var(whipplescript_store::memory::MEMORY_STORE_ENV);
+        let root = temp_root();
+        let run_store = root.join("run.sqlite");
+        let access = turn_tool_access_from_input(
+            &json!({
+                "access_grants": [
+                    {
+                        "resource": "project_memory",
+                        "operations": [{"operation": "learn"}]
+                    }
+                ]
+            })
+            .to_string(),
+        )
+        .expect("grants parse");
+        let executor = FileToolExecutor::new(&root)
+            .with_turn_tool_access(access)
+            .with_run_context(&run_store, "instance-7");
+
+        let stored = executor
+            .learn_memory(&json!({
+                "pool": "project_memory",
+                "text": "the deploy checklist lives in ops/deploy.md"
+            }))
+            .expect("a granted turn with a run store learns without any env override");
+        assert!(stored.contains("\"stored\":true"), "{stored}");
+
+        let memory_path = run_store.with_extension("memory.sqlite");
+        assert!(
+            memory_path.exists(),
+            "the entry lands beside the run store at {}",
+            memory_path.display()
+        );
+        let store = whipplescript_store::memory::SqliteMemoryStore::open(&memory_path)
+            .expect("memory store opens");
+        let rows = store
+            .query("project_memory", "deploy", None)
+            .expect("query");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].source_run_id.as_deref(),
+            Some("instance-7"),
+            "the entry is attributed to the work unit the turn runs under"
+        );
+    }
+
     #[test]
     fn tracker_write_grants_filter_model_facing_tracker_tools() {
         let policy = HarnessProfilePolicy::for_profile(Some("repo-writer"));
@@ -8765,6 +8904,93 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
+    /// The walk behind `find`/`grep` stops at [`MAX_FILES_WALKED`]. A tree
+    /// it did not finish reading must say so: an unqualified "No files
+    /// found" / "No matches" for a match that sits past the bound is a
+    /// confident false negative. Narrowing `path` past the bulk reads the
+    /// rest, and a walk that finished carries no notice.
+    #[test]
+    fn find_and_grep_say_when_the_file_bound_cut_the_walk_short() {
+        let root = temp_root();
+        let bulk = root.join("aaa");
+        std::fs::create_dir_all(&bulk).unwrap();
+        for index in 0..MAX_FILES_WALKED {
+            std::fs::write(bulk.join(format!("f{index:05}.txt")), "filler").unwrap();
+        }
+        std::fs::create_dir_all(root.join("zzz")).unwrap();
+        std::fs::write(root.join("zzz/needle.txt"), "the needle line\n").unwrap();
+        let exec = FileToolExecutor::new(&root);
+
+        let found = exec.execute(&call(TOOL_FIND, json!({ "pattern": "**/needle.txt" })));
+        assert_eq!(found.status, ToolStatus::Ok, "{}", found.content);
+        assert!(
+            found
+                .content
+                .contains("walk stopped after 5000 files under \".\""),
+            "find says the walk was cut short: {}",
+            found.content
+        );
+        assert!(
+            !found.content.contains("No files found"),
+            "an unfinished walk is not an empty one: {}",
+            found.content
+        );
+
+        let grepped = exec.execute(&call(TOOL_GREP, json!({ "pattern": "needle line" })));
+        assert_eq!(grepped.status, ToolStatus::Ok, "{}", grepped.content);
+        assert!(
+            grepped
+                .content
+                .contains("walk stopped after 5000 files under \".\""),
+            "grep says the walk was cut short: {}",
+            grepped.content
+        );
+        assert!(
+            !grepped.content.contains("No matches"),
+            "an unfinished walk is not a matchless one: {}",
+            grepped.content
+        );
+
+        // Partial hits are kept, with the notice after them.
+        let partial = exec.execute(&call(TOOL_FIND, json!({ "pattern": "**/f00001.txt" })));
+        assert_eq!(partial.status, ToolStatus::Ok);
+        assert!(
+            partial.content.starts_with("aaa/f00001.txt\n"),
+            "{}",
+            partial.content
+        );
+        assert!(
+            partial.content.contains("walk stopped after"),
+            "{}",
+            partial.content
+        );
+
+        // Narrowed past the bulk, the walk finishes and carries no notice.
+        let narrowed = exec.execute(&call(
+            TOOL_GREP,
+            json!({ "pattern": "needle line", "path": "zzz" }),
+        ));
+        assert_eq!(narrowed.status, ToolStatus::Ok);
+        assert!(
+            narrowed
+                .content
+                .contains("zzz/needle.txt:1:the needle line"),
+            "{}",
+            narrowed.content
+        );
+        assert!(
+            !narrowed.content.contains("walk stopped"),
+            "{}",
+            narrowed.content
+        );
+        let empty = exec.execute(&call(
+            TOOL_FIND,
+            json!({ "pattern": "**/absent.txt", "path": "zzz" }),
+        ));
+        assert_eq!(empty.content, "No files found");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
     #[test]
     fn bash_is_available_without_a_native_allow_list() {
         let root = temp_root();
@@ -8916,6 +9142,162 @@ mod tests {
             !offered.iter().any(|spec| spec.name == TOOL_BASH),
             "bash must not be offered without a grant: {:?}",
             offered.iter().map(|spec| &spec.name).collect::<Vec<_>>()
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The native workspace is snapshotted whole, before and after the
+    /// command, so a proposal can be diffed out of it. That snapshot is
+    /// bounded by [`MAX_FILES_WALKED`]: past the bound the "after" read would
+    /// be a partial picture of the tree, and a diff against a partial picture
+    /// silently proposes deleting every file it did not reach. So a workspace
+    /// that large is refused outright, naming the bound, rather than run
+    /// against.
+    #[test]
+    fn isolated_native_bash_refuses_a_workspace_past_the_file_bound() {
+        let root = temp_root();
+        // The accepting case first, in the SAME shape: a small workspace runs,
+        // so a guard that refused every workspace could not pass this test.
+        std::fs::write(root.join("a.txt"), "one").unwrap();
+        let exec = FileToolExecutor::new(&root).with_native_processes(true);
+        let small = exec.execute(&call(TOOL_BASH, json!({ "command": "echo ok" })));
+        assert_eq!(
+            small.status,
+            ToolStatus::Ok,
+            "a workspace under the bound runs: {}",
+            small.content
+        );
+
+        for index in 0..MAX_FILES_WALKED {
+            std::fs::write(root.join(format!("f{index:05}.txt")), "filler").unwrap();
+        }
+        let refused = exec.execute(&call(TOOL_BASH, json!({ "command": "echo ok" })));
+        assert_eq!(
+            refused.status,
+            ToolStatus::Error,
+            "a workspace past the bound is refused: {}",
+            refused.content
+        );
+        assert!(
+            refused
+                .content
+                .contains("native workspace contains more than"),
+            "the refusal says the workspace is too large: {}",
+            refused.content
+        );
+        assert!(
+            refused.content.contains(&MAX_FILES_WALKED.to_string()),
+            "the refusal names the bound: {}",
+            refused.content
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A symlink the workspace already contains (this repository's own
+    /// `CLAUDE.md -> AGENTS.md`, say) is not something the command produced:
+    /// native commands still run beside it. A symlink the command CREATES
+    /// cannot be represented in the proposal and is refused, naming the path.
+    #[test]
+    fn isolated_native_bash_tolerates_preexisting_symlinks_and_refuses_created_ones() {
+        let root = temp_root();
+        std::fs::write(root.join("AGENTS.md"), "guide").unwrap();
+        std::os::unix::fs::symlink("AGENTS.md", root.join("CLAUDE.md")).unwrap();
+        let exec = FileToolExecutor::new(&root).with_native_processes(true);
+
+        let ran = exec.execute(&call(TOOL_BASH, json!({ "command": "echo ok" })));
+        assert_eq!(
+            ran.status,
+            ToolStatus::Ok,
+            "a pre-existing symlink is not the command's doing: {}",
+            ran.content
+        );
+        assert!(ran.content.contains("ok"), "{}", ran.content);
+
+        let refused = exec.execute(&call(
+            TOOL_BASH,
+            json!({ "command": "ln -s AGENTS.md created-link" }),
+        ));
+        assert_eq!(refused.status, ToolStatus::Error, "{}", refused.content);
+        assert!(
+            refused.content.contains("unsupported workspace symlink"),
+            "{}",
+            refused.content
+        );
+        assert!(
+            refused.content.contains("`created-link`"),
+            "the refusal names the link the command made: {}",
+            refused.content
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A pre-existing link is keyed by target as well as path: retargeting
+    /// it, removing it, or replacing it with a regular file are all things the
+    /// proposal cannot represent, and each is refused naming the path.
+    #[test]
+    fn isolated_native_bash_refuses_retargeting_removing_or_replacing_preexisting_symlinks() {
+        let root = temp_root();
+        std::fs::write(root.join("AGENTS.md"), "guide").unwrap();
+        std::fs::write(root.join("AGENTS2.md"), "other guide").unwrap();
+        std::os::unix::fs::symlink("AGENTS.md", root.join("CLAUDE.md")).unwrap();
+        let exec = FileToolExecutor::new(&root).with_native_processes(true);
+
+        let ran = exec.execute(&call(TOOL_BASH, json!({ "command": "echo ok" })));
+        assert_eq!(ran.status, ToolStatus::Ok, "{}", ran.content);
+
+        let retargeted = exec.execute(&call(
+            TOOL_BASH,
+            json!({ "command": "ln -sfn AGENTS2.md CLAUDE.md" }),
+        ));
+        assert_eq!(
+            retargeted.status,
+            ToolStatus::Error,
+            "{}",
+            retargeted.content
+        );
+        assert!(
+            retargeted.content.contains("unsupported workspace symlink"),
+            "a retargeted link is a link the command produced: {}",
+            retargeted.content
+        );
+        assert!(
+            retargeted.content.contains("`CLAUDE.md`"),
+            "{}",
+            retargeted.content
+        );
+
+        let removed = exec.execute(&call(TOOL_BASH, json!({ "command": "rm CLAUDE.md" })));
+        assert_eq!(removed.status, ToolStatus::Error, "{}", removed.content);
+        assert!(
+            removed
+                .content
+                .contains("removed or replaced workspace symlink"),
+            "{}",
+            removed.content
+        );
+        assert!(
+            removed.content.contains("`CLAUDE.md`"),
+            "{}",
+            removed.content
+        );
+
+        std::os::unix::fs::symlink("AGENTS.md", root.join("CLAUDE.md")).unwrap();
+        let replaced = exec.execute(&call(
+            TOOL_BASH,
+            json!({ "command": "rm CLAUDE.md && printf plain > CLAUDE.md" }),
+        ));
+        assert_eq!(replaced.status, ToolStatus::Error, "{}", replaced.content);
+        assert!(
+            replaced
+                .content
+                .contains("removed or replaced workspace symlink"),
+            "a regular file at a link's path would be applied through the link: {}",
+            replaced.content
+        );
+        assert!(
+            replaced.content.contains("`CLAUDE.md`"),
+            "{}",
+            replaced.content
         );
         std::fs::remove_dir_all(&root).ok();
     }

@@ -1092,3 +1092,46 @@ fn stepping_an_instance_whose_active_version_is_gone_is_refused() {
         "{error:?}"
     );
 }
+
+#[test]
+fn exec_profile_env_door_refuses_what_the_flag_door_refuses() {
+    let _guard = crate::env_lock();
+    let previous = env::var_os("WHIPPLESCRIPT_EXEC_PROFILE");
+
+    // The two doors read the same string; a value neither profile spells
+    // must be refused by both, not downgraded to the permissive profile by one.
+    let flag_error = CheckOptions::parse(&["--exec-profile".to_owned(), "Hosted".to_owned()])
+        .expect_err("the flag door refuses an unknown profile");
+    assert!(
+        flag_error.contains("unknown exec profile"),
+        "flag door: {flag_error}"
+    );
+
+    env::set_var("WHIPPLESCRIPT_EXEC_PROFILE", "Hosted");
+    let env_error = CheckOptions::parse(&[]).expect_err("the env door refuses an unknown profile");
+    let worker_error = WorkerOptions::parse(&["i-1".to_owned()]).expect_err("worker");
+    let dev_error = DevOptions::parse(&["x.whip".to_owned()]).expect_err("dev");
+    match previous.as_ref() {
+        Some(value) => env::set_var("WHIPPLESCRIPT_EXEC_PROFILE", value),
+        None => env::remove_var("WHIPPLESCRIPT_EXEC_PROFILE"),
+    }
+    for error in [&env_error, &worker_error, &dev_error] {
+        assert!(
+            error.contains("WHIPPLESCRIPT_EXEC_PROFILE") && error.contains("unknown exec profile"),
+            "env door: {error}"
+        );
+    }
+
+    // The accepting cases: an unset variable is the dev profile, and the flag
+    // still selects the hosted one.
+    env::remove_var("WHIPPLESCRIPT_EXEC_PROFILE");
+    let unset = CheckOptions::parse(&[]).expect("unset variable parses");
+    assert_eq!(unset.exec_profile, ExecProfile::Dev);
+    let flagged = CheckOptions::parse(&["--exec-profile".to_owned(), "hosted".to_owned()])
+        .expect("hosted flag parses");
+    assert_eq!(flagged.exec_profile, ExecProfile::Hosted);
+    match previous {
+        Some(value) => env::set_var("WHIPPLESCRIPT_EXEC_PROFILE", value),
+        None => env::remove_var("WHIPPLESCRIPT_EXEC_PROFILE"),
+    }
+}

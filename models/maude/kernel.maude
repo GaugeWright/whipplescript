@@ -883,10 +883,6 @@ mod WHIPPLESCRIPT-KERNEL is
     effect(U, failed) dep(U, fails, D) effect(D, blocked)
     => effect(U, failed) dep(U, fails, D) effect(D, queued) .
 
-  rl [unblock-timeout-as-failure] :
-    effect(U, timedOut) dep(U, fails, D) effect(D, blocked)
-    => effect(U, timedOut) dep(U, fails, D) effect(D, queued) .
-
   rl [unblock-completes-ok] :
     effect(U, completed) dep(U, completes, D) effect(D, blocked)
     => effect(U, completed) dep(U, completes, D) effect(D, queued) .

@@ -10849,6 +10849,152 @@ test "injects blocked" {
 }
 
 #[test]
+fn test_harness_refuses_a_coerce_stub_it_cannot_inject() {
+    // A `stub coerce <fn> returns { … }` whose record does not evaluate, or
+    // whose payload is not a record, cannot inject anything. The harness
+    // must report the scenario `invalid` — never run it against the
+    // fixture's generic verdict and call the result passed or failed.
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let stores = temp_store_path();
+    let dir = unique_temp_dir("harness-coerce-invalid");
+    let wf = dir.join("wf.whip");
+    fs::write(
+        &wf,
+        r#"
+workflow CoerceInject
+
+output result Out
+
+class Out {
+  verdict string
+}
+
+class Decision {
+  verdict "merge" | "revise" | "blocked"
+}
+
+coerce classify(text string) -> Decision {
+  prompt """markdown
+  Classify the text.
+  """
+}
+
+rule run
+  when started
+=> {
+  coerce classify("hello") as decision
+
+  after decision succeeds {
+    record Out {
+      verdict decision.verdict
+    }
+    complete result {
+      verdict decision.verdict
+    }
+  }
+}
+
+test "injects merge" {
+  workflow CoerceInject
+  stub coerce classify returns {
+    verdict "merge"
+  }
+  run until idle
+  expect Out where verdict == "merge"
+}
+
+test "record that does not evaluate" {
+  workflow CoerceInject
+  stub coerce classify returns {
+    verdict nothere.value
+  }
+  run until idle
+  expect Out where verdict == "merge"
+}
+
+test "payload that is not a record" {
+  workflow CoerceInject
+  stub coerce classify returns "merge"
+  run until idle
+  expect Out where verdict == "merge"
+}
+"#,
+    )
+    .expect("write workflow");
+
+    let output = whip(bin, &stores)
+        .args(["--json", "test", wf.to_str().expect("present")])
+        .output()
+        .expect("whip test runs");
+    let report: Value = serde_json::from_slice(&output.stdout).expect("test report JSON");
+    let scenarios = report
+        .get("scenarios")
+        .and_then(Value::as_array)
+        .expect("scenarios");
+    let scenario = |id: &str| {
+        scenarios
+            .iter()
+            .find(|s| {
+                s.get("id")
+                    .and_then(Value::as_str)
+                    .and_then(|full| full.rsplit("::").next())
+                    == Some(id)
+            })
+            .unwrap_or_else(|| panic!("scenario {id} present: {report}"))
+    };
+    let status_of = |id: &str| {
+        scenario(id)
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or("missing")
+            .to_owned()
+    };
+    let harness_error_of = |id: &str| {
+        let diagnostics = scenario(id)
+            .get("diagnostics")
+            .and_then(Value::as_array)
+            .expect("diagnostics array");
+        assert_eq!(diagnostics.len(), 1, "{id}: {diagnostics:?}");
+        assert_eq!(
+            diagnostics[0].get("code").and_then(Value::as_str),
+            Some("test.harness_error"),
+            "{id}: {diagnostics:?}"
+        );
+        diagnostics[0]
+            .get("message")
+            .and_then(Value::as_str)
+            .expect("message")
+            .to_owned()
+    };
+
+    assert_eq!(status_of("injects merge"), "passed", "report: {report}");
+    assert_eq!(
+        status_of("record that does not evaluate"),
+        "invalid",
+        "report: {report}"
+    );
+    let message = harness_error_of("record that does not evaluate");
+    assert!(
+        message.contains("stub coerce classify")
+            && message.contains("`verdict`")
+            && message.contains("did not evaluate to a value"),
+        "{message}"
+    );
+    assert_eq!(
+        status_of("payload that is not a record"),
+        "invalid",
+        "report: {report}"
+    );
+    let message = harness_error_of("payload that is not a record");
+    assert!(
+        message.contains("stub coerce classify returns") && message.contains("record payload"),
+        "{message}"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn test_command_selection_patterns_and_exit_codes() {
     // `whip test` conforms to the CLI surface in `workflow-testing.md`: `-i`/`-x`
     // scenario selection over `<workflow>::<name>` ids with `*` globs, `--list`,
@@ -11235,6 +11381,102 @@ rule done_now
         .expect("whip test replay runs");
     assert_eq!(missing.status.code(), Some(2), "unknown instance is exit 2");
 
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_replay_snapshots_a_live_wal_store_without_losing_commits() {
+    // The store runs in WAL mode. While another connection holds the store —
+    // the normal situation when an operator inspects a running instance —
+    // a closing connection cannot checkpoint, so the run's commits live only
+    // in the `-wal` sidecar. `whip test replay` must snapshot the store
+    // transactionally rather than copy the main file: a file copy folds a
+    // truncated log and reports a false DIVERGED for an instance whose log
+    // re-projects identically.
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let stores = temp_store_path();
+    let dir = unique_temp_dir("replay-live-wal");
+    let store = dir.join("store.sqlite");
+    let wf = dir.join("wf.whip");
+    fs::write(
+        &wf,
+        r#"
+workflow ReplayMe
+
+output done Result
+
+class Result {
+  status string
+}
+
+rule done_now
+  when started
+=> {
+  complete done {
+    status "ok"
+  }
+}
+"#,
+    )
+    .expect("write workflow");
+    let store_str = store.to_str().expect("present");
+
+    // A live reader that outlives both commands keeps the WAL un-checkpointed.
+    let held = SqliteStore::open(&store).expect("open store to hold");
+
+    let dev = run_json_isolated(
+        bin,
+        &stores,
+        &[
+            "--store",
+            store_str,
+            "--json",
+            "run",
+            wf.to_str().expect("present"),
+            "--provider",
+            "fixture",
+            "--until",
+            "idle",
+        ],
+    );
+    let instance = dev
+        .get("instance_id")
+        .and_then(Value::as_str)
+        .expect("instance id")
+        .to_owned();
+    let wal = dir.join("store.sqlite-wal");
+    assert!(
+        fs::metadata(&wal)
+            .map(|meta| meta.len() > 0)
+            .unwrap_or(false),
+        "the run's commits are still in the WAL while a reader holds the store"
+    );
+
+    let replay = whip(bin, &stores)
+        .args(["--store", store_str, "--json", "test", "replay", &instance])
+        .output()
+        .expect("whip test replay runs");
+    let report: Value = serde_json::from_slice(&replay.stdout).unwrap_or(Value::Null);
+    assert_eq!(
+        replay.status.code(),
+        Some(0),
+        "replay of a live WAL store is equal; stderr: {}; report: {report}",
+        String::from_utf8_lossy(&replay.stderr)
+    );
+    assert_eq!(
+        report.get("replay").and_then(Value::as_str),
+        Some("equal"),
+        "report: {report}"
+    );
+    // Nothing of the throwaway snapshot is left behind in the shared temp dir.
+    assert!(
+        !std::env::temp_dir()
+            .join(format!("whip-replay-{instance}.sqlite"))
+            .exists(),
+        "no predictable, shared snapshot path is used"
+    );
+
+    drop(held);
     let _ = fs::remove_dir_all(&dir);
 }
 
@@ -12451,6 +12693,324 @@ fn coercion_status_reports_fixture_rung_and_fingerprint() {
     assert_eq!(seeded["provider_id"], "fixture", "{seeded}");
     assert_eq!(seeded["rung"], 4, "{seeded}");
     assert_eq!(seeded["fingerprint"], "fixture", "{seeded}");
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn native_coerce_compiles_the_program_under_the_worker_root() {
+    // A native coerce recompiles the program to build the call parts. Every
+    // other worker door compiles under `--root` with the source bundle
+    // resolved; the coerce door compiled the raw file with no root, so a
+    // two-workflow program that `whip run --root X` runs fine turned every
+    // native coerce into `native coerce: program did not compile` and the
+    // provider was never called. The provider here is a loopback listener
+    // that counts requests: reaching it is the proof the compile went through.
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let stores = temp_store_path();
+    let dir = unique_temp_dir("native-coerce-root");
+    let store = dir.join("store.sqlite");
+    let wf = dir.join("wf.whip");
+    fs::write(
+        &wf,
+        r#"
+workflow Sibling {
+  rule noop
+    when started
+  => {
+  }
+}
+
+workflow Classifier {
+  input ticket Ticket
+  output result R
+
+  class R {
+    ok bool
+  }
+
+  class Ticket {
+    title string
+  }
+
+  coerce assess(title string) -> R {
+    prompt "Assess"
+  }
+
+  rule run
+    when Ticket as t
+  => {
+    coerce assess(t.title) as verdict
+    after verdict succeeds as v {
+      complete result {
+        ok v.ok
+      }
+    }
+    after verdict fails as bad {
+      complete result {
+        ok false
+      }
+    }
+  }
+}
+"#,
+    )
+    .expect("write workflow");
+
+    // A stand-in provider: every request is counted and answered 500, so
+    // the coerce settles as failed without a real model.
+    let requests = Arc::new(AtomicUsize::new(0));
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind provider stand-in");
+    let port = listener.local_addr().expect("addr").port();
+    {
+        let requests = Arc::clone(&requests);
+        std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let mut scratch = [0u8; 8192];
+                let _ = stream.read(&mut scratch);
+                requests.fetch_add(1, Ordering::SeqCst);
+                let body = r#"{"error":{"message":"stand-in provider"}}"#;
+                let response = format!(
+                    "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+    }
+
+    let mut command = whip(bin, &stores);
+    command.args([
+        "--store",
+        store.to_str().expect("present"),
+        "--json",
+        "run",
+        wf.to_str().expect("present"),
+        "--root",
+        "Classifier",
+        "--input",
+        r#"{"ticket":{"title":"hello"}}"#,
+        "--until",
+        "idle",
+    ]);
+    for var in [
+        "WHIPPLESCRIPT_COERCE_MAX_TOKENS",
+        "WHIPPLESCRIPT_COERCE_TIMEOUT_SECS",
+    ] {
+        command.env_remove(var);
+    }
+    command
+        .env("WHIPPLESCRIPT_COERCE_PROVIDER", "openai")
+        .env("WHIPPLESCRIPT_COERCE_MODEL", "stand-in-model")
+        .env(
+            "WHIPPLESCRIPT_COERCE_BASE_URL",
+            format!("http://127.0.0.1:{port}"),
+        )
+        .env("OPENAI_API_KEY", "sk-test-stand-in");
+    let output = command.output().expect("whip run runs");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "run exits 0\nstdout:\n{}\nstderr:\n{stderr}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(
+        !stderr.contains("program did not compile"),
+        "the coerce door compiles under the worker's root: {stderr}"
+    );
+    assert!(
+        requests.load(Ordering::SeqCst) >= 1,
+        "the native coerce reached the provider; stderr: {stderr}"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn native_coerce_without_a_program_path_is_refused_before_the_provider() {
+    // The native coerce door needs the program to rebuild the call parts, and
+    // the worker learns the program only through `--program`. A worker pass
+    // that omits it must refuse the coerce with the reason, leave the effect
+    // queued for a pass that carries the path, and never reach the provider —
+    // a coerce settled failed here, or a request sent without a compiled
+    // prompt, would be the provider answering a call the program never made.
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let stores = temp_store_path();
+    let dir = unique_temp_dir("native-coerce-no-program");
+    let store = dir.join("store.sqlite");
+    let wf = dir.join("wf.whip");
+    fs::write(
+        &wf,
+        r#"
+workflow Sibling {
+  rule noop
+    when started
+  => {
+  }
+}
+
+workflow Classifier {
+  input ticket Ticket
+  output result R
+
+  class R {
+    ok bool
+  }
+
+  class Ticket {
+    title string
+  }
+
+  coerce assess(title string) -> R {
+    prompt "Assess"
+  }
+
+  rule run
+    when Ticket as t
+  => {
+    coerce assess(t.title) as verdict
+    after verdict succeeds as v {
+      complete result {
+        ok v.ok
+      }
+    }
+    after verdict fails as bad {
+      complete result {
+        ok false
+      }
+    }
+  }
+}
+"#,
+    )
+    .expect("write workflow");
+
+    // A stand-in provider that counts every request it receives; the pass
+    // under test must leave the count at zero.
+    let requests = Arc::new(AtomicUsize::new(0));
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind provider stand-in");
+    let port = listener.local_addr().expect("addr").port();
+    {
+        let requests = Arc::clone(&requests);
+        std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let mut scratch = [0u8; 8192];
+                let _ = stream.read(&mut scratch);
+                requests.fetch_add(1, Ordering::SeqCst);
+                let body = r#"{"error":{"message":"stand-in provider"}}"#;
+                let response = format!(
+                    "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+    }
+
+    let store_arg = store.to_str().expect("present");
+    let started = run_json_isolated(
+        bin,
+        &stores,
+        &[
+            "--store",
+            store_arg,
+            "--json",
+            "start",
+            wf.to_str().expect("present"),
+            "--root",
+            "Classifier",
+            "--input",
+            r#"{"ticket":{"title":"hello"}}"#,
+        ],
+    );
+    let instance_id = started
+        .get("instance_id")
+        .and_then(Value::as_str)
+        .expect("instance id")
+        .to_owned();
+    // One step under the program queues the coerce; the worker pass below is
+    // the first thing to claim it.
+    let stepped = run_json_isolated(
+        bin,
+        &stores,
+        &[
+            "--store",
+            store_arg,
+            "--json",
+            "step",
+            &instance_id,
+            "--program",
+            wf.to_str().expect("present"),
+            "--root",
+            "Classifier",
+        ],
+    );
+    assert_eq!(
+        stepped.get("effects_created").and_then(Value::as_u64),
+        Some(1),
+        "the step queues the coerce: {stepped}"
+    );
+
+    let mut command = whip(bin, &stores);
+    command.args(["--store", store_arg, "--json", "worker", &instance_id]);
+    for var in [
+        "WHIPPLESCRIPT_COERCE_MAX_TOKENS",
+        "WHIPPLESCRIPT_COERCE_TIMEOUT_SECS",
+    ] {
+        command.env_remove(var);
+    }
+    command
+        .env("WHIPPLESCRIPT_COERCE_PROVIDER", "openai")
+        .env("WHIPPLESCRIPT_COERCE_MODEL", "stand-in-model")
+        .env(
+            "WHIPPLESCRIPT_COERCE_BASE_URL",
+            format!("http://127.0.0.1:{port}"),
+        )
+        .env("OPENAI_API_KEY", "sk-test-stand-in");
+    let output = command.output().expect("whip worker runs");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("requires the program path"),
+        "the pass names what the coerce needs: {stderr}"
+    );
+    assert!(
+        stderr.contains("handler refused this pass"),
+        "the refusal is a per-pass handler refusal, not a settled failure: {stderr}"
+    );
+    assert_eq!(
+        requests.load(Ordering::SeqCst),
+        0,
+        "no request reaches the provider without a compiled program; stderr: {stderr}"
+    );
+
+    let effects = run_json_isolated(
+        bin,
+        &stores,
+        &["--store", store_arg, "--json", "effects", &instance_id],
+    );
+    let statuses: Vec<&str> = effects
+        .as_array()
+        .expect("effects array")
+        .iter()
+        .filter_map(|effect| effect.get("status").and_then(Value::as_str))
+        .collect();
+    assert_eq!(
+        statuses,
+        vec!["queued"],
+        "the coerce stays queued for a pass that carries the program: {effects}"
+    );
 
     let _ = fs::remove_dir_all(&dir);
 }
@@ -14329,6 +14889,128 @@ test "alpha succeeds, beta fails" {
 }
 
 #[test]
+fn test_harness_refuses_agent_turn_output_injection_as_unsupported() {
+    // Agent turn-output injection (`succeeds { summary … }`) is deferred: the
+    // fixture's turn output is a fixed generated schema, so the harness cannot
+    // honour the record. spec/workflow-testing.md says such a scenario is
+    // reported `invalid` rather than silently ignored — a rule keyed on the
+    // injected summary must not be judged against the fixture's generic one.
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let stores = temp_store_path();
+    let dir = unique_temp_dir("harness-turn-output");
+    let wf = dir.join("wf.whip");
+    fs::write(
+        &wf,
+        r#"
+@service
+workflow OneAgent
+
+class Done {
+  summary string
+}
+
+agent triager {
+  provider fixture
+  profile "repo-writer"
+  capacity 1
+}
+
+rule tell_triager
+  when started
+  when triager is available
+=> {
+  tell triager "Triage."
+}
+
+rule observe
+  when triager completed turn as turn
+=> {
+  record Done {
+    summary turn.summary
+  }
+}
+
+test "plain stub outcome is honoured" {
+  workflow OneAgent
+  stub agent triager succeeds
+  run until idle
+  expect rule observe fired
+}
+
+test "failure message is honoured" {
+  workflow OneAgent
+  stub agent triager fails "model refused"
+  run until idle
+  expect rule observe did not fire
+}
+
+test "turn output injection is not simulated" {
+  workflow OneAgent
+  stub agent triager succeeds {
+    summary "Migration failed"
+  }
+  run until idle
+  expect Done where summary == "Migration failed"
+}
+"#,
+    )
+    .expect("write workflow");
+
+    let output = whip(bin, &stores)
+        .args(["--json", "test", wf.to_str().expect("present")])
+        .output()
+        .expect("whip test runs");
+    let report: Value = serde_json::from_slice(&output.stdout).expect("test report JSON");
+    let scenarios = report
+        .get("scenarios")
+        .and_then(Value::as_array)
+        .expect("scenarios array");
+    let scenario = |id: &str| {
+        scenarios
+            .iter()
+            .find(|s| {
+                s.get("id")
+                    .and_then(Value::as_str)
+                    .and_then(|full| full.rsplit("::").next())
+                    == Some(id)
+            })
+            .unwrap_or_else(|| panic!("scenario {id} present: {report}"))
+    };
+    let status_of = |id: &str| {
+        scenario(id)
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or("missing")
+            .to_owned()
+    };
+    assert_eq!(status_of("plain stub outcome is honoured"), "passed");
+    assert_eq!(status_of("failure message is honoured"), "passed");
+    assert_eq!(
+        status_of("turn output injection is not simulated"),
+        "invalid"
+    );
+    let diagnostics = scenario("turn output injection is not simulated")
+        .get("diagnostics")
+        .and_then(Value::as_array)
+        .expect("diagnostics array");
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+    assert_eq!(
+        diagnostics[0].get("code").and_then(Value::as_str),
+        Some("test.unsupported_clause")
+    );
+    let message = diagnostics[0]
+        .get("message")
+        .and_then(Value::as_str)
+        .expect("message");
+    assert!(
+        message.contains("turn-output injection") && message.contains("triager"),
+        "{message}"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn test_harness_stub_settles_agent_turns_and_outcome_changes_behavior() {
     // The harness drives queued effects through the fixture provider, with the
     // `stub` outcome controlling settlement. A `succeeds` stub lets the agent
@@ -15040,6 +15722,148 @@ test "input violating the contract is invalid" {
     assert_eq!(
         status_of(&input_wf, "input violating the contract is invalid"),
         "invalid"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_harness_given_signal_goes_through_signal_admission() {
+    // `given` does not bypass package validation: a `given signal` enters
+    // through typed signal admission (spec/workflow-testing.md "given"), so a
+    // signal the program does not declare, or a payload the declaration
+    // refuses, cannot seed a fact that no real delivery could produce. A
+    // scenario built on such a fact describes a run the runtime refuses, and
+    // the harness reports it `invalid` instead of judging its expectations.
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let stores = temp_store_path();
+    let dir = unique_temp_dir("harness-given-signal");
+    let wf = dir.join("wf.whip");
+    fs::write(
+        &wf,
+        r#"
+workflow SignalDriven
+
+output done Result
+
+signal deploy.finished {
+  service string
+  status "ok" | "failed"
+}
+
+class Result {
+  service string
+}
+
+rule on_finished
+  when deploy.finished as d where d.status == "ok"
+=> {
+  complete done {
+    service d.service
+  }
+}
+
+test "declared signal with a conforming payload fires the rule" {
+  workflow SignalDriven
+  given signal deploy.finished {
+    service "api"
+    status "ok"
+  }
+  run until idle
+  expect rule on_finished fired
+  expect workflow completed
+}
+
+test "undeclared signal is invalid" {
+  workflow SignalDriven
+  given signal deploy.typo {
+    service "api"
+  }
+  run until idle
+  expect rule on_finished fired
+}
+
+test "payload the declaration refuses is invalid" {
+  workflow SignalDriven
+  given signal deploy.finished {
+    service "api"
+    status "unknown"
+  }
+  run until idle
+  expect rule on_finished did not fire
+}
+"#,
+    )
+    .expect("write workflow");
+
+    let output = whip(bin, &stores)
+        .args(["--json", "test", wf.to_str().expect("present")])
+        .output()
+        .expect("whip test runs");
+    let report: Value = serde_json::from_slice(&output.stdout).expect("test report JSON");
+    let scenarios = report
+        .get("scenarios")
+        .and_then(Value::as_array)
+        .expect("scenarios array");
+    let scenario = |id: &str| {
+        scenarios
+            .iter()
+            .find(|s| {
+                s.get("id")
+                    .and_then(Value::as_str)
+                    .and_then(|full| full.rsplit("::").next())
+                    == Some(id)
+            })
+            .unwrap_or_else(|| panic!("scenario {id} present"))
+    };
+    let status_of = |id: &str| {
+        scenario(id)
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or("missing")
+            .to_owned()
+    };
+    let refusal_of = |id: &str| {
+        let diagnostics = scenario(id)
+            .get("diagnostics")
+            .and_then(Value::as_array)
+            .expect("diagnostics array");
+        assert_eq!(diagnostics.len(), 1, "{id}: {diagnostics:?}");
+        assert_eq!(
+            diagnostics[0].get("code").and_then(Value::as_str),
+            Some("test.harness_error"),
+            "{id}: {diagnostics:?}"
+        );
+        diagnostics[0]
+            .get("message")
+            .and_then(Value::as_str)
+            .expect("message")
+            .to_owned()
+    };
+
+    assert_eq!(
+        status_of("declared signal with a conforming payload fires the rule"),
+        "passed"
+    );
+    assert_eq!(status_of("undeclared signal is invalid"), "invalid");
+    let undeclared = refusal_of("undeclared signal is invalid");
+    assert!(
+        undeclared.contains("not declared") && undeclared.contains("deploy.finished"),
+        "{undeclared}"
+    );
+    assert!(
+        undeclared.contains("`given signal deploy.typo`"),
+        "{undeclared}"
+    );
+    assert_eq!(
+        status_of("payload the declaration refuses is invalid"),
+        "invalid"
+    );
+    let malformed = refusal_of("payload the declaration refuses is invalid");
+    assert!(malformed.contains("does not conform"), "{malformed}");
+    assert!(
+        malformed.contains("`given signal deploy.finished`"),
+        "{malformed}"
     );
 
     let _ = fs::remove_dir_all(&dir);
@@ -23191,6 +24015,160 @@ rule begin
     let _ = fs::remove_dir_all(dir);
 }
 
+/// MEM-5: a memory grant on an owned turn either bites or is refused, never
+/// silently dropped. With NO `WHIPPLESCRIPT_MEMORY_STORE` override and no
+/// `@tool` sub-workflows registered, a granted `learn_memory` call still
+/// writes into the run store's sibling `<store>.memory.sqlite`, attributed
+/// to the instance the turn runs under.
+#[test]
+fn owned_turn_memory_grant_learns_into_the_run_store_without_the_env_override() {
+    use whipplescript_store::memory::MemoryStore;
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let stores = temp_store_path();
+    let dir = unique_temp_dir("memory-grant-run-store");
+    let store_path = dir.join("store.sqlite");
+    let store = store_path.to_str().expect("utf-8 store path");
+    let ws = dir.join("workspace");
+    fs::create_dir_all(&ws).expect("workspace");
+    let src = dir.join("memory.whip");
+    fs::write(
+        &src,
+        r#"
+workflow MemoryGrantTurn
+
+use std.memory
+
+memory pool project_memory {
+  context limit 8
+}
+
+output result Done
+
+class Done {
+  note string
+}
+
+class Ticket {
+  id string
+}
+
+agent helper {
+  provider owned
+  profile "repo-writer"
+  capacity 1
+}
+
+rule seed
+  when started
+=> {
+  record Ticket { id "T1" }
+}
+
+rule work
+  when Ticket as ticket
+  when helper is available
+=> {
+  tell helper as turn
+    with access to project_memory {
+      learn for ticket
+    }
+  """
+  Remember the ticket.
+  """
+
+  after turn succeeds {
+    complete result { note "done" }
+  }
+}
+"#,
+    )
+    .expect("write workflow");
+
+    let output = whip(bin, &stores)
+        .args([
+            "--store",
+            store,
+            "--json",
+            "run",
+            src.to_str().expect("utf-8 source path"),
+            "--provider",
+            "owned",
+            "--until",
+            "idle",
+        ])
+        .env(
+            "WHIPPLESCRIPT_OWNED_FIXTURE_TOOL",
+            r#"learn_memory:{"pool":"project_memory","text":"the deploy checklist lives in ops/deploy.md"}"#,
+        )
+        .env("WHIPPLESCRIPT_HARNESS_WORKSPACE", &ws)
+        // The point of the test: the run store alone routes the tools.
+        .env_remove("WHIPPLESCRIPT_MEMORY_STORE")
+        .output()
+        .expect("run runs");
+    assert!(
+        output.status.success(),
+        "run failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("utf-8");
+    let json_start = stdout.find(['{', '[']).expect("json output");
+    let run: Value = serde_json::from_str(&stdout[json_start..]).expect("run json");
+    let instance_id = run
+        .get("instance_id")
+        .and_then(Value::as_str)
+        .expect("instance id");
+
+    let log = run_json_isolated(
+        bin,
+        &stores,
+        &["--store", store, "--json", "log", instance_id],
+    );
+    let transcript_text = log
+        .as_array()
+        .expect("event array")
+        .iter()
+        .filter(|event| {
+            event.get("event_type").and_then(Value::as_str)
+                == Some("agent.turn.brokered.transcript")
+        })
+        .map(|event| {
+            event
+                .get("payload")
+                .map(|payload| payload.to_string())
+                .unwrap_or_default()
+        })
+        .collect::<String>();
+    assert!(
+        !transcript_text.contains("not enabled for this turn"),
+        "an offered memory grant must be honoured, not refused: {transcript_text}"
+    );
+    assert!(
+        transcript_text.contains("stored"),
+        "the learn is recorded in the turn: {transcript_text}"
+    );
+
+    let memory_path = store_path.with_extension("memory.sqlite");
+    assert!(
+        memory_path.exists(),
+        "the entry lands beside the run store at {}",
+        memory_path.display()
+    );
+    let memory = whipplescript_store::memory::SqliteMemoryStore::open(&memory_path)
+        .expect("memory store opens");
+    let rows = memory
+        .query("project_memory", "deploy", None)
+        .expect("query");
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(
+        rows[0].source_run_id.as_deref(),
+        Some(instance_id),
+        "the entry is attributed to the instance the turn runs under"
+    );
+
+    let _ = fs::remove_dir_all(dir);
+}
+
 /// Store-seam Phase 5: `whip handles` exposes the stable pointers an
 /// external policy authority admits decisions against (event position,
 /// effect ids, workspace cut ids), and `whip checkpoint
@@ -24043,6 +25021,183 @@ fn branch_reconcile_folds_disjoint_mainline_deltas_down() {
     assert_eq!(
         entry.get("outcome").and_then(Value::as_str),
         Some("up_to_date")
+    );
+
+    let _ = fs::remove_file(store_path);
+    let _ = fs::remove_dir_all(dir);
+}
+
+/// Quiescence gates whether the mediator folds parent deltas under a
+/// branch (`reconcile`) or auto-admits it to its stream line. A bound
+/// instance whose status cannot be READ is not known to be idle: the pass
+/// must defer it exactly as it defers a running one, never fold or admit
+/// under a run it could not see. A store that will not open already reads
+/// as not quiescent; a per-instance read error read as quiescent.
+#[test]
+fn branch_reconcile_treats_an_unreadable_bound_instance_as_not_quiescent() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let store_path = temp_store_path();
+    let store = store_path.to_str().expect("utf-8 temp path");
+    let dir = unique_temp_dir("reconcile-unreadable");
+    let envs_owned = [
+        (
+            "WHIPPLESCRIPT_BRANCH_STORE".to_owned(),
+            dir.join("branches.sqlite").to_string_lossy().into_owned(),
+        ),
+        (
+            "WHIPPLESCRIPT_VCS_CONTENT_STORE".to_owned(),
+            dir.join("vcs-content.sqlite")
+                .to_string_lossy()
+                .into_owned(),
+        ),
+        (
+            "WHIPPLESCRIPT_WORKSTREAM_STORE".to_owned(),
+            dir.join("workstreams.sqlite")
+                .to_string_lossy()
+                .into_owned(),
+        ),
+        (
+            "WHIPPLESCRIPT_COORDINATION_STORE".to_owned(),
+            dir.join("coordination.sqlite")
+                .to_string_lossy()
+                .into_owned(),
+        ),
+    ];
+    let envs: Vec<(&str, &str)> = envs_owned
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    let whip = |args: &[&str]| {
+        let mut full = vec!["--store", store, "--json"];
+        full.extend_from_slice(args);
+        run_json_with_env_isolated(bin, &store_path, &full, &envs)
+    };
+    let wf = dir.join("wf.whip");
+    fs::write(
+        &wf,
+        r#"
+workflow Finishes
+
+output done Result
+
+class Result {
+  status string
+}
+
+rule done_now
+  when started
+=> {
+  complete done {
+    status "ok"
+  }
+}
+"#,
+    )
+    .expect("write workflow");
+    let wf_str = wf.to_str().expect("present");
+    let instance_of = |report: &Value| -> String {
+        report
+            .get("instance_id")
+            .and_then(Value::as_str)
+            .expect("instance id")
+            .to_owned()
+    };
+    // Started but never stepped: still running.
+    let running = instance_of(&whip(&["start", wf_str, "--input", "{}"]));
+    // Run to completion: idle.
+    let done = instance_of(&whip(&[
+        "run",
+        wf_str,
+        "--provider",
+        "fixture",
+        "--until",
+        "idle",
+    ]));
+    // Two more that will be made unreadable below.
+    let unreadable_member = instance_of(&whip(&["start", wf_str, "--input", "{}"]));
+    let unreadable_plain = instance_of(&whip(&["start", wf_str, "--input", "{}"]));
+    assert_eq!(
+        whip(&["status", &running])
+            .pointer("/instance/status")
+            .and_then(Value::as_str),
+        Some("running")
+    );
+    assert_eq!(
+        whip(&["status", &done])
+            .pointer("/instance/status")
+            .and_then(Value::as_str),
+        Some("completed")
+    );
+
+    // Stream members: one under a running instance, one under a completed
+    // instance, one under an instance whose row cannot be read.
+    whip(&["stream", "create", "triage", "--name", "triage"]);
+    for member in ["draft_running", "draft_done", "draft_unreadable"] {
+        whip(&["branch", "create", member]);
+        whip(&["stream", "join", "triage", member]);
+        whip(&[
+            "branch",
+            "write",
+            member,
+            &format!("{member}.md"),
+            "--body",
+            "work",
+        ]);
+    }
+    whip(&["branch", "bind", "draft_running", &running]);
+    whip(&["branch", "bind", "draft_done", &done]);
+    whip(&["branch", "bind", "draft_unreadable", &unreadable_member]);
+    // A plain branch whose delta COLLIDES with mainline's, under an
+    // unreadable instance: quiescent asks (`conflicts`), mid-run defers.
+    whip(&["branch", "write", "main", "shared.md", "--body", "M0"]);
+    whip(&["branch", "create", "draft_plain"]);
+    whip(&[
+        "branch",
+        "write",
+        "draft_plain",
+        "shared.md",
+        "--body",
+        "mine",
+    ]);
+    whip(&["branch", "write", "main", "shared.md", "--body", "M1"]);
+    whip(&["branch", "bind", "draft_plain", &unreadable_plain]);
+
+    // Make the two rows unreadable: a BLOB where the status TEXT is read,
+    // so the store's row mapping errors for exactly these instances while
+    // the store itself opens and every other row reads fine.
+    let raw = rusqlite::Connection::open(AsRef::<Path>::as_ref(&store_path)).expect("reopen");
+    for instance in [&unreadable_member, &unreadable_plain] {
+        raw.execute(
+            "UPDATE instances SET status = X'FF' WHERE instance_id = ?1",
+            [instance.as_str()],
+        )
+        .expect("corrupt the row");
+    }
+    drop(raw);
+
+    let report = whip(&["branch", "reconcile"]);
+    let outcome = |branch_id: &str| -> String {
+        report
+            .as_array()
+            .expect("report array")
+            .iter()
+            .find(|entry| entry.get("branch_id").and_then(Value::as_str) == Some(branch_id))
+            .and_then(|entry| entry.get("outcome"))
+            .and_then(Value::as_str)
+            .unwrap_or_else(|| panic!("{branch_id} entry: {report}"))
+            .to_owned()
+    };
+    assert_eq!(outcome("draft_done"), "admitted", "{report}");
+    assert_eq!(outcome("draft_running"), "deferred_mid_run", "{report}");
+    assert_eq!(
+        outcome("draft_unreadable"),
+        "deferred_mid_run",
+        "an unreadable bound instance is not known idle, so its member is not admitted: {report}"
+    );
+    assert_eq!(
+        outcome("draft_plain"),
+        "deferred_mid_run",
+        "an unreadable bound instance is not known idle, so the colliding delta is not asked: {report}"
     );
 
     let _ = fs::remove_file(store_path);
