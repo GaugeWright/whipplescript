@@ -18,6 +18,15 @@ on:
   # change happened to touch `mkdocs.yml` or an asset outside the list, and
   # surfaced the first time one did not.
   #
+  # Nor can a second workflow stand in with same-named no-op jobs, which was the
+  # first repair attempted and is what re-added the bite. GitHub starts a
+  # workflow when ANY changed path matches its `paths`, and skips one only when
+  # EVERY changed path matches its `paths-ignore`, so the two filters are not
+  # complements and a pull request touching both docs and code starts both
+  # workflows. Two check runs of one required name is an ambiguous gate: the
+  # cheap no-op can report green for a context whose real job has not spoken
+  # yet. Each required context gets exactly one producer, and that is this file.
+  #
   # It was also skipping a gate that had nothing to say about the documentation
   # in the first place, which was the deeper problem: the programs the docs tell
   # a reader to run were checked only by `check-release-readiness.sh`, a deep
