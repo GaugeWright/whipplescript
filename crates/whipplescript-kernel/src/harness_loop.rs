@@ -192,6 +192,17 @@ pub enum HarnessModelError {
 /// The single model side effect: one model call given the conversation so far and
 /// the available tools. The real impl lives in the CLI; tests inject a fake.
 pub trait HarnessModelClient {
+    /// The resolved model id this client sends its requests with, for the
+    /// per-call record DR-0115 requires.
+    ///
+    /// `None` when the client does not know — a fixture, or a surface that
+    /// never resolved one. The fold reports that as UNRECORDED rather than
+    /// guessing, because a turn that switched models mid-loop is precisely the
+    /// case per-call recording exists to tell apart.
+    fn model_id(&self) -> Option<String> {
+        None
+    }
+
     fn next(
         &self,
         messages: &[ChatMessage],
@@ -225,6 +236,17 @@ pub trait HttpModelClient {
     /// wants to force compaction cheaply) overrides it.
     fn context_window(&self) -> u64 {
         DEFAULT_CONTEXT_WINDOW
+    }
+
+    /// The resolved model id this client sends its requests with, for the
+    /// per-call record DR-0115 requires.
+    ///
+    /// `None` when the client does not know — a fixture, or a surface that
+    /// never resolved one. The fold reports that as UNRECORDED rather than
+    /// guessing, because a turn that switched models mid-loop is precisely the
+    /// case per-call recording exists to tell apart.
+    fn model_id(&self) -> Option<String> {
+        None
     }
 }
 
@@ -265,6 +287,23 @@ impl<M: HttpModelClient + ?Sized> StepMachine for ModelCallMachine<'_, M> {
 pub enum LoopObservation {
     /// A model call was made at this 0-based step.
     ModelRequest { step: usize },
+    /// One model REPLY, with the usage the provider reported for it and the
+    /// model that served it (DR-0115).
+    ///
+    /// Recorded per reply rather than per request, and that is the contract: a
+    /// retried request that never returned produces no row, so the fold never
+    /// infers tokens for a call the provider did not report. `ModelRequest`
+    /// cannot carry these — it is pushed BEFORE the call, when no usage exists.
+    ModelReply {
+        step: usize,
+        /// The provider's usage object verbatim. `Null` when it reported none.
+        usage: Value,
+        model: Option<String>,
+        /// A compaction round is a real billed call whose usage the runtime
+        /// used to discard outright. Flagged so a reader can tell overhead from
+        /// the work the turn was asked to do.
+        compaction: bool,
+    },
     /// The model requested a tool.
     ToolRequested { call_id: String, name: String },
     /// The kernel executed the tool and got this status.
@@ -657,6 +696,12 @@ where
                 };
             }
         };
+        observations.push(LoopObservation::ModelReply {
+            step,
+            usage: reply.usage.clone(),
+            model: client.model_id(),
+            compaction: false,
+        });
         usage = merge_usage(usage, reply.usage.clone());
         last_input_tokens = input_tokens_of(&reply.usage);
 
@@ -1302,10 +1347,28 @@ where
         // usage is not the trigger signal. On a summarizer failure, disarm and
         // proceed uncompacted (the Lb-5 overflow fallback covers the hard case).
         if self.awaiting == Awaiting::Summary {
-            let folded = match (
-                self.model.parse_response(response),
-                self.pending_compaction.take(),
-            ) {
+            let parsed = self.model.parse_response(response);
+            // A summarization round is a real model call the provider bills,
+            // and its usage was discarded here — under-counting precisely where
+            // context is largest (DR-0115). It is recorded as its own per-call
+            // row, flagged so a reader can separate overhead from the work the
+            // turn was asked to do.
+            //
+            // It deliberately does NOT join `self.usage`: that sum is the
+            // compaction TRIGGER signal and an existing meter, and moving it
+            // would change what a settled turn reports. The consequence is that
+            // call-grain totals exceed turn-grain totals for a turn that
+            // compacted, which is turn grain having been wrong rather than call
+            // grain being wrong.
+            if let Ok(reply) = &parsed {
+                self.observations.push(LoopObservation::ModelReply {
+                    step: self.step,
+                    usage: reply.usage.clone(),
+                    model: self.model.model_id(),
+                    compaction: true,
+                });
+            }
+            let folded = match (parsed, self.pending_compaction.take()) {
                 (Ok(reply), Some(request)) => Some((
                     self.compactor.assemble(&request, &reply.text),
                     request.request_messages.len(),
@@ -1378,6 +1441,12 @@ where
                 });
             }
         };
+        self.observations.push(LoopObservation::ModelReply {
+            step: self.step,
+            usage: reply.usage.clone(),
+            model: self.model.model_id(),
+            compaction: false,
+        });
         self.usage = merge_usage(std::mem::take(&mut self.usage), reply.usage.clone());
         // The real-usage compaction signal is the MAIN reply's input token count.
         self.last_input_tokens = input_tokens_of(&reply.usage);
@@ -3481,10 +3550,20 @@ mod tests {
         assert_eq!(outcome.summary, "done");
         assert_eq!(outcome.steps, 1);
         assert!(exec.calls.borrow().is_empty());
-        // One model_request observation, no tool observations.
+        // One request and its reply, no tool observations. The reply row is
+        // what DR-0115 added: recorded when the reply arrives, carrying the
+        // usage the provider reported for that call.
         assert_eq!(
             outcome.observations,
-            vec![LoopObservation::ModelRequest { step: 0 }]
+            vec![
+                LoopObservation::ModelRequest { step: 0 },
+                LoopObservation::ModelReply {
+                    step: 0,
+                    usage: json!({"output_tokens": 5}),
+                    model: None,
+                    compaction: false,
+                },
+            ]
         );
         // The model was offered the tools.
         assert!(*client.seen_tools.borrow());
@@ -3581,11 +3660,20 @@ mod tests {
         assert_eq!(calls[0].name, "read");
 
         // The observation stream: a tool_result is always preceded by its
-        // tool_requested, and both sit between model_requests.
+        // tool_requested, and both sit between model rounds. Each reply row
+        // follows its own request row, so a reader can pair them and count the
+        // calls that actually returned — which is what makes `calls` a real
+        // call count where `steps` is only a round count.
         assert_eq!(
             outcome.observations,
             vec![
                 LoopObservation::ModelRequest { step: 0 },
+                LoopObservation::ModelReply {
+                    step: 0,
+                    usage: json!({"output_tokens": 3}),
+                    model: None,
+                    compaction: false,
+                },
                 LoopObservation::ToolRequested {
                     call_id: "call_1".to_string(),
                     name: "read".to_string(),
@@ -3596,6 +3684,12 @@ mod tests {
                     status: ToolStatus::Ok,
                 },
                 LoopObservation::ModelRequest { step: 1 },
+                LoopObservation::ModelReply {
+                    step: 1,
+                    usage: json!({"output_tokens": 5}),
+                    model: None,
+                    compaction: false,
+                },
             ]
         );
     }
@@ -3650,6 +3744,7 @@ mod tests {
                     );
                 }
                 LoopObservation::ModelRequest { .. }
+                | LoopObservation::ModelReply { .. }
                 | LoopObservation::WorkspaceRead { .. }
                 | LoopObservation::Compacted { .. }
                 | LoopObservation::UserCommandApplied { .. }

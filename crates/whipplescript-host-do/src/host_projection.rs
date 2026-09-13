@@ -477,64 +477,41 @@ fn project_usage(
     let Some(usage) = metadata.get("usage").filter(|usage| usage.is_object()) else {
         return Ok(None);
     };
-    let tokens = |primary: &str, alias: &str| {
-        usage
-            .get(primary)
-            .or_else(|| usage.get(alias))
-            .and_then(Value::as_u64)
-            .unwrap_or(0)
-    };
-    let cached_in = |details: &str| {
-        usage
-            .get(details)
-            .and_then(|details| details.get("cached_tokens"))
-    };
-    // Anthropic's native Messages API reports the cached span in its own fields
-    // and leaves `input_tokens` as the *uncached remainder* — the inverse of
-    // Chat Completions, where `prompt_tokens` is the total and `cached_tokens`
-    // is a subset of it. Presence of the field is what identifies the wire; a
-    // native round that cached nothing reports an explicit zero, and the
-    // arithmetic below is an identity in that case.
+
+    // ONE parse of the wire, in the kernel, shared with the stats fold and with
+    // `whip improve`'s pricing. This used to be a second implementation, and the
+    // two drifted in exactly the way a second implementation does: the kernel
+    // was missing the top-level `cached_input_tokens` alias this side had
+    // already learned to read, so cached spans arriving that way counted and
+    // priced as fresh input.
     //
-    // Reported raw, a cached native round would show `cached > input`, and the
-    // edge rejects exactly that as inexact usage ("exact provider usage is
-    // required"). So the wire that finally *can* cache would fail every turn it
-    // cached on. Normalizing to the Chat Completions convention keeps one meter
-    // honest across both surfaces.
-    let cache_read = usage.get("cache_read_input_tokens").and_then(Value::as_u64);
-    let raw_input = tokens("input_tokens", "prompt_tokens");
-    let (input_tokens, cached_input_tokens) = match cache_read {
-        Some(read) => {
-            // Cache *writes* are billed at 1.25x rather than the card's flat
-            // input rate, so folding them in under-states their cost slightly.
-            // That is deliberate: they are genuinely fresh (uncached) input, and
-            // the card is only the fallback basis — a settled turn bills the
-            // gateway's measured cost, which prices the premium exactly.
-            let created = usage
-                .get("cache_creation_input_tokens")
-                .and_then(Value::as_u64)
-                .unwrap_or(0);
-            (raw_input.saturating_add(read).saturating_add(created), read)
-        }
-        // Chat Completions and the OpenAI Responses wire. The other two fields
-        // have carried their alias since this was written; the cached one did
-        // not, and the omission was not visible as a failure — it read as an
-        // honest zero while every cached token priced as a fresh one.
-        None => (
-            raw_input,
-            usage
-                .get("cached_input_tokens")
-                .or_else(|| cached_in("input_tokens_details"))
-                .or_else(|| cached_in("prompt_tokens_details"))
-                .and_then(Value::as_u64)
-                .unwrap_or(0),
-        ),
-    };
+    // The two CONVENTIONS still differ, and that is not drift. The kernel holds
+    // DISJOINT buckets because a report prices each at its own rate. The hosted
+    // meter is INCLUSIVE — `input_tokens` is the total and `cached_input_tokens`
+    // a subset of it — because the edge validates `cached <= input`
+    // (worker/src/index.ts). Reported raw, a cached native Anthropic round shows
+    // `cached > input` and is rejected as inexact usage, so the wire that
+    // finally CAN cache would fail every turn it cached on.
+    //
+    // Disjoint is the lossless form and inclusive is a projection of it: folding
+    // the cache buckets into input is total, and recovering the read/write split
+    // afterwards is not. So the meter derives, rather than parsing again.
+    //
+    // Cache WRITES fold into input here and bill at the card's flat input rate,
+    // slightly under their true 1.25x. That is unchanged and still deliberate:
+    // they are genuinely fresh input, and the card is only the fallback basis —
+    // a settled turn bills the gateway's measured cost, which prices the premium
+    // exactly.
+    let buckets = whipplescript_kernel::stats::UsageBuckets::from_usage_json(usage);
+    let input_tokens = u64::try_from(buckets.input_side()).unwrap_or(0);
+    let cached_input_tokens = u64::try_from(buckets.cache_read.unwrap_or(0)).unwrap_or(0);
+    let output_tokens = u64::try_from(buckets.output).unwrap_or(0);
+
     Ok(Some(HostedUsageObservation {
         usage_ref: usage_ref.to_owned(),
         input_tokens,
         cached_input_tokens,
-        output_tokens: tokens("output_tokens", "completion_tokens"),
+        output_tokens,
         last_input_tokens: usage
             .get("last_input_tokens")
             .and_then(Value::as_u64)
@@ -1031,6 +1008,94 @@ mod tests {
                 result: Some("hello".to_owned()),
                 ok: Some(true),
             }]
+        );
+    }
+}
+
+#[cfg(test)]
+mod usage_convention_tests {
+    use super::*;
+    use serde_json::json;
+    use whipplescript_kernel::stats::UsageBuckets;
+
+    /// The hosted meter's INCLUSIVE form derived from the kernel's DISJOINT one.
+    ///
+    /// The two conventions are not a disagreement to settle by picking a winner.
+    /// The hosted wire contract is inclusive because the edge validates
+    /// `cached_input_tokens <= input_tokens` (worker/src/index.ts), so a native
+    /// round that cached would be rejected as inexact usage if reported raw. The
+    /// stats fold is disjoint because each bucket prices at its own rate.
+    ///
+    /// Disjoint is the LOSSLESS form and inclusive is a projection of it: you
+    /// can always fold the cache buckets in, and you cannot recover the
+    /// read/write split once folded. So the reconciliation is one parse of the
+    /// wire producing the disjoint form, with the hosted meter derived from it.
+    fn derive_hosted(buckets: UsageBuckets) -> (u64, u64) {
+        let input = u64::try_from(buckets.input_side()).unwrap_or(0);
+        let cached = u64::try_from(buckets.cache_read.unwrap_or(0)).unwrap_or(0);
+        (input, cached)
+    }
+
+    fn wire_shapes() -> Vec<(&'static str, Value)> {
+        vec![
+            (
+                "anthropic native, cached",
+                json!({"input_tokens": 100, "output_tokens": 20,
+                       "cache_read_input_tokens": 900, "cache_creation_input_tokens": 50}),
+            ),
+            (
+                "anthropic native, explicit zero cache",
+                json!({"input_tokens": 100, "output_tokens": 20,
+                       "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0}),
+            ),
+            (
+                "anthropic native, read only",
+                json!({"input_tokens": 100, "output_tokens": 20, "cache_read_input_tokens": 40}),
+            ),
+            (
+                "openai chat completions, cached",
+                json!({"prompt_tokens": 1000, "completion_tokens": 20,
+                       "prompt_tokens_details": {"cached_tokens": 900}}),
+            ),
+            (
+                "openai responses, cached",
+                json!({"input_tokens": 1000, "output_tokens": 7,
+                       "input_tokens_details": {"cached_tokens": 250}}),
+            ),
+            (
+                "no cache accounting at all",
+                json!({"input_tokens": 10, "output_tokens": 2}),
+            ),
+            (
+                "top-level cached_input_tokens alias",
+                json!({"input_tokens": 1000, "output_tokens": 3, "cached_input_tokens": 400}),
+            ),
+        ]
+    }
+
+    /// Differential: the hosted projection and a derivation from the kernel's
+    /// buckets must agree on every wire shape. Run BEFORE unifying them, so the
+    /// refactor is provably behaviour-preserving rather than hopefully so.
+    #[test]
+    fn the_hosted_meter_is_derivable_from_the_kernels_disjoint_buckets() {
+        let mut divergent = Vec::new();
+        for (label, usage) in wire_shapes() {
+            let metadata = json!({"usage": usage}).to_string();
+            let hosted = project_usage(&metadata, "ref")
+                .expect("projects")
+                .expect("has usage");
+            let derived = derive_hosted(UsageBuckets::from_usage_json(&usage));
+            if (hosted.input_tokens, hosted.cached_input_tokens) != derived {
+                divergent.push(format!(
+                    "{label}: hosted=({}, {}) derived=({}, {})",
+                    hosted.input_tokens, hosted.cached_input_tokens, derived.0, derived.1
+                ));
+            }
+        }
+        assert!(
+            divergent.is_empty(),
+            "the two usage conventions do not agree, so one parse cannot serve both:\n  {}",
+            divergent.join("\n  ")
         );
     }
 }

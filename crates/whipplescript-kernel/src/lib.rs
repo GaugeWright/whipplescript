@@ -263,6 +263,35 @@ fn brokered_observation_evidence(
         LoopObservation::ModelRequest { step } => {
             ("agent.turn.brokered.model_request", json!({ "step": step }))
         }
+        // DR-0115. The usage object and the model id cross as VALUES, not as
+        // shapes, which amends `spec/owned-harness-loop-contract.md` §3: that
+        // rule sends these payloads through `json_shape`, which maps a number
+        // to `{"type":"number"}` and so erases exactly what is being recorded.
+        //
+        // The amendment is narrow and its boundary is the authorship of the
+        // payload. A payload reduced from USER data — a prompt, a completion, a
+        // tool's arguments — still crosses as shape through the one
+        // `json_shape` (DR-0075's actual subject). This payload the kernel
+        // authors itself from structural facts about the call, and a raw
+        // integer already crossed on the sibling row as `step`.
+        //
+        // The disclosure it adds is prompt MAGNITUDE at finer granularity,
+        // which is already durable at turn grain in the run's summed usage.
+        // Prompt SHAPE stays refused.
+        LoopObservation::ModelReply {
+            step,
+            usage,
+            model,
+            compaction,
+        } => (
+            "agent.turn.brokered.model_reply",
+            json!({
+                "step": step,
+                "usage": usage,
+                "model": model,
+                "compaction": compaction,
+            }),
+        ),
         LoopObservation::ToolRequested { call_id, name } => (
             "agent.turn.tool_requested",
             json!({ "call_id": call_id, "tool": name }),

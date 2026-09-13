@@ -76,11 +76,21 @@ impl UsageBuckets {
         let cache_write = usage
             .get("cache_creation_input_tokens")
             .and_then(Value::as_i64);
+        // Three spellings of the same inclusive-family field. The top-level
+        // `cached_input_tokens` alias is the one this originally missed: it read
+        // as an honest zero while every cached token counted, and priced, as a
+        // fresh one. The hosted meter had already learned that and carried the
+        // alias; consolidating here is what made the omission visible.
         let openai_cached = usage
-            .get("prompt_tokens_details")
-            .or_else(|| usage.get("input_tokens_details"))
-            .and_then(|details| details.get("cached_tokens"))
-            .and_then(Value::as_i64);
+            .get("cached_input_tokens")
+            .and_then(Value::as_i64)
+            .or_else(|| {
+                usage
+                    .get("input_tokens_details")
+                    .or_else(|| usage.get("prompt_tokens_details"))
+                    .and_then(|details| details.get("cached_tokens"))
+                    .and_then(Value::as_i64)
+            });
         let (input_uncached, cache_read) = match (anthropic_read, openai_cached) {
             (Some(read), _) => (raw_input, Some(read)),
             (None, Some(cached)) => ((raw_input - cached).max(0), Some(cached)),
@@ -321,6 +331,26 @@ impl EffectInput {
     }
 }
 
+/// One model CALL, as the fold reads it: one `agent.turn.brokered.model_reply`
+/// evidence row (DR-0115).
+///
+/// Recorded per reply, so a retried request that never returned is absent here
+/// rather than present with zeros. That is why `calls` at this grain is a real
+/// call count where `steps` is not: `steps` counts rounds and a retry inside a
+/// round is invisible to it.
+#[derive(Clone, Debug)]
+pub struct CallInput {
+    pub run_id: String,
+    pub step: i64,
+    pub model: Option<String>,
+    /// The provider's usage object. `None` when it reported none, which stays
+    /// UNRECORDED rather than becoming an invented zero.
+    pub usage: Option<Value>,
+    /// A summarization round: a billed call that is overhead rather than the
+    /// work the turn was asked to do.
+    pub compaction: bool,
+}
+
 /// One run, as the fold reads it. `metadata_json` is parsed here rather than by
 /// each caller so the native and hosted doors cannot disagree about what a run
 /// records.
@@ -507,11 +537,17 @@ struct Contribution {
 /// Pure: the same inputs always produce the same rows, which is what lets a
 /// fixture assert a token budget and what makes the additivity property
 /// testable.
-pub fn fold(instances: &[InstanceInput], effects: &[EffectInput], runs: &[RunInput]) -> Folded {
+pub fn fold(
+    instances: &[InstanceInput],
+    effects: &[EffectInput],
+    runs: &[RunInput],
+    calls: &[CallInput],
+) -> Folded {
     Folded {
         instances: instances.to_vec(),
         effects: effects.to_vec(),
         runs: runs.to_vec(),
+        calls: calls.to_vec(),
     }
 }
 
@@ -520,6 +556,7 @@ pub struct Folded {
     instances: Vec<InstanceInput>,
     effects: Vec<EffectInput>,
     runs: Vec<RunInput>,
+    calls: Vec<CallInput>,
 }
 
 impl Folded {
@@ -530,6 +567,13 @@ impl Folded {
             .iter()
             .map(|instance| (instance.instance_id.as_str(), instance))
             .collect();
+        let mut calls_by_run: BTreeMap<&str, Vec<&CallInput>> = BTreeMap::new();
+        for call in &self.calls {
+            calls_by_run
+                .entry(call.run_id.as_str())
+                .or_default()
+                .push(call);
+        }
         let mut runs_by_effect: BTreeMap<&str, Vec<&RunInput>> = BTreeMap::new();
         for run in &self.runs {
             runs_by_effect
@@ -594,15 +638,29 @@ impl Folded {
             }
 
             for (index, run) in windowed.iter().enumerate() {
-                let mut contribution = self.run_contribution(instance, effect, run);
+                let run_calls = calls_by_run
+                    .get(run.run_id.as_str())
+                    .cloned()
+                    .unwrap_or_default();
+                // A run with per-call rows folds through the per-call path,
+                // which consumes its turn sum with it. There is no path folding
+                // both: that is the no-double-count rule.
+                let mut produced = if run_calls.is_empty() {
+                    vec![self.run_contribution(instance, effect, run)]
+                } else {
+                    self.call_contributions(instance, effect, run, &run_calls)
+                };
                 // The logical count belongs to the EFFECT, so it is added once
-                // however many times the effect ran. Adding it per run would
-                // make `retries` (runs - effects) always zero, hiding the
-                // mechanism behind exactly-once rather than showing it.
+                // however many times the effect ran, and to ONE of its
+                // contributions however many calls that run made. Adding it per
+                // run would make `retries` (runs - effects) always zero, hiding
+                // the mechanism behind exactly-once rather than showing it.
                 if index == 0 {
-                    contribution.measures.effects = Measure::recorded(1);
+                    if let Some(first) = produced.first_mut() {
+                        first.measures.effects = Measure::recorded(1);
+                    }
                 }
-                contributions.push(contribution);
+                contributions.extend(produced);
             }
         }
 
@@ -702,6 +760,65 @@ impl Folded {
             values: self.dimension_values(instance, effect, Some(run), &metadata, grain),
             measures,
         }
+    }
+
+    /// One contribution per model call. `step` and `model` become real
+    /// dimensions here, because each row is one call rather than one turn.
+    ///
+    /// The run-level facts — that this run happened, and how it ended — belong
+    /// to the RUN, so they ride on the first call only. Repeating them per call
+    /// would multiply a turn's status counts by its round count.
+    fn call_contributions(
+        &self,
+        instance: &InstanceInput,
+        effect: &EffectInput,
+        run: &RunInput,
+        calls: &[&CallInput],
+    ) -> Vec<Contribution> {
+        let metadata = run.metadata();
+        calls
+            .iter()
+            .enumerate()
+            .map(|(index, call)| {
+                let known = call.usage.is_some();
+                let usage = call
+                    .usage
+                    .as_ref()
+                    .map(UsageBuckets::from_usage_json)
+                    .unwrap_or_default();
+                let first = index == 0;
+                let mut measures = Measures {
+                    calls: Measure::recorded(1),
+                    input_uncached: token_measure(Grain::Call, known, usage.input_uncached),
+                    input_cache_read: cache_measure(Grain::Call, known, usage.cache_read),
+                    input_cache_write: cache_measure(Grain::Call, known, usage.cache_write),
+                    output: token_measure(Grain::Call, known, usage.output),
+                    ..Measures::zero()
+                };
+                if first {
+                    measures.runs = Measure::recorded(1);
+                    measures.turns = Measure::recorded(1);
+                    measures.completed = Measure::recorded(i64::from(run.status == "completed"));
+                    measures.failed = Measure::recorded(i64::from(run.status == "failed"));
+                    measures.timed_out = Measure::recorded(i64::from(run.status == "timed_out"));
+                    measures.cancelled = Measure::recorded(i64::from(run.status == "cancelled"));
+                    measures.steps = match metadata.steps {
+                        Some(steps) => Measure::recorded(steps),
+                        None => Measure::unrecorded(),
+                    };
+                    measures.last_input_tokens = match metadata.last_input_tokens {
+                        Some(tokens) => Measure::recorded(tokens),
+                        None => Measure::unrecorded(),
+                    };
+                }
+                let mut values =
+                    self.dimension_values(instance, effect, Some(run), &metadata, Grain::Call);
+                // The call's OWN model and step, not the run's.
+                values.insert(Dimension::Model, call.model.clone());
+                values.insert(Dimension::Step, Some(call.step.to_string()));
+                Contribution { values, measures }
+            })
+            .collect()
     }
 
     fn dimension_values(
@@ -951,7 +1068,7 @@ mod tests {
             ),
             run("r2", "e2", json!({})),
         ];
-        let rows = fold(&instances, &effects, &runs).rows(&by_rule());
+        let rows = fold(&instances, &effects, &runs, &[]).rows(&by_rule());
         assert_eq!(rows.len(), 2, "one rule, two grains, two rows: {rows:#?}");
         let grains: Vec<Option<String>> = rows
             .iter()
@@ -980,6 +1097,7 @@ mod tests {
                 "e1",
                 json!({"steps": 3, "usage": {"input_tokens": 10, "output_tokens": 2}}),
             )],
+            &[],
         )
         .rows(&by_rule());
         assert_eq!(rows.len(), 1);
@@ -998,6 +1116,7 @@ mod tests {
             &[instance("i1")],
             &[effect("e1", "i1", "write", "file.write")],
             &[run("r1", "e1", json!({}))],
+            &[],
         )
         .rows(&by_rule());
         assert_eq!(rows.len(), 1);
@@ -1025,6 +1144,7 @@ mod tests {
                 // Same rule, same grain, and the provider reported no usage.
                 run("r2", "e2", json!({"steps": 1})),
             ],
+            &[],
         )
         .rows(&by_rule());
         assert_eq!(rows.len(), 1, "same rule and same grain is one row");
@@ -1060,7 +1180,7 @@ mod tests {
                 json!({"usage": {"input_tokens": 30, "output_tokens": 5}}),
             ),
         ];
-        let whole = fold(&instances, &effects, &runs).rows(&by_rule());
+        let whole = fold(&instances, &effects, &runs, &[]).rows(&by_rule());
         assert_eq!(whole.len(), 1);
         let whole_output = measure_of(&whole[0], |m| m.output).expect("recorded");
 
@@ -1071,7 +1191,7 @@ mod tests {
                 instance_id: Some(one.to_owned()),
                 ..Query::default()
             };
-            let rows = fold(&instances, &effects, &runs).rows(&scoped);
+            let rows = fold(&instances, &effects, &runs, &[]).rows(&scoped);
             assert_eq!(rows.len(), 1);
             summed += measure_of(&rows[0], |m| m.output).expect("recorded");
         }
@@ -1098,6 +1218,7 @@ mod tests {
                     json!({"usage": {"input_tokens": 10, "output_tokens": 3}}),
                 ),
             ],
+            &[],
         )
         .rows(&by_rule());
         assert_eq!(rows.len(), 1);
@@ -1126,8 +1247,208 @@ mod tests {
             ),
             run("r2", "e2", json!({})),
         ];
-        let folded = fold(&instances, &effects, &runs);
+        let folded = fold(&instances, &effects, &runs, &[]);
         assert_eq!(folded.rows(&named), folded.rows(&by_rule()));
+    }
+
+    // -- call grain (DR-0115) ---------------------------------------------
+
+    fn call(run_id: &str, step: i64, model: &str, usage: Option<Value>) -> CallInput {
+        CallInput {
+            run_id: run_id.to_owned(),
+            step,
+            model: Some(model.to_owned()),
+            usage,
+            compaction: false,
+        }
+    }
+
+    #[test]
+    fn per_call_rows_give_a_real_call_count_where_steps_could_not() {
+        // `steps` counts ROUNDS. Two calls in one round — a provider retry that
+        // returned — are two calls and one step, and only per-call rows can say
+        // so.
+        let rows = fold(
+            &[instance("i1")],
+            &[effect("e1", "i1", "review", "agent.tell")],
+            &[run(
+                "r1",
+                "e1",
+                json!({"steps": 1, "usage": {"input_tokens": 99}}),
+            )],
+            &[
+                call(
+                    "r1",
+                    0,
+                    "claude-opus-5",
+                    Some(json!({"input_tokens": 10, "output_tokens": 2})),
+                ),
+                call(
+                    "r1",
+                    0,
+                    "claude-opus-5",
+                    Some(json!({"input_tokens": 12, "output_tokens": 3})),
+                ),
+            ],
+        )
+        .rows(&by_rule());
+        assert_eq!(rows.len(), 1);
+        assert_eq!(measure_of(&rows[0], |m| m.calls), Some(2));
+        assert_eq!(measure_of(&rows[0], |m| m.steps), Some(1));
+        // The turn sum (99) is NOT folded as well: one run, one path.
+        assert_eq!(measure_of(&rows[0], |m| m.input_uncached), Some(22));
+        assert_eq!(measure_of(&rows[0], |m| m.runs), Some(1));
+        assert_eq!(measure_of(&rows[0], |m| m.effects), Some(1));
+        let grain = rows[0]
+            .key
+            .iter()
+            .find(|(dimension, _)| *dimension == Dimension::Grain)
+            .and_then(|(_, value)| value.clone());
+        assert_eq!(grain, Some("call".to_owned()));
+    }
+
+    #[test]
+    fn a_turn_that_switched_models_reports_each_call_against_its_own_model() {
+        // The attribution the turn sum cannot express: one blended number
+        // becomes two rows, each against the model that actually served it.
+        let query = Query {
+            by: vec![Dimension::Model],
+            ..Query::default()
+        };
+        let rows = fold(
+            &[instance("i1")],
+            &[effect("e1", "i1", "review", "agent.tell")],
+            &[run("r1", "e1", json!({"usage": {"input_tokens": 40}}))],
+            &[
+                call(
+                    "r1",
+                    0,
+                    "claude-opus-5",
+                    Some(json!({"input_tokens": 10, "output_tokens": 1})),
+                ),
+                call(
+                    "r1",
+                    1,
+                    "claude-haiku-4-5",
+                    Some(json!({"input_tokens": 30, "output_tokens": 9})),
+                ),
+            ],
+        )
+        .rows(&query);
+        assert_eq!(rows.len(), 2, "one row per model: {rows:#?}");
+        let by_model: Vec<(Option<String>, Option<i64>)> = rows
+            .iter()
+            .map(|row| {
+                (
+                    row.key
+                        .iter()
+                        .find(|(dimension, _)| *dimension == Dimension::Model)
+                        .and_then(|(_, value)| value.clone()),
+                    row.measures.input_uncached.value(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            by_model,
+            vec![
+                (Some("claude-haiku-4-5".to_owned()), Some(30)),
+                (Some("claude-opus-5".to_owned()), Some(10)),
+            ]
+        );
+    }
+
+    #[test]
+    fn one_call_without_provider_usage_makes_the_rows_tokens_unrecorded() {
+        // The per-measure clause AT CALL GRAIN: both calls sit in one row at one
+        // grain, and population tagging does not reach this.
+        let rows = fold(
+            &[instance("i1")],
+            &[effect("e1", "i1", "review", "agent.tell")],
+            &[run("r1", "e1", json!({}))],
+            &[
+                call(
+                    "r1",
+                    0,
+                    "m",
+                    Some(json!({"input_tokens": 10, "output_tokens": 2})),
+                ),
+                call("r1", 1, "m", None),
+            ],
+        )
+        .rows(&by_rule());
+        assert_eq!(rows.len(), 1);
+        assert_eq!(measure_of(&rows[0], |m| m.calls), Some(2));
+        assert_eq!(
+            measure_of(&rows[0], |m| m.output),
+            None,
+            "a call whose provider reported no usage makes the measure unrecorded"
+        );
+    }
+
+    #[test]
+    fn a_compaction_round_is_a_call_and_says_so() {
+        // Billed, and previously discarded. It counts, and the flag lets a
+        // reader separate overhead from the work the turn was asked to do.
+        let mut compaction = call(
+            "r1",
+            0,
+            "m",
+            Some(json!({"input_tokens": 5000, "output_tokens": 200})),
+        );
+        compaction.compaction = true;
+        let rows = fold(
+            &[instance("i1")],
+            &[effect("e1", "i1", "review", "agent.tell")],
+            &[run("r1", "e1", json!({}))],
+            &[
+                call(
+                    "r1",
+                    0,
+                    "m",
+                    Some(json!({"input_tokens": 10, "output_tokens": 2})),
+                ),
+                compaction,
+            ],
+        )
+        .rows(&by_rule());
+        assert_eq!(measure_of(&rows[0], |m| m.calls), Some(2));
+        assert_eq!(measure_of(&rows[0], |m| m.input_uncached), Some(5010));
+    }
+
+    #[test]
+    fn call_and_turn_grain_runs_never_share_a_row() {
+        // The straddling instance DR-0116 describes, now that both populations
+        // can really occur: the owned harness records calls, a delegate
+        // provider records none.
+        let rows = fold(
+            &[instance("i1")],
+            &[
+                effect("e1", "i1", "review", "agent.tell"),
+                effect("e2", "i1", "review", "agent.tell"),
+            ],
+            &[
+                run(
+                    "r1",
+                    "e1",
+                    json!({"usage": {"input_tokens": 10, "output_tokens": 2}}),
+                ),
+                run(
+                    "r2",
+                    "e2",
+                    json!({"usage": {"input_tokens": 70, "output_tokens": 5}}),
+                ),
+            ],
+            &[call(
+                "r1",
+                0,
+                "m",
+                Some(json!({"input_tokens": 10, "output_tokens": 2})),
+            )],
+        )
+        .rows(&by_rule());
+        assert_eq!(rows.len(), 2, "two populations, two rows: {rows:#?}");
+        let calls: Vec<Option<i64>> = rows.iter().map(|r| r.measures.calls.value()).collect();
+        assert_eq!(calls, vec![Some(1), None]);
     }
 
     #[test]
@@ -1138,10 +1459,37 @@ mod tests {
             &[instance("i1")],
             &[effect("e1", "i1", "review", "future.kind")],
             &[run("r1", "e1", json!({}))],
+            &[],
         )
         .rows(&by_rule());
         assert_eq!(rows.len(), 1);
         assert_eq!(measure_of(&rows[0], |m| m.calls), None);
         assert_eq!(measure_of(&rows[0], |m| m.output), None);
+    }
+}
+
+#[cfg(test)]
+mod alias_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// The inclusive family spells its cached subset three ways. Missing one
+    /// does not fail loudly: it reads as an honest zero, and every cached token
+    /// then counts — and prices — as a fresh one.
+    #[test]
+    fn every_spelling_of_the_cached_subset_is_read() {
+        for usage in [
+            json!({"input_tokens": 1000, "output_tokens": 3, "cached_input_tokens": 400}),
+            json!({"input_tokens": 1000, "output_tokens": 3,
+                   "input_tokens_details": {"cached_tokens": 400}}),
+            json!({"prompt_tokens": 1000, "completion_tokens": 3,
+                   "prompt_tokens_details": {"cached_tokens": 400}}),
+        ] {
+            let buckets = UsageBuckets::from_usage_json(&usage);
+            assert_eq!(buckets.cache_read, Some(400), "usage: {usage}");
+            assert_eq!(buckets.input_uncached, 600, "usage: {usage}");
+            // The inclusive total is preserved whichever spelling arrived.
+            assert_eq!(buckets.input_side(), 1000, "usage: {usage}");
+        }
     }
 }
