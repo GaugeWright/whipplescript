@@ -51,7 +51,7 @@ use whipplescript_store::{
 };
 
 use crate::coerce_runtime::UreqCoerceTransport;
-use crate::model_auth::resolve_credential_with_source;
+use crate::model_auth::{resolve_credential_with_source, CredentialSource};
 
 pub const TOOL_READ: &str = "read";
 pub const TOOL_WRITE: &str = "write";
@@ -4845,6 +4845,10 @@ struct HarnessModelConfig {
     base_url: String,
     max_tokens: u64,
     timeout: Duration,
+    /// The Codex account id, when the credential that resolved is the Codex
+    /// OAuth token rather than an API key. Its presence is what says this turn
+    /// talks to the subscription backend, so it decides the client below.
+    codex_account_id: Option<String>,
 }
 
 /// Auth relocation (untie research note §2, tracker Phase 4): the policy
@@ -4941,12 +4945,54 @@ fn profile_config_from_value(
                 .and_then(Value::as_u64)
                 .unwrap_or(120),
         ),
+        // A provider profile names an `api_key`/`api_key_env`, which is an API
+        // key by construction — the subscription token is not something a
+        // profile can carry, so this door never routes to the codex backend.
+        codex_account_id: None,
     }))
 }
 
 /// Resolve the live model client config. `Ok(None)` means run the credential-free
 /// fixture client (dev/CI default); `Err` means the provider was requested but
 /// could not be configured (fail the turn rather than silently use the fixture).
+/// The provider `WHIPPLESCRIPT_HARNESS_PROVIDER` names.
+///
+/// Lifted out of `resolve_harness_model_config` so the refusal has a site a test
+/// can reach: the resolver around it reads the environment, and a test that had
+/// to own `WHIPPLESCRIPT_HARNESS_PROVIDER` to see this would race every other
+/// test in the binary.
+fn harness_provider_for(name: &str) -> Result<CoerceProvider, String> {
+    match name {
+        "openai" => Ok(CoerceProvider::OpenAi),
+        "openai-generic" => Ok(CoerceProvider::OpenAiCompat),
+        "xai" => Ok(CoerceProvider::Xai),
+        "anthropic" => Ok(CoerceProvider::Anthropic),
+        other => Err(format!(
+            "unknown WHIPPLESCRIPT_HARNESS_PROVIDER `{other}` (expected `openai`, `openai-generic`, `anthropic`, or `xai`)"
+        )),
+    }
+}
+
+/// The Codex account id when the resolved credential is the subscription token,
+/// and `None` for every API key.
+///
+/// The pair is what decides it: only OpenAI has a Codex backend, and only the
+/// OAuth source is a subscription token. An API key for the same provider goes
+/// to `api.openai.com` as it always did.
+///
+/// Separated from the environment it reads so the decision can be pinned without
+/// a test having to own `$HOME`. `account` is the lookup, run only when the pair
+/// already says this is a subscription turn.
+fn codex_account_for(
+    provider: CoerceProvider,
+    source: CredentialSource,
+    account: impl FnOnce() -> Option<String>,
+) -> Option<String> {
+    (provider == CoerceProvider::OpenAi && source == CredentialSource::CodexOAuth)
+        .then(account)
+        .flatten()
+}
+
 fn resolve_harness_model_config() -> Result<Option<HarnessModelConfig>, String> {
     let Some(provider_name) = std::env::var("WHIPPLESCRIPT_HARNESS_PROVIDER")
         .ok()
@@ -4954,20 +5000,17 @@ fn resolve_harness_model_config() -> Result<Option<HarnessModelConfig>, String> 
     else {
         return Ok(None);
     };
-    let provider = match provider_name.as_str() {
-        "openai" => CoerceProvider::OpenAi,
-        "openai-generic" => CoerceProvider::OpenAiCompat,
-        "xai" => CoerceProvider::Xai,
-        "anthropic" => CoerceProvider::Anthropic,
-        other => {
-            return Err(format!(
-            "unknown WHIPPLESCRIPT_HARNESS_PROVIDER `{other}` (expected `openai`, `openai-generic`, `anthropic`, or `xai`)"
-        ))
-        }
-    };
-    let (api_key, _source) = resolve_credential_with_source(provider).ok_or_else(|| {
+    let provider = harness_provider_for(&provider_name)?;
+    let (api_key, source) = resolve_credential_with_source(provider).ok_or_else(|| {
         format!("WHIPPLESCRIPT_HARNESS_PROVIDER={provider_name} is set but no credential resolved")
     })?;
+    // A ChatGPT-plan Codex OAuth token is not an API key, and the endpoint that
+    // accepts it is not `api.openai.com`. The source was resolved here and then
+    // dropped, so the harness sent a subscription token to the pay-as-you-go
+    // door and the turn failed on a credential that was perfectly good. The
+    // coerce path already routes this way (`coerce_runtime`); this is the same
+    // decision at the other door.
+    let codex_account_id = codex_account_for(provider, source, crate::model_auth::codex_account_id);
     let model = std::env::var("WHIPPLESCRIPT_HARNESS_MODEL")
         .ok()
         .filter(|value| !value.is_empty())
@@ -4978,7 +5021,13 @@ fn resolve_harness_model_config() -> Result<Option<HarnessModelConfig>, String> 
     let base_url = std::env::var("WHIPPLESCRIPT_HARNESS_BASE_URL")
         .ok()
         .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| provider.default_base_url().to_string());
+        .unwrap_or_else(|| {
+            if codex_account_id.is_some() {
+                "https://chatgpt.com".to_owned()
+            } else {
+                provider.default_base_url().to_string()
+            }
+        });
     let max_tokens = std::env::var("WHIPPLESCRIPT_HARNESS_MAX_TOKENS")
         .ok()
         .and_then(|value| value.parse().ok())
@@ -4997,6 +5046,7 @@ fn resolve_harness_model_config() -> Result<Option<HarnessModelConfig>, String> 
         base_url,
         max_tokens,
         timeout,
+        codex_account_id,
     }))
 }
 
@@ -5426,17 +5476,35 @@ pub fn run_owned_agent_turn(
     let result = match model_config {
         Some(config) => {
             let transport = UreqCoerceTransport::new(config.timeout);
-            let client = RealHarnessModelClient::new(
-                &transport,
-                config.wire,
-                config.api_key,
-                config.model,
-                config.base_url,
-                config.max_tokens,
-                // Stable cache key for this turn-thread (Decision 7): the effect id,
-                // constant across the turn's model steps.
-                Some(effect_id.to_owned()),
-            );
+            // The subscription backend is its own client, not a base-url swap:
+            // it carries the account id as a header and pins the Responses wire,
+            // which is the only dialect that door speaks.
+            let client = match config.codex_account_id {
+                Some(account_id) => RealHarnessModelClient::new_codex(
+                    &transport,
+                    config.api_key,
+                    account_id,
+                    // The session the backend groups this turn's rounds under,
+                    // and the cache key below, are both the effect id — one
+                    // turn-thread, constant across its model steps (Decision 7).
+                    effect_id.to_owned(),
+                    config.model,
+                    config.base_url,
+                    config.max_tokens,
+                    Some(effect_id.to_owned()),
+                ),
+                None => RealHarnessModelClient::new(
+                    &transport,
+                    config.wire,
+                    config.api_key,
+                    config.model,
+                    config.base_url,
+                    config.max_tokens,
+                    // Stable cache key for this turn-thread (Decision 7): the
+                    // effect id, constant across the turn's model steps.
+                    Some(effect_id.to_owned()),
+                ),
+            };
             // Native drives the sans-IO `BrokeredTurnMachine` (Option α): the ureq
             // transport is both the model client's transport and the machine's
             // `HostDriver` (blanket impl), so native and the durable object run the
@@ -5489,6 +5557,96 @@ fn owned_max_steps() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An unknown provider name is refused, and the refusal says what is
+    /// accepted. Without it the harness would resolve no credential and fail
+    /// later with a message about the credential rather than the typo.
+    #[test]
+    fn an_unknown_harness_provider_is_refused_by_name() {
+        let error = harness_provider_for("openai-codex").expect_err("unknown name is refused");
+        assert!(
+            error.contains("openai-codex"),
+            "the refusal must name what was asked for: {error}"
+        );
+        for accepted in ["openai", "openai-generic", "anthropic", "xai"] {
+            assert!(
+                error.contains(accepted),
+                "the refusal must list `{accepted}` as accepted: {error}"
+            );
+            assert!(
+                harness_provider_for(accepted).is_ok(),
+                "`{accepted}` is listed as accepted and must resolve"
+            );
+        }
+    }
+
+    /// A ChatGPT-plan Codex OAuth token is not an API key, and the endpoint that
+    /// accepts it is not `api.openai.com`.
+    ///
+    /// `resolve_harness_model_config` resolved the credential's source and then
+    /// dropped it, so the harness sent a subscription token to the
+    /// pay-as-you-go door and the turn failed on a credential that was
+    /// perfectly good. `RealHarnessModelClient::new_codex` existed the whole
+    /// time with no caller outside its own test.
+    #[test]
+    fn a_codex_subscription_token_routes_to_the_backend_that_accepts_it() {
+        assert_eq!(
+            codex_account_for(CoerceProvider::OpenAi, CredentialSource::CodexOAuth, || {
+                Some("acct-1".to_owned())
+            }),
+            Some("acct-1".to_owned()),
+            "the OAuth source is the subscription backend's credential"
+        );
+    }
+
+    /// An API key for the same provider is unaffected: it still goes to the
+    /// public endpoint, which is what every existing deployment does.
+    #[test]
+    fn an_api_key_still_takes_the_public_openai_door() {
+        for source in [
+            CredentialSource::Stored,
+            CredentialSource::Env("OPENAI_API_KEY"),
+        ] {
+            assert_eq!(
+                codex_account_for(CoerceProvider::OpenAi, source, || Some("acct-1".to_owned())),
+                None,
+                "{source:?} is an API key, not a subscription token"
+            );
+        }
+    }
+
+    /// Only OpenAI has a Codex backend. An OAuth source read against another
+    /// provider must not route there — the account lookup is not even run.
+    #[test]
+    fn another_provider_never_routes_to_the_codex_backend() {
+        let mut looked_up = false;
+        let account = codex_account_for(
+            CoerceProvider::Anthropic,
+            CredentialSource::CodexOAuth,
+            || {
+                looked_up = true;
+                Some("acct-1".to_owned())
+            },
+        );
+        assert_eq!(account, None);
+        assert!(
+            !looked_up,
+            "the account id was read for a provider that has no codex door"
+        );
+    }
+
+    /// The pair can say "subscription" and the file still hold no account id.
+    /// That is not a route to the backend with a missing header; it is the
+    /// public door, as before.
+    #[test]
+    fn a_subscription_token_with_no_account_id_does_not_half_route() {
+        assert_eq!(
+            codex_account_for(CoerceProvider::OpenAi, CredentialSource::CodexOAuth, || {
+                None
+            }),
+            None
+        );
+    }
 
     /// DR-0052 Decision 6: the `changes` tool's filter semantics —
     /// `by: "others"` excludes exactly the turn's own chain (session AND
