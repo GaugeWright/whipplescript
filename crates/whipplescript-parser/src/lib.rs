@@ -19416,17 +19416,33 @@ fn parse_tell_target(line: &str) -> Option<&str> {
         .filter(|target| !target.is_empty())
 }
 
+/// The capabilities an effect statement's `requires [...]` clause lists.
+///
+/// This clause is the one place the two halves are not the same kind of text:
+/// `requires` and its brackets are CODE, and the names between them are STRING
+/// LITERALS. So the clause is LOCATED in the code mask and READ out of the
+/// original — [`code_scan_text`] blanks byte for byte, so an offset means the
+/// same thing in both.
+///
+/// Locating it in the raw text instead let prose supply the clause. The
+/// statement a `prompt` is parsed from carries its prompt body, and the parsed
+/// names are UNIONED with the ones the AST declared, so
+/// `prompt "Escalation requires [admin.root] sign-off." as summary` gave that
+/// effect a required capability no author ever wrote.
 pub fn parse_required_capabilities(line: &str) -> Vec<String> {
-    let Some(rest) = line.split_once(" requires ") else {
+    let code = code_scan_text(line);
+    let Some(marker) = code.find(" requires ") else {
         return Vec::new();
     };
-    let Some(list) = rest.1.trim_start().strip_prefix('[') else {
+    let after = marker + " requires ".len();
+    let open = after + (code[after..].len() - code[after..].trim_start().len());
+    if code.as_bytes().get(open) != Some(&b'[') {
+        return Vec::new();
+    }
+    let Some(close) = code[open..].find(']').map(|at| open + at) else {
         return Vec::new();
     };
-    let Some((items, _)) = list.split_once(']') else {
-        return Vec::new();
-    };
-    let mut capabilities = items
+    let mut capabilities = line[open + 1..close]
         .split(',')
         .filter_map(|item| {
             let value = item.trim().trim_matches('"');
@@ -25487,6 +25503,24 @@ fn source_scan_text(text: &str) -> String {
     non_code_blanked(text, KeepInterpolations::Yes)
 }
 
+/// `text` with every string-literal and comment byte blanked to a space, byte
+/// for byte — the mask a CLAUSE scanner reads.
+///
+/// The sibling of [`source_scan_text`], and it wants the opposite of what that
+/// one wants from `{{ … }}`. An identifier scan keeps interpolations because
+/// they are live field reads wherever they are written; a scanner looking for
+/// a keyword CLAUSE — `using <provider>`, `as <binding>` — wants every byte a
+/// string contributed gone, interpolations included, because none of them can
+/// be the clause it is looking for. What survives is code, at the offsets it
+/// occupies in `text`.
+///
+/// A scanner that skips this reads prose as syntax. `prompt "Summarize the
+/// report using the attached figures." as summary` named a provider `the`,
+/// because the statement a clause is parsed from holds the prompt body too.
+pub fn code_scan_text(text: &str) -> String {
+    non_code_blanked(text, KeepInterpolations::No)
+}
+
 /// Whether a mask puts `{{ … }}` back after blanking the string that held it.
 ///
 /// An identifier scan wants them back — an interpolation is a field read
@@ -29156,8 +29190,21 @@ pub fn is_prompt_content_type_token(candidate: &str) -> bool {
         && chars.all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '/' | '.' | '+' | '-' | '_'))
 }
 
+/// The binding an effect statement's `as <binding>` clause names.
+///
+/// Scanned over the code mask, not the raw text: callers hand this whole
+/// statements, and a statement carries its prompt body and its record-block
+/// field values. `prompt "Treat the figure as evidence." as summary` answered
+/// `evidence` — the first `as` in the text, which was in the prose.
+///
+/// That one has been survivable rather than harmless: the lowering prefers the
+/// AST effect node's binding and falls back to this, so the wrong answer only
+/// surfaced where the node was absent or matched by something other than its
+/// binding. It is still the wrong answer, and the mask is the same mask
+/// `using`, `timeout` and `requires` are now read through.
 pub fn binding_after_as(line: &str) -> Option<String> {
-    let mut tokens = line.split_whitespace();
+    let code = code_scan_text(line);
+    let mut tokens = code.split_whitespace();
     while let Some(token) = tokens.next() {
         if token == "as" {
             return tokens

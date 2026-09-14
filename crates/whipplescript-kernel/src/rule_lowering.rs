@@ -2953,8 +2953,22 @@ impl ParsedEffect {
 }
 
 /// Extracts a `timeout <duration>` clause from an effect statement line.
+///
+/// The clause is CODE, and several callers hand this the JOINED statement —
+/// which for a `prompt` or `tell` carries the prompt body. Scanning that text
+/// raw read a deadline out of the author's prose: `prompt "Explain what to do
+/// when a timeout 30s window expires." as summary` gave the effect a real
+/// 30-second deadline nobody wrote, and the AST parser, which reads the clause
+/// from a token stream, saw no timeout at all. The IR node's timeout is
+/// preferred over this one, so the disagreement bit exactly where it was least
+/// visible: on the effects with no `timeout` clause of their own.
+///
+/// So blank the string and comment bytes first, as
+/// [`prompt_provider_after_using`] does for `using`. A clause that is code
+/// survives the mask unchanged.
 pub fn parse_timeout_clause_seconds(line: &str) -> Option<i64> {
-    let mut words = line.split_whitespace().peekable();
+    let code = whipplescript_parser::code_scan_text(line);
+    let mut words = code.split_whitespace().peekable();
     while let Some(word) = words.next() {
         if word == "timeout" {
             let value = words.peek()?;
@@ -5690,8 +5704,31 @@ pub fn parse_after_scope(trimmed: &str) -> Option<AfterScope> {
     Some(AfterScope { binding, predicate })
 }
 
+/// The provider an inline `prompt`'s `using <provider>` clause names.
+///
+/// `line` is the WHOLE statement, and for a `"""` prompt that is the prompt
+/// BODY as well — the caller joins the statement's lines before handing it
+/// over, so every word the author wrote to the model is in this text. A raw
+/// token scan therefore read prose as syntax: `prompt "Summarize the report
+/// using the attached figures." as summary` named a provider `the`.
+///
+/// The damage is routing, not just a confusing diagnostic. This value becomes
+/// the effect input's `provider`, which is rung 1 of the coerce selection
+/// ladder (spec/std-coercion.md "Backend selection and config precedence") and
+/// beats every other rung: a prompt whose text says `using anthropic` pinned
+/// the effect to a real backend over the operator override and the registry
+/// binding both, and one that said `using fixture` degraded a native binding
+/// to a canned answer. The AST parser (`whipplescript_parser::body`) reads the
+/// clause from a token stream and was never fooled; this scan is what the IR
+/// is built from, so the two disagreed about where the prompt went.
+///
+/// Blanking the string and comment bytes first is the repair. Masked bytes
+/// become spaces, so a clause that IS code survives the mask unchanged and the
+/// scan below is the same scan it always was — it just can no longer see
+/// inside a prompt.
 pub fn prompt_provider_after_using(line: &str) -> Option<String> {
-    let mut tokens = line.split_whitespace();
+    let code = whipplescript_parser::code_scan_text(line);
+    let mut tokens = code.split_whitespace();
     while let Some(token) = tokens.next() {
         if token == "using" {
             return tokens
@@ -8174,6 +8211,203 @@ release slot
                 .iter()
                 .any(|effect| effect.kind == "tracker.release"),
             "{effects:?}"
+        );
+    }
+
+    /// Nor does prose add a required capability.
+    ///
+    /// The scanned names are UNIONED with the ones the AST declared, so this
+    /// one could only ever add: the effect came out requiring a capability no
+    /// author wrote, and nothing in the source explained it.
+    #[test]
+    fn prompt_prose_never_requires_a_capability() {
+        let body = r#"
+prompt "Note that escalation requires [admin.root] sign-off." as summary
+"#;
+        let effects =
+            parse_effect_statements(body, &RuleContext::default(), &[], &[], &empty_ir_program());
+        let effect = effects
+            .iter()
+            .find(|effect| effect.binding.as_deref() == Some("summary"))
+            .expect("the prompt lowers to an effect");
+        assert!(
+            effect.required_capabilities.is_empty(),
+            "prompt text must not require a capability: {effect:?}"
+        );
+
+        let written = r#"
+prompt "Note that escalation requires [admin.root] sign-off." requires ["model.invoke"] as summary
+"#;
+        let effects = parse_effect_statements(
+            written,
+            &RuleContext::default(),
+            &[],
+            &[],
+            &empty_ir_program(),
+        );
+        let effect = effects
+            .iter()
+            .find(|effect| effect.binding.as_deref() == Some("summary"))
+            .expect("the prompt lowers to an effect");
+        assert_eq!(
+            effect.required_capabilities,
+            vec!["model.invoke".to_owned()],
+            "the written clause is the one that counts, quoted names and all: {effect:?}"
+        );
+    }
+
+    /// Nor does prose supply the binding.
+    ///
+    /// Survivable rather than harmless — the lowering prefers the AST effect
+    /// node's binding — but `evidence` is still not what the author named.
+    #[test]
+    fn prompt_prose_never_supplies_a_binding() {
+        let body = r#"
+prompt "Treat the figure as evidence." as summary
+"#;
+        let effects =
+            parse_effect_statements(body, &RuleContext::default(), &[], &[], &empty_ir_program());
+        assert_eq!(
+            effects
+                .iter()
+                .filter_map(|effect| effect.binding.as_deref())
+                .collect::<Vec<_>>(),
+            vec!["summary"],
+            "the binding is the one after the prompt text: {effects:?}"
+        );
+    }
+
+    /// Nor is a duration in a prompt's TEXT a `timeout` clause.
+    ///
+    /// The same statement, the same raw scan, and a worse outcome: the IR
+    /// node's timeout is preferred over the scanned one, so prose only won on
+    /// effects that carried no `timeout` clause at all — the effect got a
+    /// deadline, and nothing in the source said so.
+    #[test]
+    fn prompt_prose_never_supplies_a_timeout() {
+        let body = r#"
+prompt "Explain what to do when a timeout 30s window expires." as summary
+"#;
+        let effects =
+            parse_effect_statements(body, &RuleContext::default(), &[], &[], &empty_ir_program());
+        let effect = effects
+            .iter()
+            .find(|effect| effect.binding.as_deref() == Some("summary"))
+            .expect("the prompt lowers to an effect");
+        assert_eq!(
+            effect.timeout_seconds, None,
+            "prompt text must not set a deadline: {effect:?}"
+        );
+
+        let written = r#"
+prompt "Explain what to do when a timeout 30s window expires." timeout 5m as summary
+"#;
+        let effects = parse_effect_statements(
+            written,
+            &RuleContext::default(),
+            &[],
+            &[],
+            &empty_ir_program(),
+        );
+        let effect = effects
+            .iter()
+            .find(|effect| effect.binding.as_deref() == Some("summary"))
+            .expect("the prompt lowers to an effect");
+        assert_eq!(
+            effect.timeout_seconds,
+            Some(300),
+            "the written clause still sets the deadline: {effect:?}"
+        );
+    }
+
+    /// A word in a prompt's TEXT is not a `using` clause.
+    ///
+    /// The statement a clause is read from carries the prompt body, so a raw
+    /// token scan answered out of the author's prose. What it answered with
+    /// becomes rung 1 of the coerce selection ladder, which outranks the
+    /// operator override and the registry binding both: `using anthropic` in
+    /// a sentence pinned the effect to a real backend, and `using fixture` in
+    /// a sentence degraded a native binding to a canned answer. Neither says
+    /// anything about where the author asked the prompt to go.
+    #[test]
+    fn prompt_prose_never_supplies_a_provider() {
+        for text in [
+            "Summarize the report using the attached figures.",
+            "Rewrite this note using anthropic tone guidelines.",
+            "Draft it using fixture data from last quarter.",
+        ] {
+            let line = format!("prompt \"{text}\" as summary");
+            assert_eq!(
+                prompt_provider_after_using(&line),
+                None,
+                "prompt text must not name a provider: {line}"
+            );
+        }
+    }
+
+    /// The clause itself still parses — in both places an author may write it.
+    /// A one-line prompt carries it after the closing quote; a `"""` prompt
+    /// carries it after the closing delimiter, which the caller has joined
+    /// onto the same statement with the whole body between.
+    #[test]
+    fn a_real_using_clause_still_names_its_provider() {
+        assert_eq!(
+            prompt_provider_after_using(
+                "prompt \"Summarize the report using the attached figures.\" \
+                 using fixture as summary"
+            )
+            .as_deref(),
+            Some("fixture"),
+            "a clause after the prompt text is the one that counts"
+        );
+        assert_eq!(
+            prompt_provider_after_using(
+                "prompt \"\"\"markdown Summarize it using the figures. \"\"\" \
+                 using openai-generic requires [\"model.invoke\"] as summary"
+            )
+            .as_deref(),
+            Some("openai-generic"),
+            "a `\"\"\"` prompt carries its clause after the closing delimiter"
+        );
+    }
+
+    /// The whole path, not just the scanner: prose in a prompt must leave the
+    /// lowered effect with NO provider, so selection falls to the operator
+    /// override and the registry binding as an unqualified prompt does.
+    #[test]
+    fn prose_in_a_prompt_leaves_the_lowered_effect_unrouted() {
+        let body = r#"
+prompt "Summarize the report using the attached figures." as summary
+"#;
+        let effects =
+            parse_effect_statements(body, &RuleContext::default(), &[], &[], &empty_ir_program());
+        let effect = effects
+            .iter()
+            .find(|effect| effect.binding.as_deref() == Some("summary"))
+            .expect("the prompt lowers to an effect");
+        assert_eq!(
+            effect.target, None,
+            "an unqualified prompt routes nowhere from its own prose: {effect:?}"
+        );
+
+        let routed = r#"
+prompt "Summarize the report using the attached figures." using fixture as summary
+"#;
+        let effects = parse_effect_statements(
+            routed,
+            &RuleContext::default(),
+            &[],
+            &[],
+            &empty_ir_program(),
+        );
+        let effect = effects
+            .iter()
+            .find(|effect| effect.binding.as_deref() == Some("summary"))
+            .expect("the prompt lowers to an effect");
+        assert_eq!(
+            effect.target.as_deref(),
+            Some("fixture"),
+            "the written clause still routes the effect: {effect:?}"
         );
     }
 
