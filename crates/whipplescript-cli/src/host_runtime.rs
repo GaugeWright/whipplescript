@@ -1400,19 +1400,40 @@ impl GovernedHostRuntime {
         &self.policy
     }
 
-    /// The newest chat instance this store records, with its recorded package
-    /// reference — the adoption seam's source lookup for an embedding host
-    /// whose authored package identity has drifted past what a replayed open
-    /// can reproduce (see [`Self::adopt_instance_from`]). `None` for a store
-    /// that has never opened a chat. Ordinary host actions have their own
-    /// admitted command and are not candidates for chat adoption.
+    /// The chat instance this store records that the host means to keep, with
+    /// its recorded package reference — the adoption seam's source lookup for an
+    /// embedding host whose authored package identity has drifted past what a
+    /// replayed open can reproduce (see [`Self::adopt_instance_from`]). `None`
+    /// for a store that has never opened a chat. Ordinary host actions have
+    /// their own admitted command and are not candidates for chat adoption
+    /// (DR-0099).
+    ///
+    /// The pick is the most recently ACTIVE instance, not the most recently
+    /// created. `list_instances` orders by `(created_at, instance_id)`, so
+    /// taking the last element picked the newest-created and, on a `created_at`
+    /// tie, whichever id happened to sort highest — a migration shim opened in
+    /// the same second as the real thread's instance could win, and an adoption
+    /// seeded from it carries nothing. Ranking on `updated_at` first asks which
+    /// instance was last touched, which is the question; creation order and then
+    /// the id remain as tiebreaks so the pick stays deterministic.
+    ///
+    /// `updated_at` alone is not enough, and the hosted gate proved it: the
+    /// store stamps it with `CURRENT_TIMESTAMP`, which has one-second
+    /// resolution, so a shim opened in the same second as the carrier's turn
+    /// ties and the creation-order tiebreak hands it the shim — exactly the
+    /// case this exists for. Within a tie, the instance whose log has got
+    /// further is the one being worked in: a just-opened shim carries almost
+    /// nothing, and a chat that has run a turn carries the turn. That reach is
+    /// read off the chain head rather than by listing events, the way
+    /// [`Self::current_position`] already does.
     pub fn newest_recorded_instance(&self) -> Result<Option<RecordedInstance>, HostRuntimeError> {
-        let mut instances = self
+        let instances = self
             .kernel
             .store()
             .list_instances()
             .map_err(HostRuntimeError::Store)?;
-        while let Some(instance) = instances.pop() {
+        let mut newest: Option<(whipplescript_store::InstanceView, i64)> = None;
+        for instance in instances {
             if self
                 .kernel
                 .store()
@@ -1422,16 +1443,43 @@ impl GovernedHostRuntime {
             {
                 continue;
             }
-            // Preserve the refusal for malformed legacy chat metadata. Only a
-            // durably identified action is excluded from the chat lookup.
-            let metadata: InstanceMetadata =
-                serde_json::from_str(&instance.input_json).map_err(HostRuntimeError::Json)?;
-            return Ok(Some(RecordedInstance {
-                instance_ref: instance.instance_id,
-                package_version_ref: metadata.package_version_ref,
-            }));
+            // How far this instance's log has got. Read off the chain head
+            // rather than by listing, the way `current_position` already does.
+            let reach = self
+                .kernel
+                .store()
+                .chain_head(&instance.instance_id)
+                .map_err(HostRuntimeError::Store)?
+                .sequence
+                .unwrap_or(0);
+            let better = newest.as_ref().is_none_or(|(current, current_reach)| {
+                (
+                    &instance.updated_at,
+                    reach,
+                    &instance.created_at,
+                    &instance.instance_id,
+                ) > (
+                    &current.updated_at,
+                    *current_reach,
+                    &current.created_at,
+                    &current.instance_id,
+                )
+            });
+            if better {
+                newest = Some((instance, reach));
+            }
         }
-        Ok(None)
+        let Some((instance, _)) = newest else {
+            return Ok(None);
+        };
+        // Preserve the refusal for malformed legacy chat metadata. Only a
+        // durably identified action is excluded from the chat lookup.
+        let metadata: InstanceMetadata =
+            serde_json::from_str(&instance.input_json).map_err(HostRuntimeError::Json)?;
+        Ok(Some(RecordedInstance {
+            instance_ref: instance.instance_id,
+            package_version_ref: metadata.package_version_ref,
+        }))
     }
 
     /// Where this instance's log currently is.
@@ -4216,6 +4264,72 @@ workflow UnsafeHostChat {
         );
         drop(reopened);
         fs::remove_file(path).unwrap();
+    }
+
+    /// The adoption source is the instance whose thread the host means to keep —
+    /// the most recently ACTIVE one, not the most recently created.
+    ///
+    /// A migration shim opened after the real thread's instance must not win the
+    /// pick: an adoption seeded from it carries nothing. The shim is opened
+    /// second here, so under the old `(created_at, instance_id)` order it was
+    /// exactly what got picked.
+    #[test]
+    fn newest_recorded_instance_prefers_activity_over_creation() {
+        let path = temp_store();
+        let policy_text = signed_policy();
+        let mut runtime = GovernedHostRuntime::open(&path, 9, &policy_text).expect("runtime");
+        let carrier = runtime
+            .open_instance(
+                &OpenInstanceCommand {
+                    protocol: HOST_PROTOCOL.to_owned(),
+                    request_id: "open-thread-carrier".to_owned(),
+                    package_version_ref: "package:v1".to_owned(),
+                    policy: runtime.policy_ref().clone(),
+                },
+                &Packages,
+            )
+            .expect("thread carrier");
+        let shim = runtime
+            .open_instance(
+                &OpenInstanceCommand {
+                    protocol: HOST_PROTOCOL.to_owned(),
+                    request_id: "open-migration-shim".to_owned(),
+                    package_version_ref: "package:v1".to_owned(),
+                    policy: runtime.policy_ref().clone(),
+                },
+                &Packages,
+            )
+            .expect("migration shim opened after the carrier");
+
+        // The carrier is where activity happens.
+        runtime
+            .run_turn(
+                &turn(&carrier.instance_ref, &runtime.policy_ref().clone(), 1),
+                &Packages,
+                &Secrets {
+                    calls: Cell::new(0),
+                },
+                &Resources {
+                    calls: Cell::new(0),
+                },
+            )
+            .expect("carrier turn");
+
+        let picked = runtime
+            .newest_recorded_instance()
+            .expect("pick succeeds")
+            .expect("store has instances")
+            .instance_ref;
+        assert_ne!(
+            picked, shim.instance_ref,
+            "the shim was created last, and creation order is what used to decide"
+        );
+        assert_eq!(
+            picked, carrier.instance_ref,
+            "activity outranks creation order"
+        );
+        drop(runtime);
+        let _ = fs::remove_file(&path);
     }
 
     #[test]
