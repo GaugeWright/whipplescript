@@ -857,13 +857,27 @@ declaration's is. It is also rung 1 of the selection ladder, so it is the
 endpoint that actually runs — ahead of the operator override and the registry
 binding both.
 
+The endpoint is the principal in **both** directions of the grant. `readable by`
+says what that backend may be sent; `from` says whether what it sends back may
+shape vouched state:
+
+```text
+grant provider onprem-llm -> selfhost:llama readable by Operator from Operator
+```
+
+So one endpoint can be cleared to read Operator data without being a vouched
+writer, and clearing a second endpoint vouches for neither the first nor the
+un-named backend. An endpoint named but never given a `from` clause provides the
+untrusted bottom, like any other principal — fail-closed.
+
 A declaration with no `provider` clause, a `prompt` written without `using`, and
 an inline `decide` — which has no such clause at all — have no static endpoint
 identity, because the selection ladder picks the backend at runtime. Those keep
-the abstract `model` principal that governance already labels, and no custody
-class can be demanded of them. Clearing `model` says "whatever the ladder
-resolves is cleared"; it says nothing about an endpoint pinned past it. If you
-want per-endpoint governance over a coerce or a prompt, name its provider.
+the abstract `model` principal that governance already labels, in both
+directions, and no custody class can be demanded of them. Clearing `model` says
+"whatever the ladder resolves is cleared"; it says nothing about an endpoint
+pinned past it. If you want per-endpoint governance over a coerce or a prompt,
+name its provider.
 
 ### Demanding a class
 

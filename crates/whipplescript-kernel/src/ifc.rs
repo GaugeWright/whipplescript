@@ -3487,6 +3487,38 @@ pub struct CompositionProjection {
 /// provider on the declaration is what buys per-endpoint governance.
 pub const UNNAMED_COERCE_BACKEND: &str = "model";
 
+/// The endpoint a `schema.coerce` effect reaches, as a principal handle.
+///
+/// Both IFC doors name the endpoint by this, and they must not drift: the
+/// CONFIDENTIALITY door asks who may read what the prompt ships, the INTEGRITY
+/// door (DR-0046) asks which executor vouches for what comes back, and an
+/// endpoint that is one principal for reading and a different one for vouching
+/// is not an endpoint governance can describe. They did drift — the
+/// confidentiality door was moved to the endpoint by DR-0062 and the integrity
+/// door kept a literal `model` for every coercion — so this is the one place
+/// the answer is computed.
+///
+/// The two sources are disjoint: an effect is a declaration call, whose
+/// `provider` clause names the endpoint, or an inline `prompt` whose `using`
+/// clause does. Anything naming neither — a declaration without the clause, a
+/// `prompt` without `using`, an inline `decide` — is resolved by the selection
+/// ladder at runtime and has no static identity, so it keeps
+/// [`UNNAMED_COERCE_BACKEND`].
+fn coerce_egress_principal<'a>(ir: &'a IrProgram, effect: &'a IrEffectNode) -> &'a str {
+    effect
+        .prompt_provider
+        .as_deref()
+        .or_else(|| {
+            effect.coerce_target.as_deref().and_then(|name| {
+                ir.coerces
+                    .iter()
+                    .find(|decl| decl.name == name)
+                    .and_then(|decl| decl.provider.as_deref())
+            })
+        })
+        .unwrap_or(UNNAMED_COERCE_BACKEND)
+}
+
 /// The model endpoint an agent's turn ships its context to: a direct
 /// `provider <kind>` / `delegated to` binding (lowering also defaults a bare
 /// managed agent to `owned`), else the kind of the harness it is bound to
@@ -4327,10 +4359,13 @@ fn fact_reach_map(
                                     // token.
                                     let mut outputs = Vec::new();
                                     output_tokens_for_root(
+                                        &ExecutorLookup {
+                                            ir,
+                                            metadata: &rule.metadata,
+                                            effect_by_binding: &effect_by_binding,
+                                            agent_provider: &agent_provider,
+                                        },
                                         root,
-                                        &rule.metadata,
-                                        &effect_by_binding,
-                                        &agent_provider,
                                         false,
                                         &mut BTreeSet::new(),
                                         &mut outputs,
@@ -4480,22 +4515,46 @@ fn resolve_root_sources(
 /// output it carries, with the `endorsed` crossing applied structurally. A
 /// token is `output:<handle>` — the handle is the executing principal whose
 /// `from` clearance is the output's provided integrity (agent turn → its
-/// provider; coerce/decide/prompt → `model`; hosted exec → `script:<name>`;
-/// raw dev exec → `exec:raw`, vouched by nobody). An UNMARKED coercion is its
-/// model's level (the executor that produced the final bytes); an ENDORSED
-/// coercion is the declared judgment — it contributes its INPUTS' tokens
-/// tagged `crossed`, so the grant is checked against the executor being
-/// endorsed (decision 4). Aliases and redactions resolve through; anything
-/// else contributes nothing (it is not an effect output).
+/// provider; coerce/decide/prompt → the endpoint it reaches, via
+/// [`coerce_egress_principal`]; hosted exec → `script:<name>`; raw dev exec →
+/// `exec:raw`, vouched by nobody). An UNMARKED coercion is its model's level
+/// (the executor that produced the final bytes); an ENDORSED coercion is the
+/// declared judgment — it contributes its INPUTS' tokens tagged `crossed`, so
+/// the grant is checked against the executor being endorsed (decision 4).
+/// Aliases and redactions resolve through; anything else contributes nothing
+/// (it is not an effect output).
+///
+/// The coercion handle was a literal `model` until 2026-09-14 — every coercion
+/// in every program, whatever endpoint it named. DR-0062 had already moved the
+/// confidentiality door to the endpoint, so a policy could say who may READ
+/// what a named endpoint is sent and could not say who VOUCHES for what it
+/// sends back; `grant … from <role>` on that endpoint governed nothing, and one
+/// broadly-vouched `model` line silently vouched for every backend a program
+/// reached. Both doors now ask [`coerce_egress_principal`].
+/// What an executor token is resolved AGAINST: the program (for a coercion's
+/// endpoint), the rule being walked (for its aliases, redactions and carried
+/// inputs), and the two by-name maps. One value rather than four parameters,
+/// because the walk is recursive and every frame needs all of them.
+struct ExecutorLookup<'a> {
+    ir: &'a IrProgram,
+    metadata: &'a whipplescript_parser::IrRuleMetadata,
+    effect_by_binding: &'a BTreeMap<&'a str, &'a IrEffectNode>,
+    agent_provider: &'a BTreeMap<&'a str, &'a str>,
+}
+
 fn output_tokens_for_root(
+    lookup: &ExecutorLookup<'_>,
     root: &str,
-    metadata: &whipplescript_parser::IrRuleMetadata,
-    effect_by_binding: &BTreeMap<&str, &IrEffectNode>,
-    agent_provider: &BTreeMap<&str, &str>,
     crossed: bool,
     visited: &mut BTreeSet<String>,
     out: &mut Vec<(String, bool)>,
 ) {
+    let ExecutorLookup {
+        ir,
+        metadata,
+        effect_by_binding,
+        agent_provider,
+    } = lookup;
     let base = metadata
         .after_aliases
         .get(root)
@@ -4509,15 +4568,7 @@ fn output_tokens_for_root(
         .iter()
         .find(|redaction| redaction.binding == base)
     {
-        output_tokens_for_root(
-            &redaction.source,
-            metadata,
-            effect_by_binding,
-            agent_provider,
-            crossed,
-            visited,
-            out,
-        );
+        output_tokens_for_root(lookup, &redaction.source, crossed, visited, out);
         return;
     }
     let Some(effect) = effect_by_binding.get(base) else {
@@ -4538,19 +4589,11 @@ fn output_tokens_for_root(
                 // armed — the grant targets the executor being endorsed.
                 if let Some(arg_roots) = metadata.carried_input_roots.get(base) {
                     for arg_root in arg_roots {
-                        output_tokens_for_root(
-                            arg_root,
-                            metadata,
-                            effect_by_binding,
-                            agent_provider,
-                            true,
-                            visited,
-                            out,
-                        );
+                        output_tokens_for_root(lookup, arg_root, true, visited, out);
                     }
                 }
             } else {
-                out.push(("model".to_owned(), crossed));
+                out.push((coerce_egress_principal(ir, effect).to_owned(), crossed));
             }
         }
         IrEffectKind::ExecCommand => {
@@ -5119,15 +5162,7 @@ pub fn check_with_envelope_imports(
                 .coerce_target
                 .as_deref()
                 .and_then(|name| ir.coerces.iter().find(|decl| decl.name == name));
-            // An inline `prompt` names no declaration, so its endpoint is
-            // written at the effect: `prompt "…" using <provider> as x`. The
-            // two sources are disjoint — an effect is a declaration call or an
-            // inline prompt, never both — so this is a union, not a precedence.
-            let principal = effect
-                .prompt_provider
-                .as_deref()
-                .or_else(|| declaration.and_then(|decl| decl.provider.as_deref()))
-                .unwrap_or(UNNAMED_COERCE_BACKEND);
+            let principal = coerce_egress_principal(ir, effect);
             for resource in reads
                 .iter()
                 .copied()
@@ -5565,10 +5600,13 @@ pub fn check_with_envelope_imports(
             for root in roots {
                 let mut tokens = Vec::new();
                 output_tokens_for_root(
+                    &ExecutorLookup {
+                        ir,
+                        metadata: &rule.metadata,
+                        effect_by_binding: &effect_by_binding,
+                        agent_provider: &agent_provider,
+                    },
                     root,
-                    &rule.metadata,
-                    &effect_by_binding,
-                    &agent_provider,
                     false,
                     &mut BTreeSet::new(),
                     &mut tokens,
@@ -9101,6 +9139,164 @@ grant provider model -> model:inhouse readable by Operator from Operator\n";
                 .iter()
                 .any(|d| d.message.contains("denied influence")),
             "a vouched provider writes freely, got: {:?}",
+            diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    /// A program whose coercion and prompt each NAME the endpoint they reach,
+    /// writing that endpoint's output into a sink that demands a voucher.
+    fn named_endpoint_integrity_ir(body: &str) -> IrProgram {
+        let program = format!(
+            r#"use std.files
+
+@service
+workflow NamedEndpointIntegrity
+
+class Tick {{ id string }}
+class Verdict {{ choice "yes" | "no" }}
+
+file store vault {{ root "./vault"  allow write ["**"] }}
+
+table seed as Tick [ {{ id "T1" }} ]
+
+coerce judge(text string) -> Verdict {{
+  prompt """markdown
+  Judge: {{{{ text }}}}
+  """
+  provider onprem-llm
+}}
+
+coerce unpinned(text string) -> Verdict {{
+  prompt """markdown
+  Judge: {{{{ text }}}}
+  """
+}}
+
+rule work
+  when Tick as tick
+=> {{
+  {body}
+}}
+"#
+        );
+        let compiled = compile_program(&program);
+        compiled
+            .ir
+            .unwrap_or_else(|| panic!("compiles: {:?}", compiled.diagnostics))
+    }
+
+    /// The sink's demand, and a vault that only Operator-vouched data may
+    /// shape. Neither endpoint is vouched here; each test adds what it means.
+    const ENDPOINT_BASE_POLICY: &str =
+        "grant file_store vault -> file:/srv/vault readable by Operator from Operator\n";
+
+    #[test]
+    fn a_coerce_output_is_vouched_by_the_endpoint_the_declaration_named() {
+        // DR-0046 attributed EVERY coercion output to a literal `model`, so a
+        // policy could vouch one broad `model` line and silently vouch for
+        // every backend the program reached. `judge` names `onprem-llm`; a
+        // voucher for `model` says nothing about it.
+        let body = "coerce judge(tick.id) as verdict\n  after verdict succeeds as got {\n    write text to vault at \"n.txt\" {\n      body got.choice\n      mode append\n    } as w\n  }";
+        let elsewhere = Envelope::from_dsl(&format!(
+            "{ENDPOINT_BASE_POLICY}grant provider model -> model:inhouse readable by Operator from \
+             Operator\n\
+             grant provider onprem-llm -> selfhost:llama readable by Operator\n"
+        ))
+        .expect("valid");
+        let diagnostics = check_with_envelope(
+            &named_endpoint_integrity_ir(body),
+            &VerifiedEnvelope::for_test(elsewhere),
+        );
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("output of executor `onprem-llm`")
+                    && d.message.contains("vault")),
+            "a voucher for `model` must not vouch for the endpoint named, got: {:?}",
+            diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+
+        // And the voucher written ON that endpoint is the one that clears it —
+        // which is what `grant … from <role>` per endpoint could not do before.
+        let vouched = Envelope::from_dsl(&format!(
+            "{ENDPOINT_BASE_POLICY}grant provider onprem-llm -> selfhost:llama readable by \
+             Operator from Operator\n"
+        ))
+        .expect("valid");
+        let diagnostics = check_with_envelope(
+            &named_endpoint_integrity_ir(body),
+            &VerifiedEnvelope::for_test(vouched),
+        );
+        assert!(
+            !diagnostics
+                .iter()
+                .any(|d| d.message.contains("denied influence")),
+            "the endpoint's own voucher clears its output, got: {:?}",
+            diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn an_inline_prompt_output_is_vouched_by_its_using_clause_endpoint() {
+        // The same rule through the other source form, so the two doors agree
+        // about an inline prompt as well: its `using` clause is the endpoint
+        // for reading (DR-0062) and now for vouching too.
+        let body = "prompt \"Judge {{ tick.id }}.\" using onprem-llm as verdict\n  after verdict succeeds as got {\n    write text to vault at \"n.txt\" {\n      body got\n      mode append\n    } as w\n  }";
+        let elsewhere = Envelope::from_dsl(&format!(
+            "{ENDPOINT_BASE_POLICY}grant provider model -> model:inhouse readable by Operator from \
+             Operator\n\
+             grant provider onprem-llm -> selfhost:llama readable by Operator\n"
+        ))
+        .expect("valid");
+        let diagnostics = check_with_envelope(
+            &named_endpoint_integrity_ir(body),
+            &VerifiedEnvelope::for_test(elsewhere),
+        );
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("output of executor `onprem-llm`")),
+            "the prompt's endpoint is its voucher, got: {:?}",
+            diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn an_unpinned_coerce_output_still_answers_to_the_un_named_backend() {
+        // The other half of DR-0062's rule, at the integrity door: a coercion
+        // naming no endpoint has no static identity, so it keeps `model` and
+        // the policies that vouch `model` keep working.
+        let body = "coerce unpinned(tick.id) as verdict\n  after verdict succeeds as got {\n    write text to vault at \"n.txt\" {\n      body got.choice\n      mode append\n    } as w\n  }";
+        let vouched = Envelope::from_dsl(&format!(
+            "{ENDPOINT_BASE_POLICY}grant provider model -> model:inhouse readable by Operator from \
+             Operator\n"
+        ))
+        .expect("valid");
+        let diagnostics = check_with_envelope(
+            &named_endpoint_integrity_ir(body),
+            &VerifiedEnvelope::for_test(vouched),
+        );
+        assert!(
+            !diagnostics
+                .iter()
+                .any(|d| d.message.contains("denied influence")),
+            "a vouched `model` still vouches for an unpinned coercion, got: {:?}",
+            diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+
+        let unvouched = Envelope::from_dsl(&format!(
+            "{ENDPOINT_BASE_POLICY}grant provider model -> model:inhouse readable by Operator\n"
+        ))
+        .expect("valid");
+        let diagnostics = check_with_envelope(
+            &named_endpoint_integrity_ir(body),
+            &VerifiedEnvelope::for_test(unvouched),
+        );
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("output of executor `model`")),
+            "an unvouched `model` still denies one, got: {:?}",
             diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
         );
     }
