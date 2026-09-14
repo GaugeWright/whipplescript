@@ -844,11 +844,26 @@ coerce classify(text string) -> Verdict {
 Two coerces in one rule reaching different backends are judged separately, so
 clearing one endpoint never covers the other.
 
-A declaration with no `provider` clause — and an inline `decide`, which names no
-declaration — has no static endpoint identity, because the selection ladder
-picks the backend at runtime. Those keep the abstract `model` principal that
-governance already labels, and no custody class can be demanded of them. If you
-want per-endpoint governance over a coerce, name its provider.
+An inline `prompt` names its endpoint the same way. It has no declaration to
+hold the clause, so the clause is written at the effect:
+
+<!-- check: skip — excerpt; the surrounding program's declarations are not shown -->
+```whip
+prompt "Summarize {{ ticket.title }}." using onprem-llm as summary
+```
+
+That name is the principal the egress is judged against, exactly as the
+declaration's is. It is also rung 1 of the selection ladder, so it is the
+endpoint that actually runs — ahead of the operator override and the registry
+binding both.
+
+A declaration with no `provider` clause, a `prompt` written without `using`, and
+an inline `decide` — which has no such clause at all — have no static endpoint
+identity, because the selection ladder picks the backend at runtime. Those keep
+the abstract `model` principal that governance already labels, and no custody
+class can be demanded of them. Clearing `model` says "whatever the ladder
+resolves is cleared"; it says nothing about an endpoint pinned past it. If you
+want per-endpoint governance over a coerce or a prompt, name its provider.
 
 ### Demanding a class
 

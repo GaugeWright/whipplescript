@@ -5095,11 +5095,16 @@ pub fn check_with_envelope_imports(
         // DR-0062: the principal is THE ENDPOINT, not a single abstract `model`.
         // A declaration's `provider <name>` clause names it, exactly as an
         // agent's does, so the two doors are governed by the same vocabulary and
-        // a custody demand can attach to a coerce backend at all. A declaration
-        // naming no provider — and an inline `decide`, which names no
-        // declaration — has no static endpoint identity, because the selection
-        // ladder resolves the backend at runtime; those keep the abstract
-        // `model` principal, which is what governance already labels.
+        // a custody demand can attach to a coerce backend at all. An inline
+        // `prompt "…" using <provider>` names its endpoint the same way; it has
+        // no declaration to carry the clause, so the clause is written at the
+        // effect and read off the node (DR-0062 amendment 2026-09-14).
+        //
+        // What has no static endpoint identity is a declaration naming no
+        // provider, a `prompt` written without `using`, and an inline `decide`,
+        // which has no such clause at all. The selection ladder resolves those
+        // at runtime, so they keep the abstract `model` principal, which is what
+        // governance already labels.
         //
         // Checked PER EFFECT, not once per rule: two coerces in one rule may
         // reach different endpoints, and collapsing them would judge one by the
@@ -5114,8 +5119,14 @@ pub fn check_with_envelope_imports(
                 .coerce_target
                 .as_deref()
                 .and_then(|name| ir.coerces.iter().find(|decl| decl.name == name));
-            let principal = declaration
-                .and_then(|decl| decl.provider.as_deref())
+            // An inline `prompt` names no declaration, so its endpoint is
+            // written at the effect: `prompt "…" using <provider> as x`. The
+            // two sources are disjoint — an effect is a declaration call or an
+            // inline prompt, never both — so this is a union, not a precedence.
+            let principal = effect
+                .prompt_provider
+                .as_deref()
+                .or_else(|| declaration.and_then(|decl| decl.provider.as_deref()))
                 .unwrap_or(UNNAMED_COERCE_BACKEND);
             for resource in reads
                 .iter()
@@ -7258,6 +7269,164 @@ rule work
         assert!(
             !egress.iter().any(|m| m.contains("`onprem-llm`")),
             "the cleared endpoint must not be denied, got: {egress:?}"
+        );
+    }
+
+    #[test]
+    fn an_inline_prompt_is_judged_by_the_endpoint_its_using_clause_names() {
+        // DR-0062 amendment: `prompt "…" using <provider>` names its endpoint
+        // in source exactly as a declaration's `provider` clause does — it just
+        // has no declaration to hang the clause on. Two prompts in one rule
+        // reach different backends; the cleared one must pass and the uncleared
+        // one must be denied, in the SAME rule, as two coerces already are.
+        let program = r#"@service
+workflow PromptPerEndpoint
+
+output result R
+class R { ok bool }
+class Ticket { id string  status "open" }
+
+file store ledger { root "./ledger"  allow read ["**"] }
+
+table seed as Ticket [ { id "T1"  status "open" } ]
+
+rule work
+  when Ticket as ticket where ticket.status == "open"
+=> {
+  read text from ledger at "data.txt" as loaded
+  prompt "Summarize {{ ticket.id }}." using onprem-llm as cleared
+  prompt "Summarize {{ ticket.id }}." using acme-cloud as uncleared
+  after cleared succeeds as v {
+    complete result { ok true }
+  }
+}
+"#;
+        let ir = compile_program(program).ir.expect("compiles");
+        let envelope = Envelope::from_dsl(
+            "grant file_store ledger -> file:/srv/ledger readable by Operator\n\
+             grant provider onprem-llm -> selfhost:llama readable by Operator\n\
+             grant provider acme-cloud -> https:acme readable by public\n",
+        )
+        .expect("valid");
+        let diagnostics = check_with_envelope(&ir, &VerifiedEnvelope::for_test(envelope));
+        let egress: Vec<&String> = diagnostics
+            .iter()
+            .map(|d| &d.message)
+            .filter(|m| m.contains("denied egress") && m.contains("prompt"))
+            .collect();
+        assert!(
+            egress.iter().any(|m| m.contains("acme-cloud")),
+            "the uncleared endpoint must be denied by name, got: {egress:?}"
+        );
+        assert!(
+            !egress.iter().any(|m| m.contains("`onprem-llm`")),
+            "the cleared endpoint must not be denied, got: {egress:?}"
+        );
+    }
+
+    #[test]
+    fn a_cleared_abstract_backend_does_not_clear_a_prompt_that_named_another() {
+        // The hole, stated as its own case. Governance that clears the un-named
+        // backend `model` is saying "whatever the ladder resolves is cleared";
+        // it says nothing about an endpoint the author PINNED past the ladder.
+        // Judging the pinned prompt by `model`'s clearance admitted an egress
+        // to a backend governance never cleared — and a `using` clause outranks
+        // every other rung of the selection ladder, so the pin is what actually
+        // runs.
+        let program = r#"@service
+workflow PinnedPastTheLadder
+
+output result R
+class R { ok bool }
+class Ticket { id string  status "open" }
+
+file store ledger { root "./ledger"  allow read ["**"] }
+
+table seed as Ticket [ { id "T1"  status "open" } ]
+
+rule work
+  when Ticket as ticket where ticket.status == "open"
+=> {
+  read text from ledger at "data.txt" as loaded
+  prompt "Summarize {{ ticket.id }}." using acme-cloud as pinned
+  after pinned succeeds as v {
+    complete result { ok true }
+  }
+}
+"#;
+        let ir = compile_program(program).ir.expect("compiles");
+        let envelope = Envelope::from_dsl(
+            "grant file_store ledger -> file:/srv/ledger readable by Operator\n\
+             grant provider model -> selfhost:llama readable by Operator\n\
+             grant provider acme-cloud -> https:acme readable by public\n",
+        )
+        .expect("valid");
+        let diagnostics = check_with_envelope(&ir, &VerifiedEnvelope::for_test(envelope));
+        let egress: Vec<&String> = diagnostics
+            .iter()
+            .map(|d| &d.message)
+            .filter(|m| m.contains("denied egress"))
+            .collect();
+        assert!(
+            egress.iter().any(|m| m.contains("acme-cloud")),
+            "the pinned endpoint is the principal, not the cleared `model`: {egress:?}"
+        );
+    }
+
+    #[test]
+    fn a_prompt_without_a_using_clause_keeps_the_un_named_backend() {
+        // The other half of DR-0062's rule, which this must not disturb: a
+        // `prompt` naming no provider has no static endpoint identity — the
+        // ladder picks the backend at runtime — so it stays judged as `model`,
+        // which is what existing governance labels.
+        let program = r#"@service
+workflow UnpinnedPrompt
+
+output result R
+class R { ok bool }
+class Ticket { id string  status "open" }
+
+file store ledger { root "./ledger"  allow read ["**"] }
+
+table seed as Ticket [ { id "T1"  status "open" } ]
+
+rule work
+  when Ticket as ticket where ticket.status == "open"
+=> {
+  read text from ledger at "data.txt" as loaded
+  prompt "Summarize {{ ticket.id }}." as unpinned
+  after unpinned succeeds as v {
+    complete result { ok true }
+  }
+}
+"#;
+        let ir = compile_program(program).ir.expect("compiles");
+        let cleared = Envelope::from_dsl(
+            "grant file_store ledger -> file:/srv/ledger readable by Operator\n\
+             grant provider model -> selfhost:llama readable by Operator\n",
+        )
+        .expect("valid");
+        let diagnostics = check_with_envelope(&ir, &VerifiedEnvelope::for_test(cleared));
+        assert!(
+            !diagnostics
+                .iter()
+                .any(|d| d.message.contains("denied egress")),
+            "a cleared `model` still clears an unpinned prompt: {:?}",
+            diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+
+        let uncleared = Envelope::from_dsl(
+            "grant file_store ledger -> file:/srv/ledger readable by Operator\n\
+             grant provider model -> https:acme readable by public\n",
+        )
+        .expect("valid");
+        let diagnostics = check_with_envelope(&ir, &VerifiedEnvelope::for_test(uncleared));
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("denied egress") && d.message.contains("`model`")),
+            "an uncleared `model` still denies an unpinned prompt: {:?}",
+            diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
         );
     }
 

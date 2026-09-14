@@ -1716,6 +1716,62 @@ impl<'a> BodyParser<'a> {
         }
     }
 
+    /// A provider name at a `using` clause: `fixture`, `openai-generic`,
+    /// `onprem-llm`.
+    ///
+    /// The rule-body lexer deliberately stops an identifier at `-`, because in
+    /// a body a dash is subtraction and `a - b` must stay three tokens. A
+    /// provider name is not an expression, so it is REASSEMBLED here rather
+    /// than by widening the lexer: segments join only while each token begins
+    /// exactly where the previous one ended, and a name must end on a segment
+    /// rather than a dash. Whitespace therefore closes the name, which is what
+    /// keeps the following `as` / `requires` / `timeout` out of it.
+    ///
+    /// Without this, half the provider vocabulary could not be written on a
+    /// prompt at all: `provider openai-generic` on a `coerce` declaration
+    /// compiled, `prompt "…" using openai-generic as x` did not, and the
+    /// diagnostic said `prompt` requires an `as` binding — naming neither the
+    /// clause nor the dash. `docs/language-reference.md` calls the two clauses
+    /// equivalent; this is part of what makes them so.
+    fn provider_name(&mut self, what: &str) -> Option<String> {
+        let mut name = self.ident_text(what)?;
+        // The lexer folds a dash into a NUMBER when a digit follows (`-3`), and
+        // leaves it a symbol otherwise (`-generic`), so both shapes appear in a
+        // hyphenated name and both are joined here.
+        while self.pos > 0 {
+            let previous_end = self.tokens[self.pos - 1].end;
+            let Some(next) = self.peek() else { break };
+            if next.start != previous_end {
+                break;
+            }
+            match &next.tok {
+                Tok::Number(value) if value.starts_with('-') && value.len() > 1 => {
+                    name.push_str(value);
+                    self.pos += 1;
+                }
+                Tok::Sym('-') => {
+                    // A dash only continues the name when a segment is welded
+                    // to it; a trailing `-` is not part of the name.
+                    let Some(segment) = self.peek_at(1) else {
+                        break;
+                    };
+                    if segment.start != next.end {
+                        break;
+                    }
+                    let text = match &segment.tok {
+                        Tok::Ident(value) | Tok::Number(value) => value.clone(),
+                        _ => break,
+                    };
+                    name.push('-');
+                    name.push_str(&text);
+                    self.pos += 2;
+                }
+                _ => break,
+            }
+        }
+        Some(name)
+    }
+
     /// A credential handle at a use site: `stripe_api`, or a vault member
     /// written `deploy_keys["ci-2026-08"]`.
     ///
@@ -2686,7 +2742,7 @@ impl<'a> BodyParser<'a> {
         self.pos += 1; // prompt
         let prompt = self.parse_prompt()?;
         let provider = if self.consume_ident("using") {
-            Some(self.ident_text("provider after `using`")?)
+            Some(self.provider_name("provider after `using`")?)
         } else {
             None
         };
@@ -5831,6 +5887,58 @@ mod tests {
         let prompt = effect.prompt.as_ref().expect("prompt");
         assert_eq!(prompt.content_type.as_deref(), Some("markdown"));
         assert_eq!(prompt.text, "Summarize this.");
+    }
+
+    /// A provider name may carry dashes, as `openai-generic` — one of the four
+    /// backends the runtime resolves — and every endpoint name governance
+    /// writes does. The body lexer stops an identifier at `-`, so the name is
+    /// reassembled at the clause; before that, this program did not parse and
+    /// the diagnostic blamed the missing `as` binding.
+    #[test]
+    fn a_using_clause_takes_a_dashed_provider_name() {
+        for (source, expected) in [
+            ("prompt \"Hi\" using fixture as answer", "fixture"),
+            (
+                "prompt \"Hi\" using openai-generic as answer",
+                "openai-generic",
+            ),
+            ("prompt \"Hi\" using onprem-llm as answer", "onprem-llm"),
+            (
+                "prompt \"Hi\" using claude-3-5-sonnet as answer",
+                "claude-3-5-sonnet",
+            ),
+        ] {
+            let ast = parse_ok(source);
+            let BodyStmt::Effect(effect) = &ast.statements[0] else {
+                panic!("expected effect from {source}");
+            };
+            let BodyEffectKind::Prompt { provider } = &effect.kind else {
+                panic!("expected prompt from {source}");
+            };
+            assert_eq!(provider.as_deref(), Some(expected), "{source}");
+            assert_eq!(
+                effect.binding.as_deref(),
+                Some("answer"),
+                "the modifiers after the name must stay outside it: {source}"
+            );
+        }
+    }
+
+    /// The name closes at whitespace, which is what keeps the clause from
+    /// swallowing what follows it — and what keeps a dash that is SUBTRACTION
+    /// out of a name. Only welded segments join.
+    #[test]
+    fn a_provider_name_closes_at_whitespace() {
+        let ast = parse_ok("prompt \"Hi\" using fixture requires [\"model.invoke\"] as answer");
+        let BodyStmt::Effect(effect) = &ast.statements[0] else {
+            panic!("expected effect");
+        };
+        let BodyEffectKind::Prompt { provider } = &effect.kind else {
+            panic!("expected prompt");
+        };
+        assert_eq!(provider.as_deref(), Some("fixture"));
+        assert_eq!(effect.requires, vec!["model.invoke".to_owned()]);
+        assert_eq!(effect.binding.as_deref(), Some("answer"));
     }
 
     /// The printer must reproduce the SPELLING of a prompt, not merely its

@@ -2565,6 +2565,21 @@ pub struct IrEffectNode {
     /// non-coerce effects AND for an inline `decide`, which names no declaration
     /// and therefore no backend. Not part of the `.ir` snapshot.
     pub coerce_target: Option<String>,
+    /// The backend named by an inline `prompt "…" using <provider>` clause,
+    /// surfaced for the same reason `coerce_target` is: it is the endpoint this
+    /// egress actually reaches. `None` for every other effect, and for a
+    /// `prompt` written without the clause — the selection ladder resolves that
+    /// one at runtime, so it has no static endpoint identity.
+    ///
+    /// A `prompt` names no declaration, so `coerce_target` cannot carry this:
+    /// the clause IS the binding, written at the effect. Without the field the
+    /// checker judged every inline prompt as the un-named backend `model`, even
+    /// one whose author had pinned an endpoint in source — which is the case
+    /// DR-0062 says must be governed per endpoint, and which
+    /// `docs/language-reference.md` already promises is "the equivalent of the
+    /// `provider` clause in the block of a coercion". Not part of the `.ir`
+    /// snapshot.
+    pub prompt_provider: Option<String>,
     /// The workflow an `invoke` addresses, surfaced so information-flow analysis can
     /// enumerate and govern invoke membrane ports. `None` for non-`invoke` effects.
     /// Not part of the `.ir` snapshot.
@@ -13430,6 +13445,7 @@ fn analyze_rule(
                 resource: None,
                 agent: None,
                 coerce_target: None,
+                prompt_provider: None,
                 workflow_target: None,
                 endorsed: false,
                 declassified: false,
@@ -15491,6 +15507,19 @@ fn agent_for_body(kind: &body::BodyEffectKind) -> Option<String> {
     }
 }
 
+/// The endpoint an inline `prompt "…" using <provider>` names (DR-0062).
+///
+/// The sibling of [`coerce_target_for_body`] for the form that names no
+/// declaration. A `decide` has no such clause and a `prompt` written without
+/// one names nothing, so both yield `None` and keep the un-named-backend
+/// principal — the selection ladder resolves those at runtime.
+fn prompt_provider_for_body(kind: &body::BodyEffectKind) -> Option<String> {
+    match kind {
+        body::BodyEffectKind::Prompt { provider } => provider.clone(),
+        _ => None,
+    }
+}
+
 /// The `coerce` declaration a coerce effect invokes (DR-0062). An inline
 /// `decide` names no declaration, so it yields `None` and falls back to the
 /// un-named-backend principal.
@@ -16848,6 +16877,7 @@ fn walk_effects(
                 let resource = resource_for_body(&effect.kind, binding_resources);
                 let agent = agent_for_body(&effect.kind);
                 let coerce_target = coerce_target_for_body(&effect.kind);
+                let prompt_provider = prompt_provider_for_body(&effect.kind);
                 let workflow_target = workflow_target_for_body(&effect.kind);
                 let endorsed = endorsed_for_body(&effect.kind);
                 let declassified = declassified_for_body(&effect.kind);
@@ -16892,6 +16922,7 @@ fn walk_effects(
                     resource,
                     agent,
                     coerce_target,
+                    prompt_provider,
                     workflow_target,
                     endorsed,
                     declassified,
