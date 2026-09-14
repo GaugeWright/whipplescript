@@ -46,6 +46,7 @@ const hostOperations = [
   ["runtime.host.transcript", "GET", "/host/instances/:instance/turns/:turn/transcript", "http-json", "none", "important"],
   ["runtime.host.events", "GET", "/host/instances/:instance/events", "http-json", "none", "important"],
   ["runtime.host.evidence", "GET", "/host/instances/:instance/evidence", "http-json", "none", "important"],
+  ["runtime.host.stats", "GET", "/host/instances/:instance/stats", "http-json", "none", "important"],
   ["runtime.host.files", "GET", "/host/instances/:instance/files", "http-json", "none", "important"],
 ];
 

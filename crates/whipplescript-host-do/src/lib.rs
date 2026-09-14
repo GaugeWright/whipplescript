@@ -335,6 +335,55 @@ workflow Method {
                 last_input_tokens: 3,
             })
         );
+        // Hosted parity (DR-0114 S3), on a turn that really ran here.
+        //
+        // Parity is by CONSTRUCTION: both hosts call
+        // `stats::inputs_for_instance` over their own `RuntimeStore` and fold
+        // with `whipplescript_kernel::stats`. So this proves the WIRING — that
+        // the hosted door reaches the fold with the instance's real rows — not
+        // that two implementations of the arithmetic agree. There is no second
+        // implementation for them to disagree about, deliberately.
+        {
+            use whipplescript_kernel::stats::{self, Dimension, Query};
+            let store = host.kernel_mut().store_mut();
+            let hosted = crate::host_projection::project_host_stats(
+                store,
+                &turn.instance_ref,
+                &["rule".to_owned()],
+            )
+            .expect("the hosted stats door projects");
+            let inputs =
+                stats::inputs_for_instance(store, &turn.instance_ref).expect("inputs read");
+            let native_rows = inputs.rows(&Query {
+                by: vec![Dimension::Rule],
+                ..Query::default()
+            });
+            assert_eq!(
+                hosted["schema"], "whipplescript.stats_report.v0",
+                "the hosted door answers under the same schema the CLI does"
+            );
+            let hosted_rows = hosted["rows"].as_array().expect("rows array");
+            assert_eq!(
+                hosted_rows.len(),
+                native_rows.len(),
+                "hosted and native disagree on row count: {hosted:#}"
+            );
+            assert!(
+                !hosted_rows.is_empty(),
+                "a settled hosted turn must produce at least one row: {hosted:#}"
+            );
+            // The turn reported `prompt_tokens: 3`, so the tokens are RECORDED
+            // on the hosted path rather than unrecorded.
+            let total: i64 = hosted_rows
+                .iter()
+                .filter_map(|row| row["measures"]["input_uncached"].as_i64())
+                .sum();
+            assert_eq!(
+                total, 3,
+                "the hosted fold must see the turn's real input tokens: {hosted:#}"
+            );
+        }
+
         assert!(projection.runtime_evidence_pointers.iter().any(|pointer| {
             matches!(
                 pointer,

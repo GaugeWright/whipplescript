@@ -15,6 +15,7 @@ use whipplescript_kernel::host_protocol::{
     TurnReceipt, TurnStatus, HOST_PROTOCOL,
 };
 use whipplescript_kernel::idempotency_key;
+use whipplescript_kernel::stats::{self, Dimension, Measure, Query, Row};
 use whipplescript_store::{EventView, EvidenceRecord, NewEvent, RuntimeStore, StoreError};
 
 use crate::do_store::{DoSql, DoSqliteStore};
@@ -112,6 +113,85 @@ pub fn current_position<Sql: DoSql>(
         sequence: u64::try_from(sequence).map_err(|_| {
             StoreError::fault("runtime event position", "the stored value is negative")
         })?,
+    })
+}
+
+/// One instance's stats rows, for the hosted read door (DR-0114 S3).
+///
+/// This deliberately does NOT aggregate in SQL, and that is a considered trade
+/// rather than an oversight. Aggregating here would be a SECOND implementation
+/// of the fold, in a different language from the one the native host runs, and
+/// two implementations of a token meter drift silently — the usage-shape
+/// reconciliation is the worked example, where one side read two of three
+/// spellings of a cached-token field and the gap only surfaced when the two
+/// were put side by side.
+///
+/// What makes recompute affordable is that the door is PER INSTANCE: it scans
+/// one instance's history rather than the store. DR-0114 already accepted
+/// recompute-on-read with a materialised rollup deferred, and if this ever
+/// hurts, that rollup serves both hosts from the one fold.
+///
+/// The read itself is `stats::inputs_for_instance`, the same function the CLI
+/// calls, so the two hosts cannot drift in how they read the log either.
+pub fn project_host_stats<S: RuntimeStore>(
+    store: &S,
+    instance_id: &str,
+    by: &[String],
+) -> Result<Value, String> {
+    let mut query = Query::default();
+    for name in by {
+        // The DR-0117 refusal, reached through the same one membership check
+        // the CLI uses. An unknown dimension is refused here too rather than
+        // dropped, so a hosted caller cannot read a total as a breakdown.
+        query.by.push(Dimension::parse(name)?);
+    }
+    let inputs = stats::inputs_for_instance(store, instance_id)
+        .map_err(|error| format!("could not read instance rows: {error:?}"))?;
+    let rows = inputs.rows(&query);
+    Ok(json!({
+        "schema": "whipplescript.stats_report.v0",
+        "rows": rows.iter().map(stats_row_json).collect::<Vec<_>>(),
+    }))
+}
+
+/// A measure renders as its number or as `null`. Never rewritten to `0` on the
+/// way out: that substitution at the edge would undo DR-0116.
+fn stats_measure_json(measure: Measure) -> Value {
+    measure.value().map_or(Value::Null, |value| json!(value))
+}
+
+fn stats_row_json(row: &Row) -> Value {
+    let key: serde_json::Map<String, Value> = row
+        .key
+        .iter()
+        .map(|(dimension, value)| {
+            (
+                dimension.name().to_owned(),
+                value.clone().map_or(Value::Null, Value::String),
+            )
+        })
+        .collect();
+    let m = &row.measures;
+    json!({
+        "key": key,
+        "measures": {
+            "effects": stats_measure_json(m.effects),
+            "runs": stats_measure_json(m.runs),
+            "retries": stats_measure_json(m.retries),
+            "turns": stats_measure_json(m.turns),
+            "calls": stats_measure_json(m.calls),
+            "steps": stats_measure_json(m.steps),
+            "input_uncached": stats_measure_json(m.input_uncached),
+            "input_cache_read": stats_measure_json(m.input_cache_read),
+            "input_cache_write": stats_measure_json(m.input_cache_write),
+            "output": stats_measure_json(m.output),
+            "completed": stats_measure_json(m.completed),
+            "failed": stats_measure_json(m.failed),
+            "timed_out": stats_measure_json(m.timed_out),
+            "cancelled": stats_measure_json(m.cancelled),
+            "blocked": stats_measure_json(m.blocked),
+            "last_input_tokens": stats_measure_json(m.last_input_tokens),
+        }
     })
 }
 
@@ -625,6 +705,18 @@ mod tests {
     /// the verified read could not be reached from outside. This asserts the
     /// two halves meet: what `pinned_position` hands out is exactly what the
     /// pinned read accepts.
+    /// An unknown dimension is refused on the hosted path, not dropped.
+    #[test]
+    fn the_hosted_door_refuses_a_dimension_outside_the_closed_vocabulary() {
+        let store = crate::do_store::test_support::store();
+        let error = project_host_stats(&store, "i-stats", &["fact_key".to_owned()])
+            .expect_err("a fact key is not a dimension");
+        assert!(
+            error.contains("unknown stats dimension `fact_key`"),
+            "got: {error}"
+        );
+    }
+
     #[test]
     fn a_position_handed_out_is_a_pin_the_verified_read_accepts() {
         let store = crate::do_store::test_support::store();

@@ -1493,3 +1493,110 @@ mod alias_tests {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Reading the durable rows: ONE adapter, both hosts
+// ---------------------------------------------------------------------------
+
+/// Everything the fold reads for one instance.
+#[derive(Clone, Debug, Default)]
+pub struct FoldInputs {
+    pub instances: Vec<InstanceInput>,
+    pub effects: Vec<EffectInput>,
+    pub runs: Vec<RunInput>,
+    pub calls: Vec<CallInput>,
+}
+
+impl FoldInputs {
+    /// Fold these into report rows.
+    pub fn rows(&self, query: &Query) -> Vec<Row> {
+        fold(&self.instances, &self.effects, &self.runs, &self.calls).rows(query)
+    }
+
+    /// Absorb another instance's inputs, for a store-wide read.
+    pub fn absorb(&mut self, other: Self) {
+        self.instances.extend(other.instances);
+        self.effects.extend(other.effects);
+        self.runs.extend(other.runs);
+        self.calls.extend(other.calls);
+    }
+}
+
+/// The evidence kind one model call writes when its reply arrives (DR-0115).
+pub const MODEL_REPLY_EVIDENCE: &str = "agent.turn.brokered.model_reply";
+
+/// Read one instance's durable rows into fold inputs.
+///
+/// Generic over [`RuntimeStore`] so the native host and the Durable Object host
+/// run THIS function rather than each adapting the store their own way. The
+/// fold is already one implementation; this makes the read one too, so hosted
+/// and native parity is structural rather than something a test has to keep
+/// chasing. What a parity test then proves is that both hosts reach the same
+/// rows — not that two adapters agree on arithmetic.
+pub fn inputs_for_instance<S: crate::RuntimeStore + ?Sized>(
+    store: &S,
+    instance_id: &str,
+) -> crate::StoreResult<FoldInputs> {
+    let Some(instance) = store.get_instance(instance_id)? else {
+        return Ok(FoldInputs::default());
+    };
+    let mut inputs = FoldInputs {
+        instances: vec![InstanceInput {
+            instance_id: instance.instance_id.clone(),
+            program_id: instance.program_id.clone(),
+            program_version_id: instance.version_id.clone(),
+        }],
+        ..FoldInputs::default()
+    };
+    for effect in store.list_effects(instance_id)? {
+        inputs.effects.push(EffectInput {
+            effect_id: effect.effect_id,
+            instance_id: instance_id.to_owned(),
+            kind: effect.kind,
+            status: effect.status,
+            created_by_rule: effect.created_by_rule,
+            program_version_id: effect.program_version_id,
+            revision_epoch: effect.revision_epoch,
+            profile: effect.profile,
+            policy_block_category: effect.policy_block_category,
+        });
+    }
+    for run in store.list_runs(instance_id)? {
+        inputs.runs.push(RunInput {
+            run_id: run.run_id,
+            effect_id: run.effect_id,
+            provider: run.provider,
+            status: run.status,
+            started_at: run.started_at,
+            completed_at: run.completed_at,
+            metadata_json: run.metadata_json,
+        });
+    }
+    for row in store.list_evidence(instance_id)? {
+        if row.kind != MODEL_REPLY_EVIDENCE || row.subject_type != "run" {
+            continue;
+        }
+        let Ok(metadata) = serde_json::from_str::<Value>(&row.metadata_json) else {
+            continue;
+        };
+        inputs.calls.push(CallInput {
+            run_id: row.subject_id,
+            step: metadata.get("step").and_then(Value::as_i64).unwrap_or(0),
+            model: metadata
+                .get("model")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            // `None` when the provider reported none, which stays unrecorded
+            // rather than becoming an invented zero.
+            usage: metadata
+                .get("usage")
+                .filter(|usage| usage.is_object())
+                .cloned(),
+            compaction: metadata
+                .get("compaction")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+        });
+    }
+    Ok(inputs)
+}

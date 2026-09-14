@@ -322,6 +322,17 @@
       "authentication": "runtime-control-bearer"
     },
     {
+      "id": "runtime.host.stats",
+      "method": "GET",
+      "path": "/host/instances/:instance/stats",
+      "samplePath": "/host/instances/instance-canary/stats",
+      "transport": "http-json",
+      "sideEffect": "none",
+      "risk": "important",
+      "producer": "whipplescript-host-worker",
+      "authentication": "runtime-control-bearer"
+    },
+    {
       "id": "runtime.host.files",
       "method": "GET",
       "path": "/host/instances/:instance/files",

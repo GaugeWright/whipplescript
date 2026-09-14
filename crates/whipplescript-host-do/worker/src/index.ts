@@ -136,6 +136,11 @@ const hostFunctions = bindings as unknown as {
     bridge: unknown,
     instanceId: string,
   ) => string;
+  host_stats: (
+    bridge: unknown,
+    instanceId: string,
+    by: string,
+  ) => string;
   // The handle surface (DR-0113). Bytes never come through here: the isolate
   // is synchronous and R2 is not, so the object plane moves them and this
   // records only that they exist.
@@ -1882,6 +1887,27 @@ export class WorkflowInstance implements DurableObject {
         complete,
       });
     }
+    const stats = url.pathname.match(/^\/host\/instances\/([^/]+)\/stats$/);
+    if (stats) {
+      const instanceId = decodeURIComponent(stats[1]);
+      if (!this.instanceExists(instanceId)) {
+        return Response.json({ error: "instance not found" }, { status: 404 });
+      }
+      try {
+        // The fold runs in the wasm core, which is the same code the native
+        // host runs, so the two cannot drift. An unknown `by` dimension is
+        // REFUSED there (DR-0117) rather than dropped, because a silently
+        // shrunken breakdown reads as a total.
+        return Response.json(JSON.parse(hostFunctions.host_stats(
+          makeBridge(this.ctx.storage),
+          instanceId,
+          url.searchParams.get("by") ?? "",
+        )));
+      } catch (error) {
+        return Response.json({ error: `stats projection failed: ${String(error)}` }, { status: 409 });
+      }
+    }
+
     const evidence = url.pathname.match(/^\/host\/instances\/([^/]+)\/evidence$/);
     if (evidence) {
       const instanceId = decodeURIComponent(evidence[1]);
@@ -5173,7 +5199,7 @@ export default {
         url.pathname === "/host/turns" ||
         url.pathname === "/host/forks/import" ||
         /^\/host\/instances\/[^/]+\/discard$/.test(url.pathname) ||
-        /^\/host\/instances\/[^/]+\/(events|evidence|files|position|pending|checkpoint|restore)$/.test(url.pathname) ||
+        /^\/host\/instances\/[^/]+\/(events|evidence|files|position|pending|checkpoint|restore|stats)$/.test(url.pathname) ||
         /^\/host\/instances\/[^/]+\/events\/(stream|live)$/.test(url.pathname) ||
         /^\/host\/instances\/[^/]+\/human\/answer$/.test(url.pathname) ||
         /^\/host\/instances\/[^/]+\/fork-export$/.test(url.pathname) ||

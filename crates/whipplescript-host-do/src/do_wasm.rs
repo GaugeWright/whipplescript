@@ -331,6 +331,23 @@ pub fn host_project_turn(
 /// `list_events_pinned` — implemented and tested on both hosts — was reachable
 /// by nothing.
 #[wasm_bindgen]
+pub fn host_stats(bridge: DoSqlBridge, instance_id: &str, by: &str) -> Result<String, JsValue> {
+    // `by` is a comma-separated dimension list, refused by the same one
+    // membership check the CLI uses (DR-0117), so an unknown dimension cannot
+    // be silently dropped on the hosted path either.
+    let dimensions: Vec<String> = by
+        .split(',')
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned)
+        .collect();
+    let store = crate::do_store::DoSqliteStore::new(std::rc::Rc::new(JsDoSql { bridge }));
+    let report = crate::host_projection::project_host_stats(&store, instance_id, &dimensions)
+        .map_err(|error| JsValue::from_str(&error))?;
+    serde_json::to_string(&report).map_err(|error| JsValue::from_str(&error.to_string()))
+}
+
+#[wasm_bindgen]
 pub fn host_current_position(bridge: DoSqlBridge, instance_id: &str) -> Result<String, JsValue> {
     let store = crate::do_store::DoSqliteStore::new(std::rc::Rc::new(JsDoSql { bridge }));
     let position = crate::host_projection::pinned_position(&store, instance_id)

@@ -1018,7 +1018,31 @@ impl<Sql: DoSql + Clone> InstanceDriver for DoInstanceDriver<'_, Sql> {
                                         .and_then(|value| value.as_u64())
                                         .unwrap_or(0)
                                         as usize,
-                                    observations: Vec::new(),
+                                    // The container SENDS these — `outcome_json`
+                                    // carries them on the wire — and this door
+                                    // used to drop them on the floor, so no
+                                    // per-call row (DR-0115) could ever reach a
+                                    // hosted instance's log and every hosted run
+                                    // folded at turn grain forever.
+                                    //
+                                    // An observation this build cannot parse is
+                                    // skipped rather than failing the turn: a
+                                    // container running a newer kernel may send a
+                                    // kind that did not exist here, and a turn
+                                    // that did its work must not fail over a
+                                    // record of that work.
+                                    observations: outcome
+                                        .get("observations")
+                                        .and_then(|value| value.as_array())
+                                        .map(|values| {
+                                            values
+                                                .iter()
+                                                .filter_map(|value| {
+                                                    serde_json::from_value(value.clone()).ok()
+                                                })
+                                                .collect()
+                                        })
+                                        .unwrap_or_default(),
                                     usage: outcome
                                         .get("usage")
                                         .cloned()

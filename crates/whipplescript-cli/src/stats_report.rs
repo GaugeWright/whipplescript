@@ -9,12 +9,7 @@
 //! matching the other extracted command modules.
 
 use super::*;
-use whipplescript_kernel::stats::{
-    self, CallInput, Dimension, EffectInput, InstanceInput, Measure, Measures, Query, Row, RunInput,
-};
-
-/// The evidence kind one model call writes when its reply arrives (DR-0115).
-const MODEL_REPLY_EVIDENCE: &str = "agent.turn.brokered.model_reply";
+use whipplescript_kernel::stats::{self, Dimension, Measure, Measures, Query, Row};
 
 const USAGE: &str = "usage: whip [--store path] [--json] stats [<instance>]\n  \
     [--program <program-id>] [--since <rfc3339>] [--until <rfc3339>] [--by <dim>[,<dim>...]]\n  \
@@ -122,10 +117,9 @@ pub(crate) fn stats(options: &CliOptions) -> ExitCode {
         Err(error) => return report_store_error("failed to list instances", error),
     };
 
-    let mut instance_inputs = Vec::new();
-    let mut effect_inputs = Vec::new();
-    let mut run_inputs = Vec::new();
-    let mut call_inputs = Vec::new();
+    // ONE adapter, shared with the hosted door, so the two hosts cannot drift
+    // in how they read the log (`stats::inputs_for_instance`).
+    let mut inputs = stats::FoldInputs::default();
     for instance in &instances {
         if parsed
             .instance_id
@@ -134,74 +128,9 @@ pub(crate) fn stats(options: &CliOptions) -> ExitCode {
         {
             continue;
         }
-        instance_inputs.push(InstanceInput {
-            instance_id: instance.instance_id.clone(),
-            program_id: instance.program_id.clone(),
-            program_version_id: instance.version_id.clone(),
-        });
-        let effects = match store.list_effects(&instance.instance_id) {
-            Ok(effects) => effects,
-            Err(error) => return report_store_error("failed to list effects", error),
-        };
-        for effect in effects {
-            effect_inputs.push(EffectInput {
-                effect_id: effect.effect_id,
-                instance_id: instance.instance_id.clone(),
-                kind: effect.kind,
-                status: effect.status,
-                created_by_rule: effect.created_by_rule,
-                program_version_id: effect.program_version_id,
-                revision_epoch: effect.revision_epoch,
-                profile: effect.profile,
-                policy_block_category: effect.policy_block_category,
-            });
-        }
-        let runs = match store.list_runs(&instance.instance_id) {
-            Ok(runs) => runs,
-            Err(error) => return report_store_error("failed to list runs", error),
-        };
-        // The per-call rows. A run that has them folds at call grain; a run
-        // that does not falls back to its turn sum, tagged, and never both.
-        let evidence = match store.list_evidence(&instance.instance_id) {
-            Ok(evidence) => evidence,
-            Err(error) => return report_store_error("failed to list evidence", error),
-        };
-        for row in evidence {
-            if row.kind != MODEL_REPLY_EVIDENCE || row.subject_type != "run" {
-                continue;
-            }
-            let Ok(metadata) = serde_json::from_str::<Value>(&row.metadata_json) else {
-                continue;
-            };
-            call_inputs.push(CallInput {
-                run_id: row.subject_id,
-                step: metadata.get("step").and_then(Value::as_i64).unwrap_or(0),
-                model: metadata
-                    .get("model")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned),
-                // `None` when the provider reported none, which the fold keeps
-                // as unrecorded rather than turning into a zero.
-                usage: metadata
-                    .get("usage")
-                    .filter(|usage| usage.is_object())
-                    .cloned(),
-                compaction: metadata
-                    .get("compaction")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false),
-            });
-        }
-        for run in runs {
-            run_inputs.push(RunInput {
-                run_id: run.run_id,
-                effect_id: run.effect_id,
-                provider: run.provider,
-                status: run.status,
-                started_at: run.started_at,
-                completed_at: run.completed_at,
-                metadata_json: run.metadata_json,
-            });
+        match stats::inputs_for_instance(&store, &instance.instance_id) {
+            Ok(one) => inputs.absorb(one),
+            Err(error) => return report_store_error("failed to read instance rows", error),
         }
     }
 
@@ -212,8 +141,7 @@ pub(crate) fn stats(options: &CliOptions) -> ExitCode {
         since: parsed.since,
         until: parsed.until,
     };
-    let rows =
-        stats::fold(&instance_inputs, &effect_inputs, &run_inputs, &call_inputs).rows(&query);
+    let rows = inputs.rows(&query);
 
     if options.json {
         emit_json(json!({

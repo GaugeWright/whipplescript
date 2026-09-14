@@ -1068,6 +1068,7 @@ describe("real WorkflowInstance hibernation", () => {
       "/events",
       `/evidence?command_id=${commandId}`,
       "/pending",
+      "/stats?by=rule",
     ]) {
       const projection = await placementFetch(`${instancePath}${suffix}`);
       expect(
@@ -1615,10 +1616,10 @@ describe("real WorkflowInstance hibernation", () => {
       || path.startsWith("/host/")
       || path.startsWith("/public/session/")
     );
-    // Bumped with `runtime.host.objects.register` (DR-0113). The count is a
+    // Bumped with `runtime.host.stats` (DR-0114 S3). The count is a
     // tripwire: a route added to the surface without a thought about this
     // suite trips it, and every operation below is then exercised for real.
-    expect(operations.length).toBe(29);
+    expect(operations.length).toBe(30);
 
     for (const operation of operations) {
       for (const authorization of [undefined, "Bearer wrong-control-token"]) {
