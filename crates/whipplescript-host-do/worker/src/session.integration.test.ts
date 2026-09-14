@@ -1851,6 +1851,52 @@ describe("real WorkflowInstance hibernation", () => {
     });
   });
 
+  it("lazily provisions provider-trust evidence and restamps the object (DR-0062)", async () => {
+    // An object created before DR-0062 has no `provider_trust_evidence` and is
+    // not stamped at version 2. `DoStore::provider_trust_evidence` selects from
+    // that table before a policy load may delegate a provider, so the upgrade
+    // has to both provision it and restamp the object — a version-2 layout still
+    // unstamped would let a rolled-back deploy serve a shape it has never seen.
+    const sessionId = "session-provider-trust-upgrade";
+    const namespace = (env as unknown as TestEnv).WORKFLOW_INSTANCE;
+    const stub = namespace.get(namespace.idFromName(sessionId));
+    await bootstrapSession(stub, sessionId);
+    await runInDurableObject(stub, async (_instance, state) => {
+      state.storage.sql.exec("DROP TABLE provider_trust_evidence");
+      state.storage.sql.exec("DELETE FROM schema_migrations WHERE version = 2");
+    });
+
+    // Any entry that touches the schema upgrades the object in place.
+    const response = await stub.fetch(
+      "https://session.test/public/session/state",
+      { headers: { authorization: "Bearer session-token" } },
+    );
+    expect(response.status, await response.clone().text()).toBe(200);
+
+    await runInDurableObject(stub, async (_instance, state) => {
+      // A filed claim still has to carry a term: the upgraded table keeps the
+      // CHECK a fresh object gets from `do_schema.sql`.
+      expect(() =>
+        state.storage.sql.exec(
+          `INSERT INTO provider_trust_evidence (effect_kind, provider, claim_class)
+             VALUES ('agent_turn', 'acme', 'zero-retention')`,
+        ),
+      ).toThrow();
+      state.storage.sql.exec(
+        `INSERT INTO provider_trust_evidence
+           (effect_kind, provider, claim_class, claim_signer, claim_expires_at)
+         VALUES ('agent_turn', 'acme', 'zero-retention', 'ops@acme.com', '2027-08-07T00:00:00Z')`,
+      );
+      // Version 2 specifically, not the maximum: the tail stamps later versions
+      // too, so `MAX(version)` would pass with the one this test is about
+      // missing.
+      const stamped = state.storage.sql
+        .exec("SELECT version FROM schema_migrations WHERE version = 2")
+        .toArray() as { version: number }[];
+      expect(stamped.length, "the object was upgraded but never restamped").toBe(1);
+    });
+  });
+
   it("refuses to serve an object stamped by a newer deploy (DR-0054 Phase B)", async () => {
     // A rolled-back worker attached to an object whose schema_migrations is
     // stamped past what it knows must fail closed — a structured 500 naming

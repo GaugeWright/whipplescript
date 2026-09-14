@@ -334,6 +334,27 @@ function ensureSchema(sql: SqlStorage): void {
   if (found > SUPPORTED_DO_SCHEMA_VERSION) {
     throw new UnsupportedSchemaVersionError(found);
   }
+  // DR-0062 provider-trust evidence. An object created before it has no such
+  // table, and `DoStore::provider_trust_evidence` selects from it unguarded on
+  // every policy load that may delegate a provider — so a pre-DR-0062 object
+  // met "no such table" rather than "no evidence filed". Version 2 was seeded
+  // for a FRESH object in `do_schema.sql` and never added to this tail, so it
+  // is the one version the lazy path skipped.
+  //
+  // The CHECK comes with it: a fresh object refuses a filed claim carrying no
+  // term, and an upgraded one that dropped the constraint would accept rows the
+  // schema says cannot exist.
+  sql.exec(`CREATE TABLE IF NOT EXISTS provider_trust_evidence (
+    effect_kind TEXT NOT NULL, provider TEXT NOT NULL,
+    pinned_digest TEXT,
+    claim_class TEXT, claim_signer TEXT, claim_filed_at TEXT, claim_expires_at TEXT,
+    operator_run INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (effect_kind, provider),
+    CHECK (claim_class IS NULL OR (claim_signer IS NOT NULL AND claim_expires_at IS NOT NULL))
+  )`);
+  sql.exec(`INSERT OR IGNORE INTO schema_migrations (version, name)
+    VALUES (2, 'provider-trust-evidence')`);
   // A prior deploy does not understand retained write-result references.
   // Stamp the upgrade before exposing this object to the new branch adapter;
   // an older worker's existing downgrade guard then refuses this generation.
