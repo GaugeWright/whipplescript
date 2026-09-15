@@ -31,7 +31,7 @@ use std::collections::BTreeMap;
 use std::path::{Component, Path};
 
 #[cfg(feature = "native")]
-use crate::content::ContentBlobs;
+use crate::content::{BlobStatus, ContentBlobs};
 #[cfg(feature = "native")]
 use crate::stat_cache::{scan_dir, CachedEntry, StatCache};
 use crate::{StoreError, StoreResult};
@@ -149,6 +149,46 @@ pub fn materialize_manifest_subset(
     now_unix_nanos: i128,
     limits: &MaterializeLimits,
 ) -> StoreResult<MaterializedScratch> {
+    materialize_manifest_onto(
+        manifest,
+        include,
+        content,
+        root,
+        now_unix_nanos,
+        limits,
+        None,
+    )
+}
+
+/// Materialize onto a root whose current contents are already described by
+/// `on_disk`, writing only the files that are not already right.
+///
+/// The projection's cost used to be the whole manifest, every time, and the
+/// common case is that it had nothing to do. `commit_turn` imports the
+/// worktree and then projects the branch back onto it, so at the moment the
+/// projection runs, every observed path on disk already holds exactly the
+/// bytes the manifest records — and the projection read and rewrote all of
+/// them anyway. That is O(worktree) work, and O(worktree) memory, on every
+/// turn.
+///
+/// `on_disk` is a scan's own cache: for each path, what was there and what it
+/// hashed to. An entry may be believed only under the rule `scan_dir` already
+/// uses for the same question — size and mtime unchanged since the scan, and
+/// that mtime strictly older than the scan's stamp. Anything touched inside the
+/// racy granule is written, which is what the projection did for everything
+/// before this existed, so the conservative direction is the unchanged one.
+///
+/// Pass `None` to project unconditionally.
+#[cfg(feature = "native")]
+pub fn materialize_manifest_onto(
+    manifest: &BTreeMap<String, String>,
+    include: Option<&std::collections::BTreeSet<String>>,
+    content: &dyn ContentBlobs,
+    root: &Path,
+    now_unix_nanos: i128,
+    limits: &MaterializeLimits,
+    on_disk: Option<&StatCache>,
+) -> StoreResult<MaterializedScratch> {
     let selected: Vec<(&str, &str)> = manifest
         .iter()
         .filter(|(key, _)| include.is_none_or(|include| include.contains(*key)))
@@ -173,22 +213,18 @@ pub fn materialize_manifest_subset(
         )));
     }
 
-    let mut bodies = Vec::with_capacity(selected.len());
-    let mut total_bytes = 0u64;
-    for (key, hash) in selected {
-        let Some(body) = content.get(hash)? else {
-            // Preflight said this resolves, so a miss here is the store
-            // contradicting itself between one call and the next, not a missing
-            // input. Reported as the disagreement it is.
-            return Err(StoreError::Conflict(format!(
-                "content {hash} for {key} preflighted as servable and then did not serve; \
-                 the store disagrees with itself"
-            )));
-        };
-        total_bytes += body.len() as u64;
-        bodies.push((key.to_owned(), hash.to_owned(), body));
-    }
+    // The budget is answered from recorded sizes, not from loaded payloads.
+    // Summing what `get` returned meant holding the whole closure in memory to
+    // discover it did not fit — the one outcome for which reading it was
+    // certainly wasted. `status` is a metadata read on the native store, and
+    // the sum is only taken when a budget was actually set.
     if let Some(max_bytes) = limits.max_bytes {
+        let mut total_bytes = 0u64;
+        for (_, hash) in &selected {
+            if let BlobStatus::Live { byte_len } = content.status(hash)? {
+                total_bytes += byte_len;
+            }
+        }
         if total_bytes > max_bytes {
             return Err(StoreError::Conflict(format!(
                 "materialization needs {total_bytes} bytes but the budget is                  {max_bytes}; narrow the input closure or raise the bound                  (nothing was written)"
@@ -209,8 +245,8 @@ pub fn materialize_manifest_subset(
         entries: BTreeMap::new(),
     };
     let mut key_of = BTreeMap::new();
-    for (key, hash, body) in bodies {
-        let relative = scratch_relative(&key)?;
+    for (key, hash) in selected {
+        let relative = scratch_relative(key)?;
         let target = root.join(&relative);
         if let Some(parent) = target.parent() {
             std::fs::create_dir_all(parent).map_err(|error| {
@@ -227,10 +263,31 @@ pub fn materialize_manifest_subset(
                 )));
             }
         }
-        std::fs::write(&target, &body)
-            .map_err(|error| StoreError::Conflict(format!("materialize {relative}: {error}")))?;
-        let metadata = std::fs::metadata(&target)
-            .map_err(|error| StoreError::Conflict(format!("stat {relative}: {error}")))?;
+        // Already right on disk: no read, no write, and the entry it would
+        // have produced carried forward unchanged.
+        let metadata = match already_materialized(on_disk, &relative, hash, &target) {
+            Some(metadata) => metadata,
+            None => {
+                let Some(body) = content.get(hash)? else {
+                    // Preflight said this resolves, so a miss here is the store
+                    // contradicting itself between one call and the next, not a
+                    // missing input. Reported as the disagreement it is.
+                    return Err(StoreError::Conflict(format!(
+                        "content {hash} for {key} preflighted as servable and then did not \
+                         serve; the store disagrees with itself"
+                    )));
+                };
+                // Read one, write one. Loading the whole closure before writing
+                // any of it cost the sum of the manifest in resident memory,
+                // which is what made a chat holding recordings expensive to
+                // commit rather than expensive to upload.
+                std::fs::write(&target, &body).map_err(|error| {
+                    StoreError::Conflict(format!("materialize {relative}: {error}"))
+                })?;
+                std::fs::metadata(&target)
+                    .map_err(|error| StoreError::Conflict(format!("stat {relative}: {error}")))?
+            }
+        };
         let mtime = metadata
             .modified()
             .ok()
@@ -246,12 +303,49 @@ pub fn materialize_manifest_subset(
             CachedEntry {
                 size: metadata.len(),
                 mtime_unix_nanos: mtime,
-                content_hash: hash,
+                content_hash: hash.to_owned(),
             },
         );
-        key_of.insert(relative, key);
+        key_of.insert(relative, key.to_owned());
     }
     Ok(MaterializedScratch { cache, key_of })
+}
+
+/// Whether `target` already holds the manifest's bytes, and its metadata if so.
+///
+/// The trust rule is `scan_dir`'s, deliberately the same one: the cache entry
+/// must name this content, and the file on disk must still carry the size and
+/// mtime the scan recorded, with that mtime strictly older than the scan's
+/// stamp. A file written inside the scan's own mtime granule is a file whose
+/// fingerprint cannot distinguish two contents, so it is not believed — the
+/// same-size, same-mtime, different-bytes hazard that makes a naive importer
+/// drop a change would here make a projection skip a write it owed.
+///
+/// Two notions of "unchanged" that could drift apart would be worse than the
+/// cost this saves, so there is one.
+#[cfg(feature = "native")]
+fn already_materialized(
+    on_disk: Option<&StatCache>,
+    relative: &str,
+    hash: &str,
+    target: &Path,
+) -> Option<std::fs::Metadata> {
+    let on_disk = on_disk?;
+    let recorded = on_disk.entries.get(relative)?;
+    if recorded.content_hash != hash || recorded.mtime_unix_nanos >= on_disk.stamp_unix_nanos {
+        return None;
+    }
+    let metadata = std::fs::metadata(target).ok()?;
+    if !metadata.is_file() || metadata.len() != recorded.size {
+        return None;
+    }
+    let mtime = metadata
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_nanos() as i128;
+    (mtime == recorded.mtime_unix_nanos).then_some(metadata)
 }
 
 /// Import the scratch's state back: scan against the previous cache
@@ -341,6 +435,265 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .expect("clock")
             .as_nanos() as i128
+    }
+
+    /// A real store that also reports how many payloads were pulled out of it.
+    ///
+    /// It delegates rather than simulating, because a double that answers
+    /// differently from the backend it stands for makes every test using it a
+    /// check against a store that could not exist — and the count is the whole
+    /// point here, so the rest must be true.
+    struct CountingReads {
+        inner: ContentStore,
+        reads: std::cell::Cell<usize>,
+    }
+
+    impl Default for CountingReads {
+        fn default() -> Self {
+            Self {
+                inner: content("counting-reads"),
+                reads: std::cell::Cell::new(0),
+            }
+        }
+    }
+
+    impl ContentBlobs for CountingReads {
+        fn put(&self, body: &[u8]) -> StoreResult<String> {
+            self.inner.put(body)
+        }
+        fn put_unerased(&self, body: &[u8]) -> StoreResult<String> {
+            self.inner.put_unerased(body)
+        }
+        fn put_file(&self, path: &Path) -> StoreResult<String> {
+            self.inner.put_file(path)
+        }
+        fn get(&self, id: &str) -> StoreResult<Option<Vec<u8>>> {
+            self.reads.set(self.reads.get() + 1);
+            self.inner.get(id)
+        }
+        fn status(&self, id: &str) -> StoreResult<BlobStatus> {
+            self.inner.status(id)
+        }
+        fn erase(&self, id: &str, at: &str) -> StoreResult<crate::content::EraseOutcome> {
+            self.inner.erase(id, at)
+        }
+        fn cached_read_available(&self, id: &str) -> StoreResult<bool> {
+            self.inner.cached_read_available(id)
+        }
+        fn publish_retained<T>(
+            &self,
+            ids: &[String],
+            publish: impl FnOnce() -> StoreResult<T>,
+        ) -> StoreResult<T> {
+            self.inner.publish_retained(ids, publish)
+        }
+        fn chunk_ids(&self, id: &str) -> StoreResult<Option<Vec<String>>> {
+            self.inner.chunk_ids(id)
+        }
+        fn put_chunk_root(
+            &self,
+            root_id: &str,
+            chunk_ids: &[String],
+            byte_len: u64,
+        ) -> StoreResult<()> {
+            self.inner.put_chunk_root(root_id, chunk_ids, byte_len)
+        }
+    }
+
+    /// A store whose `status` promises what its `get` will not deliver.
+    ///
+    /// The preflight asks one question and the read asks another, and between
+    /// them the store may change its mind. That is not a missing input — it is
+    /// the store contradicting itself, and it has to be reported as such rather
+    /// than as "the blob is absent", which would send an operator to retry for
+    /// bytes the store believes it has.
+    struct DisagreesWithItself {
+        inner: ContentStore,
+    }
+
+    impl ContentBlobs for DisagreesWithItself {
+        fn put(&self, body: &[u8]) -> StoreResult<String> {
+            self.inner.put(body)
+        }
+        fn get(&self, _id: &str) -> StoreResult<Option<Vec<u8>>> {
+            Ok(None)
+        }
+        fn status(&self, id: &str) -> StoreResult<BlobStatus> {
+            self.inner.status(id)
+        }
+    }
+
+    /// A store that preflights a blob as servable and then does not serve it is
+    /// refused as the disagreement it is, and named as that rather than as an
+    /// absence.
+    #[test]
+    fn content_that_preflights_and_then_does_not_serve_is_named_a_disagreement() {
+        let store = DisagreesWithItself {
+            inner: content("disagrees"),
+        };
+        let mut manifest = BTreeMap::new();
+        manifest.insert("/ws/a.md".to_owned(), store.put_text("alpha").expect("put"));
+        let root = scratch_root("disagrees-dir");
+
+        let refused = materialize_manifest(&manifest, &store, &root, now_nanos())
+            .expect_err("a store that will not serve what it promised is refused");
+        let rendered = format!("{refused:?}");
+        assert!(
+            rendered.contains("the store disagrees with itself"),
+            "named as a disagreement, not an absence: {rendered}"
+        );
+        assert!(
+            !root.join("ws/a.md").exists(),
+            "and the file it could not serve was not invented"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The read-counting double runs the contract too: a count taken against a
+    /// store that does not behave like the real one counts nothing anybody
+    /// cares about.
+    #[test]
+    fn the_read_counting_double_satisfies_the_content_contract() {
+        crate::content::conformance::run_suite(CountingReads::default).expect("suite runs");
+    }
+
+    /// The projection's whole cost, on the turn where it has nothing to do.
+    ///
+    /// `commit_turn` imports the worktree and then projects the branch back
+    /// onto it, so every file it is about to write is already exactly right.
+    /// It used to read and rewrite all of them anyway.
+    #[test]
+    fn a_projection_onto_what_is_already_there_reads_nothing() {
+        let store = CountingReads::default();
+        let mut manifest = BTreeMap::new();
+        for (name, body) in [("a.md", "alpha"), ("deep/b.md", "beta"), ("c.md", "gamma")] {
+            manifest.insert(format!("/ws/{name}"), store.put_text(body).expect("stores"));
+        }
+        let root = scratch_root("projection-noop-dir");
+        let first =
+            materialize_manifest(&manifest, &store, &root, now_nanos()).expect("materialize");
+
+        // The scan that would precede a real projection: its stamp must be
+        // after the writes, exactly as `commit_turn`'s import stamp is.
+        let scanned = scan_dir(&root, &first.cache, now_nanos() + 2_000_000_000)
+            .expect("scan")
+            .cache;
+
+        store.reads.set(0);
+        let again = materialize_manifest_onto(
+            &manifest,
+            None,
+            &store,
+            &root,
+            now_nanos() + 4_000_000_000,
+            &MaterializeLimits::default(),
+            Some(&scanned),
+        )
+        .expect("materialize");
+
+        assert_eq!(store.reads.get(), 0, "no payload was pulled");
+        assert_eq!(
+            std::fs::read_to_string(root.join("ws/a.md")).expect("reads"),
+            "alpha",
+            "and the files are still what the manifest says"
+        );
+        // The scratch a skipped projection returns has to describe the tree as
+        // completely as one that wrote it, or the next import reads every
+        // skipped path as removed.
+        assert_eq!(
+            again.cache.entries.keys().collect::<Vec<_>>(),
+            first.cache.entries.keys().collect::<Vec<_>>()
+        );
+        assert_eq!(again.key_of, first.key_of);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The three ways a file is not what the cache claims, each of which must
+    /// be written rather than believed.
+    #[test]
+    fn a_projection_writes_what_the_cache_cannot_vouch_for() {
+        let store = CountingReads::default();
+        let mut manifest = BTreeMap::new();
+        manifest.insert("/ws/a.md".to_owned(), store.put_text("alpha").expect("put"));
+        let root = scratch_root("projection-untrusted-dir");
+        let first =
+            materialize_manifest(&manifest, &store, &root, now_nanos()).expect("materialize");
+        let scanned = scan_dir(&root, &first.cache, now_nanos() + 2_000_000_000)
+            .expect("scan")
+            .cache;
+
+        let reproject = |cache: &StatCache| -> usize {
+            store.reads.set(0);
+            materialize_manifest_onto(
+                &manifest,
+                None,
+                &store,
+                &root,
+                now_nanos() + 4_000_000_000,
+                &MaterializeLimits::default(),
+                Some(cache),
+            )
+            .expect("materialize");
+            store.reads.get()
+        };
+
+        // 1. The manifest moved on: the cache describes yesterday's content.
+        let mut stale = scanned.clone();
+        stale
+            .entries
+            .get_mut("ws/a.md")
+            .expect("entry")
+            .content_hash = "0000000000000000000000000000000f".to_owned();
+        assert_eq!(reproject(&stale), 1, "a different hash is written");
+
+        // 2. Inside the racy granule: same size, same mtime, and a fingerprint
+        //    that cannot tell two contents apart. `scan_dir` refuses to trust
+        //    this and so does the projection.
+        let mut racy = scanned.clone();
+        racy.stamp_unix_nanos = racy.entries["ws/a.md"].mtime_unix_nanos;
+        assert_eq!(reproject(&racy), 1, "the racy granule is written");
+
+        // 3. The file moved under us since the scan.
+        std::fs::write(root.join("ws/a.md"), "edited by somebody else").expect("edit");
+        assert_eq!(reproject(&scanned), 1, "a changed file is written");
+        assert_eq!(
+            std::fs::read_to_string(root.join("ws/a.md")).expect("reads"),
+            "alpha",
+            "and restored to what the manifest records"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A closure that does not fit is refused from recorded sizes, without
+    /// loading the payloads that were never going to be written.
+    #[test]
+    fn a_budget_refusal_costs_no_reads() {
+        let store = CountingReads::default();
+        let mut manifest = BTreeMap::new();
+        manifest.insert(
+            "/ws/big.bin".to_owned(),
+            store.put(&vec![7u8; 4096]).expect("stores"),
+        );
+        let root = scratch_root("projection-budget-dir");
+        store.reads.set(0);
+        let refused = materialize_manifest_onto(
+            &manifest,
+            None,
+            &store,
+            &root,
+            now_nanos(),
+            &MaterializeLimits {
+                max_bytes: Some(1024),
+            },
+            None,
+        )
+        .expect_err("the budget refuses");
+        assert!(
+            format!("{refused:?}").contains("nothing was written"),
+            "{refused:?}"
+        );
+        assert_eq!(store.reads.get(), 0, "and nothing was read either");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// **An erased input must not read as an absent one.**

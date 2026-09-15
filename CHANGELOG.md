@@ -68,6 +68,19 @@ follow [Semantic Versioning](https://semver.org). Dates are UTC.
 
 ### Changed
 
+- **A projection writes only the files that are not already right, and never
+  holds the manifest in memory.** `materialize_manifest_subset` loaded every
+  body into a vector before writing any of them, so projecting a tree cost the
+  sum of the tree — and the common case is that it had nothing to do at all,
+  because `commit_turn` imports a worktree and then projects the branch back
+  onto the same bytes. It now reads one and writes one, and
+  `materialize_manifest_onto` takes a scan's own cache and skips every path that
+  cache can vouch for, under exactly the rule `scan_dir` uses for the same
+  question — size and mtime unchanged, and that mtime strictly older than the
+  scan's stamp. Anything inside the racy granule is written, which is what
+  every path got before. The byte budget is now answered from recorded sizes
+  rather than by loading the closure to discover it does not fit.
+
 - **Importing a worktree no longer reads its largest file twice.** The scan
   hashes each file a window at a time rather than reading it whole, and
   `ContentBlobs::put_file` lets a store that can write incrementally do so —
