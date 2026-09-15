@@ -68,6 +68,18 @@ follow [Semantic Versioning](https://semver.org). Dates are UTC.
 
 ### Changed
 
+- **Importing a worktree no longer reads its largest file twice.** The scan
+  hashes each file a window at a time rather than reading it whole, and
+  `ContentBlobs::put_file` lets a store that can write incrementally do so —
+  `ContentStore` writes past the 4 MiB threshold straight into the row through
+  SQLite's incremental blob interface, verifying the bytes it writes against
+  the id it keyed them under so a file moving mid-import is refused rather than
+  stored under an id that does not describe it. Measured: importing an 80 MiB
+  recording grew the resident peak by 82 MB where it grew by 161 MB before.
+  Identity, representation below the threshold, and every other
+  `ContentBlobs` implementation are unchanged — the seam has a default that
+  reads the file, which is what every caller did before it existed.
+
 - **A source span is no longer part of a program's identity** (DR-0095).
   `ir_hash` is now `stable_hash_hex` of the `.ir` snapshot's *identity
   projection* — the same document with its source offsets erased. So **a

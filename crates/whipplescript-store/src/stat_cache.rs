@@ -16,9 +16,10 @@
 //!
 //! The caller passes the scan instant (clock at the worker boundary) and
 //! persists the returned cache however it likes (`to_json`/`from_json`).
-//! Content ids use the house primitive, `chunking::content_hash_hex`
-//! (SHA-256/128), so import-back diffs speak the same id space as manifests
-//! and blobs.
+//! Content ids use the house primitive (SHA-256/128), taken over the file a
+//! window at a time by `content::content_hash_file`, so import-back diffs
+//! speak the same id space as manifests and blobs without a scan ever holding
+//! a file whole.
 
 #[cfg(feature = "native")]
 use std::collections::BTreeMap;
@@ -28,8 +29,6 @@ use std::path::Path;
 #[cfg(feature = "native")]
 use serde_json::{json, Value};
 
-#[cfg(feature = "native")]
-use crate::chunking::content_hash_hex;
 #[cfg(feature = "native")]
 use crate::{StoreError, StoreResult};
 
@@ -207,9 +206,11 @@ pub fn scan_dir(
                 .clone()
         } else {
             rehashed += 1;
-            let bytes = std::fs::read(root.join(&path))
-                .map_err(|error| StoreError::Conflict(format!("read {path}: {error}")))?;
-            content_hash_hex(&bytes)
+            // Streamed, so the scan's cost is the window and not the file. A
+            // tree with one recording in it used to cost that recording twice
+            // over — once here and once again in the import that follows.
+            crate::content::content_hash_file(&root.join(&path))
+                .map_err(|error| StoreError::Conflict(format!("read {path}: {error}")))?
         };
         if cached.map(|entry| entry.content_hash.as_str()) != Some(content_hash.as_str()) {
             changed.insert(path.clone(), content_hash.clone());

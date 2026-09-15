@@ -10,7 +10,7 @@ readme.workspace = true
 
 [dependencies]
 whipplescript-core = { version = "0.5.6", path = "../whipplescript-core" }
-rusqlite = { version = "0.40.1", features = ["bundled", "functions"], optional = true }
+rusqlite = { version = "0.40.1", features = ["blob", "bundled", "functions"], optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1.0.145"
 sha2 = "0.11"
@@ -37,7 +37,7 @@ native = ["dep:rusqlite"]
 # authority proves a read states the position its value was read at rather
 # than racing a concurrent advance. Test-only: the production feature set
 # above is unchanged.
-rusqlite = { version = "0.40.1", features = ["bundled", "functions", "hooks"] }
+rusqlite = { version = "0.40.1", features = ["blob", "bundled", "functions", "hooks"] }
 
 [lints]
 workspace = true

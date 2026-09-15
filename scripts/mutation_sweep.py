@@ -147,6 +147,31 @@ PRINT_MACRO = re.compile(r"\b(?:eprintln|println|eprint|print)!\s*\(")
 ARM_BOUNDARY = re.compile(r"=>\s*\{\s*$|^\s*\}")
 TEST_CFG = re.compile(r'^#\[cfg\((?:test|all\(test,\s*[^()]*\))\)\]$')
 
+# A test FUNCTION is test scaffolding just as a `#[cfg(test)]` item is, and it
+# has to be recognised separately: a file reached by `#[path]` from a
+# `#[cfg(test)] mod` carries no `#[cfg(test)]` of its own, so every
+# `crates/*/src/*_tests/tests/*.rs` read as production code. A refusal-shaped
+# line in a test — an `Err(..)` fed to an assertion, a fixture error — then
+# demanded a test of its own, which is a test for a test.
+TEST_FN = re.compile(r"^#\[(?:tokio::|async_std::)?test\b")
+
+# A raw string's opening and closing delimiters. `cfg_test_extent` finds an
+# item's end by matching the closing brace at its indentation column, which is
+# unambiguous in rustfmt'd Rust and defeated by a brace inside a string: a test
+# fixture holding WhippleScript source puts a column-zero `}` in the middle of a
+# test module, the skip ends there, and every test below reads as production.
+# Tracking raw strings is far short of a lexer and covers where embedded source
+# actually lives.
+#
+# At least ONE hash is required, and that is the whole safety margin. Allowing
+# zero hashes matches `r"` wherever those two characters happen to sit inside an
+# ordinary string — `"protocol_error"` ends in exactly that — which opens a raw
+# string that never closes and silently swallows every refusal below it in the
+# file. Measured: that variant hid a real `TransportError::Protocol` refusal in
+# `whipplescript-custody`. Embedded source fixtures are written `r#"..."#`, so
+# requiring a hash keeps the case this exists for and drops the false one.
+RAW_STRING_OPEN = re.compile(r'r(#+)"')
+
 # The brace form is a PATTERN, not a construction, when it binds rather than
 # supplies: `RestoreDecision::Refused { .. }` and
 # `AdvanceOutcome::Rejected { ref current, .. }` both destructure. A construction
@@ -488,13 +513,28 @@ def find_sites(lines: list[str]) -> list[Site]:
     """
     sites: list[Site] = []
     skip_until: str | None = None
+    # Hashes of the raw string currently open, or None outside one. A line
+    # inside a raw string is data: it can neither close an item nor hold a
+    # refusal.
+    raw_hashes: str | None = None
     for index, line in enumerate(lines):
+        if raw_hashes is not None:
+            if '"' + raw_hashes in line:
+                raw_hashes = None
+            continue
+        opened = RAW_STRING_OPEN.search(line)
+        if opened is not None:
+            hashes = opened.group(1)
+            # A raw string that also closes on this line leaves nothing open.
+            if '"' + hashes not in line[opened.end() :]:
+                raw_hashes = hashes
+                continue
         if skip_until is not None:
             if line.rstrip() == skip_until:
                 skip_until = None
             continue
         stripped = line.strip()
-        if TEST_CFG.match(stripped):
+        if TEST_CFG.match(stripped) or TEST_FN.match(stripped):
             skip_until = cfg_test_extent(lines, index)
             continue
         marked = REFUSAL_MARKER.match(line)

@@ -53,6 +53,62 @@ pub(crate) fn max_blob_bytes() -> u64 {
         .unwrap_or(DEFAULT_MAX_BLOB_BYTES)
 }
 
+/// How much of a file a streaming read holds at once. Small enough that the
+/// resident cost of importing a recording does not scale with the recording,
+/// large enough that a 512 MiB file is not two thousand syscalls.
+#[cfg(feature = "native")]
+const STREAM_WINDOW_BYTES: usize = 256 * 1024;
+
+/// Below this, `put_file` reads the file whole.
+///
+/// Streaming is not free: it walks the file twice (once to learn its identity,
+/// once to write it) and stores the body as a BLOB rather than as TEXT,
+/// because SQLite's incremental blob interface writes into a `zeroblob` and a
+/// zeroblob is a BLOB. Neither cost matters for a recording; both matter for
+/// the thousands of small source files a workspace import actually walks,
+/// where a `.dump` turning into hex is a real loss for no gain. So the small
+/// files keep the path they had, byte for byte and column type for column
+/// type, and only the files that were the problem take the new one.
+#[cfg(feature = "native")]
+const STREAMED_PUT_MIN_BYTES: u64 = 4 * 1024 * 1024;
+
+/// The identity `content_hash_hex` gives these bytes, taken over a file
+/// without ever holding it whole.
+///
+/// Byte-identical to `chunking::content_hash_hex` by construction — same
+/// digest, same truncation, same encoding — and a test holds the two to it.
+/// That equality is the whole point: import compares this against what the
+/// content store returns, so a scan that hashed differently from a put would
+/// report every file as moving under it.
+#[cfg(feature = "native")]
+pub(crate) fn content_hash_file(path: &Path) -> std::io::Result<String> {
+    use sha2::Digest as _;
+    use std::io::Read as _;
+
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = sha2::Sha256::new();
+    let mut window = vec![0u8; STREAM_WINDOW_BYTES];
+    loop {
+        let read = file.read(&mut window)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&window[..read]);
+    }
+    Ok(truncated_hex(&hasher.finalize()))
+}
+
+/// SHA-256/128, hex — the tail of the house content-id primitive, shared by
+/// the streaming hasher and its verifier so they cannot encode differently.
+#[cfg(feature = "native")]
+fn truncated_hex(digest: &[u8]) -> String {
+    let mut hex = String::with_capacity(32);
+    for byte in &digest[..16] {
+        hex.push_str(&format!("{byte:02x}"));
+    }
+    hex
+}
+
 /// A read taken by a caller that wants text. `Binary` is not an error and
 /// not an absence: the blob is present and readable, and simply is not text.
 /// Callers that cannot act on bytes escalate on this arm rather than
@@ -165,6 +221,23 @@ pub trait ContentBlobs {
     /// Store UTF-8 text. The text tier over the byte seam.
     fn put_text(&self, body: &str) -> crate::StoreResult<String> {
         self.put(body.as_bytes())
+    }
+    /// Store a file's bytes, returning the same content id `put` would give
+    /// them.
+    ///
+    /// The seam exists so a store that can write incrementally never has to be
+    /// handed the whole file. The default cannot, so it reads and delegates —
+    /// which is exactly what every caller did before this method existed, so
+    /// no implementation has to change to keep working. Wrapping stores
+    /// (`ReadThrough`, `PreparedBlobs`) deliberately inherit the default:
+    /// their interception is the point, and a wrapper that streamed past it
+    /// would be a wrapper that did not run.
+    #[cfg(feature = "native")]
+    fn put_file(&self, path: &Path) -> crate::StoreResult<String> {
+        let bytes = std::fs::read(path).map_err(|error| {
+            crate::StoreError::Conflict(format!("read {}: {error}", path.display()))
+        })?;
+        self.put(&bytes)
     }
     /// Read a blob that the caller intends to treat as text.
     ///
@@ -488,6 +561,118 @@ impl ContentStore {
         ContentBlobs::put(self, body.as_bytes())
     }
 
+    /// Store a file's bytes through the byte seam.
+    pub fn put_file(&self, path: &Path) -> StoreResult<String> {
+        ContentBlobs::put_file(self, path)
+    }
+
+    /// Write a file into one blob row without holding it in memory.
+    ///
+    /// Two passes, and the second one is the guarantee. The first learns the
+    /// file's identity so the row can be keyed and a file already stored can
+    /// be skipped without writing anything. The second copies the bytes into
+    /// the row through SQLite's incremental blob interface *and hashes them
+    /// again*, because between the two passes the file could have changed and
+    /// the row would then hold bytes its own id does not describe — content
+    /// corruption that dedup would serve forever after. The whole-read path
+    /// never had that window (it hashed what it stored, in one act), so
+    /// streaming has to close it explicitly rather than inherit it.
+    ///
+    /// A mismatch, a short file, or a grown one all roll the transaction back,
+    /// so a row exists only once its bytes are complete and correct. `retry`
+    /// is honest advice: the file moved under an import, and the next scan
+    /// will see whatever it settled on.
+    ///
+    /// **This is not yet constant memory, and the reason is worth writing
+    /// down.** SQLite keeps a `zeroblob` unmaterialized only while it is the
+    /// last value in the record; `content_blobs` orders `body` ahead of
+    /// `byte_len` and `created_at`, so the insert builds the row in full and
+    /// costs one buffer the size of the file. Measured: a table with the body
+    /// last takes 3 MB to insert an 80 MiB zeroblob, the same table with two
+    /// columns after it takes 160 MB. What this removes is the other two
+    /// copies — the scan's read and the import's read — so importing an 80 MiB
+    /// file grew the resident peak by 82 MB where it grew by 161 MB before.
+    /// Making it O(1) means putting `body` last, which is a table rebuild and
+    /// a schema version, and belongs to its own change rather than to this
+    /// one. The seam is already in the right place for it: nothing outside
+    /// this function would move.
+    fn put_file_streamed(&self, path: &Path, byte_len: u64) -> StoreResult<String> {
+        use sha2::Digest as _;
+        use std::io::{Read as _, Write as _};
+
+        let id = content_hash_file(path).map_err(|error| {
+            crate::StoreError::Conflict(format!("hash {}: {error}", path.display()))
+        })?;
+        if self.holds_loose(&id)? {
+            return Ok(id);
+        }
+
+        let transaction = rusqlite::Transaction::new_unchecked(
+            &self.connection,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
+        // Re-asked under the write lock: another writer may have stored these
+        // bytes while we were hashing them.
+        if !self.holds_loose(&id)? {
+            self.connection.execute(
+                "INSERT INTO content_blobs (id, body, byte_len, created_at) \
+                 VALUES (?1, zeroblob(?2), ?2, datetime('now'))",
+                params![id, byte_len as i64],
+            )?;
+            let rowid = self.connection.last_insert_rowid();
+            let mut file = std::fs::File::open(path).map_err(|error| {
+                crate::StoreError::Conflict(format!("read back {}: {error}", path.display()))
+            })?;
+            let mut blob = self.connection.blob_open(
+                rusqlite::MAIN_DB,
+                "content_blobs",
+                "body",
+                rowid,
+                false,
+            )?;
+            let mut hasher = sha2::Sha256::new();
+            let mut window = vec![0u8; STREAM_WINDOW_BYTES];
+            let mut written: u64 = 0;
+            loop {
+                let read = file.read(&mut window).map_err(|error| {
+                    crate::StoreError::Conflict(format!("read back {}: {error}", path.display()))
+                })?;
+                if read == 0 {
+                    break;
+                }
+                // A file that grew past the row we sized for fails here, which
+                // is the rollback we want.
+                blob.write_all(&window[..read]).map_err(|error| {
+                    crate::StoreError::Conflict(format!(
+                        "content grew under the import of {}: {error}; retry",
+                        path.display()
+                    ))
+                })?;
+                hasher.update(&window[..read]);
+                written += read as u64;
+            }
+            drop(blob);
+            if written != byte_len || truncated_hex(&hasher.finalize()) != id {
+                return Err(crate::StoreError::Conflict(format!(
+                    "content moved under the import of {}; retry",
+                    path.display()
+                )));
+            }
+        }
+        transaction.commit()?;
+        Ok(id)
+    }
+
+    /// Whether these bytes already live in a plain row. Deliberately not
+    /// `status`: a streamed put is asking whether it may skip writing, and the
+    /// answer for a packed or chunked id is that it may not.
+    fn holds_loose(&self, id: &str) -> StoreResult<bool> {
+        Ok(self
+            .connection
+            .prepare_cached("SELECT EXISTS(SELECT 1 FROM content_blobs WHERE id = ?1)")?
+            .query_row(params![id], |row| row.get(0))?)
+    }
+
     /// Load authoritative roots and collect under the publication exclusion.
     /// A caller-supplied earlier snapshot could miss a newly published cut.
     /// Erasure tombstones are a
@@ -593,6 +778,29 @@ impl ContentBlobs for ContentStore {
             };
         }
         Ok(id)
+    }
+
+    /// A large file goes to disk without passing through memory; a small one
+    /// keeps the path it had.
+    ///
+    /// Protected stores are excluded, and not as an oversight. `put` seals a
+    /// body with `protection.seal`, which takes the whole body: sealing
+    /// incrementally is a different construction (a streaming AEAD), not a
+    /// smaller buffer, and pretending otherwise here would have written
+    /// unsealed bytes into a store whose whole premise is that it holds none.
+    fn put_file(&self, path: &Path) -> StoreResult<String> {
+        let byte_len = std::fs::metadata(path)
+            .map_err(|error| {
+                crate::StoreError::Conflict(format!("stat {}: {error}", path.display()))
+            })?
+            .len();
+        if self.protection.is_some() || byte_len <= STREAMED_PUT_MIN_BYTES {
+            let bytes = std::fs::read(path).map_err(|error| {
+                crate::StoreError::Conflict(format!("read {}: {error}", path.display()))
+            })?;
+            return self.put(&bytes);
+        }
+        self.put_file_streamed(path, byte_len)
     }
 
     /// Reads are transparent over the whole tier: a plain blob row, a
@@ -1371,6 +1579,135 @@ mod tests {
                 erased_at: &row.erased_at,
             })
             .collect()
+    }
+
+    /// A file large enough that `put_file` streams it, filled with bytes no
+    /// compressor or UTF-8 validator would mistake for text.
+    fn streamable_bytes(seed: u8) -> Vec<u8> {
+        let len = (STREAMED_PUT_MIN_BYTES as usize) + STREAM_WINDOW_BYTES + 7;
+        (0..len).map(|index| (index as u8) ^ seed ^ 0x80).collect()
+    }
+
+    fn scratch_file(label: &str, body: &[u8]) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "whip-put-file-{label}-{}-{}.bin",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::write(&path, body).expect("seed");
+        path
+    }
+
+    /// The identity claim the whole change rests on: hashing a file a window at
+    /// a time gives exactly what hashing its bytes in one go gives. Import
+    /// compares a scan's hash against a put's id, so if these two could differ
+    /// the store would report every file as moving under it.
+    #[test]
+    fn a_streamed_hash_is_the_same_identity_as_a_whole_one() {
+        for body in [
+            Vec::new(),
+            b"short".to_vec(),
+            vec![0u8; STREAM_WINDOW_BYTES],
+            streamable_bytes(0x5a),
+        ] {
+            let path = scratch_file("identity", &body);
+            assert_eq!(
+                content_hash_file(&path).expect("hash"),
+                crate::chunking::content_hash_hex(&body),
+                "{} bytes",
+                body.len()
+            );
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+
+    /// The round trip that matters to a person who uploaded a recording: the
+    /// bytes come back, and they come back under the id the buffered path
+    /// would have given them, so nothing upstream can tell which path ran.
+    #[test]
+    fn a_streamed_file_stores_and_reads_back_byte_identical() {
+        let (_db, store) = ledger_store("streamed-round-trip");
+        let body = streamable_bytes(0x11);
+        let path = scratch_file("round-trip", &body);
+
+        let id = store.put_file(&path).expect("stores");
+        assert_eq!(id, crate::chunking::content_hash_hex(&body));
+        assert_eq!(store.get(&id).expect("reads"), Some(body.clone()));
+        assert!(
+            matches!(store.status(&id).expect("status"), BlobStatus::Live { byte_len } if byte_len == body.len() as u64)
+        );
+
+        // Storing the same file again is the dedup path — it must not write a
+        // second row or disturb the first.
+        assert_eq!(store.put_file(&path).expect("stores again"), id);
+        assert_eq!(store.get(&id).expect("reads"), Some(body));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Streaming walks the file twice, so the bytes it writes are not the bytes
+    /// it hashed unless nothing moved in between. A row whose id does not
+    /// describe its body is corruption dedup would serve forever, so the write
+    /// pass hashes too and a mismatch must leave the store exactly as it was.
+    ///
+    /// Both arms are driven by lying about the length, which is what a file
+    /// that shrank or grew under the import looks like from inside the write.
+    #[test]
+    fn content_moving_under_a_streamed_put_stores_nothing() {
+        let (_db, store) = ledger_store("streamed-moved");
+        let body = streamable_bytes(0x22);
+        let path = scratch_file("moved", &body);
+        let id = crate::chunking::content_hash_hex(&body);
+
+        // Shrank: the row was sized for more than the file had to give.
+        let refused = store.put_file_streamed(&path, body.len() as u64 + 4096);
+        assert!(refused.is_err(), "a short file is refused");
+        assert_eq!(store.get(&id).expect("reads"), None, "and stores nothing");
+
+        // Grew: the write runs off the end of the row it was given.
+        let refused = store.put_file_streamed(&path, body.len() as u64 - 4096);
+        assert!(refused.is_err(), "a long file is refused");
+        assert_eq!(store.get(&id).expect("reads"), None, "and stores nothing");
+
+        // The honest length still works, which proves the two refusals were
+        // about the mismatch and not about the path.
+        assert_eq!(
+            store
+                .put_file_streamed(&path, body.len() as u64)
+                .expect("stores"),
+            id
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The threshold is a real seam, not a tuning knob: below it a file keeps
+    /// the TEXT representation `put` gives it, because that is what makes a
+    /// `.dump` of a source tree readable. Above it the body is a BLOB, which
+    /// is what SQLite's incremental blob interface can write.
+    #[test]
+    fn the_threshold_decides_the_stored_representation() {
+        let (_db, store) = ledger_store("streamed-representation");
+        let small = scratch_file("small", b"a source file");
+        let large = scratch_file("large", &streamable_bytes(0x33));
+
+        let small_id = store.put_file(&small).expect("stores");
+        let large_id = store.put_file(&large).expect("stores");
+        let representation = |id: &str| -> String {
+            store
+                .connection
+                .query_row(
+                    "SELECT typeof(body) FROM content_blobs WHERE id = ?1",
+                    params![id],
+                    |row| row.get::<_, String>(0),
+                )
+                .expect("row")
+        };
+        assert_eq!(representation(&small_id), "text");
+        assert_eq!(representation(&large_id), "blob");
+        let _ = std::fs::remove_file(&small);
+        let _ = std::fs::remove_file(&large);
     }
 
     fn ledger_store(label: &str) -> (std::path::PathBuf, ContentStore) {

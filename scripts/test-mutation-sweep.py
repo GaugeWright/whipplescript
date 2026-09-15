@@ -215,5 +215,76 @@ class CalibrationTests(unittest.TestCase):
             self.assertNotEqual(observed[0], observed[1])
 
 
+
+class TestScaffoldingIsNotARefusalTests(unittest.TestCase):
+    """Two ways test code used to read as production, and be asked to pin itself."""
+
+    def test_a_test_fn_body_is_not_swept(self):
+        # A file reached by `#[path]` from a `#[cfg(test)] mod` carries no
+        # `#[cfg(test)]` of its own, so every `*_tests/tests/*.rs` read as
+        # production and a fixture error inside a test demanded a test.
+        lines = [
+            "fn production(v: u8) -> Result<u8, String> {",
+            "    if v == 0 {",
+            '        return Err("production refusal".to_owned());',
+            "    }",
+            "    Ok(v)",
+            "}",
+            "",
+            "#[test]",
+            "fn a_zero_is_refused() {",
+            '    let refused = production(0).expect_err("zero is refused");',
+            '    assert!(refused.contains("production refusal"));',
+            "}",
+        ]
+        found = [site.line for site in sweep.find_sites(lines)]
+        self.assertIn(3, found, "the production refusal must still be swept")
+        self.assertNotIn(
+            10, found, "a refusal-shaped line inside a #[test] fn is scaffolding"
+        )
+
+    def test_a_brace_inside_a_raw_string_does_not_end_a_test_module(self):
+        # A test fixture holding embedded source puts a column-zero `}` in the
+        # middle of a test module. Matching the closing brace textually ended
+        # the skip there, and every test below read as production.
+        lines = [
+            "#[cfg(test)]",
+            "mod tests {",
+            '    const PROGRAM: &str = r#"',
+            "rule react {",
+            "  when thing",
+            "}",
+            '"#;',
+            "",
+            "    #[test]",
+            "    fn a_fixture_error_is_not_a_refusal() {",
+            '        let e = Err("no images in this test".to_owned());',
+            "        assert!(e.is_err());",
+            "    }",
+            "}",
+        ]
+        self.assertEqual(
+            sweep.find_sites(lines),
+            [],
+            "nothing inside a test module is a refusal, whatever its fixtures contain",
+        )
+
+    def test_a_quote_after_an_r_does_not_open_a_raw_string(self):
+        # The safety margin on the raw-string rule. `"protocol_error"` ends in
+        # exactly `r"`, and reading that as a raw-string opener swallowed every
+        # refusal below it — it hid a real transport refusal when measured.
+        lines = [
+            'fn parse(value: &Value) -> Result<(), TransportError> {',
+            '    if let Some(detail) = value.get("protocol_error") {',
+            "        return Err(TransportError::Protocol(detail.to_string()));",
+            "    }",
+            "    Ok(())",
+            "}",
+        ]
+        found = [site.line for site in sweep.find_sites(lines)]
+        self.assertIn(
+            3, found, "a refusal below an ordinary string must still be swept"
+        )
+
 if __name__ == '__main__':
     unittest.main()

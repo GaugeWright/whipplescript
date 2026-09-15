@@ -275,9 +275,13 @@ pub fn import_scratch(
         // single non-UTF-8 file failed the whole import, taking the diff and
         // the cut with it. Text keeps its identity: the digest was always
         // taken over the bytes.
-        let bytes = std::fs::read(root.join(relative))
-            .map_err(|error| StoreError::Conflict(format!("read back {relative}: {error}")))?;
-        let stored = content.put(&bytes)?;
+        // Never `read` + `put`: a worktree holds recordings now, and reading
+        // one whole to hand it to a store that will write it whole made the
+        // resident cost of finalizing a turn scale with the largest file in
+        // the tree. `put_file` lets a store that can write incrementally do
+        // so; the ones that cannot read the file themselves, which is what
+        // this line used to do anyway.
+        let stored = content.put_file(&root.join(relative))?;
         if &stored != hash {
             return Err(StoreError::Conflict(format!(
                 "content moved under the import of {relative}; retry"
@@ -474,6 +478,32 @@ mod tests {
             );
         }
         let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    /// A recording in the worktree: bigger than the streaming threshold, not
+    /// text, and it has to import under exactly the identity a whole read
+    /// would have given it. The manifest records one hash per file and nothing
+    /// upstream knows which path the store took, so if these diverged a
+    /// workspace would report the file as changed on every scan forever.
+    #[test]
+    fn a_file_past_the_streaming_threshold_imports_under_the_same_identity() {
+        let content = content("streamed-import");
+        let root = scratch_root("streamed-import-dir");
+        let scratch = materialize_manifest(&BTreeMap::new(), &content, &root, now_nanos())
+            .expect("materialize");
+
+        let body: Vec<u8> = (0..(6 * 1024 * 1024 + 13))
+            .map(|index| (index as u8) ^ 0x80)
+            .collect();
+        std::fs::write(root.join("take.wav"), &body).expect("a person adds a recording");
+
+        let import = import_scratch(&root, &scratch, &content, now_nanos() + 2_000_000_000)
+            .expect("imports");
+        let expected = crate::chunking::content_hash_hex(&body);
+        assert_eq!(import.changed.get("take.wav"), Some(&expected));
+        assert_eq!(content.get(&expected).expect("reads"), Some(body));
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// The import's identity check. `import_scratch` scans for changed files,
