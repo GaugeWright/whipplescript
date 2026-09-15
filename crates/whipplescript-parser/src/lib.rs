@@ -2635,6 +2635,27 @@ pub enum IrExecTarget {
     Capability { name: String },
 }
 
+impl IrExecTarget {
+    /// The principal handle this exec runs as: `script:<name>` for a pinned,
+    /// hash-verified manifest capability, `exec:raw` for an arbitrary dev
+    /// command — the executor DR-0046 checks a `from` clearance against, and
+    /// the door the IFC surface lists.
+    ///
+    /// One spelling, because the checker's two sides both need it and both
+    /// used to write it out: the parser spelled it into `IrEffectNode::resource`
+    /// and the kernel spelled it again in `output_tokens_for_root`, kept in
+    /// step by a comment asking the next editor to notice. A handle that is
+    /// `script:deploy` on one side and anything else on the other is two
+    /// principals, and governance would clear one while the checker judged the
+    /// other.
+    pub fn principal(&self) -> String {
+        match self {
+            IrExecTarget::Raw => "exec:raw".to_owned(),
+            IrExecTarget::Capability { name } => format!("script:{name}"),
+        }
+    }
+}
+
 /// The payload of a `request` effect (DR-0053 §5).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct IrHttpRequest {
@@ -16400,12 +16421,12 @@ fn resource_for_body(
             acquire_binding, ..
         } => binding_resources.get(acquire_binding).cloned(),
         // An exec ships argv and stdin to a process and reads stdout back. The
-        // resource is spelled exactly as `output_tokens_for_root` already
-        // spells it, so the two sides of the checker name one thing.
-        body::BodyEffectKind::Exec { target, .. } => Some(match target {
-            body::ExecTarget::Capability { name, .. } => format!("script:{name}"),
-            body::ExecTarget::RawCommand(_) => "exec:raw".to_owned(),
-        }),
+        // resource is the executor's principal handle, spelled by the one
+        // function that spells it (`IrExecTarget::principal`), so the two sides
+        // of the checker cannot name different things.
+        body::BodyEffectKind::Exec { .. } => {
+            exec_target_for_body(kind).map(|target| target.principal())
+        }
         // A child workflow is an egress of its payload and a read of its
         // result. `invoke:<name>` is the envelope's own spelling for a workflow
         // endpoint — `is_internal_workflow` already keys it that way.

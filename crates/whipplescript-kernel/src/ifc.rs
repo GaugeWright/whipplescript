@@ -3527,7 +3527,12 @@ fn coerce_egress_principal<'a>(ir: &'a IrProgram, effect: &'a IrEffectNode) -> &
 /// no egress check, no endpoint in the surface — while it reaches the same
 /// model as one naming the kind directly. Every provider-principal site goes
 /// through here so they cannot disagree.
-fn agent_provider_kind<'a>(
+///
+/// `pub` because that claim has to hold ACROSS crates to mean anything: the CLI
+/// kept a private `resolved_agent_provider_kind` with an identical body, which
+/// is how the harness-bound case above came to be known on one side and not the
+/// other. Two copies agreeing today is not the same as one answer.
+pub fn agent_provider_kind<'a>(
     ir: &'a IrProgram,
     agent: &'a whipplescript_parser::IrAgent,
 ) -> Option<&'a str> {
@@ -4597,12 +4602,13 @@ fn output_tokens_for_root(
             }
         }
         IrEffectKind::ExecCommand => {
-            let handle = match &effect.exec_target {
-                Some(whipplescript_parser::IrExecTarget::Capability { name }) => {
-                    format!("script:{name}")
-                }
-                _ => "exec:raw".to_owned(),
-            };
+            // `None` cannot happen for an exec node, and an exec vouched by
+            // nobody is the honest reading if it ever did.
+            let handle = effect
+                .exec_target
+                .as_ref()
+                .map(whipplescript_parser::IrExecTarget::principal)
+                .unwrap_or_else(|| whipplescript_parser::IrExecTarget::Raw.principal());
             out.push((handle, crossed));
         }
         // Everything else is not an effect OUTPUT: the binding it produces
@@ -6128,6 +6134,22 @@ pub fn ifc_surface(ir: &IrProgram) -> Vec<String> {
                 {
                     surface.insert(provider.to_owned());
                 }
+            }
+            // A `coerce`/`decide`/`prompt` ships its interpolated prompt to a
+            // model endpoint, which `check_with_envelope` judges as a principal
+            // exactly as it judges a turn's. The surface listed the turn's door
+            // and not this one, so a workflow that sent governed data to a model
+            // could report that it opened no model door at all.
+            //
+            // The cost was not only the report. A `@tool` producer attests this
+            // list and the consumer denies any import whose surface holds a door
+            // its envelope does not govern (DR-0029 X1/X8) — so a package that
+            // coerced to an endpoint the consumer never cleared declared no such
+            // door, and the import passed. The un-named backend is a door too:
+            // `model` is what governance labels for it, and a workflow reaching
+            // whatever the ladder resolves has still opened one.
+            if effect.kind == IrEffectKind::SchemaCoerce {
+                surface.insert(coerce_egress_principal(ir, effect).to_owned());
             }
         }
         for write in &rule.metadata.fact_writes {
@@ -12368,6 +12390,120 @@ workflow Child {
                 "surface should include `{expected}`, got: {surface:?}"
             );
         }
+    }
+
+    /// The surface's own contract is that it "mirrors the resource collection
+    /// of `check_with_envelope`". A `coerce`/`decide`/`prompt` egress is a door
+    /// the checker judges against a model principal, and the surface listed the
+    /// turn's provider door and not this one — so a workflow shipping governed
+    /// data to a model could report that it opened no model door at all.
+    #[test]
+    fn ifc_surface_lists_the_model_endpoint_a_coerce_reaches() {
+        let program = r##"@service
+workflow CoerceSurface
+
+output result R
+class R { ok bool }
+class Ticket { id string  status "open" }
+class Verdict { choice "yes" | "no" }
+
+coerce judge(text string) -> Verdict {
+  prompt """markdown
+  Judge {{ text }}
+  """
+  provider onprem-llm
+}
+
+coerce unpinned(text string) -> Verdict {
+  prompt """markdown
+  Judge {{ text }}
+  """
+}
+
+table seed as Ticket [ { id "T1"  status "open" } ]
+
+rule work
+  when Ticket as ticket where ticket.status == "open"
+=> {
+  coerce judge(ticket.id) as declared
+  prompt "Summarize {{ ticket.id }}." using acme-cloud as inline
+  coerce unpinned(ticket.id) as ladder
+  after declared succeeds as v {
+    complete result { ok true }
+  }
+}
+"##;
+        let ir = compile_program(program).ir.expect("compiles");
+        let surface = ifc_surface(&ir);
+        for expected in [
+            // the declaration's `provider` clause
+            "onprem-llm",
+            // the inline prompt's `using` clause
+            "acme-cloud",
+            // and the un-named backend, which is still a door: reaching
+            // whatever the ladder resolves is reaching something
+            "model",
+        ] {
+            assert!(
+                surface.iter().any(|door| door == expected),
+                "surface should list the endpoint `{expected}`, got: {surface:?}"
+            );
+        }
+    }
+
+    /// Why it mattered beyond the report. A `@tool` producer attests its
+    /// surface and the consumer denies any import holding a door its envelope
+    /// does not govern (DR-0029 X1/X8). A package that coerced to an endpoint
+    /// the consumer never cleared declared no such door, so the import passed
+    /// and the model egress crossed the package boundary ungoverned.
+    #[test]
+    fn an_imported_tool_that_coerces_declares_its_model_door() {
+        let program = r##"@service
+workflow ToolLike
+
+output result R
+class R { ok bool }
+class Ticket { id string  status "open" }
+class Verdict { choice "yes" | "no" }
+
+coerce judge(text string) -> Verdict {
+  prompt """markdown
+  Judge {{ text }}
+  """
+  provider acme-cloud
+}
+
+table seed as Ticket [ { id "T1"  status "open" } ]
+
+rule work
+  when Ticket as ticket where ticket.status == "open"
+=> {
+  coerce judge(ticket.id) as v
+  after v succeeds as got {
+    complete result { ok true }
+  }
+}
+"##;
+        let ir = compile_program(program).ir.expect("compiles");
+        let declared = ifc_surface(&ir);
+
+        // A consumer whose envelope governs the tool's data but has never heard
+        // of the endpoint it sends that data to.
+        let envelope =
+            Envelope::from_json(r#"{ "resources": { "fact:Ticket": { "reader": "Operator" } } }"#)
+                .expect("valid");
+        let verified = VerifiedEnvelope::for_test(envelope);
+        let imported = vec![("Judge".to_owned(), declared)];
+        let gaps = imported_surface_gaps(&imported, &verified);
+        let tool = gaps
+            .iter()
+            .find(|(tool, _)| *tool == "Judge")
+            .expect("the tool opens an ungoverned door");
+        assert!(
+            tool.1.contains(&"acme-cloud"),
+            "the ungoverned model endpoint must be one of the denied doors, got: {:?}",
+            tool.1
+        );
     }
 
     #[test]

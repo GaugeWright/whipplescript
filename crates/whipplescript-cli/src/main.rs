@@ -3090,20 +3090,15 @@ fn lint_deep_after_nesting(ir: &IrProgram) -> Vec<LintFinding> {
 /// codex/claude/fixture agent is dead — it can never be invoked — so flag it.
 /// Resolving the harness kind keeps this zero-false-positive on `using` agents.
 fn lint_tool_grant_requires_owned_harness(ir: &IrProgram) -> Vec<LintFinding> {
-    let harness_is_owned = |name: &str| {
-        ir.harnesses
-            .iter()
-            .find(|harness| harness.name == name)
-            .map(|harness| harness.kind == "owned")
-            .unwrap_or(false)
-    };
     ir.agents
         .iter()
         .filter(|agent| !agent.tools.is_empty())
+        // The same resolver the egress doors use, rather than a third inline
+        // copy of "direct `provider`, else the harness's kind": a lint that
+        // disagrees with the checker about which endpoint an agent reaches is
+        // a lint about a different program.
         .filter(|agent| {
-            let direct_owned = agent.provider.as_deref() == Some("owned");
-            let harness_owned = agent.harness.as_deref().is_some_and(harness_is_owned);
-            !direct_owned && !harness_owned
+            whipplescript_kernel::ifc::agent_provider_kind(ir, agent) != Some("owned")
         })
         .map(|agent| LintFinding {
             code: lint_diagnostic_code!("lint.tool_grant_requires_owned_harness"),
@@ -41649,20 +41644,6 @@ fn agent_provider_kind_diagnostics(
 /// The provider kind one agent resolves to: a direct `provider`/`delegated to`
 /// binding (the parser also defaults bare managed agents to `owned`), or the
 /// kind of the bound `using <harness>` declaration.
-fn resolved_agent_provider_kind<'a>(
-    ir: &'a IrProgram,
-    agent: &'a whipplescript_parser::IrAgent,
-) -> Option<&'a str> {
-    agent.provider.as_deref().or_else(|| {
-        agent.harness.as_deref().and_then(|name| {
-            ir.harnesses
-                .iter()
-                .find(|harness| harness.name == name)
-                .map(|harness| harness.kind.as_str())
-        })
-    })
-}
-
 /// `requires [<feature.class>]` vs the selected provider's accepted feature
 /// report (spec/std-agent.md "Static checks" 2, slice 6): a required class the
 /// report cannot truthfully state as supported (`native`/`emulated`) is an
@@ -41676,7 +41657,7 @@ fn agent_requires_diagnostics(ir: &IrProgram) -> Vec<Diagnostic> {
         if agent.requires.is_empty() {
             continue;
         }
-        let Some(kind) = resolved_agent_provider_kind(ir, agent) else {
+        let Some(kind) = whipplescript_kernel::ifc::agent_provider_kind(ir, agent) else {
             continue;
         };
         let report = agent_feature_report(kind);
@@ -41726,7 +41707,7 @@ fn lint_agent_requires_probed_source(ir: &IrProgram) -> Vec<LintFinding> {
     use whipplescript_kernel::agent_profile::{agent_feature_report, FeatureReportSource};
     let mut findings = Vec::new();
     for agent in &ir.agents {
-        let Some(kind) = resolved_agent_provider_kind(ir, agent) else {
+        let Some(kind) = whipplescript_kernel::ifc::agent_provider_kind(ir, agent) else {
             continue;
         };
         let Some(report) = agent_feature_report(kind) else {
