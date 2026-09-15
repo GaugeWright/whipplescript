@@ -2559,9 +2559,41 @@ fn meet_integrity(a: CarriedIntegrity, b: CarriedIntegrity) -> CarriedIntegrity 
 /// The read sources of a rule (for computing the integrity its `emit`s carry): file
 /// reads, turn-grant reads, inbound message channels, signal triggers, and human
 /// answers — the same source recognition the rule-level join box uses.
+/// Every resource a rule READS: its effects' read resources and read grants, the
+/// channel/signal/FACT it is triggered by, and the facts its guards query.
+///
+/// The fact halves were missing, and one caller knew it. A rule triggered by
+/// `when <Fact>` reads that fact — the checker denies writing its data to a sink
+/// outside its readers — but this returned only channels and signals, so
+/// `carried_integrity_of_rule` re-collected the facts itself with a comment
+/// recording the omission. The two callers that publish a DR-0030 X2 flow
+/// SIGNATURE had no such compensation, so a `@tool` told its consumer that a
+/// result field carried the reads of a file store while the field WAS the
+/// triggering fact's data: the consumer inherited a label short of the truth and
+/// could write it to a sink the tool itself may not write to. The per-field
+/// path's fail-closed fallback is the whole-program read set, so even the
+/// conservative branch inherited the gap.
+///
+/// The trigger is matched the way [`ifc_surface`] matches it — off `schema_names`
+/// rather than off the `as` binding — so a bare `when <Fact>` with no binding is
+/// a read here too, and the door list and the read set cannot disagree about
+/// which facts a rule touches.
+/// The declared CLASS names of a program — the schemas a `when <Fact>` trigger
+/// can name. Enum schemas are not facts.
+fn schema_class_names(ir: &IrProgram) -> BTreeSet<&str> {
+    ir.schemas
+        .iter()
+        .filter_map(|schema| match schema {
+            whipplescript_parser::IrSchema::Class(class) => Some(class.name.as_str()),
+            whipplescript_parser::IrSchema::Enum(_) => None,
+        })
+        .collect()
+}
+
 fn rule_read_resources(
     rule: &IrRule,
     signal_names: &BTreeSet<&str>,
+    schema_names: &BTreeSet<&str>,
     shared_coordination: &BTreeSet<String>,
 ) -> Vec<String> {
     let mut reads: Vec<String> = Vec::new();
@@ -2587,7 +2619,15 @@ fn rule_read_resources(
         if let Some(name) = pattern.split_whitespace().next() {
             if signal_names.contains(name) {
                 reads.push(format!("signal:{name}"));
+            } else if schema_names.contains(name) && !pattern.starts_with("message from ") {
+                reads.push(format!("fact:{name}"));
             }
+        }
+    }
+    // A guard that QUERIES a fact is influenced by it exactly as a trigger is.
+    for read in &rule.metadata.projection_reads {
+        if matches!(read.kind, QueryKind::Fact) {
+            reads.push(format!("fact:{}", read.head));
         }
     }
     reads
@@ -2600,37 +2640,26 @@ fn carried_integrity_of_rule(
     envelope: &Envelope,
     rule: &IrRule,
     signal_names: &BTreeSet<&str>,
+    schema_names: &BTreeSet<&str>,
     shared_coordination: &BTreeSet<String>,
 ) -> CarriedIntegrity {
     let mut acc: CarriedIntegrity = None;
-    for src in rule_read_resources(rule, signal_names, shared_coordination) {
+    for src in rule_read_resources(rule, signal_names, schema_names, shared_coordination) {
+        // An UNGOVERNED fact stays inert on this axis. Its empty integrity set
+        // would otherwise drop the meet to untrusted, so a rule guarded on any
+        // unlabelled fact would emit a signal nothing could act on — the
+        // origin-aware posture of DR-0045, which the fact half of this walk used
+        // to carry itself. Every other read keeps the fail-closed empty set: an
+        // unlabelled STORE really is untrusted input.
+        if src.starts_with("fact:") && !envelope.governed.contains(envelope.resolve(&src)) {
+            continue;
+        }
         acc = meet_integrity(acc, Some(envelope.integrity_set(&src)));
     }
-    // DR-0044 follow-on: `rule_read_resources` covers file/grant/message/human/
-    // signal reads but NOT governed FACT triggers or guard-query facts, so an
-    // emitted internal signal did not carry the integrity of a fact the rule is
-    // triggered by or guards on — a rule steered by an untrusted fact would emit
-    // a signal that still read as trusted to its receivers. A firing is
-    // influenced by every fact it matches or queries, so meet those in too.
-    // Governed-filtered: an ungoverned `fact:X` stays inert (its empty integrity
-    // set would otherwise falsely drop the meet to untrusted — the origin-aware
-    // token posture, DR-0045), and the declared label is used (carriage is
-    // conservative; the reach refinement lives in the leak/inject loop).
-    let mut fact_schemas: BTreeSet<String> = when_binding_facts(rule)
-        .values()
-        .filter_map(|source| source.strip_prefix("schema:").map(str::to_owned))
-        .collect();
-    for read in &rule.metadata.projection_reads {
-        if matches!(read.kind, QueryKind::Fact) {
-            fact_schemas.insert(read.head.clone());
-        }
-    }
-    for schema in &fact_schemas {
-        let token = format!("fact:{schema}");
-        if envelope.governed.contains(envelope.resolve(&token)) {
-            acc = meet_integrity(acc, Some(envelope.integrity_set(&token)));
-        }
-    }
+    // DR-0044 follow-on: a firing is influenced by every fact it matches or
+    // queries, and those now arrive through the walk above rather than being
+    // re-collected here. The declared label is used; the reach refinement lives
+    // in the leak/inject loop, so carriage stays conservative.
     acc
 }
 
@@ -2665,14 +2694,20 @@ fn derived_signal_integrity(
     let mut derived: BTreeMap<String, CarriedIntegrity> = BTreeMap::new();
     for ir in programs {
         let signal_names: BTreeSet<&str> = ir.events.iter().map(|e| e.name.as_str()).collect();
+        let schema_names = schema_class_names(ir);
         let shared_coordination = shared_coordination_resources(ir);
         for rule in &ir.rules {
             let ports = emitted_signal_ports(rule);
             if ports.is_empty() {
                 continue;
             }
-            let carried =
-                carried_integrity_of_rule(envelope, rule, &signal_names, &shared_coordination);
+            let carried = carried_integrity_of_rule(
+                envelope,
+                rule,
+                &signal_names,
+                &schema_names,
+                &shared_coordination,
+            );
             for port in ports {
                 let merged = match derived.remove(&port) {
                     None => carried.clone(),
@@ -3976,12 +4011,14 @@ pub fn check_with_envelope(ir: &IrProgram, verified: &VerifiedEnvelope) -> Vec<D
 /// everything the tool reads).
 fn program_read_resources(ir: &IrProgram) -> Vec<String> {
     let signal_names: BTreeSet<&str> = ir.events.iter().map(|e| e.name.as_str()).collect();
+    let schema_names = schema_class_names(ir);
     let shared_coordination = shared_coordination_resources(ir);
     let mut reads: BTreeSet<String> = BTreeSet::new();
     for rule in &ir.rules {
         reads.extend(rule_read_resources(
             rule,
             &signal_names,
+            &schema_names,
             &shared_coordination,
         ));
     }
@@ -4037,6 +4074,7 @@ fn reach_reads_from(tool: &IrProgram, seed: BTreeSet<&str>) -> BTreeSet<String> 
         }
     }
     let signal_names: BTreeSet<&str> = tool.events.iter().map(|e| e.name.as_str()).collect();
+    let schema_names = schema_class_names(tool);
     let shared_coordination = shared_coordination_resources(tool);
     let mut reads: BTreeSet<String> = BTreeSet::new();
     for rule in &tool.rules {
@@ -4044,6 +4082,7 @@ fn reach_reads_from(tool: &IrProgram, seed: BTreeSet<&str>) -> BTreeSet<String> 
             reads.extend(rule_read_resources(
                 rule,
                 &signal_names,
+                &schema_names,
                 &shared_coordination,
             ));
         }
@@ -4077,6 +4116,7 @@ fn field_dependency_reads(
     select: fn(&IrRule) -> &FieldReadMap,
 ) -> Vec<(String, String, Vec<String>)> {
     let signal_names: BTreeSet<&str> = tool.events.iter().map(|e| e.name.as_str()).collect();
+    let schema_names = schema_class_names(tool);
     let shared_coordination = shared_coordination_resources(tool);
     // egress -> field -> reads, unioned across every emitting/completing rule.
     let mut per_field: BTreeMap<(String, String), BTreeSet<String>> = BTreeMap::new();
@@ -4085,9 +4125,10 @@ fn field_dependency_reads(
         if field_reads.is_empty() {
             continue;
         }
-        let own: BTreeSet<String> = rule_read_resources(rule, &signal_names, &shared_coordination)
-            .into_iter()
-            .collect();
+        let own: BTreeSet<String> =
+            rule_read_resources(rule, &signal_names, &schema_names, &shared_coordination)
+                .into_iter()
+                .collect();
         let when_facts = when_binding_facts(rule);
         for (egress, fields) in field_reads {
             for (field, roots) in fields {
@@ -6176,6 +6217,14 @@ pub fn ifc_surface(ir: &IrProgram) -> Vec<String> {
                 }
             }
         }
+        // A guard that QUERIES a fact reads it, and `rule_read_resources` counts
+        // it as a read — so it is a door on the checker's side and belongs here
+        // by this function's own contract.
+        for read in &rule.metadata.projection_reads {
+            if matches!(read.kind, QueryKind::Fact) {
+                surface.insert(format!("fact:{}", read.head));
+            }
+        }
     }
     surface.into_iter().collect()
 }
@@ -6372,19 +6421,16 @@ pub fn governance_report(ir: &IrProgram, verified: &VerifiedEnvelope) -> Governa
     }
     trusted_surface.sort();
     let violations = check_with_envelope(ir, verified).len();
-    let mut touched: BTreeSet<String> = BTreeSet::new();
-    let shared_coordination = shared_coordination_resources(ir);
-    for rule in &ir.rules {
-        for effect in &rule.metadata.effects {
-            if let Some(resource) = ifc_resource_for_effect(effect, &shared_coordination) {
-                touched.insert(resource.to_owned());
-            }
-            for grant in &effect.access_grants {
-                touched.insert(grant.resource.clone());
-            }
-        }
-    }
-    let coverage_gaps: Vec<String> = touched
+    // Every door, from the one function that enumerates them. This was a
+    // SECOND, narrower walk — `ifc_resource_for_effect` plus access grants and
+    // nothing else — so the risk list left out the model endpoint a turn or a
+    // coercion reaches, the `invoke:` door, the facts a rule writes, and the
+    // facts and signals it is triggered by. On a workflow opening five doors
+    // under an envelope governing none of them it named one, and the empty case
+    // of this list renders as "flagged risks: none (every touched resource is
+    // governed)" — which is the line an operator reads to decide they are
+    // covered.
+    let coverage_gaps: Vec<String> = ifc_surface(ir)
         .into_iter()
         .filter(|resource| !envelope.governed.contains(envelope.resolve(resource)))
         .collect();
@@ -11505,6 +11551,136 @@ workflow Mixer {
         let text = report.render();
         assert!(text.contains("guaranteed invariants"));
         assert!(text.contains("flagged risks"));
+    }
+
+    /// The operator-facing risk list is the report's answer to "what have you
+    /// not governed". It walked its own narrower set — effect resources and
+    /// access grants — so a workflow that shipped its data to two ungoverned
+    /// model endpoints, wrote an ungoverned fact and was triggered by another
+    /// was told it had ONE thing to confirm.
+    #[test]
+    fn flagged_risks_name_every_door_the_surface_knows() {
+        let program = r##"
+@service
+workflow RiskSurface {
+  output result R
+  class R { ok bool }
+  class Note { id string }
+  class Ticket { id string  status "open" }
+  class Verdict { choice "yes" | "no" }
+
+  agent coder { provider acme-cloud  profile "p"  capacity 1 }
+
+  coerce judge(text string) -> Verdict {
+    prompt """markdown
+    Judge {{ text }}
+    """
+    provider onprem-llm
+  }
+
+  table seed as Ticket [ { id "T1"  status "open" } ]
+
+  rule work
+    when Ticket as ticket where ticket.status == "open"
+  => {
+    coerce judge(ticket.id) as v
+    tell coder as turn "go"
+    record Note { id "n1" }
+    after v succeeds as got {
+      complete result { ok true }
+    }
+  }
+}
+"##;
+        let compiled = compile_program_with_root(program, Some("RiskSurface"));
+        let ir = compiled.ir.unwrap_or_else(|| {
+            panic!(
+                "compiles: {:?}",
+                compiled
+                    .diagnostics
+                    .iter()
+                    .map(|d| &d.message)
+                    .collect::<Vec<_>>()
+            )
+        });
+        // An envelope that governs nothing this workflow touches.
+        let report = governance_report(
+            &ir,
+            &VerifiedEnvelope::for_test(Envelope::from_dsl("").expect("empty policy")),
+        );
+        for door in [
+            // the agent's model endpoint
+            "acme-cloud",
+            // the coercion's
+            "onprem-llm",
+            // the fact it writes
+            "fact:Note",
+            // and the fact it is triggered by
+            "fact:Ticket",
+        ] {
+            assert!(
+                report
+                    .flagged_risks
+                    .iter()
+                    .any(|risk| risk.starts_with(&format!("{door}:"))),
+                "`{door}` is a door this workflow opens and nothing governs it, \
+                 so it must be a flagged risk: {:?}",
+                report.flagged_risks
+            );
+        }
+    }
+
+    /// The signature a consumer inherits must not say less than the checker
+    /// knows. A rule triggered by a governed fact, completing with that fact's
+    /// own data, published `carries reads: ledger` — the file store it also
+    /// read — and never named the fact. The consumer, told the field carries
+    /// only the store's label, could write it to a sink cleared for the store
+    /// and not for the fact; the identical write INSIDE the tool is denied.
+    #[test]
+    fn a_flow_signature_names_the_fact_its_field_came_from() {
+        let ir = compile_program(
+            r#"@tool
+workflow Deriver {
+  output result R
+  class R { carried string  other string }
+  class Flag { id string }
+
+  table seed as Flag [ { id "F1" } ]
+
+  file store ledger { root "./ledger"  allow read ["**"] }
+
+  rule work
+    when Flag as f
+  => {
+    read text from ledger at "c.json" as loaded
+    after loaded succeeds as file {
+      complete result { carried f.id  other file.body }
+    }
+  }
+}
+"#,
+        )
+        .ir
+        .expect("compiles");
+        let report = governance_report(
+            &ir,
+            &VerifiedEnvelope::for_test(
+                Envelope::from_dsl(
+                    "grant file_store ledger -> file:/srv/ledger readable by Operator\n\
+                     grant fact flag -> fact:Flag readable by Clinician\n",
+                )
+                .expect("valid"),
+            ),
+        );
+        let carried = report
+            .flow_signature
+            .iter()
+            .find(|line| line.contains("result.carried"))
+            .expect("the field has a signature");
+        assert!(
+            carried.contains("fact:Flag"),
+            "`result.carried` IS the fact's data, so the signature must name it: {carried}"
+        );
     }
 
     #[test]

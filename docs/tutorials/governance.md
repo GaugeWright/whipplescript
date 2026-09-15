@@ -59,7 +59,8 @@ information-flow guarantee report
     - internal:reviewed: may not flow to a sink not cleared for Operator (unless an audited declassify clears it)
     - result: may not flow to a sink not cleared for Operator (unless an audited declassify clears it)
   violations caught in this program: 2
-  flagged risks: none (every touched resource is governed)
+  flagged risks (the operator must confirm or govern these):
+    - fact:Ticket: touched but not labelled by governance — treated as public + low-integrity (fail-closed). Confirm it holds nothing confidential and feeds no trusted sink, or add a `grant` for it.
   trusted surface (declassify + endorse grants): none
   cleared principals (providers/humans, not protected data):
     - selfhost:llama (cleared for Operator; vouched writer from Operator)
@@ -71,7 +72,7 @@ information-flow guarantee report
   fact provenance (computed producer reach a consumer inherits, DR-0045):
     - fact:Ticket carries: nothing (clean chain)
   result/milestone flow signature (per field, the reads a consumer inherits, fact-granular):
-    - result.ok carries reads: crm, inbox
+    - result.ok carries reads: crm, fact:Ticket, inbox
 error[security.confidentiality_leak]: denied flow in rule `triage`: `crm` may be read by Operator only — writing it to `public_reply` (readable by public) would expose it to parties outside its readers (the checker denies every flow from a value to a sink whose readers are not all within the value's reader set)
    --> examples/infoflow/support-triage-unsafe.whip:44:3
    |

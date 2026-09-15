@@ -258,6 +258,12 @@ rule work
 #[test]
 fn shared_success_and_failure_field_names_union_their_dependencies() {
     // Contract names are unique within their kind, not across terminal kinds.
+    //
+    // The facts are part of the answer, not noise: `error.reason` IS the
+    // `PrivateFailure` fact's field, and the rule that produced that fact fires
+    // on `Req`. A consumer of this result inherits whatever governance says
+    // about those facts, so a signature naming only `secret` told it less than
+    // the truth — the omission `rule_read_resources` used to carry.
     let source = mixed_tool_source()
         .replace("output result Answer", "output error Problem")
         .replace(
@@ -267,6 +273,14 @@ fn shared_success_and_failure_field_names_union_their_dependencies() {
     let signatures = result_field_dependency_reads(&compiled(&source));
     assert_eq!(
         signatures,
-        vec![("error".into(), "reason".into(), vec!["secret".into()])]
+        vec![(
+            "error".into(),
+            "reason".into(),
+            vec![
+                "fact:PrivateFailure".into(),
+                "fact:Req".into(),
+                "secret".into()
+            ]
+        )]
     );
 }
