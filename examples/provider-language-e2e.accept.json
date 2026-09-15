@@ -210,6 +210,20 @@
         "subject_type": "rule_commit",
         "count": 13
       }
+    ],
+    "stats": [
+      {
+        "where": {
+          "rule": "run_language_task"
+        },
+        "max": {
+          "output": 6,
+          "input_uncached": 6
+        },
+        "min": {
+          "runs": 1
+        }
+      }
     ]
   }
 }

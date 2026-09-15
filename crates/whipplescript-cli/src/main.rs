@@ -28676,6 +28676,7 @@ fn acceptance_validate_expect_shape(expect: &Value) -> Result<(), String> {
         "runs",
         "artifacts",
         "evidence",
+        "stats",
     ] {
         acceptance_validate_optional_array_field(expect, key)?;
     }
@@ -28951,6 +28952,10 @@ struct AcceptanceDevRun {
     artifacts: Vec<ArtifactView>,
     evidence: Vec<EvidenceView>,
     events: Vec<EventView>,
+    /// The stats fold's inputs for this instance, read through the SAME adapter
+    /// the `whip stats` command and the hosted door use, so a budget is judged
+    /// against the numbers an operator would actually see.
+    stats_inputs: whipplescript_kernel::stats::FoldInputs,
 }
 
 #[derive(Clone, Debug)]
@@ -29130,6 +29135,17 @@ fn acceptance_dev_report(
         artifacts: &artifacts,
         evidence: &evidence,
     });
+    let stats_inputs =
+        match whipplescript_kernel::stats::inputs_for_instance(&store, &started.instance_id)
+            .map_err(acceptance_stats_read_failure)
+        {
+            Ok(inputs) => inputs,
+            Err(message) => {
+                eprintln!("{message}");
+                return Err(ExitCode::FAILURE);
+            }
+        };
+
     Ok(AcceptanceDevRun {
         dev_report: report,
         dev_success: !failed_assertions && !guard_errors && !branch_errors,
@@ -29141,7 +29157,198 @@ fn acceptance_dev_report(
         artifacts,
         evidence,
         events,
+        stats_inputs,
     })
+}
+
+/// Why the acceptance path refuses when the stats read fails.
+///
+/// The message lives here rather than at the early return so a test can reach
+/// it: the acceptance flow cannot easily be driven with a store whose read
+/// fails, and this repository treats a refusal no test CAN fail exactly like
+/// one no test DOES fail — both are free to stop refusing without any gate
+/// noticing.
+///
+/// Refusing matters more here than it looks. Folding an unreadable store as an
+/// EMPTY report would leave every `expect.stats` clause evaluating against zero
+/// rows and passing, so a fixture would report success while measuring nothing.
+fn acceptance_stats_read_failure(error: StoreError) -> String {
+    format!("failed to read stats rows: {}", store_error(error))
+}
+
+/// Every measure a budget clause may bound, by its report name.
+const ACCEPTANCE_STATS_MEASURES: &[&str] = &[
+    "effects",
+    "runs",
+    "retries",
+    "turns",
+    "calls",
+    "steps",
+    "input_uncached",
+    "input_cache_read",
+    "input_cache_write",
+    "output",
+    "completed",
+    "failed",
+    "timed_out",
+    "cancelled",
+    "blocked",
+    "last_input_tokens",
+];
+
+fn acceptance_stats_measure(
+    measures: &whipplescript_kernel::stats::Measures,
+    name: &str,
+) -> Option<whipplescript_kernel::stats::Measure> {
+    Some(match name {
+        "effects" => measures.effects,
+        "runs" => measures.runs,
+        "retries" => measures.retries,
+        "turns" => measures.turns,
+        "calls" => measures.calls,
+        "steps" => measures.steps,
+        "input_uncached" => measures.input_uncached,
+        "input_cache_read" => measures.input_cache_read,
+        "input_cache_write" => measures.input_cache_write,
+        "output" => measures.output,
+        "completed" => measures.completed,
+        "failed" => measures.failed,
+        "timed_out" => measures.timed_out,
+        "cancelled" => measures.cancelled,
+        "blocked" => measures.blocked,
+        "last_input_tokens" => measures.last_input_tokens,
+        _ => return None,
+    })
+}
+
+/// `expect.stats`: token and call budgets, judged against the same fold
+/// `whip stats` reports (DR-0114).
+///
+/// The point is that a change which doubles a rule's spend goes red before it
+/// ships, which needs the numbers to be deterministic — they are, under the
+/// fixture provider, because the fold is a pure function of the durable log.
+///
+/// **An UNRECORDED measure FAILS the clause.** That is the decision worth
+/// stating, because the tempting alternative is silently wrong. `max_output`
+/// against a measure the log does not carry cannot be answered, and a budget
+/// that passes when it cannot be evaluated becomes vacuous exactly when the
+/// data goes missing — a change that stopped recording usage would sail through
+/// its own budget. DR-0116 already refuses to render unrecorded as zero; this
+/// refuses to read it as "within budget".
+fn acceptance_expect_stats(
+    expect: &Value,
+    inputs: &whipplescript_kernel::stats::FoldInputs,
+    failures: &mut Vec<String>,
+) {
+    use whipplescript_kernel::stats::{Dimension, Query};
+
+    let Some(clauses) = expect.get("stats").and_then(Value::as_array) else {
+        return;
+    };
+    for (index, clause) in clauses.iter().enumerate() {
+        let filters: Vec<(Dimension, String)> = match clause.get("where") {
+            None => Vec::new(),
+            Some(Value::Object(map)) => {
+                let mut parsed = Vec::new();
+                let mut bad = false;
+                for (name, value) in map {
+                    // The DR-0117 vocabulary, through the one membership check.
+                    let dimension = match Dimension::parse(name) {
+                        Ok(dimension) => dimension,
+                        Err(error) => {
+                            failures.push(format!("expect.stats[{index}].where: {error}"));
+                            bad = true;
+                            continue;
+                        }
+                    };
+                    let Some(text) = value.as_str() else {
+                        failures.push(format!(
+                            "expect.stats[{index}].where.{name} must be a string"
+                        ));
+                        bad = true;
+                        continue;
+                    };
+                    parsed.push((dimension, text.to_owned()));
+                }
+                if bad {
+                    continue;
+                }
+                parsed
+            }
+            Some(_) => {
+                failures.push(format!("expect.stats[{index}].where must be an object"));
+                continue;
+            }
+        };
+
+        let query = Query {
+            by: filters.iter().map(|(dimension, _)| *dimension).collect(),
+            ..Query::default()
+        };
+        let rows = inputs.rows(&query);
+        let matching: Vec<_> = rows
+            .iter()
+            .filter(|row| {
+                filters.iter().all(|(dimension, wanted)| {
+                    row.key
+                        .iter()
+                        .find(|(key, _)| key == dimension)
+                        .and_then(|(_, value)| value.as_deref())
+                        == Some(wanted.as_str())
+                })
+            })
+            .collect();
+
+        for (bound, over) in [("max", true), ("min", false)] {
+            let Some(limits) = clause.get(bound) else {
+                continue;
+            };
+            let Some(limits) = limits.as_object() else {
+                failures.push(format!("expect.stats[{index}].{bound} must be an object"));
+                continue;
+            };
+            for (measure_name, limit) in limits {
+                if !ACCEPTANCE_STATS_MEASURES.contains(&measure_name.as_str()) {
+                    failures.push(format!(
+                        "expect.stats[{index}].{bound}.{measure_name} is not a stats measure; \
+                         the measures are: {}",
+                        ACCEPTANCE_STATS_MEASURES.join(", ")
+                    ));
+                    continue;
+                }
+                let Some(limit) = limit.as_i64() else {
+                    failures.push(format!(
+                        "expect.stats[{index}].{bound}.{measure_name} must be an integer"
+                    ));
+                    continue;
+                };
+                // Sum the matching rows. An unrecorded contribution makes the
+                // total unrecorded, which is the fold's own rule and is what
+                // makes the failure below honest rather than pedantic.
+                let mut total = whipplescript_kernel::stats::Measure::recorded(0);
+                for row in &matching {
+                    if let Some(measure) = acceptance_stats_measure(&row.measures, measure_name) {
+                        total = total.fold(measure);
+                    }
+                }
+                match total.value() {
+                    None => failures.push(format!(
+                        "expect.stats[{index}].{bound}.{measure_name}: the log does not record \
+                         {measure_name} for these rows, so the budget cannot be judged (unrecorded \
+                         is not zero, and a budget that passes when it cannot be evaluated is \
+                         vacuous exactly when the data goes missing)"
+                    )),
+                    Some(actual) if over && actual > limit => failures.push(format!(
+                        "expect.stats[{index}]: {measure_name} {actual} exceeds max {limit}"
+                    )),
+                    Some(actual) if !over && actual < limit => failures.push(format!(
+                        "expect.stats[{index}]: {measure_name} {actual} is below min {limit}"
+                    )),
+                    Some(_) => {}
+                }
+            }
+        }
+    }
 }
 
 fn acceptance_seed_setup_facts(
@@ -29364,6 +29571,7 @@ fn acceptance_failures(fixture: &Value, run: &AcceptanceDevRun) -> Vec<String> {
     acceptance_expect_artifacts(expect, &run.artifacts, &mut failures);
     acceptance_expect_evidence(expect, &run.evidence, &mut failures);
     acceptance_expect_trace(expect, &run.events, &mut failures);
+    acceptance_expect_stats(expect, &run.stats_inputs, &mut failures);
     failures
 }
 

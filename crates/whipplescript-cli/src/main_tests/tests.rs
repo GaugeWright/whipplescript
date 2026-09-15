@@ -79,6 +79,8 @@ mod packages;
 mod provider_and_doctor;
 #[path = "tests/read_only_observation.rs"]
 mod read_only_observation;
+#[path = "tests/stats_budget.rs"]
+mod stats_budget;
 #[path = "tests/std_manifests.rs"]
 mod std_manifests;
 #[path = "tests/trace_and_log.rs"]

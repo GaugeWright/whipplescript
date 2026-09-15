@@ -3,15 +3,29 @@
   "$id": "https://whipplescript.local/schemas/acceptance_fixture_v0.schema.json",
   "title": "WhippleScript acceptance fixture v0",
   "type": "object",
-  "required": ["schema", "workflow", "expect"],
+  "required": [
+    "schema",
+    "workflow",
+    "expect"
+  ],
   "properties": {
-    "schema": {"const": "whipplescript.acceptance_fixture.v0"},
-    "workflow": {"type": "string"},
-    "root": {"type": "string"},
-    "provider": {"type": "string"},
+    "schema": {
+      "const": "whipplescript.acceptance_fixture.v0"
+    },
+    "workflow": {
+      "type": "string"
+    },
+    "root": {
+      "type": "string"
+    },
+    "provider": {
+      "type": "string"
+    },
     "provider_config_paths": {
       "type": "array",
-      "items": {"type": "string"}
+      "items": {
+        "type": "string"
+      }
     },
     "input": {},
     "setup": {
@@ -21,10 +35,17 @@
           "type": "array",
           "items": {
             "type": "object",
-            "required": ["name", "value"],
+            "required": [
+              "name",
+              "value"
+            ],
             "properties": {
-              "name": {"type": "string"},
-              "key": {"type": "string"},
+              "name": {
+                "type": "string"
+              },
+              "key": {
+                "type": "string"
+              },
               "value": {}
             },
             "additionalProperties": true
@@ -34,17 +55,37 @@
           "type": "array",
           "items": {
             "type": "object",
-            "required": ["prompt"],
+            "required": [
+              "prompt"
+            ],
             "properties": {
-              "inbox_item_id": {"type": "string"},
-              "effect_id": {"type": "string"},
-              "status": {"type": "string"},
-              "prompt": {"type": "string"},
-              "choices": {"type": "array"},
-              "freeform_allowed": {"type": "boolean"},
-              "severity": {"type": "string"},
-              "related_effects": {"type": "array"},
-              "related_artifacts": {"type": "array"}
+              "inbox_item_id": {
+                "type": "string"
+              },
+              "effect_id": {
+                "type": "string"
+              },
+              "status": {
+                "type": "string"
+              },
+              "prompt": {
+                "type": "string"
+              },
+              "choices": {
+                "type": "array"
+              },
+              "freeform_allowed": {
+                "type": "boolean"
+              },
+              "severity": {
+                "type": "string"
+              },
+              "related_effects": {
+                "type": "array"
+              },
+              "related_artifacts": {
+                "type": "array"
+              }
             },
             "additionalProperties": true
           }
@@ -58,32 +99,69 @@
       "type": "array",
       "items": {
         "type": "object",
-        "required": ["type"],
+        "required": [
+          "type"
+        ],
         "properties": {
-          "type": {"enum": ["pause", "resume", "cancel"]},
-          "reason": {"type": "string"}
+          "type": {
+            "enum": [
+              "pause",
+              "resume",
+              "cancel"
+            ]
+          },
+          "reason": {
+            "type": "string"
+          }
         },
         "additionalProperties": true
       }
     },
     "include_tags": {
       "type": "array",
-      "items": {"type": "string"}
+      "items": {
+        "type": "string"
+      }
     },
     "exclude_tags": {
       "type": "array",
-      "items": {"type": "string"}
+      "items": {
+        "type": "string"
+      }
     },
     "outcome": {
-      "enum": ["completed", "failed", "timed_out", "timeout", "cancelled", "cancel"]
+      "enum": [
+        "completed",
+        "failed",
+        "timed_out",
+        "timeout",
+        "cancelled",
+        "cancel"
+      ]
     },
-    "max_iterations": {"type": "integer", "minimum": 1},
+    "max_iterations": {
+      "type": "integer",
+      "minimum": 1
+    },
     "expect": {
       "type": "object",
       "properties": {
-        "dev_status": {"enum": ["success", "failure"]},
-        "workflow": {"type": "string"},
-        "status": {"enum": ["passed", "failed", "error"]},
+        "dev_status": {
+          "enum": [
+            "success",
+            "failure"
+          ]
+        },
+        "workflow": {
+          "type": "string"
+        },
+        "status": {
+          "enum": [
+            "passed",
+            "failed",
+            "error"
+          ]
+        },
         "source_metadata": {
           "type": "object",
           "properties": {
@@ -91,15 +169,26 @@
               "type": "array",
               "items": {
                 "type": "object",
-                "required": ["target_kind", "target"],
+                "required": [
+                  "target_kind",
+                  "target"
+                ],
                 "properties": {
-                  "target_kind": {"type": "string"},
-                  "target": {"type": "string"},
+                  "target_kind": {
+                    "type": "string"
+                  },
+                  "target": {
+                    "type": "string"
+                  },
                   "tags": {
                     "type": "array",
-                    "items": {"type": "string"}
+                    "items": {
+                      "type": "string"
+                    }
                   },
-                  "description": {"type": "string"}
+                  "description": {
+                    "type": "string"
+                  }
                 },
                 "additionalProperties": true
               }
@@ -107,15 +196,26 @@
           },
           "additionalProperties": true
         },
-        "diagnostics": {"type": "integer", "minimum": 0},
+        "diagnostics": {
+          "type": "integer",
+          "minimum": 0
+        },
         "diagnostics_by_code": {
           "type": "array",
           "items": {
             "type": "object",
-            "required": ["code", "count"],
+            "required": [
+              "code",
+              "count"
+            ],
             "properties": {
-              "code": {"type": "string"},
-              "count": {"type": "integer", "minimum": 0}
+              "code": {
+                "type": "string"
+              },
+              "count": {
+                "type": "integer",
+                "minimum": 0
+              }
             },
             "additionalProperties": true
           }
@@ -124,10 +224,22 @@
           "type": "array",
           "items": {
             "type": "object",
-            "required": ["type", "count"],
+            "required": [
+              "type",
+              "count"
+            ],
             "properties": {
-              "type": {"enum": ["pause", "resume", "cancel"]},
-              "count": {"type": "integer", "minimum": 0}
+              "type": {
+                "enum": [
+                  "pause",
+                  "resume",
+                  "cancel"
+                ]
+              },
+              "count": {
+                "type": "integer",
+                "minimum": 0
+              }
             },
             "additionalProperties": true
           }
@@ -137,38 +249,92 @@
           "items": {
             "type": "object",
             "anyOf": [
-              {"required": ["source"]},
-              {"required": ["kind"]},
-              {"required": ["head"]},
-              {"required": ["guard"]}
+              {
+                "required": [
+                  "source"
+                ]
+              },
+              {
+                "required": [
+                  "kind"
+                ]
+              },
+              {
+                "required": [
+                  "head"
+                ]
+              },
+              {
+                "required": [
+                  "guard"
+                ]
+              }
             ],
             "properties": {
-              "source": {"type": "string"},
-              "kind": {"enum": ["fact", "effect"]},
-              "head": {"type": "string"},
-              "guard": {"type": "string"},
-              "match_count": {"type": "integer", "minimum": 0},
+              "source": {
+                "type": "string"
+              },
+              "kind": {
+                "enum": [
+                  "fact",
+                  "effect"
+                ]
+              },
+              "head": {
+                "type": "string"
+              },
+              "guard": {
+                "type": "string"
+              },
+              "match_count": {
+                "type": "integer",
+                "minimum": 0
+              },
               "matches": {
                 "type": "array",
                 "items": {
                   "type": "object",
-                  "required": ["count"],
+                  "required": [
+                    "count"
+                  ],
                   "properties": {
-                    "name": {"type": "string"},
-                    "status": {"type": "string"},
-                    "prompt_content_type": {"type": "string"},
-                    "provenance_class": {"type": "string"},
-                    "trace_items": {"type": "integer", "minimum": 0},
-                    "evidence_items": {"type": "integer", "minimum": 0},
+                    "name": {
+                      "type": "string"
+                    },
+                    "status": {
+                      "type": "string"
+                    },
+                    "prompt_content_type": {
+                      "type": "string"
+                    },
+                    "provenance_class": {
+                      "type": "string"
+                    },
+                    "trace_items": {
+                      "type": "integer",
+                      "minimum": 0
+                    },
+                    "evidence_items": {
+                      "type": "integer",
+                      "minimum": 0
+                    },
                     "trace_sequences": {
                       "type": "array",
-                      "items": {"type": "integer", "minimum": 0}
+                      "items": {
+                        "type": "integer",
+                        "minimum": 0
+                      }
                     },
                     "evidence_ids": {
                       "type": "array",
-                      "items": {"type": "string"}
+                      "items": {
+                        "type": "string"
+                      }
                     },
-                    "count": {"type": "integer", "minimum": 0}
+                    "count": {
+                      "type": "integer",
+                      "minimum": 0
+                    }
                   },
                   "additionalProperties": true
                 }
@@ -183,8 +349,14 @@
             "summary": {
               "type": "object",
               "properties": {
-                "events": {"type": "integer", "minimum": 0},
-                "abstract_events": {"type": "integer", "minimum": 0}
+                "events": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "abstract_events": {
+                  "type": "integer",
+                  "minimum": 0
+                }
               },
               "additionalProperties": true
             },
@@ -192,10 +364,18 @@
               "type": "array",
               "items": {
                 "type": "object",
-                "required": ["type", "count"],
+                "required": [
+                  "type",
+                  "count"
+                ],
                 "properties": {
-                  "type": {"type": "string"},
-                  "count": {"type": "integer", "minimum": 0}
+                  "type": {
+                    "type": "string"
+                  },
+                  "count": {
+                    "type": "integer",
+                    "minimum": 0
+                  }
                 },
                 "additionalProperties": true
               }
@@ -205,24 +385,73 @@
               "items": {
                 "type": "object",
                 "anyOf": [
-                  {"required": ["sequence"]},
-                  {"required": ["type"]},
-                  {"required": ["effect_id"]},
-                  {"required": ["run_id"]},
-                  {"required": ["status"]},
-                  {"required": ["predicate"]},
-                  {"required": ["reason"]},
-                  {"required": ["provider"]}
+                  {
+                    "required": [
+                      "sequence"
+                    ]
+                  },
+                  {
+                    "required": [
+                      "type"
+                    ]
+                  },
+                  {
+                    "required": [
+                      "effect_id"
+                    ]
+                  },
+                  {
+                    "required": [
+                      "run_id"
+                    ]
+                  },
+                  {
+                    "required": [
+                      "status"
+                    ]
+                  },
+                  {
+                    "required": [
+                      "predicate"
+                    ]
+                  },
+                  {
+                    "required": [
+                      "reason"
+                    ]
+                  },
+                  {
+                    "required": [
+                      "provider"
+                    ]
+                  }
                 ],
                 "properties": {
-                  "sequence": {"type": "integer", "minimum": 0},
-                  "type": {"type": "string"},
-                  "effect_id": {"type": "string"},
-                  "run_id": {"type": "string"},
-                  "status": {"type": "string"},
-                  "predicate": {"type": "string"},
-                  "reason": {"type": "string"},
-                  "provider": {"type": "string"}
+                  "sequence": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "type": {
+                    "type": "string"
+                  },
+                  "effect_id": {
+                    "type": "string"
+                  },
+                  "run_id": {
+                    "type": "string"
+                  },
+                  "status": {
+                    "type": "string"
+                  },
+                  "predicate": {
+                    "type": "string"
+                  },
+                  "reason": {
+                    "type": "string"
+                  },
+                  "provider": {
+                    "type": "string"
+                  }
                 },
                 "additionalProperties": true
               }
@@ -230,7 +459,9 @@
             "conformance": {
               "type": "object",
               "properties": {
-                "ok": {"type": "boolean"}
+                "ok": {
+                  "type": "boolean"
+                }
               },
               "additionalProperties": true
             }
@@ -241,11 +472,21 @@
           "type": "array",
           "items": {
             "type": "object",
-            "required": ["status", "count"],
+            "required": [
+              "status",
+              "count"
+            ],
             "properties": {
-              "status": {"type": "string"},
-              "severity": {"type": "string"},
-              "count": {"type": "integer", "minimum": 0}
+              "status": {
+                "type": "string"
+              },
+              "severity": {
+                "type": "string"
+              },
+              "count": {
+                "type": "integer",
+                "minimum": 0
+              }
             },
             "additionalProperties": true
           }
@@ -253,10 +494,22 @@
         "assertions": {
           "type": "object",
           "properties": {
-            "total": {"type": "integer", "minimum": 0},
-            "passed": {"type": "integer", "minimum": 0},
-            "failed": {"type": "integer", "minimum": 0},
-            "error": {"type": "integer", "minimum": 0}
+            "total": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "passed": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "failed": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "error": {
+              "type": "integer",
+              "minimum": 0
+            }
           },
           "additionalProperties": true
         },
@@ -264,13 +517,29 @@
           "type": "array",
           "items": {
             "type": "object",
-            "required": ["tag"],
+            "required": [
+              "tag"
+            ],
             "properties": {
-              "tag": {"type": "string"},
-              "total": {"type": "integer", "minimum": 0},
-              "passed": {"type": "integer", "minimum": 0},
-              "failed": {"type": "integer", "minimum": 0},
-              "error": {"type": "integer", "minimum": 0}
+              "tag": {
+                "type": "string"
+              },
+              "total": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "passed": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "failed": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "error": {
+                "type": "integer",
+                "minimum": 0
+              }
             },
             "additionalProperties": true
           }
@@ -278,18 +547,36 @@
         "assertion_untagged": {
           "type": "object",
           "properties": {
-            "total": {"type": "integer", "minimum": 0},
-            "passed": {"type": "integer", "minimum": 0},
-            "failed": {"type": "integer", "minimum": 0},
-            "error": {"type": "integer", "minimum": 0}
+            "total": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "passed": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "failed": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "error": {
+              "type": "integer",
+              "minimum": 0
+            }
           },
           "additionalProperties": true
         },
         "summary": {
           "type": "object",
           "properties": {
-            "facts": {"type": "integer", "minimum": 0},
-            "effects": {"type": "integer", "minimum": 0}
+            "facts": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "effects": {
+              "type": "integer",
+              "minimum": 0
+            }
           },
           "additionalProperties": true
         },
@@ -297,10 +584,18 @@
           "type": "array",
           "items": {
             "type": "object",
-            "required": ["name", "count"],
+            "required": [
+              "name",
+              "count"
+            ],
             "properties": {
-              "name": {"type": "string"},
-              "count": {"type": "integer", "minimum": 0}
+              "name": {
+                "type": "string"
+              },
+              "count": {
+                "type": "integer",
+                "minimum": 0
+              }
             },
             "additionalProperties": true
           }
@@ -309,11 +604,21 @@
           "type": "array",
           "items": {
             "type": "object",
-            "required": ["kind", "count"],
+            "required": [
+              "kind",
+              "count"
+            ],
             "properties": {
-              "kind": {"type": "string"},
-              "status": {"type": "string"},
-              "count": {"type": "integer", "minimum": 0}
+              "kind": {
+                "type": "string"
+              },
+              "status": {
+                "type": "string"
+              },
+              "count": {
+                "type": "integer",
+                "minimum": 0
+              }
             },
             "additionalProperties": true
           }
@@ -322,12 +627,25 @@
           "type": "array",
           "items": {
             "type": "object",
-            "required": ["provider", "count"],
+            "required": [
+              "provider",
+              "count"
+            ],
             "properties": {
-              "provider": {"type": "string"},
-              "status": {"type": "string"},
-              "count": {"type": "integer", "minimum": 0},
-              "artifact_count": {"type": "integer", "minimum": 0}
+              "provider": {
+                "type": "string"
+              },
+              "status": {
+                "type": "string"
+              },
+              "count": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "artifact_count": {
+                "type": "integer",
+                "minimum": 0
+              }
             },
             "additionalProperties": true
           }
@@ -336,11 +654,21 @@
           "type": "array",
           "items": {
             "type": "object",
-            "required": ["kind", "count"],
+            "required": [
+              "kind",
+              "count"
+            ],
             "properties": {
-              "kind": {"type": "string"},
-              "mime_type": {"type": "string"},
-              "count": {"type": "integer", "minimum": 0}
+              "kind": {
+                "type": "string"
+              },
+              "mime_type": {
+                "type": "string"
+              },
+              "count": {
+                "type": "integer",
+                "minimum": 0
+              }
             },
             "additionalProperties": true
           }
@@ -349,13 +677,199 @@
           "type": "array",
           "items": {
             "type": "object",
-            "required": ["kind", "count"],
+            "required": [
+              "kind",
+              "count"
+            ],
             "properties": {
-              "kind": {"type": "string"},
-              "subject_type": {"type": "string"},
-              "count": {"type": "integer", "minimum": 0}
+              "kind": {
+                "type": "string"
+              },
+              "subject_type": {
+                "type": "string"
+              },
+              "count": {
+                "type": "integer",
+                "minimum": 0
+              }
             },
             "additionalProperties": true
+          }
+        },
+        "stats": {
+          "description": "Token and call budgets, judged against the same fold `whip stats` reports. An UNRECORDED measure FAILS the clause: a ceiling against a measure the log does not carry cannot be answered, and a budget that passes when it cannot be evaluated is vacuous exactly when the data goes missing.",
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "where": {
+                "description": "Restrict the clause to rows matching these dimensions. Structural identifiers only (DR-0117).",
+                "type": "object",
+                "properties": {
+                  "program_id": {
+                    "type": "string"
+                  },
+                  "program_version_id": {
+                    "type": "string"
+                  },
+                  "instance_id": {
+                    "type": "string"
+                  },
+                  "revision_epoch": {
+                    "type": "string"
+                  },
+                  "rule": {
+                    "type": "string"
+                  },
+                  "effect_kind": {
+                    "type": "string"
+                  },
+                  "effect_id": {
+                    "type": "string"
+                  },
+                  "run_id": {
+                    "type": "string"
+                  },
+                  "agent": {
+                    "type": "string"
+                  },
+                  "profile": {
+                    "type": "string"
+                  },
+                  "provider": {
+                    "type": "string"
+                  },
+                  "model": {
+                    "type": "string"
+                  },
+                  "status": {
+                    "type": "string"
+                  },
+                  "block_category": {
+                    "type": "string"
+                  },
+                  "step": {
+                    "type": "string"
+                  },
+                  "day": {
+                    "type": "string"
+                  },
+                  "grain": {
+                    "type": "string"
+                  }
+                },
+                "additionalProperties": false
+              },
+              "max": {
+                "type": "object",
+                "properties": {
+                  "effects": {
+                    "type": "integer"
+                  },
+                  "runs": {
+                    "type": "integer"
+                  },
+                  "retries": {
+                    "type": "integer"
+                  },
+                  "turns": {
+                    "type": "integer"
+                  },
+                  "calls": {
+                    "type": "integer"
+                  },
+                  "steps": {
+                    "type": "integer"
+                  },
+                  "input_uncached": {
+                    "type": "integer"
+                  },
+                  "input_cache_read": {
+                    "type": "integer"
+                  },
+                  "input_cache_write": {
+                    "type": "integer"
+                  },
+                  "output": {
+                    "type": "integer"
+                  },
+                  "completed": {
+                    "type": "integer"
+                  },
+                  "failed": {
+                    "type": "integer"
+                  },
+                  "timed_out": {
+                    "type": "integer"
+                  },
+                  "cancelled": {
+                    "type": "integer"
+                  },
+                  "blocked": {
+                    "type": "integer"
+                  },
+                  "last_input_tokens": {
+                    "type": "integer"
+                  }
+                },
+                "additionalProperties": false
+              },
+              "min": {
+                "type": "object",
+                "properties": {
+                  "effects": {
+                    "type": "integer"
+                  },
+                  "runs": {
+                    "type": "integer"
+                  },
+                  "retries": {
+                    "type": "integer"
+                  },
+                  "turns": {
+                    "type": "integer"
+                  },
+                  "calls": {
+                    "type": "integer"
+                  },
+                  "steps": {
+                    "type": "integer"
+                  },
+                  "input_uncached": {
+                    "type": "integer"
+                  },
+                  "input_cache_read": {
+                    "type": "integer"
+                  },
+                  "input_cache_write": {
+                    "type": "integer"
+                  },
+                  "output": {
+                    "type": "integer"
+                  },
+                  "completed": {
+                    "type": "integer"
+                  },
+                  "failed": {
+                    "type": "integer"
+                  },
+                  "timed_out": {
+                    "type": "integer"
+                  },
+                  "cancelled": {
+                    "type": "integer"
+                  },
+                  "blocked": {
+                    "type": "integer"
+                  },
+                  "last_input_tokens": {
+                    "type": "integer"
+                  }
+                },
+                "additionalProperties": false
+              }
+            },
+            "additionalProperties": false
           }
         }
       },
