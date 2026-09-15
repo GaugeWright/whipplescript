@@ -140,7 +140,16 @@ impl<'a> FileSettlementFact<'a> {
                     _ => false,
                 })
             || (completion.provider == TRACKER_WAIT_PROVIDER
-                && recorded_target != Some(TRACKER_WAIT_CAPABILITY))
+                && !matches!(
+                    recorded_target,
+                    Some(
+                        TRACKER_WAIT_CAPABILITY
+                            | "tracker.claim"
+                            | "tracker.renew"
+                            | "tracker.release"
+                            | "tracker.assign"
+                    )
+                ))
         {
             return Err(StoreError::Conflict(
                 "local settlement differs from the recorded target or run provider".into(),

@@ -11,6 +11,11 @@ use crate::{
 };
 
 mod closing;
+mod control;
+pub use control::{
+    control_receipt_evidence_digest, control_value, TrackerControlResultDelivery,
+    CONTROL_DELIVERY_EVENT, CONTROL_PROVIDER,
+};
 mod delivery;
 pub use closing::{
     closing_receipt_evidence_digest, TrackerClosureResultDelivery, CLOSING_DELIVERY_EVENT,
@@ -30,6 +35,8 @@ pub fn receipt_evidence_digest(receipt: &TrackerFilingReceipt) -> String {
 pub mod closing_conformance;
 #[doc(hidden)]
 pub mod conformance;
+#[doc(hidden)]
+pub mod control_conformance;
 #[cfg(all(test, feature = "native"))]
 mod tests;
 
@@ -49,6 +56,13 @@ pub struct TrackerResultDelivery {
 }
 
 pub trait TrackerResultPublications {
+    fn publish_tracker_control_result(
+        &mut self,
+        owner_epoch: i64,
+        expected_head: &str,
+        delivery: &TrackerControlResultDelivery,
+    ) -> StoreResult<StoredEvent>;
+
     fn publish_tracker_result(
         &mut self,
         owner_epoch: i64,
@@ -173,6 +187,19 @@ mod native {
     use rusqlite::{params, Connection, OptionalExtension};
 
     impl TrackerResultPublications for SqliteStore {
+        fn publish_tracker_control_result(
+            &mut self,
+            owner_epoch: i64,
+            expected_head: &str,
+            delivery: &TrackerControlResultDelivery,
+        ) -> StoreResult<StoredEvent> {
+            self.publish_tracker_delivery(
+                owner_epoch,
+                expected_head,
+                &DeliveredTrackerResult::from(delivery.clone()),
+            )
+        }
+
         fn publish_tracker_result(
             &mut self,
             owner_epoch: i64,
@@ -264,7 +291,7 @@ mod native {
             if instance != "running"
                 || kind != delivery.kind()
                 || queue.as_deref() != delivery.target()
-                || provider != "queue"
+                || provider != delivery.provider()
                 || !matches!(effect.as_str(), "running" | "failed")
                 || !matches!(
                     run.as_str(),
@@ -354,7 +381,7 @@ mod native {
                     instance_id: delivery.instance_id(),
                     effect_id: delivery.effect_id(),
                     run_id: delivery.run_id(),
-                    provider: "queue",
+                    provider: delivery.provider(),
                     worker_id: "tracker-recovery",
                     status: "completed",
                     exit_code: None,
@@ -437,6 +464,16 @@ pub(crate) use native::apply_result;
 
 #[cfg(feature = "native")]
 impl TrackerResultPublications for crate::native_stores::NativeStores {
+    fn publish_tracker_control_result(
+        &mut self,
+        owner_epoch: i64,
+        expected_head: &str,
+        delivery: &TrackerControlResultDelivery,
+    ) -> StoreResult<StoredEvent> {
+        self.runtime
+            .publish_tracker_control_result(owner_epoch, expected_head, delivery)
+    }
+
     fn publish_tracker_result(
         &mut self,
         owner_epoch: i64,

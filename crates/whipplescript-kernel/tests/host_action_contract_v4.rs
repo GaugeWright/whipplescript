@@ -16,11 +16,12 @@ fn tracker_host_action_vectors_extend_all_immutable_base_bundles() {
         .find(|report| report["id"] == "RecoverTrackerResult")
         .expect("recovery vector")["value"];
     use whipplescript_kernel::host_protocol::tracker_recovery::{
-        RecoverTrackerClosure, RecoverTrackerFiling, RecoverTrackerResult,
+        RecoverTrackerClosure, RecoverTrackerControl, RecoverTrackerFiling, RecoverTrackerResult,
     };
     let canonical: RecoverTrackerResult = serde_json::from_value(value.clone()).unwrap();
     let filing: RecoverTrackerFiling = serde_json::from_value(value.clone()).unwrap();
     let closing: RecoverTrackerClosure = serde_json::from_value(value.clone()).unwrap();
+    let control: RecoverTrackerControl = serde_json::from_value(value.clone()).unwrap();
     assert_eq!(
         canonical.signing_bytes().unwrap(),
         filing.signing_bytes().unwrap()
@@ -28,5 +29,9 @@ fn tracker_host_action_vectors_extend_all_immutable_base_bundles() {
     assert_eq!(
         canonical.signing_bytes().unwrap(),
         closing.signing_bytes().unwrap()
+    );
+    assert_eq!(
+        canonical.signing_bytes().unwrap(),
+        control.signing_bytes().unwrap()
     );
 }

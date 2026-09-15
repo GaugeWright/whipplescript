@@ -47,6 +47,10 @@ pub use protection::TrackerEventMetadata;
 
 #[cfg(feature = "native")]
 mod closure;
+#[cfg(feature = "native")]
+mod control;
+#[cfg(feature = "native")]
+mod control_ops;
 
 /// The active-lease predicate, shared by every readiness/overlay query: a lease
 /// is active while it has not been released and has not expired. A NULL
@@ -232,7 +236,9 @@ pub struct IssueConflicts {
 #[cfg(feature = "native")]
 /// This store's schema generation. Bumped when its `CREATE TABLE` set changes
 /// in a way an older build cannot read.
-const SATELLITE_SCHEMA_VERSION: i64 = 4;
+const SATELLITE_SCHEMA_VERSION: i64 = 5;
+#[cfg(feature = "native")]
+const PROTECTION_SCHEMA_VERSION: i64 = 4;
 
 impl IssueConflicts {
     #[must_use]
@@ -333,8 +339,13 @@ impl WorkItemStore {
     }
 
     fn from_connection(connection: Connection) -> StoreResult<Self> {
+        let transaction = rusqlite::Transaction::new_unchecked(
+            &connection,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
         Self::require_plain_before_initialize(&connection)?;
         Self::initialize_schema(&connection)?;
+        transaction.commit()?;
         Self::from_existing_connection(connection, None)
     }
 
@@ -346,6 +357,7 @@ impl WorkItemStore {
         // it parsed. `SqliteStore` has refused that since Phase B.
         crate::stamp_satellite_schema(connection, "work-item", SATELLITE_SCHEMA_VERSION)?;
         connection.execute_batch(crate::tracker_closure::SCHEMA)?;
+        connection.execute_batch(crate::tracker_control::SCHEMA)?;
         // Self-heal a pre-phase-B `tracker_events` (the ADR-0002 v1 linear log
         // had neither column): `CREATE TABLE IF NOT EXISTS` never alters an
         // existing table, so add the Merkle-DAG columns before the unique index
@@ -559,50 +571,16 @@ impl WorkItemStore {
             .connection
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let now = tx_now(&tx)?;
-        let exists: bool = tx
-            .query_row(
-                "SELECT 1 FROM tracker_issues WHERE issue_id = ?1",
-                [item_id],
-                |_| Ok(()),
-            )
-            .optional()?
-            .is_some();
-        if !exists {
-            tx.commit()?;
-            return Ok(ClaimOutcome::NotFound);
-        }
-        tx_expire_stale_leases(&tx, item_id, &now)?;
-        if let Some(holder) = tx_active_holder(&tx, item_id, &now)? {
-            tx.commit()?;
-            return Ok(ClaimOutcome::AlreadyClaimed { holder });
-        }
-        // No active lease: grant. The lease's identity IS its `claim.acquired`
-        // event (content hash) — like comments/evidence, so ids from different
-        // clones can never collide on merge and rebuild re-derives the same id
-        // from the log. (Alias-derived `L-{alias}-{n}` ids collided across
-        // clones: both mint `L-WS-1-0`, and the import fold's INSERT OR IGNORE
-        // silently destroyed one lease.) A plain claim writes NO durable
-        // status — readiness changes through the lease overlay.
-        let content_id = content_id_of(&tx, item_id)?
-            .ok_or_else(|| StoreError::Conflict(format!("unknown issue alias {item_id}")))?;
-        let payload = json!({"actor": claimed_by, "expires_at": expires});
-        let lease_id = tx_append_raw(
+        let outcome = control_ops::claim_item(
             &tx,
-            Some(&content_id),
-            None,
-            "claim.acquired",
-            &payload.to_string(),
-            Some(claimed_by),
+            item_id,
+            claimed_by,
+            expires,
             self.event_effect_id.as_deref(),
             &now,
         )?;
-        tx.execute(
-            "INSERT INTO tracker_leases (lease_id, issue_id, actor, acquired_at, expires_at, released_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, NULL)",
-            params![lease_id, item_id, claimed_by, now, expires],
-        )?;
         tx.commit()?;
-        Ok(ClaimOutcome::Claimed)
+        Ok(outcome)
     }
 
     /// Extend/heartbeat a held lease (`tracker-lease.maude` I2, holder-only +
@@ -620,53 +598,16 @@ impl WorkItemStore {
             .connection
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let now = tx_now(&tx)?;
-        let lease: Option<(String, Option<String>)> = tx
-            .query_row(
-                &format!(
-                    "SELECT lease_id, expires_at FROM tracker_leases \
-                     WHERE issue_id = ?1 AND actor = ?2 AND {ACTIVE_LEASE}"
-                ),
-                params![item_id, actor, now],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .optional()?;
-        let Some((lease_id, current_expires)) = lease else {
-            tx.commit()?;
-            return Ok(RenewOutcome::NotHeld);
-        };
-        // Monotonicity: a finite deadline may not move backward. NULL (no TTL)
-        // accepts a first finite deadline — the holder is voluntarily timing
-        // its own lease, which the Maude model (Nat-only expiry) does not cover.
-        if let (Some(want), Some(current)) = (expires, current_expires.as_deref()) {
-            if want <= current {
-                tx.commit()?;
-                return Ok(RenewOutcome::NotMonotonic);
-            }
-        }
-        let new_expires: Option<String> = match expires {
-            Some(want) => Some(want.to_owned()),
-            None => current_expires,
-        };
-        let payload = json!({"lease_id": lease_id, "actor": actor, "expires_at": new_expires});
-        tx_append_event(
+        let outcome = control_ops::renew_claim(
             &tx,
-            Some(item_id),
-            "claim.renewed",
-            &payload,
-            Some(actor),
+            item_id,
+            actor,
+            expires,
             self.event_effect_id.as_deref(),
             &now,
         )?;
-        if expires.is_some() {
-            tx.execute(
-                "UPDATE tracker_leases SET expires_at = ?2 WHERE lease_id = ?1",
-                params![lease_id, new_expires],
-            )?;
-        }
         tx.commit()?;
-        Ok(RenewOutcome::Renewed {
-            expires_at: new_expires,
-        })
+        Ok(outcome)
     }
 
     /// Release the active lease on an issue, optionally only if `expect_holder`
@@ -966,33 +907,16 @@ impl WorkItemStore {
             .connection
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let now = tx_now(&tx)?;
-        let status: Option<String> = tx
-            .query_row(
-                "SELECT status FROM tracker_issues WHERE issue_id = ?1",
-                [item_id],
-                |row| row.get(0),
-            )
-            .optional()?;
-        if status.as_deref() != Some("open") {
-            tx.commit()?;
-            return Ok(false);
-        }
-        let payload = json!({ "assigned_to": assignee });
-        tx_append_event(
+        let outcome = control_ops::assign_item(
             &tx,
-            Some(item_id),
-            "issue.assigned",
-            &payload,
+            item_id,
+            assignee,
             None,
             self.event_effect_id.as_deref(),
             &now,
         )?;
-        tx.execute(
-            "UPDATE tracker_issues SET assigned_to = ?2, updated_at = ?3 WHERE issue_id = ?1",
-            params![item_id, assignee, now],
-        )?;
         tx.commit()?;
-        Ok(true)
+        Ok(outcome)
     }
 
     /// Records a `blocks(from -> to)` edge: `from` blocks `to`, so `to` is not

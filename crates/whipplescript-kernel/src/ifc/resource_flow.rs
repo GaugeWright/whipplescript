@@ -2,6 +2,25 @@
 use super::VerifiedEnvelope;
 
 impl VerifiedEnvelope {
+    /// Additional disclosure to an actual recipient, as when assigning a task.
+    /// The host separately resolves this principal through its current roster
+    /// and checks access to the actual resource; labels alone grant no access.
+    pub fn check_resource_reader(&self, resource: &str, principal: &str) -> Result<(), String> {
+        let envelope = self.envelope();
+        if !envelope.governs(resource) {
+            return Err("recipient resource is not governed".into());
+        }
+        let role = envelope.role_for_principal(principal);
+        if !envelope
+            .reader_set(resource)
+            .iter()
+            .all(|reader| envelope.can_act(role, reader))
+        {
+            return Err("resource exceeds recipient clearance".into());
+        }
+        Ok(())
+    }
+
     /// Verify that a program's alias and an adapter's resource identify the
     /// same governed object. Equal labels alone do not establish that binding.
     /// This query grants neither access nor execution authority.
@@ -104,6 +123,33 @@ mod tests {
             },
             "bindings": {"remembered": "memory:resolutions", "target": "file:/target"}
         })
+    }
+
+    #[test]
+    fn tracker_control_recipient_clearance_uses_read_labels_and_all_required_roles() {
+        let mut document = policy(json!(["A", "B"]), json!([]), json!([]), json!([]));
+        document["resources"]["memory:resolutions"]["reader_sink"] = json!([]);
+        document["parties"] = json!({"person:alice":"A", "agent:assistant":"Both"});
+        document["delegations"] = json!([["Both", "A"], ["Both", "B"]]);
+        let envelope = verified(document);
+        assert_eq!(
+            envelope.check_resource_reader("remembered", "agent:assistant"),
+            Ok(())
+        );
+        for principal in ["person:alice", "person:unknown"] {
+            assert_eq!(
+                envelope.check_resource_reader("remembered", principal),
+                Err("resource exceeds recipient clearance".into())
+            );
+        }
+        assert_eq!(
+            envelope.check_resource_reader("missing", "agent:assistant"),
+            Err("recipient resource is not governed".into())
+        );
+        assert_eq!(
+            envelope.check_resource_reader("target", "person:unknown"),
+            Ok(())
+        );
     }
 
     #[test]

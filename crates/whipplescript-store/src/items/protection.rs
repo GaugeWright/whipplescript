@@ -28,7 +28,7 @@ impl WorkItemStore {
                 [],
                 |row| row.get(0),
             )?;
-            if version >= SATELLITE_SCHEMA_VERSION {
+            if version >= PROTECTION_SCHEMA_VERSION {
                 return Err(StoreError::fault(
                     "tracker protection",
                     "missing durable protection binding",

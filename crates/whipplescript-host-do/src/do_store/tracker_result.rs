@@ -1,10 +1,23 @@
 use super::*;
 use whipplescript_store::tracker_result::{
     DeliveredTrackerResult, RecordedTrackerResult, TrackerClosureResultDelivery,
-    TrackerResultDelivery, TrackerResultPublications,
+    TrackerControlResultDelivery, TrackerResultDelivery, TrackerResultPublications,
 };
 
 impl<Sql: DoSql> TrackerResultPublications for DoSqliteStore<Sql> {
+    fn publish_tracker_control_result(
+        &mut self,
+        owner_epoch: i64,
+        expected_head: &str,
+        delivery: &TrackerControlResultDelivery,
+    ) -> StoreResult<StoredEvent> {
+        self.publish_tracker_delivery(
+            owner_epoch,
+            expected_head,
+            &DeliveredTrackerResult::from(delivery.clone()),
+        )
+    }
+
     fn publish_tracker_result(
         &mut self,
         owner_epoch: i64,
@@ -99,7 +112,7 @@ fn publish(
     if as_text(&row[0]) != "running"
         || as_text(&row[1]) != delivery.kind()
         || as_opt_text(&row[2]).as_deref() != delivery.target()
-        || as_text(&row[4]) != "queue"
+        || as_text(&row[4]) != delivery.provider()
         || !matches!(as_text(&row[3]).as_str(), "running" | "failed")
         || !matches!(
             run.as_str(),
@@ -174,7 +187,7 @@ fn publish(
             instance_id: delivery.instance_id(),
             effect_id: delivery.effect_id(),
             run_id: delivery.run_id(),
-            provider: "queue",
+            provider: delivery.provider(),
             worker_id: "tracker-recovery",
             status: "completed",
             exit_code: None,
@@ -410,6 +423,23 @@ mod tests {
         );
         assert_eq!(store.chain_head(&delivery.instance_id).unwrap(), head);
     }
+    #[test]
+    fn hosted_tracker_control_result_preserves_attempts_and_matches_original_dispatch() {
+        use whipplescript_store::tracker_result::control_conformance;
+        for status in ["running", "lease_expired", "failed"] {
+            control_conformance::run_suite(
+                &mut DoSqliteStore::new(RusqliteDoSql::with_runtime_schema()),
+                status,
+            );
+        }
+        for field in ["operation", "actor", "queue", "item", "subject", "deadline"] {
+            control_conformance::refuse_changed_dispatch(
+                &mut DoSqliteStore::new(RusqliteDoSql::with_runtime_schema()),
+                field,
+            );
+        }
+    }
+
     #[test]
     fn hosted_tracker_closing_result_preserves_attempts_and_matches_original_dispatch() {
         use whipplescript_store::tracker_result::closing_conformance;

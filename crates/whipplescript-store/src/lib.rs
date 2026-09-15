@@ -40,6 +40,7 @@ mod runtime_protection;
 #[cfg(feature = "native")]
 pub use runtime_protection::RuntimeEventMetadata;
 pub mod tracker_closure;
+pub mod tracker_control;
 pub mod tracker_filing;
 pub mod tracker_result;
 /// Relocated to `whipplescript-core` (DR-0052 R4.2: one selection
@@ -7431,7 +7432,7 @@ impl SqliteStore {
                       'workflow.revision_activated',
                       'effect.run_started',
                       'effect.terminal',
-                      'tracker.filing.result_delivered', 'tracker.closing.result_delivered',
+                      'tracker.filing.result_delivered', 'tracker.closing.result_delivered', 'tracker.control.result_delivered',
                       'effect.cancelled',
                       'effect.cancellation_requested',
                       'lease.expired',
@@ -7558,6 +7559,19 @@ impl SqliteStore {
                         &serde_json::from_str::<
                             tracker_result::RecordedTrackerResult<
                                 tracker_result::TrackerClosureResultDelivery,
+                            >,
+                        >(&payload_json)?
+                        .into_delivered(),
+                    )?
+                }
+                tracker_result::CONTROL_DELIVERY_EVENT if source == "kernel" => {
+                    tracker_result::apply_result(
+                        &tx,
+                        instance_id,
+                        &event_id,
+                        &serde_json::from_str::<
+                            tracker_result::RecordedTrackerResult<
+                                tracker_result::TrackerControlResultDelivery,
                             >,
                         >(&payload_json)?
                         .into_delivered(),

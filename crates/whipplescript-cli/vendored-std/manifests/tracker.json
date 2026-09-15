@@ -57,6 +57,25 @@
           "validation": "none"
         },
         {
+          "id": "tracker.assign",
+          "effect_kind": "capability.call",
+          "source_forms": ["call tracker.assign for <request> timeout <duration>"],
+          "input_schema": {
+            "queue": "string",
+            "id": "string",
+            "expected_assignee": "json",
+            "assigned_to": "json"
+          },
+          "output_schema": {
+            "id": "string",
+            "queue": "string",
+            "outcome": "json"
+          },
+          "required_capabilities": ["tracker.assign"],
+          "provider_kinds": ["builtin-tracker"],
+          "validation": "runtime_boundary"
+        },
+        {
           "id": "tracker.wait_closed",
           "effect_kind": "capability.call",
           "source_forms": ["call tracker.wait_closed for <issue> timeout <duration>"],
@@ -157,6 +176,10 @@
       "description": "Close a claimed issue with a completion summary."
     },
     {
+      "id": "tracker.assign",
+      "description": "Compare and set an issue's assignee without changing its claim or granting recipient access."
+    },
+    {
       "id": "tracker.wait_closed",
       "description": "Observe one recorded issue closure within a mandatory effect deadline, without claiming the issue or holding a worker."
     }
@@ -205,6 +228,13 @@
       "config": {}
     },
     {
+      "id": "builtin-tracker-assign",
+      "provider_kind": "builtin-tracker",
+      "capability": "tracker.assign",
+      "effect_kind": "capability.call",
+      "config": {}
+    },
+    {
       "id": "builtin-tracker-wait-closed",
       "provider_kind": "builtin-tracker",
       "capability": "tracker.wait_closed",
@@ -225,7 +255,8 @@
         "tracker.release",
         "tracker.release_count",
         "tracker.finish",
-        "tracker.wait_closed"
+        "tracker.wait_closed",
+        "tracker.assign"
       ],
       "config": {}
     }
@@ -270,6 +301,13 @@
       "id": "binding-tracker-finish",
       "program_id": null,
       "capability": "tracker.finish",
+      "provider": "builtin-tracker",
+      "config": {}
+    },
+    {
+      "id": "binding-tracker-assign",
+      "program_id": null,
+      "capability": "tracker.assign",
       "provider": "builtin-tracker",
       "config": {}
     },

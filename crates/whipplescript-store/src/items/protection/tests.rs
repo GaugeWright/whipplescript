@@ -560,3 +560,112 @@ fn stored_sql_cannot_invoke_host_decryption() {
         0
     );
 }
+
+#[test]
+fn protected_tracker_control_conformance_and_upgrade() {
+    crate::tracker_control::conformance::run_suite(&mut store());
+    let fixture = Fixture::new();
+    let codec = Arc::new(Codec::default());
+    let mut original =
+        WorkItemStore::create_protected(fixture.path(), protection(codec.clone())).unwrap();
+    let request = crate::tracker_control::conformance::setup(&mut original);
+    let events = original.export_events().unwrap();
+    original.connection.execute_batch("DELETE FROM schema_migrations; INSERT INTO schema_migrations VALUES (4, 'work-item'); DROP TABLE tracker_control_receipts").unwrap();
+    drop(original);
+    assert!(WorkItemStore::upgrade_existing_controls(fixture.path(), None).is_err());
+    assert!(WorkItemStore::upgrade_existing_controls(
+        fixture.path(),
+        Some(PayloadProtection::new("wrong", codec.clone()).unwrap())
+    )
+    .is_err());
+    let mut upgraded =
+        WorkItemStore::upgrade_existing_controls(fixture.path(), Some(protection(codec.clone())))
+            .unwrap();
+    assert_eq!(upgraded.export_events().unwrap(), events);
+    use crate::tracker_control::TrackerControls;
+    assert!(upgraded
+        .control_receipt(&request.operation_id)
+        .unwrap()
+        .is_none());
+    let receipt = upgraded.control_issue_once(&request).unwrap();
+    drop(upgraded);
+    let mut reopened =
+        WorkItemStore::open_existing_protected(fixture.path(), protection(codec)).unwrap();
+    assert_eq!(reopened.control_issue_once(&request).unwrap(), receipt);
+}
+
+#[test]
+fn generation_four_missing_protection_binding_cannot_be_initialized_as_plaintext() {
+    let fixture = Fixture::new();
+    let original =
+        WorkItemStore::create_protected(fixture.path(), protection(Arc::new(Codec::default())))
+            .unwrap();
+    original.connection.execute_batch("DELETE FROM schema_migrations; INSERT INTO schema_migrations VALUES (4, 'work-item'); DROP TABLE tracker_payload_protection; DROP TABLE tracker_control_receipts").unwrap();
+    fault(
+        WorkItemStore::open(fixture.path()),
+        "missing durable protection binding",
+    );
+    let current: i64 = original
+        .connection
+        .query_row("SELECT MAX(version) FROM schema_migrations", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(current, 4);
+    assert!(original
+        .connection
+        .prepare("SELECT * FROM tracker_control_receipts")
+        .is_err());
+}
+
+#[test]
+fn tracker_control_retains_keys_through_mutation_and_refuses_erased_retry() {
+    use crate::tracker_control::TrackerControls;
+    struct RetainedCodec {
+        inner: Codec,
+        active: AtomicBool,
+        enforce: AtomicBool,
+        unavailable: AtomicBool,
+    }
+    impl PayloadCodec for RetainedCodec {
+        fn seal(&self, aad: &[u8], plaintext: &[u8]) -> StoreResult<Vec<u8>> {
+            assert!(!self.enforce.load(Ordering::SeqCst) || self.active.load(Ordering::SeqCst));
+            self.inner.seal(aad, plaintext)
+        }
+        fn open(&self, aad: &[u8], ciphertext: &[u8]) -> StoreResult<Vec<u8>> {
+            self.inner.open(aad, ciphertext)
+        }
+        fn retain(&self, callback: &mut dyn FnMut() -> StoreResult<()>) -> StoreResult<()> {
+            if self.unavailable.load(Ordering::SeqCst) {
+                return Err(StoreError::fault("fixture", "retention unavailable"));
+            }
+            assert!(!self.active.swap(true, Ordering::SeqCst));
+            let result = callback();
+            self.active.store(false, Ordering::SeqCst);
+            result
+        }
+    }
+    let codec = Arc::new(RetainedCodec {
+        inner: Codec::default(),
+        active: AtomicBool::new(false),
+        enforce: AtomicBool::new(false),
+        unavailable: AtomicBool::new(false),
+    });
+    let mut store = WorkItemStore::open_in_memory_protected(
+        PayloadProtection::new("domain", codec.clone()).unwrap(),
+    )
+    .unwrap();
+    let request = crate::tracker_control::conformance::setup(&mut store);
+    codec.enforce.store(true, Ordering::SeqCst);
+    let receipt = store.control_issue_once(&request).unwrap();
+    assert!(!codec.active.load(Ordering::SeqCst));
+    let before = store.event_metadata().unwrap();
+    codec.unavailable.store(true, Ordering::SeqCst);
+    fault(store.control_issue_once(&request), "retention unavailable");
+    // Metadata receipt lookup is not authority to execute after key loss.
+    assert_eq!(
+        store.control_receipt(&request.operation_id).unwrap(),
+        Some(receipt)
+    );
+    assert_eq!(store.event_metadata().unwrap(), before);
+}

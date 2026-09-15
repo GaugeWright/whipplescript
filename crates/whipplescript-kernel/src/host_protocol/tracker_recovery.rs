@@ -25,6 +25,7 @@ pub struct RecoverTrackerResult {
 /// independently checks the fixed operation kind in its authenticated history.
 pub type RecoverTrackerFiling = RecoverTrackerResult;
 pub type RecoverTrackerClosure = RecoverTrackerResult;
+pub type RecoverTrackerControl = RecoverTrackerResult;
 
 impl RecoverTrackerResult {
     pub fn signing_bytes(&self) -> Result<Vec<u8>, ProtocolError> {

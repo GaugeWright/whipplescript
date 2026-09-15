@@ -33,6 +33,22 @@ fn is_action(instance: &str) -> bool {
 }
 
 impl<S: RuntimeStore> RuntimeKernel<S> {
+    pub(crate) fn execute_verified_tracker_control(
+        &mut self,
+        verified: VerifiedActionExecution,
+        control: &whipplescript_store::tracker_control::TrackerControl,
+        binding: &crate::tracker_control::TrackerControlBinding,
+    ) -> StoreResult<StoredEvent>
+    where
+        S: whipplescript_store::tracker_control::TrackerControls,
+    {
+        let instance = verified.request().admission.instance_ref.clone();
+        let effect = verified.observed().clone();
+        self.action_execution = Some(verified);
+        let mut scope = ExecutionScope(self);
+        crate::tracker_control::run(&mut scope, &instance, &effect, control, binding)
+    }
+
     pub(crate) fn execute_verified_tracker_closure(
         &mut self,
         verified: VerifiedActionExecution,

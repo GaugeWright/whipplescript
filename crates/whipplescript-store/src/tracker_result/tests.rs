@@ -438,3 +438,100 @@ fn native_tracker_recovery_preserves_historical_run_timestamps() {
         );
     }
 }
+
+#[test]
+fn tracker_control_result_application_evidence_requires_the_exact_attempt_and_issuer() {
+    let mut store = SqliteStore::open_in_memory().unwrap();
+    let delivery = control_conformance::setup(&mut store, "lease_expired");
+    let events = store.list_events(&delivery.control.instance_id).unwrap();
+    let start: Value = serde_json::from_str(
+        &events
+            .iter()
+            .find(|event| event.event_type == "effect.run_started")
+            .unwrap()
+            .payload_json,
+    )
+    .unwrap();
+    let evidence = delivery.application_evidence(&start).unwrap();
+    assert_eq!(evidence.disposition, EvidenceDisposition::Applied);
+    assert_eq!(
+        evidence.evidence_ref,
+        format!("tracker-control:{}", delivery.control.operation_id)
+    );
+    assert_eq!(evidence.authority_ref, "workspace:fixture");
+    for field in [
+        "protocol",
+        "instance_id",
+        "effect_id",
+        "run_id",
+        "kind",
+        "provider",
+        "target",
+    ] {
+        let mut altered = start.clone();
+        altered["external_dispatch"]["frame"][field] = "different".into();
+        assert!(
+            matches!(delivery.application_evidence(&altered), Err(StoreError::Conflict(message))
+            if message == "tracker control result evidence differs from its dispatch"),
+            "{field}"
+        );
+    }
+    for issuer in [Value::Null, json!(""), json!("   "), json!(7)] {
+        let mut altered = delivery.clone();
+        altered.recovery["issuer"] = issuer;
+        assert!(
+            matches!(altered.application_evidence(&start), Err(StoreError::Conflict(message))
+            if message == "tracker control result recovery issuer is missing")
+        );
+    }
+    for field in ["operation_id", "fingerprint", "item_id", "recorded_at"] {
+        let mut receipt = serde_json::to_value(&delivery.control_receipt).unwrap();
+        receipt[field] = "another".into();
+        let receipt = serde_json::from_value(receipt).unwrap();
+        assert_ne!(
+            control_receipt_evidence_digest(&receipt),
+            evidence.evidence_digest,
+            "{field}"
+        );
+    }
+}
+
+#[test]
+fn tracker_control_result_requires_complete_publication_coordinates() {
+    let mut store = SqliteStore::open_in_memory().unwrap();
+    let delivery = control_conformance::setup(&mut store, "running");
+    for field in ["run_id", "fact_id"] {
+        for blank in ["", "   "] {
+            let mut value = serde_json::to_value(&delivery).unwrap();
+            value[field] = json!(blank);
+            let invalid: TrackerControlResultDelivery = serde_json::from_value(value).unwrap();
+            assert!(
+                matches!(invalid.validate(), Err(StoreError::Conflict(message))
+                if message == "tracker control result coordinates are incomplete")
+            );
+        }
+    }
+    for recovery in [Value::Null, json!("issuer"), json!([])] {
+        let invalid = TrackerControlResultDelivery {
+            recovery,
+            ..delivery.clone()
+        };
+        assert!(
+            matches!(invalid.validate(), Err(StoreError::Conflict(message))
+            if message == "tracker control result coordinates are incomplete")
+        );
+    }
+}
+
+#[test]
+fn native_tracker_control_result_preserves_attempts_and_matches_original_dispatch() {
+    for status in ["running", "lease_expired", "failed"] {
+        control_conformance::run_suite(&mut SqliteStore::open_in_memory().unwrap(), status);
+    }
+    for field in ["operation", "actor", "queue", "item", "subject", "deadline"] {
+        control_conformance::refuse_changed_dispatch(
+            &mut SqliteStore::open_in_memory().unwrap(),
+            field,
+        );
+    }
+}

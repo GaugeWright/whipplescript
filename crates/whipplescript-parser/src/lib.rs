@@ -14214,6 +14214,15 @@ fn collect_bounded_egresses(
 /// string literals, extracts `{{ … }}` interpolation roots (those refs live as raw
 /// text inside the literal, not as structured nodes). A bare identifier parses as
 /// `Literal(Ident)`, a dotted ref as `Path` — both are roots.
+/// Existing expression provenance, available to package policy adapters without
+/// introducing another expression walker or changing source lowering.
+pub fn expression_binding_roots(source: &str) -> Result<BTreeSet<String>, String> {
+    let expr = parse_expression(source)?;
+    let mut roots = BTreeSet::new();
+    collect_expr_binding_roots(&expr, &mut roots);
+    Ok(roots)
+}
+
 fn collect_expr_binding_roots(expr: &Expr, out: &mut BTreeSet<String>) {
     match expr {
         Expr::Literal(ExprLiteral::String(text)) => collect_template_binding_roots(text, out),

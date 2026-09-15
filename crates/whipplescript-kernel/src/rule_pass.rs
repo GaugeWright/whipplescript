@@ -449,18 +449,27 @@ pub fn step_instance_generic<S: RuntimeStore + Coordination + WorkItems + Fronti
                     event.event_type.as_str(),
                     whipplescript_store::tracker_result::DELIVERY_EVENT
                         | whipplescript_store::tracker_result::CLOSING_DELIVERY_EVENT
+                        | whipplescript_store::tracker_result::CONTROL_DELIVERY_EVENT
                 ) && event.source == "kernel"
                 {
                     use whipplescript_store::tracker_result::{
                         RecordedTrackerResult, TrackerClosureResultDelivery,
+                        TrackerControlResultDelivery,
                     };
                     let record = if event.event_type
                         == whipplescript_store::tracker_result::DELIVERY_EVENT
                     {
                         serde_json::from_str::<RecordedTrackerResult>(&event.payload_json)?
                             .into_delivered()
-                    } else {
+                    } else if event.event_type
+                        == whipplescript_store::tracker_result::CLOSING_DELIVERY_EVENT
+                    {
                         serde_json::from_str::<RecordedTrackerResult<TrackerClosureResultDelivery>>(
+                            &event.payload_json,
+                        )?
+                        .into_delivered()
+                    } else {
+                        serde_json::from_str::<RecordedTrackerResult<TrackerControlResultDelivery>>(
                             &event.payload_json,
                         )?
                         .into_delivered()

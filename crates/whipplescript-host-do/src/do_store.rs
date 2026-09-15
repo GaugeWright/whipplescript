@@ -37,6 +37,8 @@ mod dispatch;
 mod host_actions;
 pub(crate) mod recovery;
 mod tracker_closure;
+mod tracker_control;
+mod tracker_control_ops;
 mod tracker_filing;
 mod tracker_result;
 pub(crate) mod transaction;
@@ -3841,7 +3843,7 @@ impl<Sql: DoSql> DoSqliteStore<Sql> {
                      'workflow.failed', \
                      'instance.transitioned', 'workflow.revision_activated', 'effect.run_started', \
                      'effect.terminal', 'effect.cancelled', 'effect.cancellation_requested', \
-                     'lease.expired', 'tracker.filing.result_delivered', 'tracker.closing.result_delivered', 'context.restored'){bound_clause} ORDER BY sequence"
+                     'lease.expired', 'tracker.filing.result_delivered', 'tracker.closing.result_delivered', 'tracker.control.result_delivered', 'context.restored'){bound_clause} ORDER BY sequence"
                 ),
                 &[text(instance_id)],
             )
@@ -3948,6 +3950,21 @@ impl<Sql: DoSql> DoSqliteStore<Sql> {
                         &serde_json::from_str::<
                             whipplescript_store::tracker_result::RecordedTrackerResult<
                                 whipplescript_store::tracker_result::TrackerClosureResultDelivery,
+                            >,
+                        >(&payload_json)?
+                        .into_delivered(),
+                    )?
+                }
+                whipplescript_store::tracker_result::CONTROL_DELIVERY_EVENT
+                    if source == "kernel" =>
+                {
+                    tracker_result::apply_result(
+                        &self.sql,
+                        instance_id,
+                        &event_id,
+                        &serde_json::from_str::<
+                            whipplescript_store::tracker_result::RecordedTrackerResult<
+                                whipplescript_store::tracker_result::TrackerControlResultDelivery,
                             >,
                         >(&payload_json)?
                         .into_delivered(),
@@ -8113,54 +8130,14 @@ impl<Sql: DoSql> WorkItems for DoSqliteStore<Sql> {
         expires: Option<&str>,
     ) -> StoreResult<ClaimOutcome> {
         let now = do_now(&self.sql)?;
-        let exists = !self
-            .sql
-            .query(
-                "SELECT 1 FROM tracker_issues WHERE issue_id = ?1",
-                &[text(item_id)],
-            )
-            .map_err(sql_err)?
-            .is_empty();
-        if !exists {
-            return Ok(ClaimOutcome::NotFound);
-        }
-        do_expire_stale_leases(&self.sql, item_id, &now)?;
-        // Exclusivity (tracker-lease I1): grant only when no active lease. The
-        // single-writer invocation serializes this check-then-insert.
-        if let Some(holder) = do_active_holder(&self.sql, item_id)? {
-            return Ok(ClaimOutcome::AlreadyClaimed { holder });
-        }
-        // The lease's identity IS its `claim.acquired` event (content hash) —
-        // merge-stable across clones, matching the native store.
-        let content_id = do_content_id(&self.sql, item_id)?
-            .ok_or_else(|| StoreError::Conflict(format!("unknown issue alias {item_id}")))?;
-        // `expires` is an absolute deadline (`None` = no TTL); it records a
-        // claim-TTL lease that `ready`/`claim` lazily reclaim once past-due.
-        let payload = serde_json::json!({"actor": claimed_by, "expires_at": expires});
-        let lease_id = do_tracker_append_raw(
+        tracker_control_ops::claim_item(
             &self.sql,
-            Some(&content_id),
-            None,
-            "claim.acquired",
-            &payload.to_string(),
-            Some(claimed_by),
+            item_id,
+            claimed_by,
+            expires,
             self.event_effect_id.as_deref(),
             &now,
-        )?;
-        self.sql
-            .execute(
-                "INSERT INTO tracker_leases (lease_id, issue_id, actor, acquired_at, expires_at, released_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, NULL)",
-                &[
-                    text(&lease_id),
-                    text(item_id),
-                    text(claimed_by),
-                    text(&now),
-                    opt_text(expires),
-                ],
-            )
-            .map_err(sql_err)?;
-        Ok(ClaimOutcome::Claimed)
+        )
     }
 
     fn renew_claim(
@@ -8170,52 +8147,14 @@ impl<Sql: DoSql> WorkItems for DoSqliteStore<Sql> {
         expires: Option<&str>,
     ) -> StoreResult<RenewOutcome> {
         let now = do_now(&self.sql)?;
-        let rows = self
-            .sql
-            .query(
-                "SELECT lease_id, expires_at FROM tracker_leases \
-                 WHERE issue_id = ?1 AND actor = ?2 AND released_at IS NULL \
-                   AND (expires_at IS NULL OR expires_at > ?3)",
-                &[text(item_id), text(actor), text(&now)],
-            )
-            .map_err(sql_err)?;
-        let Some(row) = rows.first() else {
-            return Ok(RenewOutcome::NotHeld);
-        };
-        let lease_id = as_text(&row[0]);
-        let current_expires = as_opt_text(&row[1]);
-        // Monotonicity (tracker-lease I2): a finite deadline may not move back.
-        if let (Some(want), Some(current)) = (expires, current_expires.as_deref()) {
-            if want <= current {
-                return Ok(RenewOutcome::NotMonotonic);
-            }
-        }
-        let new_expires: Option<String> = match expires {
-            Some(want) => Some(want.to_owned()),
-            None => current_expires,
-        };
-        let payload =
-            serde_json::json!({"lease_id": lease_id, "actor": actor, "expires_at": new_expires});
-        do_tracker_append(
+        tracker_control_ops::renew_claim(
             &self.sql,
-            Some(item_id),
-            "claim.renewed",
-            &payload,
-            Some(actor),
+            item_id,
+            actor,
+            expires,
             self.event_effect_id.as_deref(),
             &now,
-        )?;
-        if expires.is_some() {
-            self.sql
-                .execute(
-                    "UPDATE tracker_leases SET expires_at = ?2 WHERE lease_id = ?1",
-                    &[text(&lease_id), opt_text(new_expires.as_deref())],
-                )
-                .map_err(sql_err)?;
-        }
-        Ok(RenewOutcome::Renewed {
-            expires_at: new_expires,
-        })
+        )
     }
 
     fn release_item(
@@ -9613,6 +9552,7 @@ pub mod test_support {
             INSERT INTO schema_migrations (version, name) VALUES (3, 'retained-write-results');
             INSERT INTO schema_migrations (version, name) VALUES (4, 'tracker-filing-receipts');
             INSERT INTO schema_migrations (version, name) VALUES (5, 'tracker-closure-receipts');
+            INSERT INTO schema_migrations (version, name) VALUES (6, 'tracker-control-receipts');
             CREATE TABLE events (
                 event_id TEXT PRIMARY KEY, instance_id TEXT NOT NULL, sequence INTEGER NOT NULL,
                 event_type TEXT NOT NULL, payload_json TEXT NOT NULL, occurred_at TEXT NOT NULL,
@@ -9915,6 +9855,8 @@ pub mod test_support {
             .expect("tracker filing schema");
         conn.execute_batch(whipplescript_store::tracker_closure::SCHEMA)
             .expect("tracker closure schema");
+        conn.execute_batch(whipplescript_store::tracker_control::SCHEMA)
+            .expect("tracker control schema");
         DoSqliteStore::new(RusqliteDoSql {
             conn: std::rc::Rc::new(conn),
         })
@@ -12518,7 +12460,7 @@ pub(crate) mod tests {
     fn do_store_core_methods_run_real_sql() {
         let store = store();
 
-        assert_eq!(store.schema_version().expect("version"), 5);
+        assert_eq!(store.schema_version().expect("version"), 6);
         assert!(!store.fact_exists("i1", "ready").expect("fact"));
 
         let event = store

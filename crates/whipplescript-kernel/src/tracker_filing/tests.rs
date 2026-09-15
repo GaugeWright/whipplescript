@@ -1315,3 +1315,6 @@ mod recovery_refusals;
 
 #[path = "closure_tests.rs"]
 mod governed_closure;
+
+#[path = "control_tests.rs"]
+mod governed_control;

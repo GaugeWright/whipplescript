@@ -3085,7 +3085,9 @@ fn effect_read_resources<'a>(
     shared_coordination: &BTreeSet<String>,
 ) -> Vec<&'a str> {
     if let Some(call) = &effect.package_call {
-        if call.target == crate::tracker_wait::CAPABILITY {
+        if call.target == crate::tracker_wait::CAPABILITY
+            || crate::tracker_control::is_control_capability(&call.target)
+        {
             return call.tracker_resources.iter().map(String::as_str).collect();
         }
     }
@@ -3098,11 +3100,22 @@ fn effect_read_resources<'a>(
     }
 }
 
+fn tracker_control_write_resources(effect: &IrEffectNode) -> impl Iterator<Item = &str> {
+    effect
+        .package_call
+        .as_ref()
+        .filter(|call| crate::tracker_control::is_control_capability(&call.target))
+        .into_iter()
+        .flat_map(|call| call.tracker_resources.iter().map(String::as_str))
+}
+
 fn selected_effect_integrity_sinks(
     effect: &IrEffectNode,
     shared_coordination: &BTreeSet<String>,
 ) -> Vec<String> {
-    let mut sinks = Vec::new();
+    let mut sinks: Vec<String> = tracker_control_write_resources(effect)
+        .map(str::to_owned)
+        .collect();
     let flow = effect_flow(&effect.kind);
     if let Some(resource) = ifc_resource_for_effect(effect, shared_coordination) {
         if flow.writes_resource {
@@ -4542,7 +4555,9 @@ fn resolve_root_sources(
     }
     if let Some(effect) = effect_by_binding.get(base) {
         if let Some(call) = &effect.package_call {
-            if call.target == crate::tracker_wait::CAPABILITY {
+            if call.target == crate::tracker_wait::CAPABILITY
+                || crate::tracker_control::is_control_capability(&call.target)
+            {
                 return Some(call.tracker_resources.iter().cloned().collect());
             }
         }
@@ -5051,6 +5066,10 @@ pub fn check_with_envelope_imports(
         let mut writes: Vec<&str> = Vec::new();
         let mut span = None;
         for effect in &rule.metadata.effects {
+            for resource in tracker_control_write_resources(effect) {
+                writes.push(resource);
+                span.get_or_insert(effect.span);
+            }
             for resource in effect_read_resources(effect, &shared_coordination) {
                 reads.push(resource);
                 span.get_or_insert(effect.span);
@@ -5831,6 +5850,57 @@ pub fn check_with_envelope_imports(
                     .flatten()
             }))
             .collect();
+        for effect in &rule.metadata.effects {
+            let Some(call) = effect
+                .package_call
+                .as_ref()
+                .filter(|call| call.target == "tracker.assign")
+            else {
+                continue;
+            };
+            let crosses = call
+                .tracker_resources
+                .iter()
+                .any(|tracker| endorsed_claim_trackers.contains(tracker.as_str()));
+            let roots = call
+                .argument
+                .as_deref()
+                .and_then(|source| whipplescript_parser::expression_binding_roots(source).ok());
+            // Resolve fact and intermediate-value provenance as well as
+            // inbound messages. A queue may accept public filings while its
+            // read side is vouched; that permission cannot choose its endorser.
+            let untrusted = roots.is_none_or(|roots| {
+                roots.iter().any(|root| {
+                    resolve_root_sources(
+                        root,
+                        &rule.metadata,
+                        &effect_by_binding,
+                        &trigger_sources,
+                        &mut BTreeSet::new(),
+                    )
+                    .is_none_or(|sources| {
+                        sources.iter().any(|source| {
+                            call.tracker_resources.iter().any(|tracker| {
+                                endorsed_claim_trackers.contains(tracker.as_str())
+                                    && !envelope.dominates(
+                                        &envelope.integrity_set(source),
+                                        &envelope.integrity_set(tracker),
+                                    )
+                            })
+                        })
+                    })
+                })
+            });
+            if crosses && untrusted {
+                diagnostics.push(Diagnostic {
+                    code: diagnostic_code!("security.untrusted_selector"), severity: Severity::Error,
+                    span: effect.span,
+                    message: format!("denied influence in rule `{}`: untrusted tracker.assign arguments may not choose an assignee in a tracker this program claims endorsed (NMIF-on-the-assignee)", rule.name),
+                    suggestion: whipplescript_parser::suggest("assign from vouched data before choosing the endorser"),
+                    related: Vec::new(), fixits: Vec::new(),
+                });
+            }
+        }
         for (tracker, per_field) in &rule.metadata.tracker_file_field_reads {
             if !endorsed_claim_trackers.contains(tracker.as_str()) {
                 continue;
@@ -6157,6 +6227,14 @@ pub fn ifc_surface(ir: &IrProgram) -> Vec<String> {
             if let Some(resource) = ifc_resource_for_effect(effect, &shared_coordination) {
                 surface.insert(resource.to_owned());
             }
+            surface.extend(
+                effect_read_resources(effect, &shared_coordination)
+                    .into_iter()
+                    .map(str::to_owned),
+            );
+            // A principal-owned tracker control (claim/renew/release/reassign)
+            // writes its target tracker, which is a door like any other.
+            surface.extend(tracker_control_write_resources(effect).map(str::to_owned));
             if let Some(target) = &effect.workflow_target {
                 surface.insert(format!("invoke:{target}"));
             }
