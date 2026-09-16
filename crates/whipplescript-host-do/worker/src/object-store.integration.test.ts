@@ -1,7 +1,7 @@
 import { env, SELF } from "cloudflare:test";
 import type { DurableObjectNamespace } from "@cloudflare/workers-types";
 import { handleObjectPlane } from "./object-store";
-import { beforeEach, describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 
 /**
  * The external byte tier's data plane, against a real bucket.
@@ -242,6 +242,251 @@ describe("the object plane", () => {
             method: "POST",
             headers: { "content-type": "application/json", authorization: `Bearer ${TOKEN}` },
             body: JSON.stringify({ id: "not-a-content-id", byte_len: 8 }),
+        });
+        expect(bogus.status).toBe(400);
+    });
+});
+
+/**
+ * Ingest: bytes the plane pulls rather than bytes a writer pushes.
+ *
+ * The two directions differ in exactly one fact — whether anybody knows the
+ * digest before the transfer — and everything else about this route follows
+ * from not knowing it.
+ */
+describe("the ingest direction", () => {
+    /** Each stubbed source answers one URL. Anything else throws rather than
+     *  reaching the network, so a check that stopped working shows up as a
+     *  failure rather than as a real request to a `.invalid` host. */
+    function stubSources(sources: Record<string, () => Response>): string[] {
+        const asked: string[] = [];
+        vi.stubGlobal("fetch", async (input: RequestInfo | URL): Promise<Response> => {
+            const target = input instanceof Request ? input.url : String(input);
+            asked.push(target);
+            const make = sources[target];
+            if (!make) throw new Error(`unexpected fetch: ${target}`);
+            return make();
+        });
+        return asked;
+    }
+
+    function sized(bytes: Uint8Array): Response {
+        return new Response(bytes, { headers: { "content-length": String(bytes.length) } });
+    }
+
+    async function ingest(url: string): Promise<Response> {
+        return SELF.fetch(
+            "https://host/v1/object-ingest",
+            authed({
+                method: "POST",
+                headers: { "content-type": "application/json" },
+                body: JSON.stringify({ url }),
+            }),
+        );
+    }
+
+    beforeEach(async () => {
+        for (const { key } of (await env.WHIP_OBJECTS.list()).objects) {
+            await env.WHIP_OBJECTS.delete(key);
+        }
+    });
+
+    /** The whole claim in one test: one pass over bytes nobody had read, and
+     *  an id computed from them rather than asserted about them. */
+    it("pulls bytes from a declared source and says what they turned out to be", async () => {
+        const picture = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0xff, 0xfe]);
+        stubSources({ "https://media.test.invalid/a.png": () => sized(picture) });
+
+        const pulled = await ingest("https://media.test.invalid/a.png");
+        expect(pulled.status, await pulled.clone().text()).toBe(201);
+        const answer = (await pulled.json()) as {
+            id: string;
+            byte_len: number;
+            storage_key: string;
+        };
+        expect(answer.id).toBe(await contentId(picture));
+        expect(answer.byte_len).toBe(picture.length);
+        expect(answer.storage_key).toMatch(/^s-[0-9a-f]{32}$/);
+        // Not under its id: the key had to be named before the digest existed.
+        expect(await env.WHIP_OBJECTS.head(answer.id)).toBeNull();
+
+        const read = await SELF.fetch(`https://host/v1/objects/${answer.storage_key}`, authed());
+        expect(read.status).toBe(200);
+        // A staging token is a key and not a hash, so it is not answered under
+        // a header every reader takes for a content id.
+        expect(read.headers.get("x-whip-object-key")).toBe(answer.storage_key);
+        expect(read.headers.get("x-whip-content-id")).toBeNull();
+        expect(new Uint8Array(await read.arrayBuffer())).toEqual(picture);
+    });
+
+    /** The URL arrives from a model's answer, so it is attacker-influencable in
+     *  the ordinary case. A route that fetched it unchecked would be a request
+     *  forger with this Worker's network position. */
+    it("refuses a source no deployment declared, without fetching it", async () => {
+        const asked = stubSources({});
+        const refused = await ingest("https://elsewhere.example/secret");
+        expect(refused.status).toBe(403);
+        expect(await refused.text()).toContain("elsewhere.example");
+        expect(asked, "the refusal happens before the request, not after").toEqual([]);
+    });
+
+    /** An allowlist checked only at the first URL is not an allowlist: one open
+     *  redirector on a declared host forwards the fetch anywhere. */
+    it("re-checks the allowlist at every redirect", async () => {
+        const asked = stubSources({
+            "https://media.test.invalid/open": () =>
+                new Response(null, { status: 302, headers: { location: "https://elsewhere.example/x" } }),
+        });
+        const refused = await ingest("https://media.test.invalid/open");
+        expect(refused.status).toBe(403);
+        expect(await refused.text()).toContain("elsewhere.example");
+        expect(asked).toEqual(["https://media.test.invalid/open"]);
+        expect((await env.WHIP_OBJECTS.list()).objects, "and nothing was written").toEqual([]);
+    });
+
+    /** Real sources redirect — a provider handing off to its CDN. A hop inside
+     *  the list is followed, or the check would be a ban. */
+    it("follows a redirect that stays inside the list", async () => {
+        const bytes = new Uint8Array([1, 2, 3, 4, 5]);
+        stubSources({
+            "https://media.test.invalid/a": () =>
+                new Response(null, { status: 302, headers: { location: "https://mirror.test.invalid/b" } }),
+            "https://mirror.test.invalid/b": () => sized(bytes),
+        });
+        const pulled = await ingest("https://media.test.invalid/a");
+        expect(pulled.status, await pulled.clone().text()).toBe(201);
+        expect(await pulled.json()).toMatchObject({ id: await contentId(bytes), byte_len: 5 });
+    });
+
+    /** The same requirement a push has, owed by the source instead of the
+     *  caller. Reading the body to discover its size is the one way out, and it
+     *  is the thing this route may not do. */
+    it("refuses a source that will not say how long it is", async () => {
+        stubSources({
+            "https://media.test.invalid/chunked": () => new Response(new Uint8Array([1, 2, 3])),
+        });
+        const refused = await ingest("https://media.test.invalid/chunked");
+        expect(refused.status).toBe(411);
+        expect((await env.WHIP_OBJECTS.list()).objects).toEqual([]);
+    });
+
+    /** A key nothing is told about is a key nothing can collect, so a failed
+     *  ingest takes its own object with it rather than leaving unreachable
+     *  bytes in the bucket.
+     *
+     *  This is the only test that errors a `put` mid-stream, and the workers
+     *  pool logs "Can't read from request stream because client disconnected"
+     *  twice while unwinding it — its R2 simulation proxies the body over an
+     *  internal request, and aborting the transfer disconnects that request's
+     *  client. It is the simulator describing itself: the lines appear with the
+     *  route's own cleanup removed, and vitest reports no error. */
+    it("leaves nothing behind when the source overruns the length it declared", async () => {
+        stubSources({
+            "https://media.test.invalid/liar": () =>
+                new Response(new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]), {
+                    headers: { "content-length": "3" },
+                }),
+        });
+        const failed = await ingest("https://media.test.invalid/liar");
+        expect(failed.status, await failed.clone().text()).toBe(502);
+        expect((await env.WHIP_OBJECTS.list()).objects).toEqual([]);
+    });
+
+    /** The object plane is routed ahead of the Worker's control-body cap,
+     *  because that cap exists for JSON the isolate parses and the byte routes
+     *  carry bodies too large to hold. Ingest sits on both sides of that: its
+     *  own request is JSON the isolate parses, and only its source is large, so
+     *  it may not inherit an exemption written for a different kind of body. */
+    it("caps its own request body, which names a source rather than carrying one", async () => {
+        const asked = await SELF.fetch(
+            "https://host/v1/object-ingest",
+            authed({
+                method: "POST",
+                headers: { "content-type": "application/json" },
+                body: JSON.stringify({ url: `https://media.test.invalid/${"a".repeat(16 * 1024)}` }),
+            }),
+        );
+        expect(asked.status).toBe(413);
+    });
+
+    /** Only this route mints staging keys. A writer holding the digest has
+     *  every reason to key on the id — that is what makes its claim checkable —
+     *  so accepting a staging key on a PUT would be a way to write bytes no
+     *  check applies to. */
+    it("refuses a written object keyed on a staging token", async () => {
+        const staged = `s-${"ab".repeat(16)}`;
+        const written = await SELF.fetch(
+            `https://host/v1/objects/${staged}`,
+            authed({
+                method: "PUT",
+                body: new Uint8Array([1]),
+                headers: {
+                    "x-whip-content-sha256": await sha256Hex(new Uint8Array([1])),
+                },
+            }),
+        );
+        expect(written.status).toBe(400);
+        expect(await written.text()).toContain("keyed on its content id");
+    });
+
+    /** Both halves of an ingest: the plane holds bytes under a minted key, and
+     *  the placement is what pairs that key with the id they turned out to
+     *  have. Until it does, the object is bytes nothing can name. */
+    it("registers an ingested handle, and tells a loser what it orphaned", async () => {
+        const bytes = new Uint8Array([9, 8, 7, 6]);
+        stubSources({ "https://media.test.invalid/one": () => sized(bytes) });
+
+        const first = (await (await ingest("https://media.test.invalid/one")).json()) as {
+            id: string;
+            byte_len: number;
+            storage_key: string;
+        };
+        const second = (await (await ingest("https://media.test.invalid/one")).json()) as {
+            storage_key: string;
+        };
+        expect(second.storage_key).not.toBe(first.storage_key);
+
+        const namespace = (env as unknown as { WORKFLOW_INSTANCE: DurableObjectNamespace })
+            .WORKFLOW_INSTANCE;
+        const stub = namespace.get(namespace.idFromName("ingested-handle-registration"));
+        async function register(storage_key: string): Promise<Response> {
+            return stub.fetch("https://placement/host/objects/register", {
+                method: "POST",
+                headers: { "content-type": "application/json", authorization: `Bearer ${TOKEN}` },
+                body: JSON.stringify({ id: first.id, byte_len: first.byte_len, storage_key }),
+            });
+        }
+
+        const won = await register(first.storage_key);
+        expect(won.status, await won.clone().text()).toBe(200);
+        expect(await won.json()).toMatchObject({
+            registered: first.id,
+            storage_key: first.storage_key,
+        });
+
+        // Same bytes, second object. The id already means the first one, and
+        // moving it is the substitution content addressing exists to prevent.
+        const lost = await register(second.storage_key);
+        expect(await lost.json()).toMatchObject({
+            storage_key: first.storage_key,
+            orphaned: second.storage_key,
+        });
+    });
+
+    /** A key the plane did not mint is a caller-chosen name in the bucket, and
+     *  keying on the hash is what kept those out. */
+    it("refuses a handle registered under a key the plane never minted", async () => {
+        const namespace = (env as unknown as { WORKFLOW_INSTANCE: DurableObjectNamespace })
+            .WORKFLOW_INSTANCE;
+        const stub = namespace.get(namespace.idFromName("ingested-handle-refusal"));
+        const bogus = await stub.fetch("https://placement/host/objects/register", {
+            method: "POST",
+            headers: { "content-type": "application/json", authorization: `Bearer ${TOKEN}` },
+            body: JSON.stringify({
+                id: await contentId(new Uint8Array([1])),
+                byte_len: 1,
+                storage_key: "../../somewhere-else",
+            }),
         });
         expect(bogus.status).toBe(400);
     });

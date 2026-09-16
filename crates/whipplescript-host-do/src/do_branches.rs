@@ -1331,6 +1331,32 @@ fn is_content_id(id: &str) -> bool {
             .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
 }
 
+/// A blob awaiting collection from the bucket: the id whose bytes are forfeit
+/// by decision, and the key the plane must delete to make that true.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PendingExternalDelete {
+    pub id: String,
+    pub storage_key: String,
+}
+
+/// A staged key is `s-` followed by sixteen random bytes, hex.
+///
+/// Ingested content cannot be keyed on its id. The digest is known only once
+/// the bytes have passed, and by then the `put` that consumed them has already
+/// had to name a key, so the plane mints one before the transfer and records
+/// it here afterwards. That is safe only while a staged key's shape is as
+/// narrow as an id's: a key a caller could choose freely would be an arbitrary
+/// name in the bucket's namespace, which is the thing keying on the hash
+/// refused in the first place. The `s-` prefix cannot collide with an id,
+/// which is hex throughout.
+fn is_staged_key(key: &str) -> bool {
+    key.len() == 34
+        && key.starts_with("s-")
+        && key[2..]
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
 /// A JS number as a byte length, or a refusal naming why it is not one.
 ///
 /// The wasm boundary hands every number across as `f64`, so "non-negative whole
@@ -1431,6 +1457,20 @@ impl<S: DoSql> DoContentBlobs<S> {
             &[],
         )
         .map_err(sql_err)?;
+        // Where a spilled blob's bytes actually sit, when that is not under its
+        // id. Additive for the same reason its neighbours are, and its absence
+        // carries meaning rather than being a gap: every row written before
+        // ingest existed was stored under its id, because a push knows the
+        // digest before it chooses a key and had no other key to use. So "no
+        // row here" reads as "the key is the id", which is true of all of them.
+        sql.execute(
+            "CREATE TABLE IF NOT EXISTS content_external_keys (
+                id TEXT PRIMARY KEY,
+                storage_key TEXT NOT NULL
+            )",
+            &[],
+        )
+        .map_err(sql_err)?;
         let store = Self {
             sql,
             external: None,
@@ -1464,7 +1504,8 @@ impl<S: DoSql> DoContentBlobs<S> {
         body.len() < self.threshold_bytes && std::str::from_utf8(body).is_ok()
     }
 
-    /// Record that content of this id and length exists on the object plane.
+    /// Record that content of this id and length exists on the object plane,
+    /// stored under its id.
     ///
     /// The plane has already placed and verified the bytes — it streams them to
     /// the bucket under a server-side checksum, so by the time this is called
@@ -1472,32 +1513,112 @@ impl<S: DoSql> DoContentBlobs<S> {
     /// that they are there, which is a small synchronous write this isolate can
     /// make.
     pub fn register_external(&self, id: &str, byte_len: u64) -> StoreResult<()> {
+        self.register_external_at(id, byte_len, None).map(|_| ())
+    }
+
+    /// The same, naming the key the bytes were actually stored under, and
+    /// answering with the key this id means once the registration settles.
+    ///
+    /// `None` is the push path: a writer that already holds the digest chooses
+    /// the id as its key, and the two are the same string. `Some` is the ingest
+    /// path, where the plane had to name a key before it could learn the digest
+    /// and so cannot have used the id.
+    ///
+    /// The answer matters because two ingests of identical bytes mint two keys
+    /// and write two objects, and only one of them can be what the id means.
+    /// The first registration is it — moving an id's bytes out from under a
+    /// reader that already resolved it is exactly the substitution content
+    /// addressing exists to prevent. The caller learns it lost by getting back
+    /// a key it did not offer, and collects the object it orphaned.
+    pub fn register_external_at(
+        &self,
+        id: &str,
+        byte_len: u64,
+        storage_key: Option<&str>,
+    ) -> StoreResult<String> {
         if !is_content_id(id) {
             return Err(StoreError::Conflict(format!(
                 "`{id}` is not a content id; the object plane keys on the hash of the bytes"
             )));
         }
+        if let Some(key) = storage_key {
+            if !is_staged_key(key) {
+                return Err(StoreError::Conflict(format!(
+                    "`{key}` is not a staged object key; the plane mints these, and a key \
+                     named anywhere else could point an id at bytes it does not describe"
+                )));
+            }
+        }
+        // Read before write: whether this id is already registered decides
+        // whose key it keeps, and `INSERT OR IGNORE` alone cannot tell the
+        // difference between the row it wrote and the row it left.
+        let already = self.external_len(id)?.is_some();
         self.sql
             .execute(
                 "INSERT OR IGNORE INTO content_external_blobs (id, byte_len) VALUES (?1, ?2)",
                 &[text(id), SqlValue::Int(byte_len as i64)],
             )
             .map_err(sql_err)?;
-        Ok(())
+        if !already {
+            if let Some(key) = storage_key {
+                self.sql
+                    .execute(
+                        "INSERT OR IGNORE INTO content_external_keys (id, storage_key) \
+                         VALUES (?1, ?2)",
+                        &[text(id), text(key)],
+                    )
+                    .map_err(sql_err)?;
+            }
+        }
+        self.external_storage_key(id)
     }
 
-    /// Ids whose bytes are erased by decision and still await collection from
-    /// the bucket. The object plane drains this; the isolate cannot delete
-    /// from R2 itself.
-    pub fn pending_external_deletes(&self, limit: u32) -> StoreResult<Vec<String>> {
+    /// Where this id's bytes sit on the plane: its staged key, or the id.
+    ///
+    /// Every read of the external tier goes through here rather than using the
+    /// id directly, because the two agree for most content and disagree for
+    /// exactly the content a caller is least likely to have tested with.
+    pub fn external_storage_key(&self, id: &str) -> StoreResult<String> {
         let rows = self
             .sql
             .query(
-                "SELECT id FROM content_external_pending_delete ORDER BY id LIMIT ?1",
+                "SELECT storage_key FROM content_external_keys WHERE id = ?1",
+                &[text(id)],
+            )
+            .map_err(sql_err)?;
+        Ok(rows
+            .first()
+            .map(|row| as_text(&row[0]))
+            .unwrap_or_else(|| id.to_owned()))
+    }
+
+    /// Blobs whose bytes are erased by decision and still await collection from
+    /// the bucket. The object plane drains this; the isolate cannot delete
+    /// from R2 itself.
+    ///
+    /// Each entry carries the key as well as the id, because the plane deletes
+    /// by key and the id stops being one the moment ingest exists. A collector
+    /// that assumed they were the same would report every staged object
+    /// collected while leaving its bytes in the bucket — an erasure that says
+    /// it happened and did not.
+    pub fn pending_external_deletes(&self, limit: u32) -> StoreResult<Vec<PendingExternalDelete>> {
+        let rows = self
+            .sql
+            .query(
+                "SELECT pending.id, COALESCE(keys.storage_key, pending.id) \
+                 FROM content_external_pending_delete AS pending \
+                 LEFT JOIN content_external_keys AS keys ON keys.id = pending.id \
+                 ORDER BY pending.id LIMIT ?1",
                 &[SqlValue::Int(i64::from(limit))],
             )
             .map_err(sql_err)?;
-        Ok(rows.iter().map(|row| as_text(&row[0])).collect())
+        Ok(rows
+            .iter()
+            .map(|row| PendingExternalDelete {
+                id: as_text(&row[0]),
+                storage_key: as_text(&row[1]),
+            })
+            .collect())
     }
 
     /// Forget a pending deletion once the bytes are actually gone.
@@ -1505,6 +1626,14 @@ impl<S: DoSql> DoContentBlobs<S> {
         self.sql
             .execute(
                 "DELETE FROM content_external_pending_delete WHERE id = ?1",
+                &[text(id)],
+            )
+            .map_err(sql_err)?;
+        // The mapping outlives its index row only for as long as a collection
+        // is owed, because finding the bytes is the whole of what it is for.
+        self.sql
+            .execute(
+                "DELETE FROM content_external_keys WHERE id = ?1",
                 &[text(id)],
             )
             .map_err(sql_err)?;
@@ -1704,10 +1833,13 @@ impl<S: DoSql> ContentBlobs for DoContentBlobs<S> {
             return Ok(Some(as_text(&row[0]).into_bytes()));
         }
         if let Some(byte_len) = self.external_len(id)? {
-            // A host that can drive a synchronous store fetches it.
+            // A host that can drive a synchronous store fetches it — under the
+            // key the bytes were stored with, which is the id only when a
+            // writer that held the digest chose it.
             if let Some(external) = self.external.as_ref() {
+                let storage_key = self.external_storage_key(id)?;
                 return external
-                    .get(id)
+                    .get(&storage_key)
                     .map_err(|error| StoreError::Conflict(format!("external byte tier: {error}")));
             }
             // Otherwise the content exists and this isolate cannot reach it.
@@ -1826,6 +1958,10 @@ impl<S: DoSql> ContentBlobs for DoContentBlobs<S> {
         // bytes are not, the blob reads as erased, which is true. The reverse
         // window would have `status` claim Live over bytes already deleted.
         if external_len.is_some() {
+            // Both branches below act on the bytes rather than on the row,
+            // and the bytes are under a key that is the id only when a writer
+            // holding the digest chose it.
+            let storage_key = self.external_storage_key(id)?;
             self.sql
                 .execute(
                     "DELETE FROM content_external_blobs WHERE id = ?1",
@@ -1833,10 +1969,19 @@ impl<S: DoSql> ContentBlobs for DoContentBlobs<S> {
                 )
                 .map_err(sql_err)?;
             match self.external.as_ref() {
-                // A synchronous store is deleted from here and now.
-                Some(external) => external.delete(id).map_err(|error| {
-                    StoreError::Conflict(format!("external byte tier: {error}"))
-                })?,
+                // A synchronous store is deleted from here and now, so nothing
+                // is owed and the mapping goes with it.
+                Some(external) => {
+                    external.delete(&storage_key).map_err(|error| {
+                        StoreError::Conflict(format!("external byte tier: {error}"))
+                    })?;
+                    self.sql
+                        .execute(
+                            "DELETE FROM content_external_keys WHERE id = ?1",
+                            &[text(id)],
+                        )
+                        .map_err(sql_err)?;
+                }
                 // Otherwise the bytes are forfeit by decision and collected
                 // later. The id already answers *erased* from its tombstone,
                 // which is the honest answer while collection is pending: the

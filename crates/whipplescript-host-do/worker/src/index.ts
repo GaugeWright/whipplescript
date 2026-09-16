@@ -144,7 +144,12 @@ const hostFunctions = bindings as unknown as {
   // The handle surface (DR-0113). Bytes never come through here: the isolate
   // is synchronous and R2 is not, so the object plane moves them and this
   // records only that they exist.
-  host_register_external_object: (bridge: unknown, id: string, byteLen: number) => void;
+  host_register_external_object: (
+    bridge: unknown,
+    id: string,
+    byteLen: number,
+    storageKey?: string,
+  ) => string;
   host_export_thread: (
     bridge: unknown,
     signedEnvelope: string,
@@ -183,6 +188,7 @@ export interface Env {
   // The external byte tier (DR-0113). Optional: a deployment without it keeps
   // the text-only behaviour and says so rather than pretending otherwise.
   WHIP_OBJECTS?: R2Bucket;
+  WHIP_INGEST_HOSTS?: string;
   // Private/legacy workflow credentials. Public sessions never consult these.
   ANTHROPIC_API_KEY?: string;
   OPENAI_API_KEY?: string;
@@ -1388,12 +1394,33 @@ export class WorkflowInstance implements DurableObject {
       if (!Number.isInteger(byteLen) || byteLen < 0) {
         return Response.json({ error: "byte_len must be a non-negative whole number" }, { status: 400 });
       }
+      // Absent for a push, whose writer keyed on the id because it held the
+      // digest; present for an ingest, which learned the digest only after it
+      // had to name a key.
+      const storageKey = typeof parsed?.storage_key === "string" ? parsed.storage_key : undefined;
+      let inForce: string;
       try {
-        hostFunctions.host_register_external_object(makeBridge(this.ctx.storage), id, byteLen);
+        inForce = hostFunctions.host_register_external_object(
+          makeBridge(this.ctx.storage),
+          id,
+          byteLen,
+          storageKey,
+        );
       } catch (error) {
         return Response.json({ error: String(error) }, { status: 400 });
       }
-      return Response.json({ registered: id, byte_len: byteLen });
+      // Getting back a key it did not offer means this id already meant other
+      // bytes, and the first registration keeps it — moving an id out from
+      // under a reader that already resolved it is the substitution content
+      // addressing exists to prevent. What the caller wrote is now unreachable,
+      // so it is told which object it has to collect.
+      const orphaned = storageKey !== undefined && storageKey !== inForce ? storageKey : undefined;
+      return Response.json({
+        registered: id,
+        byte_len: byteLen,
+        storage_key: inForce,
+        ...(orphaned ? { orphaned } : {}),
+      });
     }
     if (url.pathname === "/host/instances/open") {
       return this.openHostInstance(parsed);

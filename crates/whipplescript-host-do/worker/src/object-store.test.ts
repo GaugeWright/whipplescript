@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { declaredLength, objectPlaneRoute } from "./object-store.ts";
+import { declaredLength, ingestAllowlist, ingestRefusal, objectPlaneRoute } from "./object-store.ts";
 
 // The rules both byte routes share, apart from a bucket. `declaredLength` is
 // the one that cannot be exercised through either route under workerd — it
@@ -36,4 +36,51 @@ test("the object plane claims only its own path shape", () => {
   for (const other of ["/v1/objects", "/v1/objects/a/b", "/host/policy", "/healthz"]) {
     assert.equal(objectPlaneRoute(other), undefined, other);
   }
+});
+
+// Which sources ingest will read from. Every check here is about the same
+// fact: the URL arrives from a model provider's answer, so it is
+// attacker-influencable in the ordinary case rather than the exotic one, and a
+// Worker is a good network position to borrow.
+
+const ALLOWED = new Set(["media.example", "mirror.example"]);
+
+test("a deployment that declared no source has not enabled ingest", () => {
+  assert.equal(ingestAllowlist({}).size, 0);
+  assert.equal(ingestAllowlist({ WHIP_INGEST_HOSTS: "  ,, " }).size, 0);
+});
+
+test("declared hosts are read as a list, trimmed and case-folded", () => {
+  const allowed = ingestAllowlist({ WHIP_INGEST_HOSTS: " Media.Example , mirror.example " });
+  assert.deepEqual([...allowed].sort(), ["media.example", "mirror.example"]);
+});
+
+test("a declared https source is read", () => {
+  assert.equal(ingestRefusal("https://media.example/a.png", ALLOWED), undefined);
+  assert.equal(ingestRefusal("https://MEDIA.example:443/a.png", ALLOWED), undefined);
+});
+
+test("a source outside the list is refused, whatever else is right about it", () => {
+  const refusal = ingestRefusal("https://elsewhere.example/a.png", ALLOWED);
+  assert.match(String(refusal), /elsewhere\.example/);
+});
+
+// A declared host on an undeclared port is a scan of the services behind it;
+// userinfo in the URL is a credential `fetch` would send; and http is both of
+// those over the wire in the clear.
+test("scheme, credentials and port are each their own refusal", () => {
+  for (const bad of [
+    "http://media.example/a.png",
+    "ftp://media.example/a.png",
+    "https://user:secret@media.example/a.png",
+    "https://media.example:8080/a.png",
+    "https://media.example:22/a.png",
+    "not a url",
+  ]) {
+    assert.notEqual(ingestRefusal(bad, ALLOWED), undefined, bad);
+  }
+});
+
+test("the ingest path is its own, and not an object key", () => {
+  assert.equal(objectPlaneRoute("/v1/object-ingest"), undefined);
 });

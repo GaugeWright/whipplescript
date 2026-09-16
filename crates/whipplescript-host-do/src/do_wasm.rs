@@ -355,30 +355,42 @@ pub fn host_current_position(bridge: DoSqlBridge, instance_id: &str) -> Result<S
     serde_json::to_string(&position).map_err(|error| JsValue::from_str(&error.to_string()))
 }
 
-/// Record that content of this id and length lives on the object plane.
+/// Record that content of this id and length lives on the object plane, and
+/// answer with the key that id now means.
 ///
 /// The byte path does not come through here and cannot: this isolate is
 /// synchronous throughout and R2 is not, which is why the plane is a Worker
 /// route. By the time this is called the plane has streamed the bytes to the
-/// bucket under a server-side checksum, so the id provably describes them and
-/// all that is left is the durable fact — a small synchronous write.
+/// bucket — under a server-side checksum on the push path, and under a digest
+/// it maintained across the transfer on the ingest path — so the id provably
+/// describes them and all that is left is the durable fact.
+///
+/// `storage_key` is absent for a push, whose writer held the digest and keyed
+/// on the id, and present for an ingest, which could not. The answer is the key
+/// in force afterwards, which is the offered one unless this id was already
+/// registered; a plane that gets back a key it did not offer has written an
+/// object nothing will ever read and must collect it.
 #[wasm_bindgen]
 pub fn host_register_external_object(
     bridge: DoSqlBridge,
     id: &str,
     byte_len: f64,
-) -> Result<(), JsValue> {
+    storage_key: Option<String>,
+) -> Result<String, JsValue> {
     let byte_len =
         crate::do_branches::checked_byte_len(byte_len).map_err(|e| JsValue::from_str(&e))?;
     let blobs = crate::do_branches::DoContentBlobs::new(std::rc::Rc::new(JsDoSql { bridge }))
         .map_err(|error| JsValue::from_str(&format!("{error:?}")))?;
     blobs
-        .register_external(id, byte_len)
+        .register_external_at(id, byte_len, storage_key.as_deref())
         .map_err(|error| JsValue::from_str(&format!("{error:?}")))
 }
 
-/// Ids whose bytes are erased by decision and await collection from the bucket,
-/// as a JSON array. The plane drains this; the isolate cannot delete from R2.
+/// Blobs whose bytes are erased by decision and await collection from the
+/// bucket, as a JSON array of `{ id, storage_key }`. The plane drains this; the
+/// isolate cannot delete from R2. The key travels with the id because the plane
+/// deletes by key, and the two stopped being the same string when ingest
+/// arrived.
 #[wasm_bindgen]
 pub fn host_pending_external_deletes(bridge: DoSqlBridge, limit: u32) -> Result<String, JsValue> {
     let blobs = crate::do_branches::DoContentBlobs::new(std::rc::Rc::new(JsDoSql { bridge }))
