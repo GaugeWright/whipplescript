@@ -1648,13 +1648,19 @@ rule triage
     let program_str = program_path.to_string_lossy().into_owned();
 
     // $1 per token: the mock coerce returns 3 in + 2 out = $5 per body call.
-    // The coerce RUN records the worker's agent provider (`fixture`) and leaves
-    // the model unrecorded, so std.spend prices it under (fixture, "").
+    // The coerce RUN records the worker's agent provider (`fixture`) and the
+    // model it resolved, so std.spend prices it under (fixture, test-model).
+    //
+    // This entry used to be keyed on an EMPTY model, because a settled coercion
+    // recorded none — and an empty key is not something a real price table has.
+    // A table written from a provider's list would have failed to price every
+    // coercion, and an unpriced reading is skipped rather than reported, so the
+    // cap could not bind on coerce spend at all. The run records its model now.
     let prices_path = env.dir.join("providers.json");
     fs::write(
         &prices_path,
         r#"{"providers": [], "prices": [
-            {"provider": "fixture", "model": "",
+            {"provider": "fixture", "model": "test-model",
              "input_per_mtok_usd": 1000000.0, "output_per_mtok_usd": 1000000.0}
         ]}"#,
     )

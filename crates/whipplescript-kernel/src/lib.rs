@@ -2606,7 +2606,7 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
         // evidence row, the diagnostics, the completion, and the coerce fact.
         let safe_summary = redacted_provider_summary(&result.summary);
         let evidence = self.record_coerce_result(execution, result, &safe_summary)?;
-        let metadata_json = coerce_metadata(result);
+        let metadata_json = coerce_metadata(execution.model, result);
         // Built BEFORE the trace emit for the same reason as the provider path.
         let diagnostic = self.provider_terminal_diagnostic(
             execution.instance_id,
@@ -4674,14 +4674,39 @@ fn coerce_run_start_metadata(model: Option<&str>) -> String {
     }
 }
 
-fn coerce_metadata(result: &CoerceResult) -> String {
-    json!({
+/// A settled coerce run's metadata.
+///
+/// The completion REPLACES the run's metadata rather than merging into it, so
+/// whatever the start recorded has to be recorded again here or it is gone from
+/// the run row. That is how the model came to be missing from every settled
+/// coercion: `coerce_run_start_metadata` files it at the start and this
+/// overwrote it, in `run_coerce` and `settle_coerce_result` alike, so `whip`,
+/// the Durable Object host and an embedding host all metered a model call that
+/// could not say which model served it. The stats fold reads `model`
+/// (DR-0115), which made a coercion's tokens unattributable to any rate.
+///
+/// Both spellings are written on purpose. `model` is what the fold reads;
+/// `__fingerprint_model` is the execution-fingerprint salt the start recorded,
+/// and re-recording it keeps a settled run saying what it was fingerprinted
+/// under.
+fn coerce_metadata(model: Option<&str>, result: &CoerceResult) -> String {
+    let mut metadata = json!({
         "value": result.value_json.as_deref().map(json_payload_summary),
         "error": result_error_payload(result.error_json.as_deref()),
         "transcript": redacted_text_metadata(&result.transcript),
         "usage": json_from_str(&result.usage_json),
-    })
-    .to_string()
+    });
+    if let (Some(object), Some(model)) = (
+        metadata.as_object_mut(),
+        model.filter(|model| !model.is_empty()),
+    ) {
+        object.insert("model".to_owned(), Value::String(model.to_owned()));
+        object.insert(
+            whipplescript_store::FINGERPRINT_MODEL_METADATA_KEY.to_owned(),
+            Value::String(model.to_owned()),
+        );
+    }
+    metadata.to_string()
 }
 
 fn string_array_field(value: &Value, field: &str) -> Option<Vec<String>> {

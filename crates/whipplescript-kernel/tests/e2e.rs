@@ -285,6 +285,74 @@ rule decide
     }
 }
 
+/// A settled coercion says which model served it, where the meter reads one.
+///
+/// The completion REPLACES a run's metadata rather than merging into it, so a
+/// model recorded only at the start is gone by the time the fold reads the run.
+/// Every coerce door settles through `settle_coerce_result`, so this was not a
+/// gap between the native and sans-IO paths: `whip`, the Durable Object host
+/// and an embedding host alike metered a model call that nothing could say the
+/// model for, and DR-0115's per-call record had a hole a rate cannot cross.
+///
+/// Asserted through the fold rather than by reading the metadata string,
+/// because the spelling is the whole point — the start recorded the model under
+/// `__fingerprint_model`, which is the execution-fingerprint salt and not the
+/// key the fold reads.
+#[test]
+fn e2e_a_settled_coercion_records_the_model_the_meter_reads() {
+    use whipplescript_kernel::stats::{self, Dimension, Query};
+
+    let source = include_str!("../../../examples/coerce-branch.whip");
+    let (mut kernel, instance) = kernel_from_source("CoerceBranch", source);
+    commit_single_effect(
+        &mut kernel,
+        &instance,
+        effect(
+            "classification",
+            "schema.coerce",
+            r#"{"function_name":"classifyMessage"}"#,
+        ),
+        "classify_request",
+    );
+    let request = coerce_request();
+    kernel
+        .run_coerce(
+            CoerceExecution {
+                instance_id: &instance,
+                effect_id: "classification",
+                run_id: "run-classification",
+                provider: "fake-coerce",
+                worker_id: "worker-1",
+                lease_id: "lease-classification",
+                lease_expires_at: "2030-01-01T00:00:00Z",
+                request: &request,
+                model: Some("test-model"),
+            },
+            &FakeCoerceClient::succeeds(
+                r#"{"priority":"Urgent","summary":"triage now","confidence":0.99}"#,
+            ),
+        )
+        .expect("coerce succeeds");
+
+    let store = kernel.into_store();
+    let rows = stats::inputs_for_instance(&store, &instance)
+        .expect("the run reads back")
+        .rows(&Query {
+            by: vec![Dimension::Model],
+            ..Query::default()
+        });
+    let metered = rows
+        .iter()
+        .find(|row| {
+            row.key.iter().any(|(dimension, value)| {
+                *dimension == Dimension::Model && value.as_deref() == Some("test-model")
+            })
+        })
+        .expect("the coercion groups under the model that served it");
+    assert_eq!(metered.measures.input_uncached.value(), Some(1));
+    assert_eq!(metered.measures.output.value(), Some(1));
+}
+
 #[test]
 fn e2e_coerce_success_and_failure_branches_are_deterministic() {
     let source = include_str!("../../../examples/coerce-branch.whip");
