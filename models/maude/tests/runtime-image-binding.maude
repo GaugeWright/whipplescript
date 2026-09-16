@@ -1,0 +1,9 @@
+load ../runtime-image-binding.maude
+search [1] in RUNTIME-IMAGE-BINDING : install(exact,exact,exact) =>* binding .
+search [1] in RUNTIME-IMAGE-BINDING : install(changed,exact,exact) =>* binding .
+search [1] in RUNTIME-IMAGE-BINDING-WEAK : install(changed,exact,exact) =>* binding .
+search [1] in RUNTIME-IMAGE-BINDING : install(exact,changed,exact) =>* binding .
+search [1] in RUNTIME-IMAGE-BINDING-WEAK : install(exact,changed,exact) =>* binding .
+search [1] in RUNTIME-IMAGE-BINDING : install(exact,exact,missing) =>* binding .
+search [1] in RUNTIME-IMAGE-BINDING-WEAK : install(exact,exact,missing) =>* binding .
+quit

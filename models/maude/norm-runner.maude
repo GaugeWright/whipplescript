@@ -1,0 +1,112 @@
+--- DR-0098 / N1 runner ingress. The executor's authenticated invocation
+--- context supplies actual run/script/artifact/environment identities. This
+--- model does not derive those facts from arbitrary stdout or prove the Python
+--- interpreter trustworthy. obligation-status owns coverage and counterevidence.
+mod NORM-RUNNER is
+  protecting BOOL .
+  sorts Pin Adapter Fact Cfg State .
+  ops p0 p1 : -> Pin [ctor] .
+  ops pythonCalls unsupported : -> Adapter [ctor] .
+  subsort Fact < Cfg .
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+  op {_} : Cfg -> State [ctor] .
+  op plan : Pin Pin Pin Pin Pin Adapter -> Fact [ctor] .
+  --- run, script, artifact, environment, contract, output truncated, timed out.
+  op receipt : Pin Pin Pin Pin Pin Bool Bool -> Fact [ctor] .
+  op observed : Pin Pin Pin Bool Bool -> Fact [ctor] .
+  vars K R S A E : Pin . vars T X : Bool . var C : Cfg .
+  rl [bound-observation] :
+    { plan(R,S,A,E,K,pythonCalls) receipt(R,S,A,E,K,T,X) C }
+    => { observed(R,A,K,T,X) C } .
+endm
+mod NORM-RUNNER-WEAK-RUN is
+  including NORM-RUNNER .
+  vars K R S A E R1 S1 A1 E1 : Pin . vars T X : Bool . var C : Cfg .
+  rl [ignore-run] :
+    { plan(R,S,A,E,K,pythonCalls) receipt(R1,S,A,E,K,T,X) C }
+    => { observed(R,A,K,T,X) C } .
+endm
+mod NORM-RUNNER-WEAK-SCRIPT is
+  including NORM-RUNNER .
+  vars K R S A E R1 S1 A1 E1 : Pin . vars T X : Bool . var C : Cfg .
+  rl [ignore-script] :
+    { plan(R,S,A,E,K,pythonCalls) receipt(R,S1,A,E,K,T,X) C }
+    => { observed(R,A,K,T,X) C } .
+endm
+mod NORM-RUNNER-WEAK-ARTIFACT is
+  including NORM-RUNNER .
+  vars K R S A E R1 S1 A1 E1 : Pin . vars T X : Bool . var C : Cfg .
+  rl [ignore-artifact] :
+    { plan(R,S,A,E,K,pythonCalls) receipt(R,S,A1,E,K,T,X) C }
+    => { observed(R,A,K,T,X) C } .
+endm
+mod NORM-RUNNER-WEAK-ENVIRONMENT is
+  including NORM-RUNNER .
+  vars K R S A E R1 S1 A1 E1 : Pin . vars T X : Bool . var C : Cfg .
+  rl [ignore-environment] :
+    { plan(R,S,A,E,K,pythonCalls) receipt(R,S,A,E1,K,T,X) C }
+    => { observed(R,A,K,T,X) C } .
+endm
+mod NORM-RUNNER-WEAK-ADAPTER is
+  including NORM-RUNNER .
+  vars K R S A E : Pin . vars T X : Bool . var C : Cfg . var D : Adapter .
+  rl [any-command-is-an-adapter] :
+    { plan(R,S,A,E,K,D) receipt(R,S,A,E,K,T,X) C }
+    => { observed(R,A,K,T,X) C } .
+endm
+mod NORM-RUNNER-WEAK-TRUNCATION is
+  including NORM-RUNNER .
+  vars K R S A E : Pin . vars T X : Bool . var C : Cfg .
+  rl [drop-truncation] :
+    { plan(R,S,A,E,K,pythonCalls) receipt(R,S,A,E,K,T,X) C }
+    => { observed(R,A,K,false,X) C } .
+endm
+mod NORM-RUNNER-WEAK-TIMEOUT is
+  including NORM-RUNNER .
+  vars K R S A E : Pin . vars T X : Bool . var C : Cfg .
+  rl [drop-timeout] :
+    { plan(R,S,A,E,K,pythonCalls) receipt(R,S,A,E,K,T,X) C }
+    => { observed(R,A,K,T,false) C } .
+endm
+
+--- Each live execution owns a distinct staged path, even for identical bytes.
+mod NORM-RUNNER-STAGING is
+  including NORM-RUNNER .
+  ops stage cleanup : Pin -> Fact [ctor] .
+  ops free file : Pin -> Fact [ctor] .
+  op staged : Pin Pin -> Fact [ctor] .
+  vars R P : Pin . var C : Cfg .
+  rl [allocate-owned-path] : { stage(R) free(P) C } => { staged(R,P) file(P) C } .
+  rl [clean-owned-path] : { cleanup(R) staged(R,P) file(P) C } => { free(P) C } .
+endm
+mod NORM-RUNNER-WEAK-SHARED-PATH is
+  including NORM-RUNNER-STAGING .
+  vars R R1 P P1 : Pin . var C : Cfg .
+  rl [reuse-another-executions-path] :
+    { stage(R) staged(R1,P) file(P) free(P1) C }
+    => { staged(R,P) staged(R1,P) file(P) C } .
+endm
+
+--- A timeout ends capture without erasing the prefix already observed.
+mod NORM-RUNNER-CAPTURE is
+  including NORM-RUNNER .
+  op captured : Pin Bool -> Fact [ctor] .
+  op stop : Pin -> Fact [ctor] .
+  op stream : Pin Bool -> Fact [ctor] .
+  var R : Pin . var B : Bool . var C : Cfg .
+  rl [retain-captured-prefix] : { captured(R,B) stop(R) C } => { stream(R,B) C } .
+endm
+mod NORM-RUNNER-WEAK-DISCARD-CAPTURE is
+  including NORM-RUNNER-CAPTURE .
+  var R : Pin . var B : Bool . var C : Cfg .
+  rl [discard-on-timeout] : { captured(R,B) stop(R) C } => { stream(R,false) C } .
+endm
+
+mod NORM-RUNNER-WEAK-CONTRACT is
+  including NORM-RUNNER .
+  vars R S A E K K1 : Pin . vars T X : Bool . var C : Cfg .
+  rl [relabel-another-contract] :
+    { plan(R,S,A,E,K,pythonCalls) receipt(R,S,A,E,K1,T,X) C }
+    => { observed(R,A,K,T,X) C } .
+endm

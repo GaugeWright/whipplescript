@@ -11,6 +11,8 @@ keywords = ["agents", "automation", "cli", "orchestration", "workflow"]
 categories = ["command-line-utilities", "development-tools"]
 
 [dependencies]
+# Native executor controller authority lives on its Docker-owned volume.
+rusqlite = { version = "0.40.1", features = ["bundled"] }
 whipplescript-core = { version = "0.5.6", path = "../whipplescript-core" }
 whipplescript-custody = { version = "0.5.6", path = "../whipplescript-custody" }
 whipplescript-kernel = { version = "0.5.6", path = "../whipplescript-kernel", default-features = false, features = ["native"] }
@@ -35,6 +37,9 @@ ring = "0.17"
 url = "2"
 prctl = "1"
 htmd = "0.5"
+# The pinned reactor is verified before any guest execution.
+wasmtime = { version = "=48.0.1", default-features = false, features = ["runtime", "cranelift", "std"] }
+wasmtime-wasi = { version = "=48.0.1", default-features = false, features = ["p1"] }
 
 [features]
 # Codex/Claude delegating providers are optional (DR-0024); the owned harness is
@@ -46,14 +51,11 @@ codex = ["dep:whipplescript-provider-codex"]
 claude = ["dep:whipplescript-provider-claude"]
 
 [dev-dependencies]
+whipplescript-custodian = { path = "../whipplescript-custodian" }
 # The DO host, so the W4 parity harness drives both hosts' governed doors in
 # one test and diffs the receipt shapes. Path-only: the crate is unpublished
 # and dev-dependencies without a version never enter the publish graph.
 whipplescript-host-do = { path = "../whipplescript-host-do", features = ["test-support"] }
-# Raw store access for upgrade-shaped fixtures: the re-attestation tests age a
-# recorded ir_hash the way an older toolchain would have written it, which no
-# store API does (and none should).
-rusqlite = { version = "0.40.1", features = ["bundled"] }
 # Enables the private legacy-envelope fixture constructor only while compiling
 # this crate's tests; normal library/binary builds do not expose it.
 # `default-features = false` keeps the kernel's codex/claude adapter features

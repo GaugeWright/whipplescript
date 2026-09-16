@@ -1,0 +1,10 @@
+load ../norm-observer.maude
+search [1] in NORM-RUNTIME-IMAGE : cfg(pinned,retained,exact,staged) =>* cfg(pinned,retained,exact,built) .
+search [1] in NORM-RUNTIME-IMAGE : cfg(pinned,retained,exact,staged) =>* cfg(pinned,retained,exact,verified) .
+search [1] in NORM-RUNTIME-IMAGE : cfg(changed,retained,exact,staged) =>* cfg(changed,retained,exact,built) .
+search [1] in NORM-RUNTIME-IMAGE-WEAK : cfg(changed,retained,exact,staged) =>* cfg(changed,retained,exact,built) .
+search [1] in NORM-RUNTIME-IMAGE : cfg(pinned,retained,substituted,built) =>* cfg(pinned,retained,substituted,verified) .
+search [1] in NORM-RUNTIME-IMAGE-WEAK : cfg(pinned,retained,substituted,built) =>* cfg(pinned,retained,substituted,verified) .
+search [1] in NORM-RUNTIME-IMAGE : cfg(pinned,foreign,exact,built) =>* cfg(pinned,foreign,exact,verified) .
+search [1] in NORM-RUNTIME-IMAGE-WEAK : cfg(pinned,foreign,exact,built) =>* cfg(pinned,foreign,exact,verified) .
+quit

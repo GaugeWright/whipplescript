@@ -1,0 +1,90 @@
+--- DR-0098 / N1: explicit retirement of an accepted revision while a draft exists.
+--- active status is the latest lifecycle of that accepted content, not its activation status.
+--- Signed admission and exact vocabulary/ledger identity are trusted model inputs.
+fmod TARGETED-RETIREMENT-DATA is
+  protecting BOOL .
+  sorts Id Status Actor Fact Cfg State .
+  ops rev0 rev1 approval0 approval1 head0 head1 epoch0 epoch1 retirementHead : -> Id [ctor] .
+  ops accepted draft retired unrelated sealed : -> Status [ctor] .
+  ops owner worker : -> Actor [ctor] .
+  subsort Fact < Cfg .
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+  op {_} : Cfg -> State [ctor] .
+  op current : Id Id Status -> Fact [ctor] .
+  op active : Id Id Status -> Fact [ctor] .
+  op epoch : Id -> Fact [ctor] .
+  op request : Id Id Id Id Actor Status -> Fact [ctor] .
+  op permits : Status Status Actor -> Fact [ctor] .
+  op retiring : Status -> Fact [ctor] .
+  op inactive : -> Fact [ctor] .
+  op history : Id Id Status -> Fact [ctor] .
+  op advance : Status Actor -> Fact [ctor] .
+endfm
+mod TARGETED-RETIREMENT is
+  protecting TARGETED-RETIREMENT-DATA .
+  vars V A E H U V1 E1 H1 U1 : Id . vars S T R : Status . vars K K2 : Actor . var C : Cfg .
+  crl [retire-exact-active] :
+    { current(V,H,S) active(A,E,T) epoch(U) request(V1,E1,H1,U1,K,R) permits(T,R,K) retiring(R) C }
+    => { current(V,retirementHead,if V == A then R else S fi) inactive history(A,E,T) epoch(U) permits(T,R,K) retiring(R) C }
+    if V1 == A /\ E1 == E /\ H1 == H /\ U1 == U .
+  rl [advance-effective-lifecycle] :
+    { current(V,H,S) active(V,E,S) advance(T,K) permits(S,T,K) C }
+    => { current(V,head0,T) active(V,E,T) permits(S,T,K) C } .
+endm
+mod TARGETED-RETIREMENT-WEAK-REVISION is
+  including TARGETED-RETIREMENT .
+  vars V A E H U V1 E1 H1 U1 : Id . vars S T R : Status . vars K K2 : Actor . var C : Cfg .
+  crl [weaken-revision] :
+    { current(V,H,S) active(A,E,T) epoch(U) request(V1,E1,H1,U1,K,R) permits(T,R,K) retiring(R) C }
+    => { current(V,retirementHead,if V == A then R else S fi) inactive history(A,E,T) epoch(U) permits(T,R,K) retiring(R) C }
+    if E1 == E /\ H1 == H /\ U1 == U .
+endm
+mod TARGETED-RETIREMENT-WEAK-APPROVAL is
+  including TARGETED-RETIREMENT .
+  vars V A E H U V1 E1 H1 U1 : Id . vars S T R : Status . vars K K2 : Actor . var C : Cfg .
+  crl [weaken-approval] :
+    { current(V,H,S) active(A,E,T) epoch(U) request(V1,E1,H1,U1,K,R) permits(T,R,K) retiring(R) C }
+    => { current(V,retirementHead,if V == A then R else S fi) inactive history(A,E,T) epoch(U) permits(T,R,K) retiring(R) C }
+    if V1 == A /\ H1 == H /\ U1 == U .
+endm
+mod TARGETED-RETIREMENT-WEAK-HEAD is
+  including TARGETED-RETIREMENT .
+  vars V A E H U V1 E1 H1 U1 : Id . vars S T R : Status . vars K K2 : Actor . var C : Cfg .
+  crl [weaken-head] :
+    { current(V,H,S) active(A,E,T) epoch(U) request(V1,E1,H1,U1,K,R) permits(T,R,K) retiring(R) C }
+    => { current(V,retirementHead,if V == A then R else S fi) inactive history(A,E,T) epoch(U) permits(T,R,K) retiring(R) C }
+    if V1 == A /\ E1 == E /\ U1 == U .
+endm
+mod TARGETED-RETIREMENT-WEAK-EPOCH is
+  including TARGETED-RETIREMENT .
+  vars V A E H U V1 E1 H1 U1 : Id . vars S T R : Status . vars K K2 : Actor . var C : Cfg .
+  crl [weaken-epoch] :
+    { current(V,H,S) active(A,E,T) epoch(U) request(V1,E1,H1,U1,K,R) permits(T,R,K) retiring(R) C }
+    => { current(V,retirementHead,if V == A then R else S fi) inactive history(A,E,T) epoch(U) permits(T,R,K) retiring(R) C }
+    if V1 == A /\ E1 == E /\ H1 == H .
+endm
+mod TARGETED-RETIREMENT-WEAK-AUTHORITY is
+  including TARGETED-RETIREMENT .
+  vars V A E H U V1 E1 H1 U1 : Id . vars S T R : Status . vars K K2 : Actor . var C : Cfg .
+  crl [weaken-authority] :
+    { current(V,H,S) active(A,E,T) epoch(U) request(V1,E1,H1,U1,K,R) permits(T,R,K2) retiring(R) C }
+    => { current(V,retirementHead,if V == A then R else S fi) inactive history(A,E,T) epoch(U) permits(T,R,K2) retiring(R) C }
+    if V1 == A /\ E1 == E /\ H1 == H /\ U1 == U .
+endm
+mod TARGETED-RETIREMENT-WEAK-ROLE is
+  including TARGETED-RETIREMENT .
+  vars V A E H U V1 E1 H1 U1 : Id . vars S T R : Status . vars K K2 : Actor . var C : Cfg .
+  crl [weaken-role] :
+    { current(V,H,S) active(A,E,T) epoch(U) request(V1,E1,H1,U1,K,R) permits(T,R,K) C }
+    => { current(V,retirementHead,if V == A then R else S fi) inactive history(A,E,T) epoch(U) permits(T,R,K) C }
+    if V1 == A /\ E1 == E /\ H1 == H /\ U1 == U .
+endm
+mod TARGETED-RETIREMENT-WEAK-LIFECYCLE is
+  including TARGETED-RETIREMENT .
+  vars V A E H U V1 E1 H1 U1 : Id . vars S T R : Status . vars K K2 : Actor . var C : Cfg .
+  crl [reuse-activation-permission] :
+    { current(V,H,S) active(A,E,T) epoch(U) request(V1,E1,H1,U1,K,R) permits(accepted,R,K) retiring(R) C }
+    => { current(V,retirementHead,if V == A then R else S fi) inactive history(A,E,T) epoch(U) permits(accepted,R,K) retiring(R) C }
+    if V1 == A /\ E1 == E /\ H1 == H /\ U1 == U .
+endm

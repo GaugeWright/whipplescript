@@ -1,0 +1,82 @@
+load ../obligation-status.maude
+search [1] in OBLIGATION-STATUS :
+ evaluate(report(v0,v0,v0,v0,v0,v0,direct,both,passed,passed,complete,success)) =>* judged(true,false,false) .
+search [1] in OBLIGATION-STATUS :
+ evaluate(report(v0,v0,v0,v0,v0,v0,cached,both,passed,passed,complete,success)) =>* judged(true,false,false) .
+search [1] in OBLIGATION-STATUS :
+ evaluate(report(v0,v0,v0,v0,v0,v0,direct,both,passed,failed,complete,failure)) =>* judged(false,true,false) .
+search [1] in OBLIGATION-STATUS :
+ evaluate(report(v0,v0,v0,v0,v0,v0,direct,both,passed,failed,truncated,success)) =>* judged(false,true,true) .
+search [1] in OBLIGATION-STATUS :
+ prove(goodWorld,allWorlds) =>* proof(true) .
+--- EMPTY: the same forbidden result is reachable only with the named weakening.
+search in OBLIGATION-STATUS :
+ evaluate(report(v0,v0,v0,v0,v0,v0,direct,empty,absent,absent,complete,success)) =>* judged(true,B:Bool,D:Bool) .
+search [1] in OBLIGATION-STATUS-WEAK-EMPTY :
+ evaluate(report(v0,v0,v0,v0,v0,v0,direct,empty,absent,absent,complete,success)) =>* judged(true,B:Bool,D:Bool) .
+--- COVERAGE: the same forbidden result is reachable only with the named weakening.
+search in OBLIGATION-STATUS :
+ evaluate(report(v0,v0,v0,v0,v0,v0,direct,both,passed,absent,complete,success)) =>* judged(true,B:Bool,D:Bool) .
+search [1] in OBLIGATION-STATUS-WEAK-COVERAGE :
+ evaluate(report(v0,v0,v0,v0,v0,v0,direct,both,passed,absent,complete,success)) =>* judged(true,B:Bool,D:Bool) .
+--- COVERAGE: the same forbidden result is reachable only with the named weakening.
+search in OBLIGATION-STATUS :
+ evaluate(report(v0,v0,v0,v0,v0,v0,direct,both,passed,unexercised,complete,success)) =>* judged(true,B:Bool,D:Bool) .
+search [1] in OBLIGATION-STATUS-WEAK-COVERAGE :
+ evaluate(report(v0,v0,v0,v0,v0,v0,direct,both,passed,unexercised,complete,success)) =>* judged(true,B:Bool,D:Bool) .
+--- COMPLETION: the same forbidden result is reachable only with the named weakening.
+search in OBLIGATION-STATUS :
+ evaluate(report(v0,v0,v0,v0,v0,v0,direct,both,passed,passed,truncated,success)) =>* judged(true,B:Bool,D:Bool) .
+search [1] in OBLIGATION-STATUS-WEAK-COMPLETION :
+ evaluate(report(v0,v0,v0,v0,v0,v0,direct,both,passed,passed,truncated,success)) =>* judged(true,B:Bool,D:Bool) .
+--- COMPLETION: the same forbidden result is reachable only with the named weakening.
+search in OBLIGATION-STATUS :
+ evaluate(report(v0,v0,v0,v0,v0,v0,direct,both,passed,passed,missing,success)) =>* judged(true,B:Bool,D:Bool) .
+search [1] in OBLIGATION-STATUS-WEAK-COMPLETION :
+ evaluate(report(v0,v0,v0,v0,v0,v0,direct,both,passed,passed,missing,success)) =>* judged(true,B:Bool,D:Bool) .
+--- ARTIFACT: the same forbidden result is reachable only with the named weakening.
+search in OBLIGATION-STATUS :
+ evaluate(report(v0,v0,v0,v0,v0,v1,direct,both,passed,passed,complete,success)) =>* judged(true,B:Bool,D:Bool) .
+search [1] in OBLIGATION-STATUS-WEAK-ARTIFACT :
+ evaluate(report(v0,v0,v0,v0,v0,v1,direct,both,passed,passed,complete,success)) =>* judged(true,B:Bool,D:Bool) .
+--- REQUIREMENT: the same forbidden result is reachable only with the named weakening.
+search in OBLIGATION-STATUS :
+ evaluate(report(v0,v0,v0,v1,v0,v0,direct,both,passed,passed,complete,success)) =>* judged(true,B:Bool,D:Bool) .
+search [1] in OBLIGATION-STATUS-WEAK-REQUIREMENT :
+ evaluate(report(v0,v0,v0,v1,v0,v0,direct,both,passed,passed,complete,success)) =>* judged(true,B:Bool,D:Bool) .
+--- METHOD: the same forbidden result is reachable only with the named weakening.
+search in OBLIGATION-STATUS :
+ evaluate(report(v0,v0,v0,v0,v1,v0,direct,both,passed,passed,complete,success)) =>* judged(true,B:Bool,D:Bool) .
+search [1] in OBLIGATION-STATUS-WEAK-METHOD :
+ evaluate(report(v0,v0,v0,v0,v1,v0,direct,both,passed,passed,complete,success)) =>* judged(true,B:Bool,D:Bool) .
+--- PROVENANCE: the same forbidden result is reachable only with the named weakening.
+search in OBLIGATION-STATUS :
+ evaluate(report(v0,v0,v0,v0,v0,v0,unbound,both,passed,passed,complete,success)) =>* judged(true,B:Bool,D:Bool) .
+search [1] in OBLIGATION-STATUS-WEAK-PROVENANCE :
+ evaluate(report(v0,v0,v0,v0,v0,v0,unbound,both,passed,passed,complete,success)) =>* judged(true,B:Bool,D:Bool) .
+--- FAILURE: the same forbidden result is reachable only with the named weakening.
+search in OBLIGATION-STATUS :
+ evaluate(report(v0,v0,v0,v0,v0,v0,direct,both,passed,failed,complete,success)) =>* judged(true,B:Bool,D:Bool) .
+search [1] in OBLIGATION-STATUS-WEAK-FAILURE :
+ evaluate(report(v0,v0,v0,v0,v0,v0,direct,both,passed,failed,complete,success)) =>* judged(true,B:Bool,D:Bool) .
+--- EXIT: the same forbidden result is reachable only with the named weakening.
+search in OBLIGATION-STATUS :
+ evaluate(report(v0,v0,v0,v0,v0,v0,direct,both,passed,passed,complete,crashed)) =>* judged(true,B:Bool,D:Bool) .
+search [1] in OBLIGATION-STATUS-WEAK-EXIT :
+ evaluate(report(v0,v0,v0,v0,v0,v0,direct,both,passed,passed,complete,crashed)) =>* judged(true,B:Bool,D:Bool) .
+--- COUNTER: the same forbidden result is reachable only with the named weakening.
+search in OBLIGATION-STATUS :
+ evaluate(report(v0,v0,v0,v0,v0,v0,direct,both,passed,failed,truncated,success)) =>* judged(false,false,true) .
+search [1] in OBLIGATION-STATUS-WEAK-COUNTER :
+ evaluate(report(v0,v0,v0,v0,v0,v0,direct,both,passed,failed,truncated,success)) =>* judged(false,false,true) .
+--- VACUITY: the same forbidden result is reachable only with the named weakening.
+search in OBLIGATION-STATUS :
+ prove(goodWorld,badWorld) =>* proof(true) .
+search [1] in OBLIGATION-STATUS-WEAK-VACUITY :
+ prove(goodWorld,badWorld) =>* proof(true) .
+--- UNIVERSAL: the same forbidden result is reachable only with the named weakening.
+search in OBLIGATION-STATUS :
+ prove(allWorlds,allWorlds) =>* proof(true) .
+search [1] in OBLIGATION-STATUS-WEAK-UNIVERSAL :
+ prove(allWorlds,allWorlds) =>* proof(true) .
+quit .

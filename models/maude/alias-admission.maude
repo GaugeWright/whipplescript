@@ -1,0 +1,43 @@
+--- DR-0098 / norm-plane 1.4; reuses ADR-0002's durable clone-local alias law.
+--- One local admission transaction owns the counter and mapping. Source aliases
+--- are deliberately not transported as destination allocation authority.
+mod ALIAS-ADMISSION is
+  protecting NAT .
+  sorts Content Fact Cfg State .
+  ops a b : -> Content [ctor] .
+  subsort Fact < Cfg .
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+  op {_} : Cfg -> State [ctor] .
+  op counter : Nat -> Fact [ctor] .
+  op named : Content Nat -> Fact [ctor] .
+  op admit : Content -> Fact [ctor] .
+  op import : Content Nat -> Fact [ctor] .
+  ops rebuild rebuilt : -> Fact [ctor] .
+  var X : Content . vars N M : Nat . var C : Cfg .
+  op hasName : Content Cfg -> Bool .
+  eq hasName(X, named(X, N) C) = true .
+  eq hasName(X, C) = false [owise] .
+  crl [allocate-on-admission] :
+    { counter(N) admit(X) C } => { counter(N + 1) named(X, N) C }
+    if hasName(X, C) = false .
+  rl [retry-keeps-name] :
+    { named(X, N) admit(X) C } => { named(X, N) C } .
+  rl [source-alias-is-not-authority] :
+    { import(X, N) C } => { admit(X) C } .
+  rl [rebuild-keeps-durable-names] :
+    { rebuild C } => { rebuilt C } .
+endm
+mod ALIAS-ADMISSION-TRUST-SOURCE is
+  including ALIAS-ADMISSION .
+  var X : Content . var N : Nat . var C : Cfg .
+  rl [take-imported-number] :
+    { import(X, N) C } => { named(X, N) C } .
+endm
+mod ALIAS-ADMISSION-REUSE-COUNTER is
+  including ALIAS-ADMISSION .
+  var X : Content . var N : Nat . var C : Cfg .
+  crl [forget-counter-advance] :
+    { counter(N) admit(X) C } => { counter(N) named(X, N) C }
+    if hasName(X, C) = false .
+endm

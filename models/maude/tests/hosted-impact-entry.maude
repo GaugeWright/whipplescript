@@ -1,0 +1,9 @@
+load ../hosted-impact-entry.maude
+search [1] in HOSTED-IMPACT-ENTRY : query(valid,valid,valid) =>* planned .
+search [1] in HOSTED-IMPACT-ENTRY : query(wrong,valid,valid) =>* planned .
+search [1] in HOSTED-IMPACT-ENTRY-WEAK : query(wrong,valid,valid) =>* planned .
+search [1] in HOSTED-IMPACT-ENTRY : query(valid,caller,valid) =>* planned .
+search [1] in HOSTED-IMPACT-ENTRY-WEAK : query(valid,caller,valid) =>* planned .
+search [1] in HOSTED-IMPACT-ENTRY : query(valid,valid,wrong) =>* planned .
+search [1] in HOSTED-IMPACT-ENTRY-WEAK : query(valid,valid,wrong) =>* planned .
+quit

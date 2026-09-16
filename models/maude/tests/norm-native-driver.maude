@@ -1,0 +1,7 @@
+load ../norm-observer.maude
+search [1] in NORM-NATIVE-DRIVER : cfg(replay,active) =>* cfg(replay,settled) .
+search [1] in NORM-NATIVE-DRIVER : cfg(pending,active) =>* cfg(pending,fenced) .
+search [1] in NORM-NATIVE-DRIVER-WEAK : cfg(pending,active) =>* cfg(pending,fenced) .
+search [1] in NORM-NATIVE-DRIVER : cfg(replay,removed) =>1 cfg(replay,settled) .
+search [1] in NORM-NATIVE-DRIVER-WEAK : cfg(replay,removed) =>1 cfg(replay,settled) .
+quit

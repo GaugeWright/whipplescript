@@ -1402,6 +1402,7 @@ mod tests {
             instance_id: "ins-r4".to_owned(),
         };
         let effect = |id: &str, target: &str, input: &str| whipplescript_store::ClaimableEffect {
+            attempt_admission_event_id: None,
             effect_id: id.to_owned(),
             kind: "capability.call".to_owned(),
             target: Some(target.to_owned()),
@@ -1553,6 +1554,7 @@ mod tests {
             sql: Rc::clone(&sql),
         };
         let effect = |id: &str, stream: &str| whipplescript_store::ClaimableEffect {
+            attempt_admission_event_id: None,
             effect_id: id.to_owned(),
             kind: "capability.call".to_owned(),
             target: Some("vcs.promote".to_owned()),
@@ -1702,6 +1704,7 @@ mod tests {
             sql: Rc::clone(&sql),
         };
         let effect = whipplescript_store::ClaimableEffect {
+            attempt_admission_event_id: None,
             effect_id: effect_id.to_owned(),
             kind: "capability.call".to_owned(),
             target: Some("vcs.promote".to_owned()),
@@ -1778,6 +1781,7 @@ mod tests {
             )
             .expect("inject post-CAS fault");
             let effect = whipplescript_store::ClaimableEffect {
+                attempt_admission_event_id: None,
                 effect_id: stream_id.to_owned(),
                 kind: "capability.call".to_owned(),
                 target: Some("vcs.promote".to_owned()),

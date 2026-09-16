@@ -1,4 +1,4 @@
-import worker, { WorkflowInstance, type Env } from "./index";
+import worker, { WorkflowInstance as RuntimeWorkflowInstance, type Env } from "./index";
 import privateHome from "./private-home";
 import {
   canonicalJson,
@@ -32,6 +32,24 @@ if (!projectedTestHomeGovernanceKey) {
   throw new Error("test Home key did not project to a governance key");
 }
 const testHomeGovernanceKey: string = projectedTestHomeGovernanceKey;
+const testNormWorkerKeys = await crypto.subtle.generateKey(
+  { name: "ECDSA", namedCurve: "P-256" }, true, ["sign", "verify"],
+) as CryptoKeyPair;
+const testNormWorkerJwk = await crypto.subtle.exportKey("jwk", testNormWorkerKeys.publicKey);
+if (testNormWorkerJwk instanceof ArrayBuffer) {
+  throw new Error("test norm worker key did not export as JWK");
+}
+const testNormWorkerKey = p256JwkToGovernanceHex(testNormWorkerJwk);
+if (!testNormWorkerKey) throw new Error("test norm worker key is not a P-256 point");
+const testNormSuccessorKeys = await crypto.subtle.generateKey(
+  { name: "ECDSA", namedCurve: "P-256" }, true, ["sign", "verify"],
+) as CryptoKeyPair;
+const testNormSuccessorJwk = await crypto.subtle.exportKey("jwk", testNormSuccessorKeys.publicKey);
+if (testNormSuccessorJwk instanceof ArrayBuffer) throw new Error("test successor key is not JWK");
+const testNormSuccessorKey = p256JwkToGovernanceHex(testNormSuccessorJwk);
+if (!testNormSuccessorKey) throw new Error("test successor key is not a P-256 point");
+
+
 
 function base64(bytes: ArrayBuffer | Uint8Array): string {
   const value =
@@ -152,7 +170,91 @@ async function testHomePolicy(): Promise<Response> {
 
 export { TestDeployment, TestCredentialRegistry } from "./test-doubles";
 
-export { WorkflowInstance };
+// Test-only deployment configuration. The ephemeral private key remains here;
+// neither commands nor the production Worker can install these bindings.
+export class WorkflowInstance extends RuntimeWorkflowInstance {
+  private readonly normFixtureEnv: Env;
+  constructor(ctx: DurableObjectState, env: Env) {
+    const configured = {
+      ...env,
+      WHIP_NORM_TRUST: JSON.stringify({
+        bindings: [
+          { principal: "norm-owner", algorithm: "p256-sha256", key_id: testHomeGovernanceKey },
+          { principal: "norm-worker", algorithm: "p256-sha256", key_id: testNormWorkerKey },
+          { principal: "norm-owner", algorithm: "p256-sha256", key_id: testNormSuccessorKey },
+        ],
+        creation_grants: [{ creator: "norm-worker", owner: "norm-owner" }],
+      }),
+    };
+    super(ctx, configured);
+    this.normFixtureEnv = configured;
+  }
+
+  // Only the test harness calls this through runInDurableObject. No production
+  // route or command can alter the deployment's trust document.
+  configureNormTestExecutor(endpoint?: string, epoch?: string, runtime?: string): void {
+    this.normFixtureEnv.WHIP_EXECUTOR_URL = endpoint;
+    this.normFixtureEnv.WHIP_COMPUTE_ENV_HASH = epoch;
+    this.normFixtureEnv.WHIP_NORM_RUNTIME = runtime;
+  }
+
+  configureNormTestPlanning(deployment: { planning?: string; runtime?: string; image_binding?: string; deployed_image?: string }): void {
+    this.normFixtureEnv.WHIP_NORM_PLANNING = deployment.planning;
+    this.normFixtureEnv.WHIP_NORM_RUNTIME = deployment.runtime;
+    this.normFixtureEnv.WHIP_NORM_IMAGE_BINDING = deployment.image_binding;
+    this.normFixtureEnv.WHIP_NORM_DEPLOYMENT_IMAGE = deployment.deployed_image;
+  }
+
+  configureNormTestPublicBindings(public_bindings: unknown[], restorations: unknown[]): void {
+    this.normFixtureEnv.WHIP_NORM_TRUST = JSON.stringify({
+      bindings: [], public_bindings, creation_grants: [], restorations,
+    });
+  }
+
+  configureNormTestRestorations(restorations: unknown[]): void {
+    const trust = JSON.parse(this.normFixtureEnv.WHIP_NORM_TRUST!);
+    this.normFixtureEnv.WHIP_NORM_TRUST = JSON.stringify({
+      ...trust, creation_grants: [], restorations,
+    });
+  }
+}
+
+async function testNormSignature(binding: string, statement: unknown): Promise<string> {
+  const keys = binding === "norm-worker" ? testNormWorkerKeys
+    : binding === "norm-successor" ? testNormSuccessorKeys : testHomeKeys;
+  const signature = await crypto.subtle.sign(
+    { name: "ECDSA", hash: "SHA-256" }, keys.privateKey,
+    new TextEncoder().encode("whipplescript.norm.event.v1\0" + JSON.stringify(statement)),
+  );
+  return [...new Uint8Array(signature)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+async function testNormSign(principal: string, nonce: string, action: unknown): Promise<Response> {
+  const worker = principal === "norm-worker";
+  const successor = principal === "norm-successor";
+  const statement = {
+    protocol: "whipplescript.norm/v1",
+    actor: {
+      principal: successor ? "norm-owner" : principal,
+      algorithm: "p256-sha256",
+      key_id: worker ? testNormWorkerKey : successor ? testNormSuccessorKey : testHomeGovernanceKey,
+    },
+    nonce,
+    created_at: "2026-09-05T00:00:00Z",
+    action,
+  };
+  return Response.json({ statement, signature: await testNormSignature(principal, statement) });
+}
+
+async function testNormBootstrap(url: URL): Promise<Response> {
+  return testNormSign(
+    url.searchParams.get("principal") ?? "norm-owner", "hosted-norm-genesis", {
+      act: "bootstrap",
+      creator: url.searchParams.get("creator") ?? "norm-worker",
+      charter: { vocabularies: [], owner_scopes: [] },
+    },
+  );
+}
 export default {
   async fetch(
     request: Request,
@@ -160,6 +262,19 @@ export default {
     ctx: ExecutionContext,
   ): Promise<Response> {
     const url = new URL(request.url);
+    if (request.method === "POST" && url.pathname === "/__test/norm/cosign") {
+      const { binding, statement } = await request.json<{ binding: string; statement: unknown }>();
+      return Response.json({ signature: await testNormSignature(binding, statement) });
+    }
+    if (request.method === "POST" && url.pathname === "/__test/norm/sign") {
+      const { principal, nonce, action } = await request.json<{
+        principal: string; nonce: string; action: unknown;
+      }>();
+      return testNormSign(principal, nonce, action);
+    }
+    if (request.method === "GET" && url.pathname === "/__test/norm/bootstrap") {
+      return testNormBootstrap(url);
+    }
     if (
       request.method === "GET" &&
       url.pathname === "/__test/private-home/policy"

@@ -54,5 +54,7 @@ pub(super) fn observe<S: DoSql>(
         input_json: as_text(&row[4]),
         required_capabilities_json: as_text(&row[5]),
         declared_profiles_json: as_text(&row[6]),
+        // Not definitional and not in this row; see `dispatch_definition::check`.
+        attempt_admission_event_id: None,
     }))
 }

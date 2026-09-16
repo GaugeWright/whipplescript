@@ -1,0 +1,13 @@
+load ../impact-projection.maude
+search [1] in IMPACT-PROJECTION : input(supported,complete) =>* output(keep,complete) .
+search [1] in IMPACT-PROJECTION : input(supported,uncertain) =>* output(verify,uncertain) .
+search [1] in IMPACT-PROJECTION : input(violated,uncertain) =>* output(repair,uncertain) .
+search [1] in IMPACT-PROJECTION : input(conflicted,uncertain) =>* output(resolve,uncertain) .
+search [1] in IMPACT-PROJECTION : input(empty,uncertain) =>* output(none,uncertain) .
+search [1] in IMPACT-PROJECTION : input(supported,uncertain) =>* output(keep,complete) .
+search [1] in IMPACT-PROJECTION-WEAK : input(supported,uncertain) =>* output(keep,complete) .
+search [1] in IMPACT-PROJECTION : input(violated,uncertain) =>* output(verify,uncertain) .
+search [1] in IMPACT-PROJECTION-WEAK : input(violated,uncertain) =>* output(verify,uncertain) .
+search [1] in IMPACT-PROJECTION : input(empty,uncertain) =>* output(none,complete) .
+search [1] in IMPACT-PROJECTION-WEAK : input(empty,uncertain) =>* output(none,complete) .
+quit

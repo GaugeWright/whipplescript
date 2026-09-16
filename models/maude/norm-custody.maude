@@ -1,0 +1,49 @@
+--- DR-0098 / NC-01–03. The signature constructor represents an authenticated
+--- signature over fixed bytes under that version, not a proof of cryptography.
+--- This model separates a credential's moving backend version from the key
+--- identity pinned by a norm statement. Role checks and real crypto run in Rust.
+mod NORM-CUSTODY is
+  sorts Principal Version Fact Cfg State .
+  ops owner worker : -> Principal [ctor] .
+  ops v1 v2 : -> Version [ctor] .
+  subsort Fact < Cfg .
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+  op {_} : Cfg -> State [ctor] .
+  op binding : Principal Version -> Fact [ctor] .
+  op backend : Version -> Fact [ctor] .
+  op request : Principal Version -> Fact [ctor] .
+  --- Stated principal/version, actual signing version.
+  op reply : Principal Version Version -> Fact [ctor] .
+  op envelope : Principal Version Version -> Fact [ctor] .
+  op verified : Principal Version -> Fact [ctor] .
+  var P : Principal . vars V W : Version . var C : Cfg .
+  rl [sign-bound-request] :
+    { binding(P, V) request(P, V) backend(W) C }
+    => { binding(P, V) reply(P, V, W) backend(W) C } .
+  rl [retain-exact-version] :
+    { reply(P, V, V) C } => { envelope(P, V, V) C } .
+  rl [verify-historical-version] :
+    { binding(P, V) envelope(P, V, V) C }
+    => { binding(P, V) verified(P, V) C } .
+endm
+mod NORM-CUSTODY-DISCARD-VERSION is
+  including NORM-CUSTODY .
+  var P : Principal . vars V W : Version . var C : Cfg .
+  rl [accept-signing-race] :
+    { reply(P, V, W) C } => { envelope(P, V, W) C } .
+endm
+mod NORM-CUSTODY-VERIFY-LATEST is
+  including NORM-CUSTODY .
+  var P : Principal . vars V W : Version . var C : Cfg .
+  rl [ask-for-moving-default] :
+    { binding(P, V) envelope(P, V, W) backend(W) C }
+    => { binding(P, V) verified(P, V) backend(W) C } .
+endm
+mod NORM-CUSTODY-IMPERSONATE is
+  including NORM-CUSTODY .
+  vars P Q : Principal . vars V W : Version . var C : Cfg .
+  rl [ignore-principal-binding] :
+    { binding(P, V) request(Q, V) backend(W) C }
+    => { binding(P, V) reply(Q, V, W) backend(W) C } .
+endm

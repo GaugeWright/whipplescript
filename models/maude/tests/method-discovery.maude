@@ -1,0 +1,11 @@
+load ../method-discovery.maude
+search [1] in METHOD-DISCOVERY : discover(verified,verified,verified) =>* available .
+search [1] in METHOD-DISCOVERY : discover(missing,verified,verified) =>* available .
+search [1] in METHOD-DISCOVERY-WEAK : discover(missing,verified,verified) =>* available .
+search [1] in METHOD-DISCOVERY : discover(verified,missing,verified) =>* available .
+search [1] in METHOD-DISCOVERY-WEAK : discover(verified,missing,verified) =>* available .
+search [1] in METHOD-DISCOVERY : discover(verified,verified,missing) =>* available .
+search [1] in METHOD-DISCOVERY-WEAK : discover(verified,verified,missing) =>* available .
+search [1] in METHOD-DISCOVERY : discover(verified,different,verified) =>* available .
+search [1] in METHOD-DISCOVERY-WEAK : discover(verified,different,verified) =>* available .
+quit

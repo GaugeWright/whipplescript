@@ -1,0 +1,11 @@
+load ../native-impact-query.maude
+search [1] in NATIVE-IMPACT-QUERY : query(verified,verified,verified) =>* readOnlyPlan .
+search [1] in NATIVE-IMPACT-QUERY : query(missing,verified,verified) =>* readOnlyPlan .
+search [1] in NATIVE-IMPACT-QUERY-WEAK : query(missing,verified,verified) =>* readOnlyPlan .
+search [1] in NATIVE-IMPACT-QUERY : query(verified,callerChosen,verified) =>* readOnlyPlan .
+search [1] in NATIVE-IMPACT-QUERY-WEAK : query(verified,callerChosen,verified) =>* readOnlyPlan .
+search [1] in NATIVE-IMPACT-QUERY : query(verified,verified,missing) =>* readOnlyPlan .
+search [1] in NATIVE-IMPACT-QUERY-WEAK : query(verified,verified,missing) =>* readOnlyPlan .
+search [1] in NATIVE-IMPACT-QUERY : query(verified,verified,verified) =>* mutatedPlan .
+search [1] in NATIVE-IMPACT-QUERY-WEAK : query(verified,verified,verified) =>* mutatedPlan .
+quit

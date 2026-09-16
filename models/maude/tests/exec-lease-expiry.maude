@@ -1,0 +1,11 @@
+load ../exec-recovery-fallback.maude
+search [1] in EXEC-LEASE-EXPIRY : cfg(executor,tracked,active,none,running) =>* cfg(executor,tracked,expired,fenced,running) .
+search [1] in EXEC-LEASE-EXPIRY : cfg(executor,legacy,active,none,running) =>* cfg(executor,legacy,expired,none,running) .
+search [1] in EXEC-LEASE-EXPIRY : cfg(other,legacy,active,none,running) =>* cfg(other,legacy,expired,none,queued) .
+search [1] in EXEC-LEASE-EXPIRY : cfg(executor,tracked,active,none,running) =>* cfg(executor,tracked,expired,I:Intent,queued) .
+search [1] in EXEC-LEASE-EXPIRY-WEAK : cfg(executor,tracked,active,none,running) =>* cfg(executor,tracked,expired,I:Intent,queued) .
+search [1] in EXEC-LEASE-EXPIRY : cfg(executor,legacy,active,none,running) =>* cfg(executor,legacy,expired,none,queued) .
+search [1] in EXEC-LEASE-EXPIRY-WEAK : cfg(executor,legacy,active,none,running) =>* cfg(executor,legacy,expired,none,queued) .
+search [1] in EXEC-LEASE-EXPIRY : cfg(executor,tracked,active,none,running) =>* cfg(executor,tracked,expired,none,running) .
+search [1] in EXEC-LEASE-EXPIRY-WEAK : cfg(executor,tracked,active,none,running) =>* cfg(executor,tracked,expired,none,running) .
+quit

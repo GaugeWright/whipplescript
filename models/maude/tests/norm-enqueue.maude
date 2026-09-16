@@ -1,0 +1,22 @@
+load ../norm-enqueue.maude
+search [1] in NORM-ENQUEUE : { request(key,payload,deadline,revision) unused(key) live(revision) permitted(key) } =>* { dispatched(key) C:Cfg } .
+search [1] in NORM-ENQUEUE : { request(key,payload,deadline,revision) journal(key,payload,deadline,revision) live(other) } =>* { acknowledged(key) C:Cfg } .
+search [1] in NORM-ENQUEUE : { request(key,payload,deadline,revision) journal(key,payload,deadline,revision) } =>* { acknowledged(key) C:Cfg } .
+search [1] in NORM-ENQUEUE : { request(key,payload,deadline,revision) unused(key) } =>* { acknowledged(key) C:Cfg } .
+search [1] in NORM-ENQUEUE-WEAK-LIVE : { request(key,payload,deadline,revision) unused(key) } =>* { acknowledged(key) C:Cfg } .
+search [1] in NORM-ENQUEUE : { request(key,payload,deadline,revision) unused(key) live(other) } =>* { acknowledged(key) C:Cfg } .
+search [1] in NORM-ENQUEUE-WEAK-REVISION : { request(key,payload,deadline,revision) unused(key) live(other) } =>* { acknowledged(key) C:Cfg } .
+search [1] in NORM-ENQUEUE : { request(key,other,deadline,revision) journal(key,payload,deadline,revision) } =>* { acknowledged(key) C:Cfg } .
+search [1] in NORM-ENQUEUE-WEAK-PAYLOAD : { request(key,other,deadline,revision) journal(key,payload,deadline,revision) } =>* { acknowledged(key) C:Cfg } .
+search [1] in NORM-ENQUEUE : { request(key,payload,other,revision) journal(key,payload,deadline,revision) } =>* { acknowledged(key) C:Cfg } .
+search [1] in NORM-ENQUEUE-WEAK-DEADLINE : { request(key,payload,other,revision) journal(key,payload,deadline,revision) } =>* { acknowledged(key) C:Cfg } .
+search [1] in NORM-ENQUEUE : { queued(key) } =>* { dispatched(key) C:Cfg } .
+search [1] in NORM-ENQUEUE-WEAK-POLICY : { queued(key) } =>* { dispatched(key) C:Cfg } .
+search [1] in NORM-ENQUEUE-SELECTION : { chooseDefault(key) unused(key) current(payload) } =>* { resolved(key,payload) C:Cfg } .
+search [1] in NORM-ENQUEUE-SELECTION : { chooseDefault(key) pinned(key,payload) current(other) } =>* { resolved(key,payload) C:Cfg } .
+search [1] in NORM-ENQUEUE-SELECTION : { chooseExplicit(key,payload) pinned(key,payload) current(other) } =>* { resolved(key,payload) C:Cfg } .
+search [1] in NORM-ENQUEUE-SELECTION : { chooseDefault(key) pinned(key,payload) current(other) } =>* { resolved(key,other) C:Cfg } .
+search [1] in NORM-ENQUEUE-SELECTION-WEAK-DRIFT : { chooseDefault(key) pinned(key,payload) current(other) } =>* { resolved(key,other) C:Cfg } .
+search [1] in NORM-ENQUEUE-SELECTION : { chooseExplicit(key,other) pinned(key,payload) } =>* { resolved(key,other) C:Cfg } .
+search [1] in NORM-ENQUEUE-SELECTION-WEAK-EXPLICIT : { chooseExplicit(key,other) pinned(key,payload) } =>* { resolved(key,other) C:Cfg } .
+quit

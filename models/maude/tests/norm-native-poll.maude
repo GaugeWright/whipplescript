@@ -1,0 +1,10 @@
+load ../norm-observer.maude
+search [1] in NORM-NATIVE-POLL : cfg(terminal,open,ready) =>* cfg(terminal,fenced,cleanup) .
+search [1] in NORM-NATIVE-POLL : cfg(pending,fenced,ready) =>* cfg(pending,fenced,cleanup) .
+search [1] in NORM-NATIVE-POLL : cfg(absent,open,ready) =>* cfg(absent,open,delivered) .
+search [1] in NORM-NATIVE-POLL-WEAK : cfg(absent,open,ready) =>* cfg(absent,open,delivered) .
+search [1] in NORM-NATIVE-POLL : cfg(pending,open,ready) =>* cfg(pending,fenced,cleanup) .
+search [1] in NORM-NATIVE-POLL-WEAK : cfg(pending,open,ready) =>* cfg(pending,fenced,cleanup) .
+search [1] in NORM-NATIVE-POLL : cfg(pending,fenced,ready) =>* cfg(pending,open,read) .
+search [1] in NORM-NATIVE-POLL-WEAK : cfg(pending,fenced,ready) =>* cfg(pending,open,read) .
+quit

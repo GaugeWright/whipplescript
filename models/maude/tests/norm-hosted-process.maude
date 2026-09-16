@@ -1,0 +1,9 @@
+load ../norm-observer.maude
+search [1] in NORM-HOSTED-PROCESS : cfg(exact, preparing) =>* cfg(exact, admitted) .
+search [1] in NORM-HOSTED-PROCESS : cfg(absent, preparing) =>* cfg(absent, admitted) .
+search [1] in NORM-HOSTED-PROCESS-WEAK : cfg(absent, preparing) =>* cfg(absent, admitted) .
+search [1] in NORM-HOSTED-PROCESS : cfg(stale, preparing) =>* cfg(stale, admitted) .
+search [1] in NORM-HOSTED-PROCESS-WEAK : cfg(stale, preparing) =>* cfg(stale, admitted) .
+search [1] in NORM-HOSTED-PROCESS : cfg(changed, preparing) =>* cfg(changed, admitted) .
+search [1] in NORM-HOSTED-PROCESS-WEAK : cfg(changed, preparing) =>* cfg(changed, admitted) .
+quit

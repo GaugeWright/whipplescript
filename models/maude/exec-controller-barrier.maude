@@ -1,0 +1,31 @@
+--- Two sibling admissions share one container. destroy represents the trusted
+--- platform promise completing, not a kill request or a sampled running flag.
+--- Completion evidence can win until callbacks drain. Generation is retained
+--- after reopening so an older handshake cannot admit into a later process.
+mod EXEC-CONTROLLER-BARRIER is
+ protecting NAT .
+ sorts Gate Work Process Record Cfg .
+ ops open closing : -> Gate [ctor] .
+ ops pending drained : -> Work [ctor] .
+ ops alive dead : -> Process [ctor] .
+ ops admitted fencing completed terminated : -> Record [ctor] .
+ op cfg : Gate Nat Work Process Work Record Record -> Cfg [ctor] .
+ op stale : -> Cfg [ctor] .
+ var N : Nat . vars W K : Work . var P : Process . vars A B : Record .
+ rl [snapshot-siblings] : cfg(open,N,W,P,K,admitted,admitted) => cfg(closing,N + 1,W,P,K,fencing,fencing) .
+ rl [drain-startup] : cfg(closing,N,pending,P,K,A,B) => cfg(closing,N,drained,P,K,A,B) .
+ rl [destroy-completes] : cfg(closing,N,drained,alive,K,A,B) => cfg(closing,N,drained,dead,K,A,B) .
+ rl [buffered-completion] : cfg(closing,N,W,P,pending,fencing,B) => cfg(closing,N,W,P,pending,completed,B) .
+ rl [drain-callbacks] : cfg(closing,N,drained,dead,pending,A,B) => cfg(closing,N,drained,dead,drained,A,B) .
+ rl [commit-termination] : cfg(closing,N,drained,dead,drained,fencing,fencing) => cfg(open,N,drained,dead,drained,terminated,terminated) .
+ rl [completion-wins] : cfg(closing,N,drained,dead,drained,completed,fencing) => cfg(open,N,drained,dead,drained,completed,terminated) .
+endm
+mod EXEC-CONTROLLER-BARRIER-WEAK is
+ including EXEC-CONTROLLER-BARRIER .
+ var N : Nat . vars W K : Work . var P : Process . vars A B : Record .
+ rl [ack-before-destroy] : cfg(closing,N,drained,alive,drained,fencing,fencing) => cfg(open,N,drained,alive,drained,terminated,terminated) .
+ rl [startup-escapes] : cfg(closing,N,pending,alive,K,A,B) => cfg(closing,N,pending,dead,K,A,B) .
+ rl [forget-sibling] : cfg(open,N,W,P,K,admitted,admitted) => cfg(closing,N + 1,W,P,K,fencing,admitted) .
+ rl [overwrite-completion] : cfg(closing,N,drained,dead,drained,completed,fencing) => cfg(open,N,drained,dead,drained,terminated,terminated) .
+ rl [admit-old-generation] : cfg(open,s(N),drained,dead,drained,A,B) => stale .
+endm

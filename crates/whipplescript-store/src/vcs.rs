@@ -3784,6 +3784,16 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
         Ok(None)
     }
 
+    /// Verify and own all bytes of a recorded cut for a norm runner. A caller
+    /// cannot substitute a partial file listing or a moving branch head.
+    pub fn capture_norm_artifact(
+        &self,
+        cut_id: &str,
+        limits: crate::norm_artifact::ArtifactLimits,
+    ) -> StoreResult<crate::norm_artifact::CapturedArtifact> {
+        crate::norm_artifact::capture_cut(&self.branches, &self.content, cut_id, limits)
+    }
+
     /// A recorded cut's manifest (bisect materializes these directly —
     /// no branch pointer ever moves). `None` = unrecorded cut.
     pub fn cut_manifest(&self, cut_id: &str) -> StoreResult<Option<BTreeMap<String, String>>> {
@@ -4479,7 +4489,8 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
             crate::branches::BindOutcome::AlreadyBound { branch_id } => {
                 return Ok(InstanceForkBinding::TargetAlreadyBound { branch_id });
             }
-            crate::branches::BindOutcome::BranchMissing
+            crate::branches::BindOutcome::GatedRef
+            | crate::branches::BindOutcome::BranchMissing
             | crate::branches::BindOutcome::BranchNotActive { .. } => {
                 return Err(StoreError::Conflict(format!(
                     "fork branch `{}` closed underneath its own creation",
@@ -4666,7 +4677,8 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
             crate::branches::BindOutcome::AlreadyBound { branch_id } => {
                 return Ok(ExactInstanceForkBinding::TargetAlreadyBound { branch_id })
             }
-            crate::branches::BindOutcome::BranchMissing
+            crate::branches::BindOutcome::GatedRef
+            | crate::branches::BindOutcome::BranchMissing
             | crate::branches::BindOutcome::BranchNotActive { .. } => {
                 return Err(StoreError::Conflict(format!(
                     "exact fork branch `{}` closed underneath its own creation",
@@ -4741,6 +4753,12 @@ impl<B: Branches, C: ContentBlobs> BranchFileStore<B, C> {
     }
 
     fn apply(&self, path: &Path, body: Option<&str>) -> std::io::Result<()> {
+        if self.branch_id == MAINLINE_BRANCH_ID {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "mainline file effects require governed admission; bind the instance to a work branch",
+            ));
+        }
         let cut_id = self.next_cut_id();
         let path_key = path.to_string_lossy();
         match self
@@ -7664,8 +7682,8 @@ mod tests {
                     _ => "different immutable content or provenance",
                 };
                 assert!(message.contains(expected), "{mode}: {message}");
+                done.send(()).expect("test receiver");
             }
-            done.send(()).expect("test receiver");
         });
         finished
             .recv_timeout(std::time::Duration::from_secs(120))

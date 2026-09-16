@@ -381,6 +381,7 @@ fn repair_scope_retargets_and_refuses_excess() {
         instance_id: "ins-repair".to_owned(),
     };
     let effect = |id: &str, selection: &str| ClaimableEffect {
+        attempt_admission_event_id: None,
         effect_id: id.to_owned(),
         kind: "capability.call".to_owned(),
         target: Some("vcs.undo".to_owned()),
@@ -889,6 +890,7 @@ fn vcs_selective_provider_refuses_unresolved_region_atoms() {
         instance_id: "ins-region".to_owned(),
     };
     let effect = ClaimableEffect {
+        attempt_admission_event_id: None,
         effect_id: "e-region".to_owned(),
         kind: "capability.call".to_owned(),
         target: Some("vcs.undo".to_owned()),

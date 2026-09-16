@@ -156,6 +156,8 @@ fn governed_tracker_wait_parks_then_consumes_closure_with_a_read_only_binding() 
             input_json: queued[0].input_json.clone(),
             required_capabilities_json: queued[0].required_capabilities_json.clone(),
             declared_profiles_json: queued[0].declared_profiles_json.clone(),
+            // Fixture: no attempt admission selected this effect.
+            attempt_admission_event_id: None,
         };
         assert!(
             matches!(crate::tracker_wait::run_governed(f.facade.kernel_mut(), &instance, &effect),

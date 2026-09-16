@@ -1,0 +1,52 @@
+--- N1/G1: a captured cut owns every verified file byte, not a moving branch.
+--- Host cut-row authority and content hash collision resistance are assumptions.
+mod ARTIFACT-CAPTURE is
+  protecting BOOL .
+  sorts Id Fact Cfg State .
+  ops cut0 cut1 root0 root1 file0 file1 : -> Id [ctor] .
+  subsort Fact < Cfg .
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+  op {_} : Cfg -> State [ctor] .
+  op request : Id -> Fact [ctor] .
+  op cut : Id Id -> Fact [ctor] .
+  op branch : Id -> Fact [ctor] .
+  op root : Id Bool Bool Bool -> Fact [ctor] .
+  op files : Id Bool -> Fact [ctor] .
+  op budget : Bool -> Fact [ctor] .
+  op captured : Id Id -> Fact [ctor] .
+  vars I R : Id . var C : Cfg .
+  rl [capture-complete-verified-content] :
+    { request(I) cut(I,R) root(R,true,true,true) files(R,true) budget(true) C }
+    => { captured(I,R) C } .
+endm
+mod ARTIFACT-CAPTURE-WEAK-ROOT is
+  including ARTIFACT-CAPTURE . vars I R : Id . var B : Bool . var C : Cfg .
+  rl [unverified-root] :
+    { request(I) cut(I,R) root(R,B,true,true) files(R,true) budget(true) C } => { captured(I,R) C } .
+endm
+mod ARTIFACT-CAPTURE-WEAK-CLOSURE is
+  including ARTIFACT-CAPTURE . vars I R : Id . var B : Bool . var C : Cfg .
+  rl [partial-manifest] :
+    { request(I) cut(I,R) root(R,true,B,true) files(R,true) budget(true) C } => { captured(I,R) C } .
+endm
+mod ARTIFACT-CAPTURE-WEAK-SHAPE is
+  including ARTIFACT-CAPTURE . vars I R : Id . var B : Bool . var C : Cfg .
+  rl [ambiguous-manifest] :
+    { request(I) cut(I,R) root(R,true,true,B) files(R,true) budget(true) C } => { captured(I,R) C } .
+endm
+mod ARTIFACT-CAPTURE-WEAK-BODY is
+  including ARTIFACT-CAPTURE . vars I R : Id . var B : Bool . var C : Cfg .
+  rl [missing-or-corrupt-file] :
+    { request(I) cut(I,R) root(R,true,true,true) files(R,B) budget(true) C } => { captured(I,R) C } .
+endm
+mod ARTIFACT-CAPTURE-WEAK-LIMIT is
+  including ARTIFACT-CAPTURE . vars I R : Id . var B : Bool . var C : Cfg .
+  rl [unbounded-capture] :
+    { request(I) cut(I,R) root(R,true,true,true) files(R,true) budget(B) C } => { captured(I,R) C } .
+endm
+mod ARTIFACT-CAPTURE-WEAK-CUT is
+  including ARTIFACT-CAPTURE . vars I R J : Id . var C : Cfg .
+  rl [moving-branch-substitution] :
+    { request(I) branch(J) cut(J,R) root(R,true,true,true) files(R,true) budget(true) C } => { captured(I,R) C } .
+endm

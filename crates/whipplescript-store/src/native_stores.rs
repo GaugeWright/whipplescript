@@ -308,6 +308,52 @@ impl RuntimeStore for NativeStores {
         self.runtime.admit_fact_batch(batch)
     }
 
+    fn retain_exec_outcome(
+        &mut self,
+        observation: crate::exec_outcome::Retention<'_>,
+    ) -> StoreResult<StoredEvent> {
+        self.runtime.retain_exec_outcome(observation)
+    }
+    fn retain_exec_fence_proof(
+        &mut self,
+        proof: crate::exec_lifetime::Proof<'_>,
+    ) -> StoreResult<StoredEvent> {
+        self.runtime.retain_exec_fence_proof(proof)
+    }
+    fn ensure_exec_fence(
+        &mut self,
+        request: crate::exec_lifetime::Fence<'_>,
+    ) -> StoreResult<StoredEvent> {
+        self.runtime.ensure_exec_fence(request)
+    }
+    fn track_exec_lifetime(
+        &mut self,
+        track: crate::exec_lifetime::Track<'_>,
+    ) -> StoreResult<StoredEvent> {
+        self.runtime.track_exec_lifetime(track)
+    }
+    fn schedule_exec_reconciliation(
+        &mut self,
+        schedule: crate::exec_reconciliation::Schedule<'_>,
+    ) -> StoreResult<StoredEvent> {
+        self.runtime.schedule_exec_reconciliation(schedule)
+    }
+    fn retain_exec_settlement(
+        &mut self,
+        request: crate::exec_settlement::Retention<'_>,
+    ) -> StoreResult<StoredEvent> {
+        self.runtime.retain_exec_settlement(request)
+    }
+    fn complete_effect_settlement(
+        &mut self,
+        completion: EffectCompletion<'_>,
+        diagnostic: Option<TerminalDiagnosticRecord>,
+        facts: &[crate::SettlementFact<'_>],
+        cache: Option<crate::SettlementCache<'_>>,
+    ) -> StoreResult<StoredEvent> {
+        self.runtime
+            .complete_effect_settlement(completion, diagnostic, facts, cache)
+    }
     fn settle_file_effect(
         &mut self,
         completion: EffectCompletion<'_>,
@@ -664,6 +710,13 @@ impl RuntimeStore for NativeStores {
     fn start_run(&mut self, run: RunStart<'_>) -> StoreResult<StoredEvent> {
         self.runtime.start_run(run)
     }
+    fn start_run_for_admission(
+        &mut self,
+        run: RunStart<'_>,
+        admission: Option<&str>,
+    ) -> StoreResult<StoredEvent> {
+        self.runtime.start_run_for_admission(run, admission)
+    }
 
     fn start_dispatch(&mut self, run: RunStart<'_>) -> StoreResult<StoredEvent> {
         RuntimeStore::start_dispatch(&mut self.runtime, run)
@@ -768,6 +821,13 @@ impl RuntimeStore for NativeStores {
 
     fn retry_effect(&mut self, retry: RetryEffect<'_>) -> StoreResult<StoredEvent> {
         self.runtime.retry_effect(retry)
+    }
+    fn retry_effect_at_terminal(
+        &mut self,
+        retry: RetryEffect<'_>,
+        terminal: &str,
+    ) -> StoreResult<StoredEvent> {
+        self.runtime.retry_effect_at_terminal(retry, terminal)
     }
 
     fn rebuild_projections(&mut self, instance_id: &str) -> StoreResult<()> {

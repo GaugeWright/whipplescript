@@ -176,6 +176,45 @@ impl Drop for ConnPermit {
     }
 }
 
+/// Native managed receivers have one pinned dispatch and one delivery slot.
+/// The external controller owns durability; this gate prevents a script from
+/// reentering the local sidecar after its own invocation has started.
+struct ManagedDispatch {
+    digest: String,
+    consumed: std::sync::atomic::AtomicBool,
+}
+impl ManagedDispatch {
+    fn new(digest: String) -> std::io::Result<Self> {
+        if digest.len() != 64
+            || !digest
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
+            return Err(std::io::Error::other(
+                "managed executor dispatch digest is invalid",
+            ));
+        }
+        Ok(Self {
+            digest,
+            consumed: std::sync::atomic::AtomicBool::new(false),
+        })
+    }
+    fn admit(&self, dispatch: &Value) -> Result<(), String> {
+        if sha256_hex(dispatch.to_string().as_bytes()) != self.digest {
+            return Err("managed executor dispatch differs from its pinned invocation".into());
+        }
+        self.consumed
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+            )
+            .map_err(|_| "managed executor delivery was already consumed".to_owned())?;
+        Ok(())
+    }
+}
+
 /// Serve forever on `bind` (e.g. `127.0.0.1:8080`).
 pub fn serve(bind: &str) -> std::io::Result<()> {
     let listener = TcpListener::bind(bind)?;
@@ -184,6 +223,59 @@ pub fn serve(bind: &str) -> std::io::Result<()> {
 
 /// Serve forever on an already-bound listener (tests bind `:0` first).
 pub fn serve_on(listener: TcpListener) -> std::io::Result<()> {
+    let runtime = std::env::var("WHIP_NORM_RUNTIME")
+        .map(Some)
+        .or_else(|error| match error {
+            std::env::VarError::NotPresent => Ok(None),
+            // A runtime profile that is SET but unreadable is not an absent
+            // one. Serving without it would run unverified against a
+            // configuration the operator did mean to supply.
+            // Spelled with the error type, because with both arms yielding
+            // `Ok` there is nothing left for `or_else` to infer it from.
+            // MUTATION-SUCCESS-EXPR: Ok::<_, std::io::Error>(None)
+            _ => Err(std::io::Error::other(error)),
+        })?
+        .map(|configuration| {
+            let runtime = whipplescript_kernel::norm_runtime::parse(&configuration)
+                .map_err(std::io::Error::other)?;
+            crate::norm_observer::verify_runtime_profile(&runtime)
+                .map_err(std::io::Error::other)?;
+            Ok::<_, std::io::Error>(runtime)
+        })
+        .transpose()?;
+    let managed = match std::env::var("WHIP_EXECUTOR_DISPATCH_SHA256") {
+        Ok(digest) => Some(ManagedDispatch::new(digest)?),
+        Err(std::env::VarError::NotPresent) => None,
+        // Same, and it matters more here: falling through to `None` would mean
+        // an executor whose pinned dispatch digest was SUPPLIED but unreadable
+        // serves UNMANAGED -- every bypass the gate exists to refuse, admitted.
+        // MUTATION-SUCCESS-EXPR: None
+        Err(error) => return Err(std::io::Error::other(error)),
+    };
+    serve_on_with_runtime(listener, managed, runtime)
+}
+
+#[cfg(test)]
+fn serve_on_with_profile(
+    listener: TcpListener,
+    managed: Option<ManagedDispatch>,
+) -> std::io::Result<()> {
+    serve_on_with_runtime(listener, managed, None)
+}
+
+fn serve_on_with_runtime(
+    listener: TcpListener,
+    managed: Option<ManagedDispatch>,
+    runtime: Option<whipplescript_kernel::norm_runner::PythonRuntime>,
+) -> std::io::Result<()> {
+    let runtime = std::sync::Arc::new(runtime);
+    let managed = std::sync::Arc::new(managed);
+    use ring::rand::SecureRandom as _;
+    let mut entropy = [0u8; 32];
+    ring::rand::SystemRandom::new()
+        .fill(&mut entropy)
+        .map_err(|_| std::io::Error::other("executor incarnation entropy unavailable"))?;
+    let incarnation = std::sync::Arc::new(sha256_hex(&entropy));
     eprintln!(
         "whip executor listening on {} ({EXECUTOR_PROTOCOL})",
         listener.local_addr()?
@@ -196,9 +288,17 @@ pub fn serve_on(listener: TcpListener) -> std::io::Result<()> {
                 // (new peers queue in the OS backlog) instead of spawning an
                 // unbounded number of handler threads.
                 let permit = limiter.acquire();
+                let incarnation = std::sync::Arc::clone(&incarnation);
+                let managed = std::sync::Arc::clone(&managed);
+                let runtime = std::sync::Arc::clone(&runtime);
                 std::thread::spawn(move || {
                     let _permit = permit; // released when the handler returns
-                    let _ = handle_connection(stream);
+                    let _ = handle_connection(
+                        stream,
+                        &incarnation,
+                        managed.as_ref().as_ref(),
+                        runtime.as_ref().as_ref(),
+                    );
                 });
             }
             Err(error) => eprintln!("executor: accept failed: {error}"),
@@ -232,7 +332,12 @@ fn read_header_line(
     Ok(())
 }
 
-fn handle_connection(stream: TcpStream) -> std::io::Result<()> {
+fn handle_connection(
+    stream: TcpStream,
+    incarnation: &str,
+    managed: Option<&ManagedDispatch>,
+    runtime: Option<&whipplescript_kernel::norm_runner::PythonRuntime>,
+) -> std::io::Result<()> {
     let local_addr = stream.local_addr().ok();
     // Bound the PRE-AUTH header read: a peer that opens a connection and
     // never finishes (or dribbles) the header block is dropped when the
@@ -294,6 +399,40 @@ fn handle_connection(stream: TcpStream) -> std::io::Result<()> {
         return write_json_response(stream, 413, json!({"error": "request body too large"}));
     }
 
+    if managed.is_some()
+        && !matches!(
+            (method.as_str(), path.as_str()),
+            ("GET", "/healthz")
+                | ("GET", "/exec/incarnation")
+                | ("GET", "/exec/norm-runtime")
+                | ("POST", "/exec/bound")
+        )
+    {
+        // Drain the declared body FIRST. `write_json_response` closes the
+        // socket, and closing one whose receive queue still holds unread bytes
+        // makes the kernel send RST rather than FIN -- which discards the
+        // response the peer has not read yet. The caller then sees a connection
+        // reset where a 409 was sent, and cannot tell a refusal from a crashed
+        // executor. It is a race, so it shows up as a flaky test on a loaded
+        // machine rather than as a bug: `managed_executor_http_refuses_bypass_
+        // and_concurrent_replay` lost it on the hosted runner, which is what
+        // the mutation sweep's self test refused to run against.
+        //
+        // Best-effort, and the two refusals above deliberately do NOT do this:
+        // theirs is a header block or a body just declared too large to read,
+        // and abandoning it unread is the refusal. Here the body is within the
+        // cap and merely unwanted.
+        let _ = std::io::copy(
+            &mut (&mut reader).take(content_length as u64),
+            &mut std::io::sink(),
+        );
+        return write_json_response(
+            stream,
+            409,
+            json!({"error":"managed executor requires its pinned bound delivery"}),
+        );
+    }
+
     // Class-B turn channel (whip-turn/1): hand the raw socket to the
     // WebSocket handler. Safe because an upgrade request has no body and the
     // client sends no frames until it sees the 101 — the buffered reader has
@@ -323,6 +462,51 @@ fn handle_connection(stream: TcpStream) -> std::io::Result<()> {
 
     let (status, response_body) = match (method.as_str(), path.as_str()) {
         ("GET", "/healthz") => (200, json!({"protocol": EXECUTOR_PROTOCOL, "ok": true})),
+        ("GET", "/exec/incarnation") | ("GET", "/exec/norm-runtime") | ("POST", "/exec/bound") => {
+            match check_executor_auth(
+                local_addr.map(|addr| addr.ip()),
+                &authorization,
+                &executor_token_header,
+            ) {
+                Err((status, message)) => (status, json!({"error": message})),
+                Ok(()) => {
+                    use whipplescript_kernel::exec_incarnation;
+                    let encoded = if path == "/exec/norm-runtime" {
+                        runtime
+                            .ok_or_else(|| "executor has no verified norm runtime".to_owned())
+                            .and_then(|runtime| {
+                                whipplescript_kernel::norm_runtime::process_receipt(
+                                    incarnation,
+                                    runtime,
+                                )
+                            })
+                    } else if method == "GET" {
+                        exec_incarnation::handshake(incarnation)
+                    } else {
+                        std::str::from_utf8(&body)
+                            .map_err(|e| e.to_string())
+                            .and_then(|body| exec_incarnation::read_delivery(body, incarnation))
+                            .and_then(|request| {
+                                if let Some(managed) = managed {
+                                    managed.admit(&request)?;
+                                }
+                                let (status, response) = match handle_exec_request(&request) {
+                                    Ok(response) => (200, response),
+                                    Err((status, message)) => (status, json!({"error":message})),
+                                };
+                                exec_incarnation::completion(incarnation, status, response)
+                            })
+                    };
+                    match encoded {
+                        Ok(body) => (
+                            200,
+                            serde_json::from_str(&body).map_err(std::io::Error::other)?,
+                        ),
+                        Err(message) => (409, json!({"error":message})),
+                    }
+                }
+            }
+        }
         ("POST", "/exec") => {
             match check_executor_auth(
                 local_addr.map(|addr| addr.ip()),
@@ -379,6 +563,7 @@ fn write_json_response(
             200 => "OK",
             400 => "Bad Request",
             404 => "Not Found",
+            409 => "Conflict",
             413 => "Payload Too Large",
             431 => "Request Header Fields Too Large",
             _ => "Internal Server Error",
@@ -526,7 +711,7 @@ pub fn handle_exec_request(request: &Value) -> Result<Value, (u16, String)> {
     let staged = stage_verified_script(&actual_sha, &script_bytes, script_ext)
         .map_err(|error| (500, format!("failed to stage script: {error}")))?;
     let mut argv = argv;
-    argv[script_index] = staged.display().to_string();
+    argv[script_index] = staged.path.display().to_string();
 
     let mut command = Command::new(&argv[0]);
     command.args(&argv[1..]);
@@ -556,56 +741,55 @@ pub fn handle_exec_request(request: &Value) -> Result<Value, (u16, String)> {
     gate.acquire(priority);
     let outcome = run_with_timeout(command, &stdin_json, Duration::from_millis(timeout_ms));
     gate.release();
-    let _ = std::fs::remove_file(&staged);
-    let (exit_code, timed_out, stdout, stderr) =
-        outcome.map_err(|error| (500, format!("exec failed: {error}")))?;
-
-    let (stdout, stdout_truncated) = cap_stream(stdout);
-    let (stderr, stderr_truncated) = cap_stream(stderr);
+    drop(staged);
+    let output = outcome.map_err(|error| (500, format!("exec failed: {error}")))?;
     Ok(json!({
         "protocol": EXECUTOR_PROTOCOL,
         "effect_id": effect_id,
-        "exit_code": exit_code,
-        "timed_out": timed_out,
-        "stdout": stdout,
-        "stdout_truncated": stdout_truncated,
-        "stderr": stderr,
-        "stderr_truncated": stderr_truncated,
+        "exit_code": output.exit_code,
+        "timed_out": output.timed_out,
+        "stdout": output.stdout,
+        "stdout_truncated": output.stdout_truncated,
+        "stderr": output.stderr,
+        "stderr_truncated": output.stderr_truncated,
     }))
 }
 
 /// Spawn, hand off stdin (EPIPE-tolerant: a script that never reads stdin is
-/// normal), and wait with a kill-on-timeout loop. Returns
-/// `(exit_code, timed_out, stdout, stderr)`.
+/// normal), and wait with a kill-on-timeout loop.
+/// Captured streams retain their observed prefix even when a timeout kills the child.
 fn run_with_timeout(
     mut command: Command,
     stdin_json: &str,
     timeout: Duration,
-) -> Result<(i64, bool, String, String), String> {
+) -> Result<ExecProcessOutput, String> {
+    let start = Instant::now();
     let mut child = command
         .spawn()
         .map_err(|error| format!("failed to spawn: {error}"))?;
-    if let Some(stdin) = child.stdin.as_mut() {
-        if let Err(error) = stdin.write_all(stdin_json.as_bytes()) {
-            if error.kind() != std::io::ErrorKind::BrokenPipe {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(format!("failed to write stdin: {error}"));
-            }
-        }
-    }
-    drop(child.stdin.take());
+    // Input may exceed pipe capacity while an interpreter is stalled before
+    // reading. Hand it off independently so that backpressure cannot prevent
+    // the execution timer from starting or the parent from killing the child.
+    let stdin_handle = child.stdin.take().map(|stdin| {
+        let input = stdin_json.to_owned();
+        std::thread::spawn(move || write_exec_stdin(stdin, &input))
+    });
 
     // Drain pipes on threads so a chatty child cannot deadlock on a full pipe
     // while we poll for exit.
     let stdout_handle = child.stdout.take().map(spawn_drain);
     let stderr_handle = child.stderr.take().map(spawn_drain);
 
-    let start = Instant::now();
     let (exit_code, timed_out) = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break (i64::from(status.code().unwrap_or(-1)), false),
-            Ok(None) => {
+        // The wait FAILING and the child's state are two different questions.
+        // Relabel and propagate the first -- nothing is decided here, the OS
+        // already did -- and match only on the second, which is the decision.
+        match child
+            .try_wait()
+            .map_err(|error| format!("failed to wait: {error}"))?
+        {
+            Some(status) => break (i64::from(status.code().unwrap_or(-1)), false),
+            None => {
                 if start.elapsed() >= timeout {
                     let _ = child.kill();
                     let _ = child.wait();
@@ -613,31 +797,112 @@ fn run_with_timeout(
                 }
                 std::thread::sleep(Duration::from_millis(10));
             }
-            Err(error) => return Err(format!("failed to wait: {error}")),
         }
     };
-    if timed_out {
-        // Grandchildren of the killed process may still hold the pipes (kill
-        // reaches the direct child only); joining the drain threads would
-        // block until they exit. Abandon the drains — the threads end when
-        // the pipes close — and report empty streams for the killed run.
-        return Ok((exit_code, timed_out, String::new(), String::new()));
-    }
-    let stdout = stdout_handle
-        .and_then(|handle| handle.join().ok())
+    // A grandchild may still hold the pipes after the direct child is killed.
+    // Snapshot already captured bytes instead of joining indefinitely or erasing
+    // the prefix. Capture threads retain bounded buffers until their pipes close.
+    let deadline = start + timeout;
+    let stdin_open = if let Some(writer) = stdin_handle {
+        while !writer.is_finished() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        if writer.is_finished() {
+            writer
+                .join()
+                .map_err(|_| "executor stdin writer panicked".to_owned())?
+                .map_err(|error| format!("failed to write stdin: {error}"))?;
+            false
+        } else {
+            true
+        }
+    } else {
+        false
+    };
+    let (stdout, stdout_truncated, stdout_open) = stdout_handle
+        .map(|drain| drain.finish(deadline))
         .unwrap_or_default();
-    let stderr = stderr_handle
-        .and_then(|handle| handle.join().ok())
+    let (stderr, stderr_truncated, stderr_open) = stderr_handle
+        .map(|drain| drain.finish(deadline))
         .unwrap_or_default();
-    Ok((exit_code, timed_out, stdout, stderr))
+    let timed_out = timed_out || stdin_open || stdout_open || stderr_open;
+
+    Ok(ExecProcessOutput {
+        exit_code,
+        timed_out,
+        stdout,
+        stderr,
+        stdout_truncated,
+        stderr_truncated,
+    })
 }
 
-fn spawn_drain<R: Read + Send + 'static>(mut source: R) -> std::thread::JoinHandle<String> {
-    std::thread::spawn(move || {
-        let mut buffer = Vec::new();
-        let _ = source.read_to_end(&mut buffer);
-        String::from_utf8_lossy(&buffer).into_owned()
-    })
+fn write_exec_stdin<W: Write>(mut stdin: W, input: &str) -> std::io::Result<()> {
+    match stdin.write_all(input.as_bytes()) {
+        // A command deliberately ignoring its input is ordinary exec behavior.
+        Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+        result => result,
+    }
+}
+
+struct ExecProcessOutput {
+    exit_code: i64,
+    timed_out: bool,
+    stdout: String,
+    stderr: String,
+    stdout_truncated: bool,
+    stderr_truncated: bool,
+}
+
+#[derive(Default)]
+struct StreamCapture {
+    bytes: Vec<u8>,
+    truncated: bool,
+}
+
+struct StreamDrain {
+    thread: std::thread::JoinHandle<()>,
+    capture: std::sync::Arc<std::sync::Mutex<StreamCapture>>,
+}
+
+impl StreamDrain {
+    fn finish(self, deadline: Instant) -> (String, bool, bool) {
+        while !self.thread.is_finished() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let still_open = !self.thread.is_finished();
+        if !still_open {
+            let _ = self.thread.join();
+        }
+        let capture = self.capture.lock().expect("executor stream capture");
+        let (text, capped) = cap_stream(String::from_utf8_lossy(&capture.bytes).into_owned());
+        (text, capped || capture.truncated || still_open, still_open)
+    }
+}
+
+fn spawn_drain<R: Read + Send + 'static>(mut source: R) -> StreamDrain {
+    let capture = std::sync::Arc::new(std::sync::Mutex::new(StreamCapture::default()));
+    let writer = std::sync::Arc::clone(&capture);
+    let thread = std::thread::spawn(move || {
+        let mut chunk = [0u8; 8192];
+        loop {
+            match source.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(count) => {
+                    let mut capture = writer.lock().expect("executor stream capture");
+                    let keep = count.min(STREAM_CAP_BYTES - capture.bytes.len());
+                    capture.bytes.extend_from_slice(&chunk[..keep]);
+                    capture.truncated |= keep < count;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => {
+                    writer.lock().expect("executor stream capture").truncated = true;
+                    break;
+                }
+            }
+        }
+    });
+    StreamDrain { thread, capture }
 }
 
 fn cap_stream(stream: String) -> (String, bool) {
@@ -651,6 +916,19 @@ fn cap_stream(stream: String) -> (String, bool) {
     (stream[..end].to_owned(), true)
 }
 
+/// Own the staged path for exactly one invocation. Cleanup of identical script
+/// bytes in another invocation cannot remove this one's still-live executable.
+struct StagedScript {
+    path: PathBuf,
+    directory: PathBuf,
+}
+
+impl Drop for StagedScript {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.directory);
+    }
+}
+
 /// Stage the verified bytes under a temp path private to THIS request and
 /// make the file executable (argv may invoke it directly).
 ///
@@ -658,27 +936,40 @@ fn cap_stream(stream: String) -> (String, bool) {
 /// alone: identical scripts run concurrently as a matter of course (mass
 /// regeneration, design note §6), and a shared path lets one request truncate
 /// a file another is reading, or remove — after its own run — the script a
-/// request still parked at the admission gate is about to spawn.
-fn stage_verified_script(sha256: &str, bytes: &[u8], extension: &str) -> std::io::Result<PathBuf> {
-    static STAGE_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
+/// request still parked at the admission gate is about to spawn. The private
+/// staging directory supplies that separation, and `StagedScript` removes it.
+fn stage_verified_script(
+    sha256: &str,
+    bytes: &[u8],
+    extension: &str,
+) -> std::io::Result<StagedScript> {
+    if extension.len() > 32
+        || !extension
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "script extension must be a filename suffix",
+        ));
+    }
     let suffix = if extension.is_empty() {
         String::new()
     } else {
         format!(".{extension}")
     };
-    let unique = STAGE_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let path = std::env::temp_dir().join(format!(
-        "whip-executor-{sha256}-{}-{unique}{suffix}",
-        std::process::id()
-    ));
-    std::fs::write(&path, bytes)?;
+    let directory = super::private_staging_dir("whip-executor")?;
+    let staged = StagedScript {
+        path: directory.join(format!("{sha256}{suffix}")),
+        directory,
+    };
+    std::fs::write(&staged.path, bytes)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755));
+        std::fs::set_permissions(&staged.path, std::fs::Permissions::from_mode(0o700))?;
     }
-    Ok(path)
+    Ok(staged)
 }
 
 #[cfg(test)]
@@ -739,6 +1030,152 @@ mod tests {
             handle.join().expect("waiter joins");
         }
         assert_eq!(*order.lock().expect("order lock"), vec![0, 2]);
+    }
+
+    #[test]
+    fn managed_dispatch_requires_a_valid_digest_and_one_exact_admission() {
+        for invalid in [
+            "".to_owned(),
+            "a".repeat(63),
+            "A".repeat(64),
+            "g".repeat(64),
+        ] {
+            assert!(ManagedDispatch::new(invalid).is_err());
+        }
+        let request = json!({"original":true});
+        let gate = ManagedDispatch::new(sha256_hex(request.to_string().as_bytes())).expect("gate");
+        assert!(gate.admit(&json!({"replacement":true})).is_err());
+        assert!(gate.admit(&request).is_ok());
+        assert!(gate.admit(&request).is_err());
+    }
+
+    /// A configuration variable that is SET but unreadable is not an absent
+    /// one, and both arms that say so are load-bearing in opposite directions.
+    /// `WHIP_NORM_RUNTIME` falling through to `Ok(None)` would serve without
+    /// the verified profile the operator supplied; `WHIP_EXECUTOR_DISPATCH_SHA256`
+    /// falling through to `None` would serve UNMANAGED, admitting every bypass
+    /// the managed gate exists to refuse. `serve_on` reads both before it
+    /// accepts anything, so each refusal is observable as a startup error.
+    #[test]
+    fn unreadable_executor_configuration_refuses_to_serve() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let _guard = crate::env_lock();
+        // Not valid UTF-8, so `env::var` yields `VarError::NotUnicode` rather
+        // than `NotPresent` -- the distinction both arms turn on.
+        let unreadable = std::ffi::OsString::from_vec(vec![0x66, 0xff, 0x6f]);
+        for key in ["WHIP_NORM_RUNTIME", "WHIP_EXECUTOR_DISPATCH_SHA256"] {
+            let restore = std::env::var_os(key);
+            std::env::set_var(key, &unreadable);
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+            // On ANOTHER thread, with a deadline. Without the refusal
+            // `serve_on` does not return an error -- it goes on to serve, and
+            // a call on this thread would then block forever. A test that
+            // hangs when the guard it measures is removed reports nothing:
+            // this one wedged a mutation sweep for three hours before it was
+            // written this way, and would have spent the hosted job's whole
+            // timeout saying so.
+            let (sender, receiver) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = sender.send(serve_on(listener).is_err());
+            });
+            let refused = receiver.recv_timeout(Duration::from_secs(10));
+            match restore {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+            assert_eq!(
+                refused.ok(),
+                Some(true),
+                "{key} is set but unreadable; `serve_on` must refuse, not serve"
+            );
+        }
+    }
+
+    #[test]
+    fn managed_executor_http_refuses_bypass_and_concurrent_replay() {
+        use whipplescript_kernel::exec_incarnation;
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind executor");
+        let address = listener.local_addr().expect("address");
+        let marker = std::env::temp_dir().join(format!(
+            "whip-managed-{}-{}",
+            std::process::id(),
+            address.port()
+        ));
+        let mut dispatch = exec_request("printf x >> \"$MARKER\"\n", Value::Null);
+        dispatch["env"] = json!({"MARKER":marker.to_string_lossy()});
+        let gate = ManagedDispatch::new(sha256_hex(dispatch.to_string().as_bytes())).expect("gate");
+        std::thread::spawn(move || {
+            let _ = serve_on_with_profile(listener, Some(gate));
+        });
+        let base = format!("http://{address}");
+        let handshake = ureq::get(&format!("{base}/exec/incarnation"))
+            .call()
+            .expect("handshake")
+            .into_string()
+            .expect("body");
+        let incarnation = exec_incarnation::read_handshake(&handshake).expect("incarnation");
+        for route in ["/exec", "/turn", "/exec/controller/deliver"] {
+            let response = ureq::post(&format!("{base}{route}")).send_json(&dispatch);
+            assert!(
+                matches!(response, Err(ureq::Error::Status(409, _))),
+                "{route}: {response:?}"
+            );
+        }
+        assert!(matches!(
+            ureq::get(&format!("{base}/turn"))
+                .set("Upgrade", "websocket")
+                .set("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==")
+                .call(),
+            Err(ureq::Error::Status(409, _))
+        ));
+        let mut replaced = dispatch.clone();
+        replaced["stdin"] = json!({"replacement":true});
+        for (incarnation, request) in [("stale", &dispatch), (incarnation.as_str(), &replaced)] {
+            let delivery =
+                exec_incarnation::delivery(incarnation, request.clone()).expect("delivery");
+            assert!(matches!(
+                ureq::post(&format!("{base}/exec/bound")).send_string(&delivery),
+                Err(ureq::Error::Status(409, _))
+            ));
+        }
+        assert!(!marker.exists(), "refused deliveries executed");
+        let delivery = exec_incarnation::delivery(&incarnation, dispatch).expect("delivery");
+        let barrier = std::sync::Barrier::new(8);
+        std::thread::scope(|scope| {
+            let mut requests = Vec::new();
+            for _ in 0..8 {
+                requests.push(scope.spawn(|| {
+                    barrier.wait();
+                    match ureq::post(&format!("{base}/exec/bound")).send_string(&delivery) {
+                        Ok(response) => {
+                            let completion = response.into_string().expect("completion");
+                            let (status, body) =
+                                exec_incarnation::read_completion(&completion, &incarnation)
+                                    .expect("bound completion");
+                            assert_eq!(status, 200);
+                            assert_eq!(body["exit_code"], 0);
+                            1
+                        }
+                        Err(ureq::Error::Status(409, _)) => 0,
+                        Err(error) => panic!("unexpected delivery error: {error}"),
+                    }
+                }));
+            }
+            assert_eq!(
+                requests
+                    .into_iter()
+                    .map(|request| request.join().expect("request thread"))
+                    .sum::<usize>(),
+                1
+            );
+        });
+        assert_eq!(std::fs::read(&marker).expect("script effect"), b"x");
+        assert!(matches!(
+            ureq::post(&format!("{base}/exec/bound")).send_string(&delivery),
+            Err(ureq::Error::Status(409, _))
+        ));
+        std::fs::remove_file(marker).expect("remove marker");
     }
 
     #[test]
@@ -844,6 +1281,78 @@ mod tests {
             ureq::Error::Status(status, _) => assert_eq!(status, 400),
             other => panic!("unexpected transport error: {other}"),
         }
+    }
+
+    #[test]
+    fn exec_incarnation_http_refuses_stale_delivery_before_running_script() {
+        use whipplescript_kernel::exec_incarnation;
+        let start = || {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind executor");
+            let address = listener.local_addr().expect("executor address");
+            std::thread::spawn(move || {
+                let _ = serve_on(listener);
+            });
+            format!("http://{address}")
+        };
+        let first = start();
+        let second = start();
+        let inspect = |server: &str| {
+            let body = ureq::get(&format!("{server}/exec/incarnation"))
+                .call()
+                .expect("incarnation query")
+                .into_string()
+                .expect("incarnation body");
+            exec_incarnation::read_handshake(&body).expect("valid handshake")
+        };
+        let original = inspect(&first);
+        assert_eq!(original.len(), 64);
+        assert_eq!(
+            inspect(&first),
+            original,
+            "connections share server identity"
+        );
+        let replacement = inspect(&second);
+        assert_ne!(original, replacement, "server starts mint fresh identities");
+        let marker = std::env::temp_dir().join(format!("whip-incarnation-{original}"));
+        let mut dispatch = exec_request("printf x >> \"$MARKER\"\n", Value::Null);
+        dispatch["env"] = json!({"MARKER":marker.to_string_lossy()});
+        let stale = exec_incarnation::delivery(&original, dispatch.clone()).expect("delivery");
+        let error = ureq::post(&format!("{second}/exec/bound"))
+            .send_string(&stale)
+            .expect_err("stale incarnation refused");
+        assert!(matches!(error, ureq::Error::Status(409, _)));
+        assert!(!marker.exists(), "stale delivery must not execute");
+        let legacy = ureq::post(&format!("{second}/exec/bound"))
+            .send_json(&dispatch)
+            .expect_err("bound route refuses an unbound request");
+        assert!(matches!(legacy, ureq::Error::Status(409, _)));
+        assert!(!marker.exists());
+        let bound = exec_incarnation::delivery(&replacement, dispatch).expect("bound delivery");
+        let response = ureq::post(&format!("{second}/exec/bound"))
+            .send_string(&bound)
+            .expect("bound execution")
+            .into_string()
+            .expect("completion body");
+        let (status, body) =
+            exec_incarnation::read_completion(&response, &replacement).expect("bound completion");
+        assert_eq!(status, 200);
+        assert_eq!(body["exit_code"], 0);
+        assert_eq!(std::fs::read(&marker).expect("script effect"), b"x");
+        std::fs::remove_file(&marker).expect("remove marker");
+        assert!(exec_incarnation::read_completion(&response, &original).is_err());
+        let invalid = exec_incarnation::delivery(&replacement, json!({"protocol":"wrong"}))
+            .expect("invalid dispatch wrapped");
+        let response = ureq::post(&format!("{second}/exec/bound"))
+            .send_string(&invalid)
+            .expect("bound refusal response")
+            .into_string()
+            .expect("refusal body");
+        assert_eq!(
+            exec_incarnation::read_completion(&response, &replacement)
+                .expect("bound refusal")
+                .0,
+            400
+        );
     }
 
     // The connection limiter bounds concurrent handler threads: at the cap a
@@ -1004,7 +1513,11 @@ mod tests {
         );
     }
 
-    fn staged_paths_with_prefix(prefix: &str) -> Vec<PathBuf> {
+    /// A staged script lives INSIDE a per-request private directory
+    /// (`whip-executor-<pid>-<nanos>-<n>/<sha><suffix>`), so discovery scans one
+    /// level down. A flat match on the temp directory finds the directories,
+    /// never the scripts.
+    fn staged_paths_for_sha(sha: &str) -> Vec<PathBuf> {
         let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else {
             return Vec::new();
         };
@@ -1014,7 +1527,14 @@ mod tests {
             .filter(|path| {
                 path.file_name()
                     .and_then(|name| name.to_str())
-                    .is_some_and(|name| name.starts_with(prefix))
+                    .is_some_and(|name| name.starts_with("whip-executor-"))
+            })
+            .filter_map(|dir| std::fs::read_dir(dir).ok())
+            .flat_map(|inner| inner.flatten().map(|entry| entry.path()))
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with(sha))
             })
             .collect()
     }
@@ -1036,9 +1556,8 @@ mod tests {
 
         let script = "echo not-unstaged\n";
         let sha = sha256_hex(script.as_bytes());
-        let prefix = format!("whip-executor-{sha}");
         // A crashed earlier run can leave a file under this prefix behind.
-        for stale in staged_paths_with_prefix(&prefix) {
+        for stale in staged_paths_for_sha(&sha) {
             let _ = std::fs::remove_file(stale);
         }
 
@@ -1055,7 +1574,7 @@ mod tests {
         // Staging happens before the slot is requested, so the staged file
         // appearing means the request is parked at the gate.
         let deadline = Instant::now() + Duration::from_secs(10);
-        while staged_paths_with_prefix(&prefix).is_empty() {
+        while staged_paths_for_sha(&sha).is_empty() {
             assert!(Instant::now() < deadline, "the parked request never staged");
             std::thread::sleep(Duration::from_millis(5));
         }
@@ -1064,7 +1583,7 @@ mod tests {
         // its own staged file while the first request is still parked.
         let duplicate =
             stage_verified_script(&sha, script.as_bytes(), "sh").expect("stage duplicate");
-        std::fs::remove_file(&duplicate).expect("the duplicate removes its own staged script");
+        std::fs::remove_file(&duplicate.path).expect("the duplicate removes its own staged script");
 
         drop(held);
         let response = parked
@@ -1075,3 +1594,7 @@ mod tests {
         assert_eq!(response["stdout"], json!("not-unstaged\n"));
     }
 }
+
+#[cfg(test)]
+#[path = "exec_server_norm_tests.rs"]
+mod norm_runner_tests;

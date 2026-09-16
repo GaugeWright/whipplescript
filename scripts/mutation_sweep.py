@@ -127,6 +127,20 @@ UNIT_VALUE = re.compile(r"\b[A-Z][A-Za-z0-9_]*::[A-Z][A-Za-z0-9_]*\b")
 MUTATION_SUCCESS_EXPR = re.compile(r"^\s*// MUTATION-SUCCESS-EXPR: (\S.*?)\s*$")
 RETURNED_EXPR = re.compile(r"^(\s*return\s+)(.+)(;\s*)$")
 
+# The same substitution for a MATCH ARM. An arm's expression is returned from
+# its match exactly as `return expr;` returns from its function; only the
+# terminator differs. Reaching the `return` form alone left every arm-shaped
+# refusal reporting "no mutation applied" -- UNMEASURED, which fails the gate
+# exactly as an unexercised refusal does while naming a test nobody could
+# write. `serve_on`'s two arms refusing a configuration variable that is SET
+# but unreadable are that shape, and neither could be annotated at all.
+#
+# The arrow is required, matched non-greedily so the FIRST one wins, and a
+# block arm (`=> {`) is excluded because its value is not on this line. An arm
+# carrying `return` has it replaced along with the rest: the declared success
+# is what the arm must yield, not something to return past the match.
+ARM_EXPR = re.compile(r"^(\s*\S.*?=>\s*)(?!\{)(.+?)(,\s*)$")
+
 # A DIVERGING ARM prints its words and then returns a unit value:
 #
 #     Err(error) => {
@@ -861,7 +875,9 @@ def apply_mutation(lines: list[str], site: Site) -> list[str] | None:
         # because it is the more specific instruction: a line carrying it says
         # what this refusal's absence looks like, and guessing would be worse.
         declared = MUTATION_SUCCESS_EXPR.match(lines[index - 1])
-        returned = RETURNED_EXPR.match(lines[index])
+        # Statement form first, so the existing shape decides unchanged; the
+        # arm form has the same three groups and the same meaning.
+        returned = RETURNED_EXPR.match(lines[index]) or ARM_EXPR.match(lines[index])
         if declared and returned:
             mutated[index] = returned.group(1) + declared.group(1) + returned.group(3)
             return mutated
@@ -1300,6 +1316,20 @@ fn mutation_sweep_self_test_wrapped_unit(route: Option<u8>) -> MutationSweepWrap
         fact: String::new(),
     }
 }
+
+/// A refusal that is a MATCH ARM, which the expression form could not reach
+/// while it only replaced a `return expr;` statement. An arm's value is
+/// returned from its match the same way, and before this it reported "no
+/// mutation applied" -- unmeasured, and so indistinguishable in a summary from
+/// a refusal nothing exercises.
+#[allow(dead_code)]
+fn mutation_sweep_self_test_arm_expr(admitted: bool) -> Result<Option<u8>, String> {
+    match admitted {
+        true => Ok(Some(1)),
+        // MUTATION-SUCCESS-EXPR: Ok(None)
+        false => Err("arm refusal".to_owned()),
+    }
+}
 """
 
 # How many refusals `PLANT` contains. Asserted rather than counted so that
@@ -1320,7 +1350,7 @@ fn mutation_sweep_self_test_wrapped_unit(route: Option<u8>) -> MutationSweepWrap
 # rule with nothing planted against it is this script's own failure mode one
 # level up -- it could stop matching and every sweep would still come back
 # clean.
-PLANT_COUNT = 18
+PLANT_COUNT = 19
 
 
 def batch_unreachable_mutations(lines: list[str], sites: list[Site], start: int) -> list[str]:

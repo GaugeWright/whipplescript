@@ -1,0 +1,56 @@
+--- DR-0098 / norm-plane 1.3. Bounded governance-epoch closure, independently
+--- of the schema and lifecycle model. Event ids stand for content commitments;
+--- signature verification/key ownership are trusted binding facts. This model
+--- asks whether a rotation closes exactly the observed old-epoch frontier.
+--- Requests are finite and unique in these fixtures; hash integrity, persistence
+--- and arbitrary DAG replay are tested in Rust, not claimed by this model.
+mod NORM-SUCCESSION is
+  protecting NAT .
+  sorts Key Ids Fact Cfg State .
+  subsort Nat < Ids .
+  subsort Fact < Cfg .
+  ops oldKey newKey : -> Key [ctor] .
+  op empty : -> Ids [ctor] .
+  op _,_ : Ids Ids -> Ids [ctor assoc comm id: empty] .
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+  op {_} : Cfg -> State [ctor] .
+  op root : Nat Key -> Fact [ctor] .
+  op frontier : Ids -> Fact [ctor] .
+  op bound : Key -> Fact [ctor] .
+  op write : Nat Nat Key -> Fact [ctor] .
+  op rotate : Nat Nat Key Key Ids -> Fact [ctor] .
+  op written : Nat Key -> Fact [ctor] .
+  op rotated : Nat -> Fact [ctor] .
+  vars I R A : Nat . vars K K1 : Key . vars H HS : Ids . var C : Cfg .
+  op remove : Ids Nat -> Ids .
+  eq remove((R, H), R) = remove(H, R) .
+  eq remove(H, R) = H [owise] .
+  rl [write-current-epoch] :
+    { root(R, K) bound(K) frontier(H) write(I, R, K) C }
+    => { root(R, K) bound(K) frontier((remove(H, R), I)) written(I, K) C } .
+  rl [close-exact-frontier] :
+    { root(R, K) bound(K) bound(K1) frontier(H) rotate(A, R, K, K1, H) C }
+    => { root(A, K1) bound(K) bound(K1) frontier(A) rotated(A) C } .
+endm
+mod NORM-SUCCESSION-STALE-FRONTIER is
+  including NORM-SUCCESSION .
+  vars I R A : Nat . vars K K1 : Key . vars H HS : Ids . var C : Cfg .
+  rl [ignore-closed-frontier] :
+    { root(R, K) bound(K) bound(K1) frontier(H) rotate(A, R, K, K1, HS) C }
+    => { root(A, K1) bound(K) bound(K1) frontier(A) rotated(A) C } .
+endm
+mod NORM-SUCCESSION-OLD-EPOCH is
+  including NORM-SUCCESSION .
+  vars I R A : Nat . vars K K1 : Key . var H : Ids . var C : Cfg .
+  rl [use-retained-old-key] :
+    { root(R, K) bound(K1) frontier(H) write(I, A, K1) C }
+    => { root(R, K) bound(K1) frontier((H, I)) written(I, K1) C } .
+endm
+mod NORM-SUCCESSION-UNBOUND-KEY is
+  including NORM-SUCCESSION .
+  vars R A : Nat . vars K K1 : Key . var H : Ids . var C : Cfg .
+  rl [skip-successor-binding] :
+    { root(R, K) bound(K) frontier(H) rotate(A, R, K, K1, H) C }
+    => { root(A, K1) bound(K) frontier(A) rotated(A) C } .
+endm

@@ -1,0 +1,54 @@
+load ../norm-preservation.maude
+search [1] in NORM-PRESERVATION :
+ { request(p0,p0,p0,p0,p1,p0) basis(p0,p0,p0,p0,p0,deterministic,completeExact,at(source,content,v0) at(config,presence,absent) at(directory,membership,v0) at(external,metadata,v0)) target(p1,at(source,content,v0) at(config,presence,absent) at(directory,membership,v0) at(external,metadata,v0)) } =>* { preserved(p0,p1) } .
+search [1] in NORM-PRESERVATION :
+ { request(p0,p0,p0,p0,p1,p0) basis(p0,p0,p0,p0,p0,deterministic,enforcedCeiling,at(source,content,v0) at(config,presence,absent) at(directory,membership,v0) at(external,metadata,v0)) target(p1,at(source,content,v0) at(config,presence,absent) at(directory,membership,v0) at(external,metadata,v0)) } =>* { preserved(p0,p1) } .
+search in NORM-PRESERVATION :
+ { request(p0,p0,p0,p0,p1,p0) basis(p0,p0,p0,p0,p0,deterministic,partialTrace,at(source,content,v0) at(config,presence,absent) at(directory,membership,v0) at(external,metadata,v0)) target(p1,at(source,content,v0) at(config,presence,absent) at(directory,membership,v0) at(external,metadata,v0)) } =>* { preserved(p0,p1) } .
+search [1] in NORM-PRESERVATION-WEAK-PARTIAL :
+ { request(p0,p0,p0,p0,p1,p0) basis(p0,p0,p0,p0,p0,deterministic,partialTrace,at(source,content,v0) at(config,presence,absent) at(directory,membership,v0) at(external,metadata,v0)) target(p1,at(source,content,v0) at(config,presence,absent) at(directory,membership,v0) at(external,metadata,v0)) } =>* { preserved(p0,p1) } .
+search in NORM-PRESERVATION :
+ { request(p0,p0,p0,p0,p1,p0) basis(p0,p0,p0,p0,p0,sampled,completeExact,at(source,content,v0) at(config,presence,absent) at(directory,membership,v0) at(external,metadata,v0)) target(p1,at(source,content,v0) at(config,presence,absent) at(directory,membership,v0) at(external,metadata,v0)) } =>* { preserved(p0,p1) } .
+search [1] in NORM-PRESERVATION-WEAK-SAMPLED :
+ { request(p0,p0,p0,p0,p1,p0) basis(p0,p0,p0,p0,p0,sampled,completeExact,at(source,content,v0) at(config,presence,absent) at(directory,membership,v0) at(external,metadata,v0)) target(p1,at(source,content,v0) at(config,presence,absent) at(directory,membership,v0) at(external,metadata,v0)) } =>* { preserved(p0,p1) } .
+search in NORM-PRESERVATION :
+ { request(p0,p0,p0,p0,p1,p0) basis(p1,p0,p0,p0,p0,deterministic,completeExact,at(source,content,v0) at(config,presence,absent) at(directory,membership,v0) at(external,metadata,v0)) target(p1,at(source,content,v0) at(config,presence,absent) at(directory,membership,v0) at(external,metadata,v0)) } =>* { preserved(p0,p1) } .
+search [1] in NORM-PRESERVATION-WEAK-SCOPE :
+ { request(p0,p0,p0,p0,p1,p0) basis(p1,p0,p0,p0,p0,deterministic,completeExact,at(source,content,v0) at(config,presence,absent) at(directory,membership,v0) at(external,metadata,v0)) target(p1,at(source,content,v0) at(config,presence,absent) at(directory,membership,v0) at(external,metadata,v0)) } =>* { preserved(p0,p1) } .
+search in NORM-PRESERVATION :
+ { request(p0,p0,p0,p0,p1,p0) basis(p0,p1,p0,p0,p0,deterministic,completeExact,at(source,content,v0) at(config,presence,absent) at(directory,membership,v0) at(external,metadata,v0)) target(p1,at(source,content,v0) at(config,presence,absent) at(directory,membership,v0) at(external,metadata,v0)) } =>* { preserved(p0,p1) } .
+search [1] in NORM-PRESERVATION-WEAK-SCOPE :
+ { request(p0,p0,p0,p0,p1,p0) basis(p0,p1,p0,p0,p0,deterministic,completeExact,at(source,content,v0) at(config,presence,absent) at(directory,membership,v0) at(external,metadata,v0)) target(p1,at(source,content,v0) at(config,presence,absent) at(directory,membership,v0) at(external,metadata,v0)) } =>* { preserved(p0,p1) } .
+search in NORM-PRESERVATION :
+ { request(p0,p0,p0,p0,p1,p0) basis(p0,p0,p1,p0,p0,deterministic,completeExact,at(source,content,v0) at(config,presence,absent) at(directory,membership,v0) at(external,metadata,v0)) target(p1,at(source,content,v0) at(config,presence,absent) at(directory,membership,v0) at(external,metadata,v0)) } =>* { preserved(p0,p1) } .
+search [1] in NORM-PRESERVATION-WEAK-SCOPE :
+ { request(p0,p0,p0,p0,p1,p0) basis(p0,p0,p1,p0,p0,deterministic,completeExact,at(source,content,v0) at(config,presence,absent) at(directory,membership,v0) at(external,metadata,v0)) target(p1,at(source,content,v0) at(config,presence,absent) at(directory,membership,v0) at(external,metadata,v0)) } =>* { preserved(p0,p1) } .
+search in NORM-PRESERVATION :
+ { request(p0,p0,p0,p0,p1,p0) basis(p0,p0,p0,p1,p0,deterministic,completeExact,at(source,content,v0) at(config,presence,absent) at(directory,membership,v0) at(external,metadata,v0)) target(p1,at(source,content,v0) at(config,presence,absent) at(directory,membership,v0) at(external,metadata,v0)) } =>* { preserved(p0,p1) } .
+search [1] in NORM-PRESERVATION-WEAK-SCOPE :
+ { request(p0,p0,p0,p0,p1,p0) basis(p0,p0,p0,p1,p0,deterministic,completeExact,at(source,content,v0) at(config,presence,absent) at(directory,membership,v0) at(external,metadata,v0)) target(p1,at(source,content,v0) at(config,presence,absent) at(directory,membership,v0) at(external,metadata,v0)) } =>* { preserved(p0,p1) } .
+search in NORM-PRESERVATION :
+ { request(p0,p0,p0,p0,p1,p0) basis(p0,p0,p0,p0,p1,deterministic,completeExact,at(source,content,v0) at(config,presence,absent) at(directory,membership,v0) at(external,metadata,v0)) target(p1,at(source,content,v0) at(config,presence,absent) at(directory,membership,v0) at(external,metadata,v0)) } =>* { preserved(p0,p1) } .
+search [1] in NORM-PRESERVATION-WEAK-SCOPE :
+ { request(p0,p0,p0,p0,p1,p0) basis(p0,p0,p0,p0,p1,deterministic,completeExact,at(source,content,v0) at(config,presence,absent) at(directory,membership,v0) at(external,metadata,v0)) target(p1,at(source,content,v0) at(config,presence,absent) at(directory,membership,v0) at(external,metadata,v0)) } =>* { preserved(p0,p1) } .
+search in NORM-PRESERVATION :
+ { request(p0,p0,p0,p0,p1,p0) basis(p0,p0,p0,p0,p0,deterministic,completeExact,at(source,content,v0) at(config,presence,absent) at(directory,membership,v0) at(external,metadata,v0)) target(p1,at(source,content,v1) at(config,presence,absent) at(directory,membership,v0) at(external,metadata,v0)) } =>* { preserved(p0,p1) } .
+search [1] in NORM-PRESERVATION-WEAK-OBSERVATIONS :
+ { request(p0,p0,p0,p0,p1,p0) basis(p0,p0,p0,p0,p0,deterministic,completeExact,at(source,content,v0) at(config,presence,absent) at(directory,membership,v0) at(external,metadata,v0)) target(p1,at(source,content,v1) at(config,presence,absent) at(directory,membership,v0) at(external,metadata,v0)) } =>* { preserved(p0,p1) } .
+search in NORM-PRESERVATION :
+ { request(p0,p0,p0,p0,p1,p0) basis(p0,p0,p0,p0,p0,deterministic,completeExact,at(source,content,v0) at(config,presence,absent) at(directory,membership,v0) at(external,metadata,v0)) target(p1,at(source,content,v0) at(config,presence,present) at(directory,membership,v0) at(external,metadata,v0)) } =>* { preserved(p0,p1) } .
+search [1] in NORM-PRESERVATION-WEAK-OBSERVATIONS :
+ { request(p0,p0,p0,p0,p1,p0) basis(p0,p0,p0,p0,p0,deterministic,completeExact,at(source,content,v0) at(config,presence,absent) at(directory,membership,v0) at(external,metadata,v0)) target(p1,at(source,content,v0) at(config,presence,present) at(directory,membership,v0) at(external,metadata,v0)) } =>* { preserved(p0,p1) } .
+search in NORM-PRESERVATION :
+ { request(p0,p0,p0,p0,p1,p0) basis(p0,p0,p0,p0,p0,deterministic,completeExact,at(source,content,v0) at(config,presence,absent) at(directory,membership,v0) at(external,metadata,v0)) target(p1,at(source,content,v0) at(config,presence,absent) at(directory,membership,v1) at(external,metadata,v0)) } =>* { preserved(p0,p1) } .
+search [1] in NORM-PRESERVATION-WEAK-OBSERVATIONS :
+ { request(p0,p0,p0,p0,p1,p0) basis(p0,p0,p0,p0,p0,deterministic,completeExact,at(source,content,v0) at(config,presence,absent) at(directory,membership,v0) at(external,metadata,v0)) target(p1,at(source,content,v0) at(config,presence,absent) at(directory,membership,v1) at(external,metadata,v0)) } =>* { preserved(p0,p1) } .
+search in NORM-PRESERVATION :
+ { request(p0,p0,p0,p0,p1,p0) basis(p0,p0,p0,p0,p0,deterministic,completeExact,at(source,content,v0) at(config,presence,absent) at(directory,membership,v0) at(external,metadata,v0)) target(p1,at(source,content,v0) at(config,presence,absent) at(directory,membership,v0) at(external,metadata,v1)) } =>* { preserved(p0,p1) } .
+search [1] in NORM-PRESERVATION-WEAK-OBSERVATIONS :
+ { request(p0,p0,p0,p0,p1,p0) basis(p0,p0,p0,p0,p0,deterministic,completeExact,at(source,content,v0) at(config,presence,absent) at(directory,membership,v0) at(external,metadata,v0)) target(p1,at(source,content,v0) at(config,presence,absent) at(directory,membership,v0) at(external,metadata,v1)) } =>* { preserved(p0,p1) } .
+search in NORM-PRESERVATION :
+ { request(p0,p0,p0,p0,p1,p0) basis(p0,p0,p0,p0,p0,deterministic,completeExact,at(source,content,v0) at(config,presence,absent) at(directory,membership,v0) at(external,metadata,v0)) target(p0,at(source,content,v0) at(config,presence,absent) at(directory,membership,v0) at(external,metadata,v0)) } =>* { preserved(p0,p1) } .
+search [1] in NORM-PRESERVATION-WEAK-TARGET :
+ { request(p0,p0,p0,p0,p1,p0) basis(p0,p0,p0,p0,p0,deterministic,completeExact,at(source,content,v0) at(config,presence,absent) at(directory,membership,v0) at(external,metadata,v0)) target(p0,at(source,content,v0) at(config,presence,absent) at(directory,membership,v0) at(external,metadata,v0)) } =>* { preserved(p0,p1) } .
+quit

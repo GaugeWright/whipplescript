@@ -1,0 +1,66 @@
+--- One invocation after identity/material validation. Atomic owning-store
+--- claim and completion are assumptions; no external I/O occurs in a claim.
+mod EXEC-PROVIDER-RECEIPT is
+ sorts Slot Response State .
+ ops original replacement : -> Response [ctor] .
+ ops absent started : -> Slot [ctor] .
+ op completed : Response -> Slot [ctor] .
+ op claim : Slot -> State [ctor] .
+ op dispatch : Slot -> State [ctor] .
+ op pending : Slot -> State [ctor] .
+ op replay : Response -> State [ctor] .
+ op finish : Slot Response -> State [ctor] .
+ op saved : Slot -> State [ctor] .
+ op refused : Slot -> State [ctor] .
+ var R : Response .
+ rl [first-claim] : claim(absent) => dispatch(started) .
+ rl [unresolved-replay] : claim(started) => pending(started) .
+ rl [completed-replay] : claim(completed(R)) => replay(R) .
+ rl [retain-response] : finish(started,R) => saved(completed(R)) .
+ rl [repeat-completion] : finish(completed(R),R) => saved(completed(R)) .
+ rl [refuse-replacement] : finish(completed(original),replacement) => refused(completed(original)) .
+endm
+mod EXEC-PROVIDER-RECEIPT-WEAK is
+ including EXEC-PROVIDER-RECEIPT .
+ rl [redispatch-pending] : claim(started) => dispatch(started) .
+ rl [replace-response] : finish(completed(original),replacement) => saved(completed(replacement)) .
+endm
+
+--- Host admission and material comparison are explicit inputs here. The model
+--- does not prove authentication or hashing; fixtures exercise their readers.
+mod EXEC-HANDOFF is
+ sorts Door Binding State .
+ ops executor http : -> Door [ctor] .
+ ops current foreign stale changed : -> Binding [ctor] .
+ op handoff : Door Binding -> State [ctor] .
+ op privateBroker : -> State [ctor] .
+ rl [selected-current-exec] : handoff(executor,current) => privateBroker .
+endm
+mod EXEC-HANDOFF-WEAK is
+ including EXEC-HANDOFF .
+ var D : Door .
+ var B : Binding .
+ rl [trust-request-claims] : handoff(D,B) => privateBroker .
+endm
+
+--- An owning-store transaction either retains placement or leaves none. These
+--- rules model the subsequent dispatch guard, not container termination.
+mod EXEC-PLACEMENT is
+ sorts Destination Slot State .
+ ops original other : -> Destination [ctor] .
+ op none : -> Slot [ctor] .
+ op assigned : Destination -> Slot [ctor] .
+ op place : Slot Destination -> State [ctor] .
+ op saved : Slot -> State [ctor] .
+ op forward : Slot -> State [ctor] .
+ op sent : Destination -> State [ctor] .
+ var D : Destination .
+ rl [retain-placement] : place(none,D) => saved(assigned(D)) .
+ rl [replay-placement] : place(assigned(D),D) => saved(assigned(D)) .
+ rl [forward-after-commit] : forward(assigned(D)) => sent(D) .
+endm
+mod EXEC-PLACEMENT-WEAK is
+ including EXEC-PLACEMENT .
+ rl [forward-before-commit] : forward(none) => sent(original) .
+ rl [replace-placement] : place(assigned(original),other) => saved(assigned(other)) .
+endm

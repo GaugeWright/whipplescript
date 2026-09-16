@@ -4478,6 +4478,7 @@ mod custody_capability_tests {
 
     fn effect(target: &str, input_json: &str) -> ClaimableEffect {
         ClaimableEffect {
+            attempt_admission_event_id: None,
             effect_id: "effect-seal-1".to_owned(),
             kind: "capability.call".to_owned(),
             target: Some(target.to_owned()),

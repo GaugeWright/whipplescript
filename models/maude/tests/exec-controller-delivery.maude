@@ -1,0 +1,9 @@
+load ../exec-controller-delivery.maude
+search [1] in EXEC-CONTROLLER-DELIVERY : cfg(claimed,absent,stopped,deliver finish stop query,0,0,pending) =>* cfg(retained,completed,stopped,nil,1,1,replay) .
+search [1] in EXEC-CONTROLLER-DELIVERY : cfg(claimed,absent,stopped,query,0,0,pending) =>* cfg(claimed,absent,stopped,nil,0,0,pending) .
+search [1] in EXEC-CONTROLLER-DELIVERY : cfg(claimed,admitted,stopped,query,1,1,pending) =>* cfg(claimed,admitted,stopped,nil,1,1,pending) .
+search [1] in EXEC-CONTROLLER-DELIVERY : cfg(claimed,completed,stopped,query,1,1,pending) =>* cfg(retained,completed,running,nil,1,2,replay) .
+search [1] in EXEC-CONTROLLER-DELIVERY-WEAK : cfg(claimed,completed,stopped,query,1,1,pending) =>* cfg(retained,completed,running,nil,1,2,replay) .
+search [1] in EXEC-CONTROLLER-DELIVERY : cfg(claimed,admitted,stopped,query,1,1,pending) =>* cfg(claimed,admitted,running,nil,2,2,pending) .
+search [1] in EXEC-CONTROLLER-DELIVERY-WEAK : cfg(claimed,admitted,stopped,query,1,1,pending) =>* cfg(claimed,admitted,running,nil,2,2,pending) .
+quit

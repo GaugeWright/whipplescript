@@ -1,0 +1,69 @@
+--- DR-0098 / norm-plane 1.4. Two field values suffice to separate material
+--- changes from representation-only/no-op edits. Crypto/key binding and schema
+--- validation are separate inputs; this model owns revision/status coupling.
+mod RECORD-REVISION is
+  protecting NAT .
+  sorts Fields Status Key Policy Fact Cfg State .
+  ops f0 f1 : -> Fields [ctor] .
+  ops proposed accepted : -> Status [ctor] .
+  ops owner worker : -> Key [ctor] .
+  ops public ownerOnly : -> Policy [ctor] .
+  subsort Fact < Cfg .
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+  op {_} : Cfg -> State [ctor] .
+  --- Record id, content revision, fields, current status, event head.
+  op record : Nat Nat Fields Status Nat -> Fact [ctor] .
+  op prior : Nat Nat Fields Status Nat -> Fact [ctor] .
+  op editPolicy : Policy -> Fact [ctor] .
+  op edit : Nat Nat Nat Fields Key -> Fact [ctor] .
+  op approved : Nat Nat -> Fact [ctor] .
+  op accept : Nat Nat Nat Key -> Fact [ctor] .
+  vars I V H E : Nat . vars F F1 : Fields . var S : Status . var K : Key . var P : Policy . var C : Cfg .
+  op permits : Policy Key -> Bool .
+  eq permits(public, K) = true .
+  eq permits(ownerOnly, owner) = true .
+  eq permits(P, K) = false [owise] .
+  crl [material-edit] :
+    { record(I, V, F, S, H) editPolicy(P) edit(I, H, E, F1, K) C }
+    => { record(I, E, F1, proposed, E) prior(I, V, F, S, H) editPolicy(P) C }
+    if F =/= F1 /\ permits(P, K) .
+  crl [same-fields] :
+    { record(I, V, F, S, H) editPolicy(P) edit(I, H, E, F, K) C }
+    => { record(I, V, F, S, E) editPolicy(P) C }
+    if permits(P, K) .
+  rl [approve-exact-revision] :
+    { record(I, V, F, proposed, H) accept(I, H, E, owner) C }
+    => { record(I, V, F, accepted, E) approved(I, V) C } .
+endm
+mod RECORD-REVISION-CARRIED-STATUS is
+  including RECORD-REVISION .
+  vars I V H E : Nat . vars F F1 : Fields . var S : Status . var K : Key . var P : Policy . var C : Cfg .
+  crl [keep-status-on-new-content] :
+    { record(I, V, F, S, H) editPolicy(P) edit(I, H, E, F1, K) C }
+    => { record(I, E, F1, S, E) prior(I, V, F, S, H) editPolicy(P) C }
+    if permits(P, K) .
+endm
+mod RECORD-REVISION-IMPLICIT-EDIT is
+  including RECORD-REVISION .
+  vars I V H E : Nat . vars F F1 : Fields . var S : Status . var K : Key . var C : Cfg .
+  rl [missing-policy-is-public] :
+    { record(I, V, F, S, H) edit(I, H, E, F1, K) C }
+    => { record(I, E, F1, proposed, E) prior(I, V, F, S, H) C } .
+endm
+mod RECORD-REVISION-STALE-HEAD is
+  including RECORD-REVISION .
+  vars I V H H1 E : Nat . vars F F1 : Fields . var S : Status . var K : Key . var P : Policy . var C : Cfg .
+  crl [ignore-expected-head] :
+    { record(I, V, F, S, H) editPolicy(P) edit(I, H1, E, F1, K) C }
+    => { record(I, E, F1, proposed, E) prior(I, V, F, S, H) editPolicy(P) C }
+    if permits(P, K) .
+endm
+
+mod RECORD-REVISION-UNAUTHORIZED-EDIT is
+  including RECORD-REVISION .
+  vars I V H E : Nat . vars F F1 : Fields . var S : Status . var K : Key . var P : Policy . var C : Cfg .
+  rl [ignore-edit-authority] :
+    { record(I, V, F, S, H) editPolicy(P) edit(I, H, E, F1, K) C }
+    => { record(I, E, F1, proposed, E) prior(I, V, F, S, H) editPolicy(P) C } .
+endm

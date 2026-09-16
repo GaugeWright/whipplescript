@@ -1,0 +1,7 @@
+load ../norm-observer.maude
+search [1] in NORM-HOSTED-INVOCATION : cfg(exact, queued) =>* cfg(exact, started) .
+search [1] in NORM-HOSTED-INVOCATION : cfg(changed, queued) =>* cfg(changed, started) .
+search [1] in NORM-HOSTED-INVOCATION-WEAK : cfg(changed, queued) =>* cfg(changed, started) .
+search [1] in NORM-HOSTED-INVOCATION : cfg(missing, queued) =>* cfg(missing, started) .
+search [1] in NORM-HOSTED-INVOCATION-WEAK : cfg(missing, queued) =>* cfg(missing, started) .
+quit

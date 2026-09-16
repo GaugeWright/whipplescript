@@ -1,0 +1,22 @@
+load ../vocabulary-schema.maude
+search [1] in VOCABULARY-SCHEMA : { submit(field(title, text)) }
+  =>* { accepted(field(title, text)) RESIDUAL:Cfg } .
+search [1] in VOCABULARY-SCHEMA : { submit((field(title, text), field(count, number))) }
+  =>* { accepted((field(title, text), field(count, number))) RESIDUAL:Cfg } .
+search in VOCABULARY-SCHEMA : { submit(field(title, number)) }
+  =>* { accepted(field(title, number)) RESIDUAL:Cfg } .
+search [1] in VOCABULARY-SCHEMA-UNTYPED : { submit(field(title, number)) }
+  =>* { accepted(field(title, number)) RESIDUAL:Cfg } .
+search in VOCABULARY-SCHEMA : { submit(field(count, number)) }
+  =>* { accepted(field(count, number)) RESIDUAL:Cfg } .
+search [1] in VOCABULARY-SCHEMA-OPTIONAL : { submit(field(count, number)) }
+  =>* { accepted(field(count, number)) RESIDUAL:Cfg } .
+search in VOCABULARY-SCHEMA : { submit((field(title, text), field(extra, text))) }
+  =>* { accepted((field(title, text), field(extra, text))) RESIDUAL:Cfg } .
+search [1] in VOCABULARY-SCHEMA-OPEN : { submit((field(title, text), field(extra, text))) }
+  =>* { accepted((field(title, text), field(extra, text))) RESIDUAL:Cfg } .
+search in VOCABULARY-SCHEMA : { submit((field(title, text), field(title, text))) }
+  =>* { accepted((field(title, text), field(title, text))) RESIDUAL:Cfg } .
+search [1] in VOCABULARY-SCHEMA-DUPLICATES : { submit((field(title, text), field(title, text))) }
+  =>* { accepted((field(title, text), field(title, text))) RESIDUAL:Cfg } .
+quit .

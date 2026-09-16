@@ -1,0 +1,10 @@
+load ../exec-native-owner.maude
+search [1] in EXEC-NATIVE-COMPOSED : cfg(open,empty,inert,free,idle) =>* cfg(closed,completed,removed,free,finished) .
+search [1] in EXEC-NATIVE-COMPOSED : cfg(closed,pending,removed,held,replied) =>* cfg(closed,completed,removed,free,finished) .
+search [1] in EXEC-NATIVE-COMPOSED : cfg(closed,empty,running,free,ready) =>* cfg(closed,pending,running,held,replied) .
+search [1] in EXEC-NATIVE-COMPOSED-WEAK : cfg(closed,empty,running,free,ready) =>* cfg(closed,pending,running,held,replied) .
+search [1] in EXEC-NATIVE-COMPOSED : cfg(closed,pending,removed,held,replied) =>* cfg(closed,pending,removed,held,finished) .
+search [1] in EXEC-NATIVE-COMPOSED-WEAK : cfg(closed,pending,removed,held,replied) =>* cfg(closed,pending,removed,held,finished) .
+search [1] in EXEC-NATIVE-COMPOSED : cfg(closed,pending,running,free,replied) =>* cfg(closed,pending,running,free,finished) .
+search [1] in EXEC-NATIVE-COMPOSED-WEAK : cfg(closed,pending,running,free,replied) =>* cfg(closed,pending,running,free,finished) .
+quit

@@ -1030,6 +1030,13 @@ mod tests {
     }
 
     impl DoSql for RecordingSql {
+        fn atomic(
+            &self,
+            body: &mut dyn FnMut() -> whipplescript_store::StoreResult<()>,
+        ) -> whipplescript_store::StoreResult<()> {
+            self.inner.atomic(body)
+        }
+
         fn execute(&self, sql: &str, params: &[SqlValue]) -> Result<u64, String> {
             self.inner.execute(sql, params)
         }

@@ -1,0 +1,23 @@
+--- Result availability and execution lifetime are independent dimensions.
+--- A returned timeout may leave a descendant alive. Physical destruction is
+--- a trusted host input; these rules preserve results across that boundary.
+mod EXEC-COMPLETION-LIFETIME is
+ sorts Result Phase Process Proof Cfg .
+ ops missing retained changed : -> Result [ctor] .
+ ops idle closing finished : -> Phase [ctor] .
+ ops alive dead : -> Process [ctor] .
+ ops unproved proved : -> Proof [ctor] .
+ op cfg : Result Result Phase Process Proof -> Cfg [ctor] .
+ vars A B : Result . var P : Process .
+ rl [fence-including-completed] : cfg(A,B,idle,P,unproved) => cfg(A,B,closing,P,unproved) .
+ rl [destroy] : cfg(A,B,closing,alive,unproved) => cfg(A,B,closing,dead,unproved) .
+ rl [retain-racing-completion] : cfg(missing,B,closing,P,unproved) => cfg(retained,B,closing,P,unproved) .
+ rl [attach-proof] : cfg(A,B,closing,dead,unproved) => cfg(A,B,finished,dead,proved) .
+endm
+mod EXEC-COMPLETION-LIFETIME-WEAK is
+ including EXEC-COMPLETION-LIFETIME .
+ vars A B : Result .
+ rl [completion-is-not-quiescence] : cfg(retained,retained,idle,alive,unproved) => cfg(retained,retained,finished,alive,proved) .
+ rl [discard-output] : cfg(retained,B,closing,dead,unproved) => cfg(missing,B,finished,dead,proved) .
+ rl [replace-output] : cfg(retained,B,finished,dead,proved) => cfg(changed,B,finished,dead,proved) .
+endm

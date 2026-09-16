@@ -12,7 +12,7 @@ use crate::{EventView, RunStart, StoreError, StoreResult};
 
 pub const EFFECT_RECOVERY_PROTOCOL: &str = "whipplescript.effect-recovery.v1";
 
-pub const RECOVERY_EVENTS_SQL: &str = "SELECT event_id, sequence, event_type, payload_json, source, occurred_at FROM events WHERE instance_id = ?1 AND event_type IN ('effect.run_started', 'effect.terminal', 'lease.expired', 'effect.disposition.recorded', 'effect.disposition.reconciled') ORDER BY sequence";
+pub const RECOVERY_EVENTS_SQL: &str = "SELECT event_id, sequence, event_type, payload_json, source, occurred_at FROM events WHERE instance_id = ?1 AND event_type IN ('effect.run_started', 'effect.terminal', 'lease.expired', 'effect.disposition.recorded', 'effect.disposition.reconciled', 'exec.settlement.retained', 'exec.fence.proved') ORDER BY sequence";
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -101,6 +101,18 @@ pub struct AttemptDisposition {
     pub disposition: ExternalDisposition,
     pub evidence: Vec<DispositionEvidence>,
     pub disputed: bool,
+    /// The runtime retained the executor's OWN response for this attempt
+    /// (`exec.settlement.retained`), so its fate was observed rather than
+    /// inferred. See `require_proved_absence`.
+    ///
+    /// Off the wire, deliberately. This is derived inside one fold from
+    /// events the folder already reads, not durable evidence of its own, and
+    /// `whipplescript-host-action/v1.0.0` publishes an attempt without it. A
+    /// field that is recomputed on every read has no business obliging a
+    /// contract revision -- and a snapshot that arrives from elsewhere
+    /// defaults to `false`, which is the conservative reading.
+    #[serde(skip)]
+    pub observed_by_executor: bool,
 }
 
 /// Canonical structured hashing is independent of serde's preserve_order
@@ -216,6 +228,8 @@ pub fn fold_attempts(
                 | "lease.expired"
                 | "effect.disposition.recorded"
                 | "effect.disposition.reconciled"
+                | crate::exec_settlement::EVENT_TYPE
+                | crate::exec_lifetime::PROOF_EVENT
         ) {
             continue;
         }
@@ -264,6 +278,54 @@ pub fn fold_attempts(
             continue;
         }
         let run_id = payload.get("run_id").and_then(Value::as_str).unwrap_or("");
+        if event.event_type == crate::exec_settlement::EVENT_TYPE {
+            // The EXECUTOR's own verdict, not the effect's recorded status: a
+            // settlement can read `"status":"failed"` while its
+            // `executor_outcome` is `uncertain` -- "outcome is unknown after
+            // confirmed termination", which is the hazard itself rather than
+            // observation of it.
+            //
+            // UNCERTAINTY IS MARKED EXPLICITLY, so absence of the marker is
+            // conclusive: every other settlement carries the executor's
+            // definite answer and records no such state.
+            let uncertain = payload
+                .pointer("/settlement/metadata/executor_outcome/state")
+                .and_then(Value::as_str)
+                == Some("uncertain");
+            if !uncertain {
+                if let Some(attempt) = attempts.iter_mut().find(|attempt| attempt.run_id == run_id)
+                {
+                    attempt.observed_by_executor = true;
+                }
+            }
+            continue;
+        }
+        if event.event_type == crate::exec_lifetime::PROOF_EVENT {
+            // A retained lifetime closure is the executor's account of what
+            // became of the attempt, and only one of its two conclusive states
+            // says anything about the target. `not_admitted` means the
+            // provider never admitted the invocation, so nothing was
+            // dispatched and there is nothing to have been applied.
+            // `terminated` proves only that the incarnation is dead behind a
+            // barrier -- a process can die having already applied its effect
+            // -- so it settles the executor's fate and not the target's.
+            let record: crate::exec_lifetime::ProofRecord =
+                serde_json::from_value(payload.clone())?;
+            if matches!(
+                record.closure.lifetime,
+                crate::exec_lifetime::LifetimeEvidence::NotAdmitted { .. }
+            ) {
+                if let Some(attempt) = attempts.iter_mut().find(|attempt| attempt.run_id == run_id)
+                {
+                    if attempt.disposition == ExternalDisposition::Unknown {
+                        attempt.disposition = ExternalDisposition::NotDispatched;
+                    } else if attempt.disposition != ExternalDisposition::NotDispatched {
+                        attempt.disputed = true;
+                    }
+                }
+            }
+            continue;
+        }
         if event.event_type == "effect.run_started" {
             let dispatch: Option<DispatchMarker> = payload
                 .get("external_dispatch")
@@ -290,6 +352,7 @@ pub fn fold_attempts(
                 disposition: ExternalDisposition::Unknown,
                 evidence: Vec::new(),
                 disputed: false,
+                observed_by_executor: false,
             });
         } else {
             // A terminal describes worker execution, never target knowledge.
@@ -313,6 +376,7 @@ pub fn fold_attempts(
                     disposition: ExternalDisposition::Unknown,
                     evidence: Vec::new(),
                     disputed: false,
+                    observed_by_executor: false,
                 });
             }
         }
@@ -322,11 +386,40 @@ pub fn fold_attempts(
 
 /// The ordinary dispatch door may resubmit only after every earlier attempt
 /// is proved absent. Stronger target recovery uses its separate adapter path.
+/// Refuse a resubmission whose predecessor may have applied at a target the
+/// runtime cannot see.
+///
+/// The hazard is an UNOBSERVED application: a dispatch left a recorded attempt
+/// and nothing since can say what the target did with it. Three cases are not
+/// that hazard:
+///
+/// - `NotApplied` -- proved absence, the original reason this exists.
+/// - `NotDispatched` -- nothing reached the target, so there is nothing to
+///   duplicate. The variant existed and was refused anyway.
+/// - An attempt the runtime OBSERVED through the executor protocol: its
+///   `exec.settlement.retained` holds the executor's own response, so its fate
+///   is recorded rather than unknown, and repeating it is ordinary recovery.
+///   Without this the guard refuses every retry of an executed effect, because
+///   `native_dispatch_marker` records an attempt for every run and nothing
+///   resolves its disposition -- which would make `retry_effect` unusable.
+///
+/// A disputed attempt always refuses: conflicting evidence is worse than none.
 pub fn require_proved_absence(attempts: &[AttemptDisposition]) -> StoreResult<()> {
-    if attempts
-        .iter()
-        .any(|attempt| attempt.disputed || attempt.disposition != ExternalDisposition::NotApplied)
-    {
+    let unproved = |attempt: &AttemptDisposition| {
+        if attempt.disputed {
+            return true;
+        }
+        if matches!(
+            attempt.disposition,
+            ExternalDisposition::NotApplied | ExternalDisposition::NotDispatched
+        ) {
+            return false;
+        }
+        // Observation only settles an attempt whose disposition is still open.
+        // A recorded `Applied` is knowledge, not uncertainty, and still refuses.
+        attempt.disposition != ExternalDisposition::Unknown || !attempt.observed_by_executor
+    };
+    if attempts.iter().any(unproved) {
         return Err(StoreError::Conflict(
             "external outcome does not prove safe resubmission".into(),
         ));

@@ -1,0 +1,16 @@
+load ../artifact-capture.maude
+search [1] in ARTIFACT-CAPTURE : { request(cut0) cut(cut0,root0) root(root0,true,true,true) files(root0,true) budget(true) } =>* { captured(cut0,root0) } .
+search [1] in ARTIFACT-CAPTURE : { request(cut0) branch(cut1) cut(cut0,root0) root(root0,true,true,true) files(root0,true) budget(true) } =>* { captured(cut0,root0) branch(cut1) } .
+search in ARTIFACT-CAPTURE : { request(cut0) cut(cut0,root0) root(root0,false,true,true) files(root0,true) budget(true) } =>* { captured(cut0,root0) } .
+search [1] in ARTIFACT-CAPTURE-WEAK-ROOT : { request(cut0) cut(cut0,root0) root(root0,false,true,true) files(root0,true) budget(true) } =>* { captured(cut0,root0) } .
+search in ARTIFACT-CAPTURE : { request(cut0) cut(cut0,root0) root(root0,true,false,true) files(root0,true) budget(true) } =>* { captured(cut0,root0) } .
+search [1] in ARTIFACT-CAPTURE-WEAK-CLOSURE : { request(cut0) cut(cut0,root0) root(root0,true,false,true) files(root0,true) budget(true) } =>* { captured(cut0,root0) } .
+search in ARTIFACT-CAPTURE : { request(cut0) cut(cut0,root0) root(root0,true,true,false) files(root0,true) budget(true) } =>* { captured(cut0,root0) } .
+search [1] in ARTIFACT-CAPTURE-WEAK-SHAPE : { request(cut0) cut(cut0,root0) root(root0,true,true,false) files(root0,true) budget(true) } =>* { captured(cut0,root0) } .
+search in ARTIFACT-CAPTURE : { request(cut0) cut(cut0,root0) root(root0,true,true,true) files(root0,false) budget(true) } =>* { captured(cut0,root0) } .
+search [1] in ARTIFACT-CAPTURE-WEAK-BODY : { request(cut0) cut(cut0,root0) root(root0,true,true,true) files(root0,false) budget(true) } =>* { captured(cut0,root0) } .
+search in ARTIFACT-CAPTURE : { request(cut0) cut(cut0,root0) root(root0,true,true,true) files(root0,true) budget(false) } =>* { captured(cut0,root0) } .
+search [1] in ARTIFACT-CAPTURE-WEAK-LIMIT : { request(cut0) cut(cut0,root0) root(root0,true,true,true) files(root0,true) budget(false) } =>* { captured(cut0,root0) } .
+search in ARTIFACT-CAPTURE : { request(cut0) branch(cut1) cut(cut1,root1) root(root1,true,true,true) files(root1,true) budget(true) } =>* { captured(cut0,root1) } .
+search [1] in ARTIFACT-CAPTURE-WEAK-CUT : { request(cut0) branch(cut1) cut(cut1,root1) root(root1,true,true,true) files(root1,true) budget(true) } =>* { captured(cut0,root1) } .
+quit

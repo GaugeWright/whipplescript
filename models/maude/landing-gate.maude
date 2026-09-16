@@ -1,0 +1,143 @@
+--- Atomic ref admission after pure evaluation. Authentication, complete inventory,
+--- sound support selection and reservation arbitration are host-owned premises.
+--- One selected ref and one admission attempt are modeled per configuration.
+--- Each Mark is an exact identity, not an ordered timestamp. A certificate binds
+--- both the base head and candidate result; no source-level edit grants authority.
+mod LANDING-GATE is
+  protecting BOOL .
+  sorts Mark Artifact Door Ref Fact Cfg State .
+  ops old new : -> Mark [ctor] .
+  ops good broken repaired : -> Artifact [ctor] .
+  ops promote transport undo directStore importDoor retry : -> Door [ctor] .
+  ops main release work : -> Ref [ctor] .
+  op gated : Ref -> Bool .
+  eq gated(main) = true . eq gated(release) = true . eq gated(work) = false .
+  subsort Fact < Cfg . op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+  op {_} : Cfg -> State [ctor] .
+  --- Current premises: head, charter, evidence, authority, inventory, selection,
+  --- fencing identity and token validity at the commit's time basis.
+  op current : Mark Mark Mark Mark Mark Mark Mark Bool -> Fact [ctor] .
+  --- Evaluation supplies support and authorization under the PRECEDING charter.
+  op request : Door Ref Artifact Bool Bool -> Fact [ctor] .
+  op certificate : Door Ref Artifact Mark Mark Mark Mark Mark Mark Mark -> Fact [ctor] .
+  op commit : Door Ref Artifact -> Fact [ctor] .
+  op admitted : Door Ref Artifact -> Fact [ctor] .
+  op ungated : Door Ref Artifact -> Fact [ctor] .
+  op bind : Ref -> Fact [ctor] . op bound : Ref -> Fact [ctor] .
+  vars H C E U I S F X : Mark . var A : Artifact . var D : Door .
+  var R : Ref . vars B Q : Bool . var CFG : Cfg .
+  crl [prepare-supported-candidate] :
+    { request(D,R,A,true,true) current(H,C,E,U,I,S,F,true) CFG }
+    => { certificate(D,R,A,H,C,E,U,I,S,F) current(H,C,E,U,I,S,F,true) CFG }
+    if gated(R) .
+  crl [atomic-commit] :
+    { certificate(D,R,A,H,C,E,U,I,S,F) commit(D,R,A)
+      current(H,C,E,U,I,S,F,true) CFG }
+    => { admitted(D,R,A) current(new,C,E,U,I,S,F,true) CFG }
+    if gated(R) .
+  crl [ungated-door] : { request(D,R,A,B,Q) commit(D,R,A) CFG }
+    => { ungated(D,R,A) CFG } if not gated(R) .
+  crl [bind-ungated] : { bind(R) CFG } => { bound(R) CFG } if not gated(R) .
+endm
+mod LANDING-GATE-WEAK-HEAD is
+  including LANDING-GATE .
+  vars H C E U I S F X : Mark . var A : Artifact . var D : Door .
+  var R : Ref . var CFG : Cfg .
+  crl [ignore-head] :
+    { certificate(D,R,A,H,C,E,U,I,S,F) commit(D,R,A) current(X,C,E,U,I,S,F,true) CFG }
+    => { admitted(D,R,A) current(new,C,E,U,I,S,F,true) CFG } if gated(R) .
+endm
+mod LANDING-GATE-WEAK-CHARTER is
+  including LANDING-GATE .
+  vars H C E U I S F X : Mark . var A : Artifact . var D : Door .
+  var R : Ref . var CFG : Cfg .
+  crl [ignore-charter] :
+    { certificate(D,R,A,H,C,E,U,I,S,F) commit(D,R,A) current(H,X,E,U,I,S,F,true) CFG }
+    => { admitted(D,R,A) current(new,C,E,U,I,S,F,true) CFG } if gated(R) .
+endm
+mod LANDING-GATE-WEAK-EVIDENCE is
+  including LANDING-GATE .
+  vars H C E U I S F X : Mark . var A : Artifact . var D : Door .
+  var R : Ref . var CFG : Cfg .
+  crl [ignore-evidence] :
+    { certificate(D,R,A,H,C,E,U,I,S,F) commit(D,R,A) current(H,C,X,U,I,S,F,true) CFG }
+    => { admitted(D,R,A) current(new,C,E,U,I,S,F,true) CFG } if gated(R) .
+endm
+mod LANDING-GATE-WEAK-AUTHORITY is
+  including LANDING-GATE .
+  vars H C E U I S F X : Mark . var A : Artifact . var D : Door .
+  var R : Ref . var CFG : Cfg .
+  crl [ignore-authority] :
+    { certificate(D,R,A,H,C,E,U,I,S,F) commit(D,R,A) current(H,C,E,X,I,S,F,true) CFG }
+    => { admitted(D,R,A) current(new,C,E,U,I,S,F,true) CFG } if gated(R) .
+endm
+mod LANDING-GATE-WEAK-INVENTORY is
+  including LANDING-GATE .
+  vars H C E U I S F X : Mark . var A : Artifact . var D : Door .
+  var R : Ref . var CFG : Cfg .
+  crl [ignore-inventory] :
+    { certificate(D,R,A,H,C,E,U,I,S,F) commit(D,R,A) current(H,C,E,U,X,S,F,true) CFG }
+    => { admitted(D,R,A) current(new,C,E,U,I,S,F,true) CFG } if gated(R) .
+endm
+mod LANDING-GATE-WEAK-SELECTION is
+  including LANDING-GATE .
+  vars H C E U I S F X : Mark . var A : Artifact . var D : Door .
+  var R : Ref . var CFG : Cfg .
+  crl [ignore-selection] :
+    { certificate(D,R,A,H,C,E,U,I,S,F) commit(D,R,A) current(H,C,E,U,I,X,F,true) CFG }
+    => { admitted(D,R,A) current(new,C,E,U,I,S,F,true) CFG } if gated(R) .
+endm
+mod LANDING-GATE-WEAK-FENCE is
+  including LANDING-GATE .
+  vars H C E U I S F X : Mark . var A : Artifact . var D : Door .
+  var R : Ref . var CFG : Cfg .
+  crl [ignore-fence] :
+    { certificate(D,R,A,H,C,E,U,I,S,F) commit(D,R,A) current(H,C,E,U,I,S,X,true) CFG }
+    => { admitted(D,R,A) current(new,C,E,U,I,S,F,true) CFG } if gated(R) .
+endm
+mod LANDING-GATE-WEAK-EXPIRY is
+  including LANDING-GATE .
+  vars H C E U I S F X : Mark . var A : Artifact . var D : Door .
+  var R : Ref . var CFG : Cfg .
+  crl [ignore-expiry] :
+    { certificate(D,R,A,H,C,E,U,I,S,F) commit(D,R,A) current(H,C,E,U,I,S,F,false) CFG }
+    => { admitted(D,R,A) current(new,C,E,U,I,S,F,false) CFG } if gated(R) .
+endm
+mod LANDING-GATE-WEAK-CANDIDATE is
+  including LANDING-GATE .
+  vars H C E U I S F X : Mark . var A : Artifact . var D : Door .
+  var R : Ref . var CFG : Cfg . var OTHER : Artifact .
+  crl [substitute-candidate] :
+    { certificate(D,R,A,H,C,E,U,I,S,F) commit(D,R,OTHER) current(H,C,E,U,I,S,F,true) CFG }
+    => { admitted(D,R,OTHER) current(new,C,E,U,I,S,F,true) CFG } if gated(R) .
+endm
+mod LANDING-GATE-WEAK-SUPPORT is
+  including LANDING-GATE .
+  vars H C E U I S F X : Mark . var A : Artifact . var D : Door .
+  var R : Ref . var CFG : Cfg .
+  crl [ignore-support] :
+    { request(D,R,A,false,true) current(H,C,E,U,I,S,F,true) CFG }
+    => { certificate(D,R,A,H,C,E,U,I,S,F) current(H,C,E,U,I,S,F,true) CFG } if gated(R) .
+endm
+mod LANDING-GATE-WEAK-SELF-GRANT is
+  including LANDING-GATE .
+  vars H C E U I S F X : Mark . var A : Artifact . var D : Door .
+  var R : Ref . var CFG : Cfg .
+  crl [candidate-self-authorizes] :
+    { request(D,R,A,true,false) current(H,C,E,U,I,S,F,true) CFG }
+    => { certificate(D,R,A,H,C,E,U,I,S,F) current(H,C,E,U,I,S,F,true) CFG } if gated(R) .
+endm
+mod LANDING-GATE-WEAK-BYPASS is
+  including LANDING-GATE .
+  vars H C E U I S F X : Mark . var A : Artifact . var D : Door .
+  var R : Ref . var CFG : Cfg .
+  rl [direct-store-bypasses-gate] : { commit(directStore,main,A) CFG }
+    => { admitted(directStore,main,A) CFG } .
+endm
+mod LANDING-GATE-WEAK-BIND is
+  including LANDING-GATE .
+  vars H C E U I S F X : Mark . var A : Artifact . var D : Door .
+  var R : Ref . var CFG : Cfg .
+  rl [bind-mainline] : { bind(main) CFG } => { bound(main) CFG } .
+endm

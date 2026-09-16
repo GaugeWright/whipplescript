@@ -1,0 +1,39 @@
+--- Pure planning over authenticated inventories and independently verified
+--- evidence. This does not authorize a ref mutation or certify host premises.
+mod IMPACT-SELECTION is
+  sorts Duty Duties Support Presence Method Action State .
+  ops prior new : -> Duty [ctor] .
+  subsort Duty < Duties .
+  op none : -> Duties [ctor] .
+  op _;_ : Duties Duties -> Duties [ctor assoc comm id: none idem] .
+  ops exact preserved stale violated conflicted missing : -> Support [ctor] .
+  ops present absent : -> Presence [ctor] .
+  ops keep check repair resolve clarify observe : -> Action [ctor] .
+  op inventory : Duties Duties -> Duties .
+  vars B A : Duties .
+  eq inventory(B, A) = B ; A .
+  ops installed unavailable : -> Method [ctor] .
+  op pending : Duty Support Presence Method -> State [ctor] .
+  op planned : Duty Action -> State [ctor] .
+  var D : Duty . var S : Support . var M : Method .
+  rl [exact-support] : pending(D,exact,present,M) => planned(D,keep) .
+  rl [verified-preservation] : pending(D,preserved,present,M) => planned(D,keep) .
+  rl [stale-rerun] : pending(D,stale,present,installed) => planned(D,check) .
+  rl [missing-rerun] : pending(D,missing,present,installed) => planned(D,check) .
+  rl [repair] : pending(D,violated,present,M) => planned(D,repair) .
+  rl [resolve-conflict] : pending(D,conflicted,present,M) => planned(D,resolve) .
+  rl [missing-subject] : pending(D,S,absent,M) => planned(D,clarify) .
+  rl [no-missing-method] : pending(D,missing,present,unavailable) => planned(D,observe) .
+  rl [no-stale-method] : pending(D,stale,present,unavailable) => planned(D,observe) .
+endm
+mod IMPACT-SELECTION-WEAK is
+  including IMPACT-SELECTION .
+  var D : Duty .
+  vars B A : Duties .
+  op weakInventory : Duties Duties -> Duties .
+  eq weakInventory(B,A) = A .
+  rl [pretend-installed] : pending(D,missing,present,unavailable) => planned(D,check) .
+  rl [subject-equality-as-reuse] : pending(D,stale,present,installed) => planned(D,keep) .
+  rl [retry-wash] : pending(D,violated,present,installed) => planned(D,check) .
+  rl [hide-deleted-subject] : pending(D,exact,absent,installed) => planned(D,keep) .
+endm

@@ -1,0 +1,76 @@
+--- Enqueue identity includes the whole input and relative deadline. Storage
+--- transactions and authenticated runtime ownership are premises. An exact
+--- acknowledgment replay never creates another effect or grants dispatch.
+mod NORM-ENQUEUE is
+ sorts Id Fact Cfg State .
+ ops key payload deadline revision other : -> Id [ctor] .
+ subsort Fact < Cfg . op none : -> Cfg [ctor] .
+ op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] . op {_} : Cfg -> State [ctor] .
+ op request : Id Id Id Id -> Fact [ctor] .
+ op unused : Id -> Fact [ctor] .
+ op live : Id -> Fact [ctor] .
+ op journal : Id Id Id Id -> Fact [ctor] .
+ ops queued acknowledged permitted dispatched : Id -> Fact [ctor] .
+ vars K P D R : Id . var C : Cfg .
+ rl [enqueue] : { request(K,P,D,R) unused(K) live(R) C }
+ => { journal(K,P,D,R) queued(K) acknowledged(K) live(R) C } .
+ rl [replay] : { request(K,P,D,R) journal(K,P,D,R) C }
+ => { journal(K,P,D,R) acknowledged(K) C } .
+ rl [dispatch] : { queued(K) permitted(K) C } => { dispatched(K) C } .
+endm
+mod NORM-ENQUEUE-WEAK-LIVE is
+ including NORM-ENQUEUE .
+ vars K P D R : Id . var C : Cfg .
+ rl [weaken] : { request(K,P,D,R) unused(K) C } => { journal(K,P,D,R) queued(K) acknowledged(K) C } .
+endm
+mod NORM-ENQUEUE-WEAK-REVISION is
+ including NORM-ENQUEUE .
+ vars K P D R : Id . var C : Cfg .
+ rl [weaken] : { request(K,P,D,R) unused(K) live(other) C } => { journal(K,P,D,R) queued(K) acknowledged(K) C } .
+endm
+mod NORM-ENQUEUE-WEAK-PAYLOAD is
+ including NORM-ENQUEUE .
+ vars K P D R : Id . var C : Cfg .
+ rl [weaken] : { request(K,other,D,R) journal(K,P,D,R) C } => { journal(K,P,D,R) acknowledged(K) C } .
+endm
+mod NORM-ENQUEUE-WEAK-DEADLINE is
+ including NORM-ENQUEUE .
+ vars K P D R : Id . var C : Cfg .
+ rl [weaken] : { request(K,P,other,R) journal(K,P,D,R) C } => { journal(K,P,D,R) acknowledged(K) C } .
+endm
+mod NORM-ENQUEUE-WEAK-POLICY is
+ including NORM-ENQUEUE .
+ vars K P D R : Id . var C : Cfg .
+ rl [weaken] : { queued(K) C } => { dispatched(K) C } .
+endm
+
+--- Host selection precedes preparation. A retry defaults to the journal's
+--- pinned frontier; current history may advance without changing that choice.
+mod NORM-ENQUEUE-SELECTION is
+ including NORM-ENQUEUE .
+ op chooseDefault : Id -> Fact [ctor] .
+ op chooseExplicit : Id Id -> Fact [ctor] .
+ op current : Id -> Fact [ctor] .
+ ops pinned resolved : Id Id -> Fact [ctor] .
+ vars K F G : Id . var C : Cfg .
+ rl [fresh-default] : { chooseDefault(K) unused(K) current(F) C }
+ => { unused(K) current(F) resolved(K,F) C } .
+ rl [retained-default] : { chooseDefault(K) pinned(K,F) C }
+ => { pinned(K,F) resolved(K,F) C } .
+ rl [fresh-explicit] : { chooseExplicit(K,F) unused(K) C }
+ => { unused(K) resolved(K,F) C } .
+ rl [retained-explicit] : { chooseExplicit(K,F) pinned(K,F) C }
+ => { pinned(K,F) resolved(K,F) C } .
+endm
+mod NORM-ENQUEUE-SELECTION-WEAK-DRIFT is
+ including NORM-ENQUEUE-SELECTION .
+ vars K F G : Id . var C : Cfg .
+ rl [weaken] : { chooseDefault(K) pinned(K,F) current(G) C }
+ => { pinned(K,F) current(G) resolved(K,G) C } .
+endm
+mod NORM-ENQUEUE-SELECTION-WEAK-EXPLICIT is
+ including NORM-ENQUEUE-SELECTION .
+ vars K F G : Id . var C : Cfg .
+ rl [weaken] : { chooseExplicit(K,G) pinned(K,F) C }
+ => { pinned(K,F) resolved(K,G) C } .
+endm

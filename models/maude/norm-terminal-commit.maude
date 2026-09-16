@@ -1,0 +1,33 @@
+--- One terminal store operation, not all caller-side derived facts/cache writes.
+--- Phases abstract the event, run, lease, effect, dependent/cancellation and
+--- optional diagnostic writes. No staged prefix is externally committed.
+mod NORM-TERMINAL-COMMIT is
+ sorts Phase Written Snapshot State .
+ subsort Written < Phase .
+ op initial : -> Phase [ctor] .
+ ops event run lease effect dependencies diagnostics : -> Written [ctor] .
+ ops active terminal : -> Snapshot [ctor] .
+ op partial : Snapshot Written -> Snapshot [ctor] .
+ ops request success refused : Snapshot -> State [ctor] .
+ op staging : Snapshot Phase -> State [ctor] .
+ var S : Snapshot . var P : Phase .
+ rl [begin] : request(S) => staging(S,initial) .
+ rl [event] : staging(S,initial) => staging(S,event) .
+ rl [run] : staging(active,event) => staging(active,run) .
+ rl [lease] : staging(active,run) => staging(active,lease) .
+ rl [effect] : staging(active,lease) => staging(active,effect) .
+ rl [dependencies] : staging(active,effect) => staging(active,dependencies) .
+ rl [diagnostics] : staging(active,dependencies) => staging(active,diagnostics) .
+ rl [commit] : staging(active,diagnostics) => success(terminal) .
+ rl [refuse-second-terminal] : staging(terminal,event) => refused(terminal) .
+ rl [storage-error-rollback] : staging(S,P) => refused(S) .
+endm
+mod NORM-TERMINAL-COMMIT-WEAK-ROLLBACK is
+ including NORM-TERMINAL-COMMIT .
+ var S : Snapshot . var W : Written .
+ rl [leak-partial-writes] : staging(S,W) => refused(partial(S,W)) .
+endm
+mod NORM-TERMINAL-COMMIT-WEAK-REFUSAL is
+ including NORM-TERMINAL-COMMIT .
+ rl [leak-refused-event] : staging(terminal,event) => refused(partial(terminal,event)) .
+endm

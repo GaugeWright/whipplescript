@@ -223,6 +223,8 @@ pub(crate) mod tests {
             input_json: "{}".into(),
             required_capabilities_json: "[]".into(),
             declared_profiles_json: "[]".into(),
+            // Fixture: no attempt admission selected this effect.
+            attempt_admission_event_id: None,
         };
         let request = ExecuteActionEffect {
             protocol: ACTION_EXECUTION_PROTOCOL.into(),

@@ -1,0 +1,9 @@
+load ../hosted-impact-route.maude
+search [1] in HOSTED-IMPACT-ROUTE : query(trusted,trusted,trusted) =>* planned .
+search [1] in HOSTED-IMPACT-ROUTE : query(caller,trusted,trusted) =>* planned .
+search [1] in HOSTED-IMPACT-ROUTE-WEAK : query(caller,trusted,trusted) =>* planned .
+search [1] in HOSTED-IMPACT-ROUTE : query(trusted,missing,trusted) =>* planned .
+search [1] in HOSTED-IMPACT-ROUTE-WEAK : query(trusted,missing,trusted) =>* planned .
+search [1] in HOSTED-IMPACT-ROUTE : query(trusted,trusted,mismatched) =>* planned .
+search [1] in HOSTED-IMPACT-ROUTE-WEAK : query(trusted,trusted,mismatched) =>* planned .
+quit

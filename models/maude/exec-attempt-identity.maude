@@ -1,0 +1,38 @@
+--- Retry admission selects a fresh attempt; an in-flight response retains the
+--- selected attempt even after another retry is admitted. Admission authenticity,
+--- atomic run start, and the host's request/response association are premises.
+mod EXEC-ATTEMPT-IDENTITY is
+ sorts Id Fact Cfg State . ops original retryId : -> Id [ctor] .
+ subsort Fact < Cfg . op none : -> Cfg [ctor] .
+ op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] . op {_} : Cfg -> State [ctor] .
+ ops eligible dispatch running sent reply completed failed reattached late : Id -> Fact [ctor] .
+ op retry : Id Id -> Fact [ctor] .
+ vars A B : Id . var C : Cfg .
+ rl [start] : { eligible(A) dispatch(A) C } => { running(A) sent(A) C } .
+ rl [reattach] : { running(A) dispatch(A) C } => { running(A) reattached(A) C } .
+ rl [fail] : { running(A) C } => { failed(A) C } .
+ crl [retry-admission] : { failed(A) retry(A, B) C }
+ => { failed(A) eligible(B) C } if A =/= B .
+ rl [receive] : { running(A) sent(A) reply(A) C } => { completed(A) C } .
+ rl [late] : { failed(A) sent(A) reply(A) C } => { failed(A) late(A) C } .
+endm
+mod EXEC-ATTEMPT-IDENTITY-WEAK-ADMISSION is
+ including EXEC-ATTEMPT-IDENTITY . var A : Id . var C : Cfg .
+ rl [weaken] : { dispatch(A) C } => { running(A) sent(A) C } .
+endm
+mod EXEC-ATTEMPT-IDENTITY-WEAK-REUSE is
+ including EXEC-ATTEMPT-IDENTITY . var A : Id . var C : Cfg .
+ rl [weaken] : { failed(A) retry(A, A) C } => { failed(A) eligible(A) C } .
+endm
+mod EXEC-ATTEMPT-IDENTITY-WEAK-STALE is
+ including EXEC-ATTEMPT-IDENTITY . vars A B : Id . var C : Cfg .
+ rl [weaken] : { eligible(B) dispatch(A) C } => { running(A) sent(A) C } .
+endm
+mod EXEC-ATTEMPT-IDENTITY-WEAK-PENDING is
+ including EXEC-ATTEMPT-IDENTITY . var A : Id . var C : Cfg .
+ rl [weaken] : { running(A) reply(A) C } => { completed(A) C } .
+endm
+mod EXEC-ATTEMPT-IDENTITY-WEAK-LATEST is
+ including EXEC-ATTEMPT-IDENTITY . vars A B : Id . var C : Cfg .
+ rl [weaken] : { running(B) sent(A) reply(A) C } => { completed(B) C } .
+endm

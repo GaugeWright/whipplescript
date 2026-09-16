@@ -1,0 +1,68 @@
+--- DR-0098 / N1-D1: latest draft and effective accepted content are separate.
+--- Rules are admitted under the pinned vocabulary/authority before projection.
+--- A retirement of a different (draft) revision cannot retire the active one.
+mod EFFECTIVE-REVISION is
+  protecting BOOL .
+  sorts Id Fields Role Key Fact Cfg State .
+  ops recordId rev0 rev1 act0 act1 : -> Id [ctor] .
+  ops f0 f1 : -> Fields [ctor] .
+  ops draft activates retires : -> Role [ctor] .
+  ops owner worker : -> Key [ctor] .
+  subsort Fact < Cfg .
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+  op {_} : Cfg -> State [ctor] .
+  op current : Id Id Fields Role -> Fact [ctor] .
+  op effective : Id Id Fields Id -> Fact [ctor] .
+  op inactive : Id -> Fact [ctor] .
+  op history : Id Id Fields Id -> Fact [ctor] .
+  op edit : Id Id Fields -> Fact [ctor] .
+  op transition : Id Id Role Key -> Fact [ctor] .
+  op rule : Role Key -> Fact [ctor] .
+  vars I V V1 E : Id . vars F F1 : Fields . var R : Role . var K : Key . var C : Cfg .
+  crl [draft-does-not-replace-effective] :
+    { current(I,V,F,R) edit(I,V1,F1) C }
+    => { current(I,V1,F1,draft) C } if F =/= F1 .
+  rl [no-op-preserves-revision] :
+    { current(I,V,F,R) edit(I,V1,F) C } => { current(I,V,F,R) C } .
+  rl [first-activation] :
+    { current(I,V,F,R) inactive(I) transition(I,E,activates,K) rule(activates,K) C }
+    => { current(I,V,F,activates) effective(I,V,F,E) rule(activates,K) C } .
+  rl [replace-effective-after-activation] :
+    { current(I,V,F,R) effective(I,V1,F1,E) transition(I,act1,activates,K) rule(activates,K) C }
+    => { current(I,V,F,activates) effective(I,V,F,act1) history(I,V1,F1,E) rule(activates,K) C } .
+  rl [retire-exact-effective-revision] :
+    { current(I,V,F,R) effective(I,V,F,E) transition(I,act1,retires,K) rule(retires,K) C }
+    => { current(I,V,F,retires) inactive(I) history(I,V,F,E) rule(retires,K) C } .
+  crl [retire-draft-keeps-effective] :
+    { current(I,V,F,R) effective(I,V1,F1,E) transition(I,act1,retires,K) rule(retires,K) C }
+    => { current(I,V,F,retires) effective(I,V1,F1,E) rule(retires,K) C } if V =/= V1 .
+endm
+mod EFFECTIVE-REVISION-WEAK-DRAFT is
+  including EFFECTIVE-REVISION .
+  vars I V V1 E : Id . vars F F1 : Fields . var R : Role . var C : Cfg .
+  rl [latest-draft-erases-duty] :
+    { current(I,V,F,R) effective(I,V,F,E) edit(I,V1,F1) C }
+    => { current(I,V1,F1,draft) inactive(I) history(I,V,F,E) C } .
+endm
+mod EFFECTIVE-REVISION-WEAK-ACTIVATION is
+  including EFFECTIVE-REVISION .
+  vars I V V1 E : Id . vars F F1 : Fields . var R : Role . var C : Cfg .
+  rl [draft-inherits-acceptance] :
+    { current(I,V,F,R) effective(I,V,F,E) edit(I,V1,F1) C }
+    => { current(I,V1,F1,draft) effective(I,V1,F1,E) history(I,V,F,E) C } .
+endm
+mod EFFECTIVE-REVISION-WEAK-RETIRE is
+  including EFFECTIVE-REVISION .
+  vars I V V1 E : Id . vars F F1 : Fields . var R : Role . var K : Key . var C : Cfg .
+  rl [retire-another-revision] :
+    { current(I,V,F,R) effective(I,V1,F1,E) transition(I,act1,retires,K) rule(retires,K) C }
+    => { current(I,V,F,retires) inactive(I) history(I,V1,F1,E) rule(retires,K) C } .
+endm
+mod EFFECTIVE-REVISION-WEAK-AUTHORITY is
+  including EFFECTIVE-REVISION .
+  vars I V V1 E : Id . vars F F1 : Fields . var R : Role . var K : Key . var C : Cfg .
+  rl [unadmitted-activation] :
+    { current(I,V,F,R) effective(I,V1,F1,E) transition(I,act1,activates,K) C }
+    => { current(I,V,F,activates) effective(I,V,F,act1) history(I,V1,F1,E) C } .
+endm

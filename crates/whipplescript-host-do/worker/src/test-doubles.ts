@@ -1,3 +1,6 @@
+import { ExecutorController } from "./executor-controller";
+import { ExecutorControllerRoutes } from "./executor-controller-routes";
+import * as bindings from "../pkg/whipplescript_host_do_bg.js";
 // The Durable Object test doubles both test workers stand up: the embedder's
 // session-admission stand-in and the public-credential resolver stand-in.
 // wrangler.test.toml and wrangler.authenticated.test.toml both bind these two
@@ -50,25 +53,66 @@ export class TestDeployment implements DurableObject {
   }
 }
 
-// Stand-in for a Class-A ExecutorContainer instance: echoes which pool
-// instance served the round and threads the whip-executor/1 body back, so the
-// broker integration test can assert real-runtime routing without Docker.
+// Uses the real controller routes, SQLite and WASM reducers. Its process port
+// echoes pool identity and the dispatch body so broker tests run in workerd
+// without a physical container.
 export class TestExecutor implements DurableObject {
-  constructor(private readonly state: DurableObjectState) {}
+  private readonly routes: ExecutorControllerRoutes;
+  constructor(private readonly state: DurableObjectState) {
+    const owner = state.id.name;
+    if (!owner) throw new Error("test executor requires owner identity");
+    this.routes = new ExecutorControllerRoutes(new ExecutorController(state.storage, owner, bindings.exec_controller_transition, {
+      inspect: bindings.exec_barrier_inspect, begin: bindings.exec_barrier_begin, finish: bindings.exec_barrier_finish,
+    }), {
+      runtime: bindings.exec_norm_runtime_prepare, read: bindings.exec_incarnation_read,
+      delivery: bindings.exec_incarnation_delivery,
+      result: bindings.exec_incarnation_result,
+    }, async () => {
+      state.storage.sql.exec("CREATE TABLE IF NOT EXISTS executor_test_process (incarnation TEXT)");
+      if (state.storage.sql.exec("SELECT incarnation FROM executor_test_process").toArray().length === 0) {
+        state.storage.sql.exec("INSERT INTO executor_test_process VALUES (?)", crypto.randomUUID());
+      }
+      state.storage.sql.exec("CREATE TABLE IF NOT EXISTS executor_test_starts (started INTEGER)");
+      state.storage.sql.exec("INSERT INTO executor_test_starts VALUES (1)");
+    }, request => this.raw(request), async () => {
+      state.storage.sql.exec("DELETE FROM executor_test_process");
+    });
+  }
 
   async fetch(request: Request): Promise<Response> {
-    if (request.method !== "POST" || new URL(request.url).pathname !== "/exec") {
+    const path = new URL(request.url).pathname;
+    if (path.startsWith("/exec/controller/")) return this.routes.fetch(request);
+    if (request.method !== "POST" || path !== "/exec") {
       return Response.json({ error: "not found" }, { status: 404 });
     }
-    const body = await request.json<{ delay_ms?: number }>();
-    // Hold the round open on request so a test can observe two rounds
-    // genuinely overlapping (and therefore placed on distinct instances).
+    return this.execute(request, await request.json());
+  }
+
+  private async raw(request: Request): Promise<Response> {
+    const incarnation = this.state.storage.sql.exec<{ incarnation: string }>("SELECT incarnation FROM executor_test_process").one().incarnation;
+    if (new URL(request.url).pathname === "/exec/incarnation") {
+      return Response.json({ protocol: "whipplescript.exec.incarnation/v1", incarnation });
+    }
+    const delivery = await request.json<{ protocol: string; incarnation: string; dispatch: unknown }>();
+    if (delivery.protocol !== "whipplescript.exec.incarnation/v1" || delivery.incarnation !== incarnation) {
+      return Response.json({ error: "stale incarnation" }, { status: 409 });
+    }
+    const response = await this.execute(request, delivery.dispatch);
+    return Response.json({ protocol: "whipplescript.exec.incarnation/v1", incarnation, status: response.status, body: await response.json() });
+  }
+
+  private async execute(request: Request, value: unknown): Promise<Response> {
+    const body = value as { delay_ms?: number; effect_id?: string };
+    this.state.storage.sql.exec("CREATE TABLE IF NOT EXISTS executor_test_calls (effect_id TEXT)");
+    this.state.storage.sql.exec("INSERT INTO executor_test_calls (effect_id) VALUES (?)", body.effect_id ?? "");
     if (typeof body.delay_ms === "number" && body.delay_ms > 0) {
       await new Promise((resolve) => setTimeout(resolve, body.delay_ms));
     }
     return Response.json({
+      execution_id: crypto.randomUUID(),
       served_by: this.state.id.name ?? "<anonymous>",
       priority_header: request.headers.get("x-whip-priority"),
+      dispatch_header: request.headers.get("x-whip-exec-dispatch"),
       body,
     });
   }

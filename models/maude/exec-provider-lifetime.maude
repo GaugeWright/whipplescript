@@ -1,0 +1,114 @@
+--- Provider outcome and lifetime evidence are independent, bound to one placement.
+--- Controller proof is a trusted input only after exact response validation.
+mod EXEC-PROVIDER-LIFETIME is
+ sorts Output Intent Proof Binding Cfg .
+ ops missing retained changed : -> Output [ctor] .
+ ops none durable sent : -> Intent [ctor] .
+ --- forged is an exactly bound caller body, not a private controller reply.
+ ops unknown observed forged stored : -> Proof [ctor] .
+ ops exact foreign : -> Binding [ctor] .
+ op cfg : Output Intent Proof Binding -> Cfg [ctor] .
+ var O : Output . var I : Intent . var B : Binding .
+ rl [persist-intent] : cfg(O,none,unknown,B) => cfg(O,durable,unknown,B) .
+ rl [send-only-after-commit] : cfg(O,durable,unknown,B) => cfg(O,sent,unknown,B) .
+ rl [controller-proof] : cfg(O,sent,unknown,B) => cfg(O,sent,observed,B) .
+ rl [bound-retention] : cfg(O,I,observed,exact) => cfg(O,I,stored,exact) .
+ rl [racing-result] : cfg(missing,I,stored,exact) => cfg(retained,I,stored,exact) .
+endm
+mod EXEC-PROVIDER-LIFETIME-WEAK is
+ including EXEC-PROVIDER-LIFETIME .
+ var O : Output . var I : Intent . var B : Binding .
+ rl [caller-proof] : cfg(O,I,forged,exact) => cfg(O,I,stored,exact) .
+ rl [unbound-proof] : cfg(O,I,observed,foreign) => cfg(O,I,stored,foreign) .
+ rl [send-before-intent] : cfg(O,none,unknown,B) => cfg(O,sent,unknown,B) .
+ rl [result-implies-proof] : cfg(retained,none,unknown,exact) => cfg(retained,none,stored,exact) .
+ rl [overwrite-output] : cfg(retained,I,stored,exact) => cfg(changed,I,stored,exact) .
+endm
+
+--- A new guarded claim cannot deliver without an immutable committed placement.
+mod EXEC-PREPLACEMENT-FENCE is
+ sorts Custody Placement Effect Cfg .
+ ops absent guarded legacy : -> Custody [ctor] .
+ ops none delivery fence : -> Placement [ctor] .
+ ops quiet running notAdmitted terminated : -> Effect [ctor] .
+ op cfg : Custody Placement Effect -> Cfg [ctor] .
+ rl [claim] : cfg(absent,none,quiet) => cfg(guarded,none,quiet) .
+ rl [place] : cfg(guarded,none,quiet) => cfg(guarded,delivery,quiet) .
+ rl [deliver] : cfg(guarded,delivery,quiet) => cfg(guarded,delivery,running) .
+ rl [fence-absent] : cfg(absent,none,quiet) => cfg(guarded,fence,quiet) .
+ rl [fence-guarded] : cfg(guarded,none,quiet) => cfg(guarded,fence,quiet) .
+ rl [prove-absence] : cfg(guarded,fence,quiet) => cfg(guarded,fence,notAdmitted) .
+ rl [fence-delivered] : cfg(guarded,delivery,running) => cfg(guarded,delivery,terminated) .
+endm
+mod EXEC-PREPLACEMENT-FENCE-WEAK is
+ including EXEC-PREPLACEMENT-FENCE .
+ rl [uncommitted-placement] : cfg(guarded,none,quiet) => cfg(guarded,none,running) .
+ rl [late-placement-replaces-fence] : cfg(guarded,fence,notAdmitted) => cfg(guarded,delivery,running) .
+ rl [upgrade-legacy-custody] : cfg(legacy,none,quiet) => cfg(guarded,fence,notAdmitted) .
+endm
+
+--- Binding, requested cancellation, tracked custody, retained fence intent.
+--- Each rule is one store transaction; neither order exposes a partial join.
+mod EXEC-CANCEL-TRACKING is
+ protecting BOOL .
+ sort Cfg .
+ op cfg : Bool Bool Bool Bool -> Cfg [ctor] .
+ var B : Bool . var T : Bool .
+ rl [track-first] : cfg(B,false,false,false) => cfg(B,false,true,false) .
+ rl [cancel-first] : cfg(true,false,false,false) => cfg(true,true,false,false) .
+ rl [cancel-tracked] : cfg(true,false,true,false) => cfg(true,true,true,true) .
+ rl [track-cancelled] : cfg(true,true,false,false) => cfg(true,true,true,true) .
+ rl [unbound-request] : cfg(false,false,T,false) => cfg(false,true,T,false) .
+ rl [unbound-tracking] : cfg(false,true,false,false) => cfg(false,true,true,false) .
+endm
+mod EXEC-CANCEL-TRACKING-WEAK is
+ including EXEC-CANCEL-TRACKING .
+ rl [omit-cancellation-join] : cfg(true,false,true,false) => cfg(true,true,true,false) .
+ rl [omit-tracking-join] : cfg(true,true,false,false) => cfg(true,true,true,false) .
+ rl [select-by-effect-only] : cfg(false,true,true,false) => cfg(false,true,true,true) .
+endm
+
+--- Outcome custody and physical proof are separate durable records. A crash
+--- between them leaves the cleanup query open; neither write settles a workflow.
+mod EXEC-OUTCOME-CUSTODY is
+ sorts Proof Output Wake Cfg .
+ ops pending notAdmitted terminated : -> Proof [ctor] .
+ ops empty completed notExecuted uncertain : -> Output [ctor] .
+ ops open closed : -> Wake [ctor] .
+ op cfg : Proof Output Wake -> Cfg [ctor] .
+ var O : Output .
+ rl [result-before-proof] : cfg(pending,empty,open) => cfg(pending,completed,open) .
+ rl [termination] : cfg(pending,O,open) => cfg(terminated,O,open) .
+ rl [non-admission] : cfg(pending,empty,open) => cfg(notAdmitted,empty,open) .
+ rl [result-after-proof] : cfg(terminated,empty,open) => cfg(terminated,completed,open) .
+ rl [retain-non-execution] : cfg(notAdmitted,empty,open) => cfg(notAdmitted,notExecuted,open) .
+ rl [retain-uncertainty] : cfg(terminated,empty,open) => cfg(terminated,uncertain,open) .
+ rl [close-result] : cfg(terminated,completed,open) => cfg(terminated,completed,closed) .
+ rl [close-non-execution] : cfg(notAdmitted,notExecuted,open) => cfg(notAdmitted,notExecuted,closed) .
+ rl [close-uncertainty] : cfg(terminated,uncertain,open) => cfg(terminated,uncertain,closed) .
+endm
+mod EXEC-OUTCOME-CUSTODY-WEAK is
+ including EXEC-OUTCOME-CUSTODY .
+ rl [proof-alone-drops-query] : cfg(terminated,empty,open) => cfg(terminated,empty,closed) .
+ rl [result-alone-drops-query] : cfg(pending,completed,open) => cfg(pending,completed,closed) .
+ rl [closure-erases-result] : cfg(terminated,completed,open) => cfg(terminated,uncertain,open) .
+ rl [non-execution-without-proof] : cfg(pending,empty,open) => cfg(pending,notExecuted,open) .
+endm
+
+--- Retry request can create cleanup work, but only retained closure permits
+--- atomic replacement admission. Output alone is not quiescence.
+mod EXEC-RETRY-CLOSURE is
+ sorts Phase Proof Intent Cfg .
+ ops failed queued : -> Phase [ctor] .
+ ops unproved proved : -> Proof [ctor] .
+ ops absent requested : -> Intent [ctor] .
+ op cfg : Phase Proof Intent Bool -> Cfg [ctor] .
+ rl [request] : cfg(failed,unproved,absent,false) => cfg(failed,unproved,requested,false) .
+ rl [prove] : cfg(failed,unproved,requested,false) => cfg(failed,proved,requested,false) .
+ rl [admit] : cfg(failed,proved,requested,false) => cfg(queued,proved,requested,true) .
+endm
+mod EXEC-RETRY-CLOSURE-WEAK is
+ including EXEC-RETRY-CLOSURE .
+ rl [admit-before-proof] : cfg(failed,unproved,requested,false) => cfg(queued,unproved,requested,true) .
+ rl [partial-admission] : cfg(failed,proved,requested,false) => cfg(failed,proved,requested,true) .
+endm

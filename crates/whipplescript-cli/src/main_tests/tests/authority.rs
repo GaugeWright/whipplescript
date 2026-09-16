@@ -434,6 +434,7 @@ fn queued_invoke_child(
         .expect("commit invoke effect");
 
     let claimable = ClaimableEffect {
+        attempt_admission_event_id: None,
         effect_id: "invoke-child".to_owned(),
         kind: "workflow.invoke".to_owned(),
         target: Some("Child".to_owned()),

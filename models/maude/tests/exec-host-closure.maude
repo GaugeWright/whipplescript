@@ -1,0 +1,10 @@
+load ../exec-lifetime-tracking.maude
+search [1] in EXEC-HOST-CLOSURE : cfg(pending,running,retained,armed) =>* cfg(pending,terminal,retained,armed) .
+search [1] in EXEC-HOST-CLOSURE : cfg(pending,running,retained,armed) =>* cfg(proved,terminal,erased,idle) .
+search [1] in EXEC-HOST-CLOSURE : cfg(pending,running,retained,armed) =>* cfg(pending,terminal,retained,idle) .
+search [1] in EXEC-HOST-CLOSURE-WEAK : cfg(pending,running,retained,armed) =>* cfg(pending,terminal,retained,idle) .
+search [1] in EXEC-HOST-CLOSURE : cfg(pending,running,retained,armed) =>* cfg(pending,terminal,erased,idle) .
+search [1] in EXEC-HOST-CLOSURE-WEAK : cfg(pending,running,retained,armed) =>* cfg(pending,terminal,erased,idle) .
+search [1] in EXEC-HOST-CLOSURE : cfg(pending,running,retained,armed) =>* cfg(pending,running,erased,idle) .
+search [1] in EXEC-HOST-CLOSURE-WEAK : cfg(pending,running,retained,armed) =>* cfg(pending,running,erased,idle) .
+quit

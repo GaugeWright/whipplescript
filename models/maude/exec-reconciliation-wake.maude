@@ -1,0 +1,36 @@
+--- One already-validated invocation. Store/identity validation is outside this
+--- temporal projection; closed includes an earlier attempt superseded by retry.
+mod EXEC-RECONCILIATION-WAKE is
+ protecting NAT .
+ sorts Life State .
+ ops active closed : -> Life [ctor] .
+ op select : Nat Nat Life -> State [ctor] .
+ op waiting : Nat -> State [ctor] .
+ ops ready none : -> State [ctor] .
+ vars NOW DUE : Nat .
+ crl [wait-until-due] : select(NOW,DUE,active) => waiting(DUE) if NOW < DUE .
+ crl [poll-when-due] : select(NOW,DUE,active) => ready if DUE <= NOW .
+ rl [ignore-closed-attempt] : select(NOW,DUE,closed) => none .
+endm
+mod EXEC-RECONCILIATION-WAKE-WEAK is
+ including EXEC-RECONCILIATION-WAKE .
+ vars NOW DUE : Nat .
+ rl [ignore-due] : select(NOW,DUE,active) => ready .
+ rl [reuse-prior-attempt] : select(NOW,DUE,closed) => ready .
+endm
+
+--- After the handler has durably scheduled the wait, both entry paths must
+--- continue the fixpoint; the waiting invocation never becomes a terminal.
+mod EXEC-DEFERRED-FIXPOINT is
+ sorts Work Sched .
+ ops deferred waiting sibling siblingDone : -> Work [ctor] .
+ op drive : Work Work -> Sched [ctor] .
+ ops parkedWithWake parkedWithoutWake : -> Sched [ctor] .
+ rl [continue-after-durable-wait] : drive(deferred,sibling) => drive(waiting,sibling) .
+ rl [run-independent-work] : drive(waiting,sibling) => drive(waiting,siblingDone) .
+ rl [park-with-durable-wake] : drive(waiting,siblingDone) => parkedWithWake .
+endm
+mod EXEC-DEFERRED-FIXPOINT-WEAK is
+ including EXEC-DEFERRED-FIXPOINT .
+ rl [park-whole-instance] : drive(deferred,sibling) => parkedWithoutWake .
+endm

@@ -1,0 +1,13 @@
+mod RUNTIME-IMAGE-BINDING is
+  sorts Premise State .
+  ops exact changed missing : -> Premise [ctor] .
+  op install : Premise Premise Premise -> State [ctor] .
+  op binding : -> State [ctor] .
+  rl [probed-image] : install(exact,exact,exact) => binding .
+endm
+mod RUNTIME-IMAGE-BINDING-WEAK is
+  including RUNTIME-IMAGE-BINDING .
+  rl [mutable-image] : install(changed,exact,exact) => binding .
+  rl [wrong-entrypoint] : install(exact,changed,exact) => binding .
+  rl [unprobed-runtime] : install(exact,exact,missing) => binding .
+endm

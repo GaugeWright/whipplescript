@@ -1,0 +1,16 @@
+mod EXECUTION-POLICY is
+  sorts Match Integrity State .
+  ops same different : -> Match [ctor] .
+  ops protected cooperative : -> Integrity [ctor] .
+  op query : Match Match Match Match Integrity -> State [ctor] .
+  op accepted : -> State [ctor] .
+  rl [pinned-policy] : query(same,same,same,same,protected) => accepted .
+endm
+mod EXECUTION-POLICY-WEAK is
+  including EXECUTION-POLICY .
+  rl [ignore-policy] : query(different,same,same,same,protected) => accepted .
+  rl [ignore-time] : query(same,different,same,same,protected) => accepted .
+  rl [ignore-runtime] : query(same,same,different,same,protected) => accepted .
+  rl [ignore-requirement] : query(same,same,same,different,protected) => accepted .
+  rl [upgrade-observer] : query(same,same,same,same,cooperative) => accepted .
+endm

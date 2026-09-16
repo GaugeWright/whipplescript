@@ -1,0 +1,8 @@
+load ../exec-recovery-fallback.maude
+search [1] in EXEC-RECOVERY-FALLBACK : cfg(executor,retained,running) =>* cfg(executor,retained,completed) .
+search [1] in EXEC-RECOVERY-FALLBACK : cfg(other,missing,running) =>* cfg(other,missing,uncertain) .
+search [1] in EXEC-RECOVERY-FALLBACK : cfg(executor,missing,running) =>* cfg(executor,missing,uncertain) .
+search [1] in EXEC-RECOVERY-FALLBACK-WEAK : cfg(executor,missing,running) =>* cfg(executor,missing,uncertain) .
+search [1] in EXEC-RECOVERY-FALLBACK : cfg(executor,retained,running) =>* cfg(executor,retained,uncertain) .
+search [1] in EXEC-RECOVERY-FALLBACK-WEAK : cfg(executor,retained,running) =>* cfg(executor,retained,uncertain) .
+quit

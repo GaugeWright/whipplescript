@@ -1,3 +1,6 @@
+import { ExecutorController } from "./executor-controller";
+import { ExecutorControllerRoutes } from "./executor-controller-routes";
+import { performExecutorHandoff } from "./executor-handoff";
 // The Cloudflare Worker + Durable Object shell for the WhippleScript runtime
 // (DR-0033 chunk 5d). The Rust core is compiled to wasm and exposes
 // `WasmDurableInstance` (create / step / status); this shell supplies the three
@@ -29,7 +32,7 @@ import {
 import { Container, getRandom } from "@cloudflare/containers";
 import {
   PRIORITY_HEADER,
-  WorkspaceBroker,
+  WorkspaceBroker as WorkspaceBrokerBase,
   executorPoolSize,
 } from "./executor-broker";
 import {
@@ -81,6 +84,29 @@ const verifyHostPolicy = (
   }
 ).verify_host_policy;
 const hostFunctions = bindings as unknown as {
+  host_norm_provision: (
+    bridge: unknown,
+    objectId: string,
+    trustedConfiguration: string,
+    requestJson: string,
+  ) => string;
+  host_norm_impact: (
+    bridge: unknown, trustedConfiguration: string, commandJson: string, deployment: string,
+  ) => string;
+  host_norm_enqueue: (
+    bridge: unknown, trustedConfiguration: string, commandJson: string,
+    executorUrl: string, environmentEpoch: string, normRuntime?: string,
+  ) => string;
+  host_norm_publication: (
+    bridge: unknown,
+    trustedConfiguration: string,
+    commandJson: string,
+  ) => string;
+  host_norm_command: (
+    bridge: unknown,
+    trustedConfiguration: string,
+    commandJson: string,
+  ) => string;
   host_open_instance: (
     bridge: unknown,
     signedEnvelope: string,
@@ -202,6 +228,13 @@ export interface Env {
   // Dedicated edge-ingress credential for `/public/session/*`. Keeping this
   // separate means publication cannot acquire the private host control plane.
   WHIP_SESSION_TOKEN?: string;
+  // Deployment-owned norm principal/public-key bindings and creation grants.
+  // Applies to this deployment's ledgers; never sourced from request headers,
+  // session labels, product-policy roots, or command JSON.
+  WHIP_NORM_TRUST?: string;
+  WHIP_NORM_PLANNING?: string;
+  WHIP_NORM_IMAGE_BINDING?: string;
+  WHIP_NORM_DEPLOYMENT_IMAGE?: string;
   // Pinned GaugeDesk governance authority for `whipplescript.host.v1` policy
   // epochs. Both are deployment configuration; a request may supply neither.
   GAUGEDESK_GOVERNANCE_SIGNER?: string;
@@ -238,6 +271,8 @@ export interface Env {
   // injects it, so a toolchain bump is a visible warm-start epoch that rolls
   // the cache. Unset = the "do-v0" default epoch.
   WHIP_COMPUTE_ENV_HASH?: string;
+  // Exact installed protected runtime profile; its norm epoch is independent of the cache.
+  WHIP_NORM_RUNTIME?: string;
   // Class-B turn containers (compute plane P8): agent turns run whole in a
   // per-turn container over whip-turn/1. URLs on this sentinel host route to
   // a per-turn container instance (idFromName over the turn id) — the 1:1
@@ -263,26 +298,94 @@ export interface Env {
 
 // One Class-A executor instance (compute plane P8): a container running
 // `whip executor` (whip-executor/1), paired 1:1 with this controlling DO.
-// Stateless by design — hermeticity is demanded and audited, which is what
-// makes the pool shareable. Egress default-deny is the container posture:
-// the executor only ever answers this worker's in-cluster fetches.
+// The process executes hermetic requests; its controlling object retains
+// admission and completion records. Container network policy is configured
+// separately from the receipt protocol.
 export class ExecutorContainer extends Container {
   defaultPort = 8080;
   sleepAfter = "10m";
+  private readonly controllerRoutes: ExecutorControllerRoutes;
+
+  constructor(state: DurableObjectState<{}>, env: Env) {
+    super(state, env);
+    if (!state.id.name) throw new Error("executor controller requires its named pool identity");
+    this.envVars = {
+      ...(env.WHIP_EXECUTOR_TOKEN ? { WHIP_EXECUTOR_TOKEN: env.WHIP_EXECUTOR_TOKEN } : {}),
+      ...(env.WHIP_NORM_RUNTIME ? { WHIP_NORM_RUNTIME: env.WHIP_NORM_RUNTIME } : {}),
+    };
+    const controller = new ExecutorController(state.storage, state.id.name, bindings.exec_controller_transition, {
+      inspect: bindings.exec_barrier_inspect, begin: bindings.exec_barrier_begin, finish: bindings.exec_barrier_finish,
+    });
+    this.controllerRoutes = new ExecutorControllerRoutes(controller, {
+      runtime: bindings.exec_norm_runtime_prepare, read: bindings.exec_incarnation_read,
+      delivery: bindings.exec_incarnation_delivery,
+      result: bindings.exec_incarnation_result,
+    }, async signal => {
+      if (!env.WHIP_EXECUTOR_TOKEN) throw new Error("executor startup requires WHIP_EXECUTOR_TOKEN");
+      await this.startAndWaitForPorts(8080, { abort: signal });
+    }, async request => {
+      const container = this.ctx.container;
+      if (!container) throw new Error("executor container binding is missing");
+      this.renewActivityTimeout();
+      try {
+        return await container.getTcpPort(8080).fetch(request);
+      } finally {
+        this.renewActivityTimeout();
+      }
+    }, async () => {
+      const container = this.ctx.container;
+      if (!container) throw new Error("executor container binding is missing");
+      await container.destroy();
+    }, env.WHIP_NORM_RUNTIME ? {
+      profile: env.WHIP_NORM_RUNTIME,
+      verify: bindings.exec_norm_runtime_read,
+    } : undefined);
+  }
+
+  override async fetch(request: Request): Promise<Response> {
+    const path = new URL(request.url).pathname;
+    if (path.startsWith("/exec/controller/")) return this.controllerRoutes.fetch(request);
+    // Direct bound-route access must not bypass durable controller admission.
+    if (path === "/exec/bound" || path === "/exec/incarnation" || path === "/exec/norm-runtime") {
+      return Response.json({ error: "controller route required" }, { status: 404 });
+    }
+    return this.controllerRoutes.legacy(request, forwarded => super.fetch(forwarded));
+  }
 }
 
 // The workspace DO that owns this pool's placement (executor-broker.ts).
 // Re-exported so wrangler configs can bind the class from this entry module.
-export { WorkspaceBroker };
+export class WorkspaceBroker extends WorkspaceBrokerBase {
+  constructor(state: DurableObjectState, env: Env) {
+    super(state, env, {
+      claim: (selected, envelope, stored) => bindings.exec_provider_claim(selected, envelope, stored),
+      complete: (selected, envelope, stored, status, body) => bindings.exec_provider_complete(selected, envelope, stored, status, body),
+      place: (selected, envelope, receipt, stored, container, dispatch) => bindings.exec_controller_place(selected, envelope, receipt, stored, container, dispatch),
+      target: bindings.exec_controller_target,
+      result: bindings.exec_controller_result,
+      resolve: bindings.exec_provider_resolution,
+      prepareFence: bindings.exec_provider_prepare_fence,
+    });
+  }
+}
 
 const MAX_BOOTSTRAP_BYTES = 1024 * 1024;
 
 // The instance's next due timer, kept as a stored fact rather than written
 // straight onto the object's single alarm — see `armAlarm`.
 const INSTANCE_DUE_KEY = "instance-next-due-unix-ms";
+const EXECUTOR_LIFETIME_DUE_KEY = "executor-lifetime-next-due-unix-ms";
+type LifetimeCommand = {
+  instance_id: string;
+  run_id: string;
+  selected: unknown;
+  envelope: unknown;
+  operation: { op: "ensure_fence"; fence_id: string };
+};
 
 // The DO schema (36 tables) as a bundled text module (wrangler.toml `rules`).
 import DO_SCHEMA from "../do_schema.sql";
+import NORM_SCHEMA from "../../../whipplescript-store/src/norm_schema.sql";
 import { selectAssistantText } from "./assistant-text";
 import { credentialIdForHostPolicy } from "./credential-class-ref";
 
@@ -577,6 +680,9 @@ function ensureSchema(sql: SqlStorage): void {
   if (hasTrackerEffect.length === 0) {
     sql.exec(`ALTER TABLE tracker_events ADD COLUMN effect_id TEXT`);
   }
+  // Its trigger references event_id: install only after upgrading tracker
+  // columns on older objects. The store owns this schema for both hosts.
+  sql.exec(NORM_SCHEMA);
   const hasRuleCarries = sql
     .exec(
       `SELECT name FROM pragma_table_info('instance_revisions') WHERE name = 'rule_carries_json'`,
@@ -675,17 +781,6 @@ function ensureSchema(sql: SqlStorage): void {
   )`);
 }
 
-// Row objects from `sql.exec` are column-name keyed; the Rust `DoSql` contract
-// wants each row as a positional array in SELECT order. Cloudflare preserves
-// column order in the returned objects, so `Object.values` reconstructs it.
-function rowsToPositionalJson(cursor: Iterable<Record<string, unknown>>): string {
-  const rows: unknown[][] = [];
-  for (const row of cursor) {
-    rows.push(Object.values(row));
-  }
-  return JSON.stringify(rows);
-}
-
 // `state.storage.sql` as the `DoSqlBridge` the wasm core imports. Params arrive as
 // a JSON array of `null | number | string` (the marshalled `SqlValue`s).
 /**
@@ -694,7 +789,7 @@ function rowsToPositionalJson(cursor: Iterable<Record<string, unknown>>): string
  * the method still exists and does nothing, so the WASM binding never has to
  * probe for it.
  */
-function makeBridge(
+export function makeBridge(
   storage: DurableObjectStorage,
   onActivity?: (kind: string, detail?: string) => void,
 ) {
@@ -714,7 +809,9 @@ function makeBridge(
     query(query: string, paramsJson: string): string {
       const params = JSON.parse(paramsJson) as unknown[];
       const cursor = sql.exec(query, ...params);
-      return rowsToPositionalJson(cursor);
+      // Rust's DoSql rows are positional. Object rows collapse duplicate
+      // column names and reorder numeric names; raw() preserves SELECT order.
+      return JSON.stringify([...cursor.raw()]);
     },
   };
 }
@@ -736,6 +833,7 @@ export type PublicTurnActivity =
 
 type StepOutcome =
   | { kind: "needs_http"; request: { url: string; headers: [string, string][]; body: unknown } }
+  | { kind: "needs_executor"; request: { url: string; headers: [string, string][]; body: unknown } }
   | { kind: "terminal" }
   | { kind: "parked"; next_due_unix_ms: number | null }
   | { kind: "failed"; message: string };
@@ -1185,6 +1283,7 @@ function isMediaType(value: unknown): value is string {
 }
 
 export class WorkflowInstance implements DurableObject {
+  private executorLifetimeRun?: Promise<void>;
   private readonly turnStreams = new Map<
     string,
     Set<ReadableStreamDefaultController<Uint8Array>>
@@ -1334,6 +1433,51 @@ export class WorkflowInstance implements DurableObject {
     if (request.method !== "POST") {
       return Response.json({ error: "method not allowed" }, { status: 405 });
     }
+    if (url.pathname === "/host/norm/commands" || url.pathname === "/host/norm/provision" || url.pathname === "/host/norm/publications" || url.pathname === "/host/norm/enqueues" || url.pathname === "/host/norm/impacts") {
+      const trust = this.env.WHIP_NORM_TRUST;
+      if (!trust) {
+        return Response.json({ error: "norm trust configuration is unavailable" }, { status: 503 });
+      }
+      const early = requestBodyTooLarge(request);
+      if (early) return early;
+      const body = await request.text();
+      if (new TextEncoder().encode(body).length > MAX_BOOTSTRAP_BYTES) {
+        return Response.json({ error: "request body too large" }, { status: 413 });
+      }
+      ensureSchema(this.ctx.storage.sql);
+      try {
+        if (url.pathname === "/host/norm/impacts") {
+          const { WHIP_NORM_PLANNING: planning, WHIP_NORM_RUNTIME: runtime,
+            WHIP_NORM_IMAGE_BINDING: image_binding, WHIP_NORM_DEPLOYMENT_IMAGE: deployed_image } = this.env;
+          if (!planning?.trim() || !runtime?.trim() || !image_binding?.trim() || !deployed_image?.trim()) {
+            return Response.json({ error: "norm planning installation is unavailable" }, { status: 503 });
+          }
+          const deployment = JSON.stringify({ planning, runtime, image_binding, deployed_image,
+            time_basis: `hosted-impact/${Date.now()}/${crypto.randomUUID()}` });
+          return new Response(hostFunctions.host_norm_impact(makeBridge(this.ctx.storage), trust, body, deployment),
+            { headers: { "content-type": "application/json" } });
+        }
+        if (url.pathname === "/host/norm/enqueues") {
+          const endpoint = this.env.WHIP_EXECUTOR_URL;
+          const epoch = this.env.WHIP_COMPUTE_ENV_HASH;
+          if (!endpoint?.trim() || (!epoch?.trim() && !this.env.WHIP_NORM_RUNTIME)) {
+            return Response.json({ error: "norm executor configuration is unavailable" }, { status: 503 });
+          }
+          const result = hostFunctions.host_norm_enqueue(makeBridge(this.ctx.storage), trust, body, endpoint, epoch ?? "do-v0", this.env.WHIP_NORM_RUNTIME);
+          return new Response(result, { headers: { "content-type": "application/json" } });
+        }
+        const result = url.pathname === "/host/norm/provision"
+          ? hostFunctions.host_norm_provision(
+            makeBridge(this.ctx.storage), this.ctx.id.toString(), trust, body,
+          )
+          : url.pathname === "/host/norm/publications"
+            ? hostFunctions.host_norm_publication(makeBridge(this.ctx.storage), trust, body)
+            : hostFunctions.host_norm_command(makeBridge(this.ctx.storage), trust, body);
+        return new Response(result, { headers: { "content-type": "application/json" } });
+      } catch (error) {
+        return Response.json({ error: String(error) }, { status: 400 });
+      }
+    }
     const parsed = await readJsonBody(request);
     if (parsed instanceof Response) {
       return parsed;
@@ -1358,6 +1502,8 @@ export class WorkflowInstance implements DurableObject {
             "gaugedesk-control-plane",
           ),
         );
+        await this.scheduleExecutorLifetimes();
+        await this.armAlarm();
         return Response.json(receipt, { status: 202 });
       } catch (error) {
         return Response.json({ error: `cancellation rejected: ${String(error)}` }, { status: 400 });
@@ -2448,6 +2594,8 @@ export class WorkflowInstance implements DurableObject {
             "public-audience",
           ),
         );
+        await this.scheduleExecutorLifetimes();
+        await this.armAlarm();
         this.appendPublicEvent({
           type: "turn_stop_requested",
           request_id: requestId,
@@ -3307,9 +3455,83 @@ export class WorkflowInstance implements DurableObject {
    * Only a session that never ran a turn kept its alarm and expired correctly,
    * which is exactly the shape the symptom took in production.
    *
-   * So the two deadlines are now folded here, and the drive loop records its
+   * These deadlines are folded through `armAlarm` below, and the drive loop records its
    * due time as a fact rather than by writing the shared alarm directly.
    */
+  private hasRuntimeJournal(): boolean {
+    return this.ctx.storage.sql.exec(
+      "SELECT 1 FROM sqlite_master WHERE type='table' AND name='events'",
+    ).toArray().length > 0;
+  }
+
+  private lifetimeCommands(): LifetimeCommand[] {
+    if (!this.hasRuntimeJournal()) return [];
+    ensureSchema(this.ctx.storage.sql);
+    return JSON.parse(bindings.exec_lifetime_commands(makeBridge(this.ctx.storage)));
+  }
+
+  private hasExecutorLifetimeWork(): boolean {
+    const commands = this.lifetimeCommands();
+    return commands.length > 0 || (this.hasRuntimeJournal() &&
+      bindings.exec_lifetime_has_settlement_work(makeBridge(this.ctx.storage)));
+  }
+
+  private settleExecutorOutcomes(): void {
+    try {
+      bindings.exec_lifetime_settle(makeBridge(this.ctx.storage));
+    } catch {
+      console.log(JSON.stringify({ event: "executor_settlement_retry" }));
+    }
+  }
+
+  private async scheduleExecutorLifetimes(advance = false): Promise<void> {
+    if (!this.hasExecutorLifetimeWork()) {
+      await this.ctx.storage.delete(EXECUTOR_LIFETIME_DUE_KEY);
+    } else if (advance || await this.ctx.storage.get(EXECUTOR_LIFETIME_DUE_KEY) == null) {
+      await this.ctx.storage.put(EXECUTOR_LIFETIME_DUE_KEY, Date.now() + 1_000);
+    }
+  }
+
+  private async reconcileExecutorLifetimes(): Promise<void> {
+    if (this.executorLifetimeRun) return this.executorLifetimeRun;
+    this.executorLifetimeRun = (async () => {
+      if (!this.hasExecutorLifetimeWork()) {
+        await this.ctx.storage.delete(EXECUTOR_LIFETIME_DUE_KEY);
+        return;
+      }
+      // Arm before transport: a lost response must leave a durable retry.
+      await this.scheduleExecutorLifetimes(true);
+      await this.armAlarm();
+      this.settleExecutorOutcomes();
+      for (const command of this.lifetimeCommands()) {
+        const abort = new AbortController();
+        const timeout = setTimeout(() => abort.abort(), 10_000);
+        try {
+          const broker = this.env.WORKSPACE_BROKER;
+          if (!broker) throw new Error("executor broker unavailable");
+          const response = await broker.get(broker.idFromName("workspace")).fetch(
+            "https://workspace.internal/exec/reconcile",
+            { method: "POST", signal: abort.signal, headers: { "content-type": "application/json" },
+              body: JSON.stringify({ selected: command.selected, envelope: command.envelope, operation: command.operation }) },
+          );
+          const body = await readJsonCapped(response, MAX_FETCH_RESPONSE_BYTES);
+          if (response.status === 200) {
+            bindings.exec_lifetime_observe(makeBridge(this.ctx.storage), command.instance_id, command.run_id, JSON.stringify(body));
+          }
+        } catch {
+          console.log(JSON.stringify({ event: "executor_lifetime_retry", run_id: command.run_id }));
+        } finally {
+          clearTimeout(timeout);
+        }
+      }
+      this.settleExecutorOutcomes();
+      await this.scheduleExecutorLifetimes(true);
+      await this.armAlarm();
+    })();
+    try { await this.executorLifetimeRun; }
+    finally { this.executorLifetimeRun = undefined; }
+  }
+
   private async armAlarm(session?: PublicSessionState): Promise<void> {
     const deadlines: number[] = [];
     const live =
@@ -3324,6 +3546,8 @@ export class WorkflowInstance implements DurableObject {
     }
     const due = await this.ctx.storage.get<number>(INSTANCE_DUE_KEY);
     if (due != null) deadlines.push(due);
+    const lifetimeDue = await this.ctx.storage.get<number>(EXECUTOR_LIFETIME_DUE_KEY);
+    if (lifetimeDue != null) deadlines.push(lifetimeDue);
     if (deadlines.length === 0) {
       console.log(
         JSON.stringify({ event: "arm_alarm", armed: null, session: Boolean(live) }),
@@ -4691,6 +4915,7 @@ export class WorkflowInstance implements DurableObject {
   // fires the timers, the rule pass sees the facts, and the run continues.
   async alarm(): Promise<void> {
     try {
+      await this.reconcileExecutorLifetimes();
       await this.sessionRetentionAlarm();
     } catch (error) {
       if (
@@ -4712,10 +4937,9 @@ export class WorkflowInstance implements DurableObject {
         }),
       );
       const due = await this.ctx.storage.get<number>(INSTANCE_DUE_KEY);
+      const lifetimeDue = await this.ctx.storage.get<number>(EXECUTOR_LIFETIME_DUE_KEY);
       const retryAt = Date.now() + 60 * 60 * 1000;
-      await this.ctx.storage.setAlarm(
-        due != null ? Math.min(due, retryAt) : retryAt,
-      );
+      await this.ctx.storage.setAlarm(Math.max(Date.now() + 1_000, Math.min(due ?? retryAt, lifetimeDue ?? retryAt, retryAt)));
     }
     const bootstrap = await this.ctx.storage.get<Bootstrap>("bootstrap");
     if (bootstrap) {
@@ -4739,6 +4963,15 @@ export class WorkflowInstance implements DurableObject {
         // declared collection is still pending, so an undeliverable artifact is
         // never erased by the path that failed to deliver it. The alarm is
         // rescheduled and the session stays recoverable.
+        if (this.hasRuntimeJournal()) {
+          await this.schedulePublicSessionExpiry(publicSession);
+          bindings.exec_lifetime_retire(makeBridge(this.ctx.storage));
+          await this.scheduleExecutorLifetimes();
+          if (this.hasExecutorLifetimeWork()) {
+            await this.armAlarm(publicSession);
+            return;
+          }
+        }
         const torn = this.admitLifecycle({ kind: "tearDown" });
         if (!torn) {
           await this.schedulePublicSessionExpiry(publicSession);
@@ -4789,6 +5022,7 @@ export class WorkflowInstance implements DurableObject {
       ? JSON.stringify({
           base_url: this.env.WHIP_EXECUTOR_URL,
           environment_epoch: this.env.WHIP_COMPUTE_ENV_HASH,
+          norm_runtime: this.env.WHIP_NORM_RUNTIME,
           env: {
             ...(this.env.ANTHROPIC_API_KEY ? { ANTHROPIC_API_KEY: this.env.ANTHROPIC_API_KEY } : {}),
             ...(this.env.OPENAI_API_KEY ? { OPENAI_API_KEY: this.env.OPENAI_API_KEY } : {}),
@@ -4980,6 +5214,16 @@ export class WorkflowInstance implements DurableObject {
       if (id && !gatewayLogIds.includes(id)) gatewayLogIds.push(id);
     };
     for (;;) {
+      // Retirement must freeze the tracked set before it proves closure. An
+      // in-flight provider response can return after expiry; it may not cause
+      // a new step (and another external admission) behind the teardown check.
+      const phase = this.lifecycleState().phase;
+      if (phase === "expiring" || phase === "tornDown") {
+        await this.scheduleExecutorLifetimes();
+        await this.armAlarm();
+        return { status: instance.status(), outcome: "parked", timing,
+          ...(gatewayLogIds.length > 0 ? { gateway_log_ids: gatewayLogIds } : {}) };
+      }
       const stepStartedAt = performance.now();
       const outcome = JSON.parse(instance.step(responseJson, Date.now())) as StepOutcome;
       if (hostedInstanceId) await this.publishAppliedTurnCommands();
@@ -4987,6 +5231,34 @@ export class WorkflowInstance implements DurableObject {
         Math.round((performance.now() - stepStartedAt) * 10) / 10;
       step += 1;
       if (hostedInstanceId) this.broadcastHostProgress(hostedInstanceId);
+      await this.scheduleExecutorLifetimes();
+      if (outcome.kind === "needs_executor") {
+        const deadline = instance.effect_due_unix_ms();
+        if (deadline != null) {
+          const existing = await this.ctx.storage.get<number>(INSTANCE_DUE_KEY);
+          await this.ctx.storage.put(INSTANCE_DUE_KEY, Math.max(Date.now() + 1_000, Math.min(deadline, existing ?? deadline)));
+        }
+        await this.armAlarm();
+        try {
+          const broker = this.env.WORKSPACE_BROKER;
+          if (!broker) throw new Error("executor invocation broker is not configured");
+          responseJson = await performExecutorHandoff(
+            outcome.request,
+            (url, init) => {
+              const priority = (outcome.request.body as { envelope?: { dispatch?: { priority?: unknown } } })?.envelope?.dispatch?.priority;
+              const headers = new Headers(init.headers);
+              headers.set(PRIORITY_HEADER, typeof priority === "string" ? priority : "production");
+              return broker.get(broker.idFromName("workspace")).fetch(url, { ...init, headers });
+            },
+            (response) => readJsonCapped(response, MAX_FETCH_RESPONSE_BYTES),
+          );
+        } catch {
+          // Delivery loss is not a terminal execution result. The core retains
+          // the invocation and schedules reconciliation with the same broker.
+          responseJson = JSON.stringify({ error: "executor invocation transport unavailable" });
+        }
+        continue;
+      }
       if (outcome.kind === "needs_http") {
         mark("model_round_start");
         let streaming = false;
@@ -5125,6 +5397,8 @@ export class WorkflowInstance implements DurableObject {
         // depth atop the kernel dep guard that keeps reported dues fireable.
         const at = Math.max(outcome.next_due_unix_ms, Date.now() + 1);
         await this.ctx.storage.put(INSTANCE_DUE_KEY, at);
+      } else if (outcome.kind === "failed" && instance.effect_due_unix_ms() != null) {
+        await this.ctx.storage.put(INSTANCE_DUE_KEY, Math.max(instance.effect_due_unix_ms()!, Date.now() + 1_000));
       } else {
         // Parked with nothing due, or terminal: drop this instance's due so a
         // settled or now-unblocked instance is not woken into a pointless
@@ -5227,6 +5501,11 @@ export default {
       const legacy =
         url.pathname === "/start" ||
         url.pathname === "/host/policy" ||
+        url.pathname === "/host/norm/commands" ||
+        url.pathname === "/host/norm/provision" ||
+        url.pathname === "/host/norm/publications" ||
+        url.pathname === "/host/norm/enqueues" ||
+        url.pathname === "/host/norm/impacts" ||
         url.pathname === "/host/instances/open" ||
         url.pathname === "/host/turns" ||
         url.pathname === "/host/forks/import" ||

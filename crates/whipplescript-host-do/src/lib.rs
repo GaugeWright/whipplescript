@@ -48,6 +48,10 @@ pub mod do_tools;
 pub mod do_wasm;
 pub mod do_worker;
 pub mod do_workstreams;
+#[cfg(test)]
+mod exec_reconciliation_tests;
+#[cfg(test)]
+mod exec_settlement_retention_tests;
 /// GaugeDesk-compatible governance verification for hosted placements.
 pub mod governance;
 #[cfg(any(target_arch = "wasm32", test))]
@@ -55,6 +59,12 @@ mod host_discard;
 /// Placement-neutral projection of one governed hosted turn into the public
 /// host protocol's body-free pointers and terminal receipt.
 pub mod host_projection;
+pub mod norm_commands;
+pub mod norm_runtime;
+#[cfg(test)]
+mod rule_commit_recovery_tests;
+#[cfg(test)]
+mod run_reattach_tests;
 
 #[cfg(test)]
 mod governed_host_tests {
@@ -915,3 +925,9 @@ mod tests {
         assert_eq!(secrets.get("MISSING"), None);
     }
 }
+
+#[cfg(test)]
+mod norm_publication_tests;
+
+#[cfg(test)]
+mod native_exec_owner_tests;

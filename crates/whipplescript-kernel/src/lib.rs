@@ -10,7 +10,17 @@ pub mod context_assembly;
 pub mod effect_config;
 pub mod effect_handlers;
 pub mod effect_reconciliation;
+pub mod exec_barrier;
+pub mod exec_controller;
+pub mod exec_handoff;
 pub mod exec_http;
+pub mod exec_incarnation;
+pub mod exec_invocation;
+pub mod exec_lifetime;
+pub mod exec_outcome_settlement;
+pub mod exec_placement;
+pub mod exec_reconciliation;
+pub mod exec_resolution;
 pub mod file_lease;
 mod file_settlement;
 pub mod gov;
@@ -29,6 +39,19 @@ pub mod lowering;
 pub mod mcp;
 pub mod media;
 pub mod native_lifecycle;
+pub mod norm_custody;
+pub mod norm_discovery;
+pub mod norm_execution;
+pub mod norm_execution_policy;
+pub mod norm_governance;
+pub mod norm_impact;
+pub mod norm_planning;
+pub mod norm_projection;
+pub mod norm_public_key;
+pub mod norm_publication;
+pub mod norm_runner;
+pub mod norm_runtime;
+pub mod norm_runtime_image;
 pub mod package_registry;
 pub mod principal;
 pub mod provider;
@@ -193,6 +216,30 @@ pub struct CoerceExecution<'a> {
 struct ProviderEvidence {
     evidence_id: Option<String>,
     artifact_ids: Vec<String>,
+}
+
+/// Stable initial identities, with a separate namespace for each durable admission.
+pub fn execution_attempt_key(
+    instance: &str,
+    effect: &str,
+    admission: Option<&str>,
+    purpose: &str,
+) -> String {
+    match admission {
+        None => idempotency_key(&[instance, effect, purpose]),
+        Some(event) => idempotency_key(&[instance, effect, purpose, "admission", event]),
+    }
+}
+
+/// Settlement belongs to the original run, including replies received after retry.
+/// Preserve initial-attempt journal keys for historical redelivery.
+pub fn execution_run_key(instance: &str, effect: &str, run: &str, suffix: &[&str]) -> String {
+    let mut parts = vec![instance, effect];
+    parts.extend_from_slice(suffix);
+    if run != execution_attempt_key(instance, effect, None, "exec-run") {
+        parts.extend_from_slice(&["run", run]);
+    }
+    idempotency_key(&parts)
 }
 
 pub fn idempotency_key(parts: &[&str]) -> String {
@@ -1424,8 +1471,31 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
     }
 
     pub fn start_run(&mut self, run: RunStart<'_>) -> StoreResult<StoredEvent> {
+        self.start_run_selected(run, None)
+    }
+
+    /// The branch's admission-selected start. It takes the SAME unverified-
+    /// dispatch refusal and run-start recording as every other entry point:
+    /// naming an admission selects which attempt is expected, it does not
+    /// exempt the run from verification.
+    pub fn start_run_for_admission(
+        &mut self,
+        run: RunStart<'_>,
+        admission: Option<&str>,
+    ) -> StoreResult<StoredEvent> {
+        self.start_run_selected(run, Some(admission))
+    }
+
+    fn start_run_selected(
+        &mut self,
+        run: RunStart<'_>,
+        selection: Option<Option<&str>>,
+    ) -> StoreResult<StoredEvent> {
         self.refuse_unverified_action_dispatch(run)?;
-        let result = self.store.start_run(run);
+        let result = match selection {
+            None => self.store.start_run(run),
+            Some(admission) => self.store.start_run_for_admission(run, admission),
+        };
         self.record_run_start(run, result)
     }
 
@@ -1530,6 +1600,40 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
             effect_id: effect_id.to_owned(),
             status: Some("blocked_by_admission".to_owned()),
             reason: format!("{category}: {detail}"),
+        });
+        Ok(event)
+    }
+
+    /// Commit exec projections with their terminal receipt before emitting trace.
+    pub fn complete_exec_settlement(
+        &mut self,
+        completion: EffectCompletion<'_>,
+        facts: &[whipplescript_store::SettlementFact<'_>],
+        cache: Option<whipplescript_store::SettlementCache<'_>>,
+    ) -> StoreResult<StoredEvent> {
+        let status = match completion.status {
+            "completed" => EffectStatus::Completed,
+            "failed" => EffectStatus::Failed,
+            "cancelled" => EffectStatus::Cancelled,
+            "timed_out" => EffectStatus::TimedOut,
+            _ => {
+                return Err(StoreError::Conflict(
+                    "unsupported exec settlement status".into(),
+                ))
+            }
+        };
+        let diagnostic = if completion.status == "failed" {
+            self.terminal_diagnostic_from_completion(&completion, EffectStatus::Failed)
+        } else {
+            None
+        };
+        let event = self
+            .store
+            .complete_effect_settlement(completion, diagnostic, facts, cache)?;
+        self.emit(TraceEvent::EffectTerminal {
+            run_id: completion.run_id.to_owned(),
+            effect_id: completion.effect_id.to_owned(),
+            status,
         });
         Ok(event)
     }
@@ -1854,7 +1958,26 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
 
     pub fn retry_effect(&mut self, retry: RetryEffect<'_>) -> StoreResult<StoredEvent> {
         let effect_id = retry.effect_id.to_owned();
+        exec_lifetime::prepare_retry(&mut self.store, retry.instance_id, retry.effect_id)?;
         let event = self.store.retry_effect(retry)?;
+        self.emit(TraceEvent::EffectRetried { effect_id });
+        Ok(event)
+    }
+    pub fn retry_effect_at_terminal(
+        &mut self,
+        retry: RetryEffect<'_>,
+        terminal: &str,
+    ) -> StoreResult<StoredEvent> {
+        let effect_id = retry.effect_id.to_owned();
+        if self
+            .store
+            .effect_terminal_event(retry.instance_id, retry.effect_id)?
+            .as_deref()
+            == Some(terminal)
+        {
+            exec_lifetime::prepare_retry(&mut self.store, retry.instance_id, retry.effect_id)?;
+        }
+        let event = self.store.retry_effect_at_terminal(retry, terminal)?;
         self.emit(TraceEvent::EffectRetried { effect_id });
         Ok(event)
     }
@@ -2462,9 +2585,14 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
         &mut self,
         instance_id: &str,
     ) -> StoreResult<Vec<StoredEvent>> {
+        // A retained exec outcome is stronger evidence than the generic
+        // provider fallback. Settle it before snapshotting unresolved runs;
+        // an invalid receipt must propagate refusal, never become uncertain.
+        let mut recovered = exec_outcome_settlement::settle_instance(self, instance_id)?;
+        let tracked_exec = exec_lifetime::tracked(&self.store, instance_id)?;
         let runs = self.store.list_runs(instance_id)?;
         let effects = self.store.list_effects(instance_id)?;
-        let mut recovered = Vec::new();
+
         for run in runs.into_iter().filter(|run| run.status == "running") {
             let Some(effect) = effects
                 .iter()
@@ -2488,6 +2616,21 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
             if let Some(event) = self.recover_provider_terminal_from_evidence(execution)? {
                 recovered.push(event);
             } else {
+                // Missing exec output says nothing about process lifetime. Keep
+                // this attempt available to executor reconciliation; a generic
+                // uncertain terminal would incorrectly make retry eligible.
+                if effect.kind == "exec.command" || run.provider == "exec" {
+                    if tracked_exec.contains_key(&run.run_id) {
+                        self.store.ensure_exec_fence(
+                            whipplescript_store::exec_lifetime::Fence {
+                                instance_id,
+                                run_id: &run.run_id,
+                                reason: whipplescript_store::exec_lifetime::FenceReason::Recovery,
+                            },
+                        )?;
+                    }
+                    continue;
+                }
                 // No recoverable terminal evidence and no idempotent provider
                 // re-query: resolve the started-without-terminal run to a single
                 // `uncertain` terminal (a Failed subkind) rather than leaving it
@@ -7888,19 +8031,8 @@ rule wait
         // while a cancellation request is open, so a delegated turn with a
         // pre-start request never invokes the provider — the same pre-launch
         // protection the owned harness has.
-        let (mut kernel, instance_id) = start_running_agent_turn_without_evidence();
-        kernel
-            .store_mut()
-            .request_effect_cancellation(EffectCancellationRequest {
-                instance_id: &instance_id,
-                effect_id: "tell",
-                revision_id: None,
-                reason: Some("pre-start cancellation"),
-                requested_by: "test",
-                causation_event_id: None,
-                idempotency_key: Some("test-pre-start-cancel"),
-            })
-            .expect("cancellation request records");
+        // Persist the exact start below: identity must not mask cancellation.
+        let (mut kernel, instance_id) = kernel_with_queued_agent_tell();
         let execution = AgentTurnExecution {
             instance_id: &instance_id,
             effect_id: "tell",
@@ -7966,6 +8098,42 @@ rule wait
             credential_ref: None,
             provider_options: std::collections::BTreeMap::new(),
         };
+
+        // A crash may leave a durable start before the adapter launches. Reuse
+        // that exact identity and metadata so only cancellation prevents launch.
+        let metadata = json!({
+            "native_provider": request.to_json_redacted(),
+            "adapter_provider_id": adapter.provider_id(),
+            "adapter_capability": {
+                "provider_kind": adapter.capability().provider_kind.as_str(),
+                "surface": adapter.capability().surface.as_str(),
+            },
+        })
+        .to_string();
+        kernel
+            .start_run(RunStart {
+                instance_id: &instance_id,
+                effect_id: execution.effect_id,
+                run_id: execution.run_id,
+                provider: execution.provider,
+                worker_id: execution.worker_id,
+                lease_id: execution.lease_id,
+                lease_expires_at: execution.lease_expires_at,
+                metadata_json: &metadata,
+            })
+            .expect("persist start before provider launch");
+        kernel
+            .store_mut()
+            .request_effect_cancellation(EffectCancellationRequest {
+                instance_id: &instance_id,
+                effect_id: "tell",
+                revision_id: None,
+                reason: Some("pre-start cancellation"),
+                requested_by: "test",
+                causation_event_id: None,
+                idempotency_key: Some("test-pre-start-cancel"),
+            })
+            .expect("cancellation request records");
 
         // The store-level guard fires before any provider work; the
         // NeverLaunchAdapter proves start_turn/next_event were never reached.

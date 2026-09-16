@@ -19,6 +19,7 @@ repository.workspace = true
 readme.workspace = true
 
 [dependencies]
+whipplescript-core = { version = "0.5.6", path = "../whipplescript-core" }
 # The sans-IO core, built WITHOUT the native (rusqlite) backend — the DO supplies
 # its own storage. `sansio` (HostDriver / IoRequest / HttpRequest) lives here.
 whipplescript-kernel = { version = "0.5.6", path = "../whipplescript-kernel", default-features = false }
@@ -41,6 +42,7 @@ rusqlite = { version = "0.40.1", features = ["bundled"], optional = true }
 test-support = ["dep:rusqlite"]
 
 [dev-dependencies]
+whipplescript-store = { version = "0.5.6", path = "../whipplescript-store", features = ["native"] }
 # Backs the DoSql interface with real SQLite in tests, so the ported DO-store SQL
 # is verified against an actual SQL engine (native-only test dependency).
 rusqlite = { version = "0.40.1", features = ["bundled"] }

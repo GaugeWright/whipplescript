@@ -1,0 +1,91 @@
+--- Slot identifies ledger, instance, effect and terminal run. Envelope is
+--- complete signed bytes. Verification, backend atomicity and journal integrity
+--- are premises; there is no transaction across the runtime and ledger.
+mod NORM-PUBLICATION-OUTBOX is
+ sorts Slot Principal Report Envelope Fact Cfg State .
+ ops first second : -> Slot [ctor] .
+ ops publisher otherPublisher : -> Principal [ctor] .
+ ops pass failure otherReport : -> Report [ctor] .
+ ops signed otherSigned : -> Envelope [ctor] .
+ subsort Fact < Cfg . op none : -> Cfg [ctor] .
+ op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+ op {_} : Cfg -> State [ctor] .
+ ops empty unused : Slot -> Fact [ctor] .
+ ops preflight verified prepare retained submit recorded acknowledged admissible : Slot Principal Report Envelope -> Fact [ctor] .
+ var S : Slot . var P : Principal . var R : Report . var E : Envelope . var C : Cfg .
+ eq acknowledged(S,P,R,E) acknowledged(S,P,R,E) = acknowledged(S,P,R,E) .
+ rl [persist] : { empty(S) preflight(S,P,R,E) verified(S,P,R,E) prepare(S,P,R,E) C }
+ => { retained(S,P,R,E) verified(S,P,R,E) C } .
+ rl [append] : { retained(S,P,R,E) submit(S,P,R,E) unused(S) admissible(S,P,R,E) C }
+ => { retained(S,P,R,E) recorded(S,P,R,E) admissible(S,P,R,E) C } .
+ rl [acknowledge-or-recover] : { retained(S,P,R,E) recorded(S,P,R,E) C }
+ => { retained(S,P,R,E) recorded(S,P,R,E) acknowledged(S,P,R,E) C } .
+endm
+mod NORM-PUBLICATION-OUTBOX-WEAK-DURABILITY is
+ including NORM-PUBLICATION-OUTBOX . var C : Cfg .
+ rl [weaken] : { submit(first,publisher,pass,signed) unused(first) admissible(first,publisher,pass,signed) C } => { recorded(first,publisher,pass,signed) C } .
+endm
+mod NORM-PUBLICATION-OUTBOX-WEAK-RECEIPT is
+ including NORM-PUBLICATION-OUTBOX . var C : Cfg .
+ rl [weaken] : { retained(first,publisher,pass,signed) C } => { acknowledged(first,publisher,pass,signed) C } .
+endm
+mod NORM-PUBLICATION-OUTBOX-WEAK-ENVELOPE is
+ including NORM-PUBLICATION-OUTBOX . var C : Cfg .
+ rl [weaken] : { retained(first,publisher,pass,signed) recorded(first,publisher,pass,otherSigned) C } => { acknowledged(first,publisher,pass,signed) C } .
+endm
+mod NORM-PUBLICATION-OUTBOX-WEAK-REPORT is
+ including NORM-PUBLICATION-OUTBOX . var C : Cfg .
+ rl [weaken] : { retained(first,publisher,pass,signed) recorded(first,publisher,otherReport,signed) C } => { acknowledged(first,publisher,pass,signed) C } .
+endm
+mod NORM-PUBLICATION-OUTBOX-WEAK-PRINCIPAL is
+ including NORM-PUBLICATION-OUTBOX . var C : Cfg .
+ rl [weaken] : { retained(first,publisher,pass,signed) recorded(first,otherPublisher,pass,signed) C } => { acknowledged(first,publisher,pass,signed) C } .
+endm
+mod NORM-PUBLICATION-OUTBOX-WEAK-OVERWRITE is
+ including NORM-PUBLICATION-OUTBOX . var C : Cfg .
+ rl [weaken] : { retained(first,publisher,pass,signed) verified(first,publisher,otherReport,otherSigned) prepare(first,publisher,otherReport,otherSigned) C } => { retained(first,publisher,otherReport,otherSigned) C } .
+endm
+mod NORM-PUBLICATION-OUTBOX-WEAK-ADMISSION is
+ including NORM-PUBLICATION-OUTBOX . var C : Cfg .
+ rl [weaken] : { retained(first,publisher,pass,signed) submit(first,publisher,pass,signed) unused(first) C } => { recorded(first,publisher,pass,signed) C } .
+endm
+mod NORM-PUBLICATION-OUTBOX-WEAK-CONCURRENT is
+ including NORM-PUBLICATION-OUTBOX .
+ var S : Slot . var P : Principal . var R : Report . var E : Envelope . var C : Cfg .
+ rl [weaken-slot-consumption] : { empty(S) preflight(S,P,R,E) verified(S,P,R,E) prepare(S,P,R,E) C }
+ => { empty(S) retained(S,P,R,E) verified(S,P,R,E) C } .
+endm
+
+--- The host independently recovers (slot, publisher, report). Authentication
+--- checks the submitted complete envelope; neither premise comes from its fields.
+mod NORM-PUBLICATION-REQUEST is
+ including NORM-PUBLICATION-OUTBOX .
+ op recovered : Slot Principal Report -> Fact [ctor] .
+ ops requested checked : Slot Principal Report Envelope -> Fact [ctor] .
+ op authenticated : Envelope -> Fact [ctor] .
+ var S : Slot . var P : Principal . var R : Report . var E : Envelope . var C : Cfg .
+ rl [bind-request] : { recovered(S,P,R) requested(S,P,R,E) authenticated(E) C }
+ => { recovered(S,P,R) checked(S,P,R,E) verified(S,P,R,E) prepare(S,P,R,E) C } .
+endm
+mod NORM-PUBLICATION-REQUEST-WEAK-REPORT is
+ including NORM-PUBLICATION-REQUEST . var C : Cfg .
+ rl [weaken] : { recovered(first,publisher,pass) requested(first,publisher,otherReport,signed) authenticated(signed) C }
+ => { checked(first,publisher,otherReport,signed) C } .
+endm
+mod NORM-PUBLICATION-REQUEST-WEAK-PRINCIPAL is
+ including NORM-PUBLICATION-REQUEST . var C : Cfg .
+ rl [weaken] : { recovered(first,publisher,pass) requested(first,otherPublisher,pass,signed) authenticated(signed) C }
+ => { checked(first,otherPublisher,pass,signed) C } .
+endm
+mod NORM-PUBLICATION-REQUEST-WEAK-SIGNATURE is
+ including NORM-PUBLICATION-REQUEST . var C : Cfg .
+ rl [weaken] : { recovered(first,publisher,pass) requested(first,publisher,pass,otherSigned) authenticated(signed) C }
+ => { checked(first,publisher,pass,otherSigned) C } .
+endm
+
+mod NORM-PUBLICATION-OUTBOX-WEAK-PREFLIGHT is
+ including NORM-PUBLICATION-OUTBOX .
+ var S : Slot . var P : Principal . var R : Report . var E : Envelope . var C : Cfg .
+ rl [weaken] : { empty(S) verified(S,P,R,E) prepare(S,P,R,E) C }
+ => { retained(S,P,R,E) verified(S,P,R,E) C } .
+endm

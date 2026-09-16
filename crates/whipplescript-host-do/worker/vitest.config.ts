@@ -11,8 +11,9 @@ export default defineConfig({
   test: {
     include: [
       "src/session.integration.test.ts",
-      "src/tracker-tutorial.integration.test.ts",
       "src/executor-broker.integration.test.ts",
+      "src/executor-controller.integration.test.ts",
+      "src/tracker-tutorial.integration.test.ts",
       "src/object-store.integration.test.ts",
     ],
     // Bounds a hang, not the machine's load. See `src/test-bounds.ts`.

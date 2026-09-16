@@ -1,0 +1,44 @@
+load ../effective-revision.maude
+search [1] in EFFECTIVE-REVISION :
+ { current(recordId,rev0,f0,activates) effective(recordId,rev0,f0,act0) edit(recordId,rev1,f1) }
+ =>* { current(recordId,rev1,f1,draft) effective(recordId,rev0,f0,act0) } .
+search [1] in EFFECTIVE-REVISION :
+ { current(recordId,rev0,f0,activates) effective(recordId,rev0,f0,act0) edit(recordId,rev1,f0) }
+ =>* { current(recordId,rev0,f0,activates) effective(recordId,rev0,f0,act0) } .
+search [1] in EFFECTIVE-REVISION :
+ { current(recordId,rev1,f1,draft) effective(recordId,rev0,f0,act0) transition(recordId,act1,activates,owner) rule(activates,owner) }
+ =>* { effective(recordId,rev1,f1,act1) history(recordId,rev0,f0,act0) C:Cfg } .
+search [1] in EFFECTIVE-REVISION :
+ { current(recordId,rev0,f0,activates) effective(recordId,rev0,f0,act0) transition(recordId,act1,retires,owner) rule(retires,owner) }
+ =>* { inactive(recordId) history(recordId,rev0,f0,act0) C:Cfg } .
+search [1] in EFFECTIVE-REVISION :
+ { current(recordId,rev1,f1,draft) effective(recordId,rev0,f0,act0) transition(recordId,act1,retires,worker) rule(retires,worker) }
+ =>* { current(recordId,rev1,f1,retires) effective(recordId,rev0,f0,act0) C:Cfg } .
+search in EFFECTIVE-REVISION :
+ { current(recordId,rev0,f0,activates) effective(recordId,rev0,f0,act0) edit(recordId,rev1,f1) }
+ =>* { inactive(recordId) C:Cfg } .
+search [1] in EFFECTIVE-REVISION-WEAK-DRAFT :
+ { current(recordId,rev0,f0,activates) effective(recordId,rev0,f0,act0) edit(recordId,rev1,f1) }
+ =>* { inactive(recordId) C:Cfg } .
+search in EFFECTIVE-REVISION :
+ { current(recordId,rev0,f0,activates) effective(recordId,rev0,f0,act0) edit(recordId,rev1,f1) }
+ =>* { effective(recordId,rev1,f1,act0) C:Cfg } .
+search [1] in EFFECTIVE-REVISION-WEAK-ACTIVATION :
+ { current(recordId,rev0,f0,activates) effective(recordId,rev0,f0,act0) edit(recordId,rev1,f1) }
+ =>* { effective(recordId,rev1,f1,act0) C:Cfg } .
+search in EFFECTIVE-REVISION :
+ { current(recordId,rev1,f1,draft) effective(recordId,rev0,f0,act0) transition(recordId,act1,retires,worker) rule(retires,worker) }
+ =>* { inactive(recordId) C:Cfg } .
+search [1] in EFFECTIVE-REVISION-WEAK-RETIRE :
+ { current(recordId,rev1,f1,draft) effective(recordId,rev0,f0,act0) transition(recordId,act1,retires,worker) rule(retires,worker) }
+ =>* { inactive(recordId) C:Cfg } .
+search in EFFECTIVE-REVISION :
+ { current(recordId,rev1,f1,draft) effective(recordId,rev0,f0,act0) transition(recordId,act1,activates,worker) rule(activates,owner) }
+ =>* { effective(recordId,rev1,f1,act1) C:Cfg } .
+search [1] in EFFECTIVE-REVISION-WEAK-AUTHORITY :
+ { current(recordId,rev1,f1,draft) effective(recordId,rev0,f0,act0) transition(recordId,act1,activates,worker) rule(activates,owner) }
+ =>* { effective(recordId,rev1,f1,act1) C:Cfg } .
+search [1] in EFFECTIVE-REVISION :
+ { current(recordId,rev0,f0,draft) inactive(recordId) transition(recordId,act0,activates,owner) rule(activates,owner) }
+ =>* { effective(recordId,rev0,f0,act0) C:Cfg } .
+quit

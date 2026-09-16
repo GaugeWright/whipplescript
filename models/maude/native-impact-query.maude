@@ -1,0 +1,14 @@
+mod NATIVE-IMPACT-QUERY is
+  sorts Match State .
+  ops verified missing callerChosen : -> Match [ctor] .
+  op query : Match Match Match -> State [ctor] .
+  ops readOnlyPlan mutatedPlan : -> State [ctor] .
+  rl [captured-query] : query(verified,verified,verified) => readOnlyPlan .
+endm
+mod NATIVE-IMPACT-QUERY-WEAK is
+  including NATIVE-IMPACT-QUERY .
+  rl [guess-policy] : query(missing,verified,verified) => readOnlyPlan .
+  rl [caller-source] : query(verified,callerChosen,verified) => readOnlyPlan .
+  rl [missing-installation] : query(verified,verified,missing) => readOnlyPlan .
+  rl [query-writes] : query(verified,verified,verified) => mutatedPlan .
+endm

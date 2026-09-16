@@ -1,0 +1,17 @@
+load ../exec-attempt-identity.maude
+search [1] in EXEC-ATTEMPT-IDENTITY : { eligible(original) dispatch(original) } =>* { running(original) sent(original) } .
+search [1] in EXEC-ATTEMPT-IDENTITY : { failed(original) retry(original, retryId) dispatch(retryId) } =>* { failed(original) running(retryId) sent(retryId) } .
+search [1] in EXEC-ATTEMPT-IDENTITY : { running(original) sent(original) dispatch(original) } =>* { running(original) sent(original) reattached(original) } .
+search [1] in EXEC-ATTEMPT-IDENTITY : { failed(original) sent(original) reply(original) running(retryId) } =>* { failed(original) late(original) running(retryId) } .
+search [1] in EXEC-ATTEMPT-IDENTITY : { eligible(original) dispatch(original) reply(original) } =>* { completed(original) } .
+search [1] in EXEC-ATTEMPT-IDENTITY : { dispatch(retryId) } =>* { running(retryId) C:Cfg } .
+search [1] in EXEC-ATTEMPT-IDENTITY-WEAK-ADMISSION : { dispatch(retryId) } =>* { running(retryId) C:Cfg } .
+search [1] in EXEC-ATTEMPT-IDENTITY : { failed(original) retry(original, original) dispatch(original) } =>* { failed(original) running(original) C:Cfg } .
+search [1] in EXEC-ATTEMPT-IDENTITY-WEAK-REUSE : { failed(original) retry(original, original) dispatch(original) } =>* { failed(original) running(original) C:Cfg } .
+search [1] in EXEC-ATTEMPT-IDENTITY : { eligible(retryId) dispatch(original) } =>* { running(original) C:Cfg } .
+search [1] in EXEC-ATTEMPT-IDENTITY-WEAK-STALE : { eligible(retryId) dispatch(original) } =>* { running(original) C:Cfg } .
+search [1] in EXEC-ATTEMPT-IDENTITY : { running(original) reply(original) } =>* { completed(original) C:Cfg } .
+search [1] in EXEC-ATTEMPT-IDENTITY-WEAK-PENDING : { running(original) reply(original) } =>* { completed(original) C:Cfg } .
+search [1] in EXEC-ATTEMPT-IDENTITY : { running(retryId) sent(original) reply(original) } =>* { completed(retryId) C:Cfg } .
+search [1] in EXEC-ATTEMPT-IDENTITY-WEAK-LATEST : { running(retryId) sent(original) reply(original) } =>* { completed(retryId) C:Cfg } .
+quit

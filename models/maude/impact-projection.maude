@@ -1,0 +1,22 @@
+mod IMPACT-PROJECTION is
+  sorts Evidence Gap Work State .
+  ops supported missing violated conflicted empty : -> Evidence [ctor] .
+  ops complete uncertain : -> Gap [ctor] .
+  ops keep check repair resolve verify none : -> Work [ctor] .
+  op input : Evidence Gap -> State [ctor] .
+  op output : Work Gap -> State [ctor] .
+  var G : Gap .
+  rl [support] : input(supported,complete) => output(keep,complete) .
+  rl [missing] : input(missing,complete) => output(check,complete) .
+  rl [verify-support] : input(supported,uncertain) => output(verify,uncertain) .
+  rl [verify-missing] : input(missing,uncertain) => output(verify,uncertain) .
+  rl [retain-failure] : input(violated,G) => output(repair,G) .
+  rl [retain-conflict] : input(conflicted,G) => output(resolve,G) .
+  rl [empty-inventory] : input(empty,G) => output(none,G) .
+endm
+mod IMPACT-PROJECTION-WEAK is
+  including IMPACT-PROJECTION .
+  rl [hide-gap] : input(supported,uncertain) => output(keep,complete) .
+  rl [erase-failure] : input(violated,uncertain) => output(verify,uncertain) .
+  rl [empty-hides-gap] : input(empty,uncertain) => output(none,complete) .
+endm

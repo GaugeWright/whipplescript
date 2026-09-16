@@ -39,5 +39,8 @@ native = ["dep:rusqlite"]
 # above is unchanged.
 rusqlite = { version = "0.40.1", features = ["blob", "bundled", "functions", "hooks"] }
 
+p256 = { version = "0.14", default-features = false, features = ["ecdsa"] }
+hex = "0.4"
+
 [lints]
 workspace = true

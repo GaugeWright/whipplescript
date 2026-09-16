@@ -1,0 +1,32 @@
+load ../norm-custody.maude
+search [1] in NORM-CUSTODY :
+ { binding(owner, v1) request(owner, v1) backend(v1) }
+ =>* { verified(owner, v1) RESIDUAL:Cfg } .
+search [1] in NORM-CUSTODY :
+ { binding(owner, v1) envelope(owner, v1, v1) backend(v2) }
+ =>* { verified(owner, v1) RESIDUAL:Cfg } .
+search [1] in NORM-CUSTODY :
+ { binding(owner, v2) request(owner, v2) backend(v2) }
+ =>* { verified(owner, v2) RESIDUAL:Cfg } .
+--- Signing races cannot emit an envelope pinned to the wrong signing key.
+search in NORM-CUSTODY :
+ { binding(owner, v1) request(owner, v1) backend(v2) }
+ =>* { envelope(owner, v1, v2) RESIDUAL:Cfg } .
+search [1] in NORM-CUSTODY-DISCARD-VERSION :
+ { binding(owner, v1) request(owner, v1) backend(v2) }
+ =>* { envelope(owner, v1, v2) RESIDUAL:Cfg } .
+--- Imported signatures require the pinned historical key too.
+search in NORM-CUSTODY :
+ { binding(owner, v1) envelope(owner, v1, v2) backend(v2) }
+ =>* { verified(owner, v1) RESIDUAL:Cfg } .
+search [1] in NORM-CUSTODY-VERIFY-LATEST :
+ { binding(owner, v1) envelope(owner, v1, v2) backend(v2) }
+ =>* { verified(owner, v1) RESIDUAL:Cfg } .
+--- Request labels cannot choose a different signing principal.
+search in NORM-CUSTODY :
+ { binding(owner, v1) request(worker, v1) backend(v1) }
+ =>* { envelope(worker, v1, v1) RESIDUAL:Cfg } .
+search [1] in NORM-CUSTODY-IMPERSONATE :
+ { binding(owner, v1) request(worker, v1) backend(v1) }
+ =>* { envelope(worker, v1, v1) RESIDUAL:Cfg } .
+quit .

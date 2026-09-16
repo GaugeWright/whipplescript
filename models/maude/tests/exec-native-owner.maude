@@ -1,0 +1,15 @@
+load ../exec-native-owner.maude
+search [1] in EXEC-NATIVE-OWNER : cfg(empty,open,absent,none) =>* cfg(allocated,open,absent,create) .
+search [1] in EXEC-NATIVE-OWNER : cfg(allocated,open,absent,create) =>* cfg(allocated,fenced,original,none) .
+search [1] in EXEC-NATIVE-OWNER : cfg(allocated,fenced,absent,none) =>* cfg(allocated,fenced,original,none) .
+search [1] in EXEC-NATIVE-OWNER : cfg(empty,fenced,absent,none) =>* cfg(allocated,fenced,absent,create) .
+search [1] in EXEC-NATIVE-OWNER-WEAK : cfg(empty,fenced,absent,none) =>* cfg(allocated,fenced,absent,create) .
+search [1] in EXEC-NATIVE-OWNER : cfg(allocated,open,absent,none) =>* cfg(allocated,open,absent,create) .
+search [1] in EXEC-NATIVE-OWNER-WEAK : cfg(allocated,open,absent,none) =>* cfg(allocated,open,absent,create) .
+search [1] in EXEC-NATIVE-OWNER : cfg(empty,open,absent,none) =>* cfg(empty,open,original,none) .
+search [1] in EXEC-NATIVE-OWNER-WEAK : cfg(empty,open,absent,none) =>* cfg(empty,open,original,none) .
+search [1] in EXEC-NATIVE-OWNER : cfg(allocated,open,original,none) =>* cfg(allocated,open,replacement,none) .
+search [1] in EXEC-NATIVE-OWNER-WEAK : cfg(allocated,open,original,none) =>* cfg(allocated,open,replacement,none) .
+search [1] in EXEC-NATIVE-OWNER : cfg(allocated,open,original,none) =>* cfg(allocated,open,original,execute) .
+search [1] in EXEC-NATIVE-OWNER-WEAK : cfg(allocated,open,original,none) =>* cfg(allocated,open,original,execute) .
+quit

@@ -1,0 +1,12 @@
+load ../exec-lifetime-tracking.maude
+search [1] in EXEC-LIFETIME-TRACKING : cfg(absent,prepared,unknown) =>* cfg(original,handed,unknown) .
+search [1] in EXEC-LIFETIME-TRACKING : cfg(absent,prepared,unknown) =>* cfg(original,retry,unknown) .
+search [1] in EXEC-LIFETIME-TRACKING : cfg(absent,prepared,unknown) =>* cfg(absent,handed,unknown) .
+search [1] in EXEC-LIFETIME-TRACKING-WEAK : cfg(absent,prepared,unknown) =>* cfg(absent,handed,unknown) .
+search [1] in EXEC-LIFETIME-TRACKING : cfg(absent,prepared,unknown) =>* cfg(absent,terminal,unknown) .
+search [1] in EXEC-LIFETIME-TRACKING-WEAK : cfg(absent,prepared,unknown) =>* cfg(absent,terminal,unknown) .
+search [1] in EXEC-LIFETIME-TRACKING : cfg(absent,prepared,unknown) =>* cfg(replaced,retry,unknown) .
+search [1] in EXEC-LIFETIME-TRACKING-WEAK : cfg(absent,prepared,unknown) =>* cfg(replaced,retry,unknown) .
+search [1] in EXEC-LIFETIME-TRACKING : cfg(absent,prepared,unknown) =>* cfg(original,prepared,ended) .
+search [1] in EXEC-LIFETIME-TRACKING-WEAK : cfg(absent,prepared,unknown) =>* cfg(original,prepared,ended) .
+quit

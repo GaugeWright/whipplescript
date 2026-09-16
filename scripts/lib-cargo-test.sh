@@ -13,7 +13,7 @@
 # The point is not that these particular filters are now right — it is that the
 # next crate split fails loudly instead of quietly widening the gate.
 
-# cargo_test_named <package> <filter> [extra cargo args...]
+# cargo_test_named <package> <filter> [extra cargo args...] [-- harness args...]
 #
 # Runs `cargo test -p <package> <filter>` after proving the filter selects at
 # least one test. Extra args (e.g. `--lib`, `--test control_plane`) are passed to
@@ -23,8 +23,22 @@ cargo_test_named() {
   local filter="$2"
   shift 2
 
+  # Cargo flags and libtest flags live on opposite sides of `--`. Keep the
+  # same harness selection (notably --ignored) in both listing and execution.
+  local -a cargo_args=() harness_args=()
+  local harness=false arg
+  for arg in "$@"; do
+    if [[ "$harness" == true ]]; then
+      harness_args+=("$arg")
+    elif [[ "$arg" == -- ]]; then
+      harness=true
+    else
+      cargo_args+=("$arg")
+    fi
+  done
+
   local matched
-  matched="$(cargo test -q -p "$package" "$@" "$filter" -- --list 2>/dev/null \
+  matched="$(cargo test -q -p "$package" "${cargo_args[@]}" "$filter" -- "${harness_args[@]}" --list 2>/dev/null \
     | grep -c ': test' || true)"
 
   if [[ "$matched" == "0" ]]; then
@@ -35,5 +49,5 @@ cargo_test_named() {
     return 1
   fi
 
-  cargo test -p "$package" "$@" "$filter"
+  cargo test -p "$package" "${cargo_args[@]}" "$filter" -- "${harness_args[@]}"
 }

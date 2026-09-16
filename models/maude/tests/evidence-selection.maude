@@ -1,0 +1,36 @@
+load ../evidence-selection.maude
+search [1] in EVIDENCE-SELECTION :
+ { target(old,old) evidence(old,old,old,negative) evidence(fresh,old,old,positive) applicable(old) applicable(fresh) visible(old) visible(fresh) visible(decision) resolve(decision,old,fresh,old,old) authorized(decision,old,old) ancestor(old,decision) ancestor(fresh,decision) } =>* { retired(old,decision) evidence(old,old,old,negative) applicable(fresh) C:Cfg } .
+search [1] in EVIDENCE-SELECTION :
+ { publish target(old,old) evidence(old,old,old,negative) evidence(fresh,old,old,positive) applicable(old) applicable(fresh) visible(old) visible(fresh) } =>* view(target(old,old) evidence(old,old,old,negative) evidence(fresh,old,old,positive) applicable(old) applicable(fresh) visible(old) visible(fresh)) .
+search in EVIDENCE-SELECTION :
+ { target(old,old) evidence(old,old,old,negative) evidence(fresh,old,old,positive) applicable(old) applicable(fresh) visible(old) visible(fresh) visible(decision) resolve(decision,old,fresh,old,old)  ancestor(old,decision) ancestor(fresh,decision) } =>* { retired(old,decision) C:Cfg } .
+search [1] in EVIDENCE-SELECTION-WEAK-AUTHORITY :
+ { target(old,old) evidence(old,old,old,negative) evidence(fresh,old,old,positive) applicable(old) applicable(fresh) visible(old) visible(fresh) visible(decision) resolve(decision,old,fresh,old,old)  ancestor(old,decision) ancestor(fresh,decision) } =>* { retired(old,decision) C:Cfg } .
+search in EVIDENCE-SELECTION :
+ { target(old,old) evidence(old,old,old,negative) evidence(fresh,old,old,positive) applicable(old) applicable(fresh) visible(old) visible(fresh) visible(decision) resolve(decision,old,fresh,old,old) authorized(decision,old,old)  ancestor(fresh,decision) } =>* { retired(old,decision) C:Cfg } .
+search [1] in EVIDENCE-SELECTION-WEAK-CAUSAL :
+ { target(old,old) evidence(old,old,old,negative) evidence(fresh,old,old,positive) applicable(old) applicable(fresh) visible(old) visible(fresh) visible(decision) resolve(decision,old,fresh,old,old) authorized(decision,old,old)  ancestor(fresh,decision) } =>* { retired(old,decision) C:Cfg } .
+search in EVIDENCE-SELECTION :
+ { target(old,old) evidence(old,old,old,negative) evidence(fresh,old,old,positive) applicable(old) applicable(fresh) visible(old) visible(fresh)  resolve(decision,old,fresh,old,old) authorized(decision,old,old) ancestor(old,decision) ancestor(fresh,decision) } =>* { retired(old,decision) C:Cfg } .
+search [1] in EVIDENCE-SELECTION-WEAK-FRONTIER :
+ { target(old,old) evidence(old,old,old,negative) evidence(fresh,old,old,positive) applicable(old) applicable(fresh) visible(old) visible(fresh)  resolve(decision,old,fresh,old,old) authorized(decision,old,old) ancestor(old,decision) ancestor(fresh,decision) } =>* { retired(old,decision) C:Cfg } .
+search in EVIDENCE-SELECTION :
+ { target(old,old) evidence(old,old,old,negative) evidence(fresh,old,old,positive) applicable(old) applicable(fresh) visible(old) visible(fresh) visible(decision) resolve(decision,old,fresh,old,old) authorized(decision,other,old) ancestor(old,decision) ancestor(fresh,decision) } =>* { retired(old,decision) C:Cfg } .
+search [1] in EVIDENCE-SELECTION-WEAK-SCOPE :
+ { target(old,old) evidence(old,old,old,negative) evidence(fresh,old,old,positive) applicable(old) applicable(fresh) visible(old) visible(fresh) visible(decision) resolve(decision,old,fresh,old,old) authorized(decision,other,old) ancestor(old,decision) ancestor(fresh,decision) } =>* { retired(old,decision) C:Cfg } .
+search in EVIDENCE-SELECTION :
+ { target(old,old) evidence(old,old,old,negative) evidence(fresh,old,old,positive) applicable(old) applicable(fresh) visible(old) visible(fresh) } =>* { retired(old,fresh) C:Cfg } .
+search [1] in EVIDENCE-SELECTION-WEAK-RETRY :
+ { target(old,old) evidence(old,old,old,negative) evidence(fresh,old,old,positive) applicable(old) applicable(fresh) visible(old) visible(fresh) } =>* { retired(old,fresh) C:Cfg } .
+search in EVIDENCE-SELECTION :
+ { target(old,old) evidence(old,old,old,negative) evidence(fresh,old,old,positive) applicable(old) applicable(fresh) visible(old) visible(fresh) visible(decision) resolve(decision,old,fresh,old,old) authorized(decision,old,old) ancestor(old,decision) ancestor(fresh,decision) } =>* { target(old,old)  evidence(fresh,old,old,positive)  applicable(fresh) visible(old) visible(fresh) visible(decision) resolve(decision,old,fresh,old,old) retired(old,decision) authorized(decision,old,old) ancestor(old,decision) ancestor(fresh,decision) } .
+search [1] in EVIDENCE-SELECTION-WEAK-HISTORY :
+ { target(old,old) evidence(old,old,old,negative) evidence(fresh,old,old,positive) applicable(old) applicable(fresh) visible(old) visible(fresh) visible(decision) resolve(decision,old,fresh,old,old) authorized(decision,old,old) ancestor(old,decision) ancestor(fresh,decision) } =>* { target(old,old)  evidence(fresh,old,old,positive)  applicable(fresh) visible(old) visible(fresh) visible(decision) resolve(decision,old,fresh,old,old) retired(old,decision) authorized(decision,old,old) ancestor(old,decision) ancestor(fresh,decision) } .
+search in EVIDENCE-SELECTION :
+ { target(old,old) evidence(old,old,old,negative) evidence(fresh,old,old,positive) applicable(old) applicable(fresh) visible(old) visible(fresh) visible(decision) resolve(decision,old,fresh,old,old) authorized(decision,old,old)  ancestor(old,decision) } =>* { retired(old,decision) C:Cfg } .
+search [1] in EVIDENCE-SELECTION-WEAK-REPLACEMENT :
+ { target(old,old) evidence(old,old,old,negative) evidence(fresh,old,old,positive) applicable(old) applicable(fresh) visible(old) visible(fresh) visible(decision) resolve(decision,old,fresh,old,old) authorized(decision,old,old)  ancestor(old,decision) } =>* { retired(old,decision) C:Cfg } .
+search [1] in EVIDENCE-SELECTION :
+ { target(old,old) evidence(old,old,old,negative) evidence(fresh,old,old,positive) applicable(old) retired(fresh,other) visible(old) visible(fresh) visible(decision) resolve(decision,old,fresh,old,old) authorized(decision,old,old) ancestor(old,decision) ancestor(fresh,decision) } =>* { retired(old,decision) retired(fresh,other) evidence(old,old,old,negative) resolve(decision,old,fresh,old,old) C:Cfg } .
+quit

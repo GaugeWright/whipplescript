@@ -5,7 +5,11 @@ use std::collections::{BTreeMap, BTreeSet};
 mod diagnostic_code_register;
 pub mod freshness;
 pub mod json;
+pub mod norm_evidence;
+pub mod norm_preservation;
+pub mod norm_selection;
 pub mod selection;
+pub mod vocabulary;
 
 pub use diagnostic_code_register::{DIAGNOSTIC_CODES, RUNTIME_DIAGNOSTIC_CODES};
 

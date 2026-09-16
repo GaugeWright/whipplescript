@@ -69,6 +69,61 @@
       "authentication": "runtime-control-bearer"
     },
     {
+      "id": "runtime.host.norm.impacts",
+      "method": "POST",
+      "path": "/host/norm/impacts",
+      "samplePath": "/host/norm/impacts",
+      "transport": "http-json",
+      "sideEffect": "none",
+      "risk": "critical",
+      "producer": "whipplescript-host-worker",
+      "authentication": "runtime-control-bearer"
+    },
+    {
+      "id": "runtime.host.norm.enqueues",
+      "method": "POST",
+      "path": "/host/norm/enqueues",
+      "samplePath": "/host/norm/enqueues",
+      "transport": "http-json",
+      "sideEffect": "mutation",
+      "risk": "critical",
+      "producer": "whipplescript-host-worker",
+      "authentication": "runtime-control-bearer"
+    },
+    {
+      "id": "runtime.host.norm.publications",
+      "method": "POST",
+      "path": "/host/norm/publications",
+      "samplePath": "/host/norm/publications",
+      "transport": "http-json",
+      "sideEffect": "mutation",
+      "risk": "critical",
+      "producer": "whipplescript-host-worker",
+      "authentication": "runtime-control-bearer"
+    },
+    {
+      "id": "runtime.host.norm.provision",
+      "method": "POST",
+      "path": "/host/norm/provision",
+      "samplePath": "/host/norm/provision",
+      "transport": "http-json",
+      "sideEffect": "mutation",
+      "risk": "critical",
+      "producer": "whipplescript-host-worker",
+      "authentication": "runtime-control-bearer"
+    },
+    {
+      "id": "runtime.host.norm.commands",
+      "method": "POST",
+      "path": "/host/norm/commands",
+      "samplePath": "/host/norm/commands",
+      "transport": "http-json",
+      "sideEffect": "mutation",
+      "risk": "critical",
+      "producer": "whipplescript-host-worker",
+      "authentication": "runtime-control-bearer"
+    },
+    {
       "id": "runtime.host.policy",
       "method": "POST",
       "path": "/host/policy",

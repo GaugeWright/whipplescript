@@ -1,0 +1,86 @@
+--- Recovery after the external operation has returned. A retained receipt is
+--- immutable; local projections may be retried without another external call.
+--- This model specifies a recovery obligation, not existing runtime support.
+mod NORM-SETTLEMENT-RECOVERY is
+ sorts Receipt Phase State .
+ ops original replacement : -> Receipt [ctor] .
+ ops empty prefix complete consumed : -> Phase [ctor] .
+ op pending : Receipt Phase -> State [ctor] .
+ op cold : Receipt Phase -> State [ctor] .
+ op ready : Receipt Phase -> State [ctor] .
+ op dispatchedAgain : Receipt Phase -> State [ctor] .
+ var R : Receipt . var P : Phase .
+ rl [first-projection] : pending(R,empty) => pending(R,prefix) .
+ rl [remaining-projections] : pending(R,prefix) => pending(R,complete) .
+ rl [release-rule-visibility] : pending(R,complete) => ready(R,complete) .
+ rl [evict] : pending(R,P) => cold(R,P) .
+ rl [resume-retained-receipt] : cold(R,P) => pending(R,P) .
+ rl [consume] : ready(R,complete) => ready(R,consumed) .
+ --- Repeated recovery leaves consumed facts consumed.
+ rl [repeat-recovery] : ready(R,P) => ready(R,P) .
+endm
+mod NORM-SETTLEMENT-RECOVERY-WEAK-VISIBILITY is
+ including NORM-SETTLEMENT-RECOVERY .
+ var R : Receipt .
+ rl [expose-prefix] : pending(R,prefix) => ready(R,prefix) .
+endm
+mod NORM-SETTLEMENT-RECOVERY-WEAK-REDISPATCH is
+ including NORM-SETTLEMENT-RECOVERY .
+ var R : Receipt . var P : Phase .
+ rl [repeat-external-action] : cold(R,P) => dispatchedAgain(R,P) .
+endm
+mod NORM-SETTLEMENT-RECOVERY-WEAK-REPLACEMENT is
+ including NORM-SETTLEMENT-RECOVERY .
+ var P : Phase .
+ rl [accept-new-response] : cold(original,P) => pending(replacement,P) .
+endm
+mod NORM-SETTLEMENT-RECOVERY-WEAK-REVIVAL is
+ including NORM-SETTLEMENT-RECOVERY .
+ var R : Receipt .
+ rl [revive-consumed] : ready(R,consumed) => ready(R,complete) .
+endm
+
+--- The store owns one receipt slot per run. Exact replay can read a closed
+--- slot, but a fresh receipt requires the selected running invocation.
+mod NORM-SETTLEMENT-RETENTION is
+ sorts Invocation Slot Receipt Retention .
+ ops current stale : -> Invocation [ctor] .
+ ops original replacement : -> Receipt [ctor] .
+ op vacant : -> Slot [ctor] .
+ op held : Receipt -> Slot [ctor] .
+ op retain : Invocation Slot Receipt -> Retention [ctor] .
+ op accepted : Slot -> Retention [ctor] .
+ op refused : Slot -> Retention [ctor] .
+ var I : Invocation . var R : Receipt .
+ rl [first-receipt] : retain(current,vacant,R) => accepted(held(R)) .
+ rl [exact-replay] : retain(I,held(R),R) => accepted(held(R)) .
+ rl [refuse-stale-new] : retain(stale,vacant,R) => refused(vacant) .
+ rl [refuse-replacement] : retain(I,held(original),replacement) => refused(held(original)) .
+endm
+mod NORM-SETTLEMENT-RETENTION-WEAK is
+ including NORM-SETTLEMENT-RETENTION .
+ var R : Receipt .
+ rl [stale-first-write] : retain(stale,vacant,R) => accepted(held(R)) .
+ rl [overwrite] : retain(current,held(original),replacement) => accepted(held(replacement)) .
+endm
+
+--- A generic recovery scan can prepare an uncertain fallback before the
+--- outcome is retained. The terminal transaction must inspect the current
+--- slot, not trust that earlier scan. This models the retention-first
+--- interleaving; it does not prove that a live worker may be declared lost.
+mod NORM-SETTLEMENT-TERMINAL-RACE is
+ sorts Slot Intent State .
+ ops vacant retained : -> Slot [ctor] .
+ ops original uncertain : -> Intent [ctor] .
+ op pending : Slot Intent -> State [ctor] .
+ op terminal : Intent -> State [ctor] .
+ op refused : Slot -> State [ctor] .
+ rl [retention-after-scan] : pending(vacant,uncertain) => pending(retained,uncertain) .
+ rl [no-retained-outcome] : pending(vacant,uncertain) => terminal(uncertain) .
+ rl [matching-outcome] : pending(retained,original) => terminal(original) .
+ rl [refuse-stale-fallback] : pending(retained,uncertain) => refused(retained) .
+endm
+mod NORM-SETTLEMENT-TERMINAL-RACE-WEAK is
+ including NORM-SETTLEMENT-TERMINAL-RACE .
+ rl [trust-earlier-scan] : pending(retained,uncertain) => terminal(uncertain) .
+endm

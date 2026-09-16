@@ -1,0 +1,15 @@
+load ../norm-observer.maude
+search [1] in NORM-NATIVE-WORKER : cfg(configured,fresh,ready) =>* cfg(configured,fresh,managed) .
+search [1] in NORM-NATIVE-WORKER : cfg(configured,partial,ready) =>* cfg(configured,partial,tracked) .
+search [1] in NORM-NATIVE-WORKER : cfg(missing,fresh,ready) =>* cfg(missing,fresh,inprocess) .
+search [1] in NORM-NATIVE-WORKER-WEAK : cfg(missing,fresh,ready) =>* cfg(missing,fresh,inprocess) .
+search [1] in NORM-NATIVE-WORKER : cfg(configured,legacy,ready) =>* cfg(configured,legacy,tracked) .
+search [1] in NORM-NATIVE-WORKER-WEAK : cfg(configured,legacy,ready) =>* cfg(configured,legacy,tracked) .
+search [1] in NORM-NATIVE-WORKER : cfg(configured,partial,ready) =>* cfg(configured,partial,delivered) .
+search [1] in NORM-NATIVE-WORKER-WEAK : cfg(configured,partial,ready) =>* cfg(configured,partial,delivered) .
+search [1] in NORM-NATIVE-WORKER : cfg(configured,proved,ready) =>* cfg(configured,proved,managed) .
+search [1] in NORM-NATIVE-WORKER : cfg(configured,unclosed,ready) =>* cfg(configured,unclosed,managed) .
+search [1] in NORM-NATIVE-WORKER-WEAK : cfg(configured,unclosed,ready) =>* cfg(configured,unclosed,managed) .
+search [1] in NORM-NATIVE-WORKER : cfg(configured,partial,ready) =>* cfg(configured,partial,managed) .
+search [1] in NORM-NATIVE-WORKER : cfg(configured,partial,authorized) =>* cfg(configured,partial,delivered) .
+quit

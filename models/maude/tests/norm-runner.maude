@@ -1,0 +1,65 @@
+load ../norm-runner.maude
+search [1] in NORM-RUNNER :
+ { plan(p0,p0,p0,p0,p0,pythonCalls) receipt(p0,p0,p0,p0,p0,false,false) } =>* { observed(p0,p0,p0,false,false) } .
+search [1] in NORM-RUNNER :
+ { plan(p0,p0,p0,p0,p0,pythonCalls) receipt(p0,p0,p0,p0,p0,true,false) } =>* { observed(p0,p0,p0,true,false) } .
+search [1] in NORM-RUNNER :
+ { plan(p0,p0,p0,p0,p0,pythonCalls) receipt(p0,p0,p0,p0,p0,false,true) } =>* { observed(p0,p0,p0,false,true) } .
+search in NORM-RUNNER :
+ { plan(p0,p0,p0,p0,p0,pythonCalls) receipt(p1,p0,p0,p0,p0,false,false) } =>* { observed(p0,p0,p0,false,false) } .
+search [1] in NORM-RUNNER-WEAK-RUN :
+ { plan(p0,p0,p0,p0,p0,pythonCalls) receipt(p1,p0,p0,p0,p0,false,false) } =>* { observed(p0,p0,p0,false,false) } .
+search in NORM-RUNNER :
+ { plan(p0,p0,p0,p0,p0,pythonCalls) receipt(p0,p1,p0,p0,p0,false,false) } =>* { observed(p0,p0,p0,false,false) } .
+search [1] in NORM-RUNNER-WEAK-SCRIPT :
+ { plan(p0,p0,p0,p0,p0,pythonCalls) receipt(p0,p1,p0,p0,p0,false,false) } =>* { observed(p0,p0,p0,false,false) } .
+search in NORM-RUNNER :
+ { plan(p0,p0,p0,p0,p0,pythonCalls) receipt(p0,p0,p1,p0,p0,false,false) } =>* { observed(p0,p0,p0,false,false) } .
+search [1] in NORM-RUNNER-WEAK-ARTIFACT :
+ { plan(p0,p0,p0,p0,p0,pythonCalls) receipt(p0,p0,p1,p0,p0,false,false) } =>* { observed(p0,p0,p0,false,false) } .
+search in NORM-RUNNER :
+ { plan(p0,p0,p0,p0,p0,pythonCalls) receipt(p0,p0,p0,p1,p0,false,false) } =>* { observed(p0,p0,p0,false,false) } .
+search [1] in NORM-RUNNER-WEAK-ENVIRONMENT :
+ { plan(p0,p0,p0,p0,p0,pythonCalls) receipt(p0,p0,p0,p1,p0,false,false) } =>* { observed(p0,p0,p0,false,false) } .
+search in NORM-RUNNER :
+ { plan(p0,p0,p0,p0,p0,unsupported) receipt(p0,p0,p0,p0,p0,false,false) } =>* { observed(p0,p0,p0,false,false) } .
+search [1] in NORM-RUNNER-WEAK-ADAPTER :
+ { plan(p0,p0,p0,p0,p0,unsupported) receipt(p0,p0,p0,p0,p0,false,false) } =>* { observed(p0,p0,p0,false,false) } .
+search in NORM-RUNNER :
+ { plan(p0,p0,p0,p0,p0,pythonCalls) receipt(p0,p0,p0,p0,p0,true,false) } =>* { observed(p0,p0,p0,false,false) } .
+search [1] in NORM-RUNNER-WEAK-TRUNCATION :
+ { plan(p0,p0,p0,p0,p0,pythonCalls) receipt(p0,p0,p0,p0,p0,true,false) } =>* { observed(p0,p0,p0,false,false) } .
+search in NORM-RUNNER :
+ { plan(p0,p0,p0,p0,p0,pythonCalls) receipt(p0,p0,p0,p0,p0,false,true) } =>* { observed(p0,p0,p0,false,false) } .
+search [1] in NORM-RUNNER-WEAK-TIMEOUT :
+ { plan(p0,p0,p0,p0,p0,pythonCalls) receipt(p0,p0,p0,p0,p0,false,true) } =>* { observed(p0,p0,p0,false,false) } .
+search [1] in NORM-RUNNER-STAGING :
+ { stage(p0) stage(p1) free(p0) free(p1) }
+ =>* { staged(p0,p0) file(p0) staged(p1,p1) file(p1) } .
+search [1] in NORM-RUNNER-STAGING :
+ { stage(p0) stage(p1) free(p0) free(p1) cleanup(p0) }
+ =>* { staged(p1,p1) file(p1) free(p0) } .
+search in NORM-RUNNER-STAGING :
+ { stage(p0) stage(p1) free(p0) free(p1) cleanup(p0) }
+ =>* { staged(p1,p0) free(p0) } .
+search [1] in NORM-RUNNER-WEAK-SHARED-PATH :
+ { stage(p0) stage(p1) free(p0) free(p1) cleanup(p0) }
+ =>* { staged(p1,p0) free(p0) } .
+search [1] in NORM-RUNNER-CAPTURE :
+ { captured(p0,false) stop(p0) } =>* { stream(p0,false) } .
+search [1] in NORM-RUNNER-CAPTURE :
+ { captured(p0,true) stop(p0) } =>* { stream(p0,true) } .
+search in NORM-RUNNER-CAPTURE :
+ { captured(p0,true) stop(p0) } =>* { stream(p0,false) } .
+search [1] in NORM-RUNNER-WEAK-DISCARD-CAPTURE :
+ { captured(p0,true) stop(p0) } =>* { stream(p0,false) } .
+search [1] in NORM-RUNNER :
+ { plan(p0,p0,p0,p0,p1,pythonCalls) receipt(p0,p0,p0,p0,p1,false,false) }
+ =>* { observed(p0,p0,p1,false,false) } .
+search in NORM-RUNNER :
+ { plan(p0,p0,p0,p0,p0,pythonCalls) receipt(p0,p0,p0,p0,p1,false,false) }
+ =>* { observed(p0,p0,p0,false,false) } .
+search [1] in NORM-RUNNER-WEAK-CONTRACT :
+ { plan(p0,p0,p0,p0,p0,pythonCalls) receipt(p0,p0,p0,p0,p1,false,false) }
+ =>* { observed(p0,p0,p0,false,false) } .
+quit .

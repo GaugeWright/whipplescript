@@ -1,0 +1,14 @@
+mod METHOD-DISCOVERY is
+  sorts Match State .
+  ops verified missing different : -> Match [ctor] .
+  op discover : Match Match Match -> State [ctor] .
+  op available : -> State [ctor] .
+  rl [installed-method] : discover(verified,verified,verified) => available .
+endm
+mod METHOD-DISCOVERY-WEAK is
+  including METHOD-DISCOVERY .
+  rl [skip-contract] : discover(missing,verified,verified) => available .
+  rl [trust-declaration] : discover(verified,missing,verified) => available .
+  rl [skip-runtime] : discover(verified,verified,missing) => available .
+  rl [wrong-invocation] : discover(verified,different,verified) => available .
+endm

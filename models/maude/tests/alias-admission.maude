@@ -1,0 +1,23 @@
+load ../alias-admission.maude
+search [1] in ALIAS-ADMISSION :
+ { counter(1) admit(a) admit(b) }
+ =>* { named(a, 1) named(b, 2) counter(3) } .
+search [1] in ALIAS-ADMISSION :
+ { counter(2) named(a, 1) import(a, 9) rebuild }
+ =>* { counter(2) named(a, 1) rebuilt } .
+search [1] in ALIAS-ADMISSION :
+ { counter(2) named(a, 1) import(b, 1) }
+ =>* { counter(3) named(a, 1) named(b, 2) } .
+search in ALIAS-ADMISSION :
+ { counter(2) named(a, 1) import(b, 1) }
+ =>* { named(a, 1) named(b, 1) RESIDUAL:Cfg } .
+search [1] in ALIAS-ADMISSION-TRUST-SOURCE :
+ { counter(2) named(a, 1) import(b, 1) }
+ =>* { named(a, 1) named(b, 1) RESIDUAL:Cfg } .
+search in ALIAS-ADMISSION :
+ { counter(1) admit(a) admit(b) }
+ =>* { named(a, 1) named(b, 1) RESIDUAL:Cfg } .
+search [1] in ALIAS-ADMISSION-REUSE-COUNTER :
+ { counter(1) admit(a) admit(b) }
+ =>* { named(a, 1) named(b, 1) RESIDUAL:Cfg } .
+quit .

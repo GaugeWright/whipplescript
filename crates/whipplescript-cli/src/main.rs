@@ -29,7 +29,10 @@ use whipplescript_core::json::{require_json_array_field, required_json_string};
 // The pure, wasm-kernel-hostable package-registry parse + validation core, lifted
 // out of this binary (S7 Step 3). The filesystem-coupled DR-0025 `@tool`
 // attestation and the embedded std manifest bytes stay in the CLI below.
-use whipplescript_kernel::exec_http::{encode_cached_exec_result, ingest_exec_stdout, ExecIngest};
+use whipplescript_kernel::exec_http::{
+    commit_exec_settlement, encode_cached_exec_result, ingest_exec_stdout, ExecIngest,
+    ExecSettlementProjection,
+};
 use whipplescript_kernel::package_registry::*;
 use whipplescript_kernel::rule_correspondence::{RuleCarry, RuleCorrespondence};
 use whipplescript_kernel::{
@@ -90,14 +93,13 @@ use whipplescript_provider_codex::{
 };
 use whipplescript_store::{
     ArtifactView, CapabilityBinding, CapabilitySchemaRegistration, CheckpointCapture,
-    ClaimableEffect, ComputeResultRegistration, DerivedFact, DiagnosticRecord, DiagnosticView,
-    DurableDiagnosticCode, EffectCancellation, EffectCompletion, EffectView, EventView,
-    EvidenceLink, EvidenceLinkView, EvidenceRecord, EvidenceView, FactView, InstanceView, NewEvent,
-    NewFact, NewInstanceAuthority, NewWorkflowInvocation, ProviderValidationEvidence,
-    RestoreDecision, RetryEffect, RevisionActivation, RevisionCancellationImpact,
-    RevisionCandidate, RevisionCompatibilityDiagnostic, RevisionCompatibilityReport, RunStart,
-    RunView, RuntimeStore, SqliteStore, StatusView, StoreError, WorkflowInvocationView,
-    WorkflowRevisionView,
+    ClaimableEffect, DerivedFact, DiagnosticRecord, DiagnosticView, DurableDiagnosticCode,
+    EffectCancellation, EffectCompletion, EffectView, EventView, EvidenceLink, EvidenceLinkView,
+    EvidenceRecord, EvidenceView, FactView, InstanceView, NewEvent, NewFact, NewInstanceAuthority,
+    NewWorkflowInvocation, ProviderValidationEvidence, RestoreDecision, RetryEffect,
+    RevisionActivation, RevisionCancellationImpact, RevisionCandidate,
+    RevisionCompatibilityDiagnostic, RevisionCompatibilityReport, RunStart, RunView, RuntimeStore,
+    SqliteStore, StatusView, StoreError, WorkflowInvocationView, WorkflowRevisionView,
 };
 // File-effect byte I/O routes through the FileStore seam (DR-0033 Phase 4); the
 // native backing is `std::fs`.
@@ -144,6 +146,13 @@ mod maude_model;
 mod mcp_cli;
 mod mcp_tools;
 mod model_auth;
+mod norm_commands;
+mod norm_exec_managed;
+mod norm_exec_native;
+mod norm_observer;
+#[cfg(test)]
+mod norm_publication_tests;
+mod norm_wasi;
 mod otel;
 mod project_context;
 mod skills_loader;
@@ -853,6 +862,76 @@ fn credential_proxy_token() -> Result<String, String> {
 }
 
 fn executor_command(options: &CliOptions) -> ExitCode {
+    if options.args.first().map(String::as_str) == Some("verify-norm-runtime") {
+        return norm_observer::verify_runtime_command(&options.args[1..]);
+    }
+    if matches!(
+        options.args.first().map(String::as_str),
+        Some("install-norm-runtime" | "prepare-norm-runtime-context" | "verify-norm-runtime-image")
+    ) {
+        if options.args.len() != 3 || options.args[1] != "--request" {
+            eprintln!("usage: whip executor {} --request <path>", options.args[0]);
+            return ExitCode::from(2);
+        }
+        let result = (|| -> Result<_, StoreError> {
+            use std::io::Read;
+            let mut bytes = Vec::new();
+            fs::File::open(&options.args[2])?
+                .take(65537)
+                .read_to_end(&mut bytes)?;
+            if bytes.len() > 65536 {
+                return Err(StoreError::Conflict(
+                    "runtime installation request exceeds its bound".into(),
+                ));
+            }
+            if options.args[0] == "prepare-norm-runtime-context" {
+                let request: whipplescript::native_executor::HostedRuntimeContextRequest =
+                    serde_json::from_slice(&bytes)?;
+                Ok(serde_json::to_value(request.prepare()?)?)
+            } else if options.args[0] == "verify-norm-runtime-image" {
+                let request: whipplescript::native_executor::RuntimeImageVerificationRequest =
+                    serde_json::from_slice(&bytes)?;
+                Ok(serde_json::to_value(request.verify()?)?)
+            } else {
+                let request: whipplescript::native_executor::RuntimeImageRequest =
+                    serde_json::from_slice(&bytes)?;
+                Ok(serde_json::to_value(request.install()?)?)
+            }
+        })();
+        return match result {
+            Ok(binding) => {
+                println!(
+                    "{}",
+                    serde_json::to_string(&binding).expect("runtime binding serializes")
+                );
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                eprintln!("runtime installation failed: {error:?}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    if options.args.first().map(String::as_str) == Some("controller") {
+        if options.args.len() != 3 || options.args[1] != "--database" {
+            eprintln!("usage: whip executor controller --database <path> (JSON stdin/stdout)");
+            return ExitCode::from(2);
+        }
+        return match whipplescript::native_controller_helper::serve(
+            std::path::Path::new(&options.args[2]),
+            std::io::stdin().lock(),
+            std::io::stdout().lock(),
+        ) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("executor controller failed: {error:?}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    if options.args.first().map(String::as_str) == Some("observe-norm") {
+        return norm_observer::command(&options.args[1..]);
+    }
     let mut bind = "127.0.0.1:8080".to_owned();
     let mut iter = options.args.iter();
     while let Some(arg) = iter.next() {
@@ -996,6 +1075,7 @@ const ALSO_LISTED_IN: &[(&str, &str)] = &[("evidence", "improve")];
 /// Entries are grouped: each group's commands are contiguous, and `whip help`
 /// prints the groups in the order they first appear here.
 const COMMANDS: &[CommandSpec] = &[
+    CommandSpec { name: "norm", group: "norm plane", usage: norm_commands::USAGE, run: norm_commands::command },
     CommandSpec {
         name: "check",
         group: "authoring",
@@ -1395,7 +1475,7 @@ const COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         name: "executor",
         group: "ops/deploy",
-        usage: "usage: whip executor [--bind <addr:port>]   (Class-A exec sidecar; default 127.0.0.1:8080)",
+        usage: "usage: whip executor [--bind <addr:port>] | controller --database <path>   (sidecar or trusted native controller; also install-norm-runtime, prepare-norm-runtime-context or verify-norm-runtime-image --request <path>, and verify-norm-runtime)",
         run: executor_command,
     },
     CommandSpec {
@@ -20174,12 +20254,13 @@ fn worker(options: &CliOptions) -> ExitCode {
         Ok(report) if options.json => emit_json(worker_report_to_json(&report)),
         Ok(report) => {
             println!(
-                "worker {} ran={} provider={} cancellation_acknowledgements={} cancellation_diagnostics={}",
+                "worker {} ran={} provider={} cancellation_acknowledgements={} cancellation_diagnostics={} native_norm_pending={}",
                 report.instance_id,
                 report.ran_effects,
                 report.provider,
                 report.cancellation_acknowledgements,
-                report.cancellation_diagnostics
+                report.cancellation_diagnostics,
+                report.native_norm_pending
             );
             ExitCode::SUCCESS
         }
@@ -20395,6 +20476,7 @@ struct WorkerReport {
     inbound_messages_admitted: u64,
     cancellation_acknowledgements: usize,
     cancellation_diagnostics: usize,
+    native_norm_pending: usize,
     terminal_events: Vec<String>,
 }
 
@@ -20414,7 +20496,40 @@ fn drive_pass_idle(step_report: &StepReport, worker_report: &WorkerReport) -> bo
         && worker_report.inbound_messages_admitted == 0
 }
 
+/// Which failures of a managed norm execution the worker pass ABSORBS, leaving
+/// the effect for a later pass, and which end the pass.
+///
+/// A pass walks every claimable effect; one that will not run this time is not
+/// a reason to abandon the others. A refusal, a capacity block, and the two
+/// policy blocks that mean "not now" are all states a later pass can leave
+/// behind. Anything else is the store saying something the worker cannot
+/// interpret, and continuing past it would drop effects silently.
+///
+/// Named, rather than four arms of the match it serves, because the arms are
+/// reachable only through `execute_norm_at` -- which needs a Docker host -- and
+/// a policy no test can state is a policy that drifts. `security.script_disabled`
+/// in particular: absorbing it is what lets a worker pass finish on a host
+/// where scripts are hard-off, and ending the pass instead would make that
+/// configuration look like a broken worker.
+fn norm_pass_absorbs(error: &StoreError) -> bool {
+    match error {
+        StoreError::Conflict(_) | StoreError::CapacityBlocked { .. } => true,
+        StoreError::PolicyBlocked { reason, .. } => {
+            reason.contains("security.script_disabled") || reason.contains("capacity exhausted")
+        }
+        _ => false,
+    }
+}
+
 fn run_worker_once(store_path: &Path, options: &WorkerOptions) -> Result<WorkerReport, StoreError> {
+    run_worker_once_with_native_host(store_path, options, norm_exec_managed::configuration()?)
+}
+
+fn run_worker_once_with_native_host(
+    store_path: &Path,
+    options: &WorkerOptions,
+    native_norm_host: Option<whipplescript::native_executor::NativeNormHost>,
+) -> Result<WorkerReport, StoreError> {
     // One connection for the whole pass: every `SqliteStore::open` re-runs the
     // WAL setup, the migration sweep and the permission hardening, so the pass
     // opens once and lends `&store` to the guard and the passes below. The
@@ -20426,6 +20541,10 @@ fn run_worker_once(store_path: &Path, options: &WorkerOptions) -> Result<WorkerR
         provider: options.provider.clone(),
         ..WorkerReport::default()
     };
+    let now = options
+        .virtual_now
+        .clone()
+        .unwrap_or_else(wall_clock_instant);
     let cancellation_report =
         process_running_cancellations(&store, store_path, &options.instance_id, &options.provider)?;
     report.cancellation_acknowledgements = cancellation_report.acknowledgements;
@@ -20438,6 +20557,25 @@ fn run_worker_once(store_path: &Path, options: &WorkerOptions) -> Result<WorkerR
         &options.instance_id,
         options.virtual_now.as_deref().unwrap_or("now"),
     )?;
+    let recovered = norm_exec_managed::recover(
+        &mut kernel,
+        &options.instance_id,
+        native_norm_host.as_ref(),
+        &now,
+        false,
+    )?;
+    report.native_norm_pending = recovered.pending;
+    let mut terminals = recovered.terminal_events;
+    terminals.extend(
+        whipplescript_kernel::exec_outcome_settlement::settle_instance(
+            &mut kernel,
+            &options.instance_id,
+        )?,
+    );
+    report.ran_effects += terminals.len();
+    report
+        .terminal_events
+        .extend(terminals.into_iter().map(|event| event.event_id));
     let store = kernel.into_store();
     report.timers_fired = time_report.timers_fired;
     report.deadlines_expired = time_report.deadlines_expired;
@@ -20543,6 +20681,48 @@ fn run_worker_once(store_path: &Path, options: &WorkerOptions) -> Result<WorkerR
             claimable.push(effect);
         }
     }
+    let mut ordinary = Vec::new();
+    for effect in claimable {
+        let input = json_from_str(&effect.input_json);
+        if effect.kind != "exec.command" || !norm_exec_managed::protected(&input)? {
+            ordinary.push(effect);
+            continue;
+        }
+        let host = norm_exec_managed::require(native_norm_host.as_ref())?;
+        let mut kernel = RuntimeKernel::new(SqliteStore::open(store_path)?);
+        match host.docker()?.execute_norm_at(
+            &mut kernel,
+            &options.instance_id,
+            &effect,
+            &host.installed,
+            &options
+                .virtual_now
+                .clone()
+                .unwrap_or_else(wall_clock_instant),
+        ) {
+            Ok(progress) => {
+                report.native_norm_pending +=
+                    usize::from(!progress.closed || progress.cleanup_pending);
+                report.ran_effects += progress.terminal_events.len();
+                report.terminal_events.extend(
+                    progress
+                        .terminal_events
+                        .into_iter()
+                        .map(|event| event.event_id),
+                );
+            }
+            Err(error) if norm_pass_absorbs(&error) => {
+                if let StoreError::Conflict(reason) = &error {
+                    eprintln!(
+                        "effect `{}` ({}) handler refused this pass: {reason}",
+                        effect.effect_id, effect.kind
+                    );
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    let claimable = ordinary;
     // The ready set is mutually independent (a dependent effect is not claimable
     // until its dependency terminals), so the effects execute concurrently on a
     // bounded thread pool. Each handler opens its own WAL-mode store connection
@@ -25545,21 +25725,49 @@ fn run_exec_effect(
         .unwrap_or_default()
         .to_owned();
     let parse_contract = input.get("parse").cloned();
-    let run_id = idempotency_key(&[instance_id, &effect.effect_id, "exec-run"]);
-    let lease_id = idempotency_key(&[instance_id, &effect.effect_id, "exec-lease"]);
+    let run_id = whipplescript_kernel::execution_attempt_key(
+        instance_id,
+        &effect.effect_id,
+        effect.attempt_admission_event_id.as_deref(),
+        "exec-run",
+    );
+    let lease_id = whipplescript_kernel::execution_attempt_key(
+        instance_id,
+        &effect.effect_id,
+        effect.attempt_admission_event_id.as_deref(),
+        "exec-lease",
+    );
     let store = SqliteStore::open(store_path)?;
     let mut kernel = RuntimeKernel::new(store);
-    kernel.start_run(RunStart {
-        instance_id,
-        effect_id: &effect.effect_id,
-        run_id: &run_id,
-        provider: "exec",
-        worker_id: "whip-exec",
-        lease_id: &lease_id,
-        lease_expires_at: "2030-01-01T00:00:00Z",
-        metadata_json: &json!({"mode": mode, "command": command, "capability": capability})
-            .to_string(),
-    })?;
+    if let Some(event) =
+        whipplescript_kernel::exec_http::recover_exec_settlement(&mut kernel, instance_id, effect)?
+    {
+        return Ok(event);
+    }
+    if input.get("norm_intent").is_some() || input.get("norm_dispatch").is_some() {
+        return norm_exec_native::execute(
+            &mut kernel,
+            instance_id,
+            effect,
+            &norm_exec_managed::configuration()?
+                .map(|host| host.installed.runtime.environment)
+                .unwrap_or_else(compute_environment_hash),
+        );
+    }
+    kernel.start_run_for_admission(
+        RunStart {
+            instance_id,
+            effect_id: &effect.effect_id,
+            run_id: &run_id,
+            provider: "exec",
+            worker_id: "whip-exec",
+            lease_id: &lease_id,
+            lease_expires_at: "2030-01-01T00:00:00Z",
+            metadata_json: &json!({"mode": mode, "command": command, "capability": capability})
+                .to_string(),
+        },
+        effect.attempt_admission_event_id.as_deref(),
+    )?;
 
     // Delta-kernel result cache (compute plane P8-1): a hermetic script
     // capability is memoizable by content key (script hash + argv + resolved
@@ -25627,11 +25835,12 @@ fn run_exec_effect(
                         },
                     })
                     .to_string(),
-                    idempotency_key: Some(&idempotency_key(&[
+                    idempotency_key: Some(&whipplescript_kernel::execution_run_key(
                         instance_id,
                         &effect.effect_id,
-                        "terminal",
-                    ])),
+                        &run_id,
+                        &["terminal"],
+                    )),
                 });
             }
         };
@@ -25709,6 +25918,7 @@ fn run_exec_effect(
         }
     };
 
+    let mut projections = Vec::new();
     match outcome {
         Ok((exit_code, stdout, stderr, ingested)) => {
             let cache_payload = cache_key.as_ref().map(|_| {
@@ -25733,42 +25943,13 @@ fn run_exec_effect(
             if let Some(meta) = branch_import_meta.take() {
                 insert_json_field(&mut value, "branch_import", meta);
             }
-            if let (Some(content_key), Some(result_json)) = (&cache_key, &cache_payload) {
-                // First writer wins: an existing entry for the key stays
-                // canonical, so a replayed populate is a no-op.
-                if !cache_hit {
-                    kernel
-                        .store()
-                        .record_compute_result(ComputeResultRegistration {
-                            content_key,
-                            effect_kind: "exec.command",
-                            result_json,
-                            source_instance_id: instance_id,
-                            source_effect_id: &effect.effect_id,
-                        })?;
-                }
+            if let Some(content_key) = &cache_key {
                 insert_json_field(
                     &mut value,
                     "cache",
                     json!({"content_key": content_key, "hit": cache_hit}),
                 );
             }
-            let terminal = kernel.complete_run(EffectCompletion {
-                instance_id,
-                effect_id: &effect.effect_id,
-                run_id: &run_id,
-                provider: "exec",
-                worker_id: "whip-exec",
-                status: "completed",
-                exit_code: Some(i64::from(exit_code)),
-                summary: Some("exec completed"),
-                metadata_json: &value.to_string(),
-                idempotency_key: Some(&idempotency_key(&[
-                    instance_id,
-                    &effect.effect_id,
-                    "terminal",
-                ])),
-            })?;
             let mut fact = json!({
                 "effect_id": effect.effect_id,
                 "run_id": run_id,
@@ -25794,37 +25975,67 @@ fn run_exec_effect(
                         .unwrap_or("json")
                         .to_owned();
                     for (index, element) in elements.iter().enumerate() {
-                        kernel.ingest_fact(
-                            instance_id,
-                            &schema,
-                            &format!("{}:{index}", effect.effect_id),
-                            &element.to_string(),
-                            Some(&terminal.event_id),
-                            Some(&idempotency_key(&[
+                        projections.push(ExecSettlementProjection {
+                            name: schema.clone(),
+                            key: format!("{}:{index}", effect.effect_id),
+                            value: element.to_string(),
+                            ingest: true,
+                            event_key: whipplescript_kernel::execution_run_key(
                                 instance_id,
                                 &effect.effect_id,
-                                "ingest",
-                                &index.to_string(),
-                            ])),
-                        )?;
+                                &run_id,
+                                &["ingest", &index.to_string()],
+                            ),
+                        });
                     }
                     insert_json_field(&mut fact, "ingested_count", json!(elements.len()));
                 }
                 None => {}
             }
-            kernel.derive_fact(
-                instance_id,
-                "exec.command.completed",
-                &effect.effect_id,
-                &fact.to_string(),
-                Some(&terminal.event_id),
-                Some(&idempotency_key(&[
+            projections.push(ExecSettlementProjection {
+                name: "exec.command.completed".into(),
+                key: effect.effect_id.clone(),
+                value: fact.to_string(),
+                ingest: false,
+                event_key: whipplescript_kernel::execution_run_key(
                     instance_id,
                     &effect.effect_id,
-                    "exec-fact",
-                ])),
-            )?;
-            Ok(terminal)
+                    &run_id,
+                    &["exec-fact"],
+                ),
+            });
+            commit_exec_settlement(
+                &mut kernel,
+                &effect.input_json,
+                EffectCompletion {
+                    instance_id,
+                    effect_id: &effect.effect_id,
+                    run_id: &run_id,
+                    provider: "exec",
+                    worker_id: "whip-exec",
+                    status: "completed",
+                    exit_code: Some(i64::from(exit_code)),
+                    summary: Some("exec completed"),
+                    metadata_json: &value.to_string(),
+                    idempotency_key: Some(&whipplescript_kernel::execution_run_key(
+                        instance_id,
+                        &effect.effect_id,
+                        &run_id,
+                        &["terminal"],
+                    )),
+                },
+                &projections,
+                cache_key
+                    .as_deref()
+                    .zip(cache_payload.as_deref())
+                    .filter(|_| !cache_hit)
+                    .map(
+                        |(content_key, result_json)| whipplescript_store::SettlementCache {
+                            content_key,
+                            result_json,
+                        },
+                    ),
+            )
         }
         Err((detail, reason)) => {
             let failure = json!({"error_kind": "exec_failed", "message": reason});
@@ -25845,22 +26056,6 @@ fn run_exec_effect(
                     failure.insert("evidence".to_owned(), evidence.clone());
                 }
             }
-            let terminal = kernel.fail_run(EffectCompletion {
-                instance_id,
-                effect_id: &effect.effect_id,
-                run_id: &run_id,
-                provider: "exec",
-                worker_id: "whip-exec",
-                status: "failed",
-                exit_code: detail.as_ref().map(|(code, _, _)| i64::from(*code)),
-                summary: Some(&reason),
-                metadata_json: &metadata.to_string(),
-                idempotency_key: Some(&idempotency_key(&[
-                    instance_id,
-                    &effect.effect_id,
-                    "terminal",
-                ])),
-            })?;
             // P3 per-kind extras: the command's exit code (when the process
             // actually ran) rides the bound failure value.
             let mut exec_failure_value =
@@ -25885,19 +26080,41 @@ fn run_exec_effect(
                 }
             }
             let fact = fact.to_string();
-            kernel.derive_fact(
-                instance_id,
-                "exec.command.failed",
-                &effect.effect_id,
-                &fact,
-                Some(&terminal.event_id),
-                Some(&idempotency_key(&[
+            projections.push(ExecSettlementProjection {
+                name: "exec.command.failed".into(),
+                key: effect.effect_id.clone(),
+                value: fact,
+                ingest: false,
+                event_key: whipplescript_kernel::execution_run_key(
                     instance_id,
                     &effect.effect_id,
-                    "exec-fact",
-                ])),
-            )?;
-            Ok(terminal)
+                    &run_id,
+                    &["exec-fact"],
+                ),
+            });
+            commit_exec_settlement(
+                &mut kernel,
+                &effect.input_json,
+                EffectCompletion {
+                    instance_id,
+                    effect_id: &effect.effect_id,
+                    run_id: &run_id,
+                    provider: "exec",
+                    worker_id: "whip-exec",
+                    status: "failed",
+                    exit_code: detail.as_ref().map(|(code, _, _)| i64::from(*code)),
+                    summary: Some(&reason),
+                    metadata_json: &metadata.to_string(),
+                    idempotency_key: Some(&whipplescript_kernel::execution_run_key(
+                        instance_id,
+                        &effect.effect_id,
+                        &run_id,
+                        &["terminal"],
+                    )),
+                },
+                &projections,
+                None,
+            )
         }
     }
 }
@@ -28090,6 +28307,14 @@ fn run(options: &CliOptions) -> ExitCode {
             // waiting pass refunds its iteration so timer chains don't starve
             // the budget.
             if dev_options.wait_for_timers {
+                if workers
+                    .last()
+                    .is_some_and(|report| report.native_norm_pending > 0)
+                {
+                    std::thread::sleep(std::time::Duration::from_secs(1));
+                    iterations_left += 1;
+                    continue;
+                }
                 let pending_deadline =
                     SqliteStore::open(&options.store_path)
                         .ok()
@@ -31921,6 +32146,7 @@ fn worker_report_to_json(report: &WorkerReport) -> Value {
         "instance_id": report.instance_id,
         "provider": report.provider,
         "ran_effects": report.ran_effects,
+        "native_norm_pending": report.native_norm_pending,
         "file_lines_admitted": report.file_lines_admitted,
         "http_items_admitted": report.http_items_admitted,
         "inbound_messages_admitted": report.inbound_messages_admitted,
@@ -31933,6 +32159,7 @@ fn worker_report_to_json(report: &WorkerReport) -> Value {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct RecoverReport {
     instance_id: String,
+    native_norm_pending: usize,
     recovered_events: Vec<RecoveredEvent>,
 }
 
@@ -31956,12 +32183,27 @@ fn recover(options: &CliOptions) -> ExitCode {
         Err(code) => return code,
     };
     let mut kernel = RuntimeKernel::new(store);
-    let recovered = match kernel.recover_running_provider_runs(instance_id) {
+    let native_recovery = match norm_exec_managed::configuration().and_then(|host| {
+        norm_exec_managed::recover(
+            &mut kernel,
+            instance_id,
+            host.as_ref(),
+            &wall_clock_instant(),
+            true,
+        )
+    }) {
+        Ok(report) => report,
+        Err(error) => return report_store_error("failed to recover native norm runs", error),
+    };
+    let provider_events = match kernel.recover_running_provider_runs(instance_id) {
         Ok(events) => events,
         Err(error) => return report_store_error("failed to recover provider runs", error),
     };
+    let mut recovered = native_recovery.terminal_events;
+    recovered.extend(provider_events);
     let report = RecoverReport {
         instance_id: instance_id.clone(),
+        native_norm_pending: native_recovery.pending,
         recovered_events: recovered
             .into_iter()
             .map(|event| RecoveredEvent {
@@ -31974,9 +32216,10 @@ fn recover(options: &CliOptions) -> ExitCode {
         emit_json(recover_report_to_json(&report))
     } else {
         println!(
-            "recover {} recovered={}",
+            "recover {} recovered={} native_norm_pending={}",
             report.instance_id,
-            report.recovered_events.len()
+            report.recovered_events.len(),
+            report.native_norm_pending
         );
         ExitCode::SUCCESS
     }
@@ -31986,6 +32229,7 @@ fn recover_report_to_json(report: &RecoverReport) -> Value {
     json!({
         "instance_id": report.instance_id,
         "recovered_count": report.recovered_events.len(),
+        "native_norm_pending": report.native_norm_pending,
         "recovered_events": report
             .recovered_events
             .iter()
@@ -38066,6 +38310,9 @@ fn branch_exec_scratch(
     else {
         return Ok(None);
     };
+    if branch_id == whipplescript_store::branches::MAINLINE_BRANCH_ID {
+        return Err("mainline scratch execution requires governed admission; bind the instance to a work branch".into());
+    }
     let scratch_root = std::env::temp_dir().join(format!("whip-exec-scratch-{effect_id}"));
     let _ = std::fs::remove_dir_all(&scratch_root);
     let now_unix_nanos = std::time::SystemTime::now()
@@ -38089,6 +38336,9 @@ fn import_branch_exec_scratch(
     scratch: &whipplescript_store::materialize::MaterializedScratch,
     effect_id: &str,
 ) -> Result<Value, String> {
+    if branch_id == whipplescript_store::branches::MAINLINE_BRANCH_ID {
+        return Err("mainline scratch import requires governed admission; bind the instance to a work branch".into());
+    }
     use whipplescript_store::vcs::VcsWriteOutcome;
     let mut vcs =
         whipplescript_store::vcs::WorkspaceVcs::open(branch_store_path(), vcs_content_store_path())
@@ -38144,6 +38394,11 @@ fn bind_instance_to_branch(
         .map_err(|error| format!("bind failed: {error:?}"))?
     {
         BindOutcome::Bound => {}
+        BindOutcome::GatedRef => {
+            return Err(format!(
+                "ref `{branch_id}` is gated — instances must bind to a work branch"
+            ));
+        }
         BindOutcome::AlreadyBound { branch_id: other } => {
             return Err(format!(
                 "instance `{instance_id}` is already bound to branch `{other}`"
@@ -38162,17 +38417,31 @@ fn bind_instance_to_branch(
     let store = SqliteStore::open(store_path)
         .map_err(|error| format!("could not open the runtime store: {error:?}"))?;
     let payload = json!({ "branch_id": branch_id }).to_string();
-    store
-        .append_event(whipplescript_store::NewEvent {
-            instance_id,
-            event_type: "branch.bound",
-            payload_json: &payload,
-            source: "cli",
-            causation_id: None,
-            correlation_id: None,
-            idempotency_key: Some(&idempotency_key(&[instance_id, branch_id, "branch-bind"])),
-        })
-        .map_err(|error| format!("could not record the binding event: {error:?}"))?;
+    let key = idempotency_key(&[instance_id, branch_id, "branch-bind"]);
+    // The store calls a same-branch re-bind `Bound` on purpose: an instance is
+    // BORN on a branch, and repeating that birth is the idempotent retry rather
+    // than a second event (`instance_binding_is_write_once` in `branches.rs`).
+    // The log has to agree. Appending unconditionally made the second call fail
+    // with a duplicate-key conflict reading "a second distinct commit produced
+    // an already-used key" -- which is the opposite of what happened, and told
+    // the operator a storage fault where the answer was "already done".
+    if store
+        .event_by_idempotency_key(instance_id, &key)
+        .map_err(|error| format!("could not read the binding event: {error:?}"))?
+        .is_none()
+    {
+        store
+            .append_event(whipplescript_store::NewEvent {
+                instance_id,
+                event_type: "branch.bound",
+                payload_json: &payload,
+                source: "cli",
+                causation_id: None,
+                correlation_id: None,
+                idempotency_key: Some(&key),
+            })
+            .map_err(|error| format!("could not record the binding event: {error:?}"))?;
+    }
     Ok(())
 }
 
@@ -40724,12 +40993,30 @@ fn retry(options: &CliOptions) -> ExitCode {
         Err(code) => return code,
     };
     let mut kernel = RuntimeKernel::new(store);
-    match kernel.retry_effect(RetryEffect {
-        instance_id,
-        effect_id,
-        retry_after: None,
-        idempotency_key: Some(&idempotency_key(&[instance_id, "retry", effect_id])),
-    }) {
+    let terminal = match kernel.store().effect_terminal_event(instance_id, effect_id) {
+        Ok(Some(event)) => event,
+        Ok(None) => {
+            return report_store_error(
+                "failed to retry effect",
+                StoreError::Conflict("effect has no terminal event".into()),
+            )
+        }
+        Err(error) => return report_store_error("failed to read retry terminal", error),
+    };
+    match kernel.retry_effect_at_terminal(
+        RetryEffect {
+            instance_id,
+            effect_id,
+            retry_after: None,
+            idempotency_key: Some(&idempotency_key(&[
+                instance_id,
+                "retry",
+                effect_id,
+                &terminal,
+            ])),
+        },
+        &terminal,
+    ) {
         Ok(event) if options.json => emit_json(json!({
             "instance_id": instance_id,
             "effect_id": effect_id,

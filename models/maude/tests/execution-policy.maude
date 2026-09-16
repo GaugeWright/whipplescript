@@ -1,0 +1,13 @@
+load ../execution-policy.maude
+search [1] in EXECUTION-POLICY : query(same,same,same,same,protected) =>* accepted .
+search [1] in EXECUTION-POLICY : query(different,same,same,same,protected) =>* accepted .
+search [1] in EXECUTION-POLICY-WEAK : query(different,same,same,same,protected) =>* accepted .
+search [1] in EXECUTION-POLICY : query(same,different,same,same,protected) =>* accepted .
+search [1] in EXECUTION-POLICY-WEAK : query(same,different,same,same,protected) =>* accepted .
+search [1] in EXECUTION-POLICY : query(same,same,different,same,protected) =>* accepted .
+search [1] in EXECUTION-POLICY-WEAK : query(same,same,different,same,protected) =>* accepted .
+search [1] in EXECUTION-POLICY : query(same,same,same,different,protected) =>* accepted .
+search [1] in EXECUTION-POLICY-WEAK : query(same,same,same,different,protected) =>* accepted .
+search [1] in EXECUTION-POLICY : query(same,same,same,same,cooperative) =>* accepted .
+search [1] in EXECUTION-POLICY-WEAK : query(same,same,same,same,cooperative) =>* accepted .
+quit

@@ -1,0 +1,122 @@
+load ../vocabulary-lifecycle.maude
+
+--- Coverage: creation on behalf of owner does not require owner execution.
+search [1] in VOCABULARY-LIFECYCLE :
+  { create(7, worker, owner, original) trust declarations }
+  =>* { pinned(genesis(7, owner, original)) head(original)
+        root(genesis(7, owner, original), owner, original) RESIDUAL:Cfg } .
+
+--- Coverage: record identity is minted at creation, then kept by an update.
+search [1] in VOCABULARY-LIFECYCLE :
+  { established propose(1, v0, original) transition(1, v0, accepted, original) }
+  =>* { creation(1, v0) record(1, v0, accepted)
+        admitted(1, v0, accepted, original) RESIDUAL:Cfg } .
+
+--- Coverage: explicitly public v1 transition needs no governance root.
+search [1] in VOCABULARY-LIFECYCLE :
+  { declarations propose(2, v1, workerKey) transition(2, v1, retired, workerKey) }
+  =>* { creation(2, v1) admitted(2, v1, retired, workerKey) RESIDUAL:Cfg } .
+
+--- Coverage: exact original genesis restores usable authority.
+search [1] in VOCABULARY-LIFECYCLE :
+  { pinned(genesis(7, owner, original)) head(original) trust declarations existing
+    restore(genesis(7, owner, original)) transition(1, v0, accepted, original) }
+  =>* { admitted(1, v0, accepted, original) RESIDUAL:Cfg } .
+
+--- Coverage: rotation preserves genesis, and the replacement key works.
+search [1] in VOCABULARY-LIFECYCLE :
+  { established existing rotate(original, successor) transition(1, v0, accepted, successor) }
+  =>* { pinned(genesis(7, owner, original)) head(successor)
+        succession(genesis(7, owner, original), original, successor)
+        admitted(1, v0, accepted, successor) RESIDUAL:Cfg } .
+
+--- Coverage: restoration needs a verified chain to the pinned checkpoint.
+search [1] in VOCABULARY-LIFECYCLE :
+  { pinned(genesis(7, owner, original)) head(successor) trust declarations existing
+    restore(genesis(7, owner, original))
+    succession(genesis(7, owner, original), original, successor)
+    replaySuccession(original, successor) transition(1, v0, accepted, successor) }
+  =>* { admitted(1, v0, accepted, successor) RESIDUAL:Cfg } .
+
+--- Missing rule: accepted is in v1's domain but has no admission rule.
+search in VOCABULARY-LIFECYCLE :
+  { established propose(2, v1, workerKey) transition(2, v1, accepted, original) }
+  =>* { admitted(2, v1, accepted, original) RESIDUAL:Cfg } .
+search [1] in VOCABULARY-LIFECYCLE-MISSING-RULE :
+  { established propose(2, v1, workerKey) transition(2, v1, accepted, original) }
+  =>* { admitted(2, v1, accepted, original) RESIDUAL:Cfg } .
+
+--- Wrong version: v1's public rule cannot reinterpret a v0 record.
+search in VOCABULARY-LIFECYCLE :
+  { established existing transition(1, v1, retired, workerKey) }
+  =>* { admitted(1, v1, retired, workerKey) RESIDUAL:Cfg } .
+search [1] in VOCABULARY-LIFECYCLE-WRONG-VERSION :
+  { established existing transition(1, v1, retired, workerKey) }
+  =>* { admitted(1, v1, retired, workerKey) RESIDUAL:Cfg } .
+
+--- Creator self-grant: an authenticated worker executing creation has no vote.
+search in VOCABULARY-LIFECYCLE :
+  { create(7, worker, owner, original) trust declarations existing
+    transition(1, v0, accepted, workerKey) }
+  =>* { admitted(1, v0, accepted, workerKey) RESIDUAL:Cfg } .
+search [1] in VOCABULARY-LIFECYCLE-CREATOR-GRANT :
+  { create(7, worker, owner, original) trust declarations existing
+    transition(1, v0, accepted, workerKey) }
+  =>* { admitted(1, v0, accepted, workerKey) RESIDUAL:Cfg } .
+
+--- Replacement bootstrap is genuinely signed, but belongs to a different root.
+search in VOCABULARY-LIFECYCLE :
+  { pinned(genesis(7, owner, original)) head(original) trust declarations existing
+    restore(genesis(8, worker, workerKey)) transition(1, v0, accepted, workerKey) }
+  =>* { admitted(1, v0, accepted, workerKey) RESIDUAL:Cfg } .
+search [1] in VOCABULARY-LIFECYCLE-REPLACEMENT-GENESIS :
+  { pinned(genesis(7, owner, original)) head(original) trust declarations existing
+    restore(genesis(8, worker, workerKey)) transition(1, v0, accepted, workerKey) }
+  =>* { admitted(1, v0, accepted, workerKey) RESIDUAL:Cfg } .
+
+--- Possessing a verified worker key does not authorize root succession.
+search in VOCABULARY-LIFECYCLE :
+  { established existing rotate(workerKey, workerKey) transition(1, v0, accepted, workerKey) }
+  =>* { admitted(1, v0, accepted, workerKey) RESIDUAL:Cfg } .
+search [1] in VOCABULARY-LIFECYCLE-UNAUTHORIZED-ROTATION :
+  { established existing rotate(workerKey, workerKey) transition(1, v0, accepted, workerKey) }
+  =>* { admitted(1, v0, accepted, workerKey) RESIDUAL:Cfg } .
+
+--- Restoring original genesis alone cannot roll authority back after rotation.
+search in VOCABULARY-LIFECYCLE :
+  { pinned(genesis(7, owner, original)) head(successor) trust declarations existing
+    restore(genesis(7, owner, original)) transition(1, v0, accepted, original) }
+  =>* { admitted(1, v0, accepted, original) RESIDUAL:Cfg } .
+search [1] in VOCABULARY-LIFECYCLE-INCOMPLETE-CHAIN :
+  { pinned(genesis(7, owner, original)) head(successor) trust declarations existing
+    restore(genesis(7, owner, original)) transition(1, v0, accepted, original) }
+  =>* { admitted(1, v0, accepted, original) RESIDUAL:Cfg } .
+
+--- Private creation admits its owner; public creation admits the worker.
+search [1] in VOCABULARY-LIFECYCLE :
+  { pinned(genesis(7, owner, original)) head(original)
+    root(genesis(7, owner, original), owner, original) verified(owner, original)
+    domain(v0, proposed) creationRule(v0, ownerOnly) propose(1, v0, original) }
+  =>* { creation(1, v0) RESIDUAL:Cfg } .
+search [1] in VOCABULARY-LIFECYCLE :
+  { domain(v0, proposed) creationRule(v0, public) propose(1, v0, workerKey) }
+  =>* { creation(1, v0) RESIDUAL:Cfg } .
+--- Missing creation policy denies too; an initial status is not a grant.
+search in VOCABULARY-LIFECYCLE :
+  { domain(v0, proposed) propose(1, v0, workerKey) }
+  =>* { creation(1, v0) RESIDUAL:Cfg } .
+search [1] in VOCABULARY-LIFECYCLE-MISSING-CREATION-RULE :
+  { domain(v0, proposed) propose(1, v0, workerKey) }
+  =>* { creation(1, v0) RESIDUAL:Cfg } .
+--- A declared owner-only creation policy does not grant the worker authority.
+search in VOCABULARY-LIFECYCLE :
+  { pinned(genesis(7, owner, original)) head(original)
+    root(genesis(7, owner, original), owner, original) verified(owner, original)
+    domain(v0, proposed) creationRule(v0, ownerOnly) propose(1, v0, workerKey) }
+  =>* { creation(1, v0) RESIDUAL:Cfg } .
+search [1] in VOCABULARY-LIFECYCLE-UNAUTHORIZED-CREATION :
+  { pinned(genesis(7, owner, original)) head(original)
+    root(genesis(7, owner, original), owner, original) verified(owner, original)
+    domain(v0, proposed) creationRule(v0, ownerOnly) propose(1, v0, workerKey) }
+  =>* { creation(1, v0) RESIDUAL:Cfg } .
+quit .

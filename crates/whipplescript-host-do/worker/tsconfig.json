@@ -11,6 +11,6 @@
     "skipLibCheck": true,
     "esModuleInterop": true
   },
-  "include": ["src/**/*.ts", "src/**/*.d.ts"],
+  "include": ["src/**/*.ts", "src/**/*.d.ts", "scripts/fixtures/norm-publication-local.ts"],
   "exclude": ["src/**/*.test.ts", "src/integration-helpers.ts"]
 }

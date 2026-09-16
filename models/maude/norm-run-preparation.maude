@@ -1,0 +1,44 @@
+--- Requirement identities are established before binding a run's contract.
+--- A template contains method/cases, never its own requirement or artifact id.
+--- Verified history, captured bytes and host-installed script identity are premises.
+--- This preparation does not grant execution or authorize observation publication.
+mod NORM-RUN-PREPARATION is
+  sorts Id Contract Fact Cfg State .
+  ops run ledger other req method template cases altered artifact : -> Id [ctor] .
+  op contract : Id Id Id Id -> Contract [ctor] .
+  subsort Fact < Cfg . op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] . op {_} : Cfg -> State [ctor] .
+  ops active declaration : Id Id Id -> Fact [ctor] .
+  ops captured installed chosen : Id -> Fact [ctor] .
+  op request : Id Id Id Id -> Fact [ctor] .
+  op prepared : Id Id Id Id Id Contract -> Fact [ctor] .
+  vars I L R T M C A : Id . var REST : Cfg .
+  rl [bind-authoritative-template] :
+    { active(L,R,T) declaration(T,M,C) captured(A) installed(M) request(I,L,R,A) REST }
+    => { prepared(I,L,R,M,A,contract(R,M,A,C)) REST } .
+endm
+mod NORM-RUN-PREPARATION-WEAK-ACTIVE is
+  including NORM-RUN-PREPARATION . vars I L R T M C A : Id . var REST : Cfg .
+  rl [inactive-requirement] : { declaration(T,M,C) captured(A) installed(M) request(I,L,R,A) REST }
+    => { prepared(I,L,R,M,A,contract(R,M,A,C)) REST } .
+endm
+mod NORM-RUN-PREPARATION-WEAK-LEDGER is
+  including NORM-RUN-PREPARATION . vars I L L1 R T M C A : Id . var REST : Cfg .
+  rl [foreign-ledger] : { active(L1,R,T) declaration(T,M,C) captured(A) installed(M) request(I,L,R,A) REST }
+    => { prepared(I,L,R,M,A,contract(R,M,A,C)) REST } .
+endm
+mod NORM-RUN-PREPARATION-WEAK-ARTIFACT is
+  including NORM-RUN-PREPARATION . vars I L R T M C A A1 : Id . var REST : Cfg .
+  rl [uncaptured-artifact] : { active(L,R,T) declaration(T,M,C) captured(A1) installed(M) request(I,L,R,A) REST }
+    => { prepared(I,L,R,M,A,contract(R,M,A,C)) REST } .
+endm
+mod NORM-RUN-PREPARATION-WEAK-METHOD is
+  including NORM-RUN-PREPARATION . vars I L R T M M1 C A : Id . var REST : Cfg .
+  rl [uninstalled-method] : { active(L,R,T) declaration(T,M,C) captured(A) installed(M1) request(I,L,R,A) REST }
+    => { prepared(I,L,R,M,A,contract(R,M,A,C)) REST } .
+endm
+mod NORM-RUN-PREPARATION-WEAK-CASES is
+  including NORM-RUN-PREPARATION . vars I L R T M C C1 A : Id . var REST : Cfg .
+  rl [caller-selected-cases] : { active(L,R,T) declaration(T,M,C) captured(A) installed(M) request(I,L,R,A) chosen(C1) REST }
+    => { prepared(I,L,R,M,A,contract(R,M,A,C1)) REST } .
+endm

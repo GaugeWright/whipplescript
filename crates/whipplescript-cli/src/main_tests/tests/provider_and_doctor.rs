@@ -284,6 +284,7 @@ fn provider_cancellation_policy_tracks_validated_native_shapes() {
 #[test]
 fn agent_provider_selection_uses_bound_harness_metadata() {
     let effect = ClaimableEffect {
+        attempt_admission_event_id: None,
         effect_id: "eff-1".to_owned(),
         kind: "agent.tell".to_owned(),
         target: Some("implementer".to_owned()),
@@ -340,6 +341,7 @@ fn provider_selection_metadata_surfaces_the_explainable_reason() {
 #[test]
 fn agent_provider_selection_supports_map_shaped_harness_metadata() {
     let effect = ClaimableEffect {
+        attempt_admission_event_id: None,
         effect_id: "eff-1".to_owned(),
         kind: "agent.tell".to_owned(),
         target: Some("implementer".to_owned()),
@@ -368,6 +370,7 @@ fn agent_provider_selection_supports_map_shaped_harness_metadata() {
 #[test]
 fn agent_provider_selection_uses_direct_provider_metadata() {
     let effect = ClaimableEffect {
+        attempt_admission_event_id: None,
         effect_id: "eff-1".to_owned(),
         kind: "agent.tell".to_owned(),
         target: Some("implementer".to_owned()),
@@ -427,6 +430,7 @@ fn agent_provider_selection_uses_provider_config_for_harness_surface() {
     )
     .expect("config writes");
     let effect = ClaimableEffect {
+        attempt_admission_event_id: None,
         effect_id: "eff-1".to_owned(),
         kind: "agent.tell".to_owned(),
         target: Some("implementer".to_owned()),
@@ -531,6 +535,7 @@ fn agent_provider_selection_uses_command_provider_config_plan() {
     )
     .expect("config writes");
     let effect = ClaimableEffect {
+        attempt_admission_event_id: None,
         effect_id: "eff-1".to_owned(),
         kind: "agent.tell".to_owned(),
         target: Some("worker".to_owned()),
@@ -600,6 +605,7 @@ fn command_provider_config_requires_executable() {
     )
     .expect("config writes");
     let effect = ClaimableEffect {
+        attempt_admission_event_id: None,
         effect_id: "eff-1".to_owned(),
         kind: "agent.tell".to_owned(),
         target: Some("worker".to_owned()),
@@ -636,6 +642,7 @@ fn command_provider_config_requires_executable() {
 #[test]
 fn agent_provider_selection_falls_back_without_harness_binding() {
     let effect = ClaimableEffect {
+        attempt_admission_event_id: None,
         effect_id: "eff-1".to_owned(),
         kind: "agent.tell".to_owned(),
         target: Some("worker".to_owned()),
@@ -690,6 +697,7 @@ fn native_turn_request_applies_provider_config_fields() {
     });
     let config = ProviderBindingConfig::from_value(&config_json).expect("provider config parses");
     let effect = ClaimableEffect {
+        attempt_admission_event_id: None,
         effect_id: "eff-1".to_owned(),
         kind: "agent.tell".to_owned(),
         target: Some("implementer".to_owned()),

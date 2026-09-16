@@ -1,0 +1,10 @@
+load ../exec-native-owner.maude
+search [1] in EXEC-NATIVE-CONTROL : cfg(original,owned,consistent,waiting) =>* cfg(original,owned,consistent,accepted) .
+search [1] in EXEC-NATIVE-CONTROL : cfg(original,owned,substituted,waiting) =>* cfg(original,owned,substituted,dispatched) .
+search [1] in EXEC-NATIVE-CONTROL : cfg(original,foreign,consistent,waiting) =>* cfg(original,foreign,consistent,dispatched) .
+search [1] in EXEC-NATIVE-CONTROL-WEAK : cfg(original,foreign,consistent,waiting) =>* cfg(original,foreign,consistent,dispatched) .
+search [1] in EXEC-NATIVE-CONTROL : cfg(changed,owned,consistent,dispatched) =>* cfg(changed,owned,consistent,accepted) .
+search [1] in EXEC-NATIVE-CONTROL-WEAK : cfg(changed,owned,consistent,dispatched) =>* cfg(changed,owned,consistent,accepted) .
+search [1] in EXEC-NATIVE-CONTROL : cfg(original,owned,substituted,dispatched) =>* cfg(original,owned,substituted,accepted) .
+search [1] in EXEC-NATIVE-CONTROL-WEAK : cfg(original,owned,substituted,dispatched) =>* cfg(original,owned,substituted,accepted) .
+quit

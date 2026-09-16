@@ -1,0 +1,15 @@
+load ../norm-execution-recovery.maude
+search [1] in NORM-EXECUTION-RECOVERY : { prepared(effect,input,body) terminal(run,effect) journal(run,effect,input,body,receipt) bound(receipt) } =>* { recovered(effect,run,receipt) C:Cfg } .
+search [1] in NORM-EXECUTION-RECOVERY : { prepared(effect,input,body) terminal(run,effect) journal(run,effect,input,body,receipt) bound(receipt) retrying(effect) } =>* { recovered(effect,run,receipt) C:Cfg } .
+search [1] in NORM-EXECUTION-RECOVERY : { prepared(effect,input,body) terminal(run,effect) journal(run,effect,input,body,receipt) bound(receipt) newerSuccess(effect) } =>* { recovered(effect,run,receipt) C:Cfg } .
+search [1] in NORM-EXECUTION-RECOVERY : { prepared(effect,input,body) journal(run,effect,input,body,receipt) bound(receipt) } =>* { recovered(effect,run,receipt) C:Cfg } .
+search [1] in NORM-EXECUTION-RECOVERY-WEAK-TERMINAL : { prepared(effect,input,body) journal(run,effect,input,body,receipt) bound(receipt) } =>* { recovered(effect,run,receipt) C:Cfg } .
+search [1] in NORM-EXECUTION-RECOVERY : { prepared(effect,input,body) terminal(run,effect) journal(run,other,input,body,receipt) bound(receipt) } =>* { recovered(effect,run,receipt) C:Cfg } .
+search [1] in NORM-EXECUTION-RECOVERY-WEAK-EFFECT : { prepared(effect,input,body) terminal(run,effect) journal(run,other,input,body,receipt) bound(receipt) } =>* { recovered(effect,run,receipt) C:Cfg } .
+search [1] in NORM-EXECUTION-RECOVERY : { prepared(effect,input,body) terminal(run,effect) journal(run,effect,other,body,receipt) bound(receipt) } =>* { recovered(effect,run,receipt) C:Cfg } .
+search [1] in NORM-EXECUTION-RECOVERY-WEAK-INPUT : { prepared(effect,input,body) terminal(run,effect) journal(run,effect,other,body,receipt) bound(receipt) } =>* { recovered(effect,run,receipt) C:Cfg } .
+search [1] in NORM-EXECUTION-RECOVERY : { prepared(effect,input,body) terminal(run,effect) journal(run,effect,input,other,receipt) bound(receipt) } =>* { recovered(effect,run,receipt) C:Cfg } .
+search [1] in NORM-EXECUTION-RECOVERY-WEAK-BODY : { prepared(effect,input,body) terminal(run,effect) journal(run,effect,input,other,receipt) bound(receipt) } =>* { recovered(effect,run,receipt) C:Cfg } .
+search [1] in NORM-EXECUTION-RECOVERY : { prepared(effect,input,body) terminal(run,effect) journal(run,effect,input,body,receipt) } =>* { recovered(effect,run,receipt) C:Cfg } .
+search [1] in NORM-EXECUTION-RECOVERY-WEAK-BINDING : { prepared(effect,input,body) terminal(run,effect) journal(run,effect,input,body,receipt) } =>* { recovered(effect,run,receipt) C:Cfg } .
+quit

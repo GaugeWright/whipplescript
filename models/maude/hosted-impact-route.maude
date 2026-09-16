@@ -1,0 +1,13 @@
+mod HOSTED-IMPACT-ROUTE is
+  sorts Premise State .
+  ops trusted caller missing mismatched : -> Premise [ctor] .
+  op query : Premise Premise Premise -> State [ctor] .
+  op planned : -> State [ctor] .
+  rl [installed-query] : query(trusted,trusted,trusted) => planned .
+endm
+mod HOSTED-IMPACT-ROUTE-WEAK is
+  including HOSTED-IMPACT-ROUTE .
+  rl [caller-configuration] : query(caller,trusted,trusted) => planned .
+  rl [missing-installation] : query(trusted,missing,trusted) => planned .
+  rl [different-deployment-image] : query(trusted,trusted,mismatched) => planned .
+endm

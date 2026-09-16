@@ -1,0 +1,11 @@
+load ../exec-fence-join.maude
+search [1] in EXEC-FENCE-JOIN : cfg(absent,none,missing,pending) =>* cfg(stopped,proposed,missing,proved) .
+search [1] in EXEC-FENCE-JOIN : cfg(intended,original,missing,pending) =>* cfg(stopped,original,missing,proved) .
+search [1] in EXEC-FENCE-JOIN : cfg(intended,original,retained,pending) =>* cfg(stopped,original,retained,proved) .
+search [1] in EXEC-FENCE-JOIN : cfg(intended,original,retained,pending) =>* cfg(intended,proposed,retained,required) .
+search [1] in EXEC-FENCE-JOIN-WEAK : cfg(intended,original,retained,pending) =>* cfg(intended,proposed,retained,required) .
+search [1] in EXEC-FENCE-JOIN : cfg(intended,original,retained,pending) =>* cfg(intended,original,retained,proved) .
+search [1] in EXEC-FENCE-JOIN-WEAK : cfg(intended,original,retained,pending) =>* cfg(intended,original,retained,proved) .
+search [1] in EXEC-FENCE-JOIN : cfg(intended,original,retained,pending) =>* cfg(intended,original,changed,required) .
+search [1] in EXEC-FENCE-JOIN-WEAK : cfg(intended,original,retained,pending) =>* cfg(intended,original,changed,required) .
+quit

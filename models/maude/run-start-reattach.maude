@@ -1,0 +1,45 @@
+--- Exact active-run reattachment retains its capacity and original event.
+--- Runtime ownership and atomic transactions are premises. Rechecking outgoing
+--- dispatch policy does not govern settlement of an already received reply.
+mod RUN-START-REATTACH is
+ sorts Id Fact Cfg State . ops original changed : -> Id [ctor] .
+ subsort Fact < Cfg . op none : -> Cfg [ctor] .
+ op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] . op {_} : Cfg -> State [ctor] .
+ ops request fresh running activeLease acknowledged : Id -> Fact [ctor] .
+ op claimable : -> Fact [ctor] .
+ ops live permitted dependencies uncancelled : -> Fact [ctor] .
+ var P : Id . var C : Cfg .
+ rl [fresh-start] : { fresh(P) claimable live permitted dependencies uncancelled C }
+ => { running(P) activeLease(P) acknowledged(P) live permitted dependencies uncancelled C } .
+ rl [reattach] : { request(P) running(P) activeLease(P) live permitted dependencies uncancelled C }
+ => { running(P) activeLease(P) acknowledged(P) live permitted dependencies uncancelled C } .
+endm
+mod RUN-START-REATTACH-WEAK-IDENTITY is
+ including RUN-START-REATTACH . var C : Cfg .
+ rl [weaken] : { request(changed) running(original) activeLease(original) live permitted dependencies uncancelled C } => { acknowledged(original) C } .
+endm
+mod RUN-START-REATTACH-WEAK-LEASE is
+ including RUN-START-REATTACH . var C : Cfg .
+ rl [weaken] : { request(original) running(original) live permitted dependencies uncancelled C } => { acknowledged(original) C } .
+endm
+mod RUN-START-REATTACH-WEAK-INSTANCE is
+ including RUN-START-REATTACH . var C : Cfg .
+ rl [weaken] : { request(original) running(original) activeLease(original) permitted dependencies uncancelled C } => { acknowledged(original) C } .
+endm
+mod RUN-START-REATTACH-WEAK-POLICY is
+ including RUN-START-REATTACH . var C : Cfg .
+ rl [weaken] : { request(original) running(original) activeLease(original) live dependencies uncancelled C } => { acknowledged(original) C } .
+endm
+mod RUN-START-REATTACH-WEAK-DEPENDENCIES is
+ including RUN-START-REATTACH . var C : Cfg .
+ rl [weaken] : { request(original) running(original) activeLease(original) live permitted uncancelled C } => { acknowledged(original) C } .
+endm
+mod RUN-START-REATTACH-WEAK-CANCELLATION is
+ including RUN-START-REATTACH . var C : Cfg .
+ rl [weaken] : { request(original) running(original) activeLease(original) live permitted dependencies C } => { acknowledged(original) C } .
+endm
+mod RUN-START-REATTACH-WEAK-FRESH-CLAIM is
+ including RUN-START-REATTACH . var C : Cfg .
+ rl [weaken] : { fresh(changed) live permitted dependencies uncancelled C }
+ => { running(changed) activeLease(changed) acknowledged(changed) live permitted dependencies uncancelled C } .
+endm

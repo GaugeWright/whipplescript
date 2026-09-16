@@ -129,6 +129,7 @@ if [ -f AGENTS.md ]; then
     # the classifier's own logic. Both are toolchain-free static scans, so they
     # belong in the required bar rather than a deep suite.
     echo "== gate test filters are guarded =="
+    python3 scripts/test-cargo-test-helper.py
     node scripts/check-cargo-test-guarded.mjs --selftest
     node scripts/check-cargo-test-guarded.mjs
 fi
@@ -271,6 +272,10 @@ cargo check -p whipplescript --no-default-features
 # nothing; closing that needs a decision about libtss2-dev as a prerequisite,
 # not a line here.
 cargo check -p whipplescript-custodian --features pkcs11 --all-targets
+
+echo "== norm observer runtime preparation =="
+python3 experiments/norm-wasi/prepare.py --fetch
+python3 experiments/norm-wasi/preparation_checks.py
 
 echo "== tests =="
 cargo test --workspace

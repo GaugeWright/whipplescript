@@ -1,0 +1,14 @@
+load ../exec-provider-lifetime.maude
+search [1] in EXEC-PROVIDER-LIFETIME : cfg(retained,none,unknown,exact) =>* cfg(retained,sent,stored,exact) .
+search [1] in EXEC-PROVIDER-LIFETIME : cfg(missing,none,unknown,exact) =>* cfg(retained,sent,stored,exact) .
+search [1] in EXEC-PROVIDER-LIFETIME : cfg(retained,none,unknown,foreign) =>* cfg(retained,sent,stored,foreign) .
+search [1] in EXEC-PROVIDER-LIFETIME-WEAK : cfg(retained,none,unknown,foreign) =>* cfg(retained,sent,stored,foreign) .
+search [1] in EXEC-PROVIDER-LIFETIME : cfg(retained,none,unknown,exact) =>1 cfg(retained,sent,unknown,exact) .
+search [1] in EXEC-PROVIDER-LIFETIME-WEAK : cfg(retained,none,unknown,exact) =>1 cfg(retained,sent,unknown,exact) .
+search [1] in EXEC-PROVIDER-LIFETIME : cfg(retained,none,unknown,exact) =>* cfg(retained,none,stored,exact) .
+search [1] in EXEC-PROVIDER-LIFETIME-WEAK : cfg(retained,none,unknown,exact) =>* cfg(retained,none,stored,exact) .
+search [1] in EXEC-PROVIDER-LIFETIME : cfg(retained,none,unknown,exact) =>* cfg(changed,sent,stored,exact) .
+search [1] in EXEC-PROVIDER-LIFETIME-WEAK : cfg(retained,none,unknown,exact) =>* cfg(changed,sent,stored,exact) .
+search [1] in EXEC-PROVIDER-LIFETIME : cfg(retained,none,forged,exact) =>* cfg(retained,none,stored,exact) .
+search [1] in EXEC-PROVIDER-LIFETIME-WEAK : cfg(retained,none,forged,exact) =>* cfg(retained,none,stored,exact) .
+quit

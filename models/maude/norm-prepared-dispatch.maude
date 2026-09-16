@@ -1,0 +1,53 @@
+--- Preparation pins the execution body and environment, never authority.
+--- Body identity includes the runner-owned timeout; host timeout defaults
+--- must reconstruct the same body, never weaken this equality.
+--- Digest collision resistance and authentic durable input are premises; the
+--- exec-dispatch model separately requires persistence before transport.
+mod NORM-PREPARED-DISPATCH is
+ sorts Id Fact Cfg State .
+ ops invocation body epoch other v1 future off on : -> Id [ctor] .
+ subsort Fact < Cfg . op none : -> Cfg [ctor] .
+ op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] . op {_} : Cfg -> State [ctor] .
+ op pin : Id Id Id Id -> Fact [ctor] .
+ op candidate : Id Id Id Id Id -> Fact [ctor] .
+ ops permitted dispatched : Id -> Fact [ctor] .
+ vars K B E : Id . var C : Cfg .
+ rl [exact-prepared-dispatch] :
+  { pin(K,v1,B,E) candidate(K,B,E,off,off) permitted(K) C }
+  => { dispatched(K) C } .
+endm
+mod NORM-PREPARED-DISPATCH-WEAK-MISSING is
+ including NORM-PREPARED-DISPATCH .
+ vars K B E : Id . var C : Cfg .
+ rl [weaken] : { candidate(K,B,E,off,off) permitted(K) C } => { dispatched(K) C } .
+endm
+mod NORM-PREPARED-DISPATCH-WEAK-PROTOCOL is
+ including NORM-PREPARED-DISPATCH .
+ vars K B E : Id . var C : Cfg .
+ rl [weaken] : { pin(K,future,B,E) candidate(K,B,E,off,off) permitted(K) C } => { dispatched(K) C } .
+endm
+mod NORM-PREPARED-DISPATCH-WEAK-BODY is
+ including NORM-PREPARED-DISPATCH .
+ vars K B E : Id . var C : Cfg .
+ rl [weaken] : { pin(K,v1,B,E) candidate(K,other,E,off,off) permitted(K) C } => { dispatched(K) C } .
+endm
+mod NORM-PREPARED-DISPATCH-WEAK-EPOCH is
+ including NORM-PREPARED-DISPATCH .
+ vars K B E : Id . var C : Cfg .
+ rl [weaken] : { pin(K,v1,B,E) candidate(K,B,other,off,off) permitted(K) C } => { dispatched(K) C } .
+endm
+mod NORM-PREPARED-DISPATCH-WEAK-CACHE is
+ including NORM-PREPARED-DISPATCH .
+ vars K B E : Id . var C : Cfg .
+ rl [weaken] : { pin(K,v1,B,E) candidate(K,B,E,on,off) permitted(K) C } => { dispatched(K) C } .
+endm
+mod NORM-PREPARED-DISPATCH-WEAK-PARSE is
+ including NORM-PREPARED-DISPATCH .
+ vars K B E : Id . var C : Cfg .
+ rl [weaken] : { pin(K,v1,B,E) candidate(K,B,E,off,on) permitted(K) C } => { dispatched(K) C } .
+endm
+mod NORM-PREPARED-DISPATCH-WEAK-POLICY is
+ including NORM-PREPARED-DISPATCH .
+ vars K B E : Id . var C : Cfg .
+ rl [weaken] : { pin(K,v1,B,E) candidate(K,B,E,off,off) C } => { dispatched(K) C } .
+endm

@@ -1,0 +1,67 @@
+--- DR-0098 V0: the bounded field-validation component of a vocabulary.
+--- Strings and integers each have one representative value. The schema has a
+--- required title and optional count. Presence, type, unknown names and duplicate
+--- names remain separate conditions. Status/authority are vocabulary-lifecycle.
+--- Payload/schema syntax parsing and arbitrary recursive types are not modeled.
+mod VOCABULARY-SCHEMA is
+  protecting BOOL .
+  sorts Name Value Entry Data Fact Cfg State .
+  ops title count extra : -> Name [ctor] .
+  ops text number : -> Value [ctor] .
+  op field : Name Value -> Entry [ctor] .
+  subsort Entry < Data .
+  op empty : -> Data [ctor] .
+  op _,_ : Data Data -> Data [ctor assoc comm id: empty] .
+  subsort Fact < Cfg .
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+  op {_} : Cfg -> State [ctor] .
+  ops submit accepted : Data -> Fact [ctor] .
+  vars D REST : Data .
+  var C : Cfg .
+  var N : Name .
+  var V : Value .
+  op present : Name Data -> Bool .
+  eq present(N, (field(N, V), D)) = true .
+  eq present(N, D) = false [owise] .
+  op typed : Data -> Bool .
+  eq typed(empty) = true .
+  eq typed((field(title, text), D)) = typed(D) .
+  eq typed((field(count, number), D)) = typed(D) .
+  --- Type checking deliberately does not own the unknown-field refusal.
+  eq typed((field(extra, V), D)) = typed(D) .
+  eq typed(D) = false [owise] .
+  op known : Data -> Bool .
+  eq known((field(extra, V), D)) = false .
+  eq known(D) = true [owise] .
+  op unique : Data -> Bool .
+  eq unique(empty) = true .
+  eq unique((field(N, V), D)) = not present(N, D) and unique(D) .
+  crl [validate] : { submit(D) C } => { accepted(D) C }
+    if present(title, D) = true /\ typed(D) = true /\ known(D) = true /\ unique(D) = true .
+endm
+
+mod VOCABULARY-SCHEMA-UNTYPED is
+  including VOCABULARY-SCHEMA .
+  var D : Data . var C : Cfg .
+  crl [forget-type] : { submit(D) C } => { accepted(D) C }
+    if present(title, D) = true /\ known(D) = true /\ unique(D) = true .
+endm
+mod VOCABULARY-SCHEMA-OPTIONAL is
+  including VOCABULARY-SCHEMA .
+  var D : Data . var C : Cfg .
+  crl [forget-required] : { submit(D) C } => { accepted(D) C }
+    if typed(D) = true /\ known(D) = true /\ unique(D) = true .
+endm
+mod VOCABULARY-SCHEMA-OPEN is
+  including VOCABULARY-SCHEMA .
+  var D : Data . var C : Cfg .
+  crl [forget-known] : { submit(D) C } => { accepted(D) C }
+    if present(title, D) = true /\ typed(D) = true /\ unique(D) = true .
+endm
+mod VOCABULARY-SCHEMA-DUPLICATES is
+  including VOCABULARY-SCHEMA .
+  var D : Data . var C : Cfg .
+  crl [forget-unique] : { submit(D) C } => { accepted(D) C }
+    if present(title, D) = true /\ typed(D) = true /\ known(D) = true .
+endm

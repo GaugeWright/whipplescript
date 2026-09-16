@@ -14,8 +14,26 @@ pub const SELECT: &str = "SELECT candidate.effect_id, candidate.kind, \
 
 /// This compares observations, not grants. A successful comparison never
 /// substitutes for current authorization or ordinary dispatch eligibility.
+/// Compares the effect DEFINITION, field by field.
+///
+/// `attempt_admission_event_id` is deliberately excluded: it records which
+/// attempt admission selected the effect, not what the effect is, and it is
+/// populated by a separate lookup rather than read from the effect row. Whole-
+/// struct equality would therefore refuse every observed dispatch whose caller
+/// authorized an observation carrying one. The admission itself is still
+/// checked -- `start_run_observed_retained` verifies the selection inside the
+/// same transaction that claims the run.
 pub fn check(expected: &ClaimableEffect, observed: Option<&ClaimableEffect>) -> StoreResult<()> {
-    if observed != Some(expected) {
+    let same = observed.is_some_and(|observed| {
+        observed.effect_id == expected.effect_id
+            && observed.kind == expected.kind
+            && observed.target == expected.target
+            && observed.profile == expected.profile
+            && observed.input_json == expected.input_json
+            && observed.required_capabilities_json == expected.required_capabilities_json
+            && observed.declared_profiles_json == expected.declared_profiles_json
+    });
+    if !same {
         return Err(StoreError::Conflict(
             "dispatch effect differs from the authorized observation".into(),
         ));
@@ -58,6 +76,8 @@ pub(crate) fn native(
                 input_json: row.get(4)?,
                 required_capabilities_json: row.get(5)?,
                 declared_profiles_json: row.get(6)?,
+                // Not definitional, and not in this row; see `check`.
+                attempt_admission_event_id: None,
             })
         })
         .optional()?;

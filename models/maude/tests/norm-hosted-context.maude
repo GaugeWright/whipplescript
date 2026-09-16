@@ -1,0 +1,10 @@
+load ../norm-observer.maude
+search [1] in NORM-HOSTED-CONTEXT : cfg(exact,exact,passed,input) =>* cfg(exact,exact,passed,prepared) .
+search [1] in NORM-HOSTED-CONTEXT : cfg(exact,exact,passed,input) =>* cfg(exact,exact,passed,verified) .
+search [1] in NORM-HOSTED-CONTEXT : cfg(changed,exact,passed,input) =>* cfg(changed,exact,passed,prepared) .
+search [1] in NORM-HOSTED-CONTEXT-WEAK : cfg(changed,exact,passed,input) =>* cfg(changed,exact,passed,prepared) .
+search [1] in NORM-HOSTED-CONTEXT : cfg(exact,changed,passed,input) =>* cfg(exact,changed,passed,prepared) .
+search [1] in NORM-HOSTED-CONTEXT-WEAK : cfg(exact,changed,passed,input) =>* cfg(exact,changed,passed,prepared) .
+search [1] in NORM-HOSTED-CONTEXT : cfg(exact,exact,failed,input) =>* cfg(exact,exact,failed,verified) .
+search [1] in NORM-HOSTED-CONTEXT-WEAK : cfg(exact,exact,failed,input) =>* cfg(exact,exact,failed,verified) .
+quit

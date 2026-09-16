@@ -214,6 +214,8 @@ fn fixture_for_source(
                 input_json: effect.input_json,
                 required_capabilities_json: effect.required_capabilities_json,
                 declared_profiles_json: effect.declared_profiles_json,
+                // Fixture: no attempt admission selected this effect.
+                attempt_admission_event_id: None,
             })
             .collect();
     }

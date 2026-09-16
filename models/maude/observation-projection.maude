@@ -1,0 +1,28 @@
+--- Authenticated history and independently recovered execution are premises.
+--- Projection never derives exercise authority from a publication signature.
+mod OBSERVATION-PROJECTION is
+  sorts Binding Integrity Policy Visibility State Result .
+  ops exact altered missing unknownVocabulary : -> Binding [ctor] .
+  ops cooperative protected : -> Integrity [ctor] .
+  ops acceptsCooperative protectedOnly : -> Policy [ctor] .
+  ops ancestor later : -> Visibility [ctor] .
+  ops support gap excluded : -> Result [ctor] .
+  op candidate : Binding Integrity Policy Visibility -> State [ctor] .
+  op projected : Result -> State [ctor] .
+  var I : Integrity . var P : Policy . var V : Visibility . var B : Binding .
+  rl [outside-frontier] : candidate(B,I,P,later) => projected(excluded) .
+  rl [protected-binding] : candidate(exact,protected,P,ancestor) => projected(support) .
+  rl [cooperative-policy] : candidate(exact,cooperative,acceptsCooperative,ancestor) => projected(support) .
+  rl [policy-gap] : candidate(exact,cooperative,protectedOnly,ancestor) => projected(gap) .
+  rl [altered-publication] : candidate(altered,I,P,ancestor) => projected(gap) .
+  rl [missing-execution] : candidate(missing,I,P,ancestor) => projected(gap) .
+  rl [unknown-vocabulary] : candidate(unknownVocabulary,I,P,ancestor) => projected(gap) .
+endm
+mod OBSERVATION-PROJECTION-WEAK is
+  including OBSERVATION-PROJECTION .
+  var I : Integrity . var P : Policy .
+  rl [trust-published-label] : candidate(altered,I,P,ancestor) => projected(support) .
+  rl [signature-is-exercise] : candidate(missing,I,P,ancestor) => projected(support) .
+  rl [upgrade-observer] : candidate(exact,cooperative,protectedOnly,ancestor) => projected(support) .
+  rl [ignore-frontier] : candidate(exact,protected,P,later) => projected(support) .
+endm

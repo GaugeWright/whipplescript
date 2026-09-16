@@ -15,6 +15,11 @@ const publicOperations = [
 ];
 
 const hostOperations = [
+  ["runtime.host.norm.impacts", "POST", "/host/norm/impacts", "http-json", "none", "critical"],
+  ["runtime.host.norm.enqueues", "POST", "/host/norm/enqueues", "http-json", "mutation", "critical"],
+  ["runtime.host.norm.publications", "POST", "/host/norm/publications", "http-json", "mutation", "critical"],
+  ["runtime.host.norm.provision", "POST", "/host/norm/provision", "http-json", "mutation", "critical"],
+  ["runtime.host.norm.commands", "POST", "/host/norm/commands", "http-json", "mutation", "critical"],
   ["runtime.host.policy", "POST", "/host/policy", "http-json", "mutation", "critical"],
   // A handle, not bytes: the object plane streams the content and this records
   // that it exists (DR-0113). Important rather than critical — it asserts a fact
@@ -100,6 +105,18 @@ function samplePath(path) {
 }
 
 function evidenceFor(id) {
+  if (id === "runtime.host.norm.impacts") {
+    const impact = "src/norm-impact.integration.test.ts#norm-installed-impact";
+    return { contract: [impact], authority: [impact], journey: [impact], deployed: [], property: [impact] };
+  }
+  if (id === "runtime.host.norm.enqueues") {
+    const enqueue = "src/authenticated-host.integration.test.ts#norm-observation-enqueue";
+    return { contract: [enqueue], authority: [enqueue], journey: [enqueue], deployed: [], property: [enqueue] };
+  }
+  if (id === "runtime.host.norm.publications") {
+    const publication = "src/authenticated-host.integration.test.ts#norm-observation-publication";
+    return { contract: [publication], authority: [publication], journey: [publication], deployed: [], property: [publication] };
+  }
   const publicSession = id.startsWith("runtime.public.");
   const declaredInnerRoute = id.startsWith("runtime.host.")
     || id === "runtime.legacy.start";

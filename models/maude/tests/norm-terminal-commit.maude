@@ -1,0 +1,24 @@
+load ../norm-terminal-commit.maude
+search [1] in NORM-TERMINAL-COMMIT : request(active) =>* success(terminal) .
+search [1] in NORM-TERMINAL-COMMIT : request(terminal) =>* refused(terminal) .
+search [1] in NORM-TERMINAL-COMMIT : staging(active,event) =>* refused(active) .
+search [1] in NORM-TERMINAL-COMMIT : staging(active,event) =>* refused(partial(active,event)) .
+search [1] in NORM-TERMINAL-COMMIT-WEAK-ROLLBACK : staging(active,event) =>* refused(partial(active,event)) .
+search [1] in NORM-TERMINAL-COMMIT : staging(active,run) =>* refused(active) .
+search [1] in NORM-TERMINAL-COMMIT : staging(active,run) =>* refused(partial(active,run)) .
+search [1] in NORM-TERMINAL-COMMIT-WEAK-ROLLBACK : staging(active,run) =>* refused(partial(active,run)) .
+search [1] in NORM-TERMINAL-COMMIT : staging(active,lease) =>* refused(active) .
+search [1] in NORM-TERMINAL-COMMIT : staging(active,lease) =>* refused(partial(active,lease)) .
+search [1] in NORM-TERMINAL-COMMIT-WEAK-ROLLBACK : staging(active,lease) =>* refused(partial(active,lease)) .
+search [1] in NORM-TERMINAL-COMMIT : staging(active,effect) =>* refused(active) .
+search [1] in NORM-TERMINAL-COMMIT : staging(active,effect) =>* refused(partial(active,effect)) .
+search [1] in NORM-TERMINAL-COMMIT-WEAK-ROLLBACK : staging(active,effect) =>* refused(partial(active,effect)) .
+search [1] in NORM-TERMINAL-COMMIT : staging(active,dependencies) =>* refused(active) .
+search [1] in NORM-TERMINAL-COMMIT : staging(active,dependencies) =>* refused(partial(active,dependencies)) .
+search [1] in NORM-TERMINAL-COMMIT-WEAK-ROLLBACK : staging(active,dependencies) =>* refused(partial(active,dependencies)) .
+search [1] in NORM-TERMINAL-COMMIT : staging(active,diagnostics) =>* refused(active) .
+search [1] in NORM-TERMINAL-COMMIT : staging(active,diagnostics) =>* refused(partial(active,diagnostics)) .
+search [1] in NORM-TERMINAL-COMMIT-WEAK-ROLLBACK : staging(active,diagnostics) =>* refused(partial(active,diagnostics)) .
+search [1] in NORM-TERMINAL-COMMIT : request(terminal) =>* refused(partial(terminal,event)) .
+search [1] in NORM-TERMINAL-COMMIT-WEAK-REFUSAL : request(terminal) =>* refused(partial(terminal,event)) .
+quit

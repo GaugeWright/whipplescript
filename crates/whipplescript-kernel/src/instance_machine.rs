@@ -39,6 +39,10 @@ pub enum EffectStep {
     /// The effect settled synchronously to its terminal (a store-only effect, or
     /// the final round of an HTTP effect).
     Done(StoredEvent),
+    /// An operational wait was committed without settling the effect. Before
+    /// returning, the driver must exclude it from readiness until its durable
+    /// wake is due. Continue the fixpoint so independent work can proceed.
+    Deferred(StoredEvent),
     /// The effect needs one HTTP round; the host performs it and re-runs the
     /// effect with the response (at-least-once + idempotency key — DR-0033
     /// Decision 3; see `ResumableEffectLifecycle`).
@@ -131,7 +135,7 @@ impl<D: InstanceDriver> StepMachine for InstanceStepMachine<D> {
         if let Some(effect) = self.in_flight.take() {
             let response = incoming.map(|IoResult::Http(result)| result);
             match self.driver.run_effect(&effect, response) {
-                Ok(EffectStep::Done(_)) => {} // fall through into the fixpoint
+                Ok(EffectStep::Done(_) | EffectStep::Deferred(_)) => {} // fall through into the fixpoint
                 Ok(EffectStep::NeedsHttp(request)) => {
                     self.in_flight = Some(effect);
                     return Outcome::NeedsIo(IoRequest::Http(request));
@@ -155,7 +159,7 @@ impl<D: InstanceDriver> StepMachine for InstanceStepMachine<D> {
                 Err(error) => return Outcome::Settle(InstanceOutcome::Failed(error)),
             };
             match self.driver.run_effect(&ready, None) {
-                Ok(EffectStep::Done(_)) => continue,
+                Ok(EffectStep::Done(_) | EffectStep::Deferred(_)) => continue,
                 Ok(EffectStep::NeedsHttp(request)) => {
                     self.in_flight = Some(ready);
                     return Outcome::NeedsIo(IoRequest::Http(request));
@@ -175,6 +179,7 @@ mod tests {
 
     fn effect(id: &str, kind: &str) -> ClaimableEffect {
         ClaimableEffect {
+            attempt_admission_event_id: None,
             effect_id: id.to_owned(),
             kind: kind.to_owned(),
             target: None,

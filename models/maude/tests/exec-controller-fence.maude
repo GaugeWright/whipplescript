@@ -1,0 +1,21 @@
+load ../exec-controller-fence.maude
+search [1] in EXEC-CONTROLLER-FENCE : cfg(absent,read,0,missing) =>* cfg(absent,nil,0,missing) .
+search [1] in EXEC-CONTROLLER-FENCE : cfg(absent,fence admit,0,missing) =>* cfg(tombstone,nil,0,notAdmitted) .
+search [1] in EXEC-CONTROLLER-FENCE : cfg(absent,admit fence,0,missing) =>* cfg(fencing,nil,1,fenceRequired) .
+search [1] in EXEC-CONTROLLER-FENCE : cfg(absent,admit fence complete fence,0,missing) =>* cfg(completed,nil,1,fenceRequired) .
+search [1] in EXEC-CONTROLLER-FENCE : cfg(absent,admit complete fence read,0,missing) =>* cfg(completed,nil,1,replay) .
+search [1] in EXEC-CONTROLLER-FENCE : cfg(absent,fence admit,0,missing) =>* cfg(admitted,nil,1,execute) .
+search [1] in EXEC-CONTROLLER-FENCE-WEAK : cfg(absent,fence admit,0,missing) =>* cfg(admitted,nil,1,execute) .
+search [1] in EXEC-CONTROLLER-FENCE : cfg(absent,admit fence,0,missing) =>* cfg(tombstone,nil,1,notAdmitted) .
+search [1] in EXEC-CONTROLLER-FENCE-WEAK : cfg(absent,admit fence,0,missing) =>* cfg(tombstone,nil,1,notAdmitted) .
+search [1] in EXEC-CONTROLLER-FENCE : cfg(absent,admit complete fence,0,missing) =>* cfg(fencing,nil,1,fenceRequired) .
+search [1] in EXEC-CONTROLLER-FENCE-WEAK : cfg(absent,admit complete fence,0,missing) =>* cfg(fencing,nil,1,fenceRequired) .
+search [1] in EXEC-CONTROLLER-FENCE : cfg(absent,admit complete fence,0,missing) =>* cfg(completed,nil,1,replay) .
+search [1] in EXEC-CONTROLLER-FENCE-WEAK : cfg(absent,admit complete fence,0,missing) =>* cfg(completed,nil,1,replay) .
+search [1] in EXEC-INCARNATION : cfg(1,1,delivery,pending) =>* cfg(1,1,delivery,executed) .
+search [1] in EXEC-INCARNATION : cfg(1,0,delivery,pending) =>* cfg(1,0,delivery,rejected) .
+search [1] in EXEC-INCARNATION : cfg(1,0,delivery,pending) =>* cfg(1,0,delivery,executed) .
+search [1] in EXEC-INCARNATION-WEAK : cfg(1,0,delivery,pending) =>* cfg(1,0,delivery,executed) .
+search [1] in EXEC-INCARNATION : cfg(1,0,completion,pending) =>* cfg(1,0,completion,accepted) .
+search [1] in EXEC-INCARNATION-WEAK : cfg(1,0,completion,pending) =>* cfg(1,0,completion,accepted) .
+quit

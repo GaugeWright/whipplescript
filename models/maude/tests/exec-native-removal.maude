@@ -1,0 +1,12 @@
+load ../exec-native-owner.maude
+search [1] in EXEC-NATIVE-REMOVAL : cfg(bound,present,pending,none) =>* cfg(bound,gone,removed,none) .
+search [1] in EXEC-NATIVE-REMOVAL : cfg(bound,gone,pending,none) =>* cfg(bound,gone,removed,none) .
+search [1] in EXEC-NATIVE-REMOVAL : cfg(foreign,present,pending,none) =>* cfg(foreign,gone,removed,none) .
+search [1] in EXEC-NATIVE-REMOVAL-WEAK : cfg(foreign,present,pending,none) =>* cfg(foreign,gone,removed,none) .
+search [1] in EXEC-NATIVE-REMOVAL : cfg(missing,present,pending,none) =>* cfg(missing,gone,removed,none) .
+search [1] in EXEC-NATIVE-REMOVAL-WEAK : cfg(missing,present,pending,none) =>* cfg(missing,gone,removed,none) .
+search [1] in EXEC-NATIVE-REMOVAL : cfg(bound,gone,removed,none) =>* cfg(bound,gone,removed,proved) .
+search [1] in EXEC-NATIVE-REMOVAL-WEAK : cfg(bound,gone,removed,none) =>* cfg(bound,gone,removed,proved) .
+search [1] in EXEC-NATIVE-REMOVAL : cfg(bound,gone,removed,none) =>* cfg(bound,present,pending,none) .
+search [1] in EXEC-NATIVE-REMOVAL-WEAK : cfg(bound,gone,removed,none) =>* cfg(bound,present,pending,none) .
+quit

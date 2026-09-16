@@ -39,3 +39,18 @@ lto = "thin"
 # Local crates keep full debuggability: panics and the debugger still work here.
 [profile.dev.package."*"]
 debug = false
+
+# Observer tests compile a real CPython reactor. Keep the JIT compiler optimized
+# in development builds; unoptimized translation dominates the workspace gate.
+# Workspace crates retain their ordinary debug profile.
+[profile.dev.package.cranelift-codegen]
+opt-level = 3
+
+[profile.dev.package.cranelift-frontend]
+opt-level = 3
+
+[profile.dev.package.wasmparser]
+opt-level = 3
+
+[profile.dev.package.wasmtime-internal-cranelift]
+opt-level = 3

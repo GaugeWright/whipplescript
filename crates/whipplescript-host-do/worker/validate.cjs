@@ -7,7 +7,7 @@ const crypto = require("node:crypto");
 const fs = require("node:fs");
 const path = require("node:path");
 const { DatabaseSync } = require("node:sqlite");
-const { WasmDurableInstance } = require("./pkg/whipplescript_host_do.js");
+const { WasmDurableInstance } = require("./pkg-node/whipplescript_host_do.js");
 
 const schema = fs.readFileSync(path.join(__dirname, "do_schema.sql"), "utf8");
 
@@ -17,6 +17,17 @@ function freshInstanceEnv(seedSql) {
   db.exec(schema);
   for (const stmt of seedSql) db.exec(stmt);
   const bridge = {
+    transaction(operation) {
+      db.exec("SAVEPOINT rule_commit");
+      try {
+        operation();
+        db.exec("RELEASE rule_commit");
+      } catch (error) {
+        db.exec("ROLLBACK TO rule_commit");
+        db.exec("RELEASE rule_commit");
+        throw error;
+      }
+    },
     exec(sql, paramsJson) {
       const params = JSON.parse(paramsJson);
       return Number(db.prepare(sql).run(...params).changes);
@@ -213,7 +224,7 @@ function testAgentToolCall() {
 // 4) A Class-A EXEC workflow (compute plane P8): the exec.command effect builds a
 //    whip-executor/1 request and SUSPENDS on fetch; the sidecar's canned response
 //    RESUMES it to a terminal -- and the delta-kernel cache entry is recorded.
-function testExecSuspendResume() {
+function testExecSuspendResume(foreignReply = false) {
   const source = [
     "workflow ExecJudge", "", "use std.script", "", "output result Verdict", "",
     "class CheckInput {", "  n int", "}", "",
@@ -227,7 +238,7 @@ function testExecSuspendResume() {
     "INSERT INTO capability_schemas (capability, description, schema_json) VALUES ('script.judge', 'Run an operator-pinned script.', '{}')",
     "INSERT INTO capability_bindings (binding_id, program_id, capability, provider, config_json) VALUES ('binding_script_judge', NULL, 'script.judge', 'builtin-script', '{}')",
   ];
-  const { bridge } = freshInstanceEnv(seed);
+  const { bridge, db } = freshInstanceEnv(seed);
   const body = "echo ok\n";
   const sha = crypto.createHash("sha256").update(body).digest("hex");
   const execConfig = JSON.stringify({ base_url: "http://executor:8080", environment_epoch: "test-epoch" });
@@ -241,23 +252,45 @@ function testExecSuspendResume() {
 
   // First step: the exec effect suspends on the sidecar fetch.
   const first = JSON.parse(inst.step(undefined, Date.now()));
-  assert.strictEqual(first.kind, "needs_http", `exec step1: ${JSON.stringify(first)}`);
+  assert.strictEqual(first.kind, "needs_executor", `exec step1: ${JSON.stringify(first)}`);
   assert.ok(first.request.url.endsWith("/exec"), "request targets the executor");
-  assert.strictEqual(first.request.body.protocol, "whip-executor/1");
-  assert.strictEqual(first.request.body.script_sha256, sha);
+  assert.strictEqual(first.request.body.envelope.dispatch.protocol, "whip-executor/1");
+  assert.strictEqual(first.request.body.envelope.dispatch.script_sha256, sha);
 
+  const prepared = JSON.parse(db.prepare("SELECT metadata_json FROM runs WHERE effect_id = ?").get(first.request.body.envelope.dispatch.effect_id).metadata_json);
+  assert.strictEqual(prepared.executor_dispatch.request_sha256, crypto.createHash("sha256").update(JSON.stringify([first.request.url, first.request.body.envelope.dispatch])).digest("hex"));
+  assert.deepStrictEqual(first.request.body.envelope, prepared.executor_invocation);
+  const now = Date.now();
+  const waiting = JSON.parse(inst.step(JSON.stringify({ status: 202, body: {
+    protocol: "whipplescript.exec.reconciliation/v1", state: "pending",
+  } }), now));
+  assert.strictEqual(waiting.kind, "parked");
+  assert.strictEqual(waiting.next_due_unix_ms, now + 1000);
+  const early = JSON.parse(inst.step(undefined, now));
+  assert.deepStrictEqual(early, waiting);
+  const retry = JSON.parse(inst.step(undefined, now + 1000));
+  assert.deepStrictEqual(retry, first);
+  db.prepare("DELETE FROM script_capabilities WHERE name = ?").run("judge");
   // The shell performs the fetch; feed the sidecar's canned result back.
   const response = JSON.stringify({
     status: 200,
     body: {
-      protocol: "whip-executor/1", effect_id: "e", exit_code: 0,
+      protocol: "whip-executor/1", effect_id: foreignReply ? "foreign-effect" : first.request.body.envelope.dispatch.effect_id, exit_code: 0,
       timed_out: false, stdout: "ok\n", stderr: "",
     },
   });
   const second = JSON.parse(inst.step(response, Date.now()));
   assert.strictEqual(second.kind, "terminal", `exec step2: ${JSON.stringify(second)}`);
   assert.strictEqual(inst.status(), "completed");
-  console.log("PASS  exec workflow -> needs_http (whip-executor/1) -> terminal (two steps)");
+  const run = db.prepare("SELECT status, metadata_json FROM runs WHERE effect_id = ?").get(first.request.body.envelope.dispatch.effect_id);
+  assert.strictEqual(run.status, foreignReply ? "failed" : "completed");
+  const metadata = JSON.parse(run.metadata_json);
+  assert.deepStrictEqual(metadata.executor_dispatch, prepared.executor_dispatch);
+  assert.strictEqual(metadata.sha256, sha);
+  assert.strictEqual(metadata.executor_response.body.effect_id, foreignReply ? "foreign-effect" : first.request.body.envelope.dispatch.effect_id);
+  const cached = db.prepare("SELECT COUNT(*) AS n FROM compute_result_cache").get();
+  assert.strictEqual(Number(cached.n), foreignReply ? 0 : 1);
+  console.log(`PASS  exec dispatch survives removed registration; ${foreignReply ? "foreign reply refuses" : "original reply settles"}`);
 }
 
 
@@ -316,7 +349,7 @@ function testFileWrite() {
   const source = [
     "workflow FileWrite", "", "output result Done", "",
     "class Done {", "  status string", "}", "",
-    'file store out_files {', '  root "/ws"', "}", "",
+    'file store out_files {', '  root "/ws"', '  allow write ["note.md"]', "}", "",
     "rule pick", "  when started", "=> {",
     '  write text to out_files at "note.md" {', '    body "hello DO"', "    mode create", "  } as written", "",
     "  after written succeeds as result {", '    complete result { status "wrote" }', "  }", "}",
@@ -348,7 +381,7 @@ function testCheckpointRestore() {
   const source = [
     "workflow FileRestore", "", "output result Done", "",
     "class Done {", "  status string", "}", "",
-    'file store out_files {', '  root "/ws"', "}", "",
+    'file store out_files {', '  root "/ws"', '  allow write ["note.md"]', "}", "",
     "rule pick", "  when started", "=> {",
     '  write text to out_files at "note.md" {', '    body "V1"', "    mode create", "  } as written", "",
     "  after written succeeds as result {", '    complete result { status "wrote" }', "  }", "}",
@@ -453,6 +486,7 @@ testCoerceSuspendResume();
 testAgentSuspendResume();
 testAgentToolCall();
 testExecSuspendResume();
+testExecSuspendResume(true);
 testTurnContainerAgent();
 testFileWrite();
 testCheckpointRestore();

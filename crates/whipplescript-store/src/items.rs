@@ -403,6 +403,8 @@ impl WorkItemStore {
                 singleton INTEGER PRIMARY KEY CHECK(singleton = 1), domain TEXT
              ); INSERT OR IGNORE INTO tracker_payload_protection VALUES (1, NULL);",
         )?;
+        // The norm plane's tables live in the same satellite store.
+        connection.execute_batch(crate::norm::NORM_SCHEMA_SQL)?;
         Ok(())
     }
 
@@ -1767,6 +1769,141 @@ impl WorkItemStore {
             .flatten())
     }
 
+    /// The durable trust pin is not a disposable projection or an imported
+    /// event. A partial import can lose evidence without losing this identity.
+    pub fn norm_ledger_id(&self) -> StoreResult<Option<String>> {
+        self.connection
+            .query_row(
+                "SELECT genesis_id FROM tracker_norm_identity WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    /// A genesis-only pin is a shorthand for the initial authority checkpoint.
+    /// A ledger that has rotated must be restored from its full trusted checkpoint.
+    pub fn pin_norm_ledger(&mut self, genesis_id: &str) -> StoreResult<()> {
+        self.pin_norm_checkpoint(&crate::norm::NormCheckpoint::genesis(genesis_id.into()))
+    }
+
+    pub fn norm_checkpoint(&self) -> StoreResult<Option<crate::norm::NormCheckpoint>> {
+        load_norm_checkpoint(&self.connection)
+    }
+
+    /// Pin the destination's trusted identity and authority event together.
+    /// The host obtains these from authenticated configuration, not the bundle.
+    pub fn pin_norm_checkpoint(
+        &mut self,
+        checkpoint: &crate::norm::NormCheckpoint,
+    ) -> StoreResult<()> {
+        checkpoint.validate()?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        if load_norm_checkpoint(&tx)?
+            .as_ref()
+            .is_some_and(|existing| existing != checkpoint)
+        {
+            return Err(StoreError::Conflict(
+                "cannot replace the pinned norm checkpoint".into(),
+            ));
+        }
+        tx.execute(
+            "INSERT OR IGNORE INTO tracker_norm_checkpoint (singleton, genesis_id, authority_head) VALUES (1, ?1, ?2)",
+            params![checkpoint.ledger, checkpoint.authority_head],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Durable local aliases. Signed events and cross-ledger references always
+    /// use content ids, never this destination's display names.
+    pub fn norm_aliases(&self) -> StoreResult<std::collections::BTreeMap<String, String>> {
+        let mut query = self.connection.prepare(
+            "SELECT record_id, 'N-' || ordinal FROM tracker_norm_aliases ORDER BY ordinal",
+        )?;
+        let rows = query.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        rows.collect::<Result<_, _>>().map_err(Into::into)
+    }
+
+    pub fn resolve_norm_record(&self, reference: &str) -> StoreResult<Option<String>> {
+        self.connection.query_row(
+            "SELECT record_id FROM tracker_norm_aliases WHERE record_id = ?1 OR 'N-' || ordinal = ?1",
+            [reference], |row| row.get(0),
+        ).optional().map_err(Into::into)
+    }
+
+    pub fn norm_view(
+        &self,
+        verifier: &dyn crate::norm::NormVerifier,
+    ) -> StoreResult<crate::norm::NormView> {
+        let pin = self.norm_checkpoint()?.ok_or_else(|| {
+            StoreError::Conflict("norm ledger is not bootstrapped or pinned".into())
+        })?;
+        crate::norm::replay_norm(&load_norm_events(&self.connection)?, &pin, verifier)
+    }
+
+    pub fn append_norm_event(
+        &mut self,
+        signed: &crate::norm::SignedNormEvent,
+        verifier: &dyn crate::norm::NormVerifier,
+    ) -> StoreResult<String> {
+        let event = signed.tracker_event()?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let pin = load_norm_checkpoint(&tx)?;
+        let view =
+            crate::norm::admit_norm(&load_norm_events(&tx)?, pin.as_ref(), &event, verifier)?;
+        tx.execute(
+            "INSERT OR IGNORE INTO tracker_norm_identity (singleton, genesis_id) VALUES (1, ?1)",
+            [&view.ledger],
+        )?;
+        insert_norm_event(&tx, &event, self.event_effect_id.as_deref())?;
+        tx.commit()?;
+        Ok(event.event_id)
+    }
+
+    /// Batch restoration/import is all-or-nothing. Identity comes from the
+    /// already pinned destination, never a bootstrap proposed by the importer.
+    pub fn import_norm_events(
+        &mut self,
+        events: &[TrackerEvent],
+        verifier: &dyn crate::norm::NormVerifier,
+    ) -> StoreResult<usize> {
+        if events.iter().any(|event| !event.kind.starts_with("norm.")) {
+            return Err(StoreError::Conflict(
+                "norm import contains a non-norm event".into(),
+            ));
+        }
+        let tx = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let Some(pin) = load_norm_checkpoint(&tx)? else {
+            // MUTATION-SUCCESS-EXPR: Ok(0)
+            return Err(StoreError::Conflict("norm import is unpinned".into()));
+        };
+        let mut combined = load_norm_events(&tx)?;
+        combined.extend_from_slice(events);
+        let view = crate::norm::replay_norm(&combined, &pin, verifier)?;
+        let imported: std::collections::BTreeMap<_, _> = events
+            .iter()
+            .map(|event| (event.event_id.as_str(), event))
+            .collect();
+        let mut inserted = 0;
+        for event in view
+            .event_order()
+            .iter()
+            .filter_map(|id| imported.get(id.as_str()))
+        {
+            inserted += insert_norm_event(&tx, event, None)?;
+        }
+        tx.commit()?;
+        Ok(inserted)
+    }
+
     pub fn export_events(&self) -> StoreResult<Vec<TrackerEvent>> {
         let mut statement = self.connection.prepare(
             "SELECT event_id, parents_json, issue_id, kind, whip_tracker_event_open(event_id, kind, payload_json), actor, created_at \
@@ -1807,6 +1944,12 @@ impl WorkItemStore {
                 .connection
                 .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
             for event in events {
+                // Norm authority needs its authenticated admission door. A
+                // content hash alone cannot admit or replace governance.
+                if event.kind.starts_with("norm.") {
+                    report.rejected += 1;
+                    continue;
+                }
                 // Re-verify the content-addressed id before admitting an event
                 // from an untrusted transport (shared folder / rsync / synced
                 // drive). Without this, a tampered `<hash>.json` whose payload
@@ -3833,6 +3976,68 @@ fn row_to_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkItem> {
     })
 }
 
+#[cfg(feature = "native")]
+fn load_norm_checkpoint(
+    connection: &Connection,
+) -> StoreResult<Option<crate::norm::NormCheckpoint>> {
+    connection
+        .query_row(
+            "SELECT genesis_id, authority_head FROM tracker_norm_checkpoint WHERE singleton = 1",
+            [],
+            |row| {
+                Ok(crate::norm::NormCheckpoint {
+                    ledger: row.get(0)?,
+                    authority_head: row.get(1)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(Into::into)
+}
+
+#[cfg(feature = "native")]
+fn load_norm_events(connection: &Connection) -> StoreResult<Vec<TrackerEvent>> {
+    let mut statement = connection.prepare("SELECT event_id, parents_json, issue_id, kind, payload_json, actor, created_at FROM tracker_events WHERE kind LIKE 'norm.%' ORDER BY event_seq")?;
+    let rows = statement.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, Option<String>>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, String>(4)?,
+            row.get::<_, Option<String>>(5)?,
+            row.get::<_, String>(6)?,
+        ))
+    })?;
+    let mut events = Vec::new();
+    for row in rows {
+        let (event_id, parents, issue_id, kind, payload_json, actor, created_at) = row?;
+        events.push(TrackerEvent {
+            event_id,
+            parents: serde_json::from_str(&parents)?,
+            issue_id,
+            kind,
+            payload_json,
+            actor,
+            created_at,
+        });
+    }
+    Ok(events)
+}
+
+#[cfg(feature = "native")]
+fn insert_norm_event(
+    tx: &Transaction<'_>,
+    event: &TrackerEvent,
+    effect_id: Option<&str>,
+) -> StoreResult<usize> {
+    tx.execute(
+        crate::norm::NORM_INSERT_SQL,
+        params![serde_json::to_string(&[event])?, effect_id],
+    )
+    .map_err(Into::into)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4373,7 +4578,22 @@ mod tests {
             )
             .unwrap();
         }
-        // Opening adds the Merkle-DAG columns + index rather than erroring.
+        // Concurrent first opens must serialize the check/add migration, not
+        // race after all observing the old table shape.
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let path = path.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    WorkItemStore::open(path).expect("concurrent schema upgrade")
+                })
+            })
+            .collect();
+        for handle in handles {
+            drop(handle.join().expect("opener completes"));
+        }
         let mut store = WorkItemStore::open(&path).expect("open self-heals old schema");
         let filed = store
             .file_item("q", "t", "", &[], &json!({}), None, None)

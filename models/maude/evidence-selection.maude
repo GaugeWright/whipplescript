@@ -1,0 +1,125 @@
+--- DR-0098 / N1: causal resolution under a captured frontier.
+--- Authenticated authority, verified ancestry and frontier membership are host
+--- inputs. Adequacy/preservation precede selection. No timestamp grants authority.
+mod EVIDENCE-SELECTION is
+  sorts Id Polarity Fact Cfg State .
+  ops old fresh decision other : -> Id [ctor] .
+  ops positive negative : -> Polarity [ctor] .
+  subsort Fact < Cfg .
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+  op {_} : Cfg -> State [ctor] .
+  op view : Cfg -> State [ctor] .
+  op evidence : Id Id Id Polarity -> Fact [ctor] .
+  ops applicable visible : Id -> Fact [ctor] .
+  op target : Id Id -> Fact [ctor] .
+  op resolve : Id Id Id Id Id -> Fact [ctor] .
+  op authorized : Id Id Id -> Fact [ctor] .
+  ops ancestor retired : Id Id -> Fact [ctor] .
+  op publish : -> Fact [ctor] .
+  vars O N R Q A Q1 A1 : Id . vars P P1 : Polarity . var C : Cfg .
+  rl [authorized-causal-resolution] :
+    { target(Q,A) evidence(O,Q,A,P) evidence(N,Q,A,P1)
+      applicable(O)
+      visible(O) visible(N) visible(R)
+      resolve(R,O,N,Q,A)
+      authorized(R,Q,A)
+      ancestor(O,R) ancestor(N,R) C }
+    => { target(Q,A) evidence(O,Q,A,P) evidence(N,Q,A,P1)
+      visible(O) visible(N) visible(R)
+      resolve(R,O,N,Q,A) retired(O,R)
+      authorized(R,Q,A)
+      ancestor(O,R) ancestor(N,R) C } .
+  rl [publish-view] : { publish C } => view(C) .
+endm
+mod EVIDENCE-SELECTION-WEAK-AUTHORITY is
+  including EVIDENCE-SELECTION .
+  vars O N R Q A Q1 A1 : Id . vars P P1 : Polarity . var C : Cfg .
+  rl [weaken-authority] :
+    { target(Q,A) evidence(O,Q,A,P) evidence(N,Q,A,P1)
+      applicable(O)
+      visible(O) visible(N) visible(R)
+      resolve(R,O,N,Q,A)
+      ancestor(O,R) ancestor(N,R) C }
+    => { target(Q,A) evidence(O,Q,A,P) evidence(N,Q,A,P1)
+      visible(O) visible(N) visible(R)
+      resolve(R,O,N,Q,A) retired(O,R)
+      ancestor(O,R) ancestor(N,R) C } .
+endm
+mod EVIDENCE-SELECTION-WEAK-CAUSAL is
+  including EVIDENCE-SELECTION .
+  vars O N R Q A Q1 A1 : Id . vars P P1 : Polarity . var C : Cfg .
+  rl [weaken-causal] :
+    { target(Q,A) evidence(O,Q,A,P) evidence(N,Q,A,P1)
+      applicable(O)
+      visible(O) visible(N) visible(R)
+      resolve(R,O,N,Q,A)
+      authorized(R,Q,A)  ancestor(N,R) C }
+    => { target(Q,A) evidence(O,Q,A,P) evidence(N,Q,A,P1)
+      visible(O) visible(N) visible(R)
+      resolve(R,O,N,Q,A) retired(O,R)
+      authorized(R,Q,A)  ancestor(N,R) C } .
+endm
+mod EVIDENCE-SELECTION-WEAK-FRONTIER is
+  including EVIDENCE-SELECTION .
+  vars O N R Q A Q1 A1 : Id . vars P P1 : Polarity . var C : Cfg .
+  rl [weaken-frontier] :
+    { target(Q,A) evidence(O,Q,A,P) evidence(N,Q,A,P1)
+      applicable(O)
+      visible(O) visible(N)
+      resolve(R,O,N,Q,A)
+      authorized(R,Q,A)
+      ancestor(O,R) ancestor(N,R) C }
+    => { target(Q,A) evidence(O,Q,A,P) evidence(N,Q,A,P1)
+      visible(O) visible(N)
+      resolve(R,O,N,Q,A) retired(O,R)
+      authorized(R,Q,A)
+      ancestor(O,R) ancestor(N,R) C } .
+endm
+mod EVIDENCE-SELECTION-WEAK-SCOPE is
+  including EVIDENCE-SELECTION .
+  vars O N R Q A Q1 A1 : Id . vars P P1 : Polarity . var C : Cfg .
+  rl [weaken-scope] :
+    { target(Q,A) evidence(O,Q,A,P) evidence(N,Q,A,P1)
+      applicable(O)
+      visible(O) visible(N) visible(R)
+      resolve(R,O,N,Q,A)
+      authorized(R,Q1,A1)
+      ancestor(O,R) ancestor(N,R) C }
+    => { target(Q,A) evidence(O,Q,A,P) evidence(N,Q,A,P1)
+      visible(O) visible(N) visible(R)
+      resolve(R,O,N,Q,A) retired(O,R)
+      authorized(R,Q1,A1)
+      ancestor(O,R) ancestor(N,R) C } .
+endm
+mod EVIDENCE-SELECTION-WEAK-RETRY is
+  including EVIDENCE-SELECTION .
+  vars O N R Q A Q1 A1 : Id . vars P P1 : Polarity . var C : Cfg .
+  rl [passing-retry-washes-failure] :
+    { evidence(O,Q,A,negative) evidence(N,Q,A,positive)
+      applicable(O) applicable(N) C }
+    => { evidence(O,Q,A,negative) evidence(N,Q,A,positive) applicable(N) retired(O,N) C } .
+endm
+mod EVIDENCE-SELECTION-WEAK-HISTORY is
+  including EVIDENCE-SELECTION .
+  vars O N R Q A Q1 A1 : Id . vars P P1 : Polarity . var C : Cfg .
+  rl [erase-retired-observation] :
+    { evidence(O,Q,A,P) retired(O,R) C } => { retired(O,R) C } .
+endm
+
+mod EVIDENCE-SELECTION-WEAK-REPLACEMENT is
+  including EVIDENCE-SELECTION .
+  vars O N R Q A Q1 A1 : Id . vars P P1 : Polarity . var C : Cfg .
+  rl [weaken-replacement] :
+    { target(Q,A) evidence(O,Q,A,P) evidence(N,Q,A,P1)
+      applicable(O)
+      visible(O) visible(N) visible(R)
+      resolve(R,O,N,Q,A)
+      authorized(R,Q,A)
+      ancestor(O,R) C }
+    => { target(Q,A) evidence(O,Q,A,P) evidence(N,Q,A,P1)
+      visible(O) visible(N) visible(R)
+      resolve(R,O,N,Q,A) retired(O,R)
+      authorized(R,Q,A)
+      ancestor(O,R) C } .
+endm

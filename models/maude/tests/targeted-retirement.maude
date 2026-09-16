@@ -1,0 +1,56 @@
+load ../targeted-retirement.maude
+search [1] in TARGETED-RETIREMENT :
+ { current(rev1,head1,draft) active(rev0,approval0,accepted) epoch(epoch0) request(rev0,approval0,head1,epoch0,owner,retired) permits(accepted,retired,owner) retiring(retired) }
+ =>* { current(rev1,retirementHead,draft) inactive history(rev0,approval0,accepted) C:Cfg } .
+search [1] in TARGETED-RETIREMENT :
+ { current(rev0,head1,draft) active(rev0,approval0,accepted) epoch(epoch0) request(rev0,approval0,head1,epoch0,owner,retired) permits(accepted,retired,owner) retiring(retired) }
+ =>* { current(rev0,retirementHead,retired) inactive history(rev0,approval0,accepted) C:Cfg } .
+search in TARGETED-RETIREMENT :
+ { current(rev1,head1,draft) active(rev0,approval0,accepted) epoch(epoch0) request(rev1,approval0,head1,epoch0,owner,retired) permits(accepted,retired,owner) retiring(retired) }
+ =>* { inactive C:Cfg } .
+search [1] in TARGETED-RETIREMENT-WEAK-REVISION :
+ { current(rev1,head1,draft) active(rev0,approval0,accepted) epoch(epoch0) request(rev1,approval0,head1,epoch0,owner,retired) permits(accepted,retired,owner) retiring(retired) }
+ =>* { inactive C:Cfg } .
+search in TARGETED-RETIREMENT :
+ { current(rev1,head1,draft) active(rev0,approval0,accepted) epoch(epoch0) request(rev0,approval1,head1,epoch0,owner,retired) permits(accepted,retired,owner) retiring(retired) }
+ =>* { inactive C:Cfg } .
+search [1] in TARGETED-RETIREMENT-WEAK-APPROVAL :
+ { current(rev1,head1,draft) active(rev0,approval0,accepted) epoch(epoch0) request(rev0,approval1,head1,epoch0,owner,retired) permits(accepted,retired,owner) retiring(retired) }
+ =>* { inactive C:Cfg } .
+search in TARGETED-RETIREMENT :
+ { current(rev1,head1,draft) active(rev0,approval0,accepted) epoch(epoch0) request(rev0,approval0,head0,epoch0,owner,retired) permits(accepted,retired,owner) retiring(retired) }
+ =>* { inactive C:Cfg } .
+search [1] in TARGETED-RETIREMENT-WEAK-HEAD :
+ { current(rev1,head1,draft) active(rev0,approval0,accepted) epoch(epoch0) request(rev0,approval0,head0,epoch0,owner,retired) permits(accepted,retired,owner) retiring(retired) }
+ =>* { inactive C:Cfg } .
+search in TARGETED-RETIREMENT :
+ { current(rev1,head1,draft) active(rev0,approval0,accepted) epoch(epoch0) request(rev0,approval0,head1,epoch1,owner,retired) permits(accepted,retired,owner) retiring(retired) }
+ =>* { inactive C:Cfg } .
+search [1] in TARGETED-RETIREMENT-WEAK-EPOCH :
+ { current(rev1,head1,draft) active(rev0,approval0,accepted) epoch(epoch0) request(rev0,approval0,head1,epoch1,owner,retired) permits(accepted,retired,owner) retiring(retired) }
+ =>* { inactive C:Cfg } .
+search in TARGETED-RETIREMENT :
+ { current(rev1,head1,draft) active(rev0,approval0,accepted) epoch(epoch0) request(rev0,approval0,head1,epoch0,worker,retired) permits(accepted,retired,owner) retiring(retired) }
+ =>* { inactive C:Cfg } .
+search [1] in TARGETED-RETIREMENT-WEAK-AUTHORITY :
+ { current(rev1,head1,draft) active(rev0,approval0,accepted) epoch(epoch0) request(rev0,approval0,head1,epoch0,worker,retired) permits(accepted,retired,owner) retiring(retired) }
+ =>* { inactive C:Cfg } .
+search in TARGETED-RETIREMENT :
+ { current(rev1,head1,draft) active(rev0,approval0,accepted) epoch(epoch0) request(rev0,approval0,head1,epoch0,owner,unrelated) permits(accepted,unrelated,owner) retiring(retired) }
+ =>* { inactive C:Cfg } .
+search [1] in TARGETED-RETIREMENT-WEAK-ROLE :
+ { current(rev1,head1,draft) active(rev0,approval0,accepted) epoch(epoch0) request(rev0,approval0,head1,epoch0,owner,unrelated) permits(accepted,unrelated,owner) retiring(retired) }
+ =>* { inactive C:Cfg } .
+search [1] in TARGETED-RETIREMENT :
+ { current(rev0,head1,accepted) active(rev0,approval0,accepted) advance(sealed,owner) permits(accepted,sealed,owner) }
+ =>* { current(rev0,head0,sealed) active(rev0,approval0,sealed) C:Cfg } .
+search [1] in TARGETED-RETIREMENT :
+ { current(rev1,head1,draft) active(rev0,approval0,sealed) epoch(epoch0) request(rev0,approval0,head1,epoch0,worker,retired) permits(sealed,retired,worker) retiring(retired) }
+ =>* { current(rev1,retirementHead,draft) inactive C:Cfg } .
+search in TARGETED-RETIREMENT :
+ { current(rev1,head1,draft) active(rev0,approval0,sealed) epoch(epoch0) request(rev0,approval0,head1,epoch0,owner,retired) permits(accepted,retired,owner) retiring(retired) }
+ =>* { inactive C:Cfg } .
+search [1] in TARGETED-RETIREMENT-WEAK-LIFECYCLE :
+ { current(rev1,head1,draft) active(rev0,approval0,sealed) epoch(epoch0) request(rev0,approval0,head1,epoch0,owner,retired) permits(accepted,retired,owner) retiring(retired) }
+ =>* { inactive C:Cfg } .
+quit

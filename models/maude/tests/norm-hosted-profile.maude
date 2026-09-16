@@ -1,0 +1,8 @@
+load ../norm-observer.maude
+search [1] in NORM-HOSTED-PROFILE : cfg(exact, queued) =>* cfg(exact, admitted) .
+search [1] in NORM-HOSTED-PROFILE : cfg(cooperative, queued) =>* cfg(cooperative, admitted) .
+search [1] in NORM-HOSTED-PROFILE : cfg(missing, queued) =>* cfg(missing, admitted) .
+search [1] in NORM-HOSTED-PROFILE-WEAK : cfg(missing, queued) =>* cfg(missing, admitted) .
+search [1] in NORM-HOSTED-PROFILE : cfg(changed, queued) =>* cfg(changed, admitted) .
+search [1] in NORM-HOSTED-PROFILE-WEAK : cfg(changed, queued) =>* cfg(changed, admitted) .
+quit

@@ -1,0 +1,72 @@
+--- DR-0098 / N1 extension of ledger-freshness for norm evidence.
+--- Fingerprint equality is necessary but not sufficient. A verified observer
+--- supplies completeness/soundness relative to the named boundary, scoped to
+--- requirement, method, policy and source artifact. Authentication and actual
+--- observer completeness are assumptions, not facts proved by this finite model.
+mod NORM-PRESERVATION is
+  protecting BOOL .
+  sorts Pin Resource Aspect Value Mode Coverage Entry Footprint Fact Cfg State .
+  ops p0 p1 : -> Pin [ctor] .
+  ops source config directory external : -> Resource [ctor] .
+  ops content metadata presence membership : -> Aspect [ctor] .
+  ops absent present v0 v1 : -> Value [ctor] .
+  ops deterministic sampled : -> Mode [ctor] .
+  ops completeExact enforcedCeiling partialTrace : -> Coverage [ctor] .
+  subsort Entry < Footprint .
+  op empty : -> Footprint [ctor] .
+  op __ : Footprint Footprint -> Footprint [ctor assoc comm id: empty] .
+  op at : Resource Aspect Value -> Entry [ctor] .
+  subsort Fact < Cfg .
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+  op {_} : Cfg -> State [ctor] .
+  --- requirement, method, policy, source artifact, target artifact, boundary.
+  op request : Pin Pin Pin Pin Pin Pin -> Fact [ctor] .
+  --- independently verified source footprint and preservation assumptions.
+  op basis : Pin Pin Pin Pin Pin Mode Coverage Footprint -> Fact [ctor] .
+  --- authenticated complete target observations of the requested footprint.
+  op target : Pin Footprint -> Fact [ctor] .
+  op preserved : Pin Pin -> Fact [ctor] .
+  vars Q M P S T B : Pin . var F : Footprint . var C : Cfg .
+  rl [complete-deterministic-closure] :
+    { request(Q,M,P,S,T,B) basis(Q,M,P,S,B,deterministic,completeExact,F) target(T,F) C }
+    => { preserved(S,T) C } .
+  rl [enforced-sound-ceiling] :
+    { request(Q,M,P,S,T,B) basis(Q,M,P,S,B,deterministic,enforcedCeiling,F) target(T,F) C }
+    => { preserved(S,T) C } .
+endm
+mod NORM-PRESERVATION-WEAK-PARTIAL is
+  including NORM-PRESERVATION .
+  vars Q M P S T B : Pin . var F : Footprint . var C : Cfg .
+  rl [partial-trace-as-closure] :
+    { request(Q,M,P,S,T,B) basis(Q,M,P,S,B,deterministic,partialTrace,F) target(T,F) C }
+    => { preserved(S,T) C } .
+endm
+mod NORM-PRESERVATION-WEAK-SAMPLED is
+  including NORM-PRESERVATION .
+  vars Q M P S T B : Pin . var F : Footprint . var C : Cfg .
+  rl [one-sample-as-deterministic] :
+    { request(Q,M,P,S,T,B) basis(Q,M,P,S,B,sampled,completeExact,F) target(T,F) C }
+    => { preserved(S,T) C } .
+endm
+mod NORM-PRESERVATION-WEAK-SCOPE is
+  including NORM-PRESERVATION .
+  vars Q M P S T B Q1 M1 P1 S1 B1 : Pin . var F : Footprint . var C : Cfg .
+  rl [borrow-another-contract] :
+    { request(Q,M,P,S,T,B) basis(Q1,M1,P1,S1,B1,deterministic,completeExact,F) target(T,F) C }
+    => { preserved(S,T) C } .
+endm
+mod NORM-PRESERVATION-WEAK-OBSERVATIONS is
+  including NORM-PRESERVATION .
+  vars Q M P S T B : Pin . vars F F1 : Footprint . var C : Cfg .
+  rl [ignore-changed-observation] :
+    { request(Q,M,P,S,T,B) basis(Q,M,P,S,B,deterministic,completeExact,F) target(T,F1) C }
+    => { preserved(S,T) C } .
+endm
+mod NORM-PRESERVATION-WEAK-TARGET is
+  including NORM-PRESERVATION .
+  vars Q M P S T B T1 : Pin . var F : Footprint . var C : Cfg .
+  rl [borrow-another-target] :
+    { request(Q,M,P,S,T,B) basis(Q,M,P,S,B,deterministic,completeExact,F) target(T1,F) C }
+    => { preserved(S,T) C } .
+endm

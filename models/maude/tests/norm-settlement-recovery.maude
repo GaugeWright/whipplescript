@@ -1,0 +1,22 @@
+load ../norm-settlement-recovery.maude
+search [1] in NORM-SETTLEMENT-RECOVERY : pending(original,empty) =>* ready(original,complete) .
+search [1] in NORM-SETTLEMENT-RECOVERY : cold(original,prefix) =>* ready(original,complete) .
+search [1] in NORM-SETTLEMENT-RECOVERY : pending(original,empty) =>* ready(original,prefix) .
+search [1] in NORM-SETTLEMENT-RECOVERY-WEAK-VISIBILITY : pending(original,empty) =>* ready(original,prefix) .
+search [1] in NORM-SETTLEMENT-RECOVERY : cold(original,prefix) =>* dispatchedAgain(original,prefix) .
+search [1] in NORM-SETTLEMENT-RECOVERY-WEAK-REDISPATCH : cold(original,prefix) =>* dispatchedAgain(original,prefix) .
+search [1] in NORM-SETTLEMENT-RECOVERY : cold(original,prefix) =>* ready(replacement,complete) .
+search [1] in NORM-SETTLEMENT-RECOVERY-WEAK-REPLACEMENT : cold(original,prefix) =>* ready(replacement,complete) .
+search [1] in NORM-SETTLEMENT-RECOVERY : ready(original,consumed) =>* ready(original,complete) .
+search [1] in NORM-SETTLEMENT-RECOVERY-WEAK-REVIVAL : ready(original,consumed) =>* ready(original,complete) .
+search [1] in NORM-SETTLEMENT-RETENTION : retain(current,vacant,original) =>* accepted(held(original)) .
+search [1] in NORM-SETTLEMENT-RETENTION : retain(stale,held(original),original) =>* accepted(held(original)) .
+search [1] in NORM-SETTLEMENT-RETENTION : retain(stale,vacant,original) =>* accepted(held(original)) .
+search [1] in NORM-SETTLEMENT-RETENTION-WEAK : retain(stale,vacant,original) =>* accepted(held(original)) .
+search [1] in NORM-SETTLEMENT-RETENTION : retain(current,held(original),replacement) =>* accepted(held(replacement)) .
+search [1] in NORM-SETTLEMENT-RETENTION-WEAK : retain(current,held(original),replacement) =>* accepted(held(replacement)) .
+search [1] in NORM-SETTLEMENT-TERMINAL-RACE : pending(vacant,uncertain) =>* refused(retained) .
+search [1] in NORM-SETTLEMENT-TERMINAL-RACE : pending(retained,original) =>* terminal(original) .
+search [1] in NORM-SETTLEMENT-TERMINAL-RACE : pending(retained,uncertain) =>* terminal(uncertain) .
+search [1] in NORM-SETTLEMENT-TERMINAL-RACE-WEAK : pending(retained,uncertain) =>* terminal(uncertain) .
+quit

@@ -1,0 +1,10 @@
+load ../exec-completion-lifetime.maude
+search [1] in EXEC-COMPLETION-LIFETIME : cfg(retained,retained,idle,alive,unproved) =>* cfg(retained,retained,finished,dead,proved) .
+search [1] in EXEC-COMPLETION-LIFETIME : cfg(missing,retained,idle,alive,unproved) =>* cfg(retained,retained,finished,dead,proved) .
+search [1] in EXEC-COMPLETION-LIFETIME : cfg(retained,retained,idle,alive,unproved) =>* cfg(retained,retained,finished,alive,proved) .
+search [1] in EXEC-COMPLETION-LIFETIME-WEAK : cfg(retained,retained,idle,alive,unproved) =>* cfg(retained,retained,finished,alive,proved) .
+search [1] in EXEC-COMPLETION-LIFETIME : cfg(retained,retained,idle,alive,unproved) =>* cfg(missing,retained,finished,dead,proved) .
+search [1] in EXEC-COMPLETION-LIFETIME-WEAK : cfg(retained,retained,idle,alive,unproved) =>* cfg(missing,retained,finished,dead,proved) .
+search [1] in EXEC-COMPLETION-LIFETIME : cfg(retained,retained,idle,alive,unproved) =>* cfg(changed,retained,finished,dead,proved) .
+search [1] in EXEC-COMPLETION-LIFETIME-WEAK : cfg(retained,retained,idle,alive,unproved) =>* cfg(changed,retained,finished,dead,proved) .
+quit

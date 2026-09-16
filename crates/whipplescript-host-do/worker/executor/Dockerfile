@@ -3,9 +3,10 @@
 # Build context = this directory; `npm run build:executor` drops the release
 # `whip` binary here first. The image digest is the environment hash the
 # delta-kernel cache keys on (the image-digest wiring box).
-# trixie's glibc (2.41) covers binaries built on current hosts (2.39); the
-# release pipeline can later pin a musl-static build for a smaller image.
-FROM debian:trixie-slim
+# Ubuntu 26.04 supplies the glibc 2.43 runtime used by the supported native
+# build host. Keep this digest pinned; the physical executor suite consumes
+# this exact recipe instead of substituting its own compatibility image.
+FROM ubuntu:26.04@sha256:513c074113a871b51a8d16ab445c88779d6452d937a164fb5cc479f32668a41d
 COPY whip /usr/local/bin/whip
 EXPOSE 8080
 ENTRYPOINT ["whip", "executor", "--bind", "0.0.0.0:8080"]

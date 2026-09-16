@@ -144,9 +144,15 @@ pub enum HeadReservationOutcome {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum BindOutcome {
     Bound,
-    AlreadyBound { branch_id: String },
+    /// A governed ref is advanced through admission, never an instance binding.
+    GatedRef,
+    AlreadyBound {
+        branch_id: String,
+    },
     BranchMissing,
-    BranchNotActive { status: BranchStatus },
+    BranchNotActive {
+        status: BranchStatus,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -456,7 +462,8 @@ pub trait Branches {
         at: &str,
     ) -> StoreResult<RetargetOutcome>;
     /// Bind an instance to the branch it is born on (write-once; the
-    /// dispatch seam selects the instance's file surface by this).
+    /// dispatch seam selects the instance's file surface by this). Mainline
+    /// binding refuses, including retries of bindings from older stores.
     fn bind_instance(
         &mut self,
         instance_id: &str,
@@ -1403,6 +1410,9 @@ impl Branches for BranchStore {
         branch_id: &str,
         at: &str,
     ) -> StoreResult<BindOutcome> {
+        if branch_id == MAINLINE_BRANCH_ID {
+            return Ok(BindOutcome::GatedRef);
+        }
         let tx = self
             .connection
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -2620,6 +2630,32 @@ mod tests {
         );
     }
 
+    #[test]
+    fn norm_mainline_binding_refuses_without_mutation() {
+        let mut store = store();
+        store.ensure_mainline("t0").unwrap();
+        for at in ["t1", "t2"] {
+            assert_eq!(
+                store
+                    .bind_instance("norm_instance", MAINLINE_BRANCH_ID, at)
+                    .unwrap(),
+                BindOutcome::GatedRef
+            );
+            assert_eq!(store.instance_branch("norm_instance").unwrap(), None);
+        }
+        // A legacy binding is not made usable by an idempotent retry.
+        store.connection.execute(
+            "INSERT INTO branch_instances (instance_id, branch_id, bound_at) VALUES ('legacy', 'main', 't0')",
+            [],
+        ).unwrap();
+        assert_eq!(
+            store
+                .bind_instance("legacy", MAINLINE_BRANCH_ID, "t3")
+                .unwrap(),
+            BindOutcome::GatedRef
+        );
+    }
+
     /// Instance binding is write-once: an instance is BORN on a branch;
     /// same-branch re-bind is the idempotent retry, cross-branch re-bind
     /// refuses, dead lines refuse new births.
@@ -2650,6 +2686,16 @@ mod tests {
             store
                 .bind_instance("ins_1", MAINLINE_BRANCH_ID, "t3")
                 .expect("op"),
+            BindOutcome::GatedRef
+        );
+        assert!(matches!(
+            store
+                .create_branch(create("draft_b", MAINLINE_BRANCH_ID))
+                .unwrap(),
+            CreateBranchOutcome::Created(_)
+        ));
+        assert_eq!(
+            store.bind_instance("ins_1", "draft_b", "t3").unwrap(),
             BindOutcome::AlreadyBound {
                 branch_id: "draft_a".to_owned()
             }

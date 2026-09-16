@@ -1,0 +1,48 @@
+--- The plan commits to the selected script, request identity, ingest contract
+--- and cache key. Host authentication and durable store integrity are premises.
+--- Publication/admission remains the separate norm-run-admission contract.
+mod EXEC-DISPATCH is
+  sorts Id Fact Cfg State .
+  ops r0 r1 i0 i1 p0 p1 : -> Id [ctor] .
+  subsort Fact < Cfg .
+  op none : -> Cfg [ctor] . op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+  op {_} : Cfg -> State [ctor] .
+  ops configured reply fresh : Id -> Fact [ctor] .
+  ops input sent settled : Id Id -> Fact [ctor] .
+  ops prepare stored : Id Id Id -> Fact [ctor] .
+  vars R I P : Id . var C : Cfg .
+  rl [persist-before-dispatch] :
+    { configured(P) fresh(R) input(R,I) prepare(R,I,P) C }
+    => { configured(P) input(R,I) stored(R,I,P) sent(R,P) C } .
+  rl [redispatch-identical-plan] :
+    { input(R,I) stored(R,I,P) prepare(R,I,P) C }
+    => { input(R,I) stored(R,I,P) sent(R,P) C } .
+  rl [operator-reconfigures] : { configured(p0) C } => { configured(p1) C } .
+  rl [resume-original-plan] : { input(R,I) stored(R,I,P) reply(R) C }
+    => { input(R,I) stored(R,I,P) settled(R,P) C } .
+endm
+mod EXEC-DISPATCH-WEAK-MISSING is
+  including EXEC-DISPATCH . vars R I P : Id . var C : Cfg .
+  rl [invent-plan-at-resume] : { input(R,I) configured(P) reply(R) C }
+    => { settled(R,P) C } .
+endm
+mod EXEC-DISPATCH-WEAK-INPUT is
+  including EXEC-DISPATCH . vars R I J P : Id . var C : Cfg .
+  rl [ignore-changed-input] : { input(R,J) stored(R,I,P) reply(R) C }
+    => { settled(R,P) C } .
+endm
+mod EXEC-DISPATCH-WEAK-REPLY is
+  including EXEC-DISPATCH . vars R S I P : Id . var C : Cfg .
+  rl [cross-invocation-reply] : { input(R,I) stored(R,I,P) reply(S) C }
+    => { settled(R,P) C } .
+endm
+mod EXEC-DISPATCH-WEAK-RECONFIGURE is
+  including EXEC-DISPATCH . vars R I P Q : Id . var C : Cfg .
+  rl [replace-dispatched-plan] : { input(R,I) stored(R,I,P) configured(Q) reply(R) C }
+    => { settled(R,Q) C } .
+endm
+mod EXEC-DISPATCH-WEAK-REDISPATCH is
+  including EXEC-DISPATCH . vars R I P Q : Id . var C : Cfg .
+  rl [redispatch-changed-plan] : { input(R,I) stored(R,I,P) prepare(R,I,Q) C }
+    => { stored(R,I,P) sent(R,Q) C } .
+endm

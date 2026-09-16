@@ -1,0 +1,18 @@
+load ../norm-observer.maude
+search [1] in NORM-OBSERVER : { protected privateProtocol pending(c0) returned(c0,yes) } =>* { protected privateProtocol observed(c0,yes) } .
+search [1] in NORM-OBSERVER : { protected privateProtocol pending(c0) returned(c0,no) } =>* { protected privateProtocol observed(c0,no) } .
+search [1] in NORM-OBSERVER : { protected privateProtocol required(c0,yes) required(c1,no) pending(c0) pending(c1) returned(c0,yes) returned(c1,no) } =>* { protected privateProtocol complete supported } .
+search in NORM-OBSERVER : { protected privateProtocol candidateText(c0,yes) } =>* { protected privateProtocol observed(c0,yes) } .
+search [1] in NORM-OBSERVER-WEAK-TEXT : { protected privateProtocol candidateText(c0,yes) } =>* { protected privateProtocol observed(c0,yes) } .
+search in NORM-OBSERVER : { protected privateProtocol returned(c0,yes) } =>* { protected privateProtocol observed(c0,yes) } .
+search [1] in NORM-OBSERVER-WEAK-CALL : { protected privateProtocol returned(c0,yes) } =>* { protected privateProtocol observed(c0,yes) } .
+search in NORM-OBSERVER : { protected privateProtocol required(c0,yes) invoke(c0) returned(c0,no) } =>* { protected privateProtocol required(c0,yes) observed(c0,yes) } .
+search [1] in NORM-OBSERVER-WEAK-EXPECTED : { protected privateProtocol required(c0,yes) invoke(c0) returned(c0,no) } =>* { protected privateProtocol required(c0,yes) observed(c0,yes) } .
+search in NORM-OBSERVER : { protected invoke(c0) returned(c0,yes) } =>* { protected observed(c0,yes) } .
+search [1] in NORM-OBSERVER-WEAK-CHANNEL : { protected invoke(c0) returned(c0,yes) } =>* { protected observed(c0,yes) } .
+search [1] in NORM-OBSERVER-ARTIFACT : { installedRuntime(runtime0) loadedRuntime(runtime0) isolatedABI privateProtocol pending(c0) returned(c0,no) } =>* { protected privateProtocol observed(c0,no) } .
+search in NORM-OBSERVER-ARTIFACT : { installedRuntime(runtime0) loadedRuntime(runtime1) isolatedABI privateProtocol pending(c0) returned(c0,no) } =>* { protected privateProtocol observed(c0,no) } .
+search [1] in NORM-OBSERVER-WEAK-ARTIFACT : { installedRuntime(runtime0) loadedRuntime(runtime1) isolatedABI privateProtocol pending(c0) returned(c0,no) } =>* { protected privateProtocol observed(c0,no) } .
+search in NORM-OBSERVER-ARTIFACT : { loadedRuntime(runtime0) isolatedABI privateProtocol pending(c0) returned(c0,no) } =>* { protected privateProtocol observed(c0,no) } .
+search [1] in NORM-OBSERVER-WEAK-UNPINNED : { loadedRuntime(runtime0) isolatedABI privateProtocol pending(c0) returned(c0,no) } =>* { protected privateProtocol observed(c0,no) } .
+quit

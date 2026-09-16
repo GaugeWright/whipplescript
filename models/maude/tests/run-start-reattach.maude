@@ -1,0 +1,18 @@
+load ../run-start-reattach.maude
+search [1] in RUN-START-REATTACH : { request(original) running(original) activeLease(original) live permitted dependencies uncancelled } =>* { acknowledged(original) running(original) activeLease(original) C:Cfg } .
+search [1] in RUN-START-REATTACH : { request(changed) running(original) activeLease(original) live permitted dependencies uncancelled } =>* { acknowledged(original) C:Cfg } .
+search [1] in RUN-START-REATTACH-WEAK-IDENTITY : { request(changed) running(original) activeLease(original) live permitted dependencies uncancelled } =>* { acknowledged(original) C:Cfg } .
+search [1] in RUN-START-REATTACH : { request(original) running(original) live permitted dependencies uncancelled } =>* { acknowledged(original) C:Cfg } .
+search [1] in RUN-START-REATTACH-WEAK-LEASE : { request(original) running(original) live permitted dependencies uncancelled } =>* { acknowledged(original) C:Cfg } .
+search [1] in RUN-START-REATTACH : { request(original) running(original) activeLease(original) permitted dependencies uncancelled } =>* { acknowledged(original) C:Cfg } .
+search [1] in RUN-START-REATTACH-WEAK-INSTANCE : { request(original) running(original) activeLease(original) permitted dependencies uncancelled } =>* { acknowledged(original) C:Cfg } .
+search [1] in RUN-START-REATTACH : { request(original) running(original) activeLease(original) live dependencies uncancelled } =>* { acknowledged(original) C:Cfg } .
+search [1] in RUN-START-REATTACH-WEAK-POLICY : { request(original) running(original) activeLease(original) live dependencies uncancelled } =>* { acknowledged(original) C:Cfg } .
+search [1] in RUN-START-REATTACH : { request(original) running(original) activeLease(original) live permitted uncancelled } =>* { acknowledged(original) C:Cfg } .
+search [1] in RUN-START-REATTACH-WEAK-DEPENDENCIES : { request(original) running(original) activeLease(original) live permitted uncancelled } =>* { acknowledged(original) C:Cfg } .
+search [1] in RUN-START-REATTACH : { request(original) running(original) activeLease(original) live permitted dependencies } =>* { acknowledged(original) C:Cfg } .
+search [1] in RUN-START-REATTACH-WEAK-CANCELLATION : { request(original) running(original) activeLease(original) live permitted dependencies } =>* { acknowledged(original) C:Cfg } .
+search [1] in RUN-START-REATTACH : { fresh(original) claimable live permitted dependencies uncancelled } =>* { running(original) activeLease(original) acknowledged(original) C:Cfg } .
+search [1] in RUN-START-REATTACH : { fresh(changed) running(original) activeLease(original) live permitted dependencies uncancelled } =>* { running(original) running(changed) C:Cfg } .
+search [1] in RUN-START-REATTACH-WEAK-FRESH-CLAIM : { fresh(changed) running(original) activeLease(original) live permitted dependencies uncancelled } =>* { running(original) running(changed) C:Cfg } .
+quit

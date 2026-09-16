@@ -1,0 +1,20 @@
+load ../impact-selection.maude
+search [1] in IMPACT-SELECTION : inventory(prior,new) =>* prior ; new .
+search [1] in IMPACT-SELECTION : inventory(prior,none) =>* none .
+search [1] in IMPACT-SELECTION-WEAK : weakInventory(prior,none) =>* none .
+search [1] in IMPACT-SELECTION : pending(prior,exact,present,installed) =>* planned(prior,keep) .
+search [1] in IMPACT-SELECTION : pending(prior,preserved,present,installed) =>* planned(prior,keep) .
+search [1] in IMPACT-SELECTION : pending(prior,stale,present,installed) =>* planned(prior,keep) .
+search [1] in IMPACT-SELECTION-WEAK : pending(prior,stale,present,installed) =>* planned(prior,keep) .
+search [1] in IMPACT-SELECTION : pending(prior,violated,present,installed) =>* planned(prior,check) .
+search [1] in IMPACT-SELECTION-WEAK : pending(prior,violated,present,installed) =>* planned(prior,check) .
+search [1] in IMPACT-SELECTION : pending(prior,exact,absent,installed) =>* planned(prior,keep) .
+search [1] in IMPACT-SELECTION-WEAK : pending(prior,exact,absent,installed) =>* planned(prior,keep) .
+search [1] in IMPACT-SELECTION : pending(new,missing,present,installed) =>* planned(new,check) .
+search [1] in IMPACT-SELECTION : pending(prior,violated,present,installed) =>* planned(prior,repair) .
+search [1] in IMPACT-SELECTION : pending(prior,conflicted,present,installed) =>* planned(prior,resolve) .
+search [1] in IMPACT-SELECTION : pending(prior,exact,absent,installed) =>* planned(prior,clarify) .
+search [1] in IMPACT-SELECTION : pending(new,missing,present,unavailable) =>* planned(new,observe) .
+search [1] in IMPACT-SELECTION : pending(new,missing,present,unavailable) =>* planned(new,check) .
+search [1] in IMPACT-SELECTION-WEAK : pending(new,missing,present,unavailable) =>* planned(new,check) .
+quit

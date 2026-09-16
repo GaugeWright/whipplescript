@@ -703,6 +703,9 @@ impl<S: DoSql> Branches for DoBranches<S> {
         branch_id: &str,
         at: &str,
     ) -> StoreResult<BindOutcome> {
+        if branch_id == MAINLINE_BRANCH_ID {
+            return Ok(BindOutcome::GatedRef);
+        }
         let existing = self
             .sql
             .query(

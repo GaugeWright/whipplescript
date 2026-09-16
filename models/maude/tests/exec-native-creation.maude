@@ -1,0 +1,8 @@
+load ../exec-native-owner.maude
+search [1] in EXEC-NATIVE-CREATION : cfg(fresh,missing,open) =>* cfg(spent,bound,open) .
+search [1] in EXEC-NATIVE-CREATION : cfg(spent,inflight,closed) =>* cfg(spent,bound,closed) .
+search [1] in EXEC-NATIVE-CREATION : cfg(spent,missing,open) =>* cfg(fresh,missing,open) .
+search [1] in EXEC-NATIVE-CREATION-WEAK : cfg(spent,missing,open) =>* cfg(fresh,missing,open) .
+search [1] in EXEC-NATIVE-CREATION : cfg(fresh,missing,closed) =>* cfg(spent,inflight,closed) .
+search [1] in EXEC-NATIVE-CREATION-WEAK : cfg(fresh,missing,closed) =>* cfg(spent,inflight,closed) .
+quit

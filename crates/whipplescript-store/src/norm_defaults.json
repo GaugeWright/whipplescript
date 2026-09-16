@@ -1,0 +1,453 @@
+{
+  "vocabularies": [
+    {
+      "definition": {
+        "name": "issue",
+        "version": "1",
+        "fields": [
+          {
+            "name": "title",
+            "required": true,
+            "value_type": {
+              "type": "text"
+            }
+          },
+          {
+            "name": "body",
+            "required": false,
+            "value_type": {
+              "type": "text"
+            }
+          },
+          {
+            "name": "queue",
+            "required": false,
+            "value_type": {
+              "type": "text"
+            }
+          },
+          {
+            "name": "labels",
+            "required": false,
+            "value_type": {
+              "type": "list",
+              "item": {
+                "type": "text"
+              }
+            }
+          }
+        ],
+        "status": {
+          "values": [
+            "open",
+            "closed",
+            "canceled",
+            "archived"
+          ],
+          "initial": "open",
+          "transitions": [
+            {
+              "from": "open",
+              "to": "closed",
+              "admission": {
+                "requires": "public"
+              }
+            },
+            {
+              "from": "closed",
+              "to": "open",
+              "admission": {
+                "requires": "public"
+              }
+            },
+            {
+              "from": "open",
+              "to": "canceled",
+              "admission": {
+                "requires": "public"
+              }
+            },
+            {
+              "from": "canceled",
+              "to": "open",
+              "admission": {
+                "requires": "public"
+              }
+            },
+            {
+              "from": "closed",
+              "to": "archived",
+              "admission": {
+                "requires": "public"
+              }
+            }
+          ]
+        }
+      },
+      "creation": {
+        "requires": "public"
+      },
+      "editing": {
+        "requires": "public"
+      },
+      "inventory_role": {
+        "kind": "non_requirement"
+      }
+    },
+    {
+      "definition": {
+        "name": "assertion",
+        "version": "1",
+        "fields": [
+          {
+            "name": "title",
+            "required": true,
+            "value_type": {
+              "type": "text"
+            }
+          },
+          {
+            "name": "statement",
+            "required": true,
+            "value_type": {
+              "type": "text"
+            }
+          },
+          {
+            "name": "subject",
+            "required": false,
+            "value_type": {
+              "type": "text"
+            }
+          }
+        ],
+        "status": {
+          "values": [
+            "proposed",
+            "active",
+            "retired",
+            "withdrawn"
+          ],
+          "initial": "proposed",
+          "transitions": [
+            {
+              "from": "proposed",
+              "to": "active",
+              "admission": {
+                "requires": "authority",
+                "scope": "norm.accept"
+              }
+            },
+            {
+              "from": "proposed",
+              "to": "withdrawn",
+              "admission": {
+                "requires": "public"
+              }
+            },
+            {
+              "from": "active",
+              "to": "retired",
+              "admission": {
+                "requires": "authority",
+                "scope": "norm.retire"
+              }
+            }
+          ]
+        }
+      },
+      "creation": {
+        "requires": "public"
+      },
+      "editing": {
+        "requires": "public"
+      },
+      "effectiveness": [
+        {
+          "status": "active",
+          "effect": "activate"
+        },
+        {
+          "status": "retired",
+          "effect": "retire"
+        }
+      ],
+      "inventory_role": {
+        "kind": "non_requirement"
+      }
+    },
+    {
+      "definition": {
+        "name": "obligation",
+        "version": "1",
+        "fields": [
+          {
+            "name": "name",
+            "required": true,
+            "value_type": {
+              "type": "text"
+            }
+          },
+          {
+            "name": "proposition",
+            "required": true,
+            "value_type": {
+              "type": "text"
+            }
+          },
+          {
+            "name": "domain",
+            "required": true,
+            "value_type": {
+              "type": "text"
+            }
+          },
+          {
+            "name": "subject",
+            "required": true,
+            "value_type": {
+              "type": "text"
+            }
+          },
+          {
+            "name": "support_contract",
+            "required": false,
+            "value_type": {
+              "type": "text"
+            }
+          }
+        ],
+        "status": {
+          "values": [
+            "proposed",
+            "accepted",
+            "retired",
+            "withdrawn"
+          ],
+          "initial": "proposed",
+          "transitions": [
+            {
+              "from": "proposed",
+              "to": "accepted",
+              "admission": {
+                "requires": "authority",
+                "scope": "norm.accept"
+              }
+            },
+            {
+              "from": "proposed",
+              "to": "withdrawn",
+              "admission": {
+                "requires": "public"
+              }
+            },
+            {
+              "from": "accepted",
+              "to": "retired",
+              "admission": {
+                "requires": "authority",
+                "scope": "norm.retire"
+              }
+            }
+          ]
+        }
+      },
+      "creation": {
+        "requires": "public"
+      },
+      "editing": {
+        "requires": "public"
+      },
+      "effectiveness": [
+        {
+          "status": "accepted",
+          "effect": "activate"
+        },
+        {
+          "status": "retired",
+          "effect": "retire"
+        }
+      ],
+      "inventory_role": {
+        "kind": "requirement",
+        "fields": {
+          "name": "name",
+          "proposition": "proposition",
+          "domain": "domain",
+          "subject": "subject",
+          "support_contract": "support_contract"
+        }
+      }
+    },
+    {
+      "definition": {
+        "name": "decision",
+        "version": "1",
+        "fields": [
+          {
+            "name": "title",
+            "required": true,
+            "value_type": {
+              "type": "text"
+            }
+          },
+          {
+            "name": "intent",
+            "required": true,
+            "value_type": {
+              "type": "text"
+            }
+          },
+          {
+            "name": "subjects",
+            "required": true,
+            "value_type": {
+              "type": "list",
+              "item": {
+                "type": "text"
+              }
+            }
+          },
+          {
+            "name": "supersedes",
+            "required": false,
+            "value_type": {
+              "type": "text"
+            }
+          }
+        ],
+        "status": {
+          "values": [
+            "proposed",
+            "accepted",
+            "folded",
+            "implemented",
+            "rejected",
+            "withdrawn",
+            "superseded"
+          ],
+          "initial": "proposed",
+          "transitions": [
+            {
+              "from": "proposed",
+              "to": "accepted",
+              "admission": {
+                "requires": "authority",
+                "scope": "norm.accept"
+              }
+            },
+            {
+              "from": "proposed",
+              "to": "rejected",
+              "admission": {
+                "requires": "authority",
+                "scope": "norm.accept"
+              }
+            },
+            {
+              "from": "proposed",
+              "to": "withdrawn",
+              "admission": {
+                "requires": "public"
+              }
+            }
+          ]
+        }
+      },
+      "creation": {
+        "requires": "public"
+      },
+      "editing": {
+        "requires": "public"
+      },
+      "effectiveness": [
+        {
+          "status": "accepted",
+          "effect": "activate"
+        },
+        {
+          "status": "superseded",
+          "effect": "retire"
+        }
+      ],
+      "inventory_role": {
+        "kind": "non_requirement"
+      }
+    },
+    {
+      "definition": {
+        "name": "reservation",
+        "version": "1",
+        "fields": [
+          {
+            "name": "purpose",
+            "required": true,
+            "value_type": {
+              "type": "text"
+            }
+          },
+          {
+            "name": "selectors",
+            "required": true,
+            "value_type": {
+              "type": "list",
+              "item": {
+                "type": "text"
+              }
+            }
+          },
+          {
+            "name": "mode",
+            "required": true,
+            "value_type": {
+              "type": "enum",
+              "values": [
+                "exclusive",
+                "speculative"
+              ]
+            }
+          }
+        ],
+        "status": {
+          "values": [
+            "speculative",
+            "granted",
+            "released",
+            "expired",
+            "conflicted",
+            "withdrawn"
+          ],
+          "initial": "speculative",
+          "transitions": [
+            {
+              "from": "speculative",
+              "to": "withdrawn",
+              "admission": {
+                "requires": "public"
+              }
+            }
+          ]
+        }
+      },
+      "creation": {
+        "requires": "public"
+      },
+      "inventory_role": {
+        "kind": "non_requirement"
+      }
+    }
+  ],
+  "owner_scopes": [
+    "norm.accept",
+    "norm.retire"
+  ],
+  "resource_domains": {
+    "workspace": {
+      "include": [
+        {
+          "kind": "workspace_files"
+        }
+      ]
+    }
+  }
+}

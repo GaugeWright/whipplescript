@@ -1,0 +1,17 @@
+load ../norm-prepared-dispatch.maude
+search [1] in NORM-PREPARED-DISPATCH : { pin(invocation,v1,body,epoch) candidate(invocation,body,epoch,off,off) permitted(invocation) } =>* { dispatched(invocation) C:Cfg } .
+search [1] in NORM-PREPARED-DISPATCH : { candidate(invocation,body,epoch,off,off) permitted(invocation) } =>* { dispatched(invocation) C:Cfg } .
+search [1] in NORM-PREPARED-DISPATCH-WEAK-MISSING : { candidate(invocation,body,epoch,off,off) permitted(invocation) } =>* { dispatched(invocation) C:Cfg } .
+search [1] in NORM-PREPARED-DISPATCH : { pin(invocation,future,body,epoch) candidate(invocation,body,epoch,off,off) permitted(invocation) } =>* { dispatched(invocation) C:Cfg } .
+search [1] in NORM-PREPARED-DISPATCH-WEAK-PROTOCOL : { pin(invocation,future,body,epoch) candidate(invocation,body,epoch,off,off) permitted(invocation) } =>* { dispatched(invocation) C:Cfg } .
+search [1] in NORM-PREPARED-DISPATCH : { pin(invocation,v1,body,epoch) candidate(invocation,other,epoch,off,off) permitted(invocation) } =>* { dispatched(invocation) C:Cfg } .
+search [1] in NORM-PREPARED-DISPATCH-WEAK-BODY : { pin(invocation,v1,body,epoch) candidate(invocation,other,epoch,off,off) permitted(invocation) } =>* { dispatched(invocation) C:Cfg } .
+search [1] in NORM-PREPARED-DISPATCH : { pin(invocation,v1,body,epoch) candidate(invocation,body,other,off,off) permitted(invocation) } =>* { dispatched(invocation) C:Cfg } .
+search [1] in NORM-PREPARED-DISPATCH-WEAK-EPOCH : { pin(invocation,v1,body,epoch) candidate(invocation,body,other,off,off) permitted(invocation) } =>* { dispatched(invocation) C:Cfg } .
+search [1] in NORM-PREPARED-DISPATCH : { pin(invocation,v1,body,epoch) candidate(invocation,body,epoch,on,off) permitted(invocation) } =>* { dispatched(invocation) C:Cfg } .
+search [1] in NORM-PREPARED-DISPATCH-WEAK-CACHE : { pin(invocation,v1,body,epoch) candidate(invocation,body,epoch,on,off) permitted(invocation) } =>* { dispatched(invocation) C:Cfg } .
+search [1] in NORM-PREPARED-DISPATCH : { pin(invocation,v1,body,epoch) candidate(invocation,body,epoch,off,on) permitted(invocation) } =>* { dispatched(invocation) C:Cfg } .
+search [1] in NORM-PREPARED-DISPATCH-WEAK-PARSE : { pin(invocation,v1,body,epoch) candidate(invocation,body,epoch,off,on) permitted(invocation) } =>* { dispatched(invocation) C:Cfg } .
+search [1] in NORM-PREPARED-DISPATCH : { pin(invocation,v1,body,epoch) candidate(invocation,body,epoch,off,off) } =>* { dispatched(invocation) C:Cfg } .
+search [1] in NORM-PREPARED-DISPATCH-WEAK-POLICY : { pin(invocation,v1,body,epoch) candidate(invocation,body,epoch,off,off) } =>* { dispatched(invocation) C:Cfg } .
+quit

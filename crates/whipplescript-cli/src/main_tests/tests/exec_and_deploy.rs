@@ -544,6 +544,7 @@ fn hermetic_capability_exec_served_from_cache_on_second_run() {
 
     for effect_id in ["exec-1", "exec-2"] {
         let claimable = ClaimableEffect {
+            attempt_admission_event_id: None,
             effect_id: effect_id.to_owned(),
             kind: "exec.command".to_owned(),
             target: None,
@@ -599,6 +600,170 @@ fn hermetic_capability_exec_served_from_cache_on_second_run() {
         .expect("cache entry recorded");
     assert_eq!(entry.source_effect_id, "exec-1");
     assert_eq!(entry.effect_kind, "exec.command");
+
+    drop(store);
+    // A returned process outcome must not leave a terminal without its fact.
+    // Exercise both success and typed-ingestion failure through the real runner.
+    for failed in [false, true] {
+        let effect_id = if failed {
+            "exec-failed-projection"
+        } else {
+            "exec-success-projection"
+        };
+        let mut input = json!({"mode":"capability", "capability":"judge", "stdin":{"n": if failed {3} else {2}}});
+        if failed {
+            input["parse"] = json!({"schema":"json", "shape":{}});
+        }
+        let input = input.to_string();
+        let mut store = SqliteStore::open(&store_path).unwrap();
+        let queued = NewEffect {
+            effect_id,
+            input_json: &input,
+            idempotency_key: effect_id,
+            ..effects[0]
+        };
+        store
+            .commit_rule(RuleCommit {
+                instance_id: &instance_id,
+                rule: effect_id,
+                trigger_event_id: None,
+                facts: &[],
+                consumed_fact_ids: &[],
+                effects: &[queued],
+                dependencies: &[],
+                terminal: None,
+                idempotency_key: Some(effect_id),
+                marks: &[],
+                context_json: None,
+            })
+            .unwrap();
+        let before = store
+            .list_events(&instance_id)
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.event_type == "effect.terminal")
+            .count();
+        drop(store);
+        let db = rusqlite::Connection::open(&store_path).unwrap();
+        let cache_before: i64 = db
+            .query_row("SELECT count(*) FROM compute_result_cache", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        db.execute_batch(&format!("CREATE TRIGGER fail_native_projection AFTER INSERT ON facts WHEN NEW.key = '{effect_id}' BEGIN SELECT RAISE(ABORT, 'injected native projection failure'); END;")).unwrap();
+        let claimable = ClaimableEffect {
+            attempt_admission_event_id: None,
+            effect_id: effect_id.into(),
+            kind: "exec.command".into(),
+            target: None,
+            profile: None,
+            input_json: input,
+            required_capabilities_json: r#"["script.judge"]"#.into(),
+            declared_profiles_json: "[]".into(),
+        };
+        assert!(run_exec_effect(
+            &store_path,
+            &instance_id,
+            &claimable,
+            ExecProfile::Dev,
+            Some(&manifest)
+        )
+        .is_err());
+        let store = SqliteStore::open(&store_path).unwrap();
+        let run = store
+            .list_runs(&instance_id)
+            .unwrap()
+            .into_iter()
+            .find(|r| r.effect_id == effect_id)
+            .unwrap();
+        assert_eq!(
+            run.status, "running",
+            "failed={failed}: terminal escaped the batch"
+        );
+        assert_eq!(
+            store
+                .list_events(&instance_id)
+                .unwrap()
+                .into_iter()
+                .filter(|e| e.event_type == "effect.terminal")
+                .count(),
+            before
+        );
+        assert_eq!(
+            db.query_row("SELECT count(*) FROM compute_result_cache", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            cache_before
+        );
+        assert_eq!(
+            db.query_row(
+                "SELECT count(*) FROM facts WHERE key = ?1",
+                [effect_id],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
+        db.execute_batch("DROP TRIGGER fail_native_projection")
+            .unwrap();
+        drop(store);
+        let witness_before = fs::read_to_string(&witness_path).unwrap();
+        let mut options = WorkerOptions::parse(&[instance_id.clone(), "--once".into()]).unwrap();
+        options.script_manifest_path = None;
+        let report = run_worker_once(&store_path, &options)
+            .expect("worker discovers retained running outcome without script registration");
+        assert_eq!(report.ran_effects, 1);
+        let recovered = run_exec_effect(
+            &store_path,
+            &instance_id,
+            &claimable,
+            ExecProfile::Dev,
+            None,
+        )
+        .unwrap();
+        assert!(report.terminal_events.contains(&recovered.event_id));
+        assert_eq!(
+            fs::read_to_string(&witness_path).unwrap(),
+            witness_before,
+            "recovery spawned the script"
+        );
+        assert_eq!(
+            db.query_row(
+                "SELECT status FROM runs WHERE effect_id = ?1",
+                [effect_id],
+                |r| r.get::<_, String>(0)
+            )
+            .unwrap(),
+            if failed { "failed" } else { "completed" }
+        );
+        db.execute(
+            "UPDATE facts SET consumed_at = CURRENT_TIMESTAMP WHERE key = ?1",
+            [effect_id],
+        )
+        .unwrap();
+        assert_eq!(
+            run_exec_effect(
+                &store_path,
+                &instance_id,
+                &claimable,
+                ExecProfile::Dev,
+                None
+            )
+            .unwrap(),
+            recovered
+        );
+        assert_eq!(
+            db.query_row(
+                "SELECT count(*) FROM facts WHERE key = ?1 AND consumed_at IS NULL",
+                [effect_id],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0,
+            "recovery revived a consumed fact"
+        );
+        assert_eq!(fs::read_to_string(&witness_path).unwrap(), witness_before);
+    }
 
     for path in [&store_path, &program_path, &script_path, &witness_path] {
         let _ = fs::remove_file(path);
@@ -666,6 +831,7 @@ fn notify_refuses_cross_package_internal_workflow_target() {
     env::set_var("WHIPPLESCRIPT_IFC_ENVELOPE", &envelope_path);
 
     let effect = ClaimableEffect {
+        attempt_admission_event_id: None,
         effect_id: "notify-internal".to_owned(),
         kind: "signal.emit".to_owned(),
         target: None,

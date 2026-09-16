@@ -1,0 +1,63 @@
+--- One correctly bound placement/v2 controller admission. Owning transaction durability,
+--- incarnation validation and physical termination are outside this projection.
+--- completed means output is available without termination proof. Fencing it
+--- preserves that output but still requires the separate physical barrier.
+mod EXEC-CONTROLLER-FENCE is
+ protecting NAT .
+ sorts State Command Commands Reply Cfg .
+ subsort Command < Commands .
+ ops absent admitted fencing tombstone completed : -> State [ctor] .
+ ops read admit fence complete : -> Command [ctor] .
+ op nil : -> Commands [ctor] .
+ op __ : Commands Commands -> Commands [ctor assoc id: nil] .
+ ops missing execute pending fenceRequired notAdmitted replay : -> Reply [ctor] .
+ op cfg : State Commands Nat Reply -> Cfg [ctor] .
+ var CS : Commands . var N : Nat . var R : Reply .
+ rl [read-is-not-admission] : cfg(absent,read CS,N,R) => cfg(absent,CS,N,missing) .
+ rl [read-admitted] : cfg(admitted,read CS,N,R) => cfg(admitted,CS,N,pending) .
+ rl [read-fencing] : cfg(fencing,read CS,N,R) => cfg(fencing,CS,N,fenceRequired) .
+ rl [read-tombstone] : cfg(tombstone,read CS,N,R) => cfg(tombstone,CS,N,notAdmitted) .
+ rl [read-completed] : cfg(completed,read CS,N,R) => cfg(completed,CS,N,replay) .
+ rl [admit-completed-replays] : cfg(completed,admit CS,N,R) => cfg(completed,CS,N,replay) .
+ rl [repeat-tombstone] : cfg(tombstone,fence CS,N,R) => cfg(tombstone,CS,N,notAdmitted) .
+ rl [repeat-completion] : cfg(completed,complete CS,N,R) => cfg(completed,CS,N,replay) .
+ rl [first-admission] : cfg(absent,admit CS,N,R) => cfg(admitted,CS,N + 1,execute) .
+ rl [repeat-admission] : cfg(admitted,admit CS,N,R) => cfg(admitted,CS,N,pending) .
+ rl [fenced-admission] : cfg(tombstone,admit CS,N,R) => cfg(tombstone,CS,N,notAdmitted) .
+ rl [fencing-admission] : cfg(fencing,admit CS,N,R) => cfg(fencing,CS,N,fenceRequired) .
+ rl [non-admission-fence] : cfg(absent,fence CS,N,R) => cfg(tombstone,CS,N,notAdmitted) .
+ rl [admitted-fence-needs-proof] : cfg(admitted,fence CS,N,R) => cfg(fencing,CS,N,fenceRequired) .
+ rl [repeat-fence] : cfg(fencing,fence CS,N,R) => cfg(fencing,CS,N,fenceRequired) .
+ rl [retain-result] : cfg(admitted,complete CS,N,R) => cfg(completed,CS,N,replay) .
+ rl [completion-wins-fence-race] : cfg(fencing,complete CS,N,R) => cfg(completed,CS,N,replay) .
+ rl [fence-cannot-replace-result] : cfg(completed,fence CS,N,R) => cfg(completed,CS,N,fenceRequired) .
+endm
+mod EXEC-CONTROLLER-FENCE-WEAK is
+ including EXEC-CONTROLLER-FENCE .
+ var CS : Commands . var N : Nat . var R : Reply .
+ rl [late-dispatch-bypasses-fence] : cfg(tombstone,admit CS,N,R) => cfg(admitted,CS,N + 1,execute) .
+ rl [pretend-admitted-never-ran] : cfg(admitted,fence CS,N,R) => cfg(tombstone,CS,N,notAdmitted) .
+ rl [pretend-completed-is-quiescent] : cfg(completed,fence CS,N,R) => cfg(completed,CS,N,replay) .
+ rl [discard-retained-result] : cfg(completed,fence CS,N,R) => cfg(fencing,CS,N,fenceRequired) .
+endm
+--- Numeric generations abstract fresh server-start identities. A request for
+--- generation 0 delivered to generation 1 represents a stale delivery after
+--- replacement; this projection does not prove entropy or physical fencing.
+mod EXEC-INCARNATION is
+ protecting NAT .
+ sorts Message Reply Cfg .
+ ops delivery completion : -> Message [ctor] .
+ ops pending rejected executed accepted : -> Reply [ctor] .
+ op cfg : Nat Nat Message Reply -> Cfg [ctor] .
+ vars CURRENT EXPECTED : Nat .
+ var M : Message .
+ rl [matching-delivery] : cfg(CURRENT,CURRENT,delivery,pending) => cfg(CURRENT,CURRENT,delivery,executed) .
+ rl [matching-completion] : cfg(CURRENT,CURRENT,completion,pending) => cfg(CURRENT,CURRENT,completion,accepted) .
+ crl [changed-incarnation] : cfg(CURRENT,EXPECTED,M,pending) => cfg(CURRENT,EXPECTED,M,rejected) if CURRENT =/= EXPECTED .
+endm
+mod EXEC-INCARNATION-WEAK is
+ including EXEC-INCARNATION .
+ vars CURRENT EXPECTED : Nat .
+ rl [stale-delivery-executes] : cfg(CURRENT,EXPECTED,delivery,pending) => cfg(CURRENT,EXPECTED,delivery,executed) .
+ rl [stale-completion-accepted] : cfg(CURRENT,EXPECTED,completion,pending) => cfg(CURRENT,EXPECTED,completion,accepted) .
+endm

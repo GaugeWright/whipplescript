@@ -1,0 +1,12 @@
+load ../store-open-layout.maude
+search [1] in STORE-OPEN-LAYOUT : { open database(original) writer } =>* { ready cached(original) C:Cfg } .
+search [1] in STORE-OPEN-LAYOUT : { open database(original) cached(original) } =>* { ready database(original) cached(original) } .
+search [1] in STORE-OPEN-LAYOUT : { open database(changed) cached(original) writer } =>* { ready cached(changed) C:Cfg } .
+search [1] in STORE-OPEN-LAYOUT : { open database(changed) cached(original) } =>* { ready C:Cfg } .
+search [1] in STORE-OPEN-LAYOUT-WEAK-IDENTITY : { open database(changed) cached(original) } =>* { ready C:Cfg } .
+search [1] in STORE-OPEN-LAYOUT : { open database(original) } =>* { ready C:Cfg } .
+search [1] in STORE-OPEN-LAYOUT-WEAK-VALIDATION : { open database(original) } =>* { ready C:Cfg } .
+search [1] in STORE-OPEN-LAYOUT : { open database(original) referenceBuild } =>* { ready database(original) cached(original) } .
+search [1] in STORE-OPEN-LAYOUT : { open database(changed) referenceBuild } =>* { ready C:Cfg } .
+search [1] in STORE-OPEN-LAYOUT-WEAK-IDENTITY : { open database(changed) referenceBuild } =>* { ready C:Cfg } .
+quit

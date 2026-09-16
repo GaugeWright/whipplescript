@@ -175,6 +175,8 @@ fn worker_input_read_connects_without_a_migration_lock_or_database_creation() {
         effect_id: "following".into(), kind: "agent.tell".into(), target: Some("worker".into()), profile: None,
         input_json: json!({"after": {"binding": "prior", "predicate": "succeeds", "upstream_effect_id": "prior"}}).to_string(),
         required_capabilities_json: "[]".into(), declared_profiles_json: "[]".into(),
+        // Fixture: no attempt admission selected this effect.
+        attempt_admission_event_id: None,
     };
     assert!(resolve_effect_input_after_bindings(&path, "instance", &effect).is_err());
     assert!(!path.exists());

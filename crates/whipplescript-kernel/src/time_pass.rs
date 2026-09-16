@@ -120,6 +120,18 @@ pub fn resolve_due_time_effects<S: RuntimeStore>(
         let expired_run_id = running_run.as_ref().map(|run| run.run_id.clone());
         let terminal_event_id = match running_run {
             Some(run) => {
+                if (effect.kind == "exec.command" || run.provider == "exec")
+                    && crate::exec_lifetime::tracked(kernel.store(), instance_id)?
+                        .contains_key(&run.run_id)
+                {
+                    kernel.store_mut().ensure_exec_fence(
+                        whipplescript_store::exec_lifetime::Fence {
+                            instance_id,
+                            run_id: &run.run_id,
+                            reason: whipplescript_store::exec_lifetime::FenceReason::Deadline,
+                        },
+                    )?;
+                }
                 let terminal = kernel.timeout_run(EffectCompletion {
                     instance_id,
                     effect_id: &effect.effect_id,

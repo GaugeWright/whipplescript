@@ -1,0 +1,50 @@
+--- C0 owns resource interpretation. Captured file closure and authenticated
+--- requirement inventories are premises, not inferred from a path string.
+mod RESOURCE-INVENTORY is
+  protecting BOOL .
+  sorts Fact Cfg State . subsort Fact < Cfg .
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+  op {_} : Cfg -> State [ctor] .
+  op query : Bool Bool Bool Bool -> Fact [ctor] .
+  ops requirement retained complete gap : -> Fact [ctor] .
+  vars C : Cfg . vars P I S D : Bool .
+  rl [retain-even-empty-domain] : { requirement query(P,I,S,D) C }
+    => { retained query(P,I,S,D) C } .
+  rl [known-binding] : { retained query(true,true,true,true) C }
+    => { retained complete C } .
+  crl [unknown-is-gap] : { retained query(P,I,S,D) C }
+    => { retained gap C } if (P and I and S and D) = false .
+endm
+mod RESOURCE-INVENTORY-WEAK-POLICY is
+  including RESOURCE-INVENTORY . var C : Cfg . var P : Bool .
+  rl [guess-policy] : { retained query(P,true,true,true) C } => { retained complete C } .
+endm
+mod RESOURCE-INVENTORY-WEAK-INVENTORY is
+  including RESOURCE-INVENTORY . var C : Cfg . var I : Bool .
+  rl [omit-unknown-records] : { retained query(true,I,true,true) C } => { retained complete C } .
+endm
+mod RESOURCE-INVENTORY-WEAK-SUBJECT is
+  including RESOURCE-INVENTORY . var C : Cfg . var S : Bool .
+  rl [absent-subject-disappears] : { retained query(true,true,S,true) C } => { retained complete C } .
+endm
+mod RESOURCE-INVENTORY-WEAK-DOMAIN is
+  including RESOURCE-INVENTORY . var C : Cfg . var D : Bool .
+  rl [undeclared-domain] : { retained query(true,true,true,D) C } => { retained complete C } .
+endm
+--- Before/after inventory comparison retains the union, including retirement.
+mod RESOURCE-INVENTORY-PAIR is
+  including RESOURCE-INVENTORY .
+  op comparison : Bool Bool Bool -> Fact [ctor] .
+  op required : Bool -> Fact [ctor] .
+  vars O N : Bool . var C : Cfg .
+  rl [same-history-union] : { comparison(true,O,N) C } => { required(O or N) C } .
+endm
+mod RESOURCE-INVENTORY-WEAK-HISTORY is
+  including RESOURCE-INVENTORY-PAIR . vars H O N : Bool . var C : Cfg .
+  rl [unrelated-history] : { comparison(H,O,N) C } => { required(O or N) C } .
+endm
+mod RESOURCE-INVENTORY-WEAK-RETIREMENT is
+  including RESOURCE-INVENTORY-PAIR . vars O N : Bool . var C : Cfg .
+  rl [forget-prior-duty] : { comparison(true,O,N) C } => { required(N) C } .
+endm

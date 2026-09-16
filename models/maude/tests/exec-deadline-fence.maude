@@ -1,0 +1,10 @@
+load ../exec-lifetime-tracking.maude
+search [1] in EXEC-DEADLINE-FENCE : cfg(absent,running) =>* cfg(durable,timedOut) .
+search [1] in EXEC-DEADLINE-FENCE : cfg(absent,running) =>* cfg(durable,replaced) .
+search [1] in EXEC-DEADLINE-FENCE : cfg(absent,running) =>* cfg(absent,timedOut) .
+search [1] in EXEC-DEADLINE-FENCE-WEAK : cfg(absent,running) =>* cfg(absent,timedOut) .
+search [1] in EXEC-DEADLINE-FENCE : cfg(absent,running) =>* cfg(lost,timedOut) .
+search [1] in EXEC-DEADLINE-FENCE-WEAK : cfg(absent,running) =>* cfg(lost,timedOut) .
+search [1] in EXEC-DEADLINE-FENCE : cfg(absent,running) =>* cfg(lost,replaced) .
+search [1] in EXEC-DEADLINE-FENCE-WEAK : cfg(absent,running) =>* cfg(lost,replaced) .
+quit

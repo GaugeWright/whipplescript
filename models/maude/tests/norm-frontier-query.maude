@@ -1,0 +1,16 @@
+load ../norm-frontier-query.maude
+search [1] in NORM-FRONTIER-QUERY : { request(old,true,true,true,true,true) authority(current) } =>* { report(current,old) authority(current) } .
+search [1] in NORM-FRONTIER-QUERY : { request(current,true,true,true,true,true) authority(current) } =>* { report(current,current) authority(current) } .
+search in NORM-FRONTIER-QUERY : { request(old,false,true,true,true,true) authority(current) } =>* { report(current,old) authority(current) } .
+search [1] in NORM-FRONTIER-QUERY-WEAK-HISTORY : { request(old,false,true,true,true,true) authority(current) } =>* { report(current,old) authority(current) } .
+search in NORM-FRONTIER-QUERY : { request(old,true,false,true,true,true) authority(current) } =>* { report(current,old) authority(current) } .
+search [1] in NORM-FRONTIER-QUERY-WEAK-CONSISTENCY : { request(old,true,false,true,true,true) authority(current) } =>* { report(current,old) authority(current) } .
+search in NORM-FRONTIER-QUERY : { request(old,true,true,false,true,true) authority(current) } =>* { report(current,old) authority(current) } .
+search [1] in NORM-FRONTIER-QUERY-WEAK-FRONTIER : { request(old,true,true,false,true,true) authority(current) } =>* { report(current,old) authority(current) } .
+search in NORM-FRONTIER-QUERY : { request(old,true,true,true,false,true) authority(current) } =>* { report(current,old) authority(current) } .
+search [1] in NORM-FRONTIER-QUERY-WEAK-ARTIFACT : { request(old,true,true,true,false,true) authority(current) } =>* { report(current,old) authority(current) } .
+search in NORM-FRONTIER-QUERY : { request(old,true,true,true,true,false) authority(current) } =>* { report(current,old) authority(current) } .
+search [1] in NORM-FRONTIER-QUERY-WEAK-BUDGET : { request(old,true,true,true,true,false) authority(current) } =>* { report(current,old) authority(current) } .
+search in NORM-FRONTIER-QUERY : { request(old,true,true,true,true,true) authority(current) write(old) } =>* { report(current,old) authority(old) admitted(old) } .
+search [1] in NORM-FRONTIER-QUERY-WEAK-ROLLBACK : { request(old,true,true,true,true,true) authority(current) write(old) } =>* { report(current,old) authority(old) admitted(old) } .
+quit

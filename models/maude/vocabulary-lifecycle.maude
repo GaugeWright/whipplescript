@@ -1,0 +1,246 @@
+--- DR-0098 / norm-plane.md sections 1 and 6: bounded V0 admission model.
+---
+--- Trusted inputs: a verified key/principal binding and the host capability to
+--- create for a represented owner, plus an authenticated authority checkpoint
+--- for the selected import frontier. Cryptographic verification/custody and the
+--- derivation of that checkpoint from an event DAG are not proved here.
+--- Genesis includes a nonce, principal and key; its constructor
+--- stands for their collision-resistant commitment, NOT a mutable actor label.
+--- Record identifiers are creation events; updates append and retain that id.
+--- One immutable charter, two vocabulary versions, two record identifiers and
+--- two keys per owner suffice for the counterexamples below. Generic schema
+--- validation, aliases, concurrent event folds and host persistence are separate
+--- obligations: this model establishes status ownership and admission only.
+--- Each deliberately weakened sibling adds exactly the rule named in its title.
+
+mod VOCABULARY-LIFECYCLE is
+  protecting NAT .
+  sorts Principal Key Genesis Version Status Policy Fact Cfg State .
+  subsort Fact < Cfg .
+  ops owner worker : -> Principal [ctor] .
+  ops original successor workerKey : -> Key [ctor] .
+  op genesis : Nat Principal Key -> Genesis [ctor] .
+  ops v0 v1 : -> Version [ctor] .
+  ops proposed accepted retired : -> Status [ctor] .
+  ops public ownerOnly : -> Policy [ctor] .
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+  op {_} : Cfg -> State [ctor] .
+
+  --- Trusted binding facts are supplied by verification, not by actor labels.
+  op verified : Principal Key -> Fact [ctor] .
+  op mayCreateFor : Principal Principal -> Fact [ctor] .
+  op create : Nat Principal Principal Key -> Fact [ctor] .
+  op pinned : Genesis -> Fact [ctor] .
+  op root : Genesis Principal Key -> Fact [ctor] .
+  --- head is the pinned authority checkpoint at the imported frontier. A root
+  --- restored without the chain to this key is not usable governance.
+  op head : Key -> Fact [ctor] .
+  op restore : Genesis -> Fact [ctor] .
+  op replaySuccession : Key Key -> Fact [ctor] .
+  op rotate : Key Key -> Fact [ctor] .
+  op succession : Genesis Key Key -> Fact [ctor] .
+
+  --- Finite domain declarations are versioned. A rule is explicit even when
+  --- public. No matching rule means no transition; possession of a key alone
+  --- does not satisfy ownerOnly. Charter evolution is outside this slice.
+  op domain : Version Status -> Fact [ctor] .
+  op rule : Version Status Status Policy -> Fact [ctor] .
+  op record : Nat Version Status -> Fact [ctor] .
+  op propose : Nat Version Key -> Fact [ctor] .
+  op transition : Nat Version Status Key -> Fact [ctor] .
+  op creationRule : Version Policy -> Fact [ctor] .
+  op creation : Nat Version -> Fact [ctor] .
+  op admitted : Nat Version Status Key -> Fact [ctor] .
+
+  vars C : Cfg .
+  vars N I : Nat .
+  vars O A : Principal .
+  vars K K1 : Key .
+  vars G G1 : Genesis .
+  vars V V1 : Version .
+  vars S T : Status .
+  var P : Policy .
+
+  op hasPin : Cfg -> Bool .
+  eq hasPin(pinned(G) C) = true .
+  eq hasPin(C) = false [owise] .
+  op hasRoot : Cfg -> Bool .
+  eq hasRoot(root(G, O, K) C) = true .
+  eq hasRoot(C) = false [owise] .
+  op exists : Nat Cfg -> Bool .
+  eq exists(I, creation(I, V) C) = true .
+  eq exists(I, C) = false [owise] .
+  op permits : Policy Key Cfg -> Bool .
+  eq permits(public, K, C) = true .
+  eq permits(ownerOnly, K, pinned(G) head(K) root(G, O, K) verified(O, K) C) = true .
+  eq permits(P, K, C) = false [owise] .
+
+  --- The whole state is wrapped, so absence checks cannot hide an AC suffix.
+  crl [create-for-owner] :
+    { create(N, A, O, K) mayCreateFor(A, O) verified(O, K) C }
+    => { pinned(genesis(N, O, K)) head(K) root(genesis(N, O, K), O, K)
+         mayCreateFor(A, O) verified(O, K) C }
+    if hasPin(C) = false /\ hasRoot(C) = false .
+
+  crl [restore-original] :
+    { pinned(genesis(N, O, K)) restore(genesis(N, O, K)) verified(O, K) C }
+    => { pinned(genesis(N, O, K)) root(genesis(N, O, K), O, K) verified(O, K) C }
+    if hasRoot(C) = false .
+
+  --- Rotation consumes the current root, requires the current signing key and
+  --- an authenticated binding for its replacement, and leaves genesis pinned.
+  rl [rotate-owner-key] :
+    { pinned(G) head(K) root(G, O, K) verified(O, K) verified(O, K1) rotate(K, K1) C }
+    => { pinned(G) head(K1) root(G, O, K1) verified(O, K) verified(O, K1)
+         succession(G, K, K1) C } .
+
+  --- A verified succession edge is an input from the signature verifier. The
+  --- chain must start at the restored root, never at an arbitrary new key.
+  rl [replay-succession] :
+    { pinned(G) root(G, O, K) succession(G, K, K1) replaySuccession(K, K1)
+      verified(O, K1) C }
+    => { pinned(G) root(G, O, K1) succession(G, K, K1) verified(O, K1) C } .
+
+  crl [create-record] :
+    { propose(I, V, K) domain(V, proposed) creationRule(V, P) C }
+    => { record(I, V, proposed) creation(I, V) domain(V, proposed) creationRule(V, P) C }
+    if exists(I, C) = false /\ permits(P, K, C) = true .
+
+  crl [admit-transition] :
+    { record(I, V, S) transition(I, V, T, K) domain(V, T) rule(V, S, T, P) C }
+    => { record(I, V, T) admitted(I, V, T, K) domain(V, T) rule(V, S, T, P) C }
+    if permits(P, K, C) = true .
+
+  op declarations : -> Cfg .
+  eq declarations = creationRule(v0, public) creationRule(v1, public) domain(v0, proposed) domain(v0, accepted)
+    domain(v1, proposed) domain(v1, accepted) domain(v1, retired)
+    rule(v0, proposed, accepted, ownerOnly)
+    rule(v1, proposed, retired, public) .
+  op trust : -> Cfg .
+  eq trust = verified(owner, original) verified(owner, successor)
+    verified(worker, workerKey) mayCreateFor(worker, owner) .
+  op established : -> Cfg .
+  eq established = pinned(genesis(7, owner, original))
+    head(original) root(genesis(7, owner, original), owner, original) trust declarations .
+  op existing : -> Cfg .
+  eq existing = record(1, v0, proposed) creation(1, v0) .
+endm
+
+mod VOCABULARY-LIFECYCLE-MISSING-RULE is
+  including VOCABULARY-LIFECYCLE .
+  var C : Cfg .
+  vars N I : Nat .
+  vars O A : Principal .
+  vars K K1 : Key .
+  var G : Genesis .
+  vars V V1 : Version .
+  vars S T : Status .
+  var P : Policy .
+  --- Incorrect default: every in-domain target is implicitly public.
+  rl [implicit-public] :
+    { record(I, V, S) transition(I, V, T, K) domain(V, T) C }
+    => { record(I, V, T) admitted(I, V, T, K) domain(V, T) C } .
+endm
+
+mod VOCABULARY-LIFECYCLE-WRONG-VERSION is
+  including VOCABULARY-LIFECYCLE .
+  var C : Cfg .
+  vars N I : Nat .
+  vars O A : Principal .
+  vars K K1 : Key .
+  var G : Genesis .
+  vars V V1 : Version .
+  vars S T : Status .
+  var P : Policy .
+  --- Incorrectly looks up a request's rules instead of the record's version.
+  crl [reinterpret] :
+    { record(I, V, S) transition(I, V1, T, K) domain(V1, T) rule(V1, S, T, P) C }
+    => { record(I, V, T) admitted(I, V1, T, K) domain(V1, T) rule(V1, S, T, P) C }
+    if permits(P, K, C) = true .
+endm
+
+mod VOCABULARY-LIFECYCLE-CREATOR-GRANT is
+  including VOCABULARY-LIFECYCLE .
+  var C : Cfg .
+  vars N I : Nat .
+  vars O A : Principal .
+  vars K K1 : Key .
+  var G : Genesis .
+  vars V V1 : Version .
+  vars S T : Status .
+  var P : Policy .
+  --- Incorrectly grants governance to the executor, despite the represented O.
+  crl [executor-is-owner] :
+    { create(N, A, O, K) mayCreateFor(A, O) verified(O, K) verified(A, K1) C }
+    => { pinned(genesis(N, A, K1)) head(K1) root(genesis(N, A, K1), A, K1)
+         mayCreateFor(A, O) verified(O, K) verified(A, K1) C }
+    if hasPin(C) = false /\ hasRoot(C) = false .
+endm
+
+mod VOCABULARY-LIFECYCLE-REPLACEMENT-GENESIS is
+  including VOCABULARY-LIFECYCLE .
+  var C : Cfg .
+  vars N I : Nat .
+  vars O A : Principal .
+  vars K K1 : Key .
+  var G : Genesis .
+  vars V V1 : Version .
+  vars S T : Status .
+  var P : Policy .
+  --- Incorrectly allows an import to rewrite the client's pinned identity.
+  crl [replace-pin] :
+    { pinned(G) head(K1) restore(genesis(N, O, K)) verified(O, K) C }
+    => { pinned(genesis(N, O, K)) head(K) root(genesis(N, O, K), O, K) verified(O, K) C }
+    if hasRoot(C) = false .
+endm
+
+mod VOCABULARY-LIFECYCLE-UNAUTHORIZED-ROTATION is
+  including VOCABULARY-LIFECYCLE .
+  var C : Cfg .
+  vars N I : Nat .
+  vars O A : Principal .
+  vars K K1 : Key .
+  var G : Genesis .
+  vars V V1 : Version .
+  vars S T : Status .
+  var P : Policy .
+  --- A real verified worker key is still not the current governance key.
+  rl [rotate-any-signer] :
+    { pinned(G) head(K) root(G, O, K) verified(A, K1) rotate(K1, K1) C }
+    => { pinned(G) head(K1) root(G, A, K1) verified(A, K1) succession(G, K, K1) C } .
+endm
+
+mod VOCABULARY-LIFECYCLE-INCOMPLETE-CHAIN is
+  including VOCABULARY-LIFECYCLE .
+  var C : Cfg .
+  var I : Nat .
+  var O : Principal .
+  var K : Key .
+  var G : Genesis .
+  var V : Version .
+  vars S T : Status .
+  --- Incorrectly uses a restored old root before reaching the pinned head.
+  rl [accept-old-root] :
+    { record(I, V, S) transition(I, V, T, K) domain(V, T)
+      rule(V, S, T, ownerOnly) pinned(G) root(G, O, K) verified(O, K) C }
+    => { record(I, V, T) admitted(I, V, T, K) domain(V, T)
+      rule(V, S, T, ownerOnly) pinned(G) root(G, O, K) verified(O, K) C } .
+endm
+
+mod VOCABULARY-LIFECYCLE-MISSING-CREATION-RULE is
+  including VOCABULARY-LIFECYCLE .
+  var C : Cfg . var I : Nat . var V : Version . var K : Key .
+  crl [implicit-public-creation] :
+    { propose(I, V, K) domain(V, proposed) C }
+    => { record(I, V, proposed) creation(I, V) domain(V, proposed) C }
+    if exists(I, C) = false .
+endm
+mod VOCABULARY-LIFECYCLE-UNAUTHORIZED-CREATION is
+  including VOCABULARY-LIFECYCLE .
+  var C : Cfg . var I : Nat . var V : Version . var K : Key . var P : Policy .
+  crl [ignore-creation-authority] :
+    { propose(I, V, K) domain(V, proposed) creationRule(V, P) C }
+    => { record(I, V, proposed) creation(I, V) domain(V, proposed) creationRule(V, P) C }
+    if exists(I, C) = false .
+endm

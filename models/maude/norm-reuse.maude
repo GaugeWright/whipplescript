@@ -1,0 +1,89 @@
+--- DR-0098 / N1 composition: verified preservation transports existing
+--- support; it does not create coverage, change epistemic mode or relabel history.
+--- verified is the norm-preservation result; accepted is host policy at the
+--- query time basis. Authenticated frontier and ancestry come from selection.
+mod NORM-REUSE is
+  sorts Id Support Fact Cfg State .
+  ops o w r q m p s t b k other : -> Id [ctor] .
+  ops positive negative inadequate : -> Support [ctor] .
+  subsort Fact < Cfg .
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+  op {_} : Cfg -> State [ctor] .
+  op query : Id Id Id Id -> Fact [ctor] .
+  op observation : Id Id Id Id Support -> Fact [ctor] .
+  op verified : Id Id Id Id Id Id Id -> Fact [ctor] .
+  op accepted : Id Id Id Id -> Fact [ctor] .
+  op visible : Id -> Fact [ctor] .
+  op ancestor : Id Id -> Fact [ctor] .
+  op reused : Id Id Id Id Support -> Fact [ctor] .
+  vars O W R Q M P S T B K Q1 M1 P1 S1 T1 B1 : Id . var C : Cfg .
+  rl [transport-positive] :
+    { query(Q,P,T,K) observation(O,Q,M,S,positive) verified(W,Q,M,P,S,T,B) accepted(W,P,K,B) visible(O) visible(W) ancestor(O,W) C }
+    => { observation(O,Q,M,S,positive) verified(W,Q,M,P,S,T,B) accepted(W,P,K,B) visible(O) visible(W) ancestor(O,W) C reused(O,W,S,T,positive) } .
+  rl [transport-negative] :
+    { query(Q,P,T,K) observation(O,Q,M,S,negative) verified(W,Q,M,P,S,T,B) accepted(W,P,K,B) visible(O) visible(W) ancestor(O,W) C }
+    => { observation(O,Q,M,S,negative) verified(W,Q,M,P,S,T,B) accepted(W,P,K,B) visible(O) visible(W) ancestor(O,W) C reused(O,W,S,T,negative) } .
+endm
+mod NORM-REUSE-WEAK-CAUSAL is
+  including NORM-REUSE .
+  vars O W R Q M P S T B K Q1 M1 P1 S1 T1 B1 : Id . var C : Cfg .
+  rl [weaken-causal] :
+    { query(Q,P,T,K) observation(O,Q,M,S,positive) verified(W,Q,M,P,S,T,B) accepted(W,P,K,B) visible(O) visible(W)  C }
+    => { observation(O,Q,M,S,positive) verified(W,Q,M,P,S,T,B) accepted(W,P,K,B) visible(O) visible(W)  C reused(O,W,S,T,positive) } .
+endm
+mod NORM-REUSE-WEAK-FRONTIER is
+  including NORM-REUSE .
+  vars O W R Q M P S T B K Q1 M1 P1 S1 T1 B1 : Id . var C : Cfg .
+  rl [weaken-frontier] :
+    { query(Q,P,T,K) observation(O,Q,M,S,positive) verified(W,Q,M,P,S,T,B) accepted(W,P,K,B) visible(O)  ancestor(O,W) C }
+    => { observation(O,Q,M,S,positive) verified(W,Q,M,P,S,T,B) accepted(W,P,K,B) visible(O)  ancestor(O,W) C reused(O,W,S,T,positive) } .
+endm
+mod NORM-REUSE-WEAK-POLICY is
+  including NORM-REUSE .
+  vars O W R Q M P S T B K Q1 M1 P1 S1 T1 B1 : Id . var C : Cfg .
+  rl [weaken-policy] :
+    { query(Q,P,T,K) observation(O,Q,M,S,positive) verified(W,Q,M,P,S,T,B)  visible(O) visible(W) ancestor(O,W) C }
+    => { observation(O,Q,M,S,positive) verified(W,Q,M,P,S,T,B)  visible(O) visible(W) ancestor(O,W) C reused(O,W,S,T,positive) } .
+endm
+mod NORM-REUSE-WEAK-SCOPE is
+  including NORM-REUSE .
+  vars O W R Q M P S T B K Q1 M1 P1 S1 T1 B1 : Id . var C : Cfg .
+  rl [weaken-scope] :
+    { query(Q,P,T,K) observation(O,Q,M,S,positive) verified(W,Q1,M1,P1,S1,T1,B1) accepted(W,P,K,B) visible(O) visible(W) ancestor(O,W) C }
+    => { observation(O,Q,M,S,positive) verified(W,Q1,M1,P1,S1,T1,B1) accepted(W,P,K,B) visible(O) visible(W) ancestor(O,W) C reused(O,W,S,T,positive) } .
+endm
+mod NORM-REUSE-WEAK-ADEQUACY is
+  including NORM-REUSE .
+  vars O W R Q M P S T B K Q1 M1 P1 S1 T1 B1 : Id . var C : Cfg .
+  rl [preservation-as-support] :
+    { query(Q,P,T,K) observation(O,Q,M,S,inadequate) verified(W,Q,M,P,S,T,B) accepted(W,P,K,B) visible(O) visible(W) ancestor(O,W) C }
+    => { observation(O,Q,M,S,inadequate) verified(W,Q,M,P,S,T,B) accepted(W,P,K,B) visible(O) visible(W) ancestor(O,W) C reused(O,W,S,T,positive) } .
+endm
+mod NORM-REUSE-WEAK-POLARITY is
+  including NORM-REUSE .
+  vars O W R Q M P S T B K Q1 M1 P1 S1 T1 B1 : Id . var C : Cfg .
+  rl [counterexample-as-positive] :
+    { query(Q,P,T,K) observation(O,Q,M,S,negative) verified(W,Q,M,P,S,T,B) accepted(W,P,K,B) visible(O) visible(W) ancestor(O,W) C }
+    => { observation(O,Q,M,S,negative) verified(W,Q,M,P,S,T,B) accepted(W,P,K,B) visible(O) visible(W) ancestor(O,W) C reused(O,W,S,T,positive) } .
+endm
+
+--- A resolution may rely on transported support only after it knows the
+--- witness. The evidence-selection component verifies its remaining authority,
+--- exact target scope, and original observation ancestry.
+mod NORM-REUSE-RESOLUTION is
+  including NORM-REUSE .
+  op resolutionAccepted : Id Id -> Fact [ctor] .
+  op retired : Id Id -> Fact [ctor] .
+  vars O W R S T : Id . var A : Support . var C : Cfg .
+  rl [resolve-known-transport] :
+    { reused(O,W,S,T,A) ancestor(O,R) ancestor(W,R) resolutionAccepted(R,O) C }
+    => { reused(O,W,S,T,A) ancestor(O,R) ancestor(W,R) retired(O,R) C } .
+endm
+mod NORM-REUSE-WEAK-RESOLUTION is
+  including NORM-REUSE-RESOLUTION .
+  vars O W R S T : Id . var A : Support . var C : Cfg .
+  rl [retroactive-transport-authority] :
+    { reused(O,W,S,T,A) ancestor(O,R) resolutionAccepted(R,O) C }
+    => { reused(O,W,S,T,A) ancestor(O,R) retired(O,R) C } .
+endm

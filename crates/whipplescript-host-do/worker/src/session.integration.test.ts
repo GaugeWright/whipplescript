@@ -1,4 +1,7 @@
 import { env } from "cloudflare:workers";
+import { makeBridge } from "./index";
+import { WasmDurableInstance } from "../pkg/whipplescript_host_do_bg.js";
+import DO_SCHEMA from "../do_schema.sql";
 // workerd-production-object
 // session-control-boundary
 import {
@@ -6,7 +9,7 @@ import {
   runDurableObjectAlarm,
   runInDurableObject,
 } from "cloudflare:test";
-import { describe, expect, it, vi } from "vitest";
+import { describe, expect, it, onTestFinished, vi } from "vitest";
 import {
   COLLECTION_RECIPIENT_PRIVATE_SEED_HEX,
   COLLECTION_RECIPIENT_PUBLIC_KEY_HEX,
@@ -493,6 +496,8 @@ describe("real WorkflowInstance hibernation", () => {
     const firstRoundGate = new Promise<void>((resolve) => {
       releaseFirst = resolve;
     });
+    // A failed assertion or test timeout must not strand the mock response.
+    onTestFinished(releaseFirst);
     const providerBodies: string[] = [];
     let round = 0;
     const providerFetch = vi.fn(
@@ -569,44 +574,44 @@ describe("real WorkflowInstance hibernation", () => {
       text: "change direction",
     }));
 
-    const observed: Record<string, unknown>[] = [];
-    while (
-      observed.filter(({ type }) => type === "turn_queue_changed").length < 2
-    ) {
-      observed.push(await nextMessage(socket));
-    }
-    releaseFirst();
-    for (let index = 0; index < 120; index += 1) {
-      const message = await nextMessage(socket);
-      observed.push(message);
-      if (message.type === "turn_terminal" || message.type === "error") break;
-    }
+      const observed: Record<string, unknown>[] = [];
+      while (
+        observed.filter(({ type }) => type === "turn_queue_changed").length < 2
+      ) {
+        observed.push(await nextMessage(socket));
+      }
+      releaseFirst();
+      for (let index = 0; index < 120; index += 1) {
+        const message = await nextMessage(socket);
+        observed.push(message);
+        if (message.type === "turn_terminal" || message.type === "error") break;
+      }
 
-    expect(providerFetch).toHaveBeenCalledTimes(3);
-    expect(providerBodies[1]).toContain("change direction");
-    expect(providerBodies[2]).toContain("one more thing");
-    expect(observed.filter(({ type }) => type === "turn_command_applied"))
-      .toEqual(expect.arrayContaining([
-        expect.objectContaining({ request_id: "steer-1", kind: "steer" }),
-        expect.objectContaining({ request_id: "follow-1", kind: "follow_up" }),
-      ]));
-    expect(observed.at(-1)).toMatchObject({
-      type: "turn_terminal",
-      request_id: "turn-live",
-    });
-    const state = await stub.fetch("https://session.test/public/session/state", {
-      headers: { authorization: "Bearer session-token" },
-    });
-    expect(await state.json()).toMatchObject({
-      queue: [],
-      transcript: [
-        { type: "user", text: "start" },
-        { type: "user", text: "change direction" },
-        { type: "assistant", text: "redirected" },
-        { type: "user", text: "one more thing" },
-        { type: "assistant", text: "followed up" },
-      ],
-    });
+      expect(providerFetch).toHaveBeenCalledTimes(3);
+      expect(providerBodies[1]).toContain("change direction");
+      expect(providerBodies[2]).toContain("one more thing");
+      expect(observed.filter(({ type }) => type === "turn_command_applied"))
+        .toEqual(expect.arrayContaining([
+          expect.objectContaining({ request_id: "steer-1", kind: "steer" }),
+          expect.objectContaining({ request_id: "follow-1", kind: "follow_up" }),
+        ]));
+      expect(observed.at(-1)).toMatchObject({
+        type: "turn_terminal",
+        request_id: "turn-live",
+      });
+      const state = await stub.fetch("https://session.test/public/session/state", {
+        headers: { authorization: "Bearer session-token" },
+      });
+      expect(await state.json()).toMatchObject({
+        queue: [],
+        transcript: [
+          { type: "user", text: "start" },
+          { type: "user", text: "change direction" },
+          { type: "assistant", text: "redirected" },
+          { type: "user", text: "one more thing" },
+          { type: "assistant", text: "followed up" },
+        ],
+      });
     vi.unstubAllGlobals();
     socket.close(1000, "done");
   });
@@ -616,6 +621,8 @@ describe("real WorkflowInstance hibernation", () => {
     const firstRoundGate = new Promise<void>((resolve) => {
       releaseFirst = resolve;
     });
+    // A failed assertion or test timeout must not strand the mock response.
+    onTestFinished(releaseFirst);
     let round = 0;
     const providerFetch = vi.fn(async () => {
       round += 1;
@@ -702,20 +709,20 @@ describe("real WorkflowInstance hibernation", () => {
     }, { timeout: SETTLES_WITHIN_MS });
     releaseFirst();
 
-    const observed: Record<string, unknown>[] = [];
-    for (let index = 0; index < 100; index += 1) {
-      const message = await nextMessage(socket);
-      observed.push(message);
-      if (message.type === "turn_terminal" || message.type === "error") break;
-    }
-    expect(observed.filter(({ type }) => type === "turn_command_applied"))
-      .toEqual([
-        expect.objectContaining({ request_id: "compact-1", kind: "compact" }),
-      ]);
-    expect(observed.at(-1)).toMatchObject({
-      type: "turn_terminal",
-      request_id: "turn-compact",
-    });
+      const observed: Record<string, unknown>[] = [];
+      for (let index = 0; index < 100; index += 1) {
+        const message = await nextMessage(socket);
+        observed.push(message);
+        if (message.type === "turn_terminal" || message.type === "error") break;
+      }
+      expect(observed.filter(({ type }) => type === "turn_command_applied"))
+        .toEqual([
+          expect.objectContaining({ request_id: "compact-1", kind: "compact" }),
+        ]);
+      expect(observed.at(-1)).toMatchObject({
+        type: "turn_terminal",
+        request_id: "turn-compact",
+      });
     vi.unstubAllGlobals();
     socket.close(1000, "done");
   });
@@ -725,6 +732,8 @@ describe("real WorkflowInstance hibernation", () => {
     const firstRoundGate = new Promise<void>((resolve) => {
       releaseFirst = resolve;
     });
+    // A failed assertion or test timeout must not strand the mock response.
+    onTestFinished(releaseFirst);
     const providerFetch = vi.fn(
       async () => {
         await firstRoundGate;
@@ -772,24 +781,24 @@ describe("real WorkflowInstance hibernation", () => {
     });
     socket.send(JSON.stringify({ type: "stop", request_id: "turn-stop" }));
 
-    const observed: Record<string, unknown>[] = [];
-    while (!observed.some(({ type }) => type === "turn_stop_requested")) {
-      observed.push(await nextMessage(socket));
-    }
-    releaseFirst();
-    for (let index = 0; index < 80; index += 1) {
-      const message = await nextMessage(socket);
-      observed.push(message);
-      if (message.type === "turn_terminal" || message.type === "error") break;
-    }
+      const observed: Record<string, unknown>[] = [];
+      while (!observed.some(({ type }) => type === "turn_stop_requested")) {
+        observed.push(await nextMessage(socket));
+      }
+      releaseFirst();
+      for (let index = 0; index < 80; index += 1) {
+        const message = await nextMessage(socket);
+        observed.push(message);
+        if (message.type === "turn_terminal" || message.type === "error") break;
+      }
 
-    expect(providerFetch).toHaveBeenCalledOnce();
-    expect(observed.at(-1)).toMatchObject({
-      type: "turn_terminal",
-      request_id: "turn-stop",
-      status: 200,
-      body: { outcome: "interrupted" },
-    });
+      expect(providerFetch).toHaveBeenCalledOnce();
+      expect(observed.at(-1)).toMatchObject({
+        type: "turn_terminal",
+        request_id: "turn-stop",
+        status: 200,
+        body: { outcome: "interrupted" },
+      });
     vi.unstubAllGlobals();
     socket.close(1000, "done");
   });
@@ -1767,7 +1776,16 @@ describe("real WorkflowInstance hibernation", () => {
     const stub = namespace.get(namespace.idFromName(sessionId));
     await bootstrapSession(stub, sessionId);
     await runInDurableObject(stub, async (_instance, state) => {
-      // Regress the object to the pre-ADR-0002 tracker shape.
+      // Regress the object to the pre-ADR-0002 tracker shape, before norm
+      // identity pins or their event_id-dependent trigger existed either.
+      state.storage.sql.exec("DROP TRIGGER tracker_norm_creation_alias");
+      state.storage.sql.exec("DROP TABLE tracker_norm_aliases");
+      state.storage.sql.exec("DROP TRIGGER tracker_norm_rotation_checkpoint");
+      state.storage.sql.exec("DROP TRIGGER tracker_norm_identity_checkpoint");
+      state.storage.sql.exec("DROP TRIGGER tracker_norm_checkpoint_identity");
+      state.storage.sql.exec("DROP TABLE tracker_norm_checkpoint");
+      state.storage.sql.exec("DROP TRIGGER tracker_norm_bootstrap_pin");
+      state.storage.sql.exec("DROP TABLE tracker_norm_identity");
       state.storage.sql.exec("DROP INDEX idx_tracker_events_id");
       state.storage.sql.exec("ALTER TABLE tracker_events DROP COLUMN event_id");
       state.storage.sql.exec("ALTER TABLE tracker_events DROP COLUMN parents_json");
@@ -1788,6 +1806,9 @@ describe("real WorkflowInstance hibernation", () => {
         "tracker_aliases",
         "tracker_comments",
         "tracker_evidence",
+        "tracker_norm_identity",
+        "tracker_norm_checkpoint",
+        "tracker_norm_aliases",
       ]) {
         const present = state.storage.sql
           .exec(
@@ -1797,6 +1818,22 @@ describe("real WorkflowInstance hibernation", () => {
           .toArray();
         expect(present.length, `${table} must exist after upgrade`).toBe(1);
       }
+      for (const trigger of [
+        "tracker_norm_bootstrap_pin", "tracker_norm_rotation_checkpoint", "tracker_norm_creation_alias",
+        "tracker_norm_identity_checkpoint", "tracker_norm_checkpoint_identity",
+      ]) {
+        expect(state.storage.sql.exec(
+          "SELECT name FROM sqlite_master WHERE type = 'trigger' AND name = ?",
+          trigger,
+        ).toArray(), `${trigger} must exist after upgrade`).toHaveLength(1);
+      }
+      // The stamp this upgrade leaves is asserted where that is the subject:
+      // "upgrades legacy objects to retained-result and tracker-receipt
+      // generations" deletes down to 2 and names every table the upgrade must
+      // restore. This line said 3 -- the generation current when it was
+      // written, two migrations ago -- and a derived number restated in a
+      // second place goes stale in a second place. What THIS test owns is the
+      // tables and triggers above.
       // The content-addressed columns and their dedup index are back too:
       // the production append shape works, and repeating it is a no-op.
       const insert = () =>
@@ -1820,6 +1857,60 @@ describe("real WorkflowInstance hibernation", () => {
         .exec("SELECT content_id FROM tracker_aliases WHERE alias = 'WS-1'")
         .toArray() as { content_id: string }[];
       expect(alias[0].content_id).toBe("content-1");
+    });
+  });
+
+  it("backfills norm aliases in local admission order on a pre-alias object", async () => {
+    const sessionId = "session-norm-alias-upgrade";
+    const namespace = (env as unknown as TestEnv).WORKFLOW_INSTANCE;
+    const stub = namespace.get(namespace.idFromName(sessionId));
+    await bootstrapSession(stub, sessionId);
+    const first = "f".repeat(64);
+    const second = "0".repeat(64);
+    // Stored-row migration, not signed admission. Reverse hash order so the
+    // fixture distinguishes local event sequence from content-id sorting.
+    await runInDurableObject(stub, async (_instance, state) => {
+      state.storage.sql.exec("DROP TRIGGER tracker_norm_creation_alias");
+      state.storage.sql.exec("DROP TABLE tracker_norm_aliases");
+      for (const id of [first, second]) {
+        state.storage.sql.exec(
+          `INSERT INTO tracker_events
+             (event_id, parents_json, issue_id, kind, payload_json, actor, created_at)
+           VALUES (?, '[]', NULL, 'norm.record.created', '{}', 'fixture', '2026-09-05')`,
+          id,
+        );
+      }
+    });
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const response = await stub.fetch("https://session.test/public/session/state", {
+        headers: { authorization: "Bearer session-token" },
+      });
+      expect(response.status, await response.clone().text()).toBe(200);
+      await runInDurableObject(stub, async (_instance, state) => {
+        expect(state.storage.sql.exec(
+          "SELECT ordinal, record_id FROM tracker_norm_aliases ORDER BY ordinal",
+        ).toArray()).toEqual([
+          { ordinal: 1, record_id: first },
+          { ordinal: 2, record_id: second },
+        ]);
+      });
+    }
+    await runInDurableObject(stub, async (_instance, state) => {
+      for (const id of [first, "a".repeat(64)]) {
+        state.storage.sql.exec(
+          `INSERT OR IGNORE INTO tracker_events
+             (event_id, parents_json, issue_id, kind, payload_json, actor, created_at)
+           VALUES (?, '[]', NULL, 'norm.record.created', '{}', 'fixture', '2026-09-05')`,
+          id,
+        );
+      }
+      expect(state.storage.sql.exec(
+        "SELECT ordinal, record_id FROM tracker_norm_aliases ORDER BY ordinal",
+      ).toArray()).toEqual([
+        { ordinal: 1, record_id: first },
+        { ordinal: 2, record_id: second },
+        { ordinal: 3, record_id: "a".repeat(64) },
+      ]);
     });
   });
 
@@ -2265,4 +2356,527 @@ describe("real WorkflowInstance hibernation", () => {
     socket.close(1000, "done");
     reconnected.close(1000, "done");
   });
+});
+
+
+it("rolls back a failed rule commit through the production WASM transaction bridge", async () => {
+  const namespace = (env as unknown as TestEnv).WORKFLOW_INSTANCE;
+  const stub = namespace.get(namespace.idFromName("rule-commit-rollback"));
+  await runInDurableObject(stub, async (_object, state) => {
+    state.storage.sql.exec(DO_SCHEMA);
+    const bridge = makeBridge(state.storage);
+    const source = [
+      "workflow Rollback", "", "output result Seen", "",
+      "class Seen {", "  value string", "}", "",
+      "rule observe_start", "  when started", "=> {",
+      '  record Seen { value "observed" }',
+      '  complete result { value "observed" }', "}",
+    ].join("\n");
+    const instance = WasmDurableInstance.create(bridge, source, "{}", "local/Rollback", undefined, undefined, undefined);
+    const exec = bridge.exec.bind(bridge);
+    let injected = false;
+    bridge.exec = (query, params) => {
+      if (query.includes("INSERT INTO evidence_links") &&
+          state.storage.sql.exec("SELECT event_id FROM events WHERE event_type = 'rule.committed'").toArray().length > 0) {
+        injected = true;
+        throw new Error("injected late rule-commit failure");
+      }
+      return exec(query, params);
+    };
+    const outcome = JSON.parse(instance.step(undefined, Date.now()));
+    expect(injected).toBe(true);
+    expect(outcome.kind).toBe("failed");
+    expect(state.storage.sql.exec("SELECT event_id FROM events WHERE event_type IN ('rule.committed', 'workflow.completed')").toArray()).toEqual([]);
+    expect(state.storage.sql.exec("SELECT fact_id FROM facts WHERE provenance_class = 'derived'").toArray()).toEqual([]);
+    expect(instance.status()).toBe("running");
+    instance.free();
+  });
+});
+
+it("rolls back a failed run start through the production WASM transaction bridge", async () => {
+  const namespace = (env as unknown as TestEnv).WORKFLOW_INSTANCE;
+  const stub = namespace.get(namespace.idFromName("run-start-rollback"));
+  await runInDurableObject(stub, async (_object, state) => {
+    state.storage.sql.exec(DO_SCHEMA);
+    state.storage.sql.exec("INSERT INTO capability_schemas (capability, description, schema_json) VALUES ('script.judge', 'fixture', '{}')");
+    state.storage.sql.exec("INSERT INTO capability_bindings (binding_id, program_id, capability, provider, config_json) VALUES ('judge', NULL, 'script.judge', 'builtin-script', '{}')");
+    const bridge = makeBridge(state.storage);
+    const source = [
+      "workflow RunRollback", "", "use std.script", "", "output result Verdict", "",
+      "class CheckInput {", "  n int", "}", "",
+      "class Verdict {", "  ok int", "}", "",
+      "rule seed", "  when started", "=> {", "  record CheckInput { n 1 }", "}", "",
+      "rule go", "  when CheckInput as request", "=> {", "  exec judge with request as check", "",
+      "  after check succeeds {", "    complete result { ok 1 }", "  }", "",
+      "  after check fails {", "    complete result { ok 0 }", "  }", "}",
+    ].join("\n");
+    const body = "echo ok\n";
+    const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(body));
+    const sha256 = Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
+    const instance = WasmDurableInstance.create(
+      bridge, source, "{}", "local/RunRollback", undefined, undefined, undefined,
+      JSON.stringify({ base_url: "http://executor:8080", environment_epoch: "fixture" }),
+      JSON.stringify([{ name: "judge", argv: ["sh", "{script}"], sha256, body, hermetic: false }]),
+    );
+    const exec = bridge.exec.bind(bridge);
+    let injected = false;
+    bridge.exec = (query, params) => {
+      if (query.includes("INSERT INTO leases")) {
+        expect(state.storage.sql.exec("SELECT run_id FROM runs").toArray()).toHaveLength(1);
+        injected = true;
+        throw new Error("injected lease insert failure");
+      }
+      return exec(query, params);
+    };
+    try {
+      const failed = JSON.parse(instance.step(undefined, Date.now()));
+      expect(injected).toBe(true);
+      expect(failed.kind).toBe("failed");
+      expect(state.storage.sql.exec("SELECT event_id FROM events WHERE event_type = 'effect.run_started'").toArray()).toEqual([]);
+      expect(state.storage.sql.exec("SELECT run_id FROM runs").toArray()).toEqual([]);
+      expect(state.storage.sql.exec("SELECT lease_id FROM leases").toArray()).toEqual([]);
+      expect(state.storage.sql.exec("SELECT status FROM effects WHERE kind = 'exec.command'").toArray()).toEqual([{ status: "queued" }]);
+      bridge.exec = exec;
+      state.storage.sql.exec("CREATE TRIGGER fail_lifetime_handoff BEFORE INSERT ON events WHEN NEW.event_type = 'exec.lifetime.tracked' BEGIN SELECT RAISE(ABORT,'lifetime handoff fault'); END");
+      try {
+        const untracked = JSON.parse(instance.step(undefined, Date.now()));
+        expect(untracked.kind).toBe("failed");
+        expect(JSON.stringify(untracked)).toContain("lifetime handoff fault");
+        expect(state.storage.sql.exec("SELECT event_id FROM events WHERE event_type = 'exec.lifetime.tracked'").toArray()).toEqual([]);
+      } finally { state.storage.sql.exec("DROP TRIGGER fail_lifetime_handoff"); }
+      const retried = JSON.parse(instance.step(undefined, Date.now()));
+      expect(retried.kind).toBe("needs_executor");
+      const tracked = state.storage.sql.exec<{payload_json:string}>("SELECT payload_json FROM events WHERE event_type = 'exec.lifetime.tracked'").toArray();
+      expect(tracked).toHaveLength(1);
+      expect(JSON.parse(tracked[0].payload_json).invocation).toEqual(retried.request.body.envelope);
+      expect(JSON.parse(tracked[0].payload_json).executor_url).toBe(retried.request.url);
+      expect(state.storage.sql.exec("SELECT run_id FROM runs").toArray()).toHaveLength(1);
+      expect(state.storage.sql.exec("SELECT lease_id FROM leases").toArray()).toHaveLength(1);
+      expect(state.storage.sql.exec("SELECT event_id FROM events WHERE event_type = 'effect.run_started'").toArray()).toHaveLength(1);
+    } finally {
+      instance.free();
+    }
+  });
+});
+
+it("rolls back terminal writes and retries the retained response through the WASM bridge", async () => {
+  const namespace = (env as unknown as TestEnv).WORKFLOW_INSTANCE;
+  for (const [exitCode, phase] of [[0, "lease"], [1, "lease"], [1, "diagnostic"], [0, "fact"], [1, "fact"]] as const) {
+    const stub = namespace.get(namespace.idFromName(`terminal-rollback-${exitCode}-${phase}`));
+    await runInDurableObject(stub, async (_object, state) => {
+      state.storage.sql.exec(DO_SCHEMA);
+      state.storage.sql.exec("INSERT INTO capability_schemas (capability, description, schema_json) VALUES ('script.judge', 'fixture', '{}')");
+      state.storage.sql.exec("INSERT INTO capability_bindings (binding_id, program_id, capability, provider, config_json) VALUES ('judge', NULL, 'script.judge', 'builtin-script', '{}')");
+      const bridge = makeBridge(state.storage);
+      const source = [
+        "workflow TerminalRollback", "", "use std.script", "", "output result Verdict", "",
+        "class CheckInput {", "  n int", "}", "", "class Verdict {", "  ok int", "}", "",
+        "rule seed", "  when started", "=> {", "  record CheckInput { n 1 }", "}", "",
+        "rule go", "  when CheckInput as request", "=> {", "  exec judge with request as check", "",
+        "  after check succeeds {", "    complete result { ok 1 }", "  }", "",
+        "  after check fails {", "    complete result { ok 0 }", "  }", "}",
+      ].join("\n");
+      const body = "echo ok\n";
+      const sha256 = await sha256Hex(new TextEncoder().encode(body));
+      let instance = WasmDurableInstance.create(
+        bridge, source, "{}", "local/TerminalRollback", undefined, undefined, undefined,
+        JSON.stringify({ base_url: "http://executor:8080", environment_epoch: "fixture" }),
+        JSON.stringify([{ name: "judge", argv: ["sh", "{script}"], sha256, body, hermetic: false }]),
+      );
+      const pending = JSON.parse(instance.step(undefined, Date.now()));
+      expect(pending.kind).toBe("needs_executor");
+      const trackedLifetime = state.storage.sql.exec("SELECT event_id, payload_json FROM events WHERE event_type = 'exec.lifetime.tracked'").toArray();
+      expect(trackedLifetime).toHaveLength(1);
+      // An authenticated executor response is supplied at the embedding seam;
+      // this fixture tests persistence and retry, not a live sidecar process.
+      const response = JSON.stringify({ status: 200, body: {
+        protocol: "whip-executor/1", effect_id: pending.request.body.envelope.dispatch.effect_id,
+        exit_code: exitCode, stdout: "retained-output", stderr: exitCode ? "retained-error" : "", timed_out: false,
+      } });
+      const snapshot = () => ["events", "runs", "leases", "effects", "effect_dependencies", "effect_cancellation_requests", "diagnostics", "facts"]
+        .map(table => state.storage.sql.exec(`SELECT * FROM ${table}${table === "events" ? " WHERE event_type != 'exec.settlement.retained'" : ""} ORDER BY rowid`).toArray());
+      const before = snapshot();
+      const exec = bridge.exec.bind(bridge);
+      const query = bridge.query.bind(bridge);
+      let injected = false;
+      bridge.exec = (sql, params) => {
+        const result = exec(sql, params);
+        if ((phase === "lease" && sql.includes("UPDATE leases SET status = 'released'")) || (phase === "fact" && sql.includes("INSERT INTO facts"))) {
+          injected = true; throw new Error("injected post-release failure");
+        }
+        return result;
+      };
+      bridge.query = (sql, params) => {
+        const result = query(sql, params);
+        if (phase === "diagnostic" && sql.includes("INSERT INTO diagnostics")) {
+          injected = true; throw new Error("injected post-diagnostic failure");
+        }
+        return result;
+      };
+      try {
+        const failed = JSON.parse(instance.step(response, Date.now()));
+        expect(injected).toBe(true);
+        expect(failed.kind).toBe("failed");
+        expect(snapshot()).toEqual(before);
+        bridge.exec = exec; bridge.query = query;
+        const replacement = JSON.parse(response); replacement.body.stdout = "replacement-output";
+        expect(JSON.parse(instance.step(JSON.stringify(replacement), Date.now())).kind).toBe("terminal");
+        const metadata = JSON.parse(state.storage.sql.exec<{metadata_json:string}>("SELECT metadata_json FROM runs").one().metadata_json);
+        expect(metadata.stdout).toBe("retained-output");
+        expect(metadata.executor_response.body.stdout).toBe("retained-output");
+        instance.free();
+        instance = WasmDurableInstance.create(bridge, source, "{}", "local/TerminalRollback", undefined, undefined, undefined);
+        const retried = JSON.parse(instance.step(undefined, Date.now()));
+        expect(retried.kind, JSON.stringify(retried)).toBe("terminal");
+        expect(state.storage.sql.exec("SELECT event_id FROM events WHERE event_type = 'effect.terminal'").toArray()).toHaveLength(1);
+        expect(state.storage.sql.exec("SELECT status FROM runs").toArray()).toEqual([{ status: exitCode ? "failed" : "completed" }]);
+        expect(state.storage.sql.exec("SELECT status FROM leases").toArray()).toEqual([{ status: "released" }]);
+        expect(state.storage.sql.exec("SELECT event_id, payload_json FROM events WHERE event_type = 'exec.lifetime.tracked'").toArray()).toEqual(trackedLifetime);
+      } finally {
+        bridge.exec = exec; bridge.query = query; instance.free();
+      }
+    });
+  }
+});
+
+it("preserves duplicate and numeric SQL column names in positional bridge rows", async () => {
+  const namespace = (env as unknown as TestEnv).WORKFLOW_INSTANCE;
+  const stub = namespace.get(namespace.idFromName("positional-sql-rows"));
+  await runInDurableObject(stub, async (_object, state) => {
+    const bridge = makeBridge(state.storage);
+    expect(JSON.parse(bridge.query('SELECT 1 AS status, 2 AS status, 3 AS "0", 4 AS "1" UNION ALL SELECT 5, 6, 7, 8', '[]')))
+      .toEqual([[1, 2, 3, 4], [5, 6, 7, 8]]);
+    expect(JSON.parse(bridge.query('SELECT ? AS repeated, ? AS repeated', '[null,"text"]'))).toEqual([[null, "text"]]);
+  });
+});
+
+it("retains deadline fence intent before timeout through cold WASM recovery", async () => {
+  const namespace = (env as unknown as TestEnv).WORKFLOW_INSTANCE;
+  const stub = namespace.get(namespace.idFromName("deadline-fence-custody"));
+  await runInDurableObject(stub, async (_object, state) => {
+    state.storage.sql.exec(DO_SCHEMA);
+    state.storage.sql.exec("INSERT INTO capability_schemas (capability, description, schema_json) VALUES ('script.judge', 'fixture', '{}')");
+    state.storage.sql.exec("INSERT INTO capability_bindings (binding_id, program_id, capability, provider, config_json) VALUES ('judge', NULL, 'script.judge', 'builtin-script', '{}')");
+    const bridge = makeBridge(state.storage);
+    const source = [
+      "workflow DeadlineFence", "", "use std.script", "", "output result Verdict", "",
+      "class CheckInput {", "  n int", "}", "", "class Verdict {", "  ok int", "}", "",
+      "rule seed", "  when started", "=> {", "  record CheckInput { n 1 }", "}", "",
+      "rule go", "  when CheckInput as request", "=> {", "  exec judge with request as check", "",
+      "  after check completes {", "    complete result { ok 1 }", "  }", "}",
+    ].join("\n");
+    const body = "echo ok\n";
+    const sha256 = await sha256Hex(new TextEncoder().encode(body));
+    const make = () => WasmDurableInstance.create(
+      bridge, source, "{}", "local/DeadlineFence", undefined, undefined, undefined,
+      JSON.stringify({ base_url: "http://executor:8080", environment_epoch: "fixture" }),
+      JSON.stringify([{ name: "judge", argv: ["sh", "{script}"], sha256, body, hermetic: false }]),
+    );
+    let instance = make();
+    const now = Date.now();
+    try {
+      const handoff = JSON.parse(instance.step(undefined, now));
+      expect(handoff.kind).toBe("needs_executor");
+      const parked = JSON.parse(instance.step(JSON.stringify({status:202,body:{protocol:"whipplescript.exec.reconciliation/v1",state:"pending"}}), now));
+      expect(parked.kind).toBe("parked");
+      state.storage.sql.exec("UPDATE effects SET timeout_seconds=1, created_at=? WHERE kind='exec.command'", new Date(now - 2000).toISOString());
+      state.storage.sql.exec("CREATE TRIGGER fail_deadline_fence BEFORE INSERT ON events WHEN NEW.event_type='exec.fence.requested' BEGIN SELECT RAISE(ABORT,'deadline fence fault'); END");
+      instance.free(); instance = make();
+      const refused = JSON.parse(instance.step(undefined, now + 3000));
+      expect(refused.kind).toBe("failed");
+      expect(JSON.stringify(refused)).toContain("deadline fence fault");
+      expect(state.storage.sql.exec("SELECT status FROM runs").toArray()).toEqual([{status:"running"}]);
+      expect(state.storage.sql.exec("SELECT event_id FROM events WHERE event_type IN ('exec.fence.requested','effect.terminal')").toArray()).toEqual([]);
+      state.storage.sql.exec("DROP TRIGGER fail_deadline_fence");
+      instance.free(); instance = make();
+      const done = JSON.parse(instance.step(undefined, now + 3000));
+      expect(done.kind, JSON.stringify(done)).toBe("terminal");
+      expect(state.storage.sql.exec("SELECT status FROM runs").toArray()).toEqual([{status:"timed_out"}]);
+      const events = state.storage.sql.exec<{sequence:number,event_type:string,payload_json:string}>("SELECT sequence,event_type,payload_json FROM events WHERE event_type IN ('exec.lifetime.tracked','exec.fence.requested','effect.terminal') ORDER BY sequence").toArray();
+      expect(events.map(e=>e.event_type)).toEqual(["exec.lifetime.tracked","exec.fence.requested","effect.terminal"]);
+      expect(JSON.parse(events[0].payload_json).invocation).toEqual(handoff.request.body.envelope);
+      expect(JSON.parse(events[1].payload_json).reason).toBe("deadline");
+      instance.free(); instance = make();
+      expect(JSON.parse(instance.step(undefined, now + 4000)).kind).toBe("terminal");
+      expect(state.storage.sql.exec("SELECT event_id FROM events WHERE event_type='exec.fence.requested'").toArray()).toHaveLength(1);
+    } finally { instance.free(); }
+  });
+});
+
+it.each([false, true])("keeps terminal executor cleanup armed across cold alarms (retirement=%s)", async (retirement) => {
+  const namespaces = env as unknown as TestEnv & { WORKSPACE_BROKER: DurableObjectNamespace; EXECUTOR: DurableObjectNamespace };
+  const sessionId = `terminal-executor-cleanup-${retirement}`;
+  const stub = namespaces.WORKFLOW_INSTANCE.get(namespaces.WORKFLOW_INSTANCE.idFromName(sessionId));
+  let expectedEnvelope: unknown;
+  await runInDurableObject(stub, async (object, state) => {
+    if (!state.storage.sql.exec("SELECT 1 FROM sqlite_master WHERE name='events'").toArray().length) state.storage.sql.exec(DO_SCHEMA);
+    state.storage.sql.exec("INSERT INTO capability_schemas (capability, description, schema_json) VALUES ('script.judge', 'fixture', '{}')");
+    state.storage.sql.exec("INSERT INTO capability_bindings (binding_id, program_id, capability, provider, config_json) VALUES ('judge', NULL, 'script.judge', 'builtin-script', '{}')");
+    const bridge = makeBridge(state.storage);
+    const source = [
+      "workflow DeadlineFence", "", "use std.script", "", "output result Verdict", "",
+      "class CheckInput {", "  n int", "}", "", "class Verdict {", "  ok int", "}", "",
+      "rule seed", "  when started", "=> {", "  record CheckInput { n 1 }", "}", "",
+      "rule go", "  when CheckInput as request", "=> {", "  exec judge with request as check", "",
+      "  after check completes {", "    complete result { ok 1 }", "  }", "}",
+    ].join("\n");
+    const body = "echo ok\n";
+    const sha256 = await sha256Hex(new TextEncoder().encode(body));
+    const make = () => WasmDurableInstance.create(
+      bridge, source, "{}", "local/DeadlineFence", undefined, undefined, undefined,
+      JSON.stringify({ base_url: "http://executor:8080", environment_epoch: "fixture" }),
+      JSON.stringify([{ name: "judge", argv: ["sh", "{script}"], sha256, body, hermetic: false }]),
+    );
+    let instance = make();
+    const now = Date.now();
+    try {
+      const handoff = JSON.parse(instance.step(undefined, now));
+      expect(handoff.kind).toBe("needs_executor");
+      expectedEnvelope = handoff.request.body.envelope;
+      state.storage.sql.exec("UPDATE effects SET timeout_seconds=60 WHERE kind='exec.command'");
+      const host = object as unknown as {
+        env: { WORKSPACE_BROKER: DurableObjectNamespace };
+        driveInstance(instance: WasmDurableInstance): Promise<{outcome:string}>;
+      };
+      const broker = host.env.WORKSPACE_BROKER;
+      let observedHandoff = false;
+      host.env.WORKSPACE_BROKER = {
+        idFromName: (name: string) => broker.idFromName(name),
+        get: (id: DurableObjectId) => ({fetch: async (url: string, init: RequestInit) => {
+          // This assertion runs before the external handoff, not after parking.
+          expect(await state.storage.get("instance-next-due-unix-ms")).toBeTypeOf("number");
+          expect(await state.storage.getAlarm()).toBeTypeOf("number");
+          observedHandoff = true;
+          const delivered = await broker.get(id).fetch(url, init);
+          await delivered.arrayBuffer();
+          expect(delivered.status).toBe(200);
+          // Model response loss: the broker retains the original output.
+          return Response.json({protocol:"whipplescript.exec.reconciliation/v1",state:"pending"}, {status:202});
+        }}),
+      } as unknown as DurableObjectNamespace;
+      let first = true;
+      const continuing = {
+        step: (response: string | undefined, at: number) => {
+          if (first) { first = false; return JSON.stringify(handoff); }
+          return instance.step(response, at);
+        },
+        status: () => instance.status(),
+        effect_due_unix_ms: () => instance.effect_due_unix_ms(),
+      } as unknown as WasmDurableInstance;
+      try { expect((await host.driveInstance(continuing)).outcome).toBe("parked"); }
+      finally { host.env.WORKSPACE_BROKER = broker; }
+      expect(observedHandoff).toBe(true);
+      state.storage.sql.exec("UPDATE effects SET timeout_seconds=1, created_at=? WHERE kind='exec.command'", new Date(now-2000).toISOString());
+      state.storage.sql.exec("CREATE TRIGGER fail_deadline_fence BEFORE INSERT ON events WHEN NEW.event_type='exec.fence.requested' BEGIN SELECT RAISE(ABORT,'fence fault'); END");
+      instance.free(); instance = make();
+      expect((await host.driveInstance(instance)).outcome).toBe("failed");
+      expect(await state.storage.get("instance-next-due-unix-ms")).toBeTypeOf("number");
+      expect(await state.storage.getAlarm()).toBeTypeOf("number");
+      state.storage.sql.exec("DROP TRIGGER fail_deadline_fence");
+      instance.free(); instance = make();
+      expect((await host.driveInstance(instance)).outcome).toBe("terminal");
+      expect(await state.storage.get("instance-next-due-unix-ms")).toBeUndefined();
+      const firstDue = await state.storage.get("executor-lifetime-next-due-unix-ms");
+      expect(firstDue).toBeTypeOf("number");
+      expect((await host.driveInstance(instance)).outcome).toBe("terminal");
+      expect(await state.storage.get("executor-lifetime-next-due-unix-ms")).toBe(firstDue);
+      expect(await state.storage.getAlarm()).toBe(firstDue);
+      state.storage.sql.exec("CREATE TRIGGER fail_proof BEFORE INSERT ON events WHEN NEW.event_type='exec.fence.proved' BEGIN SELECT RAISE(ABORT,'proof fault'); END");
+    } finally { instance.free(); }
+  });
+  if (!retirement) {
+    // A downgraded host must not touch a newer store or send a destructive
+    // broker command, even though it can still recognize the tracked rows.
+    await runInDurableObject(stub, async (_object,state) => {
+      state.storage.sql.exec("INSERT INTO schema_migrations (version,name) VALUES (99,'future-exec-cleanup')");
+    });
+    let inspected = false;
+    try {
+      await evictDurableObject(stub);
+      // Own this scheduling assertion: a real one-second retry can fire
+      // during the later broker round trip and legitimately consume its alarm.
+      await runInDurableObject(stub, async (object, state) => {
+        await state.blockConcurrencyWhile(async () => {
+          // Delivery consumes the prior alarm; only this handler may re-arm it.
+          await state.storage.deleteAlarm();
+          await (object as unknown as { alarm(): Promise<void> }).alarm();
+          expect(await state.storage.getAlarm()).toBeTypeOf("number");
+        });
+      });
+      const broker = namespaces.WORKSPACE_BROKER;
+      const viewResponse = await broker.get(broker.idFromName("workspace")).fetch("https://workspace.internal/exec/reconcile", {
+        method:"POST", headers:{"content-type":"application/json"},
+        body:JSON.stringify({selected:(expectedEnvelope as {invocation:unknown}).invocation, envelope:expectedEnvelope, operation:{op:"read"}}),
+      });
+      const view = await viewResponse.json() as {lifetime:{state:string}};
+      expect(viewResponse.status).toBe(200);
+      expect(view.lifetime.state).toBe("pending");
+      inspected = true;
+    } finally {
+      await runInDurableObject(stub, async (_object,state) => {
+        state.storage.sql.exec("DELETE FROM schema_migrations WHERE version=99");
+        if (!inspected) await state.storage.deleteAlarm();
+      });
+    }
+  }
+  if (retirement) {
+    await bootstrapSession(stub, sessionId);
+    await runInDurableObject(stub, async (_object,state) => {
+      const session = await state.storage.get<Record<string, unknown>>("public-session-state");
+      await state.storage.put("public-session-state", { ...session, retention: {idle_ttl_seconds:0, absolute_ttl_seconds:0} });
+    });
+  }
+  await evictDurableObject(stub);
+  // A real alarm may already have fired during cold eviction; assert durable state below.
+  await runDurableObjectAlarm(stub);
+  await runInDurableObject(stub, async (_object,state) => {
+    expect(state.storage.sql.exec("SELECT event_id FROM events WHERE event_type='exec.fence.proved'").toArray()).toHaveLength(0);
+    expect(await state.storage.get("executor-lifetime-next-due-unix-ms")).toBeTypeOf("number");
+    expect(state.storage.sql.exec("SELECT event_id FROM events WHERE event_type='exec.lifetime.tracked'").toArray()).toHaveLength(1);
+    if (retirement) {
+      expect(await state.storage.get("public-session-state")).toBeDefined();
+      let stepped = false;
+      const inFlight = {
+        step: () => { stepped = true; throw new Error("late step after retirement"); },
+        status: () => "completed",
+      } as unknown as WasmDurableInstance;
+      const host = _object as unknown as { driveInstance(instance: WasmDurableInstance): Promise<{outcome:string}> };
+      expect((await host.driveInstance(inFlight)).outcome).toBe("parked");
+      expect(stepped).toBe(false);
+    }
+  });
+  // A one-second alarm can fire while the inspection is queued. Require it to
+  // rearm while the proof fault is still present, then allow cleanup to finish.
+  let observedRetry = false;
+  try {
+    await vi.waitFor(async () => {
+      await runInDurableObject(stub, async (_object,state) => {
+        expect(await state.storage.getAlarm()).toBeTypeOf("number");
+      });
+    }, { timeout: 15_000 });
+    observedRetry = true;
+  } finally {
+    await runInDurableObject(stub, async (_object,state) => {
+      state.storage.sql.exec("DROP TRIGGER fail_proof");
+      if (!observedRetry) await state.storage.deleteAlarm();
+    });
+  }
+  await evictDurableObject(stub);
+  // A real alarm may already have fired during cold eviction; assert durable state below.
+  await runDurableObjectAlarm(stub);
+  await runInDurableObject(stub, async (_object,state) => {
+    if (retirement) {
+      expect(await state.storage.get("public-session-state")).toBeUndefined();
+      expect(state.storage.sql.exec("SELECT event_id FROM events").toArray()).toHaveLength(0);
+      return;
+    }
+    const proof = JSON.parse(state.storage.sql.exec<{payload_json:string}>("SELECT payload_json FROM events WHERE event_type='exec.fence.proved'").one().payload_json);
+    expect(proof.closure.placement.envelope).toEqual(expectedEnvelope);
+    expect(proof.closure.lifetime.state).toBe("terminated");
+    expect(state.storage.sql.exec("SELECT status FROM runs").toArray()).toEqual([{status:"timed_out"}]);
+    expect(await state.storage.get("executor-lifetime-next-due-unix-ms")).toBeUndefined();
+    expect(await state.storage.getAlarm()).toBeNull();
+  });
+});
+
+it.each(["deadline", "cancellation", "projection-retry"] as const)("closes a tracked executor handoff that never reached its broker (%s)", async (mode) => {
+  const namespaces = env as unknown as TestEnv & {WORKSPACE_BROKER:DurableObjectNamespace; EXECUTOR:DurableObjectNamespace};
+  const stub = namespaces.WORKFLOW_INSTANCE.get(namespaces.WORKFLOW_INSTANCE.idFromName(`unclaimed-executor-cleanup-${mode}`));
+  const executor = namespaces.EXECUTOR;
+  const starts = async () => runInDurableObject(executor.get(executor.idFromName("instance-0")), async (_object,state) => {
+    if (!state.storage.sql.exec("SELECT name FROM sqlite_master WHERE name='executor_test_starts'").toArray().length) return 0;
+    return state.storage.sql.exec<{n:number}>("SELECT COUNT(*) AS n FROM executor_test_starts").one().n;
+  });
+  const beforeStarts = await starts();
+  let envelope: unknown;
+  await runInDurableObject(stub, async (object,state) => {
+    state.storage.sql.exec(DO_SCHEMA);
+    state.storage.sql.exec("INSERT INTO capability_schemas (capability, description, schema_json) VALUES ('script.judge', 'fixture', '{}')");
+    state.storage.sql.exec("INSERT INTO capability_bindings (binding_id, program_id, capability, provider, config_json) VALUES ('judge', NULL, 'script.judge', 'builtin-script', '{}')");
+    const bridge = makeBridge(state.storage);
+    const source = [
+      "workflow DeadlineFence", "", "use std.script", "", "output result Verdict", "",
+      "class CheckInput {", "  n int", "}", "", "class Verdict {", "  ok int", "}", "",
+      "rule seed", "  when started", "=> {", "  record CheckInput { n 1 }", "}", "",
+      "rule go", "  when CheckInput as request", "=> {", "  exec judge with request as check", "",
+      "  after check completes {", "    complete result { ok 1 }", "  }", "}",
+    ].join("\n");
+    const body = "echo ok\n";
+    const sha256 = await sha256Hex(new TextEncoder().encode(body));
+    const make = () => WasmDurableInstance.create(
+      bridge, source, "{}", "local/DeadlineFence", undefined, undefined, undefined,
+      JSON.stringify({ base_url: "http://executor:8080", environment_epoch: "fixture" }),
+      JSON.stringify([{ name: "judge", argv: ["sh", "{script}"], sha256, body, hermetic: false }]),
+    );
+    let instance = make();
+    const now = Date.now();
+    try {
+      const handoff = JSON.parse(instance.step(undefined, now));
+      expect(handoff.kind).toBe("needs_executor");
+      envelope = handoff.request.body.envelope;
+      // No broker claim or scheduler admission has occurred.
+      if (mode === "deadline") {
+        instance.free(); instance = make();
+        state.storage.sql.exec("UPDATE effects SET timeout_seconds=1, created_at=? WHERE kind='exec.command'", new Date(now-2000).toISOString());
+      } else {
+        const selected = (envelope as {invocation:{instance_id:string;effect_id:string}}).invocation;
+        const hostFetch = object as unknown as {env:Record<string,unknown>;fetch(request:Request):Promise<Response>};
+        const originalEnv = hostFetch.env;
+        hostFetch.env = {...originalEnv, WHIP_CONTROL_TOKEN:"executor-cancel-fixture"};
+        try {
+          const cancelled = await hostFetch.fetch(new Request(`http://host/host/instances/${encodeURIComponent(selected.instance_id)}/turns/${encodeURIComponent(selected.effect_id)}/cancel`, {method:"POST",body:"{}",headers:{"content-type":"application/json",authorization:"Bearer executor-cancel-fixture"}}));
+          const body = await cancelled.text();
+          expect(cancelled.status, body).toBe(202);
+        } finally { hostFetch.env = originalEnv; }
+        // Acknowledgement itself arms cleanup, before another drive observes it.
+        expect(await state.storage.get("executor-lifetime-next-due-unix-ms")).toBeTypeOf("number");
+        expect(await state.storage.getAlarm()).not.toBeNull();
+        // Exercise the still-live in-flight continuation, then cold readiness.
+        expect(JSON.parse(instance.step(undefined, Date.now())).kind).toBe("parked");
+        instance.free(); instance = make();
+        expect(JSON.parse(instance.step(undefined, Date.now())).kind).toBe("parked");
+      }
+      const host = object as unknown as {driveInstance(instance:WasmDurableInstance):Promise<{outcome:string}>};
+      expect((await host.driveInstance(instance)).outcome).toBe(mode === "deadline" ? "terminal" : "parked");
+      expect(await state.storage.get("executor-lifetime-next-due-unix-ms")).toBeTypeOf("number");
+    } finally {instance.free();}
+  });
+  if (mode === "projection-retry") {
+    await runInDurableObject(stub, async (_object,state) => {
+      state.storage.sql.exec("CREATE TRIGGER fail_projection BEFORE INSERT ON facts BEGIN SELECT RAISE(IGNORE); END");
+    });
+  }
+  await evictDurableObject(stub);
+  await runDurableObjectAlarm(stub);
+  if (mode === "projection-retry") {
+    await runInDurableObject(stub, async (_object,state) => {
+      expect(state.storage.sql.exec("SELECT status FROM runs").toArray()).toEqual([{status:"running"}]);
+      expect(state.storage.sql.exec("SELECT 1 FROM events WHERE event_type='exec.outcome.observed'").toArray()).toHaveLength(1);
+      expect(await state.storage.get("executor-lifetime-next-due-unix-ms")).toBeTypeOf("number");
+      expect(await state.storage.getAlarm()).toBeTypeOf("number");
+      state.storage.sql.exec("DROP TRIGGER fail_projection");
+    });
+    await evictDurableObject(stub);
+    await runDurableObjectAlarm(stub);
+  }
+  await runInDurableObject(stub, async (_object,state) => {
+    const proof = JSON.parse(state.storage.sql.exec<{payload_json:string}>("SELECT payload_json FROM events WHERE event_type='exec.fence.proved'").one().payload_json);
+    expect(proof.closure.placement.envelope).toEqual(envelope);
+    expect(proof.closure.lifetime.state).toBe("not_admitted");
+    const outcome = JSON.parse(state.storage.sql.exec<{payload_json:string}>("SELECT payload_json FROM events WHERE event_type='exec.outcome.observed'").one().payload_json);
+    expect(outcome.outcome).toEqual({state:"not_executed"});
+    expect(outcome.placement.envelope).toEqual(envelope);
+    expect(outcome.proof_event_id).toBeTypeOf("string");
+    expect(state.storage.sql.exec("SELECT status FROM runs").toArray()).toEqual([{status:mode === "deadline" ? "timed_out" : "cancelled"}]);
+    expect(await state.storage.get("executor-lifetime-next-due-unix-ms")).toBeUndefined();
+    await state.storage.deleteAlarm();
+  });
+  const broker = namespaces.WORKSPACE_BROKER;
+  const late = await broker.get(broker.idFromName("workspace")).fetch("http://executor/exec/invocation", {
+    method:"POST", headers:{"content-type":"application/json"},
+    body:JSON.stringify({selected:(envelope as {invocation:unknown}).invocation,envelope}),
+  });
+  await late.arrayBuffer();
+  expect(late.status).toBe(202);
+  expect(await starts()).toBe(beforeStarts);
 });

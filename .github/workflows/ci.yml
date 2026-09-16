@@ -124,7 +124,12 @@ jobs:
   # position and ends option parsing, and harness.rs pins that argv in a test.
   green-bar:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    # 13 minutes on `main` as of 2026-09-15, and the 20 this used to carry cut
+    # the norm-plane branch off mid-suite with about six minutes of tests left.
+    # A check set grows; a budget sized to what it cost when it was written
+    # stops reporting the suite and starts reporting the clock. Raised with
+    # room for that growth rather than to just past the current number.
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:

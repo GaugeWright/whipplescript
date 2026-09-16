@@ -1,0 +1,30 @@
+--- Composed controller/provider recovery for one correctly bound v2 placement.
+--- finish models a retained controller outcome with a lost broker write. Real
+--- process incarnation, payload validation and termination remain separate.
+mod EXEC-CONTROLLER-DELIVERY is
+ protecting NAT .
+ sorts Provider Controller Process Command Commands Reply Cfg .
+ ops claimed retained : -> Provider [ctor] .
+ ops absent admitted completed : -> Controller [ctor] .
+ ops running stopped : -> Process [ctor] .
+ ops deliver finish stop query : -> Command [ctor] .
+ subsort Command < Commands .
+ op nil : -> Commands [ctor] .
+ op __ : Commands Commands -> Commands [ctor assoc id: nil] .
+ ops pending replay : -> Reply [ctor] .
+ op cfg : Provider Controller Process Commands Nat Nat Reply -> Cfg [ctor] .
+ var P : Provider . var C : Controller . var PROCESS : Process .
+ var CS : Commands . vars EXEC START : Nat . var R : Reply .
+ rl [admit-before-execute] : cfg(claimed,absent,stopped,deliver CS,EXEC,START,R) => cfg(claimed,admitted,running,CS,EXEC + 1,START + 1,pending) .
+ rl [retain-controller-outcome] : cfg(claimed,admitted,PROCESS,finish CS,EXEC,START,R) => cfg(claimed,completed,PROCESS,CS,EXEC,START,pending) .
+ rl [process-disappears] : cfg(P,C,PROCESS,stop CS,EXEC,START,R) => cfg(P,C,stopped,CS,EXEC,START,R) .
+ rl [recover-retained-outcome] : cfg(P,completed,PROCESS,query CS,EXEC,START,R) => cfg(retained,completed,PROCESS,CS,EXEC,START,replay) .
+ rl [query-absent-does-not-dispatch] : cfg(claimed,absent,PROCESS,query CS,EXEC,START,R) => cfg(claimed,absent,PROCESS,CS,EXEC,START,pending) .
+ rl [query-admitted-does-not-dispatch] : cfg(claimed,admitted,PROCESS,query CS,EXEC,START,R) => cfg(claimed,admitted,PROCESS,CS,EXEC,START,pending) .
+endm
+mod EXEC-CONTROLLER-DELIVERY-WEAK is
+ including EXEC-CONTROLLER-DELIVERY .
+ var CS : Commands . vars EXEC START : Nat . var R : Reply .
+ rl [restart-for-query] : cfg(claimed,completed,stopped,query CS,EXEC,START,R) => cfg(retained,completed,running,CS,EXEC,START + 1,replay) .
+ rl [redispatch-unresolved] : cfg(claimed,admitted,stopped,query CS,EXEC,START,R) => cfg(claimed,admitted,running,CS,EXEC + 1,START + 1,pending) .
+endm

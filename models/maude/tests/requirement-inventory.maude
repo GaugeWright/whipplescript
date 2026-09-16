@@ -1,0 +1,20 @@
+load ../requirement-inventory.maude
+search [1] in REQUIREMENT-INVENTORY : { inspect(r0,requirement,declared,rev1) active(r0,rev0,true) } =>* { required(r0,rev0) } .
+search [1] in REQUIREMENT-INVENTORY : { inspect(r0,requirement,declared,rev0) absent(r0) } =>* { inactive(r0) } .
+search [1] in REQUIREMENT-INVENTORY : { inspect(r0,nonRequirement,unknownPolicy,rev0) } =>* { other(r0) } .
+search [1] in REQUIREMENT-INVENTORY : { schema(vocab0,nonRequirement,unknownPolicy) } =>* { classifiedSchema(vocab0) } .
+search [1] in REQUIREMENT-INVENTORY : { inspect(r0,requirement,declared,rev0) active(r0,rev0,true) inspect(r1,requirement,declared,rev1) active(r1,rev1,true) } =>* { required(r0,rev0) required(r1,rev1) } .
+search [1] in REQUIREMENT-INVENTORY : { inspect(r0,requirement,declared,rev0) active(r0,rev0,false) } =>* { required(r0,rev0) gap(r0) } .
+search in REQUIREMENT-INVENTORY : { inspect(r0,requirement,declared,rev1) active(r0,rev0,true) } =>* { inactive(r0) } .
+search [1] in REQUIREMENT-INVENTORY-WEAK-DRAFT : { inspect(r0,requirement,declared,rev1) active(r0,rev0,true) } =>* { inactive(r0) } .
+search in REQUIREMENT-INVENTORY : { inspect(r0,requirement,declared,rev1) active(r0,rev0,true) } =>* { required(r0,rev1) } .
+search [1] in REQUIREMENT-INVENTORY-WEAK-SUBSTITUTION : { inspect(r0,requirement,declared,rev1) active(r0,rev0,true) } =>* { required(r0,rev1) } .
+search in REQUIREMENT-INVENTORY : { schema(vocab0,unknownRole,declared) } =>* { classifiedSchema(vocab0) } .
+search [1] in REQUIREMENT-INVENTORY-WEAK-ROLE : { schema(vocab0,unknownRole,declared) } =>* { classifiedSchema(vocab0) } .
+search in REQUIREMENT-INVENTORY : { schema(vocab0,requirement,unknownPolicy) } =>* { classifiedSchema(vocab0) } .
+search [1] in REQUIREMENT-INVENTORY-WEAK-POLICY : { schema(vocab0,requirement,unknownPolicy) } =>* { classifiedSchema(vocab0) } .
+search in REQUIREMENT-INVENTORY : { inspect(r0,requirement,declared,rev0) active(r0,rev0,false) } =>* { required(r0,rev0) } .
+search [1] in REQUIREMENT-INVENTORY-WEAK-MEANING : { inspect(r0,requirement,declared,rev0) active(r0,rev0,false) } =>* { required(r0,rev0) } .
+search in REQUIREMENT-INVENTORY : { inspect(r0,requirement,declared,rev0) active(r0,rev0,true) inspect(r1,requirement,declared,rev1) active(r1,rev1,true) } =>* { required(r0,rev0) } .
+search [1] in REQUIREMENT-INVENTORY-WEAK-DROP : { inspect(r0,requirement,declared,rev0) active(r0,rev0,true) inspect(r1,requirement,declared,rev1) active(r1,rev1,true) } =>* { required(r0,rev0) } .
+quit

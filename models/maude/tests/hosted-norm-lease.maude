@@ -1,0 +1,7 @@
+load ../exec-recovery-fallback.maude
+search [1] in HOSTED-NORM-LEASE : cfg(partial) =>* cfg(tracked) .
+search [1] in HOSTED-NORM-LEASE : cfg(partial) =>* cfg(due) .
+search [1] in HOSTED-NORM-LEASE : cfg(partial) =>* cfg(fenced) .
+search [1] in HOSTED-NORM-LEASE : cfg(partial) =>* cfg(terminal) .
+search [1] in HOSTED-NORM-LEASE-WEAK : cfg(partial) =>* cfg(terminal) .
+quit

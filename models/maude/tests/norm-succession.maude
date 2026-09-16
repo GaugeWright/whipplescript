@@ -1,0 +1,37 @@
+load ../norm-succession.maude
+--- Original-key acts and exact-frontier rotations are both reachable.
+search [1] in NORM-SUCCESSION :
+ { root(0, oldKey) bound(oldKey) frontier(0) write(1, 0, oldKey) }
+ =>* { written(1, oldKey) frontier(1) RESIDUAL:Cfg } .
+search [1] in NORM-SUCCESSION :
+ { root(0, oldKey) bound(oldKey) bound(newKey) frontier(0)
+   write(1, 0, oldKey) rotate(2, 0, oldKey, newKey, 1) }
+ =>* { written(1, oldKey) rotated(2) root(2, newKey) RESIDUAL:Cfg } .
+search [1] in NORM-SUCCESSION :
+ { root(0, oldKey) bound(oldKey) bound(newKey) frontier(0)
+   rotate(2, 0, oldKey, newKey, 0) write(3, 2, newKey) }
+ =>* { rotated(2) written(3, newKey) RESIDUAL:Cfg } .
+--- A concurrent old-key act cannot be smuggled across rotation in either order.
+search in NORM-SUCCESSION :
+ { root(0, oldKey) bound(oldKey) bound(newKey) frontier(0)
+   write(1, 0, oldKey) rotate(2, 0, oldKey, newKey, 0) }
+ =>* { written(1, oldKey) rotated(2) RESIDUAL:Cfg } .
+search [1] in NORM-SUCCESSION-STALE-FRONTIER :
+ { root(0, oldKey) bound(oldKey) bound(newKey) frontier(0)
+   write(1, 0, oldKey) rotate(2, 0, oldKey, newKey, 0) }
+ =>* { written(1, oldKey) rotated(2) RESIDUAL:Cfg } .
+--- Retaining old bindings for history never restores their current authority.
+search in NORM-SUCCESSION :
+ { root(2, newKey) bound(oldKey) bound(newKey) frontier(2) write(3, 0, oldKey) }
+ =>* { written(3, oldKey) RESIDUAL:Cfg } .
+search [1] in NORM-SUCCESSION-OLD-EPOCH :
+ { root(2, newKey) bound(oldKey) bound(newKey) frontier(2) write(3, 0, oldKey) }
+ =>* { written(3, oldKey) RESIDUAL:Cfg } .
+--- The successor's authenticated binding is independently necessary.
+search in NORM-SUCCESSION :
+ { root(0, oldKey) bound(oldKey) frontier(0) rotate(2, 0, oldKey, newKey, 0) }
+ =>* { rotated(2) RESIDUAL:Cfg } .
+search [1] in NORM-SUCCESSION-UNBOUND-KEY :
+ { root(0, oldKey) bound(oldKey) frontier(0) rotate(2, 0, oldKey, newKey, 0) }
+ =>* { rotated(2) RESIDUAL:Cfg } .
+quit .

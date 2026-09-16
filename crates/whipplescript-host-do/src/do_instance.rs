@@ -35,8 +35,8 @@ use whipplescript_kernel::effect_handlers::{
     FixtureCapabilityProvider,
 };
 use whipplescript_kernel::exec_http::{
-    build_executor_exec_request, decode_cached_exec_result, exec_content_key, ingest_exec_stdout,
-    parse_executor_exec_response, settle_exec_http_result, ExecSettleContext,
+    build_executor_exec_request, decode_cached_exec_result, exec_content_key,
+    settle_exec_http_result, ExecDispatchPlan, ExecSettleContext,
 };
 use whipplescript_kernel::harness_loop::{
     compactor_for_strategy, provider_result_from_brokered_turn, Awaiting, BrokeredTurnInput,
@@ -115,6 +115,7 @@ use crate::do_store::{do_load_agent_snapshot, do_save_agent_snapshot, DoSql, DoS
 /// the delta-kernel cache's environment component (the workspace image
 /// digest once the container tier wires it).
 pub struct ExecutorSidecarConfig {
+    pub norm_runtime: Option<whipplescript_kernel::norm_runner::PythonRuntime>,
     pub base_url: String,
     pub env_values: std::collections::BTreeMap<String, String>,
     pub environment_epoch: String,
@@ -333,6 +334,8 @@ pub struct DoInstanceDriver<'a, Sql: DoSql> {
     pub system_prompt: &'a str,
     /// The immutable turn ceiling admitted with the authored package.
     pub max_steps: usize,
+    /// Injected host clock for persisted reconciliation readiness.
+    pub now_unix_ms: i64,
 }
 
 struct DoTurnCommandSource<Sql: DoSql> {
@@ -643,6 +646,93 @@ impl CapabilityContract for DoCapabilityContract {
     }
 }
 
+// This repairs only tracking authorized by an original bounded norm admission.
+// It neither starts a run nor sends the retained request.
+fn restore_norm_tracking<Sql: DoSql + Clone>(
+    kernel: &mut RuntimeKernel<DoSqliteStore<Sql>>,
+    instance: &str,
+) -> Result<(), StoreError> {
+    use whipplescript_kernel::{exec_handoff, exec_lifetime, norm_execution};
+    let tracked = exec_lifetime::tracked(kernel.store(), instance)?;
+    let effects = kernel.store().list_effects(instance)?;
+    let events = kernel.store().list_events(instance)?;
+    for run in kernel.store().list_runs(instance)? {
+        if run.status != "running" || tracked.contains_key(&run.run_id) {
+            continue;
+        }
+        let metadata: serde_json::Value = serde_json::from_str(&run.metadata_json)?;
+        let slot = kernel
+            .store()
+            .event_by_idempotency_key(instance, &run.run_id)?;
+        let original = slot
+            .as_ref()
+            .and_then(|slot| events.iter().find(|event| event.event_id == slot.event_id));
+        let payload: serde_json::Value = original
+            .map(|event| serde_json::from_str(&event.payload_json))
+            .transpose()?
+            .unwrap_or_default();
+        if metadata.get("norm_execution_lease").is_none()
+            && payload["metadata"].get("norm_execution_lease").is_none()
+        {
+            continue;
+        }
+        let original = original
+            .ok_or_else(|| StoreError::Conflict("norm lease admission event is missing".into()))?;
+        if metadata["norm_execution_lease"] != norm_execution::NORM_EXECUTION_LEASE_PROTOCOL
+            || original.source != "kernel"
+            || original.event_type != "effect.run_started"
+            || payload["run_id"] != run.run_id
+            || payload["effect_id"] != run.effect_id
+            || payload["metadata"] != metadata
+        {
+            return Err(StoreError::Conflict(
+                "norm lease tracking differs from original admission".into(),
+            ));
+        }
+        let row = effects
+            .iter()
+            .find(|effect| effect.effect_id == run.effect_id)
+            .ok_or_else(|| StoreError::Conflict("norm lease effect is missing".into()))?;
+        let input: serde_json::Value = serde_json::from_str(&row.input_json)?;
+        if input.get("norm_intent").is_none() {
+            return Err(StoreError::Conflict(
+                "norm lease requires its prepared effect".into(),
+            ));
+        }
+        let effect = ClaimableEffect {
+            attempt_admission_event_id: kernel
+                .store()
+                .effect_attempt_admission(instance, &row.effect_id)?,
+            effect_id: row.effect_id.clone(),
+            kind: row.kind.clone(),
+            target: row.target.clone(),
+            profile: row.profile.clone(),
+            input_json: row.input_json.clone(),
+            required_capabilities_json: row.required_capabilities_json.clone(),
+            declared_profiles_json: "[]".into(),
+        };
+        let handoff = exec_handoff::retained(kernel.store(), instance, &effect, vec![])?;
+        if handoff.run_id() != run.run_id {
+            return Err(StoreError::Conflict("norm lease attempt changed".into()));
+        }
+        let plan = ExecDispatchPlan::load(
+            kernel.store(),
+            instance,
+            &row.effect_id,
+            &run.run_id,
+            &input,
+        )?;
+        norm_execution::validate_norm_dispatch(&input, &plan).map_err(StoreError::Conflict)?;
+        exec_handoff::select_tracked(
+            kernel.store_mut(),
+            instance,
+            &effect,
+            handoff.request().clone(),
+        )?;
+    }
+    Ok(())
+}
+
 impl<Sql: DoSql + Clone> InstanceDriver for DoInstanceDriver<'_, Sql> {
     fn advance_rules(&mut self) -> Result<bool, StoreError> {
         step_instance_generic(&mut self.kernel, self.instance_id, self.ir, None, None)?;
@@ -659,14 +749,31 @@ impl<Sql: DoSql + Clone> InstanceDriver for DoInstanceDriver<'_, Sql> {
     }
 
     fn next_ready_effect(&mut self) -> Result<Option<ClaimableEffect>, StoreError> {
+        let wakes = whipplescript_kernel::exec_reconciliation::pending(
+            self.kernel.store(),
+            self.instance_id,
+        )?;
         Ok(self
             .kernel
             .claimable_effects(self.instance_id)?
             .into_iter()
-            .next())
+            .find(|effect| {
+                whipplescript_kernel::exec_reconciliation::is_ready(
+                    effect,
+                    self.instance_id,
+                    &wakes,
+                    self.now_unix_ms,
+                )
+            }))
     }
 
     fn advance_time(&mut self, now: &str) -> Result<(), StoreError> {
+        whipplescript_kernel::exec_outcome_settlement::settle_instance(
+            &mut self.kernel,
+            self.instance_id,
+        )?;
+        restore_norm_tracking(&mut self.kernel, self.instance_id)?;
+        self.kernel.expire_leases(self.instance_id, now)?;
         // The lifted due-time passes (DR-0033 Phase 6): complete due timers,
         // expire deadline-passed effects, and fire due clock-source
         // occurrences as durable signal facts — the same passes the native
@@ -698,12 +805,18 @@ impl<Sql: DoSql + Clone> InstanceDriver for DoInstanceDriver<'_, Sql> {
             now,
             self.ir,
         )?;
-        Ok(match (effect_due, clock_due) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (Some(a), None) => Some(a),
-            (None, Some(b)) => Some(b),
-            (None, None) => None,
-        })
+        let reconciliation_due = whipplescript_kernel::exec_reconciliation::pending(
+            self.kernel.store(),
+            self.instance_id,
+        )?
+        .values()
+        .map(|wake| wake.due_epoch_ms)
+        .filter(|due| *due > self.now_unix_ms)
+        .min();
+        Ok([effect_due, clock_due, reconciliation_due]
+            .into_iter()
+            .flatten()
+            .min())
     }
 
     fn run_effect(
@@ -1596,12 +1709,138 @@ impl<Sql: DoSql + Clone> InstanceDriver for DoInstanceDriver<'_, Sql> {
             // to the sidecar — with the delta-kernel result cache consulted
             // first (a hit settles without any HTTP at all).
             "exec.command" => {
+                if let Some(event) = whipplescript_kernel::exec_http::recover_exec_settlement(
+                    &mut self.kernel,
+                    self.instance_id,
+                    effect,
+                )? {
+                    return Ok(EffectStep::Done(event));
+                }
+                let input = json_from_str(&effect.input_json);
+                let run_id = whipplescript_kernel::execution_attempt_key(
+                    self.instance_id,
+                    &effect.effect_id,
+                    effect.attempt_admission_event_id.as_deref(),
+                    "exec-run",
+                );
+                if incoming.is_some() {
+                    let plan = ExecDispatchPlan::load(
+                        self.kernel.store(),
+                        self.instance_id,
+                        &effect.effect_id,
+                        &run_id,
+                        &input,
+                    )?;
+                    let pending = incoming.as_ref().is_some_and(|result| match result {
+                        Err(_) => true,
+                        Ok(response) => response.status == 202 && response.body == serde_json::json!({
+                            "protocol": "whipplescript.exec.reconciliation/v1", "state": "pending",
+                        }),
+                    });
+                    if pending {
+                        let handoff = whipplescript_kernel::exec_handoff::retained(
+                            self.kernel.store(),
+                            self.instance_id,
+                            effect,
+                            vec![],
+                        )?;
+                        let due = self.now_unix_ms.checked_add(1000).ok_or_else(|| {
+                            StoreError::Conflict("executor reconciliation deadline overflow".into())
+                        })?;
+                        let invocation = handoff.command()["envelope"].to_string();
+                        let event = self.kernel.store_mut().schedule_exec_reconciliation(
+                            whipplescript_store::exec_reconciliation::Schedule {
+                                instance_id: self.instance_id,
+                                effect_id: &effect.effect_id,
+                                run_id: &run_id,
+                                input_json: &effect.input_json,
+                                invocation_json: &invocation,
+                                now_epoch_ms: self.now_unix_ms,
+                                due_epoch_ms: due,
+                            },
+                        )?;
+                        return Ok(EffectStep::Deferred(event));
+                    }
+                    let parse_contract = plan.parse_contract.clone();
+                    let ingest_schema = parse_contract
+                        .as_ref()
+                        .and_then(|contract| contract.get("schema"))
+                        .and_then(|schema| schema.as_str())
+                        .unwrap_or("json")
+                        .to_owned();
+
+                    // Persist the original receipt even when decoding, timeout,
+                    // exit status or typed ingestion makes the effect fail.
+                    let executor_response = incoming
+                        .as_ref()
+                        .and_then(|result| result.as_ref().ok())
+                        .cloned();
+                    let outcome = match incoming {
+                        Some(Ok(response)) => {
+                            whipplescript_kernel::exec_http::decode_exec_http_outcome(
+                                &plan,
+                                &response,
+                                &effect.effect_id,
+                            )
+                        }
+                        other => Err((None, format!("executor transport error: {other:?}"))),
+                    };
+                    let ctx = ExecSettleContext {
+                        resolution_event_id: None,
+                        input_json: &effect.input_json,
+                        instance_id: self.instance_id,
+                        effect_id: &effect.effect_id,
+                        run_id: &run_id,
+                        capability: &plan.capability,
+                        script_sha256: &plan.script_sha256,
+                        cache: plan.content_key.as_deref().map(|key| (key, false)),
+                        ingest_schema: &ingest_schema,
+                        executor_response: executor_response.as_ref(),
+                        executor_transport: "http",
+                        dispatch_plan: Some(&plan),
+                    };
+                    return Ok(EffectStep::Done(settle_exec_http_result(
+                        &mut self.kernel,
+                        &ctx,
+                        outcome,
+                    )?));
+                }
                 let cfg = self.exec.ok_or_else(|| {
                     StoreError::Conflict(
                         "executor sidecar is not configured on this durable object".to_owned(),
                     )
                 })?;
-                let input = json_from_str(&effect.input_json);
+                if self
+                    .kernel
+                    .store()
+                    .list_runs(self.instance_id)?
+                    .iter()
+                    .any(|run| run.run_id == run_id)
+                {
+                    let headers = cfg
+                        .auth_token
+                        .as_ref()
+                        .map(|token| vec![("authorization".to_owned(), format!("Bearer {token}"))])
+                        .unwrap_or_default();
+                    let original = whipplescript_kernel::exec_handoff::retained(
+                        self.kernel.store(),
+                        self.instance_id,
+                        effect,
+                        headers,
+                    )?;
+                    return Ok(EffectStep::NeedsHttp(original.request().clone()));
+                }
+                crate::norm_runtime::validate(&input, cfg.norm_runtime.as_ref())
+                    .map_err(StoreError::Conflict)?;
+                let is_norm = input.get("norm_intent").is_some();
+                let environment_epoch = if is_norm {
+                    cfg.norm_runtime
+                        .as_ref()
+                        .map(|runtime| runtime.environment.as_str())
+                        .unwrap_or(&cfg.environment_epoch)
+                } else {
+                    &cfg.environment_epoch
+                };
                 let mode = input
                     .get("mode")
                     .and_then(|value| value.as_str())
@@ -1661,15 +1900,18 @@ impl<Sql: DoSql + Clone> InstanceDriver for DoInstanceDriver<'_, Sql> {
                     })?;
                     resolved_env.push((name, value.clone()));
                 }
-                let run_id = idempotency_key(&[self.instance_id, &effect.effect_id, "exec-run"]);
-                let lease_id =
-                    idempotency_key(&[self.instance_id, &effect.effect_id, "exec-lease"]);
+                let lease_id = whipplescript_kernel::execution_attempt_key(
+                    self.instance_id,
+                    &effect.effect_id,
+                    effect.attempt_admission_event_id.as_deref(),
+                    "exec-lease",
+                );
                 let content_key = script.hermetic.then(|| {
                     exec_content_key(
                         &script.sha256,
                         &argv,
                         &resolved_env,
-                        &cfg.environment_epoch,
+                        environment_epoch,
                         &stdin_json,
                         &parse_contract,
                     )
@@ -1680,112 +1922,105 @@ impl<Sql: DoSql + Clone> InstanceDriver for DoInstanceDriver<'_, Sql> {
                     .and_then(|value| value.as_str())
                     .unwrap_or("json")
                     .to_owned();
-                match incoming {
-                    None => {
-                        self.kernel.start_run(RunStart {
-                            instance_id: self.instance_id,
-                            effect_id: &effect.effect_id,
-                            run_id: &run_id,
-                            provider: "exec",
-                            worker_id: "whip-exec",
-                            lease_id: &lease_id,
-                            lease_expires_at: "2030-01-01T00:00:00Z",
-                            metadata_json: &serde_json::json!({
-                                "mode": "capability", "capability": capability,
-                            })
-                            .to_string(),
-                        })?;
-                        // Delta-kernel cache: a hit settles right here — no
-                        // container wakes, no HTTP round.
-                        if let Some(key) = &content_key {
-                            if let Some(hit) = self
-                                .kernel
-                                .store()
-                                .lookup_compute_result(key)?
-                                .and_then(|entry| decode_cached_exec_result(&entry.result_json))
-                            {
-                                let ctx = ExecSettleContext {
-                                    instance_id: self.instance_id,
-                                    effect_id: &effect.effect_id,
-                                    run_id: &run_id,
-                                    capability: &capability,
-                                    script_sha256: &script.sha256,
-                                    cache: Some((key, true)),
-                                    ingest_schema: &ingest_schema,
-                                };
-                                let event =
-                                    settle_exec_http_result(&mut self.kernel, &ctx, Ok(hit))?;
-                                return Ok(EffectStep::Done(event));
-                            }
-                        }
-                        let mut request = build_executor_exec_request(
-                            &cfg.base_url,
-                            &effect.effect_id,
-                            &script.sha256,
-                            &script.body,
-                            &argv,
-                            &resolved_env,
-                            &stdin,
-                            cfg.timeout_ms,
-                        )
-                        .map_err(StoreError::Conflict)?;
-                        if let Some(token) = &cfg.auth_token {
-                            request
-                                .headers
-                                .push(("authorization".to_owned(), format!("Bearer {token}")));
-                        }
-                        return Ok(EffectStep::NeedsHttp(request));
-                    }
-                    resumed => {
-                        let outcome = match resumed {
-                            Some(Ok(response)) => match parse_executor_exec_response(&response) {
-                                Ok(result) if result.timed_out => Err((
-                                    Some((result.exit_code, result.stdout, result.stderr)),
-                                    "exec command timed out on the executor sidecar".to_owned(),
-                                )),
-                                Ok(result) if result.exit_code != 0 => Err((
-                                    Some((result.exit_code, result.stdout.clone(), result.stderr)),
-                                    format!("exec command exited with status {}", result.exit_code),
-                                )),
-                                Ok(result) => match &parse_contract {
-                                    Some(contract) => {
-                                        match ingest_exec_stdout(contract, &result.stdout) {
-                                            Ok(ingested) => Ok((
-                                                result.exit_code,
-                                                result.stdout,
-                                                result.stderr,
-                                                Some(ingested),
-                                            )),
-                                            Err(reason) => Err((
-                                                Some((
-                                                    result.exit_code,
-                                                    result.stdout,
-                                                    result.stderr,
-                                                )),
-                                                reason,
-                                            )),
-                                        }
-                                    }
-                                    None => {
-                                        Ok((result.exit_code, result.stdout, result.stderr, None))
-                                    }
-                                },
-                                Err(reason) => Err((None, reason)),
-                            },
-                            other => Err((None, format!("executor transport error: {other:?}"))),
-                        };
+                let mut request = build_executor_exec_request(
+                    &cfg.base_url,
+                    &effect.effect_id,
+                    &script.sha256,
+                    &script.body,
+                    &argv,
+                    &resolved_env,
+                    &stdin,
+                    if is_norm {
+                        Some(whipplescript_kernel::norm_runner::PYTHON_CALLS_TIMEOUT_MS)
+                    } else {
+                        cfg.timeout_ms
+                    },
+                )
+                .map_err(StoreError::Conflict)?;
+                let plan = ExecDispatchPlan::prepare(
+                    &capability,
+                    &script.sha256,
+                    &input,
+                    &request,
+                    environment_epoch,
+                    content_key.clone(),
+                    parse_contract.clone(),
+                );
+
+                whipplescript_kernel::norm_execution::validate_norm_dispatch(&input, &plan)
+                    .map_err(StoreError::Conflict)?;
+
+                let executor_invocation = whipplescript_kernel::exec_invocation::Envelope::new(
+                    whipplescript_kernel::exec_invocation::Invocation {
+                        instance_id: self.instance_id.into(),
+                        effect_id: effect.effect_id.clone(),
+                        attempt_admission_event_id: effect.attempt_admission_event_id.clone(),
+                    },
+                    request.body.clone(),
+                )
+                .map_err(StoreError::Conflict)?;
+                let lease_expires_at = if is_norm {
+                    whipplescript_kernel::norm_execution::lease_expiry(
+                        &crate::do_worker::unix_ms_to_iso8601(self.now_unix_ms),
+                    )?
+                } else {
+                    "2030-01-01T00:00:00Z".into()
+                };
+                let mut metadata = serde_json::json!({
+                    "mode": "capability", "capability": capability, "executor_dispatch": plan,
+                    "executor_invocation": executor_invocation, "executor_url": request.url,
+                });
+                if is_norm {
+                    metadata["norm_execution_lease"] = serde_json::json!(
+                        whipplescript_kernel::norm_execution::NORM_EXECUTION_LEASE_PROTOCOL
+                    );
+                }
+                self.kernel.start_run_for_admission(
+                    RunStart {
+                        instance_id: self.instance_id,
+                        effect_id: &effect.effect_id,
+                        run_id: &run_id,
+                        provider: "exec",
+                        worker_id: "whip-exec",
+                        lease_id: &lease_id,
+                        lease_expires_at: &lease_expires_at,
+                        metadata_json: &metadata.to_string(),
+                    },
+                    effect.attempt_admission_event_id.as_deref(),
+                )?;
+                // Delta-kernel cache: a hit settles right here — no
+                // container wakes, no HTTP round.
+                if let Some(key) = content_key.as_ref() {
+                    if let Some(hit) = self
+                        .kernel
+                        .store()
+                        .lookup_compute_result(key)?
+                        .and_then(|entry| decode_cached_exec_result(&entry.result_json))
+                    {
                         let ctx = ExecSettleContext {
+                            resolution_event_id: None,
+                            input_json: &effect.input_json,
                             instance_id: self.instance_id,
                             effect_id: &effect.effect_id,
                             run_id: &run_id,
                             capability: &capability,
                             script_sha256: &script.sha256,
-                            cache: content_key.as_deref().map(|key| (key, false)),
+                            cache: Some((key, true)),
                             ingest_schema: &ingest_schema,
+                            executor_response: None,
+                            executor_transport: "http",
+                            dispatch_plan: Some(&plan),
                         };
-                        settle_exec_http_result(&mut self.kernel, &ctx, outcome)?
+                        let event = settle_exec_http_result(&mut self.kernel, &ctx, Ok(hit))?;
+                        return Ok(EffectStep::Done(event));
                     }
                 }
+                if let Some(token) = &cfg.auth_token {
+                    request
+                        .headers
+                        .push(("authorization".to_owned(), format!("Bearer {token}")));
+                }
+                return Ok(EffectStep::NeedsHttp(request));
             }
             "tracker.file" | "tracker.claim" | "tracker.renew" | "tracker.release"
             | "tracker.finish" => {
@@ -2211,6 +2446,8 @@ mod tests {
         for step in 0..=4 {
             let driver = DoInstanceDriver {
                 kernel,
+                // Fixture clock, as in this module's other driver fixtures.
+                now_unix_ms: 0,
                 files: &NoFiles,
                 coerce: None,
                 agent_model: None,
@@ -2262,6 +2499,88 @@ mod tests {
     // InstanceStepMachine, over `RuntimeKernel<DoSqliteStore>` — proving the whole
     // instance scheduler runs on the durable-object store.
     #[test]
+    fn do_instance_reconciliation_filters_readiness_and_preserves_wake() {
+        use whipplescript_store::RuntimeStore;
+        let mut store = store();
+        let sql = store.sql.clone();
+        let (instance_id, run_id, invocation) =
+            crate::exec_reconciliation_tests::prepared(&mut store, |statement| {
+                sql.execute(statement, &[]).unwrap();
+            });
+        store
+            .schedule_exec_reconciliation(whipplescript_store::exec_reconciliation::Schedule {
+                instance_id: &instance_id,
+                effect_id: "observe",
+                run_id: &run_id,
+                input_json: "{}",
+                invocation_json: &invocation,
+                now_epoch_ms: 1000,
+                due_epoch_ms: 2000,
+            })
+            .unwrap();
+        let sibling = whipplescript_store::NewEffect {
+            effect_id: "sibling",
+            idempotency_key: "sibling",
+            ..crate::rule_commit_recovery_tests::effect(None)
+        };
+        store
+            .commit_rule(whipplescript_store::RuleCommit {
+                idempotency_key: Some("sibling-enqueue"),
+                rule: "sibling-rule",
+                ..crate::rule_commit_recovery_tests::commit(&instance_id, &[sibling])
+            })
+            .unwrap();
+        drop(store);
+        let ir = whipplescript_parser::compile_program(include_str!(
+            "../../../examples/minimal-noop.whip"
+        ))
+        .ir
+        .unwrap();
+        let mut driver = DoInstanceDriver {
+            kernel: RuntimeKernel::new(DoSqliteStore::new(sql)),
+            files: &NoFiles,
+            coerce: None,
+            agent_model: None,
+            agent_tools: &NoTools,
+            agent_tool_specs: None,
+            agent_workspace_resources: None,
+            exec: None,
+            turn: None,
+            ir: &ir,
+            instance_id: &instance_id,
+            system_prompt: "test",
+            max_steps: 8,
+            now_unix_ms: 1000,
+        };
+        assert_eq!(
+            driver.next_ready_effect().unwrap().unwrap().effect_id,
+            "sibling"
+        );
+        assert_eq!(
+            driver.next_due_unix_ms("1970-01-01T00:00:01Z").unwrap(),
+            Some(2000)
+        );
+        // An unrelated early drive neither loses the persisted wake nor polls.
+        assert_eq!(
+            driver.next_ready_effect().unwrap().unwrap().effect_id,
+            "sibling"
+        );
+        assert_eq!(
+            driver.next_due_unix_ms("1970-01-01T00:00:01Z").unwrap(),
+            Some(2000)
+        );
+        driver.now_unix_ms = 2000;
+        assert_eq!(
+            driver.next_ready_effect().unwrap().unwrap().effect_id,
+            "observe"
+        );
+        assert_eq!(
+            driver.next_due_unix_ms("1970-01-01T00:00:02Z").unwrap(),
+            None
+        );
+    }
+
+    #[test]
     fn do_instance_driver_drives_rule_pass_to_terminal() {
         // The smallest complete workflow (examples/minimal-noop.whip): observe
         // start, record a fact, finish. Effect-free, so it drives to a terminal
@@ -2305,6 +2624,7 @@ mod tests {
             .expect("start event");
 
         let driver = DoInstanceDriver {
+            now_unix_ms: 0,
             kernel,
             files: &NoFiles,
             coerce: None,
@@ -2354,12 +2674,489 @@ mod tests {
         }
     }
 
+    #[test]
+    fn norm_dispatch_binding_is_enforced_before_hosted_run_start() {
+        for case in [
+            "exact",
+            "protected",
+            "configured-timeout",
+            "protected-configured-timeout",
+            "profile-missing",
+            "profile-changed",
+            "tracked",
+            "origin",
+            "hidden-marker",
+            "clock",
+            "clock-overflow",
+            "body",
+            "epoch",
+            "cache",
+            "parse",
+            "missing",
+            "future",
+            "malformed",
+            "permission",
+        ] {
+            use whipplescript_kernel::exec_http;
+            use whipplescript_store::{NewEffect, RuleCommit, ScriptCapabilityRegistration};
+
+            let source = "workflow ExecJudge\n\noutput result Verdict\n\n\
+             class Verdict {\n  ok int\n}\n";
+            let ir = whipplescript_parser::compile_program(source)
+                .ir
+                .expect("exec program compiles");
+            let store = store();
+            for stmt in [
+            "INSERT INTO capability_schemas (capability, description, schema_json) \
+             VALUES ('script.judge', 'Run an operator-pinned script capability.', '{}')",
+            "INSERT INTO capability_bindings (binding_id, program_id, capability, provider, config_json) \
+             VALUES ('binding_script_judge', NULL, 'script.judge', 'builtin-script', '{}')",
+        ] {
+            store.sql.execute(stmt, &[]).expect("seed script capability");
+        }
+            let mut kernel = RuntimeKernel::new(store);
+            let version = kernel
+                .create_program_version_for_program(
+                    ProgramVersionInput {
+                        program_name: &ir.workflow,
+                        source_hash: "src-exec",
+                        ir_hash: "ir-exec",
+                        compiler_version: "test",
+                        ir_snapshot: None,
+                    },
+                    &ir,
+                )
+                .expect("program version");
+            let instance_id = kernel
+                .create_instance_with_authority(
+                    &version,
+                    "{}",
+                    NewInstanceAuthority {
+                        workflow_principal: "local/ExecJudge",
+                        effective_authority_json: "{}",
+                    },
+                )
+                .expect("instance");
+            let protected = matches!(
+                case,
+                "protected"
+                    | "protected-configured-timeout"
+                    | "profile-missing"
+                    | "profile-changed"
+            );
+            let mut runtime = serde_json::json!({"executable":"python3", "python_version":"3.14.7", "environment":"test-epoch"});
+            if protected {
+                runtime["engine"] = serde_json::json!({"kind":"cpython3147_wasi", "artifact_path":"/opt/reactor.wasm", "artifact_sha256":"a".repeat(64)});
+                runtime["executable"] = serde_json::json!("/usr/local/bin/whip");
+            }
+            let mut installed = runtime.clone();
+            if case == "profile-changed" {
+                installed["executable"] = serde_json::json!("/changed/whip");
+            }
+            use whipplescript_core::norm_evidence::{
+                EvidenceSubject, EvidenceVersion, ReportContract,
+            };
+            use whipplescript_kernel::norm_runner::{
+                candidate_identity, PreparedNormRun, PythonCallMethod,
+            };
+            let method: PythonCallMethod = serde_json::from_value(serde_json::json!({
+                "runtime": runtime, "module":"main", "function":"check", "cases":[]
+            }))
+            .unwrap();
+            let files = std::collections::BTreeMap::from([(
+                "main.py".into(),
+                "def check(): return True\n".into(),
+            )]);
+            let contract = ReportContract {
+                subject: EvidenceSubject {
+                    requirement: EvidenceVersion {
+                        name: "fixture".into(),
+                        version: "1".into(),
+                        digest: "fixture".into(),
+                    },
+                    method: method.reference(),
+                    artifact: candidate_identity(&files),
+                },
+                cases: vec![],
+            };
+            let runner =
+                PreparedNormRun::prepare(contract, method.clone(), files, "exec-1".into()).unwrap();
+            let mut prepared_request = runner.executor_request("http://executor:8080").unwrap();
+            assert_eq!(
+                prepared_request.body["timeout_ms"],
+                serde_json::json!(30_000)
+            );
+            if case == "body" {
+                prepared_request.body["timeout_ms"] = serde_json::json!(20_000);
+            }
+            let script_sha = exec_http::sha256_hex(method.adapter().as_bytes());
+            kernel
+                .store()
+                .register_script_capability(ScriptCapabilityRegistration {
+                    name: "judge",
+                    argv_json: &prepared_request.body["argv"].to_string(),
+                    sha256: &script_sha,
+                    env_json: "{}",
+                    hermetic: case == "cache",
+                    body: method.adapter(),
+                })
+                .unwrap();
+            let norm_stdin = prepared_request.body["stdin"].clone();
+            let mut input = serde_json::json!({
+                "mode": "capability",
+                "capability": "judge",
+                "stdin": norm_stdin,
+                "norm_intent": {"invocation":"fixture"},
+                "norm_dispatch": whipplescript_kernel::norm_execution::NormDispatchBinding::for_request(&prepared_request, "test-epoch"),
+            });
+            match case {
+                "parse" => input["parse"] = serde_json::Value::Null,
+                "missing" => {
+                    input.as_object_mut().unwrap().remove("norm_dispatch");
+                }
+                "future" => input["norm_dispatch"]["protocol"] = serde_json::json!("future"),
+                "malformed" => input["norm_dispatch"] = serde_json::Value::Null,
+                _ => {}
+            }
+            if case == "permission" {
+                kernel
+                    .store()
+                    .sql
+                    .execute("DELETE FROM capability_bindings", &[])
+                    .unwrap();
+            }
+            let effect_input = input.to_string();
+            let effects = [
+                NewEffect {
+                    effect_id: "exec-1",
+                    kind: "exec.command",
+                    target: None,
+                    input_json: &effect_input,
+                    status: "queued",
+                    idempotency_key: "rule=go;effect=exec-1",
+                    required_capabilities_json: r#"["script.judge"]"#,
+                    profile: None,
+                    correlation_id: None,
+                    source_span_json: None,
+                    timeout_seconds: None,
+                },
+                NewEffect {
+                    effect_id: "exec-2",
+                    kind: "exec.command",
+                    target: None,
+                    input_json: &effect_input,
+                    status: "queued",
+                    idempotency_key: "rule=go;effect=exec-2",
+                    required_capabilities_json: r#"["script.judge"]"#,
+                    profile: None,
+                    correlation_id: None,
+                    source_span_json: None,
+                    timeout_seconds: None,
+                },
+            ];
+            kernel
+                .store_mut()
+                .commit_rule(RuleCommit {
+                    instance_id: &instance_id,
+                    rule: "go",
+                    trigger_event_id: None,
+                    facts: &[],
+                    consumed_fact_ids: &[],
+                    effects: &effects,
+                    dependencies: &[],
+                    terminal: None,
+                    idempotency_key: Some("commit-go"),
+                    marks: &[],
+                    context_json: None,
+                })
+                .expect("commit exec effects");
+
+            let exec_cfg = ExecutorSidecarConfig {
+                norm_runtime: (protected && case != "profile-missing")
+                    .then(|| serde_json::from_value(installed).unwrap()),
+                base_url: "http://executor:8080".to_owned(),
+                env_values: std::collections::BTreeMap::new(),
+                environment_epoch: if protected {
+                    "ordinary-cache-epoch"
+                } else if case == "epoch" {
+                    "changed"
+                } else {
+                    "test-epoch"
+                }
+                .to_owned(),
+                timeout_ms: case.contains("configured-timeout").then_some(7_000),
+                auth_token: None,
+            };
+            let mut driver = DoInstanceDriver {
+                now_unix_ms: match case {
+                    "clock" => i64::MAX,
+                    "clock-overflow" => 253_402_300_799_000,
+                    _ => 0,
+                },
+                kernel,
+                files: &NoFiles,
+                coerce: None,
+                agent_model: None,
+                agent_tools: &NoTools,
+                agent_tool_specs: None,
+                agent_workspace_resources: None,
+                exec: Some(&exec_cfg),
+                turn: None,
+                ir: &ir,
+                instance_id: &instance_id,
+                system_prompt: "You are a WhippleScript agent.",
+                max_steps: 8,
+            };
+            let claimable = |effect_id: &str| ClaimableEffect {
+                attempt_admission_event_id: None,
+                effect_id: effect_id.to_owned(),
+                kind: "exec.command".to_owned(),
+                target: None,
+                profile: None,
+                input_json: effect_input.clone(),
+                required_capabilities_json: r#"["script.judge"]"#.to_owned(),
+                declared_profiles_json: "[]".to_owned(),
+            };
+
+            let before = driver.kernel.store().list_events(&instance_id).unwrap();
+            let result = driver.run_effect(&claimable("exec-1"), None);
+            if matches!(
+                case,
+                "exact"
+                    | "protected"
+                    | "configured-timeout"
+                    | "protected-configured-timeout"
+                    | "tracked"
+                    | "origin"
+                    | "hidden-marker"
+            ) {
+                let EffectStep::NeedsHttp(request) = result.expect("exact plan dispatches") else {
+                    panic!("exact norm request must use the executor");
+                };
+                assert_eq!(request.body, prepared_request.body);
+                use whipplescript_kernel::{exec_handoff, exec_lifetime};
+                let run = driver.kernel.store().list_runs(&instance_id).unwrap()[0]
+                    .run_id
+                    .clone();
+                let original_events = driver.kernel.store().list_events(&instance_id).unwrap();
+                assert_eq!(
+                    driver.next_due_unix_ms("1970-01-01T00:00:00Z").unwrap(),
+                    Some(600_000)
+                );
+                assert_eq!(
+                    driver
+                        .kernel
+                        .store()
+                        .next_effect_due_epoch_ms(&instance_id)
+                        .unwrap(),
+                    Some(600_000)
+                );
+                driver.now_unix_ms = 500_000;
+                let reattached = ExecutorSidecarConfig {
+                    norm_runtime: None,
+                    base_url: "https://changed.invalid".into(),
+                    env_values: Default::default(),
+                    environment_epoch: "changed".into(),
+                    timeout_ms: Some(1),
+                    auth_token: None,
+                };
+                if case == "protected" {
+                    driver.exec = Some(&reattached);
+                }
+
+                assert!(matches!(
+                    driver.run_effect(&claimable("exec-1"), None).unwrap(),
+                    EffectStep::NeedsHttp(_)
+                ));
+                assert_eq!(
+                    driver.kernel.store().list_events(&instance_id).unwrap(),
+                    original_events
+                );
+                assert_eq!(
+                    driver
+                        .kernel
+                        .store()
+                        .next_effect_due_epoch_ms(&instance_id)
+                        .unwrap(),
+                    Some(600_000)
+                );
+                if case == "tracked" {
+                    exec_handoff::select_tracked(
+                        driver.kernel.store_mut(),
+                        &instance_id,
+                        &claimable("exec-1"),
+                        request.clone(),
+                    )
+                    .unwrap();
+                }
+                if case == "hidden-marker" {
+                    let original = driver.kernel.store().list_runs(&instance_id).unwrap()[0]
+                        .metadata_json
+                        .clone();
+                    let mut metadata: serde_json::Value = serde_json::from_str(&original).unwrap();
+                    metadata
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("norm_execution_lease");
+                    driver
+                        .kernel
+                        .store()
+                        .sql
+                        .execute(
+                            "UPDATE runs SET metadata_json=?1 WHERE run_id=?2",
+                            &[
+                                crate::do_store::SqlValue::Text(metadata.to_string()),
+                                crate::do_store::SqlValue::Text(run.clone()),
+                            ],
+                        )
+                        .unwrap();
+                    let before = driver.kernel.store().list_events(&instance_id).unwrap();
+                    assert!(format!("{:?}", driver.advance_time("1970-01-01T00:09:59Z"))
+                        .contains("norm lease tracking differs from original admission"));
+                    assert_eq!(
+                        driver.kernel.store().list_events(&instance_id).unwrap(),
+                        before
+                    );
+                    driver
+                        .kernel
+                        .store()
+                        .sql
+                        .execute(
+                            "UPDATE runs SET metadata_json=?1 WHERE run_id=?2",
+                            &[
+                                crate::do_store::SqlValue::Text(original),
+                                crate::do_store::SqlValue::Text(run.clone()),
+                            ],
+                        )
+                        .unwrap();
+                }
+                if case == "origin" {
+                    let slot = driver
+                        .kernel
+                        .store()
+                        .event_by_idempotency_key(&instance_id, &run)
+                        .unwrap()
+                        .unwrap();
+                    driver
+                        .kernel
+                        .store()
+                        .sql
+                        .execute(
+                            "UPDATE events SET source='foreign' WHERE event_id=?1",
+                            &[crate::do_store::SqlValue::Text(slot.event_id.clone())],
+                        )
+                        .unwrap();
+                    let corrupted = driver.kernel.store().list_events(&instance_id).unwrap();
+                    let result = driver.advance_time("1970-01-01T00:09:59Z");
+                    assert!(format!("{result:?}")
+                        .contains("norm lease tracking differs from original admission"));
+                    assert_eq!(
+                        driver.kernel.store().list_events(&instance_id).unwrap(),
+                        corrupted
+                    );
+                    assert!(exec_lifetime::tracked(driver.kernel.store(), &instance_id)
+                        .unwrap()
+                        .is_empty());
+                    driver
+                        .kernel
+                        .store()
+                        .sql
+                        .execute(
+                            "UPDATE events SET source='kernel' WHERE event_id=?1",
+                            &[crate::do_store::SqlValue::Text(slot.event_id)],
+                        )
+                        .unwrap();
+                }
+                driver.exec = Some(&exec_cfg);
+                driver.now_unix_ms = 599_999;
+                driver.advance_time("1970-01-01T00:09:59Z").unwrap();
+                assert!(exec_lifetime::tracked(driver.kernel.store(), &instance_id)
+                    .unwrap()
+                    .contains_key(&run));
+                assert!(exec_lifetime::fences(driver.kernel.store(), &instance_id)
+                    .unwrap()
+                    .is_empty());
+                assert_eq!(
+                    driver.next_due_unix_ms("1970-01-01T00:09:59Z").unwrap(),
+                    Some(600_000)
+                );
+                driver.now_unix_ms = 600_000;
+                driver.advance_time("1970-01-01T00:10:00Z").unwrap();
+                assert!(exec_lifetime::fences(driver.kernel.store(), &instance_id)
+                    .unwrap()
+                    .contains_key(&run));
+                assert_eq!(
+                    driver.kernel.store().list_runs(&instance_id).unwrap()[0].status,
+                    "running"
+                );
+                assert_eq!(
+                    driver
+                        .kernel
+                        .store()
+                        .effect_attempt_admission(&instance_id, "exec-1")
+                        .unwrap(),
+                    None
+                );
+                assert_eq!(
+                    driver.next_due_unix_ms("1970-01-01T00:10:00Z").unwrap(),
+                    None
+                );
+                let expired = driver.kernel.store().list_events(&instance_id).unwrap();
+                assert_eq!(
+                    expired
+                        .iter()
+                        .filter(|event| event.event_type == "exec.lease.expired")
+                        .count(),
+                    1
+                );
+                driver.advance_time("1970-01-01T00:10:00Z").unwrap();
+                assert_eq!(
+                    driver.kernel.store().list_events(&instance_id).unwrap(),
+                    expired
+                );
+
+                assert_eq!(
+                    driver.kernel.store().list_runs(&instance_id).unwrap().len(),
+                    1
+                );
+            } else {
+                assert!(result.is_err(), "{case}: {result:?}");
+                assert!(
+                    driver
+                        .kernel
+                        .store()
+                        .list_runs(&instance_id)
+                        .unwrap()
+                        .is_empty(),
+                    "{case}"
+                );
+                if case != "permission" {
+                    assert_eq!(
+                        driver.kernel.store().list_events(&instance_id).unwrap(),
+                        before,
+                        "{case}"
+                    );
+                }
+            }
+        }
+    }
+
     // Class-A exec over the sidecar (compute plane P8): the first exec builds a
     // `whip-executor/1` request and suspends on HTTP; settling records the
     // delta-kernel cache entry; an identical second exec settles from the cache
     // with NO HTTP round at all.
     #[test]
     fn do_instance_driver_execs_over_the_sidecar_and_serves_the_second_from_cache() {
+        sidecar_attempt_fixture(false, Some(10_000));
+        sidecar_attempt_fixture(false, None);
+    }
+
+    #[test]
+    fn do_instance_driver_retries_keep_late_replies_on_the_original_attempt() {
+        sidecar_attempt_fixture(true, Some(10_000));
+    }
+
+    fn sidecar_attempt_fixture(retries: bool, timeout_ms: Option<u64>) {
         use whipplescript_kernel::exec_http;
         use whipplescript_store::{NewEffect, RuleCommit, ScriptCapabilityRegistration};
 
@@ -2385,7 +3182,7 @@ mod tests {
                 argv_json: r#"["sh", "{script}"]"#,
                 sha256: &script_sha,
                 env_json: "{}",
-                hermetic: true,
+                hermetic: !retries,
                 body: script_body,
             })
             .expect("register script");
@@ -2464,13 +3261,15 @@ mod tests {
             .expect("commit exec effects");
 
         let exec_cfg = ExecutorSidecarConfig {
+            norm_runtime: None,
             base_url: "http://executor:8080".to_owned(),
             env_values: std::collections::BTreeMap::new(),
             environment_epoch: "test-epoch".to_owned(),
-            timeout_ms: Some(10_000),
+            timeout_ms,
             auth_token: None,
         };
         let mut driver = DoInstanceDriver {
+            now_unix_ms: 0,
             kernel,
             files: &NoFiles,
             coerce: None,
@@ -2485,7 +3284,94 @@ mod tests {
             system_prompt: "You are a WhippleScript agent.",
             max_steps: 8,
         };
+        if retries {
+            let response = |exit_code| HttpResponse {
+                status: 200,
+                body: serde_json::json!({
+                    "protocol": exec_http::EXECUTOR_PROTOCOL, "effect_id": "exec-1",
+                    "exit_code": exit_code, "timed_out": false, "stdout": "", "stderr": "fixture",
+                }),
+            };
+            let mut held = Vec::new();
+            let mut runs = std::collections::BTreeSet::new();
+            for attempt in 0..3 {
+                let snapshot = driver
+                    .kernel
+                    .store()
+                    .claimable_effects(&instance_id)
+                    .unwrap()
+                    .into_iter()
+                    .find(|effect| effect.effect_id == "exec-1")
+                    .unwrap();
+                let run = whipplescript_kernel::execution_attempt_key(
+                    &instance_id,
+                    "exec-1",
+                    snapshot.attempt_admission_event_id.as_deref(),
+                    "exec-run",
+                );
+                assert!(runs.insert(run));
+                assert!(matches!(
+                    driver.run_effect(&snapshot, None).unwrap(),
+                    EffectStep::NeedsHttp(_)
+                ));
+                let before_events = driver.kernel.store().list_events(&instance_id).unwrap();
+                let before_runs = driver.kernel.store().list_runs(&instance_id).unwrap();
+                let before_effects = driver.kernel.store().list_effects(&instance_id).unwrap();
+                for old in &held {
+                    assert!(
+                        driver.run_effect(old, Some(Ok(response(0)))).is_err(),
+                        "late success cannot rewrite a failed attempt"
+                    );
+                    assert_eq!(
+                        driver.kernel.store().list_events(&instance_id).unwrap(),
+                        before_events
+                    );
+                    assert_eq!(
+                        driver.kernel.store().list_runs(&instance_id).unwrap(),
+                        before_runs
+                    );
+                    assert_eq!(
+                        driver.kernel.store().list_effects(&instance_id).unwrap(),
+                        before_effects
+                    );
+                }
+                driver.run_effect(&snapshot, Some(Ok(response(7)))).unwrap();
+                held.push(snapshot);
+                let retained = driver.kernel.store().list_runs(&instance_id).unwrap();
+                assert_eq!(retained.len(), attempt + 1);
+                assert!(retained.iter().all(|run| run.status == "failed"));
+                if attempt < 2 {
+                    driver
+                        .kernel
+                        .retry_effect(whipplescript_store::RetryEffect {
+                            instance_id: &instance_id,
+                            effect_id: "exec-1",
+                            retry_after: None,
+                            idempotency_key: Some(&format!("sidecar-retry-{attempt}")),
+                        })
+                        .unwrap();
+                    driver
+                        .kernel
+                        .store_mut()
+                        .rebuild_projections(&instance_id)
+                        .unwrap();
+                }
+            }
+            assert_eq!(
+                driver
+                    .kernel
+                    .store()
+                    .list_events(&instance_id)
+                    .unwrap()
+                    .iter()
+                    .filter(|event| event.event_type == "effect.terminal")
+                    .count(),
+                3
+            );
+            return;
+        }
         let claimable = |effect_id: &str| ClaimableEffect {
+            attempt_admission_event_id: None,
             effect_id: effect_id.to_owned(),
             kind: "exec.command".to_owned(),
             target: None,
@@ -2505,6 +3391,10 @@ mod tests {
         };
         assert_eq!(request.url, "http://executor:8080/exec");
         assert_eq!(
+            request.body.get("timeout_ms"),
+            timeout_ms.map(serde_json::Value::from).as_ref()
+        );
+        assert_eq!(
             request.body["protocol"],
             serde_json::json!(exec_http::EXECUTOR_PROTOCOL)
         );
@@ -2516,6 +3406,30 @@ mod tests {
             script_body.as_bytes()
         );
 
+        let replay = driver
+            .run_effect(&claimable("exec-1"), None)
+            .expect("identical redispatch");
+        match replay {
+            EffectStep::NeedsHttp(replay) => assert_eq!(replay, request),
+            other => panic!("expected identical redispatch, got {other:?}"),
+        }
+        let changed_endpoint = ExecutorSidecarConfig {
+            norm_runtime: None,
+            base_url: "http://other-executor".into(),
+            env_values: exec_cfg.env_values.clone(),
+            environment_epoch: exec_cfg.environment_epoch.clone(),
+            timeout_ms: exec_cfg.timeout_ms,
+            auth_token: None,
+        };
+        driver.exec = Some(&changed_endpoint);
+        match driver
+            .run_effect(&claimable("exec-1"), None)
+            .expect("retained executor target")
+        {
+            EffectStep::NeedsHttp(replay) => assert_eq!(replay, request),
+            other => panic!("expected retained request, got {other:?}"),
+        }
+        driver.exec = Some(&exec_cfg);
         // Resume with the sidecar's canned response: the effect settles.
         let response = HttpResponse {
             status: 200,
@@ -2528,11 +3442,75 @@ mod tests {
                 "stderr": "",
             }),
         };
+        let mut changed_input = claimable("exec-1");
+        changed_input.input_json =
+            serde_json::json!({"mode":"capability","capability":"judge","stdin":{"n":99}})
+                .to_string();
+        let refusal = driver
+            .run_effect(&changed_input, Some(Ok(response.clone())))
+            .expect_err("changed invocation input must refuse");
+        assert!(format!("{refusal:?}").contains("original input or protocol"));
+        // Operator changes after dispatch are irrelevant to the response in flight.
+        let changed_body = "echo changed";
+        driver
+            .kernel
+            .store()
+            .register_script_capability(ScriptCapabilityRegistration {
+                name: "judge",
+                argv_json: r#"["different-runtime", "{script}"]"#,
+                sha256: &exec_http::sha256_hex(changed_body.as_bytes()),
+                env_json: "{}",
+                hermetic: true,
+                body: changed_body,
+            })
+            .expect("replace script after dispatch");
+        match driver
+            .run_effect(&claimable("exec-1"), None)
+            .expect("retained executor target")
+        {
+            EffectStep::NeedsHttp(replay) => assert_eq!(replay, request),
+            other => panic!("expected retained request, got {other:?}"),
+        }
+        let before = driver.kernel.store().list_events(&instance_id).unwrap();
+        driver.now_unix_ms = i64::MAX;
+        let error = driver
+            .run_effect(
+                &claimable("exec-1"),
+                Some(Ok(HttpResponse {
+                    status: 202,
+                    body: serde_json::json!({
+                        "protocol": "whipplescript.exec.reconciliation/v1", "state": "pending",
+                    }),
+                })),
+            )
+            .expect_err("overflow must not schedule a wrapped deadline");
+        assert!(format!("{error:?}").contains("deadline overflow"));
+        assert_eq!(
+            driver.kernel.store().list_events(&instance_id).unwrap(),
+            before
+        );
+        driver.now_unix_ms = 0;
+        driver.exec = None;
         let step = driver
-            .run_effect(&claimable("exec-1"), Some(Ok(response)))
+            .run_effect(&claimable("exec-1"), Some(Ok(response.clone())))
             .expect("first exec settles");
         assert!(matches!(step, EffectStep::Done(_)), "{step:?}");
 
+        // Restore the original capability for a second invocation. Only a cache
+        // entry written under the dispatched plan can satisfy this invocation.
+        driver.exec = Some(&exec_cfg);
+        driver
+            .kernel
+            .store()
+            .register_script_capability(ScriptCapabilityRegistration {
+                name: "judge",
+                argv_json: r#"["sh", "{script}"]"#,
+                sha256: &script_sha,
+                env_json: "{}",
+                hermetic: true,
+                body: script_body,
+            })
+            .expect("restore original script");
         // Second identical exec: served from the delta-kernel cache — DONE
         // immediately on prepare, no HTTP round.
         let step = driver
@@ -2562,8 +3540,28 @@ mod tests {
             first["cache"]["content_key"],
             second["cache"]["content_key"]
         );
+        assert_eq!(
+            first["executor_response"],
+            serde_json::json!({"status":response.status,"body":response.body})
+        );
+        assert!(
+            second.get("executor_response").is_none(),
+            "cache hit minted a fresh receipt"
+        );
         assert_eq!(first["stdout"], second["stdout"]);
         assert_eq!(first["sha256"], serde_json::json!(script_sha));
+        assert_eq!(
+            first["executor_dispatch"]["script_sha256"],
+            serde_json::json!(script_sha)
+        );
+        assert_eq!(
+            first["executor_dispatch"]["request_sha256"],
+            serde_json::json!(exec_http::sha256_hex(
+                serde_json::json!([request.url, request.body])
+                    .to_string()
+                    .as_bytes()
+            ))
+        );
 
         let content_key = first["cache"]["content_key"]
             .as_str()
@@ -2643,6 +3641,7 @@ mod tests {
             codex_account_id: None,
         };
         let driver = DoInstanceDriver {
+            now_unix_ms: 0,
             kernel,
             files: &NoFiles,
             coerce: Some(&cfg),
@@ -2794,6 +3793,7 @@ mod tests {
 
         let model = FinalReplyModel;
         let driver = DoInstanceDriver {
+            now_unix_ms: 0,
             kernel,
             files: &NoFiles,
             coerce: None,
@@ -2976,6 +3976,7 @@ mod tests {
             writable: Some(false),
         }];
         let driver = DoInstanceDriver {
+            now_unix_ms: 0,
             kernel,
             files: &NoFiles,
             coerce: None,
@@ -3175,6 +4176,7 @@ mod tests {
             auth_token: None,
         };
         let driver = DoInstanceDriver {
+            now_unix_ms: 0,
             kernel,
             files: &NoFiles,
             coerce: None,
@@ -3278,6 +4280,8 @@ mod tests {
         };
         let driver = DoInstanceDriver {
             kernel,
+            // Fixture clock, as in this module's other driver fixtures.
+            now_unix_ms: 0,
             files: &NoFiles,
             coerce: None,
             agent_model: None,
@@ -3395,6 +4399,8 @@ mod tests {
         );
         let driver = DoInstanceDriver {
             kernel,
+            // Fixture clock, as in this module's other driver fixtures.
+            now_unix_ms: 0,
             files: &NoFiles,
             coerce: None,
             agent_model: Some(&model),
@@ -3447,6 +4453,7 @@ mod custody_routing_tests {
         // success. A program would believe it had sealed its data while holding
         // a fixture summary containing no ciphertext at all.
         let effect = whipplescript_store::ClaimableEffect {
+            attempt_admission_event_id: None,
             effect_id: "e1".to_owned(),
             kind: "capability.call".to_owned(),
             target: Some("custody.wrap".to_owned()),
@@ -3483,6 +4490,7 @@ mod custody_routing_tests {
         // have. Opening is the more dangerous direction, so it gets its own
         // assertion rather than riding on the wrap test.
         let effect = whipplescript_store::ClaimableEffect {
+            attempt_admission_event_id: None,
             effect_id: "e2".to_owned(),
             kind: "capability.call".to_owned(),
             target: Some("custody.unwrap".to_owned()),

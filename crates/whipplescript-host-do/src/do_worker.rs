@@ -44,6 +44,9 @@ pub enum DurableStepOutcome {
     /// Perform this HTTP request via `fetch` and call `step` again with the
     /// response. The in-flight effect is held in the handle until then.
     NeedsHttp(HttpRequest),
+    /// Private executor broker operation, authorized from the current in-flight
+    /// effect and retained dispatch rather than the HTTP URL or body.
+    NeedsExecutor(Box<whipplescript_kernel::exec_handoff::Handoff>),
     /// The instance reached a workflow terminal (absorbing).
     Terminal,
     /// Quiescent but not terminal — parked awaiting external input / an alarm.
@@ -591,6 +594,11 @@ impl<Sql: DoSql + 'static> DurableInstance<Sql> {
             .map_err(|error| format!("bind failed: {error:?}"))?
         {
             BindOutcome::Bound => {}
+            BindOutcome::GatedRef => {
+                return Err(format!(
+                    "ref `{branch_id}` is gated — instances must bind to a work branch"
+                ));
+            }
             BindOutcome::AlreadyBound { branch_id: other } => {
                 return Err(format!("instance is already bound to branch `{other}`"));
             }
@@ -669,6 +677,7 @@ impl<Sql: DoSql + 'static> DurableInstance<Sql> {
             }
         };
         let mut driver = DoInstanceDriver {
+            now_unix_ms,
             kernel,
             files: self.files.as_ref(),
             coerce: self.coerce.as_ref(),
@@ -686,6 +695,33 @@ impl<Sql: DoSql + 'static> DurableInstance<Sql> {
 
         let now = unix_ms_to_iso8601(now_unix_ms);
         let outcome = drive_fixpoint(&mut driver, &mut self.in_flight, incoming, &now);
+        let outcome = match (outcome, self.in_flight.as_ref()) {
+            (DurableStepOutcome::NeedsHttp(request), Some(effect))
+                if effect.kind == "exec.command" =>
+            {
+                match whipplescript_kernel::exec_handoff::select_tracked(
+                    driver.kernel.store_mut(),
+                    &self.instance_id,
+                    effect,
+                    request,
+                ) {
+                    Ok(handoff) => match whipplescript_kernel::exec_lifetime::fences(
+                        driver.kernel.store(),
+                        &self.instance_id,
+                    ) {
+                        Ok(fences) if fences.contains_key(&handoff.run_id()) => {
+                            DurableStepOutcome::Parked {
+                                next_due_unix_ms: None,
+                            }
+                        }
+                        Ok(_) => DurableStepOutcome::NeedsExecutor(Box::new(handoff)),
+                        Err(error) => DurableStepOutcome::Failed(format!("{error:?}")),
+                    },
+                    Err(error) => DurableStepOutcome::Failed(format!("{error:?}")),
+                }
+            }
+            (other, _) => other,
+        };
         self.kernel = Some(driver.kernel);
         outcome
     }
@@ -698,6 +734,15 @@ impl<Sql: DoSql + 'static> DurableInstance<Sql> {
             .store()
             .get_instance(&self.instance_id)?
             .map(|instance| instance.status))
+    }
+
+    /// Persist this wake before yielding to executor transport.
+    pub fn effect_due_unix_ms(&self) -> Result<Option<i64>, StoreError> {
+        self.kernel
+            .as_ref()
+            .expect("kernel present between steps")
+            .store()
+            .next_effect_due_epoch_ms(&self.instance_id)
     }
 
     #[cfg(test)]
@@ -895,7 +940,7 @@ fn drive_fixpoint<D: InstanceDriver>(
     // Resume an effect suspended on an HTTP round with the host's response.
     if let Some(effect) = in_flight.take() {
         match driver.run_effect(&effect, incoming) {
-            Ok(EffectStep::Done(_)) => {}
+            Ok(EffectStep::Done(_) | EffectStep::Deferred(_)) => {}
             Ok(EffectStep::NeedsHttp(request)) => {
                 *in_flight = Some(effect);
                 return DurableStepOutcome::NeedsHttp(request);
@@ -905,7 +950,12 @@ fn drive_fixpoint<D: InstanceDriver>(
                     next_due_unix_ms: None,
                 }
             }
-            Err(error) => return DurableStepOutcome::Failed(format!("{error:?}")),
+            Err(error) => {
+                // Settlement may have rolled back. Preserve the association so
+                // the caller can retry its response without another dispatch.
+                *in_flight = Some(effect);
+                return DurableStepOutcome::Failed(format!("{error:?}"));
+            }
         }
     }
 
@@ -935,7 +985,7 @@ fn drive_fixpoint<D: InstanceDriver>(
             Err(error) => return DurableStepOutcome::Failed(format!("{error:?}")),
         };
         match driver.run_effect(&ready, None) {
-            Ok(EffectStep::Done(_)) => continue,
+            Ok(EffectStep::Done(_) | EffectStep::Deferred(_)) => continue,
             Ok(EffectStep::NeedsHttp(request)) => {
                 *in_flight = Some(ready);
                 return DurableStepOutcome::NeedsHttp(request);
@@ -953,6 +1003,197 @@ fn drive_fixpoint<D: InstanceDriver>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct DeferredDriver {
+        store: DoSqliteStore<crate::do_store::test_support::RusqliteDoSql>,
+        instance: String,
+        run: String,
+        invocation: String,
+        ready: Vec<ClaimableEffect>,
+        sibling_ran: bool,
+        fail_wake: bool,
+        request_first: bool,
+    }
+
+    impl DeferredDriver {
+        fn new() -> Self {
+            let mut store = store();
+            let sql = store.sql.clone();
+            let (instance, run, invocation) =
+                crate::exec_reconciliation_tests::prepared(&mut store, |statement| {
+                    sql.execute(statement, &[]).unwrap();
+                });
+            let original = RuntimeKernel::new(store);
+            let observe = original.claimable_effects(&instance).unwrap().remove(0);
+            let sibling = ClaimableEffect {
+                effect_id: "sibling".into(),
+                ..observe.clone()
+            };
+            Self {
+                store: original.into_store(),
+                instance,
+                run,
+                invocation,
+                ready: vec![observe, sibling],
+                sibling_ran: false,
+                fail_wake: false,
+                request_first: false,
+            }
+        }
+    }
+
+    impl InstanceDriver for DeferredDriver {
+        fn advance_rules(&mut self) -> Result<bool, StoreError> {
+            Ok(false)
+        }
+
+        fn next_ready_effect(&mut self) -> Result<Option<ClaimableEffect>, StoreError> {
+            let wakes =
+                whipplescript_kernel::exec_reconciliation::pending(&self.store, &self.instance)?;
+            Ok(self
+                .ready
+                .iter()
+                .find(|effect| {
+                    whipplescript_kernel::exec_reconciliation::is_ready(
+                        effect,
+                        &self.instance,
+                        &wakes,
+                        1000,
+                    )
+                })
+                .cloned())
+        }
+
+        fn run_effect(
+            &mut self,
+            effect: &ClaimableEffect,
+            _incoming: Option<Result<HttpResponse, TransportError>>,
+        ) -> Result<EffectStep, StoreError> {
+            if effect.effect_id == "observe" {
+                if self.request_first {
+                    self.request_first = false;
+                    return Ok(EffectStep::NeedsHttp(HttpRequest {
+                        url: "http://fixture/exec".into(),
+                        headers: vec![],
+                        body: serde_json::json!({}),
+                    }));
+                }
+                let event = self.store.schedule_exec_reconciliation(
+                    whipplescript_store::exec_reconciliation::Schedule {
+                        instance_id: &self.instance,
+                        effect_id: "observe",
+                        run_id: &self.run,
+                        input_json: "{}",
+                        invocation_json: &self.invocation,
+                        now_epoch_ms: 1000,
+                        due_epoch_ms: if self.fail_wake { 1000 } else { 2000 },
+                    },
+                )?;
+                return Ok(EffectStep::Deferred(event));
+            }
+            self.sibling_ran = true;
+            self.ready.retain(|item| item.effect_id != "sibling");
+            Ok(EffectStep::Done(whipplescript_store::StoredEvent {
+                event_id: "sibling-done".into(),
+                sequence: 0,
+            }))
+        }
+
+        fn next_due_unix_ms(&mut self, _now: &str) -> Result<Option<i64>, StoreError> {
+            Ok(
+                whipplescript_kernel::exec_reconciliation::pending(&self.store, &self.instance)?
+                    .values()
+                    .map(|wake| wake.due_epoch_ms)
+                    .min(),
+            )
+        }
+    }
+
+    #[test]
+    fn deferred_effect_continues_siblings_and_preserves_host_wake() {
+        for resume in [false, true] {
+            let mut driver = DeferredDriver::new();
+            let mut in_flight = resume.then(|| driver.ready[0].clone());
+            let outcome = drive_fixpoint(&mut driver, &mut in_flight, None, "1970-01-01T00:00:01Z");
+            assert!(
+                matches!(
+                    outcome,
+                    DurableStepOutcome::Parked {
+                        next_due_unix_ms: Some(2000)
+                    }
+                ),
+                "{outcome:?}"
+            );
+            assert!(driver.sibling_ran);
+            assert!(in_flight.is_none());
+            assert_eq!(
+                driver.store.list_runs(&driver.instance).unwrap()[0].status,
+                "running"
+            );
+            assert!(driver
+                .store
+                .list_facts(&driver.instance)
+                .unwrap()
+                .is_empty());
+        }
+    }
+
+    #[test]
+    fn deferred_wake_failure_preserves_resumed_effect_for_retry() {
+        let mut driver = DeferredDriver::new();
+        driver.fail_wake = true;
+        let mut in_flight = Some(driver.ready[0].clone());
+        assert!(matches!(
+            drive_fixpoint(&mut driver, &mut in_flight, None, "1970-01-01T00:00:01Z"),
+            DurableStepOutcome::Failed(_)
+        ));
+        assert_eq!(in_flight.as_ref().unwrap().effect_id, "observe");
+        assert!(!driver.sibling_ran);
+        assert!(whipplescript_kernel::exec_reconciliation::pending(
+            &driver.store,
+            &driver.instance
+        )
+        .unwrap()
+        .is_empty());
+        driver.fail_wake = false;
+        assert!(matches!(
+            drive_fixpoint(&mut driver, &mut in_flight, None, "1970-01-01T00:00:01Z"),
+            DurableStepOutcome::Parked {
+                next_due_unix_ms: Some(2000)
+            }
+        ));
+        assert!(driver.sibling_ran);
+    }
+
+    #[test]
+    fn deferred_effect_continues_shared_scheduler_fixpoint() {
+        use whipplescript_kernel::instance_machine::{InstanceOutcome, InstanceStepMachine};
+        use whipplescript_kernel::sansio::{Outcome, StepMachine};
+        for resume in [false, true] {
+            let mut driver = DeferredDriver::new();
+            driver.request_first = resume;
+            let mut machine = InstanceStepMachine::new(driver);
+            if resume {
+                assert!(matches!(machine.step(None), Outcome::NeedsIo(_)));
+            }
+            let response = resume.then(|| {
+                whipplescript_kernel::sansio::IoResult::Http(Ok(HttpResponse {
+                    status: 202,
+                    body: serde_json::json!({"state":"pending"}),
+                }))
+            });
+            assert!(matches!(
+                machine.step(response),
+                Outcome::Settle(InstanceOutcome::Parked)
+            ));
+            let driver = machine.into_driver();
+            assert!(driver.sibling_ran);
+            assert_eq!(
+                driver.store.list_runs(&driver.instance).unwrap()[0].status,
+                "running"
+            );
+        }
+    }
 
     /// A fixed injected clock for deterministic tests (2026-01-01T00:00:00Z).
     const TEST_NOW_MS: i64 = 1_767_225_600_000;
@@ -1286,6 +1527,7 @@ rule go
         }];
         let ports = || DurableEffectPorts {
             exec: Some(ExecutorSidecarConfig {
+                norm_runtime: None,
                 base_url: "http://executor:8080".to_owned(),
                 env_values: std::collections::BTreeMap::from([
                     ("SAFE_VALUE".to_owned(), "visible-safe-value".to_owned()),
@@ -1312,9 +1554,41 @@ rule go
         )
         .expect("create");
         let request = match instance.step(None, TEST_NOW_MS) {
-            DurableStepOutcome::NeedsHttp(request) => request,
+            DurableStepOutcome::NeedsExecutor(handoff) => handoff.request().clone(),
             other => panic!("expected executor request, got {other:?}"),
         };
+        let custody = whipplescript_kernel::exec_lifetime::tracked(
+            instance.kernel.as_ref().unwrap().store(),
+            &instance.instance_id,
+        )
+        .unwrap();
+        assert_eq!(custody.len(), 1, "handoff requires durable custody");
+        let original_custody = custody.values().next().unwrap().invocation.clone();
+        assert_eq!(original_custody["dispatch"], request.body);
+        let pending = HttpResponse {
+            status: 202,
+            body: serde_json::json!({
+                "protocol": "whipplescript.exec.reconciliation/v1", "state": "pending",
+            }),
+        };
+        assert!(matches!(instance.step(Some(Ok(pending)), TEST_NOW_MS),
+            DurableStepOutcome::Parked { next_due_unix_ms: Some(due) } if due == TEST_NOW_MS + 1000));
+        let before_facts = instance
+            .kernel
+            .as_ref()
+            .unwrap()
+            .store()
+            .list_facts(&instance.instance_id)
+            .unwrap();
+        assert!(instance
+            .kernel
+            .as_ref()
+            .unwrap()
+            .store()
+            .list_runs(&instance.instance_id)
+            .unwrap()
+            .iter()
+            .all(|run| run.status == "running"));
         drop(instance);
 
         let mut instance = DurableInstance::create(
@@ -1327,8 +1601,20 @@ rule go
             &scripts,
         )
         .expect("reattach");
-        let replay = match instance.step(None, TEST_NOW_MS) {
-            DurableStepOutcome::NeedsHttp(request) => request,
+        assert!(matches!(instance.step(None, TEST_NOW_MS),
+            DurableStepOutcome::Parked { next_due_unix_ms: Some(due) } if due == TEST_NOW_MS + 1000));
+        assert_eq!(
+            instance
+                .kernel
+                .as_ref()
+                .unwrap()
+                .store()
+                .list_facts(&instance.instance_id)
+                .unwrap(),
+            before_facts
+        );
+        let replay = match instance.step(None, TEST_NOW_MS + 1000) {
+            DurableStepOutcome::NeedsExecutor(handoff) => handoff.request().clone(),
             other => panic!("expected replayed executor request, got {other:?}"),
         };
         assert_eq!(replay.url, request.url);
@@ -1347,6 +1633,14 @@ rule go
             "an unrelated host credential must not enter the executor request"
         );
 
+        assert!(
+            matches!(instance.step(Some(Err(TransportError::Transport("lost reply".into()))), TEST_NOW_MS + 1000),
+            DurableStepOutcome::Parked { next_due_unix_ms: Some(due) } if due == TEST_NOW_MS + 2000)
+        );
+        match instance.step(None, TEST_NOW_MS + 2000) {
+            DurableStepOutcome::NeedsExecutor(handoff) => assert_eq!(handoff.request(), &request),
+            other => panic!("expected same invocation after delivery loss, got {other:?}"),
+        }
         let effect_id = replay.body["effect_id"]
             .as_str()
             .expect("executor request effect id");
@@ -1362,7 +1656,7 @@ rule go
             }),
         };
         assert!(matches!(
-            instance.step(Some(Ok(response)), TEST_NOW_MS),
+            instance.step(Some(Ok(response)), TEST_NOW_MS + 2000),
             DurableStepOutcome::Terminal
         ));
         let kernel = instance.kernel.as_ref().expect("kernel");
@@ -1372,6 +1666,14 @@ rule go
             .expect("runs");
         assert_eq!(runs.len(), 1, "reattachment must not mint a second run");
         assert_eq!(runs[0].status, "completed");
+        let custody =
+            whipplescript_kernel::exec_lifetime::tracked(kernel.store(), &instance.instance_id)
+                .unwrap();
+        assert_eq!(custody.len(), 1);
+        assert_eq!(
+            custody.values().next().unwrap().invocation,
+            original_custody
+        );
         let effects = kernel
             .store()
             .list_effects(&instance.instance_id)
@@ -1552,12 +1854,41 @@ rule go
 
 #[cfg(test)]
 mod branch_dispatch_tests {
+
     use super::*;
     use crate::do_branches::DoBranches;
     use crate::do_store::test_support::store;
     use whipplescript_store::branches::{
         Branches, CreateBranch, CreateBranchOutcome, MAINLINE_BRANCH_ID,
     };
+
+    #[test]
+    fn norm_mainline_binding_refuses_without_mutation() {
+        use whipplescript_store::branches::BindOutcome;
+        let sql = Rc::new(store().sql);
+        let mut branches = DoBranches::new(Rc::clone(&sql)).unwrap();
+        branches.ensure_mainline("t0").unwrap();
+        for at in ["t1", "t2"] {
+            assert_eq!(
+                branches
+                    .bind_instance("norm_instance", MAINLINE_BRANCH_ID, at)
+                    .unwrap(),
+                BindOutcome::GatedRef
+            );
+            assert_eq!(branches.instance_branch("norm_instance").unwrap(), None);
+        }
+        use crate::do_store::DoSql;
+        sql.execute(
+            "INSERT INTO branch_instances (instance_id, branch_id, bound_at) VALUES ('legacy', 'main', 't0')",
+            &[],
+        ).unwrap();
+        assert_eq!(
+            branches
+                .bind_instance("legacy", MAINLINE_BRANCH_ID, "t3")
+                .unwrap(),
+            BindOutcome::GatedRef
+        );
+    }
 
     const TEST_NOW_MS: i64 = 1_767_225_600_000;
 

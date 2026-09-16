@@ -1,0 +1,9 @@
+load ../exec-recovery-fallback.maude
+search [1] in EXEC-RECOVERY-INTENT : cfg(tracked,none,running) =>* cfg(tracked,recovery,running) .
+search [1] in EXEC-RECOVERY-INTENT : cfg(legacy,none,running) =>* cfg(legacy,recovery,running) .
+search [1] in EXEC-RECOVERY-INTENT-WEAK : cfg(legacy,none,running) =>* cfg(legacy,recovery,running) .
+search [1] in EXEC-RECOVERY-INTENT : cfg(tracked,recovery,running) =>* cfg(tracked,recovery,terminal) .
+search [1] in EXEC-RECOVERY-INTENT-WEAK : cfg(tracked,recovery,running) =>* cfg(tracked,recovery,terminal) .
+search [1] in EXEC-RECOVERY-INTENT : cfg(tracked,cancellation,running) =>* cfg(tracked,recovery,running) .
+search [1] in EXEC-RECOVERY-INTENT-WEAK : cfg(tracked,cancellation,running) =>* cfg(tracked,recovery,running) .
+quit

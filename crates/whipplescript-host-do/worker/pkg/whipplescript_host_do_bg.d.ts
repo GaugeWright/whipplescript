@@ -1,2 +1,2 @@
 export function __wbg_set_wasm(exports: WebAssembly.Exports): void;
-export { WasmDurableInstance } from "./whipplescript_host_do";
+export { WasmDurableInstance, exec_lifetime_commands, exec_lifetime_has_settlement_work, exec_lifetime_settle, exec_lifetime_observe, exec_lifetime_retire, exec_provider_claim, exec_provider_resolution, exec_provider_prepare_fence, exec_provider_complete, exec_provider_place, exec_controller_place, exec_controller_transition, exec_barrier_inspect, exec_barrier_begin, exec_barrier_finish, exec_controller_target, exec_controller_result, exec_incarnation_read, exec_incarnation_delivery, exec_incarnation_result, exec_norm_runtime_read, exec_norm_runtime_prepare } from "./whipplescript_host_do";

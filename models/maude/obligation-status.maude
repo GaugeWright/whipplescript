@@ -1,0 +1,145 @@
+--- DR-0098, norm-plane sections 2 and 3.1/3.4. Two cases distinguish
+--- empty, partial and complete coverage. Observations are assertion outcomes
+--- authenticated by an adapter boundary, not names/counts supplied by a process.
+--- Direct and cached bindings are already verified provenance inputs; this
+--- model does not prove adapter honesty or dependency closure for later reuse.
+mod OBLIGATION-STATUS is
+  protecting BOOL .
+  sorts Ref Family Observation Provenance Completion Exit Report State Worlds .
+  ops v0 v1 : -> Ref [ctor] .
+  ops empty first second both : -> Family [ctor] .
+  ops absent unexercised passed failed : -> Observation [ctor] .
+  ops direct cached unbound : -> Provenance [ctor] .
+  ops complete truncated missing : -> Completion [ctor] .
+  ops success failure crashed : -> Exit [ctor] .
+  --- expected requirement/method/artifact, reported identities, provenance,
+  --- contract case inventory, assertion observations, completion, termination.
+  op report : Ref Ref Ref Ref Ref Ref Provenance Family Observation Observation Completion Exit -> Report [ctor] .
+  op evaluate : Report -> State [ctor] .
+  --- Positive support, retained counterexample, harness diagnostic.
+  op judged : Bool Bool Bool -> State [ctor] .
+  vars R M A R1 M1 A1 : Ref . var P : Provenance . var F : Family .
+  vars X Y : Observation . var C : Completion . var E : Exit . var Q : Report .
+  op hasFirst : Family -> Bool .
+  eq hasFirst(first) = true . eq hasFirst(both) = true . eq hasFirst(F) = false [owise] .
+  op hasSecond : Family -> Bool .
+  eq hasSecond(second) = true . eq hasSecond(both) = true . eq hasSecond(F) = false [owise] .
+  op exercised : Observation -> Bool .
+  eq exercised(passed) = true . eq exercised(failed) = true . eq exercised(X) = false [owise] .
+  op bound : Report -> Bool .
+  eq bound(report(R,M,A,R1,M1,A1,P,F,X,Y,C,E)) = (R == R1 and M == M1 and A == A1 and P =/= unbound) .
+  op covered : Report -> Bool .
+  eq covered(report(R,M,A,R1,M1,A1,P,F,X,Y,C,E)) =
+    ((not hasFirst(F) or exercised(X)) and (not hasSecond(F) or exercised(Y))) .
+  op hasFailure : Report -> Bool .
+  eq hasFailure(report(R,M,A,R1,M1,A1,P,F,X,Y,C,E)) =
+    ((hasFirst(F) and X == failed) or (hasSecond(F) and Y == failed)) .
+  op consistent : Report -> Bool .
+  eq consistent(report(R,M,A,R1,M1,A1,P,F,X,Y,C,E)) =
+    ((hasFailure(report(R,M,A,R1,M1,A1,P,F,X,Y,C,E)) and E == failure) or
+     (not hasFailure(report(R,M,A,R1,M1,A1,P,F,X,Y,C,E)) and E == success)) .
+  op adequate : Report -> Bool .
+  eq adequate(report(R,M,A,R1,M1,A1,P,F,X,Y,C,E)) =
+    (bound(report(R,M,A,R1,M1,A1,P,F,X,Y,C,E)) and F =/= empty and
+     covered(report(R,M,A,R1,M1,A1,P,F,X,Y,C,E)) and C == complete and
+     consistent(report(R,M,A,R1,M1,A1,P,F,X,Y,C,E))) .
+  op positive : Report -> Bool .
+  eq positive(Q) = (adequate(Q) and not hasFailure(Q)) .
+  op counter : Report -> Bool .
+  eq counter(Q) = (bound(Q) and hasFailure(Q)) .
+  rl [evaluate-report] : evaluate(Q) => judged(positive(Q), counter(Q), not adequate(Q)) .
+
+  --- A bounded explicit interpretation universe, not a trusted consistency bit.
+  ops noWorld goodWorld badWorld allWorlds : -> Worlds [ctor] .
+  vars W W1 : Worlds .
+  op intersect : Worlds Worlds -> Worlds .
+  eq intersect(noWorld,W) = noWorld .
+  eq intersect(goodWorld,goodWorld) = goodWorld .
+  eq intersect(goodWorld,allWorlds) = goodWorld .
+  eq intersect(goodWorld,W) = noWorld [owise] .
+  eq intersect(badWorld,badWorld) = badWorld .
+  eq intersect(badWorld,allWorlds) = badWorld .
+  eq intersect(badWorld,W) = noWorld [owise] .
+  eq intersect(allWorlds,W) = W .
+  op allSatisfy : Worlds -> Bool .
+  eq allSatisfy(noWorld) = true . eq allSatisfy(goodWorld) = true .
+  eq allSatisfy(W) = false [owise] .
+  op prove : Worlds Worlds -> State [ctor] .
+  op proof : Bool -> State [ctor] .
+  rl [nonvacuous-proof] : prove(W,W1) => proof(intersect(W,W1) =/= noWorld and allSatisfy(intersect(W,W1))) .
+endm
+mod OBLIGATION-STATUS-WEAK-REQUIREMENT is
+  including OBLIGATION-STATUS .
+  vars R M A R1 M1 A1 : Ref . var P : Provenance . var F : Family .
+  vars X Y : Observation . var C : Completion . var E : Exit .
+  crl [omit-requirement] : evaluate(report(R,M,A,R1,M1,A1,P,F,X,Y,C,E)) => judged(true, counter(report(R,M,A,R1,M1,A1,P,F,X,Y,C,E)), true)
+    if M == M1 and A == A1 and P =/= unbound and F =/= empty and covered(report(R,M,A,R1,M1,A1,P,F,X,Y,C,E)) and C == complete and not hasFailure(report(R,M,A,R1,M1,A1,P,F,X,Y,C,E)) and E == success .
+endm
+mod OBLIGATION-STATUS-WEAK-METHOD is
+  including OBLIGATION-STATUS .
+  vars R M A R1 M1 A1 : Ref . var P : Provenance . var F : Family .
+  vars X Y : Observation . var C : Completion . var E : Exit .
+  crl [omit-method] : evaluate(report(R,M,A,R1,M1,A1,P,F,X,Y,C,E)) => judged(true, counter(report(R,M,A,R1,M1,A1,P,F,X,Y,C,E)), true)
+    if R == R1 and A == A1 and P =/= unbound and F =/= empty and covered(report(R,M,A,R1,M1,A1,P,F,X,Y,C,E)) and C == complete and not hasFailure(report(R,M,A,R1,M1,A1,P,F,X,Y,C,E)) and E == success .
+endm
+mod OBLIGATION-STATUS-WEAK-ARTIFACT is
+  including OBLIGATION-STATUS .
+  vars R M A R1 M1 A1 : Ref . var P : Provenance . var F : Family .
+  vars X Y : Observation . var C : Completion . var E : Exit .
+  crl [omit-artifact] : evaluate(report(R,M,A,R1,M1,A1,P,F,X,Y,C,E)) => judged(true, counter(report(R,M,A,R1,M1,A1,P,F,X,Y,C,E)), true)
+    if R == R1 and M == M1 and P =/= unbound and F =/= empty and covered(report(R,M,A,R1,M1,A1,P,F,X,Y,C,E)) and C == complete and not hasFailure(report(R,M,A,R1,M1,A1,P,F,X,Y,C,E)) and E == success .
+endm
+mod OBLIGATION-STATUS-WEAK-PROVENANCE is
+  including OBLIGATION-STATUS .
+  vars R M A R1 M1 A1 : Ref . var P : Provenance . var F : Family .
+  vars X Y : Observation . var C : Completion . var E : Exit .
+  crl [omit-provenance] : evaluate(report(R,M,A,R1,M1,A1,P,F,X,Y,C,E)) => judged(true, counter(report(R,M,A,R1,M1,A1,P,F,X,Y,C,E)), true)
+    if R == R1 and M == M1 and A == A1 and F =/= empty and covered(report(R,M,A,R1,M1,A1,P,F,X,Y,C,E)) and C == complete and not hasFailure(report(R,M,A,R1,M1,A1,P,F,X,Y,C,E)) and E == success .
+endm
+mod OBLIGATION-STATUS-WEAK-EMPTY is
+  including OBLIGATION-STATUS .
+  vars R M A R1 M1 A1 : Ref . var P : Provenance . var F : Family .
+  vars X Y : Observation . var C : Completion . var E : Exit .
+  crl [omit-empty] : evaluate(report(R,M,A,R1,M1,A1,P,F,X,Y,C,E)) => judged(true, counter(report(R,M,A,R1,M1,A1,P,F,X,Y,C,E)), true)
+    if R == R1 and M == M1 and A == A1 and P =/= unbound and covered(report(R,M,A,R1,M1,A1,P,F,X,Y,C,E)) and C == complete and not hasFailure(report(R,M,A,R1,M1,A1,P,F,X,Y,C,E)) and E == success .
+endm
+mod OBLIGATION-STATUS-WEAK-COVERAGE is
+  including OBLIGATION-STATUS .
+  vars R M A R1 M1 A1 : Ref . var P : Provenance . var F : Family .
+  vars X Y : Observation . var C : Completion . var E : Exit .
+  crl [omit-coverage] : evaluate(report(R,M,A,R1,M1,A1,P,F,X,Y,C,E)) => judged(true, counter(report(R,M,A,R1,M1,A1,P,F,X,Y,C,E)), true)
+    if R == R1 and M == M1 and A == A1 and P =/= unbound and F =/= empty and C == complete and not hasFailure(report(R,M,A,R1,M1,A1,P,F,X,Y,C,E)) and E == success .
+endm
+mod OBLIGATION-STATUS-WEAK-COMPLETION is
+  including OBLIGATION-STATUS .
+  vars R M A R1 M1 A1 : Ref . var P : Provenance . var F : Family .
+  vars X Y : Observation . var C : Completion . var E : Exit .
+  crl [omit-completion] : evaluate(report(R,M,A,R1,M1,A1,P,F,X,Y,C,E)) => judged(true, counter(report(R,M,A,R1,M1,A1,P,F,X,Y,C,E)), true)
+    if R == R1 and M == M1 and A == A1 and P =/= unbound and F =/= empty and covered(report(R,M,A,R1,M1,A1,P,F,X,Y,C,E)) and not hasFailure(report(R,M,A,R1,M1,A1,P,F,X,Y,C,E)) and E == success .
+endm
+mod OBLIGATION-STATUS-WEAK-FAILURE is
+  including OBLIGATION-STATUS .
+  vars R M A R1 M1 A1 : Ref . var P : Provenance . var F : Family .
+  vars X Y : Observation . var C : Completion . var E : Exit .
+  crl [omit-failure] : evaluate(report(R,M,A,R1,M1,A1,P,F,X,Y,C,E)) => judged(true, counter(report(R,M,A,R1,M1,A1,P,F,X,Y,C,E)), true)
+    if R == R1 and M == M1 and A == A1 and P =/= unbound and F =/= empty and covered(report(R,M,A,R1,M1,A1,P,F,X,Y,C,E)) and C == complete and E == success .
+endm
+mod OBLIGATION-STATUS-WEAK-EXIT is
+  including OBLIGATION-STATUS .
+  vars R M A R1 M1 A1 : Ref . var P : Provenance . var F : Family .
+  vars X Y : Observation . var C : Completion . var E : Exit .
+  crl [omit-exit] : evaluate(report(R,M,A,R1,M1,A1,P,F,X,Y,C,E)) => judged(true, counter(report(R,M,A,R1,M1,A1,P,F,X,Y,C,E)), true)
+    if R == R1 and M == M1 and A == A1 and P =/= unbound and F =/= empty and covered(report(R,M,A,R1,M1,A1,P,F,X,Y,C,E)) and C == complete and not hasFailure(report(R,M,A,R1,M1,A1,P,F,X,Y,C,E)) .
+endm
+mod OBLIGATION-STATUS-WEAK-COUNTER is
+  including OBLIGATION-STATUS . var Q : Report .
+  crl [erase-on-harness-failure] : evaluate(Q) => judged(false,false,true) if not adequate(Q) .
+endm
+mod OBLIGATION-STATUS-WEAK-VACUITY is
+  including OBLIGATION-STATUS . vars W W1 : Worlds .
+  rl [empty-premises-prove-anything] : prove(W,W1) => proof(allSatisfy(intersect(W,W1))) .
+endm
+mod OBLIGATION-STATUS-WEAK-UNIVERSAL is
+  including OBLIGATION-STATUS . vars W W1 : Worlds .
+  rl [nonempty-is-not-proof] : prove(W,W1) => proof(intersect(W,W1) =/= noWorld) .
+endm

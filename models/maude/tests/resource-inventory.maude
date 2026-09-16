@@ -1,0 +1,18 @@
+load ../resource-inventory.maude
+search [1] in RESOURCE-INVENTORY : { requirement query(true,true,true,true) } =>* { retained complete } .
+search [1] in RESOURCE-INVENTORY : { requirement query(true,true,false,true) } =>* { retained gap } .
+search in RESOURCE-INVENTORY : { requirement query(false,true,true,true) } =>* { retained complete } .
+search [1] in RESOURCE-INVENTORY-WEAK-POLICY : { requirement query(false,true,true,true) } =>* { retained complete } .
+search in RESOURCE-INVENTORY : { requirement query(true,false,true,true) } =>* { retained complete } .
+search [1] in RESOURCE-INVENTORY-WEAK-INVENTORY : { requirement query(true,false,true,true) } =>* { retained complete } .
+search in RESOURCE-INVENTORY : { requirement query(true,true,false,true) } =>* { retained complete } .
+search [1] in RESOURCE-INVENTORY-WEAK-SUBJECT : { requirement query(true,true,false,true) } =>* { retained complete } .
+search in RESOURCE-INVENTORY : { requirement query(true,true,true,false) } =>* { retained complete } .
+search [1] in RESOURCE-INVENTORY-WEAK-DOMAIN : { requirement query(true,true,true,false) } =>* { retained complete } .
+search [1] in RESOURCE-INVENTORY-PAIR : { comparison(true,true,false) } =>* { required(true) } .
+search [1] in RESOURCE-INVENTORY-PAIR : { comparison(true,false,true) } =>* { required(true) } .
+search in RESOURCE-INVENTORY-PAIR : { comparison(false,true,false) } =>* { required(true) } .
+search [1] in RESOURCE-INVENTORY-WEAK-HISTORY : { comparison(false,true,false) } =>* { required(true) } .
+search in RESOURCE-INVENTORY-PAIR : { comparison(true,true,false) } =>* { required(false) } .
+search [1] in RESOURCE-INVENTORY-WEAK-RETIREMENT : { comparison(true,true,false) } =>* { required(false) } .
+quit

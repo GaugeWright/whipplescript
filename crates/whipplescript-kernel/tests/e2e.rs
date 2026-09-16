@@ -1779,6 +1779,7 @@ fn e2e_malformed_coordination_input_fails_typed_instead_of_defaulting() {
             })
             .expect("forged effect commits");
         let claimable = ClaimableEffect {
+            attempt_admission_event_id: None,
             effect_id: effect_id.to_owned(),
             kind: kind.to_owned(),
             target: None,
@@ -1906,6 +1907,7 @@ fn e2e_counter_period_is_timezone_anchored_and_replay_deterministic() {
         })
         .expect("consume commits");
     let claimable = ClaimableEffect {
+        attempt_admission_event_id: None,
         effect_id: "consume-1".to_owned(),
         kind: "counter.consume".to_owned(),
         target: None,
@@ -1965,6 +1967,7 @@ fn e2e_counter_period_is_timezone_anchored_and_replay_deterministic() {
         })
         .expect("append commits");
     let claimable = ClaimableEffect {
+        attempt_admission_event_id: None,
         effect_id: "append-1".to_owned(),
         kind: "ledger.append".to_owned(),
         target: None,

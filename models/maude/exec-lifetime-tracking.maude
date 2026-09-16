@@ -1,0 +1,59 @@
+--- Handoff requires durable original-request custody; outcome closure cannot erase it.
+mod EXEC-LIFETIME-TRACKING is
+ sorts Custody Phase Proof Cfg .
+ ops absent original replaced : -> Custody [ctor] .
+ ops prepared handed terminal retry : -> Phase [ctor] .
+ ops unknown ended : -> Proof [ctor] .
+ op cfg : Custody Phase Proof -> Cfg [ctor] .
+ rl [track] : cfg(absent,prepared,unknown) => cfg(original,prepared,unknown) .
+ rl [handoff] : cfg(original,prepared,unknown) => cfg(original,handed,unknown) .
+ rl [outcome] : cfg(original,handed,unknown) => cfg(original,terminal,unknown) .
+ --- This models historical attempt retention, not retry admission authority.
+ rl [later-attempt] : cfg(original,terminal,unknown) => cfg(original,retry,unknown) .
+endm
+mod EXEC-LIFETIME-TRACKING-WEAK is
+ including EXEC-LIFETIME-TRACKING .
+ rl [untracked-handoff] : cfg(absent,prepared,unknown) => cfg(absent,handed,unknown) .
+ rl [terminal-erases-custody] : cfg(original,terminal,unknown) => cfg(absent,terminal,unknown) .
+ rl [retry-replaces-custody] : cfg(original,retry,unknown) => cfg(replaced,retry,unknown) .
+ rl [tracking-is-proof] : cfg(original,prepared,unknown) => cfg(original,prepared,ended) .
+endm
+
+--- Deadline publication requires durable cancellation intent, not destruction proof.
+mod EXEC-DEADLINE-FENCE is
+ sorts Intent Outcome Cfg .
+ ops absent durable lost : -> Intent [ctor] .
+ ops running timedOut replaced : -> Outcome [ctor] .
+ op cfg : Intent Outcome -> Cfg [ctor] .
+ rl [request] : cfg(absent,running) => cfg(durable,running) .
+ rl [deadline] : cfg(durable,running) => cfg(durable,timedOut) .
+ --- Historical replacement is external to this intent-retention projection.
+ rl [history] : cfg(durable,timedOut) => cfg(durable,replaced) .
+endm
+mod EXEC-DEADLINE-FENCE-WEAK is
+ including EXEC-DEADLINE-FENCE .
+ rl [timeout-first] : cfg(absent,running) => cfg(absent,timedOut) .
+ rl [completion-clears-intent] : cfg(durable,timedOut) => cfg(lost,timedOut) .
+ rl [retry-clears-intent] : cfg(durable,replaced) => cfg(lost,replaced) .
+endm
+
+--- Host cleanup is independent of the workflow outcome and survives retirement.
+mod EXEC-HOST-CLOSURE is
+ sorts Proof Outcome Custody Wake Cfg .
+ ops pending proved : -> Proof [ctor] .
+ ops running terminal : -> Outcome [ctor] .
+ ops retained erased : -> Custody [ctor] .
+ ops armed idle : -> Wake [ctor] .
+ op cfg : Proof Outcome Custody Wake -> Cfg [ctor] .
+ var O : Outcome .
+ rl [settle] : cfg(pending,running,retained,armed) => cfg(pending,terminal,retained,armed) .
+ --- Proof-write failure has no transition; the pre-I/O wake survives.
+ rl [retain-bound-proof] : cfg(pending,O,retained,armed) => cfg(proved,O,retained,idle) .
+ rl [retire] : cfg(proved,terminal,retained,idle) => cfg(proved,terminal,erased,idle) .
+endm
+mod EXEC-HOST-CLOSURE-WEAK is
+ including EXEC-HOST-CLOSURE .
+ rl [terminal-clears-wake] : cfg(pending,terminal,retained,armed) => cfg(pending,terminal,retained,idle) .
+ rl [retirement-erases-intent] : cfg(pending,terminal,retained,armed) => cfg(pending,terminal,erased,idle) .
+ rl [late-workflow-step] : cfg(proved,terminal,erased,idle) => cfg(pending,running,erased,idle) .
+endm

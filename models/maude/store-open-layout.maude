@@ -1,0 +1,23 @@
+--- Exact schema and version-metadata identity; cache entries are minted only
+--- after successful atomic upgrades. Database integrity is a premise. This
+--- cache grants no workflow authority and caches no policy or effect data.
+mod STORE-OPEN-LAYOUT is
+ sorts Layout Fact Cfg State . ops original changed : -> Layout [ctor] .
+ subsort Fact < Cfg . op none : -> Cfg [ctor] .
+ op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] . op {_} : Cfg -> State [ctor] .
+ ops database cached : Layout -> Fact [ctor] . ops open writer ready referenceBuild : -> Fact [ctor] .
+ var L : Layout . var C : Cfg .
+ --- A private database runs this binary's migrations to commit before minting
+ --- the canonical identity. It never takes the target database's writer.
+ rl [build-reference] : { referenceBuild C } => { cached(original) C } .
+ rl [validated-read] : { open database(L) cached(L) C } => { ready database(L) cached(L) C } .
+ rl [atomic-upgrade] : { open database(L) writer C } => { ready database(L) cached(L) writer C } .
+endm
+mod STORE-OPEN-LAYOUT-WEAK-IDENTITY is
+ including STORE-OPEN-LAYOUT . var C : Cfg .
+ rl [weaken] : { open database(changed) cached(original) C } => { ready C } .
+endm
+mod STORE-OPEN-LAYOUT-WEAK-VALIDATION is
+ including STORE-OPEN-LAYOUT . var C : Cfg .
+ rl [weaken] : { open database(original) C } => { ready C } .
+endm

@@ -1,0 +1,162 @@
+--- One native invocation. Allocation/binding custody does not grant execution.
+--- Docker identity authenticity and physical destruction are adapter obligations.
+mod EXEC-NATIVE-OWNER is
+ sorts Phase Fence Binding Authority Cfg .
+ ops empty allocated : -> Phase [ctor] .
+ ops open fenced : -> Fence [ctor] .
+ ops absent original replacement : -> Binding [ctor] .
+ ops none create execute : -> Authority [ctor] .
+ op cfg : Phase Fence Binding Authority -> Cfg [ctor] .
+ var F : Fence . var B : Binding . var A : Authority .
+ rl [allocate] : cfg(empty,open,absent,none) => cfg(allocated,open,absent,create) .
+ rl [creation-consumed-or-crashed] : cfg(allocated,F,absent,create) => cfg(allocated,F,absent,none) .
+ rl [fence] : cfg(allocated,open,B,A) => cfg(allocated,fenced,B,A) .
+ rl [retain-late-container] : cfg(allocated,F,absent,A) => cfg(allocated,F,original,none) .
+endm
+mod EXEC-NATIVE-OWNER-WEAK is
+ including EXEC-NATIVE-OWNER .
+ var F : Fence .
+ rl [allocate-after-fence] : cfg(empty,fenced,absent,none) => cfg(allocated,fenced,absent,create) .
+ rl [replay-creation] : cfg(allocated,F,absent,none) => cfg(allocated,F,absent,create) .
+ rl [bind-without-owner] : cfg(empty,F,absent,none) => cfg(empty,F,original,none) .
+ rl [replace-container] : cfg(allocated,F,original,none) => cfg(allocated,F,replacement,none) .
+ rl [binding-is-execution] : cfg(allocated,F,original,none) => cfg(allocated,F,original,execute) .
+endm
+
+--- Removal observes the bound physical target through the trusted Docker
+--- adapter. No controller-drain premise is present, so proof cannot follow.
+mod EXEC-NATIVE-REMOVAL is
+ sorts Ownership Physical Observation Evidence Cfg .
+ ops bound foreign missing : -> Ownership [ctor] .
+ ops present gone : -> Physical [ctor] .
+ ops pending removed : -> Observation [ctor] .
+ ops none proved : -> Evidence [ctor] .
+ op cfg : Ownership Physical Observation Evidence -> Cfg [ctor] .
+ rl [remove-original] : cfg(bound,present,pending,none) => cfg(bound,gone,removed,none) .
+ rl [observe-already-gone] : cfg(bound,gone,pending,none) => cfg(bound,gone,removed,none) .
+endm
+mod EXEC-NATIVE-REMOVAL-WEAK is
+ including EXEC-NATIVE-REMOVAL .
+ rl [wrong-owner] : cfg(foreign,present,pending,none) => cfg(foreign,gone,removed,none) .
+ rl [missing-binding] : cfg(missing,present,pending,none) => cfg(missing,gone,removed,none) .
+ rl [absence-is-proof] : cfg(bound,gone,removed,none) => cfg(bound,gone,removed,proved) .
+ rl [recreate-bound-owner] : cfg(bound,gone,removed,none) => cfg(bound,present,pending,none) .
+endm
+
+--- Controller state is independent of workflow restoration. A transient grant
+--- is consumed once; completion survives loss of the client. Trusted custody
+--- excludes script mutation and rollback of the controller's own storage.
+mod EXEC-NATIVE-AUTHORITY is
+ sorts Durable Grant Workflow Cfg .
+ ops fresh admitted completed : -> Durable [ctor] .
+ ops none execute : -> Grant [ctor] .
+ ops current restored : -> Workflow [ctor] .
+ op cfg : Durable Grant Workflow -> Cfg [ctor] .
+ var D : Durable . var W : Workflow . var G : Grant .
+ rl [commit-admission] : cfg(fresh,none,W) => cfg(admitted,execute,W) .
+ rl [consume-or-lose-grant] : cfg(admitted,execute,W) => cfg(admitted,none,W) .
+ rl [retain-completion] : cfg(admitted,execute,W) => cfg(completed,none,W) .
+ rl [restore-workflow] : cfg(D,G,current) => cfg(D,G,restored) .
+endm
+mod EXEC-NATIVE-AUTHORITY-WEAK is
+ including EXEC-NATIVE-AUTHORITY .
+ var W : Workflow .
+ rl [regrant-admission] : cfg(admitted,none,W) => cfg(admitted,execute,W) .
+ rl [restore-controller-with-workflow] : cfg(admitted,none,current) => cfg(fresh,none,restored) .
+ rl [lose-retained-output] : cfg(completed,none,W) => cfg(admitted,none,W) .
+endm
+
+--- Process-local managed delivery complements durable controller admission.
+--- Only an exact authenticated bound request consumes the slot. The model
+--- abstracts authentication/incarnation checks into the `exact` constructor.
+mod EXEC-NATIVE-MANAGED is
+ sorts Slot Request Result Cfg .
+ ops available consumed : -> Slot [ctor] .
+ ops exact changed stateless : -> Request [ctor] .
+ ops waiting refused executed : -> Result [ctor] .
+ op cfg : Slot Request Result -> Cfg [ctor] .
+ var S : Slot .
+ rl [deliver-once] : cfg(available,exact,waiting) => cfg(consumed,exact,executed) .
+ rl [refuse-repeat] : cfg(consumed,exact,waiting) => cfg(consumed,exact,refused) .
+ rl [refuse-changed] : cfg(S,changed,waiting) => cfg(S,changed,refused) .
+ rl [refuse-stateless] : cfg(S,stateless,waiting) => cfg(S,stateless,refused) .
+endm
+mod EXEC-NATIVE-MANAGED-WEAK is
+ including EXEC-NATIVE-MANAGED .
+ rl [repeat] : cfg(consumed,exact,waiting) => cfg(consumed,exact,executed) .
+ rl [substitute] : cfg(available,changed,waiting) => cfg(consumed,changed,executed) .
+ rl [bypass] : cfg(consumed,stateless,waiting) => cfg(consumed,stateless,executed) .
+endm
+
+--- Control helpers cross a retained daemon/volume boundary. Acceptance also
+--- requires a consistent command acknowledgment; helper launch is not proof.
+mod EXEC-NATIVE-CONTROL is
+ sorts Daemon Volume Reply Phase Cfg .
+ ops original changed : -> Daemon [ctor] .
+ ops owned foreign : -> Volume [ctor] .
+ ops consistent substituted : -> Reply [ctor] .
+ ops waiting dispatched accepted : -> Phase [ctor] .
+ op cfg : Daemon Volume Reply Phase -> Cfg [ctor] .
+ var R : Reply . var V : Volume .
+ rl [dispatch] : cfg(original,owned,R,waiting) => cfg(original,owned,R,dispatched) .
+ rl [accept] : cfg(original,owned,consistent,dispatched) => cfg(original,owned,consistent,accepted) .
+ rl [daemon-change] : cfg(original,V,R,dispatched) => cfg(changed,V,R,dispatched) .
+endm
+mod EXEC-NATIVE-CONTROL-WEAK is
+ including EXEC-NATIVE-CONTROL .
+ var R : Reply .
+ rl [foreign-volume] : cfg(original,foreign,R,waiting) => cfg(original,foreign,R,dispatched) .
+ rl [changed-daemon] : cfg(changed,owned,consistent,dispatched) => cfg(changed,owned,consistent,accepted) .
+ rl [substituted-acknowledgment] : cfg(original,owned,substituted,dispatched) => cfg(original,owned,substituted,accepted) .
+endm
+
+--- Composed creation consumes its transient grant even when lookup is delayed.
+--- Durable ownership survives workflow restore; fence permits late inert binding.
+mod EXEC-NATIVE-CREATION is
+ sorts Grant Target Gate Cfg .
+ ops fresh spent : -> Grant [ctor] .
+ ops missing inflight visible bound : -> Target [ctor] .
+ ops open closed : -> Gate [ctor] .
+ op cfg : Grant Target Gate -> Cfg [ctor] .
+ var T : Target . var G : Gate . var C : Grant .
+ rl [create] : cfg(fresh,missing,open) => cfg(spent,inflight,open) .
+ rl [create-arrives] : cfg(spent,inflight,G) => cfg(spent,visible,G) .
+ rl [create-fails] : cfg(spent,inflight,G) => cfg(spent,missing,G) .
+ rl [bind-original] : cfg(spent,visible,G) => cfg(spent,bound,G) .
+ rl [fence] : cfg(C,T,open) => cfg(C,T,closed) .
+endm
+mod EXEC-NATIVE-CREATION-WEAK is
+ including EXEC-NATIVE-CREATION .
+ var G : Gate .
+ rl [return-consumed-grant] : cfg(spent,missing,G) => cfg(fresh,missing,G) .
+ rl [create-after-fence] : cfg(fresh,missing,closed) => cfg(spent,inflight,closed) .
+endm
+
+--- Startup is not admission. Removal and helper custody drain are separate.
+--- The helper may retain a completion after fencing/removal but before finish.
+mod EXEC-NATIVE-COMPOSED is
+ sorts Gate Receipt Target Custody Phase Cfg .
+ ops open closed : -> Gate [ctor] .
+ ops empty pending completed : -> Receipt [ctor] .
+ ops inert running removed : -> Target [ctor] .
+ ops free held : -> Custody [ctor] .
+ ops idle started ready replied finished : -> Phase [ctor] .
+ op cfg : Gate Receipt Target Custody Phase -> Cfg [ctor] .
+ var G : Gate . var R : Receipt . var T : Target .
+ var C : Custody . var P : Phase .
+ rl [start] : cfg(open,empty,inert,free,idle) => cfg(open,empty,running,free,started) .
+ rl [recheck] : cfg(open,empty,running,free,started) => cfg(open,empty,running,free,ready) .
+ rl [admit] : cfg(open,empty,running,free,ready) => cfg(open,pending,running,held,replied) .
+ rl [fence] : cfg(open,R,T,C,P) => cfg(closed,R,T,C,P) .
+ rl [remove] : cfg(closed,R,T,C,P) => cfg(closed,R,removed,C,P) .
+ rl [complete] : cfg(G,pending,T,held,P) => cfg(G,completed,T,free,P) .
+ rl [lost-transport] : cfg(G,pending,T,held,P) => cfg(G,pending,T,free,P) .
+ rl [finish] : cfg(closed,R,removed,free,P) => cfg(closed,R,removed,free,finished) .
+endm
+mod EXEC-NATIVE-COMPOSED-WEAK is
+ including EXEC-NATIVE-COMPOSED .
+ var R : Receipt . var T : Target . var C : Custody . var P : Phase .
+ rl [late-delivery] : cfg(closed,empty,running,free,ready) => cfg(closed,pending,running,held,replied) .
+ rl [finish-before-drain] : cfg(closed,R,removed,held,P) => cfg(closed,R,removed,held,finished) .
+ rl [finish-before-removal] : cfg(closed,R,running,free,P) => cfg(closed,R,running,free,finished) .
+endm

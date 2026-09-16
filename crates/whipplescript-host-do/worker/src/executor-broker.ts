@@ -12,13 +12,16 @@
 //
 // The scheduler state is in-memory, like the executor's own process-local
 // AdmissionGate: the broker never hibernates while requests are in flight,
-// and an eviction fails those fetches back to their workflow DOs as
-// TransportError terminals — the documented at-least-once posture
-// (DR-0033 Decision 3). There is nothing durable to lose.
+// and an eviction can interrupt a container fetch. The legacy /exec route
+// retains its at-least-once transport posture (DR-0033 Decision 3). The private
+// /exec/invocation route additionally owns durable provider receipts: an
+// interrupted claim stays pending and must never grant another dispatch.
 //
 // This module is imported by node --test files under --experimental-strip-types,
 // so it must stay free of non-erasable TypeScript (no parameter properties,
 // no enums).
+
+import { ExecutorReceipts, type ReceiptReducer } from "./executor-receipts.ts";
 
 /** Priority classes, best first: production(0) > working(1) > counterfactual(2). */
 export const PRIORITY_CLASSES = 3;
@@ -254,8 +257,11 @@ export class WorkspaceBroker {
   private readonly env: BrokerEnv;
   private readonly scheduler: BrokerScheduler;
 
-  constructor(_state: unknown, env: BrokerEnv) {
+  private readonly receipts: ExecutorReceipts;
+
+  constructor(state: DurableObjectState, env: BrokerEnv, reducer: ReceiptReducer) {
     this.env = env;
+    this.receipts = new ExecutorReceipts(state.storage, reducer);
     this.scheduler = new BrokerScheduler(
       executorPoolSize(env.WHIP_EXECUTOR_POOL_SIZE),
       SLOTS_PER_CONTAINER,
@@ -264,9 +270,43 @@ export class WorkspaceBroker {
   }
 
   async fetch(request: Request): Promise<Response> {
+    if (new URL(request.url).pathname === "/exec/reconcile") {
+      return this.receipts.reconcile(request, async (container, placement, operation, headers) => {
+        const pool = this.env.EXECUTOR;
+        const queryHeaders = new Headers(headers);
+        queryHeaders.delete("content-length");
+        return pool.get(pool.idFromName(container)).fetch(new Request(`http://container/exec/controller/${operation.op}`, {
+          method: "POST", headers: queryHeaders, body: JSON.stringify({ placement, ...(operation.fence_id === undefined ? {} : { fence_id: operation.fence_id }) }),
+        }));
+      }, executorInstanceName(0));
+    }
+    if (new URL(request.url).pathname === "/exec/invocation") {
+      return this.receipts.execute(request, (forwarded, place) => this.forward(forwarded, place), async (container, placement, headers) => {
+        const pool = this.env.EXECUTOR;
+        const queryHeaders = new Headers(headers);
+        queryHeaders.delete("content-length");
+        return pool.get(pool.idFromName(container)).fetch(new Request("http://container/exec/controller/read", {
+          method: "POST", headers: queryHeaders, body: JSON.stringify({ placement }),
+        }));
+      });
+    }
+    return this.forward(request);
+  }
+
+  private async forward(request: Request, place?: (container: string) => string): Promise<Response> {
     return handleBrokeredExec(request, this.scheduler, (container, forwarded) => {
       const pool = this.env.EXECUTOR;
-      const stub = pool.get(pool.idFromName(executorInstanceName(container)));
+      const containerId = executorInstanceName(container);
+      const stub = pool.get(pool.idFromName(containerId));
+      if (place) {
+        const placement = JSON.parse(place(containerId)) as { dispatch_id: string };
+        const headers = new Headers(forwarded.headers);
+        headers.set("x-whip-exec-dispatch", placement.dispatch_id);
+        headers.delete("content-length");
+        forwarded = new Request("http://container/exec/controller/deliver", {
+          method: "POST", headers, body: JSON.stringify({ placement }),
+        });
+      }
       return stub.fetch(forwarded);
     });
   }

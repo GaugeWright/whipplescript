@@ -231,6 +231,415 @@ pub struct DoSqliteStore<Sql: DoSql> {
 }
 
 impl<Sql: DoSql> DoSqliteStore<Sql> {
+    fn record_run_policy_block(&self, run: &RunStart<'_>, block: &PolicyBlock) -> StoreResult<()> {
+        let payload = serde_json::json!({
+            "effect_id": run.effect_id,
+            "status": block.status,
+            "reason": block.reason,
+        })
+        .to_string();
+        let legacy_key = format!("policy-block:{}:{}", run.effect_id, run.run_id);
+        let original_rows = self
+            .sql
+            .query(
+                "SELECT payload_json FROM events WHERE instance_id = ?1 AND idempotency_key = ?2",
+                &[text(run.instance_id), text(&legacy_key)],
+            )
+            .map_err(sql_err)?;
+        let original_payload = original_rows.first().map(|row| as_text(&row[0]));
+        let block_key = run_block_event_key(&legacy_key, &payload, original_payload.as_deref());
+        do_append_event_idempotent(
+            &self.sql,
+            NewEvent {
+                instance_id: run.instance_id,
+                event_type: "effect.blocked",
+                payload_json: &payload,
+                source: "kernel",
+                causation_id: Some(run.effect_id),
+                correlation_id: None,
+                idempotency_key: Some(&block_key),
+            },
+        )?;
+        self.sql
+            .execute(
+                "UPDATE effects SET status = ?1, policy_block_reason = ?2, \
+                 updated_at = CURRENT_TIMESTAMP WHERE instance_id = ?3 AND effect_id = ?4 \
+                 AND status IN ('queued', 'blocked', 'blocked_by_admission', 'blocked_by_dependency', 'blocked_by_capacity', 'blocked_by_capability', 'blocked_by_profile')",
+                &[
+                    text(block.status),
+                    text(&block.reason),
+                    text(run.instance_id),
+                    text(run.effect_id),
+                ],
+            )
+            .map_err(sql_err)?;
+        Ok(())
+    }
+
+    fn record_run_capacity_block(&self, run: &RunStart<'_>, reason: &str) -> StoreResult<()> {
+        let payload = serde_json::json!({
+            "effect_id": run.effect_id,
+            "status": "blocked_by_capacity",
+            "reason": reason,
+        })
+        .to_string();
+        // Idempotent: the same (effect, run) can be capacity-blocked again
+        // on a later worker pass after an interleaved unblock — the same
+        // durable statement, not a second event.
+        let legacy_key = format!("capacity-block:{}:{}", run.effect_id, run.run_id);
+        let original_rows = self
+            .sql
+            .query(
+                "SELECT payload_json FROM events WHERE instance_id = ?1 AND idempotency_key = ?2",
+                &[text(run.instance_id), text(&legacy_key)],
+            )
+            .map_err(sql_err)?;
+        let original_payload = original_rows.first().map(|row| as_text(&row[0]));
+        let block_key = run_block_event_key(&legacy_key, &payload, original_payload.as_deref());
+        do_append_event_idempotent(
+            &self.sql,
+            NewEvent {
+                instance_id: run.instance_id,
+                event_type: "effect.blocked",
+                payload_json: &payload,
+                source: "kernel",
+                causation_id: Some(run.effect_id),
+                correlation_id: None,
+                idempotency_key: Some(&block_key),
+            },
+        )?;
+        self.sql
+            .execute(
+                "UPDATE effects SET status = 'blocked_by_capacity', policy_block_reason = ?1, \
+                 updated_at = CURRENT_TIMESTAMP WHERE instance_id = ?2 AND effect_id = ?3 \
+                 AND status IN ('queued', 'blocked', 'blocked_by_admission', 'blocked_by_dependency', 'blocked_by_capacity')",
+                &[text(reason), text(run.instance_id), text(run.effect_id)],
+            )
+            .map_err(sql_err)?;
+        Ok(())
+    }
+
+    fn start_run_with_selection(
+        &self,
+        run: RunStart<'_>,
+        selection: Option<Option<&str>>,
+    ) -> StoreResult<StoredEvent> {
+        recovery::atomic_result(&self.sql, true, &mut || {
+            if let Some(expected) = selection {
+                if self
+                    .effect_attempt_admission(run.instance_id, run.effect_id)?
+                    .as_deref()
+                    != expected
+                {
+                    return Err(StoreError::Conflict(
+                        "execution attempt admission changed".into(),
+                    ));
+                }
+            }
+            match self.start_run_inner(run) {
+                Err(error)
+                    if matches!(
+                        &error,
+                        StoreError::PolicyBlocked { .. } | StoreError::CapacityBlocked { .. }
+                    ) =>
+                {
+                    Ok(Err(error))
+                }
+                outcome => outcome.map(Ok),
+            }
+        })?
+    }
+
+    fn retry_effect_selected(
+        &self,
+        retry: RetryEffect<'_>,
+        terminal: Option<&str>,
+    ) -> StoreResult<StoredEvent> {
+        recovery::atomic_result(&self.sql, true, &mut || {
+            // BEFORE the replay check, as on native: a replayed key is not
+            // evidence that the world still permits the retry.
+            recovery::require_proved_absence(&self.sql, retry.instance_id, retry.effect_id)?;
+            let payload = attempt_admission::retry_payload(retry, terminal);
+            if let Some(key) = retry.idempotency_key {
+                let rows = self.sql.query(
+                    "SELECT event_id, sequence, event_type, payload_json, source, causation_id FROM events WHERE instance_id = ?1 AND idempotency_key = ?2",
+                    &[text(retry.instance_id), text(key)],
+                ).map_err(sql_err)?;
+                if let Some(row) = rows.first() {
+                    if as_text(&row[2]) != "effect.retried"
+                        || as_text(&row[3]) != payload
+                        || as_text(&row[4]) != "kernel"
+                        || as_text(&row[5]) != retry.effect_id
+                    {
+                        return Err(StoreError::Conflict(
+                            "retry idempotency key has a different request".to_owned(),
+                        ));
+                    }
+                    return Ok(StoredEvent {
+                        event_id: as_text(&row[0]),
+                        sequence: as_i64(&row[1]),
+                    });
+                }
+            }
+            if let Some(expected) = terminal {
+                if self
+                    .effect_terminal_event(retry.instance_id, retry.effect_id)?
+                    .as_deref()
+                    != Some(expected)
+                {
+                    return Err(StoreError::Conflict("retry terminal changed".into()));
+                }
+            }
+            let runs = self
+                .sql
+                .query(
+                    whipplescript_store::exec_lifetime::RETRY_RUNS_SQL,
+                    &[text(retry.instance_id), text(retry.effect_id)],
+                )
+                .map_err(sql_err)?
+                .iter()
+                .map(|row| (as_text(&row[0]), as_i64(&row[1]) != 0))
+                .collect::<Vec<_>>();
+            whipplescript_store::exec_lifetime::verify_retry_closure(
+                retry.instance_id,
+                retry.effect_id,
+                &runs,
+                |key| {
+                    let rows = self.sql.query("SELECT event_id, event_type, source, payload_json FROM events WHERE instance_id=?1 AND idempotency_key=?2", &[text(retry.instance_id),text(key)]).map_err(sql_err)?;
+                    Ok(rows.first().map(|row| {
+                        (
+                            as_text(&row[0]),
+                            as_text(&row[1]),
+                            as_text(&row[2]),
+                            as_text(&row[3]),
+                        )
+                    }))
+                },
+            )?;
+            let event = do_append_event(
+                &self.sql,
+                NewEvent {
+                    instance_id: retry.instance_id,
+                    event_type: "effect.retried",
+                    payload_json: &payload,
+                    source: "kernel",
+                    causation_id: Some(retry.effect_id),
+                    correlation_id: None,
+                    idempotency_key: retry.idempotency_key,
+                },
+            )?;
+            let changed = self
+                .sql
+                .execute(
+                    "UPDATE effects SET status = 'queued', updated_at = CURRENT_TIMESTAMP \
+                 WHERE instance_id = ?1 AND effect_id = ?2 AND status IN ('failed', 'timed_out')",
+                    &[text(retry.instance_id), text(retry.effect_id)],
+                )
+                .map_err(sql_err)?;
+            if changed != 1 {
+                return Err(StoreError::Conflict("effect is not retryable".to_owned()));
+            }
+            Ok(event)
+        })
+    }
+
+    fn start_run_inner(&self, run: RunStart<'_>) -> StoreResult<StoredEvent> {
+        // Reattachment retains its existing capacity but rechecks live policy.
+        // Immutable request identity is compared against the original event.
+        let existing = self
+            .sql
+            .query(
+                "SELECT runs.effect_id, runs.instance_id, runs.provider, runs.worker_id, \
+                 runs.status, leases.lease_id, leases.status, effects.status \
+                 FROM runs LEFT JOIN leases ON leases.run_id = runs.run_id \
+                 LEFT JOIN effects ON effects.effect_id = runs.effect_id AND effects.instance_id = runs.instance_id \
+                 WHERE runs.run_id = ?1 LIMIT 1",
+                &[text(run.run_id)],
+            )
+            .map_err(sql_err)?;
+        let reattaching = !existing.is_empty();
+        if let Some(row) = existing.first() {
+            let matches = as_text(&row[0]) == run.effect_id
+                && as_text(&row[1]) == run.instance_id
+                && as_text(&row[2]) == run.provider
+                && as_text(&row[3]) == run.worker_id
+                && as_text(&row[4]) == "running"
+                && as_text(&row[5]) == run.lease_id
+                && as_text(&row[6]) == "active"
+                && as_text(&row[7]) == "running";
+            if !matches {
+                return Err(StoreError::Conflict(
+                    "run id was reused with different active run identity".to_owned(),
+                ));
+            }
+        }
+        // Identity before policy. A continuation whose recorded execution
+        // changed is not this run at all, so there is no run whose live policy
+        // could meaningfully be rechecked -- and diagnosing it as a policy
+        // block would also record an `effect.blocked` event for an attempt
+        // that was never admitted. `recovery::reattach_run` settles identity
+        // and hands back the original receipt; the gates below then still get
+        // to refuse a continuation whose world changed after it started.
+        let reattached = reattaching
+            .then(|| recovery::reattach_run(&self.sql, run))
+            .transpose()?;
+        let status_rows = self
+            .sql
+            .query(
+                "SELECT status FROM instances WHERE instance_id = ?1",
+                &[text(run.instance_id)],
+            )
+            .map_err(sql_err)?;
+        if let Some(row) = status_rows.first() {
+            let status = as_text(&row[0]);
+            if status != "running" {
+                return Err(StoreError::Conflict(format!(
+                    "instance is {status}; provider runs require a running instance"
+                )));
+            }
+        }
+        if let Some(block) = do_policy_block(&self.sql, run.instance_id, run.effect_id)? {
+            self.record_run_policy_block(&run, &block)?;
+            return Err(StoreError::PolicyBlocked {
+                effect_id: run.effect_id.to_owned(),
+                reason: block.reason,
+            });
+        }
+        // Dependency gate: NOT EXISTS an unsatisfied dependency.
+        let claimable_rows = self
+            .sql
+            .query(
+                // The predicate table is `DEPENDENCY_SATISFIED`, not a copy of
+                // it: every other admission clause in this file reads the
+                // shared constant, and an inlined duplicate here is what let a
+                // `fails` edge be satisfied by a timed-out upstream while the
+                // claimable listing and the timer guard both refused it.
+                &format!(
+                    "SELECT NOT EXISTS (SELECT 1 FROM effect_dependencies AS dependency \
+                     JOIN effects AS upstream ON upstream.effect_id = dependency.upstream_effect_id \
+                      AND upstream.instance_id = dependency.instance_id \
+                     WHERE dependency.instance_id = ?1 AND dependency.downstream_effect_id = ?2 \
+                     AND NOT {DEPENDENCY_SATISFIED})"
+                ),
+                &[text(run.instance_id), text(run.effect_id)],
+            )
+            .map_err(sql_err)?;
+        let claimable = claimable_rows
+            .first()
+            .map(|r| as_i64(&r[0]) != 0)
+            .unwrap_or(true);
+        if !claimable {
+            self.sql
+                .execute(
+                    "UPDATE effects SET status = 'blocked_by_dependency', \
+                     updated_at = CURRENT_TIMESTAMP \
+                     WHERE instance_id = ?1 AND effect_id = ?2 AND status = 'queued'",
+                    &[text(run.instance_id), text(run.effect_id)],
+                )
+                .map_err(sql_err)?;
+            return Err(StoreError::Conflict(
+                "effect dependencies are not satisfied".to_owned(),
+            ));
+        }
+        if self.effect_has_open_cancellation_request(run.instance_id, run.effect_id)? {
+            return Err(StoreError::Conflict(
+                "effect cancellation has been requested".to_owned(),
+            ));
+        }
+        let capacity_block = if reattaching {
+            None
+        } else {
+            do_capacity_block(&self.sql, run.instance_id, run.effect_id)?
+        };
+        if let Some(reason) = capacity_block {
+            self.record_run_capacity_block(&run, &reason)?;
+            return Err(StoreError::CapacityBlocked {
+                effect_id: run.effect_id.to_owned(),
+                reason,
+            });
+        }
+
+        // Reattachment identity is `recovery::reattach_run`'s to decide, not a
+        // second implementation of it here: it compares the whole recorded
+        // run-start payload as a value, and it also requires the original to
+        // have come from the kernel. What this path adds is only that the
+        // policy, dependency and cancellation gates above are re-read first --
+        // a block that arrived after the original start refuses the
+        // continuation rather than being waved through by matching ids.
+        if let Some(original) = reattached {
+            return Ok(original);
+        }
+
+        // Fresh attempt only. A reattachment returned above, so what reaches
+        // here is a second dispatch of an effect that may already have acted
+        // on its target -- the hazard this guard names. `start_dispatch` is
+        // stricter still: it refuses a reattachment outright before arriving.
+        recovery::require_proved_absence(&self.sql, run.instance_id, run.effect_id)?;
+
+        let fingerprint = do_execution_fingerprint(&self.sql, run.instance_id, run.effect_id)?;
+        let run_metadata = inject_execution_fingerprint(&run, run.metadata_json, &fingerprint)?;
+        let dispatch = recovery::dispatch_marker(&self.sql, run, &fingerprint)?;
+        let payload = run_start_payload(&run, &run_metadata, &dispatch)?;
+        let event = do_append_event(
+            &self.sql,
+            NewEvent {
+                instance_id: run.instance_id,
+                event_type: "effect.run_started",
+                payload_json: &payload,
+                source: "kernel",
+                causation_id: Some(run.effect_id),
+                correlation_id: None,
+                idempotency_key: Some(run.run_id),
+            },
+        )?;
+        let changed = self
+            .sql
+            .execute(
+                &format!(
+                    "UPDATE effects SET status = 'running', policy_block_reason = NULL, \
+                     policy_block_category = NULL, updated_at = CURRENT_TIMESTAMP \
+                     WHERE instance_id = ?1 AND effect_id = ?2 \
+                     AND status IN {PENDING_EFFECT_STATUSES}"
+                ),
+                &[text(run.instance_id), text(run.effect_id)],
+            )
+            .map_err(sql_err)?;
+        if changed != 1 {
+            return Err(StoreError::Conflict("effect is not claimable".to_owned()));
+        }
+        self.sql
+            .execute(
+                "INSERT INTO runs (run_id, effect_id, instance_id, provider, worker_id, status, \
+                 metadata_json, started_at) VALUES (?1, ?2, ?3, ?4, ?5, 'running', ?6, \
+                 (SELECT occurred_at FROM events WHERE event_id = ?7))",
+                &[
+                    text(run.run_id),
+                    text(run.effect_id),
+                    text(run.instance_id),
+                    text(run.provider),
+                    text(run.worker_id),
+                    text(&run_metadata),
+                    text(&event.event_id),
+                ],
+            )
+            .map_err(sql_err)?;
+        self.sql
+            .execute(
+                "INSERT INTO leases (lease_id, run_id, effect_id, instance_id, worker_id, status, \
+                 expires_at) VALUES (?1, ?2, ?3, ?4, ?5, 'active', ?6)",
+                &[
+                    text(run.lease_id),
+                    text(run.run_id),
+                    text(run.effect_id),
+                    text(run.instance_id),
+                    text(run.worker_id),
+                    text(run.lease_expires_at),
+                ],
+            )
+            .map_err(sql_err)?;
+        Ok(event)
+    }
+
     pub fn new(sql: Sql) -> Self {
         Self {
             sql,
@@ -454,6 +863,13 @@ impl<Sql: DoSql> DoSqliteStore<Sql> {
                   AND json_extract(e.input_json, '$.deadline_at') IS NOT NULL \
                   AND e.status NOT IN ('completed', 'failed', 'timed_out', 'cancelled') \
                   AND {dependency_guard} \
+               UNION ALL \
+               SELECT CAST(strftime('%s', l.expires_at) AS INTEGER) \
+                 FROM leases AS l JOIN runs AS r \
+                   ON r.instance_id = l.instance_id AND r.run_id = l.run_id \
+                WHERE l.instance_id = ?1 AND l.status = 'active' AND r.status = 'running' \
+                  AND json_extract(r.metadata_json, '$.norm_execution_lease') \
+                    = 'whipplescript.norm.execution-lease/v1' \
              )"
         );
         let rows = self
@@ -464,6 +880,183 @@ impl<Sql: DoSql> DoSqliteStore<Sql> {
             .first()
             .and_then(|row| as_opt_i64(&row[0]))
             .map(|epoch_seconds| epoch_seconds * 1000))
+    }
+
+    fn expire_leases_inner(&self, instance_id: &str, now: &str) -> StoreResult<Vec<ExpiredLease>> {
+        let rows = self
+            .sql
+            .query(
+                "SELECT lease_id, run_id, effect_id FROM leases \
+                 WHERE instance_id = ?1 AND status = 'active' AND expires_at <= ?2 \
+                 ORDER BY expires_at, lease_id",
+                &[text(instance_id), text(now)],
+            )
+            .map_err(sql_err)?;
+        let expired: Vec<ExpiredLease> = rows
+            .iter()
+            .map(|r| ExpiredLease {
+                lease_id: as_text(&r[0]),
+                run_id: as_text(&r[1]),
+                effect_id: as_text(&r[2]),
+            })
+            .collect();
+        for lease in &expired {
+            let fence = whipplescript_store::exec_lifetime::Fence {
+                instance_id,
+                run_id: &lease.run_id,
+                reason: whipplescript_store::exec_lifetime::FenceReason::Recovery,
+            };
+            let state = self
+                .sql
+                .query(
+                    whipplescript_store::exec_lifetime::LEASE_EXEC_STATE_SQL,
+                    &[
+                        text(instance_id),
+                        text(&lease.run_id),
+                        text(&fence.tracking_key()),
+                    ],
+                )
+                .map_err(sql_err)?;
+            let execution = as_i64(&state[0][0]) != 0;
+            if as_i64(&state[0][1]) != 0 {
+                self.ensure_exec_fence_inner(fence)?;
+            }
+            let payload = serde_json::json!({
+                "lease_id": lease.lease_id,
+                "run_id": lease.run_id,
+                "effect_id": lease.effect_id,
+                "expired_at": now,
+                "effect_status": "failed",
+            })
+            .to_string();
+            do_append_event(
+                &self.sql,
+                NewEvent {
+                    instance_id,
+                    event_type: if execution {
+                        "exec.lease.expired"
+                    } else {
+                        "lease.expired"
+                    },
+                    payload_json: &payload,
+                    source: "kernel",
+                    causation_id: Some(&lease.run_id),
+                    correlation_id: None,
+                    idempotency_key: Some(&format!("lease-expired:{}", lease.lease_id)),
+                },
+            )?;
+            self.sql
+                .execute(
+                    "UPDATE leases SET status = 'expired', released_at = CURRENT_TIMESTAMP \
+                     WHERE lease_id = ?1",
+                    &[text(&lease.lease_id)],
+                )
+                .map_err(sql_err)?;
+            let held = self
+                .sql
+                .query(
+                    "SELECT status FROM leases WHERE lease_id=?1",
+                    &[text(&lease.lease_id)],
+                )
+                .map_err(sql_err)?;
+            if held.first().map(|r| as_text(&r[0])).as_deref() != Some("expired") {
+                return Err(StoreError::Conflict("lease expiry was not retained".into()));
+            }
+            if execution {
+                continue;
+            }
+            self.sql
+                .execute(
+                    "UPDATE runs SET status = 'lease_expired', completed_at = CURRENT_TIMESTAMP \
+                     WHERE run_id = ?1 AND status = 'running'",
+                    &[text(&lease.run_id)],
+                )
+                .map_err(sql_err)?;
+            self.sql
+                .execute(
+                    // 'failed', not 'queued': an expired lease is a failed attempt.
+                    // Re-queueing here makes the effect claimable again with no
+                    // retry admission, which the native path does not do.
+                    "UPDATE effects SET status = 'failed', updated_at = CURRENT_TIMESTAMP \
+                     WHERE instance_id = ?1 AND effect_id = ?2 AND status = 'running'",
+                    &[text(instance_id), text(&lease.effect_id)],
+                )
+                .map_err(sql_err)?;
+        }
+        Ok(expired)
+    }
+
+    fn ensure_exec_fence_inner(
+        &self,
+        request: whipplescript_store::exec_lifetime::Fence<'_>,
+    ) -> StoreResult<StoredEvent> {
+        request.validate()?;
+        let rows = self.sql.query("SELECT event_id, event_type, source, payload_json FROM events WHERE instance_id = ?1 AND idempotency_key = ?2", &[text(request.instance_id),text(&request.tracking_key())]).map_err(sql_err)?;
+        let tracked = rows
+            .first()
+            .ok_or_else(|| StoreError::Conflict("exec fence tracking record is missing".into()))?;
+        let tracking_event = as_text(&tracked[0]);
+        let payload = request.payload(
+            &tracking_event,
+            &as_text(&tracked[1]),
+            &as_text(&tracked[2]),
+            &as_text(&tracked[3]),
+        )?;
+        let key = request.key();
+        let existing = self.sql.query("SELECT event_id, sequence, event_type, source, payload_json FROM events WHERE instance_id = ?1 AND idempotency_key = ?2", &[text(request.instance_id),text(&key)]).map_err(sql_err)?;
+        if let Some(row) = existing.first() {
+            request.verify_existing(
+                &as_text(&row[2]),
+                &as_text(&row[3]),
+                &as_text(&row[4]),
+                &payload,
+            )?;
+            return Ok(StoredEvent {
+                event_id: as_text(&row[0]),
+                sequence: as_i64(&row[1]),
+            });
+        }
+        do_append_event(
+            &self.sql,
+            NewEvent {
+                instance_id: request.instance_id,
+                event_type: whipplescript_store::exec_lifetime::FENCE_EVENT,
+                payload_json: &payload,
+                source: "kernel",
+                causation_id: Some(&tracking_event),
+                correlation_id: None,
+                idempotency_key: Some(&key),
+            },
+        )
+    }
+
+    fn fence_cancelled_exec(&self, instance: &str, effect: &str, run: &str) -> StoreResult<()> {
+        use whipplescript_store::exec_lifetime::{Fence, FenceReason, CANCELLATION_FOR_RUN_SQL};
+        let request = Fence {
+            instance_id: instance,
+            run_id: run,
+            reason: FenceReason::Cancellation,
+        };
+        let tracked = self
+            .sql
+            .query(
+                "SELECT 1 FROM events WHERE instance_id = ?1 AND idempotency_key = ?2",
+                &[text(instance), text(&request.tracking_key())],
+            )
+            .map_err(sql_err)?;
+        if !tracked.is_empty()
+            && !self
+                .sql
+                .query(
+                    CANCELLATION_FOR_RUN_SQL,
+                    &[text(instance), text(effect), text(run)],
+                )
+                .map_err(sql_err)?
+                .is_empty()
+        {
+            self.ensure_exec_fence_inner(request)?;
+        }
+        Ok(())
     }
 
     /// Records an effect-cancellation request (idempotent replay + open-request
@@ -596,6 +1189,9 @@ impl<Sql: DoSql> DoSqliteStore<Sql> {
         for run_id in &active_run_ids {
             link("run", run_id, "active_run")?;
         }
+        for run_id in &active_run_ids {
+            self.fence_cancelled_exec(request.instance_id, request.effect_id, run_id)?;
+        }
         let recorded = self
             .sql
             .query(
@@ -624,37 +1220,14 @@ impl<Sql: DoSql> DoSqliteStore<Sql> {
         commit: RuleCommit<'_>,
         guard: Option<RuleCommitRevisionGuard<'_>>,
     ) -> StoreResult<StoredEvent> {
-        let status_rows = self
-            .sql
-            .query(
-                "SELECT status FROM instances WHERE instance_id = ?1",
-                &[text(commit.instance_id)],
-            )
-            .map_err(sql_err)?;
-        if let Some(row) = status_rows.first() {
-            let status = as_text(&row[0]);
-            if status != "running" {
-                return Err(StoreError::Conflict(format!(
-                    "instance is {status}; rule commits require a running instance"
-                )));
-            }
-        }
         let (program_version_id, revision_epoch) =
             do_active_revision(&self.sql, commit.instance_id)?;
-        if let Some(guard) = guard {
-            if program_version_id.as_deref() != Some(guard.program_version_id)
-                || revision_epoch != guard.revision_epoch
-            {
-                return Err(StoreError::Conflict(format!(
-                    "active revision changed before rule commit (expected version {} epoch {}, got version {} epoch {})",
-                    guard.program_version_id,
-                    guard.revision_epoch,
-                    program_version_id.as_deref().unwrap_or("<none>"),
-                    revision_epoch
-                )));
-            }
-        }
-        let payload = rule_commit_payload(&commit, program_version_id.as_deref(), revision_epoch)?;
+        // A guarded replay compares its original attribution, not the live
+        // revision. This acknowledges committed history without firing again.
+        let (payload_version, payload_epoch) = guard
+            .map(|pin| (Some(pin.program_version_id), pin.revision_epoch))
+            .unwrap_or((program_version_id.as_deref(), revision_epoch));
+        let payload = rule_commit_payload(&commit, payload_version, payload_epoch)?;
         // Replays are idempotent, collisions are bugs (native commit_rule_inner
         // parity): a re-lowering that reproduces a committed firing
         // byte-for-byte returns the stored commit and touches nothing — before
@@ -672,17 +1245,47 @@ impl<Sql: DoSql> DoSqliteStore<Sql> {
                 )
                 .map_err(sql_err)?;
             if let Some(row) = existing.first() {
-                if as_text(&row[2]) == payload {
-                    return Ok(StoredEvent {
-                        event_id: as_text(&row[0]),
-                        sequence: as_i64(&row[1]),
-                    });
+                if as_text(&row[2]) != payload {
+                    return Err(StoreError::Conflict(format!(
+                        "rule commit idempotency key reused with a DIFFERENT payload \
+                         (rule `{}`, key `{key}`): two distinct firings derived one \
+                         commit key — this is a whip bug, please report it",
+                        commit.rule
+                    )));
                 }
+                return Ok(StoredEvent {
+                    event_id: as_text(&row[0]),
+                    sequence: as_i64(&row[1]),
+                });
+            }
+        }
+        // Only a new firing reaches live admission. Exact replay above changes
+        // neither effects nor their creation-anchored deadlines.
+        let status_rows = self
+            .sql
+            .query(
+                "SELECT status FROM instances WHERE instance_id = ?1",
+                &[text(commit.instance_id)],
+            )
+            .map_err(sql_err)?;
+        if let Some(row) = status_rows.first() {
+            let status = as_text(&row[0]);
+            if status != "running" {
                 return Err(StoreError::Conflict(format!(
-                    "rule commit idempotency key reused with a DIFFERENT payload \
-                     (rule `{}`, key `{key}`): two distinct firings derived one \
-                     commit key — this is a whip bug, please report it",
-                    commit.rule
+                    "instance is {status}; rule commits require a running instance"
+                )));
+            }
+        }
+        if let Some(guard) = guard {
+            if program_version_id.as_deref() != Some(guard.program_version_id)
+                || revision_epoch != guard.revision_epoch
+            {
+                return Err(StoreError::Conflict(format!(
+                    "active revision changed before rule commit (expected version {} epoch {}, got version {} epoch {})",
+                    guard.program_version_id,
+                    guard.revision_epoch,
+                    program_version_id.as_deref().unwrap_or("<none>"),
+                    revision_epoch
                 )));
             }
         }
@@ -843,7 +1446,160 @@ impl<Sql: DoSql> DoSqliteStore<Sql> {
     /// double terminal), release the lease, transition the effect, resolve any
     /// cancellation requests, satisfy newly-unblocked dependencies, and optionally
     /// record a terminal diagnostic. Mirrors `complete_effect_terminal_inner`.
+    fn derive_fact_in_transaction(&self, derived: DerivedFact<'_>) -> StoreResult<StoredEvent> {
+        let payload = serde_json::json!({
+            "fact_id": derived.fact.fact_id,
+            "name": derived.fact.name,
+            "key": derived.fact.key,
+            "value": serde_json::from_str::<Value>(derived.fact.value_json)?,
+            "schema_id": derived.fact.schema_id,
+            "provenance_class": derived.fact.provenance_class,
+            "correlation_id": derived.fact.correlation_id,
+        })
+        .to_string();
+        // Replay-tolerant (native parity): a re-derivation under an existing
+        // idempotency key is a crash-window heal; on replay the fact row is
+        // inserted only if missing entirely, never revived from consumed.
+        let mut replayed = false;
+        let event = match derived.idempotency_key {
+            Some(key) => {
+                let existing = self
+                    .sql
+                    .query(
+                        "SELECT event_id, sequence FROM events \
+                         WHERE instance_id = ?1 AND idempotency_key = ?2",
+                        &[text(derived.instance_id), text(key)],
+                    )
+                    .map_err(sql_err)?;
+                match existing.first() {
+                    Some(row) => {
+                        replayed = true;
+                        StoredEvent {
+                            event_id: as_text(&row[0]),
+                            sequence: as_i64(&row[1]),
+                        }
+                    }
+                    None => do_append_event(
+                        &self.sql,
+                        NewEvent {
+                            instance_id: derived.instance_id,
+                            event_type: "fact.derived",
+                            payload_json: &payload,
+                            source: derived.source,
+                            causation_id: derived.causation_id,
+                            correlation_id: derived.fact.correlation_id,
+                            idempotency_key: derived.idempotency_key,
+                        },
+                    )?,
+                }
+            }
+            None => do_append_event(
+                &self.sql,
+                NewEvent {
+                    instance_id: derived.instance_id,
+                    event_type: "fact.derived",
+                    payload_json: &payload,
+                    source: derived.source,
+                    causation_id: derived.causation_id,
+                    correlation_id: derived.fact.correlation_id,
+                    idempotency_key: derived.idempotency_key,
+                },
+            )?,
+        };
+        let fact_row_exists = replayed
+            && !self
+                .sql
+                .query(
+                    "SELECT 1 FROM facts WHERE instance_id = ?1 AND name = ?2 AND key = ?3",
+                    &[
+                        text(derived.instance_id),
+                        text(derived.fact.name),
+                        text(derived.fact.key),
+                    ],
+                )
+                .map_err(sql_err)?
+                .is_empty();
+        if !fact_row_exists {
+            let (program_version_id, revision_epoch) =
+                do_active_revision(&self.sql, derived.instance_id)?;
+            do_insert_fact(
+                &self.sql,
+                derived.instance_id,
+                derived.source,
+                &event.event_id,
+                program_version_id.as_deref(),
+                revision_epoch,
+                &derived.fact,
+            )?;
+        }
+        Ok(event)
+    }
+
+    fn verify_retained_exec_settlement(
+        &self,
+        completion: EffectCompletion<'_>,
+        run_status: &str,
+        facts: &[whipplescript_store::SettlementFact<'_>],
+        cache: Option<whipplescript_store::SettlementCache<'_>>,
+    ) -> StoreResult<String> {
+        let retained = self.sql.query("SELECT event_type, source, payload_json FROM events WHERE instance_id = ?1 AND idempotency_key = ?2", &[text(completion.instance_id), text(&exec_settlement::retention_key(completion.run_id))]).map_err(sql_err)?;
+        if let Some(row) = retained.first() {
+            let input = self
+                .sql
+                .query(
+                    "SELECT input_json FROM effects WHERE instance_id = ?1 AND effect_id = ?2",
+                    &[text(completion.instance_id), text(completion.effect_id)],
+                )
+                .map_err(sql_err)?;
+            let input = input
+                .first()
+                .ok_or_else(|| StoreError::Conflict("exec projection effect is missing".into()))?;
+            exec_settlement::verify_settlement(
+                &as_text(&row[0]),
+                &as_text(&row[1]),
+                &as_text(&row[2]),
+                &as_text(&input[0]),
+                completion,
+                facts,
+                cache,
+            )?;
+        }
+        whipplescript_store::exec_outcome::projection_run_status(
+            completion,
+            run_status,
+            cache.is_some(),
+            |key| {
+                let rows=self.sql.query("SELECT event_id,event_type,source,payload_json FROM events WHERE instance_id=?1 AND idempotency_key=?2", &[text(completion.instance_id),text(key)]).map_err(sql_err)?;
+                Ok(rows.first().map(|r| {
+                    (
+                        as_text(&r[0]),
+                        as_text(&r[1]),
+                        as_text(&r[2]),
+                        as_text(&r[3]),
+                    )
+                }))
+            },
+        )
+    }
+
     fn complete_effect_terminal_inner(
+        &self,
+        completion: EffectCompletion<'_>,
+        diagnostic: Option<TerminalDiagnosticRecord>,
+        run_status: &str,
+    ) -> StoreResult<StoredEvent> {
+        recovery::atomic_result(&self.sql, true, &mut || {
+            let run_status =
+                self.verify_retained_exec_settlement(completion, run_status, &[], None)?;
+            self.complete_effect_terminal_in_transaction(
+                completion,
+                diagnostic.clone(),
+                &run_status,
+            )
+        })
+    }
+
+    fn complete_effect_terminal_in_transaction(
         &self,
         completion: EffectCompletion<'_>,
         diagnostic: Option<TerminalDiagnosticRecord>,
@@ -1405,6 +2161,26 @@ fn skill_to_json(skill: &SkillView) -> StoreResult<Value> {
         "description": skill.description,
         "required_capabilities": required_capabilities,
     }))
+}
+
+/// Validate the synchronous transaction bridge after its callback returns.
+/// Kept portable so absent callbacks and host commit failures are exercised by
+/// native tests as well as the actual WASM bridge.
+pub fn validate_transaction_completion(
+    callback_ran: bool,
+    bridge_result: Result<(), String>,
+) -> StoreResult<()> {
+    if let Err(error) = bridge_result {
+        return Err(StoreError::Conflict(format!(
+            "DO transaction failed: {error}"
+        )));
+    }
+    if !callback_ran {
+        return Err(StoreError::Conflict(
+            "DO transaction did not execute its callback".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Decode the DO SQL bridge's JSON result rows.
@@ -2751,6 +3527,29 @@ fn do_replay_effect_cancelled<Sql: DoSql>(
     Ok(())
 }
 
+fn do_replay_effect_retried<Sql: DoSql>(
+    sql: &Sql,
+    instance_id: &str,
+    event_id: &str,
+    payload_json: &str,
+) -> StoreResult<()> {
+    let payload: Value = serde_json::from_str(payload_json)?;
+    let effect_id = payload
+        .get("effect_id")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let changed = sql.execute(
+        "UPDATE effects SET status = 'queued', updated_at = (SELECT occurred_at FROM events WHERE event_id = ?3) WHERE instance_id = ?1 AND effect_id = ?2 AND status IN ('failed', 'timed_out')",
+        &[text(instance_id), text(effect_id), text(event_id)],
+    ).map_err(sql_err)?;
+    if changed != 1 {
+        return Err(StoreError::Conflict(
+            "replayed retry has no retryable effect".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 fn do_replay_lease_expired<Sql: DoSql>(
     sql: &Sql,
     instance_id: &str,
@@ -2775,6 +3574,20 @@ fn do_replay_lease_expired<Sql: DoSql>(
         &[text(lease_id)],
     )
     .map_err(sql_err)?;
+    let fence = whipplescript_store::exec_lifetime::Fence {
+        instance_id,
+        run_id,
+        reason: whipplescript_store::exec_lifetime::FenceReason::Recovery,
+    };
+    let state = sql
+        .query(
+            whipplescript_store::exec_lifetime::LEASE_EXEC_STATE_SQL,
+            &[text(instance_id), text(run_id), text(&fence.tracking_key())],
+        )
+        .map_err(sql_err)?;
+    if as_i64(&state[0][0]) != 0 {
+        return Ok(());
+    }
     sql.execute(
         "UPDATE runs SET status = 'lease_expired', completed_at = (SELECT occurred_at FROM events WHERE event_id = ?2) \
          WHERE run_id = ?1 AND status = 'running'",
@@ -3590,9 +4403,11 @@ fn do_policy_block<Sql: DoSql>(
     // A persisted policy block is re-evaluated here every pass — that is what
     // makes it RECOVERABLE once the missing profile/capability is registered
     // (parity with native `policy_block_on`).
+    // Active-run reattachment rechecks current policy before redispatch.
     if !matches!(
         effect.status.as_str(),
         "queued"
+            | "running"
             | "blocked_by_dependency"
             | "blocked_by_capacity"
             | "blocked_by_capability"
@@ -3768,6 +4583,16 @@ impl<Sql: DoSql> DoSqliteStore<Sql> {
         instance_id: &str,
         up_to_sequence: Option<i64>,
     ) -> StoreResult<()> {
+        recovery::atomic_result(&self.sql, true, &mut || {
+            self.rebuild_projections_inner(instance_id, up_to_sequence)
+        })
+    }
+
+    fn rebuild_projections_inner(
+        &self,
+        instance_id: &str,
+        up_to_sequence: Option<i64>,
+    ) -> StoreResult<()> {
         // Detach artifacts from the runs we're about to delete, then re-link the
         // surviving ones after replay.
         let artifact_rows = self
@@ -3842,8 +4667,8 @@ impl<Sql: DoSql> DoSqliteStore<Sql> {
                      'instance.created', 'rule.committed', 'fact.derived', 'workflow.completed', \
                      'workflow.failed', \
                      'instance.transitioned', 'workflow.revision_activated', 'effect.run_started', \
-                     'effect.terminal', 'effect.cancelled', 'effect.cancellation_requested', \
-                     'lease.expired', 'tracker.filing.result_delivered', 'tracker.closing.result_delivered', 'tracker.control.result_delivered', 'context.restored'){bound_clause} ORDER BY sequence"
+                     'effect.terminal', 'effect.retried', 'effect.cancelled', 'effect.cancellation_requested', \
+                     'lease.expired', 'exec.lease.expired', 'tracker.filing.result_delivered', 'tracker.closing.result_delivered', 'tracker.control.result_delivered', 'context.restored'){bound_clause} ORDER BY sequence"
                 ),
                 &[text(instance_id)],
             )
@@ -3981,7 +4806,10 @@ impl<Sql: DoSql> DoSqliteStore<Sql> {
                     idempotency_key.as_deref(),
                     causation_id.as_deref(),
                 )?,
-                "lease.expired" => {
+                "effect.retried" => {
+                    do_replay_effect_retried(&self.sql, instance_id, &event_id, &payload_json)?
+                }
+                "lease.expired" | "exec.lease.expired" => {
                     do_replay_lease_expired(&self.sql, instance_id, &event_id, &payload_json)?
                 }
                 _ => {}
@@ -4252,6 +5080,35 @@ fn do_insert_program_version<Sql: DoSql>(
         .first()
         .map(|r| as_text(&r[0]))
         .ok_or_else(|| sql_err("program_version row missing after insert".to_string()))
+}
+
+impl<Sql: DoSql> whipplescript_store::norm_commands::NormCommandStore for DoSqliteStore<Sql> {
+    fn norm_state(
+        &self,
+        verifier: &dyn whipplescript_store::norm::NormVerifier,
+    ) -> StoreResult<whipplescript_store::norm::NormView> {
+        self.norm_view(verifier)
+    }
+    fn local_norm_aliases(&self) -> StoreResult<std::collections::BTreeMap<String, String>> {
+        self.norm_aliases()
+    }
+    fn tracker_history(&self) -> StoreResult<Vec<whipplescript_store::items::TrackerEvent>> {
+        self.export_events()
+    }
+    fn append_norm(
+        &mut self,
+        event: &whipplescript_store::norm::SignedNormEvent,
+        verifier: &dyn whipplescript_store::norm::NormVerifier,
+    ) -> StoreResult<String> {
+        self.append_norm_event(event, verifier)
+    }
+    fn import_norm(
+        &mut self,
+        events: &[whipplescript_store::items::TrackerEvent],
+        verifier: &dyn whipplescript_store::norm::NormVerifier,
+    ) -> StoreResult<usize> {
+        self.import_norm_events(events, verifier)
+    }
 }
 
 impl<Sql: DoSql> DoSqliteStore<Sql> {
@@ -4923,23 +5780,25 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
         &mut self,
         request: EffectCancellationRequest<'_>,
     ) -> StoreResult<EffectCancellationRequestView> {
-        let status_rows = self
-            .sql
-            .query(
-                "SELECT status FROM effects WHERE instance_id = ?1 AND effect_id = ?2",
-                &[text(request.instance_id), text(request.effect_id)],
-            )
-            .map_err(sql_err)?;
-        let status = status_rows
-            .first()
-            .map(|r| as_text(&r[0]))
-            .ok_or_else(|| StoreError::Conflict("effect does not exist".to_owned()))?;
-        if status != "running" {
-            return Err(StoreError::Conflict(format!(
-                "effect is {status}; cancellation requests require running work"
-            )));
-        }
-        self.insert_effect_cancellation_request(request)
+        recovery::atomic_result(&self.sql, true, &mut || {
+            let status_rows = self
+                .sql
+                .query(
+                    "SELECT status FROM effects WHERE instance_id = ?1 AND effect_id = ?2",
+                    &[text(request.instance_id), text(request.effect_id)],
+                )
+                .map_err(sql_err)?;
+            let status = status_rows
+                .first()
+                .map(|r| as_text(&r[0]))
+                .ok_or_else(|| StoreError::Conflict("effect does not exist".to_owned()))?;
+            if status != "running" {
+                return Err(StoreError::Conflict(format!(
+                    "effect is {status}; cancellation requests require running work"
+                )));
+            }
+            self.insert_effect_cancellation_request(request)
+        })
     }
 
     fn effect_has_open_cancellation_request(
@@ -5086,7 +5945,9 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
     }
 
     fn commit_rule(&mut self, commit: RuleCommit<'_>) -> StoreResult<StoredEvent> {
-        self.commit_rule_inner(commit, None)
+        recovery::atomic_result(&self.sql, true, &mut || {
+            self.commit_rule_inner(commit, None)
+        })
     }
 
     fn commit_rule_with_revision_guard(
@@ -5094,96 +5955,15 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
         commit: RuleCommit<'_>,
         guard: RuleCommitRevisionGuard<'_>,
     ) -> StoreResult<StoredEvent> {
-        self.commit_rule_inner(commit, Some(guard))
+        recovery::atomic_result(&self.sql, true, &mut || {
+            self.commit_rule_inner(commit, Some(guard))
+        })
     }
 
     fn derive_fact(&mut self, derived: DerivedFact<'_>) -> StoreResult<StoredEvent> {
-        let payload = serde_json::json!({
-            "fact_id": derived.fact.fact_id,
-            "name": derived.fact.name,
-            "key": derived.fact.key,
-            "value": serde_json::from_str::<Value>(derived.fact.value_json)?,
-            "schema_id": derived.fact.schema_id,
-            "provenance_class": derived.fact.provenance_class,
-            "correlation_id": derived.fact.correlation_id,
+        recovery::atomic_result(&self.sql, true, &mut || {
+            self.derive_fact_in_transaction(derived)
         })
-        .to_string();
-        // Replay-tolerant (native parity): a re-derivation under an existing
-        // idempotency key is a crash-window heal; on replay the fact row is
-        // inserted only if missing entirely, never revived from consumed.
-        let mut replayed = false;
-        let event = match derived.idempotency_key {
-            Some(key) => {
-                let existing = self
-                    .sql
-                    .query(
-                        "SELECT event_id, sequence FROM events \
-                         WHERE instance_id = ?1 AND idempotency_key = ?2",
-                        &[text(derived.instance_id), text(key)],
-                    )
-                    .map_err(sql_err)?;
-                match existing.first() {
-                    Some(row) => {
-                        replayed = true;
-                        StoredEvent {
-                            event_id: as_text(&row[0]),
-                            sequence: as_i64(&row[1]),
-                        }
-                    }
-                    None => do_append_event(
-                        &self.sql,
-                        NewEvent {
-                            instance_id: derived.instance_id,
-                            event_type: "fact.derived",
-                            payload_json: &payload,
-                            source: derived.source,
-                            causation_id: derived.causation_id,
-                            correlation_id: derived.fact.correlation_id,
-                            idempotency_key: derived.idempotency_key,
-                        },
-                    )?,
-                }
-            }
-            None => do_append_event(
-                &self.sql,
-                NewEvent {
-                    instance_id: derived.instance_id,
-                    event_type: "fact.derived",
-                    payload_json: &payload,
-                    source: derived.source,
-                    causation_id: derived.causation_id,
-                    correlation_id: derived.fact.correlation_id,
-                    idempotency_key: derived.idempotency_key,
-                },
-            )?,
-        };
-        let fact_row_exists = replayed
-            && !self
-                .sql
-                .query(
-                    "SELECT 1 FROM facts WHERE instance_id = ?1 AND name = ?2 AND key = ?3",
-                    &[
-                        text(derived.instance_id),
-                        text(derived.fact.name),
-                        text(derived.fact.key),
-                    ],
-                )
-                .map_err(sql_err)?
-                .is_empty();
-        if !fact_row_exists {
-            let (program_version_id, revision_epoch) =
-                do_active_revision(&self.sql, derived.instance_id)?;
-            do_insert_fact(
-                &self.sql,
-                derived.instance_id,
-                derived.source,
-                &event.event_id,
-                program_version_id.as_deref(),
-                revision_epoch,
-                &derived.fact,
-            )?;
-        }
-        Ok(event)
     }
 
     fn admit_fact_batch(&mut self, batch: FactBatch<'_>) -> StoreResult<FactBatchOutcome> {
@@ -5272,6 +6052,319 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
         Ok(FactBatchOutcome { admitted, skipped })
     }
 
+    fn retain_exec_outcome(
+        &mut self,
+        observation: whipplescript_store::exec_outcome::Retention<'_>,
+    ) -> StoreResult<StoredEvent> {
+        use whipplescript_store::exec_lifetime::Journal;
+        recovery::atomic_result(&self.sql, true, &mut || {
+            let read = |key: &str| -> StoreResult<Option<(String, String, String, String)>> {
+                let rows=self.sql.query("SELECT event_id,event_type,source,payload_json FROM events WHERE instance_id=?1 AND idempotency_key=?2", &[text(observation.instance_id),text(key)]).map_err(sql_err)?;
+                Ok(rows.first().map(|r| {
+                    (
+                        as_text(&r[0]),
+                        as_text(&r[1]),
+                        as_text(&r[2]),
+                        as_text(&r[3]),
+                    )
+                }))
+            };
+            let request = whipplescript_store::exec_lifetime::Fence {
+                instance_id: observation.instance_id,
+                run_id: observation.run_id,
+                reason: whipplescript_store::exec_lifetime::FenceReason::Recovery,
+            };
+            let tracking = read(&request.tracking_key())?
+                .ok_or_else(|| StoreError::Conflict("exec outcome tracking is missing".into()))?;
+            let fence = read(&request.key())?
+                .ok_or_else(|| StoreError::Conflict("exec outcome fence is missing".into()))?;
+            let proof = if observation.needs_proof()? {
+                read(&observation.proof_key())?
+            } else {
+                None
+            };
+            let payload = observation.payload(
+                Journal {
+                    event_id: &tracking.0,
+                    kind: &tracking.1,
+                    source: &tracking.2,
+                    payload: &tracking.3,
+                },
+                Journal {
+                    event_id: &fence.0,
+                    kind: &fence.1,
+                    source: &fence.2,
+                    payload: &fence.3,
+                },
+                proof.as_ref().map(|p| Journal {
+                    event_id: &p.0,
+                    kind: &p.1,
+                    source: &p.2,
+                    payload: &p.3,
+                }),
+            )?;
+            let key = observation.key();
+            let existing=self.sql.query("SELECT event_id,sequence,event_type,source,payload_json FROM events WHERE instance_id=?1 AND idempotency_key=?2", &[text(observation.instance_id),text(&key)]).map_err(sql_err)?;
+            if let Some(row) = existing.first() {
+                observation.verify_replay(
+                    &as_text(&row[2]),
+                    &as_text(&row[3]),
+                    &as_text(&row[4]),
+                    &payload,
+                )?;
+                return Ok(StoredEvent {
+                    event_id: as_text(&row[0]),
+                    sequence: as_i64(&row[1]),
+                });
+            }
+            do_append_event(
+                &self.sql,
+                NewEvent {
+                    instance_id: observation.instance_id,
+                    event_type: whipplescript_store::exec_outcome::EVENT_TYPE,
+                    payload_json: &payload,
+                    source: "kernel",
+                    causation_id: Some(&fence.0),
+                    correlation_id: None,
+                    idempotency_key: Some(&key),
+                },
+            )
+        })
+    }
+    fn retain_exec_fence_proof(
+        &mut self,
+        proof: whipplescript_store::exec_lifetime::Proof<'_>,
+    ) -> StoreResult<StoredEvent> {
+        use whipplescript_store::exec_lifetime::{Fence, FenceReason, Journal, PROOF_EVENT};
+        recovery::atomic_result(&self.sql, true, &mut || {
+            let read = |key: &str| -> StoreResult<Vec<SqlValue>> {
+                self.sql.query("SELECT event_id,event_type,source,payload_json FROM events WHERE instance_id=?1 AND idempotency_key=?2",&[text(proof.instance_id),text(key)]).map_err(sql_err)?.into_iter().next().ok_or_else(||StoreError::Conflict("exec closure journal reference is missing".into()))
+            };
+            let request = Fence {
+                instance_id: proof.instance_id,
+                run_id: proof.run_id,
+                reason: FenceReason::Recovery,
+            };
+            let tracking = read(&request.tracking_key())?;
+            let fence = read(&request.key())?;
+            let payload = proof.payload(
+                Journal {
+                    event_id: &as_text(&tracking[0]),
+                    kind: &as_text(&tracking[1]),
+                    source: &as_text(&tracking[2]),
+                    payload: &as_text(&tracking[3]),
+                },
+                Journal {
+                    event_id: &as_text(&fence[0]),
+                    kind: &as_text(&fence[1]),
+                    source: &as_text(&fence[2]),
+                    payload: &as_text(&fence[3]),
+                },
+            )?;
+            let key = proof.key();
+            let existing=self.sql.query("SELECT event_id,sequence,event_type,source,payload_json FROM events WHERE instance_id=?1 AND idempotency_key=?2",&[text(proof.instance_id),text(&key)]).map_err(sql_err)?;
+            if let Some(row) = existing.first() {
+                proof.verify_replay(
+                    &as_text(&row[2]),
+                    &as_text(&row[3]),
+                    &as_text(&row[4]),
+                    &payload,
+                )?;
+                return Ok(StoredEvent {
+                    event_id: as_text(&row[0]),
+                    sequence: as_i64(&row[1]),
+                });
+            }
+            do_append_event(
+                &self.sql,
+                NewEvent {
+                    instance_id: proof.instance_id,
+                    event_type: PROOF_EVENT,
+                    payload_json: &payload,
+                    source: "kernel",
+                    causation_id: Some(&as_text(&fence[0])),
+                    correlation_id: None,
+                    idempotency_key: Some(&key),
+                },
+            )
+        })
+    }
+    fn ensure_exec_fence(
+        &mut self,
+        request: whipplescript_store::exec_lifetime::Fence<'_>,
+    ) -> StoreResult<StoredEvent> {
+        recovery::atomic_result(&self.sql, true, &mut || {
+            self.ensure_exec_fence_inner(request)
+        })
+    }
+    fn track_exec_lifetime(
+        &mut self,
+        track: whipplescript_store::exec_lifetime::Track<'_>,
+    ) -> StoreResult<StoredEvent> {
+        let payload = track.payload()?;
+        let key = track.key();
+        recovery::atomic_result(&self.sql, true, &mut || {
+            let existing = self.sql.query("SELECT event_type, source, payload_json, event_id, sequence FROM events WHERE instance_id = ?1 AND idempotency_key = ?2", &[text(track.instance_id), text(&key)]).map_err(sql_err)?;
+            if let Some(row) = existing.first() {
+                track.verify_replay(
+                    &as_text(&row[0]),
+                    &as_text(&row[1]),
+                    &as_text(&row[2]),
+                    &payload,
+                )?;
+                self.fence_cancelled_exec(track.instance_id, track.effect_id, track.run_id)?;
+                return Ok(StoredEvent {
+                    event_id: as_text(&row[3]),
+                    sequence: as_i64(&row[4]),
+                });
+            }
+            let rows = self.sql.query("SELECT effects.input_json, runs.metadata_json FROM runs JOIN effects ON effects.instance_id = runs.instance_id AND effects.effect_id = runs.effect_id WHERE runs.instance_id = ?1 AND runs.effect_id = ?2 AND runs.run_id = ?3 AND runs.provider = 'exec' AND runs.worker_id = 'whip-exec' AND runs.status = 'running' AND effects.status = 'running' AND effects.kind = 'exec.command'", &[text(track.instance_id), text(track.effect_id), text(track.run_id)]).map_err(sql_err)?;
+            let row = rows.first().ok_or_else(|| {
+                StoreError::Conflict(
+                    "exec lifetime tracking requires its running invocation".into(),
+                )
+            })?;
+            track.verify_binding(&as_text(&row[0]), &as_text(&row[1]))?;
+            let event = do_append_event(
+                &self.sql,
+                NewEvent {
+                    instance_id: track.instance_id,
+                    event_type: whipplescript_store::exec_lifetime::EVENT_TYPE,
+                    payload_json: &payload,
+                    source: "kernel",
+                    causation_id: Some(track.run_id),
+                    correlation_id: None,
+                    idempotency_key: Some(&key),
+                },
+            )?;
+            self.fence_cancelled_exec(track.instance_id, track.effect_id, track.run_id)?;
+            Ok(event)
+        })
+    }
+    fn schedule_exec_reconciliation(
+        &mut self,
+        schedule: whipplescript_store::exec_reconciliation::Schedule<'_>,
+    ) -> StoreResult<StoredEvent> {
+        let payload = schedule.payload()?;
+        let key = schedule.key();
+        recovery::atomic_result(&self.sql, true, &mut || {
+            let existing = self.sql.query("SELECT event_type, source, payload_json, event_id, sequence FROM events WHERE instance_id = ?1 AND idempotency_key = ?2", &[text(schedule.instance_id), text(&key)]).map_err(sql_err)?;
+            if let Some(row) = existing.first() {
+                schedule.verify_replay(
+                    &as_text(&row[0]),
+                    &as_text(&row[1]),
+                    &as_text(&row[2]),
+                    &payload,
+                )?;
+                return Ok(StoredEvent {
+                    event_id: as_text(&row[3]),
+                    sequence: as_i64(&row[4]),
+                });
+            }
+            let rows = self.sql.query("SELECT effects.input_json, runs.metadata_json FROM runs JOIN effects ON effects.instance_id = runs.instance_id AND effects.effect_id = runs.effect_id WHERE runs.instance_id = ?1 AND runs.effect_id = ?2 AND runs.run_id = ?3 AND runs.provider = 'exec' AND runs.worker_id = 'whip-exec' AND runs.status = 'running' AND effects.status = 'running' AND effects.kind = 'exec.command'", &[text(schedule.instance_id), text(schedule.effect_id), text(schedule.run_id)]).map_err(sql_err)?;
+            let row = rows.first().ok_or_else(|| {
+                StoreError::Conflict("exec reconciliation requires its running invocation".into())
+            })?;
+            schedule.verify_binding(&as_text(&row[0]), &as_text(&row[1]))?;
+            do_append_event(
+                &self.sql,
+                NewEvent {
+                    instance_id: schedule.instance_id,
+                    event_type: whipplescript_store::exec_reconciliation::EVENT_TYPE,
+                    payload_json: &payload,
+                    source: "kernel",
+                    causation_id: Some(schedule.run_id),
+                    correlation_id: None,
+                    idempotency_key: Some(&key),
+                },
+            )
+        })
+    }
+    fn retain_exec_settlement(
+        &mut self,
+        request: whipplescript_store::exec_settlement::Retention<'_>,
+    ) -> StoreResult<StoredEvent> {
+        let payload = request.payload()?;
+        let key = request.key();
+        recovery::atomic_result(&self.sql, true, &mut || {
+            let existing = self.sql.query("SELECT event_type, payload_json, event_id, sequence, source FROM events WHERE instance_id = ?1 AND idempotency_key = ?2", &[text(request.instance_id), text(&key)]).map_err(sql_err)?;
+            if let Some(row) = existing.first() {
+                exec_settlement::verify_replay(
+                    &as_text(&row[0]),
+                    &as_text(&row[4]),
+                    &as_text(&row[1]),
+                    &payload,
+                )?;
+                return Ok(StoredEvent {
+                    event_id: as_text(&row[2]),
+                    sequence: as_i64(&row[3]),
+                });
+            }
+            let rows = self.sql.query("SELECT effects.input_json FROM runs JOIN effects ON effects.instance_id = runs.instance_id AND effects.effect_id = runs.effect_id WHERE runs.instance_id = ?1 AND runs.effect_id = ?2 AND runs.run_id = ?3 AND runs.provider = 'exec' AND runs.worker_id = 'whip-exec' AND runs.status = 'running' AND effects.status = 'running' AND effects.kind = 'exec.command'", &[text(request.instance_id), text(request.effect_id), text(request.run_id)]).map_err(sql_err)?;
+            let row = rows.first().ok_or_else(|| {
+                StoreError::Conflict("exec settlement requires its running invocation".into())
+            })?;
+            request.verify_input(&as_text(&row[0]))?;
+            do_append_event(
+                &self.sql,
+                NewEvent {
+                    instance_id: request.instance_id,
+                    event_type: exec_settlement::EVENT_TYPE,
+                    payload_json: &payload,
+                    source: "kernel",
+                    causation_id: Some(request.run_id),
+                    correlation_id: None,
+                    idempotency_key: Some(&key),
+                },
+            )
+        })
+    }
+    fn complete_effect_settlement(
+        &mut self,
+        completion: EffectCompletion<'_>,
+        diagnostic: Option<TerminalDiagnosticRecord>,
+        facts: &[whipplescript_store::SettlementFact<'_>],
+        cache: Option<whipplescript_store::SettlementCache<'_>>,
+    ) -> StoreResult<StoredEvent> {
+        recovery::atomic_result(&self.sql, true, &mut || {
+            let run_status =
+                self.verify_retained_exec_settlement(completion, completion.status, facts, cache)?;
+            let event = self.complete_effect_terminal_in_transaction(
+                completion,
+                diagnostic.clone(),
+                &run_status,
+            )?;
+            if let Some(cache) = cache {
+                self.record_compute_result(ComputeResultRegistration {
+                    content_key: cache.content_key,
+                    result_json: cache.result_json,
+                    effect_kind: "exec.command",
+                    source_instance_id: completion.instance_id,
+                    source_effect_id: completion.effect_id,
+                })?;
+            }
+            for projection in facts {
+                self.derive_fact_in_transaction(DerivedFact {
+                    instance_id: completion.instance_id,
+                    fact: projection.fact,
+                    source: "kernel",
+                    causation_id: Some(&event.event_id),
+                    idempotency_key: Some(projection.idempotency_key),
+                })?;
+                let rows = self.sql.query(
+                    "SELECT value_json FROM facts WHERE instance_id=?1 AND name=?2 AND key=?3 AND consumed_at IS NULL",
+                    &[text(completion.instance_id), text(projection.fact.name), text(projection.fact.key)],
+                ).map_err(sql_err)?;
+                // Existing active facts collapse by name/key across attempts.
+                if rows.is_empty() {
+                    return Err(StoreError::Conflict(
+                        "exec settlement fact was not projected".into(),
+                    ));
+                }
+            }
+            Ok(event)
+        })
+    }
     fn settle_file_effect(
         &mut self,
         completion: EffectCompletion<'_>,
@@ -5375,6 +6468,7 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
         // RC-4b on the effects plane: orphaned-segment PENDING effects are
         // never handed to the worker after a restore (parity with native).
         let live = do_live_event_ids(&self.sql, instance_id)?;
+        let admissions = attempt_admission::selections(&self.list_events(instance_id)?)?;
         let mut claimable = Vec::new();
         for row in &rows {
             if let (Some(live), Some(event_id)) = (&live, as_opt_text(&row[7])) {
@@ -5383,6 +6477,7 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
                 }
             }
             let effect = ClaimableEffect {
+                attempt_admission_event_id: admissions.get(&as_text(&row[0])).cloned(),
                 effect_id: as_text(&row[0]),
                 kind: as_text(&row[1]),
                 target: as_opt_text(&row[2]),
@@ -6825,7 +7920,17 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
     }
 
     fn start_run(&mut self, run: RunStart<'_>) -> StoreResult<StoredEvent> {
-        recovery::atomic_result(&self.sql, true, &mut || self.start_run_on(run))
+        self.start_run_with_selection(run, None)
+    }
+
+    fn start_run_for_admission(
+        &mut self,
+        run: RunStart<'_>,
+        admission: Option<&str>,
+    ) -> StoreResult<StoredEvent> {
+        // `start_run_with_selection` already takes the atomic boundary and
+        // verifies the admission inside it.
+        self.start_run_with_selection(run, Some(admission))
     }
 
     fn start_dispatch(&mut self, run: RunStart<'_>) -> StoreResult<StoredEvent> {
@@ -7202,13 +8307,30 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
     }
 
     fn expire_leases(&mut self, instance_id: &str, now: &str) -> StoreResult<Vec<ExpiredLease>> {
+        // `_inner` is the superset: it does everything `_on` did and also
+        // fences exec lifetime for each expired lease.
         recovery::atomic_result(&self.sql, false, &mut || {
-            self.expire_leases_on(instance_id, now)
+            self.expire_leases_inner(instance_id, now)
         })
     }
 
     fn retry_effect(&mut self, retry: RetryEffect<'_>) -> StoreResult<StoredEvent> {
-        recovery::atomic_result(&self.sql, false, &mut || self.retry_effect_on(retry))
+        // Through the selected path so a replayed acknowledgement returns its
+        // original event instead of colliding on the key.
+        self.retry_effect_selected(retry, None)
+    }
+
+    /// The branch's terminal-selected retry, over the same admission body: the
+    /// caller names the terminal it observed, and admission refuses if that is
+    /// no longer the effect's terminal.
+    fn retry_effect_at_terminal(
+        &mut self,
+        retry: RetryEffect<'_>,
+        terminal: &str,
+    ) -> StoreResult<StoredEvent> {
+        // `retry_effect_selected` already takes the atomic boundary; nesting a
+        // second one here would depend on the host bridge being reentrant.
+        self.retry_effect_selected(retry, Some(terminal))
     }
 
     fn rebuild_projections(&mut self, instance_id: &str) -> StoreResult<()> {
@@ -8438,6 +9560,174 @@ impl<Sql: DoSql> DoSqliteStore<Sql> {
         Ok(Some(evidence_id))
     }
 
+    pub fn norm_ledger_id(&self) -> StoreResult<Option<String>> {
+        let rows = self
+            .sql
+            .query(
+                "SELECT genesis_id FROM tracker_norm_identity WHERE singleton = 1",
+                &[],
+            )
+            .map_err(sql_err)?;
+        Ok(rows.first().map(|row| as_text(&row[0])))
+    }
+
+    pub fn norm_checkpoint(
+        &self,
+    ) -> StoreResult<Option<whipplescript_store::norm::NormCheckpoint>> {
+        let rows = self.sql.query(
+            "SELECT genesis_id, authority_head FROM tracker_norm_checkpoint WHERE singleton = 1", &[],
+        ).map_err(sql_err)?;
+        Ok(rows
+            .first()
+            .map(|row| whipplescript_store::norm::NormCheckpoint {
+                ledger: as_text(&row[0]),
+                authority_head: as_text(&row[1]),
+            }))
+    }
+
+    /// Genesis-only shorthand; a rotated ledger needs its full trusted checkpoint.
+    pub fn pin_norm_ledger(&mut self, genesis_id: &str) -> StoreResult<()> {
+        self.pin_norm_checkpoint(&whipplescript_store::norm::NormCheckpoint::genesis(
+            genesis_id.into(),
+        ))
+    }
+
+    /// The synchronous host admits the externally established checkpoint with
+    /// one statement. The schema trigger installs its immutable identity too.
+    pub fn pin_norm_checkpoint(
+        &mut self,
+        checkpoint: &whipplescript_store::norm::NormCheckpoint,
+    ) -> StoreResult<()> {
+        checkpoint.validate()?;
+        if self
+            .norm_checkpoint()?
+            .as_ref()
+            .is_some_and(|existing| existing != checkpoint)
+        {
+            return Err(StoreError::Conflict(
+                "cannot replace the pinned norm checkpoint".into(),
+            ));
+        }
+        self.sql.execute(
+            "INSERT OR IGNORE INTO tracker_norm_checkpoint (singleton, genesis_id, authority_head) VALUES (1, ?1, ?2)",
+            &[text(&checkpoint.ledger), text(&checkpoint.authority_head)],
+        ).map_err(sql_err)?;
+        Ok(())
+    }
+
+    fn norm_events(&self) -> StoreResult<Vec<whipplescript_store::items::TrackerEvent>> {
+        self.sql.query("SELECT event_id, parents_json, issue_id, kind, payload_json, actor, created_at FROM tracker_events WHERE kind LIKE 'norm.%' ORDER BY event_seq", &[]).map_err(sql_err)?
+            .into_iter().map(|row| Ok(whipplescript_store::items::TrackerEvent {
+                event_id:as_text(&row[0]), parents:serde_json::from_str(&as_text(&row[1])).map_err(|e| sql_err(e.to_string()))?, issue_id:as_opt_text(&row[2]), kind:as_text(&row[3]), payload_json:as_text(&row[4]), actor:as_opt_text(&row[5]), created_at:as_text(&row[6]),
+            })).collect()
+    }
+
+    pub fn norm_aliases(&self) -> StoreResult<std::collections::BTreeMap<String, String>> {
+        let rows = self
+            .sql
+            .query(
+                "SELECT record_id, 'N-' || ordinal FROM tracker_norm_aliases ORDER BY ordinal",
+                &[],
+            )
+            .map_err(sql_err)?;
+        Ok(rows
+            .into_iter()
+            .map(|row| (as_text(&row[0]), as_text(&row[1])))
+            .collect())
+    }
+
+    pub fn resolve_norm_record(&self, reference: &str) -> StoreResult<Option<String>> {
+        let rows = self.sql.query(
+            "SELECT record_id FROM tracker_norm_aliases WHERE record_id = ?1 OR 'N-' || ordinal = ?1",
+            &[text(reference)],
+        ).map_err(sql_err)?;
+        Ok(rows.first().map(|row| as_text(&row[0])))
+    }
+
+    pub fn norm_view(
+        &self,
+        verifier: &dyn whipplescript_store::norm::NormVerifier,
+    ) -> StoreResult<whipplescript_store::norm::NormView> {
+        let pin = self.norm_checkpoint()?.ok_or_else(|| {
+            StoreError::Conflict("norm ledger is not bootstrapped or pinned".to_owned())
+        })?;
+        whipplescript_store::norm::replay_norm(&self.norm_events()?, &pin, verifier)
+    }
+
+    pub fn append_norm_event(
+        &mut self,
+        signed: &whipplescript_store::norm::SignedNormEvent,
+        verifier: &dyn whipplescript_store::norm::NormVerifier,
+    ) -> StoreResult<String> {
+        let event = signed.tracker_event()?;
+        let pin = self.norm_checkpoint()?;
+        whipplescript_store::norm::admit_norm(
+            &self.norm_events()?,
+            pin.as_ref(),
+            &event,
+            verifier,
+        )?;
+        // No yield separates validation and write on the single-writer DO.
+        // Its schema trigger creates the genesis pin IN this same statement.
+        self.sql
+            .execute(
+                whipplescript_store::norm::NORM_INSERT_SQL,
+                &[
+                    text(&serde_json::to_string(&[&event]).map_err(|e| sql_err(e.to_string()))?),
+                    opt_text(self.event_effect_id.as_deref()),
+                ],
+            )
+            .map_err(sql_err)?;
+        Ok(event.event_id)
+    }
+
+    pub fn import_norm_events(
+        &mut self,
+        events: &[whipplescript_store::items::TrackerEvent],
+        verifier: &dyn whipplescript_store::norm::NormVerifier,
+    ) -> StoreResult<usize> {
+        if events.iter().any(|event| !event.kind.starts_with("norm.")) {
+            return Err(StoreError::Conflict(
+                "norm import contains a non-norm event".to_owned(),
+            ));
+        }
+        let Some(pin) = self.norm_checkpoint()? else {
+            // MUTATION-SUCCESS-EXPR: Ok(0)
+            return Err(StoreError::Conflict("norm import is unpinned".into()));
+        };
+        let mut combined = self.norm_events()?;
+        let present: std::collections::BTreeSet<_> = combined
+            .iter()
+            .map(|event| event.event_id.clone())
+            .collect();
+        combined.extend_from_slice(events);
+        let view = whipplescript_store::norm::replay_norm(&combined, &pin, verifier)?;
+        let imported: std::collections::BTreeMap<_, _> = events
+            .iter()
+            .map(|event| (event.event_id.as_str(), event))
+            .collect();
+        let ordered: Vec<_> = view
+            .event_order()
+            .iter()
+            .filter(|id| !present.contains(*id))
+            .filter_map(|id| imported.get(id.as_str()))
+            .collect();
+        // A single SQLite statement is atomic even if one row or trigger fails.
+        self.sql
+            .execute(
+                whipplescript_store::norm::NORM_INSERT_SQL,
+                &[
+                    text(&serde_json::to_string(&ordered).map_err(|e| sql_err(e.to_string()))?),
+                    SqlValue::Null,
+                ],
+            )
+            .map_err(sql_err)?;
+        // Workerd rowsWritten includes SQLite bookkeeping/trigger writes; it
+        // is not the number of newly admitted events. Validation and this one
+        // statement have no intervening yield, so the deduplicated delta is exact.
+        Ok(ordered.len())
+    }
+
     /// Export every event in transport form (the unit another clone unions in).
     pub fn export_events(&self) -> StoreResult<Vec<whipplescript_store::items::TrackerEvent>> {
         let rows = self
@@ -8471,6 +9761,10 @@ impl<Sql: DoSql> DoSqliteStore<Sql> {
     ) -> StoreResult<whipplescript_store::items::ImportReport> {
         let mut report = whipplescript_store::items::ImportReport::default();
         for event in events {
+            if event.kind.starts_with("norm.") {
+                report.rejected += 1;
+                continue;
+            }
             // Re-verify the content-addressed id before admitting an event from
             // an untrusted transport (kept in lockstep with the native store):
             // reject a tampered event whose id != SHA-256 of its own content, or
@@ -9538,11 +10832,9 @@ pub mod test_support {
         }
     }
 
-    /// In-crate tests only: out-of-crate `test-support` consumers build
-    /// their own worlds, so without `cfg(test)` this would be dead code
-    /// under feature unification.
-    #[cfg(test)]
-    pub(crate) fn store() -> DoSqliteStore<RusqliteDoSql> {
+    /// Shared runtime fixture schema for in-crate tests and cross-host command
+    /// parity consumers of the explicitly enabled `test-support` feature.
+    pub fn store() -> DoSqliteStore<RusqliteDoSql> {
         let conn = Connection::open_in_memory().expect("sqlite");
         conn.execute_batch(
             r#"
@@ -9851,6 +11143,8 @@ pub mod test_support {
             "#,
         )
         .expect("schema");
+        conn.execute_batch(whipplescript_store::norm::NORM_SCHEMA_SQL)
+            .expect("norm schema");
         conn.execute_batch(whipplescript_store::tracker_filing::SCHEMA)
             .expect("tracker filing schema");
         conn.execute_batch(whipplescript_store::tracker_closure::SCHEMA)
@@ -10316,106 +11610,9 @@ impl<Sql: DoSql> DoSqliteStore<Sql> {
     }
 }
 
-impl<Sql: DoSql> DoSqliteStore<Sql> {
-    fn expire_leases_on(&self, instance_id: &str, now: &str) -> StoreResult<Vec<ExpiredLease>> {
-        let rows = self
-            .sql
-            .query(
-                "SELECT lease_id, run_id, effect_id FROM leases \
-                 WHERE instance_id = ?1 AND status = 'active' AND expires_at <= ?2 \
-                 ORDER BY expires_at, lease_id",
-                &[text(instance_id), text(now)],
-            )
-            .map_err(sql_err)?;
-        let expired: Vec<ExpiredLease> = rows
-            .iter()
-            .map(|r| ExpiredLease {
-                lease_id: as_text(&r[0]),
-                run_id: as_text(&r[1]),
-                effect_id: as_text(&r[2]),
-            })
-            .collect();
-        for lease in &expired {
-            let payload = serde_json::json!({
-                "lease_id": lease.lease_id,
-                "run_id": lease.run_id,
-                "effect_id": lease.effect_id,
-                "expired_at": now,
-                "effect_status": "failed",
-            })
-            .to_string();
-            let event = do_append_event(
-                &self.sql,
-                NewEvent {
-                    instance_id,
-                    event_type: "lease.expired",
-                    payload_json: &payload,
-                    source: "kernel",
-                    causation_id: Some(&lease.run_id),
-                    correlation_id: None,
-                    idempotency_key: Some(&format!("lease-expired:{}", lease.lease_id)),
-                },
-            )?;
-            self.sql
-                .execute(
-                    "UPDATE leases SET status = 'expired', released_at = CURRENT_TIMESTAMP \
-                     WHERE lease_id = ?1",
-                    &[text(&lease.lease_id)],
-                )
-                .map_err(sql_err)?;
-            self.sql
-                .execute(
-                    "UPDATE runs SET status = 'lease_expired', completed_at = (SELECT occurred_at FROM events WHERE event_id = ?2) \
-                     WHERE run_id = ?1 AND status = 'running'",
-                    &[text(&lease.run_id), text(&event.event_id)],
-                )
-                .map_err(sql_err)?;
-            self.sql
-                .execute(
-                    "UPDATE effects SET status = 'failed', updated_at = CURRENT_TIMESTAMP \
-                     WHERE instance_id = ?1 AND effect_id = ?2 AND status = 'running'",
-                    &[text(instance_id), text(&lease.effect_id)],
-                )
-                .map_err(sql_err)?;
-        }
-        Ok(expired)
-    }
-}
+impl<Sql: DoSql> DoSqliteStore<Sql> {}
 
-impl<Sql: DoSql> DoSqliteStore<Sql> {
-    fn retry_effect_on(&self, retry: RetryEffect<'_>) -> StoreResult<StoredEvent> {
-        recovery::require_proved_absence(&self.sql, retry.instance_id, retry.effect_id)?;
-        let payload = serde_json::json!({
-            "effect_id": retry.effect_id,
-            "retry_after": retry.retry_after,
-        })
-        .to_string();
-        let event = do_append_event(
-            &self.sql,
-            NewEvent {
-                instance_id: retry.instance_id,
-                event_type: "effect.retried",
-                payload_json: &payload,
-                source: "kernel",
-                causation_id: Some(retry.effect_id),
-                correlation_id: None,
-                idempotency_key: retry.idempotency_key,
-            },
-        )?;
-        let changed = self
-            .sql
-            .execute(
-                "UPDATE effects SET status = 'queued', updated_at = CURRENT_TIMESTAMP \
-                 WHERE instance_id = ?1 AND effect_id = ?2 AND status IN ('failed', 'timed_out')",
-                &[text(retry.instance_id), text(retry.effect_id)],
-            )
-            .map_err(sql_err)?;
-        if changed != 1 {
-            return Err(StoreError::Conflict("effect is not retryable".to_owned()));
-        }
-        Ok(event)
-    }
-}
+impl<Sql: DoSql> DoSqliteStore<Sql> {}
 
 #[cfg(test)]
 pub(crate) mod tests {
@@ -12241,6 +13438,7 @@ pub(crate) mod tests {
         inner: S,
         fail_at: std::cell::Cell<usize>,
         seen: std::cell::Cell<usize>,
+        after_statements: bool,
     }
 
     impl<S: DoSql> FaultySql<S> {
@@ -12249,7 +13447,12 @@ pub(crate) mod tests {
                 inner,
                 fail_at: std::cell::Cell::new(fail_at),
                 seen: std::cell::Cell::new(0),
+                after_statements: false,
             }
+        }
+        fn after_statements(mut self) -> Self {
+            self.after_statements = true;
+            self
         }
         /// Stop injecting, so a checker can read the wreckage.
         pub(crate) fn disarm(&self) {
@@ -12266,18 +13469,493 @@ pub(crate) mod tests {
         }
         fn execute(&self, sql: &str, params: &[SqlValue]) -> Result<u64, String> {
             self.seen.set(self.seen.get() + 1);
-            if self.seen.get() == self.fail_at.get() {
+            let fails = self.seen.get() == self.fail_at.get();
+            if fails && !self.after_statements {
                 return Err("injected fault".to_owned());
             }
-            self.inner.execute(sql, params)
+            let result = self.inner.execute(sql, params)?;
+            if fails {
+                return Err("injected post-write fault".to_owned());
+            }
+            Ok(result)
         }
         fn query(&self, sql: &str, params: &[SqlValue]) -> Result<Vec<Vec<SqlValue>>, String> {
             self.seen.set(self.seen.get() + 1);
-            if self.seen.get() == self.fail_at.get() {
+            let fails = self.seen.get() == self.fail_at.get();
+            if fails && !self.after_statements {
                 return Err("injected fault".to_owned());
             }
-            self.inner.query(sql, params)
+            let result = self.inner.query(sql, params)?;
+            if fails {
+                return Err("injected post-statement fault".to_owned());
+            }
+            Ok(result)
         }
+    }
+
+    #[test]
+    fn exec_settlement_retention_rolls_back_each_statement_failure() {
+        for after_statement in [false, true] {
+            let mut statements = 0;
+            let mut failures = 0;
+            for fail_at in std::iter::once(usize::MAX).chain(1..40) {
+                let mut original = store();
+                let instance = crate::exec_settlement_retention_tests::setup(&mut original);
+                let request = exec_settlement::Retention {
+                    instance_id: &instance,
+                    effect_id: "observe",
+                    run_id: "run",
+                    input_json: "{}",
+                    settlement_json: "{\"outcome\":1}",
+                };
+                let before = original.list_events(&instance).unwrap();
+                let head = original.chain_head(&instance).unwrap();
+                let sql = FaultySql::new(original.sql.clone(), fail_at);
+                let mut faulty = DoSqliteStore::new(if after_statement {
+                    sql.after_statements()
+                } else {
+                    sql
+                });
+                let result = faulty.retain_exec_settlement(request);
+                if fail_at == usize::MAX {
+                    statements = faulty.sql.seen.get();
+                }
+                faulty.sql.disarm();
+                if result.is_err() {
+                    failures += 1;
+                    assert_eq!(
+                        original.list_events(&instance).unwrap(),
+                        before,
+                        "after={after_statement}, statement={fail_at}"
+                    );
+                    assert_eq!(original.chain_head(&instance).unwrap(), head);
+                }
+                let event = faulty.retain_exec_settlement(request).unwrap();
+                assert_eq!(faulty.retain_exec_settlement(request).unwrap(), event);
+                assert_eq!(
+                    original.list_events(&instance).unwrap().len(),
+                    before.len() + 1
+                );
+            }
+            assert!((1..40).contains(&statements));
+            assert_eq!(failures, statements);
+        }
+    }
+
+    #[test]
+    fn terminal_completion_rolls_back_each_injected_storage_failure() {
+        fn finish<S: DoSql>(store: &mut DoSqliteStore<S>, mode: usize) -> StoreResult<StoredEvent> {
+            let completion = EffectCompletion {
+                instance_id: "terminal-instance",
+                effect_id: "parent",
+                run_id: "run",
+                provider: "exec",
+                worker_id: "whip-exec",
+                status: if mode == 0 || mode == 3 {
+                    "completed"
+                } else {
+                    "failed"
+                },
+                exit_code: Some(if mode == 0 || mode == 3 { 0 } else { 1 }),
+                summary: Some("fixture receipt"),
+                metadata_json: r#"{"executor_response":{"body":"retained"}}"#,
+                idempotency_key: Some("terminal"),
+            };
+            let diagnostic = TerminalDiagnosticRecord {
+                program_id: None,
+                program_version_id: None,
+                severity: whipplescript_core::Severity::Error,
+                code: Some(DurableDiagnosticCode::ProviderKind("fixture".into())),
+                message: "terminal fixture".into(),
+                source_span_json: None,
+                subject_type: None,
+                subject_id: None,
+                assertion_id: None,
+                evidence_ids_json: "[]".into(),
+                artifact_ids_json: "[]".into(),
+                causation_id: None,
+                correlation_id: None,
+                idempotency_key: Some("terminal-diagnostic".into()),
+            };
+            match mode {
+                0 => store.complete_effect(completion),
+                1 => store.complete_effect_with_terminal_diagnostic(completion, Some(diagnostic)),
+                2 => store.resolve_effect_uncertain(completion, Some(diagnostic)),
+                _ => {
+                    let facts: Vec<_> = ["one", "two"]
+                        .iter()
+                        .map(|key| whipplescript_store::SettlementFact {
+                            fact: NewFact {
+                                fact_id: key,
+                                name: "projection",
+                                key,
+                                value_json: "{\"n\":1}",
+                                schema_id: None,
+                                provenance_class: "external",
+                                correlation_id: None,
+                                source_span_json: None,
+                            },
+                            idempotency_key: key,
+                        })
+                        .collect();
+                    store.complete_effect_settlement(
+                        completion,
+                        (mode == 4).then_some(diagnostic),
+                        &facts,
+                        (mode == 3).then_some(whipplescript_store::SettlementCache {
+                            content_key: "cache",
+                            result_json: "{}",
+                        }),
+                    )
+                }
+            }
+        }
+        fn snapshot<S: DoSql>(store: &DoSqliteStore<S>) -> Vec<Vec<Vec<SqlValue>>> {
+            [
+                "events",
+                "runs",
+                "leases",
+                "effects",
+                "effect_dependencies",
+                "effect_cancellation_requests",
+                "diagnostics",
+                "facts",
+                "compute_result_cache",
+            ]
+            .iter()
+            .map(|table| {
+                // A terminal attempt refused with a `Conflict` records that
+                // refusal OUTSIDE the rolled-back transaction, on purpose: a
+                // denial that rolls back is a denial nobody can see. It is the
+                // one row a failed completion may legitimately leave behind,
+                // so the durable state this assertion is about is every other
+                // row.
+                let refusals = if *table == "events" {
+                    " WHERE event_type <> 'run.terminal_refused'"
+                } else {
+                    ""
+                };
+                store
+                    .sql
+                    .query(
+                        &format!("SELECT * FROM {table}{refusals} ORDER BY rowid"),
+                        &[],
+                    )
+                    .unwrap()
+            })
+            .collect()
+        }
+        fn refused<S: DoSql>(store: &DoSqliteStore<S>) -> usize {
+            store
+                .list_events("terminal-instance")
+                .unwrap()
+                .iter()
+                .filter(|event| event.event_type == "run.terminal_refused")
+                .count()
+        }
+        for mode in 0..5 {
+            for after_statement in [false, true] {
+                let mut statements = 0;
+                let mut failures = 0;
+                for fail_at in std::iter::once(usize::MAX).chain(1..80) {
+                    let original = store();
+                    for sql in [
+                        "INSERT INTO effects (effect_id, instance_id, kind, status, input_json) VALUES ('parent', 'terminal-instance', 'exec.command', 'running', '{}')",
+                        "INSERT INTO effects (effect_id, instance_id, kind, status, input_json) VALUES ('child', 'terminal-instance', 'exec.command', 'blocked_by_dependency', '{}')",
+                        "INSERT INTO effect_dependencies (instance_id, downstream_effect_id, upstream_effect_id, predicate) VALUES ('terminal-instance', 'child', 'parent', 'completes')",
+                        "INSERT INTO runs (run_id, instance_id, effect_id, provider, worker_id, status) VALUES ('run', 'terminal-instance', 'parent', 'exec', 'whip-exec', 'running')",
+                        "INSERT INTO leases (lease_id, instance_id, run_id, effect_id, status, expires_at) VALUES ('lease', 'terminal-instance', 'run', 'parent', 'active', '2099-01-01T00:00:00Z')",
+                        "INSERT INTO effect_cancellation_requests (request_id, instance_id, effect_id, requested_by, status) VALUES ('cancel', 'terminal-instance', 'parent', 'fixture', 'requested')",
+                    ] { original.sql.execute(sql, &[]).unwrap(); }
+                    let before = snapshot(&original);
+                    let chain = original.chain_head("terminal-instance").unwrap();
+                    let sql = FaultySql::new(original.sql.clone(), fail_at);
+                    let mut faulty = DoSqliteStore::new(if after_statement {
+                        sql.after_statements()
+                    } else {
+                        sql
+                    });
+                    let result = finish(&mut faulty, mode);
+                    if fail_at == usize::MAX {
+                        statements = faulty.sql.seen.get();
+                    }
+                    faulty.sql.disarm();
+                    if result.is_err() {
+                        failures += 1;
+                        assert_eq!(
+                            snapshot(&original),
+                            before,
+                            "mode={mode}, after={after_statement}, statement={fail_at}"
+                        );
+                        // The refusal is a real append, so it moves the chain
+                        // head with it. Where no refusal was recorded the head
+                        // must not have moved at all.
+                        if refused(&original) == 0 {
+                            assert_eq!(original.chain_head("terminal-instance").unwrap(), chain);
+                        }
+                        finish(&mut faulty, mode).expect("same completion succeeds after rollback");
+                    }
+                    assert_eq!(
+                        original
+                            .list_events("terminal-instance")
+                            .unwrap()
+                            .iter()
+                            .filter(|event| event.event_type != "run.terminal_refused")
+                            .count(),
+                        if mode >= 3 { 3 } else { 1 }
+                    );
+                    assert_eq!(
+                        original.list_runs("terminal-instance").unwrap()[0].status,
+                        match mode {
+                            0 | 3 => "completed",
+                            1 | 4 => "failed",
+                            _ => "uncertain",
+                        }
+                    );
+                    assert_eq!(
+                        as_text(
+                            &original
+                                .sql
+                                .query("SELECT status FROM leases", &[])
+                                .unwrap()[0][0]
+                        ),
+                        "released"
+                    );
+                    assert_eq!(
+                        as_text(
+                            &original
+                                .sql
+                                .query("SELECT status FROM effects WHERE effect_id = 'child'", &[])
+                                .unwrap()[0][0]
+                        ),
+                        "queued"
+                    );
+                    assert_eq!(
+                        as_text(
+                            &original
+                                .sql
+                                .query("SELECT status FROM effect_cancellation_requests", &[])
+                                .unwrap()[0][0]
+                        ),
+                        "terminal"
+                    );
+                    assert_eq!(
+                        original
+                            .list_diagnostics(Some("terminal-instance"))
+                            .unwrap()
+                            .len(),
+                        usize::from(mode != 0 && mode != 3)
+                    );
+                }
+                assert!((1..80).contains(&statements));
+                assert_eq!(
+                    failures, statements,
+                    "every statement failure must propagate and roll back"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn run_reattach_rolls_back_each_injected_storage_failure() {
+        use crate::rule_commit_recovery_tests::{commit, effect, version};
+        use crate::run_reattach_tests::request;
+        for reattaching in [false, true] {
+            let mut failures = 0;
+            let mut successes = 0;
+            let mut statement_count = 0;
+            for fail_at in std::iter::once(usize::MAX).chain(1..80) {
+                let mut original = store();
+                let v = original
+                    .create_program_version(version("run-fault"))
+                    .unwrap();
+                let instance = original
+                    .create_instance(NewInstance {
+                        program_id: &v.program_id,
+                        version_id: &v.version_id,
+                        input_json: "{}",
+                    })
+                    .unwrap()
+                    .instance_id;
+                original
+                    .register_capability_schema(CapabilitySchemaRegistration {
+                        capability: "script.observer",
+                        description: "fixture",
+                        schema_json: "{}",
+                        registered_by_package_id: None,
+                    })
+                    .unwrap();
+                original
+                    .bind_capability(CapabilityBinding {
+                        binding_id: "observer",
+                        program_id: Some(&v.program_id),
+                        capability: "script.observer",
+                        provider: "builtin-script",
+                        config_json: "{}",
+                    })
+                    .unwrap();
+                original
+                    .commit_rule(commit(&instance, &[effect(None)]))
+                    .unwrap();
+                if reattaching {
+                    original.start_run(request(&instance)).unwrap();
+                }
+                let before = original.list_events(&instance).unwrap();
+                let effects = original.list_effects(&instance).unwrap();
+                let runs = original.list_runs(&instance).unwrap();
+                let leases = original.sql.query("SELECT * FROM leases", &[]).unwrap();
+                let mut faulty = DoSqliteStore::new(FaultySql::new(original.sql.clone(), fail_at));
+                let result = faulty.start_run(request(&instance));
+                if fail_at == usize::MAX {
+                    statement_count = faulty.sql.seen.get();
+                }
+                faulty.sql.disarm();
+                if result.is_err() {
+                    failures += 1;
+                    assert_eq!(
+                        original.list_events(&instance).unwrap(),
+                        before,
+                        "reattach={reattaching}, statement={fail_at}"
+                    );
+                    assert_eq!(original.list_effects(&instance).unwrap(), effects);
+                    assert_eq!(original.list_runs(&instance).unwrap(), runs);
+                    assert_eq!(
+                        original.sql.query("SELECT * FROM leases", &[]).unwrap(),
+                        leases
+                    );
+                    faulty
+                        .start_run(request(&instance))
+                        .expect("same request recovers after rollback");
+                } else {
+                    successes += 1;
+                    assert_eq!(
+                        original.list_events(&instance).unwrap().len(),
+                        before.len() + usize::from(!reattaching)
+                    );
+                }
+                assert_eq!(original.list_runs(&instance).unwrap().len(), 1);
+                assert_eq!(
+                    as_i64(
+                        &original
+                            .sql
+                            .query("SELECT count(*) FROM leases", &[])
+                            .unwrap()[0][0]
+                    ),
+                    1
+                );
+                assert_eq!(
+                    original.list_effects(&instance).unwrap()[0].status,
+                    "running"
+                );
+            }
+            assert!(
+                (1..80).contains(&statement_count),
+                "every baseline statement is injected"
+            );
+            assert!(
+                failures > 0 && successes > 0,
+                "both injected refusal and restored success are exercised"
+            );
+        }
+    }
+
+    #[test]
+    fn rule_commit_recovery_rolls_back_every_injected_statement_failure() {
+        use crate::rule_commit_recovery_tests::{commit, effect, version};
+        let mut failures = 0;
+        let mut successes = 0;
+        let mut statement_count = 0;
+        for fail_at in std::iter::once(usize::MAX).chain(1..80) {
+            let mut original = store();
+            let v = original
+                .create_program_version(version("v1"))
+                .expect("version");
+            let instance = original
+                .create_instance(NewInstance {
+                    program_id: &v.program_id,
+                    version_id: &v.version_id,
+                    input_json: "{}",
+                })
+                .expect("instance");
+            let before = original.list_events(&instance.instance_id).expect("events");
+            let live = original
+                .get_instance(&instance.instance_id)
+                .expect("instance");
+            let mut faulty = DoSqliteStore::new(FaultySql::new(original.sql.clone(), fail_at));
+            let effects = [effect(Some(60))];
+            let mut request = commit(&instance.instance_id, &effects);
+            request.terminal = Some(WorkflowTerminal {
+                kind: WorkflowTerminalKind::Completed,
+                name: "done",
+                payload_json: "{}",
+                idempotency_key: Some("terminal"),
+            });
+            let result = faulty.commit_rule(request);
+            if fail_at == usize::MAX {
+                statement_count = faulty.sql.seen.get();
+            }
+            faulty.sql.disarm();
+            if result.is_err() {
+                failures += 1;
+                assert_eq!(
+                    original
+                        .list_events(&instance.instance_id)
+                        .expect("rolled back events"),
+                    before,
+                    "statement {fail_at}"
+                );
+                assert!(
+                    original
+                        .list_effects(&instance.instance_id)
+                        .expect("rolled back effects")
+                        .is_empty(),
+                    "statement {fail_at}"
+                );
+                assert!(
+                    original
+                        .list_evidence(&instance.instance_id)
+                        .expect("rolled back evidence")
+                        .is_empty(),
+                    "statement {fail_at}"
+                );
+                assert_eq!(
+                    original
+                        .get_instance(&instance.instance_id)
+                        .expect("rolled back terminal"),
+                    live,
+                    "statement {fail_at}"
+                );
+                // The same invocation succeeds after rollback, rather than
+                // hitting a poisoned idempotency key from a partial append.
+                faulty.commit_rule(request).expect("retry after rollback");
+            } else {
+                successes += 1;
+                assert_eq!(
+                    original
+                        .list_effects(&instance.instance_id)
+                        .expect("complete effect")
+                        .len(),
+                    1
+                );
+                assert_eq!(
+                    original
+                        .get_instance(&instance.instance_id)
+                        .expect("complete instance")
+                        .expect("instance exists")
+                        .status,
+                    "completed"
+                );
+            }
+        }
+        assert!(
+            statement_count > 0 && statement_count < 80,
+            "the sweep must cover all {statement_count} statements"
+        );
+        assert!(
+            failures > 0,
+            "must exercise rollback rather than only success"
+        );
+        assert!(successes > 0, "the sweep must pass the last SQL statement");
     }
 
     /// **A statement failing mid-append must never leave the recorded head
@@ -14360,6 +16038,13 @@ pub(crate) mod tests {
             )
             .expect("read");
         assert_eq!(as_text(&status[0][0]), "queued");
+        let before = store
+            .sql
+            .query(
+                "SELECT event_id FROM events WHERE instance_id = ?1 ORDER BY sequence",
+                &[text("i1")],
+            )
+            .expect("events before refusal");
         // A now-queued (not failed/timed_out) effect is not retryable.
         assert!(store
             .retry_effect(RetryEffect {
@@ -14369,6 +16054,128 @@ pub(crate) mod tests {
                 idempotency_key: None,
             })
             .is_err());
+        assert_eq!(
+            store
+                .sql
+                .query(
+                    "SELECT event_id FROM events WHERE instance_id = ?1 ORDER BY sequence",
+                    &[text("i1")],
+                )
+                .expect("events after refusal"),
+            before,
+            "refused retry must not append an event"
+        );
+    }
+
+    #[test]
+    fn retry_admission_rolls_back_each_storage_failure() {
+        let mut statements = 0;
+        for fail_at in std::iter::once(usize::MAX).chain(1..40) {
+            let original = store();
+            original.sql.execute(
+                "INSERT INTO effects (effect_id, instance_id, kind, status, input_json) VALUES (?1, ?2, ?3, ?4, ?5)",
+                &[text("retry-effect"), text("i1"), text("schema.coerce"), text("failed"), text("{}")],
+            ).expect("seed failed effect");
+            let mut faulty = DoSqliteStore::new(FaultySql::new(original.sql, fail_at));
+            let result = faulty.retry_effect(RetryEffect {
+                instance_id: "i1",
+                effect_id: "retry-effect",
+                retry_after: None,
+                idempotency_key: Some("retry-admission"),
+            });
+            if fail_at == usize::MAX {
+                result.expect("baseline admission");
+                statements = faulty.sql.seen.get();
+                assert!(statements > 1 && statements < 40);
+                continue;
+            }
+            if fail_at > statements {
+                break;
+            }
+            assert!(result.is_err(), "statement {fail_at} must fail");
+            faulty.sql.disarm();
+            assert!(
+                faulty
+                    .sql
+                    .query(
+                        "SELECT event_id FROM events WHERE instance_id = ?1",
+                        &[text("i1")]
+                    )
+                    .unwrap()
+                    .is_empty(),
+                "statement {fail_at} left an event"
+            );
+            let status = faulty
+                .sql
+                .query(
+                    "SELECT status FROM effects WHERE effect_id = ?1",
+                    &[text("retry-effect")],
+                )
+                .unwrap();
+            assert_eq!(
+                as_text(&status[0][0]),
+                "failed",
+                "statement {fail_at} changed eligibility"
+            );
+            faulty
+                .retry_effect(RetryEffect {
+                    instance_id: "i1",
+                    effect_id: "retry-effect",
+                    retry_after: None,
+                    idempotency_key: Some("retry-admission"),
+                })
+                .expect("retry succeeds after rollback");
+        }
+    }
+
+    #[test]
+    fn retry_rebuild_rolls_back_each_storage_failure() {
+        let mut statements = 0;
+        for fail_at in std::iter::once(usize::MAX).chain(1..300) {
+            let mut original = store();
+            let (instance, _) =
+                crate::rule_commit_recovery_tests::seed_retry_rebuild(&mut original);
+            let raw = original.sql.clone();
+            let tables = raw
+                .query(
+                    "SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name",
+                    &[],
+                )
+                .unwrap();
+            let snapshot = || {
+                tables
+                    .iter()
+                    .map(|row| {
+                        let name = as_text(&row[0]).replace('"', "\"\"");
+                        raw.query(&format!("SELECT * FROM \"{name}\""), &[])
+                            .unwrap()
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let before = snapshot();
+            let mut faulty = DoSqliteStore::new(FaultySql::new(original.sql, fail_at));
+            let result = faulty.rebuild_projections(&instance);
+            if fail_at == usize::MAX {
+                result.expect("baseline rebuild");
+                statements = faulty.sql.seen.get();
+                assert!(statements > 1 && statements < 300);
+                continue;
+            }
+            if fail_at > statements {
+                break;
+            }
+            assert!(result.is_err(), "statement {fail_at} must fail");
+            faulty.sql.disarm();
+            assert_eq!(
+                snapshot(),
+                before,
+                "statement {fail_at} changed stored rows"
+            );
+            faulty
+                .rebuild_projections(&instance)
+                .expect("rebuild after rollback");
+            assert_eq!(faulty.list_effects(&instance).unwrap()[0].status, "queued");
+        }
     }
 
     /// claimable_effects applies the dependency gate, the cancellation-request
@@ -14859,6 +16666,7 @@ pub(crate) mod tests {
         assert_eq!(as_text(&dep[0][0]), "queued");
 
         // A second completion of the same run is rejected (double terminal).
+        let before_refusal = store.list_events("i1").expect("journal before refusal");
         let again = store.complete_effect(EffectCompletion {
             instance_id: "i1",
             effect_id: "eff_1",
@@ -14872,6 +16680,27 @@ pub(crate) mod tests {
             idempotency_key: Some("done-2"),
         });
         assert!(again.is_err());
+        let after_refusal = store.list_events("i1").expect("journal after refusal");
+        let terminals = |events: &[EventView]| {
+            events
+                .iter()
+                .filter(|event| event.event_type == "effect.terminal")
+                .count()
+        };
+        assert_eq!(
+            terminals(&after_refusal),
+            terminals(&before_refusal),
+            "a refused completion must not append a terminal event"
+        );
+        // It DOES leave evidence of the refusal, deliberately outside the
+        // rolled-back transaction: a worker that tried to complete a run
+        // someone else had already settled is what an operator wants to see.
+        assert!(
+            after_refusal
+                .iter()
+                .any(|event| event.event_type == "run.terminal_refused"),
+            "the refusal is recorded"
+        );
 
         // complete_effect_with_terminal_diagnostic records a diagnostic row.
         store
@@ -15150,6 +16979,85 @@ pub(crate) mod tests {
                 idempotency_key: Some("term-2"),
             })
             .is_err());
+    }
+
+    /// A failed binding append must not leave an acknowledged cancellation whose
+    /// replay skips the original run evidence. This exercises the public method.
+    #[test]
+    fn do_store_cancellation_rolls_back_original_run_bindings() {
+        for table in ["effect_cancellation_requests", "evidence", "evidence_links"] {
+            let mut store = store();
+            store.sql.execute("INSERT INTO effects (effect_id, instance_id, kind, status, input_json) VALUES ('eff_1', 'i1', 'exec.command', 'running', '{}')", &[]).unwrap();
+            store.sql.execute("INSERT INTO runs (run_id, instance_id, effect_id, provider, worker_id, status) VALUES ('run_1', 'i1', 'eff_1', 'exec', 'whip-exec', 'running')", &[]).unwrap();
+            let request = || EffectCancellationRequest {
+                instance_id: "i1",
+                effect_id: "eff_1",
+                revision_id: None,
+                reason: Some("user asked"),
+                requested_by: "operator",
+                causation_event_id: None,
+                idempotency_key: Some("atomic-cancel"),
+            };
+            let before = store.list_events("i1").unwrap();
+            let when = if table == "evidence_links" {
+                "WHEN NEW.relation = 'active_run'"
+            } else {
+                ""
+            };
+            store.sql.execute(&format!("CREATE TRIGGER fail_cancel BEFORE INSERT ON {table} {when} BEGIN SELECT RAISE(ABORT, 'injected cancellation failure'); END"), &[]).unwrap();
+            assert!(
+                store.request_effect_cancellation(request()).is_err(),
+                "{table}"
+            );
+            assert_eq!(
+                store.list_events("i1").unwrap().len(),
+                before.len(),
+                "{table}: partial journal"
+            );
+            assert!(
+                store
+                    .list_effect_cancellation_requests("i1")
+                    .unwrap()
+                    .is_empty(),
+                "{table}: partial request"
+            );
+            assert!(
+                store.list_evidence_links("i1").unwrap().is_empty(),
+                "{table}: partial bindings"
+            );
+            let evidence = store
+                .sql
+                .query(
+                    "SELECT count(*) FROM evidence WHERE instance_id = 'i1'",
+                    &[],
+                )
+                .unwrap();
+            assert_eq!(as_i64(&evidence[0][0]), 0, "{table}: partial evidence");
+            store.sql.execute("DROP TRIGGER fail_cancel", &[]).unwrap();
+            let accepted = store.request_effect_cancellation(request()).unwrap();
+            // Replay cannot capture a new run even if the active set changed.
+            store
+                .sql
+                .execute(
+                    "UPDATE runs SET status = 'completed' WHERE run_id = 'run_1'",
+                    &[],
+                )
+                .unwrap();
+            store.sql.execute("INSERT INTO runs (run_id, instance_id, effect_id, provider, worker_id, status) VALUES ('run_2', 'i1', 'eff_1', 'exec', 'whip-exec', 'running')", &[]).unwrap();
+            let replay = store.request_effect_cancellation(request()).unwrap();
+            assert_eq!(accepted.request_id, replay.request_id);
+            let links = store.list_evidence_links("i1").unwrap();
+            assert!(!links
+                .iter()
+                .any(|link| link.relation == "active_run" && link.target_id == "run_2"));
+            assert_eq!(
+                links
+                    .iter()
+                    .filter(|link| link.relation == "active_run" && link.target_id == "run_1")
+                    .count(),
+                1
+            );
+        }
     }
 
     /// revision_cancellation_impact classifies pending vs running effects by policy.
@@ -16734,5 +18642,1012 @@ pub(crate) mod tests {
             1,
             "one block, one durable statement of it: {blocked:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod norm_admission_tests {
+    use super::*;
+    use p256::ecdsa::signature::Signer;
+    use p256::ecdsa::{Signature, SigningKey};
+    use p256::elliptic_curve::sec1::ToSec1Point;
+    use whipplescript_core::vocabulary::{AdmissionPredicate, Vocabulary};
+    use whipplescript_kernel::norm_governance::{NormGovernanceVerifier, NormPrincipalBinding};
+    use whipplescript_store::norm::*;
+
+    fn actor(principal: &str, key: &SigningKey) -> NormActor {
+        NormActor {
+            principal: principal.into(),
+            algorithm: "p256-sha256".into(),
+            key_id: hex::encode(
+                key.verifying_key()
+                    .as_affine()
+                    .to_sec1_point(true)
+                    .as_bytes(),
+            ),
+        }
+    }
+    fn signed(actor: NormActor, key: &SigningKey, nonce: &str, action: NormAct) -> SignedNormEvent {
+        let statement = NormStatement {
+            protocol: "whipplescript.norm/v1".into(),
+            actor,
+            nonce: nonce.into(),
+            created_at: "2026-09-05T00:00:00Z".into(),
+            action,
+        };
+        let signature: Signature = key.sign(&statement.signing_bytes().expect("bytes"));
+        SignedNormEvent {
+            successor_signature: None,
+            statement,
+            signature: hex::encode(signature.to_bytes()),
+        }
+    }
+    fn charter() -> NormCharter {
+        NormCharter {resource_domains:None,vocabularies:vec![NormVocabulary {
+                editing: None,
+                effectiveness: None,
+                inventory_role: None,
+            definition:serde_json::from_value(serde_json::json!({
+                "name":"decision","version":"1","fields":[{"name":"title","required":true,"value_type":{"type":"text"}}],
+                "status":{"values":["proposed","accepted"],"initial":"proposed","transitions":[{"from":"proposed","to":"accepted","admission":{"requires":"authority","scope":"accept"}}]}
+            })).expect("fixture"),creation:AdmissionPredicate::Public {},
+        }],owner_scopes:vec!["accept".into()]}
+    }
+
+    #[test]
+    fn norm_native_and_do_admit_the_same_authenticated_history() {
+        let owner_key = SigningKey::from_slice(&[1; 32]).unwrap();
+        let worker_key = SigningKey::from_slice(&[2; 32]).unwrap();
+        let owner = actor("owner", &owner_key);
+        let worker = actor("worker", &worker_key);
+        let owner_root = crate::governance::GaugeDeskGovernanceRoot::new("owner", &owner.key_id);
+        let worker_root = crate::governance::GaugeDeskGovernanceRoot::new("worker", &worker.key_id);
+        let verifier = NormGovernanceVerifier::new(
+            vec![
+                NormPrincipalBinding {
+                    actor: owner.clone(),
+                    verifier: &owner_root,
+                },
+                NormPrincipalBinding {
+                    actor: worker.clone(),
+                    verifier: &worker_root,
+                },
+            ],
+            BTreeSet::from([("worker".into(), "owner".into())]),
+        )
+        .unwrap();
+        let mut native = whipplescript_store::items::WorkItemStore::open_in_memory().unwrap();
+        let mut hosted = test_support::store();
+        let bootstrap = signed(
+            owner.clone(),
+            &owner_key,
+            "genesis",
+            NormAct::Bootstrap {
+                creator: "worker".into(),
+                charter: charter(),
+            },
+        );
+        let ledger = native.append_norm_event(&bootstrap, &verifier).unwrap();
+        assert_eq!(
+            hosted.append_norm_event(&bootstrap, &verifier).unwrap(),
+            ledger
+        );
+        assert_eq!(
+            hosted.append_norm_event(&bootstrap, &verifier).unwrap(),
+            ledger
+        );
+        let vocabulary = Vocabulary::new(charter().vocabularies[0].definition.clone())
+            .unwrap()
+            .reference()
+            .clone();
+        let creation = signed(
+            worker.clone(),
+            &worker_key,
+            "D0",
+            NormAct::Create {
+                authority: None,
+                ledger: ledger.clone(),
+                vocabulary: vocabulary.clone(),
+                fields_json: r#"{"title":"repair"}"#.into(),
+            },
+        );
+        let record = native.append_norm_event(&creation, &verifier).unwrap();
+        assert_eq!(
+            hosted.append_norm_event(&creation, &verifier).unwrap(),
+            record
+        );
+        let action = NormAct::Transition {
+            authority: None,
+            ledger: ledger.clone(),
+            vocabulary,
+            record: record.clone(),
+            previous: record.clone(),
+            status: "accepted".into(),
+        };
+        let denied = signed(worker, &worker_key, "denied", action.clone());
+        assert!(native.append_norm_event(&denied, &verifier).is_err());
+        assert!(hosted.append_norm_event(&denied, &verifier).is_err());
+        let accepted = signed(owner, &owner_key, "accepted", action);
+        assert_eq!(
+            native.append_norm_event(&accepted, &verifier).unwrap(),
+            hosted.append_norm_event(&accepted, &verifier).unwrap()
+        );
+        assert_eq!(
+            native.norm_view(&verifier).unwrap().records,
+            hosted.norm_view(&verifier).unwrap().records
+        );
+        assert_eq!(
+            native.export_events().unwrap(),
+            hosted.export_events().unwrap()
+        );
+        let mut restored = test_support::store();
+        assert!(matches!(restored.norm_view(&verifier),
+            Err(StoreError::Conflict(message)) if message.contains("norm ledger is not bootstrapped or pinned")));
+        assert!(matches!(
+            restored.pin_norm_ledger("invalid"),
+            Err(StoreError::Conflict(_))
+        ));
+        assert!(restored
+            .import_norm_events(&hosted.export_events().unwrap(), &verifier)
+            .is_err());
+        restored.pin_norm_ledger(&ledger).unwrap();
+        assert!(matches!(
+            restored.pin_norm_ledger(&"f".repeat(64)),
+            Err(StoreError::Conflict(_))
+        ));
+        assert!(restored.norm_view(&verifier).is_err());
+        let mut history = hosted.export_events().unwrap();
+        history.reverse();
+        assert_eq!(restored.import_norm_events(&history, &verifier).unwrap(), 3);
+        assert_eq!(restored.import_norm_events(&history, &verifier).unwrap(), 0);
+        let mut foreign = creation.tracker_event().unwrap();
+        foreign.kind = "issue.created".into();
+        assert!(restored.import_norm_events(&[foreign], &verifier).is_err());
+        assert_eq!(
+            restored.norm_view(&verifier).unwrap().records,
+            hosted.norm_view(&verifier).unwrap().records
+        );
+        let mut legacy = test_support::store();
+        assert_eq!(legacy.import_events(&history).unwrap().rejected, 3);
+        assert!(legacy.export_events().unwrap().is_empty());
+    }
+
+    #[test]
+    fn norm_do_statement_failure_rolls_back_both_genesis_and_pin() {
+        let key = SigningKey::from_slice(&[1; 32]).unwrap();
+        let owner = actor("owner", &key);
+        let root = crate::governance::GaugeDeskGovernanceRoot::new("owner", &owner.key_id);
+        let verifier = NormGovernanceVerifier::new(
+            vec![NormPrincipalBinding {
+                actor: owner.clone(),
+                verifier: &root,
+            }],
+            BTreeSet::from([("worker".into(), "owner".into())]),
+        )
+        .unwrap();
+        let bootstrap = signed(
+            owner,
+            &key,
+            "genesis",
+            NormAct::Bootstrap {
+                creator: "worker".into(),
+                charter: charter(),
+            },
+        );
+        let mut hosted = test_support::store();
+        hosted.sql.execute("CREATE TRIGGER fail_pin BEFORE INSERT ON tracker_norm_identity BEGIN SELECT RAISE(ABORT, 'injected failure'); END",&[]).unwrap();
+        assert!(hosted.append_norm_event(&bootstrap, &verifier).is_err());
+        assert!(hosted.export_events().unwrap().is_empty());
+        assert_eq!(hosted.norm_ledger_id().unwrap(), None);
+        hosted.sql.execute("DROP TRIGGER fail_pin", &[]).unwrap();
+        hosted.append_norm_event(&bootstrap, &verifier).unwrap();
+        assert_eq!(hosted.export_events().unwrap().len(), 1);
+    }
+    #[test]
+    fn norm_host_bindings_and_creation_grants_are_not_request_claims() {
+        let key = SigningKey::from_slice(&[1; 32]).unwrap();
+        let owner = actor("owner", &key);
+        let root = crate::governance::GaugeDeskGovernanceRoot::new("owner", &owner.key_id);
+        assert!(NormGovernanceVerifier::new(
+            vec![
+                NormPrincipalBinding {
+                    actor: owner.clone(),
+                    verifier: &root
+                },
+                NormPrincipalBinding {
+                    actor: owner.clone(),
+                    verifier: &root
+                }
+            ],
+            BTreeSet::new()
+        )
+        .is_err());
+        let verifier = NormGovernanceVerifier::new(
+            vec![NormPrincipalBinding {
+                actor: owner.clone(),
+                verifier: &root,
+            }],
+            BTreeSet::new(),
+        )
+        .unwrap();
+        let bootstrap = signed(
+            owner.clone(),
+            &key,
+            "genesis",
+            NormAct::Bootstrap {
+                creator: "worker".into(),
+                charter: charter(),
+            },
+        );
+        let mut hosted = test_support::store();
+        assert!(hosted.append_norm_event(&bootstrap, &verifier).is_err());
+        assert_eq!(hosted.norm_ledger_id().unwrap(), None);
+        let bytes = bootstrap.statement.signing_bytes().unwrap();
+        let mut unknown = owner.clone();
+        unknown.principal = "invented".into();
+        assert!(verifier
+            .verify(&unknown, &bytes, &bootstrap.signature)
+            .is_err());
+        let mut wrong = owner;
+        wrong.key_id = "another key".into();
+        assert!(verifier
+            .verify(&wrong, &bytes, &bootstrap.signature)
+            .is_err());
+    }
+    #[test]
+    fn norm_native_and_do_rotate_restore_and_keep_the_authority_checkpoint() {
+        let keys: Vec<_> = [1, 3, 4]
+            .into_iter()
+            .map(|n| SigningKey::from_slice(&[n; 32]).unwrap())
+            .collect();
+        let actors: Vec<_> = keys.iter().map(|key| actor("owner", key)).collect();
+        let roots: Vec<_> = actors
+            .iter()
+            .map(|a| crate::governance::GaugeDeskGovernanceRoot::new("owner", &a.key_id))
+            .collect();
+        let verifier = NormGovernanceVerifier::new(
+            actors
+                .iter()
+                .zip(&roots)
+                .map(|(actor, root)| NormPrincipalBinding {
+                    actor: actor.clone(),
+                    verifier: root,
+                })
+                .collect(),
+            BTreeSet::from([("worker".into(), "owner".into())]),
+        )
+        .unwrap();
+        let mut native = whipplescript_store::items::WorkItemStore::open_in_memory().unwrap();
+        let mut hosted = test_support::store();
+        let bootstrap = signed(
+            actors[0].clone(),
+            &keys[0],
+            "genesis",
+            NormAct::Bootstrap {
+                creator: "worker".into(),
+                charter: charter(),
+            },
+        );
+        let ledger = native.append_norm_event(&bootstrap, &verifier).unwrap();
+        assert_eq!(
+            hosted.append_norm_event(&bootstrap, &verifier).unwrap(),
+            ledger
+        );
+        let vocabulary = Vocabulary::new(charter().vocabularies[0].definition.clone())
+            .unwrap()
+            .reference()
+            .clone();
+        let mut records = Vec::new();
+        for nonce in ["D0", "D1"] {
+            let event = signed(
+                actors[0].clone(),
+                &keys[0],
+                nonce,
+                NormAct::Create {
+                    authority: None,
+                    ledger: ledger.clone(),
+                    vocabulary: vocabulary.clone(),
+                    fields_json: r#"{"title":"two independent records"}"#.into(),
+                },
+            );
+            let id = native.append_norm_event(&event, &verifier).unwrap();
+            assert_eq!(hosted.append_norm_event(&event, &verifier).unwrap(), id);
+            records.push(id);
+        }
+        let rotate = |view: &NormView, from: usize, to: usize, nonce: &str| {
+            let mut event = signed(
+                actors[from].clone(),
+                &keys[from],
+                nonce,
+                NormAct::Rotate {
+                    ledger: view.ledger.clone(),
+                    previous: view.authority_head.clone(),
+                    successor: actors[to].clone(),
+                    frontier: view.frontier.iter().cloned().collect(),
+                },
+            );
+            let signature: Signature = keys[to].sign(&event.statement.signing_bytes().unwrap());
+            event.successor_signature = Some(hex::encode(signature.to_bytes()));
+            event
+        };
+        let view = hosted.norm_view(&verifier).unwrap();
+        assert_eq!(view.frontier.len(), 2);
+        let first = rotate(&view, 0, 1, "rotation-one");
+        let r1 = native.append_norm_event(&first, &verifier).unwrap();
+        assert_eq!(hosted.append_norm_event(&first, &verifier).unwrap(), r1);
+        assert_eq!(
+            hosted.norm_checkpoint().unwrap(),
+            native.norm_checkpoint().unwrap()
+        );
+        let transition = NormAct::Transition {
+            ledger: ledger.clone(),
+            authority: Some(r1.clone()),
+            vocabulary,
+            record: records[0].clone(),
+            previous: records[0].clone(),
+            status: "accepted".into(),
+        };
+        let stale_owner = signed(actors[0].clone(), &keys[0], "old-key", transition.clone());
+        assert!(hosted.append_norm_event(&stale_owner, &verifier).is_err());
+        let accepted = signed(actors[1].clone(), &keys[1], "new-key", transition);
+        assert_eq!(
+            hosted.append_norm_event(&accepted, &verifier).unwrap(),
+            native.append_norm_event(&accepted, &verifier).unwrap()
+        );
+        let second = rotate(&hosted.norm_view(&verifier).unwrap(), 1, 2, "rotation-two");
+        let before = hosted.export_events().unwrap();
+        hosted.sql.execute("CREATE TRIGGER fail_rotation BEFORE UPDATE ON tracker_norm_checkpoint BEGIN SELECT RAISE(ABORT, 'injected failure'); END", &[]).unwrap();
+        assert!(hosted.append_norm_event(&second, &verifier).is_err());
+        assert_eq!(hosted.export_events().unwrap(), before);
+        assert_eq!(
+            hosted.norm_checkpoint().unwrap().unwrap().authority_head,
+            r1
+        );
+        hosted
+            .sql
+            .execute("DROP TRIGGER fail_rotation", &[])
+            .unwrap();
+        let r2 = native.append_norm_event(&second, &verifier).unwrap();
+        assert_eq!(hosted.append_norm_event(&second, &verifier).unwrap(), r2);
+        let checkpoint = hosted.norm_checkpoint().unwrap().unwrap();
+        assert_eq!(
+            hosted.export_events().unwrap(),
+            native.export_events().unwrap()
+        );
+        let mut events = hosted.export_events().unwrap();
+        let mut restored = test_support::store();
+        restored.pin_norm_checkpoint(&checkpoint).unwrap();
+        assert_eq!(restored.norm_ledger_id().unwrap(), Some(ledger.clone()));
+        assert!(restored
+            .import_norm_events(&events[..3], &verifier)
+            .is_err());
+        assert!(restored.export_events().unwrap().is_empty());
+        events.reverse();
+        assert_eq!(restored.import_norm_events(&events, &verifier).unwrap(), 6);
+        assert_eq!(restored.import_norm_events(&events, &verifier).unwrap(), 0);
+        assert_eq!(
+            restored.norm_checkpoint().unwrap(),
+            Some(checkpoint.clone())
+        );
+        assert_eq!(
+            restored.norm_view(&verifier).unwrap().records,
+            native.norm_view(&verifier).unwrap().records
+        );
+        let mut advancing = test_support::store();
+        advancing.pin_norm_ledger(&ledger).unwrap();
+        advancing.import_norm_events(&events, &verifier).unwrap();
+        assert_eq!(
+            advancing.norm_checkpoint().unwrap(),
+            Some(checkpoint.clone())
+        );
+        // Losing an earlier edge does not erase the retained checkpoint, and
+        // restoring that edge cannot move it backwards via an insert trigger.
+        restored
+            .sql
+            .execute(
+                "DELETE FROM tracker_events WHERE event_id = ?1",
+                &[text(&r1)],
+            )
+            .unwrap();
+        assert!(restored.norm_view(&verifier).is_err());
+        assert_eq!(
+            restored
+                .import_norm_events(&[first.tracker_event().unwrap()], &verifier)
+                .unwrap(),
+            1
+        );
+        assert_eq!(restored.norm_checkpoint().unwrap(), Some(checkpoint));
+        assert_eq!(restored.norm_view(&verifier).unwrap().owner, actors[2]);
+    }
+    #[test]
+    fn norm_do_bundled_edits_and_local_aliases_match_native_records() {
+        let owner_key = SigningKey::from_slice(&[1; 32]).unwrap();
+        let worker_key = SigningKey::from_slice(&[2; 32]).unwrap();
+        let owner = actor("owner", &owner_key);
+        let worker = actor("worker", &worker_key);
+        let owner_root = crate::governance::GaugeDeskGovernanceRoot::new("owner", &owner.key_id);
+        let worker_root = crate::governance::GaugeDeskGovernanceRoot::new("worker", &worker.key_id);
+        let verifier = NormGovernanceVerifier::new(
+            vec![
+                NormPrincipalBinding {
+                    actor: owner.clone(),
+                    verifier: &owner_root,
+                },
+                NormPrincipalBinding {
+                    actor: worker.clone(),
+                    verifier: &worker_root,
+                },
+            ],
+            BTreeSet::from([("worker".into(), "owner".into())]),
+        )
+        .unwrap();
+        let c = NormCharter::bundled().unwrap();
+        let reference = |name: &str| {
+            Vocabulary::new(
+                c.vocabularies
+                    .iter()
+                    .find(|entry| entry.definition.name == name)
+                    .unwrap()
+                    .definition
+                    .clone(),
+            )
+            .unwrap()
+            .reference()
+            .clone()
+        };
+        let mut native = whipplescript_store::items::WorkItemStore::open_in_memory().unwrap();
+        let mut hosted = test_support::store();
+        let bootstrap = signed(
+            owner.clone(),
+            &owner_key,
+            "bundle",
+            NormAct::Bootstrap {
+                creator: "worker".into(),
+                charter: c.clone(),
+            },
+        );
+        let ledger = native.append_norm_event(&bootstrap, &verifier).unwrap();
+        assert_eq!(
+            hosted.append_norm_event(&bootstrap, &verifier).unwrap(),
+            ledger
+        );
+        let fields = r#"{"title":"repair","intent":"deny worker","subjects":["src/auth.py"]}"#;
+        let creation = signed(
+            worker.clone(),
+            &worker_key,
+            "D0",
+            NormAct::Create {
+                ledger: ledger.clone(),
+                authority: None,
+                vocabulary: reference("decision"),
+                fields_json: fields.into(),
+            },
+        );
+        let record = native.append_norm_event(&creation, &verifier).unwrap();
+        assert_eq!(
+            hosted.append_norm_event(&creation, &verifier).unwrap(),
+            record
+        );
+        assert_eq!(
+            hosted.norm_aliases().unwrap(),
+            native.norm_aliases().unwrap()
+        );
+        assert_eq!(
+            hosted.resolve_norm_record("N-1").unwrap(),
+            Some(record.clone())
+        );
+        let accept = signed(
+            owner.clone(),
+            &owner_key,
+            "accept",
+            NormAct::Transition {
+                ledger: ledger.clone(),
+                authority: None,
+                vocabulary: reference("decision"),
+                record: record.clone(),
+                previous: record.clone(),
+                status: "accepted".into(),
+            },
+        );
+        let accepted_head = native.append_norm_event(&accept, &verifier).unwrap();
+        assert_eq!(
+            hosted.append_norm_event(&accept, &verifier).unwrap(),
+            accepted_head
+        );
+        let noop = signed(worker.clone(), &worker_key, "noop", NormAct::Edit {
+            ledger: ledger.clone(), authority: None, vocabulary: reference("decision"), record: record.clone(),
+            previous: accepted_head, fields_json: r#" { "subjects" : ["src/auth.py"], "intent" : "deny worker", "title" : "repair" } "#.into(),
+        });
+        let noop_head = native.append_norm_event(&noop, &verifier).unwrap();
+        assert_eq!(
+            hosted.append_norm_event(&noop, &verifier).unwrap(),
+            noop_head
+        );
+        assert_eq!(
+            hosted.norm_view(&verifier).unwrap().records[&record].status,
+            "accepted"
+        );
+        assert_eq!(
+            hosted.norm_view(&verifier).unwrap().records[&record].content_head,
+            record
+        );
+        let change = signed(worker.clone(), &worker_key, "edit", NormAct::Edit {
+            ledger: ledger.clone(), authority: None, vocabulary: reference("decision"), record: record.clone(),
+            previous: noop_head, fields_json: r#"{"title":"repair","intent":"deny unknown roles too","subjects":["src/auth.py"]}"#.into(),
+        });
+        let edited = native.append_norm_event(&change, &verifier).unwrap();
+        assert_eq!(
+            hosted.append_norm_event(&change, &verifier).unwrap(),
+            edited
+        );
+        assert_eq!(
+            hosted.norm_view(&verifier).unwrap().records,
+            native.norm_view(&verifier).unwrap().records
+        );
+        assert_eq!(
+            hosted.norm_view(&verifier).unwrap().records[&record].status,
+            "proposed"
+        );
+        assert_eq!(
+            hosted.norm_view(&verifier).unwrap().records[&record].content_head,
+            edited
+        );
+        let active = hosted.norm_view(&verifier).unwrap().effective_records;
+        assert_eq!(
+            active,
+            native.norm_view(&verifier).unwrap().effective_records
+        );
+        assert_eq!(active[&record].content_head, record);
+        assert_eq!(
+            active[&record].head,
+            accept.tracker_event().unwrap().event_id
+        );
+        assert_eq!(active[&record].fields["intent"], "deny worker");
+        let mut host =
+            whipplescript_store::norm_commands::NormCommandHost::new(&mut hosted, &verifier);
+        let snapshot = host
+            .execute(whipplescript_store::norm_commands::NormCommandRequest::new(
+                whipplescript_store::norm_commands::NormCommand::Snapshot {},
+            ))
+            .unwrap();
+        let value = serde_json::to_value(snapshot).unwrap();
+        assert_eq!(
+            value["result"]["snapshot"]["records"][0]["effectiveness"]["kind"],
+            "active"
+        );
+        assert_eq!(
+            value["result"]["snapshot"]["records"][0]["effectiveness"]["record"]["content_head"],
+            record
+        );
+        let mut clone = test_support::store();
+        clone.append_norm_event(&bootstrap, &verifier).unwrap();
+        let local = signed(
+            worker,
+            &worker_key,
+            "local-issue",
+            NormAct::Create {
+                ledger,
+                authority: None,
+                vocabulary: reference("issue"),
+                fields_json: r#"{"title":"local"}"#.into(),
+            },
+        );
+        let local_id = clone.append_norm_event(&local, &verifier).unwrap();
+        let mut history = hosted.export_events().unwrap();
+        history.reverse();
+        assert_eq!(clone.import_norm_events(&history, &verifier).unwrap(), 4);
+        assert_eq!(clone.import_norm_events(&history, &verifier).unwrap(), 0);
+        assert_eq!(clone.norm_aliases().unwrap()[&record], "N-2");
+        assert_eq!(
+            clone.norm_view(&verifier).unwrap().effective_records,
+            active
+        );
+        assert_eq!(clone.resolve_norm_record("N-1").unwrap(), Some(local_id));
+        assert_eq!(
+            clone.resolve_norm_record(&record).unwrap(),
+            Some(record.clone())
+        );
+        assert_eq!(clone.resolve_norm_record("N-01").unwrap(), None);
+        assert_eq!(
+            clone.norm_view(&verifier).unwrap().records[&record],
+            hosted.norm_view(&verifier).unwrap().records[&record]
+        );
+    }
+
+    #[test]
+    fn norm_do_alias_allocation_is_atomic_for_batch_import_and_append() {
+        let key = SigningKey::from_slice(&[1; 32]).unwrap();
+        let owner = actor("owner", &key);
+        let root = crate::governance::GaugeDeskGovernanceRoot::new("owner", &owner.key_id);
+        let verifier = NormGovernanceVerifier::new(
+            vec![NormPrincipalBinding {
+                actor: owner.clone(),
+                verifier: &root,
+            }],
+            BTreeSet::from([("worker".into(), "owner".into())]),
+        )
+        .unwrap();
+        let bootstrap = signed(
+            owner.clone(),
+            &key,
+            "genesis",
+            NormAct::Bootstrap {
+                creator: "worker".into(),
+                charter: charter(),
+            },
+        );
+        let mut source = whipplescript_store::items::WorkItemStore::open_in_memory().unwrap();
+        let ledger = source.append_norm_event(&bootstrap, &verifier).unwrap();
+        let vocabulary = Vocabulary::new(charter().vocabularies[0].definition.clone())
+            .unwrap()
+            .reference()
+            .clone();
+        let create = |nonce: &str| {
+            signed(
+                owner.clone(),
+                &key,
+                nonce,
+                NormAct::Create {
+                    ledger: ledger.clone(),
+                    authority: None,
+                    vocabulary: vocabulary.clone(),
+                    fields_json: r#"{"title":"local name"}"#.into(),
+                },
+            )
+        };
+        source.append_norm_event(&create("A"), &verifier).unwrap();
+        source.append_norm_event(&create("B"), &verifier).unwrap();
+        let history = source.export_events().unwrap();
+        let mut hosted = test_support::store();
+        hosted.append_norm_event(&bootstrap, &verifier).unwrap();
+        hosted.sql.execute("CREATE TRIGGER fail_second_alias BEFORE INSERT ON tracker_norm_aliases WHEN (SELECT count(*) FROM tracker_norm_aliases) >= 1 BEGIN SELECT RAISE(ABORT, 'injected second allocation failure'); END", &[]).unwrap();
+        assert!(hosted.import_norm_events(&history, &verifier).is_err());
+        assert_eq!(hosted.export_events().unwrap().len(), 1);
+        assert!(hosted.norm_aliases().unwrap().is_empty());
+        assert_eq!(hosted.resolve_norm_record("N-1").unwrap(), None);
+        hosted
+            .sql
+            .execute("DROP TRIGGER fail_second_alias", &[])
+            .unwrap();
+        assert_eq!(hosted.import_norm_events(&history, &verifier).unwrap(), 2);
+        assert_eq!(hosted.norm_aliases().unwrap().len(), 2);
+        let third = hosted.append_norm_event(&create("C"), &verifier).unwrap();
+        assert_eq!(hosted.norm_aliases().unwrap()[&third], "N-3");
+        hosted.sql.execute("CREATE TRIGGER fail_alias BEFORE INSERT ON tracker_norm_aliases BEGIN SELECT RAISE(ABORT, 'injected append failure'); END", &[]).unwrap();
+        assert!(hosted.append_norm_event(&create("D"), &verifier).is_err());
+        assert_eq!(hosted.export_events().unwrap().len(), 4);
+        assert_eq!(hosted.norm_aliases().unwrap().len(), 3);
+        hosted.sql.execute("DROP TRIGGER fail_alias", &[]).unwrap();
+        let fourth = hosted.append_norm_event(&create("D"), &verifier).unwrap();
+        assert_eq!(hosted.norm_aliases().unwrap()[&fourth], "N-4");
+        let first_id = hosted.resolve_norm_record("N-1").unwrap().unwrap();
+        let first = history
+            .iter()
+            .find(|event| event.event_id == first_id)
+            .unwrap();
+        hosted
+            .sql
+            .execute(
+                "DELETE FROM tracker_events WHERE event_id = ?1",
+                &[text(&first_id)],
+            )
+            .unwrap();
+        assert_eq!(
+            hosted
+                .import_norm_events(std::slice::from_ref(first), &verifier)
+                .unwrap(),
+            1
+        );
+        assert_eq!(hosted.resolve_norm_record("N-1").unwrap(), Some(first_id));
+        let fifth = hosted.append_norm_event(&create("E"), &verifier).unwrap();
+        assert_eq!(hosted.norm_aliases().unwrap()[&fifth], "N-5");
+    }
+    #[test]
+    fn norm_command_protocol_has_native_do_parity_without_imported_trust() {
+        use whipplescript_store::norm_commands::*;
+        fn run<S: NormCommandStore>(
+            store: &mut S,
+            verifier: &dyn NormVerifier,
+            command: NormCommand,
+        ) -> StoreResult<serde_json::Value> {
+            let wire = serde_json::to_string(&NormCommandRequest::new(command))?;
+            let request = serde_json::from_str(&wire)?;
+            Ok(serde_json::to_value(
+                NormCommandHost::new(store, verifier).execute(request)?,
+            )?)
+        }
+        let owner_key = SigningKey::from_slice(&[1; 32]).unwrap();
+        let worker_key = SigningKey::from_slice(&[2; 32]).unwrap();
+        let owner = actor("owner", &owner_key);
+        let worker = actor("worker", &worker_key);
+        let owner_root = crate::governance::GaugeDeskGovernanceRoot::new("owner", &owner.key_id);
+        let worker_root = crate::governance::GaugeDeskGovernanceRoot::new("worker", &worker.key_id);
+        let verifier = NormGovernanceVerifier::new(
+            vec![
+                NormPrincipalBinding {
+                    actor: owner.clone(),
+                    verifier: &owner_root,
+                },
+                NormPrincipalBinding {
+                    actor: worker.clone(),
+                    verifier: &worker_root,
+                },
+            ],
+            BTreeSet::from([("worker".into(), "owner".into())]),
+        )
+        .unwrap();
+        let charter = NormCharter::bundled().unwrap();
+        let vocabulary = Vocabulary::new(
+            charter
+                .vocabularies
+                .iter()
+                .find(|entry| entry.definition.name == "decision")
+                .unwrap()
+                .definition
+                .clone(),
+        )
+        .unwrap()
+        .reference()
+        .clone();
+        let genesis = signed(
+            owner.clone(),
+            &owner_key,
+            "command-genesis",
+            NormAct::Bootstrap {
+                creator: "worker".into(),
+                charter,
+            },
+        );
+        let ledger = genesis.tracker_event().unwrap().event_id;
+        let creation = signed(
+            worker.clone(),
+            &worker_key,
+            "command-create",
+            NormAct::Create {
+                ledger: ledger.clone(),
+                authority: None,
+                vocabulary: vocabulary.clone(),
+                fields_json:
+                    r#"{"title":"repair","intent":"deny worker","subjects":["src/auth.py"]}"#.into(),
+            },
+        );
+        let record = creation.tracker_event().unwrap().event_id;
+        let mut native = whipplescript_store::items::WorkItemStore::open_in_memory().unwrap();
+        let mut hosted = test_support::store();
+        for event in [genesis, creation] {
+            assert_eq!(
+                run(&mut native, &verifier, NormCommand::append(event.clone())).unwrap(),
+                run(&mut hosted, &verifier, NormCommand::append(event)).unwrap()
+            );
+        }
+        let action = NormAct::Transition {
+            ledger,
+            authority: None,
+            vocabulary,
+            record: record.clone(),
+            previous: record,
+            status: "accepted".into(),
+        };
+        let denied = signed(worker, &worker_key, "command-accept-denied", action.clone());
+        assert!(run(&mut native, &verifier, NormCommand::append(denied.clone())).is_err());
+        assert!(run(&mut hosted, &verifier, NormCommand::append(denied)).is_err());
+        let accepted = signed(owner, &owner_key, "command-accept", action);
+        assert_eq!(
+            run(
+                &mut native,
+                &verifier,
+                NormCommand::append(accepted.clone())
+            )
+            .unwrap(),
+            run(&mut hosted, &verifier, NormCommand::append(accepted)).unwrap()
+        );
+        for command in [NormCommand::Snapshot {}, NormCommand::Export {}] {
+            assert_eq!(
+                run(&mut native, &verifier, command.clone()).unwrap(),
+                run(&mut hosted, &verifier, command).unwrap()
+            );
+        }
+        let checkpoint = native.norm_checkpoint().unwrap().unwrap();
+        let mut events = native.export_events().unwrap();
+        events.reverse();
+        let mut other_native = whipplescript_store::items::WorkItemStore::open_in_memory().unwrap();
+        let mut other_hosted = test_support::store();
+        assert!(run(
+            &mut other_native,
+            &verifier,
+            NormCommand::Import {
+                events: events.clone()
+            }
+        )
+        .is_err());
+        assert!(run(
+            &mut other_hosted,
+            &verifier,
+            NormCommand::Import {
+                events: events.clone()
+            }
+        )
+        .is_err());
+        other_native.pin_norm_checkpoint(&checkpoint).unwrap();
+        other_hosted.pin_norm_checkpoint(&checkpoint).unwrap();
+        for expected in [3, 0] {
+            let n = run(
+                &mut other_native,
+                &verifier,
+                NormCommand::Import {
+                    events: events.clone(),
+                },
+            )
+            .unwrap();
+            let d = run(
+                &mut other_hosted,
+                &verifier,
+                NormCommand::Import {
+                    events: events.clone(),
+                },
+            )
+            .unwrap();
+            assert_eq!(n, d);
+            assert_eq!(n["result"]["inserted"], expected);
+        }
+        assert_eq!(
+            run(&mut other_native, &verifier, NormCommand::Snapshot {}).unwrap(),
+            run(&mut hosted, &verifier, NormCommand::Snapshot {}).unwrap()
+        );
+    }
+    #[test]
+    fn norm_resources_native_and_do_derive_identical_captured_comparisons() {
+        use whipplescript_store::branches::{Branches, CutRecord, MAINLINE_BRANCH_ID};
+        use whipplescript_store::content::ContentBlobs;
+        use whipplescript_store::norm_artifact::{capture_cut, ArtifactLimits, CapturedArtifact};
+        use whipplescript_store::norm_resources::{
+            compare_resources, ResourceChange, ResourceLimits,
+        };
+        fn captures(
+            mut branches: impl Branches,
+            content: impl ContentBlobs,
+        ) -> [CapturedArtifact; 2] {
+            branches.ensure_mainline("t0").expect("mainline");
+            ["before", "after"].map(|id| {
+                let manifest = BTreeMap::from([
+                    (
+                        "src/auth.py".into(),
+                        content.put("authorization".as_bytes()).expect("subject"),
+                    ),
+                    (
+                        "src/parser.py".into(),
+                        content.put(id.as_bytes()).expect("dependency"),
+                    ),
+                ]);
+                let root = whipplescript_store::manifest_tree::build(&content, &manifest)
+                    .expect("manifest");
+                branches
+                    .record_cut(CutRecord {
+                        cut_id: id,
+                        change_id: id,
+                        branch_id: MAINLINE_BRANCH_ID,
+                        manifest_hash: &root,
+                        parent_cut_id: None,
+                        origin: None,
+                        actor: None,
+                        intent: None,
+                        recorded_at: "t1",
+                    })
+                    .expect("cut");
+                capture_cut(&branches, &content, id, ArtifactLimits::default()).expect("capture")
+            })
+        }
+        let key = SigningKey::from_slice(&[1; 32]).unwrap();
+        let owner = actor("owner", &key);
+        let root = crate::governance::GaugeDeskGovernanceRoot::new("owner", &owner.key_id);
+        let verifier = NormGovernanceVerifier::new(
+            vec![NormPrincipalBinding {
+                actor: owner.clone(),
+                verifier: &root,
+            }],
+            BTreeSet::from([("owner".into(), "owner".into())]),
+        )
+        .unwrap();
+        let charter = NormCharter::bundled().unwrap();
+        let vocabulary = Vocabulary::new(
+            charter
+                .vocabularies
+                .iter()
+                .find(|entry| entry.definition.name == "obligation")
+                .unwrap()
+                .definition
+                .clone(),
+        )
+        .unwrap();
+        let mut native = whipplescript_store::items::WorkItemStore::open_in_memory().unwrap();
+        let mut hosted = test_support::store();
+        let bootstrap = signed(
+            owner.clone(),
+            &key,
+            "resource-genesis",
+            NormAct::Bootstrap {
+                creator: "owner".into(),
+                charter,
+            },
+        );
+        let ledger = native.append_norm_event(&bootstrap, &verifier).unwrap();
+        assert_eq!(
+            hosted.append_norm_event(&bootstrap, &verifier).unwrap(),
+            ledger
+        );
+        let create=signed(owner.clone(),&key,"resource-create",NormAct::Create {ledger:ledger.clone(),authority:Some(ledger.clone()),vocabulary:vocabulary.reference().clone(),fields_json:serde_json::json!({"name":"auth","proposition":"deny unknown","domain":"workspace","subject":"src/auth.py"}).to_string()});
+        let id = native.append_norm_event(&create, &verifier).unwrap();
+        assert_eq!(hosted.append_norm_event(&create, &verifier).unwrap(), id);
+        let accept = signed(
+            owner,
+            &key,
+            "resource-accept",
+            NormAct::Transition {
+                ledger: ledger.clone(),
+                authority: Some(ledger),
+                vocabulary: vocabulary.reference().clone(),
+                record: id.clone(),
+                previous: id.clone(),
+                status: "accepted".into(),
+            },
+        );
+        assert_eq!(
+            native.append_norm_event(&accept, &verifier).unwrap(),
+            hosted.append_norm_event(&accept, &verifier).unwrap()
+        );
+        let native_artifacts = captures(
+            whipplescript_store::branches::BranchStore::open(":memory:").unwrap(),
+            whipplescript_store::content::ContentStore::open(":memory:").unwrap(),
+        );
+        let sql = test_support::RusqliteDoSql::in_memory();
+        let hosted_artifacts = captures(
+            crate::do_branches::DoBranches::new(sql.clone()).unwrap(),
+            crate::do_branches::DoContentBlobs::new(sql).unwrap(),
+        );
+        let native_view = native.norm_view(&verifier).unwrap();
+        let hosted_view = hosted.norm_view(&verifier).unwrap();
+        let left = compare_resources(
+            &native_view,
+            &native_artifacts[0],
+            &native_view,
+            &native_artifacts[1],
+            ResourceLimits::default(),
+        )
+        .unwrap();
+        let right = compare_resources(
+            &hosted_view,
+            &hosted_artifacts[0],
+            &hosted_view,
+            &hosted_artifacts[1],
+            ResourceLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(left, right);
+        assert!(left.before.binding_complete && left.after.binding_complete);
+        assert_eq!(left.requirements, BTreeSet::from([id]));
+        assert_eq!(
+            left.changes,
+            BTreeMap::from([("src/parser.py".into(), ResourceChange::Modified)])
+        );
+    }
+}
+
+impl<S: DoSql> norm_publication::NormPublicationJournal for DoSqliteStore<S> {
+    fn prepare_publication(
+        &self,
+        candidate: &norm_publication::PublicationCandidate,
+    ) -> StoreResult<norm_publication::RetainedPublication> {
+        recovery::atomic_result(&self.sql, true, &mut || {
+            norm_publication::prepare_in_transaction(self, candidate)
+        })
+    }
+    fn acknowledge_publication(
+        &self,
+        slot: &norm_publication::PublicationSlot,
+        event_id: &str,
+    ) -> StoreResult<StoredEvent> {
+        recovery::atomic_result(&self.sql, true, &mut || {
+            norm_publication::acknowledge_in_transaction(self, slot, event_id)
+        })
     }
 }

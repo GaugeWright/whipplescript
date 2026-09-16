@@ -1,0 +1,238 @@
+--- Observer state belongs to the host, outside the candidate interpreter.
+--- Memory-safe interpreter execution and absent host capabilities are premises;
+--- these rules do not derive them from a candidate-authored receipt.
+mod NORM-OBSERVER is
+  protecting BOOL .
+  sorts Case Value Fact Cfg State .
+  ops c0 c1 : -> Case [ctor] . ops yes no : -> Value [ctor] .
+  subsort Fact < Cfg . op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+  op {_} : Cfg -> State [ctor] .
+  op required : Case Value -> Fact [ctor] .
+  op pending : Case -> Fact [ctor] .
+  op invoke : Case -> Fact [ctor] .
+  op returned : Case Value -> Fact [ctor] .
+  op observed : Case Value -> Fact [ctor] .
+  op candidateText : Case Value -> Fact [ctor] .
+  ops protected privateProtocol complete supported : -> Fact [ctor] .
+  var K : Case . var V : Value . var C : Cfg .
+  rl [host-invokes] : { protected privateProtocol pending(K) C }
+    => { protected privateProtocol invoke(K) C } .
+  --- Only the embedding boundary, never candidate stdout, supplies returned.
+  rl [host-records-return] : { protected privateProtocol invoke(K) returned(K,V) C }
+    => { protected privateProtocol observed(K,V) C } .
+  rl [host-completes] : { protected privateProtocol required(c0,yes) required(c1,no)
+      observed(c0,yes) observed(c1,no) C }
+    => { protected privateProtocol complete supported C } .
+endm
+
+--- A separately delivered guest is executable authority. Equality here models
+--- checking its bytes against a host-installed digest, not trusting a manifest
+--- supplied alongside the candidate. ABI isolation remains an explicit premise.
+mod NORM-OBSERVER-ARTIFACT is
+  including NORM-OBSERVER .
+  sort RuntimeIdentity . ops runtime0 runtime1 : -> RuntimeIdentity [ctor] .
+  ops installedRuntime loadedRuntime : RuntimeIdentity -> Fact [ctor] .
+  op isolatedABI : -> Fact [ctor] .
+  var R : RuntimeIdentity . var C : Cfg .
+  rl [verify-runtime-before-observation] :
+    { installedRuntime(R) loadedRuntime(R) isolatedABI C }
+    => { protected C } .
+endm
+
+mod NORM-OBSERVER-WEAK-ARTIFACT is
+  including NORM-OBSERVER-ARTIFACT .
+  vars R S : RuntimeIdentity . var C : Cfg .
+  rl [accept-a-different-runtime] :
+    { installedRuntime(R) loadedRuntime(S) isolatedABI C }
+    => { protected C } .
+endm
+
+mod NORM-OBSERVER-WEAK-UNPINNED is
+  including NORM-OBSERVER-ARTIFACT .
+  var R : RuntimeIdentity . var C : Cfg .
+  rl [loaded-runtime-selects-its-own-authority] :
+    { loadedRuntime(R) isolatedABI C }
+    => { protected C } .
+endm
+mod NORM-OBSERVER-WEAK-TEXT is
+  including NORM-OBSERVER . var K : Case . var V : Value . var C : Cfg .
+  rl [candidate-fabricates-observation] : { candidateText(K,V) C }
+    => { observed(K,V) C } .
+endm
+mod NORM-OBSERVER-WEAK-CALL is
+  including NORM-OBSERVER . var K : Case . var V : Value . var C : Cfg .
+  rl [uninvoked-return] : { protected privateProtocol returned(K,V) C }
+    => { protected privateProtocol observed(K,V) C } .
+endm
+mod NORM-OBSERVER-WEAK-EXPECTED is
+  including NORM-OBSERVER . var K : Case . vars V E : Value . var C : Cfg .
+  rl [substitute-expectation] : { protected privateProtocol required(K,E) invoke(K) returned(K,V) C }
+    => { protected privateProtocol required(K,E) observed(K,E) C } .
+endm
+
+mod NORM-OBSERVER-WEAK-CHANNEL is
+  including NORM-OBSERVER . var K : Case . var V : Value . var C : Cfg .
+  rl [certify-without-a-private-protocol-channel] :
+    { protected invoke(K) returned(K,V) C }
+    => { protected observed(K,V) C } .
+endm
+
+--- An image build alone does not establish an installed runtime binding.
+--- Exact profile acknowledgment abstracts the isolated ABI probe, not its proof.
+mod NORM-RUNTIME-IMAGE is
+ sorts Artifact Daemon Probe Phase Cfg .
+ ops pinned changed : -> Artifact [ctor] .
+ ops retained foreign : -> Daemon [ctor] .
+ ops exact substituted : -> Probe [ctor] .
+ ops staged built verified : -> Phase [ctor] .
+ op cfg : Artifact Daemon Probe Phase -> Cfg [ctor] .
+ var P : Probe .
+ rl [build] : cfg(pinned,retained,P,staged) => cfg(pinned,retained,P,built) .
+ rl [verify] : cfg(pinned,retained,exact,built) => cfg(pinned,retained,exact,verified) .
+ rl [daemon-change] : cfg(pinned,retained,P,built) => cfg(pinned,foreign,P,built) .
+endm
+mod NORM-RUNTIME-IMAGE-WEAK is
+ including NORM-RUNTIME-IMAGE .
+ rl [unpin] : cfg(changed,retained,exact,staged) => cfg(changed,retained,exact,built) .
+ rl [skip-probe] : cfg(pinned,retained,substituted,built) => cfg(pinned,retained,substituted,verified) .
+ rl [wrong-daemon] : cfg(pinned,foreign,exact,built) => cfg(pinned,foreign,exact,verified) .
+endm
+
+--- The current host configuration is not authority to rewrite an admitted run.
+mod NORM-NATIVE-ADMISSION is
+ sorts Binding Run Fence Phase Cfg .
+ ops original replacement : -> Binding [ctor] .
+ ops fresh managed legacy : -> Run [ctor] .
+ ops open fenced : -> Fence [ctor] .
+ ops selected tracked allocated refused : -> Phase [ctor] .
+ op cfg : Binding Binding Run Fence Phase -> Cfg [ctor] .
+ vars B H : Binding . var F : Fence .
+ rl [fresh] : cfg(B,B,fresh,F,selected) => cfg(B,B,managed,F,tracked) .
+ rl [resume-original] : cfg(B,H,managed,F,selected) => cfg(B,H,managed,F,tracked) .
+ rl [allocate-unfenced] : cfg(B,H,managed,open,tracked) => cfg(B,H,managed,open,allocated) .
+ rl [legacy-refusal] : cfg(B,H,legacy,F,selected) => cfg(B,H,legacy,F,refused) .
+endm
+mod NORM-NATIVE-ADMISSION-WEAK is
+ including NORM-NATIVE-ADMISSION .
+ rl [replace-on-resume] : cfg(original,replacement,managed,open,selected) => cfg(replacement,replacement,managed,open,tracked) .
+ rl [upgrade-legacy] : cfg(original,original,legacy,open,selected) => cfg(original,original,managed,open,tracked) .
+ rl [ignore-fence] : cfg(original,original,managed,fenced,tracked) => cfg(original,original,managed,fenced,allocated) .
+endm
+
+--- A replayable result still owes physical cleanup and evidence retention.
+mod NORM-NATIVE-DRIVER is
+ sorts Reply Phase State .
+ ops pending replay : -> Reply [ctor] .
+ ops active fenced removed retained settled : -> Phase [ctor] .
+ op cfg : Reply Phase -> State [ctor] .
+ rl [fence-replay] : cfg(replay,active) => cfg(replay,fenced) .
+ rl [remove] : cfg(replay,fenced) => cfg(replay,removed) .
+ rl [retain-proof-outcome] : cfg(replay,removed) => cfg(replay,retained) .
+ rl [settle] : cfg(replay,retained) => cfg(replay,settled) .
+endm
+mod NORM-NATIVE-DRIVER-WEAK is
+ including NORM-NATIVE-DRIVER .
+ rl [fence-live-reattachment] : cfg(pending,active) => cfg(pending,fenced) .
+ rl [settle-without-retention] : cfg(replay,removed) => cfg(replay,settled) .
+endm
+
+--- Polling cannot turn an absent external admission into a new delivery.
+mod NORM-NATIVE-POLL is
+ sorts Reply Intent Phase State .
+ ops absent pending terminal : -> Reply [ctor] .
+ ops open fenced : -> Intent [ctor] .
+ ops ready read cleanup delivered : -> Phase [ctor] .
+ op cfg : Reply Intent Phase -> State [ctor] .
+ var R : Reply . var I : Intent .
+ rl [poll] : cfg(R,open,ready) => cfg(R,open,read) .
+ rl [terminal-fence] : cfg(terminal,open,read) => cfg(terminal,fenced,cleanup) .
+ rl [retained-intent] : cfg(R,fenced,ready) => cfg(R,fenced,cleanup) .
+endm
+mod NORM-NATIVE-POLL-WEAK is
+ including NORM-NATIVE-POLL .
+ rl [redispatch-absent] : cfg(absent,open,read) => cfg(absent,open,delivered) .
+ rl [fence-live] : cfg(pending,open,read) => cfg(pending,fenced,cleanup) .
+ rl [ignore-intent] : cfg(pending,fenced,ready) => cfg(pending,open,read) .
+endm
+
+mod NORM-NATIVE-WORKER is
+ sorts Host Admission Phase State .
+ ops configured missing : -> Host [ctor] .
+ ops fresh partial legacy proved unclosed : -> Admission [ctor] .
+ ops ready tracked managed authorized inprocess delivered refused : -> Phase [ctor] .
+ op cfg : Host Admission Phase -> State [ctor] .
+ rl [dispatch] : cfg(configured,fresh,ready) => cfg(configured,fresh,managed) .
+ rl [proved-retry] : cfg(configured,proved,ready) => cfg(configured,proved,managed) .
+ rl [restore-tracking] : cfg(configured,partial,ready) => cfg(configured,partial,tracked) .
+ rl [resume-original] : cfg(configured,partial,tracked) => cfg(configured,partial,managed) .
+ --- External authority is supplied by the separately checked controller; the
+ --- workflow journal cannot manufacture this phase by repairing its tracking.
+ rl [authorized-delivery] : cfg(configured,partial,authorized) => cfg(configured,partial,delivered) .
+ rl [refuse-missing] : cfg(missing,fresh,ready) => cfg(missing,fresh,refused) .
+endm
+mod NORM-NATIVE-WORKER-WEAK is
+ including NORM-NATIVE-WORKER .
+ rl [fallback] : cfg(missing,fresh,ready) => cfg(missing,fresh,inprocess) .
+ rl [unclosed-retry] : cfg(configured,unclosed,ready) => cfg(configured,unclosed,managed) .
+ rl [adopt-legacy] : cfg(configured,legacy,ready) => cfg(configured,legacy,tracked) .
+ rl [redispatch-recovery] : cfg(configured,partial,tracked) => cfg(configured,partial,delivered) .
+endm
+
+--- Pins, recipe identity, paths and ABI-probe outcome are host premises.
+mod NORM-HOSTED-CONTEXT is
+ sorts Binding Probe Phase State .
+ ops exact changed : -> Binding [ctor] .
+ ops passed failed : -> Probe [ctor] .
+ ops input prepared verified : -> Phase [ctor] .
+ op cfg : Binding Binding Probe Phase -> State [ctor] .
+ var P : Probe .
+ rl [prepare] : cfg(exact,exact,P,input) => cfg(exact,exact,P,prepared) .
+ rl [build-probe] : cfg(exact,exact,passed,prepared) => cfg(exact,exact,passed,verified) .
+endm
+mod NORM-HOSTED-CONTEXT-WEAK is
+ including NORM-HOSTED-CONTEXT .
+ rl [unbound-artifact] : cfg(changed,exact,passed,input) => cfg(changed,exact,passed,prepared) .
+ rl [changed-profile] : cfg(exact,changed,passed,input) => cfg(exact,changed,passed,prepared) .
+ rl [missing-probe] : cfg(exact,exact,failed,prepared) => cfg(exact,exact,failed,verified) .
+endm
+
+mod NORM-HOSTED-PROFILE is
+  sorts Profile Phase State .
+  ops exact missing changed cooperative : -> Profile [ctor] .
+  ops queued admitted : -> Phase [ctor] .
+  op cfg : Profile Phase -> State [ctor] .
+  rl [protected] : cfg(exact, queued) => cfg(exact, admitted) .
+  rl [cooperative] : cfg(cooperative, queued) => cfg(cooperative, admitted) .
+endm
+mod NORM-HOSTED-PROFILE-WEAK is
+  including NORM-HOSTED-PROFILE .
+  rl [missing-profile] : cfg(missing, queued) => cfg(missing, admitted) .
+  rl [changed-profile] : cfg(changed, queued) => cfg(changed, admitted) .
+endm
+
+mod NORM-HOSTED-PROCESS is
+  sorts Proof Phase State .
+  ops exact absent stale changed : -> Proof [ctor] .
+  ops preparing admitted : -> Phase [ctor] .
+  op cfg : Proof Phase -> State [ctor] .
+  rl [verified-runtime] : cfg(exact, preparing) => cfg(exact, admitted) .
+endm
+mod NORM-HOSTED-PROCESS-WEAK is
+  including NORM-HOSTED-PROCESS .
+  var P : Proof .
+  rl [unverified-runtime] : cfg(P, preparing) => cfg(P, admitted) .
+endm
+
+mod NORM-HOSTED-INVOCATION is
+  sorts Profile Phase State .
+  ops exact changed missing : -> Profile [ctor] .
+  ops queued started : -> Phase [ctor] .
+  op cfg : Profile Phase -> State [ctor] .
+  rl [matching-runtime] : cfg(exact, queued) => cfg(exact, started) .
+endm
+mod NORM-HOSTED-INVOCATION-WEAK is
+  including NORM-HOSTED-INVOCATION .
+  var P : Profile .
+  rl [ignore-invocation-runtime] : cfg(P, queued) => cfg(P, started) .
+endm

@@ -1,0 +1,10 @@
+load ../exec-native-owner.maude
+search [1] in EXEC-NATIVE-MANAGED : cfg(available,exact,waiting) =>* cfg(consumed,exact,executed) .
+search [1] in EXEC-NATIVE-MANAGED : cfg(available,changed,waiting) =>* cfg(available,changed,refused) .
+search [1] in EXEC-NATIVE-MANAGED : cfg(consumed,exact,waiting) =>* cfg(consumed,exact,executed) .
+search [1] in EXEC-NATIVE-MANAGED-WEAK : cfg(consumed,exact,waiting) =>* cfg(consumed,exact,executed) .
+search [1] in EXEC-NATIVE-MANAGED : cfg(available,changed,waiting) =>* cfg(consumed,changed,executed) .
+search [1] in EXEC-NATIVE-MANAGED-WEAK : cfg(available,changed,waiting) =>* cfg(consumed,changed,executed) .
+search [1] in EXEC-NATIVE-MANAGED : cfg(consumed,stateless,waiting) =>* cfg(consumed,stateless,executed) .
+search [1] in EXEC-NATIVE-MANAGED-WEAK : cfg(consumed,stateless,waiting) =>* cfg(consumed,stateless,executed) .
+quit

@@ -1,0 +1,22 @@
+--- A proposed fence name cannot replace the selected controller's older intent.
+--- Phase describes the fence: absent does not assert non-admission.
+--- Joining requests lifetime closure; an intent is never termination evidence.
+mod EXEC-FENCE-JOIN is
+ sorts Phase Identity Outcome Reply Cfg .
+ ops absent intended stopped : -> Phase [ctor] .
+ ops none original proposed : -> Identity [ctor] .
+ ops missing retained changed : -> Outcome [ctor] .
+ ops pending required proved : -> Reply [ctor] .
+ op cfg : Phase Identity Outcome Reply -> Cfg [ctor] .
+ var O : Outcome . var I : Identity .
+ rl [new-intent] : cfg(absent,none,O,pending) => cfg(intended,proposed,O,required) .
+ rl [join-original] : cfg(intended,original,O,pending) => cfg(intended,original,O,required) .
+ rl [physical-finish] : cfg(intended,I,O,required) => cfg(stopped,I,O,proved) .
+endm
+mod EXEC-FENCE-JOIN-WEAK is
+ including EXEC-FENCE-JOIN .
+ var O : Outcome .
+ rl [replace-identity] : cfg(intended,original,O,pending) => cfg(intended,proposed,O,required) .
+ rl [intent-is-proof] : cfg(intended,original,O,pending) => cfg(intended,original,O,proved) .
+ rl [discard-result] : cfg(intended,original,retained,pending) => cfg(intended,original,changed,required) .
+endm

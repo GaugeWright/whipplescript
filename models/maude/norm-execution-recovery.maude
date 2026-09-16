@@ -1,0 +1,42 @@
+--- Recovery from a host-owned durable journal; hashes and receipt authentication
+--- are premises. This is observation binding, never publication authorization.
+mod NORM-EXECUTION-RECOVERY is
+ sorts Id Fact Cfg State .
+ ops effect run input body receipt other : -> Id [ctor] .
+ subsort Fact < Cfg . op none : -> Cfg [ctor] .
+ op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] . op {_} : Cfg -> State [ctor] .
+ op prepared : Id Id Id -> Fact [ctor] .
+ op terminal : Id Id -> Fact [ctor] .
+ op journal : Id Id Id Id Id -> Fact [ctor] .
+ op bound : Id -> Fact [ctor] .
+ ops retrying newerSuccess : Id -> Fact [ctor] .
+ op recovered : Id Id Id -> Fact [ctor] .
+ vars E R I B D : Id . var C : Cfg .
+ rl [recover] : { prepared(E,I,B) terminal(R,E) journal(R,E,I,B,D) bound(D) C }
+ => { recovered(E,R,D) C } .
+endm
+mod NORM-EXECUTION-RECOVERY-WEAK-TERMINAL is
+ including NORM-EXECUTION-RECOVERY .
+ vars E R I B D : Id . var C : Cfg .
+ rl [weaken] : { prepared(E,I,B) journal(R,E,I,B,D) bound(D) C } => { recovered(E,R,D) C } .
+endm
+mod NORM-EXECUTION-RECOVERY-WEAK-EFFECT is
+ including NORM-EXECUTION-RECOVERY .
+ vars E R I B D : Id . var C : Cfg .
+ rl [weaken] : { prepared(E,I,B) terminal(R,E) journal(R,other,I,B,D) bound(D) C } => { recovered(E,R,D) C } .
+endm
+mod NORM-EXECUTION-RECOVERY-WEAK-INPUT is
+ including NORM-EXECUTION-RECOVERY .
+ vars E R I B D : Id . var C : Cfg .
+ rl [weaken] : { prepared(E,I,B) terminal(R,E) journal(R,E,other,B,D) bound(D) C } => { recovered(E,R,D) C } .
+endm
+mod NORM-EXECUTION-RECOVERY-WEAK-BODY is
+ including NORM-EXECUTION-RECOVERY .
+ vars E R I B D : Id . var C : Cfg .
+ rl [weaken] : { prepared(E,I,B) terminal(R,E) journal(R,E,I,other,D) bound(D) C } => { recovered(E,R,D) C } .
+endm
+mod NORM-EXECUTION-RECOVERY-WEAK-BINDING is
+ including NORM-EXECUTION-RECOVERY .
+ vars E R I B D : Id . var C : Cfg .
+ rl [weaken] : { prepared(E,I,B) terminal(R,E) journal(R,E,I,B,D) C } => { recovered(E,R,D) C } .
+endm

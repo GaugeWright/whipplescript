@@ -1,0 +1,10 @@
+load ../norm-observer.maude
+search [1] in NORM-NATIVE-ADMISSION : cfg(original,original,fresh,open,selected) =>* cfg(original,original,managed,open,allocated) .
+search [1] in NORM-NATIVE-ADMISSION : cfg(original,replacement,managed,open,selected) =>* cfg(original,replacement,managed,open,allocated) .
+search [1] in NORM-NATIVE-ADMISSION : cfg(original,replacement,managed,open,selected) =>* cfg(replacement,replacement,managed,open,tracked) .
+search [1] in NORM-NATIVE-ADMISSION-WEAK : cfg(original,replacement,managed,open,selected) =>* cfg(replacement,replacement,managed,open,tracked) .
+search [1] in NORM-NATIVE-ADMISSION : cfg(original,original,legacy,open,selected) =>* cfg(original,original,managed,open,tracked) .
+search [1] in NORM-NATIVE-ADMISSION-WEAK : cfg(original,original,legacy,open,selected) =>* cfg(original,original,managed,open,tracked) .
+search [1] in NORM-NATIVE-ADMISSION : cfg(original,original,managed,fenced,tracked) =>* cfg(original,original,managed,fenced,allocated) .
+search [1] in NORM-NATIVE-ADMISSION-WEAK : cfg(original,original,managed,fenced,tracked) =>* cfg(original,original,managed,fenced,allocated) .
+quit

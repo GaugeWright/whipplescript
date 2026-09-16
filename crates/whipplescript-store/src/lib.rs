@@ -1,5 +1,6 @@
 //! Durable SQLite store for event logs, facts, effects, and evidence.
 
+pub mod attempt_admission;
 pub mod branches;
 pub mod bundle;
 pub mod chunking;
@@ -13,6 +14,12 @@ pub mod erasure_ledger;
 pub mod event_chain;
 #[cfg(feature = "native")]
 mod event_payload_protection;
+pub mod exec_lifetime;
+#[cfg(feature = "native")]
+pub mod exec_native_owner;
+pub mod exec_outcome;
+pub mod exec_reconciliation;
+pub mod exec_settlement;
 pub mod file_settlement;
 pub mod files;
 pub mod host_actions;
@@ -29,6 +36,13 @@ pub mod merge;
 mod native_existing;
 #[cfg(feature = "native")]
 pub mod native_stores;
+pub mod norm;
+pub mod norm_artifact;
+pub mod norm_commands;
+pub mod norm_history;
+pub mod norm_inventory;
+pub mod norm_publication;
+pub mod norm_resources;
 #[cfg(feature = "native")]
 pub mod payload_protection;
 pub mod preflight;
@@ -75,6 +89,24 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Value};
 
 pub type StoreResult<T> = result::Result<T, StoreError>;
+
+/// Keep the original block-event key for its original payload, including
+/// journals written before reason-sensitive retries. Different observations
+/// get deterministic keys without replacing the first durable statement.
+pub fn run_block_event_key(legacy: &str, payload: &str, original: Option<&str>) -> String {
+    use sha2::{Digest, Sha256};
+    match original {
+        None => legacy.to_owned(),
+        Some(value) if value == payload => legacy.to_owned(),
+        Some(_) => {
+            let digest: String = Sha256::digest(payload.as_bytes())
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect();
+            format!("{legacy}:reason:{digest}")
+        }
+    }
+}
 
 /// DR-0054 Phase B: the highest `schema_migrations` version this build
 /// understands. Must stay equal to the highest version in `MIGRATIONS`
@@ -137,8 +169,9 @@ pub(crate) fn stamp_satellite_schema(
 /// DR-0054 Phase B: the `events.format_version` this build stamps on every
 /// new row and the highest it will fold. Legacy rows carry NULL and read as
 /// version 1; a row stamped beyond this fails the fold closed with its row
-/// identity instead of misparsing.
-pub const SUPPORTED_EVENT_FORMAT_VERSION: i64 = 1;
+/// identity instead of misparsing. Version 2 retains rule-effect deadlines;
+/// version-1 readers would silently discard them during projection rebuild.
+pub const SUPPORTED_EVENT_FORMAT_VERSION: i64 = 2;
 
 /// DR-0054 Phase B: the crate version recorded in `store_meta.writer_version`
 /// on every open, so a store on disk can always be diagnosed ("which build
@@ -659,6 +692,20 @@ pub struct DerivedFact<'a> {
     pub source: &'a str,
     pub causation_id: Option<&'a str>,
     pub idempotency_key: Option<&'a str>,
+}
+
+/// One projection committed with an execution terminal receipt. The store
+/// supplies the instance, source and terminal causation identity.
+#[derive(Clone, Copy, Debug)]
+pub struct SettlementFact<'a> {
+    pub fact: NewFact<'a>,
+    pub idempotency_key: &'a str,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct SettlementCache<'a> {
+    pub content_key: &'a str,
+    pub result_json: &'a str,
 }
 
 /// One row of a typed fact batch (spec/admission-and-idempotency.md). `fact_id`
@@ -1250,6 +1297,8 @@ pub struct EffectCompletion<'a> {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ClaimableEffect {
+    /// Durable retry/expiry selected with this snapshot; retained across I/O.
+    pub attempt_admission_event_id: Option<String>,
     pub effect_id: String,
     pub kind: String,
     pub target: Option<String>,
@@ -1589,6 +1638,23 @@ const MIGRATIONS: &[Migration] = &[
 /// Stage marker retained for the CLI/kernel scaffold.
 pub fn store_stage() -> &'static str {
     whipplescript_core::IMPLEMENTATION_STAGE
+}
+
+/// Whether re-presenting an already recorded run is a continuation of that
+/// attempt or a second dispatch.
+///
+/// `start_run` resumes: a provider re-presenting its own active run is
+/// reattaching, and the identity checks below refuse a reused id whose
+/// dispatch differs. `start_dispatch` does not: new sink I/O requires
+/// fresh admission, which is the whole reason it is a separate operation.
+///
+/// Native-only, like the `SqliteStore` impl it discriminates for: without the
+/// `native` feature there is no `start_run` here to admit anything.
+#[cfg(feature = "native")]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RunAdmission {
+    Resumable,
+    FreshOnly,
 }
 
 #[cfg(feature = "native")]
@@ -2936,28 +3002,13 @@ impl SqliteStore {
         let tx = self
             .connection
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        if let Some(status) = instance_status_on(&tx, commit.instance_id)? {
-            if status != "running" {
-                return Err(StoreError::Conflict(format!(
-                    "instance is {status}; rule commits require a running instance"
-                )));
-            }
-        }
         let (program_version_id, revision_epoch) = active_revision_on(&tx, commit.instance_id)?;
-        if let Some(guard) = guard {
-            if program_version_id.as_deref() != Some(guard.program_version_id)
-                || revision_epoch != guard.revision_epoch
-            {
-                return Err(StoreError::Conflict(format!(
-                    "active revision changed before rule commit (expected version {} epoch {}, got version {} epoch {})",
-                    guard.program_version_id,
-                    guard.revision_epoch,
-                    program_version_id.as_deref().unwrap_or("<none>"),
-                    revision_epoch
-                )));
-            }
-        }
-        let payload = rule_commit_payload(commit, program_version_id.as_deref(), revision_epoch)?;
+        // A guarded replay compares its original attribution, not the live
+        // revision. This acknowledges committed history without firing again.
+        let (payload_version, payload_epoch) = guard
+            .map(|pin| (Some(pin.program_version_id), pin.revision_epoch))
+            .unwrap_or((program_version_id.as_deref(), revision_epoch));
+        let payload = rule_commit_payload(commit, payload_version, payload_epoch)?;
         // Replays are idempotent, collisions are bugs: a pinned re-lowering
         // that reproduces a committed firing byte-for-byte (same idempotency
         // key, same payload) returns the stored commit and touches nothing —
@@ -2979,14 +3030,36 @@ impl SqliteStore {
                 )
                 .optional()?
             {
-                if stored_payload == payload {
-                    return Ok(StoredEvent { event_id, sequence });
+                if stored_payload != payload {
+                    return Err(StoreError::Conflict(format!(
+                        "rule commit idempotency key reused with a DIFFERENT payload \
+                         (rule `{}`, key `{key}`): two distinct firings derived one \
+                         commit key — this is a whip bug, please report it",
+                        commit.rule
+                    )));
                 }
+                return Ok(StoredEvent { event_id, sequence });
+            }
+        }
+        // Only a new firing reaches live admission. Exact replay above changes
+        // neither effects nor their creation-anchored deadlines.
+        if let Some(status) = instance_status_on(&tx, commit.instance_id)? {
+            if status != "running" {
                 return Err(StoreError::Conflict(format!(
-                    "rule commit idempotency key reused with a DIFFERENT payload \
-                     (rule `{}`, key `{key}`): two distinct firings derived one \
-                     commit key — this is a whip bug, please report it",
-                    commit.rule
+                    "instance is {status}; rule commits require a running instance"
+                )));
+            }
+        }
+        if let Some(guard) = guard {
+            if program_version_id.as_deref() != Some(guard.program_version_id)
+                || revision_epoch != guard.revision_epoch
+            {
+                return Err(StoreError::Conflict(format!(
+                    "active revision changed before rule commit (expected version {} epoch {}, got version {} epoch {})",
+                    guard.program_version_id,
+                    guard.revision_epoch,
+                    program_version_id.as_deref().unwrap_or("<none>"),
+                    revision_epoch
                 )));
             }
         }
@@ -3202,79 +3275,10 @@ impl SqliteStore {
     }
 
     fn derive_fact_retained(&mut self, derived: DerivedFact<'_>) -> StoreResult<StoredEvent> {
-        let payload = json!({
-            "fact_id": derived.fact.fact_id,
-            "name": derived.fact.name,
-            "key": derived.fact.key,
-            "value": serde_json::from_str::<Value>(derived.fact.value_json)?,
-            "schema_id": derived.fact.schema_id,
-            "provenance_class": derived.fact.provenance_class,
-            "correlation_id": derived.fact.correlation_id,
-        })
-        .to_string();
         let tx = self
             .connection
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        // Replay-tolerant: a re-derivation under an existing idempotency key is
-        // a crash-window heal (the caller's projection re-ran), not an error.
-        // On replay the fact row is inserted only if it is missing entirely —
-        // NEVER revived from consumed — so a replayed projection cannot
-        // resurrect a fact a rule legitimately consumed after the original
-        // derivation.
-        let existing_event = match derived.idempotency_key {
-            Some(key) => tx
-                .query_row(
-                    "SELECT event_id, sequence FROM events \
-                     WHERE instance_id = ?1 AND idempotency_key = ?2",
-                    params![derived.instance_id, key],
-                    |row| {
-                        Ok(StoredEvent {
-                            event_id: row.get(0)?,
-                            sequence: row.get(1)?,
-                        })
-                    },
-                )
-                .optional()?,
-            None => None,
-        };
-        let replayed = existing_event.is_some();
-        let event = match existing_event {
-            Some(event) => event,
-            None => append_event_on(
-                &tx,
-                NewEvent {
-                    instance_id: derived.instance_id,
-                    event_type: "fact.derived",
-                    payload_json: &payload,
-                    source: derived.source,
-                    causation_id: derived.causation_id,
-                    correlation_id: derived.fact.correlation_id,
-                    idempotency_key: derived.idempotency_key,
-                },
-            )?,
-        };
-        let fact_row_exists = replayed
-            && tx
-                .query_row(
-                    "SELECT 1 FROM facts WHERE instance_id = ?1 AND name = ?2 AND key = whip_runtime_fact_key(?3)",
-                    params![derived.instance_id, derived.fact.name, derived.fact.key],
-                    |_| Ok(()),
-                )
-                .optional()?
-                .is_some();
-        if !fact_row_exists {
-            let (program_version_id, revision_epoch) =
-                active_revision_on(&tx, derived.instance_id)?;
-            insert_fact(
-                &tx,
-                derived.instance_id,
-                derived.source,
-                &event.event_id,
-                program_version_id.as_deref(),
-                revision_epoch,
-                &derived.fact,
-            )?;
-        }
+        let event = derive_fact_on(&tx, derived)?;
         tx.commit()?;
         Ok(event)
     }
@@ -3531,8 +3535,15 @@ impl SqliteStore {
         let tx = self
             .connection
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let event =
-            Self::complete_effect_terminal_on(&tx, completion, diagnostic, run_status, fact)?;
+        let event = Self::complete_effect_terminal_on(
+            &tx,
+            completion,
+            diagnostic,
+            run_status,
+            fact,
+            &[],
+            None,
+        )?;
         tx.commit()?;
         Ok(event)
     }
@@ -3543,7 +3554,26 @@ impl SqliteStore {
         diagnostic: Option<TerminalDiagnosticRecord>,
         run_status: &str,
         fact: Option<file_settlement::FileSettlementFact<'_>>,
+        facts: &[SettlementFact<'_>],
+        cache: Option<SettlementCache<'_>>,
     ) -> StoreResult<StoredEvent> {
+        // A retained settlement replays against the original input rather than
+        // re-deriving it, so a second attempt cannot settle differently.
+        if let Some((kind, source, retained)) = tx.query_row("SELECT event_type, source, payload_json FROM events WHERE instance_id = ?1 AND idempotency_key = ?2", params![completion.instance_id, exec_settlement::retention_key(completion.run_id)], |r| Ok((r.get::<_,String>(0)?, r.get::<_,String>(1)?, r.get::<_,String>(2)?))).optional()? {
+            let input: String = tx.query_row("SELECT input_json FROM effects WHERE instance_id = ?1 AND effect_id = ?2", params![completion.instance_id, completion.effect_id], |r| r.get(0))?;
+            exec_settlement::verify_settlement(&kind, &source, &retained, &input, completion, facts, cache)?;
+        }
+        // Projected BEFORE the payload: `effect_completion_payload` writes
+        // `run_status` into the canonical `effect.terminal` event, and it must
+        // equal what the `runs` row below is set to.
+        let run_status = &exec_outcome::projection_run_status(
+            completion,
+            run_status,
+            cache.is_some(),
+            |key| {
+                Ok(tx.query_row("SELECT event_id,event_type,source,payload_json FROM events WHERE instance_id=?1 AND idempotency_key=?2",params![completion.instance_id,key],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()?)
+            },
+        )?;
         let payload = effect_completion_payload(completion, diagnostic.as_ref(), run_status)?;
         let event = append_event_on(
             tx,
@@ -3666,6 +3696,35 @@ impl SqliteStore {
             )?;
         }
 
+        if let Some(cache) = cache {
+            tx.execute(
+                "INSERT OR IGNORE INTO compute_result_cache (content_key, effect_kind, result_json, source_instance_id, source_effect_id) VALUES (?1, 'exec.command', ?2, ?3, ?4)",
+                params![cache.content_key, cache.result_json, completion.instance_id, completion.effect_id],
+            )?;
+        }
+        for projection in facts {
+            derive_fact_on(
+                tx,
+                DerivedFact {
+                    instance_id: completion.instance_id,
+                    fact: projection.fact,
+                    source: "kernel",
+                    causation_id: Some(&event.event_id),
+                    idempotency_key: Some(projection.idempotency_key),
+                },
+            )?;
+            let present = tx.query_row(
+                "SELECT value_json FROM facts WHERE instance_id=?1 AND name=?2 AND key=?3 AND consumed_at IS NULL",
+                params![completion.instance_id, projection.fact.name, projection.fact.key],
+                |row| row.get::<_, String>(0),
+            ).optional()?;
+            // Existing active facts collapse by name/key across attempts.
+            if present.is_none() {
+                return Err(StoreError::Conflict(
+                    "exec settlement fact was not projected".into(),
+                ));
+            }
+        }
         if let Some(fact) = fact {
             file_settlement::append_fact(tx, completion, &event, fact)?;
         }
@@ -3746,6 +3805,7 @@ impl SqliteStore {
             .query_map([instance_id], |row| {
                 Ok((
                     ClaimableEffect {
+                        attempt_admission_event_id: None,
                         effect_id: row.get(0)?,
                         kind: row.get(1)?,
                         target: row.get(2)?,
@@ -3762,13 +3822,17 @@ impl SqliteStore {
         // RC-4b on the effects plane: orphaned-segment PENDING effects are
         // never handed to a worker after a restore.
         let live = live_event_ids_on(&self.connection, instance_id)?;
+        let admissions = attempt_admission::selections(&self.list_events(instance_id)?)?;
         let effects: Vec<ClaimableEffect> = effects
             .into_iter()
             .filter(|(_, created_by)| match (&live, created_by) {
                 (Some(live), Some(event_id)) => live.contains(event_id),
                 _ => true,
             })
-            .map(|(effect, _)| effect)
+            .map(|(mut effect, _)| {
+                effect.attempt_admission_event_id = admissions.get(&effect.effect_id).cloned();
+                effect
+            })
             .collect();
         let mut claimable = Vec::new();
         for effect in effects {
@@ -3835,6 +3899,7 @@ impl SqliteStore {
             .query_map([instance_id], |row| {
                 Ok((
                     ClaimableEffect {
+                        attempt_admission_event_id: None,
                         effect_id: row.get(0)?,
                         kind: row.get(1)?,
                         target: row.get(2)?,
@@ -3850,13 +3915,17 @@ impl SqliteStore {
         // RC-4b on the effects plane: the orphaned segment's effects are
         // invisible after a restore, exactly as `list_effects` hides them.
         let live = live_event_ids_on(&self.connection, instance_id)?;
+        let admissions = attempt_admission::selections(&self.list_events(instance_id)?)?;
         let effects = effects
             .into_iter()
             .filter(|(_, created_by)| match (&live, created_by) {
                 (Some(live), Some(event_id)) => live.contains(event_id),
                 _ => true,
             })
-            .map(|(effect, _)| effect)
+            .map(|(mut effect, _)| {
+                effect.attempt_admission_event_id = admissions.get(&effect.effect_id).cloned();
+                effect
+            })
             .collect();
         Ok(effects)
     }
@@ -6159,7 +6228,19 @@ impl SqliteStore {
     }
 
     pub fn start_run(&mut self, run: RunStart<'_>) -> StoreResult<StoredEvent> {
-        self.start_run_observed(run, None, None)
+        self.start_run_observed(run, None, None, None, RunAdmission::Resumable)
+    }
+
+    pub fn start_run_for_admission(
+        &mut self,
+        run: RunStart<'_>,
+        admission: Option<&str>,
+    ) -> StoreResult<StoredEvent> {
+        self.start_run_observed(run, None, None, Some(admission), RunAdmission::Resumable)
+    }
+
+    pub(crate) fn start_run_fresh(&mut self, run: RunStart<'_>) -> StoreResult<StoredEvent> {
+        self.start_run_observed(run, None, None, None, RunAdmission::FreshOnly)
     }
 
     fn start_run_observed(
@@ -6167,9 +6248,12 @@ impl SqliteStore {
         run: RunStart<'_>,
         expected: Option<&ClaimableEffect>,
         settlement: Option<file_settlement::TrackerWaitSettlement<'_>>,
+        selection: Option<Option<&str>>,
+        admission: RunAdmission,
     ) -> StoreResult<StoredEvent> {
-        self.retained_publication()
-            .run(|| self.start_run_observed_retained(run, expected, settlement))
+        self.retained_publication().run(|| {
+            self.start_run_observed_retained(run, expected, settlement, selection, admission)
+        })
     }
 
     fn start_run_observed_retained(
@@ -6177,12 +6261,69 @@ impl SqliteStore {
         run: RunStart<'_>,
         expected: Option<&ClaimableEffect>,
         settlement: Option<file_settlement::TrackerWaitSettlement<'_>>,
+        selection: Option<Option<&str>>,
+        admission: RunAdmission,
     ) -> StoreResult<StoredEvent> {
         let tx = self
             .connection
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         if let Some(expected) = expected {
             dispatch_definition::native(&tx, run.instance_id, run.effect_id, expected)?;
+        }
+        if let Some(expected) = selection {
+            let mut statement = tx.prepare("SELECT event_id, sequence, event_type, payload_json, source, occurred_at FROM events WHERE instance_id = ?1 ORDER BY sequence")?;
+            let events = statement
+                .query_map([run.instance_id], |row| {
+                    Ok(EventView {
+                        event_id: row.get(0)?,
+                        sequence: row.get(1)?,
+                        event_type: row.get(2)?,
+                        payload_json: row.get(3)?,
+                        source: row.get(4)?,
+                        occurred_at: row.get(5)?,
+                    })
+                })?
+                .collect::<result::Result<Vec<_>, _>>()?;
+            if attempt_admission::select(&events, run.effect_id)?.as_deref() != expected {
+                return Err(StoreError::Conflict(
+                    "execution attempt admission changed".into(),
+                ));
+            }
+        }
+        let existing = tx.query_row(
+            "SELECT runs.effect_id, runs.instance_id, runs.provider, runs.worker_id, runs.status,
+             leases.lease_id, leases.status, effects.status FROM runs
+             LEFT JOIN leases ON leases.run_id = runs.run_id
+             LEFT JOIN effects ON effects.effect_id = runs.effect_id AND effects.instance_id = runs.instance_id
+             WHERE runs.run_id = ?1 LIMIT 1",
+            params![run.run_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?, row.get::<_, String>(4)?, row.get::<_, Option<String>>(5)?, row.get::<_, Option<String>>(6)?, row.get::<_, Option<String>>(7)?)),
+        ).optional()?;
+        let reattaching = existing.is_some();
+        if let Some((
+            effect,
+            instance,
+            provider,
+            worker,
+            status,
+            lease,
+            lease_status,
+            effect_status,
+        )) = existing
+        {
+            let identity_matches = effect == run.effect_id
+                && instance == run.instance_id
+                && provider == run.provider
+                && worker == run.worker_id
+                && status == "running"
+                && lease.as_deref() == Some(run.lease_id)
+                && lease_status.as_deref() == Some("active")
+                && effect_status.as_deref() == Some("running");
+            if !identity_matches {
+                return Err(StoreError::Conflict(
+                    "run id was reused with different active run identity".into(),
+                ));
+            }
         }
         if let Some(status) = instance_status_on(&tx, run.instance_id)? {
             if status != "running" {
@@ -6198,6 +6339,12 @@ impl SqliteStore {
                 "reason": block.reason,
             })
             .to_string();
+            let legacy_key = format!("policy-block:{}:{}", run.effect_id, run.run_id);
+            let original_payload: Option<String> = tx.query_row(
+                "SELECT payload_json FROM events WHERE instance_id = ?1 AND idempotency_key = ?2",
+                params![run.instance_id, &legacy_key], |row| row.get(0),
+            ).optional()?;
+            let block_key = run_block_event_key(&legacy_key, &payload, original_payload.as_deref());
             append_event_idempotent_on(
                 &tx,
                 NewEvent {
@@ -6207,10 +6354,7 @@ impl SqliteStore {
                     source: "kernel",
                     causation_id: Some(run.effect_id),
                     correlation_id: None,
-                    idempotency_key: Some(&format!(
-                        "policy-block:{}:{}",
-                        run.effect_id, run.run_id
-                    )),
+                    idempotency_key: Some(&block_key),
                 },
             )?;
             tx.execute(
@@ -6265,7 +6409,12 @@ impl SqliteStore {
                 "effect cancellation has been requested".to_owned(),
             ));
         }
-        if let Some(reason) = capacity_block_on(&tx, run.instance_id, run.effect_id)? {
+        let capacity_block = if reattaching {
+            None
+        } else {
+            capacity_block_on(&tx, run.instance_id, run.effect_id)?
+        };
+        if let Some(reason) = capacity_block {
             let payload = json!({
                 "effect_id": run.effect_id,
                 "status": "blocked_by_capacity",
@@ -6275,6 +6424,12 @@ impl SqliteStore {
             // Idempotent: the same (effect, run) can be capacity-blocked again
             // on a later worker pass after an interleaved unblock — the same
             // durable statement, not a second event.
+            let legacy_key = format!("capacity-block:{}:{}", run.effect_id, run.run_id);
+            let original_payload: Option<String> = tx.query_row(
+                "SELECT payload_json FROM events WHERE instance_id = ?1 AND idempotency_key = ?2",
+                params![run.instance_id, &legacy_key], |row| row.get(0),
+            ).optional()?;
+            let block_key = run_block_event_key(&legacy_key, &payload, original_payload.as_deref());
             append_event_idempotent_on(
                 &tx,
                 NewEvent {
@@ -6284,10 +6439,7 @@ impl SqliteStore {
                     source: "kernel",
                     causation_id: Some(run.effect_id),
                     correlation_id: None,
-                    idempotency_key: Some(&format!(
-                        "capacity-block:{}:{}",
-                        run.effect_id, run.run_id
-                    )),
+                    idempotency_key: Some(&block_key),
                 },
             )?;
             tx.execute(
@@ -6312,11 +6464,20 @@ impl SqliteStore {
         }
 
         let fingerprint_salt = fingerprint_salt_from_metadata(run.metadata_json);
-        effect_recovery::require_proved_absence(&effect_recovery::native_attempts(
-            &tx,
-            run.instance_id,
-            run.effect_id,
-        )?)?;
+        // Re-admitting the SAME run is a replay, not a resubmission: the caller
+        // is continuing one attempt, not creating a second that could apply
+        // twice. The identity checks below still refuse a reused run id whose
+        // dispatch differs.
+        // Resuming one's own recorded run is a continuation, not a second
+        // dispatch that could apply twice, so proved absence is not required
+        // for it. Fresh admission always checks. The identity comparison below
+        // still refuses a reused run id whose dispatch differs.
+        let attempts = effect_recovery::native_attempts(&tx, run.instance_id, run.effect_id)?;
+        let resuming = admission == RunAdmission::Resumable
+            && attempts.iter().any(|attempt| attempt.run_id == run.run_id);
+        if !resuming {
+            effect_recovery::require_proved_absence(&attempts)?;
+        }
         let fingerprint = execution_fingerprint_on(
             &tx,
             run.instance_id,
@@ -6326,6 +6487,28 @@ impl SqliteStore {
         let run_metadata = inject_execution_fingerprint(&run, run.metadata_json, &fingerprint)?;
         let dispatch = effect_recovery::native_dispatch_marker(&tx, run, &fingerprint)?;
         let payload = run_start_payload(run, &run_metadata, &dispatch)?;
+        if reattaching {
+            let original = tx.query_row(
+                "SELECT event_id, sequence, event_type, payload_json FROM events WHERE instance_id = ?1 AND idempotency_key = ?2",
+                params![run.instance_id, run.run_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?)),
+            ).optional()?;
+            if original.is_none() {
+                return Err(StoreError::Conflict(
+                    "active run has no durable run-start event".into(),
+                ));
+            }
+            let (event_id, sequence, kind, original_payload) =
+                original.expect("original event presence was checked");
+            if kind != "effect.run_started" || original_payload != payload {
+                return Err(StoreError::Conflict(
+                    "active run start payload differs from its original event".into(),
+                ));
+            }
+            tx.commit()?;
+            return Ok(StoredEvent { event_id, sequence });
+        }
+
         let event = append_event_on(
             &tx,
             NewEvent {
@@ -6410,6 +6593,8 @@ impl SqliteStore {
                 settlement.diagnostic,
                 settlement.completion.status,
                 Some(settlement.fact),
+                &[],
+                None,
             )?
         } else {
             event
@@ -7087,6 +7272,19 @@ impl SqliteStore {
         };
 
         for lease in &expired {
+            let fence = exec_lifetime::Fence {
+                instance_id,
+                run_id: &lease.run_id,
+                reason: exec_lifetime::FenceReason::Recovery,
+            };
+            let (execution, tracked): (bool, bool) = tx.query_row(
+                exec_lifetime::LEASE_EXEC_STATE_SQL,
+                params![instance_id, &lease.run_id, fence.tracking_key()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            if tracked {
+                ensure_exec_fence_on(&tx, fence)?;
+            }
             let payload = json!({
                 "lease_id": lease.lease_id,
                 "run_id": lease.run_id,
@@ -7099,7 +7297,11 @@ impl SqliteStore {
                 &tx,
                 NewEvent {
                     instance_id,
-                    event_type: "lease.expired",
+                    event_type: if execution {
+                        "exec.lease.expired"
+                    } else {
+                        "lease.expired"
+                    },
                     payload_json: &payload,
                     source: "kernel",
                     causation_id: Some(&lease.run_id),
@@ -7107,7 +7309,7 @@ impl SqliteStore {
                     idempotency_key: Some(&format!("lease-expired:{}", lease.lease_id)),
                 },
             )?;
-            tx.execute(
+            let changed = tx.execute(
                 r#"
                 UPDATE leases
                 SET status = 'expired',
@@ -7116,6 +7318,12 @@ impl SqliteStore {
                 "#,
                 [&lease.lease_id],
             )?;
+            if changed != 1 {
+                return Err(StoreError::Conflict("lease expiry was not retained".into()));
+            }
+            if execution {
+                continue;
+            }
             tx.execute(
                 r#"
                 UPDATE runs
@@ -7144,24 +7352,95 @@ impl SqliteStore {
     }
 
     pub fn retry_effect(&mut self, retry: RetryEffect<'_>) -> StoreResult<StoredEvent> {
+        self.retry_effect_selected(retry, None)
+    }
+    pub fn retry_effect_at_terminal(
+        &mut self,
+        retry: RetryEffect<'_>,
+        terminal: &str,
+    ) -> StoreResult<StoredEvent> {
+        self.retry_effect_selected(retry, Some(terminal))
+    }
+    fn retry_effect_selected(
+        &mut self,
+        retry: RetryEffect<'_>,
+        terminal: Option<&str>,
+    ) -> StoreResult<StoredEvent> {
         self.retained_publication()
-            .run(|| self.retry_effect_retained(retry))
+            .run(|| self.retry_effect_selected_retained(retry, terminal))
     }
 
-    fn retry_effect_retained(&mut self, retry: RetryEffect<'_>) -> StoreResult<StoredEvent> {
-        let payload = json!({
-            "effect_id": retry.effect_id,
-            "retry_after": retry.retry_after,
-        })
-        .to_string();
+    fn retry_effect_selected_retained(
+        &mut self,
+        retry: RetryEffect<'_>,
+        terminal: Option<&str>,
+    ) -> StoreResult<StoredEvent> {
+        let payload = attempt_admission::retry_payload(retry, terminal);
         let tx = self
             .connection
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        // BEFORE the replay check, not after. A replayed key is not evidence
+        // that the world still permits the retry: absence proved for the
+        // attempt that existed when the key was first admitted says nothing
+        // about an attempt started since. Returning the original event without
+        // re-checking would let a stale key license a resubmission the guard
+        // would refuse today.
         effect_recovery::require_proved_absence(&effect_recovery::native_attempts(
             &tx,
             retry.instance_id,
             retry.effect_id,
         )?)?;
+        if let Some(key) = retry.idempotency_key {
+            let existing = tx.query_row(
+                "SELECT event_id, sequence, event_type, payload_json, source, causation_id FROM events WHERE instance_id = ?1 AND idempotency_key = ?2",
+                params![retry.instance_id, key],
+                |row| Ok((StoredEvent { event_id: row.get(0)?, sequence: row.get(1)? }, row.get::<_, String>(2)?, row.get::<_, String>(3)?, row.get::<_, String>(4)?, row.get::<_, Option<String>>(5)?)),
+            ).optional()?;
+            if let Some((event, kind, recorded, source, cause)) = existing {
+                if kind != "effect.retried"
+                    || recorded != payload
+                    || source != "kernel"
+                    || cause.as_deref() != Some(retry.effect_id)
+                {
+                    return Err(StoreError::Conflict(
+                        "retry idempotency key has a different request".to_owned(),
+                    ));
+                }
+                tx.commit()?;
+                return Ok(event);
+            }
+        }
+        if let Some(expected) = terminal {
+            let mut statement = tx.prepare("SELECT event_id, sequence, event_type, payload_json, source, occurred_at FROM events WHERE instance_id = ?1 ORDER BY sequence")?;
+            let events = statement
+                .query_map([retry.instance_id], |row| {
+                    Ok(EventView {
+                        event_id: row.get(0)?,
+                        sequence: row.get(1)?,
+                        event_type: row.get(2)?,
+                        payload_json: row.get(3)?,
+                        source: row.get(4)?,
+                        occurred_at: row.get(5)?,
+                    })
+                })?
+                .collect::<result::Result<Vec<_>, _>>()?;
+            if attempt_admission::terminal(&events, retry.effect_id)?.as_deref() != Some(expected) {
+                return Err(StoreError::Conflict("retry terminal changed".into()));
+            }
+        }
+        let runs = {
+            let mut statement = tx.prepare(exec_lifetime::RETRY_RUNS_SQL)?;
+            let rows = statement
+                .query_map(params![retry.instance_id, retry.effect_id], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, bool>(1)?))
+                })?
+                .collect::<result::Result<Vec<_>, _>>()?;
+            rows
+        };
+        exec_lifetime::verify_retry_closure(retry.instance_id, retry.effect_id, &runs, |key| {
+            tx.query_row("SELECT event_id, event_type, source, payload_json FROM events WHERE instance_id=?1 AND idempotency_key=?2",
+                params![retry.instance_id, key], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?))).optional().map_err(StoreError::from)
+        })?;
         let event = append_event_on(
             &tx,
             NewEvent {
@@ -7433,9 +7712,11 @@ impl SqliteStore {
                       'effect.run_started',
                       'effect.terminal',
                       'tracker.filing.result_delivered', 'tracker.closing.result_delivered', 'tracker.control.result_delivered',
+                      'effect.retried',
                       'effect.cancelled',
                       'effect.cancellation_requested',
                       'lease.expired',
+                      'exec.lease.expired',
                       'context.restored'
                   )
                 {bound_clause}ORDER BY sequence
@@ -7588,7 +7869,10 @@ impl SqliteStore {
                     idempotency_key.as_deref(),
                     causation_id.as_deref(),
                 )?,
-                "lease.expired" => {
+                "effect.retried" => {
+                    replay_effect_retried(&tx, instance_id, &event_id, &payload_json)?
+                }
+                "lease.expired" | "exec.lease.expired" => {
                     replay_lease_expired(&tx, instance_id, &event_id, &payload_json)?
                 }
                 _ => {}
@@ -7988,6 +8272,37 @@ pub trait RuntimeStore {
     ) -> StoreResult<StoredEvent>;
     fn derive_fact(&mut self, derived: DerivedFact<'_>) -> StoreResult<StoredEvent>;
     fn admit_fact_batch(&mut self, batch: FactBatch<'_>) -> StoreResult<FactBatchOutcome>;
+    fn retain_exec_outcome(
+        &mut self,
+        observation: crate::exec_outcome::Retention<'_>,
+    ) -> StoreResult<StoredEvent>;
+    fn retain_exec_fence_proof(
+        &mut self,
+        proof: crate::exec_lifetime::Proof<'_>,
+    ) -> StoreResult<StoredEvent>;
+    fn ensure_exec_fence(
+        &mut self,
+        request: crate::exec_lifetime::Fence<'_>,
+    ) -> StoreResult<StoredEvent>;
+    fn track_exec_lifetime(
+        &mut self,
+        track: crate::exec_lifetime::Track<'_>,
+    ) -> StoreResult<StoredEvent>;
+    fn schedule_exec_reconciliation(
+        &mut self,
+        schedule: crate::exec_reconciliation::Schedule<'_>,
+    ) -> StoreResult<StoredEvent>;
+    fn retain_exec_settlement(
+        &mut self,
+        request: crate::exec_settlement::Retention<'_>,
+    ) -> StoreResult<StoredEvent>;
+    fn complete_effect_settlement(
+        &mut self,
+        completion: EffectCompletion<'_>,
+        diagnostic: Option<TerminalDiagnosticRecord>,
+        facts: &[SettlementFact<'_>],
+        cache: Option<SettlementCache<'_>>,
+    ) -> StoreResult<StoredEvent>;
     fn complete_effect(&mut self, completion: EffectCompletion<'_>) -> StoreResult<StoredEvent>;
 
     /// Atomically commit a file terminal, its projections/diagnostic and its
@@ -8192,6 +8507,18 @@ pub trait RuntimeStore {
     fn status(&self, instance_id: &str) -> StoreResult<Option<StatusView>>;
     fn satisfy_dependencies(&self, instance_id: &str) -> StoreResult<usize>;
     fn start_run(&mut self, run: RunStart<'_>) -> StoreResult<StoredEvent>;
+    fn start_run_for_admission(
+        &mut self,
+        run: RunStart<'_>,
+        admission: Option<&str>,
+    ) -> StoreResult<StoredEvent>;
+    fn effect_attempt_admission(
+        &self,
+        instance_id: &str,
+        effect_id: &str,
+    ) -> StoreResult<Option<String>> {
+        attempt_admission::select(&self.list_events(instance_id)?, effect_id)
+    }
     /// Admit new sink I/O exactly once for this run identity. Returning an
     /// existing run-start event is forbidden here, even on a host where
     /// `start_run` supports reattaching a provider's existing execution.
@@ -8251,6 +8578,18 @@ pub trait RuntimeStore {
     fn renew_lease(&mut self, renewal: LeaseRenewal<'_>) -> StoreResult<StoredEvent>;
     fn expire_leases(&mut self, instance_id: &str, now: &str) -> StoreResult<Vec<ExpiredLease>>;
     fn retry_effect(&mut self, retry: RetryEffect<'_>) -> StoreResult<StoredEvent>;
+    fn retry_effect_at_terminal(
+        &mut self,
+        retry: RetryEffect<'_>,
+        terminal: &str,
+    ) -> StoreResult<StoredEvent>;
+    fn effect_terminal_event(
+        &self,
+        instance_id: &str,
+        effect_id: &str,
+    ) -> StoreResult<Option<String>> {
+        attempt_admission::terminal(&self.list_events(instance_id)?, effect_id)
+    }
     fn rebuild_projections(&mut self, instance_id: &str) -> StoreResult<()>;
     fn table_exists(&self, table: &str) -> StoreResult<bool>;
 }
@@ -8383,6 +8722,258 @@ impl RuntimeStore for SqliteStore {
     fn admit_fact_batch(&mut self, batch: FactBatch<'_>) -> StoreResult<FactBatchOutcome> {
         self.admit_fact_batch(batch)
     }
+    fn retain_exec_outcome(
+        &mut self,
+        observation: crate::exec_outcome::Retention<'_>,
+    ) -> StoreResult<StoredEvent> {
+        use crate::exec_lifetime::Journal;
+        let tx = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let read = |key: &str| -> StoreResult<Option<(String, String, String, String)>> {
+            Ok(tx.query_row("SELECT event_id,event_type,source,payload_json FROM events WHERE instance_id=?1 AND idempotency_key=?2",params![observation.instance_id,key],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()?)
+        };
+        let request = crate::exec_lifetime::Fence {
+            instance_id: observation.instance_id,
+            run_id: observation.run_id,
+            reason: crate::exec_lifetime::FenceReason::Recovery,
+        };
+        let tracking = read(&request.tracking_key())?
+            .ok_or_else(|| StoreError::Conflict("exec outcome tracking is missing".into()))?;
+        let fence = read(&request.key())?
+            .ok_or_else(|| StoreError::Conflict("exec outcome fence is missing".into()))?;
+        let proof = if observation.needs_proof()? {
+            read(&observation.proof_key())?
+        } else {
+            None
+        };
+        let payload = observation.payload(
+            Journal {
+                event_id: &tracking.0,
+                kind: &tracking.1,
+                source: &tracking.2,
+                payload: &tracking.3,
+            },
+            Journal {
+                event_id: &fence.0,
+                kind: &fence.1,
+                source: &fence.2,
+                payload: &fence.3,
+            },
+            proof.as_ref().map(|p| Journal {
+                event_id: &p.0,
+                kind: &p.1,
+                source: &p.2,
+                payload: &p.3,
+            }),
+        )?;
+        let key = observation.key();
+        let existing=tx.query_row("SELECT event_id,sequence,event_type,source,payload_json FROM events WHERE instance_id=?1 AND idempotency_key=?2",params![observation.instance_id,key],|r|Ok((r.get::<_,String>(0)?,r.get::<_,i64>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?))).optional()?;
+        let event = if let Some((event_id, sequence, kind, source, stored)) = existing {
+            observation.verify_replay(&kind, &source, &stored, &payload)?;
+            StoredEvent { event_id, sequence }
+        } else {
+            append_event_on(
+                &tx,
+                NewEvent {
+                    instance_id: observation.instance_id,
+                    event_type: exec_outcome::EVENT_TYPE,
+                    payload_json: &payload,
+                    source: "kernel",
+                    causation_id: Some(&fence.0),
+                    correlation_id: None,
+                    idempotency_key: Some(&key),
+                },
+            )?
+        };
+        tx.commit()?;
+        Ok(event)
+    }
+    fn retain_exec_fence_proof(
+        &mut self,
+        proof: crate::exec_lifetime::Proof<'_>,
+    ) -> StoreResult<StoredEvent> {
+        use exec_lifetime::{Fence, FenceReason, Journal, PROOF_EVENT};
+        let tx = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let read = |key: &str| -> StoreResult<(String, String, String, String)> {
+            tx.query_row("SELECT event_id,event_type,source,payload_json FROM events WHERE instance_id=?1 AND idempotency_key=?2",params![proof.instance_id,key],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()?.ok_or_else(||StoreError::Conflict("exec closure journal reference is missing".into()))
+        };
+        let request = Fence {
+            instance_id: proof.instance_id,
+            run_id: proof.run_id,
+            reason: FenceReason::Recovery,
+        };
+        let tracking = read(&request.tracking_key())?;
+        let fence = read(&request.key())?;
+        let payload = proof.payload(
+            Journal {
+                event_id: &tracking.0,
+                kind: &tracking.1,
+                source: &tracking.2,
+                payload: &tracking.3,
+            },
+            Journal {
+                event_id: &fence.0,
+                kind: &fence.1,
+                source: &fence.2,
+                payload: &fence.3,
+            },
+        )?;
+        let key = proof.key();
+        let existing=tx.query_row("SELECT event_id,sequence,event_type,source,payload_json FROM events WHERE instance_id=?1 AND idempotency_key=?2",params![proof.instance_id,key],|r|Ok((r.get::<_,String>(0)?,r.get::<_,i64>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?))).optional()?;
+        if let Some((event_id, sequence, kind, source, stored)) = existing {
+            proof.verify_replay(&kind, &source, &stored, &payload)?;
+            tx.commit()?;
+            return Ok(StoredEvent { event_id, sequence });
+        }
+        let event = append_event_on(
+            &tx,
+            NewEvent {
+                instance_id: proof.instance_id,
+                event_type: PROOF_EVENT,
+                payload_json: &payload,
+                source: "kernel",
+                causation_id: Some(&fence.0),
+                correlation_id: None,
+                idempotency_key: Some(&key),
+            },
+        )?;
+        tx.commit()?;
+        Ok(event)
+    }
+    fn ensure_exec_fence(
+        &mut self,
+        request: crate::exec_lifetime::Fence<'_>,
+    ) -> StoreResult<StoredEvent> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let event = ensure_exec_fence_on(&tx, request)?;
+        tx.commit()?;
+        Ok(event)
+    }
+    fn track_exec_lifetime(
+        &mut self,
+        track: crate::exec_lifetime::Track<'_>,
+    ) -> StoreResult<StoredEvent> {
+        let payload = track.payload()?;
+        let key = track.key();
+        let tx = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let existing = tx.query_row("SELECT event_type, source, payload_json, event_id, sequence FROM events WHERE instance_id = ?1 AND idempotency_key = ?2", params![track.instance_id, key], |r| Ok((r.get::<_,String>(0)?, r.get::<_,String>(1)?, r.get::<_,String>(2)?, r.get::<_,String>(3)?, r.get::<_,i64>(4)?))).optional()?;
+        if let Some((kind, source, stored, event_id, sequence)) = existing {
+            track.verify_replay(&kind, &source, &stored, &payload)?;
+            fence_cancelled_exec_on(&tx, track.instance_id, track.effect_id, track.run_id)?;
+            tx.commit()?;
+            return Ok(StoredEvent { event_id, sequence });
+        }
+        let (input, metadata) = tx.query_row("SELECT effects.input_json, runs.metadata_json FROM runs JOIN effects ON effects.instance_id = runs.instance_id AND effects.effect_id = runs.effect_id WHERE runs.instance_id = ?1 AND runs.effect_id = ?2 AND runs.run_id = ?3 AND runs.provider = 'exec' AND runs.worker_id = 'whip-exec' AND runs.status = 'running' AND effects.status = 'running' AND effects.kind = 'exec.command'", params![track.instance_id, track.effect_id, track.run_id], |r| Ok((r.get::<_,String>(0)?, r.get::<_,String>(1)?))).optional()?.ok_or_else(|| StoreError::Conflict("exec lifetime tracking requires its running invocation".into()))?;
+        track.verify_binding(&input, &metadata)?;
+        let event = append_event_on(
+            &tx,
+            NewEvent {
+                instance_id: track.instance_id,
+                event_type: exec_lifetime::EVENT_TYPE,
+                payload_json: &payload,
+                source: "kernel",
+                causation_id: Some(track.run_id),
+                correlation_id: None,
+                idempotency_key: Some(&key),
+            },
+        )?;
+        fence_cancelled_exec_on(&tx, track.instance_id, track.effect_id, track.run_id)?;
+        tx.commit()?;
+        Ok(event)
+    }
+    fn schedule_exec_reconciliation(
+        &mut self,
+        schedule: crate::exec_reconciliation::Schedule<'_>,
+    ) -> StoreResult<StoredEvent> {
+        let payload = schedule.payload()?;
+        let key = schedule.key();
+        let tx = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let existing = tx.query_row("SELECT event_type, source, payload_json, event_id, sequence FROM events WHERE instance_id = ?1 AND idempotency_key = ?2", params![schedule.instance_id, key], |r| Ok((r.get::<_,String>(0)?, r.get::<_,String>(1)?, r.get::<_,String>(2)?, r.get::<_,String>(3)?, r.get::<_,i64>(4)?))).optional()?;
+        if let Some((kind, source, stored, event_id, sequence)) = existing {
+            schedule.verify_replay(&kind, &source, &stored, &payload)?;
+            tx.commit()?;
+            return Ok(StoredEvent { event_id, sequence });
+        }
+        let (input, metadata) = tx.query_row("SELECT effects.input_json, runs.metadata_json FROM runs JOIN effects ON effects.instance_id = runs.instance_id AND effects.effect_id = runs.effect_id WHERE runs.instance_id = ?1 AND runs.effect_id = ?2 AND runs.run_id = ?3 AND runs.provider = 'exec' AND runs.worker_id = 'whip-exec' AND runs.status = 'running' AND effects.status = 'running' AND effects.kind = 'exec.command'", params![schedule.instance_id, schedule.effect_id, schedule.run_id], |r| Ok((r.get::<_,String>(0)?, r.get::<_,String>(1)?))).optional()?.ok_or_else(|| StoreError::Conflict("exec reconciliation requires its running invocation".into()))?;
+        schedule.verify_binding(&input, &metadata)?;
+        let event = append_event_on(
+            &tx,
+            NewEvent {
+                instance_id: schedule.instance_id,
+                event_type: exec_reconciliation::EVENT_TYPE,
+                payload_json: &payload,
+                source: "kernel",
+                causation_id: Some(schedule.run_id),
+                correlation_id: None,
+                idempotency_key: Some(&key),
+            },
+        )?;
+        tx.commit()?;
+        Ok(event)
+    }
+    fn retain_exec_settlement(
+        &mut self,
+        request: crate::exec_settlement::Retention<'_>,
+    ) -> StoreResult<StoredEvent> {
+        let payload = request.payload()?;
+        let key = request.key();
+        let tx = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let existing = tx.query_row("SELECT event_type, payload_json, event_id, sequence, source FROM events WHERE instance_id = ?1 AND idempotency_key = ?2", params![request.instance_id, key], |row| Ok((row.get::<_,String>(0)?, row.get::<_,String>(1)?, row.get::<_,String>(2)?, row.get::<_,i64>(3)?, row.get::<_,String>(4)?))).optional()?;
+        if let Some((kind, retained, event_id, sequence, source)) = existing {
+            exec_settlement::verify_replay(&kind, &source, &retained, &payload)?;
+            tx.commit()?;
+            return Ok(StoredEvent { event_id, sequence });
+        }
+        let input = tx.query_row("SELECT effects.input_json FROM runs JOIN effects ON effects.instance_id = runs.instance_id AND effects.effect_id = runs.effect_id WHERE runs.instance_id = ?1 AND runs.effect_id = ?2 AND runs.run_id = ?3 AND runs.provider = 'exec' AND runs.worker_id = 'whip-exec' AND runs.status = 'running' AND effects.status = 'running' AND effects.kind = 'exec.command'", params![request.instance_id, request.effect_id, request.run_id], |row| row.get::<_,String>(0)).optional()?.ok_or_else(|| StoreError::Conflict("exec settlement requires its running invocation".into()))?;
+        request.verify_input(&input)?;
+        let event = append_event_on(
+            &tx,
+            NewEvent {
+                instance_id: request.instance_id,
+                event_type: exec_settlement::EVENT_TYPE,
+                payload_json: &payload,
+                source: "kernel",
+                causation_id: Some(request.run_id),
+                correlation_id: None,
+                idempotency_key: Some(&key),
+            },
+        )?;
+        tx.commit()?;
+        Ok(event)
+    }
+    fn complete_effect_settlement(
+        &mut self,
+        completion: EffectCompletion<'_>,
+        diagnostic: Option<TerminalDiagnosticRecord>,
+        facts: &[SettlementFact<'_>],
+        cache: Option<SettlementCache<'_>>,
+    ) -> StoreResult<StoredEvent> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let event = Self::complete_effect_terminal_on(
+            &tx,
+            completion,
+            diagnostic,
+            completion.status,
+            None,
+            facts,
+            cache,
+        )?;
+        tx.commit()?;
+        Ok(event)
+    }
     fn settle_file_effect(
         &mut self,
         completion: EffectCompletion<'_>,
@@ -8399,7 +8990,13 @@ impl RuntimeStore for SqliteStore {
         settlement: file_settlement::TrackerWaitSettlement<'_>,
     ) -> StoreResult<StoredEvent> {
         settlement.validate(run, expected)?;
-        self.start_run_observed(run, Some(expected), Some(settlement))
+        self.start_run_observed(
+            run,
+            Some(expected),
+            Some(settlement),
+            None,
+            RunAdmission::FreshOnly,
+        )
     }
 
     fn complete_effect(&mut self, completion: EffectCompletion<'_>) -> StoreResult<StoredEvent> {
@@ -8684,17 +9281,25 @@ impl RuntimeStore for SqliteStore {
     fn start_run(&mut self, run: RunStart<'_>) -> StoreResult<StoredEvent> {
         self.start_run(run)
     }
+    fn start_run_for_admission(
+        &mut self,
+        run: RunStart<'_>,
+        admission: Option<&str>,
+    ) -> StoreResult<StoredEvent> {
+        self.start_run_for_admission(run, admission)
+    }
     fn start_dispatch(&mut self, run: RunStart<'_>) -> StoreResult<StoredEvent> {
-        // Native start_run already uses strict inserts and refuses every
-        // previously dispatched attempt inside its admission transaction.
-        self.start_run(run)
+        // Fresh admission only. `start_run` resumes a provider's own active
+        // run; new sink I/O must not reattach to one, which is why this is a
+        // separate operation at all.
+        self.start_run_fresh(run)
     }
     fn start_dispatch_observed(
         &mut self,
         run: RunStart<'_>,
         expected: &ClaimableEffect,
     ) -> StoreResult<StoredEvent> {
-        self.start_run_observed(run, Some(expected), None)
+        self.start_run_observed(run, Some(expected), None, None, RunAdmission::FreshOnly)
     }
     fn block_effect_binding(
         &mut self,
@@ -8769,6 +9374,13 @@ impl RuntimeStore for SqliteStore {
     }
     fn retry_effect(&mut self, retry: RetryEffect<'_>) -> StoreResult<StoredEvent> {
         self.retry_effect(retry)
+    }
+    fn retry_effect_at_terminal(
+        &mut self,
+        retry: RetryEffect<'_>,
+        terminal: &str,
+    ) -> StoreResult<StoredEvent> {
+        self.retry_effect_at_terminal(retry, terminal)
     }
     fn rebuild_projections(&mut self, instance_id: &str) -> StoreResult<()> {
         self.rebuild_projections(instance_id)
@@ -9432,6 +10044,81 @@ fn append_event_idempotent_on(
 }
 
 #[cfg(feature = "native")]
+fn derive_fact_on(connection: &Connection, derived: DerivedFact<'_>) -> StoreResult<StoredEvent> {
+    let payload = json!({
+        "fact_id": derived.fact.fact_id,
+        "name": derived.fact.name,
+        "key": derived.fact.key,
+        "value": serde_json::from_str::<Value>(derived.fact.value_json)?,
+        "schema_id": derived.fact.schema_id,
+        "provenance_class": derived.fact.provenance_class,
+        "correlation_id": derived.fact.correlation_id,
+    })
+    .to_string();
+    // Replay-tolerant: a re-derivation under an existing idempotency key is
+    // a crash-window heal (the caller's projection re-ran), not an error.
+    // On replay the fact row is inserted only if it is missing entirely —
+    // NEVER revived from consumed — so a replayed projection cannot
+    // resurrect a fact a rule legitimately consumed after the original
+    // derivation.
+    let existing_event = match derived.idempotency_key {
+        Some(key) => connection
+            .query_row(
+                "SELECT event_id, sequence FROM events \
+                     WHERE instance_id = ?1 AND idempotency_key = ?2",
+                params![derived.instance_id, key],
+                |row| {
+                    Ok(StoredEvent {
+                        event_id: row.get(0)?,
+                        sequence: row.get(1)?,
+                    })
+                },
+            )
+            .optional()?,
+        None => None,
+    };
+    let replayed = existing_event.is_some();
+    let event = match existing_event {
+        Some(event) => event,
+        None => append_event_on(
+            connection,
+            NewEvent {
+                instance_id: derived.instance_id,
+                event_type: "fact.derived",
+                payload_json: &payload,
+                source: derived.source,
+                causation_id: derived.causation_id,
+                correlation_id: derived.fact.correlation_id,
+                idempotency_key: derived.idempotency_key,
+            },
+        )?,
+    };
+    let fact_row_exists = replayed
+        && connection
+            .query_row(
+                "SELECT 1 FROM facts WHERE instance_id = ?1 AND name = ?2 AND key = ?3",
+                params![derived.instance_id, derived.fact.name, derived.fact.key],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+    if !fact_row_exists {
+        let (program_version_id, revision_epoch) =
+            active_revision_on(connection, derived.instance_id)?;
+        insert_fact(
+            connection,
+            derived.instance_id,
+            derived.source,
+            &event.event_id,
+            program_version_id.as_deref(),
+            revision_epoch,
+            &derived.fact,
+        )?;
+    }
+    Ok(event)
+}
+
+#[cfg(feature = "native")]
 /// Facts are set-like by (instance, name, key), and the record key is
 /// content-derived (`record_fact_key`). A conflicting insert is either a
 /// byte-identical fact already ACTIVE in the projection — a harmless no-op
@@ -10066,9 +10753,11 @@ fn policy_block_on(
     // is re-evaluated here every pass: this is what makes it RECOVERABLE — the
     // moment the missing profile/capability is registered, the gate returns
     // None and the effect is claimable again.
+    // Active-run reattachment rechecks current policy before redispatch.
     if !matches!(
         effect.status.as_str(),
         "queued"
+            | "running"
             | "blocked_by_dependency"
             | "blocked_by_capacity"
             | "blocked_by_capability"
@@ -11608,6 +12297,70 @@ fn cancellation_request_by_id_on(
 }
 
 #[cfg(feature = "native")]
+fn ensure_exec_fence_on(
+    connection: &Connection,
+    request: exec_lifetime::Fence<'_>,
+) -> StoreResult<StoredEvent> {
+    request.validate()?;
+    let tracked = connection.query_row("SELECT event_id, event_type, source, payload_json FROM events WHERE instance_id = ?1 AND idempotency_key = ?2", params![request.instance_id, request.tracking_key()], |r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?))).optional()?.ok_or_else(|| StoreError::Conflict("exec fence tracking record is missing".into()))?;
+    let payload = request.payload(&tracked.0, &tracked.1, &tracked.2, &tracked.3)?;
+    let key = request.key();
+    let existing = connection.query_row("SELECT event_id, sequence, event_type, source, payload_json FROM events WHERE instance_id = ?1 AND idempotency_key = ?2", params![request.instance_id,key], |r| Ok((r.get::<_,String>(0)?,r.get::<_,i64>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?))).optional()?;
+    if let Some((event_id, sequence, kind, source, stored)) = existing {
+        request.verify_existing(&kind, &source, &stored, &payload)?;
+        return Ok(StoredEvent { event_id, sequence });
+    }
+    let event = append_event_on(
+        connection,
+        NewEvent {
+            instance_id: request.instance_id,
+            event_type: exec_lifetime::FENCE_EVENT,
+            payload_json: &payload,
+            source: "kernel",
+            causation_id: Some(&tracked.0),
+            correlation_id: None,
+            idempotency_key: Some(&key),
+        },
+    )?;
+    Ok(event)
+}
+
+#[cfg(feature = "native")]
+fn fence_cancelled_exec_on(
+    connection: &Connection,
+    instance: &str,
+    effect: &str,
+    run: &str,
+) -> StoreResult<()> {
+    let request = exec_lifetime::Fence {
+        instance_id: instance,
+        run_id: run,
+        reason: exec_lifetime::FenceReason::Cancellation,
+    };
+    let tracked = connection
+        .query_row(
+            "SELECT 1 FROM events WHERE instance_id = ?1 AND idempotency_key = ?2",
+            params![instance, request.tracking_key()],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if tracked
+        && connection
+            .query_row(
+                exec_lifetime::CANCELLATION_FOR_RUN_SQL,
+                params![instance, effect, run],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some()
+    {
+        ensure_exec_fence_on(connection, request)?;
+    }
+    Ok(())
+}
+
+#[cfg(feature = "native")]
 fn insert_effect_cancellation_request_on(
     connection: &Connection,
     request: EffectCancellationRequest<'_>,
@@ -11743,6 +12496,9 @@ fn insert_effect_cancellation_request_on(
                 relation: "active_run",
             },
         )?;
+    }
+    for run_id in &active_run_ids {
+        fence_cancelled_exec_on(connection, request.instance_id, request.effect_id, run_id)?;
     }
     StoreError::written_row(
         cancellation_request_by_id_on(connection, &request_id)?,
@@ -13044,6 +13800,30 @@ fn replay_effect_cancelled(
 }
 
 #[cfg(feature = "native")]
+fn replay_effect_retried(
+    connection: &Connection,
+    instance_id: &str,
+    event_id: &str,
+    payload_json: &str,
+) -> StoreResult<()> {
+    let payload: Value = serde_json::from_str(payload_json)?;
+    let effect_id = payload
+        .get("effect_id")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let changed = connection.execute(
+        "UPDATE effects SET status = 'queued', updated_at = (SELECT occurred_at FROM events WHERE event_id = ?3) WHERE instance_id = ?1 AND effect_id = ?2 AND status IN ('failed', 'timed_out')",
+        params![instance_id, effect_id, event_id],
+    )?;
+    if changed != 1 {
+        return Err(StoreError::Conflict(
+            "replayed retry has no retryable effect".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "native")]
 fn replay_lease_expired(
     connection: &Connection,
     instance_id: &str,
@@ -13072,6 +13852,19 @@ fn replay_lease_expired(
         "#,
         [lease_id],
     )?;
+    let fence = exec_lifetime::Fence {
+        instance_id,
+        run_id,
+        reason: exec_lifetime::FenceReason::Recovery,
+    };
+    let execution: bool = connection.query_row(
+        exec_lifetime::LEASE_EXEC_STATE_SQL,
+        params![instance_id, run_id, fence.tracking_key()],
+        |row| row.get(0),
+    )?;
+    if execution {
+        return Ok(());
+    }
     connection.execute(
         r#"
         UPDATE runs
@@ -13173,13 +13966,121 @@ fn replay_cancellation_request(
 }
 
 #[cfg(feature = "native")]
+fn validated_store_layouts() -> &'static std::sync::Mutex<BTreeSet<String>> {
+    static LAYOUTS: std::sync::OnceLock<std::sync::Mutex<BTreeSet<String>>> =
+        std::sync::OnceLock::new();
+    LAYOUTS.get_or_init(|| std::sync::Mutex::new(BTreeSet::new()))
+}
+
+/// Called inside a snapshot or the upgrade transaction. Use exact serialized
+/// rows, not a path or a caller-provided version claiming that a layout is ready.
+#[cfg(feature = "native")]
+fn store_layout_snapshot(connection: &Connection) -> StoreResult<Option<String>> {
+    let mut statement = connection.prepare(
+        "SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY type, name, tbl_name",
+    )?;
+    let schema = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    if !["schema_migrations", "store_meta"]
+        .iter()
+        .all(|name| schema.iter().any(|row| row.0 == "table" && row.1 == *name))
+    {
+        return Ok(None);
+    }
+    let mut statement =
+        connection.prepare("SELECT version, name FROM schema_migrations ORDER BY version")?;
+    let versions = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut statement = connection.prepare("SELECT key, value FROM store_meta ORDER BY key")?;
+    let metadata = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Some(serde_json::to_string(&(schema, versions, metadata))?))
+}
+
+/// The reference is built from this binary's own migration code and retained
+/// only after its private transaction commits. No target-store metadata can
+/// assert that its own layout is canonical.
+#[cfg(feature = "native")]
+fn canonical_store_layout() -> StoreResult<Option<&'static str>> {
+    static CANONICAL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    if CANONICAL.get().is_none() {
+        let mut reference = Connection::open_in_memory()?;
+        reference.pragma_update(None, "foreign_keys", true)?;
+        if let Some(layout) = upgrade_store_layout(&mut reference)? {
+            // Concurrent builders produce the same reference; retain one.
+            let _ = CANONICAL.set(layout);
+        }
+    }
+    Ok(CANONICAL.get().map(String::as_str))
+}
+
+#[cfg(feature = "native")]
+fn upgrade_store_layout(connection: &mut Connection) -> StoreResult<Option<String>> {
+    let transaction =
+        connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    initialize_runtime_schema_on(&transaction)?;
+    let layout = store_layout_snapshot(&transaction)?;
+    transaction.commit()?;
+    Ok(layout)
+}
+
+#[cfg(feature = "native")]
 fn apply_migrations(connection: &mut Connection) -> StoreResult<()> {
+    // Custody preconditions run UNCONDITIONALLY. The layout fast path below
+    // returns early on a store whose schema already matches, and must never
+    // skip registering the protection codec: a store initialized without it
+    // carries payload protection silently absent (whipplescript #480).
     SqliteStore::require_plain_before_initialize(connection)?;
     runtime_protection::register(connection, None)?;
     connection.pragma_update(None, "foreign_keys", "ON")?;
-    let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-    initialize_runtime_schema_on(&tx)?;
-    tx.commit()?;
+    // This transaction never writes. A changed or unknown snapshot falls
+    // through to writer admission; no read transaction is upgraded in place.
+    let snapshot = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Deferred)?;
+    let layout = store_layout_snapshot(&snapshot)?;
+    let cached = layout.as_ref().is_some_and(|layout| {
+        validated_store_layouts()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(layout)
+    });
+    let canonical = if !cached && layout.is_some() {
+        canonical_store_layout()?
+    } else {
+        None
+    };
+    let ready = cached
+        || layout
+            .as_deref()
+            .zip(canonical)
+            .is_some_and(|(found, reference)| found == reference);
+    snapshot.commit()?;
+    if ready {
+        return Ok(());
+    }
+    // Only committed upgrades mint cache entries. Bound memory use; a full
+    // cache simply makes an unfamiliar layout take the ordinary upgrade path.
+    if let Some(layout) = upgrade_store_layout(connection)? {
+        let mut layouts = validated_store_layouts()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if layouts.len() < 32 {
+            layouts.insert(layout);
+        }
+    }
     Ok(())
 }
 
@@ -13187,7 +14088,6 @@ fn apply_migrations(connection: &mut Connection) -> StoreResult<()> {
 fn initialize_runtime_schema_on(connection: &Connection) -> StoreResult<()> {
     connection.execute_batch(
         r#"
-        PRAGMA foreign_keys = ON;
         CREATE TABLE IF NOT EXISTS schema_migrations (
             version INTEGER PRIMARY KEY,
             name TEXT NOT NULL,
@@ -13565,7 +14465,7 @@ fn ensure_event_format_column(connection: &Connection) -> StoreResult<()> {
 
 /// DR-0054 Phase B: record which build last opened this store. `store_meta`
 /// carries `writer_version` (the crate version) and `format_version` (the
-/// event format this build writes), upserted on every open, so a store found
+/// event format this build writes), upserted on upgrade, so a store found
 /// on disk is always diagnosable — "written by whom, in what format" — without
 /// inference from its contents.
 #[cfg(feature = "native")]
@@ -20788,6 +21688,142 @@ mod tests {
     }
 
     #[test]
+    fn retries_failed_effects_through_backoff_gate() {
+        let mut store = SqliteStore::open_in_memory().expect("store opens");
+        let effects = [test_effect("tell", "agent.tell", "rule=start;effect=tell")];
+        store
+            .commit_rule(RuleCommit {
+                instance_id: "instance-a",
+                rule: "start",
+                trigger_event_id: None,
+                facts: &[],
+                consumed_fact_ids: &[],
+                effects: &effects,
+                dependencies: &[],
+                terminal: None,
+                idempotency_key: Some("commit-start"),
+                marks: &[],
+                context_json: None,
+            })
+            .expect("rule commit succeeds");
+        store
+            .start_run(RunStart {
+                instance_id: "instance-a",
+                effect_id: "tell",
+                run_id: "run-tell",
+                provider: "test",
+                worker_id: "worker-1",
+                lease_id: "lease-tell",
+                lease_expires_at: "2030-01-01T00:00:00Z",
+                metadata_json: "{}",
+            })
+            .expect("run starts");
+        store
+            .complete_effect(EffectCompletion {
+                instance_id: "instance-a",
+                effect_id: "tell",
+                run_id: "run-tell",
+                provider: "test",
+                worker_id: "worker-1",
+                status: "failed",
+                exit_code: Some(1),
+                summary: Some("failed"),
+                metadata_json: "{}",
+                idempotency_key: Some("fail-tell"),
+            })
+            .expect("effect fails");
+        assert_eq!(effect_status(&store, "tell"), "failed");
+
+        // This test is about the backoff gate and replay survival, not the
+        // recovery contract -- but a failed attempt is not retryable until its
+        // absence is proved, so prove it the way the recovery conformance
+        // fixture does. Production callers cannot assert this label; the
+        // kernel records it from a fenced observation.
+        let started = store
+            .list_events("instance-a")
+            .expect("history")
+            .into_iter()
+            .find(|event| event.event_type == "effect.run_started")
+            .expect("the attempt was recorded");
+        let payload: Value = serde_json::from_str(&started.payload_json).expect("run start");
+        let dispatch: effect_recovery::DispatchMarker =
+            serde_json::from_value(payload["external_dispatch"].clone()).expect("dispatch marker");
+        let absent = effect_recovery::DispositionEvidence {
+            frame: dispatch.frame,
+            disposition: effect_recovery::EvidenceDisposition::NotApplied,
+            evidence_ref: "fixture:absence".into(),
+            evidence_digest: "fixture:digest".into(),
+            authority_ref: "fixture:target".into(),
+        };
+        store
+            .append_event(NewEvent {
+                instance_id: "instance-a",
+                event_type: "effect.disposition.recorded",
+                payload_json: &serde_json::to_string(&absent).expect("encode absence"),
+                source: "kernel",
+                causation_id: Some("run-tell"),
+                correlation_id: None,
+                idempotency_key: Some("fixture:absence"),
+            })
+            .expect("record proved absence");
+
+        store
+            .retry_effect(RetryEffect {
+                instance_id: "instance-a",
+                effect_id: "tell",
+                retry_after: Some("2030-01-01T00:00:00Z"),
+                idempotency_key: Some("retry-tell"),
+            })
+            .expect("a retry with proved absence is admitted");
+        assert_eq!(effect_status(&store, "tell"), "queued");
+        store
+            .rebuild_projections("instance-a")
+            .expect("replay admitted retry");
+        assert_eq!(
+            effect_status(&store, "tell"),
+            "queued",
+            "retry admission survives replay"
+        );
+        let retained = store
+            .connection
+            .query_row(
+                "SELECT status FROM runs WHERE run_id = 'run-tell'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .expect("historical run remains");
+        assert_eq!(retained, "failed");
+
+        store
+            .start_run(RunStart {
+                instance_id: "instance-a",
+                effect_id: "tell",
+                run_id: "run-tell-2",
+                provider: "test",
+                worker_id: "worker-1",
+                lease_id: "lease-tell-2",
+                lease_expires_at: "2030-01-02T00:00:00Z",
+                metadata_json: "{}",
+            })
+            .expect("retry run starts");
+        store
+            .complete_effect(EffectCompletion {
+                instance_id: "instance-a",
+                effect_id: "tell",
+                run_id: "run-tell-2",
+                provider: "test",
+                worker_id: "worker-1",
+                status: "completed",
+                exit_code: Some(0),
+                summary: Some("retry completed"),
+                metadata_json: "{}",
+                idempotency_key: Some("complete-tell-2"),
+            })
+            .expect("retry run completes");
+        assert_eq!(effect_status(&store, "tell"), "completed");
+    }
+
+    #[test]
     fn inspection_views_report_instance_state() {
         let mut store = SqliteStore::open_in_memory().expect("store opens");
         let declared_profiles_json = r#"{"harnesses":[{"name":"coder","kind":"codex"}],"agents":[{"name":"worker","profile":"repo-writer","capacity":1,"harness":"coder","capabilities":["agent.tell"]}]}"#;
@@ -22067,6 +23103,189 @@ mod tests {
             !declared_agents_present(r#"{"harnesses":[{"name":"coder","kind":"codex"}]}"#)
                 .expect("metadata parses")
         );
+    }
+
+    #[test]
+    fn store_open_ready_layout_does_not_acquire_writer_lock() {
+        let dir = std::env::temp_dir().join(format!(
+            "store-ready-open-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir(&dir).expect("fixture directory");
+        let path = dir.join("store.sqlite");
+        let mut writer = SqliteStore::open(&path).expect("initialize and validate layout");
+        let transaction = writer
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .expect("hold writer lock");
+        let reader = SqliteStore::open(&path);
+        assert!(
+            reader.is_ok(),
+            "unchanged validated layout needs no migration write: {:?}",
+            reader.as_ref().err()
+        );
+        drop(reader);
+        transaction.rollback().expect("release writer");
+        drop(writer);
+        std::fs::remove_dir_all(dir).expect("cleanup");
+    }
+
+    #[test]
+    fn store_open_ready_layout_in_fresh_process() {
+        const PROBE_PATH: &str = "WHIPPLESCRIPT_COLD_OPEN_FIXTURE";
+        if let Some(path) = std::env::var_os(PROBE_PATH) {
+            SqliteStore::open(path).expect("fresh process opens ready store");
+            return;
+        }
+        for changed in [false, true] {
+            let dir = std::env::temp_dir().join(format!(
+                "store-cold-open-{}-{}-{changed}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("clock")
+                    .as_nanos()
+            ));
+            std::fs::create_dir(&dir).expect("fixture directory");
+            let path = dir.join("store.sqlite");
+            let mut writer = SqliteStore::open(&path).expect("initialize layout");
+            if changed {
+                writer
+                    .connection
+                    .execute_batch("DROP INDEX idx_facts_instance_name")
+                    .expect("require an additive upgrade");
+            }
+            let transaction = writer
+                .connection
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .expect("hold writer lock");
+            let probe = || {
+                std::process::Command::new(std::env::current_exe().expect("test binary"))
+                    .args([
+                        "--exact",
+                        "tests::store_open_ready_layout_in_fresh_process",
+                        "--nocapture",
+                    ])
+                    .env(PROBE_PATH, &path)
+                    .output()
+                    .expect("fresh process probe")
+            };
+            let held = probe();
+            transaction.rollback().expect("release writer");
+            let released = probe();
+            drop(writer);
+            std::fs::remove_dir_all(dir).expect("cleanup");
+            assert!(released.status.success(), "released: {released:?}");
+            assert_eq!(
+                held.status.success(),
+                !changed,
+                "fresh process, changed={changed}: {held:?}"
+            );
+            if changed {
+                assert!(String::from_utf8_lossy(&held.stderr).contains("database is locked"));
+            }
+        }
+    }
+
+    #[test]
+    fn store_open_layout_reuse_rechecks_schema_and_version_metadata() {
+        for case in ["schema", "version", "metadata"] {
+            let mut store = SqliteStore::open_in_memory().expect("validated layout");
+            match case {
+                "schema" => store
+                    .connection
+                    .execute_batch("DROP INDEX idx_facts_instance_name")
+                    .expect("change schema"),
+                "version" => {
+                    store.connection.execute("UPDATE schema_migrations SET version = ?1 WHERE version = (SELECT MAX(version) FROM schema_migrations)", [SUPPORTED_SCHEMA_VERSION + 1]).expect("newer writer");
+                }
+                _ => {
+                    store
+                        .connection
+                        .execute(
+                            "UPDATE store_meta SET value='older-writer' WHERE key='writer_version'",
+                            [],
+                        )
+                        .expect("change writer metadata");
+                }
+            }
+            let result = apply_migrations(&mut store.connection);
+            if case == "version" {
+                assert!(
+                    matches!(result, Err(StoreError::UnsupportedVersion { .. })),
+                    "newer version must not reuse a known layout"
+                );
+            } else {
+                result.expect("changed layout takes upgrade path");
+                let indexes: i64 = store
+                    .connection
+                    .query_row(
+                        "SELECT count(*) FROM sqlite_master WHERE name='idx_facts_instance_name'",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .expect("index");
+                assert_eq!(indexes, 1);
+                let writer: String = store
+                    .connection
+                    .query_row(
+                        "SELECT value FROM store_meta WHERE key='writer_version'",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .expect("writer");
+                assert_eq!(writer, WRITER_VERSION);
+            }
+        }
+    }
+
+    #[test]
+    fn store_open_upgrade_rolls_back_if_metadata_write_fails() {
+        let mut store = SqliteStore::open_in_memory().expect("store");
+        store
+            .connection
+            .execute_batch(
+                "DROP INDEX idx_facts_instance_name;
+             CREATE TRIGGER reject_metadata BEFORE UPDATE ON store_meta
+             BEGIN SELECT RAISE(ABORT, 'injected metadata failure'); END;",
+            )
+            .expect("prepare an upgrade and failure");
+        let result = apply_migrations(&mut store.connection);
+        assert!(result.is_err(), "metadata failure must refuse open");
+        assert!(
+            apply_migrations(&mut store.connection).is_err(),
+            "a failed upgrade must not mint a reusable layout"
+        );
+        let index_count: i64 = store
+            .connection
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE name='idx_facts_instance_name'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("index state");
+        assert_eq!(
+            index_count, 0,
+            "a failed open must roll back its schema additions"
+        );
+        store
+            .connection
+            .execute_batch("DROP TRIGGER reject_metadata")
+            .expect("remove injected failure");
+        apply_migrations(&mut store.connection).expect("upgrade retries");
+        let index_count: i64 = store
+            .connection
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE name='idx_facts_instance_name'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("index state after retry");
+        assert_eq!(index_count, 1);
     }
 
     /// A capacity-blocked effect is retried by the worker on later passes with

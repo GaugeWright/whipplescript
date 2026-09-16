@@ -1,0 +1,8 @@
+load ../exec-provider-lifetime.maude
+search [1] in EXEC-RETRY-CLOSURE : cfg(failed,unproved,absent,false) =>* cfg(queued,proved,requested,true) .
+search [1] in EXEC-RETRY-CLOSURE : cfg(failed,unproved,absent,false) =>* cfg(failed,unproved,requested,false) .
+search [1] in EXEC-RETRY-CLOSURE : cfg(failed,unproved,requested,false) =>* cfg(queued,unproved,requested,true) .
+search [1] in EXEC-RETRY-CLOSURE-WEAK : cfg(failed,unproved,requested,false) =>* cfg(queued,unproved,requested,true) .
+search [1] in EXEC-RETRY-CLOSURE : cfg(failed,proved,requested,false) =>* cfg(failed,proved,requested,true) .
+search [1] in EXEC-RETRY-CLOSURE-WEAK : cfg(failed,proved,requested,false) =>* cfg(failed,proved,requested,true) .
+quit

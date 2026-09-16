@@ -42,6 +42,256 @@ use crate::host_discard::{
     validate_discard_eligibility, verify_discard_event, DISCARDED_FORK_REASON,
 };
 
+/// Internal host cleanup seam; never exposed as a caller-supplied proof route.
+#[wasm_bindgen]
+pub fn exec_lifetime_commands(bridge: DoSqlBridge) -> Result<String, JsValue> {
+    let sql = std::rc::Rc::new(JsDoSql { bridge });
+    let store = crate::do_store::DoSqliteStore::new(sql);
+    whipplescript_kernel::exec_lifetime::commands(&store)
+        .map(|commands| commands.to_string())
+        .map_err(|e| JsValue::from_str(&format!("{e:?}")))
+}
+
+#[wasm_bindgen]
+pub fn exec_lifetime_retire(bridge: DoSqlBridge) -> Result<(), JsValue> {
+    let sql = std::rc::Rc::new(JsDoSql { bridge });
+    let mut store = crate::do_store::DoSqliteStore::new(sql);
+    whipplescript_kernel::exec_lifetime::retire(&mut store)
+        .map_err(|e| JsValue::from_str(&format!("{e:?}")))
+}
+
+#[wasm_bindgen]
+pub fn exec_lifetime_has_settlement_work(bridge: DoSqlBridge) -> Result<bool, JsValue> {
+    let store = crate::do_store::DoSqliteStore::new(std::rc::Rc::new(JsDoSql { bridge }));
+    whipplescript_kernel::exec_outcome_settlement::pending(&store)
+        .map_err(|e| JsValue::from_str(&format!("{e:?}")))
+}
+
+#[wasm_bindgen]
+pub fn exec_lifetime_settle(bridge: DoSqlBridge) -> Result<(), JsValue> {
+    let store = crate::do_store::DoSqliteStore::new(std::rc::Rc::new(JsDoSql { bridge }));
+    let mut kernel = whipplescript_kernel::RuntimeKernel::new(store);
+    let instances = kernel
+        .store()
+        .list_instances()
+        .map_err(|e| JsValue::from_str(&format!("{e:?}")))?;
+    for instance in instances {
+        whipplescript_kernel::exec_outcome_settlement::settle_instance(
+            &mut kernel,
+            &instance.instance_id,
+        )
+        .map_err(|e| JsValue::from_str(&format!("{e:?}")))?;
+    }
+    Ok(())
+}
+
+#[wasm_bindgen]
+pub fn exec_lifetime_observe(
+    bridge: DoSqlBridge,
+    instance: &str,
+    run: &str,
+    response: &str,
+) -> Result<bool, JsValue> {
+    let sql = std::rc::Rc::new(JsDoSql { bridge });
+    let mut store = crate::do_store::DoSqliteStore::new(sql);
+    whipplescript_kernel::exec_lifetime::observe(&mut store, instance, run, response)
+        .map_err(|e| JsValue::from_str(&format!("{e:?}")))
+}
+
+/// Internal workspace-broker seam; selection is supplied by its trusted host.
+#[wasm_bindgen]
+pub fn exec_provider_claim(
+    selected: &str,
+    requested: &str,
+    stored: Option<String>,
+) -> Result<String, JsValue> {
+    whipplescript_kernel::exec_invocation::claim_json(selected, requested, stored.as_deref())
+        .map_err(|e| JsValue::from_str(&e))
+}
+
+#[wasm_bindgen]
+pub fn exec_provider_prepare_fence(
+    selected: &str,
+    requested: &str,
+    receipt: Option<String>,
+    placement: Option<String>,
+    container: &str,
+    dispatch: &str,
+    operation: &str,
+) -> Result<String, JsValue> {
+    whipplescript_kernel::exec_resolution::prepare_fence_json(
+        selected,
+        requested,
+        receipt.as_deref(),
+        placement.as_deref(),
+        container,
+        dispatch,
+        operation,
+    )
+    .map_err(|e| JsValue::from_str(&e))
+}
+
+#[wasm_bindgen]
+pub fn exec_provider_resolution(
+    selected: &str,
+    requested: &str,
+    receipt: &str,
+    placement: &str,
+    stored: Option<String>,
+    operation: &str,
+) -> Result<String, JsValue> {
+    whipplescript_kernel::exec_resolution::transition_json(
+        selected,
+        requested,
+        receipt,
+        placement,
+        stored.as_deref(),
+        operation,
+    )
+    .map_err(|e| JsValue::from_str(&e))
+}
+
+#[wasm_bindgen]
+pub fn exec_provider_place(
+    selected: &str,
+    requested: &str,
+    receipt: &str,
+    stored: Option<String>,
+    container_id: &str,
+    dispatch_id: &str,
+) -> Result<String, JsValue> {
+    whipplescript_kernel::exec_placement::bind_json(
+        selected,
+        requested,
+        receipt,
+        stored.as_deref(),
+        container_id,
+        dispatch_id,
+    )
+    .map_err(|e| JsValue::from_str(&e))
+}
+
+/// Internal controlling-owner seam. Storage commits precede observable actions.
+#[wasm_bindgen]
+pub fn exec_controller_transition(
+    container_id: &str,
+    placement: &str,
+    stored: Option<String>,
+    operation: &str,
+    barrier: Option<String>,
+    observed_generation: Option<String>,
+) -> Result<String, JsValue> {
+    whipplescript_kernel::exec_controller::transition_with_gate_json(
+        container_id,
+        placement,
+        stored.as_deref(),
+        operation,
+        barrier.as_deref(),
+        observed_generation.as_deref().unwrap_or("0"),
+    )
+    .map_err(|e| JsValue::from_str(&e))
+}
+
+#[wasm_bindgen]
+pub fn exec_barrier_inspect(owner: &str, stored: Option<String>) -> Result<String, JsValue> {
+    whipplescript_kernel::exec_barrier::inspect_json(owner, stored.as_deref())
+        .map_err(|e| JsValue::from_str(&e))
+}
+
+#[wasm_bindgen]
+pub fn exec_barrier_begin(
+    owner: &str,
+    stored: Option<String>,
+    inventory: &str,
+) -> Result<String, JsValue> {
+    whipplescript_kernel::exec_barrier::begin_json(owner, stored.as_deref(), inventory)
+        .map_err(|e| JsValue::from_str(&e))
+}
+
+#[wasm_bindgen]
+pub fn exec_barrier_finish(
+    owner: &str,
+    stored: &str,
+    inventory: &str,
+    barrier_id: &str,
+) -> Result<String, JsValue> {
+    whipplescript_kernel::exec_barrier::finish_json(owner, stored, inventory, barrier_id)
+        .map_err(|e| JsValue::from_str(&e))
+}
+
+#[wasm_bindgen]
+pub fn exec_controller_place(
+    selected: &str,
+    requested: &str,
+    receipt: &str,
+    stored: Option<String>,
+    container_id: &str,
+    dispatch_id: &str,
+) -> Result<String, JsValue> {
+    whipplescript_kernel::exec_placement::bind_controller_json(
+        selected,
+        requested,
+        receipt,
+        stored.as_deref(),
+        container_id,
+        dispatch_id,
+    )
+    .map_err(|e| JsValue::from_str(&e))
+}
+
+#[wasm_bindgen]
+pub fn exec_controller_target(
+    selected: &str,
+    requested: &str,
+    receipt: &str,
+    stored: &str,
+) -> Result<String, JsValue> {
+    whipplescript_kernel::exec_placement::controller_target_json(
+        selected, requested, receipt, stored,
+    )
+    .map_err(|e| JsValue::from_str(&e))
+}
+
+#[wasm_bindgen]
+pub fn exec_controller_result(placement: &str, response: &str) -> Result<String, JsValue> {
+    whipplescript_kernel::exec_controller::result_json(placement, response)
+        .map_err(|e| JsValue::from_str(&e))
+}
+
+#[wasm_bindgen]
+pub fn exec_incarnation_read(response: &str) -> Result<String, JsValue> {
+    whipplescript_kernel::exec_incarnation::read_handshake(response)
+        .map_err(|e| JsValue::from_str(&e))
+}
+
+#[wasm_bindgen]
+pub fn exec_incarnation_delivery(incarnation: &str, dispatch: &str) -> Result<String, JsValue> {
+    let dispatch =
+        serde_json::from_str(dispatch).map_err(|e| JsValue::from_str(&format!("{e}")))?;
+    whipplescript_kernel::exec_incarnation::delivery(incarnation, dispatch)
+        .map_err(|e| JsValue::from_str(&e))
+}
+
+#[wasm_bindgen]
+pub fn exec_incarnation_result(response: &str, expected: &str) -> Result<String, JsValue> {
+    let (status, body) =
+        whipplescript_kernel::exec_incarnation::read_completion(response, expected)
+            .map_err(|e| JsValue::from_str(&e))?;
+    Ok(serde_json::json!({"status":status,"body":body}).to_string())
+}
+
+#[wasm_bindgen]
+pub fn exec_provider_complete(
+    selected: &str,
+    requested: &str,
+    stored: &str,
+    status: u16,
+    body: &str,
+) -> Result<String, JsValue> {
+    whipplescript_kernel::exec_invocation::complete_json(selected, requested, stored, status, body)
+        .map_err(|e| JsValue::from_str(&e))
+}
+
 /// Verify and normalize one GaugeDesk-signed hosted policy epoch. This is a
 /// direct wasm export so the Worker shell can fail closed before persisting a
 /// placement bootstrap. The signer and key come from Worker bindings, never
@@ -56,6 +306,129 @@ pub fn verify_host_policy(
         .verify(signed_envelope)
         .map_err(|error| JsValue::from_str(&error))?;
     serde_json::to_string(&verified.policy).map_err(|error| JsValue::from_str(&error.to_string()))
+}
+
+/// Dispatch a raw norm body using independently supplied deployment trust.
+#[wasm_bindgen]
+pub fn host_norm_command(
+    bridge: DoSqlBridge,
+    trusted_configuration: &str,
+    command: &str,
+) -> Result<String, JsValue> {
+    let sql = std::rc::Rc::new(JsDoSql { bridge });
+    let mut store = crate::do_store::DoSqliteStore::new(sql.clone());
+    let artifacts = |cut: &str| {
+        crate::do_branches::compose_vcs(&sql)?.capture_norm_artifact(
+            cut,
+            whipplescript_store::norm_artifact::ArtifactLimits::default(),
+        )
+    };
+    crate::norm_commands::execute_hosted_norm_command_with_artifacts(
+        &mut store,
+        trusted_configuration,
+        command,
+        Some(&artifacts),
+    )
+    .map_err(|error| JsValue::from_str(&error))
+}
+
+/// Read-only planning with a deployment-owned probed image binding.
+#[wasm_bindgen]
+pub fn host_norm_impact(
+    bridge: DoSqlBridge,
+    trusted_configuration: &str,
+    command: &str,
+    deployment: &str,
+) -> Result<String, JsValue> {
+    let sql = std::rc::Rc::new(JsDoSql { bridge });
+    let store = crate::do_store::DoSqliteStore::new(sql.clone());
+    let artifacts = |cut: &str| {
+        crate::do_branches::compose_vcs(&sql)?.capture_norm_artifact(
+            cut,
+            whipplescript_store::norm_artifact::ArtifactLimits::default(),
+        )
+    };
+    crate::norm_commands::execute_installed_hosted_norm_impact(
+        &store,
+        trusted_configuration,
+        command,
+        &artifacts,
+        deployment,
+    )
+    .map_err(|error| JsValue::from_str(&error))
+}
+
+/// Prepare and atomically enqueue with deployment-owned execution settings.
+#[wasm_bindgen]
+pub fn host_norm_enqueue(
+    bridge: DoSqlBridge,
+    trusted_configuration: &str,
+    command: &str,
+    executor_url: &str,
+    environment_epoch: &str,
+    norm_runtime: Option<String>,
+) -> Result<String, JsValue> {
+    let sql = std::rc::Rc::new(JsDoSql { bridge });
+    let mut kernel =
+        whipplescript_kernel::RuntimeKernel::new(crate::do_store::DoSqliteStore::new(sql.clone()));
+    let artifacts = |cut: &str| {
+        crate::do_branches::compose_vcs(&sql)?.capture_norm_artifact(
+            cut,
+            whipplescript_store::norm_artifact::ArtifactLimits::default(),
+        )
+    };
+    crate::norm_commands::execute_hosted_norm_enqueue(
+        &mut kernel,
+        trusted_configuration,
+        command,
+        &artifacts,
+        executor_url,
+        environment_epoch,
+        norm_runtime.as_deref(),
+    )
+    .map_err(|error| JsValue::from_str(&error))
+}
+
+/// Recover and publish observations with client signatures and host-owned data.
+#[wasm_bindgen]
+pub fn host_norm_publication(
+    bridge: DoSqlBridge,
+    trusted_configuration: &str,
+    command: &str,
+) -> Result<String, JsValue> {
+    let sql = std::rc::Rc::new(JsDoSql { bridge });
+    let mut store = crate::do_store::DoSqliteStore::new(sql.clone());
+    let artifacts = |cut: &str| {
+        crate::do_branches::compose_vcs(&sql)?.capture_norm_artifact(
+            cut,
+            whipplescript_store::norm_artifact::ArtifactLimits::default(),
+        )
+    };
+    crate::norm_commands::execute_hosted_norm_publication(
+        &mut store,
+        trusted_configuration,
+        command,
+        &artifacts,
+    )
+    .map_err(|error| JsValue::from_str(&error))
+}
+
+/// Provision a restoration pin selected by the DO identity, never the body.
+#[wasm_bindgen]
+pub fn host_norm_provision(
+    bridge: DoSqlBridge,
+    object_id: &str,
+    trusted_configuration: &str,
+    request: &str,
+) -> Result<String, JsValue> {
+    let mut store = crate::do_store::DoSqliteStore::new(JsDoSql { bridge });
+    crate::norm_commands::provision_hosted_norm(
+        &mut store,
+        object_id,
+        trusted_configuration,
+        request,
+    )
+    .map_err(|error| JsValue::from_str(&error))
 }
 
 fn hosted_facade(
@@ -710,6 +1083,12 @@ extern "C" {
     pub type DoSqlBridge;
 
     #[wasm_bindgen(method, catch)]
+    fn transaction(
+        this: &DoSqlBridge,
+        operation: &mut dyn FnMut() -> Result<(), JsValue>,
+    ) -> Result<(), JsValue>;
+
+    #[wasm_bindgen(method, catch)]
     fn exec(this: &DoSqlBridge, sql: &str, params_json: &str) -> Result<f64, JsValue>;
 
     #[wasm_bindgen(method, catch)]
@@ -826,6 +1205,14 @@ fn outcome_to_json(outcome: &DurableStepOutcome) -> String {
                 "url": request.url,
                 "headers": request.headers,
                 "body": request.body,
+            },
+        }),
+        DurableStepOutcome::NeedsExecutor(handoff) => serde_json::json!({
+            "kind": "needs_executor",
+            "request": {
+                "url": handoff.request().url,
+                "headers": handoff.request().headers,
+                "body": handoff.command(),
             },
         }),
         DurableStepOutcome::Terminal => serde_json::json!({ "kind": "terminal" }),
@@ -972,7 +1359,18 @@ fn parse_exec_config(json: &str) -> Result<ExecutorSidecarConfig, String> {
         Some(env) => serde_json::from_value(env.clone())
             .map_err(|error| format!("exec config env must map names to strings: {error}"))?,
     };
+    let norm_runtime = value
+        .get("norm_runtime")
+        .filter(|v| !v.is_null())
+        .map(|value| {
+            value
+                .as_str()
+                .ok_or("norm runtime configuration must be a JSON string".to_owned())
+                .and_then(crate::norm_runtime::parse)
+        })
+        .transpose()?;
     Ok(ExecutorSidecarConfig {
+        norm_runtime,
         base_url,
         env_values,
         environment_epoch: value
@@ -1235,6 +1633,13 @@ impl WasmDurableInstance {
             .map_err(|error| JsValue::from_str(&format!("{error:?}")))
     }
 
+    pub fn effect_due_unix_ms(&self) -> Result<Option<f64>, JsValue> {
+        self.inner
+            .effect_due_unix_ms()
+            .map(|at| at.map(|at| at as f64))
+            .map_err(|e| JsValue::from_str(&format!("{e:?}")))
+    }
+
     /// Capture a restorable checkpoint (P3 — the DO operator command). Returns
     /// the checkpoint report as JSON, or a JS error if the instance is not
     /// quiescent.
@@ -1270,4 +1675,25 @@ impl WasmDurableInstance {
         })
         .to_string())
     }
+}
+
+/// Verify a runtime proof against the same process selected for delivery.
+#[wasm_bindgen]
+pub fn exec_norm_runtime_read(
+    receipt: &str,
+    incarnation: &str,
+    configuration: &str,
+) -> Result<(), JsValue> {
+    crate::norm_runtime::verify_process_receipt(receipt, incarnation, configuration)
+        .map_err(|error| JsValue::from_str(&error))
+}
+
+/// Refuse runtime drift before controller process preparation or admission.
+#[wasm_bindgen]
+pub fn exec_norm_runtime_prepare(
+    placement: &str,
+    configuration: Option<String>,
+) -> Result<(), JsValue> {
+    crate::norm_runtime::validate_placement_runtime(placement, configuration.as_deref())
+        .map_err(|error| JsValue::from_str(&error))
 }

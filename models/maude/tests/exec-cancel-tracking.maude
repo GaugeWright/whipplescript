@@ -1,0 +1,10 @@
+load ../exec-provider-lifetime.maude
+search [1] in EXEC-CANCEL-TRACKING : cfg(true,false,true,false) =>* cfg(true,true,true,true) .
+search [1] in EXEC-CANCEL-TRACKING : cfg(true,true,false,false) =>* cfg(true,true,true,true) .
+search [1] in EXEC-CANCEL-TRACKING : cfg(true,false,true,false) =>* cfg(true,true,true,false) .
+search [1] in EXEC-CANCEL-TRACKING-WEAK : cfg(true,false,true,false) =>* cfg(true,true,true,false) .
+search [1] in EXEC-CANCEL-TRACKING : cfg(true,true,false,false) =>* cfg(true,true,true,false) .
+search [1] in EXEC-CANCEL-TRACKING-WEAK : cfg(true,true,false,false) =>* cfg(true,true,true,false) .
+search [1] in EXEC-CANCEL-TRACKING : cfg(false,true,true,false) =>* cfg(false,true,true,true) .
+search [1] in EXEC-CANCEL-TRACKING-WEAK : cfg(false,true,true,false) =>* cfg(false,true,true,true) .
+quit

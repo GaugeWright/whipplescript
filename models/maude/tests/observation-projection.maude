@@ -1,0 +1,13 @@
+load ../observation-projection.maude
+search [1] in OBSERVATION-PROJECTION : candidate(exact,protected,protectedOnly,ancestor) =>* projected(support) .
+search [1] in OBSERVATION-PROJECTION : candidate(exact,cooperative,acceptsCooperative,ancestor) =>* projected(support) .
+search [1] in OBSERVATION-PROJECTION : candidate(unknownVocabulary,protected,protectedOnly,ancestor) =>* projected(gap) .
+search [1] in OBSERVATION-PROJECTION : candidate(altered,protected,protectedOnly,ancestor) =>* projected(support) .
+search [1] in OBSERVATION-PROJECTION-WEAK : candidate(altered,protected,protectedOnly,ancestor) =>* projected(support) .
+search [1] in OBSERVATION-PROJECTION : candidate(missing,protected,protectedOnly,ancestor) =>* projected(support) .
+search [1] in OBSERVATION-PROJECTION-WEAK : candidate(missing,protected,protectedOnly,ancestor) =>* projected(support) .
+search [1] in OBSERVATION-PROJECTION : candidate(exact,cooperative,protectedOnly,ancestor) =>* projected(support) .
+search [1] in OBSERVATION-PROJECTION-WEAK : candidate(exact,cooperative,protectedOnly,ancestor) =>* projected(support) .
+search [1] in OBSERVATION-PROJECTION : candidate(exact,protected,protectedOnly,later) =>* projected(support) .
+search [1] in OBSERVATION-PROJECTION-WEAK : candidate(exact,protected,protectedOnly,later) =>* projected(support) .
+quit

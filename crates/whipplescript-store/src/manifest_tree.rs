@@ -125,6 +125,7 @@ pub fn is_node(body: &str) -> bool {
 /// `(last_key_in_child, child_node_id)` — so a descent compares against the
 /// child's greatest key.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Node {
     pub tag: String,
     pub level: u32,

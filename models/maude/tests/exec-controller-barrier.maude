@@ -1,0 +1,14 @@
+load ../exec-controller-barrier.maude
+search [1] in EXEC-CONTROLLER-BARRIER : cfg(open,0,pending,alive,pending,admitted,admitted) =>* cfg(open,1,drained,dead,drained,terminated,terminated) .
+search [1] in EXEC-CONTROLLER-BARRIER : cfg(open,0,pending,alive,pending,admitted,admitted) =>* cfg(open,1,drained,dead,drained,completed,terminated) .
+search [1] in EXEC-CONTROLLER-BARRIER : cfg(closing,1,drained,alive,drained,fencing,fencing) =>* cfg(open,1,drained,alive,drained,terminated,terminated) .
+search [1] in EXEC-CONTROLLER-BARRIER-WEAK : cfg(closing,1,drained,alive,drained,fencing,fencing) =>* cfg(open,1,drained,alive,drained,terminated,terminated) .
+search [1] in EXEC-CONTROLLER-BARRIER : cfg(closing,1,pending,alive,pending,fencing,fencing) =>* cfg(closing,1,pending,dead,pending,fencing,fencing) .
+search [1] in EXEC-CONTROLLER-BARRIER-WEAK : cfg(closing,1,pending,alive,pending,fencing,fencing) =>* cfg(closing,1,pending,dead,pending,fencing,fencing) .
+search [1] in EXEC-CONTROLLER-BARRIER : cfg(open,0,pending,alive,pending,admitted,admitted) =>* cfg(closing,1,pending,alive,pending,fencing,admitted) .
+search [1] in EXEC-CONTROLLER-BARRIER-WEAK : cfg(open,0,pending,alive,pending,admitted,admitted) =>* cfg(closing,1,pending,alive,pending,fencing,admitted) .
+search [1] in EXEC-CONTROLLER-BARRIER : cfg(closing,1,drained,dead,drained,completed,fencing) =>* cfg(open,1,drained,dead,drained,terminated,terminated) .
+search [1] in EXEC-CONTROLLER-BARRIER-WEAK : cfg(closing,1,drained,dead,drained,completed,fencing) =>* cfg(open,1,drained,dead,drained,terminated,terminated) .
+search [1] in EXEC-CONTROLLER-BARRIER : cfg(open,1,drained,dead,drained,terminated,terminated) =>* stale .
+search [1] in EXEC-CONTROLLER-BARRIER-WEAK : cfg(open,1,drained,dead,drained,terminated,terminated) =>* stale .
+quit

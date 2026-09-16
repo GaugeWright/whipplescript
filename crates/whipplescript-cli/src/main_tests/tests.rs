@@ -67,6 +67,8 @@ mod command_table;
 mod construct_graph;
 #[path = "tests/exec_and_deploy.rs"]
 mod exec_and_deploy;
+#[path = "tests/instance_branch_binding_refusal.rs"]
+mod instance_branch_binding_refusal;
 #[path = "tests/lowered_ir.rs"]
 mod lowered_ir;
 #[path = "tests/lowering_semantics.rs"]
@@ -1551,6 +1553,7 @@ fn a_guard_refusal_aborts_the_pass_while_a_semantic_conflict_is_absorbed() {
 
     fn effect(id: &str) -> ClaimableEffect {
         ClaimableEffect {
+            attempt_admission_event_id: None,
             effect_id: id.to_owned(),
             kind: "notify".to_owned(),
             target: None,
@@ -1802,6 +1805,7 @@ impl ParityWorlds {
     /// outcomes as (produced-or-failed) JSON for comparison.
     fn promote_both(&self, effect_id: &str, stream: &str) -> (Value, Value) {
         let effect = |id: &str| ClaimableEffect {
+            attempt_admission_event_id: None,
             effect_id: id.to_owned(),
             kind: "capability.call".to_owned(),
             target: Some("vcs.promote".to_owned()),
@@ -1826,6 +1830,7 @@ impl ParityWorlds {
 
     fn selective_both(&self, effect_id: &str, target: &str, input: Value) -> (Value, Value) {
         let effect = |id: &str| ClaimableEffect {
+            attempt_admission_event_id: None,
             effect_id: id.to_owned(),
             kind: "capability.call".to_owned(),
             target: Some(target.to_owned()),
@@ -2033,6 +2038,91 @@ fn selective_door_receipts_agree_across_hosts() {
     assert_eq!(
         native["failed"]["message"], "the effect names no selection",
         "{native}"
+    );
+    worlds.close();
+}
+
+#[test]
+fn norm_legacy_mainline_dispatch_refuses_on_both_hosts() {
+    use whipplescript_store::files::FileStore;
+    use whipplescript_store::vcs::BranchFileStore;
+    let _guard = env_lock();
+    let worlds = ParityWorlds::open("norm-legacy-mainline");
+    let mut native = worlds.native_vcs();
+    let mut hosted = worlds.do_vcs();
+    native.init("t0").unwrap();
+    hosted.init("t0").unwrap();
+    native
+        .write("main", "keep.txt", Some("original"), "base", "t1")
+        .unwrap();
+    hosted
+        .write("main", "keep.txt", Some("original"), "base", "t1")
+        .unwrap();
+    let native_before = native.get_branch("main").unwrap();
+    let hosted_before = hosted.get_branch("main").unwrap();
+    rusqlite::Connection::open(branch_store_path()).unwrap().execute(
+        "INSERT INTO branch_instances (instance_id, branch_id, bound_at) VALUES ('legacy', 'main', 't0')", [],
+    ).unwrap();
+    // Resolve the actual native persisted binding, not just a hand-built port.
+    let native_files = file_store_for_instance("legacy", "norm-legacy");
+    let hosted_files = BranchFileStore::new(hosted, "main", "norm-legacy", "t2");
+    for files in [&*native_files, &hosted_files as &dyn FileStore] {
+        assert_eq!(
+            files.read_to_string(Path::new("keep.txt")).unwrap(),
+            "original"
+        );
+        for result in [
+            files.write(Path::new("new.txt"), b"bad"),
+            files.append(Path::new("keep.txt"), b"bad"),
+            files.remove(Path::new("keep.txt")),
+        ] {
+            assert_eq!(
+                result.unwrap_err().kind(),
+                std::io::ErrorKind::PermissionDenied
+            );
+        }
+        assert!(!files.exists(Path::new("new.txt")));
+        assert_eq!(
+            files.read_to_string(Path::new("keep.txt")).unwrap(),
+            "original"
+        );
+    }
+    assert_eq!(
+        worlds.native_vcs().get_branch("main").unwrap(),
+        native_before
+    );
+    assert_eq!(worlds.do_vcs().get_branch("main").unwrap(), hosted_before);
+    assert!(branch_exec_scratch("legacy", "norm-legacy")
+        .unwrap_err()
+        .contains("governed admission"));
+    // Even a retained scratch from an older run cannot import onto mainline.
+    let scratch = native
+        .materialize_branch("main", &worlds._dir.join("scratch"), 0)
+        .unwrap()
+        .unwrap();
+    std::fs::write(worlds._dir.join("scratch/keep.txt"), "changed").unwrap();
+    assert!(import_branch_exec_scratch(
+        "legacy",
+        "main",
+        &worlds._dir.join("scratch"),
+        &scratch,
+        "norm-legacy"
+    )
+    .unwrap_err()
+    .contains("governed admission"));
+    assert_eq!(
+        worlds.native_vcs().get_branch("main").unwrap(),
+        native_before
+    );
+    // Ordinary work still obtains a writable file surface.
+    native
+        .create_branch("work-norm", None, "main", "t3")
+        .unwrap();
+    let work = BranchFileStore::new(native, "work-norm", "work-effect", "t4");
+    work.write(Path::new("new.txt"), b"allowed").unwrap();
+    assert_eq!(
+        work.read_to_string(Path::new("new.txt")).unwrap(),
+        "allowed"
     );
     worlds.close();
 }

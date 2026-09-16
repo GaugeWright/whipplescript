@@ -9,7 +9,7 @@ import {
   runInDurableObject,
   SELF,
 } from "cloudflare:test";
-import { describe, expect, it, vi } from "vitest";
+import { beforeAll, describe, expect, it, vi } from "vitest";
 import {
   COLLECTION_RECIPIENT_PRIVATE_SEED_HEX,
   COLLECTION_RECIPIENT_PUBLIC_KEY_HEX,
@@ -117,6 +117,25 @@ async function placementFetch(
 }
 
 describe("real WorkflowInstance hibernation", () => {
+  // Initialize the real authenticated WASM host before each case's five-second
+  // assertion budget. Readiness is observed, not inferred from a delay; every
+  // case below still creates and exercises its own isolated object.
+  beforeAll(async () => {
+    const namespace = (env as unknown as TestEnv).WORKFLOW_INSTANCE;
+    const sessionId = "session-authenticated-runtime-readiness";
+    const stub = namespace.get(namespace.idFromName(sessionId));
+    await bootstrapSession(stub, sessionId);
+    const socket = await openSocket(stub);
+    try {
+      expect(await nextMessage(socket)).toMatchObject({
+        type: "session_ready",
+        sequence: 0,
+      });
+    } finally {
+      socket.close(1000, "ready");
+    }
+  });
+
   it("rehydrates durable state and the browser socket attachment after object eviction", async () => {
     const namespace = (env as unknown as TestEnv).WORKFLOW_INSTANCE;
     const stub = namespace.get(namespace.idFromName("session-hibernation"));
@@ -1616,10 +1635,15 @@ describe("real WorkflowInstance hibernation", () => {
       || path.startsWith("/host/")
       || path.startsWith("/public/session/")
     );
-    // Bumped with `runtime.host.stats` (DR-0114 S3). The count is a
-    // tripwire: a route added to the surface without a thought about this
-    // suite trips it, and every operation below is then exercised for real.
-    expect(operations.length).toBe(30);
+    // Bumped with the five `/host/norm/` routes. The count is a tripwire: a
+    // route added to the surface without a thought about this suite trips it,
+    // and every operation below is then exercised for real.
+    //
+    // It counts what the FILTER yields, not the surface: six `/v1/...` routes
+    // sit outside it on both sides, which is why 36 declared operations were
+    // 30 here. Raising this to the new declared total of 41 counted those six
+    // twice and failed at 35.
+    expect(operations.length).toBe(35);
 
     for (const operation of operations) {
       for (const authorization of [undefined, "Bearer wrong-control-token"]) {
@@ -1733,5 +1757,575 @@ describe("real WorkflowInstance hibernation", () => {
     );
     firstSocket.close(1000, "done");
     secondSocket.close(1000, "done");
+  });
+});
+
+
+describe("hosted norm commands", () => {
+  it("restores the freshly generated native custody vector through the actual WASM route", async () => {
+    const vector = JSON.parse((env as unknown as { NORM_PORTABLE_VECTOR: string }).NORM_PORTABLE_VECTOR) as {
+      protocol: string; public_bindings: unknown[]; checkpoint: { ledger: string; authority_head: string }; events: unknown[];
+      snapshot: { result: { snapshot: { inventory: unknown } } };
+      artifacts: { blobs: Array<{ id: string; body: string; byte_len: number }>; cuts: Array<{ cut_id: string; change_id: string; branch_id: string; manifest_hash: string; recorded_at: string }> };
+      queries: Array<{ command: unknown; response: unknown }>;
+    };
+    expect(vector.protocol).toBe("whipplescript.norm.test-vector/v1");
+    const namespace = (env as unknown as TestEnv).WORKFLOW_INSTANCE;
+    const id = namespace.idFromName("tenant:norm-test:placement:native-vector");
+    const target = namespace.get(id);
+    await runInDurableObject(target, async (instance) => {
+      (instance as unknown as { configureNormTestPublicBindings(keys: unknown[], restorations: unknown[]): void })
+        .configureNormTestPublicBindings(vector.public_bindings, [{ object_id: id.toString(), checkpoint: vector.checkpoint }]);
+    });
+    const send = (operation: string, body: unknown) => SELF.fetch(
+      `https://runtime.test/v1/tenants/norm-test/placements/native-vector/host/norm/${operation}`, {
+        method: "POST", headers: { authorization: "Bearer control-token", "content-type": "application/json" },
+        body: JSON.stringify(body),
+      },
+    );
+    const command = (value: unknown) => send("commands", { protocol: "whipplescript.norm.commands/v1", command: value });
+    const provisioned = await send("provision", {});
+    expect(provisioned.status).toBe(200);
+    await provisioned.body?.cancel();
+    const restored = await command({ kind: "import", events: [...vector.events].reverse() });
+    const receipt = await restored.json();
+    expect(restored.status, JSON.stringify(receipt)).toBe(200);
+    expect(receipt).toMatchObject({ result: { kind: "imported", inserted: vector.events.length } });
+    const snapshot = await command({ kind: "snapshot" });
+    expect(await snapshot.json()).toEqual(vector.snapshot);
+    const inventory = await command({ kind: "inventory" });
+    expect(inventory.status).toBe(200);
+    expect(await inventory.json()).toEqual({ protocol: "whipplescript.norm.commands/v1",
+      result: { kind: "inventory", inventory: vector.snapshot.result.snapshot.inventory } });
+    const missingArtifact = await command({ kind: "resources", point: { cut: "before" } });
+    expect(missingArtifact.status).toBe(400);
+    expect(await missingArtifact.text()).toContain("is not recorded");
+    // Seed stored cuts and blobs from the native owning codec, never request
+    // fields. The actual WASM callback reads this placement's SQL itself.
+    await runInDurableObject(target, async (_instance, state) => {
+      for (const blob of vector.artifacts.blobs) {
+        state.storage.sql.exec("INSERT INTO content_blobs (id, body, byte_len) VALUES (?, ?, ?)", blob.id, blob.body, blob.byte_len);
+      }
+      for (const cut of vector.artifacts.cuts) {
+        state.storage.sql.exec("INSERT INTO cuts (cut_id, change_id, branch_id, manifest_hash, recorded_at) VALUES (?, ?, ?, ?, ?)", cut.cut_id, cut.change_id, cut.branch_id, cut.manifest_hash, cut.recorded_at);
+      }
+    });
+    expect(vector.queries).toHaveLength(5);
+    for (const query of vector.queries) {
+      const response = await command(query.command);
+      const actual = await response.json();
+      expect(response.status, JSON.stringify(actual)).toBe(200);
+      expect(actual).toEqual(query.response);
+    }
+    const oldFrontier = (vector.queries[0].command as { frontier: string[] }).frontier;
+    for (const invalid of [
+      { kind: "resources", point: { cut: "before", frontier: [] } },
+      { kind: "resources", point: { cut: "other-placement-cut" } },
+      { kind: "resources", point: { cut: "before", files: { "src/auth.py": "forged" } } },
+      { kind: "snapshot_at", frontier: [oldFrontier[0], oldFrontier[0]] },
+      { kind: "snapshot_at", frontier: [oldFrontier[0], vector.checkpoint.ledger] },
+      { kind: "snapshot_at", frontier: ["f".repeat(64)] },
+      { kind: "compare_resources", before: { cut: "after" }, after: { cut: "before", frontier: oldFrontier } },
+    ]) {
+      const response = await command(invalid);
+      expect(response.status).toBe(400);
+      await response.body?.cancel();
+    }
+    const duplicateCut = await SELF.fetch("https://runtime.test/v1/tenants/norm-test/placements/native-vector/host/norm/commands", {
+      method: "POST", headers: { authorization: "Bearer control-token", "content-type": "application/json" },
+      body: '{"protocol":"whipplescript.norm.commands/v1","command":{"kind":"resources","point":{"cut":"before","cut":"after"}}}',
+    });
+    expect(duplicateCut.status).toBe(400);
+    await duplicateCut.body?.cancel();
+    const root = vector.artifacts.cuts.find(cut => cut.cut_id === "before")!.manifest_hash;
+    const manifest = JSON.parse(vector.artifacts.blobs.find(blob => blob.id === root)!.body) as Record<string, string>;
+    const subject = vector.artifacts.blobs.find(blob => blob.id === manifest["src/auth.py"])!;
+    await runInDurableObject(target, async (_instance, state) => {
+      state.storage.sql.exec("UPDATE content_blobs SET body = ? WHERE id = ?", "tampered", subject.id);
+    });
+    const damaged = await command({ kind: "resources", point: { cut: "before" } });
+    expect(damaged.status).toBe(400);
+    await damaged.body?.cancel();
+    await runInDurableObject(target, async (_instance, state) => {
+      state.storage.sql.exec("UPDATE content_blobs SET body = ? WHERE id = ?", subject.body, subject.id);
+    });
+    const repaired = await command(vector.queries[2].command);
+    expect(repaired.status).toBe(200);
+    expect(await repaired.json()).toEqual(vector.queries[2].response);
+    const exported = await command({ kind: "export" });
+    expect(await exported.json()).toMatchObject({ result: { checkpoint: vector.checkpoint, events: vector.events } });
+    const injected = await send("commands", {
+      protocol: "whipplescript.norm.commands/v1", command: { kind: "snapshot" }, public_bindings: vector.public_bindings,
+    });
+    expect(injected.status).toBe(400);
+    await injected.body?.cancel();
+  });
+
+  it("restores a rotated ledger only from the destination object's configured checkpoint", async () => {
+    const namespace = (env as unknown as TestEnv).WORKFLOW_INSTANCE;
+    const sourceRoot = "https://runtime.test/v1/tenants/norm-test/placements/restore-source/host/norm";
+    const targetRoot = "https://runtime.test/v1/tenants/norm-test/placements/restore-target/host/norm";
+    const targetId = namespace.idFromName("tenant:norm-test:placement:restore-target");
+    const target = namespace.get(targetId);
+    const send = (url: string, body: unknown, token = "control-token") => SELF.fetch(url, {
+      method: "POST", headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const command = (root: string, value: unknown) => send(`${root}/commands`, {
+      protocol: "whipplescript.norm.commands/v1", command: value,
+    });
+    const sign = async (principal: string, nonce: string, action: unknown) => {
+      const response = await send("https://runtime.test/__test/norm/sign", { principal, nonce, action });
+      return response.json<{ statement: { actor: unknown }; signature: string }>();
+    };
+    const bootstrapAction = { act: "bootstrap", creator: "norm-worker", charter: { vocabularies: [], owner_scopes: [] } };
+    const genesis = await sign("norm-owner", "restore-genesis", bootstrapAction);
+    const genesisResponse = await command(sourceRoot, { kind: "append", event: genesis });
+    expect(genesisResponse.status).toBe(200);
+    const genesisReceipt = await genesisResponse.json<{ result: { event_id: string } }>();
+    const ledger = genesisReceipt.result.event_id;
+    const successor = (await sign("norm-successor", "unused", bootstrapAction)).statement.actor;
+    const rotation = await sign("norm-owner", "restore-rotation", {
+      act: "rotate", ledger, previous: ledger, successor, frontier: [ledger],
+    });
+    const cosigned = await send("https://runtime.test/__test/norm/cosign", {
+      binding: "norm-successor", statement: rotation.statement,
+    });
+    const { signature: successor_signature } = await cosigned.json<{ signature: string }>();
+    const badRotation = await command(sourceRoot, { kind: "append", event: { ...rotation, successor_signature: "00" } });
+    expect(badRotation.status).toBe(400);
+    await badRotation.body?.cancel();
+    const rotated = await command(sourceRoot, { kind: "append", event: { ...rotation, successor_signature } });
+    expect(rotated.status).toBe(200);
+    await rotated.body?.cancel();
+    const exported = await command(sourceRoot, { kind: "export" });
+    const { result: history } = await exported.json<{ result: {
+      checkpoint: { ledger: string; authority_head: string }; events: unknown[];
+    } }>();
+    expect(history.events).toHaveLength(2);
+    const configure = (restorations: unknown[]) => runInDurableObject(target, async (instance) => {
+      (instance as unknown as { configureNormTestRestorations(value: unknown[]): void })
+        .configureNormTestRestorations(restorations);
+    });
+    const valid = { object_id: targetId.toString(), checkpoint: history.checkpoint };
+    for (const restorations of [[], [{ ...valid, object_id: "another-object" }], [valid, valid]]) {
+      await configure(restorations);
+      const denied = await send(`${targetRoot}/provision`, {});
+      expect(denied.status).toBe(400);
+      await denied.body?.cancel();
+    }
+    await configure([valid]);
+    for (const [body, token, status] of [
+      [{ checkpoint: history.checkpoint }, "control-token", 400],
+      [{}, "session-token", 401],
+    ] as const) {
+      const denied = await send(`${targetRoot}/provision`, body, token);
+      expect(denied.status).toBe(status);
+      await denied.body?.cancel();
+    }
+    expect(await runInDurableObject(target, async (_instance, state) =>
+      state.storage.sql.exec("SELECT genesis_id FROM tracker_norm_checkpoint").toArray(),
+    )).toEqual([]);
+    const unpinned = await command(targetRoot, { kind: "import", events: history.events });
+    expect(unpinned.status).toBe(400);
+    await unpinned.body?.cancel();
+    const provisioned = await send(`${targetRoot}/provision`, {});
+    expect(provisioned.status).toBe(200);
+    expect(await provisioned.json()).toEqual({ checkpoint: history.checkpoint });
+    const incomplete = await command(targetRoot, { kind: "import", events: [history.events[0]] });
+    expect(incomplete.status).toBe(400);
+    await incomplete.body?.cancel();
+    const restored = await command(targetRoot, { kind: "import", events: [...history.events].reverse() });
+    expect(restored.status).toBe(200);
+    expect(await restored.json()).toMatchObject({ result: { kind: "imported", inserted: 2 } });
+    const snapshot = await command(targetRoot, { kind: "snapshot" });
+    expect(await snapshot.json()).toMatchObject({ result: { snapshot: {
+      checkpoint: history.checkpoint, owner: successor,
+    } } });
+    const repeated = await command(targetRoot, { kind: "import", events: history.events });
+    expect(await repeated.json()).toMatchObject({ result: { kind: "imported", inserted: 0 } });
+    await configure([{ ...valid, checkpoint: { ledger, authority_head: ledger } }]);
+    const rollback = await send(`${targetRoot}/provision`, {});
+    expect(rollback.status).toBe(400);
+    await rollback.body?.cancel();
+    const finalExport = await command(targetRoot, { kind: "export" });
+    expect(await finalExport.json()).toMatchObject({ result: history });
+  });
+
+  it("admits a custom vocabulary lifecycle and keeps worker edits separate from owner acceptance", async () => {
+    const path = "https://runtime.test/v1/tenants/norm-test/placements/record-lifecycle/host/norm/commands";
+    const post = (command: unknown) => SELF.fetch(path, {
+      method: "POST", headers: { authorization: "Bearer control-token", "content-type": "application/json" },
+      body: JSON.stringify({ protocol: "whipplescript.norm.commands/v1", command }),
+    });
+    const sign = async (principal: string, nonce: string, action: unknown) => {
+      const result = await SELF.fetch("https://runtime.test/__test/norm/sign", {
+        method: "POST", body: JSON.stringify({ principal, nonce, action }),
+      });
+      return result.json();
+    };
+    const append = async (principal: string, nonce: string, action: unknown, status = 200) => {
+      const result = await post({ kind: "append", event: await sign(principal, nonce, action) });
+      const body = await result.json<{ result: { event_id: string }; error?: string }>();
+      expect(result.status, JSON.stringify(body)).toBe(status);
+      return body.result?.event_id;
+    };
+    const definition = {
+      name: "review-note", version: "1",
+      fields: [{ name: "title", required: true, value_type: { type: "text" } }],
+      status: { values: ["draft", "accepted"], initial: "draft", transitions: [
+        { from: "draft", to: "accepted", admission: { requires: "authority", scope: "accept" } },
+      ] },
+    };
+    const vocabulary = { name: definition.name, version: definition.version,
+      digest: await sha256("whipplescript.vocabulary.v1\0" + JSON.stringify(definition)) };
+    const ledger = await append("norm-owner", "genesis", {
+      act: "bootstrap", creator: "norm-worker", charter: {
+        vocabularies: [{ definition, creation: { requires: "public" }, editing: { requires: "public" } }],
+        owner_scopes: ["accept"],
+      },
+    });
+    const record = await append("norm-worker", "create", {
+      act: "create", ledger, vocabulary, fields_json: '{"title":"Initial"}',
+    });
+    const transition = { act: "transition", ledger, vocabulary, record, previous: record, status: "accepted" };
+    await append("norm-worker", "forbidden-accept", transition, 400);
+    const accepted = await append("norm-owner", "accept", transition);
+    const edited = await append("norm-worker", "edit", {
+      act: "edit", ledger, vocabulary, record, previous: accepted, fields_json: '{"title":"Revised"}',
+    });
+    await append("norm-owner", "stale-accept", { ...transition, previous: accepted }, 400);
+    const snapshot = await post({ kind: "snapshot" });
+    expect(await snapshot.json()).toMatchObject({ result: { snapshot: { records: [{ alias: "N-1", record: {
+      id: record, fields: { title: "Revised" }, status: "draft", head: edited, content_head: edited,
+    } }] } } });
+    const reaccepted = await append("norm-owner", "accept-revision", { ...transition, previous: edited });
+    const exported = await post({ kind: "export" });
+    const history = await exported.json<{ result: { events: unknown[]; frontier: string[] } }>();
+    expect(history.result.events).toHaveLength(5);
+    expect(history.result.frontier).toEqual([reaccepted]);
+    const repeated = await post({ kind: "import", events: [...history.result.events].reverse() });
+    expect(await repeated.json()).toMatchObject({ result: { kind: "imported", inserted: 0 } });
+    const successorEvent = await sign("norm-successor", "successor-identity", {
+      act: "bootstrap", creator: "norm-worker", charter: { vocabularies: [], owner_scopes: [] },
+    }) as { statement: { actor: unknown } };
+    const rotation = await sign("norm-owner", "root-rotation", {
+      act: "rotate", ledger, previous: ledger, successor: successorEvent.statement.actor, frontier: [reaccepted],
+    }) as { statement: unknown; signature: string };
+    const cosigned = await SELF.fetch("https://runtime.test/__test/norm/cosign", {
+      method: "POST", body: JSON.stringify({ binding: "norm-successor", statement: rotation.statement }),
+    });
+    const { signature: successor_signature } = await cosigned.json<{ signature: string }>();
+    const rotationResponse = await post({ kind: "append", event: { ...rotation, successor_signature } });
+    expect(rotationResponse.status).toBe(200);
+    const authority = (await rotationResponse.json<{ result: { event_id: string } }>()).result.event_id;
+    const newRevision = await append("norm-worker", "post-rotation-edit", {
+      act: "edit", ledger, authority, vocabulary, record, previous: reaccepted, fields_json: '{"title":"After rotation"}',
+    });
+    const newAcceptance = {
+      act: "transition", ledger, authority, vocabulary, record, previous: newRevision, status: "accepted",
+    };
+    await append("norm-owner", "old-key-acceptance", newAcceptance, 400);
+    const latest = await append("norm-successor", "successor-acceptance", newAcceptance);
+    const afterRotation = await post({ kind: "snapshot" });
+    expect(await afterRotation.json()).toMatchObject({ result: { snapshot: {
+      owner: successorEvent.statement.actor, frontier: [latest], records: [{ alias: "N-1", record: {
+        id: record, status: "accepted", fields: { title: "After rotation" },
+      } }],
+    } } });
+  });
+
+  it("authenticates raw signed commands with deployment bindings and independent grants", async () => {
+    const path = "https://runtime.test/v1/tenants/norm-test/placements/raw-commands/host/norm/commands";
+    const command = (value: unknown) => JSON.stringify({ protocol: "whipplescript.norm.commands/v1", command: value });
+    const post = (body: string, token = "control-token") => SELF.fetch(path, {
+      method: "POST", headers: { authorization: `Bearer ${token}`, "content-type": "application/json" }, body,
+    });
+    const bootstrap = async (query = "") => {
+      const result = await SELF.fetch(`https://runtime.test/__test/norm/bootstrap${query}`);
+      return result.json<Record<string, unknown>>();
+    };
+    const event = await bootstrap();
+    const append = command({ kind: "append", event });
+    for (const token of ["session-token", "wrong-token"]) {
+      const denied = await post(append, token);
+      expect(denied.status).toBe(401);
+      await denied.body?.cancel();
+    }
+    for (const body of [
+      append.replace('"kind":"append"', '"kind":"append","kind":"append"'),
+      append.replace('"principal":"norm-owner"', '"principal":"norm-owner","principal":"norm-owner"'),
+      append.replace('{', '{"bindings":[],'),
+      command({ kind: "append", event: await bootstrap("?creator=ungranted") }),
+      command({ kind: "append", event: await bootstrap("?principal=unbound") }),
+      command({ kind: "append", event: { ...event, signature: "00" } }),
+    ]) {
+      const denied = await post(body);
+      expect(denied.status).toBe(400);
+      await denied.body?.cancel();
+    }
+    const empty = await post(command({ kind: "snapshot" }));
+    expect(empty.status).toBe(400);
+    await empty.body?.cancel();
+    const admitted = await post(append);
+    expect(admitted.status).toBe(200);
+    const receipt = await admitted.json<{ result: { event_id: string } }>();
+    const retry = await post(append);
+    expect(await retry.json()).toEqual(receipt);
+    const snapshot = await post(command({ kind: "snapshot" }));
+    expect(snapshot.status).toBe(200);
+    expect(await snapshot.json()).toMatchObject({ result: { kind: "snapshot", snapshot: {
+      owner: { principal: "norm-owner" }, records: [], frontier: [receipt.result.event_id],
+    } } });
+    const exported = await post(command({ kind: "export" }));
+    const history = await exported.json<{ result: { events: unknown[] } }>();
+    expect(history.result.events).toHaveLength(1);
+    const imported = await post(command({ kind: "import", events: history.result.events }));
+    expect(await imported.json()).toMatchObject({ result: { kind: "imported", inserted: 0 } });
+  });
+});
+
+
+// norm-observation-publication
+describe("hosted observation publication", () => {
+  it("binds external custody signatures to recovered execution through the WASM door", async () => {
+    const vectors = JSON.parse((env as unknown as { NORM_PUBLICATION_VECTOR: string }).NORM_PUBLICATION_VECTOR) as {
+      cases: Array<{
+        public_bindings: unknown[]; checkpoint: unknown; events: unknown[];
+        runtime_rows: Array<{ table: string; columns: string[]; rows: Array<Array<string | number | null>> }>;
+        artifacts: { blobs: Array<{ id: string; body: string; byte_len: number }>; cuts: Array<{ cut_id: string; change_id: string; branch_id: string; manifest_hash: string; recorded_at: string }> };
+        draft_command: Record<string, unknown>; draft: unknown;
+        event: { signature: string; statement: unknown }; forged: unknown; incompatible: unknown; response: { protocol: string; result: { event_id: string; observation: unknown; acknowledgment: { event_id: string; sequence: number } } };
+      }>;
+    };
+    expect(vectors.cases).toHaveLength(2);
+    for (const [index, vector] of vectors.cases.entries()) {
+      const namespace = (env as unknown as TestEnv).WORKFLOW_INSTANCE;
+      const id = namespace.idFromName(`tenant:norm-test:placement:publication-${index}`);
+      const target = namespace.get(id);
+      await runInDurableObject(target, async (instance) => {
+        (instance as unknown as { configureNormTestPublicBindings(keys: unknown[], restorations: unknown[]): void })
+          .configureNormTestPublicBindings(vector.public_bindings, [{ object_id: id.toString(), checkpoint: vector.checkpoint }]);
+      });
+      const send = (operation: string, body: unknown, authorized = true) => SELF.fetch(
+        `https://runtime.test/v1/tenants/norm-test/placements/publication-${index}/host/norm/${operation}`, {
+          method: "POST", headers: { ...(authorized ? { authorization: "Bearer control-token" } : {}), "content-type": "application/json" }, body: JSON.stringify(body),
+        },
+      );
+      const publication = (command: unknown) => ({ protocol: "whipplescript.norm.publication/v1", command });
+      const unauthorized = await send("publications", publication(vector.draft_command), false);
+      expect(unauthorized.status).toBe(401);
+      await unauthorized.body?.cancel();
+      const provisioned = await send("provision", {});
+      expect(provisioned.status).toBe(200);
+      await provisioned.body?.cancel();
+      const imported = await send("commands", { protocol: "whipplescript.norm.commands/v1", command: { kind: "import", events: vector.events } });
+      expect(imported.status).toBe(200);
+      await imported.body?.cancel();
+      const absent = await send("publications", publication(vector.draft_command));
+      expect(absent.status).toBe(400);
+      expect(await absent.text()).toContain("run is missing");
+      const artifactOpen = await send("commands", { protocol: "whipplescript.norm.commands/v1", command: { kind: "resources", point: { cut: "cut" } } });
+      expect(artifactOpen.status).toBe(400);
+      expect(await artifactOpen.text()).toContain("is not recorded");
+      // Only the test harness installs the owning Rust DO fixture's durable
+      // rows. This is authenticated transport evidence, not a live executor.
+      await runInDurableObject(target, async (_instance, state) => {
+        for (const table of vector.runtime_rows) {
+          expect(/^[a-z_]+$/.test(table.table)).toBe(true);
+          for (const column of table.columns) expect(/^[a-z_]+$/.test(column)).toBe(true);
+          for (const row of table.rows) state.storage.sql.exec(
+            `INSERT INTO "${table.table}" (${table.columns.map(column => `"${column}"`).join(",")}) VALUES (${row.map(() => "?").join(",")})`, ...row,
+          );
+        }
+        for (const blob of vector.artifacts.blobs) state.storage.sql.exec("INSERT INTO content_blobs (id, body, byte_len) VALUES (?, ?, ?)", blob.id, blob.body, blob.byte_len);
+        for (const cut of vector.artifacts.cuts) state.storage.sql.exec("INSERT INTO cuts (cut_id, change_id, branch_id, manifest_hash, recorded_at) VALUES (?, ?, ?, ?, ?)", cut.cut_id, cut.change_id, cut.branch_id, cut.manifest_hash, cut.recorded_at);
+      });
+      const invalidDraft = await send("publications", publication({ ...vector.draft_command, vocabulary: "decision@1" }));
+      expect(invalidDraft.status).toBe(400);
+      await invalidDraft.body?.cancel();
+      const draft = await send("publications", publication(vector.draft_command));
+      const draftBody = await draft.json();
+      expect(draft.status, JSON.stringify(draftBody)).toBe(200);
+      expect(draftBody).toEqual(vector.draft);
+      const publish = (event: unknown) => publication({ kind: "publish", instance: "instance", run: "run", event });
+      let firstPublication: unknown;
+      for (const retained of [false, true]) {
+        for (const [event, diagnostic] of [[vector.forged, "differs"], [{ ...vector.event, signature: "invalid" }, "signature"]] as const) {
+          const refused = await send("publications", publish(event));
+          expect(refused.status).toBe(400);
+          expect((await refused.text()).toLowerCase()).toContain(diagnostic);
+        }
+        const incompatible = await send("publications", publish(vector.incompatible));
+        expect(incompatible.status).toBe(400);
+        await incompatible.body?.cancel();
+        await runInDurableObject(target, async (_instance, state) => {
+          const rows = state.storage.sql.exec<{ count: number }>("SELECT COUNT(*) AS count FROM events WHERE instance_id = 'instance' AND event_type = 'norm.publication.prepared'").toArray();
+          expect(rows[0].count).toBe(retained ? 1 : 0);
+        });
+        const result = await send("publications", publish(vector.event));
+        const body = await result.json() as typeof vector.response;
+        expect(result.status, JSON.stringify(body)).toBe(200);
+        // Runtime journal IDs are SQLite randomblob identities local to each
+        // host. The signed ledger ID and observation must match across hosts;
+        // the complete local receipt must match on retry within this host.
+        expect(body).toEqual({ ...vector.response, result: { ...vector.response.result, acknowledgment: { ...vector.response.result.acknowledgment, event_id: body.result.acknowledgment.event_id } } });
+        expect(body.result.acknowledgment.event_id).toMatch(/^evt_[0-9a-f]{32}$/);
+        if (retained) expect(body).toEqual(firstPublication);
+        else firstPublication = body;
+        await runInDurableObject(target, async (_instance, state) => {
+          const rows = state.storage.sql.exec<{ event_id: string; event_type: string }>("SELECT event_id, event_type FROM events WHERE instance_id = 'instance' AND event_type IN ('norm.publication.prepared', 'norm.publication.acknowledged') ORDER BY sequence").toArray();
+          expect(rows.map(row => row.event_type)).toEqual(["norm.publication.prepared", "norm.publication.acknowledged"]);
+          expect(rows[1].event_id).toBe(body.result.acknowledgment.event_id);
+        });
+        const recovered = await send("publications", publication({ ...vector.draft_command, created_at: "later" }));
+        expect(recovered.status).toBe(200);
+        expect(await recovered.json()).toMatchObject({ result: { kind: "retained", event: vector.event } });
+        if (retained) {
+          const exported = await send("commands", { protocol: "whipplescript.norm.commands/v1", command: { kind: "export" } });
+          const body = await exported.json() as { result: { events: unknown[] } };
+          expect(body.result.events).toHaveLength(vector.events.length + 1);
+        }
+      }
+      for (const request of [
+        { ...publication(vector.draft_command), public_bindings: vector.public_bindings },
+        { ...publication(vector.draft_command), protocol: "untrusted" },
+        publication({ ...vector.draft_command, files: { "main.py": "forged" } }),
+        publication({ ...vector.draft_command, actor: { ...(vector.draft_command.actor as Record<string, unknown>), principal: "other-publisher" } }),
+      ]) {
+        const refused = await send("publications", request);
+        expect(refused.status).toBe(400);
+        await refused.body?.cancel();
+      }
+      await runInDurableObject(target, async (_instance, state) => { state.storage.sql.exec("DELETE FROM cuts WHERE cut_id = 'cut'"); });
+      const missingCut = await send("publications", publish(vector.event));
+      expect(missingCut.status).toBe(400);
+      expect(await missingCut.text()).toContain("is not recorded");
+    }
+  });
+});
+
+// norm-observation-enqueue
+describe("hosted observation enqueue", () => {
+  it("pins selections and recovers acknowledgments through the authenticated WASM route", async () => {
+    type Rows = Array<{ table: string; columns: string[]; rows: Array<Array<string | number | null>> }>;
+    const vectors = JSON.parse((env as unknown as { NORM_PUBLICATION_VECTOR: string }).NORM_PUBLICATION_VECTOR) as {
+      cases: Array<{
+        public_bindings: unknown[]; checkpoint: unknown; events: unknown[]; advance: unknown;
+        artifacts: { blobs: Array<{ id: string; body: string; byte_len: number }>; cuts: Array<{ cut_id: string; change_id: string; branch_id: string; manifest_hash: string; recorded_at: string }> };
+        enqueue: { command: Record<string, unknown> & { instance: string }; runtime_rows: Rows;
+          response: { result: { effect_id: string; anchor: { frontier: string[] }; artifact: unknown; acknowledgment: { sequence: number } } } };
+      }>;
+    };
+    expect(vectors.cases).toHaveLength(2);
+    for (const [index, vector] of vectors.cases.entries()) {
+      const namespace = (env as unknown as TestEnv).WORKFLOW_INSTANCE;
+      const id = namespace.idFromName(`tenant:norm-test:placement:enqueue-${index}`);
+      const target = namespace.get(id);
+      const configure = async (endpoint?: string, epoch?: string, runtime?: string) => runInDurableObject(target, async (instance) => {
+        (instance as unknown as { configureNormTestExecutor(endpoint?: string, epoch?: string, runtime?: string): void }).configureNormTestExecutor(endpoint, epoch, runtime);
+      });
+      await runInDurableObject(target, async (instance) => {
+        (instance as unknown as { configureNormTestPublicBindings(keys: unknown[], restorations: unknown[]): void })
+          .configureNormTestPublicBindings(vector.public_bindings, [{ object_id: id.toString(), checkpoint: vector.checkpoint }]);
+      });
+      const send = (operation: string, body: unknown, authorized = true) => SELF.fetch(
+        `https://runtime.test/v1/tenants/norm-test/placements/enqueue-${index}/host/norm/${operation}`, {
+          method: "POST", headers: { ...(authorized ? { authorization: "Bearer control-token" } : {}), "content-type": "application/json" }, body: JSON.stringify(body),
+        },
+      );
+      const request = (command: unknown) => ({ protocol: "whipplescript.norm.enqueue/v1", command });
+      const norm = (command: unknown) => ({ protocol: "whipplescript.norm.commands/v1", command });
+      const invoke = (command: unknown = vector.enqueue.command) => send("enqueues", request(command));
+      const unauthorized = await send("enqueues", request(vector.enqueue.command), false);
+      expect(unauthorized.status).toBe(401); await unauthorized.body?.cancel();
+      const unavailable = await invoke();
+      expect(unavailable.status).toBe(503); await unavailable.body?.cancel();
+      await configure("https://executor", "epoch");
+      const provision = await send("provision", {});
+      expect(provision.status).toBe(200); await provision.body?.cancel();
+      const imported = await send("commands", norm({ kind: "import", events: vector.events }));
+      expect(imported.status).toBe(200); await imported.body?.cancel();
+      const artifactOpen = await send("commands", norm({ kind: "resources", point: { cut: "cut" } }));
+      expect(artifactOpen.status).toBe(400); await artifactOpen.body?.cancel();
+      await runInDurableObject(target, async (_instance, state) => {
+        for (const table of vector.enqueue.runtime_rows) {
+          expect(/^[a-z_][a-z0-9_]*$/.test(table.table)).toBe(true);
+          for (const column of table.columns) expect(/^[a-z_][a-z0-9_]*$/.test(column)).toBe(true);
+          for (const row of table.rows) state.storage.sql.exec(
+            `INSERT INTO "${table.table}" (${table.columns.map(column => `"${column}"`).join(",")}) VALUES (${row.map(() => "?").join(",")})`, ...row,
+          );
+        }
+        for (const blob of vector.artifacts.blobs) state.storage.sql.exec("INSERT INTO content_blobs (id, body, byte_len) VALUES (?, ?, ?)", blob.id, blob.body, blob.byte_len);
+        for (const cut of vector.artifacts.cuts) state.storage.sql.exec("INSERT INTO cuts (cut_id, change_id, branch_id, manifest_hash, recorded_at) VALUES (?, ?, ?, ?, ?)", cut.cut_id, cut.change_id, cut.branch_id, cut.manifest_hash, cut.recorded_at);
+      });
+      const journal = async () => runInDurableObject(target, async (_instance, state) => state.storage.sql.exec("SELECT * FROM events WHERE instance_id = ? ORDER BY sequence", vector.enqueue.command.instance).toArray());
+      const before = await journal();
+      for (const command of [
+        { ...vector.enqueue.command, publisher: "unbound" },
+        { ...vector.enqueue.command, deadline_seconds: 0 },
+        { ...vector.enqueue.command, instance: "absent" },
+        { ...vector.enqueue.command, capability: "absent" },
+        { ...vector.enqueue.command, executor_url: "https://request.invalid" },
+        { ...vector.enqueue.command, environment_epoch: "request-owned" },
+        { ...vector.enqueue.command, files: { "main.py": "forged" } },
+      ]) {
+        const refused = await invoke(command); expect(refused.status).toBe(400); await refused.body?.cancel();
+        expect(await journal()).toEqual(before);
+      }
+      const wrongProtocol = await send("enqueues", { ...request(vector.enqueue.command), protocol: "unknown" });
+      expect(wrongProtocol.status).toBe(400); await wrongProtocol.body?.cancel();
+      const injectedTrust = await send("enqueues", { ...request(vector.enqueue.command), public_bindings: vector.public_bindings });
+      expect(injectedTrust.status).toBe(400); await injectedTrust.body?.cancel();
+      await configure("https://executor", "wrong-epoch");
+      const wrongEpoch = await invoke(); expect(wrongEpoch.status).toBe(400); await wrongEpoch.body?.cancel();
+      expect(await journal()).toEqual(before);
+      await configure("https://executor", "epoch");
+      const runtime = { engine: { kind: "cpython3147_wasi", artifact_path: "/opt/reactor.wasm", artifact_sha256: "a".repeat(64) },
+        executable: "/usr/local/bin/whip", python_version: "3.14.7", environment: "epoch" };
+      for (const invalid of ["{}", JSON.stringify({ ...runtime, unknown: true }), JSON.stringify(runtime) + " ".repeat(16_384)]) {
+        await configure("https://executor", "epoch", invalid);
+        const refused = await invoke(); expect(refused.status).toBe(400); await refused.body?.cancel();
+        expect(await journal()).toEqual(before);
+      }
+      // The cooperative fixture retains its integrity class while using the
+      // deployment's norm epoch, independently of the ordinary cache epoch.
+      await configure("https://executor", undefined, JSON.stringify(runtime));
+      const [first, concurrent] = await Promise.all([invoke(), invoke()]);
+      const firstBody = await first.json<{ result: { acknowledgment: { event_id: string; sequence: number } } }>();
+      const concurrentBody = await concurrent.json();
+      expect(concurrent.status, JSON.stringify(concurrentBody)).toBe(200);
+      expect(concurrentBody).toEqual(firstBody);
+      expect(first.status, JSON.stringify(firstBody)).toBe(200);
+      expect(firstBody).toMatchObject({ protocol: "whipplescript.norm.enqueue/v1", result: {
+        effect_id: vector.enqueue.response.result.effect_id, anchor: vector.enqueue.response.result.anchor,
+        artifact: vector.enqueue.response.result.artifact,
+        acknowledgment: { sequence: vector.enqueue.response.result.acknowledgment.sequence },
+      } });
+      expect(firstBody.result.acknowledgment.event_id).toBeTruthy();
+      const advance = await send("commands", norm({ kind: "append", event: vector.advance }));
+      expect(advance.status).toBe(200); const advanced = await advance.json<{ result: { event_id: string } }>();
+      await runInDurableObject(target, async (_instance, state) => {
+        state.storage.sql.exec("DELETE FROM script_capabilities WHERE name = 'observer'");
+        state.storage.sql.exec("UPDATE instances SET status = 'paused' WHERE instance_id = ?", vector.enqueue.command.instance);
+      });
+      await configure("https://changed-executor", "changed-epoch");
+      const retained = await journal();
+      const replay = await invoke(); expect(replay.status).toBe(200); expect(await replay.json()).toEqual(firstBody);
+      const explicit = await invoke({ ...vector.enqueue.command, frontier: vector.enqueue.response.result.anchor.frontier });
+      expect(explicit.status).toBe(200); expect(await explicit.json()).toEqual(firstBody);
+      for (const command of [
+        { ...vector.enqueue.command, frontier: [advanced.result.event_id] },
+        { ...vector.enqueue.command, deadline_seconds: 121 },
+        { ...vector.enqueue.command, publisher: "unbound" },
+      ]) {
+        const refused = await invoke(command); expect(refused.status).toBe(400); await refused.body?.cancel();
+      }
+      expect(await journal()).toEqual(retained);
+      await runInDurableObject(target, async (_instance, state) => {
+        expect(state.storage.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM effects WHERE instance_id = ?", vector.enqueue.command.instance).toArray()[0].n).toBe(1);
+        expect(state.storage.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM runs WHERE instance_id = ?", vector.enqueue.command.instance).toArray()[0].n).toBe(0);
+      });
+    }
   });
 });

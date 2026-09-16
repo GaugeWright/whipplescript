@@ -1,0 +1,16 @@
+load ../exec-dispatch.maude
+search [1] in EXEC-DISPATCH : { configured(p0) fresh(r0) input(r0,i0) prepare(r0,i0,p0) } =>* { stored(r0,i0,p0) sent(r0,p0) C:Cfg } .
+search [1] in EXEC-DISPATCH : { configured(p0) fresh(r0) input(r0,i0) prepare(r0,i0,p0) reply(r0) } =>* { settled(r0,p0) C:Cfg } .
+search [1] in EXEC-DISPATCH : { configured(p1) input(r0,i0) stored(r0,i0,p0) reply(r0) } =>* { settled(r0,p0) C:Cfg } .
+search [1] in EXEC-DISPATCH : { input(r0,i0) stored(r0,i0,p0) prepare(r0,i0,p0) } =>* { sent(r0,p0) C:Cfg } .
+search [1] in EXEC-DISPATCH : { configured(p0) input(r0,i0) reply(r0) } =>* { settled(r0,p0) C:Cfg } .
+search [1] in EXEC-DISPATCH-WEAK-MISSING : { configured(p0) input(r0,i0) reply(r0) } =>* { settled(r0,p0) C:Cfg } .
+search [1] in EXEC-DISPATCH : { input(r0,i1) stored(r0,i0,p0) reply(r0) } =>* { settled(r0,p0) C:Cfg } .
+search [1] in EXEC-DISPATCH-WEAK-INPUT : { input(r0,i1) stored(r0,i0,p0) reply(r0) } =>* { settled(r0,p0) C:Cfg } .
+search [1] in EXEC-DISPATCH : { input(r0,i0) stored(r0,i0,p0) reply(r1) } =>* { settled(r0,p0) C:Cfg } .
+search [1] in EXEC-DISPATCH-WEAK-REPLY : { input(r0,i0) stored(r0,i0,p0) reply(r1) } =>* { settled(r0,p0) C:Cfg } .
+search [1] in EXEC-DISPATCH : { configured(p1) input(r0,i0) stored(r0,i0,p0) reply(r0) } =>* { settled(r0,p1) C:Cfg } .
+search [1] in EXEC-DISPATCH-WEAK-RECONFIGURE : { configured(p1) input(r0,i0) stored(r0,i0,p0) reply(r0) } =>* { settled(r0,p1) C:Cfg } .
+search [1] in EXEC-DISPATCH : { configured(p1) input(r0,i0) stored(r0,i0,p0) prepare(r0,i0,p1) } =>* { sent(r0,p1) C:Cfg } .
+search [1] in EXEC-DISPATCH-WEAK-REDISPATCH : { configured(p1) input(r0,i0) stored(r0,i0,p0) prepare(r0,i0,p1) } =>* { sent(r0,p1) C:Cfg } .
+quit

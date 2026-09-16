@@ -1,0 +1,10 @@
+load ../exec-provider-lifetime.maude
+search [1] in EXEC-PREPLACEMENT-FENCE : cfg(absent,none,quiet) =>* cfg(guarded,fence,notAdmitted) .
+search [1] in EXEC-PREPLACEMENT-FENCE : cfg(guarded,none,quiet) =>* cfg(guarded,fence,notAdmitted) .
+search [1] in EXEC-PREPLACEMENT-FENCE : cfg(guarded,none,quiet) =>* cfg(guarded,none,running) .
+search [1] in EXEC-PREPLACEMENT-FENCE-WEAK : cfg(guarded,none,quiet) =>* cfg(guarded,none,running) .
+search [1] in EXEC-PREPLACEMENT-FENCE : cfg(guarded,fence,notAdmitted) =>* cfg(guarded,delivery,running) .
+search [1] in EXEC-PREPLACEMENT-FENCE-WEAK : cfg(guarded,fence,notAdmitted) =>* cfg(guarded,delivery,running) .
+search [1] in EXEC-PREPLACEMENT-FENCE : cfg(legacy,none,quiet) =>* cfg(guarded,fence,notAdmitted) .
+search [1] in EXEC-PREPLACEMENT-FENCE-WEAK : cfg(legacy,none,quiet) =>* cfg(guarded,fence,notAdmitted) .
+quit

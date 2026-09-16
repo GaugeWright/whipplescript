@@ -1,0 +1,12 @@
+load ../exec-reconciliation-wake.maude
+search [1] in EXEC-RECONCILIATION-WAKE : select(1,2,active) =>* waiting(2) .
+search [1] in EXEC-RECONCILIATION-WAKE : select(2,2,active) =>* ready .
+search [1] in EXEC-RECONCILIATION-WAKE : select(2,2,closed) =>* none .
+search [1] in EXEC-RECONCILIATION-WAKE : select(1,2,active) =>* ready .
+search [1] in EXEC-RECONCILIATION-WAKE-WEAK : select(1,2,active) =>* ready .
+search [1] in EXEC-RECONCILIATION-WAKE : select(2,2,closed) =>* ready .
+search [1] in EXEC-RECONCILIATION-WAKE-WEAK : select(2,2,closed) =>* ready .
+search [1] in EXEC-DEFERRED-FIXPOINT : drive(deferred,sibling) =>* parkedWithWake .
+search [1] in EXEC-DEFERRED-FIXPOINT : drive(deferred,sibling) =>* parkedWithoutWake .
+search [1] in EXEC-DEFERRED-FIXPOINT-WEAK : drive(deferred,sibling) =>* parkedWithoutWake .
+quit

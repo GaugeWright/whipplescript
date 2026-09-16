@@ -1,0 +1,101 @@
+--- Observation publication contract; backend integration remains separate.
+--- Atomic consumption of fresh is a storage premise, not a proof of a backend
+--- transaction. Report identities stand for complete immutable report bytes.
+--- Signed-envelope identity and nonce validation belong to the existing ledger;
+--- this model checks report-level retry consistency, not signature encodings.
+--- prepared, verified, committed and publisher are independently installed host
+--- facts, never supplied by the candidate report. Hash equality is abstracted.
+--- Historical basis is pinned by prepared; current requirement activity is not
+--- a premise for retaining a historical observation.
+mod NORM-RUN-ADMISSION is
+  sorts Id Outcome Counter Fact Cfg State .
+  ops run other ledger principal requirement method artifact contract report : -> Id [ctor] .
+  ops pass fail harnessFailed : -> Outcome [ctor] .
+  ops noCounter counterexample : -> Counter [ctor] .
+  subsort Fact < Cfg .
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+  op {_} : Cfg -> State [ctor] .
+  op prepared : Id Id Id Id Id Id Id -> Fact [ctor] .
+  op observed : Id Id Id Id Id Id Outcome Counter -> Fact [ctor] .
+  ops verified committed : Id Id -> Fact [ctor] .
+  op publisher : Id Id -> Fact [ctor] .
+  op publish : Id Id Id -> Fact [ctor] .
+  op fresh : Id Id Id -> Fact [ctor] .
+  op acknowledged : Id Id -> Fact [ctor] .
+  op recorded : Id Id Id Id Outcome Counter -> Fact [ctor] .
+  vars I L U R M A K D : Id . var O : Outcome . var X : Counter . var C : Cfg .
+  rl [publish-completed-observation] :
+    { prepared(I,L,R,M,A,K,U) observed(I,D,R,M,A,K,O,X)
+      verified(I,D) committed(I,D) publisher(L,U) publish(U,I,D) fresh(L,U,I) C }
+    => { prepared(I,L,R,M,A,K,U) observed(I,D,R,M,A,K,O,X)
+      verified(I,D) committed(I,D) publisher(L,U) recorded(L,U,I,D,O,X) acknowledged(I,D) C } .
+  rl [replay-identical-publication] :
+    { recorded(L,U,I,D,O,X) publisher(L,U) publish(U,I,D) C }
+    => { recorded(L,U,I,D,O,X) publisher(L,U) acknowledged(I,D) C } .
+endm
+mod NORM-RUN-ADMISSION-WEAK-VERIFIER is
+  including NORM-RUN-ADMISSION .
+  vars I L U R M A K D : Id . var O : Outcome . var X : Counter . var C : Cfg .
+  rl [accept-unverified-report] :
+    { prepared(I,L,R,M,A,K,U) observed(I,D,R,M,A,K,O,X)
+      committed(I,D) publisher(L,U) publish(U,I,D) fresh(L,U,I) C }
+    => { recorded(L,U,I,D,O,X) C } .
+endm
+mod NORM-RUN-ADMISSION-WEAK-COMMIT is
+  including NORM-RUN-ADMISSION .
+  vars I L U R M A K D : Id . var O : Outcome . var X : Counter . var C : Cfg .
+  rl [accept-uncommitted-result] :
+    { prepared(I,L,R,M,A,K,U) observed(I,D,R,M,A,K,O,X)
+      verified(I,D) publisher(L,U) publish(U,I,D) fresh(L,U,I) C }
+    => { recorded(L,U,I,D,O,X) C } .
+endm
+mod NORM-RUN-ADMISSION-WEAK-SCOPE is
+  including NORM-RUN-ADMISSION .
+  vars I L U R M A K D R1 M1 A1 K1 : Id . var O : Outcome . var X : Counter . var C : Cfg .
+  rl [substitute-artifact] :
+    { prepared(I,L,R,M,A,K,U) observed(I,D,R1,M1,A1,K1,O,X)
+      verified(I,D) committed(I,D) publisher(L,U) publish(U,I,D) fresh(L,U,I) C }
+    => { recorded(L,U,I,D,O,X) C } .
+endm
+mod NORM-RUN-ADMISSION-WEAK-COUNTER is
+  including NORM-RUN-ADMISSION .
+  vars I L U R M A K D : Id . var C : Cfg .
+  rl [erase-counter-on-harness-failure] :
+    { prepared(I,L,R,M,A,K,U) observed(I,D,R,M,A,K,harnessFailed,counterexample)
+      verified(I,D) committed(I,D) publisher(L,U) publish(U,I,D) fresh(L,U,I) C }
+    => { recorded(L,U,I,D,harnessFailed,noCounter) C } .
+endm
+
+mod NORM-RUN-ADMISSION-WEAK-PUBLISHER is
+  including NORM-RUN-ADMISSION .
+  vars I L U R M A K D L1 U1 : Id . var O : Outcome . var X : Counter . var C : Cfg .
+  rl [accept-unscoped-publisher] :
+    { prepared(I,L,R,M,A,K,U) observed(I,D,R,M,A,K,O,X)
+      verified(I,D) committed(I,D) publisher(L1,U1) publish(U,I,D) fresh(L,U,I) C }
+    => { recorded(L,U,I,D,O,X) C } .
+endm
+mod NORM-RUN-ADMISSION-WEAK-REPLAY is
+  including NORM-RUN-ADMISSION .
+  vars I L U D : Id . var O : Outcome . var X : Counter . var C : Cfg .
+  rl [duplicate-publication] :
+    { recorded(L,U,I,D,O,X) publisher(L,U) publish(U,I,D) C }
+    => { recorded(L,U,I,D,O,X) recorded(L,U,I,D,O,X) publisher(L,U) C } .
+endm
+
+mod NORM-RUN-ADMISSION-WEAK-PINNED-PUBLISHER is
+  including NORM-RUN-ADMISSION .
+  vars I L U R M A K D U1 : Id . var O : Outcome . var X : Counter . var C : Cfg .
+  rl [switch-invocation-principal] :
+    { prepared(I,L,R,M,A,K,U1) observed(I,D,R,M,A,K,O,X)
+      verified(I,D) committed(I,D) publisher(L,U) publish(U,I,D) fresh(L,U,I) C }
+    => { recorded(L,U,I,D,O,X) C } .
+endm
+
+mod NORM-RUN-ADMISSION-WEAK-CONFLICT is
+  including NORM-RUN-ADMISSION .
+  vars I L U D D1 : Id . var O : Outcome . var X : Counter . var C : Cfg .
+  rl [acknowledge-different-publication] :
+    { recorded(L,U,I,D,O,X) publisher(L,U) publish(U,I,D1) C }
+    => { recorded(L,U,I,D,O,X) acknowledged(I,D1) C } .
+endm

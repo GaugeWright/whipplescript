@@ -1,0 +1,26 @@
+load ../exec-provider-receipt.maude
+search [1] in EXEC-PROVIDER-RECEIPT : claim(absent) =>* dispatch(started) .
+search [1] in EXEC-PROVIDER-RECEIPT : claim(started) =>* pending(started) .
+search [1] in EXEC-PROVIDER-RECEIPT : claim(completed(original)) =>* replay(original) .
+search [1] in EXEC-PROVIDER-RECEIPT : finish(started,original) =>* saved(completed(original)) .
+search [1] in EXEC-PROVIDER-RECEIPT : finish(completed(original),original) =>* saved(completed(original)) .
+search [1] in EXEC-PROVIDER-RECEIPT : claim(started) =>* dispatch(started) .
+search [1] in EXEC-PROVIDER-RECEIPT-WEAK : claim(started) =>* dispatch(started) .
+search [1] in EXEC-PROVIDER-RECEIPT : finish(completed(original),replacement) =>* saved(completed(replacement)) .
+search [1] in EXEC-PROVIDER-RECEIPT-WEAK : finish(completed(original),replacement) =>* saved(completed(replacement)) .
+search [1] in EXEC-HANDOFF : handoff(executor,current) =>* privateBroker .
+search [1] in EXEC-HANDOFF : handoff(http,current) =>* privateBroker .
+search [1] in EXEC-HANDOFF-WEAK : handoff(http,current) =>* privateBroker .
+search [1] in EXEC-HANDOFF : handoff(executor,foreign) =>* privateBroker .
+search [1] in EXEC-HANDOFF-WEAK : handoff(executor,foreign) =>* privateBroker .
+search [1] in EXEC-HANDOFF : handoff(executor,stale) =>* privateBroker .
+search [1] in EXEC-HANDOFF-WEAK : handoff(executor,stale) =>* privateBroker .
+search [1] in EXEC-HANDOFF : handoff(executor,changed) =>* privateBroker .
+search [1] in EXEC-HANDOFF-WEAK : handoff(executor,changed) =>* privateBroker .
+search [1] in EXEC-PLACEMENT : place(none,original) =>* saved(assigned(original)) .
+search [1] in EXEC-PLACEMENT : place(assigned(original),original) =>* saved(assigned(original)) .
+search [1] in EXEC-PLACEMENT : forward(none) =>* sent(original) .
+search [1] in EXEC-PLACEMENT-WEAK : forward(none) =>* sent(original) .
+search [1] in EXEC-PLACEMENT : place(assigned(original),other) =>* saved(assigned(other)) .
+search [1] in EXEC-PLACEMENT-WEAK : place(assigned(original),other) =>* saved(assigned(other)) .
+quit

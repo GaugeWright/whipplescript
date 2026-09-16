@@ -1,0 +1,13 @@
+mod HOSTED-IMPACT-ENTRY is
+  sorts Premise State .
+  ops valid wrong caller : -> Premise [ctor] .
+  op query : Premise Premise Premise -> State [ctor] .
+  op planned : -> State [ctor] .
+  rl [trusted-entry] : query(valid,valid,valid) => planned .
+endm
+mod HOSTED-IMPACT-ENTRY-WEAK is
+  including HOSTED-IMPACT-ENTRY .
+  rl [ignore-protocol] : query(wrong,valid,valid) => planned .
+  rl [caller-authority] : query(valid,caller,valid) => planned .
+  rl [unverified-history] : query(valid,valid,wrong) => planned .
+endm

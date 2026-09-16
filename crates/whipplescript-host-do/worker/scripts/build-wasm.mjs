@@ -1,6 +1,8 @@
 import { spawnSync } from "node:child_process";
+import { writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 
+const nodeTarget = process.argv.includes("--node");
 const workerDirectory = resolve(import.meta.dirname, "..");
 const workspaceDirectory = resolve(workerDirectory, "../../..");
 const targetDirectory = process.env.CARGO_TARGET_DIR
@@ -44,9 +46,13 @@ run(
       "wasm32-unknown-unknown/release/whipplescript_host_do.wasm",
     ),
     "--out-dir",
-    resolve(workerDirectory, "pkg"),
+    resolve(workerDirectory, nodeTarget ? "pkg-node" : "pkg"),
     "--target",
-    "bundler",
+    nodeTarget ? "nodejs" : "bundler",
   ],
   workerDirectory,
 );
+
+if (nodeTarget) {
+  writeFileSync(resolve(workerDirectory, "pkg-node/package.json"), '{"type":"commonjs"}\n');
+}

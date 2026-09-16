@@ -1,0 +1,69 @@
+--- Missing output cannot establish an executor's lifetime termination.
+--- Retained output recovery precedes the generic provider fallback.
+mod EXEC-RECOVERY-FALLBACK is
+ sorts Kind Output State Cfg .
+ ops executor other : -> Kind [ctor] .
+ ops missing retained : -> Output [ctor] .
+ ops running completed uncertain : -> State [ctor] .
+ op cfg : Kind Output State -> Cfg [ctor] .
+ var K : Kind .
+ rl [retained-result] : cfg(K,retained,running) => cfg(K,retained,completed) .
+ rl [generic-fallback] : cfg(other,missing,running) => cfg(other,missing,uncertain) .
+endm
+mod EXEC-RECOVERY-FALLBACK-WEAK is
+ including EXEC-RECOVERY-FALLBACK .
+ rl [missing-output-is-ended] : cfg(executor,missing,running) => cfg(executor,missing,uncertain) .
+ rl [discard-retained-result] : cfg(executor,retained,running) => cfg(executor,retained,uncertain) .
+endm
+
+--- Recovery requests closure only for original tracked custody. Intent alone
+--- never resolves the run, and an older reason remains the selected intent.
+mod EXEC-RECOVERY-INTENT is
+ sorts Custody Intent Run Cfg .
+ ops tracked legacy : -> Custody [ctor] .
+ ops none recovery cancellation : -> Intent [ctor] .
+ ops running terminal : -> Run [ctor] .
+ op cfg : Custody Intent Run -> Cfg [ctor] .
+ rl [request-closure] : cfg(tracked,none,running) => cfg(tracked,recovery,running) .
+endm
+mod EXEC-RECOVERY-INTENT-WEAK is
+ including EXEC-RECOVERY-INTENT .
+ rl [legacy-proof-invention] : cfg(legacy,none,running) => cfg(legacy,recovery,running) .
+ rl [intent-is-terminal] : cfg(tracked,recovery,running) => cfg(tracked,recovery,terminal) .
+ rl [replace-intent] : cfg(tracked,cancellation,running) => cfg(tracked,recovery,running) .
+endm
+
+--- Lease expiry reports lost worker custody, not stopped external execution.
+mod EXEC-LEASE-EXPIRY is
+ sorts Kind Custody Lease Intent Run Cfg .
+ ops executor other : -> Kind [ctor] .
+ ops tracked legacy : -> Custody [ctor] .
+ ops active expired : -> Lease [ctor] .
+ ops none fenced : -> Intent [ctor] .
+ ops running queued : -> Run [ctor] .
+ op cfg : Kind Custody Lease Intent Run -> Cfg [ctor] .
+ rl [tracked-expiry] : cfg(executor,tracked,active,none,running) => cfg(executor,tracked,expired,fenced,running) .
+ rl [existing-intent] : cfg(executor,tracked,active,fenced,running) => cfg(executor,tracked,expired,fenced,running) .
+ rl [legacy-expiry] : cfg(executor,legacy,active,none,running) => cfg(executor,legacy,expired,none,running) .
+ rl [generic-expiry] : cfg(other,legacy,active,none,running) => cfg(other,legacy,expired,none,queued) .
+endm
+mod EXEC-LEASE-EXPIRY-WEAK is
+ including EXEC-LEASE-EXPIRY .
+ rl [requeue-tracked] : cfg(executor,tracked,active,none,running) => cfg(executor,tracked,expired,none,queued) .
+ rl [requeue-legacy] : cfg(executor,legacy,active,none,running) => cfg(executor,legacy,expired,none,queued) .
+ rl [lose-fence] : cfg(executor,tracked,active,none,running) => cfg(executor,tracked,expired,none,running) .
+endm
+
+--- Host clock, original marked admission and validated restoration are premises.
+mod HOSTED-NORM-LEASE is
+ sorts Phase State .
+ ops partial tracked due fenced terminal : -> Phase [ctor] .
+ op cfg : Phase -> State [ctor] .
+ rl [restore-original] : cfg(partial) => cfg(tracked) .
+ rl [alarm] : cfg(tracked) => cfg(due) .
+ rl [expire] : cfg(due) => cfg(fenced) .
+endm
+mod HOSTED-NORM-LEASE-WEAK is
+ including HOSTED-NORM-LEASE .
+ rl [skip-expiry] : cfg(due) => cfg(terminal) .
+endm

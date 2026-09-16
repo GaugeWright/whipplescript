@@ -429,7 +429,8 @@ if (process.argv.includes("--selftest")) {
   process.exit(0);
 }
 
-const workerTables = parseTables(readFileSync(WORKER_SCHEMA, "utf8"));
+const sharedNormSchema = readFileSync("crates/whipplescript-store/src/norm_schema.sql", "utf8");
+const workerTables = parseTables(readFileSync(WORKER_SCHEMA, "utf8") + sharedNormSchema);
 const rustSource = readFileSync(RUST_STORE, "utf8");
 const bootstrap = rustBootstrapSchema(rustSource);
 if (bootstrap === null) {
@@ -439,10 +440,16 @@ if (bootstrap === null) {
   );
   process.exit(1);
 }
-const rustTables = parseTables(bootstrap);
+const rustTables = parseTables(bootstrap + sharedNormSchema);
 const indexSource = readFileSync(WORKER_INDEX, "utf8");
 
 const findings = fixtureDrift(rustTables, workerTables);
+if (!indexSource.includes('import NORM_SCHEMA from "../../../whipplescript-store/src/norm_schema.sql";') || !indexSource.includes("sql.exec(NORM_SCHEMA)")) {
+  findings.push("hosted provisioning must import and apply the store-owned norm schema");
+}
+if (!rustSource.includes("execute_batch(whipplescript_store::norm::NORM_SCHEMA_SQL)")) {
+  findings.push("Rust DO fixture must apply the store-owned norm schema");
+}
 
 // Rule 3 reads the whole Rust store, not the bootstrap block: the statements
 // live throughout the file, and it is the statements this rule is about.
@@ -473,7 +480,7 @@ if (baseSchema === null) {
       parseTables(baseSchema),
       workerTables,
       lazyColumnAdds(indexSource),
-      lazyCreatedTables(indexSource),
+      lazyCreatedTables(indexSource + sharedNormSchema),
     ),
   );
   differential = "checked against the merge base";

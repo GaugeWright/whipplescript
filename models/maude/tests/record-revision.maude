@@ -1,0 +1,36 @@
+load ../record-revision.maude
+search [1] in RECORD-REVISION :
+ { record(1, 1, f0, accepted, 2) editPolicy(public) edit(1, 2, 3, f1, worker) }
+ =>* { record(1, 3, f1, proposed, 3) prior(1, 1, f0, accepted, 2) RESIDUAL:Cfg } .
+search [1] in RECORD-REVISION :
+ { record(1, 1, f0, accepted, 2) editPolicy(public) edit(1, 2, 3, f0, worker) }
+ =>* { record(1, 1, f0, accepted, 3) RESIDUAL:Cfg } .
+search [1] in RECORD-REVISION :
+ { record(1, 1, f0, accepted, 2) editPolicy(public) edit(1, 2, 3, f1, worker) accept(1, 3, 4, owner) }
+ =>* { record(1, 3, f1, accepted, 4) approved(1, 3) prior(1, 1, f0, accepted, 2) RESIDUAL:Cfg } .
+--- An earlier acceptance cannot silently approve changed fields.
+search in RECORD-REVISION :
+ { record(1, 1, f0, accepted, 2) editPolicy(public) edit(1, 2, 3, f1, worker) }
+ =>* { record(1, 3, f1, accepted, 3) RESIDUAL:Cfg } .
+search [1] in RECORD-REVISION-CARRIED-STATUS :
+ { record(1, 1, f0, accepted, 2) editPolicy(public) edit(1, 2, 3, f1, worker) }
+ =>* { record(1, 3, f1, accepted, 3) RESIDUAL:Cfg } .
+search in RECORD-REVISION :
+ { record(1, 1, f0, proposed, 1) edit(1, 1, 2, f1, worker) }
+ =>* { record(1, 2, f1, proposed, 2) RESIDUAL:Cfg } .
+search [1] in RECORD-REVISION-IMPLICIT-EDIT :
+ { record(1, 1, f0, proposed, 1) edit(1, 1, 2, f1, worker) }
+ =>* { record(1, 2, f1, proposed, 2) RESIDUAL:Cfg } .
+search in RECORD-REVISION :
+ { record(1, 1, f0, accepted, 2) editPolicy(public) edit(1, 1, 3, f1, worker) }
+ =>* { record(1, 3, f1, proposed, 3) RESIDUAL:Cfg } .
+search [1] in RECORD-REVISION-STALE-HEAD :
+ { record(1, 1, f0, accepted, 2) editPolicy(public) edit(1, 1, 3, f1, worker) }
+ =>* { record(1, 3, f1, proposed, 3) RESIDUAL:Cfg } .
+search in RECORD-REVISION :
+ { record(1, 1, f0, proposed, 1) editPolicy(ownerOnly) edit(1, 1, 2, f1, worker) }
+ =>* { record(1, 2, f1, proposed, 2) RESIDUAL:Cfg } .
+search [1] in RECORD-REVISION-UNAUTHORIZED-EDIT :
+ { record(1, 1, f0, proposed, 1) editPolicy(ownerOnly) edit(1, 1, 2, f1, worker) }
+ =>* { record(1, 2, f1, proposed, 2) RESIDUAL:Cfg } .
+quit .

@@ -1,0 +1,12 @@
+load ../exec-provider-lifetime.maude
+search [1] in EXEC-OUTCOME-CUSTODY : cfg(pending,completed,open) =>* cfg(terminated,completed,closed) .
+search [1] in EXEC-OUTCOME-CUSTODY : cfg(notAdmitted,empty,open) =>* cfg(notAdmitted,notExecuted,closed) .
+search [1] in EXEC-OUTCOME-CUSTODY : cfg(terminated,empty,open) =>* cfg(terminated,empty,closed) .
+search [1] in EXEC-OUTCOME-CUSTODY-WEAK : cfg(terminated,empty,open) =>* cfg(terminated,empty,closed) .
+search [1] in EXEC-OUTCOME-CUSTODY : cfg(pending,completed,open) =>* cfg(pending,completed,closed) .
+search [1] in EXEC-OUTCOME-CUSTODY-WEAK : cfg(pending,completed,open) =>* cfg(pending,completed,closed) .
+search [1] in EXEC-OUTCOME-CUSTODY : cfg(terminated,completed,open) =>* cfg(terminated,uncertain,open) .
+search [1] in EXEC-OUTCOME-CUSTODY-WEAK : cfg(terminated,completed,open) =>* cfg(terminated,uncertain,open) .
+search [1] in EXEC-OUTCOME-CUSTODY : cfg(pending,empty,open) =>* cfg(pending,notExecuted,open) .
+search [1] in EXEC-OUTCOME-CUSTODY-WEAK : cfg(pending,empty,open) =>* cfg(pending,notExecuted,open) .
+quit

@@ -1,0 +1,10 @@
+load ../exec-native-owner.maude
+search [1] in EXEC-NATIVE-AUTHORITY : cfg(fresh,none,current) =>* cfg(completed,none,current) .
+search [1] in EXEC-NATIVE-AUTHORITY : cfg(completed,none,current) =>* cfg(completed,none,restored) .
+search [1] in EXEC-NATIVE-AUTHORITY : cfg(admitted,none,current) =>* cfg(admitted,execute,restored) .
+search [1] in EXEC-NATIVE-AUTHORITY-WEAK : cfg(admitted,none,current) =>* cfg(admitted,execute,restored) .
+search [1] in EXEC-NATIVE-AUTHORITY : cfg(admitted,none,current) =>* cfg(fresh,none,restored) .
+search [1] in EXEC-NATIVE-AUTHORITY-WEAK : cfg(admitted,none,current) =>* cfg(fresh,none,restored) .
+search [1] in EXEC-NATIVE-AUTHORITY : cfg(completed,none,current) =>* cfg(admitted,none,current) .
+search [1] in EXEC-NATIVE-AUTHORITY-WEAK : cfg(completed,none,current) =>* cfg(admitted,none,current) .
+quit

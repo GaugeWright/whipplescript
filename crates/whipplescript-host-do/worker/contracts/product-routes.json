@@ -219,6 +219,186 @@
       }
     },
     {
+      "id": "runtime.host.norm.impacts",
+      "jurisdiction": "managed-workflow-placement",
+      "transport": "http-json",
+      "method": "POST",
+      "path": "/host/norm/impacts",
+      "producer": "whipplescript-host-worker",
+      "consumer": "WhippleScript host protocol client",
+      "authentication": "runtime-control-bearer",
+      "scope": "tenant-placement",
+      "capability": "workflow-control",
+      "requestSchema": "typescript:whipplescript-runtime/runtime.host.norm.impacts/request",
+      "responseSchema": "typescript:whipplescript-runtime/runtime.host.norm.impacts/response",
+      "sideEffect": "none",
+      "risk": "critical",
+      "compatibility": {
+        "contractVersion": 1,
+        "minimumConsumer": 1,
+        "maximumConsumer": null
+      },
+      "evidence": {
+        "contract": [
+          "src/norm-impact.integration.test.ts#norm-installed-impact"
+        ],
+        "authority": [
+          "src/norm-impact.integration.test.ts#norm-installed-impact"
+        ],
+        "journey": [
+          "src/norm-impact.integration.test.ts#norm-installed-impact"
+        ],
+        "deployed": [],
+        "property": [
+          "src/norm-impact.integration.test.ts#norm-installed-impact"
+        ]
+      }
+    },
+    {
+      "id": "runtime.host.norm.enqueues",
+      "jurisdiction": "managed-workflow-placement",
+      "transport": "http-json",
+      "method": "POST",
+      "path": "/host/norm/enqueues",
+      "producer": "whipplescript-host-worker",
+      "consumer": "WhippleScript host protocol client",
+      "authentication": "runtime-control-bearer",
+      "scope": "tenant-placement",
+      "capability": "workflow-control",
+      "requestSchema": "typescript:whipplescript-runtime/runtime.host.norm.enqueues/request",
+      "responseSchema": "typescript:whipplescript-runtime/runtime.host.norm.enqueues/response",
+      "sideEffect": "mutation",
+      "risk": "critical",
+      "compatibility": {
+        "contractVersion": 1,
+        "minimumConsumer": 1,
+        "maximumConsumer": null
+      },
+      "evidence": {
+        "contract": [
+          "src/authenticated-host.integration.test.ts#norm-observation-enqueue"
+        ],
+        "authority": [
+          "src/authenticated-host.integration.test.ts#norm-observation-enqueue"
+        ],
+        "journey": [
+          "src/authenticated-host.integration.test.ts#norm-observation-enqueue"
+        ],
+        "deployed": [],
+        "property": [
+          "src/authenticated-host.integration.test.ts#norm-observation-enqueue"
+        ]
+      }
+    },
+    {
+      "id": "runtime.host.norm.publications",
+      "jurisdiction": "managed-workflow-placement",
+      "transport": "http-json",
+      "method": "POST",
+      "path": "/host/norm/publications",
+      "producer": "whipplescript-host-worker",
+      "consumer": "WhippleScript host protocol client",
+      "authentication": "runtime-control-bearer",
+      "scope": "tenant-placement",
+      "capability": "workflow-control",
+      "requestSchema": "typescript:whipplescript-runtime/runtime.host.norm.publications/request",
+      "responseSchema": "typescript:whipplescript-runtime/runtime.host.norm.publications/response",
+      "sideEffect": "mutation",
+      "risk": "critical",
+      "compatibility": {
+        "contractVersion": 1,
+        "minimumConsumer": 1,
+        "maximumConsumer": null
+      },
+      "evidence": {
+        "contract": [
+          "src/authenticated-host.integration.test.ts#norm-observation-publication"
+        ],
+        "authority": [
+          "src/authenticated-host.integration.test.ts#norm-observation-publication"
+        ],
+        "journey": [
+          "src/authenticated-host.integration.test.ts#norm-observation-publication"
+        ],
+        "deployed": [],
+        "property": [
+          "src/authenticated-host.integration.test.ts#norm-observation-publication"
+        ]
+      }
+    },
+    {
+      "id": "runtime.host.norm.provision",
+      "jurisdiction": "managed-workflow-placement",
+      "transport": "http-json",
+      "method": "POST",
+      "path": "/host/norm/provision",
+      "producer": "whipplescript-host-worker",
+      "consumer": "WhippleScript host protocol client",
+      "authentication": "runtime-control-bearer",
+      "scope": "tenant-placement",
+      "capability": "workflow-control",
+      "requestSchema": "typescript:whipplescript-runtime/runtime.host.norm.provision/request",
+      "responseSchema": "typescript:whipplescript-runtime/runtime.host.norm.provision/response",
+      "sideEffect": "mutation",
+      "risk": "critical",
+      "compatibility": {
+        "contractVersion": 1,
+        "minimumConsumer": 1,
+        "maximumConsumer": null
+      },
+      "evidence": {
+        "contract": [
+          "src/authenticated-host.integration.test.ts#declared-route-surface"
+        ],
+        "authority": [
+          "src/authenticated-host.integration.test.ts#declared-route-surface"
+        ],
+        "journey": [
+          "src/authenticated-host.integration.test.ts#authenticated-placement-journey"
+        ],
+        "deployed": [],
+        "property": [
+          "src/authenticated-host.integration.test.ts#declared-route-surface"
+        ]
+      }
+    },
+    {
+      "id": "runtime.host.norm.commands",
+      "jurisdiction": "managed-workflow-placement",
+      "transport": "http-json",
+      "method": "POST",
+      "path": "/host/norm/commands",
+      "producer": "whipplescript-host-worker",
+      "consumer": "WhippleScript host protocol client",
+      "authentication": "runtime-control-bearer",
+      "scope": "tenant-placement",
+      "capability": "workflow-control",
+      "requestSchema": "typescript:whipplescript-runtime/runtime.host.norm.commands/request",
+      "responseSchema": "typescript:whipplescript-runtime/runtime.host.norm.commands/response",
+      "sideEffect": "mutation",
+      "risk": "critical",
+      "compatibility": {
+        "contractVersion": 1,
+        "minimumConsumer": 1,
+        "maximumConsumer": null
+      },
+      "evidence": {
+        "contract": [
+          "src/authenticated-host.integration.test.ts#declared-route-surface"
+        ],
+        "authority": [
+          "src/authenticated-host.integration.test.ts#declared-route-surface"
+        ],
+        "journey": [
+          "src/authenticated-host.integration.test.ts#authenticated-placement-journey"
+        ],
+        "deployed": [],
+        "property": [
+          "src/authenticated-host.integration.test.ts#declared-route-surface"
+        ]
+      }
+    },
+    {
       "id": "runtime.host.policy",
       "jurisdiction": "managed-workflow-placement",
       "transport": "http-json",

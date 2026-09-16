@@ -12,6 +12,14 @@ pub mod host_runtime;
 /// everything above it — a host that draws an instance must not reimplement
 /// the join, and GaugeDesk draws one.
 pub mod instance_view;
+pub mod native_controller;
+pub mod native_controller_helper;
+pub mod native_executor;
+/// Where the tests that need a built norm reactor find it. In the library
+/// because four integration-test binaries and the bin's own tests all ask the
+/// same question, and one copy of the answer is fewer than five.
+#[doc(hidden)]
+pub mod norm_reactor;
 /// The workspace `grep` tool's matching semantics, shared by both
 /// implementations of that tool (see the module docs for why there are two).
 pub mod workspace_grep;

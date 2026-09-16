@@ -1,0 +1,82 @@
+--- DR-0098 / N1-G1: classification of a captured authenticated ledger view.
+--- Snapshot authenticity/completeness is a host input; resource applicability,
+--- method adequacy and enforcement are not established by classification.
+mod REQUIREMENT-INVENTORY is
+  protecting BOOL .
+  sorts Id Role Policy Fact Cfg State .
+  ops r0 r1 rev0 rev1 vocab0 : -> Id [ctor] .
+  ops requirement nonRequirement unknownRole : -> Role [ctor] .
+  ops declared unknownPolicy : -> Policy [ctor] .
+  subsort Fact < Cfg .
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+  op {_} : Cfg -> State [ctor] .
+  op schema : Id Role Policy -> Fact [ctor] .
+  op classifiedSchema : Id -> Fact [ctor] .
+  op inspect : Id Role Policy Id -> Fact [ctor] .
+  op active : Id Id Bool -> Fact [ctor] .
+  op absent : Id -> Fact [ctor] .
+  op required : Id Id -> Fact [ctor] .
+  op inactive : Id -> Fact [ctor] .
+  op other : Id -> Fact [ctor] .
+  op gap : Id -> Fact [ctor] .
+  vars I V E : Id . var P : Policy . var C : Cfg . var B : Bool .
+  rl [unknown-role-is-a-gap-even-with-no-records] :
+    { schema(I,unknownRole,P) C } => { gap(I) C } .
+  rl [unknown-effect-is-a-gap-even-with-no-records] :
+    { schema(I,requirement,unknownPolicy) C } => { gap(I) C } .
+  rl [declared-schema] :
+    { schema(I,requirement,declared) C } => { classifiedSchema(I) C } .
+  rl [explicit-non-requirement-schema] :
+    { schema(I,nonRequirement,P) C } => { classifiedSchema(I) C } .
+  rl [effective-content-wins-over-latest-draft] :
+    { inspect(I,requirement,declared,V) active(I,E,true) C }
+    => { required(I,E) C } .
+  rl [malformed-active-content-is-a-gap] :
+    { inspect(I,requirement,declared,V) active(I,E,false) C }
+    => { required(I,E) gap(I) C } .
+  rl [explicit-inactivity] :
+    { inspect(I,requirement,declared,V) absent(I) C } => { inactive(I) C } .
+  rl [explicit-other-record] :
+    { inspect(I,nonRequirement,P,V) C } => { other(I) C } .
+  rl [unclassified-record] :
+    { inspect(I,unknownRole,P,V) C } => { gap(I) C } .
+  rl [unknown-effect-record] :
+    { inspect(I,requirement,unknownPolicy,V) C } => { gap(I) C } .
+endm
+mod REQUIREMENT-INVENTORY-WEAK-DRAFT is
+  including REQUIREMENT-INVENTORY .
+  vars I V E : Id . var C : Cfg .
+  rl [latest-draft-erases-requirement] :
+    { inspect(I,requirement,declared,V) active(I,E,true) C } => { inactive(I) C } .
+endm
+mod REQUIREMENT-INVENTORY-WEAK-SUBSTITUTION is
+  including REQUIREMENT-INVENTORY .
+  vars I V E : Id . var C : Cfg .
+  rl [substitute-draft] :
+    { inspect(I,requirement,declared,V) active(I,E,true) C } => { required(I,V) C } .
+endm
+mod REQUIREMENT-INVENTORY-WEAK-ROLE is
+  including REQUIREMENT-INVENTORY .
+  var I : Id . var P : Policy . var C : Cfg .
+  rl [unknown-is-non-requirement] :
+    { schema(I,unknownRole,P) C } => { classifiedSchema(I) C } .
+endm
+mod REQUIREMENT-INVENTORY-WEAK-POLICY is
+  including REQUIREMENT-INVENTORY .
+  var I : Id . var C : Cfg .
+  rl [unknown-is-inactive] :
+    { schema(I,requirement,unknownPolicy) C } => { classifiedSchema(I) C } .
+endm
+mod REQUIREMENT-INVENTORY-WEAK-MEANING is
+  including REQUIREMENT-INVENTORY .
+  vars I V E : Id . var C : Cfg .
+  rl [malformed-is-complete] :
+    { inspect(I,requirement,declared,V) active(I,E,false) C } => { required(I,E) C } .
+endm
+mod REQUIREMENT-INVENTORY-WEAK-DROP is
+  including REQUIREMENT-INVENTORY .
+  vars I V E : Id . var C : Cfg .
+  rl [another-requirement-is-dropped] :
+    { inspect(I,requirement,declared,V) active(I,E,true) C } => { C } .
+endm

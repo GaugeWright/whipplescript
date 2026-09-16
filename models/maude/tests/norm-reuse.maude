@@ -1,0 +1,59 @@
+load ../norm-reuse.maude
+search [1] in NORM-REUSE :
+ { query(q,p,t,k) observation(o,q,m,s,positive) verified(w,q,m,p,s,t,b) accepted(w,p,k,b) visible(o) visible(w) ancestor(o,w) } =>* { reused(o,w,s,t,positive) C:Cfg } .
+search [1] in NORM-REUSE :
+ { query(q,p,t,k) observation(o,q,m,s,negative) verified(w,q,m,p,s,t,b) accepted(w,p,k,b) visible(o) visible(w) ancestor(o,w) } =>* { reused(o,w,s,t,negative) C:Cfg } .
+search in NORM-REUSE :
+ { query(q,p,t,k) observation(o,q,m,s,positive) verified(w,q,m,p,s,t,b) accepted(w,p,k,b) visible(o) visible(w)  } =>* { reused(o,w,s,t,positive) C:Cfg } .
+search [1] in NORM-REUSE-WEAK-CAUSAL :
+ { query(q,p,t,k) observation(o,q,m,s,positive) verified(w,q,m,p,s,t,b) accepted(w,p,k,b) visible(o) visible(w)  } =>* { reused(o,w,s,t,positive) C:Cfg } .
+search in NORM-REUSE :
+ { query(q,p,t,k) observation(o,q,m,s,positive) verified(w,q,m,p,s,t,b) accepted(w,p,k,b) visible(o)  ancestor(o,w) } =>* { reused(o,w,s,t,positive) C:Cfg } .
+search [1] in NORM-REUSE-WEAK-FRONTIER :
+ { query(q,p,t,k) observation(o,q,m,s,positive) verified(w,q,m,p,s,t,b) accepted(w,p,k,b) visible(o)  ancestor(o,w) } =>* { reused(o,w,s,t,positive) C:Cfg } .
+search in NORM-REUSE :
+ { query(q,p,t,k) observation(o,q,m,s,positive) verified(w,q,m,p,s,t,b) accepted(w,p,other,b) visible(o) visible(w) ancestor(o,w) } =>* { reused(o,w,s,t,positive) C:Cfg } .
+search [1] in NORM-REUSE-WEAK-POLICY :
+ { query(q,p,t,k) observation(o,q,m,s,positive) verified(w,q,m,p,s,t,b) accepted(w,p,other,b) visible(o) visible(w) ancestor(o,w) } =>* { reused(o,w,s,t,positive) C:Cfg } .
+search in NORM-REUSE :
+ { query(q,p,t,k) observation(o,q,m,s,positive) verified(w,other,m,p,s,t,b) accepted(w,p,k,b) visible(o) visible(w) ancestor(o,w) } =>* { reused(o,w,s,t,positive) C:Cfg } .
+search [1] in NORM-REUSE-WEAK-SCOPE :
+ { query(q,p,t,k) observation(o,q,m,s,positive) verified(w,other,m,p,s,t,b) accepted(w,p,k,b) visible(o) visible(w) ancestor(o,w) } =>* { reused(o,w,s,t,positive) C:Cfg } .
+search in NORM-REUSE :
+ { query(q,p,t,k) observation(o,q,m,s,positive) verified(w,q,other,p,s,t,b) accepted(w,p,k,b) visible(o) visible(w) ancestor(o,w) } =>* { reused(o,w,s,t,positive) C:Cfg } .
+search [1] in NORM-REUSE-WEAK-SCOPE :
+ { query(q,p,t,k) observation(o,q,m,s,positive) verified(w,q,other,p,s,t,b) accepted(w,p,k,b) visible(o) visible(w) ancestor(o,w) } =>* { reused(o,w,s,t,positive) C:Cfg } .
+search in NORM-REUSE :
+ { query(q,p,t,k) observation(o,q,m,s,positive) verified(w,q,m,other,s,t,b) accepted(w,p,k,b) visible(o) visible(w) ancestor(o,w) } =>* { reused(o,w,s,t,positive) C:Cfg } .
+search [1] in NORM-REUSE-WEAK-SCOPE :
+ { query(q,p,t,k) observation(o,q,m,s,positive) verified(w,q,m,other,s,t,b) accepted(w,p,k,b) visible(o) visible(w) ancestor(o,w) } =>* { reused(o,w,s,t,positive) C:Cfg } .
+search in NORM-REUSE :
+ { query(q,p,t,k) observation(o,q,m,s,positive) verified(w,q,m,p,other,t,b) accepted(w,p,k,b) visible(o) visible(w) ancestor(o,w) } =>* { reused(o,w,s,t,positive) C:Cfg } .
+search [1] in NORM-REUSE-WEAK-SCOPE :
+ { query(q,p,t,k) observation(o,q,m,s,positive) verified(w,q,m,p,other,t,b) accepted(w,p,k,b) visible(o) visible(w) ancestor(o,w) } =>* { reused(o,w,s,t,positive) C:Cfg } .
+search in NORM-REUSE :
+ { query(q,p,t,k) observation(o,q,m,s,positive) verified(w,q,m,p,s,other,b) accepted(w,p,k,b) visible(o) visible(w) ancestor(o,w) } =>* { reused(o,w,s,t,positive) C:Cfg } .
+search [1] in NORM-REUSE-WEAK-SCOPE :
+ { query(q,p,t,k) observation(o,q,m,s,positive) verified(w,q,m,p,s,other,b) accepted(w,p,k,b) visible(o) visible(w) ancestor(o,w) } =>* { reused(o,w,s,t,positive) C:Cfg } .
+search in NORM-REUSE :
+ { query(q,p,t,k) observation(o,q,m,s,positive) verified(w,q,m,p,s,t,other) accepted(w,p,k,b) visible(o) visible(w) ancestor(o,w) } =>* { reused(o,w,s,t,positive) C:Cfg } .
+search [1] in NORM-REUSE-WEAK-SCOPE :
+ { query(q,p,t,k) observation(o,q,m,s,positive) verified(w,q,m,p,s,t,other) accepted(w,p,k,b) visible(o) visible(w) ancestor(o,w) } =>* { reused(o,w,s,t,positive) C:Cfg } .
+search in NORM-REUSE :
+ { query(q,p,t,k) observation(o,q,m,s,inadequate) verified(w,q,m,p,s,t,b) accepted(w,p,k,b) visible(o) visible(w) ancestor(o,w) } =>* { reused(o,w,s,t,positive) C:Cfg } .
+search [1] in NORM-REUSE-WEAK-ADEQUACY :
+ { query(q,p,t,k) observation(o,q,m,s,inadequate) verified(w,q,m,p,s,t,b) accepted(w,p,k,b) visible(o) visible(w) ancestor(o,w) } =>* { reused(o,w,s,t,positive) C:Cfg } .
+search in NORM-REUSE :
+ { query(q,p,t,k) observation(o,q,m,s,negative) verified(w,q,m,p,s,t,b) accepted(w,p,k,b) visible(o) visible(w) ancestor(o,w) } =>* { reused(o,w,s,t,positive) C:Cfg } .
+search [1] in NORM-REUSE-WEAK-POLARITY :
+ { query(q,p,t,k) observation(o,q,m,s,negative) verified(w,q,m,p,s,t,b) accepted(w,p,k,b) visible(o) visible(w) ancestor(o,w) } =>* { reused(o,w,s,t,positive) C:Cfg } .
+search [1] in NORM-REUSE-RESOLUTION :
+ { reused(o,w,s,t,negative) ancestor(o,r) ancestor(w,r) resolutionAccepted(r,o) }
+ =>* { retired(o,r) C:Cfg } .
+search in NORM-REUSE-RESOLUTION :
+ { reused(o,w,s,t,negative) ancestor(o,r) resolutionAccepted(r,o) }
+ =>* { retired(o,r) C:Cfg } .
+search [1] in NORM-REUSE-WEAK-RESOLUTION :
+ { reused(o,w,s,t,negative) ancestor(o,r) resolutionAccepted(r,o) }
+ =>* { retired(o,r) C:Cfg } .
+quit

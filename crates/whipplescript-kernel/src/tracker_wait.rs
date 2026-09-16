@@ -236,6 +236,8 @@ mod tests {
             input_json: "{}".to_owned(),
             required_capabilities_json: "[]".to_owned(),
             declared_profiles_json: "[]".to_owned(),
+            // Fixture: no attempt admission selected this effect.
+            attempt_admission_event_id: None,
         };
         let value = json!({"id":"issue", "queue":"inbox", "event":"closing", "closed_at":"now"});
         let contract = Observed(Observation::Closed(value.clone()));

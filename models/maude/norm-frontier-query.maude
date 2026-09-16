@@ -1,0 +1,45 @@
+--- Complete current history is verified before an older frontier is projected.
+--- Signature trust and verified artifact capture remain host-owned premises.
+mod NORM-FRONTIER-QUERY is
+  protecting BOOL .
+  sorts Epoch Fact Cfg State . ops old current : -> Epoch [ctor] .
+  subsort Fact < Cfg . op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] . op {_} : Cfg -> State [ctor] .
+  op request : Epoch Bool Bool Bool Bool Bool -> Fact [ctor] .
+  op report : Epoch Epoch -> Fact [ctor] . op authority : Epoch -> Fact [ctor] .
+  op write : Epoch -> Fact [ctor] . op admitted : Epoch -> Fact [ctor] .
+  var E : Epoch . var C : Cfg .
+  rl [anchored-read] : { request(E,true,true,true,true,true) authority(current) C }
+    => { report(current,E) authority(current) C } .
+  rl [current-write] : { authority(E) write(E) C } => { authority(E) admitted(E) C } .
+endm
+mod NORM-FRONTIER-QUERY-WEAK-HISTORY is
+  including NORM-FRONTIER-QUERY . var E : Epoch . var B : Bool . var C : Cfg .
+  rl [prefix-instead-of-current-history] : { request(E,B,true,true,true,true) authority(current) C }
+    => { report(current,E) authority(current) C } .
+endm
+mod NORM-FRONTIER-QUERY-WEAK-CONSISTENCY is
+  including NORM-FRONTIER-QUERY . var E : Epoch . var B : Bool . var C : Cfg .
+  rl [mixed-store-snapshots] : { request(E,true,B,true,true,true) authority(current) C }
+    => { report(current,E) authority(current) C } .
+endm
+mod NORM-FRONTIER-QUERY-WEAK-FRONTIER is
+  including NORM-FRONTIER-QUERY . var E : Epoch . var B : Bool . var C : Cfg .
+  rl [unknown-or-redundant-frontier] : { request(E,true,true,B,true,true) authority(current) C }
+    => { report(current,E) authority(current) C } .
+endm
+mod NORM-FRONTIER-QUERY-WEAK-ARTIFACT is
+  including NORM-FRONTIER-QUERY . var E : Epoch . var B : Bool . var C : Cfg .
+  rl [caller-supplied-files] : { request(E,true,true,true,B,true) authority(current) C }
+    => { report(current,E) authority(current) C } .
+endm
+mod NORM-FRONTIER-QUERY-WEAK-BUDGET is
+  including NORM-FRONTIER-QUERY . var E : Epoch . var B : Bool . var C : Cfg .
+  rl [unbounded-query] : { request(E,true,true,true,true,B) authority(current) C }
+    => { report(current,E) authority(current) C } .
+endm
+mod NORM-FRONTIER-QUERY-WEAK-ROLLBACK is
+  including NORM-FRONTIER-QUERY . var C : Cfg .
+  rl [historical-read-restores-old-authority] : { report(current,old) authority(current) C }
+    => { report(current,old) authority(old) C } .
+endm
