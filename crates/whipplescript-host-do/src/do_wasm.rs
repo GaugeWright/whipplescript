@@ -1248,6 +1248,31 @@ fn coerce_provider_of_wire(wire: ModelWire) -> CoerceProvider {
     }
 }
 
+/// `media_config_json`: generation backends by capability,
+/// `{"image.generate": {<the same shape `coerce_config_json` takes>}}`.
+///
+/// A map rather than one config, because the capability is the unit of
+/// authority: `image.generate` and `video.generate` are different grants and may
+/// be different vendors. Each entry parses exactly as a coercion backend does —
+/// what differs is which effect reaches it, not how it is described.
+///
+/// Absent or empty is the honest default: this host then refuses a media prompt
+/// rather than sending it to the coercion endpoint.
+fn parse_media_configs(
+    json: &str,
+) -> Result<std::collections::BTreeMap<String, ResolvedCoercionConfig>, String> {
+    let value: serde_json::Value = serde_json::from_str(json).map_err(|error| error.to_string())?;
+    let object = value
+        .as_object()
+        .ok_or("media config must be an object keyed by capability")?;
+    let mut configs = std::collections::BTreeMap::new();
+    for (capability, entry) in object {
+        crate::do_instance::media_capability_or_refusal(capability)?;
+        configs.insert(capability.clone(), parse_coerce_config(&entry.to_string())?);
+    }
+    Ok(configs)
+}
+
 fn parse_coerce_config(json: &str) -> Result<ResolvedCoercionConfig, String> {
     let value: serde_json::Value = serde_json::from_str(json).map_err(|error| error.to_string())?;
     let backend = match value.get("provider").and_then(serde_json::Value::as_str) {
@@ -1551,6 +1576,13 @@ impl WasmDurableInstance {
         exec_config_json: Option<String>,
         scripts_json: Option<String>,
         turn_config_json: Option<String>,
+        // APPENDED, not inserted beside `coerce_config_json` where it belongs by
+        // meaning: every caller passes these positionally, so a parameter added
+        // in the middle silently shifts each one after it — the exec config
+        // landed where the project context was read and failed as "invalid
+        // type: map, expected a sequence", eight tests deep and nowhere near
+        // the cause.
+        media_config_json: Option<String>,
     ) -> Result<WasmDurableInstance, JsValue> {
         // Deploy-shipped project instructions: `[{"path": ..., "content": ...}]`
         // in injection order (context-assembly Phase 3 item 4).
@@ -1569,6 +1601,10 @@ impl WasmDurableInstance {
         let coerce = match coerce_config_json {
             Some(json) => Some(parse_coerce_config(&json).map_err(|e| JsValue::from_str(&e))?),
             None => None,
+        };
+        let media = match media_config_json {
+            Some(json) => parse_media_configs(&json).map_err(|e| JsValue::from_str(&e))?,
+            None => std::collections::BTreeMap::new(),
         };
         let agent_model: Option<Box<dyn whipplescript_kernel::harness_loop::HttpModelClient>> =
             match agent_config_json {
@@ -1596,6 +1632,7 @@ impl WasmDurableInstance {
             principal,
             DurableEffectPorts {
                 coerce,
+                media,
                 agent_model,
                 exec,
                 turn,

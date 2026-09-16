@@ -1048,6 +1048,49 @@ pub fn build_coerce_call_parts(
     Ok((prompt, schema, wrapped, output_type_name(&coerce.output)))
 }
 
+/// The provider-facing parts of an INLINE `prompt "…" [-> <Type>] as x`.
+///
+/// The sibling of [`build_coerce_call_parts`] for the form that names no
+/// declaration. A named `coerce` carries its output type in
+/// `ir.coerces[].output`; an inline prompt carries it in the annotation, and
+/// until now nothing read it here — both hosts asked the provider for
+/// `{"type": "string"}` whatever the author wrote, so `prompt "…" -> Review`
+/// typed its binding as a `Review` and then asked the model for a sentence.
+///
+/// An unannotated prompt is still `string`, which is what every prompt meant
+/// before the annotation existed.
+///
+/// A MEDIA annotation resolves through the same door and renders as a string
+/// schema, because `json_schema_for_type` has no other rendering for a
+/// reference type. That is honest for a coercion-shaped request: what a
+/// generation actually needs is a different request BODY, which no host builds
+/// yet. Routing the type here is what makes that a body to write rather than a
+/// type to plumb.
+pub fn inline_prompt_call_parts(
+    ir: &IrProgram,
+    output_type: &str,
+    prompt: String,
+) -> (String, Value, bool, String) {
+    // `string` keeps the historical shape EXACTLY — a bare `{"type": "string"}`,
+    // unwrapped, named `string`. It is what an unannotated prompt means, so
+    // routing it through the envelope would change the request every existing
+    // prompt already sends, which is not what fixing the annotation is for. A
+    // name that resolves to nothing lands here too; the parser refused it at
+    // check time (`type.unknown_schema`), so this is the belt, not the braces.
+    let resolved = crate::rule_lowering::named_ir_type(output_type, ir)
+        .filter(|ty| !matches!(ty, IrType::Primitive(IrPrimitiveType::String)));
+    let Some(ty) = resolved else {
+        return (
+            prompt,
+            json!({"type": "string"}),
+            false,
+            "string".to_owned(),
+        );
+    };
+    let (schema, wrapped) = output_schema_envelope(&ty, &ir.schemas);
+    (prompt, schema, wrapped, output_type_name(&ty))
+}
+
 /// Map positional argument keys (`arg0`, `arg1`, …) to the coerce function's
 /// declared parameter names, keeping the originals so either form resolves.
 fn name_positional_arguments(coerce: &whipplescript_parser::IrCoerce, arguments: &Value) -> Value {
@@ -1140,6 +1183,57 @@ mod tests {
     use crate::sansio::{IoRequest, IoResult, Outcome, StepMachine};
     use std::cell::RefCell;
     use whipplescript_parser::{IrClass, IrEnum};
+
+    /// An inline prompt asks the provider for the type it named.
+    ///
+    /// Both hosts sent `{"type": "string"}` for every inline prompt whatever the
+    /// annotation said, so `prompt "…" -> Review as r` typed its binding as a
+    /// `Review` and then asked the model for a sentence. The annotation reached
+    /// the effect key and the binding and stopped short of the one place it
+    /// changes what the provider is asked for.
+    #[test]
+    fn an_inline_prompt_asks_for_the_type_it_named() {
+        let ir = whipplescript_parser::compile_program(
+            r#"
+workflow Ask
+
+class Review {
+  reason string
+}
+
+rule go
+  when started
+=> {
+  prompt "Review it" -> Review as r
+}
+"#,
+        )
+        .ir
+        .expect("compiles");
+
+        let (_, declared, _, name) =
+            inline_prompt_call_parts(&ir, "Review", "Review it".to_owned());
+        assert_eq!(name, "Review");
+        assert!(
+            declared.to_string().contains("reason"),
+            "the declared class's own schema reaches the provider: {declared}"
+        );
+
+        // Unannotated is still `string` — what every prompt meant before the
+        // annotation existed.
+        let (_, plain, _, plain_name) =
+            inline_prompt_call_parts(&ir, "string", "Summarize it".to_owned());
+        assert_eq!(plain_name, "string");
+        assert_eq!(plain, json!({"type": "string"}));
+
+        // A name that resolves to nothing cannot invent a schema, and falls back
+        // rather than failing the effect: the parser already refused it at check
+        // time (`type.unknown_schema`), so this is the belt, not the braces.
+        let (_, unknown, _, unknown_name) =
+            inline_prompt_call_parts(&ir, "NoSuchClass", "x".to_owned());
+        assert_eq!(unknown_name, "string");
+        assert_eq!(unknown, json!({"type": "string"}));
+    }
 
     fn span() -> whipplescript_parser::SourceSpan {
         whipplescript_parser::SourceSpan { start: 0, end: 0 }

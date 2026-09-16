@@ -23958,11 +23958,15 @@ fn run_native_coerce_effect(
             .or_else(|| input.get("prompt_template").and_then(Value::as_str))
             .unwrap_or_default()
             .to_owned();
-        (
+        // The annotation decides the schema. This was `{"type": "string"}`
+        // unconditionally, so `prompt "…" -> Review as r` typed its binding as a
+        // `Review` and then asked the model for a sentence — the annotation
+        // reached the effect key and the binding and stopped short of the one
+        // place it changes what the provider is asked for.
+        whipplescript_kernel::coerce_native::inline_prompt_call_parts(
+            &ir,
+            &request.output_type,
             prompt,
-            json!({"type": "string"}),
-            false,
-            "string".to_owned(),
         )
     } else {
         whipplescript_kernel::coerce_native::build_coerce_call_parts(

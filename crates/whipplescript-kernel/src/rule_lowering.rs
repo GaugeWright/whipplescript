@@ -5627,7 +5627,7 @@ pub fn effect_turn_skills_json(rule: &IrRule, effect: &ParsedEffect, kind: IrEff
 
 /// A type named by an inline annotation, as an `IrType`. Mirrors the parser's
 /// resolution: a primitive keyword, or a class/enum the program declares.
-fn named_ir_type(name: &str, ir: &IrProgram) -> Option<IrType> {
+pub fn named_ir_type(name: &str, ir: &IrProgram) -> Option<IrType> {
     if let Some(primitive) = IrPrimitiveType::from_type_name(name) {
         return Some(IrType::Primitive(primitive));
     }

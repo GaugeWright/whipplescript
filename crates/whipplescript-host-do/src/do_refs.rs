@@ -401,6 +401,90 @@ mod tests {
         );
     }
 
+    /// The generation backend is found by capability, or its absence is said.
+    ///
+    /// Both halves matter: a configured backend must be REACHED (or a host that
+    /// paid to configure one still refuses), and an absent one must be REFUSED
+    /// naming the capability (or the prompt falls through to whatever else is
+    /// configured, which is the coercion endpoint).
+    #[test]
+    fn a_generation_backend_is_found_by_capability_or_its_absence_is_named() {
+        use crate::do_instance::generation_backend_or_refusal;
+        let drawing = whipplescript_kernel::coerce_native::ResolvedCoercionConfig {
+            backend: whipplescript_kernel::coerce_native::CoerceProvider::OpenAi,
+            provider_id: "a-drawing-model".to_owned(),
+            base_url: "https://example.invalid".to_owned(),
+            api_key: "k".to_owned(),
+            model: "draws".to_owned(),
+            max_tokens: 1024,
+            timeout_secs: 30,
+            codex_account_id: None,
+        };
+        let media: std::collections::BTreeMap<_, _> = [("image.generate".to_owned(), drawing)]
+            .into_iter()
+            .collect();
+
+        assert!(
+            generation_backend_or_refusal(&media, "image.generate", "image").is_ok(),
+            "the configured backend is reached"
+        );
+        assert_eq!(media["image.generate"].provider_id, "a-drawing-model");
+
+        // A modality this host did not configure is refused, and the refusal
+        // names which one — an operator cannot fix "no backend" without it.
+        let refusal = generation_backend_or_refusal(&media, "video.generate", "video")
+            .expect_err("video has no backend here");
+        assert!(
+            refusal.contains("video.generate") && refusal.contains("-> video"),
+            "the refusal names the capability and the annotation: {refusal}"
+        );
+        assert!(
+            generation_backend_or_refusal(
+                &std::collections::BTreeMap::new(),
+                "image.generate",
+                "image"
+            )
+            .is_err(),
+            "a host with no generation backends at all refuses every modality"
+        );
+    }
+
+    /// The media config is keyed by CAPABILITY, and only a generation capability
+    /// is one.
+    ///
+    /// A typo or a coercion key would register a backend nothing ever reaches,
+    /// silently: dispatch looks the capability up by name, and an absent entry
+    /// is the ordinary "this host generates no media" case. Refusing at parse
+    /// makes a misconfigured deploy loud instead of inert.
+    #[test]
+    fn a_media_config_is_keyed_by_a_generation_capability() {
+        use crate::do_instance::media_capability_or_refusal;
+        for good in [
+            "image.generate",
+            "audio.generate",
+            "pdf.generate",
+            "video.generate",
+        ] {
+            assert!(media_capability_or_refusal(good).is_ok(), "{good}");
+        }
+        for bad in [
+            "schema.coerce",
+            "image",
+            "image.generat",
+            "script.raw",
+            "",
+            ".generate",
+            "IMAGE.generate",
+        ] {
+            let refusal = media_capability_or_refusal(bad)
+                .expect_err(&format!("`{bad}` names no generation capability"));
+            assert!(
+                refusal.contains("image.generate"),
+                "the refusal lists what would have been accepted: {refusal}"
+            );
+        }
+    }
+
     /// This host serves coercions and has no generation backend, so a media
     /// prompt is refused rather than sent to the coercion provider.
     ///

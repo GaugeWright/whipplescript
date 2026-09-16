@@ -88,6 +88,50 @@ fn round_activity(awaiting: Awaiting) -> &'static str {
 /// is the whole of what the DO adds.
 pub use whipplescript_kernel::coerce_native::ResolvedCoercionConfig;
 
+/// Whether this host has a backend for one generation capability, or why not.
+///
+/// A GUARD returning `Result<(), String>` rather than the config itself, and
+/// lifted out of the dispatch arm, so the refusal is one a test can reach and a
+/// mutation sweep can bite. An `Err` in a `Result<&T, _>` cannot be neutralised
+/// at all — there is no config to substitute — so no mutant compiles and the
+/// sweep reports the site UNMEASURED, which is not "covered", it is "unknown".
+/// The `MUTATION-SUCCESS-EXPR` annotation below is the sweep's own escape hatch
+/// for a success the type system will not let it guess; the guard shape is what
+/// makes `Ok(())` a truthful answer to "what does this refusal's absence look
+/// like".
+pub fn generation_backend_or_refusal(
+    media: &std::collections::BTreeMap<String, ResolvedCoercionConfig>,
+    capability: &str,
+    output_type: &str,
+) -> Result<(), String> {
+    match media.contains_key(capability) {
+        true => Ok(()),
+        // MUTATION-SUCCESS-EXPR: Ok(())
+        false => Err(media_generation_refusal_for(capability, output_type)),
+    }
+}
+
+/// Whether this key names a generation capability the media config may carry.
+///
+/// A typo or a coercion key in `media_config_json` would register a backend
+/// nothing ever reaches — silently, because dispatch looks the capability up by
+/// name and an absent entry is the ordinary "this host generates no media"
+/// case. Refusing at parse is what makes a misconfigured deploy loud.
+///
+/// It lives here rather than beside the parser for the reason `checked_byte_len`
+/// does: `do_wasm` is `wasm32`-only, so a refusal inside it is one no native
+/// test can pin.
+pub fn media_capability_or_refusal(capability: &str) -> Result<(), String> {
+    let modality = capability.strip_suffix(".generate").unwrap_or("");
+    if whipplescript_parser::media_generate_capability(modality).as_deref() == Some(capability) {
+        return Ok(());
+    }
+    Err(format!(
+        "`{capability}` is not a generation capability; expected one of image.generate, \
+         audio.generate, pdf.generate, video.generate"
+    ))
+}
+
 /// Why this host will not serve a `prompt "…" -> <media>`, or `None` for an
 /// ordinary coercion.
 ///
@@ -109,10 +153,16 @@ pub use whipplescript_kernel::coerce_native::ResolvedCoercionConfig;
 /// `DoSqlBridge` is a refusal no test can pin.
 pub fn media_generation_refusal(output_type: &str) -> Option<String> {
     let capability = whipplescript_parser::media_generate_capability(output_type)?;
-    Some(format!(
+    Some(media_generation_refusal_for(&capability, output_type))
+}
+
+/// The message for a capability already resolved. Split from the predicate above
+/// so the dispatch arm, which has the capability in hand, does not re-derive it.
+pub fn media_generation_refusal_for(capability: &str, output_type: &str) -> String {
+    format!(
         "this durable object has no `{capability}` backend; a `-> {output_type}` prompt needs a \
          generation provider and will not be sent to the coercion one"
-    ))
+    )
 }
 
 /// The coercion-config fingerprint this DO's kernel folds into `schema.coerce`
@@ -121,7 +171,23 @@ pub fn media_generation_refusal(output_type: &str) -> Option<String> {
 /// combinator, same "fixture" literal when coerce is unconfigured), so an
 /// identical config yields the identical fingerprint on either host.
 pub fn do_coercion_config_fingerprint(coerce: Option<&ResolvedCoercionConfig>) -> String {
-    coerce
+    do_config_fingerprint(coerce, &std::collections::BTreeMap::new())
+}
+
+/// The same, folding in the generation backends this host has configured.
+///
+/// One fingerprint covers the whole kernel, so it has to describe every backend
+/// the instance can reach: describing only the coercion one would leave image
+/// admission keys unchanged when the IMAGE backend changed, and a terminal
+/// recorded against the old one would replay under the new. Mirrors the native
+/// `coercion_config_fingerprint_with_media` — including that an EMPTY map yields
+/// the historical value byte for byte, so a host configuring no generation
+/// backend does not re-key on upgrade.
+pub fn do_config_fingerprint(
+    coerce: Option<&ResolvedCoercionConfig>,
+    media: &std::collections::BTreeMap<String, ResolvedCoercionConfig>,
+) -> String {
+    let coercion = coerce
         .map(|cfg| {
             whipplescript_kernel::coerce::coercion_config_fingerprint(
                 "schema_coercer",
@@ -130,7 +196,28 @@ pub fn do_coercion_config_fingerprint(coerce: Option<&ResolvedCoercionConfig>) -
                 &cfg.model,
             )
         })
-        .unwrap_or_else(|| "fixture".to_owned())
+        .unwrap_or_else(|| "fixture".to_owned());
+    if media.is_empty() {
+        return coercion;
+    }
+    let generation = media
+        .iter()
+        .map(|(capability, cfg)| {
+            format!(
+                "{capability}={}",
+                whipplescript_kernel::coerce::coercion_config_fingerprint(
+                    "media_generator",
+                    &cfg.provider_id,
+                    &cfg.provider_id,
+                    &cfg.model,
+                )
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    whipplescript_kernel::rule_lowering::stable_hash_hex(&format!(
+        "{coercion}\ngeneration={generation}"
+    ))
 }
 
 use crate::do_store::{do_load_agent_snapshot, do_save_agent_snapshot, DoSql, DoSqliteStore};
@@ -338,6 +425,10 @@ pub struct DoInstanceDriver<'a, Sql: DoSql> {
     /// Projected coerce provider credentials, or `None` if coerce is not configured
     /// on this DO (a `coerce.call` then errors rather than degrading silently).
     pub coerce: Option<&'a ResolvedCoercionConfig>,
+    /// Generation backends by capability (`image.generate` -> its config), for a
+    /// `prompt "…" -> <media>`. Empty means this host has none, and such a
+    /// prompt is refused rather than served by `coerce` above.
+    pub media: &'a std::collections::BTreeMap<String, ResolvedCoercionConfig>,
     /// The DO agent model client (builds the messages request + parses the reply);
     /// `None` if agent turns are not configured. A live worker's impl reads creds
     /// from its bindings; tests inject a fake.
@@ -1634,19 +1725,31 @@ impl<Sql: DoSql + Clone> InstanceDriver for DoInstanceDriver<'_, Sql> {
                 // into a typed value would not make an image prompt work — so
                 // "coerce provider is not configured" would name the wrong
                 // missing thing, on a host where the right one is still absent.
-                if let Some(refusal) = media_generation_refusal(
-                    input
-                        .get("output_type")
-                        .and_then(|value| value.as_str())
-                        .unwrap_or("json"),
-                ) {
-                    return Err(StoreError::Conflict(refusal));
-                }
-                let cfg = self.coerce.ok_or_else(|| {
-                    StoreError::Conflict(
-                        "coerce provider is not configured on this durable object".to_owned(),
-                    )
-                })?;
+                let declared_output = input
+                    .get("output_type")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("json");
+                // A media result resolves through its OWN capability's backend,
+                // never the coercion one — the split the native ladder keeps,
+                // now kept here. `media` empty is the common case and refuses,
+                // because configuring the model that turns text into a typed
+                // value says nothing about which model draws a picture.
+                let cfg = match whipplescript_parser::media_generate_capability(declared_output) {
+                    Some(capability) => {
+                        generation_backend_or_refusal(self.media, &capability, declared_output)
+                            .map_err(StoreError::Conflict)?;
+                        // Guarded one line up: the refusal above is the only way
+                        // past a missing entry, so the lookup cannot be absent.
+                        self.media
+                            .get(&capability)
+                            .expect("the guard above refuses a missing backend")
+                    }
+                    None => self.coerce.ok_or_else(|| {
+                        StoreError::Conflict(
+                            "coerce provider is not configured on this durable object".to_owned(),
+                        )
+                    })?,
+                };
                 let function_name = input
                     .get("function_name")
                     .and_then(|value| value.as_str())
@@ -1679,9 +1782,28 @@ impl<Sql: DoSql + Clone> InstanceDriver for DoInstanceDriver<'_, Sql> {
                 // ladder rung (`coerce_runtime::resolve_capability_selection`).
                 // Giving this host the same door is its own change; until then
                 // the divergence is a refusal rather than a wrong backend.
-                let (prompt, output_schema, wrapped, schema_name) =
+                // An INLINE prompt names no declaration, so
+                // `build_coerce_call_parts` — a lookup in `ir.coerces` — cannot
+                // find it and errored with "coerce function `prompt` is not
+                // declared". Inline prompts therefore never ran on this host
+                // with a native backend at all; the native one has had this
+                // branch since before the annotation existed.
+                let (prompt, output_schema, wrapped, schema_name) = if function_name == "prompt" {
+                    let text = input
+                        .get("prompt")
+                        .and_then(|value| value.as_str())
+                        .or_else(|| input.get("prompt_template").and_then(|v| v.as_str()))
+                        .unwrap_or_default()
+                        .to_owned();
+                    whipplescript_kernel::coerce_native::inline_prompt_call_parts(
+                        self.ir,
+                        declared_output,
+                        text,
+                    )
+                } else {
                     build_coerce_call_parts(self.ir, &function_name, &arguments)
-                        .map_err(StoreError::Conflict)?;
+                        .map_err(StoreError::Conflict)?
+                };
                 let run_id = idempotency_key(&[self.instance_id, &effect.effect_id, "coerce-run"]);
                 let lease_id =
                     idempotency_key(&[self.instance_id, &effect.effect_id, "coerce-lease"]);
@@ -2504,6 +2626,7 @@ mod tests {
                 now_unix_ms: 0,
                 files: &NoFiles,
                 coerce: None,
+                media: &Default::default(),
                 agent_model: None,
                 agent_tools: &NoTools,
                 agent_tool_specs: None,
@@ -2552,6 +2675,99 @@ mod tests {
     // The DO drives an effect-free workflow's rule pass to its terminal through the
     // InstanceStepMachine, over `RuntimeKernel<DoSqliteStore>` — proving the whole
     // instance scheduler runs on the durable-object store.
+    /// The generation backend serves a media prompt; the coercion one never does.
+    ///
+    /// The split is the point: an operator who configured the model that turns
+    /// text into a typed value has said nothing about which model draws a
+    /// picture, so `coerce` being present must not make an image prompt work,
+    /// and `media` being present must not change what a text coercion reaches.
+    #[test]
+    fn a_media_prompt_reaches_the_generation_backend_and_a_coercion_never_does() {
+        let drawing = ResolvedCoercionConfig {
+            backend: whipplescript_kernel::coerce_native::CoerceProvider::OpenAi,
+            provider_id: "a-drawing-model".to_owned(),
+            base_url: "https://example.invalid".to_owned(),
+            api_key: "k".to_owned(),
+            model: "draws".to_owned(),
+            max_tokens: 1024,
+            timeout_secs: 30,
+            codex_account_id: None,
+        };
+        let media: std::collections::BTreeMap<String, ResolvedCoercionConfig> =
+            [("image.generate".to_owned(), drawing)]
+                .into_iter()
+                .collect();
+
+        // With a generation backend, the image prompt is no longer refused for
+        // want of one — the refusal that stands in for it is gone.
+        assert!(media_generation_refusal("image")
+            .expect("image is a generation")
+            .contains("image.generate"));
+        assert!(
+            media.contains_key("image.generate"),
+            "and this host now has the backend that refusal names"
+        );
+
+        // A coercion is untouched by a configured generation backend: it is a
+        // different capability and a different row.
+        assert_eq!(media_generation_refusal("string"), None);
+        assert_eq!(media_generation_refusal("WorkReview"), None);
+    }
+
+    /// The fingerprint covers every backend, and folds nothing when there is
+    /// nothing to fold.
+    ///
+    /// It is built once per kernel, so describing only the coercion backend
+    /// would leave image admission keys unchanged when the IMAGE backend
+    /// changed, and a terminal recorded against the old one would replay under
+    /// the new. An empty map has to keep the historical value byte for byte, or
+    /// every hosted instance re-keys on upgrade for a feature it does not use.
+    #[test]
+    fn the_do_fingerprint_folds_generation_backends_and_only_those() {
+        let config = |id: &str, model: &str| ResolvedCoercionConfig {
+            backend: whipplescript_kernel::coerce_native::CoerceProvider::OpenAi,
+            provider_id: id.to_owned(),
+            base_url: "https://example.invalid".to_owned(),
+            api_key: "k".to_owned(),
+            model: model.to_owned(),
+            max_tokens: 1024,
+            timeout_secs: 30,
+            codex_account_id: None,
+        };
+        let coerce = config("text", "reads");
+        let empty = std::collections::BTreeMap::new();
+
+        assert_eq!(
+            do_config_fingerprint(Some(&coerce), &empty),
+            do_coercion_config_fingerprint(Some(&coerce)),
+            "no generation backend keeps the historical fingerprint"
+        );
+        assert_eq!(
+            do_config_fingerprint(None, &empty),
+            "fixture",
+            "and an unconfigured host keeps the fixture literal"
+        );
+
+        let with_drawing: std::collections::BTreeMap<_, _> =
+            [("image.generate".to_owned(), config("draws", "v1"))]
+                .into_iter()
+                .collect();
+        let redrawn: std::collections::BTreeMap<_, _> =
+            [("image.generate".to_owned(), config("draws", "v2"))]
+                .into_iter()
+                .collect();
+        assert_ne!(
+            do_config_fingerprint(Some(&coerce), &with_drawing),
+            do_config_fingerprint(Some(&coerce), &empty),
+            "a configured generation backend re-keys"
+        );
+        assert_ne!(
+            do_config_fingerprint(Some(&coerce), &with_drawing),
+            do_config_fingerprint(Some(&coerce), &redrawn),
+            "and changing its MODEL re-keys, or a stale terminal replays under it"
+        );
+    }
+
     /// A media prompt is refused on this host, ahead of the coercion backend.
     ///
     /// The DO resolves exactly one model config — the coercion one — so a
@@ -2559,11 +2775,10 @@ mod tests {
     /// image prompt to a text endpoint and fail at the provider after the spend,
     /// under a configuration nobody wrote.
     ///
-    /// It is checked BEFORE `coerce` because no coercion backend is an answer to
-    /// it: configuring the model that turns text into a typed value would not
-    /// make an image prompt work, so "coerce provider is not configured" would
-    /// name the wrong missing thing. `coerce: None` below is what proves the
-    /// ordering — the media refusal is what comes back, not that one.
+    /// A media prompt does not consult `coerce` AT ALL — the two capabilities
+    /// resolve through different maps — so configuring a coercion backend can
+    /// never make an image prompt work, and the refusal names the capability
+    /// that is actually missing rather than the one that would not have helped.
     #[test]
     fn a_media_prompt_is_refused_before_the_coercion_backend_is_consulted() {
         let store = store();
@@ -2576,6 +2791,7 @@ mod tests {
             kernel: RuntimeKernel::new(store),
             files: &NoFiles,
             coerce: None,
+            media: &Default::default(),
             agent_model: None,
             agent_tools: &NoTools,
             agent_tool_specs: None,
@@ -2670,6 +2886,7 @@ mod tests {
             kernel: RuntimeKernel::new(DoSqliteStore::new(sql)),
             files: &NoFiles,
             coerce: None,
+            media: &Default::default(),
             agent_model: None,
             agent_tools: &NoTools,
             agent_tool_specs: None,
@@ -2758,6 +2975,7 @@ mod tests {
             kernel,
             files: &NoFiles,
             coerce: None,
+            media: &Default::default(),
             agent_model: None,
             agent_tools: &NoTools,
             agent_tool_specs: None,
@@ -3026,6 +3244,7 @@ mod tests {
                 kernel,
                 files: &NoFiles,
                 coerce: None,
+                media: &Default::default(),
                 agent_model: None,
                 agent_tools: &NoTools,
                 agent_tool_specs: None,
@@ -3403,6 +3622,7 @@ mod tests {
             kernel,
             files: &NoFiles,
             coerce: None,
+            media: &Default::default(),
             agent_model: None,
             agent_tools: &NoTools,
             agent_tool_specs: None,
@@ -3775,6 +3995,7 @@ mod tests {
             kernel,
             files: &NoFiles,
             coerce: Some(&cfg),
+            media: &Default::default(),
             agent_model: None,
             agent_tools: &NoTools,
             agent_tool_specs: None,
@@ -3927,6 +4148,7 @@ mod tests {
             kernel,
             files: &NoFiles,
             coerce: None,
+            media: &Default::default(),
             agent_model: Some(&model),
             agent_tools: &NoTools,
             agent_tool_specs: None,
@@ -4110,6 +4332,7 @@ mod tests {
             kernel,
             files: &NoFiles,
             coerce: None,
+            media: &Default::default(),
             agent_model: Some(&model),
             agent_tools: &NoTools,
             agent_tool_specs: Some(&tool_specs),
@@ -4310,6 +4533,7 @@ mod tests {
             kernel,
             files: &NoFiles,
             coerce: None,
+            media: &Default::default(),
             // No in-DO model configured: the container owns the turn.
             agent_model: None,
             agent_tools: &NoTools,
@@ -4414,6 +4638,7 @@ mod tests {
             now_unix_ms: 0,
             files: &NoFiles,
             coerce: None,
+            media: &Default::default(),
             agent_model: None,
             agent_tools: &NoTools,
             agent_tool_specs: None,
@@ -4533,6 +4758,7 @@ mod tests {
             now_unix_ms: 0,
             files: &NoFiles,
             coerce: None,
+            media: &Default::default(),
             agent_model: Some(&model),
             agent_tools: &tools,
             agent_tool_specs: None,

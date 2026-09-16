@@ -31,8 +31,7 @@ use whipplescript_store::{
 };
 
 use crate::do_instance::{
-    do_coercion_config_fingerprint, DoInstanceDriver, ExecutorSidecarConfig,
-    ResolvedCoercionConfig, TurnContainerConfig,
+    DoInstanceDriver, ExecutorSidecarConfig, ResolvedCoercionConfig, TurnContainerConfig,
 };
 use crate::do_store::{DoSql, DoSqlStorage, DoSqliteStore};
 use crate::DoFileStore;
@@ -91,6 +90,14 @@ pub fn unix_ms_to_iso8601(unix_ms: i64) -> String {
 pub struct DurableEffectPorts {
     pub files: Option<Box<dyn FileStore>>,
     pub coerce: Option<ResolvedCoercionConfig>,
+    /// Generation backends by capability (`image.generate` -> its config).
+    ///
+    /// Separate from `coerce` rather than folded into it, because a coercion
+    /// backend is not a statement about which model draws a picture — the same
+    /// split the native ladder keeps between `WHIPPLESCRIPT_COERCE_*` and
+    /// `WHIPPLESCRIPT_<MODALITY>_*`. Empty is the honest default: this host
+    /// refuses a media prompt rather than sending it to the coercion endpoint.
+    pub media: std::collections::BTreeMap<String, ResolvedCoercionConfig>,
     pub agent_model: Option<Box<dyn HttpModelClient>>,
     pub agent_tools: Option<Box<dyn ToolExecutor>>,
     /// Exact file-store references admitted for this host turn. When present,
@@ -129,6 +136,7 @@ pub struct DurableInstance<Sql: DoSql> {
     in_flight: Option<ClaimableEffect>,
     files: Box<dyn FileStore>,
     coerce: Option<ResolvedCoercionConfig>,
+    media: std::collections::BTreeMap<String, ResolvedCoercionConfig>,
     agent_model: Option<Box<dyn HttpModelClient>>,
     agent_tools: Box<dyn ToolExecutor>,
     agent_workspace_resources: Option<Vec<ResourceRef>>,
@@ -155,8 +163,9 @@ impl<Sql: DoSql + 'static> DurableInstance<Sql> {
     ) -> Result<Self, String> {
         let sql = Rc::new(sql);
         let kernel = RuntimeKernel::new(DoSqliteStore::new(Rc::clone(&sql)))
-            .with_coercion_config_fingerprint(do_coercion_config_fingerprint(
+            .with_coercion_config_fingerprint(crate::do_instance::do_config_fingerprint(
                 ports.coerce.as_ref(),
+                &ports.media,
             ));
         let exists = kernel
             .store()
@@ -221,6 +230,7 @@ impl<Sql: DoSql + 'static> DurableInstance<Sql> {
             in_flight: None,
             files: ports.files.unwrap_or(default_files),
             coerce: ports.coerce,
+            media: ports.media,
             agent_model: ports.agent_model,
             agent_tools,
             agent_workspace_resources: ports.agent_workspace_resources,
@@ -253,8 +263,9 @@ impl<Sql: DoSql + 'static> DurableInstance<Sql> {
         // `Connection`).
         let sql = Rc::new(sql);
         let mut kernel = RuntimeKernel::new(DoSqliteStore::new(Rc::clone(&sql)))
-            .with_coercion_config_fingerprint(do_coercion_config_fingerprint(
+            .with_coercion_config_fingerprint(crate::do_instance::do_config_fingerprint(
                 ports.coerce.as_ref(),
+                &ports.media,
             ));
         // DR-0054 Phase B introduced real revision identity here, and stamped
         // `ir_hash` as `source_hash+compiler_version` for a stated reason: "no
@@ -557,6 +568,7 @@ impl<Sql: DoSql + 'static> DurableInstance<Sql> {
             // e.g. a `TieredFileStore`, still wins).
             files: ports.files.unwrap_or(default_files),
             coerce: ports.coerce,
+            media: ports.media,
             agent_model: ports.agent_model,
             // P4: the DO agent turn gets a real in-isolate tool executor over
             // the shared DO SQLite by default (the file plane IS the sandbox),
@@ -681,6 +693,7 @@ impl<Sql: DoSql + 'static> DurableInstance<Sql> {
             kernel,
             files: self.files.as_ref(),
             coerce: self.coerce.as_ref(),
+            media: &self.media,
             agent_model: self.agent_model.as_deref(),
             agent_tools: self.agent_tools.as_ref(),
             agent_workspace_resources: self.agent_workspace_resources.as_deref(),

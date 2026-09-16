@@ -215,6 +215,10 @@ export interface Env {
   // the text-only behaviour and says so rather than pretending otherwise.
   WHIP_OBJECTS?: R2Bucket;
   WHIP_INGEST_HOSTS?: string;
+  // Generation backends by capability, e.g.
+  // `{"image.generate":{"provider":"openai","base_url":…,"api_key":…,"model":…}}`.
+  // Absent means this deployment generates no media.
+  WHIP_MEDIA_CONFIG_JSON?: string;
   // Private/legacy workflow credentials. Public sessions never consult these.
   ANTHROPIC_API_KEY?: string;
   OPENAI_API_KEY?: string;
@@ -5015,6 +5019,13 @@ export class WorkflowInstance implements DurableObject {
           })
         : undefined;
     const coerceConfig = anthropicConfig("claude-3-5-sonnet-latest", 1024);
+    // Generation backends, by capability. Deliberately NOT derived from the
+    // coercion credentials above: a key for the model that turns text into a
+    // typed value is not a statement about which model draws a picture, and
+    // `image.generate` is a separate grant. Unset means this deployment
+    // generates no media, and a `prompt "…" -> image` is refused rather than
+    // sent to the coercion endpoint.
+    const mediaConfig = this.env.WHIP_MEDIA_CONFIG_JSON;
     const agentConfig = anthropicConfig("claude-3-5-sonnet-latest", 4096);
     // Class-A exec sidecar wiring (compute plane P8): the executor URL comes
     // from the environment; script env references resolve against DO secrets.
@@ -5058,6 +5069,7 @@ export class WorkflowInstance implements DurableObject {
       execConfig,
       this.env.WHIP_SCRIPT_CAPABILITIES_JSON,
       turnConfig,
+      mediaConfig,
     );
   }
 
