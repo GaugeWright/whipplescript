@@ -20030,14 +20030,106 @@ fn coerce_registry_default(
     store: &SqliteStore,
     instance_id: &str,
 ) -> Result<Option<coerce_runtime::CoerceRegistryDefault>, StoreError> {
-    let Some(provider) = store.capability_bound_provider(instance_id, "schema.coerce")? else {
+    capability_registry_default(store, instance_id, coerce_runtime::COERCE_CAPABILITY)
+}
+
+/// The rung-3 binding row for ONE capability.
+///
+/// A `prompt "…" -> image` demands `image.generate` (DR-0120) and must resolve
+/// through that capability's own row: the `schema.coerce` row says which model
+/// turns text into a typed value, which is not a statement about which model
+/// draws a picture. Reading it for a media effect would send the prompt to a
+/// text endpoint under a configuration nobody wrote.
+fn capability_registry_default(
+    store: &SqliteStore,
+    instance_id: &str,
+    capability: &str,
+) -> Result<Option<coerce_runtime::CoerceRegistryDefault>, StoreError> {
+    // A binding's `provider` column names the provider KIND, not the row: the
+    // manifest validator requires it to match a declared provider's kind, so
+    // `binding-image-default` stores `media_generator`. The row it selects is
+    // `config.provider_id`, which lives on the BINDING and which
+    // `effect_provider_config` — a lookup of the provider row — cannot see. So
+    // the binding is read whole and resolved here, before anything downstream
+    // treats the value as a provider name.
+    //
+    // This was invisible while `schema.coerce` was the only capability. Its
+    // `binding-coercion-default` row stores a kind too, and is masked by the
+    // older `binding_coerce_builtin` row whose `provider` happens to be a real
+    // name. `image.generate` is the first binding with no such twin, and it sent
+    // `media_generator` straight to the provider parser, which refused it.
+    let Some(binding) = store
+        .capability_bindings_for(instance_id, capability)?
+        .into_iter()
+        .find(|binding| binding.provider.is_some())
+    else {
         return Ok(None);
     };
-    let config_json = store.effect_provider_config("schema.coerce", &provider)?;
+    let declared = binding.provider.unwrap_or_default();
+    let provider = serde_json::from_str::<Value>(&binding.config_json)
+        .ok()
+        .and_then(|config| {
+            config
+                .get("provider_id")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .unwrap_or(declared);
+    let config_json = store.effect_provider_config(capability, &provider)?;
     Ok(Some(coerce_runtime::CoerceRegistryDefault {
         provider,
         config_json,
     }))
+}
+
+/// Every generation capability this program can demand, deduplicated.
+///
+/// The kernel-construction fingerprint is built once for a whole instance, so it
+/// has to know every backend that instance can reach before any effect is in
+/// hand. Reading the program is how: a `-> image` anywhere in it means an
+/// `image.generate` backend is reachable, and a change to that backend has to
+/// re-key admission or a terminal recorded against the old one replays under the
+/// new. A program with no media prompt yields nothing, and the fingerprint is
+/// then byte-identical to what it was before generation existed.
+fn media_capabilities_for_program(ir: &IrProgram) -> Vec<String> {
+    let mut capabilities: BTreeSet<String> = BTreeSet::new();
+    for rule in &ir.rules {
+        for effect in &rule.metadata.effects {
+            if let Some(result_type) = effect.prompt_result_type.as_deref() {
+                if let Some(capability) =
+                    whipplescript_parser::media_generate_capability(result_type)
+                {
+                    capabilities.insert(capability);
+                }
+            }
+        }
+    }
+    capabilities.into_iter().collect()
+}
+
+/// The rung-3 rows for every generation capability a program can demand, paired
+/// with the capability so the fingerprint commits which backend serves which.
+fn media_registry_defaults(
+    store: &SqliteStore,
+    instance_id: &str,
+    ir: &IrProgram,
+) -> Result<Vec<(String, Option<coerce_runtime::CoerceRegistryDefault>)>, StoreError> {
+    media_capabilities_for_program(ir)
+        .into_iter()
+        .map(|capability| {
+            let row = capability_registry_default(store, instance_id, &capability)?;
+            Ok((capability, row))
+        })
+        .collect()
+}
+
+/// The capability an effect with this result type demands: `<modality>.generate`
+/// for a media result, ordinary coercion otherwise. One derivation, shared by
+/// the dispatch ladder and the admission fingerprint, so the two cannot disagree
+/// about which backend an effect reaches.
+fn capability_for_output_type(output_type: &str) -> String {
+    whipplescript_parser::media_generate_capability(output_type)
+        .unwrap_or_else(|| coerce_runtime::COERCE_CAPABILITY.to_owned())
 }
 
 /// Native entry: build the unified `NativeStores` handle (runtime + coordination +
@@ -20061,10 +20153,12 @@ fn step_instance(
     // it; rung 1 is per-effect and stays out of the kernel-construction
     // fingerprint; credentials are never consulted).
     let registry_default = coerce_registry_default(&stores.runtime, instance_id)?;
+    let media_defaults = media_registry_defaults(&stores.runtime, instance_id, ir)?;
     let mut kernel = RuntimeKernel::new(stores)
-        .with_coercion_config_fingerprint(
-            coerce_runtime::coercion_config_fingerprint_with_registry(registry_default.as_ref()),
-        )
+        .with_coercion_config_fingerprint(coerce_runtime::coercion_config_fingerprint_with_media(
+            registry_default.as_ref(),
+            &media_defaults,
+        ))
         // Installed HERE because this is the one door the CLI has into the rule
         // pass, and the rule pass is where an instance reaches terminal. The
         // other kernels this binary builds inspect, replay or report; none of
@@ -23108,14 +23202,21 @@ fn run_coerce_effect(
     // credential) surfaces as a clear error rather than silently degrading to
     // a fixture.
     let provider_override = input.get("provider").and_then(Value::as_str);
+    // The result type decides the capability, and the capability decides the
+    // whole ladder below it: which environment names it reads, which binding row
+    // is its default, and which provider kind its admission key commits.
+    let capability = capability_for_output_type(&output_type);
     let registry_default = {
         let store = SqliteStore::open(store_path)?;
-        coerce_registry_default(&store, instance_id)?
+        capability_registry_default(&store, instance_id, &capability)?
     };
-    let native_config =
-        coerce_runtime::resolve_coercion_selection(provider_override, registry_default.as_ref())
-            .map_err(StoreError::Conflict)?
-            .config;
+    let native_config = coerce_runtime::resolve_capability_selection(
+        &capability,
+        provider_override,
+        registry_default.as_ref(),
+    )
+    .map_err(StoreError::Conflict)?
+    .config;
     if let Some(config) = native_config {
         return run_native_coerce_effect(
             store_path,

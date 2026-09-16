@@ -95,7 +95,14 @@ pub struct CoerceSelection {
 /// migration-0001 seeded binding's provider name for the same deterministic
 /// provider the manifest names `fixture`.
 pub(crate) fn is_fixture_provider_name(name: &str) -> bool {
-    name.eq_ignore_ascii_case("fixture") || name == "builtin-coerce"
+    name.eq_ignore_ascii_case("fixture")
+        || name == "builtin-coerce"
+        // std.image's fixture generator. It cannot simply be called `fixture`:
+        // provider row ids are unique across the whole registry and
+        // std.coercion owns that one. Listed by name rather than matched by a
+        // `-fixture` suffix, so a real provider cannot select the fixture path
+        // by being named for it.
+        || name == "image-fixture"
 }
 
 /// Snapshot of the operator-override environment (`WHIPPLESCRIPT_COERCE_*`),
@@ -108,15 +115,70 @@ struct OperatorEnv {
     timeout_secs: Option<u64>,
 }
 
+/// The capability an ordinary coercion demands. A `prompt "…" -> image` demands
+/// `image.generate` instead (DR-0120), and the whole ladder below follows that
+/// difference: which environment names it reads, which registry row it takes as
+/// its default, and which provider kind it commits to the admission key.
+pub const COERCE_CAPABILITY: &str = "schema.coerce";
+
+/// The provider kind a capability's backend must be registered under.
+///
+/// `media_generator` for a generation capability, never `schema_coercer`. A
+/// schema coercer is contractually text in, schema-shaped value out, which an
+/// image model is not — and letting the kinds blur would make every configured
+/// coercer a candidate to serve an image prompt, which is the authority split
+/// `<modality>.generate` exists for, defeated at the registry layer.
+pub fn provider_kind_for_capability(capability: &str) -> &'static str {
+    if capability == COERCE_CAPABILITY {
+        whipplescript_kernel::provider::PROVIDER_SCHEMA_COERCE
+    } else {
+        "media_generator"
+    }
+}
+
+/// The environment prefix a capability's operator override reads, or `None`
+/// when the capability has no environment door.
+///
+/// `image.generate` reads `WHIPPLESCRIPT_IMAGE_*`, not `WHIPPLESCRIPT_COERCE_*`.
+/// This is the load-bearing half of the split at this layer: an operator who set
+/// a text coercion backend has said nothing about which model draws pictures,
+/// and silently sending a `-> image` prompt to it would be asking a text
+/// endpoint for an image — a failure at the provider, after the spend, under a
+/// configuration nobody wrote.
+fn env_prefix_for_capability(capability: &str) -> Option<String> {
+    if capability == COERCE_CAPABILITY {
+        return Some("WHIPPLESCRIPT_COERCE_".to_owned());
+    }
+    let modality = capability.strip_suffix(".generate")?;
+    Some(format!("WHIPPLESCRIPT_{}_", modality.to_uppercase()))
+}
+
 impl OperatorEnv {
     fn from_process() -> Self {
+        Self::for_capability(COERCE_CAPABILITY)
+    }
+
+    /// The operator override for one capability. Unknown capabilities read
+    /// nothing rather than falling back to the coercion names, so a capability
+    /// added without an environment door is unconfigured rather than quietly
+    /// sharing another's.
+    fn for_capability(capability: &str) -> Self {
+        let Some(prefix) = env_prefix_for_capability(capability) else {
+            return Self {
+                provider: None,
+                model: None,
+                base_url: None,
+                max_tokens: None,
+                timeout_secs: None,
+            };
+        };
         Self {
-            provider: env_nonempty("WHIPPLESCRIPT_COERCE_PROVIDER"),
-            model: env_nonempty("WHIPPLESCRIPT_COERCE_MODEL"),
-            base_url: env_nonempty("WHIPPLESCRIPT_COERCE_BASE_URL"),
-            max_tokens: env_nonempty("WHIPPLESCRIPT_COERCE_MAX_TOKENS")
+            provider: env_nonempty(&format!("{prefix}PROVIDER")),
+            model: env_nonempty(&format!("{prefix}MODEL")),
+            base_url: env_nonempty(&format!("{prefix}BASE_URL")),
+            max_tokens: env_nonempty(&format!("{prefix}MAX_TOKENS"))
                 .and_then(|value| value.parse().ok()),
-            timeout_secs: env_nonempty("WHIPPLESCRIPT_COERCE_TIMEOUT_SECS")
+            timeout_secs: env_nonempty(&format!("{prefix}TIMEOUT_SECS"))
                 .and_then(|value| value.parse().ok()),
         }
     }
@@ -165,18 +227,61 @@ impl CredentialProbes<'_> {
 pub fn coercion_config_fingerprint_with_registry(
     registry_default: Option<&CoerceRegistryDefault>,
 ) -> String {
-    fingerprint_inner(
+    coercion_config_fingerprint_with_media(registry_default, &[])
+}
+
+/// The same, folding in the generation backends this instance has configured.
+///
+/// One fingerprint covers the whole kernel — it is built once, before any effect
+/// is in hand — so it has to describe every backend the instance can reach. If
+/// it described only the coercion backend, changing the IMAGE backend would
+/// leave image admission keys unchanged and a recorded terminal from the old
+/// backend would replay under the new one, which is exactly what the
+/// fingerprint exists to prevent.
+///
+/// A configured generation backend therefore re-keys the coercions too, which
+/// over-invalidates: switching image providers re-runs text coercions that did
+/// not change. That is the safe direction, and the alternative is a per-effect
+/// fingerprint, which this seam does not have.
+///
+/// `media` EMPTY yields the historical value byte for byte, so an instance that
+/// configures no generation backend does not re-key on upgrade.
+pub fn coercion_config_fingerprint_with_media(
+    registry_default: Option<&CoerceRegistryDefault>,
+    media: &[(String, Option<CoerceRegistryDefault>)],
+) -> String {
+    let coercion = fingerprint_inner(
         &OperatorEnv::from_process(),
         registry_default,
+        COERCE_CAPABILITY,
         &codex_config_model,
-    )
+    );
+    let generation: Vec<String> = media
+        .iter()
+        .map(|(capability, default)| {
+            let env = OperatorEnv::for_capability(capability);
+            let resolved =
+                fingerprint_inner(&env, default.as_ref(), capability, &codex_config_model);
+            format!("{capability}={resolved}")
+        })
+        .filter(|entry| !entry.ends_with("=fixture"))
+        .collect();
+    if generation.is_empty() {
+        return coercion;
+    }
+    whipplescript_kernel::rule_lowering::stable_hash_hex(&format!(
+        "{coercion}\ngeneration={}",
+        generation.join(",")
+    ))
 }
 
 fn fingerprint_inner(
     env: &OperatorEnv,
     registry_default: Option<&CoerceRegistryDefault>,
+    capability: &str,
     codex_model: &dyn Fn() -> Option<String>,
 ) -> String {
+    let provider_kind = provider_kind_for_capability(capability);
     // Rung 2: operator override.
     if let Some(provider_name) = &env.provider {
         if is_fixture_provider_name(provider_name) {
@@ -184,7 +289,7 @@ fn fingerprint_inner(
         }
         let model = env.model.clone().or_else(codex_model).unwrap_or_default();
         return whipplescript_kernel::coerce::coercion_config_fingerprint(
-            "schema_coercer",
+            provider_kind,
             provider_name,
             provider_name,
             &model,
@@ -203,7 +308,7 @@ fn fingerprint_inner(
                 .or_else(codex_model)
                 .unwrap_or_default();
             return whipplescript_kernel::coerce::coercion_config_fingerprint(
-                "schema_coercer",
+                provider_kind,
                 &default.provider,
                 &backend_name,
                 &model,
@@ -221,9 +326,26 @@ pub fn resolve_coercion_selection(
     provider_override: Option<&str>,
     registry_default: Option<&CoerceRegistryDefault>,
 ) -> Result<CoerceSelection, String> {
+    resolve_capability_selection(COERCE_CAPABILITY, provider_override, registry_default)
+}
+
+/// The same ladder, for one capability.
+///
+/// `registry_default` must be the binding row for THAT capability — the
+/// `image.generate` row for an image prompt, not the `schema.coerce` one — and
+/// the operator override is read from that capability's own environment names.
+/// Nothing here falls back to the coercion configuration: a generation
+/// capability with no backend configured lands on rung 4 and runs the fixture,
+/// which is the honest answer for a deployment that has not said which model
+/// draws its pictures.
+pub fn resolve_capability_selection(
+    capability: &str,
+    provider_override: Option<&str>,
+    registry_default: Option<&CoerceRegistryDefault>,
+) -> Result<CoerceSelection, String> {
     resolve_selection_inner(
         provider_override,
-        &OperatorEnv::from_process(),
+        &OperatorEnv::for_capability(capability),
         registry_default,
         &CredentialProbes::real(),
     )
@@ -816,7 +938,12 @@ mod tests {
     fn fingerprint_resolves_through_the_same_ladder_rungs_2_to_4() {
         // Rung 4: fixture literal.
         assert_eq!(
-            fingerprint_inner(&OperatorEnv::empty(), None, &no_codex_model),
+            fingerprint_inner(
+                &OperatorEnv::empty(),
+                None,
+                COERCE_CAPABILITY,
+                &no_codex_model
+            ),
             "fixture"
         );
         // Registry fixture binding is still the fixture literal.
@@ -827,6 +954,7 @@ mod tests {
                     provider: "builtin-coerce".to_owned(),
                     config_json: None,
                 }),
+                COERCE_CAPABILITY,
                 &no_codex_model
             ),
             "fixture"
@@ -834,8 +962,12 @@ mod tests {
         // Rung 3: provider id + backend + model from the registry row — and it
         // matches the dispatch-path resolution for the same inputs.
         let registry = registry_native_openai(Some("gpt-registry"));
-        let fingerprint =
-            fingerprint_inner(&OperatorEnv::empty(), Some(&registry), &no_codex_model);
+        let fingerprint = fingerprint_inner(
+            &OperatorEnv::empty(),
+            Some(&registry),
+            COERCE_CAPABILITY,
+            &no_codex_model,
+        );
         assert_eq!(
             fingerprint,
             whipplescript_kernel::coerce::coercion_config_fingerprint(
@@ -871,13 +1003,123 @@ mod tests {
             ..OperatorEnv::empty()
         };
         assert_eq!(
-            fingerprint_inner(&env, Some(&registry), &no_codex_model),
+            fingerprint_inner(&env, Some(&registry), COERCE_CAPABILITY, &no_codex_model),
             whipplescript_kernel::coerce::coercion_config_fingerprint(
                 "schema_coercer",
                 "anthropic",
                 "anthropic",
                 "claude-test",
             )
+        );
+    }
+
+    /// A generation capability reads its OWN environment, never the coercion's.
+    ///
+    /// This is the load-bearing half of the split at this layer. An operator who
+    /// set `WHIPPLESCRIPT_COERCE_PROVIDER=anthropic` has said which model turns
+    /// text into a typed value and NOTHING about which model draws a picture.
+    /// Letting a `-> image` prompt inherit it would send the prompt to a text
+    /// endpoint under a configuration nobody wrote — a failure at the provider,
+    /// after the spend.
+    #[test]
+    fn a_generation_capability_reads_its_own_environment() {
+        assert_eq!(
+            env_prefix_for_capability(COERCE_CAPABILITY).as_deref(),
+            Some("WHIPPLESCRIPT_COERCE_")
+        );
+        assert_eq!(
+            env_prefix_for_capability("image.generate").as_deref(),
+            Some("WHIPPLESCRIPT_IMAGE_")
+        );
+        assert_eq!(
+            env_prefix_for_capability("video.generate").as_deref(),
+            Some("WHIPPLESCRIPT_VIDEO_")
+        );
+        // A capability with no environment door reads nothing rather than
+        // borrowing the coercion names.
+        assert_eq!(env_prefix_for_capability("script.raw"), None);
+        let borrowed = OperatorEnv::for_capability("script.raw");
+        assert!(borrowed.provider.is_none() && borrowed.model.is_none());
+    }
+
+    /// The provider kind travels into the admission key, so a coercion and a
+    /// generation on the same backend name are still different commitments.
+    #[test]
+    fn a_generation_commits_the_media_provider_kind() {
+        assert_eq!(
+            provider_kind_for_capability(COERCE_CAPABILITY),
+            "schema_coercer"
+        );
+        assert_eq!(
+            provider_kind_for_capability("image.generate"),
+            "media_generator"
+        );
+        let registry = registry_native_openai(Some("m"));
+        let as_coercion = fingerprint_inner(
+            &OperatorEnv::empty(),
+            Some(&registry),
+            COERCE_CAPABILITY,
+            &no_codex_model,
+        );
+        let as_generation = fingerprint_inner(
+            &OperatorEnv::empty(),
+            Some(&registry),
+            "image.generate",
+            &no_codex_model,
+        );
+        assert_ne!(
+            as_coercion, as_generation,
+            "the same row under a different kind is a different commitment"
+        );
+    }
+
+    /// An instance that configures no generation backend keeps the fingerprint
+    /// it had before generation existed.
+    ///
+    /// The fingerprint is folded into every `schema.coerce` admission key, so a
+    /// gratuitous change re-runs coercions on upgrade for programs that gained
+    /// nothing. A media entry that resolves to the fixture contributes nothing
+    /// for the same reason: the fixture path is what an unconfigured deployment
+    /// already had.
+    #[test]
+    fn an_unconfigured_generation_backend_does_not_rekey_admission() {
+        let base = coercion_config_fingerprint_with_registry(None);
+        assert_eq!(
+            coercion_config_fingerprint_with_media(None, &[]),
+            base,
+            "no generation capability at all"
+        );
+        assert_eq!(
+            coercion_config_fingerprint_with_media(None, &[("image.generate".to_owned(), None)]),
+            base,
+            "a generation capability with no binding row"
+        );
+        assert_eq!(
+            coercion_config_fingerprint_with_media(
+                None,
+                &[(
+                    "image.generate".to_owned(),
+                    Some(CoerceRegistryDefault {
+                        provider: "image-fixture".to_owned(),
+                        config_json: None,
+                    })
+                )]
+            ),
+            base,
+            "a generation capability bound to the fixture"
+        );
+        // A real one does re-key, which is the point: a recorded terminal from
+        // the old backend must not replay under the new.
+        assert_ne!(
+            coercion_config_fingerprint_with_media(
+                None,
+                &[(
+                    "image.generate".to_owned(),
+                    Some(registry_native_openai(Some("a-drawing-model")))
+                )]
+            ),
+            base,
+            "a configured generation backend re-keys"
         );
     }
 

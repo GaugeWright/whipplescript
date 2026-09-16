@@ -88,6 +88,33 @@ fn round_activity(awaiting: Awaiting) -> &'static str {
 /// is the whole of what the DO adds.
 pub use whipplescript_kernel::coerce_native::ResolvedCoercionConfig;
 
+/// Why this host will not serve a `prompt "…" -> <media>`, or `None` for an
+/// ordinary coercion.
+///
+/// A media result demands `<modality>.generate` (DR-0120), and the only backend
+/// this host resolves is the COERCION one — which model turns text into a typed
+/// value, and no statement at all about which model draws a picture. With no
+/// generation config to reach, the two available answers are refuse, or send an
+/// image prompt to a text endpoint. Refusing names what is missing; the other
+/// spends the caller's money to fail at the provider, under a configuration
+/// nobody wrote.
+///
+/// The native host resolves `<modality>.generate` through its own ladder rung
+/// (`coerce_runtime::resolve_capability_selection`). Giving this host the same
+/// door is its own change; until then the divergence is a refusal rather than a
+/// wrong backend.
+///
+/// It lives here, apart from the dispatch arm, for the reason `checked_byte_len`
+/// does: a refusal reachable only by driving a whole effect through a
+/// `DoSqlBridge` is a refusal no test can pin.
+pub fn media_generation_refusal(output_type: &str) -> Option<String> {
+    let capability = whipplescript_parser::media_generate_capability(output_type)?;
+    Some(format!(
+        "this durable object has no `{capability}` backend; a `-> {output_type}` prompt needs a \
+         generation provider and will not be sent to the coercion one"
+    ))
+}
+
 /// The coercion-config fingerprint this DO's kernel folds into `schema.coerce`
 /// effect admission keys (DR-0014 amendment) — derived from `coerce_config_json`
 /// exactly as the native host derives it from its resolved config (same
@@ -1600,12 +1627,26 @@ impl<Sql: DoSql + Clone> InstanceDriver for DoInstanceDriver<'_, Sql> {
             // response, which `parse_response` + `settle_coerce_result` turn into the
             // terminal — every piece host-neutral in the kernel but the creds.
             "schema.coerce" => {
+                let input = json_from_str(&effect.input_json);
+                // Ahead of the coercion backend, because no coercion backend is
+                // an answer to this. A `prompt "…" -> image` demands
+                // `image.generate`, and configuring the model that turns text
+                // into a typed value would not make an image prompt work — so
+                // "coerce provider is not configured" would name the wrong
+                // missing thing, on a host where the right one is still absent.
+                if let Some(refusal) = media_generation_refusal(
+                    input
+                        .get("output_type")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("json"),
+                ) {
+                    return Err(StoreError::Conflict(refusal));
+                }
                 let cfg = self.coerce.ok_or_else(|| {
                     StoreError::Conflict(
                         "coerce provider is not configured on this durable object".to_owned(),
                     )
                 })?;
-                let input = json_from_str(&effect.input_json);
                 let function_name = input
                     .get("function_name")
                     .and_then(|value| value.as_str())
@@ -1625,6 +1666,19 @@ impl<Sql: DoSql + Clone> InstanceDriver for DoInstanceDriver<'_, Sql> {
                     .and_then(|value| value.as_str())
                     .unwrap_or("json")
                     .to_owned();
+                // A `prompt "…" -> image` demands `image.generate`, and `cfg`
+                // above is the COERCION backend — which model turns text into a
+                // typed value, and no statement at all about which model draws
+                // a picture. This host has no generation config to resolve, so
+                // the only two answers are refuse and send an image prompt to a
+                // text endpoint. Refusing says what is missing; the other spends
+                // the caller's money to fail at the provider, under a
+                // configuration nobody wrote.
+                //
+                // The native host resolves `<modality>.generate` through its own
+                // ladder rung (`coerce_runtime::resolve_capability_selection`).
+                // Giving this host the same door is its own change; until then
+                // the divergence is a refusal rather than a wrong backend.
                 let (prompt, output_schema, wrapped, schema_name) =
                     build_coerce_call_parts(self.ir, &function_name, &arguments)
                         .map_err(StoreError::Conflict)?;
@@ -2498,6 +2552,82 @@ mod tests {
     // The DO drives an effect-free workflow's rule pass to its terminal through the
     // InstanceStepMachine, over `RuntimeKernel<DoSqliteStore>` — proving the whole
     // instance scheduler runs on the durable-object store.
+    /// A media prompt is refused on this host, ahead of the coercion backend.
+    ///
+    /// The DO resolves exactly one model config — the coercion one — so a
+    /// `prompt "…" -> image` here has two possible answers: refuse, or send an
+    /// image prompt to a text endpoint and fail at the provider after the spend,
+    /// under a configuration nobody wrote.
+    ///
+    /// It is checked BEFORE `coerce` because no coercion backend is an answer to
+    /// it: configuring the model that turns text into a typed value would not
+    /// make an image prompt work, so "coerce provider is not configured" would
+    /// name the wrong missing thing. `coerce: None` below is what proves the
+    /// ordering — the media refusal is what comes back, not that one.
+    #[test]
+    fn a_media_prompt_is_refused_before_the_coercion_backend_is_consulted() {
+        let store = store();
+        let ir = whipplescript_parser::compile_program(include_str!(
+            "../../../examples/minimal-noop.whip"
+        ))
+        .ir
+        .unwrap();
+        let mut driver = DoInstanceDriver {
+            kernel: RuntimeKernel::new(store),
+            files: &NoFiles,
+            coerce: None,
+            agent_model: None,
+            agent_tools: &NoTools,
+            agent_tool_specs: None,
+            agent_workspace_resources: None,
+            exec: None,
+            turn: None,
+            ir: &ir,
+            instance_id: "i1",
+            system_prompt: "test",
+            max_steps: 8,
+            now_unix_ms: 1000,
+        };
+        let effect = |output_type: &str| whipplescript_store::ClaimableEffect {
+            attempt_admission_event_id: None,
+            effect_id: "eff_media".to_owned(),
+            kind: "schema.coerce".to_owned(),
+            target: None,
+            profile: None,
+            input_json: serde_json::json!({
+                "function_name": "prompt",
+                "arguments": {},
+                "output_type": output_type,
+            })
+            .to_string(),
+            required_capabilities_json: "[]".to_owned(),
+            declared_profiles_json: "[]".to_owned(),
+        };
+
+        let refused = driver
+            .run_effect(&effect("image"), None)
+            .expect_err("an image prompt has no backend on this host");
+        let message = format!("{refused:?}");
+        assert!(
+            message.contains("image.generate"),
+            "the refusal names the capability that is missing: {message}"
+        );
+        assert!(
+            !message.contains("coerce provider is not configured"),
+            "and not the one that would not have helped: {message}"
+        );
+
+        // An ordinary coercion still reaches the backend check, so this is a
+        // narrow door rather than a new gate on the effect.
+        let ordinary = driver
+            .run_effect(&effect("string"), None)
+            .expect_err("no coercion backend is configured either");
+        assert!(
+            format!("{ordinary:?}").contains("coerce provider is not configured"),
+            "a text coercion is answered by the coercion backend check"
+        );
+    }
+
     #[test]
     fn do_instance_reconciliation_filters_readiness_and_preserves_wake() {
         use whipplescript_store::RuntimeStore;

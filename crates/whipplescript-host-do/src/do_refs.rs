@@ -401,6 +401,40 @@ mod tests {
         );
     }
 
+    /// This host serves coercions and has no generation backend, so a media
+    /// prompt is refused rather than sent to the coercion provider.
+    ///
+    /// Sending it would be the expensive kind of wrong: an image prompt reaches
+    /// a text endpoint, the spend happens, and the failure arrives from the
+    /// provider under a configuration nobody wrote. The refusal names the
+    /// capability that is missing, which is what an operator needs to fix it.
+    #[test]
+    fn a_media_prompt_is_refused_rather_than_sent_to_the_coercion_backend() {
+        use crate::do_instance::media_generation_refusal;
+        for (output_type, capability) in [
+            ("image", "image.generate"),
+            ("audio", "audio.generate"),
+            ("pdf", "pdf.generate"),
+            ("video", "video.generate"),
+        ] {
+            let refusal = media_generation_refusal(output_type)
+                .unwrap_or_else(|| panic!("`{output_type}` is a generation, not a coercion"));
+            assert!(
+                refusal.contains(capability),
+                "the refusal names the missing capability: {refusal}"
+            );
+        }
+        // Every ordinary coercion is untouched — this is a narrow door, not a
+        // new gate on the effect.
+        for ordinary in ["string", "json", "WorkReview", "MessageClassification"] {
+            assert_eq!(
+                media_generation_refusal(ordinary),
+                None,
+                "`{ordinary}` is a coercion and this host serves it"
+            );
+        }
+    }
+
     /// Every shape a JS number can arrive in that is not a length.
     ///
     /// The wasm boundary passes numbers as `f64`, so this is the only place
