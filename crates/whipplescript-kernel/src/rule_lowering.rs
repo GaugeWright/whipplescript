@@ -4688,7 +4688,9 @@ pub fn parsed_effect_input_json(
                     effect.binding.as_deref().unwrap_or_default(),
                 )
             } else if function_name == "prompt" {
-                "string".to_owned()
+                // `prompt "…" -> <Type>` names what the model is asked for; an
+                // unannotated prompt keeps the `string` it always returned.
+                effect_prompt_result_type(rule, effect).unwrap_or_else(|| "string".to_owned())
             } else {
                 ir.coerces
                     .iter()
@@ -5587,6 +5589,20 @@ pub fn effect_on_stream_json(rule: &IrRule, effect: &ParsedEffect, kind: IrEffec
         .unwrap_or(Value::Null)
 }
 
+/// The result type an inline `prompt "…" -> <Type> as x` named, correlated from
+/// the IR effect node the way turn skills and access grants are. `None` is an
+/// unannotated prompt, whose result stays `string`.
+pub fn effect_prompt_result_type(rule: &IrRule, effect: &ParsedEffect) -> Option<String> {
+    rule.metadata
+        .effects
+        .iter()
+        .find(|node| {
+            node.kind == IrEffectKind::SchemaCoerce
+                && node.binding.as_deref() == effect.binding.as_deref()
+        })
+        .and_then(|node| node.prompt_result_type.clone())
+}
+
 pub fn effect_turn_skills_json(rule: &IrRule, effect: &ParsedEffect, kind: IrEffectKind) -> Value {
     let Some(node) = rule.metadata.effects.iter().find(|node| {
         if node.kind != kind {
@@ -5607,6 +5623,21 @@ pub fn effect_turn_skills_json(rule: &IrRule, effect: &ParsedEffect, kind: IrEff
             .map(|skill| Value::String(skill.clone()))
             .collect(),
     )
+}
+
+/// A type named by an inline annotation, as an `IrType`. Mirrors the parser's
+/// resolution: a primitive keyword, or a class/enum the program declares.
+fn named_ir_type(name: &str, ir: &IrProgram) -> Option<IrType> {
+    if let Some(primitive) = IrPrimitiveType::from_type_name(name) {
+        return Some(IrType::Primitive(primitive));
+    }
+    ir.schemas
+        .iter()
+        .any(|schema| match schema {
+            whipplescript_parser::IrSchema::Class(class) => class.name == name,
+            whipplescript_parser::IrSchema::Enum(decl) => decl.name == name,
+        })
+        .then(|| IrType::Ref(name.to_owned()))
 }
 
 /// Admission-time key commitments for a `schema.coerce` effect (DR-0014
@@ -5630,6 +5661,11 @@ pub fn schema_coerce_key_commitments(
             .map(|prompt| prompt.text)
             .unwrap_or_default(),
     };
+    let declared_prompt_type = ir
+        .rules
+        .iter()
+        .find(|rule| rule.name == rule_name)
+        .and_then(|rule| effect_prompt_result_type(rule, parsed));
     let output_type = match coercion_name {
         "decide" => Some(IrType::Ref(
             whipplescript_parser::inline_decide_schema_name(
@@ -5637,7 +5673,16 @@ pub fn schema_coerce_key_commitments(
                 parsed.binding.as_deref().unwrap_or_default(),
             ),
         )),
-        "prompt" => Some(IrType::Primitive(IrPrimitiveType::String)),
+        // An annotated inline prompt commits to the type it named. This is the
+        // key, so it MUST move: two programs differing only in `-> image` vs
+        // the default `string` ask the model for different things, and a
+        // shared key would replay one's terminal for the other.
+        "prompt" => Some(
+            declared_prompt_type
+                .as_deref()
+                .and_then(|name| named_ir_type(name, ir))
+                .unwrap_or(IrType::Primitive(IrPrimitiveType::String)),
+        ),
         _ => ir
             .coerces
             .iter()
@@ -5651,8 +5696,19 @@ pub fn schema_coerce_key_commitments(
                 .to_string()
         })
         .unwrap_or_else(|| "json".to_owned());
+    // A named `coerce` commits its output type transitively: the NAME picks the
+    // declaration, and the declaration fixes the type. An inline prompt is
+    // always named `prompt`, so its declared type is committed nowhere else --
+    // and it cannot ride on the schema hash, because a media type and a string
+    // render the same `{"type":"string"}` to the provider today. So the
+    // annotation joins the coercion identity, which leaves every unannotated
+    // prompt and every named coerce keying exactly as before.
+    let coercion_identity = match (coercion_name, &declared_prompt_type) {
+        ("prompt", Some(declared)) => format!("prompt->{declared}"),
+        _ => coercion_name.to_owned(),
+    };
     [
-        format!("coercion={coercion_name}"),
+        format!("coercion={coercion_identity}"),
         format!("prompt_template_hash={}", stable_hash_hex(&template)),
         format!("output_schema_hash={}", stable_hash_hex(&output_schema)),
     ]
@@ -7470,6 +7526,182 @@ rule relay
     /// fall-through invisible, and is why this calls the function DIRECTLY:
     /// there is no IR that reaches the arm, because every `IrEffectKind` maps
     /// to a handled string. A kind added on the runtime side without an arm
+    /// The runtime half of `prompt "…" -> <Type>`. The annotation types the
+    /// BINDING in the compiler; this is what makes it reach the provider —
+    /// `output_type` on the effect's input is what the coerce runtime builds
+    /// the model-facing schema from, and it was pinned to `string` for every
+    /// inline prompt.
+    ///
+    /// The unannotated case is the compatibility pin: every prompt written
+    /// before the annotation existed must still ask for a string.
+    #[test]
+    fn an_annotated_prompt_asks_the_provider_for_the_type_it_named() {
+        let output_type_for = |annotation: &str| {
+            let ir = ir_of(&format!(
+                r#"use std.coercion
+
+workflow Relay
+
+output result Done
+
+class Done {{
+  note string
+}}
+
+class Task {{
+  id string
+}}
+
+table tasks as Task [
+  {{ id "t1" }}
+]
+
+rule relay
+  when Task as t
+=> {{
+  prompt "make a poster"{annotation} as poster
+
+  after poster succeeds {{
+    complete result {{ note "done" }}
+  }}
+
+  after poster fails {{
+    complete result {{ note "no" }}
+  }}
+}}
+"#
+            ));
+            let facts = vec![fact("Task", "Task:t1", r#"{"id":"t1"}"#)];
+            let rule = ir
+                .rules
+                .iter()
+                .find(|rule| rule.name == "relay")
+                .expect("fixture rule");
+            let ready = super::ready_contexts(&ir, rule, &facts, &[], None);
+            let context = ready.contexts.first().expect("the rule is ready once");
+            let effect = super::ParsedEffect {
+                kind: "schema.coerce".to_owned(),
+                target: None,
+                name: Some("prompt".to_owned()),
+                binding: Some("poster".to_owned()),
+                args: Vec::new(),
+                prompt: Some("make a poster".to_owned()),
+                prompt_content_type: None,
+                prompt_template: Some("make a poster".to_owned()),
+                required_capabilities: Vec::new(),
+                after: None,
+                timeout_seconds: None,
+            };
+            let mut errors = Vec::new();
+            let input = super::parsed_effect_input_json(
+                &ir,
+                rule,
+                &effect,
+                context,
+                &std::collections::BTreeMap::new(),
+                &mut errors,
+                &facts,
+                &[],
+            );
+            assert!(errors.is_empty(), "{errors:?}");
+            super::json_from_str(&input)
+                .get("output_type")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+                .expect("a coerce effect input names its output type")
+        };
+
+        assert_eq!(
+            output_type_for(" -> image"),
+            "image",
+            "the provider is asked for the type the author named"
+        );
+        assert_eq!(
+            output_type_for(""),
+            "string",
+            "and a prompt written before the annotation still asks for a string"
+        );
+    }
+
+    /// The effect KEY commits to the declared type. Two programs differing only
+    /// in their annotation ask the model for different things, so sharing a key
+    /// would replay one's terminal for the other -- the stale-replay failure
+    /// the schema commitment exists to prevent.
+    #[test]
+    fn changing_a_prompts_result_type_changes_its_effect_key() {
+        let commitments = |annotation: &str| {
+            let ir = ir_of(&format!(
+                r#"use std.coercion
+
+workflow Relay
+
+output result Done
+
+class Done {{
+  note string
+}}
+
+rule relay
+  when started
+=> {{
+  prompt "make a poster"{annotation} as poster
+
+  after poster succeeds {{
+    complete result {{ note "done" }}
+  }}
+
+  after poster fails {{
+    complete result {{ note "no" }}
+  }}
+}}
+"#
+            ));
+            let effect = super::ParsedEffect {
+                kind: "schema.coerce".to_owned(),
+                target: None,
+                name: Some("prompt".to_owned()),
+                binding: Some("poster".to_owned()),
+                args: Vec::new(),
+                prompt: Some("make a poster".to_owned()),
+                prompt_content_type: None,
+                prompt_template: Some("make a poster".to_owned()),
+                required_capabilities: Vec::new(),
+                after: None,
+                timeout_seconds: None,
+            };
+            super::schema_coerce_key_commitments(&ir, "relay", &effect)
+        };
+
+        let unannotated = commitments("");
+        let image = commitments(" -> image");
+        assert_ne!(
+            unannotated, image,
+            "the key moves when the declared type does"
+        );
+        // Specifically in the COERCION identity, not the schema hash: a media
+        // type and a string render the same `{"type":"string"}` to the provider
+        // today, so the schema alone cannot tell them apart. This assertion is
+        // what would notice if the distinction were ever moved back onto a
+        // commitment that does not carry it.
+        assert_eq!(
+            unannotated[0], "coercion=prompt",
+            "an unannotated prompt keys exactly as it always did"
+        );
+        assert_eq!(image[0], "coercion=prompt->image");
+        assert_eq!(
+            unannotated[2], image[2],
+            "and the schema hash genuinely does NOT distinguish them yet"
+        );
+
+        // The control: the same program keys the same, or nothing dedupes and
+        // every replay re-runs the model.
+        assert_eq!(
+            image,
+            commitments(" -> image"),
+            "an unchanged program still dedupes"
+        );
+    }
+
     /// here would have lowered to an input carrying only its rule name and
     /// queued normally, with everything the effect needed missing.
     #[test]

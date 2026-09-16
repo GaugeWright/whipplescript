@@ -500,10 +500,13 @@ pub enum BodyEffectKind {
         declassified: bool,
     },
     /// Bare free-text model prompt: `prompt "<text>" [using <provider>] as x`.
-    /// It lowers through the same model/backend path as `coerce`, but its
-    /// completed value is a plain string.
+    /// It lowers through the same model/backend path as `coerce`. Its
+    /// completed value is a plain string unless `-> <Type>` names another,
+    /// the way `decide`'s `-> { … }` names an anonymous one.
     Prompt {
         provider: Option<String>,
+        /// `prompt "…" -> <Type> as x`. `None` keeps the historical `string`.
+        result_type: Option<String>,
     },
     /// Inline anonymous coercion: `decide "<prompt>" -> { field type, ... } as x`.
     Decide {
@@ -2741,6 +2744,18 @@ impl<'a> BodyParser<'a> {
         let start = self.pos;
         self.pos += 1; // prompt
         let prompt = self.parse_prompt()?;
+        // `-> <Type>` names the result. `prompt` is the coerce family's inline
+        // member -- text out to a model, a value back -- and its result was
+        // pinned to `string`, which is the only thing that made "ask a model
+        // for an image" a different effect rather than this one with a
+        // different result type. Read as a TOKEN, so a prompt whose prose says
+        // "-> image" declares nothing.
+        let result_type = if matches!(self.peek().map(|t| &t.tok), Some(Tok::Arrow)) {
+            self.advance();
+            Some(self.ident_text("type after `->`")?)
+        } else {
+            None
+        };
         let provider = if self.consume_ident("using") {
             Some(self.provider_name("provider after `using`")?)
         } else {
@@ -2768,7 +2783,10 @@ impl<'a> BodyParser<'a> {
             );
         }
         Some(BodyStmt::Effect(EffectStmt {
-            kind: BodyEffectKind::Prompt { provider },
+            kind: BodyEffectKind::Prompt {
+                provider,
+                result_type,
+            },
             binding,
             requires,
             timeout_seconds,
@@ -5877,10 +5895,19 @@ mod tests {
         let BodyStmt::Effect(effect) = &ast.statements[0] else {
             panic!("expected effect");
         };
-        let BodyEffectKind::Prompt { provider } = &effect.kind else {
+        let BodyEffectKind::Prompt {
+            provider,
+            result_type,
+        } = &effect.kind
+        else {
             panic!("expected prompt");
         };
         assert_eq!(provider.as_deref(), Some("fixture"));
+        assert_eq!(
+            result_type.as_deref(),
+            None,
+            "an unannotated prompt declares no result type"
+        );
         assert_eq!(effect.binding.as_deref(), Some("answer"));
         assert_eq!(effect.requires, vec!["model.invoke".to_owned()]);
         assert_eq!(effect.timeout_seconds, Some(600));
@@ -5912,10 +5939,19 @@ mod tests {
             let BodyStmt::Effect(effect) = &ast.statements[0] else {
                 panic!("expected effect from {source}");
             };
-            let BodyEffectKind::Prompt { provider } = &effect.kind else {
+            let BodyEffectKind::Prompt {
+                provider,
+                result_type,
+            } = &effect.kind
+            else {
                 panic!("expected prompt from {source}");
             };
             assert_eq!(provider.as_deref(), Some(expected), "{source}");
+            assert_eq!(
+                result_type.as_deref(),
+                None,
+                "none of these names a result type: {source}"
+            );
             assert_eq!(
                 effect.binding.as_deref(),
                 Some("answer"),
@@ -5933,12 +5969,43 @@ mod tests {
         let BodyStmt::Effect(effect) = &ast.statements[0] else {
             panic!("expected effect");
         };
-        let BodyEffectKind::Prompt { provider } = &effect.kind else {
+        let BodyEffectKind::Prompt {
+            provider,
+            result_type,
+        } = &effect.kind
+        else {
             panic!("expected prompt");
         };
         assert_eq!(provider.as_deref(), Some("fixture"));
+        assert_eq!(result_type.as_deref(), None);
         assert_eq!(effect.requires, vec!["model.invoke".to_owned()]);
         assert_eq!(effect.binding.as_deref(), Some("answer"));
+    }
+
+    /// The result type and the endpoint are separate clauses in a fixed order,
+    /// and each must leave the other whole.
+    ///
+    /// They meet at a dash: `->` opens the annotation and a provider name may
+    /// carry dashes, which the body lexer splits and the clause reassembles.
+    /// A name that welded across the arrow, or an annotation that consumed the
+    /// name after it, would each read as the other clause being absent rather
+    /// than as a parse error.
+    #[test]
+    fn a_result_type_and_a_using_clause_each_leave_the_other_whole() {
+        let ast = parse_ok("prompt \"Draw a cat\" -> image using openai-generic as picture");
+        let BodyStmt::Effect(effect) = &ast.statements[0] else {
+            panic!("expected effect");
+        };
+        let BodyEffectKind::Prompt {
+            provider,
+            result_type,
+        } = &effect.kind
+        else {
+            panic!("expected prompt");
+        };
+        assert_eq!(result_type.as_deref(), Some("image"));
+        assert_eq!(provider.as_deref(), Some("openai-generic"));
+        assert_eq!(effect.binding.as_deref(), Some("picture"));
     }
 
     /// The printer must reproduce the SPELLING of a prompt, not merely its
@@ -5995,6 +6062,68 @@ mod tests {
             effect.prompt.as_ref().expect("prompt").text,
             "say \"hi\"",
             "the reprint must re-lex to the same text"
+        );
+    }
+
+    /// A reprint that drops `-> <Type>` changes what the program asks for.
+    ///
+    /// `whip fmt` reprints from the AST, so an annotation the printer does not
+    /// carry is not a formatting difference — it is the rule silently going
+    /// back to asking for a string, and asking a different endpoint, with no
+    /// diagnostic anywhere. Both prompt spellings put the clause in the same
+    /// place, and both have to round-trip: the one-line form on the effect
+    /// line, the block form on the closing `"""`.
+    #[test]
+    fn a_reprinted_prompt_still_asks_for_the_type_it_named() {
+        let reprint = |source: &str| {
+            let (ast, diagnostics) = parse_rule_body(source, 0);
+            assert!(diagnostics.is_empty(), "{diagnostics:?}");
+            let mut printed = String::new();
+            for statement in &ast.statements {
+                crate::body_print::print_statement_rn(
+                    statement,
+                    0,
+                    &|text: &str| text.to_owned(),
+                    &mut printed,
+                );
+            }
+            printed
+        };
+        let result_type_of = |printed: &str| {
+            let (ast, diagnostics) = parse_rule_body(printed.trim(), 0);
+            assert!(diagnostics.is_empty(), "{diagnostics:?}");
+            let BodyStmt::Effect(effect) = &ast.statements[0] else {
+                panic!("expected an effect, got {:?}", ast.statements[0]);
+            };
+            let BodyEffectKind::Prompt { result_type, .. } = &effect.kind else {
+                panic!("expected a prompt");
+            };
+            result_type.clone()
+        };
+
+        let one_line = reprint("prompt \"Draw a cat\" -> image using openai-generic as picture\n");
+        assert!(
+            one_line.contains("-> image"),
+            "the annotation survives the reprint: {one_line}"
+        );
+        assert_eq!(
+            result_type_of(&one_line).as_deref(),
+            Some("image"),
+            "and the reprint re-parses to the same request: {one_line}"
+        );
+
+        let block = reprint("prompt \"\"\"\nDraw a cat\n\"\"\" -> image as picture\n");
+        assert_eq!(
+            result_type_of(&block).as_deref(),
+            Some("image"),
+            "a block prompt carries it on the closing quotes: {block}"
+        );
+
+        // An unannotated prompt must not gain one, which is the same defect
+        // from the other side: a rule that now asks for something it did not.
+        assert_eq!(
+            result_type_of(&reprint("prompt \"Summarize it\" as summary\n")),
+            None
         );
     }
 

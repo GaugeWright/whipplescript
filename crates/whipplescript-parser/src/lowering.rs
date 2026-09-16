@@ -2968,21 +2968,8 @@ pub(crate) fn lower_type(ty: TypeSyntax) -> IrType {
 }
 
 fn lower_primitive_type(name: &str) -> IrPrimitiveType {
-    match name {
-        "string" => IrPrimitiveType::String,
-        "int" => IrPrimitiveType::Int,
-        "float" => IrPrimitiveType::Float,
-        "bool" => IrPrimitiveType::Bool,
-        "null" => IrPrimitiveType::Null,
-        "duration" => IrPrimitiveType::Duration,
-        "time" => IrPrimitiveType::Time,
-        "image" => IrPrimitiveType::Image,
-        "audio" => IrPrimitiveType::Audio,
-        "pdf" => IrPrimitiveType::Pdf,
-        "video" => IrPrimitiveType::Video,
-        // `secret` must never fall into the String default below: that would
-        // silently downgrade the one type whose point is having no
-        // eliminator.
-        _ => IrPrimitiveType::String,
-    }
+    // `secret` deliberately resolves to NONE here and is handled by its own
+    // syntax arm: falling through to the `String` default would silently
+    // downgrade the one type whose point is having no eliminator.
+    IrPrimitiveType::from_type_name(name).unwrap_or(IrPrimitiveType::String)
 }

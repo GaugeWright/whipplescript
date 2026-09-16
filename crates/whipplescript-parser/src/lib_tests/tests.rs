@@ -26414,3 +26414,145 @@ fn exactly_the_two_model_calling_kinds_make_model_calls() {
         .collect();
     assert_eq!(calling, vec!["agent.tell", "schema.coerce"]);
 }
+
+/// `prompt` is the coerce family's INLINE member — text out to a model, a value
+/// back — and its result was pinned to `string`. That pin was the only thing
+/// making "ask a model for an image" a different effect rather than this one
+/// with a different result type, so `-> <Type>` unpins it.
+///
+/// The annotation is read as a TOKEN, never by scanning the statement text,
+/// for the reason the neighbouring `exec … -> Schema` collector already gives:
+/// the prompt is author prose and can itself contain `->`. The third probe is
+/// that property — a sentence may not declare a type — and it is the one that
+/// would rot silently if someone later "simplified" this to a text scan.
+#[test]
+fn a_prompt_result_type_comes_from_the_annotation_and_never_from_the_prose() {
+    let program = |prompt_line: &str, read: &str| {
+        format!(
+            "use std.coercion\n\nworkflow P\n\noutput result Done\n\n\
+             class Done {{\n  note string\n}}\n\n\
+             rule go\n  when started\n=> {{\n  \
+               {prompt_line}\n\n  \
+               after summary succeeds as r {{\n    complete result {{ note {read} }}\n  }}\n\n  \
+               after summary fails {{\n    complete result {{ note \"no\" }}\n  }}\n\
+             }}\n"
+        )
+    };
+    let codes = |prompt_line: &str, read: &str| {
+        compile_program(&program(prompt_line, read))
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.severity == Severity::Error)
+            .map(|diagnostic| diagnostic.code.as_str().to_owned())
+            .collect::<Vec<_>>()
+    };
+
+    // The annotation types the binding, so a read resolves against THAT class.
+    assert_eq!(
+        codes(r#"prompt "summarize it" -> Done as summary"#, "r.note"),
+        Vec::<String>::new(),
+        "a declared field of the annotated class reads"
+    );
+    assert_eq!(
+        codes(r#"prompt "summarize it" -> Done as summary"#, "r.nope"),
+        vec!["type.unknown_field"],
+        "and a field the class does not have is refused"
+    );
+
+    // Prose is not a declaration. Were this parsed by scanning the statement
+    // text, `-> Done` inside the literal would type the binding and `r.nope`
+    // would be refused against a class the author never named.
+    assert_eq!(
+        codes(
+            r#"prompt "rewrite this as -> Done and explain" as summary"#,
+            "r.nope"
+        ),
+        Vec::<String>::new(),
+        "a prompt whose TEXT contains an arrow declares nothing"
+    );
+
+    // An unannotated prompt keeps the `string` it always had.
+    assert_eq!(
+        codes(r#"prompt "summarize it" as summary"#, "\"x\""),
+        Vec::<String>::new(),
+        "the historical form is untouched"
+    );
+
+    // The type decides what every read resolves against, so a name that
+    // resolves to nothing is one mistake reported once.
+    assert_eq!(
+        codes(
+            r#"prompt "summarize it" -> Nonexistent as summary"#,
+            "\"x\""
+        ),
+        vec!["type.unknown_schema"],
+        "an unresolvable result type is refused"
+    );
+    // A primitive is a type too — this is what makes `-> image` spell itself.
+    assert_eq!(
+        codes(r#"prompt "make a poster" -> image as summary"#, "\"x\""),
+        Vec::<String>::new(),
+        "a media primitive is an admitted result type"
+    );
+}
+
+/// Asking a model for structured text is COERCION; asking it to synthesize an
+/// image is GENERATION — a different provider, a different cost, a different
+/// egress. If an annotated prompt ran under `schema.coerce` alone, a coercion
+/// grant would quietly confer image generation, which is an authority widening
+/// nobody wrote down.
+///
+/// Per modality, not one `media.generate`: a grant to make stills should not
+/// also buy video. The class and unannotated probes are the other half of the
+/// line — they must NOT demand generation, or every existing prompt would start
+/// requiring an authority it never needed.
+#[test]
+fn only_a_media_result_makes_a_prompt_demand_generation_authority() {
+    let capabilities_of = |annotation: &str| {
+        let source = format!(
+            "use std.coercion\n\nworkflow P\n\noutput result Done\n\n\
+             class Done {{\n  note string\n}}\n\n\
+             rule go\n  when started\n=> {{\n  \
+               prompt \"make a poster\"{annotation} as poster\n\n  \
+               after poster succeeds {{\n    complete result {{ note \"ok\" }}\n  }}\n\n  \
+               after poster fails {{\n    complete result {{ note \"no\" }}\n  }}\n\
+             }}\n"
+        );
+        let ir = compile_program(&source).ir.expect("the program compiles");
+        ir.rules
+            .iter()
+            .flat_map(|rule| rule.metadata.effects.iter())
+            .filter(|node| node.binding.as_deref() == Some("poster"))
+            .flat_map(|node| node.required_capabilities.iter().cloned())
+            .collect::<Vec<_>>()
+    };
+
+    assert!(
+        capabilities_of(" -> image").contains(&"image.generate".to_owned()),
+        "a media result demands its modality's generation capability: {:?}",
+        capabilities_of(" -> image")
+    );
+    assert!(
+        capabilities_of(" -> video").contains(&"video.generate".to_owned()),
+        "and the capability is per modality, so stills do not buy video"
+    );
+    assert!(
+        !capabilities_of(" -> video").contains(&"image.generate".to_owned()),
+        "nor the reverse"
+    );
+
+    // The other half of the line.
+    assert!(
+        !capabilities_of(" -> Done")
+            .iter()
+            .any(|capability| capability.ends_with(".generate")),
+        "a class result is ordinary coercion: {:?}",
+        capabilities_of(" -> Done")
+    );
+    assert!(
+        !capabilities_of("")
+            .iter()
+            .any(|capability| capability.ends_with(".generate")),
+        "and an unannotated prompt demands nothing new"
+    );
+}

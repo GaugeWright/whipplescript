@@ -2079,6 +2079,30 @@ pub enum IrPrimitiveType {
 }
 
 impl IrPrimitiveType {
+    /// The primitive a source type keyword names, or `None` when the keyword is
+    /// not a primitive at all. The ONE name table: `lower_primitive_type` reads
+    /// it, and so does anything outside the parser that has to resolve a type
+    /// named by bare identifier (an inline `prompt … -> <Type>`).
+    ///
+    /// `secret` is deliberately absent: it is spelled with an optional kind
+    /// argument and resolving it from a bare name would drop that.
+    pub fn from_type_name(name: &str) -> Option<Self> {
+        match name {
+            "string" => Some(IrPrimitiveType::String),
+            "int" => Some(IrPrimitiveType::Int),
+            "float" => Some(IrPrimitiveType::Float),
+            "bool" => Some(IrPrimitiveType::Bool),
+            "null" => Some(IrPrimitiveType::Null),
+            "duration" => Some(IrPrimitiveType::Duration),
+            "time" => Some(IrPrimitiveType::Time),
+            "image" => Some(IrPrimitiveType::Image),
+            "audio" => Some(IrPrimitiveType::Audio),
+            "pdf" => Some(IrPrimitiveType::Pdf),
+            "video" => Some(IrPrimitiveType::Video),
+            _ => None,
+        }
+    }
+
     /// Whether this is one of the opaque multimodal boundary types
     /// (`spec/type-system.md` "Type Universe"). Exhaustive on purpose: adding a
     /// fifth kind must not be able to leave it silently non-media, which is
@@ -2536,6 +2560,12 @@ pub struct IrEffectNode {
     /// Turn-access grants (`with access to …`) lowered onto an `agent.tell` effect as
     /// authority-narrowing metadata (Proposal A). Empty for non-grant effects.
     pub access_grants: Vec<IrAccessGrant>,
+    /// `prompt "…" -> <Type> as x`: the result type the author named, carried
+    /// here because the runtime builds the model-facing schema from the IR and
+    /// an INLINE prompt has no declaration to read it from (a named `coerce`
+    /// has `ir.coerces[].output`). `None` is an unannotated prompt, which keeps
+    /// the `string` every prompt returned before the annotation existed.
+    pub prompt_result_type: Option<String>,
     /// Turn-scoped skills (`with skills [...]`) pinned onto an `agent.tell` effect as
     /// provenance (context-assembly Phase 7). Recorded, not enforced — the owned
     /// catalogue stays discover-all. Empty for effects without a skill pin.
@@ -12779,7 +12809,8 @@ fn analyze_rule(
         &rule.name.name,
         &mut effect_payload_types,
     );
-    collect_prompt_payload_types(&body_ast.statements, &mut effect_payload_types);
+    collect_prompt_payload_types(&body_ast.statements, semantic, &mut effect_payload_types);
+    validate_prompt_result_types(rule, &body_ast.statements, semantic, diagnostics);
     // `redact … as <binding>` result carries the synthesized `redact.<rule>.<binding>`
     // projected class (see `collect_redact_schemas`), so access through it resolves
     // against the kept-only fields.
@@ -13449,6 +13480,9 @@ fn analyze_rule(
                 id,
                 kind,
                 binding,
+                // Overwritten by `collect_effects_from_ast` below, like the
+                // grants: the annotation is an AST fact, not a line fact.
+                prompt_result_type: None,
                 after_arm,
                 required_capabilities: parse_required_capabilities(line),
                 construct_use: None,
@@ -15406,6 +15440,20 @@ fn tell_agent_name(line: &str) -> Option<&str> {
     (!agent.is_empty()).then_some(agent)
 }
 
+/// A type named by bare identifier in a rule body: a primitive keyword, or a
+/// class/enum the program declares. `None` when nothing of that name exists,
+/// which the caller reports rather than guessing a type for.
+fn resolve_named_type(name: &str, semantic: &SemanticContext) -> Option<IrType> {
+    if crate::syntax::is_primitive_type(name) {
+        return Some(lower_type(TypeSyntax::Primitive {
+            name: name.to_owned(),
+            span: SourceSpan { start: 0, end: 0 },
+        }));
+    }
+    (semantic.schemas.classes.contains_key(name) || semantic.schemas.enums.contains_key(name))
+        .then(|| IrType::Ref(name.to_owned()))
+}
+
 fn terminal_unknown_payload_type() -> IrType {
     IrType::Object(Vec::new())
 }
@@ -15545,7 +15593,7 @@ fn agent_for_body(kind: &body::BodyEffectKind) -> Option<String> {
 /// principal — the selection ladder resolves those at runtime.
 fn prompt_provider_for_body(kind: &body::BodyEffectKind) -> Option<String> {
     match kind {
-        body::BodyEffectKind::Prompt { provider } => provider.clone(),
+        body::BodyEffectKind::Prompt { provider, .. } => provider.clone(),
         _ => None,
     }
 }
@@ -15586,6 +15634,33 @@ fn coerce_target_for_body(kind: &body::BodyEffectKind) -> Option<String> {
 }
 
 /// Turn-scoped `with skills [...]` pinned onto an `agent.tell` effect (Phase 7).
+/// The result type an inline `prompt "…" -> <Type> as x` named, for the IR. A
+/// named `coerce` keeps its output in `ir.coerces[].output`; an inline prompt
+/// has no declaration, so the annotation rides on the effect node instead.
+/// The capability an inline `prompt "…" -> <Type>` demands, when the type it
+/// names is MEDIA.
+///
+/// Asking a model for structured text is coercion; asking it to synthesize an
+/// image is generation — a different provider, a different cost, a different
+/// egress. Running it under `schema.coerce` would make a coercion grant quietly
+/// confer image generation, so the authority splits by what the author asked
+/// for. Per MODALITY, not one `media.generate`: a grant to make stills should
+/// not also buy video.
+///
+/// `None` for a non-media result, which stays ordinary coercion.
+pub fn media_generate_capability(result_type: &str) -> Option<String> {
+    IrPrimitiveType::from_type_name(result_type)
+        .filter(IrPrimitiveType::is_media)
+        .map(|_| format!("{result_type}.generate"))
+}
+
+fn prompt_result_type_for_body(kind: &body::BodyEffectKind) -> Option<String> {
+    match kind {
+        body::BodyEffectKind::Prompt { result_type, .. } => result_type.clone(),
+        _ => None,
+    }
+}
+
 fn turn_skills_for_body(kind: &body::BodyEffectKind) -> Vec<String> {
     match kind {
         body::BodyEffectKind::Tell { skills, .. } => skills.clone(),
@@ -16895,6 +16970,14 @@ fn walk_effects(
                     } => {
                         required_capabilities.push(target_capability.clone());
                     }
+                    body::BodyEffectKind::Prompt {
+                        result_type: Some(result_type),
+                        ..
+                    } => {
+                        if let Some(capability) = media_generate_capability(result_type) {
+                            required_capabilities.push(capability);
+                        }
+                    }
                     _ => {}
                 }
                 required_capabilities.sort();
@@ -16902,6 +16985,7 @@ fn walk_effects(
                 let construct_use = construct_use_for_body(&effect.kind);
                 let access_grants = ir_access_grants_for_body(&effect.kind);
                 let turn_skills = turn_skills_for_body(&effect.kind);
+                let prompt_result_type = prompt_result_type_for_body(&effect.kind);
                 let on_stream = on_stream_for_body(&effect.kind);
                 let (selection_source, transport_onto) = vcs_selective_for_body(&effect.kind);
                 let resource = resource_for_body(&effect.kind, binding_resources);
@@ -16918,6 +17002,7 @@ fn walk_effects(
                     id,
                     kind,
                     binding: effect.binding.clone(),
+                    prompt_result_type,
                     after_arm: after_stack
                         .last()
                         .map(|(binding, _, arm)| (binding.clone(), arm.clone())),
@@ -21305,24 +21390,95 @@ fn collect_decide_payload_types(
     }
 }
 
+/// `prompt "…" -> <Type> as x` must name something. The type decides what every
+/// read through the binding resolves against, so a name that resolves to
+/// nothing would silently fall back to `string` and report as a pile of
+/// confusing field errors instead of the one mistake the author made.
+fn validate_prompt_result_types(
+    rule: &RuleDecl,
+    statements: &[body::BodyStmt],
+    semantic: &SemanticContext,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    for statement in statements {
+        match statement {
+            body::BodyStmt::Effect(effect) => {
+                let body::BodyEffectKind::Prompt { result_type, .. } = &effect.kind else {
+                    continue;
+                };
+                let Some(name) = result_type.as_deref() else {
+                    continue;
+                };
+                if resolve_named_type(name, semantic).is_some() {
+                    continue;
+                }
+                let suggestion = suggest_otherwise(
+                    name,
+                    semantic.schemas.classes.keys(),
+                    format!(
+                        "name a primitive (`string`, `int`, `image`, …) or declare \
+                         `class {name}` before a prompt returns it"
+                    ),
+                );
+                diagnostics.push(Diagnostic {
+                    code: diagnostic_code!("type.unknown_schema"),
+                    severity: Severity::Error,
+                    related: Vec::new(),
+                    fixits: Vec::new(),
+                    span: effect.span,
+                    message: format!(
+                        "rule `{}` has a prompt returning unknown type `{name}`",
+                        rule.name.name
+                    ),
+                    suggestion: suggest(suggestion),
+                });
+            }
+            body::BodyStmt::After(after) => {
+                validate_prompt_result_types(rule, &after.body, semantic, diagnostics)
+            }
+            body::BodyStmt::Case(case) => {
+                for branch in &case.branches {
+                    validate_prompt_result_types(rule, &branch.body, semantic, diagnostics);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// `prompt "…" [-> <Type>] as x`. Read from the AST for the reason the
+/// `exec … -> Schema` collector states: the prompt text is author prose and can
+/// itself contain `->`, so a scan of the statement text would let a sentence
+/// declare a type. An unannotated prompt keeps `string`, which is what every
+/// prompt was before the annotation existed.
 fn collect_prompt_payload_types(
     statements: &[body::BodyStmt],
+    semantic: &SemanticContext,
     payloads: &mut BTreeMap<String, IrType>,
 ) {
     for statement in statements {
         match statement {
             body::BodyStmt::Effect(effect) => {
-                if matches!(&effect.kind, body::BodyEffectKind::Prompt { .. }) {
+                if let body::BodyEffectKind::Prompt { result_type, .. } = &effect.kind {
                     if let Some(binding) = &effect.binding {
-                        payloads
-                            .insert(binding.clone(), IrType::Primitive(IrPrimitiveType::String));
+                        // A name that resolves to nothing is refused by
+                        // `validate_prompt_result_types`; falling back to
+                        // `string` keeps one bad annotation reporting once
+                        // instead of cascading into every read of the binding.
+                        let payload = result_type
+                            .as_deref()
+                            .and_then(|name| resolve_named_type(name, semantic))
+                            .unwrap_or(IrType::Primitive(IrPrimitiveType::String));
+                        payloads.insert(binding.clone(), payload);
                     }
                 }
             }
-            body::BodyStmt::After(after) => collect_prompt_payload_types(&after.body, payloads),
+            body::BodyStmt::After(after) => {
+                collect_prompt_payload_types(&after.body, semantic, payloads)
+            }
             body::BodyStmt::Case(case) => {
                 for branch in &case.branches {
-                    collect_prompt_payload_types(&branch.body, payloads);
+                    collect_prompt_payload_types(&branch.body, semantic, payloads);
                 }
             }
             _ => {}

@@ -226,10 +226,18 @@ pub(crate) fn print_effect(
                 rn(target)
             )
         }
-        BodyEffectKind::Prompt { provider } => {
+        BodyEffectKind::Prompt {
+            provider,
+            result_type,
+        } => {
             let using = provider
                 .as_ref()
                 .map(|provider| format!(" using {provider}"))
+                .unwrap_or_default();
+            // Before `using`, matching the order the parser reads them in.
+            let returns = result_type
+                .as_ref()
+                .map(|ty| format!(" -> {ty}"))
                 .unwrap_or_default();
             let (text, content_type, triple_quoted) = effect
                 .prompt
@@ -257,7 +265,7 @@ pub(crate) fn print_effect(
                     push_stmt_line(
                         out,
                         indent,
-                        &format!("prompt {literal}{using}{requires}{binding}{timeout}"),
+                        &format!("prompt {literal}{returns}{using}{requires}{binding}{timeout}"),
                     );
                     return;
                 }
@@ -270,7 +278,7 @@ pub(crate) fn print_effect(
             push_stmt_line(
                 out,
                 indent,
-                &format!("\"\"\"{using}{requires}{binding}{timeout}"),
+                &format!("\"\"\"{returns}{using}{requires}{binding}{timeout}"),
             );
             return;
         }
