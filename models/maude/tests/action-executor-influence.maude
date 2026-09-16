@@ -1,0 +1,19 @@
+load ../action-executor-influence.maude
+search [1] in WHIPPLESCRIPT-ACTION-EXECUTOR-INFLUENCE : check(public, false) =>* allowed .
+search [1] in WHIPPLESCRIPT-ACTION-EXECUTOR-INFLUENCE : check(alias(provider), false) =>* denied .
+search [1] in WHIPPLESCRIPT-ACTION-EXECUTOR-INFLUENCE : check(endorse(provider), true) =>* allowed .
+search [1] in WHIPPLESCRIPT-ACTION-EXECUTOR-INFLUENCE : check(alias(provider), false) =>* allowed .
+search [1] in WHIPPLESCRIPT-ACTION-EXECUTOR-INFLUENCE-LOST : check(alias(provider), false) =>* allowed .
+search [1] in WHIPPLESCRIPT-ACTION-EXECUTOR-INFLUENCE : check(provider, true) =>* allowed .
+search [1] in WHIPPLESCRIPT-ACTION-EXECUTOR-INFLUENCE-LOST : check(provider, true) =>* allowed .
+search [1] in WHIPPLESCRIPT-ACTION-EXECUTOR-INFLUENCE : check(endorse(provider), false) =>* allowed .
+search [1] in WHIPPLESCRIPT-ACTION-EXECUTOR-INFLUENCE-LOST : check(endorse(provider), false) =>* allowed .
+search [1] in WHIPPLESCRIPT-ACTION-EXECUTOR-INFLUENCE : check(selected(provider, endorse(provider)), true) =>* allowed .
+search [1] in WHIPPLESCRIPT-ACTION-EXECUTOR-INFLUENCE-LOST : check(selected(provider, endorse(provider)), true) =>* allowed .
+search [1] in WHIPPLESCRIPT-ACTION-EXECUTOR-INFLUENCE : check(declassify(provider), true) =>* allowed .
+search [1] in WHIPPLESCRIPT-ACTION-EXECUTOR-INFLUENCE-LOST : check(declassify(provider), true) =>* allowed .
+search [1] in WHIPPLESCRIPT-ACTION-EXECUTOR-INFLUENCE : check(project(provider, public, false), false) =>* denied .
+search [1] in WHIPPLESCRIPT-ACTION-EXECUTOR-INFLUENCE : check(project(provider, public, false), false) =>* allowed .
+search [1] in WHIPPLESCRIPT-ACTION-EXECUTOR-INFLUENCE : check(project(provider, public, true), false) =>* allowed .
+search [1] in WHIPPLESCRIPT-ACTION-EXECUTOR-INFLUENCE : check(project(public, provider, true), false) =>* denied .
+quit

@@ -1,0 +1,13 @@
+load ../action-case-types.maude
+search [1] in WHIPPLESCRIPT-ACTION-CASE-TYPES : select(ticket, validTicket, false) =>* ticketArm .
+search [1] in WHIPPLESCRIPT-ACTION-CASE-TYPES : select(ticket, spoofedStatus, false) =>* ticketArm .
+search [1] in WHIPPLESCRIPT-ACTION-CASE-TYPES : select(ticket, spoofedStatus, false) =>* otherArm .
+search [1] in WHIPPLESCRIPT-ACTION-CASE-FORGED : select(ticket, spoofedStatus, false) =>* otherArm .
+search [1] in WHIPPLESCRIPT-ACTION-CASE-TYPES : select(ticket, invalidTicket, true) =>* fallback .
+search [1] in WHIPPLESCRIPT-ACTION-CASE-UNCHECKED : select(ticket, invalidTicket, true) =>* fallback .
+search [1] in WHIPPLESCRIPT-ACTION-CASE-TYPES : select(absent, validTicket, false) =>* ticketArm .
+search [1] in WHIPPLESCRIPT-ACTION-CASE-TYPES : select(ambiguous, validTicket, false) =>* ticketArm .
+search [1] in WHIPPLESCRIPT-ACTION-CASE-UNTYPED : select(ambiguous, validTicket, false) =>* ticketArm .
+search [1] in WHIPPLESCRIPT-ACTION-CASE-TYPES : decode(true) =>* decoded .
+search [1] in WHIPPLESCRIPT-ACTION-CASE-TYPES : decode(false) =>* decoded .
+search [1] in WHIPPLESCRIPT-ACTION-CASE-INCOMPLETE : decode(false) =>* decoded .

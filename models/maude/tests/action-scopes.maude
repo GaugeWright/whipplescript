@@ -1,0 +1,86 @@
+load ../action-scopes.maude
+
+--- Two independent operations can settle in either order (both witnesses).
+search [1] in WHIPPLESCRIPT-ACTION-SCOPES : independent =>*
+  scope(call1, active, absent, closed, ok, pending, noRequest) .
+search [1] in WHIPPLESCRIPT-ACTION-SCOPES : independent =>*
+  scope(call1, active, absent, closed, pending, ok, noRequest) .
+search [1] in WHIPPLESCRIPT-ACTION-SCOPES : independent =>*
+  scope(call1, succeeded, value, closed, ok, ok, noRequest) .
+
+--- Value readiness cannot abandon an owned sibling. The weakened rule does.
+search [1] in WHIPPLESCRIPT-ACTION-SCOPES : prematureValue =>*
+  scope(call1, succeeded, value, closed, ok, pending, noRequest) .
+search [1] in WHIPPLESCRIPT-ACTION-EAGER-RETURN : prematureValue =>*
+  scope(call1, succeeded, value, closed, ok, pending, noRequest) .
+
+--- A branch the graph marked unselected adds no settlement debt.
+search [1] in WHIPPLESCRIPT-ACTION-SCOPES :
+  scope(call1, active, absent, closed, ok, skipped, noRequest) =>*
+  scope(call1, succeeded, value, closed, ok, skipped, noRequest) .
+
+--- An unselected VALUE cannot be treated as a result or an optional absence.
+search [1] in WHIPPLESCRIPT-ACTION-SCOPES :
+  scope(call1, active, absent, closed, skipped, ok, noRequest) =>*
+  scope(call1, succeeded, value, closed, skipped, ok, noRequest) .
+
+--- Settlement alone cannot discharge unexecuted continuation debt.
+search [1] in WHIPPLESCRIPT-ACTION-SCOPES :
+  scope(call1, active, value, open, ok, ok, noRequest) =>*
+  scope(call1, succeeded, value, open, ok, ok, noRequest) .
+search [1] in WHIPPLESCRIPT-ACTION-EAGER-PLAN-CLOSE :
+  scope(call1, active, value, open, ok, ok, noRequest) =>*
+  scope(call1, succeeded, value, open, ok, ok, noRequest) .
+
+--- Request/acknowledgement: the exact target has NO acknowledgement evidence.
+search [1] in WHIPPLESCRIPT-ACTION-SCOPES : prematureValue =>*
+  scope(call1, succeeded, value, closed, ok, recovered(cancelled), requested) .
+search [1] in WHIPPLESCRIPT-ACTION-CANCEL-IS-ACK : prematureValue =>*
+  scope(call1, succeeded, value, closed, ok, recovered(cancelled), requested) .
+search [1] in WHIPPLESCRIPT-ACTION-SCOPES : prematureValue =>*
+  scope(call1, succeeded, value, closed, ok, recovered(cancelled), requested)
+  acknowledged(call1) .
+
+--- Uncertain external work is still owned, even after a return expression.
+search [1] in WHIPPLESCRIPT-ACTION-SCOPES : prematureValue =>*
+  scope(call1, succeeded, value, closed, ok, unknown, requested) C:Cfg .
+
+--- Both concurrent failures survive propagation and explicit local recovery.
+search [1] in WHIPPLESCRIPT-ACTION-SCOPES : twoFailures =>*
+  scope(call1, rejected, absent, closed, failed, timedOut, noRequest) .
+search [1] in WHIPPLESCRIPT-ACTION-SCOPES : twoFailures =>*
+  scope(call1, succeeded, value, closed, recovered(failed), recovered(timedOut), noRequest) .
+search [1] in WHIPPLESCRIPT-ACTION-SCOPES : twoFailures =>*
+  scope(call1, rejected, absent, closed, failed, skipped, noRequest) .
+search [1] in WHIPPLESCRIPT-ACTION-LOSES-CAUSE : twoFailures =>*
+  scope(call1, rejected, absent, closed, failed, skipped, noRequest) .
+search [1] in WHIPPLESCRIPT-ACTION-SCOPES : twoFailures =>*
+  scope(call1, succeeded, value, closed, failed, timedOut, noRequest) .
+
+--- Each action completes once: settlement cells cannot manufacture a second.
+search [1] in WHIPPLESCRIPT-ACTION-SCOPES : independent =>*
+  scope(call1, succeeded, value, closed, A:Status, B:Status, C:Cancel)
+  scope(call1, succeeded, value, closed, D:Status, E:Status, F:Cancel) REST:Cfg .
+
+--- Two call sites and two firings are independent even with pending siblings.
+search [1] in WHIPPLESCRIPT-ACTION-SCOPES :
+  scope(call1, active, value, closed, ok, ok, noRequest)
+  scope(call2, active, absent, closed, pending, pending, noRequest)
+  scope(firing2, active, absent, closed, pending, pending, noRequest) =>*
+  scope(call1, succeeded, value, closed, ok, ok, noRequest)
+  scope(call2, active, absent, closed, pending, pending, noRequest)
+  scope(firing2, active, absent, closed, pending, pending, noRequest) .
+
+--- Returning a child's result joins the child's owned work transitively.
+search [1] in WHIPPLESCRIPT-ACTION-SCOPES :
+  scope(call1, active, absent, closed, waiting(child), ok, noRequest)
+  scope(child, active, value, closed, ok, pending, noRequest) =>*
+  scope(call1, succeeded, value, closed, ok, ok, noRequest)
+  scope(child, succeeded, value, closed, ok, ok, noRequest) .
+search [1] in WHIPPLESCRIPT-ACTION-SCOPES :
+  scope(call1, active, absent, closed, waiting(child), ok, noRequest)
+  scope(child, active, value, closed, ok, pending, noRequest) =>*
+  scope(call1, succeeded, value, closed, ok, ok, noRequest)
+  scope(child, active, value, closed, ok, pending, noRequest) .
+
+quit

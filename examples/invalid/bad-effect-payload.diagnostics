@@ -3,7 +3,7 @@ warning[effect.unhandled_failure]: effect `review`'s failure is unhandled in rul
    |
 30 |   coerce reviewPayload(
    |   ^^^^^^^^^^^^^^^^^^^^^
-   = help: handle it with `after review fails { … }` (typed failure or recovery) or observe every outcome with `after review completes`
+   = help: handle it with `after review fails { … }` (typed failure or recovery), observe every outcome with `after review completes`, or add one `on failure as problem { … }` handler to the rule
 error[expr.untyped_object_literal]: rule `bad_coerce` uses an object literal without an expected object or map type
    --> examples/invalid/bad-effect-payload.whip:28:27
    |

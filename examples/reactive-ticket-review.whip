@@ -1,0 +1,162 @@
+use std.agent
+use std.coercion
+
+@service
+workflow ReactiveTicketReview
+
+class Ticket {
+  id string
+  mode "investigate" | "skip"
+}
+
+class Investigation {
+  summary string
+}
+
+class Policy {
+  allowed bool
+}
+
+class Review {
+  id string
+  summary string
+  allowed bool
+}
+
+class ReviewFailure {
+  reason string
+}
+
+class AuditReceipt {
+  label string
+}
+
+agent investigator {
+  provider fixture
+  profile "repo-reader"
+  capacity 2
+}
+
+coerce parseInvestigation(text string) -> Investigation {
+  prompt "Parse {{ text }}. {{ ctx.output_format }}"
+}
+
+coerce assessPolicy(id string) -> Policy {
+  prompt "Assess {{ id }}. {{ ctx.output_format }}"
+}
+
+coerce audit(label string) -> AuditReceipt {
+  prompt "Audit {{ label }}. {{ ctx.output_format }}"
+}
+
+action investigate(ticket Ticket) -> Investigation {
+  tell investigator "Investigate {{ ticket.id }}" as turn
+  after turn succeeds {
+    coerce parseInvestigation(turn) as investigation
+    after investigation succeeds {
+      return investigation
+    }
+  }
+}
+
+action assess_policy(ticket Ticket) -> Policy {
+  coerce assessPolicy(ticket.id) as policy
+  after policy succeeds {
+    return policy
+  }
+  after policy fails as problem {
+    return { allowed false }
+  }
+}
+
+action review(ticket Ticket) -> Review ! ReviewFailure {
+  case ticket.mode {
+    "investigate" => {
+      during true {
+        investigate(ticket) as investigation
+        assess_policy(ticket) as policy
+        return {
+          id ticket.id
+          summary investigation.summary
+          allowed policy.allowed
+        }
+      } on lapse {
+        fail { reason "review window closed" }
+      }
+    }
+    "skip" => {
+      return {
+        id ticket.id
+        summary "skipped"
+        allowed false
+      }
+    }
+  }
+}
+
+@external
+rule process
+  when Ticket as ticket
+  when investigator is available
+=> {
+  review(ticket) as reviewed
+  then first <- coerce audit("first")
+  then second <- coerce audit("second")
+  done ticket -> record Review from reviewed {
+    id
+    summary
+    allowed
+  }
+}
+
+test "two ticket reviews compose" {
+  workflow ReactiveTicketReview
+
+  given fact Ticket {
+    id "T1"
+    mode "investigate"
+  }
+  given fact Ticket {
+    id "T2"
+    mode "investigate"
+  }
+
+  stub agent investigator succeeds
+  stub coerce parseInvestigation returns {
+    summary "investigated"
+  }
+  stub coerce assessPolicy returns {
+    allowed true
+  }
+  stub coerce audit returns {
+    label "recorded"
+  }
+
+  run until idle
+
+  expect rule process fired
+  expect Review count where allowed == true is 2
+}
+
+test "policy failure recovers without failing independent work" {
+  workflow ReactiveTicketReview
+
+  given fact Ticket {
+    id "T3"
+    mode "investigate"
+  }
+
+  stub agent investigator succeeds
+  stub coerce parseInvestigation returns {
+    summary "investigated"
+  }
+  stub coerce assessPolicy fails
+  stub coerce audit returns {
+    label "recorded"
+  }
+
+  run until idle
+
+  expect effect schema.coerce failed
+  expect Review count where allowed == false is 1
+}

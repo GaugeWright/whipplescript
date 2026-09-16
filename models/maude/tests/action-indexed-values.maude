@@ -1,0 +1,14 @@
+load ../action-indexed-values.maude
+search [1] in WHIPPLESCRIPT-ACTION-INDEXED-VALUES : lookup(present, present) =>* value .
+search [1] in WHIPPLESCRIPT-ACTION-INDEXED-VALUES : lookup(missing, present) =>* absent .
+search [1] in WHIPPLESCRIPT-ACTION-INDEXED-VALUES : lookup(pending, present) =>* absent .
+search [1] in WHIPPLESCRIPT-ACTION-INDEXED-VALUES-LOST : lookup(pending, present) =>* absent .
+search [1] in WHIPPLESCRIPT-ACTION-INDEXED-VALUES : lookup(missing, pending) =>* absent .
+search [1] in WHIPPLESCRIPT-ACTION-INDEXED-VALUES-LOST : lookup(missing, pending) =>* absent .
+search [1] in WHIPPLESCRIPT-ACTION-INDEXED-VALUES : lookup(missing, failed) =>* absent .
+search [1] in WHIPPLESCRIPT-ACTION-INDEXED-VALUES-LOST : lookup(missing, failed) =>* absent .
+search [1] in WHIPPLESCRIPT-ACTION-INDEXED-VALUES : lookup(present, wrongKey) =>* absent .
+search [1] in WHIPPLESCRIPT-ACTION-INDEXED-VALUES-LOST : lookup(present, wrongKey) =>* absent .
+search [1] in WHIPPLESCRIPT-ACTION-INDEXED-VALUES : resultType(false) =>* optional .
+search [1] in WHIPPLESCRIPT-ACTION-INDEXED-VALUES : selectedSubject(false, true) =>* false .
+quit

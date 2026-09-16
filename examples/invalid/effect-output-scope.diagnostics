@@ -3,7 +3,7 @@ warning[effect.unhandled_failure]: effect `claim`'s failure is unhandled in rule
    |
 14 |   claim item as claim
    |   ^^^^^^^^^^^^^^^^^^^
-   = help: handle it with `after claim fails { … }` (typed failure or recovery) or observe every outcome with `after claim completes`
+   = help: handle it with `after claim fails { … }` (typed failure or recovery), observe every outcome with `after claim completes`, or add one `on failure as problem { … }` handler to the rule
 error[effect.output_scope_leak]: rule `bad_scope` uses effect output `claim` outside a matching `after claim ...` block
    --> examples/invalid/effect-output-scope.whip:16:3
    |

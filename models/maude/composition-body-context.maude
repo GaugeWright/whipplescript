@@ -1,0 +1,17 @@
+--- Real source context and every rule precede body inventory; inventory is not admission.
+mod WHIPPLESCRIPT-COMPOSITION-BODY-CONTEXT is
+  protecting BOOL .
+  sort Stage .
+  ops invalid inventoried admitted : -> Stage [ctor] .
+  op analyze : Bool Bool Bool -> Stage .
+  vars R E : Bool .
+  eq analyze(false, R, E) = invalid .
+  eq analyze(true, false, E) = invalid .
+  eq analyze(true, true, false) = invalid .
+  eq analyze(true, true, true) = inventoried .
+endm
+mod WHIPPLESCRIPT-COMPOSITION-BODY-CONTEXT-LOST is
+  including WHIPPLESCRIPT-COMPOSITION-BODY-CONTEXT .
+  rl [omit-obligation] : invalid => inventoried .
+  rl [confuse-admission] : inventoried => admitted .
+endm

@@ -1,0 +1,37 @@
+--- Transitive helper footprints must reach the owning trigger-consumption
+--- check. This bounded model does not grant pacing from a call boundary.
+mod WHIPPLESCRIPT-ACTION-FACT-FLOW is
+ protecting BOOL .
+ sorts Body Footprint Check .
+ ops idle effect write consume dataDone : -> Body [ctor] .
+ op call : Body -> Body [ctor] .
+ op pair : Body Body -> Body [ctor] .
+ op fp : Bool Bool Bool -> Footprint [ctor] .
+ op footprint : Body -> Footprint .
+ op merge : Footprint Footprint -> Footprint .
+ vars A B : Body .
+ vars E W C F X D : Bool .
+ eq footprint(idle) = fp(false, false, false) .
+ eq footprint(effect) = fp(true, false, false) .
+ eq footprint(write) = fp(false, true, false) .
+ eq footprint(consume) = fp(false, false, true) .
+ --- Invalid subject requirements stop before this consumer. Data is never a
+ --- substitute for a discharged original-subject requirement.
+ eq footprint(dataDone) = fp(false, false, false) .
+ eq footprint(call(A)) = footprint(A) .
+ eq footprint(pair(A, B)) = merge(footprint(A), footprint(B)) .
+ eq merge(fp(E,W,C),fp(F,X,D)) = fp(E or F,W or X,C or D) .
+ op check : Footprint -> Check [ctor] .
+ ops accepted refused : -> Check [ctor] .
+ crl [preserved-trigger] : check(fp(E,W,C)) => refused if E and W and not C .
+ crl [no-preserved-effectful-trigger] : check(fp(E,W,C)) => accepted if not (E and W and not C) .
+endm
+mod WHIPPLESCRIPT-ACTION-FACT-FLOW-SKIP-CALL is
+ including WHIPPLESCRIPT-ACTION-FACT-FLOW .
+ op weak : Body -> Check .
+ eq weak(call(A:Body)) = check(fp(false,false,false)) .
+endm
+mod WHIPPLESCRIPT-ACTION-FACT-FLOW-INVENT-CONSUME is
+ including WHIPPLESCRIPT-ACTION-FACT-FLOW .
+ rl [parameter-type-is-not-consumption] : check(fp(true,true,false)) => accepted .
+endm

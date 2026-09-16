@@ -1,0 +1,36 @@
+mod WHIPPLESCRIPT-ACTION-RESOURCE-IDENTITY is
+  protecting BOOL .
+  sorts Value Resource State .
+  ops queueA queueB leaseA : -> Resource [ctor] .
+  op item : Resource -> Value [ctor] .
+  ops claim lease : Resource -> Value [ctor] .
+  ops alias rebuild transform : Value -> Value [ctor] .
+  op choice : Value Value -> Value [ctor] .
+  op validItem : Value -> Bool .
+  var R : Resource . vars X Y : Value .
+  eq validItem(item(R)) = true .
+  eq validItem(claim(R)) = true .
+  eq validItem(lease(R)) = false .
+  eq validItem(alias(X)) = validItem(X) .
+  eq validItem(rebuild(X)) = false .
+  eq validItem(transform(X)) = false .
+  eq validItem(choice(X, Y)) = validItem(X) and validItem(Y) .
+  op finish : Value -> State [ctor] .
+  ops allowed refused trackerRenewed leaseRenewed : -> State [ctor] .
+  op renew : Value -> State [ctor] .
+  rl [renew-alias] : renew(alias(X)) => renew(X) .
+  rl [renew-claim] : renew(claim(R)) => trackerRenewed .
+  rl [renew-lease] : renew(lease(R)) => leaseRenewed .
+  rl [renew-item] : renew(item(R)) => refused .
+  crl [original] : finish(X) => allowed if validItem(X) .
+  crl [invalid] : finish(X) => refused if not validItem(X) .
+endm
+mod WHIPPLESCRIPT-ACTION-RESOURCE-IDENTITY-LOST is
+  including WHIPPLESCRIPT-ACTION-RESOURCE-IDENTITY .
+  vars X Y : Value . var R : Resource .
+  rl [wrong-renew-kind] : renew(claim(R)) => leaseRenewed .
+  rl [item-as-claim] : renew(item(R)) => trackerRenewed .
+  rl [rebuilt] : finish(rebuild(X)) => finish(X) .
+  rl [influence-as-identity] : finish(transform(X)) => finish(X) .
+  rl [first-only] : finish(choice(X, Y)) => finish(X) .
+endm

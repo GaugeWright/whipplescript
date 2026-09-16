@@ -2,9 +2,64 @@
 
 use super::*;
 
+fn compile_legacy_program(source: &str) -> CompileOutput {
+    crate::execution_semantics::compile_recorded_program_with_root(
+        source,
+        None,
+        ExecutionSemantics::LegacyActionChainsV1,
+    )
+}
+
 #[test]
 fn parser_scaffold_links_to_core() {
     assert_eq!(parser_stage(), "release");
+}
+
+#[test]
+fn typed_regions_compile_after_full_static_checking() {
+    let valid = "workflow Demo\naction held(ready bool) -> int ! string { during ready { return 1 } on lapse { fail \"lapsed\" } }\nrule run when started => { }";
+    let compiled = compile_program(valid);
+    assert!(
+        compiled.diagnostics.is_empty(),
+        "{:?}",
+        compiled.diagnostics
+    );
+    assert!(compiled.ir.is_some());
+    assert!(compiled
+        .typed_actions
+        .as_ref()
+        .is_some_and(|actions| actions.contains_key("run")));
+
+    let missing = valid.replace("on lapse { fail \"lapsed\" }", "on lapse { }");
+    let diagnostics = compile_program(&missing).diagnostics;
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+    assert!(diagnostics[0]
+        .message
+        .contains("successful path without a return when during `ready` = lapse at entry"));
+
+    let root = "workflow Demo\naction helper() -> null { return null }\nrule run when started => { during true { helper() } on lapse { } }";
+    let compiled = compile_program(root);
+    assert!(
+        compiled.diagnostics.is_empty(),
+        "{:?}",
+        compiled.diagnostics
+    );
+    assert!(compiled.ir.is_some());
+
+    let nested = "workflow Demo\naction nested(outer bool, inner bool) -> int ! string { during outer { during inner { return 1 } on lapse { fail \"inner\" } } on lapse { fail \"outer\" } }\nrule run when started => { nested(true, true) as value }";
+    let compiled = compile_program(nested);
+    assert!(
+        compiled.diagnostics.is_empty(),
+        "{:?}",
+        compiled.diagnostics
+    );
+    let regions = compiled.typed_actions.unwrap()["run"]
+        .plan
+        .nodes
+        .iter()
+        .filter(|node| matches!(node.kind, action_plan::NodeKind::Region { .. }))
+        .count();
+    assert_eq!(regions, 2, "nested regions remain in the managed plan");
 }
 
 #[test]
@@ -845,7 +900,7 @@ fn accepted_rule_body_matrix_has_no_silent_noops() {
         let effect = b1g_effect(&rule, kind, binding, case_name);
         match case_name {
             "send" => {
-                assert_eq!(effect.resource.as_deref(), Some("ops_room"));
+                assert_eq!(effect.resources, ["ops_room"]);
                 assert_eq!(
                     effect
                         .construct_use
@@ -855,10 +910,10 @@ fn accepted_rule_body_matrix_has_no_silent_noops() {
                 );
             }
             "notify" => {
-                assert_eq!(effect.resource.as_deref(), Some("signal:deploy.finished"));
+                assert_eq!(effect.resources, ["signal:deploy.finished"]);
             }
             "file_read" | "file_write" | "file_import" | "file_export" => {
-                assert_eq!(effect.resource.as_deref(), Some("docs"));
+                assert_eq!(effect.resources, ["docs"]);
             }
             _ => {}
         }
@@ -5386,7 +5441,7 @@ fn action_declaration_parses_and_is_inert_until_expansion() {
     // body) and lowers away cleanly (inert until call-site expansion in
     // slice 2), so a program declaring an unused action compiles with no
     // diagnostics.
-    let compiled = compile_program(
+    let compiled = crate::execution_semantics::compile_recorded_program_with_root(
         r#"
 workflow A
 
@@ -5414,6 +5469,8 @@ rule go
   }
 }
 "#,
+        None,
+        ExecutionSemantics::LegacyActionChainsV1,
     );
     assert_eq!(
         compiled.diagnostics,
@@ -6730,6 +6787,17 @@ apply One<R> as Thing {
 rule r
   when started
 => { complete result { ok true } }
+"#,
+        ),
+        (
+            "parameterized view declarations are not allowed in pattern bodies",
+            r#"
+workflow P
+pattern Reusable<T> {
+  view identity(value int) -> int { return value }
+}
+apply Reusable<int> as Thing { }
+rule run when started => { timer 1s as wait }
 "#,
         ),
     ];
@@ -10774,6 +10842,14 @@ fn invalid_fixtures_have_actionable_diagnostics() {
             include_str!("../../../../examples/invalid/bad-pattern-assertion.whip"),
         ),
         (
+            "bad-parameterized-views",
+            include_str!("../../../../examples/invalid/bad-parameterized-views.whip"),
+        ),
+        (
+            "bad-managed-success-alias",
+            include_str!("../../../../examples/invalid/bad-managed-success-alias.whip"),
+        ),
+        (
             "bounded-unmeasured-ring",
             include_str!("../../../../examples/invalid/bounded-unmeasured-ring.whip"),
         ),
@@ -11517,6 +11593,7 @@ rule r
     // assertion above passing.
     let mislabelled = CompileOutput {
         ir: None,
+        typed_actions: None,
         diagnostics: vec![Diagnostic::warning(
             diagnostic_code!("parse.unexpected_token"),
             SourceSpan { start: 0, end: 1 },
@@ -11530,6 +11607,7 @@ rule r
     );
     let unblocked = CompileOutput {
         ir: None,
+        typed_actions: None,
         diagnostics: Vec::new(),
         warnings: vec![Diagnostic::error(
             diagnostic_code!("parse.unexpected_token"),
@@ -12720,28 +12798,6 @@ rule j
 "#,
         ),
         (
-            "the `during` region in rule `j` contains no progression",
-            r#"
-workflow RegionEmpty
-use std.ingress
-
-output result R
-class R { v string }
-signal go.now { x string }
-
-rule j
-  when go.now as g
-=> {
-  during quiet {
-    record R { v "x" }
-  } on lapse {
-    complete result { v "lapsed" }
-  }
-  complete result { v "ok" }
-}
-"#,
-        ),
-        (
             "rule `keep` declassifies into `Ghost`, which is not a declared class",
             r#"
 use std.custody
@@ -12859,6 +12915,33 @@ test "malformed given value" {
                 .collect::<Vec<_>>()
         );
     }
+}
+
+#[test]
+fn recorded_region_without_progression_keeps_legacy_refusal() {
+    let source = r#"
+workflow RegionEmpty
+use std.ingress
+
+output result R
+class R { v string }
+signal go.now { x string }
+
+rule j
+  when go.now as g
+=> {
+  during quiet {
+    record R { v "x" }
+  } on lapse {
+    complete result { v "lapsed" }
+  }
+  complete result { v "ok" }
+}
+"#;
+    let compiled = compile_legacy_program(source);
+    assert!(compiled.diagnostics.iter().any(|diagnostic| {
+        diagnostic.message == "the `during` region in rule `j` contains no progression"
+    }));
 }
 
 #[test]
@@ -13193,7 +13276,7 @@ fn rejects_effect_output_outside_after_scope() {
         .contains("outside a matching `after claim ...` block"));
 }
 
-/// DR-0043 Decision 5: a `during`/`until` region compiles; the canonical
+/// Recorded DR-0043 semantics: a `during`/`until` region compiles; the canonical
 /// IR body is the condition-HOLDS splice (no region syntax left), and the
 /// metadata carries the removed/lapsed variants and the region effects
 /// with their level-1 scopes.
@@ -13233,7 +13316,7 @@ rule ship
   }
 }
 "#;
-    let compiled = compile_program(source);
+    let compiled = compile_legacy_program(source);
     assert!(
         compiled.diagnostics.is_empty(),
         "region must compile: {:?}",
@@ -13309,7 +13392,7 @@ rule ship
         )
     };
     let bad_path = |arm: &str| {
-        compile_program(&program(arm))
+        compile_legacy_program(&program(arm))
             .diagnostics
             .into_iter()
             .find(|d| d.message.contains("invalid field path"))
@@ -13318,7 +13401,7 @@ rule ship
 
     // Accepted: a step, a step's status, and a field of a step's own payload.
     for arm in ["got.plan.verdict", "got.steps.plan"] {
-        let compiled = compile_program(&program(arm));
+        let compiled = compile_legacy_program(&program(arm));
         assert!(compiled.ir.is_some(), "{:?}", compiled.diagnostics);
         assert_eq!(bad_path(arm), None, "`{arm}` must resolve");
     }
@@ -13359,7 +13442,7 @@ rule ship
   }
 }
 "#;
-    let compiled = compile_program(source);
+    let compiled = compile_legacy_program(source);
     assert!(
         compiled
             .diagnostics
@@ -13417,7 +13500,7 @@ rule ship
         )
     };
     let narrowed = |source: &str| {
-        compile_program(source)
+        compile_legacy_program(source)
             .diagnostics
             .into_iter()
             .any(|d| d.message.contains("reads conditional field `e.region`"))
@@ -13436,7 +13519,7 @@ rule ship
     )));
     // Inside the matching `deploy` arm the same read is legal, and the region's
     // enclosing arm is the context the lapse arm inherits.
-    let inside = compile_program(&program("        fail error { reason e.region }", true));
+    let inside = compile_legacy_program(&program("        fail error { reason e.region }", true));
     assert!(inside.ir.is_some(), "{:?}", inside.diagnostics);
     assert!(!narrowed(&program(
         "        fail error { reason e.region }",
@@ -13444,7 +13527,7 @@ rule ship
     )));
 }
 
-/// v1 limit: one region per rule; the second draws a spanned error.
+/// Recorded DR-0043 limit: one region per rule; the second draws a spanned error.
 #[test]
 fn two_regions_in_one_rule_rejected() {
     let source = r#"
@@ -13492,7 +13575,7 @@ rule go
   }
 }
 "#;
-    let compiled = compile_program(source);
+    let compiled = compile_legacy_program(source);
     assert!(
         compiled
             .diagnostics
@@ -13540,7 +13623,7 @@ rule go
   }
 }
 "#;
-    let compiled = compile_program(source);
+    let compiled = compile_legacy_program(source);
     assert!(
         compiled
             .diagnostics
@@ -16859,6 +16942,342 @@ rule r
     );
 }
 
+#[test]
+fn typed_action_failure_warnings_follow_call_boundaries() {
+    fn compile(action_tail: &str, rule_body: &str) -> CompileOutput {
+        compile_program(&format!(
+            r#"workflow TypedWarnings
+agent reader {{ provider mock }}
+output result Done
+class Done {{ ok bool }}
+action work() -> null {{
+  tell reader as turn "go"
+  {action_tail}
+}}
+rule run when started => {{
+  {rule_body}
+}}"#
+        ))
+    }
+
+    let unhandled = compile(
+        "return null",
+        "work() as attempt\n  complete result { ok true }",
+    );
+    assert!(
+        unhandled.diagnostics.is_empty(),
+        "{:?}",
+        unhandled.diagnostics
+    );
+    let warnings: Vec<_> = unhandled
+        .warnings
+        .iter()
+        .filter(|warning| warning.code.as_str() == "effect.unhandled_failure")
+        .collect();
+    assert_eq!(warnings.len(), 1, "{:?}", unhandled.warnings);
+    assert!(warnings[0]
+        .message
+        .contains("`turn`'s failure is unhandled"));
+    assert_eq!(warnings[0].related.len(), 1);
+    assert!(warnings[0].related[0].message.contains("action `work`"));
+
+    let locally_observed = compile(
+        "after turn fails { return null }\n  after turn succeeds { return null }",
+        "work() as attempt\n  complete result { ok true }",
+    );
+    assert!(
+        locally_observed.diagnostics.is_empty(),
+        "{:?}",
+        locally_observed.diagnostics
+    );
+    assert!(locally_observed
+        .warnings
+        .iter()
+        .all(|warning| warning.code.as_str() != "effect.unhandled_failure"));
+
+    let action_handler = compile(
+        "after turn succeeds { return null }\n  on failure as problem { return null }",
+        "work() as attempt\n  complete result { ok true }",
+    );
+    assert!(action_handler.diagnostics.is_empty());
+    assert!(action_handler
+        .warnings
+        .iter()
+        .all(|warning| warning.code.as_str() != "effect.unhandled_failure"));
+
+    let rule_handler = compile(
+        "return null",
+        "work() as attempt\n  after attempt succeeds { complete result { ok true } }\n  on failure as problem { complete result { ok false } }",
+    );
+    assert!(rule_handler.diagnostics.is_empty());
+    assert!(rule_handler
+        .warnings
+        .iter()
+        .all(|warning| warning.code.as_str() != "effect.unhandled_failure"));
+
+    let handler_owned_failure = compile_program(
+        r#"workflow HandlerOwnedWarning
+agent reader { provider mock }
+output result Done
+class Done { ok bool }
+action selects_typed_semantics() -> null { return null }
+rule run when started => {
+  tell reader as primary "go"
+  after primary succeeds { complete result { ok true } }
+  on failure as problem { tell reader as reporting "report" }
+}"#,
+    );
+    assert!(handler_owned_failure.diagnostics.is_empty());
+    let warnings: Vec<_> = handler_owned_failure
+        .warnings
+        .iter()
+        .filter(|warning| warning.code.as_str() == "effect.unhandled_failure")
+        .collect();
+    assert_eq!(warnings.len(), 1, "{:?}", handler_owned_failure.warnings);
+    assert!(warnings[0]
+        .message
+        .contains("`reporting`'s failure is unhandled"));
+
+    let boundary_observed = compile_program(
+        r#"workflow TypedBoundaryWarning
+agent reader { provider mock }
+output result Done
+class Done { ok bool }
+action work() -> null {
+  tell reader as turn "go"
+  return null
+}
+action wrapper() -> null {
+  work() as attempt
+  after attempt fails { return null }
+  after attempt succeeds { return null }
+}
+rule run when started => {
+  wrapper() as result
+  complete result { ok true }
+}"#,
+    );
+    assert!(
+        boundary_observed.diagnostics.is_empty(),
+        "{:?}",
+        boundary_observed.diagnostics
+    );
+    assert!(boundary_observed
+        .warnings
+        .iter()
+        .all(|warning| warning.code.as_str() != "effect.unhandled_failure"));
+
+    let repeated = compile(
+        "return null",
+        "work() as first\n  work() as second\n  complete result { ok true }",
+    );
+    assert!(
+        repeated.diagnostics.is_empty(),
+        "{:?}",
+        repeated.diagnostics
+    );
+    let warnings: Vec<_> = repeated
+        .warnings
+        .iter()
+        .filter(|warning| warning.code.as_str() == "effect.unhandled_failure")
+        .collect();
+    assert_eq!(warnings.len(), 1, "{:?}", repeated.warnings);
+    assert_eq!(warnings[0].related.len(), 2);
+}
+
+#[test]
+fn typed_action_metadata_projects_continuation_and_selector_edges() {
+    let compiled = compile_program(
+        r#"@service
+workflow TypedGraph
+class Trigger { enabled bool }
+agent reader { provider mock }
+action work() -> null {
+  tell reader as first "one"
+  after first succeeds {
+    tell reader as second "two"
+    after second succeeds { return null }
+  }
+  after first fails { return null }
+}
+
+action follow() -> null {
+  work() as attempt
+  after attempt succeeds {
+    tell reader as third "three"
+    after third succeeds { return null }
+  }
+  after attempt fails { return null }
+}
+rule run when Trigger as trigger => {
+  case trigger.enabled {
+    true => { follow() as result }
+    false => { }
+  }
+}"#,
+    );
+    assert!(
+        compiled.diagnostics.is_empty(),
+        "{:?}",
+        compiled.diagnostics
+    );
+    let ir = compiled.ir.expect("typed IR");
+    let metadata = &ir.rules[0].metadata;
+    let first = metadata
+        .effects
+        .iter()
+        .find(|effect| effect.binding.as_deref() == Some("first"))
+        .expect("first effect");
+    let second = metadata
+        .effects
+        .iter()
+        .find(|effect| effect.binding.as_deref() == Some("second"))
+        .expect("second effect");
+    let third = metadata
+        .effects
+        .iter()
+        .find(|effect| effect.binding.as_deref() == Some("third"))
+        .expect("third effect");
+    assert_eq!(
+        first.selected_by,
+        Some(("trigger.enabled".into(), "true".into()))
+    );
+    assert_eq!(second.selected_by, first.selected_by);
+    assert_eq!(third.selected_by, first.selected_by);
+    assert_eq!(second.after_arm, Some(("first".into(), "succeeds".into())));
+    assert_eq!(third.after_arm, Some(("attempt".into(), "succeeds".into())));
+    assert_eq!(metadata.dependencies.len(), 3);
+    for dependency in [
+        IrEffectDependency {
+            upstream: first.id.clone(),
+            predicate: DependencyPredicate::Succeeds,
+            downstream: second.id.clone(),
+        },
+        IrEffectDependency {
+            upstream: first.id.clone(),
+            predicate: DependencyPredicate::Succeeds,
+            downstream: third.id.clone(),
+        },
+        IrEffectDependency {
+            upstream: second.id.clone(),
+            predicate: DependencyPredicate::Succeeds,
+            downstream: third.id.clone(),
+        },
+    ] {
+        assert!(metadata.dependencies.contains(&dependency));
+    }
+}
+
+#[test]
+fn typed_action_metadata_preserves_composed_resource_identities() {
+    let compiled = compile_program(
+        r#"use std.tracker
+@service
+workflow TypedResources
+tracker jobs { provider builtin }
+tracker other { provider builtin }
+class Ticket { id string }
+lease slots { key Ticket slots 1 ttl 5m }
+action finish_it(item WorkItem) -> null {
+  claim item as held
+  after held succeeds {
+    finish held { summary "done" } as finished
+    return null
+  }
+  after held fails { return null }
+}
+action wrapper(item WorkItem) -> null {
+  finish_it(item) as result
+  return null
+}
+action choose(left WorkItem, right WorkItem, flag bool) -> WorkItem {
+  case flag {
+    true => { return left }
+    false => { return right }
+  }
+}
+rule direct when jobs has ready issue as item => {
+  wrapper(item) as result
+}
+rule alternatives
+  when jobs has ready issue as left
+  when other has ready issue as right
+=> {
+  choose(left, right, true) as selected
+  finish selected { summary "chosen" } as finished
+}
+rule lease_rule when Ticket as key => {
+  acquire slots for key until ttl as slot
+  renew slot as renewed
+}"#,
+    );
+    assert!(
+        compiled.diagnostics.is_empty(),
+        "{:?}",
+        compiled.diagnostics
+    );
+    let ir = compiled.ir.expect("typed IR");
+    let resources = |rule: &str, binding: &str| {
+        ir.rules
+            .iter()
+            .find(|candidate| candidate.name == rule)
+            .unwrap()
+            .metadata
+            .effects
+            .iter()
+            .find(|effect| effect.binding.as_deref() == Some(binding))
+            .unwrap()
+            .resources
+            .clone()
+    };
+    assert_eq!(resources("direct", "finished"), ["jobs"]);
+    assert_eq!(resources("alternatives", "finished"), ["jobs", "other"]);
+    assert_eq!(resources("lease_rule", "renewed"), ["resource:slots"]);
+    let renewed = ir
+        .rules
+        .iter()
+        .find(|rule| rule.name == "lease_rule")
+        .unwrap()
+        .metadata
+        .effects
+        .iter()
+        .find(|effect| effect.binding.as_deref() == Some("renewed"))
+        .unwrap();
+    assert_eq!(renewed.kind, IrEffectKind::LeaseRenew);
+}
+
+#[test]
+fn typed_action_resource_errors_report_the_definition_and_call_chain() {
+    let source = r#"@service
+workflow BadTypedResource
+class Ticket { queue string id string title string }
+action finish_it(item Ticket) -> null {
+  finish item { summary "done" } as finished
+  return null
+}
+rule run when Ticket as item => {
+  finish_it(item) as result
+}"#;
+    let compiled = compile_program(source);
+    let error = compiled
+        .diagnostics
+        .iter()
+        .find(|diagnostic| {
+            diagnostic
+                .message
+                .contains("requires one matching tracker trigger")
+        })
+        .expect("resource diagnostic");
+    assert!(source[error.span.start..error.span.end].contains("finish item"));
+    assert!(error
+        .related
+        .iter()
+        .any(|related| related.message == "action `finish_it` defined here"));
+    assert!(error
+        .related
+        .iter()
+        .any(|related| related.message == "call to action `finish_it`"));
+}
 #[test]
 fn lowers_turn_access_grants_onto_the_agent_tell_effect() {
     // `with access to <resource> { … }` on a tell lowers to `access_grants` on the
@@ -23316,7 +23735,11 @@ rule chained
 "#;
     let crlf = lf.replace('\n', "\r\n");
     for (label, source) in [("lf", lf.to_owned()), ("crlf", crlf.clone())] {
-        let compiled = compile_program(&source);
+        let compiled = crate::execution_semantics::compile_recorded_program_with_root(
+            &source,
+            None,
+            ExecutionSemantics::LegacyActionChainsV1,
+        );
         let diagnostic = find_diagnostic(&compiled, "effect `u`'s failure is unhandled");
         assert_eq!(
             diagnostic_text(&source, diagnostic),
@@ -23330,7 +23753,13 @@ rule chained
     // expansion pass may not quietly delete the file's line endings out of
     // every rule body it walks past. `then` expansion had the same defect, so
     // both a rule it rewrites and a rule it only copies are checked.
-    let ir = compile_program(&crlf).ir.expect("compiles");
+    let ir = crate::execution_semantics::compile_recorded_program_with_root(
+        &crlf,
+        None,
+        ExecutionSemantics::LegacyActionChainsV1,
+    )
+    .ir
+    .expect("compiles");
     for name in ["untouched", "chained"] {
         let rule = ir
             .rules
@@ -23402,7 +23831,11 @@ rule act
   }
 }
 "#;
-    let compiled = compile_program(source);
+    let compiled = crate::execution_semantics::compile_recorded_program_with_root(
+        source,
+        None,
+        ExecutionSemantics::LegacyActionChainsV1,
+    );
     let diagnostic = find_diagnostic(&compiled, "effect `t`'s failure is unhandled");
     assert_eq!(
         diagnostic_text(source, diagnostic),
@@ -25403,9 +25836,9 @@ fn expr_spans_mirror_the_expression_tree() {
     }
 }
 
-/// A parse failure names the token it stopped at — except for the call whose
-/// name the kernel does not have, where it names the NAME (see
-/// `an_unsupported_call_underlines_the_name_not_the_parenthesis`).
+/// A parse failure names the token it stopped at. Function-shaped expressions
+/// parse structurally so the type checker can resolve parameterized views and
+/// report an unknown function at its name.
 ///
 /// The message already said "unexpected token"; without a range the caret
 /// underlined the whole clause the expression was written in, so the message
@@ -25413,7 +25846,6 @@ fn expr_spans_mirror_the_expression_tree() {
 #[test]
 fn expression_parse_errors_carry_the_offending_token() {
     let cases = [
-        ("uppercase(task.title) == \"x\"", "uppercase"),
         ("task.a == 1)", ")"),
         ("task..a", "a"),
         ("task.a not b", "b"),
@@ -25543,11 +25975,8 @@ rule count_words
     assert_eq!(anchor.at(0..5), synthesized.span);
 }
 
-/// `parse.invalid_expression` is reached most often by calling a function the
-/// expression kernel does not have. The parser stops on the `(` — every call it
-/// supports is spelled out, so anything else parses as a bare identifier and
-/// leaves the parenthesis behind — but the parenthesis is not what the reader
-/// has to change. The NAME is.
+/// Function calls parse independently of name resolution so parameterized view
+/// declarations compose. An unresolved function still underlines its name.
 #[test]
 fn an_unsupported_call_underlines_the_name_not_the_parenthesis() {
     let source = r#"
@@ -25575,7 +26004,7 @@ rule shout
     let diagnostic = compiled
         .diagnostics
         .iter()
-        .find(|d| d.code.as_str() == "parse.invalid_expression")
+        .find(|d| d.code.as_str() == "expr.unsupported_function")
         .expect("the unsupported call is refused");
     assert_eq!(
         &source[diagnostic.span.start..diagnostic.span.end],
@@ -25589,6 +26018,61 @@ rule shout
     let error = parse_expression_spanned(source).expect_err("refused");
     let range = error.range.expect("a token range");
     assert_eq!(&source[range], "(", "nothing to rename, so nothing renamed");
+}
+
+#[test]
+fn parameterized_views_format_canonically_and_idempotently() {
+    let source = r#"workflow Views
+class Ticket { owner string }
+@internal
+description "Reusable ownership observation"
+view owned( wanted string ) -> bool { return exists(Ticket where owner == wanted) }
+rule run when started => { timer 1s as wait }
+"#;
+    let formatted = format_program(source).formatted.expect("formats");
+    assert!(formatted.contains("view owned(wanted string) -> bool {"));
+    assert!(formatted.contains("  return exists(Ticket where owner == wanted)"));
+    assert_eq!(
+        format_program(&formatted).formatted.expect("reformats"),
+        formatted
+    );
+}
+
+#[test]
+fn generic_expression_validation_checks_parameterized_view_arity() {
+    let parsed = parse_program(
+        r#"workflow Views
+view positive(value int) -> bool { return value > 0 }
+rule run when started => { timer 1s as wait }
+"#,
+    );
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let semantic = SemanticContext::from_program(&parsed.program, BTreeMap::new());
+    let rule = parsed
+        .program
+        .items
+        .iter()
+        .find_map(|item| match item {
+            Item::Rule(rule) => Some(rule),
+            _ => None,
+        })
+        .unwrap();
+    let mut diagnostics = Vec::new();
+    validate_expression(
+        rule,
+        "positive()",
+        BodyAnchor::fixed(rule.span),
+        &semantic,
+        &BTreeMap::new(),
+        "guard",
+        &mut diagnostics,
+    );
+    let arity: Vec<_> = diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.code.as_str() == "expr.arity_mismatch")
+        .collect();
+    assert_eq!(arity.len(), 1, "{diagnostics:?}");
+    assert!(arity[0].message.contains("expected 1"));
 }
 
 /// A `pattern` rewrites the text of the guards and assertions inside it while
@@ -25671,7 +26155,7 @@ rule finish
         "a guard whose text a pattern rewrote degrades to the whole clause"
     );
     assert_eq!(
-        underlined("parse.invalid_expression"),
+        underlined("expr.unsupported_function"),
         "count(Input) == nope(0)",
         "an assertion whose text a pattern rewrote degrades to the whole assertion"
     );
@@ -26481,6 +26965,78 @@ fn exactly_the_two_model_calling_kinds_make_model_calls() {
         .map(|kind| kind.as_str())
         .collect();
     assert_eq!(calling, vec!["agent.tell", "schema.coerce"]);
+}
+
+#[test]
+fn managed_rule_boundary_selects_managed_source_semantics_without_an_action_declaration() {
+    let source = "@service\nworkflow ManagedRule\nrule run\nwhen started\n=> { timer 1s as primary\non failure as problem { timer 2s as cleanup } }";
+    let compiled = compile_program(source);
+    assert!(
+        compiled.diagnostics.is_empty(),
+        "{:?}",
+        compiled.diagnostics
+    );
+    assert_eq!(
+        compiled.ir.as_ref().unwrap().execution_semantics,
+        ExecutionSemantics::TypedActionsV1
+    );
+    let typed = compiled.typed_actions.unwrap();
+    assert!(typed["run"]
+        .plan
+        .nodes
+        .iter()
+        .any(|node| matches!(node.kind, action_plan::NodeKind::OnFailure { .. })));
+
+    let region_source = "@service\nworkflow ManagedRegion\nrule run when started => { during false { timer 1s as work } on lapse as progress { case progress.steps.work { \"not_requested\" => { timer 2s as cleanup } _ => { } } }\nduring true { timer 3s as second } on lapse { } }";
+    let region = compile_program(region_source);
+    assert!(region.diagnostics.is_empty(), "{:?}", region.diagnostics);
+    assert_eq!(
+        region.ir.as_ref().unwrap().execution_semantics,
+        ExecutionSemantics::TypedActionsV1
+    );
+    let typed = region.typed_actions.unwrap();
+    assert_eq!(
+        typed["run"]
+            .plan
+            .nodes
+            .iter()
+            .filter(|node| matches!(node.kind, action_plan::NodeKind::Region { .. }))
+            .count(),
+        2,
+        "fresh source keeps multiple regions in one managed plan"
+    );
+
+    let unknown_status =
+        compile_program(&region_source.replace("progress.steps.work", "progress.steps.missing"));
+    assert!(unknown_status.ir.is_none());
+    assert!(
+        unknown_status
+            .diagnostics
+            .iter()
+            .any(
+                |diagnostic| diagnostic.code == diagnostic_code!("type.unknown_field")
+                    && diagnostic
+                        .message
+                        .contains("`progress.steps` has no field `missing`")
+            ),
+        "{:?}",
+        unknown_status.diagnostics
+    );
+
+    let escaped = compile_program(
+        "@service\nworkflow ManagedRegion\nrule run when started => { during true { timer 1s as work } on lapse { cancel work } }",
+    );
+    assert!(escaped.diagnostics.iter().any(|diagnostic| {
+        diagnostic.code == diagnostic_code!("expr.binding_out_of_scope")
+            && diagnostic.message.contains("references `work`")
+    }));
+
+    let legacy =
+        compile_program("@service\nworkflow Legacy\nrule run when started => { timer 1s as work }");
+    assert_eq!(
+        legacy.ir.unwrap().execution_semantics,
+        ExecutionSemantics::LegacyActionChainsV1
+    );
 }
 
 /// `prompt` is the coerce family's INLINE member — text out to a model, a value

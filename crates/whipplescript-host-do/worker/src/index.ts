@@ -176,6 +176,14 @@ const hostFunctions = bindings as unknown as {
     byteLen: number,
     storageKey?: string,
   ) => string;
+  host_explain_action: (
+    bridge: unknown,
+    instanceId: string,
+    result: string,
+    firing: string | undefined,
+    coerceProvider: string,
+    coerceModel: string,
+  ) => string;
   host_export_thread: (
     bridge: unknown,
     signedEnvelope: string,
@@ -411,7 +419,7 @@ const BUILTIN_SEEDS = [
 // understands. A rolled-back worker attached to an object stamped past this
 // must refuse rather than misread (or "lazily upgrade") a layout it has never
 // seen. Keep in step with the version rows `do_schema.sql` inserts.
-const SUPPORTED_DO_SCHEMA_VERSION = 6;
+const SUPPORTED_DO_SCHEMA_VERSION = 7;
 
 /**
  * DR-0054 Phase B: the object's durable schema is stamped with a version newer
@@ -494,6 +502,16 @@ function ensureSchema(sql: SqlStorage): void {
   )`);
   sql.exec(`INSERT OR IGNORE INTO schema_migrations (version, name)
     VALUES (6, 'tracker-control-receipts')`);
+  // Generation 7, not 4: this branch and `main` each took the next free
+  // number while apart, and `schema_migrations.version` is a PRIMARY KEY.
+  const hasFactValidity = sql
+    .exec(`SELECT name FROM pragma_table_info('facts') WHERE name = 'validity_json'`)
+    .toArray();
+  if (hasFactValidity.length === 0) {
+    sql.exec(`ALTER TABLE facts ADD COLUMN validity_json TEXT`);
+  }
+  sql.exec(`INSERT OR IGNORE INTO schema_migrations (version, name)
+    VALUES (7, 'fact-validity')`);
   // Existing placement objects predate GaugeDesk's writer profile. Keep
   // additive runtime policy seeds outside the first-touch branch so a deploy
   // upgrades those objects lazily without rewriting operator-owned rows.
@@ -2090,6 +2108,34 @@ export class WorkflowInstance implements DurableObject {
       }
     }
 
+    const explanation = url.pathname.match(/^\/host\/instances\/([^/]+)\/explain$/);
+    if (explanation) {
+      const instanceId = decodeURIComponent(explanation[1]);
+      if (!this.instanceExists(instanceId)) {
+        return Response.json({ error: "instance not found" }, { status: 404 });
+      }
+      const result = url.searchParams.get("result")?.trim();
+      if (!result) {
+        return Response.json({ error: "result query parameter is required" }, { status: 400 });
+      }
+      const firing = url.searchParams.get("firing")?.trim() || undefined;
+      const configured = Boolean(this.env.ANTHROPIC_API_KEY);
+      try {
+        return Response.json(JSON.parse(hostFunctions.host_explain_action(
+          makeBridge(this.ctx.storage),
+          instanceId,
+          result,
+          firing,
+          configured ? "anthropic" : "",
+          configured ? "claude-3-5-sonnet-latest" : "",
+        )));
+      } catch (error) {
+        return Response.json(
+          { error: `action explanation failed: ${String(error)}` },
+          { status: 409 },
+        );
+      }
+    }
     const evidence = url.pathname.match(/^\/host\/instances\/([^/]+)\/evidence$/);
     if (evidence) {
       const instanceId = decodeURIComponent(evidence[1]);
@@ -5522,7 +5568,7 @@ export default {
         url.pathname === "/host/turns" ||
         url.pathname === "/host/forks/import" ||
         /^\/host\/instances\/[^/]+\/discard$/.test(url.pathname) ||
-        /^\/host\/instances\/[^/]+\/(events|evidence|files|position|pending|checkpoint|restore|stats)$/.test(url.pathname) ||
+        /^\/host\/instances\/[^/]+\/(events|evidence|explain|files|position|pending|checkpoint|restore|stats)$/.test(url.pathname) ||
         /^\/host\/instances\/[^/]+\/events\/(stream|live)$/.test(url.pathname) ||
         /^\/host\/instances\/[^/]+\/human\/answer$/.test(url.pathname) ||
         /^\/host\/instances\/[^/]+\/fork-export$/.test(url.pathname) ||

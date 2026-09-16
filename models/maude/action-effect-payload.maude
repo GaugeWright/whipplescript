@@ -1,0 +1,28 @@
+mod WHIPPLESCRIPT-ACTION-EFFECT-PAYLOAD is
+  protecting BOOL .
+  sorts Value State .
+  ops constant executor : -> Value [ctor] .
+  ops forwarded template : Value -> Value [ctor] .
+  op endorsed : Value Bool -> Value [ctor] .
+  op unsafe : Value -> Bool .
+  var V : Value . var G : Bool .
+  eq unsafe(constant) = false .
+  eq unsafe(executor) = true .
+  eq unsafe(forwarded(V)) = unsafe(V) .
+  eq unsafe(template(V)) = unsafe(V) .
+  eq unsafe(endorsed(V, G)) = unsafe(V) and not G .
+  op write : Value Value Value Value -> State [ctor] .
+  ops allowed denied : -> State [ctor] .
+  vars U H B C : Value .
+  crl [all-parts] : write(U, H, B, C) => allowed
+    if not (unsafe(U) or unsafe(H) or unsafe(B) or unsafe(C)) .
+  crl [any-part] : write(U, H, B, C) => denied
+    if unsafe(U) or unsafe(H) or unsafe(B) or unsafe(C) .
+endm
+mod WHIPPLESCRIPT-ACTION-EFFECT-PAYLOAD-LOST is
+  including WHIPPLESCRIPT-ACTION-EFFECT-PAYLOAD .
+  var V : Value .
+  rl [body-only] : write(V, constant, constant, constant) => allowed .
+  rl [lost-header] : write(constant, V, constant, constant) => allowed .
+  rl [lost-selector] : write(constant, constant, endorsed(executor, true), V) => allowed .
+endm

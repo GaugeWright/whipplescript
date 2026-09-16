@@ -1,0 +1,46 @@
+--- Static traversal preserves the shared per-effect grant verdict. Grant
+--- classification itself belongs to custody; this bounded model abstracts its
+--- result. Separate effects do not merge resource sets. No runtime authority.
+mod WHIPPLESCRIPT-ACTION-EFFECT-GRANTS is
+  protecting BOOL .
+  sorts Body Check .
+  ops valid invalid : -> Body [ctor] .
+  op declaredGrant : Bool Bool -> Body [ctor] .
+  op both : Body Body -> Body [ctor] .
+  ops helper branch continuation region : Body -> Body [ctor] .
+  op sound : Body -> Bool .
+  vars A B : Body .
+  eq sound(valid) = true .
+  eq sound(invalid) = false .
+  vars Known Supported : Bool .
+  eq sound(declaredGrant(Known, Supported)) = Known and Supported .
+  eq sound(both(A, B)) = sound(A) and sound(B) .
+  eq sound(helper(A)) = sound(A) .
+  eq sound(branch(A)) = sound(A) .
+  eq sound(continuation(A)) = sound(A) .
+  eq sound(region(A)) = sound(A) .
+  op check : Body -> Check [ctor] .
+  ops accepted refused : -> Check [ctor] .
+  crl [accept] : check(A) => accepted if sound(A) .
+  crl [refuse] : check(A) => refused if not sound(A) .
+endm
+mod WHIPPLESCRIPT-ACTION-GRANTS-SKIPS-HELPER is
+  including WHIPPLESCRIPT-ACTION-EFFECT-GRANTS .
+  var A : Body .
+  rl [skip-helper] : check(helper(A)) => accepted .
+endm
+mod WHIPPLESCRIPT-ACTION-GRANTS-SKIPS-BRANCH is
+  including WHIPPLESCRIPT-ACTION-EFFECT-GRANTS .
+  var A : Body .
+  rl [skip-branch] : check(branch(A)) => accepted .
+endm
+
+mod WHIPPLESCRIPT-ACTION-GRANTS-IGNORES-DECLARATION is
+  including WHIPPLESCRIPT-ACTION-EFFECT-GRANTS .
+  var Supported : Bool .
+  rl [ignore-declaration] : check(helper(declaredGrant(false, Supported))) => accepted .
+endm
+mod WHIPPLESCRIPT-ACTION-GRANTS-IGNORES-KIND is
+  including WHIPPLESCRIPT-ACTION-EFFECT-GRANTS .
+  rl [ignore-kind] : check(helper(declaredGrant(true, false))) => accepted .
+endm

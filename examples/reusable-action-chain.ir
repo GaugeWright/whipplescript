@@ -1,4 +1,5 @@
 workflow ReusableActionChain
+execution_semantics dr0100-typed-actions-v1
 workflow_contracts
   output result ref<ReviewBatch>
   failure error ref<ReviewFailure>
@@ -34,7 +35,7 @@ rules
     writes
       schema:ChangeRequest
     record_sources
-      schema:ChangeRequest construct=table_row span=677..750
+      schema:ChangeRequest construct=table_row span=664..737
     body_hash 1e2d8eb96f5c5e1d8eeee67fe2c9f6a9
   rule review
     when ChangeRequest as item
@@ -45,11 +46,14 @@ rules
     writes
       schema:ReviewFailure
       schema:ReviewedChange
+    record_sources
+      schema:ReviewFailure construct=action span=1215..1272
+      schema:ReviewedChange construct=action span=1073..1168
     consumes
       schema:ChangeRequest
     effects
-      turn__act0 kind=agent.tell binding=turn__act0 key=9508d6f0eae6a7c101338dda98a70e4e
-    body_hash 8e6e780e4b21217b8c4a44b3309b8fb1
+      turn@1 kind=agent.tell binding=turn key=90feab9f003fe5eacc2ffaed8e382355
+    body_hash 47fef2efd00eb9063cdbfabb660f025a
   rule fail_on_review_failure
     when ReviewFailure as failure
     reads

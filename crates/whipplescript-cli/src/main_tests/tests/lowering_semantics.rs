@@ -238,6 +238,7 @@ assert exists(Window where elapsed < limit)
         value_json: r#"{"elapsed":"bad-duration","limit":"PT1H"}"#.to_owned(),
         provenance_class: "external".to_owned(),
         source_span_json: None,
+        validity_json: None,
         source_event_id: String::new(),
     }];
 
@@ -289,6 +290,7 @@ rule finish
         value_json: r#"{"status":"queued"}"#.to_owned(),
         provenance_class: "rule".to_owned(),
         source_span_json: None,
+        validity_json: None,
         source_event_id: String::new(),
     };
     let facts = vec![fact];
@@ -1036,6 +1038,7 @@ rule claim_ready
             .to_owned(),
         provenance_class: "queue".to_owned(),
         source_span_json: None,
+        validity_json: None,
         source_event_id: String::new(),
     };
     let other_queue = FactView {
@@ -1047,6 +1050,7 @@ rule claim_ready
         value_json: r#"{"queue":"other","id":"WS-2","title":"Other","body":""}"#.to_owned(),
         provenance_class: "queue".to_owned(),
         source_span_json: None,
+        validity_json: None,
         source_event_id: String::new(),
     };
     let facts = vec![fact, other_queue];
@@ -1102,6 +1106,7 @@ rule on_close
                 .to_owned(),
         provenance_class: "queue".to_owned(),
         source_span_json: None,
+        validity_json: None,
         source_event_id: String::new(),
     };
     let second = FactView {
@@ -1179,6 +1184,7 @@ rule on_contention
         value_json: format!(r#"{{"branch":"line","cut":"{id}","path":"src/a.rs","by":"{by}"}}"#),
         provenance_class: "external".to_owned(),
         source_span_json: None,
+        validity_json: None,
         source_event_id: String::new(),
     };
     let own = cut_fact("c-own", "instance:i-1");
@@ -1210,6 +1216,7 @@ rule on_contention
         value_json: format!(r#"{{"branch":"line","stream":"{stream}","slice":["src/a.rs"]}}"#),
         provenance_class: "external".to_owned(),
         source_span_json: None,
+        validity_json: None,
         source_event_id: String::new(),
     };
     let facts = vec![contention("k-1", "triage"), contention("k-2", "hotfix")];

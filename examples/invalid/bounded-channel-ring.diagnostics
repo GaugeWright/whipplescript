@@ -3,7 +3,7 @@ warning[effect.unhandled_failure]: effect `ack`'s failure is unhandled in rule `
    |
 28 |   send via ops_room {
    |   ^^^^^^^^^^^^^^^^^^^
-   = help: handle it with `after ack fails { … }` (typed failure or recovery) or observe every outcome with `after ack completes`
+   = help: handle it with `after ack fails { … }` (typed failure or recovery), observe every outcome with `after ack completes`, or add one `on failure as problem { … }` handler to the rule
 error[graph.bounded_workflow_effect_cycle]: effect cycle in a bounded workflow is not allowed: workflow `BoundedChannelRing` is `@bounded`, and rule cycle echo_forever -> echo_forever runs the effects of rule `echo_forever` on every turn
    --> examples/invalid/bounded-channel-ring.whip:28:3
    |

@@ -1,0 +1,26 @@
+--- Native append reads its candidate head while owning the writer lock.
+fmod SERIALIZED-LOG-APPEND-STATE is
+ protecting NAT .
+ sorts Lock Phase State .
+ ops free a b : -> Lock [ctor] .
+ ops idle done : -> Phase [ctor] .
+ op read : Nat -> Phase [ctor] .
+ op log : Nat Lock Phase Phase -> State [ctor] .
+ op collision : -> State [ctor] .
+endfm
+mod WHIPPLESCRIPT-SERIALIZED-LOG-APPEND is
+ protecting SERIALIZED-LOG-APPEND-STATE .
+ vars H S : Nat . vars A B : Phase .
+ rl [a-read-owned] : log(H, free, idle, B) => log(H, a, read(H), B) .
+ rl [b-read-owned] : log(H, free, A, idle) => log(H, b, A, read(H)) .
+ rl [a-publish] : log(H, a, read(H), B) => log(s(H), free, done, B) .
+ rl [b-publish] : log(H, b, A, read(H)) => log(s(H), free, A, done) .
+ crl [a-stale] : log(H, a, read(S), B) => collision if H =/= S .
+ crl [b-stale] : log(H, b, A, read(S)) => collision if H =/= S .
+endm
+mod WHIPPLESCRIPT-SERIALIZED-LOG-APPEND-LOST is
+ including WHIPPLESCRIPT-SERIALIZED-LOG-APPEND .
+ vars H S : Nat . vars A B : Phase .
+ rl [a-early-read] : log(H, free, idle, B) => log(H, free, read(H), B) .
+ rl [a-late-lock] : log(H, free, read(S), B) => log(H, a, read(S), B) .
+endm

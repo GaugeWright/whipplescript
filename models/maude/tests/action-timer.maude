@@ -1,0 +1,10 @@
+load ../action-timer.maude
+search [1] in WHIPPLESCRIPT-ACTION-TIMER : project(ready, none) =>* result(draft) .
+search [1] in WHIPPLESCRIPT-ACTION-TIMER : project(missing, fired) =>* result(unit) .
+search [1] in WHIPPLESCRIPT-ACTION-TIMER : project(ready, queued) =>* result(unit) .
+search [1] in WHIPPLESCRIPT-ACTION-TIMER : project(missing, fired) =>* result(waiting) .
+search [1] in WHIPPLESCRIPT-ACTION-TIMER : project(ready, queued) =>* result(draft) .
+search [1] in WHIPPLESCRIPT-ACTION-TIMER-EARLY-UNIT : project(ready, queued) =>* result(unit) .
+search [1] in WHIPPLESCRIPT-ACTION-TIMER-READS-LIVE : project(missing, fired) =>* result(waiting) .
+search [1] in WHIPPLESCRIPT-ACTION-TIMER-READMITS : project(ready, queued) =>* result(draft) .
+quit

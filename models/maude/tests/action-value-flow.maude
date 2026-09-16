@@ -1,0 +1,22 @@
+load ../action-value-flow.maude
+search [1] in WHIPPLESCRIPT-ACTION-VALUE-FLOW : inspect(alias(input(true))) =>* flow(true, false, false) .
+search [1] in WHIPPLESCRIPT-ACTION-VALUE-FLOW : inspect(first(object(input(false), input(true)))) =>* flow(false, false, false) .
+search [1] in WHIPPLESCRIPT-ACTION-VALUE-FLOW : inspect(selected(true, input(false))) =>* flow(false, true, false) .
+search [1] in WHIPPLESCRIPT-ACTION-VALUE-FLOW : inspect(owned(input(false))) =>* flow(false, false, true) .
+search [1] in WHIPPLESCRIPT-ACTION-VALUE-FLOW : inspect(alias(input(true))) =>* flow(false, false, false) .
+search [1] in WHIPPLESCRIPT-ACTION-VALUE-LOST : inspect(alias(input(true))) =>* flow(false, false, false) .
+search [1] in WHIPPLESCRIPT-ACTION-VALUE-FLOW : inspect(selected(true, input(false))) =>* flow(false, false, false) .
+search [1] in WHIPPLESCRIPT-ACTION-VALUE-LOST : inspect(selected(true, input(false))) =>* flow(false, false, false) .
+search [1] in WHIPPLESCRIPT-ACTION-VALUE-FLOW : inspect(owned(input(false))) =>* flow(true, false, true) .
+search [1] in WHIPPLESCRIPT-ACTION-VALUE-LOST : inspect(owned(input(false))) =>* flow(true, false, true) .
+search [1] in WHIPPLESCRIPT-ACTION-VALUE-FLOW : inspect(unknown) =>* flow(false, false, false) .
+search [1] in WHIPPLESCRIPT-ACTION-VALUE-LOST : inspect(unknown) =>* flow(false, false, false) .
+search [1] in WHIPPLESCRIPT-ACTION-VALUE-FLOW : inspect(cyclic) =>* flow(false, false, false) .
+search [1] in WHIPPLESCRIPT-ACTION-VALUE-LOST : inspect(cyclic) =>* flow(false, false, false) .
+--- Clean exit controls a public constant without becoming its payload.
+search [1] in WHIPPLESCRIPT-ACTION-VALUE-FLOW : inspect(postExit(true, input(false))) =>* flow(false, true, false) .
+search [1] in WHIPPLESCRIPT-ACTION-VALUE-FLOW : inspect(postExit(true, input(false))) =>* flow(false, false, false) .
+search [1] in WHIPPLESCRIPT-ACTION-VALUE-LOST : inspect(postExit(true, input(false))) =>* flow(false, false, false) .
+search [1] in WHIPPLESCRIPT-ACTION-VALUE-FLOW : inspect(postExit(true, input(false))) =>* flow(true, false, false) .
+search [1] in WHIPPLESCRIPT-ACTION-VALUE-LOST : inspect(postExit(true, input(false))) =>* flow(true, false, false) .
+quit

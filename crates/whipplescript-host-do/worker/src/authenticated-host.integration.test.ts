@@ -985,6 +985,19 @@ describe("real WorkflowInstance hibernation", () => {
     const instancePath =
       `/host/instances/${encodeURIComponent(opened.instance_ref)}`;
 
+    const missingExplainSelector = await placementFetch(`${instancePath}/explain`);
+    expect(missingExplainSelector.status).toBe(400);
+    const explanation = await placementFetch(
+      `${instancePath}/explain?result=${encodeURIComponent("not-a-result")}`,
+    );
+    expect(explanation.status, await explanation.clone().text()).toBe(200);
+    expect(await explanation.json()).toEqual({
+      schema: "whipplescript.action-explanation-query.v1",
+      instance_id: opened.instance_ref,
+      query: { result: "not-a-result", firing: null },
+      outcome: { kind: "not_found" },
+    });
+
     const filesSynced = await placementFetch(`${instancePath}/files/sync`, {
       method: "POST",
       body: JSON.stringify({
@@ -1635,15 +1648,15 @@ describe("real WorkflowInstance hibernation", () => {
       || path.startsWith("/host/")
       || path.startsWith("/public/session/")
     );
-    // Bumped with the five `/host/norm/` routes. The count is a tripwire: a
-    // route added to the surface without a thought about this suite trips it,
-    // and every operation below is then exercised for real.
+    // The count is a tripwire: a route added to the surface without a thought
+    // about this suite trips it, and every operation below is then exercised
+    // for real.
     //
-    // It counts what the FILTER yields, not the surface: six `/v1/...` routes
-    // sit outside it on both sides, which is why 36 declared operations were
-    // 30 here. Raising this to the new declared total of 41 counted those six
-    // twice and failed at 35.
-    expect(operations.length).toBe(35);
+    // It counts what the FILTER yields, not the declared surface: of the 42
+    // declared operations, six are `/v1/...` routes outside it. Writing the
+    // declared total here counts those six and fails; this number is counted
+    // from `runtime-route-surface.json` through the same filter.
+    expect(operations.length).toBe(36);
 
     for (const operation of operations) {
       for (const authorization of [undefined, "Bearer wrong-control-token"]) {

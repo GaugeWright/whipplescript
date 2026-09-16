@@ -1,0 +1,13 @@
+load ../action-demand.maude
+search [1] in WHIPPLESCRIPT-ACTION-DEMAND : read(ready(absent, a)) =>* observed(ready(absent, a)) .
+search [1] in WHIPPLESCRIPT-ACTION-DEMAND : array(pending) =>* observed(pending) .
+search [1] in WHIPPLESCRIPT-ACTION-DEMAND : array(pending) =>* observed(ready(absent, none)) .
+search [1] in WHIPPLESCRIPT-ACTION-PENDING-AS-ABSENT : array(pending) =>* observed(ready(absent, none)) .
+search [1] in WHIPPLESCRIPT-ACTION-DEMAND : both(ready(yes, a), ready(yes, b)) =>* observed(ready(yes, a b)) .
+search [1] in WHIPPLESCRIPT-ACTION-DEMAND : both(ready(yes, a), ready(yes, b)) =>* observed(ready(yes, none)) .
+search [1] in WHIPPLESCRIPT-ACTION-LOSES-SOURCES : both(ready(yes, a), ready(yes, b)) =>* observed(ready(yes, none)) .
+search [1] in WHIPPLESCRIPT-ACTION-DEMAND : choose(ready(no, a), pending) =>* observed(ready(no, a)) .
+search [1] in WHIPPLESCRIPT-ACTION-DEMAND : choose(ready(no, a), pending) =>* observed(pending) .
+search [1] in WHIPPLESCRIPT-ACTION-WAITS-VISIBLE : choose(ready(no, a), pending) =>* observed(pending) .
+search [1] in WHIPPLESCRIPT-ACTION-DEMAND : choose(ready(yes, a), pending) =>* observed(pending) .
+quit

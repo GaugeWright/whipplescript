@@ -1,0 +1,11 @@
+load ../action-subject-contracts.maude
+search [1] in WHIPPLESCRIPT-ACTION-SUBJECT-CONTRACTS : requireFact(pass(field(box(fact)))) =>* admitted .
+search [1] in WHIPPLESCRIPT-ACTION-SUBJECT-CONTRACTS : requireFact(choose(fact, fact)) =>* admitted .
+search [1] in WHIPPLESCRIPT-ACTION-SUBJECT-CONTRACTS : requireFact(copy(fact)) =>* refused .
+search [1] in WHIPPLESCRIPT-ACTION-SUBJECT-CONTRACTS : requireFact(copy(fact)) =>* admitted .
+search [1] in WHIPPLESCRIPT-ACTION-SUBJECT-CONTRACTS : requireFact(box(fact)) =>* admitted .
+search [1] in WHIPPLESCRIPT-ACTION-SUBJECT-CONTRACTS : requireFact(field(fact)) =>* admitted .
+search [1] in WHIPPLESCRIPT-ACTION-SUBJECT-CONTRACTS : requireFact(choose(fact, data)) =>* admitted .
+search [1] in WHIPPLESCRIPT-ACTION-SUBJECT-TYPE-AS-PROOF : requireFact(data) =>* admitted .
+search [1] in WHIPPLESCRIPT-ACTION-SUBJECT-ONE-RETURN : requireFact(choose(fact, data)) =>* admitted .
+quit

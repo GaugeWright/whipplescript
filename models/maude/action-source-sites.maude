@@ -1,0 +1,27 @@
+--- A source location is diagnostic data; a checked site has lexical identity.
+mod WHIPPLESCRIPT-ACTION-SOURCE-SITES is
+  protecting NAT .
+  sorts Owner Path Site Type State .
+  ops helper caller : -> Owner [ctor] .
+  op root : -> Path [ctor] .
+  op child : Path Nat -> Path [ctor] .
+  op site : Owner Path -> Site [ctor] .
+  ops reader writer : -> Type [ctor] .
+  op join : Site Type Nat Site Type Nat -> State [ctor] .
+  ops distinct shared refused merged : -> State [ctor] .
+  vars S T : Site . vars A B : Type . vars X Y : Nat .
+  crl [distinct-sites] : join(S, A, X, T, B, Y) => distinct if S =/= T .
+  rl [same-site-same-type] : join(S, A, X, S, A, Y) => shared .
+  crl [same-site-conflict] : join(S, A, X, S, B, Y) => refused if A =/= B .
+endm
+mod WHIPPLESCRIPT-ACTION-SOURCE-SPANS is
+  including WHIPPLESCRIPT-ACTION-SOURCE-SITES .
+  vars S T : Site . vars A B : Type . var X : Nat .
+  rl [span-key] : join(S, A, X, T, B, X) => merged .
+endm
+mod WHIPPLESCRIPT-ACTION-SOURCE-OWNERLESS is
+  including WHIPPLESCRIPT-ACTION-SOURCE-SITES .
+  vars O P : Owner . var K : Path .
+  vars A B : Type . vars X Y : Nat .
+  rl [ownerless-key] : join(site(O, K), A, X, site(P, K), B, Y) => merged .
+endm

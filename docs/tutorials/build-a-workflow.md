@@ -156,7 +156,7 @@ warning[effect.unhandled_failure]: effect `turn`'s failure is unhandled in rule 
    |
 68 |   tell triager as turn """markdown
    |   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-   = help: handle it with `after turn fails { … }` (typed failure or recovery) or observe every outcome with `after turn completes`
+   = help: handle it with `after turn fails { … }` (typed failure or recovery), observe every outcome with `after turn completes`, or add one `on failure as problem { … }` handler to the rule
 error[graph.unreachable_terminal]: workflow `TicketTriage` has no rule that reaches `complete` or `fail`
   --> examples/diagnostics/tutorial-missing-terminal.whip:1:1
   |

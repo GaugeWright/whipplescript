@@ -1,0 +1,9 @@
+load ../action-progression.maude
+search [1] in WHIPPLESCRIPT-ACTION-PROGRESSION : progress(pending, waiting, absent) =>* success .
+search [1] in WHIPPLESCRIPT-ACTION-PROGRESSION : progress(settled, waiting, absent) =>1 progress(settled, visited, running) .
+search [1] in WHIPPLESCRIPT-ACTION-PROGRESSION : progress(settled, waiting, absent) =>1 success .
+search [1] in WHIPPLESCRIPT-ACTION-CLOSES-BEFORE-AFTER : progress(settled, waiting, absent) =>1 success .
+search [1] in WHIPPLESCRIPT-ACTION-PROGRESSION : progress(settled, visited, resultReady) =>1 success .
+search [1] in WHIPPLESCRIPT-ACTION-PUBLISHES-CHILD-RESULT : progress(settled, visited, resultReady) =>1 success .
+search [1] in WHIPPLESCRIPT-ACTION-PROGRESSION : progress(settled, visited, unselected) =>1 success .
+quit

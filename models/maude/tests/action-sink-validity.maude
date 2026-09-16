@@ -1,0 +1,34 @@
+load ../action-sink-validity.maude
+search [1] in WHIPPLESCRIPT-ACTION-SINK-VALIDITY :
+  publishFact(value(7, upstream(3)), 11) =>* fact(11, 7, upstream(3)) .
+search [1] in WHIPPLESCRIPT-ACTION-SINK-VALIDITY :
+  readFact(publishFact(value(7, upstream(3)), 11), 19) =>*
+  value(7, upstream(3) membership(19)) .
+search [1] in WHIPPLESCRIPT-ACTION-SINK-VALIDITY :
+  reopenFact(publishFact(value(7, upstream(3)), 11)) =>*
+  fact(11, 7, upstream(3)) .
+search [1] in WHIPPLESCRIPT-ACTION-SINK-VALIDITY :
+  reopenTerminal(publishTerminal(value(7, upstream(3)))) =>*
+  terminal(7, upstream(3)) .
+
+search [1] in WHIPPLESCRIPT-ACTION-SINK-VALIDITY :
+  publishFact(value(7, upstream(3)), 11) =>* fact(11, 7, noValidity) .
+search [1] in WHIPPLESCRIPT-ACTION-SINK-DROPS-FACT-VALIDITY :
+  publishFactDropped(value(7, upstream(3)), 11) =>* fact(11, 7, noValidity) .
+search [1] in WHIPPLESCRIPT-ACTION-SINK-VALIDITY :
+  readFact(publishFact(value(7, upstream(3)), 11), 19) =>*
+  value(7, membership(19)) .
+search [1] in WHIPPLESCRIPT-ACTION-SINK-DROPS-TRANSITIVE-VALIDITY :
+  readFactDropped(publishFact(value(7, upstream(3)), 11), 19) =>*
+  value(7, membership(19)) .
+search [1] in WHIPPLESCRIPT-ACTION-SINK-VALIDITY :
+  publishTerminal(value(7, upstream(3))) =>* terminal(7, noValidity) .
+search [1] in WHIPPLESCRIPT-ACTION-SINK-DROPS-TERMINAL-VALIDITY :
+  publishTerminalDropped(value(7, upstream(3))) =>* terminal(7, noValidity) .
+search [1] in WHIPPLESCRIPT-ACTION-SINK-VALIDITY :
+  reopenFact(publishFact(value(7, upstream(3)), 11)) =>*
+  fact(12, 7, upstream(3)) .
+search [1] in WHIPPLESCRIPT-ACTION-SINK-RETARGETS-ADMISSION :
+  reopenFactRetargeted(publishFact(value(7, upstream(3)), 11), 12) =>*
+  fact(12, 7, upstream(3)) .
+quit

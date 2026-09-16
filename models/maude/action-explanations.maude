@@ -1,0 +1,84 @@
+--- One captured managed progression projects source results without reading or
+--- changing runtime state. Branch labels come from recorded selection, causes
+--- remain shared nodes, and failure payload bytes never enter the explanation.
+mod WHIPPLESCRIPT-ACTION-EXPLANATIONS is
+ protecting NAT .
+ sorts Status Selection Dependents CauseView CauseViews Payload WitnessMark SafeCause
+       LeakyCause ExplanationItem ResultId ResultPair .
+ subsorts SafeCause LeakyCause < ExplanationItem .
+ ops waiting notSelected notReached uncertain : -> Status [ctor] .
+ op selected : Nat -> Selection [ctor] .
+ op unresolved : -> Selection [ctor] .
+ op branchStatus : Nat Selection -> Status .
+ vars B C : Nat .
+ eq branchStatus(B, selected(B)) = waiting .
+ ceq branchStatus(B, selected(C)) = notSelected if B =/= C .
+ eq branchStatus(B, unresolved) = notReached .
+
+ op none : -> Dependents [ctor] .
+ op dependent : Nat -> Dependents [ctor] .
+ op __ : Dependents Dependents -> Dependents [ctor assoc comm id: none] .
+ op cause : Nat Dependents -> CauseView [ctor] .
+ subsort CauseView < CauseViews .
+ op noCauses : -> CauseViews [ctor] .
+ op _++_ : CauseViews CauseViews -> CauseViews [ctor assoc comm id: noCauses] .
+ op groupShared : Nat Nat Nat -> CauseView .
+ op keepSecondary : Nat Nat Nat -> CauseViews .
+ vars R R2 C2 : Nat .
+ eq groupShared(C, R, R2) = cause(C, dependent(R) dependent(R2)) .
+ eq keepSecondary(R, C, C2) = cause(C, dependent(R)) ++ cause(C2, dependent(R)) .
+
+ op payload : Nat -> Payload [ctor] .
+ op shown : Nat -> WitnessMark [ctor] .
+ op redacted : -> WitnessMark [ctor] .
+ op safeCause : Nat WitnessMark -> SafeCause [ctor] .
+ op leakyCause : Nat Payload WitnessMark -> LeakyCause [ctor] .
+ op explainVisible : Nat Payload Nat -> ExplanationItem .
+ op explainHidden : Nat Payload Nat -> ExplanationItem .
+ vars P W : Nat .
+ eq explainVisible(C, payload(P), W) = safeCause(C, shown(W)) .
+ eq explainHidden(C, payload(P), W) = safeCause(C, redacted) .
+
+ op resultId : Nat Nat -> ResultId [ctor] .
+ op pair : ResultId ResultId -> ResultPair [ctor] .
+endm
+
+--- Wrong: missing selection evidence is reported as if another branch won.
+mod WHIPPLESCRIPT-ACTION-EXPLANATIONS-GUESSES-SELECTION is
+ including WHIPPLESCRIPT-ACTION-EXPLANATIONS .
+ op guessedBranchStatus : Nat Selection -> Status .
+ var B : Nat .
+ eq guessedBranchStatus(B, unresolved) = notSelected .
+endm
+
+--- Wrong: one shared cause is duplicated once per dependent.
+mod WHIPPLESCRIPT-ACTION-EXPLANATIONS-SPLITS-SHARED-CAUSE is
+ including WHIPPLESCRIPT-ACTION-EXPLANATIONS .
+ op splitShared : Nat Nat Nat -> CauseViews .
+ vars C R R2 : Nat .
+ eq splitShared(C, R, R2) = cause(C, dependent(R)) ++ cause(C, dependent(R2)) .
+endm
+
+--- Wrong: retaining the primary cause silently erases a secondary cause.
+mod WHIPPLESCRIPT-ACTION-EXPLANATIONS-DROPS-SECONDARY is
+ including WHIPPLESCRIPT-ACTION-EXPLANATIONS .
+ op dropSecondary : Nat Nat Nat -> CauseViews .
+ vars R C C2 : Nat .
+ eq dropSecondary(R, C, C2) = cause(C, dependent(R)) .
+endm
+
+--- Wrong: an explanation copies the provider/domain payload into its wire form.
+mod WHIPPLESCRIPT-ACTION-EXPLANATIONS-LEAKS-PAYLOAD is
+ including WHIPPLESCRIPT-ACTION-EXPLANATIONS .
+ op explainLeaky : Nat Payload Nat -> ExplanationItem .
+ vars C P W : Nat .
+ eq explainLeaky(C, payload(P), W) = leakyCause(C, payload(P), shown(W)) .
+endm
+
+--- Wrong: result identity drops the firing and aliases two executions.
+mod WHIPPLESCRIPT-ACTION-EXPLANATIONS-DROPS-FIRING is
+ including WHIPPLESCRIPT-ACTION-EXPLANATIONS .
+ op resultIdDropped : Nat Nat -> ResultId .
+ vars F B : Nat .
+ eq resultIdDropped(F, B) = resultId(0, B) .
+endm

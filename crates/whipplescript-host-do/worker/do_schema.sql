@@ -5,6 +5,7 @@
             INSERT INTO schema_migrations (version, name) VALUES (4, 'tracker-filing-receipts');
             INSERT INTO schema_migrations (version, name) VALUES (5, 'tracker-closure-receipts');
             INSERT INTO schema_migrations (version, name) VALUES (6, 'tracker-control-receipts');
+            INSERT INTO schema_migrations (version, name) VALUES (7, 'fact-validity');
             CREATE TABLE events (
                 event_id TEXT PRIMARY KEY, instance_id TEXT NOT NULL, sequence INTEGER NOT NULL,
                 event_type TEXT NOT NULL, payload_json TEXT NOT NULL, occurred_at TEXT NOT NULL,
@@ -29,7 +30,7 @@
                 key TEXT NOT NULL DEFAULT '', value_json TEXT NOT NULL DEFAULT '{}',
                 source_event_id TEXT, source_rule TEXT, schema_id TEXT,
                 provenance_class TEXT NOT NULL DEFAULT 'derived', correlation_id TEXT,
-                source_span_json TEXT, consumed_at TEXT, updated_at TEXT,
+                source_span_json TEXT, validity_json TEXT, consumed_at TEXT, updated_at TEXT,
                 UNIQUE(instance_id, name, key)
             );
             CREATE TABLE instances (

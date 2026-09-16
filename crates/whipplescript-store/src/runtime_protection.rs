@@ -130,7 +130,7 @@ impl SqliteStore {
     ) -> StoreResult<Self> {
         let connection = crate::native_existing::open(
             path.as_ref(),
-            "native-payload-protection",
+            crate::RUNTIME_SCHEMA_OWNER,
             SUPPORTED_SCHEMA_VERSION,
         )?;
         crate::harden_store_file_permissions(path.as_ref())?;
@@ -157,7 +157,7 @@ impl SqliteStore {
         connection.busy_timeout(crate::STORE_BUSY_TIMEOUT)?;
         crate::native_existing::validate(
             &connection,
-            "native-payload-protection",
+            crate::RUNTIME_SCHEMA_OWNER,
             SUPPORTED_SCHEMA_VERSION,
         )?;
         Self::from_existing_connection(connection, Some(protection))

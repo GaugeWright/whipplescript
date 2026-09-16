@@ -1,0 +1,16 @@
+load ../action-case-patterns.maude
+search [1] in WHIPPLESCRIPT-ACTION-CASE-PATTERNS : classify(finite, some) =>* literalSome .
+search [1] in WHIPPLESCRIPT-ACTION-CASE-PATTERNS : classify(optional, some) =>* presence .
+search [1] in WHIPPLESCRIPT-ACTION-CASE-PATTERNS : classify(finite, some) =>* presence .
+search [1] in WHIPPLESCRIPT-ACTION-CASE-PATTERNS-LOST : classify(finite, some) =>* presence .
+search [1] in WHIPPLESCRIPT-ACTION-CASE-PATTERNS : classify(finite, none) =>* absence .
+search [1] in WHIPPLESCRIPT-ACTION-CASE-PATTERNS-LOST : classify(finite, none) =>* absence .
+search [1] in WHIPPLESCRIPT-ACTION-CASE-PATTERNS : classify(finite, none) =>* literalNone .
+search [1] in WHIPPLESCRIPT-ACTION-CASE-PATTERNS : classify(optional, none) =>* absence .
+search [1] in WHIPPLESCRIPT-ACTION-CASE-PATTERNS : classify(optional, quotedSome) =>* literalSome .
+search [1] in WHIPPLESCRIPT-ACTION-CASE-PATTERNS : bindClass(presence) =>* allowed .
+search [1] in WHIPPLESCRIPT-ACTION-CASE-PATTERNS-LOST : bindClass(presence) =>* allowed .
+search [1] in WHIPPLESCRIPT-ACTION-CASE-PATTERNS : bindClass(absence) =>* allowed .
+search [1] in WHIPPLESCRIPT-ACTION-CASE-PATTERNS-LOST : bindClass(absence) =>* allowed .
+search [1] in WHIPPLESCRIPT-ACTION-CASE-PATTERNS : bindClass(nominal) =>* allowed .
+quit

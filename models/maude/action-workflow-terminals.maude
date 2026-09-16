@@ -1,0 +1,29 @@
+mod WHIPPLESCRIPT-ACTION-WORKFLOW-TERMINALS is
+  protecting BOOL .
+  sorts Input Work State .
+  ops ready pending invalid : -> Input [ctor] .
+  ops settled running failed uncertain : -> Work [ctor] .
+  op complete : Input Work Bool -> State [ctor] .
+  op workflowFail : Input Work Bool -> State [ctor] .
+  op replay : Bool -> State [ctor] .
+  ops committed failedTerminal noChange duplicate : -> State [ctor] .
+  rl [complete] : complete(ready, settled, true) => committed .
+  rl [declared-failure] : workflowFail(ready, settled, true) => failedTerminal .
+  rl [replay] : replay(true) => noChange .
+endm
+mod WHIPPLESCRIPT-ACTION-TERMINAL-EARLY is
+  including WHIPPLESCRIPT-ACTION-WORKFLOW-TERMINALS .
+  rl [abandon-sibling] : complete(ready, running, true) => committed .
+endm
+mod WHIPPLESCRIPT-ACTION-TERMINAL-UNTYPED is
+  including WHIPPLESCRIPT-ACTION-WORKFLOW-TERMINALS .
+  rl [ignore-contract] : complete(invalid, settled, true) => committed .
+endm
+mod WHIPPLESCRIPT-ACTION-TERMINAL-HELPER is
+  including WHIPPLESCRIPT-ACTION-WORKFLOW-TERMINALS .
+  rl [escape-helper] : complete(ready, settled, false) => committed .
+endm
+mod WHIPPLESCRIPT-ACTION-TERMINAL-REPLAY is
+  including WHIPPLESCRIPT-ACTION-WORKFLOW-TERMINALS .
+  rl [repeat] : replay(true) => duplicate .
+endm

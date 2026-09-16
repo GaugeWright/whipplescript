@@ -1,0 +1,58 @@
+--- DR-0100: recursion is a property of the current expansion PATH, not a
+--- global 'already used' set. This finite model derives it from actual call
+--- edges. Call-site paths distinguish two expansions of the same helper.
+fmod ACTION-CALL-GRAPH-STATE is
+  protecting BOOL .
+  sorts Action Site Trail Path Edge Graph Work .
+  ops review investigate assess : -> Action [ctor] .
+  ops one two three : -> Site [ctor] .
+  op nil : -> Trail [ctor] .
+  op _::_ : Action Trail -> Trail [ctor] .
+  op root : -> Path [ctor] .
+  op _/_ : Path Site -> Path [ctor] .
+  subsort Edge < Graph .
+  op edge : Action Action Site -> Edge [ctor] .
+  op empty : -> Graph [ctor] .
+  op __ : Graph Graph -> Graph [ctor assoc comm id: empty] .
+  op none : -> Work [ctor] .
+  op __ : Work Work -> Work [ctor assoc comm id: none] .
+  op visit : Action Trail Path Graph -> Work [ctor] .
+  op expanded : Action Path -> Work [ctor] .
+  op recursive : Action Trail Path -> Work [ctor] .
+  op contains : Action Trail -> Bool .
+  op children : Action Trail Path Graph Graph -> Work .
+  vars A B C : Action .
+  var T : Trail .
+  var P : Path .
+  var S : Site .
+  vars G WHOLE : Graph .
+  eq contains(A, nil) = false .
+  eq contains(A, B :: T) = (A == B) or contains(A, T) .
+  eq children(A, T, P, empty, WHOLE) = none .
+  eq children(A, T, P, edge(B, C, S) G, WHOLE) =
+    (if A == B then visit(C, T, P / S, WHOLE) else none fi)
+    children(A, T, P, G, WHOLE) .
+endfm
+
+mod WHIPPLESCRIPT-ACTION-CALL-GRAPH is
+  including ACTION-CALL-GRAPH-STATE .
+  var A : Action .
+  var T : Trail .
+  var P : Path .
+  var G : Graph .
+  crl [expand] : visit(A, T, P, G)
+    => expanded(A, P) children(A, A :: T, P, G, G)
+    if not contains(A, T) .
+  crl [refuse-cycle] : visit(A, T, P, G)
+    => recursive(A, T, P) if contains(A, T) .
+endm
+
+mod WHIPPLESCRIPT-ACTION-IGNORES-CYCLE is
+  including WHIPPLESCRIPT-ACTION-CALL-GRAPH .
+  var A : Action .
+  var T : Trail .
+  var P : Path .
+  var G : Graph .
+  --- Incorrectly expand a call whose definition is already on this path.
+  rl [ignore-cycle] : visit(A, T, P, G) => expanded(A, P) .
+endm

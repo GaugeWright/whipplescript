@@ -1,0 +1,69 @@
+--- A consumer resolves a source result without choosing a latest firing and
+--- derives only observational guidance. Uncertain external work is reconciled,
+--- never retried, until its owning recovery contract proves that safe.
+mod WHIPPLESCRIPT-ACTION-EXPLANATION-QUERY is
+ protecting NAT .
+ protecting BOOL .
+ sorts QueryOutcome Status Advice Authority Retry .
+ ops notFound selected ambiguous : -> QueryOutcome [ctor] .
+ op resolve : Nat -> QueryOutcome .
+ var N : Nat .
+ eq resolve(0) = notFound .
+ eq resolve(1) = selected .
+ ceq resolve(N) = ambiguous if N > 1 .
+
+ op firingMatches : Nat Nat -> Bool .
+ vars F G : Nat .
+ eq firingMatches(F, F) = true .
+ ceq firingMatches(F, G) = false if F =/= G .
+
+ ops waitingInput waitingOperation cancellation recovery uncertain failed
+     ready notSelected notReached : -> Status [ctor] .
+ ops noAuthority : -> Authority [ctor] .
+ ops retryDenied retryAllowed : -> Retry [ctor] .
+ op inspectResult : Nat Authority Retry -> Advice [ctor] .
+ op awaitOperation : Nat Authority Retry -> Advice [ctor] .
+ op awaitCancellation : Nat Authority Retry -> Advice [ctor] .
+ op observeRecovery : Nat Authority Retry -> Advice [ctor] .
+ op reconcileOperation : Nat Authority Retry -> Advice [ctor] .
+ op inspectCause : Nat Authority Retry -> Advice [ctor] .
+ op noAdvice : -> Advice [ctor] .
+ op advise : Status Nat -> Advice .
+ var I : Nat .
+ eq advise(waitingInput, I) = inspectResult(I, noAuthority, retryDenied) .
+ eq advise(waitingOperation, I) = awaitOperation(I, noAuthority, retryDenied) .
+ eq advise(cancellation, I) = awaitCancellation(I, noAuthority, retryDenied) .
+ eq advise(recovery, I) = observeRecovery(I, noAuthority, retryDenied) .
+ eq advise(uncertain, I) = reconcileOperation(I, noAuthority, retryDenied) .
+ eq advise(failed, I) = inspectCause(I, noAuthority, retryDenied) .
+ eq advise(ready, I) = noAdvice .
+ eq advise(notSelected, I) = noAdvice .
+ eq advise(notReached, I) = noAdvice .
+endm
+
+--- Wrong: more than one matching result silently chooses one as latest.
+mod WHIPPLESCRIPT-ACTION-EXPLANATION-QUERY-LATEST-WINS is
+ including WHIPPLESCRIPT-ACTION-EXPLANATION-QUERY .
+ op resolveLatest : Nat -> QueryOutcome .
+ var N : Nat .
+ eq resolveLatest(0) = notFound .
+ ceq resolveLatest(N) = selected if N > 0 .
+endm
+
+--- Wrong: uncertainty is presented as permission to retry external work.
+mod WHIPPLESCRIPT-ACTION-EXPLANATION-QUERY-UNSAFE-RETRY is
+ including WHIPPLESCRIPT-ACTION-EXPLANATION-QUERY .
+ op unsafeAdvice : Status Nat -> Advice .
+ var I : Nat .
+ eq unsafeAdvice(uncertain, I) =
+   reconcileOperation(I, noAuthority, retryAllowed) .
+endm
+
+--- Wrong: a branch that was not selected receives invented work guidance.
+mod WHIPPLESCRIPT-ACTION-EXPLANATION-QUERY-GUESSES-WORK is
+ including WHIPPLESCRIPT-ACTION-EXPLANATION-QUERY .
+ op guessedAdvice : Status Nat -> Advice .
+ var I : Nat .
+ eq guessedAdvice(notSelected, I) =
+   awaitOperation(I, noAuthority, retryDenied) .
+endm

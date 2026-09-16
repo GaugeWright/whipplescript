@@ -1,0 +1,11 @@
+load ../action-rule-roots.maude
+search [1] in WHIPPLESCRIPT-ACTION-RULE-ROOTS : analyze(declared, valid) =>* header .
+search [1] in WHIPPLESCRIPT-ACTION-RULE-ROOTS : analyze(unknownInput, valid) =>* header .
+search [1] in WHIPPLESCRIPT-ACTION-RULE-ROOTS-LOST : analyze(unknownInput, valid) =>* header .
+search [1] in WHIPPLESCRIPT-ACTION-RULE-ROOTS : analyze(declared, invalid) =>* header .
+search [1] in WHIPPLESCRIPT-ACTION-RULE-ROOTS-LOST : analyze(declared, invalid) =>* header .
+search [1] in WHIPPLESCRIPT-ACTION-RULE-ROOTS : analyze(declared, bodyRead) =>* header .
+search [1] in WHIPPLESCRIPT-ACTION-RULE-ROOTS-LOST : analyze(declared, bodyRead) =>* header .
+search [1] in WHIPPLESCRIPT-ACTION-RULE-ROOTS : reads(trigger, query) =>* trigger .
+search [1] in WHIPPLESCRIPT-ACTION-RULE-ROOTS-LOST : reads(trigger, query) =>* trigger .
+quit

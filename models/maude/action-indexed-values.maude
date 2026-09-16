@@ -1,0 +1,27 @@
+mod WHIPPLESCRIPT-ACTION-INDEXED-VALUES is
+  protecting BOOL .
+  sorts Operand State Type .
+  ops present missing pending failed wrongKey : -> Operand [ctor] .
+  ops value absent waiting failure invalid : -> State [ctor] .
+  ops required optional : -> Type [ctor] .
+  op lookup : Operand Operand -> State [ctor] .
+  op resultType : Bool -> Type .
+  eq resultType(true) = required .
+  eq resultType(false) = optional .
+  rl [read] : lookup(present, present) => value .
+  rl [missing] : lookup(missing, present) => absent .
+  rl [target-pending] : lookup(pending, present) => waiting .
+  rl [key-pending] : lookup(missing, pending) => waiting .
+  rl [key-failure] : lookup(missing, failed) => failure .
+  rl [key-type] : lookup(present, wrongKey) => invalid .
+  op selectedSubject : Bool Bool -> Bool .
+  vars S K : Bool .
+  eq selectedSubject(S, K) = S .
+endm
+mod WHIPPLESCRIPT-ACTION-INDEXED-VALUES-LOST is
+  including WHIPPLESCRIPT-ACTION-INDEXED-VALUES .
+  rl [pending-as-absent] : lookup(pending, present) => absent .
+  rl [skip-pending-key] : lookup(missing, pending) => absent .
+  rl [skip-failed-key] : lookup(missing, failed) => absent .
+  rl [wrong-key-as-missing] : lookup(present, wrongKey) => absent .
+endm

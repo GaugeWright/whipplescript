@@ -1,0 +1,19 @@
+error[construct.duplicate_binding]: view `duplicate` repeats parameter `value`
+  --> examples/invalid/bad-parameterized-views.whip:3:27
+  |
+3 | view duplicate(value int, value int) -> int {
+  |                           ^^^^^
+  = note: first parameter declared here (examples/invalid/bad-parameterized-views.whip:3:16)
+  = help: rename or remove the repeated parameter
+error[construct.parameterized_view_body]: parameterized view `malformed` must contain exactly one `return` expression
+  --> examples/invalid/bad-parameterized-views.whip:7:34
+  |
+7 | view malformed(value int) -> int {
+  |                                  ^
+  = help: replace the body with one pure `return <expression>`
+error[construct.recursive_view]: recursive parameterized view composition includes `first`
+   --> examples/invalid/bad-parameterized-views.whip:12:6
+   |
+12 | view first(value int) -> int {
+   |      ^^^^^
+   = help: break the cycle so every view expands to a finite expression

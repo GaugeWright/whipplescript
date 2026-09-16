@@ -1,0 +1,17 @@
+load ../action-resource-identity.maude
+search [1] in WHIPPLESCRIPT-ACTION-RESOURCE-IDENTITY : finish(alias(item(queueA))) =>* allowed .
+search [1] in WHIPPLESCRIPT-ACTION-RESOURCE-IDENTITY : finish(choice(item(queueA), claim(queueB))) =>* allowed .
+search [1] in WHIPPLESCRIPT-ACTION-RESOURCE-IDENTITY : finish(lease(leaseA)) =>* refused .
+search [1] in WHIPPLESCRIPT-ACTION-RESOURCE-IDENTITY : finish(rebuild(item(queueA))) =>* allowed .
+search [1] in WHIPPLESCRIPT-ACTION-RESOURCE-IDENTITY-LOST : finish(rebuild(item(queueA))) =>* allowed .
+search [1] in WHIPPLESCRIPT-ACTION-RESOURCE-IDENTITY : finish(transform(item(queueA))) =>* allowed .
+search [1] in WHIPPLESCRIPT-ACTION-RESOURCE-IDENTITY-LOST : finish(transform(item(queueA))) =>* allowed .
+search [1] in WHIPPLESCRIPT-ACTION-RESOURCE-IDENTITY : finish(choice(item(queueA), rebuild(item(queueB)))) =>* allowed .
+search [1] in WHIPPLESCRIPT-ACTION-RESOURCE-IDENTITY-LOST : finish(choice(item(queueA), rebuild(item(queueB)))) =>* allowed .
+search [1] in WHIPPLESCRIPT-ACTION-RESOURCE-IDENTITY : renew(alias(claim(queueA))) =>* trackerRenewed .
+search [1] in WHIPPLESCRIPT-ACTION-RESOURCE-IDENTITY : renew(lease(leaseA)) =>* leaseRenewed .
+search [1] in WHIPPLESCRIPT-ACTION-RESOURCE-IDENTITY : renew(claim(queueA)) =>* leaseRenewed .
+search [1] in WHIPPLESCRIPT-ACTION-RESOURCE-IDENTITY-LOST : renew(claim(queueA)) =>* leaseRenewed .
+search [1] in WHIPPLESCRIPT-ACTION-RESOURCE-IDENTITY : renew(item(queueA)) =>* trackerRenewed .
+search [1] in WHIPPLESCRIPT-ACTION-RESOURCE-IDENTITY-LOST : renew(item(queueA)) =>* trackerRenewed .
+quit

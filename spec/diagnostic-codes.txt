@@ -37,6 +37,7 @@ construct.ambiguous_root_workflow COVERED
 construct.capability_not_declared COVERED
 construct.cardinality_conflict COVERED
 construct.dead_measure PROVISIONAL
+construct.duplicate_binding COVERED
 construct.duplicate_declaration COVERED
 construct.duplicate_field COVERED
 construct.duplicate_include PROVISIONAL
@@ -47,14 +48,17 @@ construct.incompatible_clause PROVISIONAL
 construct.invalid_clause PROVISIONAL
 construct.invalid_clause_value COVERED
 construct.invalid_declaration_scope PROVISIONAL
-construct.invalid_expansion PROVISIONAL
+construct.invalid_expansion COVERED
 construct.invalid_include_path PROVISIONAL
 construct.invalid_pattern_argument PROVISIONAL
 construct.missing_requirement COVERED
 construct.missing_timezone COVERED
 construct.missing_workflow COVERED
 construct.near_miss_tag PROVISIONAL
+construct.parameterized_view_body COVERED
 construct.pattern_terminal_action PROVISIONAL
+construct.recursive_view COVERED
+construct.redundant_success_alias COVERED
 construct.reserved_name PROVISIONAL
 construct.tag_conflict PROVISIONAL
 construct.type_argument_arity PROVISIONAL
@@ -99,7 +103,7 @@ expr.unorderable_types COVERED
 expr.unreachable_case_branch COVERED
 expr.unsatisfiable_comparison COVERED
 expr.unsupported_argument_type COVERED
-expr.unsupported_function PROVISIONAL
+expr.unsupported_function COVERED
 expr.untyped_case_scrutinee COVERED
 expr.untyped_object_literal COVERED
 expr.variant_without_payload PROVISIONAL
@@ -149,7 +153,7 @@ lowering.internal PROVISIONAL
 lowering.unexpanded_pattern_application PROVISIONAL
 package_set.unknown_package PROVISIONAL
 parse.invalid_content_type PROVISIONAL
-parse.invalid_expression COVERED
+parse.invalid_expression PROVISIONAL
 parse.invalid_field_assignment PROVISIONAL
 parse.invalid_measure PROVISIONAL
 parse.invalid_name PROVISIONAL

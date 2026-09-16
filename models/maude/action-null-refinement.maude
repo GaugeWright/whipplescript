@@ -1,0 +1,31 @@
+mod WHIPPLESCRIPT-ACTION-NULL-REFINEMENT is
+  protecting BOOL .
+  sorts Domain Guard .
+  ops nullable presentOnly absentOnly : -> Domain [ctor] .
+  ops isNull notNull nonNullAndUnknown nonNullOrUnknown : -> Guard [ctor] .
+  op refine : Domain Guard -> Domain [ctor] .
+  op fallbackAfterNull : Bool -> Domain [ctor] .
+  op shadow : Domain Domain -> Domain [ctor] .
+  rl [null-arm] : refine(nullable, isNull) => absentOnly .
+  rl [nonnull-arm] : refine(nullable, notNull) => presentOnly .
+  rl [and] : refine(nullable, nonNullAndUnknown) => presentOnly .
+  rl [or] : refine(nullable, nonNullOrUnknown) => nullable .
+  rl [unguarded-null] : fallbackAfterNull(false) => presentOnly .
+  rl [guarded-null] : fallbackAfterNull(true) => nullable .
+  sorts Pattern Value .
+  ops nullPattern quotedNullPattern : -> Pattern [ctor] .
+  ops nullValue stringNullValue : -> Value [ctor] .
+  op matchesValue : Pattern Value -> Bool [ctor] .
+  rl [match-absence] : matchesValue(nullPattern, nullValue) => true .
+  rl [quoted-is-not-absence] : matchesValue(quotedNullPattern, nullValue) => false .
+  rl [match-string] : matchesValue(quotedNullPattern, stringNullValue) => true .
+  vars OLD NEW : Domain .
+  rl [new-binding] : shadow(OLD, NEW) => NEW .
+endm
+mod WHIPPLESCRIPT-ACTION-NULL-REFINEMENT-LOST is
+  including WHIPPLESCRIPT-ACTION-NULL-REFINEMENT .
+  rl [assume-unknown-false] : refine(nullable, nonNullOrUnknown) => presentOnly .
+  rl [ignore-guard] : fallbackAfterNull(true) => presentOnly .
+  rl [skip-optional-null] : matchesValue(nullPattern, nullValue) => false .
+  rl [keep-outer-proof] : shadow(presentOnly, nullable) => presentOnly .
+endm

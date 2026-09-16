@@ -1,0 +1,21 @@
+--- Original input influence survives helper extraction and control nesting.
+fmod MANAGED-INPUT-SELECTORS is
+ protecting BOOL .
+ op crossing : Bool Bool Bool -> Bool .
+ vars V M G : Bool .
+ eq crossing(V, M, G) = V or (M and G) .
+endfm
+mod WHIPPLESCRIPT-MANAGED-INPUT-SELECTORS is
+ protecting MANAGED-INPUT-SELECTORS .
+ sort State .
+ op select : Bool Bool Bool Bool -> State [ctor] .
+ op allowed : -> State [ctor] .
+ vars V M G S : Bool .
+ crl [check] : select(V, M, G, S) => allowed if crossing(V, M, G) and S .
+endm
+mod WHIPPLESCRIPT-MANAGED-INPUT-SELECTORS-LOST is
+ including WHIPPLESCRIPT-MANAGED-INPUT-SELECTORS .
+ vars V M G S : Bool .
+ rl [lost-source] : select(V, M, G, true) => allowed .
+ crl [lost-destination] : select(V, M, G, S) => allowed if crossing(V, M, G) .
+endm

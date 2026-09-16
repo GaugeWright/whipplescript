@@ -4,6 +4,7 @@ pub mod attempt_admission;
 pub mod branches;
 pub mod bundle;
 pub mod chunking;
+pub mod coerce_settlement;
 pub mod content;
 pub mod coordination;
 pub mod dependency_graph;
@@ -46,6 +47,7 @@ pub mod norm_resources;
 #[cfg(feature = "native")]
 pub mod payload_protection;
 pub mod preflight;
+pub mod projection_prefix;
 pub mod read_through;
 pub mod reconcile;
 pub mod ref_authority;
@@ -112,7 +114,7 @@ pub fn run_block_event_key(legacy: &str, payload: &str, original: Option<&str>) 
 /// understands. Must stay equal to the highest version in `MIGRATIONS`
 /// (asserted by test); `apply_migrations` refuses to open a store stamped
 /// beyond it instead of silently misreading a newer layout.
-pub const SUPPORTED_SCHEMA_VERSION: i64 = 3;
+pub const SUPPORTED_SCHEMA_VERSION: i64 = 4;
 
 /// Stamp a satellite store's schema generation, and refuse one stamped beyond
 /// what this build understands.
@@ -247,6 +249,12 @@ impl GuardKind {
             Self::SequenceContention => "sequence contention",
         }
     }
+}
+
+#[cfg(feature = "native")]
+enum TerminalAttachment<'a> {
+    File(file_settlement::FileSettlementFact<'a>),
+    Coerce(coerce_settlement::CoerceSettlementFact<'a>),
 }
 
 #[derive(Debug)]
@@ -634,6 +642,9 @@ pub struct RuleCommit<'a> {
 pub struct RuleCommitRevisionGuard<'a> {
     pub program_version_id: &'a str,
     pub revision_epoch: i64,
+    /// Optional event frontier evaluated by this lowering. Checked atomically
+    /// before a new commit; an exact replay needs no new admission.
+    pub evaluated_frontier: Option<i64>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -641,6 +652,9 @@ pub struct WorkflowTerminal<'a> {
     pub kind: WorkflowTerminalKind,
     pub name: &'a str,
     pub payload_json: &'a str,
+    /// Recorded read premises for the terminal payload. `None` means the
+    /// producer did not supply a trace; it never means complete and empty.
+    pub validity_json: Option<&'a str>,
     pub idempotency_key: Option<&'a str>,
 }
 
@@ -683,6 +697,9 @@ pub struct NewFact<'a> {
     pub provenance_class: &'a str,
     pub correlation_id: Option<&'a str>,
     pub source_span_json: Option<&'a str>,
+    /// Recorded read premises for this admission generation. `None` preserves
+    /// a legacy or external producer's partial trace without inventing closure.
+    pub validity_json: Option<&'a str>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1328,6 +1345,7 @@ pub struct FactView {
     pub value_json: String,
     pub provenance_class: String,
     pub source_span_json: Option<String>,
+    pub validity_json: Option<String>,
     /// The event that ADMITTED this fact (its current liveness generation).
     /// A consumed-then-re-recorded fact keeps its content identity but gains
     /// a fresh admitting event; the stepper folds this into a firing's
@@ -1633,7 +1651,28 @@ const MIGRATIONS: &[Migration] = &[
         name: "native-payload-protection",
         sql: include_str!("../migrations/0003_native_payload_protection.sql"),
     },
+    // Version 4, not 3: this branch and `main` each took the next free number
+    // while apart, and a migration version identifies one layout.
+    Migration {
+        version: 4,
+        name: "fact-validity",
+        sql: include_str!("../migrations/0004_fact_validity.sql"),
+    },
 ];
+
+/// The schema owner an existing runtime store must carry: the name of its
+/// newest migration, which is what `apply_migrations` leaves in the top
+/// `schema_migrations` row and what `native_existing::validate` compares
+/// against to tell a runtime store from a coordination or work-item one.
+///
+/// Derived, not written out. Two protected-reopen sites spelled it
+/// `"native-payload-protection"` -- the name of migration 3 -- so adding
+/// migration 4 made every protected reopen refuse its own file, reporting the
+/// store's most recent migration as a foreign schema owner. A literal that has
+/// to be edited in step with this list, from another module, with nothing
+/// checking that it was.
+#[cfg(feature = "native")]
+pub(crate) const RUNTIME_SCHEMA_OWNER: &str = MIGRATIONS[MIGRATIONS.len() - 1].name;
 
 /// Stage marker retained for the CLI/kernel scaffold.
 pub fn store_stage() -> &'static str {
@@ -3063,6 +3102,16 @@ impl SqliteStore {
                 )));
             }
         }
+        if let Some(frontier) = guard.and_then(|guard| guard.evaluated_frontier) {
+            let head = chain_head_on(&tx, commit.instance_id)?;
+            if head.sequence.unwrap_or(0) != frontier {
+                return Err(StoreError::GuardRefused {
+                    guard: GuardKind::CompareAndSet,
+                    instance_id: commit.instance_id.to_owned(),
+                    detail: format!("rule evaluated at event {frontier}, but the log advanced to {}; re-read before committing", head.sequence.unwrap_or(0)),
+                });
+            }
+        }
         let event = append_event_on(
             &tx,
             NewEvent {
@@ -3377,6 +3426,7 @@ impl SqliteStore {
                     provenance_class: "import",
                     correlation_id: batch.correlation_id,
                     source_span_json: None,
+                    validity_json: None,
                 },
             )?;
             admitted += 1;
@@ -3520,7 +3570,23 @@ impl SqliteStore {
             completion,
             diagnostic,
             completion.status,
-            Some(fact),
+            Some(TerminalAttachment::File(fact)),
+        );
+        self.record_terminal_refusal(completion, completion.status, outcome)
+    }
+
+    pub fn settle_coerce_effect(
+        &mut self,
+        completion: EffectCompletion<'_>,
+        diagnostic: Option<TerminalDiagnosticRecord>,
+        fact: coerce_settlement::CoerceSettlementFact<'_>,
+    ) -> StoreResult<StoredEvent> {
+        fact.validate(completion)?;
+        let outcome = self.complete_effect_terminal_inner(
+            completion,
+            diagnostic,
+            completion.status,
+            Some(TerminalAttachment::Coerce(fact)),
         );
         self.record_terminal_refusal(completion, completion.status, outcome)
     }
@@ -3530,7 +3596,7 @@ impl SqliteStore {
         completion: EffectCompletion<'_>,
         diagnostic: Option<TerminalDiagnosticRecord>,
         run_status: &str,
-        fact: Option<file_settlement::FileSettlementFact<'_>>,
+        fact: Option<TerminalAttachment<'_>>,
     ) -> StoreResult<StoredEvent> {
         let tx = self
             .connection
@@ -3553,7 +3619,9 @@ impl SqliteStore {
         completion: EffectCompletion<'_>,
         diagnostic: Option<TerminalDiagnosticRecord>,
         run_status: &str,
-        fact: Option<file_settlement::FileSettlementFact<'_>>,
+        // A settlement attaches a file fact OR a coercion result, so this is
+        // the attachment rather than the file fact it used to be.
+        fact: Option<TerminalAttachment<'_>>,
         facts: &[SettlementFact<'_>],
         cache: Option<SettlementCache<'_>>,
     ) -> StoreResult<StoredEvent> {
@@ -3725,8 +3793,14 @@ impl SqliteStore {
                 ));
             }
         }
-        if let Some(fact) = fact {
-            file_settlement::append_fact(tx, completion, &event, fact)?;
+        match fact {
+            Some(TerminalAttachment::File(fact)) => {
+                file_settlement::append_fact(tx, completion, &event, fact)?
+            }
+            Some(TerminalAttachment::Coerce(fact)) => {
+                coerce_settlement::append_result(tx, completion, fact)?
+            }
+            None => {}
         }
         Ok(event)
     }
@@ -5934,7 +6008,12 @@ impl SqliteStore {
                 whip_payload_open('runtime.facts.value_json', json_array(facts.instance_id, facts.name, facts.key), value_json),
                 provenance_class,
                 whip_payload_open('runtime.facts.source_span_json', json_array(facts.instance_id, facts.name, facts.key), source_span_json),
-                source_event_id
+                source_event_id,
+                -- Validity is a JSON array of intervals over the fact's own
+                -- key and name, both of which are protected above. It carries
+                -- no workflow payload of its own, so it is read in the clear
+                -- like `provenance_class` beside it.
+                validity_json
             FROM facts
             WHERE instance_id = ?1{consumed_clause}
             ORDER BY name, natural_key
@@ -5952,6 +6031,7 @@ impl SqliteStore {
                     provenance_class: row.get(6)?,
                     source_span_json: row.get(7)?,
                     source_event_id: row.get::<_, Option<String>>(8)?.unwrap_or_default(),
+                    validity_json: row.get(9)?,
                 })
             })?
             .collect::<result::Result<Vec<_>, _>>()?;
@@ -6592,7 +6672,7 @@ impl SqliteStore {
                 settlement.completion,
                 settlement.diagnostic,
                 settlement.completion.status,
-                Some(settlement.fact),
+                Some(TerminalAttachment::File(settlement.fact)),
                 &[],
                 None,
             )?
@@ -8305,8 +8385,16 @@ pub trait RuntimeStore {
     ) -> StoreResult<StoredEvent>;
     fn complete_effect(&mut self, completion: EffectCompletion<'_>) -> StoreResult<StoredEvent>;
 
-    /// Atomically commit a file terminal, its projections/diagnostic and its
-    /// ordinary workflow fact. No default can split these across transactions.
+    /// Atomically commit a coerce terminal, its projections/diagnostic, result
+    /// event and ordinary workflow fact. No default can split these across transactions.
+    fn settle_coerce_effect(
+        &mut self,
+        completion: EffectCompletion<'_>,
+        diagnostic: Option<TerminalDiagnosticRecord>,
+        fact: coerce_settlement::CoerceSettlementFact<'_>,
+    ) -> StoreResult<StoredEvent>;
+
+    /// Atomically commit the file terminal and its workflow fact.
     fn settle_file_effect(
         &mut self,
         completion: EffectCompletion<'_>,
@@ -8476,6 +8564,17 @@ pub trait RuntimeStore {
     fn list_instances(&self) -> StoreResult<Vec<InstanceView>>;
     fn get_instance(&self, instance_id: &str) -> StoreResult<Option<InstanceView>>;
     fn list_events(&self, instance_id: &str) -> StoreResult<Vec<EventView>>;
+    /// Reconstruct the event-sourced fact/effect world at one exact event
+    /// frontier without changing the live projection tables. Native and hosted
+    /// stores share this fold so captured action projection cannot drift by
+    /// placement.
+    fn projection_prefix(
+        &self,
+        instance_id: &str,
+        frontier: i64,
+    ) -> StoreResult<projection_prefix::ProjectionPrefix> {
+        projection_prefix::fold(&self.list_events(instance_id)?, frontier)
+    }
     /// The already-recorded event carrying this `(instance_id, idempotency_key)`
     /// pair, if any — the read side of the events unique index
     /// (migrations/0001), so an admission driver can absorb a re-delivered
@@ -8722,6 +8821,15 @@ impl RuntimeStore for SqliteStore {
     fn admit_fact_batch(&mut self, batch: FactBatch<'_>) -> StoreResult<FactBatchOutcome> {
         self.admit_fact_batch(batch)
     }
+    fn settle_coerce_effect(
+        &mut self,
+        completion: EffectCompletion<'_>,
+        diagnostic: Option<TerminalDiagnosticRecord>,
+        fact: coerce_settlement::CoerceSettlementFact<'_>,
+    ) -> StoreResult<StoredEvent> {
+        self.settle_coerce_effect(completion, diagnostic, fact)
+    }
+
     fn retain_exec_outcome(
         &mut self,
         observation: crate::exec_outcome::Retention<'_>,
@@ -9797,46 +9905,20 @@ pub fn restore_marker_target(payload_json: &str) -> Option<i64> {
         .and_then(Value::as_i64)
 }
 
-#[cfg(feature = "native")]
-/// The unguarded append: no expected head, no epoch — and therefore it must
-/// still behave the way it did before the chain existed, which means a
-/// concurrent writer is something to retry past rather than report.
-///
-/// **This retry is a regression fix, and the regression was mine.** Before
-/// DR-0067 the sequence was computed *inside* the INSERT
-/// (`SELECT COALESCE(MAX(sequence), 0) + 1 ...` as a subquery), so SQLite
-/// evaluated it under the write lock and concurrent appends to one instance
-/// serialized with no possible collision. Chaining moved the head read into a
-/// separate statement, because the digest has to commit to a sequence the
-/// INSERT has not chosen yet — and that opened a window where two threads read
-/// the same head, computed the same sequence, and the loser's append was simply
-/// lost. `dev_native_fixture_stress_records_one_terminal_per_effect` caught it
-/// intermittently, which is exactly how this class of bug shows up.
-///
-/// The guarded paths do NOT retry: a caller that passed an expected head or an
-/// epoch asked to be told about contention, and swallowing it there would
-/// defeat the point of asking.
+/// Serialize an unguarded append's head read and insert under one writer lock.
+/// Existing transactions retain commit/rollback ownership; an autocommit caller
+/// waits for write access using the connection's busy policy before reading.
+/// Explicit head-CAS and owner-epoch paths retain their separate guard checks.
 #[cfg(feature = "native")]
 fn append_event_on(connection: &Connection, event: NewEvent<'_>) -> StoreResult<StoredEvent> {
-    // Bounded: a livelock under extreme contention should surface as an error,
-    // not spin. Each attempt re-reads the head, so a retry races afresh rather
-    // than replaying a stale sequence.
-    const ATTEMPTS: usize = 16;
-    let mut last = None;
-    for _ in 0..ATTEMPTS {
-        match append_event_chained_on(connection, None, None, event) {
-            Ok(stored) => return Ok(stored),
-            Err(StoreError::Conflict(message)) if message.contains("is already taken") => {
-                last = Some(StoreError::Conflict(message));
-            }
-            Err(other) => return Err(other),
-        }
+    if !connection.is_autocommit() {
+        return append_event_chained_on(connection, None, None, event);
     }
-    Err(last.unwrap_or_else(|| StoreError::GuardRefused {
-        guard: GuardKind::SequenceContention,
-        instance_id: event.instance_id.to_owned(),
-        detail: format!("did not clear in {ATTEMPTS} attempts"),
-    }))
+    let transaction =
+        rusqlite::Transaction::new_unchecked(connection, rusqlite::TransactionBehavior::Immediate)?;
+    let stored = append_event_chained_on(&transaction, None, None, event)?;
+    transaction.commit()?;
+    Ok(stored)
 }
 
 /// DR-0067 §2 and §3 together: append only if the head is still `expected_head`
@@ -10045,6 +10127,11 @@ fn append_event_idempotent_on(
 
 #[cfg(feature = "native")]
 fn derive_fact_on(connection: &Connection, derived: DerivedFact<'_>) -> StoreResult<StoredEvent> {
+    // `validity` travels on the derivation EVENT, not only in the row: main
+    // moved this payload out of `derive_fact_retained` and into here while this
+    // branch was adding the field to it, so the two edits met as a call site
+    // with nothing left to build and a builder that had never heard of it.
+    let validity = validity_json_value(derived.fact.validity_json, "fact")?;
     let payload = json!({
         "fact_id": derived.fact.fact_id,
         "name": derived.fact.name,
@@ -10053,6 +10140,7 @@ fn derive_fact_on(connection: &Connection, derived: DerivedFact<'_>) -> StoreRes
         "schema_id": derived.fact.schema_id,
         "provenance_class": derived.fact.provenance_class,
         "correlation_id": derived.fact.correlation_id,
+        "validity": validity.unwrap_or(Value::Null),
     })
     .to_string();
     // Replay-tolerant: a re-derivation under an existing idempotency key is
@@ -10137,12 +10225,13 @@ fn insert_fact(
     if let Some(source_span_json) = fact.source_span_json {
         serde_json::from_str::<Value>(source_span_json)?;
     }
+    validity_json_value(fact.validity_json, "fact")?;
     connection.execute(
         r#"
         INSERT INTO facts (
             fact_id, instance_id, program_version_id, revision_epoch, name, key,
             value_json, source_event_id, source_rule, schema_id, provenance_class,
-            correlation_id, source_span_json, key_payload
+            correlation_id, source_span_json, key_payload, validity_json
         )
         VALUES (
             ?1, ?2, ?3, ?4, ?5, whip_runtime_fact_key(?6),
@@ -10152,7 +10241,8 @@ fn insert_fact(
             whip_payload_seal('runtime.facts.source_span_json',
                 json_array(?2, ?5, whip_runtime_fact_key(?6)), ?13),
             whip_payload_seal('runtime.facts.key',
-                json_array(?2, ?5, whip_runtime_fact_key(?6)), ?6)
+                json_array(?2, ?5, whip_runtime_fact_key(?6)), ?6),
+            ?14
         )
         ON CONFLICT(instance_id, name, key) DO UPDATE SET
             consumed_at = NULL,
@@ -10162,6 +10252,7 @@ fn insert_fact(
             source_rule = excluded.source_rule,
             program_version_id = excluded.program_version_id,
             revision_epoch = excluded.revision_epoch,
+            validity_json = excluded.validity_json,
             updated_at = CURRENT_TIMESTAMP
         WHERE facts.consumed_at IS NOT NULL
         "#,
@@ -10179,6 +10270,7 @@ fn insert_fact(
             fact.provenance_class,
             fact.correlation_id,
             fact.source_span_json,
+            fact.validity_json,
         ],
     )?;
     Ok(())
@@ -12829,6 +12921,7 @@ fn rule_commit_payload(
             if let Some(source_span_json) = fact.source_span_json {
                 serde_json::from_str::<Value>(source_span_json)?;
             }
+            let validity = validity_json_value(fact.validity_json, "fact")?;
             Ok(json!({
                 "fact_id": fact.fact_id,
                 "name": fact.name,
@@ -12843,6 +12936,7 @@ fn rule_commit_payload(
                     .map(serde_json::from_str::<Value>)
                     .transpose()?
                     .unwrap_or(Value::Null),
+                "validity": validity.unwrap_or(Value::Null),
             }))
         })
         .collect::<StoreResult<Vec<_>>>()?;
@@ -12930,14 +13024,27 @@ fn workflow_terminal_payload(
     commit: RuleCommit<'_>,
     terminal: WorkflowTerminal<'_>,
 ) -> StoreResult<String> {
+    let validity = validity_json_value(terminal.validity_json, "workflow terminal")?;
     let payload = json!({
         "workflow_action": terminal.kind.action(),
         "workflow_status": terminal.kind.instance_status(),
         "terminal_name": terminal.name,
         "payload": serde_json::from_str::<Value>(terminal.payload_json)?,
         "rule": commit.rule,
+        "validity": validity.unwrap_or(Value::Null),
     });
     serde_json::to_string(&payload).map_err(Into::into)
+}
+
+#[cfg(feature = "native")]
+fn validity_json_value(value: Option<&str>, subject: &str) -> StoreResult<Option<Value>> {
+    let validity = value.map(serde_json::from_str::<Value>).transpose()?;
+    if validity.as_ref().is_some_and(|value| !value.is_array()) {
+        return Err(StoreError::Conflict(format!(
+            "{subject} validity must be a JSON array"
+        )));
+    }
+    Ok(validity)
 }
 
 #[cfg(feature = "native")]
@@ -13119,6 +13226,10 @@ fn replay_rule_commit(
             .map(Value::to_string)
             .unwrap_or_else(|| "{}".to_owned());
         let source_span_json = fact.get("source_span").map(Value::to_string);
+        let validity_json = fact
+            .get("validity")
+            .filter(|value| !value.is_null())
+            .map(Value::to_string);
         let program_version_id = fact
             .get("program_version_id")
             .and_then(Value::as_str)
@@ -13139,6 +13250,7 @@ fn replay_rule_commit(
                 .unwrap_or("replayed"),
             correlation_id: fact.get("correlation_id").and_then(Value::as_str),
             source_span_json: source_span_json.as_deref(),
+            validity_json: validity_json.as_deref(),
         };
         insert_fact(
             connection,
@@ -13275,6 +13387,10 @@ fn replay_fact_derived(
         .cloned()
         .unwrap_or(Value::Null)
         .to_string();
+    let validity_json = payload
+        .get("validity")
+        .filter(|value| !value.is_null())
+        .map(Value::to_string);
     let fact = NewFact {
         fact_id,
         name,
@@ -13287,6 +13403,7 @@ fn replay_fact_derived(
             .unwrap_or("derived"),
         correlation_id: payload.get("correlation_id").and_then(Value::as_str),
         source_span_json: None,
+        validity_json: validity_json.as_deref(),
     };
     let (program_version_id, revision_epoch) = active_revision_on(connection, instance_id)?;
     insert_fact(
@@ -14952,6 +15069,8 @@ mod tests {
                 .is_empty());
         }
     }
+    #[cfg(feature = "native")]
+    mod native_append_tests;
 
     #[test]
     fn store_scaffold_links_to_core() {
@@ -15159,15 +15278,90 @@ mod tests {
     #[test]
     fn provider_trust_evidence_is_a_separate_stamped_migration() {
         let store = SqliteStore::open_in_memory().expect("store opens");
-        let versions: Vec<i64> = store
+        let stamped: Vec<(i64, String)> = store
             .connection
-            .prepare("SELECT version FROM schema_migrations ORDER BY version")
+            .prepare("SELECT version, name FROM schema_migrations ORDER BY version")
             .expect("prepare")
-            .query_map([], |row| row.get(0))
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
             .expect("query")
             .collect::<Result<Vec<_>, _>>()
             .expect("rows");
-        assert_eq!(versions, vec![1, 2, 3]);
+        // Against MIGRATIONS rather than a written-out list. The claim is that
+        // every migration stamps its own row and that the evidence table is one
+        // of them; a literal restates that as a number, which goes stale the
+        // next time a migration is added -- which is how this test came to fail
+        // on migration 4, about which it says nothing.
+        assert_eq!(
+            stamped,
+            MIGRATIONS
+                .iter()
+                .map(|migration| (migration.version, migration.name.to_owned()))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            stamped
+                .iter()
+                .any(|(version, name)| *version == 2 && name == "provider-trust-evidence"),
+            "the evidence table upgrades a store stamped at 1: {stamped:?}"
+        );
+    }
+
+    #[test]
+    fn opening_v2_store_adds_optional_fact_validity() {
+        let path = std::env::temp_dir().join(format!(
+            "whipplescript-store-v2-validity-{}-{}.sqlite",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time")
+                .as_nanos()
+        ));
+        {
+            let connection = Connection::open(&path).expect("v2 db opens");
+            connection
+                .execute_batch(MIGRATIONS[0].sql)
+                .expect("v1 schema creates");
+            connection
+                .execute_batch(MIGRATIONS[1].sql)
+                .expect("v2 schema creates");
+            connection
+                .execute_batch(
+                    r#"
+                    CREATE TABLE schema_migrations (
+                        version INTEGER PRIMARY KEY,
+                        name TEXT NOT NULL,
+                        applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                    );
+                    INSERT INTO schema_migrations (version, name)
+                    VALUES (1, 'runtime-store-schema'),
+                           (2, 'provider-trust-evidence');
+                    INSERT INTO facts (
+                        fact_id, instance_id, name, key, value_json,
+                        provenance_class
+                    ) VALUES ('legacy', 'instance-a', 'Ready', 'ready', '{}', 'external');
+                    "#,
+                )
+                .expect("v2 stamp and legacy fact create");
+        }
+
+        let store = SqliteStore::open(&path).expect("store upgrades v2 schema");
+        assert!(column_exists(&store.connection, "facts", "validity_json")
+            .expect("fact validity column lookup"));
+        let validity: Option<String> = store
+            .connection
+            .query_row(
+                "SELECT validity_json FROM facts WHERE fact_id = 'legacy'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("legacy fact reads");
+        assert_eq!(validity, None, "an old fact gains no invented premises");
+        assert_eq!(
+            store.schema_version().expect("schema version"),
+            SUPPORTED_SCHEMA_VERSION
+        );
+
+        fs::remove_file(path).expect("v2 db removes");
     }
 
     /// Drive the store through the `RuntimeStore` trait as a `&dyn` object:
@@ -16613,6 +16807,58 @@ mod tests {
     }
 
     #[test]
+    fn fact_and_terminal_validity_refuse_non_array_json() {
+        let mut store = SqliteStore::open_in_memory().expect("store opens");
+        let mut invalid_fact = test_fact("fact-invalid", "Ready", "ready");
+        invalid_fact.validity_json = Some("{}");
+        let fact_result = store.commit_rule(RuleCommit {
+            instance_id: "instance-a",
+            rule: "invalid-fact",
+            trigger_event_id: None,
+            facts: &[invalid_fact],
+            consumed_fact_ids: &[],
+            effects: &[],
+            dependencies: &[],
+            terminal: None,
+            idempotency_key: Some("invalid-fact"),
+            marks: &[],
+            context_json: None,
+        });
+        assert!(matches!(
+            fact_result,
+            Err(StoreError::Conflict(message))
+                if message == "fact validity must be a JSON array"
+        ));
+
+        let terminal_result = store.commit_rule(RuleCommit {
+            instance_id: "instance-a",
+            rule: "invalid-terminal",
+            trigger_event_id: None,
+            facts: &[],
+            consumed_fact_ids: &[],
+            effects: &[],
+            dependencies: &[],
+            terminal: Some(WorkflowTerminal {
+                kind: WorkflowTerminalKind::Completed,
+                name: "result",
+                payload_json: "{}",
+                validity_json: Some("{}"),
+                idempotency_key: Some("invalid-terminal-event"),
+            }),
+            idempotency_key: Some("invalid-terminal"),
+            marks: &[],
+            context_json: None,
+        });
+        assert!(matches!(
+            terminal_result,
+            Err(StoreError::Conflict(message))
+                if message == "workflow terminal validity must be a JSON array"
+        ));
+        assert_eq!(row_count(&store, "events"), 0);
+        assert_eq!(row_count(&store, "facts"), 0);
+    }
+
+    #[test]
     fn rule_commit_with_workflow_terminal_updates_instance_atomically() {
         let mut store = SqliteStore::open_in_memory().expect("store opens");
         let version = store
@@ -16639,6 +16885,7 @@ mod tests {
                     kind: WorkflowTerminalKind::Completed,
                     name: "result",
                     payload_json: r#"{"status":"ok"}"#,
+                    validity_json: Some(r#"[{"frontier":1,"kind":"fact","head":"Evidence","guard_json":null,"members":[]}]"#),
                     idempotency_key: Some("workflow-complete-result"),
                 }),
                 idempotency_key: Some("commit-finish"),
@@ -16661,6 +16908,16 @@ mod tests {
             .expect("terminal event type");
         // 1 `instance.created`, 2 `rule.committed`, 3 the terminal.
         assert_eq!(event_type, "workflow.completed");
+        let terminal_payload: Value = store
+            .connection
+            .query_row(
+                "SELECT payload_json FROM events WHERE instance_id = ?1 AND sequence = 3",
+                [&instance.instance_id],
+                |row| row.get::<_, String>(0),
+            )
+            .map(|payload| serde_json::from_str(&payload).unwrap())
+            .expect("terminal payload");
+        assert_eq!(terminal_payload["validity"][0]["head"], "Evidence");
 
         let duplicate = store.commit_rule(RuleCommit {
             instance_id: &instance.instance_id,
@@ -17442,6 +17699,7 @@ mod tests {
                     provenance_class: "derived",
                     correlation_id: Some("claim"),
                     source_span_json: None,
+                    validity_json: None,
                 },
                 source: "kernel",
                 causation_id: None,
@@ -18376,6 +18634,7 @@ mod tests {
                     kind: WorkflowTerminalKind::Completed,
                     name: "result",
                     payload_json: "{}",
+                    validity_json: None,
                     idempotency_key: Some("workflow-complete-terminal-guard"),
                 }),
                 idempotency_key: Some("commit-finish-terminal-guard"),
@@ -18593,6 +18852,7 @@ mod tests {
                 context_json: None,
             },
             RuleCommitRevisionGuard {
+                evaluated_frontier: None,
                 program_version_id: &version1.version_id,
                 revision_epoch: 0,
             },
@@ -18604,6 +18864,11 @@ mod tests {
                 if message.contains("active revision changed before rule commit")
         ));
         assert_eq!(row_count(&store, "effects"), 0);
+    }
+
+    #[test]
+    fn action_capture_rule_frontier_conformance() {
+        crate::log_append::conformance::run_rule_frontier(SqliteStore::open_in_memory().unwrap());
     }
 
     /// G1 of the instance view-model note: a program version records
@@ -19921,6 +20186,7 @@ mod tests {
                         provenance_class: "derived",
                         correlation_id: None,
                         source_span_json: None,
+                        validity_json: None,
                     },
                 ],
                 consumed_fact_ids: &[],
@@ -20712,6 +20978,7 @@ mod tests {
                         provenance_class: "derived",
                         correlation_id: None,
                         source_span_json: None,
+                        validity_json: None,
                     },
                     source: "kernel",
                     causation_id: None,
@@ -20865,6 +21132,7 @@ mod tests {
                     provenance_class: "derived",
                     correlation_id: None,
                     source_span_json: None,
+                    validity_json: None,
                 },
                 source: "kernel",
                 causation_id: None,
@@ -24784,6 +25052,7 @@ mod tests {
             provenance_class: "derived",
             correlation_id: None,
             source_span_json: None,
+            validity_json: None,
         }
     }
 

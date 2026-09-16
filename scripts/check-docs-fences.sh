@@ -125,7 +125,7 @@ EXPECTED = {
     "docs/manual/03-expressions.md": 1,
     "docs/manual/04-rules.md": 5,
     "docs/manual/05-effects.md": 2,
-    "docs/manual/06-error-handling.md": 3,
+    "docs/manual/06-error-handling.md": 7,
     "docs/manual/07-case.md": 2,
     "docs/manual/08-coerce.md": 3,
     "docs/manual/09-then.md": 1,

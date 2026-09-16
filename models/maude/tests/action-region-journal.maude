@@ -1,0 +1,21 @@
+load ../action-region-journal.maude
+search [1] in WHIPPLESCRIPT-ACTION-REGION-JOURNAL : write(nil, f1r1, 2, holding) =>* accepted(cut(f1r1, 2, holding, nil)) .
+search [1] in WHIPPLESCRIPT-ACTION-REGION-JOURNAL : write(nil, f1r1, 2, lapsed) =>* accepted(cut(f1r1, 2, lapsed, nil)) .
+search [1] in WHIPPLESCRIPT-ACTION-REGION-JOURNAL : write(nil, f1r1, 2, exited) =>* accepted(cut(f1r1, 2, exited, nil)) .
+search [1] in WHIPPLESCRIPT-ACTION-REGION-JOURNAL : write(cut(f1r1, 2, holding, nil), f1r1, 3, exited) =>* accepted(cut(f1r1, 3, exited, cut(f1r1, 2, holding, nil))) .
+search [1] in WHIPPLESCRIPT-ACTION-REGION-JOURNAL : write(cut(f1r1, 2, holding, nil), f1r1, 3, lapsed) =>* accepted(cut(f1r1, 3, lapsed, cut(f1r1, 2, holding, nil))) .
+search [1] in WHIPPLESCRIPT-ACTION-REGION-JOURNAL : write(cut(f1r1, 3, lapsed, cut(f1r1, 2, holding, nil)), f1r1, 2, holding) =>* accepted(cut(f1r1, 3, lapsed, cut(f1r1, 2, holding, nil))) .
+--- A later arrival cannot reopen a closed region.
+search [1] in WHIPPLESCRIPT-ACTION-REGION-JOURNAL : write(cut(f1r1, 3, lapsed, nil), f1r1, 4, holding) =>* accepted(H:History) .
+search [1] in WHIPPLESCRIPT-ACTION-REGION-JOURNAL-REOPENS : write(cut(f1r1, 3, lapsed, nil), f1r1, 4, holding) =>* accepted(H:History) .
+--- Exact replay preserves later history; it does not replace the latest cut.
+search [1] in WHIPPLESCRIPT-ACTION-REGION-JOURNAL : write(cut(f1r1, 3, lapsed, cut(f1r1, 2, holding, nil)), f1r1, 2, holding) =>* accepted(H:History) such that latest(H:History, f1r1) == at(2, holding) .
+search [1] in WHIPPLESCRIPT-ACTION-REGION-JOURNAL-ROLLS-BACK : write(cut(f1r1, 3, lapsed, cut(f1r1, 2, holding, nil)), f1r1, 2, holding) =>* accepted(H:History) such that latest(H:History, f1r1) == at(2, holding) .
+--- Distinct firings and structural regions cannot alias one another.
+search [1] in WHIPPLESCRIPT-ACTION-REGION-JOURNAL : write(cut(f1r1, 2, lapsed, nil), f2r1, 2, holding) =>* refused .
+search [1] in WHIPPLESCRIPT-ACTION-REGION-JOURNAL-ALIASES-FIRINGS : write(cut(f1r1, 2, lapsed, nil), f2r1, 2, holding) =>* refused .
+search [1] in WHIPPLESCRIPT-ACTION-REGION-JOURNAL : write(cut(f1r1, 2, lapsed, nil), f1r2, 2, holding) =>* accepted(H:History) .
+--- An unrecorded past cut cannot be smuggled in as replay.
+search [1] in WHIPPLESCRIPT-ACTION-REGION-JOURNAL : write(cut(f1r1, 3, holding, nil), f1r1, 2, holding) =>* accepted(H:History) .
+search [1] in WHIPPLESCRIPT-ACTION-REGION-JOURNAL-REOPENS : write(cut(f1r1, 3, holding, nil), f1r1, 2, holding) =>* accepted(H:History) .
+quit

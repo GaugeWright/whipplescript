@@ -1,0 +1,27 @@
+--- A delayed first read uses the admitted root across live changes and reopen.
+--- Value abstracts the complete immutable argument, including its origins.
+mod WHIPPLESCRIPT-ACTION-ROOT-CAPTURE is
+  sorts Value Root Later Cfg .
+  ops original newer : -> Value [ctor] .
+  ops none : -> Root [ctor] .
+  op saved : Value -> Root [ctor] .
+  ops waiting : -> Later [ctor] .
+  op read : Value -> Later [ctor] .
+  op at : Value Root Later -> Cfg [ctor] .
+  op reopened : Value Root Later -> Cfg [ctor] .
+  vars V W : Value . var R : Root . var L : Later .
+  rl [capture-root] : at(V, none, waiting) => at(V, saved(V), waiting) .
+  rl [live-edit] : at(original, R, L) => at(newer, R, L) .
+  rl [reopen] : at(V, saved(W), L) => reopened(V, saved(W), L) .
+  rl [delayed-first-read] : reopened(V, saved(W), waiting) => reopened(V, saved(W), read(W)) .
+endm
+mod WHIPPLESCRIPT-ACTION-ROOT-READS-LIVE is
+  including WHIPPLESCRIPT-ACTION-ROOT-CAPTURE .
+  vars V W : Value .
+  rl [read-live] : reopened(V, saved(W), waiting) => reopened(V, saved(W), read(V)) .
+endm
+mod WHIPPLESCRIPT-ACTION-ROOT-FORGETS-ADMISSION is
+  including WHIPPLESCRIPT-ACTION-ROOT-CAPTURE .
+  vars V W : Value .
+  rl [overwrite-root] : reopened(V, saved(W), waiting) => reopened(V, saved(V), waiting) .
+endm

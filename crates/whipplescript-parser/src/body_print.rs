@@ -777,6 +777,55 @@ pub(crate) fn print_statement_rn(
     out: &mut String,
 ) {
     match statement {
+        BodyStmt::Composition(composition) => {
+            use body::CompositionStmt;
+            match composition {
+                CompositionStmt::Return(value) | CompositionStmt::Fail(value) => {
+                    let keyword = if matches!(composition, CompositionStmt::Return(_)) {
+                        "return"
+                    } else {
+                        "fail"
+                    };
+                    push_stmt_line(out, indent, &format!("{keyword} {}", rn(&value.source)));
+                }
+                CompositionStmt::OnFailure { alias, body, .. } => {
+                    push_stmt_line(out, indent, &format!("on failure as {} {{", rn(alias)));
+                    for statement in body {
+                        print_statement_rn(statement, indent + 1, rn, out);
+                    }
+                    push_stmt_line(out, indent, "}");
+                }
+                CompositionStmt::Call {
+                    name,
+                    arguments,
+                    binding,
+                    ..
+                } => {
+                    let args = arguments
+                        .iter()
+                        .map(|arg| rn(&arg.source))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let binding = binding
+                        .as_ref()
+                        .map_or_else(String::new, |binding| format!(" as {binding}"));
+                    push_stmt_line(out, indent, &format!("{name}({args}){binding}"));
+                }
+                CompositionStmt::Then {
+                    binding, operation, ..
+                } => {
+                    let mut printed = String::new();
+                    print_statement_rn(operation, 0, &rn, &mut printed);
+                    for (index, line) in printed.lines().enumerate() {
+                        if index == 0 {
+                            push_stmt_line(out, indent, &format!("then {binding} <- {line}"));
+                        } else {
+                            push_stmt_line(out, indent, line);
+                        }
+                    }
+                }
+            }
+        }
         BodyStmt::Record(record) => print_record(record, indent, &rn, out, "record"),
         BodyStmt::Done {
             binding,

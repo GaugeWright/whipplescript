@@ -1,0 +1,14 @@
+load ../action-region-prefix.maude
+search [1] in WHIPPLESCRIPT-ACTION-REGION-PREFIX : reconstruct(cut(holding, 2, nil), 2, true, true, true) =>* view(true, false, true) .
+search [1] in WHIPPLESCRIPT-ACTION-REGION-PREFIX : reconstruct(cut(exited, 3, cut(holding, 2, nil)), 3, true, true, true) =>* view(true, true, true) .
+search [1] in WHIPPLESCRIPT-ACTION-REGION-PREFIX : reconstruct(cut(lapsed, 4, cut(holding, 2, nil)), 2, true, true, true) =>* view(true, false, true) .
+search [1] in WHIPPLESCRIPT-ACTION-REGION-PREFIX : reconstruct(cut(lapsed, 1, nil), 1, true, false, false) =>* absent .
+search [1] in WHIPPLESCRIPT-ACTION-REGION-PREFIX : reconstruct(cut(holding, 2, nil), 1, true, true, true) =>* view(true, false, true) .
+search [1] in WHIPPLESCRIPT-ACTION-REGION-PREFIX : reconstruct(cut(holding, 2, nil), 2, false, true, true) =>* refused .
+search [1] in WHIPPLESCRIPT-ACTION-REGION-PREFIX : reconstruct(cut(holding, 2, nil), 2, true, false, true) =>* view(false, false, true) .
+search [1] in WHIPPLESCRIPT-ACTION-REGION-PREFIX : reconstruct(cut(holding, 2, nil), 2, true, true, true) =>* view(true, true, true) .
+search [1] in WHIPPLESCRIPT-ACTION-REGION-PREFIX-CURRENT : reconstruct(cut(lapsed, 4, cut(holding, 2, nil)), 2, true, true, true) =>* refused .
+search [1] in WHIPPLESCRIPT-ACTION-REGION-PREFIX-OPENS-TAIL : reconstruct(cut(holding, 2, nil), 2, true, true, true) =>* view(true, true, true) .
+search [1] in WHIPPLESCRIPT-ACTION-REGION-PREFIX-INVENTS-WORK : reconstruct(cut(holding, 2, nil), 2, true, false, true) =>* view(true, false, true) .
+search [1] in WHIPPLESCRIPT-ACTION-REGION-PREFIX-LOSES-RESULT : reconstruct(cut(holding, 2, nil), 2, true, true, true) =>* view(true, false, false) .
+quit

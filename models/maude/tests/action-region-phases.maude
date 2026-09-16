@@ -1,0 +1,19 @@
+load ../action-region-phases.maude
+search [1] in WHIPPLESCRIPT-ACTION-REGION-PHASES : decide(entry, holds, open) =>* verdict(holdCut) .
+search [1] in WHIPPLESCRIPT-ACTION-REGION-PHASES : decide(entry, broken, open) =>* verdict(lapseCut) .
+search [1] in WHIPPLESCRIPT-ACTION-REGION-PHASES : decide(entry, blocked, open) =>* verdict(noCut) .
+search [1] in WHIPPLESCRIPT-ACTION-REGION-PHASES : decide(holding, holds, open) =>* verdict(noCut) .
+search [1] in WHIPPLESCRIPT-ACTION-REGION-PHASES : decide(holding, broken, open) =>* verdict(lapseCut) .
+search [1] in WHIPPLESCRIPT-ACTION-REGION-PHASES : decide(holding, holds, complete) =>* verdict(exitCut) .
+search [1] in WHIPPLESCRIPT-ACTION-REGION-PHASES : decide(holding, broken, complete) =>* verdict(exitCut) .
+search [1] in WHIPPLESCRIPT-ACTION-REGION-PHASES : decide(lapsed, holds, complete) =>* verdict(noCut) .
+search [1] in WHIPPLESCRIPT-ACTION-REGION-PHASES : nested(lapseCut, holdCut) =>* verdict(lapseCut, noCut) .
+--- The base machine never guesses a blocked predicate, lets a same-frontier
+--- break beat completed held work, or enters below an enclosing lapse.
+search [1] in WHIPPLESCRIPT-ACTION-REGION-PHASES : decide(entry, blocked, open) =>* verdict(lapseCut) .
+search [1] in WHIPPLESCRIPT-ACTION-REGION-PHASES-BLOCKED-LAPSES : decide(entry, blocked, open) =>* verdict(lapseCut) .
+search [1] in WHIPPLESCRIPT-ACTION-REGION-PHASES : decide(holding, broken, complete) =>* verdict(lapseCut) .
+search [1] in WHIPPLESCRIPT-ACTION-REGION-PHASES-LAPSES-COMPLETE : decide(holding, broken, complete) =>* verdict(lapseCut) .
+search [1] in WHIPPLESCRIPT-ACTION-REGION-PHASES : nested(lapseCut, holdCut) =>* verdict(lapseCut, holdCut) .
+search [1] in WHIPPLESCRIPT-ACTION-REGION-PHASES-LEAKS-NESTED : nested(lapseCut, holdCut) =>* verdict(lapseCut, holdCut) .
+quit

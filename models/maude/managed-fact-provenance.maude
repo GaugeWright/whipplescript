@@ -1,0 +1,25 @@
+--- Actual producer contributions survive a cross-rule fixed point.
+fmod MANAGED-FACT-TOKENS is
+  sorts Token Tokens .
+  subsort Token < Tokens .
+  ops secret executor label : -> Token [ctor] .
+  op none : -> Tokens [ctor] .
+  op __ : Tokens Tokens -> Tokens [ctor assoc comm id: none] .
+  var T : Token .
+  eq T T = T .
+endfm
+mod WHIPPLESCRIPT-MANAGED-FACT-PROVENANCE is
+  protecting MANAGED-FACT-TOKENS .
+  sort State .
+  op chain : Tokens Tokens Tokens -> State [ctor] .
+  vars A B C : Tokens .
+  --- B consumes A, C consumes B; C feeds B to exercise a finite cycle.
+  rl [forward] : chain(A, B, C) => chain(A, A B C, B C) .
+endm
+mod WHIPPLESCRIPT-MANAGED-FACT-PROVENANCE-LOST is
+  including WHIPPLESCRIPT-MANAGED-FACT-PROVENANCE .
+  --- Treating a marked producer as a portable permission erases its executor.
+  rl [portable-endorsement] : executor => none .
+  rl [lost-read] : secret => none .
+  rl [lost-fallback] : label => none .
+endm

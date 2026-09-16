@@ -1,0 +1,12 @@
+load ../action-effect-payload.maude
+search [1] in WHIPPLESCRIPT-ACTION-EFFECT-PAYLOAD : write(constant, constant, constant, constant) =>* allowed .
+search [1] in WHIPPLESCRIPT-ACTION-EFFECT-PAYLOAD : write(template(forwarded(executor)), constant, constant, constant) =>* denied .
+search [1] in WHIPPLESCRIPT-ACTION-EFFECT-PAYLOAD : write(template(forwarded(executor)), constant, constant, constant) =>* allowed .
+search [1] in WHIPPLESCRIPT-ACTION-EFFECT-PAYLOAD-LOST : write(template(forwarded(executor)), constant, constant, constant) =>* allowed .
+search [1] in WHIPPLESCRIPT-ACTION-EFFECT-PAYLOAD : write(constant, forwarded(executor), constant, constant) =>* allowed .
+search [1] in WHIPPLESCRIPT-ACTION-EFFECT-PAYLOAD-LOST : write(constant, forwarded(executor), constant, constant) =>* allowed .
+search [1] in WHIPPLESCRIPT-ACTION-EFFECT-PAYLOAD : write(constant, constant, endorsed(executor, true), constant) =>* allowed .
+search [1] in WHIPPLESCRIPT-ACTION-EFFECT-PAYLOAD : write(constant, constant, endorsed(executor, false), constant) =>* allowed .
+search [1] in WHIPPLESCRIPT-ACTION-EFFECT-PAYLOAD : write(constant, constant, endorsed(executor, true), executor) =>* allowed .
+search [1] in WHIPPLESCRIPT-ACTION-EFFECT-PAYLOAD-LOST : write(constant, constant, endorsed(executor, true), executor) =>* allowed .
+quit

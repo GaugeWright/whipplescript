@@ -1,0 +1,99 @@
+--- A typed executable is one immutable identity over the static IR and every
+--- checked rule plan. Legacy artifacts remain plan-free. Typed dispatch opens
+--- only when that complete capture reaches the managed rule-pass driver.
+mod WHIPPLESCRIPT-TYPED-EXECUTABLE-PROGRAM is
+ protecting NAT .
+ protecting BOOL .
+ sorts SourceShape Semantics Format Capture Dispatch Host .
+ ops actionSource actionlessSource : -> SourceShape [ctor] .
+ ops legacy typed : -> Semantics [ctor] .
+ ops v1 v2 : -> Format [ctor] .
+ ops readyLegacy readyTyped refused : -> Capture [ctor] .
+ ops blocked running : -> Dispatch [ctor] .
+ ops native hosted : -> Host [ctor] .
+
+ --- An authored action is the source discriminator. Recorded programs bypass
+ --- this function and retain their stored semantics tag.
+ op compileSource : SourceShape -> Semantics .
+ eq compileSource(actionSource) = typed .
+ eq compileSource(actionlessSource) = legacy .
+
+ op capture : Semantics Format Nat Nat Bool Bool -> Capture .
+ vars RULES PLANS : Nat .
+ eq capture(legacy, v1, RULES, 0, true, true) = readyLegacy .
+ ceq capture(typed, v2, RULES, PLANS, true, true) = readyTyped
+   if RULES == PLANS .
+ eq capture(legacy, v2, RULES, PLANS, true, true) = refused .
+ eq capture(typed, v1, RULES, PLANS, true, true) = refused .
+ eq capture(legacy, v1, RULES, PLANS, false, true) = refused .
+ eq capture(typed, v2, RULES, PLANS, false, true) = refused .
+ eq capture(legacy, v1, RULES, PLANS, true, false) = refused .
+ eq capture(typed, v2, RULES, PLANS, true, false) = refused .
+ ceq capture(legacy, v1, RULES, PLANS, true, true) = refused if PLANS =/= 0 .
+ ceq capture(typed, v2, RULES, PLANS, true, true) = refused if RULES =/= PLANS .
+
+ op dispatch : Semantics Capture Bool -> Dispatch .
+ eq dispatch(legacy, readyLegacy, true) = running .
+ eq dispatch(typed, readyTyped, true) = running .
+ eq dispatch(typed, readyTyped, false) = blocked .
+ eq dispatch(typed, refused, true) = blocked .
+
+ op hostDispatch : Host Semantics Capture Bool -> Dispatch .
+ var HOST : Host .
+ eq hostDispatch(HOST, legacy, readyLegacy, true) = running .
+ eq hostDispatch(HOST, typed, readyTyped, true) = running .
+ eq hostDispatch(HOST, typed, readyTyped, false) = blocked .
+endm
+
+--- Wrong: authored actions silently retain the old source default.
+mod WHIPPLESCRIPT-TYPED-EXECUTABLE-LEGACY-SOURCE is
+ including WHIPPLESCRIPT-TYPED-EXECUTABLE-PROGRAM .
+ op weakCompileSource : SourceShape -> Semantics .
+ eq weakCompileSource(actionSource) = legacy .
+endm
+
+--- Wrong: one host bypasses the shared managed-driver requirement.
+mod WHIPPLESCRIPT-TYPED-EXECUTABLE-HOST-BYPASS is
+ including WHIPPLESCRIPT-TYPED-EXECUTABLE-PROGRAM .
+ op weakHostDispatch : Host Semantics Capture Bool -> Dispatch .
+ eq weakHostDispatch(hosted, typed, readyTyped, false) = running .
+endm
+
+--- Wrong: the typed identity can omit the plans and still authorize capture.
+mod WHIPPLESCRIPT-TYPED-EXECUTABLE-UNBOUND-IDENTITY is
+ including WHIPPLESCRIPT-TYPED-EXECUTABLE-PROGRAM .
+ op weakCapture : Semantics Format Nat Nat Bool Bool -> Capture .
+ vars RULES PLANS : Nat .
+ eq weakCapture(typed, v2, RULES, PLANS, false, true) = readyTyped .
+endm
+
+--- Wrong: a typed artifact can omit one or more rule plans.
+mod WHIPPLESCRIPT-TYPED-EXECUTABLE-PARTIAL-PLANS is
+ including WHIPPLESCRIPT-TYPED-EXECUTABLE-PROGRAM .
+ op weakCapture : Semantics Format Nat Nat Bool Bool -> Capture .
+ vars RULES PLANS : Nat .
+ eq weakCapture(typed, v2, RULES, PLANS, true, true) = readyTyped .
+endm
+
+--- Wrong: the metadata reference may claim a different artifact format.
+mod WHIPPLESCRIPT-TYPED-EXECUTABLE-CROSSED-FORMAT is
+ including WHIPPLESCRIPT-TYPED-EXECUTABLE-PROGRAM .
+ op weakCapture : Semantics Format Nat Nat Bool Bool -> Capture .
+ vars RULES PLANS : Nat .
+ eq weakCapture(typed, v1, RULES, PLANS, true, true) = readyTyped .
+endm
+
+--- Wrong: legacy identity silently accepts managed plan authority.
+mod WHIPPLESCRIPT-TYPED-EXECUTABLE-LEGACY-PLANS is
+ including WHIPPLESCRIPT-TYPED-EXECUTABLE-PROGRAM .
+ op weakCapture : Semantics Format Nat Nat Bool Bool -> Capture .
+ vars RULES PLANS : Nat .
+ eq weakCapture(legacy, v1, RULES, PLANS, true, true) = readyLegacy .
+endm
+
+--- Wrong: a typed capture dispatches even though the managed driver is absent.
+mod WHIPPLESCRIPT-TYPED-EXECUTABLE-EARLY-DISPATCH is
+ including WHIPPLESCRIPT-TYPED-EXECUTABLE-PROGRAM .
+ op weakDispatch : Semantics Capture Bool -> Dispatch .
+ eq weakDispatch(typed, readyTyped, false) = running .
+endm

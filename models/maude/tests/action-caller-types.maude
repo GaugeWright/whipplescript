@@ -1,0 +1,8 @@
+load ../action-caller-types.maude
+search [1] in WHIPPLESCRIPT-ACTION-CALLER-TYPES : caller(integer, decimal, selected) =>* accepted .
+search [1] in WHIPPLESCRIPT-ACTION-CALLER-TYPES : caller(ticket, review, unselected) =>* refused .
+search [1] in WHIPPLESCRIPT-ACTION-CALLER-TYPES : caller(ticket, review, selected) =>* accepted .
+search [1] in WHIPPLESCRIPT-ACTION-CALLER-TYPES : caller(optional(integer), integer, unselected) =>* accepted .
+search [1] in WHIPPLESCRIPT-ACTION-CALLER-ASSUMES-PARAMETER : caller(ticket, review, selected) =>* accepted .
+search [1] in WHIPPLESCRIPT-ACTION-CALLER-SKIPS-BRANCH : caller(optional(integer), integer, unselected) =>* accepted .
+quit

@@ -1,0 +1,44 @@
+--- One expanded region with a helper boundary, its external leaf, an
+--- unselected alternative, and independent/lapse work. This witnesses the
+--- distinction between direct-child joins and actual transitive effect leaves.
+--- It does not prove graph closure or decide when to request cancellation.
+mod WHIPPLESCRIPT-ACTION-REGION-OWNERSHIP is
+ protecting BOOL .
+ sorts Node State Question Answer .
+ ops outside helper leaf unselected lapse tail : -> Node [ctor] .
+ ops pending requested uncertain succeeded cancelled : -> State [ctor] .
+ ops join effects : -> Question [ctor] .
+ op held : Node -> Bool . op direct : Node -> Bool . op external : Node -> Bool . op admitted : Node -> Bool .
+ op inspect : Question Node State -> Answer [ctor] .
+ op kept : Node State -> Answer [ctor] . op absent : -> Answer [ctor] .
+ var N : Node . var S : State . var Q : Question .
+ eq held(N) = N == helper or N == leaf or N == unselected .
+ eq direct(N) = N =/= leaf .
+ eq external(N) = N =/= helper .
+ eq admitted(N) = N =/= unselected and N =/= tail .
+ op member : Question Node -> Bool .
+ eq member(join, N) = held(N) and direct(N) and admitted(N) .
+ eq member(effects, N) = held(N) and external(N) and admitted(N) .
+ crl [actual-member] : inspect(Q, N, S) => kept(N, S) if member(Q, N) .
+ crl [not-owned-here] : inspect(Q, N, S) => absent if not member(Q, N) .
+endm
+mod WHIPPLESCRIPT-ACTION-REGION-INVENTS-WORK is
+ including WHIPPLESCRIPT-ACTION-REGION-OWNERSHIP .
+ var N : Node . var S : State .
+ crl [potential-is-actual] : inspect(effects, N, S) => kept(N, S) if held(N) and external(N) .
+endm
+mod WHIPPLESCRIPT-ACTION-REGION-JOINS-LEAVES is
+ including WHIPPLESCRIPT-ACTION-REGION-OWNERSHIP .
+ var N : Node . var S : State .
+ crl [leaf-is-child] : inspect(join, N, S) => kept(N, S) if held(N) and admitted(N) .
+endm
+mod WHIPPLESCRIPT-ACTION-REGION-OWNS-SIBLINGS is
+ including WHIPPLESCRIPT-ACTION-REGION-OWNERSHIP .
+ var N : Node . var S : State .
+ crl [all-admitted-is-held] : inspect(effects, N, S) => kept(N, S) if external(N) and admitted(N) .
+endm
+mod WHIPPLESCRIPT-ACTION-REGION-ACKS-REQUEST is
+ including WHIPPLESCRIPT-ACTION-REGION-OWNERSHIP .
+ var N : Node .
+ crl [request-is-terminal] : inspect(effects, N, requested) => kept(N, cancelled) if member(effects, N) .
+endm

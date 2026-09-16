@@ -169,6 +169,52 @@ TEST_CFG = re.compile(r'^#\[cfg\((?:test|all\(test,\s*[^()]*\))\)\]$')
 # demanded a test of its own, which is a test for a test.
 TEST_FN = re.compile(r"^#\[(?:tokio::|async_std::)?test\b")
 
+# A whole FILE is test scaffolding when the `mod` that pulls it in is
+# `#[cfg(test)]`. That declaration lives in the PARENT module, so the file
+# itself carries no marker of any kind and every line in it read as production
+# -- including the `Err(..)` an assertion is matching ON, which is the thing
+# under test rather than a refusal of its own. `assert_recovery` in
+# `whipplescript-host-do` is the case that found this: a shared helper, so not a
+# `#[test]` fn either, and the sweep asked for a test pinning a test's
+# assertion.
+#
+# Resolved from the declaration because that is where the answer is. Nothing
+# inside such a file reaches a release binary, so skipping it cannot hide a
+# product refusal; a file whose declaration cannot be found is treated as
+# production, which is the direction that over-asks rather than under-asks.
+CFG_TEST_MOD = re.compile(
+    r"#\[cfg\((?:test|all\(test,[^()]*\))\)\]\s*(?:\n\s*)*(?:pub(?:\([^()]*\))?\s+)?mod\s+(\w+)\s*;"
+)
+
+
+def test_only_module(target: str) -> bool:
+    """Is `target` compiled only under `cfg(test)`, per its own declaration?"""
+    path = Path(target).resolve()
+    stem = path.stem
+    if stem in ("lib", "main", "mod"):
+        return False
+    # The declaration sits in this file's parent module: a sibling `.rs`, the
+    # directory's own `mod.rs`/`<dir>.rs`, or the crate root. Search the crate's
+    # whole `src/` rather than guess which -- it is a handful of files, read
+    # once per sweep.
+    root = path.parent
+    while root.name != "src" and root.parent != root:
+        root = root.parent
+    if root.name != "src":
+        return False
+    for candidate in root.rglob("*.rs"):
+        if candidate == path:
+            continue
+        try:
+            text = candidate.read_text()
+        except OSError:
+            continue
+        if re.search(rf"\bmod\s+{re.escape(stem)}\s*;", text) is None:
+            continue
+        if any(name == stem for name in CFG_TEST_MOD.findall(text)):
+            return True
+    return False
+
 # A raw string's opening and closing delimiters. `cfg_test_extent` finds an
 # item's end by matching the closing brace at its indentation column, which is
 # unambiguous in rustfmt'd Rust and defeated by a brace inside a string: a test
@@ -1461,6 +1507,15 @@ def main() -> int:
     if not os.path.exists(target):
         print(f"no such target: {target}", file=sys.stderr)
         return 2
+
+    # Before anything reads the file: a module the crate compiles only under
+    # `cfg(test)` holds no product refusal, whatever its lines look like.
+    # `--list-sites` stays silent so the caller parses an empty site list and
+    # skips the file; a direct sweep says why it did nothing.
+    if test_only_module(target):
+        if not args.list_sites:
+            print(f"== {target} is compiled only under cfg(test); no refusals here ==")
+        return 0
 
     if args.list_sites:
         for site in find_sites(Path(target).read_text().split("\n")):

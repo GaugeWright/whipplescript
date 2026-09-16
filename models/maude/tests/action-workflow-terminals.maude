@@ -1,0 +1,16 @@
+load ../action-workflow-terminals.maude
+search [1] in WHIPPLESCRIPT-ACTION-WORKFLOW-TERMINALS : complete(ready, settled, true) =>* committed .
+search [1] in WHIPPLESCRIPT-ACTION-WORKFLOW-TERMINALS : complete(ready, running, true) =>* committed .
+search [1] in WHIPPLESCRIPT-ACTION-TERMINAL-EARLY : complete(ready, running, true) =>* committed .
+search [1] in WHIPPLESCRIPT-ACTION-WORKFLOW-TERMINALS : complete(pending, settled, true) =>* committed .
+search [1] in WHIPPLESCRIPT-ACTION-WORKFLOW-TERMINALS : complete(invalid, settled, true) =>* committed .
+search [1] in WHIPPLESCRIPT-ACTION-TERMINAL-UNTYPED : complete(invalid, settled, true) =>* committed .
+search [1] in WHIPPLESCRIPT-ACTION-WORKFLOW-TERMINALS : complete(ready, failed, true) =>* committed .
+search [1] in WHIPPLESCRIPT-ACTION-WORKFLOW-TERMINALS : complete(ready, uncertain, true) =>* committed .
+search [1] in WHIPPLESCRIPT-ACTION-WORKFLOW-TERMINALS : complete(ready, settled, false) =>* committed .
+search [1] in WHIPPLESCRIPT-ACTION-TERMINAL-HELPER : complete(ready, settled, false) =>* committed .
+search [1] in WHIPPLESCRIPT-ACTION-WORKFLOW-TERMINALS : workflowFail(ready, settled, true) =>* failedTerminal .
+search [1] in WHIPPLESCRIPT-ACTION-WORKFLOW-TERMINALS : workflowFail(ready, running, true) =>* failedTerminal .
+search [1] in WHIPPLESCRIPT-ACTION-WORKFLOW-TERMINALS : replay(true) =>* noChange .
+search [1] in WHIPPLESCRIPT-ACTION-WORKFLOW-TERMINALS : replay(true) =>* duplicate .
+search [1] in WHIPPLESCRIPT-ACTION-TERMINAL-REPLAY : replay(true) =>* duplicate .

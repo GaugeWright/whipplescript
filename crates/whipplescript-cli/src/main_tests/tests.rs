@@ -45,6 +45,109 @@ fn credential_proxy_args_are_refused_by_reason() {
     }
 }
 
+#[test]
+fn native_step_loads_and_drives_the_active_typed_executable() {
+    const SOURCE: &str = r#"workflow NativeTyped
+output result Answer
+class Answer { text string }
+action answer() -> Answer { return { text "native" } }
+rule finish when started => { answer() as answer
+complete result answer }
+"#;
+    let compiled = whipplescript_parser::compile_program(SOURCE);
+    assert!(
+        compiled.diagnostics.is_empty(),
+        "{:?}",
+        compiled.diagnostics
+    );
+    let program = compiled.ir.unwrap();
+    let plans = compiled.typed_actions.unwrap();
+    let temp = std::env::temp_dir().join(format!(
+        "whip-native-typed-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&temp).unwrap();
+    let store_path = temp.join("runtime.sqlite");
+    let side_stores = SideStorePaths {
+        coordination: temp.join("coordination.sqlite"),
+        items: temp.join("items.sqlite"),
+    };
+    let mut kernel = RuntimeKernel::new(SqliteStore::open(&store_path).unwrap());
+    let source_hash = kernel.store().put_content(SOURCE).unwrap();
+    let version = kernel
+        .create_program_version_for_compiled_program(
+            CompiledProgramVersionInput {
+                program_name: &program.workflow,
+                source_hash: &source_hash,
+                compiler_version: "test",
+            },
+            &program,
+            Some(&plans),
+        )
+        .unwrap();
+    let stored_version = kernel
+        .store()
+        .get_program_version(&version.version_id)
+        .unwrap()
+        .unwrap();
+    let summary: Value = serde_json::from_str(&stored_version.analysis_summary_json).unwrap();
+    assert_eq!(
+        summary["executable_program"]["format"],
+        whipplescript_kernel::program_artifact::TYPED_FORMAT
+    );
+    let instance = kernel.create_instance(&version, "{}").unwrap();
+    kernel
+        .ingest_external_event(&instance, "external.started", "{}", Some("started"))
+        .unwrap();
+    drop(kernel);
+
+    let report = step_instance(
+        &store_path,
+        &instance,
+        &program,
+        None,
+        Some(&version.version_id),
+        Some(&side_stores),
+    )
+    .unwrap();
+    assert!(report.committed_rules >= 1);
+    let store = SqliteStore::open(&store_path).unwrap();
+    assert_eq!(
+        store.get_instance(&instance).unwrap().unwrap().status,
+        "completed"
+    );
+    let event = store
+        .list_events(&instance)
+        .unwrap()
+        .into_iter()
+        .find(|event| event.event_type == "workflow.completed")
+        .unwrap();
+    let payload: Value = serde_json::from_str(&event.payload_json).unwrap();
+    assert_eq!(payload["payload"], json!({"text":"native"}));
+    drop(store);
+    std::fs::remove_dir_all(temp).unwrap();
+}
+
+#[test]
+fn compile_cache_retains_typed_action_plans() {
+    const SOURCE: &str = r#"workflow CachedTyped
+action answer() -> int { return 42 }
+rule run when started => { answer() as answer }
+"#;
+    let fresh = compile_program_with_root_cached(SOURCE, None);
+    let cached = compile_program_with_root_cached(SOURCE, None);
+    assert_eq!(
+        fresh.ir.as_ref().map(|ir| ir.execution_semantics),
+        Some(whipplescript_parser::ExecutionSemantics::TypedActionsV1)
+    );
+    assert_eq!(cached.typed_actions, fresh.typed_actions);
+    assert!(cached.typed_actions.is_some());
+}
+
 // `NewEffect`/`IrRedaction` are exercised only by tests here (their production
 // users — the lowering `as_*` converters and the rule-lowering closure — moved
 // to `whipplescript_kernel::lowering` / `::rule_lowering`).

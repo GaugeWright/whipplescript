@@ -1,0 +1,19 @@
+@service
+workflow RecordedActions
+
+class Note { label string }
+agent reviewer { provider fixture profile "r" capacity 1 }
+
+action note(label string) {
+  tell reviewer as turn "Review {{ label }}."
+  after turn succeeds {
+    record Note { label label }
+  }
+}
+
+rule review
+  when started
+=> {
+  note("first")
+  note("second")
+}

@@ -161,6 +161,20 @@ read of a field that does not belong to that kind is a check error. A read of
 raw detail such as `stderr` is also a check error. The language deliberately
 does not make `stderr` available.
 
+The same typed binding is available inside a typed action when the observed
+operation is a direct effect. `after attempt times out as elapsed` binds a
+`TerminalTimedOut`; `after attempt cancelled as stopped` binds a
+`TerminalCancelled`. These values keep the original operation identity and are
+rebuilt from its recorded terminal during replay. They are lexical diagnostic
+values: returning from the selected handler can recover the action, while
+merely reading or recording one does not.
+
+A failed child action may contain several leaf failures and a domain failure.
+Its alias is therefore an aggregate rather than one provider payload. The
+`failure.causes` array retains every cause in stable origin order, and
+`failure.domain` contains the child's optional declared domain failure. The
+child section below gives the complete shape.
+
 ## The three outcomes of a wait
 
 With failure in the model, an `after` block has three predicates:
@@ -176,6 +190,132 @@ you handle differently. Use the `completes` predicate for a reaction that
 applies to each outcome. With the `case` statement from the next chapter, the
 `completes` predicate also handles each outcome exhaustively in one location.
 
+Inside a typed action, observe the operation's terminal union and match it
+directly:
+
+<!-- check: fragment -->
+```whip
+action awaitPause() -> string {
+  timer 1s as pause
+
+  case outcome(pause) {
+    Completed as value => { return "done" }
+    Failed as problem => { return problem.reason }
+    TimedOut as problem => { return problem.summary }
+    Cancelled as problem => { return problem.summary }
+  }
+}
+```
+
+The four tags form a closed set. Omitting one without a fallback is a local
+compile error. Each branch binding has its precise payload type: `Completed`
+carries the effect's success value, and the other three carry the same typed
+payloads as their individual `after` predicates. The envelope and its payload
+keep the original operation's provenance when reconstructed during replay.
+Pending work selects no arm, and reading `outcome(pause)` alone does not recover
+a failure. A successful return from the selected non-success arm performs the
+recovery after that arm's work joins.
+
+The longer `after pause completes as outcome { case outcome { ... } }` form has
+the same terminal types and runtime behavior. Use it when the lexical
+continuation itself is useful; use `case outcome(pause)` when the extra nesting
+adds no meaning.
+
+A child action has a smaller terminal boundary. It either completes with its
+declared result or fails with an aggregate:
+
+<!-- check: fragment -->
+```whip
+class Problem { reason string }
+
+action child() -> string ! Problem {
+  fail { reason "unavailable" }
+}
+
+action parent() -> string {
+  child() as result
+
+  case outcome(result) {
+    Completed as value => { return value }
+    Failed as failure => {
+      case failure.domain {
+        Problem as problem => { return problem.reason }
+        None => { return failure.summary }
+      }
+    }
+  }
+}
+```
+
+`failure.causes` retains every cause in stable origin order. Each entry has
+`origin`, `kind`, `summary`, `recovered`, and `evidence`. A leaf timeout or
+cancellation appears as its cause kind; it is not a `TimedOut` or `Cancelled`
+terminal for the child itself. When the child declares a domain failure type,
+`failure.domain` is an optional value of exactly that type. Use `after result
+fails as failure` when only the failed continuation is relevant; it binds the
+same aggregate.
+
+## One handler for an action scope
+
+Use `on failure` when the same recovery applies to any operation in a larger
+lexical block. This keeps the successful path direct and avoids repeating a
+failure continuation for every step:
+
+<!-- check: fragment -->
+```whip
+action resilientPause() -> string {
+  timer 1s as pause
+
+  after pause succeeds { return "done" }
+
+  on failure as problem {
+    return problem.summary
+  }
+}
+```
+
+An action has at most one lexical failure handler. The handler covers
+unrecovered operation failures and an explicit typed `fail` selected in its
+enclosing block. A more local `after ... fails` or `case outcome(...)` recovery
+runs first; the broader handler stays dormant when that recovery succeeds.
+
+The runtime waits for already admitted sibling work before it enters the
+handler, so the aggregate cannot depend on which failure arrived first. The
+binding has the same `summary`, `operation_id`, `domain`, and `causes` fields as
+a child failure. A successful `return` from the handler recovers its causes only
+after work started inside the handler settles. A `fail` or failed operation in
+the handler propagates outward and does not re-enter the same handler. Merely
+reading, recording, or forwarding `problem` does not recover it.
+
+The same spelling gives a rule one recovery boundary for a firing:
+
+```whip
+use std.script
+
+workflow Guarded
+output result Done
+class Done { note string }
+
+rule run when started => {
+  exec "false" as attempt
+
+  after attempt succeeds {
+    complete result { note "command passed" }
+  }
+
+  on failure as problem {
+    complete result { note problem.summary }
+  }
+}
+```
+
+The runtime resolves a more local `after` or `case outcome(...)` recovery before
+the rule handler. It also waits for admitted sibling work. A rule handler has no
+result to return: when its selected body and the work it starts close
+successfully, it recovers that firing. Its `domain` field is always `null`.
+A failure inside the handler escapes once and cannot select the same handler
+again.
+
 ## Automatic failure when no branch handles the failure
 
 Delete the `after attempt fails` branch from the `Fragile` program. First, the
@@ -188,7 +328,7 @@ warning[effect.unhandled_failure]: effect `attempt`'s failure is unhandled in ru
    |
 28 |   exec "false" as attempt
    |   ^^^^^^^^^^^^^^^^^^^^^^^
-   = help: handle it with `after attempt fails { … }` (typed failure or recovery) or observe every outcome with `after attempt completes`
+   = help: handle it with `after attempt fails { … }` (typed failure or recovery), observe every outcome with `after attempt completes`, or add one `on failure as problem { … }` handler to the rule
 ```
 
 Run the program:
@@ -219,12 +359,13 @@ The net has two deliberate limits:
 - **A cancellation is an exception.** A cancelled effect never causes an
   automatic failure. A rule cancels an effect *deliberately*. The watchdog in
   chapter 5 cancels the slower effect as its usual operation. Thus a
-  cancellation is not an outcome without a handler.
+  cancellation does not enter the outer failure net.
 - **A service records the failure instead.** An `@service` workflow runs
   continuously by design. Chapter 10 gives services. Thus a service cannot fail
   automatically. The runtime records each failure without a handler one time as
   a durable diagnostic. The `whip diagnostics` command shows the diagnostic.
-  The service continues to run.
+  The service continues to run. A rule-level `on failure` that recovers the
+  firing prevents this diagnostic.
 
 The automatic failure makes an unhandled failure *safe*. The workflow still
 ends honestly at a terminal. But a generic reason is a poor message at 2 a.m.
@@ -232,6 +373,15 @@ Thus the warning at check time is prominent and not hidden. Handle each failure
 that needs a typed reason or a recovery. Use `after x fails` for the failure
 branch. As an alternative, use `completes` to observe each outcome in one
 location.
+
+An effect inside an `action` follows the same rule across the composition
+boundary. You may handle its binding inside the action, let the failure
+propagate and handle `fails` on the enclosing action call, or put one
+`on failure` handler on the rule for any remaining failure in that firing.
+`whip check` follows the checked action scopes when it decides whether a failure
+is unhandled. When the same action is called more than once, one warning points
+back to all unhandled call sites instead of repeating the definition
+diagnostic.
 
 ## Where next
 

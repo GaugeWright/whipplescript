@@ -144,8 +144,29 @@ rule call
 
 The `exec greet with request -> Reply` statement sends the `request` fact as
 JSON on the stdin of the script. The statement admits the stdout of the script
-through the `Reply` schema. Thus the two directions are typed. The definition
-of `greet` is outside the workspace, in a manifest that the operator supplies:
+through the `Reply` schema. Thus the two directions are typed.
+
+The same single-result form composes inside an action:
+
+<!-- check: skip — excerpt; `Request` and `Reply` are declared by the surrounding program -->
+```whip
+action greet_once(request Request) -> Reply {
+  exec greet with request -> Reply as call
+  after call succeeds as reply {
+    return reply
+  }
+}
+```
+
+`call` is an operation whose successful value has type `Reply`. The script can
+run only after `request` is ready, and callers can use `greet_once(...)` like
+any other typed action. WhippleScript records the input value and the exact
+fact, operation, and query observations that made it ready. A replay uses that
+captured input and the recorded operation result. Raw shell commands, untyped
+stdout, and `-> each` streams are not scalar action values.
+
+The definition of `greet` is outside the workspace, in a manifest that the
+operator supplies:
 
 ```json
 {

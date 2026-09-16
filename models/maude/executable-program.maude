@@ -1,0 +1,28 @@
+mod WHIPPLESCRIPT-EXECUTABLE-PROGRAM is
+  protecting BOOL .
+  sorts Artifact Tag State .
+  ops absent exact corrupt missing mismatched : -> Artifact [ctor] .
+  ops legacy unknown : -> Tag [ctor] .
+  op load : Artifact Tag Bool -> State [ctor] .
+  ops captured recompiled refused : -> State [ctor] .
+  var A : Artifact . var T : Tag . var B : Bool .
+  rl [captured] : load(exact, legacy, B) => captured .
+  rl [legacy] : load(absent, legacy, true) => recompiled .
+  rl [missing-source] : load(absent, legacy, false) => refused .
+  rl [unknown] : load(A, unknown, B) => refused .
+  rl [corrupt] : load(corrupt, T, B) => refused .
+  rl [missing] : load(missing, T, B) => refused .
+  rl [identity] : load(mismatched, T, B) => refused .
+endm
+mod WHIPPLESCRIPT-EXECUTABLE-FALLBACK is
+  including WHIPPLESCRIPT-EXECUTABLE-PROGRAM .
+  rl [reinterpret] : load(corrupt, legacy, true) => recompiled .
+endm
+mod WHIPPLESCRIPT-EXECUTABLE-UNBOUND is
+  including WHIPPLESCRIPT-EXECUTABLE-PROGRAM .
+  rl [wrong-version] : load(mismatched, legacy, true) => captured .
+endm
+mod WHIPPLESCRIPT-EXECUTABLE-UNKNOWN is
+  including WHIPPLESCRIPT-EXECUTABLE-PROGRAM .
+  rl [unknown-semantics] : load(exact, unknown, true) => captured .
+endm

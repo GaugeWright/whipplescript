@@ -96,11 +96,15 @@ fn resources<'a>(
             || rule.metadata.effects.iter().any(|effect| {
                 !effect.access_grants.is_empty()
                     || match effect.kind {
+                        // Exactly this handle and nothing else. Resources became
+                        // a list, and `any` would be a weaker question than the
+                        // one this asks: an effect naming the expected handle
+                        // ALONGSIDE another is not a scoped save either.
                         IrEffectKind::FileRead => {
-                            effect.resource.as_deref() != Some(input.handle.as_str())
+                            effect.resources.as_slice() != [input.handle.clone()]
                         }
                         IrEffectKind::FileWrite => {
-                            effect.resource.as_deref() != Some(target.resource.handle.as_str())
+                            effect.resources.as_slice() != [target.resource.handle.clone()]
                         }
                         _ => true,
                     }

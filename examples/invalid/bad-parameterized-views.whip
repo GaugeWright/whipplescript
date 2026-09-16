@@ -1,0 +1,24 @@
+workflow BadParameterizedViews
+
+view duplicate(value int, value int) -> int {
+  return value
+}
+
+view malformed(value int) -> int {
+  return value
+  return value
+}
+
+view first(value int) -> int {
+  return second(value)
+}
+
+view second(value int) -> int {
+  return first(value)
+}
+
+rule run
+  when started
+=> {
+  timer 1s as wait
+}

@@ -359,6 +359,9 @@ impl PreparedNormExecution {
             RuleCommitRevisionGuard {
                 program_version_id: &version,
                 revision_epoch: epoch,
+                // A norm enqueue evaluates no event frontier: it is keyed by
+                // its own intent, and `key` is what makes a replay a no-op.
+                evaluated_frontier: None,
             },
         )
     }

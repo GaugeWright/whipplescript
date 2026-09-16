@@ -1,0 +1,20 @@
+@service
+workflow BadManagedSuccessAlias
+
+class Seen {
+  value string
+}
+
+action fetch() -> string {
+  return "ready"
+}
+
+rule observe
+  when started
+=> {
+  fetch() as result
+
+  after result succeeds as output {
+    record Seen { value output }
+  }
+}

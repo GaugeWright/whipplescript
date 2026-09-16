@@ -1,0 +1,32 @@
+--- Table elaboration feeds the same rule checks and preserves row provenance.
+mod WHIPPLESCRIPT-ACTION-TABLE-ELABORATION is
+  protecting BOOL .
+  sort Stage .
+  ops ready schemaError emptyError duplicateError typeError provenanceError checked : -> Stage [ctor] .
+  vars N T P : Bool .
+  op expand : Bool Bool -> Stage .
+  --- A named string may cross an explicit action boundary, not a record field.
+  op assignAgent : Bool Bool -> Stage .
+  eq assignAgent(true, N) = checked .
+  eq assignAgent(false, true) = checked .
+  eq assignAgent(false, false) = typeError .
+  op analyze : Stage Bool Bool Bool -> Stage .
+
+  eq expand(false, N) = schemaError .
+  eq expand(true, false) = emptyError .
+  eq expand(true, true) = ready .
+  eq analyze(schemaError, N, T, P) = schemaError .
+  eq analyze(emptyError, N, T, P) = emptyError .
+  eq analyze(ready, false, T, P) = duplicateError .
+  eq analyze(ready, true, false, P) = typeError .
+  eq analyze(ready, true, true, false) = provenanceError .
+  eq analyze(ready, true, true, true) = checked .
+endm
+mod WHIPPLESCRIPT-ACTION-TABLE-ELABORATION-LOST is
+  including WHIPPLESCRIPT-ACTION-TABLE-ELABORATION .
+  rl [ignore-schema] : schemaError => checked .
+  rl [ignore-empty] : emptyError => checked .
+  rl [ignore-duplicate] : duplicateError => checked .
+  rl [ignore-type] : typeError => checked .
+  rl [ignore-provenance] : provenanceError => checked .
+endm

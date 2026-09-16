@@ -1,0 +1,151 @@
+--- DR-0100: the boundary between having a value and completing an action.
+--- Bounded to two owned operations per scope. Provider settlement and local
+--- recovery are inputs, not provider/handler implementations. A closed plan
+--- means every selected continuation has run or been suppressed; it is NOT
+--- inferred from the absence of running effects. The runtime must establish
+--- that premise from the expanded graph before using this completion test.
+---
+--- Id includes firing AND static call path. Nested completion is represented
+--- by a parent's child-wait cell; no independently addressable workflow exists.
+--- Terminal statuses retain all causes even after recovery. unknown is not a
+--- terminal acknowledgement. The weakening modules deliberately break each
+--- distinction without changing the positive model.
+
+fmod ACTION-SCOPE-STATE is
+  protecting BOOL .
+  sorts Id Phase Result Plan Status Cancel Cfg .
+  ops call1 call2 firing2 child : -> Id [ctor] .
+  ops active succeeded rejected : -> Phase [ctor] .
+  ops absent value : -> Result [ctor] .
+  ops open closed : -> Plan [ctor] .
+  ops pending ok failed timedOut cancelled unknown skipped : -> Status [ctor] .
+  op recovered : Status -> Status [ctor] .
+  op waiting : Id -> Status [ctor] .
+  ops noRequest requested : -> Cancel [ctor] .
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+  op scope : Id Phase Result Plan Status Status Cancel -> Cfg [ctor] .
+  op acknowledged : Id -> Cfg [ctor] .
+
+  op settled : Status -> Bool .
+  op acceptable : Status -> Bool .
+  op failure : Status -> Bool .
+  var S : Status .
+  var I : Id .
+  eq settled(pending) = false .
+  eq settled(unknown) = false .
+  eq settled(waiting(I)) = false .
+  eq settled(recovered(S)) = failure(S) .
+  eq settled(S) = true [owise] .
+  eq acceptable(ok) = true .
+  eq acceptable(skipped) = true .
+  eq acceptable(recovered(S)) = failure(S) .
+  eq acceptable(S) = false [owise] .
+  eq failure(failed) = true .
+  eq failure(timedOut) = true .
+  eq failure(cancelled) = true .
+  eq failure(S) = false [owise] .
+
+  op independent : -> Cfg .
+  eq independent = scope(call1, active, absent, closed, pending, pending, noRequest) .
+  op prematureValue : -> Cfg .
+  eq prematureValue = scope(call1, active, value, closed, ok, pending, noRequest) .
+  op twoFailures : -> Cfg .
+  eq twoFailures = scope(call1, active, absent, closed, failed, timedOut, noRequest) .
+endfm
+
+mod WHIPPLESCRIPT-ACTION-SCOPES is
+  including ACTION-SCOPE-STATE .
+  vars I J : Id .
+  var R : Result .
+  var P : Plan .
+  vars A B : Status .
+  var C : Cancel .
+
+  --- Independent provider results may arrive in either order. Outcomes are
+  --- never overwritten after settlement; recovery preserves the original.
+  rl [left-ok] : scope(I, active, R, P, pending, B, C)
+    => scope(I, active, R, P, ok, B, C) .
+  rl [right-ok] : scope(I, active, R, P, A, pending, C)
+    => scope(I, active, R, P, A, ok, C) .
+  rl [left-fails] : scope(I, active, R, P, pending, B, C)
+    => scope(I, active, R, P, failed, B, C) .
+  rl [right-timeout] : scope(I, active, R, P, A, pending, C)
+    => scope(I, active, R, P, A, timedOut, C) .
+  rl [request-cancel] : scope(I, active, R, P, A, pending, noRequest)
+    => scope(I, active, R, P, A, pending, requested) .
+  rl [ack-cancel] : scope(I, active, R, P, A, pending, requested)
+    => scope(I, active, R, P, A, cancelled, requested) acknowledged(I) .
+  rl [uncertain-cancel] : scope(I, active, R, P, A, pending, requested)
+    => scope(I, active, R, P, A, unknown, requested) .
+  rl [resolve-uncertain] : scope(I, active, R, P, A, unknown, requested)
+    => scope(I, active, R, P, A, cancelled, requested) acknowledged(I) .
+
+  --- These transitions stand for checked local recovery that has completed,
+  --- not an outcome read or logging. DR-0102 models handler execution itself.
+  crl [recover-left] : scope(I, active, R, P, A, B, C)
+    => scope(I, active, R, P, recovered(A), B, C) if failure(A) .
+  crl [recover-right] : scope(I, active, R, P, A, B, C)
+    => scope(I, active, R, P, A, recovered(B), C) if failure(B) .
+
+  --- The result reads the left operation; it does not silently join the right.
+  crl [return-value] : scope(I, active, absent, P, A, B, C)
+    => scope(I, active, value, P, A, B, C) if acceptable(A) /\ (A =/= skipped) .
+  crl [complete] : scope(I, active, value, closed, A, B, C)
+    => scope(I, succeeded, value, closed, A, B, C)
+    if acceptable(A) /\ acceptable(B) .
+  crl [propagate] : scope(I, active, R, closed, A, B, C)
+    => scope(I, rejected, R, closed, A, B, C)
+    if settled(A) /\ settled(B) /\ (failure(A) or failure(B)) .
+
+  --- A parent's child wait is discharged only by THAT child's scope result.
+  --- This model's nested witness is the successful case; structured nested
+  --- failure/cause references are an additional implementation obligation.
+  rl [child-result] :
+    scope(I, active, R, P, waiting(J), B, C)
+    scope(J, succeeded, value, closed, A, ok, noRequest)
+    => scope(I, active, R, P, ok, B, C)
+       scope(J, succeeded, value, closed, A, ok, noRequest) .
+endm
+
+mod WHIPPLESCRIPT-ACTION-EAGER-RETURN is
+  including WHIPPLESCRIPT-ACTION-SCOPES .
+  var I : Id .
+  vars A B : Status .
+  var C : Cancel .
+  --- Invalid extraction: return readiness is mistaken for scope completion.
+  rl [eager-return] : scope(I, active, value, closed, A, B, C)
+    => scope(I, succeeded, value, closed, A, B, C) .
+endm
+
+mod WHIPPLESCRIPT-ACTION-CANCEL-IS-ACK is
+  including WHIPPLESCRIPT-ACTION-SCOPES .
+  var I : Id .
+  var R : Result .
+  var P : Plan .
+  var A : Status .
+  --- Wrongly discard the pending obligation as soon as cancellation is asked.
+  rl [request-is-ack] : scope(I, active, R, P, A, pending, noRequest)
+    => scope(I, active, R, P, A, recovered(cancelled), requested) .
+endm
+
+mod WHIPPLESCRIPT-ACTION-LOSES-CAUSE is
+  including WHIPPLESCRIPT-ACTION-SCOPES .
+  var I : Id .
+  var R : Result .
+  var C : Cancel .
+  --- A first-failure winner erases a distinct concurrent timeout.
+  rl [first-failure-only] : scope(I, active, R, closed, failed, timedOut, C)
+    => scope(I, rejected, R, closed, failed, skipped, C) .
+endm
+
+mod WHIPPLESCRIPT-ACTION-EAGER-PLAN-CLOSE is
+  including WHIPPLESCRIPT-ACTION-SCOPES .
+  var I : Id .
+  vars A B : Status .
+  var C : Cancel .
+  --- Settled effects cannot prove that all continuations have executed.
+  crl [ignore-open-plan] : scope(I, active, value, open, A, B, C)
+    => scope(I, succeeded, value, open, A, B, C)
+    if acceptable(A) /\ acceptable(B) .
+endm

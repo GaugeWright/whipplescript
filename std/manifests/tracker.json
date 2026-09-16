@@ -43,8 +43,10 @@
           "effect_kind": "tracker.release",
           "source_forms": ["release"],
           "input_schema": "tracker.release.input",
+          "output_schema": "TrackerRelease",
           "required_capabilities": ["tracker.release"],
           "provider_kinds": ["builtin-tracker"],
+          "projected_facts": ["effect.output"],
           "validation": "none"
         },
         {
@@ -52,8 +54,10 @@
           "effect_kind": "tracker.finish",
           "source_forms": ["finish"],
           "input_schema": "tracker.finish.input",
+          "output_schema": "TrackerFinish",
           "required_capabilities": ["tracker.finish"],
           "provider_kinds": ["builtin-tracker"],
+          "projected_facts": ["effect.output"],
           "validation": "none"
         },
         {
@@ -135,7 +139,7 @@
           "keyword": "release",
           "scope": "rule_body",
           "requires": [{ "kind": "Capability", "name": "tracker.release" }],
-          "provides": [{ "kind": "EffectHandle" }],
+          "provides": [{ "kind": "EffectHandle", "type": "TrackerRelease" }],
           "lowering_target": "typed_effect_call"
         },
         {
@@ -144,7 +148,7 @@
           "keyword": "finish",
           "scope": "rule_body",
           "requires": [{ "kind": "Capability", "name": "tracker.finish" }],
-          "provides": [{ "kind": "EffectHandle" }],
+          "provides": [{ "kind": "EffectHandle", "type": "TrackerFinish" }],
           "lowering_target": "typed_effect_call"
         }
       ]

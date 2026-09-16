@@ -1,0 +1,13 @@
+load ../action-continuation-recovery.maude
+search [1] in WHIPPLESCRIPT-ACTION-CONTINUATION-RECOVERY : scope(failed, returning, true, false) =>* recovered .
+search [1] in WHIPPLESCRIPT-ACTION-CONTINUATION-RECOVERY : scope(failed, returning, false, false) =>* recovered .
+search [1] in WHIPPLESCRIPT-ACTION-RECOVERY-EARLY : scope(failed, returning, false, false) =>* recovered .
+search [1] in WHIPPLESCRIPT-ACTION-CONTINUATION-RECOVERY : scope(failed, observed, true, false) =>* recovered .
+search [1] in WHIPPLESCRIPT-ACTION-RECOVERY-OBSERVATION : scope(failed, observed, true, false) =>* recovered .
+search [1] in WHIPPLESCRIPT-ACTION-CONTINUATION-RECOVERY : scope(failed, returning, true, true) =>* recovered .
+search [1] in WHIPPLESCRIPT-ACTION-RECOVERY-LOST-SIBLING : scope(failed, returning, true, true) =>* recovered .
+search [1] in WHIPPLESCRIPT-ACTION-CONTINUATION-RECOVERY : scope(suppressed, returning, true, false) =>* recovered .
+search [1] in WHIPPLESCRIPT-ACTION-RECOVERY-FAKE-TERMINAL : scope(suppressed, returning, true, false) =>* recovered .
+search [1] in WHIPPLESCRIPT-ACTION-CONTINUATION-RECOVERY : scope(requested, returning, true, false) =>* recovered .
+search [1] in WHIPPLESCRIPT-ACTION-CONTINUATION-RECOVERY : scope(uncertain, returning, true, false) =>* recovered .
+search [1] in WHIPPLESCRIPT-ACTION-CONTINUATION-RECOVERY : scope(failed, broken, true, false) =>* recovered .

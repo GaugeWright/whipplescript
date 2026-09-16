@@ -11,6 +11,10 @@ use crate::{
 };
 use std::ops::Range;
 
+mod composition;
+mod record_expression;
+pub use composition::{CompositionExpr, CompositionStmt};
+
 /// What a byte offset into a body text means to the file the text came from.
 ///
 /// Body text is not always a slice of the source: `then`/action expansion,
@@ -260,13 +264,18 @@ pub fn is_iso8601_instant(value: &str) -> bool {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BodyAst {
     pub statements: Vec<BodyStmt>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum BodyStmt {
+    /// DR-0100 source composition, parsed only in the typed-action path and
+    /// expanded before the ordinary rule lowering visitors consume a body.
+    Composition(CompositionStmt),
     Record(RecordStmt),
     /// `done x` / `done x -> record ...` — marks a fact terminal, optionally
     /// replacing it with a record.
@@ -336,7 +345,8 @@ pub enum BodyStmt {
     },
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RecordStmt {
     pub schema: String,
     pub from: Option<String>,
@@ -350,7 +360,8 @@ pub struct RecordStmt {
 /// `with credential` modifier. Each form lowers to a sentinel that the
 /// custodian substitutes at egress, so the program text never contains the
 /// material and the language has no way to ask for it.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum CredentialPresentation {
     /// `Authorization: Bearer <material>`.
     Bearer,
@@ -380,7 +391,8 @@ impl CredentialPresentation {
 }
 
 /// One `header "<name>" <value>` line of a `request` block.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RequestHeader {
     pub name: String,
     pub value: RequestHeaderValue,
@@ -389,7 +401,8 @@ pub struct RequestHeader {
 
 /// A header value: either an ordinary expression, or a credential in one of the
 /// presentation forms — which is the *marked slot* the custodian fills.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum RequestHeaderValue {
     /// Both the source text and the parsed node, matching `FieldValue::Expr`:
     /// the checker reads the text, the lowering reads the node.
@@ -400,14 +413,16 @@ pub enum RequestHeaderValue {
     },
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FieldAssign {
     pub name: String,
     pub value: FieldValue,
     pub span: SourceSpan,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum FieldValue {
     /// Bare field in a `from` block: copy the same-named field.
     Shorthand,
@@ -421,7 +436,8 @@ pub enum FieldValue {
     },
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EffectStmt {
     pub kind: BodyEffectKind,
     pub binding: Option<String>,
@@ -433,6 +449,71 @@ pub struct EffectStmt {
 }
 
 impl BodyEffectKind {
+    /// Whether DR-0100's first managed executor can project this operation.
+    /// Runtime preflight owns no second inventory; source migration can use
+    /// this same boundary as each remaining compiler analysis gains parity.
+    pub fn managed_execution_v1_supported(&self) -> bool {
+        matches!(
+            self,
+            Self::Timer { .. }
+                | Self::Tell { .. }
+                | Self::Coerce { .. }
+                | Self::Prompt { .. }
+                | Self::Decide { .. }
+                | Self::FileRead { .. }
+                | Self::FileWrite { .. }
+                | Self::FileImport { .. }
+                | Self::FileExport { .. }
+                | Self::Notify { .. }
+                | Self::TrackerFile { .. }
+                | Self::TrackerClaim { .. }
+                | Self::TrackerRelease { .. }
+                | Self::TrackerFinish { .. }
+                | Self::LedgerAppend { .. }
+                | Self::CounterConsume { .. }
+                | Self::Exec {
+                    target: ExecTarget::Capability { .. },
+                    parse_target: Some(ExecParse { each: false, .. }),
+                    ..
+                }
+        )
+    }
+
+    /// The authored operation name used in diagnostics. This deliberately
+    /// names the source construct rather than the runtime effect kind, because
+    /// a migration error must tell the author which statement needs attention.
+    pub fn source_name(&self) -> &str {
+        match self {
+            Self::Tell { .. } => "tell",
+            Self::Coerce { .. } => "coerce",
+            Self::Prompt { .. } => "prompt",
+            Self::Decide { .. } => "decide",
+            Self::Call { .. } => "call",
+            Self::ConstructCapabilityCall { keyword, .. } => keyword,
+            Self::Invoke { .. } => "invoke",
+            Self::Timer { .. } => "timer",
+            Self::HttpRequest { .. } => "request",
+            Self::RotateCredential { .. } => "rotate",
+            Self::RevokeCredential { .. } => "revoke",
+            Self::MintCredential { .. } => "mint credential",
+            Self::Exec { .. } => "exec",
+            Self::ObtainCredential { .. } => "obtain credential",
+            Self::TrackerFile { .. } => "file",
+            Self::TrackerClaim { .. } => "claim",
+            Self::TrackerRelease { .. } => "release",
+            Self::TrackerFinish { .. } => "finish",
+            Self::LeaseAcquire { .. } => "acquire",
+            Self::LeaseRenew { .. } => "renew",
+            Self::LedgerAppend { .. } => "append",
+            Self::CounterConsume { .. } => "consume",
+            Self::Notify { .. } => "emit signal",
+            Self::FileRead { .. } => "read",
+            Self::FileWrite { .. } => "write",
+            Self::FileImport { .. } => "import",
+            Self::FileExport { .. } => "export",
+        }
+    }
+
     /// The `with access to …` grants declared on this effect, if its kind
     /// carries any. Only `tell` and `invoke` do: a turn's grants narrow the
     /// authority the worker runs under, and an invoke's narrow the child's.
@@ -451,7 +532,8 @@ impl BodyEffectKind {
 /// effect. On `tell`, it narrows the turn's effective authority per Proposal A
 /// (spec/agent-harness.md). On `invoke`, it is the explicit start-grant surface for
 /// narrowing the child workflow's authority.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AccessGrant {
     pub resource: String,
     pub operations: Vec<AccessGrantOp>,
@@ -461,7 +543,8 @@ pub struct AccessGrant {
 /// One operation clause inside a turn-access grant block — an operation name with its
 /// optional `for <target>` reference and/or `["glob", …]` path patterns (e.g.
 /// `recall for issue`, `read ["docs/**"]`).
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AccessGrantOp {
     pub operation: String,
     pub target: Option<String>,
@@ -469,7 +552,8 @@ pub struct AccessGrantOp {
     pub span: SourceSpan,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum BodyEffectKind {
     Tell {
         target: String,
@@ -729,7 +813,8 @@ pub enum BodyEffectKind {
     },
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ConstructUseField {
     pub name: String,
     pub source: String,
@@ -746,6 +831,25 @@ pub struct ConstructUseField {
 // manifests' `grammar` objects (std/manifests/*.json — the single source of
 // grammar). See spec/construct-grammar.md, "DR-0011 Two-Shape Meta-Grammar
 // (S6 build)".
+
+impl BodyEffectKind {
+    /// Inputs whose source provenance the output carries. Authority and
+    /// executor integrity are separate transfers, owned by IFC.
+    pub fn carried_input_expressions(&self) -> Option<Vec<&str>> {
+        match self {
+            Self::Coerce { args, .. } => Some(args.iter().map(String::as_str).collect()),
+            Self::ConstructCapabilityCall {
+                target_capability,
+                fields,
+                ..
+            } if target_capability == crate::CUSTODY_UNWRAP_CAPABILITY => fields
+                .iter()
+                .find(|field| field.name == crate::OPEN_ENVELOPE_SLOT)
+                .map(|field| vec![field.source.as_str()]),
+            _ => None,
+        }
+    }
+}
 
 /// A slot's value kind: a bare identifier or a value expression.
 #[derive(Clone, Copy, Debug)]
@@ -824,7 +928,8 @@ pub(crate) fn starts_with_package_effect_verb(line: &str) -> bool {
     })
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum ExecTarget {
     RawCommand(String),
     Capability { name: String, stdin_binding: String },
@@ -832,13 +937,15 @@ pub enum ExecTarget {
 
 /// The `->` ingestion contract on an `exec`: stdout must parse as `schema`
 /// (one object) or, with `each`, as a JSONL/array stream of `schema`.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ExecParse {
     pub schema: String,
     pub each: bool,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Prompt {
     pub text: String,
     pub content_type: Option<String>,
@@ -858,7 +965,8 @@ pub struct Prompt {
 /// commit — and the first advancing commit under a broken condition commits
 /// the lapse arm instead, exactly once. Statements after the region are the
 /// point of no return.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RegionBlock {
     /// `until` negates: the region runs while the condition is FALSE and
     /// lapses when it becomes true.
@@ -882,7 +990,8 @@ pub struct RegionBlock {
     pub span: SourceSpan,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AfterBlock {
     pub binding: String,
     pub predicate: AfterPredicate,
@@ -935,7 +1044,8 @@ impl AfterPredicate {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum AfterPredicate {
     Succeeds,
     Fails,
@@ -997,14 +1107,16 @@ impl AfterPredicate {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CaseBlock {
     pub scrutinee: String,
     pub branches: Vec<CaseBranch>,
     pub span: SourceSpan,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CaseBranch {
     pub pattern: String,
     pub binding: Option<String>,
@@ -1013,7 +1125,8 @@ pub struct CaseBranch {
     pub span: SourceSpan,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TerminalStmt {
     pub kind: TerminalKind,
     pub name: String,
@@ -1032,7 +1145,8 @@ pub struct TerminalStmt {
     pub span: SourceSpan,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum TerminalKind {
     Complete,
     Fail,
@@ -1101,6 +1215,8 @@ fn split_fields_inner(
         tokens,
         pos: 0,
         diagnostics,
+        mode: BodyMode::LegacyRule,
+        implicit_result_binding: false,
     };
     let mut assignments = Vec::new();
     while let Some(token) = parser.peek() {
@@ -1530,6 +1646,8 @@ pub fn parse_first_statement<'a>(
         tokens,
         pos: 0,
         diagnostics,
+        mode: BodyMode::LegacyRule,
+        implicit_result_binding: false,
     };
     let statement = parser.parse_statement();
     (statement, parser.diagnostics)
@@ -1539,7 +1657,39 @@ pub fn parse_rule_body<'a>(
     source: &str,
     base: impl Into<BodyBase<'a>>,
 ) -> (BodyAst, Vec<Diagnostic>) {
-    let base = base.into();
+    parse_body(source, base.into(), BodyMode::LegacyRule)
+}
+
+/// Parse typed action syntax with the same effects, branches and source spans
+/// as rule bodies. Legacy rule parsing deliberately keeps its existing surface.
+pub fn parse_action_body<'a>(
+    source: &str,
+    base: impl Into<BodyBase<'a>>,
+) -> (BodyAst, Vec<Diagnostic>) {
+    parse_body(source, base.into(), BodyMode::Action)
+}
+
+/// Parse a rule containing action calls without changing workflow terminals.
+/// This is a preparation path; legacy executable rule parsing is unchanged.
+pub fn parse_composed_rule_body<'a>(
+    source: &str,
+    base: impl Into<BodyBase<'a>>,
+) -> (BodyAst, Vec<Diagnostic>) {
+    parse_body(source, base.into(), BodyMode::ComposedRule)
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum BodyMode {
+    LegacyRule,
+    ComposedRule,
+    Action,
+}
+
+fn parse_body<'a>(
+    source: &'a str,
+    base: BodyBase<'a>,
+    mode: BodyMode,
+) -> (BodyAst, Vec<Diagnostic>) {
     let mut diagnostics = Vec::new();
     let tokens = lex_body(source, base, &mut diagnostics);
     let mut parser = BodyParser {
@@ -1548,6 +1698,8 @@ pub fn parse_rule_body<'a>(
         tokens,
         pos: 0,
         diagnostics,
+        mode,
+        implicit_result_binding: false,
     };
     let statements = parser.parse_statements(None);
     (BodyAst { statements }, parser.diagnostics)
@@ -1559,9 +1711,15 @@ struct BodyParser<'a> {
     tokens: Vec<Token>,
     pos: usize,
     diagnostics: Vec<Diagnostic>,
+    mode: BodyMode,
+    implicit_result_binding: bool,
 }
 
 impl<'a> BodyParser<'a> {
+    fn has_result_binding(&self, binding: &Option<String>) -> bool {
+        binding.is_some() || self.implicit_result_binding
+    }
+
     fn peek(&self) -> Option<&Token> {
         self.tokens.get(self.pos)
     }
@@ -1908,6 +2066,14 @@ impl<'a> BodyParser<'a> {
                 return None;
             }
         };
+        if self.mode != BodyMode::LegacyRule
+            && (matches!(keyword.as_str(), "return" | "then")
+                || self.mode == BodyMode::Action && matches!(keyword.as_str(), "fail" | "complete")
+                || keyword == "on"
+                || matches!(self.peek_at(1).map(|token| &token.tok), Some(Tok::Sym('('))))
+        {
+            return self.parse_composition_statement(&keyword);
+        }
         // Data-driven `effect_operation` constructs (DR-0011): a leading keyword
         // registered in the compiled-in grammar table is parsed generically.
         if let Some(spec) = effect_operation_spec(&keyword) {
@@ -2773,7 +2939,7 @@ impl<'a> BodyParser<'a> {
         // statement WITHOUT its `as` and supplies the binding afterwards
         // (spec/language.md "Sequencing sugar"). Returning `None` here left
         // the verb unchainable.
-        if binding.is_none() {
+        if !self.has_result_binding(&binding) {
             let span = self.span_from(start);
             self.error(
                 diagnostic_code!("construct.missing_requirement"),
@@ -2835,7 +3001,7 @@ impl<'a> BodyParser<'a> {
         if !self.parse_effect_modifiers(&mut binding, &mut requires, &mut timeout_seconds) {
             return None;
         }
-        if binding.is_none() {
+        if !self.has_result_binding(&binding) {
             let span = self.span_from(start);
             self.error(
                 diagnostic_code!("construct.missing_requirement"),
@@ -3458,7 +3624,7 @@ impl<'a> BodyParser<'a> {
             return None;
         }
         match spec.binding {
-            BindingMode::Required if binding.is_none() => {
+            BindingMode::Required if !self.has_result_binding(&binding) => {
                 // Returned bindingless so `then` can supply the binding; see
                 // `parse_prompt_effect`.
                 let span = self.span_from(start);
@@ -3469,7 +3635,7 @@ impl<'a> BodyParser<'a> {
                     None,
                 );
             }
-            BindingMode::None if binding.is_some() => {
+            BindingMode::None if self.has_result_binding(&binding) => {
                 let span = self.span_from(start);
                 self.error(
                     diagnostic_code!("construct.incompatible_clause"),
@@ -3549,7 +3715,7 @@ impl<'a> BodyParser<'a> {
         }
         // Returned bindingless so `then` can supply the binding; see
         // `parse_prompt_effect`.
-        if binding.is_none() {
+        if !self.has_result_binding(&binding) {
             let span = self.span_from(start);
             self.error(
                 diagnostic_code!("construct.missing_requirement"),
@@ -3690,7 +3856,7 @@ impl<'a> BodyParser<'a> {
         }
         // Returned bindingless so `then` can supply the binding; see
         // `parse_prompt_effect`.
-        if binding.is_none() {
+        if !self.has_result_binding(&binding) {
             let span = self.span_from(start);
             self.error(
                 diagnostic_code!("construct.missing_requirement"),
@@ -3764,7 +3930,7 @@ impl<'a> BodyParser<'a> {
         }
         // Returned bindingless so `then` can supply the binding; see
         // `parse_prompt_effect`.
-        if binding.is_none() {
+        if !self.has_result_binding(&binding) {
             let span = self.span_from(start);
             self.error(
                 diagnostic_code!("construct.missing_requirement"),
@@ -3919,7 +4085,7 @@ impl<'a> BodyParser<'a> {
         }
         // Returned bindingless so `then` can supply the binding; see
         // `parse_prompt_effect`.
-        if binding.is_none() {
+        if !self.has_result_binding(&binding) {
             let span = self.span_from(start);
             self.error(
                 diagnostic_code!("construct.missing_requirement"),
@@ -4033,7 +4199,7 @@ impl<'a> BodyParser<'a> {
             if !self.parse_effect_modifiers(&mut binding, &mut requires, &mut timeout_seconds) {
                 return None;
             }
-            if binding.is_none() {
+            if !self.has_result_binding(&binding) {
                 let span = self.span_from(start);
                 self.error(
                     diagnostic_code!("construct.missing_requirement"),
@@ -4078,7 +4244,7 @@ impl<'a> BodyParser<'a> {
             if !self.parse_effect_modifiers(&mut binding, &mut requires, &mut timeout_seconds) {
                 return None;
             }
-            if binding.is_none() {
+            if !self.has_result_binding(&binding) {
                 let span = self.span_from(start);
                 self.error(
                     diagnostic_code!("construct.missing_requirement"),
@@ -4128,7 +4294,7 @@ impl<'a> BodyParser<'a> {
         if !self.parse_effect_modifiers(&mut binding, &mut requires, &mut timeout_seconds) {
             return None;
         }
-        if binding.is_none() {
+        if !self.has_result_binding(&binding) {
             let span = self.span_from(start);
             self.error(
                 diagnostic_code!("construct.missing_requirement"),
@@ -4361,7 +4527,7 @@ impl<'a> BodyParser<'a> {
         if !self.parse_effect_modifiers(&mut binding, &mut requires, &mut timeout_seconds) {
             return None;
         }
-        if binding.is_none() {
+        if !self.has_result_binding(&binding) {
             let span = self.span_from(start);
             self.error(
                 diagnostic_code!("construct.missing_requirement"),
@@ -4432,7 +4598,7 @@ impl<'a> BodyParser<'a> {
         if !self.parse_effect_modifiers(&mut binding, &mut requires, &mut timeout_seconds) {
             return None;
         }
-        if binding.is_none() {
+        if !self.has_result_binding(&binding) {
             let span = self.span_from(start);
             self.error(
                 diagnostic_code!("construct.missing_requirement"),
@@ -4556,7 +4722,7 @@ impl<'a> BodyParser<'a> {
         if !self.parse_effect_modifiers(&mut binding, &mut requires, &mut timeout_seconds) {
             return None;
         }
-        if binding.is_none() {
+        if !self.has_result_binding(&binding) {
             let span = self.span_from(start);
             self.error(
                 diagnostic_code!("construct.missing_requirement"),
@@ -4793,7 +4959,7 @@ impl<'a> BodyParser<'a> {
             return None;
         }
         match &parse_target {
-            Some(parse) if parse.each && binding.is_some() => {
+            Some(parse) if parse.each && self.has_result_binding(&binding) => {
                 let span = self.span_from(start);
                 self.error(
                     diagnostic_code!("construct.incompatible_clause"),
@@ -4802,7 +4968,7 @@ impl<'a> BodyParser<'a> {
                     Some("drop the `as` binding and react with `when <Schema> as item`".to_owned()),
                 );
             }
-            Some(parse) if !parse.each && binding.is_none() => {
+            Some(parse) if !parse.each && !self.has_result_binding(&binding) => {
                 let span = self.span_from(start);
                 self.error(diagnostic_code!("construct.missing_requirement"), 
                     span,
@@ -4995,11 +5161,17 @@ impl<'a> BodyParser<'a> {
         let start = self.pos;
         self.pos += 1; // release
         let item = self.ident_text("issue binding after `release`")?;
+        let mut binding = None;
+        let mut requires = Vec::new();
+        let mut timeout_seconds = None;
+        if !self.parse_effect_modifiers(&mut binding, &mut requires, &mut timeout_seconds) {
+            return None;
+        }
         Some(BodyStmt::Effect(EffectStmt {
             kind: BodyEffectKind::TrackerRelease { item },
-            binding: None,
-            requires: Vec::new(),
-            timeout_seconds: None,
+            binding,
+            requires,
+            timeout_seconds,
             prompt: None,
             span: self.span_from(start),
         }))
@@ -5254,7 +5426,37 @@ impl<'a> BodyParser<'a> {
     fn parse_case(&mut self) -> Option<BodyStmt> {
         let start = self.pos;
         self.pos += 1; // case
-        let scrutinee = self.ident_text("case scrutinee path")?;
+        let expression_start = self.pos;
+        let mut parentheses = 0usize;
+        let mut brackets = 0usize;
+        while let Some(token) = self.peek() {
+            match token.tok {
+                Tok::Sym('{') if parentheses == 0 && brackets == 0 => break,
+                Tok::Sym('(') => parentheses += 1,
+                Tok::Sym(')') => parentheses = parentheses.saturating_sub(1),
+                Tok::Sym('[') => brackets += 1,
+                Tok::Sym(']') => brackets = brackets.saturating_sub(1),
+                _ => {}
+            }
+            self.pos += 1;
+        }
+        let scrutinee = match (
+            self.tokens.get(expression_start),
+            self.tokens.get(self.pos.saturating_sub(1)),
+        ) {
+            (Some(first), Some(last)) if expression_start < self.pos => {
+                self.source[first.start..last.end].trim().to_owned()
+            }
+            _ => {
+                self.error(
+                    diagnostic_code!("parse.unexpected_token"),
+                    self.span_here(),
+                    "expected a case scrutinee expression".to_owned(),
+                    None,
+                );
+                return None;
+            }
+        };
         let opened_at = self.span_here();
         if !self.consume_sym('{') {
             let span = self.span_here();
@@ -6412,6 +6614,40 @@ mod tests {
             ..
         } if name == "backup_repo" && stdin_binding == "request" && schema == "Report"));
         assert_eq!(effect.binding.as_deref(), Some("result"));
+    }
+
+    #[test]
+    fn managed_execution_support_inventory_has_a_shared_boundary() {
+        for (source, supported) in [
+            ("timer 1s as wait", true),
+            ("coerce classify(msg.content) as verdict", true),
+            (
+                "export json Row to docs at \"rows.json\" { mode create } as exported",
+                true,
+            ),
+            ("exec backup_repo with request -> Report as result", true),
+            ("invoke Review {} as review", false),
+            (
+                "import json Row from docs at \"rows.json\" as imported",
+                true,
+            ),
+            (
+                "emit signal task.done to peer.id { note \"ok\" } as sent",
+                true,
+            ),
+            ("consume budget for ticket amount 1 as spent", true),
+            ("exec \"script.sh\" as result", false),
+        ] {
+            let ast = parse_ok(source);
+            let BodyStmt::Effect(effect) = &ast.statements[0] else {
+                panic!("expected effect for {source}");
+            };
+            assert_eq!(
+                effect.kind.managed_execution_v1_supported(),
+                supported,
+                "unexpected managed execution support for {source}"
+            );
+        }
     }
 
     #[test]

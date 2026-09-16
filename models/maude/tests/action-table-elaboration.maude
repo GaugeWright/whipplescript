@@ -1,0 +1,17 @@
+load ../action-table-elaboration.maude
+search [1] in WHIPPLESCRIPT-ACTION-TABLE-ELABORATION : analyze(expand(true, true), true, true, true) =>* checked .
+search [1] in WHIPPLESCRIPT-ACTION-TABLE-ELABORATION : analyze(expand(false, true), true, true, true) =>* checked .
+search [1] in WHIPPLESCRIPT-ACTION-TABLE-ELABORATION-LOST : analyze(expand(false, true), true, true, true) =>* checked .
+search [1] in WHIPPLESCRIPT-ACTION-TABLE-ELABORATION : analyze(expand(true, false), true, true, true) =>* checked .
+search [1] in WHIPPLESCRIPT-ACTION-TABLE-ELABORATION-LOST : analyze(expand(true, false), true, true, true) =>* checked .
+search [1] in WHIPPLESCRIPT-ACTION-TABLE-ELABORATION : analyze(expand(true, true), false, true, true) =>* checked .
+search [1] in WHIPPLESCRIPT-ACTION-TABLE-ELABORATION-LOST : analyze(expand(true, true), false, true, true) =>* checked .
+search [1] in WHIPPLESCRIPT-ACTION-TABLE-ELABORATION : analyze(expand(true, true), true, false, true) =>* checked .
+search [1] in WHIPPLESCRIPT-ACTION-TABLE-ELABORATION-LOST : analyze(expand(true, true), true, false, true) =>* checked .
+search [1] in WHIPPLESCRIPT-ACTION-TABLE-ELABORATION : analyze(expand(true, true), true, true, false) =>* checked .
+search [1] in WHIPPLESCRIPT-ACTION-TABLE-ELABORATION-LOST : analyze(expand(true, true), true, true, false) =>* checked .
+search [1] in WHIPPLESCRIPT-ACTION-TABLE-ELABORATION : assignAgent(true, false) =>* checked .
+search [1] in WHIPPLESCRIPT-ACTION-TABLE-ELABORATION : assignAgent(false, true) =>* checked .
+search [1] in WHIPPLESCRIPT-ACTION-TABLE-ELABORATION : assignAgent(false, false) =>* checked .
+search [1] in WHIPPLESCRIPT-ACTION-TABLE-ELABORATION-LOST : assignAgent(false, false) =>* checked .
+quit

@@ -1,0 +1,9 @@
+load ../managed-input-selectors.maude
+search [1] in WHIPPLESCRIPT-MANAGED-INPUT-SELECTORS : select(true, false, false, true) =>! allowed .
+search [1] in WHIPPLESCRIPT-MANAGED-INPUT-SELECTORS : select(false, false, true, true) =>! allowed .
+search [1] in WHIPPLESCRIPT-MANAGED-INPUT-SELECTORS-LOST : select(false, false, true, true) =>! allowed .
+search [1] in WHIPPLESCRIPT-MANAGED-INPUT-SELECTORS : select(false, true, false, true) =>! allowed .
+search [1] in WHIPPLESCRIPT-MANAGED-INPUT-SELECTORS : select(false, true, true, true) =>! allowed .
+search [1] in WHIPPLESCRIPT-MANAGED-INPUT-SELECTORS : select(true, false, false, false) =>! allowed .
+search [1] in WHIPPLESCRIPT-MANAGED-INPUT-SELECTORS-LOST : select(true, false, false, false) =>! allowed .
+quit

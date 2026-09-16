@@ -1,9 +1,9 @@
-error[parse.invalid_expression]: rule `shout` has invalid guard expression: unexpected token in expression `uppercase(issue.title) == "FLAKY"`
+error[expr.unsupported_function]: rule `shout` calls unsupported expression function `uppercase`
    --> examples/invalid/bad-guard-expressions.whip:42:29
    |
 42 |   when Issue as issue where uppercase(issue.title) == "FLAKY"
    |                             ^^^^^^^^^
-   = help: use deterministic field paths, literals, boolean operators, comparisons, membership, count, or exists
+   = help: use `count`, `exists`, or `empty`
 error[expr.non_numeric_operand]: rule `count_words` uses arithmetic with a non-numeric operand
    --> examples/invalid/bad-guard-expressions.whip:50:29
    |

@@ -1,0 +1,11 @@
+load ../action-record-admission.maude
+search [1] in WHIPPLESCRIPT-ACTION-RECORD-ADMISSION : draft(false, false, true, true) =>* committed(false, true) .
+search [1] in WHIPPLESCRIPT-ACTION-RECORD-ADMISSION : draft(true, false, true, true) =>* committed(true, true) .
+search [1] in WHIPPLESCRIPT-ACTION-RECORD-ADMISSION : draft(true, false, true, false) =>* committed(true, false) .
+search [1] in WHIPPLESCRIPT-ACTION-RECORD-ADMISSION : draft(true, true, false, false) =>* committed(true, false) .
+search [1] in WHIPPLESCRIPT-ACTION-RECORD-ADMISSION : draft(true, true, true, false) =>* committed(false, false) .
+search [1] in WHIPPLESCRIPT-ACTION-RECORD-ADMISSION : draft(true, false, false, false) =>* committed(true, false) .
+search [1] in WHIPPLESCRIPT-ACTION-RECORD-ADMISSION : draft(true, false, true, false) =>* committed(true, true) .
+search [1] in WHIPPLESCRIPT-ACTION-RECORD-EARLY-CONSUMPTION : draft(false, false, true, true) =>* committed(false, true) .
+search [1] in WHIPPLESCRIPT-ACTION-RECORD-REPLAY-REVIVAL : draft(true, true, false, false) =>* committed(true, false) .
+quit

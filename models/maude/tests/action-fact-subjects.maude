@@ -1,0 +1,10 @@
+load ../action-fact-subjects.maude
+search [1] in WHIPPLESCRIPT-ACTION-FACT-SUBJECTS : done(select(box(original)), admitted) =>* consumed .
+search [1] in WHIPPLESCRIPT-ACTION-FACT-SUBJECTS : done(original, revived) =>* noop .
+search [1] in WHIPPLESCRIPT-ACTION-FACT-SUBJECTS : done(original, absent) =>* noop .
+search [1] in WHIPPLESCRIPT-ACTION-FACT-SUBJECTS : done(rebuilt, admitted) =>* consumed .
+search [1] in WHIPPLESCRIPT-ACTION-FACT-SUBJECTS : done(box(original), admitted) =>* consumed .
+search [1] in WHIPPLESCRIPT-ACTION-FACT-SUBJECTS : done(original, revived) =>* consumed .
+search [1] in WHIPPLESCRIPT-ACTION-PROVENANCE-AS-SUBJECT : done(rebuilt, admitted) =>* consumed .
+search [1] in WHIPPLESCRIPT-ACTION-CONSUMES-REVIVAL : done(original, revived) =>* consumed .
+quit

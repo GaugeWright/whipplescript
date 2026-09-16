@@ -286,5 +286,56 @@ class TestScaffoldingIsNotARefusalTests(unittest.TestCase):
             3, found, "a refusal below an ordinary string must still be swept"
         )
 
+class TestOnlyModule(unittest.TestCase):
+    """A file the crate compiles only under `cfg(test)` holds no refusal.
+
+    The declaration is in the PARENT module, so nothing in the file itself says
+    so and every line read as production -- including the `Err(..)` an assertion
+    matches ON. `assert_recovery` in `whipplescript-host-do` is the case that
+    found it: a shared helper rather than a `#[test]` fn, so the test-function
+    rule did not reach it either, and the sweep asked for a test pinning a
+    test's own assertion.
+    """
+
+    def crate(self, declaration: str) -> str:
+        root = tempfile.mkdtemp()
+        src = Path(root) / "src"
+        (src / "nested").mkdir(parents=True)
+        (src / "lib.rs").write_text(declaration)
+        target = src / "nested" / "recovery_tests.rs"
+        target.write_text(
+            "fn assert_it<S>(store: S) {\n"
+            '    assert!(matches!(store.commit(), Err(StoreError::Conflict(_))));\n'
+            "}\n"
+        )
+        return str(target)
+
+    def test_a_cfg_test_module_declaration_excludes_the_whole_file(self):
+        for declaration in (
+            "#[cfg(test)]\nmod recovery_tests;\n",
+            "#[cfg(all(test, feature = \"native\"))]\nmod recovery_tests;\n",
+            "#[cfg(all(test, unix))]\npub mod recovery_tests;\n",
+        ):
+            with self.subTest(declaration=declaration.splitlines()[0]):
+                self.assertTrue(
+                    sweep.test_only_module(self.crate(declaration)),
+                    "a module declared under cfg(test) is test scaffolding",
+                )
+
+    def test_an_ordinary_module_declaration_is_still_swept(self):
+        self.assertFalse(
+            sweep.test_only_module(self.crate("mod recovery_tests;\n")),
+            "an unconditional module is production, whatever the file is named",
+        )
+
+    def test_a_file_whose_declaration_is_absent_is_treated_as_production(self):
+        # Fail closed: an unfindable declaration over-asks rather than
+        # silently dropping a file out of the sweep.
+        self.assertFalse(
+            sweep.test_only_module(self.crate("// nothing declares it\n")),
+            "an undeclared file must stay in the sweep",
+        )
+
+
 if __name__ == '__main__':
     unittest.main()

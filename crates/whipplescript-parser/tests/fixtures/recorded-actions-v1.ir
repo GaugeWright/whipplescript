@@ -1,0 +1,19 @@
+workflow RecordedActions
+source_tags
+@service workflow RecordedActions
+schemas
+  class Note
+    label string
+agents
+  agent reviewer harness=<fallback> provider=fixture profile=r capacity=1 skills=[] capabilities=[] tools=[]
+rules
+  rule review
+    when started
+    reads
+      pattern:started
+    writes
+      schema:Note
+    effects
+      turn__act0 kind=agent.tell binding=turn__act0 key=9508d6f0eae6a7c101338dda98a70e4e
+      turn__act1 kind=agent.tell binding=turn__act1 key=e94d87a2faeede275ef8bbcef18a38c4
+    body_hash 1ef540077d680d5db9d80bc7a7380d85

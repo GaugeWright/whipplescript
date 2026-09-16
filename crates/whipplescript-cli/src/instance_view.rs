@@ -40,7 +40,7 @@ use whipplescript_kernel::idempotency_key;
 use whipplescript_parser::snapshot;
 use whipplescript_store::{EffectView, EventView, InstanceView, RunView, SqliteStore, StoreResult};
 
-pub const INSTANCE_VIEW_SCHEMA: &str = "whipplescript.instance_view.v0";
+pub const INSTANCE_VIEW_SCHEMA: &str = "whipplescript.instance_view.v1";
 
 /// One advance of a firing: a `rule.committed` event, with the parts the effect
 /// key is built from.
@@ -154,7 +154,11 @@ pub struct VersionSnapshot {
 /// `None` when the instance does not exist. This is the entry point a host
 /// uses — `whip view` and GaugeDesk's Instances tab both come through here —
 /// so the join has one implementation and the two cannot drift.
-pub fn load(store: &SqliteStore, instance_id: &str) -> StoreResult<Option<Value>> {
+pub fn load(
+    store: &SqliteStore,
+    instance_id: &str,
+    coercion_fingerprint: &str,
+) -> StoreResult<Option<Value>> {
     let Some(instance) = store.get_instance(instance_id)? else {
         return Ok(None);
     };
@@ -162,9 +166,24 @@ pub fn load(store: &SqliteStore, instance_id: &str) -> StoreResult<Option<Value>
     let effects = store.list_effects(instance_id)?;
     let runs = store.list_runs(instance_id)?;
     let versions = version_snapshots(store, &instance, &events)?;
-    Ok(Some(project(
-        &instance, &versions, &events, &effects, &runs,
-    )))
+    let mut view = project(&instance, &versions, &events, &effects, &runs);
+    let explanations = whipplescript_kernel::source_action::explanation::project_instance(
+        store,
+        instance_id,
+        coercion_fingerprint,
+        &BTreeSet::new(),
+    )?;
+    view.as_object_mut()
+        .expect("instance view is an object")
+        .insert(
+            "action_explanations".into(),
+            serde_json::to_value(explanations).map_err(|error| {
+                whipplescript_store::StoreError::Conflict(format!(
+                    "could not encode action explanations: {error}"
+                ))
+            })?,
+        );
+    Ok(Some(view))
 }
 
 /// Every program version the instance's firings ran under, with the stored

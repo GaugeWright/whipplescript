@@ -1,0 +1,20 @@
+load ../action-return-paths.maude
+
+--- Both alternatives return, or the other explicitly fails.
+search [1] in WHIPPLESCRIPT-ACTION-RETURN-PATHS : audit(result(x) result(neg(x))) =>* missing .
+search [1] in WHIPPLESCRIPT-ACTION-RETURN-PATHS : audit(result(x) result(neg(x))) =>* multiple .
+search [1] in WHIPPLESCRIPT-ACTION-RETURN-PATHS : audit(result(x) failure(neg(x))) =>* missing .
+--- Missing on one selected branch, not a manufactured optional/null value.
+search [1] in WHIPPLESCRIPT-ACTION-RETURN-PATHS : audit(result(x)) =>* missing .
+search [1] in WHIPPLESCRIPT-ACTION-RETURN-PATHS : inspect(none, env(true, true, true, true)) =>* approved .
+search [1] in WHIPPLESCRIPT-ACTION-MANUFACTURES-RETURN : inspect(none, env(true, true, true, true)) =>* approved .
+--- Independent after continuations can both return. Source order cannot pick.
+search [1] in WHIPPLESCRIPT-ACTION-RETURN-PATHS : audit(ownA(yes) ownB(yes) result(a) result(b)) =>* multiple .
+search [1] in WHIPPLESCRIPT-ACTION-RETURN-PATHS : inspect(result(a) result(b), env(true, true, true, true)) =>* approved .
+search [1] in WHIPPLESCRIPT-ACTION-KEEPS-FIRST-RETURN : inspect(result(a) result(b), env(true, true, true, true)) =>* approved .
+--- Then's return requires success; failed work propagates without fake data.
+search [1] in WHIPPLESCRIPT-ACTION-RETURN-PATHS : audit(ownA(yes) ownB(a) result(both(a, b))) =>* missing .
+--- Fallback cannot be activated by an unready guard while failure handling runs.
+search [1] in WHIPPLESCRIPT-ACTION-RETURN-PATHS : audit(result(fallback(a, truth)) result(neg(a))) =>* multiple .
+search [1] in WHIPPLESCRIPT-ACTION-UNREADY-IS-FALSE : audit(result(fallback(a, truth)) result(neg(a))) =>* multiple .
+quit

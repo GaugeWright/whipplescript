@@ -226,10 +226,11 @@ program's static structure joined to this instance's runtime state, per firing.
 
 ```json
 {
-  "schema": "whipplescript.instance_view.v0",
+  "schema": "whipplescript.instance_view.v1",
   "instance": {"instance_id": "ins_...", "status": "running", "program_version_id": "ver_...", "revision_epoch": 0, "ir_hash": "..."},
   "structure": {"available": true, "workflow": "...", "rules": [], "rule_edges": []},
   "firings": [],
+  "action_explanations": [],
   "absent_total": 0,
   "unattributed_effects": []
 }
@@ -279,6 +280,56 @@ effect entries rather than an invented set.
 
 The view carries identifiers, statuses, reasons and spans only. Fact values,
 effect inputs and turn outputs never cross it.
+
+`action_explanations` contains the payload-free managed-result projection for
+every retained firing. Each entry keeps its admitted program version, revision,
+firing identity and evaluated frontier. Result statuses distinguish `ready`,
+`waiting`, `failed`, `uncertain`, `not_selected` and `not_reached`; shared
+causes are normalized once and referenced by identity.
+
+### Action Result Explanation
+
+`whip --json explain <instance> <result> [--firing <identity>]` resolves an
+exact result id or an authored result name. A repeated name returns candidates
+instead of selecting the latest firing. The hosted equivalent is
+`GET /host/instances/:instance/explain?result=<result>&firing=<identity>`.
+
+```json
+{
+  "schema": "whipplescript.action-explanation-query.v1",
+  "instance_id": "ins_...",
+  "query": {"result": "review", "firing": null},
+  "outcome": {
+    "kind": "selected",
+    "selection": {
+      "program_version_id": "ver_...",
+      "revision": "0",
+      "revision_epoch": 0,
+      "rule": "work",
+      "firing": {"identity": null, "trigger_event": "evt_..."},
+      "evaluated_frontier": 4,
+      "result": {"name": "review", "status": "waiting"},
+      "causes": [],
+      "next_action": {
+        "code": "await_operation",
+        "authorizes_work": false,
+        "retry_permitted": false
+      }
+    }
+  }
+}
+```
+
+The actual `result` and `next_action` objects also carry their exact result,
+operation, binding and source references. The abbreviated example highlights
+the selection contract. Explanation reads launch no effects. A next action is
+observational and never authorizes work or retry.
+
+An action result can be waiting even after its return expression has a value,
+because the action must settle all work it started. When a bound direct child is
+the obstruction, `result.waiting_on` names that child's result and
+`next_action.code` is `inspect_result`. Following that result reaches the
+provider operation; the action boundary does not hide it behind a generic wait.
 
 
 ### Event

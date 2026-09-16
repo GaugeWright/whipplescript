@@ -1,0 +1,60 @@
+--- A recorded region cut selects an immutable held evaluation prefix. The
+--- caller supplies facts/effects from that same frontier; this bounded model
+--- represents their actual-work and selected-result summaries as booleans.
+--- It does not evaluate conditions, advance phases, or issue cancellation.
+mod WHIPPLESCRIPT-ACTION-REGION-PREFIX is
+ protecting BOOL . protecting NAT .
+ sorts Phase History MaybeFrontier Result .
+ ops holding exited lapsed : -> Phase [ctor] .
+ op nil : -> History [ctor] .
+ --- Newest cut is outermost.
+ op cut : Phase Nat History -> History [ctor] .
+ op noFrontier : -> MaybeFrontier [ctor] .
+ op at : Nat -> MaybeFrontier [ctor] .
+ op heldFrontier : History -> MaybeFrontier .
+ op exitedAt : History Nat -> Bool .
+ op reconstruct : History Nat Bool Bool Bool -> Result [ctor] .
+ --- actual held work, clean-exit tail eligibility, retained result candidate.
+ op view : Bool Bool Bool -> Result [ctor] .
+ ops absent refused : -> Result [ctor] .
+ vars H : History . vars F N : Nat . var P : Phase . vars A B C : Bool .
+ eq heldFrontier(nil) = noFrontier .
+ eq heldFrontier(cut(lapsed, F, H)) = heldFrontier(H) .
+ eq heldFrontier(cut(holding, F, H)) = at(F) .
+ eq heldFrontier(cut(exited, F, H)) = at(F) .
+ eq exitedAt(nil, N) = false .
+ eq exitedAt(cut(P, F, H), N) =
+   if F <= N then P == exited else exitedAt(H, N) fi .
+ crl [held-prefix] : reconstruct(H, N, true, A, C) => view(A, exitedAt(H, N), C)
+   if heldFrontier(H) == at(N) .
+ crl [no-held-prefix] : reconstruct(H, N, A, B, C) => absent
+   if heldFrontier(H) == noFrontier .
+ crl [wrong-admission] : reconstruct(H, N, false, A, C) => refused
+   if heldFrontier(H) =/= noFrontier .
+endm
+
+--- These variants add one observable bad behavior apiece. They are separate
+--- so the base module remains deterministic for the intended searches.
+mod WHIPPLESCRIPT-ACTION-REGION-PREFIX-CURRENT is
+ including WHIPPLESCRIPT-ACTION-REGION-PREFIX .
+ vars H : History . vars F N : Nat . vars A C : Bool .
+ crl [latest-lapse-erases-held] : reconstruct(cut(lapsed, F, H), N, true, A, C) => refused
+   if heldFrontier(H) == at(N) .
+endm
+mod WHIPPLESCRIPT-ACTION-REGION-PREFIX-OPENS-TAIL is
+ including WHIPPLESCRIPT-ACTION-REGION-PREFIX .
+ var H : History . var N : Nat . vars A C : Bool .
+ rl [holding-opens-tail] : reconstruct(cut(holding, N, H), N, true, A, C) => view(A, true, C) .
+endm
+mod WHIPPLESCRIPT-ACTION-REGION-PREFIX-INVENTS-WORK is
+ including WHIPPLESCRIPT-ACTION-REGION-PREFIX .
+ var H : History . var N : Nat . var C : Bool .
+ crl [potential-becomes-actual] : reconstruct(H, N, true, false, C) => view(true, false, C)
+   if heldFrontier(H) == at(N) .
+endm
+mod WHIPPLESCRIPT-ACTION-REGION-PREFIX-LOSES-RESULT is
+ including WHIPPLESCRIPT-ACTION-REGION-PREFIX .
+ var H : History . var N : Nat . var A : Bool .
+ crl [forget-candidate] : reconstruct(H, N, true, A, true) => view(A, false, false)
+   if heldFrontier(H) == at(N) .
+endm

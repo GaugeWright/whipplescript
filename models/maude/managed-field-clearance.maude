@@ -1,0 +1,30 @@
+--- Field obligations survive helper/container composition; whole-source labels
+--- remain a separate, additive obligation even when a field is discarded.
+fmod MANAGED-FIELD-CLEARANCE is
+ protecting BOOL .
+ sorts Value .
+ ops public secret : -> Value [ctor] .
+ op pair : Value Value -> Value [ctor] .
+ ops helper mix : Value -> Value [ctor] .
+ op first : Value -> Value .
+ op restricted : Value -> Bool .
+ op admitted : Value Bool Bool -> Bool .
+ vars A B : Value . vars SOURCEOK FIELDOK : Bool .
+ eq first(pair(A, B)) = A .
+ eq first(helper(A)) = first(A) .
+ eq restricted(public) = false .
+ eq restricted(secret) = true .
+ eq restricted(pair(A, B)) = restricted(A) or restricted(B) .
+ eq restricted(helper(A)) = restricted(A) .
+ eq restricted(mix(A)) = restricted(A) .
+ eq admitted(A, SOURCEOK, FIELDOK) = SOURCEOK and (FIELDOK or not restricted(A)) .
+endfm
+mod WHIPPLESCRIPT-MANAGED-FIELD-CLEARANCE is
+ protecting MANAGED-FIELD-CLEARANCE .
+endm
+mod WHIPPLESCRIPT-MANAGED-FIELD-CLEARANCE-LOST is
+ protecting MANAGED-FIELD-CLEARANCE .
+ op unsafeHelper : Value -> Value .
+ var A : Value .
+ eq unsafeHelper(A) = public .
+endm

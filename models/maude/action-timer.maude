@@ -1,0 +1,29 @@
+--- One timer operation: admission is durable, success requires settlement.
+mod WHIPPLESCRIPT-ACTION-TIMER is
+  sorts Input Record Output State .
+  ops ready missing : -> Input [ctor] .
+  ops none queued fired failed cancelAsked uncertain : -> Record [ctor] .
+  ops waiting draft unit failure : -> Output [ctor] .
+  op project : Input Record -> State [ctor] .
+  op result : Output -> State [ctor] .
+  var I : Input .
+  rl [admit] : project(ready, none) => result(draft) .
+  rl [wait-input] : project(missing, none) => result(waiting) .
+  rl [recorded] : project(I, queued) => result(waiting) .
+  rl [fired] : project(I, fired) => result(unit) .
+  rl [failed] : project(I, failed) => result(failure) .
+  rl [cancel-request] : project(I, cancelAsked) => result(waiting) .
+  rl [uncertain] : project(I, uncertain) => result(waiting) .
+endm
+mod WHIPPLESCRIPT-ACTION-TIMER-EARLY-UNIT is
+  including WHIPPLESCRIPT-ACTION-TIMER .
+  rl [invent-unit] : project(ready, queued) => result(unit) .
+endm
+mod WHIPPLESCRIPT-ACTION-TIMER-READS-LIVE is
+  including WHIPPLESCRIPT-ACTION-TIMER .
+  rl [read-live] : project(missing, fired) => result(waiting) .
+endm
+mod WHIPPLESCRIPT-ACTION-TIMER-READMITS is
+  including WHIPPLESCRIPT-ACTION-TIMER .
+  rl [readmit] : project(ready, queued) => result(draft) .
+endm

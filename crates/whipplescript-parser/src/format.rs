@@ -504,9 +504,16 @@ pub(crate) fn format_item(item: Item, formatted: &mut String) {
                 .map(|param| format!("{} {}", param.name.name, param.ty.to_source()))
                 .collect::<Vec<_>>()
                 .join(", ");
+            let result = action.result.as_ref().map_or_else(String::new, |result| {
+                let failure = result
+                    .failure
+                    .as_ref()
+                    .map_or_else(String::new, |ty| format!(" ! {}", ty.to_source()));
+                format!(" -> {}{failure}", result.success.to_source())
+            });
             push_line(
                 formatted,
-                format!("action {}({params}) {{", action.name.name),
+                format!("action {}({params}){result} {{", action.name.name),
             );
             for line in action.body.text.lines() {
                 if line.trim().is_empty() {
@@ -515,6 +522,26 @@ pub(crate) fn format_item(item: Item, formatted: &mut String) {
                     push_line(formatted, line.trim_end());
                 }
             }
+            push_line(formatted, "}");
+        }
+        Item::View(view) => {
+            format_tags(&view.tags, formatted);
+            format_description(view.description.as_ref(), formatted);
+            let params = view
+                .params
+                .iter()
+                .map(|param| format!("{} {}", param.name.name, param.ty.to_source()))
+                .collect::<Vec<_>>()
+                .join(", ");
+            push_line(
+                formatted,
+                format!(
+                    "view {}({params}) -> {} {{",
+                    view.name.name,
+                    view.result.to_source()
+                ),
+            );
+            format_block_body(&view.body.text, formatted);
             push_line(formatted, "}");
         }
         Item::Pattern(pattern) => format_pattern(pattern, formatted),

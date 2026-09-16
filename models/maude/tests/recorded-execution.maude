@@ -1,0 +1,13 @@
+load ../recorded-execution.maude
+
+search [1] in WHIPPLESCRIPT-RECORDED-EXECUTION : recorded(absent, typed) =>* compiled(legacy) .
+search [1] in WHIPPLESCRIPT-RECORDED-EXECUTION : recorded(absent, typed) =>* compiled(typed) .
+search [1] in WHIPPLESCRIPT-RECORDED-EXECUTION : recorded(legacyTag, typed) =>* compiled(legacy) .
+search [1] in WHIPPLESCRIPT-RECORDED-EXECUTION : recorded(legacyTag, typed) =>* compiled(typed) .
+search [1] in WHIPPLESCRIPT-RECORDED-EXECUTION : recorded(unknown, legacy) =>* refused .
+search [1] in WHIPPLESCRIPT-RECORDED-EXECUTION : recorded(unknown, legacy) =>* compiled(legacy) .
+search [1] in WHIPPLESCRIPT-RECORDED-EXECUTION : recorded(malformed, legacy) =>* compiled(legacy) .
+search [1] in WHIPPLESCRIPT-RECORDED-USES-SOURCE-DEFAULT : recorded(absent, typed) =>* compiled(typed) .
+search [1] in WHIPPLESCRIPT-RECORDED-USES-SOURCE-DEFAULT : recorded(unknown, legacy) =>* compiled(legacy) .
+search [1] in WHIPPLESCRIPT-RECORDED-CORRUPT-IS-ABSENT : recorded(malformed, legacy) =>* compiled(legacy) .
+quit

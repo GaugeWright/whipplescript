@@ -1,0 +1,9 @@
+load ../coerce-operation-value.maude
+search [1] in WHIPPLESCRIPT-COERCE-OPERATION-VALUE : arguments(true, true) =>* admitted .
+search [1] in WHIPPLESCRIPT-COERCE-OPERATION-VALUE : arguments(true, false) =>* admitted .
+search [1] in WHIPPLESCRIPT-COERCE-OPERATION-EARLY : arguments(true, false) =>* admitted .
+search [1] in WHIPPLESCRIPT-COERCE-OPERATION-VALUE : terminal(true, true) =>* value .
+search [1] in WHIPPLESCRIPT-COERCE-OPERATION-VALUE : terminal(false, true) =>* value .
+search [1] in WHIPPLESCRIPT-COERCE-OPERATION-STALE : terminal(false, true) =>* value .
+search [1] in WHIPPLESCRIPT-COERCE-OPERATION-VALUE : terminal(true, false) =>* value .
+search [1] in WHIPPLESCRIPT-COERCE-OPERATION-INVALID : terminal(true, false) =>* value .

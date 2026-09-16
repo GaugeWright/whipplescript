@@ -1,0 +1,53 @@
+--- DR-0100/DR-0104: the pure phase decision over one captured frontier.
+--- Predicate observation, selected-graph completion and durable history are
+--- distinct inputs. This model does not project effects, commit cuts or join a
+--- historical held graph after lapse; those have separate witnesses.
+mod WHIPPLESCRIPT-ACTION-REGION-PHASES is
+  protecting BOOL .
+  sorts Phase Observation Completion Decision Request Verdict Config .
+  subsorts Request Verdict < Config .
+  ops entry holding exited lapsed : -> Phase [ctor] .
+  ops holds broken blocked : -> Observation [ctor] .
+  ops open complete : -> Completion [ctor] .
+  ops noCut holdCut exitCut lapseCut : -> Decision [ctor] .
+  op decide : Phase Observation Completion -> Request [ctor] .
+  op nested : Decision Decision -> Request [ctor] .
+  op verdict : Decision -> Verdict [ctor] .
+  op verdict : Decision Decision -> Verdict [ctor] .
+  vars O : Observation . var C : Completion . var D : Decision .
+
+  rl [enter-holding] : decide(entry, holds, C) => verdict(holdCut) .
+  rl [lapse-at-entry] : decide(entry, broken, C) => verdict(lapseCut) .
+  rl [entry-blocked] : decide(entry, blocked, C) => verdict(noCut) .
+  rl [holding-blocked] : decide(holding, blocked, C) => verdict(noCut) .
+  rl [holding-open] : decide(holding, holds, open) => verdict(noCut) .
+  rl [lapse-while-open] : decide(holding, broken, open) => verdict(lapseCut) .
+  --- Completion wins when completion and a break share one observation.
+  rl [exit-complete-holds] : decide(holding, holds, complete) => verdict(exitCut) .
+  rl [exit-complete-broken] : decide(holding, broken, complete) => verdict(exitCut) .
+  rl [exited-is-final] : decide(exited, O, C) => verdict(noCut) .
+  rl [lapsed-is-final] : decide(lapsed, O, C) => verdict(noCut) .
+
+  --- An enclosing lapse suppresses a nested entry at the same frontier.
+  rl [suppress-nested-entry] : nested(lapseCut, D) => verdict(lapseCut, noCut) .
+  rl [retain-nested-with-no-outer-cut] : nested(noCut, D) => verdict(noCut, D) .
+  rl [retain-nested-with-outer-hold] : nested(holdCut, D) => verdict(holdCut, D) .
+  rl [retain-nested-with-outer-exit] : nested(exitCut, D) => verdict(exitCut, D) .
+endm
+
+mod WHIPPLESCRIPT-ACTION-REGION-PHASES-BLOCKED-LAPSES is
+  including WHIPPLESCRIPT-ACTION-REGION-PHASES .
+  var C : Completion .
+  rl [guess-unavailable-as-false] : decide(entry, blocked, C) => verdict(lapseCut) .
+endm
+
+mod WHIPPLESCRIPT-ACTION-REGION-PHASES-LAPSES-COMPLETE is
+  including WHIPPLESCRIPT-ACTION-REGION-PHASES .
+  rl [let-break-beat-completion] : decide(holding, broken, complete) => verdict(lapseCut) .
+endm
+
+mod WHIPPLESCRIPT-ACTION-REGION-PHASES-LEAKS-NESTED is
+  including WHIPPLESCRIPT-ACTION-REGION-PHASES .
+  var D : Decision .
+  rl [retain-entry-below-lapse] : nested(lapseCut, D) => verdict(lapseCut, D) .
+endm

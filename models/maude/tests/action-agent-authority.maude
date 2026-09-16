@@ -1,0 +1,10 @@
+load ../action-agent-authority.maude
+search [1] in WHIPPLESCRIPT-ACTION-AGENT-AUTHORITY : check(agents(true, true), read) =>* accepted .
+search [1] in WHIPPLESCRIPT-ACTION-AGENT-AUTHORITY : check(intersect(agents(true, true), agents(false, true)), write) =>* accepted .
+search [1] in WHIPPLESCRIPT-ACTION-AGENT-AUTHORITY : check(fallback(agents(true, true), true), write) =>* accepted .
+search [1] in WHIPPLESCRIPT-ACTION-AGENT-AUTHORITY : check(agents(true, true), write) =>* accepted .
+search [1] in WHIPPLESCRIPT-ACTION-AGENT-AUTHORITY : check(fallback(agents(true, true), false), write) =>* accepted .
+search [1] in WHIPPLESCRIPT-ACTION-AGENT-AUTHORITY : check(shadow(agents(false, true), agents(true, true)), write) =>* accepted .
+search [1] in WHIPPLESCRIPT-ACTION-AGENT-CHECKS-ONE : check(agents(true, true), write) =>* accepted .
+search [1] in WHIPPLESCRIPT-ACTION-AGENT-KEEPS-SHADOW : reused(agents(false, true), agents(true, true), write) =>* accepted .
+quit

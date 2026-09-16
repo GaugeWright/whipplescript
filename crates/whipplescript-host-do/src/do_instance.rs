@@ -5,7 +5,7 @@
 //! `RuntimeKernel<DoSqliteStore<Sql>>`, so the same [`InstanceStepMachine`] drives
 //! a workflow instance on the durable object. Because `DoSqliteStore` now
 //! implements all three store traits (chunk 5a), the whole rule pass
-//! (`step_instance_generic`) runs over the DO's one SQLite.
+//! (`step_active_program_generic`) runs over the DO's one SQLite.
 //!
 //! What is wired: the rule pass (`advance_rules`), ready-effect discovery
 //! (`next_ready_effect`), and `run_effect` dispatch of the lifted store-only
@@ -21,7 +21,8 @@ use whipplescript_kernel::coerce::{CoerceRequest, CoerceResult, CoerceStatus};
 #[cfg(test)]
 use whipplescript_kernel::coerce_native::CoerceProvider;
 use whipplescript_kernel::coerce_native::{
-    build_coerce_call_parts, build_request, parse_response, CoerceCall,
+    build_coerce_call_parts, build_inline_coerce_call_parts, build_request, parse_response,
+    CoerceCall,
 };
 use whipplescript_kernel::context_assembly::{
     assemble, contribution, render_available_skills, render_project_context, ContributionLifecycle,
@@ -47,7 +48,7 @@ use whipplescript_kernel::harness_loop::{
 use whipplescript_kernel::host_protocol::ResourceRef;
 use whipplescript_kernel::instance_machine::{EffectStep, InstanceDriver};
 use whipplescript_kernel::rule_lowering::json_from_str;
-use whipplescript_kernel::rule_pass::step_instance_generic;
+use whipplescript_kernel::rule_pass::step_active_program_generic;
 use whipplescript_kernel::sansio::{
     HttpResponse, IoRequest, IoResult, Outcome, StepMachine, TransportError,
 };
@@ -853,7 +854,13 @@ fn restore_norm_tracking<Sql: DoSql + Clone>(
 
 impl<Sql: DoSql + Clone> InstanceDriver for DoInstanceDriver<'_, Sql> {
     fn advance_rules(&mut self) -> Result<bool, StoreError> {
-        step_instance_generic(&mut self.kernel, self.instance_id, self.ir, None, None)?;
+        step_active_program_generic(
+            &mut self.kernel,
+            self.instance_id,
+            Some(self.ir),
+            None,
+            None,
+        )?;
         // Only the instance row's status is read, so read only that row:
         // `status()` also counts six tables and projects revisions and
         // invocations, and this runs once per drive-loop iteration.
@@ -1788,22 +1795,14 @@ impl<Sql: DoSql + Clone> InstanceDriver for DoInstanceDriver<'_, Sql> {
                 // declared". Inline prompts therefore never ran on this host
                 // with a native backend at all; the native one has had this
                 // branch since before the annotation existed.
-                let (prompt, output_schema, wrapped, schema_name) = if function_name == "prompt" {
-                    let text = input
-                        .get("prompt")
-                        .and_then(|value| value.as_str())
-                        .or_else(|| input.get("prompt_template").and_then(|v| v.as_str()))
-                        .unwrap_or_default()
-                        .to_owned();
-                    whipplescript_kernel::coerce_native::inline_prompt_call_parts(
-                        self.ir,
-                        declared_output,
-                        text,
-                    )
-                } else {
-                    build_coerce_call_parts(self.ir, &function_name, &arguments)
+                let (prompt, output_schema, wrapped, schema_name) =
+                    match build_inline_coerce_call_parts(self.ir, &input)
                         .map_err(StoreError::Conflict)?
-                };
+                    {
+                        Some(parts) => parts,
+                        None => build_coerce_call_parts(self.ir, &function_name, &arguments)
+                            .map_err(StoreError::Conflict)?,
+                    };
                 let run_id = idempotency_key(&[self.instance_id, &effect.effect_id, "coerce-run"]);
                 let lease_id =
                     idempotency_key(&[self.instance_id, &effect.effect_id, "coerce-lease"]);
@@ -2214,8 +2213,9 @@ impl<Sql: DoSql + Clone> InstanceDriver for DoInstanceDriver<'_, Sql> {
             }
             "lease.acquire" | "lease.release" | "lease.renew" | "ledger.append"
             | "counter.consume" => {
-                // The DO worker uses wall-clock time for the bounded-wait deadline;
-                // deterministic-clock injection is a native/scenario concern.
+                // Resolve the host clock once. Counter period selection and
+                // bounded lease waits consume the same instant.
+                let now = self.kernel.store().resolve_clock("now")?;
                 // DR-0052 S6 (DO parity): resolve each contending holder's
                 // workspace context — its line and the line's newest cut's
                 // actor/intent — through the DO branch tables, exactly as
@@ -2237,7 +2237,7 @@ impl<Sql: DoSql + Clone> InstanceDriver for DoInstanceDriver<'_, Sql> {
                     &mut self.kernel,
                     self.instance_id,
                     effect,
-                    "now",
+                    &now,
                     Some(&holder_context),
                 )?
             }
@@ -2354,9 +2354,12 @@ impl<Sql: DoSql + Clone> InstanceDriver for DoInstanceDriver<'_, Sql> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use whipplescript_kernel::exec_http;
     use whipplescript_kernel::instance_machine::{InstanceOutcome, InstanceStepMachine};
     use whipplescript_kernel::sansio::{run_to_completion, HostDriver, IoRequest, IoResult};
     use whipplescript_kernel::ProgramVersionInput;
+    use whipplescript_store::coordination::Coordination;
+    use whipplescript_store::items::WorkItems;
     use whipplescript_store::NewInstanceAuthority;
 
     use crate::do_store::test_support::store;
@@ -2414,6 +2417,77 @@ mod tests {
         }
         fn remove(&self, _path: &std::path::Path) -> std::io::Result<()> {
             Err(std::io::Error::other("no files in this test"))
+        }
+    }
+
+    struct ReadFiles;
+    impl FileStore for ReadFiles {
+        fn read_to_string(&self, path: &std::path::Path) -> std::io::Result<String> {
+            match path.to_string_lossy().as_ref() {
+                "./docs/guide.md" => Ok("hosted guide".to_owned()),
+                "./docs/tickets.json" => Ok(
+                    r#"[{"owner":"alice","priority":4},{"owner":"bob","priority":1}]"#.to_owned(),
+                ),
+                _ => Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "missing file",
+                )),
+            }
+        }
+        fn exists(&self, _path: &std::path::Path) -> bool {
+            false
+        }
+        fn create_dir_all(&self, _path: &std::path::Path) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn write(&self, _path: &std::path::Path, _bytes: &[u8]) -> std::io::Result<()> {
+            Err(std::io::Error::other("read-only fixture"))
+        }
+        fn append(&self, _path: &std::path::Path, _bytes: &[u8]) -> std::io::Result<()> {
+            Err(std::io::Error::other("read-only fixture"))
+        }
+        fn remove(&self, _path: &std::path::Path) -> std::io::Result<()> {
+            Err(std::io::Error::other("read-only fixture"))
+        }
+    }
+
+    #[derive(Default)]
+    struct WriteFiles(std::cell::RefCell<Option<(std::path::PathBuf, Vec<u8>)>>);
+    impl FileStore for WriteFiles {
+        fn read_to_string(&self, path: &std::path::Path) -> std::io::Result<String> {
+            self.0
+                .borrow()
+                .as_ref()
+                .filter(|(saved, _)| saved == path)
+                .map(|(_, bytes)| String::from_utf8_lossy(bytes).into_owned())
+                .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "missing file"))
+        }
+        fn exists(&self, path: &std::path::Path) -> bool {
+            self.0
+                .borrow()
+                .as_ref()
+                .is_some_and(|(saved, _)| saved == path)
+        }
+        fn create_dir_all(&self, _path: &std::path::Path) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn write(&self, path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+            *self.0.borrow_mut() = Some((path.to_owned(), bytes.to_vec()));
+            Ok(())
+        }
+        fn append(&self, path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+            let mut saved = self.0.borrow_mut();
+            match saved.as_mut() {
+                Some((saved_path, body)) if saved_path == path => body.extend_from_slice(bytes),
+                _ => *saved = Some((path.to_owned(), bytes.to_vec())),
+            }
+            Ok(())
+        }
+        fn remove(&self, path: &std::path::Path) -> std::io::Result<()> {
+            if self.exists(path) {
+                *self.0.borrow_mut() = None;
+            }
+            Ok(())
         }
     }
 
@@ -3004,6 +3078,726 @@ mod tests {
         assert_eq!(status.instance.status, "completed");
     }
 
+    #[test]
+    fn do_instance_driver_loads_and_drives_the_active_typed_executable() {
+        const SOURCE: &str = r#"workflow HostedTyped
+output result Answer
+class Answer { text string }
+class Secret { text string internal string }
+action answer() -> Secret {
+  timer 1s as wait
+  after wait succeeds { return { text "late", internal "drop" } }
+  after wait cancelled { return { text "hosted", internal "drop" } }
+}
+rule finish when started => { answer() as original
+cancel original
+declassify original into Answer as released
+redact released keep [text] as selected
+emit milestone "released" of Answer { text selected.text }
+complete result { text selected.text } }
+"#;
+        let compiled =
+            whipplescript_parser::execution_semantics::compile_recorded_program_with_root(
+                SOURCE,
+                None,
+                whipplescript_parser::ExecutionSemantics::TypedActionsV1,
+            );
+        assert!(
+            compiled.diagnostics.is_empty(),
+            "{:?}",
+            compiled.diagnostics
+        );
+        let ir = compiled.ir.unwrap();
+        let plans = compiled.typed_actions.unwrap();
+        let identity =
+            whipplescript_kernel::program_artifact::typed_identity_projection(&ir, &plans).unwrap();
+        let mut kernel = RuntimeKernel::new(store());
+        let source_hash = kernel.store().put_content(SOURCE).unwrap();
+        let version = kernel
+            .create_program_version_for_typed_program(
+                ProgramVersionInput {
+                    program_name: &ir.workflow,
+                    source_hash: &source_hash,
+                    ir_hash: &crate::do_store::stable_hash_hex(&identity),
+                    compiler_version: "test",
+                    ir_snapshot: Some(&identity),
+                },
+                &ir,
+                &plans,
+            )
+            .unwrap();
+        let instance_id = kernel
+            .create_instance_with_authority(
+                &version,
+                "{}",
+                NewInstanceAuthority {
+                    workflow_principal: "local/HostedTyped",
+                    effective_authority_json: "{}",
+                },
+            )
+            .unwrap();
+        kernel
+            .ingest_external_event(&instance_id, "external.started", "{}", Some("started"))
+            .unwrap();
+        let driver = DoInstanceDriver {
+            media: &Default::default(),
+            now_unix_ms: 0,
+            kernel,
+            files: &NoFiles,
+            coerce: None,
+            agent_model: None,
+            agent_tools: &NoTools,
+            agent_tool_specs: None,
+            agent_workspace_resources: None,
+            exec: None,
+            turn: None,
+            ir: &ir,
+            instance_id: &instance_id,
+            system_prompt: "You are a WhippleScript agent.",
+            max_steps: 8,
+        };
+        let mut machine = InstanceStepMachine::new(driver);
+        let outcome = run_to_completion(&mut machine, &RefuseIoHost);
+        assert!(matches!(outcome, InstanceOutcome::Terminal), "{outcome:?}");
+        let driver = machine.into_driver();
+        let status = driver
+            .kernel
+            .store()
+            .get_instance(&instance_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(status.status, "completed");
+        let terminal = driver
+            .kernel
+            .store()
+            .list_events(&instance_id)
+            .unwrap()
+            .into_iter()
+            .find(|event| event.event_type == "workflow.completed")
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_str(&terminal.payload_json).unwrap();
+        assert_eq!(payload["payload"], serde_json::json!({"text":"hosted"}));
+        let effect = driver
+            .kernel
+            .store()
+            .list_effects(&instance_id)
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        assert_eq!(effect.status, "cancelled");
+        let milestone = driver
+            .kernel
+            .store()
+            .list_facts(&instance_id)
+            .unwrap()
+            .into_iter()
+            .find(|fact| fact.name == "workflow.milestone:released")
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&milestone.value_json).unwrap(),
+            serde_json::json!({
+                "milestone": "released",
+                "status": "completed",
+                "value": {"text": "hosted"},
+            })
+        );
+        let explanations = whipplescript_kernel::source_action::explanation::project_instance(
+            driver.kernel.store(),
+            &instance_id,
+            "fixture",
+            &std::collections::BTreeSet::new(),
+        )
+        .expect("hosted action explanations project");
+        let selected = whipplescript_kernel::source_action::explanation::query::resolve(
+            &explanations,
+            &instance_id,
+            "original",
+            None,
+        )
+        .expect("hosted result resolves");
+        let whipplescript_kernel::source_action::explanation::query::Outcome::Selected {
+            selection,
+        } = selected.outcome
+        else {
+            panic!("hosted result was not selected")
+        };
+        assert_eq!(selection.result.name, "original");
+        assert_eq!(selection.program_version_id, version.version_id);
+        assert_eq!(
+            selection.result.status,
+            whipplescript_kernel::source_action::explanation::ResultStatus::Ready
+        );
+    }
+
+    #[test]
+    fn hosted_action_explanation_points_through_a_waiting_scope_to_its_child() {
+        const SOURCE: &str = r#"workflow HostedOwnedWait
+output result Answer
+class Answer { text string }
+action wait_for_pause() -> string {
+  timer 300s as pause
+  return "finished"
+}
+rule finish when started => {
+  wait_for_pause() as done
+  after done succeeds { complete result { text done } }
+}
+"#;
+        let compiled =
+            whipplescript_parser::execution_semantics::compile_recorded_program_with_root(
+                SOURCE,
+                None,
+                whipplescript_parser::ExecutionSemantics::TypedActionsV1,
+            );
+        assert!(
+            compiled.diagnostics.is_empty(),
+            "{:?}",
+            compiled.diagnostics
+        );
+        let ir = compiled.ir.unwrap();
+        let plans = compiled.typed_actions.unwrap();
+        let identity =
+            whipplescript_kernel::program_artifact::typed_identity_projection(&ir, &plans).unwrap();
+        let mut kernel = RuntimeKernel::new(store());
+        let source_hash = kernel.store().put_content(SOURCE).unwrap();
+        let version = kernel
+            .create_program_version_for_typed_program(
+                ProgramVersionInput {
+                    program_name: &ir.workflow,
+                    source_hash: &source_hash,
+                    ir_hash: &crate::do_store::stable_hash_hex(&identity),
+                    compiler_version: "test",
+                    ir_snapshot: Some(&identity),
+                },
+                &ir,
+                &plans,
+            )
+            .unwrap();
+        let instance_id = kernel
+            .create_instance_with_authority(
+                &version,
+                "{}",
+                NewInstanceAuthority {
+                    workflow_principal: "local/HostedOwnedWait",
+                    effective_authority_json: "{}",
+                },
+            )
+            .unwrap();
+        kernel
+            .ingest_external_event(&instance_id, "external.started", "{}", Some("started"))
+            .unwrap();
+        let driver = DoInstanceDriver {
+            media: &Default::default(),
+            now_unix_ms: 0,
+            kernel,
+            files: &NoFiles,
+            coerce: None,
+            agent_model: None,
+            agent_tools: &NoTools,
+            agent_tool_specs: None,
+            agent_workspace_resources: None,
+            exec: None,
+            turn: None,
+            ir: &ir,
+            instance_id: &instance_id,
+            system_prompt: "You are a WhippleScript agent.",
+            max_steps: 8,
+        };
+        let mut machine = InstanceStepMachine::new(driver);
+        let outcome = run_to_completion(&mut machine, &RefuseIoHost);
+        assert!(matches!(outcome, InstanceOutcome::Parked), "{outcome:?}");
+        let driver = machine.into_driver();
+        let explanations = whipplescript_kernel::source_action::explanation::project_instance(
+            driver.kernel.store(),
+            &instance_id,
+            "fixture",
+            &std::collections::BTreeSet::new(),
+        )
+        .unwrap();
+        let response = whipplescript_kernel::source_action::explanation::query::resolve(
+            &explanations,
+            &instance_id,
+            "done",
+            None,
+        )
+        .unwrap();
+        let whipplescript_kernel::source_action::explanation::query::Outcome::Selected {
+            selection,
+        } = response.outcome
+        else {
+            panic!("hosted action result selected")
+        };
+        assert_eq!(
+            selection.result.status,
+            whipplescript_kernel::source_action::explanation::ResultStatus::Waiting
+        );
+        assert_eq!(selection.result.waiting_on.len(), 1);
+        assert_eq!(
+            selection.result.waiting_on[0].name.as_deref(),
+            Some("pause")
+        );
+        assert_eq!(
+            selection.next_action.as_ref().map(|next| next.code),
+            Some(
+                whipplescript_kernel::source_action::explanation::query::NextActionCode::InspectResult
+            )
+        );
+        assert_eq!(
+            selection
+                .next_action
+                .as_ref()
+                .and_then(|next| next.result_id.as_deref()),
+            selection.result.waiting_on[0].result_id.as_deref()
+        );
+    }
+
+    #[test]
+    fn inline_and_extracted_reactive_composition_match_on_the_hosted_runtime() {
+        const INLINE: &str = include_str!(
+            "../../whipplescript-kernel/tests/fixtures/reactive-extraction-inline.whip"
+        );
+        const EXTRACTED: &str = include_str!(
+            "../../whipplescript-kernel/tests/fixtures/reactive-extraction-action.whip"
+        );
+
+        struct Run {
+            terminal: serde_json::Value,
+            effects: Vec<(String, String, String)>,
+            admitted_together: usize,
+            result_statuses: Vec<whipplescript_kernel::source_action::explanation::ResultStatus>,
+            first_source_role: whipplescript_kernel::source_action::explanation::SourceRole,
+        }
+        let run = |source: &'static str, principal: &str, fail_policy: bool| {
+            let compiled =
+                whipplescript_parser::execution_semantics::compile_recorded_program_with_root(
+                    source,
+                    None,
+                    whipplescript_parser::ExecutionSemantics::TypedActionsV1,
+                );
+            assert!(
+                compiled.diagnostics.is_empty(),
+                "{:?}",
+                compiled.diagnostics
+            );
+            let ir = compiled.ir.unwrap();
+            let plans = compiled.typed_actions.unwrap();
+            let identity =
+                whipplescript_kernel::program_artifact::typed_identity_projection(&ir, &plans)
+                    .unwrap();
+            let store = store();
+            for statement in [
+                "INSERT INTO capability_schemas (capability, description, schema_json) VALUES ('schema.coerce', 'Coerce unstructured data into a typed value.', '{}')",
+                "INSERT INTO effect_providers (provider_id, effect_kind, provider, capability, config_json) VALUES ('provider_coerce_builtin', 'schema.coerce', 'builtin-coerce', 'schema.coerce', '{}')",
+                "INSERT INTO capability_bindings (binding_id, program_id, capability, provider, config_json) VALUES ('binding_coerce_builtin', NULL, 'schema.coerce', 'builtin-coerce', '{}')",
+            ] {
+                store.sql.execute(statement, &[]).unwrap();
+            }
+            let mut kernel = RuntimeKernel::new(store);
+            let source_hash = kernel.store().put_content(source).unwrap();
+            let version = kernel
+                .create_program_version_for_typed_program(
+                    ProgramVersionInput {
+                        program_name: &ir.workflow,
+                        source_hash: &source_hash,
+                        ir_hash: &crate::do_store::stable_hash_hex(&identity),
+                        compiler_version: "test",
+                        ir_snapshot: Some(&identity),
+                    },
+                    &ir,
+                    &plans,
+                )
+                .unwrap();
+            let instance_id = kernel
+                .create_instance_with_authority(
+                    &version,
+                    "{}",
+                    NewInstanceAuthority {
+                        workflow_principal: principal,
+                        effective_authority_json: "{}",
+                    },
+                )
+                .unwrap();
+            kernel
+                .ingest_external_event(&instance_id, "external.started", "{}", Some("started"))
+                .unwrap();
+            let cfg = ResolvedCoercionConfig {
+                provider_id: "anthropic".to_owned(),
+                backend: CoerceProvider::Anthropic,
+                base_url: "https://api.anthropic.com".to_owned(),
+                api_key: "test-key".to_owned(),
+                model: "claude-test".to_owned(),
+                max_tokens: whipplescript_kernel::coerce_native::DEFAULT_COERCE_MAX_TOKENS,
+                timeout_secs: whipplescript_kernel::coerce_native::DEFAULT_COERCE_TIMEOUT_SECS,
+                codex_account_id: None,
+            };
+            let driver = DoInstanceDriver {
+                media: &Default::default(),
+                now_unix_ms: 0,
+                kernel,
+                files: &NoFiles,
+                coerce: Some(&cfg),
+                agent_model: None,
+                agent_tools: &NoTools,
+                agent_tool_specs: None,
+                agent_workspace_resources: None,
+                exec: None,
+                turn: None,
+                ir: &ir,
+                instance_id: &instance_id,
+                system_prompt: "You are a WhippleScript agent.",
+                max_steps: 16,
+            };
+            let mut machine = InstanceStepMachine::new(driver);
+            let outcome = run_to_completion(&mut machine, &PieceHost { fail_policy });
+            assert!(matches!(outcome, InstanceOutcome::Terminal), "{outcome:?}");
+            let driver = machine.into_driver();
+            let events = driver.kernel.store().list_events(&instance_id).unwrap();
+            let terminal = events
+                .iter()
+                .find(|event| event.event_type == "workflow.completed")
+                .map(|event| {
+                    serde_json::from_str::<serde_json::Value>(&event.payload_json).unwrap()
+                })
+                .unwrap();
+            let admitted_together = events
+                .iter()
+                .filter(|event| event.event_type == "rule.committed")
+                .map(|event| {
+                    serde_json::from_str::<serde_json::Value>(&event.payload_json).unwrap()
+                })
+                .filter_map(|payload| payload["effects"].as_array().map(Vec::len))
+                .max()
+                .unwrap_or_default();
+            let mut effects = driver
+                .kernel
+                .store()
+                .list_effects(&instance_id)
+                .unwrap()
+                .into_iter()
+                .map(|effect| {
+                    let input: serde_json::Value =
+                        serde_json::from_str(&effect.input_json).unwrap();
+                    (
+                        effect.kind,
+                        effect.status,
+                        input["function_name"].as_str().unwrap().to_owned(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            effects.sort();
+            let explanations = whipplescript_kernel::source_action::explanation::project_instance(
+                driver.kernel.store(),
+                &instance_id,
+                &do_coercion_config_fingerprint(Some(&cfg)),
+                &std::collections::BTreeSet::new(),
+            )
+            .unwrap();
+            let selections = ["investigation", "policy"].map(|name| {
+                let response = whipplescript_kernel::source_action::explanation::query::resolve(
+                    &explanations,
+                    &instance_id,
+                    name,
+                    None,
+                )
+                .unwrap();
+                let whipplescript_kernel::source_action::explanation::query::Outcome::Selected {
+                    selection,
+                } = response.outcome
+                else {
+                    panic!("{name} selected")
+                };
+                selection
+            });
+            Run {
+                terminal,
+                effects,
+                admitted_together,
+                result_statuses: selections
+                    .iter()
+                    .map(|selection| selection.result.status)
+                    .collect(),
+                first_source_role: selections[0].result.source[0].role,
+            }
+        };
+
+        let inline = run(INLINE, "local/ReactiveInline", false);
+        let extracted = run(EXTRACTED, "local/ReactiveExtracted", false);
+        assert_eq!(
+            inline.terminal["payload"],
+            serde_json::json!({"text": "reviewed"})
+        );
+        assert_eq!(extracted.terminal["payload"], inline.terminal["payload"]);
+        assert_eq!(inline.effects, extracted.effects);
+        assert_eq!(
+            inline.effects,
+            vec![
+                (
+                    "schema.coerce".into(),
+                    "completed".into(),
+                    "assessPolicy".into()
+                ),
+                (
+                    "schema.coerce".into(),
+                    "completed".into(),
+                    "investigate".into()
+                ),
+            ]
+        );
+        assert_eq!(inline.admitted_together, 2);
+        assert_eq!(extracted.admitted_together, 2);
+        assert_eq!(inline.result_statuses, extracted.result_statuses);
+        assert!(inline.result_statuses.iter().all(|status| *status
+            == whipplescript_kernel::source_action::explanation::ResultStatus::Ready));
+        assert_eq!(
+            inline.first_source_role,
+            whipplescript_kernel::source_action::explanation::SourceRole::Result
+        );
+        assert_eq!(
+            extracted.first_source_role,
+            whipplescript_kernel::source_action::explanation::SourceRole::CallSite
+        );
+
+        let inline_recovery = run(INLINE, "local/ReactiveInline", true);
+        let extracted_recovery = run(EXTRACTED, "local/ReactiveExtracted", true);
+        assert_eq!(
+            inline_recovery.terminal["payload"],
+            serde_json::json!({"text": "conservative"})
+        );
+        assert_eq!(
+            extracted_recovery.terminal["payload"],
+            inline_recovery.terminal["payload"]
+        );
+        assert_eq!(inline_recovery.effects, extracted_recovery.effects);
+        assert_eq!(inline_recovery.admitted_together, 2);
+        assert_eq!(extracted_recovery.admitted_together, 2);
+        assert_eq!(
+            inline_recovery.result_statuses,
+            extracted_recovery.result_statuses
+        );
+    }
+
+    #[test]
+    fn do_instance_driver_runs_parameterized_views_at_one_captured_frontier() {
+        const SOURCE: &str = r#"workflow HostedViews
+output result Answer
+class Ticket { owner string }
+class Review { owner string }
+class Answer { present bool missing bool }
+view owned(wanted string) -> bool { return exists(Ticket where owner == wanted) }
+view readiness(wanted string) -> Answer {
+  return { present owned(wanted), missing empty(Review where owner == wanted) }
+}
+action inspect(wanted string) -> Answer { return readiness(wanted) }
+rule finish when Ticket as ticket => {
+  inspect(ticket.owner) as answer
+  complete result {
+    present answer.present
+    missing answer.missing
+  }
+}
+"#;
+        let compiled = whipplescript_parser::compile_program(SOURCE);
+        assert!(
+            compiled.diagnostics.is_empty(),
+            "{:?}",
+            compiled.diagnostics
+        );
+        let ir = compiled.ir.unwrap();
+        let plans = compiled.typed_actions.unwrap();
+        let identity =
+            whipplescript_kernel::program_artifact::typed_identity_projection(&ir, &plans).unwrap();
+        let mut kernel = RuntimeKernel::new(store());
+        let source_hash = kernel.store().put_content(SOURCE).unwrap();
+        let version = kernel
+            .create_program_version_for_typed_program(
+                ProgramVersionInput {
+                    program_name: &ir.workflow,
+                    source_hash: &source_hash,
+                    ir_hash: &crate::do_store::stable_hash_hex(&identity),
+                    compiler_version: "test",
+                    ir_snapshot: Some(&identity),
+                },
+                &ir,
+                &plans,
+            )
+            .unwrap();
+        let instance_id = kernel
+            .create_instance_with_authority(
+                &version,
+                "{}",
+                NewInstanceAuthority {
+                    workflow_principal: "local/HostedViews",
+                    effective_authority_json: "{}",
+                },
+            )
+            .unwrap();
+        kernel
+            .derive_fact(
+                &instance_id,
+                "Ticket",
+                "ticket",
+                r#"{"owner":"alice"}"#,
+                None,
+                Some("ticket"),
+            )
+            .unwrap();
+        let driver = DoInstanceDriver {
+            media: &Default::default(),
+            now_unix_ms: 0,
+            kernel,
+            files: &NoFiles,
+            coerce: None,
+            agent_model: None,
+            agent_tools: &NoTools,
+            agent_tool_specs: None,
+            agent_workspace_resources: None,
+            exec: None,
+            turn: None,
+            ir: &ir,
+            instance_id: &instance_id,
+            system_prompt: "You are a WhippleScript agent.",
+            max_steps: 8,
+        };
+        let mut machine = InstanceStepMachine::new(driver);
+        assert!(matches!(
+            run_to_completion(&mut machine, &RefuseIoHost),
+            InstanceOutcome::Terminal
+        ));
+        let driver = machine.into_driver();
+        let terminal = driver
+            .kernel
+            .store()
+            .list_events(&instance_id)
+            .unwrap()
+            .into_iter()
+            .find(|event| event.event_type == "workflow.completed")
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_str(&terminal.payload_json).unwrap();
+        assert_eq!(
+            payload["payload"],
+            serde_json::json!({"present":true,"missing":true})
+        );
+        let validity = payload["validity"].as_array().unwrap();
+        assert_eq!(validity.len(), 2);
+        assert!(validity
+            .iter()
+            .all(|item| item["frontier"] == validity[0]["frontier"]));
+        assert!(validity.iter().any(|item| item["head"] == "Review"
+            && item["members"].as_array().is_some_and(Vec::is_empty)));
+        assert!(driver
+            .kernel
+            .store()
+            .list_effects(&instance_id)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn do_instance_driver_lapses_a_typed_region_and_cancels_held_work() {
+        const SOURCE: &str = r#"workflow HostedRegion
+class Stop { id string }
+rule finish when started => { during empty(Stop) { timer 1h as held } on lapse as progress { timer 2h as cleanup } }
+"#;
+        let compiled = whipplescript_parser::compile_program(SOURCE);
+        assert!(
+            compiled.diagnostics.is_empty(),
+            "{:?}",
+            compiled.diagnostics
+        );
+        let ir = compiled.ir.unwrap();
+        let plans = compiled.typed_actions.unwrap();
+        let identity =
+            whipplescript_kernel::program_artifact::typed_identity_projection(&ir, &plans).unwrap();
+        let mut kernel = RuntimeKernel::new(store());
+        let source_hash = kernel.store().put_content(SOURCE).unwrap();
+        let version = kernel
+            .create_program_version_for_typed_program(
+                ProgramVersionInput {
+                    program_name: &ir.workflow,
+                    source_hash: &source_hash,
+                    ir_hash: &crate::do_store::stable_hash_hex(&identity),
+                    compiler_version: "test",
+                    ir_snapshot: Some(&identity),
+                },
+                &ir,
+                &plans,
+            )
+            .unwrap();
+        let instance_id = kernel
+            .create_instance_with_authority(
+                &version,
+                "{}",
+                NewInstanceAuthority {
+                    workflow_principal: "local/HostedRegion",
+                    effective_authority_json: "{}",
+                },
+            )
+            .unwrap();
+        kernel
+            .ingest_external_event(&instance_id, "external.started", "{}", Some("started"))
+            .unwrap();
+        let driver = DoInstanceDriver {
+            media: &Default::default(),
+            now_unix_ms: 0,
+            kernel,
+            files: &NoFiles,
+            coerce: None,
+            agent_model: None,
+            agent_tools: &NoTools,
+            agent_tool_specs: None,
+            agent_workspace_resources: None,
+            exec: None,
+            turn: None,
+            ir: &ir,
+            instance_id: &instance_id,
+            system_prompt: "You are a WhippleScript agent.",
+            max_steps: 8,
+        };
+        let mut machine = InstanceStepMachine::new(driver);
+        assert!(matches!(
+            run_to_completion(&mut machine, &RefuseIoHost),
+            InstanceOutcome::Parked
+        ));
+        let mut driver = machine.into_driver();
+        let held = driver.kernel.store().list_effects(&instance_id).unwrap()[0].clone();
+        assert_eq!(held.status, "queued");
+
+        driver
+            .kernel
+            .derive_fact(&instance_id, "Stop", "stop", r#"{"id":"stop"}"#, None, None)
+            .unwrap();
+        let mut machine = InstanceStepMachine::new(driver);
+        assert!(matches!(
+            run_to_completion(&mut machine, &RefuseIoHost),
+            InstanceOutcome::Parked
+        ));
+        let driver = machine.into_driver();
+        let effects = driver.kernel.store().list_effects(&instance_id).unwrap();
+        assert_eq!(effects.len(), 2);
+        assert_eq!(
+            effects
+                .iter()
+                .find(|effect| effect.effect_id == held.effect_id)
+                .unwrap()
+                .status,
+            "cancelled"
+        );
+        assert_eq!(
+            effects
+                .iter()
+                .filter(|effect| effect.status == "queued")
+                .count(),
+            1
+        );
+        assert!(driver
+            .kernel
+            .store()
+            .list_diagnostics(Some(&instance_id))
+            .unwrap()
+            .is_empty());
+    }
+
     /// A host that answers the coerce `fetch` with a canned Anthropic structured
     /// output (mirrors `coerce_native`'s parse fixtures).
     struct CoerceHost;
@@ -3020,6 +3814,1993 @@ mod tests {
                 }),
             }))
         }
+    }
+
+    struct PromptHost;
+    impl HostDriver for PromptHost {
+        fn fulfill(&self, request: &IoRequest) -> IoResult {
+            let IoRequest::Http(_) = request;
+            IoResult::Http(Ok(HttpResponse {
+                status: 200,
+                body: serde_json::json!({
+                    // Unwrapped, because an unannotated prompt asks for a bare
+                    // string: the tool input IS the value, with no `value` key
+                    // to unwrap.
+                    "content": [
+                        { "type": "tool_use", "name": "string", "input": "hosted prompt" }
+                    ],
+                    "usage": { "input_tokens": 1, "output_tokens": 1 }
+                }),
+            }))
+        }
+    }
+
+    struct PieceHost {
+        fail_policy: bool,
+    }
+    impl HostDriver for PieceHost {
+        fn fulfill(&self, request: &IoRequest) -> IoResult {
+            let IoRequest::Http(request) = request;
+            if self.fail_policy && request.body.to_string().contains("Assess policy") {
+                return IoResult::Http(Ok(HttpResponse {
+                    status: 503,
+                    body: serde_json::json!({"error":{"message":"policy unavailable"}}),
+                }));
+            }
+            IoResult::Http(Ok(HttpResponse {
+                status: 200,
+                body: serde_json::json!({
+                    "content": [
+                        { "type": "tool_use", "name": "Piece", "input": { "text": "hosted" } }
+                    ],
+                    "usage": { "input_tokens": 1, "output_tokens": 1 }
+                }),
+            }))
+        }
+    }
+
+    struct FailedCoerceHost;
+    impl HostDriver for FailedCoerceHost {
+        fn fulfill(&self, request: &IoRequest) -> IoResult {
+            let IoRequest::Http(_) = request;
+            IoResult::Http(Ok(HttpResponse {
+                status: 503,
+                body: serde_json::json!({"error":{"message":"provider unavailable"}}),
+            }))
+        }
+    }
+
+    struct DecideHost;
+    impl HostDriver for DecideHost {
+        fn fulfill(&self, request: &IoRequest) -> IoResult {
+            let IoRequest::Http(_) = request;
+            IoResult::Http(Ok(HttpResponse {
+                status: 200,
+                body: serde_json::json!({
+                    "content": [
+                        { "type": "tool_use", "name": "emit_InlineDecision", "input": {
+                            "safe": true, "reason": "hosted decide"
+                        } }
+                    ],
+                    "usage": { "input_tokens": 1, "output_tokens": 1 }
+                }),
+            }))
+        }
+    }
+
+    struct ManagedExecHost;
+    impl HostDriver for ManagedExecHost {
+        fn fulfill(&self, request: &IoRequest) -> IoResult {
+            let IoRequest::Http(request) = request;
+            IoResult::Http(Ok(HttpResponse {
+                status: 200,
+                body: serde_json::json!({
+                    "protocol": exec_http::EXECUTOR_PROTOCOL,
+                    "effect_id": request.body["effect_id"],
+                    "exit_code": 0,
+                    "timed_out": false,
+                    "stdout": "{\"text\":\"hosted render\"}\n",
+                    "stderr": "",
+                }),
+            }))
+        }
+    }
+
+    #[test]
+    fn inline_coerce_call_parts_require_captured_prompt_and_schema() {
+        let ir = whipplescript_parser::compile_program(
+            "workflow PromptParts\noutput result string\nrule finish when started => { complete result \"done\" }",
+        )
+        .ir
+        .unwrap();
+        let missing_prompt =
+            build_inline_coerce_call_parts(&ir, &serde_json::json!({"function_name":"prompt"}));
+        assert_eq!(
+            missing_prompt.unwrap_err(),
+            "inline prompt effect has no rendered prompt"
+        );
+        assert!(
+            build_inline_coerce_call_parts(&ir, &serde_json::json!({"function_name":"other"}))
+                .unwrap()
+                .is_none()
+        );
+        let (prompt, schema, wrapped, name) = build_inline_coerce_call_parts(
+            &ir,
+            &serde_json::json!({"function_name":"prompt","prompt":"captured"}),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(prompt, "captured");
+        // Unannotated: the bare `{"type": "string"}` every prompt written
+        // before `-> <Type>` already sends, unwrapped. An annotation routes
+        // through the envelope instead; the default was never wrapped.
+        assert_eq!(schema["type"], "string");
+        assert!(!wrapped);
+        assert_eq!(name, "string");
+
+        let (prompt, schema, wrapped, name) = build_inline_coerce_call_parts(
+            &ir,
+            &serde_json::json!({
+                "function_name":"decide", "prompt":"choose",
+                "output_type":"{safe bool}",
+                "output_schema": {
+                    "type":"object", "properties":{"safe":{"type":"boolean"}},
+                    "required":["safe"], "additionalProperties":false
+                }
+            }),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(prompt, "choose");
+        assert_eq!(schema["properties"]["safe"]["type"], "boolean");
+        assert!(!wrapped);
+        assert_eq!(name, "InlineDecision");
+    }
+
+    #[test]
+    fn do_instance_driver_runs_a_managed_inline_prompt_as_a_string_operation() {
+        const SOURCE: &str = r#"workflow HostedPrompt
+output result Answer
+class Answer { text string }
+rule finish when started => {
+  prompt "Hello" using anthropic as reply
+  after reply succeeds { complete result { text reply } }
+}
+"#;
+        let compiled =
+            whipplescript_parser::execution_semantics::compile_recorded_program_with_root(
+                SOURCE,
+                None,
+                whipplescript_parser::ExecutionSemantics::TypedActionsV1,
+            );
+        assert!(
+            compiled.diagnostics.is_empty(),
+            "{:?}",
+            compiled.diagnostics
+        );
+        let ir = compiled.ir.unwrap();
+        let plans = compiled.typed_actions.unwrap();
+        let identity =
+            whipplescript_kernel::program_artifact::typed_identity_projection(&ir, &plans).unwrap();
+        let store = store();
+        for stmt in [
+            "INSERT INTO capability_schemas (capability, description, schema_json) \
+             VALUES ('schema.coerce', 'Coerce unstructured data into a typed value.', '{}')",
+            "INSERT INTO effect_providers (provider_id, effect_kind, provider, capability, config_json) \
+             VALUES ('provider_coerce_builtin', 'schema.coerce', 'builtin-coerce', 'schema.coerce', '{}')",
+            "INSERT INTO capability_bindings (binding_id, program_id, capability, provider, config_json) \
+             VALUES ('binding_coerce_builtin', NULL, 'schema.coerce', 'builtin-coerce', '{}')",
+        ] {
+            store.sql.execute(stmt, &[]).expect("seed coerce provider");
+        }
+        let mut kernel = RuntimeKernel::new(store);
+        let source_hash = kernel.store().put_content(SOURCE).unwrap();
+        let version = kernel
+            .create_program_version_for_typed_program(
+                ProgramVersionInput {
+                    program_name: &ir.workflow,
+                    source_hash: &source_hash,
+                    ir_hash: &crate::do_store::stable_hash_hex(&identity),
+                    compiler_version: "test",
+                    ir_snapshot: Some(&identity),
+                },
+                &ir,
+                &plans,
+            )
+            .unwrap();
+        let instance_id = kernel
+            .create_instance_with_authority(
+                &version,
+                "{}",
+                NewInstanceAuthority {
+                    workflow_principal: "local/HostedPrompt",
+                    effective_authority_json: "{}",
+                },
+            )
+            .unwrap();
+        kernel
+            .ingest_external_event(&instance_id, "external.started", "{}", Some("started"))
+            .unwrap();
+        let cfg = ResolvedCoercionConfig {
+            provider_id: "anthropic".to_owned(),
+            backend: CoerceProvider::Anthropic,
+            base_url: "https://api.anthropic.com".to_owned(),
+            api_key: "test-key".to_owned(),
+            model: "claude-test".to_owned(),
+            max_tokens: whipplescript_kernel::coerce_native::DEFAULT_COERCE_MAX_TOKENS,
+            timeout_secs: whipplescript_kernel::coerce_native::DEFAULT_COERCE_TIMEOUT_SECS,
+            codex_account_id: None,
+        };
+        let driver = DoInstanceDriver {
+            media: &Default::default(),
+            now_unix_ms: 0,
+            kernel,
+            files: &NoFiles,
+            coerce: Some(&cfg),
+            agent_model: None,
+            agent_tools: &NoTools,
+            agent_tool_specs: None,
+            agent_workspace_resources: None,
+            exec: None,
+            turn: None,
+            ir: &ir,
+            instance_id: &instance_id,
+            system_prompt: "You are a WhippleScript agent.",
+            max_steps: 8,
+        };
+        let mut machine = InstanceStepMachine::new(driver);
+        let outcome = run_to_completion(&mut machine, &PromptHost);
+        assert!(matches!(outcome, InstanceOutcome::Terminal), "{outcome:?}");
+        let driver = machine.into_driver();
+        let terminal = driver
+            .kernel
+            .store()
+            .list_events(&instance_id)
+            .unwrap()
+            .into_iter()
+            .find(|event| event.event_type == "workflow.completed")
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_str(&terminal.payload_json).unwrap();
+        assert_eq!(
+            payload["payload"],
+            serde_json::json!({"text":"hosted prompt"})
+        );
+        let effect = driver
+            .kernel
+            .store()
+            .list_effects(&instance_id)
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        let input: serde_json::Value = serde_json::from_str(&effect.input_json).unwrap();
+        assert_eq!(input["function_name"], "prompt");
+        assert_eq!(input["prompt"], "Hello");
+        assert_eq!(effect.status, "completed");
+    }
+
+    struct FailedCoerceRun {
+        outcome: InstanceOutcome,
+        instance_status: String,
+        effect_statuses: Vec<String>,
+        events: Vec<(String, String)>,
+        diagnostic_messages: Vec<String>,
+    }
+
+    fn run_failed_coerce(source: &str, workflow: &str) -> FailedCoerceRun {
+        let compiled =
+            whipplescript_parser::execution_semantics::compile_recorded_program_with_root(
+                source,
+                None,
+                whipplescript_parser::ExecutionSemantics::TypedActionsV1,
+            );
+        assert!(
+            compiled.ir.is_some() && compiled.typed_actions.is_some(),
+            "{:?}",
+            compiled.diagnostics
+        );
+        let ir = compiled.ir.unwrap();
+        let plans = compiled.typed_actions.unwrap();
+        let identity =
+            whipplescript_kernel::program_artifact::typed_identity_projection(&ir, &plans).unwrap();
+        let store = store();
+        for stmt in [
+            "INSERT INTO capability_schemas (capability, description, schema_json) VALUES ('schema.coerce', 'Coerce unstructured data into a typed value.', '{}')",
+            "INSERT INTO effect_providers (provider_id, effect_kind, provider, capability, config_json) VALUES ('provider_coerce_builtin', 'schema.coerce', 'builtin-coerce', 'schema.coerce', '{}')",
+            "INSERT INTO capability_bindings (binding_id, program_id, capability, provider, config_json) VALUES ('binding_coerce_builtin', NULL, 'schema.coerce', 'builtin-coerce', '{}')",
+        ] {
+            store.sql.execute(stmt, &[]).expect("seed coerce provider");
+        }
+        let mut kernel = RuntimeKernel::new(store);
+        let source_hash = kernel.store().put_content(source).unwrap();
+        let version = kernel
+            .create_program_version_for_typed_program(
+                ProgramVersionInput {
+                    program_name: &ir.workflow,
+                    source_hash: &source_hash,
+                    ir_hash: &crate::do_store::stable_hash_hex(&identity),
+                    compiler_version: "test",
+                    ir_snapshot: Some(&identity),
+                },
+                &ir,
+                &plans,
+            )
+            .unwrap();
+        let instance_id = kernel
+            .create_instance_with_authority(
+                &version,
+                "{}",
+                NewInstanceAuthority {
+                    workflow_principal: &format!("local/{workflow}"),
+                    effective_authority_json: "{}",
+                },
+            )
+            .unwrap();
+        kernel
+            .ingest_external_event(&instance_id, "external.started", "{}", Some("started"))
+            .unwrap();
+        let cfg = ResolvedCoercionConfig {
+            provider_id: "anthropic".to_owned(),
+            backend: CoerceProvider::Anthropic,
+            base_url: "https://api.anthropic.com".to_owned(),
+            api_key: "test-key".to_owned(),
+            model: "claude-test".to_owned(),
+            max_tokens: whipplescript_kernel::coerce_native::DEFAULT_COERCE_MAX_TOKENS,
+            timeout_secs: whipplescript_kernel::coerce_native::DEFAULT_COERCE_TIMEOUT_SECS,
+            codex_account_id: None,
+        };
+        let driver = DoInstanceDriver {
+            media: &Default::default(),
+            now_unix_ms: 0,
+            kernel,
+            files: &NoFiles,
+            coerce: Some(&cfg),
+            agent_model: None,
+            agent_tools: &NoTools,
+            agent_tool_specs: None,
+            agent_workspace_resources: None,
+            exec: None,
+            turn: None,
+            ir: &ir,
+            instance_id: &instance_id,
+            system_prompt: "You are a WhippleScript agent.",
+            max_steps: 8,
+        };
+        let mut machine = InstanceStepMachine::new(driver);
+        let outcome = run_to_completion(&mut machine, &FailedCoerceHost);
+        let driver = machine.into_driver();
+        let effects = driver.kernel.store().list_effects(&instance_id).unwrap();
+        let events = driver.kernel.store().list_events(&instance_id).unwrap();
+        let instance_status = driver
+            .kernel
+            .store()
+            .get_instance(&instance_id)
+            .unwrap()
+            .unwrap()
+            .status;
+        let diagnostic_messages = driver
+            .kernel
+            .store()
+            .list_diagnostics(Some(&instance_id))
+            .unwrap()
+            .into_iter()
+            .map(|diagnostic| diagnostic.message)
+            .collect();
+        FailedCoerceRun {
+            outcome,
+            instance_status,
+            effect_statuses: effects.into_iter().map(|effect| effect.status).collect(),
+            events: events
+                .into_iter()
+                .map(|event| (event.event_type, event.payload_json))
+                .collect(),
+            diagnostic_messages,
+        }
+    }
+
+    fn assert_failed_coerce_recovery(source: &str, workflow: &str, expected: &str) {
+        let run = run_failed_coerce(source, workflow);
+        assert!(matches!(run.outcome, InstanceOutcome::Terminal));
+        assert_eq!(run.instance_status, "completed");
+        assert_eq!(run.effect_statuses, ["failed"]);
+        let terminal = run
+            .events
+            .iter()
+            .find(|(event_type, _)| event_type == "workflow.completed")
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_str(&terminal.1).unwrap();
+        assert_eq!(payload["payload"], serde_json::json!({"text":expected}));
+        assert!(run
+            .events
+            .iter()
+            .any(|(event_type, _)| event_type == "schema.coerce.failed"));
+    }
+
+    #[test]
+    fn do_instance_driver_exposes_a_typed_failure_alias_to_its_recovery_handler() {
+        const SOURCE: &str = r#"workflow HostedFailureAlias
+output result Answer
+class Answer { text string }
+coerce classify(text string) -> Answer { prompt "{{ text }} {{ ctx.output_format }}" }
+action recover() -> string {
+  coerce classify("primary") as primary
+  after primary succeeds { return primary.text }
+  after primary fails as problem { return problem.reason }
+}
+rule finish when started => { recover() as recovered
+complete result { text recovered } }
+"#;
+        assert_failed_coerce_recovery(SOURCE, "HostedFailureAlias", "coerce failed");
+    }
+
+    #[test]
+    fn do_instance_driver_selects_a_typed_terminal_outcome() {
+        const SOURCE: &str = r#"workflow HostedTerminalOutcome
+output result Answer
+class Answer { text string }
+coerce classify(text string) -> Answer { prompt "{{ text }} {{ ctx.output_format }}" }
+action recover() -> string {
+  coerce classify("primary") as primary
+  after primary completes as outcome {
+    case outcome {
+      Completed as value => { return value.text }
+      Failed as problem => { return problem.reason }
+      TimedOut as problem => { return problem.summary }
+      Cancelled as problem => { return problem.summary }
+    }
+  }
+}
+rule finish when started => { recover() as recovered
+complete result { text recovered } }
+"#;
+        assert_failed_coerce_recovery(SOURCE, "HostedTerminalOutcome", "coerce failed");
+    }
+
+    #[test]
+    fn do_instance_driver_selects_an_expression_terminal_outcome() {
+        const SOURCE: &str = r#"workflow HostedOutcomeExpression
+output result Answer
+class Answer { text string }
+coerce classify(text string) -> Answer { prompt "{{ text }} {{ ctx.output_format }}" }
+action recover() -> string {
+  coerce classify("primary") as primary
+  case outcome(primary) {
+    Completed as value => { return value.text }
+    Failed as problem => { return problem.reason }
+    TimedOut as problem => { return problem.summary }
+    Cancelled as problem => { return problem.summary }
+  }
+}
+rule finish when started => { recover() as recovered
+complete result { text recovered } }
+"#;
+        assert_failed_coerce_recovery(SOURCE, "HostedOutcomeExpression", "coerce failed");
+    }
+
+    #[test]
+    fn do_instance_driver_selects_an_aggregate_child_outcome() {
+        const SOURCE: &str = r#"workflow HostedChildOutcome
+output result Answer
+class Answer { text string }
+coerce classify(text string) -> Answer { prompt "{{ text }} {{ ctx.output_format }}" }
+action leaf() -> Answer {
+  coerce classify("primary") as primary
+  after primary succeeds { return primary }
+}
+action recover() -> string {
+  leaf() as child
+  case outcome(child) {
+    Completed as value => { return value.text }
+    Failed as problem => { return problem.summary }
+  }
+}
+rule finish when started => { recover() as recovered
+complete result { text recovered } }
+"#;
+        assert_failed_coerce_recovery(
+            SOURCE,
+            "HostedChildOutcome",
+            "child action failed with 1 unrecovered cause",
+        );
+    }
+
+    #[test]
+    fn do_instance_driver_runs_a_lexical_failure_handler() {
+        const SOURCE: &str = r#"workflow HostedLexicalFailure
+output result Answer
+class Answer { text string }
+coerce classify(text string) -> Answer { prompt "{{ text }} {{ ctx.output_format }}" }
+action recover() -> string {
+  coerce classify("primary") as primary
+  after primary succeeds { return primary.text }
+  on failure as problem { return problem.summary }
+}
+rule finish when started => { recover() as recovered
+complete result { text recovered } }
+"#;
+        assert_failed_coerce_recovery(
+            SOURCE,
+            "HostedLexicalFailure",
+            "action scope failed with 1 unrecovered cause",
+        );
+    }
+
+    #[test]
+    fn do_instance_driver_runs_a_rule_failure_handler() {
+        const SOURCE: &str = r#"workflow HostedRuleFailure
+output result Answer
+class Answer { text string }
+coerce classify(text string) -> Answer { prompt "{{ text }} {{ ctx.output_format }}" }
+rule finish when started => {
+  coerce classify("primary") as primary
+  on failure as problem {
+    complete result { text problem.summary }
+  }
+}
+"#;
+        assert_failed_coerce_recovery(
+            SOURCE,
+            "HostedRuleFailure",
+            "rule progression failed with 1 unrecovered cause",
+        );
+    }
+
+    #[test]
+    fn do_instance_driver_applies_the_outer_rule_failure_contract() {
+        const TERMINATING: &str = r#"workflow HostedUnhandledFailure
+output result Answer
+class Answer { text string }
+coerce classify(text string) -> Answer { prompt "{{ text }} {{ ctx.output_format }}" }
+action selects_typed_semantics() -> null { return null }
+rule finish when started => {
+  coerce classify("primary") as primary
+  after primary succeeds { complete result primary }
+}
+"#;
+        let terminating = run_failed_coerce(TERMINATING, "HostedUnhandledFailure");
+        assert!(matches!(terminating.outcome, InstanceOutcome::Terminal));
+        assert_eq!(terminating.instance_status, "failed");
+        assert_eq!(terminating.effect_statuses, ["failed"]);
+        assert!(terminating
+            .events
+            .iter()
+            .any(
+                |(event_type, payload)| event_type == "instance.transitioned"
+                    && serde_json::from_str::<serde_json::Value>(payload)
+                        .is_ok_and(|value| value["status"] == "failed")
+            ));
+        assert!(terminating
+            .diagnostic_messages
+            .iter()
+            .all(|message| !message.contains("workflow keeps running")));
+
+        const SERVICE: &str = r#"@service
+workflow HostedUnhandledService
+class Answer { text string }
+coerce classify(text string) -> Answer { prompt "{{ text }} {{ ctx.output_format }}" }
+action selects_typed_semantics() -> null { return null }
+rule finish when started => {
+  coerce classify("primary") as primary
+  after primary succeeds { record Answer { text primary.text } }
+}
+"#;
+        let service = run_failed_coerce(SERVICE, "HostedUnhandledService");
+        assert!(matches!(service.outcome, InstanceOutcome::Parked));
+        assert_eq!(service.instance_status, "running");
+        assert_eq!(service.effect_statuses, ["failed"]);
+        assert_eq!(
+            service
+                .diagnostic_messages
+                .iter()
+                .filter(|message| message.contains("workflow keeps running"))
+                .count(),
+            1,
+            "{:?}",
+            service.diagnostic_messages
+        );
+    }
+
+    #[test]
+    fn do_instance_driver_runs_a_managed_inline_decide_inside_an_action() {
+        const SOURCE: &str = r#"workflow HostedDecide
+output result Answer
+class Answer { safe bool reason string }
+action judge(subject string) -> Answer {
+  decide "Review {{ subject }}" -> { safe bool, reason string } as verdict
+  after verdict succeeds { return verdict }
+}
+rule finish when started => { judge("release") as verdict
+complete result verdict }
+"#;
+        let compiled =
+            whipplescript_parser::execution_semantics::compile_recorded_program_with_root(
+                SOURCE,
+                None,
+                whipplescript_parser::ExecutionSemantics::TypedActionsV1,
+            );
+        assert!(
+            compiled.diagnostics.is_empty(),
+            "{:?}",
+            compiled.diagnostics
+        );
+        let ir = compiled.ir.unwrap();
+        let plans = compiled.typed_actions.unwrap();
+        let identity =
+            whipplescript_kernel::program_artifact::typed_identity_projection(&ir, &plans).unwrap();
+        let store = store();
+        for stmt in [
+            "INSERT INTO capability_schemas (capability, description, schema_json) \
+             VALUES ('schema.coerce', 'Coerce unstructured data into a typed value.', '{}')",
+            "INSERT INTO effect_providers (provider_id, effect_kind, provider, capability, config_json) \
+             VALUES ('provider_coerce_builtin', 'schema.coerce', 'builtin-coerce', 'schema.coerce', '{}')",
+            "INSERT INTO capability_bindings (binding_id, program_id, capability, provider, config_json) \
+             VALUES ('binding_coerce_builtin', NULL, 'schema.coerce', 'builtin-coerce', '{}')",
+        ] {
+            store.sql.execute(stmt, &[]).expect("seed coerce provider");
+        }
+        let mut kernel = RuntimeKernel::new(store);
+        let source_hash = kernel.store().put_content(SOURCE).unwrap();
+        let version = kernel
+            .create_program_version_for_typed_program(
+                ProgramVersionInput {
+                    program_name: &ir.workflow,
+                    source_hash: &source_hash,
+                    ir_hash: &crate::do_store::stable_hash_hex(&identity),
+                    compiler_version: "test",
+                    ir_snapshot: Some(&identity),
+                },
+                &ir,
+                &plans,
+            )
+            .unwrap();
+        let instance_id = kernel
+            .create_instance_with_authority(
+                &version,
+                "{}",
+                NewInstanceAuthority {
+                    workflow_principal: "local/HostedDecide",
+                    effective_authority_json: "{}",
+                },
+            )
+            .unwrap();
+        kernel
+            .ingest_external_event(&instance_id, "external.started", "{}", Some("started"))
+            .unwrap();
+        let cfg = ResolvedCoercionConfig {
+            provider_id: "anthropic".to_owned(),
+            backend: CoerceProvider::Anthropic,
+            base_url: "https://api.anthropic.com".to_owned(),
+            api_key: "test-key".to_owned(),
+            model: "claude-test".to_owned(),
+            max_tokens: whipplescript_kernel::coerce_native::DEFAULT_COERCE_MAX_TOKENS,
+            timeout_secs: whipplescript_kernel::coerce_native::DEFAULT_COERCE_TIMEOUT_SECS,
+            codex_account_id: None,
+        };
+        let driver = DoInstanceDriver {
+            media: &Default::default(),
+            now_unix_ms: 0,
+            kernel,
+            files: &NoFiles,
+            coerce: Some(&cfg),
+            agent_model: None,
+            agent_tools: &NoTools,
+            agent_tool_specs: None,
+            agent_workspace_resources: None,
+            exec: None,
+            turn: None,
+            ir: &ir,
+            instance_id: &instance_id,
+            system_prompt: "You are a WhippleScript agent.",
+            max_steps: 8,
+        };
+        let mut machine = InstanceStepMachine::new(driver);
+        let outcome = run_to_completion(&mut machine, &DecideHost);
+        assert!(matches!(outcome, InstanceOutcome::Terminal), "{outcome:?}");
+        let driver = machine.into_driver();
+        let terminal = driver
+            .kernel
+            .store()
+            .list_events(&instance_id)
+            .unwrap()
+            .into_iter()
+            .find(|event| event.event_type == "workflow.completed")
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_str(&terminal.payload_json).unwrap();
+        assert_eq!(
+            payload["payload"],
+            serde_json::json!({"safe":true,"reason":"hosted decide"})
+        );
+        let effect = driver
+            .kernel
+            .store()
+            .list_effects(&instance_id)
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        let input: serde_json::Value = serde_json::from_str(&effect.input_json).unwrap();
+        assert_eq!(input["function_name"], "decide");
+        assert_eq!(input["prompt"], "Review release");
+        assert_eq!(
+            input["output_schema"]["properties"]["safe"]["type"],
+            "boolean"
+        );
+        assert_eq!(effect.status, "completed");
+    }
+
+    #[test]
+    fn do_instance_driver_runs_a_managed_script_exec_inside_an_action() {
+        use whipplescript_store::ScriptCapabilityRegistration;
+
+        const SOURCE: &str = r#"use std.script
+workflow HostedExec
+output result Answer
+class Answer { text string }
+class ScriptReport { text string }
+action render(input string) -> ScriptReport {
+  exec render with input -> ScriptReport as report
+  after report succeeds { return report }
+}
+rule finish when started => { render("release") as report
+complete result { text report.text } }
+"#;
+        let compiled =
+            whipplescript_parser::execution_semantics::compile_recorded_program_with_root(
+                SOURCE,
+                None,
+                whipplescript_parser::ExecutionSemantics::TypedActionsV1,
+            );
+        assert!(
+            compiled.diagnostics.is_empty(),
+            "{:?}",
+            compiled.diagnostics
+        );
+        let ir = compiled.ir.unwrap();
+        let plans = compiled.typed_actions.unwrap();
+        let identity =
+            whipplescript_kernel::program_artifact::typed_identity_projection(&ir, &plans).unwrap();
+        let store = store();
+        for stmt in [
+            "INSERT INTO capability_schemas (capability, description, schema_json) \
+             VALUES ('script.render', 'Run the render script.', '{}')",
+            "INSERT INTO capability_bindings (binding_id, program_id, capability, provider, config_json) \
+             VALUES ('binding_script_render', NULL, 'script.render', 'builtin-script', '{}')",
+        ] {
+            store.sql.execute(stmt, &[]).expect("seed script capability");
+        }
+        let script_body = "read line\necho '{\"text\":\"hosted render\"}'\n";
+        let script_sha = exec_http::sha256_hex(script_body.as_bytes());
+        store
+            .register_script_capability(ScriptCapabilityRegistration {
+                name: "render",
+                argv_json: r#"["sh", "{script}"]"#,
+                sha256: &script_sha,
+                env_json: "{}",
+                hermetic: false,
+                body: script_body,
+            })
+            .unwrap();
+        let mut kernel = RuntimeKernel::new(store);
+        let source_hash = kernel.store().put_content(SOURCE).unwrap();
+        let version = kernel
+            .create_program_version_for_typed_program(
+                ProgramVersionInput {
+                    program_name: &ir.workflow,
+                    source_hash: &source_hash,
+                    ir_hash: &crate::do_store::stable_hash_hex(&identity),
+                    compiler_version: "test",
+                    ir_snapshot: Some(&identity),
+                },
+                &ir,
+                &plans,
+            )
+            .unwrap();
+        let instance_id = kernel
+            .create_instance_with_authority(
+                &version,
+                "{}",
+                NewInstanceAuthority {
+                    workflow_principal: "local/HostedExec",
+                    effective_authority_json: "{}",
+                },
+            )
+            .unwrap();
+        kernel
+            .ingest_external_event(&instance_id, "external.started", "{}", Some("started"))
+            .unwrap();
+        let exec_cfg = ExecutorSidecarConfig {
+            norm_runtime: None,
+            base_url: "http://executor:8080".to_owned(),
+            env_values: std::collections::BTreeMap::new(),
+            environment_epoch: "test-epoch".to_owned(),
+            timeout_ms: Some(10_000),
+            auth_token: None,
+        };
+        let driver = DoInstanceDriver {
+            media: &Default::default(),
+            now_unix_ms: 0,
+            kernel,
+            files: &NoFiles,
+            coerce: None,
+            agent_model: None,
+            agent_tools: &NoTools,
+            agent_tool_specs: None,
+            agent_workspace_resources: None,
+            exec: Some(&exec_cfg),
+            turn: None,
+            ir: &ir,
+            instance_id: &instance_id,
+            system_prompt: "You are a WhippleScript agent.",
+            max_steps: 8,
+        };
+        let mut machine = InstanceStepMachine::new(driver);
+        let outcome = run_to_completion(&mut machine, &ManagedExecHost);
+        assert!(matches!(outcome, InstanceOutcome::Terminal), "{outcome:?}");
+        let driver = machine.into_driver();
+        let terminal = driver
+            .kernel
+            .store()
+            .list_events(&instance_id)
+            .unwrap()
+            .into_iter()
+            .find(|event| event.event_type == "workflow.completed")
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_str(&terminal.payload_json).unwrap();
+        assert_eq!(
+            payload["payload"],
+            serde_json::json!({"text":"hosted render"})
+        );
+        let effect = driver
+            .kernel
+            .store()
+            .list_effects(&instance_id)
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        let input: serde_json::Value = serde_json::from_str(&effect.input_json).unwrap();
+        assert_eq!(input["mode"], "capability");
+        assert_eq!(input["capability"], "render");
+        assert_eq!(input["stdin"], "release");
+        assert_eq!(input["parse"]["schema"], "ScriptReport");
+        assert_eq!(effect.status, "completed");
+    }
+
+    #[test]
+    fn do_instance_driver_runs_a_managed_file_read_inside_an_action() {
+        const SOURCE: &str = r#"workflow HostedFiles
+file store workspace { root "." allow read ["docs/**"] }
+output result Answer
+class Answer { text string }
+action load(path string) -> string {
+  read text from workspace at path as document
+  after document succeeds { return document.content }
+}
+rule finish when started => { load("docs/guide.md") as content
+complete result { text content } }
+"#;
+        let compiled =
+            whipplescript_parser::execution_semantics::compile_recorded_program_with_root(
+                SOURCE,
+                None,
+                whipplescript_parser::ExecutionSemantics::TypedActionsV1,
+            );
+        assert!(
+            compiled.diagnostics.is_empty(),
+            "{:?}",
+            compiled.diagnostics
+        );
+        let ir = compiled.ir.unwrap();
+        let plans = compiled.typed_actions.unwrap();
+        let identity =
+            whipplescript_kernel::program_artifact::typed_identity_projection(&ir, &plans).unwrap();
+        let store = store();
+        for stmt in [
+            "INSERT INTO capability_schemas (capability, description, schema_json) \
+             VALUES ('file.read', 'Read a declared file store.', '{}')",
+            "INSERT INTO effect_providers (provider_id, effect_kind, provider, capability, config_json) \
+             VALUES ('provider_files_read', 'file.read', 'files', 'file.read', '{}')",
+            "INSERT INTO capability_bindings (binding_id, program_id, capability, provider, config_json) \
+             VALUES ('binding_files_read', NULL, 'file.read', 'files', '{}')",
+        ] {
+            store.sql.execute(stmt, &[]).expect("seed file provider");
+        }
+        let mut kernel = RuntimeKernel::new(store);
+        let source_hash = kernel.store().put_content(SOURCE).unwrap();
+        let version = kernel
+            .create_program_version_for_typed_program(
+                ProgramVersionInput {
+                    program_name: &ir.workflow,
+                    source_hash: &source_hash,
+                    ir_hash: &crate::do_store::stable_hash_hex(&identity),
+                    compiler_version: "test",
+                    ir_snapshot: Some(&identity),
+                },
+                &ir,
+                &plans,
+            )
+            .unwrap();
+        let instance_id = kernel
+            .create_instance_with_authority(
+                &version,
+                "{}",
+                NewInstanceAuthority {
+                    workflow_principal: "local/HostedFiles",
+                    effective_authority_json: "{}",
+                },
+            )
+            .unwrap();
+        kernel
+            .ingest_external_event(&instance_id, "external.started", "{}", Some("started"))
+            .unwrap();
+        let driver = DoInstanceDriver {
+            media: &Default::default(),
+            now_unix_ms: 0,
+            kernel,
+            files: &ReadFiles,
+            coerce: None,
+            agent_model: None,
+            agent_tools: &NoTools,
+            agent_tool_specs: None,
+            agent_workspace_resources: None,
+            exec: None,
+            turn: None,
+            ir: &ir,
+            instance_id: &instance_id,
+            system_prompt: "You are a WhippleScript agent.",
+            max_steps: 8,
+        };
+        let mut machine = InstanceStepMachine::new(driver);
+        let outcome = run_to_completion(&mut machine, &RefuseIoHost);
+        assert!(matches!(outcome, InstanceOutcome::Terminal), "{outcome:?}");
+        let driver = machine.into_driver();
+        let terminal = driver
+            .kernel
+            .store()
+            .list_events(&instance_id)
+            .unwrap()
+            .into_iter()
+            .find(|event| event.event_type == "workflow.completed")
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_str(&terminal.payload_json).unwrap();
+        assert_eq!(
+            payload["payload"],
+            serde_json::json!({"text":"hosted guide"})
+        );
+        let effect = driver
+            .kernel
+            .store()
+            .list_effects(&instance_id)
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        let input: serde_json::Value = serde_json::from_str(&effect.input_json).unwrap();
+        assert_eq!(input["path"], "docs/guide.md");
+        assert_eq!(input["path_expr"], "path");
+        assert_eq!(effect.status, "completed");
+    }
+
+    #[test]
+    fn do_instance_driver_runs_a_managed_file_import_inside_an_action() {
+        const SOURCE: &str = r#"workflow HostedImports
+file store workspace { root "." allow read ["docs/**"] }
+output result Answer
+class Answer { count int }
+class Ticket { owner string priority int }
+action load(path string) -> int {
+  import json Ticket from workspace at path as imported
+  after imported succeeds { return imported.admitted }
+}
+rule finish when started => { load("docs/tickets.json") as count
+complete result { count count } }
+"#;
+        let compiled =
+            whipplescript_parser::execution_semantics::compile_recorded_program_with_root(
+                SOURCE,
+                None,
+                whipplescript_parser::ExecutionSemantics::TypedActionsV1,
+            );
+        assert!(
+            compiled.diagnostics.is_empty(),
+            "{:?}",
+            compiled.diagnostics
+        );
+        let ir = compiled.ir.unwrap();
+        let plans = compiled.typed_actions.unwrap();
+        let identity =
+            whipplescript_kernel::program_artifact::typed_identity_projection(&ir, &plans).unwrap();
+        let store = store();
+        for stmt in [
+            "INSERT INTO capability_schemas (capability, description, schema_json) VALUES ('file.import', 'Import rows into facts.', '{}')",
+            "INSERT INTO effect_providers (provider_id, effect_kind, provider, capability, config_json) VALUES ('provider_files_import', 'file.import', 'files', 'file.import', '{}')",
+            "INSERT INTO capability_bindings (binding_id, program_id, capability, provider, config_json) VALUES ('binding_files_import', NULL, 'file.import', 'files', '{}')",
+        ] {
+            store.sql.execute(stmt, &[]).expect("seed file provider");
+        }
+        let mut kernel = RuntimeKernel::new(store);
+        let source_hash = kernel.store().put_content(SOURCE).unwrap();
+        let version = kernel
+            .create_program_version_for_typed_program(
+                ProgramVersionInput {
+                    program_name: &ir.workflow,
+                    source_hash: &source_hash,
+                    ir_hash: &crate::do_store::stable_hash_hex(&identity),
+                    compiler_version: "test",
+                    ir_snapshot: Some(&identity),
+                },
+                &ir,
+                &plans,
+            )
+            .unwrap();
+        let instance_id = kernel
+            .create_instance_with_authority(
+                &version,
+                "{}",
+                NewInstanceAuthority {
+                    workflow_principal: "local/HostedImports",
+                    effective_authority_json: "{}",
+                },
+            )
+            .unwrap();
+        kernel
+            .ingest_external_event(&instance_id, "external.started", "{}", Some("started"))
+            .unwrap();
+        let driver = DoInstanceDriver {
+            media: &Default::default(),
+            now_unix_ms: 0,
+            kernel,
+            files: &ReadFiles,
+            coerce: None,
+            agent_model: None,
+            agent_tools: &NoTools,
+            agent_tool_specs: None,
+            agent_workspace_resources: None,
+            exec: None,
+            turn: None,
+            ir: &ir,
+            instance_id: &instance_id,
+            system_prompt: "You are a WhippleScript agent.",
+            max_steps: 8,
+        };
+        let mut machine = InstanceStepMachine::new(driver);
+        let outcome = run_to_completion(&mut machine, &RefuseIoHost);
+        assert!(matches!(outcome, InstanceOutcome::Terminal), "{outcome:?}");
+        let driver = machine.into_driver();
+        let facts = driver.kernel.store().list_facts(&instance_id).unwrap();
+        assert_eq!(facts.iter().filter(|fact| fact.name == "Ticket").count(), 2);
+        let terminal = driver
+            .kernel
+            .store()
+            .list_events(&instance_id)
+            .unwrap()
+            .into_iter()
+            .find(|event| event.event_type == "workflow.completed")
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_str(&terminal.payload_json).unwrap();
+        assert_eq!(payload["payload"], serde_json::json!({"count":2}));
+        let effect = driver
+            .kernel
+            .store()
+            .list_effects(&instance_id)
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        let input: serde_json::Value = serde_json::from_str(&effect.input_json).unwrap();
+        assert_eq!(input["path"], "docs/tickets.json");
+        assert_eq!(input["path_expr"], "path");
+        assert_eq!(input["schema"], "Ticket");
+        assert_eq!(effect.status, "completed");
+    }
+
+    #[test]
+    fn do_instance_driver_runs_a_managed_signal_inside_an_action() {
+        const SOURCE: &str = r#"workflow HostedSignals
+signal go.now { target string }
+signal task.done { id string }
+output result Answer
+class Answer { event string }
+action notify(target string) -> string {
+  emit signal task.done to target { id "T-1" } as sent
+  after sent succeeds { return sent.event }
+}
+rule finish when go.now as go => { notify(go.target) as event
+complete result { event event } }
+"#;
+        let compiled =
+            whipplescript_parser::execution_semantics::compile_recorded_program_with_root(
+                SOURCE,
+                None,
+                whipplescript_parser::ExecutionSemantics::TypedActionsV1,
+            );
+        assert!(
+            compiled.diagnostics.is_empty(),
+            "{:?}",
+            compiled.diagnostics
+        );
+        let ir = compiled.ir.unwrap();
+        let plans = compiled.typed_actions.unwrap();
+        let identity =
+            whipplescript_kernel::program_artifact::typed_identity_projection(&ir, &plans).unwrap();
+        let store = store();
+        for stmt in [
+            "INSERT INTO capability_schemas (capability, description, schema_json) VALUES ('signal.emit', 'Deliver a declared signal.', '{}')",
+            "INSERT INTO effect_providers (provider_id, effect_kind, provider, capability, config_json) VALUES ('provider_signal', 'signal.emit', 'notify', 'signal.emit', '{}')",
+            "INSERT INTO capability_bindings (binding_id, program_id, capability, provider, config_json) VALUES ('binding_signal', NULL, 'signal.emit', 'notify', '{}')",
+        ] {
+            store.sql.execute(stmt, &[]).expect("seed signal provider");
+        }
+        let mut kernel = RuntimeKernel::new(store);
+        let source_hash = kernel.store().put_content(SOURCE).unwrap();
+        let version = kernel
+            .create_program_version_for_typed_program(
+                ProgramVersionInput {
+                    program_name: &ir.workflow,
+                    source_hash: &source_hash,
+                    ir_hash: &crate::do_store::stable_hash_hex(&identity),
+                    compiler_version: "test",
+                    ir_snapshot: Some(&identity),
+                },
+                &ir,
+                &plans,
+            )
+            .unwrap();
+        let receiver = kernel
+            .create_instance_with_authority(
+                &version,
+                "{}",
+                NewInstanceAuthority {
+                    workflow_principal: "local/HostedSignals",
+                    effective_authority_json: "{}",
+                },
+            )
+            .unwrap();
+        let instance_id = kernel
+            .create_instance_with_authority(
+                &version,
+                "{}",
+                NewInstanceAuthority {
+                    workflow_principal: "local/HostedSignals",
+                    effective_authority_json: "{}",
+                },
+            )
+            .unwrap();
+        let admitted = kernel
+            .ingest_external_event(
+                &instance_id,
+                "go.now",
+                &serde_json::json!({"target":receiver}).to_string(),
+                Some("go"),
+            )
+            .unwrap();
+        kernel
+            .derive_fact(
+                &instance_id,
+                "go.now",
+                &admitted.event_id,
+                &serde_json::json!({"target":receiver}).to_string(),
+                Some(&admitted.event_id),
+                Some("go-fact"),
+            )
+            .unwrap();
+        let driver = DoInstanceDriver {
+            media: &Default::default(),
+            now_unix_ms: 0,
+            kernel,
+            files: &ReadFiles,
+            coerce: None,
+            agent_model: None,
+            agent_tools: &NoTools,
+            agent_tool_specs: None,
+            agent_workspace_resources: None,
+            exec: None,
+            turn: None,
+            ir: &ir,
+            instance_id: &instance_id,
+            system_prompt: "You are a WhippleScript agent.",
+            max_steps: 8,
+        };
+        let mut machine = InstanceStepMachine::new(driver);
+        let outcome = run_to_completion(&mut machine, &RefuseIoHost);
+        assert!(matches!(outcome, InstanceOutcome::Terminal), "{outcome:?}");
+        let driver = machine.into_driver();
+        let delivered = driver.kernel.store().list_facts(&receiver).unwrap();
+        assert!(delivered
+            .iter()
+            .any(|fact| fact.name == "task.done" && fact.value_json == r#"{"id":"T-1"}"#));
+        let terminal = driver
+            .kernel
+            .store()
+            .list_events(&instance_id)
+            .unwrap()
+            .into_iter()
+            .find(|event| event.event_type == "workflow.completed")
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_str(&terminal.payload_json).unwrap();
+        assert_eq!(payload["payload"], serde_json::json!({"event":"task.done"}));
+        let effect = driver
+            .kernel
+            .store()
+            .list_effects(&instance_id)
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        let input: serde_json::Value = serde_json::from_str(&effect.input_json).unwrap();
+        assert_eq!(input["target_instance"], receiver);
+        assert_eq!(input["payload"], serde_json::json!({"id":"T-1"}));
+        assert_eq!(effect.status, "completed");
+    }
+
+    #[test]
+    fn do_instance_driver_runs_a_managed_counter_over_arm() {
+        const SOURCE: &str = r#"use std.coord
+workflow HostedCounter
+class Customer { id string }
+counter budget { key Customer cap 10 reset daily timezone "UTC" }
+output result Answer
+class Answer { remaining int }
+action spend(customer string, units int) -> int {
+  consume budget for customer amount units as spent
+  after spent ok as outcome { return outcome.remaining }
+  after spent over as outcome { return outcome.remaining }
+}
+rule finish when started => { spend("C-1", 11) as remaining
+complete result { remaining remaining } }
+"#;
+        let compiled =
+            whipplescript_parser::execution_semantics::compile_recorded_program_with_root(
+                SOURCE,
+                None,
+                whipplescript_parser::ExecutionSemantics::TypedActionsV1,
+            );
+        assert!(
+            compiled.diagnostics.is_empty(),
+            "{:?}",
+            compiled.diagnostics
+        );
+        let ir = compiled.ir.unwrap();
+        let plans = compiled.typed_actions.unwrap();
+        let identity =
+            whipplescript_kernel::program_artifact::typed_identity_projection(&ir, &plans).unwrap();
+        let store = store();
+        for stmt in [
+            "INSERT INTO capability_schemas (capability, description, schema_json) VALUES ('counter.consume', 'Consume a declared counter.', '{}')",
+            "INSERT INTO effect_providers (provider_id, effect_kind, provider, capability, config_json) VALUES ('provider_counter', 'counter.consume', 'coordination', 'counter.consume', '{}')",
+            "INSERT INTO capability_bindings (binding_id, program_id, capability, provider, config_json) VALUES ('binding_counter', NULL, 'counter.consume', 'coordination', '{}')",
+        ] {
+            store.sql.execute(stmt, &[]).expect("seed counter provider");
+        }
+        let mut kernel = RuntimeKernel::new(store);
+        let source_hash = kernel.store().put_content(SOURCE).unwrap();
+        let version = kernel
+            .create_program_version_for_typed_program(
+                ProgramVersionInput {
+                    program_name: &ir.workflow,
+                    source_hash: &source_hash,
+                    ir_hash: &crate::do_store::stable_hash_hex(&identity),
+                    compiler_version: "test",
+                    ir_snapshot: Some(&identity),
+                },
+                &ir,
+                &plans,
+            )
+            .unwrap();
+        let instance_id = kernel
+            .create_instance_with_authority(
+                &version,
+                "{}",
+                NewInstanceAuthority {
+                    workflow_principal: "local/HostedCounter",
+                    effective_authority_json: "{}",
+                },
+            )
+            .unwrap();
+        kernel
+            .ingest_external_event(&instance_id, "external.started", "{}", Some("started"))
+            .unwrap();
+        let driver = DoInstanceDriver {
+            media: &Default::default(),
+            now_unix_ms: 0,
+            kernel,
+            files: &ReadFiles,
+            coerce: None,
+            agent_model: None,
+            agent_tools: &NoTools,
+            agent_tool_specs: None,
+            agent_workspace_resources: None,
+            exec: None,
+            turn: None,
+            ir: &ir,
+            instance_id: &instance_id,
+            system_prompt: "You are a WhippleScript agent.",
+            max_steps: 8,
+        };
+        let mut machine = InstanceStepMachine::new(driver);
+        let outcome = run_to_completion(&mut machine, &RefuseIoHost);
+        assert!(matches!(outcome, InstanceOutcome::Terminal), "{outcome:?}");
+        let driver = machine.into_driver();
+        let terminal = driver
+            .kernel
+            .store()
+            .list_events(&instance_id)
+            .unwrap()
+            .into_iter()
+            .find(|event| event.event_type == "workflow.completed")
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_str(&terminal.payload_json).unwrap();
+        assert_eq!(payload["payload"], serde_json::json!({"remaining":10}));
+        let effect = driver
+            .kernel
+            .store()
+            .list_effects(&instance_id)
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        let input: serde_json::Value = serde_json::from_str(&effect.input_json).unwrap();
+        assert_eq!(input["key"], "C-1");
+        assert_eq!(input["amount"], 11);
+        assert_eq!(effect.status, "completed");
+        let result = driver
+            .kernel
+            .store()
+            .list_facts(&instance_id)
+            .unwrap()
+            .into_iter()
+            .find(|fact| fact.name == "counter.consume.completed")
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&result.value_json).unwrap();
+        assert_eq!(value["value"]["variant"], "Over");
+    }
+
+    #[test]
+    fn do_instance_driver_runs_a_managed_ledger_append() {
+        const SOURCE: &str = r#"use std.coord
+workflow HostedLedger
+class Decision { area string choice string }
+ledger decisions { entry Decision partition by area retain 90d }
+output result Answer
+class Answer { sequence int partition string }
+action record(area string, choice string) -> Answer {
+  append Decision { area area choice choice } to decisions as saved
+  after saved succeeds { return { sequence saved.seq, partition saved.partition } }
+}
+rule finish when started => { record("api", "typed values") as result
+complete result result }
+"#;
+        let compiled =
+            whipplescript_parser::execution_semantics::compile_recorded_program_with_root(
+                SOURCE,
+                None,
+                whipplescript_parser::ExecutionSemantics::TypedActionsV1,
+            );
+        assert!(
+            compiled.diagnostics.is_empty(),
+            "{:?}",
+            compiled.diagnostics
+        );
+        let ir = compiled.ir.unwrap();
+        let plans = compiled.typed_actions.unwrap();
+        let identity =
+            whipplescript_kernel::program_artifact::typed_identity_projection(&ir, &plans).unwrap();
+        let store = store();
+        for stmt in [
+            "INSERT INTO capability_schemas (capability, description, schema_json) VALUES ('ledger.append', 'Append a declared ledger entry.', '{}')",
+            "INSERT INTO effect_providers (provider_id, effect_kind, provider, capability, config_json) VALUES ('provider_ledger', 'ledger.append', 'coordination', 'ledger.append', '{}')",
+            "INSERT INTO capability_bindings (binding_id, program_id, capability, provider, config_json) VALUES ('binding_ledger', NULL, 'ledger.append', 'coordination', '{}')",
+        ] {
+            store.sql.execute(stmt, &[]).expect("seed ledger provider");
+        }
+        let mut kernel = RuntimeKernel::new(store);
+        let source_hash = kernel.store().put_content(SOURCE).unwrap();
+        let version = kernel
+            .create_program_version_for_typed_program(
+                ProgramVersionInput {
+                    program_name: &ir.workflow,
+                    source_hash: &source_hash,
+                    ir_hash: &crate::do_store::stable_hash_hex(&identity),
+                    compiler_version: "test",
+                    ir_snapshot: Some(&identity),
+                },
+                &ir,
+                &plans,
+            )
+            .unwrap();
+        let instance_id = kernel
+            .create_instance_with_authority(
+                &version,
+                "{}",
+                NewInstanceAuthority {
+                    workflow_principal: "local/HostedLedger",
+                    effective_authority_json: "{}",
+                },
+            )
+            .unwrap();
+        kernel
+            .ingest_external_event(&instance_id, "external.started", "{}", Some("started"))
+            .unwrap();
+        let driver = DoInstanceDriver {
+            media: &Default::default(),
+            now_unix_ms: 0,
+            kernel,
+            files: &NoFiles,
+            coerce: None,
+            agent_model: None,
+            agent_tools: &NoTools,
+            agent_tool_specs: None,
+            agent_workspace_resources: None,
+            exec: None,
+            turn: None,
+            ir: &ir,
+            instance_id: &instance_id,
+            system_prompt: "You are a WhippleScript agent.",
+            max_steps: 8,
+        };
+        let mut machine = InstanceStepMachine::new(driver);
+        let outcome = run_to_completion(&mut machine, &RefuseIoHost);
+        assert!(matches!(outcome, InstanceOutcome::Terminal), "{outcome:?}");
+        let driver = machine.into_driver();
+        let terminal = driver
+            .kernel
+            .store()
+            .list_events(&instance_id)
+            .unwrap()
+            .into_iter()
+            .find(|event| event.event_type == "workflow.completed")
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_str(&terminal.payload_json).unwrap();
+        assert_eq!(
+            payload["payload"],
+            serde_json::json!({"sequence":1,"partition":"api"})
+        );
+        let entries = driver
+            .kernel
+            .store()
+            .list_entries_for_owner(None, Some("decisions"), Some("api"))
+            .unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].seq, 1);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&entries[0].payload_json).unwrap(),
+            serde_json::json!({"area":"api","choice":"typed values"})
+        );
+        let effect = driver
+            .kernel
+            .store()
+            .list_effects(&instance_id)
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        assert_eq!(effect.kind, "ledger.append");
+        assert_eq!(effect.status, "completed");
+        let input: serde_json::Value = serde_json::from_str(&effect.input_json).unwrap();
+        assert_eq!(input["partition"], "api");
+        assert_eq!(input["partition_field"], "area");
+    }
+
+    #[test]
+    fn do_instance_driver_runs_a_managed_tracker_filing() {
+        const SOURCE: &str = r#"use std.tracker
+workflow HostedTrackerFile
+tracker backlog
+output result Answer
+class Answer { item string title string }
+action file(title string) -> Answer {
+  file issue into backlog { title title body "hosted" labels ["bug"] metadata { source "api" } } as filed
+  after filed succeeds { return { item filed.id, title filed.title } }
+}
+rule finish when started => { file("Fix login") as result
+complete result result }
+"#;
+        let compiled =
+            whipplescript_parser::execution_semantics::compile_recorded_program_with_root(
+                SOURCE,
+                None,
+                whipplescript_parser::ExecutionSemantics::TypedActionsV1,
+            );
+        assert!(
+            compiled.diagnostics.is_empty(),
+            "{:?}",
+            compiled.diagnostics
+        );
+        let ir = compiled.ir.unwrap();
+        let plans = compiled.typed_actions.unwrap();
+        let identity =
+            whipplescript_kernel::program_artifact::typed_identity_projection(&ir, &plans).unwrap();
+        let store = store();
+        for stmt in [
+            "INSERT INTO capability_schemas (capability, description, schema_json) VALUES ('tracker.file', 'File a tracker item.', '{}')",
+            "INSERT INTO effect_providers (provider_id, effect_kind, provider, capability, config_json) VALUES ('provider_tracker_file', 'tracker.file', 'queue', 'tracker.file', '{}')",
+            "INSERT INTO capability_bindings (binding_id, program_id, capability, provider, config_json) VALUES ('binding_tracker_file', NULL, 'tracker.file', 'queue', '{}')",
+        ] {
+            store.sql.execute(stmt, &[]).expect("seed tracker provider");
+        }
+        let mut kernel = RuntimeKernel::new(store);
+        let source_hash = kernel.store().put_content(SOURCE).unwrap();
+        let version = kernel
+            .create_program_version_for_typed_program(
+                ProgramVersionInput {
+                    program_name: &ir.workflow,
+                    source_hash: &source_hash,
+                    ir_hash: &crate::do_store::stable_hash_hex(&identity),
+                    compiler_version: "test",
+                    ir_snapshot: Some(&identity),
+                },
+                &ir,
+                &plans,
+            )
+            .unwrap();
+        let instance_id = kernel
+            .create_instance_with_authority(
+                &version,
+                "{}",
+                NewInstanceAuthority {
+                    workflow_principal: "local/HostedTrackerFile",
+                    effective_authority_json: "{}",
+                },
+            )
+            .unwrap();
+        kernel
+            .ingest_external_event(&instance_id, "external.started", "{}", Some("started"))
+            .unwrap();
+        let driver = DoInstanceDriver {
+            media: &Default::default(),
+            now_unix_ms: 0,
+            kernel,
+            files: &NoFiles,
+            coerce: None,
+            agent_model: None,
+            agent_tools: &NoTools,
+            agent_tool_specs: None,
+            agent_workspace_resources: None,
+            exec: None,
+            turn: None,
+            ir: &ir,
+            instance_id: &instance_id,
+            system_prompt: "You are a WhippleScript agent.",
+            max_steps: 8,
+        };
+        let mut machine = InstanceStepMachine::new(driver);
+        let outcome = run_to_completion(&mut machine, &RefuseIoHost);
+        assert!(matches!(outcome, InstanceOutcome::Terminal), "{outcome:?}");
+        let driver = machine.into_driver();
+        let terminal = driver
+            .kernel
+            .store()
+            .list_events(&instance_id)
+            .unwrap()
+            .into_iter()
+            .find(|event| event.event_type == "workflow.completed")
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_str(&terminal.payload_json).unwrap();
+        assert_eq!(
+            payload["payload"],
+            serde_json::json!({"item":"WS-1","title":"Fix login"})
+        );
+        let items = driver
+            .kernel
+            .store()
+            .list_items(Some("backlog"), None)
+            .unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].title, "Fix login");
+        let effect = driver
+            .kernel
+            .store()
+            .list_effects(&instance_id)
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        assert_eq!(effect.kind, "tracker.file");
+        assert_eq!(effect.status, "completed");
+        let input: serde_json::Value = serde_json::from_str(&effect.input_json).unwrap();
+        assert_eq!(input["item"]["labels"], serde_json::json!(["bug"]));
+    }
+
+    #[test]
+    fn do_instance_driver_composes_the_managed_tracker_lifecycle() {
+        const SOURCE: &str = r#"use std.tracker
+workflow HostedTrackerLifecycle
+tracker backlog
+output result Answer
+class Answer { item string status string }
+action close(title string) -> Answer {
+  file issue into backlog { title title body "hosted" labels ["bug"] } as filed
+  after filed succeeds {
+    claim filed as held
+    after held succeeds {
+      release held as reopened
+      after reopened succeeds {
+        claim reopened as reclaimed
+        after reclaimed succeeds {
+          finish reclaimed { summary "verified" } as finished
+          after finished succeeds { return { item finished.id, status finished.status } }
+        }
+      }
+    }
+  }
+}
+rule finish when started => { close("Fix login") as result
+complete result result }
+"#;
+        let compiled =
+            whipplescript_parser::execution_semantics::compile_recorded_program_with_root(
+                SOURCE,
+                None,
+                whipplescript_parser::ExecutionSemantics::TypedActionsV1,
+            );
+        assert!(
+            compiled.diagnostics.is_empty(),
+            "{:?}",
+            compiled.diagnostics
+        );
+        let ir = compiled.ir.unwrap();
+        let plans = compiled.typed_actions.unwrap();
+        let identity =
+            whipplescript_kernel::program_artifact::typed_identity_projection(&ir, &plans).unwrap();
+        let store = store();
+        for (kind, provider) in [
+            ("tracker.file", "provider_tracker_file"),
+            ("tracker.claim", "provider_tracker_claim"),
+            ("tracker.release", "provider_tracker_release"),
+            ("tracker.finish", "provider_tracker_finish"),
+        ] {
+            store
+                .sql
+                .execute(
+                    "INSERT INTO capability_schemas (capability, description, schema_json) VALUES (?1, 'tracker lifecycle', '{}')",
+                    &[crate::do_store::SqlValue::Text(kind.into())],
+                )
+                .unwrap();
+            store
+                .sql
+                .execute(
+                    "INSERT INTO effect_providers (provider_id, effect_kind, provider, capability, config_json) VALUES (?1, ?2, 'queue', ?2, '{}')",
+                    &[
+                        crate::do_store::SqlValue::Text(provider.into()),
+                        crate::do_store::SqlValue::Text(kind.into()),
+                    ],
+                )
+                .unwrap();
+            store
+                .sql
+                .execute(
+                    "INSERT INTO capability_bindings (binding_id, program_id, capability, provider, config_json) VALUES (?1, NULL, ?2, 'queue', '{}')",
+                    &[
+                        crate::do_store::SqlValue::Text(provider.into()),
+                        crate::do_store::SqlValue::Text(kind.into()),
+                    ],
+                )
+                .unwrap();
+        }
+        let mut kernel = RuntimeKernel::new(store);
+        let source_hash = kernel.store().put_content(SOURCE).unwrap();
+        let version = kernel
+            .create_program_version_for_typed_program(
+                ProgramVersionInput {
+                    program_name: &ir.workflow,
+                    source_hash: &source_hash,
+                    ir_hash: &crate::do_store::stable_hash_hex(&identity),
+                    compiler_version: "test",
+                    ir_snapshot: Some(&identity),
+                },
+                &ir,
+                &plans,
+            )
+            .unwrap();
+        let instance_id = kernel
+            .create_instance_with_authority(
+                &version,
+                "{}",
+                NewInstanceAuthority {
+                    workflow_principal: "local/HostedTrackerLifecycle",
+                    effective_authority_json: "{}",
+                },
+            )
+            .unwrap();
+        kernel
+            .ingest_external_event(&instance_id, "external.started", "{}", Some("started"))
+            .unwrap();
+        let driver = DoInstanceDriver {
+            media: &Default::default(),
+            now_unix_ms: 0,
+            kernel,
+            files: &NoFiles,
+            coerce: None,
+            agent_model: None,
+            agent_tools: &NoTools,
+            agent_tool_specs: None,
+            agent_workspace_resources: None,
+            exec: None,
+            turn: None,
+            ir: &ir,
+            instance_id: &instance_id,
+            system_prompt: "You are a WhippleScript agent.",
+            max_steps: 24,
+        };
+        let mut machine = InstanceStepMachine::new(driver);
+        let outcome = run_to_completion(&mut machine, &RefuseIoHost);
+        assert!(matches!(outcome, InstanceOutcome::Terminal), "{outcome:?}");
+        let driver = machine.into_driver();
+        let terminal = driver
+            .kernel
+            .store()
+            .list_events(&instance_id)
+            .unwrap()
+            .into_iter()
+            .find(|event| event.event_type == "workflow.completed")
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_str(&terminal.payload_json).unwrap();
+        assert_eq!(
+            payload["payload"],
+            serde_json::json!({"item":"WS-1","status":"closed"})
+        );
+        let items = driver
+            .kernel
+            .store()
+            .list_items(Some("backlog"), None)
+            .unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].id, "WS-1");
+        assert_eq!(items[0].status, "closed");
+        let effects = driver.kernel.store().list_effects(&instance_id).unwrap();
+        let mut kinds = effects
+            .iter()
+            .map(|effect| effect.kind.as_str())
+            .collect::<Vec<_>>();
+        kinds.sort_unstable();
+        assert_eq!(
+            kinds,
+            [
+                "tracker.claim",
+                "tracker.claim",
+                "tracker.file",
+                "tracker.finish",
+                "tracker.release",
+            ]
+        );
+        assert!(effects.iter().all(|effect| effect.status == "completed"));
+    }
+
+    #[test]
+    fn do_instance_driver_runs_a_managed_file_write_inside_an_action() {
+        const SOURCE: &str = r#"workflow HostedWrites
+file store workspace { root "." allow write ["out/**"] }
+output result Answer
+class Answer { text string }
+action save(path string, body string) -> string {
+  write text to workspace at path { body body mode upsert } as written
+  after written succeeds { return written.content_hash }
+}
+rule finish when started => { save("out/guide.md", "hosted guide") as digest
+complete result { text digest } }
+"#;
+        let compiled =
+            whipplescript_parser::execution_semantics::compile_recorded_program_with_root(
+                SOURCE,
+                None,
+                whipplescript_parser::ExecutionSemantics::TypedActionsV1,
+            );
+        assert!(
+            compiled.diagnostics.is_empty(),
+            "{:?}",
+            compiled.diagnostics
+        );
+        let ir = compiled.ir.unwrap();
+        let plans = compiled.typed_actions.unwrap();
+        let identity =
+            whipplescript_kernel::program_artifact::typed_identity_projection(&ir, &plans).unwrap();
+        let store = store();
+        for stmt in [
+            "INSERT INTO capability_schemas (capability, description, schema_json) VALUES ('file.write', 'Write a declared file store.', '{}')",
+            "INSERT INTO effect_providers (provider_id, effect_kind, provider, capability, config_json) VALUES ('provider_files_write', 'file.write', 'files', 'file.write', '{}')",
+            "INSERT INTO capability_bindings (binding_id, program_id, capability, provider, config_json) VALUES ('binding_files_write', NULL, 'file.write', 'files', '{}')",
+        ] {
+            store.sql.execute(stmt, &[]).expect("seed file provider");
+        }
+        let mut kernel = RuntimeKernel::new(store);
+        let source_hash = kernel.store().put_content(SOURCE).unwrap();
+        let version = kernel
+            .create_program_version_for_typed_program(
+                ProgramVersionInput {
+                    program_name: &ir.workflow,
+                    source_hash: &source_hash,
+                    ir_hash: &crate::do_store::stable_hash_hex(&identity),
+                    compiler_version: "test",
+                    ir_snapshot: Some(&identity),
+                },
+                &ir,
+                &plans,
+            )
+            .unwrap();
+        let instance_id = kernel
+            .create_instance_with_authority(
+                &version,
+                "{}",
+                NewInstanceAuthority {
+                    workflow_principal: "local/HostedWrites",
+                    effective_authority_json: "{}",
+                },
+            )
+            .unwrap();
+        kernel
+            .ingest_external_event(&instance_id, "external.started", "{}", Some("started"))
+            .unwrap();
+        let files = WriteFiles::default();
+        let driver = DoInstanceDriver {
+            media: &Default::default(),
+            now_unix_ms: 0,
+            kernel,
+            files: &files,
+            coerce: None,
+            agent_model: None,
+            agent_tools: &NoTools,
+            agent_tool_specs: None,
+            agent_workspace_resources: None,
+            exec: None,
+            turn: None,
+            ir: &ir,
+            instance_id: &instance_id,
+            system_prompt: "You are a WhippleScript agent.",
+            max_steps: 8,
+        };
+        let mut machine = InstanceStepMachine::new(driver);
+        let outcome = run_to_completion(&mut machine, &RefuseIoHost);
+        assert!(matches!(outcome, InstanceOutcome::Terminal), "{outcome:?}");
+        let driver = machine.into_driver();
+        assert_eq!(
+            files
+                .read_to_string(std::path::Path::new("./out/guide.md"))
+                .unwrap(),
+            "hosted guide"
+        );
+        let terminal = driver
+            .kernel
+            .store()
+            .list_events(&instance_id)
+            .unwrap()
+            .into_iter()
+            .find(|event| event.event_type == "workflow.completed")
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_str(&terminal.payload_json).unwrap();
+        assert_eq!(
+            payload["payload"],
+            serde_json::json!({"text":whipplescript_store::stable_hash_hex("hosted guide")})
+        );
+    }
+
+    #[test]
+    fn do_instance_driver_runs_a_freshness_captured_file_export() {
+        const SOURCE: &str = r#"workflow HostedExports
+file store workspace { root "." allow write ["out/**"] }
+output result Answer
+class Answer { count int }
+class Ticket { owner string priority int }
+action save(path string) -> int {
+  export jsonl Ticket to workspace at path { where priority > 2 mode upsert } as written
+  after written succeeds { return written.row_count }
+}
+rule finish when started => { save("out/tickets.jsonl") as count
+complete result { count count } }
+"#;
+        let compiled =
+            whipplescript_parser::execution_semantics::compile_recorded_program_with_root(
+                SOURCE,
+                None,
+                whipplescript_parser::ExecutionSemantics::TypedActionsV1,
+            );
+        assert!(
+            compiled.diagnostics.is_empty(),
+            "{:?}",
+            compiled.diagnostics
+        );
+        let ir = compiled.ir.unwrap();
+        let plans = compiled.typed_actions.unwrap();
+        let identity =
+            whipplescript_kernel::program_artifact::typed_identity_projection(&ir, &plans).unwrap();
+        let store = store();
+        for stmt in [
+            "INSERT INTO capability_schemas (capability, description, schema_json) VALUES ('file.export', 'Export a captured fact collection.', '{}')",
+            "INSERT INTO effect_providers (provider_id, effect_kind, provider, capability, config_json) VALUES ('provider_files_export', 'file.export', 'files', 'file.export', '{}')",
+            "INSERT INTO capability_bindings (binding_id, program_id, capability, provider, config_json) VALUES ('binding_files_export', NULL, 'file.export', 'files', '{}')",
+        ] {
+            store.sql.execute(stmt, &[]).expect("seed file provider");
+        }
+        let mut kernel = RuntimeKernel::new(store);
+        let source_hash = kernel.store().put_content(SOURCE).unwrap();
+        let version = kernel
+            .create_program_version_for_typed_program(
+                ProgramVersionInput {
+                    program_name: &ir.workflow,
+                    source_hash: &source_hash,
+                    ir_hash: &crate::do_store::stable_hash_hex(&identity),
+                    compiler_version: "test",
+                    ir_snapshot: Some(&identity),
+                },
+                &ir,
+                &plans,
+            )
+            .unwrap();
+        let instance_id = kernel
+            .create_instance_with_authority(
+                &version,
+                "{}",
+                NewInstanceAuthority {
+                    workflow_principal: "local/HostedExports",
+                    effective_authority_json: "{}",
+                },
+            )
+            .unwrap();
+        kernel
+            .ingest_external_event(&instance_id, "external.started", "{}", Some("started"))
+            .unwrap();
+        for (key, owner, priority) in [("alice", "alice", 4), ("bob", "bob", 1)] {
+            kernel
+                .derive_fact(
+                    &instance_id,
+                    "Ticket",
+                    key,
+                    &serde_json::json!({"owner":owner,"priority":priority}).to_string(),
+                    None,
+                    Some(&format!("seed-{key}")),
+                )
+                .unwrap();
+        }
+        let files = WriteFiles::default();
+        let driver = DoInstanceDriver {
+            media: &Default::default(),
+            now_unix_ms: 0,
+            kernel,
+            files: &files,
+            coerce: None,
+            agent_model: None,
+            agent_tools: &NoTools,
+            agent_tool_specs: None,
+            agent_workspace_resources: None,
+            exec: None,
+            turn: None,
+            ir: &ir,
+            instance_id: &instance_id,
+            system_prompt: "You are a WhippleScript agent.",
+            max_steps: 8,
+        };
+        let mut machine = InstanceStepMachine::new(driver);
+        let outcome = run_to_completion(&mut machine, &RefuseIoHost);
+        assert!(matches!(outcome, InstanceOutcome::Terminal), "{outcome:?}");
+        let driver = machine.into_driver();
+        assert_eq!(
+            files
+                .read_to_string(std::path::Path::new("./out/tickets.jsonl"))
+                .unwrap(),
+            "{\"owner\":\"alice\",\"priority\":4}\n"
+        );
+        let effect = driver
+            .kernel
+            .store()
+            .list_effects(&instance_id)
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        let input: serde_json::Value = serde_json::from_str(&effect.input_json).unwrap();
+        assert_eq!(
+            input["rows_argument"]["value"],
+            serde_json::json!([{"owner":"alice","priority":4}])
+        );
+        let terminal = driver
+            .kernel
+            .store()
+            .list_events(&instance_id)
+            .unwrap()
+            .into_iter()
+            .find(|event| event.event_type == "workflow.completed")
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_str(&terminal.payload_json).unwrap();
+        assert_eq!(payload["payload"], serde_json::json!({"count":1}));
     }
 
     #[test]

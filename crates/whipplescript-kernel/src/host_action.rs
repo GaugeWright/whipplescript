@@ -229,6 +229,7 @@ impl<S: RuntimeStore + LogAppend> RuntimeKernel<S> {
                 provenance_class: "external",
                 correlation_id: Some(admission.fingerprint()),
                 source_span_json: None,
+                validity_json: None,
             })
             .collect();
         let principal = format!("workflow:{}/{}", command.issuer, action.program.workflow);

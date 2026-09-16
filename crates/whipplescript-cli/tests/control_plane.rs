@@ -162,9 +162,9 @@ fn skills_command_lists_declared_skills() {
     assert_eq!(author, Some(vec!["worker".to_owned()]));
 }
 
-/// (with a hygienic `turn__act0` binding) must run end to end under the fixture
-/// provider: the tell effect completes, the seeded `ChangeRequest` is consumed,
-/// and a `ReviewedChange` fact is recorded.
+/// The reusable typed action must run end to end under the fixture provider:
+/// its managed tell completes, the seeded `ChangeRequest` is consumed, and its
+/// `ReviewedChange` fact is recorded.
 #[test]
 fn action_expanded_chain_runs_end_to_end() {
     let bin = env!("CARGO_BIN_EXE_whip");
@@ -196,12 +196,12 @@ fn action_expanded_chain_runs_end_to_end() {
         .collect();
     assert!(
         fact_names.contains(&"ReviewedChange"),
-        "inlined record ran: {fact_names:?}"
+        "typed action record ran: {fact_names:?}"
     );
     // `done item` consumed the seeded ChangeRequest fact.
     assert!(
         !fact_names.contains(&"ChangeRequest"),
-        "inlined `done` consumed the input: {fact_names:?}"
+        "typed action `done` consumed the input: {fact_names:?}"
     );
 
     let effects = run_json_isolated(
@@ -7756,6 +7756,448 @@ rule work
     let _ = fs::remove_file(workflow_path);
 }
 
+/// DR-0100 E1 production door. The native instance view and `whip explain`
+/// consume the same captured managed progression. Repeated inspection remains
+/// read-only, and the suggested wait neither authorizes work nor permits a
+/// retry.
+#[test]
+fn managed_action_explanation_is_shared_by_view_and_cli_without_launching_work() {
+    const SOURCE: &str = r#"
+workflow Explain
+
+output result Done
+failure error Halted
+
+class Done {
+  note string
+}
+
+class Halted {
+  reason string
+}
+
+action wait_for_pause() -> string {
+  timer 300s as pause
+  return "finished"
+}
+
+rule wait
+  when started
+=> {
+  wait_for_pause() as done
+
+  after done succeeds {
+    complete result {
+      note done
+    }
+  }
+
+  on failure as problem {
+    fail error {
+      reason problem.summary
+    }
+  }
+}
+"#;
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let store_path = temp_store_path();
+    let workflow_path = temp_workflow_path("managed-explanation");
+    fs::write(&workflow_path, SOURCE).expect("workflow writes");
+    let store = store_path.to_str().expect("utf-8 temp path");
+    let output = whip(bin, &store_path)
+        .args([
+            "--store",
+            store,
+            "--json",
+            "run",
+            workflow_path.to_str().expect("utf-8 workflow path"),
+            "--until",
+            "idle",
+        ])
+        .output()
+        .expect("run starts");
+    assert!(
+        output.status.success(),
+        "run failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let dev: Value =
+        serde_json::from_str(&stdout[stdout.find('{').expect("json")..]).expect("run json");
+    let instance_id = dev
+        .get("instance_id")
+        .and_then(Value::as_str)
+        .expect("instance id");
+
+    let effects_before = run_json_isolated(
+        bin,
+        &store_path,
+        &["--store", store, "--json", "effects", instance_id],
+    );
+    assert_eq!(effects_before.as_array().map(Vec::len), Some(1));
+    let explanation = run_json_isolated(
+        bin,
+        &store_path,
+        &["--store", store, "--json", "explain", instance_id, "done"],
+    );
+    assert_eq!(
+        explanation.get("schema").and_then(Value::as_str),
+        Some("whipplescript.action-explanation-query.v1")
+    );
+    assert_eq!(
+        explanation.pointer("/outcome/kind").and_then(Value::as_str),
+        Some("selected"),
+        "{explanation}"
+    );
+    assert_eq!(
+        explanation
+            .pointer("/outcome/selection/result/status")
+            .and_then(Value::as_str),
+        Some("waiting")
+    );
+    assert_eq!(
+        explanation
+            .pointer("/outcome/selection/next_action/code")
+            .and_then(Value::as_str),
+        Some("inspect_result")
+    );
+    let pending_child = explanation
+        .pointer("/outcome/selection/result/waiting_on/0")
+        .expect("the action boundary names its pending child");
+    assert_eq!(
+        pending_child.get("name").and_then(Value::as_str),
+        Some("pause")
+    );
+    assert_eq!(
+        explanation.pointer("/outcome/selection/next_action/result_id"),
+        pending_child.get("result_id")
+    );
+    assert_eq!(
+        explanation.pointer("/outcome/selection/next_action/authorizes_work"),
+        Some(&Value::Bool(false))
+    );
+    assert_eq!(
+        explanation.pointer("/outcome/selection/next_action/retry_permitted"),
+        Some(&Value::Bool(false))
+    );
+    let admitted_version = explanation
+        .pointer("/outcome/selection/program_version_id")
+        .and_then(Value::as_str)
+        .expect("explanation version")
+        .to_owned();
+
+    // Activate a different immutable program while this firing is still open.
+    // Its explanation must continue to load the old captured plan and spans.
+    let revised_path = temp_workflow_path("managed-explanation-revised");
+    fs::write(
+        &revised_path,
+        SOURCE.replace(
+            "class Done {",
+            "class Added { note string }\n\nclass Done {",
+        ),
+    )
+    .expect("revised workflow writes");
+    let revised = whip(bin, &store_path)
+        .args([
+            "--store",
+            store,
+            "revise",
+            instance_id,
+            revised_path.to_str().expect("utf-8 revised path"),
+        ])
+        .output()
+        .expect("revision runs");
+    assert!(
+        revised.status.success(),
+        "revision failed: {}",
+        String::from_utf8_lossy(&revised.stderr)
+    );
+
+    let view = run_json_isolated(
+        bin,
+        &store_path,
+        &["--store", store, "--json", "view", instance_id],
+    );
+    assert_eq!(
+        view.get("schema").and_then(Value::as_str),
+        Some("whipplescript.instance_view.v1")
+    );
+    assert_eq!(
+        view.pointer("/action_explanations/0/results/0/name")
+            .and_then(Value::as_str),
+        Some("done")
+    );
+    assert_ne!(
+        view.pointer("/instance/program_version_id")
+            .and_then(Value::as_str),
+        Some(admitted_version.as_str()),
+        "the revision changed the active program"
+    );
+    assert_eq!(
+        view.pointer("/action_explanations/0/program_version_id")
+            .and_then(Value::as_str),
+        Some(admitted_version.as_str()),
+        "the open firing still resolves against its admitted source version"
+    );
+
+    // Two explanation reads and the view join launch nothing.
+    let current_explanation = run_json_isolated(
+        bin,
+        &store_path,
+        &["--store", store, "--json", "explain", instance_id, "done"],
+    );
+    let effects_after = run_json_isolated(
+        bin,
+        &store_path,
+        &["--store", store, "--json", "effects", instance_id],
+    );
+    assert_eq!(effects_after, effects_before);
+
+    let mut lsp_input = String::new();
+    lsp_input += &frame(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#);
+    lsp_input += &frame(
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "workspace/executeCommand",
+            "params": {
+                "command": "whip.explainResult",
+                "arguments": [{ "instance": instance_id, "result": "done" }],
+            },
+        })
+        .to_string(),
+    );
+    lsp_input += &frame(
+        r#"{"jsonrpc":"2.0","id":3,"method":"workspace/executeCommand","params":{"command":"whip.unknown","arguments":[]}}"#,
+    );
+    lsp_input += &frame(r#"{"jsonrpc":"2.0","id":4,"method":"shutdown","params":{}}"#);
+    lsp_input += &frame(r#"{"jsonrpc":"2.0","method":"exit","params":{}}"#);
+    let lsp = lsp_messages(&lsp_stdout(bin, &store_path, &lsp_input));
+    let initialized = lsp.iter().find(|message| message["id"] == 1).unwrap();
+    assert_eq!(
+        initialized["result"]["capabilities"]["executeCommandProvider"]["commands"],
+        json!(["whip.explainResult"])
+    );
+    let editor = lsp.iter().find(|message| message["id"] == 2).unwrap();
+    assert_eq!(
+        editor["result"], current_explanation,
+        "CLI and editor consume one explanation query projection"
+    );
+    let unsupported = lsp.iter().find(|message| message["id"] == 3).unwrap();
+    assert_eq!(unsupported["error"]["code"], -32602);
+    assert_eq!(
+        unsupported["error"]["message"],
+        "unsupported LSP command `whip.unknown`"
+    );
+
+    let _ = fs::remove_file(store_path);
+    let _ = fs::remove_file(workflow_path);
+    let _ = fs::remove_file(revised_path);
+}
+
+/// DR-0100 I1 production comparison. The inline and extracted sources admit
+/// both independent operations together, settle the same effect obligations,
+/// and publish the same terminal value. Extraction adds source provenance and
+/// an action result, but does not add an execution dependency.
+#[test]
+fn inline_and_extracted_reactive_composition_match_on_the_native_host() {
+    const INLINE: &str =
+        include_str!("../../whipplescript-kernel/tests/fixtures/reactive-extraction-inline.whip");
+    const EXTRACTED: &str =
+        include_str!("../../whipplescript-kernel/tests/fixtures/reactive-extraction-action.whip");
+
+    struct Run {
+        report: Value,
+        status: Value,
+        effects: Value,
+        investigation: Value,
+        policy: Value,
+    }
+    let run = |source: &str, label: &str| {
+        let bin = env!("CARGO_BIN_EXE_whip");
+        let store = temp_store_path();
+        let source_path = temp_workflow_path(label);
+        fs::write(&source_path, source).expect("comparison source writes");
+        let store_arg = store.path.to_str().expect("utf-8 store path");
+        let source_arg = source_path.to_str().expect("utf-8 source path");
+        let report = run_json_isolated(
+            bin,
+            &store,
+            &[
+                "--store", store_arg, "--json", "run", source_arg, "--until", "idle",
+            ],
+        );
+        let instance = report
+            .get("instance_id")
+            .and_then(Value::as_str)
+            .expect("instance id")
+            .to_owned();
+        let status = run_json_isolated(
+            bin,
+            &store,
+            &["--store", store_arg, "--json", "status", &instance],
+        );
+        let effects = run_json_isolated(
+            bin,
+            &store,
+            &["--store", store_arg, "--json", "effects", &instance],
+        );
+        let explanation = |name| {
+            run_json_isolated(
+                bin,
+                &store,
+                &["--store", store_arg, "--json", "explain", &instance, name],
+            )
+        };
+        let result = Run {
+            report,
+            status,
+            effects,
+            investigation: explanation("investigation"),
+            policy: explanation("policy"),
+        };
+        let _ = fs::remove_file(source_path);
+        result
+    };
+    let inline = run(INLINE, "reactive-comparison-inline");
+    let extracted = run(EXTRACTED, "reactive-comparison-action");
+
+    let terminal = |run: &Run| run.status.pointer("/workflow_terminal/payload").cloned();
+    assert_eq!(terminal(&inline), Some(json!({"text": "reviewed"})));
+    assert_eq!(terminal(&extracted), terminal(&inline));
+    assert_eq!(
+        inline
+            .report
+            .pointer("/steps/0/effects_created")
+            .and_then(Value::as_u64),
+        Some(2),
+        "both independent operations are admitted before either provider runs"
+    );
+    assert_eq!(
+        extracted
+            .report
+            .pointer("/steps/0/effects_created")
+            .and_then(Value::as_u64),
+        Some(2),
+        "extraction preserves the eligible pair"
+    );
+
+    let effect_contract = |run: &Run| {
+        let mut effects = run
+            .effects
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|effect| {
+                (
+                    effect["kind"].as_str().unwrap().to_owned(),
+                    effect["status"].as_str().unwrap().to_owned(),
+                    effect
+                        .pointer("/input/function_name")
+                        .and_then(Value::as_str)
+                        .unwrap()
+                        .to_owned(),
+                )
+            })
+            .collect::<Vec<_>>();
+        effects.sort();
+        effects
+    };
+    assert_eq!(effect_contract(&extracted), effect_contract(&inline));
+    assert_eq!(
+        effect_contract(&inline),
+        vec![
+            (
+                "schema.coerce".into(),
+                "completed".into(),
+                "assessPolicy".into()
+            ),
+            (
+                "schema.coerce".into(),
+                "completed".into(),
+                "investigate".into()
+            ),
+        ]
+    );
+
+    for (inline_result, extracted_result) in [
+        (&inline.investigation, &extracted.investigation),
+        (&inline.policy, &extracted.policy),
+    ] {
+        assert_eq!(
+            inline_result.pointer("/outcome/selection/result/status"),
+            Some(&json!("ready"))
+        );
+        assert_eq!(
+            extracted_result.pointer("/outcome/selection/result/status"),
+            inline_result.pointer("/outcome/selection/result/status")
+        );
+        assert_eq!(
+            inline_result.pointer("/outcome/selection/result/reasons"),
+            extracted_result.pointer("/outcome/selection/result/reasons")
+        );
+        assert_eq!(
+            inline_result.pointer("/outcome/selection/result/cause_ids"),
+            extracted_result.pointer("/outcome/selection/result/cause_ids")
+        );
+    }
+    assert_eq!(
+        inline
+            .investigation
+            .pointer("/outcome/selection/result/source/0/role"),
+        Some(&json!("result"))
+    );
+    assert_eq!(
+        extracted
+            .investigation
+            .pointer("/outcome/selection/result/source/0/role"),
+        Some(&json!("call_site")),
+        "the extracted form adds caller/definition provenance"
+    );
+
+    for (source, label) in [
+        (INLINE, "reactive-recovery-inline"),
+        (EXTRACTED, "reactive-recovery-action"),
+    ] {
+        let store = temp_store_path();
+        let source_path = temp_workflow_path(label);
+        fs::write(&source_path, source).expect("recovery source writes");
+        let report = run_json_isolated(
+            env!("CARGO_BIN_EXE_whip"),
+            &store,
+            &[
+                "--json",
+                "test",
+                source_path.to_str().expect("utf-8 source path"),
+            ],
+        );
+        assert_eq!(
+            report.pointer("/summary/failed").and_then(Value::as_u64),
+            Some(0),
+            "{report}"
+        );
+        assert_eq!(
+            report.pointer("/summary/passed").and_then(Value::as_u64),
+            Some(1),
+            "{report}"
+        );
+        assert_eq!(
+            report
+                .pointer("/scenarios/0/expectations")
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(2),
+            "the failed policy effect and completed workflow are both asserted"
+        );
+        assert!(report["scenarios"][0]["expectations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|expectation| expectation["status"] == "passed"));
+        let _ = fs::remove_file(source_path);
+    }
+}
+
 /// DR-0043 slice 4 (`during`/`until` regions), the full lapse lifecycle: an
 /// Incident lands while the region's first step is settled and its second is
 /// in flight — the lapse commits ONCE (durable `progression.region.lapsed`
@@ -10992,6 +11434,42 @@ test "payload that is not a record" {
     );
 
     let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn reactive_ticket_review_fixture_composes_and_recovers_one_named_coercion() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let stores = temp_store_path();
+    let program = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../examples/reactive-ticket-review.whip");
+    let lint = whip(bin, &stores)
+        .args(["lint", program.to_str().expect("program path")])
+        .output()
+        .expect("ticket-review lint runs");
+    assert!(
+        lint.status.success(),
+        "{}",
+        String::from_utf8_lossy(&lint.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&lint.stdout), "no lint findings\n");
+    let output = whip(bin, &stores)
+        .args(["--json", "test", program.to_str().expect("program path")])
+        .output()
+        .expect("ticket-review fixture runs");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).expect("test report JSON");
+    let scenarios = report["scenarios"].as_array().expect("scenarios");
+    assert_eq!(scenarios.len(), 2, "{report}");
+    assert!(
+        scenarios
+            .iter()
+            .all(|scenario| scenario["status"] == "passed"),
+        "{report}"
+    );
 }
 
 #[test]
@@ -19895,6 +20373,7 @@ rule accept
         provenance_class: "external",
         correlation_id: None,
         source_span_json: None,
+        validity_json: None,
     };
     store
         .commit_rule(RuleCommit {
@@ -22626,6 +23105,29 @@ fn lsp_stdout(bin: &str, stores: &TempStorePath, input: &str) -> String {
         .expect("write LSP input");
     let output = child.wait_with_output().expect("lsp exits");
     String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+fn lsp_messages(output: &str) -> Vec<Value> {
+    let mut input = output.as_bytes();
+    let mut messages = Vec::new();
+    while !input.is_empty() {
+        let header_end = input
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .expect("LSP header terminator");
+        let header = std::str::from_utf8(&input[..header_end]).expect("LSP header utf-8");
+        let length = header
+            .lines()
+            .find_map(|line| line.strip_prefix("Content-Length:"))
+            .map(str::trim)
+            .and_then(|length| length.parse::<usize>().ok())
+            .expect("LSP content length");
+        let body_start = header_end + 4;
+        let body_end = body_start + length;
+        messages.push(serde_json::from_slice(&input[body_start..body_end]).expect("LSP JSON body"));
+        input = &input[body_end..];
+    }
+    messages
 }
 
 fn ticket(status: &Value) -> Option<&str> {

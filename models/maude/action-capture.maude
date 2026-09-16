@@ -1,0 +1,39 @@
+--- DR-0100: argument evaluation is captured once, in the progression journal.
+mod WHIPPLESCRIPT-ACTION-CAPTURE is
+  sorts Value Slot Journal Command .
+  ops old new : -> Value [ctor] .
+  op empty : -> Slot [ctor] .
+  op captured : Value -> Slot [ctor] .
+  op journal : Slot Slot -> Journal [ctor] .
+  op captureFirst : Journal Value -> Command [ctor] .
+  op captureSecond : Journal Value -> Command [ctor] .
+  op saved : Journal -> Command [ctor] .
+  op refused : -> Command [ctor] .
+  op guarded : Value Value -> Command [ctor] .
+  var S : Slot . vars V W : Value .
+  rl [first] : captureFirst(journal(empty, S), V) => saved(journal(captured(V), S)) .
+  rl [second] : captureSecond(journal(S, empty), V) => saved(journal(S, captured(V))) .
+  rl [replay] : captureFirst(journal(captured(V), S), V) => saved(journal(captured(V), S)) .
+  crl [immutable] : captureFirst(journal(captured(V), S), W) => refused if V =/= W .
+  --- old/new also abstract the evaluated/current journal frontier.
+  rl [same-frontier] : guarded(V, V) => saved(journal(empty, empty)) .
+  crl [changed-frontier] : guarded(V, W) => refused if V =/= W .
+endm
+
+mod WHIPPLESCRIPT-ACTION-IGNORES-FRONTIER is
+  including WHIPPLESCRIPT-ACTION-CAPTURE .
+  vars V W : Value .
+  rl [ignore-append] : guarded(V, W) => saved(journal(empty, empty)) .
+endm
+
+mod WHIPPLESCRIPT-ACTION-REEVALUATES is
+  including WHIPPLESCRIPT-ACTION-CAPTURE .
+  var S : Slot . vars V W : Value .
+  rl [overwrite] : captureFirst(journal(captured(V), S), W) => saved(journal(captured(W), S)) .
+endm
+
+mod WHIPPLESCRIPT-ACTION-KEEPS-FIRST-COMMIT is
+  including WHIPPLESCRIPT-ACTION-CAPTURE .
+  var S : Slot . var V : Value .
+  rl [discard-later-call] : captureSecond(journal(S, empty), V) => saved(journal(S, empty)) .
+endm

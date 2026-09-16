@@ -1,0 +1,18 @@
+load ../action-null-refinement.maude
+search [1] in WHIPPLESCRIPT-ACTION-NULL-REFINEMENT : refine(nullable, isNull) =>* absentOnly .
+search [1] in WHIPPLESCRIPT-ACTION-NULL-REFINEMENT : refine(nullable, notNull) =>* presentOnly .
+search [1] in WHIPPLESCRIPT-ACTION-NULL-REFINEMENT : refine(nullable, nonNullAndUnknown) =>* presentOnly .
+search [1] in WHIPPLESCRIPT-ACTION-NULL-REFINEMENT : refine(nullable, nonNullOrUnknown) =>* presentOnly .
+search [1] in WHIPPLESCRIPT-ACTION-NULL-REFINEMENT-LOST : refine(nullable, nonNullOrUnknown) =>* presentOnly .
+search [1] in WHIPPLESCRIPT-ACTION-NULL-REFINEMENT : fallbackAfterNull(false) =>* presentOnly .
+search [1] in WHIPPLESCRIPT-ACTION-NULL-REFINEMENT : fallbackAfterNull(true) =>* presentOnly .
+search [1] in WHIPPLESCRIPT-ACTION-NULL-REFINEMENT-LOST : fallbackAfterNull(true) =>* presentOnly .
+search [1] in WHIPPLESCRIPT-ACTION-NULL-REFINEMENT : shadow(presentOnly, nullable) =>* presentOnly .
+search [1] in WHIPPLESCRIPT-ACTION-NULL-REFINEMENT-LOST : shadow(presentOnly, nullable) =>* presentOnly .
+search [1] in WHIPPLESCRIPT-ACTION-NULL-REFINEMENT : refine(nullable, isNull) =>* presentOnly .
+search [1] in WHIPPLESCRIPT-ACTION-NULL-REFINEMENT : shadow(presentOnly, nullable) =>* nullable .
+search [1] in WHIPPLESCRIPT-ACTION-NULL-REFINEMENT : matchesValue(nullPattern, nullValue) =>* true .
+search [1] in WHIPPLESCRIPT-ACTION-NULL-REFINEMENT : matchesValue(quotedNullPattern, nullValue) =>* true .
+search [1] in WHIPPLESCRIPT-ACTION-NULL-REFINEMENT : matchesValue(quotedNullPattern, stringNullValue) =>* true .
+search [1] in WHIPPLESCRIPT-ACTION-NULL-REFINEMENT-LOST : matchesValue(nullPattern, nullValue) =>* false .
+quit

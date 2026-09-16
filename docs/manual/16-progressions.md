@@ -255,11 +255,11 @@ bindings is a compile error:
 <!-- render: examples/diagnostics/lapse-arm-scope.whip code expr.binding_out_of_scope -->
 ```text
 error[expr.binding_out_of_scope]: the `on lapse` arm of rule `ship` references `plan`, a binding the region introduces — it may not exist when the arm runs
-   --> examples/diagnostics/lapse-arm-scope.whip:37:4
+   --> examples/diagnostics/lapse-arm-scope.whip:38:3
    |
-37 | => {
-   |    ^
-   = help: reference only bindings from before the region, or bind the progress view (`on lapse as got`) and read `got.<binding>` — its fields are present exactly if that step settled
+38 |   until exists(Incident where sev == "sev1") {
+   |   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   = help: reference only bindings from before the region, or bind the progress view (`on lapse as got`) and read `got.<binding>`
 ```
 
 The permitted method to see the progress is the **progress view**. The
@@ -299,12 +299,12 @@ status is a string:
 
 <!-- render: examples/diagnostics/progress-view-field.whip code type.unknown_field -->
 ```text
-error[type.unknown_field]: rule `ship` has invalid field path `got.plna`: schema `region.ship.Progress` has no field `plna`
-   --> examples/diagnostics/progress-view-field.whip:37:4
+error[type.unknown_field]: action expression has invalid field path `got.plna`: `got` has no field `plna`
+   --> examples/diagnostics/progress-view-field.whip:46:7
    |
-37 | => {
-   |    ^
-   = help: did you mean `plan`? otherwise use a field declared on the bound schema or add it to the class declaration
+46 |       reason got.plna
+   |       ^^^^^^^^^^^^^^^
+   = help: did you mean `plan`? use a field available on `got`
 ```
 
 The runtime pins the statuses in the same commit as the values, so a step that

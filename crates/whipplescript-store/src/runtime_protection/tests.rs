@@ -208,6 +208,7 @@ fn protected_facts_effects_runs_and_replay_preserve_their_payloads() {
         provenance_class: "derived",
         correlation_id: None,
         source_span_json: Some(span),
+        validity_json: None,
     };
     let effect = NewEffect {
         effect_id: "effect",

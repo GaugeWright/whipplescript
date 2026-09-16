@@ -1,0 +1,88 @@
+--- DR-0100: selected-path return obligations. Graph continuations are parallel;
+--- guarded alternatives and explicit success sequencing provide conditions.
+fmod ACTION-RETURN-PATHS is
+  protecting BOOL .
+  protecting NAT .
+  sorts Condition Environment Node Graph .
+  subsort Node < Graph .
+  ops yes no x a b truth : -> Condition [ctor] .
+  op neg : Condition -> Condition [ctor] .
+  ops both either fallback : Condition Condition -> Condition [ctor] .
+  op env : Bool Bool Bool Bool -> Environment [ctor] .
+  op value : Condition Environment -> Bool .
+  op none : -> Graph [ctor] .
+  op __ : Graph Graph -> Graph [ctor assoc id: none] .
+  ops result failure ownA ownB : Condition -> Node [ctor] .
+  op returns : Graph Environment -> Nat .
+  op successful : Graph Environment -> Bool .
+  vars X A B T : Bool .
+  vars C D : Condition .
+  var E : Environment .
+  var G : Graph .
+  eq value(yes, E) = true .
+  eq value(no, E) = false .
+  eq value(x, env(X, A, B, T)) = X .
+  eq value(a, env(X, A, B, T)) = A .
+  eq value(b, env(X, A, B, T)) = B .
+  eq value(truth, env(X, A, B, T)) = T .
+  eq value(neg(C), E) = not value(C, E) .
+  eq value(both(C, D), E) = value(C, E) and value(D, E) .
+  eq value(either(C, D), E) = value(C, E) or value(D, E) .
+  --- Unready is not false. Readiness remains outside the negation.
+  eq value(fallback(C, D), E) = value(C, E) and not value(D, E) .
+  eq returns(none, E) = 0 .
+  eq returns(result(C) G, E) = (if value(C, E) then 1 else 0 fi) + returns(G, E) .
+  eq returns(failure(C) G, E) = returns(G, E) .
+  eq returns(ownA(C) G, E) = returns(G, E) .
+  eq returns(ownB(C) G, E) = returns(G, E) .
+  eq successful(none, E) = true .
+  eq successful(result(C) G, E) = successful(G, E) .
+  eq successful(failure(C) G, E) = not value(C, E) and successful(G, E) .
+  eq successful(ownA(C) G, E) = (not value(C, E) or value(a, E)) and successful(G, E) .
+  eq successful(ownB(C) G, E) = (not value(C, E) or value(b, E)) and successful(G, E) .
+endfm
+
+mod WHIPPLESCRIPT-ACTION-RETURN-PATHS is
+  protecting ACTION-RETURN-PATHS .
+  sort Check .
+  op audit : Graph -> Check [ctor] .
+  op chooseA : Graph Bool -> Check [ctor] .
+  op chooseB : Graph Bool Bool -> Check [ctor] .
+  op chooseT : Graph Bool Bool Bool -> Check [ctor] .
+  op inspect : Graph Environment -> Check [ctor] .
+  ops approved missing multiple : -> Check [ctor] .
+  var G : Graph .
+  var E : Environment .
+  vars X A B : Bool .
+  rl [x-true] : audit(G) => chooseA(G, true) .
+  rl [x-false] : audit(G) => chooseA(G, false) .
+  rl [a-true] : chooseA(G, X) => chooseB(G, X, true) .
+  rl [a-false] : chooseA(G, X) => chooseB(G, X, false) .
+  rl [b-true] : chooseB(G, X, A) => chooseT(G, X, A, true) .
+  rl [b-false] : chooseB(G, X, A) => chooseT(G, X, A, false) .
+  rl [guard-true] : chooseT(G, X, A, B) => inspect(G, env(X, A, B, true)) .
+  rl [guard-false] : chooseT(G, X, A, B) => inspect(G, env(X, A, B, false)) .
+  crl [missing-result] : inspect(G, E) => missing if successful(G, E) and returns(G, E) == 0 .
+  crl [conflicting-results] : inspect(G, E) => multiple if returns(G, E) > 1 .
+  crl [result-obligation-met] : inspect(G, E) => approved
+    if returns(G, E) <= 1 and (not successful(G, E) or returns(G, E) == 1) .
+endm
+
+mod WHIPPLESCRIPT-ACTION-MANUFACTURES-RETURN is
+  including WHIPPLESCRIPT-ACTION-RETURN-PATHS .
+  var G : Graph . var E : Environment .
+  crl [manufacture-null] : inspect(G, E) => approved if returns(G, E) == 0 .
+endm
+
+mod WHIPPLESCRIPT-ACTION-KEEPS-FIRST-RETURN is
+  including WHIPPLESCRIPT-ACTION-RETURN-PATHS .
+  var G : Graph . var E : Environment .
+  crl [source-order-winner] : inspect(G, E) => approved if returns(G, E) > 1 .
+endm
+
+mod WHIPPLESCRIPT-ACTION-UNREADY-IS-FALSE is
+  including WHIPPLESCRIPT-ACTION-RETURN-PATHS .
+  vars C D : Condition . var G : Graph . var E : Environment .
+  rl [bad-fallback] : inspect(result(fallback(C, D)) G, E)
+    => inspect(result(neg(both(C, D))) G, E) .
+endm

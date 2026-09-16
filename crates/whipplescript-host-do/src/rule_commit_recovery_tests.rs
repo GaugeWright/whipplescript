@@ -69,6 +69,7 @@ fn assert_recovery<S: RuntimeStore>(mut store: S) {
         .expect("instance");
     let instance = instance.instance_id;
     let guard = RuleCommitRevisionGuard {
+        evaluated_frontier: None,
         program_version_id: &v1.version_id,
         revision_epoch: 0,
     };
@@ -188,6 +189,7 @@ fn assert_recovery<S: RuntimeStore>(mut store: S) {
     let mut terminal = commit(&instance, &[]);
     terminal.idempotency_key = Some("done");
     terminal.terminal = Some(WorkflowTerminal {
+        validity_json: None,
         kind: WorkflowTerminalKind::Completed,
         name: "done",
         payload_json: "{}",
@@ -211,6 +213,7 @@ fn assert_recovery<S: RuntimeStore>(mut store: S) {
         settled_effects
     );
     let current = RuleCommitRevisionGuard {
+        evaluated_frontier: None,
         program_version_id: &v2.version_id,
         revision_epoch: 1,
     };
@@ -276,6 +279,7 @@ fn native_concurrent_enqueue_commits_one_identity() {
                     .commit_rule_with_revision_guard(
                         commit(&instance.instance_id, &[effect(Some(60))]),
                         RuleCommitRevisionGuard {
+                            evaluated_frontier: None,
                             program_version_id: &v.version_id,
                             revision_epoch: 0,
                         },

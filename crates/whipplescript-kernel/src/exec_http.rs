@@ -902,6 +902,9 @@ fn commit_exec_projection_batch<S: RuntimeStore>(
                 provenance_class: if p.ingest { "ingest" } else { "external" },
                 correlation_id: None,
                 source_span_json: None,
+                // An exec settlement projection carries no declared validity:
+                // its premises are the run's, recorded on the settlement.
+                validity_json: None,
             },
             idempotency_key: &p.event_key,
         })

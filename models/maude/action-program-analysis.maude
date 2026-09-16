@@ -1,0 +1,30 @@
+--- Source-phase failures stop before downstream findings; all callers belong
+--- to the same analysis. A checked front end is not runtime admission.
+mod WHIPPLESCRIPT-ACTION-PROGRAM-ANALYSIS is
+  protecting BOOL .
+  sort Result .
+  ops checked typeError grantError subjectError : -> Result [ctor] .
+  op analyze : Bool Bool Bool Bool -> Result .
+  ops declared declarationError executable : -> Result [ctor] .
+  op withDecl : Result Bool -> Result .
+  var D : Bool .
+  eq withDecl(checked, true) = declared .
+  eq withDecl(checked, false) = declarationError .
+  eq withDecl(typeError, D) = typeError .
+  eq withDecl(grantError, D) = grantError .
+  eq withDecl(subjectError, D) = subjectError .
+  vars C G S : Bool .
+  eq analyze(false, C, G, S) = typeError .
+  eq analyze(true, false, G, S) = typeError .
+  eq analyze(true, true, false, S) = grantError .
+  eq analyze(true, true, true, false) = subjectError .
+  eq analyze(true, true, true, true) = checked .
+endm
+mod WHIPPLESCRIPT-ACTION-PROGRAM-ANALYSIS-LOST is
+  including WHIPPLESCRIPT-ACTION-PROGRAM-ANALYSIS .
+  rl [ignore-declaration] : declarationError => declared .
+  rl [execute-incomplete] : declared => executable .
+  rl [ignore-type] : typeError => checked .
+  rl [ignore-grant] : grantError => checked .
+  rl [ignore-subject] : subjectError => checked .
+endm

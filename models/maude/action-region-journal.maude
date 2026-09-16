@@ -1,0 +1,51 @@
+--- Region cut history in the existing rule journal. Keys abstract the full
+--- firing frame plus structural region node. This is a bounded journal
+--- witness, not proof of region admission or selected-graph closure.
+mod WHIPPLESCRIPT-ACTION-REGION-JOURNAL is
+ protecting BOOL . protecting NAT .
+ sorts Key Phase History Latest Result .
+ ops f1r1 f1r2 f2r1 : -> Key [ctor] .
+ ops holding exited lapsed : -> Phase [ctor] .
+ op nil : -> History [ctor] .
+ op cut : Key Nat Phase History -> History [ctor] .
+ op absent : -> Latest [ctor] .
+ op at : Nat Phase -> Latest [ctor] .
+ op latest : History Key -> Latest .
+ op known : History Key Nat Phase -> Bool .
+ op newer : Latest Nat -> Bool .
+ op allowed : History Key Nat Phase -> Bool .
+ op write : History Key Nat Phase -> Result [ctor] .
+ op accepted : History -> Result [ctor] .
+ op refused : -> Result [ctor] .
+ vars K J : Key . vars N M : Nat . vars P Q : Phase . var H : History .
+ eq latest(nil, K) = absent .
+ eq latest(cut(J, M, Q, H), K) = if J == K then at(M, Q) else latest(H, K) fi .
+ eq known(nil, K, N, P) = false .
+ eq known(cut(J, M, Q, H), K, N, P) = (J == K and M == N and Q == P) or known(H, K, N, P) .
+ eq newer(absent, N) = true .
+ eq newer(at(M, Q), N) = Q == holding and N > M .
+ eq allowed(H, K, N, P) = known(H, K, N, P) or newer(latest(H, K), N) .
+ crl [exact-replay] : write(H, K, N, P) => accepted(H) if known(H, K, N, P) .
+ crl [append-cut] : write(H, K, N, P) => accepted(cut(K, N, P, H))
+   if allowed(H, K, N, P) and not known(H, K, N, P) .
+ crl [refuse-history-change] : write(H, K, N, P) => refused if not allowed(H, K, N, P) .
+endm
+
+mod WHIPPLESCRIPT-ACTION-REGION-JOURNAL-REOPENS is
+ including WHIPPLESCRIPT-ACTION-REGION-JOURNAL .
+ var H : History . var K : Key . var N : Nat . var P : Phase .
+ rl [forget-closed-state] : write(H, K, N, P) => accepted(cut(K, N, P, H)) .
+endm
+
+mod WHIPPLESCRIPT-ACTION-REGION-JOURNAL-ROLLS-BACK is
+ including WHIPPLESCRIPT-ACTION-REGION-JOURNAL .
+ var H : History . var K : Key . var N : Nat . var P : Phase .
+ crl [old-replay-replaces-latest] : write(H, K, N, P) => accepted(cut(K, N, P, nil))
+   if known(H, K, N, P) .
+endm
+
+mod WHIPPLESCRIPT-ACTION-REGION-JOURNAL-ALIASES-FIRINGS is
+ including WHIPPLESCRIPT-ACTION-REGION-JOURNAL .
+ var H : History . var N : Nat . var P : Phase .
+ rl [forget-firing] : write(H, f2r1, N, P) => write(H, f1r1, N, P) .
+endm

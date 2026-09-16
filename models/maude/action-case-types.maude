@@ -1,0 +1,29 @@
+--- Checked case types belong to the expanded node, not to object fields.
+mod WHIPPLESCRIPT-ACTION-CASE-TYPES is
+  protecting BOOL .
+  sorts Type Value State .
+  ops ticket other absent ambiguous : -> Type [ctor] .
+  ops validTicket spoofedStatus invalidTicket : -> Value [ctor] .
+  op select : Type Value Bool -> State [ctor] .
+  op decode : Bool -> State [ctor] .
+  ops ticketArm otherArm fallback decoded : -> State [ctor] .
+  rl [nominal] : select(ticket, validTicket, false) => ticketArm .
+  rl [field-is-not-type] : select(ticket, spoofedStatus, false) => ticketArm .
+  rl [coverage] : decode(true) => decoded .
+endm
+mod WHIPPLESCRIPT-ACTION-CASE-FORGED is
+  including WHIPPLESCRIPT-ACTION-CASE-TYPES .
+  rl [forged] : select(ticket, spoofedStatus, false) => otherArm .
+endm
+mod WHIPPLESCRIPT-ACTION-CASE-UNCHECKED is
+  including WHIPPLESCRIPT-ACTION-CASE-TYPES .
+  rl [unchecked-fallback] : select(ticket, invalidTicket, true) => fallback .
+endm
+mod WHIPPLESCRIPT-ACTION-CASE-UNTYPED is
+  including WHIPPLESCRIPT-ACTION-CASE-TYPES .
+  rl [guess] : select(ambiguous, validTicket, false) => ticketArm .
+endm
+mod WHIPPLESCRIPT-ACTION-CASE-INCOMPLETE is
+  including WHIPPLESCRIPT-ACTION-CASE-TYPES .
+  rl [incomplete] : decode(false) => decoded .
+endm

@@ -1,0 +1,29 @@
+--- DR-0100 §8.1: recorded dispatch is independent of the source default.
+--- `typed` as a source default represents the eventual rollout, not an
+--- implemented compiler in this bounded selection witness.
+mod WHIPPLESCRIPT-RECORDED-EXECUTION is
+  sorts Tag Pipeline Load .
+  ops absent legacyTag unknown malformed : -> Tag [ctor] .
+  ops legacy typed : -> Pipeline [ctor] .
+  op recorded : Tag Pipeline -> Load [ctor] .
+  op compiled : Pipeline -> Load [ctor] .
+  op refused : -> Load [ctor] .
+  var CURRENT : Pipeline .
+  rl [untagged-is-historical] : recorded(absent, CURRENT) => compiled(legacy) .
+  rl [explicit-path] : recorded(legacyTag, CURRENT) => compiled(legacy) .
+  rl [unsupported] : recorded(unknown, CURRENT) => refused .
+  rl [invalid-is-not-absent] : recorded(malformed, CURRENT) => refused .
+endm
+
+mod WHIPPLESCRIPT-RECORDED-USES-SOURCE-DEFAULT is
+  including WHIPPLESCRIPT-RECORDED-EXECUTION .
+  var CURRENT : Pipeline .
+  rl [current-for-untagged] : recorded(absent, CURRENT) => compiled(CURRENT) .
+  rl [fallback-for-unknown] : recorded(unknown, CURRENT) => compiled(CURRENT) .
+endm
+
+mod WHIPPLESCRIPT-RECORDED-CORRUPT-IS-ABSENT is
+  including WHIPPLESCRIPT-RECORDED-EXECUTION .
+  var CURRENT : Pipeline .
+  rl [erase-invalid-field] : recorded(malformed, CURRENT) => recorded(absent, CURRENT) .
+endm

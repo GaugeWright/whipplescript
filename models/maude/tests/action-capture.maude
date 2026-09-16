@@ -1,0 +1,13 @@
+load ../action-capture.maude
+search [1] in WHIPPLESCRIPT-ACTION-CAPTURE : captureFirst(journal(empty, empty), old) =>* saved(journal(captured(old), empty)) .
+search [1] in WHIPPLESCRIPT-ACTION-CAPTURE : captureFirst(journal(captured(old), empty), old) =>* saved(journal(captured(old), empty)) .
+search [1] in WHIPPLESCRIPT-ACTION-CAPTURE : captureFirst(journal(captured(old), empty), new) =>* refused .
+search [1] in WHIPPLESCRIPT-ACTION-CAPTURE : captureFirst(journal(captured(old), empty), new) =>* saved(journal(captured(new), empty)) .
+search [1] in WHIPPLESCRIPT-ACTION-REEVALUATES : captureFirst(journal(captured(old), empty), new) =>* saved(journal(captured(new), empty)) .
+search [1] in WHIPPLESCRIPT-ACTION-CAPTURE : captureSecond(journal(captured(old), empty), new) =>* saved(journal(captured(old), captured(new))) .
+search [1] in WHIPPLESCRIPT-ACTION-CAPTURE : captureSecond(journal(captured(old), empty), new) =>* saved(journal(captured(old), empty)) .
+search [1] in WHIPPLESCRIPT-ACTION-KEEPS-FIRST-COMMIT : captureSecond(journal(captured(old), empty), new) =>* saved(journal(captured(old), empty)) .
+search [1] in WHIPPLESCRIPT-ACTION-CAPTURE : guarded(old, new) =>* refused .
+search [1] in WHIPPLESCRIPT-ACTION-CAPTURE : guarded(old, new) =>* saved(journal(empty, empty)) .
+search [1] in WHIPPLESCRIPT-ACTION-IGNORES-FRONTIER : guarded(old, new) =>* saved(journal(empty, empty)) .
+quit

@@ -1,0 +1,17 @@
+load ../action-tell-values.maude
+search [1] in WHIPPLESCRIPT-ACTION-TELL-VALUES : admit(ready, ready, true) =>* drafted .
+search [1] in WHIPPLESCRIPT-ACTION-TELL-VALUES : admit(ready, pending, true) =>* drafted .
+search [1] in WHIPPLESCRIPT-ACTION-TELL-EARLY : admit(ready, pending, true) =>* drafted .
+search [1] in WHIPPLESCRIPT-ACTION-TELL-VALUES : admit(ready, ready, false) =>* drafted .
+search [1] in WHIPPLESCRIPT-ACTION-TELL-UNDECLARED : admit(ready, ready, false) =>* drafted .
+search [1] in WHIPPLESCRIPT-ACTION-TELL-VALUES : observe(completed) =>* published .
+search [1] in WHIPPLESCRIPT-ACTION-TELL-VALUES : observe(missingSummary) =>* published .
+search [1] in WHIPPLESCRIPT-ACTION-TELL-FAKE-VALUE : observe(missingSummary) =>* published .
+search [1] in WHIPPLESCRIPT-ACTION-TELL-VALUES : observe(failedTurn) =>* published .
+search [1] in WHIPPLESCRIPT-ACTION-TELL-VALUES : observe(uncertain) =>* published .
+search [1] in WHIPPLESCRIPT-ACTION-TELL-VALUES : render(false) =>* interpolated .
+search [1] in WHIPPLESCRIPT-ACTION-TELL-VALUES : render(true) =>* interpolated .
+search [1] in WHIPPLESCRIPT-ACTION-TELL-REEXPANSION : render(true) =>* interpolated .
+search [1] in WHIPPLESCRIPT-ACTION-TELL-VALUES : opening(true, false) =>* opened .
+search [1] in WHIPPLESCRIPT-ACTION-TELL-VALUES : opening(true, true) =>* opened .
+search [1] in WHIPPLESCRIPT-ACTION-TELL-DURABLE-PLAINTEXT : opening(true, true) =>* opened .

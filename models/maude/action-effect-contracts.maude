@@ -1,0 +1,30 @@
+mod WHIPPLESCRIPT-ACTION-EFFECT-CONTRACTS is
+  protecting BOOL .
+  sorts Resource Domain State .
+  ops noResource namedResource boundResource missingBinding : -> Resource [ctor] .
+  ops readerOnly readerWriter noTargets : -> Domain [ctor] .
+  op capture : Bool Bool Resource -> State [ctor] .
+  op tell : Domain Bool -> State [ctor] .
+  ops captured admitted refused : -> State [ctor] .
+  var R : Resource .
+  crl [complete] : capture(true, true, R) => captured if R =/= missingBinding .
+  rl [reader] : tell(readerOnly, false) => admitted .
+  rl [reader-domain] : tell(readerWriter, false) => admitted .
+  rl [writer-domain] : tell(readerWriter, true) => admitted .
+endm
+mod WHIPPLESCRIPT-ACTION-EFFECT-MISSING is
+  including WHIPPLESCRIPT-ACTION-EFFECT-CONTRACTS .
+  rl [missing-proof] : capture(false, true, noResource) => captured .
+endm
+mod WHIPPLESCRIPT-ACTION-EFFECT-ERASED is
+  including WHIPPLESCRIPT-ACTION-EFFECT-CONTRACTS .
+  rl [dropped-policy] : capture(true, false, noResource) => captured .
+endm
+mod WHIPPLESCRIPT-ACTION-EFFECT-RESOURCE is
+  including WHIPPLESCRIPT-ACTION-EFFECT-CONTRACTS .
+  rl [unknown-is-none] : capture(true, true, missingBinding) => captured .
+endm
+mod WHIPPLESCRIPT-ACTION-EFFECT-TARGET is
+  including WHIPPLESCRIPT-ACTION-EFFECT-CONTRACTS .
+  rl [outside-domain] : tell(readerOnly, true) => admitted .
+endm

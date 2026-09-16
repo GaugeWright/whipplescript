@@ -1,0 +1,117 @@
+--- DR-0100/DR-0104, inheriting DR-0043: a bounded region HISTORY, not
+--- an if/else. One held result site, one owned effect and its success
+--- continuation, one lapse result site, and one post-region result site.
+--- Each site may or may not supply a candidate. The held candidate can be
+--- selected while the owned effect is outstanding, so a later lapse must
+--- retain it. The region cannot close while that effect is unsettled.
+---
+--- This is a selection/ownership witness, NOT the source return checker or
+--- executable region admission. It abstracts condition observations into
+--- lapse transitions; fact-query evaluation, nested regions, failure recovery,
+--- candidate values/types, and the final action outcome are outside it.
+--- In particular closedLapse with a candidate is not a claim of success:
+--- acknowledged cancellation remains a cause under the action-boundary rules.
+
+fmod ACTION-REGION-RESULT-STATE is
+  protecting BOOL .
+  protecting NAT .
+  sorts Phase Worker Site Results Config .
+  ops entry holding settled exited lapsePending lapseSelected
+      closedClean closedLapse : -> Phase [ctor] .
+  ops absent running requested succeeded cancelled : -> Worker [ctor] .
+  ops heldResult afterResult lapseResult postResult : -> Site [ctor] .
+  op none : -> Results [ctor] .
+  op _;_ : Site Results -> Results [ctor] .
+  op choose : Bool Site Results -> Results .
+  op count : Results -> Nat .
+  op has : Site Results -> Bool .
+  op terminal : Worker -> Bool .
+  --- Booleans select which of the four sites supplies a result.
+  op frame : Phase Worker Bool Bool Bool Bool Results -> Config [ctor] .
+  op start : Bool Bool Bool Bool -> Config .
+  vars B A L P : Bool .
+  vars I J : Site .
+  var R : Results .
+  eq choose(true, I, R) = I ; R .
+  eq choose(false, I, R) = R .
+  eq count(none) = 0 .
+  eq count(I ; R) = 1 + count(R) .
+  eq has(I, none) = false .
+  eq has(I, J ; R) = (I == J) or has(I, R) .
+  eq terminal(absent) = true .
+  eq terminal(running) = false .
+  eq terminal(requested) = false .
+  eq terminal(succeeded) = true .
+  eq terminal(cancelled) = true .
+  eq start(B, A, L, P) = frame(entry, absent, B, A, L, P, none) .
+endfm
+
+mod WHIPPLESCRIPT-ACTION-REGION-RESULTS is
+  protecting ACTION-REGION-RESULT-STATE .
+  vars B A L P : Bool .
+  var R : Results .
+  var W : Worker .
+  var Q : Phase .
+  --- A holding observation admits the held candidate and the owned effect.
+  rl [enter-held] : frame(entry, absent, B, A, L, P, R)
+    => frame(holding, running, B, A, L, P, choose(B, heldResult, R)) .
+  rl [entry-lapse] : frame(entry, absent, B, A, L, P, R)
+    => frame(lapsePending, absent, B, A, L, P, R) .
+  rl [effect-succeeds] : frame(holding, running, B, A, L, P, R)
+    => frame(settled, succeeded, B, A, L, P, R) .
+  --- Settlement and admission of its continuation are distinct events.
+  rl [held-continuation] : frame(settled, succeeded, B, A, L, P, R)
+    => frame(exited, succeeded, B, A, L, P, choose(A, afterResult, R)) .
+  rl [in-flight-lapse] : frame(holding, running, B, A, L, P, R)
+    => frame(lapsePending, requested, B, A, L, P, R) .
+  rl [settled-lapse] : frame(settled, succeeded, B, A, L, P, R)
+    => frame(lapsePending, succeeded, B, A, L, P, R) .
+  rl [select-lapse] : frame(lapsePending, W, B, A, L, P, R)
+    => frame(lapseSelected, W, B, A, L, P, choose(L, lapseResult, R)) .
+  --- Cancellation acknowledgement may race a successful provider outcome.
+  --- Neither can select the now-abandoned held continuation.
+  rl [acknowledge-cancel] : frame(Q, requested, B, A, L, P, R)
+    => frame(Q, cancelled, B, A, L, P, R) .
+  rl [late-success] : frame(Q, requested, B, A, L, P, R)
+    => frame(Q, succeeded, B, A, L, P, R) .
+  rl [post-clean-exit] : frame(exited, succeeded, B, A, L, P, R)
+    => frame(closedClean, succeeded, B, A, L, P, choose(P, postResult, R)) .
+  crl [close-lapse] : frame(lapseSelected, W, B, A, L, P, R)
+    => frame(closedLapse, W, B, A, L, P, R) if terminal(W) .
+endm
+
+mod WHIPPLESCRIPT-ACTION-REGION-ERASES-HISTORY is
+  including WHIPPLESCRIPT-ACTION-REGION-RESULTS .
+  vars B A L P : Bool . var R : Results .
+  rl [forget-held-result] : frame(holding, running, B, A, L, P, R)
+    => frame(lapsePending, requested, B, A, L, P, none) .
+endm
+
+mod WHIPPLESCRIPT-ACTION-REGION-POST-ON-LAPSE is
+  including WHIPPLESCRIPT-ACTION-REGION-RESULTS .
+  vars B A L P : Bool . var R : Results . var W : Worker .
+  crl [lapse-is-clean-exit] : frame(lapseSelected, W, B, A, L, P, R)
+    => frame(closedLapse, W, B, A, L, P, choose(P, postResult, R)) if terminal(W) .
+endm
+
+mod WHIPPLESCRIPT-ACTION-REGION-LATE-CONTINUATION is
+  including WHIPPLESCRIPT-ACTION-REGION-RESULTS .
+  vars B A L P : Bool . var R : Results . var Q : Phase .
+  rl [late-outcome-fires] : frame(Q, requested, B, A, L, P, R)
+    => frame(Q, succeeded, B, A, L, P, choose(A, afterResult, R)) .
+endm
+
+mod WHIPPLESCRIPT-ACTION-REGION-REQUEST-IS-ACK is
+  including WHIPPLESCRIPT-ACTION-REGION-RESULTS .
+  vars B A L P : Bool . var R : Results .
+  rl [premature-closure] : frame(lapseSelected, requested, B, A, L, P, R)
+    => frame(closedLapse, requested, B, A, L, P, R) .
+endm
+
+mod WHIPPLESCRIPT-ACTION-REGION-REPEATS-LAPSE is
+  including WHIPPLESCRIPT-ACTION-REGION-RESULTS .
+  vars B A L P : Bool . var R : Results . var W : Worker .
+  --- Bounded duplicate, to keep unrestricted negative searches finite.
+  crl [duplicate-lapse] : frame(lapseSelected, W, B, A, L, P, R)
+    => frame(closedLapse, W, B, A, L, P, choose(L, lapseResult, R)) if terminal(W) .
+endm

@@ -1,0 +1,24 @@
+--- Closure is derived from the selected continuation graph, not only effects.
+mod WHIPPLESCRIPT-ACTION-PROGRESSION is
+  sorts Effect Continuation Child Cfg .
+  ops pending settled : -> Effect [ctor] .
+  ops waiting visited : -> Continuation [ctor] .
+  ops absent running resultReady complete unselected : -> Child [ctor] .
+  op progress : Effect Continuation Child -> Cfg [ctor] .
+  op success : -> Cfg [ctor] .
+  var C : Continuation . var K : Child .
+  rl [settle-source] : progress(pending, C, K) => progress(settled, C, K) .
+  rl [visit-after] : progress(settled, waiting, absent) => progress(settled, visited, running) .
+  rl [child-result] : progress(settled, visited, running) => progress(settled, visited, resultReady) .
+  rl [child-drained] : progress(settled, visited, resultReady) => progress(settled, visited, complete) .
+  rl [joined-child] : progress(settled, visited, complete) => success .
+  rl [no-unselected-debt] : progress(settled, visited, unselected) => success .
+endm
+mod WHIPPLESCRIPT-ACTION-CLOSES-BEFORE-AFTER is
+  including WHIPPLESCRIPT-ACTION-PROGRESSION .
+  rl [ignore-continuation] : progress(settled, waiting, absent) => success .
+endm
+mod WHIPPLESCRIPT-ACTION-PUBLISHES-CHILD-RESULT is
+  including WHIPPLESCRIPT-ACTION-PROGRESSION .
+  rl [skip-child-work] : progress(settled, visited, resultReady) => success .
+endm

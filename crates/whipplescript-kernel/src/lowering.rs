@@ -29,6 +29,7 @@ pub struct OwnedFact {
     pub provenance_class: String,
     pub correlation_id: Option<String>,
     pub source_span_json: Option<String>,
+    pub validity_json: Option<String>,
 }
 
 impl OwnedFact {
@@ -42,6 +43,7 @@ impl OwnedFact {
             provenance_class: &self.provenance_class,
             correlation_id: self.correlation_id.as_deref(),
             source_span_json: self.source_span_json.as_deref(),
+            validity_json: self.validity_json.as_deref(),
         }
     }
 }
@@ -106,6 +108,7 @@ pub struct OwnedWorkflowTerminal {
     pub kind: WorkflowTerminalKind,
     pub name: String,
     pub payload_json: String,
+    pub validity_json: Option<String>,
     pub idempotency_key: String,
 }
 
@@ -115,6 +118,7 @@ impl OwnedWorkflowTerminal {
             kind: self.kind,
             name: &self.name,
             payload_json: &self.payload_json,
+            validity_json: self.validity_json.as_deref(),
             idempotency_key: Some(&self.idempotency_key),
         }
     }
@@ -125,6 +129,13 @@ impl OwnedWorkflowTerminal {
 /// reports, any lowering errors, cancel targets, and the 503 auto-fail signal.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct OwnedLowering {
+    /// Admitted root values, captured with this lowering in the rule journal.
+    pub action_root: Option<crate::source_action::journal::root::RootCapture>,
+    /// Local call evaluations. Neither root nor call captures are facts or
+    /// external effect admissions.
+    pub action_captures: Vec<crate::source_action::journal::CallCapture>,
+    /// Structural region evaluation cuts, committed with the same root/calls.
+    pub action_regions: Vec<crate::source_action::journal::regions::Cut>,
     pub facts: Vec<OwnedFact>,
     pub consumed_fact_ids: Vec<String>,
     pub effects: Vec<OwnedEffect>,
@@ -146,6 +157,21 @@ pub struct OwnedLowering {
     /// (recorded idempotently per effect in rule_pass) and the service keeps
     /// running.
     pub unhandled_failures: Vec<OwnedUnhandledFailure>,
+}
+
+impl OwnedLowering {
+    pub fn has_commit_work(&self) -> bool {
+        self.action_root.is_some()
+            || !self.action_captures.is_empty()
+            || !self.action_regions.is_empty()
+            || !self.facts.is_empty()
+            || !self.consumed_fact_ids.is_empty()
+            || !self.effects.is_empty()
+            || !self.dependencies.is_empty()
+            || !self.cancels.is_empty()
+            || self.terminal.is_some()
+            || self.internal_fail.is_some()
+    }
 }
 
 /// One unhandled effect failure observed by the rule-level auto-fail net in a

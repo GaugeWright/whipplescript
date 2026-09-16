@@ -1,0 +1,95 @@
+--- A lexical action failure handler is selected only for an unrecovered
+--- protected failure after admitted protected work settles. Recovery requires
+--- an authored return, settlement of handler-owned work and the complete cause
+--- aggregate. A handler failure propagates without selecting the same handler
+--- again. Source graph traversal and aggregate payload typing are separate.
+mod WHIPPLESCRIPT-LEXICAL-FAILURE-HANDLER is
+  protecting BOOL .
+  sorts Outcome LocalRecovery Work Handler Causes State .
+  ops succeeded failed : -> Outcome [ctor] .
+  ops unrecovered recovered : -> LocalRecovery [ctor] .
+  ops joined pending requested uncertain : -> Work [ctor] .
+  ops dormant returning broken observed : -> Handler [ctor] .
+  ops complete lost : -> Causes [ctor] .
+  op boundary : Outcome LocalRecovery Work Handler Work Causes -> State [ctor] .
+  ops recoveredResult propagatesResult waitingResult dormantResult duplicateHandler : -> State [ctor] .
+
+  vars L : LocalRecovery . vars W HW : Work . vars H : Handler . vars C : Causes .
+  rl [successful-scope] : boundary(succeeded, L, W, H, HW, C) => dormantResult .
+  rl [locally-recovered] : boundary(failed, recovered, joined, dormant, joined, C) => dormantResult .
+  rl [protected-pending] : boundary(failed, unrecovered, pending, H, HW, C) => waitingResult .
+  rl [protected-cancellation] : boundary(failed, unrecovered, requested, H, HW, C) => waitingResult .
+  rl [protected-uncertain] : boundary(failed, unrecovered, uncertain, H, HW, C) => waitingResult .
+  rl [handler-pending] : boundary(failed, unrecovered, joined, returning, pending, C) => waitingResult .
+  rl [handler-cancellation] : boundary(failed, unrecovered, joined, returning, requested, C) => waitingResult .
+  rl [handler-uncertain] : boundary(failed, unrecovered, joined, returning, uncertain, C) => waitingResult .
+  rl [recover] : boundary(failed, unrecovered, joined, returning, joined, complete) => recoveredResult .
+  rl [handler-failed] : boundary(failed, unrecovered, joined, broken, HW, C) => propagatesResult .
+  rl [observation-only] : boundary(failed, unrecovered, joined, observed, HW, C) => propagatesResult .
+endm
+
+--- The outer rule boundary translates a remaining failure according to the
+--- workflow lifecycle. Services retain one diagnostic for every cause;
+--- terminating workflows fail; direct authored cancellation remains separate.
+mod WHIPPLESCRIPT-RULE-FAILURE-BOUNDARY is
+  protecting BOOL .
+  sorts WorkflowKind OuterOutcome CauseKind CauseCount OuterState .
+  ops terminating service : -> WorkflowKind [ctor] .
+  ops outerSucceeded outerFailed : -> OuterOutcome [ctor] .
+  ops ordinary deliberateCancellation : -> CauseKind [ctor] .
+  ops one multiple : -> CauseCount [ctor] .
+  op outer : WorkflowKind OuterOutcome CauseKind CauseCount -> OuterState [ctor] .
+  ops terminalFailure continuingDiagnostic continuingDiagnostics noOuterAction cancellationResult : -> OuterState [ctor] .
+
+  vars W : WorkflowKind . vars K : CauseKind . vars C : CauseCount .
+  rl [successful-firing] : outer(W, outerSucceeded, K, C) => noOuterAction .
+  rl [direct-cancellation] : outer(W, outerFailed, deliberateCancellation, C) => cancellationResult .
+  rl [terminating-failure] : outer(terminating, outerFailed, ordinary, C) => terminalFailure .
+  rl [service-one-cause] : outer(service, outerFailed, ordinary, one) => continuingDiagnostic .
+  rl [service-many-causes] : outer(service, outerFailed, ordinary, multiple) => continuingDiagnostics .
+endm
+
+mod WHIPPLESCRIPT-RULE-FAILURE-SERVICE-TERMINATES is
+  including WHIPPLESCRIPT-RULE-FAILURE-BOUNDARY .
+  rl [service-terminates] : outer(service, outerFailed, ordinary, one) => terminalFailure .
+endm
+
+mod WHIPPLESCRIPT-RULE-FAILURE-TERMINATING-CONTINUES is
+  including WHIPPLESCRIPT-RULE-FAILURE-BOUNDARY .
+  rl [terminating-continues] : outer(terminating, outerFailed, ordinary, one) => continuingDiagnostic .
+endm
+
+mod WHIPPLESCRIPT-RULE-FAILURE-CANCELS-FAIL is
+  including WHIPPLESCRIPT-RULE-FAILURE-BOUNDARY .
+  rl [cancel-auto-fails] : outer(terminating, outerFailed, deliberateCancellation, one) => terminalFailure .
+endm
+
+mod WHIPPLESCRIPT-RULE-FAILURE-COLLAPSES-CAUSES is
+  including WHIPPLESCRIPT-RULE-FAILURE-BOUNDARY .
+  rl [collapse-causes] : outer(service, outerFailed, ordinary, multiple) => continuingDiagnostic .
+endm
+
+mod WHIPPLESCRIPT-LEXICAL-HANDLER-EARLY is
+  including WHIPPLESCRIPT-LEXICAL-FAILURE-HANDLER .
+  rl [early-recovery] : boundary(failed, unrecovered, pending, returning, joined, complete) => recoveredResult .
+endm
+
+mod WHIPPLESCRIPT-LEXICAL-HANDLER-STEALS-LOCAL is
+  including WHIPPLESCRIPT-LEXICAL-FAILURE-HANDLER .
+  rl [steal-local] : boundary(failed, recovered, joined, returning, joined, complete) => recoveredResult .
+endm
+
+mod WHIPPLESCRIPT-LEXICAL-HANDLER-OBSERVATION is
+  including WHIPPLESCRIPT-LEXICAL-FAILURE-HANDLER .
+  rl [observation-recovers] : boundary(failed, unrecovered, joined, observed, joined, complete) => recoveredResult .
+endm
+
+mod WHIPPLESCRIPT-LEXICAL-HANDLER-REENTRY is
+  including WHIPPLESCRIPT-LEXICAL-FAILURE-HANDLER .
+  rl [reenter] : boundary(failed, unrecovered, joined, broken, joined, complete) => duplicateHandler .
+endm
+
+mod WHIPPLESCRIPT-LEXICAL-HANDLER-LOSES-CAUSES is
+  including WHIPPLESCRIPT-LEXICAL-FAILURE-HANDLER .
+  rl [lose-causes] : boundary(failed, unrecovered, joined, returning, joined, lost) => recoveredResult .
+endm

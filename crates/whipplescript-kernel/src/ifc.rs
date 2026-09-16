@@ -22,7 +22,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 use whipplescript_parser::{
-    diagnostic_code, Diagnostic, IrEffectKind, IrEffectNode, IrProgram, IrRule,
+    diagnostic_code, suggest, Diagnostic, IrEffectKind, IrEffectNode, IrProgram, IrRule,
     IrWorkflowContractKind, QueryKind, RelatedInfo, Severity,
 };
 
@@ -31,6 +31,66 @@ use crate::host_policy::{PlacementPolicy, ProviderBindingPolicy};
 #[cfg(test)]
 mod failure_egress;
 mod resource_flow;
+/// The caller has structurally validated this plan and node before reporting.
+fn managed_call_context(
+    diagnostic: &mut Diagnostic,
+    plan: &whipplescript_parser::action_plan::ActionPlan,
+    id: whipplescript_parser::action_plan::NodeId,
+) {
+    let node = &plan.nodes[id.0];
+    let mut scope = match node.kind {
+        whipplescript_parser::action_plan::NodeKind::Call { scope, .. } => Some(scope),
+        _ => plan.blocks[node.block.0].scope,
+    };
+    while let Some(id) = scope {
+        let owner = &plan.scopes[id.0];
+        diagnostic.related.push(RelatedInfo {
+            span: owner.definition_span,
+            message: format!("action `{}` defined here", owner.action),
+        });
+        let Some(call) = owner.parent_call else {
+            break;
+        };
+        let caller = &plan.nodes[call.0];
+        diagnostic.related.push(RelatedInfo {
+            span: caller.span,
+            message: format!("call to action `{}`", owner.action),
+        });
+        scope = plan.blocks[caller.block.0].scope;
+    }
+}
+
+mod authority_policy;
+mod claim_endorsement;
+mod claim_policy;
+mod composition_authority;
+mod composition_bodies;
+mod composition_fields;
+mod composition_selectors;
+mod fact_producers;
+mod program_context;
+mod projection_policy;
+mod selector_policy;
+mod source_flow;
+mod source_inputs;
+mod source_reads;
+pub use composition_bodies::{
+    analyze as analyze_composition_bodies, CompositionBodies, RuleBodyAnalysis,
+};
+mod managed_resources;
+pub use managed_resources::{
+    resolve as resolve_managed_effect_resources, ResolvedEffect as ManagedEffectResources,
+};
+mod output_integrity;
+pub use output_integrity::managed::sinks::{
+    inventory as managed_statement_executor_sinks, Inventory as ManagedStatementSinks,
+    OwnedSink as ManagedOwnedSink,
+};
+pub use output_integrity::managed::{
+    check_sink as check_managed_executor_sink, Sink as ManagedExecutorSink,
+};
+mod provider_egress;
+pub use provider_egress::check_managed as check_managed_provider_egress;
 
 /// The bottom reader-authority: data readable by `public` is readable by anyone,
 /// and `public` itself holds no authority above itself.
@@ -1960,25 +2020,6 @@ impl Envelope {
         label_text(&self.reader_set(resource))
     }
 
-    /// The reader-authority of a `redact <source> keep [..]` PROJECTION: the JOIN
-    /// (union of compartments — a combined value is readable only by a party cleared
-    /// for every part) of the kept fields' per-field labels. Per-field labels are
-    /// envelope resources keyed `<schema>.<field>` (e.g. `Customer.ssn`), so an
-    /// unlabeled field is public and `keep`ing only public fields yields a public
-    /// projection — exactly the per-field non-interference proven in
-    /// `models/lean/Whipple/Redaction.lean` (`canRead_redact`) and
-    /// `models/maude/infoflow-redaction.maude` (`projReaders`). Keeping every field
-    /// recovers the whole-record join (`redact_keep_all` = the opaque box). The
-    /// dropped fields never contribute — they are physically removed at runtime, so
-    /// they cannot leak.
-    fn projected_reader_set(&self, schema: &str, keep: &[String]) -> BTreeSet<String> {
-        let mut readers = BTreeSet::new();
-        for field in keep {
-            readers.extend(self.reader_set(&format!("{schema}.{field}")));
-        }
-        readers
-    }
-
     /// `provider` DOMINATES `required` iff every required compartment is covered by
     /// some provider compartment (via acts-for) — the leak/inject decision, proven
     /// sound in `ReaderSets.lean` (`leak_safe`). An empty `required` is vacuously
@@ -2671,7 +2712,7 @@ fn emitted_signal_ports(rule: &IrRule) -> Vec<String> {
         .effects
         .iter()
         .filter(|effect| effect_flow(&effect.kind).emits_stream)
-        .filter_map(|effect| effect.resource.clone())
+        .flat_map(|effect| effect.resources.iter().cloned())
         .filter(|resource| resource.starts_with("signal:"))
         .collect()
 }
@@ -2751,19 +2792,22 @@ fn is_egress_op(operation: &str) -> bool {
 /// — an MCP server, `web`, `command` — whose operation names belong to someone
 /// else and mean nothing here.
 fn declared_resources(ir: &IrProgram) -> BTreeSet<&str> {
+    declared_resources_in(program_context::ProgramContext::Legacy(ir))
+}
+fn declared_resources_in(ir: program_context::ProgramContext<'_>) -> BTreeSet<&str> {
     let mut names = BTreeSet::new();
-    names.extend(ir.file_stores.iter().map(|r| r.name.as_str()));
-    names.extend(ir.trackers.iter().map(|r| r.name.as_str()));
-    names.extend(ir.ledgers.iter().map(|r| r.name.as_str()));
-    names.extend(ir.channels.iter().map(|r| r.name.as_str()));
-    names.extend(ir.memory_pools.iter().map(|r| r.name.as_str()));
-    names.extend(ir.counters.iter().map(|r| r.name.as_str()));
-    names.extend(ir.leases.iter().map(|r| r.name.as_str()));
-    names.extend(ir.streams.iter().map(|r| r.name.as_str()));
+    names.extend(ir.file_stores().iter().map(|r| r.name.as_str()));
+    names.extend(ir.trackers().iter().map(|r| r.name.as_str()));
+    names.extend(ir.ledgers().iter().map(|r| r.name.as_str()));
+    names.extend(ir.channels().iter().map(|r| r.name.as_str()));
+    names.extend(ir.memory_pools().iter().map(|r| r.name.as_str()));
+    names.extend(ir.counters().iter().map(|r| r.name.as_str()));
+    names.extend(ir.leases().iter().map(|r| r.name.as_str()));
+    names.extend(ir.streams().iter().map(|r| r.name.as_str()));
     // A credential is a declared resource too: `request` names one as its
     // egress sink, so the grant vocabulary that classifies operations on
     // declared resources has to see it as declared.
-    names.extend(ir.credentials.iter().map(|r| r.name.as_str()));
+    names.extend(ir.credentials().iter().map(|r| r.name.as_str()));
     names
 }
 
@@ -2822,19 +2866,19 @@ fn is_coordination_effect(kind: &IrEffectKind) -> bool {
 /// decided what it does to the flow.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct EffectFlow {
-    /// External data comes IN through `effect.resource`. The rule performing
+    /// External data comes IN through `effect.resources`. The rule performing
     /// the effect has read that resource: its integrity drops to the meet with
     /// the resource's, and the acting principal must be cleared for it.
     reads_resource: bool,
-    /// Rule data goes OUT through `effect.resource`. The resource is a sink, so
+    /// Rule data goes OUT through `effect.resources`. Each resource is a sink, so
     /// anything the rule read whose readers exceed the sink's leaks there.
     writes_resource: bool,
     /// The effect pushes the broadcast `stream` sink rather than its own
     /// resource: the durable session-event log and the telemetry export both
     /// observe it (E2), and `stream` is unlabeled-public by default.
     emits_stream: bool,
-    /// The effect's OUTPUT BINDING is attributable to `effect.resource` — a
-    /// value the effect produced carries that resource as its provenance root.
+    /// The effect's OUTPUT BINDING is attributable to `effect.resources` — a
+    /// value the effect produced carries those resources as its provenance roots.
     ///
     /// Deliberately NARROWER than `reads_resource`, and the difference is not
     /// an oversight: a `request`, an `exec` or a turn also brings data in, but
@@ -2949,10 +2993,10 @@ fn effect_flow(kind: &IrEffectKind) -> EffectFlow {
         // emit/notify publish an event to the durable log, which the DR-0026
         // session-event stream and the telemetry export both observe (E2, the
         // last two of the five doors). The sink is `stream`, not
-        // `effect.resource` — which for these names the signal port.
+        // `effect.resources` — which for these names the signal port.
         IrEffectKind::EventEmit | IrEffectKind::SignalEmit => EffectFlow::STREAM,
         // `AgentTell` egresses to its agent's PROVIDER, which is a different
-        // resource from `effect.resource`; the provider-egress block in
+        // resource from `effect.resources`; the provider-egress block in
         // `check_with_envelope` reads the agent declaration to find it.
         IrEffectKind::AgentTell => EffectFlow::NONE,
         // `SchemaCoerce` egresses to `model`, resolved through the
@@ -2965,27 +3009,31 @@ fn effect_flow(kind: &IrEffectKind) -> EffectFlow {
 }
 
 fn shared_coordination_resources(ir: &IrProgram) -> BTreeSet<String> {
-    if !ir.shared_coordination_usage.is_empty() {
+    shared_coordination_resources_in(program_context::ProgramContext::Legacy(ir))
+}
+
+fn shared_coordination_resources_in(ir: program_context::ProgramContext<'_>) -> BTreeSet<String> {
+    if !ir.shared_coordination_usage().is_empty() {
         return ir
-            .shared_coordination_usage
+            .shared_coordination_usage()
             .iter()
             .filter(|usage| usage.workflow_principals.len() >= 2)
             .map(|usage| usage.resource.clone())
             .collect();
     }
 
-    ir.leases
+    ir.leases()
         .iter()
         .filter(|lease| lease.shared)
         .map(|lease| format!("resource:{}", lease.name))
         .chain(
-            ir.ledgers
+            ir.ledgers()
                 .iter()
                 .filter(|ledger| ledger.shared)
                 .map(|ledger| format!("resource:{}", ledger.name)),
         )
         .chain(
-            ir.counters
+            ir.counters()
                 .iter()
                 .filter(|counter| counter.shared)
                 .map(|counter| format!("resource:{}", counter.name)),
@@ -3137,12 +3185,23 @@ fn endpoint_doors_for_effect(ir: &IrProgram, effect: &IrEffectNode) -> Vec<Strin
     }
 }
 
-fn ifc_resource_for_effect<'a>(
+fn ifc_resources_for_effect<'a>(
     effect: &'a IrEffectNode,
     shared_coordination: &BTreeSet<String>,
+) -> Vec<&'a str> {
+    effect
+        .resources
+        .iter()
+        .filter_map(|resource| resource_for_ifc(&effect.kind, resource, shared_coordination))
+        .collect()
+}
+
+fn resource_for_ifc<'a>(
+    kind: &IrEffectKind,
+    resource: &'a str,
+    shared_coordination: &BTreeSet<String>,
 ) -> Option<&'a str> {
-    let resource = effect.resource.as_deref()?;
-    if is_coordination_effect(&effect.kind) && !shared_coordination.contains(resource) {
+    if is_coordination_effect(kind) && !shared_coordination.contains(resource) {
         return None;
     }
     Some(resource)
@@ -3163,9 +3222,7 @@ fn effect_read_resources<'a>(
         }
     }
     if effect_flow(&effect.kind).reads_resource {
-        ifc_resource_for_effect(effect, shared_coordination)
-            .into_iter()
-            .collect()
+        ifc_resources_for_effect(effect, shared_coordination)
     } else {
         Vec::new()
     }
@@ -3188,7 +3245,7 @@ fn selected_effect_integrity_sinks(
         .map(str::to_owned)
         .collect();
     let flow = effect_flow(&effect.kind);
-    if let Some(resource) = ifc_resource_for_effect(effect, shared_coordination) {
+    for resource in ifc_resources_for_effect(effect, shared_coordination) {
         if flow.writes_resource {
             sinks.push(resource.to_owned());
         }
@@ -3624,17 +3681,28 @@ pub const UNNAMED_COERCE_BACKEND: &str = "model";
 /// ladder at runtime and has no static identity, so it keeps
 /// [`UNNAMED_COERCE_BACKEND`].
 fn coerce_egress_principal<'a>(ir: &'a IrProgram, effect: &'a IrEffectNode) -> &'a str {
-    effect
-        .prompt_provider
-        .as_deref()
-        .or_else(|| {
-            effect.coerce_target.as_deref().and_then(|name| {
-                ir.coerces
-                    .iter()
-                    .find(|decl| decl.name == name)
-                    .and_then(|decl| decl.provider.as_deref())
-            })
-        })
+    coerce_principal(
+        effect.prompt_provider.as_deref(),
+        effect.coerce_target.as_deref().and_then(|name| {
+            ir.coerces
+                .iter()
+                .find(|declaration| declaration.name == name)
+        }),
+    )
+}
+
+/// The same answer for a caller that has already resolved the declaration.
+/// The managed walk reaches a coercion through its contract and its program
+/// context rather than through an `IrEffectNode` and an `IrProgram`, so it
+/// cannot call the adapter above -- and a second body computing "the endpoint
+/// this coercion reaches" is exactly the drift the doc above says this
+/// function exists to prevent. One body, two ways in.
+pub(crate) fn coerce_principal<'a>(
+    prompt_provider: Option<&'a str>,
+    declaration: Option<&'a whipplescript_parser::IrCoerce>,
+) -> &'a str {
+    prompt_provider
+        .or_else(|| declaration.and_then(|declaration| declaration.provider.as_deref()))
         .unwrap_or(UNNAMED_COERCE_BACKEND)
 }
 
@@ -4327,7 +4395,7 @@ fn when_binding_facts(rule: &IrRule) -> BTreeMap<String, String> {
 /// egresses (`complete` bindings, `fact:<Schema>` record sinks, or `send`
 /// channels): a sink whose payload references ONLY redaction outputs (each with a
 /// resolvable source schema) must have its own label dominate the JOIN of those
-/// projections' kept-field labels (`projected_reader_set`) — else keeping a
+/// projections' kept-field labels (`projection_policy`) — else keeping a
 /// too-sensitive field is flagged (naming it). This is PURELY ADDITIVE: it does
 /// NOT exempt the egress from the conservative read×sink leak check. The kept
 /// fields carry data derived from the rule's READS, whose provenance the schema
@@ -4359,55 +4427,12 @@ fn fact_reach_map(
 ) -> BTreeMap<String, BTreeSet<String>> {
     let shared_coordination = shared_coordination_resources(ir);
     let token = |schema: &str| format!("fact:{schema}");
-    // The label token is ORIGIN-AWARE. Seeds, inputs, and unattributable
-    // producer roots are program/operator-authored content: their token means
-    // "the declared label applies" and is inert when the schema is ungoverned
-    // (an ungoverned seed must not make its consumers untrusted — seeds are
-    // source text, not attacker data). An `@external` arrival is the outside
-    // world: its token is kept even ungoverned, so the empty label reads as
-    // public + UNTRUSTED — fail-closed exactly like an unlabeled channel.
-    let governed_token = |schema: &str| -> Option<String> {
-        let t = token(schema);
-        envelope
-            .governed
-            .contains(envelope.resolve(&t))
-            .then_some(t)
-    };
-    let mut reach: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-    for contract in &ir.workflow_contracts {
-        if contract.kind == IrWorkflowContractKind::Input {
-            if let whipplescript_parser::IrType::Ref(name) = &contract.ty {
-                if schema_names.contains(name.as_str()) {
-                    if let Some(t) = governed_token(name) {
-                        reach.entry(name.clone()).or_default().insert(t);
-                    }
-                }
-            }
-        }
-    }
-    let external_rules: BTreeSet<&str> = ir
-        .source_tags
-        .iter()
-        .filter(|tag| tag.name == "external" && tag.target_kind == "rule")
-        .map(|tag| tag.target.as_str())
-        .collect();
-    for rule in &ir.rules {
-        if !external_rules.contains(rule.name.as_str()) {
-            continue;
-        }
-        // @external: the token is kept even for an ungoverned schema (see
-        // governed_token above) — external content is untrusted by default.
-        for when in &rule.whens {
-            if let Some(head) = when.pattern.split_whitespace().next() {
-                if schema_names.contains(head) {
-                    reach
-                        .entry(head.to_owned())
-                        .or_default()
-                        .insert(token(head));
-                }
-            }
-        }
-    }
+    let governed_token = |schema: &str| fact_producers::governed_token(schema, envelope);
+    let mut reach = fact_producers::initial(
+        program_context::ProgramContext::Legacy(ir),
+        envelope,
+        schema_names,
+    );
     let agent_provider: BTreeMap<&str, &str> = ir
         .agents
         .iter()
@@ -4541,8 +4566,16 @@ fn trigger_source_map(
     schema_names: &BTreeSet<&str>,
     fact_reach: &BTreeMap<String, BTreeSet<String>>,
 ) -> BTreeMap<String, BTreeSet<String>> {
+    trigger_source_map_whens(&rule.whens, signal_names, schema_names, fact_reach)
+}
+fn trigger_source_map_whens(
+    whens: &[whipplescript_parser::IrWhen],
+    signal_names: &BTreeSet<&str>,
+    schema_names: &BTreeSet<&str>,
+    fact_reach: &BTreeMap<String, BTreeSet<String>>,
+) -> BTreeMap<String, BTreeSet<String>> {
     let mut map = BTreeMap::new();
-    for when in &rule.whens {
+    for when in whens {
         let pattern = when.pattern.trim_start();
         let tokens: Vec<&str> = pattern.split_whitespace().collect();
         let Some(alias_at) = tokens.iter().position(|tok| *tok == "as") else {
@@ -4635,10 +4668,7 @@ fn resolve_root_sources(
         if !effect_flow(&effect.kind).resource_is_output_provenance {
             return None;
         }
-        return effect
-            .resource
-            .as_ref()
-            .map(|resource| BTreeSet::from([resource.clone()]));
+        return (!effect.resources.is_empty()).then(|| effect.resources.iter().cloned().collect());
     }
     trigger_sources.get(base).cloned()
 }
@@ -4704,10 +4734,22 @@ fn output_tokens_for_root(
         return;
     }
     let Some(effect) = effect_by_binding.get(base) else {
+        // A pure declassification release carries bytes without becoming a
+        // new executor or an integrity endorsement.
+        if let Some(inputs) = metadata.carried_input_roots.get(base) {
+            for input in inputs {
+                output_tokens_for_root(lookup, input, crossed, visited, out);
+            }
+        }
         return;
     };
-    match effect.kind {
-        IrEffectKind::AgentTell => {
+    match output_integrity::transfer(
+        &effect.kind,
+        effect.endorsed,
+        effect.exec_target.as_ref(),
+        metadata.carried_input_roots.contains_key(base),
+    ) {
+        output_integrity::Transfer::Agent => {
             let handle = effect
                 .agent
                 .as_deref()
@@ -4715,58 +4757,18 @@ fn output_tokens_for_root(
                 .unwrap_or("provider:unknown");
             out.push((handle.to_owned(), crossed));
         }
-        IrEffectKind::SchemaCoerce => {
-            if effect.endorsed {
-                // The judgment: recurse into the coercion's inputs, crossing
-                // armed — the grant targets the executor being endorsed.
-                if let Some(arg_roots) = metadata.carried_input_roots.get(base) {
-                    for arg_root in arg_roots {
-                        output_tokens_for_root(lookup, arg_root, true, visited, out);
-                    }
+        output_integrity::Transfer::Inputs { endorsed } => {
+            if let Some(arg_roots) = metadata.carried_input_roots.get(base) {
+                for arg_root in arg_roots {
+                    output_tokens_for_root(lookup, arg_root, crossed || endorsed, visited, out);
                 }
-            } else {
-                out.push((coerce_egress_principal(ir, effect).to_owned(), crossed));
             }
         }
-        IrEffectKind::ExecCommand => {
-            // `None` cannot happen for an exec node, and an exec vouched by
-            // nobody is the honest reading if it ever did.
-            let handle = effect
-                .exec_target
-                .as_ref()
-                .map(whipplescript_parser::IrExecTarget::principal)
-                .unwrap_or_else(|| whipplescript_parser::IrExecTarget::Raw.principal());
-            out.push((handle, crossed));
+        output_integrity::Transfer::CoerceEgress => {
+            out.push((coerce_egress_principal(ir, effect).to_owned(), crossed));
         }
-        // Everything else is not an effect OUTPUT: the binding it produces
-        // carries no executing principal whose `from` clearance could be the
-        // output's provided integrity. Named rather than left to a wildcard,
-        // because "contributes nothing" is a decision about each kind and a new
-        // one must make it deliberately — a wildcard here would silently give a
-        // new executor no token, which reads downstream as "vouched by nobody
-        // and produced by nobody" rather than as an unattributed executor.
-        IrEffectKind::CapabilityCall
-        | IrEffectKind::EventEmit
-        | IrEffectKind::WorkflowInvoke
-        | IrEffectKind::TimerWait
-        | IrEffectKind::HttpRequest
-        | IrEffectKind::MintCredential
-        | IrEffectKind::RotateCredential
-        | IrEffectKind::RevokeCredential
-        | IrEffectKind::TrackerFile
-        | IrEffectKind::TrackerClaim
-        | IrEffectKind::TrackerRenew
-        | IrEffectKind::TrackerRelease
-        | IrEffectKind::TrackerFinish
-        | IrEffectKind::LeaseAcquire
-        | IrEffectKind::LeaseRenew
-        | IrEffectKind::LedgerAppend
-        | IrEffectKind::CounterConsume
-        | IrEffectKind::SignalEmit
-        | IrEffectKind::FileRead
-        | IrEffectKind::FileWrite
-        | IrEffectKind::FileImport
-        | IrEffectKind::FileExport => {}
+        output_integrity::Transfer::Executor(handle) => out.push((handle, crossed)),
+        output_integrity::Transfer::None => {}
     }
 }
 
@@ -4804,80 +4806,45 @@ fn flag_redacted_egress_projections(
     span: whipplescript_parser::SourceSpan,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
-    let projected_for = |binding: &str| -> Option<BTreeSet<String>> {
-        let redaction = rule
-            .metadata
-            .redactions
-            .iter()
-            .find(|redaction| redaction.binding == binding)?;
-        let schema = redaction.source_schema.as_deref()?;
-        Some(envelope.projected_reader_set(schema, &redaction.keep))
-    };
     for sink in candidates {
-        let roots = rule.metadata.egress_payload_reads.get(sink);
-        let fully_redacted = roots.is_some_and(|roots| {
-            !roots.is_empty() && roots.iter().all(|r| projected_for(r).is_some())
-        });
-        if !fully_redacted {
+        let Some(roots) = rule
+            .metadata
+            .egress_payload_reads
+            .get(sink)
+            .filter(|roots| !roots.is_empty())
+        else {
             continue;
-        }
-        let projected: BTreeSet<String> = roots
-            .into_iter()
-            .flatten()
-            .filter_map(|root| projected_for(root))
-            .flatten()
-            .collect();
-        let sink_readers = envelope.reader_sink(sink);
-        if !envelope.dominates(&sink_readers, &projected) {
-            // Name exactly which kept fields the sink cannot read, and suggest the
-            // safe keep-set — the sound "auto-suggest" form of auto-redaction, which
-            // keeps the crossing explicit (the author still narrows the `keep` list).
-            let mut offending: BTreeSet<String> = BTreeSet::new();
-            let mut safe: Vec<String> = Vec::new();
-            for root in roots.into_iter().flatten() {
-                let Some(redaction) = rule.metadata.redactions.iter().find(|r| &r.binding == root)
-                else {
-                    continue;
-                };
-                let Some(schema) = redaction.source_schema.as_deref() else {
-                    continue;
-                };
-                for field in &redaction.keep {
-                    let field_label = envelope.reader_set(&format!("{schema}.{field}"));
-                    if envelope.dominates(&sink_readers, &field_label) {
-                        safe.push(field.clone());
-                    } else {
-                        offending.insert(field.clone());
-                    }
-                }
-            }
-            let suggestion = if offending.is_empty() {
-                format!("clear the sink with `grant … -> {sink} readable by <role>`")
-            } else {
-                let dropped = offending.iter().cloned().collect::<Vec<_>>().join(", ");
-                let keep = safe.join(", ");
-                format!(
-                    "drop the field(s) `{dropped}` the sink cannot read (keep only [{keep}]), or \
-                     clear the sink with `grant … -> {sink} readable by <role>`"
+        };
+        let fields: Option<Vec<_>> = roots
+            .iter()
+            .map(|root| {
+                let redaction = rule
+                    .metadata
+                    .redactions
+                    .iter()
+                    .find(|r| &r.binding == root)?;
+                let schema = redaction.source_schema.as_ref()?;
+                Some(
+                    redaction
+                        .keep
+                        .iter()
+                        .map(|field| format!("{schema}.{field}"))
+                        .collect::<Vec<_>>(),
                 )
-            };
-            diagnostics.push(Diagnostic {
-                code: diagnostic_code!("security.projection_leak"),
-                severity: Severity::Error,
-                span,
-                message: format!(
-                    "denied flow in rule `{rule}`: the redacted egress `{sink}` still carries \
-                     fields only {proj} may read — `{sink}` (readable by {have}) would expose them \
-                     outside their readers (the checker denies every egress whose kept fields \
-                     exceed the sink's readers)",
-                    rule = rule.name,
-                    proj = label_text(&projected),
-                    have = envelope.reader_label(sink),
-                ),
-                suggestion: whipplescript_parser::suggest(suggestion),
-                related: Vec::new(),
-                fixits: Vec::new(),
-            });
+            })
+            .collect();
+        let Some(fields) = fields else {
+            continue;
+        };
+        if let Some(error) = projection_policy::check(
+            &rule.name,
+            span,
+            sink,
+            projection_policy::Kind::Redacted,
+            &fields.into_iter().flatten().collect(),
+            envelope,
+        ) {
+            diagnostics.push(error);
         }
     }
 }
@@ -5045,28 +5012,7 @@ pub fn check_with_envelope_imports(
             if !rule.metadata.endorsed_claim_items.contains(bound) {
                 continue;
             }
-            if !envelope.integrity_set(tracker).is_empty() {
-                continue;
-            }
-            diagnostics.push(Diagnostic {
-                code: diagnostic_code!("security.unvouched_endorsement"),
-                severity: Severity::Error,
-                span: when.span,
-                message: format!(
-                    "`claim … endorsed` in rule `{rule}` claims out of tracker `{tracker}`, \
-                     which nobody vouches (integrity public) — an endorsement may only draw \
-                     its authority from a queue the envelope says who may file into, or an \
-                     agent could file its own issue and claim it",
-                    rule = rule.name,
-                ),
-                suggestion: whipplescript_parser::suggest(format!(
-                    "name who may file into it: `grant tracker {tracker} -> \
-                     tracker:/{tracker} from <Role>`. if this claim is not an integrity \
-                     crossing, drop the `endorsed` marker instead"
-                )),
-                related: Vec::new(),
-                fixits: Vec::new(),
-            });
+            claim_policy::tracker(&rule.name, when.span, tracker, envelope, &mut diagnostics);
         }
         // DR-0051 §4: only closed fields cross. A record field shaped by an
         // endorsed claim must carry a value that cannot express prose.
@@ -5105,29 +5051,14 @@ pub fn check_with_envelope_imports(
                     let Some(field) = class.fields.iter().find(|f| &f.name == field_name) else {
                         continue;
                     };
-                    if !carries_prose(&field.ty) {
-                        continue;
-                    }
-                    diagnostics.push(Diagnostic {
-                        code: diagnostic_code!("security.endorsed_prose_field"),
-                        severity: Severity::Error,
-                        span: rule_span,
-                        message: format!(
-                            "in rule `{rule}`, `{schema}.{field_name}` is shaped by an endorsed \
-                             claim but can carry prose — an endorsement raises a *decision* to \
-                             trusted integrity, and a free-text field raised the same way \
-                             launders whatever the endorser quoted from the untrusted item",
-                            rule = rule.name,
-                        ),
-                        suggestion: whipplescript_parser::suggest(format!(
-                            "declare `{field_name}` as a closed union of literals (e.g. \
-                             `\"keep\" | \"flag\"`) or another type that cannot hold a sentence \
-                             — a number or a bool. to keep the endorser's prose, record it in a \
-                             separate fact the envelope leaves at public integrity"
-                        )),
-                        related: Vec::new(),
-                        fixits: Vec::new(),
-                    });
+                    claim_policy::field(
+                        &rule.name,
+                        rule_span,
+                        schema,
+                        field_name,
+                        &field.ty,
+                        &mut diagnostics,
+                    );
                 }
             }
         }
@@ -5145,7 +5076,9 @@ pub fn check_with_envelope_imports(
                 reads.push(resource);
                 span.get_or_insert(effect.span);
             }
-            if let Some(resource) = ifc_resource_for_effect(effect, &shared_coordination) {
+            // One effect can name several resources since they became a list,
+            // so this is a loop where it used to be a single `Option`.
+            for resource in ifc_resources_for_effect(effect, &shared_coordination) {
                 // The audit of which kinds read and which write lives in
                 // `effect_flow`, so this join box and the five other flow sites
                 // cannot disagree about a kind.
@@ -5213,52 +5146,20 @@ pub fn check_with_envelope_imports(
             // context to the agent's model provider, so a read-confidential turn
             // whose provider is not cleared leaks to the model.
             if effect.kind == IrEffectKind::AgentTell {
-                let declaration = effect
+                if let Some(agent) = effect
                     .agent
                     .as_deref()
-                    .and_then(|name| ir.agents.iter().find(|a| a.name == name));
-                if let Some(provider) = declaration.and_then(|a| agent_provider_kind(ir, a)) {
-                    for grant in &effect.access_grants {
-                        let resource = grant.resource.as_str();
-                        let reads_resource =
-                            grant.operations.iter().any(|op| is_read_op(&op.operation));
-                        if reads_resource && envelope.leaks(resource, provider) {
-                            diagnostics.push(Diagnostic {
-                                code: diagnostic_code!("security.provider_egress_leak"),
-                                severity: Severity::Error,
-                                span: effect.span,
-                                message: format!(
-                                    "denied egress in rule `{rule}`: `{resource}` may be read by \
-                                     {rr} only — sending this turn's context to provider \
-                                     `{provider}` (clearance {pr}) would disclose it to a model \
-                                     outside its readers (the checker denies every turn egress to \
-                                     a provider not cleared for everything the turn read)",
-                                    rule = rule.name,
-                                    rr = envelope.reader_label(resource),
-                                    pr = envelope.reader_label(provider),
-                                ),
-                                suggestion: whipplescript_parser::suggest(format!(
-                                    "bind the agent to a provider cleared for `{resource}`, or \
-                                     declassify before the turn"
-                                )),
-                                // The binding is per-agent for the life of the
-                                // conversation (DR-0062 §1), so the fix is the
-                                // declaration, not this call site. Point there.
-                                related: declaration
-                                    .map(|agent| RelatedInfo {
-                                        span: agent.span,
-                                        message: format!(
-                                            "`{}` is bound to provider `{provider}` here",
-                                            agent.name
-                                        ),
-                                    })
-                                    .into_iter()
-                                    .collect(),
-                                fixits: Vec::new(),
-                            });
-                            break;
-                        }
-                    }
+                    .and_then(|name| ir.agents.iter().find(|a| a.name == name))
+                {
+                    provider_egress::turn(
+                        &rule.name,
+                        effect.span,
+                        agent,
+                        agent_provider_kind(ir, agent),
+                        &effect.access_grants,
+                        envelope,
+                        &mut diagnostics,
+                    );
                 }
             }
         }
@@ -5299,58 +5200,20 @@ pub fn check_with_envelope_imports(
                 .coerce_target
                 .as_deref()
                 .and_then(|name| ir.coerces.iter().find(|decl| decl.name == name));
-            let principal = coerce_egress_principal(ir, effect);
-            for resource in reads
-                .iter()
-                .copied()
-                .chain(fact_reads.iter().map(String::as_str))
-            {
-                if envelope.leaks(resource, principal) {
-                    diagnostics.push(Diagnostic {
-                        code: diagnostic_code!("security.provider_egress_leak"),
-                        severity: Severity::Error,
-                        span: effect.span,
-                        message: format!(
-                            "denied egress in rule `{rule}`: a `coerce`/`decide`/`prompt` reads \
-                             `{resource}`, which {rr} only may read — sending the prompt to the \
-                             schema.coerce model provider `{principal}` (clearance {pr}) would \
-                             disclose it to an uncleared model (the checker denies every prompt \
-                             egress to a provider not cleared for its inputs)",
-                            rule = rule.name,
-                            rr = envelope.reader_label(resource),
-                            pr = envelope.reader_label(principal),
-                        ),
-                        suggestion: whipplescript_parser::suggest(format!(
-                            "clear this endpoint for the resource (`grant provider {principal} -> \
-                             … readable by <role>`), or declassify before the coerce"
-                        )),
-                        // Point at the declaration whose `provider` clause chose
-                        // this endpoint — or, when none did, say so, since the
-                        // remedy there is to name one rather than to re-grant.
-                        related: declaration
-                            .map(|decl| RelatedInfo {
-                                span: decl.span,
-                                message: match decl.provider.as_deref() {
-                                    Some(provider) => format!(
-                                        "`{}` sends to provider `{provider}` here",
-                                        decl.name
-                                    ),
-                                    None => format!(
-                                        "`{}` names no provider, so it is judged as the \
-                                         un-named backend `{UNNAMED_COERCE_BACKEND}` — name one \
-                                         to govern this coerce per endpoint",
-                                        decl.name
-                                    ),
-                                },
-                            })
-                            .into_iter()
-                            .collect(),
-                        fixits: Vec::new(),
-                    });
-                    break;
-                }
-            }
+            provider_egress::coerce(
+                &rule.name,
+                effect.span,
+                coerce_egress_principal(ir, effect),
+                declaration,
+                reads
+                    .iter()
+                    .copied()
+                    .chain(fact_reads.iter().map(String::as_str)),
+                envelope,
+                &mut diagnostics,
+            );
         }
+
         // `record <Fact>` writes the durable fact-base, which other rules and the
         // DR-0026 session-event stream observe — a governed egress sink (the
         // recordSink of infoflow-composition, H2). Sink id `fact:<schema>`;
@@ -5376,9 +5239,8 @@ pub fn check_with_envelope_imports(
         // `record`) whose payload references ONLY redaction outputs is FULLY-REDACTED.
         // The runtime physically projects each such binding to its kept fields, so the
         // egress carries only those — its confidentiality is the kept fields' per-field
-        // label join (`projected_reader_set`), NOT the rule's whole read set. Such an
-        // egress is governed by its projected label here and EXCLUDED from the
-        // conservative read×sink loop; a mixed or unresolved egress stays conservative.
+        // label join in addition to the rule's whole read set. The projection
+        // never exempts this egress from the conservative read×sink loop.
         let redact_span = span.unwrap_or(whipplescript_parser::SourceSpan { start: 0, end: 0 });
         let result_sinks: Vec<String> = if is_tool {
             Vec::new()
@@ -5421,45 +5283,21 @@ pub fn check_with_envelope_imports(
         // recorded fact keeps exactly `T`'s fields, checked against those fields'
         // per-field label join. Also purely additive (no read exemption).
         for bounded in &rule.metadata.bounded_egresses {
-            let projected = envelope.projected_reader_set(&bounded.source_schema, &bounded.keep);
-            let sink_readers = envelope.reader_sink(&bounded.sink);
-            if envelope.dominates(&sink_readers, &projected) {
-                continue;
-            }
-            let offending: Vec<String> = bounded
+            let fields = bounded
                 .keep
                 .iter()
-                .filter(|field| {
-                    !envelope.dominates(
-                        &sink_readers,
-                        &envelope.reader_set(&format!("{}.{}", bounded.source_schema, field)),
-                    )
-                })
-                .cloned()
+                .map(|field| format!("{}.{}", bounded.source_schema, field))
                 .collect();
-            diagnostics.push(Diagnostic {
-                code: diagnostic_code!("security.projection_leak"),
-                severity: Severity::Error,
-                span: redact_span,
-                message: format!(
-                    "denied flow in rule `{rule}`: the bounded-type egress `{sink}` carries \
-                     fields only {proj} may read — `{sink}` is readable by {have}, outside those \
-                     fields' readers (the checker denies every egress whose payload fields exceed \
-                     the sink's readers)",
-                    rule = rule.name,
-                    sink = bounded.sink,
-                    proj = label_text(&projected),
-                    have = envelope.reader_label(&bounded.sink),
-                ),
-                suggestion: whipplescript_parser::suggest(format!(
-                    "remove the field(s) `{dropped}` from the target type, or clear the sink with \
-                     `grant … -> {sink} readable by <role>`",
-                    dropped = offending.join(", "),
-                    sink = bounded.sink,
-                )),
-                related: Vec::new(),
-                fixits: Vec::new(),
-            });
+            if let Some(error) = projection_policy::check(
+                &rule.name,
+                redact_span,
+                &bounded.sink,
+                projection_policy::Kind::Bounded,
+                &fields,
+                envelope,
+            ) {
+                diagnostics.push(error);
+            }
         }
         // DR-0030 X2 (cross-package): a `tell <agent>` turn whose agent may call an
         // imported `@tool` (DR-0025 `tools [...]`) can pull that tool's result into the
@@ -5485,49 +5323,15 @@ pub fn check_with_envelope_imports(
             };
             for tool_name in &agent.tools {
                 if let Some(tool) = imports.iter().find(|t| &t.workflow == tool_name) {
-                    let reads = result_dependency_reads(tool);
-                    // DR-0027 provider-as-principal: an imported tool's
-                    // result is streamed back to the model at runtime
-                    // (host_runtime `ChatMessage::ToolResults` re-enters the
-                    // turn), so a tool that reads confidential data, called
-                    // by an agent whose provider is not cleared for it,
-                    // egresses that data to the uncleared model exactly like
-                    // the tell's own read grants. The provider-egress check
-                    // in the effects loop only inspects `effect.access_grants`
-                    // and never sees these tool result reads, so check them
-                    // against the provider here.
-                    if let Some(provider) = agent_provider_kind(ir, agent) {
-                        for resource in &reads {
-                            if envelope.leaks(resource, provider) {
-                                diagnostics.push(Diagnostic {
-                                    code: diagnostic_code!("security.provider_egress_leak"),
-                                    severity: Severity::Error,
-                                    span: effect.span,
-                                    message: format!(
-                                        "denied egress in rule `{rule}`: agent `{agent}` may call \
-                                         tool `{tool}` which reads `{resource}` ({rr} only) — its \
-                                         provider `{provider}` (clearance {pr}) is outside those \
-                                         readers, so the tool result would reach an uncleared \
-                                         model (the checker denies every tool-result egress to a \
-                                         provider not cleared for it)",
-                                        rule = rule.name,
-                                        agent = agent_name,
-                                        tool = tool_name,
-                                        rr = envelope.reader_label(resource),
-                                        pr = envelope.reader_label(provider),
-                                    ),
-                                    suggestion: whipplescript_parser::suggest(format!(
-                                        "bind `{agent_name}` to a provider cleared for \
-                                         `{resource}`, or declassify before the tool result \
-                                         reaches the turn"
-                                    )),
-                                    related: Vec::new(),
-                                    fixits: Vec::new(),
-                                });
-                            }
-                        }
-                    }
-                    tool_result_reads.extend(reads);
+                    tool_result_reads.extend(provider_egress::tool_result(
+                        &rule.name,
+                        effect.span,
+                        agent,
+                        agent_provider_kind(ir, agent),
+                        tool,
+                        envelope,
+                        &mut diagnostics,
+                    ));
                 }
             }
         }
@@ -5665,9 +5469,12 @@ pub fn check_with_envelope_imports(
                 }
                 let reaches_marked = matches!(narrowed, Some(Some(_)));
                 if leak.is_none()
-                    && envelope.leaks(src, sink)
-                    && !(carried_only_by(sink, declassified_outputs)
-                        && envelope.declassify_releases(src, sink))
+                    && source_flow::leaks(
+                        envelope,
+                        src,
+                        sink,
+                        carried_only_by(sink, declassified_outputs),
+                    )
                 {
                     leak = Some((src.to_owned(), sink.to_owned(), reaches_marked));
                 }
@@ -5678,19 +5485,13 @@ pub fn check_with_envelope_imports(
                     // A fact-carried executor token (`output:<handle>`, DR-0046)
                     // provides its executor's `from` clearance and is inert on
                     // the confidentiality axis (its reader set is empty).
-                    let integrity_id = src.strip_prefix("output:").unwrap_or(src);
-                    let injects = if internal_signal.contains(src) {
-                        match &src_integrity {
-                            None => false,
-                            Some(set) => !envelope.dominates(set, &envelope.integrity_sink(sink)),
-                        }
-                    } else {
-                        !(envelope.dominates(
-                            &envelope.integrity_set(integrity_id),
-                            &envelope.integrity_sink(sink),
-                        ) || (carried_only_by(sink, endorsed_outputs)
-                            && envelope.endorse_raises(integrity_id, sink)))
-                    };
+                    let injects = source_flow::injects(
+                        envelope,
+                        src,
+                        sink,
+                        internal_signal.contains(src).then_some(&src_integrity),
+                        carried_only_by(sink, endorsed_outputs),
+                    );
                     if injects {
                         inject = Some((
                             src.to_owned(),
@@ -5749,14 +5550,7 @@ pub fn check_with_envelope_imports(
                     &mut tokens,
                 );
                 for (handle, crossed) in tokens {
-                    let raised = if crossed {
-                        envelope.endorse_raises(&handle, sink)
-                    } else {
-                        false
-                    };
-                    if !raised
-                        && !envelope.dominates(&envelope.integrity_set(&handle), &requirement)
-                    {
+                    if output_integrity::denied(envelope, &handle, sink, crossed) {
                         output_inject = Some((handle, sink.to_owned(), crossed));
                         break 'outputs;
                     }
@@ -5764,105 +5558,34 @@ pub fn check_with_envelope_imports(
             }
         }
         if let Some((handle, sink, crossed)) = output_inject {
-            let via = if crossed {
-                " (its `endorsed` judgment lacks a matching `grant endorse` for this sink)"
-            } else {
-                ""
-            };
-            diagnostics.push(Diagnostic {
-                code: diagnostic_code!("security.integrity_injection"),
-                severity: Severity::Error,
-                span: report_span,
-                message: format!(
-                    "denied influence in rule `{rule}`: the output of executor `{handle}` \
-                     (vouched at {provided}) shapes `{sink}`, which only {required}-vouched data \
-                     may shape{via} (the checker denies every effect output flowing into a sink \
-                     above its executor's `from` clearance; DR-0046)",
-                    rule = rule.name,
-                    provided = envelope.integrity_label(&handle),
-                    required = envelope.integrity_label(&sink),
-                ),
-                suggestion: whipplescript_parser::suggest(format!(
-                    "escalate (needs governance): vouch the executor's outputs with `grant … -> … \
-                     from <role>` on `{handle}`, or route the value through a `coerce … endorsed` \
-                     judgment under `grant endorse {handle} to <role vouched for {sink}>`"
-                )),
-                related: Vec::new(),
-                fixits: Vec::new(),
-            });
+            diagnostics.push(output_integrity::diagnostic(
+                &rule.name,
+                report_span,
+                &handle,
+                &sink,
+                crossed,
+                envelope,
+            ));
         }
         if let Some((src, sink, reaches_marked)) = leak {
-            let reach_note = if reaches_marked {
-                " — it reaches the marked crossing's inputs, so the release requires its grant"
-            } else {
-                ""
-            };
-            // The endpoint's clearance can be in order while the party in
-            // between is not; say which one refused, or the two reader labels
-            // read as a contradiction.
-            let custodian_note = envelope
-                .uncleared_custodian(&src, &sink)
-                .map(|custodian| {
-                    format!(
-                        " — and `{sink}` routes its payload through custodian `{custodian}`, \
-                         which is not cleared for those readers (DR-0053 §9: confine the \
-                         credential with `egress from workflow`, or delegate the custodian)"
-                    )
-                })
-                .unwrap_or_default();
-            diagnostics.push(Diagnostic {
-                code: diagnostic_code!("security.confidentiality_leak"),
-                severity: Severity::Error,
-                span: report_span,
-                message: format!(
-                    "denied flow in rule `{rule}`: `{src}` may be read by {src_reader} only — \
-                     writing it to `{sink}` (readable by {sink_reader}) would expose it to parties \
-                     outside its readers (the checker denies every flow from a value to a sink \
-                     whose readers are not all within the value's reader set){reach_note}\
-                     {custodian_note}",
-                    rule = rule.name,
-                    src_reader = envelope.reader_label(&src),
-                    sink_reader = envelope.reader_label(&sink),
-                ),
-                suggestion: whipplescript_parser::suggest(format!(
-                    "self-serve (no grant needed): separate the contexts — read `{src}` in a \
-                     distinct turn and pass only a bounded result. escalate (needs governance): \
-                     route the release through a `coerce … declassified` whose output is the \
-                     egress's whole payload, under `grant declassify {src} to <role cleared for \
-                     {sink}>` (a grant alone never blesses a raw flow)"
-                )),
-                related: Vec::new(),
-                fixits: Vec::new(),
-            });
+            diagnostics.push(source_flow::leak_diagnostic(
+                &rule.name,
+                report_span,
+                &src,
+                &sink,
+                reaches_marked,
+                envelope,
+            ));
         }
         if let Some((src, sink, src_int)) = inject {
-            let src_name = match src.strip_prefix("output:") {
-                Some(handle) => format!("the fact-carried output of executor `{handle}`"),
-                None => format!("`{src}`"),
-            };
-            diagnostics.push(Diagnostic {
-                code: diagnostic_code!("security.integrity_injection"),
-                severity: Severity::Error,
-                span: report_span,
-                message: format!(
-                    "denied influence in rule `{rule}`: {src_name} is untrusted (integrity \
-                     {src_int}) — it can never influence `{sink}`, which only {sink_int}-vouched \
-                     data may shape (the checker denies every flow from lower-integrity data into \
-                     a higher-integrity sink; the sanctioned crossing is a source-marked \
-                     `endorsed` coerce)",
-                    rule = rule.name,
-                    sink_int = envelope.integrity_label(&sink),
-                ),
-                suggestion: whipplescript_parser::suggest(format!(
-                    "self-serve (no grant needed): do not let `{src}` influence `{sink}` — gate \
-                     the sink on trusted data. escalate (needs governance): route the influence \
-                     through a `coerce … endorsed` whose output is the sink's whole payload, \
-                     under `grant endorse {src} to <role>` (a grant alone never vouches a raw \
-                     influence)"
-                )),
-                related: Vec::new(),
-                fixits: Vec::new(),
-            });
+            diagnostics.push(source_flow::injection_diagnostic(
+                &rule.name,
+                report_span,
+                &src,
+                &sink,
+                &src_int,
+                envelope,
+            ));
         }
 
         // NMIF-on-the-selector (DR §5.6 / §7.4): a crossing (`endorsed`/`declassified`)
@@ -5874,6 +5597,13 @@ pub fn check_with_envelope_imports(
         // gating a crossing — the §5.6 channel-2 case the uniform recognition makes
         // live). A signal vouched by governance (`signal:<name> from <Role>`) is
         // high-integrity and may steer a crossing.
+        let selector_inputs =
+            selector_policy::inputs(program_context::ProgramContext::Legacy(ir), &rule.whens);
+        // The bindings a low-integrity `when` delivers, which is a different
+        // question from `selector_inputs` above: that one is asked per-root
+        // through `Input`, this one is the SET the assignee check below
+        // intersects. Both walk `rule.whens` because they want different
+        // answers from it.
         let low_integrity_bindings: Vec<&str> = rule
             .whens
             .iter()
@@ -5998,7 +5728,9 @@ pub fn check_with_envelope_imports(
                 .iter()
                 .find(|effect| {
                     matches!(effect.kind, IrEffectKind::TrackerFile)
-                        && effect.resource.as_deref() == Some(tracker.as_str())
+                        // Resources became a list; this asks whether the filing
+                        // touches THIS tracker, so `any` is the same question.
+                        && effect.resources.iter().any(|resource| resource == tracker)
                 })
                 .map(|effect| effect.span)
                 .or_else(|| rule.whens.first().map(|when| when.span))
@@ -6020,84 +5752,31 @@ pub fn check_with_envelope_imports(
                 fixits: Vec::new(),
             });
         }
-        let input_roots: BTreeSet<&str> = ir
-            .workflow_contracts
-            .iter()
-            .filter(|contract| matches!(contract.kind, IrWorkflowContractKind::Input))
-            .map(|contract| contract.name.as_str())
-            .collect();
-        let invoke_selector_port = format!("invoke:{}", ir.workflow);
         for effect in &rule.metadata.effects {
             let Some((scrutinee, pattern)) = &effect.selected_by else {
                 continue;
             };
             let root = scrutinee.split('.').next().unwrap_or(scrutinee.as_str());
-            let selector_is_invoke_input = input_roots.contains(root);
-            let selector_integrity = if selector_is_invoke_input {
-                Some(envelope.integrity_set(&invoke_selector_port))
-            } else if low_integrity_bindings.contains(&root) {
-                Some(BTreeSet::new())
-            } else {
-                None
-            };
-            if selector_integrity.as_ref().is_some_and(BTreeSet::is_empty)
-                && (effect.endorsed || effect.declassified)
-            {
-                let crossing = if effect.declassified {
-                    "declassify"
-                } else {
-                    "endorse"
-                };
-                diagnostics.push(Diagnostic {
-                    code: diagnostic_code!("security.untrusted_selector"),
-                    severity: Severity::Error,
-                    span: effect.span,
-                    message: format!(
-                        "denied influence in rule `{rule}`: the low-integrity discriminant \
-                         `{scrutinee}` (arm `{pattern}`) may not select a {crossing} crossing — an \
-                         attacker could steer the crossing (the checker denies every crossing \
-                         selected by untrusted data; NMIF-on-the-selector)",
-                        rule = rule.name,
-                    ),
-                    suggestion: whipplescript_parser::suggest(format!(
-                        "do not branch a crossing on untrusted `{scrutinee}`; gate the `case` on \
-                         high-integrity data, or endorse `{root}` before the `case`"
-                    )),
-                    related: Vec::new(),
-                    fixits: Vec::new(),
-                });
-            }
-            let Some(selector_integrity) = selector_integrity else {
+            let Some(input) = selector_inputs.get(root) else {
                 continue;
             };
-            if !selector_is_invoke_input {
-                continue;
+            let selection = selector_policy::Selection {
+                rule: &rule.name,
+                span: effect.span,
+                scrutinee,
+                pattern,
+            };
+            if effect.endorsed || effect.declassified {
+                selection.crossing(
+                    input,
+                    false,
+                    effect.declassified,
+                    envelope,
+                    &mut diagnostics,
+                );
             }
             for sink in selected_effect_integrity_sinks(effect, &shared_coordination) {
-                let required = envelope.integrity_sink(&sink);
-                if envelope.dominates(&selector_integrity, &required) {
-                    continue;
-                }
-                diagnostics.push(Diagnostic {
-                    code: diagnostic_code!("security.untrusted_selector"),
-                    severity: Severity::Error,
-                    span: effect.span,
-                    message: format!(
-                        "denied influence in rule `{rule}`: the low-integrity selector \
-                         `{scrutinee}` (arm `{pattern}`) may not control `{sink}`, which requires \
-                         integrity {sink_int} (the checker denies every effect selection by data \
-                         below the effect's integrity; NMIF-on-invoke-selector)",
-                        rule = rule.name,
-                        sink_int = envelope.integrity_label(&sink),
-                    ),
-                    suggestion: whipplescript_parser::suggest(format!(
-                        "do not let `{scrutinee}` select a higher-integrity effect; vouch the \
-                         inbound invoke port `{invoke_selector_port}` with `grant invoke ... from \
-                         <role>`, or move the effect outside the untrusted `case`"
-                    )),
-                    related: Vec::new(),
-                    fixits: Vec::new(),
-                });
+                selection.invocation(input, false, &sink, envelope, &mut diagnostics);
             }
         }
     }
@@ -6127,58 +5806,13 @@ fn check_turn_unwrap_scoping(
 ) {
     for rule in &ir.rules {
         for effect in &rule.metadata.effects {
-            for grant in &effect.access_grants {
-                let Some(credential) = grant.resource.strip_prefix("credential ") else {
-                    continue;
-                };
-                for op in &grant.operations {
-                    if op.operation != "unwrap" {
-                        continue;
-                    }
-                    // A bare `unwrap` is the parser's diagnostic, already
-                    // emitted. Reporting it twice would say nothing new.
-                    let Some(payload_type) = op.target.as_deref() else {
-                        continue;
-                    };
-                    // An ungoverned credential is not an ungranted one: under
-                    // the gradual model a handle the envelope never mentions is
-                    // outside the policy's scope, and refusing here would make
-                    // governance a precondition for naming a credential at all.
-                    if !envelope.governs(envelope.resolve(credential)) {
-                        continue;
-                    }
-                    if envelope.grants_any_unwrap(credential, payload_type) {
-                        continue;
-                    }
-                    let available = envelope.unwrap_types_for(credential);
-                    diagnostics.push(Diagnostic {
-                        code: diagnostic_code!("security.unwrap_not_granted"),
-                        severity: Severity::Error,
-                        span: effect.span,
-                        related: Vec::new(),
-                        fixits: Vec::new(),
-                        message: format!(
-                            "rule `{rule}` scopes `unwrap for {payload_type}` on credential \
-                             `{credential}`, which governance grants to nobody for that type",
-                            rule = rule.name,
-                        ),
-                        suggestion: whipplescript_parser::suggest(if available.is_empty() {
-                            format!(
-                                "governance grants no unwrap at all on `{credential}`; add \
-                                 `grant unwrap {credential} for {payload_type} to <Role>` to the \
-                                 envelope, or drop the operation from the turn"
-                            )
-                        } else {
-                            format!(
-                                "governance grants unwrap on `{credential}` for {}; scope the \
-                                 turn to one of those, or add `grant unwrap {credential} for \
-                                 {payload_type} to <Role>` to the envelope",
-                                available.join(", ")
-                            )
-                        }),
-                    });
-                }
-            }
+            authority_policy::unwrap_grants(
+                &rule.name,
+                effect.span,
+                &effect.access_grants,
+                envelope,
+                diagnostics,
+            );
         }
     }
 }
@@ -6230,29 +5864,14 @@ pub fn check_principal_ceiling(
         }
         for (src, span) in reads {
             let src = src.as_str();
-            let required = envelope.reader_set(src);
-            // the principal must be cleared for EVERY compartment of the source (it
-            // can read iff it acts-for the whole reader set — `canRead`).
-            let cleared = required.iter().all(|r| envelope.can_act(principal_role, r));
-            if !cleared && flagged.insert(format!("{}:{src}", rule.name)) {
-                let required = envelope.reader_label(src);
-                diagnostics.push(Diagnostic {
-                    code: diagnostic_code!("security.principal_ceiling_exceeded"),
-                    severity: Severity::Error,
-                    span,
-                    message: format!(
-                        "denied read in rule `{rule}`: the agent acts-for `{principal_role}`, \
-                         which is outside `{src}`'s readers ({required}) — an agent can never read \
-                         above the user's clearance (DR-0028 D3)",
-                        rule = rule.name,
-                    ),
-                    suggestion: whipplescript_parser::suggest(format!(
-                        "the principal role `{principal_role}` is not cleared for `{src}`; serve a user \
-                         whose role acts-for {required}, or do not read `{src}`"
-                    )),
-                    related: Vec::new(),
-                    fixits: Vec::new(),
-                });
+            if flagged.contains(&format!("{}:{src}", rule.name)) {
+                continue;
+            }
+            if let Some(error) =
+                authority_policy::principal_read(&rule.name, span, src, principal_role, envelope)
+            {
+                flagged.insert(format!("{}:{src}", rule.name));
+                diagnostics.push(error);
             }
         }
     }
@@ -6305,7 +5924,7 @@ pub fn ifc_surface(ir: &IrProgram) -> Vec<String> {
     let mut surface: BTreeSet<String> = BTreeSet::new();
     for rule in &ir.rules {
         for effect in &rule.metadata.effects {
-            if let Some(resource) = ifc_resource_for_effect(effect, &shared_coordination) {
+            for resource in ifc_resources_for_effect(effect, &shared_coordination) {
                 surface.insert(resource.to_owned());
             }
             surface.extend(
@@ -7026,7 +6645,7 @@ rule triage
   when Ticket as ticket
 => {{
   read text from ledger at "customer.json" as rec
-  after rec succeeds as customer {{
+  after rec succeeds {{
     until exists(Incident where sev == "sev1") {{
       timer 1s as t
       after t completes {{
@@ -7069,13 +6688,13 @@ rule triage
         };
 
         denied(
-            &program("        record Leaked { blob customer.content }", "      "),
+            &program("        record Leaked { blob rec.content }", "      "),
             "in the region body",
         );
         denied(
             &program(
                 "        complete result { ok true }",
-                "      record Leaked { blob customer.content }",
+                "      record Leaked { blob rec.content }",
             ),
             "in the on-lapse arm",
         );
@@ -7144,15 +6763,11 @@ rule triage
         };
 
         denied(
-            &program(
-                "  after rec succeeds as customer {\n    record Leaked { blob customer.content }\n  }",
-            ),
+            &program("  after rec succeeds {\n    record Leaked { blob rec.content }\n  }"),
             "multi-line",
         );
         denied(
-            &program(
-                "  after rec succeeds as customer { record Leaked { blob customer.content } }",
-            ),
+            &program("  after rec succeeds { record Leaked { blob rec.content } }"),
             "inline",
         );
     }
@@ -14199,7 +13814,7 @@ rule scoped
             .find(|effect| effect.kind == IrEffectKind::MintCredential)
             .expect("the mint lowers to an effect node");
         // The PARENT is the sink: the child does not exist yet.
-        assert_eq!(node.resource.as_deref(), Some("stripe_api"));
+        assert_eq!(node.resources, ["stripe_api"]);
         let reads = ir
             .rules
             .iter()
@@ -14319,7 +13934,7 @@ rule leak
             .flat_map(|rule| rule.metadata.effects.iter())
             .find(|effect| effect.kind == IrEffectKind::TrackerFile)
             .expect("the file lowers to an effect node");
-        assert_eq!(filed.resource.as_deref(), Some("ops"));
+        assert_eq!(filed.resources, ["ops"]);
 
         let reads = ir
             .rules
@@ -14792,7 +14407,7 @@ rule refund
             .flat_map(|rule| rule.metadata.effects.iter())
             .find(|effect| effect.kind == IrEffectKind::HttpRequest)
             .expect("the request lowers to an effect node");
-        assert_eq!(request.resource.as_deref(), Some("stripe_api"));
+        assert_eq!(request.resources, ["stripe_api"]);
 
         // And the body's binding roots are recorded against that sink, so the
         // label of what is being sent is knowable.
@@ -15398,7 +15013,7 @@ rule act
             .iter()
             .flat_map(|rule| rule.metadata.effects.iter())
             .find(|effect| effect.kind == kind)
-            .and_then(|effect| effect.resource.clone())
+            .and_then(|effect| effect.resources.first().cloned())
     }
 
     #[test]

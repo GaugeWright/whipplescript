@@ -177,6 +177,7 @@ impl<'a> FileSettlementFact<'a> {
             provenance_class: "external",
             correlation_id: None,
             source_span_json: None,
+            validity_json: None,
         }
     }
 

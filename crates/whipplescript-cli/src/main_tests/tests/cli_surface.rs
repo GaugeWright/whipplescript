@@ -1270,6 +1270,7 @@ fn materialize_redactions_binds_the_projection() {
                 value_json: json!({"id": "c1", "ssn": "secret", "status": "active"}).to_string(),
                 provenance_class: "effect".to_owned(),
                 source_span_json: None,
+                validity_json: None,
                 source_event_id: String::new(),
             },
         )],

@@ -3,13 +3,13 @@ warning[effect.unhandled_failure]: effect `turn`'s failure is unhandled in rule 
    |
 35 |   tell reviewer "review the docs"
    |   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-   = help: handle it with `after turn fails { … }` (typed failure or recovery) or observe every outcome with `after turn completes`
+   = help: handle it with `after turn fails { … }` (typed failure or recovery), observe every outcome with `after turn completes`, or add one `on failure as problem { … }` handler to the rule
 warning[effect.unhandled_failure]: effect `turn`'s failure is unhandled in rule `grants_nothing`; if it fails or times out, the instance will auto-fail with a generic reason
    --> examples/invalid/bad-access-grants.whip:53:3
    |
 53 |   tell reviewer "review again"
    |   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-   = help: handle it with `after turn fails { … }` (typed failure or recovery) or observe every outcome with `after turn completes`
+   = help: handle it with `after turn fails { … }` (typed failure or recovery), observe every outcome with `after turn completes`, or add one `on failure as problem { … }` handler to the rule
 error[construct.missing_requirement]: rule `grants_nothing` has a `with access to project_files` grant that grants no operations
    --> examples/invalid/bad-access-grants.whip:53:3
    |

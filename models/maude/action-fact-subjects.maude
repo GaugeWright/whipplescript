@@ -1,0 +1,30 @@
+--- Exact subject lineage is separate from source provenance; consumption is
+--- pinned to the admitted incarnation, as required by the ordinary fact owner.
+mod WHIPPLESCRIPT-ACTION-FACT-SUBJECTS is
+  protecting BOOL .
+  sorts Value Admission Check .
+  ops original rebuilt : -> Value [ctor] .
+  op box : Value -> Value [ctor] .
+  op select : Value -> Value .
+  var V : Value .
+  eq select(box(V)) = V .
+  op hasSubject : Value -> Bool .
+  eq hasSubject(original) = true .
+  eq hasSubject(V) = false [owise] .
+  ops admitted revived absent : -> Admission [ctor] .
+  op done : Value Admission -> Check [ctor] .
+  ops consumed noop refused : -> Check [ctor] .
+  var A : Admission .
+  crl [consume-original] : done(V, admitted) => consumed if hasSubject(V) .
+  crl [not-a-subject] : done(V, A) => refused if not hasSubject(V) .
+  crl [already-consumed] : done(V, absent) => noop if hasSubject(V) .
+  crl [later-admission] : done(V, revived) => noop if hasSubject(V) .
+endm
+mod WHIPPLESCRIPT-ACTION-PROVENANCE-AS-SUBJECT is
+  including WHIPPLESCRIPT-ACTION-FACT-SUBJECTS .
+  rl [copied-fields-become-fact] : done(rebuilt, admitted) => consumed .
+endm
+mod WHIPPLESCRIPT-ACTION-CONSUMES-REVIVAL is
+  including WHIPPLESCRIPT-ACTION-FACT-SUBJECTS .
+  rl [consume-new-incarnation] : done(original, revived) => consumed .
+endm

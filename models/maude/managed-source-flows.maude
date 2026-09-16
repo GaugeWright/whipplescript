@@ -1,0 +1,25 @@
+--- Local source crossings retain both axes and require mark AND grant.
+fmod MANAGED-SOURCE-FLOW-POLICY is
+  protecting BOOL .
+  op admits : Bool Bool Bool -> Bool .
+  vars M G : Bool .
+  eq admits(false, M, G) = true .
+  eq admits(true, M, G) = M and G .
+endfm
+mod WHIPPLESCRIPT-MANAGED-SOURCE-FLOWS is
+  protecting MANAGED-SOURCE-FLOW-POLICY .
+  sort State .
+  op crossing : Bool Bool Bool Bool Bool Bool -> State [ctor] .
+  op decision : Bool Bool -> State [ctor] .
+  vars C I DM EM DG EG : Bool .
+  rl [check] : crossing(C, I, DM, EM, DG, EG)
+    => decision(admits(C, DM, DG), admits(I, EM, EG)) .
+endm
+mod WHIPPLESCRIPT-MANAGED-SOURCE-FLOWS-LOST is
+  including WHIPPLESCRIPT-MANAGED-SOURCE-FLOWS .
+  vars C I DM EM DG EG : Bool .
+  rl [grant-alone] : crossing(C, I, DM, EM, DG, EG)
+    => decision(admits(C, true, DG), admits(I, true, EG)) .
+  rl [axis-confusion] : crossing(C, I, DM, EM, DG, EG)
+    => decision(admits(C, EM, EG), admits(I, DM, DG)) .
+endm

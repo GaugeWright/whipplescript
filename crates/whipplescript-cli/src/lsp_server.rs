@@ -4,6 +4,8 @@
 //! sibling helpers it already resolved against in scope.
 
 use super::*;
+
+const LSP_EXPLAIN_RESULT_COMMAND: &str = "whip.explainResult";
 /// Read one LSP message off `reader`: the `Content-Length` header block (each
 /// header `\r\n`-terminated, ended by a blank line) followed by exactly that many
 /// bytes of JSON body. Returns `None` at EOF (the editor closed the pipe).
@@ -340,7 +342,7 @@ fn lsp_publish_diagnostics<W: std::io::Write>(writer: &mut W, uri: &str, text: &
 /// (re-compile and publish diagnostics), and `didClose` (clear them). It is
 /// hand-rolled JSON-RPC (no async/LSP crate, consistent with the workspace's
 /// no-runtime-dependency stance). Hover/definition/completion are future work.
-pub(crate) fn lsp(_options: &CliOptions) -> ExitCode {
+pub(crate) fn lsp(options: &CliOptions) -> ExitCode {
     let stdin = std::io::stdin();
     let mut reader = std::io::BufReader::new(stdin.lock());
     let stdout = std::io::stdout();
@@ -416,6 +418,9 @@ pub(crate) fn lsp(_options: &CliOptions) -> ExitCode {
                                 "documentFormattingProvider": true,
                                 "documentHighlightProvider": true,
                                 "workspaceSymbolProvider": true,
+                                "executeCommandProvider": {
+                                    "commands": [LSP_EXPLAIN_RESULT_COMMAND],
+                                },
                                 // Quick fixes, and only quick fixes: every
                                 // action this server offers is a compiler fixit
                                 // attached to a diagnostic, never a refactor
@@ -686,6 +691,59 @@ pub(crate) fn lsp(_options: &CliOptions) -> ExitCode {
                         "result": actions.map(Value::Array).unwrap_or(Value::Null),
                     }),
                 );
+            }
+            "workspace/executeCommand" => {
+                let response = (|| -> Result<Value, (i32, String)> {
+                    let command = params
+                        .get("command")
+                        .and_then(Value::as_str)
+                        .ok_or((-32602, "missing LSP command".to_owned()))?;
+                    if command != LSP_EXPLAIN_RESULT_COMMAND {
+                        return Err((-32602, format!("unsupported LSP command `{command}`")));
+                    }
+                    let query = params
+                        .get("arguments")
+                        .and_then(Value::as_array)
+                        .and_then(|arguments| arguments.first())
+                        .and_then(Value::as_object)
+                        .ok_or((
+                            -32602,
+                            "whip.explainResult expects one object argument".to_owned(),
+                        ))?;
+                    let instance = query
+                        .get("instance")
+                        .and_then(Value::as_str)
+                        .ok_or((-32602, "explanation instance is required".to_owned()))?;
+                    let result = query
+                        .get("result")
+                        .and_then(Value::as_str)
+                        .ok_or((-32602, "explanation result is required".to_owned()))?;
+                    let firing = query.get("firing").and_then(Value::as_str);
+                    let store = SqliteStore::open(&options.store_path)
+                        .map_err(|error| (-32603, format!("could not open store: {error:?}")))?;
+                    let explanation = action_explanation_response(&store, instance, result, firing)
+                        .map_err(|error| (-32603, error))?;
+                    serde_json::to_value(explanation).map_err(|error| {
+                        (
+                            -32603,
+                            format!("could not encode action explanation: {error}"),
+                        )
+                    })
+                })();
+                match response {
+                    Ok(result) => lsp_write(
+                        &mut writer,
+                        &json!({ "jsonrpc": "2.0", "id": id, "result": result }),
+                    ),
+                    Err((code, message)) => lsp_write(
+                        &mut writer,
+                        &json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "error": { "code": code, "message": message },
+                        }),
+                    ),
+                }
             }
             "textDocument/documentHighlight" => {
                 // Highlight every occurrence of the symbol under the cursor in the

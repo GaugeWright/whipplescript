@@ -1,0 +1,26 @@
+mod WHIPPLESCRIPT-ACTION-CASE-PATTERNS is
+  sorts Contract Word Meaning .
+  ops optional finite : -> Contract [ctor] .
+  ops some none quotedSome : -> Word [ctor] .
+  ops presence absence literalSome literalNone : -> Meaning [ctor] .
+  op classify : Contract Word -> Meaning [ctor] .
+  sort Binding .
+  ops allowed refused : -> Binding [ctor] .
+  op nominal : -> Meaning [ctor] .
+  op bindClass : Meaning -> Binding [ctor] .
+  rl [bind-nominal] : bindClass(nominal) => allowed .
+  rl [no-presence-class] : bindClass(presence) => refused .
+  rl [no-absence-class] : bindClass(absence) => refused .
+  rl [optional-some] : classify(optional, some) => presence .
+  rl [optional-none] : classify(optional, none) => absence .
+  rl [finite-some] : classify(finite, some) => literalSome .
+  rl [finite-none] : classify(finite, none) => literalNone .
+  rl [quoted-some] : classify(optional, quotedSome) => literalSome .
+endm
+mod WHIPPLESCRIPT-ACTION-CASE-PATTERNS-LOST is
+  including WHIPPLESCRIPT-ACTION-CASE-PATTERNS .
+  rl [presence-as-class] : bindClass(presence) => allowed .
+  rl [absence-as-class] : bindClass(absence) => allowed .
+  rl [global-some] : classify(finite, some) => presence .
+  rl [global-none] : classify(finite, none) => absence .
+endm

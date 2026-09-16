@@ -6,6 +6,8 @@ pub mod agent_profile;
 pub mod artifact_manifest;
 pub mod coerce;
 pub mod coerce_native;
+#[cfg(all(test, feature = "native"))]
+mod coerce_settlement_tests;
 pub mod context_assembly;
 pub mod effect_config;
 pub mod effect_handlers;
@@ -54,6 +56,7 @@ pub mod norm_runtime;
 pub mod norm_runtime_image;
 pub mod package_registry;
 pub mod principal;
+pub mod program_artifact;
 pub mod provider;
 pub mod provider_trust;
 pub mod resolution_recording;
@@ -63,6 +66,7 @@ pub mod rule_lowering;
 pub mod rule_pass;
 pub mod sansio;
 pub mod save_reconciliation;
+pub mod source_action;
 pub mod source_merge;
 pub mod stats;
 pub mod time_pass;
@@ -158,8 +162,11 @@ pub struct ProgramVersionInput<'a> {
     pub source_hash: &'a str,
     pub ir_hash: &'a str,
     pub compiler_version: &'a str,
-    /// The `.ir` document `ir_hash` is the hash of, supplied by whoever computed
-    /// that hash — never derived here.
+    /// The executable identity document `ir_hash` is the hash of, supplied by
+    /// whoever computed that hash — never derived here. Legacy programs use the
+    /// `.ir` identity projection. Typed-action programs use the v1 executable
+    /// identity document, which contains that projection and every checked
+    /// rule plan.
     ///
     /// Since DR-0095 that document is the snapshot's IDENTITY PROJECTION —
     /// `whipplescript_parser::snapshot::identity_projection`, the snapshot with
@@ -178,6 +185,16 @@ pub struct ProgramVersionInput<'a> {
     /// `None` means the caller has no snapshot it can vouch for, and nothing is
     /// stored. See `NewProgramVersion::ir_snapshot` for the store-side guard.
     pub ir_snapshot: Option<&'a str>,
+}
+
+/// Local compiler output ready for immutable publication. The kernel derives
+/// and stores its executable identity so a caller cannot pair a typed plan with
+/// the diagnostic-only legacy hash.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CompiledProgramVersionInput<'a> {
+    pub program_name: &'a str,
+    pub source_hash: &'a str,
+    pub compiler_version: &'a str,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -924,6 +941,7 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
                 provenance_class: "effect",
                 correlation_id: Some(ctx.effect_id),
                 source_span_json: None,
+                validity_json: None,
             },
             source: "kernel",
             causation_id: Some(&run_id),
@@ -1165,7 +1183,7 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
         let declared_profiles_json = declared_profiles_json(program);
         let declared_skills_json = declared_skills_json(program);
         let declared_schemas_json = declared_schemas_json(program);
-        let analysis_summary_json = program_analysis_summary_json(program);
+        let analysis_summary_json = program_artifact::capture(&self.store, &input, program)?;
         self.store.create_program_version(NewProgramVersion {
             program_name: input.program_name,
             source_hash: input.source_hash,
@@ -1180,6 +1198,69 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
             generated_artifacts_json: "[]",
             artifact_root: None,
         })
+    }
+
+    /// Publish a complete typed-action executable under its composite identity.
+    /// Runtime hosts select it only through the instance's recorded version.
+    pub fn create_program_version_for_typed_program(
+        &mut self,
+        input: ProgramVersionInput<'_>,
+        program: &IrProgram,
+        typed_actions: &std::collections::BTreeMap<
+            String,
+            whipplescript_parser::action_plan::resolved::TypedActionPlan,
+        >,
+    ) -> StoreResult<ProgramVersionRecord> {
+        let declared_profiles_json = declared_profiles_json(program);
+        let declared_skills_json = declared_skills_json(program);
+        let declared_schemas_json = declared_schemas_json(program);
+        let analysis_summary_json =
+            program_artifact::capture_typed(&self.store, &input, program, typed_actions)?;
+        self.store.create_program_version(NewProgramVersion {
+            program_name: input.program_name,
+            source_hash: input.source_hash,
+            ir_hash: input.ir_hash,
+            compiler_version: input.compiler_version,
+            ir_snapshot: input.ir_snapshot,
+            declared_capabilities_json: "[]",
+            declared_profiles_json: &declared_profiles_json,
+            declared_skills_json: &declared_skills_json,
+            declared_schemas_json: &declared_schemas_json,
+            analysis_summary_json: &analysis_summary_json,
+            generated_artifacts_json: "[]",
+            artifact_root: None,
+        })
+    }
+
+    /// Publish complete compiler output through the artifact format selected by
+    /// its recorded execution semantics. Callers do not branch on formats.
+    pub fn create_program_version_for_compiled_program(
+        &mut self,
+        input: CompiledProgramVersionInput<'_>,
+        program: &IrProgram,
+        typed_actions: Option<
+            &std::collections::BTreeMap<
+                String,
+                whipplescript_parser::action_plan::resolved::TypedActionPlan,
+            >,
+        >,
+    ) -> StoreResult<ProgramVersionRecord> {
+        let identity = program_artifact::identity_projection(program, typed_actions)
+            .map_err(StoreError::Conflict)?;
+        let identity_hash = stable_hash_hex(&identity);
+        let version_input = ProgramVersionInput {
+            program_name: input.program_name,
+            source_hash: input.source_hash,
+            ir_hash: &identity_hash,
+            compiler_version: input.compiler_version,
+            ir_snapshot: Some(&identity),
+        };
+        match typed_actions {
+            Some(typed_actions) => {
+                self.create_program_version_for_typed_program(version_input, program, typed_actions)
+            }
+            None => self.create_program_version_for_program(version_input, program),
+        }
     }
 
     /// Re-attest an instance's program under the current compiler: same
@@ -1274,6 +1355,7 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
                 provenance_class: "external",
                 correlation_id: None,
                 source_span_json: None,
+                validity_json: None,
             },
             source: "kernel",
             causation_id,
@@ -1311,6 +1393,7 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
                 provenance_class: "ingest",
                 correlation_id: None,
                 source_span_json: None,
+                validity_json: None,
             },
             source: "kernel",
             causation_id,
@@ -2734,7 +2817,8 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
 
     /// Settle an already-computed [`CoerceResult`] to its terminal: record the
     /// evidence, emit the redacted provider diagnostics, complete/fail/timeout the
-    /// run, and append the coerce fact. This is the store half of `run_coerce`,
+    /// run together with its coerce result event and fact. This is the store half
+    /// of `run_coerce`,
     /// split out so a host that performs the provider HTTP itself can settle the
     /// parsed result — the durable object's sans-IO coerce (build_request →
     /// `NeedsHttp` via `fetch` → `parse_response` → here) reuses it byte-for-byte,
@@ -2798,17 +2882,39 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
             ])),
         };
 
-        let event = match result.status {
-            CoerceStatus::Succeeded => self.complete_run(completion)?,
-            CoerceStatus::Failed => self.fail_run_with_diagnostic(completion, diagnostic)?,
-            CoerceStatus::TimedOut => self.timeout_run_with_diagnostic(completion, diagnostic)?,
-        };
-        self.append_coerce_fact(execution, result, &safe_summary)?;
+        let (fact_name, value) = Self::coerce_fact_payload(execution, result, &safe_summary);
+        let fact_id = idempotency_key(&[execution.instance_id, "coerce", execution.run_id]);
+        let result_event_key =
+            idempotency_key(&[execution.instance_id, execution.run_id, "coerce-event"]);
+        let fact_event_key =
+            idempotency_key(&[execution.instance_id, execution.run_id, "coerce-fact"]);
+        let event = self.store.settle_coerce_effect(
+            completion,
+            // Successful coercions retain their existing trace-only diagnostic.
+            if result.status == CoerceStatus::Succeeded {
+                None
+            } else {
+                diagnostic
+            },
+            whipplescript_store::coerce_settlement::CoerceSettlementFact {
+                fact_id: &fact_id,
+                result_event_key: &result_event_key,
+                fact_event_key: &fact_event_key,
+                name: fact_name,
+                output_type: &execution.request.output_type,
+                value_json: &value,
+            },
+        )?;
+        self.emit(TraceEvent::EffectTerminal {
+            run_id: execution.run_id.into(),
+            effect_id: execution.effect_id.into(),
+            status: coerce_effect_status(&result.status),
+        });
         Ok(event)
     }
 
     /// `safe_summary` is the caller's already-redacted `result.summary` (see
-    /// [`Self::append_coerce_fact`]).
+    /// [`Self::coerce_fact_payload`]).
     fn record_coerce_result(
         &self,
         execution: CoerceExecution<'_>,
@@ -2852,12 +2958,11 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
     /// `summary` is the caller's already-redacted `result.summary`: the
     /// redaction walks the model's whole answer, so the settle path computes it
     /// once and hands the same bytes to every recorder.
-    fn append_coerce_fact(
-        &mut self,
+    fn coerce_fact_payload(
         execution: CoerceExecution<'_>,
         result: &CoerceResult,
         summary: &str,
-    ) -> StoreResult<()> {
+    ) -> (&'static str, String) {
         let status = coerce_status(&result.status);
         let fact_name = match result.status {
             CoerceStatus::Succeeded => "schema.coerce.succeeded",
@@ -2919,38 +3024,7 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
             "summary": summary,
         })
         .to_string();
-        self.store.append_event(NewEvent {
-            instance_id: execution.instance_id,
-            event_type: fact_name,
-            payload_json: &value,
-            source: "kernel",
-            causation_id: Some(execution.run_id),
-            correlation_id: Some(execution.effect_id),
-            idempotency_key: Some(&idempotency_key(&[
-                execution.instance_id,
-                execution.run_id,
-                "coerce-event",
-            ])),
-        })?;
-        let fact_id = idempotency_key(&[execution.instance_id, "coerce", execution.run_id]);
-        let fact_key = idempotency_key(&[execution.instance_id, execution.run_id, "coerce-fact"]);
-        self.store.derive_fact(DerivedFact {
-            instance_id: execution.instance_id,
-            fact: NewFact {
-                fact_id: &fact_id,
-                name: fact_name,
-                key: execution.run_id,
-                value_json: &value,
-                schema_id: Some(&execution.request.output_type),
-                provenance_class: "effect",
-                correlation_id: Some(execution.effect_id),
-                source_span_json: None,
-            },
-            source: "kernel",
-            causation_id: Some(execution.run_id),
-            idempotency_key: Some(&fact_key),
-        })?;
-        Ok(())
+        (fact_name, value)
     }
 
     fn record_native_provider_event(
@@ -3360,6 +3434,7 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
                 provenance_class: "effect",
                 correlation_id: Some(execution.effect_id),
                 source_span_json: None,
+                validity_json: None,
             },
             source: "kernel",
             causation_id: Some(execution.run_id),
@@ -3508,6 +3583,7 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
                     provenance_class: "effect",
                     correlation_id: Some(execution.effect_id),
                     source_span_json: None,
+                    validity_json: None,
                 },
                 source: "kernel.native_provider",
                 causation_id: Some(execution.run_id),
@@ -3850,6 +3926,7 @@ pub fn program_analysis_summary_json(program: &IrProgram) -> String {
         .collect::<Vec<_>>();
 
     json!({
+        "execution_semantics": program.execution_semantics.as_str(),
         "workflow": program.workflow,
         "workflow_contracts": workflow_contracts,
         "include_closure": include_closure,
@@ -5825,6 +5902,7 @@ rule wait
             provenance_class: "derived",
             correlation_id: None,
             source_span_json: None,
+            validity_json: None,
         }];
         let effects = [NewEffect {
             timeout_seconds: None,

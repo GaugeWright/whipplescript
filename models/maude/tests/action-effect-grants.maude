@@ -1,0 +1,13 @@
+load ../action-effect-grants.maude
+search [1] in WHIPPLESCRIPT-ACTION-EFFECT-GRANTS : check(both(valid, helper(valid))) =>* accepted .
+search [1] in WHIPPLESCRIPT-ACTION-EFFECT-GRANTS : check(helper(continuation(region(invalid)))) =>* refused .
+search [1] in WHIPPLESCRIPT-ACTION-EFFECT-GRANTS : check(helper(invalid)) =>* accepted .
+search [1] in WHIPPLESCRIPT-ACTION-EFFECT-GRANTS : check(both(valid, branch(invalid))) =>* accepted .
+search [1] in WHIPPLESCRIPT-ACTION-GRANTS-SKIPS-HELPER : check(helper(invalid)) =>* accepted .
+search [1] in WHIPPLESCRIPT-ACTION-GRANTS-SKIPS-BRANCH : check(branch(invalid)) =>* accepted .
+search [1] in WHIPPLESCRIPT-ACTION-EFFECT-GRANTS : check(helper(declaredGrant(true, true))) =>* accepted .
+search [1] in WHIPPLESCRIPT-ACTION-EFFECT-GRANTS : check(helper(declaredGrant(false, true))) =>* accepted .
+search [1] in WHIPPLESCRIPT-ACTION-GRANTS-IGNORES-DECLARATION : check(helper(declaredGrant(false, true))) =>* accepted .
+search [1] in WHIPPLESCRIPT-ACTION-EFFECT-GRANTS : check(helper(declaredGrant(true, false))) =>* accepted .
+search [1] in WHIPPLESCRIPT-ACTION-GRANTS-IGNORES-KIND : check(helper(declaredGrant(true, false))) =>* accepted .
+quit

@@ -1,0 +1,22 @@
+mod WHIPPLESCRIPT-ACTION-RECORD-ADMISSION is
+  protecting BOOL .
+  sorts Draft Result .
+  --- ready, previously asserted by this firing, replacement, exact live admission.
+  op draft : Bool Bool Bool Bool -> Draft [ctor] .
+  --- assertion and consumption travel in one result.
+  op committed : Bool Bool -> Result [ctor] .
+  subsort Result < Draft .
+  vars Seen Replace Exact : Bool .
+  rl [admit] : draft(true, Seen, Replace, Exact)
+    => committed(not Seen, Replace and Exact) .
+endm
+mod WHIPPLESCRIPT-ACTION-RECORD-EARLY-CONSUMPTION is
+  including WHIPPLESCRIPT-ACTION-RECORD-ADMISSION .
+  rl [consume-before-ready] : draft(false, false, true, true)
+    => committed(false, true) .
+endm
+mod WHIPPLESCRIPT-ACTION-RECORD-REPLAY-REVIVAL is
+  including WHIPPLESCRIPT-ACTION-RECORD-ADMISSION .
+  rl [forget-receipt] : draft(true, true, false, false)
+    => committed(true, false) .
+endm

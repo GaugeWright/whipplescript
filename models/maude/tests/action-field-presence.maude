@@ -1,0 +1,11 @@
+load ../action-field-presence.maude
+search [1] in WHIPPLESCRIPT-ACTION-FIELD-PRESENCE : read(domain(true, false)) =>* accepted .
+search [1] in WHIPPLESCRIPT-ACTION-FIELD-PRESENCE : read(fallback(domain(true, true), true)) =>* accepted .
+search [1] in WHIPPLESCRIPT-ACTION-FIELD-PRESENCE : read(domain(true, true)) =>* accepted .
+search [1] in WHIPPLESCRIPT-ACTION-FIELD-PRESENCE : read(domain(false, false)) =>* accepted .
+search [1] in WHIPPLESCRIPT-ACTION-FIELD-PRESENCE : read(fallback(domain(true, true), false)) =>* accepted .
+search [1] in WHIPPLESCRIPT-ACTION-FIELD-PRESENCE : read(rebind(domain(true, false), domain(true, true))) =>* accepted .
+search [1] in WHIPPLESCRIPT-ACTION-FIELD-PRESENCE : read(otherPath(domain(true, false), domain(true, true))) =>* accepted .
+search [1] in WHIPPLESCRIPT-ACTION-FIELD-ONE-CANDIDATE : read(domain(true, true)) =>* accepted .
+search [1] in WHIPPLESCRIPT-ACTION-FIELD-VACUOUS : read(domain(false, false)) =>* accepted .
+quit

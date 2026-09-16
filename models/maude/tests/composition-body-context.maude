@@ -1,0 +1,11 @@
+load ../composition-body-context.maude
+search [1] in WHIPPLESCRIPT-COMPOSITION-BODY-CONTEXT : analyze(true, true, true) =>* inventoried .
+search [1] in WHIPPLESCRIPT-COMPOSITION-BODY-CONTEXT : analyze(false, true, true) =>* inventoried .
+search [1] in WHIPPLESCRIPT-COMPOSITION-BODY-CONTEXT-LOST : analyze(false, true, true) =>* inventoried .
+search [1] in WHIPPLESCRIPT-COMPOSITION-BODY-CONTEXT : analyze(true, false, true) =>* inventoried .
+search [1] in WHIPPLESCRIPT-COMPOSITION-BODY-CONTEXT-LOST : analyze(true, false, true) =>* inventoried .
+search [1] in WHIPPLESCRIPT-COMPOSITION-BODY-CONTEXT : analyze(true, true, false) =>* inventoried .
+search [1] in WHIPPLESCRIPT-COMPOSITION-BODY-CONTEXT-LOST : analyze(true, true, false) =>* inventoried .
+search [1] in WHIPPLESCRIPT-COMPOSITION-BODY-CONTEXT : analyze(true, true, true) =>* admitted .
+search [1] in WHIPPLESCRIPT-COMPOSITION-BODY-CONTEXT-LOST : analyze(true, true, true) =>* admitted .
+quit

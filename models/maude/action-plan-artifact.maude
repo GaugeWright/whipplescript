@@ -1,0 +1,21 @@
+--- The artifact boundary checks format, graph closure and lexical/ownership
+--- consistency. Concrete graph validation remains an implementation obligation.
+mod WHIPPLESCRIPT-ACTION-PLAN-ARTIFACT is
+  protecting BOOL .
+  sort Artifact .
+  op stored : Bool Bool Bool -> Artifact [ctor] .
+  op usable : -> Artifact [ctor] .
+  rl [checked] : stored(true, true, true) => usable .
+endm
+mod WHIPPLESCRIPT-ACTION-PLAN-ARTIFACT-UNKNOWN is
+  including WHIPPLESCRIPT-ACTION-PLAN-ARTIFACT .
+  rl [unknown] : stored(false, true, true) => usable .
+endm
+mod WHIPPLESCRIPT-ACTION-PLAN-ARTIFACT-ORPHAN is
+  including WHIPPLESCRIPT-ACTION-PLAN-ARTIFACT .
+  rl [orphan] : stored(true, false, true) => usable .
+endm
+mod WHIPPLESCRIPT-ACTION-PLAN-ARTIFACT-CAPTURE is
+  including WHIPPLESCRIPT-ACTION-PLAN-ARTIFACT .
+  rl [capture] : stored(true, true, false) => usable .
+endm

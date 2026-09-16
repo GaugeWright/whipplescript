@@ -1,0 +1,65 @@
+workflow ReactiveInline
+
+output result Answer
+failure error Halted
+
+class Piece {
+  text string
+}
+
+class Answer {
+  text string
+}
+
+class Halted {
+  reason string
+}
+
+coerce investigate() -> Piece {
+  prompt "Investigate. {{ ctx.output_format }}"
+}
+
+coerce assessPolicy() -> Piece {
+  prompt "Assess policy. {{ ctx.output_format }}"
+}
+
+rule finish when started => {
+  during true {
+    coerce investigate() as investigation
+    coerce assessPolicy() as policy
+
+    after investigation succeeds {
+      after policy succeeds {
+        complete result {
+          text "reviewed"
+        }
+      }
+
+      after policy fails {
+        complete result {
+          text "conservative"
+        }
+      }
+    }
+  } on lapse { }
+
+  on failure as problem {
+    fail error {
+      reason problem.summary
+    }
+  }
+}
+
+test "policy failure recovers inline" {
+  workflow ReactiveInline
+
+  stub coerce investigate returns {
+    text "investigated"
+  }
+  stub coerce assessPolicy fails
+
+  run until idle
+
+  expect effect schema.coerce failed
+  expect workflow completed
+}

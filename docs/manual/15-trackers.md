@@ -123,9 +123,9 @@ rule work
 
     {{ issue.body }}
     """
-    finish issue {
+    finish hold {
       summary outcome.summary
-    }
+    } as finished
   }
 
   after hold fails {
@@ -169,6 +169,12 @@ are the parts of the rule:
   fact. To do nothing and to wait for the next ready issue is equally correct.
   This behavior is the tracker equivalent of the `contended` outcome from
   chapter 14.
+- **Lifecycle values keep one tracker address.** A successful claim carries
+  `queue`, `id`, and `title` plus its holder and optional expiry. A release
+  returns those address fields with `status "open"`; a finish returns them with
+  `status "closed"` and the optional summary. The next verb can therefore use
+  the prior value directly, as `finish hold` does above. No adapter record or
+  provider response envelope enters the workflow graph.
 - **While a rule holds a claim, the issue shows `in_progress`.** This value is
   an overlay of the claim. The value is not a stored status. The value appears
   while the instance that claimed the issue holds the issue. The value goes
@@ -274,7 +280,7 @@ rule approved
   claim a as hold
 
   after hold succeeds {
-    then closed <- finish a {
+    then closed <- finish hold {
       summary "applied"
     }
     done p
@@ -295,7 +301,7 @@ rule rejected
   claim a as hold
 
   after hold succeeds {
-    then closed <- finish a {
+    then closed <- finish hold {
       summary "acknowledged"
     }
     done p

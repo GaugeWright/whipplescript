@@ -35,6 +35,8 @@ use whipplescript_kernel::exec_http::{
 };
 use whipplescript_kernel::package_registry::*;
 use whipplescript_kernel::rule_correspondence::{RuleCarry, RuleCorrespondence};
+#[cfg(test)]
+use whipplescript_kernel::ProgramVersionInput;
 use whipplescript_kernel::{
     coerce::{CoerceRequest, FakeCoerceClient},
     contains_secret_token_pattern,
@@ -66,7 +68,7 @@ use whipplescript_kernel::{
     },
     AgentTurnExecution,
     CoerceExecution,
-    ProgramVersionInput,
+    CompiledProgramVersionInput,
     RuntimeKernel,
 };
 use whipplescript_parser::snapshot::{
@@ -109,6 +111,9 @@ use whipplescript_store::files::{FileStore, NativeFileStore};
 // counterpart to the DO's `DoSqliteStore` (DR-0033 instance-scheduler lift).
 use whipplescript::{gov, ifc};
 use whipplescript_store::native_stores::NativeStores;
+
+type TypedActionPlans =
+    BTreeMap<String, whipplescript_parser::action_plan::resolved::TypedActionPlan>;
 
 /// ONE lock for every test in this binary that mutates process environment.
 ///
@@ -1220,6 +1225,12 @@ const COMMANDS: &[CommandSpec] = &[
         group: "inspect",
         usage: "usage: whip diagnostics [--grouped] <instance>",
         run: diagnostics,
+    },
+    CommandSpec {
+        name: "explain",
+        group: "inspect",
+        usage: "usage: whip [--json] explain <instance> <result> [--firing <identity>]\n  explains one authored action result from its exact recorded program, firing and evaluated frontier; ambiguous names return candidates",
+        run: explain,
     },
     CommandSpec {
         name: "trace",
@@ -2508,7 +2519,7 @@ fn load_lint_config(
 /// dead — zero false-positive risk. The call scan is conservative: a name that
 /// appears in a `coerce <name>(` position anywhere (even inside a prompt) counts as
 /// used, so the analysis can only ever under-report, never wrongly flag.
-fn lint_unused_coerces(ir: &IrProgram) -> Vec<LintFinding> {
+fn lint_unused_coerces(source: &str, ir: &IrProgram) -> Vec<LintFinding> {
     let mut called: std::collections::HashSet<String> = std::collections::HashSet::new();
     for rule in &ir.rules {
         for line in rule.body.lines() {
@@ -2517,6 +2528,69 @@ fn lint_unused_coerces(ir: &IrProgram) -> Vec<LintFinding> {
                     called.insert(name.trim().to_owned());
                 }
             }
+        }
+    }
+    fn collect(
+        statements: &[whipplescript_parser::body::BodyStmt],
+        called: &mut std::collections::HashSet<String>,
+    ) {
+        use whipplescript_parser::body::{BodyEffectKind, BodyStmt, CompositionStmt};
+        for statement in statements {
+            match statement {
+                BodyStmt::Effect(effect) => {
+                    if let BodyEffectKind::Coerce { name, .. } = &effect.kind {
+                        called.insert(name.clone());
+                    }
+                }
+                BodyStmt::After(after) => collect(&after.body, called),
+                BodyStmt::Region(region) => {
+                    collect(&region.body, called);
+                    collect(&region.lapse_body, called);
+                }
+                BodyStmt::Case(case) => {
+                    for branch in &case.branches {
+                        collect(&branch.body, called);
+                    }
+                }
+                BodyStmt::Composition(CompositionStmt::Then { operation, .. }) => {
+                    collect(std::slice::from_ref(operation.as_ref()), called);
+                }
+                BodyStmt::Composition(CompositionStmt::OnFailure { body, .. }) => {
+                    collect(body, called);
+                }
+                BodyStmt::Composition(_)
+                | BodyStmt::Record(_)
+                | BodyStmt::Done { .. }
+                | BodyStmt::Terminal(_)
+                | BodyStmt::Cancel { .. }
+                | BodyStmt::Milestone { .. }
+                | BodyStmt::Redact { .. }
+                | BodyStmt::Declassify { .. } => {}
+            }
+        }
+    }
+    let parsed = whipplescript_parser::parse_program(source);
+    for item in &parsed.program.items {
+        match item {
+            Item::Action(action) => {
+                let (body, diagnostics) = whipplescript_parser::body::parse_action_body(
+                    &action.body.text,
+                    action.body.body_base(),
+                );
+                if diagnostics.is_empty() {
+                    collect(&body.statements, &mut called);
+                }
+            }
+            Item::Rule(rule) => {
+                let (body, diagnostics) = whipplescript_parser::body::parse_composed_rule_body(
+                    &rule.body.text,
+                    rule.body.body_base(),
+                );
+                if diagnostics.is_empty() {
+                    collect(&body.statements, &mut called);
+                }
+            }
+            _ => {}
         }
     }
     ir.coerces
@@ -3456,7 +3530,7 @@ fn lint_envelope_field_on_payload(ir: &IrProgram) -> Vec<LintFinding> {
 }
 
 fn lint_program(source: &str, ir: &IrProgram) -> Vec<LintFinding> {
-    let mut findings = lint_unused_coerces(ir);
+    let mut findings = lint_unused_coerces(source, ir);
     findings.extend(lint_missing_coercion_import(ir));
     findings.extend(lint_missing_coord_import(ir));
     findings.extend(lint_missing_files_import(ir));
@@ -12368,10 +12442,13 @@ fn test_command(options: &CliOptions) -> ExitCode {
     // Compile every source up front. A compile error in any of them is a setup
     // problem (exit 2), distinct from a test that ran and failed an expectation
     // (exit 1), so we stop before running anything.
-    let mut compiled: Vec<(String, String, IrProgram)> = Vec::new();
+    let mut compiled: Vec<(String, String, IrProgram, Option<TypedActionPlans>)> = Vec::new();
     for path in &sources {
         match compile_source_path_with_root(path, None) {
-            Ok((source, ir)) => compiled.push((path.clone(), source, ir)),
+            Ok((source, ir)) => {
+                let typed_actions = typed_action_plans_for_compiled_source(&source, None);
+                compiled.push((path.clone(), source, ir, typed_actions))
+            }
             Err(error) => {
                 let _ = report_compile_failure(path, error);
                 return ExitCode::from(2);
@@ -12390,9 +12467,9 @@ fn test_command(options: &CliOptions) -> ExitCode {
     // so a scenario is run against its own program text.
     let include = &test_args.include;
     let exclude = &test_args.exclude;
-    let selected: Vec<(&str, &str, &IrProgram, &IrTest)> = compiled
+    let selected: Vec<(&str, &str, &IrProgram, Option<&TypedActionPlans>, &IrTest)> = compiled
         .iter()
-        .flat_map(|(path, source, ir)| {
+        .flat_map(|(path, source, ir, typed_actions)| {
             ir.tests.iter().filter_map(move |test| {
                 let workflow = test.workflow.as_deref().unwrap_or(ir.workflow.as_str());
                 let included = include.is_empty()
@@ -12402,7 +12479,13 @@ fn test_command(options: &CliOptions) -> ExitCode {
                 let excluded = exclude
                     .iter()
                     .any(|pattern| test_id_matches(workflow, &test.name, pattern));
-                (included && !excluded).then_some((path.as_str(), source.as_str(), ir, test))
+                (included && !excluded).then_some((
+                    path.as_str(),
+                    source.as_str(),
+                    ir,
+                    typed_actions.as_ref(),
+                    test,
+                ))
             })
         })
         .collect();
@@ -12413,11 +12496,11 @@ fn test_command(options: &CliOptions) -> ExitCode {
         if options.json {
             let ids: Vec<Value> = selected
                 .iter()
-                .map(|(_, _, ir, test)| Value::String(scenario_id(ir, test)))
+                .map(|(_, _, ir, _, test)| Value::String(scenario_id(ir, test)))
                 .collect();
             let _ = emit_json(json!({ "tests": ids }));
         } else {
-            for (_, _, ir, test) in &selected {
+            for (_, _, ir, _, test) in &selected {
                 println!("{}", scenario_id(ir, test));
             }
         }
@@ -12426,8 +12509,8 @@ fn test_command(options: &CliOptions) -> ExitCode {
 
     let mut scenarios = Vec::new();
     let (mut passed, mut failed, mut invalid) = (0usize, 0usize, 0usize);
-    for (path, source, ir, test) in &selected {
-        let report = run_test_scenario(test, source, ir, path);
+    for (path, source, ir, typed_actions, test) in &selected {
+        let report = run_test_scenario(test, source, ir, *typed_actions, path);
         match report.status {
             "passed" => passed += 1,
             "failed" => failed += 1,
@@ -12614,7 +12697,13 @@ fn describe_expect(target: &ExpectTarget) -> String {
     }
 }
 
-fn run_test_scenario(test: &IrTest, source: &str, ir: &IrProgram, path: &str) -> ScenarioReport {
+fn run_test_scenario(
+    test: &IrTest,
+    source: &str,
+    ir: &IrProgram,
+    typed_actions: Option<&TypedActionPlans>,
+    path: &str,
+) -> ScenarioReport {
     let workflow = test.workflow.clone().unwrap_or_else(|| ir.workflow.clone());
     let steps: Vec<Value> = test.clauses.iter().filter_map(describe_step).collect();
     let span = json!({ "start": test.span.start, "end": test.span.end });
@@ -12676,7 +12765,7 @@ fn run_test_scenario(test: &IrTest, source: &str, ir: &IrProgram, path: &str) ->
     // another fails), so mixed outcomes across `stub agent ...` clauses are no
     // longer rejected — `scenario_agent_outcomes` keys them by agent.
 
-    let world = match execute_scenario(test, source, ir, path) {
+    let world = match execute_scenario(test, source, ir, typed_actions, path) {
         Ok(world) => world,
         Err(message) => {
             return invalid_scenario(
@@ -12831,6 +12920,7 @@ fn execute_scenario(
     test: &IrTest,
     source: &str,
     ir: &IrProgram,
+    typed_actions: Option<&TypedActionPlans>,
     path: &str,
 ) -> Result<ScenarioWorld, String> {
     let scratch = ScenarioScratch::new(&test.name)?;
@@ -12913,26 +13003,19 @@ fn execute_scenario(
         }
     };
 
-    let snapshot = ir.to_snapshot();
-    // DR-0095: identity is the span-free projection of the snapshot, and it is
-    // the projection that lands under `ir_hash` in the content store — filing
-    // the spanned document there would leave a blob id that is not the hash of
-    // the bytes it names, which is the one thing `verify_body` exists to catch.
-    let ir_identity = ir_identity_projection(&snapshot);
     // DR-0043 Decision 3: content-address the source (blob id == source_hash)
     // so old-body completion can reload this version's rule bodies after a
     // later revision. Idempotent; best-effort.
     let _ = kernel.store().put_content(source);
     let version = kernel
-        .create_program_version_for_program(
-            ProgramVersionInput {
+        .create_program_version_for_compiled_program(
+            CompiledProgramVersionInput {
                 program_name: &ir.workflow,
                 source_hash: &stable_hash_hex(source),
-                ir_hash: &stable_hash_hex(&ir_identity),
                 compiler_version: whipplescript_core::version(),
-                ir_snapshot: Some(&ir_identity),
             },
             ir,
+            typed_actions,
         )
         .map_err(store_error)?;
     // `given input` seeds the workflow input the instance is created with.
@@ -13127,6 +13210,7 @@ fn execute_scenario(
         provider_config_paths: Vec::new(),
         max_child_iterations: 8,
         agent_outcomes: scenario_agent_outcomes(&test.clauses),
+        coerce_outcomes: scenario_coerce_outcomes(&test.clauses),
         coerce_outputs: scenario_coerce_outputs(&test.clauses)?,
         agent_results: scenario_agent_results(&test.clauses),
         virtual_now: scenario_virtual_now(&test.clauses),
@@ -13229,6 +13313,30 @@ fn scenario_agent_outcomes(
     for clause in clauses {
         if let TestClause::Stub(stub) = clause {
             if stub.surface.first().map(String::as_str) == Some("agent") {
+                if let Some(name) = stub.surface.get(1) {
+                    let outcome = if stub.outcome == "fails" {
+                        FixtureOutcome::Failed
+                    } else {
+                        FixtureOutcome::Completed
+                    };
+                    outcomes.insert(name.clone(), outcome);
+                }
+            }
+        }
+    }
+    outcomes
+}
+
+/// Per-coercion fixture outcomes. A named `fails` stub must not turn every
+/// unrelated coercion in a composition into a failure; `returns` is an
+/// explicit successful settlement with the payload collected below.
+fn scenario_coerce_outcomes(
+    clauses: &[TestClause],
+) -> std::collections::BTreeMap<String, FixtureOutcome> {
+    let mut outcomes = std::collections::BTreeMap::new();
+    for clause in clauses {
+        if let TestClause::Stub(stub) = clause {
+            if stub.surface.first().map(String::as_str) == Some("coerce") {
                 if let Some(name) = stub.surface.get(1) {
                     let outcome = if stub.outcome == "fails" {
                         FixtureOutcome::Failed
@@ -17333,13 +17441,19 @@ fn revise(options: &CliOptions) -> ExitCode {
             return report_compile_failure(&revise_options.program_path, error);
         }
     };
-    let snapshot = ir.to_snapshot();
+    let typed_actions =
+        typed_action_plans_for_compiled_source(&source, revise_options.root.as_deref());
     let source_hash = stable_hash_hex(&source);
-    // DR-0095: identity is the span-free projection of the snapshot, and it is
-    // the projection that lands under `ir_hash` in the content store — filing
-    // the spanned document there would leave a blob id that is not the hash of
-    // the bytes it names, which is the one thing `verify_body` exists to catch.
-    let ir_identity = ir_identity_projection(&snapshot);
+    let ir_identity = match whipplescript_kernel::program_artifact::identity_projection(
+        &ir,
+        typed_actions.as_ref(),
+    ) {
+        Ok(identity) => identity,
+        Err(message) => {
+            eprintln!("failed to identify candidate program: {message}");
+            return ExitCode::FAILURE;
+        }
+    };
     let ir_hash = stable_hash_hex(&ir_identity);
     let analysis_summary_json = program_analysis_summary_json(&ir);
     let candidate_label = format!("candidate:{ir_hash}");
@@ -17418,15 +17532,14 @@ fn revise(options: &CliOptions) -> ExitCode {
     // so old-body completion can reload this version's rule bodies after a
     // later revision. Idempotent; best-effort.
     let _ = kernel.store().put_content(&source);
-    let version = match kernel.create_program_version_for_program(
-        ProgramVersionInput {
+    let version = match kernel.create_program_version_for_compiled_program(
+        CompiledProgramVersionInput {
             program_name: &ir.workflow,
             source_hash: &source_hash,
-            ir_hash: &ir_hash,
             compiler_version: whipplescript_core::version(),
-            ir_snapshot: Some(&ir_identity),
         },
         &ir,
+        typed_actions.as_ref(),
     ) {
         Ok(version) => version,
         Err(error) => {
@@ -19651,12 +19764,6 @@ fn start_workflow_instance(
             return Err(ExitCode::from(2));
         }
     };
-    let snapshot = ir.to_snapshot();
-    // DR-0095: identity is the span-free projection of the snapshot, and it is
-    // the projection that lands under `ir_hash` in the content store — filing
-    // the spanned document there would leave a blob id that is not the hash of
-    // the bytes it names, which is the one thing `verify_body` exists to catch.
-    let ir_identity = ir_identity_projection(&snapshot);
     let run_source = Path::new(path);
     let package_lock = match load_package_lock(package_lock_path, std::slice::from_ref(&run_source))
     {
@@ -19681,20 +19788,20 @@ fn start_workflow_instance(
         eprintln!("failed to register locked packages: {}", store_error(error));
         return Err(ExitCode::FAILURE);
     }
+    let typed_actions = typed_action_plans_for_compiled_source(&source, root);
     let mut kernel = RuntimeKernel::new(store);
     // DR-0043 Decision 3: content-address the source (blob id == source_hash)
     // so old-body completion can reload this version's rule bodies after a
     // later revision. Idempotent; best-effort.
     let _ = kernel.store().put_content(&source);
-    let version = match kernel.create_program_version_for_program(
-        ProgramVersionInput {
+    let version = match kernel.create_program_version_for_compiled_program(
+        CompiledProgramVersionInput {
             program_name: &ir.workflow,
             source_hash: &stable_hash_hex(&source),
-            ir_hash: &stable_hash_hex(&ir_identity),
             compiler_version: whipplescript_core::version(),
-            ir_snapshot: Some(&ir_identity),
         },
         &ir,
+        typed_actions.as_ref(),
     ) {
         Ok(version) => version,
         Err(error) => {
@@ -19780,12 +19887,15 @@ fn step(options: &CliOptions) -> ExitCode {
         Ok(compiled) => compiled,
         Err(error) => return report_compile_failure(&step_options.program_path, error),
     };
+    let typed_actions =
+        typed_action_plans_for_compiled_source(&source, step_options.root.as_deref());
     let active_version_id = match validate_step_program_version(
         &options.store_path,
         &step_options.instance_id,
         &step_options.program_path,
         &source,
         &ir,
+        typed_actions.as_ref(),
     ) {
         Ok(active_version_id) => active_version_id,
         Err(error) => return report_store_error("failed to validate step program", error),
@@ -19836,6 +19946,7 @@ fn validate_step_program_version(
     program_path: &str,
     source: &str,
     ir: &IrProgram,
+    typed_actions: Option<&TypedActionPlans>,
 ) -> Result<String, StoreError> {
     let store = SqliteStore::open(store_path)?;
     let instance = store
@@ -19844,9 +19955,12 @@ fn validate_step_program_version(
     let active_version = store
         .get_program_version(&instance.version_id)?
         .ok_or_else(|| StoreError::Conflict("active program version does not exist".to_owned()))?;
-    let snapshot = ir.to_snapshot();
     let source_hash = stable_hash_hex(source);
-    let ir_hash = ir_identity_hash(&snapshot);
+    let identity = whipplescript_kernel::program_artifact::identity_projection(ir, typed_actions)
+        .map_err(|message| {
+        StoreError::Conflict(format!("step program identity is invalid: {message}"))
+    })?;
+    let ir_hash = stable_hash_hex(&identity);
     if source_hash != active_version.source_hash || ir_hash != active_version.ir_hash {
         let message = format!(
             "step program `{program_path}` does not match active version {} at epoch {} (expected source_hash={} ir_hash={}, got source_hash={} ir_hash={}); activate the candidate with `whip revise` before stepping it",
@@ -20133,10 +20247,13 @@ fn capability_for_output_type(output_type: &str) -> String {
 }
 
 /// Native entry: build the unified `NativeStores` handle (runtime + coordination +
-/// work-items) and drive the generic rule pass over one held `RuntimeKernel`.
+/// work-items), load the active immutable executable, and drive the generic
+/// rule pass over one held `RuntimeKernel`.
 fn step_instance(
     store_path: &Path,
     instance_id: &str,
+    // Named again: the managed lowering stopped needing it here, and main's
+    // media-registry defaults now do.
     ir: &IrProgram,
     source_path: Option<&Path>,
     active_version_guard: Option<&str>,
@@ -20165,10 +20282,10 @@ fn step_instance(
         // them can end a run, so a reaper on those would be a door onto
         // nothing.
         .with_credential_reaper(std::sync::Arc::new(CustodianReaper));
-    step_instance_generic(
+    step_active_program_generic(
         &mut kernel,
         instance_id,
-        ir,
+        Some(ir),
         source_path,
         active_version_guard,
     )
@@ -20176,7 +20293,7 @@ fn step_instance(
 
 /// The native binding of the instance step machine (DR-0033 chunk 4): it wires the
 /// kernel's `InstanceDriver` seam to the concrete native pieces — the rule pass
-/// (`step_instance_generic`), ready-effect discovery (`claimable_effects`), and the
+/// (`step_active_program_generic`), ready-effect discovery (`claimable_effects`), and the
 /// store-only effect handler cores over one held `RuntimeKernel<NativeStores>`.
 /// Because the native effect handlers run their HTTP to completion internally,
 /// `run_effect` here always settles (`Done`) and never suspends — only the DO
@@ -20202,10 +20319,10 @@ struct NativeInstanceDriver<'a> {
 
 impl InstanceDriver for NativeInstanceDriver<'_> {
     fn advance_rules(&mut self) -> Result<bool, StoreError> {
-        step_instance_generic(
+        step_active_program_generic(
             &mut self.kernel,
             self.instance_id,
-            self.ir,
+            Some(self.ir),
             self.source_path,
             self.version_guard,
         )?;
@@ -20381,6 +20498,10 @@ struct WorkerOptions {
     /// stub different agents differently (e.g. one succeeds, one fails). Empty
     /// outside the `whip test` harness, where `outcome` is the only setting.
     agent_outcomes: std::collections::BTreeMap<String, FixtureOutcome>,
+    /// Per-coercion fixture outcomes keyed by declaration name. This lets one
+    /// recovery path fail without changing independent coercions in the same
+    /// scenario.
+    coerce_outcomes: std::collections::BTreeMap<String, FixtureOutcome>,
     /// Injected coerce outputs (keyed by coerce function name) as JSON, from
     /// `stub coerce <fn> returns { … }` clauses, so a test controls the typed
     /// result a fixture coerce returns instead of the generated placeholder.
@@ -20533,6 +20654,7 @@ impl WorkerOptions {
             provider_config_paths,
             max_child_iterations,
             agent_outcomes: std::collections::BTreeMap::new(),
+            coerce_outcomes: std::collections::BTreeMap::new(),
             coerce_outputs: std::collections::BTreeMap::new(),
             agent_results: std::collections::BTreeMap::new(),
             virtual_now: None,
@@ -23146,6 +23268,11 @@ fn run_coerce_effect(
         .and_then(Value::as_str)
         .unwrap_or("coerce")
         .to_owned();
+    let outcome = options
+        .coerce_outcomes
+        .get(&function_name)
+        .copied()
+        .unwrap_or(options.outcome);
     let arguments_json = input
         .get("arguments")
         .cloned()
@@ -23192,7 +23319,7 @@ fn run_coerce_effect(
                 .unwrap_or_else(fixture_coerce_value_generic)
                 .to_string()
         });
-    if options.outcome == FixtureOutcome::Cancelled {
+    if outcome == FixtureOutcome::Cancelled {
         return cancel_coerce_effect(store_path, instance_id, effect, &input, options);
     }
     // Registry-honest selection (spec/std-coercion.md "Backend selection and
@@ -23228,7 +23355,7 @@ fn run_coerce_effect(
             config,
         );
     }
-    let client = match options.outcome {
+    let client = match outcome {
         FixtureOutcome::Completed => FakeCoerceClient::succeeds(value),
         FixtureOutcome::Failed => FakeCoerceClient::fails("fixture coerce failure"),
         FixtureOutcome::TimedOut => FakeCoerceClient::times_out("fixture coerce timeout"),
@@ -23951,31 +24078,25 @@ fn run_native_coerce_effect(
         .cloned()
         .and_then(|value| serde_json::from_value(value).ok())
         .unwrap_or_default();
-    let (prompt, output_schema, wrapped, schema_name) = if request.function_name == "prompt" {
-        let prompt = input
-            .get("prompt")
-            .and_then(Value::as_str)
-            .or_else(|| input.get("prompt_template").and_then(Value::as_str))
-            .unwrap_or_default()
-            .to_owned();
-        // The annotation decides the schema. This was `{"type": "string"}`
-        // unconditionally, so `prompt "…" -> Review as r` typed its binding as a
-        // `Review` and then asked the model for a sentence — the annotation
-        // reached the effect key and the binding and stopped short of the one
-        // place it changes what the provider is asked for.
-        whipplescript_kernel::coerce_native::inline_prompt_call_parts(
-            &ir,
-            &request.output_type,
-            prompt,
-        )
-    } else {
-        whipplescript_kernel::coerce_native::build_coerce_call_parts(
-            &ir,
-            &request.function_name,
-            &arguments,
-        )
-        .map_err(StoreError::Conflict)?
-    };
+    // The annotation decides the schema. This was `{"type": "string"}`
+    // unconditionally, so `prompt "…" -> Review as r` typed its binding as a
+    // `Review` and then asked the model for a sentence — the annotation reached
+    // the effect key and the binding and stopped short of the one place it
+    // changes what the provider is asked for. `build_inline_coerce_call_parts`
+    // routes the prompt arm through `inline_prompt_call_parts` for exactly that,
+    // and answers for inline `decide` besides.
+    let (prompt, output_schema, wrapped, schema_name) =
+        match whipplescript_kernel::coerce_native::build_inline_coerce_call_parts(&ir, input)
+            .map_err(StoreError::Conflict)?
+        {
+            Some(parts) => parts,
+            None => whipplescript_kernel::coerce_native::build_coerce_call_parts(
+                &ir,
+                &request.function_name,
+                &arguments,
+            )
+            .map_err(StoreError::Conflict)?,
+        };
     let transport = coerce_runtime::UreqCoerceTransport::new(std::time::Duration::from_secs(
         config.timeout_secs,
     ));
@@ -27291,6 +27412,7 @@ fn run_workflow_invoke_effect(
             provider_config_paths: options.provider_config_paths.clone(),
             max_child_iterations: options.max_child_iterations,
             agent_outcomes: options.agent_outcomes.clone(),
+            coerce_outcomes: options.coerce_outcomes.clone(),
             coerce_outputs: options.coerce_outputs.clone(),
             agent_results: options.agent_results.clone(),
             virtual_now: options.virtual_now.clone(),
@@ -27648,27 +27770,21 @@ fn start_child_workflow_instance_in_package(
             )));
         }
     }
-    let snapshot = ir.to_snapshot();
-    // DR-0095: identity is the span-free projection of the snapshot, and it is
-    // the projection that lands under `ir_hash` in the content store — filing
-    // the spanned document there would leave a blob id that is not the hash of
-    // the bytes it names, which is the one thing `verify_body` exists to catch.
-    let ir_identity = ir_identity_projection(&snapshot);
+    let typed_actions = typed_action_plans_for_compiled_source(&source, Some(root));
     let store = SqliteStore::open(store_path)?;
     let mut kernel = RuntimeKernel::new(store);
     // DR-0043 Decision 3: content-address the source (blob id == source_hash)
     // so old-body completion can reload this version's rule bodies after a
     // later revision. Idempotent; best-effort.
     let _ = kernel.store().put_content(&source);
-    let version = kernel.create_program_version_for_program(
-        ProgramVersionInput {
+    let version = kernel.create_program_version_for_compiled_program(
+        CompiledProgramVersionInput {
             program_name: &ir.workflow,
             source_hash: &stable_hash_hex(&source),
-            ir_hash: &stable_hash_hex(&ir_identity),
             compiler_version: whipplescript_core::version(),
-            ir_snapshot: Some(&ir_identity),
         },
         &ir,
+        typed_actions.as_ref(),
     )?;
     let (workflow_principal, declared_authority_json) = authority_for_ir_in_package(package, &ir);
     let effective_authority_json = if authority.delegating {
@@ -27814,6 +27930,7 @@ struct SubworkflowProviderContext {
     package_lock_path: Option<PathBuf>,
     provider_config_paths: Vec<PathBuf>,
     agent_outcomes: std::collections::BTreeMap<String, FixtureOutcome>,
+    coerce_outcomes: std::collections::BTreeMap<String, FixtureOutcome>,
     coerce_outputs: std::collections::BTreeMap<String, String>,
     agent_results: std::collections::BTreeMap<String, String>,
     virtual_now: Option<String>,
@@ -27829,6 +27946,7 @@ impl SubworkflowProviderContext {
             package_lock_path: options.package_lock_path.clone(),
             provider_config_paths: options.provider_config_paths.clone(),
             agent_outcomes: options.agent_outcomes.clone(),
+            coerce_outcomes: options.coerce_outcomes.clone(),
             coerce_outputs: options.coerce_outputs.clone(),
             agent_results: options.agent_results.clone(),
             virtual_now: options.virtual_now.clone(),
@@ -27880,6 +27998,7 @@ fn drive_subworkflow_tool(
             provider_config_paths: provider_ctx.provider_config_paths.clone(),
             max_child_iterations: iterations,
             agent_outcomes: provider_ctx.agent_outcomes.clone(),
+            coerce_outcomes: provider_ctx.coerce_outcomes.clone(),
             coerce_outputs: provider_ctx.coerce_outputs.clone(),
             agent_results: provider_ctx.agent_results.clone(),
             virtual_now: provider_ctx.virtual_now.clone(),
@@ -28417,6 +28536,7 @@ fn run(options: &CliOptions) -> ExitCode {
                 provider_config_paths: dev_options.provider_config_paths.clone(),
                 max_child_iterations: 8,
                 agent_outcomes: std::collections::BTreeMap::new(),
+                coerce_outcomes: std::collections::BTreeMap::new(),
                 coerce_outputs: std::collections::BTreeMap::new(),
                 agent_results: std::collections::BTreeMap::new(),
                 virtual_now: None,
@@ -29385,6 +29505,7 @@ fn acceptance_dev_report(
                 provider_config_paths: dev_options.provider_config_paths.clone(),
                 max_child_iterations: 8,
                 agent_outcomes: std::collections::BTreeMap::new(),
+                coerce_outcomes: std::collections::BTreeMap::new(),
                 coerce_outputs: std::collections::BTreeMap::new(),
                 agent_results: std::collections::BTreeMap::new(),
                 virtual_now: None,
@@ -29796,6 +29917,7 @@ fn acceptance_seed_setup_facts(
                 provenance_class: "fixture",
                 correlation_id: Some("acceptance.fixture"),
                 source_span_json: None,
+                validity_json: None,
             },
             source: "acceptance.fixture",
             causation_id: None,
@@ -32653,7 +32775,13 @@ fn view(options: &CliOptions) -> ExitCode {
         Ok(store) => store,
         Err(code) => return code,
     };
-    let view = match instance_view::load(&store, instance_id) {
+    let registry_default = match coerce_registry_default(&store, instance_id) {
+        Ok(default) => default,
+        Err(error) => return report_store_error("failed to resolve coercion configuration", error),
+    };
+    let coercion_fingerprint =
+        coerce_runtime::coercion_config_fingerprint_with_registry(registry_default.as_ref());
+    let view = match instance_view::load(&store, instance_id, &coercion_fingerprint) {
         Ok(Some(view)) => view,
         Ok(None) => {
             eprintln!("instance {instance_id} does not exist");
@@ -32751,6 +32879,149 @@ fn view(options: &CliOptions) -> ExitCode {
         );
     }
     ExitCode::SUCCESS
+}
+
+/// One native explanation read for both CLI and editor consumers.
+fn action_explanation_response(
+    store: &SqliteStore,
+    instance_id: &str,
+    result: &str,
+    firing: Option<&str>,
+) -> Result<whipplescript_kernel::source_action::explanation::query::Response, String> {
+    let registry_default = coerce_registry_default(store, instance_id)
+        .map_err(|error| format!("failed to resolve coercion configuration: {error:?}"))?;
+    let fingerprint =
+        coerce_runtime::coercion_config_fingerprint_with_registry(registry_default.as_ref());
+    let explanations = whipplescript_kernel::source_action::explanation::project_instance(
+        store,
+        instance_id,
+        &fingerprint,
+        &BTreeSet::new(),
+    )
+    .map_err(|error| format!("failed to explain action results: {error:?}"))?;
+    whipplescript_kernel::source_action::explanation::query::resolve(
+        &explanations,
+        instance_id,
+        result,
+        firing,
+    )
+    .map_err(|error| format!("could not resolve action result: {error}"))
+}
+
+/// `whip explain <instance> <result> [--firing <identity>]` — one query over
+/// the action explanations embedded in the shared instance view contract.
+/// Selection is exact or explicitly ambiguous; this command never chooses the
+/// newest firing and every suggested next step remains observational.
+fn explain(options: &CliOptions) -> ExitCode {
+    let usage = "usage: whip [--json] explain <instance> <result> [--firing <identity>]";
+    let mut positional = Vec::new();
+    let mut firing = None;
+    let mut args = options.args.iter();
+    while let Some(arg) = args.next() {
+        if arg == "--firing" {
+            let Some(identity) = args.next() else {
+                eprintln!("{usage}");
+                return ExitCode::from(2);
+            };
+            if firing.replace(identity.as_str()).is_some() {
+                eprintln!("{usage}");
+                return ExitCode::from(2);
+            }
+        } else if arg.starts_with("--") {
+            eprintln!("unknown explain argument `{arg}`\n{usage}");
+            return ExitCode::from(2);
+        } else {
+            positional.push(arg.as_str());
+        }
+    }
+    let [instance_id, result] = positional.as_slice() else {
+        eprintln!("{usage}");
+        return ExitCode::from(2);
+    };
+    let store = match open_store_or_exit(options) {
+        Ok(store) => store,
+        Err(code) => return code,
+    };
+    let response = match action_explanation_response(&store, instance_id, result, firing) {
+        Ok(response) => response,
+        Err(error) => {
+            eprintln!("{error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if options.json {
+        return emit_json(serde_json::to_value(response).expect("explanation response serializes"));
+    }
+    use whipplescript_kernel::source_action::explanation::query::Outcome;
+    match response.outcome {
+        Outcome::NotFound => {
+            eprintln!(
+                "no action result `{result}` in instance `{instance_id}`{}",
+                firing.map_or(String::new(), |identity| format!(
+                    " for firing `{identity}`"
+                ))
+            );
+            ExitCode::from(1)
+        }
+        Outcome::Ambiguous { candidates } => {
+            println!(
+                "`{result}` names {} action results; choose one result id or add --firing:",
+                candidates.len()
+            );
+            for candidate in candidates {
+                println!(
+                    "  {}  {:?}  rule={} firing={} version={} epoch={} frontier={}",
+                    candidate.result_id,
+                    candidate.status,
+                    candidate.rule,
+                    candidate.firing.identity.as_deref().unwrap_or("started"),
+                    candidate.program_version_id,
+                    candidate.revision_epoch,
+                    candidate.evaluated_frontier,
+                );
+            }
+            ExitCode::SUCCESS
+        }
+        Outcome::Selected { selection } => {
+            println!(
+                "{}  {:?}  rule={} firing={} version={} revision={} frontier={}",
+                selection.result.name,
+                selection.result.status,
+                selection.rule,
+                selection.firing.identity.as_deref().unwrap_or("started"),
+                selection.program_version_id,
+                selection.revision,
+                selection.evaluated_frontier,
+            );
+            if !selection.result.reasons.is_empty() {
+                println!("  reasons: {:?}", selection.result.reasons);
+            }
+            for dependency in &selection.result.waiting_on {
+                println!(
+                    "  waiting on: {}",
+                    dependency
+                        .name
+                        .as_deref()
+                        .or(dependency.result_id.as_deref())
+                        .unwrap_or("input")
+                );
+            }
+            for cause in &selection.causes {
+                println!(
+                    "  cause {}: {:?}{} ({} dependent result{})",
+                    cause.cause_id,
+                    cause.kind,
+                    if cause.recovered { ", recovered" } else { "" },
+                    cause.dependents.len(),
+                    if cause.dependents.len() == 1 { "" } else { "s" },
+                );
+            }
+            if let Some(next) = selection.next_action {
+                println!("  next: {:?}", next.code);
+            }
+            ExitCode::SUCCESS
+        }
+    }
 }
 
 fn effects(options: &CliOptions) -> ExitCode {
@@ -38794,6 +39065,7 @@ fn route_workspace_facts(
                     provenance_class: "external",
                     correlation_id: None,
                     source_span_json: None,
+                    validity_json: None,
                 },
                 source: "workspace",
                 causation_id: None,
@@ -41313,14 +41585,19 @@ fn compile_program_with_root_cached(
     source: &str,
     root: Option<&str>,
 ) -> whipplescript_parser::CompileOutput {
-    type CacheEntry = (IrProgram, Vec<whipplescript_parser::Diagnostic>);
+    type CacheEntry = (
+        IrProgram,
+        Option<TypedActionPlans>,
+        Vec<whipplescript_parser::Diagnostic>,
+    );
     type CacheMap = std::collections::HashMap<(Option<String>, String), CacheEntry>;
     static CACHE: std::sync::Mutex<Option<CacheMap>> = std::sync::Mutex::new(None);
     let key = (root.map(str::to_owned), sha256_hex(source.as_bytes()));
     if let Ok(guard) = CACHE.lock() {
-        if let Some((ir, warnings)) = guard.as_ref().and_then(|map| map.get(&key)) {
+        if let Some((ir, typed_actions, warnings)) = guard.as_ref().and_then(|map| map.get(&key)) {
             return whipplescript_parser::CompileOutput {
                 ir: Some(ir.clone()),
+                typed_actions: typed_actions.clone(),
                 diagnostics: Vec::new(),
                 warnings: warnings.clone(),
             };
@@ -41333,7 +41610,14 @@ fn compile_program_with_root_cached(
             if map.len() >= 32 {
                 map.clear();
             }
-            map.insert(key, (ir.clone(), compiled.warnings.clone()));
+            map.insert(
+                key,
+                (
+                    ir.clone(),
+                    compiled.typed_actions.clone(),
+                    compiled.warnings.clone(),
+                ),
+            );
         }
     }
     compiled
@@ -41362,6 +41646,16 @@ fn compile_source_path_with_root(
             diagnostics: compiled.diagnostics,
         })
     }
+}
+
+/// Recover the complete executable component from the successful compilation
+/// cached by `compile_source_path_with_root`. A poisoned lock merely recompiles;
+/// it cannot turn typed output into legacy output.
+fn typed_action_plans_for_compiled_source(
+    source: &str,
+    root: Option<&str>,
+) -> Option<TypedActionPlans> {
+    compile_program_with_root_cached(source, root).typed_actions
 }
 
 /// Compile for static validation (`check`/`compile`): on top of ordinary

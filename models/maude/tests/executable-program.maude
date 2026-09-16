@@ -1,0 +1,14 @@
+load ../executable-program.maude
+search [1] in WHIPPLESCRIPT-EXECUTABLE-PROGRAM : load(exact, legacy, true) =>* captured .
+search [1] in WHIPPLESCRIPT-EXECUTABLE-PROGRAM : load(exact, legacy, false) =>* captured .
+search [1] in WHIPPLESCRIPT-EXECUTABLE-PROGRAM : load(exact, legacy, true) =>* recompiled .
+search [1] in WHIPPLESCRIPT-EXECUTABLE-PROGRAM : load(absent, legacy, true) =>* recompiled .
+search [1] in WHIPPLESCRIPT-EXECUTABLE-PROGRAM : load(corrupt, legacy, true) =>* recompiled .
+search [1] in WHIPPLESCRIPT-EXECUTABLE-FALLBACK : load(corrupt, legacy, true) =>* recompiled .
+search [1] in WHIPPLESCRIPT-EXECUTABLE-PROGRAM : load(missing, legacy, true) =>* recompiled .
+search [1] in WHIPPLESCRIPT-EXECUTABLE-PROGRAM : load(mismatched, legacy, true) =>* captured .
+search [1] in WHIPPLESCRIPT-EXECUTABLE-UNBOUND : load(mismatched, legacy, true) =>* captured .
+search [1] in WHIPPLESCRIPT-EXECUTABLE-PROGRAM : load(exact, unknown, true) =>* captured .
+search [1] in WHIPPLESCRIPT-EXECUTABLE-UNKNOWN : load(exact, unknown, true) =>* captured .
+search [1] in WHIPPLESCRIPT-EXECUTABLE-PROGRAM : load(absent, legacy, false) =>* recompiled .
+quit

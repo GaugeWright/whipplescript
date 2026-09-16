@@ -6,8 +6,8 @@ output result ReviewBatch
 failure error ReviewFailure
 
 # `action` removes a repeated *intra-rule effect chain*. Unlike `pattern`, which
-# generates whole declarations, an action inlines a chain of statements inside a
-# rule body, fully expanded into the durable graph at each call site (DR-0023).
+# generates whole declarations, a typed action contributes an inspectable scope
+# to the durable graph and returns a value to its caller (DR-0100).
 class ChangeRequest {
   id string
   title string
@@ -42,26 +42,27 @@ table changes as ChangeRequest [
   }
 ]
 
-# A typed, hygienic template over a rule-body effect chain. The internal binding
-# `turn` is uniquified per call site; parameters substitute by name. Calls are
-# fire-and-forget (v0): the chain is the encapsulated unit.
-action review_change(who AgentRef<reviewer>, item ChangeRequest) {
+# A typed, hygienic action over a rule-body effect graph. Its null result makes
+# completion explicit even though this caller does not bind the value.
+action review_change(who AgentRef<reviewer>, item ChangeRequest) -> null {
   tell who as turn """markdown
   Review {{ item.title }}.
   """
 
-  after turn succeeds as reviewed {
+  after turn succeeds {
     done item -> record ReviewedChange {
       id item.id
-      summary reviewed.summary
+      summary "reviewed"
       status "reviewed"
     }
+    return null
   }
 
-  after turn fails as f {
+  after turn fails {
     record ReviewFailure {
-      reason f.reason
+      reason "review failed"
     }
+    return null
   }
 }
 

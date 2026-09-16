@@ -1,0 +1,13 @@
+load ../action-region-ownership.maude
+search [1] in WHIPPLESCRIPT-ACTION-REGION-OWNERSHIP : inspect(join, helper, pending) =>* kept(helper, pending) .
+search [1] in WHIPPLESCRIPT-ACTION-REGION-OWNERSHIP : inspect(effects, leaf, requested) =>* kept(leaf, requested) .
+search [1] in WHIPPLESCRIPT-ACTION-REGION-OWNERSHIP : inspect(effects, leaf, uncertain) =>* kept(leaf, uncertain) .
+search [1] in WHIPPLESCRIPT-ACTION-REGION-OWNERSHIP : inspect(effects, unselected, pending) =>* kept(unselected, pending) .
+search [1] in WHIPPLESCRIPT-ACTION-REGION-INVENTS-WORK : inspect(effects, unselected, pending) =>* kept(unselected, pending) .
+search [1] in WHIPPLESCRIPT-ACTION-REGION-OWNERSHIP : inspect(join, leaf, pending) =>* kept(leaf, pending) .
+search [1] in WHIPPLESCRIPT-ACTION-REGION-JOINS-LEAVES : inspect(join, leaf, pending) =>* kept(leaf, pending) .
+search [1] in WHIPPLESCRIPT-ACTION-REGION-OWNERSHIP : inspect(effects, outside, pending) =>* kept(outside, pending) .
+search [1] in WHIPPLESCRIPT-ACTION-REGION-OWNS-SIBLINGS : inspect(effects, outside, pending) =>* kept(outside, pending) .
+search [1] in WHIPPLESCRIPT-ACTION-REGION-OWNERSHIP : inspect(effects, leaf, requested) =>* kept(leaf, cancelled) .
+search [1] in WHIPPLESCRIPT-ACTION-REGION-ACKS-REQUEST : inspect(effects, leaf, requested) =>* kept(leaf, cancelled) .
+quit

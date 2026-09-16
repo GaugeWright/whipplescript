@@ -253,6 +253,7 @@ pub fn resolve_effect_input_after_bindings_generic<S: RuntimeStore>(
             value_json: binding_value.to_string(),
             provenance_class: "effect".to_owned(),
             source_span_json: None,
+            validity_json: None,
             source_event_id: String::new(),
         },
     ));
@@ -301,6 +302,7 @@ pub fn context_from_input_bindings(input: &Value) -> RuleContext {
                 value_json: value.to_string(),
                 provenance_class: "input".to_owned(),
                 source_span_json: None,
+                validity_json: None,
                 source_event_id: String::new(),
             },
         ));
@@ -1245,11 +1247,12 @@ pub fn encode_export_rows(
 
 /// Host-agnostic core (DR-0033 chunk 3; relocated from the CLI in std.files
 /// slice F4 — crate location, not shape): export a `<Schema>` fact collection
-/// (optionally filtered by the `where` predicate, ordered deterministically by
-/// the store's `(name, key)` ordering — DR-0022) to a file through the
+/// to a file through the
 /// `FileStore` seam over a held `RuntimeKernel<S>`. A success settles
 /// `file.export.completed` with the row count and a content hash; living in
 /// the kernel, it builds for wasm32 so exports run on the DO plane too.
+/// Managed inputs carry the already selected, freshness-captured rows. Legacy
+/// inputs retain their optional predicate and deterministic store projection.
 pub fn run_file_export_effect_generic<S: RuntimeStore>(
     kernel: &mut RuntimeKernel<S>,
     files: &dyn FileStore,
@@ -1332,20 +1335,32 @@ pub fn run_file_export_effect_generic<S: RuntimeStore>(
         {
             return Err(reason);
         }
-        // Resolve the collection: facts of <schema> [where predicate], ordered by
-        // the store's deterministic (name, key) ordering for reproducible output.
-        let facts = kernel
-            .store()
-            .list_facts(instance_id)
-            .map_err(|error| format!("{error:?}"))?;
-        let mut rows = Vec::new();
-        for fact in facts.iter().filter(|fact| fact.name == schema) {
-            let value: Value = serde_json::from_str(&fact.value_json)
-                .map_err(|error| format!("fact value is not JSON: {error}"))?;
-            if predicate.is_empty() || evaluate_proj_predicate(&predicate, &value)? {
-                rows.push(value);
+        // Managed composition freezes the selected collection at admission and
+        // sends it as an ordinary captured argument. Legacy effects have no such
+        // field and retain their historical dispatch-time projection.
+        let rows = if let Some(argument) = input.get("rows_argument") {
+            argument
+                .get("value")
+                .and_then(Value::as_array)
+                .cloned()
+                .ok_or_else(|| "captured export rows are not an array".to_owned())?
+        } else {
+            // Resolve the legacy collection: facts of <schema> [where predicate],
+            // ordered by the store's deterministic (name, key) ordering.
+            let facts = kernel
+                .store()
+                .list_facts(instance_id)
+                .map_err(|error| format!("{error:?}"))?;
+            let mut rows = Vec::new();
+            for fact in facts.iter().filter(|fact| fact.name == schema) {
+                let value: Value = serde_json::from_str(&fact.value_json)
+                    .map_err(|error| format!("fact value is not JSON: {error}"))?;
+                if predicate.is_empty() || evaluate_proj_predicate(&predicate, &value)? {
+                    rows.push(value);
+                }
             }
-        }
+            rows
+        };
         let exists = files.exists(&full);
         write_mode_policy(&mode, path, exists)?;
         let serialized = encode_export_rows(&format, &rows, &fields)?;
@@ -2186,6 +2201,98 @@ pub fn auto_attest_finish_generic<S: WorkItems + FrontierRead>(
     );
 }
 
+fn tracker_claim_result(
+    outcome: Result<whipplescript_store::items::ClaimOutcome, String>,
+    queue: &str,
+    id: &str,
+    title: &str,
+    claimed_by: &str,
+    expires_at: Option<&str>,
+) -> Result<Value, String> {
+    use whipplescript_store::items::ClaimOutcome;
+    match outcome {
+        Ok(ClaimOutcome::Claimed) => Ok(json!({
+            "queue": queue,
+            "id": id,
+            "title": title,
+            "claimed_by": claimed_by,
+            "expires_at": expires_at,
+        })),
+        Ok(ClaimOutcome::AlreadyClaimed { holder }) => {
+            Err(format!("already claimed by `{holder}`"))
+        }
+        Ok(ClaimOutcome::NotFound) => Err(format!("item `{id}` not found")),
+        Err(error) => Err(format!("claim failed: {error}")),
+    }
+}
+
+fn tracker_renew_result(
+    outcome: Result<whipplescript_store::items::RenewOutcome, String>,
+    id: &str,
+) -> Result<Value, String> {
+    use whipplescript_store::items::RenewOutcome;
+    match outcome {
+        Ok(RenewOutcome::Renewed { expires_at }) => {
+            Ok(json!({"id": id, "renewed": true, "expires_at": expires_at}))
+        }
+        Ok(RenewOutcome::NotHeld) => Err(format!(
+            "not held: no active claim on `{id}` by this holder"
+        )),
+        Ok(RenewOutcome::NotMonotonic) => {
+            Err(format!("renew of `{id}` would move the deadline backward"))
+        }
+        Err(error) => Err(format!("renew failed: {error}")),
+    }
+}
+
+fn tracker_release_result(
+    outcome: Result<whipplescript_store::items::ReleaseOutcome, String>,
+    queue: &str,
+    id: &str,
+    title: &str,
+) -> Result<Value, String> {
+    use whipplescript_store::items::ReleaseOutcome;
+    match outcome {
+        Ok(ReleaseOutcome::Released) => Ok(json!({
+            "queue": queue,
+            "id": id,
+            "title": title,
+            "status": "open",
+        })),
+        Ok(ReleaseOutcome::NotHeld) => Err(format!("item `{id}` was not in progress")),
+        Ok(ReleaseOutcome::HeldByOther { holder }) => {
+            Err(format!("item `{id}` is held by {holder}"))
+        }
+        Err(error) => Err(format!("release failed: {error}")),
+    }
+}
+
+fn tracker_finish_result(
+    outcome: Result<whipplescript_store::items::FinishOutcome, String>,
+    queue: &str,
+    id: &str,
+    title: &str,
+    summary: Option<&str>,
+) -> Result<Value, String> {
+    use whipplescript_store::items::FinishOutcome;
+    match outcome {
+        Ok(FinishOutcome::Finished) => Ok(json!({
+            "queue": queue,
+            "id": id,
+            "title": title,
+            "status": "closed",
+            "summary": summary,
+        })),
+        Ok(FinishOutcome::NotOpen) => {
+            Err(format!("item `{id}` cannot finish from its current status"))
+        }
+        Ok(FinishOutcome::HeldByOther { holder }) => {
+            Err(format!("item `{id}` is held by {holder}"))
+        }
+        Err(error) => Err(format!("finish failed: {error}")),
+    }
+}
+
 pub fn run_queue_effect_generic<S: RuntimeStore + WorkItems + FrontierRead>(
     kernel: &mut RuntimeKernel<S>,
     instance_id: &str,
@@ -2193,7 +2300,7 @@ pub fn run_queue_effect_generic<S: RuntimeStore + WorkItems + FrontierRead>(
     now: &str,
     _config: &EffectConfig,
 ) -> Result<whipplescript_store::StoredEvent, StoreError> {
-    use whipplescript_store::items::{ClaimOutcome, FinishOutcome, ReleaseOutcome, RenewOutcome};
+    use whipplescript_store::items::FinishOutcome;
     let input = json_from_str(&effect.input_json);
     let run_id = idempotency_key(&[instance_id, &effect.effect_id, "queue-run"]);
     let lease_id = idempotency_key(&[instance_id, &effect.effect_id, "queue-lease"]);
@@ -2269,76 +2376,89 @@ pub fn run_queue_effect_generic<S: RuntimeStore + WorkItems + FrontierRead>(
         }
         "tracker.claim" => {
             let id = input.get("id").and_then(Value::as_str).unwrap_or_default();
+            let queue = input
+                .get("queue")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let title = input
+                .get("title")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
             // Claim TTL (T3): `expires_at = now + ttl` from the injected clock,
             // or `None` (untimed backstop lease) when no `ttl` clause was given.
             let expires =
                 tracker_expires_from_now(now, input.get("ttl_seconds").and_then(Value::as_i64));
-            match kernel
-                .store_mut()
-                .claim_item(id, instance_id, expires.as_deref())
-            {
-                Ok(ClaimOutcome::Claimed) => {
-                    Ok(json!({"id": id, "claimed_by": instance_id, "expires_at": expires}))
-                }
-                Ok(ClaimOutcome::AlreadyClaimed { holder }) => {
-                    Err(format!("already claimed by `{holder}`"))
-                }
-                Ok(ClaimOutcome::NotFound) => Err(format!("item `{id}` not found")),
-                Err(error) => Err(format!("claim failed: {error:?}")),
-            }
+            tracker_claim_result(
+                kernel
+                    .store_mut()
+                    .claim_item(id, instance_id, expires.as_deref())
+                    .map_err(|error| format!("{error:?}")),
+                queue,
+                id,
+                title,
+                instance_id,
+                expires.as_deref(),
+            )
         }
         "tracker.renew" => {
             // Holder heartbeat (T3): re-affirm the holder's active claim without
             // moving its deadline (`expires = None`). `not_held`/`not_monotonic`
             // are typed failures; the store enforces holder-only + monotonicity.
             let id = input.get("id").and_then(Value::as_str).unwrap_or_default();
-            match kernel.store_mut().renew_claim(id, instance_id, None) {
-                Ok(RenewOutcome::Renewed { expires_at }) => {
-                    Ok(json!({"id": id, "renewed": true, "expires_at": expires_at}))
-                }
-                Ok(RenewOutcome::NotHeld) => Err(format!(
-                    "not held: no active claim on `{id}` by this holder"
-                )),
-                Ok(RenewOutcome::NotMonotonic) => {
-                    Err(format!("renew of `{id}` would move the deadline backward"))
-                }
-                Err(error) => Err(format!("renew failed: {error:?}")),
-            }
+            tracker_renew_result(
+                kernel
+                    .store_mut()
+                    .renew_claim(id, instance_id, None)
+                    .map_err(|error| format!("{error:?}")),
+                id,
+            )
         }
         "tracker.release" => {
             let id = input.get("id").and_then(Value::as_str).unwrap_or_default();
+            let queue = input
+                .get("queue")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let title = input
+                .get("title")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
             // `None`: the in-program `release` effect is the program acting on
             // its own tracker, not one agent reaching across another's claim.
-            match kernel.store_mut().release_item(id, None) {
-                Ok(ReleaseOutcome::Released) => Ok(json!({"id": id, "status": "open"})),
-                Ok(ReleaseOutcome::NotHeld) => Err(format!("item `{id}` was not in progress")),
-                Ok(ReleaseOutcome::HeldByOther { holder }) => {
-                    Err(format!("item `{id}` is held by {holder}"))
-                }
-                Err(error) => Err(format!("release failed: {error:?}")),
-            }
+            tracker_release_result(
+                kernel
+                    .store_mut()
+                    .release_item(id, None)
+                    .map_err(|error| format!("{error:?}")),
+                queue,
+                id,
+                title,
+            )
         }
         "tracker.finish" => {
             let id = input.get("id").and_then(Value::as_str).unwrap_or_default();
+            let queue = input
+                .get("queue")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let title = input
+                .get("title")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
             let summary = input
                 .pointer("/payload/summary")
                 .and_then(Value::as_str)
                 .map(str::to_owned);
-            match kernel.store_mut().finish_item(id, summary.as_deref(), None) {
-                Ok(FinishOutcome::Finished) => {
-                    // DR-0086 F3: the effect door mints the same cut-trail
-                    // evidence the CLI and agent doors do (advisory).
-                    auto_attest_finish_generic(kernel.store_mut(), id, Some(instance_id));
-                    Ok(json!({"id": id, "status": "done", "summary": summary}))
-                }
-                Ok(FinishOutcome::NotOpen) => {
-                    Err(format!("item `{id}` cannot finish from its current status"))
-                }
-                Ok(FinishOutcome::HeldByOther { holder }) => {
-                    Err(format!("item `{id}` is held by {holder}"))
-                }
-                Err(error) => Err(format!("finish failed: {error:?}")),
+            let result = kernel
+                .store_mut()
+                .finish_item(id, summary.as_deref(), None)
+                .map_err(|error| format!("{error:?}"));
+            if matches!(result, Ok(FinishOutcome::Finished)) {
+                // DR-0086 F3: the effect door mints the same cut-trail
+                // evidence the CLI and agent doors do (advisory).
+                auto_attest_finish_generic(kernel.store_mut(), id, Some(instance_id));
             }
+            tracker_finish_result(result, queue, id, title, summary.as_deref())
         }
         other => Err(format!("unknown queue effect kind `{other}`")),
     };
@@ -3834,6 +3954,10 @@ pub fn open_sealed_effect_inputs(
     let mut input = json_from_str(input_json);
     let grants = effect_unwrap_grants(&input);
     if grants.is_empty() {
+        if input.get("managed_prompt").is_some() {
+            crate::source_action::tell::materialize_prompt(&mut input)?;
+            return Ok(OpenedEffectInput(input.to_string()));
+        }
         return Ok(OpenedEffectInput(input_json.to_owned()));
     }
     let granted_credentials: std::collections::BTreeSet<&String> = grants.values().collect();
@@ -3924,6 +4048,7 @@ pub fn open_sealed_effect_inputs(
     if let Some(error) = failure {
         return Err(error);
     }
+    crate::source_action::tell::materialize_prompt(&mut input)?;
     Ok(OpenedEffectInput(input.to_string()))
 }
 
@@ -4556,6 +4681,49 @@ mod custody_capability_tests {
     }
 
     #[test]
+    fn managed_tell_prompt_opens_then_renders_without_persisting_or_reexpanding_plaintext() {
+        let transport = custodian_with_wrapping_key();
+        let envelope = sealed_envelope(&transport, r#"{"notes":"private {{ unrelated.secret }}"}"#);
+        let mut claimable = granted_effect(&envelope, "PatientRecord");
+        let mut input: Value = serde_json::from_str(&claimable.input_json).unwrap();
+        input["bindings"] = json!({});
+        input["managed_prompt"] = json!([
+            {"kind":"text","text":"Review "}, {"kind":"value","argument":0}
+        ]);
+        input["action_arguments"] =
+            json!([crate::source_action::arguments::Argument::from(envelope)]);
+        crate::source_action::tell::materialize_prompt(&mut input).unwrap();
+        claimable.input_json = input.to_string();
+        let original = claimable.input_json.clone();
+        let opened = open_sealed_effect_inputs(&transport, &claimable, &original, "run-1").unwrap();
+        let provider: Value = serde_json::from_str(opened.provider_payload()).unwrap();
+        assert_eq!(
+            provider["prompt"],
+            r#"Review {"notes":"private {{ unrelated.secret }}"}"#
+        );
+        assert!(!provider["prompt"]
+            .as_str()
+            .unwrap()
+            .contains("ciphertext_b64"));
+        assert_eq!(claimable.input_json, original);
+        assert!(!original.contains("private"));
+        // A grantless input still validates/renders its captured arguments,
+        // while a grant never licenses a second interpretation of their text.
+        input["access_grants"] = json!([]);
+        input["action_arguments"] = json!([crate::source_action::arguments::Argument::from(
+            json!("{{ unrelated.secret }}")
+        )]);
+        let source = input.to_string();
+        let opened =
+            open_sealed_effect_inputs(&transport, &effect("agent.tell", &source), &source, "run-2")
+                .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(opened.provider_payload()).unwrap()["prompt"],
+            "Review {{ unrelated.secret }}"
+        );
+    }
+
+    #[test]
     fn an_ungranted_turn_leaves_the_envelope_sealed() {
         // Fail-closed on the runtime's own terms. The checker refuses this
         // program, but a worker must not open on the strength of holding a
@@ -4757,6 +4925,106 @@ mod queue_effect_refusal_tests {
     use super::*;
     use whipplescript_store::native_stores::NativeStores;
     use whipplescript_store::{NewEffect, RuleCommit};
+
+    #[test]
+    fn tracker_lifecycle_outcomes_keep_each_domain_and_store_failure_distinct() {
+        use whipplescript_store::items::{
+            ClaimOutcome, FinishOutcome, ReleaseOutcome, RenewOutcome,
+        };
+
+        assert_eq!(
+            tracker_claim_result(
+                Ok(ClaimOutcome::AlreadyClaimed {
+                    holder: "other".into(),
+                }),
+                "backlog",
+                "WS-1",
+                "Fix login",
+                "instance",
+                None,
+            ),
+            Err("already claimed by `other`".into())
+        );
+        assert_eq!(
+            tracker_claim_result(
+                Ok(ClaimOutcome::NotFound),
+                "backlog",
+                "WS-1",
+                "Fix login",
+                "instance",
+                None,
+            ),
+            Err("item `WS-1` not found".into())
+        );
+        assert_eq!(
+            tracker_claim_result(
+                Err("store".into()),
+                "backlog",
+                "WS-1",
+                "Fix login",
+                "instance",
+                None,
+            ),
+            Err("claim failed: store".into())
+        );
+        assert_eq!(
+            tracker_renew_result(Ok(RenewOutcome::NotHeld), "WS-1"),
+            Err("not held: no active claim on `WS-1` by this holder".into())
+        );
+        assert_eq!(
+            tracker_renew_result(Ok(RenewOutcome::NotMonotonic), "WS-1"),
+            Err("renew of `WS-1` would move the deadline backward".into())
+        );
+        assert_eq!(
+            tracker_renew_result(Err("store".into()), "WS-1"),
+            Err("renew failed: store".into())
+        );
+        assert_eq!(
+            tracker_release_result(Ok(ReleaseOutcome::NotHeld), "backlog", "WS-1", "Fix login",),
+            Err("item `WS-1` was not in progress".into())
+        );
+        assert_eq!(
+            tracker_release_result(
+                Ok(ReleaseOutcome::HeldByOther {
+                    holder: "other".into(),
+                }),
+                "backlog",
+                "WS-1",
+                "Fix login",
+            ),
+            Err("item `WS-1` is held by other".into())
+        );
+        assert_eq!(
+            tracker_release_result(Err("store".into()), "backlog", "WS-1", "Fix login"),
+            Err("release failed: store".into())
+        );
+        assert_eq!(
+            tracker_finish_result(
+                Ok(FinishOutcome::NotOpen),
+                "backlog",
+                "WS-1",
+                "Fix login",
+                None,
+            ),
+            Err("item `WS-1` cannot finish from its current status".into())
+        );
+        assert_eq!(
+            tracker_finish_result(
+                Ok(FinishOutcome::HeldByOther {
+                    holder: "other".into(),
+                }),
+                "backlog",
+                "WS-1",
+                "Fix login",
+                None,
+            ),
+            Err("item `WS-1` is held by other".into())
+        );
+        assert_eq!(
+            tracker_finish_result(Err("store".into()), "backlog", "WS-1", "Fix login", None,),
+            Err("finish failed: store".into())
+        );
+    }
 
     fn queued(kind: &'static str, input_json: &'static str) -> NewEffect<'static> {
         NewEffect {

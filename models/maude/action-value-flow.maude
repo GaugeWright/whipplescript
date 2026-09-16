@@ -1,0 +1,37 @@
+mod WHIPPLESCRIPT-ACTION-VALUE-FLOW is
+ protecting BOOL .
+ sorts Value State .
+ op input : Bool -> Value [ctor] .
+ op alias : Value -> Value [ctor] .
+ op object : Value Value -> Value [ctor] .
+ op first : Value -> Value [ctor] .
+ op selected : Bool Value -> Value [ctor] .
+ --- A completed region remains a selection source for its lexical tail.
+ --- Its condition is neither a payload byte nor an owned-success join.
+ op postExit : Bool Value -> Value [ctor] .
+ op owned : Value -> Value [ctor] .
+ ops unknown cyclic : -> Value [ctor] .
+ op inspect : Value -> State [ctor] .
+ op flow : Bool Bool Bool -> State [ctor] .
+ op refused : -> State [ctor] .
+ vars A B : Bool .
+ vars X Y : Value .
+ rl [input] : inspect(input(A)) => flow(A, false, false) .
+ rl [alias] : inspect(alias(X)) => inspect(X) .
+ rl [field] : inspect(first(object(X, Y))) => inspect(X) .
+ rl [selection] : inspect(selected(A, input(B))) => flow(B, A, false) .
+ rl [region-exit] : inspect(postExit(A, input(B))) => flow(B, A, false) .
+ rl [join] : inspect(owned(input(A))) => flow(A, false, true) .
+ rl [unknown] : inspect(unknown) => refused .
+ rl [cycle] : inspect(cyclic) => refused .
+endm
+mod WHIPPLESCRIPT-ACTION-VALUE-LOST is
+ including WHIPPLESCRIPT-ACTION-VALUE-FLOW .
+ rl [lost-alias] : inspect(alias(input(true))) => flow(false, false, false) .
+ rl [lost-selection] : inspect(selected(true, input(false))) => flow(false, false, false) .
+ rl [join-is-data] : inspect(owned(input(false))) => flow(true, false, true) .
+ rl [unknown-is-public] : inspect(unknown) => flow(false, false, false) .
+ rl [cycle-is-public] : inspect(cyclic) => flow(false, false, false) .
+ rl [lost-region-exit] : inspect(postExit(true, input(false))) => flow(false, false, false) .
+ rl [region-exit-is-data] : inspect(postExit(true, input(false))) => flow(true, false, false) .
+endm

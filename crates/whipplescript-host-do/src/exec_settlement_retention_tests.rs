@@ -393,6 +393,7 @@ fn cold_recovery<S: RuntimeStore>(
         ]);
         let facts = [SettlementFact {
             fact: NewFact {
+                validity_json: None,
                 fact_id: &id,
                 name: "exec.command.completed",
                 key: "observe",

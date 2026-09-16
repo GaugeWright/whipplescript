@@ -1,0 +1,49 @@
+--- Captured evaluations and their later recording events have distinct
+--- coordinates. This bounded witness selects immutable journal metadata;
+--- it does not fold fact/effect state or prove region eligibility.
+mod WHIPPLESCRIPT-ACTION-CAPTURE-PREFIX is
+ protecting BOOL . protecting NAT .
+ sorts Frame Kind History Result .
+ ops first second : -> Frame [ctor] .
+ ops root local holding lapsed : -> Kind [ctor] .
+ op nil : -> History [ctor] .
+ --- Frame, kind, structural identity, evaluated frontier, recording sequence.
+ op item : Frame Kind Nat Nat Nat History -> History [ctor] .
+ op through : History Nat -> History .
+ op hasRoot : History Frame -> Bool .
+ op project : History Frame Nat -> Result [ctor] .
+ op selected : History -> Result [ctor] .
+ op refused : -> Result [ctor] .
+ vars F G : Frame . var K : Kind . vars I E R N : Nat . var H : History .
+ eq through(nil, N) = nil .
+ eq through(item(F, K, I, E, R, H), N) =
+   if E <= N then item(F, K, I, E, R, through(H, N)) else through(H, N) fi .
+ eq hasRoot(nil, F) = false .
+ eq hasRoot(item(G, K, I, E, R, H), F) = (F == G and K == root) or hasRoot(H, F) .
+ crl [captured] : project(H, F, N) => selected(through(H, N)) if hasRoot(through(H, N), F) .
+ crl [not-admitted] : project(H, F, N) => refused if not hasRoot(through(H, N), F) .
+endm
+mod WHIPPLESCRIPT-ACTION-CAPTURE-BY-RECORD is
+ including WHIPPLESCRIPT-ACTION-CAPTURE-PREFIX .
+ op recordedThrough : History Nat -> History .
+ var F : Frame . var K : Kind . vars I E R N : Nat . var H : History .
+ eq recordedThrough(nil, N) = nil .
+ eq recordedThrough(item(F, K, I, E, R, H), N) =
+   if R <= N then item(F, K, I, E, R, recordedThrough(H, N)) else recordedThrough(H, N) fi .
+ crl [wrong-coordinate] : project(H, F, N) => selected(recordedThrough(H, N)) if hasRoot(through(H, N), F) .
+endm
+mod WHIPPLESCRIPT-ACTION-CAPTURE-FUTURE is
+ including WHIPPLESCRIPT-ACTION-CAPTURE-PREFIX .
+ var F : Frame . var N : Nat . var H : History .
+ crl [future-captures] : project(H, F, N) => selected(H) if hasRoot(through(H, N), F) .
+endm
+mod WHIPPLESCRIPT-ACTION-CAPTURE-NO-ROOT is
+ including WHIPPLESCRIPT-ACTION-CAPTURE-PREFIX .
+ var F : Frame . var N : Nat . var H : History .
+ rl [invent-admission] : project(H, F, N) => selected(through(H, N)) .
+endm
+mod WHIPPLESCRIPT-ACTION-CAPTURE-EXCLUSIVE is
+ including WHIPPLESCRIPT-ACTION-CAPTURE-PREFIX .
+ var F : Frame . var N : Nat . var H : History .
+ crl [lose-exact-frontier] : project(H, F, s(N)) => selected(through(H, N)) if hasRoot(through(H, N), F) .
+endm

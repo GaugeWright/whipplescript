@@ -142,7 +142,12 @@ the parts:
 - **The `read text from <store> at <path> as x` statement** loads one file. The
   success binding makes `result.content` and `result.bytes` available. An
   absent file is a usual failure. A path that the policy refuses is also a
-  usual failure. Branch on the failure.
+  usual failure. Branch on the failure. Inside an `action`, the read is a typed
+  operation value with `store`, `path`, `format`, `content`, `bytes`, and
+  `content_hash` fields. The path may be a string parameter or another ready
+  expression. The action waits for that value and captures its freshness
+  evidence before the read is admitted; no auxiliary fact or wrapper class is
+  needed to pass the result to another action.
 - **The `import <format> <Schema> from <store> at <path>` statement** decodes a
   structured file into one typed fact for each row. The formats are `jsonl`,
   `json`, and `csv`. The runtime validates each row against the schema. The
@@ -159,11 +164,20 @@ the parts:
   branch. The violation does not change the file. The `body` value is an
   expression. The runtime resolves the expression when the effect runs. Thus a
   write operation in an `after notes succeeds as loaded` block can write
-  `loaded.content`.
+  `loaded.content`. Inside an `action`, both the path and body must be strings
+  and wait for their actual dependencies. The successful value has `store`,
+  `path`, `format`, `mode`, `bytes`, and `content_hash`. Host paths and provider
+  receipts remain evidence rather than action fields.
 - **The `export <format> <Schema> to <store> at <path>` statement** is the
   inverse of the import statement. The statement serializes the facts of the
   schema deterministically. A `where` clause can filter the facts. The same
-  mode policy applies.
+  mode policy applies. Inside an `action`, the path must be a string and the
+  predicate must be boolean for one row of the named schema. The operation
+  freezes the selected rows and their membership/absence evidence when it is
+  admitted. A fact arriving while the worker is delayed cannot slip into that
+  file. The successful value contains `store`, `path`, `format`, `schema`,
+  `mode`, `row_count`, and `content_hash`; the captured rows stay in operation
+  evidence rather than flowing through every caller.
 
 ## Files and the remainder of the system
 

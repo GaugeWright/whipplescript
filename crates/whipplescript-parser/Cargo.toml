@@ -13,6 +13,8 @@ whipplescript-core = { version = "0.5.6", path = "../whipplescript-core" }
 whipplescript-custody = { version = "0.5.6", path = "../whipplescript-custody" }
 # Collision-resistant source/IR identity hashes (pure-Rust, wasm-safe).
 sha2 = "0.11"
+# Artifact traits only; the runtime owns JSON decoding and validation.
+serde = { version = "1", features = ["derive"] }
 
 [dev-dependencies]
 # Reading `spec/report-schemas/package_manifest_v0.schema.json` back, to pin its

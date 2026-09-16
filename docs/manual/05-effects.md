@@ -179,6 +179,41 @@ Subsequent chapters give agents and models. With an agent or a model, the
 deadline pattern becomes practical. Request the work and a timer together. The
 effect that settles first then selects the branch.
 
+In composed code, `cancel` can also name an action call. Whipple cancels the
+external operations that the selected path of that call actually started,
+including operations in nested actions. It does not cancel branches that were
+never selected. A cancellation request is still pending work until the provider
+acknowledges a terminal cancellation; an action result and a workflow terminal
+wait for that acknowledgement. The compiler reports `cancel` on a fact,
+parameter, or pure transformed value at the statement because only operation
+bindings have a cancellation identity.
+
+## Inline prompts return text
+
+An inline prompt is an ordinary operation binding whose successful value is a
+string. Its interpolations are expressions, so the compiler checks them where
+they are written and the operation waits until all of them are ready:
+
+<!-- check: skip — requires a configured schema.coerce provider -->
+```whip
+action greet(name string) -> string {
+  prompt "Write a greeting for {{ name }}" as greeting
+  return greeting
+}
+```
+
+Whipple records the rendered prompt together with the exact fact and query
+observations used by its interpolations. Reopening the workflow observes the
+same operation result; it does not render the template again from newer facts.
+A changed prompt template or coercion-provider configuration changes the
+operation's replay commitment.
+
+Inline prompt interpolation is textual. It can render strings, numbers,
+booleans, records, arrays, and maps, but it cannot contain `image`, `pdf`,
+`audio`, `video`, or `sealed<T>` values. Declare a typed `coerce` parameter when
+a model call needs media or an explicit custody grant. This keeps attachment
+and decryption authority visible in the operation's signature.
+
 ## The subject that this chapter did not give
 
 An effect can fail. A command can exit with a code that is not zero. A provider

@@ -1,0 +1,8 @@
+load ../action-plan-artifact.maude
+search [1] in WHIPPLESCRIPT-ACTION-PLAN-ARTIFACT : stored(true, true, true) =>* usable .
+search [1] in WHIPPLESCRIPT-ACTION-PLAN-ARTIFACT : stored(false, true, true) =>* usable .
+search [1] in WHIPPLESCRIPT-ACTION-PLAN-ARTIFACT-UNKNOWN : stored(false, true, true) =>* usable .
+search [1] in WHIPPLESCRIPT-ACTION-PLAN-ARTIFACT : stored(true, false, true) =>* usable .
+search [1] in WHIPPLESCRIPT-ACTION-PLAN-ARTIFACT-ORPHAN : stored(true, false, true) =>* usable .
+search [1] in WHIPPLESCRIPT-ACTION-PLAN-ARTIFACT : stored(true, true, false) =>* usable .
+search [1] in WHIPPLESCRIPT-ACTION-PLAN-ARTIFACT-CAPTURE : stored(true, true, false) =>* usable .

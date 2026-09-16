@@ -1,0 +1,10 @@
+load ../managed-authority-ceilings.maude
+search [1] in WHIPPLESCRIPT-MANAGED-AUTHORITY : request(true, true, true, true, true) =>! checked(true, true) .
+search [1] in WHIPPLESCRIPT-MANAGED-AUTHORITY : request(true, true, false, false, false) =>! checked(true, true) .
+search [1] in WHIPPLESCRIPT-MANAGED-AUTHORITY-LOST : request(true, true, false, false, false) =>! checked(true, true) .
+search [1] in WHIPPLESCRIPT-MANAGED-AUTHORITY : request(true, false, false, false, false) =>! checked(true, true) .
+search [1] in WHIPPLESCRIPT-MANAGED-AUTHORITY : request(false, false, false, false, false) =>! checked(true, true) .
+search [1] in WHIPPLESCRIPT-MANAGED-AUTHORITY : request(true, true, true, true, false) =>! checked(true, true) .
+search [1] in WHIPPLESCRIPT-MANAGED-AUTHORITY-LOST : request(true, true, true, true, false) =>! checked(true, true) .
+search [1] in WHIPPLESCRIPT-MANAGED-AUTHORITY : request(true, true, true, false, false) =>! checked(true, true) .
+quit

@@ -1,0 +1,30 @@
+mod WHIPPLESCRIPT-ACTION-FIELD-PRESENCE is
+  protecting BOOL .
+  sorts Domain Read .
+  op domain : Bool Bool -> Domain [ctor] .
+  --- Left is the required discriminator; right is another possible value.
+  op present : Domain -> Bool .
+  vars L R : Bool .
+  eq present(domain(L, R)) = L and not R .
+  op fallback : Domain Bool -> Domain .
+  eq fallback(domain(L, R), true) = domain(L, false) .
+  eq fallback(domain(L, R), false) = domain(L, R) .
+  op read : Domain -> Read [ctor] .
+  op accepted : -> Read [ctor] .
+  var D : Domain .
+  crl [proven] : read(D) => accepted if present(D) .
+  op rebind : Domain Domain -> Domain .
+  vars A B : Domain .
+  eq rebind(A, B) = B .
+  op otherPath : Domain Domain -> Domain .
+  eq otherPath(A, B) = B .
+endm
+mod WHIPPLESCRIPT-ACTION-FIELD-ONE-CANDIDATE is
+  including WHIPPLESCRIPT-ACTION-FIELD-PRESENCE .
+  var R : Bool .
+  rl [one-candidate] : read(domain(true, R)) => accepted .
+endm
+mod WHIPPLESCRIPT-ACTION-FIELD-VACUOUS is
+  including WHIPPLESCRIPT-ACTION-FIELD-PRESENCE .
+  rl [empty-is-proof] : read(domain(false, false)) => accepted .
+endm

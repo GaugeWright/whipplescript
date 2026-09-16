@@ -1,0 +1,19 @@
+load action-value-types.maude
+mod WHIPPLESCRIPT-ACTION-CALLER-TYPES is
+  including WHIPPLESCRIPT-ACTION-VALUE-TYPES .
+  sort Selection .
+  ops selected unselected : -> Selection [ctor] .
+  op caller : Type Type Selection -> Check [ctor] .
+  vars A E : Type . var S : Selection .
+  rl [caller-type] : caller(A, E, S) => check(A, E) .
+endm
+mod WHIPPLESCRIPT-ACTION-CALLER-ASSUMES-PARAMETER is
+  including WHIPPLESCRIPT-ACTION-CALLER-TYPES .
+  vars A E : Type . var S : Selection .
+  rl [assume-required] : caller(A, E, S) => check(E, E) .
+endm
+mod WHIPPLESCRIPT-ACTION-CALLER-SKIPS-BRANCH is
+  including WHIPPLESCRIPT-ACTION-CALLER-TYPES .
+  vars A E : Type .
+  rl [skip-unselected] : caller(A, E, unselected) => accepted .
+endm

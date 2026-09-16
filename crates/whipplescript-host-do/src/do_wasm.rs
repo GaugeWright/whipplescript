@@ -784,6 +784,47 @@ pub fn host_external_delete_collected(bridge: DoSqlBridge, id: &str) -> Result<(
         .map_err(|error| JsValue::from_str(&format!("{error:?}")))
 }
 
+/// Resolve one authored managed result through the same host-neutral
+/// explanation projection as the native CLI. The Worker supplies only the
+/// non-secret coerce provider/model identity needed to reproduce operation
+/// ids; an empty provider is the deterministic fixture configuration.
+#[wasm_bindgen]
+pub fn host_explain_action(
+    bridge: DoSqlBridge,
+    instance_id: &str,
+    result: &str,
+    firing: Option<String>,
+    coerce_provider: &str,
+    coerce_model: &str,
+) -> Result<String, JsValue> {
+    let store = crate::do_store::DoSqliteStore::new(std::rc::Rc::new(JsDoSql { bridge }));
+    let fingerprint = if coerce_provider.is_empty() {
+        "fixture".to_owned()
+    } else {
+        whipplescript_kernel::coerce::coercion_config_fingerprint(
+            "schema_coercer",
+            coerce_provider,
+            coerce_provider,
+            coerce_model,
+        )
+    };
+    let explanations = whipplescript_kernel::source_action::explanation::project_instance(
+        &store,
+        instance_id,
+        &fingerprint,
+        &std::collections::BTreeSet::new(),
+    )
+    .map_err(|error| JsValue::from_str(&format!("{error:?}")))?;
+    let response = whipplescript_kernel::source_action::explanation::query::resolve(
+        &explanations,
+        instance_id,
+        result,
+        firing.as_deref(),
+    )
+    .map_err(|error| JsValue::from_str(&error))?;
+    serde_json::to_string(&response).map_err(|error| JsValue::from_str(&error.to_string()))
+}
+
 /// Export the source agent's live thread at one exact event coordinate. The
 /// source package/policy binding and quiescence are revalidated before any
 /// transcript projection leaves its placement.

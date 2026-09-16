@@ -1,0 +1,8 @@
+load ../action-root-capture.maude
+search [1] in WHIPPLESCRIPT-ACTION-ROOT-CAPTURE : at(original, none, waiting) =>* at(original, saved(original), waiting) .
+search [1] in WHIPPLESCRIPT-ACTION-ROOT-CAPTURE : at(original, saved(original), waiting) =>* reopened(newer, saved(original), read(original)) .
+search [1] in WHIPPLESCRIPT-ACTION-ROOT-CAPTURE : at(original, saved(original), waiting) =>* reopened(newer, saved(original), read(newer)) .
+search [1] in WHIPPLESCRIPT-ACTION-ROOT-CAPTURE : at(original, saved(original), waiting) =>* reopened(newer, saved(newer), read(newer)) .
+search [1] in WHIPPLESCRIPT-ACTION-ROOT-READS-LIVE : at(original, saved(original), waiting) =>* reopened(newer, saved(original), read(newer)) .
+search [1] in WHIPPLESCRIPT-ACTION-ROOT-FORGETS-ADMISSION : at(original, saved(original), waiting) =>* reopened(newer, saved(newer), read(newer)) .
+quit

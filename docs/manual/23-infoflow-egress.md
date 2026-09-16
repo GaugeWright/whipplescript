@@ -109,6 +109,12 @@ follows. If only the `ssn` field made the record readable by Operator only, the
 label of the redacted projection becomes more narrow. The flow that the checker
 denied then becomes safe.
 
+Both `redact` and `declassify source into Type as value` are synchronous value
+transformations. They do not start work, so extracting either into an action
+does not add a wait edge. They still wait for their source value and retain the
+source's captured-query validity. `declassify` also projects to the named target
+class and checks that bounded shape before the value can continue.
+
 ## The two crossings and their guard
 
 Each denial in these three chapters names a maximum of one permitted crossing.

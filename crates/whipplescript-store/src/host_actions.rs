@@ -218,6 +218,7 @@ pub mod conformance {
                 provenance_class: "external",
                 correlation_id: Some("action-fingerprint"),
                 source_span_json: None,
+                validity_json: None,
             },
             NewFact {
                 fact_id: "action-second",
@@ -228,6 +229,7 @@ pub mod conformance {
                 provenance_class: "external",
                 correlation_id: Some("action-fingerprint"),
                 source_span_json: None,
+                validity_json: None,
             },
         ];
         HostActionStart {

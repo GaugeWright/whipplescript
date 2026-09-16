@@ -1,0 +1,26 @@
+--- Static read and unwrap ceilings; runtime custody/admission are separate.
+fmod MANAGED-AUTHORITY-POLICY is
+  protecting BOOL .
+  op readOK : Bool Bool Bool -> Bool .
+  op unwrapOK : Bool Bool -> Bool .
+  vars P A B G T : Bool .
+  eq readOK(P, A, B) = not P or (A and B) .
+  eq unwrapOK(G, T) = not G or T .
+endfm
+mod WHIPPLESCRIPT-MANAGED-AUTHORITY is
+  protecting MANAGED-AUTHORITY-POLICY .
+  sort State .
+  op request : Bool Bool Bool Bool Bool -> State [ctor] .
+  op checked : Bool Bool -> State [ctor] .
+  vars P A B G T : Bool .
+  rl [check] : request(P, A, B, G, T)
+    => checked(readOK(P, A, B), unwrapOK(G, T)) .
+endm
+mod WHIPPLESCRIPT-MANAGED-AUTHORITY-LOST is
+  including WHIPPLESCRIPT-MANAGED-AUTHORITY .
+  vars P A B G T : Bool .
+  rl [partial-clearance] : request(P, A, B, G, T)
+    => checked(not P or A or B, unwrapOK(G, T)) .
+  rl [unscoped-unwrap] : request(P, A, B, G, T)
+    => checked(readOK(P, A, B), true) .
+endm

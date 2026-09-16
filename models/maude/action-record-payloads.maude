@@ -1,0 +1,32 @@
+mod WHIPPLESCRIPT-ACTION-RECORD-PAYLOADS is
+  protecting BOOL .
+  sorts Field Check .
+  ops absent good bad maybe : -> Field [ctor] .
+  op overlay : Field Field -> Field .
+  vars A B : Field .
+  eq overlay(A, absent) = A .
+  eq overlay(A, good) = good .
+  eq overlay(A, bad) = bad .
+  eq overlay(A, maybe) = maybe .
+  op valid : Field Bool -> Bool .
+  var Required : Bool .
+  eq valid(good, Required) = true .
+  eq valid(bad, Required) = false .
+  eq valid(absent, Required) = not Required .
+  eq valid(maybe, Required) = not Required .
+  op check : Field Bool -> Check [ctor] .
+  op enumCheck : Bool Bool -> Check [ctor] .
+  op accepted : -> Check [ctor] .
+  crl [field] : check(A, Required) => accepted if valid(A, Required) .
+  --- First bit: variant declares a payload. Second: payload supplied and valid.
+  crl [enum] : enumCheck(Required, true) => accepted if Required .
+  rl [bare-tag] : enumCheck(false, false) => accepted .
+endm
+mod WHIPPLESCRIPT-ACTION-RECORD-IGNORES-OMISSION is
+  including WHIPPLESCRIPT-ACTION-RECORD-PAYLOADS .
+  rl [nullable-is-present] : check(maybe, true) => accepted .
+endm
+mod WHIPPLESCRIPT-ACTION-RECORD-BARE-PAYLOAD is
+  including WHIPPLESCRIPT-ACTION-RECORD-PAYLOADS .
+  rl [label-is-enough] : enumCheck(true, false) => accepted .
+endm

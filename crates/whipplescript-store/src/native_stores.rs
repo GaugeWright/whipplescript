@@ -308,6 +308,16 @@ impl RuntimeStore for NativeStores {
         self.runtime.admit_fact_batch(batch)
     }
 
+    fn settle_coerce_effect(
+        &mut self,
+        completion: EffectCompletion<'_>,
+        diagnostic: Option<TerminalDiagnosticRecord>,
+        fact: crate::coerce_settlement::CoerceSettlementFact<'_>,
+    ) -> StoreResult<StoredEvent> {
+        self.runtime
+            .settle_coerce_effect(completion, diagnostic, fact)
+    }
+
     fn retain_exec_outcome(
         &mut self,
         observation: crate::exec_outcome::Retention<'_>,

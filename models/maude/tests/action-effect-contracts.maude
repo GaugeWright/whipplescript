@@ -1,0 +1,15 @@
+load ../action-effect-contracts.maude
+search [1] in WHIPPLESCRIPT-ACTION-EFFECT-CONTRACTS : capture(true, true, noResource) =>* captured .
+search [1] in WHIPPLESCRIPT-ACTION-EFFECT-CONTRACTS : capture(true, true, boundResource) =>* captured .
+search [1] in WHIPPLESCRIPT-ACTION-EFFECT-CONTRACTS : capture(false, true, noResource) =>* captured .
+search [1] in WHIPPLESCRIPT-ACTION-EFFECT-MISSING : capture(false, true, noResource) =>* captured .
+search [1] in WHIPPLESCRIPT-ACTION-EFFECT-CONTRACTS : capture(true, false, noResource) =>* captured .
+search [1] in WHIPPLESCRIPT-ACTION-EFFECT-ERASED : capture(true, false, noResource) =>* captured .
+search [1] in WHIPPLESCRIPT-ACTION-EFFECT-CONTRACTS : capture(true, true, missingBinding) =>* captured .
+search [1] in WHIPPLESCRIPT-ACTION-EFFECT-RESOURCE : capture(true, true, missingBinding) =>* captured .
+search [1] in WHIPPLESCRIPT-ACTION-EFFECT-CONTRACTS : tell(readerOnly, false) =>* admitted .
+search [1] in WHIPPLESCRIPT-ACTION-EFFECT-CONTRACTS : tell(readerWriter, true) =>* admitted .
+search [1] in WHIPPLESCRIPT-ACTION-EFFECT-CONTRACTS : tell(readerOnly, true) =>* admitted .
+search [1] in WHIPPLESCRIPT-ACTION-EFFECT-TARGET : tell(readerOnly, true) =>* admitted .
+search [1] in WHIPPLESCRIPT-ACTION-EFFECT-CONTRACTS : tell(noTargets, false) =>* admitted .
+quit

@@ -246,6 +246,20 @@ workflows. The `decide` statement is for a local judgment that occurs one time.
 When the same shape of decision occurs a second time, change the shape into a
 named declaration.
 
+The inline result is a structural value. It can flow through `after`, `return`,
+and an action call without declaring a class just to connect those statements.
+The shape remains local: use a named `coerce` and named class when another rule
+or workflow must refer to the contract by name.
+
+Each `{{ expression }}` is checked at the `decide` statement and must become
+strictly ready before the effect is admitted. The durable operation captures
+the authored template, rendered prompt, output schema, and the source and query
+validity premises of every interpolation. Replay observes that operation before
+consulting current bindings, so a later fact cannot rewrite a decision already
+in flight. Inline interpolation is textual. Media-containing and sealed values
+must cross through a declared `coerce` parameter, where attachment and custody
+authority are explicit.
+
 ## Where next
 
 Chapter 9 gives the `then` statement. The statement chains a progression that

@@ -1,0 +1,13 @@
+load ../action-hygiene.maude
+
+search [1] in WHIPPLESCRIPT-ACTION-HYGIENE : read(first, parameter) =>* result(slot(first, parameter)) .
+search [1] in WHIPPLESCRIPT-ACTION-HYGIENE : read(second, parameter) =>* result(slot(second, parameter)) .
+search [1] in WHIPPLESCRIPT-ACTION-HYGIENE : read(second, parameter) =>* result(slot(first, parameter)) .
+search [1] in WHIPPLESCRIPT-ACTION-SHARES-CALL-SCOPE : read(second, parameter) =>* result(slot(first, parameter)) .
+search [1] in WHIPPLESCRIPT-ACTION-HYGIENE : read(second, callerOnly) =>* result(unresolved) .
+search [1] in WHIPPLESCRIPT-ACTION-HYGIENE : read(second, callerOnly) =>* result(callerSlot) .
+search [1] in WHIPPLESCRIPT-ACTION-CAPTURES-CALLER : read(second, callerOnly) =>* result(callerSlot) .
+search [1] in WHIPPLESCRIPT-ACTION-HYGIENE : object(second) =>* result(field(label, slot(second, parameter))) .
+search [1] in WHIPPLESCRIPT-ACTION-HYGIENE : object(second) =>* result(field(parameter, slot(second, parameter))) .
+search [1] in WHIPPLESCRIPT-ACTION-RENAMES-FIELD : object(second) =>* result(field(parameter, slot(second, parameter))) .
+quit

@@ -1,0 +1,40 @@
+load ../action-explanations.maude
+search [1] in WHIPPLESCRIPT-ACTION-EXPLANATIONS :
+  branchStatus(1, selected(1)) =>* waiting .
+search [1] in WHIPPLESCRIPT-ACTION-EXPLANATIONS :
+  branchStatus(1, selected(2)) =>* notSelected .
+search [1] in WHIPPLESCRIPT-ACTION-EXPLANATIONS :
+  branchStatus(1, unresolved) =>* notReached .
+search [1] in WHIPPLESCRIPT-ACTION-EXPLANATIONS :
+  groupShared(7, 1, 2) =>* cause(7, dependent(1) dependent(2)) .
+search [1] in WHIPPLESCRIPT-ACTION-EXPLANATIONS :
+  keepSecondary(1, 7, 8) =>* cause(7, dependent(1)) ++ cause(8, dependent(1)) .
+search [1] in WHIPPLESCRIPT-ACTION-EXPLANATIONS :
+  explainVisible(7, payload(99), 3) =>* safeCause(7, shown(3)) .
+search [1] in WHIPPLESCRIPT-ACTION-EXPLANATIONS :
+  explainHidden(7, payload(99), 3) =>* safeCause(7, redacted) .
+search [1] in WHIPPLESCRIPT-ACTION-EXPLANATIONS :
+  resultId(4, 9) =>* resultId(4, 9) .
+
+search [1] in WHIPPLESCRIPT-ACTION-EXPLANATIONS :
+  branchStatus(1, unresolved) =>* notSelected .
+search [1] in WHIPPLESCRIPT-ACTION-EXPLANATIONS-GUESSES-SELECTION :
+  guessedBranchStatus(1, unresolved) =>* notSelected .
+search [1] in WHIPPLESCRIPT-ACTION-EXPLANATIONS :
+  groupShared(7, 1, 2) =>* cause(7, dependent(1)) ++ cause(7, dependent(2)) .
+search [1] in WHIPPLESCRIPT-ACTION-EXPLANATIONS-SPLITS-SHARED-CAUSE :
+  splitShared(7, 1, 2) =>* cause(7, dependent(1)) ++ cause(7, dependent(2)) .
+search [1] in WHIPPLESCRIPT-ACTION-EXPLANATIONS :
+  keepSecondary(1, 7, 8) =>* cause(7, dependent(1)) .
+search [1] in WHIPPLESCRIPT-ACTION-EXPLANATIONS-DROPS-SECONDARY :
+  dropSecondary(1, 7, 8) =>* cause(7, dependent(1)) .
+search [1] in WHIPPLESCRIPT-ACTION-EXPLANATIONS :
+  explainVisible(7, payload(99), 3) =>* leakyCause(7, payload(99), shown(3)) .
+search [1] in WHIPPLESCRIPT-ACTION-EXPLANATIONS-LEAKS-PAYLOAD :
+  explainLeaky(7, payload(99), 3) =>* leakyCause(7, payload(99), shown(3)) .
+search [1] in WHIPPLESCRIPT-ACTION-EXPLANATIONS :
+  pair(resultId(1, 9), resultId(2, 9)) =>* pair(resultId(0, 9), resultId(0, 9)) .
+search [1] in WHIPPLESCRIPT-ACTION-EXPLANATIONS-DROPS-FIRING :
+  pair(resultIdDropped(1, 9), resultIdDropped(2, 9)) =>*
+  pair(resultId(0, 9), resultId(0, 9)) .
+quit

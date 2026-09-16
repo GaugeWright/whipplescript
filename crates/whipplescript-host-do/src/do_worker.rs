@@ -21,7 +21,7 @@ use whipplescript_kernel::harness_loop::{HttpModelClient, ToolExecutor};
 use whipplescript_kernel::host_protocol::ResourceRef;
 use whipplescript_kernel::instance_machine::{EffectStep, InstanceDriver};
 use whipplescript_kernel::sansio::{HttpRequest, HttpResponse, TransportError};
-use whipplescript_kernel::{idempotency_key, ProgramVersionInput, RuntimeKernel};
+use whipplescript_kernel::{idempotency_key, CompiledProgramVersionInput, RuntimeKernel};
 use whipplescript_parser::IrProgram;
 use whipplescript_store::branches::Branches;
 use whipplescript_store::files::FileStore;
@@ -254,7 +254,8 @@ impl<Sql: DoSql + 'static> DurableInstance<Sql> {
         project_context: &[(String, String)],
         scripts: &[ScriptCapabilityInput],
     ) -> Result<Self, String> {
-        let ir = whipplescript_parser::compile_program(program_source)
+        let compiled = whipplescript_parser::compile_program(program_source);
+        let ir = compiled
             .ir
             .ok_or_else(|| "program did not compile".to_owned())?;
         // P1: share ONE DoSql handle between the runtime store and the file
@@ -267,45 +268,21 @@ impl<Sql: DoSql + 'static> DurableInstance<Sql> {
                 ports.coerce.as_ref(),
                 &ports.media,
             ));
-        // DR-0054 Phase B introduced real revision identity here, and stamped
-        // `ir_hash` as `source_hash+compiler_version` for a stated reason: "no
-        // canonical IR serialization exists to hash directly". That reason is
-        // gone. `IrProgram::to_snapshot` is that serialization — golden-tested
-        // across the example corpus, and read back by
-        // `whipplescript_parser::snapshot::parse` — and the native host has
-        // hashed it as `ir_hash` since the view-model note's G1.
-        //
-        // So hash the document the field is named after. Two things follow: the
-        // snapshot can be stored under it and read back by it, which is what a
-        // hosted instance needs before anything can draw its structure (G1a);
-        // and `ir_hash` means the same thing on both hosts, where before the
-        // same column held a content hash natively and a derived string here.
-        //
-        // Existing hosted instances keep the version they point at. A deploy
-        // mints a new version row under the new identity, exactly as a compiler
-        // change does natively.
+        // The kernel derives and stores the same executable identity on both
+        // hosts: the diagnostic IR projection for legacy output, or that
+        // projection plus every checked plan for typed output. Existing hosted
+        // instances keep the immutable version they already point at.
         let source_hash = whipplescript_kernel::exec_http::sha256_hex(program_source.as_bytes());
         let compiler_version = concat!("whipplescript-host-do ", env!("CARGO_PKG_VERSION"));
-        // DR-0095: identity is the span-free PROJECTION of the snapshot, and the
-        // projection is what lands under `ir_hash` — exactly as natively.
-        // Hashing the spanned document here would make the two hosts disagree
-        // about `ir_hash` for one program, which is the thing repairing this
-        // path was for, and would file a blob whose id is not the hash of the
-        // bytes it names, which is what `verify_body` exists to catch.
-        let ir_snapshot = whipplescript_parser::snapshot::identity_projection(&ir.to_snapshot());
-        let ir_hash = crate::do_store::stable_hash_hex(&ir_snapshot);
         let version = kernel
-            .create_program_version_for_program(
-                ProgramVersionInput {
+            .create_program_version_for_compiled_program(
+                CompiledProgramVersionInput {
                     program_name: &ir.workflow,
                     source_hash: &source_hash,
-                    ir_hash: &ir_hash,
                     compiler_version,
-                    // The snapshot `ir_hash` now names. The store checks the
-                    // two agree and refuses the pair if they do not.
-                    ir_snapshot: Some(&ir_snapshot),
                 },
                 &ir,
+                compiled.typed_actions.as_ref(),
             )
             .map_err(|error| format!("{error:?}"))?;
         // DO-plane package bootstrap (spec/durable-object-runtime-tracker.md):
@@ -421,8 +398,8 @@ impl<Sql: DoSql + 'static> DurableInstance<Sql> {
                             instance.instance_id, stored.source_hash, stored.compiler_version
                         );
                         let drift_key = format!(
-                            "do.revision_drift:{}:{}:{ir_hash}",
-                            stored.version_id, instance.instance_id
+                            "do.revision_drift:{}:{}:{}",
+                            stored.version_id, instance.instance_id, version.version_id
                         );
                         kernel
                             .store()
@@ -1211,6 +1188,45 @@ mod tests {
     /// A fixed injected clock for deterministic tests (2026-01-01T00:00:00Z).
     const TEST_NOW_MS: i64 = 1_767_225_600_000;
     use crate::do_store::test_support::store;
+
+    #[test]
+    fn create_publishes_action_source_as_a_typed_executable() {
+        const SOURCE: &str = r#"workflow HostedTypedSource
+output result Answer
+class Answer { text string }
+action answer() -> Answer { return { text "hosted" } }
+rule finish when started => { answer() as answer
+complete result answer }
+"#;
+        let mut instance = DurableInstance::create(
+            store().sql,
+            SOURCE,
+            "{}",
+            "local/HostedTypedSource",
+            DurableEffectPorts::default(),
+            &[],
+            &[],
+        )
+        .expect("typed source creates");
+        let kernel = instance.kernel.as_ref().expect("kernel");
+        let instances = kernel.store().list_instances().expect("instances");
+        assert_eq!(instances.len(), 1);
+        let version = kernel
+            .store()
+            .get_program_version(&instances[0].version_id)
+            .expect("version read")
+            .expect("version");
+        let summary: serde_json::Value =
+            serde_json::from_str(&version.analysis_summary_json).expect("summary");
+        assert_eq!(
+            summary["executable_program"]["format"],
+            whipplescript_kernel::program_artifact::TYPED_FORMAT
+        );
+        assert!(matches!(
+            instance.step(None, TEST_NOW_MS),
+            DurableStepOutcome::Terminal
+        ));
+    }
 
     // The worker-shell loop over an effect-free workflow: `create`, then `step`
     // until a terminal — no HTTP round, one settle.

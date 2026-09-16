@@ -2026,6 +2026,7 @@ fn drive_to_idle(
                 provider_config_paths: provider_config_paths.to_vec(),
                 max_child_iterations: 8,
                 agent_outcomes: BTreeMap::new(),
+                coerce_outcomes: BTreeMap::new(),
                 coerce_outputs: BTreeMap::new(),
                 agent_results: BTreeMap::new(),
                 virtual_now: None,

@@ -148,6 +148,11 @@ turn. The clause applies to each agent separately. Thus `alpha succeeds` and
 injects the exact typed decision that a branch needs. This clause exercises the
 two `case` arms above with no model.
 
+Coercion outcomes are also keyed by declaration. `stub coerce policy fails`
+can exercise one local recovery while independent coercions keep their own
+`returns` stubs. A named failure does not turn every model operation in the
+scenario into a failure.
+
 The **`run`** clause drives the rounds of the true engine. The `until idle`
 clause and the `until workflow completed|failed` clause drive the engine to a
 fixed point. The `for N steps` clause drives the engine to an intermediate

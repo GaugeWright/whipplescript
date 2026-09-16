@@ -70,6 +70,125 @@ pub mod conformance {
     use crate::event_chain;
     use crate::{NewEvent, StoreError, StoreResult};
 
+    /// A lowering evaluated before another writer's commit cannot append work.
+    /// Both real SQL hosts run this schedule, including exact replay after the
+    /// frontier moves. It is a rule-commit witness, not a synthetic CAS flag.
+    pub fn run_rule_frontier<S: crate::RuntimeStore>(mut store: S) {
+        use crate::{
+            NewEffect, NewInstance, NewProgramVersion, RuleCommit, RuleCommitRevisionGuard,
+        };
+        let version = store
+            .create_program_version(NewProgramVersion {
+                program_name: "RuleFrontier",
+                source_hash: "source",
+                ir_hash: "ir",
+                ir_snapshot: None,
+                compiler_version: "test",
+                declared_capabilities_json: "[]",
+                declared_profiles_json: "[]",
+                declared_skills_json: "[]",
+                declared_schemas_json: "[]",
+                analysis_summary_json: "{}",
+                generated_artifacts_json: "[]",
+                artifact_root: None,
+            })
+            .expect("frontier fixture version");
+        let instance = store
+            .create_instance(NewInstance {
+                program_id: &version.program_id,
+                version_id: &version.version_id,
+                input_json: "{}",
+            })
+            .expect("frontier fixture instance");
+        let instance_id = &instance.instance_id;
+        let frontier = store
+            .list_events(instance_id)
+            .expect("frontier events")
+            .last()
+            .expect("creation event")
+            .sequence;
+        let guard = RuleCommitRevisionGuard {
+            program_version_id: &version.version_id,
+            revision_epoch: 0,
+            evaluated_frontier: Some(frontier),
+        };
+        let first = RuleCommit {
+            instance_id,
+            rule: "review",
+            trigger_event_id: None,
+            facts: &[],
+            consumed_fact_ids: &[],
+            effects: &[],
+            dependencies: &[],
+            terminal: None,
+            idempotency_key: Some("frontier-winner"),
+            marks: &[],
+            context_json: Some("{}"),
+        };
+        let winner = store
+            .commit_rule_with_revision_guard(first, guard)
+            .expect("first capture commit wins");
+        let effects = [NewEffect {
+            effect_id: "frontier-effect",
+            kind: "timer.wait",
+            target: None,
+            input_json: "{}",
+            status: "queued",
+            idempotency_key: "frontier-effect-key",
+            required_capabilities_json: "[]",
+            profile: None,
+            correlation_id: None,
+            source_span_json: None,
+            timeout_seconds: None,
+        }];
+        let racing = RuleCommit {
+            effects: &effects,
+            idempotency_key: Some("frontier-loser"),
+            ..first
+        };
+        let before = store.list_events(instance_id).expect("winner prefix");
+        let refused = store
+            .commit_rule_with_revision_guard(racing, guard)
+            .expect_err("stale frontier refuses");
+        assert!(matches!(
+            refused,
+            StoreError::GuardRefused {
+                guard: crate::GuardKind::CompareAndSet,
+                ..
+            }
+        ));
+        assert_eq!(
+            store.list_events(instance_id).expect("unchanged prefix"),
+            before
+        );
+        assert!(store
+            .list_effects(instance_id)
+            .expect("no stale effects")
+            .is_empty());
+        let reread = RuleCommitRevisionGuard {
+            evaluated_frontier: Some(winner.sequence),
+            ..guard
+        };
+        store
+            .commit_rule_with_revision_guard(racing, reread)
+            .expect("replanned work commits");
+        assert_eq!(
+            store.list_effects(instance_id).expect("one effect").len(),
+            1
+        );
+        let before_replay = store.list_events(instance_id).expect("replay frontier");
+        let replay = store
+            .commit_rule_with_revision_guard(first, guard)
+            .expect("old frontier exact replay");
+        assert_eq!(replay, winner);
+        assert_eq!(
+            store
+                .list_events(instance_id)
+                .expect("replay appends nothing"),
+            before_replay
+        );
+    }
+
     fn next_random(state: &mut u64) -> u64 {
         *state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
         let mut z = *state;

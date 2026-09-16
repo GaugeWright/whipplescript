@@ -37,6 +37,13 @@ struct ClosureInput {
     id: String,
     #[serde(rename = "rule")]
     _rule: String,
+    /// The item's title travels with its address, so a `claim`/`release`/
+    /// `finish` result can name the item it acted on. A closure addresses the
+    /// item by queue and id and is authorized against the binding, so the title
+    /// decides nothing here -- but `deny_unknown_fields` is deliberate, and a
+    /// field the lowering emits has to be named to be ignored.
+    #[serde(rename = "title", default)]
+    _title: Option<String>,
     #[serde(default)]
     payload: ClosurePayload,
 }

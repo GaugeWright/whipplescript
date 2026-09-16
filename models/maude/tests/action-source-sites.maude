@@ -1,0 +1,11 @@
+load ../action-source-sites.maude
+search [1] in WHIPPLESCRIPT-ACTION-SOURCE-SITES : join(site(helper, child(root, 0)), reader, 0, site(helper, child(root, 1)), writer, 0) =>* distinct .
+search [1] in WHIPPLESCRIPT-ACTION-SOURCE-SITES : join(site(helper, child(root, 0)), reader, 0, site(helper, child(root, 1)), writer, 0) =>* merged .
+search [1] in WHIPPLESCRIPT-ACTION-SOURCE-SPANS : join(site(helper, child(root, 0)), reader, 0, site(helper, child(root, 1)), writer, 0) =>* merged .
+search [1] in WHIPPLESCRIPT-ACTION-SOURCE-SITES : join(site(helper, root), reader, 0, site(caller, root), writer, 0) =>* distinct .
+search [1] in WHIPPLESCRIPT-ACTION-SOURCE-SITES : join(site(helper, root), reader, 0, site(caller, root), writer, 0) =>* merged .
+search [1] in WHIPPLESCRIPT-ACTION-SOURCE-OWNERLESS : join(site(helper, root), reader, 0, site(caller, root), writer, 0) =>* merged .
+search [1] in WHIPPLESCRIPT-ACTION-SOURCE-SITES : join(site(helper, root), reader, 0, site(helper, root), reader, 9) =>* shared .
+search [1] in WHIPPLESCRIPT-ACTION-SOURCE-SITES : join(site(helper, root), reader, 0, site(helper, root), writer, 9) =>* shared .
+search [1] in WHIPPLESCRIPT-ACTION-SOURCE-SITES : join(site(helper, root), reader, 0, site(helper, root), writer, 9) =>* refused .
+quit

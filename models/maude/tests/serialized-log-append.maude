@@ -1,0 +1,7 @@
+load ../serialized-log-append.maude
+search [1] in WHIPPLESCRIPT-SERIALIZED-LOG-APPEND : log(0, free, idle, idle) =>! log(2, free, done, done) .
+search [1] in WHIPPLESCRIPT-SERIALIZED-LOG-APPEND : log(0, free, idle, idle) =>* collision .
+search [1] in WHIPPLESCRIPT-SERIALIZED-LOG-APPEND-LOST : log(0, free, idle, idle) =>* collision .
+search [1] in WHIPPLESCRIPT-SERIALIZED-LOG-APPEND : log(0, free, idle, idle) =>! log(1, free, done, done) .
+search [1] in WHIPPLESCRIPT-SERIALIZED-LOG-APPEND : log(0, free, idle, idle) =>* log(1, free, done, idle) .
+quit

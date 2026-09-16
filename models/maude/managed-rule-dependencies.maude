@@ -1,0 +1,28 @@
+--- Bounded activation footprint: helper extraction preserves possible writes;
+--- taking work out of ready does not create a producer/consumer coupling.
+fmod MANAGED-RULE-DEPENDENCIES is
+ protecting BOOL .
+ sorts Key Operation .
+ ops fact queue channel : -> Key [ctor] .
+ ops record file release send claim finish renew leaseRelease idle : -> Operation [ctor] .
+ op helper : Operation -> Operation [ctor] .
+ op both : Operation Operation -> Operation [ctor] .
+ op writes : Operation Key -> Bool .
+ vars A B : Operation . var K : Key .
+ eq writes(helper(A), K) = writes(A, K) .
+ eq writes(both(A, B), K) = writes(A, K) or writes(B, K) .
+ eq writes(record, fact) = true .
+ eq writes(file, queue) = true .
+ eq writes(release, queue) = true .
+ eq writes(send, channel) = true .
+ eq writes(A, K) = false [owise] .
+endfm
+mod WHIPPLESCRIPT-MANAGED-RULE-DEPENDENCIES is
+ protecting MANAGED-RULE-DEPENDENCIES .
+endm
+mod WHIPPLESCRIPT-MANAGED-RULE-DEPENDENCIES-LOST is
+ protecting MANAGED-RULE-DEPENDENCIES .
+ op unsafeHelper : Operation -> Operation .
+ var A : Operation .
+ eq unsafeHelper(A) = idle .
+endm

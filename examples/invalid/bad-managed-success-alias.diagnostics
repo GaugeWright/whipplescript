@@ -1,0 +1,6 @@
+error[construct.redundant_success_alias]: managed operation `result` already denotes its successful value; success alias `output` is redundant
+   --> examples/invalid/bad-managed-success-alias.whip:17:3
+   |
+17 |   after result succeeds as output {
+   |   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   = help: write `after result succeeds { ... }` and use `result` directly

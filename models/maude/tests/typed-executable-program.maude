@@ -1,0 +1,49 @@
+load ../typed-executable-program.maude
+search [1] in WHIPPLESCRIPT-TYPED-EXECUTABLE-PROGRAM :
+  capture(legacy, v1, 3, 0, true, true) =>* readyLegacy .
+search [1] in WHIPPLESCRIPT-TYPED-EXECUTABLE-PROGRAM :
+  capture(typed, v2, 3, 3, true, true) =>* readyTyped .
+search [1] in WHIPPLESCRIPT-TYPED-EXECUTABLE-PROGRAM :
+  dispatch(legacy, readyLegacy, true) =>* running .
+search [1] in WHIPPLESCRIPT-TYPED-EXECUTABLE-PROGRAM :
+  dispatch(typed, readyTyped, true) =>* running .
+search [1] in WHIPPLESCRIPT-TYPED-EXECUTABLE-PROGRAM :
+  compileSource(actionSource) =>* typed .
+search [1] in WHIPPLESCRIPT-TYPED-EXECUTABLE-PROGRAM :
+  compileSource(actionlessSource) =>* legacy .
+
+search [1] in WHIPPLESCRIPT-TYPED-EXECUTABLE-PROGRAM :
+  compileSource(actionSource) =>* legacy .
+search [1] in WHIPPLESCRIPT-TYPED-EXECUTABLE-LEGACY-SOURCE :
+  weakCompileSource(actionSource) =>* legacy .
+
+search [1] in WHIPPLESCRIPT-TYPED-EXECUTABLE-PROGRAM :
+  capture(typed, v2, 3, 2, true, true) =>* readyTyped .
+search [1] in WHIPPLESCRIPT-TYPED-EXECUTABLE-PARTIAL-PLANS :
+  weakCapture(typed, v2, 3, 2, true, true) =>* readyTyped .
+search [1] in WHIPPLESCRIPT-TYPED-EXECUTABLE-PROGRAM :
+  capture(typed, v2, 3, 3, false, true) =>* readyTyped .
+search [1] in WHIPPLESCRIPT-TYPED-EXECUTABLE-UNBOUND-IDENTITY :
+  weakCapture(typed, v2, 3, 3, false, true) =>* readyTyped .
+search [1] in WHIPPLESCRIPT-TYPED-EXECUTABLE-PROGRAM :
+  capture(typed, v1, 3, 3, true, true) =>* readyTyped .
+search [1] in WHIPPLESCRIPT-TYPED-EXECUTABLE-CROSSED-FORMAT :
+  weakCapture(typed, v1, 3, 3, true, true) =>* readyTyped .
+search [1] in WHIPPLESCRIPT-TYPED-EXECUTABLE-PROGRAM :
+  capture(legacy, v1, 3, 3, true, true) =>* readyLegacy .
+search [1] in WHIPPLESCRIPT-TYPED-EXECUTABLE-LEGACY-PLANS :
+  weakCapture(legacy, v1, 3, 3, true, true) =>* readyLegacy .
+search [1] in WHIPPLESCRIPT-TYPED-EXECUTABLE-PROGRAM :
+  dispatch(typed, readyTyped, false) =>* running .
+search [1] in WHIPPLESCRIPT-TYPED-EXECUTABLE-EARLY-DISPATCH :
+  weakDispatch(typed, readyTyped, false) =>* running .
+
+search [1] in WHIPPLESCRIPT-TYPED-EXECUTABLE-PROGRAM :
+  hostDispatch(native, typed, readyTyped, true) =>* running .
+search [1] in WHIPPLESCRIPT-TYPED-EXECUTABLE-PROGRAM :
+  hostDispatch(hosted, typed, readyTyped, true) =>* running .
+search [1] in WHIPPLESCRIPT-TYPED-EXECUTABLE-PROGRAM :
+  hostDispatch(hosted, typed, readyTyped, false) =>* running .
+search [1] in WHIPPLESCRIPT-TYPED-EXECUTABLE-HOST-BYPASS :
+  weakHostDispatch(hosted, typed, readyTyped, false) =>* running .
+quit

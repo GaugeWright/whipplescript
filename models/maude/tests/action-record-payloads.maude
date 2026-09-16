@@ -1,0 +1,12 @@
+load ../action-record-payloads.maude
+search [1] in WHIPPLESCRIPT-ACTION-RECORD-PAYLOADS : check(overlay(bad, good), true) =>* accepted .
+search [1] in WHIPPLESCRIPT-ACTION-RECORD-PAYLOADS : check(absent, false) =>* accepted .
+search [1] in WHIPPLESCRIPT-ACTION-RECORD-PAYLOADS : check(overlay(good, bad), false) =>* accepted .
+search [1] in WHIPPLESCRIPT-ACTION-RECORD-PAYLOADS : check(absent, true) =>* accepted .
+search [1] in WHIPPLESCRIPT-ACTION-RECORD-PAYLOADS : check(maybe, true) =>* accepted .
+search [1] in WHIPPLESCRIPT-ACTION-RECORD-PAYLOADS : enumCheck(true, true) =>* accepted .
+search [1] in WHIPPLESCRIPT-ACTION-RECORD-PAYLOADS : enumCheck(false, false) =>* accepted .
+search [1] in WHIPPLESCRIPT-ACTION-RECORD-PAYLOADS : enumCheck(true, false) =>* accepted .
+search [1] in WHIPPLESCRIPT-ACTION-RECORD-IGNORES-OMISSION : check(maybe, true) =>* accepted .
+search [1] in WHIPPLESCRIPT-ACTION-RECORD-BARE-PAYLOAD : enumCheck(true, false) =>* accepted .
+quit

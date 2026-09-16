@@ -1,0 +1,10 @@
+load ../managed-claim-endorsement.maude
+search [1] in WHIPPLESCRIPT-MANAGED-CLAIMS : claim(true, true, true, true, false) =>! checked(true) .
+search [1] in WHIPPLESCRIPT-MANAGED-CLAIMS : claim(true, false, true, true, false) =>! checked(true) .
+search [1] in WHIPPLESCRIPT-MANAGED-CLAIMS-LOST : claim(true, false, true, true, false) =>! checked(true) .
+search [1] in WHIPPLESCRIPT-MANAGED-CLAIMS : claim(true, true, true, true, true) =>! checked(true) .
+search [1] in WHIPPLESCRIPT-MANAGED-CLAIMS-LOST : claim(true, true, true, true, true) =>! checked(true) .
+search [1] in WHIPPLESCRIPT-MANAGED-CLAIMS : claim(true, true, false, true, false) =>! checked(true) .
+search [1] in WHIPPLESCRIPT-MANAGED-CLAIMS-LOST : claim(true, true, false, true, false) =>! checked(true) .
+search [1] in WHIPPLESCRIPT-MANAGED-CLAIMS : claim(true, true, true, false, false) =>! checked(true) .
+quit

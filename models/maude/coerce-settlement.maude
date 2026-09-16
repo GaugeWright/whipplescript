@@ -1,0 +1,25 @@
+--- Coerce settlement: terminal, immutable result, and ordinary fact are atomic.
+--- Payload validation and provider invocation are outside this finite witness.
+mod WHIPPLESCRIPT-COERCE-SETTLEMENT is
+  sorts Result Cfg .
+  ops f g : -> Result [ctor] .
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+  ops pending consume : -> Cfg [ctor] .
+  ops request terminal result fact consumed : Result -> Cfg [ctor] .
+  var F : Result .
+  rl [commit] : pending request(F) => terminal(F) result(F) fact(F) .
+  rl [consume] : consume fact(F) => consumed(F) .
+endm
+mod WHIPPLESCRIPT-COERCE-SETTLEMENT-SPLIT is
+  including WHIPPLESCRIPT-COERCE-SETTLEMENT .
+  rl [terminal-first] : pending request(F:Result) => terminal(F:Result) .
+endm
+mod WHIPPLESCRIPT-COERCE-SETTLEMENT-REBOUND is
+  including WHIPPLESCRIPT-COERCE-SETTLEMENT .
+  rl [wrong-result] : pending request(F:Result) => terminal(F:Result) result(g) fact(g) .
+endm
+mod WHIPPLESCRIPT-COERCE-SETTLEMENT-REVIVE is
+  including WHIPPLESCRIPT-COERCE-SETTLEMENT .
+  rl [redelivery] : request(F:Result) consumed(F:Result) => fact(F:Result) .
+endm

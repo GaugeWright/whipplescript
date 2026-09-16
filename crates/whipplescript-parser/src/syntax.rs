@@ -5,6 +5,8 @@
 
 use super::*;
 
+pub mod managed_template;
+
 /// Every field an `agent { … }` block accepts, in the order the parser dispatches
 /// them. `harness` is deliberately absent: it is the header clause
 /// `agent <name> using <harness>`, not a block field.
@@ -1235,12 +1237,7 @@ impl Parser<'_> {
             )
             .map(Item::Rule)
         } else if self.at_ident("view") {
-            self.parse_rule(
-                RuleKind::View,
-                std::mem::take(pending_tags),
-                pending_description.take(),
-            )
-            .map(Item::Rule)
+            self.parse_view(std::mem::take(pending_tags), pending_description.take())
         // TOP-LEVEL-ARMS-END (2 of 2)
         } else {
             None
@@ -4090,8 +4087,9 @@ impl Parser<'_> {
         Some(params)
     }
 
-    /// `action <name>(<param: type>, …) { <effect chain> }` (DR-0023). The body
-    /// is captured as a block source; expansion at call sites is a later slice.
+    /// Action declarations retain their success/domain failure contract before
+    /// body analysis or expansion. The absent-arrow form is retained for the
+    /// DR-0023 compiler path during the DR-0100 migration.
     fn parse_action(&mut self) -> Option<ActionDecl> {
         let start = self.expect_keyword("action")?.span.start;
         let name = self.expect_ident("action name")?;
@@ -4111,6 +4109,19 @@ impl Parser<'_> {
             }
         }
         self.expect_symbol(')')?;
+        let result = if self.at_thin_arrow() {
+            self.advance();
+            let success = self.parse_type()?;
+            let failure = if self.at_symbol('!') {
+                self.advance();
+                Some(self.parse_type()?)
+            } else {
+                None
+            };
+            Some(ActionResult { success, failure })
+        } else {
+            None
+        };
         let body = self.parse_block_source()?;
         let span = SourceSpan {
             start,
@@ -4119,9 +4130,61 @@ impl Parser<'_> {
         Some(ActionDecl {
             name,
             params,
+            result,
             body,
             span,
         })
+    }
+
+    /// `view name when ...` is the existing maintained derivation. A `(` after
+    /// the name selects the DR-0103 pure parameterized declaration instead.
+    fn parse_view(
+        &mut self,
+        tags: Vec<TagDecl>,
+        description: Option<StringLiteral>,
+    ) -> Option<Item> {
+        let start = self.expect_keyword("view")?.span.start;
+        let name = self.expect_ident("view name")?;
+        if !self.at_symbol('(') {
+            return self
+                .parse_rule_tail(start, name, RuleKind::View, tags, description)
+                .map(Item::Rule);
+        }
+        self.expect_symbol('(')?;
+        let mut params = Vec::new();
+        while !self.is_at_end() && !self.at_symbol(')') {
+            let param_name = self.expect_ident("view parameter name")?;
+            let ty = self.parse_type()?;
+            let span = param_name.span.join(ty.span());
+            params.push(ActionParam {
+                name: param_name,
+                ty,
+                span,
+            });
+            if self.at_symbol(',') {
+                self.advance();
+            } else if !self.at_symbol(')') {
+                self.unexpected("`,` or `)`");
+                return None;
+            }
+        }
+        self.expect_symbol(')')?;
+        self.expect_thin_arrow()?;
+        let result = self.parse_type()?;
+        let body = self.parse_block_source()?;
+        let span = SourceSpan {
+            start,
+            end: body.span.end,
+        };
+        Some(Item::View(ViewDecl {
+            name,
+            params,
+            result,
+            body,
+            tags,
+            description,
+            span,
+        }))
     }
 
     fn parse_rule(
@@ -4135,6 +4198,17 @@ impl Parser<'_> {
             RuleKind::Rule => "rule name",
             RuleKind::View => "view name",
         })?;
+        self.parse_rule_tail(start, name, kind, tags, description)
+    }
+
+    fn parse_rule_tail(
+        &mut self,
+        start: usize,
+        name: Ident,
+        kind: RuleKind,
+        tags: Vec<TagDecl>,
+        description: Option<StringLiteral>,
+    ) -> Option<RuleDecl> {
         let mut whens = Vec::new();
 
         while !self.is_at_end() && !self.at_arrow() {

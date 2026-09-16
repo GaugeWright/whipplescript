@@ -1,0 +1,9 @@
+load ../managed-field-clearance.maude
+search [1] in WHIPPLESCRIPT-MANAGED-FIELD-CLEARANCE : admitted(helper(secret), true, false) =>* false .
+search [1] in WHIPPLESCRIPT-MANAGED-FIELD-CLEARANCE : admitted(helper(secret), true, false) =>* true .
+search [1] in WHIPPLESCRIPT-MANAGED-FIELD-CLEARANCE : admitted(first(helper(pair(public, secret))), true, false) =>* true .
+search [1] in WHIPPLESCRIPT-MANAGED-FIELD-CLEARANCE : admitted(first(helper(pair(public, secret))), false, true) =>* true .
+search [1] in WHIPPLESCRIPT-MANAGED-FIELD-CLEARANCE : admitted(mix(pair(public, helper(secret))), true, false) =>* false .
+search [1] in WHIPPLESCRIPT-MANAGED-FIELD-CLEARANCE : admitted(helper(secret), true, true) =>* true .
+search [1] in WHIPPLESCRIPT-MANAGED-FIELD-CLEARANCE-LOST : admitted(unsafeHelper(secret), true, false) =>* true .
+quit

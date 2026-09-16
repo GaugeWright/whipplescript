@@ -1,0 +1,36 @@
+--- Managed tell values: readiness, real string terminals, and literal insertion.
+mod WHIPPLESCRIPT-ACTION-TELL-VALUES is
+  protecting BOOL .
+  sorts Input Terminal State .
+  ops ready pending failed : -> Input [ctor] .
+  ops completed failedTurn uncertain missingSummary : -> Terminal [ctor] .
+  op admit : Input Input Bool -> State [ctor] .
+  op observe : Terminal -> State [ctor] .
+  op render : Bool -> State [ctor] .
+  ops drafted published interpolated refused opened : -> State [ctor] .
+  op opening : Bool Bool -> State [ctor] .
+  rl [ephemeral-opening] : opening(true, false) => opened .
+  rl [admit] : admit(ready, ready, true) => drafted .
+  rl [value] : observe(completed) => published .
+  rl [literal] : render(false) => interpolated .
+endm
+mod WHIPPLESCRIPT-ACTION-TELL-EARLY is
+  including WHIPPLESCRIPT-ACTION-TELL-VALUES .
+  rl [early] : admit(ready, pending, true) => drafted .
+endm
+mod WHIPPLESCRIPT-ACTION-TELL-UNDECLARED is
+  including WHIPPLESCRIPT-ACTION-TELL-VALUES .
+  rl [unknown-agent] : admit(ready, ready, false) => drafted .
+endm
+mod WHIPPLESCRIPT-ACTION-TELL-FAKE-VALUE is
+  including WHIPPLESCRIPT-ACTION-TELL-VALUES .
+  rl [empty-summary] : observe(missingSummary) => published .
+endm
+mod WHIPPLESCRIPT-ACTION-TELL-REEXPANSION is
+  including WHIPPLESCRIPT-ACTION-TELL-VALUES .
+  rl [reexpand] : render(true) => interpolated .
+endm
+mod WHIPPLESCRIPT-ACTION-TELL-DURABLE-PLAINTEXT is
+  including WHIPPLESCRIPT-ACTION-TELL-VALUES .
+  rl [persist-plaintext] : opening(true, true) => opened .
+endm

@@ -462,15 +462,14 @@ own lifecycle, use a `workflow` declaration and an `invoke` statement.
 
 ### `action`
 
-An action gives reuse at compile time for a *chain of effects in the body of a
-rule*. The `pattern` construct and the `apply` construct abstract a full
-declaration. An `action` construct abstracts a chain of statements. The
-compiler inlines the action at each call site and expands the action fully into
-the durable graph:
+An action gives typed reuse for a scope in the body of a rule. The `pattern`
+and `apply` constructs abstract a full declaration. An `action` abstracts
+statements and their result, while remaining part of the calling rule's durable
+graph:
 
 <!-- check: skip — excerpt; the surrounding program's declarations are not shown -->
 ```whip
-action review_change(who AgentRef<reviewer>, item ChangeRequest) {
+action review_change(who AgentRef<reviewer>, item ChangeRequest) -> null {
   tell who as turn """markdown
   Review {{ item.title }}.
   """
@@ -478,9 +477,10 @@ action review_change(who AgentRef<reviewer>, item ChangeRequest) {
   after turn succeeds as reviewed {
     done item -> record ReviewedChange {
       id item.id
-      summary reviewed.summary
+      summary "reviewed"
       status "reviewed"
     }
+    return null
   }
 }
 
@@ -494,22 +494,45 @@ rule review
 
 These are the semantics:
 
-- **The expansion is inline and hygienic.** The compiler replaces the call with
-  the body of the action. The compiler substitutes each argument for its
-  parameter. The compiler makes the internal bindings of the action unique for
-  each call site. The internal bindings above are `turn` and `reviewed`. Thus
-  two calls in one rule body never collide. The compiled rule shows the
-  expanded chain. There is no call, no frame, and no recursion at run time.
-- **A call has no result (v0).** A call is an independent statement. You cannot
-  bind a call with `as`.
-- **The shape of the chain (v0).** The body of an action can contain effect
-  statements, `after` blocks, `record` statements, and `done` statements. In
-  v0, the body cannot contain `complete`, `fail`, `case`, or `branch`. The body
-  also cannot contain a nested call to an action. Keep the terminal logic and
-  the branch logic in the rule that makes the call.
+- **Results are explicit.** `-> T` declares the success type. `! E` optionally
+  declares the domain-failure type. Every reachable success or domain-failure
+  path must return a value of the declared type. Use `-> null` with `return
+  null` when only completion matters.
+- **Calls are lexical and hygienic.** Arguments, local bindings and returned
+  values are checked in their real caller and callee scopes. A call can bind
+  its successful result with `as`; discarding a result does not discard the
+  action's effects or failure behavior.
+- **Nesting is finite.** Actions may call actions. Direct and indirect cycles
+  are compile errors, including cycles in currently unselected branches.
+- **The graph stays inspectable.** The executable plan retains action scopes,
+  call paths, dependencies, effects, fact reads and writes, result contracts
+  and source locations. The runtime drives that plan through the calling rule's
+  firing and commit; it does not create another workflow instance or scheduler.
+- **Recovery is local.** `after` observes the named operation or call outcome
+  inside the lexical scope. Unrecovered operation failures propagate through
+  the action and the rule. One `on failure as problem` handler may recover the
+  remaining failures in an action scope after narrower continuations resolve.
+- **Region histories are checked before execution support.** A `during` or
+  `until` inside typed composition is checked for lapse at entry, lapse after
+  held work, and clean exit. A held result can conflict with a lapse result,
+  and only clean exit opens the following statements. Compilation currently
+  rejects an otherwise valid typed region at that region because managed phase
+  advancement and historical lapse joining are not yet available.
 
-An action has no identity at run time. This is the same behavior as a pattern.
-An action is reuse and not a subroutine.
+New source containing an action uses these typed semantics and every action in
+it needs a result contract. The old resultless, fire-and-forget action template
+is retained only when replaying a recorded legacy program version.
+During the remaining statement-family migration, a construct that has no
+managed execution path is refused at its source span and named using its source
+keyword, such as `exec` or `invoke`. The diagnostic does not expose an internal
+runtime enum or collapse every missing family into an unnamed contract error.
+
+Managed file imports keep their fact-producing meaning. The operation binding
+is a typed receipt with `store`, `path`, `format`, `schema`, `row_count`,
+`admitted`, and `skipped` fields; imported rows are read through ordinary fact
+queries. The runtime captures the path's dependency and freshness evidence at
+admission and validates it on replay, so a pending path cannot become absence
+and an admitted import cannot silently retarget a later value.
 
 ### `redact`
 
@@ -943,10 +966,10 @@ an effect. A later rule then branches on the completion of the effect.
 | `coerce fn(...) as x` | Puts a typed `schema.coerce` effect in the queue. |
 | `decide "..." -> { ... } as x` | Puts an inline typed model decision in the queue. Refer to [Inline `decide`](#inline-decide). |
 | `prompt "..." [using <provider>] as x` | Puts a free-text call to a model in the queue. The effect is a `schema.coerce` effect with a plain string as its result. Refer to [The `prompt` effect](#the-prompt-effect). |
-| `file issue into <tracker> { ... }` | Files a new issue into a [tracker](#trackers). |
-| `claim <issue> [as x]` | Claims an issue in a tracker. An issue that a different rule already claimed is a failure that you can branch on. |
-| `release <issue>` | Returns a claimed issue to the tracker. |
-| `finish <issue> [{ summary ... }] [as x]` | Marks an issue in a tracker as complete. |
+| `file issue into <tracker> { ... } as x` | Files a new issue. On success `x` is `{ queue string, id string, title string }`. |
+| `claim <issue> [ttl <dur>] as x` | Claims an issue. On success `x` is `{ queue string, id string, title string, claimed_by string, expires_at string? }`. A conflicting claim is a failure that you can branch on. |
+| `release <claim> [as x]` | Returns a claimed issue to the tracker. On success `x` is `{ queue string, id string, title string, status "open" }` and can be claimed again. |
+| `finish <claim> [{ summary ... }] [as x]` | Closes an issue. On success `x` is `{ queue string, id string, title string, status "closed", summary string? }`. |
 | `timer <dur> as x` | Makes a [timer effect](#time-and-deadlines) that fires when the duration is due. |
 | `timer until <time> as x` | Makes an absolute [timer effect](#time-and-deadlines) that fires at a typed instant or after a typed instant. |
 | `cancel <binding>` | Cancels an effect that is pending or in operation. An earlier statement must bind the effect. |
@@ -954,12 +977,12 @@ an effect. A later rule then branches on the completion of the effect.
 | `exec <capability> with <record> -> Type as x` | Puts a hosted script capability effect in the queue. The stdin data and the stdout data are typed. |
 | `call package.capability ... [as x]` | Puts a package capability effect in the queue. |
 | `recall from <pool> for <query> as x` | The memory form that a package owns. This form needs a lock that authorizes the lowering to the memory recall capability. |
-| `emit signal <name> to <instance> { ... } as x` | Puts a typed injection of a signal to a different instance in the queue. |
+| `emit signal <name> to <instance> [from <binding>] { ... } as x` | Puts a typed injection of a signal to a different instance in the queue. On success `x` is `{ target string, event string }`. |
 | `acquire <lease> for <key> as x` | Acquires a lease with the scope of the workspace. Branch on `held` or on `contended`. |
 | `release <lease-binding>` | Releases a lease that an earlier statement in the progression of the rule acquired. |
 | `renew <lease-binding> [until <dur>] as x` | Sends a heartbeat for a held lease and extends its TTL. Branch on the outcome of the renewal. |
-| `append Type { ... } to <ledger> as x` | Appends a typed entry to a ledger with partitions. |
-| `consume <counter> for <key> amount <expr> as x` | Consumes from a counter with a limit. Branch on `ok` or on `over`. |
+| `append Type { ... } to <ledger> as x` | Appends a typed entry. On success `x` is `{ variant "Appended", ledger string, partition string, seq int }`. |
+| `consume <counter> for <key> amount <expr> as x` | Atomically consumes from a counter. `x` is `{ variant "Ok" | "Over", counter string, key string, remaining int, period string }`; branch on `ok` or `over`. |
 | `invoke Workflow { ... } [with access to <resource> { ... } \| with access to { <resource> { ... } ... }] as x` | Starts a durable child workflow. The optional clause makes the start authority of the child more narrow. |
 | `after x succeeds as y { ... }` | Runs when the effect `x` completes with success. |
 | `after x fails as y { ... }` | Runs when the effect `x` fails. The binding `y` holds the failure base. The next section gives the base. |
@@ -1024,6 +1047,56 @@ current value. The commit log keeps every derivation, because the log is
 append-only and the history of a maintained value stays auditable; the fact base
 keeps only the current one.
 
+WhippleScript also has **typed parameterized views** for reusable pure
+expressions inside managed rules and actions:
+
+<!-- check: skip — excerpt; the surrounding workflow and rule are not shown -->
+```whip
+class Ticket {
+  owner string
+}
+
+class Review {
+  owner string
+}
+
+class Readiness {
+  owned bool
+  unreviewed bool
+}
+
+view owned(wanted string) -> bool {
+  return exists(Ticket where owner == wanted)
+}
+
+view readiness(wanted string) -> Readiness {
+  return {
+    owned owned(wanted)
+    unreviewed empty(Review where owner == wanted)
+  }
+}
+```
+
+The parentheses distinguish this declaration from a maintained view with a
+`when` clause. Parameters and the result use the ordinary type grammar. The
+body contains exactly one `return` expression. It may call other parameterized
+views and use `count`, `exists`, and `empty`; direct and indirect recursion is
+refused. The names `count`, `exists`, `empty`, and `outcome` are reserved, so a
+declaration cannot shadow the expression kernel.
+
+A nested call uses the caller's captured projection frontier. Membership and
+absence observations, predicate binding reads, and prior fact validity flow
+through every nested call into the result. Calling or replaying a view creates
+no effect. A partial external observation stays partial: a view result carries
+the evidence the runtime actually observed and does not invent observer
+coverage or a completeness claim. IFC checks expand the same pure view body,
+so a helper cannot hide a restricted argument; a query-derived value is
+refused at a protected sink until that sink has an observation contract.
+
+Parameterized views do not create maintained facts by themselves. Use the
+`view name when ... => ...` form below when the desired result is a maintained
+fact whose revision follows its trigger.
+
 <!-- check: skip — excerpt; the surrounding program's declarations are not shown -->
 ```whip
 view backlog_by_queue
@@ -1078,16 +1151,20 @@ fires once per distinct derived value — a guard of `b.open > 50` fires on ever
 value above 50, not once when it crosses. To act on the crossing, record a
 marker fact and guard on its absence.
 
-### Unhandled-failure auto-fail (rule-level net)
+### Rule failure boundary and unhandled-failure net
 
-An effect can get to a terminal `failed` status or a terminal `timed_out`
-status with **no `after` block that observes** its binding. Such a block is a
-`fails` block, a `times out` block, or a `completes` block in the body of the
-rule. In this condition, the effect can never advance its rule again. The
-kernel does not leave the instance in the `running` state and idle for an
-unlimited time. The kernel **fails the instance automatically**. The status is
-`failed`. The generic reason is `unhandled failure of <binding> in rule <name>`.
-There is no typed `failure` payload. These are the deliberate limits:
+A rule may declare one `on failure as problem` handler. It runs once for the
+firing after narrower `after` and `case outcome(...)` recovery has resolved and
+all admitted sibling work has settled. The binding supplies `summary`,
+`operation_id`, `domain`, and `causes`; `domain` is always `null` at a rule
+boundary. Closing the handler body and its admitted work successfully recovers
+the firing. Failure in that body escapes without re-entering the handler.
+
+If a terminal `failed` or `timed_out` effect remains unrecovered, the kernel
+does not leave the instance running and idle. It **fails the instance
+automatically**. The status is `failed`, with a stable reason naming the rule
+and originating operation. There is no typed workflow failure payload. These
+are the deliberate limits:
 
 - **The `cancelled` status is an exception.** A rule cancels an effect
   deliberately, as in the watchdog pattern. A cancellation is never an outcome
@@ -1101,8 +1178,8 @@ There is no typed `failure` payload. These are the deliberate limits:
 
 The `whip check` command shows the gap before the run. An effect that only a
 `succeeds` block handles gets a prominent warning that the instance will fail
-automatically. Handle the `fails` predicate, or observe the `completes`
-predicate, at each position where a typed failure or a recovery is important.
+automatically. Handle a specific outcome with `fails` or `completes`, or add
+one `on failure` handler when the whole firing shares a recovery policy.
 
 ### Child-milestone lifecycle (`emit milestone` / `after ... reaches`)
 
@@ -1405,6 +1482,14 @@ removes the firing from the open set. The lapse arm deliberately does not run,
 because the abandonment by an operator is not a lapse of a condition. The
 instance continues to run.
 
+The `whip explain <instance> <result> [--firing <identity>]` command explains
+one authored operation or action result from that same captured progression.
+It reports the exact program version, revision and evaluation frontier, leads
+with the authored name, and points to the smallest known wait or failure cause.
+When a name occurs in more than one firing, it lists candidates; it never picks
+the newest one. Reading an explanation launches no work, and its suggested next
+step never grants authority or permits a retry.
+
 Reactivity in a progression is explicit. The construct is a **region**:
 
 <!-- check: skip — excerpt; the surrounding program's declarations are not shown -->
@@ -1461,8 +1546,9 @@ an error, and a deeper path under a step resolves against that step's own schema
 A region step may not be bound to the name `steps`. The same statuses ride the
 `progression.region.lapsed` fact for audit. The runtime
 pins the view at the time of the lapse. Read the view with `exists got.plan` and
-then with `got.plan.summary`. A region must contain a minimum of one effect. In
-v1, a rule has a maximum of one region.
+then with `got.plan.summary`. Regions may be nested or successive. Each has its
+own condition, held prefix, lapse value, and lexical arm; the checker rejects a
+direct reference from a lapse arm to a binding introduced by that region.
 
 A condition that breaks and then repairs **inside one pass**, before any
 evaluation observed the broken condition, never lapses. The window is one pass
@@ -1646,8 +1732,8 @@ binding *is* the string:
 ```whip
 prompt "Summarize this incident for the status page: {{ ticket.title }}" as summary
 
-after summary succeeds as text {
-  record StatusUpdate { body text }
+after summary succeeds {
+  record StatusUpdate { body summary }
 }
 ```
 
@@ -1661,8 +1747,9 @@ statement.
 
 The `then <binding> <- <effect statement>` statement chains the **success** of
 an effect into the remainder of the block that contains the statement. The
-statement is pure sugar. Each statement after the `then` line to the end of the
-block desugars to `after <handle> succeeds as <binding> { … }`. Thus the
+statement is pure sugar. It names the operation with `<binding>` and places each
+following statement to the end of the lexical block behind that operation's
+success. The same binding denotes the checked successful value there. Thus the
 runtime stays the deterministic rule kernel that this page gives. The `flow`
 declaration is no longer in the language. The `then` statement is the surface
 for a sequence.
@@ -1684,12 +1771,10 @@ rule triage
 
 These are the semantics:
 
-- **The binding is the success payload.** The behavior is exactly the behavior
-  of `after … succeeds as`. The handle of the effect is a synthetic hidden name
-  in the form `__then_<binding>`. The `__then_` namespace is reserved. If you
-  write such a name, the result is a check error. A step that needs the raw
-  handle uses the traditional `as` and `after` form. A step that a `cancel`
-  statement stops is an example.
+- **The binding is the operation and its success payload.** This is the same
+  source meaning as `<effect> as <binding>` followed by
+  `after <binding> succeeds { … }`. Lowering may use a reserved synthetic name,
+  but that name is not part of the source language.
 - **A `then` statement chains success only.** If a chained step fails or times
   out, the automatic failure net at the level of the rule catches the step. The
   section above gives the net. The reason gives the name of your binding. This
@@ -1735,9 +1820,32 @@ The body of a rule uses these verbs on a tracker:
 ```whip
 file issue into backlog { title "Fix login" body "Users report 500s." }
 claim issue as work
-release issue
-finish issue { summary "patched and verified" }      # optional `as x` for chaining
+release work as reopened
+claim reopened as retry
+finish retry { summary "patched and verified" } as finished
 ```
+
+The filing item has a required string `title` and optional `body` string,
+`labels` list of strings, and `metadata` object. Other fields are rejected at
+the statement. Filing is available inside an `action`, and its receipt composes
+through the ordinary success value:
+
+<!-- check: skip — excerpt; the surrounding declarations are not shown -->
+```whip
+file issue into backlog { title request.title body request.detail } as filed
+after filed succeeds { return filed.id }
+```
+
+Managed execution captures the complete item and its freshness evidence before
+dispatch. The receipt identifies the tracker row; the body, labels and metadata
+remain in the tracker.
+
+The lifecycle receipts keep the same `{ queue, id, title }` address prefix, so
+they compose without an adapter class. A claim adds its holder and optional
+expiry. Release returns the item to `open`, and finish returns the canonical
+`closed` status plus the admitted optional summary. Managed execution captures
+each operand and its freshness evidence before dispatch and verifies the exact
+address again when the operation settles.
 
 React to ready work with this readiness pattern:
 
@@ -2963,6 +3071,12 @@ emit signal deploy.finished to s.target {
 The target, which is `s.target` here, must be the identifier of an instance
 that exists in the same store. If not, the effect fails with
 `target instance <id> not found` and goes to the `after sent fails` branch.
+The target must be a string. The payload must match the declared signal fields.
+`from source` copies the signal's same-named fields from `source`, and fields in
+the block override those copies. Managed execution captures the target and
+projected payload with their freshness evidence before delivery. After
+`sent succeeds`, `sent.target` and `sent.event` are the stable delivery receipt;
+the payload itself is observed as the admitted signal fact on the receiver.
 
 The system generates an instance identifier at the time of the `run` command.
 Thus a true identifier of a peer usually comes on a fact. An example is a
@@ -3003,6 +3117,37 @@ The compiler applies the safety model. A progression holds a maximum of one
 lease. The handling of the outcomes must be exhaustive: `held` and `contended`,
 or `ok` and `over`. The rule must release a lease on each path that is not a
 terminal.
+
+Counter consumption is also available inside an `action`. Both outcome arms
+receive the same typed receipt, so they compose without separate result shapes:
+
+<!-- check: skip — excerpt; the surrounding declarations are not shown -->
+```whip
+consume budget for customer amount units as spend
+after spend ok as receipt   { return receipt.remaining }
+after spend over as receipt { return receipt.remaining }
+```
+
+The amount must be an integer and the key must resolve to a value. `Over` is a
+successful counter decision; provider or storage failure follows the ordinary
+failure path. `after spend succeeds` is rejected because it hides the `Ok` /
+`Over` distinction. Use `after spend completes` when the terminal envelope is
+the intended value.
+
+Ledger append is also available inside an `action`. Its closed receipt composes
+like any other single-result operation:
+
+<!-- check: skip — excerpt; the surrounding declarations are not shown -->
+```whip
+append Decision { area decision.area } to decisions as saved
+after saved succeeds as receipt { return receipt.seq }
+```
+
+The compiler checks the ledger declaration, entry schema and complete entry
+shape at the append statement. Managed execution captures the entry and its
+freshness evidence before dispatch. The receipt identifies the committed
+ledger row; the entry payload remains in the ledger and is not duplicated in
+the action result.
 
 A terminal releases each lease that the instance holds, automatically. The
 terminal can be a `complete` statement or a `fail` statement from a rule. The

@@ -445,6 +445,7 @@ mod native {
             provenance_class: "external",
             correlation_id: None,
             source_span_json: None,
+            validity_json: None,
         };
         let (version, epoch) = crate::active_revision_on(connection, instance)?;
         crate::insert_fact(

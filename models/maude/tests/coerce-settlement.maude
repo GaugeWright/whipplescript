@@ -1,0 +1,17 @@
+load ../coerce-settlement.maude
+search [1] in WHIPPLESCRIPT-COERCE-SETTLEMENT : pending request(f)
+  =>* terminal(f) result(f) fact(f) .
+search [1] in WHIPPLESCRIPT-COERCE-SETTLEMENT : pending request(f)
+  =>* terminal(f) .
+search [1] in WHIPPLESCRIPT-COERCE-SETTLEMENT-SPLIT : pending request(f)
+  =>* terminal(f) .
+search [1] in WHIPPLESCRIPT-COERCE-SETTLEMENT : pending request(f)
+  =>* terminal(f) result(g) fact(g) .
+search [1] in WHIPPLESCRIPT-COERCE-SETTLEMENT-REBOUND : pending request(f)
+  =>* terminal(f) result(g) fact(g) .
+search [1] in WHIPPLESCRIPT-COERCE-SETTLEMENT : pending request(f) consume
+  =>* terminal(f) result(f) consumed(f) .
+search [1] in WHIPPLESCRIPT-COERCE-SETTLEMENT : terminal(f) result(f) consumed(f) request(f)
+  =>* terminal(f) result(f) fact(f) .
+search [1] in WHIPPLESCRIPT-COERCE-SETTLEMENT-REVIVE : terminal(f) result(f) consumed(f) request(f)
+  =>* terminal(f) result(f) fact(f) .

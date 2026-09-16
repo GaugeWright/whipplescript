@@ -1,0 +1,11 @@
+load ../managed-fact-provenance.maude
+search [1] in WHIPPLESCRIPT-MANAGED-FACT-PROVENANCE : chain(secret executor, none, none) =>* chain(secret executor, secret executor, secret executor) .
+search [1] in WHIPPLESCRIPT-MANAGED-FACT-PROVENANCE : chain(secret executor, none, none) =>* chain(secret, secret, secret) .
+search [1] in WHIPPLESCRIPT-MANAGED-FACT-PROVENANCE-LOST : chain(secret executor, none, none) =>* chain(secret, secret, secret) .
+search [1] in WHIPPLESCRIPT-MANAGED-FACT-PROVENANCE : chain(secret executor, none, none) =>* chain(executor, executor, executor) .
+search [1] in WHIPPLESCRIPT-MANAGED-FACT-PROVENANCE-LOST : chain(secret executor, none, none) =>* chain(executor, executor, executor) .
+search [1] in WHIPPLESCRIPT-MANAGED-FACT-PROVENANCE : chain(label, none, none) =>* chain(label, label, label) .
+search [1] in WHIPPLESCRIPT-MANAGED-FACT-PROVENANCE : chain(label, none, none) =>* chain(none, none, none) .
+search [1] in WHIPPLESCRIPT-MANAGED-FACT-PROVENANCE-LOST : chain(label, none, none) =>* chain(none, none, none) .
+search [1] in WHIPPLESCRIPT-MANAGED-FACT-PROVENANCE : chain(none, none, none) =>* chain(none, none, none) .
+quit

@@ -1,0 +1,33 @@
+--- An inferred helper requirement is separate from its value type. Substituting
+--- an argument must retain the original fact subject, including through a box.
+mod WHIPPLESCRIPT-ACTION-SUBJECT-CONTRACTS is
+  protecting BOOL .
+  sorts Shape Check .
+  ops param fact data : -> Shape [ctor] .
+  op box : Shape -> Shape [ctor] .
+  op field : Shape -> Shape .
+  op pass : Shape -> Shape .
+  op copy : Shape -> Shape .
+  op choose : Shape Shape -> Shape [ctor] .
+  var S T : Shape .
+  eq field(box(S)) = S .
+  eq field(fact) = data .
+  eq pass(S) = S .
+  eq copy(S) = data .
+  op subject : Shape -> Bool .
+  eq subject(fact) = true .
+  eq subject(choose(S, T)) = subject(S) and subject(T) .
+  eq subject(S) = false [owise] .
+  op requireFact : Shape -> Check [ctor] .
+  ops admitted refused : -> Check [ctor] .
+  crl [proved] : requireFact(S) => admitted if subject(S) .
+  crl [unproved] : requireFact(S) => refused if not subject(S) .
+endm
+mod WHIPPLESCRIPT-ACTION-SUBJECT-TYPE-AS-PROOF is
+  including WHIPPLESCRIPT-ACTION-SUBJECT-CONTRACTS .
+  rl [record-type-is-not-identity] : requireFact(data) => admitted .
+endm
+mod WHIPPLESCRIPT-ACTION-SUBJECT-ONE-RETURN is
+  including WHIPPLESCRIPT-ACTION-SUBJECT-CONTRACTS .
+  rl [ignores-return-alternative] : requireFact(choose(fact, data)) => admitted .
+endm

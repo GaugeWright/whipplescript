@@ -1,0 +1,16 @@
+load ../action-value-types.maude
+
+search [1] in WHIPPLESCRIPT-ACTION-VALUE-TYPES : check(integer, decimal) =>* accepted .
+search [1] in WHIPPLESCRIPT-ACTION-VALUE-TYPES : check(decimal, integer) =>* accepted .
+search [1] in WHIPPLESCRIPT-ACTION-VALUE-TYPES : check(null, string) =>* accepted .
+search [1] in WHIPPLESCRIPT-ACTION-VALUE-TYPES : check(string, optional(string)) =>* accepted .
+search [1] in WHIPPLESCRIPT-ACTION-VALUE-TYPES : check(optional(string), string) =>* accepted .
+search [1] in WHIPPLESCRIPT-ACTION-DROPS-OPTIONAL : check(optional(string), string) =>* accepted .
+search [1] in WHIPPLESCRIPT-ACTION-VALUE-TYPES : check(either(integer, string), string) =>* accepted .
+search [1] in WHIPPLESCRIPT-ACTION-DROPS-ALTERNATIVE : check(either(integer, string), string) =>* accepted .
+search [1] in WHIPPLESCRIPT-ACTION-VALUE-TYPES : check(either(integer, string), either(string, integer)) =>* accepted .
+search [1] in WHIPPLESCRIPT-ACTION-VALUE-TYPES : check(array(optional(string)), array(string)) =>* accepted .
+search [1] in WHIPPLESCRIPT-ACTION-VALUE-TYPES : check(ticket, review) =>* accepted .
+search [1] in WHIPPLESCRIPT-ACTION-ERASES-RECORD : check(ticket, review) =>* accepted .
+search [1] in WHIPPLESCRIPT-ACTION-VALUE-TYPES : check(sealed(integer), sealed(decimal)) =>* accepted .
+quit

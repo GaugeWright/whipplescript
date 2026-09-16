@@ -1,0 +1,17 @@
+load ../action-program-analysis.maude
+search [1] in WHIPPLESCRIPT-ACTION-PROGRAM-ANALYSIS : analyze(true, true, true, true) =>* checked .
+search [1] in WHIPPLESCRIPT-ACTION-PROGRAM-ANALYSIS : analyze(false, true, false, false) =>* typeError .
+search [1] in WHIPPLESCRIPT-ACTION-PROGRAM-ANALYSIS : analyze(true, false, true, true) =>* checked .
+search [1] in WHIPPLESCRIPT-ACTION-PROGRAM-ANALYSIS-LOST : analyze(true, false, true, true) =>* checked .
+search [1] in WHIPPLESCRIPT-ACTION-PROGRAM-ANALYSIS : analyze(true, true, false, false) =>* grantError .
+search [1] in WHIPPLESCRIPT-ACTION-PROGRAM-ANALYSIS : analyze(true, true, false, true) =>* checked .
+search [1] in WHIPPLESCRIPT-ACTION-PROGRAM-ANALYSIS-LOST : analyze(true, true, false, true) =>* checked .
+search [1] in WHIPPLESCRIPT-ACTION-PROGRAM-ANALYSIS : analyze(true, true, true, false) =>* checked .
+search [1] in WHIPPLESCRIPT-ACTION-PROGRAM-ANALYSIS-LOST : analyze(true, true, true, false) =>* checked .
+search [1] in WHIPPLESCRIPT-ACTION-PROGRAM-ANALYSIS : withDecl(checked, true) =>* declared .
+search [1] in WHIPPLESCRIPT-ACTION-PROGRAM-ANALYSIS : withDecl(checked, false) =>* declared .
+search [1] in WHIPPLESCRIPT-ACTION-PROGRAM-ANALYSIS-LOST : withDecl(checked, false) =>* declared .
+search [1] in WHIPPLESCRIPT-ACTION-PROGRAM-ANALYSIS : withDecl(typeError, true) =>* typeError .
+search [1] in WHIPPLESCRIPT-ACTION-PROGRAM-ANALYSIS : withDecl(checked, true) =>* executable .
+search [1] in WHIPPLESCRIPT-ACTION-PROGRAM-ANALYSIS-LOST : withDecl(checked, true) =>* executable .
+quit

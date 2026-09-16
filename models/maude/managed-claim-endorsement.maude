@@ -1,0 +1,22 @@
+--- Static claim crossing: all queues vouched, exact source mark, closed fields.
+fmod MANAGED-CLAIM-POLICY is
+  protecting BOOL .
+  op allowed : Bool Bool Bool Bool Bool -> Bool .
+  vars Q1 Q2 M G P : Bool .
+  eq allowed(Q1, Q2, M, G, P) = Q1 and Q2 and M and G and not P .
+endfm
+mod WHIPPLESCRIPT-MANAGED-CLAIMS is
+  protecting MANAGED-CLAIM-POLICY .
+  sort State .
+  op claim : Bool Bool Bool Bool Bool -> State [ctor] .
+  op checked : Bool -> State [ctor] .
+  vars Q1 Q2 M G P : Bool .
+  rl [check] : claim(Q1, Q2, M, G, P) => checked(allowed(Q1, Q2, M, G, P)) .
+endm
+mod WHIPPLESCRIPT-MANAGED-CLAIMS-LOST is
+  including WHIPPLESCRIPT-MANAGED-CLAIMS .
+  vars Q1 Q2 M G P : Bool .
+  rl [first-queue-only] : claim(Q1, Q2, M, G, P) => checked(allowed(Q1, true, M, G, P)) .
+  rl [prose-crossing] : claim(Q1, Q2, M, G, P) => checked(allowed(Q1, Q2, M, G, false)) .
+  rl [borrowed-marker] : claim(Q1, Q2, M, G, P) => checked(allowed(Q1, Q2, true, G, P)) .
+endm

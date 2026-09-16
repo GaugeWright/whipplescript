@@ -1,0 +1,56 @@
+--- A managed value publishes its validity with the admission generation of a
+--- fact or with a workflow terminal. Reading the fact adds the new membership
+--- observation without erasing the premises that produced the stored value.
+mod WHIPPLESCRIPT-ACTION-SINK-VALIDITY is
+ protecting NAT .
+ sorts Validity Value Fact Terminal .
+ op noValidity : -> Validity [ctor] .
+ ops upstream membership : Nat -> Validity [ctor] .
+ op __ : Validity Validity -> Validity [ctor assoc comm id: noValidity] .
+ op value : Nat Validity -> Value [ctor] .
+ op fact : Nat Nat Validity -> Fact [ctor] .
+ op terminal : Nat Validity -> Terminal [ctor] .
+ op publishFact : Value Nat -> Fact .
+ op readFact : Fact Nat -> Value .
+ op publishTerminal : Value -> Terminal .
+ op reopenFact : Fact -> Fact .
+ op reopenTerminal : Terminal -> Terminal .
+ vars A G Q : Nat . var V : Validity .
+ eq publishFact(value(A, V), G) = fact(G, A, V) .
+ eq readFact(fact(G, A, V), Q) = value(A, V membership(Q)) .
+ eq publishTerminal(value(A, V)) = terminal(A, V) .
+ eq reopenFact(fact(G, A, V)) = fact(G, A, V) .
+ eq reopenTerminal(terminal(A, V)) = terminal(A, V) .
+endm
+
+--- Wrong: fact publication keeps the payload but drops its validity.
+mod WHIPPLESCRIPT-ACTION-SINK-DROPS-FACT-VALIDITY is
+ including WHIPPLESCRIPT-ACTION-SINK-VALIDITY .
+ op publishFactDropped : Value Nat -> Fact .
+ vars A G : Nat . var V : Validity .
+ eq publishFactDropped(value(A, V), G) = fact(G, A, noValidity) .
+endm
+
+--- Wrong: a composed read records only its own membership observation.
+mod WHIPPLESCRIPT-ACTION-SINK-DROPS-TRANSITIVE-VALIDITY is
+ including WHIPPLESCRIPT-ACTION-SINK-VALIDITY .
+ op readFactDropped : Fact Nat -> Value .
+ vars A G Q : Nat . var V : Validity .
+ eq readFactDropped(fact(G, A, V), Q) = value(A, membership(Q)) .
+endm
+
+--- Wrong: terminal publication keeps the payload but drops its validity.
+mod WHIPPLESCRIPT-ACTION-SINK-DROPS-TERMINAL-VALIDITY is
+ including WHIPPLESCRIPT-ACTION-SINK-VALIDITY .
+ op publishTerminalDropped : Value -> Terminal .
+ var A : Nat . var V : Validity .
+ eq publishTerminalDropped(value(A, V)) = terminal(A, noValidity) .
+endm
+
+--- Wrong: reopening a fact substitutes a different admission generation.
+mod WHIPPLESCRIPT-ACTION-SINK-RETARGETS-ADMISSION is
+ including WHIPPLESCRIPT-ACTION-SINK-VALIDITY .
+ op reopenFactRetargeted : Fact Nat -> Fact .
+ vars A G G2 : Nat . var V : Validity .
+ eq reopenFactRetargeted(fact(G, A, V), G2) = fact(G2, A, V) .
+endm

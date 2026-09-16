@@ -1,0 +1,33 @@
+load ../action-call-graph.maude
+
+--- A chain expands with its whole static call path, without a runtime call.
+search [1] in WHIPPLESCRIPT-ACTION-CALL-GRAPH :
+  visit(review, nil, root, edge(review, investigate, one) edge(investigate, assess, two)) =>*
+  expanded(review, root) expanded(investigate, root / one) expanded(assess, (root / one) / two) .
+
+--- Two calls of the same helper are independent expansions, not recursion.
+search [1] in WHIPPLESCRIPT-ACTION-CALL-GRAPH :
+  visit(review, nil, root, edge(review, assess, one) edge(review, assess, two)) =>*
+  expanded(review, root) expanded(assess, root / one) expanded(assess, root / two) .
+search [1] in WHIPPLESCRIPT-ACTION-CALL-GRAPH :
+  visit(review, nil, root, edge(review, assess, one) edge(review, assess, two)) =>*
+  recursive(A:Action, T:Trail, P:Path) W:Work .
+
+--- Direct and indirect cycles are derived from real edges, including the
+--- exact call path that closes the cycle.
+search [1] in WHIPPLESCRIPT-ACTION-CALL-GRAPH :
+  visit(review, nil, root, edge(review, review, one)) =>*
+  recursive(review, review :: nil, root / one) W:Work .
+search [1] in WHIPPLESCRIPT-ACTION-CALL-GRAPH :
+  visit(review, nil, root, edge(review, investigate, one) edge(investigate, review, two)) =>*
+  recursive(review, investigate :: review :: nil, (root / one) / two) W:Work .
+
+--- A repeated definition on the path never expands again. The weakening
+--- makes this bad prefix reachable; no infinite search is needed to see it.
+search [1] in WHIPPLESCRIPT-ACTION-CALL-GRAPH :
+  visit(review, nil, root, edge(review, review, one)) =>*
+  expanded(review, root / one) W:Work .
+search [1] in WHIPPLESCRIPT-ACTION-IGNORES-CYCLE :
+  visit(review, nil, root, edge(review, review, one)) =>*
+  expanded(review, root / one) W:Work .
+quit

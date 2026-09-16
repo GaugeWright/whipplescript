@@ -1,0 +1,75 @@
+--- A parameterized view is a pure function over one captured evaluation
+--- frontier. Nested composition unions every membership and absence premise,
+--- preserves that frontier through durable capture, and creates no work.
+load action-query-validity.maude
+
+mod WHIPPLESCRIPT-PARAMETERIZED-VIEWS is
+ including WHIPPLESCRIPT-ACTION-QUERY-VALIDITY .
+ sorts ViewValue ViewCapture Definition ViewCheck .
+ ops leaf recursive : -> Definition [ctor] .
+ ops accepted refusedView : -> ViewCheck [ctor] .
+ op viewValue : Nat Validity Nat -> ViewValue [ctor] .
+ op readView : Query Nat Nat Nat -> ViewValue .
+ op composeView : ViewValue ViewValue -> ViewValue .
+ op saveView : ViewValue -> ViewCapture .
+ op capturedView : ViewValue -> ViewCapture [ctor] .
+ op reopenView : ViewCapture -> ViewValue .
+ op validateView : Definition -> ViewCheck .
+ vars Q R : Query . vars N H M K A B WA WB : Nat .
+ vars VA VB : Validity . var V : ViewValue .
+
+ crl [view-read] : readView(Q, N, H, M) =>
+   viewValue(N, observed(Q, N, M), 0) if N <= H .
+ eq composeView(viewValue(N, VA, WA), viewValue(N, VB, WB)) =
+   viewValue(N, VA VB, WA + WB) .
+ eq saveView(V) = capturedView(V) .
+ eq reopenView(capturedView(V)) = V .
+ eq validateView(leaf) = accepted .
+ eq validateView(recursive) = refusedView .
+endm
+
+--- Wrong: observations captured at different frontiers may be joined.
+mod WHIPPLESCRIPT-PARAMETERIZED-VIEWS-MIXED-FRONTIER is
+ including WHIPPLESCRIPT-PARAMETERIZED-VIEWS .
+ vars N K WA WB : Nat . vars VA VB : Validity .
+ eq composeView(viewValue(N, VA, WA), viewValue(K, VB, WB)) =
+   viewValue(N, VA VB, WA + WB) .
+endm
+
+--- Wrong: nested composition keeps only the left dependency set.
+mod WHIPPLESCRIPT-PARAMETERIZED-VIEWS-DROPS-RIGHT is
+ including WHIPPLESCRIPT-PARAMETERIZED-VIEWS .
+ vars N WA WB : Nat . vars VA VB : Validity .
+ eq composeView(viewValue(N, VA, WA), viewValue(N, VB, WB)) =
+   viewValue(N, VA, WA + WB) .
+endm
+
+--- Wrong: evaluating a view query starts one unit of external work.
+mod WHIPPLESCRIPT-PARAMETERIZED-VIEWS-REISSUES is
+ including WHIPPLESCRIPT-PARAMETERIZED-VIEWS .
+ vars Q : Query . vars N H M : Nat .
+ crl [view-reissues] : readView(Q, N, H, M) =>
+   viewValue(N, observed(Q, N, M), 1) if N <= H .
+endm
+
+--- Wrong: a recursive view graph is admitted.
+mod WHIPPLESCRIPT-PARAMETERIZED-VIEWS-ACCEPTS-RECURSION is
+ including WHIPPLESCRIPT-PARAMETERIZED-VIEWS .
+ eq validateView(recursive) = accepted .
+endm
+
+--- Wrong: absence is collapsed into no evidence.
+mod WHIPPLESCRIPT-PARAMETERIZED-VIEWS-DROPS-ABSENCE is
+ including WHIPPLESCRIPT-PARAMETERIZED-VIEWS .
+ vars Q : Query . vars N H : Nat .
+ crl [view-drops-absence] : readView(Q, N, H, 0) =>
+   viewValue(N, noValidity, 0) if N <= H .
+endm
+
+--- Wrong: a positive observation drops its exact member identity.
+mod WHIPPLESCRIPT-PARAMETERIZED-VIEWS-DROPS-MEMBER is
+ including WHIPPLESCRIPT-PARAMETERIZED-VIEWS .
+ vars Q : Query . vars N H M : Nat .
+ crl [view-drops-member] : readView(Q, N, H, M) =>
+   viewValue(N, observed(Q, N, 0), 0) if N <= H /\ M > 0 .
+endm

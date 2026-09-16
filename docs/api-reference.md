@@ -409,9 +409,10 @@ These are the other analyses:
   four of the five classes of operation.
 - **`lint.envelope_field_on_payload`** — a read of a terminal envelope field
   off a `Completed` payload whose shape is not statically known. The statement
-  `after x completes as o` binds the envelope, which carries `tag`, `status`,
-  `summary`, `effect_id`, and `run_id`. The arm `case o { Completed as v => … }`
-  binds the output of the effect itself. When the effect declares no output
+  `outcome(x)` produces the same envelope as `after x completes as o`; it carries
+  `tag`, `status`, `summary`, `effect_id`, and `run_id`. The arm
+  `case outcome(x) { Completed as v => … }` binds the output of the effect
+  itself. When the effect declares no output
   schema, as an agent turn does, `v` is a boundary of the runtime, and `whip
   check` accepts each field name on it. That is correct, because a read of a
   real output field is the purpose of the arm. It stops being correct when the
@@ -419,7 +420,8 @@ These are the other analyses:
   `Completed` payload. The program compiles, runs the effect, and then fails to
   lower the arm, once a billed and non-idempotent turn has committed. The
   finding is advice, not a rejection, because the output of a model can carry a
-  key of that name. Read the field off the alias of the envelope.
+  key of that name. Read the field from the envelope before selecting its
+  `Completed` payload.
 - **`lint.missing_coercion_import`**, **`lint.missing_coord_import`**,
   **`lint.missing_files_import`**, **`lint.missing_tracker_import`**, and
   **`lint.missing_ingress_import`** — the program uses a construct with no
@@ -524,6 +526,12 @@ at run time. The v0 version supplies these features:
   the case. An empty query returns each symbol. The v0 version indexes the
   documents that the editor opened. An index across the file system depends on
   the shared service for the symbol index below.
+- **Action result explanations** — `workspace/executeCommand` advertises
+  `whip.explainResult`. Its single object argument contains `instance`, `result`,
+  and an optional `firing`. The result is the same
+  `whipplescript.action-explanation-query.v1` value returned by
+  `whip --json explain`; it retains the admitted program version, evaluated
+  frontier, caller and definition spans, causes, and read-only next action.
 
 Navigation across files and navigation that knows the scope are in the plan.
 These features depend on a shared service for the symbol index. The features are
@@ -2055,7 +2063,7 @@ the constructs of the source.
 | `redact <binding> keep [..] as <out>` | Projects a binding with a record type onto a subset of the fields. The projection operates at the level of the type and removes the fields at run time, with a refinement of the IFC label for each field. |
 | `then <binding> <- <effect ...>` | The sugar for a sequential chain. The statement desugars to nested `after` blocks for success. A step that fails fails the instance automatically and names the binding. |
 | `during <condition> { ... } on lapse [as <x>] { ... }` | A region of a pinned progression. The steps of the body run while the condition is true. When the condition breaks while the region still owes work, the region lapses: the runtime cancels the work in operation and runs the mandatory arm. The optional `as <x>` binds the progress view. Refer to chapter 16 of the manual. |
-| `until <condition> { ... } on lapse [as <x>] { ... }` | The opposite polarity of the `during` region. The steps of the body run while the condition is false, and the region lapses when the condition becomes true. One region per rule in v1. |
+| `until <condition> { ... } on lapse [as <x>] { ... }` | The opposite polarity of the `during` region. The steps of the body run while the condition is false, and the region lapses when the condition becomes true. Regions may be nested or successive. |
 | `emit milestone "<name>" { ... }` | Publishes a typed milestone. A parent observes the milestone with an `after child reaches "<name>"` arm during the run. |
 | `send via <channel> { text ... }` | An outbound message on a declared channel (std.messaging). |
 | `timer <duration> as x` | A `timer.wait` effect that completes when the duration is due. |

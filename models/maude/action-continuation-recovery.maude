@@ -1,0 +1,32 @@
+--- Scope recovery requires a real terminal, a selected returned handler and
+--- its owned-work join. Actual graph traversal and source typing are separate.
+mod WHIPPLESCRIPT-ACTION-CONTINUATION-RECOVERY is
+  protecting BOOL .
+  sorts Outcome Handler State .
+  ops pending requested uncertain suppressed failed succeeded : -> Outcome [ctor] .
+  ops observed returning broken : -> Handler [ctor] .
+  op scope : Outcome Handler Bool Bool -> State [ctor] .
+  ops recovered propagates waiting : -> State [ctor] .
+  var H : Handler . vars Joined OtherFailure : Bool .
+  rl [recover] : scope(failed, returning, true, false) => recovered .
+  rl [observe] : scope(failed, observed, Joined, OtherFailure) => propagates .
+  rl [handler-failed] : scope(failed, broken, Joined, OtherFailure) => propagates .
+  rl [sibling-failed] : scope(failed, returning, true, true) => propagates .
+  rl [join] : scope(failed, returning, false, OtherFailure) => waiting .
+endm
+mod WHIPPLESCRIPT-ACTION-RECOVERY-EARLY is
+  including WHIPPLESCRIPT-ACTION-CONTINUATION-RECOVERY .
+  rl [early] : scope(failed, returning, false, false) => recovered .
+endm
+mod WHIPPLESCRIPT-ACTION-RECOVERY-OBSERVATION is
+  including WHIPPLESCRIPT-ACTION-CONTINUATION-RECOVERY .
+  rl [observation] : scope(failed, observed, true, false) => recovered .
+endm
+mod WHIPPLESCRIPT-ACTION-RECOVERY-LOST-SIBLING is
+  including WHIPPLESCRIPT-ACTION-CONTINUATION-RECOVERY .
+  rl [lost-sibling] : scope(failed, returning, true, true) => recovered .
+endm
+mod WHIPPLESCRIPT-ACTION-RECOVERY-FAKE-TERMINAL is
+  including WHIPPLESCRIPT-ACTION-CONTINUATION-RECOVERY .
+  rl [fake-terminal] : scope(suppressed, returning, true, false) => recovered .
+endm

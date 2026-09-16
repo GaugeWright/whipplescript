@@ -1,0 +1,14 @@
+load ../action-capture-prefix.maude
+search [1] in WHIPPLESCRIPT-ACTION-CAPTURE-PREFIX : project(item(first, local, 7, 2, 5, item(first, root, 0, 1, 2, nil)), first, 2) =>* selected(item(first, local, 7, 2, 5, item(first, root, 0, 1, 2, nil))) .
+search [1] in WHIPPLESCRIPT-ACTION-CAPTURE-PREFIX : project(item(first, local, 7, 2, 5, item(first, root, 0, 1, 2, nil)), first, 1) =>* selected(item(first, root, 0, 1, 2, nil)) .
+search [1] in WHIPPLESCRIPT-ACTION-CAPTURE-PREFIX : project(item(first, local, 7, 2, 5, item(first, root, 0, 1, 2, nil)), first, 0) =>* refused .
+search [1] in WHIPPLESCRIPT-ACTION-CAPTURE-PREFIX : project(item(first, local, 7, 2, 5, item(first, root, 0, 1, 2, nil)), first, 2) =>* selected(item(first, root, 0, 1, 2, nil)) .
+search [1] in WHIPPLESCRIPT-ACTION-CAPTURE-BY-RECORD : project(item(first, local, 7, 2, 5, item(first, root, 0, 1, 2, nil)), first, 2) =>* selected(item(first, root, 0, 1, 2, nil)) .
+search [1] in WHIPPLESCRIPT-ACTION-CAPTURE-PREFIX : project(item(first, local, 8, 4, 7, item(first, local, 7, 2, 5, item(first, root, 0, 1, 2, nil))), first, 2) =>* selected(item(first, local, 8, 4, 7, item(first, local, 7, 2, 5, item(first, root, 0, 1, 2, nil)))) .
+search [1] in WHIPPLESCRIPT-ACTION-CAPTURE-FUTURE : project(item(first, local, 8, 4, 7, item(first, local, 7, 2, 5, item(first, root, 0, 1, 2, nil))), first, 2) =>* selected(item(first, local, 8, 4, 7, item(first, local, 7, 2, 5, item(first, root, 0, 1, 2, nil)))) .
+search [1] in WHIPPLESCRIPT-ACTION-CAPTURE-PREFIX : project(item(first, local, 7, 2, 5, item(first, root, 0, 1, 2, nil)), second, 2) =>* selected(item(first, local, 7, 2, 5, item(first, root, 0, 1, 2, nil))) .
+search [1] in WHIPPLESCRIPT-ACTION-CAPTURE-NO-ROOT : project(item(first, local, 7, 2, 5, item(first, root, 0, 1, 2, nil)), second, 2) =>* selected(item(first, local, 7, 2, 5, item(first, root, 0, 1, 2, nil))) .
+search [1] in WHIPPLESCRIPT-ACTION-CAPTURE-PREFIX : project(item(first, lapsed, 9, 4, 7, item(first, holding, 9, 2, 5, item(first, root, 0, 1, 2, nil))), first, 2) =>* selected(item(first, holding, 9, 2, 5, item(first, root, 0, 1, 2, nil))) .
+search [1] in WHIPPLESCRIPT-ACTION-CAPTURE-PREFIX : project(item(first, local, 7, 2, 5, item(first, root, 0, 1, 2, nil)), first, 2) =>* selected(item(first, root, 0, 1, 2, nil)) .
+search [1] in WHIPPLESCRIPT-ACTION-CAPTURE-EXCLUSIVE : project(item(first, local, 7, 2, 5, item(first, root, 0, 1, 2, nil)), first, 2) =>* selected(item(first, root, 0, 1, 2, nil)) .
+quit

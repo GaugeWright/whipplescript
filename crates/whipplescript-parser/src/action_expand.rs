@@ -1,5 +1,5 @@
-//! Action-call expansion (DR-0023): inlines `action` effect-chain templates at
-//! their rule-body call sites before analysis, the sibling of `pattern`
+//! Recorded legacy action-call expansion (DR-0023): inlines resultless
+//! effect-chain templates at their rule-body call sites, the sibling of `pattern`
 //! expansion. A call `run_task(reviewer, task, "codex")` is replaced by the
 //! action's body with parameters substituted for arguments and the action's
 //! internal bindings uniquified per call site (hygiene), so two calls in one
@@ -7,7 +7,7 @@
 //! re-enters the normal lowering pipeline — the durable graph shows the
 //! expansion, never a hidden call (modelled in models/maude/tests/action-expansion.maude).
 //!
-//! v0 scope (DR-0023 O1/O2): calls are fire-and-forget (no `as` binding); an
+//! The recorded v0 scope (DR-0023 O1/O2) is fire-and-forget (no `as` binding); an
 //! action body holds only effect statements, `after` blocks, and `record` — no
 //! `complete`/`fail`/`case`/`branch`, and no nested action calls. Forbidding
 //! calls inside action bodies keeps the call graph depth-1 (trivially acyclic,
@@ -30,6 +30,24 @@ pub fn expand_action_calls(
     diagnostics: &mut Vec<Diagnostic>,
 ) {
     if actions.is_empty() {
+        return;
+    }
+    if actions.iter().any(|action| action.result.is_some()) {
+        let checked = crate::action_signature::validate(actions);
+        if checked.is_empty() {
+            for action in actions.iter().filter(|action| action.result.is_some()) {
+                diagnostics.push(diag(
+                    action.name.span,
+                    format!(
+                        "typed action `{}` has a parsed result contract, but its scope lowering is not implemented yet",
+                        action.name.name
+                    ),
+                    "DR-0100 requires owned-work completion before this action can execute",
+                ));
+            }
+        } else {
+            diagnostics.extend(checked);
+        }
         return;
     }
     let by_name: BTreeMap<&str, &ActionDecl> =
@@ -373,6 +391,7 @@ fn validate_body(
 
 fn statement_label(statement: &BodyStmt) -> &'static str {
     match statement {
+        BodyStmt::Composition(_) => "action composition",
         BodyStmt::Record(_) => "record",
         BodyStmt::Done { .. } => "done",
         BodyStmt::Effect(_) => "effect",
@@ -469,12 +488,17 @@ fn diag(span: SourceSpan, message: String, suggestion: &str) -> Diagnostic {
 
 #[cfg(test)]
 mod tests {
-    use crate::compile_program;
+    use crate::execution_semantics::compile_recorded_program_with_root;
+    use crate::ExecutionSemantics;
+
+    fn compile_legacy(source: &str) -> crate::CompileOutput {
+        compile_recorded_program_with_root(source, None, ExecutionSemantics::LegacyActionChainsV1)
+    }
 
     const PRELUDE: &str = "@service\nworkflow ActionDemo\n\nclass Ticket { id string }\nclass Note { provider string  status string }\n\nagent reviewer { provider fixture  profile \"r\"  capacity 1 }\n";
 
     fn route_body(source: &str) -> String {
-        let compiled = compile_program(source);
+        let compiled = compile_legacy(source);
         assert_eq!(
             compiled.diagnostics,
             Vec::new(),
@@ -672,7 +696,7 @@ mod tests {
     }
 
     fn diagnostics_for(source: &str) -> Vec<String> {
-        compile_program(source)
+        compile_legacy(source)
             .diagnostics
             .into_iter()
             .map(|d| d.message)
@@ -686,7 +710,7 @@ mod tests {
             "{PRELUDE}\nrule route\n  when Ticket as ticket\n=> {{\n  tell reviewer as turn \"go\"\n}}\n\naction other(x string) {{\n  tell reviewer as turn \"{{{{ x }}}}\"\n}}\n"
         );
         // `other` is declared but never called: this compiles cleanly (inert).
-        let compiled = compile_program(&source);
+        let compiled = compile_legacy(&source);
         assert_eq!(
             compiled.diagnostics,
             Vec::new(),

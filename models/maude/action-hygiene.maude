@@ -1,0 +1,33 @@
+--- DR-0100: call sites and lexical binders, never source offsets, own names.
+mod WHIPPLESCRIPT-ACTION-HYGIENE is
+  sorts Site Name Value Check .
+  ops first second : -> Site [ctor] .
+  ops parameter callerOnly label : -> Name [ctor] .
+  op slot : Site Name -> Value [ctor] .
+  ops callerSlot unresolved : -> Value [ctor] .
+  op field : Name Value -> Value [ctor] .
+  op read : Site Name -> Check [ctor] .
+  op object : Site -> Check [ctor] .
+  op result : Value -> Check [ctor] .
+  var S : Site .
+  rl [local-parameter] : read(S, parameter) => result(slot(S, parameter)) .
+  rl [caller-locals-do-not-enter] : read(S, callerOnly) => result(unresolved) .
+  rl [substitute-value-only] : object(S) => result(field(label, slot(S, parameter))) .
+endm
+
+mod WHIPPLESCRIPT-ACTION-SHARES-CALL-SCOPE is
+  including WHIPPLESCRIPT-ACTION-HYGIENE .
+  rl [reuse-first-instance] : read(second, parameter) => result(slot(first, parameter)) .
+endm
+
+mod WHIPPLESCRIPT-ACTION-CAPTURES-CALLER is
+  including WHIPPLESCRIPT-ACTION-HYGIENE .
+  var S : Site .
+  rl [copy-caller-environment] : read(S, callerOnly) => result(callerSlot) .
+endm
+
+mod WHIPPLESCRIPT-ACTION-RENAMES-FIELD is
+  including WHIPPLESCRIPT-ACTION-HYGIENE .
+  var S : Site .
+  rl [rewrite-field-name] : object(S) => result(field(parameter, slot(S, parameter))) .
+endm

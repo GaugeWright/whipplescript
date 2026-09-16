@@ -1,0 +1,12 @@
+load ../action-fact-flow.maude
+search [1] in WHIPPLESCRIPT-ACTION-FACT-FLOW : check(footprint(call(pair(effect, write)))) =>* refused .
+search [1] in WHIPPLESCRIPT-ACTION-FACT-FLOW : check(footprint(call(pair(effect, write)))) =>* accepted .
+search [1] in WHIPPLESCRIPT-ACTION-FACT-FLOW : check(footprint(pair(call(effect), call(write)))) =>* refused .
+search [1] in WHIPPLESCRIPT-ACTION-FACT-FLOW : check(footprint(pair(call(effect), call(write)))) =>* accepted .
+search [1] in WHIPPLESCRIPT-ACTION-FACT-FLOW : check(footprint(call(pair(pair(effect, write), consume)))) =>* accepted .
+search [1] in WHIPPLESCRIPT-ACTION-FACT-FLOW : check(footprint(call(pair(pair(effect, write), consume)))) =>* refused .
+search [1] in WHIPPLESCRIPT-ACTION-FACT-FLOW : check(footprint(call(pair(pair(effect, write), dataDone)))) =>* accepted .
+search [1] in WHIPPLESCRIPT-ACTION-FACT-FLOW : check(footprint(call(write))) =>* accepted .
+search [1] in WHIPPLESCRIPT-ACTION-FACT-FLOW-SKIP-CALL : weak(call(pair(effect, write))) =>* accepted .
+search [1] in WHIPPLESCRIPT-ACTION-FACT-FLOW-INVENT-CONSUME : check(footprint(pair(effect, write))) =>* accepted .
+quit

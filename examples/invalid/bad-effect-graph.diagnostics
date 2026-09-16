@@ -3,7 +3,7 @@ warning[effect.unhandled_failure]: effect `claim`'s failure is unhandled in rule
    |
 18 |   claim item as claim
    |   ^^^^^^^^^^^^^^^^^^^
-   = help: handle it with `after claim fails { … }` (typed failure or recovery) or observe every outcome with `after claim completes`
+   = help: handle it with `after claim fails { … }` (typed failure or recovery), observe every outcome with `after claim completes`, or add one `on failure as problem { … }` handler to the rule
 error[effect.unsupported_predicate]: unsupported `after` predicate `retries`
    --> examples/invalid/bad-effect-graph.whip:20:3
    |

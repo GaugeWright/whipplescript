@@ -1,0 +1,25 @@
+--- Managed coerce: ready arguments admit once; only the current attempt's
+--- validated durable result supplies a value. Concrete schema/identity parsing
+--- and authority proofs are obligations of the implementation, not this model.
+mod WHIPPLESCRIPT-COERCE-OPERATION-VALUE is
+  protecting BOOL .
+  sorts State .
+  op arguments : Bool Bool -> State [ctor] .
+  op admitted : -> State [ctor] .
+  op terminal : Bool Bool -> State [ctor] .
+  op value : -> State [ctor] .
+  rl [admit-ready] : arguments(true, true) => admitted .
+  rl [read-current-valid] : terminal(true, true) => value .
+endm
+mod WHIPPLESCRIPT-COERCE-OPERATION-EARLY is
+  including WHIPPLESCRIPT-COERCE-OPERATION-VALUE .
+  rl [early] : arguments(true, false) => admitted .
+endm
+mod WHIPPLESCRIPT-COERCE-OPERATION-STALE is
+  including WHIPPLESCRIPT-COERCE-OPERATION-VALUE .
+  rl [stale] : terminal(false, true) => value .
+endm
+mod WHIPPLESCRIPT-COERCE-OPERATION-INVALID is
+  including WHIPPLESCRIPT-COERCE-OPERATION-VALUE .
+  rl [invalid] : terminal(true, false) => value .
+endm

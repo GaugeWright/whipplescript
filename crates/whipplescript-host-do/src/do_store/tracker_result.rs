@@ -244,6 +244,8 @@ pub(super) fn apply_result(
         provenance_class: "external",
         correlation_id: None,
         source_span_json: None,
+        // A tracker result carries no validity premises of its own.
+        validity_json: None,
     };
     let (version, epoch) = do_active_revision(sql, instance)?;
     do_insert_fact(

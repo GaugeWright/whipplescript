@@ -68,30 +68,26 @@ coercion two lines below the request. There is no nested `after` block.
 A `then` statement has no new semantics. It is only a different spelling. The
 rule above compiles to exactly the nested form that you can write manually:
 
-<!-- check: skip — shows the `__then_` bindings expansion generates -->
+<!-- check: skip — shows the semantic expansion of a `then` chain -->
 ```whip
 rule triage
   when Ticket as t
 => {
-  exec "true" as __then_precheck
+  exec "true" as precheck
 
-  after __then_precheck succeeds as precheck {
-    coerce judge(t.title) as __then_verdict
+  after precheck succeeds {
+    coerce judge(t.title) as verdict
 
-    after __then_verdict succeeds as verdict {
+    after verdict succeeds {
       complete result { priority verdict.priority }
     }
   }
 }
 ```
 
-The `whip check` command shows the desugared rule. Thus you can always examine
-the sequence. The `__then_*` names are the synthetic handles of the effects.
-The compiler reserves these names. If you write such a name, the result is a
-check error. The compiler hides these names deliberately. The `then` binding is
-the *success payload*. The binding is not the handle of the effect. If a step
-needs the handle, write the step in the traditional `as` and `after` form. A
-step that a `cancel` statement stops is an example.
+The expansion shows the source semantics: the `then` binding names the
+operation, and inside its success continuation the same binding is its checked
+successful value. Compiler-generated names are an internal lowering detail.
 
 ## Failure: the net and not a branch
 

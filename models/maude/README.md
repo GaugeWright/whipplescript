@@ -22,6 +22,18 @@ Its 16 searches include six reachable negative controls. The model's sink is
 unverifiable; stronger adapter recovery ceilings and correspondence to the
 store/executor implementation remain separate obligations.
 
+`lexical-failure-handler.maude` models scope-wide recovery after local
+continuations have had priority and the rule's outer workflow disposition. Its
+36 searches require protected and handler-owned work to settle, preserve the
+complete cause aggregate, make handler failure escape without re-entry, fail a
+terminating workflow, keep a service running with one diagnostic per cause, and
+leave direct deliberate cancellation outside the failure net. Nine reachable
+negative controls weaken early recovery, local-recovery priority,
+authored-return selection, single entry, cause preservation, terminating
+failure, service continuation, service cause cardinality, and cancellation.
+Runtime and host fixtures establish the correspondence to captured plans and
+durable terminal evidence.
+
 
 Maude is the primary executable-spec target for the WhippleScript kernel and
 for the package/library lowering pipeline.

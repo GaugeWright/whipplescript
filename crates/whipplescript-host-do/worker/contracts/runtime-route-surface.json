@@ -333,6 +333,17 @@
       "authentication": "runtime-control-bearer"
     },
     {
+      "id": "runtime.host.action.explain",
+      "method": "GET",
+      "path": "/host/instances/:instance/explain",
+      "samplePath": "/host/instances/instance-canary/explain",
+      "transport": "http-json",
+      "sideEffect": "none",
+      "risk": "important",
+      "producer": "whipplescript-host-worker",
+      "authentication": "runtime-control-bearer"
+    },
+    {
       "id": "runtime.host.turn.read",
       "method": "GET",
       "path": "/host/instances/:instance/turns/:turn",

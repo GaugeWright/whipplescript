@@ -203,6 +203,7 @@ pub fn context_record_json(context: &RuleContext) -> String {
                 "key": fact.key,
                 "value": json_from_str(&fact.value_json),
                 "provenance_class": fact.provenance_class,
+                "validity": fact.validity_json.as_deref().map(json_from_str),
             })
         })
         .collect();
@@ -226,6 +227,16 @@ pub fn context_from_record(record: &Value) -> Option<RuleContext> {
         .iter()
         .map(|entry| {
             let binding = entry.get("binding")?.as_str()?.to_owned();
+            let validity_json = match entry.get("validity") {
+                None | Some(Value::Null) => None,
+                Some(value) => {
+                    let validity = serde_json::from_value::<
+                        crate::source_action::arguments::Validity,
+                    >(value.clone())
+                    .ok()?;
+                    Some(serde_json::to_string(&validity).ok()?)
+                }
+            };
             let fact = FactView {
                 fact_id: entry.get("fact_id")?.as_str()?.to_owned(),
                 program_version_id: entry
@@ -249,6 +260,7 @@ pub fn context_from_record(record: &Value) -> Option<RuleContext> {
                     .unwrap_or_default()
                     .to_owned(),
                 source_span_json: None,
+                validity_json,
                 source_event_id: String::new(),
             };
             Some((binding, fact))
@@ -717,6 +729,7 @@ impl<'a> EvalScope<'a> {
 
 pub fn empty_ir_program() -> IrProgram {
     IrProgram {
+        execution_semantics: whipplescript_parser::ExecutionSemantics::LegacyActionChainsV1,
         workflow: String::new(),
         source_tags: Vec::new(),
         source_descriptions: Vec::new(),
@@ -920,25 +933,32 @@ pub fn eval_binary(op: BinaryOp, left: &Expr, right: &Expr, scope: &EvalScope<'_
                 EvalValue::Json(Value::Bool(truthy(&eval_expr_value(right, scope))))
             }
         }
-        BinaryOp::Eq => EvalValue::Json(Value::Bool(compare_eq(
-            &eval_expr_value(left, scope),
-            &eval_expr_value(right, scope),
-        ))),
-        BinaryOp::Ne => EvalValue::Json(Value::Bool(!compare_eq(
-            &eval_expr_value(left, scope),
-            &eval_expr_value(right, scope),
-        ))),
+        _ => eval_binary_values(
+            op,
+            eval_expr_value(left, scope),
+            eval_expr_value(right, scope),
+            expr_runtime_primitive(left, scope).as_ref(),
+            expr_runtime_primitive(right, scope).as_ref(),
+        ),
+    }
+}
+
+/// Shared scalar semantics after the caller has established operand readiness.
+/// The legacy evaluator still owns its historical missing/error behavior.
+pub(crate) fn eval_binary_values(
+    op: BinaryOp,
+    left: EvalValue,
+    right: EvalValue,
+    left_ty: Option<&IrPrimitiveType>,
+    right_ty: Option<&IrPrimitiveType>,
+) -> EvalValue {
+    match op {
+        BinaryOp::And => EvalValue::Json(Value::Bool(truthy(&left) && truthy(&right))),
+        BinaryOp::Or => EvalValue::Json(Value::Bool(truthy(&left) || truthy(&right))),
+        BinaryOp::Eq => EvalValue::Json(Value::Bool(compare_eq(&left, &right))),
+        BinaryOp::Ne => EvalValue::Json(Value::Bool(!compare_eq(&left, &right))),
         BinaryOp::Lt | BinaryOp::Le | BinaryOp::Gt | BinaryOp::Ge => {
-            let left_value = eval_expr_value(left, scope);
-            let right_value = eval_expr_value(right, scope);
-            let left_ty = expr_runtime_primitive(left, scope);
-            let right_ty = expr_runtime_primitive(right, scope);
-            match ordered_cmp(
-                &left_value,
-                &right_value,
-                left_ty.as_ref(),
-                right_ty.as_ref(),
-            ) {
+            match ordered_cmp(&left, &right, left_ty, right_ty) {
                 Ok(ordering) => {
                     let result = ordering
                         .map(|ordering| match op {
@@ -955,8 +975,8 @@ pub fn eval_binary(op: BinaryOp, left: &Expr, right: &Expr, scope: &EvalScope<'_
             }
         }
         BinaryOp::In | BinaryOp::NotIn => {
-            let needle = eval_expr_value(left, scope).into_json();
-            let haystack = eval_expr_value(right, scope).into_json();
+            let needle = left.into_json();
+            let haystack = right.into_json();
             let contains = match &haystack {
                 Value::Array(items) => items.iter().any(|item| item == &needle),
                 Value::Object(object) => {
@@ -971,8 +991,6 @@ pub fn eval_binary(op: BinaryOp, left: &Expr, right: &Expr, scope: &EvalScope<'_
             }))
         }
         BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div => {
-            let left = eval_expr_value(left, scope);
-            let right = eval_expr_value(right, scope);
             if let Some(duration) = eval_duration_arithmetic(op, &left, &right) {
                 return duration;
             }
@@ -1006,10 +1024,24 @@ pub fn eval_binary(op: BinaryOp, left: &Expr, right: &Expr, scope: &EvalScope<'_
 
 pub fn eval_call(name: &str, args: &[Expr], scope: &EvalScope<'_>) -> EvalValue {
     match (name, args) {
-        ("count", [query @ Expr::Query { .. }]) => eval_query_count(query, scope)
-            .map(|count| EvalValue::Json(Value::Number(count.into())))
-            .unwrap_or_else(|value| value),
-        ("count", [expr]) => match eval_expr_value(expr, scope) {
+        ("count" | "exists" | "empty", [query @ Expr::Query { .. }]) => {
+            match eval_query_count(query, scope) {
+                Ok(count) => EvalValue::Json(match name {
+                    "count" => Value::Number(count.into()),
+                    "exists" => Value::Bool(count > 0),
+                    _ => Value::Bool(count == 0),
+                }),
+                Err(value) => value,
+            }
+        }
+        (_, [expr]) => eval_value_call(name, eval_expr_value(expr, scope)),
+        _ => EvalValue::error("unknown expression function"),
+    }
+}
+
+pub(crate) fn eval_value_call(name: &str, value: EvalValue) -> EvalValue {
+    match name {
+        "count" => match value {
             EvalValue::Json(Value::Array(items)) => {
                 EvalValue::Json(Value::Number((items.len() as i64).into()))
             }
@@ -1023,21 +1055,11 @@ pub fn eval_call(name: &str, args: &[Expr], scope: &EvalScope<'_>) -> EvalValue 
             EvalValue::Error(message) => EvalValue::Error(message),
             _ => EvalValue::error("unsupported value for count"),
         },
-        ("exists", [query @ Expr::Query { .. }]) => eval_query_count(query, scope)
-            .map(|count| EvalValue::Json(Value::Bool(count > 0)))
-            .unwrap_or_else(|value| value),
-        ("exists", [expr]) => EvalValue::Json(Value::Bool(
-            !eval_expr_value(expr, scope).is_missing_or_null(),
-        )),
-        ("empty", [query @ Expr::Query { .. }]) => eval_query_count(query, scope)
-            .map(|count| EvalValue::Json(Value::Bool(count == 0)))
-            .unwrap_or_else(|value| value),
-        ("empty", [expr]) => match eval_expr_value(expr, scope) {
+        "exists" => EvalValue::Json(Value::Bool(!value.is_missing_or_null())),
+        "empty" => match value {
             EvalValue::Json(Value::Array(items)) => EvalValue::Json(Value::Bool(items.is_empty())),
             EvalValue::Json(Value::Object(items)) => EvalValue::Json(Value::Bool(items.is_empty())),
             EvalValue::Json(Value::String(value)) => EvalValue::Json(Value::Bool(value.is_empty())),
-            // Spec: for optional values `empty` is true for missing/null and
-            // otherwise delegates to the present inner value.
             EvalValue::Json(Value::Null) | EvalValue::Missing => EvalValue::Json(Value::Bool(true)),
             EvalValue::Error(message) => EvalValue::Error(message),
             _ => EvalValue::error("unsupported value for empty"),
@@ -1480,6 +1502,7 @@ pub fn lower_rule(
             correlation_id: context.identity.clone(),
             source_span_json: record_source
                 .map(|source| source_span_json(source_path, source.span, &source.construct)),
+            validity_json: None,
         });
     }
 
@@ -1524,6 +1547,7 @@ pub fn lower_rule(
             provenance_class: "rule".to_owned(),
             correlation_id: context.identity.clone(),
             source_span_json: None,
+            validity_json: None,
         });
     }
 
@@ -1750,6 +1774,7 @@ pub fn lower_rule(
                 provenance_class: "rule".to_owned(),
                 correlation_id: context.identity.clone(),
                 source_span_json: None,
+                validity_json: None,
             });
         }
         let mut selected_effects =
@@ -2103,6 +2128,7 @@ fn lower_nested_after_blocks(
                 provenance_class: "rule".to_owned(),
                 correlation_id: after_context.identity.clone(),
                 source_span_json: None,
+                validity_json: None,
             });
         }
         for binding in cancel_statements(&own_scope_body) {
@@ -2215,6 +2241,7 @@ pub fn push_effect_binding(
             value_json: value.to_string(),
             provenance_class: "effect".to_owned(),
             source_span_json: None,
+            validity_json: None,
             source_event_id: String::new(),
         },
     ));
@@ -2642,6 +2669,7 @@ pub fn case_pattern_matches(pattern: &str, value: &Value, context: &mut RuleCont
                     value_json: payload.to_string(),
                     provenance_class: "case".to_owned(),
                     source_span_json: None,
+                    validity_json: None,
                     source_event_id: String::new(),
                 },
             ));
@@ -2666,6 +2694,7 @@ pub fn case_pattern_matches(pattern: &str, value: &Value, context: &mut RuleCont
                 value_json: value.to_string(),
                 provenance_class: "case".to_owned(),
                 source_span_json: None,
+                validity_json: None,
                 source_event_id: String::new(),
             },
         ));
@@ -2697,6 +2726,7 @@ pub fn case_pattern_matches(pattern: &str, value: &Value, context: &mut RuleCont
                     value_json: value.to_string(),
                     provenance_class: "case".to_owned(),
                     source_span_json: None,
+                    validity_json: None,
                     source_event_id: String::new(),
                 },
             ));
@@ -2853,6 +2883,7 @@ pub fn append_workflow_terminal(
         kind: terminal.kind,
         name: terminal.name,
         payload_json,
+        validity_json: None,
         idempotency_key,
     });
 }
@@ -4698,29 +4729,15 @@ pub fn parsed_effect_input_json(
                     .map(|coerce| ir_type_name(&coerce.output))
                     .unwrap_or_else(|| "json".to_owned())
             };
-            let mut arguments = serde_json::Map::new();
-            let mut media = Vec::new();
-            let mut prompt_media_values = Vec::new();
-            let declaration = ir
-                .coerces
+            let values = effect
+                .args
                 .iter()
-                .find(|coerce| coerce.name == function_name);
-            for (index, arg) in effect.args.iter().enumerate() {
-                let value =
-                    parse_field_value_scoped(arg, context, live_facts, live_effects, live_ir);
-                if let Some(primitive) = declaration
-                    .and_then(|coerce| coerce.params.get(index))
-                    .and_then(|param| unwrap_optional_type(&param.ty))
-                    .and_then(|ty| match ty {
-                        IrType::Primitive(primitive) => Some(primitive),
-                        _ => None,
-                    })
-                    .filter(|primitive| is_media_primitive(primitive))
-                {
-                    media.push(media_input_json(&value, primitive));
-                }
-                arguments.insert(format!("arg{index}"), value);
-            }
+                .map(|arg| {
+                    parse_field_value_scoped(arg, context, live_facts, live_effects, live_ir)
+                })
+                .collect::<Vec<_>>();
+            let (arguments, mut media) = coerce_arguments_json(ir, function_name, &values);
+            let mut prompt_media_values = Vec::new();
             if function_name == "prompt" {
                 for (expr, primitive) in prompt_media_interpolations(
                     effect.prompt_template.as_deref().unwrap_or_default(),
@@ -4745,7 +4762,7 @@ pub fn parsed_effect_input_json(
             }
             let mut input = json!({
                 "function_name": function_name,
-                "arguments": Value::Object(arguments),
+                "arguments": arguments,
                 "argument_exprs": effect.args,
                 "output_type": output_type,
                 "bindings": context_bindings_json(context),
@@ -4761,44 +4778,7 @@ pub fn parsed_effect_input_json(
                     &ir.file_stores, &ir.vaults,
                 ),
             });
-            // Sum-type output (spec/sum-types.md): embed deterministic
-            // per-variant fixture values so a fixture run returns a tagged
-            // variant (first declared by default; `--variant` selects an
-            // arm) without the worker needing the IR.
-            if let Some(decl) = ir.schemas.iter().find_map(|schema| match schema {
-                IrSchema::Enum(decl) if decl.name == output_type => Some(decl),
-                _ => None,
-            }) {
-                let has_payloads = ir.schemas.iter().any(|schema| {
-                    matches!(schema, IrSchema::Class(class)
-                        if class.name.starts_with(&format!("{}.", decl.name)))
-                });
-                if has_payloads {
-                    let mut fixtures = serde_json::Map::new();
-                    for variant in &decl.variants {
-                        let generated = format!("{}.{variant}", decl.name);
-                        let value = if ir.schemas.iter().any(|schema| {
-                            matches!(schema, IrSchema::Class(class) if class.name == generated)
-                        }) {
-                            fixture_value_for_shape(&ingest_shape_json(
-                                ir,
-                                &IrType::Ref(generated),
-                                0,
-                            ))
-                        } else {
-                            Value::String(variant.clone())
-                        };
-                        fixtures.insert(variant.clone(), value);
-                    }
-                    if let Some(object) = input.as_object_mut() {
-                        object.insert("fixture_variants".to_owned(), Value::Object(fixtures));
-                        if let Some(first) = decl.variants.first() {
-                            object
-                                .insert("fixture_default".to_owned(), Value::String(first.clone()));
-                        }
-                    }
-                }
-            }
+            coerce_fixture_json(ir, &output_type, &mut input);
             if let Some(prompt) = coerce_prompt {
                 if let Some(object) = input.as_object_mut() {
                     if function_name == "prompt" {
@@ -4847,6 +4827,7 @@ pub fn parsed_effect_input_json(
             let mut input = json!({
                 "queue": item.get("queue").cloned().unwrap_or(Value::Null),
                 "id": item.get("id").cloned().unwrap_or(Value::Null),
+                "title": item.get("title").cloned().unwrap_or(Value::Null),
                 "rule": rule.name,
             });
             if effect.kind == "tracker.claim" {
@@ -5476,6 +5457,68 @@ pub fn parsed_effect_input_json(
     input.to_string()
 }
 
+/// Positional provider arguments and typed media, shared by both source drivers.
+pub(crate) fn coerce_arguments_json(
+    ir: &IrProgram,
+    function: &str,
+    values: &[Value],
+) -> (Value, Vec<Value>) {
+    let declaration = ir.coerces.iter().find(|coerce| coerce.name == function);
+    let mut media = Vec::new();
+    let arguments = values
+        .iter()
+        .enumerate()
+        .map(|(index, value)| {
+            if let Some(IrType::Primitive(primitive)) = declaration
+                .and_then(|coerce| coerce.params.get(index))
+                .filter(|param| !(value.is_null() && matches!(param.ty, IrType::Optional(_))))
+                .and_then(|param| unwrap_optional_type(&param.ty))
+                .filter(|ty| matches!(ty, IrType::Primitive(p) if is_media_primitive(p)))
+            {
+                media.push(media_input_json(value, primitive));
+            }
+            (format!("arg{index}"), value.clone())
+        })
+        .collect::<serde_json::Map<_, _>>();
+    (Value::Object(arguments), media)
+}
+
+pub(crate) fn coerce_fixture_json(ir: &IrProgram, output_type: &str, input: &mut Value) {
+    // Sum-type output (spec/sum-types.md): embed deterministic
+    // per-variant fixture values so a fixture run returns a tagged
+    // variant (first declared by default; `--variant` selects an
+    // arm) without the worker needing the IR.
+    if let Some(decl) = ir.schemas.iter().find_map(|schema| match schema {
+        IrSchema::Enum(decl) if decl.name == output_type => Some(decl),
+        _ => None,
+    }) {
+        let has_payloads = ir.schemas.iter().any(|schema| {
+            matches!(schema, IrSchema::Class(class)
+                        if class.name.starts_with(&format!("{}.", decl.name)))
+        });
+        if has_payloads {
+            let mut fixtures = serde_json::Map::new();
+            for variant in &decl.variants {
+                let generated = format!("{}.{variant}", decl.name);
+                let value = if ir.schemas.iter().any(
+                    |schema| matches!(schema, IrSchema::Class(class) if class.name == generated),
+                ) {
+                    fixture_value_for_shape(&ingest_shape_json(ir, &IrType::Ref(generated), 0))
+                } else {
+                    Value::String(variant.clone())
+                };
+                fixtures.insert(variant.clone(), value);
+            }
+            if let Some(object) = input.as_object_mut() {
+                object.insert("fixture_variants".to_owned(), Value::Object(fixtures));
+                if let Some(first) = decl.variants.first() {
+                    object.insert("fixture_default".to_owned(), Value::String(first.clone()));
+                }
+            }
+        }
+    }
+}
+
 pub fn effect_access_grants_json(
     rule: &IrRule,
     effect: &ParsedEffect,
@@ -5500,8 +5543,16 @@ pub fn effect_access_grants_json(
     }) else {
         return json!([]);
     };
+    access_grants_json(&node.access_grants, file_stores, vaults)
+}
+
+pub(crate) fn access_grants_json(
+    grants: &[whipplescript_parser::IrAccessGrant],
+    file_stores: &[IrFileStore],
+    vaults: &[whipplescript_parser::IrVault],
+) -> Value {
     Value::Array(
-        node.access_grants
+        grants
             .iter()
             .map(|grant| {
                 let mut value = json!({
@@ -5654,6 +5705,15 @@ pub fn schema_coerce_key_commitments(
     rule_name: &str,
     parsed: &ParsedEffect,
 ) -> [String; 3] {
+    schema_coerce_key_commitments_with_output(ir, rule_name, parsed, None)
+}
+
+fn schema_coerce_key_commitments_with_output(
+    ir: &IrProgram,
+    rule_name: &str,
+    parsed: &ParsedEffect,
+    output_override: Option<&IrType>,
+) -> [String; 3] {
     let coercion_name = parsed.name.as_deref().unwrap_or("coerce");
     let template = match coercion_name {
         "decide" | "prompt" => parsed.prompt_template.clone().unwrap_or_default(),
@@ -5666,7 +5726,7 @@ pub fn schema_coerce_key_commitments(
         .iter()
         .find(|rule| rule.name == rule_name)
         .and_then(|rule| effect_prompt_result_type(rule, parsed));
-    let output_type = match coercion_name {
+    let output_type = output_override.cloned().or_else(|| match coercion_name {
         "decide" => Some(IrType::Ref(
             whipplescript_parser::inline_decide_schema_name(
                 rule_name,
@@ -5688,7 +5748,7 @@ pub fn schema_coerce_key_commitments(
             .iter()
             .find(|coerce| coerce.name == coercion_name)
             .map(|coerce| coerce.output.clone()),
-    };
+    });
     let output_schema = output_type
         .map(|ty| {
             crate::coerce_native::output_schema_envelope(&ty, &ir.schemas)
@@ -5717,7 +5777,7 @@ pub fn schema_coerce_key_commitments(
 /// The effect admission key. `schema.coerce` effects fold in the coercion
 /// commitments plus the host-supplied config fingerprint — schema.coerce
 /// keys only, so no other kind ever rekeys on a coerce config change.
-fn effect_admission_key(
+pub(crate) fn effect_admission_key(
     ir: &IrProgram,
     rule_name: &str,
     parsed: &ParsedEffect,
@@ -5737,6 +5797,29 @@ fn effect_admission_key(
     } else {
         idempotency_key(&[effect_id, "effect"])
     }
+}
+
+/// Admission key for an inline schema-coerce whose anonymous output type is
+/// carried by the typed executable. This keeps a reusable action's decision
+/// schema structural instead of deriving a nominal class from its caller.
+pub(crate) fn inline_coerce_admission_key(
+    ir: &IrProgram,
+    rule_name: &str,
+    parsed: &ParsedEffect,
+    effect_id: &str,
+    coercion_config_fingerprint: &str,
+    output: &IrType,
+) -> String {
+    let [name, template, schema] =
+        schema_coerce_key_commitments_with_output(ir, rule_name, parsed, Some(output));
+    idempotency_key(&[
+        effect_id,
+        "effect",
+        &name,
+        &template,
+        &schema,
+        &format!("coercion_config_fingerprint={coercion_config_fingerprint}"),
+    ])
 }
 
 pub fn coerce_prompt_from_ir(ir: &IrProgram, function_name: &str) -> Option<ParsedPrompt> {
@@ -5955,6 +6038,9 @@ pub fn validate_json_for_ir_type(
                 errors.push(format!("{path} must be literal {expected:?}"));
             }
         }
+        IrType::Ref(name) if name == "TerminalOutcome" => {
+            validate_terminal_outcome_value(value, path, errors)
+        }
         IrType::Ref(name) => validate_json_for_ref(ir, value, name, path, errors),
         IrType::AgentRef(agents) => match value.as_str() {
             Some(agent) if agents.iter().any(|candidate| candidate == agent) => {}
@@ -6009,6 +6095,45 @@ pub fn validate_json_for_ir_type(
                 ));
             }
         }
+    }
+}
+
+fn validate_terminal_outcome_value(value: &Value, path: &str, errors: &mut Vec<String>) {
+    let Some(object) = value.as_object() else {
+        errors.push(format!("{path} must be a terminal outcome object"));
+        return;
+    };
+    let Some(tag) = object.get("tag").and_then(Value::as_str) else {
+        errors.push(format!("{path}.tag must be a terminal outcome tag"));
+        return;
+    };
+    let expected_status = match tag {
+        "Completed" => "completed",
+        "Failed" => "failed",
+        "TimedOut" => "timed_out",
+        "Cancelled" => "cancelled",
+        _ => {
+            errors.push(format!("{path}.tag has unknown terminal outcome `{tag}`"));
+            return;
+        }
+    };
+    if object.get("status").and_then(Value::as_str) != Some(expected_status) {
+        errors.push(format!(
+            "{path}.status must be `{expected_status}` for `{tag}`"
+        ));
+    }
+    for field in ["summary", "effect_id", "run_id"] {
+        if object
+            .get(field)
+            .is_some_and(|value| !value.is_null() && !value.is_string())
+        {
+            errors.push(format!("{path}.{field} must be a string or null"));
+        }
+    }
+    if !object.contains_key("value") || !object.contains_key("error") {
+        errors.push(format!(
+            "{path} must carry both terminal `value` and `error` slots"
+        ));
     }
 }
 
@@ -6072,11 +6197,45 @@ fn validate_json_for_ref(
                 if enum_decl
                     .variants
                     .iter()
-                    .any(|candidate| candidate == variant) => {}
+                    .any(|candidate| candidate == variant) =>
+            {
+                if ir.schemas.iter().any(|schema| {
+                    matches!(schema,
+                    IrSchema::Class(class) if class.name == format!("{name}.{variant}"))
+                }) {
+                    errors.push(format!(
+                        "{path} variant `{variant}` requires a payload object"
+                    ));
+                }
+            }
             Some(_) => errors.push(format!(
                 "{path} must be one of: {}",
                 enum_decl.variants.join(", ")
             )),
+            None if value.is_object() => {
+                let payload = value
+                    .get("variant")
+                    .and_then(Value::as_str)
+                    .filter(|variant| {
+                        enum_decl
+                            .variants
+                            .iter()
+                            .any(|candidate| candidate == variant)
+                    })
+                    .and_then(|variant| {
+                        ir.schemas.iter().find_map(|schema| match schema {
+                            IrSchema::Class(class) if class.name == format!("{name}.{variant}") => {
+                                Some(class)
+                            }
+                            _ => None,
+                        })
+                    });
+                if let Some(class) = payload {
+                    validate_json_for_object(ir, value, &class.fields, path, errors);
+                } else {
+                    errors.push(format!("{path} must name a declared payload variant"));
+                }
+            }
             None => errors.push(format!("{path} must be a string enum variant")),
         }
         return;
@@ -7368,6 +7527,7 @@ mod ir_reference_admission_tests {
             value_json: value_json.to_owned(),
             provenance_class: "rule".to_owned(),
             source_span_json: None,
+            validity_json: None,
             source_event_id: String::new(),
         }
     }
@@ -8052,6 +8212,59 @@ mod ir_admission_tests {
         assert_eq!(errors_for(ir, value, ty), Vec::<String>::new());
     }
 
+    #[test]
+    fn terminal_outcome_validation_keeps_dynamic_payloads_but_checks_the_tag_contract() {
+        let ir = ir_of("workflow W");
+        let ty = IrType::Ref("TerminalOutcome".into());
+        accepts(
+            &ir,
+            json!({
+                "tag":"Completed", "status":"completed", "value":{"any":42},
+                "error":null, "summary":null, "effect_id":"effect", "run_id":null
+            }),
+            &ty,
+        );
+        rejects(
+            &ir,
+            json!({"tag":"Failed", "status":"completed", "value":null, "error":{}}),
+            &ty,
+            "$.status must be `failed` for `Failed`",
+        );
+        rejects(
+            &ir,
+            json!({"tag":"Other", "status":"other", "value":null, "error":null}),
+            &ty,
+            "$.tag has unknown terminal outcome `Other`",
+        );
+        rejects(
+            &ir,
+            json!("completed"),
+            &ty,
+            "$ must be a terminal outcome object",
+        );
+        rejects(
+            &ir,
+            json!({"status":"failed", "value":null, "error":{}}),
+            &ty,
+            "$.tag must be a terminal outcome tag",
+        );
+        rejects(
+            &ir,
+            json!({
+                "tag":"Failed", "status":"failed", "value":null, "error":{},
+                "summary":42
+            }),
+            &ty,
+            "$.summary must be a string or null",
+        );
+        rejects(
+            &ir,
+            json!({"tag":"Cancelled", "status":"cancelled", "value":null}),
+            &ty,
+            "$ must carry both terminal `value` and `error` slots",
+        );
+    }
+
     const FIXTURE: &str = r#"
 workflow Admission
 
@@ -8091,6 +8304,39 @@ rule r
   when started
 => { complete result { ok true } }
 "#;
+
+    #[test]
+    fn managed_record_ir_gate_uses_the_canonical_mixed_enum_representation() {
+        let ir = ir_of(&FIXTURE.replace(
+            "enum Priority {\n  Low\n  High\n}",
+            "enum Priority {\n  Low\n  High { score int }\n  Maybe { note string? }\n}",
+        ));
+        let ty = field_ty(&ir, "Shapes", "rank");
+        accepts(&ir, json!("Low"), &ty);
+        accepts(&ir, json!({"variant":"High","score":3}), &ty);
+        accepts(&ir, json!({"variant":"Maybe"}), &ty);
+        accepts(
+            &ir,
+            json!(["Low",{"variant":"High","score":3}]),
+            &IrType::Array(Box::new(ty.clone())),
+        );
+        for value in [
+            json!("High"),
+            json!("Maybe"),
+            json!({}),
+            json!({"variant":3}),
+            json!({"variant":"Unknown"}),
+            json!({"variant":"Low"}),
+            json!({"variant":"High"}),
+            json!({"variant":"High","score":"wrong"}),
+            json!({"variant":"High","score":3,"extra":true}),
+        ] {
+            assert!(
+                !errors_for(&ir, value.clone(), &ty).is_empty(),
+                "accepted {value}"
+            );
+        }
+    }
 
     #[test]
     fn a_literal_field_rejects_any_other_value() {
@@ -8324,6 +8570,7 @@ mod tests {
             value_json: value_json.to_owned(),
             provenance_class: "table".to_owned(),
             source_span_json: None,
+            validity_json: None,
             source_event_id: String::new(),
         }
     }
@@ -8950,6 +9197,7 @@ renew slot until 300s as r
             value_json: "{\"done\": false}".to_owned(),
             provenance_class: "rule".to_owned(),
             source_span_json: None,
+            validity_json: None,
             source_event_id: String::new(),
         }];
         let scope = EvalScope::assertions(&facts, &[], &ir);
@@ -9175,6 +9423,7 @@ mod block_token_regression_tests {
             value_json: value_json.to_owned(),
             provenance_class: "rule".to_owned(),
             source_span_json: None,
+            validity_json: None,
             source_event_id: String::new(),
         }
     }

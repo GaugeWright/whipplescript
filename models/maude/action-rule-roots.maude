@@ -1,0 +1,20 @@
+mod WHIPPLESCRIPT-ACTION-RULE-ROOTS is
+  sorts Input Guard Result Read .
+  ops declared unknownInput : -> Input [ctor] .
+  ops valid invalid bodyRead : -> Guard [ctor] .
+  ops header refused : -> Result [ctor] .
+  op analyze : Input Guard -> Result [ctor] .
+  ops trigger query : -> Read [ctor] .
+  op reads : Read Read -> Read [ctor] .
+  rl [checked-root] : analyze(declared, valid) => header .
+  rl [unknown-input] : analyze(unknownInput, valid) => refused .
+  rl [invalid-guard] : analyze(declared, invalid) => refused .
+  rl [body-not-input] : analyze(declared, bodyRead) => refused .
+endm
+mod WHIPPLESCRIPT-ACTION-RULE-ROOTS-LOST is
+  including WHIPPLESCRIPT-ACTION-RULE-ROOTS .
+  rl [skip-input] : analyze(unknownInput, valid) => header .
+  rl [skip-guard] : analyze(declared, invalid) => header .
+  rl [body-as-input] : analyze(declared, bodyRead) => header .
+  rl [drop-query] : reads(trigger, query) => trigger .
+endm

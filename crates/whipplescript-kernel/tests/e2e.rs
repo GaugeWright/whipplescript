@@ -33,6 +33,7 @@ fn e2e_compiles_and_runs_minimal_workflow() {
         provenance_class: "rule",
         correlation_id: None,
         source_span_json: None,
+        validity_json: None,
     }];
 
     kernel
@@ -475,6 +476,7 @@ fn e2e_concurrent_instances_do_not_cross_contaminate_facts() {
             provenance_class: "rule",
             correlation_id: None,
             source_span_json: None,
+            validity_json: None,
         }];
         kernel
             .commit_rule(RuleCommit {
@@ -1407,6 +1409,7 @@ fn e2e_child_revision_parent_observes_terminal_output() {
                 kind: WorkflowTerminalKind::Completed,
                 name: "result",
                 payload_json: r#"{"summary":"done"}"#,
+                validity_json: None,
                 idempotency_key: Some("child-terminal"),
             }),
             idempotency_key: Some("commit-child-terminal"),

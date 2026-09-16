@@ -1289,8 +1289,23 @@ impl<Sql: DoSql> DoSqliteStore<Sql> {
                 )));
             }
         }
-        let event = do_append_event(
+        let captured_head = if let Some(frontier) = guard.and_then(|guard| guard.evaluated_frontier)
+        {
+            let head = do_chain_head(&self.sql, commit.instance_id)?;
+            if head.sequence.unwrap_or(0) != frontier {
+                return Err(StoreError::GuardRefused {
+                    guard: whipplescript_store::GuardKind::CompareAndSet,
+                    instance_id: commit.instance_id.to_owned(),
+                    detail: format!("rule evaluated at event {frontier}, but the log advanced to {}; re-read before committing", head.sequence.unwrap_or(0)),
+                });
+            }
+            Some(head.digest)
+        } else {
+            None
+        };
+        let event = do_append_event_chained(
             &self.sql,
+            captured_head.as_deref(),
             NewEvent {
                 instance_id: commit.instance_id,
                 event_type: "rule.committed",
@@ -1447,6 +1462,10 @@ impl<Sql: DoSql> DoSqliteStore<Sql> {
     /// cancellation requests, satisfy newly-unblocked dependencies, and optionally
     /// record a terminal diagnostic. Mirrors `complete_effect_terminal_inner`.
     fn derive_fact_in_transaction(&self, derived: DerivedFact<'_>) -> StoreResult<StoredEvent> {
+        // Native parity: `derive_fact_on` puts `validity` on the derivation
+        // event, and a DO object whose events omit it would answer a fact's
+        // validity differently from the same program on the native store.
+        let validity = validity_json_value(derived.fact.validity_json, "fact")?;
         let payload = serde_json::json!({
             "fact_id": derived.fact.fact_id,
             "name": derived.fact.name,
@@ -1455,6 +1474,7 @@ impl<Sql: DoSql> DoSqliteStore<Sql> {
             "schema_id": derived.fact.schema_id,
             "provenance_class": derived.fact.provenance_class,
             "correlation_id": derived.fact.correlation_id,
+            "validity": validity.unwrap_or(Value::Null),
         })
         .to_string();
         // Replay-tolerant (native parity): a re-derivation under an existing
@@ -1832,8 +1852,8 @@ fn event_view_from_row(row: &[SqlValue]) -> EventView {
     }
 }
 
-/// Maps a 9-column fact row to a `FactView` (nullable: `program_version_id`,
-/// `source_span_json`).
+/// Maps a 10-column fact row to a `FactView` (nullable: `program_version_id`,
+/// `source_span_json`, `validity_json`).
 fn fact_view_from_row(row: &[SqlValue]) -> FactView {
     FactView {
         fact_id: as_text(&row[0]),
@@ -1845,6 +1865,7 @@ fn fact_view_from_row(row: &[SqlValue]) -> FactView {
         provenance_class: as_text(&row[6]),
         source_span_json: as_opt_text(&row[7]),
         source_event_id: as_opt_text(&row[8]).unwrap_or_default(),
+        validity_json: as_opt_text(&row[9]),
     }
 }
 
@@ -2788,18 +2809,20 @@ fn do_insert_fact<Sql: DoSql>(
     if let Some(source_span_json) = fact.source_span_json {
         serde_json::from_str::<Value>(source_span_json)?;
     }
+    validity_json_value(fact.validity_json, "fact")?;
     sql.execute(
         // Set-like collapse (native parity): the key is content-derived, so a
         // conflict is a byte-identical active fact — re-recording is a no-op.
         "INSERT INTO facts (fact_id, instance_id, program_version_id, revision_epoch, name, key, \
          value_json, source_event_id, source_rule, schema_id, provenance_class, correlation_id, \
-         source_span_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13) \
+         source_span_json, validity_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14) \
          ON CONFLICT(instance_id, name, key) DO UPDATE SET \
              consumed_at = NULL, fact_id = excluded.fact_id, \
              value_json = excluded.value_json, \
              source_event_id = excluded.source_event_id, source_rule = excluded.source_rule, \
              program_version_id = excluded.program_version_id, \
-             revision_epoch = excluded.revision_epoch, updated_at = CURRENT_TIMESTAMP \
+             revision_epoch = excluded.revision_epoch, validity_json = excluded.validity_json, \
+             updated_at = CURRENT_TIMESTAMP \
          WHERE facts.consumed_at IS NOT NULL",
         &[
             text(fact.fact_id),
@@ -2815,6 +2838,7 @@ fn do_insert_fact<Sql: DoSql>(
             text(fact.provenance_class),
             opt_text(fact.correlation_id),
             opt_text(fact.source_span_json),
+            opt_text(fact.validity_json),
         ],
     )
     .map_err(sql_err)?;
@@ -3000,6 +3024,10 @@ fn do_replay_rule_commit<Sql: DoSql>(
             .map(Value::to_string)
             .unwrap_or_else(|| "{}".to_owned());
         let source_span_json = fact.get("source_span").map(Value::to_string);
+        let validity_json = fact
+            .get("validity")
+            .filter(|value| !value.is_null())
+            .map(Value::to_string);
         let program_version_id = fact
             .get("program_version_id")
             .and_then(Value::as_str)
@@ -3020,6 +3048,7 @@ fn do_replay_rule_commit<Sql: DoSql>(
                 .unwrap_or("replayed"),
             correlation_id: fact.get("correlation_id").and_then(Value::as_str),
             source_span_json: source_span_json.as_deref(),
+            validity_json: validity_json.as_deref(),
         };
         do_insert_fact(
             sql,
@@ -3151,6 +3180,10 @@ fn do_replay_fact_derived<Sql: DoSql>(
         .cloned()
         .unwrap_or(Value::Null)
         .to_string();
+    let validity_json = payload
+        .get("validity")
+        .filter(|value| !value.is_null())
+        .map(Value::to_string);
     let fact = NewFact {
         fact_id,
         name,
@@ -3163,6 +3196,7 @@ fn do_replay_fact_derived<Sql: DoSql>(
             .unwrap_or("derived"),
         correlation_id: payload.get("correlation_id").and_then(Value::as_str),
         source_span_json: None,
+        validity_json: validity_json.as_deref(),
     };
     let (program_version_id, revision_epoch) = do_active_revision(sql, instance_id)?;
     do_insert_fact(
@@ -3671,14 +3705,26 @@ fn workflow_terminal_payload(
     commit: &RuleCommit<'_>,
     terminal: WorkflowTerminal<'_>,
 ) -> StoreResult<String> {
+    let validity = validity_json_value(terminal.validity_json, "workflow terminal")?;
     let payload = serde_json::json!({
         "workflow_action": terminal.kind.action(),
         "workflow_status": terminal.kind.instance_status(),
         "terminal_name": terminal.name,
         "payload": serde_json::from_str::<Value>(terminal.payload_json)?,
         "rule": commit.rule,
+        "validity": validity.unwrap_or(Value::Null),
     });
     serde_json::to_string(&payload).map_err(Into::into)
+}
+
+fn validity_json_value(value: Option<&str>, subject: &str) -> StoreResult<Option<Value>> {
+    let validity = value.map(serde_json::from_str::<Value>).transpose()?;
+    if validity.as_ref().is_some_and(|value| !value.is_array()) {
+        return Err(StoreError::Conflict(format!(
+            "{subject} validity must be a JSON array"
+        )));
+    }
+    Ok(validity)
 }
 
 /// The `rule.committed` event payload, mirroring `rule_commit_payload`.
@@ -3694,6 +3740,7 @@ fn rule_commit_payload(
             if let Some(source_span_json) = fact.source_span_json {
                 serde_json::from_str::<Value>(source_span_json)?;
             }
+            let validity = validity_json_value(fact.validity_json, "fact")?;
             Ok(serde_json::json!({
                 "fact_id": fact.fact_id,
                 "name": fact.name,
@@ -3708,6 +3755,7 @@ fn rule_commit_payload(
                     .map(serde_json::from_str::<Value>)
                     .transpose()?
                     .unwrap_or(Value::Null),
+                "validity": validity.unwrap_or(Value::Null),
             }))
         })
         .collect::<StoreResult<Vec<_>>>()?;
@@ -6045,11 +6093,80 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
                     provenance_class: "import",
                     correlation_id: batch.correlation_id,
                     source_span_json: None,
+                    validity_json: None,
                 },
             )?;
             admitted += 1;
         }
         Ok(FactBatchOutcome { admitted, skipped })
+    }
+
+    fn settle_coerce_effect(
+        &mut self,
+        completion: EffectCompletion<'_>,
+        diagnostic: Option<TerminalDiagnosticRecord>,
+        fact: whipplescript_store::coerce_settlement::CoerceSettlementFact<'_>,
+    ) -> StoreResult<StoredEvent> {
+        fact.validate(completion)?;
+        let outcome = recovery::atomic_result(&self.sql, false, &mut || {
+            let terminal = self.complete_effect_terminal_on(
+                completion,
+                diagnostic.clone(),
+                completion.status,
+            )?;
+            let kinds = self
+                .sql
+                .query(
+                    "SELECT kind FROM effects WHERE instance_id = ?1 AND effect_id = ?2",
+                    &[text(completion.instance_id), text(completion.effect_id)],
+                )
+                .map_err(sql_err)?;
+            let kind = kinds.first().map(|row| as_text(&row[0]));
+            fact.check_kind(kind.as_deref())?;
+            let active = self.sql.query(
+                "SELECT 1 FROM facts WHERE instance_id = ?1 AND name = ?2 AND key = ?3 AND consumed_at IS NULL",
+                &[text(completion.instance_id), text(fact.name), text(completion.run_id)],
+            ).map_err(sql_err)?;
+            fact.require_fresh_fact(!active.is_empty())?;
+
+            do_append_event(
+                &self.sql,
+                NewEvent {
+                    instance_id: completion.instance_id,
+                    event_type: fact.name,
+                    payload_json: fact.value_json,
+                    source: "kernel",
+                    causation_id: Some(completion.run_id),
+                    correlation_id: Some(completion.effect_id),
+                    idempotency_key: Some(fact.result_event_key),
+                },
+            )?;
+            let payload = fact.payload(completion)?;
+            let event = do_append_event(
+                &self.sql,
+                NewEvent {
+                    instance_id: completion.instance_id,
+                    event_type: "fact.derived",
+                    payload_json: &payload,
+                    source: "kernel",
+                    causation_id: Some(completion.run_id),
+                    correlation_id: Some(completion.effect_id),
+                    idempotency_key: Some(fact.fact_event_key),
+                },
+            )?;
+            let (version, epoch) = do_active_revision(&self.sql, completion.instance_id)?;
+            do_insert_fact(
+                &self.sql,
+                completion.instance_id,
+                "kernel",
+                &event.event_id,
+                version.as_deref(),
+                epoch,
+                &fact.fact(completion),
+            )?;
+            Ok(terminal)
+        });
+        self.record_terminal_refusal(completion, completion.status, outcome)
     }
 
     fn retain_exec_outcome(
@@ -7751,7 +7868,7 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
             .sql
             .query(
                 "SELECT fact_id, program_version_id, revision_epoch, name, key, value_json, \
-                 provenance_class, source_span_json, source_event_id FROM facts \
+                 provenance_class, source_span_json, source_event_id, validity_json FROM facts \
                  WHERE instance_id = ?1 AND consumed_at IS NULL ORDER BY name, key",
                 &[text(instance_id)],
             )
@@ -7764,7 +7881,7 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
             .sql
             .query(
                 "SELECT fact_id, program_version_id, revision_epoch, name, key, value_json, \
-                 provenance_class, source_span_json, source_event_id FROM facts \
+                 provenance_class, source_span_json, source_event_id, validity_json FROM facts \
                  WHERE instance_id = ?1 ORDER BY name, key",
                 &[text(instance_id)],
             )
@@ -10845,6 +10962,7 @@ pub mod test_support {
             INSERT INTO schema_migrations (version, name) VALUES (4, 'tracker-filing-receipts');
             INSERT INTO schema_migrations (version, name) VALUES (5, 'tracker-closure-receipts');
             INSERT INTO schema_migrations (version, name) VALUES (6, 'tracker-control-receipts');
+            INSERT INTO schema_migrations (version, name) VALUES (7, 'fact-validity');
             CREATE TABLE events (
                 event_id TEXT PRIMARY KEY, instance_id TEXT NOT NULL, sequence INTEGER NOT NULL,
                 event_type TEXT NOT NULL, payload_json TEXT NOT NULL, occurred_at TEXT NOT NULL,
@@ -10862,7 +10980,7 @@ pub mod test_support {
                 key TEXT NOT NULL DEFAULT '', value_json TEXT NOT NULL DEFAULT '{}',
                 source_event_id TEXT, source_rule TEXT, schema_id TEXT,
                 provenance_class TEXT NOT NULL DEFAULT 'derived', correlation_id TEXT,
-                source_span_json TEXT, consumed_at TEXT, updated_at TEXT,
+                source_span_json TEXT, validity_json TEXT, consumed_at TEXT, updated_at TEXT,
                 UNIQUE(instance_id, name, key)
             );
             CREATE TABLE instances (
@@ -11656,6 +11774,13 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn executable_program_do_revised_progression_uses_complete_capture() {
+        whipplescript_kernel::program_artifact::conformance::revised_progression_uses_capture(
+            DoSqliteStore::new(test_support::RusqliteDoSql::with_runtime_schema()),
+        );
+    }
+
+    #[test]
     fn do_file_settlement_and_replay() {
         for kind in ["file.read", "file.write", "file.import", "file.export"] {
             for status in ["completed", "failed"] {
@@ -11676,6 +11801,80 @@ pub(crate) mod tests {
         }
         for case in ["kind", "provider", "missing-queue", "empty-queue"] {
             tracker_conformance::refuse_foreign_profile(&mut store(), case);
+        }
+    }
+
+    #[test]
+    fn do_coerce_settlement_refuses_wrong_kind_and_occupied_admission() {
+        use whipplescript_store::coerce_settlement::conformance;
+        conformance::wrong_kind(&mut DoSqliteStore::new(
+            test_support::RusqliteDoSql::with_runtime_schema(),
+        ));
+        conformance::occupied_fact(&mut DoSqliteStore::new(
+            test_support::RusqliteDoSql::with_runtime_schema(),
+        ));
+    }
+
+    #[test]
+    fn do_coerce_settlement_and_replay() {
+        for status in ["completed", "failed", "timed_out"] {
+            let mut store = DoSqliteStore::new(test_support::RusqliteDoSql::with_runtime_schema());
+            whipplescript_store::coerce_settlement::conformance::run_suite(&mut store, status);
+        }
+    }
+
+    #[test]
+    fn do_coerce_settlement_rolls_back_every_sql_boundary() {
+        use whipplescript_store::coerce_settlement::conformance;
+        for status in ["completed", "failed", "timed_out"] {
+            let mut finished = false;
+            for fail_at in 1..=100 {
+                let mut base =
+                    DoSqliteStore::new(test_support::RusqliteDoSql::with_runtime_schema());
+                let fixture = conformance::setup(&mut base, "schema.coerce", status);
+                let snapshot = |sql: &dyn DoSql| {
+                    [
+                        "events",
+                        "instances",
+                        "effects",
+                        "runs",
+                        "leases",
+                        "facts",
+                        "diagnostics",
+                        "effect_dependencies",
+                    ]
+                    .map(|table| {
+                        sql.query(&format!("SELECT * FROM {table} ORDER BY rowid"), &[])
+                            .unwrap()
+                    })
+                };
+                let before = snapshot(&base.sql);
+                let mut store = DoSqliteStore::new(FaultySql::new(base.sql, fail_at));
+                let outcome = store.settle_coerce_effect(
+                    fixture.completion(),
+                    fixture.diagnostic(),
+                    fixture.fact(),
+                );
+                let seen = store.sql.seen.get();
+                store.sql.disarm();
+                if outcome.is_ok() {
+                    assert!(fail_at > seen, "{status}: swallowed SQL failure {fail_at}");
+                    assert!(seen > 10, "exercise the complete transaction");
+                    assert_eq!(store.list_facts(&fixture.instance).unwrap().len(), 1);
+                    finished = true;
+                    break;
+                }
+                assert_eq!(
+                    snapshot(&store.sql),
+                    before,
+                    "{status}: SQL failure {fail_at}"
+                );
+                assert!(format!("{:?}", outcome.unwrap_err()).contains("injected fault"));
+            }
+            assert!(
+                finished,
+                "must reach a successful {status} settlement after all SQL failures"
+            );
         }
     }
 
@@ -13586,6 +13785,7 @@ pub(crate) mod tests {
                         .iter()
                         .map(|key| whipplescript_store::SettlementFact {
                             fact: NewFact {
+                                validity_json: None,
                                 fact_id: key,
                                 name: "projection",
                                 key,
@@ -13885,6 +14085,7 @@ pub(crate) mod tests {
             let effects = [effect(Some(60))];
             let mut request = commit(&instance.instance_id, &effects);
             request.terminal = Some(WorkflowTerminal {
+                validity_json: None,
                 kind: WorkflowTerminalKind::Completed,
                 name: "done",
                 payload_json: "{}",
@@ -14077,6 +14278,16 @@ pub(crate) mod tests {
         .expect("suite runs");
     }
 
+    #[test]
+    fn action_capture_rule_frontier_conformance() {
+        whipplescript_store::log_append::conformance::run_rule_frontier(store());
+    }
+
+    #[test]
+    fn action_projection_prefix_conformance() {
+        whipplescript_store::projection_prefix::conformance::run(store());
+    }
+
     /// DR-0068 §3 on this host: the pinned read returns exactly the pinned
     /// prefix and refuses a substituted one.
     #[test]
@@ -14138,7 +14349,9 @@ pub(crate) mod tests {
     fn do_store_core_methods_run_real_sql() {
         let store = store();
 
-        assert_eq!(store.schema_version().expect("version"), 6);
+        // 7: main's six generations plus this branch's `fact-validity`, which
+        // was renumbered off 4 because both sides had taken it.
+        assert_eq!(store.schema_version().expect("version"), 7);
         assert!(!store.fact_exists("i1", "ready").expect("fact"));
 
         let event = store
@@ -15507,6 +15720,7 @@ pub(crate) mod tests {
                     provenance_class: "derived",
                     correlation_id: None,
                     source_span_json: None,
+                    validity_json: None,
                 },
                 source: "rule.a",
                 causation_id: None,
@@ -16812,6 +17026,7 @@ pub(crate) mod tests {
             provenance_class: "derived",
             correlation_id: None,
             source_span_json: None,
+            validity_json: None,
         }];
         let effects = [NewEffect {
             effect_id: "eff_new",
@@ -16872,6 +17087,7 @@ pub(crate) mod tests {
                 context_json: None,
             },
             RuleCommitRevisionGuard {
+                evaluated_frontier: None,
                 program_version_id: "ver_WRONG",
                 revision_epoch: 99,
             },
@@ -17435,6 +17651,9 @@ pub(crate) mod tests {
             provenance_class: "derived",
             correlation_id: None,
             source_span_json: None,
+            validity_json: Some(
+                r#"[{"frontier":1,"kind":"fact","head":"Evidence","guard_json":null,"members":[]}]"#,
+            ),
         }];
         let effects = [NewEffect {
             effect_id: "eff_1",
@@ -17527,6 +17746,10 @@ pub(crate) mod tests {
         let facts = store.list_facts("i1").expect("facts");
         assert_eq!(facts.len(), 1);
         assert_eq!(facts[0].name, "ready");
+        assert!(facts[0]
+            .validity_json
+            .as_deref()
+            .is_some_and(|validity| validity.contains("Evidence")));
         let eff = store
             .sql
             .query(
@@ -17551,6 +17774,28 @@ pub(crate) mod tests {
         let runs = store.list_runs("i1").expect("runs");
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].status, "completed");
+    }
+
+    #[test]
+    fn validity_json_refuses_non_array_values_with_the_sink_named() {
+        assert!(matches!(
+            validity_json_value(Some("{}"), "fact"),
+            Err(StoreError::Conflict(message))
+                if message == "fact validity must be a JSON array"
+        ));
+        assert!(matches!(
+            validity_json_value(Some("true"), "workflow terminal"),
+            Err(StoreError::Conflict(message))
+                if message == "workflow terminal validity must be a JSON array"
+        ));
+        assert_eq!(
+            validity_json_value(Some("[]"), "fact").expect("array accepted"),
+            Some(serde_json::json!([]))
+        );
+        assert_eq!(
+            validity_json_value(None, "fact").expect("legacy absence accepted"),
+            None
+        );
     }
 
     /// The narrowed run lookup answers with the row `list_runs` + a linear

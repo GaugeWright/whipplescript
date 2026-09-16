@@ -1182,6 +1182,7 @@ fn stepping_an_instance_the_store_does_not_have_is_refused() {
         "probe.whip",
         source,
         &ir,
+        None,
     )
     .expect_err("an absent instance is refused");
     assert!(
@@ -1251,6 +1252,7 @@ fn stepping_an_instance_whose_active_version_is_gone_is_refused() {
         "probe.whip",
         source,
         &ir,
+        None,
     )
     .expect_err("an absent active version is refused");
     assert!(

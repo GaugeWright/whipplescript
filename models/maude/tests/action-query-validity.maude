@@ -1,0 +1,59 @@
+load ../action-query-validity.maude
+--- Membership and absence both carry an exact captured frontier.
+search [1] in WHIPPLESCRIPT-ACTION-QUERY-VALIDITY :
+  query(tickets, 4, 9, 17) =>* selected(value(1, observed(tickets, 4, 17), 0)) .
+search [1] in WHIPPLESCRIPT-ACTION-QUERY-VALIDITY :
+  query(tickets, 4, 9, 0) =>* selected(value(0, observed(tickets, 4, 0), 0)) .
+--- Equal query identities at distinct frontiers remain distinct premises.
+search [1] in WHIPPLESCRIPT-ACTION-QUERY-VALIDITY :
+  query(effects, 3, 8, 21) =>* selected(value(1, observed(effects, 3, 21), 0)) .
+--- Scalar composition unions validity from both operands.
+search [1] in WHIPPLESCRIPT-ACTION-QUERY-VALIDITY :
+  compose(value(1, observed(tickets, 4, 17), 0),
+          value(0, observed(effects, 4, 0), 0)) =>*
+  value(1, observed(tickets, 4, 17) observed(effects, 4, 0), 0) .
+--- Durable capture and reopen preserve the observation.
+search [1] in WHIPPLESCRIPT-ACTION-QUERY-VALIDITY :
+  reopen(save(value(1, observed(tickets, 4, 17), 0))) =>*
+  value(1, observed(tickets, 4, 17), 0) .
+--- Reads remain pure.
+search [1] in WHIPPLESCRIPT-ACTION-QUERY-VALIDITY :
+  query(effects, 4, 9, 0) =>* selected(value(0, observed(effects, 4, 0), 0)) .
+
+--- Current semantics cannot relabel an old observation with today's frontier.
+search [1] in WHIPPLESCRIPT-ACTION-QUERY-VALIDITY :
+  query(tickets, 4, 9, 17) =>* selected(value(1, observed(tickets, 9, 17), 0)) .
+search [1] in WHIPPLESCRIPT-ACTION-QUERY-LATEST-VALIDITY :
+  query(tickets, 4, 9, 17) =>* selected(value(1, observed(tickets, 9, 17), 0)) .
+--- Empty membership is positive evidence, not no evidence.
+search [1] in WHIPPLESCRIPT-ACTION-QUERY-VALIDITY :
+  query(tickets, 4, 9, 0) =>* selected(value(0, noValidity, 0)) .
+search [1] in WHIPPLESCRIPT-ACTION-QUERY-DROPS-ABSENCE :
+  query(tickets, 4, 9, 0) =>* selected(value(0, noValidity, 0)) .
+--- A matching scalar cannot replace the exact member with absence.
+search [1] in WHIPPLESCRIPT-ACTION-QUERY-VALIDITY :
+  query(tickets, 4, 9, 17) =>* selected(value(1, observed(tickets, 4, 0), 0)) .
+search [1] in WHIPPLESCRIPT-ACTION-QUERY-DROPS-MEMBER :
+  query(tickets, 4, 9, 17) =>* selected(value(1, observed(tickets, 4, 0), 0)) .
+--- Composition cannot erase the right operand's premise.
+search [1] in WHIPPLESCRIPT-ACTION-QUERY-VALIDITY :
+  compose(value(1, observed(tickets, 4, 17), 0),
+          value(0, observed(effects, 4, 0), 0)) =>*
+  value(1, observed(tickets, 4, 17), 0) .
+search [1] in WHIPPLESCRIPT-ACTION-QUERY-DROPS-COMPOSED-VALIDITY :
+  composeDropped(value(1, observed(tickets, 4, 17), 0),
+                 value(0, observed(effects, 4, 0), 0)) =>*
+  value(1, observed(tickets, 4, 17), 0) .
+--- Replay cannot erase validity.
+search [1] in WHIPPLESCRIPT-ACTION-QUERY-VALIDITY :
+  reopen(save(value(1, observed(tickets, 4, 17), 0))) =>*
+  value(1, noValidity, 0) .
+search [1] in WHIPPLESCRIPT-ACTION-QUERY-DROPS-REPLAY-VALIDITY :
+  reopenDropped(save(value(1, observed(tickets, 4, 17), 0))) =>*
+  value(1, noValidity, 0) .
+--- Query evaluation cannot launch external work.
+search [1] in WHIPPLESCRIPT-ACTION-QUERY-VALIDITY :
+  query(effects, 4, 9, 0) =>* selected(value(0, observed(effects, 4, 0), 1)) .
+search [1] in WHIPPLESCRIPT-ACTION-QUERY-REISSUES :
+  query(effects, 4, 9, 0) =>* selected(value(0, observed(effects, 4, 0), 1)) .
+quit

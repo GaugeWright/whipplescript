@@ -1,0 +1,33 @@
+load ../action-explanation-query.maude
+search [1] in WHIPPLESCRIPT-ACTION-EXPLANATION-QUERY :
+  resolve(0) =>* notFound .
+search [1] in WHIPPLESCRIPT-ACTION-EXPLANATION-QUERY :
+  resolve(1) =>* selected .
+search [1] in WHIPPLESCRIPT-ACTION-EXPLANATION-QUERY :
+  resolve(2) =>* ambiguous .
+search [1] in WHIPPLESCRIPT-ACTION-EXPLANATION-QUERY :
+  firingMatches(7, 7) =>* true .
+search [1] in WHIPPLESCRIPT-ACTION-EXPLANATION-QUERY :
+  firingMatches(7, 8) =>* false .
+search [1] in WHIPPLESCRIPT-ACTION-EXPLANATION-QUERY :
+  advise(waitingInput, 4) =>* inspectResult(4, noAuthority, retryDenied) .
+search [1] in WHIPPLESCRIPT-ACTION-EXPLANATION-QUERY :
+  advise(uncertain, 9) =>* reconcileOperation(9, noAuthority, retryDenied) .
+search [1] in WHIPPLESCRIPT-ACTION-EXPLANATION-QUERY :
+  advise(failed, 3) =>* inspectCause(3, noAuthority, retryDenied) .
+search [1] in WHIPPLESCRIPT-ACTION-EXPLANATION-QUERY :
+  advise(notSelected, 5) =>* noAdvice .
+
+search [1] in WHIPPLESCRIPT-ACTION-EXPLANATION-QUERY :
+  resolve(2) =>* selected .
+search [1] in WHIPPLESCRIPT-ACTION-EXPLANATION-QUERY-LATEST-WINS :
+  resolveLatest(2) =>* selected .
+search [1] in WHIPPLESCRIPT-ACTION-EXPLANATION-QUERY :
+  advise(uncertain, 9) =>* reconcileOperation(9, noAuthority, retryAllowed) .
+search [1] in WHIPPLESCRIPT-ACTION-EXPLANATION-QUERY-UNSAFE-RETRY :
+  unsafeAdvice(uncertain, 9) =>* reconcileOperation(9, noAuthority, retryAllowed) .
+search [1] in WHIPPLESCRIPT-ACTION-EXPLANATION-QUERY :
+  advise(notSelected, 5) =>* awaitOperation(5, noAuthority, retryDenied) .
+search [1] in WHIPPLESCRIPT-ACTION-EXPLANATION-QUERY-GUESSES-WORK :
+  guessedAdvice(notSelected, 5) =>* awaitOperation(5, noAuthority, retryDenied) .
+quit

@@ -1,0 +1,94 @@
+--- One event frontier names the facts, effects and terminal evidence visible to
+--- a captured action projection. Restore rewinds the pre-marker suffix; work
+--- recorded after the marker belongs to the new live line. This bounded model
+--- abstracts one fact and one effect, enough to catch the four ways a host can
+--- hand the pure action projector a mixed-time world.
+mod WHIPPLESCRIPT-ACTION-PROJECTION-PREFIX is
+ protecting BOOL . protecting NAT .
+ sorts Restore Log EffectState Prefix Result .
+ op none : -> Restore [ctor] .
+ --- Recording sequence and target frontier.
+ op rewind : Nat Nat -> Restore [ctor] .
+ --- fact-created, fact-consumed (0 = absent), effect-created,
+ --- effect-terminal (0 = absent), cancellation-requested (0 = absent),
+ --- restore and current log head.
+ op log : Nat Nat Nat Nat Nat Restore Nat -> Log [ctor] .
+ ops absent pending succeeded : -> EffectState [ctor] .
+ op prefix : Bool EffectState Bool -> Prefix [ctor] .
+ op selected : Prefix -> Result [ctor] .
+ op refused : -> Result [ctor] .
+ op visible : Nat Nat Restore -> Bool .
+ op factLive : Log Nat -> Bool .
+ op effectAt : Log Nat -> EffectState .
+ op cancellationOpen : Log Nat -> Bool .
+ op project : Log Nat -> Result .
+ vars FC FX EC ET CR R T N H : Nat . var RS : Restore . var L : Log .
+
+ eq visible(0, N, RS) = false .
+ eq visible(R, N, none) = R <= N .
+ eq visible(R, N, rewind(T, H)) =
+   R <= N and (H > N or R <= T or H <= R) .
+ eq factLive(log(FC, FX, EC, ET, CR, RS, H), N) =
+   visible(FC, N, RS) and not visible(FX, N, RS) .
+ eq effectAt(log(FC, FX, EC, ET, CR, RS, H), N) =
+   if visible(ET, N, RS) then succeeded
+   else if visible(EC, N, RS) then pending else absent fi fi .
+ eq cancellationOpen(log(FC, FX, EC, ET, CR, RS, H), N) =
+   visible(CR, N, RS) and not visible(ET, N, RS) .
+ crl [exact-prefix] : project(log(FC, FX, EC, ET, CR, RS, H), N) =>
+   selected(prefix(
+     factLive(log(FC, FX, EC, ET, CR, RS, H), N),
+     effectAt(log(FC, FX, EC, ET, CR, RS, H), N),
+     cancellationOpen(log(FC, FX, EC, ET, CR, RS, H), N)))
+   if N <= H .
+ crl [missing-frontier] : project(log(FC, FX, EC, ET, CR, RS, H), N) => refused
+   if H < N .
+endm
+
+--- Wrong: hands the projector today's fact/effect rows for an older frontier.
+mod WHIPPLESCRIPT-ACTION-PROJECTION-LATEST is
+ including WHIPPLESCRIPT-ACTION-PROJECTION-PREFIX .
+ vars FC FX EC ET CR N H : Nat . var RS : Restore .
+ crl [latest-rows] : project(log(FC, FX, EC, ET, CR, RS, H), N) =>
+   selected(prefix(
+     factLive(log(FC, FX, EC, ET, CR, RS, H), H),
+     effectAt(log(FC, FX, EC, ET, CR, RS, H), H),
+     cancellationOpen(log(FC, FX, EC, ET, CR, RS, H), H)))
+   if N <= H .
+endm
+
+--- Wrong: reconstructs all admitted facts without applying consumption.
+mod WHIPPLESCRIPT-ACTION-PROJECTION-KEEPS-CONSUMED is
+ including WHIPPLESCRIPT-ACTION-PROJECTION-PREFIX .
+ vars FC FX EC ET CR N H : Nat . var RS : Restore .
+ crl [keep-consumed] : project(log(FC, FX, EC, ET, CR, RS, H), N) =>
+   selected(prefix(
+     visible(FC, N, RS),
+     effectAt(log(FC, FX, EC, ET, CR, RS, H), N),
+     cancellationOpen(log(FC, FX, EC, ET, CR, RS, H), N)))
+   if N <= H .
+endm
+
+--- Wrong: restore markers do not remove an abandoned pre-marker suffix.
+mod WHIPPLESCRIPT-ACTION-PROJECTION-IGNORES-RESTORE is
+ including WHIPPLESCRIPT-ACTION-PROJECTION-PREFIX .
+ vars FC FX EC ET CR N H : Nat . var RS : Restore .
+ crl [ignore-restore] : project(log(FC, FX, EC, ET, CR, RS, H), N) =>
+   selected(prefix(
+     factLive(log(FC, FX, EC, ET, CR, none, H), N),
+     effectAt(log(FC, FX, EC, ET, CR, none, H), N),
+     cancellationOpen(log(FC, FX, EC, ET, CR, none, H), N)))
+   if N <= H .
+endm
+
+--- Wrong: a terminal observation leaves cancellation requested forever.
+mod WHIPPLESCRIPT-ACTION-PROJECTION-STICKY-CANCEL is
+ including WHIPPLESCRIPT-ACTION-PROJECTION-PREFIX .
+ vars FC FX EC ET CR N H : Nat . var RS : Restore .
+ crl [sticky-cancel] : project(log(FC, FX, EC, ET, CR, RS, H), N) =>
+   selected(prefix(
+     factLive(log(FC, FX, EC, ET, CR, RS, H), N),
+     effectAt(log(FC, FX, EC, ET, CR, RS, H), N),
+     visible(CR, N, RS)))
+   if N <= H .
+endm

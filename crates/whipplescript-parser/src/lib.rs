@@ -5,7 +5,19 @@
 //! as source text until the typed IR is ready to lower them.
 
 mod action_expand;
+pub mod action_plan;
+pub mod case_pattern;
+pub use syntax::managed_template;
+mod action_signature;
+mod action_subjects;
+mod action_types;
+mod agent_capabilities;
 mod canonical;
+pub mod effect_contract;
+mod effect_grants;
+pub mod execution_semantics;
+mod fact_flow;
+pub use execution_semantics::ExecutionSemantics;
 pub mod fixit;
 pub use canonical::{canonical_declarations, canonical_program_hash, DeclCanon};
 pub mod body;
@@ -13,9 +25,12 @@ mod body_print;
 mod format;
 mod lowering;
 mod measure;
+pub mod rule_dependencies;
+mod rule_roots;
 pub mod snapshot;
 use format::*;
 pub use format::{format_program, format_program_preserving_comments, FormatOutput};
+pub use lowering::declarations::{DeclarationAnalysis, PendingBody};
 use lowering::*;
 mod source_text;
 pub use source_text::{BlockSource, BodyOrigin, SourceText};
@@ -40,7 +55,8 @@ use whipplescript_core::{
 // reaching for a second copy.
 pub use whipplescript_core::{diagnostic_code, DiagnosticCode, Severity};
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SourceSpan {
     pub start: usize,
     pub end: usize,
@@ -184,7 +200,7 @@ impl From<&str> for Suggestion {
 }
 
 /// The construction-site spelling: `suggestion: suggest(text)` where
-/// `suggestion: Some(text)` stood. The same closing parenthesis, so the rewrite
+/// `suggestion: suggest(text)` stood. The same closing parenthesis, so the rewrite
 /// of the existing sites was a token swap and nothing else.
 pub fn suggest(message: impl Into<String>) -> Option<Suggestion> {
     Some(Suggestion::manual(message))
@@ -323,13 +339,15 @@ pub struct Comment {
     pub span: SourceSpan,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Ident {
     pub name: String,
     pub span: SourceSpan,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StringLiteral {
     pub value: String,
     pub span: SourceSpan,
@@ -374,6 +392,7 @@ pub enum Item {
     FileStore(FileStoreDecl),
     MemoryPool(MemoryPoolDecl),
     Action(ActionDecl),
+    View(ViewDecl),
     Agent(AgentDecl),
     Enum(EnumDecl),
     Event(EventDecl),
@@ -417,6 +436,7 @@ impl Item {
             Self::FileStore(decl) => decl.span,
             Self::MemoryPool(decl) => decl.span,
             Self::Action(decl) => decl.span,
+            Self::View(decl) => decl.span,
             Self::Agent(decl) => decl.span,
             Self::Enum(decl) => decl.span,
             Self::Event(decl) => decl.span,
@@ -796,14 +816,37 @@ pub struct ActionParam {
     pub span: SourceSpan,
 }
 
-/// `action <name>(<param: type>, …) { <effect chain> }` (DR-0023): a static,
-/// hygienic, inline-expanded template over rule-body effect chains. Consumed by
-/// `expand_action_calls` before lowering; never a runtime construct.
+/// The DR-0100 action result contract. Keeping the domain failure inside this
+/// value makes a failure declaration without a success result unrepresentable.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ActionResult {
+    pub success: TypeSyntax,
+    pub failure: Option<TypeSyntax>,
+}
+
+/// An action declaration. `result: None` is the recorded DR-0023 template
+/// surface; `Some` is the typed DR-0100 declaration used by new source.
+/// Parsing retains both forms so recorded program versions remain replayable.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ActionDecl {
     pub name: Ident,
     pub params: Vec<ActionParam>,
+    pub result: Option<ActionResult>,
     pub body: BlockSource,
+    pub span: SourceSpan,
+}
+
+/// A pure, typed query abstraction. Unlike a maintained `view ... when`, this
+/// declaration is called from expressions and never owns a firing or a fact.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ViewDecl {
+    pub name: Ident,
+    pub params: Vec<ActionParam>,
+    pub result: TypeSyntax,
+    pub body: BlockSource,
+    pub tags: Vec<TagDecl>,
+    pub description: Option<StringLiteral>,
     pub span: SourceSpan,
 }
 
@@ -923,7 +966,8 @@ pub struct MeasureDecl {
     pub span: SourceSpan,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum MeasureDeclBound {
     Literal(i64),
     /// A field of the same class that the ring must never change.
@@ -1047,7 +1091,8 @@ pub struct ClockPolicy {
 }
 
 /// Recurrence forms from spec/std-time.md (conservative first surface).
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum Recurrence {
     /// `at <hh:mm>` — a single scheduled occurrence.
     At { time: TimeOfDay, span: SourceSpan },
@@ -1065,14 +1110,16 @@ pub enum Recurrence {
     },
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum CalendarPattern {
     Day,
     Weekday,
     Weekly(Weekday),
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum Weekday {
     Monday,
     Tuesday,
@@ -1083,7 +1130,8 @@ pub enum Weekday {
     Sunday,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TimeOfDay {
     pub hour: u8,
     pub minute: u8,
@@ -1092,7 +1140,8 @@ pub struct TimeOfDay {
 
 /// Missed-occurrence policy from spec/std-time.md. No silent default: a recurring
 /// source must declare one (enforced by the checker).
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum MissedPolicy {
     Skip,
     Coalesce,
@@ -1121,7 +1170,8 @@ pub struct SourceEmitField {
 
 /// A value mapped into an emitted signal field: an observation path
 /// (`tick.scheduled_at`) or a literal.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum SourceValue {
     Path {
         binding: Ident,
@@ -1145,7 +1195,8 @@ pub struct TestDecl {
     pub span: SourceSpan,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum TestClause {
     Given(GivenClause),
     Stub(StubClause),
@@ -1156,14 +1207,16 @@ pub enum TestClause {
 /// A `<field> <expr>` mapping inside a `given` record body. `value` is the source
 /// text of the expression (parsed via `parse_expression` when validated), matching
 /// how guards and assertions capture expressions.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TestField {
     pub name: Ident,
     pub value: String,
     pub span: SourceSpan,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum GivenClause {
     Input {
         fields: Vec<TestField>,
@@ -1201,7 +1254,8 @@ pub enum GivenClause {
 
 /// `stub <surface…> <outcome> [record | string]`. The surface path and outcome
 /// are kept as tokens; provider-specific validation happens in the harness.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StubClause {
     /// Surface path segments (each may be dotted, e.g. `script.run`); the trailing
     /// segment is the outcome.
@@ -1211,19 +1265,22 @@ pub struct StubClause {
     pub span: SourceSpan,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum StubPayload {
     Record(Vec<TestField>),
     Message(StringLiteral),
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RunClause {
     pub kind: RunKind,
     pub span: SourceSpan,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum RunKind {
     UntilIdle,
     UntilWorkflowCompleted,
@@ -1231,13 +1288,15 @@ pub enum RunKind {
     ForSteps(u32),
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ExpectClause {
     pub target: ExpectTarget,
     pub span: SourceSpan,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum ExpectTarget {
     WorkflowCompleted,
     WorkflowFailed { failure: Option<Ident> },
@@ -1248,14 +1307,16 @@ pub enum ExpectTarget {
     Projection(ProjQuery),
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum RuleStatus {
     Fired,
     FiredTimes(u32),
     DidNotFire,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum EffectStatus {
     Requested,
     Completed,
@@ -1266,14 +1327,16 @@ pub enum EffectStatus {
 /// The predicate reuses the guard expression kernel, restricted to projection
 /// fields. The noun is a dotted fact name, so a scenario can assert over runtime
 /// facts such as `agent.turn.completed` as well as single-identifier user facts.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProjQuery {
     pub noun: String,
     pub kind: ProjQueryKind,
     pub span: SourceSpan,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum ProjQueryKind {
     Exists,
     Count { predicate: String, count: u32 },
@@ -1312,7 +1375,8 @@ pub struct ParamDecl {
     pub span: SourceSpan,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum TypeSyntax {
     Primitive {
         name: String,
@@ -1401,7 +1465,8 @@ pub struct RuleDecl {
 }
 
 /// DR-0083 Decisions 1 and 2.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum RuleKind {
     /// Evaluates its body once, against the fact base as it stands, and closes.
     #[default]
@@ -1447,6 +1512,10 @@ pub struct ParseOutput {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CompileOutput {
     pub ir: Option<IrProgram>,
+    /// Present only for the managed typed-action compiler path. These plans
+    /// are complete compiler output and must be captured with the IR before a
+    /// stored version may execute them.
+    pub typed_actions: Option<BTreeMap<String, action_plan::resolved::TypedActionPlan>>,
     pub diagnostics: Vec<Diagnostic>,
     /// Non-fatal diagnostics (deprecations, style); never block compilation.
     pub warnings: Vec<Diagnostic>,
@@ -1485,8 +1554,11 @@ impl CompileOutput {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct IrProgram {
+    /// Recorded action pipeline; source syntax and compiler versions do not select replay.
+    pub execution_semantics: ExecutionSemantics,
     pub workflow: String,
     pub source_tags: Vec<IrSourceTag>,
     pub source_descriptions: Vec<IrSourceDescription>,
@@ -1530,7 +1602,8 @@ pub struct IrProgram {
     pub measures: Vec<IrMeasure>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct IrMeasureDeclaration {
     pub class: String,
     pub field: String,
@@ -1539,21 +1612,24 @@ pub struct IrMeasureDeclaration {
     pub span: SourceSpan,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct IrMeasure {
     /// The cycle the measure covers, as the rule names of one round trip.
     pub cycle: Vec<String>,
     pub rendering: String,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct IrSharedCoordinationUsage {
     pub resource: String,
     pub workflow_principals: Vec<String>,
 }
 
 /// `auth <mode> secret <ident>` on an inbound source.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SourceAuth {
     pub mode: SourceAuthMode,
     /// The secret REFERENCE — an identifier the runtime resolves, never the
@@ -1571,7 +1647,8 @@ pub struct SourceAuth {
 /// whip sends the signed bytes and the presented signature and is told yes or
 /// no. §5's rule that the language cannot name a secret's bytes therefore holds
 /// at the inbound door as it does at the outbound one.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SourceVerified {
     /// The declared credential whose material verifies the delivery.
     pub credential: Ident,
@@ -1579,7 +1656,8 @@ pub struct SourceVerified {
 }
 
 /// How an inbound delivery authenticates (spec/std-ingress.md Surface).
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum SourceAuthMode {
     /// A signature over the body under a shared secret: the only mode that
     /// binds the CONTENT, so a replayed body cannot be re-signed for different
@@ -1610,7 +1688,8 @@ impl SourceAuthMode {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct IrSourceTag {
     pub name: String,
     pub target_kind: String,
@@ -1618,7 +1697,8 @@ pub struct IrSourceTag {
     pub span: SourceSpan,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct IrSourceDescription {
     pub value: String,
     pub target_kind: String,
@@ -1626,7 +1706,8 @@ pub struct IrSourceDescription {
     pub span: SourceSpan,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct IrPatternApplication {
     pub pattern: String,
     pub alias: String,
@@ -1640,13 +1721,15 @@ pub struct IrPatternApplication {
     pub application_span: SourceSpan,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct IrPatternArgument {
     pub name: String,
     pub value: String,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct IrWorkflowContract {
     pub kind: IrWorkflowContractKind,
     pub name: String,
@@ -1654,7 +1737,8 @@ pub struct IrWorkflowContract {
     pub span: SourceSpan,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum IrWorkflowContractKind {
     Input,
     Output,
@@ -1671,39 +1755,45 @@ impl IrWorkflowContractKind {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct IrInclude {
     pub path: String,
     pub source_hash: Option<String>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct IrAssertion {
     pub expr: IrExpression,
     pub projection_reads: Vec<IrProjectionRead>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct IrExpression {
     pub source: String,
     pub expr: Expr,
     pub span: SourceSpan,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct IrUse {
     pub kind: IrUseKind,
     pub name: String,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum IrUseKind {
     Package,
 }
 
 /// One lowered `stream` declaration (std.vcs): the workstream tier's
 /// declared membership + staleness bound. Runtime homing reads this.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct IrStream {
     pub name: String,
     pub members: Vec<String>,
@@ -1712,7 +1802,8 @@ pub struct IrStream {
     pub span: SourceSpan,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct IrTracker {
     pub name: String,
     pub provider: String,
@@ -1724,7 +1815,8 @@ pub struct IrTracker {
 /// selective verbs' slots against this table at effect-input build. (Named
 /// `IrRegionDecl` because `IrRegion` is DR-0043's rule-body during/until
 /// region — an unrelated concept that predates this declaration.)
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct IrRegionDecl {
     pub name: String,
     /// The selection-grammar source, unquoted; validated at check time.
@@ -1735,7 +1827,8 @@ pub struct IrRegionDecl {
 /// A lowered `channel` declaration (std.messaging): the channel identity, its
 /// provider, and optional workspace/destination config. Lowering class is
 /// `metadata_only`; the runtime messaging provider consumes it later.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct IrChannel {
     pub name: String,
     pub provider: String,
@@ -1746,7 +1839,8 @@ pub struct IrChannel {
 
 /// A lowered `vault`: a declared container of dynamically-named credentials
 /// (DR-0053 §5 Amendment). See `VaultDecl`.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct IrVault {
     pub name: String,
     /// Kebab-case credential kind — every member carries it.
@@ -1763,7 +1857,8 @@ pub struct IrVault {
 /// declared kind, normalized to the custody protocol's kebab-case. Metadata
 /// only — reality (material, sealing rung, grants) lives with the custodian
 /// and governance, never in the program.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct IrCredential {
     pub name: String,
     /// Kebab-case credential kind (`bearer`, `hmac-sha256`, …).
@@ -1778,7 +1873,8 @@ pub struct IrCredential {
 /// A lowered `mark` declaration: a named cut point riding a committing
 /// site. `metadata_only`; the runtime stamps `mark.reached` events, the
 /// improve store pins scenarios at them.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct IrMark {
     pub name: String,
     pub site: String,
@@ -1789,7 +1885,8 @@ pub struct IrMark {
 /// a judge to a quality dimension, versioning with the program. Lowering
 /// class is `metadata_only`; the evidence engine (`whip evidence` /
 /// `whip improve`) consumes it at runtime.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct IrGauge {
     pub name: String,
     pub site: Option<String>,
@@ -1811,7 +1908,8 @@ pub struct IrGauge {
 /// A lowered gauge bar. `form` is `chance` (`P(field)`) or `stat`
 /// (`p10`/`mean`/…); `op` is `>=` (`at least`) or `<=` (`at most`);
 /// `threshold` keeps its exact source text — consumers parse.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct IrGaugeBar {
     pub form: String,
     pub subject: String,
@@ -1822,7 +1920,8 @@ pub struct IrGaugeBar {
 /// A lowered `campaign` declaration (improve design note §3): the named,
 /// versioned partition of the gauge vector. `metadata_only`; consumed by
 /// `whip improve <name>`.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct IrCampaign {
     pub name: String,
     pub ascend: Vec<String>,
@@ -1834,7 +1933,8 @@ pub struct IrCampaign {
     pub span: SourceSpan,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct IrCampaignReach {
     pub gauge: String,
     pub op: String,
@@ -1842,7 +1942,8 @@ pub struct IrCampaignReach {
     pub unit: Option<String>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct IrCampaignGuard {
     pub gauge: String,
     pub band_percent: String,
@@ -1850,7 +1951,8 @@ pub struct IrCampaignGuard {
 
 /// A lowered `file store` declaration (std.files): the store identity + its
 /// literal local root directory, consumed by the runtime file provider.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct IrFileStore {
     pub name: String,
     pub root: String,
@@ -1872,7 +1974,8 @@ pub struct IrFileStore {
 /// A lowered `memory pool` declaration (std.memory, MEM-1): the pool identity +
 /// its optional recall context-limit budget. `metadata_only` — provides
 /// `Resource<MemoryPool>`; providers read `context_limit` from the effect input.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct IrMemoryPool {
     pub name: String,
     /// Optional recall packing budget (`context limit <n>`); providers read it
@@ -1880,27 +1983,31 @@ pub struct IrMemoryPool {
     pub context_limit: Option<u64>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct IrHarness {
     pub name: String,
     pub kind: String,
     pub span: SourceSpan,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum IrSchema {
     Enum(IrEnum),
     Class(IrClass),
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct IrEnum {
     pub name: String,
     pub variants: Vec<String>,
     pub span: SourceSpan,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct IrClass {
     pub name: String,
     pub fields: Vec<IrClassField>,
@@ -1909,7 +2016,8 @@ pub struct IrClass {
 
 /// A declared external event: the typed ingress manifest
 /// (spec/event-ingress.md). Dotted name, class-shaped payload.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct IrEvent {
     pub name: String,
     pub fields: Vec<IrClassField>,
@@ -1919,7 +2027,8 @@ pub struct IrEvent {
 /// A lowered source declaration (spec/std-time.md). `is_clock` selects the
 /// `clock_source` lowering; otherwise `signal_source`. Both lower through the
 /// `source_declaration` construct family and admit a durable signal fact.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct IrSource {
     pub name: String,
     pub provider: String,
@@ -1970,7 +2079,8 @@ pub struct IrSource {
     pub span: SourceSpan,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct IrSourceEmitField {
     pub name: String,
     pub value: SourceValue,
@@ -1980,7 +2090,8 @@ pub struct IrSourceEmitField {
 /// A lowered test scenario (spec/workflow-testing.md). Tests are excluded from
 /// the executable IR (`compile`/`run` ignore them); `whip check` validates them
 /// and `whip test` runs them. The clause detail is retained for the harness.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct IrTest {
     pub name: String,
     pub workflow: Option<String>,
@@ -1989,7 +2100,8 @@ pub struct IrTest {
 }
 
 /// Coordination resources (spec/coordination.md), lowered.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct IrLease {
     pub name: String,
     pub key_type: String,
@@ -1999,7 +2111,8 @@ pub struct IrLease {
     pub span: SourceSpan,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct IrLedger {
     pub name: String,
     pub entry_schema: String,
@@ -2009,7 +2122,8 @@ pub struct IrLedger {
     pub span: SourceSpan,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct IrCounter {
     pub name: String,
     pub key_type: String,
@@ -2021,7 +2135,8 @@ pub struct IrCounter {
     pub span: SourceSpan,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct IrClassField {
     pub name: String,
     pub ty: IrType,
@@ -2034,7 +2149,8 @@ pub struct IrClassField {
     pub span: SourceSpan,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum IrType {
     Primitive(IrPrimitiveType),
     LiteralString(String),
@@ -2051,7 +2167,8 @@ pub enum IrType {
     Union(Vec<IrType>),
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum IrPrimitiveType {
     String,
     Int,
@@ -2132,7 +2249,8 @@ impl IrPrimitiveType {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct IrAgent {
     pub name: String,
     /// Where the declaration sits, so a diagnostic about this agent's PROVIDER
@@ -2178,7 +2296,8 @@ pub struct IrAgent {
     pub harness_class: HarnessClass,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct IrCoerce {
     pub name: String,
     /// Where the declaration sits, so a diagnostic about the endpoint this
@@ -2199,13 +2318,15 @@ pub struct IrCoerce {
     pub provider: Option<String>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct IrParam {
     pub name: String,
     pub ty: IrType,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct IrRule {
     pub name: String,
     /// DR-0083: `rule` (evaluate once, then closed) or `view` (re-derive while
@@ -2217,7 +2338,8 @@ pub struct IrRule {
     pub metadata: IrRuleMetadata,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct IrWhen {
     pub source: String,
     pub pattern: String,
@@ -2226,13 +2348,15 @@ pub struct IrWhen {
 }
 
 /// One `release <binding>` of an item this rule matched out of `queue`.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct IrResourceRelease {
     pub queue: String,
     pub binding: String,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct IrRuleDependency {
     pub producer: String,
     pub consumer: String,
@@ -2241,7 +2365,8 @@ pub struct IrRuleDependency {
 
 /// DR-0043 Decision 5: one effect the region contains, with the level-1
 /// `after` scope the kernel keys its effect id under.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct IrRegionEffect {
     pub binding: String,
     pub scope: Option<(String, String)>,
@@ -2254,7 +2379,8 @@ pub struct IrRegionEffect {
 /// `body_removed` (region gone -- post-lapse suppression) or `body_lapsed`
 /// (region replaced by its arm) per the region's durable state. NOT rendered
 /// into the .ir snapshot (derived, deterministic).
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct IrRegion {
     pub until: bool,
     /// Guard-grammar condition text; the kernel parses and evaluates it
@@ -2275,7 +2401,8 @@ pub struct IrRegion {
     pub arm_case_arms: Vec<(String, String)>,
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct IrRuleMetadata {
     pub fact_reads: Vec<String>,
     pub projection_reads: Vec<IrProjectionRead>,
@@ -2466,7 +2593,8 @@ pub struct IrRuleMetadata {
 /// (DR-0027). The bound is the declared target type `T`; the labels are the
 /// SOURCE schema's (a target field mislabelled public is still caught against the
 /// source's label). The IFC engine governs it exactly like an explicit `redact`.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct IrBoundedEgress {
     /// The engine's sink string (`fact:<T>` for a record).
     pub sink: String,
@@ -2480,7 +2608,8 @@ pub struct IrBoundedEgress {
 /// A `redact <source> keep [..] as <binding>` projection, surfaced for the
 /// information-flow value-flow engine (DR-0027). `source` is the binding being
 /// projected, `keep` the kept field names, `binding` the projected output.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct IrRedaction {
     pub source: String,
     pub keep: Vec<String>,
@@ -2495,7 +2624,8 @@ pub struct IrRedaction {
     pub source_schema: Option<String>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct IrRecordShape {
     pub schema: String,
     /// `(field name, assigned expression)` in source order. A `from` shorthand
@@ -2506,14 +2636,16 @@ pub struct IrRecordShape {
     pub immediate: bool,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct IrRecordSource {
     pub schema: String,
     pub construct: String,
     pub span: SourceSpan,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct IrProjectionRead {
     pub kind: QueryKind,
     pub head: String,
@@ -2533,7 +2665,8 @@ impl IrProjectionRead {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct IrEffectNode {
     pub id: String,
     pub kind: IrEffectKind,
@@ -2580,11 +2713,16 @@ pub struct IrEffectNode {
     /// The `onto <target>` of a `transport` effect: `mainline` or a
     /// declared stream, validated post-lowering.
     pub transport_onto: Option<String>,
-    /// The named resource (file store / channel) a direct effect touches, if any —
-    /// e.g. the store of a `read`/`write`. Surfaced so information-flow analysis can
-    /// see rule-body data flows, not just turn-access grants. `None` for effects
-    /// that touch no named resource. Not part of the `.ir` snapshot.
-    pub resource: Option<String>,
+    /// Named resources this effect may touch. Most direct effects name zero or
+    /// one; a composed resource operand can preserve alternatives from several
+    /// action return paths. Surfaced so information-flow analysis sees the full
+    /// destination set. Not part of the `.ir` snapshot.
+    #[serde(
+        default,
+        alias = "resource",
+        deserialize_with = "deserialize_effect_resources"
+    )]
+    pub resources: Vec<String>,
     /// The agent a `tell` addresses (its `target`), surfaced so information-flow
     /// analysis can model the turn's egress to that agent's provider. `None` for
     /// non-`tell` effects. Not part of the `.ir` snapshot.
@@ -2646,7 +2784,8 @@ pub struct IrEffectNode {
 }
 
 /// Analysis metadata for an ordinary `call <capability> for <binding>`.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct IrPackageCall {
     pub target: String,
     pub argument: Option<String>,
@@ -2656,10 +2795,30 @@ pub struct IrPackageCall {
     pub tracker_resources: Vec<String>,
 }
 
+fn deserialize_effect_resources<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(serde::Deserialize)]
+    #[serde(untagged)]
+    enum Encoded {
+        One(Option<String>),
+        Many(Vec<String>),
+    }
+
+    Ok(
+        match <Encoded as serde::Deserialize>::deserialize(deserializer)? {
+            Encoded::One(resource) => resource.into_iter().collect(),
+            Encoded::Many(resources) => resources,
+        },
+    )
+}
+
 /// The two `exec` source forms (spec/std-script.md): a raw command string
 /// (`exec "cmd"`, dev-profile only) or an operator-manifest capability
 /// (`exec <name> with <record>`).
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum IrExecTarget {
     Raw,
     Capability { name: String },
@@ -2687,7 +2846,8 @@ impl IrExecTarget {
 }
 
 /// The payload of a `request` effect (DR-0053 §5).
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct IrHttpRequest {
     pub method: String,
     pub url: String,
@@ -2701,7 +2861,8 @@ pub struct IrHttpRequest {
 /// DR-0053 §5 as amended: a credential exchange. The exchange itself reuses
 /// `IrHttpRequest` because it IS one — the same headers, the same marked slots,
 /// the same body — and only the extraction is new.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct IrMintCredential {
     /// The credential the exchange spends, and whose egress ceiling the minted
     /// child inherits.
@@ -2711,13 +2872,15 @@ pub struct IrMintCredential {
     pub public_paths: Vec<String>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct IrRequestHeader {
     pub name: String,
     pub value: IrRequestHeaderValue,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum IrRequestHeaderValue {
     /// Expression source.
     Expr(String),
@@ -2760,20 +2923,23 @@ impl IrHttpRequest {
 
 /// A lowered turn-access grant: the granted operations narrow the turn's effective
 /// authority on `resource` (modeled in `models/maude/turn-access-grant.maude`).
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct IrAccessGrant {
     pub resource: String,
     pub operations: Vec<IrAccessGrantOp>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct IrAccessGrantOp {
     pub operation: String,
     pub target: Option<String>,
     pub globs: Vec<String>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct IrConstructUse {
     pub keyword: String,
     pub scope: String,
@@ -2782,7 +2948,8 @@ pub struct IrConstructUse {
     pub target_capability: String,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum IrEffectKind {
     AgentTell,
     SchemaCoerce,
@@ -2829,14 +2996,16 @@ pub enum IrEffectKind {
     FileExport,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct IrEffectDependency {
     pub upstream: String,
     pub predicate: DependencyPredicate,
     pub downstream: String,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct IrRuleCaseBranch {
     pub scrutinee: String,
     pub scrutinee_type: IrType,
@@ -2846,7 +3015,8 @@ pub struct IrRuleCaseBranch {
     pub pattern_span: SourceSpan,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum IrCasePattern {
     EnumVariant(String),
     LiteralString(String),
@@ -2869,21 +3039,24 @@ impl IrCasePattern {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct IrTerminalOutput {
     pub binding: String,
     pub alternatives: Vec<IrTerminalAlternative>,
     pub span: SourceSpan,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct IrTerminalAlternative {
     pub tag: String,
     pub payload_type: IrType,
     pub source_span: SourceSpan,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct IrTerminalCaseBranch {
     pub scrutinee: String,
     pub tag: Option<String>,
@@ -2915,7 +3088,8 @@ pub struct IrTerminalCaseBranch {
 /// `summary` key, so this is a lint (`lint.envelope_field_on_payload`), not a
 /// diagnostic. Lint-only metadata — deliberately NOT rendered in the `.ir`
 /// snapshot, so it adds no golden/hash churn.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct IrEnvelopeFieldOnPayload {
     /// The envelope alias the field is available on (`after x completes as o`).
     pub scrutinee: String,
@@ -2926,7 +3100,8 @@ pub struct IrEnvelopeFieldOnPayload {
     pub span: SourceSpan,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum DependencyPredicate {
     Succeeds,
     Fails,
@@ -2937,6 +3112,7 @@ pub enum DependencyPredicate {
 
 #[derive(Clone, Debug)]
 struct SemanticContext {
+    workflow_terminals: Vec<WorkflowContractDecl>,
     workflow: Option<String>,
     schemas: SchemaIndex,
     agents: BTreeSet<String>,
@@ -2947,10 +3123,13 @@ struct SemanticContext {
     agent_returns: BTreeMap<String, String>,
     coerce_outputs: BTreeMap<String, TypeSyntax>,
     coerce_params: BTreeMap<String, Vec<ParamDecl>>,
+    parameterized_views: BTreeMap<String, ViewDecl>,
+    parameterized_view_diagnostics: Vec<Diagnostic>,
     workflow_inputs: BTreeMap<String, WorkflowInputSurface>,
     /// Declared coordination resources (spec/coordination.md).
     leases: BTreeSet<String>,
     ledgers: BTreeSet<String>,
+    ledger_entries: BTreeMap<String, String>,
     counters: BTreeSet<String>,
     /// Declared `channel` names (std.messaging); `send via <channel>` must name one.
     channels: BTreeSet<String>,
@@ -3140,7 +3319,8 @@ enum ExprType {
     Unknown,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum Expr {
     Literal(ExprLiteral),
     Path(Vec<String>),
@@ -3170,13 +3350,15 @@ pub enum Expr {
     },
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ExprObjectField {
     pub key: String,
     pub value: Expr,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum ExprLiteral {
     String(String),
     Number(String),
@@ -3189,12 +3371,14 @@ pub enum ExprLiteral {
     Duration(i64),
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum UnaryOp {
     Not,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum BinaryOp {
     Or,
     And,
@@ -3212,7 +3396,8 @@ pub enum BinaryOp {
     Div,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum QueryKind {
     Fact,
     Effect,
@@ -3459,7 +3644,71 @@ pub fn workflow_names(source: &str) -> Vec<String> {
 }
 
 pub fn compile_program_with_root(source: &str, root: Option<&str>) -> CompileOutput {
-    let mut output = compile_program_with_root_inner(source, root);
+    let semantics = source_execution_semantics(source);
+    compile_with_execution_semantics(source, root, semantics)
+}
+
+/// New source selects the managed execution machine when it declares an
+/// action or uses a managed rule-body boundary. Recorded versions never call
+/// this selector: they compile through `compile_recorded_program_with_root`
+/// with their stored semantics tag.
+fn source_execution_semantics(source: &str) -> ExecutionSemantics {
+    let parsed = parse_program(source);
+    let items: Vec<_> = parsed
+        .program
+        .items
+        .iter()
+        .chain(
+            parsed
+                .program
+                .workflows
+                .iter()
+                .flat_map(|workflow| workflow.items.iter()),
+        )
+        .collect();
+    let declares_action = items
+        .iter()
+        .any(|item| matches!(item, Item::Action(_) | Item::View(_)));
+    let uses_managed_rule_body = items.iter().any(|item| {
+        let Item::Rule(rule) = item else {
+            return false;
+        };
+        if rule.kind != RuleKind::Rule {
+            return false;
+        }
+        let (body, diagnostics) =
+            body::parse_composed_rule_body(&rule.body.text, rule.body.body_base());
+        diagnostics.is_empty() && statements_require_managed_semantics(&body.statements)
+    });
+    if declares_action || uses_managed_rule_body {
+        ExecutionSemantics::TypedActionsV1
+    } else {
+        ExecutionSemantics::LegacyActionChainsV1
+    }
+}
+
+fn statements_require_managed_semantics(statements: &[body::BodyStmt]) -> bool {
+    statements.iter().any(|statement| match statement {
+        body::BodyStmt::Composition(body::CompositionStmt::OnFailure { .. }) => true,
+        body::BodyStmt::Composition(body::CompositionStmt::Then { operation, .. }) => {
+            statements_require_managed_semantics(std::slice::from_ref(operation))
+        }
+        body::BodyStmt::After(after) => statements_require_managed_semantics(&after.body),
+        body::BodyStmt::Case(case) => case
+            .branches
+            .iter()
+            .any(|branch| statements_require_managed_semantics(&branch.body)),
+        body::BodyStmt::Region(_) => true,
+        _ => false,
+    })
+}
+
+fn compile_with_execution_semantics(
+    source: &str,
+    root: Option<&str>,
+    semantics: ExecutionSemantics,
+) -> CompileOutput {
+    let mut output = compile_program_with_root_inner(source, root, semantics);
     // Machine-applicable repairs are decided HERE, once, over the finished
     // diagnostics and the source they were produced from — see [`fixit`] for why
     // an emission site is the wrong place to attach one. Additive only: nothing
@@ -3602,11 +3851,16 @@ impl RuleBodyPasses {
     }
 }
 
-fn compile_program_with_root_inner(source: &str, root: Option<&str>) -> CompileOutput {
+fn compile_program_with_root_inner(
+    source: &str,
+    root: Option<&str>,
+    semantics: ExecutionSemantics,
+) -> CompileOutput {
     let parsed = parse_program(source);
     if !parsed.diagnostics.is_empty() {
         return CompileOutput {
             ir: None,
+            typed_actions: None,
             diagnostics: parsed.diagnostics,
             warnings: Vec::new(),
         };
@@ -3627,6 +3881,7 @@ fn compile_program_with_root_inner(source: &str, root: Option<&str>) -> CompileO
     if !invoke_recursion_diagnostics.is_empty() {
         return CompileOutput {
             ir: None,
+            typed_actions: None,
             diagnostics: invoke_recursion_diagnostics,
             warnings: Vec::new(),
         };
@@ -3706,6 +3961,7 @@ fn compile_program_with_root_inner(source: &str, root: Option<&str>) -> CompileO
                         scoped,
                         workflow_inputs.clone(),
                         shared_coordination_usage.clone(),
+                        semantics,
                     )
                     .diagnostics
                 }
@@ -3738,6 +3994,7 @@ fn compile_program_with_root_inner(source: &str, root: Option<&str>) -> CompileO
         if !aggregated.is_empty() {
             return CompileOutput {
                 ir: None,
+                typed_actions: None,
                 diagnostics: aggregated,
                 warnings: Vec::new(),
             };
@@ -3745,9 +4002,15 @@ fn compile_program_with_root_inner(source: &str, root: Option<&str>) -> CompileO
     }
 
     match select_root_workflow(parsed.program, root) {
-        Ok(program) => lower_program(program, workflow_inputs, shared_coordination_usage),
+        Ok(program) => lower_program(
+            program,
+            workflow_inputs,
+            shared_coordination_usage,
+            semantics,
+        ),
         Err(diagnostics) => CompileOutput {
             ir: None,
+            typed_actions: None,
             diagnostics,
             warnings: Vec::new(),
         },
@@ -3797,6 +4060,7 @@ pub fn document_symbols(source: &str) -> Vec<DeclSymbol> {
             Item::Rule(decl) => ("rule", decl.name.name.clone(), decl.span),
             Item::Coerce(decl) => ("coerce", decl.name.name.clone(), decl.span),
             Item::Action(decl) => ("action", decl.name.name.clone(), decl.span),
+            Item::View(decl) => ("view", decl.name.name.clone(), decl.span),
             Item::Lease(decl) => ("lease", decl.name.name.clone(), decl.span),
             Item::Ledger(decl) => ("ledger", decl.name.name.clone(), decl.span),
             Item::Counter(decl) => ("counter", decl.name.name.clone(), decl.span),
@@ -4514,6 +4778,9 @@ impl IrProgram {
     pub fn to_snapshot(&self) -> String {
         let mut snapshot = String::new();
         push_line(&mut snapshot, format!("workflow {}", self.workflow));
+        if let Some(tag) = self.execution_semantics.snapshot_tag() {
+            push_line(&mut snapshot, format!("execution_semantics {tag}"));
+        }
 
         if !self.source_tags.is_empty() {
             push_line(&mut snapshot, "source_tags");
@@ -5477,20 +5744,20 @@ fn effect_contract_for_kind(
             "std.tracker",
             strings(&["release"]),
             Some("tracker.release.input"),
-            None,
+            Some("TrackerRelease"),
             strings(&["tracker.release"]),
             Vec::new(),
-            Vec::new(),
+            strings(&["effect.output"]),
             TypedOutputValidation::None,
         ),
         IrEffectKind::TrackerFinish => (
             "std.tracker",
             strings(&["finish"]),
             Some("tracker.finish.input"),
-            None,
+            Some("TrackerFinish"),
             strings(&["tracker.finish"]),
             Vec::new(),
-            Vec::new(),
+            strings(&["effect.output"]),
             TypedOutputValidation::None,
         ),
         IrEffectKind::LeaseAcquire => (
@@ -5849,257 +6116,6 @@ impl IrPrimitiveType {
     }
 }
 
-/// Post-lowering check: a turn-access grant whose resource is a declared `file store`
-/// may only grant file operations (`read`/`write`/`import`/`export`). Runs after the
-/// whole program is lowered so every file-store declaration is visible regardless of
-/// source order. Grants whose resource is NOT a declared file store are left alone —
-/// they may be package-provided resources whose operation vocabulary lives in the
-/// capability registry (validated at the construct-graph layer), so this stays
-/// zero-false-positive.
-fn validate_turn_access_grant_file_operations(ir: &IrProgram, diagnostics: &mut Vec<Diagnostic>) {
-    const FILE_OPERATIONS: [&str; 4] = ["read", "write", "import", "export"];
-    let file_stores: BTreeSet<&str> = ir
-        .file_stores
-        .iter()
-        .map(|store| store.name.as_str())
-        .collect();
-    for rule in &ir.rules {
-        for effect in &rule.metadata.effects {
-            for grant in &effect.access_grants {
-                if !file_stores.contains(grant.resource.as_str()) {
-                    continue;
-                }
-                for op in &grant.operations {
-                    if !FILE_OPERATIONS.contains(&op.operation.as_str()) {
-                        diagnostics.push(Diagnostic {
-                            code: diagnostic_code!("capability.invalid_grant_operation"),
-                            severity: Severity::Error,
-                            related: Vec::new(),
-                            fixits: Vec::new(),
-                            span: effect.span,
-                            message: format!(
-                                "rule `{}` grants `{}` on file store `{}`, which is not a file operation",
-                                rule.name, op.operation, grant.resource
-                            ),
-                            suggestion: suggest(suggest_then_keyword(
-                                &op.operation,
-                                FILE_OPERATIONS.iter().copied(),
-                                "file-store grants allow `read`, `write`, `import`, or `export`",
-                            )),
-                        });
-                    }
-                }
-            }
-        }
-    }
-}
-
-/// Post-lowering check: a turn-access grant whose resource is a declared `memory
-/// pool` (std.memory, MEM-1) may only grant memory operations
-/// (`recall`/`learn`/`curate`). Runs after the whole program is lowered so every
-/// pool declaration is visible regardless of source order. Grants whose resource
-/// is NOT a declared memory pool are left alone — they may be file stores or
-/// package-provided resources whose operation vocabulary lives elsewhere, so this
-/// stays zero-false-positive. This closes the deliberate memory-grant-validation
-/// deferral (there was no declared-pool list to key it off before MEM-1).
-fn validate_turn_access_grant_memory_operations(ir: &IrProgram, diagnostics: &mut Vec<Diagnostic>) {
-    const MEMORY_OPERATIONS: [&str; 3] = ["recall", "learn", "curate"];
-    let memory_pools: BTreeSet<&str> = ir
-        .memory_pools
-        .iter()
-        .map(|pool| pool.name.as_str())
-        .collect();
-    for rule in &ir.rules {
-        for effect in &rule.metadata.effects {
-            for grant in &effect.access_grants {
-                if !memory_pools.contains(grant.resource.as_str()) {
-                    continue;
-                }
-                for op in &grant.operations {
-                    if !MEMORY_OPERATIONS.contains(&op.operation.as_str()) {
-                        diagnostics.push(Diagnostic {
-                            code: diagnostic_code!("capability.invalid_grant_operation"),
-                            severity: Severity::Error,
-                            related: Vec::new(),
-                            fixits: Vec::new(),
-                            span: effect.span,
-                            message: format!(
-                                "rule `{}` grants `{}` on memory pool `{}`, which is not a memory operation",
-                                rule.name, op.operation, grant.resource
-                            ),
-                            suggestion: suggest(suggest_then_keyword(
-                                &op.operation,
-                                MEMORY_OPERATIONS.iter().copied(),
-                                "memory-pool grants allow `recall`, `learn`, or `curate`",
-                            )),
-                        });
-                    }
-                }
-            }
-        }
-    }
-}
-
-/// Post-lowering check: a turn-access grant on a declared `credential` may only
-/// grant operations that credential's KIND can actually perform. Runs after the
-/// whole program is lowered so every credential declaration is visible
-/// regardless of source order.
-///
-/// This is S4's argument applied to custody. `CredentialKind::supports` is
-/// enforced by the custodian, which refuses the operation at runtime — so
-/// before this, `credential k { kind ed25519 }` granted `unwrap` compiled
-/// clean and failed in production. An ed25519 key cannot decrypt, and nothing
-/// about that depends on runtime state, so the compiler is where it belongs.
-///
-/// A grant whose resource is not a declared credential is left alone, as its
-/// file-store and memory-pool siblings do, so this stays zero-false-positive.
-/// An unparseable kind is left alone too: the credential declaration's own
-/// check owns that error, and reporting it twice from here would say nothing
-/// new.
-/// A `with access to vault <name> { … }` grant names a declared vault and lists
-/// CONTAINER operations (DR-0053 §14 Amendment 2026-08-29).
-///
-/// The two refusals are the two ways the grant can mean nothing. A vault the
-/// program does not declare would reach the custodian as an unknown container
-/// at generate time; a MEMBER operation named here — `sign`, `wrap` — reads as
-/// narrowed while granting nothing, because the container grants decide what
-/// may be done TO the vault and a declaration's `allow` decides what its
-/// members may do.
-fn validate_turn_access_grant_vaults(ir: &IrProgram, diagnostics: &mut Vec<Diagnostic>) {
-    use whipplescript_custody::Operation;
-
-    let declared: BTreeSet<&str> = ir.vaults.iter().map(|vault| vault.name.as_str()).collect();
-    for rule in &ir.rules {
-        for effect in &rule.metadata.effects {
-            for grant in &effect.access_grants {
-                let Some(name) = grant.resource.strip_prefix("vault ") else {
-                    continue;
-                };
-                if !declared.contains(name) {
-                    diagnostics.push(Diagnostic {
-                        code: diagnostic_code!("type.unknown_resource"),
-                        severity: Severity::Error,
-                        related: Vec::new(),
-                        fixits: Vec::new(),
-                        span: effect.span,
-                        message: format!(
-                            "rule `{}` grants access to undeclared vault `{name}`",
-                            rule.name
-                        ),
-                        suggestion: suggest(format!(
-                            "declare it with `vault {name} {{ kind <kind>  allow [<op>, ...] }}`"
-                        )),
-                    });
-                    continue;
-                }
-                for op in &grant.operations {
-                    let Ok(operation) = Operation::parse(&op.operation) else {
-                        diagnostics.push(Diagnostic {
-                            code: diagnostic_code!("capability.invalid_grant_operation"),
-                            severity: Severity::Error,
-                            related: Vec::new(),
-                            fixits: Vec::new(),
-                            span: effect.span,
-                            message: format!(
-                                "rule `{}` grants unknown operation `{}` on vault `{name}`",
-                                rule.name, op.operation
-                            ),
-                            suggestion: suggest(format!(
-                                "a vault grant names container operations: {}",
-                                Operation::CONTAINER
-                                    .iter()
-                                    .map(|op| op.as_str())
-                                    .collect::<Vec<_>>()
-                                    .join(", ")
-                            )),
-                        });
-                        continue;
-                    };
-                    if !operation.is_container() {
-                        diagnostics.push(Diagnostic {
-                            code: diagnostic_code!("capability.invalid_narrowing"),
-                            severity: Severity::Error,
-                            related: Vec::new(),
-                            fixits: Vec::new(),
-                            span: effect.span,
-                            message: format!(
-                                "rule `{}` grants member operation `{}` on vault `{name}`, which \
-                                 is a container grant",
-                                rule.name,
-                                operation.as_str()
-                            ),
-                            suggestion: suggest(format!(
-                                "a vault grant names what may be done TO the container ({}); what \
-                                 its members may do is the vault's own `allow` list",
-                                Operation::CONTAINER
-                                    .iter()
-                                    .map(|op| op.as_str())
-                                    .collect::<Vec<_>>()
-                                    .join(", ")
-                            )),
-                        });
-                    }
-                }
-            }
-        }
-    }
-}
-
-fn validate_turn_access_grant_credential_kinds(ir: &IrProgram, diagnostics: &mut Vec<Diagnostic>) {
-    use whipplescript_custody::{CredentialKind, Operation};
-
-    let kinds: BTreeMap<&str, &str> = ir
-        .credentials
-        .iter()
-        .map(|credential| (credential.name.as_str(), credential.kind.as_str()))
-        .collect();
-    for rule in &ir.rules {
-        for effect in &rule.metadata.effects {
-            for grant in &effect.access_grants {
-                let Some(name) = grant.resource.strip_prefix("credential ") else {
-                    continue;
-                };
-                let Some(declared) = kinds.get(name) else {
-                    continue;
-                };
-                let Ok(kind) = CredentialKind::parse(declared) else {
-                    continue;
-                };
-                for op in &grant.operations {
-                    let Ok(operation) = Operation::parse(&op.operation) else {
-                        continue;
-                    };
-                    if kind.supports(operation) {
-                        continue;
-                    }
-                    let able: Vec<&str> = CredentialKind::ALL
-                        .into_iter()
-                        .filter(|candidate| candidate.supports(operation))
-                        .map(|candidate| candidate.as_str())
-                        .collect();
-                    diagnostics.push(Diagnostic {
-                        code: diagnostic_code!("capability.credential_kind_mismatch"),
-                        severity: Severity::Error,
-                        related: Vec::new(),
-                        fixits: Vec::new(),
-                        span: effect.span,
-                        message: format!(
-                            "rule `{}` grants `{}` on credential `{name}`, whose kind `{declared}` \
-                             cannot perform it",
-                            rule.name, op.operation
-                        ),
-                        suggestion: suggest(format!(
-                            "`{}` needs a credential of kind {}",
-                            op.operation,
-                            able.join(" or ")
-                        )),
-                    });
-                }
-            }
-        }
-    }
-}
-
 /// S4 (file-store default posture): a store is READ-ONLY by default — a
 /// `write`/`export` against a store with no `allow write [...]` policy will
 /// fail closed at runtime, so surface it as a check error here ("catch before
@@ -6282,12 +6298,20 @@ fn expand_source_emit_from(ir: &mut IrProgram, diagnostics: &mut Vec<Diagnostic>
 /// predicates (`held`/`contended`/`ok`/`over`) count as observers here so
 /// ordinary coordination code stays quiet, while the runtime net still catches
 /// a genuine op failure underneath them.
-fn warn_unhandled_effect_failures(ir: &IrProgram, warnings: &mut Vec<Diagnostic>) {
+fn warn_unhandled_effect_failures(
+    ir: &IrProgram,
+    typed_actions: Option<&BTreeMap<String, action_plan::resolved::TypedActionPlan>>,
+    warnings: &mut Vec<Diagnostic>,
+) {
     let service = ir
         .source_tags
         .iter()
         .any(|tag| tag.target_kind == "workflow" && tag.name == "service");
     if service {
+        return;
+    }
+    if let Some(typed_actions) = typed_actions {
+        warn_unhandled_typed_effect_failures(ir, typed_actions, warnings);
         return;
     }
     for rule in &ir.rules {
@@ -6342,12 +6366,156 @@ fn warn_unhandled_effect_failures(ir: &IrProgram, warnings: &mut Vec<Diagnostic>
                     rule.name
                 ),
                 suggestion: suggest(format!(
-                    "handle it with `after {binding} fails {{ … }}` (typed failure or recovery) \
-                     or observe every outcome with `after {binding} completes`"
+                    "handle it with `after {binding} fails {{ … }}` (typed failure or recovery), \
+                     observe every outcome with `after {binding} completes`, or add one \
+                     `on failure as problem {{ … }}` handler to the rule"
                 )),
             });
         }
     }
+}
+
+/// Managed source has one checked graph for execution and diagnostics. A leaf
+/// failure is observed when its exact result binding has a failure arm, or when
+/// it propagates through action-call boundaries to a call that has one. The
+/// binding ids make this insensitive to shadowing and repeated action calls.
+fn warn_unhandled_typed_effect_failures(
+    ir: &IrProgram,
+    typed_actions: &BTreeMap<String, action_plan::resolved::TypedActionPlan>,
+    warnings: &mut Vec<Diagnostic>,
+) {
+    for rule in &ir.rules {
+        let Some(typed) = typed_actions.get(&rule.name) else {
+            continue;
+        };
+        let plan = &typed.plan;
+        let mut rule_warnings: BTreeMap<(usize, usize, String), Diagnostic> = BTreeMap::new();
+        for (node_id, checked) in &typed.effects {
+            let node = &plan.nodes[node_id.0];
+            let action_plan::NodeKind::Statement(statement) = &node.kind else {
+                continue;
+            };
+            let body::BodyStmt::Effect(effect) = statement.as_ref() else {
+                continue;
+            };
+            let Some(binding) = effect.binding.as_deref() else {
+                continue;
+            };
+            if checked.contract.kind == IrEffectKind::TimerWait
+                || binding.starts_with(then_expand::THEN_BINDING_PREFIX)
+                || typed_operation_failure_is_observed(plan, *node_id)
+            {
+                continue;
+            }
+            let key = (node.span.start, node.span.end, binding.to_owned());
+            let call_chain = typed_action_call_chain(plan, *node_id);
+            let diagnostic = rule_warnings.entry(key).or_insert_with(|| Diagnostic {
+                code: diagnostic_code!("effect.unhandled_failure"),
+                severity: Severity::Warning,
+                related: Vec::new(),
+                fixits: Vec::new(),
+                span: node.span,
+                message: format!(
+                    "effect `{binding}`'s failure is unhandled in rule `{}`; if it fails or \
+                     times out, the instance will auto-fail with a generic reason",
+                    rule.name
+                ),
+                suggestion: suggest(if call_chain.is_empty() {
+                    format!(
+                        "handle it with `after {binding} fails {{ … }}`, observe every outcome \
+                         with `after {binding} completes`, or add one \
+                         `on failure as problem {{ … }}` handler to the rule"
+                    )
+                } else {
+                    format!(
+                        "handle it where `{binding}` is declared, or handle `fails` on the action \
+                         call through which it propagates, or add one \
+                         `on failure as problem {{ … }}` handler to the rule"
+                    )
+                }),
+            });
+            for (span, action) in call_chain {
+                if !diagnostic
+                    .related
+                    .iter()
+                    .any(|related| related.span == span && related.message.contains(&action))
+                {
+                    diagnostic.related.push(RelatedInfo {
+                        span,
+                        message: format!("action `{action}` is called here"),
+                    });
+                }
+            }
+        }
+        warnings.extend(rule_warnings.into_values());
+    }
+}
+
+fn typed_operation_failure_is_observed(
+    plan: &action_plan::ActionPlan,
+    mut operation: action_plan::NodeId,
+) -> bool {
+    loop {
+        if plan.nodes.iter().enumerate().any(|(node, candidate)| {
+            matches!(candidate.kind, action_plan::NodeKind::OnFailure { .. })
+                && plan
+                    .protected_operation_nodes(action_plan::NodeId(node))
+                    .contains(&operation)
+        }) {
+            return true;
+        }
+        if plan.nodes[operation.0].result.is_some_and(|result| {
+            plan.nodes.iter().any(|node| {
+                matches!(
+                    node.kind,
+                    action_plan::NodeKind::After { observed, predicate, .. }
+                        if observed == result && typed_failure_observer(predicate)
+                )
+            })
+        }) {
+            return true;
+        }
+        let Some(scope) = plan.blocks[plan.nodes[operation.0].block.0].scope else {
+            return false;
+        };
+        let Some(parent_call) = plan.scopes[scope.0].parent_call else {
+            return false;
+        };
+        operation = parent_call;
+    }
+}
+
+fn typed_failure_observer(predicate: body::AfterPredicate) -> bool {
+    matches!(
+        predicate,
+        body::AfterPredicate::Fails
+            | body::AfterPredicate::TimedOut
+            | body::AfterPredicate::Cancelled
+            | body::AfterPredicate::Completes
+            | body::AfterPredicate::Held
+            | body::AfterPredicate::Contended
+            | body::AfterPredicate::Ok
+            | body::AfterPredicate::Over
+            | body::AfterPredicate::Promoted
+            | body::AfterPredicate::Conflicted
+    )
+}
+
+fn typed_action_call_chain(
+    plan: &action_plan::ActionPlan,
+    operation: action_plan::NodeId,
+) -> Vec<(SourceSpan, String)> {
+    let mut calls = Vec::new();
+    let mut scope = plan.blocks[plan.nodes[operation.0].block.0].scope;
+    while let Some(scope_id) = scope {
+        let owner = &plan.scopes[scope_id.0];
+        let Some(call) = owner.parent_call else {
+            break;
+        };
+        calls.push((plan.nodes[call.0].span, owner.action.clone()));
+        scope = plan.blocks[plan.nodes[call.0].block.0].scope;
+    }
+    calls
 }
 
 /// The tags that CHANGE WHAT THE COMPILER DOES, as opposed to the free-form
@@ -7424,6 +7592,16 @@ fn pattern_body_admission(
             message: "mark declarations are not allowed in pattern bodies".to_owned(),
             suggestion: suggest("declare marks at source top level".to_owned()),
         }),
+        Item::View(view) => Some(Diagnostic {
+            code: diagnostic_code!("construct.forbidden_pattern_item"),
+            severity: Severity::Error,
+            related: Vec::new(),
+            fixits: Vec::new(),
+            span: view.span,
+            message: "parameterized view declarations are not allowed in pattern bodies"
+                .to_owned(),
+            suggestion: suggest("declare reusable views at source top level".to_owned()),
+        }),
         Item::Rule(rule) => pattern_rule_terminal_span(rule).map(|span| Diagnostic {
             code: diagnostic_code!("construct.pattern_terminal_action"),
             severity: Severity::Error,
@@ -7539,6 +7717,9 @@ fn expand_pattern_item(
         Item::Action(action) => {
             Some((format!("action:{}", action.name.name), Item::Action(action)))
         }
+        // Parameterized views are refused by `pattern_body_admission`; silently
+        // dropping a declaration here would leave expanded callers unresolved.
+        Item::View(_) => None,
         Item::Harness(mut harness) => {
             let name = rename_ident(harness.name, alias, local_names);
             let generated = format!("harness:{}", name.name);
@@ -8033,8 +8214,11 @@ impl SemanticContext {
         let mut agent_returns = BTreeMap::new();
         let mut coerce_outputs = BTreeMap::new();
         let mut coerce_params = BTreeMap::new();
+        let mut parameterized_views = BTreeMap::new();
+        let mut diagnostics: Vec<Diagnostic> = Vec::new();
         let mut leases = BTreeSet::new();
         let mut ledgers = BTreeSet::new();
+        let mut ledger_entries = BTreeMap::new();
         let mut counters = BTreeSet::new();
         let mut channels = BTreeSet::new();
         let mut use_names = BTreeSet::new();
@@ -8074,11 +8258,43 @@ impl SemanticContext {
                     coerce_outputs.insert(coerce.name.name.clone(), coerce.output.clone());
                     coerce_params.insert(coerce.name.name.clone(), coerce.params.clone());
                 }
+                Item::View(view) => {
+                    if matches!(
+                        view.name.name.as_str(),
+                        "count" | "exists" | "empty" | "outcome"
+                    ) {
+                        let diagnostic = Diagnostic::error(
+                            diagnostic_code!("construct.duplicate_declaration"),
+                            view.name.span,
+                            format!(
+                                "view name `{}` is reserved by the expression kernel",
+                                view.name.name
+                            ),
+                        )
+                        .with_suggestion(
+                            "choose a name other than `count`, `exists`, `empty`, or `outcome`",
+                        );
+                        diagnostics.push(diagnostic);
+                    } else if let Some(first) =
+                        parameterized_views.insert(view.name.name.clone(), view.clone())
+                    {
+                        let diagnostic = Diagnostic::error(
+                            diagnostic_code!("construct.duplicate_declaration"),
+                            view.name.span,
+                            format!("view `{}` is declared more than once", view.name.name),
+                        )
+                        .with_related(first.name.span, "first view declared here")
+                        .with_suggestion("rename one declaration or combine the view bodies");
+                        diagnostics.push(diagnostic);
+                    }
+                }
                 Item::Lease(lease) => {
                     leases.insert(lease.name.name.clone());
                 }
                 Item::Ledger(ledger) => {
                     ledgers.insert(ledger.name.name.clone());
+                    ledger_entries
+                        .insert(ledger.name.name.clone(), ledger.entry_schema.name.clone());
                 }
                 Item::Counter(counter) => {
                     counters.insert(counter.name.name.clone());
@@ -8120,6 +8336,14 @@ impl SemanticContext {
         }
 
         Self {
+            workflow_terminals: program
+                .items
+                .iter()
+                .filter_map(|item| match item {
+                    Item::WorkflowContract(contract) => Some(contract.clone()),
+                    _ => None,
+                })
+                .collect(),
             workflow: program
                 .workflow
                 .as_ref()
@@ -8131,9 +8355,12 @@ impl SemanticContext {
             agent_returns,
             coerce_outputs,
             coerce_params,
+            parameterized_views,
+            parameterized_view_diagnostics: diagnostics,
             workflow_inputs,
             leases,
             ledgers,
+            ledger_entries,
             counters,
             channels,
             channel_providers,
@@ -8183,33 +8410,37 @@ fn collect_workflow_input_surfaces(program: &Program) -> BTreeMap<String, Workfl
 }
 
 fn collect_shared_coordination_usage(program: &Program) -> Vec<IrSharedCoordinationUsage> {
-    let global_shared = shared_coordination_declarations(&program.items);
+    let roots: Vec<_> = if let Some(workflow) = &program.workflow {
+        vec![workflow.name.as_str()]
+    } else {
+        program
+            .workflows
+            .iter()
+            .map(|workflow| workflow.name.name.as_str())
+            .collect()
+    };
     let mut usage: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-
-    let mut record_workflow = |workflow_name: &str, local_items: &[Item]| {
-        let mut shared = global_shared.clone();
-        shared.extend(shared_coordination_declarations(local_items));
+    for root in roots {
+        // Use the same scope and pattern owners as compilation. Their actual
+        // diagnostics still belong to the compiler; this census is consumed
+        // only after those source checks succeed.
+        let Ok(selected) = select_root_workflow(program.clone(), Some(root)) else {
+            continue;
+        };
+        let (selected, _) = expand_pattern_applications(selected, &mut Vec::new());
+        let shared = shared_coordination_declarations(&selected.items);
         if shared.is_empty() {
-            return;
+            continue;
         }
-        let principal = format!("workflow:local/{workflow_name}");
-        for resource in coordination_resources_used_by_items(&program.items)
-            .into_iter()
-            .chain(coordination_resources_used_by_items(local_items))
-        {
+        for resource in coordination_resources_used_by_items(&selected.items) {
             if shared.contains(&resource) {
-                usage.entry(resource).or_default().insert(principal.clone());
+                usage
+                    .entry(resource)
+                    .or_default()
+                    .insert(format!("workflow:local/{root}"));
             }
         }
-    };
-
-    if let Some(workflow) = &program.workflow {
-        record_workflow(&workflow.name, &[]);
     }
-    for workflow in &program.workflows {
-        record_workflow(&workflow.name.name, &workflow.items);
-    }
-
     usage
         .into_iter()
         .map(|(resource, principals)| IrSharedCoordinationUsage {
@@ -8232,13 +8463,40 @@ fn shared_coordination_declarations(items: &[Item]) -> BTreeSet<String> {
 }
 
 fn coordination_resources_used_by_items(items: &[Item]) -> BTreeSet<String> {
+    let actions: BTreeMap<_, _> = items
+        .iter()
+        .filter_map(|item| match item {
+            Item::Action(action) => Some((action.name.name.as_str(), action)),
+            _ => None,
+        })
+        .collect();
     let mut resources = BTreeSet::new();
+    let mut calls = BTreeSet::new();
     for item in items {
         let Item::Rule(rule) = item else {
             continue;
         };
-        let (body, _) = body::parse_rule_body(&rule.body.text, rule.body.body_base());
-        collect_coordination_resources_from_statements(&body.statements, &mut resources);
+        let (body, _) = body::parse_composed_rule_body(&rule.body.text, rule.body.body_base());
+        collect_coordination_resources_from_statements(
+            &body.statements,
+            &mut resources,
+            &mut calls,
+        );
+    }
+    let mut visited = BTreeSet::new();
+    while let Some(name) = calls.pop_first() {
+        if !visited.insert(name.clone()) {
+            continue;
+        }
+        let Some(action) = actions.get(name.as_str()) else {
+            continue;
+        };
+        let (body, _) = body::parse_action_body(&action.body.text, action.body.body_base());
+        collect_coordination_resources_from_statements(
+            &body.statements,
+            &mut resources,
+            &mut calls,
+        );
     }
     resources
 }
@@ -8246,9 +8504,26 @@ fn coordination_resources_used_by_items(items: &[Item]) -> BTreeSet<String> {
 fn collect_coordination_resources_from_statements(
     statements: &[body::BodyStmt],
     resources: &mut BTreeSet<String>,
+    calls: &mut BTreeSet<String>,
 ) {
     for statement in statements {
         match statement {
+            body::BodyStmt::Composition(composition) => match composition {
+                body::CompositionStmt::Call { name, .. } => {
+                    calls.insert(name.clone());
+                }
+                body::CompositionStmt::Then { operation, .. } => {
+                    collect_coordination_resources_from_statements(
+                        std::slice::from_ref(operation),
+                        resources,
+                        calls,
+                    )
+                }
+                body::CompositionStmt::OnFailure { body, .. } => {
+                    collect_coordination_resources_from_statements(body, resources, calls)
+                }
+                body::CompositionStmt::Return(_) | body::CompositionStmt::Fail(_) => {}
+            },
             body::BodyStmt::Effect(effect) => match &effect.kind {
                 body::BodyEffectKind::LeaseAcquire { resource, .. } => {
                     resources.insert(resource.clone());
@@ -8262,15 +8537,19 @@ fn collect_coordination_resources_from_statements(
                 _ => {}
             },
             body::BodyStmt::After(after) => {
-                collect_coordination_resources_from_statements(&after.body, resources);
+                collect_coordination_resources_from_statements(&after.body, resources, calls);
             }
             body::BodyStmt::Region(region) => {
-                collect_coordination_resources_from_statements(&region.body, resources);
-                collect_coordination_resources_from_statements(&region.lapse_body, resources);
+                collect_coordination_resources_from_statements(&region.body, resources, calls);
+                collect_coordination_resources_from_statements(
+                    &region.lapse_body,
+                    resources,
+                    calls,
+                );
             }
             body::BodyStmt::Case(case_stmt) => {
                 for branch in &case_stmt.branches {
-                    collect_coordination_resources_from_statements(&branch.body, resources);
+                    collect_coordination_resources_from_statements(&branch.body, resources, calls);
                 }
             }
             body::BodyStmt::Record(_)
@@ -8813,7 +9092,10 @@ impl SchemaIndex {
         index.insert_class(
             "TerminalOutcome",
             [
-                ("tag", string_ty()),
+                (
+                    "tag",
+                    literal_union_ty(&["Completed", "Failed", "TimedOut", "Cancelled"]),
+                ),
                 ("status", string_ty()),
                 ("summary", string_ty()),
                 ("effect_id", string_ty()),
@@ -9164,7 +9446,7 @@ pub const STD_PACKAGE_IDS: &[&str] = &[
 /// items lower so agent order does not matter): every member names a
 /// declared agent, and membership is single-valued — one stream per
 /// agent, so the sync topology stays a tree.
-fn validate_streams(ir: &IrProgram, diagnostics: &mut Vec<Diagnostic>) {
+fn validate_stream_memberships(ir: &IrProgram, diagnostics: &mut Vec<Diagnostic>) {
     // (agent, holding stream, span of the membership that claimed it). The span
     // is the third element because the message names the holding stream and then
     // leaves the reader to go and find where it lists this agent.
@@ -9217,6 +9499,10 @@ fn validate_streams(ir: &IrProgram, diagnostics: &mut Vec<Diagnostic>) {
             memberships.push((member, &stream.name, *span));
         }
     }
+}
+
+fn validate_streams(ir: &IrProgram, diagnostics: &mut Vec<Diagnostic>) {
+    validate_stream_memberships(ir, diagnostics);
     // `on stream <name>` on a tell must name a declared stream — the
     // per-turn exception cannot invent topology.
     for rule in &ir.rules {
@@ -9815,7 +10101,8 @@ fn validate_improve_declarations(ir: &IrProgram, diagnostics: &mut Vec<Diagnosti
 /// (owned; hermetic context, full provenance, reproducible). `Delegated` = a foreign
 /// runtime WhippleScript invokes, which assembles its own context. The guarantee is
 /// two-valued, so the class is too.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum HarnessClass {
     Managed,
     Delegated,
@@ -10631,7 +10918,7 @@ fn validate_effectful_rule_recursion(
     // `validate_effectful_self_trigger`'s diagnostic. Its self-edge is dropped
     // here so the same defect is not reported twice under two names.
     let preserves_trigger = |index: usize, fact: &String| {
-        rules[index].metadata.fact_reads.contains(fact)
+        dependency_read_facts(&rules[index].metadata).contains(fact)
             && !rules[index].metadata.fact_consumes.contains(fact)
     };
 
@@ -11104,15 +11391,7 @@ fn dependency_read_facts(metadata: &IrRuleMetadata) -> Vec<String> {
     metadata
         .fact_reads
         .iter()
-        .map(|read| {
-            let Some(pattern) = read.strip_prefix("pattern:fact ") else {
-                return read.clone();
-            };
-            match pattern.split_whitespace().next() {
-                Some(name) if name.starts_with(char::is_uppercase) => format!("schema:{name}"),
-                _ => read.clone(),
-            }
-        })
+        .map(|read| fact_flow::normalize_read(read))
         .collect()
 }
 
@@ -11234,45 +11513,27 @@ fn tracker_resource_releases(
 }
 
 fn build_rule_dependencies(rules: &[IrRule]) -> Vec<IrRuleDependency> {
-    let reads_by_rule = rules
+    let footprints: Vec<_> = rules
         .iter()
-        .map(|rule| dependency_read_facts(&rule.metadata))
-        .collect::<Vec<_>>();
-    let mut dependencies = Vec::new();
-    for producer in rules {
-        // DR-0085: a resource coupling is a rule dependency on the same terms as
-        // a schema fact. It is never an `immediate_fact_writes` entry — a `file`
-        // is an effect, so the issue does not exist until a terminal arrives —
-        // which is why the default-pacing rule in
-        // `validate_effectful_rule_recursion` skips these edges and only a
-        // `@bounded` workflow, which promised to settle, counts them.
-        let produced = producer
-            .metadata
-            .fact_writes
-            .iter()
-            .chain(&producer.metadata.resource_writes);
-        for produced_fact in produced {
-            for (consumer, reads) in rules.iter().zip(&reads_by_rule) {
-                if reads.contains(produced_fact)
-                    || consumer.metadata.resource_reads.contains(produced_fact)
-                {
-                    dependencies.push(IrRuleDependency {
-                        producer: producer.name.clone(),
-                        consumer: consumer.name.clone(),
-                        fact: produced_fact.clone(),
-                    });
-                }
-            }
-        }
-    }
-    dependencies.sort_by(|left, right| {
-        (&left.producer, &left.consumer, &left.fact).cmp(&(
-            &right.producer,
-            &right.consumer,
-            &right.fact,
-        ))
-    });
-    dependencies
+        .map(|rule| rule_dependencies::Footprint {
+            name: &rule.name,
+            reads: rule
+                .metadata
+                .fact_reads
+                .iter()
+                .chain(&rule.metadata.resource_reads)
+                .cloned()
+                .collect(),
+            writes: rule
+                .metadata
+                .fact_writes
+                .iter()
+                .chain(&rule.metadata.resource_writes)
+                .cloned()
+                .collect(),
+        })
+        .collect();
+    rule_dependencies::build(&footprints)
 }
 
 /// `send via <channel>` (std.messaging) must name a declared `channel`. The
@@ -11465,129 +11726,14 @@ const EVIDENCE_ONLY_TURN_FACTS: [&str; 3] = [
     "agent.turn.artifact_captured",
 ];
 
-/// Structural well-formedness of access grants (`with access to <resource> { … }`):
-/// a grant must grant at least one operation, and a single effect must not list the
-/// same resource twice (merge them). The deeper "required
-/// Resource/Operation/Capability ports" validation against the capability registry
-/// is a separate construct-graph-layer concern, so this stays registry-independent
-/// and zero-false-positive.
 fn validate_turn_access_grants(
     rule: &RuleDecl,
     metadata: &IrRuleMetadata,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
+    let owner = format!("rule `{}`", rule.name.name);
     for effect in &metadata.effects {
-        if effect.access_grants.is_empty() {
-            continue;
-        }
-        let mut seen = BTreeSet::new();
-        for grant in &effect.access_grants {
-            if grant.operations.is_empty() {
-                diagnostics.push(Diagnostic {
-                    code: diagnostic_code!("construct.missing_requirement"),
-                    severity: Severity::Error,
-                    related: Vec::new(),
-                    fixits: Vec::new(),
-                    span: effect.span,
-                    message: format!(
-                        "rule `{}` has a `with access to {}` grant that grants no operations",
-                        rule.name.name, grant.resource
-                    ),
-                    suggestion: suggest(
-                        "list at least one operation in the grant block, or drop the grant"
-                            .to_owned(),
-                    ),
-                });
-            }
-            validate_credential_grant_classes(rule, effect.span, grant, diagnostics);
-            if !seen.insert(grant.resource.clone()) {
-                diagnostics.push(Diagnostic {
-                    code: diagnostic_code!("capability.duplicate_grant"),
-                    severity: Severity::Error,
-                    related: Vec::new(),
-                    fixits: Vec::new(),
-                    span: effect.span,
-                    message: format!(
-                        "rule `{}` lists access resource `{}` more than once on one effect",
-                        rule.name.name, grant.resource
-                    ),
-                    suggestion: suggest(
-                        "merge the grant clauses for a resource into a single block".to_owned(),
-                    ),
-                });
-            }
-        }
-    }
-}
-
-/// DR-0053 §14 as extended by DR-0074 §2: each custody operation declares how
-/// it may be narrowed, and a grant that narrows it the wrong way is a check
-/// error rather than a clause that reads as narrowed while meaning nothing.
-///
-/// Only `credential` grants are classed here. Every other resource keeps its
-/// own vocabulary, and an operation name that happens to collide with a custody
-/// one must not be dragged into custody's rules.
-fn validate_credential_grant_classes(
-    rule: &RuleDecl,
-    span: SourceSpan,
-    grant: &IrAccessGrant,
-    diagnostics: &mut Vec<Diagnostic>,
-) {
-    use whipplescript_custody::{GrantClass, Operation};
-
-    let Some(credential) = grant.resource.strip_prefix("credential ") else {
-        return;
-    };
-    for op in &grant.operations {
-        let Ok(operation) = Operation::parse(&op.operation) else {
-            continue;
-        };
-        let class = operation.grant_class();
-        let (bad, detail) = match class {
-            GrantClass::Narrowable => (op.globs.is_empty(), "names no glob list"),
-            GrantClass::TypeNarrowed => match (&op.target, op.globs.is_empty()) {
-                (None, _) => (true, "names no type"),
-                (Some(_), false) => (true, "carries a glob list as well as a type"),
-                (Some(_), true) => (false, ""),
-            },
-            GrantClass::NonNarrowable => (
-                op.target.is_some() || !op.globs.is_empty(),
-                "carries a narrowing clause",
-            ),
-        };
-        if !bad {
-            continue;
-        }
-        diagnostics.push(Diagnostic {
-            code: diagnostic_code!("capability.invalid_narrowing"),
-            severity: Severity::Error,
-            related: Vec::new(),
-            fixits: Vec::new(),
-            span,
-            message: format!(
-                "rule `{}` grants `{}` on credential `{credential}` but {detail}: this operation takes {}",
-                rule.name.name,
-                op.operation,
-                class.requirement()
-            ),
-            suggestion: suggest(match class {
-                GrantClass::Narrowable => format!(
-                    "narrow it, as in `{} [\"host/path/*\"]`",
-                    op.operation
-                ),
-                // Failing closed is the point: reading a bare `unwrap` as
-                // "every type" would preserve exactly the over-grant DR-0074
-                // exists to remove.
-                GrantClass::TypeNarrowed => format!(
-                    "name the type it may open, as in `{} for PatientRecord`",
-                    op.operation
-                ),
-                GrantClass::NonNarrowable => format!(
-                    "name it bare, as in `{}`",
-                    op.operation
-                ),
-            }),
-        });
+        effect_grants::validate(&owner, effect.span, &effect.access_grants, diagnostics);
     }
 }
 
@@ -12001,6 +12147,20 @@ fn collect_statement_roots(statements: &[body::BodyStmt], out: &mut BTreeSet<Str
     }
     for statement in statements {
         match statement {
+            body::BodyStmt::Composition(composition) => match composition {
+                body::CompositionStmt::Call { arguments, .. } => {
+                    for argument in arguments {
+                        roots_in_expr(&argument.source, out);
+                    }
+                }
+                body::CompositionStmt::Return(value) | body::CompositionStmt::Fail(value) => {
+                    roots_in_expr(&value.source, out)
+                }
+                body::CompositionStmt::Then { operation, .. } => {
+                    collect_statement_roots(std::slice::from_ref(operation), out)
+                }
+                body::CompositionStmt::OnFailure { body, .. } => collect_statement_roots(body, out),
+            },
             body::BodyStmt::Record(record) => roots_in_fields(&record.fields, out),
             body::BodyStmt::Done {
                 binding,
@@ -12065,31 +12225,15 @@ fn validate_effectful_self_trigger(
     metadata: &IrRuleMetadata,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
-    if metadata.effects.is_empty() {
-        return;
-    }
-
-    for written_fact in &metadata.fact_writes {
-        if metadata.fact_reads.contains(written_fact)
-            && !metadata.fact_consumes.contains(written_fact)
-        {
-            diagnostics.push(Diagnostic {
-                code: diagnostic_code!("effect.unconsumed_trigger"),
-                severity: Severity::Error,
-                related: Vec::new(),
-                fixits: Vec::new(),
-                span: rule.body.span,
-                message: format!(
-                    "effectful rule `{}` preserves trigger fact `{written_fact}`",
-                    rule.name.name
-                ),
-                suggestion: suggest(
-                    "consume or advance the triggering fact, or move the next effect behind an external completion event"
-                        .to_owned(),
-                ),
-            });
-        }
-    }
+    fact_flow::validate_self_trigger(
+        &rule.name.name,
+        rule.body.span,
+        !metadata.effects.is_empty(),
+        &dependency_read_facts(metadata),
+        &metadata.fact_writes,
+        &metadata.fact_consumes,
+        diagnostics,
+    );
 }
 
 fn binding_types_for_rule(rule: &RuleDecl) -> BTreeMap<String, String> {
@@ -12609,6 +12753,9 @@ fn validate_view_body(
     let name = &rule.name.name;
     for statement in statements {
         match statement {
+            body::BodyStmt::Composition(composition) => {
+                refuse_unexpanded_composition(composition, diagnostics)
+            }
             // The whole of a view's surface. The `case` here matches typed
             // alternatives, as it does anywhere else — a comparison belongs in
             // the view's `when … where` guard.
@@ -12721,82 +12868,11 @@ fn analyze_rule(
         ..IrRuleMetadata::default()
     };
     let mut seen_bindings = BTreeSet::new();
-    let mut binding_types = BTreeMap::new();
+    let mut binding_types = rule_roots::bindings(rule, semantic, diagnostics);
     // Bindings whose schema is declared inside a CHILD workflow (`after <invoke>
     // succeeds/fails/reaches as x`). Their field paths resolve in that child's
     // index, not this one — see `SchemaScopes`.
     let mut foreign_schemas: BTreeMap<String, String> = BTreeMap::new();
-    for when in &rule.whens {
-        // A pattern that binds (`... as x`) but maps to no known readiness
-        // form would otherwise be a silently-dead rule.
-        let (pattern_text, _) = split_when_guard(&when.text);
-        if binding_after_as(pattern_text).is_some()
-            && binding_from_when(&when.text).is_none()
-            && !pattern_text.ends_with(" is available")
-        {
-            diagnostics.push(Diagnostic {
-                code: diagnostic_code!("parse.unsupported_when_pattern"),
-                severity: Severity::Error,
-                related: Vec::new(),
-                fixits: Vec::new(),
-                span: when.span,
-                message: format!(
-                    "rule `{}` has unknown readiness pattern `{pattern_text}`",
-                    rule.name.name
-                ),
-                suggestion: suggest(
-                    "match a class (`when Class as x`) or a runtime fact (`when fact <name> as x`)"
-                        .to_owned(),
-                ),
-            });
-        }
-        if let Some((binding, schema)) = binding_from_when(&when.text) {
-            validate_binding_name(rule, &binding, when.span, diagnostics);
-            if !schema.contains('.') && !semantic.schemas.class_exists(&schema) {
-                let suggestion = suggest_otherwise(
-                    &schema,
-                    semantic.schemas.classes.keys(),
-                    format!("declare `class {schema}` before matching it"),
-                );
-                diagnostics.push(Diagnostic {
-                    code: diagnostic_code!("type.unknown_schema"),
-                    severity: Severity::Error,
-                    related: Vec::new(),
-                    fixits: Vec::new(),
-                    span: when.span,
-                    message: format!("rule `{}` matches unknown class `{schema}`", rule.name.name),
-                    suggestion: suggest(suggestion),
-                });
-            }
-            // The bare dotted form is the typed signal reaction
-            // (spec/event-ingress.md): it requires a declared `signal`;
-            // undeclared dotted facts keep the untyped `when fact` form.
-            if schema.contains('.')
-                && !pattern_text.trim_start().starts_with("fact ")
-                && !semantic.schemas.events.contains(&schema)
-            {
-                diagnostics.push(Diagnostic {
-                    code: diagnostic_code!("type.unknown_signal"),
-                    severity: Severity::Error,
-                    related: Vec::new(),
-                    fixits: Vec::new(),
-                    span: when.span,
-                    message: format!(
-                        "rule `{}` reacts to undeclared signal `{schema}`",
-                        rule.name.name
-                    ),
-                    suggestion: suggest(suggest_otherwise(
-                        &schema,
-                        semantic.schemas.events.iter(),
-                        format!(
-                            "declare `signal {schema} {{ ... }}` for a typed reaction, or use `when fact {schema} as ...` for an untyped one"
-                        ),
-                    )),
-                });
-            }
-            binding_types.insert(binding, schema);
-        }
-    }
     let mut effect_payload_types = collect_effect_payload_types(rule, semantic, diagnostics);
     // `exec ... -> Schema as binding` is parsed from the AST (the command text
     // can itself contain `->`/` as `, so a text scan is unsafe), giving its
@@ -13096,47 +13172,13 @@ fn analyze_rule(
             .iter()
             .filter_map(|event| event.split_once('.').map(|(family, _)| family.to_owned())),
     );
-    for when in &rule.whens {
-        if let (_, Some(guard)) = split_when_guard(&when.text) {
-            // The guard is a slice of the `when` clause, and the clause is a
-            // verbatim slice of the file when the parser cut it from one, so a
-            // finding inside the guard can name the guard rather than the whole
-            // clause (D10). A synthesized clause records no origin and every
-            // finding lands on the clause, exactly as before.
-            let guard_anchor = when_guard_anchor(when, guard);
-            validate_expression(
-                rule,
-                guard,
-                guard_anchor,
-                semantic,
-                &binding_types,
-                "guard",
-                diagnostics,
-            );
-            validate_known_field_paths(
-                rule,
-                guard,
-                guard_anchor,
-                semantic,
-                &binding_types,
-                &body_roots,
-                diagnostics,
-            );
-            if let Some(expr) = lower_expression(guard, when.span) {
-                metadata
-                    .projection_reads
-                    .extend(collect_projection_reads(&expr.expr));
-            }
-        }
-        validate_availability_when(
-            rule,
-            &when.text,
-            when.span,
-            semantic,
-            &binding_types,
-            diagnostics,
-        );
-    }
+    metadata.projection_reads.extend(rule_roots::guards(
+        rule,
+        semantic,
+        &binding_types,
+        &body_roots,
+        diagnostics,
+    ));
     // The passes below overlap on purpose; see `RuleBodyPasses` for what that
     // costs the reader and why deduplicating per pass is not the same thing as
     // deduplicating the finished list.
@@ -13194,6 +13236,7 @@ fn analyze_rule(
         &binding_types,
         diagnostics,
     );
+    validate_lease_declarations(rule, &body_ast.statements, semantic, diagnostics);
     validate_coordination_discipline(rule, &body_ast.statements, diagnostics);
     // `redact <source> keep [..] as <out>`: the source must resolve to a known
     // schema and every kept field must exist on it (fail-closed).
@@ -13500,7 +13543,7 @@ fn analyze_rule(
                 on_stream: None,
                 selection_source: None,
                 transport_onto: None,
-                resource: None,
+                resources: Vec::new(),
                 agent: None,
                 coerce_target: None,
                 prompt_provider: None,
@@ -13845,51 +13888,21 @@ fn collect_provenance_metadata(
                     .extend(roots);
             }
             body::BodyStmt::Effect(effect) => {
-                // DR-0074 §3: an `open`'s output is the plaintext of the
-                // envelope it was given, so it carries that envelope's
-                // provenance exactly.
-                if let body::BodyEffectKind::ConstructCapabilityCall {
-                    target_capability,
-                    fields,
-                    ..
-                } = &effect.kind
+                if let (Some(binding), Some(inputs)) =
+                    (&effect.binding, effect.kind.carried_input_expressions())
                 {
-                    if target_capability == CUSTODY_UNWRAP_CAPABILITY {
-                        if let (Some(binding), Some(envelope)) = (
-                            effect.binding.as_ref(),
-                            fields
-                                .iter()
-                                .find(|field| field.name == OPEN_ENVELOPE_SLOT)
-                                .map(|field| field.source.as_str()),
-                        ) {
-                            let mut roots = BTreeSet::new();
-                            if let Ok(expr) = parse_expression(envelope) {
-                                collect_expr_binding_roots(&expr, &mut roots);
-                            } else {
-                                collect_template_binding_roots(envelope, &mut roots);
-                            }
-                            carried_input_roots
-                                .entry(binding.clone())
-                                .or_default()
-                                .extend(roots);
+                    let mut roots = BTreeSet::new();
+                    for input in inputs {
+                        if let Ok(expr) = parse_expression(input) {
+                            collect_expr_binding_roots(&expr, &mut roots);
+                        } else {
+                            collect_template_binding_roots(input, &mut roots);
                         }
                     }
-                }
-                if let body::BodyEffectKind::Coerce { args, .. } = &effect.kind {
-                    if let Some(binding) = &effect.binding {
-                        let mut roots = BTreeSet::new();
-                        for arg in args {
-                            if let Ok(expr) = parse_expression(arg) {
-                                collect_expr_binding_roots(&expr, &mut roots);
-                            } else {
-                                collect_template_binding_roots(arg, &mut roots);
-                            }
-                        }
-                        carried_input_roots
-                            .entry(binding.clone())
-                            .or_default()
-                            .extend(roots);
-                    }
+                    carried_input_roots
+                        .entry(binding.clone())
+                        .or_default()
+                        .extend(roots);
                 }
             }
             body::BodyStmt::After(after) => {
@@ -15473,7 +15486,7 @@ fn ir_field(name: &str, ty: IrType) -> IrClassField {
 
 /// Lower parsed access grants to IR for effects that carry authority-narrowing
 /// metadata (`tell` turns and `invoke` start grants).
-fn ir_access_grants_for_body(kind: &body::BodyEffectKind) -> Vec<IrAccessGrant> {
+pub fn ir_access_grants_for_body(kind: &body::BodyEffectKind) -> Vec<IrAccessGrant> {
     match kind {
         body::BodyEffectKind::Tell { access_grants, .. }
         | body::BodyEffectKind::Invoke { access_grants, .. }
@@ -16052,6 +16065,25 @@ fn validate_http_requests(
                 validate_http_requests(rule, &region.body, declared_credentials, diagnostics);
                 validate_http_requests(rule, &region.lapse_body, declared_credentials, diagnostics);
             }
+            // A composition nests statements too, and this walk is about
+            // reaching every request wherever it is written: `on failure`
+            // carries a body and `then` carries one operation. Listing them
+            // with the leaves below would leave a request inside a recovery
+            // handler naming no credential, with nothing saying so.
+            body::BodyStmt::Composition(composition) => match composition {
+                body::CompositionStmt::OnFailure { body, .. } => {
+                    validate_http_requests(rule, body, declared_credentials, diagnostics)
+                }
+                body::CompositionStmt::Then { operation, .. } => validate_http_requests(
+                    rule,
+                    std::slice::from_ref(operation.as_ref()),
+                    declared_credentials,
+                    diagnostics,
+                ),
+                body::CompositionStmt::Call { .. }
+                | body::CompositionStmt::Return(_)
+                | body::CompositionStmt::Fail(_) => {}
+            },
             body::BodyStmt::Record(_)
             | body::BodyStmt::Done { .. }
             | body::BodyStmt::Terminal(_)
@@ -16946,13 +16978,14 @@ fn walk_effects(
                     .binding
                     .clone()
                     .unwrap_or_else(|| format!("effect{counter}"));
+                let contract = effect_contract::Contract::from_statement(effect);
                 // A `renew` naming a claim binding lowers to `tracker.renew`;
                 // otherwise it stays the coord `lease.renew` its parser produced.
                 let kind = match &effect.kind {
                     body::BodyEffectKind::LeaseRenew {
                         acquire_binding, ..
                     } if claim_bindings.contains(acquire_binding) => IrEffectKind::TrackerRenew,
-                    other => ir_effect_kind_for_body(other),
+                    _ => contract.kind.clone(),
                 };
                 for (upstream, predicate, _arm) in after_stack.iter() {
                     dependencies.push(IrEffectDependency {
@@ -16963,91 +16996,40 @@ fn walk_effects(
                 }
                 let idempotency_key =
                     effect_idempotency_key(rule_name, &id, &kind, &effect.binding);
-                let mut required_capabilities = effect.requires.clone();
-                match &effect.kind {
-                    body::BodyEffectKind::Call { capability, .. } => {
-                        required_capabilities.push(capability.clone());
-                    }
-                    body::BodyEffectKind::ConstructCapabilityCall {
-                        target_capability, ..
-                    } => {
-                        required_capabilities.push(target_capability.clone());
-                    }
-                    body::BodyEffectKind::Prompt {
-                        result_type: Some(result_type),
-                        ..
-                    } => {
-                        if let Some(capability) = media_generate_capability(result_type) {
-                            required_capabilities.push(capability);
-                        }
-                    }
-                    _ => {}
-                }
-                required_capabilities.sort();
-                required_capabilities.dedup();
-                let construct_use = construct_use_for_body(&effect.kind);
-                let access_grants = ir_access_grants_for_body(&effect.kind);
-                let turn_skills = turn_skills_for_body(&effect.kind);
-                let prompt_result_type = prompt_result_type_for_body(&effect.kind);
-                let on_stream = on_stream_for_body(&effect.kind);
-                let (selection_source, transport_onto) = vcs_selective_for_body(&effect.kind);
-                let resource = resource_for_body(&effect.kind, binding_resources);
-                let agent = agent_for_body(&effect.kind);
-                let coerce_target = coerce_target_for_body(&effect.kind);
-                let prompt_provider = prompt_provider_for_body(&effect.kind);
-                let workflow_target = workflow_target_for_body(&effect.kind);
-                let endorsed = endorsed_for_body(&effect.kind);
-                let declassified = declassified_for_body(&effect.kind);
-                let exec_target = exec_target_for_body(&effect.kind);
-                let http_request = http_request_for_body(&effect.kind);
-                let mint_credential = mint_credential_for_body(&effect.kind);
                 effects.push(IrEffectNode {
                     id,
                     kind,
                     binding: effect.binding.clone(),
-                    prompt_result_type,
+                    prompt_result_type: contract.prompt_result_type,
                     after_arm: after_stack
                         .last()
                         .map(|(binding, _, arm)| (binding.clone(), arm.clone())),
-                    required_capabilities,
-                    construct_use,
-                    package_call: match &effect.kind {
-                        body::BodyEffectKind::Call {
-                            capability,
-                            argument,
-                        } => Some(IrPackageCall {
-                            target: capability.clone(),
-                            argument: argument.clone(),
-                            tracker_resources: Vec::new(),
-                        }),
-                        body::BodyEffectKind::ConstructCapabilityCall {
-                            target_capability, ..
-                        } => Some(IrPackageCall {
-                            target: target_capability.clone(),
-                            argument: None,
-                            tracker_resources: Vec::new(),
-                        }),
-                        _ => None,
-                    },
+                    required_capabilities: contract.required_capabilities,
+                    construct_use: contract.construct_use,
+                    package_call: contract.package_call,
                     idempotency_key,
                     span: effect.span,
-                    timeout_seconds: effect.timeout_seconds,
-                    access_grants,
-                    turn_skills,
-                    on_stream,
-                    selection_source,
-                    transport_onto,
-                    resource,
-                    agent,
-                    coerce_target,
-                    prompt_provider,
-                    workflow_target,
-                    endorsed,
-                    declassified,
+                    timeout_seconds: contract.timeout_seconds,
+                    access_grants: contract.access_grants,
+                    turn_skills: contract.turn_skills,
+                    on_stream: contract.on_stream,
+                    selection_source: contract.selection_source,
+                    transport_onto: contract.transport_onto,
+                    resources: contract
+                        .resource
+                        .legacy_name(binding_resources)
+                        .into_iter()
+                        .collect(),
+                    agent: contract.agent,
+                    coerce_target: contract.coerce_target,
+                    prompt_provider: contract.prompt_provider,
+                    workflow_target: contract.workflow_target,
+                    endorsed: contract.endorsed,
+                    declassified: contract.declassified,
                     selected_by: case_stack.last().cloned(),
-                    exec_target,
-                    http_request,
-                    mint_credential,
+                    exec_target: contract.exec_target,
+                    http_request: contract.http_request,
+                    mint_credential: contract.mint_credential,
                 });
             }
             body::BodyStmt::After(after) => {
@@ -17547,36 +17529,14 @@ fn validate_agent_capabilities(
     semantic: &SemanticContext,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
-    if required_capabilities.is_empty() {
-        return;
-    }
-    let declared = semantic
-        .agent_capabilities
-        .get(agent)
-        .cloned()
-        .unwrap_or_default();
-    for capability in required_capabilities {
-        if !declared.contains(capability) {
-            diagnostics.push(Diagnostic {
-                code: diagnostic_code!("construct.capability_not_declared"),
-                severity: Severity::Error,
-                related: Vec::new(),
-                fixits: Vec::new(),
-                span: at.whole(),
-                message: format!(
-                    "rule `{}` tells agent `{agent}` requiring undeclared capability `{capability}`",
-                    rule.name.name
-                ),
-                suggestion: suggest(suggest_otherwise(
-                    capability,
-                    declared.iter(),
-                    format!(
-                        "add `{capability}` to agent `{agent}` capabilities or choose another AgentRef target"
-                    ),
-                )),
-            });
-        }
-    }
+    agent_capabilities::validate(
+        &format!("rule `{}`", rule.name.name),
+        at.whole(),
+        agent,
+        required_capabilities,
+        semantic,
+        diagnostics,
+    );
 }
 
 fn validate_availability_when(
@@ -17633,6 +17593,13 @@ fn validate_availability_when(
 
 #[derive(Clone, Debug, Default)]
 struct ExprScope {
+    // Immediate operands already checked by managed inference. The legacy
+    // checker never populates this compiler-local proof.
+    value_expression_types: Vec<(Expr, IrType)>,
+    value_types: BTreeMap<String, IrType>,
+    // Typed composition has already proved these exact reads in its lexical
+    // environment. Preserve their types across the shared operator boundary.
+    value_path_types: BTreeMap<Vec<String>, IrType>,
     binding_types: BTreeMap<String, String>,
     implicit_schema: Option<String>,
 }
@@ -17641,6 +17608,9 @@ impl ExprScope {
     fn from_bindings(binding_types: &BTreeMap<String, String>) -> Self {
         Self {
             binding_types: binding_types.clone(),
+            value_expression_types: Vec::new(),
+            value_types: BTreeMap::new(),
+            value_path_types: BTreeMap::new(),
             implicit_schema: None,
         }
     }
@@ -17692,6 +17662,19 @@ impl<'a> ExprValidationContext<'a> {
     fn node(&self, spans: &ExprSpans) -> SourceSpan {
         match spans.range() {
             Some(range) if !range.is_empty() && self.at.holds(&range) => self.at.at(range),
+            _ => self.span(),
+        }
+    }
+
+    fn call_name(&self, spans: &ExprSpans, name: &str) -> SourceSpan {
+        match spans.range() {
+            Some(range)
+                if !range.is_empty()
+                    && range.start.saturating_add(name.len()) <= range.end
+                    && self.at.holds(&(range.start..range.start + name.len())) =>
+            {
+                self.at.at(range.start..range.start + name.len())
+            }
             _ => self.span(),
         }
     }
@@ -18329,6 +18312,28 @@ fn validate_function_call(
     // argument.
     let call = context.node(spans);
     let argument = context.node(spans.child(0));
+    if let Some(view) = semantic.parameterized_views.get(name) {
+        if args.len() != view.params.len() {
+            diagnostics.push(Diagnostic {
+                code: diagnostic_code!("expr.arity_mismatch"),
+                severity: Severity::Error,
+                related: vec![RelatedInfo {
+                    span: view.name.span,
+                    message: "view declared here".to_owned(),
+                }],
+                fixits: Vec::new(),
+                span: call,
+                message: format!(
+                    "{} calls view `{name}` with {} arguments, expected {}",
+                    context.subject,
+                    args.len(),
+                    view.params.len()
+                ),
+                suggestion: suggest("pass one value for each declared view parameter".to_owned()),
+            });
+        }
+        return;
+    }
     match name {
         "count" => {
             if args.len() != 1 {
@@ -18730,7 +18735,17 @@ fn infer_expr_type(
     context: &ExprValidationContext,
     diagnostics: &mut Vec<Diagnostic>,
 ) -> ExprType {
+    if let Some((_, ty)) = scope
+        .value_expression_types
+        .iter()
+        .find(|(checked, _)| checked == expr)
+    {
+        return action_types::expression_type(ty, semantic);
+    }
     match expr {
+        Expr::Literal(ExprLiteral::Ident(name)) if scope.value_types.contains_key(name) => {
+            action_types::expression_type(&scope.value_types[name], semantic)
+        }
         Expr::Literal(ExprLiteral::Ident(name)) => implicit_field_type(name, semantic, scope)
             .map(|ty| expr_type_from_type_syntax(&ty, semantic))
             .unwrap_or_else(|| expr_literal_type(&ExprLiteral::Ident(name.clone()))),
@@ -18833,6 +18848,19 @@ fn infer_expr_type(
             "count" => ExprType::Int,
             "exists" => ExprType::Bool,
             "empty" => ExprType::Bool,
+            _ if semantic.parameterized_views.contains_key(name) => {
+                for (index, arg) in args.iter().enumerate() {
+                    infer_expr_type(
+                        arg,
+                        spans.child(index),
+                        semantic,
+                        scope,
+                        context,
+                        diagnostics,
+                    );
+                }
+                expr_type_from_type_syntax(&semantic.parameterized_views[name].result, semantic)
+            }
             _ => {
                 diagnostics.push(Diagnostic {
                     code: diagnostic_code!("expr.unsupported_function"),
@@ -18841,7 +18869,7 @@ fn infer_expr_type(
                     fixits: Vec::new(),
                     // The call, name and arguments: it is the call that is not
                     // one of the three the kernel has.
-                    span: context.node(spans),
+                    span: context.call_name(spans, name),
                     message: format!(
                         "{} calls unsupported expression function `{name}`",
                         context.subject
@@ -19114,6 +19142,13 @@ fn expr_path_type(
     semantic: &SemanticContext,
     scope: &ExprScope,
 ) -> Option<ExprType> {
+    if let Some(ty) = scope.value_path_types.get(path) {
+        return Some(action_types::expression_type(ty, semantic));
+    }
+    if let Some(ty) = path.first().and_then(|root| scope.value_types.get(root)) {
+        return action_types::field_type(ty, &path[1..], semantic)
+            .map(|ty| action_types::expression_type(&ty, semantic));
+    }
     if path.len() < 2 {
         return None;
     }
@@ -21346,6 +21381,326 @@ fn decide_field_type_syntax(ty: &str, span: SourceSpan) -> TypeSyntax {
     }
 }
 
+/// The structural result type written by one inline `decide`. Managed action
+/// execution uses this directly so an anonymous decision composes inside a
+/// reusable action without inventing a rule-scoped nominal class for each
+/// caller. Rule lowering may still publish its hygienic class for legacy IR
+/// consumers; both shapes are built from this same field conversion.
+pub fn inline_decide_output_type(fields: &[(String, String)], span: SourceSpan) -> IrType {
+    IrType::Object(
+        fields
+            .iter()
+            .map(|(name, ty)| IrClassField {
+                name: name.clone(),
+                ty: lower_type(decide_field_type_syntax(ty, span)),
+                is_key: false,
+                presence_condition: None,
+                span,
+            })
+            .collect(),
+    )
+}
+
+/// The value produced by `read text|markdown from …`. Keeping this structural
+/// lets file reads compose inside actions without requiring authors to declare
+/// a mirror class for the standard operation's fixed result record.
+pub fn file_read_output_type(span: SourceSpan) -> IrType {
+    IrType::Object(
+        [
+            ("store", IrPrimitiveType::String),
+            ("path", IrPrimitiveType::String),
+            ("format", IrPrimitiveType::String),
+            ("content", IrPrimitiveType::String),
+            ("bytes", IrPrimitiveType::Int),
+            ("content_hash", IrPrimitiveType::String),
+        ]
+        .into_iter()
+        .map(|(name, ty)| IrClassField {
+            name: name.into(),
+            ty: IrType::Primitive(ty),
+            is_key: false,
+            presence_condition: None,
+            span,
+        })
+        .collect(),
+    )
+}
+
+/// The stable workflow-visible value produced by `write text|markdown to …`.
+/// Host paths and provider receipts remain settlement evidence rather than
+/// becoming fields every composed action must carry.
+pub fn file_write_output_type(span: SourceSpan) -> IrType {
+    IrType::Object(
+        [
+            ("store", IrPrimitiveType::String),
+            ("path", IrPrimitiveType::String),
+            ("format", IrPrimitiveType::String),
+            ("mode", IrPrimitiveType::String),
+            ("bytes", IrPrimitiveType::Int),
+            ("content_hash", IrPrimitiveType::String),
+        ]
+        .into_iter()
+        .map(|(name, ty)| IrClassField {
+            name: name.into(),
+            ty: IrType::Primitive(ty),
+            is_key: false,
+            presence_condition: None,
+            span,
+        })
+        .collect(),
+    )
+}
+
+/// The stable workflow-visible value produced by one structured file import.
+/// Imported rows become ordinary facts; composition receives the bounded
+/// admission receipt rather than a second copy of their payloads.
+pub fn file_import_output_type(span: SourceSpan) -> IrType {
+    IrType::Object(
+        [
+            ("store", IrPrimitiveType::String),
+            ("path", IrPrimitiveType::String),
+            ("format", IrPrimitiveType::String),
+            ("schema", IrPrimitiveType::String),
+            ("row_count", IrPrimitiveType::Int),
+            ("admitted", IrPrimitiveType::Int),
+            ("skipped", IrPrimitiveType::Int),
+        ]
+        .into_iter()
+        .map(|(name, ty)| IrClassField {
+            name: name.into(),
+            ty: IrType::Primitive(ty),
+            is_key: false,
+            presence_condition: None,
+            span,
+        })
+        .collect(),
+    )
+}
+
+/// The stable workflow-visible receipt produced by a directed signal. The
+/// delivered payload remains on the receiver; composed work only needs the
+/// destination and declared signal identity to continue deterministically.
+pub fn signal_emit_output_type(span: SourceSpan) -> IrType {
+    IrType::Object(
+        [
+            ("target", IrPrimitiveType::String),
+            ("event", IrPrimitiveType::String),
+        ]
+        .into_iter()
+        .map(|(name, ty)| IrClassField {
+            name: name.into(),
+            ty: IrType::Primitive(ty),
+            is_key: false,
+            presence_condition: None,
+            span,
+        })
+        .collect(),
+    )
+}
+
+/// The stable workflow-visible receipt produced by one append. The entry stays
+/// in the ledger; composition receives only its durable address.
+pub fn ledger_append_output_type(span: SourceSpan) -> IrType {
+    IrType::Object(vec![
+        IrClassField {
+            name: "variant".into(),
+            ty: IrType::LiteralString("Appended".into()),
+            is_key: false,
+            presence_condition: None,
+            span,
+        },
+        IrClassField {
+            name: "ledger".into(),
+            ty: IrType::Primitive(IrPrimitiveType::String),
+            is_key: false,
+            presence_condition: None,
+            span,
+        },
+        IrClassField {
+            name: "partition".into(),
+            ty: IrType::Primitive(IrPrimitiveType::String),
+            is_key: false,
+            presence_condition: None,
+            span,
+        },
+        IrClassField {
+            name: "seq".into(),
+            ty: IrType::Primitive(IrPrimitiveType::Int),
+            is_key: false,
+            presence_condition: None,
+            span,
+        },
+    ])
+}
+
+/// The stable workflow-visible address of one newly filed tracker item.
+pub fn tracker_file_output_type(span: SourceSpan) -> IrType {
+    IrType::Object(vec![
+        IrClassField {
+            name: "queue".into(),
+            ty: IrType::Primitive(IrPrimitiveType::String),
+            is_key: false,
+            presence_condition: None,
+            span,
+        },
+        IrClassField {
+            name: "id".into(),
+            ty: IrType::Primitive(IrPrimitiveType::String),
+            is_key: false,
+            presence_condition: None,
+            span,
+        },
+        IrClassField {
+            name: "title".into(),
+            ty: IrType::Primitive(IrPrimitiveType::String),
+            is_key: false,
+            presence_condition: None,
+            span,
+        },
+    ])
+}
+
+fn tracker_address_fields(span: SourceSpan) -> Vec<IrClassField> {
+    ["queue", "id", "title"]
+        .into_iter()
+        .map(|name| IrClassField {
+            name: name.into(),
+            ty: IrType::Primitive(IrPrimitiveType::String),
+            is_key: false,
+            presence_condition: None,
+            span,
+        })
+        .collect()
+}
+
+/// The claimed tracker address and holder lease returned by `claim`.
+pub fn tracker_claim_output_type(span: SourceSpan) -> IrType {
+    let mut fields = tracker_address_fields(span);
+    fields.extend([
+        IrClassField {
+            name: "claimed_by".into(),
+            ty: IrType::Primitive(IrPrimitiveType::String),
+            is_key: false,
+            presence_condition: None,
+            span,
+        },
+        IrClassField {
+            name: "expires_at".into(),
+            ty: IrType::Optional(Box::new(IrType::Primitive(IrPrimitiveType::String))),
+            is_key: false,
+            presence_condition: None,
+            span,
+        },
+    ]);
+    IrType::Object(fields)
+}
+
+/// The stable address and ready status returned by `release`.
+pub fn tracker_release_output_type(span: SourceSpan) -> IrType {
+    let mut fields = tracker_address_fields(span);
+    fields.push(IrClassField {
+        name: "status".into(),
+        ty: IrType::LiteralString("open".into()),
+        is_key: false,
+        presence_condition: None,
+        span,
+    });
+    IrType::Object(fields)
+}
+
+/// The stable address and completion metadata returned by `finish`.
+pub fn tracker_finish_output_type(span: SourceSpan) -> IrType {
+    let mut fields = tracker_address_fields(span);
+    fields.extend([
+        IrClassField {
+            name: "status".into(),
+            ty: IrType::LiteralString("closed".into()),
+            is_key: false,
+            presence_condition: None,
+            span,
+        },
+        IrClassField {
+            name: "summary".into(),
+            ty: IrType::Optional(Box::new(IrType::Primitive(IrPrimitiveType::String))),
+            is_key: false,
+            presence_condition: None,
+            span,
+        },
+    ]);
+    IrType::Object(fields)
+}
+
+/// The stable sum-shaped value produced by one counter consume. `Over` is a
+/// completed coordination decision, not an infrastructure failure.
+pub fn counter_consume_output_type(span: SourceSpan) -> IrType {
+    IrType::Object(vec![
+        IrClassField {
+            name: "variant".into(),
+            ty: IrType::Union(vec![
+                IrType::LiteralString("Ok".into()),
+                IrType::LiteralString("Over".into()),
+            ]),
+            is_key: false,
+            presence_condition: None,
+            span,
+        },
+        IrClassField {
+            name: "counter".into(),
+            ty: IrType::Primitive(IrPrimitiveType::String),
+            is_key: false,
+            presence_condition: None,
+            span,
+        },
+        IrClassField {
+            name: "key".into(),
+            ty: IrType::Primitive(IrPrimitiveType::String),
+            is_key: false,
+            presence_condition: None,
+            span,
+        },
+        IrClassField {
+            name: "remaining".into(),
+            ty: IrType::Primitive(IrPrimitiveType::Int),
+            is_key: false,
+            presence_condition: None,
+            span,
+        },
+        IrClassField {
+            name: "period".into(),
+            ty: IrType::Primitive(IrPrimitiveType::String),
+            is_key: false,
+            presence_condition: None,
+            span,
+        },
+    ])
+}
+
+/// The stable workflow-visible value produced by one collection export. The
+/// exported rows and host path stay in the operation's captured/evidence data;
+/// composition receives only the deterministic receipt.
+pub fn file_export_output_type(span: SourceSpan) -> IrType {
+    IrType::Object(
+        [
+            ("store", IrPrimitiveType::String),
+            ("path", IrPrimitiveType::String),
+            ("format", IrPrimitiveType::String),
+            ("schema", IrPrimitiveType::String),
+            ("mode", IrPrimitiveType::String),
+            ("row_count", IrPrimitiveType::Int),
+            ("content_hash", IrPrimitiveType::String),
+        ]
+        .into_iter()
+        .map(|(name, ty)| IrClassField {
+            name: name.into(),
+            ty: IrType::Primitive(ty),
+            is_key: false,
+            presence_condition: None,
+            span,
+        })
+        .collect(),
+    )
+}
+
 /// Collects every inline `decide … as <binding>` in a rule body — recursing
 /// through nested after/case/branch/handler blocks — yielding
 /// `(binding, result_fields, span)` for synthesis and type registration.
@@ -21507,18 +21862,13 @@ fn collect_inline_decide_schemas(
             // Build the field shape once as `TypeSyntax` (the schema-index form),
             // then lower it for the IR so both representations stay in lockstep.
             let mut syntax_fields: BTreeMap<String, TypeSyntax> = BTreeMap::new();
-            let mut ir_fields = Vec::new();
             for (field_name, field_ty) in fields {
                 let ty = decide_field_type_syntax(field_ty, span);
-                ir_fields.push(IrClassField {
-                    name: field_name.clone(),
-                    ty: lower_type(ty.clone()),
-                    is_key: false,
-                    presence_condition: None,
-                    span,
-                });
                 syntax_fields.insert(field_name.clone(), ty);
             }
+            let IrType::Object(ir_fields) = inline_decide_output_type(fields, span) else {
+                unreachable!("inline decide output is structural")
+            };
             semantic.schemas.classes.insert(name.clone(), syntax_fields);
             ir.schemas.push(IrSchema::Class(IrClass {
                 name,
@@ -21844,6 +22194,9 @@ fn validate_confinement(
     let confined = &mut confined;
     for statement in statements {
         match statement {
+            body::BodyStmt::Composition(composition) => {
+                refuse_unexpanded_composition(composition, diagnostics)
+            }
             body::BodyStmt::Record(record) => {
                 let mut roots = BTreeSet::new();
                 collect_payload_field_roots(&record.fields, record.from.as_deref(), &mut roots);
@@ -23071,15 +23424,22 @@ fn validate_recorded_schemas(
     semantic: &SemanticContext,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
+    validate_recorded_schemas_named(
+        &format!("rule `{}`", rule.name.name),
+        statements,
+        semantic,
+        diagnostics,
+    );
+}
+
+fn validate_recorded_schemas_named(
+    owner: &str,
+    statements: &[body::BodyStmt],
+    semantic: &SemanticContext,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
     for statement in statements {
-        let recorded = match statement {
-            body::BodyStmt::Record(record) => Some(record),
-            body::BodyStmt::Done {
-                replacement: Some(record),
-                ..
-            } => Some(record),
-            _ => None,
-        };
+        let recorded = fact_flow::record(statement);
         if let Some(record) = recorded {
             let schema = &record.schema;
             // A class the PROGRAM declared is the program's own type, whatever
@@ -23097,8 +23457,7 @@ fn validate_recorded_schemas(
                     fixits: Vec::new(),
                     span: record.span,
                     message: format!(
-                        "rule `{}` cannot record kernel-owned terminal schema `{schema}`",
-                        rule.name.name
+                        "{owner} cannot record kernel-owned terminal schema `{schema}`"
                     ),
                     suggestion: suggest(
                         "the terminal family (`TerminalFailed`/`TerminalTimedOut`/`TerminalCancelled`) is produced only by the kernel; to fail this workflow use `fail <failure> { ... }`, and to react to an effect terminal use `after <effect> fails/times out/cancels as f`"
@@ -23112,7 +23471,7 @@ fn validate_recorded_schemas(
                     related: Vec::new(),
                     fixits: Vec::new(),
                     span: record.span,
-                    message: format!("rule `{}` records unknown class `{schema}`", rule.name.name),
+                    message: format!("{owner} records unknown class `{schema}`"),
                     suggestion: suggest(suggest_otherwise(
                         schema,
                         semantic.schemas.classes.keys(),
@@ -23122,17 +23481,25 @@ fn validate_recorded_schemas(
             }
         }
         match statement {
+            body::BodyStmt::Composition(body::CompositionStmt::Then { operation, .. }) => {
+                validate_recorded_schemas_named(
+                    owner,
+                    std::slice::from_ref(operation.as_ref()),
+                    semantic,
+                    diagnostics,
+                );
+            }
             body::BodyStmt::After(after) => {
-                validate_recorded_schemas(rule, &after.body, semantic, diagnostics);
+                validate_recorded_schemas_named(owner, &after.body, semantic, diagnostics);
             }
             body::BodyStmt::Case(case) => {
                 for branch in &case.branches {
-                    validate_recorded_schemas(rule, &branch.body, semantic, diagnostics);
+                    validate_recorded_schemas_named(owner, &branch.body, semantic, diagnostics);
                 }
             }
             body::BodyStmt::Region(region) => {
-                validate_recorded_schemas(rule, &region.body, semantic, diagnostics);
-                validate_recorded_schemas(rule, &region.lapse_body, semantic, diagnostics);
+                validate_recorded_schemas_named(owner, &region.body, semantic, diagnostics);
+                validate_recorded_schemas_named(owner, &region.lapse_body, semantic, diagnostics);
             }
             _ => {}
         }
@@ -23143,20 +23510,8 @@ fn push_ingest_fact_writes(statements: &[body::BodyStmt], fact_writes: &mut Vec<
     for statement in statements {
         match statement {
             body::BodyStmt::Effect(effect) => {
-                match &effect.kind {
-                    body::BodyEffectKind::Exec {
-                        parse_target: Some(parse),
-                        ..
-                    } if parse.each => {
-                        fact_writes.push(format!("schema:{}", parse.schema));
-                    }
-                    // `import <fmt> <Schema>` admits one `<Schema>` fact per row
-                    // (spec/files.md), so a `when <Schema>` rule has a
-                    // producer for liveness/effect-graph analysis.
-                    body::BodyEffectKind::FileImport { schema, .. } => {
-                        fact_writes.push(format!("schema:{schema}"));
-                    }
-                    _ => {}
+                if let Some(schema) = fact_flow::ingest_schema(effect) {
+                    fact_writes.push(format!("schema:{schema}"));
                 }
             }
             body::BodyStmt::After(after) => push_ingest_fact_writes(&after.body, fact_writes),
@@ -23494,6 +23849,28 @@ fn find_after_body<'a>(
                     }
                 }
             }
+            // The same two nestings `for_each_body` now walks. This is a pure
+            // search: not looking inside them only ever loses the block it was
+            // sent to find, and its caller then asks nothing of it.
+            body::BodyStmt::Region(region) => {
+                for statements in [&region.body, &region.lapse_body] {
+                    if let Some(found) = find_after_body(statements, binding, predicate) {
+                        return Some(found);
+                    }
+                }
+            }
+            body::BodyStmt::Composition(body::CompositionStmt::OnFailure { body, .. }) => {
+                if let Some(found) = find_after_body(body, binding, predicate) {
+                    return Some(found);
+                }
+            }
+            body::BodyStmt::Composition(body::CompositionStmt::Then { operation, .. }) => {
+                if let Some(found) =
+                    find_after_body(std::slice::from_ref(operation), binding, predicate)
+                {
+                    return Some(found);
+                }
+            }
             _ => {}
         }
     }
@@ -23519,6 +23896,22 @@ fn releases_or_terminates(statements: &[body::BodyStmt], binding: &str) -> bool 
                     .iter()
                     .all(|branch| releases_or_terminates(&branch.body, binding))
         }
+        // A `then <op>` is an ordinary statement that always runs, so a release
+        // inside it releases. A region runs one half or the other, so it
+        // guarantees release only when BOTH halves do -- the same rule `case`
+        // applies to its branches. An `on failure` handler runs only when the
+        // operation failed and guarantees nothing, so it stays unsafe.
+        //
+        // Both additions can only turn a `false` into a `true`: this answers
+        // "is release guaranteed", so a release the walk cannot see is a
+        // refusal for a program that does release.
+        body::BodyStmt::Composition(body::CompositionStmt::Then { operation, .. }) => {
+            releases_or_terminates(std::slice::from_ref(operation), binding)
+        }
+        body::BodyStmt::Region(region) => {
+            releases_or_terminates(&region.body, binding)
+                && releases_or_terminates(&region.lapse_body, binding)
+        }
         _ => false,
     })
 }
@@ -23532,6 +23925,26 @@ fn for_each_body(statements: &[body::BodyStmt], visit: &mut impl FnMut(&body::Bo
                 for branch in &case.branches {
                     for_each_body(&branch.body, visit);
                 }
+            }
+            // A composed body nests ordinary statements the same way `after`
+            // does. Walking only the two legacy blocks made every check built
+            // on this walk stop at the first `on failure` or `then` -- an
+            // effect inside one was not skipped as unsupported, it was simply
+            // not seen.
+            body::BodyStmt::Composition(body::CompositionStmt::OnFailure { body, .. }) => {
+                for_each_body(body, visit)
+            }
+            body::BodyStmt::Composition(body::CompositionStmt::Then { operation, .. }) => {
+                for_each_body(std::slice::from_ref(operation), visit)
+            }
+            // A region and its lapse arm. The legacy machine splices both out of
+            // the body before any of these walks runs, so this arm was dead
+            // there and never written; the managed machine keeps the region in
+            // the body it analyses, so without it every check built on this walk
+            // steps over a whole `during` block and the arm beside it.
+            body::BodyStmt::Region(region) => {
+                for_each_body(&region.body, visit);
+                for_each_body(&region.lapse_body, visit);
             }
             _ => {}
         }
@@ -24064,6 +24477,9 @@ fn validate_conditioned_field_reads(
 ) {
     for statement in statements {
         match statement {
+            body::BodyStmt::Composition(composition) => {
+                refuse_unexpanded_composition(composition, diagnostics)
+            }
             body::BodyStmt::Record(record) => {
                 check_conditioned_record_reads(
                     rule,
@@ -24201,6 +24617,50 @@ fn validate_conditioned_field_reads(
     }
 }
 
+/// A `lease` an `acquire` names must be declared -- on EITHER machine.
+///
+/// This lived inside `validate_body_effect_operands`, which the managed
+/// lowering skips wholesale because its other checks need action calls already
+/// expanded into effect handles. This one needs nothing of the kind: it asks
+/// whether a name appears in the program's `lease` declarations. Left where it
+/// was, a single `on failure` or `then` anywhere in a rule -- or any `during`
+/// region, which selects the managed machine on its own -- silently took the
+/// refusal away, and `acquire ghost_lease` compiled clean.
+fn validate_lease_declarations(
+    rule: &RuleDecl,
+    statements: &[body::BodyStmt],
+    semantic: &SemanticContext,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    for_each_body(statements, &mut |statement| {
+        let body::BodyStmt::Effect(effect) = statement else {
+            return;
+        };
+        let body::BodyEffectKind::LeaseAcquire { resource, .. } = &effect.kind else {
+            return;
+        };
+        if semantic.leases.contains(resource) {
+            return;
+        }
+        diagnostics.push(Diagnostic {
+            code: diagnostic_code!("type.unknown_resource"),
+            severity: Severity::Error,
+            related: Vec::new(),
+            fixits: Vec::new(),
+            span: effect.span,
+            message: format!(
+                "rule `{}` acquires undeclared lease `{resource}`",
+                rule.name.name
+            ),
+            suggestion: suggest(suggest_otherwise(
+                resource,
+                semantic.leases.iter(),
+                format!("declare `lease {resource} {{ key <Type>  slots <N>  ttl <duration> }}`"),
+            )),
+        });
+    });
+}
+
 fn validate_body_effect_operands(
     rule: &RuleDecl,
     statements: &[body::BodyStmt],
@@ -24212,28 +24672,6 @@ fn validate_body_effect_operands(
         match statement {
             body::BodyStmt::Effect(effect) => {
                 match &effect.kind {
-                    body::BodyEffectKind::LeaseAcquire { resource, .. }
-                        if !semantic.leases.contains(resource) =>
-                    {
-                        diagnostics.push(Diagnostic {
-                            code: diagnostic_code!("type.unknown_resource"),
-                            severity: Severity::Error,
-                            related: Vec::new(),
-                            fixits: Vec::new(),
-                            span: effect.span,
-                            message: format!(
-                                "rule `{}` acquires undeclared lease `{resource}`",
-                                rule.name.name
-                            ),
-                            suggestion: suggest(suggest_otherwise(
-                                resource,
-                                semantic.leases.iter(),
-                                format!(
-                                    "declare `lease {resource} {{ key <Type>  slots <N>  ttl <duration> }}`"
-                                ),
-                            )),
-                        });
-                    }
                     body::BodyEffectKind::LedgerAppend { ledger, schema, .. } => {
                         if !semantic.ledgers.contains(ledger) {
                             diagnostics.push(Diagnostic {
@@ -24680,6 +25118,7 @@ fn validate_lapse_arm(
         &arm_bindings,
         &mut arm_diagnostics,
     );
+    validate_lease_declarations(rule, &arm_ast.statements, semantic, &mut arm_diagnostics);
     validate_coordination_discipline(rule, &arm_ast.statements, &mut arm_diagnostics);
     validate_redactions(
         rule,
@@ -26530,6 +26969,17 @@ fn suggest_binding_root(root: &str, known_roots: &BTreeSet<String>, fallback: &s
     )
 }
 
+fn refuse_unexpanded_composition(
+    composition: &body::CompositionStmt,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    diagnostics.push(Diagnostic::error(
+        diagnostic_code!("construct.invalid_expansion"),
+        composition.span(),
+        "action composition must be expanded before rule authority and field checks",
+    ));
+}
+
 /// Collects every binding NAME a rule body introduces, from the parsed AST so it
 /// is robust to multi-line prompts and nesting (the line-based effect collectors
 /// only track `coerce`/`claim`, so `tell`/`exec`/etc. bindings are invisible to
@@ -26538,6 +26988,24 @@ fn suggest_binding_root(root: &str, known_roots: &BTreeSet<String>, fallback: &s
 fn collect_all_binding_names(statements: &[body::BodyStmt], out: &mut BTreeSet<String>) {
     for statement in statements {
         match statement {
+            body::BodyStmt::Composition(composition) => match composition {
+                body::CompositionStmt::Call { binding, .. } => {
+                    if let Some(binding) = binding {
+                        out.insert(binding.clone());
+                    }
+                }
+                body::CompositionStmt::Then {
+                    binding, operation, ..
+                } => {
+                    out.insert(binding.clone());
+                    collect_all_binding_names(std::slice::from_ref(operation), out);
+                }
+                body::CompositionStmt::OnFailure { alias, body, .. } => {
+                    out.insert(alias.clone());
+                    collect_all_binding_names(body, out);
+                }
+                body::CompositionStmt::Return(_) | body::CompositionStmt::Fail(_) => {}
+            },
             body::BodyStmt::Effect(effect) => {
                 if let Some(binding) = &effect.binding {
                     out.insert(binding.clone());
@@ -26834,6 +27302,31 @@ fn validate_emit_signal_declarations(
             }
             body::BodyStmt::After(after) => {
                 validate_emit_signal_declarations(rule, &after.body, declared_signals, diagnostics)
+            }
+            body::BodyStmt::Composition(body::CompositionStmt::OnFailure { body, .. }) => {
+                validate_emit_signal_declarations(rule, body, declared_signals, diagnostics)
+            }
+            body::BodyStmt::Composition(body::CompositionStmt::Then { operation, .. }) => {
+                validate_emit_signal_declarations(
+                    rule,
+                    std::slice::from_ref(operation),
+                    declared_signals,
+                    diagnostics,
+                )
+            }
+            body::BodyStmt::Region(region) => {
+                validate_emit_signal_declarations(
+                    rule,
+                    &region.body,
+                    declared_signals,
+                    diagnostics,
+                );
+                validate_emit_signal_declarations(
+                    rule,
+                    &region.lapse_body,
+                    declared_signals,
+                    diagnostics,
+                );
             }
             body::BodyStmt::Case(case) => {
                 for branch in &case.branches {
@@ -28781,12 +29274,14 @@ impl<'a> ExprParser<'a> {
                     vec![arg.spans],
                 ))
             }
-            Some(ExprTokenKind::Ident(value))
-                if matches!(value.as_str(), "count" | "exists" | "empty")
-                    && self.at_symbol('(') =>
-            {
+            Some(ExprTokenKind::Ident(value)) if self.at_symbol('(') => {
                 self.expect_symbol('(')?;
-                if let Some(query) = self.try_parse_query()? {
+                let query = if matches!(value.as_str(), "count" | "exists" | "empty") {
+                    self.try_parse_query()?
+                } else {
+                    None
+                };
+                if let Some(query) = query {
                     self.expect_symbol(')')?;
                     Ok(Spanned::new(
                         Expr::Call {
@@ -29841,3 +30336,7 @@ impl TypeSyntax {
 #[cfg(test)]
 #[path = "lib_tests/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "lib_tests/coordination_composition.rs"]
+mod coordination_composition_tests;

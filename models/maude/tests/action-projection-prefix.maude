@@ -1,0 +1,53 @@
+load ../action-projection-prefix.maude
+--- Before consumption and terminal: admitted fact plus pending effect.
+search [1] in WHIPPLESCRIPT-ACTION-PROJECTION-PREFIX :
+  project(log(1, 3, 2, 4, 0, none, 5), 2) =>*
+  selected(prefix(true, pending, false)) .
+--- At the later cut, consumption and terminal are both visible.
+search [1] in WHIPPLESCRIPT-ACTION-PROJECTION-PREFIX :
+  project(log(1, 3, 2, 5, 4, none, 5), 5) =>*
+  selected(prefix(false, succeeded, false)) .
+--- An unacknowledged request remains open before terminal evidence.
+search [1] in WHIPPLESCRIPT-ACTION-PROJECTION-PREFIX :
+  project(log(1, 0, 2, 5, 4, none, 5), 4) =>*
+  selected(prefix(true, pending, true)) .
+--- Restore at 6 to frontier 2 abandons consumption, terminal and request.
+search [1] in WHIPPLESCRIPT-ACTION-PROJECTION-PREFIX :
+  project(log(1, 4, 2, 5, 3, rewind(2, 6), 6), 6) =>*
+  selected(prefix(true, pending, false)) .
+--- Work after the restore marker belongs to the new live line.
+search [1] in WHIPPLESCRIPT-ACTION-PROJECTION-PREFIX :
+  project(log(1, 4, 2, 5, 7, rewind(2, 6), 7), 7) =>*
+  selected(prefix(true, pending, true)) .
+--- A sequence the log does not contain is not an exact prefix.
+search [1] in WHIPPLESCRIPT-ACTION-PROJECTION-PREFIX :
+  project(log(1, 0, 2, 0, 0, none, 4), 5) =>* refused .
+--- Current implementation must not expose a future terminal at cut 2.
+search [1] in WHIPPLESCRIPT-ACTION-PROJECTION-PREFIX :
+  project(log(1, 3, 2, 4, 0, none, 4), 2) =>*
+  selected(prefix(true, succeeded, false)) .
+search [1] in WHIPPLESCRIPT-ACTION-PROJECTION-LATEST :
+  project(log(1, 3, 2, 4, 0, none, 4), 2) =>*
+  selected(prefix(false, succeeded, false)) .
+--- Current implementation must remove a consumed fact.
+search [1] in WHIPPLESCRIPT-ACTION-PROJECTION-PREFIX :
+  project(log(1, 3, 2, 0, 0, none, 3), 3) =>*
+  selected(prefix(true, pending, false)) .
+search [1] in WHIPPLESCRIPT-ACTION-PROJECTION-KEEPS-CONSUMED :
+  project(log(1, 3, 2, 0, 0, none, 3), 3) =>*
+  selected(prefix(true, pending, false)) .
+--- Current implementation must discard the abandoned suffix at restore.
+search [1] in WHIPPLESCRIPT-ACTION-PROJECTION-PREFIX :
+  project(log(1, 4, 2, 5, 3, rewind(2, 6), 6), 6) =>*
+  selected(prefix(false, succeeded, false)) .
+search [1] in WHIPPLESCRIPT-ACTION-PROJECTION-IGNORES-RESTORE :
+  project(log(1, 4, 2, 5, 3, rewind(2, 6), 6), 6) =>*
+  selected(prefix(false, succeeded, false)) .
+--- Terminal evidence acknowledges the open cancellation request.
+search [1] in WHIPPLESCRIPT-ACTION-PROJECTION-PREFIX :
+  project(log(1, 0, 2, 5, 4, none, 5), 5) =>*
+  selected(prefix(true, succeeded, true)) .
+search [1] in WHIPPLESCRIPT-ACTION-PROJECTION-STICKY-CANCEL :
+  project(log(1, 0, 2, 5, 4, none, 5), 5) =>*
+  selected(prefix(true, succeeded, true)) .
+quit

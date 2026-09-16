@@ -1,0 +1,41 @@
+--- Managed expression demand: absence is ready, pending is not a value.
+mod WHIPPLESCRIPT-ACTION-DEMAND is
+  sorts Value Origin Origins State Expr Result .
+  ops yes no absent : -> Value [ctor] .
+  ops a b : -> Origin [ctor] .
+  subsort Origin < Origins .
+  op none : -> Origins [ctor] .
+  op __ : Origins Origins -> Origins [ctor assoc comm id: none] .
+  op ready : Value Origins -> State [ctor] .
+  op pending : -> State [ctor] .
+  op read : State -> Expr [ctor] .
+  op array : State -> Expr [ctor] .
+  op both : State State -> Expr [ctor] .
+  op choose : State State -> Expr [ctor] .
+  op observed : State -> Result [ctor] .
+  subsort Expr < Result .
+  vars V W : Value . vars O P : Origins . var S : State .
+  rl [read] : read(S) => observed(S) .
+  rl [collection] : array(ready(V, O)) => observed(ready(V, O)) .
+  rl [defer-collection] : array(pending) => observed(pending) .
+  rl [strict] : both(ready(V, O), ready(W, P)) => observed(ready(yes, O P)) .
+  rl [strict-wait] : both(ready(V, O), pending) => observed(pending) .
+  rl [skip] : choose(ready(no, O), S) => observed(ready(no, O)) .
+  rl [take] : choose(ready(yes, O), ready(V, P)) => observed(ready(V, O P)) .
+  rl [take-wait] : choose(ready(yes, O), pending) => observed(pending) .
+  rl [selector-wait] : choose(pending, S) => observed(pending) .
+endm
+mod WHIPPLESCRIPT-ACTION-PENDING-AS-ABSENT is
+  including WHIPPLESCRIPT-ACTION-DEMAND .
+  rl [invent-absence] : array(pending) => observed(ready(absent, none)) .
+endm
+mod WHIPPLESCRIPT-ACTION-LOSES-SOURCES is
+  including WHIPPLESCRIPT-ACTION-DEMAND .
+  vars V W : Value . vars O P : Origins .
+  rl [drop-sources] : both(ready(V, O), ready(W, P)) => observed(ready(yes, none)) .
+endm
+mod WHIPPLESCRIPT-ACTION-WAITS-VISIBLE is
+  including WHIPPLESCRIPT-ACTION-DEMAND .
+  var O : Origins .
+  rl [unselected-debt] : choose(ready(no, O), pending) => observed(pending) .
+endm

@@ -1,0 +1,54 @@
+--- DR-0100: accepting an argument/result is directional, unlike comparing two
+--- values. This bounded model keeps every optional/union alternative and the
+--- nominal identity of a record at the action boundary.
+fmod ACTION-VALUE-TYPES is
+  protecting BOOL .
+  sort Type .
+  ops integer decimal string null ticket review : -> Type [ctor] .
+  ops optional array sealed : Type -> Type [ctor] .
+  op either : Type Type -> Type [ctor] .
+  op fits : Type Type -> Bool .
+  op alternatives : Type -> Bool .
+  vars A B E F : Type .
+  eq alternatives(either(A, B)) = true .
+  eq alternatives(optional(A)) = true .
+  eq alternatives(A) = false [owise] .
+  eq fits(either(A, B), E) = fits(A, E) and fits(B, E) .
+  eq fits(optional(A), E) = fits(A, E) and fits(null, E) .
+  ceq fits(A, either(E, F)) = fits(A, E) or fits(A, F)
+    if not alternatives(A) .
+  ceq fits(A, optional(E)) = (A == null) or fits(A, E)
+    if not alternatives(A) .
+  eq fits(integer, decimal) = true .
+  eq fits(array(A), array(E)) = fits(A, E) .
+  --- Sealed payloads are invariant; no ciphertext retyping.
+  eq fits(A, E) = (A == E) [owise] .
+endfm
+
+mod WHIPPLESCRIPT-ACTION-VALUE-TYPES is
+  protecting ACTION-VALUE-TYPES .
+  sort Check .
+  op check : Type Type -> Check [ctor] .
+  ops accepted refused : -> Check [ctor] .
+  vars A E : Type .
+  crl [accept] : check(A, E) => accepted if fits(A, E) .
+  crl [refuse] : check(A, E) => refused if not fits(A, E) .
+endm
+
+mod WHIPPLESCRIPT-ACTION-DROPS-OPTIONAL is
+  including WHIPPLESCRIPT-ACTION-VALUE-TYPES .
+  vars A E : Type .
+  crl [forget-null] : check(optional(A), E) => accepted if fits(A, E) .
+endm
+
+mod WHIPPLESCRIPT-ACTION-DROPS-ALTERNATIVE is
+  including WHIPPLESCRIPT-ACTION-VALUE-TYPES .
+  vars A B E : Type .
+  crl [accept-one-alternative] : check(either(A, B), E) => accepted
+    if fits(A, E) or fits(B, E) .
+endm
+
+mod WHIPPLESCRIPT-ACTION-ERASES-RECORD is
+  including WHIPPLESCRIPT-ACTION-VALUE-TYPES .
+  rl [erase-record-identity] : check(ticket, review) => accepted .
+endm

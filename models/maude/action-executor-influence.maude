@@ -1,0 +1,31 @@
+mod WHIPPLESCRIPT-ACTION-EXECUTOR-INFLUENCE is
+  protecting BOOL .
+  sorts Value State .
+  ops public model provider : -> Value [ctor] .
+  ops alias endorse declassify : Value -> Value [ctor] .
+  op selected : Value Value -> Value [ctor] .
+  op project : Value Value Bool -> Value .
+  vars Original Override : Value .
+  eq project(Original, Override, false) = Original .
+  eq project(Original, Override, true) = Override .
+  op check : Value Bool -> State [ctor] .
+  ops allowed denied : -> State [ctor] .
+  var V : Value . var G : Bool .
+  rl [constant] : check(public, G) => allowed .
+  rl [model] : check(model, G) => denied .
+  rl [provider] : check(provider, G) => denied .
+  rl [alias] : check(alias(V), G) => check(V, G) .
+  rl [declassify] : check(declassify(V), G) => check(V, G) .
+  rl [endorsed-grant] : check(endorse(provider), true) => allowed .
+  rl [endorsed-without-grant] : check(endorse(provider), false) => denied .
+  rl [selector] : check(selected(provider, endorse(provider)), G) => denied .
+endm
+mod WHIPPLESCRIPT-ACTION-EXECUTOR-INFLUENCE-LOST is
+  including WHIPPLESCRIPT-ACTION-EXECUTOR-INFLUENCE .
+  var G : Bool .
+  rl [lost-alias] : check(alias(provider), G) => allowed .
+  rl [grant-only] : check(provider, true) => allowed .
+  rl [marker-only] : check(endorse(provider), false) => allowed .
+  rl [crossed-selector] : check(selected(provider, endorse(provider)), true) => allowed .
+  rl [wrong-axis] : check(declassify(provider), G) => allowed .
+endm

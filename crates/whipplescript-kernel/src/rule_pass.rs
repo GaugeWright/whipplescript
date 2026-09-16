@@ -31,6 +31,7 @@ use crate::rule_lowering::{
     context_from_record, context_record_json, json_from_str, lower_rule, ready_contexts_for,
     stable_hash_hex, GuardReport, RuleContext,
 };
+use crate::source_action::rule::{StoredContext, StoredProjectionError};
 use crate::RuntimeKernel;
 
 /// One operator-cancelled firing: the rule's name, the firing identity, and the
@@ -197,6 +198,155 @@ pub fn step_instance_generic<S: RuntimeStore + Coordination + WorkItems + Fronti
     kernel: &mut RuntimeKernel<S>,
     instance_id: &str,
     ir: &IrProgram,
+    source_path: Option<&Path>,
+    active_version_guard: Option<&str>,
+) -> Result<StepReport, StoreError> {
+    if ir.execution_semantics != whipplescript_parser::ExecutionSemantics::LegacyActionChainsV1 {
+        return Err(StoreError::Conflict(
+            "typed execution requires the complete executable program".into(),
+        ));
+    }
+    step_instance_with_plans_generic(
+        kernel,
+        instance_id,
+        ir,
+        &std::collections::BTreeMap::new(),
+        source_path,
+        active_version_guard,
+    )
+}
+
+/// Drive one already verified executable program. This is the single rule-pass
+/// seam for the typed machine: matching, replay, commit arbitration and effect
+/// execution remain owned by the existing runtime; only body projection is
+/// selected from the program version's checked plan map.
+pub fn step_executable_program_generic<
+    S: RuntimeStore + Coordination + WorkItems + FrontierRead,
+>(
+    kernel: &mut RuntimeKernel<S>,
+    instance_id: &str,
+    executable: &crate::program_artifact::ExecutableProgram,
+    source_path: Option<&Path>,
+    active_version_guard: Option<&str>,
+) -> Result<StepReport, StoreError> {
+    executable.validate().map_err(StoreError::Conflict)?;
+    let active = kernel
+        .store()
+        .get_instance(instance_id)?
+        .ok_or_else(|| StoreError::Conflict("instance does not exist".into()))?;
+    if let Some(guard) = active_version_guard {
+        if guard != active.version_id {
+            return Err(StoreError::Conflict(format!(
+                "active version changed before executable dispatch from {guard} to {}; reload the active program",
+                active.version_id
+            )));
+        }
+    }
+    let version = kernel
+        .store()
+        .get_program_version(&active.version_id)?
+        .ok_or_else(|| StoreError::Conflict("active program version does not exist".into()))?;
+    let (semantics, artifact) =
+        crate::program_artifact::recorded_execution_metadata(&version.analysis_summary_json)
+            .map_err(StoreError::Conflict)?;
+    if semantics != executable.program().execution_semantics
+        || version.program_name != executable.program().workflow
+        || version.ir_hash != executable.identity_hash().map_err(StoreError::Conflict)?
+        || semantics == whipplescript_parser::ExecutionSemantics::TypedActionsV1
+            && artifact.is_none()
+    {
+        return Err(StoreError::Conflict(
+            "executable program does not match the active recorded version".into(),
+        ));
+    }
+    step_instance_with_plans_generic(
+        kernel,
+        instance_id,
+        executable.program(),
+        executable.typed_actions(),
+        source_path,
+        active_version_guard,
+    )
+}
+
+/// Load the active version's immutable executable and drive it through the
+/// shared rule pass. Runtime hosts use this entry point so execution semantics
+/// come from durable version metadata rather than from a caller's compiler
+/// choice. The optional IR preserves only old, uncaptured legacy versions whose
+/// source was never content-addressed; it can never select typed semantics.
+pub fn step_active_program_generic<S: RuntimeStore + Coordination + WorkItems + FrontierRead>(
+    kernel: &mut RuntimeKernel<S>,
+    instance_id: &str,
+    uncaptured_legacy_ir: Option<&IrProgram>,
+    source_path: Option<&Path>,
+    active_version_guard: Option<&str>,
+) -> Result<StepReport, StoreError> {
+    let active = kernel
+        .store()
+        .get_instance(instance_id)?
+        .ok_or_else(|| StoreError::Conflict("instance does not exist".into()))?;
+    if let Some(guard) = active_version_guard {
+        if guard != active.version_id {
+            return Err(StoreError::Conflict(format!(
+                "active version changed before program load from {guard} to {}; reload the instance",
+                active.version_id
+            )));
+        }
+    }
+    let version = kernel
+        .store()
+        .get_program_version(&active.version_id)?
+        .ok_or_else(|| StoreError::Conflict("active program version does not exist".into()))?;
+    let (semantics, artifact) =
+        crate::program_artifact::recorded_execution_metadata(&version.analysis_summary_json)
+            .map_err(StoreError::Conflict)?;
+    if artifact.is_none()
+        && semantics == whipplescript_parser::ExecutionSemantics::LegacyActionChainsV1
+        && kernel.store().get_content(&version.source_hash)?.is_none()
+    {
+        let Some(ir) = uncaptured_legacy_ir else {
+            return Err(StoreError::Conflict(format!(
+                "active legacy program `{}` has neither an executable capture, stored source nor caller fallback",
+                active.version_id
+            )));
+        };
+        if ir.execution_semantics != whipplescript_parser::ExecutionSemantics::LegacyActionChainsV1
+        {
+            return Err(StoreError::Conflict(
+                "active legacy version cannot use a typed executable fallback".into(),
+            ));
+        }
+        return step_instance_generic(
+            kernel,
+            instance_id,
+            ir,
+            source_path,
+            Some(&active.version_id),
+        );
+    }
+    let Some(executable) = load_version_program(kernel, instance_id, &active.version_id)? else {
+        return Err(StoreError::Conflict(format!(
+            "active executable program `{}` is unavailable",
+            active.version_id
+        )));
+    };
+    step_executable_program_generic(
+        kernel,
+        instance_id,
+        &executable,
+        source_path,
+        Some(&active.version_id),
+    )
+}
+
+fn step_instance_with_plans_generic<S: RuntimeStore + Coordination + WorkItems + FrontierRead>(
+    kernel: &mut RuntimeKernel<S>,
+    instance_id: &str,
+    ir: &IrProgram,
+    typed_actions: &std::collections::BTreeMap<
+        String,
+        whipplescript_parser::action_plan::resolved::TypedActionPlan,
+    >,
     source_path: Option<&Path>,
     active_version_guard: Option<&str>,
 ) -> Result<StepReport, StoreError> {
@@ -383,6 +533,7 @@ pub fn step_instance_generic<S: RuntimeStore + Coordination + WorkItems + Fronti
         > = std::collections::HashMap::new();
         let mut effect_terminal_sequence: std::collections::HashMap<String, i64> =
             std::collections::HashMap::new();
+        let mut action_journal = crate::source_action::journal::Journal::default();
         let (recorded_firings, cancelled_firings): (Vec<RecordedFiring>, Vec<CancelledFiring>) = {
             let mut live: Vec<&EventView> = Vec::new();
             for event in &events {
@@ -442,6 +593,9 @@ pub fn step_instance_generic<S: RuntimeStore + Coordination + WorkItems + Fronti
             }
             let mut recorded = Vec::new();
             for event in live {
+                action_journal.apply(event).map_err(|error| {
+                    StoreError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+                })?;
                 // A proved result can arrive after the original run expired.
                 // Its run terminal stays final, but the firing still owes its
                 // ordinary continuation after this newer result publication.
@@ -581,12 +735,10 @@ pub fn step_instance_generic<S: RuntimeStore + Coordination + WorkItems + Fronti
         // DR-0043 slice 3 (old-body completion): a firing admitted under an
         // earlier program version completes under THAT version's rule body,
         // with its admission-time epoch in every derived key -- the firing
-        // owns its bindings AND its code. Sources are content-addressed
-        // (`put_content` at version-creation/drive time; blob id ==
-        // source_hash), so the old body is a store read + compile, cached per
-        // pass. A missing blob (a version never driven since the pinning
-        // surface landed) records one loud diagnostic and skips -- never a
-        // silent stall, never a wrong-body lowering.
+        // owns its bindings AND its code. Complete captured programs load
+        // directly from the content store. Older uncaptured versions use the
+        // recorded legacy source compiler. Both are cached per pass; an
+        // unavailable version records a diagnostic and cannot use the new body.
         let (active_recorded, old_recorded): (Vec<&RecordedFiring>, Vec<&RecordedFiring>) =
             recorded_firings.iter().partition(|firing| {
                 firing.version_id.as_deref() == Some(active_version_id.as_str())
@@ -606,21 +758,24 @@ pub fn step_instance_generic<S: RuntimeStore + Coordination + WorkItems + Fronti
                 )
             })
             .collect();
-        let mut old_irs: std::collections::BTreeMap<String, Option<IrProgram>> =
-            std::collections::BTreeMap::new();
+        let mut old_programs: std::collections::BTreeMap<
+            String,
+            Option<crate::program_artifact::ExecutableProgram>,
+        > = std::collections::BTreeMap::new();
         for firing in &old_recorded {
             let Some(version_id) = firing.version_id.as_deref() else {
                 continue;
             };
-            if old_irs.contains_key(version_id) {
+            if old_programs.contains_key(version_id) {
                 continue;
             }
-            let loaded = load_version_ir(kernel, instance_id, version_id)?;
-            old_irs.insert(version_id.to_owned(), loaded);
+            let loaded = load_version_program(kernel, instance_id, version_id)?;
+            old_programs.insert(version_id.to_owned(), loaded);
         }
 
         struct LoweringGroup<'g> {
             ir: &'g IrProgram,
+            typed: Option<&'g whipplescript_parser::action_plan::resolved::TypedActionPlan>,
             rule_name: String,
             version_id: String,
             epoch_key: String,
@@ -740,6 +895,7 @@ pub fn step_instance_generic<S: RuntimeStore + Coordination + WorkItems + Fronti
             }
             groups.push(LoweringGroup {
                 ir,
+                typed: typed_actions.get(&rule.name),
                 rule_name: rule.name.clone(),
                 version_id: active_version_id.clone(),
                 epoch_key: active_revision_epoch_key.clone(),
@@ -750,9 +906,11 @@ pub fn step_instance_generic<S: RuntimeStore + Coordination + WorkItems + Fronti
             let Some(version_id) = firing.version_id.as_deref() else {
                 continue;
             };
-            let Some(Some(old_ir)) = old_irs.get(version_id) else {
+            let Some(Some(old_program)) = old_programs.get(version_id) else {
                 continue;
             };
+            let old_ir = &old_program.program;
+            let old_typed = old_program.typed_actions.get(&firing.rule);
             let epoch_key =
                 revision_branch_key(firing.epoch, bound_branch.as_deref(), restore_generation);
             if let Some(group) = groups.iter_mut().find(|group| {
@@ -769,6 +927,7 @@ pub fn step_instance_generic<S: RuntimeStore + Coordination + WorkItems + Fronti
             } else {
                 groups.push(LoweringGroup {
                     ir: old_ir,
+                    typed: old_typed,
                     rule_name: firing.rule.clone(),
                     version_id: version_id.to_owned(),
                     epoch_key,
@@ -787,20 +946,63 @@ pub fn step_instance_generic<S: RuntimeStore + Coordination + WorkItems + Fronti
                 continue;
             };
             for context in group.contexts {
-                let mut lowering = lower_rule_with_region(
-                    instance_id,
-                    &group.version_id,
-                    &group.epoch_key,
-                    kernel.coercion_config_fingerprint(),
-                    ir,
-                    rule,
-                    &context,
-                    &facts,
-                    &all_facts,
-                    &effects,
-                    source_path,
-                    &active_fact_ids,
-                );
+                let frame = crate::source_action::journal::Frame {
+                    version: group.version_id.clone(),
+                    revision: group.epoch_key.clone(),
+                    rule: rule.name.clone(),
+                    identity: context.identity.clone(),
+                    trigger_event: context.trigger_event_id.clone(),
+                };
+                let mut managed_error_span = None;
+                let (mut lowering, evaluated_frontier) = if let Some(typed) = group.typed {
+                    match crate::source_action::rule::project_regions_from_store(
+                        kernel.store(),
+                        StoredContext {
+                            ir,
+                            typed,
+                            instance: instance_id,
+                            frame: &frame,
+                            admission: &context,
+                            journal: &action_journal,
+                            coercion_fingerprint: kernel.coercion_config_fingerprint(),
+                            source_path,
+                        },
+                        pass_head_sequence,
+                    ) {
+                        Ok(progression) => (progression.lowering, Some(progression.frontier)),
+                        Err(StoredProjectionError::Store(error)) => {
+                            return Err(error);
+                        }
+                        Err(StoredProjectionError::Projection(error)) => {
+                            managed_error_span = Some(error.span);
+                            (
+                                OwnedLowering {
+                                    errors: vec![error.message],
+                                    ..Default::default()
+                                },
+                                Some(pass_head_sequence),
+                            )
+                        }
+                    }
+                } else {
+                    (
+                        lower_rule_with_region(
+                            instance_id,
+                            &group.version_id,
+                            &group.epoch_key,
+                            kernel.coercion_config_fingerprint(),
+                            ir,
+                            rule,
+                            &context,
+                            &facts,
+                            &all_facts,
+                            &effects,
+                            source_path,
+                            &active_fact_ids,
+                        ),
+                        None,
+                    )
+                };
                 // Consumption is idempotent under pinned re-lowering
                 // (DR-0043): a recorded firing re-lowers its own already-
                 // committed `done` (or races a sibling's); a fact no longer
@@ -968,7 +1170,15 @@ pub fn step_instance_generic<S: RuntimeStore + Coordination + WorkItems + Fronti
                             ),
                         )),
                         message: &message,
-                        source_span_json: None,
+                        source_span_json: managed_error_span
+                            .map(|span| {
+                                crate::rule_lowering::source_span_json(
+                                    source_path,
+                                    span,
+                                    "managed action",
+                                )
+                            })
+                            .as_deref(),
                         subject_type: Some("rule"),
                         subject_id: Some(&rule.name),
                         event_id: None,
@@ -1003,10 +1213,11 @@ pub fn step_instance_generic<S: RuntimeStore + Coordination + WorkItems + Fronti
                         .strip_prefix("__then_")
                         .unwrap_or(&unhandled.binding);
                     let message = format!(
-                        "unhandled failure of `{named}` in rule `{}` (effect {}): the \
+                        "unhandled failure of `{named}` in rule `{}` (effect {}, status {}): the \
                          `@service` workflow keeps running; handle it with `after {named} \
-                         fails {{ … }}` or retry the effect",
-                        unhandled.rule, unhandled.status
+                         fails {{ … }}`, add `on failure as problem {{ … }}` to the rule, or \
+                         retry the effect",
+                        unhandled.rule, unhandled.effect_id, unhandled.status
                     );
                     kernel.store().record_diagnostic(DiagnosticRecord {
                         instance_id: Some(instance_id),
@@ -1037,14 +1248,7 @@ pub fn step_instance_generic<S: RuntimeStore + Coordination + WorkItems + Fronti
                         ])),
                     })?;
                 }
-                if lowering.facts.is_empty()
-                    && lowering.consumed_fact_ids.is_empty()
-                    && lowering.effects.is_empty()
-                    && lowering.dependencies.is_empty()
-                    && lowering.cancels.is_empty()
-                    && lowering.terminal.is_none()
-                    && lowering.internal_fail.is_none()
-                {
+                if !lowering.has_commit_work() {
                     continue;
                 }
                 // Auto-fail (R1): an unhandled effect failure in a self-terminating
@@ -1081,83 +1285,21 @@ pub fn step_instance_generic<S: RuntimeStore + Coordination + WorkItems + Fronti
                         Err(error) => return Err(error),
                     }
                 }
-                let consumed_fact_ids = lowering
-                    .consumed_fact_ids
-                    .iter()
-                    .map(String::as_str)
-                    .collect::<Vec<_>>();
-                let new_facts = lowering
-                    .facts
-                    .iter()
-                    .map(OwnedFact::as_new_fact)
-                    .collect::<Vec<_>>();
-                let new_effects = lowering
-                    .effects
-                    .iter()
-                    .map(OwnedEffect::as_new_effect)
-                    .collect::<Vec<_>>();
-                let new_dependencies = lowering
-                    .dependencies
-                    .iter()
-                    .map(OwnedDependency::as_new_dependency)
-                    .collect::<Vec<_>>();
-                let terminal = lowering
-                    .terminal
-                    .as_ref()
-                    .map(OwnedWorkflowTerminal::as_workflow_terminal);
-                let lowering_key = lowering_idempotency_key(&lowering);
-                let commit_key = idempotency_key(&[
+                let committed = commit_lowering(
+                    kernel,
                     instance_id,
-                    &group.version_id,
-                    &group.epoch_key,
-                    &rule.name,
-                    context.identity.as_deref().unwrap_or("started"),
-                    // The ADMITTING event disambiguates re-admissions: a fact
-                    // consumed and later re-recorded with identical content
-                    // has the same content-keyed identity but a fresh
-                    // admission, and the rule must fire again rather than
-                    // collide with the first firing's commit. Replay-safe:
-                    // the pinned context records trigger_event_id, so
-                    // re-lowering a committed firing reproduces the same key.
-                    context.trigger_event_id.as_deref().unwrap_or("-"),
-                    &lowering_key,
-                ]);
-                // Named cut points (experimentation surface): every
-                // declared `mark "<name>" after <site>` riding this rule is
-                // stamped IN the commit transaction — a durable commit can
-                // never exist without its cut coordinate. One event per
-                // firing, so a looping site marks each pass.
-                // DR-0043 slice 1: embed the firing's pinned context (identity
-                // + bound trigger values) in the commit record, making every
-                // firing self-contained for pinned re-lowering and the
-                // `whip progressions` view.
-                let context_record = context_record_json(&context);
-                let mark_names: Vec<&str> = ir
-                    .marks
-                    .iter()
-                    .filter(|mark| mark.site == rule.name)
-                    .map(|mark| mark.name.as_str())
-                    .collect();
-                let event = kernel.commit_rule_with_revision_guard(
-                    RuleCommit {
-                        instance_id,
-                        rule: &rule.name,
-                        trigger_event_id: context.trigger_event_id.as_deref(),
-                        facts: &new_facts,
-                        consumed_fact_ids: &consumed_fact_ids,
-                        effects: &new_effects,
-                        dependencies: &new_dependencies,
-                        terminal,
-                        idempotency_key: Some(&commit_key),
-                        marks: &mark_names,
-                        context_json: Some(&context_record),
-                    },
+                    ir,
+                    &context,
+                    &frame,
+                    &lowering,
+                    &action_journal,
+                    pass_head_sequence,
                     RuleCommitRevisionGuard {
+                        evaluated_frontier,
                         program_version_id: &active_version_id,
                         revision_epoch: active_revision_epoch,
                     },
-                );
-                let committed = event?;
+                )?;
                 // Cancels run on replays too: they are status-guarded no-ops
                 // once applied, and a crash between the original commit and
                 // its cancel application would otherwise lose the cancels
@@ -1178,9 +1320,9 @@ pub fn step_instance_generic<S: RuntimeStore + Coordination + WorkItems + Fronti
                     continue;
                 }
                 report.committed_rules += 1;
-                report.facts_created += new_facts.len();
-                report.facts_consumed += consumed_fact_ids.len();
-                report.effects_created += new_effects.len();
+                report.facts_created += lowering.facts.len();
+                report.facts_consumed += lowering.consumed_fact_ids.len();
+                report.effects_created += lowering.effects.len();
                 // Holder-lifetime bound (spec/coordination.md): an
                 // instance reaching a workflow terminal auto-releases
                 // every lease it held.
@@ -1444,6 +1586,7 @@ fn lower_rule_with_region(
         provenance_class: "kernel".to_owned(),
         correlation_id: context.identity.clone(),
         source_span_json: None,
+        validity_json: None,
     });
     for region_effect in &region.effects {
         let Some(effect_id) = region_effect_id(
@@ -1607,17 +1750,36 @@ fn recorded_firing_from_payload(payload_json: &str) -> Option<RecordedFiring> {
     })
 }
 
+/// Pure receipt projection for managed statements, using the ordinary firing
+/// decoder and its carry semantics. Events are the driver's retained, instance-
+/// scoped prefix after restore; source captures need not occur in every commit.
+pub(crate) fn recorded_facts_for_firing(
+    events: &[EventView],
+    frame: &crate::source_action::journal::Frame,
+) -> std::collections::BTreeSet<String> {
+    events
+        .iter()
+        .filter(|event| event.event_type == "rule.committed")
+        .filter_map(|event| recorded_firing_from_payload(&event.payload_json))
+        .filter(|firing| {
+            firing.rule == frame.rule
+                && firing.context.identity == frame.identity
+                && firing.context.trigger_event_id == frame.trigger_event
+        })
+        .flat_map(|firing| firing.fact_ids)
+        .collect()
+}
+
 /// Loads and compiles the rule bodies of an OLD program version for old-body
-/// completion (DR-0043 Decision 3). The source is content-addressed: version
-/// creation and every verified drive `put_content` it, so the blob id is the
-/// version's `source_hash`. A missing blob or a failed compile records ONE
-/// loud diagnostic (idempotent per version) and returns `None` -- the firing
-/// is skipped visibly, never lowered under the wrong body.
-fn load_version_ir<S: RuntimeStore>(
+/// completion (DR-0043 Decision 3). A complete program capture is read under
+/// its immutable version's content hash. Uncaptured legacy versions retain the
+/// recorded source compiler. Missing/corrupt captures never fall back to that
+/// compiler: one version-specific diagnostic explains the unavailable firing.
+fn load_version_program<S: RuntimeStore>(
     kernel: &mut RuntimeKernel<S>,
     instance_id: &str,
     version_id: &str,
-) -> Result<Option<IrProgram>, StoreError> {
+) -> Result<Option<crate::program_artifact::ExecutableProgram>, StoreError> {
     let unavailable = |kernel: &RuntimeKernel<S>, detail: &str| -> Result<(), StoreError> {
         let message = format!(
             "cannot complete progressions admitted under program version `{version_id}`: {detail}"
@@ -1650,28 +1812,27 @@ fn load_version_ir<S: RuntimeStore>(
         })?;
         Ok(())
     };
-    let Some(view) = kernel.store().get_program_version(version_id)? else {
-        unavailable(kernel, "the version record is missing")?;
-        return Ok(None);
-    };
-    let Some(source) = kernel.store().get_content(&view.source_hash)? else {
-        unavailable(
-            kernel,
-            "its source is not in the content store (the version was never driven \
-             since source pinning landed)",
-        )?;
-        return Ok(None);
-    };
-    let compiled =
-        whipplescript_parser::compile_program_with_root(&source, Some(&view.program_name));
-    match compiled.ir {
-        Some(ir) => Ok(Some(ir)),
-        None => {
-            unavailable(kernel, "its stored source no longer compiles")?;
+    match crate::program_artifact::load_recorded_version(kernel.store(), version_id)? {
+        crate::program_artifact::RecordedLoad::Ready(executable) => Ok(Some(*executable)),
+        crate::program_artifact::RecordedLoad::Unavailable(detail) => {
+            unavailable(kernel, &detail)?;
             Ok(None)
         }
     }
 }
+
+#[cfg(all(test, feature = "native"))]
+fn load_version_ir<S: RuntimeStore>(
+    kernel: &mut RuntimeKernel<S>,
+    instance_id: &str,
+    version_id: &str,
+) -> Result<Option<IrProgram>, StoreError> {
+    Ok(load_version_program(kernel, instance_id, version_id)?.map(|executable| executable.program))
+}
+
+#[cfg(all(test, feature = "native"))]
+#[path = "rule_pass/recorded_semantics_tests.rs"]
+mod recorded_semantics_tests;
 
 /// Holder-lifetime release on terminal (spec/coordination.md principle 3 +
 /// spec/work-queues.md): an instance that reaches ANY terminal — a rule-driven
@@ -1901,8 +2062,159 @@ fn project_tracker_closings<S: RuntimeStore + WorkItems>(
     Ok(())
 }
 
+/// One shared commit path for native and hosted rule advancement, including
+/// capture-only local evaluation. All data lands under the same revision guard.
+pub(crate) fn commit_lowering<S: RuntimeStore>(
+    kernel: &mut RuntimeKernel<S>,
+    instance_id: &str,
+    ir: &IrProgram,
+    context: &RuleContext,
+    frame: &crate::source_action::journal::Frame,
+    lowering: &OwnedLowering,
+    journal: &crate::source_action::journal::Journal,
+    frontier: i64,
+    guard: RuleCommitRevisionGuard<'_>,
+) -> Result<whipplescript_store::StoredEvent, StoreError> {
+    journal
+        .check_root(frame, lowering.action_root.as_ref(), frontier)
+        .and_then(|()| journal.check(frame, &lowering.action_captures, frontier))
+        .and_then(|()| {
+            journal.check_regions(
+                frame,
+                &lowering.action_regions,
+                lowering.action_root.as_ref(),
+                frontier,
+            )
+        })
+        .map_err(|error| {
+            StoreError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+        })?;
+    let consumed_fact_ids = lowering
+        .consumed_fact_ids
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    let new_facts = lowering
+        .facts
+        .iter()
+        .map(OwnedFact::as_new_fact)
+        .collect::<Vec<_>>();
+    let new_effects = lowering
+        .effects
+        .iter()
+        .map(OwnedEffect::as_new_effect)
+        .collect::<Vec<_>>();
+    let new_dependencies = lowering
+        .dependencies
+        .iter()
+        .map(OwnedDependency::as_new_dependency)
+        .collect::<Vec<_>>();
+    let terminal = lowering
+        .terminal
+        .as_ref()
+        .map(OwnedWorkflowTerminal::as_workflow_terminal);
+    let lowering_key = lowering_idempotency_key(lowering);
+    let commit_key = idempotency_key(&[
+        instance_id,
+        &frame.version,
+        &frame.revision,
+        &frame.rule,
+        context.identity.as_deref().unwrap_or("started"),
+        // The ADMITTING event disambiguates re-admissions: a fact
+        // consumed and later re-recorded with identical content
+        // has the same content-keyed identity but a fresh
+        // admission, and the rule must fire again rather than
+        // collide with the first firing's commit. Replay-safe:
+        // the pinned context records trigger_event_id, so
+        // re-lowering a committed firing reproduces the same key.
+        context.trigger_event_id.as_deref().unwrap_or("-"),
+        &lowering_key,
+    ]);
+    // Named cut points (experimentation surface): every
+    // declared `mark "<name>" after <site>` riding this rule is
+    // stamped IN the commit transaction — a durable commit can
+    // never exist without its cut coordinate. One event per
+    // firing, so a looping site marks each pass.
+    // DR-0043 slice 1: embed the firing's pinned context (identity
+    // + bound trigger values) in the commit record, making every
+    // firing self-contained for pinned re-lowering and the
+    // `whip progressions` view.
+    let context_record = crate::source_action::journal::context_with_captures(
+        &context_record_json(context),
+        frame,
+        &lowering.action_captures,
+        frontier,
+    )
+    .map_err(|error| StoreError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, error)))?;
+    let context_record = crate::source_action::journal::root::context_with_root(
+        &context_record,
+        frame,
+        lowering.action_root.as_ref(),
+        frontier,
+    )
+    .map_err(|error| StoreError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, error)))?;
+    let context_record = crate::source_action::journal::regions::context_with_regions(
+        &context_record,
+        frame,
+        &lowering.action_regions,
+        frontier,
+    )
+    .map_err(|error| StoreError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, error)))?;
+    let mark_names: Vec<&str> = ir
+        .marks
+        .iter()
+        .filter(|mark| mark.site == frame.rule)
+        .map(|mark| mark.name.as_str())
+        .collect();
+    let guard = RuleCommitRevisionGuard {
+        evaluated_frontier: if lowering.action_captures.is_empty()
+            && lowering.action_root.is_none()
+            && lowering.action_regions.is_empty()
+        {
+            guard.evaluated_frontier
+        } else {
+            Some(frontier)
+        },
+        ..guard
+    };
+    kernel.commit_rule_with_revision_guard(
+        RuleCommit {
+            instance_id,
+            rule: &frame.rule,
+            trigger_event_id: context.trigger_event_id.as_deref(),
+            facts: &new_facts,
+            consumed_fact_ids: &consumed_fact_ids,
+            effects: &new_effects,
+            dependencies: &new_dependencies,
+            terminal,
+            idempotency_key: Some(&commit_key),
+            marks: &mark_names,
+            context_json: Some(&context_record),
+        },
+        guard,
+    )
+}
+
 pub fn lowering_idempotency_key(lowering: &OwnedLowering) -> String {
     let mut ids: Vec<String> = Vec::new();
+    if !lowering.action_regions.is_empty() {
+        ids.push(format!(
+            "action-regions:{}",
+            crate::source_action::journal::regions::identity(&lowering.action_regions)
+        ));
+    }
+    if let Some(root) = &lowering.action_root {
+        ids.push(format!(
+            "action-root:{}",
+            crate::source_action::journal::root::identity(root)
+        ));
+    }
+    if !lowering.action_captures.is_empty() {
+        ids.push(format!(
+            "action-captures:{}",
+            crate::source_action::journal::capture_identity(&lowering.action_captures)
+        ));
+    }
     // Each id carries what the lowering DOES with it. Recorded and consumed ids
     // were concatenated into one flat list, so a lowering that RECORDS fact X
     // and one that CONSUMES fact X derived the same key — and the commit that

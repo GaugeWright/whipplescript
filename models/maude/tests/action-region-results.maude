@@ -1,0 +1,40 @@
+load ../action-region-results.maude
+
+--- Coverage: clean continuation, post-exit tail, and lapse at entry.
+search [1] in WHIPPLESCRIPT-ACTION-REGION-RESULTS : start(false, true, true, false) =>* frame(closedClean, succeeded, false, true, true, false, afterResult ; none) .
+search [1] in WHIPPLESCRIPT-ACTION-REGION-RESULTS : start(false, false, true, true) =>* frame(closedClean, succeeded, false, false, true, true, postResult ; none) .
+search [1] in WHIPPLESCRIPT-ACTION-REGION-RESULTS : start(false, false, true, false) =>* frame(closedLapse, absent, false, false, true, false, lapseResult ; none) .
+--- A selected held return and lapse return can BOTH survive in one history.
+search [1] in WHIPPLESCRIPT-ACTION-REGION-RESULTS : start(true, false, true, false) =>* frame(closedLapse, cancelled, true, false, true, false, lapseResult ; heldResult ; none) .
+--- A success-continuation return plus a lapse return covers the bounded
+--- selection histories. This does not claim cancellation was recovered.
+search [1] in WHIPPLESCRIPT-ACTION-REGION-RESULTS : start(false, true, true, false) =>* frame(Q:Phase, W:Worker, false, true, true, false, none) such that Q:Phase == closedClean or Q:Phase == closedLapse .
+--- Post-region alone leaves an entry-lapse resultless, with no owned cause.
+search [1] in WHIPPLESCRIPT-ACTION-REGION-RESULTS : start(false, false, false, true) =>* frame(closedLapse, absent, false, false, false, true, none) .
+
+--- Negative control: post-region continuation is not a lapse fallback.
+search [1] in WHIPPLESCRIPT-ACTION-REGION-RESULTS : start(false, false, false, true) =>* frame(closedLapse, W:Worker, false, false, false, true, R:Results) such that has(postResult, R:Results) .
+search [1] in WHIPPLESCRIPT-ACTION-REGION-POST-ON-LAPSE : start(false, false, false, true) =>* frame(closedLapse, W:Worker, false, false, false, true, R:Results) such that has(postResult, R:Results) .
+--- Negative control: late success settles ownership but fires no continuation.
+search [1] in WHIPPLESCRIPT-ACTION-REGION-RESULTS : start(false, true, true, false) =>* frame(closedLapse, succeeded, false, true, true, false, R:Results) such that has(afterResult, R:Results) .
+search [1] in WHIPPLESCRIPT-ACTION-REGION-LATE-CONTINUATION : start(false, true, true, false) =>* frame(closedLapse, succeeded, false, true, true, false, R:Results) such that has(afterResult, R:Results) .
+--- Negative control: start AFTER the held candidate was selected, so entry
+--- lapse cannot make the erased-history witness vacuous.
+search [1] in WHIPPLESCRIPT-ACTION-REGION-RESULTS : frame(holding, running, true, false, true, false, heldResult ; none) =>* frame(closedLapse, W:Worker, true, false, true, false, R:Results) such that not has(heldResult, R:Results) .
+search [1] in WHIPPLESCRIPT-ACTION-REGION-ERASES-HISTORY : frame(holding, running, true, false, true, false, heldResult ; none) =>* frame(closedLapse, W:Worker, true, false, true, false, R:Results) such that not has(heldResult, R:Results) .
+--- Negative control: the cancellation request is not terminal evidence.
+search [1] in WHIPPLESCRIPT-ACTION-REGION-RESULTS : start(false, false, true, false) =>* frame(closedLapse, requested, false, false, true, false, R:Results) .
+search [1] in WHIPPLESCRIPT-ACTION-REGION-REQUEST-IS-ACK : start(false, false, true, false) =>* frame(closedLapse, requested, false, false, true, false, R:Results) .
+--- Negative control: lapse selects its candidate exactly once.
+search [1] in WHIPPLESCRIPT-ACTION-REGION-RESULTS : start(false, false, true, false) =>* frame(closedLapse, W:Worker, false, false, true, false, R:Results) such that count(R:Results) > 1 .
+search [1] in WHIPPLESCRIPT-ACTION-REGION-REPEATS-LAPSE : start(false, false, true, false) =>* frame(closedLapse, W:Worker, false, false, true, false, R:Results) such that count(R:Results) > 1 .
+
+--- Coverage: acknowledged cancellation and late success both drain the join.
+search [1] in WHIPPLESCRIPT-ACTION-REGION-RESULTS : start(false, true, true, false) =>* frame(closedLapse, cancelled, false, true, true, false, lapseResult ; none) .
+search [1] in WHIPPLESCRIPT-ACTION-REGION-RESULTS : start(false, true, true, false) =>* frame(closedLapse, succeeded, false, true, true, false, lapseResult ; none) .
+--- Missing clean results and two independently ready held results are real.
+search [1] in WHIPPLESCRIPT-ACTION-REGION-RESULTS : start(false, false, true, false) =>* frame(closedClean, succeeded, false, false, true, false, none) .
+search [1] in WHIPPLESCRIPT-ACTION-REGION-RESULTS : start(true, true, false, false) =>* frame(closedClean, succeeded, true, true, false, false, R:Results) such that count(R:Results) > 1 .
+--- A candidate remains provisional while the cancellation is unacknowledged.
+search [1] in WHIPPLESCRIPT-ACTION-REGION-RESULTS : start(false, true, true, false) =>* frame(lapseSelected, requested, false, true, true, false, lapseResult ; none) .
+quit

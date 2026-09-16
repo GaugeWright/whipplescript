@@ -69,8 +69,9 @@ rusqlite = { version = "0.40.1", features = ["bundled"] }
 # The kernel has zero compile-time knowledge of any external provider.
 default = ["native"]
 native = ["whipplescript-store/native"]
-# Exposes deterministic legacy-envelope construction only to downstream test
-# targets. Production embeddings must use an external governance signature.
+# Exposes shared conformance witnesses and deterministic legacy-envelope
+# construction to downstream tests. Production embeddings must use an external
+# governance signature.
 test-support = []
 
 [lints]

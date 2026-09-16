@@ -1021,6 +1021,57 @@ impl StepMachine for CoerceStepMachine<'_> {
 // request identically before their transports run it. Native builds it from the
 // workspace program; the DO from its program metadata.
 
+/// Build captured call parts for the two inline schema-coerce forms.
+///
+/// Returns `(rendered_prompt, output_schema, wrapped, schema_name)`.
+pub fn build_inline_coerce_call_parts(
+    ir: &IrProgram,
+    input: &Value,
+) -> Result<Option<(String, Value, bool, String)>, String> {
+    let Some(function_name) = input.get("function_name").and_then(Value::as_str) else {
+        return Ok(None);
+    };
+    if !matches!(function_name, "prompt" | "decide") {
+        return Ok(None);
+    }
+    let prompt = input
+        .get("prompt")
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("inline {function_name} effect has no rendered prompt"))?
+        .to_owned();
+    match function_name {
+        // Through `inline_prompt_call_parts`, not a flat `string`: an inline
+        // prompt names the type it asks for (DR-0120), and the two spellings of
+        // "what an inline prompt returns" have to be one answer. This
+        // dispatcher stays because it is also the one that knows about inline
+        // `decide`, which that function does not.
+        "prompt" => {
+            let output_type = input
+                .get("output_type")
+                .and_then(Value::as_str)
+                .unwrap_or("string");
+            Ok(Some(inline_prompt_call_parts(ir, output_type, prompt)))
+        }
+        "decide" => {
+            let schema = input
+                .get("output_schema")
+                .cloned()
+                .ok_or("inline decide effect has no captured output schema")?;
+            if schema.get("type").and_then(Value::as_str) != Some("object") {
+                // MUTATION-SUCCESS-EXPR: Ok(Some((prompt, schema, false, "CoerceResult".to_owned())))
+                return Err("inline decide output schema is not object-rooted".into());
+            }
+            input
+                .get("output_type")
+                .and_then(Value::as_str)
+                .filter(|name| !name.is_empty())
+                .ok_or("inline decide effect has no output type")?;
+            Ok(Some((prompt, schema, false, "InlineDecision".to_owned())))
+        }
+        _ => unreachable!("inline function matched above"),
+    }
+}
+
 /// Build the prompt and output schema for a declared coerce function.
 ///
 /// Returns `(rendered_prompt, output_schema, wrapped, schema_name)`.
@@ -1275,6 +1326,60 @@ rule go
             ],
             span: span(),
         })
+    }
+
+    #[test]
+    fn inline_coerce_parts_share_prompt_and_decide_host_contracts() {
+        let ir = whipplescript_parser::compile_program(
+            "workflow InlineParts\noutput result string\nrule finish when started => { complete result \"done\" }",
+        )
+        .ir
+        .unwrap();
+        assert!(build_inline_coerce_call_parts(
+            &ir,
+            &json!({"function_name":"named","prompt":"ignored"})
+        )
+        .unwrap()
+        .is_none());
+        assert_eq!(
+            build_inline_coerce_call_parts(&ir, &json!({"function_name":"prompt"})).unwrap_err(),
+            "inline prompt effect has no rendered prompt"
+        );
+        let (_, prompt_schema, wrapped, prompt_name) = build_inline_coerce_call_parts(
+            &ir,
+            &json!({"function_name":"prompt","prompt":"hello"}),
+        )
+        .unwrap()
+        .unwrap();
+        // The historical shape for an UNANNOTATED inline prompt: a bare
+        // `{"type": "string"}`, unwrapped, named `string` -- which is what every
+        // prompt written before the annotation already sends. This asserted the
+        // wrapped envelope, a shape only this branch ever produced and one that
+        // would change the request under every existing prompt. `-> <Type>`
+        // routes through the envelope; the default stays exactly as it was.
+        assert_eq!(prompt_schema["type"], "string");
+        assert!(!wrapped);
+        assert_eq!(prompt_name, "string");
+
+        for input in [
+            json!({"function_name":"decide","prompt":"choose","output_type":"shape"}),
+            json!({"function_name":"decide","prompt":"choose","output_schema":{"type":"object"}}),
+            json!({"function_name":"decide","prompt":"choose","output_type":"shape","output_schema":{"type":"string"}}),
+        ] {
+            assert!(build_inline_coerce_call_parts(&ir, &input).is_err());
+        }
+        let (_, schema, wrapped, name) = build_inline_coerce_call_parts(
+            &ir,
+            &json!({
+                "function_name":"decide", "prompt":"choose", "output_type":"shape",
+                "output_schema":{"type":"object","properties":{"safe":{"type":"boolean"}}}
+            }),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(schema["properties"]["safe"]["type"], "boolean");
+        assert!(!wrapped);
+        assert_eq!(name, "InlineDecision");
     }
 
     #[test]

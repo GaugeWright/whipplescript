@@ -1,0 +1,57 @@
+load ../parameterized-views.maude
+--- Membership and absence retain the exact captured frontier.
+search [1] in WHIPPLESCRIPT-PARAMETERIZED-VIEWS :
+  readView(tickets, 4, 9, 17) =>* viewValue(4, observed(tickets, 4, 17), 0) .
+search [1] in WHIPPLESCRIPT-PARAMETERIZED-VIEWS :
+  readView(effects, 4, 9, 0) =>* viewValue(4, observed(effects, 4, 0), 0) .
+--- Nested composition unions all premises and remains pure.
+search [1] in WHIPPLESCRIPT-PARAMETERIZED-VIEWS :
+  composeView(readView(tickets, 4, 9, 17), readView(effects, 4, 9, 0)) =>*
+  viewValue(4, observed(tickets, 4, 17) observed(effects, 4, 0), 0) .
+search [1] in WHIPPLESCRIPT-PARAMETERIZED-VIEWS :
+  composeView(composeView(readView(tickets, 4, 9, 17),
+                          readView(effects, 4, 9, 0)),
+              readView(tickets, 4, 9, 23)) =>*
+  viewValue(4, observed(tickets, 4, 17) observed(effects, 4, 0)
+               observed(tickets, 4, 23), 0) .
+--- Durable capture does not retarget or reissue the view.
+search [1] in WHIPPLESCRIPT-PARAMETERIZED-VIEWS :
+  reopenView(saveView(readView(tickets, 4, 9, 17))) =>*
+  viewValue(4, observed(tickets, 4, 17), 0) .
+search [1] in WHIPPLESCRIPT-PARAMETERIZED-VIEWS :
+  validateView(leaf) =>* accepted .
+
+--- Current semantics expose each forbidden weakening.
+search [1] in WHIPPLESCRIPT-PARAMETERIZED-VIEWS :
+  composeView(viewValue(4, observed(tickets, 4, 17), 0),
+              viewValue(5, observed(effects, 5, 0), 0)) =>*
+  viewValue(4, observed(tickets, 4, 17) observed(effects, 5, 0), 0) .
+search [1] in WHIPPLESCRIPT-PARAMETERIZED-VIEWS-MIXED-FRONTIER :
+  composeView(viewValue(4, observed(tickets, 4, 17), 0),
+              viewValue(5, observed(effects, 5, 0), 0)) =>*
+  viewValue(4, observed(tickets, 4, 17) observed(effects, 5, 0), 0) .
+search [1] in WHIPPLESCRIPT-PARAMETERIZED-VIEWS :
+  composeView(viewValue(4, observed(tickets, 4, 17), 0),
+              viewValue(4, observed(effects, 4, 0), 0)) =>*
+  viewValue(4, observed(tickets, 4, 17), 0) .
+search [1] in WHIPPLESCRIPT-PARAMETERIZED-VIEWS-DROPS-RIGHT :
+  composeView(viewValue(4, observed(tickets, 4, 17), 0),
+              viewValue(4, observed(effects, 4, 0), 0)) =>*
+  viewValue(4, observed(tickets, 4, 17), 0) .
+search [1] in WHIPPLESCRIPT-PARAMETERIZED-VIEWS :
+  readView(effects, 4, 9, 0) =>* viewValue(4, observed(effects, 4, 0), 1) .
+search [1] in WHIPPLESCRIPT-PARAMETERIZED-VIEWS-REISSUES :
+  readView(effects, 4, 9, 0) =>* viewValue(4, observed(effects, 4, 0), 1) .
+search [1] in WHIPPLESCRIPT-PARAMETERIZED-VIEWS :
+  validateView(recursive) =>* accepted .
+search [1] in WHIPPLESCRIPT-PARAMETERIZED-VIEWS-ACCEPTS-RECURSION :
+  validateView(recursive) =>* accepted .
+search [1] in WHIPPLESCRIPT-PARAMETERIZED-VIEWS :
+  readView(tickets, 4, 9, 0) =>* viewValue(4, noValidity, 0) .
+search [1] in WHIPPLESCRIPT-PARAMETERIZED-VIEWS-DROPS-ABSENCE :
+  readView(tickets, 4, 9, 0) =>* viewValue(4, noValidity, 0) .
+search [1] in WHIPPLESCRIPT-PARAMETERIZED-VIEWS :
+  readView(tickets, 4, 9, 17) =>* viewValue(4, observed(tickets, 4, 0), 0) .
+search [1] in WHIPPLESCRIPT-PARAMETERIZED-VIEWS-DROPS-MEMBER :
+  readView(tickets, 4, 9, 17) =>* viewValue(4, observed(tickets, 4, 0), 0) .
+quit

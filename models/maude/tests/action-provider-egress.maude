@@ -1,0 +1,14 @@
+load ../action-provider-egress.maude
+search [1] in WHIPPLESCRIPT-ACTION-PROVIDER-EGRESS : check(true, trustedOnly, grantSecret) =>* admitted .
+search [1] in WHIPPLESCRIPT-ACTION-PROVIDER-EGRESS : check(true, bothTargets, publicRead) =>* admitted .
+search [1] in WHIPPLESCRIPT-ACTION-PROVIDER-EGRESS : check(true, emptyDomain, grantSecret) =>* admitted .
+search [1] in WHIPPLESCRIPT-ACTION-PROVIDER-EGRESS : check(true, bothTargets, grantSecret) =>* admitted .
+search [1] in WHIPPLESCRIPT-ACTION-PROVIDER-FIRST : check(true, bothTargets, grantSecret) =>* admitted .
+search [1] in WHIPPLESCRIPT-ACTION-PROVIDER-EGRESS : check(true, bothTargets, toolSecret) =>* admitted .
+search [1] in WHIPPLESCRIPT-ACTION-PROVIDER-TOOL : check(true, bothTargets, toolSecret) =>* admitted .
+search [1] in WHIPPLESCRIPT-ACTION-PROVIDER-EGRESS : check(true, missingAgent, grantSecret) =>* admitted .
+search [1] in WHIPPLESCRIPT-ACTION-PROVIDER-MISSING : check(true, missingAgent, grantSecret) =>* admitted .
+search [1] in WHIPPLESCRIPT-ACTION-PROVIDER-EGRESS : check(true, trustedOnly, missingTool) =>* admitted .
+search [1] in WHIPPLESCRIPT-ACTION-PROVIDER-MISSING : check(true, trustedOnly, missingTool) =>* admitted .
+search [1] in WHIPPLESCRIPT-ACTION-PROVIDER-EGRESS : check(false, trustedOnly, publicRead) =>* admitted .
+quit

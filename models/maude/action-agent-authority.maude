@@ -1,0 +1,36 @@
+load turn-access-grant.maude
+mod WHIPPLESCRIPT-ACTION-AGENT-AUTHORITY is
+  including WHIPPLESCRIPT-TURN-ACCESS-GRANT .
+  sorts Agents Check .
+  --- Two-bit finite domain: reader, writer. These are types, not runtime picks.
+  op agents : Bool Bool -> Agents [ctor] .
+  op permitted : Agents Cap -> Bool .
+  vars R W : Bool . var C : Cap .
+  eq permitted(agents(R, W), C) = ((not R) or member(C, read)) and ((not W) or member(C, read ; write)) .
+  op intersect : Agents Agents -> Agents .
+  vars R2 W2 : Bool .
+  eq intersect(agents(R, W), agents(R2, W2)) = agents(R and R2, W and W2) .
+  op fallback : Agents Bool -> Agents .
+  --- A preceding reader pattern excludes reader only when unguarded.
+  eq fallback(agents(R, W), true) = agents(false, W) .
+  eq fallback(agents(R, W), false) = agents(R, W) .
+  op shadow : Agents Agents -> Agents .
+  vars A B : Agents .
+  eq shadow(A, B) = B .
+  op check : Agents Cap -> Check [ctor] .
+  ops accepted refused : -> Check [ctor] .
+  crl [accept] : check(A, C) => accepted if permitted(A, C) .
+  crl [refuse] : check(A, C) => refused if not permitted(A, C) .
+endm
+mod WHIPPLESCRIPT-ACTION-AGENT-CHECKS-ONE is
+  including WHIPPLESCRIPT-ACTION-AGENT-AUTHORITY .
+  var C : Cap .
+  crl [one-agent] : check(agents(true, true), C) => accepted if member(C, read ; write) .
+endm
+mod WHIPPLESCRIPT-ACTION-AGENT-KEEPS-SHADOW is
+  including WHIPPLESCRIPT-ACTION-AGENT-AUTHORITY .
+  vars A B : Agents . var C : Cap .
+  op reused : Agents Agents Cap -> Check [ctor] .
+  rl [correct-shadow] : reused(A, B, C) => check(B, C) .
+  crl [old-proof] : reused(A, B, C) => accepted if permitted(A, C) .
+endm

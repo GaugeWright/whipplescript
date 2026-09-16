@@ -1,0 +1,85 @@
+--- A managed fact/effect query is a pure read of one captured projection.
+--- Its scalar result carries the exact observation that makes it reusable:
+--- query identity, frontier, and either exact membership or positive absence.
+--- Composition and durable action capture preserve those validity premises.
+--- This bounded model uses one member identity and one work counter, enough to
+--- expose the six semantic weakenings below.
+mod WHIPPLESCRIPT-ACTION-QUERY-VALIDITY is
+ protecting BOOL . protecting NAT .
+ sorts Query Validity Value Capture Result .
+ ops tickets effects : -> Query [ctor] .
+ op noValidity : -> Validity [ctor] .
+ op observed : Query Nat Nat -> Validity [ctor] .
+ op __ : Validity Validity -> Validity [ctor assoc comm id: noValidity] .
+ --- scalar result, transitive validity, external work launched by the read.
+ op value : Nat Validity Nat -> Value [ctor] .
+ op captured : Value -> Capture [ctor] .
+ op selected : Value -> Result [ctor] .
+ op refused : -> Result [ctor] .
+ op query : Query Nat Nat Nat -> Result .
+ op compose : Value Value -> Value .
+ op save : Value -> Capture .
+ op reopen : Capture -> Value .
+ vars Q : Query . vars N H M A B WA WB : Nat . vars VA VB : Validity .
+
+ crl [captured-query] : query(Q, N, H, M) =>
+   selected(value(if M == 0 then 0 else 1 fi, observed(Q, N, M), 0))
+   if N <= H .
+ crl [future-frontier] : query(Q, N, H, M) => refused if H < N .
+ eq compose(value(A, VA, WA), value(B, VB, WB)) =
+   value(A + B, VA VB, WA + WB) .
+ eq save(value(A, VA, WA)) = captured(value(A, VA, WA)) .
+ eq reopen(captured(value(A, VA, WA))) = value(A, VA, WA) .
+endm
+
+--- Wrong: the scalar is computed from a historical projection but its validity
+--- premise is relabelled with the current head.
+mod WHIPPLESCRIPT-ACTION-QUERY-LATEST-VALIDITY is
+ including WHIPPLESCRIPT-ACTION-QUERY-VALIDITY .
+ vars Q : Query . vars N H M : Nat .
+ crl [latest-validity] : query(Q, N, H, M) =>
+   selected(value(if M == 0 then 0 else 1 fi, observed(Q, H, M), 0))
+   if N <= H .
+endm
+
+--- Wrong: an empty query keeps its scalar but loses the absence observation.
+mod WHIPPLESCRIPT-ACTION-QUERY-DROPS-ABSENCE is
+ including WHIPPLESCRIPT-ACTION-QUERY-VALIDITY .
+ vars Q : Query . vars N H : Nat .
+ crl [drop-absence] : query(Q, N, H, 0) =>
+   selected(value(0, noValidity, 0)) if N <= H .
+endm
+
+--- Wrong: a matching query retains the count but erases the member identity.
+mod WHIPPLESCRIPT-ACTION-QUERY-DROPS-MEMBER is
+ including WHIPPLESCRIPT-ACTION-QUERY-VALIDITY .
+ vars Q : Query . vars N H M : Nat .
+ crl [drop-member] : query(Q, N, H, M) =>
+   selected(value(1, observed(Q, N, 0), 0)) if N <= H /\ M > 0 .
+endm
+
+--- Wrong: scalar composition retains only the left operand's premises.
+mod WHIPPLESCRIPT-ACTION-QUERY-DROPS-COMPOSED-VALIDITY is
+ including WHIPPLESCRIPT-ACTION-QUERY-VALIDITY .
+ op composeDropped : Value Value -> Value .
+ vars A B WA WB : Nat . vars VA VB : Validity .
+ eq composeDropped(value(A, VA, WA), value(B, VB, WB)) =
+   value(A + B, VA, WA + WB) .
+endm
+
+--- Wrong: durable action capture reopens the scalar without its premises.
+mod WHIPPLESCRIPT-ACTION-QUERY-DROPS-REPLAY-VALIDITY is
+ including WHIPPLESCRIPT-ACTION-QUERY-VALIDITY .
+ op reopenDropped : Capture -> Value .
+ vars A W : Nat . var V : Validity .
+ eq reopenDropped(captured(value(A, V, W))) = value(A, noValidity, W) .
+endm
+
+--- Wrong: evaluating a query launches one unit of external work.
+mod WHIPPLESCRIPT-ACTION-QUERY-REISSUES is
+ including WHIPPLESCRIPT-ACTION-QUERY-VALIDITY .
+ vars Q : Query . vars N H M : Nat .
+ crl [query-reissues] : query(Q, N, H, M) =>
+   selected(value(if M == 0 then 0 else 1 fi, observed(Q, N, M), 1))
+   if N <= H .
+endm

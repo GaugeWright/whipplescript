@@ -6,9 +6,11 @@ classes. One rule shape covers five different types. WhippleScript composes on
 two axes. The largest part of this chapter keeps the two axes separate. The
 first axis is **composition at run time**. The `invoke` statement starts a true
 child instance with its own log and its own lifecycle. The second axis is
-**reuse at compile time**. The `include`, `pattern`, and `action` constructs
-give text and templates. The compiler expands each of these constructs fully
-before any operation runs.
+**reuse inside one reactive graph**. `include` and `pattern` shape declarations
+at compile time. An `action` defines a typed, reusable scope inside a rule's
+checked plan. The compiler expands every call finitely before any operation
+runs and retains the scope boundaries needed to join owned work and propagate
+failures.
 
 ## Bundles, the `input` contract, and roots
 
@@ -239,6 +241,10 @@ statically. A `reaches` arm for a milestone that the child never declares is a
 compile error. Thus a parent can observe only the states that the child
 projects explicitly.
 
+The same rule holds when an action body contributes the statement: action
+composition does not turn the milestone into a wait or provider operation. Its
+payload must be ready and valid, then it commits with the surrounding rule.
+
 ## Reuse at compile time
 
 The second axis never makes an instance. This axis shapes the source before the
@@ -272,10 +278,10 @@ pattern AgentReview<Input, Output> {
     Review {{ item.title }}.
     """
 
-    after turn succeeds as reviewed {
+    after turn succeeds {
       done item -> record Output {
         id item.id
-        summary reviewed.summary
+        summary turn.summary
         status "reviewed"
       }
     }
@@ -292,28 +298,31 @@ apply AgentReview<ChangeRequest, ReviewedChange> as changeReview {
 }
 ```
 
-**The `action` construct** makes a template of a *chain of effects in one
-rule*. This unit is smaller than a rule:
+**The `action` construct** defines a typed *chain of work in one rule*. It names
+its result contract and returns on each successful path. This unit is smaller
+than a rule:
 
 <!-- check: skip — excerpt; `ChangeRequest` is the surrounding program's fact -->
 ```whip
-action review_change(who AgentRef<reviewer>, item ChangeRequest) {
+action review_change(who AgentRef<reviewer>, item ChangeRequest) -> null {
   tell who as turn """markdown
   Review {{ item.title }}.
   """
 
-  after turn succeeds as reviewed {
+  after turn succeeds {
     done item -> record ReviewedChange {
       id item.id
-      summary reviewed.summary
+      summary turn.summary
       status "reviewed"
     }
+    return null
   }
 
   after turn fails as f {
     record ReviewFailure {
       reason f.reason
     }
+    return null
   }
 }
 
@@ -321,20 +330,34 @@ rule review
   when ChangeRequest as item
   when reviewer is available
 => {
-  review_change(reviewer, item)
+  review_change(reviewer, item) as review
 }
 ```
 
-The three constructs expand at compile time. The result is the same explicit
-lowered graph that you can write manually. The compiler makes each internal
-binding unique for each call site. The compiler substitutes a parameter by its
-name. The `whip check` command reports on the expanded result. These constructs
-are reuse. They are not subroutines at run time. There is no call stack and no
-dynamic dispatch. At run time, you can observe only the items that the
-expansion lowered. When the item that you reuse needs its *own* lifecycle, use
-the `invoke` statement. Such an item needs its own log, its own retries, and
-its own outcome. When more than one program needs the same *shape*, an
-expansion has a lower cost and stays fully open to inspection.
+The compiler expands the action into one finite, hygienic graph. Every call gets
+distinct binding identity, even when source names repeat, and `whip check`
+reports failures, continuation edges, and case selectors through the composed
+graph. The runtime retains lexical action scopes so a caller can wait for the
+scope's owned work and receive its result or propagated failure. An action does
+not create an instance, log, or dynamically dispatched call stack. When the
+reused unit needs its own lifecycle, use `invoke`; that boundary owns its own
+log, retries, and outcome. When several programs need the same graph shape, a
+source expansion remains fully open to inspection.
+
+The runnable
+[`reactive-ticket-review.whip`](../../examples/reactive-ticket-review.whip)
+example composes nested actions, an unselected branch, independent work, a
+managed region, explicit `then` barriers, two firings, and typed local recovery
+without auxiliary result facts.
+
+Resource handles keep their identity through this composition. An action may
+accept a tracker item, pass it through another action, claim it, and finish it;
+the compiler still records the original tracker on every resource effect. The
+same applies to a lease passed to a renewal helper. If several return paths can
+select items from different trackers, the checked effect records every possible
+tracker. Rebuilding a handle from fields or mixing tracker and lease handles is
+a compile error, reported at the consuming statement with the action definition
+and calls that led there.
 
 ## Where next
 

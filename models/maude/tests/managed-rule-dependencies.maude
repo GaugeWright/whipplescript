@@ -1,0 +1,9 @@
+load ../managed-rule-dependencies.maude
+search [1] in WHIPPLESCRIPT-MANAGED-RULE-DEPENDENCIES : writes(helper(record), fact) =>* true .
+search [1] in WHIPPLESCRIPT-MANAGED-RULE-DEPENDENCIES : writes(helper(file), queue) =>* false .
+search [1] in WHIPPLESCRIPT-MANAGED-RULE-DEPENDENCIES : writes(helper(release), queue) =>* true .
+search [1] in WHIPPLESCRIPT-MANAGED-RULE-DEPENDENCIES : writes(both(claim, both(finish, both(renew, leaseRelease))), queue) =>* true .
+search [1] in WHIPPLESCRIPT-MANAGED-RULE-DEPENDENCIES : writes(helper(send), channel) =>* true .
+search [1] in WHIPPLESCRIPT-MANAGED-RULE-DEPENDENCIES : writes(both(helper(record), helper(file)), queue) =>* true .
+search [1] in WHIPPLESCRIPT-MANAGED-RULE-DEPENDENCIES-LOST : writes(unsafeHelper(record), fact) =>* false .
+quit

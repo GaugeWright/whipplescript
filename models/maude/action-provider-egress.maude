@@ -1,0 +1,25 @@
+mod WHIPPLESCRIPT-ACTION-PROVIDER-EGRESS is
+  protecting BOOL .
+  sorts Domain Read State .
+  ops trustedOnly bothTargets emptyDomain missingAgent : -> Domain [ctor] .
+  ops publicRead grantSecret toolSecret missingTool : -> Read [ctor] .
+  op check : Bool Domain Read -> State [ctor] .
+  op admitted : -> State [ctor] .
+  var R : Read .
+  rl [empty] : check(true, emptyDomain, R) => admitted .
+  crl [cleared] : check(true, trustedOnly, R) => admitted if R =/= missingTool .
+  rl [public] : check(true, bothTargets, publicRead) => admitted .
+endm
+mod WHIPPLESCRIPT-ACTION-PROVIDER-FIRST is
+  including WHIPPLESCRIPT-ACTION-PROVIDER-EGRESS .
+  rl [first-target-only] : check(true, bothTargets, grantSecret) => admitted .
+endm
+mod WHIPPLESCRIPT-ACTION-PROVIDER-TOOL is
+  including WHIPPLESCRIPT-ACTION-PROVIDER-EGRESS .
+  rl [lost-tool-read] : check(true, bothTargets, toolSecret) => admitted .
+endm
+mod WHIPPLESCRIPT-ACTION-PROVIDER-MISSING is
+  including WHIPPLESCRIPT-ACTION-PROVIDER-EGRESS .
+  rl [unknown-is-empty] : check(true, missingAgent, grantSecret) => admitted .
+  rl [missing-tool-is-empty] : check(true, trustedOnly, missingTool) => admitted .
+endm

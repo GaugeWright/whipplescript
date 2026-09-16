@@ -47,6 +47,7 @@ const hostOperations = [
   ["runtime.host.pending.compatibility", "GET", "/host/instances/:instance/pending", "http-json", "none", "internal"],
   ["runtime.host.turn.result", "GET", "/host/instances/:instance/turns/:turn/result", "http-json", "none", "important"],
   ["runtime.host.position", "GET", "/host/instances/:instance/position", "http-json", "none", "important"],
+  ["runtime.host.action.explain", "GET", "/host/instances/:instance/explain", "http-json", "none", "important"],
   ["runtime.host.turn.read", "GET", "/host/instances/:instance/turns/:turn", "http-json", "none", "important"],
   ["runtime.host.transcript", "GET", "/host/instances/:instance/turns/:turn/transcript", "http-json", "none", "important"],
   ["runtime.host.events", "GET", "/host/instances/:instance/events", "http-json", "none", "important"],
