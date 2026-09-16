@@ -178,6 +178,27 @@ pub mod std_manifests {
             "std.messaging",
             include_str!("../vendored-std/manifests/messaging.json"),
         ),
+        // Capability-only, for the reason std.script is: `prompt` is core
+        // grammar, so this manifest authors no construct and no effect
+        // contract. What it contributes is the `image.generate` capability row
+        // a `prompt "…" -> image` demands (DR-0120). A deployment that does not
+        // seed this manifest blocks such an effect as `blocked_by_capability`,
+        // which is the honest answer for a host that never asked to generate
+        // images; a deployment that does seed it has the row, and the per-program
+        // gate is then a profile's `allowed_capabilities`, not the `use`, which
+        // is advisory like every std import.
+        //
+        // The provider row names kind `media_generator` rather than
+        // `schema_coercer`. Generation is not coercion, and registering an
+        // image provider as a coercer would make every `schema_coercer`
+        // default a candidate for an image prompt — the authority split
+        // `<modality>.generate` exists for, defeated at the registry layer.
+        // Also deliberately absent from the parser build.rs list, which is
+        // grammar-only.
+        (
+            "std.image",
+            include_str!("../vendored-std/manifests/image.json"),
+        ),
         // Contracts-only: `exec` is core grammar (never manifest-authored — the
         // package pipeline forbids `core_effect` lowering), so this manifest
         // carries the library identity and the `script.raw` capability row shape;

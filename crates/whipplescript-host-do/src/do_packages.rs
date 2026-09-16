@@ -43,6 +43,10 @@ pub const EMBEDDED_STD_MANIFESTS: &[(&str, &str)] = &[
         include_str!("../../../std/manifests/files.json"),
     ),
     (
+        "std.image",
+        include_str!("../../../std/manifests/image.json"),
+    ),
+    (
         "std.ingress",
         include_str!("../../../std/manifests/ingress.json"),
     ),

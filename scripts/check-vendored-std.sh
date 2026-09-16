@@ -35,6 +35,7 @@ crates/whipplescript-cli/vendored-std/manifests/agent-claude.json	std/manifests/
 crates/whipplescript-cli/vendored-std/manifests/coercion.json	std/manifests/coercion.json
 crates/whipplescript-cli/vendored-std/manifests/coord.json	std/manifests/coord.json
 crates/whipplescript-cli/vendored-std/manifests/files.json	std/manifests/files.json
+crates/whipplescript-cli/vendored-std/manifests/image.json	std/manifests/image.json
 crates/whipplescript-cli/vendored-std/manifests/ingress.json	std/manifests/ingress.json
 crates/whipplescript-cli/vendored-std/manifests/memory.json	std/manifests/memory.json
 crates/whipplescript-cli/vendored-std/manifests/messaging.json	std/manifests/messaging.json

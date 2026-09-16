@@ -1,0 +1,46 @@
+{
+  "schema": "whipplescript.package_manifest.v0",
+  "package_id": "std.image",
+  "name": "std.image",
+  "version": "0.1.0",
+  "libraries": [
+    {
+      "id": "std.image",
+      "version": "0.1.0",
+      "standard": true
+    }
+  ],
+  "capabilities": [
+    {
+      "id": "image.generate",
+      "description": "Ask a model to synthesize a still image, through the schema.coerce effect a `prompt \"…\" -> image` raises (DR-0120). Distinct from schema.coerce because generation is not coercion: a different provider, a different unit of cost, and an egress that produces bytes rather than a value. Per modality on purpose — a grant to make stills does not also buy audio, pdf, or video, each of which carries its own <modality>.generate row when its package lands."
+    }
+  ],
+  "providers": [
+    {
+      "id": "image-fixture",
+      "provider_kind": "media_generator",
+      "capability": "image.generate",
+      "config": {}
+    }
+  ],
+  "profiles": [
+    {
+      "id": "profile-image-author",
+      "name": "image-author",
+      "description": "Allow still-image generation.",
+      "enforcement_mode": "enforce",
+      "allowed_capabilities": ["image.generate"],
+      "config": {}
+    }
+  ],
+  "bindings": [
+    {
+      "id": "binding-image-default",
+      "program_id": null,
+      "capability": "image.generate",
+      "provider": "media_generator",
+      "config": { "provider_id": "image-fixture" }
+    }
+  ]
+}

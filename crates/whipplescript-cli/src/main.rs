@@ -23092,7 +23092,8 @@ fn run_coerce_effect(
         // Fall back to a hand-tuned known value, then to a value synthesized
         // from the declared output schema, and only then to the generic stub.
         .unwrap_or_else(|| {
-            fixture_coerce_value_known(&output_type)
+            fixture_media_value(&output_type, &input)
+                .or_else(|| fixture_coerce_value_known(&output_type))
                 .or_else(|| schema_based_fixture_coerce_value(&output_type, options))
                 .unwrap_or_else(fixture_coerce_value_generic)
                 .to_string()
@@ -27802,6 +27803,48 @@ fn drive_subworkflow_tool(
             "`@tool` sub-workflow `{root}` did not reach a terminal within {iterations} iterations"
         ))
     })
+}
+
+/// The fixture artifact a `prompt "…" -> image` gets (DR-0120, std.image).
+///
+/// `None` for every non-media output type, so the ordinary fixture ladder below
+/// is untouched. A media result cannot use that ladder: its `output_type` names
+/// no declared class, so `schema_based_fixture_coerce_value` finds nothing and
+/// the generic `{summary, confidence}` placeholder comes back — which is not a
+/// media value at all, and is what a `-> image` prompt returned before this.
+///
+/// The shape is `media_input_json`'s (`rule_lowering.rs`), because a generated
+/// artifact and a supplied one must read identically to everything downstream.
+///
+/// The reference is `fixture:` and NOT a 32-hex content id, deliberately. A
+/// fixture generates no bytes, and an id-shaped reference would send a later
+/// reader to the object plane for content nobody stored — a 404 that reads as a
+/// storage fault rather than as "this ran on the fixture provider".
+///
+/// It hashes the RENDERED prompt. The three evidence digests on the request all
+/// miss it — `generated_coerce_source_hash` commits the literal `"prompt"` and
+/// `input_schema_hash` commits `arguments`, which an inline prompt leaves empty
+/// — so every image in a program would otherwise share one artifact, and a test
+/// asserting a poster differs from a thumbnail would pass on two copies of the
+/// same reference. The rendered text is also stable across runs of the same
+/// program and input, which the effect id is not: that commits the instance, so
+/// it changes every run and would churn any golden that saw it.
+fn fixture_media_value(output_type: &str, input: &Value) -> Option<Value> {
+    let primitive = whipplescript_parser::IrPrimitiveType::from_type_name(output_type)
+        .filter(|p| p.is_media())?;
+    let rendered = input
+        .get("prompt")
+        .or_else(|| input.get("prompt_template"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    Some(json!({
+        "artifact_ref": format!(
+            "fixture:{}",
+            whipplescript_kernel::rule_lowering::stable_hash_hex(rendered)
+        ),
+        "media_type": primitive.media_mime().unwrap_or("application/octet-stream"),
+        "metadata": { "source": "fixture_media_generator" },
+    }))
 }
 
 /// Hand-tuned fixture coerce outputs for specific schemas whose exact values

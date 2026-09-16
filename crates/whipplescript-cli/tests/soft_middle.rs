@@ -6022,6 +6022,110 @@ fn timer_until_static_checks_reject_bad_operands() {
     }
 }
 
+/// `std.image` end to end on the fixture provider: the capability the import
+/// registers, the artifact the fixture mints, and the `image` field that holds
+/// it (DR-0120, #506).
+///
+/// The three pieces only work together. Without the manifest's capability row
+/// the effect admits as `blocked_by_capability` and the run never completes;
+/// without the fixture media arm the value is the generic `{summary,
+/// confidence}` placeholder, which is not a media artifact at all; and before
+/// #506 an `image` field refused every value form including the binding. A
+/// completed run carrying a media-shaped artifact proves all three.
+///
+/// Note what this does NOT prove: the `use std.image` line. Std imports are
+/// advisory — the capability is seeded from the embedded manifest set, not from
+/// the program's imports — so deleting the import still passes here. The
+/// per-program gate is a profile's `allowed_capabilities`.
+#[test]
+fn std_image_generates_an_artifact_on_the_fixture_provider() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let program =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/image-generation.whip");
+    let store = temp_path("std-image", "sqlite");
+
+    let run = |theme: &str| -> String {
+        let store = temp_path("std-image-run", "sqlite");
+        let output = Command::new(bin)
+            .args([
+                "--store",
+                store.to_str().expect("utf-8"),
+                "run",
+                program.to_str().expect("utf-8"),
+                "--input",
+                &format!(r#"{{"brief":{{"theme":"{theme}"}}}}"#),
+                "--provider",
+                "fixture",
+            ])
+            .output()
+            .expect("command runs");
+        assert!(
+            output.status.success(),
+            "run failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        assert!(
+            stdout.contains("status completed"),
+            "the workflow must reach its terminal, not park on a blocked \
+             capability; stdout was:\n{stdout}"
+        );
+        let instance = stdout
+            .split_whitespace()
+            .find(|word| word.starts_with("ins_"))
+            .expect("run prints an instance id")
+            .to_owned();
+        let facts = Command::new(bin)
+            .args([
+                "--store",
+                store.to_str().expect("utf-8"),
+                "facts",
+                &instance,
+            ])
+            .output()
+            .expect("facts runs");
+        String::from_utf8_lossy(&facts.stdout).into_owned()
+    };
+
+    let harvest = run("autumn harvest");
+    assert!(
+        harvest.contains(r#""output_type":"image""#),
+        "the annotation reaches the runtime; facts were:\n{harvest}"
+    );
+    assert!(
+        harvest.contains(r#""media_type":"image/*""#)
+            && harvest.contains(r#""source":"fixture_media_generator""#),
+        "the value is a media artifact, not the generic coerce placeholder; \
+         facts were:\n{harvest}"
+    );
+    // Never a content id: the fixture stored no bytes, and an id-shaped
+    // reference would send a reader to the object plane for content that does
+    // not exist there.
+    let reference = harvest
+        .split("\"artifact_ref\":\"")
+        .nth(1)
+        .and_then(|rest| rest.split('"').next())
+        .expect("the artifact carries a reference")
+        .to_owned();
+    assert!(
+        reference.starts_with("fixture:"),
+        "a fixture artifact says so in its reference, got `{reference}`"
+    );
+
+    // Deterministic for one input, and distinct across inputs — a program with
+    // two images must not conflate them.
+    assert!(
+        run("autumn harvest").contains(&reference),
+        "the same brief mints the same artifact"
+    );
+    assert!(
+        !run("winter frost").contains(&reference),
+        "a different brief mints a different artifact"
+    );
+    drop(store);
+}
+
 /// DR-0025 cross-package `@tool`: an owned-harness agent granted a workflow tool
 /// exported by a `use`d package resolves it from the package attestation, drives
 /// the package's shipped source synchronously, and the parent turn completes. The

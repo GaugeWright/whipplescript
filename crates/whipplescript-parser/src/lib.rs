@@ -9134,7 +9134,9 @@ fn schema_name_for_path(ty: &TypeSyntax) -> Option<String> {
 
 /// The complete standard-package universe: the standard-package campaign's
 /// fourteen, plus `std.custody` (DR-0074 §12, which made custody the fifteenth
-/// so `seal` could be a construct instance rather than core surgery).
+/// so `seal` could be a construct instance rather than core surgery) and
+/// `std.image`, the sixteenth, which carries the `image.generate` capability a
+/// `prompt "…" -> image` demands (DR-0120).
 /// `use std.<name>` outside this list is a check error: std resolution is a
 /// built-in registry, so an unknown name can never resolve later — a typo'd
 /// `use std.coercon` would otherwise silently import nothing (and downstream
@@ -9147,6 +9149,7 @@ pub const STD_PACKAGE_IDS: &[&str] = &[
     "std.custody",
     "std.files",
     "std.human",
+    "std.image",
     "std.ingress",
     "std.memory",
     "std.messaging",

@@ -1,0 +1,50 @@
+use std.coercion
+use std.image
+
+description "Generate a poster from a campaign brief, and hand the artifact on"
+workflow ImageGeneration
+
+input brief Brief
+output shipped Poster
+failure unpainted Trouble
+
+class Brief {
+  theme string
+}
+
+class Trouble {
+  reason string
+}
+
+# `art` is an `image`, not a string: the medium lives in the TYPE, which is what
+# lets the same `prompt` verb ask for a picture and a sentence (DR-0120). An
+# `image` is a reference the runtime mints — there is no way to write one in
+# source, so this field can only ever hold what an effect produced.
+class Poster {
+  theme string
+  art image
+}
+
+rule paint
+  when Brief as brief
+=> {
+  # The `-> image` is what demands `image.generate` rather than the coercion
+  # grant: generating a picture is not the authority coercing text carries.
+  # The `use` above is advisory, as every std import is — what registers the
+  # capability is the deployment shipping std.image's manifest, and what gates
+  # it is a profile's `allowed_capabilities`. A profile that allows
+  # `schema.coerce` and not `image.generate` refuses this line and admits every
+  # other prompt in the program, which is the whole point of splitting them.
+  prompt "Draw a poster for {{ brief.theme }}" -> image as art
+
+  after art succeeds {
+    complete shipped {
+      theme brief.theme
+      art art
+    }
+  }
+
+  after art fails {
+    fail unpainted { reason "the image provider did not answer" }
+  }
+}
