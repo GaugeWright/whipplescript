@@ -21060,6 +21060,74 @@ rule seed
 /// substituted: the expanded class kept `sealed<Input>` and `sealed<Note>`,
 /// which either failed as an unknown schema on a program the author wrote
 /// correctly or silently captured a top-level class of the same name.
+/// A `prompt … -> image` result must be storable, and a literal must not be.
+///
+/// The media primitives were absent from `validate_primitive_literal`'s table,
+/// which is a closed allowlist — so EVERY value form was refused for an `image`
+/// field, the binding reference included. DR-0120 shipped a result type with
+/// nowhere to put it: `prompt "…" -> image as art` compiled, and `art art`
+/// into an `image` field did not.
+///
+/// Both halves are the test. Accepting the reference is the repair; refusing
+/// the literal is what the repair must not cost, because an `image` is a
+/// reference the runtime mints and nothing an author types is one — the same
+/// rule `sealed` and `secret` keep.
+#[test]
+fn a_media_field_takes_an_effects_result_and_never_a_literal() {
+    let program = |value: &str| {
+        format!(
+            r#"
+workflow PosterStudio
+
+class Poster {{
+  art image
+}}
+
+rule draw
+  when started
+=> {{
+  prompt "Draw a poster" -> image as art
+
+  after art succeeds {{
+    record Poster {{
+      art {value}
+    }}
+  }}
+}}
+"#
+        )
+    };
+
+    let stored = compile_program(&program("art"));
+    assert!(
+        !stored
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("Poster.art")),
+        "an image binding is exactly what an image field holds; diagnostics were: {:?}",
+        stored
+            .diagnostics
+            .iter()
+            .map(|diagnostic| &diagnostic.message)
+            .collect::<Vec<_>>()
+    );
+
+    let written = compile_program(&program(r#""a picture of a cat""#));
+    assert!(
+        written.diagnostics.iter().any(|diagnostic| {
+            diagnostic
+                .message
+                .contains("expects `image`, which has no literal form")
+        }),
+        "prose describing a picture is not a picture; diagnostics were: {:?}",
+        written
+            .diagnostics
+            .iter()
+            .map(|diagnostic| &diagnostic.message)
+            .collect::<Vec<_>>()
+    );
+}
+
 #[test]
 fn a_sealed_field_in_a_pattern_is_substituted_like_any_other() {
     let source = r#"

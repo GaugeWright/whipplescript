@@ -29091,6 +29091,37 @@ fn validate_primitive_literal(
     literal: &LiteralExpr<'_>,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
+    // A media primitive has NO LITERAL FORM, for the reason `sealed` and
+    // `secret` two arms up have none: an `image` is a reference the runtime
+    // mints, and nothing an author can type is one. A bare identifier is the
+    // exemption, and it is load-bearing rather than a loosening — `Ident` is
+    // how a binding reference parses in a field position, so refusing it made
+    // the only value that CAN legally land in an `image` field, a
+    // `prompt … -> image`'s own output, unstorable. Which is what happened:
+    // the media primitives were absent from the table below, so every literal
+    // form was refused and so was every reference, and DR-0120 shipped a
+    // result type with nowhere to put it.
+    if let Some(media) = IrPrimitiveType::from_type_name(primitive).filter(|p| p.is_media()) {
+        if !matches!(literal, LiteralExpr::Ident(_)) {
+            let _ = media;
+            diagnostics.push(Diagnostic {
+                code: diagnostic_code!("type.invalid_literal"),
+                severity: Severity::Error,
+                related: Vec::new(),
+                fixits: Vec::new(),
+                span: at.whole(),
+                message: format!(
+                    "field `{record_schema}.{field}` expects `{primitive}`, which has no \
+                     literal form"
+                ),
+                suggestion: suggest(format!(
+                    "ask a model for one first: `prompt \"…\" -> {primitive} as v`, then use \
+                     `v` — `{primitive}` values arise from an effect, never from source"
+                )),
+            });
+        }
+        return;
+    }
     let valid = matches!(
         (primitive, literal),
         ("string", LiteralExpr::String(_))
