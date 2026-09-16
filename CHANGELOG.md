@@ -68,6 +68,27 @@ follow [Semantic Versioning](https://semver.org). Dates are UTC.
 
 ### Changed
 
+- **BREAKING — spend-table rates are whole micros of USD per Mtok.**
+  `input_per_mtok_usd` and its three siblings become `input_micros_per_mtok`,
+  `output_micros_per_mtok`, `cache_read_micros_per_mtok` and
+  `cache_write_micros_per_mtok`, each a non-negative whole number. $3.00/Mtok is
+  `3000000`.
+
+  The unit moved into the key name because the two readings differ by a factor
+  of a million and nothing in a file says which one it means, so an old table is
+  **refused by name** rather than silently priced at a millionth of itself. The
+  message carries the replacement key and the conversion.
+
+  Every published rate is exact in this unit, and `cost_micros` now accumulates
+  the four buckets in `u128` and rounds once, upward, rather than summing `f64`
+  dollars and rounding at the end — so a turn costing a fraction of a micro
+  costs one micro rather than nothing, and four buckets cannot each contribute
+  their own error. A spend cap therefore binds no later than it was told to.
+
+  This also makes the table the one rate document the estate shares: GaugeDesk
+  prices WhippleScript's stats report from it rather than from a second table of
+  its own.
+
 - **A projection writes only the files that are not already right, and never
   holds the manifest in memory.** `materialize_manifest_subset` loaded every
   body into a vector before writing any of them, so projecting a tree cost the

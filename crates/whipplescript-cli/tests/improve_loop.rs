@@ -1032,7 +1032,7 @@ fn spend_cap_parks_and_resume_continues_the_campaign() {
         &prices_path,
         r#"{"providers": [], "prices": [
             {"provider": "fixture-llm", "model": "m1",
-             "input_per_mtok_usd": 1000000.0, "output_per_mtok_usd": 0.0}
+             "input_micros_per_mtok": 1000000000000, "output_micros_per_mtok": 0}
         ]}"#,
     )
     .expect("write prices");
@@ -1545,7 +1545,8 @@ fn judge_turns_are_priced_spend_and_bind_the_settle_cap() {
         &prices_path,
         r#"{"providers": [], "prices": [
             {"provider": "openai-generic", "model": "test-model",
-             "input_per_mtok_usd": 1000000.0, "output_per_mtok_usd": 1000000.0}
+             "input_micros_per_mtok": 1000000000000,
+             "output_micros_per_mtok": 1000000000000}
         ]}"#,
     )
     .expect("write prices");
@@ -1647,7 +1648,8 @@ rule triage
     fs::write(&program_path, &program_src).expect("write program");
     let program_str = program_path.to_string_lossy().into_owned();
 
-    // $1 per token: the mock coerce returns 3 in + 2 out = $5 per body call.
+    // $1 per token — 1e12 micros per Mtok: the mock coerce returns 3 in + 2
+    // out = $5 per body call.
     // The coerce RUN records the worker's agent provider (`fixture`) and the
     // model it resolved, so std.spend prices it under (fixture, test-model).
     //
@@ -1661,7 +1663,8 @@ rule triage
         &prices_path,
         r#"{"providers": [], "prices": [
             {"provider": "fixture", "model": "test-model",
-             "input_per_mtok_usd": 1000000.0, "output_per_mtok_usd": 1000000.0}
+             "input_micros_per_mtok": 1000000000000,
+             "output_micros_per_mtok": 1000000000000}
         ]}"#,
     )
     .expect("write prices");
@@ -1789,7 +1792,8 @@ fn parallel_evaluation_pairs_scenarios_and_records_judge_spend() {
         &prices_path,
         r#"{"providers": [], "prices": [
             {"provider": "openai-generic", "model": "test-model",
-             "input_per_mtok_usd": 1000000.0, "output_per_mtok_usd": 1000000.0}
+             "input_micros_per_mtok": 1000000000000,
+             "output_micros_per_mtok": 1000000000000}
         ]}"#,
     )
     .expect("write prices");

@@ -31,14 +31,14 @@
     {
       "provider": "anthropic",
       "model": "claude-sonnet-5",
-      "input_per_mtok_usd": 3.0,
-      "output_per_mtok_usd": 15.0
+      "input_micros_per_mtok": 3000000,
+      "output_micros_per_mtok": 15000000
     },
     {
       "provider": "openai",
       "model": "gpt-5.4-mini",
-      "input_per_mtok_usd": 0.25,
-      "output_per_mtok_usd": 2.0
+      "input_micros_per_mtok": 250000,
+      "output_micros_per_mtok": 2000000
     }
   ]
 }

@@ -362,19 +362,42 @@ struct PriceTable {
     rates: BTreeMap<(String, String), PriceRate>,
 }
 
-/// Per-(provider, model) USD-per-Mtok rates. The cache rates are optional:
-/// providers bill cache reads/writes differently (Anthropic ~0.1× input for
-/// reads, 1.25× for writes; OpenAI ~0.5× for cached input, writes unbilled) —
-/// whip ships NO multipliers (same no-invented-prices posture), so an entry
-/// without cache rates prices cache traffic at the input rate, a conservative
-/// overestimate for reads.
+/// Per-(provider, model) rates, in MICROS of USD per Mtok.
+///
+/// Integer micros rather than fractional dollars, and the unit is in the key
+/// name so a table written for the old one fails loudly instead of pricing a
+/// millionth of what it means. Every published rate is exact here — $3.00/Mtok
+/// is `3_000_000` — while an `f64` carries a rounding question through a money
+/// path for no benefit, which is a posture `gaugedesk-src`'s own money surface
+/// already holds and which this table is the other half of: the desk prices the
+/// stats report from the same document.
+///
+/// The cache rates are optional: providers bill cache reads/writes differently
+/// (Anthropic ~0.1× input for reads, 1.25× for writes; OpenAI ~0.5× for cached
+/// input, writes unbilled) — whip ships NO multipliers (same no-invented-prices
+/// posture), so an entry without cache rates prices cache traffic at the input
+/// rate, a conservative overestimate for reads.
 #[derive(Clone, Copy, Debug)]
 struct PriceRate {
-    input: f64,
-    output: f64,
-    cache_read: Option<f64>,
-    cache_write: Option<f64>,
+    input: u64,
+    output: u64,
+    cache_read: Option<u64>,
+    cache_write: Option<u64>,
 }
+
+/// The keys this table was written with before rates became integer micros.
+///
+/// Refused rather than ignored, and refused rather than converted. A silent
+/// conversion would be the kinder-looking choice and the wrong one: the whole
+/// posture here is that whip never invents a price, and reading `3.0` as either
+/// $3.00/Mtok or 3 micros/Mtok is inventing which of two answers a thousand-fold
+/// apart the operator meant.
+const RETIRED_RATE_KEYS: [(&str, &str); 4] = [
+    ("input_per_mtok_usd", "input_micros_per_mtok"),
+    ("output_per_mtok_usd", "output_micros_per_mtok"),
+    ("cache_read_per_mtok_usd", "cache_read_micros_per_mtok"),
+    ("cache_write_per_mtok_usd", "cache_write_micros_per_mtok"),
+];
 
 impl PriceTable {
     /// Load the union of every `--provider-config` file's `prices` block.
@@ -394,37 +417,47 @@ impl PriceTable {
                 .into_iter()
                 .flatten()
             {
+                // A table written in dollars means a thousand-fold different
+                // number under the new unit, so it is named and refused rather
+                // than read. Checked before anything else in the entry: the
+                // operator needs the conversion, not a complaint about a
+                // missing key they have never heard of.
+                for (retired, replacement) in RETIRED_RATE_KEYS {
+                    if entry.get(retired).is_some() {
+                        return Err(format!(
+                            "retired `{retired}` in price entry in {}: rates are now integer \
+                             MICROS of USD per Mtok under `{replacement}`. Multiply the dollar \
+                             figure by 1000000 — $3.00/Mtok is 3000000: {entry}",
+                            path.display()
+                        ));
+                    }
+                }
                 let provider = entry.get("provider").and_then(Value::as_str);
                 let model = entry.get("model").and_then(Value::as_str);
-                let input = entry.get("input_per_mtok_usd").and_then(Value::as_f64);
-                let output = entry.get("output_per_mtok_usd").and_then(Value::as_f64);
+                let input = entry.get("input_micros_per_mtok").and_then(Value::as_u64);
+                let output = entry.get("output_micros_per_mtok").and_then(Value::as_u64);
                 // Optional cache rates (spec/inference-cache-note.md G2): a
                 // present-but-invalid value is a hard error like any other
                 // malformed entry; an absent one falls back to the input rate
                 // at cost time (conservative for cache reads — providers
                 // discount them — so the cap binds sooner, never later).
-                let cache_rate = |key: &str| -> Result<Option<f64>, String> {
+                let cache_rate = |key: &str| -> Result<Option<u64>, String> {
                     match entry.get(key) {
                         None => Ok(None),
-                        Some(value) => match value.as_f64() {
-                            Some(rate) if rate >= 0.0 && rate.is_finite() => Ok(Some(rate)),
-                            _ => Err(format!(
+                        Some(value) => match value.as_u64() {
+                            Some(rate) => Ok(Some(rate)),
+                            None => Err(format!(
                                 "invalid `{key}` in price entry in {} (need a non-negative \
-                                 number): {entry}",
+                                 whole number of micros per Mtok): {entry}",
                                 path.display()
                             )),
                         },
                     }
                 };
-                let cache_read = cache_rate("cache_read_per_mtok_usd")?;
-                let cache_write = cache_rate("cache_write_per_mtok_usd")?;
+                let cache_read = cache_rate("cache_read_micros_per_mtok")?;
+                let cache_write = cache_rate("cache_write_micros_per_mtok")?;
                 match (provider, model, input, output) {
-                    (Some(provider), Some(model), Some(input), Some(output))
-                        if input >= 0.0
-                            && output >= 0.0
-                            && input.is_finite()
-                            && output.is_finite() =>
-                    {
+                    (Some(provider), Some(model), Some(input), Some(output)) => {
                         table.rates.insert(
                             (provider.to_owned(), model.to_owned()),
                             PriceRate {
@@ -438,7 +471,8 @@ impl PriceTable {
                     _ => {
                         return Err(format!(
                             "invalid price entry in {} (need provider, model, \
-                             input_per_mtok_usd, output_per_mtok_usd, all non-negative): {entry}",
+                             input_micros_per_mtok, output_micros_per_mtok, each a \
+                             non-negative whole number): {entry}",
                             path.display()
                         ));
                     }
@@ -464,13 +498,24 @@ impl PriceTable {
         let rate = self
             .rates
             .get(&(usage.provider.clone(), usage.model.clone()))?;
-        let usd = (usage.input_tokens as f64 * rate.input
-            + usage.output_tokens as f64 * rate.output
-            + usage.cache_read_tokens.unwrap_or(0) as f64 * rate.cache_read.unwrap_or(rate.input)
-            + usage.cache_write_tokens.unwrap_or(0) as f64
-                * rate.cache_write.unwrap_or(rate.input))
-            / 1_000_000.0;
-        Some((usd * 1_000_000.0).round() as i64)
+        // Exact until the single division, so the four buckets cannot each
+        // contribute their own rounding error. `u128` because a rate is micros
+        // per Mtok: a million tokens of a $15/Mtok model is 1.5e13 before the
+        // divide, which still fits `i64` — but the headroom is free and a
+        // wrapped figure would be small and plausible, which is the worst way
+        // for a money number to be wrong.
+        let tokens = |count: i64| u128::from(count.max(0) as u64);
+        let micro_mtok = tokens(usage.input_tokens) * u128::from(rate.input)
+            + tokens(usage.output_tokens) * u128::from(rate.output)
+            + tokens(usage.cache_read_tokens.unwrap_or(0))
+                * u128::from(rate.cache_read.unwrap_or(rate.input))
+            + tokens(usage.cache_write_tokens.unwrap_or(0))
+                * u128::from(rate.cache_write.unwrap_or(rate.input));
+        // Rounded UP, once. A cap that under-counts binds later than it was
+        // told to, and a turn that cost a fraction of a micro cost something;
+        // reporting it as free is the same defect the unpriced posture exists
+        // to avoid, reached by arithmetic instead of by a missing entry.
+        Some(i64::try_from(micro_mtok.div_ceil(1_000_000)).unwrap_or(i64::MAX))
     }
 }
 
@@ -6409,7 +6454,7 @@ mod tests {
             &path,
             r#"{"providers": [], "prices": [
                 {"provider": "anthropic", "model": "claude-sonnet-5",
-                 "input_per_mtok_usd": 3.0, "output_per_mtok_usd": 15.0}
+                 "input_micros_per_mtok": 3000000, "output_micros_per_mtok": 15000000}
             ]}"#,
         )
         .expect("write config");
@@ -6442,10 +6487,59 @@ mod tests {
         // deserves to know it is not being used.
         std::fs::write(
             &path,
-            r#"{"prices": [{"provider": "anthropic", "model": "m", "input_per_mtok_usd": 3.0}]}"#,
+            r#"{"prices": [{"provider": "anthropic", "model": "m",
+                            "input_micros_per_mtok": 3000000}]}"#,
         )
         .expect("write config");
-        assert!(PriceTable::load(&[path]).is_err());
+        // Asserted on the MESSAGE, not merely on being an error. A refusal
+        // whose text nothing reads is free to stop saying which key is missing
+        // while still refusing, and an operator holding "invalid price entry"
+        // and nothing else has to diff their table against the docs to find a
+        // missing `output_micros_per_mtok`.
+        let malformed = PriceTable::load(std::slice::from_ref(&path)).expect_err("refused");
+        assert!(
+            malformed.contains("output_micros_per_mtok") && malformed.contains("provider"),
+            "the refusal names the fields an entry needs: {malformed}"
+        );
+        // And a table written in DOLLARS is refused by name rather than read as
+        // a millionth of itself. This is the one failure a silent conversion
+        // would have made invisible, and it is worth more than the convenience:
+        // `3.0` is either $3.00/Mtok or 3 micros/Mtok and nothing in the file
+        // says which.
+        std::fs::write(
+            &path,
+            r#"{"prices": [{"provider": "anthropic", "model": "m",
+                            "input_per_mtok_usd": 3.0, "output_per_mtok_usd": 15.0}]}"#,
+        )
+        .expect("write config");
+        let refusal = PriceTable::load(std::slice::from_ref(&path)).expect_err("refused");
+        assert!(
+            refusal.contains("input_micros_per_mtok") && refusal.contains("1000000"),
+            "the refusal names the replacement key and the conversion: {refusal}"
+        );
+        // A whole number of micros below one micro of cost still costs
+        // something: one token of a $0.30/Mtok model rounds UP to one micro
+        // rather than to free.
+        std::fs::write(
+            &path,
+            r#"{"prices": [{"provider": "anthropic", "model": "cheap",
+                            "input_micros_per_mtok": 300000,
+                            "output_micros_per_mtok": 0}]}"#,
+        )
+        .expect("write config");
+        let cheap = PriceTable::load(std::slice::from_ref(&path)).expect("loads");
+        assert_eq!(
+            cheap.cost_micros(&TurnUsage {
+                provider: "anthropic".to_owned(),
+                model: "cheap".to_owned(),
+                input_tokens: 1,
+                output_tokens: 0,
+                cache_read_tokens: None,
+                cache_write_tokens: None,
+                total_tokens: 1,
+            }),
+            Some(1)
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -6524,8 +6618,9 @@ mod tests {
             &path,
             r#"{"prices": [
                 {"provider": "anthropic", "model": "m",
-                 "input_per_mtok_usd": 3.0, "output_per_mtok_usd": 15.0,
-                 "cache_read_per_mtok_usd": 0.3, "cache_write_per_mtok_usd": 3.75}
+                 "input_micros_per_mtok": 3000000, "output_micros_per_mtok": 15000000,
+                 "cache_read_micros_per_mtok": 300000,
+                 "cache_write_micros_per_mtok": 3750000}
             ]}"#,
         )
         .expect("write config");
@@ -6548,7 +6643,7 @@ mod tests {
             &path,
             r#"{"prices": [
                 {"provider": "anthropic", "model": "m",
-                 "input_per_mtok_usd": 3.0, "output_per_mtok_usd": 15.0}
+                 "input_micros_per_mtok": 3000000, "output_micros_per_mtok": 15000000}
             ]}"#,
         )
         .expect("write config");
@@ -6570,12 +6665,19 @@ mod tests {
             &path,
             r#"{"prices": [
                 {"provider": "anthropic", "model": "m",
-                 "input_per_mtok_usd": 3.0, "output_per_mtok_usd": 15.0,
-                 "cache_read_per_mtok_usd": -1.0}
+                 "input_micros_per_mtok": 3000000, "output_micros_per_mtok": 15000000,
+                 "cache_read_micros_per_mtok": -1}
             ]}"#,
         )
         .expect("write config");
-        assert!(PriceTable::load(&[path]).is_err());
+        // The message names the offending key and the unit it wanted, for the
+        // same reason as above: an entry carrying four rates and one typo needs
+        // to be told which one, and "invalid price entry" does not.
+        let refusal = PriceTable::load(&[path]).expect_err("refused");
+        assert!(
+            refusal.contains("cache_read_micros_per_mtok") && refusal.contains("micros per Mtok"),
+            "the refusal names the key and its unit: {refusal}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -6627,8 +6729,8 @@ mod tests {
         table.rates.insert(
             ("anthropic".to_owned(), "claude-sonnet-5".to_owned()),
             PriceRate {
-                input: 3.0,
-                output: 15.0,
+                input: 3_000_000,
+                output: 15_000_000,
                 cache_read: None,
                 cache_write: None,
             },

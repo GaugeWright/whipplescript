@@ -318,8 +318,8 @@ gauge:
   "providers": [...],
   "prices": [
     {"provider": "anthropic", "model": "claude-sonnet-5",
-     "input_per_mtok_usd": 3.0, "output_per_mtok_usd": 15.0,
-     "cache_read_per_mtok_usd": 0.3, "cache_write_per_mtok_usd": 3.75}
+     "input_micros_per_mtok": 3000000, "output_micros_per_mtok": 15000000,
+     "cache_read_micros_per_mtok": 300000, "cache_write_micros_per_mtok": 3750000}
   ]
 }
 ```
@@ -339,10 +339,22 @@ the hit rate of the cache. The rate is the tokens that the provider read from
 the cache divided by each token on the input side. The gauge is available when
 the provider reports the use of its cache.
 
-A rate is in USD for each million tokens, for each provider and model, with the
-input side and the output side separate. The prices are in the **configuration
-only**. Whip ships no built-in rate. A built-in rate that is not current would
-give an incorrect price for the spend, and the system would give no message.
+A rate is a whole number of **micros of USD for each million tokens**, for each
+provider and model, with the input side and the output side separate. A micro is
+a millionth of a dollar, so a price of $3.00 for each million tokens is
+`3000000`, and $0.30 is `300000`. Every published rate is a whole number in this
+unit, and the arithmetic stays exact from the token count to the figure.
+
+The unit is in the name of each key. An older table wrote the rates as dollars
+under `input_per_mtok_usd` and its siblings, and those names are now **refused**
+rather than read: `3.0` means either $3.00 for each million tokens or three
+micros, the two differ by a factor of a million, and nothing in the file says
+which. The message names the replacement key and the conversion. Multiply each
+dollar figure by 1000000.
+
+The prices are in the **configuration only**. Whip ships no built-in rate. A
+built-in rate that is not current would give an incorrect price for the spend,
+and the system would give no message.
 
 Usage with no matching entry records honestly as `unpriced` with a cost of 0.
 Such usage is visible in the events of the spend, and such usage cannot bind a
@@ -362,8 +374,8 @@ the cap.
 > This condition is most important for an arbitrary `openai-generic` endpoint.
 > Add a `prices` entry for the model to make the cap enforceable. For a local
 > model that is truly free, such as Ollama or a local vLLM instance, add an
-> entry with `input_per_mtok_usd: 0` and `output_per_mtok_usd: 0`. That entry
-> declares the model free and stops the warning.
+> entry with `input_micros_per_mtok: 0` and `output_micros_per_mtok: 0`. That
+> entry declares the model free and stops the warning.
 
 ## Native providers
 
