@@ -3066,6 +3066,77 @@ fn carries_prose(ty: &whipplescript_parser::IrType) -> bool {
     }
 }
 
+/// The ENDPOINT doors an effect opens: the model endpoint a turn or a coercion
+/// reaches, and the child workflow an invoke enters. Its own `resource` and its
+/// read set are enumerated separately, through the helpers the checker itself
+/// uses; this is the part that is decided per KIND.
+///
+/// Exhaustive, with no wildcard, for the reason [`effect_flow`] gives: "opens no
+/// endpoint" is a decision about each kind, and a new one must make it
+/// deliberately. A wildcard here is not hypothetical — it is how both of this
+/// enumeration's failures happened. An agent bound `using <harness>` reached a
+/// model with no endpoint in the surface until 2026-08; a `coerce`/`prompt`
+/// reached one with no endpoint in the surface until 2026-09, and a `@tool`
+/// attesting that surface carried the omission across the package boundary,
+/// where the consumer's refusal is what the list is FOR (DR-0029 X1/X8).
+///
+/// Both were written as `if effect.kind == …` beside a walk that handled every
+/// other kind generically, so nothing failed when a kind that needed an arm did
+/// not get one. The match is the register: a variant the compiler has not seen
+/// answered here does not build.
+fn endpoint_doors_for_effect(ir: &IrProgram, effect: &IrEffectNode) -> Vec<String> {
+    match effect.kind {
+        // A turn ships its whole context to the model its agent is bound to.
+        IrEffectKind::AgentTell => effect
+            .agent
+            .as_deref()
+            .and_then(|name| ir.agents.iter().find(|agent| agent.name == name))
+            .and_then(|agent| agent_provider_kind(ir, agent))
+            .map(str::to_owned)
+            .into_iter()
+            .collect(),
+        // A `coerce`/`decide`/`prompt` ships its interpolated prompt to the
+        // endpoint `coerce_egress_principal` names — the same principal both
+        // egress doors judge it against. The un-named backend is a door too:
+        // reaching whatever the selection ladder resolves is still reaching
+        // something, and `model` is the handle governance labels for it.
+        IrEffectKind::SchemaCoerce => vec![coerce_egress_principal(ir, effect).to_owned()],
+        // A child workflow is an endpoint the payload crosses into. Its
+        // `resource` spells this too; naming it here keeps the door attached to
+        // the field that authoritatively carries the target.
+        IrEffectKind::WorkflowInvoke => effect
+            .workflow_target
+            .as_deref()
+            .map(|target| format!("invoke:{target}"))
+            .into_iter()
+            .collect(),
+        // Everything else reaches no endpoint beyond the resource it names and
+        // the resources it reads, both of which the walk already enumerates.
+        IrEffectKind::CapabilityCall
+        | IrEffectKind::EventEmit
+        | IrEffectKind::TimerWait
+        | IrEffectKind::ExecCommand
+        | IrEffectKind::HttpRequest
+        | IrEffectKind::MintCredential
+        | IrEffectKind::RotateCredential
+        | IrEffectKind::RevokeCredential
+        | IrEffectKind::TrackerFile
+        | IrEffectKind::TrackerClaim
+        | IrEffectKind::TrackerRenew
+        | IrEffectKind::TrackerRelease
+        | IrEffectKind::TrackerFinish
+        | IrEffectKind::LeaseAcquire
+        | IrEffectKind::LeaseRenew
+        | IrEffectKind::LedgerAppend
+        | IrEffectKind::CounterConsume
+        | IrEffectKind::SignalEmit
+        | IrEffectKind::FileRead
+        | IrEffectKind::FileWrite
+        | IrEffectKind::FileImport
+        | IrEffectKind::FileExport => Vec::new(),
+    }
+}
+
 fn ifc_resource_for_effect<'a>(
     effect: &'a IrEffectNode,
     shared_coordination: &BTreeSet<String>,
@@ -6210,6 +6281,16 @@ pub fn check_principal_ceiling_for_identity(
 /// checks the surface refines its envelope (no element is an ungoverned door).
 /// Mirrors the resource collection of `check_with_envelope`, so the surface is
 /// exactly the set of handles the checker would treat as a source or sink.
+///
+/// That sentence is a claim this function has twice failed to honour, so it is
+/// built to be unable to rather than checked afterwards (DR-0121). Reads and
+/// sinks are enumerated by calling the checker's OWN helpers, so the surface
+/// cannot be narrower than the checker for those; the part decided per effect
+/// kind goes through [`endpoint_doors_for_effect`], whose exhaustive match makes
+/// a new kind a compile error until it says what door it opens. This function is
+/// the single producer of the door set — the guarantee report's risk list and
+/// the `@tool` attestation both consume it rather than walking the program
+/// again.
 pub fn ifc_surface(ir: &IrProgram) -> Vec<String> {
     let signal_names: BTreeSet<&str> = ir.events.iter().map(|e| e.name.as_str()).collect();
     let schema_names: BTreeSet<&str> = ir
@@ -6235,40 +6316,14 @@ pub fn ifc_surface(ir: &IrProgram) -> Vec<String> {
             // A principal-owned tracker control (claim/renew/release/reassign)
             // writes its target tracker, which is a door like any other.
             surface.extend(tracker_control_write_resources(effect).map(str::to_owned));
-            if let Some(target) = &effect.workflow_target {
-                surface.insert(format!("invoke:{target}"));
-            }
+            // Every endpoint this KIND reaches, decided by an exhaustive match
+            // so a new effect kind cannot arrive without one.
+            surface.extend(endpoint_doors_for_effect(ir, effect));
             for grant in &effect.access_grants {
                 surface.insert(grant.resource.clone());
             }
             if effect_flow(&effect.kind).emits_stream {
                 surface.insert("stream".to_owned());
-            }
-            if effect.kind == IrEffectKind::AgentTell {
-                if let Some(provider) = effect
-                    .agent
-                    .as_deref()
-                    .and_then(|name| ir.agents.iter().find(|a| a.name == name))
-                    .and_then(|a| agent_provider_kind(ir, a))
-                {
-                    surface.insert(provider.to_owned());
-                }
-            }
-            // A `coerce`/`decide`/`prompt` ships its interpolated prompt to a
-            // model endpoint, which `check_with_envelope` judges as a principal
-            // exactly as it judges a turn's. The surface listed the turn's door
-            // and not this one, so a workflow that sent governed data to a model
-            // could report that it opened no model door at all.
-            //
-            // The cost was not only the report. A `@tool` producer attests this
-            // list and the consumer denies any import whose surface holds a door
-            // its envelope does not govern (DR-0029 X1/X8) — so a package that
-            // coerced to an endpoint the consumer never cleared declared no such
-            // door, and the import passed. The un-named backend is a door too:
-            // `model` is what governance labels for it, and a workflow reaching
-            // whatever the ladder resolves has still opened one.
-            if effect.kind == IrEffectKind::SchemaCoerce {
-                surface.insert(coerce_egress_principal(ir, effect).to_owned());
             }
         }
         for write in &rule.metadata.fact_writes {
