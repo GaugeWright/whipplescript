@@ -165,7 +165,7 @@ jobs:
       # that run those checks separately. cargo-deny is version-pinned because it
       # gates license and source policy; a floating build could change a verdict
       # under an unchanged tree.
-      - uses: taiki-e/install-action@7f4eb899022d8fe70b20c4f3de697aa85c309026 # v2.85.11
+      - uses: taiki-e/install-action@3f74d7c16a4242f1c95561e98edc25d36adb4375 # v2.87.12
         with:
           tool: cargo-audit, cargo-deny@0.20.2
       # The green bar now audits the npm trees too, so this job needs the pinned
@@ -406,7 +406,7 @@ jobs:
         with:
           submodules: recursive
       - name: Install Nix
-        uses: cachix/install-nix-action@630ae543ea3a38a9a4166f03376c02c50f408342 # v31.11.0
+        uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
       - name: TLA model checks
         run: scripts/check-tla-models.sh
 
