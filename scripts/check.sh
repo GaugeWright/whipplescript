@@ -277,8 +277,41 @@ echo "== norm observer runtime preparation =="
 python3 experiments/norm-wasi/prepare.py --fetch
 python3 experiments/norm-wasi/preparation_checks.py
 
+# cargo-nextest runs each test in its own process and schedules the whole set
+# across cores itself, rather than handing one process per test binary to
+# libtest's thread pool. Measured on this workspace's 5,206 tests, warm tree,
+# --no-fail-fast on both so they do identical work:
+#
+#   cargo test --workspace         107.9s wall   215.7s user   493.1s sys
+#   cargo nextest run --workspace   27.0s wall   239.3s user    55.6s sys
+#
+# Four times the wall clock, and — the column that decides whether a laptop
+# throttles — an eighth of the kernel time. That sys figure is libtest's thread
+# pool contending across 5,206 tests inside a handful of processes. It is heat
+# this gate was spending for nothing.
+#
+# Use-if-present, never a new prerequisite. The bar has to mean the same thing
+# on a host that does not carry it, so its absence falls back to exactly the
+# command this line has always been rather than skipping the section. What is
+# asserted does not change either way: the same test binaries, the same set.
+#
+# No `--doc` companion, deliberately. nextest does not run doctests, which would
+# normally make one mandatory here — but this workspace has none. Every fenced
+# block in its doc comments is ```text prose, and `cargo test --workspace --doc`
+# reports "0 passed; 0 filtered out". A doc run here would assert nothing, and a
+# gate line that asserts nothing is worse than no line at all. A crate that
+# later gains a real doctest has to add that command back with this one.
+#
+# scripts/check-cargo-test-guarded.mjs does not see `cargo nextest run`, only
+# `cargo test `. Nothing is weakened today because this run carries no filter,
+# but a future filtered nextest call would be unguarded — that lint needs
+# widening before one is written.
 echo "== tests =="
-cargo test --workspace
+if command -v cargo-nextest >/dev/null 2>&1; then
+    cargo nextest run --workspace
+else
+    cargo test --workspace
+fi
 
 # What a release compiles, which is more than what it distributes: every
 # workspace member for every target in dist-workspace.toml. The command lives in

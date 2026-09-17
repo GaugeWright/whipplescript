@@ -165,9 +165,18 @@ jobs:
       # that run those checks separately. cargo-deny is version-pinned because it
       # gates license and source policy; a floating build could change a verdict
       # under an unchanged tree.
+      #
+      # cargo-nextest is what the green bar's test section uses when it is
+      # present, so this job installs it rather than letting the gate quietly
+      # fall back to the slower runner. The fallback exists for a workstation
+      # without it, not for CI: if the runner that gates every change took the
+      # other branch, the bar CI reports and the bar the founder runs would be
+      # executing different commands, which is the one thing check.sh exists not
+      # to allow. Unpinned, unlike cargo-deny, because it schedules the same
+      # test binaries rather than deciding a policy verdict.
       - uses: taiki-e/install-action@3f74d7c16a4242f1c95561e98edc25d36adb4375 # v2.87.12
         with:
-          tool: cargo-audit, cargo-deny@0.20.2
+          tool: cargo-audit, cargo-deny@0.20.2, nextest
       # The green bar now audits the npm trees too, so this job needs the pinned
       # Node even though it skips the hosted-runtime contracts below.
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
