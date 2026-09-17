@@ -675,6 +675,9 @@ impl RuntimeStore for NativeStores {
     fn list_events(&self, instance_id: &str) -> StoreResult<Vec<EventView>> {
         self.runtime.list_events(instance_id)
     }
+    fn last_activity(&self, instance_id: &str) -> StoreResult<Option<crate::InstanceActivity>> {
+        self.runtime.last_activity(instance_id)
+    }
 
     fn event_by_idempotency_key(
         &self,

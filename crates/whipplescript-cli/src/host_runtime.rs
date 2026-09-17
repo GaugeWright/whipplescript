@@ -1194,6 +1194,27 @@ pub struct RecordedInstance {
     pub package_version_ref: String,
 }
 
+/// How [`GovernedHostRuntime::newest_recorded_instance`] orders adoption
+/// candidates: one lexicographic key, most significant field first.
+///
+/// Field ORDER is the rule — `derive(Ord)` compares in declaration order — so
+/// moving a field up or down here changes which instance a host adopts. The
+/// reasoning for this order, and for what is deliberately absent from it,
+/// is on `newest_recorded_instance`.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct AdoptionRank {
+    /// When this instance's log was last extended. The question being asked.
+    last_activity_at: String,
+    /// How far the log has got, which settles a same-second tie in favour of
+    /// the instance actually being worked in.
+    reach: i64,
+    /// Creation order, for candidates with identical activity and reach.
+    created_at: String,
+    /// The last resort, so the pick is total and never depends on the order
+    /// `list_instances` happened to return.
+    instance_id: String,
+}
+
 /// Out-of-band cooperative cancellation capability for one admitted host
 /// command. It opens an independent store connection, so an embedding UI can
 /// request cancellation while the runtime-owning thread is blocked in provider
@@ -1413,26 +1434,39 @@ impl GovernedHostRuntime {
     /// taking the last element picked the newest-created and, on a `created_at`
     /// tie, whichever id happened to sort highest — a migration shim opened in
     /// the same second as the real thread's instance could win, and an adoption
-    /// seeded from it carries nothing. Ranking on `updated_at` first asks which
-    /// instance was last touched, which is the question; creation order and then
-    /// the id remain as tiebreaks so the pick stays deterministic.
+    /// seeded from it carries nothing.
     ///
-    /// `updated_at` alone is not enough, and the hosted gate proved it: the
-    /// store stamps it with `CURRENT_TIMESTAMP`, which has one-second
-    /// resolution, so a shim opened in the same second as the carrier's turn
-    /// ties and the creation-order tiebreak hands it the shim — exactly the
-    /// case this exists for. Within a tie, the instance whose log has got
-    /// further is the one being worked in: a just-opened shim carries almost
-    /// nothing, and a chat that has run a turn carries the turn. That reach is
-    /// read off the chain head rather than by listing events, the way
-    /// [`Self::current_position`] already does.
+    /// "Last active" is read off the LOG, not off `instances.updated_at`.
+    /// Ranking on that column looked like the answer and was not: the
+    /// projection stamps it on a status transition, a revision activation and a
+    /// terminal event, and on nothing else, so a chat that has run twenty turns
+    /// without changing status still carries the timestamp it was created with.
+    /// Under that key a shim opened one second after the carrier outranked the
+    /// carrier no matter how much work the carrier had since done, and kept
+    /// outranking it forever — the exact failure DR-0099's pick exists to
+    /// prevent, moved one second along. It read as a flaky test rather than as
+    /// a defect because everything in an idle test lands in one second, where
+    /// the column ties and the reach tiebreak below covers for it; a loaded
+    /// machine straddles the second and the shim wins.
+    ///
+    /// The order is `(last activity, reach, created_at, instance_id)`, applied
+    /// as one lexicographic key by [`AdoptionRank`]. Timestamps are
+    /// `CURRENT_TIMESTAMP`, which has one-second resolution, so the later keys
+    /// are load-bearing rather than decorative: within one second the instance
+    /// whose log has got further is the one being worked in — a just-opened
+    /// shim carries almost nothing, and a chat that has run a turn carries the
+    /// turn — and `created_at` then `instance_id` make the pick total, so two
+    /// candidates that are genuinely indistinguishable still resolve the same
+    /// way on every run. Both the timestamp and the reach come off the chain
+    /// head in one query, the way [`Self::current_position`] already reads a
+    /// position, rather than by listing a whole log to look at its last row.
     pub fn newest_recorded_instance(&self) -> Result<Option<RecordedInstance>, HostRuntimeError> {
         let instances = self
             .kernel
             .store()
             .list_instances()
             .map_err(HostRuntimeError::Store)?;
-        let mut newest: Option<(whipplescript_store::InstanceView, i64)> = None;
+        let mut newest: Option<(whipplescript_store::InstanceView, AdoptionRank)> = None;
         for instance in instances {
             if self
                 .kernel
@@ -1443,30 +1477,28 @@ impl GovernedHostRuntime {
             {
                 continue;
             }
-            // How far this instance's log has got. Read off the chain head
-            // rather than by listing, the way `current_position` already does.
-            let reach = self
+            let activity = self
                 .kernel
                 .store()
-                .chain_head(&instance.instance_id)
-                .map_err(HostRuntimeError::Store)?
-                .sequence
-                .unwrap_or(0);
-            let better = newest.as_ref().is_none_or(|(current, current_reach)| {
-                (
-                    &instance.updated_at,
-                    reach,
-                    &instance.created_at,
-                    &instance.instance_id,
-                ) > (
-                    &current.updated_at,
-                    *current_reach,
-                    &current.created_at,
-                    &current.instance_id,
-                )
-            });
-            if better {
-                newest = Some((instance, reach));
+                .last_activity(&instance.instance_id)
+                .map_err(HostRuntimeError::Store)?;
+            let rank = AdoptionRank {
+                // An instance with no log at all has never been active. The
+                // empty string sorts below every recorded timestamp, which is
+                // where "never" belongs.
+                last_activity_at: activity
+                    .as_ref()
+                    .map(|activity| activity.occurred_at.clone())
+                    .unwrap_or_default(),
+                reach: activity.as_ref().map_or(0, |activity| activity.sequence),
+                created_at: instance.created_at.clone(),
+                instance_id: instance.instance_id.clone(),
+            };
+            if newest
+                .as_ref()
+                .is_none_or(|(_, incumbent)| rank > *incumbent)
+            {
+                newest = Some((instance, rank));
             }
         }
         let Some((instance, _)) = newest else {
@@ -4266,6 +4298,67 @@ workflow UnsafeHostChat {
         fs::remove_file(path).unwrap();
     }
 
+    fn rank(last_activity_at: &str, reach: i64, created_at: &str, id: &str) -> AdoptionRank {
+        AdoptionRank {
+            last_activity_at: last_activity_at.to_owned(),
+            reach,
+            created_at: created_at.to_owned(),
+            instance_id: id.to_owned(),
+        }
+    }
+
+    /// What the adoption order means, stated on the key itself: recency of
+    /// ACTIVITY decides, and everything below it only settles what activity
+    /// leaves tied.
+    ///
+    /// The first case is the one the store cannot state. A carrier created at
+    /// `:00` and worked at `:02` outranks a shim created at `:01` and never
+    /// touched since — but `instances.updated_at` reads `:00` for that carrier
+    /// and `:01` for that shim, so an order keyed on the projection column
+    /// inverts it. Pinning the rule here rather than only end-to-end keeps it
+    /// stated in a form no wall clock participates in.
+    #[test]
+    fn adoption_rank_puts_activity_above_creation_and_stays_total() {
+        let carrier = rank("2026-09-16 12:00:02", 4, "2026-09-16 12:00:00", "ins_a");
+        let shim = rank("2026-09-16 12:00:01", 1, "2026-09-16 12:00:01", "ins_z");
+        assert!(
+            carrier > shim,
+            "the worked-in instance outranks one created later and left alone"
+        );
+
+        let same_second = rank("2026-09-16 12:00:01", 4, "2026-09-16 12:00:00", "ins_a");
+        assert!(
+            same_second > shim,
+            "within one second, the log that has got further is the live one"
+        );
+
+        let shallower_but_older = rank("2026-09-16 12:00:01", 1, "2026-09-16 12:00:00", "ins_z");
+        assert!(
+            shim > shallower_but_older,
+            "activity and reach tied, creation order decides"
+        );
+        assert!(
+            rank("2026-09-16 12:00:01", 1, "2026-09-16 12:00:01", "ins_z")
+                > rank("2026-09-16 12:00:01", 1, "2026-09-16 12:00:01", "ins_a"),
+            "identical candidates still resolve the same way on every run"
+        );
+    }
+
+    /// Wait until the store's clock has entered a new second.
+    ///
+    /// `CURRENT_TIMESTAMP` has one-second resolution, so two writes in one
+    /// second carry the same timestamp and a test that means to separate them
+    /// has to say so. Sleeping a fixed span would only make the separation
+    /// LIKELY; sleeping out the remainder of the current second makes it
+    /// certain, and costs less than a second to do it.
+    fn cross_a_store_second() {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("the clock is after the epoch");
+        let into_the_second = Duration::from_nanos(u64::from(now.subsec_nanos()));
+        std::thread::sleep(Duration::from_millis(1050) - into_the_second);
+    }
+
     /// The adoption source is the instance whose thread the host means to keep —
     /// the most recently ACTIVE one, not the most recently created.
     ///
@@ -4273,6 +4366,18 @@ workflow UnsafeHostChat {
     /// pick: an adoption seeded from it carries nothing. The shim is opened
     /// second here, so under the old `(created_at, instance_id)` order it was
     /// exactly what got picked.
+    ///
+    /// The second boundary between the two opens is the point of the test, not
+    /// scaffolding around it. Without it both instances are created in the same
+    /// second, every ordering that has ever been written here ties on its first
+    /// key, and the reach tiebreak carries the pick regardless — so the test
+    /// passed under an ordering keyed on `instances.updated_at`, which does not
+    /// move when a turn runs and therefore ranked the shim above a carrier that
+    /// had done all the work. That defect surfaced as one failure in a loaded
+    /// `scripts/check.sh` run on 2026-09-16 and passed on the immediate re-run.
+    /// Crossing the second deliberately makes the carrier's creation strictly
+    /// older than the shim's, which is the only arrangement in which the pick
+    /// has to consult activity at all.
     #[test]
     fn newest_recorded_instance_prefers_activity_over_creation() {
         let path = temp_store();
@@ -4289,6 +4394,7 @@ workflow UnsafeHostChat {
                 &Packages,
             )
             .expect("thread carrier");
+        cross_a_store_second();
         let shim = runtime
             .open_instance(
                 &OpenInstanceCommand {
@@ -4322,7 +4428,7 @@ workflow UnsafeHostChat {
             .instance_ref;
         assert_ne!(
             picked, shim.instance_ref,
-            "the shim was created last, and creation order is what used to decide"
+            "the shim was created last, in a later second, and carries no work"
         );
         assert_eq!(
             picked, carrier.instance_ref,

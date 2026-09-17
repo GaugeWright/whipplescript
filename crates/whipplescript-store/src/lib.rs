@@ -600,6 +600,22 @@ pub struct InstanceRecord {
     pub status: String,
 }
 
+/// When an instance's log was last extended, and how far it has got.
+///
+/// The answer `instances.updated_at` does NOT give. That column is stamped by
+/// a status transition, a revision activation and a terminal event, and by
+/// nothing else — an instance that has run turns without changing status still
+/// carries the timestamp of whatever last transitioned it, which is usually its
+/// creation. Anything ranking instances by recency of ACTIVITY has to ask the
+/// log, because activity is what the log is.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InstanceActivity {
+    /// The last committed sequence — how far the log has got.
+    pub sequence: i64,
+    /// When that last event was appended.
+    pub occurred_at: String,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct InstanceView {
     pub instance_id: String,
@@ -1841,6 +1857,28 @@ impl SqliteStore {
     /// machines.
     pub fn chain_head(&self, instance_id: &str) -> StoreResult<event_chain::ChainHead> {
         chain_head_on(&self.connection, instance_id)
+    }
+
+    /// [`RuntimeStore::last_activity`], read off the head of the log rather
+    /// than by listing it — the same narrowing [`Self::chain_head`] does, for
+    /// the same reason: this answers one question about the last row, and
+    /// folding every row to reach it makes the cost of asking grow with the
+    /// length of the conversation.
+    pub fn last_activity(&self, instance_id: &str) -> StoreResult<Option<InstanceActivity>> {
+        self.connection
+            .query_row(
+                "SELECT sequence, occurred_at FROM events WHERE instance_id = ?1 \
+                 ORDER BY sequence DESC LIMIT 1",
+                params![instance_id],
+                |row| {
+                    Ok(InstanceActivity {
+                        sequence: row.get(0)?,
+                        occurred_at: row.get(1)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(StoreError::from)
     }
 
     /// DR-0067 §2: append only if the log's head is still `expected_head`.
@@ -8575,6 +8613,22 @@ pub trait RuntimeStore {
     ) -> StoreResult<projection_prefix::ProjectionPrefix> {
         projection_prefix::fold(&self.list_events(instance_id)?, frontier)
     }
+    /// When this instance's log was last extended, and how far it has got —
+    /// `None` for an instance whose log is empty.
+    ///
+    /// The read behind any "which instance is being worked in" question; see
+    /// [`InstanceActivity`] for why the `instances` projection cannot answer
+    /// it. The default body is the scan it replaces, so an implementation that
+    /// does not narrow the query still answers with the same head.
+    fn last_activity(&self, instance_id: &str) -> StoreResult<Option<InstanceActivity>> {
+        Ok(self
+            .list_events(instance_id)?
+            .last()
+            .map(|event| InstanceActivity {
+                sequence: event.sequence,
+                occurred_at: event.occurred_at.clone(),
+            }))
+    }
     /// The already-recorded event carrying this `(instance_id, idempotency_key)`
     /// pair, if any — the read side of the events unique index
     /// (migrations/0001), so an admission driver can absorb a re-delivered
@@ -9353,6 +9407,9 @@ impl RuntimeStore for SqliteStore {
     }
     fn list_events(&self, instance_id: &str) -> StoreResult<Vec<EventView>> {
         self.list_events(instance_id)
+    }
+    fn last_activity(&self, instance_id: &str) -> StoreResult<Option<InstanceActivity>> {
+        Self::last_activity(self, instance_id)
     }
     fn event_by_idempotency_key(
         &self,
@@ -15854,6 +15911,55 @@ mod tests {
             store.chain_head("instance-a").expect("head reads").sequence,
             Some(1),
             "the refused append must not have landed"
+        );
+    }
+
+    /// The narrowed head read answers exactly what the listing answered about
+    /// the last row, and answers `None` rather than guessing for an instance
+    /// with no log at all.
+    ///
+    /// The point of it is that the cost of asking does not grow with the log:
+    /// a caller ranking instances by recency of activity asks once per
+    /// instance, and folding a whole conversation to look at its last row made
+    /// that a scan of everything the host had ever recorded.
+    #[test]
+    fn the_last_activity_read_matches_the_listing_it_narrows() {
+        let store = SqliteStore::open_in_memory().expect("store opens");
+        assert_eq!(
+            store.last_activity("instance-a").expect("empty log reads"),
+            None,
+            "an instance that has never been appended to has never been active"
+        );
+
+        store
+            .append_event(new_event("instance-a", "external.started", None))
+            .expect("first appends");
+        store
+            .append_event(new_event("instance-a", "rule.fired", None))
+            .expect("second appends");
+
+        let listed = store.list_events("instance-a").expect("listing reads");
+        let last = listed.last().expect("the log has a last row");
+        assert_eq!(
+            store.last_activity("instance-a").expect("head reads"),
+            Some(InstanceActivity {
+                sequence: last.sequence,
+                occurred_at: last.occurred_at.clone(),
+            }),
+            "the narrowed read is the listing's last row"
+        );
+
+        // Another instance's appends are not this instance's activity.
+        store
+            .append_event(new_event("instance-b", "external.started", None))
+            .expect("a sibling instance appends");
+        assert_eq!(
+            store.last_activity("instance-a").expect("head re-reads"),
+            Some(InstanceActivity {
+                sequence: last.sequence,
+                occurred_at: last.occurred_at.clone(),
+            }),
+            "the read is scoped to the instance asked about"
         );
     }
 
