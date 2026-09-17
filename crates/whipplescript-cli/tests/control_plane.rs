@@ -19612,9 +19612,24 @@ rule start_denied_work
             "--until",
             "idle",
         ];
-        // Codex policy validation happens after the adapter is constructed but
-        // before any app-server I/O. Supply a harmless transport and explicit
-        // model so this test exercises that boundary on clean CI hosts too.
+        // Both native adapters validate policy after the adapter is
+        // constructed but before any provider I/O, so a denial needs no live
+        // peer -- only a transport that spawns. Neither half may fall back to
+        // the adapter's real launch command, because those are host
+        // prerequisites this test has nothing to say about: the Claude half
+        // spawns `node` by default, and on a host without one the spawn fails
+        // first, the binding is blocked as `provider_health` before a run row
+        // is ever written, and the assertion below reports a missing "provider
+        // run" rather than the boundary it is here to check. Pin a harmless
+        // transport and an explicit model for each, so this test asks the same
+        // question of a clean CI runner, a developer's machine with the Node
+        // toolchain, and one without.
+        //
+        // `/bin/cat` with no file reads stdin and echoes; the adapter always
+        // appends the sidecar path as an argument, so the Claude half passes
+        // `-` -- cat's own spelling of stdin -- to keep it from reading a file
+        // and exiting. The version exchange tolerates a peer that does not
+        // answer, and the policy check that follows performs no I/O at all.
         let dev = if provider == "codex" {
             run_json_with_env_isolated(
                 bin,
@@ -19626,7 +19641,16 @@ rule start_denied_work
                 ],
             )
         } else {
-            run_json_isolated(bin, &store_path, &args)
+            run_json_with_env_isolated(
+                bin,
+                &store_path,
+                &args,
+                &[
+                    ("WHIPPLESCRIPT_CLAUDE_AGENT_SDK_COMMAND", "/bin/cat"),
+                    ("WHIPPLESCRIPT_CLAUDE_AGENT_SDK_SIDECAR", "-"),
+                    ("WHIPPLESCRIPT_CLAUDE_AGENT_SDK_MODEL", "test-model"),
+                ],
+            )
         };
         let instance_id = dev
             .get("instance_id")
@@ -23245,14 +23269,41 @@ impl Drop for TempStorePath {
     }
 }
 
-fn temp_store_path() -> TempStorePath {
+/// Distinguishes two temp paths taken in the same instant by different test
+/// threads, which the clock alone does not.
+///
+/// The pid and the nanosecond stamp below separate one test BINARY from
+/// another. Inside one binary the pid is constant, so uniqueness rested
+/// entirely on `SystemTime::now()` advancing between two threads' calls --
+/// and it does not have to. Linux's `CLOCK_REALTIME` reports true nanoseconds,
+/// but macOS reports microseconds with three zeroes pasted on, so two tests
+/// starting in the same microsecond computed the SAME directory name.
+///
+/// That is not a harmless duplicate name: `create_dir_all` succeeds on a
+/// directory that already exists, so both tests ran happily out of one
+/// directory until whichever finished first dropped its [`TempStorePath`] and
+/// `remove_dir_all` took the directory out from under the other. The survivor
+/// then failed with `unable to open database file` or `No such file or
+/// directory` for a store it had just created -- under `cargo test` only,
+/// never alone, on a random two or three of 235 tests per run.
+///
+/// A counter is exact where a clock is approximate: `fetch_add` cannot hand
+/// the same value to two threads however fast they arrive.
+static TEMP_PATH_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn temp_path_discriminator() -> String {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("system time after epoch")
         .as_nanos();
+    let sequence = TEMP_PATH_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!("{}-{nanos}-{sequence}", std::process::id())
+}
+
+fn temp_store_path() -> TempStorePath {
     let dir = std::env::temp_dir().join(format!(
-        "whipplescript-control-plane-{}-{nanos}",
-        std::process::id()
+        "whipplescript-control-plane-{}",
+        temp_path_discriminator()
     ));
     std::fs::create_dir_all(&dir).expect("create control-plane temp dir");
     let path = dir.join("store.sqlite");
@@ -23260,13 +23311,9 @@ fn temp_store_path() -> TempStorePath {
 }
 
 fn temp_workflow_path(label: &str) -> PathBuf {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system time after epoch")
-        .as_nanos();
     std::env::temp_dir().join(format!(
-        "whipplescript-{label}-{}-{nanos}.whip",
-        std::process::id()
+        "whipplescript-{label}-{}.whip",
+        temp_path_discriminator()
     ))
 }
 

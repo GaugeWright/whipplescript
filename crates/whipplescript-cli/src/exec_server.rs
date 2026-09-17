@@ -1392,23 +1392,42 @@ mod tests {
         });
 
         let mut stream = std::net::TcpStream::connect(address).expect("connect");
-        stream
-            .write_all(b"GET /healthz HTTP/1.1\r\n")
-            .expect("request line");
-        // One header line past the cap, then the terminator.
-        let mut headers = b"X-Pad: ".to_vec();
-        headers.resize(headers.len() + MAX_HEADER_BYTES + 64, b'a');
-        headers.extend_from_slice(b"\r\n\r\n");
-        stream.write_all(&headers).expect("oversized headers");
+        let request_line = b"GET /healthz HTTP/1.1\r\n";
+        stream.write_all(request_line).expect("request line");
+        // Many COMPLETE header lines -- the block, not one long line, is what
+        // this test is about -- cut off at exactly the first refused byte.
+        //
+        // The cut is the same precaution `an_unterminated_header_line_is_cut_off_at_the_cap`
+        // takes below and for the same reason: a tail the server never reads
+        // is still sitting in its receive buffer when it closes, which makes
+        // the close an RST, and an RST discards the 431 the client has already
+        // been sent. This test used to write MAX_HEADER_BYTES + 64 bytes and a
+        // terminator past the cap, so it carried about 64 KiB of exactly that
+        // tail. The Linux runner drained it in time and the assertion passed;
+        // elsewhere the client read `"HTTP/1.1 "` and the gate reported a
+        // truncated response as a missing refusal. Nothing about the cap
+        // needs the tail -- the server has refused by then and stopped
+        // reading -- so it is not sent.
+        let mut headers = Vec::new();
+        while headers.len() < MAX_HEADER_BYTES + 1 - request_line.len() {
+            let mut line = b"X-Pad: ".to_vec();
+            line.resize(1024 - 2, b'a');
+            line.extend_from_slice(b"\r\n");
+            headers.extend_from_slice(&line);
+        }
+        headers.truncate(MAX_HEADER_BYTES + 1 - request_line.len());
+        stream.write_all(&headers).expect("oversized header block");
         stream.flush().ok();
 
         stream
             .set_read_timeout(Some(Duration::from_secs(5)))
             .expect("read timeout");
         let mut response = String::new();
-        let _ = stream.read_to_string(&mut response);
+        stream
+            .read_to_string(&mut response)
+            .expect("complete refusal response");
         assert!(
-            response.contains(" 431 "),
+            response.contains(" 431 ") && response.contains("request headers too large"),
             "oversized headers must be rejected with 431: {response:?}"
         );
     }

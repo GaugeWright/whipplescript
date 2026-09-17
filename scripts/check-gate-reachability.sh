@@ -33,14 +33,22 @@ cd "$ROOT"
 SELF="check-gate-reachability.sh"
 
 # --- the roots -------------------------------------------------------------
-declare -A REACHABLE=()
+# A space-delimited set rather than `declare -A`, which is bash 4: macOS ships
+# bash 3.2, where the declaration itself fails with `declare: -A: invalid
+# option` and takes the whole gate with it -- a message about the host at the
+# end of a run that had answered everything else. Script names carry no spaces,
+# so a delimited substring test is an exact membership test. The leading and
+# trailing spaces are the invariant that makes it exact: every entry sits
+# between two of them, so `check-docs.sh` can never match inside
+# `check-docs-fences.sh`.
+REACHABLE=" "
 FRONTIER=()
 
 seed() {
   local name="$1"
   [ -f "scripts/$name" ] || return 0
-  [ -n "${REACHABLE[$name]:-}" ] && return 0
-  REACHABLE["$name"]=1
+  case "$REACHABLE" in *" $name "*) return 0 ;; esac
+  REACHABLE="$REACHABLE$name "
   FRONTIER+=("$name")
 }
 
@@ -93,7 +101,7 @@ unreachable=()
 for path in scripts/check-*.sh; do
   name="$(basename "$path")"
   [ "$name" = "$SELF" ] && continue
-  [ -n "${REACHABLE[$name]:-}" ] && continue
+  case "$REACHABLE" in *" $name "*) continue ;; esac
   # Self-declared entry point: `# dispatch: <who runs it, and why>`.
   if grep -qE '^# dispatch:' "$path"; then
     continue

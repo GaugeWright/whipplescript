@@ -8,6 +8,18 @@ import sys
 HERE = Path(__file__).resolve().parent
 ROOT = Path(sys.argv[1]).resolve() if len(sys.argv) > 1 else HERE.parents[1] / "target"
 path = ROOT / "norm-wasi-prepared.json"
+# These checks mutate the prepared readiness metadata and assert that each
+# mutation is refused, so they need something prepared to mutate. Absent, the
+# read below raised a FileNotFoundError traceback, which reads as a broken
+# script rather than as an unprepared tree -- and the tree is unprepared
+# because prepare.py refuses off Linux x86-64, which is a fact about the host.
+if not path.is_file():
+    raise SystemExit(
+        f"norm readiness metadata absent at {path}: run "
+        f"`python3 {HERE / 'prepare.py'} --fetch` first. That builder requires a "
+        "Linux x86-64 host, so on any other host this cannot be answered here; "
+        "the green-bar CI job prepares and checks it on ubuntu-latest."
+    )
 original = path.read_bytes()
 base = json.loads(original)
 command = [sys.executable, str(HERE / "prepare.py"), str(ROOT), "--check"]

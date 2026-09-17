@@ -780,6 +780,51 @@ fn refresh_report_package_contract_digest(entry: &mut Value) -> String {
     digest
 }
 
+/// The prerequisite the lowered-IR bridge tests need, or `None` when this host
+/// can answer them.
+///
+/// The bridge is `scripts/lowered-ir-to-maude.py`, which validates its input
+/// against a JSON Schema and therefore needs python's `jsonschema`. Nothing
+/// declares that for the green bar: the `green-bar` job installs Rust, the
+/// cargo audit tools and Node, and `jsonschema` was reaching it only because
+/// the GitHub ubuntu image happens to carry one. So these five ran on the
+/// runner by luck and, on a host without the package, failed with the script's
+/// own message -- which names its remedy, but fails the gate on the host
+/// rather than on the change.
+///
+/// Both halves are repaired: the job now installs `requirements-dev.txt`, so
+/// the runner answers them because it was asked to, and a host that cannot
+/// says which package it is missing and how to get it.
+fn lowered_ir_bridge_prerequisite() -> Option<String> {
+    let Some(python) = find_executable_in_path(&["python3", "python"], &path_value()) else {
+        return Some("the lowered-IR bridge needs python3 or python on PATH".to_owned());
+    };
+    match Command::new(&python)
+        .arg("-c")
+        .arg("import jsonschema")
+        .output()
+    {
+        Ok(output) if output.status.success() => None,
+        _ => Some(format!(
+            "the lowered-IR bridge needs python's `jsonschema`, which {python} cannot \
+             import. Install it with `python3 -m pip install --user -r \
+             requirements-dev.txt`, or run under `nix develop`."
+        )),
+    }
+}
+
+/// Prints the missing prerequisite in the `skipped:` form the rest of this
+/// repository's tests use, and reports whether the caller should return.
+fn skip_without_lowered_ir_bridge() -> bool {
+    match lowered_ir_bridge_prerequisite() {
+        Some(reason) => {
+            eprintln!("skipped: {reason}");
+            true
+        }
+        None => false,
+    }
+}
+
 fn run_lowered_ir_bridge_for_test(path: &str, graph: &Value, lowered: &Value) -> String {
     let report_entry = artifact_model_search_check_report_entry(path, graph, lowered);
     let report_path = write_verified_artifact_model_search_bundle(path, &report_entry)

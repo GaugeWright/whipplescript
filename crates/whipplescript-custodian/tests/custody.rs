@@ -659,16 +659,30 @@ fn unix_socket_daemon_serves_and_refuses_get() {
     use std::io::{BufRead, BufReader, Write};
     use std::os::unix::net::UnixStream;
 
-    let nonce = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("clock after Unix epoch")
-        .as_nanos();
-    let dir = std::env::temp_dir().join(format!(
-        "whip-custodian-sock-{}-{nonce}",
-        std::process::id()
-    ));
+    // Short on purpose, and it has to stay short: a Unix socket path is copied
+    // into `sockaddr_un.sun_path`, which is 104 bytes on macOS and 108 on
+    // Linux, and the whole absolute path counts. This used to be
+    // `whip-custodian-sock-{pid}-{nanos}/custodian.sock`, about 66 characters,
+    // which fits under Linux's five-character `/tmp` and does not fit under
+    // the per-user `/var/folders/…/T` that macOS hands back from
+    // `env::temp_dir()` -- 48 characters before this name begins. The test
+    // failed there with `path must be shorter than SUN_LEN`, which is a fact
+    // about the two platforms' temp directories and says nothing about custody.
+    //
+    // A counter rather than a nanosecond stamp for the same reason the name is
+    // short, and one more: `SystemTime` is microsecond-granular on macOS, so a
+    // stamp is not the unique discriminator it looks like. `fetch_add` is.
+    static SOCKET_SEQUENCE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let sequence = SOCKET_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("whip-cd-{}-{sequence}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("mkdir");
-    let socket_path = dir.join("custodian.sock");
+    let socket_path = dir.join("c.sock");
+    assert!(
+        socket_path.as_os_str().len() < 104,
+        "socket path must fit sun_path on every host, got {} bytes: {}",
+        socket_path.as_os_str().len(),
+        socket_path.display()
+    );
 
     let c = Arc::new(custodian_with(&[(
         "hook",

@@ -274,8 +274,28 @@ cargo check -p whipplescript --no-default-features
 cargo check -p whipplescript-custodian --features pkcs11 --all-targets
 
 echo "== norm observer runtime preparation =="
-python3 experiments/norm-wasi/prepare.py --fetch
-python3 experiments/norm-wasi/preparation_checks.py
+# `prepare.py` builds the CPython observer reactor and refuses on any host that
+# is not Linux x86-64 — the builder needs that platform, which an arm64 Mac
+# cannot supply however much it installs. Left unguarded, the whole bar died
+# there with "this builder currently requires a Linux x86-64 build host": a
+# true sentence about the host, and nothing at all about the change, on a run
+# that had already passed everything it could answer.
+#
+# So this section skips where it cannot be answered and names the job that does
+# answer it, the way scripts/check-windows-compile.sh names `windows-compiles`.
+# The tests that need the reactor stand down the same way through
+# `norm_reactor::prepared_reactor`, which prints where the artifact belongs.
+norm_host="$(uname -s)-$(uname -m)"
+case "$norm_host" in
+    Linux-x86_64 | Linux-amd64)
+        python3 experiments/norm-wasi/prepare.py --fetch
+        python3 experiments/norm-wasi/preparation_checks.py
+        ;;
+    *)
+        echo "skipped: the observer reactor builder requires a Linux x86-64 host, and this is $norm_host;"
+        echo "         the green-bar CI job runs this same script on ubuntu-latest and prepares it there"
+        ;;
+esac
 
 # cargo-nextest runs each test in its own process and schedules the whole set
 # across cores itself, rather than handing one process per test binary to

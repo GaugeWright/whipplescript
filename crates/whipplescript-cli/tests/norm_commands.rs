@@ -57,6 +57,18 @@ impl Fixture {
                     }
                     Err(error) => panic!("{error}"),
                 };
+                // Blocking reads inside the handler, the way
+                // `credential_proxy`'s accept loop already does it: the
+                // listener above is non-blocking so the loop can watch `stop`,
+                // and Linux hands back an accepted socket with O_NONBLOCK
+                // cleared while BSD -- macOS -- hands back one that inherited
+                // it. Without this the read below returned EAGAIN instantly on
+                // macOS, the fixture thread panicked inside `expect`, and the
+                // client read the resulting EOF as `malformed reply`, which
+                // then panicked in a destructor and aborted the whole test
+                // binary. A read timeout does not cover it; a non-blocking
+                // socket does not wait to time out.
+                let _ = stream.set_nonblocking(false);
                 stream
                     .set_read_timeout(Some(Duration::from_secs(5)))
                     .expect("norm CLI fixture");
@@ -1004,8 +1016,54 @@ fn norm_artifact_capture_matches_native_and_do_stores() {
     assert_eq!(native, hosted);
 }
 
+/// What this host is missing to run the observer, or `None` when it can.
+///
+/// The PRESENCE of `python3` is all this needs, not a particular version. The
+/// method's declared `python_version` is derived by running `python3` when the
+/// observation is enqueued, and the observer reports the version of the
+/// `python3` it actually runs, so the adapter header binds whenever those two
+/// are the same interpreter. 3.9, 3.12 and 3.14 each pass on their own; this
+/// test was verified under 3.9.6 and 3.14.7.
+///
+/// What broke it on macOS was therefore not a version but a DISAGREEMENT: the
+/// worker's environment was cleared without PATH, so its observer resolved
+/// `python3` through the OS default path while the enqueue side used the
+/// caller's, and the two halves reported different interpreters. Forwarding
+/// PATH is that repair. This covers only a host with no python3 at all, where
+/// the enqueue fixture would otherwise panic inside `whip` with nothing
+/// pointing at the cause.
+fn norm_observer_python_prerequisite() -> Option<String> {
+    let found = Command::new("python3")
+        .arg("--version")
+        .output()
+        .is_ok_and(|out| out.status.success());
+    (!found).then(|| {
+        "the norm observer needs python3 on PATH, and there is none. Any version does: \
+         the enqueue side and the observer must simply resolve the SAME one."
+            .to_owned()
+    })
+}
+
 #[test]
 fn norm_cli_publication_recovers_verified_execution_with_real_custody() {
+    if let Some(reason) = norm_observer_python_prerequisite() {
+        // A skip here is available only when nobody is collecting this test's
+        // OUTPUT. It is not just an assertion: it is the producer of the
+        // publication vector that the hosted worker's authenticated suite
+        // consumes, and `worker/scripts/generate-norm-vector.mjs` sets the
+        // variable below and then reads the file it writes. Standing down with
+        // that variable set hands the consumer a missing file and an ENOENT
+        // three jobs away from the cause -- which is exactly what a first,
+        // wrong guard on this test did to `hosted-runtime-contracts`. So when
+        // the vector has been asked for, an unmet prerequisite is a failure
+        // that names itself, here, where it can be read.
+        assert!(
+            std::env::var_os("WHIPPLESCRIPT_NORM_PUBLICATION_VECTOR_OUT").is_none(),
+            "the publication vector was requested, but {reason}"
+        );
+        eprintln!("skipped: {reason}");
+        return;
+    }
     use whipplescript_custody::client::UnixSocketTransport;
     use whipplescript_kernel::norm_custody::{NormCustodyKey, NormCustodyVersion};
     use whipplescript_kernel::norm_execution::{fixtures as execution, PreparedNormExecution};
@@ -1611,6 +1669,16 @@ fn norm_enqueue_command_fixture(fixture: &Fixture, requirement: &str, actual: bo
     let worker = Command::new(env!("CARGO_BIN_EXE_whip"))
         .current_dir(&fixture.root)
         .env_clear()
+        // PATH, because the observer this worker runs is a real subprocess and
+        // the interpreter it finds decides the outcome. `exec_server` forwards
+        // PATH to the script it spawns on purpose -- "only the declared values
+        // plus PATH" -- so a worker with NO PATH is an environment production
+        // never has. Without it the child resolved `python3` through the OS
+        // default path instead -- the same interpreter as the enqueue half on
+        // the Linux runner, and a different one on macOS, where /usr/bin/python3
+        // is Apple's 3.9. That disagreement, not any particular version, is
+        // what produced `no bound observer header` here and nothing there.
+        .env("PATH", std::env::var("PATH").unwrap_or_default())
         .env("WHIPPLESCRIPT_STORE", &path)
         .env("WHIPPLESCRIPT_COMPUTE_ENV_HASH", "ignored-legacy-label")
         .env(

@@ -282,8 +282,67 @@ fn serving_marker(store_path: &std::path::Path) -> PathBuf {
 fn serving_socket(store_path: &std::path::Path) -> Option<String> {
     let text = std::fs::read_to_string(serving_marker(store_path)).ok()?;
     let (pid, socket) = text.trim().split_once('\t')?;
-    let alive = std::path::Path::new("/proc").join(pid).exists();
-    alive.then(|| socket.to_owned())
+    // A marker we cannot parse is a marker we cannot trust, and the same
+    // answer as a stale one: admit the direct path rather than lock the
+    // operator out on the strength of a corrupted file.
+    let pid = pid.parse::<i32>().ok()?;
+    pid_is_live(pid).then(|| socket.to_owned())
+}
+
+/// Whether `pid` names a process that could still be serving.
+///
+/// `kill(pid, 0)` runs the existence and permission checks without delivering
+/// a signal, which is the POSIX way to ask this and answers on every Unix.
+/// `rustix::process::test_kill_process` is that call behind a safe signature;
+/// the workspace forbids `unsafe`, so the raw libc edge is not available here
+/// and does not need to be.
+///
+/// Its predecessor asked whether `/proc/<pid>` existed. There is no `/proc` on
+/// macOS or on any BSD, so off Linux it answered "gone" for every pid,
+/// [`serving_socket`] always returned `None`, and [`refuse_if_serving`] never
+/// refused — a function whose own documentation promises to fail CLOSED failed
+/// open, and the lost update it exists to prevent went through in silence on
+/// every host that was not Linux. That is worse than having no check, because
+/// the comment above it tells the next reader to stop looking.
+///
+/// `EPERM` is alive: a custodian running as another user is still a custodian
+/// holding the store open, and only `ESRCH` means the process is gone.
+///
+/// What this still cannot see, as `/proc` could not either, is pid REUSE — a
+/// marker outliving its custodian long enough for the number to come round
+/// again reads as live. The window is small and the failure is towards
+/// refusing, which is the safe direction here.
+#[cfg(target_family = "unix")]
+fn pid_is_live(pid: i32) -> bool {
+    // Rejected before `Pid::from_raw` rather than left to it: `kill(0, …)`
+    // addresses every process in the CALLER's process group and a negative pid
+    // addresses another group, so either would report "live" for something
+    // that is not this custodian at all. `from_raw` rejects 0 on its own, but
+    // a negative only trips a `debug_assert`, which would panic the tests
+    // rather than answer them. A stale marker is written with pid 0 precisely
+    // because 0 is never a process.
+    if pid <= 0 {
+        return false;
+    }
+    let Some(pid) = rustix::process::Pid::from_raw(pid) else {
+        return false;
+    };
+    match rustix::process::test_kill_process(pid) {
+        Ok(()) => true,
+        Err(error) => error == rustix::io::Errno::PERM,
+    }
+}
+
+/// No Unix socket, so no custodian, so nothing can be serving.
+///
+/// `serve_command` is `cfg(target_family = "unix")` because the socket with
+/// mode 0o600 IS the custody boundary (DR-0053 §4). Where it cannot run, a
+/// marker names a process that cannot be holding this store open, and there is
+/// no lost update to prevent. This is a platform where the question is empty,
+/// not one where the answer is unavailable.
+#[cfg(not(target_family = "unix"))]
+fn pid_is_live(_pid: i32) -> bool {
+    false
 }
 
 /// Refuse a direct-store mutation while a custodian serves that store.
@@ -801,6 +860,32 @@ mod tests {
 
         assert_eq!(serving_socket(&store), None);
         refuse_if_serving(&store, "import").expect("a stale marker admits the direct path");
+    }
+
+    /// A negative pid in a marker is not live, whatever process group exists.
+    ///
+    /// This one is specific to asking `kill`: `kill(-N, 0)` addresses a process
+    /// GROUP, so a marker holding `-1` would consult an unrelated group and
+    /// could answer "a custodian is serving" for a custodian that is not. A
+    /// marker is a file on disk and a hand-edited or corrupted one has to fail
+    /// towards admitting the operator, not towards locking them out.
+    #[test]
+    fn a_negative_pid_in_a_marker_is_not_live() {
+        let store = marker_dir("negative").join("s.json");
+        std::fs::write(serving_marker(&store), "-1\t/run/whip.sock").expect("write marker");
+
+        assert_eq!(serving_socket(&store), None);
+        refuse_if_serving(&store, "import").expect("a negative pid admits the direct path");
+    }
+
+    /// A marker whose pid is not a number at all is not live either.
+    #[test]
+    fn an_unparseable_pid_in_a_marker_is_not_live() {
+        let store = marker_dir("garbage").join("s.json");
+        std::fs::write(serving_marker(&store), "not-a-pid\t/run/whip.sock").expect("write marker");
+
+        assert_eq!(serving_socket(&store), None);
+        refuse_if_serving(&store, "import").expect("an unreadable marker admits the direct path");
     }
 
     /// No marker at all is the ordinary case: no custodian, no refusal.

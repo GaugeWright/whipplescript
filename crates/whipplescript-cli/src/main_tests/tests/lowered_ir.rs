@@ -1036,6 +1036,9 @@ fn lowered_ir_validator_rejects_dependency_object_without_entrypoint_refs() {
 
 #[test]
 fn lowered_ir_bridge_emits_dependency_handoff_entrypoint() {
+    if skip_without_lowered_ir_bridge() {
+        return;
+    }
     let (graph, lowered) = package_memory_dependency_construct_graph_and_lowered_report_for_test();
     assert_eq!(
         validate_lowered_ir_report(&lowered, &graph),
@@ -1131,6 +1134,9 @@ fn lowered_ir_validator_rejects_rule_object_without_entrypoint_refs() {
 
 #[test]
 fn lowered_ir_bridge_emits_signal_source_handoff_entrypoint() {
+    if skip_without_lowered_ir_bridge() {
+        return;
+    }
     let (graph, lowered) = signal_source_construct_graph_and_lowered_report_for_test();
     assert_eq!(
         validate_lowered_ir_report(&lowered, &graph),
@@ -1146,6 +1152,9 @@ fn lowered_ir_bridge_emits_signal_source_handoff_entrypoint() {
 
 #[test]
 fn lowered_ir_bridge_emits_schedule_handoff_entrypoint() {
+    if skip_without_lowered_ir_bridge() {
+        return;
+    }
     let (graph, lowered) = schedule_construct_graph_and_lowered_report_for_test();
     assert_eq!(
         validate_lowered_ir_report(&lowered, &graph),
@@ -1161,6 +1170,9 @@ fn lowered_ir_bridge_emits_schedule_handoff_entrypoint() {
 
 #[test]
 fn lowered_ir_bridge_emits_assertion_handoff_entrypoint() {
+    if skip_without_lowered_ir_bridge() {
+        return;
+    }
     let (graph, lowered) = assertion_construct_graph_and_lowered_report_for_test();
     assert_eq!(
         validate_lowered_ir_report(&lowered, &graph),
@@ -1177,6 +1189,9 @@ fn lowered_ir_bridge_emits_assertion_handoff_entrypoint() {
 
 #[test]
 fn lowered_ir_bridge_emits_rule_handoff_entrypoint() {
+    if skip_without_lowered_ir_bridge() {
+        return;
+    }
     let (graph, lowered) = rule_template_construct_graph_and_lowered_report_for_test();
     assert_eq!(
         validate_lowered_ir_report(&lowered, &graph),

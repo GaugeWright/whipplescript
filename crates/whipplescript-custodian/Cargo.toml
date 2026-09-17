@@ -53,6 +53,23 @@ url = "2"
 tss-esapi = { version = "7.7", optional = true }
 cryptoki = { version = "0.12", optional = true }
 
+# `kill(pid, 0)` for the serving-marker liveness check, which decides whether a
+# direct-store write would be a lost update.
+#
+# rustix rather than libc, and not by preference: `[workspace.lints.rust]` sets
+# `unsafe_code = "forbid"`, which no `#[allow]` can lift, and every libc call is
+# an unsafe block by construction. rustix wraps the same syscall in a safe
+# signature — `process::test_kill_process` IS `kill(pid, 0)` — so the check is
+# the intended one and the workspace invariant stands. It is already in
+# Cargo.lock at this version by way of the existing tree, so this adds a direct
+# edge rather than a new dependency.
+#
+# Unix-only because that is where a custodian can serve at all — the boundary is
+# a Unix domain socket (DR-0053 §4) — which also keeps the Windows leg of the
+# release compile, which builds every workspace member, free of it.
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1", features = ["process"] }
+
 [[bin]]
 name = "whip-custodian"
 path = "src/bin/whip_custodian.rs"

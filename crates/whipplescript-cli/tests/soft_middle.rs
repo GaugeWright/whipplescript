@@ -4834,6 +4834,28 @@ fn spawn_otel_status_collector(status: &'static str) -> (u16, std::thread::JoinH
                     let _ = stream.write_all(
                         format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\n\r\n").as_bytes(),
                     );
+                    let _ = stream.flush();
+                    // Then drain what the exporter is still sending, before
+                    // this socket closes.
+                    //
+                    // The header terminator arrives long before the OTLP body
+                    // does, so breaking here left that body unread in the
+                    // receive buffer -- and a close with unread data is an RST
+                    // rather than a FIN, which discards the response already
+                    // sent. The exporter then read an empty status line and
+                    // reported `Invalid argument (os error 22)` instead of the
+                    // 503 this test is about. Roughly one run in three on a
+                    // parallel runner, and pre-existing: it is the same fault,
+                    // and the same repair, as the oversized-header test in
+                    // exec_server.rs.
+                    //
+                    // Draining to EOF rather than to `Content-Length` so that a
+                    // chunked or compressed body is covered too; the client
+                    // closes once it has read the response, which is the EOF.
+                    // The timeout is a backstop so a client that does not close
+                    // cannot hang the suite.
+                    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+                    while stream.read(&mut chunk).unwrap_or(0) > 0 {}
                     break;
                 }
             }

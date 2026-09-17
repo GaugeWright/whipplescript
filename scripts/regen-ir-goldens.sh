@@ -98,7 +98,17 @@ for ir in "$ROOT"/examples/*.ir; do
     args=(--package-lock "${whip%.whip}.lock.json")
   fi
   # Redirect (not $(...)) so the trailing newline is preserved exactly.
-  if ! "${WHIP[@]}" compile "$whip" "${args[@]}" >"$tmp" 2>"$err"; then
+  # `${args[@]+"${args[@]}"}` rather than `"${args[@]}"`: bash 3.2 reads the
+  # expansion of an EMPTY array as an unbound variable under `set -u`, and
+  # `args` is empty for every fixture without a sibling argument file -- which
+  # is nearly all of them. On macOS that killed this loop on its first
+  # iteration, and because the failure happened inside the loop the script
+  # still reached its end and exited 0. So this gate printed one line about
+  # `args[@]` and then reported success while checking nothing at all, which is
+  # worse than the red bars elsewhere in this branch: a gate that has quietly
+  # stopped gating. The guarded form expands to nothing when the array is empty
+  # and to the quoted elements when it is not, on bash 3.2 and on bash 5 alike.
+  if ! "${WHIP[@]}" compile "$whip" ${args[@]+"${args[@]}"} >"$tmp" 2>"$err"; then
     case " $EXPECTED_COMPILE_SKIPS " in
       *" $name "*)
         echo "skip (recorded: needs setup the refresher can't supply): ${whip#"$ROOT"/}" >&2

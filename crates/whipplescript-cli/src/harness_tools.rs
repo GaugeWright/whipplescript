@@ -1224,6 +1224,42 @@ impl HarnessProfilePolicy {
     }
 }
 
+/// The program that bounds a native command, and the name Homebrew's coreutils
+/// gives the same GNU binary on a host whose own `timeout` does not exist.
+const NATIVE_TIMEOUT_PROGRAM: &str = "timeout";
+const NATIVE_TIMEOUT_PROGRAM_GNU_ALIAS: &str = "gtimeout";
+
+/// The timeout program to spawn, or the refusal naming what is missing.
+///
+/// Pure over `available` so the refusal has a test on every host, including the
+/// ones that do have GNU coreutils and can therefore never reach it for real.
+/// Everything that needs the message asks here rather than reading a constant,
+/// so there is still one copy of it.
+fn native_timeout_program(available: impl Fn(&str) -> bool) -> Result<&'static str, String> {
+    for program in [NATIVE_TIMEOUT_PROGRAM, NATIVE_TIMEOUT_PROGRAM_GNU_ALIAS] {
+        if available(program) {
+            return Ok(program);
+        }
+    }
+    // The message is written HERE rather than pulled from a `const`, and the
+    // refusal is a plain tail `Err` rather than `.find(…).ok_or_else(|| …)`.
+    // Both are for `scripts/mutation_sweep.py`, the one instrument that asks
+    // whether a refusal is exercised. It ignores `ok_or_else` unless the
+    // closure names an explicit `…Error::` constructor, and it neutralises a
+    // refusal by rewriting the message LITERAL at the site — so a site whose
+    // text lives in a constant elsewhere has nothing to rewrite and reports
+    // `SKIP (no mutation)`, which the gate counts as unmeasured rather than
+    // covered. Both shapes are tidier to read and invisible to the sweep, which
+    // is how an instrument gets ignored.
+    Err(
+        "native commands need GNU coreutils `timeout`, which bounds every command this \
+         tool runs, and neither `timeout` nor `gtimeout` is on PATH. Install it with \
+         `brew install coreutils` on macOS, or `apt-get install coreutils` on Debian and \
+         Ubuntu."
+            .to_owned(),
+    )
+}
+
 impl FileToolExecutor {
     /// A workspace-rooted executor. Empty glob lists apply only the
     /// absolute/`..`-escape guard (the basic slice-1 sandbox); the `file store`
@@ -2298,19 +2334,47 @@ impl FileToolExecutor {
     fn native_bash(&self, command: &str, timeout: Duration) -> Result<String, String> {
         let before = self.native_workspace_snapshot(None)?;
         let path = std::env::var("PATH").unwrap_or_else(|_| "/usr/local/bin:/usr/bin:/bin".into());
-        let output = std::process::Command::new("timeout")
-            .arg("--signal=KILL")
-            .arg(format!("{}s", timeout.as_secs()))
-            .arg("/bin/sh")
-            .arg("-lc")
-            .arg(command)
-            .current_dir(&self.root)
-            .env_clear()
-            .env("PATH", path)
-            .env("HOME", "/tmp")
-            .env("TMPDIR", "/tmp")
-            .output()
-            .map_err(|error| format!("cannot start native command: {error}"))?;
+        let run = |program: &str| {
+            std::process::Command::new(program)
+                .arg("--signal=KILL")
+                .arg(format!("{}s", timeout.as_secs()))
+                .arg("/bin/sh")
+                .arg("-lc")
+                .arg(command)
+                .current_dir(&self.root)
+                .env_clear()
+                .env("PATH", &path)
+                .env("HOME", "/tmp")
+                .env("TMPDIR", "/tmp")
+                .output()
+        };
+        // GNU coreutils `timeout` is what bounds every native command, and the
+        // flags above are GNU's. macOS ships no `timeout` at all; Homebrew's
+        // coreutils installs the same program under the name `gtimeout`, so
+        // both spellings are accepted.
+        //
+        // Named rather than left to ENOENT: unresolved, a host without GNU
+        // coreutils failed with `cannot start native command: No such file or
+        // directory`, which says neither which program is missing nor how to
+        // get it — and it is the sandbox's own dependency, not the caller's
+        // command, that is absent.
+        //
+        // Resolved by a probe rather than by spawning the real command and
+        // falling back on ENOENT. The fallback worked, but its refusal was
+        // reachable only on a host WITHOUT coreutils, so on every host that has
+        // it — every runner this repository uses — no test could exercise the
+        // refusal, and `new-refusals` correctly refused a refusal nothing pins.
+        // A probe makes the choice pure over `available`, which
+        // `native_timeout_resolution_names_the_missing_prerequisite` pins
+        // everywhere.
+        let program = native_timeout_program(|candidate| {
+            std::process::Command::new(candidate)
+                .arg("--version")
+                .output()
+                .is_ok()
+        })?;
+        let output =
+            run(program).map_err(|error| format!("cannot start native command: {error}"))?;
         let after = match self.native_workspace_snapshot(Some(&before.symlinks)) {
             Ok(after) => after,
             Err(error) => {
@@ -5956,14 +6020,81 @@ mod tests {
         }
     }
 
+    /// The refusal in `native_bash` has to be pinned where every host can run it.
+    ///
+    /// Its spawn path reaches the refusal only where GNU coreutils is absent,
+    /// which is no runner this repository uses, so the refusal was added
+    /// unexercised and `new-refusals` said so. Resolution is pure over
+    /// `available`, so all three answers are checkable anywhere.
+    #[test]
+    fn native_timeout_resolution_names_the_missing_prerequisite() {
+        assert_eq!(
+            native_timeout_program(|program| program == NATIVE_TIMEOUT_PROGRAM),
+            Ok(NATIVE_TIMEOUT_PROGRAM)
+        );
+        // The `g`-prefixed name Homebrew's coreutils installs is the same GNU
+        // binary, and is taken when the unprefixed one is absent.
+        assert_eq!(
+            native_timeout_program(|program| program == NATIVE_TIMEOUT_PROGRAM_GNU_ALIAS),
+            Ok(NATIVE_TIMEOUT_PROGRAM_GNU_ALIAS)
+        );
+        let refused = native_timeout_program(|_| false).expect_err("neither is available");
+        assert!(refused.contains("GNU coreutils"), "{refused}");
+        assert!(refused.contains("brew install coreutils"), "{refused}");
+        assert!(refused.contains("apt-get install coreutils"), "{refused}");
+    }
+
+    /// This host's answer to [`native_timeout_program`], probing for real.
+    ///
+    /// The native-bash tests drive a real process through GNU coreutils
+    /// `timeout`, which macOS does not ship. Skipping names the prerequisite
+    /// and its remedy; the alternative was four assertions failing with `No
+    /// such file or directory`, which is a message about the host and none
+    /// about the sandbox they exist to check. The Linux runner has coreutils,
+    /// so the gate still runs them on every change.
+    fn native_timeout_here() -> Result<&'static str, String> {
+        native_timeout_program(|program| {
+            std::process::Command::new(program)
+                .arg("--version")
+                .output()
+                .is_ok()
+        })
+    }
+
+    macro_rules! require_native_timeout {
+        () => {
+            if let Err(reason) = native_timeout_here() {
+                eprintln!("skipped: {reason}");
+                return;
+            }
+        };
+    }
+
+    /// A directory of this test's own, under BOTH test runners.
+    ///
+    /// The pid and the counter are each load-bearing, and for opposite reasons.
+    /// This used to be a nanosecond stamp plus `thread::current().id()`, which
+    /// is exactly right under `cargo test`: every test shares one process, so
+    /// thread ids are distinct and the stamp is decoration. Under cargo-nextest
+    /// it is exactly wrong: every test gets its OWN process, thread ids restart
+    /// from the same small numbers in each of them, and macOS reports
+    /// microseconds — so two tests starting in the same microsecond in two
+    /// processes computed one directory name. `create_dir_all` succeeds on a
+    /// directory that exists, so both ran out of it until whichever finished
+    /// first dropped its `TempRoot` and `remove_dir_all` took it from the
+    /// other. That is a random two or three of 777 per run, never alone, and
+    /// only under nextest — which `scripts/check.sh` now uses where it is
+    /// installed (DR/PR #517).
+    ///
+    /// The pid separates processes and the counter separates threads within
+    /// one, so the name is unique whichever runner is in front of it.
     fn temp_root() -> TempRoot {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock after epoch")
-            .as_nanos();
+        static TEMP_ROOT_SEQUENCE: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(0);
+        let sequence = TEMP_ROOT_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let dir = std::env::temp_dir().join(format!(
-            "whip-harness-tools-{nanos}-{:?}",
-            std::thread::current().id()
+            "whip-harness-tools-{}-{sequence}",
+            std::process::id()
         ));
         std::fs::create_dir_all(&dir).expect("create temp root");
         TempRoot { path: dir }
@@ -9202,6 +9333,7 @@ mod tests {
 
     #[test]
     fn isolated_native_bash_runs_toolchain_commands_and_restores_protected_inputs() {
+        require_native_timeout!();
         let root = temp_root();
         std::fs::write(root.join(".agent-config.json"), "protected").unwrap();
         let exec = FileToolExecutor::new(&root)
@@ -9313,6 +9445,7 @@ mod tests {
     /// against.
     #[test]
     fn isolated_native_bash_refuses_a_workspace_past_the_file_bound() {
+        require_native_timeout!();
         let root = temp_root();
         // The accepting case first, in the SAME shape: a small workspace runs,
         // so a guard that refused every workspace could not pass this test.
@@ -9357,6 +9490,7 @@ mod tests {
     /// cannot be represented in the proposal and is refused, naming the path.
     #[test]
     fn isolated_native_bash_tolerates_preexisting_symlinks_and_refuses_created_ones() {
+        require_native_timeout!();
         let root = temp_root();
         std::fs::write(root.join("AGENTS.md"), "guide").unwrap();
         std::os::unix::fs::symlink("AGENTS.md", root.join("CLAUDE.md")).unwrap();
@@ -9394,6 +9528,7 @@ mod tests {
     /// proposal cannot represent, and each is refused naming the path.
     #[test]
     fn isolated_native_bash_refuses_retargeting_removing_or_replacing_preexisting_symlinks() {
+        require_native_timeout!();
         let root = temp_root();
         std::fs::write(root.join("AGENTS.md"), "guide").unwrap();
         std::fs::write(root.join("AGENTS2.md"), "other guide").unwrap();

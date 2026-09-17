@@ -126,7 +126,17 @@ for whip in examples/invalid/*.whip; do
   # `whip check` exits non-zero on a refusal — that is the whole point of these
   # fixtures — so the status is deliberately not the failure signal here.
   accepted=0
-  "$WHIP" check "$whip" "${args[@]}" >"$tmp" 2>&1 || accepted=$?
+  # `${args[@]+"${args[@]}"}` rather than `"${args[@]}"`: bash 3.2 reads the
+  # expansion of an EMPTY array as an unbound variable under `set -u`, and
+  # `args` is empty for every fixture without a sibling argument file -- which
+  # is nearly all of them. On macOS that killed this loop on its first
+  # iteration, and because the failure happened inside the loop the script
+  # still reached its end and exited 0. So this gate printed one line about
+  # `args[@]` and then reported success while checking nothing at all, which is
+  # worse than the red bars elsewhere in this branch: a gate that has quietly
+  # stopped gating. The guarded form expands to nothing when the array is empty
+  # and to the quoted elements when it is not, on bash 3.2 and on bash 5 alike.
+  "$WHIP" check "$whip" ${args[@]+"${args[@]}"} >"$tmp" 2>&1 || accepted=$?
   # THE ACCEPTANCE GUARD, and it keys on the exit status rather than on whether
   # anything was printed. Emptiness cannot detect this: `whip check` on a file
   # it ACCEPTS exits 0 and prints an IR dump to stdout, so the captured output is

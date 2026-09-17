@@ -344,12 +344,22 @@ while read -r whip; do
     args=($(cat "${whip%.whip}.check-args"))
   fi
   # A refused fixture exits non-zero; that is the normal case here, not a fault.
-  "$WHIP" check "$whip" "${args[@]}" >>"$work/raw" 2>&1 || true
+  # `${args[@]+"${args[@]}"}` rather than `"${args[@]}"`: bash 3.2 reads the
+  # expansion of an EMPTY array as an unbound variable under `set -u`, and
+  # `args` is empty for every fixture without a sibling argument file -- which
+  # is nearly all of them. On macOS that killed this loop on its first
+  # iteration, and because the failure happened inside the loop the script
+  # still reached its end and exited 0. So this gate printed one line about
+  # `args[@]` and then reported success while checking nothing at all, which is
+  # worse than the red bars elsewhere in this branch: a gate that has quietly
+  # stopped gating. The guarded form expands to nothing when the array is empty
+  # and to the quoted elements when it is not, on bash 3.2 and on bash 5 alike.
+  "$WHIP" check "$whip" ${args[@]+"${args[@]}"} >>"$work/raw" 2>&1 || true
   # The advisory plane, kept in its own file so the two renderings are read by
   # their own patterns. A program `check` refuses never reaches a lint rule —
   # `lint` reports the compile failure and stops — so this adds coverage only
   # where a program compiles, which is exactly where a lint code can be emitted.
-  "$WHIP" lint "$whip" "${args[@]}" >>"$work/raw-lint" 2>&1 || true
+  "$WHIP" lint "$whip" ${args[@]+"${args[@]}"} >>"$work/raw-lint" 2>&1 || true
 done < <(git ls-files '*.whip')
 
 if [[ "$corpus" -lt 50 ]]; then
