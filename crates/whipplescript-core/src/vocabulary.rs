@@ -35,6 +35,13 @@ pub struct FieldDefinition {
     pub name: String,
     pub required: bool,
     pub value_type: ValueType,
+    /// The declaration's own classification of a change to this field. A
+    /// change to an editorial field rewords a record; a change to any other
+    /// field changes its meaning, and a field the declaration does not classify
+    /// is meaning. The classification is part of the declaration's identity,
+    /// so a false value is not serialized and earlier digests are unchanged.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub editorial: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

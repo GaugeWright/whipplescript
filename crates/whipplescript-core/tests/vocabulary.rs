@@ -336,6 +336,7 @@ mod tests {
             value_type: ValueType::List {
                 item: Box::new(ValueType::Enum { values: vec![] }),
             },
+            editorial: false,
         });
         assert!(
             matches!(Vocabulary::new(bad),Err(VocabularyError::InvalidDefinition {path,..}) if path == "fields.nested")
@@ -404,4 +405,49 @@ mod tests {
             );
         }
     }
+}
+
+/// A declaration classifies a field as editorial; the classification is part
+/// of the declaration's identity, and its absence is meaning with no change to
+/// the digests of declarations that predate it.
+#[test]
+fn editorial_classification_is_declared_and_is_part_of_the_identity() {
+    use whipplescript_core::vocabulary::{Vocabulary, VocabularyDefinition};
+    let definition = |labels_editorial: Option<bool>| -> VocabularyDefinition {
+        let mut labels = serde_json::json!({
+            "name": "labels", "required": false,
+            "value_type": {"type": "list", "item": {"type": "text"}}
+        });
+        if let Some(editorial) = labels_editorial {
+            labels["editorial"] = serde_json::Value::Bool(editorial);
+        }
+        serde_json::from_value(serde_json::json!({
+            "name": "task", "version": "1",
+            "fields": [
+                {"name": "title", "required": true, "value_type": {"type": "text"}},
+                labels
+            ],
+            "status": {"values": ["open"], "initial": "open", "transitions": []}
+        }))
+        .unwrap()
+    };
+    let digest = |definition: VocabularyDefinition| {
+        Vocabulary::new(definition)
+            .unwrap()
+            .reference()
+            .digest
+            .clone()
+    };
+    let plain = definition(None);
+    assert!(!plain.fields[1].editorial);
+    assert_eq!(digest(plain.clone()), digest(definition(Some(false))));
+    let classified = definition(Some(true));
+    assert!(classified.fields[1].editorial);
+    assert_ne!(digest(plain), digest(classified.clone()));
+    let json = serde_json::to_value(&classified).unwrap();
+    assert_eq!(
+        json["fields"][1]["editorial"],
+        serde_json::Value::Bool(true)
+    );
+    assert!(json["fields"][0].get("editorial").is_none());
 }

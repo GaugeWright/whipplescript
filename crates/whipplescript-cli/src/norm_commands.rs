@@ -31,6 +31,8 @@ pub(crate) const USAGE: &str = "usage: whip [--json] norm <command>\n\
   resources <cut> [--frontier <file>]\n\
   compare-resources <before-cut> <after-cut> [--before-frontier <file>] [--after-frontier <file>]\n\
   impact <before-cut> <after-cut> [--before-frontier <file>] [--after-frontier <file>]\n\
+  render <id-or-alias> [--frontier <file>] | explain <id-or-alias> [--frontier <file>]\n\
+  diff --before-frontier <file> [--after-frontier <file>]\n\
   bootstrap --as <binding> --creator <principal> [--charter <file>]\n\
   create <vocabulary@version> --as <binding> --fields <file>\n\
   enqueue-observation <instance> <requirement> <cut> --effect <id> --capability <name> --as <binding> [--frontier <file>] [--deadline <seconds>]\n\
@@ -96,6 +98,8 @@ impl<'a> Arguments<'a> {
         let verb = args.first().map(String::as_str).unwrap_or("snapshot");
         let (arity, allowed): (usize, &[&str]) = match verb {
             "snapshot" | "inventory" => (0, &["--frontier"]),
+            "render" | "explain" => (1, &["--frontier"]),
+            "diff" => (0, &["--before-frontier", "--after-frontier"]),
             "export" | "provision" => (0, &[]),
             "resources" => (1, &["--frontier"]),
             "compare-resources" | "impact" => (2, &["--before-frontier", "--after-frontier"]),
@@ -483,6 +487,28 @@ fn execute(args: &[String], runtime_path: &std::path::Path) -> Result<Value, Str
                 frontier: args.frontier("--after-frontier")?,
             },
         },
+        "render" | "explain" => {
+            let record = store
+                .resolve_norm_record(args.positional[0])
+                .map_err(debug_error)?
+                .ok_or("unknown norm record or alias")?;
+            let frontier = args.frontier("--frontier")?;
+            if args.verb == "render" {
+                NormCommand::Render {
+                    manifest: record,
+                    frontier,
+                }
+            } else {
+                NormCommand::Explain { record, frontier }
+            }
+        }
+        "diff" => {
+            args.required("--before-frontier")?;
+            NormCommand::Diff {
+                before: args.frontier("--before-frontier")?.unwrap_or_default(),
+                after: args.frontier("--after-frontier")?,
+            }
+        }
         "export" => NormCommand::Export {},
         "import" => NormCommand::Import {
             events: serde_json::from_str(&args.file("--events")?)

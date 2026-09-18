@@ -17,5 +17,11 @@ revision a task addresses, `supports` offers an observation for one, and
 evidence. Each edge binds its family basis and its references as premises,
 so a replay reproduces every admission.
 
+A task's `queue` and `labels` are declared `editorial`: a change confined
+to them rewords the task, and the diff of meaning (norm-plane §8.1) says
+so. Every other field of every noun here carries meaning, as does a field
+no declaration classifies; a requirement's applicability statement or a
+specification's definitions are not presumed cosmetic.
+
 The kernel interprets nothing here that it does not interpret for the
 bundled defaults. A different process is a different charter.

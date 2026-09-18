@@ -416,9 +416,10 @@ pub struct NormView {
     pub records: BTreeMap<String, NormRecord>,
     pub effective_records: BTreeMap<String, NormRecord>,
     effective_lifecycles: BTreeMap<String, EffectiveLifecycle>,
-    /// Every content revision ever admitted, by its revision id, so a revision
-    /// reference resolves to its record after later edits moved the head.
-    revisions: BTreeMap<String, String>,
+    /// Every content revision ever admitted, by its revision id: the record as
+    /// it stood at that act, so a revision reference resolves to its record
+    /// after later edits moved the head and a view can render exact content.
+    revisions: BTreeMap<String, NormRecord>,
     /// The last admitted act on any record of each relation family; the basis
     /// a relation act binds. A family with no act yet has the ledger as its basis.
     family_heads: BTreeMap<String, String>,
@@ -696,8 +697,10 @@ impl NormView {
                         head: event.event_id.clone(),
                     },
                 );
-                self.revisions
-                    .insert(event.event_id.clone(), event.event_id.clone());
+                self.revisions.insert(
+                    event.event_id.clone(),
+                    self.records[&event.event_id].clone(),
+                );
                 self.advance_family(
                     &self.records[&event.event_id].vocabulary.clone(),
                     &event.event_id,
@@ -797,10 +800,12 @@ impl NormView {
                     updated.fields = fields;
                     updated.content_head = event.event_id.clone();
                     updated.status = resulting_status;
-                    self.revisions
-                        .insert(event.event_id.clone(), record.clone());
                 }
                 updated.head = event.event_id.clone();
+                if content_changed {
+                    self.revisions
+                        .insert(event.event_id.clone(), updated.clone());
+                }
                 self.records.insert(record, updated);
                 self.advance_family(&vocabulary, &event.event_id);
             }
@@ -965,7 +970,7 @@ impl NormView {
         }
     }
 
-    fn relation_of(
+    pub(crate) fn relation_of(
         &self,
         vocabulary: &VocabularyRef,
     ) -> Option<(&NormVocabulary, &RelationDeclaration)> {
@@ -1006,9 +1011,10 @@ impl NormView {
                 .records
                 .contains_key(reference)
                 .then(|| reference.to_owned()),
-            (Some(ReferenceForm::Revision), Some(reference)) => {
-                self.revisions.get(reference).cloned()
-            }
+            (Some(ReferenceForm::Revision), Some(reference)) => self
+                .revisions
+                .get(reference)
+                .map(|record| record.id.clone()),
             _ => None,
         };
         let Some(record_id) = record_id else {
@@ -1199,6 +1205,27 @@ impl NormView {
                     && entry.definition.version == vocabulary.version
             })
             .and_then(|entry| entry.manifest.as_ref().map(|manifest| (entry, manifest)))
+    }
+
+    /// The record as it stood when this content revision was admitted: its
+    /// fields, and its status and head at that act. Later lifecycle acts on
+    /// the record do not move it.
+    pub fn revision(&self, revision: &str) -> Option<&NormRecord> {
+        self.revisions.get(revision)
+    }
+
+    /// Every content revision of one record admitted at this frontier, in
+    /// admission order.
+    pub fn revisions_of(&self, record: &str) -> Vec<String> {
+        self.event_order
+            .iter()
+            .filter(|event| {
+                self.revisions
+                    .get(*event)
+                    .is_some_and(|revision| revision.id == record)
+            })
+            .cloned()
+            .collect()
     }
 
     /// The inventory frontier an admitted exhaustive manifest bound, if any.

@@ -2859,6 +2859,683 @@ mod tests {
         assert_eq!(record.content_head, r0);
     }
 
+    /// Stage 3 of the operating-model note (norm-plane §8.1, the Q1 subset):
+    /// rendering, the diff of meaning and explanation are pure projections at
+    /// a named frontier. A rendering carries the derived completeness
+    /// judgment and nothing derived from the members it lists, so a bounded
+    /// or incomplete manifest whose every member is visible is still not
+    /// complete. The diff classifies a revision by the declaration's field
+    /// classification. Every explanation node is one of five kinds and names
+    /// its basis.
+    #[test]
+    fn norm_views_render_diff_and_explain_at_named_frontiers() {
+        use whipplescript_store::norm_commands::*;
+        use whipplescript_store::norm_manifests::ManifestCompleteness;
+        use whipplescript_store::norm_views::*;
+        let charter: NormCharter =
+            serde_json::from_str(include_str!("../../../examples/engineering/charter.json"))
+                .expect("the engineering charter is a charter");
+        let keys = Keys::new();
+        let mut store = WorkItemStore::open_in_memory().unwrap();
+        let ledger = store
+            .append_norm_event(
+                &keys.sign(
+                    "owner",
+                    "engineering",
+                    NormAct::Bootstrap {
+                        creator: "worker".into(),
+                        charter: charter.clone(),
+                    },
+                ),
+                &keys,
+            )
+            .unwrap();
+        let reference = |name: &str| {
+            Vocabulary::new(
+                charter
+                    .vocabularies
+                    .iter()
+                    .find(|entry| entry.definition.name == name)
+                    .unwrap_or_else(|| panic!("charter declares {name}"))
+                    .definition
+                    .clone(),
+            )
+            .unwrap()
+            .reference()
+            .clone()
+        };
+        let create = |actor: &str, nonce: &str, kind: &str, fields: serde_json::Value| {
+            keys.sign(
+                actor,
+                nonce,
+                NormAct::Create {
+                    ledger: ledger.clone(),
+                    authority: None,
+                    vocabulary: reference(kind),
+                    fields_json: fields.to_string(),
+                },
+            )
+        };
+        let transition =
+            |actor: &str, nonce: &str, kind: &str, record: &str, previous: &str, status: &str| {
+                keys.sign(
+                    actor,
+                    nonce,
+                    NormAct::Transition {
+                        ledger: ledger.clone(),
+                        authority: None,
+                        vocabulary: reference(kind),
+                        record: record.into(),
+                        previous: previous.into(),
+                        status: status.into(),
+                    },
+                )
+            };
+        let relate =
+            |actor: &str, nonce: &str, kind: &str, source: &str, target: &str, basis: &str| {
+                keys.sign_with(
+                    actor,
+                    nonce,
+                    NormAct::Create {
+                        ledger: ledger.clone(),
+                        authority: None,
+                        vocabulary: reference(kind),
+                        fields_json: json!({"source": source, "target": target}).to_string(),
+                    },
+                    Some(NormPremises {
+                        family_basis: Some(basis.into()),
+                        references: vec![source.into(), target.into()],
+                        inventory_frontier: Vec::new(),
+                    }),
+                )
+            };
+        let manifest = |actor: &str,
+                        nonce: &str,
+                        fields: serde_json::Value,
+                        members: Vec<String>,
+                        frontier: Vec<String>| {
+            keys.sign_with(
+                actor,
+                nonce,
+                NormAct::Create {
+                    ledger: ledger.clone(),
+                    authority: None,
+                    vocabulary: reference("specification"),
+                    fields_json: fields.to_string(),
+                },
+                Some(NormPremises {
+                    family_basis: None,
+                    references: members,
+                    inventory_frontier: frontier,
+                }),
+            )
+        };
+        let view = |store: &WorkItemStore| store.norm_state(&keys).unwrap();
+        let head = |store: &WorkItemStore, id: &str| view(store).records[id].head.clone();
+        let effective = |store: &WorkItemStore, id: &str| {
+            view(store).effective_records[id].content_head.clone()
+        };
+        let basis = |store: &WorkItemStore, family: &str| {
+            view(store).relation_family(family).unwrap().basis
+        };
+        let frontier = |store: &WorkItemStore| -> Vec<String> {
+            view(store).frontier.iter().cloned().collect()
+        };
+        fn run(
+            store: &mut WorkItemStore,
+            keys: &Keys,
+            command: NormCommand,
+        ) -> Result<NormCommandResult, StoreError> {
+            NormCommandHost::new(store, keys)
+                .execute(NormCommandRequest::new(command))
+                .map(|response| response.result)
+        }
+        let render =
+            |store: &mut WorkItemStore, manifest: &str, frontier: Option<Vec<String>>| match run(
+                store,
+                &keys,
+                NormCommand::Render {
+                    manifest: manifest.into(),
+                    frontier,
+                },
+            )
+            .unwrap()
+            {
+                NormCommandResult::Rendered { rendering, .. } => *rendering,
+                other => panic!("rendering expected, got {other:?}"),
+            };
+        let diff =
+            |store: &mut WorkItemStore, before: Vec<String>, after: Option<Vec<String>>| match run(
+                store,
+                &keys,
+                NormCommand::Diff { before, after },
+            )
+            .unwrap()
+            {
+                NormCommandResult::Differed { diff, .. } => *diff,
+                other => panic!("diff expected, got {other:?}"),
+            };
+        let explain =
+            |store: &mut WorkItemStore, record: &str, frontier: Option<Vec<String>>| match run(
+                store,
+                &keys,
+                NormCommand::Explain {
+                    record: record.into(),
+                    frontier,
+                },
+            )
+            .unwrap()
+            {
+                NormCommandResult::Explained { explanation, .. } => *explanation,
+                other => panic!("explanation expected, got {other:?}"),
+            };
+        let refused = |result: Result<NormCommandResult, StoreError>, needle: &str| {
+            let message = format!("{:?}", result.expect_err("refusal expected"));
+            assert!(message.contains(needle), "{message}");
+        };
+
+        // A requirement accepted, a task targeting its revision, an
+        // observation supporting it, an exhaustive specification judged at
+        // the frontier it bound, and a bounded one over the same member.
+        let r = store
+            .append_norm_event(
+                &create("worker", "R", "requirement", json!({
+                    "name": "custody-authorization", "proposition": "role == owner or grant == allow",
+                    "domain": "src/", "subject": "src/auth.py",
+                    "applicability": "every mainline candidate", "owner": "owner"
+                })),
+                &keys,
+            )
+            .unwrap();
+        store
+            .append_norm_event(
+                &transition("owner", "accept-R", "requirement", &r, &r, "accepted"),
+                &keys,
+            )
+            .unwrap();
+        let r0 = effective(&store, &r);
+        let t = store
+            .append_norm_event(
+                &create(
+                    "worker",
+                    "T",
+                    "task",
+                    json!({"title": "implement custody authorization", "labels": ["norm"]}),
+                ),
+                &keys,
+            )
+            .unwrap();
+        let work = basis(&store, "work");
+        store
+            .append_norm_event(
+                &relate("worker", "T-targets", "targets", &t, &r0, &work),
+                &keys,
+            )
+            .unwrap();
+        let o = store
+            .append_norm_event(
+                &create("worker", "O", "observation", json!({
+                    "title": "Q0 on A0", "statement": "all four cases pass", "subject": "src/auth.py",
+                    "artifact": "cut-a0", "method": "Q0", "outcome": "pass"
+                })),
+                &keys,
+            )
+            .unwrap();
+        store
+            .append_norm_event(
+                &transition("owner", "activate-O", "observation", &o, &o, "active"),
+                &keys,
+            )
+            .unwrap();
+        let support = basis(&store, "support");
+        store
+            .append_norm_event(
+                &relate("worker", "O-supports", "supports", &o, &r0, &support),
+                &keys,
+            )
+            .unwrap();
+        let baseline_frontier = frontier(&store);
+        let s = store
+            .append_norm_event(
+                &manifest(
+                    "worker",
+                    "S",
+                    json!({
+                        "title": "Authorization 1.0", "purpose": "what mainline must satisfy",
+                        "selection": "every accepted requirement in src/", "members": [r0],
+                        "claim": "exhaustive", "scope": "src/", "definitions": "grant: a recorded allowance"
+                    }),
+                    vec![r0.clone()],
+                    baseline_frontier.clone(),
+                ),
+                &keys,
+            )
+            .unwrap();
+        store
+            .append_norm_event(
+                &transition("owner", "publish-S", "specification", &s, &s, "published"),
+                &keys,
+            )
+            .unwrap();
+        let b = store
+            .append_norm_event(
+                &manifest(
+                    "worker",
+                    "B",
+                    json!({
+                        "title": "Authorization, src only", "purpose": "a bounded view",
+                        "selection": "what the author could see", "members": [r0],
+                        "claim": "bounded", "scope": "src/"
+                    }),
+                    vec![r0.clone()],
+                    Vec::new(),
+                ),
+                &keys,
+            )
+            .unwrap();
+        let published_frontier = frontier(&store);
+
+        // Rendering: the member at its exact revision, effective here; the
+        // document is the manifest's own fields without the member list; the
+        // judgment is the derived one at the bound basis.
+        let rendered = render(&mut store, &s, Some(published_frontier.clone()));
+        assert_eq!(rendered.frontier, published_frontier);
+        assert_eq!(rendered.manifest.id, s);
+        assert!(
+            rendered.manifest.alias.is_some(),
+            "aliases are local and present"
+        );
+        assert!(rendered.document.get("members").is_none());
+        assert_eq!(rendered.document["title"], json!("Authorization 1.0"));
+        assert_eq!(
+            rendered.document["definitions"],
+            json!("grant: a recorded allowance")
+        );
+        assert_eq!(rendered.members.len(), 1);
+        assert_eq!(rendered.members[0].reference, r0);
+        assert_eq!(rendered.members[0].record.id, r);
+        assert_eq!(rendered.members[0].record.revision, r0);
+        assert_eq!(
+            rendered.members[0].fields["proposition"],
+            json!("role == owner or grant == allow")
+        );
+        assert_eq!(rendered.members[0].standing, MemberStanding::Effective);
+        assert_eq!(
+            rendered.completeness.completeness,
+            ManifestCompleteness::Complete {
+                basis: baseline_frontier.clone()
+            }
+        );
+        // The bounded manifest lists every applicable revision there is, and
+        // the rendering still says only what was judged: bounded to a scope.
+        let bounded = render(&mut store, &b, None);
+        assert_eq!(bounded.members.len(), rendered.members.len());
+        assert_eq!(
+            bounded.completeness.completeness,
+            ManifestCompleteness::Bounded {
+                scope: Some("src/".into())
+            }
+        );
+        // Only a manifest renders.
+        refused(
+            run(
+                &mut store,
+                &keys,
+                NormCommand::Render {
+                    manifest: r.clone(),
+                    frontier: None,
+                },
+            ),
+            "not a manifest",
+        );
+        refused(
+            run(
+                &mut store,
+                &keys,
+                NormCommand::Render {
+                    manifest: "0".repeat(64),
+                    frontier: None,
+                },
+            ),
+            "no norm record",
+        );
+
+        // The requirement is revised in meaning and accepted; the task is
+        // reworded in an editorial field only.
+        let edited = store
+            .append_norm_event(
+                &keys.sign(
+                    "owner",
+                    "edit-R",
+                    NormAct::Edit {
+                        ledger: ledger.clone(),
+                        authority: None,
+                        vocabulary: reference("requirement"),
+                        record: r.clone(),
+                        previous: head(&store, &r),
+                        fields_json: json!({
+                            "name": "custody-authorization", "proposition": "role == owner or (grant == allow and grant is fresh)",
+                            "domain": "src/", "subject": "src/auth.py",
+                            "applicability": "every mainline candidate", "owner": "owner"
+                        })
+                        .to_string(),
+                    },
+                ),
+                &keys,
+            )
+            .unwrap();
+        store
+            .append_norm_event(
+                &transition("owner", "accept-R1", "requirement", &r, &edited, "accepted"),
+                &keys,
+            )
+            .unwrap();
+        let r1 = effective(&store, &r);
+        assert_ne!(r1, r0);
+        store
+            .append_norm_event(
+                &keys.sign(
+                    "worker",
+                    "edit-T",
+                    NormAct::Edit {
+                        ledger: ledger.clone(),
+                        authority: None,
+                        vocabulary: reference("task"),
+                        record: t.clone(),
+                        previous: head(&store, &t),
+                        fields_json: json!({
+                            "title": "implement custody authorization",
+                            "labels": ["norm", "authorization"], "queue": "now"
+                        })
+                        .to_string(),
+                    },
+                ),
+                &keys,
+            )
+            .unwrap();
+        let now = frontier(&store);
+        let s3 = store
+            .append_norm_event(
+                &manifest(
+                    "worker",
+                    "S3",
+                    json!({
+                        "title": "Authorization 1.0 again", "purpose": "p", "selection": "s",
+                        "members": [r0], "claim": "exhaustive"
+                    }),
+                    vec![r0.clone()],
+                    now.clone(),
+                ),
+                &keys,
+            )
+            .unwrap();
+
+        // The old member renders at its exact revision, superseded now; the
+        // historical judgment is unchanged; the fresh claim is incomplete
+        // while its one member renders in full.
+        let rendered = render(&mut store, &s, None);
+        assert_eq!(
+            rendered.members[0].fields["proposition"],
+            json!("role == owner or grant == allow")
+        );
+        assert_eq!(
+            rendered.members[0].standing,
+            MemberStanding::Superseded {
+                effective: r1.clone()
+            }
+        );
+        assert_eq!(
+            rendered.completeness.completeness,
+            ManifestCompleteness::Complete {
+                basis: baseline_frontier.clone()
+            }
+        );
+        let fresh = render(&mut store, &s3, None);
+        assert_eq!(fresh.members.len(), 1);
+        assert_eq!(
+            fresh.completeness.completeness,
+            ManifestCompleteness::Incomplete {
+                basis: now.clone(),
+                missing: vec![r1.clone()]
+            }
+        );
+
+        // The diff of meaning from publication to now.
+        let latest = frontier(&store);
+        let changes = diff(&mut store, published_frontier.clone(), None);
+        assert_eq!(changes.before, published_frontier);
+        assert_eq!(changes.after, latest);
+        assert!(changes.inventory.before_classification_complete);
+        assert!(changes.inventory.after_classification_complete);
+        let of = |changes: &MeaningDiff, id: &str| -> Vec<RecordChangeKind> {
+            changes
+                .records
+                .iter()
+                .find(|change| change.record == id)
+                .map(|change| change.changes.clone())
+                .unwrap_or_default()
+        };
+        let r_changes = of(&changes, &r);
+        assert!(
+            r_changes.iter().any(|change| matches!(
+                change,
+                RecordChangeKind::Revised { from, to, classification: ChangeClass::Meaning, fields }
+                    if *from == r0 && *to == r1
+                        && fields == &vec![FieldChange {
+                            field: "proposition".into(),
+                            change: FieldChangeKind::Changed,
+                            classification: ChangeClass::Meaning,
+                        }]
+            )),
+            "{r_changes:?}"
+        );
+        assert!(
+            r_changes.iter().any(|change| matches!(
+                change,
+                RecordChangeKind::Effect {
+                    from: EffectSummary::Active { revision: from, .. },
+                    to: EffectSummary::Active { revision: to, .. },
+                } if *from == r0 && *to == r1
+            )),
+            "{r_changes:?}"
+        );
+        let t_changes = of(&changes, &t);
+        assert!(
+            t_changes.iter().any(|change| matches!(
+                change,
+                RecordChangeKind::Revised { classification: ChangeClass::Editorial, fields, .. }
+                    if fields.len() == 2
+                        && fields.iter().all(|field| field.classification == ChangeClass::Editorial)
+                        && fields.iter().any(|field| field.field == "labels" && field.change == FieldChangeKind::Changed)
+                        && fields.iter().any(|field| field.field == "queue" && field.change == FieldChangeKind::Added)
+            )),
+            "{t_changes:?}"
+        );
+        assert_eq!(
+            of(&changes, &s3),
+            vec![RecordChangeKind::Created {
+                revision: s3.clone()
+            }]
+        );
+        assert!(of(&changes, &s).is_empty());
+        assert!(
+            changes.edges.is_empty(),
+            "no live edge moved: {:?}",
+            changes.edges
+        );
+        let s3_change = changes
+            .manifests
+            .iter()
+            .find(|change| change.record == s3)
+            .expect("the fresh claim is a manifest change");
+        assert!(s3_change.before.is_none());
+        assert!(matches!(
+            s3_change
+                .after
+                .as_ref()
+                .map(|judgment| &judgment.completeness),
+            Some(ManifestCompleteness::Incomplete { .. })
+        ));
+        assert!(changes.manifests.iter().all(|change| change.record != s));
+        // The reverse diff names what the earlier frontier does not reach.
+        let latest = frontier(&store);
+        let reverse = diff(&mut store, latest, Some(published_frontier.clone()));
+        assert_eq!(
+            of(&reverse, &s3),
+            vec![RecordChangeKind::Unreached {
+                revision: s3.clone()
+            }]
+        );
+        assert!(of(&reverse, &r).iter().any(|change| matches!(
+            change,
+            RecordChangeKind::Revised { from, to, .. } if *from == r1 && *to == r0
+        )));
+        // Both ends are named frontiers of the history.
+        refused(
+            run(
+                &mut store,
+                &keys,
+                NormCommand::Diff {
+                    before: vec!["0".repeat(64)],
+                    after: None,
+                },
+            ),
+            "frontier",
+        );
+
+        // Explanations: every node is one of five kinds and names its basis.
+        let five = ["obligation", "revision", "evidence", "premise", "authority"];
+        let check_shape = |explanation: &Explanation| {
+            assert!(!explanation.nodes.is_empty());
+            for node in &explanation.nodes {
+                let json = serde_json::to_value(node).unwrap();
+                assert!(five.contains(&json["kind"].as_str().unwrap()), "{json}");
+                let basis = &json["basis"];
+                let named = match basis["kind"].as_str().unwrap() {
+                    "frontier" | "inventory" => !basis["frontier"].as_array().unwrap().is_empty(),
+                    "family" => !basis["basis"].as_str().unwrap().is_empty(),
+                    "act" => !basis["event"].as_str().unwrap().is_empty(),
+                    other => panic!("unknown basis {other}"),
+                };
+                assert!(named, "every node names its basis: {json}");
+            }
+        };
+        let kinds = |explanation: &Explanation, kind: ExplanationKind| -> Vec<ExplanationNode> {
+            explanation
+                .nodes
+                .iter()
+                .filter(|node| node.kind == kind)
+                .cloned()
+                .collect()
+        };
+        // The task: its obligation is named at r0, whose effective revision is r1.
+        let task = explain(&mut store, &t, None);
+        check_shape(&task);
+        assert_eq!(task.subject.id, t);
+        let obligations = kinds(&task, ExplanationKind::Obligation);
+        assert!(
+            obligations
+                .iter()
+                .any(|node| node.detail["requirement"] == json!(r)
+                    && node.detail["named"] == json!(r0)
+                    && node.detail["effective"] == json!(r1)
+                    && node.statement.contains("its effective revision here is")),
+            "{obligations:?}"
+        );
+        assert!(kinds(&task, ExplanationKind::Evidence)
+            .iter()
+            .any(|node| node.detail["edge"]["relation"] == json!("targets")));
+        assert!(kinds(&task, ExplanationKind::Authority)
+            .iter()
+            .any(|node| node.statement == "created by worker"));
+        assert!(kinds(&task, ExplanationKind::Premise)
+            .iter()
+            .any(|node| node.detail["premises"].is_null() && node.detail["parents"].is_array()));
+        // The requirement: an applicable obligation; supported, targeted, and
+        // a member of two manifests; effective at r1 by the owner's act.
+        let requirement = explain(&mut store, &r, None);
+        check_shape(&requirement);
+        assert!(kinds(&requirement, ExplanationKind::Obligation)
+            .iter()
+            .any(|node| node
+                .statement
+                .starts_with("applicable requirement custody-authorization")));
+        let evidence = kinds(&requirement, ExplanationKind::Evidence);
+        assert!(evidence
+            .iter()
+            .any(|node| node.detail["edge"]["relation"] == json!("supports")));
+        assert!(evidence
+            .iter()
+            .any(|node| node.detail["edge"]["relation"] == json!("targets")));
+        let memberships: Vec<&ExplanationNode> = evidence
+            .iter()
+            .filter(|node| node.detail["member"] == json!(r0))
+            .collect();
+        assert_eq!(memberships.len(), 3, "S, B and S3 list r0: {memberships:?}");
+        let revisions = kinds(&requirement, ExplanationKind::Revision);
+        assert!(revisions
+            .iter()
+            .any(|node| node.detail["revision"] == json!(r1)
+                && node.detail["status"] == json!("accepted")));
+        assert!(kinds(&requirement, ExplanationKind::Authority)
+            .iter()
+            .any(|node| {
+                node.statement.starts_with("activated by owner")
+                    && node.detail["rules"]
+                        .as_array()
+                        .is_some_and(|rules| !rules.is_empty())
+            }));
+        // At the published frontier the same record was effective at r0.
+        let then = explain(&mut store, &r, Some(published_frontier.clone()));
+        check_shape(&then);
+        assert_eq!(then.frontier, published_frontier);
+        assert!(kinds(&then, ExplanationKind::Revision)
+            .iter()
+            .any(|node| node.detail["revision"] == json!(r0)
+                && node.detail["activation"].is_string()));
+        assert!(!kinds(&then, ExplanationKind::Revision)
+            .iter()
+            .any(|node| node.detail["revision"] == json!(r1)));
+        // The specification: its premise is the inventory frontier it bound,
+        // and its evidence is the judgment there.
+        let specification = explain(&mut store, &s, None);
+        check_shape(&specification);
+        assert!(kinds(&specification, ExplanationKind::Premise)
+            .iter()
+            .any(|node| {
+                node.basis
+                    == ExplanationBasis::Inventory {
+                        frontier: baseline_frontier.clone(),
+                    }
+                    && node.statement.contains("judged against the inventory")
+            }));
+        assert!(kinds(&specification, ExplanationKind::Evidence)
+            .iter()
+            .any(|node| {
+                node.statement == "the exhaustive claim is complete at its basis"
+                    && node.basis
+                        == ExplanationBasis::Inventory {
+                            frontier: baseline_frontier.clone(),
+                        }
+            }));
+        let bounded = explain(&mut store, &b, None);
+        assert!(kinds(&bounded, ExplanationKind::Evidence)
+            .iter()
+            .any(|node| node.statement.contains("bounded to scope src/")));
+        // A record the frontier does not reach cannot be explained there.
+        refused(
+            run(
+                &mut store,
+                &keys,
+                NormCommand::Explain {
+                    record: s3.clone(),
+                    frontier: Some(published_frontier),
+                },
+            ),
+            "no norm record",
+        );
+    }
+
     #[test]
     fn norm_commands_decode_raw_json_before_any_admission() {
         use whipplescript_store::norm_commands::*;

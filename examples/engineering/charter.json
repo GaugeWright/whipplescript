@@ -377,7 +377,8 @@
             "required": false,
             "value_type": {
               "type": "text"
-            }
+            },
+            "editorial": true
           },
           {
             "name": "labels",
@@ -387,7 +388,8 @@
               "item": {
                 "type": "text"
               }
-            }
+            },
+            "editorial": true
           }
         ],
         "status": {

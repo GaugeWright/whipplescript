@@ -58,6 +58,25 @@ pub enum NormCommand {
         after: NormResourcePoint,
     },
     Export {},
+    /// Render one manifest as a document at a frontier (§8.1).
+    Render {
+        manifest: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        frontier: Option<Vec<String>>,
+    },
+    /// The diff of meaning from one frontier to another; `after` omitted is
+    /// the captured current frontier, named in the result.
+    Diff {
+        before: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        after: Option<Vec<String>>,
+    },
+    /// Explain one record at a frontier.
+    Explain {
+        record: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        frontier: Option<Vec<String>>,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -121,6 +140,18 @@ pub enum NormCommandResult {
         checkpoint: NormCheckpoint,
         frontier: Vec<String>,
         events: Vec<TrackerEvent>,
+    },
+    Rendered {
+        captured: NormReadAnchor,
+        rendering: Box<crate::norm_views::ManifestRendering>,
+    },
+    Differed {
+        captured: NormReadAnchor,
+        diff: Box<crate::norm_views::MeaningDiff>,
+    },
+    Explained {
+        captured: NormReadAnchor,
+        explanation: Box<crate::norm_views::Explanation>,
     },
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -213,7 +244,7 @@ impl<'a, S: NormCommandStore> NormCommandHost<'a, S> {
             });
         }
         Ok(NormSnapshot {
-            manifests: self.manifest_judgments(&view)?,
+            manifests: self.manifest_judgments(&view, None)?,
             families: view.relation_families()?,
             inventory: view.requirement_inventory()?,
             checkpoint: view.checkpoint(),
@@ -230,6 +261,7 @@ impl<'a, S: NormCommandStore> NormCommandHost<'a, S> {
     fn manifest_judgments(
         &self,
         view: &NormView,
+        captured: Option<&CapturedNormHistory>,
     ) -> StoreResult<BTreeMap<String, crate::norm_manifests::ManifestJudgment>> {
         use crate::norm_manifests::{judge, ManifestCompleteness, ManifestJudgment};
         let mut judgments = BTreeMap::new();
@@ -258,10 +290,15 @@ impl<'a, S: NormCommandStore> NormCommandHost<'a, S> {
                 .to_owned();
             let completeness = if claim == manifest.exhaustive {
                 let basis: Vec<String> = view.manifest_basis(&record.id).unwrap_or(&[]).to_vec();
-                if history.is_none() {
-                    history = Some(self.history()?);
-                }
-                let history = history.as_ref().expect("captured above");
+                let history = match captured {
+                    Some(captured) => captured,
+                    None => {
+                        if history.is_none() {
+                            history = Some(self.history()?);
+                        }
+                        history.as_ref().expect("captured above")
+                    }
+                };
                 match history.project(Some(&basis), self.verifier) {
                     Ok(at_basis) => judge(&members, &at_basis.requirement_inventory()?, basis),
                     Err(error) => ManifestCompleteness::Unresolved {
@@ -291,6 +328,35 @@ impl<'a, S: NormCommandStore> NormCommandHost<'a, S> {
             );
         }
         Ok(judgments)
+    }
+
+    /// Every act of a projected view as an explanation cites it: causal
+    /// parents from the transport and the statement it carries. The history
+    /// was verified at capture; this reads it, it does not authenticate again.
+    fn acts_of(
+        &self,
+        history: &CapturedNormHistory,
+        view: &NormView,
+    ) -> StoreResult<BTreeMap<String, crate::norm_views::ExplainedAct>> {
+        let events: BTreeMap<&str, &TrackerEvent> = history
+            .events()
+            .map(|event| (event.event_id.as_str(), event))
+            .collect();
+        let mut acts = BTreeMap::new();
+        for id in view.event_order() {
+            let Some(event) = events.get(id.as_str()) else {
+                continue;
+            };
+            let signed: SignedNormEvent = serde_json::from_str(&event.payload_json)?;
+            acts.insert(
+                id.clone(),
+                crate::norm_views::ExplainedAct {
+                    parents: event.parents.clone(),
+                    statement: signed.statement,
+                },
+            );
+        }
+        Ok(acts)
     }
 
     fn capture_artifact(&self, cut: &str) -> StoreResult<CapturedArtifact> {
@@ -380,6 +446,63 @@ impl<'a, S: NormCommandStore> NormCommandHost<'a, S> {
                         &after_view,
                         &after_artifact,
                         ResourceLimits::default(),
+                    )?),
+                }
+            }
+            NormCommand::Render { manifest, frontier } => {
+                let history = self.history()?;
+                let view = history.project(frontier.as_deref(), self.verifier)?;
+                let manifests = self.manifest_judgments(&view, Some(&history))?;
+                let aliases = self.store.local_norm_aliases()?;
+                let context = crate::norm_views::ViewContext {
+                    view: &view,
+                    aliases: &aliases,
+                    manifests: &manifests,
+                };
+                NormCommandResult::Rendered {
+                    captured: history.anchor(),
+                    rendering: Box::new(crate::norm_views::render_manifest(&context, &manifest)?),
+                }
+            }
+            NormCommand::Diff { before, after } => {
+                let history = self.history()?;
+                let before_view = history.project(Some(&before), self.verifier)?;
+                let after_view = history.project(after.as_deref(), self.verifier)?;
+                let before_manifests = self.manifest_judgments(&before_view, Some(&history))?;
+                let after_manifests = self.manifest_judgments(&after_view, Some(&history))?;
+                let aliases = self.store.local_norm_aliases()?;
+                let diff = crate::norm_views::diff_meaning(
+                    &crate::norm_views::ViewContext {
+                        view: &before_view,
+                        aliases: &aliases,
+                        manifests: &before_manifests,
+                    },
+                    &crate::norm_views::ViewContext {
+                        view: &after_view,
+                        aliases: &aliases,
+                        manifests: &after_manifests,
+                    },
+                )?;
+                NormCommandResult::Differed {
+                    captured: history.anchor(),
+                    diff: Box::new(diff),
+                }
+            }
+            NormCommand::Explain { record, frontier } => {
+                let history = self.history()?;
+                let view = history.project(frontier.as_deref(), self.verifier)?;
+                let manifests = self.manifest_judgments(&view, Some(&history))?;
+                let aliases = self.store.local_norm_aliases()?;
+                let acts = self.acts_of(&history, &view)?;
+                let context = crate::norm_views::ViewContext {
+                    view: &view,
+                    aliases: &aliases,
+                    manifests: &manifests,
+                };
+                NormCommandResult::Explained {
+                    captured: history.anchor(),
+                    explanation: Box::new(crate::norm_views::explain_record(
+                        &context, &acts, &record,
                     )?),
                 }
             }

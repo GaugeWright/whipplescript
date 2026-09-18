@@ -47,6 +47,7 @@ pub mod norm_manifests;
 pub mod norm_publication;
 pub mod norm_relations;
 pub mod norm_resources;
+pub mod norm_views;
 #[cfg(feature = "native")]
 pub mod payload_protection;
 pub mod preflight;
