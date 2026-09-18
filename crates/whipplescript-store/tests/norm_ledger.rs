@@ -2384,6 +2384,481 @@ mod tests {
             .unwrap();
     }
 
+    /// DR-0123: the engineering vocabulary is a charter document, installed
+    /// through the ordinary bootstrap path with no kernel change, and the
+    /// loop it describes closes on the store as it is: requirement, decision
+    /// and its attested incorporation, initiative and task, observation,
+    /// specification judged at its frontier and reproduced there, release
+    /// bound to baseline and evidence, and a requirement revision after which
+    /// the task's target is obsolete while every historical judgment stands.
+    #[test]
+    fn norm_engineering_charter_installs_as_declarations_and_closes_the_loop() {
+        use whipplescript_store::norm_commands::*;
+        use whipplescript_store::norm_manifests::ManifestCompleteness;
+        let charter: NormCharter =
+            serde_json::from_str(include_str!("../../../examples/engineering/charter.json"))
+                .expect("the engineering charter is a charter");
+        let keys = Keys::new();
+        let mut store = WorkItemStore::open_in_memory().unwrap();
+        let ledger = store
+            .append_norm_event(
+                &keys.sign(
+                    "owner",
+                    "engineering",
+                    NormAct::Bootstrap {
+                        creator: "worker".into(),
+                        charter: charter.clone(),
+                    },
+                ),
+                &keys,
+            )
+            .unwrap();
+        let reference = |name: &str| {
+            Vocabulary::new(
+                charter
+                    .vocabularies
+                    .iter()
+                    .find(|entry| entry.definition.name == name)
+                    .unwrap_or_else(|| panic!("charter declares {name}"))
+                    .definition
+                    .clone(),
+            )
+            .unwrap()
+            .reference()
+            .clone()
+        };
+        let refused = |result: Result<String, StoreError>, needle: &str| {
+            let message = format!("{:?}", result.expect_err("refusal expected"));
+            assert!(message.contains(needle), "{message}");
+        };
+        let create = |actor: &str, nonce: &str, kind: &str, fields: serde_json::Value| {
+            keys.sign(
+                actor,
+                nonce,
+                NormAct::Create {
+                    ledger: ledger.clone(),
+                    authority: None,
+                    vocabulary: reference(kind),
+                    fields_json: fields.to_string(),
+                },
+            )
+        };
+        let transition =
+            |actor: &str, nonce: &str, kind: &str, record: &str, previous: &str, status: &str| {
+                keys.sign(
+                    actor,
+                    nonce,
+                    NormAct::Transition {
+                        ledger: ledger.clone(),
+                        authority: None,
+                        vocabulary: reference(kind),
+                        record: record.into(),
+                        previous: previous.into(),
+                        status: status.into(),
+                    },
+                )
+            };
+        let view = |store: &WorkItemStore| store.norm_state(&keys).unwrap();
+        let head = |store: &WorkItemStore, id: &str| view(store).records[id].head.clone();
+        let revision =
+            |store: &WorkItemStore, id: &str| view(store).records[id].content_head.clone();
+        let effective = |store: &WorkItemStore, id: &str| {
+            view(store).effective_records[id].content_head.clone()
+        };
+        let basis = |store: &WorkItemStore, family: &str| {
+            view(store).relation_family(family).unwrap().basis
+        };
+        let relate =
+            |actor: &str, nonce: &str, kind: &str, source: &str, target: &str, basis: &str| {
+                keys.sign_with(
+                    actor,
+                    nonce,
+                    NormAct::Create {
+                        ledger: ledger.clone(),
+                        authority: None,
+                        vocabulary: reference(kind),
+                        fields_json: json!({"source": source, "target": target}).to_string(),
+                    },
+                    Some(NormPremises {
+                        family_basis: Some(basis.into()),
+                        references: vec![source.into(), target.into()],
+                        inventory_frontier: Vec::new(),
+                    }),
+                )
+            };
+        let snapshot = |store: &mut WorkItemStore, frontier: Option<Vec<String>>| {
+            let mut host = NormCommandHost::new(store, &keys);
+            let command = match frontier {
+                None => NormCommand::Snapshot {},
+                Some(frontier) => NormCommand::SnapshotAt { frontier },
+            };
+            match host
+                .execute(NormCommandRequest::new(command))
+                .unwrap()
+                .result
+            {
+                NormCommandResult::Snapshot { snapshot } => *snapshot,
+                NormCommandResult::HistoricalSnapshot { snapshot, .. } => *snapshot,
+                other => panic!("snapshot expected, got {other:?}"),
+            }
+        };
+
+        // A requirement, accepted by the authority, forms the inventory.
+        let r = store
+            .append_norm_event(
+                &create("worker", "R", "requirement", json!({
+                    "name": "custody-authorization", "proposition": "role == owner or grant == allow",
+                    "domain": "src/", "subject": "src/auth.py",
+                    "applicability": "every mainline candidate", "owner": "owner"
+                })),
+                &keys,
+            )
+            .unwrap();
+        store
+            .append_norm_event(
+                &transition("owner", "accept-R", "requirement", &r, &r, "accepted"),
+                &keys,
+            )
+            .unwrap();
+        let r0 = effective(&store, &r);
+        assert_eq!(
+            view(&store)
+                .requirement_inventory()
+                .unwrap()
+                .requirements
+                .len(),
+            1
+        );
+
+        // A decision, accepted on its exact content by the authority alone.
+        let d = store
+            .append_norm_event(
+                &create("worker", "D", "decision", json!({
+                    "title": "Authorize by role or grant", "question": "who may act",
+                    "course": "owners always, workers when granted", "rationale": "least authority",
+                    "alternatives": ["grants only"], "scope": "src/auth.py",
+                    "consequences": "the parser interprets grants", "subjects": ["src/auth.py"]
+                })),
+                &keys,
+            )
+            .unwrap();
+        refused(
+            store.append_norm_event(
+                &transition("worker", "accept-D-worker", "decision", &d, &d, "accepted"),
+                &keys,
+            ),
+            "authenticated governance authority",
+        );
+        store
+            .append_norm_event(
+                &transition("owner", "accept-D", "decision", &d, &d, "accepted"),
+                &keys,
+            )
+            .unwrap();
+        // Incorporation is the authority's attestation, not the worker's.
+        let incorporation = basis(&store, "incorporation");
+        refused(
+            store.append_norm_event(
+                &relate(
+                    "worker",
+                    "inc-worker",
+                    "incorporates",
+                    &d,
+                    &r0,
+                    &incorporation,
+                ),
+                &keys,
+            ),
+            "authenticated governance authority",
+        );
+        store
+            .append_norm_event(
+                &relate("owner", "inc", "incorporates", &d, &r0, &incorporation),
+                &keys,
+            )
+            .unwrap();
+
+        // An initiative committed by its authority, and a task targeting the
+        // requirement's exact revision.
+        let i = store
+            .append_norm_event(
+                &create("worker", "I", "initiative", json!({
+                    "title": "Ship authorization", "problem": "no authorization",
+                    "outcome": "owners and granted workers act", "owner": "owner", "scope": "src/"
+                })),
+                &keys,
+            )
+            .unwrap();
+        refused(
+            store.append_norm_event(
+                &transition(
+                    "worker",
+                    "commit-I-worker",
+                    "initiative",
+                    &i,
+                    &i,
+                    "committed",
+                ),
+                &keys,
+            ),
+            "authenticated governance authority",
+        );
+        store
+            .append_norm_event(
+                &transition("owner", "commit-I", "initiative", &i, &i, "committed"),
+                &keys,
+            )
+            .unwrap();
+        let t = store
+            .append_norm_event(
+                &create(
+                    "worker",
+                    "T",
+                    "task",
+                    json!({"title": "implement custody authorization", "labels": ["norm"]}),
+                ),
+                &keys,
+            )
+            .unwrap();
+        let work = basis(&store, "work");
+        store
+            .append_norm_event(
+                &relate("worker", "T-targets", "targets", &t, &r0, &work),
+                &keys,
+            )
+            .unwrap();
+
+        // An observation of the checked artifact, offered as support.
+        let o = store
+            .append_norm_event(
+                &create("worker", "O", "observation", json!({
+                    "title": "Q0 on A0", "statement": "all four cases pass", "subject": "src/auth.py",
+                    "artifact": "cut-a0", "method": "Q0", "outcome": "pass"
+                })),
+                &keys,
+            )
+            .unwrap();
+        store
+            .append_norm_event(
+                &transition("owner", "activate-O", "observation", &o, &o, "active"),
+                &keys,
+            )
+            .unwrap();
+        let o0 = revision(&store, &o);
+        let support = basis(&store, "support");
+        store
+            .append_norm_event(
+                &relate("worker", "O-supports", "supports", &o, &r0, &support),
+                &keys,
+            )
+            .unwrap();
+
+        // A specification: an exhaustive claim judged at its bound frontier,
+        // published by the authority, and reproduced by the historical
+        // snapshot at that frontier.
+        let baseline_frontier: Vec<String> = view(&store).frontier.iter().cloned().collect();
+        let s = store
+            .append_norm_event(
+                &keys.sign_with(
+                    "worker",
+                    "S",
+                    NormAct::Create {
+                        ledger: ledger.clone(),
+                        authority: None,
+                        vocabulary: reference("specification"),
+                        fields_json: json!({
+                            "title": "Authorization 1.0", "purpose": "what mainline must satisfy",
+                            "selection": "every accepted requirement in src/", "members": [r0],
+                            "claim": "exhaustive", "scope": "src/", "definitions": "grant: a recorded allowance"
+                        })
+                        .to_string(),
+                    },
+                    Some(NormPremises {
+                        family_basis: None,
+                        references: vec![r0.clone()],
+                        inventory_frontier: baseline_frontier.clone(),
+                    }),
+                ),
+                &keys,
+            )
+            .unwrap();
+        store
+            .append_norm_event(
+                &transition("owner", "publish-S", "specification", &s, &s, "published"),
+                &keys,
+            )
+            .unwrap();
+        let s0 = revision(&store, &s);
+        let judged = snapshot(&mut store, None).manifests;
+        assert_eq!(
+            judged[&s].completeness,
+            ManifestCompleteness::Complete {
+                basis: baseline_frontier.clone()
+            }
+        );
+        let published_frontier: Vec<String> = view(&store).frontier.iter().cloned().collect();
+        let historical = snapshot(&mut store, Some(published_frontier.clone()));
+        assert_eq!(
+            historical.manifests[&s].completeness,
+            judged[&s].completeness
+        );
+
+        // A release bound to its baseline and its evidence, admitted by the
+        // release authority alone.
+        let l = store
+            .append_norm_event(
+                &create("worker", "L", "release", json!({
+                    "title": "1.0", "artifacts": ["cut-a0"], "policy": "mainline gated by Authorization 1.0", "exceptions": []
+                })),
+                &keys,
+            )
+            .unwrap();
+        let binding = basis(&store, "release-binding");
+        store
+            .append_norm_event(
+                &relate("worker", "L-baseline", "baselined_on", &l, &s0, &binding),
+                &keys,
+            )
+            .unwrap();
+        let binding = basis(&store, "release-binding");
+        store
+            .append_norm_event(
+                &relate("worker", "L-evidence", "supported_by", &l, &o0, &binding),
+                &keys,
+            )
+            .unwrap();
+        refused(
+            store.append_norm_event(
+                &transition("worker", "admit-L-worker", "release", &l, &l, "admitted"),
+                &keys,
+            ),
+            "authenticated governance authority",
+        );
+        store
+            .append_norm_event(
+                &transition("owner", "admit-L", "release", &l, &l, "admitted"),
+                &keys,
+            )
+            .unwrap();
+
+        // The requirement is revised: a draft edit leaves the accepted
+        // revision effective; acceptance of the new revision moves it.
+        let edited = store
+            .append_norm_event(
+                &keys.sign(
+                    "owner",
+                    "edit-R",
+                    NormAct::Edit {
+                        ledger: ledger.clone(),
+                        authority: None,
+                        vocabulary: reference("requirement"),
+                        record: r.clone(),
+                        previous: head(&store, &r),
+                        fields_json: json!({
+                            "name": "custody-authorization", "proposition": "role == owner or (grant == allow and grant is fresh)",
+                            "domain": "src/", "subject": "src/auth.py",
+                            "applicability": "every mainline candidate", "owner": "owner"
+                        })
+                        .to_string(),
+                    },
+                ),
+                &keys,
+            )
+            .unwrap();
+        assert_eq!(effective(&store, &r), r0);
+        store
+            .append_norm_event(
+                &transition("owner", "accept-R1", "requirement", &r, &edited, "accepted"),
+                &keys,
+            )
+            .unwrap();
+        let r1 = effective(&store, &r);
+        assert_ne!(r1, r0);
+
+        // Reconciliation is derived from the snapshot, never performed: the
+        // task still targets r0, and r0 is no longer effective.
+        let current = snapshot(&mut store, None);
+        let target = &current.families["work"].edges[0];
+        assert_eq!(
+            (target.source.as_str(), target.target.as_str()),
+            (t.as_str(), r.as_str())
+        );
+        let targeted_revision = view(&store).records[&t].id.clone();
+        let _ = targeted_revision;
+        let targets_obsolete = view(&store)
+            .records
+            .values()
+            .filter(|record| record.vocabulary.name == "targets")
+            .any(|edge| edge.fields["target"] == json!(r0) && effective(&store, &r) != r0);
+        assert!(
+            targets_obsolete,
+            "the task's targeted revision is no longer effective"
+        );
+        assert_eq!(view(&store).records[&t].status, "open");
+        // The specification's judgment at its basis is unchanged; a fresh
+        // exhaustive claim is judged at its own frontier and finds r1 missing.
+        assert_eq!(
+            current.manifests[&s].completeness,
+            ManifestCompleteness::Complete {
+                basis: baseline_frontier.clone()
+            }
+        );
+        let now: Vec<String> = view(&store).frontier.iter().cloned().collect();
+        let s2 = store
+            .append_norm_event(
+                &keys.sign_with(
+                    "worker",
+                    "S2",
+                    NormAct::Create {
+                        ledger: ledger.clone(),
+                        authority: None,
+                        vocabulary: reference("specification"),
+                        fields_json: json!({
+                            "title": "Authorization 1.0 again", "purpose": "p", "selection": "s",
+                            "members": [r0], "claim": "exhaustive"
+                        })
+                        .to_string(),
+                    },
+                    Some(NormPremises {
+                        family_basis: None,
+                        references: vec![r0.clone()],
+                        inventory_frontier: now,
+                    }),
+                ),
+                &keys,
+            )
+            .unwrap();
+        let current = snapshot(&mut store, None);
+        let ManifestCompleteness::Incomplete { missing, .. } = &current.manifests[&s2].completeness
+        else {
+            panic!(
+                "a fresh exhaustive claim is incomplete now: {:?}",
+                current.manifests[&s2]
+            );
+        };
+        assert_eq!(missing, &vec![r1.clone()]);
+        // The release's claim stands as made: admitted, bound to s0 and o0.
+        assert_eq!(view(&store).records[&l].status, "admitted");
+        let bindings: Vec<(String, String)> = current.families["release-binding"]
+            .edges
+            .iter()
+            .map(|edge| (edge.relation.clone(), edge.target.clone()))
+            .collect();
+        assert!(bindings.contains(&("baselined_on".into(), s.clone())));
+        assert!(bindings.contains(&("supported_by".into(), o.clone())));
+        // And the historical snapshot at publication still shows r0 effective.
+        let then = snapshot(&mut store, Some(published_frontier));
+        let then_r = then
+            .records
+            .iter()
+            .find(|named| named.record.id == r)
+            .unwrap();
+        let EffectiveRevision::Active { record, .. } = &then_r.effectiveness else {
+            panic!("r was effective at publication");
+        };
+        assert_eq!(record.content_head, r0);
+    }
+
     #[test]
     fn norm_commands_decode_raw_json_before_any_admission() {
         use whipplescript_store::norm_commands::*;

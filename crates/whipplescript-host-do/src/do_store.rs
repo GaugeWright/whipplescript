@@ -19788,6 +19788,390 @@ mod norm_admission_tests {
         assert!(native_view.effective_records.is_empty());
     }
 
+    /// DR-0123: the engineering charter installs on both hosts through the
+    /// same bootstrap path and the loop it describes derives the same views
+    /// on both: records, families, manifests and inventory.
+    #[test]
+    fn norm_native_and_do_run_the_engineering_charter_identically() {
+        use whipplescript_store::norm_commands::{
+            NormCommand, NormCommandHost, NormCommandRequest, NormCommandResult, NormCommandStore,
+        };
+        let charter: NormCharter =
+            serde_json::from_str(include_str!("../../../examples/engineering/charter.json"))
+                .expect("the engineering charter is a charter");
+        let owner_key = SigningKey::from_slice(&[1; 32]).unwrap();
+        let worker_key = SigningKey::from_slice(&[2; 32]).unwrap();
+        let owner = actor("owner", &owner_key);
+        let worker = actor("worker", &worker_key);
+        let owner_root = crate::governance::GaugeDeskGovernanceRoot::new("owner", &owner.key_id);
+        let worker_root = crate::governance::GaugeDeskGovernanceRoot::new("worker", &worker.key_id);
+        let verifier = NormGovernanceVerifier::new(
+            vec![
+                NormPrincipalBinding {
+                    actor: owner.clone(),
+                    verifier: &owner_root,
+                },
+                NormPrincipalBinding {
+                    actor: worker.clone(),
+                    verifier: &worker_root,
+                },
+            ],
+            BTreeSet::from([("worker".into(), "owner".into())]),
+        )
+        .unwrap();
+        let reference = |name: &str| {
+            Vocabulary::new(
+                charter
+                    .vocabularies
+                    .iter()
+                    .find(|entry| entry.definition.name == name)
+                    .unwrap_or_else(|| panic!("charter declares {name}"))
+                    .definition
+                    .clone(),
+            )
+            .unwrap()
+            .reference()
+            .clone()
+        };
+        let mut native = whipplescript_store::items::WorkItemStore::open_in_memory().unwrap();
+        let mut hosted = test_support::store();
+        let bootstrap = signed(
+            owner.clone(),
+            &owner_key,
+            "engineering",
+            NormAct::Bootstrap {
+                creator: "worker".into(),
+                charter: charter.clone(),
+            },
+        );
+        let ledger = native.append_norm_event(&bootstrap, &verifier).unwrap();
+        assert_eq!(
+            hosted.append_norm_event(&bootstrap, &verifier).unwrap(),
+            ledger
+        );
+        let both = |native: &mut whipplescript_store::items::WorkItemStore,
+                    hosted: &mut DoSqliteStore<test_support::RusqliteDoSql>,
+                    event: &SignedNormEvent| {
+            let native_result = native.append_norm_event(event, &verifier);
+            let hosted_result = hosted.append_norm_event(event, &verifier);
+            match (&native_result, &hosted_result) {
+                (Ok(a), Ok(b)) => assert_eq!(a, b),
+                (Err(a), Err(b)) => assert_eq!(format!("{a:?}"), format!("{b:?}")),
+                other => panic!("hosts disagree: {other:?}"),
+            }
+            native_result.unwrap()
+        };
+        let key_of = |principal: &str| -> (&NormActor, &SigningKey) {
+            if principal == "owner" {
+                (&owner, &owner_key)
+            } else {
+                (&worker, &worker_key)
+            }
+        };
+        let create = |principal: &str, nonce: &str, kind: &str, fields: serde_json::Value| {
+            let (actor, key) = key_of(principal);
+            signed(
+                actor.clone(),
+                key,
+                nonce,
+                NormAct::Create {
+                    ledger: ledger.clone(),
+                    authority: None,
+                    vocabulary: reference(kind),
+                    fields_json: fields.to_string(),
+                },
+            )
+        };
+        let transition = |principal: &str,
+                          nonce: &str,
+                          kind: &str,
+                          record: &str,
+                          previous: &str,
+                          status: &str| {
+            let (actor, key) = key_of(principal);
+            signed(
+                actor.clone(),
+                key,
+                nonce,
+                NormAct::Transition {
+                    ledger: ledger.clone(),
+                    authority: None,
+                    vocabulary: reference(kind),
+                    record: record.into(),
+                    previous: previous.into(),
+                    status: status.into(),
+                },
+            )
+        };
+        let relate =
+            |principal: &str, nonce: &str, kind: &str, source: &str, target: &str, basis: &str| {
+                let (actor, key) = key_of(principal);
+                signed_with(
+                    actor.clone(),
+                    key,
+                    nonce,
+                    NormAct::Create {
+                        ledger: ledger.clone(),
+                        authority: None,
+                        vocabulary: reference(kind),
+                        fields_json: serde_json::json!({"source": source, "target": target})
+                            .to_string(),
+                    },
+                    Some(NormPremises {
+                        family_basis: Some(basis.into()),
+                        references: vec![source.into(), target.into()],
+                        inventory_frontier: Vec::new(),
+                    }),
+                )
+            };
+        fn take_snapshot<S: NormCommandStore>(
+            store: &mut S,
+            verifier: &dyn whipplescript_store::norm::NormVerifier,
+        ) -> whipplescript_store::norm_commands::NormSnapshot {
+            let response = NormCommandHost::new(store, verifier)
+                .execute(NormCommandRequest::new(NormCommand::Snapshot {}))
+                .unwrap();
+            let NormCommandResult::Snapshot { snapshot } = response.result else {
+                panic!("snapshot expected");
+            };
+            *snapshot
+        }
+        let agree = |native: &mut whipplescript_store::items::WorkItemStore,
+                     hosted: &mut DoSqliteStore<test_support::RusqliteDoSql>| {
+            let a = take_snapshot(native, &verifier);
+            let b = take_snapshot(hosted, &verifier);
+            assert_eq!(
+                serde_json::to_value(&a.records).unwrap(),
+                serde_json::to_value(&b.records).unwrap()
+            );
+            assert_eq!(a.families, b.families);
+            assert_eq!(a.manifests, b.manifests);
+            assert_eq!(a.inventory.requirements, b.inventory.requirements);
+            assert_eq!(a.frontier, b.frontier);
+            a
+        };
+        let effective =
+            |snapshot: &whipplescript_store::norm_commands::NormSnapshot, id: &str| -> String {
+                let named = snapshot
+                    .records
+                    .iter()
+                    .find(|named| named.record.id == id)
+                    .unwrap();
+                let EffectiveRevision::Active { record, .. } = &named.effectiveness else {
+                    panic!("{id} is effective");
+                };
+                record.content_head.clone()
+            };
+        let revision =
+            |snapshot: &whipplescript_store::norm_commands::NormSnapshot, id: &str| -> String {
+                snapshot
+                    .records
+                    .iter()
+                    .find(|named| named.record.id == id)
+                    .unwrap()
+                    .record
+                    .content_head
+                    .clone()
+            };
+        let r = both(
+            &mut native,
+            &mut hosted,
+            &create(
+                "worker",
+                "R",
+                "requirement",
+                serde_json::json!({
+                    "name": "custody-authorization", "proposition": "role == owner or grant == allow",
+                    "domain": "src/", "subject": "src/auth.py", "applicability": "every mainline candidate", "owner": "owner"
+                }),
+            ),
+        );
+        both(
+            &mut native,
+            &mut hosted,
+            &transition("owner", "accept-R", "requirement", &r, &r, "accepted"),
+        );
+        let snapshot = agree(&mut native, &mut hosted);
+        let r0 = effective(&snapshot, &r);
+        let d = both(
+            &mut native,
+            &mut hosted,
+            &create(
+                "worker",
+                "D",
+                "decision",
+                serde_json::json!({
+                    "title": "Authorize by role or grant", "question": "who may act", "course": "owners always",
+                    "rationale": "least authority", "alternatives": [], "scope": "src/auth.py",
+                    "consequences": "the parser interprets grants", "subjects": ["src/auth.py"]
+                }),
+            ),
+        );
+        both(
+            &mut native,
+            &mut hosted,
+            &transition("owner", "accept-D", "decision", &d, &d, "accepted"),
+        );
+        let incorporation = agree(&mut native, &mut hosted).families["incorporation"]
+            .basis
+            .clone();
+        both(
+            &mut native,
+            &mut hosted,
+            &relate("owner", "inc", "incorporates", &d, &r0, &incorporation),
+        );
+        let t = both(
+            &mut native,
+            &mut hosted,
+            &create(
+                "worker",
+                "T",
+                "task",
+                serde_json::json!({"title": "implement", "labels": []}),
+            ),
+        );
+        let work = agree(&mut native, &mut hosted).families["work"]
+            .basis
+            .clone();
+        both(
+            &mut native,
+            &mut hosted,
+            &relate("worker", "T-targets", "targets", &t, &r0, &work),
+        );
+        let o = both(
+            &mut native,
+            &mut hosted,
+            &create(
+                "worker",
+                "O",
+                "observation",
+                serde_json::json!({
+                    "title": "Q0 on A0", "statement": "all cases pass", "artifact": "cut-a0", "method": "Q0", "outcome": "pass"
+                }),
+            ),
+        );
+        both(
+            &mut native,
+            &mut hosted,
+            &transition("owner", "activate-O", "observation", &o, &o, "active"),
+        );
+        let snapshot = agree(&mut native, &mut hosted);
+        let o0 = revision(&snapshot, &o);
+        let support = snapshot.families["support"].basis.clone();
+        both(
+            &mut native,
+            &mut hosted,
+            &relate("worker", "O-supports", "supports", &o, &r0, &support),
+        );
+        let baseline_frontier = agree(&mut native, &mut hosted).frontier.clone();
+        let s = both(
+            &mut native,
+            &mut hosted,
+            &signed_with(
+                worker.clone(),
+                &worker_key,
+                "S",
+                NormAct::Create {
+                    ledger: ledger.clone(),
+                    authority: None,
+                    vocabulary: reference("specification"),
+                    fields_json: serde_json::json!({
+                        "title": "Authorization 1.0", "purpose": "p", "selection": "s", "members": [r0], "claim": "exhaustive"
+                    })
+                    .to_string(),
+                },
+                Some(NormPremises {
+                    family_basis: None,
+                    references: vec![r0.clone()],
+                    inventory_frontier: baseline_frontier.clone(),
+                }),
+            ),
+        );
+        both(
+            &mut native,
+            &mut hosted,
+            &transition("owner", "publish-S", "specification", &s, &s, "published"),
+        );
+        let snapshot = agree(&mut native, &mut hosted);
+        let s0 = revision(&snapshot, &s);
+        assert!(
+            matches!(&snapshot.manifests[&s].completeness, whipplescript_store::norm_manifests::ManifestCompleteness::Complete { basis } if *basis == baseline_frontier)
+        );
+        let l = both(
+            &mut native,
+            &mut hosted,
+            &create(
+                "worker",
+                "L",
+                "release",
+                serde_json::json!({
+                    "title": "1.0", "artifacts": ["cut-a0"], "policy": "gated", "exceptions": []
+                }),
+            ),
+        );
+        let binding = agree(&mut native, &mut hosted).families["release-binding"]
+            .basis
+            .clone();
+        both(
+            &mut native,
+            &mut hosted,
+            &relate("worker", "L-baseline", "baselined_on", &l, &s0, &binding),
+        );
+        let binding = agree(&mut native, &mut hosted).families["release-binding"]
+            .basis
+            .clone();
+        both(
+            &mut native,
+            &mut hosted,
+            &relate("worker", "L-evidence", "supported_by", &l, &o0, &binding),
+        );
+        both(
+            &mut native,
+            &mut hosted,
+            &transition("owner", "admit-L", "release", &l, &l, "admitted"),
+        );
+        let head = agree(&mut native, &mut hosted)
+            .records
+            .iter()
+            .find(|named| named.record.id == r)
+            .unwrap()
+            .record
+            .head
+            .clone();
+        let edited = both(
+            &mut native,
+            &mut hosted,
+            &signed(
+                owner.clone(),
+                &owner_key,
+                "edit-R",
+                NormAct::Edit {
+                    ledger: ledger.clone(),
+                    authority: None,
+                    vocabulary: reference("requirement"),
+                    record: r.clone(),
+                    previous: head,
+                    fields_json: serde_json::json!({
+                        "name": "custody-authorization", "proposition": "role == owner or fresh grant",
+                        "domain": "src/", "subject": "src/auth.py", "applicability": "every mainline candidate", "owner": "owner"
+                    })
+                    .to_string(),
+                },
+            ),
+        );
+        both(
+            &mut native,
+            &mut hosted,
+            &transition("owner", "accept-R1", "requirement", &r, &edited, "accepted"),
+        );
+        let snapshot = agree(&mut native, &mut hosted);
+        assert_ne!(effective(&snapshot, &r), r0);
+        assert_eq!(snapshot.families["work"].edges[0].target, r);
+        assert!(
+            matches!(&snapshot.manifests[&s].completeness, whipplescript_store::norm_manifests::ManifestCompleteness::Complete { basis } if *basis == baseline_frontier)
+        );
+    }
+
     #[test]
     fn norm_do_bundled_edits_and_local_aliases_match_native_records() {
         let owner_key = SigningKey::from_slice(&[1; 32]).unwrap();

@@ -2019,3 +2019,157 @@ fn recovered_execution_binds_selection_to_the_original_contract_and_exercise() {
         );
     }
 }
+
+/// DR-0123: the engineering charter carries the kernel's observation
+/// declaration under the publishing scope, so a verified execution's
+/// observation lands in an engineering ledger through the existing
+/// publication path, and can then be offered as support for the
+/// requirement's exact revision through the charter's own relation.
+#[test]
+fn engineering_charter_receives_a_verified_observation_through_publication() {
+    use crate::norm_publication::{ObservationSigning, PreparedObservationPublication};
+    let charter: NormCharter =
+        serde_json::from_str(include_str!("../../../examples/engineering/charter.json"))
+            .expect("the engineering charter is a charter");
+    let mut ledger = whipplescript_store::items::WorkItemStore::open_in_memory().unwrap();
+    let ledger_id = ledger
+        .append_norm_event(
+            &sign(
+                "root",
+                NormAct::Bootstrap {
+                    creator: "owner".into(),
+                    charter: charter.clone(),
+                },
+            ),
+            &Boundary,
+        )
+        .unwrap();
+    let reference = |name: &str| {
+        Vocabulary::new(
+            charter
+                .vocabularies
+                .iter()
+                .find(|entry| entry.definition.name == name)
+                .unwrap_or_else(|| panic!("charter declares {name}"))
+                .definition
+                .clone(),
+        )
+        .unwrap()
+        .reference()
+        .clone()
+    };
+    let mut fields = json!({
+        "name": "allow", "proposition": "unknown denied", "domain": "workspace",
+        "subject": "main.py", "applicability": "every candidate", "owner": "owner"
+    });
+    fields["support_contract"] = json!(template().to_string());
+    let requirement = ledger
+        .append_norm_event(
+            &sign(
+                "requirement",
+                NormAct::Create {
+                    ledger: ledger_id.clone(),
+                    authority: None,
+                    vocabulary: reference("requirement"),
+                    fields_json: fields.to_string(),
+                },
+            ),
+            &Boundary,
+        )
+        .unwrap();
+    ledger
+        .append_norm_event(
+            &sign(
+                "accept",
+                NormAct::Transition {
+                    ledger: ledger_id.clone(),
+                    authority: None,
+                    vocabulary: reference("requirement"),
+                    record: requirement.clone(),
+                    previous: requirement.clone(),
+                    status: "accepted".into(),
+                },
+            ),
+            &Boundary,
+        )
+        .unwrap();
+    let captured = history(&ledger);
+    let execution = PreparedNormExecution::prepare(
+        &captured,
+        &Boundary,
+        &artifact("def allow(user): return False"),
+        &script(),
+        selection(&ledger_id, &requirement),
+    )
+    .unwrap();
+    let kernel = journal_execution(
+        whipplescript_store::SqliteStore::open_in_memory().unwrap(),
+        &execution,
+        &receipt(&execution, false, false),
+        false,
+    );
+    let verified = execution
+        .verify_settled(kernel.store(), "instance", "run")
+        .unwrap();
+    let observation_vocabulary = reference("local-observation");
+    let actor = actor();
+    let prepared = PreparedObservationPublication::prepare(
+        &verified,
+        &captured,
+        kernel.store(),
+        &Boundary,
+        ObservationSigning {
+            vocabulary: &observation_vocabulary,
+            authority: None,
+            actor: &actor,
+            created_at: "2026-09-18T00:00:00Z",
+        },
+        |statement| Ok(sha256_hex(&statement.signing_bytes().unwrap())),
+    )
+    .unwrap();
+    let receipt = prepared.submit(&mut ledger, &Boundary).unwrap();
+    let observation = receipt.event_id().to_string();
+    let view = ledger.norm_view(&Boundary).unwrap();
+    assert_eq!(
+        view.records[&observation].vocabulary.name,
+        "local-observation"
+    );
+    let r0 = view.effective_records[&requirement].content_head.clone();
+    let support = view.relation_family("support").unwrap().basis;
+    let statement = NormStatement {
+        protocol: "whipplescript.norm/v1".into(),
+        actor: actor.clone(),
+        nonce: "supports".into(),
+        created_at: "2026-09-18T00:00:00Z".into(),
+        action: NormAct::Create {
+            ledger: ledger_id.clone(),
+            authority: None,
+            vocabulary: reference("supports"),
+            fields_json: json!({"source": observation, "target": r0}).to_string(),
+        },
+        premises: Some(NormPremises {
+            family_basis: Some(support),
+            references: vec![observation.clone(), r0.clone()],
+            inventory_frontier: Vec::new(),
+        }),
+    };
+    let signature = sha256_hex(&statement.signing_bytes().unwrap());
+    ledger
+        .append_norm_event(
+            &SignedNormEvent {
+                statement,
+                signature,
+                successor_signature: None,
+            },
+            &Boundary,
+        )
+        .unwrap();
+    let family = ledger
+        .norm_view(&Boundary)
+        .unwrap()
+        .relation_family("support")
+        .unwrap();
+    assert!(family.edges.iter().any(|edge| {
+        edge.source == observation && edge.target == requirement && edge.relation == "supports"
+    }));
+}
