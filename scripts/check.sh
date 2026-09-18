@@ -36,28 +36,18 @@ esac
 # scripts/check-new-advisories.sh asks the same question about cargo-audit.
 export prerequisites
 
-# A step whose tool this host has not installed. Returns non-zero when the
-# caller must skip, so a guarded step reads `if prerequisite …; then`; under
-# `required` it never returns at all.
-#
-#   $1 the tool, $2 what it gates, $3 the command that installs it,
-#   $4 the CI job that runs it anyway
-prerequisite() {
-  command -v "$1" >/dev/null 2>&1 && return 0
-  if [ "$prerequisites" = required ]; then
-    echo "$2 requires $1." >&2
-    echo "install: $3" >&2
-    exit 1
-  fi
-  echo "-- $2 SKIPPED: $1 is not installed --" >&2
-  echo "   the $4 CI job runs it on every pull request." >&2
-  echo "   To close the gap locally: $3" >&2
-  return 1
-}
+# The helper that decides what an absent tool means is in its own file because
+# scripts/section.sh needs it too: from stage 3 a section's command lives there
+# and runs in its own process — under Buck2, one that inherits nothing from
+# this shell. One copy, sourced twice, rather than two that drift. DR-0127 in
+# the GaugeWright repository renders exactly this helper to exactly this path;
+# when that rollout reaches here, the rendered copy replaces this one.
+# shellcheck source=scripts/prerequisite.sh
+. scripts/prerequisite.sh
 
-# Stage 2 of the Buck2 migration (GaugeWright BUILD.md, DR-0124): each pure
-# section is a Buck2 target declaring what it reads. When this checkout is a
-# cell of a materialized workspace, a section runs through Buck2, which spares
+# Stages 2 and 3 of the Buck2 migration (GaugeWright BUILD.md, DR-0124): every
+# section of this bar is a Buck2 target declaring what it reads. When this
+# checkout is a# cell of a materialized workspace, a section runs through Buck2, which spares
 # the re-run when nothing the section declares has changed and otherwise runs
 # scripts/section.sh exactly as the direct path does. When it is not — a
 # worktree, a CI runner, a host without buck2 — the same script runs directly.
@@ -69,9 +59,13 @@ if [ -z "${GREEN_BAR_INSIDE_BUCK2:-}" ] && command -v buck2 >/dev/null 2>&1 \
    && buck2 audit cell 2>/dev/null | grep -qx "whipplescript: $(pwd -P)"; then
   via_buck2=1
 fi
+# One nonce for the whole run: the sections whose answer is not in this tree
+# put it in their action's environment and will not run without it, while the
+# cached sections do not read the key and are undisturbed by it.
+GREEN_BAR_RUN="${GREEN_BAR_RUN:-$(date +%s)-$$}"
 section() {
   if [ -n "$via_buck2" ]; then
-    log="$(buck2 build "//:$1" --show-full-simple-output)"
+    log="$(buck2 build "//:$1" -c "green_bar.run=$GREEN_BAR_RUN" --show-full-simple-output)"
     cat "$log"
   else
     scripts/section.sh "$1"
@@ -157,7 +151,7 @@ if [ -f AGENTS.md ]; then
     # a file on a branch, so two branches in flight always collide and nothing
     # notices until a person reads the merge; that happened twice on 2026-08-25.
     echo "== decision records =="
-    scripts/check-decision-records.sh
+    section decision-records
 
     echo "== governed doors =="
     section governed-doors
@@ -213,15 +207,6 @@ echo "== intra-workspace version pins =="
 # workspace was 0.5.6 and all 24 still said 0.5.5. Caret semantics hid it (a
 # `0.5.5` requirement accepts 0.5.6), which is exactly why it could sit there.
 section version-pins
-pin_drift="$(grep -n 'path = "\.\./whipplescript-' crates/*/Cargo.toml \
-    | grep 'version = "' \
-    | grep -v "version = \"$ws_version\"" || true)"
-if [ -n "$pin_drift" ]; then
-    echo "intra-workspace pins disagree with [workspace.package] version $ws_version:" >&2
-    echo "$pin_drift" >&2
-    echo "Bump each to \"$ws_version\"; cargo cannot inherit this field." >&2
-    exit 1
-fi
 
 # DR-0066: the shared digest/verification cores must stay free of ambient time,
 # randomness, and IO, or deterministic simulation stops being available and the
@@ -245,14 +230,7 @@ echo "== workstream host contract =="
 section workstream-host-contract
 
 echo "== host action contract =="
-python3 scripts/check-host-action-contract.py
-python3 scripts/test-host-action-contract.py
-python3 scripts/check-host-action-contract-v2.py
-python3 scripts/test-host-action-contract-v2.py
-python3 scripts/check-host-action-contract-v3.py
-python3 scripts/test-host-action-contract-v3.py
-python3 scripts/check-host-action-contract-v4.py
-python3 scripts/test-host-action-contract-v4.py
+section host-action-contract
 
 echo "== refusal scanner contracts =="
 section refusal-scanner
@@ -277,7 +255,7 @@ echo "== production dependency advisories =="
 # `.github/workflows/security-baseline.yml`, on `main` and on the daily cron,
 # beside the gitleaks scan that already splits the same two questions the same
 # way.
-scripts/check-new-advisories.sh
+section advisories
 
 echo "== supply-chain policy =="
 # What `cargo audit` does not answer: the LICENSES the dependency tree carries,
@@ -288,16 +266,12 @@ echo "== supply-chain policy =="
 # already the hard advisory gate over the same RustSec database, and a second
 # one only adds nondeterministic breakage when a new advisory lands. deny.toml
 # says the same at more length.
-if prerequisite cargo-deny "the supply-chain policy check" \
-        "cargo install cargo-deny --locked" "check"; then
-    cargo deny check bans licenses sources
-fi
-
+section supply-chain
 echo "== formatting =="
-cargo fmt --all -- --check
+section formatting
 
 echo "== lints =="
-cargo clippy --workspace --all-targets -- -D warnings
+section lints
 
 # The default feature set is not the only one this repository promises. Until
 # now `grep -rn 'no-default-features\|all-features' scripts/ .github/` returned
@@ -315,20 +289,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 # runner, where these feature unifications share no artifacts with the workspace
 # build above — about 80s.
 echo "== non-default feature builds =="
-cargo check -p whipplescript-store --no-default-features
-cargo check -p whipplescript-kernel --no-default-features
-cargo check -p whipplescript --no-default-features
-# whipplescript-custodian's `pkcs11` gates eight cfg sites and was compiled by
-# nothing. cryptoki loads its vendor module at runtime and its bindings are
-# pre-generated, so this needs no system library and is portable.
-#
-# Its sibling `tpm` is deliberately NOT here: tss-esapi links the native tss2
-# stack, so the check would pass on a box with libtss2-dev and fail everywhere
-# else — a gate that means two different things in two places, which is the one
-# thing this script exists not to be. Those eight cfg sites remain compiled by
-# nothing; closing that needs a decision about libtss2-dev as a prerequisite,
-# not a line here.
-cargo check -p whipplescript-custodian --features pkcs11 --all-targets
+section feature-builds
 
 echo "== norm observer runtime preparation =="
 # `prepare.py` builds the CPython observer reactor and refuses on any host that
@@ -342,17 +303,7 @@ echo "== norm observer runtime preparation =="
 # answer it, the way scripts/check-windows-compile.sh names `windows-compiles`.
 # The tests that need the reactor stand down the same way through
 # `norm_reactor::prepared_reactor`, which prints where the artifact belongs.
-norm_host="$(uname -s)-$(uname -m)"
-case "$norm_host" in
-    Linux-x86_64 | Linux-amd64)
-        python3 experiments/norm-wasi/prepare.py --fetch
-        python3 experiments/norm-wasi/preparation_checks.py
-        ;;
-    *)
-        echo "skipped: the observer reactor builder requires a Linux x86-64 host, and this is $norm_host;"
-        echo "         the green-bar CI job runs this same script on ubuntu-latest and prepares it there"
-        ;;
-esac
+section norm-observer
 
 # cargo-nextest runs each test in its own process and schedules the whole set
 # across cores itself, rather than handing one process per test binary to
@@ -384,11 +335,7 @@ esac
 # but a future filtered nextest call would be unguarded — that lint needs
 # widening before one is written.
 echo "== tests =="
-if command -v cargo-nextest >/dev/null 2>&1; then
-    cargo nextest run --workspace
-else
-    cargo test --workspace
-fi
+section tests
 
 # What a release compiles, which is more than what it distributes: every
 # workspace member for every target in dist-workspace.toml. The command lives in
@@ -397,7 +344,7 @@ fi
 # this bar. On a non-Windows host it says why it cannot answer instead of
 # pretending to.
 echo "== release compile for windows =="
-scripts/check-windows-compile.sh
+section windows-compile
 
 # The hosted Durable Object worker is part of the same per-change gate: its
 # production route inventory, authenticated compositions, types, and deployable
@@ -430,20 +377,19 @@ echo "== docs =="
 # stays out: it provisions a virtualenv over the network when mkdocs is absent,
 # and a network install inside the required gate costs more in flakiness than
 # the class of bug it catches. It remains in the release gate.
-scripts/check-docs-snippets.sh
-scripts/check-docs-fences.sh
-
-# The OUTPUT printed in the pages, which is the other half of what a page claims
-# and had no gate at all: about two dozen `error[code]: …` blocks, with their
-# `-->` line, gutter, caret and help. They were hand-written, so when the
-# diagnostic rendering changed shape every one went stale at once and each was
-# corrected by hand — the same position `examples/invalid/*.diagnostics` was in
-# before it was gated. Each sample now names the program it renders from in a
-# `<!-- render: … -->` comment and is GENERATED from it, a block whose named code
-# the program stopped emitting is a failure rather than an empty sample, and a
-# block that looks like compiler output but names no source fails outright, so a
-# sample nobody can regenerate cannot be added.
-scripts/regen-docs-diagnostics.sh --check
+#
+# The section also covers the OUTPUT printed in the pages, which is the other
+# half of what a page claims and had no gate at all: about two dozen
+# `error[code]: …` blocks, with their `-->` line, gutter, caret and help. They
+# were hand-written, so when the diagnostic rendering changed shape every one
+# went stale at once and each was corrected by hand — the same position
+# `examples/invalid/*.diagnostics` was in before it was gated. Each sample now
+# names the program it renders from in a `<!-- render: … -->` comment and is
+# GENERATED from it, a block whose named code the program stopped emitting is a
+# failure rather than an empty sample, and a block that looks like compiler
+# output but names no source fails outright, so a sample nobody can regenerate
+# cannot be added.
+section docs
 
 # The other half of the examples corpus: examples/invalid/, whose *.diagnostics
 # files are snapshots of what `whip check` actually prints. They were written by
@@ -456,7 +402,7 @@ scripts/regen-docs-diagnostics.sh --check
 # fails when one is absent from the corpus test's hand-maintained include_str!
 # list, which is the same self-flattering shape the coverage gate had.
 echo "== invalid-fixture diagnostics =="
-scripts/regen-invalid-diagnostics.sh --check
+section invalid-diagnostics
 
 # The `.ir` lowering goldens. Same shape as the two --check regenerations above,
 # and it belonged here for the same reason: it was reachable only from
@@ -466,7 +412,7 @@ scripts/regen-invalid-diagnostics.sh --check
 # `whip` is already built by the docs gate above — which is cheap enough to ask
 # on every change, and one command blesses a deliberate move.
 echo "== IR lowering goldens =="
-scripts/regen-ir-goldens.sh --check
+section ir-goldens
 
 # The diagnostic code registers, and the coverage column that makes the code set
 # answerable. A second audit of the codes kept finding one-fault-two-codes pairs
@@ -481,7 +427,7 @@ scripts/regen-ir-goldens.sh --check
 # what keeps the macro the only door: `DiagnosticCode` has no constructor, so an
 # unregistered literal does not compile.
 echo "== diagnostic code registers =="
-scripts/regen-diagnostic-codes.sh --check
+section diagnostic-codes
 
 # The vendored `std/` copies. `std/` is the source of truth and each crate
 # carries a build-time copy; `crates/whipplescript-parser/build.rs`,
@@ -519,39 +465,13 @@ if [ -d .github/workflows ]; then
 fi
 
 echo "== hosted runtime contracts =="
-worker=crates/whipplescript-host-do/worker
+# The skip is decided HERE rather than inside the section, so that a run which
+# skipped is never a verdict at all: a section that resolved to "skipped" would
+# be a cacheable answer keyed on inputs that did not decide it.
 if [ -n "${WHIPPLESCRIPT_CHECK_SKIP_HOSTED:-}" ]; then
     echo "skipped: WHIPPLESCRIPT_CHECK_SKIP_HOSTED is set (a separate job owns these)"
 else
-    # The hard exit here named neither a remedy nor the job that does run this,
-    # so a workstation without the wasm toolchain got a red bar that said only
-    # that it was a workstation. `wrangler` arrives with the worker's own
-    # node_modules, so an absent one is often just an uninstalled tree.
-    missing_hosted=""
-    for tool in wasm-bindgen wrangler; do
-        command -v "$tool" >/dev/null 2>&1 || [ -x "$worker/node_modules/.bin/$tool" ] \
-            || missing_hosted="${missing_hosted:+$missing_hosted }$tool"
-    done
-
-    hosted_install="cargo install wasm-bindgen-cli --locked, and npm --prefix $worker ci"
-    if [ -z "$missing_hosted" ]; then
-        [ -d "$worker/node_modules" ] || npm --prefix "$worker" ci
-        npm --prefix "$worker" test
-        (cd "$worker" && npx tsc --noEmit)
-        # Cosmetic requests must not hold the gate open after the dry-run.
-        # Wrangler's banner stops waiting for its update lookup without
-        # cancelling the request.
-        (cd "$worker" && WRANGLER_HIDE_BANNER=true WRANGLER_SEND_METRICS=false \
-            npx wrangler deploy --config wrangler.public.toml --dry-run --outdir dist-ci)
-    elif [ "$prerequisites" = required ]; then
-        echo "the hosted runtime contracts require:$missing_hosted" >&2
-        echo "install: $hosted_install" >&2
-        exit 1
-    else
-        echo "-- hosted runtime contracts SKIPPED: missing$missing_hosted --" >&2
-        echo "   the hosted-runtime-contracts CI job has this toolchain and runs them on" >&2
-        echo "   every pull request. To close the gap locally: $hosted_install" >&2
-    fi
+    section hosted-runtime
 fi
 
 echo "== whipplescript green bar PASSED =="

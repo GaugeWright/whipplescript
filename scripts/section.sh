@@ -1,20 +1,64 @@
 #!/usr/bin/env bash
-# The green bar's pure sections, each stated once (GaugeWright BUILD.md, stage 2).
+# Every section of the green bar, each stated once (GaugeWright BUILD.md, stages 2 and 3).
 #
 #   scripts/section.sh <name>
 #
 # scripts/check.sh runs a section either directly, through this script, or as
 # the Buck2 target of the same name — which also runs this script, in this
 # checkout, and re-runs it only when a file the target declares has changed.
-# The command lives here and nowhere else. Not here, and never targets: the
-# decision-record and host-action-contract sections, which read origin/main
-# (the first is the decision-id collision guard, and a cached verdict of it is
-# the collision); the advisory and supply-chain sections, which read the world;
-# and every section that builds or runs `whip` — the formatter, the lints, the
-# feature builds, the tests, the docs and golden regenerations, the hosted
-# runtime — which stage 3 owns.
+# The command lives here and nowhere else. Stage 3 brought in the rest: every
+# section that builds or runs `whip` — the formatter, the lints, the feature
+# builds, the tests, the docs and golden regenerations, the hosted runtime —
+# and the four whose answer is not in this tree at all. Those four are
+# `check_world` targets, which refuse to run without a nonce naming the run, so
+# they are in the graph without ever being answered from it: the advisory sweep
+# and the observer-reactor preparation reach the network, and the decision
+# records and the host action contract read origin/main — the first of those is
+# the decision-id collision guard, and a cached verdict of it is the collision.
 set -euo pipefail
 cd "$(dirname "$0")/.."
+
+# What an absent tool means, defined once and sourced by scripts/check.sh too.
+# `prerequisites` arrives exported on the direct path and in the action's
+# environment on the Buck2 path; absent, it is required, because a skip is not
+# a verdict and the gate must never quietly stop gating.
+# shellcheck source=scripts/prerequisite.sh
+. scripts/prerequisite.sh
+
+# This invocation's own tracker store. Without it the store resolves to
+# `.whipplescript/items.sqlite` in the working directory, which a check run
+# would share with the developer's own tracker and with any concurrent run.
+# scripts/check.sh makes one per run and exports it, and that reaches the
+# sections it invokes directly — but a section running as a Buck2 action does
+# not inherit that process's environment, so it makes its own here. The
+# property is the same either way; only the scope differs.
+# One EXIT trap for every temporary root this script makes, because a second
+# `trap … EXIT` would replace the first and leak what it was cleaning up.
+section_temp_roots=()
+section_cleanup() { [ ${#section_temp_roots[@]} -eq 0 ] || rm -rf "${section_temp_roots[@]}"; }
+trap section_cleanup EXIT
+
+if [ -z "${WHIPPLESCRIPT_ITEMS_STORE:-}" ]; then
+    section_items_root="$(mktemp -d)"
+    section_temp_roots+=("$section_items_root")
+    export WHIPPLESCRIPT_ITEMS_STORE="$section_items_root/items.sqlite"
+fi
+
+# Where anything this section runs writes its temporary files. A Unix-domain
+# socket path has a hard length limit — SUN_LEN, 104 bytes on macOS — and the
+# CLI tests bind one under $TMPDIR, directly and again through the worker's
+# native vector producer. Buck2 gives an action a TMPDIR deep inside buck-out
+# (`buck-out/v2/tmp/<cell>/<hash>/<category>/<name>`), long enough on its own to
+# push those binds past the limit: the same tests, the same assertions, failing
+# on where they were told to write rather than on anything about the change.
+#
+# So every section says where it writes, in the one place both paths read, and
+# `/tmp` is the base because the point is that it is SHORT — it is what
+# `env::temp_dir()` falls back to anyway. Removed however this script ends.
+section_tmpdir="$(mktemp -d /tmp/whip-check.XXXXXX)"
+section_temp_roots+=("$section_tmpdir")
+export TMPDIR="$section_tmpdir"
+
 case "${1:-}" in
   agent-guide)          node scripts/check-agent-guide.mjs ;;
   mirror-projection)    node scripts/check-mirror-projection.mjs ;;
@@ -57,5 +101,89 @@ case "${1:-}" in
   vendored-std)         scripts/check-vendored-std.sh ;;
   trackers)             scripts/check-trackers.sh ;;
   gate-reachability)    scripts/check-gate-reachability.sh ;;
+  decision-records)     scripts/check-decision-records.sh ;;
+  host-action-contract)
+    python3 scripts/check-host-action-contract.py
+    python3 scripts/test-host-action-contract.py
+    python3 scripts/check-host-action-contract-v2.py
+    python3 scripts/test-host-action-contract-v2.py
+    python3 scripts/check-host-action-contract-v3.py
+    python3 scripts/test-host-action-contract-v3.py
+    python3 scripts/check-host-action-contract-v4.py
+    python3 scripts/test-host-action-contract-v4.py ;;
+  advisories)           scripts/check-new-advisories.sh ;;
+  supply-chain)
+    if prerequisite cargo-deny "the supply-chain policy check" \
+            "cargo install cargo-deny --locked" "check"; then
+        cargo deny check bans licenses sources
+    fi ;;
+  formatting)           cargo fmt --all -- --check ;;
+  lints)                cargo clippy --workspace --all-targets -- -D warnings ;;
+  feature-builds)
+    cargo check -p whipplescript-store --no-default-features
+    cargo check -p whipplescript-kernel --no-default-features
+    cargo check -p whipplescript --no-default-features
+    # whipplescript-custodian's `pkcs11` gates eight cfg sites and was compiled
+    # by nothing. cryptoki loads its vendor module at runtime and its bindings
+    # are pre-generated, so this needs no system library and is portable. Its
+    # sibling `tpm` is deliberately NOT here: tss-esapi links the native tss2
+    # stack, so the check would pass on a box with libtss2-dev and fail
+    # everywhere else — a gate that means two different things in two places.
+    cargo check -p whipplescript-custodian --features pkcs11 --all-targets ;;
+  norm-observer)
+    norm_host="$(uname -s)-$(uname -m)"
+    case "$norm_host" in
+      Linux-x86_64 | Linux-amd64)
+        python3 experiments/norm-wasi/prepare.py --fetch
+        python3 experiments/norm-wasi/preparation_checks.py ;;
+      *)
+        echo "skipped: the observer reactor builder requires a Linux x86-64 host, and this is $norm_host;"
+        echo "         the green-bar CI job runs this same script on ubuntu-latest and prepares it there" ;;
+    esac ;;
+  tests)
+    if command -v cargo-nextest >/dev/null 2>&1; then
+        cargo nextest run --workspace
+    else
+        cargo test --workspace
+    fi ;;
+  windows-compile)      scripts/check-windows-compile.sh ;;
+  docs)
+    scripts/check-docs-snippets.sh
+    scripts/check-docs-fences.sh
+    scripts/regen-docs-diagnostics.sh --check ;;
+  invalid-diagnostics)  scripts/regen-invalid-diagnostics.sh --check ;;
+  ir-goldens)           scripts/regen-ir-goldens.sh --check ;;
+  diagnostic-codes)     scripts/regen-diagnostic-codes.sh --check ;;
+  hosted-runtime)
+  worker=crates/whipplescript-host-do/worker
+  # The hard exit here named neither a remedy nor the job that does run this,
+  # so a workstation without the wasm toolchain got a red bar that said only
+  # that it was a workstation. `wrangler` arrives with the worker's own
+  # node_modules, so an absent one is often just an uninstalled tree.
+  missing_hosted=""
+  for tool in wasm-bindgen wrangler; do
+      command -v "$tool" >/dev/null 2>&1 || [ -x "$worker/node_modules/.bin/$tool" ] \
+          || missing_hosted="${missing_hosted:+$missing_hosted }$tool"
+  done
+
+  hosted_install="cargo install wasm-bindgen-cli --locked, and npm --prefix $worker ci"
+  if [ -z "$missing_hosted" ]; then
+      [ -d "$worker/node_modules" ] || npm --prefix "$worker" ci
+      npm --prefix "$worker" test
+      (cd "$worker" && npx tsc --noEmit)
+      # Cosmetic requests must not hold the gate open after the dry-run.
+      # Wrangler's banner stops waiting for its update lookup without
+      # cancelling the request.
+      (cd "$worker" && WRANGLER_HIDE_BANNER=true WRANGLER_SEND_METRICS=false \
+          npx wrangler deploy --config wrangler.public.toml --dry-run --outdir dist-ci)
+  elif [ "$prerequisites" = required ]; then
+      echo "the hosted runtime contracts require:$missing_hosted" >&2
+      echo "install: $hosted_install" >&2
+      exit 1
+  else
+      echo "-- hosted runtime contracts SKIPPED: missing$missing_hosted --" >&2
+      echo "   the hosted-runtime-contracts CI job has this toolchain and runs them on" >&2
+      echo "   every pull request. To close the gap locally: $hosted_install" >&2
+  fi ;;
   *) echo "section.sh: unknown section '${1:-}'" >&2; exit 2 ;;
 esac
