@@ -753,22 +753,43 @@ esac
         std::fs::create_dir(&dir).unwrap();
         let path = dir.join("docker");
         docker.program = path.clone();
+        // Two kinds of case, and only one of them is about time.
+        //
+        // A case that asserts what the output parses to is not asserting that
+        // the parse was quick, so its deadline must be far enough away that
+        // only a genuinely stuck child reaches it. It used to be two seconds,
+        // which is a statement about the host's scheduler rather than about
+        // this code: on a loaded machine a child that runs `printf` and exits
+        // was not reaped inside it, and the bar failed with `Docker operation
+        // timed out` — a message about retained ownership, for a test that had
+        // never gone near a daemon. Measured on the founder's machine under a
+        // concurrent build and six forking loops, that was two failures in six
+        // runs, each landing on the ceiling exactly.
+        //
+        // A case that asserts the operation is BOUNDED does need a short
+        // deadline, because the deadline is the input. What it must not need is
+        // a tight ceiling: the property is that the call returns without
+        // waiting for the child, so the child sleeps far longer than the
+        // ceiling and scheduling noise has nowhere to push the verdict. The two
+        // backgrounded cases leave that sleep orphaned, which is why it is ten
+        // seconds and not a minute.
+        const UNBOUNDED: Duration = Duration::from_secs(60);
+        const BOUND_DEADLINE: Duration = Duration::from_millis(30);
+        const BOUND_CEILING: Duration = Duration::from_secs(5);
+
         for (case, script) in [
             ("exact", "printf '  daemon-id\\n'"),
             ("failure", "exit 7"),
-            ("timeout", "sleep 1"),
-            ("inherited-pipe", "sleep 1 & exit 0"),
+            ("timeout", "sleep 10"),
+            ("inherited-pipe", "sleep 10 & exit 0"),
             ("delayed-output", "(sleep 0.2; printf daemon-id) & exit 0"),
             ("oversized", "head -c 65537 /dev/zero"),
             ("invalid-utf8", "printf '\\377'"),
         ] {
             std::fs::write(&path, format!("#!/bin/sh\n{script}\n")).unwrap();
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
-            docker.timeout = if matches!(case, "timeout" | "inherited-pipe") {
-                Duration::from_millis(30)
-            } else {
-                Duration::from_secs(2)
-            };
+            let bounded = matches!(case, "timeout" | "inherited-pipe");
+            docker.timeout = if bounded { BOUND_DEADLINE } else { UNBOUNDED };
             let started = Instant::now();
             let result = docker.daemon_id();
             if matches!(case, "exact" | "delayed-output") {
@@ -776,20 +797,20 @@ esac
             } else {
                 assert!(result.is_err(), "{case}");
             }
-            if matches!(case, "timeout" | "inherited-pipe") {
+            if bounded {
                 assert!(
-                    started.elapsed() < Duration::from_millis(900),
+                    started.elapsed() < BOUND_CEILING,
                     "{case} did not bound the client operation"
                 );
             }
         }
         for (case, script) in [
             ("duplex", "head -c 1048576 /dev/zero; cat"),
-            ("unread-input", "sleep 1"),
+            ("unread-input", "sleep 10"),
             ("closed-input", "exec 0<&-; sleep 0.02; printf '{}'"),
             (
                 "inherited-input",
-                "exec 3<&0; sleep 1 <&3 >/dev/null & exit 0",
+                "exec 3<&0; sleep 10 <&3 >/dev/null & exit 0",
             ),
             (
                 "delayed-input",
@@ -798,16 +819,13 @@ esac
         ] {
             std::fs::write(&path, format!("#!/bin/sh\n{script}\n")).unwrap();
             let started = Instant::now();
+            let bounded = matches!(case, "unread-input" | "inherited-input");
             let result = docker.command_io(
                 &[],
                 None,
                 Some(vec![b'x'; 1048576]),
                 3 * 1048576,
-                if matches!(case, "unread-input" | "inherited-input") {
-                    Duration::from_millis(30)
-                } else {
-                    Duration::from_secs(2)
-                },
+                if bounded { BOUND_DEADLINE } else { UNBOUNDED },
             );
             if case == "duplex" {
                 let output = result.unwrap();
@@ -819,7 +837,7 @@ esac
             } else {
                 assert!(result.is_err(), "{case}");
                 assert!(
-                    started.elapsed() < Duration::from_millis(900),
+                    started.elapsed() < BOUND_CEILING,
                     "{case} did not bound stdin"
                 );
             }
