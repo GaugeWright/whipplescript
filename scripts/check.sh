@@ -12,6 +12,29 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
+# Stage 2 of the Buck2 migration (GaugeWright BUILD.md, DR-0124): each pure
+# section is a Buck2 target declaring what it reads. When this checkout is a
+# cell of a materialized workspace, a section runs through Buck2, which spares
+# the re-run when nothing the section declares has changed and otherwise runs
+# scripts/section.sh exactly as the direct path does. When it is not — a
+# worktree, a CI runner, a host without buck2 — the same script runs directly.
+# Same order, same command, same output, same verdict; Buck2 is under this bar,
+# never beside it. Inside a Buck2 action already running the whole bar, the
+# direct path is taken so no nested client meets the daemon.
+via_buck2=""
+if [ -z "${GREEN_BAR_INSIDE_BUCK2:-}" ] && command -v buck2 >/dev/null 2>&1 \
+   && buck2 audit cell 2>/dev/null | grep -qx "whipplescript: $(pwd -P)"; then
+  via_buck2=1
+fi
+section() {
+  if [ -n "$via_buck2" ]; then
+    log="$(buck2 build "//:$1" --show-full-simple-output)"
+    cat "$log"
+  else
+    scripts/section.sh "$1"
+  fi
+}
+
 # Every run keeps its own transcript, because the reflex on a red bar — run it
 # again — destroys the only copy of the evidence. That costs nothing on a
 # reproducible failure and everything on an intermittent one: a rerun that goes
@@ -77,14 +100,14 @@ export WHIPPLESCRIPT_ITEMS_STORE="$items_store_root/items.sqlite"
 # repository is checked from GaugeWright, which owns the shared guidance.
 if [ -f AGENTS.md ]; then
     echo "== agent guide =="
-    node scripts/check-agent-guide.mjs
+    section agent-guide
 
     # Same guard, opposite reason: this one needs the FULL tree, because it
     # answers what the projection withheld. Only `-src` can run it — the mirror
     # is the thing being checked, and it cannot see what it is missing
     # (GaugeWright DR-0069 OPS-8 — that repository runs its own DR sequence).
     echo "== mirror projection =="
-    node scripts/check-mirror-projection.mjs
+    section mirror-projection
 
     # `-src` only, because `spec/decision-records/` is not projected — the mirror
     # has no records to check the numbering of. A DR number is claimed by writing
@@ -94,21 +117,20 @@ if [ -f AGENTS.md ]; then
     scripts/check-decision-records.sh
 
     echo "== governed doors =="
-    scripts/check-governed-doors.sh
-    python3 scripts/test-governed-doors.py
+    section governed-doors
 
     # A conformance suite is worth what it is pointed at. `ContentBlobs` had
     # seven implementations and three ran its suite, and two of the four that
     # did not were minting ids no real backend produces.
     echo "== conformance coverage =="
-    scripts/check-conformance-coverage.sh
+    section conformance-coverage
 
     # DR-0066 §8 opens "a change that weakens one of these is a defect even when
     # it makes something faster", and not one of its seven refusals had a check.
     # Two are mechanically checkable; the other five are recorded as unchecked
     # rather than left implied.
     echo "== substrate refusals =="
-    scripts/check-substrate-refusals.sh
+    section substrate-refusals
 
     # Rendered from tools/shared-checks/build-coverage.mjs in the GaugeWright
     # repository, which owns it. It fails when a cargo workspace or a lockfile is
@@ -119,7 +141,7 @@ if [ -f AGENTS.md ]; then
     # of a curated projection that receives neither the rendered check nor the
     # npm trees whose lockfiles are half of those obligations.
     echo "== build coverage =="
-    node scripts/check-build-coverage.mjs
+    section build-coverage
 
     # A filtered `cargo test` exits 0 when its filter matches nothing, so a gate
     # built on one silently stops asserting anything after a rename or crate
@@ -129,16 +151,14 @@ if [ -f AGENTS.md ]; then
     # the classifier's own logic. Both are toolchain-free static scans, so they
     # belong in the required bar rather than a deep suite.
     echo "== gate test filters are guarded =="
-    python3 scripts/test-cargo-test-helper.py
-    node scripts/check-cargo-test-guarded.mjs --selftest
-    node scripts/check-cargo-test-guarded.mjs
+    section gate-test-filters
 fi
 
 echo "== workflow action pins =="
 # Every third-party action must be SHA-pinned, not floating on a tag. The lane
 # this most protects is publish-crates.yml, whose job holds the crates.io token
 # and cannot be undone. Cheap, needs no toolchain, so it runs on every change.
-scripts/check-actions-pinned.sh
+section workflow-action-pins
 
 echo "== intra-workspace version pins =="
 # Every crate here pins its sibling with `version = "X", path = "../…"`. The
@@ -149,11 +169,7 @@ echo "== intra-workspace version pins =="
 # nothing compared them to `[workspace.package] version`. They had drifted: the
 # workspace was 0.5.6 and all 24 still said 0.5.5. Caret semantics hid it (a
 # `0.5.5` requirement accepts 0.5.6), which is exactly why it could sit there.
-ws_version="$(awk -F'"' '/^\[workspace\.package\]/{p=1;next} /^\[/{p=0} p&&/^version *= *"/{print $2;exit}' Cargo.toml)"
-if [ -z "$ws_version" ]; then
-    echo "could not read [workspace.package] version out of Cargo.toml" >&2
-    exit 1
-fi
+section version-pins
 pin_drift="$(grep -n 'path = "\.\./whipplescript-' crates/*/Cargo.toml \
     | grep 'version = "' \
     | grep -v "version = \"$ws_version\"" || true)"
@@ -169,7 +185,7 @@ fi
 # two hosts become able to disagree. Cheap enough for the green bar; the script
 # is explicit about what it does and does not claim.
 echo "== sans-IO purity =="
-scripts/check-sansio-purity.sh
+section sansio-purity
 
 # The Durable Object's table layout is written out three times -- the worker's
 # `do_schema.sql`, the Rust test fixture in `do_store.rs`, and the lazy
@@ -180,11 +196,10 @@ scripts/check-sansio-purity.sh
 # check's first run found `skills.body`, written by `register_skill` and never
 # declared on this side at all. Node-only, so it belongs in the required bar.
 echo "== durable object schema =="
-node scripts/check-do-schema-consistency.mjs --selftest
-node scripts/check-do-schema-consistency.mjs
+section do-schema
 
 echo "== workstream host contract =="
-python3 scripts/check-workstream-host-contract.py
+section workstream-host-contract
 
 echo "== host action contract =="
 python3 scripts/check-host-action-contract.py
@@ -197,7 +212,7 @@ python3 scripts/check-host-action-contract-v4.py
 python3 scripts/test-host-action-contract-v4.py
 
 echo "== refusal scanner contracts =="
-python3 scripts/test-mutation-sweep.py
+section refusal-scanner
 
 echo "== production dependency advisories =="
 # The audit lives here rather than in a workflow step so that the documented
@@ -434,7 +449,7 @@ scripts/regen-diagnostic-codes.sh --check
 # a drifted copy would have shipped. Found while adding a manifest entry by
 # hand — the same day one of its copies turned out to be missing from the
 # script's own map, and therefore checked by nothing at all.
-scripts/check-vendored-std.sh
+section vendored-std
 
 # The tracker registry. `spec/TRACKERS.md` is the status ledger and this script
 # is its enforcement, but nothing invoked it — so on 2026-08-27 trunk carried a
@@ -446,7 +461,7 @@ scripts/check-vendored-std.sh
 # the trackers it indexes live under `spec/`, which the mirror withholds, so
 # this can only run where the full tree is.
 if [ -f spec/TRACKERS.md ]; then
-    scripts/check-trackers.sh
+    section trackers
 fi
 
 # A check nothing invokes reads exactly like a passing one. This gate is the
@@ -458,7 +473,7 @@ fi
 # no workflows at all: with the workflow root absent, every gate a workflow owns
 # would read as unreachable and the check would accuse the whole set.
 if [ -d .github/workflows ]; then
-    scripts/check-gate-reachability.sh
+    section gate-reachability
 fi
 
 echo "== hosted runtime contracts =="

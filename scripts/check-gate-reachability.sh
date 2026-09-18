@@ -53,6 +53,11 @@ seed() {
 }
 
 seed "check.sh"
+# The bar's pure sections are stated once in scripts/section.sh and reached
+# from check.sh through it (GaugeWright BUILD.md, stage 2). Its name does not
+# match the check-*.sh shape this walk follows, so it is a root in its own
+# right: it is part of the one check command, not a script beside it.
+seed "section.sh"
 
 # Anything a configured workflow RUNS is a root: the gate invokes it directly.
 #
