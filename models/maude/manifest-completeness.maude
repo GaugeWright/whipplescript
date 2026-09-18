@@ -1,0 +1,94 @@
+--- DR-0122 §13.1: a manifest binds members, a selection interpretation and a
+--- completeness judgment over a bounded inventory, and structural validity is
+--- a separate judgment from completeness. Three obligations, members as
+--- revision references or moving aliases, one frontier-bound applicable
+--- inventory, and a judging principal who may see only part of it. Selection
+--- rules, presentation and the admission certificate itself are not modeled.
+mod MANIFEST-COMPLETENESS is
+  protecting BOOL .
+  sorts Obl Obls Ref Refs Judgment Fact Cfg State .
+  ops r1 r2 r3 : -> Obl [ctor] .
+  subsort Obl < Obls .
+  op nil : -> Obls [ctor] .
+  op __ : Obls Obls -> Obls [ctor assoc comm id: nil] .
+  ops rev alias : Obl -> Ref [ctor] .
+  subsort Ref < Refs .
+  op empty : -> Refs [ctor] .
+  op _,_ : Refs Refs -> Refs [ctor assoc comm id: empty] .
+  subsort Fact < Cfg .
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+  op {_} : Cfg -> State [ctor] .
+  --- the applicable inventory at the frontier, and what the judge can see of it
+  ops inventory visible : Obls -> Fact [ctor] .
+  op manifest : Refs -> Fact [ctor] .
+  op claimExhaustive : -> Fact [ctor] .
+  --- the two judgments are asked for once; a door consumes the request
+  ops judgeStructure judgeCompleteness : -> Fact [ctor] .
+  op structural : Bool -> Fact [ctor] .
+  --- a completeness judgment always names its basis; a bounded one names its scope
+  ops complete incomplete bounded : Obls -> Judgment [ctor] .
+  op refusedClaim : -> Judgment [ctor] .
+  op judged : Judgment -> Fact [ctor] .
+  vars O P : Obl .
+  vars I V : Obls .
+  var M : Refs .
+  var C : Cfg .
+  var R : Ref .
+  --- every member is a revision reference; an alias is not a member
+  op wellFormed : Refs -> Bool .
+  eq wellFormed(empty) = true .
+  eq wellFormed((rev(O), M)) = wellFormed(M) .
+  eq wellFormed(M) = false [owise] .
+  --- the revision members cover an obligation set
+  op covers : Refs Obls -> Bool .
+  eq covers(M, nil) = true .
+  eq covers((rev(O), M), O I) = covers((rev(O), M), I) .
+  eq covers(M, I) = false [owise] .
+  op subset : Obls Obls -> Bool .
+  eq subset(nil, I) = true .
+  eq subset(O V, O I) = subset(V, I) .
+  eq subset(V, I) = false [owise] .
+  --- structural validity is judged on the members alone
+  rl [structure] : { manifest(M) judgeStructure C } => { manifest(M) structural(wellFormed(M)) C } .
+  --- with the whole inventory visible, completeness is judged against it and
+  --- names it as the basis, whichever way it comes out
+  crl [judge-complete] : { manifest(M) inventory(I) visible(I) judgeCompleteness C }
+    => { manifest(M) inventory(I) visible(I) judged(complete(I)) C }
+    if covers(M, I) .
+  crl [judge-incomplete] : { manifest(M) inventory(I) visible(I) judgeCompleteness C }
+    => { manifest(M) inventory(I) visible(I) judged(incomplete(I)) C }
+    if not covers(M, I) .
+  --- with only part of the inventory visible, the judgment is bounded by the
+  --- visible scope and is never total
+  crl [judge-bounded] : { manifest(M) inventory(I) visible(V) judgeCompleteness C }
+    => { manifest(M) inventory(I) visible(V) judged(bounded(V)) C }
+    if V =/= I /\ subset(V, I) /\ covers(M, V) .
+  --- an exhaustiveness claim without a basis is refused, not recorded
+  rl [refuse-claim] : { manifest(M) claimExhaustive judgeCompleteness C } => { manifest(M) judged(refusedClaim) C } .
+endm
+
+--- Weakening: completeness folded into structural validity. A well-formed
+--- manifest is judged complete without consulting the inventory.
+mod MANIFEST-COMPLETENESS-FOLDED is
+  including MANIFEST-COMPLETENESS .
+  var M : Refs . var I : Obls . var C : Cfg .
+  crl [complete-by-structure] : { manifest(M) inventory(I) judgeCompleteness C } => { manifest(M) inventory(I) judged(complete(I)) C }
+    if wellFormed(M) .
+endm
+
+--- Weakening: the author's exhaustiveness claim is taken as the basis.
+mod MANIFEST-COMPLETENESS-CLAIMED is
+  including MANIFEST-COMPLETENESS .
+  var M : Refs . var I : Obls . var C : Cfg .
+  rl [complete-by-claim] : { manifest(M) inventory(I) claimExhaustive judgeCompleteness C } => { manifest(M) inventory(I) judged(complete(I)) C } .
+endm
+
+--- Weakening: total completeness inferred from the visible subset.
+mod MANIFEST-COMPLETENESS-SUBSET is
+  including MANIFEST-COMPLETENESS .
+  var M : Refs . vars I V : Obls . var C : Cfg .
+  crl [complete-from-visible] : { manifest(M) inventory(I) visible(V) judgeCompleteness C }
+    => { manifest(M) inventory(I) visible(V) judged(complete(I)) C }
+    if covers(M, V) .
+endm

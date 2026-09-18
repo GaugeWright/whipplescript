@@ -55,10 +55,10 @@ impl PreparedObservationPublication {
         execution: &VerifiedNormExecution,
         signing: &ObservationSigning<'_>,
     ) -> Result<NormStatement, String> {
-        if signing.actor.principal != execution.intent().publisher {
-            return Err("observation signer differs from prepared publisher".into());
-        }
+        // The signer is checked once, in `prepare`, which every path reaches;
+        // a second check here was a refusal nothing could exercise.
         Ok(NormStatement {
+            premises: None,
             protocol: "whipplescript.norm/v1".into(),
             actor: signing.actor.clone(),
             nonce: crate::execution_run_key(

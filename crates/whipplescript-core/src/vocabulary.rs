@@ -53,6 +53,22 @@ pub enum ValueType {
     Object {
         fields: Vec<FieldDefinition>,
     },
+    /// A reference to another record (DR-0122). Its value is a content id: the
+    /// interpreter checks that shape and nothing more. Resolution, the target's
+    /// type and the revision binding are the admitting ledger's to establish.
+    Reference {
+        form: ReferenceForm,
+    },
+}
+
+/// An identity reference names a record's immutable creation identity and is
+/// resolved to its effective revision in a named context; a revision reference
+/// names exact content. A ledger-local alias is neither and is never a reference.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReferenceForm {
+    Identity,
+    Revision,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -323,6 +339,14 @@ fn validate_type(value_type: &ValueType, path: &str) -> Result<(), VocabularyErr
         _ => Ok(()),
     }
 }
+/// Content ids are lowercase hex SHA-256 digests, the shape every ledger event
+/// and record identity has. `N-12` is a local alias and fails this on purpose.
+fn is_content_id(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+}
 fn record_error(path: &str, reason: &str) -> VocabularyError {
     VocabularyError::InvalidRecord {
         path: path.to_owned(),
@@ -377,6 +401,7 @@ fn validate_value(
             validate_object(fields, value, path)?;
             true
         }
+        ValueType::Reference { .. } => value.as_str().is_some_and(is_content_id),
     };
     if valid {
         Ok(())
@@ -388,6 +413,12 @@ fn validate_value(
             ValueType::Enum { .. } => "a declared enum literal",
             ValueType::List { .. } => "List",
             ValueType::Object { .. } => "Object",
+            ValueType::Reference {
+                form: ReferenceForm::Identity,
+            } => "a content-id identity reference, never a local alias",
+            ValueType::Reference {
+                form: ReferenceForm::Revision,
+            } => "a content-id revision reference, never a local alias",
         };
         Err(record_error(path, &format!("expected {expected}")))
     }

@@ -57,12 +57,22 @@ mod tests {
             }
         }
         fn sign(&self, principal: &str, nonce: &str, action: NormAct) -> SignedNormEvent {
+            self.sign_with(principal, nonce, action, None)
+        }
+        fn sign_with(
+            &self,
+            principal: &str,
+            nonce: &str,
+            action: NormAct,
+            premises: Option<NormPremises>,
+        ) -> SignedNormEvent {
             let statement = NormStatement {
                 protocol: "whipplescript.norm/v1".into(),
                 actor: self.actor(principal),
                 nonce: nonce.into(),
                 created_at: "2026-09-05T00:00:00Z".into(),
                 action,
+                premises,
             };
             let signature: Signature =
                 self.keys[principal].sign(&statement.signing_bytes().expect("bytes"));
@@ -212,6 +222,9 @@ mod tests {
         NormCharter {
             resource_domains: None,
             vocabularies: vec![NormVocabulary {
+                relation: None,
+                manifest: None,
+                correspondence: None,
                 editing: None,
                 effectiveness: None,
                 inventory_role: None,
@@ -1180,7 +1193,13 @@ mod tests {
                 "assertion",
                 "obligation",
                 "decision",
-                "reservation"
+                "reservation",
+                "refines",
+                "derives",
+                "supersedes",
+                "derived_from",
+                "manifest",
+                "correspondence"
             ]
         );
         let keys = Keys::new();
@@ -1200,6 +1219,14 @@ mod tests {
             .unwrap();
         let mut ids = BTreeMap::new();
         for entry in &c.vocabularies {
+            // Relations and manifests need resolvable references and bound
+            // premises; their own fixtures exercise them.
+            if entry.relation.is_some()
+                || entry.manifest.is_some()
+                || entry.correspondence.is_some()
+            {
+                continue;
+            }
             let fields = match entry.definition.name.as_str() {
                 "issue" => json!({"title":"repair","labels":["norm"]}),
                 "assertion" => json!({"title":"claim","statement":"the parser denies the worker"}),
@@ -1274,6 +1301,1089 @@ mod tests {
         assert!(store.append_norm_event(&granted, &keys).is_err());
         assert_eq!(store.norm_aliases().unwrap().len(), 5);
     }
+    /// DR-0122 §13.2 and §13.4, the runtime half of
+    /// `models/maude/relation-validation-scope.maude`: an act that makes an
+    /// edge live binds the family basis it was validated against, a moved
+    /// basis is refused for re-evaluation, and the family stays acyclic and
+    /// within its declared kinds and cardinality.
+    #[test]
+    fn norm_relations_bind_the_family_basis_and_keep_the_family_acyclic() {
+        use whipplescript_store::norm_commands::NormCommandStore;
+        let c = NormCharter::bundled().unwrap();
+        let keys = Keys::new();
+        let mut store = WorkItemStore::open_in_memory().unwrap();
+        let ledger = store
+            .append_norm_event(
+                &keys.sign(
+                    "owner",
+                    "relations",
+                    NormAct::Bootstrap {
+                        creator: "worker".into(),
+                        charter: c.clone(),
+                    },
+                ),
+                &keys,
+            )
+            .unwrap();
+        let reference = |name: &str| {
+            Vocabulary::new(
+                c.vocabularies
+                    .iter()
+                    .find(|entry| entry.definition.name == name)
+                    .unwrap()
+                    .definition
+                    .clone(),
+            )
+            .unwrap()
+            .reference()
+            .clone()
+        };
+        let create = |nonce: &str, kind: &str, fields: serde_json::Value| {
+            keys.sign(
+                "worker",
+                nonce,
+                NormAct::Create {
+                    ledger: ledger.clone(),
+                    authority: None,
+                    vocabulary: reference(kind),
+                    fields_json: fields.to_string(),
+                },
+            )
+        };
+        let obligation = |name: &str| {
+            create(
+                name,
+                "obligation",
+                json!({"name": name, "proposition": "holds", "domain": "src/", "subject": "src/x.py"}),
+            )
+        };
+        let relate = |nonce: &str, kind: &str, source: &str, target: &str, basis: Option<&str>| {
+            keys.sign_with(
+                "worker",
+                nonce,
+                NormAct::Create {
+                    ledger: ledger.clone(),
+                    authority: None,
+                    vocabulary: reference(kind),
+                    fields_json: json!({"source": source, "target": target}).to_string(),
+                },
+                basis.map(|basis| NormPremises {
+                    family_basis: Some(basis.into()),
+                    references: vec![source.into(), target.into()],
+                    inventory_frontier: Vec::new(),
+                }),
+            )
+        };
+        let a = store.append_norm_event(&obligation("a"), &keys).unwrap();
+        let b = store.append_norm_event(&obligation("b"), &keys).unwrap();
+        let c_ = store.append_norm_event(&obligation("c"), &keys).unwrap();
+        let d = store.append_norm_event(&obligation("d"), &keys).unwrap();
+        let refused = |result: Result<String, StoreError>, needle: &str| {
+            let message = format!("{:?}", result.expect_err("refusal expected"));
+            assert!(message.contains(needle), "{message}");
+        };
+        let basis = |store: &WorkItemStore, family: &str| {
+            store
+                .norm_state(&keys)
+                .unwrap()
+                .relation_family(family)
+                .unwrap()
+                .basis
+        };
+        assert!(store
+            .norm_state(&keys)
+            .unwrap()
+            .relation_family("undeclared")
+            .is_err());
+        let empty = basis(&store, "refinement");
+        // An empty family still has a basis, and a live edge is admitted on it.
+        let ab = store
+            .append_norm_event(&relate("ab", "refines", &a, &b, Some(&empty)), &keys)
+            .unwrap();
+        // The basis moved; a candidate captured against the old one is refused
+        // for re-evaluation, never admitted on a substituted token.
+        refused(
+            store.append_norm_event(&relate("bc-stale", "refines", &b, &c_, Some(&empty)), &keys),
+            "moved since it was captured",
+        );
+        let after_ab = basis(&store, "refinement");
+        assert_ne!(after_ab, empty);
+        store
+            .append_norm_event(&relate("bc", "refines", &b, &c_, Some(&after_ab)), &keys)
+            .unwrap();
+        // A cycle through the longer path a -> b -> c is refused on the whole
+        // family, not on the immediate reverse edge.
+        let after_bc = basis(&store, "refinement");
+        refused(
+            store.append_norm_event(&relate("ca", "refines", &c_, &a, Some(&after_bc)), &keys),
+            "close a cycle in family refinement",
+        );
+        // Both families are checked as one: derives shares the refinement family.
+        refused(
+            store.append_norm_event(
+                &relate("ca-derives", "derives", &c_, &a, Some(&after_bc)),
+                &keys,
+            ),
+            "close a cycle",
+        );
+        refused(
+            store.append_norm_event(&relate("no-basis", "refines", &c_, &d, None), &keys),
+            "must bind the family basis",
+        );
+        refused(
+            store.append_norm_event(&relate("self", "refines", &d, &d, Some(&after_bc)), &keys),
+            "relate a record to itself",
+        );
+        // A non-relation act binds no basis.
+        refused(
+            store.append_norm_event(
+                &keys.sign_with(
+                    "worker",
+                    "e",
+                    NormAct::Create {
+                        ledger: ledger.clone(),
+                        authority: None,
+                        vocabulary: reference("obligation"),
+                        fields_json: json!({"name": "e", "proposition": "holds", "domain": "src/", "subject": "src/e.py"}).to_string(),
+                    },
+                    Some(NormPremises {
+                        family_basis: Some(after_bc.clone()),
+                        references: Vec::new(),
+                        inventory_frontier: Vec::new(),
+                    }),
+                ),
+                &keys,
+            ),
+            "only an act on a relation binds",
+        );
+        // Two candidates captured against the same basis, one edge of a
+        // two-cycle each: the first lands, the second is refused as moved, and
+        // re-evaluated it is refused as a cycle.
+        let p = store.append_norm_event(&obligation("p"), &keys).unwrap();
+        let q = store.append_norm_event(&obligation("q"), &keys).unwrap();
+        let shared = basis(&store, "refinement");
+        store
+            .append_norm_event(&relate("pq", "refines", &p, &q, Some(&shared)), &keys)
+            .unwrap();
+        refused(
+            store.append_norm_event(&relate("qp", "refines", &q, &p, Some(&shared)), &keys),
+            "moved since it was captured",
+        );
+        let after_pq = basis(&store, "refinement");
+        refused(
+            store.append_norm_event(
+                &relate("qp-again", "refines", &q, &p, Some(&after_pq)),
+                &keys,
+            ),
+            "close a cycle",
+        );
+        // An independent candidate captured against the stale basis pays a
+        // re-evaluation, not the work: recaptured, it lands.
+        let r = store.append_norm_event(&obligation("r"), &keys).unwrap();
+        let s_ = store.append_norm_event(&obligation("s"), &keys).unwrap();
+        refused(
+            store.append_norm_event(
+                &relate("rs-stale", "refines", &r, &s_, Some(&shared)),
+                &keys,
+            ),
+            "moved since it was captured",
+        );
+        let current = basis(&store, "refinement");
+        store
+            .append_norm_event(&relate("rs", "refines", &r, &s_, Some(&current)), &keys)
+            .unwrap();
+        // Endpoints resolve to declared kinds, and a dangling reference resolves to nothing.
+        let issue = store
+            .append_norm_event(
+                &create("issue", "issue", json!({"title": "not an obligation"})),
+                &keys,
+            )
+            .unwrap();
+        let current = basis(&store, "refinement");
+        refused(
+            store.append_norm_event(
+                &relate("kind", "refines", &issue, &a, Some(&current)),
+                &keys,
+            ),
+            "undeclared kind",
+        );
+        // A reference to an event that is not a record resolves to nothing,
+        // and one to no event at all is a missing parent before it is anything.
+        refused(
+            store.append_norm_event(
+                &relate("not-a-record", "refines", &ledger, &a, Some(&current)),
+                &keys,
+            ),
+            "does not resolve",
+        );
+        refused(
+            store.append_norm_event(
+                &relate("dangling", "refines", &"f".repeat(64), &a, Some(&current)),
+                &keys,
+            ),
+            "missing parents",
+        );
+        // The references an act names are premises: unbound, the act is refused
+        // even when they resolve, because a replay could apply it before them.
+        refused(
+            store.append_norm_event(
+                &keys.sign_with(
+                    "worker",
+                    "unbound-refs",
+                    NormAct::Create {
+                        ledger: ledger.clone(),
+                        authority: None,
+                        vocabulary: reference("refines"),
+                        fields_json: json!({"source": a, "target": d}).to_string(),
+                    },
+                    Some(NormPremises {
+                        family_basis: Some(current.clone()),
+                        references: vec![a.clone()],
+                        inventory_frontier: Vec::new(),
+                    }),
+                ),
+                &keys,
+            ),
+            "bind the references it names",
+        );
+        // Cardinality: at most one live successor per predecessor in succession.
+        let d1 = store
+            .append_norm_event(
+                &create(
+                    "d1",
+                    "decision",
+                    json!({"title": "one", "intent": "i", "subjects": []}),
+                ),
+                &keys,
+            )
+            .unwrap();
+        let d2 = store
+            .append_norm_event(
+                &create(
+                    "d2",
+                    "decision",
+                    json!({"title": "two", "intent": "i", "subjects": []}),
+                ),
+                &keys,
+            )
+            .unwrap();
+        let d3 = store
+            .append_norm_event(
+                &create(
+                    "d3",
+                    "decision",
+                    json!({"title": "three", "intent": "i", "subjects": []}),
+                ),
+                &keys,
+            )
+            .unwrap();
+        let succession = basis(&store, "succession");
+        store
+            .append_norm_event(
+                &relate("d1d2", "supersedes", &d1, &d2, Some(&succession)),
+                &keys,
+            )
+            .unwrap();
+        let succession = basis(&store, "succession");
+        refused(
+            store.append_norm_event(
+                &relate("d3d2", "supersedes", &d3, &d2, Some(&succession)),
+                &keys,
+            ),
+            "at most one live relation per target",
+        );
+        // Withdrawing an edge binds the family basis like every family act,
+        // because it moves the family, but it is not checked structurally: it
+        // leaves the live family. What the withdrawal made admissible then is,
+        // and re-asserting the edge is an act that makes it live again, checked
+        // on the family as it stands.
+        let refines = reference("refines");
+        refused(
+            store.append_norm_event(
+                &keys.sign(
+                    "worker",
+                    "withdraw-ab-unbound",
+                    NormAct::Transition {
+                        ledger: ledger.clone(),
+                        authority: None,
+                        vocabulary: refines.clone(),
+                        record: ab.clone(),
+                        previous: ab.clone(),
+                        status: "withdrawn".into(),
+                    },
+                ),
+                &keys,
+            ),
+            "must bind the family basis",
+        );
+        let current = basis(&store, "refinement");
+        let withdrawn = store
+            .append_norm_event(
+                &keys.sign_with(
+                    "worker",
+                    "withdraw-ab",
+                    NormAct::Transition {
+                        ledger: ledger.clone(),
+                        authority: None,
+                        vocabulary: refines.clone(),
+                        record: ab.clone(),
+                        previous: ab.clone(),
+                        status: "withdrawn".into(),
+                    },
+                    Some(NormPremises {
+                        family_basis: Some(current),
+                        references: Vec::new(),
+                        inventory_frontier: Vec::new(),
+                    }),
+                ),
+                &keys,
+            )
+            .unwrap();
+        let current = basis(&store, "refinement");
+        store
+            .append_norm_event(&relate("ca-now", "refines", &c_, &a, Some(&current)), &keys)
+            .unwrap();
+        let reassert = |nonce: &str, previous: &str, basis: Option<&str>| {
+            keys.sign_with(
+                "worker",
+                nonce,
+                NormAct::Transition {
+                    ledger: ledger.clone(),
+                    authority: None,
+                    vocabulary: refines.clone(),
+                    record: ab.clone(),
+                    previous: previous.into(),
+                    status: "asserted".into(),
+                },
+                basis.map(|basis| NormPremises {
+                    family_basis: Some(basis.into()),
+                    references: vec![a.clone(), b.clone()],
+                    inventory_frontier: Vec::new(),
+                }),
+            )
+        };
+        refused(
+            store.append_norm_event(&reassert("reassert-unbound", &withdrawn, None), &keys),
+            "must bind the family basis",
+        );
+        let current = basis(&store, "refinement");
+        refused(
+            store.append_norm_event(&reassert("reassert", &withdrawn, Some(&current)), &keys),
+            "close a cycle",
+        );
+        // A revision reference resolves to its record after later edits moved
+        // the head, so lineage from an exact revision keeps resolving.
+        let d_revision = store.norm_state(&keys).unwrap().records[&d]
+            .content_head
+            .clone();
+        store
+            .append_norm_event(
+                &keys.sign(
+                    "worker",
+                    "edit-d",
+                    NormAct::Edit {
+                        ledger: ledger.clone(),
+                        authority: None,
+                        vocabulary: reference("obligation"),
+                        record: d.clone(),
+                        previous: d.clone(),
+                        fields_json: json!({"name": "d", "proposition": "holds more", "domain": "src/", "subject": "src/x.py"}).to_string(),
+                    },
+                ),
+                &keys,
+            )
+            .unwrap();
+        let lineage = basis(&store, "lineage");
+        store
+            .append_norm_event(
+                &relate("fork", "derived_from", &a, &d_revision, Some(&lineage)),
+                &keys,
+            )
+            .unwrap();
+        // The snapshot exposes every family with its live edges and basis.
+        let view = store.norm_state(&keys).unwrap();
+        let families = view.relation_families().unwrap();
+        assert_eq!(
+            families.keys().cloned().collect::<Vec<_>>(),
+            ["lineage", "refinement", "succession"]
+        );
+        let refinement = &families["refinement"];
+        assert_eq!(refinement.basis, basis(&store, "refinement"));
+        let edges: Vec<(&str, &str, &str)> = refinement
+            .edges
+            .iter()
+            .map(|edge| {
+                (
+                    edge.relation.as_str(),
+                    edge.source.as_str(),
+                    edge.target.as_str(),
+                )
+            })
+            .collect();
+        assert!(edges.contains(&("refines", b.as_str(), c_.as_str())));
+        assert!(edges.contains(&("refines", c_.as_str(), a.as_str())));
+        assert!(!edges
+            .iter()
+            .any(|(_, source, target)| *source == a && *target == b));
+        assert_eq!(families["lineage"].edges[0].target, d);
+        let mut host = whipplescript_store::norm_commands::NormCommandHost::new(&mut store, &keys);
+        let response = host
+            .execute(whipplescript_store::norm_commands::NormCommandRequest::new(
+                whipplescript_store::norm_commands::NormCommand::Snapshot {},
+            ))
+            .unwrap();
+        let whipplescript_store::norm_commands::NormCommandResult::Snapshot { snapshot } =
+            response.result
+        else {
+            panic!("snapshot expected");
+        };
+        assert_eq!(snapshot.families, families);
+    }
+
+    /// DR-0122 §13.1, the runtime half of `models/maude/manifest-completeness.maude`:
+    /// members are bound and resolve or the act is refused, an exhaustive claim
+    /// binds the inventory frontier it was judged against or is refused, a
+    /// bounded claim is never total, and completeness is a judgment derived at
+    /// the bound frontier that a later requirement does not rewrite.
+    #[test]
+    fn norm_manifests_bind_the_inventory_frontier_and_judge_completeness_there() {
+        use whipplescript_store::norm_commands::*;
+        use whipplescript_store::norm_manifests::ManifestCompleteness;
+        let c = NormCharter::bundled().unwrap();
+        let keys = Keys::new();
+        let mut store = WorkItemStore::open_in_memory().unwrap();
+        let ledger = store
+            .append_norm_event(
+                &keys.sign(
+                    "owner",
+                    "manifests",
+                    NormAct::Bootstrap {
+                        creator: "worker".into(),
+                        charter: c.clone(),
+                    },
+                ),
+                &keys,
+            )
+            .unwrap();
+        let reference = |name: &str| {
+            Vocabulary::new(
+                c.vocabularies
+                    .iter()
+                    .find(|entry| entry.definition.name == name)
+                    .unwrap()
+                    .definition
+                    .clone(),
+            )
+            .unwrap()
+            .reference()
+            .clone()
+        };
+        let refused = |result: Result<String, StoreError>, needle: &str| {
+            let message = format!("{:?}", result.expect_err("refusal expected"));
+            assert!(message.contains(needle), "{message}");
+        };
+        let requirement = |nonce: &str, name: &str| {
+            keys.sign(
+                "worker",
+                nonce,
+                NormAct::Create {
+                    ledger: ledger.clone(),
+                    authority: None,
+                    vocabulary: reference("obligation"),
+                    fields_json: json!({"name": name, "proposition": "holds", "domain": "src/", "subject": "src/x.py"}).to_string(),
+                },
+            )
+        };
+        let accept = |nonce: &str, record: &str| {
+            keys.sign(
+                "owner",
+                nonce,
+                NormAct::Transition {
+                    ledger: ledger.clone(),
+                    authority: None,
+                    vocabulary: reference("obligation"),
+                    record: record.into(),
+                    previous: record.into(),
+                    status: "accepted".into(),
+                },
+            )
+        };
+        // Two accepted requirements form the applicable inventory.
+        let r1 = store
+            .append_norm_event(&requirement("r1", "r1"), &keys)
+            .unwrap();
+        store
+            .append_norm_event(&accept("accept-r1", &r1), &keys)
+            .unwrap();
+        let r2 = store
+            .append_norm_event(&requirement("r2", "r2"), &keys)
+            .unwrap();
+        store
+            .append_norm_event(&accept("accept-r2", &r2), &keys)
+            .unwrap();
+        let revision = |store: &WorkItemStore, id: &str| -> String {
+            store.norm_state(&keys).unwrap().effective_records[id]
+                .content_head
+                .clone()
+        };
+        let frontier = |store: &WorkItemStore| -> Vec<String> {
+            store
+                .norm_state(&keys)
+                .unwrap()
+                .frontier
+                .iter()
+                .cloned()
+                .collect()
+        };
+        let manifest = |nonce: &str,
+                        members: &[String],
+                        claim: &str,
+                        frontier: Vec<String>,
+                        bind: bool| {
+            keys.sign_with(
+                "worker",
+                nonce,
+                NormAct::Create {
+                    ledger: ledger.clone(),
+                    authority: None,
+                    vocabulary: reference("manifest"),
+                    fields_json: json!({"title": nonce, "selection": "all accepted obligations", "members": members, "claim": claim, "scope": "src/"}).to_string(),
+                },
+                Some(NormPremises {
+                    family_basis: None,
+                    references: if bind { members.to_vec() } else { Vec::new() },
+                    inventory_frontier: frontier,
+                }),
+            )
+        };
+        let both = vec![revision(&store, &r1), revision(&store, &r2)];
+        let now = frontier(&store);
+        // Complete at its basis.
+        let complete = store
+            .append_norm_event(
+                &manifest("complete", &both, "exhaustive", now.clone(), true),
+                &keys,
+            )
+            .unwrap();
+        // Structurally valid and incomplete: admitted, judged incomplete, the
+        // missing revision named.
+        let partial = store
+            .append_norm_event(
+                &manifest("partial", &both[..1], "exhaustive", frontier(&store), true),
+                &keys,
+            )
+            .unwrap();
+        // An exhaustive claim without a basis is refused; a bounded claim binds none.
+        refused(
+            store.append_norm_event(
+                &manifest("unbased", &both, "exhaustive", Vec::new(), true),
+                &keys,
+            ),
+            "must bind the inventory frontier",
+        );
+        refused(
+            store.append_norm_event(
+                &manifest("bounded-based", &both, "bounded", frontier(&store), true),
+                &keys,
+            ),
+            "bounded manifest claim binds no inventory frontier",
+        );
+        let bounded = store
+            .append_norm_event(
+                &manifest("bounded", &both[..1], "bounded", Vec::new(), true),
+                &keys,
+            )
+            .unwrap();
+        // Members are premises: unbound, or unresolvable, the act is refused;
+        // an alias is not even a reference; an unknown frontier is a missing parent.
+        refused(
+            store.append_norm_event(
+                &manifest("unbound", &both, "exhaustive", frontier(&store), false),
+                &keys,
+            ),
+            "must bind the members it names",
+        );
+        refused(
+            store.append_norm_event(
+                &manifest(
+                    "not-a-revision",
+                    std::slice::from_ref(&ledger),
+                    "exhaustive",
+                    frontier(&store),
+                    true,
+                ),
+                &keys,
+            ),
+            "does not resolve to an admitted revision",
+        );
+        // An alias is not a reference at all: bound, it would be a missing
+        // parent; unbound, the interpreter refuses its shape.
+        refused(
+            store.append_norm_event(
+                &manifest(
+                    "alias",
+                    &["N-1".to_owned()],
+                    "exhaustive",
+                    frontier(&store),
+                    false,
+                ),
+                &keys,
+            ),
+            "revision reference",
+        );
+        refused(
+            store.append_norm_event(
+                &manifest(
+                    "unknown-frontier",
+                    &both,
+                    "exhaustive",
+                    vec!["f".repeat(64)],
+                    true,
+                ),
+                &keys,
+            ),
+            "missing parents",
+        );
+        // A bound frontier names each admitted event once.
+        let dup = frontier(&store);
+        refused(
+            store.append_norm_event(
+                &manifest(
+                    "dup-frontier",
+                    &both,
+                    "exhaustive",
+                    vec![dup[0].clone(), dup[0].clone()],
+                    true,
+                ),
+                &keys,
+            ),
+            "names each admitted event once",
+        );
+        // A non-manifest act binds no inventory frontier.
+        refused(
+            store.append_norm_event(
+                &keys.sign_with(
+                    "worker",
+                    "r3-with-frontier",
+                    NormAct::Create {
+                        ledger: ledger.clone(),
+                        authority: None,
+                        vocabulary: reference("obligation"),
+                        fields_json: json!({"name": "r3", "proposition": "holds", "domain": "src/", "subject": "src/x.py"}).to_string(),
+                    },
+                    Some(NormPremises {
+                        family_basis: None,
+                        references: Vec::new(),
+                        inventory_frontier: frontier(&store),
+                    }),
+                ),
+                &keys,
+            ),
+            "only an act on a manifest binds",
+        );
+        let judgments = |store: &mut WorkItemStore| {
+            let mut host = NormCommandHost::new(store, &keys);
+            let response = host
+                .execute(NormCommandRequest::new(NormCommand::Snapshot {}))
+                .unwrap();
+            let NormCommandResult::Snapshot { snapshot } = response.result else {
+                panic!("snapshot expected");
+            };
+            snapshot.manifests
+        };
+        let judged = judgments(&mut store);
+        assert_eq!(
+            judged[&complete].completeness,
+            ManifestCompleteness::Complete { basis: now.clone() }
+        );
+        let ManifestCompleteness::Incomplete { missing, .. } = &judged[&partial].completeness
+        else {
+            panic!(
+                "partial manifest must be judged incomplete: {:?}",
+                judged[&partial]
+            );
+        };
+        assert_eq!(missing, &vec![both[1].clone()]);
+        assert_eq!(
+            judged[&bounded].completeness,
+            ManifestCompleteness::Bounded {
+                scope: Some("src/".into())
+            }
+        );
+        // A requirement accepted afterwards does not rewrite the judgment at
+        // the basis: complete then is complete then, and a fresh exhaustive
+        // manifest with the same members is incomplete now.
+        let r3 = store
+            .append_norm_event(&requirement("r3", "r3"), &keys)
+            .unwrap();
+        store
+            .append_norm_event(&accept("accept-r3", &r3), &keys)
+            .unwrap();
+        let later = store
+            .append_norm_event(
+                &manifest("later", &both, "exhaustive", frontier(&store), true),
+                &keys,
+            )
+            .unwrap();
+        let judged = judgments(&mut store);
+        assert_eq!(
+            judged[&complete].completeness,
+            ManifestCompleteness::Complete { basis: now }
+        );
+        let ManifestCompleteness::Incomplete { missing, .. } = &judged[&later].completeness else {
+            panic!(
+                "later manifest must be judged incomplete: {:?}",
+                judged[&later]
+            );
+        };
+        assert_eq!(missing, &vec![revision(&store, &r3)]);
+    }
+
+    /// DR-0122 §13.3, the runtime half of `models/maude/correspondence-reuse.maude`:
+    /// a correspondence binds both sides as premises and resolves them, and it
+    /// activates nothing; a successor becomes active only through an admitted
+    /// act on that successor by the authority the transition names.
+    #[test]
+    fn norm_correspondence_binds_both_sides_and_activates_nothing() {
+        use whipplescript_store::norm_commands::NormCommandStore;
+        let c = NormCharter::bundled().unwrap();
+        let keys = Keys::new();
+        let mut store = WorkItemStore::open_in_memory().unwrap();
+        let ledger = store
+            .append_norm_event(
+                &keys.sign(
+                    "owner",
+                    "correspondence",
+                    NormAct::Bootstrap {
+                        creator: "worker".into(),
+                        charter: c.clone(),
+                    },
+                ),
+                &keys,
+            )
+            .unwrap();
+        let reference = |name: &str| {
+            Vocabulary::new(
+                c.vocabularies
+                    .iter()
+                    .find(|entry| entry.definition.name == name)
+                    .unwrap()
+                    .definition
+                    .clone(),
+            )
+            .unwrap()
+            .reference()
+            .clone()
+        };
+        let refused = |result: Result<String, StoreError>, needle: &str| {
+            let message = format!("{:?}", result.expect_err("refusal expected"));
+            assert!(message.contains(needle), "{message}");
+        };
+        let requirement = |nonce: &str| {
+            keys.sign(
+                "worker",
+                nonce,
+                NormAct::Create {
+                    ledger: ledger.clone(),
+                    authority: None,
+                    vocabulary: reference("obligation"),
+                    fields_json: json!({"name": nonce, "proposition": "holds", "domain": "src/", "subject": "src/x.py"}).to_string(),
+                },
+            )
+        };
+        let transition = |actor: &str, nonce: &str, record: &str, status: &str| {
+            keys.sign(
+                actor,
+                nonce,
+                NormAct::Transition {
+                    ledger: ledger.clone(),
+                    authority: None,
+                    vocabulary: reference("obligation"),
+                    record: record.into(),
+                    previous: record.into(),
+                    status: status.into(),
+                },
+            )
+        };
+        let r = store.append_norm_event(&requirement("r"), &keys).unwrap();
+        store
+            .append_norm_event(&transition("owner", "accept-r", &r, "accepted"), &keys)
+            .unwrap();
+        let r1 = store.append_norm_event(&requirement("r1"), &keys).unwrap();
+        let r2 = store.append_norm_event(&requirement("r2"), &keys).unwrap();
+        let revision = |store: &WorkItemStore, id: &str| -> String {
+            store.norm_state(&keys).unwrap().records[id]
+                .content_head
+                .clone()
+        };
+        let correspond = |nonce: &str, sources: &[String], targets: &[String], bind: bool| {
+            keys.sign_with(
+                "worker",
+                nonce,
+                NormAct::Create {
+                    ledger: ledger.clone(),
+                    authority: None,
+                    vocabulary: reference("correspondence"),
+                    fields_json: json!({
+                        "sources": sources, "targets": targets, "claim": "split",
+                        "property": "the conjunction of the successors preserves the original",
+                        "direction": "forward", "witness": "review of 2026-09-18", "mode": "attested",
+                        "reliance": "norm.accept"
+                    })
+                    .to_string(),
+                },
+                Some(NormPremises {
+                    family_basis: None,
+                    references: if bind {
+                        sources.iter().chain(targets).cloned().collect()
+                    } else {
+                        Vec::new()
+                    },
+                    inventory_frontier: Vec::new(),
+                }),
+            )
+        };
+        let original = vec![revision(&store, &r)];
+        let successors = vec![revision(&store, &r1), revision(&store, &r2)];
+        // Bound and resolving, the split is admitted; the successors are
+        // untouched by it.
+        let split = store
+            .append_norm_event(&correspond("split", &original, &successors, true), &keys)
+            .unwrap();
+        let view = store.norm_state(&keys).unwrap();
+        assert_eq!(view.records[&split].status, "proposed");
+        assert_eq!(view.records[&r1].status, "proposed");
+        assert_eq!(view.records[&r2].status, "proposed");
+        assert!(!view.effective_records.contains_key(&r1));
+        // Unbound, unresolvable, empty or self-related sides are refused.
+        refused(
+            store.append_norm_event(&correspond("unbound", &original, &successors, false), &keys),
+            "must bind the revisions it names",
+        );
+        refused(
+            store.append_norm_event(
+                &correspond(
+                    "not-a-revision",
+                    &original,
+                    std::slice::from_ref(&ledger),
+                    true,
+                ),
+                &keys,
+            ),
+            "does not resolve to an admitted revision",
+        );
+        refused(
+            store.append_norm_event(&correspond("empty", &original, &[], true), &keys),
+            "at least one revision on each side",
+        );
+        refused(
+            store.append_norm_event(&correspond("self", &original, &original, true), &keys),
+            "not to itself",
+        );
+        // Attesting the correspondence is the authority's act, and it still
+        // activates no successor. Activation is an act on the successor, by
+        // the authority the successor's own transition names.
+        let attest = |actor: &str, nonce: &str, previous: &str| {
+            keys.sign(
+                actor,
+                nonce,
+                NormAct::Transition {
+                    ledger: ledger.clone(),
+                    authority: None,
+                    vocabulary: reference("correspondence"),
+                    record: split.clone(),
+                    previous: previous.into(),
+                    status: "attested".into(),
+                },
+            )
+        };
+        refused(
+            store.append_norm_event(&attest("worker", "attest-by-worker", &split), &keys),
+            "authenticated governance authority",
+        );
+        store
+            .append_norm_event(&attest("owner", "attest", &split), &keys)
+            .unwrap();
+        let view = store.norm_state(&keys).unwrap();
+        assert_eq!(view.records[&split].status, "attested");
+        assert_eq!(view.records[&r1].status, "proposed");
+        refused(
+            store.append_norm_event(
+                &transition("worker", "activate-r1-by-worker", &r1, "accepted"),
+                &keys,
+            ),
+            "authenticated governance authority",
+        );
+        store
+            .append_norm_event(&transition("owner", "activate-r1", &r1, "accepted"), &keys)
+            .unwrap();
+        let view = store.norm_state(&keys).unwrap();
+        assert!(view.effective_records.contains_key(&r1));
+        assert_eq!(view.records[&r2].status, "proposed");
+        // Lineage to a revision a later edit moved past still resolves.
+        store
+            .append_norm_event(
+                &keys.sign(
+                    "worker",
+                    "edit-r",
+                    NormAct::Edit {
+                        ledger: ledger.clone(),
+                        authority: None,
+                        vocabulary: reference("obligation"),
+                        record: r.clone(),
+                        previous: view.records[&r].head.clone(),
+                        fields_json: json!({"name": "r", "proposition": "holds more", "domain": "src/", "subject": "src/x.py"}).to_string(),
+                    },
+                ),
+                &keys,
+            )
+            .unwrap();
+        store
+            .append_norm_event(
+                &correspond("equivalence", &original, &[revision(&store, &r)], true),
+                &keys,
+            )
+            .unwrap();
+    }
+
+    /// DR-0122: a relation, manifest or correspondence declaration is
+    /// validated with its charter at bootstrap; a malformed one is not a charter.
+    #[test]
+    fn norm_typed_declarations_are_validated_with_the_charter() {
+        let keys = Keys::new();
+        let refuses = |mutate: &dyn Fn(&mut NormCharter), needle: &str| {
+            let mut charter = NormCharter::bundled().unwrap();
+            mutate(&mut charter);
+            let mut store = WorkItemStore::open_in_memory().unwrap();
+            let result = store.append_norm_event(
+                &keys.sign(
+                    "owner",
+                    "malformed",
+                    NormAct::Bootstrap {
+                        creator: "worker".into(),
+                        charter,
+                    },
+                ),
+                &keys,
+            );
+            let message = format!(
+                "{:?}",
+                result.expect_err("malformed declaration must refuse")
+            );
+            assert!(message.contains(needle), "{message}");
+        };
+        fn relation(
+            charter: &mut NormCharter,
+        ) -> &mut whipplescript_store::norm_relations::RelationDeclaration {
+            charter
+                .vocabularies
+                .iter_mut()
+                .find(|entry| entry.definition.name == "refines")
+                .unwrap()
+                .relation
+                .as_mut()
+                .unwrap()
+        }
+        refuses(
+            &|charter| relation(charter).source = "note".into(),
+            "relation source must name a required reference field",
+        );
+        refuses(
+            &|charter| relation(charter).target = "source".into(),
+            "relation source and target must be distinct fields",
+        );
+        refuses(
+            &|charter| relation(charter).family = " ".into(),
+            "relation family must be named",
+        );
+        refuses(
+            &|charter| relation(charter).live_statuses = vec!["nonexistent".into()],
+            "relation live statuses must be nonempty and from the vocabulary",
+        );
+        refuses(
+            &|charter| relation(charter).source_kinds = vec!["nonexistent".into()],
+            "relation endpoint kinds must name vocabularies the charter declares",
+        );
+        fn manifest(
+            charter: &mut NormCharter,
+        ) -> &mut whipplescript_store::norm_manifests::ManifestDeclaration {
+            charter
+                .vocabularies
+                .iter_mut()
+                .find(|entry| entry.definition.name == "manifest")
+                .unwrap()
+                .manifest
+                .as_mut()
+                .unwrap()
+        }
+        refuses(
+            &|charter| manifest(charter).members = "title".into(),
+            "manifest members must be a required list of revision references",
+        );
+        refuses(
+            &|charter| manifest(charter).claim = "selection".into(),
+            "manifest claim must be a required enum field containing the exhaustive literal",
+        );
+        refuses(
+            &|charter| manifest(charter).scope = Some("members".into()),
+            "manifest scope must name a text field",
+        );
+        fn correspondence(
+            charter: &mut NormCharter,
+        ) -> &mut whipplescript_store::norm_correspondence::CorrespondenceDeclaration {
+            charter
+                .vocabularies
+                .iter_mut()
+                .find(|entry| entry.definition.name == "correspondence")
+                .unwrap()
+                .correspondence
+                .as_mut()
+                .unwrap()
+        }
+        refuses(
+            &|charter| correspondence(charter).sources = "claim".into(),
+            "correspondence sources must be a required list of revision references",
+        );
+        refuses(
+            &|charter| correspondence(charter).targets = "sources".into(),
+            "correspondence sources and targets must be distinct fields",
+        );
+        refuses(
+            &|charter| correspondence(charter).claim = "witness".into(),
+            "correspondence claim must be a required enum field",
+        );
+    }
+
+    /// A creation preview refuses a nonce this ledger already admitted and
+    /// accepts a fresh one; the preview is not admission.
+    #[test]
+    fn norm_preview_refuses_an_admitted_nonce() {
+        use whipplescript_store::norm_commands::NormCommandStore;
+        use whipplescript_store::norm_history::{CapturedNormHistory, NormHistoryLimits};
+        let keys = Keys::new();
+        let mut store = WorkItemStore::open_in_memory().unwrap();
+        let ledger = store.append_norm_event(&keys.bootstrap(), &keys).unwrap();
+        let admitted = keys.create(&ledger, "once");
+        store.append_norm_event(&admitted, &keys).unwrap();
+        let history = CapturedNormHistory::capture(
+            &store.norm_state(&keys).unwrap(),
+            &store.tracker_history().unwrap(),
+            &keys,
+            NormHistoryLimits::default(),
+        )
+        .unwrap();
+        let message = format!(
+            "{:?}",
+            history
+                .preview_creation(&admitted.statement)
+                .expect_err("an admitted nonce cannot be previewed again")
+        );
+        assert!(message.contains("nonce was already admitted"), "{message}");
+        history
+            .preview_creation(&keys.create(&ledger, "fresh").statement)
+            .unwrap();
+    }
+
     #[test]
     fn norm_commands_decode_raw_json_before_any_admission() {
         use whipplescript_store::norm_commands::*;

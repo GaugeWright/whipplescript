@@ -1,0 +1,34 @@
+load ../relation-validation-scope.maude
+--- positive: an acyclic add on the current basis commits
+search [1] in RELATION-VALIDATION-SCOPE : { graph(a -> b) cand(b -> c, a -> b) }
+  =>* { graph(G:Edges) admitted(b -> c) RESIDUAL:Cfg } .
+--- positive: a candidate closing a cycle through a longer path is refused
+search [1] in RELATION-VALIDATION-SCOPE : { graph((a -> b) ; (b -> c)) cand(c -> a, (a -> b) ; (b -> c)) }
+  =>* { graph(G:Edges) refused(c -> a) RESIDUAL:Cfg } .
+--- refusal: that candidate is never admitted by the strong door
+search in RELATION-VALIDATION-SCOPE : { graph((a -> b) ; (b -> c)) cand(c -> a, (a -> b) ; (b -> c)) }
+  =>* { graph(G:Edges) admitted(c -> a) RESIDUAL:Cfg } .
+--- weakening: local validation admits it, because no direct reverse edge exists
+search [1] in RELATION-VALIDATION-LOCAL : { graph((a -> b) ; (b -> c)) cand(c -> a, (a -> b) ; (b -> c)) }
+  =>* { graph(G:Edges) admitted(c -> a) RESIDUAL:Cfg } .
+--- positive: two candidates captured against the same empty family, one edge of
+--- a two-cycle each; the strong door admits one and refuses the other
+search [1] in RELATION-VALIDATION-SCOPE : { graph(none) cand(a -> b, none) cand(b -> a, none) }
+  =>* { graph(G:Edges) admitted(a -> b) refused(b -> a) RESIDUAL:Cfg } .
+--- refusal: the strong door never admits both
+search in RELATION-VALIDATION-SCOPE : { graph(none) cand(a -> b, none) cand(b -> a, none) }
+  =>* { graph(G:Edges) admitted(a -> b) admitted(b -> a) RESIDUAL:Cfg } .
+--- weakening: binding only the endpoint records admits both
+search [1] in RELATION-VALIDATION-ENDPOINTS : { graph(none) cand(a -> b, none) cand(b -> a, none) }
+  =>* { graph(G:Edges) admitted(a -> b) admitted(b -> a) RESIDUAL:Cfg } .
+--- refusal: no reachable family under the strong door has a cycle
+search in RELATION-VALIDATION-SCOPE : { graph(none) cand(a -> b, none) cand(b -> a, none) }
+  =>* { graph(G:Edges) RESIDUAL:Cfg } such that hasCycle(G:Edges) .
+--- weakening: the endpoint door reaches a cyclic family
+search [1] in RELATION-VALIDATION-ENDPOINTS : { graph(none) cand(a -> b, none) cand(b -> a, none) }
+  =>* { graph(G:Edges) RESIDUAL:Cfg } such that hasCycle(G:Edges) .
+--- positive: independent candidates both commit under the conservative family
+--- basis, the second after re-evaluation; conservatism costs a re-check, not the work
+search [1] in RELATION-VALIDATION-SCOPE : { graph(none) cand(a -> b, none) cand(c -> d, none) }
+  =>* { graph(G:Edges) admitted(a -> b) admitted(c -> d) RESIDUAL:Cfg } .
+quit .

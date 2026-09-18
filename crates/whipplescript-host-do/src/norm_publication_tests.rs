@@ -16,6 +16,7 @@ fn candidate(instance: &str) -> PublicationCandidate {
         observation: serde_json::json!({"outcome":"fail","counterexample":"retained"}),
         event: SignedNormEvent {
             statement: NormStatement {
+                premises: None,
                 protocol: "whipplescript.norm.event/v1".into(),
                 actor: NormActor {
                     principal: "publisher".into(),

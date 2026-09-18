@@ -284,3 +284,6 @@ native-impact-query.maude	SNSNSNSNS
 hosted-impact-entry.maude	SNSNSNS
 runtime-image-binding.maude	SNSNSNS
 hosted-impact-route.maude	SNSNSNS
+relation-validation-scope.maude	SSNSSNSNSS
+manifest-completeness.maude	SSNSSNSSSNS
+correspondence-reuse.maude	SNSNSSNSS

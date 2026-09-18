@@ -1,0 +1,74 @@
+--- DR-0122 §13.4: structural validation names its scope and binds its basis.
+--- Four records and one relation family declared acyclic. A candidate adds
+--- one edge and is captured against the family's edge set at its frontier.
+--- The strong door commits only when the captured family basis is still the
+--- current one, re-evaluating otherwise; two weakenings below commit on a
+--- narrower premise. Records, aliases, cardinality and manifests are not
+--- modeled here; reachability is bounded by the four nodes.
+mod RELATION-VALIDATION-SCOPE is
+  protecting BOOL .
+  protecting NAT .
+  sorts Node Edge Edges Fact Cfg State .
+  ops a b c d : -> Node [ctor] .
+  op _->_ : Node Node -> Edge [ctor] .
+  subsort Edge < Edges .
+  op none : -> Edges [ctor] .
+  op _;_ : Edges Edges -> Edges [ctor assoc comm id: none] .
+  subsort Fact < Cfg .
+  op empty : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: empty] .
+  op {_} : Cfg -> State [ctor] .
+  --- the family's current edge set, and a candidate edge with its captured basis
+  op graph : Edges -> Fact [ctor] .
+  op cand : Edge Edges -> Fact [ctor] .
+  ops admitted refused : Edge -> Fact [ctor] .
+  vars X Y Z : Node .
+  vars G B : Edges .
+  var E : Edge .
+  var C : Cfg .
+  var N : Nat .
+  --- simple-path reachability, bounded by the node count
+  op reach : Edges Node Node -> Bool .
+  op reachN : Edges Node Node Nat -> Bool .
+  eq reach(G, X, Y) = reachN(G, X, Y, 4) .
+  eq reachN(G, X, Y, 0) = false .
+  eq reachN((X -> Y) ; G, X, Y, s(N)) = true .
+  ceq reachN((X -> Z) ; G, X, Y, s(N)) = true if reachN(G, Z, Y, N) .
+  eq reachN(G, X, Y, s(N)) = false [owise] .
+  --- adding X -> Y keeps the family acyclic iff no path Y ~> X exists
+  op acyclicAdd : Edges Edge -> Bool .
+  eq acyclicAdd(G, X -> Y) = (X =/= Y) and not reach(G, Y, X) .
+  op hasCycle : Edges -> Bool .
+  eq hasCycle(G) = reach(G, a, a) or reach(G, b, b) or reach(G, c, c) or reach(G, d, d) .
+  --- The strong door: the certificate binds the family basis. A candidate whose
+  --- basis is the current family commits or is refused on the whole family;
+  --- one whose basis moved is re-evaluated against the current family first.
+  crl [commit] : { graph(G) cand(E, G) C } => { graph(G ; E) admitted(E) C }
+    if acyclicAdd(G, E) .
+  crl [refuse] : { graph(G) cand(E, G) C } => { graph(G) refused(E) C }
+    if not acyclicAdd(G, E) .
+  crl [reevaluate] : { graph(G) cand(E, B) C } => { graph(G) cand(E, G) C }
+    if B =/= G .
+endm
+
+--- Weakening: the door binds only the endpoint records. An added edge never
+--- moves an endpoint record's head, so a candidate validated at capture commits
+--- on its captured basis whatever the family has become since.
+mod RELATION-VALIDATION-ENDPOINTS is
+  including RELATION-VALIDATION-SCOPE .
+  vars G B : Edges . var E : Edge . var C : Cfg .
+  crl [commit-on-endpoints] : { graph(G) cand(E, B) C } => { graph(G ; E) admitted(E) C }
+    if acyclicAdd(B, E) .
+endm
+
+--- Weakening: validation is local to the changed records. Only the immediate
+--- reverse edge is checked, so a cycle through a longer existing path passes.
+mod RELATION-VALIDATION-LOCAL is
+  including RELATION-VALIDATION-SCOPE .
+  vars X Y : Node . var G : Edges . var C : Cfg .
+  op localOk : Edges Edge -> Bool .
+  eq localOk((Y -> X) ; G, X -> Y) = false .
+  eq localOk(G, X -> Y) = X =/= Y [owise] .
+  crl [commit-local] : { graph(G) cand(X -> Y, G) C } => { graph(G ; (X -> Y)) admitted(X -> Y) C }
+    if localOk(G, X -> Y) .
+endm

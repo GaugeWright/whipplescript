@@ -23,6 +23,83 @@ mod tests {
     })).expect("valid test vocabulary")
     }
 
+    fn reference_definition() -> VocabularyDefinition {
+        serde_json::from_value(json!({
+        "name":"link", "version":"1",
+        "fields":[
+            {"name":"source","required":true,"value_type":{"type":"reference","form":"identity"}},
+            {"name":"target","required":true,"value_type":{"type":"reference","form":"revision"}},
+            {"name":"members","required":false,"value_type":{"type":"list","item":{"type":"reference","form":"revision"}}}
+        ],
+        "status":{"values":["open"],"initial":"open","transitions":[]}
+    })).expect("valid reference vocabulary")
+    }
+
+    #[test]
+    fn references_are_content_ids_and_never_aliases() {
+        let vocabulary = Vocabulary::new(reference_definition()).unwrap();
+        let id = "a".repeat(64);
+        let other = "b".repeat(64);
+        vocabulary
+            .validate_record(
+                &json!({"source": id, "target": other, "members": [id, other]}),
+                "open",
+            )
+            .unwrap();
+        // A ledger-local alias names a record only in one clone; it is not a reference.
+        for bad in [
+            json!("N-12"),
+            json!(""),
+            json!("A".repeat(64)),
+            json!("a".repeat(63)),
+            json!(12),
+            json!(null),
+        ] {
+            let error = vocabulary
+                .validate_record(&json!({"source": id, "target": bad}), "open")
+                .unwrap_err();
+            assert!(
+                matches!(&error, VocabularyError::InvalidRecord { path, reason } if path == "fields.target" && reason.contains("revision reference")),
+                "{error}"
+            );
+        }
+        let error = vocabulary
+            .validate_record(&json!({"source": "N-12", "target": other}), "open")
+            .unwrap_err();
+        assert!(
+            matches!(&error, VocabularyError::InvalidRecord { path, reason } if path == "fields.source" && reason.contains("identity reference"))
+        );
+        let error = vocabulary
+            .validate_record(
+                &json!({"source": id, "target": other, "members": [id, "N-3"]}),
+                "open",
+            )
+            .unwrap_err();
+        assert!(
+            matches!(&error, VocabularyError::InvalidRecord { path, .. } if path == "fields.members[1]")
+        );
+    }
+
+    #[test]
+    fn reference_form_is_declared_and_part_of_identity() {
+        let identity = Vocabulary::new(reference_definition()).unwrap();
+        let mut swapped = reference_definition();
+        swapped.fields[0].value_type = ValueType::Reference {
+            form: ReferenceForm::Revision,
+        };
+        let swapped = Vocabulary::new(swapped).unwrap();
+        assert_ne!(identity.reference().digest, swapped.reference().digest);
+        let missing_form = serde_json::from_value::<VocabularyDefinition>(json!({
+            "name":"link","version":"1",
+            "fields":[{"name":"source","required":true,"value_type":{"type":"reference"}}],
+            "status":{"values":["open"],"initial":"open","transitions":[]}
+        }));
+        assert!(
+            missing_form.is_err(),
+            "a reference without a declared form is not a declaration"
+        );
+    }
+
     #[test]
     fn declarations_and_record_shapes_are_data() {
         let vocabulary = Vocabulary::new(definition()).unwrap();

@@ -132,6 +132,15 @@ pub struct NormSnapshot {
     pub charter: NormCharter,
     pub records: Vec<NamedNormRecord>,
     pub inventory: crate::norm_inventory::RequirementInventory,
+    /// Every declared relation family with its live edges and the basis an
+    /// act binds (DR-0122); a family with no edges still has a basis.
+    #[serde(default)]
+    pub families: BTreeMap<String, crate::norm_relations::RelationFamilyView>,
+    /// Every manifest record's derived completeness judgment (DR-0122): an
+    /// exhaustive claim judged at the frontier it bound, a bounded claim
+    /// within its scope. Never inferred from the members.
+    #[serde(default)]
+    pub manifests: BTreeMap<String, crate::norm_manifests::ManifestJudgment>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -204,6 +213,8 @@ impl<'a, S: NormCommandStore> NormCommandHost<'a, S> {
             });
         }
         Ok(NormSnapshot {
+            manifests: self.manifest_judgments(&view)?,
+            families: view.relation_families()?,
             inventory: view.requirement_inventory()?,
             checkpoint: view.checkpoint(),
             frontier: view.frontier.into_iter().collect(),
@@ -211,6 +222,75 @@ impl<'a, S: NormCommandStore> NormCommandHost<'a, S> {
             charter: view.charter,
             records,
         })
+    }
+
+    /// An exhaustive claim is judged by projecting the verified history at the
+    /// frontier the act bound, so the judgment is the same in every replay and
+    /// stays a historical one when the inventory moves afterwards.
+    fn manifest_judgments(
+        &self,
+        view: &NormView,
+    ) -> StoreResult<BTreeMap<String, crate::norm_manifests::ManifestJudgment>> {
+        use crate::norm_manifests::{judge, ManifestCompleteness, ManifestJudgment};
+        let mut judgments = BTreeMap::new();
+        let mut history = None;
+        for record in view.records.values() {
+            let Some((_, manifest)) = view.manifest_of(&record.vocabulary) else {
+                continue;
+            };
+            let members: Vec<String> = record
+                .fields
+                .get(&manifest.members)
+                .and_then(serde_json::Value::as_array)
+                .map(|members| {
+                    members
+                        .iter()
+                        .filter_map(serde_json::Value::as_str)
+                        .map(str::to_owned)
+                        .collect()
+                })
+                .unwrap_or_default();
+            let claim = record
+                .fields
+                .get(&manifest.claim)
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_owned();
+            let completeness = if claim == manifest.exhaustive {
+                let basis: Vec<String> = view.manifest_basis(&record.id).unwrap_or(&[]).to_vec();
+                if history.is_none() {
+                    history = Some(self.history()?);
+                }
+                let history = history.as_ref().expect("captured above");
+                match history.project(Some(&basis), self.verifier) {
+                    Ok(at_basis) => judge(&members, &at_basis.requirement_inventory()?, basis),
+                    Err(error) => ManifestCompleteness::Unresolved {
+                        basis,
+                        reason: format!(
+                            "the bound basis is not a frontier of this history: {error:?}"
+                        ),
+                    },
+                }
+            } else {
+                ManifestCompleteness::Bounded {
+                    scope: manifest
+                        .scope
+                        .as_ref()
+                        .and_then(|field| record.fields.get(field))
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned),
+                }
+            };
+            judgments.insert(
+                record.id.clone(),
+                ManifestJudgment {
+                    revision: record.content_head.clone(),
+                    claim,
+                    completeness,
+                },
+            );
+        }
+        Ok(judgments)
     }
 
     fn capture_artifact(&self, cut: &str) -> StoreResult<CapturedArtifact> {

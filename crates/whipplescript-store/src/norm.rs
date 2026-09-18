@@ -9,7 +9,14 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use whipplescript_core::vocabulary::{
-    AdmissionPredicate, Vocabulary, VocabularyDefinition, VocabularyRef, VocabularyRegistry,
+    AdmissionPredicate, ReferenceForm, ValueType, Vocabulary, VocabularyDefinition, VocabularyRef,
+    VocabularyRegistry,
+};
+
+use crate::norm_correspondence::CorrespondenceDeclaration;
+use crate::norm_manifests::ManifestDeclaration;
+use crate::norm_relations::{
+    RelationCardinality, RelationDeclaration, RelationEdge, RelationFamilyView,
 };
 
 use crate::items::{event_content_id, TrackerEvent};
@@ -81,6 +88,18 @@ pub struct NormVocabulary {
     pub effectiveness: Option<Vec<EffectivenessRule>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inventory_role: Option<crate::norm_inventory::InventoryRole>,
+    /// Declares this vocabulary's records as edges of a relation family
+    /// (DR-0122). None means records of this vocabulary relate nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relation: Option<RelationDeclaration>,
+    /// Declares this vocabulary's records as manifests (DR-0122): members and
+    /// a completeness claim. None means records of this vocabulary select nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manifest: Option<ManifestDeclaration>,
+    /// Declares this vocabulary's records as correspondences (DR-0122): exact
+    /// revisions on two sides and a claim from a closed set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub correspondence: Option<CorrespondenceDeclaration>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -160,6 +179,30 @@ pub enum NormAct {
     },
 }
 
+/// What an act bound at validation. Every premise is also a causal parent of
+/// the act's event, so a replay applies the act after the events it was
+/// validated against and reproduces the admission. The door refuses the act
+/// when a bound premise no longer holds; a caller re-captures and validates
+/// again rather than substituting a newer token into an old calculation.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NormPremises {
+    /// The basis of the relation family the act's edge joins: the event id of
+    /// the family's last admitted act, or the ledger's genesis when it has none.
+    /// Any act on a record of the family moves it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub family_basis: Option<String>,
+    /// The content ids the act's reference fields name, so the records and
+    /// revisions they resolve to precede the act in every replay.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub references: Vec<String>,
+    /// The ledger frontier an exhaustive manifest claim was judged against.
+    /// Bound as parents, so the inventory at that frontier precedes the act,
+    /// and the judgment is derived there in every replay.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub inventory_frontier: Vec<String>,
+}
+
 /// The nonce identifies one invocation by this principal. Retries reuse the
 /// signed event; a second event reusing a nonce for different bytes is refused.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -170,6 +213,10 @@ pub struct NormStatement {
     pub nonce: String,
     pub created_at: String,
     pub action: NormAct,
+    /// The premises this act was validated against (DR-0122 §13.4). Absent
+    /// premises are not serialized, so earlier statements keep their bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub premises: Option<NormPremises>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -296,6 +343,11 @@ impl SignedNormEvent {
                 (ROTATE_KIND, None, parents)
             }
         };
+        if let Some(premises) = &self.statement.premises {
+            parents.extend(premises.family_basis.iter().cloned());
+            parents.extend(premises.references.iter().cloned());
+            parents.extend(premises.inventory_frontier.iter().cloned());
+        }
         parents.sort();
         parents.dedup();
         let payload_json = serde_json::to_string(self)?;
@@ -364,6 +416,14 @@ pub struct NormView {
     pub records: BTreeMap<String, NormRecord>,
     pub effective_records: BTreeMap<String, NormRecord>,
     effective_lifecycles: BTreeMap<String, EffectiveLifecycle>,
+    /// Every content revision ever admitted, by its revision id, so a revision
+    /// reference resolves to its record after later edits moved the head.
+    revisions: BTreeMap<String, String>,
+    /// The last admitted act on any record of each relation family; the basis
+    /// a relation act binds. A family with no act yet has the ledger as its basis.
+    family_heads: BTreeMap<String, String>,
+    /// The inventory frontier each exhaustive manifest revision bound.
+    manifest_bases: BTreeMap<String, Vec<String>>,
     pub authority_head: String,
     pub frontier: BTreeSet<String>,
     authority_history: BTreeSet<String>,
@@ -442,6 +502,9 @@ fn registry_for(charter: &NormCharter) -> StoreResult<VocabularyRegistry> {
             return Err(refused("C0 repeats a vocabulary version"));
         }
         crate::norm_inventory::validate_inventory_role(entry)?;
+        crate::norm_relations::validate_relation_declaration(entry, charter)?;
+        crate::norm_manifests::validate_manifest_declaration(entry)?;
+        crate::norm_correspondence::validate_correspondence_declaration(entry)?;
         let mut effect_statuses = BTreeSet::new();
         for rule in entry.effectiveness.iter().flatten() {
             let unique = effect_statuses.insert(&rule.status);
@@ -499,6 +562,9 @@ impl NormView {
             records: BTreeMap::new(),
             effective_records: BTreeMap::new(),
             effective_lifecycles: BTreeMap::new(),
+            revisions: BTreeMap::new(),
+            family_heads: BTreeMap::new(),
+            manifest_bases: BTreeMap::new(),
             authority_head: event.event_id.clone(),
             frontier: BTreeSet::from([event.event_id.clone()]),
             authority_history: BTreeSet::from([event.event_id.clone()]),
@@ -569,7 +635,16 @@ impl NormView {
         {
             return Err(refused("norm invocation nonce was already admitted"));
         }
-        self.creation_fields(&statement.actor, vocabulary, fields_json)?;
+        let (status, fields) = self.creation_fields(&statement.actor, vocabulary, fields_json)?;
+        self.check_relation_act(
+            None,
+            vocabulary,
+            &fields,
+            &status,
+            statement.premises.as_ref(),
+        )?;
+        self.check_manifest_act(vocabulary, &fields, statement.premises.as_ref())?;
+        self.check_correspondence_act(vocabulary, &fields, statement.premises.as_ref())?;
         Ok(())
     }
 
@@ -597,6 +672,19 @@ impl NormView {
                 self.check_authority(authority.as_deref().unwrap_or(&ledger))?;
                 let (status, fields) =
                     self.creation_fields(&statement.actor, &vocabulary, &fields_json)?;
+                self.check_relation_act(
+                    None,
+                    &vocabulary,
+                    &fields,
+                    &status,
+                    statement.premises.as_ref(),
+                )?;
+                let manifest_basis =
+                    self.check_manifest_act(&vocabulary, &fields, statement.premises.as_ref())?;
+                self.check_correspondence_act(&vocabulary, &fields, statement.premises.as_ref())?;
+                if let Some(basis) = manifest_basis {
+                    self.manifest_bases.insert(event.event_id.clone(), basis);
+                }
                 self.records.insert(
                     event.event_id.clone(),
                     NormRecord {
@@ -607,6 +695,12 @@ impl NormView {
                         status,
                         head: event.event_id.clone(),
                     },
+                );
+                self.revisions
+                    .insert(event.event_id.clone(), event.event_id.clone());
+                self.advance_family(
+                    &self.records[&event.event_id].vocabulary.clone(),
+                    &event.event_id,
                 );
             }
             NormAct::Transition {
@@ -628,10 +722,18 @@ impl NormView {
                     .transition(&current.status, &status)
                     .map_err(|e| refused(e.to_string()))?;
                 self.permitted(predicate, &statement.actor)?;
+                self.check_relation_act(
+                    Some(&record),
+                    &vocabulary,
+                    &current.fields,
+                    &status,
+                    statement.premises.as_ref(),
+                )?;
                 let mut updated = current.clone();
                 updated.status = status;
                 updated.head = event.event_id.clone();
                 self.records.insert(record, updated);
+                self.advance_family(&vocabulary, &event.event_id);
             }
             NormAct::Edit {
                 ledger,
@@ -666,14 +768,41 @@ impl NormView {
                 let fields = definition
                     .parse_record_json(&fields_json, initial)
                     .map_err(|e| refused(e.to_string()))?;
+                let content_changed = fields != current.fields;
+                let resulting_status = if content_changed {
+                    initial.clone()
+                } else {
+                    current.status.clone()
+                };
+                self.check_relation_act(
+                    Some(&record),
+                    &vocabulary,
+                    &fields,
+                    &resulting_status,
+                    statement.premises.as_ref(),
+                )?;
+                let manifest_basis =
+                    self.check_manifest_act(&vocabulary, &fields, statement.premises.as_ref())?;
+                self.check_correspondence_act(&vocabulary, &fields, statement.premises.as_ref())?;
                 let mut updated = current.clone();
-                if fields != current.fields {
+                match manifest_basis {
+                    Some(basis) => {
+                        self.manifest_bases.insert(record.clone(), basis);
+                    }
+                    None => {
+                        self.manifest_bases.remove(&record);
+                    }
+                }
+                if content_changed {
                     updated.fields = fields;
                     updated.content_head = event.event_id.clone();
-                    updated.status = initial.clone();
+                    updated.status = resulting_status;
+                    self.revisions
+                        .insert(event.event_id.clone(), record.clone());
                 }
                 updated.head = event.event_id.clone();
                 self.records.insert(record, updated);
+                self.advance_family(&vocabulary, &event.event_id);
             }
             NormAct::Retire {
                 ledger,
@@ -726,6 +855,7 @@ impl NormView {
                 self.records.insert(record.clone(), updated);
                 self.effective_records.remove(&record);
                 self.effective_lifecycles.remove(&record);
+                self.advance_family(&vocabulary, &event.event_id);
             }
             NormAct::Rotate {
                 ledger,
@@ -833,6 +963,384 @@ impl NormView {
                 },
             );
         }
+    }
+
+    fn relation_of(
+        &self,
+        vocabulary: &VocabularyRef,
+    ) -> Option<(&NormVocabulary, &RelationDeclaration)> {
+        self.charter
+            .vocabularies
+            .iter()
+            .find(|entry| {
+                entry.definition.name == vocabulary.name
+                    && entry.definition.version == vocabulary.version
+            })
+            .and_then(|entry| entry.relation.as_ref().map(|relation| (entry, relation)))
+    }
+
+    /// Resolve one declared reference field to the record it names, by the
+    /// form the declaration gives it, and check the record's kind.
+    fn resolve_endpoint(
+        &self,
+        entry: &NormVocabulary,
+        fields: &Value,
+        field: &str,
+        kinds: &[String],
+    ) -> StoreResult<String> {
+        // The declaration was validated with the charter and the interpreter
+        // validated the fields, so an absent form or value cannot happen; both
+        // fall into the one refusal a caller can reach, an unresolved endpoint.
+        let form = entry
+            .definition
+            .fields
+            .iter()
+            .find(|declared| declared.name == field)
+            .and_then(|declared| match declared.value_type {
+                ValueType::Reference { form } => Some(form),
+                _ => None,
+            });
+        let reference = fields.get(field).and_then(Value::as_str);
+        let record_id = match (form, reference) {
+            (Some(ReferenceForm::Identity), Some(reference)) => self
+                .records
+                .contains_key(reference)
+                .then(|| reference.to_owned()),
+            (Some(ReferenceForm::Revision), Some(reference)) => {
+                self.revisions.get(reference).cloned()
+            }
+            _ => None,
+        };
+        let Some(record_id) = record_id else {
+            // The negative control resolves a dangling reference to the reference itself.
+            // MUTATION-SUCCESS-EXPR: Ok(reference.to_owned())
+            return Err(refused(
+                "relation endpoint does not resolve at this frontier",
+            ));
+        };
+        if !kinds.is_empty() && !kinds.contains(&self.records[&record_id].vocabulary.name) {
+            return Err(refused(
+                "relation endpoint is a record of an undeclared kind",
+            ));
+        }
+        Ok(record_id)
+    }
+
+    /// Every family the charter declares, with its live edges at this frontier
+    /// and the basis an act binds.
+    pub fn relation_families(&self) -> StoreResult<BTreeMap<String, RelationFamilyView>> {
+        let mut families: BTreeMap<String, Vec<RelationEdge>> = self
+            .charter
+            .vocabularies
+            .iter()
+            .filter_map(|entry| entry.relation.as_ref())
+            .map(|relation| (relation.family.clone(), Vec::new()))
+            .collect();
+        for record in self.records.values() {
+            let Some((entry, relation)) = self.relation_of(&record.vocabulary) else {
+                continue;
+            };
+            if !relation.live_statuses.contains(&record.status) {
+                continue;
+            }
+            let source = self.resolve_endpoint(
+                entry,
+                &record.fields,
+                &relation.source,
+                &relation.source_kinds,
+            )?;
+            let target = self.resolve_endpoint(
+                entry,
+                &record.fields,
+                &relation.target,
+                &relation.target_kinds,
+            )?;
+            families
+                .entry(relation.family.clone())
+                .or_default()
+                .push(RelationEdge {
+                    record: record.id.clone(),
+                    revision: record.content_head.clone(),
+                    relation: record.vocabulary.name.clone(),
+                    source,
+                    target,
+                });
+        }
+        Ok(families
+            .into_iter()
+            .map(|(family, edges)| {
+                let basis = self.family_basis(&family);
+                (family, RelationFamilyView::new(basis, edges))
+            })
+            .collect())
+    }
+
+    fn family_basis(&self, family: &str) -> String {
+        self.family_heads
+            .get(family)
+            .cloned()
+            .unwrap_or_else(|| self.ledger.clone())
+    }
+
+    /// An admitted act on a relation record moves its family's basis.
+    fn advance_family(&mut self, vocabulary: &VocabularyRef, event_id: &str) {
+        if let Some((_, relation)) = self.relation_of(vocabulary) {
+            let family = relation.family.clone();
+            self.family_heads.insert(family, event_id.to_owned());
+        }
+    }
+
+    pub fn relation_family(&self, family: &str) -> StoreResult<RelationFamilyView> {
+        self.relation_families()?
+            .remove(family)
+            .ok_or_else(|| refused("charter declares no such relation family"))
+    }
+
+    /// The structural door for an act whose record is a relation. Every such
+    /// act binds the family basis it was validated against, so the family's
+    /// history is one causal chain; a moved basis is refused for re-evaluation,
+    /// not substituted. Only an act that leaves the edge live is checked
+    /// structurally. A non-relation act binds no basis.
+    fn check_relation_act(
+        &self,
+        record: Option<&str>,
+        vocabulary: &VocabularyRef,
+        fields: &Value,
+        status: &str,
+        premises: Option<&NormPremises>,
+    ) -> StoreResult<()> {
+        let bound = premises.and_then(|premises| premises.family_basis.as_deref());
+        let Some((entry, relation)) = self.relation_of(vocabulary) else {
+            if bound.is_some() {
+                return Err(refused("only an act on a relation binds a family basis"));
+            }
+            return Ok(());
+        };
+        let live = relation.live_statuses.iter().any(|value| value == status);
+        let family = self.relation_family(&relation.family)?;
+        match bound {
+            Some(basis) if *basis == family.basis => {}
+            Some(_) => {
+                // The negative control substitutes the current basis for the stale one.
+                // MUTATION-SUCCESS-EXPR: ()
+                return Err(refused(
+                    "family basis moved since it was captured; re-evaluate the relation against the current family",
+                ));
+            }
+            None => {
+                // Every act on a relation moves the family, so every one binds
+                // the basis: the family's history is then one causal chain that
+                // a replay walks in admission order, whatever the transport order.
+                return Err(refused(
+                    "an act on a relation must bind the family basis it was validated against",
+                ));
+            }
+        }
+        if !live {
+            return Ok(());
+        }
+        let references = premises
+            .map(|premises| premises.references.as_slice())
+            .unwrap_or(&[]);
+        for field in [&relation.source, &relation.target] {
+            let named = fields.get(field).and_then(Value::as_str);
+            if !named.is_some_and(|value| references.iter().any(|bound| bound == value)) {
+                // The negative control lets an unbound reference through, so a
+                // replay may apply the act before the record it names.
+                // MUTATION-SUCCESS-EXPR: ()
+                return Err(refused(
+                    "an act that makes a relation live must bind the references it names as premises",
+                ));
+            }
+        }
+        let source =
+            self.resolve_endpoint(entry, fields, &relation.source, &relation.source_kinds)?;
+        let target =
+            self.resolve_endpoint(entry, fields, &relation.target, &relation.target_kinds)?;
+        if relation.acyclic {
+            if source == target {
+                return Err(refused(
+                    "an acyclic relation cannot relate a record to itself",
+                ));
+            }
+            if family.reaches(&target, &source, record) {
+                // The negative control checks only the immediate reverse edge.
+                // MUTATION-SUCCESS-EXPR: false
+                return Err(refused(format!(
+                    "relation would close a cycle in family {}",
+                    relation.family
+                )));
+            }
+        }
+        if let Some(RelationCardinality::AtMostOneLivePerTarget) = relation.cardinality {
+            let taken = family
+                .edges
+                .iter()
+                .any(|edge| Some(edge.record.as_str()) != record && edge.target == target);
+            if taken {
+                return Err(refused(format!(
+                    "family {} admits at most one live relation per target",
+                    relation.family
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn manifest_of(
+        &self,
+        vocabulary: &VocabularyRef,
+    ) -> Option<(&NormVocabulary, &ManifestDeclaration)> {
+        self.charter
+            .vocabularies
+            .iter()
+            .find(|entry| {
+                entry.definition.name == vocabulary.name
+                    && entry.definition.version == vocabulary.version
+            })
+            .and_then(|entry| entry.manifest.as_ref().map(|manifest| (entry, manifest)))
+    }
+
+    /// The inventory frontier an admitted exhaustive manifest bound, if any.
+    pub fn manifest_basis(&self, record: &str) -> Option<&[String]> {
+        self.manifest_bases.get(record).map(Vec::as_slice)
+    }
+
+    /// The structural door for an act whose record is a manifest. Every
+    /// member is bound as a premise and resolves to an admitted revision; an
+    /// exhaustive claim binds the inventory frontier it was judged against,
+    /// and a bounded claim binds none. Completeness is not decided here.
+    fn check_manifest_act(
+        &self,
+        vocabulary: &VocabularyRef,
+        fields: &Value,
+        premises: Option<&NormPremises>,
+    ) -> StoreResult<Option<Vec<String>>> {
+        let frontier = premises
+            .map(|premises| premises.inventory_frontier.as_slice())
+            .unwrap_or(&[]);
+        let Some((_, manifest)) = self.manifest_of(vocabulary) else {
+            if !frontier.is_empty() {
+                return Err(refused(
+                    "only an act on a manifest binds an inventory frontier",
+                ));
+            }
+            return Ok(None);
+        };
+        let references = premises
+            .map(|premises| premises.references.as_slice())
+            .unwrap_or(&[]);
+        // The interpreter validated the members as a list of references, so
+        // a missing list or a non-string member cannot reach this door.
+        let members = fields
+            .get(&manifest.members)
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str);
+        for member in members {
+            if !references.iter().any(|bound| bound == member) {
+                // MUTATION-SUCCESS-EXPR: ()
+                return Err(refused(
+                    "an act on a manifest must bind the members it names as premises",
+                ));
+            }
+            if !self.revisions.contains_key(member) {
+                return Err(refused(
+                    "manifest member does not resolve to an admitted revision",
+                ));
+            }
+        }
+        let claim = fields
+            .get(&manifest.claim)
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if claim != manifest.exhaustive {
+            if !frontier.is_empty() {
+                return Err(refused(
+                    "a bounded manifest claim binds no inventory frontier",
+                ));
+            }
+            return Ok(None);
+        }
+        if frontier.is_empty() {
+            // The negative control takes the claim as its own basis.
+            // MUTATION-SUCCESS-EXPR: Ok(Some(Vec::new()))
+            return Err(refused(
+                "an exhaustive manifest claim must bind the inventory frontier it was judged against",
+            ));
+        }
+        let unique: BTreeSet<&String> = frontier.iter().collect();
+        if unique.len() != frontier.len()
+            || frontier.iter().any(|id| !self.event_order.contains(id))
+        {
+            return Err(refused(
+                "a bound inventory frontier names each admitted event once",
+            ));
+        }
+        Ok(Some(frontier.to_vec()))
+    }
+
+    /// The structural door for an act whose record is a correspondence. Both
+    /// sides are nonempty, disjoint, bound as premises and resolve to admitted
+    /// revisions. Nothing here touches the revisions it relates.
+    fn check_correspondence_act(
+        &self,
+        vocabulary: &VocabularyRef,
+        fields: &Value,
+        premises: Option<&NormPremises>,
+    ) -> StoreResult<()> {
+        let Some(entry) = self.charter.vocabularies.iter().find(|entry| {
+            entry.definition.name == vocabulary.name
+                && entry.definition.version == vocabulary.version
+        }) else {
+            return Ok(());
+        };
+        let Some(correspondence) = entry.correspondence.as_ref() else {
+            return Ok(());
+        };
+        let references = premises
+            .map(|premises| premises.references.as_slice())
+            .unwrap_or(&[]);
+        let side = |field: &str| -> StoreResult<Vec<String>> {
+            // The interpreter validated each side as a list of references.
+            let values: Vec<&str> = fields
+                .get(field)
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .collect();
+            if values.is_empty() {
+                return Err(refused(
+                    "a correspondence relates at least one revision on each side",
+                ));
+            }
+            let mut side = Vec::with_capacity(values.len());
+            for revision in values {
+                if !references.iter().any(|bound| bound == revision) {
+                    // MUTATION-SUCCESS-EXPR: ()
+                    return Err(refused(
+                        "an act on a correspondence must bind the revisions it names as premises",
+                    ));
+                }
+                if !self.revisions.contains_key(revision) {
+                    return Err(refused(
+                        "correspondence member does not resolve to an admitted revision",
+                    ));
+                }
+                side.push(revision.to_owned());
+            }
+            Ok(side)
+        };
+        let sources = side(&correspondence.sources)?;
+        let targets = side(&correspondence.targets)?;
+        if sources.iter().any(|source| targets.contains(source)) {
+            return Err(refused(
+                "a correspondence relates a revision to other revisions, not to itself",
+            ));
+        }
+        Ok(())
     }
 
     fn current_record(

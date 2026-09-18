@@ -190,6 +190,7 @@ mod tests {
 
     fn statement(actor: &NormActor, nonce: &str) -> NormStatement {
         NormStatement {
+            premises: None,
             protocol: "whipplescript.norm/v1".into(),
             actor: actor.clone(),
             nonce: nonce.into(),

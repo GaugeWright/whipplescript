@@ -1,0 +1,31 @@
+load ../correspondence-reuse.maude
+--- positive: under an authorized rule, the original's support is reused for
+--- both successors
+search [1] in CORRESPONDENCE-REUSE : { split(r, r1, r2) accepted(r) support(r) reuseRule proposed(r1) proposed(r2) }
+  =>* { derived(r1) derived(r2) RESIDUAL:Cfg } .
+--- refusal: without the rule, the correspondence alone carries no support
+search in CORRESPONDENCE-REUSE : { split(r, r1, r2) accepted(r) support(r) proposed(r1) proposed(r2) }
+  =>* { derived(r1) RESIDUAL:Cfg } .
+--- weakening: reuse by resemblance carries it
+search [1] in CORRESPONDENCE-REUSE-RESEMBLANCE : { split(r, r1, r2) accepted(r) support(r) proposed(r1) proposed(r2) }
+  =>* { derived(r1) RESIDUAL:Cfg } .
+--- refusal: reuse, even under the rule, activates nothing
+search in CORRESPONDENCE-REUSE : { split(r, r1, r2) accepted(r) support(r) reuseRule proposed(r1) proposed(r2) }
+  =>* { active(r1) RESIDUAL:Cfg } .
+--- weakening: the transplanting door activates a successor from the split
+search [1] in CORRESPONDENCE-REUSE-TRANSPLANT : { split(r, r1, r2) accepted(r) support(r) proposed(r1) proposed(r2) }
+  =>* { active(r1) RESIDUAL:Cfg } .
+--- positive: an admitted activation act activates the successor it names, and
+--- only that one
+search [1] in CORRESPONDENCE-REUSE : { split(r, r1, r2) accepted(r) proposed(r1) proposed(r2) activation(r1) }
+  =>* { active(r1) proposed(r2) RESIDUAL:Cfg } .
+--- refusal: the act for one successor never activates the other
+search in CORRESPONDENCE-REUSE : { split(r, r1, r2) accepted(r) proposed(r1) proposed(r2) activation(r1) }
+  =>* { active(r2) RESIDUAL:Cfg } .
+--- positive: a previously authorized policy performs the act, and the act is
+--- what activates
+search [1] in CORRESPONDENCE-REUSE : { split(r, r1, r2) accepted(r) proposed(r1) proposed(r2) autoActivate }
+  =>* { activation(r1) RESIDUAL:Cfg } .
+search [1] in CORRESPONDENCE-REUSE : { split(r, r1, r2) accepted(r) proposed(r1) proposed(r2) autoActivate }
+  =>* { active(r1) active(r2) RESIDUAL:Cfg } .
+quit .

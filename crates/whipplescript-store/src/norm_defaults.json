@@ -435,6 +435,551 @@
       "inventory_role": {
         "kind": "non_requirement"
       }
+    },
+    {
+      "definition": {
+        "name": "refines",
+        "version": "1",
+        "fields": [
+          {
+            "name": "source",
+            "required": true,
+            "value_type": {
+              "type": "reference",
+              "form": "identity"
+            }
+          },
+          {
+            "name": "target",
+            "required": true,
+            "value_type": {
+              "type": "reference",
+              "form": "identity"
+            }
+          },
+          {
+            "name": "note",
+            "required": false,
+            "value_type": {
+              "type": "text"
+            }
+          }
+        ],
+        "status": {
+          "values": [
+            "asserted",
+            "withdrawn"
+          ],
+          "initial": "asserted",
+          "transitions": [
+            {
+              "from": "asserted",
+              "to": "withdrawn",
+              "admission": {
+                "requires": "public"
+              }
+            },
+            {
+              "from": "withdrawn",
+              "to": "asserted",
+              "admission": {
+                "requires": "public"
+              }
+            }
+          ]
+        }
+      },
+      "creation": {
+        "requires": "public"
+      },
+      "editing": {
+        "requires": "public"
+      },
+      "inventory_role": {
+        "kind": "non_requirement"
+      },
+      "relation": {
+        "source": "source",
+        "target": "target",
+        "source_kinds": [
+          "obligation"
+        ],
+        "target_kinds": [
+          "obligation"
+        ],
+        "family": "refinement",
+        "acyclic": true,
+        "live_statuses": [
+          "asserted"
+        ]
+      }
+    },
+    {
+      "definition": {
+        "name": "derives",
+        "version": "1",
+        "fields": [
+          {
+            "name": "source",
+            "required": true,
+            "value_type": {
+              "type": "reference",
+              "form": "identity"
+            }
+          },
+          {
+            "name": "target",
+            "required": true,
+            "value_type": {
+              "type": "reference",
+              "form": "identity"
+            }
+          },
+          {
+            "name": "note",
+            "required": false,
+            "value_type": {
+              "type": "text"
+            }
+          }
+        ],
+        "status": {
+          "values": [
+            "asserted",
+            "withdrawn"
+          ],
+          "initial": "asserted",
+          "transitions": [
+            {
+              "from": "asserted",
+              "to": "withdrawn",
+              "admission": {
+                "requires": "public"
+              }
+            },
+            {
+              "from": "withdrawn",
+              "to": "asserted",
+              "admission": {
+                "requires": "public"
+              }
+            }
+          ]
+        }
+      },
+      "creation": {
+        "requires": "public"
+      },
+      "editing": {
+        "requires": "public"
+      },
+      "inventory_role": {
+        "kind": "non_requirement"
+      },
+      "relation": {
+        "source": "source",
+        "target": "target",
+        "source_kinds": [
+          "obligation"
+        ],
+        "target_kinds": [
+          "obligation"
+        ],
+        "family": "refinement",
+        "acyclic": true,
+        "live_statuses": [
+          "asserted"
+        ]
+      }
+    },
+    {
+      "definition": {
+        "name": "supersedes",
+        "version": "1",
+        "fields": [
+          {
+            "name": "source",
+            "required": true,
+            "value_type": {
+              "type": "reference",
+              "form": "identity"
+            }
+          },
+          {
+            "name": "target",
+            "required": true,
+            "value_type": {
+              "type": "reference",
+              "form": "identity"
+            }
+          },
+          {
+            "name": "note",
+            "required": false,
+            "value_type": {
+              "type": "text"
+            }
+          }
+        ],
+        "status": {
+          "values": [
+            "asserted",
+            "withdrawn"
+          ],
+          "initial": "asserted",
+          "transitions": [
+            {
+              "from": "asserted",
+              "to": "withdrawn",
+              "admission": {
+                "requires": "public"
+              }
+            },
+            {
+              "from": "withdrawn",
+              "to": "asserted",
+              "admission": {
+                "requires": "public"
+              }
+            }
+          ]
+        }
+      },
+      "creation": {
+        "requires": "public"
+      },
+      "editing": {
+        "requires": "public"
+      },
+      "inventory_role": {
+        "kind": "non_requirement"
+      },
+      "relation": {
+        "source": "source",
+        "target": "target",
+        "source_kinds": [
+          "decision",
+          "obligation"
+        ],
+        "target_kinds": [
+          "decision",
+          "obligation"
+        ],
+        "family": "succession",
+        "acyclic": true,
+        "live_statuses": [
+          "asserted"
+        ],
+        "cardinality": "at_most_one_live_per_target"
+      }
+    },
+    {
+      "definition": {
+        "name": "derived_from",
+        "version": "1",
+        "fields": [
+          {
+            "name": "source",
+            "required": true,
+            "value_type": {
+              "type": "reference",
+              "form": "revision"
+            }
+          },
+          {
+            "name": "target",
+            "required": true,
+            "value_type": {
+              "type": "reference",
+              "form": "revision"
+            }
+          },
+          {
+            "name": "note",
+            "required": false,
+            "value_type": {
+              "type": "text"
+            }
+          }
+        ],
+        "status": {
+          "values": [
+            "asserted",
+            "withdrawn"
+          ],
+          "initial": "asserted",
+          "transitions": [
+            {
+              "from": "asserted",
+              "to": "withdrawn",
+              "admission": {
+                "requires": "public"
+              }
+            },
+            {
+              "from": "withdrawn",
+              "to": "asserted",
+              "admission": {
+                "requires": "public"
+              }
+            }
+          ]
+        }
+      },
+      "creation": {
+        "requires": "public"
+      },
+      "editing": {
+        "requires": "public"
+      },
+      "inventory_role": {
+        "kind": "non_requirement"
+      },
+      "relation": {
+        "source": "source",
+        "target": "target",
+        "source_kinds": [],
+        "target_kinds": [],
+        "family": "lineage",
+        "acyclic": true,
+        "live_statuses": [
+          "asserted"
+        ]
+      }
+    },
+    {
+      "definition": {
+        "name": "manifest",
+        "version": "1",
+        "fields": [
+          {
+            "name": "title",
+            "required": true,
+            "value_type": {
+              "type": "text"
+            }
+          },
+          {
+            "name": "selection",
+            "required": true,
+            "value_type": {
+              "type": "text"
+            }
+          },
+          {
+            "name": "members",
+            "required": true,
+            "value_type": {
+              "type": "list",
+              "item": {
+                "type": "reference",
+                "form": "revision"
+              }
+            }
+          },
+          {
+            "name": "claim",
+            "required": true,
+            "value_type": {
+              "type": "enum",
+              "values": [
+                "bounded",
+                "exhaustive"
+              ]
+            }
+          },
+          {
+            "name": "scope",
+            "required": false,
+            "value_type": {
+              "type": "text"
+            }
+          }
+        ],
+        "status": {
+          "values": [
+            "draft",
+            "published",
+            "withdrawn"
+          ],
+          "initial": "draft",
+          "transitions": [
+            {
+              "from": "draft",
+              "to": "published",
+              "admission": {
+                "requires": "authority",
+                "scope": "norm.accept"
+              }
+            },
+            {
+              "from": "draft",
+              "to": "withdrawn",
+              "admission": {
+                "requires": "public"
+              }
+            },
+            {
+              "from": "published",
+              "to": "withdrawn",
+              "admission": {
+                "requires": "authority",
+                "scope": "norm.accept"
+              }
+            }
+          ]
+        }
+      },
+      "creation": {
+        "requires": "public"
+      },
+      "editing": {
+        "requires": "public"
+      },
+      "inventory_role": {
+        "kind": "non_requirement"
+      },
+      "manifest": {
+        "members": "members",
+        "claim": "claim",
+        "exhaustive": "exhaustive",
+        "scope": "scope"
+      }
+    },
+    {
+      "definition": {
+        "name": "correspondence",
+        "version": "1",
+        "fields": [
+          {
+            "name": "sources",
+            "required": true,
+            "value_type": {
+              "type": "list",
+              "item": {
+                "type": "reference",
+                "form": "revision"
+              }
+            }
+          },
+          {
+            "name": "targets",
+            "required": true,
+            "value_type": {
+              "type": "list",
+              "item": {
+                "type": "reference",
+                "form": "revision"
+              }
+            }
+          },
+          {
+            "name": "claim",
+            "required": true,
+            "value_type": {
+              "type": "enum",
+              "values": [
+                "split",
+                "merge",
+                "equivalence",
+                "preserves",
+                "method"
+              ]
+            }
+          },
+          {
+            "name": "property",
+            "required": false,
+            "value_type": {
+              "type": "text"
+            }
+          },
+          {
+            "name": "direction",
+            "required": true,
+            "value_type": {
+              "type": "enum",
+              "values": [
+                "forward",
+                "backward",
+                "both"
+              ]
+            }
+          },
+          {
+            "name": "witness",
+            "required": true,
+            "value_type": {
+              "type": "text"
+            }
+          },
+          {
+            "name": "mode",
+            "required": true,
+            "value_type": {
+              "type": "enum",
+              "values": [
+                "attested",
+                "checked"
+              ]
+            }
+          },
+          {
+            "name": "reliance",
+            "required": true,
+            "value_type": {
+              "type": "text"
+            }
+          }
+        ],
+        "status": {
+          "values": [
+            "proposed",
+            "attested",
+            "withdrawn"
+          ],
+          "initial": "proposed",
+          "transitions": [
+            {
+              "from": "proposed",
+              "to": "attested",
+              "admission": {
+                "requires": "authority",
+                "scope": "norm.accept"
+              }
+            },
+            {
+              "from": "proposed",
+              "to": "withdrawn",
+              "admission": {
+                "requires": "public"
+              }
+            },
+            {
+              "from": "attested",
+              "to": "withdrawn",
+              "admission": {
+                "requires": "authority",
+                "scope": "norm.accept"
+              }
+            }
+          ]
+        }
+      },
+      "creation": {
+        "requires": "public"
+      },
+      "editing": {
+        "requires": "public"
+      },
+      "inventory_role": {
+        "kind": "non_requirement"
+      },
+      "correspondence": {
+        "sources": "sources",
+        "targets": "targets",
+        "claim": "claim"
+      }
     }
   ],
   "owner_scopes": [

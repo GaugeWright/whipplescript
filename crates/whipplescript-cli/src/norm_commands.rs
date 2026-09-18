@@ -15,7 +15,8 @@ use whipplescript_kernel::norm_governance::{NormGovernanceVerifier, NormPrincipa
 use whipplescript_kernel::norm_public_key::{NormPublicKeyBinding, NormPublicKeyVerifier};
 use whipplescript_store::items::WorkItemStore;
 use whipplescript_store::norm::{
-    NormAct, NormCharter, NormCheckpoint, NormStatement, NormVerifier, SignedNormEvent,
+    NormAct, NormCharter, NormCheckpoint, NormPremises, NormStatement, NormVerifier,
+    SignedNormEvent,
 };
 use whipplescript_store::norm_commands::{
     NormCommand, NormCommandHost, NormCommandRequest, NormResourcePoint,
@@ -103,7 +104,17 @@ impl<'a> Arguments<'a> {
             "sign" => (0, &["--as", "--statement"]),
             "cosign" => (0, &["--as", "--event"]),
             "bootstrap" => (0, &["--as", "--creator", "--charter", "--nonce", "--at"]),
-            "create" | "edit" => (1, &["--as", "--fields", "--nonce", "--at"]),
+            "create" | "edit" => (
+                1,
+                &[
+                    "--as",
+                    "--fields",
+                    "--family-basis",
+                    "--references",
+                    "--nonce",
+                    "--at",
+                ],
+            ),
             "publish-observation" => (3, &["--as", "--at"]),
             "enqueue-observation" => (
                 3,
@@ -115,7 +126,10 @@ impl<'a> Arguments<'a> {
                     "--deadline",
                 ],
             ),
-            "transition" | "retire" => (2, &["--as", "--nonce", "--at"]),
+            "transition" | "retire" => (
+                2,
+                &["--as", "--family-basis", "--references", "--nonce", "--at"],
+            ),
             "rotate" => (0, &["--as", "--successor", "--nonce", "--at"]),
             _ => {
                 // MUTATION-SUCCESS-EXPR: Ok(Self { verb: "snapshot", positional: Vec::new(), flags: BTreeMap::new() })
@@ -578,6 +592,25 @@ fn execute(args: &[String], runtime_path: &std::path::Path) -> Result<Value, Str
                     .map(|value| (*value).into())
                     .unwrap_or_else(super::now_stamp),
                 action,
+                // DR-0122: an act on a relation binds the family basis the
+                // caller captured from a snapshot and validated against. The
+                // door refuses a moved basis; nothing here substitutes a fresh one.
+                premises: match (
+                    args.flags.get("--family-basis"),
+                    args.flags.get("--references"),
+                    args.flags.get("--inventory-frontier"),
+                ) {
+                    (None, None, None) => None,
+                    (basis, references, frontier) => Some(NormPremises {
+                        family_basis: basis.map(|basis| (*basis).into()),
+                        references: references
+                            .map(|list| list.split(',').map(str::to_owned).collect())
+                            .unwrap_or_default(),
+                        inventory_frontier: frontier
+                            .map(|list| list.split(',').map(str::to_owned).collect())
+                            .unwrap_or_default(),
+                    }),
+                },
             };
             let signature = signer.sign(&statement)?;
             let successor_signature = if args.verb == "rotate" {

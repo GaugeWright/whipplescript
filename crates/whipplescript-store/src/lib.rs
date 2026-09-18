@@ -40,9 +40,12 @@ pub mod native_stores;
 pub mod norm;
 pub mod norm_artifact;
 pub mod norm_commands;
+pub mod norm_correspondence;
 pub mod norm_history;
 pub mod norm_inventory;
+pub mod norm_manifests;
 pub mod norm_publication;
+pub mod norm_relations;
 pub mod norm_resources;
 #[cfg(feature = "native")]
 pub mod payload_protection;

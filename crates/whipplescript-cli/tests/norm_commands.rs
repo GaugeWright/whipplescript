@@ -893,6 +893,7 @@ fn norm_cli_restores_hosted_p256_history_with_public_bindings_only() {
                 owner_scopes: vec![],
             },
         },
+        premises: None,
     };
     let signature = hex(key
         .sign(&rng, &statement.signing_bytes().expect("bytes"))

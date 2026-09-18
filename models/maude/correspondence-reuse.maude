@@ -1,0 +1,63 @@
+--- DR-0122 §13.3: a correspondence carries a scoped preservation claim and
+--- never an approval. One accepted, supported requirement splits into two
+--- successors under a witnessed correspondence. Support is reused only under
+--- an authorized rule; activation of a successor is an admitted act, which a
+--- previously authorized policy may perform and the correspondence never
+--- implies. Witness adequacy, evidence premises and authority scopes are not
+--- modeled beyond their presence.
+mod CORRESPONDENCE-REUSE is
+  protecting BOOL .
+  sorts Req Fact Cfg State .
+  ops r r1 r2 : -> Req [ctor] .
+  subsort Fact < Cfg .
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+  op {_} : Cfg -> State [ctor] .
+  ops accepted proposed active : Req -> Fact [ctor] .
+  --- direct support for a requirement, and support derived through a correspondence
+  ops support derived : Req -> Fact [ctor] .
+  --- the split correspondence: the successors' conjunction preserves the original
+  op split : Req Req Req -> Fact [ctor] .
+  --- an authorized rule permitting reuse across the split
+  op reuseRule : -> Fact [ctor] .
+  --- an admitted activation act, and a previously authorized policy that performs one
+  op activation : Req -> Fact [ctor] .
+  op autoActivate : -> Fact [ctor] .
+  vars P Q S : Req .
+  var C : Cfg .
+  var F : Fact .
+  op has : Fact Cfg -> Bool .
+  eq has(F, F C) = true .
+  eq has(F, C) = false [owise] .
+  --- support is reused across the split only under the rule, and only from
+  --- the original's own support; a derivation is recorded once
+  crl [reuse] : { split(P, Q, S) support(P) reuseRule C }
+    => { split(P, Q, S) support(P) reuseRule derived(Q) derived(S) C }
+    if not has(derived(Q), C) .
+  --- a proposed successor becomes active through an admitted act
+  rl [activate] : { proposed(Q) activation(Q) C } => { active(Q) C } .
+  --- a previously authorized policy admits the act itself, with the policy as
+  --- its basis; the correspondence is a premise of the policy, not the act
+  crl [policy-act] : { split(P, Q, S) accepted(P) proposed(Q) autoActivate C }
+    => { split(P, Q, S) accepted(P) proposed(Q) activation(Q) autoActivate C }
+    if not has(activation(Q), C) .
+  crl [policy-act-other] : { split(P, Q, S) accepted(P) proposed(S) autoActivate C }
+    => { split(P, Q, S) accepted(P) proposed(S) activation(S) autoActivate C }
+    if not has(activation(S), C) .
+endm
+
+--- Weakening: reuse by resemblance. The split alone carries support across.
+mod CORRESPONDENCE-REUSE-RESEMBLANCE is
+  including CORRESPONDENCE-REUSE .
+  vars P Q S : Req . var C : Cfg .
+  crl [reuse-unruled] : { split(P, Q, S) support(P) C } => { split(P, Q, S) support(P) derived(Q) derived(S) C }
+    if not has(derived(Q), C) .
+endm
+
+--- Weakening: the correspondence transplants the original's acceptance onto
+--- its successors.
+mod CORRESPONDENCE-REUSE-TRANSPLANT is
+  including CORRESPONDENCE-REUSE .
+  vars P Q S : Req . var C : Cfg .
+  rl [activate-by-split] : { split(P, Q, S) accepted(P) proposed(Q) C } => { split(P, Q, S) accepted(P) active(Q) C } .
+endm

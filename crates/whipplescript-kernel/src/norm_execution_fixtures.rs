@@ -46,6 +46,7 @@ pub fn sign(nonce: &str, action: NormAct) -> SignedNormEvent {
         nonce: nonce.into(),
         created_at: "2026-09-09T00:00:00Z".into(),
         action,
+        premises: None,
     };
     let signature = sha256_hex(
         &statement
@@ -128,6 +129,21 @@ pub fn fixture_with_custom_observation(
         .expect("valid norm preparation fixture")
         .reference()
         .clone();
+    // The bundled relations name the obligation kind; a renamed vocabulary is
+    // renamed wherever the charter names it, or the charter is not one.
+    for entry in &mut charter.vocabularies {
+        if let Some(relation) = entry.relation.as_mut() {
+            for kind in relation
+                .source_kinds
+                .iter_mut()
+                .chain(relation.target_kinds.iter_mut())
+            {
+                if kind == "obligation" {
+                    *kind = "local-duty".into();
+                }
+            }
+        }
+    }
     let ledger = store
         .append_norm_event(
             &sign(

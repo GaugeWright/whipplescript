@@ -18913,12 +18913,22 @@ mod norm_admission_tests {
         }
     }
     fn signed(actor: NormActor, key: &SigningKey, nonce: &str, action: NormAct) -> SignedNormEvent {
+        signed_with(actor, key, nonce, action, None)
+    }
+    fn signed_with(
+        actor: NormActor,
+        key: &SigningKey,
+        nonce: &str,
+        action: NormAct,
+        premises: Option<NormPremises>,
+    ) -> SignedNormEvent {
         let statement = NormStatement {
             protocol: "whipplescript.norm/v1".into(),
             actor,
             nonce: nonce.into(),
             created_at: "2026-09-05T00:00:00Z".into(),
             action,
+            premises,
         };
         let signature: Signature = key.sign(&statement.signing_bytes().expect("bytes"));
         SignedNormEvent {
@@ -18929,6 +18939,9 @@ mod norm_admission_tests {
     }
     fn charter() -> NormCharter {
         NormCharter {resource_domains:None,vocabularies:vec![NormVocabulary {
+            relation: None,
+            manifest: None,
+            correspondence: None,
                 editing: None,
                 effectiveness: None,
                 inventory_role: None,
@@ -19304,6 +19317,477 @@ mod norm_admission_tests {
         assert_eq!(restored.norm_checkpoint().unwrap(), Some(checkpoint));
         assert_eq!(restored.norm_view(&verifier).unwrap().owner, actors[2]);
     }
+    /// DR-0122: the relation door is one implementation on both hosts. The
+    /// same authenticated history binds the same family basis, admits the same
+    /// edges, and refuses the same stale basis and the same cycle.
+    #[test]
+    fn norm_native_and_do_bind_the_same_relation_family_basis() {
+        use whipplescript_store::norm_commands::NormCommandStore;
+        let owner_key = SigningKey::from_slice(&[1; 32]).unwrap();
+        let worker_key = SigningKey::from_slice(&[2; 32]).unwrap();
+        let owner = actor("owner", &owner_key);
+        let worker = actor("worker", &worker_key);
+        let owner_root = crate::governance::GaugeDeskGovernanceRoot::new("owner", &owner.key_id);
+        let worker_root = crate::governance::GaugeDeskGovernanceRoot::new("worker", &worker.key_id);
+        let verifier = NormGovernanceVerifier::new(
+            vec![
+                NormPrincipalBinding {
+                    actor: owner.clone(),
+                    verifier: &owner_root,
+                },
+                NormPrincipalBinding {
+                    actor: worker.clone(),
+                    verifier: &worker_root,
+                },
+            ],
+            BTreeSet::from([("worker".into(), "owner".into())]),
+        )
+        .unwrap();
+        let c = NormCharter::bundled().unwrap();
+        let reference = |name: &str| {
+            Vocabulary::new(
+                c.vocabularies
+                    .iter()
+                    .find(|entry| entry.definition.name == name)
+                    .unwrap()
+                    .definition
+                    .clone(),
+            )
+            .unwrap()
+            .reference()
+            .clone()
+        };
+        let mut native = whipplescript_store::items::WorkItemStore::open_in_memory().unwrap();
+        let mut hosted = test_support::store();
+        let bootstrap = signed(
+            owner.clone(),
+            &owner_key,
+            "relations",
+            NormAct::Bootstrap {
+                creator: "worker".into(),
+                charter: c.clone(),
+            },
+        );
+        let ledger = native.append_norm_event(&bootstrap, &verifier).unwrap();
+        assert_eq!(
+            hosted.append_norm_event(&bootstrap, &verifier).unwrap(),
+            ledger
+        );
+        let both = |native: &mut whipplescript_store::items::WorkItemStore,
+                    hosted: &mut DoSqliteStore<test_support::RusqliteDoSql>,
+                    event: &SignedNormEvent| {
+            let native_result = native.append_norm_event(event, &verifier);
+            let hosted_result = hosted.append_norm_event(event, &verifier);
+            match (&native_result, &hosted_result) {
+                (Ok(a), Ok(b)) => assert_eq!(a, b),
+                (Err(a), Err(b)) => assert_eq!(format!("{a:?}"), format!("{b:?}")),
+                other => panic!("hosts disagree: {other:?}"),
+            }
+            native_result
+        };
+        let obligation = |name: &str| {
+            signed(
+                worker.clone(),
+                &worker_key,
+                name,
+                NormAct::Create {
+                    ledger: ledger.clone(),
+                    authority: None,
+                    vocabulary: reference("obligation"),
+                    fields_json: serde_json::json!({"name": name, "proposition": "holds", "domain": "src/", "subject": "src/x.py"}).to_string(),
+                },
+            )
+        };
+        let a = both(&mut native, &mut hosted, &obligation("a")).unwrap();
+        let b = both(&mut native, &mut hosted, &obligation("b")).unwrap();
+        let c_ = both(&mut native, &mut hosted, &obligation("c")).unwrap();
+        let relate = |nonce: &str, source: &str, target: &str, basis: &str| {
+            signed_with(
+                worker.clone(),
+                &worker_key,
+                nonce,
+                NormAct::Create {
+                    ledger: ledger.clone(),
+                    authority: None,
+                    vocabulary: reference("refines"),
+                    fields_json: serde_json::json!({"source": source, "target": target})
+                        .to_string(),
+                },
+                Some(NormPremises {
+                    family_basis: Some(basis.into()),
+                    references: vec![source.into(), target.into()],
+                    inventory_frontier: Vec::new(),
+                }),
+            )
+        };
+        let families =
+            |native: &whipplescript_store::items::WorkItemStore,
+             hosted: &DoSqliteStore<test_support::RusqliteDoSql>| {
+                let native_families = native
+                    .norm_state(&verifier)
+                    .unwrap()
+                    .relation_families()
+                    .unwrap();
+                let hosted_families = hosted
+                    .norm_state(&verifier)
+                    .unwrap()
+                    .relation_families()
+                    .unwrap();
+                assert_eq!(native_families, hosted_families);
+                native_families
+            };
+        let empty = families(&native, &hosted)["refinement"].basis.clone();
+        assert_eq!(empty, ledger);
+        both(&mut native, &mut hosted, &relate("ab", &a, &b, &empty)).unwrap();
+        assert!(both(
+            &mut native,
+            &mut hosted,
+            &relate("bc-stale", &b, &c_, &empty)
+        )
+        .is_err());
+        let after_ab = families(&native, &hosted)["refinement"].basis.clone();
+        both(&mut native, &mut hosted, &relate("bc", &b, &c_, &after_ab)).unwrap();
+        let after_bc = families(&native, &hosted)["refinement"].basis.clone();
+        assert!(both(&mut native, &mut hosted, &relate("ca", &c_, &a, &after_bc)).is_err());
+        let refinement = &families(&native, &hosted)["refinement"];
+        assert_eq!(refinement.basis, after_bc);
+        assert_eq!(refinement.edges.len(), 2);
+    }
+
+    /// DR-0122: the manifest door and the judgment derived at the bound
+    /// frontier are one implementation on both hosts.
+    #[test]
+    fn norm_native_and_do_judge_the_same_manifest_completeness() {
+        use whipplescript_store::norm_commands::{
+            NormCommand, NormCommandHost, NormCommandRequest, NormCommandResult,
+        };
+        use whipplescript_store::norm_manifests::ManifestCompleteness;
+        let owner_key = SigningKey::from_slice(&[1; 32]).unwrap();
+        let worker_key = SigningKey::from_slice(&[2; 32]).unwrap();
+        let owner = actor("owner", &owner_key);
+        let worker = actor("worker", &worker_key);
+        let owner_root = crate::governance::GaugeDeskGovernanceRoot::new("owner", &owner.key_id);
+        let worker_root = crate::governance::GaugeDeskGovernanceRoot::new("worker", &worker.key_id);
+        let verifier = NormGovernanceVerifier::new(
+            vec![
+                NormPrincipalBinding {
+                    actor: owner.clone(),
+                    verifier: &owner_root,
+                },
+                NormPrincipalBinding {
+                    actor: worker.clone(),
+                    verifier: &worker_root,
+                },
+            ],
+            BTreeSet::from([("worker".into(), "owner".into())]),
+        )
+        .unwrap();
+        let c = NormCharter::bundled().unwrap();
+        let reference = |name: &str| {
+            Vocabulary::new(
+                c.vocabularies
+                    .iter()
+                    .find(|entry| entry.definition.name == name)
+                    .unwrap()
+                    .definition
+                    .clone(),
+            )
+            .unwrap()
+            .reference()
+            .clone()
+        };
+        let mut native = whipplescript_store::items::WorkItemStore::open_in_memory().unwrap();
+        let mut hosted = test_support::store();
+        let bootstrap = signed(
+            owner.clone(),
+            &owner_key,
+            "manifests",
+            NormAct::Bootstrap {
+                creator: "worker".into(),
+                charter: c.clone(),
+            },
+        );
+        let ledger = native.append_norm_event(&bootstrap, &verifier).unwrap();
+        assert_eq!(
+            hosted.append_norm_event(&bootstrap, &verifier).unwrap(),
+            ledger
+        );
+        let both = |native: &mut whipplescript_store::items::WorkItemStore,
+                    hosted: &mut DoSqliteStore<test_support::RusqliteDoSql>,
+                    event: &SignedNormEvent| {
+            let native_result = native.append_norm_event(event, &verifier);
+            let hosted_result = hosted.append_norm_event(event, &verifier);
+            match (&native_result, &hosted_result) {
+                (Ok(a), Ok(b)) => assert_eq!(a, b),
+                (Err(a), Err(b)) => assert_eq!(format!("{a:?}"), format!("{b:?}")),
+                other => panic!("hosts disagree: {other:?}"),
+            }
+            native_result
+        };
+        let requirement = |name: &str| {
+            signed(
+                worker.clone(),
+                &worker_key,
+                name,
+                NormAct::Create {
+                    ledger: ledger.clone(),
+                    authority: None,
+                    vocabulary: reference("obligation"),
+                    fields_json: serde_json::json!({"name": name, "proposition": "holds", "domain": "src/", "subject": "src/x.py"}).to_string(),
+                },
+            )
+        };
+        let accept = |nonce: &str, record: &str| {
+            signed(
+                owner.clone(),
+                &owner_key,
+                nonce,
+                NormAct::Transition {
+                    ledger: ledger.clone(),
+                    authority: None,
+                    vocabulary: reference("obligation"),
+                    record: record.into(),
+                    previous: record.into(),
+                    status: "accepted".into(),
+                },
+            )
+        };
+        let r1 = both(&mut native, &mut hosted, &requirement("r1")).unwrap();
+        both(&mut native, &mut hosted, &accept("accept-r1", &r1)).unwrap();
+        let r2 = both(&mut native, &mut hosted, &requirement("r2")).unwrap();
+        both(&mut native, &mut hosted, &accept("accept-r2", &r2)).unwrap();
+        fn take_snapshot<S: whipplescript_store::norm_commands::NormCommandStore>(
+            store: &mut S,
+            verifier: &dyn whipplescript_store::norm::NormVerifier,
+        ) -> whipplescript_store::norm_commands::NormSnapshot {
+            let response = NormCommandHost::new(store, verifier)
+                .execute(NormCommandRequest::new(NormCommand::Snapshot {}))
+                .unwrap();
+            let NormCommandResult::Snapshot { snapshot } = response.result else {
+                panic!("snapshot expected");
+            };
+            *snapshot
+        }
+        let snapshots =
+            |native: &mut whipplescript_store::items::WorkItemStore,
+             hosted: &mut DoSqliteStore<test_support::RusqliteDoSql>| {
+                let native_snapshot = take_snapshot(native, &verifier);
+                let hosted_snapshot = take_snapshot(hosted, &verifier);
+                assert_eq!(native_snapshot.manifests, hosted_snapshot.manifests);
+                assert_eq!(native_snapshot.families, hosted_snapshot.families);
+                assert_eq!(native_snapshot.frontier, hosted_snapshot.frontier);
+                native_snapshot
+            };
+        let before = snapshots(&mut native, &mut hosted);
+        let revisions: Vec<String> = [&r1, &r2]
+            .iter()
+            .map(|id| {
+                before
+                    .records
+                    .iter()
+                    .find(|named| &named.record.id == *id)
+                    .unwrap()
+                    .record
+                    .content_head
+                    .clone()
+            })
+            .collect();
+        let manifest = |nonce: &str, members: &[String], claim: &str, frontier: Vec<String>| {
+            signed_with(
+                worker.clone(),
+                &worker_key,
+                nonce,
+                NormAct::Create {
+                    ledger: ledger.clone(),
+                    authority: None,
+                    vocabulary: reference("manifest"),
+                    fields_json: serde_json::json!({"title": nonce, "selection": "all", "members": members, "claim": claim}).to_string(),
+                },
+                Some(NormPremises {
+                    family_basis: None,
+                    references: members.to_vec(),
+                    inventory_frontier: frontier,
+                }),
+            )
+        };
+        let complete = both(
+            &mut native,
+            &mut hosted,
+            &manifest(
+                "complete",
+                &revisions,
+                "exhaustive",
+                before.frontier.clone(),
+            ),
+        )
+        .unwrap();
+        let partial = both(
+            &mut native,
+            &mut hosted,
+            &manifest(
+                "partial",
+                &revisions[..1],
+                "exhaustive",
+                before.frontier.clone(),
+            ),
+        )
+        .unwrap();
+        assert!(both(
+            &mut native,
+            &mut hosted,
+            &manifest("unbased", &revisions, "exhaustive", Vec::new())
+        )
+        .is_err());
+        let judged = snapshots(&mut native, &mut hosted).manifests;
+        assert_eq!(
+            judged[&complete].completeness,
+            ManifestCompleteness::Complete {
+                basis: before.frontier.clone()
+            }
+        );
+        assert!(matches!(
+            &judged[&partial].completeness,
+            ManifestCompleteness::Incomplete { missing, .. } if missing == &vec![revisions[1].clone()]
+        ));
+    }
+
+    /// DR-0122: the correspondence door is one implementation on both hosts,
+    /// and a correspondence touches no record it relates on either.
+    #[test]
+    fn norm_native_and_do_admit_the_same_correspondence_and_activate_nothing() {
+        use whipplescript_store::norm_commands::NormCommandStore;
+        let owner_key = SigningKey::from_slice(&[1; 32]).unwrap();
+        let worker_key = SigningKey::from_slice(&[2; 32]).unwrap();
+        let owner = actor("owner", &owner_key);
+        let worker = actor("worker", &worker_key);
+        let owner_root = crate::governance::GaugeDeskGovernanceRoot::new("owner", &owner.key_id);
+        let worker_root = crate::governance::GaugeDeskGovernanceRoot::new("worker", &worker.key_id);
+        let verifier = NormGovernanceVerifier::new(
+            vec![
+                NormPrincipalBinding {
+                    actor: owner.clone(),
+                    verifier: &owner_root,
+                },
+                NormPrincipalBinding {
+                    actor: worker.clone(),
+                    verifier: &worker_root,
+                },
+            ],
+            BTreeSet::from([("worker".into(), "owner".into())]),
+        )
+        .unwrap();
+        let c = NormCharter::bundled().unwrap();
+        let reference = |name: &str| {
+            Vocabulary::new(
+                c.vocabularies
+                    .iter()
+                    .find(|entry| entry.definition.name == name)
+                    .unwrap()
+                    .definition
+                    .clone(),
+            )
+            .unwrap()
+            .reference()
+            .clone()
+        };
+        let mut native = whipplescript_store::items::WorkItemStore::open_in_memory().unwrap();
+        let mut hosted = test_support::store();
+        let bootstrap = signed(
+            owner.clone(),
+            &owner_key,
+            "correspondence",
+            NormAct::Bootstrap {
+                creator: "worker".into(),
+                charter: c.clone(),
+            },
+        );
+        let ledger = native.append_norm_event(&bootstrap, &verifier).unwrap();
+        assert_eq!(
+            hosted.append_norm_event(&bootstrap, &verifier).unwrap(),
+            ledger
+        );
+        let both = |native: &mut whipplescript_store::items::WorkItemStore,
+                    hosted: &mut DoSqliteStore<test_support::RusqliteDoSql>,
+                    event: &SignedNormEvent| {
+            let native_result = native.append_norm_event(event, &verifier);
+            let hosted_result = hosted.append_norm_event(event, &verifier);
+            match (&native_result, &hosted_result) {
+                (Ok(a), Ok(b)) => assert_eq!(a, b),
+                (Err(a), Err(b)) => assert_eq!(format!("{a:?}"), format!("{b:?}")),
+                other => panic!("hosts disagree: {other:?}"),
+            }
+            native_result
+        };
+        let requirement = |name: &str| {
+            signed(
+                worker.clone(),
+                &worker_key,
+                name,
+                NormAct::Create {
+                    ledger: ledger.clone(),
+                    authority: None,
+                    vocabulary: reference("obligation"),
+                    fields_json: serde_json::json!({"name": name, "proposition": "holds", "domain": "src/", "subject": "src/x.py"}).to_string(),
+                },
+            )
+        };
+        let r = both(&mut native, &mut hosted, &requirement("r")).unwrap();
+        let r1 = both(&mut native, &mut hosted, &requirement("r1")).unwrap();
+        let r2 = both(&mut native, &mut hosted, &requirement("r2")).unwrap();
+        let correspond = |nonce: &str, sources: Vec<String>, targets: Vec<String>, bind: bool| {
+            signed_with(
+                worker.clone(),
+                &worker_key,
+                nonce,
+                NormAct::Create {
+                    ledger: ledger.clone(),
+                    authority: None,
+                    vocabulary: reference("correspondence"),
+                    fields_json: serde_json::json!({
+                        "sources": sources, "targets": targets, "claim": "split",
+                        "direction": "forward", "witness": "review", "mode": "attested",
+                        "reliance": "norm.accept"
+                    })
+                    .to_string(),
+                },
+                Some(NormPremises {
+                    family_basis: None,
+                    references: if bind {
+                        sources.iter().chain(&targets).cloned().collect()
+                    } else {
+                        Vec::new()
+                    },
+                    inventory_frontier: Vec::new(),
+                }),
+            )
+        };
+        let split = both(
+            &mut native,
+            &mut hosted,
+            &correspond("split", vec![r.clone()], vec![r1.clone(), r2.clone()], true),
+        )
+        .unwrap();
+        assert!(both(
+            &mut native,
+            &mut hosted,
+            &correspond("unbound", vec![r.clone()], vec![r1.clone()], false)
+        )
+        .is_err());
+        assert!(both(
+            &mut native,
+            &mut hosted,
+            &correspond("self", vec![r.clone()], vec![r.clone()], true)
+        )
+        .is_err());
+        let native_view = native.norm_state(&verifier).unwrap();
+        let hosted_view = hosted.norm_state(&verifier).unwrap();
+        assert_eq!(native_view.records, hosted_view.records);
+        assert_eq!(native_view.records[&split].status, "proposed");
+        assert_eq!(native_view.records[&r1].status, "proposed");
+        assert_eq!(native_view.records[&r2].status, "proposed");
+        assert!(native_view.effective_records.is_empty());
+    }
+
     #[test]
     fn norm_do_bundled_edits_and_local_aliases_match_native_records() {
         let owner_key = SigningKey::from_slice(&[1; 32]).unwrap();

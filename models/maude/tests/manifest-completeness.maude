@@ -1,0 +1,37 @@
+load ../manifest-completeness.maude
+--- positive: a well-formed manifest covering the visible whole inventory is
+--- judged complete with that inventory as its basis
+search [1] in MANIFEST-COMPLETENESS : { manifest((rev(r1), rev(r2))) inventory(r1 r2) visible(r1 r2) judgeStructure judgeCompleteness }
+  =>* { structural(true) judged(complete(r1 r2)) RESIDUAL:Cfg } .
+--- positive: structurally valid and incomplete are reported as two results
+search [1] in MANIFEST-COMPLETENESS : { manifest(rev(r1)) inventory(r1 r2) visible(r1 r2) judgeStructure judgeCompleteness }
+  =>* { structural(true) judged(incomplete(r1 r2)) RESIDUAL:Cfg } .
+--- refusal: an incomplete manifest is never judged complete
+search in MANIFEST-COMPLETENESS : { manifest(rev(r1)) inventory(r1 r2) visible(r1 r2) judgeStructure judgeCompleteness }
+  =>* { judged(complete(I:Obls)) RESIDUAL:Cfg } .
+--- weakening: folding completeness into structure judges it complete
+search [1] in MANIFEST-COMPLETENESS-FOLDED : { manifest(rev(r1)) inventory(r1 r2) visible(r1 r2) judgeStructure judgeCompleteness }
+  =>* { judged(complete(I:Obls)) RESIDUAL:Cfg } .
+--- positive: an alias member is structurally invalid, and completeness is still
+--- judged on the revision members it does have
+search [1] in MANIFEST-COMPLETENESS : { manifest((rev(r1), alias(r2))) inventory(r1 r2) visible(r1 r2) judgeStructure judgeCompleteness }
+  =>* { structural(false) judged(incomplete(r1 r2)) RESIDUAL:Cfg } .
+--- refusal: an exhaustiveness claim without a basis never yields completeness
+search in MANIFEST-COMPLETENESS : { manifest(rev(r1)) inventory(r1 r2) claimExhaustive judgeStructure judgeCompleteness }
+  =>* { judged(complete(I:Obls)) RESIDUAL:Cfg } .
+--- positive: the claim is refused, visibly
+search [1] in MANIFEST-COMPLETENESS : { manifest(rev(r1)) inventory(r1 r2) claimExhaustive judgeStructure judgeCompleteness }
+  =>* { judged(refusedClaim) RESIDUAL:Cfg } .
+--- weakening: taking the claim as the basis yields completeness
+search [1] in MANIFEST-COMPLETENESS-CLAIMED : { manifest(rev(r1)) inventory(r1 r2) claimExhaustive judgeStructure judgeCompleteness }
+  =>* { judged(complete(I:Obls)) RESIDUAL:Cfg } .
+--- positive: with a partial view the judgment is bounded by what was visible
+search [1] in MANIFEST-COMPLETENESS : { manifest(rev(r1)) inventory(r1 r2) visible(r1) judgeStructure judgeCompleteness }
+  =>* { judged(bounded(r1)) RESIDUAL:Cfg } .
+--- refusal: a partial view never yields a total completeness judgment
+search in MANIFEST-COMPLETENESS : { manifest(rev(r1)) inventory(r1 r2) visible(r1) judgeStructure judgeCompleteness }
+  =>* { judged(complete(I:Obls)) RESIDUAL:Cfg } .
+--- weakening: inferring the whole from the visible subset yields one
+search [1] in MANIFEST-COMPLETENESS-SUBSET : { manifest(rev(r1)) inventory(r1 r2) visible(r1) judgeStructure judgeCompleteness }
+  =>* { judged(complete(I:Obls)) RESIDUAL:Cfg } .
+quit .

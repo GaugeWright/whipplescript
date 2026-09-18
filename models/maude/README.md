@@ -35,6 +35,32 @@ Runtime and host fixtures establish the correspondence to captured plans and
 durable terminal evidence.
 
 
+`relation-validation-scope.maude` models DR-0122 §13.4: a candidate edge in an
+acyclic relation family is captured against the family's edge set, and the
+strong door commits only on the basis it captured, re-evaluating when the
+family has moved. Ten searches include three refusals — a cycle through a
+longer path, both edges of a two-cycle captured against the same empty family,
+and any cyclic family at all — each paired with a weakening that admits it:
+a door that binds only the endpoint records, and validation that checks only
+the immediate reverse edge. Records, aliases and cardinality are not modeled.
+
+`manifest-completeness.maude` models DR-0122 §13.1: structural validity and
+completeness are separate judgments, completeness names its inventory basis,
+an exhaustiveness claim without a basis is refused, and a partial view yields
+a bounded judgment and never a total one. Eleven searches include three
+refusals, each paired with a weakening: completeness folded into structure,
+the author's claim taken as the basis, and totality inferred from the visible
+subset. Selection rules and the admission certificate are not modeled.
+
+`correspondence-reuse.maude` models DR-0122 §13.3: a split's correspondence
+lets the original's support be reused for its successors only under an
+authorized rule, and activates nothing; activation is an admitted act, which
+a previously authorized policy may perform for either successor. Nine
+searches include three refusals — reuse without the rule, activation from
+reuse, and the act for one successor activating the other — with weakenings
+for reuse by resemblance and for a door that transplants acceptance across
+the split. Witness adequacy and evidence premises are not modeled.
+
 Maude is the primary executable-spec target for the WhippleScript kernel and
 for the package/library lowering pipeline.
 
