@@ -36,9 +36,20 @@ cd "$ROOT"
 
 BASE_REF="${1:-origin/main}"
 
+# `prerequisites` arrives exported from scripts/check.sh, which sets it to
+# best-effort for the bar and to required for the gate. A direct invocation
+# carries no word and is someone asking for this check by name, so it defaults
+# to required here.
 command -v cargo-audit >/dev/null || {
-    echo "cargo-audit is not installed; run: cargo install cargo-audit" >&2
-    exit 1
+    if [ "${prerequisites:-required}" = required ]; then
+        echo "the new-advisory check requires cargo-audit." >&2
+        echo "install: cargo install cargo-audit" >&2
+        exit 1
+    fi
+    echo "-- new-advisory check SKIPPED: cargo-audit is not installed --" >&2
+    echo "   the check CI job installs it and runs this on every pull request." >&2
+    echo "   To close the gap locally: cargo install cargo-audit" >&2
+    exit 0
 }
 
 if ! BASE="$(git merge-base "$BASE_REF" HEAD 2>/dev/null)"; then

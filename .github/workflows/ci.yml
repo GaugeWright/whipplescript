@@ -199,7 +199,12 @@ jobs:
         # opt-out the green bar fails on missing tooling every run.
         env:
           WHIPPLESCRIPT_CHECK_SKIP_HOSTED: "1"
-        run: scripts/check.sh
+        # `required` is what makes the tool install above load-bearing. A bare
+        # `scripts/check.sh` reports an absent prerequisite and runs everything
+        # else, so a workstation missing one gets an answer about its change
+        # instead of a red bar about itself. This invocation is the enforced
+        # gate, so it refuses.
+        run: scripts/check.sh required
 
   # The Windows leg of the green bar. `scripts/check.sh` runs
   # scripts/check-windows-compile.sh too, and that script — not this job — owns

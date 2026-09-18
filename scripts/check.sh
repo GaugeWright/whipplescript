@@ -3,7 +3,23 @@
 # that runs on every change, and the configured CI gate runs this same script,
 # so a passing run here and a passing gate cannot mean different things.
 #
-#   scripts/check.sh
+#   scripts/check.sh              the bar
+#   scripts/check.sh required     the gate (what ci.yml runs)
+#
+# The word decides what an absent prerequisite means. A tool this host has not
+# installed is not a tool it cannot supply, and GaugeWright's shared agent guide
+# draws the line between them: the bar reports the gap and names the command
+# that closes it, so a run that has answered everything else about the change
+# still says so, while the invocation the gate runs refuses. A gate that fails
+# with a message about the host when it has nothing to say about the change is
+# how a reader learns to wave red through.
+#
+# What the gate covers is unchanged, because ci.yml installs the tools in the
+# step above the invocation and then asks for `required` — so a dropped install
+# step reddens the gate rather than quietly buying itself a skip.
+#
+# Bare is the bar; any word at all — `required`, or a mistyped one — is the
+# gate, so a typo can never quietly buy a skip.
 #
 # The deep suites — formal models, TLA, end-to-end, report schemas, release
 # readiness, and the native provider matrix — are deliberately not here. They
@@ -11,6 +27,33 @@
 # Their entry points remain the individual scripts/check-*.sh.
 set -euo pipefail
 cd "$(dirname "$0")/.."
+
+case "${1:-best-effort}" in
+  best-effort) prerequisites=best-effort ;;
+  *)           prerequisites=required ;;
+esac
+# Exported because the checks this script calls are separate processes, and
+# scripts/check-new-advisories.sh asks the same question about cargo-audit.
+export prerequisites
+
+# A step whose tool this host has not installed. Returns non-zero when the
+# caller must skip, so a guarded step reads `if prerequisite …; then`; under
+# `required` it never returns at all.
+#
+#   $1 the tool, $2 what it gates, $3 the command that installs it,
+#   $4 the CI job that runs it anyway
+prerequisite() {
+  command -v "$1" >/dev/null 2>&1 && return 0
+  if [ "$prerequisites" = required ]; then
+    echo "$2 requires $1." >&2
+    echo "install: $3" >&2
+    exit 1
+  fi
+  echo "-- $2 SKIPPED: $1 is not installed --" >&2
+  echo "   the $4 CI job runs it on every pull request." >&2
+  echo "   To close the gap locally: $3" >&2
+  return 1
+}
 
 # Stage 2 of the Buck2 migration (GaugeWright BUILD.md, DR-0124): each pure
 # section is a Buck2 target declaring what it reads. When this checkout is a
@@ -245,11 +288,10 @@ echo "== supply-chain policy =="
 # already the hard advisory gate over the same RustSec database, and a second
 # one only adds nondeterministic breakage when a new advisory lands. deny.toml
 # says the same at more length.
-command -v cargo-deny >/dev/null || {
-    echo "cargo-deny is not installed; run: cargo install cargo-deny --locked" >&2
-    exit 1
-}
-cargo deny check bans licenses sources
+if prerequisite cargo-deny "the supply-chain policy check" \
+        "cargo install cargo-deny --locked" "check"; then
+    cargo deny check bans licenses sources
+fi
 
 echo "== formatting =="
 cargo fmt --all -- --check
@@ -481,19 +523,35 @@ worker=crates/whipplescript-host-do/worker
 if [ -n "${WHIPPLESCRIPT_CHECK_SKIP_HOSTED:-}" ]; then
     echo "skipped: WHIPPLESCRIPT_CHECK_SKIP_HOSTED is set (a separate job owns these)"
 else
+    # The hard exit here named neither a remedy nor the job that does run this,
+    # so a workstation without the wasm toolchain got a red bar that said only
+    # that it was a workstation. `wrangler` arrives with the worker's own
+    # node_modules, so an absent one is often just an uninstalled tree.
+    missing_hosted=""
     for tool in wasm-bindgen wrangler; do
-        command -v "$tool" >/dev/null 2>&1 || [ -x "$worker/node_modules/.bin/$tool" ] || {
-            echo "missing $tool; the hosted runtime contracts are part of the gate" >&2
-            exit 1
-        }
+        command -v "$tool" >/dev/null 2>&1 || [ -x "$worker/node_modules/.bin/$tool" ] \
+            || missing_hosted="${missing_hosted:+$missing_hosted }$tool"
     done
-    [ -d "$worker/node_modules" ] || npm --prefix "$worker" ci
-    npm --prefix "$worker" test
-    (cd "$worker" && npx tsc --noEmit)
-    # Cosmetic requests must not hold the gate open after the dry-run. Wrangler's
-    # banner stops waiting for its update lookup without cancelling the request.
-    (cd "$worker" && WRANGLER_HIDE_BANNER=true WRANGLER_SEND_METRICS=false \
-        npx wrangler deploy --config wrangler.public.toml --dry-run --outdir dist-ci)
+
+    hosted_install="cargo install wasm-bindgen-cli --locked, and npm --prefix $worker ci"
+    if [ -z "$missing_hosted" ]; then
+        [ -d "$worker/node_modules" ] || npm --prefix "$worker" ci
+        npm --prefix "$worker" test
+        (cd "$worker" && npx tsc --noEmit)
+        # Cosmetic requests must not hold the gate open after the dry-run.
+        # Wrangler's banner stops waiting for its update lookup without
+        # cancelling the request.
+        (cd "$worker" && WRANGLER_HIDE_BANNER=true WRANGLER_SEND_METRICS=false \
+            npx wrangler deploy --config wrangler.public.toml --dry-run --outdir dist-ci)
+    elif [ "$prerequisites" = required ]; then
+        echo "the hosted runtime contracts require:$missing_hosted" >&2
+        echo "install: $hosted_install" >&2
+        exit 1
+    else
+        echo "-- hosted runtime contracts SKIPPED: missing$missing_hosted --" >&2
+        echo "   the hosted-runtime-contracts CI job has this toolchain and runs them on" >&2
+        echo "   every pull request. To close the gap locally: $hosted_install" >&2
+    fi
 fi
 
 echo "== whipplescript green bar PASSED =="
