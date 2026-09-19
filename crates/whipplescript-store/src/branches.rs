@@ -692,6 +692,7 @@ impl BranchStore {
         let connection =
             Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         connection.busy_timeout(crate::STORE_BUSY_TIMEOUT)?;
+        connection.set_prepared_statement_cache_capacity(crate::STATEMENT_CACHE_CAPACITY);
         Ok(Self { connection })
     }
 
@@ -705,6 +706,7 @@ impl BranchStore {
         crate::establish_wal(&connection)?;
         connection.execute_batch("PRAGMA foreign_keys = ON;")?;
         ensure_branch_schema(&connection)?;
+        connection.set_prepared_statement_cache_capacity(crate::STATEMENT_CACHE_CAPACITY);
         Ok(Self { connection })
     }
 
@@ -712,19 +714,19 @@ impl BranchStore {
     pub fn open_in_memory() -> StoreResult<Self> {
         let connection = Connection::open_in_memory()?;
         ensure_branch_schema(&connection)?;
+        connection.set_prepared_statement_cache_capacity(crate::STATEMENT_CACHE_CAPACITY);
         Ok(Self { connection })
     }
 
     fn row_by_id(connection: &Connection, branch_id: &str) -> StoreResult<Option<BranchRow>> {
         let row = connection
-            .query_row(
+            .prepare_cached(
                 "SELECT branch_id, name, parent_branch_id, branch_point_cut_id, \
                  branch_point_manifest_hash, head_cut_id, head_manifest_hash, \
                  adopted_merge_cut_id, status, created_at, updated_at \
                  FROM branches WHERE branch_id = ?1",
-                params![branch_id],
-                map_branch_row,
-            )
+            )?
+            .query_row(params![branch_id], map_branch_row)
             .optional()?;
         Ok(row)
     }
@@ -1135,7 +1137,7 @@ impl Branches for BranchStore {
         let mut rows = Vec::new();
         match status {
             Some(status) => {
-                let mut stmt = self.connection.prepare(
+                let mut stmt = self.connection.prepare_cached(
                     "SELECT branch_id, name, parent_branch_id, branch_point_cut_id, \
                      branch_point_manifest_hash, head_cut_id, head_manifest_hash, \
                      adopted_merge_cut_id, status, created_at, updated_at \
@@ -1147,7 +1149,7 @@ impl Branches for BranchStore {
                 }
             }
             None => {
-                let mut stmt = self.connection.prepare(
+                let mut stmt = self.connection.prepare_cached(
                     "SELECT branch_id, name, parent_branch_id, branch_point_cut_id, \
                      branch_point_manifest_hash, head_cut_id, head_manifest_hash, \
                      adopted_merge_cut_id, status, created_at, updated_at \
@@ -1163,7 +1165,7 @@ impl Branches for BranchStore {
     }
 
     fn list_children(&self, parent_branch_id: &str) -> StoreResult<Vec<BranchRow>> {
-        let mut stmt = self.connection.prepare(
+        let mut stmt = self.connection.prepare_cached(
             "SELECT branch_id, name, parent_branch_id, branch_point_cut_id, \
              branch_point_manifest_hash, head_cut_id, head_manifest_hash, \
              adopted_merge_cut_id, status, created_at, updated_at \
@@ -1702,19 +1704,18 @@ impl Branches for BranchStore {
     fn get_cut(&self, cut_id: &str) -> StoreResult<Option<CutRow>> {
         let row = self
             .connection
-            .query_row(
+            .prepare_cached(
                 "SELECT cut_id, change_id, branch_id, manifest_hash, \
                  parent_cut_id, origin, actor, intent, recorded_at \
                  FROM cuts WHERE cut_id = ?1",
-                params![cut_id],
-                map_cut_row,
-            )
+            )?
+            .query_row(params![cut_id], map_cut_row)
             .optional()?;
         Ok(row)
     }
 
     fn list_cuts(&self, branch_id: &str, limit: usize) -> StoreResult<Vec<CutRow>> {
-        let mut stmt = self.connection.prepare(
+        let mut stmt = self.connection.prepare_cached(
             "SELECT cut_id, change_id, branch_id, manifest_hash, \
              parent_cut_id, origin, actor, intent, recorded_at \
              FROM cuts WHERE branch_id = ?1 ORDER BY rowid DESC LIMIT ?2",
@@ -1797,12 +1798,11 @@ impl Branches for BranchStore {
     fn get_op(&self, op_id: &str) -> StoreResult<Option<OpRow>> {
         let row = self
             .connection
-            .query_row(
+            .prepare_cached(
                 "SELECT seq, op_id, kind, deltas, origin, recorded_at FROM ops \
                  WHERE op_id = ?1",
-                params![op_id],
-                map_op_row,
-            )
+            )?
+            .query_row(params![op_id], map_op_row)
             .optional()?;
         row.transpose()
     }

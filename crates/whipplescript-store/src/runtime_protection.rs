@@ -52,6 +52,7 @@ impl SqliteStore {
         connection: Connection,
         protection: Option<PayloadProtection>,
     ) -> StoreResult<Self> {
+        connection.set_prepared_statement_cache_capacity(crate::STATEMENT_CACHE_CAPACITY);
         let recorded = Self::recorded_protection(&connection)?;
         if recorded.as_deref() != protection.as_ref().map(PayloadProtection::domain) {
             return Err(StoreError::fault(

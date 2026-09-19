@@ -41,7 +41,8 @@ pub(super) fn native_read(
     use rusqlite::OptionalExtension;
     store
         .connection
-        .query_row(SELECT, [cut_id], |row| {
+        .prepare_cached(SELECT)?
+        .query_row([cut_id], |row| {
             Ok(WriteEvidenceRef {
                 schema_ref: row.get(0)?,
                 label_ref: row.get(1)?,

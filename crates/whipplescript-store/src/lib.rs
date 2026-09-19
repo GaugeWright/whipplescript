@@ -3022,7 +3022,7 @@ impl SqliteStore {
         &self,
         parent_instance_id: &str,
     ) -> StoreResult<Vec<WorkflowInvocationView>> {
-        let mut statement = self.connection.prepare(&format!(
+        let mut statement = self.connection.prepare_cached(&format!(
             r#"{WORKFLOW_INVOCATION_SELECT}
     WHERE workflow_invocations.parent_instance_id = ?1
     ORDER BY workflow_invocations.created_at, invocation_id
@@ -3039,17 +3039,14 @@ impl SqliteStore {
         child_instance_id: &str,
     ) -> StoreResult<Option<WorkflowInvocationView>> {
         self.connection
-            .query_row(
-                &format!(
-                    r#"{WORKFLOW_INVOCATION_SELECT}
+            .prepare_cached(&format!(
+                r#"{WORKFLOW_INVOCATION_SELECT}
     WHERE workflow_invocations.child_instance_id = ?1
     ORDER BY workflow_invocations.created_at DESC, invocation_id DESC
     LIMIT 1
     "#
-                ),
-                [child_instance_id],
-                workflow_invocation_from_row,
-            )
+            ))?
+            .query_row([child_instance_id], workflow_invocation_from_row)
             .optional()
             .map_err(Into::into)
     }
@@ -3874,7 +3871,7 @@ impl SqliteStore {
                 return Ok(Vec::new());
             }
         }
-        let mut statement = self.connection.prepare(
+        let mut statement = self.connection.prepare_cached(
             &format!(r#"
             SELECT
                 candidate.effect_id,
@@ -6081,7 +6078,7 @@ impl SqliteStore {
     }
 
     pub fn list_effects(&self, instance_id: &str) -> StoreResult<Vec<EffectView>> {
-        let mut statement = self.connection.prepare(
+        let mut statement = self.connection.prepare_cached(
             r#"
             SELECT
                 effects.effect_id,
@@ -6393,7 +6390,7 @@ impl SqliteStore {
             dispatch_definition::native(&tx, run.instance_id, run.effect_id, expected)?;
         }
         if let Some(expected) = selection {
-            let mut statement = tx.prepare("SELECT event_id, sequence, event_type, payload_json, source, occurred_at FROM events WHERE instance_id = ?1 ORDER BY sequence")?;
+            let mut statement = tx.prepare_cached("SELECT event_id, sequence, event_type, payload_json, source, occurred_at FROM events WHERE instance_id = ?1 ORDER BY sequence")?;
             let events = statement
                 .query_map([run.instance_id], |row| {
                     Ok(EventView {
@@ -6412,15 +6409,27 @@ impl SqliteStore {
                 ));
             }
         }
-        let existing = tx.query_row(
-            "SELECT runs.effect_id, runs.instance_id, runs.provider, runs.worker_id, runs.status,
-             leases.lease_id, leases.status, effects.status FROM runs
-             LEFT JOIN leases ON leases.run_id = runs.run_id
-             LEFT JOIN effects ON effects.effect_id = runs.effect_id AND effects.instance_id = runs.instance_id
-             WHERE runs.run_id = ?1 LIMIT 1",
-            params![run.run_id],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?, row.get::<_, String>(4)?, row.get::<_, Option<String>>(5)?, row.get::<_, Option<String>>(6)?, row.get::<_, Option<String>>(7)?)),
-        ).optional()?;
+        let existing = tx
+            .prepare_cached(
+                "SELECT runs.effect_id, runs.instance_id, runs.provider, runs.worker_id, runs.status,
+                 leases.lease_id, leases.status, effects.status FROM runs
+                 LEFT JOIN leases ON leases.run_id = runs.run_id
+                 LEFT JOIN effects ON effects.effect_id = runs.effect_id AND effects.instance_id = runs.instance_id
+                 WHERE runs.run_id = ?1 LIMIT 1",
+            )?
+            .query_row(params![run.run_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                ))
+            })
+            .optional()?;
         let reattaching = existing.is_some();
         if let Some((
             effect,
@@ -6462,10 +6471,12 @@ impl SqliteStore {
             })
             .to_string();
             let legacy_key = format!("policy-block:{}:{}", run.effect_id, run.run_id);
-            let original_payload: Option<String> = tx.query_row(
-                "SELECT payload_json FROM events WHERE instance_id = ?1 AND idempotency_key = ?2",
-                params![run.instance_id, &legacy_key], |row| row.get(0),
-            ).optional()?;
+            let original_payload: Option<String> = tx
+                .prepare_cached(
+                    "SELECT payload_json FROM events WHERE instance_id = ?1 AND idempotency_key = ?2",
+                )?
+                .query_row(params![run.instance_id, &legacy_key], |row| row.get(0))
+                .optional()?;
             let block_key = run_block_event_key(&legacy_key, &payload, original_payload.as_deref());
             append_event_idempotent_on(
                 &tx,
@@ -6547,10 +6558,12 @@ impl SqliteStore {
             // on a later worker pass after an interleaved unblock — the same
             // durable statement, not a second event.
             let legacy_key = format!("capacity-block:{}:{}", run.effect_id, run.run_id);
-            let original_payload: Option<String> = tx.query_row(
-                "SELECT payload_json FROM events WHERE instance_id = ?1 AND idempotency_key = ?2",
-                params![run.instance_id, &legacy_key], |row| row.get(0),
-            ).optional()?;
+            let original_payload: Option<String> = tx
+                .prepare_cached(
+                    "SELECT payload_json FROM events WHERE instance_id = ?1 AND idempotency_key = ?2",
+                )?
+                .query_row(params![run.instance_id, &legacy_key], |row| row.get(0))
+                .optional()?;
             let block_key = run_block_event_key(&legacy_key, &payload, original_payload.as_deref());
             append_event_idempotent_on(
                 &tx,
@@ -6610,11 +6623,19 @@ impl SqliteStore {
         let dispatch = effect_recovery::native_dispatch_marker(&tx, run, &fingerprint)?;
         let payload = run_start_payload(run, &run_metadata, &dispatch)?;
         if reattaching {
-            let original = tx.query_row(
-                "SELECT event_id, sequence, event_type, payload_json FROM events WHERE instance_id = ?1 AND idempotency_key = ?2",
-                params![run.instance_id, run.run_id],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?)),
-            ).optional()?;
+            let original = tx
+                .prepare_cached(
+                    "SELECT event_id, sequence, event_type, payload_json FROM events WHERE instance_id = ?1 AND idempotency_key = ?2",
+                )?
+                .query_row(params![run.instance_id, run.run_id], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                })
+                .optional()?;
             if original.is_none() {
                 return Err(StoreError::Conflict(
                     "active run has no durable run-start event".into(),
@@ -9577,6 +9598,15 @@ impl RuntimeStore for SqliteStore {
 #[cfg(feature = "native")]
 pub(crate) const STORE_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// How many compiled statements a connection keeps between calls. The hot
+/// per-row reads and appends go through `prepare_cached`, so a branch walk or
+/// an event append re-uses its statement instead of re-parsing the SQL on
+/// every call; rusqlite's default of 16 is smaller than the set of statements
+/// one connection cycles through, which would make the cache evict what it
+/// is about to need.
+#[cfg(feature = "native")]
+pub(crate) const STATEMENT_CACHE_CAPACITY: usize = 64;
+
 /// Put a freshly opened connection into the mode every store in this crate
 /// expects: a lock wait installed, and WAL established.
 ///
@@ -10058,11 +10088,11 @@ fn append_event_chained_on(
             });
         }
     }
-    let (event_id, occurred_at) = connection.query_row(
-        "SELECT 'evt_' || lower(hex(randomblob(16))), CURRENT_TIMESTAMP",
-        [],
-        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
-    )?;
+    let (event_id, occurred_at) = connection
+        .prepare_cached("SELECT 'evt_' || lower(hex(randomblob(16))), CURRENT_TIMESTAMP")?
+        .query_row([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
     let sequence = head.sequence.unwrap_or(0) + 1;
     // DR-0054 Phase B: stamp the writer's event format so a future reader can
     // tell a row it must not misparse. Constant within a build, so replay
@@ -10083,8 +10113,7 @@ fn append_event_chained_on(
     };
     let entry_digest = event_chain::entry_digest(&head.digest, &entry);
     connection
-        .query_row(
-            r#"
+        .prepare_cached(r#"
             INSERT INTO events (
                 event_id,
                 instance_id,
@@ -10102,8 +10131,7 @@ fn append_event_chained_on(
             )
             VALUES (?1, ?2, ?3, ?4, whip_runtime_event_seal(?1, ?4, ?5), ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
             RETURNING event_id, sequence
-            "#,
-            params![
+            "#)?.query_row(params![
                 event_id,
                 event.instance_id,
                 sequence,
@@ -10504,8 +10532,7 @@ fn insert_evidence_on(
     evidence: EvidenceRecord<'_>,
 ) -> StoreResult<String> {
     serde_json::from_str::<Value>(evidence.metadata_json)?;
-    let evidence_id = connection.query_row(
-        r#"
+    let evidence_id = connection.prepare_cached(r#"
         WITH payload_identity(id) AS MATERIALIZED (SELECT 'evd_' || lower(hex(randomblob(16))))
         INSERT INTO evidence (evidence_id, instance_id, kind, subject_type, subject_id, causation_id, correlation_id, summary, metadata_json)
         VALUES (
@@ -10520,8 +10547,7 @@ fn insert_evidence_on(
             whip_payload_seal('runtime.evidence.metadata_json', (SELECT id FROM payload_identity), ?8)
         )
         RETURNING evidence_id
-        "#,
-        params![
+        "#)?.query_row(params![
             evidence.instance_id,
             evidence.kind,
             evidence.subject_type,
@@ -11162,8 +11188,7 @@ fn capacity_block_on(
     effect_id: &str,
 ) -> StoreResult<Option<String>> {
     let Some((kind, target, declared_profiles)) = connection
-        .query_row(
-            r#"
+        .prepare_cached(r#"
             SELECT effects.kind,
                    effects.target,
                    COALESCE(whip_payload_open('runtime.program_versions.declared_profiles', effect_versions.version_id, effect_versions.declared_profiles), whip_payload_open('runtime.program_versions.declared_profiles', active_versions.version_id, active_versions.declared_profiles))
@@ -11175,8 +11200,7 @@ fn capacity_block_on(
               ON effect_versions.version_id = effects.program_version_id
             WHERE effects.instance_id = ?1
               AND effects.effect_id = ?2
-            "#,
-            params![instance_id, effect_id],
+            "#)?.query_row(params![instance_id, effect_id],
             |row| {
                 Ok((
                     row.get::<_, String>(0)?,
@@ -11198,8 +11222,9 @@ fn capacity_block_on(
     let Some(capacity) = declared_agent_capacity(&declared_profiles, &agent)? else {
         return Ok(None);
     };
-    let running = connection.query_row(
-        r#"
+    let running = connection
+        .prepare_cached(
+            r#"
         SELECT COUNT(*)
         FROM effects
         WHERE instance_id = ?1
@@ -11207,9 +11232,8 @@ fn capacity_block_on(
           AND target = ?2
           AND status = 'running'
         "#,
-        params![instance_id, agent],
-        |row| row.get::<_, i64>(0),
-    )?;
+        )?
+        .query_row(params![instance_id, agent], |row| row.get::<_, i64>(0))?;
     if running >= capacity {
         Ok(Some(format!(
             "agent `{agent}` capacity exhausted ({running}/{capacity} running)"
@@ -11537,11 +11561,8 @@ fn profile_policy(
 #[cfg(feature = "native")]
 fn instance_status_on(connection: &Connection, instance_id: &str) -> StoreResult<Option<String>> {
     connection
-        .query_row(
-            "SELECT status FROM instances WHERE instance_id = ?1",
-            [instance_id],
-            |row| row.get(0),
-        )
+        .prepare_cached("SELECT status FROM instances WHERE instance_id = ?1")?
+        .query_row([instance_id], |row| row.get(0))
         .optional()
         .map_err(Into::into)
 }
@@ -11552,11 +11573,10 @@ fn active_revision_on(
     instance_id: &str,
 ) -> StoreResult<(Option<String>, i64)> {
     connection
-        .query_row(
-            "SELECT version_id, revision_epoch FROM instances WHERE instance_id = ?1",
-            [instance_id],
-            |row| Ok((Some(row.get::<_, String>(0)?), row.get::<_, i64>(1)?)),
-        )
+        .prepare_cached("SELECT version_id, revision_epoch FROM instances WHERE instance_id = ?1")?
+        .query_row([instance_id], |row| {
+            Ok((Some(row.get::<_, String>(0)?), row.get::<_, i64>(1)?))
+        })
         .optional()
         .map(|row| row.unwrap_or((None, 0)))
         .map_err(Into::into)
@@ -12348,7 +12368,7 @@ fn effect_has_open_cancellation_request_on(
     effect_id: &str,
 ) -> StoreResult<bool> {
     connection
-        .query_row(
+        .prepare_cached(
             r#"
             SELECT 1
             FROM effect_cancellation_requests
@@ -12357,9 +12377,8 @@ fn effect_has_open_cancellation_request_on(
               AND status = 'requested'
             LIMIT 1
             "#,
-            params![instance_id, effect_id],
-            |_| Ok(()),
-        )
+        )?
+        .query_row(params![instance_id, effect_id], |_| Ok(()))
         .optional()
         .map(|row| row.is_some())
         .map_err(Into::into)
@@ -14369,11 +14388,8 @@ fn ensure_instance_owner_epoch(connection: &Connection) -> StoreResult<()> {
 #[cfg(feature = "native")]
 fn instance_owner_epoch_on(connection: &Connection, instance_id: &str) -> StoreResult<i64> {
     Ok(connection
-        .query_row(
-            "SELECT owner_epoch FROM instances WHERE instance_id = ?1",
-            params![instance_id],
-            |row| row.get::<_, i64>(0),
-        )
+        .prepare_cached("SELECT owner_epoch FROM instances WHERE instance_id = ?1")?
+        .query_row(params![instance_id], |row| row.get::<_, i64>(0))
         .optional()?
         .unwrap_or(0))
 }
@@ -14518,7 +14534,7 @@ impl crate::log_append::LogAppend for SqliteStore {
     }
 
     fn chain_prefix(&self, instance_id: &str) -> StoreResult<Vec<event_chain::OwnedChainEntry>> {
-        let mut statement = self.connection.prepare(
+        let mut statement = self.connection.prepare_cached(
             "SELECT event_id, sequence, event_type, whip_runtime_event_open(event_id, event_type, payload_json), occurred_at, source, \
              causation_id, correlation_id, idempotency_key, format_version \
              FROM events WHERE instance_id = ?1 ORDER BY sequence ASC",
@@ -14589,12 +14605,13 @@ fn chain_head_on(
     instance_id: &str,
 ) -> StoreResult<event_chain::ChainHead> {
     let head = connection
-        .query_row(
+        .prepare_cached(
             "SELECT sequence, entry_digest FROM events WHERE instance_id = ?1 \
              ORDER BY sequence DESC LIMIT 1",
-            params![instance_id],
-            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?)),
-        )
+        )?
+        .query_row(params![instance_id], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?))
+        })
         .optional()?;
     match head {
         Some((sequence, Some(digest))) => Ok(event_chain::ChainHead {
@@ -17388,6 +17405,119 @@ mod tests {
         assert_eq!(cleared.status, "running");
         assert_eq!(cleared.policy_block_reason, None);
         assert_eq!(cleared.policy_block_category, None);
+    }
+
+    /// A start that carries the attempt admission its caller observed is
+    /// refused when the journal's own selection differs: the retry or lease
+    /// expiry the caller admitted against is not the one the live prefix now
+    /// names, and the run must not begin on a stale admission. The refusal
+    /// had no test that failed without it; here the journal selects the
+    /// initial attempt and the caller claims a retry that never happened.
+    #[test]
+    fn a_start_whose_attempt_admission_has_changed_is_refused() {
+        let mut store = SqliteStore::open_in_memory().expect("store opens");
+        store
+            .commit_rule(RuleCommit {
+                instance_id: "instance-a",
+                rule: "start",
+                trigger_event_id: None,
+                facts: &[],
+                consumed_fact_ids: &[],
+                effects: &[test_effect("tell", "agent.tell", "rule=start;effect=tell")],
+                dependencies: &[],
+                terminal: None,
+                idempotency_key: Some("commit-start"),
+                marks: &[],
+                context_json: None,
+            })
+            .expect("rule commit succeeds");
+        let run = RunStart {
+            instance_id: "instance-a",
+            effect_id: "tell",
+            run_id: "run-1",
+            provider: "owned",
+            worker_id: "worker-1",
+            lease_id: "lease-1",
+            lease_expires_at: "2030-01-01T00:00:00Z",
+            metadata_json: "{}",
+        };
+
+        let error = store
+            .start_run_for_admission(run, Some("evt-retry-that-never-happened"))
+            .expect_err("a stale attempt admission is refused");
+        assert!(
+            matches!(
+                &error,
+                StoreError::Conflict(message)
+                    if message == "execution attempt admission changed"
+            ),
+            "unexpected error: {error:?}"
+        );
+        assert!(
+            store
+                .list_effects("instance-a")
+                .expect("effects list")
+                .iter()
+                .any(|e| e.effect_id == "tell" && e.status != "running"),
+            "the refused start must not have started the run"
+        );
+    }
+
+    /// Reattaching to an active run re-reads the run-start event the first
+    /// start appended, and a `runs` row with no such event is a store that
+    /// has lost part of its own record: the start refuses rather than mint a
+    /// second start event under the same run id. The refusal had no test that
+    /// failed without it, so the row is produced by a real start here and its
+    /// event removed underneath it.
+    #[test]
+    fn reattaching_to_a_run_without_its_start_event_is_refused() {
+        let mut store = SqliteStore::open_in_memory().expect("store opens");
+        store
+            .commit_rule(RuleCommit {
+                instance_id: "instance-a",
+                rule: "start",
+                trigger_event_id: None,
+                facts: &[],
+                consumed_fact_ids: &[],
+                effects: &[test_effect("tell", "agent.tell", "rule=start;effect=tell")],
+                dependencies: &[],
+                terminal: None,
+                idempotency_key: Some("commit-start"),
+                marks: &[],
+                context_json: None,
+            })
+            .expect("rule commit succeeds");
+        let run = || RunStart {
+            instance_id: "instance-a",
+            effect_id: "tell",
+            run_id: "run-1",
+            provider: "owned",
+            worker_id: "worker-1",
+            lease_id: "lease-1",
+            lease_expires_at: "2030-01-01T00:00:00Z",
+            metadata_json: "{}",
+        };
+        store.start_run(run()).expect("the run starts");
+        let removed = store
+            .connection
+            .execute(
+                "DELETE FROM events WHERE instance_id = 'instance-a' AND idempotency_key = 'run-1'",
+                [],
+            )
+            .expect("the run-start event is removed");
+        assert_eq!(removed, 1, "exactly the run-start event was removed");
+
+        let error = store
+            .start_run(run())
+            .expect_err("reattaching without the start event is refused");
+        assert!(
+            matches!(
+                &error,
+                StoreError::Conflict(message)
+                    if message == "active run has no durable run-start event"
+            ),
+            "unexpected error: {error:?}"
+        );
     }
 
     /// A revision that cancels pending effects cancels an admission-denied one
