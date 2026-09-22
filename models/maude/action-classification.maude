@@ -1,0 +1,114 @@
+--- DR-0124 §14.2: an action's classification covers its input data and the
+--- observations that determined its description — discovery observations
+--- including membership and absence — and a rule's declared label is a bound,
+--- not permission to omit those influences. A cached result keeps its
+--- classification. A principal reads only results whose classification they
+--- hold, and a query under a principal's view reports what the view could not
+--- observe as unobserved, never as absent. Two labels, two actions, two files,
+--- two principals; the daemon, the cache and the result interface are rules.
+--- Buck2's own analysis, the wrapper's interfaces and the ceiling choice are
+--- not modeled: the model fixes what any ceiling must preserve.
+mod ACTION-CLASSIFICATION is
+  protecting BOOL .
+  sorts Act File Lbl Prin Fact Cfg State .
+  ops a b : -> Act [ctor] .
+  ops f g : -> File [ctor] .
+  ops low high : -> Lbl [ctor] .
+  ops p q : -> Prin [ctor] .
+  subsort Fact < Cfg .
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+  op {_} : Cfg -> State [ctor] .
+  --- the cut: a file, or a directory slot a protected member may occupy, with its label
+  op file : File Lbl -> Fact [ctor] .
+  --- what shaped the action: a declared file input, a presence observation,
+  --- an absence observation, and the rule's declared label
+  op input : Act File -> Fact [ctor] .
+  op observesPresence : Act File -> Fact [ctor] .
+  op observesAbsence : Act File -> Fact [ctor] .
+  op declared : Act Lbl -> Fact [ctor] .
+  --- the daemon classifies the action; the request is consumed
+  op classify : Act -> Fact [ctor] .
+  op classified : Act Lbl -> Fact [ctor] .
+  --- the cache stores a classified result and serves a later request from it
+  op cache : Act -> Fact [ctor] .
+  op cached : Act Lbl -> Fact [ctor] .
+  op serve : Act -> Fact [ctor] .
+  op served : Act Lbl -> Fact [ctor] .
+  --- the result interface: what a principal holds, asks for, and receives
+  op holds : Prin Lbl -> Fact [ctor] .
+  op request : Prin Act -> Fact [ctor] .
+  op disclosed : Prin Act -> Fact [ctor] .
+  op refused : Prin Act -> Fact [ctor] .
+  --- an existence query under a principal's view
+  op query : Prin File -> Fact [ctor] .
+  op present : Prin File -> Fact [ctor] .
+  op unobserved : Prin File -> Fact [ctor] .
+  op absent : Prin File -> Fact [ctor] .
+  vars A : Act . vars F : File . vars L M D H : Lbl . var P : Prin . var C : Cfg .
+  op join : Lbl Lbl -> Lbl [comm] .
+  eq join(high, L) = high .
+  eq join(low, low) = low .
+  op leq : Lbl Lbl -> Bool .
+  eq leq(L, H) = join(L, H) == H .
+  --- every influence on the action, absence included
+  op influence : Act Cfg -> Lbl .
+  eq influence(A, input(A, F) file(F, L) C) = join(L, influence(A, file(F, L) C)) .
+  eq influence(A, observesPresence(A, F) file(F, L) C) = join(L, influence(A, file(F, L) C)) .
+  eq influence(A, observesAbsence(A, F) file(F, L) C) = join(L, influence(A, file(F, L) C)) .
+  eq influence(A, C) = low [owise] .
+  --- the same, counting only presence: what a weakening below reads
+  op presenceOnly : Act Cfg -> Lbl .
+  eq presenceOnly(A, input(A, F) file(F, L) C) = join(L, presenceOnly(A, file(F, L) C)) .
+  eq presenceOnly(A, observesPresence(A, F) file(F, L) C) = join(L, presenceOnly(A, file(F, L) C)) .
+  eq presenceOnly(A, C) = low [owise] .
+  --- the daemon: the declared label bounds, and every influence joins it
+  rl [classify] : { classify(A) declared(A, D) C }
+    => { classified(A, join(D, influence(A, C))) declared(A, D) C } .
+  --- the cache keeps the classification it stored
+  rl [cache] : { cache(A) classified(A, L) C } => { cached(A, L) classified(A, L) C } .
+  rl [serve] : { serve(A) cached(A, L) C } => { served(A, L) cached(A, L) C } .
+  --- the result interface discloses only what the principal holds
+  crl [disclose] : { request(P, A) classified(A, L) holds(P, H) C }
+    => { disclosed(P, A) classified(A, L) holds(P, H) C } if leq(L, H) .
+  crl [refuse] : { request(P, A) classified(A, L) holds(P, H) C }
+    => { refused(P, A) classified(A, L) holds(P, H) C } if not leq(L, H) .
+  --- a query answers within the view: held files are observed, the rest are
+  --- unobserved; refusal never becomes absence
+  crl [observe] : { query(P, F) file(F, L) holds(P, H) C }
+    => { present(P, F) file(F, L) holds(P, H) C } if leq(L, H) .
+  crl [unobserved] : { query(P, F) file(F, L) holds(P, H) C }
+    => { unobserved(P, F) file(F, L) holds(P, H) C } if not leq(L, H) .
+endm
+
+--- Weakening: the declared label is taken as the classification.
+mod ACTION-CLASSIFICATION-LABEL is
+  including ACTION-CLASSIFICATION .
+  var A : Act . var D : Lbl . var C : Cfg .
+  rl [classify-by-label] : { classify(A) declared(A, D) C } => { classified(A, D) declared(A, D) C } .
+endm
+
+--- Weakening: an observation of absence does not count as an influence.
+mod ACTION-CLASSIFICATION-ABSENCE is
+  including ACTION-CLASSIFICATION .
+  var A : Act . var D : Lbl . var C : Cfg .
+  rl [classify-ignoring-absence] : { classify(A) declared(A, D) C }
+    => { classified(A, join(D, presenceOnly(A, C))) declared(A, D) C } .
+endm
+
+--- Weakening: a result served from the cache carries the declared label,
+--- not the classification the cache stored.
+mod ACTION-CLASSIFICATION-CACHE is
+  including ACTION-CLASSIFICATION .
+  var A : Act . vars L D : Lbl . var C : Cfg .
+  rl [serve-declared] : { serve(A) cached(A, L) declared(A, D) C }
+    => { served(A, D) cached(A, L) declared(A, D) C } .
+endm
+
+--- Weakening: a refused observation is reported as absence.
+mod ACTION-CLASSIFICATION-REFUSAL is
+  including ACTION-CLASSIFICATION .
+  var P : Prin . var F : File . vars L H : Lbl . var C : Cfg .
+  crl [refusal-as-absence] : { query(P, F) file(F, L) holds(P, H) C }
+    => { absent(P, F) file(F, L) holds(P, H) C } if not leq(L, H) .
+endm

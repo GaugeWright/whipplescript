@@ -1,0 +1,11 @@
+load("//:rules.bzl", "whip_test")
+
+# Every case passes, and says so.
+whip_test(name = "passing", script = "tests/passing.sh")
+
+# One case fails and says so, and the script still exits 0: the swallowed
+# failure the executor must retain as counterevidence.
+whip_test(name = "swallowed", script = "tests/swallowed.sh")
+
+# Runs, exits 0, reports nothing: no report is a named harness failure.
+whip_test(name = "silent", script = "tests/silent.sh")

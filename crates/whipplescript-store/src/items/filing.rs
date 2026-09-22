@@ -85,11 +85,7 @@ mod tests {
     use super::*;
 
     fn database_path() -> std::path::PathBuf {
-        std::env::temp_dir().join(format!(
-            "whip-filing-{}-{}.sqlite",
-            std::process::id(),
-            crate::stable_hash_hex(&format!("{:?}", std::time::SystemTime::now()))
-        ))
+        crate::scratch::file("whip-filing", "sqlite")
     }
 
     #[test]

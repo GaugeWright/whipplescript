@@ -246,14 +246,7 @@ fn scoped_save_reauthorizes_a_head_that_wins_the_first_cas_race() {
             let _ = std::fs::remove_dir_all(&self.0);
         }
     }
-    let dir = Scratch(std::env::temp_dir().join(format!(
-            "whipple-save-authority-race-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        )));
+    let dir = Scratch(crate::scratch::path("whipple-save-authority-race"));
     std::fs::create_dir(&dir.0).unwrap();
     let branches = dir.0.join("branches.sqlite");
     let content = dir.0.join("content.sqlite");

@@ -414,14 +414,7 @@ mod tests {
     use crate::content::ContentStore;
 
     fn scratch_root(label: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "whipplescript-materialize-{label}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock")
-                .as_nanos(),
-        ));
+        let dir = crate::scratch::path(&format!("whipplescript-materialize-{label}"));
         std::fs::create_dir_all(&dir).expect("scratch");
         dir
     }

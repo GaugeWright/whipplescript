@@ -4878,14 +4878,7 @@ mod tests {
     }
 
     pub(super) fn vcs() -> TempVcs {
-        let dir = std::env::temp_dir().join(format!(
-            "whipplescript-vcs-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock")
-                .as_nanos(),
-        ));
+        let dir = crate::scratch::path("whipplescript-vcs");
         let inner = WorkspaceVcs::open(dir.join("branches.sqlite"), dir.join("content.sqlite"))
             .expect("open vcs");
         TempVcs { dir, inner }
@@ -7918,14 +7911,7 @@ mod tests {
 
     #[test]
     fn concurrent_exact_promotions_have_one_main_cas_winner() {
-        let dir = std::env::temp_dir().join(format!(
-            "whipplescript-boundary-race-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock")
-                .as_nanos()
-        ));
+        let dir = crate::scratch::path("whipplescript-boundary-race");
         let branches = dir.join("branches.sqlite");
         let content = dir.join("content.sqlite");
         let mut setup = NativeWorkspaceVcs::open(&branches, &content).expect("setup");

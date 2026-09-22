@@ -625,14 +625,7 @@ mod tests {
             memory_store_path(),
             PathBuf::from(DEFAULT_MEMORY_STORE_PATH),
         );
-        let override_path = std::env::temp_dir().join(format!(
-            "whipplescript-memory-{}-{}.sqlite",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock")
-                .as_nanos(),
-        ));
+        let override_path = crate::scratch::file("whipplescript-memory", "sqlite");
         std::env::set_var(MEMORY_STORE_ENV, &override_path);
         assert_eq!(memory_store_path(), override_path);
         let mut store = SqliteMemoryStore::open_default().expect("open store");

@@ -68,14 +68,7 @@ fn resolution_batch_reopens_read_only_without_repeating_or_rewriting_memory() {
             let _ = std::fs::remove_dir_all(&self.0);
         }
     }
-    let dir = Directory(std::env::temp_dir().join(format!(
-            "whip-resolution-batch-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock")
-                .as_nanos()
-        )));
+    let dir = Directory(crate::scratch::path("whip-resolution-batch"));
     std::fs::create_dir_all(&dir.0).expect("fixture directory");
     let path = dir.0.join("branches.sqlite");
     let request = conformance::request();

@@ -55,7 +55,24 @@ fi
 # So every section says where it writes, in the one place both paths read, and
 # `/tmp` is the base because the point is that it is SHORT — it is what
 # `env::temp_dir()` falls back to anyway. Removed however this script ends.
-section_tmpdir="$(mktemp -d /tmp/whip-check.XXXXXX)"
+#
+# On Linux the base is `/dev/shm` instead when it can hold the run: a tmpfs is
+# as short a path, and the tests are I/O-bound on the stores they create — a
+# SQLite database per fixture, journaled and fsynced — so a disk-backed /tmp
+# spends the hosted runner's time in the kernel. GaugeDesk's bar measured the
+# same move at 250 s → 148 s for its test phase (gaugedesk-src #697). One
+# gigabyte free is the threshold because the whole suite's temporary files
+# peak at 219 MB across every parallel test process; the hosted runner's
+# /dev/shm is 3.9 GB. Off Linux, or without the room, the base stays `/tmp`
+# and the transcript says which it was.
+section_tmp_base=/tmp
+if [ "$(uname -s)" = Linux ] && [ -d /dev/shm ] && [ -w /dev/shm ]; then
+    section_shm_free_kb="$(df -Pk /dev/shm | awk 'NR == 2 { print $4 }')"
+    if [ "${section_shm_free_kb:-0}" -ge $((1024 * 1024)) ]; then
+        section_tmp_base=/dev/shm
+    fi
+fi
+section_tmpdir="$(mktemp -d "$section_tmp_base/whip-check.XXXXXX")"
 section_temp_roots+=("$section_tmpdir")
 export TMPDIR="$section_tmpdir"
 
@@ -145,6 +162,20 @@ case "${1:-}" in
         cargo nextest run --workspace
     else
         cargo test --workspace
+    fi ;;
+  buck2-test-executor)
+    # BE-02 of the admission fixtures: the test executor of DR-0124 §14.5
+    # against a real Buck2 over examples/buck2-tests. The test is ignored
+    # under the ordinary `tests` unit because it needs buck2 on the PATH;
+    # this unit runs it where buck2 is, and names the remedy where it is not.
+    if prerequisite buck2 "the Buck2 test-executor fixture" \
+        "scripts/install-buck2.sh in the GaugeWright repository, which installs the pinned release" \
+        buck2-test-executor; then
+        if command -v cargo-nextest >/dev/null 2>&1; then
+            cargo nextest run -p whipplescript-test-executor --test buck2 --run-ignored all
+        else
+            cargo test -p whipplescript-test-executor --test buck2 -- --ignored
+        fi
     fi ;;
   windows-compile)      scripts/check-windows-compile.sh ;;
   docs)

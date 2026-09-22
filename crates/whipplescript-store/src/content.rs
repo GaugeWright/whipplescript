@@ -1589,14 +1589,7 @@ mod tests {
     }
 
     fn scratch_file(label: &str, body: &[u8]) -> std::path::PathBuf {
-        let path = std::env::temp_dir().join(format!(
-            "whip-put-file-{label}-{}-{}.bin",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock")
-                .as_nanos()
-        ));
+        let path = crate::scratch::file(&format!("whip-put-file-{label}"), "bin");
         std::fs::write(&path, body).expect("seed");
         path
     }
@@ -1711,14 +1704,7 @@ mod tests {
     }
 
     fn ledger_store(label: &str) -> (std::path::PathBuf, ContentStore) {
-        let path = std::env::temp_dir().join(format!(
-            "whip-erasure-ledger-{label}-{}-{}.db",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock")
-                .as_nanos()
-        ));
+        let path = crate::scratch::file(&format!("whip-erasure-ledger-{label}"), "db");
         let _ = std::fs::remove_file(&path);
         let store = ContentStore::open(&path).expect("open");
         (path, store)
@@ -1857,7 +1843,7 @@ mod tests {
     #[test]
     fn chunk_root_reassembly_refuses_beyond_cap() {
         use crate::chunking::ChunkingConfig;
-        let dir = std::env::temp_dir().join(format!("whip-content-cap-{}", std::process::id()));
+        let dir = crate::scratch::path("whip-content-cap");
         let path = dir.join("content.db");
         let _ = std::fs::remove_file(&path);
         let store = ContentStore::open(&path).expect("open");
@@ -1895,7 +1881,7 @@ mod tests {
 
     #[test]
     fn put_is_content_addressed_and_get_round_trips() {
-        let dir = std::env::temp_dir().join(format!("whip-content-{}", std::process::id()));
+        let dir = crate::scratch::path("whip-content");
         let path = dir.join("content.db");
         let _ = std::fs::remove_file(&path);
         let store = ContentStore::open(&path).expect("open");
@@ -1918,14 +1904,7 @@ mod tests {
     /// The native content store runs the trait's own conformance suite.
     #[test]
     fn the_native_content_store_passes_the_conformance_suite() {
-        let root = std::env::temp_dir().join(format!(
-            "whip-content-conf-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock")
-                .as_nanos()
-        ));
+        let root = crate::scratch::path("whip-content-conf");
         let counter = std::cell::Cell::new(0usize);
         conformance::run_suite(|| {
             counter.set(counter.get() + 1);
@@ -1951,14 +1930,7 @@ mod tests {
     #[test]
     fn erasing_a_packed_blob_removes_the_bytes() {
         use crate::chunking::ChunkingConfig;
-        let dir = std::env::temp_dir().join(format!(
-            "whip-pack-erase-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock")
-                .as_nanos(),
-        ));
+        let dir = crate::scratch::path("whip-pack-erase");
         let store = ContentStore::open(dir.join("content.db")).expect("open");
         let config = ChunkingConfig {
             whole_blob_threshold: 64,
@@ -2027,14 +1999,7 @@ mod tests {
     #[test]
     fn chunk_tier_roundtrip_dedup_and_erasure_with_retained_root() {
         use crate::chunking::ChunkingConfig;
-        let dir = std::env::temp_dir().join(format!(
-            "whip-chunk-tier-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock")
-                .as_nanos(),
-        ));
+        let dir = crate::scratch::path("whip-chunk-tier");
         let store = ContentStore::open(dir.join("content.db")).expect("open");
         let config = ChunkingConfig {
             whole_blob_threshold: 256,
@@ -2116,14 +2081,7 @@ mod tests {
     #[test]
     fn a_pack_entry_pointing_outside_its_pack_is_refused() {
         use crate::chunking::ChunkingConfig;
-        let dir = std::env::temp_dir().join(format!(
-            "whip-pack-bounds-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock")
-                .as_nanos(),
-        ));
+        let dir = crate::scratch::path("whip-pack-bounds");
         let store = ContentStore::open(dir.join("content.db")).expect("open");
         let config = ChunkingConfig {
             whole_blob_threshold: 256,
@@ -2160,14 +2118,7 @@ mod tests {
     #[test]
     fn pack_root_is_read_transparent_and_erasure_safe() {
         use crate::chunking::ChunkingConfig;
-        let dir = std::env::temp_dir().join(format!(
-            "whip-pack-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock")
-                .as_nanos(),
-        ));
+        let dir = crate::scratch::path("whip-pack");
         let store = ContentStore::open(dir.join("content.db")).expect("open");
         let config = ChunkingConfig {
             whole_blob_threshold: 256,
@@ -2227,14 +2178,7 @@ mod tests {
     #[test]
     fn a_chunk_root_erasure_that_cannot_be_recorded_keeps_its_bytes() {
         use crate::chunking::ChunkingConfig;
-        let dir = std::env::temp_dir().join(format!(
-            "whip-erase-record-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock")
-                .as_nanos(),
-        ));
+        let dir = crate::scratch::path("whip-erase-record");
         let store = ContentStore::open(dir.join("content.db")).expect("open");
         let config = ChunkingConfig {
             whole_blob_threshold: 256,

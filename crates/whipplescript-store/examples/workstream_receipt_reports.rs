@@ -2,6 +2,8 @@
 //! temporary fixture stores; it accepts no user-store path or credentials.
 #[path = "../tests/support/receipt_fixture.rs"]
 mod receipt_fixture;
+#[path = "../tests/support/scratch.rs"]
+mod scratch;
 
 use receipt_fixture::{expected, Fixture};
 use serde_json::{json, Value};

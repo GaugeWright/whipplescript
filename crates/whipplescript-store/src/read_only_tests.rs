@@ -1,23 +1,11 @@
 //! Native observation must not silently initialize, repair, or mutate a store.
 use super::*;
-use std::{
-    path::{Path, PathBuf},
-    sync::atomic::{AtomicU64, Ordering},
-};
+use std::path::{Path, PathBuf};
 
 struct Fixture(PathBuf);
 impl Fixture {
     fn new() -> Self {
-        static NEXT: AtomicU64 = AtomicU64::new(0);
-        let path = std::env::temp_dir().join(format!(
-            "whip-runtime-read-only-{}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock")
-                .as_nanos(),
-            NEXT.fetch_add(1, Ordering::Relaxed),
-        ));
+        let path = crate::scratch::path("whip-runtime-read-only");
         std::fs::create_dir(&path).expect("isolated fixture");
         Self(path)
     }

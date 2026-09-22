@@ -222,14 +222,7 @@ mod tests {
     }
 
     fn content() -> TempContent {
-        let dir = std::env::temp_dir().join(format!(
-            "whipplescript-working-set-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock")
-                .as_nanos(),
-        ));
+        let dir = crate::scratch::path("whipplescript-working-set");
         std::fs::create_dir_all(&dir).expect("create working-set temp dir");
         let inner = ContentStore::open(dir.join("content.sqlite")).expect("open content store");
         TempContent { dir, inner }

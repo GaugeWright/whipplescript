@@ -65,7 +65,21 @@ fi
 GREEN_BAR_RUN="${GREEN_BAR_RUN:-$(date +%s)-$$}"
 section() {
   if [ -n "$via_buck2" ]; then
-    log="$(buck2 build "//:$1" -c "green_bar.run=$GREEN_BAR_RUN" --show-full-simple-output)"
+    # The word travels with the run, for the opposite reason to the nonce. The
+    # rule defaults an absent `green_bar.prerequisites` to `required`, so a
+    # dispatcher that computes the word and then drops it makes this bar
+    # STRICTER than the block at the top of this file documents: on the one
+    # host that takes this path — the founder's, the only checkout that is a
+    # cell of a materialized workspace — a bare `scripts/check.sh` without
+    # cargo-deny or wrangler failed with a message about the host rather than
+    # skipping and naming the remedy. That is the failure GaugeWright DR-0127
+    # was written against, arriving through the door the direct path had
+    # already closed, and it is why the two paths cannot be trusted to agree
+    # by inspection. It is part of the action's KEY, not merely its
+    # environment, because a skip is not a verdict: a run that skipped the
+    # supply-chain policy check must never be served to one that required it.
+    log="$(buck2 build "//:$1" -c "green_bar.run=$GREEN_BAR_RUN" \
+      -c "green_bar.prerequisites=$prerequisites" --show-full-simple-output)"
     cat "$log"
   else
     scripts/section.sh "$1"
@@ -336,6 +350,9 @@ section norm-observer
 # widening before one is written.
 echo "== tests =="
 section tests
+
+echo "== buck2 test executor =="
+section buck2-test-executor
 
 # What a release compiles, which is more than what it distributes: every
 # workspace member for every target in dist-workspace.toml. The command lives in

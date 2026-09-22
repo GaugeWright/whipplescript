@@ -32,3 +32,6 @@ crates/whipplescript-host-do/worker/.wrangler/
 # root. It carries a ChatGPT account identifier, so it is ignored rather than left
 # to be picked up by a `git add .` the way it was in #49.
 error.log
+
+# The Buck2 test-executor fixture project builds into its own buck-out.
+examples/buck2-tests/buck-out/

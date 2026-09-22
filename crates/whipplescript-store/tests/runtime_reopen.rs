@@ -1,17 +1,12 @@
 //! Workers connect to the initialized runtime without taking a migration lock.
 #![cfg(feature = "native")]
+#[path = "support/scratch.rs"]
+mod scratch;
 use whipplescript_store::{NewInstance, SqliteStore, StoreError, SUPPORTED_SCHEMA_VERSION};
 struct Fixture(std::path::PathBuf);
 impl Fixture {
     fn new() -> Self {
-        let root = std::env::temp_dir().join(format!(
-            "whip-runtime-reopen-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("fixture clock")
-                .as_nanos()
-        ));
+        let root = crate::scratch::path("whip-runtime-reopen");
         std::fs::create_dir_all(&root).expect("fixture directory");
         Self(root)
     }

@@ -61,6 +61,26 @@ reuse, and the act for one successor activating the other — with weakenings
 for reuse by resemblance and for a door that transplants acceptance across
 the split. Witness adequacy and evidence premises are not modeled.
 
+`action-classification.maude` models DR-0124 §14.2: an action's
+classification joins its declared label with every influence that shaped
+it — a declared input, a presence observation, an observation of absence —
+so a protected slot's absence classifies an otherwise innocuous result; the
+cache serves the classification it stored; the result interface discloses
+only what a principal holds and leaves unrelated results readable; a query
+under a view reports what it could not observe as unobserved. Four
+weakenings: the label taken as the classification, absence not counted, the
+cache serving the declared label, and refusal reported as absence.
+
+`store-authorization.maude` models DR-0124 §14.3: a read needs a handle to
+an admitted use and that use's label, a missing-blobs query answers only
+within the caller's view while the duplicate upload is accepted, identical
+bytes keep their labels apart across uses, and evidence comes only from an
+approved executor's execution while a submitted result is a claim. Four
+weakenings, one per rule: possession of the digest as access, the existence
+oracle, deduplication merging labels, and the submission trusted. The fifth
+rule, a cached result keeping its classification, is the cache in
+`action-classification.maude`.
+
 Maude is the primary executable-spec target for the WhippleScript kernel and
 for the package/library lowering pipeline.
 

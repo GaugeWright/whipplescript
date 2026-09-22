@@ -1,0 +1,51 @@
+load ../action-classification.maude
+--- action a: declared low, one low input, and an observation that the
+--- protected slot g is absent shaped it; action b: declared low, low input.
+--- positive: the absence observation classifies a's result high
+search [1] in ACTION-CLASSIFICATION : { file(f, low) file(g, high) input(a, f) observesAbsence(a, g) declared(a, low) classify(a) }
+  =>* { classified(a, high) RESIDUAL:Cfg } .
+--- refusal: it is never classified by its declared label alone
+search in ACTION-CLASSIFICATION : { file(f, low) file(g, high) input(a, f) observesAbsence(a, g) declared(a, low) classify(a) }
+  =>* { classified(a, low) RESIDUAL:Cfg } .
+--- weakening: the label taken as the classification
+search [1] in ACTION-CLASSIFICATION-LABEL : { file(f, low) file(g, high) input(a, f) observesAbsence(a, g) declared(a, low) classify(a) }
+  =>* { classified(a, low) RESIDUAL:Cfg } .
+--- weakening: absence not counted as an influence
+search [1] in ACTION-CLASSIFICATION-ABSENCE : { file(f, low) file(g, high) input(a, f) observesAbsence(a, g) declared(a, low) classify(a) }
+  =>* { classified(a, low) RESIDUAL:Cfg } .
+--- positive: a presence observation of the protected slot classifies the same way
+search [1] in ACTION-CLASSIFICATION : { file(f, low) file(g, high) input(a, f) observesPresence(a, g) declared(a, low) classify(a) }
+  =>* { classified(a, high) RESIDUAL:Cfg } .
+--- positive: an action nothing protected shaped stays low
+search [1] in ACTION-CLASSIFICATION : { file(f, low) file(g, high) input(b, f) declared(b, low) classify(b) }
+  =>* { classified(b, low) RESIDUAL:Cfg } .
+--- positive: a result served from the cache keeps the stored classification
+search [1] in ACTION-CLASSIFICATION : { file(f, low) file(g, high) input(a, f) observesAbsence(a, g) declared(a, low) classify(a) cache(a) serve(a) }
+  =>* { served(a, high) RESIDUAL:Cfg } .
+--- refusal: the cache never lowers it
+search in ACTION-CLASSIFICATION : { file(f, low) file(g, high) input(a, f) observesAbsence(a, g) declared(a, low) classify(a) cache(a) serve(a) }
+  =>* { served(a, low) RESIDUAL:Cfg } .
+--- weakening: the cache serves the declared label
+search [1] in ACTION-CLASSIFICATION-CACHE : { file(f, low) file(g, high) input(a, f) observesAbsence(a, g) declared(a, low) classify(a) cache(a) serve(a) }
+  =>* { served(a, low) RESIDUAL:Cfg } .
+--- positive: the principal without the protected label is refused a's result
+--- and still reads the unrelated b; the principal with it reads a
+search [1] in ACTION-CLASSIFICATION : { file(f, low) file(g, high) input(a, f) observesAbsence(a, g) declared(a, low) input(b, f) declared(b, low) classify(a) classify(b) holds(p, low) holds(q, high) request(p, a) request(p, b) request(q, a) }
+  =>* { refused(p, a) disclosed(p, b) disclosed(q, a) RESIDUAL:Cfg } .
+--- refusal: the innocuous output shaped by the protected observation is never
+--- disclosed to the principal without the label
+search in ACTION-CLASSIFICATION : { file(f, low) file(g, high) input(a, f) observesAbsence(a, g) declared(a, low) classify(a) holds(p, low) request(p, a) }
+  =>* { disclosed(p, a) RESIDUAL:Cfg } .
+--- weakening: under the label ceiling it is
+search [1] in ACTION-CLASSIFICATION-LABEL : { file(f, low) file(g, high) input(a, f) observesAbsence(a, g) declared(a, low) classify(a) holds(p, low) request(p, a) }
+  =>* { disclosed(p, a) RESIDUAL:Cfg } .
+--- positive: a query under the unprivileged view reports g unobserved, and f present
+search [1] in ACTION-CLASSIFICATION : { file(f, low) file(g, high) holds(p, low) query(p, f) query(p, g) }
+  =>* { present(p, f) unobserved(p, g) RESIDUAL:Cfg } .
+--- refusal: refusal is never reported as absence
+search in ACTION-CLASSIFICATION : { file(f, low) file(g, high) holds(p, low) query(p, g) }
+  =>* { absent(p, g) RESIDUAL:Cfg } .
+--- weakening: the refusal reported as absence
+search [1] in ACTION-CLASSIFICATION-REFUSAL : { file(f, low) file(g, high) holds(p, low) query(p, g) }
+  =>* { absent(p, g) RESIDUAL:Cfg } .
+quit .

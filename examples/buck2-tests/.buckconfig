@@ -1,0 +1,18 @@
+# A fixture Buck2 project for the WhippleScript test executor (DR-0124 §14.5).
+# No prelude: the one rule it needs is defined in rules.bzl, so the project
+# builds with a pinned Buck2 and nothing else.
+[cells]
+root = .
+
+[buildfile]
+# The fixture's build file is FIXTURE, not BUCK: this directory sits inside
+# the whipplescript cell of the company's Buck2 workspace, whose packages are
+# BUCK files, and a BUCK file here would be evaluated there as one of them
+# with a load path that does not resolve. Under this .buckroot the fixture is
+# its own project and FIXTURE is its build file.
+name = FIXTURE
+
+[test]
+# The executor under test is named on the command line by the fixture
+# (-c test.v2_test_executor=<path>), never here: the built binary's path is
+# the test's, not the project's.

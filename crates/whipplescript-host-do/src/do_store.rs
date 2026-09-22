@@ -20113,6 +20113,175 @@ mod norm_admission_tests {
         }));
     }
 
+    /// DR-0124 §14.6 on both hosts: the artifact record under `build.publish`
+    /// and the `implements` edge admit identically, and the worker is
+    /// refused identically.
+    #[test]
+    fn norm_native_and_do_admit_the_same_artifact_and_implements_edge() {
+        use whipplescript_store::norm_commands::NormCommandStore;
+        let charter: NormCharter =
+            serde_json::from_str(include_str!("../../../examples/engineering/charter.json"))
+                .expect("the engineering charter is a charter");
+        let owner_key = SigningKey::from_slice(&[1; 32]).unwrap();
+        let worker_key = SigningKey::from_slice(&[2; 32]).unwrap();
+        let owner = actor("owner", &owner_key);
+        let worker = actor("worker", &worker_key);
+        let owner_root = crate::governance::GaugeDeskGovernanceRoot::new("owner", &owner.key_id);
+        let worker_root = crate::governance::GaugeDeskGovernanceRoot::new("worker", &worker.key_id);
+        let verifier = NormGovernanceVerifier::new(
+            vec![
+                NormPrincipalBinding {
+                    actor: owner.clone(),
+                    verifier: &owner_root,
+                },
+                NormPrincipalBinding {
+                    actor: worker.clone(),
+                    verifier: &worker_root,
+                },
+            ],
+            BTreeSet::from([("worker".into(), "owner".into())]),
+        )
+        .unwrap();
+        let reference = |name: &str| {
+            Vocabulary::new(
+                charter
+                    .vocabularies
+                    .iter()
+                    .find(|entry| entry.definition.name == name)
+                    .unwrap_or_else(|| panic!("charter declares {name}"))
+                    .definition
+                    .clone(),
+            )
+            .unwrap()
+            .reference()
+            .clone()
+        };
+        let mut native = whipplescript_store::items::WorkItemStore::open_in_memory().unwrap();
+        let mut hosted = test_support::store();
+        let bootstrap = signed(
+            owner.clone(),
+            &owner_key,
+            "engineering",
+            NormAct::Bootstrap {
+                creator: "worker".into(),
+                charter: charter.clone(),
+            },
+        );
+        let ledger = native.append_norm_event(&bootstrap, &verifier).unwrap();
+        assert_eq!(
+            hosted.append_norm_event(&bootstrap, &verifier).unwrap(),
+            ledger
+        );
+        let both = |native: &mut whipplescript_store::items::WorkItemStore,
+                    hosted: &mut DoSqliteStore<test_support::RusqliteDoSql>,
+                    event: &SignedNormEvent| {
+            let native_result = native.append_norm_event(event, &verifier);
+            let hosted_result = hosted.append_norm_event(event, &verifier);
+            match (&native_result, &hosted_result) {
+                (Ok(a), Ok(b)) => assert_eq!(a, b),
+                (Err(a), Err(b)) => assert_eq!(format!("{a:?}"), format!("{b:?}")),
+                other => panic!("hosts disagree: {other:?}"),
+            }
+            native_result
+        };
+        let key_of = |principal: &str| -> (&NormActor, &SigningKey) {
+            if principal == "owner" {
+                (&owner, &owner_key)
+            } else {
+                (&worker, &worker_key)
+            }
+        };
+        let create = |principal: &str,
+                      nonce: &str,
+                      kind: &str,
+                      fields: serde_json::Value,
+                      premises: Option<NormPremises>| {
+            let (actor, key) = key_of(principal);
+            signed_with(
+                actor.clone(),
+                key,
+                nonce,
+                NormAct::Create {
+                    ledger: ledger.clone(),
+                    authority: None,
+                    vocabulary: reference(kind),
+                    fields_json: fields.to_string(),
+                },
+                premises,
+            )
+        };
+        let artifact_fields = serde_json::json!({
+            "cut": "cut-a0", "label": "root//parser:parser", "configuration": "cfg:linux-x86_64",
+            "outputs": ["0a"], "classification": "low", "encoding": "whipplescript.build.input-root/v1"
+        });
+        let t = both(
+            &mut native,
+            &mut hosted,
+            &create(
+                "worker",
+                "T",
+                "task",
+                serde_json::json!({"title": "ship the parser"}),
+                None,
+            ),
+        )
+        .unwrap();
+        let worker_refused = both(
+            &mut native,
+            &mut hosted,
+            &create(
+                "worker",
+                "A-worker",
+                "artifact",
+                artifact_fields.clone(),
+                None,
+            ),
+        );
+        assert!(format!("{:?}", worker_refused.unwrap_err())
+            .contains("authenticated governance authority"));
+        let a = both(
+            &mut native,
+            &mut hosted,
+            &create("owner", "A", "artifact", artifact_fields.clone(), None),
+        )
+        .unwrap();
+        let basis = native
+            .norm_state(&verifier)
+            .unwrap()
+            .relation_family("implementation")
+            .unwrap()
+            .basis;
+        both(
+            &mut native,
+            &mut hosted,
+            &create(
+                "worker",
+                "T-implements",
+                "implements",
+                serde_json::json!({"source": t, "target": a}),
+                Some(NormPremises {
+                    family_basis: Some(basis),
+                    references: vec![t.clone(), a.clone()],
+                    inventory_frontier: Vec::new(),
+                }),
+            ),
+        )
+        .unwrap();
+        let native_family = native
+            .norm_state(&verifier)
+            .unwrap()
+            .relation_family("implementation")
+            .unwrap();
+        let hosted_family = hosted
+            .norm_state(&verifier)
+            .unwrap()
+            .relation_family("implementation")
+            .unwrap();
+        assert_eq!(native_family, hosted_family);
+        assert_eq!(native_family.edges.len(), 1);
+        assert_eq!(native_family.edges[0].target, a);
+    }
+
     #[test]
     fn norm_native_and_do_run_the_engineering_charter_identically() {
         use whipplescript_store::norm_commands::{

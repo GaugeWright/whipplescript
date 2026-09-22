@@ -777,6 +777,21 @@ esac
         const BOUND_DEADLINE: Duration = Duration::from_millis(30);
         const BOUND_CEILING: Duration = Duration::from_secs(5);
 
+        // Which leaves the cases that are neither: they are expected to fail,
+        // and not for want of time. `is_err()` cannot tell their own refusal
+        // from the deadline catching a hang, so with UNBOUNDED sixty seconds
+        // away it would read that hang as a pass -- quietly, and a minute
+        // later. Assert instead that the deadline fired exactly when it was
+        // the input and never otherwise, which is a question about the error
+        // rather than about the clock.
+        let bound_fired = |result: &StoreResult<String>| {
+            matches!(
+                result,
+                Err(StoreError::Conflict(message))
+                    if message.contains("timed out") || message.contains("did not close")
+            )
+        };
+
         for (case, script) in [
             ("exact", "printf '  daemon-id\\n'"),
             ("failure", "exit 7"),
@@ -796,6 +811,7 @@ esac
                 assert_eq!(result.unwrap(), "daemon-id");
             } else {
                 assert!(result.is_err(), "{case}");
+                assert_eq!(bound_fired(&result), bounded, "{case}");
             }
             if bounded {
                 assert!(
@@ -836,10 +852,13 @@ esac
                 assert_eq!(result.unwrap(), "{}");
             } else {
                 assert!(result.is_err(), "{case}");
-                assert!(
-                    started.elapsed() < BOUND_CEILING,
-                    "{case} did not bound stdin"
-                );
+                assert_eq!(bound_fired(&result), bounded, "{case}");
+                if bounded {
+                    assert!(
+                        started.elapsed() < BOUND_CEILING,
+                        "{case} did not bound stdin"
+                    );
+                }
             }
         }
         std::fs::remove_dir_all(dir).unwrap();

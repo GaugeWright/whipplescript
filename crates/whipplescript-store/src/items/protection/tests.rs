@@ -270,12 +270,7 @@ fn cell_and_event_transplants_and_summary_tampering_are_refused() {
 struct Fixture(std::path::PathBuf);
 impl Fixture {
     fn new() -> Self {
-        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let root = std::env::temp_dir().join(format!(
-            "whip-tracker-protection-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::SeqCst)
-        ));
+        let root = crate::scratch::path("whip-tracker-protection");
         std::fs::create_dir(&root).unwrap();
         Self(root)
     }

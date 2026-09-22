@@ -1,0 +1,219 @@
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
+ *
+ * This source code is dual-licensed under either the MIT license found in the
+ * LICENSE-MIT file in the root directory of this source tree or the Apache
+ * License, Version 2.0 found in the LICENSE-APACHE file in the root directory
+ * of this source tree. You may select, at your option, one of the
+ * above-listed licenses.
+ */
+
+syntax = "proto3";
+
+package buck.data;
+
+import "google/protobuf/duration.proto";
+import "google/protobuf/timestamp.proto";
+
+// A wire-compatible subset of Buck2's data.proto at release 2026-09-15: the
+// transitive closure of the two messages the test protocol imports,
+// CommandExecution and CommandExecutionKind. Fields of other messages are
+// omitted, never renumbered; proto3 decoding skips what is not declared.
+
+message CommandExecution {
+  CommandExecutionDetails details = 1;
+
+  message Success {}
+
+  message Failure {}
+
+  message WorkerFailure {}
+
+  message Timeout {
+    google.protobuf.Duration duration = 1;
+  }
+
+  message Error {
+    string stage = 1;
+    string error = 2;
+  }
+
+  // (Hybrid execution only) This executor released its claim in order to allow
+  // another executor to proceed. We use this to cancel local tasks when racing
+  // local & RE.
+  message Cancelled {}
+
+  reserved 6;
+
+  // Serialization of CommandExecutionStatus.
+  oneof status {
+    Success success = 2;
+    Failure failure = 3;
+    Timeout timeout = 4;
+    Error error = 5;
+    Cancelled cancelled = 7;
+    WorkerFailure worker_failure = 8;
+  }
+
+  InlineCommandExecutionEnvironmentMetadata inline_environment_metadata = 20;
+}
+
+message CommandExecutionKind {
+  oneof command {
+    // The command, if it was local.
+    LocalCommand local_command = 1;
+    // The command, if it was remote.
+    RemoteCommand remote_command = 2;
+    // The command, if it was local and omitted from this log record for
+    // brevity.
+    OmittedLocalCommand omitted_local_command = 3;
+    // The command used to initialize the worker, if the action failed at this
+    // step.
+    WorkerInitCommand worker_init_command = 4;
+    // The command, if executed by a local worker.
+    WorkerCommand worker_command = 5;
+  }
+}
+
+message InlineCommandExecutionEnvironmentMetadata {
+  optional uint64 sandcastle_instance_id = 1;
+}
+
+message CommandExecutionDetails {
+  reserved 6, 7, 8, 9, 10, 11, 12, 35;
+
+  // Same as exit_code but allowing negative values
+  optional sint32 signed_exit_code = 4;
+  // The stdout of the command. This may be omitted for successful commands.
+  string cmd_stdout = 2;
+  // The stderr of the command.
+  string cmd_stderr = 3;
+
+  CommandExecutionKind command_kind = 5;
+  CommandExecutionMetadata metadata = 13;
+  optional string additional_message = 14;
+}
+
+message LocalCommand {
+  repeated string argv = 1;
+  repeated EnvironmentEntry env = 2;
+  string action_digest = 3;
+}
+
+message WorkerInitCommand {
+  repeated string argv = 1;
+  repeated EnvironmentEntry env = 2;
+}
+
+message WorkerCommand {
+  repeated string argv = 1;
+  repeated EnvironmentEntry env = 2;
+  string action_digest = 3;
+  /// The exe args to run this command as a separate process,
+  /// if needed to reproduce a failed command.
+  repeated string fallback_exe = 4;
+}
+
+message OmittedLocalCommand {
+  string action_digest = 1;
+}
+
+message RemoteCommand {
+  string action_digest = 1;
+  bool cache_hit = 2;
+
+  /// How long this build waited in queue.
+  google.protobuf.Duration queue_time = 3;
+
+  // Potentially more details about this command.
+  optional RemoteCommandDetails details = 4;
+
+  CacheHitType cache_hit_type = 5;
+  optional string remote_dep_file_key = 6;
+
+  // Project relative paths to the materialized inputs for failed
+  // actions, if `--materialize-failed-inputs` was passed to build options
+  repeated string materialized_inputs_for_failed = 7;
+
+  // Project relative paths to the materialized outputs for failed actions, if
+  // `--unstable_materialize_failed_action_outputs` was passed to build options
+  repeated string materialized_outputs_for_failed_actions = 8;
+}
+
+message CommandExecutionMetadata {
+  reserved 9;
+
+  /// How long this command actually waited for this action to complete
+  google.protobuf.Duration wall_time = 1;
+
+  /// How long this command actually took to execute
+  google.protobuf.Duration execution_time = 2;
+
+  /// When execution started.
+  google.protobuf.Timestamp start_time = 3;
+
+  /// How long it took to materialize the action's inputs.
+  google.protobuf.Duration input_materialization_duration = 4;
+
+  CommandExecutionStats execution_stats = 5;
+
+  /// Sum of all hashing times of individual files. Can be larger than user time
+  /// because hashing is done in parallel.
+
+  google.protobuf.Duration hashing_duration = 6;
+
+  uint64 hashed_artifacts_count = 7;
+
+  /// How long this command spent waiting to run
+  optional google.protobuf.Duration queue_duration = 8;
+
+  /// The duration this command was suspended for. None if it was never
+  /// suspended
+  optional google.protobuf.Duration suspend_duration = 10;
+
+  /// The number of times this action was suspended. None indicates that
+  /// resource control was not enabled.
+  optional uint64 suspend_count = 11;
+}
+
+message EnvironmentEntry {
+  // The environment key.
+  string key = 1;
+  // The environment value.
+  string value = 2;
+}
+
+enum CacheHitType {
+  ACTION_CACHE = 0;
+  REMOTE_DEP_FILE_CACHE = 1;
+  EXECUTED = 2; // not a cache hit
+}
+
+message RemoteCommandDetails {
+  optional string session_id = 1;
+  string use_case = 2;
+  RePlatform platform = 3;
+  bool persistent_worker = 4;
+}
+
+message CommandExecutionStats {
+  optional uint64 cpu_instructions_user = 1;
+  optional uint64 cpu_instructions_kernel = 2;
+  optional CpuCounter userspace_events = 3;
+  optional CpuCounter kernel_events = 4;
+  optional uint64 memory_peak = 5;
+}
+
+message RePlatform {
+  message Property {
+    string name = 1;
+    string value = 2;
+  }
+  repeated Property properties = 1;
+}
+
+message CpuCounter {
+  uint64 count = 1;
+  uint64 time_enabled = 2;
+  uint64 time_running = 3;
+}

@@ -4,17 +4,11 @@ use crate::branches::MAINLINE_BRANCH_ID;
 use crate::vcs::NativeWorkspaceVcs;
 use rusqlite::{params, Connection};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 struct Fixture(PathBuf);
 impl Fixture {
     fn new() -> Self {
-        static SEQUENCE: AtomicU64 = AtomicU64::new(0);
-        let path = std::env::temp_dir().join(format!(
-            "whip-save-recovery-{}-{}",
-            std::process::id(),
-            SEQUENCE.fetch_add(1, Ordering::Relaxed)
-        ));
+        let path = crate::scratch::path("whip-save-recovery");
         std::fs::create_dir_all(&path).expect("fixture");
         Self(path)
     }

@@ -61,12 +61,7 @@ fn store() -> ContentStore {
 struct Fixture(std::path::PathBuf);
 impl Fixture {
     fn new() -> Self {
-        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let root = std::env::temp_dir().join(format!(
-            "whip-protection-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::SeqCst)
-        ));
+        let root = crate::scratch::path("whip-protection");
         std::fs::create_dir(&root).unwrap();
         Self(root)
     }

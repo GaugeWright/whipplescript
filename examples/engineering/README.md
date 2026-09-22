@@ -17,6 +17,11 @@ revision a task addresses, `supports` offers an observation for one, and
 evidence. Each edge binds its family basis and its references as premises,
 so a replay reproduces every admission.
 
+`artifact` is the bundled build-artifact record (DR-0124 §14.6), published
+by the wrapper under the `build.publish` scope, and `implements` names the
+exact artifact revision a task or a release delivers; it is the edge
+DR-0123 deferred until an artifact had an identity.
+
 A task's `queue` and `labels` are declared `editorial`: a change confined
 to them rewords the task, and the diff of meaning (norm-plane §8.1) says
 so. Every other field of every noun here carries meaning, as does a field

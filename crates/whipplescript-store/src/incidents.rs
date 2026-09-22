@@ -718,15 +718,7 @@ mod tests {
 
     impl TempIncidentDir {
         fn new(label: &str) -> Self {
-            let dir = std::env::temp_dir().join(format!(
-                "whipplescript-incidents-{}-{}-{}",
-                label,
-                std::process::id(),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .expect("clock")
-                    .as_nanos(),
-            ));
+            let dir = crate::scratch::path(&format!("whipplescript-incidents-{label}"));
             std::fs::create_dir_all(&dir).expect("create incidents temp dir");
             Self(dir)
         }

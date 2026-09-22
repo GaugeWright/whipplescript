@@ -8,7 +8,8 @@ use whipplescript_store::norm::{NormAct, NormActor, NormStatement, NormVerifier,
 use whipplescript_store::norm_commands::NormCommandStore;
 use whipplescript_store::norm_history::CapturedNormHistory;
 use whipplescript_store::norm_publication::{
-    NormPublicationJournal, PublicationCandidate, PublicationSlot, RetainedPublication,
+    NormPublicationJournal, PublicationBasis, PublicationCandidate, PublicationSlot,
+    RetainedPublication,
 };
 use whipplescript_store::StoredEvent;
 
@@ -206,6 +207,7 @@ impl PreparedObservationPublication {
                             invocation: invocation.clone(),
                             observation: observation.clone(),
                             event,
+                            basis: PublicationBasis::Run {},
                         })
                         .map_err(|e| format!("{e:?}"))?
                 }

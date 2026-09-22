@@ -470,14 +470,7 @@ mod tests {
     #[test]
     fn host_action_native_concurrent_delivery_and_restart_keep_one_admission() {
         use std::sync::{Arc, Barrier};
-        let path = std::env::temp_dir().join(format!(
-            "whip-host-action-race-{}-{}.sqlite",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let path = crate::scratch::file("whip-host-action-race", "sqlite");
         let mut initial = SqliteStore::open(&path).unwrap();
         let version = conformance::register(&mut initial);
         drop(initial);

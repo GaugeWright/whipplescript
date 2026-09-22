@@ -322,12 +322,7 @@ fn protected_facts_effects_runs_and_replay_preserve_their_payloads() {
 struct Fixture(std::path::PathBuf);
 impl Fixture {
     fn new() -> Self {
-        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let path = std::env::temp_dir().join(format!(
-            "whip-runtime-protection-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::SeqCst)
-        ));
+        let path = crate::scratch::path("whip-runtime-protection");
         std::fs::create_dir(&path).unwrap();
         Self(path)
     }

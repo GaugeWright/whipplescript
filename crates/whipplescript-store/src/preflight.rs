@@ -511,14 +511,7 @@ mod tests {
     fn the_real_store_reports_absent_and_erased_apart() {
         use crate::content::ContentStore;
 
-        let dir = std::env::temp_dir().join(format!(
-            "whip-preflight-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock")
-                .as_nanos()
-        ));
+        let dir = crate::scratch::path("whip-preflight");
         let store = ContentStore::open(dir.join("content.sqlite")).expect("content store opens");
 
         let live = store.put_text("kept").expect("live blob stores");

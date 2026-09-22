@@ -56,10 +56,7 @@ mod tests {
     struct Fixture(std::path::PathBuf);
     impl Fixture {
         fn new() -> Self {
-            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-            let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let root =
-                std::env::temp_dir().join(format!("whip-existing-{}-{id}", std::process::id()));
+            let root = crate::scratch::path("whip-existing");
             std::fs::create_dir(&root).expect("isolated fixture");
             Self(root)
         }

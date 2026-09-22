@@ -572,14 +572,7 @@ mod tests {
     /// value overwritten unseen.
     #[test]
     fn concurrent_advances_form_one_chain_with_no_lost_update() {
-        let dir = std::env::temp_dir().join(format!(
-            "whip-ref-race-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock")
-                .as_nanos()
-        ));
+        let dir = crate::scratch::path("whip-ref-race");
         std::fs::create_dir_all(&dir).expect("scratch dir");
         let path = dir.join("refs.sqlite");
         SqliteRefAuthority::open(&path).expect("authority initialises");
@@ -676,14 +669,7 @@ mod tests {
         SqliteRefAuthority,
         std::sync::Arc<std::sync::atomic::AtomicBool>,
     ) {
-        let dir = std::env::temp_dir().join(format!(
-            "whip-ref-snapshot-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock")
-                .as_nanos()
-        ));
+        let dir = crate::scratch::path("whip-ref-snapshot");
         std::fs::create_dir_all(&dir).expect("scratch dir");
         let path = dir.join("refs.sqlite");
         SqliteRefAuthority::open(&path)

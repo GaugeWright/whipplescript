@@ -1170,15 +1170,7 @@ mod tests {
     }
 
     fn temp(label: &str) -> std::path::PathBuf {
-        std::env::temp_dir().join(format!(
-            "whipplescript-native-stores-{}-{}-{}.sqlite",
-            label,
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock")
-                .as_nanos(),
-        ))
+        crate::scratch::file(&format!("whipplescript-native-stores-{label}"), "sqlite")
     }
 
     // The facade presents all three store surfaces on one handle; each trait

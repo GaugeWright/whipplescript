@@ -1,6 +1,8 @@
 #![cfg(feature = "native")]
 #[path = "../../whipplescript-store/tests/support/receipt_fixture.rs"]
 mod receipt_fixture;
+#[path = "../../whipplescript-store/tests/support/scratch.rs"]
+mod scratch;
 
 use receipt_fixture::{expected, Fixture};
 use whipplescript_kernel::effect_handlers::{

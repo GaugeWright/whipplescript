@@ -1437,15 +1437,7 @@ mod tests {
 
     impl TempStoreDir {
         fn new(label: &str) -> Self {
-            let dir = std::env::temp_dir().join(format!(
-                "whipplescript-coordination-{}-{}-{}",
-                label,
-                std::process::id(),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .expect("clock")
-                    .as_nanos(),
-            ));
+            let dir = crate::scratch::path(&format!("whipplescript-coordination-{label}"));
             std::fs::create_dir_all(&dir).expect("create coordination temp dir");
             Self(dir)
         }

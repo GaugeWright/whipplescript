@@ -5,6 +5,8 @@
 
 #[path = "support/receipt_fixture.rs"]
 mod receipt_fixture;
+#[path = "support/scratch.rs"]
+mod scratch;
 use receipt_fixture::{expected, Fixture};
 use whipplescript_store::workstreams::{
     fork_at_cut_and_admit, ExactForkDestination, StreamStatus, Workstreams,

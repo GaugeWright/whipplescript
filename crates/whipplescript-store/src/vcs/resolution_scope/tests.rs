@@ -12,14 +12,7 @@ impl Drop for Directory {
     }
 }
 fn fixture() -> (Directory, NativeWorkspaceVcs) {
-    let root = std::env::temp_dir().join(format!(
-        "resolution-observations-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = crate::scratch::path("resolution-observations");
     std::fs::create_dir_all(&root).expect("fixture root");
     let mut vcs =
         NativeWorkspaceVcs::open(root.join("branches.sqlite"), root.join("content.sqlite"))

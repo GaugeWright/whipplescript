@@ -937,14 +937,7 @@ mod tests {
 
     #[test]
     fn reopening_a_store_tolerates_only_the_duplicate_column_widening() {
-        let dir = std::env::temp_dir().join(format!(
-            "whipplescript-improve-reopen-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock")
-                .as_nanos(),
-        ));
+        let dir = crate::scratch::path("whipplescript-improve-reopen");
         std::fs::create_dir_all(&dir).expect("create temp dir");
         let path = dir.join("improve.sqlite");
         drop(ImproveStore::open(&path).expect("first open widens a fresh store"));

@@ -39,6 +39,7 @@ fn candidate(instance: &str) -> PublicationCandidate {
             signature: "first-signature".into(),
             successor_signature: None,
         },
+        basis: Default::default(),
     }
 }
 

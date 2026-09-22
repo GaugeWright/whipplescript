@@ -26,14 +26,7 @@ fn report_busy(_: i32) -> bool {
 #[test]
 fn append_waits_for_writer_before_observing_head() {
     for commit_repair in [true, false] {
-        let dir = std::env::temp_dir().join(format!(
-            "whip-append-head-{}-{}-{commit_repair}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let dir = crate::scratch::path(&format!("whip-append-head-{commit_repair}"));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("store.sqlite");
         let owner = SqliteStore::open(&path).unwrap();

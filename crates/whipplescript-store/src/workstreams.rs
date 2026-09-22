@@ -1434,14 +1434,7 @@ mod tests {
 
     #[test]
     fn exact_fork_admission_keeps_source_content_and_rejects_closed_home_first() {
-        let dir = std::env::temp_dir().join(format!(
-            "whipplescript-exact-fork-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock")
-                .as_nanos()
-        ));
+        let dir = crate::scratch::path("whipplescript-exact-fork");
         let mut vcs = crate::vcs::NativeWorkspaceVcs::open(
             dir.join("branches.sqlite"),
             dir.join("content.sqlite"),
@@ -1756,14 +1749,7 @@ mod tests {
 
     #[test]
     fn concurrent_boundary_reservations_have_one_winner() {
-        let path = std::env::temp_dir().join(format!(
-            "whipplescript-workstream-race-{}-{}.sqlite",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock")
-                .as_nanos()
-        ));
+        let path = crate::scratch::file("whipplescript-workstream-race", "sqlite");
         let mut setup = WorkstreamStore::open(&path).expect("setup store");
         setup
             .create_stream("ws", None, "line-ws", "t0", None)

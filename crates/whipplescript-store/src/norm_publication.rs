@@ -21,6 +21,23 @@ pub struct PublicationSlot {
     pub run: String,
 }
 
+/// The durable fact a retention rests on. An observation rests on the
+/// slot's settled run; a build artifact (DR-0124 §14.6) rests on the durable
+/// build record the wrapper appended under the slot's instance, whose payload
+/// is the candidate's invocation. Absent in older payloads, which were runs.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum PublicationBasis {
+    Run {},
+    Event { event_id: String },
+}
+
+impl Default for PublicationBasis {
+    fn default() -> Self {
+        Self::Run {}
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PublicationCandidate {
@@ -29,6 +46,14 @@ pub struct PublicationCandidate {
     pub invocation: Value,
     pub observation: Value,
     pub event: SignedNormEvent,
+    #[serde(default, skip_serializing_if = "PublicationBasis::is_run")]
+    pub basis: PublicationBasis,
+}
+
+impl PublicationBasis {
+    fn is_run(&self) -> bool {
+        matches!(self, Self::Run {})
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -148,21 +173,41 @@ pub fn prepare_in_transaction<S: RuntimeStore>(
                 &candidate.event.statement.action,
             )
             || winner.candidate.event.statement.protocol != candidate.event.statement.protocol
+            || winner.candidate.basis != candidate.basis
         {
             return Err(conflict("slot has different immutable bindings"));
         }
         return Ok(winner);
     }
-    let terminal = store
-        .list_runs(&candidate.slot.instance)?
-        .into_iter()
-        .any(|run| {
-            run.run_id == candidate.slot.run
-                && run.effect_id == candidate.slot.effect
-                && matches!(run.status.as_str(), "completed" | "failed")
-        });
-    if !terminal {
-        return Err(conflict("requires the selected durable terminal run"));
+    match &candidate.basis {
+        PublicationBasis::Run {} => {
+            let terminal = store
+                .list_runs(&candidate.slot.instance)?
+                .into_iter()
+                .any(|run| {
+                    run.run_id == candidate.slot.run
+                        && run.effect_id == candidate.slot.effect
+                        && matches!(run.status.as_str(), "completed" | "failed")
+                });
+            if !terminal {
+                return Err(conflict("requires the selected durable terminal run"));
+            }
+        }
+        PublicationBasis::Event { event_id } => {
+            let recorded = store
+                .list_events(&candidate.slot.instance)?
+                .into_iter()
+                .any(|event| {
+                    event.event_id == *event_id
+                        && serde_json::from_str::<Value>(&event.payload_json)
+                            .is_ok_and(|payload| payload == candidate.invocation)
+                });
+            if !recorded {
+                return Err(conflict(
+                    "requires the durable record it names, with the candidate's invocation as its payload",
+                ));
+            }
+        }
     }
     let payload = serde_json::to_string(candidate)?;
     let key = key(&candidate.slot, PREPARED)?;

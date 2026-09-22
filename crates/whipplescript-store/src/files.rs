@@ -379,14 +379,7 @@ mod tests {
     /// exists round-trip as the file effects expect.
     #[test]
     fn native_file_store_round_trips_through_the_trait() {
-        let dir = std::env::temp_dir().join(format!(
-            "whipplescript-filestore-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock")
-                .as_nanos(),
-        ));
+        let dir = crate::scratch::path("whipplescript-filestore");
         let path = dir.join("nested/note.txt");
         let files: &dyn FileStore = &NativeFileStore;
 
@@ -406,14 +399,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn native_file_store_refuses_symlink_escape() {
-        let dir = std::env::temp_dir().join(format!(
-            "whipplescript-filestore-link-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock")
-                .as_nanos(),
-        ));
+        let dir = crate::scratch::path("whipplescript-filestore-link");
         let root = dir.join("root");
         let outside = dir.join("outside");
         std::fs::create_dir_all(&root).expect("root");
@@ -438,14 +424,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn native_file_store_refuses_a_path_through_an_unresolvable_symlink() {
-        let dir = std::env::temp_dir().join(format!(
-            "whipplescript-filestore-dangling-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock")
-                .as_nanos(),
-        ));
+        let dir = crate::scratch::path("whipplescript-filestore-dangling");
         let root = dir.join("root");
         let outside = dir.join("outside");
         std::fs::create_dir_all(root.join("notes")).expect("root");

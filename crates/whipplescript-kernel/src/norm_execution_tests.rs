@@ -2173,3 +2173,208 @@ fn engineering_charter_receives_a_verified_observation_through_publication() {
         edge.source == observation && edge.target == requirement && edge.relation == "supports"
     }));
 }
+
+/// DR-0124 §14.6: the wrapper publishes an artifact through the journal-retained
+/// path a Home process already uses, keyed by the artifact's identity; the
+/// ledger admits it under `build.publish`; a retry recovers the retained
+/// envelope; a differing candidate for the same identity is refused; and a
+/// task's `implements` edge to the artifact's revision is an ordinary relation.
+#[test]
+fn engineering_charter_receives_a_published_artifact_and_an_implements_edge() {
+    use crate::norm_artifact_publication::{
+        ArtifactSigning, BuildArtifact, PreparedArtifactPublication, INPUT_ROOT_ENCODING_V1,
+    };
+    let charter: NormCharter =
+        serde_json::from_str(include_str!("../../../examples/engineering/charter.json"))
+            .expect("the engineering charter is a charter");
+    let mut ledger = whipplescript_store::items::WorkItemStore::open_in_memory().unwrap();
+    let ledger_id = ledger
+        .append_norm_event(
+            &sign(
+                "root",
+                NormAct::Bootstrap {
+                    creator: "owner".into(),
+                    charter: charter.clone(),
+                },
+            ),
+            &Boundary,
+        )
+        .unwrap();
+    let reference = |name: &str| {
+        Vocabulary::new(
+            charter
+                .vocabularies
+                .iter()
+                .find(|entry| entry.definition.name == name)
+                .unwrap_or_else(|| panic!("charter declares {name}"))
+                .definition
+                .clone(),
+        )
+        .unwrap()
+        .reference()
+        .clone()
+    };
+    let task = ledger
+        .append_norm_event(
+            &sign(
+                "task",
+                NormAct::Create {
+                    ledger: ledger_id.clone(),
+                    authority: None,
+                    vocabulary: reference("task"),
+                    fields_json: json!({"title": "ship the parser", "labels": ["build"]})
+                        .to_string(),
+                },
+            ),
+            &Boundary,
+        )
+        .unwrap();
+    let captured = history(&ledger);
+    let journal = whipplescript_store::SqliteStore::open_in_memory().unwrap();
+    let artifact = BuildArtifact {
+        ledger: ledger_id.clone(),
+        cut: "cut-a0".into(),
+        label: "root//parser:parser".into(),
+        configuration: "cfg:linux-x86_64".into(),
+        outputs: vec![sha256_hex(b"parser binary")],
+        classification: "low".into(),
+        encoding: INPUT_ROOT_ENCODING_V1.into(),
+        action: Some(sha256_hex(b"action")),
+    };
+    let vocabulary = reference("artifact");
+    let actor = actor();
+    let signer = |statement: &NormStatement| Ok(sha256_hex(&statement.signing_bytes().unwrap()));
+    // Without a durable build record the journal retains nothing.
+    let unrecorded = PreparedArtifactPublication::prepare(
+        &artifact,
+        &"0".repeat(64),
+        &captured,
+        &journal,
+        &Boundary,
+        ArtifactSigning {
+            vocabulary: &vocabulary,
+            authority: None,
+            actor: &actor,
+            created_at: "2026-09-22T00:00:00Z",
+        },
+        signer,
+    )
+    .expect_err("an unrecorded build is not published");
+    assert!(
+        unrecorded.contains("durable record it names"),
+        "{unrecorded}"
+    );
+    // The wrapper records the completed build, then publishes it.
+    let build_record = journal
+        .append_event(whipplescript_store::NewEvent {
+            instance_id: &PreparedArtifactPublication::build_instance(&artifact),
+            event_type: PreparedArtifactPublication::BUILD_RECORDED,
+            payload_json: &serde_json::to_string(&artifact).unwrap(),
+            source: "wrapper",
+            causation_id: None,
+            correlation_id: None,
+            idempotency_key: None,
+        })
+        .unwrap()
+        .event_id;
+    let prepared = PreparedArtifactPublication::prepare(
+        &artifact,
+        &build_record,
+        &captured,
+        &journal,
+        &Boundary,
+        ArtifactSigning {
+            vocabulary: &vocabulary,
+            authority: None,
+            actor: &actor,
+            created_at: "2026-09-22T00:00:00Z",
+        },
+        signer,
+    )
+    .unwrap();
+    // A retry for the same identity recovers the retained envelope without signing.
+    let again = PreparedArtifactPublication::prepare(
+        &artifact,
+        &build_record,
+        &captured,
+        &journal,
+        &Boundary,
+        ArtifactSigning {
+            vocabulary: &vocabulary,
+            authority: None,
+            actor: &actor,
+            created_at: "2026-09-22T00:00:00Z",
+        },
+        |_| Err("a retained envelope is never re-signed".into()),
+    )
+    .unwrap();
+    assert_eq!(again.event(), prepared.event());
+    // A different candidate for the same identity is refused.
+    let mut other = artifact.clone();
+    other.outputs = vec![sha256_hex(b"another parser binary")];
+    let refused = PreparedArtifactPublication::prepare(
+        &other,
+        &build_record,
+        &captured,
+        &journal,
+        &Boundary,
+        ArtifactSigning {
+            vocabulary: &vocabulary,
+            authority: None,
+            actor: &actor,
+            created_at: "2026-09-22T00:00:00Z",
+        },
+        signer,
+    )
+    .expect_err("a differing candidate is refused");
+    assert!(refused.contains("differs from the artifact"), "{refused}");
+    let receipt = prepared.submit(&mut ledger, &Boundary).unwrap();
+    receipt.acknowledge(&journal).unwrap();
+    let published = receipt.event_id().to_string();
+    let view = ledger.norm_view(&Boundary).unwrap();
+    let record = &view.records[&published];
+    assert_eq!(record.vocabulary.name, "artifact");
+    assert_eq!(record.status, "recorded");
+    assert_eq!(record.fields["cut"], json!("cut-a0"));
+    assert_eq!(record.fields["encoding"], json!(INPUT_ROOT_ENCODING_V1));
+    assert_eq!(record.fields["classification"], json!("low"));
+    // The task implements the artifact's exact revision, binding the family
+    // basis and both references as premises.
+    let basis = view.relation_family("implementation").unwrap().basis;
+    let statement = NormStatement {
+        protocol: "whipplescript.norm/v1".into(),
+        actor: actor.clone(),
+        nonce: "implements".into(),
+        created_at: "2026-09-22T00:00:00Z".into(),
+        action: NormAct::Create {
+            ledger: ledger_id.clone(),
+            authority: None,
+            vocabulary: reference("implements"),
+            fields_json: json!({"source": task, "target": published}).to_string(),
+        },
+        premises: Some(NormPremises {
+            family_basis: Some(basis),
+            references: vec![task.clone(), published.clone()],
+            inventory_frontier: Vec::new(),
+        }),
+    };
+    let signature = sha256_hex(&statement.signing_bytes().unwrap());
+    ledger
+        .append_norm_event(
+            &SignedNormEvent {
+                statement,
+                signature,
+                successor_signature: None,
+            },
+            &Boundary,
+        )
+        .unwrap();
+    let family = ledger
+        .norm_view(&Boundary)
+        .unwrap()
+        .relation_family("implementation")
+        .unwrap();
+    assert!(family.edges.iter().any(|edge| {
+        edge.source == task && edge.target == published && edge.relation == "implements"
+    }));
+}

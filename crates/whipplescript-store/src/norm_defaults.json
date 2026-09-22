@@ -980,11 +980,86 @@
         "targets": "targets",
         "claim": "claim"
       }
+    },
+    {
+      "definition": {
+        "name": "artifact",
+        "version": "1",
+        "fields": [
+          {
+            "name": "cut",
+            "required": true,
+            "value_type": {
+              "type": "text"
+            }
+          },
+          {
+            "name": "label",
+            "required": true,
+            "value_type": {
+              "type": "text"
+            }
+          },
+          {
+            "name": "configuration",
+            "required": true,
+            "value_type": {
+              "type": "text"
+            }
+          },
+          {
+            "name": "outputs",
+            "required": true,
+            "value_type": {
+              "type": "list",
+              "item": {
+                "type": "text"
+              }
+            }
+          },
+          {
+            "name": "classification",
+            "required": true,
+            "value_type": {
+              "type": "text"
+            }
+          },
+          {
+            "name": "encoding",
+            "required": true,
+            "value_type": {
+              "type": "text"
+            }
+          },
+          {
+            "name": "action",
+            "required": false,
+            "value_type": {
+              "type": "text"
+            }
+          }
+        ],
+        "status": {
+          "values": [
+            "recorded"
+          ],
+          "initial": "recorded",
+          "transitions": []
+        }
+      },
+      "creation": {
+        "requires": "authority",
+        "scope": "build.publish"
+      },
+      "inventory_role": {
+        "kind": "non_requirement"
+      }
     }
   ],
   "owner_scopes": [
     "norm.accept",
-    "norm.retire"
+    "norm.retire",
+    "build.publish"
   ],
   "resource_domains": {
     "workspace": {

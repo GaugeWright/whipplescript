@@ -10,6 +10,7 @@ members = [
     "crates/whipplescript-provider-claude",
     "crates/whipplescript-provider-codex",
     "crates/whipplescript-store",
+    "crates/whipplescript-test-executor",
 ]
 resolver = "2"
 

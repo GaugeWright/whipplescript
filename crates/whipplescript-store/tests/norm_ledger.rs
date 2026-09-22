@@ -1,3 +1,5 @@
+#[path = "support/scratch.rs"]
+mod scratch;
 #[cfg(all(test, feature = "native"))]
 mod tests {
     use p256::ecdsa::signature::{Signer, Verifier};
@@ -387,14 +389,7 @@ mod tests {
     }
     #[test]
     fn norm_native_pin_persists_and_failed_write_rolls_back_bootstrap() {
-        let path = std::env::temp_dir().join(format!(
-            "whip-norm-{}-{}.sqlite",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let path = crate::scratch::file("whip-norm", "sqlite");
         let keys = Keys::new();
         let ledger;
         {
@@ -696,14 +691,7 @@ mod tests {
 
     #[test]
     fn norm_native_checkpoint_survives_missing_succession_and_rotation_write_failure() {
-        let path = std::env::temp_dir().join(format!(
-            "norm-rotation-{}-{}.sqlite",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let path = crate::scratch::file("norm-rotation", "sqlite");
         let keys = Keys::new();
         let mut store = WorkItemStore::open(&path).unwrap();
         let ledger = store.append_norm_event(&keys.bootstrap(), &keys).unwrap();
@@ -1067,14 +1055,7 @@ mod tests {
 
     #[test]
     fn norm_native_upgrades_pre_alias_history_in_local_admission_order() {
-        let path = std::env::temp_dir().join(format!(
-            "norm-alias-upgrade-{}-{}.sqlite",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let path = crate::scratch::file("norm-alias-upgrade", "sqlite");
         let keys = Keys::new();
         let mut store = WorkItemStore::open(&path).unwrap();
         let ledger = store.append_norm_event(&keys.bootstrap(), &keys).unwrap();
@@ -1119,14 +1100,7 @@ mod tests {
 
     #[test]
     fn norm_native_alias_failure_and_missing_evidence_preserve_allocations() {
-        let path = std::env::temp_dir().join(format!(
-            "norm-alias-{}-{}.sqlite",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let path = crate::scratch::file("norm-alias", "sqlite");
         let keys = Keys::new();
         let mut store = WorkItemStore::open(&path).unwrap();
         let ledger = store.append_norm_event(&keys.bootstrap(), &keys).unwrap();
@@ -1199,7 +1173,8 @@ mod tests {
                 "supersedes",
                 "derived_from",
                 "manifest",
-                "correspondence"
+                "correspondence",
+                "artifact"
             ]
         );
         let keys = Keys::new();
@@ -1220,10 +1195,12 @@ mod tests {
         let mut ids = BTreeMap::new();
         for entry in &c.vocabularies {
             // Relations and manifests need resolvable references and bound
-            // premises; their own fixtures exercise them.
+            // premises, and an artifact the owner's `build.publish` scope;
+            // their own fixtures exercise them.
             if entry.relation.is_some()
                 || entry.manifest.is_some()
                 || entry.correspondence.is_some()
+                || entry.definition.name == "artifact"
             {
                 continue;
             }
@@ -3533,6 +3510,334 @@ mod tests {
                 },
             ),
             "no norm record",
+        );
+    }
+
+    /// DR-0124 §14.6: an artifact is a record of the bundled `artifact`
+    /// vocabulary, admitted only under the `build.publish` scope and never
+    /// edited; in the engineering charter a task's `implements` edge to its
+    /// revision is an ordinary relation, and a requirement cannot implement.
+    #[test]
+    fn norm_artifacts_are_bundled_records_under_build_publish_and_implements_is_an_edge() {
+        use whipplescript_store::norm_commands::NormCommandStore;
+        let refused = |result: Result<String, StoreError>, needle: &str| {
+            let message = format!("{:?}", result.expect_err("refusal expected"));
+            assert!(message.contains(needle), "{message}");
+        };
+        let artifact_fields = json!({
+            "cut": "cut-a0", "label": "root//parser:parser", "configuration": "cfg:linux-x86_64",
+            "outputs": ["0a"], "classification": "low", "encoding": "whipplescript.build.input-root/v1"
+        });
+        // The bundled charter.
+        {
+            let keys = Keys::new();
+            let mut store = WorkItemStore::open_in_memory().unwrap();
+            let bundled = NormCharter::bundled().unwrap();
+            assert!(bundled.owner_scopes.contains(&"build.publish".to_string()));
+            let ledger = store
+                .append_norm_event(
+                    &keys.sign(
+                        "owner",
+                        "bundled",
+                        NormAct::Bootstrap {
+                            creator: "worker".into(),
+                            charter: bundled.clone(),
+                        },
+                    ),
+                    &keys,
+                )
+                .unwrap();
+            let artifact = Vocabulary::new(
+                bundled
+                    .vocabularies
+                    .iter()
+                    .find(|entry| entry.definition.name == "artifact")
+                    .expect("the bundled defaults declare artifact")
+                    .definition
+                    .clone(),
+            )
+            .unwrap()
+            .reference()
+            .clone();
+            let create = |actor: &str, nonce: &str| {
+                keys.sign(
+                    actor,
+                    nonce,
+                    NormAct::Create {
+                        ledger: ledger.clone(),
+                        authority: None,
+                        vocabulary: artifact.clone(),
+                        fields_json: artifact_fields.to_string(),
+                    },
+                )
+            };
+            refused(
+                store.append_norm_event(&create("worker", "A-worker"), &keys),
+                "authenticated governance authority",
+            );
+            let a = store
+                .append_norm_event(&create("owner", "A"), &keys)
+                .unwrap();
+            let view = store.norm_state(&keys).unwrap();
+            assert_eq!(view.records[&a].status, "recorded");
+            assert_eq!(view.records[&a].fields, artifact_fields);
+            refused(
+                store.append_norm_event(
+                    &keys.sign(
+                        "owner",
+                        "edit-A",
+                        NormAct::Edit {
+                            ledger: ledger.clone(),
+                            authority: None,
+                            vocabulary: artifact.clone(),
+                            record: a.clone(),
+                            previous: a.clone(),
+                            fields_json: artifact_fields.to_string(),
+                        },
+                    ),
+                    &keys,
+                ),
+                "no edit rule",
+            );
+        }
+        // The engineering charter.
+        let charter: NormCharter =
+            serde_json::from_str(include_str!("../../../examples/engineering/charter.json"))
+                .expect("the engineering charter is a charter");
+        let keys = Keys::new();
+        let mut store = WorkItemStore::open_in_memory().unwrap();
+        let ledger = store
+            .append_norm_event(
+                &keys.sign(
+                    "owner",
+                    "engineering",
+                    NormAct::Bootstrap {
+                        creator: "worker".into(),
+                        charter: charter.clone(),
+                    },
+                ),
+                &keys,
+            )
+            .unwrap();
+        let reference = |name: &str| {
+            Vocabulary::new(
+                charter
+                    .vocabularies
+                    .iter()
+                    .find(|entry| entry.definition.name == name)
+                    .unwrap_or_else(|| panic!("charter declares {name}"))
+                    .definition
+                    .clone(),
+            )
+            .unwrap()
+            .reference()
+            .clone()
+        };
+        let create = |actor: &str, nonce: &str, kind: &str, fields: serde_json::Value| {
+            keys.sign(
+                actor,
+                nonce,
+                NormAct::Create {
+                    ledger: ledger.clone(),
+                    authority: None,
+                    vocabulary: reference(kind),
+                    fields_json: fields.to_string(),
+                },
+            )
+        };
+        let view = |store: &WorkItemStore| store.norm_state(&keys).unwrap();
+        let relate = |actor: &str, nonce: &str, source: &str, target: &str, basis: &str| {
+            keys.sign_with(
+                actor,
+                nonce,
+                NormAct::Create {
+                    ledger: ledger.clone(),
+                    authority: None,
+                    vocabulary: reference("implements"),
+                    fields_json: json!({"source": source, "target": target}).to_string(),
+                },
+                Some(NormPremises {
+                    family_basis: Some(basis.into()),
+                    references: vec![source.into(), target.into()],
+                    inventory_frontier: Vec::new(),
+                }),
+            )
+        };
+        let t = store
+            .append_norm_event(
+                &create("worker", "T", "task", json!({"title": "ship the parser"})),
+                &keys,
+            )
+            .unwrap();
+        let r = store
+            .append_norm_event(
+                &create("worker", "R", "requirement", json!({
+                    "name": "parses", "proposition": "the parser accepts every fixture",
+                    "domain": "src/", "subject": "src/parser.rs", "applicability": "every candidate", "owner": "owner"
+                })),
+                &keys,
+            )
+            .unwrap();
+        refused(
+            store.append_norm_event(
+                &create("worker", "A-worker", "artifact", artifact_fields.clone()),
+                &keys,
+            ),
+            "authenticated governance authority",
+        );
+        let a = store
+            .append_norm_event(
+                &create("owner", "A", "artifact", artifact_fields.clone()),
+                &keys,
+            )
+            .unwrap();
+        let basis = view(&store)
+            .relation_family("implementation")
+            .unwrap()
+            .basis;
+        refused(
+            store.append_norm_event(&relate("worker", "R-implements", &r, &a, &basis), &keys),
+            "undeclared kind",
+        );
+        store
+            .append_norm_event(&relate("worker", "T-implements", &t, &a, &basis), &keys)
+            .unwrap();
+        let family = view(&store).relation_family("implementation").unwrap();
+        assert_eq!(family.edges.len(), 1);
+        assert_eq!(
+            (
+                family.edges[0].source.as_str(),
+                family.edges[0].target.as_str()
+            ),
+            (t.as_str(), a.as_str())
+        );
+        // The artifact has no effectiveness rule: it is a record, not a duty.
+        assert_eq!(
+            view(&store).effective_revision(&view(&store).records[&a]),
+            EffectiveRevision::Unspecified
+        );
+    }
+
+    /// DR-0124 §14.6: a retention names the durable fact it rests on. A
+    /// candidate resting on a durable record is refused until that record
+    /// exists under the slot's instance with the candidate's invocation as
+    /// its payload, and a later candidate for the same slot with a different
+    /// basis has different immutable bindings.
+    #[test]
+    fn norm_publication_retention_rests_on_the_durable_record_it_names() {
+        use whipplescript_store::norm_publication::{
+            NormPublicationJournal, PublicationBasis, PublicationCandidate, PublicationSlot,
+        };
+        let keys = Keys::new();
+        let journal = whipplescript_store::SqliteStore::open_in_memory().unwrap();
+        let ledger = "1".repeat(64);
+        let slot = PublicationSlot {
+            ledger: ledger.clone(),
+            instance: "build:cut-a0".into(),
+            effect: "root//parser:parser#cfg".into(),
+            run: "artifact".into(),
+        };
+        let invocation = json!({"cut": "cut-a0", "label": "root//parser:parser"});
+        let event = keys.sign(
+            "owner",
+            "artifact",
+            NormAct::Create {
+                ledger: ledger.clone(),
+                authority: None,
+                vocabulary: Vocabulary::new(definition()).unwrap().reference().clone(),
+                fields_json: json!({"title": "artifact"}).to_string(),
+            },
+        );
+        let candidate = |basis: PublicationBasis| PublicationCandidate {
+            slot: slot.clone(),
+            invocation: invocation.clone(),
+            observation: invocation.clone(),
+            event: event.clone(),
+            basis,
+        };
+        let refused = |result: Result<_, StoreError>, needle: &str| {
+            let message = format!("{:?}", result.expect_err("refusal expected"));
+            assert!(message.contains(needle), "{message}");
+        };
+        let named = PublicationBasis::Event {
+            event_id: "0".repeat(64),
+        };
+        refused(
+            journal.prepare_publication(&candidate(named.clone())),
+            "durable record it names",
+        );
+        // A record with another payload under the instance does not serve.
+        journal
+            .append_event(whipplescript_store::NewEvent {
+                instance_id: &slot.instance,
+                event_type: "build.recorded",
+                payload_json: &json!({"cut": "cut-b1"}).to_string(),
+                source: "wrapper",
+                causation_id: None,
+                correlation_id: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+        let other = journal
+            .append_event(whipplescript_store::NewEvent {
+                instance_id: &slot.instance,
+                event_type: "build.recorded",
+                payload_json: &json!({"cut": "cut-b1"}).to_string(),
+                source: "wrapper",
+                causation_id: None,
+                correlation_id: None,
+                idempotency_key: Some("other"),
+            })
+            .unwrap()
+            .event_id;
+        refused(
+            journal.prepare_publication(&candidate(PublicationBasis::Event { event_id: other })),
+            "durable record it names",
+        );
+        let record = journal
+            .append_event(whipplescript_store::NewEvent {
+                instance_id: &slot.instance,
+                event_type: "build.recorded",
+                payload_json: &invocation.to_string(),
+                source: "wrapper",
+                causation_id: None,
+                correlation_id: None,
+                idempotency_key: None,
+            })
+            .unwrap()
+            .event_id;
+        let basis = PublicationBasis::Event { event_id: record };
+        let retained = journal
+            .prepare_publication(&candidate(basis.clone()))
+            .unwrap();
+        assert_eq!(retained.candidate.basis, basis);
+        assert_eq!(
+            journal
+                .retained_publication(&slot)
+                .unwrap()
+                .unwrap()
+                .candidate,
+            retained.candidate
+        );
+        // The same slot under another basis is another binding.
+        refused(
+            journal.prepare_publication(&candidate(PublicationBasis::Run {})),
+            "different immutable bindings",
+        );
+        // A run-based candidate on an instance with no settled run is refused as before.
+        let run_slot = PublicationSlot {
+            instance: "instance".into(),
+            ..slot.clone()
+        };
+        refused(
+            journal.prepare_publication(&PublicationCandidate {
+                slot: run_slot,
+                invocation: invocation.clone(),
+                observation: invocation.clone(),
+                event: event.clone(),
+                basis: PublicationBasis::Run {},
+            }),
+            "durable terminal run",
         );
     }
 

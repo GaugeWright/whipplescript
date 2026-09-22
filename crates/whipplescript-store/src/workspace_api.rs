@@ -371,14 +371,7 @@ mod tests {
     use crate::vcs::NativeWorkspaceVcs;
 
     fn vcs() -> NativeWorkspaceVcs {
-        let dir = std::env::temp_dir().join(format!(
-            "whipplescript-wsapi-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock")
-                .as_nanos(),
-        ));
+        let dir = crate::scratch::path("whipplescript-wsapi");
         NativeWorkspaceVcs::open(dir.join("branches.sqlite"), dir.join("content.sqlite"))
             .expect("open vcs")
     }

@@ -4562,8 +4562,7 @@ mod tests {
                 let _ = std::fs::remove_dir_all(&self.0);
             }
         }
-        let scratch =
-            Scratch(std::env::temp_dir().join(format!("whip-tracker-heal-{}", std::process::id())));
+        let scratch = Scratch(crate::scratch::path("whip-tracker-heal"));
         let _ = std::fs::remove_dir_all(&scratch.0);
         std::fs::create_dir_all(&scratch.0).unwrap();
         let path = scratch.0.join("items.sqlite");
@@ -5434,7 +5433,7 @@ mod tests {
     /// BOTH — the drop-a-folder multi-writer exchange.
     #[test]
     fn dir_sync_reconciles_two_clones() {
-        let dir = std::env::temp_dir().join(format!("whip-tracker-sync-{}", std::process::id()));
+        let dir = crate::scratch::path("whip-tracker-sync");
         let _ = std::fs::remove_dir_all(&dir);
 
         let mut a = open_memory();
@@ -5936,11 +5935,7 @@ mod tests {
     /// existing tracker keeps working rather than failing to open.
     #[test]
     fn a_pre_assignment_database_self_heals() {
-        let path = std::env::temp_dir().join(format!(
-            "whip-tracker-selfheal-{}-{:?}.sqlite",
-            std::process::id(),
-            std::thread::current().id(),
-        ));
+        let path = crate::scratch::file("whip-tracker-selfheal", "sqlite");
         let _ = std::fs::remove_file(&path);
         {
             // A pre-0.2.2 shape: the issues table without `assigned_to`.

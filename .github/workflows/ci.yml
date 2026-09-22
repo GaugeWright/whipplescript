@@ -1,5 +1,46 @@
 name: CI
 
+# THE DEEP SUITES ONLY. This workflow runs no part of the green bar.
+#
+# Until 2026-09-22 it carried the per-change gate as well — `green-bar`,
+# `new-refusals`, `windows-compiles` and `hosted-runtime-contracts`, each a
+# required status check on `main` and on the merge queue's ref. GaugeWright
+# DR-0131 moved every gate off the forge: the company's gates execute on its own
+# fleet, which materializes the workspace at the pushed revision, runs
+# `scripts/check.sh required`, and posts the verdict on the commit as the
+# `gaugewright/bar` status. The forge supplies the trigger and displays the
+# verdict and runs no part of a bar (FLEET.md, stage 1: "nothing that runs a
+# bar remains in `.github/`"). The four jobs are gone rather than disabled, and
+# with them the `push`, `pull_request` and `merge_group` triggers, because
+# every job that remains is conditioned on the schedule or on the `deep` input
+# and a per-change run of this file would have started only to skip them all.
+#
+# What each retired job covered, and where it is answered now:
+#
+#   green-bar                 `scripts/check.sh required` — the fleet's bar.
+#   hosted-runtime-contracts  the bar's `hosted-runtime` section. It ran as its
+#                             own job here only so the green-bar job could skip
+#                             it (`WHIPPLESCRIPT_CHECK_SKIP_HOSTED`); the fleet
+#                             runs the bar with the flag unset, so the section
+#                             runs inside the one bar.
+#   windows-compiles          `scripts/check-windows-compile.sh` on a Windows
+#                             runner. The bar's `windows-compile` section skips
+#                             on any other host and says so, and the fleet has
+#                             no Windows host yet: this leg is UNANSWERED until
+#                             one enrolls, and a release still compiles every
+#                             target in dist-workspace.toml.
+#   new-refusals              `scripts/check-new-refusals.sh` against the merge
+#                             base — a question only a diff can ask, so it was
+#                             never in the bar. Run it by hand on a branch that
+#                             adds a refusal until the fleet takes it as a job
+#                             of its own under the manifest's `gate` block.
+#
+# The same file is published to the public mirror verbatim (publish-mirror.sh),
+# so the suites below that are marked mirror-only run there on the weekly cron
+# and on dispatch; `release-readiness` drives scripts and credentials the mirror
+# does not carry and stays here. `mirror-schedule-verdict.yml` reads the
+# mirror's scheduled result back into this repository.
+
 on:
   workflow_dispatch:
     inputs:
@@ -8,49 +49,6 @@ on:
         required: false
         default: false
         type: boolean
-  # NO `paths-ignore`, deliberately, and re-adding one has bitten twice over.
-  #
-  # `green-bar`, `hosted-runtime-contracts`, and `new-refusals` are required
-  # status checks on `main` (`windows-compiles` too, from this file).
-  # A required check that never runs is not pending — it is missing —
-  # so any pull request whose files all matched an ignore list reported BLOCKED
-  # and could not merge at all. That stayed hidden while every documentation
-  # change happened to touch `mkdocs.yml` or an asset outside the list, and
-  # surfaced the first time one did not.
-  #
-  # Nor can a second workflow stand in with same-named no-op jobs, which was the
-  # first repair attempted and is what re-added the bite. GitHub starts a
-  # workflow when ANY changed path matches its `paths`, and skips one only when
-  # EVERY changed path matches its `paths-ignore`, so the two filters are not
-  # complements and a pull request touching both docs and code starts both
-  # workflows. Two check runs of one required name is an ambiguous gate: the
-  # cheap no-op can report green for a context whose real job has not spoken
-  # yet. Each required context gets exactly one producer, and that is this file.
-  #
-  # It was also skipping a gate that had nothing to say about the documentation
-  # in the first place, which was the deeper problem: the programs the docs tell
-  # a reader to run were checked only by `check-release-readiness.sh`, a deep
-  # suite that does not run on a pull request, so breaking one was caught at
-  # release time or not at all. `scripts/check.sh` now runs
-  # `check-docs-snippets.sh` and `check-docs-fences.sh`, so this filter would be
-  # hiding real failures rather than skipping vacuous ones.
-  #
-  # The gate is cheap here: `-src`'s minutes come out of the Enterprise plan's
-  # included allowance, and the mirror runs on GitHub-hosted runners for free
-  # as a public repository. If a future filter is still wanted,
-  # it has to leave the required contexts reported on every pull request, or
-  # the deadlock comes back silently.
-  push:
-    branches: [main]
-  pull_request:
-  # The merge queue re-runs the required checks on a ref that carries the TRUE
-  # prospective base — current main plus every entry queued ahead. A pull
-  # request's own checks run against the base as of run creation, and merging
-  # on them raced: the fourth DR-number collision (two DR-0088s) merged on
-  # checks whose origin/main predated the sibling that claimed the number.
-  # Without this trigger a queued entry times out waiting for required checks
-  # that never start.
-  merge_group:
   schedule:
     - cron: "37 6 * * 2"
 
@@ -60,319 +58,12 @@ permissions:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  # Superseded runs on a branch are wasted minutes, so they still cancel.
-  # Trunk is different: when a burst of merges cancels a run, the run is
-  # recorded as `failure` with no failing job, and that red never meant
-  # anything. A trunk verdict you have to click through to trust is worth
-  # less than the minutes cancelling it saves.
-  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
-
-# WHERE EACH JOB RUNS. This one file is published to the public mirror
-# verbatim, so it is the CI for both repositories and every job says which one
-# it belongs to.
-#
-# The long jobs used to run on the mirror because `-src` is private, billed
-# Actions at 1x, and had exhausted its allowance — jobs there were never
-# assigned a runner or evicted mid-run. That is no longer the constraint:
-# the Enterprise plan's included allowance covers `-src`, so both
-# repositories run on the same GitHub-hosted labels. Blacksmith bridged the
-# gap between those two states and is retired.
-#
-# So the gate comes home. `green-bar` now runs on `-src` too, where the pull
-# requests are, which is the whole point of a gate: a change is checked before
-# it lands rather than after it is published. Until now `rust`-affecting pull
-# requests here reported green having never been compiled by anything.
-#
-# It keeps running on the mirror as well, because the two runs answer different
-# questions: `-src` checks the change, the mirror checks the curated tree
-# `publish-mirror.sh` actually publishes. `mirror-verdict.yml` carries the
-# mirror's verdict back onto the trunk commit, so dropping the mirror run would
-# leave a projection-only breakage reported green there.
-#
-# The repository check stays spelled out in each job rather than hoisted into
-# a variable because `env` is not available to a job-level `if`.
-#
-# None of this is a statement about secrecy. It is about which repository
-# should pay for, and be gated by, the job.
+  # A scheduled or dispatched run of the deep suites is never superseded by a
+  # later one: a cancelled run is recorded as `failure` with no failing job,
+  # and that red never meant anything.
+  cancel-in-progress: false
 
 jobs:
-  # The per-change gate runs the repository's own green bar, so a local pass and
-  # a gate pass cannot mean different things. Add checks to scripts/check.sh.
-  #
-  # Runs on BOTH, for two different reasons. On `-src` it is the gate: it
-  # belongs where the pull requests are, and until it ran here every
-  # `rust`-affecting pull request reported green without being compiled by
-  # anything. On the mirror it is the check on the published projection —
-  # `publish-mirror.sh` builds a curated tree, and this is the only job that
-  # compiles and tests that tree as a whole, so `mirror-verdict.yml` has
-  # something real to carry back to trunk. Pre-merge gating is the `-src` run;
-  # the mirror run is free, and a report of the projection is exactly what it
-  # should be.
-  #
-  # This job spent a while red for a reason that had nothing to do with the
-  # gate coming home, and the diagnosis is worth keeping: the suite was killing
-  # the runner. `terminate_process_tree` in the kernel's command harness
-  # signalled a timed-out provider's process group by shelling out to
-  # `kill -TERM -<pgid>`, and procps-ng reads that leading-dash pgid as an
-  # option rather than an operand — left with no operands it falls back to
-  # signalling pid 0, the caller's own process group. On CI that group holds
-  # the runner agent, so the harness's two timeout tests SIGTERMed and then
-  # SIGKILLed the runner mid-suite. That is why no test ever failed, nothing
-  # panicked, nothing came near a memory or disk limit, and 8 vCPU with 32 GB
-  # died in exactly the same place as 4 vCPU: it was never resource
-  # exhaustion. `-s <SIGNAL> -- -<pgid>` keeps the signal out of operand
-  # position and ends option parsing, and harness.rs pins that argv in a test.
-  green-bar:
-    runs-on: ubuntu-latest
-    # 13 minutes on `main` as of 2026-09-15, and the 20 this used to carry cut
-    # the norm-plane branch off mid-suite with about six minutes of tests left.
-    # A check set grows; a budget sized to what it cost when it was written
-    # stops reporting the suite and starts reporting the clock. Raised with
-    # room for that growth rather than to just past the current number.
-    timeout-minutes: 40
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          submodules: recursive
-          # The green bar's advisory check diffs against the merge base, which a
-          # shallow clone does not have. `scripts/check-new-advisories.sh` exits
-          # non-zero rather than skipping when it cannot find one, so a shallow
-          # checkout here fails the bar loudly instead of quietly auditing
-          # nothing — same reason `new-refusals` fetches full history.
-          fetch-depth: 0
-      # GitHub's ubuntu image ships tens of gigabytes of toolchains this
-      # repository never uses, and the workspace's debug build plus its test
-      # binaries no longer fit in what is left. PR #510 linked with 14 MB free
-      # and `rust-lld` died with SIGBUS, which reads as a compiler crash and is
-      # not one: two jobs reported "could not compile" for a tree that builds
-      # clean. Reclaiming the unused images is cheaper than shrinking the build,
-      # and a disk limit that reports itself as an LLVM bug is worth never
-      # meeting again. Same reasoning as this job's timeout: a check set grows,
-      # and a budget sized to what it cost when it was written stops reporting
-      # the suite and starts reporting its own ceiling.
-      - name: Reclaim runner disk
-        run: |
-          df -h /
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
-            /usr/local/share/boost /usr/local/graalvm /usr/share/swift
-          df -h /
-      # rustup materializes the toolchain named in rust-toolchain.toml.
-      - name: Install Rust
-        run: rustup show active-toolchain || rustup toolchain install
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-      # The green bar audits the dependency tree and checks its supply-chain
-      # policy, so the tools it needs are installed here rather than in workflows
-      # that run those checks separately. cargo-deny is version-pinned because it
-      # gates license and source policy; a floating build could change a verdict
-      # under an unchanged tree.
-      #
-      # cargo-nextest is what the green bar's test section uses when it is
-      # present, so this job installs it rather than letting the gate quietly
-      # fall back to the slower runner. The fallback exists for a workstation
-      # without it, not for CI: if the runner that gates every change took the
-      # other branch, the bar CI reports and the bar the founder runs would be
-      # executing different commands, which is the one thing check.sh exists not
-      # to allow. Unpinned, unlike cargo-deny, because it schedules the same
-      # test binaries rather than deciding a policy verdict.
-      - uses: taiki-e/install-action@3f74d7c16a4242f1c95561e98edc25d36adb4375 # v2.87.12
-        with:
-          tool: cargo-audit, cargo-deny@0.20.2, nextest
-      # The green bar now audits the npm trees too, so this job needs the pinned
-      # Node even though it skips the hosted-runtime contracts below.
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
-        with:
-          node-version-file: .node-version
-      # `cargo test --workspace` includes the five lowered-IR bridge tests, and
-      # the bridge validates against a JSON Schema, so it needs python's
-      # `jsonschema`. This job never asked for it: the package was reaching the
-      # bar only because the GitHub ubuntu image happens to ship one, which
-      # meant the green bar depended on the runner image for a prerequisite it
-      # had not declared, and the tests failed on any host that did not happen
-      # to carry it. Declared here, beside the other three jobs that install
-      # the same file, so the coverage is the job's rather than the image's.
-      - name: Install python test prerequisites
-        run: python3 -m pip install --user -r requirements-dev.txt
-      - name: Green bar
-        # The hosted runtime contracts are the `hosted-runtime-contracts` job
-        # below, which runs the same four steps with the wasm-bindgen/wrangler/
-        # Node toolchain they need. This job installs none of it, so without the
-        # opt-out the green bar fails on missing tooling every run.
-        env:
-          WHIPPLESCRIPT_CHECK_SKIP_HOSTED: "1"
-        # `required` is what makes the tool install above load-bearing. A bare
-        # `scripts/check.sh` reports an absent prerequisite and runs everything
-        # else, so a workstation missing one gets an answer about its change
-        # instead of a red bar about itself. This invocation is the enforced
-        # gate, so it refuses.
-        run: scripts/check.sh required
-
-  # The Windows leg of the green bar. `scripts/check.sh` runs
-  # scripts/check-windows-compile.sh too, and that script — not this job — owns
-  # the command and the reasoning for it: a release compiles every workspace
-  # member for every target in dist-workspace.toml, so a member that uses
-  # std::os::unix outside a cfg passed every gate and then failed the release.
-  #
-  # This job exists because that script cannot answer on a Linux host: rusqlite's
-  # `bundled` build script compiles C for the target, and an MSVC target wants
-  # cl.exe. So the coverage runs here, through the repository's own script, and a
-  # change to the command changes both callers at once. It runs that one script
-  # rather than the whole bar because the rest of the bar needs a toolchain this
-  # runner deliberately does without. windows-latest on both repositories — the
-  # -src runner pool is Linux-only.
-  # A refusal this change ADDS must be pinned by a test that fails without it.
-  #
-  # Its own job rather than a step in the green bar: cost is one crate rebuild
-  # per touched refusal, which is proportional to the change but not to zero,
-  # and a pull request that adds none finishes in seconds. `check.sh` stays the
-  # one command for the required set; this asks a question only a DIFF can ask,
-  # and there is no diff at all when the bar runs locally on a clean tree.
-  new-refusals:
-    # `-src` only. The mirror is a squash-published projection with disjoint
-    # history, so a merge base there names the whole projection rather than a
-    # change, and the sweep would try to pin every refusal in the repository.
-    #
-    # REQUIRED, and therefore on the merge queue's ref too. It went red
-    # nineteen times in its first four days and every merged branch fixed the
-    # finding before landing — a record held purely by each author choosing to
-    # wait for an advisory check, which the queue quietly stopped showing them:
-    # the queue consults only required checks, and on refusal-touching changes
-    # this is the slowest check running, so "enqueue while the sweep still
-    # runs" would merge an unpinned refusal without anyone declining anything.
-    # The queue-ref re-run is not duplication: the sweep's scope is the diff
-    # against the merge base, and the base moving underneath is exactly the
-    # race the queue exists to close.
-    if: ${{ github.repository != 'GaugeWright/whipplescript' }}
-    runs-on: ubuntu-latest
-    # The queue fast-path below reads the pull request's head and its check
-    # verdict; everything else in this job only reads the tree.
-    permissions:
-      contents: read
-      checks: read
-      pull-requests: read
-    # Calibration compiles the 17 independent, unreachable plant mutations
-    # together and runs the real package suite once per file. Actual refusal
-    # trials remain separate. Re-running that whole suite 17 times per file
-    # exhausted this limit on PR #428 before it reached its ninth real site.
-    # Keep the existing limit; reducing repeated calibration is the repair.
-    timeout-minutes: 75
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          submodules: recursive
-          # The sweep diffs against the merge base, which a shallow clone does
-          # not have.
-          fetch-depth: 0
-      # GitHub's ubuntu image ships tens of gigabytes of toolchains this
-      # repository never uses, and the workspace's debug build plus its test
-      # binaries no longer fit in what is left. PR #510 linked with 14 MB free
-      # and `rust-lld` died with SIGBUS, which reads as a compiler crash and is
-      # not one: two jobs reported "could not compile" for a tree that builds
-      # clean. Reclaiming the unused images is cheaper than shrinking the build,
-      # and a disk limit that reports itself as an LLVM bug is worth never
-      # meeting again. Same reasoning as this job's timeout: a check set grows,
-      # and a budget sized to what it cost when it was written stops reporting
-      # the suite and starts reporting its own ceiling.
-      - name: Reclaim runner disk
-        run: |
-          df -h /
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
-            /usr/local/share/boost /usr/local/graalvm /usr/share/swift
-          df -h /
-      - name: Install Rust
-        run: rustup show active-toolchain || rustup toolchain install
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-      # On a pull request the sweep diffs against the merge base with the base
-      # branch. On the merge queue's ref the right base is HEAD^1, not
-      # origin/main: the queue (method SQUASH) builds each entry as ONE
-      # single-parent squashed commit on top of main plus the entries ahead,
-      # so an origin/main diff re-sweeps the entries ahead too — their sites
-      # spend the twelve-site cap in diff order before this entry's own, and
-      # each costs a crate rebuild their own entries already paid for. HEAD^1
-      # scopes the question to what this entry adds to the true base, which is
-      # the question the queue run exists to ask.
-      #
-      # And when that question was already answered: an entry whose tree is
-      # IDENTICAL to the pull request's head, where this same check already
-      # passed, would run the same mutations against the same code — same
-      # tree, and a scope the pull-request run's scope contains. Forwarding
-      # that verdict is a proof, not a shortcut, so the run says whose verdict
-      # it forwards; any doubt — trees differ, the head moved, the check not
-      # green, the ref unparseable — falls through to the full sweep. The
-      # forwarded verdict carries the pull-request run's own declared
-      # cap-skips; this path never narrows what that run said.
-      - name: Sweep the refusals this change touched
-        env:
-          GH_TOKEN: ${{ github.token }}
-          MG_HEAD_REF: ${{ github.event.merge_group.head_ref }}
-        run: |
-          if [ "${{ github.event_name }}" != "merge_group" ]; then
-            exec scripts/check-new-refusals.sh "origin/${{ github.base_ref || 'main' }}"
-          fi
-          prnum="$(sed -nE 's|.*/pr-([0-9]+)-.*|\1|p' <<< "$MG_HEAD_REF")"
-          if [ -n "$prnum" ]; then
-            pr_head="$(gh api "repos/$GITHUB_REPOSITORY/pulls/$prnum" --jq .head.sha 2>/dev/null || true)"
-            pr_tree="$(gh api "repos/$GITHUB_REPOSITORY/commits/$pr_head" --jq .commit.tree.sha 2>/dev/null || true)"
-            if [ -n "$pr_tree" ] && [ "$pr_tree" = "$(git rev-parse 'HEAD^{tree}')" ]; then
-              verdict="$(gh api "repos/$GITHUB_REPOSITORY/commits/$pr_head/check-runs?check_name=new-refusals" \
-                --jq '[.check_runs[] | select(.name=="new-refusals")] | sort_by(.completed_at) | last | .conclusion // empty' 2>/dev/null || true)"
-              if [ "$verdict" = "success" ]; then
-                echo "queue tree is identical to pull request #$prnum head $pr_head, whose sweep passed;"
-                echo "forwarding that verdict — same tree, contained scope, same answer."
-                exit 0
-              fi
-            fi
-          fi
-          exec scripts/check-new-refusals.sh HEAD^1
-
-  windows-compiles:
-    runs-on: windows-latest
-    # An optimised `dist`-profile build of the whole workspace, cold on the
-    # first run of a cache key. Twenty minutes, the rest of this file's figure,
-    # is a check's budget rather than a build's.
-    timeout-minutes: 60
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          submodules: recursive
-      - name: Install Rust
-        run: rustup show active-toolchain || rustup toolchain install
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-      - name: Check the workspace for x86_64-pc-windows-msvc
-        shell: bash
-        run: scripts/check-windows-compile.sh
-
-  # Runs on BOTH: it finishes in about two minutes, inside what `-src` can
-  # sustain, and it is the one gate that touches Worker deploy configuration.
-  hosted-runtime-contracts:
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    defaults:
-      run:
-        working-directory: crates/whipplescript-host-do/worker
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          submodules: recursive
-      # rustup materializes the toolchain and wasm target named in
-      # rust-toolchain.toml.
-      - name: Install Rust
-        run: rustup show active-toolchain || rustup toolchain install
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-      - name: Install matching wasm-bindgen CLI
-        run: cargo install wasm-bindgen-cli --version 0.2.126 --locked
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
-        with:
-          node-version-file: .node-version
-          cache: npm
-          cache-dependency-path: crates/whipplescript-host-do/worker/package-lock.json
-      - run: npm ci
-      - name: Inventory production runtime routes and run authenticated compositions
-        run: npm test
-      - name: Typecheck Worker
-        run: npx tsc --noEmit
-      - name: Build production public Worker artifact
-        run: npx wrangler deploy --config wrangler.public.toml --dry-run --outdir dist-ci
-
   # Mirror only — 112 Maude tests, about ten minutes; free on the mirror.
   formal-models:
     if: ${{ github.repository == 'GaugeWright/whipplescript' && (github.event_name == 'schedule' || inputs.deep) }}
@@ -396,8 +87,9 @@ jobs:
 
   # Mirror only — the Lean proof layer, on the deep schedule with the other
   # model suites. It is the quick one: hermetic, offline, no Mathlib, fifteen
-  # targets. Until #291 it ran nowhere at all, and read as covered because
-  # `sync-public-mirror.yml` names the script in a `paths:` trigger filter.
+  # targets. Until #291 it ran nowhere at all, and read as covered because the
+  # since-retired `sync-public-mirror.yml` named the script in a `paths:`
+  # trigger filter.
   lean-models:
     if: ${{ github.repository == 'GaugeWright/whipplescript' && (github.event_name == 'schedule' || inputs.deep) }}
     runs-on: ubuntu-latest
@@ -481,13 +173,6 @@ jobs:
   # cancellation policy matrix, the control-plane driver, the docs site.
   # `scripts/README.md` already described this job as "on schedule or dispatch";
   # the condition is what did not say so.
-  #
-  # The comment this replaces justified dispatch-only as "far too long for
-  # `-src`'s weekly cron to ever finish". That reasoning belongs to the era when
-  # `-src` had exhausted its Actions allowance and jobs there were evicted; the
-  # header of this file records that constraint as retired, and every other deep
-  # job already runs on the cron. The 20-minute timeout below is the real budget,
-  # and it is the same one the dispatch path has always had.
   #
   # Every sibling deep job spells the same pair the same way — see formal-models,
   # lean-models, tla-models, e2e, report-schemas above; only the repository half

@@ -15059,6 +15059,13 @@ fn column_exists(connection: &Connection, table: &str, column: &str) -> StoreRes
 #[cfg(all(test, feature = "native"))]
 mod read_only_tests;
 
+// One scratch-path helper for every fixture in the crate. It lives with the
+// integration tests' support code, which include it the same way, so the unit
+// and integration tests share one copy without a dev-dependency.
+#[cfg(test)]
+#[path = "../tests/support/scratch.rs"]
+mod scratch;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -15386,14 +15393,7 @@ mod tests {
 
     #[test]
     fn opening_v2_store_adds_optional_fact_validity() {
-        let path = std::env::temp_dir().join(format!(
-            "whipplescript-store-v2-validity-{}-{}.sqlite",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("system time")
-                .as_nanos()
-        ));
+        let path = crate::scratch::file("whipplescript-store-v2-validity", "sqlite");
         {
             let connection = Connection::open(&path).expect("v2 db opens");
             connection
@@ -15521,14 +15521,7 @@ mod tests {
     /// and leaves the store untouched.
     #[test]
     fn store_stamped_by_a_newer_build_refuses_to_open() {
-        let path = std::env::temp_dir().join(format!(
-            "whipplescript-store-downgrade-{}-{}.sqlite",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("system time")
-                .as_nanos()
-        ));
+        let path = crate::scratch::file("whipplescript-store-downgrade", "sqlite");
         drop(SqliteStore::open(&path).expect("fresh store opens"));
         {
             let connection = Connection::open(&path).expect("raw connection opens");
@@ -15775,14 +15768,7 @@ mod tests {
     fn opening_file_store_hardens_file_permissions() {
         use std::os::unix::fs::PermissionsExt;
 
-        let path = std::env::temp_dir().join(format!(
-            "whipplescript-store-permissions-{}-{}.sqlite",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock is after epoch")
-                .as_nanos()
-        ));
+        let path = crate::scratch::file("whipplescript-store-permissions", "sqlite");
         fs::write(&path, "").expect("precreated store file writes");
         fs::set_permissions(&path, fs::Permissions::from_mode(0o644))
             .expect("precreated permissions set");
@@ -16208,14 +16194,7 @@ mod tests {
     /// over here.
     #[test]
     fn reopening_after_an_interrupted_backfill_stays_refused() {
-        let dir = std::env::temp_dir().join(format!(
-            "whip-reopen-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock")
-                .as_nanos()
-        ));
+        let dir = crate::scratch::path("whip-reopen");
         std::fs::create_dir_all(&dir).expect("scratch dir");
         let path = dir.join("store.sqlite");
 
@@ -16278,14 +16257,7 @@ mod tests {
     /// downstream symptom.
     #[test]
     fn concurrent_unguarded_appends_all_land() {
-        let dir = std::env::temp_dir().join(format!(
-            "whip-append-race-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock")
-                .as_nanos()
-        ));
+        let dir = crate::scratch::path("whip-append-race");
         std::fs::create_dir_all(&dir).expect("scratch dir");
         let path = dir.join("store.sqlite");
         SqliteStore::open(&path).expect("store initialises");
@@ -20814,11 +20786,7 @@ mod tests {
     /// claim that rests on one.
     #[test]
     fn a_satellite_store_stamps_its_file_and_refuses_a_newer_one() {
-        let dir = std::env::temp_dir().join(format!(
-            "whip-satellite-stamp-{}-{}",
-            std::process::id(),
-            SUPPORTED_SCHEMA_VERSION
-        ));
+        let dir = crate::scratch::path("whip-satellite-stamp");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("temp dir");
         let path = dir.join("coordination.sqlite");
@@ -21406,11 +21374,7 @@ mod tests {
         // first refusal, so the loop rarely runs to the bound.
         const APPENDS: usize = 2000;
 
-        let dir = std::env::temp_dir().join(format!(
-            "whip-superseded-{}-{}",
-            std::process::id(),
-            APPENDS
-        ));
+        let dir = crate::scratch::path("whip-superseded");
         std::fs::create_dir_all(&dir).expect("scratch dir");
         let path = dir.join("store.sqlite");
 
@@ -22917,14 +22881,7 @@ mod tests {
 
     #[test]
     fn opening_v1_store_adds_diagnostic_columns() {
-        let path = std::env::temp_dir().join(format!(
-            "whipplescript-store-v1-{}-{}.sqlite",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("system time")
-                .as_nanos()
-        ));
+        let path = crate::scratch::file("whipplescript-store-v1", "sqlite");
         {
             let connection = Connection::open(&path).expect("v1 db opens");
             connection
@@ -23131,14 +23088,7 @@ mod tests {
 
     #[test]
     fn opening_v1_store_adds_workspace_table() {
-        let path = std::env::temp_dir().join(format!(
-            "whipplescript-store-workspace-v1-{}-{}.sqlite",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("system time")
-                .as_nanos()
-        ));
+        let path = crate::scratch::file("whipplescript-store-workspace-v1", "sqlite");
         {
             let connection = Connection::open(&path).expect("v1 db opens");
             connection
@@ -23615,14 +23565,7 @@ mod tests {
 
     #[test]
     fn store_open_ready_layout_does_not_acquire_writer_lock() {
-        let dir = std::env::temp_dir().join(format!(
-            "store-ready-open-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock")
-                .as_nanos()
-        ));
+        let dir = crate::scratch::path("store-ready-open");
         std::fs::create_dir(&dir).expect("fixture directory");
         let path = dir.join("store.sqlite");
         let mut writer = SqliteStore::open(&path).expect("initialize and validate layout");
@@ -23650,14 +23593,7 @@ mod tests {
             return;
         }
         for changed in [false, true] {
-            let dir = std::env::temp_dir().join(format!(
-                "store-cold-open-{}-{}-{changed}",
-                std::process::id(),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .expect("clock")
-                    .as_nanos()
-            ));
+            let dir = crate::scratch::path(&format!("store-cold-open-{changed}"));
             std::fs::create_dir(&dir).expect("fixture directory");
             let path = dir.join("store.sqlite");
             let mut writer = SqliteStore::open(&path).expect("initialize layout");
@@ -25002,14 +24938,7 @@ mod tests {
 
     #[test]
     fn provider_validation_evidence_records_refs_and_reopens() {
-        let path = std::env::temp_dir().join(format!(
-            "whipplescript-provider-validation-evidence-{}-{}.sqlite",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("time after epoch")
-                .as_nanos()
-        ));
+        let path = crate::scratch::file("whipplescript-provider-validation-evidence", "sqlite");
         {
             let mut store = SqliteStore::open(&path).expect("store opens");
             let version = store
@@ -25101,14 +25030,7 @@ mod tests {
 
     #[test]
     fn codex_app_server_evidence_records_refs_and_reopens() {
-        let path = std::env::temp_dir().join(format!(
-            "whipplescript-codex-app-server-evidence-{}-{}.sqlite",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("time after epoch")
-                .as_nanos()
-        ));
+        let path = crate::scratch::file("whipplescript-codex-app-server-evidence", "sqlite");
         {
             let mut store = SqliteStore::open(&path).expect("store opens");
             let version = store
@@ -25184,14 +25106,7 @@ mod tests {
 
     #[test]
     fn claude_agent_sdk_evidence_records_refs_and_reopens() {
-        let path = std::env::temp_dir().join(format!(
-            "whipplescript-claude-agent-sdk-evidence-{}-{}.sqlite",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("time after epoch")
-                .as_nanos()
-        ));
+        let path = crate::scratch::file("whipplescript-claude-agent-sdk-evidence", "sqlite");
         {
             let mut store = SqliteStore::open(&path).expect("store opens");
             let version = store

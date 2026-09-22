@@ -1,0 +1,45 @@
+load ../store-authorization.maude
+--- blob d has two admitted uses: u under low, v under high. p holds low with a
+--- handle to u and knows the digest; q holds high with a handle to v.
+--- positive: a handle plus the use's label reads the bytes
+search [1] in STORE-AUTHORIZATION : { blob(d) use(u, d, low) use(v, d, high) holds(p, low) handle(p, u) knows(p, d) fetch(p, u) }
+  =>* { bytes(p, u) RESIDUAL:Cfg } .
+--- refusal: the digest alone reads nothing through the high use
+search in STORE-AUTHORIZATION : { blob(d) use(u, d, low) use(v, d, high) holds(p, low) handle(p, u) knows(p, d) fetch(p, v) }
+  =>* { bytes(p, v) RESIDUAL:Cfg } .
+--- weakening: possession of the digest is access
+search [1] in STORE-AUTHORIZATION-DIGEST : { blob(d) use(u, d, low) use(v, d, high) holds(p, low) handle(p, u) knows(p, d) fetch(p, v) }
+  =>* { bytes(p, v) RESIDUAL:Cfg } .
+--- refusal: a handle to the high use without the label reads nothing
+search in STORE-AUTHORIZATION : { blob(d) use(u, d, low) use(v, d, high) holds(p, low) handle(p, v) fetch(p, v) }
+  =>* { bytes(p, v) RESIDUAL:Cfg } .
+--- positive: identical bytes keep their labels apart — the high use is read
+--- by the principal who holds high, and never by the one who holds only the low use
+search [1] in STORE-AUTHORIZATION : { blob(d) use(u, d, low) use(v, d, high) holds(q, high) handle(q, v) fetch(q, v) }
+  =>* { bytes(q, v) RESIDUAL:Cfg } .
+--- weakening: deduplication merges the labels, and the low principal reads the high use
+search [1] in STORE-AUTHORIZATION-DEDUP : { blob(d) use(u, d, low) use(v, d, high) holds(p, low) handle(p, u) handle(p, v) fetch(p, v) }
+  =>* { bytes(p, v) RESIDUAL:Cfg } .
+--- positive: an existence query outside the view is not seen, and the
+--- duplicate upload is accepted; inside the view it exists
+search [1] in STORE-AUTHORIZATION : { blob(d) use(v, d, high) holds(p, low) holds(q, high) missing(p, d) upload(p, d) missing(q, d) }
+  =>* { notSeen(p, d) accepted(p, d) exists(q, d) RESIDUAL:Cfg } .
+--- refusal: the query never discloses existence outside the view
+search in STORE-AUTHORIZATION : { blob(d) use(v, d, high) holds(p, low) missing(p, d) }
+  =>* { exists(p, d) RESIDUAL:Cfg } .
+--- weakening: the existence oracle
+search [1] in STORE-AUTHORIZATION-ORACLE : { blob(d) use(v, d, high) holds(p, low) missing(p, d) }
+  =>* { exists(p, d) RESIDUAL:Cfg } .
+--- positive: an approved executor's execution is evidence
+search [1] in STORE-AUTHORIZATION : { blob(d) approved(x) executed(x, act, d) }
+  =>* { evidence(act, d) RESIDUAL:Cfg } .
+--- refusal: a client-submitted result with a matching digest is a claim, never evidence
+search in STORE-AUTHORIZATION : { blob(d) approved(x) submit(p, act, d) }
+  =>* { evidence(act, d) RESIDUAL:Cfg } .
+--- refusal: nor is an unapproved executor's execution
+search in STORE-AUTHORIZATION : { blob(d) approved(x) executed(y, act, d) }
+  =>* { evidence(act, d) RESIDUAL:Cfg } .
+--- weakening: the submission trusted
+search [1] in STORE-AUTHORIZATION-CLIENT : { blob(d) approved(x) submit(p, act, d) }
+  =>* { evidence(act, d) RESIDUAL:Cfg } .
+quit .

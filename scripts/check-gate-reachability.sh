@@ -64,9 +64,10 @@ seed "section.sh"
 # A `paths:` / `paths-ignore:` filter is not that. It names files whose CHANGE
 # should trigger a workflow, which is the opposite claim from "this workflow
 # runs it" — and the two are indistinguishable to a bare grep. Found the hard
-# way: `sync-public-mirror.yml` lists `scripts/check-lean-models.sh` among the
-# paths that trigger a mirror sync, and that mention alone made a gate nothing
-# has ever run read as reachable. Same fault as the comment case below, one
+# way: `sync-public-mirror.yml` listed `scripts/check-lean-models.sh` among the
+# paths that triggered a mirror sync, and that mention alone made a gate nothing
+# has ever run read as reachable. That workflow is retired — the fleet publishes
+# the mirror now — and the rule it taught is not. Same fault as the comment case below, one
 # file type over: a mention that looks like a call.
 while IFS= read -r name; do
   seed "$name"

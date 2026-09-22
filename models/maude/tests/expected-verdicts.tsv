@@ -287,3 +287,5 @@ hosted-impact-route.maude	SNSNSNS
 relation-validation-scope.maude	SSNSSNSNSS
 manifest-completeness.maude	SSNSSNSSSNS
 correspondence-reuse.maude	SNSNSSNSS
+action-classification.maude	SNSSSSSNSSNSSNS
+store-authorization.maude	SNSNSSSNSSNNS

@@ -1,0 +1,93 @@
+--- DR-0124 §14.3: five rules at the store boundary. Possession of a digest
+--- grants no access; a matching digest does not authenticate the producer; identical
+--- bytes do not acquire one label; existence is a disclosure; a cached result
+--- keeps its classification (modeled with the cache in
+--- `action-classification.maude`). One blob, two admitted uses of its bytes
+--- under two labels, one approved executor, two principals. The wire protocol,
+--- the handle mechanism and the labels' lattice beyond two points are not
+--- modeled.
+mod STORE-AUTHORIZATION is
+  protecting BOOL .
+  sorts Blob Use Act Exec Lbl Prin Fact Cfg State .
+  op d : -> Blob [ctor] .
+  ops u v : -> Use [ctor] .
+  op act : -> Act [ctor] .
+  ops x y : -> Exec [ctor] .
+  ops low high : -> Lbl [ctor] .
+  ops p q : -> Prin [ctor] .
+  subsort Fact < Cfg .
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+  op {_} : Cfg -> State [ctor] .
+  --- the store: a blob's bytes, and each admitted use of them under a label
+  op blob : Blob -> Fact [ctor] .
+  op use : Use Blob Lbl -> Fact [ctor] .
+  --- principals: what they hold, know, and have handles to
+  op holds : Prin Lbl -> Fact [ctor] .
+  op knows : Prin Blob -> Fact [ctor] .
+  op handle : Prin Use -> Fact [ctor] .
+  --- reads: a request through a use (consumed), and what comes back
+  op fetch : Prin Use -> Fact [ctor] .
+  op bytes : Prin Use -> Fact [ctor] .
+  --- existence: a missing-blobs query (consumed) and an upload (consumed)
+  op missing : Prin Blob -> Fact [ctor] .
+  op exists : Prin Blob -> Fact [ctor] .
+  op notSeen : Prin Blob -> Fact [ctor] .
+  op upload : Prin Blob -> Fact [ctor] .
+  op accepted : Prin Blob -> Fact [ctor] .
+  --- producers: an approved executor, an execution it performed, and a
+  --- client's submitted result (consumed)
+  op approved : Exec -> Fact [ctor] .
+  op executed : Exec Act Blob -> Fact [ctor] .
+  op submit : Prin Act Blob -> Fact [ctor] .
+  op claim : Prin Act Blob -> Fact [ctor] .
+  op evidence : Act Blob -> Fact [ctor] .
+  var P : Prin . var B : Blob . vars U V : Use . vars L M H : Lbl . var C : Cfg . var E : Exec . var A : Act .
+  op join : Lbl Lbl -> Lbl [comm] .
+  eq join(high, L) = high .
+  eq join(low, low) = low .
+  op leq : Lbl Lbl -> Bool .
+  eq leq(L, H) = join(L, H) == H .
+  --- 1. a read needs a handle to the use, and the use's label
+  crl [read] : { fetch(P, U) handle(P, U) use(U, B, L) holds(P, H) C }
+    => { bytes(P, U) handle(P, U) use(U, B, L) holds(P, H) C } if leq(L, H) .
+  --- 4. an existence query answers only within the caller's view; outside it
+  --- the blob is not seen and the duplicate upload is accepted
+  crl [exists-in-view] : { missing(P, B) use(U, B, L) holds(P, H) C }
+    => { exists(P, B) use(U, B, L) holds(P, H) C } if leq(L, H) .
+  crl [not-in-view] : { missing(P, B) use(U, B, L) holds(P, H) C }
+    => { notSeen(P, B) use(U, B, L) holds(P, H) C } if not leq(L, H) .
+  rl [accept-upload] : { upload(P, B) C } => { accepted(P, B) C } .
+  --- 2. evidence comes from an approved executor's execution; a submitted
+  --- result is a claim
+  rl [execution] : { executed(E, A, B) approved(E) C } => { evidence(A, B) executed(E, A, B) approved(E) C } .
+  rl [submission] : { submit(P, A, B) C } => { claim(P, A, B) C } .
+endm
+
+--- Weakening: possession of the digest is access.
+mod STORE-AUTHORIZATION-DIGEST is
+  including STORE-AUTHORIZATION .
+  var P : Prin . var B : Blob . var U : Use . var L : Lbl . var C : Cfg .
+  rl [read-by-digest] : { fetch(P, U) knows(P, B) use(U, B, L) C } => { bytes(P, U) knows(P, B) use(U, B, L) C } .
+endm
+
+--- Weakening: the existence oracle answers outside the view.
+mod STORE-AUTHORIZATION-ORACLE is
+  including STORE-AUTHORIZATION .
+  var P : Prin . var B : Blob . var C : Cfg .
+  rl [exists-anywhere] : { missing(P, B) blob(B) C } => { exists(P, B) blob(B) C } .
+endm
+
+--- Weakening: deduplication merges the labels of identical bytes.
+mod STORE-AUTHORIZATION-DEDUP is
+  including STORE-AUTHORIZATION .
+  var B : Blob . vars U V : Use . vars L M : Lbl . var C : Cfg .
+  rl [merge-labels] : { use(U, B, L) use(V, B, M) C } => { use(U, B, L) use(V, B, L) C } .
+endm
+
+--- Weakening: a client-submitted result is producer evidence.
+mod STORE-AUTHORIZATION-CLIENT is
+  including STORE-AUTHORIZATION .
+  var P : Prin . var A : Act . var B : Blob . var C : Cfg .
+  rl [trust-submission] : { submit(P, A, B) C } => { evidence(A, B) C } .
+endm

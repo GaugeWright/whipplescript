@@ -206,12 +206,7 @@ fn tracker_control_every_transaction_boundary_rolls_back() {
 struct Fixture(std::path::PathBuf);
 impl Fixture {
     fn new() -> Self {
-        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let path = std::env::temp_dir().join(format!(
-            "whip-controls-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-        ));
+        let path = crate::scratch::path("whip-controls");
         std::fs::create_dir(&path).unwrap();
         Self(path)
     }

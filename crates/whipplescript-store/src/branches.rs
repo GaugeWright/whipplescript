@@ -2091,14 +2091,7 @@ mod tests {
     /// test — which is the only reason it is fixed before it mattered.
     #[test]
     fn a_concurrently_pinned_cut_keeps_exactly_one_pin() {
-        let dir = std::env::temp_dir().join(format!(
-            "whip-pin-race-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock")
-                .as_nanos()
-        ));
+        let dir = crate::scratch::path("whip-pin-race");
         std::fs::create_dir_all(&dir).expect("scratch dir");
         let path = dir.join("branches.sqlite");
         {
@@ -2310,14 +2303,7 @@ mod tests {
     /// forever.
     #[test]
     fn concurrent_pins_and_releases_leave_no_orphaned_hold() {
-        let dir = std::env::temp_dir().join(format!(
-            "whip-pinrace-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock")
-                .as_nanos()
-        ));
+        let dir = crate::scratch::path("whip-pinrace");
         std::fs::create_dir_all(&dir).expect("scratch dir");
         let path = dir.join("branches.sqlite");
         {
@@ -2769,15 +2755,7 @@ mod tests {
 
     impl TempBranchDir {
         fn new(label: &str) -> Self {
-            let dir = std::env::temp_dir().join(format!(
-                "whipplescript-branches-{}-{}-{}",
-                label,
-                std::process::id(),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .expect("clock")
-                    .as_nanos(),
-            ));
+            let dir = crate::scratch::path(&format!("whipplescript-branches-{label}"));
             std::fs::create_dir_all(&dir).expect("create branches temp dir");
             Self(dir)
         }

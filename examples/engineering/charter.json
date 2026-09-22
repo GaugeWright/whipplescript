@@ -1568,6 +1568,159 @@
           "asserted"
         ]
       }
+    },
+    {
+      "definition": {
+        "name": "artifact",
+        "version": "1",
+        "fields": [
+          {
+            "name": "cut",
+            "required": true,
+            "value_type": {
+              "type": "text"
+            }
+          },
+          {
+            "name": "label",
+            "required": true,
+            "value_type": {
+              "type": "text"
+            }
+          },
+          {
+            "name": "configuration",
+            "required": true,
+            "value_type": {
+              "type": "text"
+            }
+          },
+          {
+            "name": "outputs",
+            "required": true,
+            "value_type": {
+              "type": "list",
+              "item": {
+                "type": "text"
+              }
+            }
+          },
+          {
+            "name": "classification",
+            "required": true,
+            "value_type": {
+              "type": "text"
+            }
+          },
+          {
+            "name": "encoding",
+            "required": true,
+            "value_type": {
+              "type": "text"
+            }
+          },
+          {
+            "name": "action",
+            "required": false,
+            "value_type": {
+              "type": "text"
+            }
+          }
+        ],
+        "status": {
+          "values": [
+            "recorded"
+          ],
+          "initial": "recorded",
+          "transitions": []
+        }
+      },
+      "creation": {
+        "requires": "authority",
+        "scope": "build.publish"
+      },
+      "inventory_role": {
+        "kind": "non_requirement"
+      }
+    },
+    {
+      "definition": {
+        "name": "implements",
+        "version": "1",
+        "fields": [
+          {
+            "name": "source",
+            "required": true,
+            "value_type": {
+              "type": "reference",
+              "form": "revision"
+            }
+          },
+          {
+            "name": "target",
+            "required": true,
+            "value_type": {
+              "type": "reference",
+              "form": "revision"
+            }
+          },
+          {
+            "name": "note",
+            "required": false,
+            "value_type": {
+              "type": "text"
+            }
+          }
+        ],
+        "status": {
+          "values": [
+            "asserted",
+            "withdrawn"
+          ],
+          "initial": "asserted",
+          "transitions": [
+            {
+              "from": "asserted",
+              "to": "withdrawn",
+              "admission": {
+                "requires": "public"
+              }
+            },
+            {
+              "from": "withdrawn",
+              "to": "asserted",
+              "admission": {
+                "requires": "public"
+              }
+            }
+          ]
+        }
+      },
+      "creation": {
+        "requires": "public"
+      },
+      "editing": {
+        "requires": "public"
+      },
+      "inventory_role": {
+        "kind": "non_requirement"
+      },
+      "relation": {
+        "source": "source",
+        "target": "target",
+        "source_kinds": [
+          "task",
+          "release"
+        ],
+        "target_kinds": [
+          "artifact"
+        ],
+        "family": "implementation",
+        "acyclic": true,
+        "live_statuses": [
+          "asserted"
+        ]
+      }
     }
   ],
   "owner_scopes": [
@@ -1575,6 +1728,7 @@
     "norm.retire",
     "work.commit",
     "release.admit",
-    "observe.publish"
+    "observe.publish",
+    "build.publish"
   ]
 }

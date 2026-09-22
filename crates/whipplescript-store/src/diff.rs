@@ -499,14 +499,7 @@ mod tests {
     #[cfg(feature = "native")]
     #[test]
     fn manifest_diff_reports_kinds_and_honest_unavailability() {
-        let dir = std::env::temp_dir().join(format!(
-            "whipplescript-diff-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock")
-                .as_nanos(),
-        ));
+        let dir = crate::scratch::path("whipplescript-diff");
         let content = crate::content::ContentStore::open(dir.join("content.sqlite"))
             .expect("open content store");
         let old_hash = content.put_text("line one\nline two\n").expect("put");
@@ -550,7 +543,7 @@ mod binary_tests {
     /// about a file sitting right there.
     #[test]
     fn a_changed_binary_file_reports_binary_rather_than_unavailable() {
-        let dir = std::env::temp_dir().join(format!("whip-diff-binary-{}", std::process::id()));
+        let dir = crate::scratch::path("whip-diff-binary");
         let _ = std::fs::remove_dir_all(&dir);
         let store = ContentStore::open(dir.join("content.db")).expect("open");
         let before = store.put(&[0x89, b'P', b'N', b'G', 0x0d]).expect("put");
@@ -576,7 +569,7 @@ mod binary_tests {
     /// Text beside it still diffs, line by line.
     #[test]
     fn text_still_diffs_beside_it() {
-        let dir = std::env::temp_dir().join(format!("whip-diff-text-{}", std::process::id()));
+        let dir = crate::scratch::path("whip-diff-text");
         let _ = std::fs::remove_dir_all(&dir);
         let store = ContentStore::open(dir.join("content.db")).expect("open");
         let before = store.put_text("one\ntwo\n").expect("put");

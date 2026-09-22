@@ -68,14 +68,7 @@ mod tests {
     #[test]
     fn native_preparation_preserves_erasure_under_replay_and_reopen() {
         conformance::check(|| ContentStore::open(":memory:").unwrap());
-        let path = std::env::temp_dir().join(format!(
-            "whipple-input-preparation-{}-{}.sqlite",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos(),
-        ));
+        let path = crate::scratch::file("whipple-input-preparation", "sqlite");
         let body = b"saved-source input";
         let store = ContentStore::open(&path).unwrap();
         let id = store.put_unerased(body).unwrap();

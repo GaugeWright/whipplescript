@@ -7,8 +7,9 @@
 # Run by the `lean-models` job on the mirror's deep schedule, and by hand when
 # models/lean changes — it needs a Lean toolchain (`lake`), which is why it is a
 # deep suite rather than part of the bar. It was reachable from nothing at all
-# until 2026-08-29: `sync-public-mirror.yml` names it in a `paths:` trigger
-# filter, and the reachability gate read that mention as a caller.
+# until 2026-08-29: the since-retired `sync-public-mirror.yml` named it in a
+# `paths:` trigger filter, and the reachability gate read that mention as a
+# caller.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

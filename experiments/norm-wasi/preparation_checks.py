@@ -18,7 +18,7 @@ if not path.is_file():
         f"norm readiness metadata absent at {path}: run "
         f"`python3 {HERE / 'prepare.py'} --fetch` first. That builder requires a "
         "Linux x86-64 host, so on any other host this cannot be answered here; "
-        "the green-bar CI job prepares and checks it on ubuntu-latest."
+        "the fleet's Linux bar (the `gaugewright/bar` status) prepares and checks it."
     )
 original = path.read_bytes()
 base = json.loads(original)

@@ -1,5 +1,7 @@
 //! Observation cannot initialize storage, become a writer, or ignore live WAL.
 #![cfg(feature = "native")]
+#[path = "support/scratch.rs"]
+mod scratch;
 
 use std::path::PathBuf;
 use whipplescript_store::{
@@ -11,12 +13,7 @@ use whipplescript_store::{
 struct Fixture(PathBuf);
 impl Fixture {
     fn new() -> Self {
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos();
-        let root =
-            std::env::temp_dir().join(format!("whipple-read-only-{}-{nonce}", std::process::id()));
+        let root = crate::scratch::path("whipple-read-only");
         std::fs::create_dir_all(&root).expect("fixture directory");
         Self(root)
     }

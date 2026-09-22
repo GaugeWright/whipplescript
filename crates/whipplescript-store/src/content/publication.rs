@@ -171,14 +171,7 @@ mod tests {
                 let _ = std::fs::remove_dir_all(&self.0);
             }
         }
-        let directory = Directory(std::env::temp_dir().join(format!(
-            "whip-publication-access-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock")
-                .as_nanos()
-        )));
+        let directory = Directory(crate::scratch::path("whip-publication-access"));
         std::fs::create_dir_all(&directory.0).expect("fixture directory");
         run(&directory.0.join("content.sqlite"));
     }
@@ -363,14 +356,7 @@ mod tests {
             }
         }
         for lose_callback in [false, true] {
-            let directory = Directory(std::env::temp_dir().join(format!(
-                    "whip-publication-{}-{}",
-                    std::process::id(),
-                    std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .expect("clock")
-                        .as_nanos()
-                )));
+            let directory = Directory(crate::scratch::path("whip-publication"));
             std::fs::create_dir_all(&directory.0).expect("fixture directory");
             let content_path = directory.0.join("content.sqlite");
             let branch_path = directory.0.join("branches.sqlite");

@@ -98,14 +98,7 @@ fn protection(codec: Arc<Codec>) -> PayloadProtection {
 struct Fixture(std::path::PathBuf);
 impl Fixture {
     fn new() -> Self {
-        let path = std::env::temp_dir().join(format!(
-            "whip-protected-coordination-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let path = crate::scratch::path("whip-protected-coordination");
         std::fs::create_dir(&path).unwrap();
         Self(path)
     }

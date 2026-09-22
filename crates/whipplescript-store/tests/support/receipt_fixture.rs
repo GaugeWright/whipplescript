@@ -49,14 +49,7 @@ pub fn expected(case: &str, file: &str) -> serde_json::Value {
 
 impl Fixture {
     pub fn load(case: &str) -> Self {
-        let root = std::env::temp_dir().join(format!(
-            "whip-receipt-upgrade-{case}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("valid generated legacy receipt fixture")
-                .as_nanos()
-        ));
+        let root = crate::scratch::path(&format!("whip-receipt-upgrade-{case}"));
         std::fs::create_dir(&root).expect("valid generated legacy receipt fixture");
         for name in ["branches", "content", "streams"] {
             rusqlite::Connection::open(root.join(format!("{name}.sqlite")))
