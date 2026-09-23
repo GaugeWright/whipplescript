@@ -51,6 +51,7 @@ codex = ["dep:whipplescript-provider-codex"]
 claude = ["dep:whipplescript-provider-claude"]
 
 [dev-dependencies]
+tempfile = "3"
 whipplescript-custodian = { path = "../whipplescript-custodian" }
 # The DO host, so the W4 parity harness drives both hosts' governed doors in
 # one test and diffs the receipt shapes. Path-only: the crate is unpublished

@@ -4371,6 +4371,24 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
             .map(Some)
     }
 
+    /// The build engine's tree (DR-0124 §14.1): project a recorded cut's
+    /// manifest, not a branch head, into a real directory, so what the Home's
+    /// daemon evaluates is exactly the cut and nothing that moved since.
+    /// `None` = unrecorded cut.
+    #[cfg(feature = "native")]
+    pub fn materialize_cut(
+        &self,
+        cut_id: &str,
+        root: &Path,
+        now_unix_nanos: i128,
+    ) -> StoreResult<Option<crate::materialize::MaterializedScratch>> {
+        let Some(manifest) = self.cut_manifest(cut_id)? else {
+            return Ok(None);
+        };
+        crate::materialize::materialize_manifest(&manifest, &self.content, root, now_unix_nanos)
+            .map(Some)
+    }
+
     /// Import-back: scan the scratch against its seeded cache, store every
     /// changed blob, and commit the whole diff as ONE effect-keyed,
     /// idempotent cut on the branch.

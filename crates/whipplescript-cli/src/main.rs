@@ -146,6 +146,7 @@ mod ingress_listener;
 mod injected_secrets;
 mod stats_report;
 use whipplescript::instance_view;
+mod build_commands;
 mod lsp_server;
 mod maude_model;
 mod mcp_cli;
@@ -1081,6 +1082,7 @@ const ALSO_LISTED_IN: &[(&str, &str)] = &[("evidence", "improve")];
 /// prints the groups in the order they first appear here.
 const COMMANDS: &[CommandSpec] = &[
     CommandSpec { name: "norm", group: "norm plane", usage: norm_commands::USAGE, run: norm_commands::command },
+    CommandSpec { name: "build", group: "build engine", usage: build_commands::USAGE, run: build_commands::command },
     CommandSpec {
         name: "check",
         group: "authoring",

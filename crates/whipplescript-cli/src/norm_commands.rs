@@ -9,7 +9,7 @@ use std::process::ExitCode;
 use serde::Deserialize;
 use serde_json::Value;
 use whipplescript_core::vocabulary::Vocabulary;
-use whipplescript_custody::CredentialName;
+use whipplescript_custody::{CredentialName, CustodyTransport};
 use whipplescript_kernel::norm_custody::{NormCustodyKey, NormCustodyVersion};
 use whipplescript_kernel::norm_governance::{NormGovernanceVerifier, NormPrincipalBinding};
 use whipplescript_kernel::norm_public_key::{NormPublicKeyBinding, NormPublicKeyVerifier};
@@ -52,7 +52,7 @@ pub(crate) const USAGE: &str = "usage: whip [--json] norm <command>\n\
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Trust {
+pub(crate) struct Trust {
     bindings: Vec<Binding>,
     creation_grants: Vec<CreationGrant>,
     #[serde(default)]
@@ -205,60 +205,113 @@ pub(crate) fn command(options: &super::CliOptions) -> ExitCode {
     }
 }
 
-fn execute(args: &[String], runtime_path: &std::path::Path) -> Result<Value, String> {
-    let args = Arguments::parse(args)?;
+/// The host's trusted norm signers and verification roots, loaded from
+/// `WHIPPLESCRIPT_NORM_TRUST`. Shared by every command that signs a norm
+/// act: `norm` itself and the build engine's `build` (DR-0124 §14.6).
+pub(crate) struct NormTrust<'a> {
+    keys: BTreeMap<String, NormCustodyKey<'a>>,
+    public_keys: Vec<NormPublicKeyVerifier>,
+    creation_grants: Vec<(String, String)>,
+    pub(crate) checkpoint: Option<NormCheckpoint>,
+}
+
+/// The host's trust document, from the environment only.
+pub(crate) fn trust_document() -> Result<Trust, String> {
     let trusted =
         std::env::var(TRUST_ENV).map_err(|_| format!("host must configure {TRUST_ENV}"))?;
     let trust: Trust = serde_json::from_str(&trusted).map_err(|error| error.to_string())?;
-    let transport = if trust.bindings.is_empty() {
-        None
-    } else {
-        Some(super::custody_egress_transport()?.ok_or(
-            "norm custody bindings require the configured custodian; no local checksum fallback",
-        )?)
-    };
-    let public_keys = trust
-        .public_bindings
-        .into_iter()
-        .map(NormPublicKeyVerifier::new)
-        .collect::<Result<Vec<_>, _>>()?;
-    let mut keys = BTreeMap::new();
-    for binding in trust.bindings {
-        let key = NormCustodyKey::new(
-            binding.principal,
-            binding.credential,
-            binding.version.into(),
-            transport
-                .as_deref()
-                .ok_or("norm custody binding has no transport")?,
-        )?;
-        let named = !binding.name.trim().is_empty();
-        let repeated = keys.insert(binding.name, key).is_some();
-        if !named || repeated {
+    check_binding_names(trust.bindings.iter().map(|binding| binding.name.as_str()))?;
+    Ok(trust)
+}
+
+/// The custody transport the document's bindings need; none when it has no
+/// bindings. The caller owns it for as long as the keys that borrow it.
+pub(crate) fn custody_transport_for(
+    document: &Trust,
+) -> Result<Option<Box<dyn CustodyTransport>>, String> {
+    if document.bindings.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(super::custody_egress_transport()?.ok_or(
+        "norm custody bindings require the configured custodian; no local checksum fallback",
+    )?))
+}
+
+impl<'a> NormTrust<'a> {
+    pub(crate) fn from_document(
+        trust: Trust,
+        transport: Option<&'a dyn CustodyTransport>,
+    ) -> Result<Self, String> {
+        let public_keys = trust
+            .public_bindings
+            .into_iter()
+            .map(NormPublicKeyVerifier::new)
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut keys = BTreeMap::new();
+        for binding in trust.bindings {
+            let key = NormCustodyKey::new(
+                binding.principal,
+                binding.credential,
+                binding.version.into(),
+                transport.ok_or("norm custody binding has no transport")?,
+            )?;
+            keys.insert(binding.name, key);
+        }
+        Ok(Self {
+            keys,
+            public_keys,
+            creation_grants: trust
+                .creation_grants
+                .into_iter()
+                .map(|grant| (grant.creator, grant.owner))
+                .collect(),
+            checkpoint: trust.checkpoint,
+        })
+    }
+
+    pub(crate) fn verifier(&self) -> Result<NormGovernanceVerifier<'_>, String> {
+        NormGovernanceVerifier::new(
+            self.keys
+                .values()
+                .map(|key| NormPrincipalBinding {
+                    actor: key.actor().clone(),
+                    verifier: key as &dyn whipplescript_kernel::gov::GovernanceAttestationVerifier,
+                })
+                .chain(self.public_keys.iter().map(|key| NormPrincipalBinding {
+                    actor: key.actor().clone(),
+                    verifier: key,
+                }))
+                .collect(),
+            self.creation_grants.iter().cloned().collect(),
+        )
+    }
+
+    pub(crate) fn key(&self, name: &str) -> Result<&NormCustodyKey<'a>, String> {
+        self.keys
+            .get(name)
+            .ok_or_else(|| format!("no trusted norm binding named {name}"))
+    }
+}
+
+/// Binding names select signers, so an empty or repeated one is refused
+/// before any key is minted.
+fn check_binding_names<'a>(names: impl Iterator<Item = &'a str>) -> Result<(), String> {
+    let mut seen: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+    for name in names {
+        if name.trim().is_empty() || !seen.insert(name) {
             return Err("norm binding names must be nonempty and unique".into());
         }
     }
-    let verifier = NormGovernanceVerifier::new(
-        keys.values()
-            .map(|key| NormPrincipalBinding {
-                actor: key.actor().clone(),
-                verifier: key as &dyn whipplescript_kernel::gov::GovernanceAttestationVerifier,
-            })
-            .chain(public_keys.iter().map(|key| NormPrincipalBinding {
-                actor: key.actor().clone(),
-                verifier: key,
-            }))
-            .collect(),
-        trust
-            .creation_grants
-            .into_iter()
-            .map(|grant| (grant.creator, grant.owner))
-            .collect(),
-    )?;
-    let key = |name: &str| {
-        keys.get(name)
-            .ok_or_else(|| format!("no trusted norm binding named {name}"))
-    };
+    Ok(())
+}
+
+fn execute(args: &[String], runtime_path: &std::path::Path) -> Result<Value, String> {
+    let args = Arguments::parse(args)?;
+    let document = trust_document()?;
+    let transport = custody_transport_for(&document)?;
+    let trust = NormTrust::from_document(document, transport.as_deref())?;
+    let verifier = trust.verifier()?;
+    let key = |name: &str| trust.key(name);
     // Signing has no store side effects and cannot import a request's binding.
     if args.verb == "sign" {
         let statement: NormStatement =
@@ -664,7 +717,19 @@ fn debug_error(error: whipplescript_store::StoreError) -> String {
 
 #[cfg(test)]
 mod query_tests {
-    use super::KeyVersion;
+    use super::{check_binding_names, KeyVersion};
+    #[test]
+    fn norm_binding_names_must_be_nonempty_and_unique() {
+        assert!(check_binding_names(["owner", "worker"].into_iter()).is_ok());
+        assert_eq!(
+            check_binding_names(["owner", "owner"].into_iter()).unwrap_err(),
+            "norm binding names must be nonempty and unique"
+        );
+        assert_eq!(
+            check_binding_names([" "].into_iter()).unwrap_err(),
+            "norm binding names must be nonempty and unique"
+        );
+    }
     #[test]
     fn norm_query_local_key_version_refuses_silently_ignored_options() {
         assert!(matches!(

@@ -162,6 +162,8 @@ use whipplescript_store::{NewEffect, RuleCommit};
 mod authority;
 #[path = "tests/branch_from_flag_refusal.rs"]
 mod branch_from_flag_refusal;
+#[path = "tests/build_engine.rs"]
+mod build_engine;
 #[path = "tests/cli_surface.rs"]
 mod cli_surface;
 #[path = "tests/command_table.rs"]

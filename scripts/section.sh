@@ -173,8 +173,10 @@ case "${1:-}" in
         buck2-test-executor; then
         if command -v cargo-nextest >/dev/null 2>&1; then
             cargo nextest run -p whipplescript-test-executor --test buck2 --run-ignored all
+            cargo nextest run -p whipplescript --run-ignored all -E 'test(/build_engine::/)'
         else
             cargo test -p whipplescript-test-executor --test buck2 -- --ignored
+            cargo test -p whipplescript --bin whip -- --ignored build_engine::
         fi
     fi ;;
   windows-compile)      scripts/check-windows-compile.sh ;;
