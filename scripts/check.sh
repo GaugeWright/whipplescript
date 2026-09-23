@@ -153,6 +153,10 @@ if [ -f AGENTS.md ]; then
     echo "== agent guide =="
     section agent-guide
 
+echo "== agent guide, as an edge =="
+section carries-agent-guide
+section carries-agent-guide-checker
+
     # Same guard, opposite reason: this one needs the FULL tree, because it
     # answers what the projection withheld. Only `-src` can run it — the mirror
     # is the thing being checked, and it cannot see what it is missing

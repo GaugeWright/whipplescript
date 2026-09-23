@@ -78,6 +78,12 @@ export TMPDIR="$section_tmpdir"
 
 case "${1:-}" in
   agent-guide)          node scripts/check-agent-guide.mjs ;;
+  carries-agent-guide|carries-agent-guide-checker)
+    # The cross-repository edge (GaugeWright DR-0124 stage 4). In a workspace
+    # the bar builds the `carries` target and never reaches here; reaching here
+    # means there is no `gaugewright` cell, so the question cannot be asked.
+    echo "#unasserted: $1 needs a materialized workspace; the digest check answered instead"
+    echo "-- $1 SKIPPED: no gaugewright cell outside a workspace --" >&2 ;;
   mirror-projection)    node scripts/check-mirror-projection.mjs ;;
   governed-doors)
     scripts/check-governed-doors.sh
