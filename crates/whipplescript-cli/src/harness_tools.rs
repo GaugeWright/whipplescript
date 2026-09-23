@@ -1522,12 +1522,18 @@ impl FileToolExecutor {
     /// Whether this process is configured to allow real process spawn:
     /// `WHIPPLESCRIPT_NATIVE_PROCESSES=1`, set by whoever started the binary.
     pub(crate) fn native_processes_permitted_by_operator() -> bool {
-        matches!(
+        Self::native_processes_permitted(
             std::env::var("WHIPPLESCRIPT_NATIVE_PROCESSES")
-                .unwrap_or_default()
-                .trim(),
-            "1" | "true" | "yes"
+                .ok()
+                .as_deref(),
         )
+    }
+
+    /// The reading of that variable's value, kept apart from the read so that
+    /// the test of it never has to write this process's environment. Only an
+    /// affirmative `1`, `true` or `yes` is on; unset and everything else is off.
+    pub(crate) fn native_processes_permitted(value: Option<&str>) -> bool {
+        matches!(value.unwrap_or_default().trim(), "1" | "true" | "yes")
     }
 
     #[cfg(test)]
@@ -9364,26 +9370,37 @@ mod tests {
     }
 
     /// Real process spawn is enabled by the OPERATOR, never by a caller.
+    ///
+    /// Over VALUES, never by writing `WHIPPLESCRIPT_NATIVE_PROCESSES` into this
+    /// process. Every container turn in this binary reads that variable on its
+    /// way through `run_turn_in_workspace`, and
+    /// `turn_server::tests::a_request_cannot_ask_for_native_processes` asserts
+    /// it unset; this test used to set it to `true` for a moment with no lock,
+    /// so under a threaded `cargo test` whichever turn ran in that moment was
+    /// handed real process spawn. A race of that shape is what the refusal
+    /// sweep's self test met on a loaded gate host on 2026-09-23 — this crate's
+    /// suite green under nextest, where every test is its own process, and red
+    /// twice in a row under libtest's threads, with no test named in the
+    /// transcript. `crate::env_lock` would only serialise this against the
+    /// other tests that take it; not writing at all closes the window for the
+    /// readers that do not.
     #[test]
     fn native_process_spawn_reads_only_the_operator_environment() {
-        // Unset is the default posture, and anything the operator did not
-        // affirmatively write is off.
+        // Anything the operator did not affirmatively write is off.
         for value in ["", "0", "false", "no", "maybe", " "] {
-            std::env::set_var("WHIPPLESCRIPT_NATIVE_PROCESSES", value);
             assert!(
-                !FileToolExecutor::native_processes_permitted_by_operator(),
+                !FileToolExecutor::native_processes_permitted(Some(value)),
                 "`{value}` must not enable native process spawn"
             );
         }
         for value in ["1", "true", "yes", " true "] {
-            std::env::set_var("WHIPPLESCRIPT_NATIVE_PROCESSES", value);
             assert!(
-                FileToolExecutor::native_processes_permitted_by_operator(),
+                FileToolExecutor::native_processes_permitted(Some(value)),
                 "`{value}` is an affirmative operator setting"
             );
         }
-        std::env::remove_var("WHIPPLESCRIPT_NATIVE_PROCESSES");
-        assert!(!FileToolExecutor::native_processes_permitted_by_operator());
+        // Unset is the default posture.
+        assert!(!FileToolExecutor::native_processes_permitted(None));
     }
 
     /// The container turn's shape: permissive profile, NO grant.

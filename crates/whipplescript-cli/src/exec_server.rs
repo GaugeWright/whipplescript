@@ -1208,6 +1208,7 @@ mod tests {
 
     #[test]
     fn exec_request_cleans_the_environment() {
+        let _guard = crate::env_lock();
         // A host env var not declared in the request must not leak through.
         std::env::set_var("WHIP_EXECUTOR_LEAK_PROBE", "leaked");
         let response = handle_exec_request(&exec_request(

@@ -929,6 +929,10 @@ mod tests {
     /// turn asks for the tool the way a real model would.
     #[test]
     fn a_container_turn_without_a_grant_does_not_get_bash() {
+        // This writes `WHIPPLESCRIPT_OWNED_FIXTURE_TOOL`, which every
+        // `FixtureModelClient` built while it is set reads: one lock for the
+        // whole binary, or two env-writing tests trample each other.
+        let _guard = crate::env_lock();
         let workspace = std::env::temp_dir().join(format!(
             "whipple-ungranted-bash-{}-{}",
             std::process::id(),

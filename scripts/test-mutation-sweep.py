@@ -185,6 +185,43 @@ class CalibrationTests(unittest.TestCase):
                 with self.subTest(outcome=outcome), mock.patch.object(sweep, "run_suite", return_value=outcome), contextlib.redirect_stderr(io.StringIO()):
                     self.assertFalse(sweep.self_test(str(target), "filter", str(backup)))
 
+    def test_a_failed_run_names_the_tests_libtest_blamed(self):
+        output = (
+            "....F.F\n\nfailures:\n\n"
+            "---- turn_server::tests::a_request stdout ----\nthread panicked at x\n\n"
+            "---- exec_server::tests::b stdout ----\n\n\n"
+            "failures:\n    turn_server::tests::a_request\n    exec_server::tests::b\n\n"
+            "test result: FAILED. 5 passed; 2 failed\n"
+            "error: test failed, to rerun pass `--bin whip`\n"
+        )
+        self.assertEqual(
+            sweep.failing_tests(output),
+            ["turn_server::tests::a_request", "exec_server::tests::b"],
+        )
+        died = "Caused by:\n  process didn't exit successfully: `target/debug/deps/whip-1` (signal: 11, SIGSEGV)\n"
+        self.assertEqual(
+            sweep.failing_tests(died),
+            ["process didn't exit successfully: `target/debug/deps/whip-1` (signal: 11, SIGSEGV)"],
+        )
+        self.assertEqual(sweep.failing_tests("test result: ok. 3 passed\n"), [])
+
+    def test_a_caught_calibration_says_which_test_caught_it(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "target.rs"
+            backup = Path(directory) / "original.rs"
+            backup.write_text("// original\n")
+            def trial(_filter):
+                sweep.CAUGHT_BY[:] = ["turn_server::tests::a_request"]
+                return sweep.CAUGHT
+            stderr = io.StringIO()
+            with mock.patch.object(sweep, "run_suite", side_effect=trial), contextlib.redirect_stderr(stderr):
+                self.assertFalse(sweep.self_test(str(target), "filter", str(backup)))
+            self.assertIn("caught, by `turn_server::tests::a_request`", stderr.getvalue())
+            sweep.CAUGHT_BY.clear()
+            with mock.patch.object(sweep, "run_suite", return_value=sweep.CAUGHT), contextlib.redirect_stderr(stderr):
+                self.assertFalse(sweep.self_test(str(target), "filter", str(backup)))
+            self.assertIn("a test cargo did not name", stderr.getvalue())
+
     def test_failed_calibration_restores_the_original_source(self):
         with tempfile.TemporaryDirectory() as directory:
             target = Path(directory) / "target.rs"

@@ -1204,6 +1204,7 @@ mod tests {
 
     #[test]
     fn env_indirection_resolves_and_a_missing_variable_is_loud() {
+        let _guard = crate::env_lock();
         std::env::set_var("WHIP_TEST_MCP_TOKEN", "s3cret");
         assert_eq!(
             resolve_secret("env:WHIP_TEST_MCP_TOKEN", "ctx").expect("resolved"),
@@ -1393,6 +1394,7 @@ for line in sys.stdin:
     /// and a `tools/call` — plus the two properties this module owns.
     #[test]
     fn stdio_server_round_trips_and_gets_a_cleaned_environment() {
+        let _guard = crate::env_lock();
         if !have_python() {
             eprintln!("skipping: python3 not available");
             return;
@@ -1469,6 +1471,7 @@ for line in sys.stdin:
     /// failure names the drifted tool.
     #[test]
     fn drift_against_a_real_server_fails_turn_setup() {
+        let _guard = crate::env_lock();
         if !have_python() {
             eprintln!("skipping: python3 not available");
             return;
@@ -1520,6 +1523,7 @@ for line in sys.stdin:
     /// unrepresentable.
     #[test]
     fn an_unrepresentable_tool_name_fails_the_turn_rather_than_being_rewritten() {
+        let _guard = crate::env_lock();
         if !have_python() {
             eprintln!("skipping: python3 not available");
             return;
@@ -1578,6 +1582,7 @@ for line in sys.stdin:
     /// two apart.
     #[test]
     fn a_below_bar_server_is_never_executed() {
+        let _guard = crate::env_lock();
         if !have_python() {
             eprintln!("skipping: python3 not available");
             return;
@@ -1642,6 +1647,7 @@ for line in sys.stdin:
     /// message tells the operator which lever to pull.
     #[test]
     fn envelope_minimum_rung_denies_a_live_server() {
+        let _guard = crate::env_lock();
         if !have_python() {
             eprintln!("skipping: python3 not available");
             return;
