@@ -1,0 +1,6 @@
+load("@root//:rules.bzl", "whip_file")
+
+# A target in the nested cell, whose package listing is this cell's alone:
+# the wrapper places `inner//:note` here through the cell map, and the
+# root package's listing does not reach `note.txt`.
+whip_file(name = "note", content = "a note from the inner cell")

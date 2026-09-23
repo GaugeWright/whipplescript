@@ -47,8 +47,8 @@ use whipplescript_store::vcs::NativeWorkspaceVcs;
 use whipplescript_store::{NewEvent, SqliteStore};
 
 use super::build_scope::{
-    build_file_names, classify, project, ActionInfluences, Classification, LabelPolicy, Packages,
-    Principal, Projection,
+    classify, project, ActionInfluences, Cells, Classification, LabelPolicy, Packages, Principal,
+    Projection,
 };
 
 pub(crate) const USAGE: &str = "usage: whip [--json] build <command> --as <binding>\n\
@@ -59,6 +59,7 @@ pub(crate) const USAGE: &str = "usage: whip [--json] build <command> --as <bindi
   test <target>... --cut <cut> [--report <file>] [--timeout <seconds>]\n\
   daemon status|stop --cut <cut>\n\
   endpoint --cut <cut>              serve the remote-execution endpoint to the cut's daemon until stdin closes\n\
+  record <dir> [--cut <id>] [--branch <name>]   record a directory tree (a git workspace, its cells) as a cut\n\
   The cut is materialized under .whipplescript/build/cuts/<cut> and evaluated there by the\n\
   Home's Buck2 daemon (isolation dir whip-home), which reaches whip-test-executor over the TCP launch.\n\
   Host configuration: WHIPPLESCRIPT_NORM_TRUST (bindings with labels, and labeled regions);\n\
@@ -97,6 +98,9 @@ pub(crate) struct CutTree {
     pub manifest: BTreeMap<String, String>,
     /// The projection, when this is a principal's tree and not the cut.
     pub projection: Option<Projection>,
+    /// The tree's cells: the explicit name-to-directory mapping every label
+    /// is placed in the tree through (GaugeWright DR-0125).
+    pub cells: Cells,
 }
 
 pub(crate) fn buck2_binary() -> PathBuf {
@@ -306,6 +310,12 @@ fn finish_tree(
             String::from_utf8_lossy(&version.stderr).trim()
         ));
     }
+    let cells = Cells::from_configs(
+        std::fs::read_to_string(root.join(".buckconfig"))
+            .ok()
+            .as_deref(),
+        |dir| std::fs::read_to_string(root.join(dir).join(".buckconfig")).ok(),
+    );
     Ok(CutTree {
         cut: cut.to_owned(),
         root,
@@ -315,7 +325,164 @@ fn finish_tree(
         isolation_dir,
         manifest,
         projection,
+        cells,
     })
+}
+
+/// What recording a tree produced.
+#[derive(Clone, Debug, serde::Serialize)]
+pub(crate) struct RecordedTree {
+    pub cut: String,
+    pub branch: String,
+    pub files: usize,
+    pub bytes: usize,
+}
+
+/// The files of a directory tree as a cut would hold them: a git
+/// repository's tracked and unignored files, a plain directory's files, and
+/// nested git repositories — the cells of a workspace — the same way, each
+/// under its directory; never `.git` or `buck-out`.
+pub(crate) fn tree_files(root: &Path) -> Result<Vec<(String, PathBuf)>, String> {
+    let mut files = Vec::new();
+    walk_tree(root, root, &mut files)?;
+    files.sort();
+    Ok(files)
+}
+
+fn walk_tree(root: &Path, dir: &Path, into: &mut Vec<(String, PathBuf)>) -> Result<(), String> {
+    let relative = |path: &Path| {
+        path.strip_prefix(root)
+            .map(|p| p.to_string_lossy().replace('\\', "/"))
+            .unwrap_or_default()
+    };
+    if dir.join(".git").exists() {
+        let listed = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args([
+                "ls-files",
+                "-z",
+                "--cached",
+                "--others",
+                "--exclude-standard",
+            ])
+            .output()
+            .map_err(|error| format!("cannot run git in {}: {error}", dir.display()))?;
+        if !listed.status.success() {
+            return Err(format!(
+                "git ls-files failed in {}: {}",
+                dir.display(),
+                String::from_utf8_lossy(&listed.stderr).trim()
+            ));
+        }
+        for entry in listed.stdout.split(|b| *b == 0).filter(|e| !e.is_empty()) {
+            let entry = String::from_utf8_lossy(entry).into_owned();
+            let path = dir.join(&entry);
+            if entry.ends_with('/') {
+                // A nested repository: git lists its directory, not its files.
+                walk_tree(root, &dir.join(entry.trim_end_matches('/')), into)?;
+            } else if path.is_file() && !entry.starts_with("buck-out/") {
+                into.push((relative(&path), path));
+            }
+        }
+        return Ok(());
+    }
+    let entries = std::fs::read_dir(dir)
+        .map_err(|error| format!("cannot list {}: {error}", dir.display()))?;
+    for entry in entries {
+        let entry = entry.map_err(|error| format!("cannot list {}: {error}", dir.display()))?;
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if path.is_dir() {
+            if name == ".git" || name == "buck-out" {
+                continue;
+            }
+            walk_tree(root, &path, into)?;
+        } else if path.is_file() {
+            into.push((relative(&path), path));
+        }
+    }
+    Ok(())
+}
+
+/// Record a directory tree as one cut on a branch of the Home's store: every
+/// file's bytes into the content store, the whole tree as one import, keyed
+/// by the tree's own digest unless a cut id is given, so recording the same
+/// tree twice is the same cut. The branch is created off the mainline when
+/// it does not exist, and never the mainline itself.
+pub(crate) fn record_tree(
+    vcs: &mut NativeWorkspaceVcs,
+    root: &Path,
+    branch: &str,
+    cut: Option<&str>,
+    at: &str,
+) -> Result<RecordedTree, String> {
+    if branch == NativeWorkspaceVcs::mainline() {
+        return Err("a recorded tree never lands on the mainline; name a build branch".into());
+    }
+    let files = tree_files(root)?;
+    if files.is_empty() {
+        return Err(format!("nothing to record under {}", root.display()));
+    }
+    let mut changed = BTreeMap::new();
+    let mut bytes = 0;
+    let mut digest = Sha256::new();
+    for (relative, path) in &files {
+        let body = std::fs::read(path)
+            .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+        bytes += body.len();
+        let id = vcs
+            .content_store()
+            .put(&body)
+            .map_err(|error| format!("cannot store {}: {error:?}", path.display()))?;
+        digest.update(relative.as_bytes());
+        digest.update(b"\0");
+        digest.update(id.as_bytes());
+        digest.update(b"\n");
+        changed.insert(relative.clone(), id);
+    }
+    let cut = match cut {
+        Some(cut) => cut.to_owned(),
+        None => format!("tree:{}", &hex(&digest.finalize())[..32]),
+    };
+    let branches = vcs
+        .list_branches(None)
+        .map_err(|error| format!("cannot list branches: {error:?}"))?;
+    let existing = branches.iter().find(|row| row.branch_id == branch);
+    let removed: Vec<String> = match existing.and_then(|row| row.head_cut_id.clone()) {
+        Some(head) => cut_manifest_of(vcs, &head)?
+            .keys()
+            .filter(|path| !changed.contains_key(*path))
+            .cloned()
+            .collect(),
+        None => Vec::new(),
+    };
+    if existing.is_none() {
+        vcs.create_branch(branch, None, NativeWorkspaceVcs::mainline(), at)
+            .map_err(|error| format!("cannot create branch {branch}: {error:?}"))?;
+    }
+    let outcome = vcs
+        .import_diff(branch, &changed, &removed, &cut, at)
+        .map_err(|error| format!("cannot record the tree: {error:?}"))?;
+    recorded(outcome, branch, files.len(), bytes)
+}
+
+/// The recording the store reports, or the refusal it is.
+fn recorded(
+    outcome: whipplescript_store::vcs::VcsWriteOutcome,
+    branch: &str,
+    files: usize,
+    bytes: usize,
+) -> Result<RecordedTree, String> {
+    match outcome {
+        whipplescript_store::vcs::VcsWriteOutcome::Written { cut_id, .. } => Ok(RecordedTree {
+            cut: cut_id,
+            branch: branch.to_owned(),
+            files,
+            bytes,
+        }),
+        other => Err(format!("the tree was not recorded: {other:?}")),
+    }
 }
 
 /// The tree's daemon: its isolation directory, and the environment under
@@ -355,25 +522,27 @@ pub(crate) fn parse_configured_label(line: &str) -> Option<(String, String)> {
     Some((label.to_owned(), configuration.to_owned()))
 }
 
-/// The package of `cell//package:target`.
-pub(crate) fn package_of_label(label: &str) -> Option<String> {
-    let (_, rest) = label.split_once("//")?;
+/// The cell and package of `cell//package:target`.
+pub(crate) fn package_of_label(label: &str) -> Option<(String, String)> {
+    let (cell, rest) = label.split_once("//")?;
     let (package, name) = rest.split_once(':')?;
-    if name.is_empty() {
+    if name.is_empty() || cell.is_empty() {
         return None;
     }
-    Some(package.to_owned())
+    Some((cell.to_owned(), package.to_owned()))
 }
 
 /// A path Buck2 printed, made relative to the tree: an absolute path under
-/// the root, or a `cell//path` reference.
-fn tree_relative(root: &Path, printed: &str) -> String {
+/// the root, or a `cell//path` reference placed through the cell map.
+fn tree_relative(root: &Path, cells: &Cells, printed: &str) -> String {
     let printed = printed.trim();
     if let Ok(relative) = Path::new(printed).strip_prefix(root) {
         return relative.to_string_lossy().into_owned();
     }
     match printed.split_once("//") {
-        Some((cell, path)) if !cell.contains('/') => path.to_owned(),
+        Some((cell, path)) if !cell.contains('/') => cells
+            .tree_path(cell, path)
+            .unwrap_or_else(|| path.to_owned()),
         _ => printed.to_owned(),
     }
 }
@@ -385,11 +554,6 @@ pub(crate) fn influences_of(
     tree: &CutTree,
     pattern: &str,
 ) -> Result<Vec<ActionInfluences>, String> {
-    let build_files = build_file_names(
-        std::fs::read_to_string(tree.root.join(".buckconfig"))
-            .ok()
-            .as_deref(),
-    );
     let mut deps = buck2(tree);
     deps.arg("cquery").arg(format!("deps({pattern})"));
     let resolved = run(deps, &format!("resolve the dependencies of {pattern}"))?;
@@ -398,19 +562,22 @@ pub(crate) fn influences_of(
         .lines()
         .filter_map(parse_configured_label)
     {
-        let package = package_of_label(&label)
+        let (cell, package) = package_of_label(&label)
             .ok_or_else(|| format!("buck2 printed a label without a package: {label}"))?;
-        let build_file = build_files
+        let build_file = tree
+            .cells
+            .build_files(&cell)
             .iter()
-            .map(|name| {
-                if package.is_empty() {
+            .filter_map(|name| {
+                let relative = if package.is_empty() {
                     name.clone()
                 } else {
                     format!("{package}/{name}")
-                }
+                };
+                tree.cells.tree_path(&cell, &relative)
             })
             .find(|path| tree.manifest.contains_key(path))
-            .ok_or_else(|| format!("the tree holds no build file for package {package}"))?;
+            .ok_or_else(|| format!("the tree holds no build file for package {cell}//{package}"))?;
         let mut audit = buck2(tree);
         audit.arg("audit").arg("includes").arg(&build_file);
         let listed = run(audit, &format!("list the includes of {build_file}"))?;
@@ -418,7 +585,7 @@ pub(crate) fn influences_of(
             .lines()
             .map(str::trim)
             .filter(|line| !line.is_empty() && !line.starts_with('#'))
-            .map(|line| tree_relative(&tree.root, line))
+            .map(|line| tree_relative(&tree.root, &tree.cells, line))
             .collect();
         let mut inputs = buck2(tree);
         inputs.arg("cquery").arg(format!("inputs({label})"));
@@ -427,10 +594,11 @@ pub(crate) fn influences_of(
             .lines()
             .map(str::trim)
             .filter(|line| !line.is_empty())
-            .map(|line| tree_relative(&tree.root, line))
+            .map(|line| tree_relative(&tree.root, &tree.cells, line))
             .collect();
         influences.push(ActionInfluences {
             target: label,
+            cell,
             package,
             includes,
             inputs,
@@ -445,12 +613,7 @@ pub(crate) fn classification_of(
     pattern: &str,
     policy: &LabelPolicy,
 ) -> Result<Classification, String> {
-    let build_files = build_file_names(
-        std::fs::read_to_string(tree.root.join(".buckconfig"))
-            .ok()
-            .as_deref(),
-    );
-    let packages = Packages::of_manifest(&tree.manifest, &build_files);
+    let packages = Packages::of_manifest(&tree.manifest, &tree.cells);
     Ok(classify(
         &tree.manifest,
         policy,
@@ -943,6 +1106,7 @@ enum Verb {
     Test,
     Daemon,
     Endpoint,
+    Record,
 }
 
 #[derive(Debug)]
@@ -973,6 +1137,7 @@ impl<'a> Arguments<'a> {
             "test" => (Verb::Test, &["--cut", "--as", "--report", "--timeout"]),
             "daemon" => (Verb::Daemon, &["--cut", "--as"]),
             "endpoint" => (Verb::Endpoint, &["--cut", "--as"]),
+            "record" => (Verb::Record, &["--as", "--cut", "--branch"]),
             _ => return Err(format!("unknown build command {name:?}\n{USAGE}")),
         };
         let mut parsed = Self {
@@ -1044,8 +1209,7 @@ fn open_ledger(options: &super::CliOptions, verifier: &dyn NormVerifier) -> Resu
 
 fn execute(options: &super::CliOptions) -> Result<Value, String> {
     let args = Arguments::parse(&options.args)?;
-    let vcs = super::open_vcs().map_err(|_| "could not open the branch stores".to_owned())?;
-    let cut = args.required("--cut")?;
+    let mut vcs = super::open_vcs().map_err(|_| "could not open the branch stores".to_owned())?;
     let binding = args.required("--as")?;
     let document = super::norm_commands::trust_document()?;
     let transport = super::norm_commands::custody_transport_for(&document)?;
@@ -1056,7 +1220,26 @@ fn execute(options: &super::CliOptions) -> Result<Value, String> {
     let policy = &trust.policy;
     let buck2_binary = buck2_binary();
     let build_root = build_root();
+    if args.verb == Verb::Record {
+        // Recording a tree is the Home's act: what the daemon will evaluate.
+        operator_only(principal, policy)?;
+        let dir = args
+            .positional
+            .first()
+            .copied()
+            .ok_or("build record needs a directory")?;
+        let recorded = record_tree(
+            &mut vcs,
+            Path::new(dir),
+            args.flags.get("--branch").copied().unwrap_or("build"),
+            args.flags.get("--cut").copied(),
+            &super::now_stamp(),
+        )?;
+        return Ok(json!(recorded));
+    }
+    let cut = args.required("--cut")?;
     match args.verb {
+        Verb::Record => unreachable!("answered above"),
         Verb::Daemon => {
             operator_only(principal, policy)?;
             let tree = materialize_cut(&vcs, cut, &build_root, &buck2_binary)?;
@@ -1327,19 +1510,32 @@ mod tests {
         assert_eq!(parse_configured_label("nonsense"), None);
         assert_eq!(parse_configured_label(" (cfg)"), None);
         assert_eq!(
-            package_of_label("root//secret-gate:gate").as_deref(),
-            Some("secret-gate")
+            package_of_label("root//secret-gate:gate"),
+            Some(("root".into(), "secret-gate".into()))
         );
-        assert_eq!(package_of_label("root//:passing").as_deref(), Some(""));
+        assert_eq!(
+            package_of_label("inner//:note"),
+            Some(("inner".into(), "".into()))
+        );
         assert_eq!(package_of_label("root//pkg:"), None);
+        assert_eq!(package_of_label("//pkg:t"), None);
         assert_eq!(package_of_label("nonsense"), None);
         let root = Path::new("/tree");
-        assert_eq!(tree_relative(root, "/tree/rules.bzl"), "rules.bzl");
+        let cells = Cells::from_configs(Some("[cells]\nroot = .\ninner = inner\n"), |_| None);
+        assert_eq!(tree_relative(root, &cells, "/tree/rules.bzl"), "rules.bzl");
         assert_eq!(
-            tree_relative(root, "root//tests/passing.sh"),
+            tree_relative(root, &cells, "root//tests/passing.sh"),
             "tests/passing.sh"
         );
-        assert_eq!(tree_relative(root, "tests/passing.sh"), "tests/passing.sh");
+        assert_eq!(
+            tree_relative(root, &cells, "inner//note.txt"),
+            "inner/note.txt"
+        );
+        assert_eq!(tree_relative(root, &cells, "other//x"), "x");
+        assert_eq!(
+            tree_relative(root, &cells, "tests/passing.sh"),
+            "tests/passing.sh"
+        );
         let dir = tempfile::tempdir().expect("a temporary directory");
         std::fs::write(dir.path().join("b.txt"), b"bee").expect("write");
         std::fs::create_dir(dir.path().join("sub")).expect("mkdir");
@@ -1501,6 +1697,119 @@ mod tests {
             parse_endpoint_announcement("not json").unwrap_err(),
             "the endpoint announced nothing readable: expected ident at line 1 column 2"
         );
+    }
+
+    #[test]
+    fn a_tree_records_as_one_cut_with_its_nested_repositories_and_never_on_the_mainline() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let tree = dir.path().join("workspace");
+        std::fs::create_dir_all(tree.join("cell/src")).expect("mkdir");
+        std::fs::create_dir_all(tree.join("cell/buck-out")).expect("mkdir");
+        std::fs::create_dir_all(tree.join("plain")).expect("mkdir");
+        std::fs::write(tree.join(".buckconfig"), "[cells]\nroot = .\ncell = cell\n")
+            .expect("write");
+        std::fs::write(tree.join("cell/src/a.txt"), "alpha").expect("write");
+        std::fs::write(tree.join("cell/buck-out/junk"), "junk").expect("write");
+        std::fs::write(tree.join("cell/ignored.log"), "log").expect("write");
+        std::fs::write(tree.join("cell/.gitignore"), "*.log\n").expect("write");
+        std::fs::write(tree.join("plain/note"), "note").expect("write");
+        let git = |args: &[&str]| {
+            let status = Command::new("git")
+                .arg("-C")
+                .arg(tree.join("cell"))
+                .args(args)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .expect("git");
+            assert!(status.success(), "git {args:?}");
+        };
+        git(&["init", "-q"]);
+        let files: Vec<String> = tree_files(&tree)
+            .expect("the tree lists")
+            .into_iter()
+            .map(|(relative, _)| relative)
+            .collect();
+        assert_eq!(
+            files,
+            vec![
+                ".buckconfig",
+                "cell/.gitignore",
+                "cell/src/a.txt",
+                "plain/note"
+            ]
+        );
+        let mut vcs = NativeWorkspaceVcs::open(
+            dir.path().join("branches.sqlite"),
+            dir.path().join("content.sqlite"),
+        )
+        .expect("a vcs");
+        vcs.init("t0").expect("init");
+        assert_eq!(
+            record_tree(&mut vcs, &tree, "main", None, "t1").unwrap_err(),
+            "a recorded tree never lands on the mainline; name a build branch"
+        );
+        let empty = dir.path().join("empty");
+        std::fs::create_dir_all(&empty).expect("mkdir");
+        assert_eq!(
+            record_tree(&mut vcs, &empty, "build", None, "t1").unwrap_err(),
+            format!("nothing to record under {}", empty.display())
+        );
+        let first = record_tree(&mut vcs, &tree, "build", None, "t1").expect("records");
+        assert_eq!(first.files, 4);
+        assert_eq!(
+            first.bytes,
+            5 + 6 + 4 + "[cells]\nroot = .\ncell = cell\n".len()
+        );
+        assert!(first.cut.starts_with("tree:"));
+        let manifest = cut_manifest_of(&vcs, &first.cut).expect("the cut is recorded");
+        assert_eq!(manifest.len(), 4);
+        // The same tree is the same cut; a changed tree is a new cut that
+        // drops what is gone.
+        let again = record_tree(&mut vcs, &tree, "build", None, "t2").expect("records again");
+        assert_eq!(again.cut, first.cut);
+        std::fs::remove_file(tree.join("plain/note")).expect("remove");
+        let changed = record_tree(&mut vcs, &tree, "build", Some("cut-named"), "t3")
+            .expect("records the change");
+        assert_eq!(changed.cut, "cut-named");
+        assert_eq!(
+            cut_manifest_of(&vcs, "cut-named").expect("recorded").len(),
+            3
+        );
+        // The store's other answers are refusals, said as what they are.
+        assert_eq!(
+            recorded(
+                whipplescript_store::vcs::VcsWriteOutcome::BranchMissing,
+                "build",
+                1,
+                1
+            )
+            .unwrap_err(),
+            "the tree was not recorded: BranchMissing"
+        );
+        // A directory that claims to be a repository and is not is refused
+        // with git's own words.
+        let broken = dir.path().join("broken");
+        std::fs::create_dir_all(broken.join("inner/.git")).expect("mkdir");
+        std::fs::write(broken.join("inner/x"), "x").expect("write");
+        let refused = tree_files(&broken).unwrap_err();
+        assert!(
+            refused.starts_with(&format!(
+                "git ls-files failed in {}: ",
+                broken.join("inner").display()
+            )),
+            "{refused}"
+        );
+        // A tree materialized from the cut carries its cells.
+        let materialized = materialize_cut(
+            &vcs,
+            "cut-named",
+            &dir.path().join("build"),
+            &fake_buck2(dir.path(), false),
+        )
+        .expect("materializes");
+        assert_eq!(materialized.cells.dir("cell"), Some("cell"));
+        assert!(materialized.root.join("cell/src/a.txt").is_file());
     }
 
     #[test]
@@ -1698,6 +2007,10 @@ mod tests {
             Arguments::parse(&owned(&["test", "--cut", "c1"])).unwrap_err(),
             "build test needs at least one target"
         );
+        let record = owned(&["record", "/tmp/tree", "--as", "owner", "--branch", "b"]);
+        let parsed = Arguments::parse(&record).unwrap();
+        assert_eq!(parsed.positional, vec!["/tmp/tree"]);
+        assert_eq!(parsed.flags.get("--branch").copied(), Some("b"));
         for verb in ["iterate", "correspond", "result"] {
             let list = owned(&[verb, "--cut", "c1", "--as", "dev"]);
             let parsed = Arguments::parse(&list).unwrap();

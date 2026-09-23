@@ -7,7 +7,7 @@ use super::*;
 use crate::build_commands::{
     admit_trigger, artifact, artifact_records, artifact_vocabulary, build_target,
     classification_of, correspondence_fields, materialize_cut, materialize_projection,
-    publish_correspondence, record_and_publish, scoped_result, test_targets, CutTree,
+    publish_correspondence, record_and_publish, record_tree, scoped_result, test_targets, CutTree,
     HOME_ISOLATION_DIR, ORGANIZATION_CEILING,
 };
 use crate::build_scope::{LabelPolicy, Principal, Region, PACKAGE_CEILING};
@@ -123,7 +123,7 @@ impl Fixture {
         assert!(executor.is_file(), "no executor at {}", executor.display());
         std::env::set_var("WHIPPLESCRIPT_TEST_EXECUTOR", &executor);
 
-        // The cut: the fixture project, recorded file by file on the mainline.
+        // The cut: the fixture project, recorded as one tree on a build branch.
         let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("..")
             .join("..")
@@ -131,28 +131,10 @@ impl Fixture {
             .join("buck2-tests");
         let mut vcs = open_vcs().expect("vcs");
         vcs.init("t0").expect("init");
-        let mut cut = String::new();
-        for (index, relative) in [
-            ".buckconfig",
-            ".buckroot",
-            ".buck2-version",
-            "FIXTURE",
-            "rules.bzl",
-            "platforms.bzl",
-            "tests/passing.sh",
-            "tests/swallowed.sh",
-            "tests/silent.sh",
-            "secret-gate/FIXTURE",
-            "secret-gate/protected/flag",
-        ]
-        .iter()
-        .enumerate()
-        {
-            let body = std::fs::read_to_string(fixture.join(relative)).expect(relative);
-            cut = format!("fixture-{index}");
-            vcs.write("main", relative, Some(&body), &cut, "t1")
-                .expect("record the fixture file");
-        }
+        let recorded = record_tree(&mut vcs, &fixture, "build", None, "t1")
+            .expect("the fixture project records as a cut");
+        assert!(recorded.files >= 14, "{recorded:?}");
+        let cut = recorded.cut;
 
         // The ledger: the engineering charter, which declares artifact,
         // build.publish and correspondence.
@@ -415,7 +397,7 @@ fn principals_reach_the_daemon_through_scoped_interfaces_and_the_tiers_correspon
         .iter()
         .find(|influence| influence.kind == "package-listing")
         .expect("the package listing is an influence");
-    assert_eq!(listing.subject, "root//secret-gate:gate//secret-gate");
+    assert_eq!(listing.subject, "root//secret-gate");
     assert!(gate
         .influences
         .iter()
@@ -441,6 +423,28 @@ fn principals_reach_the_daemon_through_scoped_interfaces_and_the_tiers_correspon
         .any(|i| i.kind == "input" && i.subject == "tests/passing.sh"));
     admit_trigger(&dev, "//:passing", &passing).expect("public is dev's to trigger");
     let (cut_passing, _) = fixture.publish(&home, "//:passing", &passing.basis());
+    // A nested cell: the label is placed in the tree through the cell map,
+    // its listing is the cell's own, and the root's listing stops at it.
+    assert_eq!(home.cells.dir("inner"), Some("inner"));
+    let note = classification_of(&home, "inner//:note", &policy).expect("classifies");
+    let note_listing = note
+        .influences
+        .iter()
+        .find(|influence| influence.kind == "package-listing")
+        .expect("the inner cell's listing");
+    assert_eq!(note_listing.subject, "inner//");
+    assert!(note
+        .influences
+        .iter()
+        .any(|i| i.kind == "include" && i.subject == "rules.bzl"));
+    let root_listing = passing
+        .influences
+        .iter()
+        .find(|influence| influence.kind == "package-listing")
+        .expect("the root listing");
+    assert_eq!(root_listing.subject, "root//");
+    let (_, note_outputs) = fixture.publish(&home, "inner//:note", &note.basis());
+    assert_eq!(content(&note_outputs), "a note from the inner cell");
 
     // The result interface: dev reads the cut's public result and does not
     // observe the gated one; owner reads both.

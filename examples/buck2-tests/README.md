@@ -29,3 +29,8 @@ without that label receives a projection without the directory, builds the
 other branch there, and is refused the cut's result by name — while
 `//:passing` in the root package, whose listing stops at the sub-package,
 stays public.
+
+`inner/` is a nested cell with its own `.buckconfig`: `inner//:note` is placed
+in the tree through the root `.buckconfig`'s cell map, its package listing is
+the cell's own, and the root package's listing stops at the cell's boundary,
+which is how the wrapper reads a workspace of several cells (DR-0124 §14.2).

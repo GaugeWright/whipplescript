@@ -3,6 +3,9 @@
 # builds with a pinned Buck2 and nothing else.
 [cells]
 root = .
+# A nested cell: a label in it is placed in the tree through this mapping,
+# and the root cell's globs stop at its boundary (DR-0124 §14.2).
+inner = inner
 
 [buildfile]
 # The fixture's build file is FIXTURE, not BUCK: this directory sits inside
