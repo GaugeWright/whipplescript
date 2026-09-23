@@ -25,3 +25,18 @@ whip_test = rule(
         "labels": attrs.list(attrs.string(), default = []),
     },
 )
+
+# A file whose bytes are its `content` attribute: an action with no file
+# inputs at all, so what classifies its result can only be the observations
+# that decided to generate it (DR-0124 §14.2).
+
+def _whip_file_impl(ctx):
+    out = ctx.actions.write(ctx.attrs.name + ".txt", ctx.attrs.content)
+    return [DefaultInfo(default_output = out)]
+
+whip_file = rule(
+    impl = _whip_file_impl,
+    attrs = {
+        "content": attrs.string(),
+    },
+)

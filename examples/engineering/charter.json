@@ -1625,6 +1625,13 @@
             "value_type": {
               "type": "text"
             }
+          },
+          {
+            "name": "projection",
+            "required": false,
+            "value_type": {
+              "type": "text"
+            }
           }
         ],
         "status": {

@@ -49,6 +49,11 @@ pub struct BuildArtifact {
     /// The action digest Buck2 computed, when the wrapper has it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub action: Option<String>,
+    /// The projected tree the artifact was built over, when it was not the
+    /// cut: a principal's ungated iteration claims only that tree (§14.1),
+    /// and the projection is part of the artifact's identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub projection: Option<String>,
 }
 
 impl BuildArtifact {
@@ -65,6 +70,9 @@ impl BuildArtifact {
         if let Some(action) = &self.action {
             fields["action"] = json!(action);
         }
+        if let Some(projection) = &self.projection {
+            fields["projection"] = json!(projection);
+        }
         fields
     }
 
@@ -73,7 +81,10 @@ impl BuildArtifact {
         PublicationSlot {
             ledger: self.ledger.clone(),
             instance: format!("build:{}", self.cut),
-            effect: format!("{}#{}", self.label, self.configuration),
+            effect: match &self.projection {
+                None => format!("{}#{}", self.label, self.configuration),
+                Some(projection) => format!("{}#{}@{projection}", self.label, self.configuration),
+            },
             run: "artifact".into(),
         }
     }
@@ -85,6 +96,7 @@ impl BuildArtifact {
             &self.cut,
             &self.label,
             &self.configuration,
+            self.projection.as_deref().unwrap_or(""),
         ])
     }
 }

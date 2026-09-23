@@ -147,6 +147,7 @@ mod injected_secrets;
 mod stats_report;
 use whipplescript::instance_view;
 mod build_commands;
+mod build_scope;
 mod lsp_server;
 mod maude_model;
 mod mcp_cli;

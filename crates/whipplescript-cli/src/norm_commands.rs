@@ -58,6 +58,10 @@ pub(crate) struct Trust {
     #[serde(default)]
     public_bindings: Vec<NormPublicKeyBinding>,
     checkpoint: Option<NormCheckpoint>,
+    /// The labeled regions of every cut the Home builds (DR-0124 §14.2):
+    /// who may read a region is the Home's policy, never the build cell's.
+    #[serde(default)]
+    regions: Vec<super::build_scope::Region>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -66,6 +70,9 @@ struct Binding {
     principal: String,
     credential: CredentialName,
     version: KeyVersion,
+    /// The region labels this binding's principal holds; none by default.
+    #[serde(default)]
+    labels: Vec<String>,
 }
 #[derive(Clone, Copy, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
@@ -213,6 +220,9 @@ pub(crate) struct NormTrust<'a> {
     public_keys: Vec<NormPublicKeyVerifier>,
     creation_grants: Vec<(String, String)>,
     pub(crate) checkpoint: Option<NormCheckpoint>,
+    /// The Home's label policy and the labels each binding holds.
+    pub(crate) policy: super::build_scope::LabelPolicy,
+    principals: BTreeMap<String, super::build_scope::Principal>,
 }
 
 /// The host's trust document, from the environment only.
@@ -247,7 +257,9 @@ impl<'a> NormTrust<'a> {
             .into_iter()
             .map(NormPublicKeyVerifier::new)
             .collect::<Result<Vec<_>, _>>()?;
+        let policy = super::build_scope::LabelPolicy::new(trust.regions)?;
         let mut keys = BTreeMap::new();
+        let mut principals = BTreeMap::new();
         for binding in trust.bindings {
             let key = NormCustodyKey::new(
                 binding.principal,
@@ -255,6 +267,13 @@ impl<'a> NormTrust<'a> {
                 binding.version.into(),
                 transport.ok_or("norm custody binding has no transport")?,
             )?;
+            principals.insert(
+                binding.name.clone(),
+                super::build_scope::Principal {
+                    name: binding.name.clone(),
+                    labels: binding.labels.into_iter().collect(),
+                },
+            );
             keys.insert(binding.name, key);
         }
         Ok(Self {
@@ -266,6 +285,8 @@ impl<'a> NormTrust<'a> {
                 .map(|grant| (grant.creator, grant.owner))
                 .collect(),
             checkpoint: trust.checkpoint,
+            policy,
+            principals,
         })
     }
 
@@ -288,6 +309,13 @@ impl<'a> NormTrust<'a> {
 
     pub(crate) fn key(&self, name: &str) -> Result<&NormCustodyKey<'a>, String> {
         self.keys
+            .get(name)
+            .ok_or_else(|| format!("no trusted norm binding named {name}"))
+    }
+
+    /// The principal a binding acts as, with the labels the document grants it.
+    pub(crate) fn principal(&self, name: &str) -> Result<&super::build_scope::Principal, String> {
+        self.principals
             .get(name)
             .ok_or_else(|| format!("no trusted norm binding named {name}"))
     }

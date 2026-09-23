@@ -2240,6 +2240,7 @@ fn engineering_charter_receives_a_published_artifact_and_an_implements_edge() {
         classification: "low".into(),
         encoding: INPUT_ROOT_ENCODING_V1.into(),
         action: Some(sha256_hex(b"action")),
+        projection: None,
     };
     let vocabulary = reference("artifact");
     let actor = actor();

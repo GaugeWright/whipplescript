@@ -12,3 +12,13 @@ suite that runs and reports nothing.
 The executor crate's integration test runs
 `buck2 test //... -- --report <path>` here with
 `-c test.v2_test_executor=<the built executor>` and reads the report.
+
+`secret-gate/` is a second package, the qualification experiment of DR-0124
+§14.2 (BE-03, BE-04): its build file globs `protected/` and generates
+`//secret-gate:gate` with `whip_file`, an action with no file input whose
+content says whether the listing was observed. The Home daemon's wrapper
+labels `secret-gate/protected/` `protected` in its fixture, so a principal
+without that label receives a projection without the directory, builds the
+other branch there, and is refused the cut's result by name — while
+`//:passing` in the root package, whose listing stops at the sub-package,
+stays public.

@@ -4389,6 +4389,32 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
             .map(Some)
     }
 
+    /// A principal's projection of a recorded cut (DR-0124 §14.2): only the
+    /// manifest paths in `include` — the regions the principal's labels
+    /// permit — are projected, so what a build over it observes is exactly
+    /// that view. `None` = unrecorded cut.
+    #[cfg(feature = "native")]
+    pub fn materialize_cut_subset(
+        &self,
+        cut_id: &str,
+        include: &std::collections::BTreeSet<String>,
+        root: &Path,
+        now_unix_nanos: i128,
+    ) -> StoreResult<Option<crate::materialize::MaterializedScratch>> {
+        let Some(manifest) = self.cut_manifest(cut_id)? else {
+            return Ok(None);
+        };
+        crate::materialize::materialize_manifest_subset(
+            &manifest,
+            Some(include),
+            &self.content,
+            root,
+            now_unix_nanos,
+            &crate::materialize::MaterializeLimits::default(),
+        )
+        .map(Some)
+    }
+
     /// Import-back: scan the scratch against its seeded cache, store every
     /// changed blob, and commit the whole diff as ONE effect-keyed,
     /// idempotent cut on the branch.

@@ -1,0 +1,11 @@
+load("//:rules.bzl", "whip_file")
+
+# The qualification experiment of DR-0124 §14.2: a protected discovery
+# observation decides what one action produces, and the action has no
+# protected file as an input. The glob observes the listing of `protected/`
+# — membership, or absence — and the innocuous output that results carries
+# the classification of what shaped it, not of what it reads.
+whip_file(
+    name = "gate",
+    content = "with the protected observation" if len(glob(["protected/*"])) > 0 else "without the protected observation",
+)

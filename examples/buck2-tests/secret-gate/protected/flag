@@ -1,0 +1,4 @@
+The protected region's one file. Its presence, never its content, is what
+the package's build file observes: a principal whose labels do not include
+`protected` receives a projection without it, and the glob over this
+directory answers differently there (DR-0124 §14.2, BE-03 and BE-04).
