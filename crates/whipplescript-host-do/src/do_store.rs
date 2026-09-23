@@ -19923,6 +19923,9 @@ mod norm_admission_tests {
                 NormCommandResult::Explained { explanation, .. } => {
                     serde_json::to_value(&*explanation).unwrap()
                 }
+                NormCommandResult::Queried { result, .. } => {
+                    serde_json::to_value(&*result).unwrap()
+                }
                 other => panic!("view expected, got {other:?}"),
             }
         }
@@ -20061,6 +20064,31 @@ mod norm_admission_tests {
             },
         );
         assert_eq!(historical["members"][0]["standing"]["kind"], "effective");
+        // The typed query answers identically on both hosts, now and at the
+        // published frontier.
+        let queried = agree(
+            &mut native,
+            &mut hosted,
+            NormCommand::Query {
+                expression: format!(
+                    "related(work, members(record({s}))) | status(requirement, accepted)"
+                ),
+                frontier: None,
+                cut: None,
+            },
+        );
+        assert_eq!(queried["members"]["kind"], "records");
+        assert_eq!(queried["completeness"]["complete"], serde_json::json!(true));
+        let queried_then = agree(
+            &mut native,
+            &mut hosted,
+            NormCommand::Query {
+                expression: format!("revision({r0})"),
+                frontier: Some(published.clone()),
+                cut: None,
+            },
+        );
+        assert_eq!(queried_then["frontier"], serde_json::json!(published));
         let diff = agree(
             &mut native,
             &mut hosted,

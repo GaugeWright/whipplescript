@@ -2379,3 +2379,124 @@ fn engineering_charter_receives_a_published_artifact_and_an_implements_edge() {
         edge.source == task && edge.target == published && edge.relation == "implements"
     }));
 }
+
+/// The projection producer (norm-plane §8, E4): a typed query at a frontier,
+/// handed to a consumer as a pure value that says what it could not see.
+#[test]
+fn a_projection_is_the_query_at_its_frontier_and_nothing_more() {
+    use crate::norm_query_producer::{project, ProjectedMembers, PROJECTION_PROTOCOL};
+    let charter: NormCharter =
+        serde_json::from_str(include_str!("../../../examples/engineering/charter.json"))
+            .expect("the engineering charter is a charter");
+    let mut ledger = whipplescript_store::items::WorkItemStore::open_in_memory().unwrap();
+    let ledger_id = ledger
+        .append_norm_event(
+            &sign(
+                "root",
+                NormAct::Bootstrap {
+                    creator: "owner".into(),
+                    charter: charter.clone(),
+                },
+            ),
+            &Boundary,
+        )
+        .unwrap();
+    let reference = |name: &str| {
+        Vocabulary::new(
+            charter
+                .vocabularies
+                .iter()
+                .find(|entry| entry.definition.name == name)
+                .unwrap_or_else(|| panic!("charter declares {name}"))
+                .definition
+                .clone(),
+        )
+        .unwrap()
+        .reference()
+        .clone()
+    };
+    let task = ledger
+        .append_norm_event(
+            &sign(
+                "task",
+                NormAct::Create {
+                    ledger: ledger_id.clone(),
+                    authority: None,
+                    vocabulary: reference("task"),
+                    fields_json: json!({"title": "ship the parser", "labels": ["build"]})
+                        .to_string(),
+                },
+            ),
+            &Boundary,
+        )
+        .unwrap();
+    let projected = project(
+        &mut ledger,
+        &Boundary,
+        None,
+        "vocabulary(task) & status(task, open)",
+        None,
+        None,
+    )
+    .expect("the query projects");
+    assert_eq!(projected.protocol, PROJECTION_PROTOCOL);
+    assert_eq!(
+        projected.expression,
+        "(vocabulary(task) & status(task, open))"
+    );
+    assert!(!projected.frontier.is_empty());
+    assert_eq!(projected.cut, None);
+    match &projected.members {
+        ProjectedMembers::Records { records } => {
+            assert_eq!(records.len(), 1);
+            assert_eq!(records[0].record, task);
+            assert_eq!(records[0].vocabulary, "task");
+            assert_eq!(records[0].status, "open");
+        }
+        other => panic!("records expected, got {other:?}"),
+    }
+    assert!(
+        projected.completeness.complete,
+        "{:?}",
+        projected.completeness
+    );
+    // The same query at the same frontier is the same projection.
+    let again = project(
+        &mut ledger,
+        &Boundary,
+        None,
+        "vocabulary(task) & status(task, open)",
+        Some(projected.frontier.clone()),
+        None,
+    )
+    .expect("projects again");
+    assert_eq!(again.key(), projected.key());
+    assert_eq!(again, projected);
+    // A projection over the artifact needs the cut it is read at.
+    let refused = project(
+        &mut ledger,
+        &Boundary,
+        None,
+        "anchored(path(src/**))",
+        None,
+        None,
+    )
+    .expect_err("no resource point");
+    assert!(
+        refused.contains("a query over the artifact needs a resource point: name the cut"),
+        "{refused}"
+    );
+    let malformed = project(
+        &mut ledger,
+        &Boundary,
+        None,
+        "vocabulary(task) | path(src/**)",
+        None,
+        None,
+    )
+    .expect_err("mixed types");
+    assert!(
+        malformed.contains("region and record sets share operators but are different types"),
+        "{malformed}"
+    );
+}

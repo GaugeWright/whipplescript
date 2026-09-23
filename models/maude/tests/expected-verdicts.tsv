@@ -289,3 +289,4 @@ manifest-completeness.maude	SSNSSNSSSNS
 correspondence-reuse.maude	SNSNSSNSS
 action-classification.maude	SNSSSSSNSSNSSNS
 store-authorization.maude	SNSNSSSNSSNNS
+ledger-query.maude	SSNNSNNSSS

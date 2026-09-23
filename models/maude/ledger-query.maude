@@ -1,0 +1,73 @@
+--- The typed ledger query of norm-plane §8 (DR-0098 §6; Q1).
+---
+--- A query is answered at one frontier over what the caller may see. Three
+--- things hold. A dependency join reaches every record the family's live
+--- edges bind from the set it starts at, so a bound record is never missing
+--- from an answer reported complete. A record the view withholds from the
+--- caller is still counted: an answer that could not see it is partial, and
+--- partial is never presented as complete. And a query writes nothing — no
+--- fact is filed, no act admitted, no check run — so answering it leaves
+--- the ledger as it was. Each weakening below reaches a state the base model
+--- cannot.
+---
+--- Facts: rec(R) a record at the frontier; edge(F, R1, R2) a live edge of
+--- family F from R1 to R2; visible(R) the caller may read R; withheld(R)
+--- the view redacts R; query(F, R) a dependency query from R along F;
+--- reached(F, R) the join has visited R; result(R) R is in the answer;
+--- answered(complete) or answered(partial) how the answer was reported;
+--- written a fact the query filed; sealed(F) the join stopped short.
+mod LEDGER-QUERY is
+  protecting BOOL .
+  sorts Rec Fam Report Fact Cfg State .
+  ops r1 r2 r3 : -> Rec [ctor] . op f : -> Fam [ctor] .
+  ops complete partial : -> Report [ctor] .
+  subsort Fact < Cfg . op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] . op {_} : Cfg -> State [ctor] .
+  ops rec visible withheld result : Rec -> Fact [ctor] .
+  op edge : Fam Rec Rec -> Fact [ctor] . ops query reached : Fam Rec -> Fact [ctor] .
+  op answered : Report -> Fact [ctor] . op written : -> Fact [ctor] .
+  op sealed : Fam -> Fact [ctor] .
+  op _in_ : Fact Cfg -> Bool . ops canJoin reachesWithheld : Fam Cfg -> Bool .
+  var X : Fact . vars R R2 : Rec . var F : Fam . var C : Cfg .
+  eq X in (X C) = true . eq X in C = false [owise] .
+  ceq canJoin(F, reached(F, R) edge(F, R, R2) visible(R2) C) = true if not(reached(F, R2) in C) .
+  eq canJoin(F, C) = false [owise] .
+  eq reachesWithheld(F, reached(F, R) edge(F, R, R2) withheld(R2) C) = true .
+  eq reachesWithheld(F, C) = false [owise] .
+  rl [start] : { query(F, R) C } => { reached(F, R) C } .
+  --- The join follows every live edge from a record it reached and puts
+  --- what it may see in the answer, once.
+  crl [join] : { reached(F, R) edge(F, R, R2) visible(R2) C }
+    => { reached(F, R) reached(F, R2) result(R2) edge(F, R, R2) visible(R2) C }
+    if not(reached(F, R2) in C) .
+  --- A withheld record the join reaches makes the answer partial.
+  crl [reach-withheld] : { reached(F, R) edge(F, R, R2) withheld(R2) C }
+    => { reached(F, R) edge(F, R, R2) withheld(R2) answered(partial) C }
+    if not(answered(partial) in C) .
+  --- Complete is reported only once the join has nothing left to follow
+  --- and reached nothing withheld.
+  crl [report-complete] : { reached(F, R) C } => { reached(F, R) answered(complete) C }
+    if not(answered(complete) in C) and not(answered(partial) in C)
+       and not(canJoin(F, reached(F, R) C)) and not(reachesWithheld(F, reached(F, R) C)) .
+endm
+--- Weakening: the join marks a record reached without answering it, so a
+--- dependency-bound record is missing from an answer reported complete.
+mod LEDGER-QUERY-MISSING-DEPENDENCY is
+  including LEDGER-QUERY .
+  vars R R2 : Rec . var F : Fam . var C : Cfg .
+  crl [skip-edge] : { reached(F, R) edge(F, R, R2) visible(R2) C }
+    => { reached(F, R) reached(F, R2) sealed(F) edge(F, R, R2) visible(R2) C }
+    if not(reached(F, R2) in C) .
+endm
+--- Weakening: a partial answer is presented as complete.
+mod LEDGER-QUERY-REDACTION-AS-COMPLETE is
+  including LEDGER-QUERY .
+  var C : Cfg .
+  rl [partial-as-complete] : { answered(partial) C } => { answered(complete) answered(partial) C } .
+endm
+--- Weakening: answering the query writes to the ledger.
+mod LEDGER-QUERY-SIDE-EFFECT is
+  including LEDGER-QUERY .
+  var R : Rec . var F : Fam . var C : Cfg .
+  crl [query-writes] : { reached(F, R) C } => { reached(F, R) written C } if not(written in C) .
+endm

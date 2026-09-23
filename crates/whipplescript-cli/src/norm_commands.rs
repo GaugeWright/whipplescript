@@ -32,6 +32,7 @@ pub(crate) const USAGE: &str = "usage: whip [--json] norm <command>\n\
   compare-resources <before-cut> <after-cut> [--before-frontier <file>] [--after-frontier <file>]\n\
   impact <before-cut> <after-cut> [--before-frontier <file>] [--after-frontier <file>]\n\
   render <id-or-alias> [--frontier <file>] | explain <id-or-alias> [--frontier <file>]\n\
+  query <expression> [--frontier <file>] [--cut <cut>]\n\
   diff --before-frontier <file> [--after-frontier <file>]\n\
   bootstrap --as <binding> --creator <principal> [--charter <file>]\n\
   create <vocabulary@version> --as <binding> --fields <file>\n\
@@ -106,6 +107,7 @@ impl<'a> Arguments<'a> {
         let (arity, allowed): (usize, &[&str]) = match verb {
             "snapshot" | "inventory" => (0, &["--frontier"]),
             "render" | "explain" => (1, &["--frontier"]),
+            "query" => (1, &["--frontier", "--cut"]),
             "diff" => (0, &["--before-frontier", "--after-frontier"]),
             "export" | "provision" => (0, &[]),
             "resources" => (1, &["--frontier"]),
@@ -588,6 +590,11 @@ fn execute(args: &[String], runtime_path: &std::path::Path) -> Result<Value, Str
                 NormCommand::Explain { record, frontier }
             }
         }
+        "query" => NormCommand::Query {
+            expression: args.positional[0].to_owned(),
+            frontier: args.frontier("--frontier")?,
+            cut: args.flags.get("--cut").map(|cut| (*cut).to_owned()),
+        },
         "diff" => {
             args.required("--before-frontier")?;
             NormCommand::Diff {

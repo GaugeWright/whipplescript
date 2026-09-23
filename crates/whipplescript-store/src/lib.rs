@@ -45,6 +45,7 @@ pub mod norm_history;
 pub mod norm_inventory;
 pub mod norm_manifests;
 pub mod norm_publication;
+pub mod norm_query;
 pub mod norm_relations;
 pub mod norm_resources;
 pub mod norm_views;

@@ -61,6 +61,14 @@ reuse, and the act for one successor activating the other — with weakenings
 for reuse by resemblance and for a door that transplants acceptance across
 the split. Witness adequacy and evidence premises are not modeled.
 
+`ledger-query.maude` models norm-plane §8 (DR-0098 §6, Q1): a dependency
+join reaches every record a family's live edges bind from where it starts,
+so an answer reported complete never lacks a bound record; a record the view
+withholds makes the answer partial, and partial is never presented as
+complete; and a query writes nothing. Three weakenings: the join marking a
+record reached without answering it, a partial answer presented as
+complete, and a query that files a fact.
+
 `action-classification.maude` models DR-0124 §14.2: an action's
 classification joins its declared label with every influence that shaped
 it — a declared input, a presence observation, an observation of absence —

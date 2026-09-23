@@ -77,6 +77,15 @@ pub enum NormCommand {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         frontier: Option<Vec<String>>,
     },
+    /// Evaluate a typed query (§8, `norm_query`) at a frontier; a query that
+    /// reaches the artifact names the cut it is read at.
+    Query {
+        expression: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        frontier: Option<Vec<String>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cut: Option<String>,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -152,6 +161,10 @@ pub enum NormCommandResult {
     Explained {
         captured: NormReadAnchor,
         explanation: Box<crate::norm_views::Explanation>,
+    },
+    Queried {
+        captured: NormReadAnchor,
+        result: Box<crate::norm_query::QueryResult>,
     },
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -462,6 +475,48 @@ impl<'a, S: NormCommandStore> NormCommandHost<'a, S> {
                 NormCommandResult::Rendered {
                     captured: history.anchor(),
                     rendering: Box::new(crate::norm_views::render_manifest(&context, &manifest)?),
+                }
+            }
+            NormCommand::Query {
+                expression,
+                frontier,
+                cut,
+            } => {
+                let query = crate::norm_query::parse(&expression)?;
+                let history = self.history()?;
+                let view = history.project(frontier.as_deref(), self.verifier)?;
+                let manifests = self.manifest_judgments(&view, Some(&history))?;
+                let aliases = self.store.local_norm_aliases()?;
+                let context = crate::norm_views::ViewContext {
+                    view: &view,
+                    aliases: &aliases,
+                    manifests: &manifests,
+                };
+                let captured_artifact = match &cut {
+                    Some(cut) => Some(self.capture_artifact(cut)?),
+                    None => None,
+                };
+                let resources = match &captured_artifact {
+                    Some(artifact) => {
+                        Some(view.resource_inventory(artifact, ResourceLimits::default())?)
+                    }
+                    None => None,
+                };
+                let artifact_paths: Option<std::collections::BTreeSet<String>> = captured_artifact
+                    .as_ref()
+                    .map(|artifact| artifact.files().keys().cloned().collect());
+                let result = crate::norm_query::evaluate(
+                    &query,
+                    &crate::norm_query::QueryInput {
+                        context: &context,
+                        resources: resources.as_ref(),
+                        artifact_paths: artifact_paths.as_ref(),
+                        redacted: 0,
+                    },
+                )?;
+                NormCommandResult::Queried {
+                    captured: history.anchor(),
+                    result: Box::new(result),
                 }
             }
             NormCommand::Diff { before, after } => {

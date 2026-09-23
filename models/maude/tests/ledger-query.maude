@@ -1,0 +1,33 @@
+load ../ledger-query.maude
+--- r1 -f-> r2 -f-> r3, all visible: a query from r1 reaches both.
+--- positive: the dependency-bound record two hops away is in the answer
+search [1] in LEDGER-QUERY : { rec(r1) rec(r2) rec(r3) visible(r1) visible(r2) visible(r3) edge(f, r1, r2) edge(f, r2, r3) query(f, r1) }
+  =>* { result(r2) result(r3) RESIDUAL:Cfg } .
+--- positive: with nothing withheld the answer is reported complete
+search [1] in LEDGER-QUERY : { rec(r1) rec(r2) rec(r3) visible(r1) visible(r2) visible(r3) edge(f, r1, r2) edge(f, r2, r3) query(f, r1) }
+  =>* { answered(complete) RESIDUAL:Cfg } .
+--- refusal: nothing is ever written by a query
+search in LEDGER-QUERY : { rec(r1) rec(r2) rec(r3) visible(r1) visible(r2) visible(r3) edge(f, r1, r2) edge(f, r2, r3) query(f, r1) }
+  =>* { written RESIDUAL:Cfg } .
+--- refusal: an answer reported complete never lacks a bound record
+search in LEDGER-QUERY : { rec(r1) rec(r2) rec(r3) visible(r1) visible(r2) visible(r3) edge(f, r1, r2) edge(f, r2, r3) query(f, r1) }
+  =>* { answered(complete) RESIDUAL:Cfg } such that not(result(r3) in RESIDUAL:Cfg) .
+--- r3 withheld: the answer holds r2, and is partial, never complete.
+--- positive: the withheld record makes the answer partial
+search [1] in LEDGER-QUERY : { rec(r1) rec(r2) rec(r3) visible(r1) visible(r2) withheld(r3) edge(f, r1, r2) edge(f, r2, r3) query(f, r1) }
+  =>* { result(r2) answered(partial) RESIDUAL:Cfg } .
+--- refusal: a redacted premise is never presented as complete
+search in LEDGER-QUERY : { rec(r1) rec(r2) rec(r3) visible(r1) visible(r2) withheld(r3) edge(f, r1, r2) edge(f, r2, r3) query(f, r1) }
+  =>* { answered(complete) RESIDUAL:Cfg } .
+--- refusal: the withheld record is never in the answer
+search in LEDGER-QUERY : { rec(r1) rec(r2) rec(r3) visible(r1) visible(r2) withheld(r3) edge(f, r1, r2) edge(f, r2, r3) query(f, r1) }
+  =>* { result(r3) RESIDUAL:Cfg } .
+--- weakening: the join skips a bound record and still reports complete
+search [1] in LEDGER-QUERY-MISSING-DEPENDENCY : { rec(r1) rec(r2) rec(r3) visible(r1) visible(r2) visible(r3) edge(f, r1, r2) edge(f, r2, r3) query(f, r1) }
+  =>* { sealed(f) answered(complete) RESIDUAL:Cfg } such that not(result(r3) in RESIDUAL:Cfg) .
+--- weakening: the partial answer is presented as complete
+search [1] in LEDGER-QUERY-REDACTION-AS-COMPLETE : { rec(r1) rec(r2) rec(r3) visible(r1) visible(r2) withheld(r3) edge(f, r1, r2) edge(f, r2, r3) query(f, r1) }
+  =>* { answered(complete) RESIDUAL:Cfg } .
+--- weakening: the query writes
+search [1] in LEDGER-QUERY-SIDE-EFFECT : { rec(r1) rec(r2) rec(r3) visible(r1) visible(r2) visible(r3) edge(f, r1, r2) edge(f, r2, r3) query(f, r1) }
+  =>* { written RESIDUAL:Cfg } .

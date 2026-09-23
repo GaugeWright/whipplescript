@@ -5858,4 +5858,482 @@ mod tests {
             .execute_json(&duplicate)
             .is_err());
     }
+
+    /// EV-12 and EV-13: the typed query of norm-plane §8 over the same
+    /// history — record sets narrowed by vocabulary and status, dependency
+    /// and membership joins, region sets at a cut and the anchoring join
+    /// between them, at named frontiers, each answer saying what it could
+    /// not see.
+    #[test]
+    fn norm_query_joins_records_and_regions_at_a_frontier_and_says_what_it_could_not_see() {
+        use whipplescript_store::norm_commands::*;
+        use whipplescript_store::norm_query::QueryMembers;
+        let charter: NormCharter =
+            serde_json::from_str(include_str!("../../../examples/engineering/charter.json"))
+                .expect("the engineering charter is a charter");
+        let keys = Keys::new();
+        let mut store = WorkItemStore::open_in_memory().unwrap();
+        let ledger = store
+            .append_norm_event(
+                &keys.sign(
+                    "owner",
+                    "engineering",
+                    NormAct::Bootstrap {
+                        creator: "worker".into(),
+                        charter: charter.clone(),
+                    },
+                ),
+                &keys,
+            )
+            .unwrap();
+        let reference = |name: &str| {
+            Vocabulary::new(
+                charter
+                    .vocabularies
+                    .iter()
+                    .find(|entry| entry.definition.name == name)
+                    .unwrap_or_else(|| panic!("charter declares {name}"))
+                    .definition
+                    .clone(),
+            )
+            .unwrap()
+            .reference()
+            .clone()
+        };
+        let create = |actor: &str, nonce: &str, kind: &str, fields: serde_json::Value| {
+            keys.sign(
+                actor,
+                nonce,
+                NormAct::Create {
+                    ledger: ledger.clone(),
+                    authority: None,
+                    vocabulary: reference(kind),
+                    fields_json: fields.to_string(),
+                },
+            )
+        };
+        let transition =
+            |actor: &str, nonce: &str, kind: &str, record: &str, previous: &str, status: &str| {
+                keys.sign(
+                    actor,
+                    nonce,
+                    NormAct::Transition {
+                        ledger: ledger.clone(),
+                        authority: None,
+                        vocabulary: reference(kind),
+                        record: record.into(),
+                        previous: previous.into(),
+                        status: status.into(),
+                    },
+                )
+            };
+        let relate =
+            |actor: &str, nonce: &str, kind: &str, source: &str, target: &str, basis: &str| {
+                keys.sign_with(
+                    actor,
+                    nonce,
+                    NormAct::Create {
+                        ledger: ledger.clone(),
+                        authority: None,
+                        vocabulary: reference(kind),
+                        fields_json: json!({"source": source, "target": target}).to_string(),
+                    },
+                    Some(NormPremises {
+                        family_basis: Some(basis.into()),
+                        references: vec![source.into(), target.into()],
+                        inventory_frontier: Vec::new(),
+                    }),
+                )
+            };
+        let view = |store: &WorkItemStore| store.norm_state(&keys).unwrap();
+        let effective = |store: &WorkItemStore, id: &str| {
+            view(store).effective_records[id].content_head.clone()
+        };
+        let basis = |store: &WorkItemStore, family: &str| {
+            view(store).relation_family(family).unwrap().basis
+        };
+        let frontier = |store: &WorkItemStore| -> Vec<String> {
+            view(store).frontier.iter().cloned().collect()
+        };
+        let r = store
+            .append_norm_event(
+                &create("worker", "R", "requirement", json!({
+                    "name": "custody-authorization", "proposition": "role == owner or grant == allow",
+                    "domain": "workspace", "subject": "src/auth.py",
+                    "applicability": "every mainline candidate", "owner": "owner"
+                })),
+                &keys,
+            )
+            .unwrap();
+        store
+            .append_norm_event(
+                &transition("owner", "accept-R", "requirement", &r, &r, "accepted"),
+                &keys,
+            )
+            .unwrap();
+        let r0 = effective(&store, &r);
+        let t = store
+            .append_norm_event(
+                &create(
+                    "worker",
+                    "T",
+                    "task",
+                    json!({"title": "implement custody authorization", "labels": ["norm"]}),
+                ),
+                &keys,
+            )
+            .unwrap();
+        let work = basis(&store, "work");
+        store
+            .append_norm_event(
+                &relate("worker", "T-targets", "targets", &t, &r0, &work),
+                &keys,
+            )
+            .unwrap();
+        let o = store
+            .append_norm_event(
+                &create("worker", "O", "observation", json!({
+                    "title": "Q0 on A0", "statement": "all four cases pass", "subject": "src/auth.py",
+                    "artifact": "a0", "method": "Q0", "outcome": "pass"
+                })),
+                &keys,
+            )
+            .unwrap();
+        store
+            .append_norm_event(
+                &transition("owner", "activate-O", "observation", &o, &o, "active"),
+                &keys,
+            )
+            .unwrap();
+        let support = basis(&store, "support");
+        store
+            .append_norm_event(
+                &relate("worker", "O-supports", "supports", &o, &r0, &support),
+                &keys,
+            )
+            .unwrap();
+        let baseline = frontier(&store);
+        let s = store
+            .append_norm_event(
+                &keys.sign_with(
+                    "worker",
+                    "S",
+                    NormAct::Create {
+                        ledger: ledger.clone(),
+                        authority: None,
+                        vocabulary: reference("specification"),
+                        fields_json: json!({
+                            "title": "Authorization 1.0", "purpose": "what mainline must satisfy",
+                            "selection": "every accepted requirement", "members": [r0],
+                            "claim": "exhaustive", "definitions": "grant: a recorded allowance"
+                        })
+                        .to_string(),
+                    },
+                    Some(NormPremises {
+                        family_basis: None,
+                        references: vec![r0.clone()],
+                        inventory_frontier: baseline.clone(),
+                    }),
+                ),
+                &keys,
+            )
+            .unwrap();
+        let published = frontier(&store);
+        let artifact = resource_artifact(
+            "a0",
+            &[
+                ("src/auth.py", "ok"),
+                ("src/parser.py", "old"),
+                ("docs/x.md", "prose"),
+            ],
+        );
+        let artifacts = |cut: &str| match cut {
+            "a0" => Ok(artifact.clone()),
+            _ => Err(StoreError::Conflict("fixture missing cut".into())),
+        };
+        let query = |store: &mut WorkItemStore,
+                     expression: &str,
+                     frontier: Option<Vec<String>>,
+                     cut: Option<&str>| {
+            NormCommandHost::new(store, &keys)
+                .with_artifacts(&artifacts)
+                .execute(NormCommandRequest::new(NormCommand::Query {
+                    expression: expression.into(),
+                    frontier,
+                    cut: cut.map(str::to_owned),
+                }))
+                .map(|response| match response.result {
+                    NormCommandResult::Queried { result, .. } => *result,
+                    other => panic!("a query result was expected, got {other:?}"),
+                })
+        };
+        let ids = |members: &QueryMembers| -> Vec<String> {
+            match members {
+                QueryMembers::Records { heads } => heads.iter().map(|h| h.id.clone()).collect(),
+                QueryMembers::Regions { paths, .. } => paths.clone(),
+            }
+        };
+        let refused = |result: Result<_, StoreError>, needle: &str| {
+            let message = format!("{:?}", result.expect_err("a refusal was expected"));
+            assert!(message.contains(needle), "{message}");
+        };
+
+        // Record sets: narrowed by vocabulary and by a status the vocabulary
+        // declares; joined along declared families and through a manifest.
+        let requirements = query(&mut store, "vocabulary(requirement)", None, None).unwrap();
+        assert_eq!(ids(&requirements.members), vec![r.clone()]);
+        assert_eq!(requirements.frontier, published);
+        assert!(
+            requirements.completeness.complete,
+            "{:?}",
+            requirements.completeness
+        );
+        assert!(requirements.completeness.classification_complete);
+        assert_eq!(requirements.completeness.binding_complete, None);
+        assert_eq!(
+            ids(&query(
+                &mut store,
+                "status(requirement, accepted) & effective",
+                None,
+                None
+            )
+            .unwrap()
+            .members),
+            vec![r.clone()]
+        );
+        assert!(ids(
+            &query(&mut store, "status(requirement@1, proposed)", None, None)
+                .unwrap()
+                .members
+        )
+        .is_empty());
+        refused(
+            query(&mut store, "status(requirement, bogus)", None, None),
+            "`bogus` is not a status of vocabulary `requirement`",
+        );
+        refused(
+            query(&mut store, "status(nope, accepted)", None, None),
+            "the charter declares no vocabulary `nope`",
+        );
+        refused(
+            query(&mut store, "status(requirement@9, accepted)", None, None),
+            "the charter declares no vocabulary `requirement` at version 9",
+        );
+        assert_eq!(
+            ids(&query(
+                &mut store,
+                &format!("related(work, record({t}))"),
+                None,
+                None
+            )
+            .unwrap()
+            .members),
+            vec![r.clone()]
+        );
+        assert_eq!(
+            ids(&query(
+                &mut store,
+                &format!("related(work, record({r}), sources)"),
+                None,
+                None
+            )
+            .unwrap()
+            .members),
+            vec![t.clone()]
+        );
+        assert_eq!(
+            ids(&query(
+                &mut store,
+                &format!("related(support, revision({r0}), sources)"),
+                None,
+                None
+            )
+            .unwrap()
+            .members),
+            vec![o.clone()]
+        );
+        assert_eq!(
+            ids(
+                &query(&mut store, &format!("members(record({s}))"), None, None)
+                    .unwrap()
+                    .members
+            ),
+            vec![r.clone()]
+        );
+        assert_eq!(
+            ids(&query(
+                &mut store,
+                "members(vocabulary(specification)) | vocabulary(task)",
+                None,
+                None
+            )
+            .unwrap()
+            .members),
+            {
+                let mut both = vec![r.clone(), t.clone()];
+                both.sort();
+                both
+            }
+        );
+        assert_eq!(
+            ids(&query(&mut store, "all - effective", None, None)
+                .unwrap()
+                .members),
+            {
+                let mut rest = vec![
+                    t.clone(),
+                    s.clone(),
+                    view(&store)
+                        .records
+                        .keys()
+                        .find(|id| view(&store).records[*id].vocabulary.name == "targets")
+                        .cloned()
+                        .unwrap(),
+                    view(&store)
+                        .records
+                        .keys()
+                        .find(|id| view(&store).records[*id].vocabulary.name == "supports")
+                        .cloned()
+                        .unwrap(),
+                ];
+                rest.sort();
+                rest
+            }
+        );
+        refused(
+            query(&mut store, "record(nobody)", None, None),
+            "no norm record `nobody` at this frontier",
+        );
+        refused(
+            query(&mut store, "revision(nothing)", None, None),
+            "no admitted revision `nothing` at this frontier",
+        );
+        refused(query(&mut store, "related(nofamily, all)", None, None), "");
+
+        // Region sets need the artifact, and say so.
+        refused(
+            query(&mut store, "path(src/**)", None, None),
+            "a query over the artifact needs a resource point: name the cut",
+        );
+        let src = query(&mut store, "path(src/**)", None, Some("a0")).unwrap();
+        assert_eq!(
+            ids(&src.members),
+            vec!["src/auth.py".to_owned(), "src/parser.py".to_owned()]
+        );
+        assert!(matches!(&src.members, QueryMembers::Regions { cut, .. } if cut == "a0"));
+        assert_eq!(src.completeness.binding_complete, Some(true));
+        assert!(src.completeness.complete);
+        assert_eq!(
+            ids(
+                &query(&mut store, "workspace - subtree(src)", None, Some("a0"))
+                    .unwrap()
+                    .members
+            ),
+            vec!["docs/x.md".to_owned()]
+        );
+        assert_eq!(
+            ids(&query(
+                &mut store,
+                "file(docs/x.md) | file(src/auth.py)",
+                None,
+                Some("a0")
+            )
+            .unwrap()
+            .members),
+            vec!["docs/x.md".to_owned(), "src/auth.py".to_owned()]
+        );
+        // The anchoring join crosses the types explicitly, both ways.
+        assert_eq!(
+            ids(
+                &query(&mut store, "anchored(file(src/auth.py))", None, Some("a0"))
+                    .unwrap()
+                    .members
+            ),
+            vec![r.clone()]
+        );
+        assert_eq!(
+            ids(&query(
+                &mut store,
+                &format!("anchors(record({r}))"),
+                None,
+                Some("a0")
+            )
+            .unwrap()
+            .members),
+            vec![
+                "docs/x.md".to_owned(),
+                "src/auth.py".to_owned(),
+                "src/parser.py".to_owned()
+            ]
+        );
+        assert_eq!(
+            ids(
+                &query(&mut store, "anchored(path(none/**))", None, Some("a0"))
+                    .unwrap()
+                    .members
+            ),
+            Vec::<String>::new()
+        );
+        refused(
+            query(&mut store, "anchored(file(src/auth.py))", None, Some("a1")),
+            "fixture missing cut",
+        );
+
+        // A frontier is named: after an edit the requirement's revision moves,
+        // and the historical answer is what the published frontier held.
+        let edited = store
+            .append_norm_event(
+                &keys.sign(
+                    "owner",
+                    "edit-R",
+                    NormAct::Edit {
+                        ledger: ledger.clone(),
+                        authority: None,
+                        vocabulary: reference("requirement"),
+                        record: r.clone(),
+                        previous: view(&store).records[&r].head.clone(),
+                        fields_json: json!({
+                            "name": "custody-authorization", "proposition": "role == owner or grant == allow or role == admin",
+                            "domain": "workspace", "subject": "src/auth.py",
+                            "applicability": "every mainline candidate", "owner": "owner"
+                        })
+                        .to_string(),
+                    },
+                ),
+                &keys,
+            )
+            .unwrap();
+        let now = query(&mut store, &format!("revision({edited})"), None, None).unwrap();
+        assert_eq!(ids(&now.members), vec![r.clone()]);
+        assert_ne!(now.frontier, published);
+        refused(
+            query(
+                &mut store,
+                &format!("revision({edited})"),
+                Some(published.clone()),
+                None,
+            ),
+            "no admitted revision",
+        );
+        let then = query(
+            &mut store,
+            &format!("revision({r0})"),
+            Some(published.clone()),
+            None,
+        )
+        .unwrap();
+        assert_eq!(then.frontier, published);
+        assert_eq!(ids(&then.members), vec![r.clone()]);
+        assert_eq!(
+            ids(&query(
+                &mut store,
+                &format!("related(work, record({t}))"),
+                Some(published.clone()),
+                None
+            )
+            .unwrap()
+            .members),
+            vec![r.clone()]
+        );
+    }
 }
