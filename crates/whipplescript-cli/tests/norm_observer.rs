@@ -2,6 +2,8 @@
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom};
 use std::net::TcpListener;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -16,7 +18,32 @@ use whipplescript_kernel::sansio::HttpResponse;
 struct Executor {
     child: Child,
     url: String,
+    log: File,
 }
+
+/// A file for the executor's two streams, and what it wrote, for a failure
+/// message.
+///
+/// The fixture used to send both streams to `Stdio::null()`, so an executor
+/// that panicked, could not take its address, or rejected its token failed
+/// this test as "executor exited during startup" or "executor startup timed
+/// out" — which say that it did not come up, and never which of those it
+/// was. An unnamed temporary keeps the output out of a passing run and out
+/// of the way of tests running beside this one.
+fn executor_log() -> File {
+    tempfile::tempfile().expect("a file for the executor's output")
+}
+
+fn said(log: &mut File) -> String {
+    let mut text = String::new();
+    let _ = log.seek(SeekFrom::Start(0));
+    match log.read_to_string(&mut text) {
+        Ok(_) if !text.trim().is_empty() => format!("; it said: {}", text.trim()),
+        Ok(_) => "; it wrote nothing before stopping".to_string(),
+        Err(error) => format!("; its output could not be read: {error}"),
+    }
+}
+
 impl Drop for Executor {
     fn drop(&mut self) {
         let _ = self.child.kill();
@@ -28,16 +55,18 @@ impl Executor {
         let listener = TcpListener::bind("127.0.0.1:0").expect("norm observer fixture");
         let address = listener.local_addr().expect("norm observer fixture");
         drop(listener);
+        let log = executor_log();
         let child = Command::new(env!("CARGO_BIN_EXE_whip"))
             .args(["executor", "--bind", &address.to_string()])
             .env("WHIP_EXECUTOR_TOKEN", "norm-observer-fixture-token")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stdout(Stdio::from(log.try_clone().expect("share the log")))
+            .stderr(Stdio::from(log.try_clone().expect("share the log")))
             .spawn()
             .expect("norm observer fixture");
         let mut executor = Self {
             child,
             url: format!("http://{address}"),
+            log,
         };
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
@@ -48,15 +77,17 @@ impl Executor {
             {
                 break;
             }
+            if let Some(status) = executor.child.try_wait().expect("norm observer fixture") {
+                panic!(
+                    "executor exited before startup with {status}{}",
+                    said(&mut executor.log)
+                );
+            }
             assert!(
-                executor
-                    .child
-                    .try_wait()
-                    .expect("norm observer fixture")
-                    .is_none(),
-                "executor exited before startup"
+                Instant::now() < deadline,
+                "executor startup timed out after 10s{}",
+                said(&mut executor.log)
             );
-            assert!(Instant::now() < deadline, "executor startup timed out");
             std::thread::sleep(Duration::from_millis(20));
         }
         executor
