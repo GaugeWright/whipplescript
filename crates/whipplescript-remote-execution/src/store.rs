@@ -48,6 +48,15 @@ pub struct Store {
     inner: Mutex<Inner>,
 }
 
+/// The store's size, as the operator reads it.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Serialize)]
+pub struct StoreStats {
+    pub blobs: usize,
+    pub bytes: usize,
+    pub uses: usize,
+    pub handles: usize,
+}
+
 /// A view over the store: one handle, its principal, its uses.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct View {
@@ -170,6 +179,18 @@ impl Store {
             })
             .cloned()
             .collect()
+    }
+
+    /// What the store holds, for the operator's eyes: never an answer given
+    /// to a caller.
+    pub fn stats(&self) -> StoreStats {
+        let inner = self.lock();
+        StoreStats {
+            blobs: inner.blobs.len(),
+            bytes: inner.blobs.values().map(Vec::len).sum(),
+            uses: inner.uses.len(),
+            handles: inner.handles.len(),
+        }
     }
 
     /// Whether the bytes are stored at all: the store's own knowledge, never

@@ -132,6 +132,16 @@ impl ActionCache {
         Some(entry.clone())
     }
 
+    /// How many results the cache holds by origin: (executed, submitted).
+    pub fn counts(&self) -> (usize, usize) {
+        let entries = self.lock();
+        let executed = entries
+            .values()
+            .filter(|entry| matches!(entry.origin, Origin::Executed { .. }))
+            .count();
+        (executed, entries.len() - executed)
+    }
+
     /// Every action the endpoint's executor ran, in no particular order.
     pub fn executed_actions(&self) -> Vec<(Digest, Entry)> {
         self.lock()
