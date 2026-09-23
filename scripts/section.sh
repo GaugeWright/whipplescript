@@ -170,18 +170,22 @@ case "${1:-}" in
         cargo test --workspace
     fi ;;
   buck2-test-executor)
-    # BE-02 of the admission fixtures: the test executor of DR-0124 §14.5
-    # against a real Buck2 over examples/buck2-tests. The test is ignored
-    # under the ordinary `tests` unit because it needs buck2 on the PATH;
-    # this unit runs it where buck2 is, and names the remedy where it is not.
+    # BE-02 to BE-05 of the admission fixtures: the test executor of DR-0124
+    # §14.5, the Home daemon's wrapper of §14.1–§14.2 and the remote-execution
+    # endpoint of §14.4 against a real Buck2 over examples/buck2-tests. The
+    # tests are ignored under the ordinary `tests` unit because they need
+    # buck2 on the PATH; this unit runs them where buck2 is, and names the
+    # remedy where it is not.
     if prerequisite buck2 "the Buck2 test-executor fixture" \
         "scripts/install-buck2.sh in the GaugeWright repository, which installs the pinned release" \
         buck2-test-executor; then
         if command -v cargo-nextest >/dev/null 2>&1; then
             cargo nextest run -p whipplescript-test-executor --test buck2 --run-ignored all
+            cargo nextest run -p whipplescript-remote-execution --test buck2 --run-ignored all
             cargo nextest run -p whipplescript --run-ignored all -E 'test(/build_engine::/)'
         else
             cargo test -p whipplescript-test-executor --test buck2 -- --ignored
+            cargo test -p whipplescript-remote-execution --test buck2 -- --ignored
             cargo test -p whipplescript --bin whip -- --ignored build_engine::
         fi
     fi ;;

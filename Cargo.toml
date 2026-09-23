@@ -9,6 +9,7 @@ members = [
     "crates/whipplescript-parser",
     "crates/whipplescript-provider-claude",
     "crates/whipplescript-provider-codex",
+    "crates/whipplescript-remote-execution",
     "crates/whipplescript-store",
     "crates/whipplescript-test-executor",
 ]

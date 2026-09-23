@@ -9,3 +9,9 @@ whip_test(name = "swallowed", script = "tests/swallowed.sh")
 
 # Runs, exits 0, reports nothing: no report is a named harness failure.
 whip_test(name = "silent", script = "tests/silent.sh")
+
+load("//:platforms.bzl", "remote_platform")
+
+# The remote-only execution platform of the endpoint's fixture; unregistered
+# unless a build selects it (platforms.bzl).
+remote_platform(name = "remote", properties = {"whipplescript.labels": "fixture"})

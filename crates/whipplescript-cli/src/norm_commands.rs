@@ -313,6 +313,11 @@ impl<'a> NormTrust<'a> {
             .ok_or_else(|| format!("no trusted norm binding named {name}"))
     }
 
+    /// Every binding's principal, for an endpoint that admits them all.
+    pub(crate) fn principals(&self) -> impl Iterator<Item = &super::build_scope::Principal> {
+        self.principals.values()
+    }
+
     /// The principal a binding acts as, with the labels the document grants it.
     pub(crate) fn principal(&self, name: &str) -> Result<&super::build_scope::Principal, String> {
         self.principals

@@ -9,3 +9,9 @@ whip_file(
     name = "gate",
     content = "with the protected observation" if len(glob(["protected/*"])) > 0 else "without the protected observation",
 )
+
+load("//:rules.bzl", "whip_shout")
+
+# A real action over this package's build file, for the endpoint's fixture:
+# under `//:remote` it runs at the wrapper's endpoint and nowhere else.
+whip_shout(name = "shout", src = "FIXTURE")

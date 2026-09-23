@@ -13,6 +13,13 @@ The executor crate's integration test runs
 `buck2 test //... -- --report <path>` here with
 `-c test.v2_test_executor=<the built executor>` and reads the report.
 
+`//:remote` (`platforms.bzl`) is a remote-only execution platform, registered
+only when a build selects it with `-c build.execution_platforms=root//:remote`
+or a `.buckconfig.local` says so, and `//secret-gate:shout` is a real
+`actions.run` over this package's build file: under that platform every
+action goes to the wrapper's remote-execution endpoint (DR-0124 §14.4), which
+the endpoint crate's `buck2` test drives with a real daemon (BE-05).
+
 `secret-gate/` is a second package, the qualification experiment of DR-0124
 §14.2 (BE-03, BE-04): its build file globs `protected/` and generates
 `//secret-gate:gate` with `whip_file`, an action with no file input whose

@@ -138,6 +138,7 @@ impl Fixture {
             ".buck2-version",
             "FIXTURE",
             "rules.bzl",
+            "platforms.bzl",
             "tests/passing.sh",
             "tests/swallowed.sh",
             "tests/silent.sh",

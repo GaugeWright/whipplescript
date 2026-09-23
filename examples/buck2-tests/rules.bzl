@@ -40,3 +40,22 @@ whip_file = rule(
         "content": attrs.string(),
     },
 )
+
+# A real action: a shell command over one source, run wherever the execution
+# platform says — locally with none registered, at the wrapper's endpoint
+# under `//:remote` (DR-0124 §14.4).
+
+def _whip_shout_impl(ctx):
+    out = ctx.actions.declare_output(ctx.attrs.name + ".txt")
+    ctx.actions.run(
+        cmd_args(["sh", "-c", 'tr a-z A-Z < "$1" > "$2"', "--", ctx.attrs.src, out.as_output()]),
+        category = "whip_shout",
+    )
+    return [DefaultInfo(default_output = out)]
+
+whip_shout = rule(
+    impl = _whip_shout_impl,
+    attrs = {
+        "src": attrs.source(),
+    },
+)

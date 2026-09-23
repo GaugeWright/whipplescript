@@ -58,11 +58,13 @@ pub(crate) const USAGE: &str = "usage: whip [--json] build <command> --as <bindi
   result <label> --cut <cut>        read the cut's results for a label under the binding's view\n\
   test <target>... --cut <cut> [--report <file>] [--timeout <seconds>]\n\
   daemon status|stop --cut <cut>\n\
+  endpoint --cut <cut>              serve the remote-execution endpoint to the cut's daemon until stdin closes\n\
   The cut is materialized under .whipplescript/build/cuts/<cut> and evaluated there by the\n\
   Home's Buck2 daemon (isolation dir whip-home), which reaches whip-test-executor over the TCP launch.\n\
   Host configuration: WHIPPLESCRIPT_NORM_TRUST (bindings with labels, and labeled regions);\n\
   WHIPPLESCRIPT_BUCK2 (the pinned buck2, default: buck2 on the PATH); WHIPPLESCRIPT_TEST_EXECUTOR\n\
-  (default: whip-test-executor beside whip).";
+  (default: whip-test-executor beside whip); WHIPPLESCRIPT_REMOTE_EXECUTION (default:\n\
+  whip-remote-execution beside whip).";
 
 /// The Home daemon's isolation directory: one daemon per materialized cut,
 /// never the developer's own.
@@ -115,18 +117,78 @@ pub(crate) fn executor_binary() -> Result<PathBuf, String> {
 }
 
 fn executor_binary_from(named: Option<PathBuf>, whip: &Path) -> Result<PathBuf, String> {
+    beside_whip(
+        named,
+        whip,
+        "whip-test-executor",
+        "WHIPPLESCRIPT_TEST_EXECUTOR",
+    )
+}
+
+/// The remote-execution endpoint the wrapper serves to a daemon (§14.4):
+/// named by the host, or the binary installed beside `whip`.
+pub(crate) fn endpoint_binary() -> Result<PathBuf, String> {
+    let whip =
+        std::env::current_exe().map_err(|error| format!("cannot locate whip itself: {error}"))?;
+    beside_whip(
+        std::env::var_os("WHIPPLESCRIPT_REMOTE_EXECUTION").map(PathBuf::from),
+        &whip,
+        "whip-remote-execution",
+        "WHIPPLESCRIPT_REMOTE_EXECUTION",
+    )
+}
+
+fn beside_whip(
+    named: Option<PathBuf>,
+    whip: &Path,
+    binary: &str,
+    variable: &str,
+) -> Result<PathBuf, String> {
     if let Some(path) = named {
         return Ok(path);
     }
-    let beside = whip.with_file_name("whip-test-executor");
+    let beside = whip.with_file_name(binary);
     if beside.is_file() {
         Ok(beside)
     } else {
         Err(format!(
-            "no whip-test-executor beside whip at {}; set WHIPPLESCRIPT_TEST_EXECUTOR",
+            "no {binary} beside whip at {}; set {variable}",
             beside.display()
         ))
     }
+}
+
+/// The Buck2 client configuration that points a daemon at the endpoint:
+/// written beside the tree's `.buckconfig`, never into it, as the cut's own
+/// content stays exactly the cut.
+pub(crate) fn endpoint_client_config(address: &str) -> String {
+    format!(
+        "# Written by `whip build endpoint` (DR-0124 §14.4): the wrapper's remote-execution\n\
+# endpoint for this tree's daemon. Every action, cache lookup and blob goes through it.\n\
+[buck2_re_client]\n\
+engine_address = grpc://{address}\n\
+action_cache_address = grpc://{address}\n\
+cas_address = grpc://{address}\n\
+tls = false\n\
+instance_name = main\n\
+\n\
+[buck2]\n\
+digest_algorithms = SHA256\n"
+    )
+}
+
+/// What the endpoint process announced on its first line.
+#[derive(Debug, serde::Deserialize)]
+pub(crate) struct EndpointAnnouncement {
+    pub address: String,
+    pub executor: String,
+    #[serde(default)]
+    pub handles: BTreeMap<String, String>,
+}
+
+pub(crate) fn parse_endpoint_announcement(line: &str) -> Result<EndpointAnnouncement, String> {
+    serde_json::from_str(line.trim())
+        .map_err(|error| format!("the endpoint announced nothing readable: {error}"))
 }
 
 fn now_unix_nanos() -> i128 {
@@ -880,6 +942,7 @@ enum Verb {
     Result,
     Test,
     Daemon,
+    Endpoint,
 }
 
 #[derive(Debug)]
@@ -909,6 +972,7 @@ impl<'a> Arguments<'a> {
             "result" => (Verb::Result, &["--cut", "--as"]),
             "test" => (Verb::Test, &["--cut", "--as", "--report", "--timeout"]),
             "daemon" => (Verb::Daemon, &["--cut", "--as"]),
+            "endpoint" => (Verb::Endpoint, &["--cut", "--as"]),
             _ => return Err(format!("unknown build command {name:?}\n{USAGE}")),
         };
         let mut parsed = Self {
@@ -1012,6 +1076,70 @@ fn execute(options: &super::CliOptions) -> Result<Value, String> {
                 "pin": tree.pin,
                 "output": String::from_utf8_lossy(&output.stdout).trim(),
             }))
+        }
+        Verb::Endpoint => {
+            // The endpoint the Home's daemon reaches is the operator's to
+            // serve; it admits every binding, and the daemon acts as this one.
+            operator_only(principal, policy)?;
+            let tree = materialize_cut(&vcs, cut, &build_root, &buck2_binary)?;
+            let binary = endpoint_binary()?;
+            let mut command = Command::new(&binary);
+            command
+                .arg("--listen")
+                .arg("127.0.0.1:0")
+                .arg("--scratch")
+                .arg(build_root.join("actions"))
+                .arg("--daemon")
+                .arg(binding)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped());
+            for admitted in trust.principals() {
+                let mut spec = admitted.name.clone();
+                if !admitted.labels.is_empty() {
+                    spec.push('=');
+                    spec.push_str(
+                        &admitted
+                            .labels
+                            .iter()
+                            .cloned()
+                            .collect::<Vec<_>>()
+                            .join(","),
+                    );
+                }
+                command.arg("--principal").arg(spec);
+            }
+            let mut child = command
+                .spawn()
+                .map_err(|error| format!("cannot start {}: {error}", binary.display()))?;
+            let mut first = String::new();
+            {
+                use std::io::BufRead;
+                let stdout = child.stdout.take().ok_or("the endpoint has no stdout")?;
+                std::io::BufReader::new(stdout)
+                    .read_line(&mut first)
+                    .map_err(|error| format!("cannot read the endpoint's announcement: {error}"))?;
+            }
+            let announced = parse_endpoint_announcement(&first)?;
+            let config = tree.root.join(".buckconfig.local");
+            std::fs::write(&config, endpoint_client_config(&announced.address))
+                .map_err(|error| format!("cannot write {}: {error}", config.display()))?;
+            println!(
+                "{}",
+                json!({
+                    "cut": tree.cut,
+                    "root": tree.root,
+                    "address": announced.address,
+                    "executor": announced.executor,
+                    "daemon": binding,
+                    "handles": announced.handles,
+                    "config": config,
+                })
+            );
+            // The endpoint lives as long as this command: its stdin is ours.
+            let status = child
+                .wait()
+                .map_err(|error| format!("the endpoint did not finish: {error}"))?;
+            Ok(json!({"endpoint_exit": status.code()}))
         }
         Verb::Artifact | Verb::Iterate => {
             let label = args.label()?;
@@ -1339,6 +1467,39 @@ mod tests {
         assert_eq!(
             materialize_projection(&vcs, "nope", &build_root, &buck2, &policy(), &dev).unwrap_err(),
             "no recorded cut nope"
+        );
+    }
+
+    #[test]
+    fn the_endpoint_is_found_beside_whip_and_its_announcement_configures_the_daemon() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let whip = dir.path().join("whip");
+        assert_eq!(
+            beside_whip(
+                None,
+                &whip,
+                "whip-remote-execution",
+                "WHIPPLESCRIPT_REMOTE_EXECUTION"
+            )
+            .unwrap_err(),
+            format!(
+                "no whip-remote-execution beside whip at {}; set WHIPPLESCRIPT_REMOTE_EXECUTION",
+                dir.path().join("whip-remote-execution").display()
+            )
+        );
+        let config = endpoint_client_config("127.0.0.1:4321");
+        assert!(config.contains("engine_address = grpc://127.0.0.1:4321\n"));
+        assert!(config.contains("cas_address = grpc://127.0.0.1:4321\n"));
+        assert!(config.contains("digest_algorithms = SHA256\n"));
+        let announced = parse_endpoint_announcement(
+            "{\"address\":\"127.0.0.1:4321\",\"executor\":\"whip-remote-execution/local\",\"handles\":{\"owner\":\"ab\"}}\n",
+        )
+        .unwrap();
+        assert_eq!(announced.address, "127.0.0.1:4321");
+        assert_eq!(announced.handles["owner"], "ab");
+        assert_eq!(
+            parse_endpoint_announcement("not json").unwrap_err(),
+            "the endpoint announced nothing readable: expected ident at line 1 column 2"
         );
     }
 
