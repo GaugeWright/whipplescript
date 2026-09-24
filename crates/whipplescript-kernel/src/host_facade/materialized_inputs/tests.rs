@@ -537,10 +537,7 @@ rule begin
         facade
             .kernel()
             .store()
-            .register_package_manifest(include_str!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../std/manifests/tracker.json"
-            )))
+            .register_package_manifest(include_str!("../../../../../std/manifests/tracker.json"))
             .unwrap();
         let custody = Custody::new(&original);
         let admission = admit(&mut facade, &action, &original, &custody).unwrap();

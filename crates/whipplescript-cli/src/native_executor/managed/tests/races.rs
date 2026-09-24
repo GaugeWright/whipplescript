@@ -276,10 +276,7 @@ fn managed_failed_removal_never_finishes_the_barrier_and_retry_recovers() {
 }
 
 mod workflow {
-    include!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/tests/support/native_executor.rs"
-    ));
+    include!("../../../../tests/support/native_executor.rs");
 }
 fn workflow_identity(store: &SqliteStore, instance: &str, run: &str) -> Identity {
     let tracked = whipplescript_kernel::exec_lifetime::tracked(store, instance).unwrap();

@@ -176,10 +176,7 @@ fn prepare_source_with_custody<
     facade
         .kernel()
         .store()
-        .register_package_manifest(include_str!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../std/manifests/tracker.json"
-        )))
+        .register_package_manifest(include_str!("../../../../std/manifests/tracker.json"))
         .expect("register ordinary tracker package");
     let binding = TrackerBinding {
         scope: "workspace:1".into(),
