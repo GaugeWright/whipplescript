@@ -893,6 +893,84 @@ impl WorkItemStore {
         Ok(FinishOutcome::Finished)
     }
 
+    /// Withdraws an open issue (`issue.canceled`) with an optional reason, and
+    /// releases any active lease. The same guards as `finish_item`: cancelable
+    /// only from durable `open`, and holder-scoped when `expect_holder` is
+    /// `Some`. Cancellation is not closure — `closings` deliberately does not
+    /// see it — so this is the door for work nobody will do, not work done.
+    ///
+    /// `set_field(id, "status", "canceled")` reaches the same status but
+    /// strands the lease: the issue stops being `open`, so the overlay stops
+    /// showing its holder, and the lease row outlives the work. This does not.
+    pub fn cancel_item(
+        &mut self,
+        item_id: &str,
+        reason: Option<&str>,
+        expect_holder: Option<&str>,
+    ) -> StoreResult<FinishOutcome> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let now = tx_now(&tx)?;
+        if let Some(holder) = tx_holder_conflict(&tx, item_id, &now, expect_holder)? {
+            tx.commit()?;
+            return Ok(FinishOutcome::HeldByOther { holder });
+        }
+        if tx_status(&tx, item_id)?.as_deref() != Some("open") {
+            tx.commit()?;
+            return Ok(FinishOutcome::NotOpen);
+        }
+        let payload = json!({"status": "canceled", "summary": reason});
+        tx_append_event(
+            &tx,
+            Some(item_id),
+            "issue.canceled",
+            &payload,
+            None,
+            self.event_effect_id.as_deref(),
+            &now,
+        )?;
+        fold_set_status(&tx, Some(item_id), &payload, "canceled", &now)?;
+        tx_release_active_lease(&tx, item_id, self.event_effect_id.as_deref(), &now)?;
+        tx.commit()?;
+        Ok(FinishOutcome::Finished)
+    }
+
+    /// Returns a `closed` or `canceled` issue to `open` (`issue.reopened`), so
+    /// it is ready again unless something blocks it. An `archived` issue stays
+    /// archived: archiving is the statement that nobody will look again.
+    pub fn reopen_item(&mut self, item_id: &str, note: Option<&str>) -> StoreResult<ReopenOutcome> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let now = tx_now(&tx)?;
+        match tx_status(&tx, item_id)?.as_deref() {
+            None => {
+                tx.commit()?;
+                return Ok(ReopenOutcome::NotFound);
+            }
+            Some("closed" | "canceled") => {}
+            Some(status) => {
+                let status = status.to_owned();
+                tx.commit()?;
+                return Ok(ReopenOutcome::NotReopenable { status });
+            }
+        }
+        let payload = json!({"status": "open", "summary": note});
+        tx_append_event(
+            &tx,
+            Some(item_id),
+            "issue.reopened",
+            &payload,
+            None,
+            self.event_effect_id.as_deref(),
+            &now,
+        )?;
+        fold_set_status(&tx, Some(item_id), &payload, "open", &now)?;
+        tx.commit()?;
+        Ok(ReopenOutcome::Reopened)
+    }
+
     /// Direct an open issue at `assignee`, or clear it with `None` (0.2.2).
     ///
     /// Assignment is advisory by design: it records who *should* act, and does
@@ -2668,6 +2746,18 @@ fn tx_active_lease_holder(
         .optional()?)
 }
 
+/// The issue's durable status (no lease overlay), or `None` if it is absent.
+#[cfg(feature = "native")]
+fn tx_status(tx: &Transaction<'_>, item_id: &str) -> StoreResult<Option<String>> {
+    Ok(tx
+        .query_row(
+            "SELECT status FROM tracker_issues WHERE issue_id = ?1",
+            [item_id],
+            |row| row.get(0),
+        )
+        .optional()?)
+}
+
 /// Holder precondition, evaluated INSIDE the caller's transaction.
 ///
 /// `expect_holder` is `None` for the operator and in-program paths, which may
@@ -3951,6 +4041,14 @@ pub enum FinishOutcome {
     Finished,
     NotOpen,
     HeldByOther { holder: String },
+}
+
+/// Outcome of `reopen_item`. `NotReopenable` carries the status that refused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReopenOutcome {
+    Reopened,
+    NotFound,
+    NotReopenable { status: String },
 }
 
 #[cfg(feature = "native")]
@@ -6270,6 +6368,86 @@ mod tests {
                 .release_item(&item.id, Some("agent:a"))
                 .expect("holder releases"),
             ReleaseOutcome::Released
+        );
+    }
+
+    /// `cancel_item` withdraws held work without stranding its lease, is not a
+    /// closure, and survives a rebuild; `reopen_item` makes it ready again.
+    #[test]
+    fn cancel_releases_the_claim_and_reopen_restores_readiness() {
+        let mut store = open_memory();
+        let item = store
+            .file_item("backlog", "a", "", &[], &json!({}), None, None)
+            .expect("files");
+        store.claim_item(&item.id, "agent:a", None).expect("claims");
+
+        assert_eq!(
+            store
+                .cancel_item(&item.id, Some("nobody needs it"), Some("agent:b"))
+                .expect("cancel refused"),
+            FinishOutcome::HeldByOther {
+                holder: "agent:a".to_string()
+            }
+        );
+        assert_eq!(
+            store
+                .cancel_item(&item.id, Some("nobody needs it"), Some("agent:a"))
+                .expect("holder cancels"),
+            FinishOutcome::Finished
+        );
+        let canceled = store.get_item(&item.id).expect("gets").expect("exists");
+        assert_eq!(canceled.status, "canceled");
+        assert_eq!(canceled.claimed_by, None, "the lease went with the work");
+        assert!(store.ready_items("backlog").expect("ready").is_empty());
+        assert!(
+            store.closings("backlog").expect("closings").is_empty(),
+            "cancellation is not closure"
+        );
+        assert_eq!(
+            store
+                .cancel_item(&item.id, None, None)
+                .expect("second cancel"),
+            FinishOutcome::NotOpen
+        );
+
+        store.rebuild_projection().expect("rebuild");
+        let rebuilt = store.get_item(&item.id).expect("gets").expect("exists");
+        assert_eq!(rebuilt.status, "canceled");
+        assert_eq!(rebuilt.claimed_by, None);
+
+        assert_eq!(
+            store.reopen_item(&item.id, None).expect("reopens"),
+            ReopenOutcome::Reopened
+        );
+        let ready = store.ready_items("backlog").expect("ready");
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].id, item.id);
+        assert_eq!(
+            store.reopen_item(&item.id, None).expect("open refuses"),
+            ReopenOutcome::NotReopenable {
+                status: "open".to_string()
+            }
+        );
+        assert_eq!(
+            store.reopen_item("WS-404", None).expect("absent"),
+            ReopenOutcome::NotFound
+        );
+
+        store.finish_item(&item.id, None, None).expect("finishes");
+        assert_eq!(
+            store
+                .reopen_item(&item.id, Some("regressed"))
+                .expect("reopens closed"),
+            ReopenOutcome::Reopened
+        );
+        store.rebuild_projection().expect("rebuild");
+        assert_eq!(
+            store
+                .get_item(&item.id)
+                .expect("gets")
+                .expect("exists")
+                .status,
+            "open"
         );
     }
 

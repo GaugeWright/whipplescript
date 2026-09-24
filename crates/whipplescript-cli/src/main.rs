@@ -33696,6 +33696,7 @@ renew <id> [--actor A] [--ttl D]|\
 release <id>|\
 assign <id> [--to A|--clear]|\
 finish <id> [--summary S]|complete <id> [--summary S]|\
+cancel <id> [--reason R]|reopen <id> [--note N]|\
 fail <id> [--actor A]|\
 set <id> <field> <value> [--expect-state-token T]|\
 conflicts <id>|conflicts --tracker TR|\
@@ -34409,7 +34410,8 @@ fn assert_command(options: &CliOptions) -> ExitCode {
 
 fn issue(options: &CliOptions) -> ExitCode {
     use whipplescript_store::items::{
-        ClaimOutcome, FinishOutcome, ReleaseOutcome, RenewOutcome, SetFieldOutcome, WorkItemStore,
+        ClaimOutcome, FinishOutcome, ReleaseOutcome, RenewOutcome, ReopenOutcome, SetFieldOutcome,
+        WorkItemStore,
     };
     let usage = ISSUE_USAGE;
     let args = &options.args;
@@ -34776,6 +34778,48 @@ fn issue(options: &CliOptions) -> ExitCode {
                 Err(error) => report_store_error("failed to finish issue", error),
             }
         }
+        "cancel" => {
+            // `cancel <id> [--reason R]`: withdraw an open issue nobody will do,
+            // releasing any claim on it. Not a closure — nothing waiting on the
+            // issue closing is woken by it.
+            let Some(id) = args.get(1) else {
+                eprintln!("{usage}");
+                return ExitCode::from(2);
+            };
+            let reason = flag_value(args, "--reason");
+            match store.cancel_item(id, reason.as_deref(), None) {
+                Ok(FinishOutcome::Finished) => emit_issue_row(&store, id, "canceled", options.json),
+                Ok(FinishOutcome::NotOpen) => {
+                    eprintln!("issue `{id}` is not open (cannot cancel)");
+                    ExitCode::FAILURE
+                }
+                Ok(FinishOutcome::HeldByOther { holder }) => {
+                    eprintln!("issue `{id}` is held by {holder}");
+                    ExitCode::FAILURE
+                }
+                Err(error) => report_store_error("failed to cancel issue", error),
+            }
+        }
+        "reopen" => {
+            // `reopen <id> [--note N]`: return a closed or canceled issue to open.
+            let Some(id) = args.get(1) else {
+                eprintln!("{usage}");
+                return ExitCode::from(2);
+            };
+            let note = flag_value(args, "--note");
+            match store.reopen_item(id, note.as_deref()) {
+                Ok(ReopenOutcome::Reopened) => emit_issue_row(&store, id, "reopened", options.json),
+                Ok(ReopenOutcome::NotFound) => {
+                    eprintln!("issue `{id}` was not found");
+                    ExitCode::FAILURE
+                }
+                Ok(ReopenOutcome::NotReopenable { status }) => {
+                    eprintln!("issue `{id}` is {status} (only closed or canceled issues reopen)");
+                    ExitCode::FAILURE
+                }
+                Err(error) => report_store_error("failed to reopen issue", error),
+            }
+        }
         "fail" => {
             // v1 `fail` releases the actor's lease so the issue re-projects as
             // ready (the ADR `fail --release` behavior). A durable failure
@@ -34875,6 +34919,18 @@ fn issue(options: &CliOptions) -> ExitCode {
                 eprintln!("{usage}");
                 return ExitCode::from(2);
             };
+            // The status domain is finite (DR-0093): a workflow that writes
+            // `"cancelled"` is a compile error, so the CLI refuses it too rather
+            // than storing a status no reader recognises.
+            if field.as_str() == "status"
+                && !matches!(value.as_str(), "open" | "closed" | "canceled" | "archived")
+            {
+                eprintln!(
+                    "`{value}` is not a status (open, closed, canceled, archived); \
+                     `cancel` and `reopen` also release or restore readiness"
+                );
+                return ExitCode::from(2);
+            }
             if let Some(expected) = flag_value(args, "--expect-state-token") {
                 match store.set_field_checked(id, field, value, &expected) {
                     Ok(SetFieldOutcome::Applied { state_token }) => {

@@ -201,8 +201,15 @@ whip issue list [--tracker backlog] [--status open]
 whip issue show WS-1
 whip issue ready backlog          # what a worker would see
 whip issue claim WS-1 / renew / release / finish [--summary "done"]
+whip issue cancel WS-1 [--reason "not needed"]   # withdraw; releases any claim
+whip issue reopen WS-1 [--note "regressed"]      # closed or canceled -> open
 whip issue dep add WS-2 depends-on WS-1
 ```
+
+A canceled issue is not a closed one: nothing waiting on the issue closing is
+woken by its cancellation. `set <id> status` refuses a value outside the four
+durable statuses, so a typo such as `cancelled` fails at the command rather
+than storing a status that no rule can match.
 
 The full set of commands is larger than this working set. The set also has
 `set` with an optimistic `--expect-state-token` flag, `conflicts`, `note`,
