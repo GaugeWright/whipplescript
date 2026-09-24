@@ -29,6 +29,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 from dataclasses import dataclass
 
@@ -1085,13 +1086,27 @@ def blamed_as_text(names: list[str]) -> str:
 
 
 def sweep(
-    target: str, filter_expr: str, sites: list[Site], backup: str
-) -> tuple[list[Site], list[Site]]:
-    """Returns (unexercised refusals, sites the sweep could not measure)."""
+    target: str, filter_expr: str, sites: list[Site], backup: str, deadline: float | None = None
+) -> tuple[list[Site], list[Site], list[Site]]:
+    """Returns (unexercised refusals, sites the sweep could not measure, sites
+    it reached the deadline before starting).
+
+    The deadline is checked before each site and never during one: a mutation
+    interrupted mid-suite would be a verdict about nothing. A site the deadline
+    reached first is UNKNOWN, like one that could not be measured, but it is not
+    a finding — it says the run ran out of time, not that the refusal is loose —
+    so the caller reports it by name and does not fail on it.
+    """
     survivors: list[Site] = []
     unmeasured: list[Site] = []
+    deferred: list[Site] = []
     source = Path(backup).read_text().split("\n")
     for number, site in enumerate(sites, 1):
+        if deadline is not None and time.time() >= deadline:
+            deferred = sites[number - 1 :]
+            for later, left in enumerate(deferred, number):
+                print(f"  {later:4d}/{len(sites)}  NOT SWEPT (time budget)  {target}:{left.line}  {left.label}", flush=True)
+            break
         mutated = apply_mutation(source, site)
         if mutated is None:
             print(f"  {number:4d}/{len(sites)}  SKIP (no mutation)  {site.label}", flush=True)
@@ -1107,7 +1122,7 @@ def sweep(
             print(f"  {number:4d}/{len(sites)}  BUILD FAILED (not measured)  {target}:{site.line}  {site.label}", flush=True)
         else:
             print(f"  {number:4d}/{len(sites)}  caught       {site.label}", flush=True)
-    return survivors, unmeasured
+    return survivors, unmeasured, deferred
 
 
 # Five plants, one per refusal SHAPE the scanner claims to see: a pushed
@@ -1539,6 +1554,19 @@ def main() -> int:
         "rather than of the file, and it costs one full rebuild per plant.",
     )
     parser.add_argument(
+        "--deadline",
+        type=float,
+        default=None,
+        help="seconds since the epoch; start no site at or after it. The sites "
+        "left are reported as not swept, and do not fail the run.",
+    )
+    parser.add_argument(
+        "--deferred-file",
+        default="",
+        help="append `<target>:<line>` for each site the deadline reached "
+        "first, so a caller spending one budget across files can report them.",
+    )
+    parser.add_argument(
         "--list-sites",
         action="store_true",
         help="print the refusal sites as `<line>\\t<label>` and exit, mutating "
@@ -1607,7 +1635,7 @@ def main() -> int:
             print(f"note: sweeping {args.limit} of {len(sites)} sites", flush=True)
             sites = sites[: args.limit]
         print(f"== sweeping {len(sites)} refusals in {target} ==", flush=True)
-        survivors, unmeasured = sweep(target, args.filter, sites, backup)
+        survivors, unmeasured, deferred = sweep(target, args.filter, sites, backup, args.deadline)
     finally:
         shutil.copy(backup, target)
         os.remove(backup)
@@ -1623,6 +1651,17 @@ def main() -> int:
         )
         for site in unmeasured:
             print(f"  {target}:{site.line}  {site.label}")
+    if deferred:
+        print(
+            f"\n{len(deferred)} of {len(sites)} refusals were NOT swept — the time "
+            f"budget ran out first. These are unknown, not covered."
+        )
+        for site in deferred:
+            print(f"  {target}:{site.line}  {site.label}")
+        if args.deferred_file:
+            with open(args.deferred_file, "a") as handle:
+                for site in deferred:
+                    handle.write(f"{target}:{site.line}\n")
     if missing:
         print(
             f"\n{len(missing)} requested line(s) held no refusal site and were "
