@@ -144,6 +144,7 @@ mod harness_tools;
 mod improve;
 mod ingress_listener;
 mod injected_secrets;
+mod issue_readiness;
 mod stats_report;
 use whipplescript::instance_view;
 mod build_commands;
@@ -13227,13 +13228,14 @@ fn execute_scenario(
     };
     let mut previous_event_count = 0usize;
     for _ in 0..max_rounds {
-        step_instance(
+        step_instance_at(
             &store_path,
             &instance_id,
             ir,
             Some(Path::new(path)),
             None,
             None,
+            worker_options.virtual_now.as_deref(),
         )
         .map_err(|error| format!("step scenario: {}", store_error(error)))?;
         run_worker_once(&store_path, &worker_options)
@@ -20255,12 +20257,37 @@ fn capability_for_output_type(output_type: &str) -> String {
 fn step_instance(
     store_path: &Path,
     instance_id: &str,
+    ir: &IrProgram,
+    source_path: Option<&Path>,
+    active_version_guard: Option<&str>,
+    side_stores: Option<&SideStorePaths>,
+) -> Result<StepReport, StoreError> {
+    step_instance_at(
+        store_path,
+        instance_id,
+        ir,
+        source_path,
+        active_version_guard,
+        side_stores,
+        None,
+    )
+}
+
+/// [`step_instance`] on a virtual clock: `pass_instant` is the instant tracker
+/// readiness is decided at (DR-0126 RV-3).
+fn step_instance_at(
+    store_path: &Path,
+    instance_id: &str,
     // Named again: the managed lowering stopped needing it here, and main's
     // media-registry defaults now do.
     ir: &IrProgram,
     source_path: Option<&Path>,
     active_version_guard: Option<&str>,
     side_stores: Option<&SideStorePaths>,
+    // The instant this step is at, when the caller runs on a virtual clock
+    // (DR-0126 RV-3): tracker readiness is decided at it. `None` is the store's
+    // own clock — a real run.
+    pass_instant: Option<&str>,
 ) -> Result<StepReport, StoreError> {
     let stores = NativeStores::open(
         store_path,
@@ -20284,7 +20311,8 @@ fn step_instance(
         // other kernels this binary builds inspect, replay or report; none of
         // them can end a run, so a reaper on those would be a door onto
         // nothing.
-        .with_credential_reaper(std::sync::Arc::new(CustodianReaper));
+        .with_credential_reaper(std::sync::Arc::new(CustodianReaper))
+        .with_pass_instant(pass_instant);
     step_active_program_generic(
         &mut kernel,
         instance_id,
@@ -27406,13 +27434,14 @@ fn run_workflow_invoke_effect(
     }
 
     for _ in 0..options.max_child_iterations {
-        let step_report = step_instance(
+        let step_report = step_instance_at(
             store_path,
             &child_instance_id,
             &child_ir,
             Some(program_path),
             None,
             options.side_stores.as_ref(),
+            options.virtual_now.as_deref(),
         )?;
         let child_worker = WorkerOptions {
             instance_id: child_instance_id.clone(),
@@ -27992,13 +28021,14 @@ fn drive_subworkflow_tool(
     let child_instance_id = started.instance_id;
     let iterations = max_child_iterations.max(1);
     for _ in 0..iterations {
-        let step_report = step_instance(
+        let step_report = step_instance_at(
             store_path,
             &child_instance_id,
             &child_ir,
             Some(program_path),
             None,
             provider_ctx.side_stores.as_ref(),
+            provider_ctx.virtual_now.as_deref(),
         )?;
         let child_worker = WorkerOptions {
             instance_id: child_instance_id.clone(),
@@ -33703,7 +33733,7 @@ new --tracker TR --title T [--body B] [--label L]... [--actor A]|\
 list [--tracker TR] [--status S]|\
 show <id>|\
 ready <tracker> [--limit N]|\
-claim <id> [--actor A] [--ttl D]|\
+claim <id> [--actor A] [--ttl D] [--override REASON]|why <id>|\
 renew <id> [--actor A] [--ttl D]|\
 release <id>|\
 assign <id> [--to A|--clear]|\
@@ -33712,7 +33742,10 @@ cancel <id> [--reason R]|reopen <id> [--note N]|\
 fail <id> [--actor A]|\
 set <id> <field> <value> [--expect-state-token T]|\
 conflicts <id>|conflicts --tracker TR|\
-dep add <blocked> [depends-on] <blocker> [--kind K]|\
+dep add <blocked> [depends-on] <blocker> [--kind K] [--actor A]|\
+defer <id> (--until WHEN|--after ISSUE|--reached RECORD:STATUS|--demand LABEL:N) [--review WHEN] [--actor A]|\
+undefer <id> <wait>|undefer <id> --all|waits <id>|review [--tracker TR] [--assignee A]|\
+order <a> before <b> [--actor A]|rank <parent> <child> <child>... [--actor A]|\
 link <from> <kind> <to>|unlink <from> <kind> <to>|\
 note <id> <text>|comments <id>|\
 evidence <id> [--kind K --ref R --note N]|\
@@ -34422,8 +34455,7 @@ fn assert_command(options: &CliOptions) -> ExitCode {
 
 fn issue(options: &CliOptions) -> ExitCode {
     use whipplescript_store::items::{
-        ClaimOutcome, FinishOutcome, ReleaseOutcome, RenewOutcome, ReopenOutcome, SetFieldOutcome,
-        WorkItemStore,
+        FinishOutcome, ReleaseOutcome, RenewOutcome, ReopenOutcome, SetFieldOutcome, WorkItemStore,
     };
     let usage = ISSUE_USAGE;
     let args = &options.args;
@@ -34432,6 +34464,9 @@ fn issue(options: &CliOptions) -> ExitCode {
         Ok(store) => store,
         Err(error) => return report_store_error("failed to open items store", error),
     };
+    if let Some(code) = issue_readiness::verbs(&mut store, options, command, usage) {
+        return code;
+    }
     match command {
         "new" | "add" => {
             let mut queue = None;
@@ -34571,6 +34606,13 @@ fn issue(options: &CliOptions) -> ExitCode {
                                 map.insert("verification".to_owned(), verification);
                             }
                         }
+                        // DR-0126: the one readiness, with its reasons and waits.
+                        if let (Some(map), Some(readiness)) = (
+                            value.as_object_mut(),
+                            issue_readiness::readiness_json(&store, id),
+                        ) {
+                            map.insert("readiness".to_owned(), readiness);
+                        }
                         emit_json(value)
                     } else {
                         println!("{} [{}] tracker={}", item.id, item.status, item.queue);
@@ -34587,6 +34629,7 @@ fn issue(options: &CliOptions) -> ExitCode {
                         if let Some(filed) = &item.filed_by {
                             println!("filed by: {filed}");
                         }
+                        issue_readiness::print_readiness(&store, id);
                         if let Some(view) = &conflicts {
                             if view.conflicted() {
                                 println!("CONFLICTED (not ready):");
@@ -34670,28 +34713,7 @@ fn issue(options: &CliOptions) -> ExitCode {
             }
             ExitCode::SUCCESS
         }
-        "claim" => {
-            let Some(id) = args.get(1) else {
-                eprintln!("{usage}");
-                return ExitCode::from(2);
-            };
-            let actor = issue_actor(flag_value(args, "--actor"));
-            // `--ttl <duration>` records a timed claim (`expires_at = now + ttl`);
-            // omitting it is the untimed backstop lease.
-            let expires = issue_ttl_expires(args);
-            match store.claim_item(id, &actor, expires.as_deref()) {
-                Ok(ClaimOutcome::Claimed) => emit_issue_row(&store, id, "claimed", options.json),
-                Ok(ClaimOutcome::AlreadyClaimed { holder }) => {
-                    eprintln!("issue `{id}` is already claimed by {holder}");
-                    ExitCode::FAILURE
-                }
-                Ok(ClaimOutcome::NotFound) => {
-                    eprintln!("issue `{id}` was not found");
-                    ExitCode::FAILURE
-                }
-                Err(error) => report_store_error("failed to claim issue", error),
-            }
-        }
+        "claim" => issue_readiness::claim(&mut store, options, usage),
         "renew" => {
             let Some(id) = args.get(1) else {
                 eprintln!("{usage}");
@@ -34863,12 +34885,13 @@ fn issue(options: &CliOptions) -> ExitCode {
                 return ExitCode::from(2);
             }
             let dep_kind = flag_value(args, "--kind");
+            let actor = issue_actor(flag_value(args, "--actor"));
             let mut positional = Vec::new();
             let mut iter = args.iter().skip(2);
             while let Some(token) = iter.next() {
                 match token.as_str() {
                     "depends-on" => {}
-                    "--kind" => {
+                    "--kind" | "--actor" => {
                         iter.next(); // its value is consumed by flag_value above
                     }
                     _ => positional.push(token),
@@ -34878,8 +34901,21 @@ fn issue(options: &CliOptions) -> ExitCode {
                 eprintln!("{usage}");
                 return ExitCode::from(2);
             };
-            match store.add_relation(blocker, blocked, "blocks", dep_kind.as_deref()) {
-                Ok(()) => emit_issue_row(&store, blocked, "gated by dependency", options.json),
+            // DR-0126: `order` and `soft` are ordering statements, not gates.
+            let note =
+                if whipplescript_store::items::readiness::dependency_gates(dep_kind.as_deref()) {
+                    "gated by dependency".to_owned()
+                } else {
+                    format!("ordered after {blocker}")
+                };
+            match store.add_relation_by(
+                blocker,
+                blocked,
+                "blocks",
+                dep_kind.as_deref(),
+                Some(&actor),
+            ) {
+                Ok(()) => emit_issue_row(&store, blocked, &note, options.json),
                 Err(error) => report_store_error("failed to add dependency", error),
             }
         }
@@ -34889,7 +34925,8 @@ fn issue(options: &CliOptions) -> ExitCode {
                 eprintln!("{usage}");
                 return ExitCode::from(2);
             };
-            match store.add_relation(from, to, kind, None) {
+            let actor = issue_actor(flag_value(args, "--actor"));
+            match store.add_relation_by(from, to, kind, None, Some(&actor)) {
                 Ok(()) => emit_issue_row(&store, from, &format!("{kind} -> {to}"), options.json),
                 Err(error) => report_store_error("failed to link relation", error),
             }
@@ -34992,10 +35029,21 @@ fn issue(options: &CliOptions) -> ExitCode {
                     Ok(items) => items,
                     Err(error) => return report_store_error("failed to list issues", error),
                 };
+                // DR-0126: contradictory ordering statements are a conflict too,
+                // surfaced here though they gate nothing.
+                let ordering = match store.ordering_conflicts() {
+                    Ok(conflicted) => conflicted,
+                    Err(error) => return report_store_error("failed to read ordering", error),
+                };
                 let mut rows = Vec::new();
                 for item in listed {
                     match store.issue_conflicts(&item.id) {
-                        Ok(Some(view)) if view.conflicted() => rows.push((item, view)),
+                        Ok(Some(view))
+                            if view.conflicted() || ordering.contains(item.id.as_str()) =>
+                        {
+                            let ordered = ordering.contains(item.id.as_str());
+                            rows.push((item, view, ordered));
+                        }
                         Ok(_) => {}
                         Err(error) => return report_store_error("failed to read conflicts", error),
                     }
@@ -35003,17 +35051,26 @@ fn issue(options: &CliOptions) -> ExitCode {
                 if options.json {
                     return emit_json(Value::Array(
                         rows.iter()
-                            .map(|(item, view)| issue_conflicts_to_json(&item.id, view))
+                            .map(|(item, view, ordered)| {
+                                let mut row = issue_conflicts_to_json(&item.id, view);
+                                if let Some(map) = row.as_object_mut() {
+                                    map.insert("ordering_conflict".to_owned(), json!(ordered));
+                                }
+                                row
+                            })
                             .collect(),
                     ));
                 }
                 if rows.is_empty() {
                     println!("no conflicted issues in {queue}");
                 }
-                for (item, view) in rows {
+                for (item, view, ordered) in rows {
                     println!("{} {}", item.id, item.title);
                     for fc in &view.field_conflicts {
                         println!("  {} in dispute: {}", fc.field, fc.values.join(" | "));
+                    }
+                    if ordered {
+                        println!("  ordering statements contradict each other");
                     }
                 }
                 ExitCode::SUCCESS

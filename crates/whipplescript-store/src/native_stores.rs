@@ -1068,6 +1068,28 @@ impl WorkItems for NativeStores {
         self.items.ready_items(queue)
     }
 
+    fn ready_items_at(&self, queue: &str, at: &str) -> StoreResult<Vec<WorkItem>> {
+        WorkItems::ready_items_at(&self.items, queue, at)
+    }
+
+    fn claim_item_at(
+        &mut self,
+        item_id: &str,
+        claimed_by: &str,
+        expires: Option<&str>,
+        at: &str,
+    ) -> StoreResult<ClaimOutcome> {
+        WorkItems::claim_item_at(&mut self.items, item_id, claimed_by, expires, at)
+    }
+
+    fn next_readiness_change_after(
+        &self,
+        queues: &[String],
+        at: &str,
+    ) -> StoreResult<Option<String>> {
+        WorkItems::next_readiness_change_after(&self.items, queues, at)
+    }
+
     fn closings(&self, queue: &str) -> StoreResult<Vec<crate::items::IssueClosing>> {
         self.items.closings(queue)
     }

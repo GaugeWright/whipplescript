@@ -2222,6 +2222,15 @@ fn tracker_claim_result(
             Err(format!("already claimed by `{holder}`"))
         }
         Ok(ClaimOutcome::NotFound) => Err(format!("item `{id}` not found")),
+        Ok(ClaimOutcome::NotOpen { status }) => Err(format!("item `{id}` is {status}, not open")),
+        Ok(ClaimOutcome::NotReady { reasons }) => Err(format!(
+            "item `{id}` is not ready: {}",
+            reasons
+                .iter()
+                .map(whipplescript_store::items::readiness::Unready::describe)
+                .collect::<Vec<_>>()
+                .join("; ")
+        )),
         Err(error) => Err(format!("claim failed: {error}")),
     }
 }
@@ -2388,11 +2397,20 @@ pub fn run_queue_effect_generic<S: RuntimeStore + WorkItems + FrontierRead>(
             // or `None` (untimed backstop lease) when no `ttl` clause was given.
             let expires =
                 tracker_expires_from_now(now, input.get("ttl_seconds").and_then(Value::as_i64));
-            tracker_claim_result(
-                kernel
+            // Decided at the effect's instant when it is one (DR-0126 RV-3); a
+            // host still passing a clock stub gets the store's clock.
+            let claimed = match whipplescript_store::items::readiness::canonical_instant(now) {
+                Some(at) => {
+                    kernel
+                        .store_mut()
+                        .claim_item_at(id, instance_id, expires.as_deref(), &at)
+                }
+                None => kernel
                     .store_mut()
-                    .claim_item(id, instance_id, expires.as_deref())
-                    .map_err(|error| format!("{error:?}")),
+                    .claim_item(id, instance_id, expires.as_deref()),
+            };
+            tracker_claim_result(
+                claimed.map_err(|error| format!("{error:?}")),
                 queue,
                 id,
                 title,
@@ -5004,6 +5022,45 @@ mod queue_effect_refusal_tests {
                 None,
             ),
             Err("item `WS-1` not found".into())
+        );
+        // DR-0126: the claim guard's two refusals stay distinct from each other
+        // and name what refused them.
+        assert_eq!(
+            tracker_claim_result(
+                Ok(ClaimOutcome::NotOpen {
+                    status: "closed".into(),
+                }),
+                "backlog",
+                "WS-1",
+                "Fix login",
+                "instance",
+                None,
+            ),
+            Err("item `WS-1` is closed, not open".into())
+        );
+        assert_eq!(
+            tracker_claim_result(
+                Ok(ClaimOutcome::NotReady {
+                    reasons: vec![
+                        whipplescript_store::items::readiness::Unready::BlockedBy {
+                            issue: "WS-2".into(),
+                            dep_kind: None,
+                        },
+                        whipplescript_store::items::readiness::Unready::Conflicted {
+                            fields: vec!["title".into()],
+                        },
+                    ],
+                }),
+                "backlog",
+                "WS-1",
+                "Fix login",
+                "instance",
+                None,
+            ),
+            Err(
+                "item `WS-1` is not ready: waits on WS-2, still open; fields in conflict: title"
+                    .into()
+            )
         );
         assert_eq!(
             tracker_claim_result(

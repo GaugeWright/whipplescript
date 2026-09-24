@@ -27,6 +27,9 @@ pub fn resolve_due_time_effects<S: RuntimeStore>(
     now: &str,
 ) -> StoreResult<TimePassReport> {
     let mut report = TimePassReport::default();
+    // The instant this pass is at is the instant the rule pass that follows
+    // decides tracker readiness at (DR-0126 RV-3).
+    kernel.set_pass_instant(Some(now));
     let due = kernel.store().due_time_effects(instance_id, now)?;
     for effect in due {
         // A `lease.acquire … wait <duration>` carries a creation-anchored
@@ -477,6 +480,35 @@ pub fn resolve_due_clock_sources<S: RuntimeStore>(
 /// after `now`, across the program's clock sources — the clock half of the
 /// DO's single wake-up alarm (DR-0033 Phase 6). Runs after the due pass, so
 /// anything at or before `now` has already fired; this looks forward only.
+/// The earliest instant after `now` at which readiness of an issue in one of
+/// the program's builtin trackers can change by time alone — a claim expiring,
+/// a deferral's instant, a review date (DR-0126 RV-3). A parked instance must
+/// wake for it, or an issue that becomes ready only because time passed waits
+/// for some unrelated wake-up. `None` when nothing is time-bound.
+pub fn next_tracker_readiness_due_unix_ms<
+    S: RuntimeStore + whipplescript_store::items::WorkItems,
+>(
+    kernel: &RuntimeKernel<S>,
+    now: &str,
+    ir: &IrProgram,
+) -> StoreResult<Option<i64>> {
+    let queues: Vec<String> = ir
+        .trackers
+        .iter()
+        .filter(|tracker| tracker.provider == "builtin")
+        .map(|tracker| tracker.name.clone())
+        .collect();
+    if queues.is_empty() || parse_clock_instant(now).is_none() {
+        return Ok(None);
+    }
+    Ok(kernel
+        .store()
+        .next_readiness_change_after(&queues, now)?
+        .as_deref()
+        .and_then(parse_clock_instant)
+        .map(|instant| instant.timestamp_millis()))
+}
+
 pub fn next_clock_due_unix_ms<S: RuntimeStore>(
     kernel: &mut RuntimeKernel<S>,
     instance_id: &str,

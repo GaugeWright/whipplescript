@@ -13,8 +13,10 @@
 //! "combined claim/status write" cure): a plain `claim` appends only a
 //! `claim.acquired` event and changes readiness through a lease OVERLAY, not a
 //! durable `in_progress` write. Durable issue status is only `open` / `closed`
-//! / `canceled`; `in_progress` is purely the active-lease overlay, and `ready`
-//! is a derived predicate (open, unblocked, unleased).
+//! / `canceled` / `archived`; `in_progress` is purely the active-lease overlay,
+//! and `ready` is a derived predicate with one definition (DR-0126,
+//! [`readiness`]): open, unleased, unconflicted, no open gating dependency,
+//! and every wait condition holding, at the caller's instant.
 //!
 //! The three invariant models under `models/maude/` are the spec this storage
 //! realizes: exclusivity + expiry + holder-only renew + terminal-release
@@ -44,6 +46,10 @@ mod filing;
 mod protection;
 #[cfg(feature = "native")]
 pub use protection::TrackerEventMetadata;
+
+pub mod readiness;
+#[cfg(feature = "native")]
+mod readiness_native;
 
 #[cfg(feature = "native")]
 mod closure;
@@ -119,7 +125,9 @@ const STORE_PRODUCED_STATUSES: &[&str] = &[
 ];
 
 /// The relation kinds the builtin provider supports (ADR-0002 "Relations And
-/// Dependencies"). Only `blocks` gates readiness; the rest are graph metadata.
+/// Dependencies"). Only `blocks` bears on readiness, and only when its
+/// dependency kind gates (DR-0126); `parent-of` places an issue under the
+/// parent its position is ranked within; the rest are graph metadata.
 pub const RELATION_KINDS: &[&str] = &[
     "blocks",
     "parent-of",
@@ -130,8 +138,11 @@ pub const RELATION_KINDS: &[&str] = &[
 ];
 
 /// The dependency-kind taxonomy a `blocks` relation may carry (small and
-/// operational). Recorded metadata; every `blocks` edge gates readiness
-/// regardless of `dep_kind` (providers may later refine).
+/// operational). DR-0126 splits it by meaning: `order` and `soft` are ordering
+/// statements that rank and never gate
+/// ([`readiness::ORDERING_DEPENDENCY_KINDS`]); every other kind, and an edge
+/// with none, is a dependency that gates readiness. `discovered` records how a
+/// dependency was found, not how strong it is, so it gates like `hard`.
 pub const DEPENDENCY_KINDS: &[&str] = &[
     "hard",
     "soft",
@@ -509,47 +520,11 @@ impl WorkItemStore {
         Ok(items)
     }
 
-    /// Readiness is the tracker's promise (`tracker-readiness.maude`): ready
-    /// iff durable status is `open`, no ACTIVE blocker (`blocks(B, id)` with `B`
-    /// still open), and no ACTIVE lease. Expired/released leases do not block.
+    /// The ready set of `queue` at the store's own clock — the CLI's boundary
+    /// instant. The one readiness (DR-0126) decides; see [`Self::ready_items_at`].
     pub fn ready_items(&self, queue: &str) -> StoreResult<Vec<WorkItem>> {
-        let mut statement = self.connection.prepare(&format!(
-            "SELECT {ISSUE_COLS} FROM tracker_issues i \
-             WHERE i.queue = ?1 AND i.status = 'open' \
-             AND NOT EXISTS ( \
-               SELECT 1 FROM tracker_leases l \
-               WHERE l.issue_id = i.issue_id \
-                 AND l.released_at IS NULL \
-                 AND (l.expires_at IS NULL OR l.expires_at > datetime('now'))) \
-             AND NOT EXISTS ( \
-               SELECT 1 FROM tracker_relations r JOIN tracker_issues b ON b.issue_id = r.from_issue \
-               WHERE r.to_issue = i.issue_id AND r.kind = 'blocks' AND b.status = 'open') \
-             ORDER BY i.created_at, i.issue_id"
-        ))?;
-        let rows = statement
-            .query_map([queue], row_to_item)?
-            .collect::<Result<Vec<_>, _>>()?;
-        // A conflicted issue is not ready (ADR-0002 phase B1 slice ii): its
-        // field values are in dispute, so handing it to a worker would race a
-        // resolution. The DAG conflict test is not expressible in the SQL
-        // predicate above, so filter it here (the candidate set is small).
-        let mut ready = Vec::with_capacity(rows.len());
-        for item in rows {
-            let conflicted = match content_id_of(&self.connection, &item.id)? {
-                Some(content_id) => {
-                    analyze_issue_dag(&load_issue_events(&self.connection, &content_id)?)
-                        .conflicted()
-                }
-                None => false,
-            };
-            if !conflicted {
-                ready.push(item);
-            }
-        }
-        // Ready items have no active lease by construction, so the overlay is a
-        // no-op here; return them as the projection sees them (durable `open`,
-        // unclaimed).
-        Ok(ready)
+        let at = self.store_now()?;
+        self.ready_items_at(queue, &at)
     }
 
     /// Atomic claim (`tracker-lease.maude` I1, exclusivity): grants a lease ONLY
@@ -570,6 +545,24 @@ impl WorkItemStore {
         claimed_by: &str,
         expires: Option<&str>,
     ) -> StoreResult<ClaimOutcome> {
+        let at = self.store_now()?;
+        self.claim_item_at(item_id, claimed_by, expires, &at, None)
+    }
+
+    /// Claim at the caller's instant `at` (DR-0126 RV-1/RV-3): granted only when
+    /// the one readiness calls the issue ready then. `override_reason` lets a
+    /// person claim an issue that is open but not ready, and is recorded on the
+    /// claim; a workflow never passes one.
+    pub fn claim_item_at(
+        &mut self,
+        item_id: &str,
+        claimed_by: &str,
+        expires: Option<&str>,
+        at: &str,
+        override_reason: Option<&str>,
+    ) -> StoreResult<ClaimOutcome> {
+        let at = readiness::canonical_instant(at)
+            .ok_or_else(|| StoreError::Conflict(format!("`{at}` is not an instant")))?;
         let tx = self
             .connection
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -579,6 +572,8 @@ impl WorkItemStore {
             item_id,
             claimed_by,
             expires,
+            &at,
+            override_reason,
             self.event_effect_id.as_deref(),
             &now,
         )?;
@@ -1023,6 +1018,20 @@ impl WorkItemStore {
         kind: &str,
         dep_kind: Option<&str>,
     ) -> StoreResult<()> {
+        self.add_relation_by(from, to, kind, dep_kind, None)
+    }
+
+    /// [`Self::add_relation`], recording who wrote the edge. For an ordering
+    /// statement (an `order` or `soft` dependency) the writer is what decides
+    /// whether it ranks: only the parent's owner's statements do (DR-0126).
+    pub fn add_relation_by(
+        &mut self,
+        from: &str,
+        to: &str,
+        kind: &str,
+        dep_kind: Option<&str>,
+        actor: Option<&str>,
+    ) -> StoreResult<()> {
         if !RELATION_KINDS.contains(&kind) {
             return Err(StoreError::Conflict(format!(
                 "unknown relation kind `{kind}`"
@@ -1054,7 +1063,7 @@ impl WorkItemStore {
             Some(to),
             "relation.added",
             &payload,
-            None,
+            actor,
             self.event_effect_id.as_deref(),
             &now,
         )?;
@@ -2730,15 +2739,22 @@ fn tx_active_holder(tx: &Transaction<'_>, item_id: &str, now: &str) -> StoreResu
 
 /// Lazily expire past-due, still-held leases on an issue (append `claim.expired`,
 /// mark released), so an expired lease frees the issue for a fresh claim.
+/// Decides at the caller's instant `at` which leases have lapsed, and stamps
+/// the release with the store's `now`.
 #[cfg(feature = "native")]
-fn tx_expire_stale_leases(tx: &Transaction<'_>, item_id: &str, now: &str) -> StoreResult<()> {
+fn tx_expire_stale_leases_at(
+    tx: &Transaction<'_>,
+    item_id: &str,
+    at: &str,
+    now: &str,
+) -> StoreResult<()> {
     let stale: Vec<String> = tx
         .prepare(
             "SELECT lease_id FROM tracker_leases \
              WHERE issue_id = ?1 AND released_at IS NULL AND expires_at IS NOT NULL \
                AND expires_at <= ?2",
         )?
-        .query_map(params![item_id, now], |row| row.get(0))?
+        .query_map(params![item_id, at], |row| row.get(0))?
         .collect::<Result<Vec<_>, _>>()?;
     for lease_id in &stale {
         tx_mark_lease_released(tx, lease_id, item_id, "claim.expired", "system", None, now)?;
@@ -3586,6 +3602,31 @@ pub trait WorkItems {
 
     fn ready_items(&self, queue: &str) -> StoreResult<Vec<WorkItem>>;
 
+    /// The ready set of `queue` at the caller's instant `at`, in derived order
+    /// (DR-0126): the one readiness decides, and nothing here reads a clock.
+    /// The kernel's projection asks this with its injected `now`.
+    fn ready_items_at(&self, queue: &str, at: &str) -> StoreResult<Vec<WorkItem>>;
+
+    /// A claim at the caller's instant `at` (DR-0126): granted only when the one
+    /// readiness calls the issue ready then, with no override — the door a
+    /// workflow uses.
+    fn claim_item_at(
+        &mut self,
+        item_id: &str,
+        claimed_by: &str,
+        expires: Option<&str>,
+        at: &str,
+    ) -> StoreResult<ClaimOutcome>;
+
+    /// The earliest instant after `at` at which readiness of any issue in
+    /// `queues` can change by time alone — a claim expiring, a deferral's
+    /// instant, a review date — so a parked instance wakes for it (DR-0126).
+    fn next_readiness_change_after(
+        &self,
+        queues: &[String],
+        at: &str,
+    ) -> StoreResult<Option<String>>;
+
     /// Every closing of every issue in `queue`, oldest first (DR-0110).
     ///
     /// Deliberately has NO default. A default returning an empty list would let
@@ -3767,6 +3808,32 @@ impl WorkItems for WorkItemStore {
         self.ready_items(queue)
     }
 
+    fn ready_items_at(&self, queue: &str, at: &str) -> StoreResult<Vec<WorkItem>> {
+        let at = readiness::canonical_instant(at)
+            .ok_or_else(|| StoreError::Conflict(format!("`{at}` is not an instant")))?;
+        self.ready_items_at(queue, &at)
+    }
+
+    fn claim_item_at(
+        &mut self,
+        item_id: &str,
+        claimed_by: &str,
+        expires: Option<&str>,
+        at: &str,
+    ) -> StoreResult<ClaimOutcome> {
+        self.claim_item_at(item_id, claimed_by, expires, at, None)
+    }
+
+    fn next_readiness_change_after(
+        &self,
+        queues: &[String],
+        at: &str,
+    ) -> StoreResult<Option<String>> {
+        let at = readiness::canonical_instant(at)
+            .ok_or_else(|| StoreError::Conflict(format!("`{at}` is not an instant")))?;
+        self.next_readiness_change_after(queues, &at)
+    }
+
     fn claim_item(
         &mut self,
         item_id: &str,
@@ -3843,8 +3910,20 @@ impl WorkItems for WorkItemStore {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ClaimOutcome {
     Claimed,
-    AlreadyClaimed { holder: String },
+    AlreadyClaimed {
+        holder: String,
+    },
     NotFound,
+    /// The issue is not open work — closed, canceled or archived. Never
+    /// overridable: reopen it first.
+    NotOpen {
+        status: String,
+    },
+    /// The one readiness refused it (DR-0126): every reason, so the caller can
+    /// say what the claim would have skipped.
+    NotReady {
+        reasons: Vec<readiness::Unready>,
+    },
 }
 
 /// Outcome of `renew_claim` (`tracker-lease.maude` I2). `NotHeld` = the actor
@@ -5538,7 +5617,13 @@ mod tests {
         assert_eq!(after[0].kind, "related");
 
         // Validation: unknown kinds and misplaced dep_kind are rejected.
-        assert!(store.add_relation(&a.id, &b.id, "bogus", None).is_err());
+        let refused = store
+            .add_relation(&a.id, &b.id, "bogus", None)
+            .expect_err("an unknown kind is refused");
+        assert!(
+            format!("{refused:?}").contains("unknown relation kind `bogus`"),
+            "{refused:?}"
+        );
         assert!(store
             .add_relation(&a.id, &b.id, "related", Some("hard"))
             .is_err());
@@ -6204,7 +6289,7 @@ mod tests {
                 {
                     ClaimOutcome::Claimed => claimed += 1,
                     ClaimOutcome::AlreadyClaimed { .. } => already += 1,
-                    ClaimOutcome::NotFound => panic!("item vanished"),
+                    other => panic!("unexpected claim outcome {other:?}"),
                 }
             }
             assert_eq!(claimed, 1, "exactly one worker claims {id}");

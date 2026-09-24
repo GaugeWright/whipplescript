@@ -1,28 +1,46 @@
---- Tracker readiness fold (ADR-0002 v1, A+blockers scope). Readiness is the
---- derived predicate that gates whether an issue may be worked:
+--- Tracker readiness fold (ADR-0002 v1, A+blockers scope; DR-0126). Readiness
+--- is the derived predicate that gates whether an issue may be worked:
 ---
----   ready(id) iff status(id) = open
----              AND no ACTIVE blocker -- no blocks(B, id) whose issue B is
----                  still active, such as not closed and not canceled
----              AND no ACTIVE lease on id.
+---   ready(id) at T iff status(id) = open
+---              AND no ACTIVE gating blocker -- no gating blocks(B, id, K)
+---                  whose issue B is still active (open or in-progress)
+---              AND no ACTIVE lease on id at T
+---              AND id is not in field conflict
+---              AND every wait condition on id holds at T.
 ---
---- `blocks` is the only readiness-affecting relation; conflicts, heads, and
---- state-tokens are OUT of v1. status is one of open, in-progress, closed,
---- canceled; a blocker counts only while its own issue is active (open or
---- in-progress). A lease is active iff expiresAt > now.
+--- DR-0126 split `blocks` by dependency kind: hard, resource, review,
+--- contract and discovered GATE readiness; order and soft are ordering
+--- statements (tracker-ordering.maude) and never gate. The two-argument
+--- `blocks(B, id)` is the historical spelling of a hard dependency.
 ---
---- The ready rule is a GLOBAL fold: "no active blocker anywhere" and "no
---- active lease anywhere" are whole-state predicates, so the state is WRAPPED
---- in { _ } and the rule captures the entire rest in C. The bites are
---- No-solution searches: an actively-blocked, actively-leased, or
---- closed/canceled issue is never reachable as ready.
+--- A wait condition is data on the issue, never a status, so a deferral is
+--- lifted by nothing but the facts it reads coming to hold -- no transition
+--- fires. The bundled kinds:
+---
+---   at(T0)          the evaluation instant has reached T0;
+---   settled(X)      issue X is no longer open work (closed, canceled,
+---                   archived) -- the condition a gating dependency is;
+---   reached(R, S)   an admitted event brought norm record R to status S,
+---                   monotonically: a later transition away does not unmake it;
+---   count(L, N)     at least N issues in the queue carry label L, not
+---                   counting withdrawn (canceled) ones -- "demand".
+---
+--- Every wait names a review instant. Past it, a wait whose condition still
+--- does not hold puts its issue in its owner's review view; the issue stays
+--- not ready. A condition that holds is never up for review.
+---
+--- Readiness is a GLOBAL fold: "no active blocker anywhere" and "no active
+--- lease anywhere" are whole-state predicates, so the state is WRAPPED in
+--- { _ } and each rule captures the entire rest in C.
 mod TRACKER-READINESS is
   protecting NAT .
 
-  sorts Fact Cfg State Status .
+  sorts Fact Cfg State Status DepKind Cond Label .
   subsort Fact < Cfg .
 
-  ops open inProgress closed canceled : -> Status [ctor] .
+  ops open inProgress closed canceled archived : -> Status [ctor] .
+  ops hard soft order resource review contract discovered : -> DepKind [ctor] .
+  ops lblA lblB : -> Label [ctor] .
 
   op none : -> Cfg [ctor] .
   op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
@@ -30,18 +48,42 @@ mod TRACKER-READINESS is
 
   --- issue(id, status): durable issue status.
   op issue : Nat Status -> Fact [ctor] .
-  --- blocks(from, to): `from` blocks `to`.
-  op blocks : Nat Nat -> Fact [ctor] .
+  --- blocks(from, to, kind): `from` is a dependency of `to` of this kind.
+  op blocks : Nat Nat DepKind -> Fact [ctor] .
+  --- blocks(from, to): the historical spelling, a hard dependency.
+  op blocks : Nat Nat -> Fact .
   --- lease(issue, actor, expiresAt): a held runtime lease.
   op lease : Nat Nat Nat -> Fact [ctor] .
-  --- now(T): the runtime clock.
+  --- now(T): the instant readiness is evaluated at, supplied by the caller's
+  --- boundary (the pass's injected clock, or the CLI's own); never read here.
   op now : Nat -> Fact [ctor] .
+  --- conflicted(id): the issue's field values are in dispute.
+  op conflicted : Nat -> Fact [ctor] .
+  --- wait(waitId, issue, condition, reviewAt): a deferral.
+  op wait : Nat Nat Cond Nat -> Fact [ctor] .
+  --- reachedEvent(record, status): an admitted norm event reached this status.
+  op reachedEvent : Nat Nat -> Fact [ctor] .
+  --- labeled(issue, label): the issue carries this label.
+  op labeled : Nat Label -> Fact [ctor] .
   --- ready(id): the derived readiness fact.
   op ready : Nat -> Fact [ctor] .
+  --- dueReview(id): a wait on id is past its review instant and unmet.
+  op dueReview : Nat -> Fact [ctor] .
 
-  vars Id B A E T : Nat .
-  var S : Status .
+  op at : Nat -> Cond [ctor] .
+  op settled : Nat -> Cond [ctor] .
+  op reached : Nat Nat -> Cond [ctor] .
+  op count : Label Nat -> Cond [ctor] .
+
+  vars Id B A E T T0 X R S W N : Nat .
+  var St : Status .
+  var K : DepKind .
+  var Cd : Cond .
+  var L : Label .
   vars C Full : Cfg .
+
+  --- The historical two-argument dependency is a hard one.
+  eq blocks(B, Id) = blocks(B, Id, hard) .
 
   --- An issue is active while it is open or in-progress.
   op isActive : Status -> Bool .
@@ -49,33 +91,108 @@ mod TRACKER-READINESS is
   eq isActive(inProgress) = true .
   eq isActive(closed) = false .
   eq isActive(canceled) = false .
+  eq isActive(archived) = false .
 
-  --- Look up whether issue B is active in the full config.
+  --- Which dependency kinds gate readiness (DR-0126 Decision 3).
+  op gates : DepKind -> Bool .
+  eq gates(hard) = true .
+  eq gates(resource) = true .
+  eq gates(review) = true .
+  eq gates(contract) = true .
+  eq gates(discovered) = true .
+  eq gates(order) = false .
+  eq gates(soft) = false .
+
+  --- Look up whether issue B is active in the full config. An unknown issue is
+  --- not active: a dependency on work this clone does not hold does not gate.
   op issueActive : Nat Cfg -> Bool .
-  eq issueActive(B, issue(B, S) C) = isActive(S) .
+  eq issueActive(B, issue(B, St) C) = isActive(St) .
   eq issueActive(B, C) = false [owise] .
 
-  --- Is Id blocked by an ACTIVE issue? Scan the blocks edges, consulting the
-  --- full config for each blocker's own status.
+  --- Is issue X known here at all? settled(X) on an unknown X does not hold.
+  op known : Nat Cfg -> Bool .
+  eq known(X, issue(X, St) C) = true .
+  eq known(X, C) = false [owise] .
+
+  --- Is Id blocked by an ACTIVE issue through a GATING edge?
   op blockedByActive : Nat Cfg Cfg -> Bool .
-  eq blockedByActive(Id, blocks(B, Id) C, Full) =
-    if issueActive(B, Full) then true else blockedByActive(Id, C, Full) fi .
+  eq blockedByActive(Id, blocks(B, Id, K) C, Full) =
+    if gates(K) and issueActive(B, Full) then true
+    else blockedByActive(Id, C, Full) fi .
   eq blockedByActive(Id, C, Full) = false [owise] .
 
-  --- Is there an ACTIVE lease on Id anywhere, given clock T?
+  --- Is there an ACTIVE lease on Id anywhere, given the instant T?
   op hasActiveLeaseOn : Nat Nat Cfg -> Bool .
   eq hasActiveLeaseOn(Id, T, lease(Id, A, E) C) =
     if E > T then true else hasActiveLeaseOn(Id, T, C) fi .
   eq hasActiveLeaseOn(Id, T, C) = false [owise] .
 
-  --- Has Id already been derived ready? Keeps the fold terminating.
+  op isConflicted : Nat Cfg -> Bool .
+  eq isConflicted(Id, conflicted(Id) C) = true .
+  eq isConflicted(Id, C) = false [owise] .
+
+  --- How many non-withdrawn issues carry label L.
+  op labelCount : Label Cfg Cfg -> Nat .
+  eq labelCount(L, labeled(X, L) C, Full) =
+    (if issueWithdrawn(X, Full) then 0 else 1 fi) + labelCount(L, C, Full) .
+  eq labelCount(L, C, Full) = 0 [owise] .
+
+  op issueWithdrawn : Nat Cfg -> Bool .
+  eq issueWithdrawn(X, issue(X, canceled) C) = true .
+  eq issueWithdrawn(X, C) = false [owise] .
+
+  op hasReachedEvent : Nat Nat Cfg -> Bool .
+  eq hasReachedEvent(R, S, reachedEvent(R, S) C) = true .
+  eq hasReachedEvent(R, S, C) = false [owise] .
+
+  --- Does condition Cd hold at instant T over the full config?
+  op holds : Cond Nat Cfg -> Bool .
+  eq holds(at(T0), T, Full) = T >= T0 .
+  eq holds(settled(X), T, Full) = known(X, Full) and not issueActive(X, Full) .
+  eq holds(reached(R, S), T, Full) = hasReachedEvent(R, S, Full) .
+  eq holds(count(L, N), T, Full) = labelCount(L, Full, Full) >= N .
+
+  --- Does every wait on Id hold at T?
+  op waitsHold : Nat Nat Cfg Cfg -> Bool .
+  eq waitsHold(Id, T, wait(W, Id, Cd, R) C, Full) =
+    if holds(Cd, T, Full) then waitsHold(Id, T, C, Full) else false fi .
+  eq waitsHold(Id, T, C, Full) = true [owise] .
+
+  --- Is some wait on Id past its review instant and still unmet?
+  op reviewDue : Nat Nat Cfg Cfg -> Bool .
+  eq reviewDue(Id, T, wait(W, Id, Cd, R) C, Full) =
+    if R <= T and not holds(Cd, T, Full) then true
+    else reviewDue(Id, T, C, Full) fi .
+  eq reviewDue(Id, T, C, Full) = false [owise] .
+
+  --- Has Id already been derived ready / due? Keeps the fold terminating.
   op hasReady : Nat Cfg -> Bool .
   eq hasReady(Id, ready(Id) C) = true .
   eq hasReady(Id, C) = false [owise] .
+  op hasDue : Nat Cfg -> Bool .
+  eq hasDue(Id, dueReview(Id) C) = true .
+  eq hasDue(Id, C) = false [owise] .
 
-  --- Derive ready(Id): open, no active blocker, no active lease, not yet ready.
+  --- Derive ready(Id): open, no active gating blocker, no active lease, not in
+  --- conflict, every wait holds, not yet ready.
   crl [ready] : { issue(Id, open) now(T) C } => { ready(Id) issue(Id, open) now(T) C }
     if blockedByActive(Id, C, issue(Id, open) now(T) C) = false
     /\ hasActiveLeaseOn(Id, T, C) = false
+    /\ isConflicted(Id, C) = false
+    /\ waitsHold(Id, T, C, issue(Id, open) now(T) C) = true
     /\ hasReady(Id, C) = false .
+
+  --- Derive dueReview(Id): an open issue with a wait past review and unmet.
+  crl [due] : { issue(Id, open) now(T) C } => { dueReview(Id) issue(Id, open) now(T) C }
+    if reviewDue(Id, T, C, issue(Id, open) now(T) C) = true
+    /\ hasDue(Id, C) = false .
+endm
+
+--- The clock, separately: the only rule that changes a fact. Coverage over
+--- this module shows a deferral lifting with nothing but the instant moving.
+mod TRACKER-READINESS-CLOCK is
+  including TRACKER-READINESS .
+  var T : Nat .
+  var C : Cfg .
+  crl [tick] : { now(T) C } => { now(T + 10) C } if T < 100 .
 endm

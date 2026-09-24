@@ -160,7 +160,10 @@ then finished each issue with the summary of the turn as the resolution. These
 are the parts of the rule:
 
 - **The `when backlog has ready issue as issue` clause** matches an issue that
-  a rule can *claim*. Such an issue is open, and no rule claimed it. The
+  a rule can *claim*. Such an issue is open, and nobody holds a claim on it. No
+  open dependency blocks it, no field of it is in conflict, and every deferral
+  on it has lifted. That is the tracker's one definition of ready. The
+  `whip issue ready` command and the claim use the same definition. The
   binding carries `issue.id`, `issue.title`, and `issue.body`.
 - **The `claim issue as hold` statement is an atomic take.** The statement can
   fail. When a different claimant won the race, the claim effect fails
@@ -199,12 +202,22 @@ adds inspection:
 ```sh
 whip issue list [--tracker backlog] [--status open]
 whip issue show WS-1
-whip issue ready backlog          # what a worker would see
+whip issue ready backlog          # what a worker would see, in order
+whip issue why WS-2               # every reason WS-2 is not ready
 whip issue claim WS-1 / renew / release / finish [--summary "done"]
+whip issue claim WS-2 --override "pairing with the owner"   # records why
 whip issue cancel WS-1 [--reason "not needed"]   # withdraw; releases any claim
 whip issue reopen WS-1 [--note "regressed"]      # closed or canceled -> open
 whip issue dep add WS-2 depends-on WS-1
+whip issue defer WS-3 --demand provider-request:2 --review 30d
+whip issue waits WS-3 / undefer WS-3 <wait> / review --tracker backlog
+whip issue rank WS-7 WS-4 WS-5    # order the children of WS-7
 ```
+
+A claim takes only a ready issue. A claim of a blocked or deferred issue fails,
+and the failure names each reason. A person can pass `--override` with a reason.
+The claim then records the reason and what it skipped. A workflow cannot
+override. A claim of a closed, canceled, or archived issue always fails.
 
 A canceled issue is not a closed one: nothing waiting on the issue closing is
 woken by its cancellation. `set <id> status` refuses a value outside the four
@@ -222,6 +235,51 @@ half of the design. The backlog is state of the workspace with a neutral
 surface. Thus a person at the shell and an `@service` workflow with many agents
 are peers on the same queue. This equality makes the last pattern of this
 chapter possible.
+
+## Deferring work, and the order of ready work
+
+A deferral holds an issue back until something is true. The deferral is not a
+status. The issue stays open. The tracker checks the condition each time it
+asks what is ready, and the issue becomes ready when the condition holds. No
+one has to act.
+
+```sh
+whip issue defer WS-3 --until 2026-11-01                 # a date
+whip issue defer WS-3 --after WS-2 --review 14d          # an issue settles
+whip issue defer WS-3 --reached N-4:accepted --review 30d  # a decision is accepted
+whip issue defer WS-3 --demand provider-request:2 --review 90d  # enough requests
+```
+
+The `--after` issue must be in the same tracker. A condition reads only what its
+own tracker can see. Use a dependency for work in another tracker. The
+`--demand` condition counts issues with the label, but not canceled ones.
+
+Each deferral has a review date. When the date passes and the condition still
+does not hold, the issue appears in `whip issue review`. The issue is still not
+ready. An owner looks again and decides. Without a review date, a deferral can
+wait forever, and nobody sees it. `whip issue why` names the condition and what
+the tracker saw, for example `0 of 2 matching issue(s)`.
+
+A dependency and an order are different statements. A dependency says that B
+needs A to be done. A `hard`, `resource`, `review`, `contract`, or `discovered`
+dependency keeps B out of the ready set until A settles. An `order` or `soft`
+edge says only that A comes first. It never keeps B from being ready, so a free
+worker can take B while A is claimed.
+
+The order of `whip issue ready` comes from three rules:
+
+- **Position is local to a parent.** `whip issue rank WS-7 WS-4 WS-5` puts WS-4
+  before WS-5 under WS-7. A statement ranks only siblings. A statement ranks
+  only when its author is the parent's assignee, or when the parent has none.
+  A statement from anyone else is a proposal. The tracker keeps it and ranks
+  nothing with it.
+- **Children follow their parents.** When WS-7 comes before WS-8, each child of
+  WS-7 comes before each child of WS-8.
+- **Urgency flows back to what blocks it.** When an early issue depends on a
+  late one, the late one moves up to the early one's position.
+
+Two statements that contradict each other are a conflict. Neither statement
+wins. `whip issue conflicts --tracker backlog` shows the conflict.
 
 ## A person in the loop
 

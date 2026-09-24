@@ -142,6 +142,10 @@ pub struct RuntimeKernel<S: RuntimeStore = SqliteStore> {
     /// Transient current authority; never reconstructed from runtime metadata.
     action_execution: Option<host_protocol::execution::VerifiedActionExecution>,
     file_lease_policy: file_lease::FileLeasePolicy,
+    /// The instant the host is stepping at (DR-0126 RV-3): the tracker's ready
+    /// projection is decided at it, never at a clock the store reads. `None`
+    /// is a host that has not said, which falls back to the store's clock.
+    pass_instant: Option<String>,
 }
 
 /// wasm / no-native form: no default backend (rusqlite `SqliteStore` is absent).
@@ -158,6 +162,10 @@ pub struct RuntimeKernel<S: RuntimeStore> {
     /// Transient current authority; never reconstructed from runtime metadata.
     action_execution: Option<host_protocol::execution::VerifiedActionExecution>,
     file_lease_policy: file_lease::FileLeasePolicy,
+    /// The instant the host is stepping at (DR-0126 RV-3): the tracker's ready
+    /// projection is decided at it, never at a clock the store reads. `None`
+    /// is a host that has not said, which falls back to the store's clock.
+    pass_instant: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -545,7 +553,31 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
             credential_reaper: None,
             action_execution: None,
             file_lease_policy: file_lease::FileLeasePolicy::default(),
+            pass_instant: None,
         }
+    }
+
+    /// Step at `instant` (DR-0126 RV-3): the instant the tracker's ready
+    /// projection is decided at. The time pass sets it from the instant it is
+    /// handed; a host that builds a kernel per step sets it here.
+    #[must_use]
+    pub fn with_pass_instant(mut self, instant: Option<&str>) -> Self {
+        self.set_pass_instant(instant);
+        self
+    }
+
+    /// Set the pass instant. Anything that is not an instant — the literal
+    /// `"now"` some hosts pass as a clock stub — clears it, and readiness falls
+    /// back to the store's clock rather than being decided at a guess.
+    pub fn set_pass_instant(&mut self, instant: Option<&str>) {
+        self.pass_instant =
+            instant.and_then(whipplescript_store::items::readiness::canonical_instant);
+    }
+
+    /// The instant this kernel is stepping at, if the host has said.
+    #[must_use]
+    pub fn pass_instant(&self) -> Option<&str> {
+        self.pass_instant.as_deref()
     }
 
     /// Supply the coercion-config fingerprint the rule pass folds into

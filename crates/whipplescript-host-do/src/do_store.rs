@@ -35,6 +35,7 @@
 
 mod dispatch;
 mod host_actions;
+mod readiness;
 pub(crate) mod recovery;
 mod tracker_closure;
 mod tracker_control;
@@ -8718,14 +8719,20 @@ fn do_active_holders(sql: &impl DoSql) -> StoreResult<std::collections::HashMap<
 }
 
 /// Lazily expire past-due, still-held leases on an issue, so an expired lease
-/// frees the issue for a fresh claim.
-fn do_expire_stale_leases(sql: &impl DoSql, item_id: &str, now: &str) -> StoreResult<()> {
+/// frees the issue for a fresh claim. Decides at the caller's instant `at`
+/// which leases have lapsed, and stamps each release with the store's `now`.
+fn do_expire_stale_leases_at(
+    sql: &impl DoSql,
+    item_id: &str,
+    at: &str,
+    now: &str,
+) -> StoreResult<()> {
     let stale = sql
         .query(
             "SELECT lease_id FROM tracker_leases \
              WHERE issue_id = ?1 AND released_at IS NULL AND expires_at IS NOT NULL \
                AND expires_at <= ?2",
-            &[text(item_id), text(now)],
+            &[text(item_id), text(at)],
         )
         .map_err(sql_err)?;
     for row in &stale {
@@ -9345,47 +9352,24 @@ impl<Sql: DoSql> WorkItems for DoSqliteStore<Sql> {
     }
 
     fn ready_items(&self, queue: &str) -> StoreResult<Vec<WorkItem>> {
-        // Ready iff durable `open`, no active lease, no active blocker (a
-        // `blocks(B, id)` with B still open). Expired/released leases and
-        // closed/canceled blockers do not gate.
-        let rows = self
-            .sql
-            .query(
-                &format!(
-                    "SELECT {DO_ISSUE_COLS} FROM tracker_issues i \
-                     WHERE i.queue = ?1 AND i.status = 'open' \
-                     AND NOT EXISTS ( \
-                       SELECT 1 FROM tracker_leases l \
-                       WHERE l.issue_id = i.issue_id \
-                         AND l.released_at IS NULL \
-                         AND (l.expires_at IS NULL OR l.expires_at > datetime('now'))) \
-                     AND NOT EXISTS ( \
-                       SELECT 1 FROM tracker_relations r JOIN tracker_issues b ON b.issue_id = r.from_issue \
-                       WHERE r.to_issue = i.issue_id AND r.kind = 'blocks' AND b.status = 'open') \
-                     ORDER BY i.created_at, i.issue_id"
-                ),
-                &[text(queue)],
-            )
-            .map_err(sql_err)?;
-        // A conflicted issue is not ready (ADR-0002 phase B1 slice ii): its
-        // field values are in dispute. Not expressible in the SQL predicate, so
-        // filter here via the shared DAG conflict analysis.
-        let mut ready = Vec::with_capacity(rows.len());
-        for row in &rows {
-            let item = do_issue_row(row);
-            let conflicted = match do_content_id(&self.sql, &item.id)? {
-                Some(content_id) => whipplescript_store::items::analyze_issue_dag(
-                    &do_load_issue_events(&self.sql, &content_id)?,
-                )
-                .conflicted(),
-                None => false,
-            };
-            if !conflicted {
-                ready.push(item);
-            }
-        }
-        // Ready rows have no active lease by construction; the overlay is a no-op.
-        Ok(ready)
+        let at = do_now(&self.sql)?;
+        self.do_ready_items_at(queue, &at)
+    }
+
+    fn ready_items_at(&self, queue: &str, at: &str) -> StoreResult<Vec<WorkItem>> {
+        let at = whipplescript_store::items::readiness::canonical_instant(at)
+            .ok_or_else(|| StoreError::Conflict(format!("`{at}` is not an instant")))?;
+        self.do_ready_items_at(queue, &at)
+    }
+
+    fn next_readiness_change_after(
+        &self,
+        queues: &[String],
+        at: &str,
+    ) -> StoreResult<Option<String>> {
+        let at = whipplescript_store::items::readiness::canonical_instant(at)
+            .ok_or_else(|| StoreError::Conflict(format!("`{at}` is not an instant")))?;
+        self.do_next_readiness_change_after(queues, &at)
     }
 
     fn claim_item(
@@ -9394,12 +9378,26 @@ impl<Sql: DoSql> WorkItems for DoSqliteStore<Sql> {
         claimed_by: &str,
         expires: Option<&str>,
     ) -> StoreResult<ClaimOutcome> {
+        let at = do_now(&self.sql)?;
+        WorkItems::claim_item_at(self, item_id, claimed_by, expires, &at)
+    }
+
+    fn claim_item_at(
+        &mut self,
+        item_id: &str,
+        claimed_by: &str,
+        expires: Option<&str>,
+        at: &str,
+    ) -> StoreResult<ClaimOutcome> {
+        let at = whipplescript_store::items::readiness::canonical_instant(at)
+            .ok_or_else(|| StoreError::Conflict(format!("`{at}` is not an instant")))?;
         let now = do_now(&self.sql)?;
         tracker_control_ops::claim_item(
             &self.sql,
             item_id,
             claimed_by,
             expires,
+            &at,
             self.event_effect_id.as_deref(),
             &now,
         )

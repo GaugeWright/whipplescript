@@ -1860,8 +1860,16 @@ rule pick_up
 }
 ```
 
+A ready issue is open, has no active claim, waits on no open dependency, has
+no field in merge conflict, and has no deferral that still holds it back. The
+tracker has one definition of ready. The pattern, `whip issue ready`, and a
+claim all use it, at the instant the worker steps at. An `order` or `soft`
+dependency ranks an issue and never holds it back; `whip issue ready` and the
+pattern present ready issues in that order.
+
 A `claim` statement can fail. When a different claimant already holds the item,
-the claim effect fails normally. Branch on the failure with
+the claim effect fails normally. A claim of an item that is not ready also
+fails normally, and the failure names each reason. Branch on the failure with
 `after work fails as f { ... }`, as you branch on each other failure. Do not
 treat the failure as an error.
 
@@ -1884,6 +1892,10 @@ whip issue renew WS-1 [--actor agent:a]
 whip issue release WS-1
 whip issue finish WS-1 [--summary "done"]
 whip issue dep add WS-2 depends-on WS-1
+whip issue why WS-2
+whip issue defer WS-3 --until 2026-11-01
+whip issue defer WS-4 --after WS-2 --review 14d
+whip issue rank WS-7 WS-4 WS-5
 ```
 
 When an agent files an item during a turn through the CLI, the runtime stamps

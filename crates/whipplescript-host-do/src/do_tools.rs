@@ -729,6 +729,21 @@ impl<Sql: DoSql> DoToolExecutor<Sql> {
                     return Err(format!("`{id}` is already claimed by {current}"));
                 }
                 ClaimOutcome::NotFound => return Err(format!("`{id}` was not found")),
+                ClaimOutcome::NotOpen { status } => {
+                    return Err(format!("`{id}` is {status}, not open work"));
+                }
+                // The one readiness (DR-0126): a todo that is blocked or deferred
+                // is refused with why, so the model works something ready.
+                ClaimOutcome::NotReady { reasons } => {
+                    return Err(format!(
+                        "`{id}` is not ready: {}",
+                        reasons
+                            .iter()
+                            .map(whipplescript_store::items::readiness::Unready::describe)
+                            .collect::<Vec<_>>()
+                            .join("; ")
+                    ));
+                }
             },
             // Holder-scoped, at parity with the native path
             // (`tracker-lease.maude` I4): closing releases the lease, so an
@@ -1514,6 +1529,51 @@ mod tests {
         let completed = exec.execute(&call("list_todos", json!({ "status": "completed" })));
         let rows: Value = serde_json::from_str(&completed.content).expect("completed json");
         assert_eq!(rows.as_array().expect("array").len(), 1);
+    }
+
+    /// DR-0126, at parity with the native tool: a todo that is blocked or
+    /// already finished is refused with why when marked `in_progress`.
+    #[test]
+    fn update_todo_refuses_work_that_is_not_ready_and_work_that_is_done() {
+        let sql = Rc::new(store().sql);
+        let exec = DoToolExecutor::new(Rc::clone(&sql));
+        let file = |content: &str| {
+            let added = exec.execute(&call("add_todo", json!({ "content": content })));
+            assert_eq!(added.status, ToolStatus::Ok, "{}", added.content);
+            serde_json::from_str::<Value>(&added.content).expect("add_todo json")["id"]
+                .as_str()
+                .expect("id string")
+                .to_owned()
+        };
+        let first = file("first");
+        let second = file("second");
+        let mut store = DoSqliteStore::new(Rc::clone(&sql));
+        WorkItems::add_blocks(&mut store, &first, &second).expect("gates");
+        let blocked = exec.execute(&call(
+            "update_todo",
+            json!({ "id": second, "status": "in_progress" }),
+        ));
+        assert_eq!(blocked.status, ToolStatus::Error, "{}", blocked.content);
+        assert!(
+            blocked.content.contains("is not ready") && blocked.content.contains(&first),
+            "{}",
+            blocked.content
+        );
+        let done = exec.execute(&call(
+            "update_todo",
+            json!({ "id": first, "status": "completed" }),
+        ));
+        assert_eq!(done.status, ToolStatus::Ok, "{}", done.content);
+        let reclaimed = exec.execute(&call(
+            "update_todo",
+            json!({ "id": first, "status": "in_progress" }),
+        ));
+        assert_eq!(reclaimed.status, ToolStatus::Error, "{}", reclaimed.content);
+        assert!(
+            reclaimed.content.contains("not open work"),
+            "{}",
+            reclaimed.content
+        );
     }
 
     /// Parity with the native harness tool: a claim the store refused reaches

@@ -5,6 +5,38 @@ follow [Semantic Versioning](https://semver.org). Dates are UTC.
 
 ## [Unreleased]
 
+### Changed
+
+- **A tracker has one definition of ready, and a claim asks it (DR-0126).**
+  `whip issue ready`, `when <tracker> has ready issue`, every claim — CLI,
+  workflow, agent todo tools, host actions — and the new `whip issue why <id>`
+  decide readiness the same way. Before, a workflow saw blocked and conflicted
+  issues as ready, and a claim succeeded on a blocked or a closed issue. A claim
+  of a closed, canceled or archived issue now fails as not open, and a claim of
+  an open issue that is not ready fails with every reason. A person may pass
+  `whip issue claim <id> --override "<why>"`; the claim records the reason.
+- **`order` and `soft` dependencies no longer hold an issue back.** They rank
+  it: `dep add B depends-on A --kind order` says A comes first, and a free
+  worker may still take B while A is claimed. `hard`, `resource`, `review`,
+  `contract` and `discovered` still gate.
+- **Readiness is decided at the worker's instant, not the store's clock.** A
+  claim `ttl` on a `given clock at` scenario lapses on the scenario's clock, a
+  claim `ttl` on a hosted instance lapses at all (it was ignored there), and a
+  parked hosted instance wakes when a claim lapses or a deferral comes due.
+
+### Added
+
+- **Deferral: `whip issue defer <id> --until WHEN | --after ISSUE |
+  --reached RECORD:STATUS | --demand LABEL:N [--review WHEN]`.** An issue stays
+  out of the ready set until the condition holds, then becomes ready with no
+  one acting. Every deferral has a review date; `whip issue review` lists the
+  ones past it and still unmet. `waits` shows them and `undefer` lifts one early.
+- **Ordering: `whip issue order A before B` and `whip issue rank PARENT
+  CHILD...`.** `ready` returns issues in a derived order: a parent's rank leads
+  its children's, only the parent's assignee ranks its children (anyone else's
+  statement is kept as a proposal), and a dependency inherits the rank of what
+  waits on it. Contradictory rankings show in `whip issue conflicts`.
+
 ## [0.6.0] — 2026-09-24
 
 A minor release rather than a patch, because it breaks source that 0.5.6

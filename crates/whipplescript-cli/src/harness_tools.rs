@@ -3142,6 +3142,21 @@ impl FileToolExecutor {
                     return Err(format!("`{id}` is already claimed by {current}"));
                 }
                 ClaimOutcome::NotFound => return Err(format!("`{id}` was not found")),
+                ClaimOutcome::NotOpen { status } => {
+                    return Err(format!("`{id}` is {status}, not open work"));
+                }
+                // The one readiness (DR-0126): a todo that is blocked or deferred
+                // is refused with why, so the agent works something ready.
+                ClaimOutcome::NotReady { reasons } => {
+                    return Err(format!(
+                        "`{id}` is not ready: {}",
+                        reasons
+                            .iter()
+                            .map(whipplescript_store::items::readiness::Unready::describe)
+                            .collect::<Vec<_>>()
+                            .join("; ")
+                    ));
+                }
             },
             // Holder-scoped (`tracker-lease.maude` I4): closing an item releases
             // its lease, so an unguarded close ends work another agent is still
@@ -8257,6 +8272,76 @@ mod tests {
 
         // Bob is not subscribed, so his own turn hears nothing.
         assert!(bob.poll_notices().is_empty());
+    }
+
+    /// DR-0126: the todo tool asks the tracker's one readiness. An agent that
+    /// marks a blocked or a finished item `in_progress` is refused with why,
+    /// rather than handed work that is not ready.
+    #[test]
+    fn update_todo_refuses_work_that_is_not_ready_and_work_that_is_done() {
+        let root = temp_root();
+        let store_path = root.join("items.sqlite");
+        let grants = turn_tool_access_from_input(
+            &json!({
+                "access_grants": [
+                    {
+                        "resource": "tracker",
+                        "operations": [
+                            {"operation": "file"},
+                            {"operation": "claim"},
+                            {"operation": "finish"},
+                            {"operation": "release"}
+                        ]
+                    }
+                ]
+            })
+            .to_string(),
+        )
+        .expect("tracker grants parse");
+        let agent = FileToolExecutor::new(&root)
+            .with_tracker("queue", "alice")
+            .with_tracker_store(store_path.clone())
+            .with_turn_tool_access(grants)
+            .with_profile_policy(Some("repo-writer"));
+        let file = |content: &str| {
+            let filed = agent.execute(&call(TOOL_ADD_TODO, json!({ "content": content })));
+            assert_eq!(filed.status, ToolStatus::Ok, "{}", filed.content);
+            serde_json::from_str::<Value>(&filed.content).expect("json")["id"]
+                .as_str()
+                .expect("filed id")
+                .to_owned()
+        };
+        let first = file("first");
+        let second = file("second");
+        whipplescript_store::items::WorkItemStore::open(&store_path)
+            .expect("store")
+            .add_relation(&first, &second, "blocks", None)
+            .expect("gates");
+        let blocked = agent.execute(&call(
+            TOOL_UPDATE_TODO,
+            json!({ "id": second, "status": "in_progress" }),
+        ));
+        assert_eq!(blocked.status, ToolStatus::Error, "{}", blocked.content);
+        assert!(
+            blocked.content.contains("is not ready") && blocked.content.contains(&first),
+            "{}",
+            blocked.content
+        );
+        let done = agent.execute(&call(
+            TOOL_UPDATE_TODO,
+            json!({ "id": first, "status": "completed" }),
+        ));
+        assert_eq!(done.status, ToolStatus::Ok, "{}", done.content);
+        let reclaimed = agent.execute(&call(
+            TOOL_UPDATE_TODO,
+            json!({ "id": first, "status": "in_progress" }),
+        ));
+        assert_eq!(reclaimed.status, ToolStatus::Error, "{}", reclaimed.content);
+        assert!(
+            reclaimed.content.contains("not open work"),
+            "{}",
+            reclaimed.content
+        );
     }
 
     #[test]

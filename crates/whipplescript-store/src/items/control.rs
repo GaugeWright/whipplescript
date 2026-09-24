@@ -47,12 +47,29 @@ fn execute(
                 return Ok(Outcome::DeadlineElapsed);
             }
             Ok(
-                match control_ops::claim_item(tx, id, actor, Some(expires_at), effect, now)? {
+                // A host action is not a person: it gets the one readiness's
+                // answer (DR-0126) and no override.
+                match control_ops::claim_item(
+                    tx,
+                    id,
+                    actor,
+                    Some(expires_at),
+                    now,
+                    None,
+                    effect,
+                    now,
+                )? {
                     ClaimOutcome::Claimed => Outcome::Claimed {
                         expires_at: expires_at.clone(),
                     },
                     ClaimOutcome::AlreadyClaimed { holder } => Outcome::AlreadyClaimed { holder },
-                    ClaimOutcome::NotFound => Outcome::NotOpen,
+                    ClaimOutcome::NotFound | ClaimOutcome::NotOpen { .. } => Outcome::NotOpen,
+                    ClaimOutcome::NotReady { reasons } => Outcome::NotReady {
+                        reasons: reasons
+                            .iter()
+                            .map(super::readiness::Unready::describe)
+                            .collect(),
+                    },
                 },
             )
         }
