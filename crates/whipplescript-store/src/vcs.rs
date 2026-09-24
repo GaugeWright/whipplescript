@@ -294,6 +294,55 @@ pub enum BoundaryPromotionOutcome {
     StreamLineNotActive,
     MainMissing,
     MainNotActive,
+    /// The mainline's gate refused the proposed result; the ref did not move.
+    GateRefused(GateRefusal),
+    /// A premise the gate certified changed before the ref could move; the
+    /// ref did not move, and a retry prepares again.
+    GateStale {
+        changed: String,
+    },
+}
+
+/// Why a gate refused: a sentence for a person and the structured account a
+/// caller acts on, which names what the proposed result lacks.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GateRefusal {
+    pub reason: String,
+    pub detail: serde_json::Value,
+}
+
+/// What a gate concluded about a proposed result.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum GateVerdict {
+    Admit,
+    Refuse(GateRefusal),
+}
+
+/// What a gate's commit did.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum GateCommit {
+    /// The certified premises held and `advance` ran under them.
+    Committed,
+    /// A certified premise changed; `advance` did not run.
+    Stale { changed: String },
+}
+
+/// The admission a door onto the mainline passes through (norm-plane §5).
+/// The engine records the proposed cut, asks the gate to judge it, and moves
+/// the ref only inside the gate's commit, which re-checks every premise it
+/// certified while holding whatever exclusion keeps them from changing. The
+/// engine has no path that moves the mainline without one.
+pub trait MainlineGate {
+    /// Judge the recorded proposed cut against the base the ref would move
+    /// from. Pure with respect to the ref: it reads, it never advances.
+    fn prepare(
+        &mut self,
+        base_cut: Option<&str>,
+        proposed_cut: &str,
+        artifacts: &crate::norm_commands::NormArtifactCapture<'_>,
+    ) -> StoreResult<GateVerdict>;
+    /// Run `advance` if and only if what `prepare` certified still holds.
+    fn commit(&mut self, advance: &mut dyn FnMut() -> StoreResult<()>) -> StoreResult<GateCommit>;
 }
 
 /// Restore (un-tie's `revert` mapping): re-point the branch head to a
@@ -2602,6 +2651,7 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
         expected_main_cut: Option<&str>,
         proposed_main_cut: &str,
         at: &str,
+        gate: &mut dyn MainlineGate,
     ) -> StoreResult<BoundaryPromotionOutcome> {
         self.require_head_reservation(stream_line_id, reservation_id)?;
         let Some(line) = self.branches.get_branch(stream_line_id)? else {
@@ -2693,24 +2743,55 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
             &origin,
         )?;
 
-        let advanced = match self.branches.advance_head(
-            MAINLINE_BRANCH_ID,
-            expected_main_cut,
-            proposed_main_cut,
-            &manifest_hash,
-            at,
-        )? {
-            AdvanceOutcome::Advanced(advanced) => advanced,
-            AdvanceOutcome::Stale {
-                current_head_cut_id,
-            } => {
+        // The recorded proposal is the exact result the gate judges; an
+        // unreferenced cut left by a refusal is collectible like a lost CAS's.
+        let verdict = {
+            let capture = |cut: &str| {
+                self.capture_norm_artifact(cut, crate::norm_artifact::ArtifactLimits::default())
+            };
+            gate.prepare(expected_main_cut, proposed_main_cut, &capture)?
+        };
+        if let GateVerdict::Refuse(refusal) = verdict {
+            return Ok(BoundaryPromotionOutcome::GateRefused(refusal));
+        }
+        let mut advance_outcome = None;
+        let committed = gate.commit(&mut || {
+            advance_outcome = Some(self.branches.advance_head(
+                MAINLINE_BRANCH_ID,
+                expected_main_cut,
+                proposed_main_cut,
+                &manifest_hash,
+                at,
+            )?);
+            Ok(())
+        })?;
+        let advanced = match (committed, advance_outcome) {
+            (GateCommit::Stale { changed }, _) => {
+                return Ok(BoundaryPromotionOutcome::GateStale { changed })
+            }
+            (GateCommit::Committed, Some(AdvanceOutcome::Advanced(advanced))) => advanced,
+            (
+                GateCommit::Committed,
+                Some(AdvanceOutcome::Stale {
+                    current_head_cut_id,
+                }),
+            ) => {
                 return Ok(BoundaryPromotionOutcome::ExpectedCutsMoved {
                     current_line_cut,
                     current_main_cut: current_head_cut_id,
                 })
             }
-            AdvanceOutcome::NotActive { .. } => return Ok(BoundaryPromotionOutcome::MainNotActive),
-            AdvanceOutcome::NotFound => return Ok(BoundaryPromotionOutcome::MainMissing),
+            (GateCommit::Committed, Some(AdvanceOutcome::NotActive { .. })) => {
+                return Ok(BoundaryPromotionOutcome::MainNotActive)
+            }
+            (GateCommit::Committed, Some(AdvanceOutcome::NotFound)) => {
+                return Ok(BoundaryPromotionOutcome::MainMissing)
+            }
+            (GateCommit::Committed, None) => {
+                return Err(StoreError::Conflict(
+                    "the mainline gate committed without moving the ref".into(),
+                ))
+            }
         };
         self.log_op(
             &format!("op-{proposed_main_cut}"),
@@ -7470,6 +7551,7 @@ mod tests {
                 Some("main-1"),
                 "main-2",
                 "t4",
+                &mut NoNormLedger,
             )
             .expect("promote")
         else {
@@ -7751,6 +7833,7 @@ mod tests {
                 Some("main-1"),
                 "main-2",
                 "t4",
+                &mut NoNormLedger,
             )
             .expect("promote");
         let BoundaryPromotionOutcome::Promoted {
@@ -7798,6 +7881,7 @@ mod tests {
                 Some("main-1"),
                 "main-3",
                 "t5",
+                &mut NoNormLedger,
             )
             .expect("stale attempt");
         assert!(matches!(
@@ -7813,6 +7897,154 @@ mod tests {
         );
     }
 
+    /// These engine fixtures carry no norm ledger, so nothing gates their
+    /// mainline: the gate admits and runs the compare-and-swap as asked.
+    struct NoNormLedger;
+
+    impl MainlineGate for NoNormLedger {
+        fn prepare(
+            &mut self,
+            _base_cut: Option<&str>,
+            _proposed_cut: &str,
+            _artifacts: &crate::norm_commands::NormArtifactCapture<'_>,
+        ) -> StoreResult<GateVerdict> {
+            Ok(GateVerdict::Admit)
+        }
+        fn commit(
+            &mut self,
+            advance: &mut dyn FnMut() -> StoreResult<()>,
+        ) -> StoreResult<GateCommit> {
+            advance()?;
+            Ok(GateCommit::Committed)
+        }
+    }
+
+    /// A gate whose verdict and commit the test chooses, recording what it
+    /// was asked to judge.
+    struct ScriptedGate {
+        verdict: GateVerdict,
+        commit: GateCommit,
+        run_advance: bool,
+        judged: Vec<(Option<String>, String, BTreeMap<String, String>)>,
+    }
+
+    impl MainlineGate for ScriptedGate {
+        fn prepare(
+            &mut self,
+            base_cut: Option<&str>,
+            proposed_cut: &str,
+            artifacts: &crate::norm_commands::NormArtifactCapture<'_>,
+        ) -> StoreResult<GateVerdict> {
+            let captured = artifacts(proposed_cut)?;
+            self.judged.push((
+                base_cut.map(str::to_owned),
+                proposed_cut.to_owned(),
+                captured.files().clone(),
+            ));
+            Ok(self.verdict.clone())
+        }
+        fn commit(
+            &mut self,
+            advance: &mut dyn FnMut() -> StoreResult<()>,
+        ) -> StoreResult<GateCommit> {
+            if self.run_advance && self.commit == GateCommit::Committed {
+                advance()?;
+            }
+            Ok(self.commit.clone())
+        }
+    }
+
+    #[test]
+    fn the_mainline_moves_only_inside_its_gates_commit() {
+        let mut vcs = vcs();
+        vcs.init("t0").expect("init");
+        vcs.write(MAINLINE_BRANCH_ID, "base.md", Some("base"), "main-1", "t1")
+            .expect("seed main");
+        vcs.create_branch("line-ws", None, MAINLINE_BRANCH_ID, "t2")
+            .expect("line");
+        vcs.write("line-ws", "work.md", Some("work"), "line-1", "t3")
+            .expect("stream work");
+        vcs.reserve_branch_head("line-ws", "reservation-ws", "t4")
+            .expect("reserve line");
+        let main_head = |vcs: &NativeWorkspaceVcs| {
+            vcs.get_branch(MAINLINE_BRANCH_ID)
+                .expect("main read")
+                .expect("main")
+                .head_cut_id
+        };
+        let refusal = GateRefusal {
+            reason: "custody-authorization is not supported at the proposed result".into(),
+            detail: serde_json::json!({"requirements": {"custody-authorization": ["repair"]}}),
+        };
+        let mut gate = ScriptedGate {
+            verdict: GateVerdict::Refuse(refusal.clone()),
+            commit: GateCommit::Committed,
+            run_advance: true,
+            judged: Vec::new(),
+        };
+        let promote = |vcs: &mut NativeWorkspaceVcs, cut: &str, gate: &mut ScriptedGate| {
+            vcs.promote_line_exact(
+                "line-ws",
+                "reservation-ws",
+                Some("line-1"),
+                Some("main-1"),
+                cut,
+                "t4",
+                gate,
+            )
+            .expect("promotion attempt")
+        };
+        // Refused: the ref stays, and the gate judged the exact merged result
+        // against the base the ref would have moved from.
+        assert_eq!(
+            promote(&mut vcs, "main-2", &mut gate),
+            BoundaryPromotionOutcome::GateRefused(refusal)
+        );
+        assert_eq!(main_head(&vcs).as_deref(), Some("main-1"));
+        let (base, proposed, files) = &gate.judged[0];
+        assert_eq!(
+            (base.as_deref(), proposed.as_str()),
+            (Some("main-1"), "main-2")
+        );
+        assert!(files.contains_key("work.md") && files.contains_key("base.md"));
+        // Stale: a certified premise changed; the ref stays.
+        gate.verdict = GateVerdict::Admit;
+        gate.commit = GateCommit::Stale {
+            changed: "the norm ledger moved".into(),
+        };
+        assert_eq!(
+            promote(&mut vcs, "main-3", &mut gate),
+            BoundaryPromotionOutcome::GateStale {
+                changed: "the norm ledger moved".into()
+            }
+        );
+        assert_eq!(main_head(&vcs).as_deref(), Some("main-1"));
+        // A gate that reports a commit it never ran is not believed.
+        gate.commit = GateCommit::Committed;
+        gate.run_advance = false;
+        assert!(matches!(
+            vcs.promote_line_exact(
+                "line-ws",
+                "reservation-ws",
+                Some("line-1"),
+                Some("main-1"),
+                "main-4",
+                "t4",
+                &mut gate,
+            )
+            .unwrap_err(),
+            StoreError::Conflict(message) if message == "the mainline gate committed without moving the ref"
+        ));
+        assert_eq!(main_head(&vcs).as_deref(), Some("main-1"));
+        // Admitted: the ref moves inside the commit.
+        gate.run_advance = true;
+        assert!(matches!(
+            promote(&mut vcs, "main-5", &mut gate),
+            BoundaryPromotionOutcome::Promoted { ref main_cut_id, .. } if main_cut_id == "main-5"
+        ));
+        assert_eq!(main_head(&vcs).as_deref(), Some("main-5"));
+    }
+
     #[test]
     fn exact_promotion_requires_its_durable_reservation() {
         let mut vcs = vcs();
@@ -7821,7 +8053,15 @@ mod tests {
             .expect("line");
 
         let error = vcs
-            .promote_line_exact("line-ws", "missing-reservation", None, None, "main-1", "t2")
+            .promote_line_exact(
+                "line-ws",
+                "missing-reservation",
+                None,
+                None,
+                "main-1",
+                "t2",
+                &mut NoNormLedger,
+            )
             .expect_err("promotion without the matching reservation must refuse");
         assert!(format!("{error:?}").contains("not frozen by reservation"));
     }
@@ -7862,6 +8102,7 @@ mod tests {
                 Some("main-2"),
                 "main-3",
                 "t5",
+                &mut NoNormLedger,
             )
             .expect("probe");
         assert!(matches!(
@@ -7940,6 +8181,7 @@ mod tests {
                 Some("main-1"),
                 "main-2",
                 "t4",
+                &mut NoNormLedger,
             )
             .expect_err("conflicting immutable cut identity must fail before Main CAS");
         assert!(format!("{error:?}").contains("different immutable content"));
@@ -7990,6 +8232,7 @@ mod tests {
                     Some("main-1"),
                     proposed,
                     "race",
+                    &mut NoNormLedger,
                 )
                 .expect("promotion outcome")
             }));

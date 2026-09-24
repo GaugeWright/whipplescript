@@ -31,10 +31,34 @@ enum Interpretation {
     Context,
     PublishedExecution,
 }
-#[derive(serde::Serialize)]
-struct MethodGap {
-    requirement: Option<EvidenceVersion>,
-    reason: String,
+/// A requirement the host could discover no installed method for.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct MethodGap {
+    pub requirement: Option<EvidenceVersion>,
+    pub reason: String,
+}
+
+/// A plan and the exact ledger state it was computed at: the read anchor the
+/// history was captured under, and the two frontiers it projected.
+pub struct Planned {
+    pub anchor: whipplescript_store::norm_history::NormReadAnchor,
+    pub before_frontier: std::collections::BTreeSet<String>,
+    pub after_frontier: std::collections::BTreeSet<String>,
+    pub plan: crate::norm_impact::ImpactPlan,
+    pub method_gaps: BTreeMap<String, Vec<MethodGap>>,
+}
+
+impl Planned {
+    /// The query's answer, as `norm impact` has always returned it.
+    pub fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "anchor": self.anchor,
+            "before_frontier": self.before_frontier,
+            "after_frontier": self.after_frontier,
+            "plan": self.plan,
+            "method_gaps": self.method_gaps,
+        })
+    }
 }
 
 /// Validated embedding configuration, never part of a query request.
@@ -97,6 +121,14 @@ pub fn execute<S: RuntimeStore>(
     input: ImpactQuery<'_, S>,
     verify_runtime: impl Fn(&PythonRuntime) -> Result<(), String>,
 ) -> Result<serde_json::Value, String> {
+    plan(input, verify_runtime).map(|planned| planned.to_json())
+}
+
+/// The same composition, typed, for a door that must act on its answer.
+pub fn plan<S: RuntimeStore>(
+    input: ImpactQuery<'_, S>,
+    verify_runtime: impl Fn(&PythonRuntime) -> Result<(), String>,
+) -> Result<Planned, String> {
     let ImpactQuery {
         configuration,
         history,
@@ -172,11 +204,11 @@ pub fn execute<S: RuntimeStore>(
         ImpactLimits::default(),
     )
     .map_err(|error| format!("{error:?}"))?;
-    Ok(serde_json::json!({
-        "anchor": history.anchor(),
-        "before_frontier": before.frontier,
-        "after_frontier": after.frontier,
-        "plan": plan,
-        "method_gaps": method_gaps.into_inner(),
-    }))
+    Ok(Planned {
+        anchor: history.anchor(),
+        before_frontier: before.frontier,
+        after_frontier: after.frontier,
+        plan,
+        method_gaps: method_gaps.into_inner(),
+    })
 }

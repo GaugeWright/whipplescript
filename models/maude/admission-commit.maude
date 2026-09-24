@@ -1,0 +1,61 @@
+--- How a governed door commits across two stores (norm-plane §5). The
+--- LANDING-GATE model takes the commit as one atomic step; a host realizes it
+--- by holding the norm ledger's write exclusion from the re-check of every
+--- ledger premise until the ref's compare-and-swap has run. Evidence, authority
+--- and charter changes are ledger writes, so none can land between the check
+--- and the ref move; the ref's own compare-and-swap covers the base head.
+---
+--- One admission attempt and one ledger writer are modeled. The attempt was
+--- prepared against an evidence identity and a base head; the writer admits
+--- new evidence whenever the exclusion is free. `raced` marks an admission
+--- whose ref moved while the evidence it certified was no longer current.
+mod ADMISSION-COMMIT is
+  protecting BOOL .
+  sorts Mark Phase Fact Cfg State .
+  ops old new : -> Mark [ctor] .
+  ops prepared locked checked admitted refused : -> Phase [ctor] .
+  subsort Fact < Cfg . op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+  op {_} : Cfg -> State [ctor] .
+  --- The ledger's current evidence identity, and whether its exclusion is held.
+  op ledger : Mark Bool -> Fact [ctor] .
+  --- The gated ref's head.
+  op head : Mark -> Fact [ctor] .
+  --- The attempt: its phase, and the evidence and head it certified.
+  op attempt : Phase Mark Mark -> Fact [ctor] .
+  op writer : -> Fact [ctor] .
+  op raced : -> Fact [ctor] .
+  vars E H CE CH : Mark . var CFG : Cfg .
+  --- A ledger write waits for the exclusion.
+  rl [write-evidence] : { writer ledger(E,false) CFG } => { ledger(new,false) CFG } .
+  rl [take-exclusion] : { attempt(prepared,CE,CH) ledger(E,false) CFG }
+    => { attempt(locked,CE,CH) ledger(E,true) CFG } .
+  rl [recheck-holds] : { attempt(locked,CE,CH) ledger(CE,true) head(CH) CFG }
+    => { attempt(checked,CE,CH) ledger(CE,true) head(CH) CFG } .
+  crl [recheck-refuses] : { attempt(locked,CE,CH) ledger(E,true) head(H) CFG }
+    => { attempt(refused,CE,CH) ledger(E,false) head(H) CFG }
+    if E =/= CE or H =/= CH .
+  --- The ref's compare-and-swap, still under the exclusion, then its release.
+  rl [advance-and-release] : { attempt(checked,CE,CH) ledger(CE,true) head(CH) CFG }
+    => { attempt(admitted,CE,CH) ledger(CE,false) head(new) CFG } .
+  crl [advance-on-stale-evidence] : { attempt(checked,CE,CH) ledger(E,B:Bool) head(CH) CFG }
+    => { attempt(admitted,CE,CH) ledger(E,false) head(new) raced CFG }
+    if E =/= CE .
+endm
+--- Releasing the exclusion after the check and before the ref moves lets
+--- evidence land in between.
+mod ADMISSION-COMMIT-WEAK-EARLY-RELEASE is
+  including ADMISSION-COMMIT .
+  vars CE CH : Mark . var CFG : Cfg .
+  rl [release-before-advance] : { attempt(checked,CE,CH) ledger(CE,true) CFG }
+    => { attempt(checked,CE,CH) ledger(CE,false) CFG } .
+endm
+--- Checking the premises before taking the exclusion leaves the same window.
+mod ADMISSION-COMMIT-WEAK-UNLOCKED-CHECK is
+  including ADMISSION-COMMIT .
+  vars E CE CH : Mark . var CFG : Cfg .
+  rl [check-then-lock] : { attempt(prepared,CE,CH) ledger(CE,false) head(CH) CFG }
+    => { attempt(locked,CE,CH) ledger(CE,false) head(CH) CFG } .
+  rl [lock-after-check] : { attempt(locked,CE,CH) ledger(E,false) CFG }
+    => { attempt(checked,CE,CH) ledger(E,true) CFG } .
+endm

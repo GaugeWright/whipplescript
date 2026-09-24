@@ -1874,7 +1874,10 @@ impl ParityWorlds {
             dir.join("coordination.sqlite"),
         );
         env::set_var("WHIPPLESCRIPT_ITEMS_STORE", dir.join("items.sqlite"));
-        let do_sql = whipplescript_host_do::do_store::test_support::RusqliteDoSql::in_memory();
+        // A workspace object always carries the norm ledger's schema, and the
+        // promote door's mainline gate reads it.
+        let do_sql =
+            whipplescript_host_do::do_store::test_support::RusqliteDoSql::with_store_schema();
         Self {
             store_path: dir.join("items.sqlite"),
             _dir: dir,

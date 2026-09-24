@@ -1871,6 +1871,24 @@ impl WorkItemStore {
         load_norm_checkpoint(&self.connection)
     }
 
+    /// Run `f` holding the ledger database's write lock, so no norm event —
+    /// no evidence, revocation, rotation or grant — can be appended until it
+    /// returns. Reads inside `f` see the state the lock froze; nothing is
+    /// written, so the transaction is rolled back. A gated ref's admission
+    /// holds this across the branch store's compare-and-swap (norm-plane §5).
+    pub fn with_norm_write_exclusion<T>(
+        &self,
+        f: &mut dyn FnMut() -> StoreResult<T>,
+    ) -> StoreResult<T> {
+        let exclusion = rusqlite::Transaction::new_unchecked(
+            &self.connection,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
+        let result = f();
+        exclusion.rollback()?;
+        result
+    }
+
     /// Pin the destination's trusted identity and authority event together.
     /// The host obtains these from authenticated configuration, not the bundle.
     pub fn pin_norm_checkpoint(

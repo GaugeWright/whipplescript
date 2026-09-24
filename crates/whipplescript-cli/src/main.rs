@@ -24934,6 +24934,7 @@ impl whipplescript_kernel::effect_handlers::CapabilityProvider for VcsPromoteCap
             &reservation_id,
             &holder,
             &at,
+            &self.store_path,
         );
         // Fact routing is this host's surface (A5): the mediator delivers
         // vcs.* facts natively; the DO deliberately routes none.
@@ -38358,6 +38359,8 @@ impl whipplescript_kernel::effect_handlers::PromotionSerialization for AdoptionL
 /// DR-0078's promotion coordinator, now a dispatch onto the kernel's one
 /// choreography (DR-0091 W1): this wrapper mints the identity-bearing
 /// coordinates the way native always has and supplies the adoption lease.
+/// The mainline's norm-plane gate (norm-plane §5) is the host's: the native
+/// ledger and the evaluation inputs `norm impact` uses, over `runtime_path`.
 fn run_reserved_boundary_promotion(
     streams: &mut whipplescript_store::workstreams::WorkstreamStore,
     vcs: &mut whipplescript_store::vcs::NativeWorkspaceVcs,
@@ -38365,21 +38368,25 @@ fn run_reserved_boundary_promotion(
     reservation_seed: &str,
     holder: &str,
     at: &str,
+    runtime_path: &Path,
 ) -> Result<BoundaryRunOutcome, String> {
     let proposed_main = format!("{}-promote", generated_cut_id());
     let mut serialization = AdoptionLeaseSerialization::new(holder);
-    whipplescript_kernel::effect_handlers::run_reserved_boundary_promotion_generic(
-        streams,
-        vcs,
-        &whipplescript_kernel::effect_handlers::PromoteDoorRequest {
-            stream_id,
-            reservation_id: reservation_seed,
-            proposed_main: &proposed_main,
-            at,
-            receipt_scope: "native-workspace",
-        },
-        &mut serialization,
-    )
+    norm_commands::with_mainline_admission(runtime_path, |gate| {
+        whipplescript_kernel::effect_handlers::run_reserved_boundary_promotion_generic(
+            streams,
+            vcs,
+            &whipplescript_kernel::effect_handlers::PromoteDoorRequest {
+                stream_id,
+                reservation_id: reservation_seed,
+                proposed_main: &proposed_main,
+                at,
+                receipt_scope: "native-workspace",
+            },
+            &mut serialization,
+            gate,
+        )
+    })?
 }
 
 /// `whip stream …` — the workstream tier: named shared lines +
@@ -38551,6 +38558,7 @@ fn stream_command(options: &CliOptions) -> ExitCode {
                 &reservation_id,
                 &holder,
                 &at,
+                &options.store_path,
             ) {
                 Ok(BoundaryRunOutcome::Promoted {
                     receipt,
@@ -38597,6 +38605,21 @@ fn stream_command(options: &CliOptions) -> ExitCode {
                         "conflicts": conflicts.iter().map(conflict_json).collect::<Vec<_>>(),
                     });
                     eprintln!("promotion conflicted: {payload}");
+                    ExitCode::FAILURE
+                }
+                Ok(BoundaryRunOutcome::GateRefused(refusal)) => {
+                    // The structured refusal is the answer: a caller reads the
+                    // requirements it names, never this sentence.
+                    println!(
+                        "{}",
+                        json!({
+                            "refused": stream_id,
+                            "target": "main",
+                            "reason": refusal.reason,
+                            "detail": refusal.detail,
+                        })
+                    );
+                    eprintln!("promotion refused: {}", refusal.reason);
                     ExitCode::FAILURE
                 }
                 Ok(BoundaryRunOutcome::Refused(message)) | Err(message) => {

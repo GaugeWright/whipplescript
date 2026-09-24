@@ -803,6 +803,10 @@ pub fn home_do_turn_branch<Sql: DoSql + Clone>(
 /// serialization (`SingleWriterSerialization`, vw note §7); and **no
 /// fact routing** — vcs.* fact delivery is the mediator surface (A5),
 /// which lives native-side.
+/// Why the hosted mainline gate cannot evaluate a norm ledger yet.
+pub const HOSTED_ADMISSION_UNCONFIGURED: &str =
+    "the hosted promote door does not yet receive the deployment's norm planning configuration";
+
 pub struct DoVcsPromoteCapabilityProvider<Sql: DoSql + Clone> {
     /// The shared DO SQLite handle (an `Rc<…>` in every real
     /// instantiation, so cloning is a refcount bump).
@@ -848,6 +852,23 @@ impl<Sql: DoSql + Clone> whipplescript_kernel::effect_handlers::CapabilityProvid
         let at = format!("promote:{}", effect.effect_id);
         let reservation_id = format!("effect-{}", effect.effect_id);
         let proposed_main = format!("cut-{seed}-promote");
+        // The mainline's gate (norm-plane §5) over this object's ledger. The
+        // hosted door does not yet receive the deployment's planning inputs,
+        // so a workspace with a norm ledger is refused rather than promoted
+        // unevaluated; one without a ledger is gated by nothing.
+        let ledger = crate::do_store::DoSqliteStore::new(self.sql.clone());
+        let mut gate = whipplescript_kernel::norm_admission::NormMainlineAdmission::new(
+            &ledger,
+            Err::<
+                whipplescript_kernel::norm_admission::AdmissionHost<
+                    '_,
+                    crate::do_store::DoSqliteStore<Sql>,
+                >,
+                _,
+            >(HOSTED_ADMISSION_UNCONFIGURED.to_owned()),
+            whipplescript_kernel::norm_admission::AdmissionDoor::Promote,
+            whipplescript_store::branches::MAINLINE_BRANCH_ID,
+        );
         // Single-writer per object: the DO's turn IS the serialization
         // (DR-0091 Decision 2), so the kernel choreography runs unleased.
         let result = whipplescript_kernel::effect_handlers::run_reserved_boundary_promotion_generic(
@@ -861,6 +882,7 @@ impl<Sql: DoSql + Clone> whipplescript_kernel::effect_handlers::CapabilityProvid
                 receipt_scope: "durable-object-workspace",
             },
             &mut whipplescript_kernel::effect_handlers::SingleWriterSerialization,
+            &mut gate,
         );
         // No fact routing: vcs.* fact delivery is the mediator surface (A5),
         // which lives native-side.
@@ -991,8 +1013,11 @@ mod tests {
 
     use crate::do_store::test_support::RusqliteDoSql;
 
+    /// Every workspace object carries the store's schema, the norm ledger's
+    /// included (the Worker applies it at start), and the promote door reads
+    /// that ledger's checkpoint.
     fn sql() -> Rc<RusqliteDoSql> {
-        Rc::new(RusqliteDoSql::in_memory())
+        Rc::new(RusqliteDoSql::from_store_schema())
     }
 
     #[test]

@@ -623,3 +623,100 @@ fn impact_retains_authority_rotation_as_a_distinct_action() {
     );
     assert_eq!(result.requirements[&id].len(), 1);
 }
+/// The mainline gate's judgment over real plans (norm-plane §5): admissible
+/// only when every requirement on either basis is supported and nothing about
+/// the plan is unresolved; otherwise refused, naming what is lacking.
+#[test]
+fn the_gate_admits_only_a_fully_supported_plan_and_names_what_is_lacking() {
+    use crate::norm_admission::judge;
+    use crate::norm_planning::{MethodGap, Planned};
+    use whipplescript_store::norm_history::NormReadAnchor;
+    let (store, id) = f::fixture(Some(f::template()), true);
+    let view = store.norm_view(&Boundary).unwrap();
+    let requirement = view.requirement_inventory().unwrap().requirements[&id]
+        .requirement
+        .clone()
+        .unwrap();
+    let before = artifact(&[("main.py", "same subject"), ("parser.py", "old")]);
+    let candidate = artifact(&[("main.py", "same subject"), ("parser.py", "changed")]);
+    let planned = |plan: ImpactPlan, method_gaps: BTreeMap<String, Vec<MethodGap>>| Planned {
+        anchor: NormReadAnchor {
+            checkpoint: view.checkpoint(),
+            frontier: view.frontier.clone(),
+        },
+        before_frontier: view.frontier.clone(),
+        after_frontier: view.frontier.clone(),
+        plan,
+        method_gaps,
+    };
+    let plan_for = |mode: &str| {
+        let mut host = Host {
+            events: events(&store),
+            automatic: Some(version("method")),
+        };
+        host.events[0].payload = observation(
+            requirement.clone(),
+            candidate_identity(if mode == "stale" {
+                before.files()
+            } else {
+                candidate.files()
+            }),
+            mode != "failure",
+        );
+        evaluate(&view, &before, &view, &candidate, &host)
+    };
+    // Supported at the exact candidate: admitted, certifying the requirement
+    // and the evidence selected for it.
+    let (requirements, evidence) = judge(&planned(plan_for("exact"), BTreeMap::new())).unwrap();
+    assert_eq!(requirements, [id.clone()].into());
+    assert_eq!(evidence.len(), 1);
+    // A failure, or support for another candidate, refuses with the work named.
+    for (mode, work) in [("failure", "repair"), ("stale", "check")] {
+        let refusal = judge(&planned(plan_for(mode), BTreeMap::new())).unwrap_err();
+        assert_eq!(
+            refusal.requirements,
+            [(id.clone(), vec![work.to_owned()])].into()
+        );
+        assert_eq!(
+            refusal.reason(),
+            format!("the proposed result is not supported: {id} ({work})")
+        );
+    }
+    // Evidence the host could not interpret, a requirement with no installed
+    // method, and a pending authority act each refuse on their own.
+    let mut gapped = plan_for("exact");
+    gapped.evidence_gaps.insert(
+        "unverified".into(),
+        crate::norm_projection::ProjectionGap::MalformedPublication,
+    );
+    assert_eq!(
+        judge(&planned(gapped, BTreeMap::new()))
+            .unwrap_err()
+            .reason(),
+        "the proposed result is not supported: uninterpretable evidence unverified"
+    );
+    let unmethoded = [(
+        id.clone(),
+        vec![MethodGap {
+            requirement: Some(requirement.clone()),
+            reason: "norm observer capability is not registered".into(),
+        }],
+    )]
+    .into();
+    assert_eq!(
+        judge(&planned(plan_for("exact"), unmethoded))
+            .unwrap_err()
+            .reason(),
+        format!("the proposed result is not supported: {id} (no installed method)")
+    );
+    let mut rotating = plan_for("exact");
+    rotating
+        .authority_actions
+        .insert(ImpactAuthorityAction::AuthorityChanged);
+    assert_eq!(
+        judge(&planned(rotating, BTreeMap::new()))
+            .unwrap_err()
+            .reason(),
+        "the proposed result is not supported: AuthorityChanged"
+    );
+}

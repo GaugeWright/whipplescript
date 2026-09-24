@@ -228,6 +228,7 @@ resource-inventory.maude	SSNSNSNSNSSSNSNS
 norm-frontier-query.maude	SSNSNSNSNSNSNS
 norm-observer.maude	SSSNSNSNSNSSNSNS
 landing-gate.maude	SSSSSSSSSSNSNSNSNSNSNSNSNSNSNSNSNSNS
+admission-commit.maude	SSSSNSNSN
 norm-run-admission.maude	SSSSNSNSNSNSNSNSNSNSNSNSNSNS
 exec-dispatch.maude	SSSSNSNSNSNSNS
 norm-run-preparation.maude	SSSNSNSNSNSNS

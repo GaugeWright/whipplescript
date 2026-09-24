@@ -2962,6 +2962,9 @@ pub enum BoundaryRunOutcome {
     Conflicted {
         conflicts: Vec<whipplescript_store::merge::PathConflict>,
     },
+    /// The mainline's gate refused the proposed result (norm-plane §5): the
+    /// ref did not move, and the refusal names what the result lacks.
+    GateRefused(whipplescript_store::vcs::GateRefusal),
     Refused(String),
 }
 
@@ -3097,6 +3100,7 @@ pub fn run_reserved_boundary_promotion_generic<W, B, C>(
     vcs: &mut whipplescript_store::vcs::WorkspaceVcs<B, C>,
     request: &PromoteDoorRequest<'_>,
     serialization: &mut dyn PromotionSerialization,
+    gate: &mut dyn whipplescript_store::vcs::MainlineGate,
 ) -> Result<BoundaryRunOutcome, String>
 where
     W: Workstreams + ?Sized,
@@ -3108,7 +3112,7 @@ where
         Ok(Some(refusal)) => return Ok(BoundaryRunOutcome::Refused(refusal)),
         Err(error) => return Err(error),
     }
-    let result = run_reserved_boundary_promotion_serialized(streams, vcs, request);
+    let result = run_reserved_boundary_promotion_serialized(streams, vcs, request, gate);
     serialization.release();
     result
 }
@@ -3117,6 +3121,7 @@ fn run_reserved_boundary_promotion_serialized<W, B, C>(
     streams: &mut W,
     vcs: &mut whipplescript_store::vcs::WorkspaceVcs<B, C>,
     request: &PromoteDoorRequest<'_>,
+    gate: &mut dyn whipplescript_store::vcs::MainlineGate,
 ) -> Result<BoundaryRunOutcome, String>
 where
     W: Workstreams + ?Sized,
@@ -3299,7 +3304,18 @@ where
             promote_cut_value(&expected_main),
             &proposed_main,
             at,
+            gate,
         ) {
+            Ok(whipplescript_store::vcs::BoundaryPromotionOutcome::GateRefused(refusal)) => {
+                release_reserved_boundary_generic(streams, vcs, stream_id, &reservation_id, at)?;
+                return Ok(BoundaryRunOutcome::GateRefused(refusal));
+            }
+            Ok(whipplescript_store::vcs::BoundaryPromotionOutcome::GateStale { changed }) => {
+                release_reserved_boundary_generic(streams, vcs, stream_id, &reservation_id, at)?;
+                return Ok(BoundaryRunOutcome::Refused(format!(
+                    "{changed}; the promotion is prepared again on retry"
+                )));
+            }
             Ok(whipplescript_store::vcs::BoundaryPromotionOutcome::Promoted {
                 ref_position,
                 ref_receipt_handle,
@@ -3416,7 +3432,8 @@ pub fn promote_conflict_json(conflict: &whipplescript_store::merge::PathConflict
 /// Render a promote run as the effect door's outcome — one output shape for
 /// every host, so receipt parity is by construction rather than lockstep.
 /// `Refused` and `Err` both complete as `Failed` with the `vcs_promote`
-/// error kind, exactly as both host doors always have.
+/// error kind, exactly as both host doors always have; a gate's refusal
+/// completes as `Failed` with `norm_gate_refused`.
 pub fn promote_effect_outcome(
     stream_id: &str,
     result: &Result<BoundaryRunOutcome, String>,
@@ -3443,6 +3460,12 @@ pub fn promote_effect_outcome(
                 &conflicts.iter().map(promote_conflict_json).collect::<Vec<_>>()
             ).unwrap_or_default(),
         })),
+        // The gate's refusal is a distinct failure: the ref is intact and the
+        // proposal is not supported, which retrying the same result cannot fix.
+        Ok(BoundaryRunOutcome::GateRefused(refusal)) => CapabilityOutcome::Failed {
+            error_kind: "norm_gate_refused".to_owned(),
+            message: refusal.reason.clone(),
+        },
         Ok(BoundaryRunOutcome::Refused(message)) => failed(message),
         Err(message) => failed(message),
     }
@@ -5204,6 +5227,28 @@ mod promote_door_tests {
     //! receipt parity rests on.
 
     use super::*;
+
+    /// These door fixtures carry no norm ledger, so nothing gates their
+    /// mainline: the gate admits and runs the compare-and-swap as asked.
+    struct NoNormLedger;
+
+    impl whipplescript_store::vcs::MainlineGate for NoNormLedger {
+        fn prepare(
+            &mut self,
+            _base_cut: Option<&str>,
+            _proposed_cut: &str,
+            _artifacts: &whipplescript_store::norm_commands::NormArtifactCapture<'_>,
+        ) -> whipplescript_store::StoreResult<whipplescript_store::vcs::GateVerdict> {
+            Ok(whipplescript_store::vcs::GateVerdict::Admit)
+        }
+        fn commit(
+            &mut self,
+            advance: &mut dyn FnMut() -> whipplescript_store::StoreResult<()>,
+        ) -> whipplescript_store::StoreResult<whipplescript_store::vcs::GateCommit> {
+            advance()?;
+            Ok(whipplescript_store::vcs::GateCommit::Committed)
+        }
+    }
     use whipplescript_store::workstreams as ws;
 
     struct AtAcquire<F>(F);
@@ -5551,6 +5596,7 @@ mod promote_door_tests {
                     receipt_scope: "workspace",
                 },
                 &mut SingleWriterSerialization,
+                &mut NoNormLedger,
             )
             .unwrap();
             let BoundaryRunOutcome::Refused(message) = result else {
@@ -5596,6 +5642,7 @@ mod promote_door_tests {
                         Some("main-1"),
                         "main-2",
                         "t3",
+                        &mut NoNormLedger,
                     )
                     .unwrap();
                 let whipplescript_store::vcs::BoundaryPromotionOutcome::Promoted {
@@ -5633,6 +5680,7 @@ mod promote_door_tests {
                 &mut vcs,
                 &request,
                 &mut SingleWriterSerialization,
+                &mut NoNormLedger,
             )
             .unwrap();
             let BoundaryRunOutcome::Refused(message) = result else {
@@ -5663,6 +5711,7 @@ mod promote_door_tests {
                 &mut vcs,
                 &request,
                 &mut SingleWriterSerialization,
+                &mut NoNormLedger,
             )
             .unwrap();
             let BoundaryRunOutcome::Promoted { receipt, .. } = result else {
@@ -5675,6 +5724,113 @@ mod promote_door_tests {
             );
             assert_eq!(vcs.branch_head_reservation("line").unwrap(), None);
         }
+    }
+
+    /// A mainline gate whose answers the test chooses.
+    struct ScriptedGate {
+        refuse: Option<whipplescript_store::vcs::GateRefusal>,
+        stale: Option<String>,
+    }
+
+    impl whipplescript_store::vcs::MainlineGate for ScriptedGate {
+        fn prepare(
+            &mut self,
+            _base_cut: Option<&str>,
+            _proposed_cut: &str,
+            _artifacts: &whipplescript_store::norm_commands::NormArtifactCapture<'_>,
+        ) -> whipplescript_store::StoreResult<whipplescript_store::vcs::GateVerdict> {
+            Ok(match &self.refuse {
+                Some(refusal) => whipplescript_store::vcs::GateVerdict::Refuse(refusal.clone()),
+                None => whipplescript_store::vcs::GateVerdict::Admit,
+            })
+        }
+        fn commit(
+            &mut self,
+            advance: &mut dyn FnMut() -> whipplescript_store::StoreResult<()>,
+        ) -> whipplescript_store::StoreResult<whipplescript_store::vcs::GateCommit> {
+            if let Some(changed) = &self.stale {
+                return Ok(whipplescript_store::vcs::GateCommit::Stale {
+                    changed: changed.clone(),
+                });
+            }
+            advance()?;
+            Ok(whipplescript_store::vcs::GateCommit::Committed)
+        }
+    }
+
+    /// The door hands the gate's refusal back whole and its stale commit as
+    /// a retry, releasing the stream both times with the mainline unmoved;
+    /// the effect renders the refusal as its own failure kind.
+    #[test]
+    fn the_door_returns_the_gates_refusal_whole_and_its_stale_commit_as_a_retry() {
+        let (mut streams, mut vcs) = refusal_fixture();
+        let refusal = whipplescript_store::vcs::GateRefusal {
+            reason: "the proposed result is not supported: custody-authorization (repair)".into(),
+            detail: serde_json::json!({"requirements": {"custody-authorization": ["repair"]}}),
+        };
+        let promote = |gate: &mut ScriptedGate,
+                       streams: &mut ws::WorkstreamStore,
+                       vcs: &mut whipplescript_store::vcs::NativeWorkspaceVcs,
+                       proposed: &str| {
+            run_reserved_boundary_promotion_generic(
+                streams,
+                vcs,
+                &PromoteDoorRequest {
+                    stream_id: "ws",
+                    reservation_id: proposed,
+                    proposed_main: proposed,
+                    at: "t3",
+                    receipt_scope: "workspace",
+                },
+                &mut SingleWriterSerialization,
+                gate,
+            )
+            .unwrap()
+        };
+        let main_head = |vcs: &whipplescript_store::vcs::NativeWorkspaceVcs| {
+            vcs.get_branch("main").unwrap().unwrap().head_cut_id
+        };
+        let mut gate = ScriptedGate {
+            refuse: Some(refusal.clone()),
+            stale: None,
+        };
+        let refused = promote(&mut gate, &mut streams, &mut vcs, "main-2");
+        assert!(matches!(&refused, BoundaryRunOutcome::GateRefused(got) if got == &refusal));
+        assert_eq!(main_head(&vcs).as_deref(), Some("main-1"));
+        let row = streams.get_stream("ws").unwrap().unwrap();
+        assert_eq!(row.status, ws::StreamStatus::Active);
+        assert_eq!(row.reservation_id, None);
+        let CapabilityOutcome::Failed {
+            error_kind,
+            message,
+        } = promote_effect_outcome("ws", &Ok(refused))
+        else {
+            panic!("a gate refusal renders as a failure");
+        };
+        assert_eq!(error_kind, "norm_gate_refused");
+        assert_eq!(message, refusal.reason);
+        let mut gate = ScriptedGate {
+            refuse: None,
+            stale: Some("the norm ledger changed after the admission was prepared".into()),
+        };
+        let stale = promote(&mut gate, &mut streams, &mut vcs, "main-3");
+        let BoundaryRunOutcome::Refused(message) = stale else {
+            panic!("{stale:?}")
+        };
+        assert_eq!(
+            message,
+            "the norm ledger changed after the admission was prepared; the promotion is prepared again on retry"
+        );
+        assert_eq!(main_head(&vcs).as_deref(), Some("main-1"));
+        let mut gate = ScriptedGate {
+            refuse: None,
+            stale: None,
+        };
+        assert!(matches!(
+            promote(&mut gate, &mut streams, &mut vcs, "main-4"),
+            BoundaryRunOutcome::Promoted { .. }
+        ));
+        assert_eq!(main_head(&vcs).as_deref(), Some("main-4"));
     }
 
     #[test]
@@ -5706,6 +5862,7 @@ mod promote_door_tests {
                 receipt_scope: "workspace",
             },
             &mut SingleWriterSerialization,
+            &mut NoNormLedger,
         )
         .unwrap();
         let BoundaryRunOutcome::Refused(message) = result else {
@@ -5822,6 +5979,7 @@ mod promote_door_tests {
                     receipt_scope: "workspace",
                 },
                 &mut serialization,
+                &mut NoNormLedger,
             )
             .unwrap();
             let BoundaryRunOutcome::Promoted { receipt, .. } = result else {
@@ -5985,6 +6143,7 @@ mod promote_door_tests {
                     receipt_scope: "test-workspace",
                 },
                 &mut serialization,
+                &mut NoNormLedger,
             );
             let row = streams
                 .get_stream("ws")
@@ -6069,6 +6228,7 @@ mod promote_door_tests {
                         receipt_scope: "test-workspace",
                     },
                     &mut SingleWriterSerialization,
+                    &mut NoNormLedger,
                 );
                 assert!(
                     retry.is_err(),
@@ -6138,6 +6298,7 @@ mod promote_door_tests {
             &mut vcs,
             &request,
             &mut SingleWriterSerialization,
+            &mut NoNormLedger,
         )
         .expect_err("receipt write fails after CAS");
         assert!(error.contains("ref receipt record failed"), "{error}");
@@ -6177,6 +6338,7 @@ mod promote_door_tests {
                 receipt_scope: "workspace",
             },
             &mut SingleWriterSerialization,
+            &mut NoNormLedger,
         )
         .expect("later promotion");
         assert!(matches!(second, BoundaryRunOutcome::Promoted { .. }));
@@ -6192,6 +6354,7 @@ mod promote_door_tests {
             &mut vcs,
             &request,
             &mut SingleWriterSerialization,
+            &mut NoNormLedger,
         )
         .expect("recover earlier promotion") else {
             panic!("earlier landed promotion must close forward");
@@ -6226,6 +6389,7 @@ mod promote_door_tests {
             &mut vcs,
             &request,
             &mut SingleWriterSerialization,
+            &mut NoNormLedger,
         )
         .expect("replay receipt");
         assert!(

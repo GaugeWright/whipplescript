@@ -56,7 +56,7 @@ crates/whipplescript-cli/src/main.rs|apply_undo_selection|2
 crates/whipplescript-store/src/vcs.rs|transport_selection|4
 crates/whipplescript-kernel/src/effect_handlers.rs|transport_selection|1
 crates/whipplescript-cli/src/main.rs|transport_selection|1
-crates/whipplescript-store/src/vcs.rs|promote_line_exact|7
+crates/whipplescript-store/src/vcs.rs|promote_line_exact|9
 crates/whipplescript-kernel/src/effect_handlers.rs|promote_line_exact|2
 crates/whipplescript-store/src/vcs.rs|boundary_ref_evidence|6
 crates/whipplescript-kernel/src/effect_handlers.rs|boundary_ref_evidence|3
@@ -71,7 +71,7 @@ crates/whipplescript-kernel/src/effect_handlers.rs|release_boundary|3
 crates/whipplescript-store/src/workstreams.rs|acknowledge_boundary_release|7
 crates/whipplescript-kernel/src/effect_handlers.rs|acknowledge_boundary_release|3
 crates/whipplescript-host-do/src/do_workstreams.rs|acknowledge_boundary_release|4
-crates/whipplescript-store/src/vcs.rs|reserve_branch_head|6
+crates/whipplescript-store/src/vcs.rs|reserve_branch_head|7
 crates/whipplescript-kernel/src/effect_handlers.rs|reserve_branch_head|5
 crates/whipplescript-kernel/src/effect_handlers.rs|release_branch_head_reservation|2
 crates/whipplescript-cli/src/main_tests/tests/cli_surface.rs|reserve_boundary|2
@@ -111,16 +111,16 @@ DISPATCH=(
 DISPATCH_PINNED="\
 crates/whipplescript-cli/src/main.rs|run_reserved_boundary_promotion_generic|1
 crates/whipplescript-host-do/src/do_workstreams.rs|run_reserved_boundary_promotion_generic|1
-crates/whipplescript-kernel/src/effect_handlers.rs|run_reserved_boundary_promotion_generic|11
+crates/whipplescript-kernel/src/effect_handlers.rs|run_reserved_boundary_promotion_generic|12
 crates/whipplescript-kernel/tests/mtarget_receipt_upgrade.rs|run_reserved_boundary_promotion_generic|1
-crates/whipplescript-kernel/src/effect_handlers.rs|release_reserved_boundary_generic|9
+crates/whipplescript-kernel/src/effect_handlers.rs|release_reserved_boundary_generic|11
 crates/whipplescript-host-do/src/do_workstreams.rs|release_reserved_boundary_generic|6
 crates/whipplescript-cli/src/main.rs|run_selective_verb_generic|1
 crates/whipplescript-host-do/src/do_workstreams.rs|run_selective_verb_generic|1
 crates/whipplescript-kernel/src/effect_handlers.rs|run_selective_verb_generic|7
 crates/whipplescript-cli/src/main.rs|promote_effect_outcome|1
 crates/whipplescript-host-do/src/do_workstreams.rs|promote_effect_outcome|1
-crates/whipplescript-kernel/src/effect_handlers.rs|promote_effect_outcome|5
+crates/whipplescript-kernel/src/effect_handlers.rs|promote_effect_outcome|6
 crates/whipplescript-cli/src/main.rs|selective_effect_outcome|1
 crates/whipplescript-host-do/src/do_workstreams.rs|selective_effect_outcome|1
 crates/whipplescript-kernel/src/effect_handlers.rs|selective_effect_outcome|1"

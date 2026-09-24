@@ -5130,6 +5130,32 @@ fn do_insert_program_version<Sql: DoSql>(
         .ok_or_else(|| sql_err("program_version row missing after insert".to_string()))
 }
 
+/// The hosted ledger as the mainline gate needs it (norm-plane §5). The
+/// workspace object is single-writer: a gate's commit runs inside the one
+/// request that holds the object, against the one database both the ledger
+/// and the branches live in, so no ledger write can interleave with it and
+/// the exclusion is the request itself.
+impl<Sql: DoSql> whipplescript_kernel::norm_admission::AdmissionLedger for DoSqliteStore<Sql> {
+    fn bootstrapped(&self) -> StoreResult<bool> {
+        Ok(self.norm_checkpoint()?.is_some())
+    }
+    fn capture(
+        &self,
+        verifier: &dyn whipplescript_store::norm::NormVerifier,
+    ) -> StoreResult<(
+        whipplescript_store::norm::NormView,
+        Vec<whipplescript_store::items::TrackerEvent>,
+    )> {
+        Ok((self.norm_view(verifier)?, self.export_events()?))
+    }
+    fn exclusively(
+        &self,
+        f: &mut dyn FnMut() -> StoreResult<whipplescript_store::vcs::GateCommit>,
+    ) -> StoreResult<whipplescript_store::vcs::GateCommit> {
+        f()
+    }
+}
+
 impl<Sql: DoSql> whipplescript_store::norm_commands::NormCommandStore for DoSqliteStore<Sql> {
     fn norm_state(
         &self,
@@ -10819,6 +10845,13 @@ pub mod test_support {
             Self {
                 conn: std::rc::Rc::new(Connection::open_in_memory().expect("sqlite")),
             }
+        }
+
+        /// A handle over the store's full schema, the norm ledger's included,
+        /// for a fixture outside this crate whose doors read the ledger (the
+        /// mainline gate) the way a workspace object always can.
+        pub fn with_store_schema() -> Self {
+            store().sql
         }
 
         /// The deployed Worker schema, for shared runtime conformance fixtures.
@@ -18950,6 +18983,100 @@ mod norm_admission_tests {
                 "status":{"values":["proposed","accepted"],"initial":"proposed","transitions":[{"from":"proposed","to":"accepted","admission":{"requires":"authority","scope":"accept"}}]}
             })).expect("fixture"),creation:AdmissionPredicate::Public {},
         }],owner_scopes:vec!["accept".into()]}
+    }
+
+    /// The hosted promote door runs the mainline gate over the object's own
+    /// ledger (norm-plane §5). Until the door receives the deployment's
+    /// planning inputs, a governed workspace is refused with the reason named
+    /// and the mainline unmoved, never promoted unevaluated.
+    #[test]
+    fn the_hosted_mainline_gate_refuses_a_governed_workspace_it_cannot_evaluate() {
+        use std::rc::Rc;
+        use whipplescript_kernel::effect_handlers::{CapabilityOutcome, CapabilityProvider};
+        use whipplescript_store::branches::{Branches, MAINLINE_BRANCH_ID};
+        use whipplescript_store::workstreams::Workstreams;
+        let owner_key = SigningKey::from_slice(&[1; 32]).unwrap();
+        let owner = actor("owner", &owner_key);
+        let owner_root = crate::governance::GaugeDeskGovernanceRoot::new("owner", &owner.key_id);
+        let verifier = NormGovernanceVerifier::new(
+            vec![NormPrincipalBinding {
+                actor: owner.clone(),
+                verifier: &owner_root,
+            }],
+            BTreeSet::from([("owner".into(), "owner".into())]),
+        )
+        .unwrap();
+        let sql = Rc::new(super::test_support::RusqliteDoSql::from_store_schema());
+        let mut streams = crate::do_workstreams::DoWorkstreams::new(Rc::clone(&sql)).unwrap();
+        let mut branches = crate::do_branches::DoBranches::new(Rc::clone(&sql)).unwrap();
+        branches.ensure_mainline("t0").unwrap();
+        let mut vcs = crate::do_branches::compose_vcs(&sql).unwrap();
+        vcs.init("t0").unwrap();
+        vcs.write(MAINLINE_BRANCH_ID, "base.md", Some("base"), "cut_0", "t1")
+            .unwrap();
+        vcs.create_branch("line-triage", None, MAINLINE_BRANCH_ID, "t2")
+            .unwrap();
+        streams
+            .create_stream("triage", None, "line-triage", "t2", None)
+            .unwrap();
+        vcs.write("line-triage", "feature.md", Some("work"), "cut_1", "t3")
+            .unwrap();
+        let mut ledger = DoSqliteStore::new(Rc::clone(&sql));
+        ledger
+            .append_norm_event(
+                &signed(
+                    owner.clone(),
+                    &owner_key,
+                    "genesis",
+                    NormAct::Bootstrap {
+                        creator: "owner".into(),
+                        charter: charter(),
+                    },
+                ),
+                &verifier,
+            )
+            .unwrap();
+        let provider = crate::do_workstreams::DoVcsPromoteCapabilityProvider {
+            sql: Rc::clone(&sql),
+        };
+        let outcome = provider.produce(
+            &whipplescript_store::ClaimableEffect {
+                attempt_admission_event_id: None,
+                effect_id: "promote-1".into(),
+                kind: "capability.call".into(),
+                target: Some("vcs.promote".into()),
+                profile: None,
+                input_json: serde_json::json!({"stream": "triage"}).to_string(),
+                required_capabilities_json: "[]".into(),
+                declared_profiles_json: "[]".into(),
+            },
+            &whipplescript_kernel::effect_config::EffectConfig::default(),
+        );
+        let CapabilityOutcome::Failed {
+            error_kind,
+            message,
+        } = outcome
+        else {
+            panic!("a governed hosted workspace promoted unevaluated");
+        };
+        assert_eq!(error_kind, "norm_gate_refused");
+        assert_eq!(
+            message,
+            format!(
+                "the mainline's gated requirements cannot be evaluated: {}",
+                crate::do_workstreams::HOSTED_ADMISSION_UNCONFIGURED
+            )
+        );
+        assert_eq!(
+            branches
+                .get_branch(MAINLINE_BRANCH_ID)
+                .unwrap()
+                .unwrap()
+                .head_cut_id
+                .as_deref(),
+            Some("cut_0"),
+            "the mainline did not move"
+        );
     }
 
     #[test]

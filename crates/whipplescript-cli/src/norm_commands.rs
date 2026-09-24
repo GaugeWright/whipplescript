@@ -755,6 +755,96 @@ fn debug_error(error: whipplescript_store::StoreError) -> String {
     format!("{error:?}")
 }
 
+/// The mainline gate on this host (norm-plane §5): the native ledger, and the
+/// same trust, planning configuration, managed runtime and runtime store `norm
+/// impact` evaluates with. A workspace with no norm ledger is gated by
+/// nothing; one with a ledger this host cannot evaluate refuses, naming the
+/// missing configuration.
+pub(crate) fn with_mainline_admission<T>(
+    runtime_path: &std::path::Path,
+    f: impl FnOnce(&mut dyn whipplescript_store::vcs::MainlineGate) -> T,
+) -> Result<T, String> {
+    use whipplescript_kernel::norm_admission::{
+        AdmissionDoor, AdmissionHost, NormMainlineAdmission,
+    };
+    use whipplescript_kernel::norm_execution_policy::ProtectedPythonPolicy;
+    use whipplescript_kernel::norm_planning::PlanningConfiguration;
+    use whipplescript_kernel::norm_runner::PythonRuntime;
+    // A workspace that never opened a ledger has none to consult, and asking
+    // must not create one.
+    let path = super::items_store_path();
+    let ledger = if path.exists() {
+        WorkItemStore::open(path)
+    } else {
+        WorkItemStore::open_in_memory()
+    }
+    .map_err(debug_error)?;
+    let document = trust_document();
+    let transport = document
+        .as_ref()
+        .map_err(Clone::clone)
+        .and_then(|document| custody_transport_for(document));
+    let trust = document.and_then(|document| {
+        let transport = transport.as_ref().map_err(Clone::clone)?;
+        NormTrust::from_document(document, transport.as_deref())
+    });
+    let verifier = trust
+        .as_ref()
+        .map_err(Clone::clone)
+        .and_then(|trust| trust.verifier());
+    let configuration = std::env::var("WHIPPLESCRIPT_NORM_PLANNING")
+        .map_err(|_| "host must configure WHIPPLESCRIPT_NORM_PLANNING".to_owned())
+        .and_then(|configured| PlanningConfiguration::parse(&configured));
+    let managed = super::norm_exec_managed::configuration().map_err(debug_error);
+    let managed = managed
+        .as_ref()
+        .map_err(Clone::clone)
+        .and_then(|host| super::norm_exec_managed::require(host.as_ref()).map_err(debug_error));
+    let time_basis = format!(
+        "native-admission/{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_nanos())
+            .unwrap_or_default()
+    );
+    let policy = managed.as_ref().map_err(Clone::clone).and_then(|host| {
+        ProtectedPythonPolicy::new(
+            &serde_json::to_string(&host.installed.runtime).map_err(|error| error.to_string())?,
+            &time_basis,
+        )
+    });
+    // Opening the runtime store creates it; an ungoverned workspace's
+    // promotion must touch nothing it does not already have.
+    let governed = ledger.norm_checkpoint().map_err(debug_error)?.is_some();
+    let runtime = if governed {
+        super::open_store(runtime_path)
+    } else {
+        whipplescript_store::SqliteStore::open_in_memory().map_err(debug_error)
+    };
+    let verify = |selected: &PythonRuntime| {
+        managed
+            .as_ref()
+            .map_err(Clone::clone)
+            .and_then(|host| host.installed.validate_for(selected).map_err(debug_error))
+    };
+    let host = (|| {
+        Ok(AdmissionHost {
+            verifier: verifier.as_ref().map_err(Clone::clone)?,
+            configuration: configuration.as_ref().map_err(Clone::clone)?,
+            runtime: runtime.as_ref().map_err(Clone::clone)?,
+            policy: policy.as_ref().map_err(Clone::clone)?,
+            verify_runtime: &verify,
+        })
+    })();
+    let mut gate = NormMainlineAdmission::new(
+        &ledger,
+        host,
+        AdmissionDoor::Promote,
+        whipplescript_store::branches::MAINLINE_BRANCH_ID,
+    );
+    Ok(f(&mut gate))
+}
+
 #[cfg(test)]
 mod query_tests {
     use super::{check_binding_names, KeyVersion};

@@ -1,0 +1,17 @@
+load ../admission-commit.maude
+--- The attempt admits when nothing interleaves.
+search [1] in ADMISSION-COMMIT : { attempt(prepared,old,old) ledger(old,false) head(old) writer } =>* { attempt(admitted,old,old) head(new) CFG:Cfg } .
+--- Evidence that lands before the exclusion is taken refuses the stale certificate and moves nothing.
+search [1] in ADMISSION-COMMIT : { attempt(prepared,old,old) ledger(old,false) head(old) writer } =>* { attempt(refused,old,old) head(old) ledger(new,false) CFG:Cfg } .
+--- The writer is delayed, never lost: its evidence lands after the admission.
+search [1] in ADMISSION-COMMIT : { attempt(prepared,old,old) ledger(old,false) head(old) writer } =>* { attempt(admitted,old,old) ledger(new,false) CFG:Cfg } .
+--- A base head that moved refuses too.
+search [1] in ADMISSION-COMMIT : { attempt(prepared,old,old) ledger(old,false) head(new) } =>* { attempt(refused,old,old) head(new) CFG:Cfg } .
+--- Held across the compare-and-swap, no evidence lands between check and move.
+search in ADMISSION-COMMIT : { attempt(prepared,old,old) ledger(old,false) head(old) writer } =>* { raced CFG:Cfg } .
+search [1] in ADMISSION-COMMIT-WEAK-EARLY-RELEASE : { attempt(prepared,old,old) ledger(old,false) head(old) writer } =>* { raced CFG:Cfg } .
+search in ADMISSION-COMMIT : { attempt(prepared,old,old) ledger(old,false) head(old) writer } =>* { raced CFG:Cfg } .
+search [1] in ADMISSION-COMMIT-WEAK-UNLOCKED-CHECK : { attempt(prepared,old,old) ledger(old,false) head(old) writer } =>* { raced CFG:Cfg } .
+--- A refusal never moves the ref.
+search in ADMISSION-COMMIT : { attempt(prepared,old,old) ledger(old,false) head(old) writer } =>* { attempt(refused,old,old) head(new) CFG:Cfg } .
+quit

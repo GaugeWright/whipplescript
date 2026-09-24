@@ -101,6 +101,7 @@ fn main() {
             Some("main-1"),
             "main-2",
             "t5",
+            &mut NoNormLedger,
         )
         .expect("synthetic receipt fixture operation succeeds");
     let BoundaryPromotionOutcome::Promoted {
@@ -201,4 +202,26 @@ fn main() {
         "{}",
         serde_json::to_string(&reports).expect("synthetic receipt fixture operation succeeds")
     );
+}
+
+/// The fixture workspace has no norm ledger, so nothing gates its mainline:
+/// the gate admits and runs the ref's compare-and-swap as asked.
+struct NoNormLedger;
+
+impl whipplescript_store::vcs::MainlineGate for NoNormLedger {
+    fn prepare(
+        &mut self,
+        _base_cut: Option<&str>,
+        _proposed_cut: &str,
+        _artifacts: &whipplescript_store::norm_commands::NormArtifactCapture<'_>,
+    ) -> whipplescript_store::StoreResult<whipplescript_store::vcs::GateVerdict> {
+        Ok(whipplescript_store::vcs::GateVerdict::Admit)
+    }
+    fn commit(
+        &mut self,
+        advance: &mut dyn FnMut() -> whipplescript_store::StoreResult<()>,
+    ) -> whipplescript_store::StoreResult<whipplescript_store::vcs::GateCommit> {
+        advance()?;
+        Ok(whipplescript_store::vcs::GateCommit::Committed)
+    }
 }

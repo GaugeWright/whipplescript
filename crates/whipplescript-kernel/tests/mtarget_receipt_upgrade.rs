@@ -34,6 +34,7 @@ fn old_post_cas_store_closes_forward_without_another_main_write() {
                 receipt_scope: "workspace",
             },
             &mut SingleWriterSerialization,
+            &mut NeverConsulted,
         )
         .expect("legacy post-CAS fixture closes without a second Main write");
         let BoundaryRunOutcome::Promoted { receipt, .. } = result else {
@@ -69,5 +70,26 @@ fn old_post_cas_store_closes_forward_without_another_main_write() {
             .get_cut("unused-new-cut")
             .expect("legacy post-CAS fixture closes without a second Main write")
             .is_none());
+    }
+}
+
+/// The ref already moved before this fixture was recorded: closing it forward
+/// judges nothing and moves nothing, so a gate consulted here is a defect.
+struct NeverConsulted;
+
+impl whipplescript_store::vcs::MainlineGate for NeverConsulted {
+    fn prepare(
+        &mut self,
+        _base_cut: Option<&str>,
+        _proposed_cut: &str,
+        _artifacts: &whipplescript_store::norm_commands::NormArtifactCapture<'_>,
+    ) -> whipplescript_store::StoreResult<whipplescript_store::vcs::GateVerdict> {
+        panic!("a promotion closing forward after its CAS consulted the mainline gate")
+    }
+    fn commit(
+        &mut self,
+        _advance: &mut dyn FnMut() -> whipplescript_store::StoreResult<()>,
+    ) -> whipplescript_store::StoreResult<whipplescript_store::vcs::GateCommit> {
+        panic!("a promotion closing forward after its CAS committed through the mainline gate")
     }
 }
