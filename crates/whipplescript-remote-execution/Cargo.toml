@@ -25,7 +25,7 @@ base64 = "0.23"
 # wire contract need none of it, which is how the `whip executor` sidecar
 # mounts the action route without the endpoint's runtime (`default-features
 # = false`).
-whipplescript-store = { version = "0.5.6", path = "../whipplescript-store", features = ["native"], optional = true }
+whipplescript-store = { version = "0.6.0", path = "../whipplescript-store", features = ["native"], optional = true }
 # The store and the action cache persist in one SQLite file beside the build
 # root, at the version the rest of the workspace uses.
 rusqlite = { version = "0.40.1", features = ["bundled"], optional = true }

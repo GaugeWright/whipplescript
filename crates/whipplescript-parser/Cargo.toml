@@ -9,8 +9,8 @@ repository.workspace = true
 readme.workspace = true
 
 [dependencies]
-whipplescript-core = { version = "0.5.6", path = "../whipplescript-core" }
-whipplescript-custody = { version = "0.5.6", path = "../whipplescript-custody" }
+whipplescript-core = { version = "0.6.0", path = "../whipplescript-core" }
+whipplescript-custody = { version = "0.6.0", path = "../whipplescript-custody" }
 # Collision-resistant source/IR identity hashes (pure-Rust, wasm-safe).
 sha2 = "0.11"
 # Artifact traits only; the runtime owns JSON decoding and validation.
@@ -27,7 +27,7 @@ serde_json = "1"
 # the build script reads it from there rather than re-declaring it. `core`
 # depends on nothing but serde, so this costs a host-side compile of a leaf
 # crate the parser already links.
-whipplescript-core = { version = "0.5.6", path = "../whipplescript-core" }
+whipplescript-core = { version = "0.6.0", path = "../whipplescript-core" }
 serde_json = "1"
 
 [lints]

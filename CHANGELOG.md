@@ -5,7 +5,30 @@ follow [Semantic Versioning](https://semver.org). Dates are UTC.
 
 ## [Unreleased]
 
+## [0.6.0] — 2026-09-24
+
+A minor release rather than a patch, because it breaks source that 0.5.6
+accepted: see **Breaking** below, and `mint`'s `scope` and `ttl`, which are
+gone. It is also the first release built on GaugeWright's own fleet rather than
+on GitHub Actions. The archives, installers and formula are the same set as
+before; what changes is how a release is verified. A GitHub build attestation
+is bound to an Actions run, so this release carries an in-toto provenance
+statement over every file's SHA-256 instead, signed with the key published in
+[`docs/release-provenance.pub`](docs/release-provenance.pub), and an SPDX SBOM.
+
 ### Added
+
+- **`whip issue cancel <id> [--reason R]` and `whip issue reopen <id> [--note N]`.**
+  `cancel` withdraws an open issue nobody will do and releases any claim on it
+  in the same transaction, with `finish`'s holder guard. A canceled issue is not
+  a closed one: nothing waiting on the issue closing is woken by it. `reopen`
+  returns a closed or canceled issue to open, and so to ready unless something
+  blocks it. Both append the `issue.canceled` and `issue.reopened` events every
+  store already folded, so a store written by 0.5.6 needs nothing.
+
+- **`whip issue set <id> status` refuses a status outside open, closed,
+  canceled and archived**, as the compiler already did. `cancelled` used to be
+  stored silently, as a status no rule could match.
 
 - **`mint credential from <parent> { … }`** (DR-0053 §5, as amended
   2026-08-27) — spend a credential at an issuer's token endpoint for a scoped
