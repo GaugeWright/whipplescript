@@ -4,7 +4,8 @@
 //! one JSON line with the bound address and each principal's handle token,
 //! and runs until its standard input closes or it is told to stop. With
 //! `--state <file>` its store and action cache are that SQLite database, so
-//! the next process over the same file serves what this one stored.
+//! the next process over the same file serves what this one stored; with
+//! `--content <file>` as well, its bytes are the workspace's content store.
 
 use std::sync::Arc;
 
@@ -12,13 +13,14 @@ use whipplescript_remote_execution::endpoint::Endpoint;
 use whipplescript_remote_execution::runner::LocalRunner;
 use whipplescript_remote_execution::store::Principal;
 
-const USAGE: &str = "usage: whip-remote-execution --listen <addr> --scratch <dir> [--state <file>] [--principal <name>[=<label>,...]]... [--daemon <name>]";
+const USAGE: &str = "usage: whip-remote-execution --listen <addr> --scratch <dir> [--state <file> [--content <file>]] [--principal <name>[=<label>,...]]... [--daemon <name>]";
 
 #[derive(Debug)]
 struct Arguments {
     listen: String,
     scratch: String,
     state: Option<String>,
+    content: Option<String>,
     principals: Vec<Principal>,
     daemon: Option<String>,
 }
@@ -27,6 +29,7 @@ fn parse(args: &[String]) -> Result<Arguments, String> {
     let mut listen = None;
     let mut scratch = None;
     let mut state = None;
+    let mut content = None;
     let mut principals = Vec::new();
     let mut daemon = None;
     let mut it = args.iter();
@@ -36,6 +39,7 @@ fn parse(args: &[String]) -> Result<Arguments, String> {
             "--listen" => listen = value(),
             "--scratch" => scratch = value(),
             "--state" => state = value(),
+            "--content" => content = value(),
             "--daemon" => daemon = value(),
             "--principal" => {
                 let spec = value().ok_or_else(|| format!("--principal needs a value\n{USAGE}"))?;
@@ -60,10 +64,16 @@ fn parse(args: &[String]) -> Result<Arguments, String> {
         }
         it.next();
     }
+    if content.is_some() && state.is_none() {
+        return Err(format!(
+            "--content needs --state: the uses that scope shared bytes must outlive the process as the bytes do\n{USAGE}"
+        ));
+    }
     Ok(Arguments {
         listen: listen.ok_or_else(|| format!("--listen is required\n{USAGE}"))?,
         scratch: scratch.ok_or_else(|| format!("--scratch is required\n{USAGE}"))?,
         state,
+        content,
         principals,
         daemon,
     })
@@ -73,9 +83,14 @@ async fn run(args: Arguments) -> Result<(), String> {
     std::fs::create_dir_all(&args.scratch)
         .map_err(|error| format!("cannot create {}: {error}", args.scratch))?;
     let runner = Arc::new(LocalRunner::new(&args.scratch));
-    let mut endpoint = match &args.state {
-        Some(state) => Endpoint::open(runner, std::path::Path::new(state))?,
-        None => Endpoint::new(runner),
+    let mut endpoint = match (&args.state, &args.content) {
+        (Some(state), Some(content)) => Endpoint::open_sharing(
+            runner,
+            std::path::Path::new(state),
+            std::path::Path::new(content),
+        )?,
+        (Some(state), None) => Endpoint::open(runner, std::path::Path::new(state))?,
+        (None, _) => Endpoint::new(runner),
     };
     let mut handles = serde_json::Map::new();
     let mut daemon_handle = None;
@@ -95,7 +110,7 @@ async fn run(args: Arguments) -> Result<(), String> {
     let (listener, bound) = whipplescript_remote_execution::server::bind(&args.listen).await?;
     println!(
         "{}",
-        serde_json::json!({"address": bound.to_string(), "executor": endpoint.executor_name(), "handles": handles, "state": args.state})
+        serde_json::json!({"address": bound.to_string(), "executor": endpoint.executor_name(), "handles": handles, "state": args.state, "content": args.content})
     );
     let endpoint = Arc::new(endpoint);
     let stdin_closed = async {
@@ -153,6 +168,8 @@ mod tests {
             "/tmp/s",
             "--state",
             "/tmp/s/endpoint.sqlite",
+            "--content",
+            "/tmp/s/vcs-content.sqlite",
             "--principal",
             "owner=protected,internal",
             "--principal",
@@ -163,6 +180,17 @@ mod tests {
         .unwrap();
         assert_eq!(parsed.listen, "127.0.0.1:0");
         assert_eq!(parsed.state.as_deref(), Some("/tmp/s/endpoint.sqlite"));
+        assert_eq!(parsed.content.as_deref(), Some("/tmp/s/vcs-content.sqlite"));
+        assert!(parse(&owned(&[
+            "--listen",
+            "x",
+            "--scratch",
+            "s",
+            "--content",
+            "c"
+        ]))
+        .unwrap_err()
+        .starts_with("--content needs --state: "));
         assert_eq!(parsed.principals.len(), 2);
         assert_eq!(parsed.principals[0].labels.len(), 2);
         assert!(parsed.principals[1].labels.is_empty());

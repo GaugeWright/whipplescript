@@ -157,7 +157,7 @@ impl re::action_cache_server::ActionCache for Services {
     ) -> Result<Response<re::ActionResult>, Status> {
         let view = self.view(&request)?;
         let action = digest_of(request.get_ref().action_digest.as_ref(), "action")?;
-        match self.endpoint.cache.lookup(&view, &action) {
+        match self.endpoint.cached(&view, &action) {
             Some(entry) => Ok(Response::new(entry.result)),
             None => Err(Status::not_found(format!(
                 "no result for action {action} under this view"

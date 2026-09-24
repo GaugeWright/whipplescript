@@ -71,9 +71,36 @@ impl Endpoint {
         Ok(Self::over(runner, Db::open(state)?))
     }
 
+    /// An endpoint whose uses and cache are the database at `state` and whose
+    /// bytes are the workspace's content store at `content` (§14.3): one copy
+    /// of every blob, under the workspace's erasure.
+    pub fn open_sharing(
+        runner: Arc<dyn ActionRunner>,
+        state: &std::path::Path,
+        content: &std::path::Path,
+    ) -> Result<Self, String> {
+        let db = Db::open(state)?;
+        let shared =
+            whipplescript_store::content::ContentStore::open(content).map_err(|error| {
+                format!(
+                    "cannot open the workspace's content store {}: {error:?}",
+                    content.display()
+                )
+            })?;
+        Ok(Self::with_store(
+            runner,
+            Store::sharing(db.clone(), shared)?,
+            db,
+        ))
+    }
+
     fn over(runner: Arc<dyn ActionRunner>, db: Db) -> Self {
+        Self::with_store(runner, Store::over(db.clone()), db)
+    }
+
+    fn with_store(runner: Arc<dyn ActionRunner>, store: Store, db: Db) -> Self {
         Self {
-            store: Store::over(db.clone()),
+            store,
             cache: ActionCache::over(db),
             runner,
             daemon: None,
@@ -141,7 +168,7 @@ impl Endpoint {
         skip_cache_lookup: bool,
     ) -> Result<Executed, ExecuteRefusal> {
         if !skip_cache_lookup {
-            if let Some(entry) = self.cache.lookup(view, action_digest) {
+            if let Some(entry) = self.cached(view, action_digest) {
                 return Ok(Executed {
                     result: entry.result,
                     cached: true,
@@ -345,6 +372,46 @@ impl Endpoint {
             result,
             cached: false,
         })
+    }
+
+    /// The cached result a view may be served: one the cache gives it whose
+    /// outputs, logs and output trees it can still read. A result whose
+    /// bytes are gone — erased by the workspace, or never uploaded by the
+    /// client that claimed it — is not served, since a hit the caller cannot
+    /// download is a failure it would learn of later and worse.
+    pub fn cached(&self, view: &View, action: &Digest) -> Option<Entry> {
+        let entry = self.cache.lookup(view, action)?;
+        let result = &entry.result;
+        let mut referenced = Vec::new();
+        let mut push = |digest: Option<&re::Digest>| -> Option<()> {
+            if let Some(digest) = digest {
+                referenced.push(Digest::from_proto(digest).ok()?);
+            }
+            Some(())
+        };
+        for file in &result.output_files {
+            push(file.digest.as_ref())?;
+        }
+        push(result.stdout_digest.as_ref())?;
+        push(result.stderr_digest.as_ref())?;
+        let mut trees = Vec::new();
+        for directory in &result.output_directories {
+            push(directory.tree_digest.as_ref())?;
+            let tree = Digest::from_proto(directory.tree_digest.as_ref()?).ok()?;
+            trees.push(tree);
+        }
+        for tree in &trees {
+            let tree = re::Tree::decode(self.store.get(view, tree)?.as_slice()).ok()?;
+            for directory in tree.root.iter().chain(tree.children.iter()) {
+                for file in &directory.files {
+                    push(file.digest.as_ref())?;
+                }
+            }
+        }
+        self.store
+            .missing(view, referenced.iter())
+            .is_empty()
+            .then_some(entry)
     }
 
     /// Store an output directory as a `Tree` under the view, returning the
@@ -661,5 +728,79 @@ mod tests {
             Some(&b"kept\n"[..])
         );
         assert_eq!(endpoint.cache.counts(), (1, 0));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_result_whose_output_the_workspace_erased_is_not_served_and_cannot_be_remade() {
+        use whipplescript_store::content::{ContentBlobs, ContentStore};
+        let scratch = tempfile::tempdir().expect("scratch");
+        let state = scratch.path().join("endpoint.sqlite");
+        let content = scratch.path().join("vcs-content.sqlite");
+        let endpoint = Endpoint::open_sharing(
+            Arc::new(LocalRunner::new(scratch.path().join("actions"))),
+            &state,
+            &content,
+        )
+        .expect("the state and the content store open");
+        let (_, view) = endpoint
+            .admit(Principal {
+                name: "owner".into(),
+                labels: Labels::new(),
+            })
+            .expect("admitted");
+        let put = |bytes: Vec<u8>| endpoint.store.put(&view, &bytes, &Labels::new()).unwrap();
+        let command = put(re::Command {
+            arguments: vec!["sh".into(), "-c".into(), "echo derived > out.txt".into()],
+            output_paths: vec!["out.txt".into()],
+            ..Default::default()
+        }
+        .encode_to_vec());
+        let root = put(re::Directory::default().encode_to_vec());
+        let action = put(re::Action {
+            command_digest: Some(command.to_proto()),
+            input_root_digest: Some(root.to_proto()),
+            ..Default::default()
+        }
+        .encode_to_vec());
+        let executed = endpoint.execute(&view, &action, false).await.expect("ran");
+        let output = Digest::from_proto(
+            executed.result.output_files[0]
+                .digest
+                .as_ref()
+                .expect("an output digest"),
+        )
+        .expect("a digest");
+        // The output is the workspace's bytes, under the workspace's id.
+        let workspace = ContentStore::open(&content).expect("a second connection");
+        assert_eq!(
+            workspace.get(&output.hash[..32]).unwrap().as_deref(),
+            Some(&b"derived\n"[..])
+        );
+        assert!(endpoint.cached(&view, &action).is_some());
+        workspace.erase(&output.hash[..32], "t1").expect("erased");
+        assert_eq!(endpoint.cached(&view, &action), None);
+        assert!(
+            endpoint.evidence(&action).is_some(),
+            "the record of the run stays"
+        );
+        assert_eq!(
+            endpoint.execute(&view, &action, false).await.unwrap_err(),
+            ExecuteRefusal::Failed(format!(
+                "cannot write blob {output} to the workspace's content store: derived content identity was erased"
+            ))
+        );
+        let not_a_store = scratch.path().join("notes.txt");
+        std::fs::write(&not_a_store, vec![b'x'; 4096]).expect("the fixture's own step");
+        assert!(Endpoint::open_sharing(
+            Arc::new(LocalRunner::new(scratch.path().join("actions"))),
+            &scratch.path().join("other.sqlite"),
+            &not_a_store,
+        )
+        .err()
+        .expect("refused")
+        .starts_with(&format!(
+            "cannot open the workspace's content store {}: ",
+            not_a_store.display()
+        )));
     }
 }

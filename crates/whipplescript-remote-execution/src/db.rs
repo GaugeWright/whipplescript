@@ -17,7 +17,11 @@ use rusqlite::Connection;
 use crate::store::Labels;
 
 /// The schema this endpoint reads and writes, as `PRAGMA user_version`.
-pub const SCHEMA_VERSION: i64 = 1;
+///
+/// 2: a use no longer references a row of `blobs`, because a shared blob's
+/// bytes are the workspace's and have no row here. A file at 1 is rebuilt
+/// on open; a file at 2 is refused by an endpoint that reads 1.
+pub const SCHEMA_VERSION: i64 = 2;
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS blobs (
@@ -30,7 +34,7 @@ CREATE TABLE IF NOT EXISTS principals (
 );
 CREATE TABLE IF NOT EXISTS uses (
     principal TEXT NOT NULL,
-    hash TEXT NOT NULL REFERENCES blobs(hash),
+    hash TEXT NOT NULL,
     labels TEXT NOT NULL,
     PRIMARY KEY (principal, hash)
 );
@@ -88,6 +92,23 @@ impl Db {
             .map_err(Opening::Sqlite)?;
         if version > SCHEMA_VERSION {
             return Err(Opening::Newer(version));
+        }
+        if version == 1 {
+            connection
+                .execute_batch(
+                    "BEGIN;
+                     CREATE TABLE uses_v2 (
+                         principal TEXT NOT NULL,
+                         hash TEXT NOT NULL,
+                         labels TEXT NOT NULL,
+                         PRIMARY KEY (principal, hash)
+                     );
+                     INSERT INTO uses_v2 SELECT principal, hash, labels FROM uses;
+                     DROP TABLE uses;
+                     ALTER TABLE uses_v2 RENAME TO uses;
+                     COMMIT;",
+                )
+                .map_err(Opening::Sqlite)?;
         }
         connection
             .execute_batch(SCHEMA)
@@ -152,10 +173,40 @@ mod tests {
         assert_eq!(
             Db::open(&path).err(),
             Some(format!(
-                "{} was written by a newer endpoint (schema 99); this one reads schema 1",
+                "{} was written by a newer endpoint (schema 99); this one reads schema 2",
                 path.display()
             ))
         );
+        // A file the previous schema wrote is rebuilt, its uses kept and no
+        // longer tied to a row of `blobs`.
+        let old = dir.path().join("v1.sqlite");
+        Connection::open(&old)
+            .and_then(|c| {
+                c.execute_batch(
+                    "CREATE TABLE blobs (hash TEXT PRIMARY KEY, bytes BLOB NOT NULL);
+                     CREATE TABLE uses (principal TEXT NOT NULL,
+                         hash TEXT NOT NULL REFERENCES blobs(hash),
+                         labels TEXT NOT NULL, PRIMARY KEY (principal, hash));
+                     INSERT INTO blobs VALUES ('h', x'00');
+                     INSERT INTO uses VALUES ('owner', 'h', '[]');
+                     PRAGMA user_version = 1;",
+                )
+            })
+            .expect("the fixture's own step");
+        let migrated = Db::open(&old).expect("a v1 file opens");
+        let connection = migrated.lock();
+        connection
+            .execute("DELETE FROM blobs", [])
+            .expect("a use no longer holds its blob's row");
+        let kept: (i64, i64) = connection
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM uses), (SELECT user_version FROM pragma_user_version)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("the fixture's own step");
+        assert_eq!(kept, (1, 2));
+        drop(connection);
         let not_a_database = dir.path().join("notes.txt");
         std::fs::write(&not_a_database, vec![b'x'; 4096]).expect("the fixture's own step");
         assert_eq!(

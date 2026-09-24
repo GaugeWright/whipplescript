@@ -7,17 +7,31 @@
 //! labels (rule 3); what a view has no use of is missing under that view, and
 //! its upload is accepted (rule 4). Rules 2 and 5 live in `cache.rs`.
 //!
-//! Blobs and uses are rows of the endpoint's database (`db.rs`), so they
-//! outlive the process; a use belongs to the principal's name, which a
-//! restart keeps. Handles are the process's own: a token minted for a
-//! principal, remembered in memory, and gone when the process is. A read the
-//! database cannot answer is answered as missing, which grants nothing; a
-//! write it cannot make is refused.
+//! Uses are rows of the endpoint's database (`db.rs`), so they outlive the
+//! process; a use belongs to the principal's name, which a restart keeps.
+//! Handles are the process's own: a token minted for a principal, remembered
+//! in memory, and gone when the process is. A read the database cannot answer
+//! is answered as missing, which grants nothing; a write it cannot make is
+//! refused.
+//!
+//! The bytes live in one of two places. An endpoint on its own keeps them in
+//! its database. An endpoint serving a Home shares the artifact plane's
+//! content store (§14.3): the bytes are stored there once, under the
+//! workspace's content id, which is the first half of the same SHA-256 the
+//! protocol names them by, so no mapping is kept and every read is checked
+//! against the full digest. Sharing the bytes shares their erasure: bytes the
+//! workspace erased read as missing under every view, and neither an upload
+//! nor an execution can store them again. It shares nothing else — the
+//! content store answers who may read nothing, so a blob the workspace holds
+//! is still missing under a view with no use of it.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Mutex, MutexGuard};
 
 use rusqlite::{params, OptionalExtension};
+
+use whipplescript_store::content::{BlobStatus, ContentBlobs, ContentStore};
+use whipplescript_store::StoreError;
 
 use crate::db::{labels_from_text, labels_to_text, Db};
 use crate::digest::Digest;
@@ -47,6 +61,7 @@ pub struct HandleId(pub String);
 /// The store: blobs and uses in the database, handles in the process.
 pub struct Store {
     db: Db,
+    shared: Option<Mutex<ContentStore>>,
     handles: Mutex<BTreeMap<HandleId, Principal>>,
 }
 
@@ -78,6 +93,26 @@ pub(crate) fn written<T>(what: &str, result: rusqlite::Result<T>) -> Result<T, S
     result.map_err(|error| format!("cannot write {what} to the endpoint's state: {error}"))
 }
 
+/// A write the workspace's content store refused, in its own words.
+fn shared_written<T>(what: &str, result: Result<T, StoreError>) -> Result<T, String> {
+    result.map_err(|error| {
+        let reason = match error {
+            StoreError::Conflict(reason) => reason,
+            other => format!("{other:?}"),
+        };
+        format!("cannot write {what} to the workspace's content store: {reason}")
+    })
+}
+
+/// The workspace's content id for a digest: the first 128 bits of the same
+/// SHA-256, which is how the artifact plane truncates its hashes. None for a
+/// digest that is not a SHA-256 in hex, which no stored bytes can have.
+fn content_id(digest: &Digest) -> Option<&str> {
+    (digest.hash.len() == 64)
+        .then(|| digest.hash.get(..32))
+        .flatten()
+}
+
 impl Store {
     /// A store that lives as long as the process.
     pub fn new() -> Self {
@@ -88,8 +123,61 @@ impl Store {
     pub fn over(db: Db) -> Self {
         Self {
             db,
+            shared: None,
             handles: Mutex::new(BTreeMap::new()),
         }
+    }
+
+    /// A store whose uses are the endpoint's database and whose bytes are the
+    /// workspace's content store. Bytes an earlier process kept in the
+    /// database move into the content store first — except bytes the
+    /// workspace has erased, which are dropped rather than restored — so after
+    /// this there is one copy of every blob, and it is the workspace's.
+    pub fn sharing(db: Db, content: ContentStore) -> Result<Self, String> {
+        let kept: Vec<(String, Vec<u8>)> = db
+            .lock()
+            .prepare("SELECT hash, bytes FROM blobs")
+            .and_then(|mut statement| {
+                statement
+                    .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                    .and_then(Iterator::collect)
+            })
+            .map_err(|error| format!("cannot read the endpoint's own blobs: {error}"))?;
+        for (hash, bytes) in kept {
+            let digest = Digest::of(&bytes);
+            let what = format!("blob {digest}");
+            // A row whose bytes are not the digest it is filed under is
+            // damage, and bytes the workspace erased stay erased: both are
+            // dropped rather than carried across.
+            if digest.hash == hash {
+                let erased = content_id(&digest)
+                    .map(|id| shared_written(&what, content.erased_byte_len(id)))
+                    .transpose()?
+                    .flatten()
+                    .is_some();
+                if !erased {
+                    shared_written(&what, content.put_unerased(&bytes))?;
+                }
+            }
+            written(
+                &what,
+                db.lock()
+                    .execute("DELETE FROM blobs WHERE hash = ?1", params![hash]),
+            )?;
+        }
+        Ok(Self {
+            db,
+            shared: Some(Mutex::new(content)),
+            handles: Mutex::new(BTreeMap::new()),
+        })
+    }
+
+    fn content(&self) -> Option<MutexGuard<'_, ContentStore>> {
+        self.shared.as_ref().map(|content| {
+            content
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+        })
     }
 
     fn handles(&self) -> MutexGuard<'_, BTreeMap<HandleId, Principal>> {
@@ -174,6 +262,17 @@ impl Store {
     /// principals' uses apart).
     pub fn put(&self, view: &View, bytes: &[u8], labels: &Labels) -> Result<Digest, String> {
         let digest = Digest::of(bytes);
+        if let Some(content) = self.content() {
+            // The workspace refuses an identity it erased; that refusal is
+            // the endpoint's, so erased bytes are never stored again.
+            shared_written(&format!("blob {digest}"), content.put_unerased(bytes))?;
+            drop(content);
+            return written(
+                &format!("a use of {digest}"),
+                Self::join_use(&self.db.lock(), &view.principal.name, &digest, labels),
+            )
+            .map(|()| digest);
+        }
         let mut connection = self.db.lock();
         written(
             &format!("blob {digest}"),
@@ -232,20 +331,33 @@ impl Store {
         if !view.principal.holds(&labels) {
             return None;
         }
-        self.db
-            .lock()
-            .query_row(
-                "SELECT bytes FROM blobs WHERE hash = ?1",
-                params![digest.hash],
-                |row| row.get::<_, Vec<u8>>(0),
-            )
-            .optional()
-            .ok()
-            .flatten()
+        self.bytes(digest)
+    }
+
+    /// The stored bytes for a digest, from wherever they live, and only when
+    /// they are the bytes the full digest names.
+    fn bytes(&self, digest: &Digest) -> Option<Vec<u8>> {
+        let bytes = match self.content() {
+            Some(content) => content.get(content_id(digest)?).ok().flatten()?,
+            None => self
+                .db
+                .lock()
+                .query_row(
+                    "SELECT bytes FROM blobs WHERE hash = ?1",
+                    params![digest.hash],
+                    |row| row.get::<_, Vec<u8>>(0),
+                )
+                .optional()
+                .ok()
+                .flatten()?,
+        };
+        (Digest::of(&bytes) == *digest).then_some(bytes)
     }
 
     /// Which of the digests are missing under the view: every one the view
-    /// has no readable use of, whether or not the bytes are stored (rule 4).
+    /// has no readable use of, whether or not the bytes are stored (rule 4),
+    /// and every one whose bytes are gone — erased, or collected — whatever
+    /// use the view held of them.
     pub fn missing<'d>(
         &self,
         view: &View,
@@ -255,9 +367,10 @@ impl Store {
             .into_iter()
             .filter(|digest| {
                 !digest.is_empty()
-                    && self
+                    && (self
                         .use_of(view, digest)
                         .is_none_or(|labels| !view.principal.holds(&labels))
+                        || !self.stored(digest))
             })
             .cloned()
             .collect()
@@ -266,19 +379,56 @@ impl Store {
     /// What the store holds, for the operator's eyes: never an answer given
     /// to a caller.
     pub fn stats(&self) -> StoreStats {
-        let handles = self.handles().len();
-        let connection = self.db.lock();
-        let count = |sql: &str| -> usize {
-            connection
-                .query_row(sql, [], |row| row.get::<_, i64>(0))
-                .map(|n| usize::try_from(n).unwrap_or(0))
-                .unwrap_or(0)
+        let handles = self.handles();
+        let handles = handles.len();
+        let (uses, principals, own) = {
+            let connection = self.db.lock();
+            let count = |sql: &str| -> usize {
+                connection
+                    .query_row(sql, [], |row| row.get::<_, i64>(0))
+                    .map(|n| usize::try_from(n).unwrap_or(0))
+                    .unwrap_or(0)
+            };
+            let own = (
+                count("SELECT COUNT(*) FROM blobs"),
+                count("SELECT COALESCE(SUM(LENGTH(bytes)), 0) FROM blobs"),
+            );
+            (
+                count("SELECT COUNT(*) FROM uses"),
+                count("SELECT COUNT(*) FROM principals"),
+                own,
+            )
+        };
+        // Shared bytes are counted as the blobs some use names that the
+        // workspace still holds: the endpoint's share of the content store.
+        let (blobs, bytes) = match self.content() {
+            None => own,
+            Some(content) => {
+                let hashes: Vec<String> = {
+                    let connection = self.db.lock();
+                    connection
+                        .prepare("SELECT DISTINCT hash FROM uses")
+                        .and_then(|mut statement| {
+                            statement
+                                .query_map([], |row| row.get::<_, String>(0))
+                                .and_then(Iterator::collect)
+                        })
+                        .unwrap_or_default()
+                };
+                hashes
+                    .iter()
+                    .filter_map(|hash| match content.status(hash.get(..32)?).ok()? {
+                        BlobStatus::Live { byte_len } => usize::try_from(byte_len).ok(),
+                        BlobStatus::Erased { .. } | BlobStatus::Unknown => None,
+                    })
+                    .fold((0, 0), |(blobs, bytes), len| (blobs + 1, bytes + len))
+            }
         };
         StoreStats {
-            blobs: count("SELECT COUNT(*) FROM blobs"),
-            bytes: count("SELECT COALESCE(SUM(LENGTH(bytes)), 0) FROM blobs"),
-            uses: count("SELECT COUNT(*) FROM uses"),
-            principals: count("SELECT COUNT(*) FROM principals"),
+            blobs,
+            bytes,
+            uses,
+            principals,
             handles,
         }
     }
@@ -286,8 +436,18 @@ impl Store {
     /// Whether the bytes are stored at all: the store's own knowledge, never
     /// an answer given to a caller.
     pub fn stored(&self, digest: &Digest) -> bool {
-        digest.is_empty()
-            || self
+        if digest.is_empty() {
+            return true;
+        }
+        match self.content() {
+            Some(content) => content_id(digest).is_some_and(|id| {
+                matches!(
+                    content.status(id),
+                    Ok(BlobStatus::Live { byte_len })
+                        if i64::try_from(byte_len).ok() == Some(digest.size_bytes)
+                )
+            }),
+            None => self
                 .db
                 .lock()
                 .query_row(
@@ -298,7 +458,8 @@ impl Store {
                 .optional()
                 .ok()
                 .flatten()
-                .is_some()
+                .is_some(),
+        }
     }
 }
 
@@ -441,6 +602,107 @@ mod tests {
                 "cannot write blob {} to the endpoint's state: attempt to write a readonly database",
                 Digest::of(b"new bytes")
             )
+        );
+    }
+
+    #[test]
+    fn shared_bytes_live_once_in_the_workspace_and_its_erasure_is_the_endpoints() {
+        let dir = tempfile::tempdir().expect("scratch");
+        let state = dir.path().join("endpoint.sqlite");
+        let content_path = dir.path().join("vcs-content.sqlite");
+        let workspace = ContentStore::open(&content_path).unwrap();
+        // An earlier endpoint kept its own bytes: one the workspace has since
+        // erased, one it has not.
+        let (carried, erased_before) = {
+            let store = Store::over(Db::open(&state).unwrap());
+            let owner = store
+                .admit(HandleId("t0".into()), principal("owner", &["protected"]))
+                .unwrap();
+            let carried = store
+                .put(&owner, b"carried bytes", &labels(&["protected"]))
+                .unwrap();
+            let erased_before = store.put(&owner, b"erased before", &labels(&[])).unwrap();
+            let id = workspace.put(b"erased before").unwrap();
+            assert_eq!(id, erased_before.hash[..32]);
+            workspace.erase(&id, "t1").unwrap();
+            (carried, erased_before)
+        };
+        let db = Db::open(&state).unwrap();
+        let store = Store::sharing(db.clone(), ContentStore::open(&content_path).unwrap()).unwrap();
+        let own: i64 = db
+            .lock()
+            .query_row("SELECT COUNT(*) FROM blobs", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(own, 0, "every blob now has one copy, the workspace's");
+        let owner = store
+            .admit(HandleId("t1".into()), principal("owner", &["protected"]))
+            .unwrap();
+        let dev = store
+            .admit(HandleId("t2".into()), principal("dev", &[]))
+            .unwrap();
+        assert_eq!(
+            store.get(&owner, &carried).as_deref(),
+            Some(&b"carried bytes"[..])
+        );
+        assert_eq!(
+            workspace.get(&carried.hash[..32]).unwrap().as_deref(),
+            Some(&b"carried bytes"[..])
+        );
+        assert_eq!(store.get(&owner, &erased_before), None);
+        assert_eq!(
+            store.missing(&owner, [&erased_before]),
+            vec![erased_before.clone()]
+        );
+        // Rule 1 across the planes: bytes the workspace holds are missing
+        // under a view with no use of them, and their upload is accepted.
+        let id = workspace.put(b"workspace bytes").unwrap();
+        let held = Digest::of(b"workspace bytes");
+        assert_eq!(id, held.hash[..32]);
+        assert!(store.stored(&held));
+        assert_eq!(store.missing(&dev, [&held]), vec![held.clone()]);
+        assert_eq!(
+            store.put(&dev, b"workspace bytes", &labels(&[])).unwrap(),
+            held
+        );
+        assert_eq!(
+            store.get(&dev, &held).as_deref(),
+            Some(&b"workspace bytes"[..])
+        );
+        // The workspace's erasure is the endpoint's: the bytes read as missing
+        // under every view and cannot be uploaded again.
+        let doomed = store.put(&owner, b"to be erased", &labels(&[])).unwrap();
+        workspace.erase(&doomed.hash[..32], "t2").unwrap();
+        assert_eq!(store.get(&owner, &doomed), None);
+        assert!(!store.stored(&doomed));
+        assert_eq!(
+            store.put(&owner, b"to be erased", &labels(&[])).unwrap_err(),
+            format!(
+                "cannot write blob {doomed} to the workspace's content store: derived content identity was erased"
+            )
+        );
+        assert_eq!(
+            store.stats(),
+            StoreStats {
+                blobs: 2,
+                bytes: 13 + 15,
+                uses: 4,
+                principals: 2,
+                handles: 2,
+            }
+        );
+        // A digest that is not a SHA-256 names nothing in either plane.
+        let malformed = Digest {
+            hash: "abc".into(),
+            size_bytes: 3,
+        };
+        assert_eq!(store.get(&owner, &malformed), None);
+        let broken = Db::open(&dir.path().join("broken.sqlite")).unwrap();
+        broken.lock().execute_batch("DROP TABLE blobs").unwrap();
+        assert_eq!(
+            Store::sharing(broken, ContentStore::open(&content_path).unwrap())
+                .err()
+                .expect("refused"),
+            "cannot read the endpoint's own blobs: no such table: blobs"
         );
     }
 }

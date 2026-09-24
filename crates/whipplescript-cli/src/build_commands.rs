@@ -1277,6 +1277,10 @@ fn execute(options: &super::CliOptions) -> Result<Value, String> {
                 // stored and executed.
                 .arg("--state")
                 .arg(build_root.join("endpoint.sqlite"))
+                // Its bytes are the workspace's content store, stored once for
+                // both planes and under the workspace's erasure (§14.3).
+                .arg("--content")
+                .arg(super::vcs_content_store_path())
                 .arg("--daemon")
                 .arg(binding)
                 .stdin(std::process::Stdio::piped())
@@ -1321,6 +1325,7 @@ fn execute(options: &super::CliOptions) -> Result<Value, String> {
                     "daemon": binding,
                     "handles": announced.handles,
                     "state": build_root.join("endpoint.sqlite"),
+                    "content": super::vcs_content_store_path(),
                     "config": config,
                 })
             );
