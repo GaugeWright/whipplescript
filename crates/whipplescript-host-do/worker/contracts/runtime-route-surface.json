@@ -80,6 +80,17 @@
       "authentication": "runtime-control-bearer"
     },
     {
+      "id": "runtime.host.norm.promotions",
+      "method": "POST",
+      "path": "/host/norm/promotions",
+      "samplePath": "/host/norm/promotions",
+      "transport": "http-json",
+      "sideEffect": "mutation",
+      "risk": "critical",
+      "producer": "whipplescript-host-worker",
+      "authentication": "runtime-control-bearer"
+    },
+    {
       "id": "runtime.host.norm.enqueues",
       "method": "POST",
       "path": "/host/norm/enqueues",

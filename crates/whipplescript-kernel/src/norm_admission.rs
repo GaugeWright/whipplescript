@@ -62,6 +62,9 @@ pub struct AdmissionCertificate {
     pub requirements: BTreeSet<String>,
     /// The evidence selected in their support.
     pub evidence: BTreeSet<String>,
+    /// Each exclusive reservation the proposal's changes fall under, with
+    /// the current token the requester presented for it (norm-plane §7).
+    pub reservations: BTreeMap<String, String>,
 }
 
 /// Why a proposal was refused, named by what it lacks.
@@ -76,6 +79,9 @@ pub struct AdmissionRefusal {
     pub method_gaps: BTreeSet<String>,
     /// Authority acts the proposal needs before it can be judged.
     pub authority_actions: Vec<String>,
+    /// Exclusive reservations the proposal's changes fall under whose
+    /// current token the requester did not present, with why.
+    pub reservations: BTreeMap<String, String>,
     /// A premise the host could not establish at all.
     pub unevaluated: Option<String>,
 }
@@ -101,6 +107,11 @@ impl AdmissionRefusal {
                 .map(|requirement| format!("{requirement} (no installed method)")),
         );
         named.extend(self.authority_actions.iter().cloned());
+        named.extend(
+            self.reservations
+                .iter()
+                .map(|(reservation, why)| format!("reservation {reservation} ({why})")),
+        );
         format!("the proposed result is not supported: {}", named.join("; "))
     }
 
@@ -126,7 +137,9 @@ fn work_name(work: &ImpactWork) -> String {
 
 /// Judge a plan: admissible only when every requirement, on either basis, is
 /// supported and nothing about the plan is unresolved.
-pub fn judge(planned: &Planned) -> Result<(BTreeSet<String>, BTreeSet<String>), AdmissionRefusal> {
+pub fn judge(
+    planned: &Planned,
+) -> Result<(BTreeSet<String>, BTreeSet<String>), Box<AdmissionRefusal>> {
     let mut refusal = AdmissionRefusal {
         evidence_gaps: planned.plan.evidence_gaps.keys().cloned().collect(),
         method_gaps: planned.method_gaps.keys().cloned().collect(),
@@ -159,8 +172,72 @@ pub fn judge(planned: &Planned) -> Result<(BTreeSet<String>, BTreeSet<String>), 
     if refusal == AdmissionRefusal::default() {
         Ok((requirements, evidence))
     } else {
-        Err(refusal)
+        Err(Box::new(refusal))
     }
+}
+
+/// Every path whose content differs between two captured results.
+fn changed_paths(
+    before: &BTreeMap<String, String>,
+    after: &BTreeMap<String, String>,
+) -> BTreeSet<String> {
+    before
+        .keys()
+        .chain(after.keys())
+        .filter(|path| before.get(*path) != after.get(*path))
+        .cloned()
+        .collect()
+}
+
+/// Whether a reservation selector covers a path, future members included
+/// (norm-plane §7): `dir/**` is the subtree, `**` everything, and any other
+/// pattern the gate cannot resolve conservatively covers every path.
+fn covers(selector: &str, path: &str) -> bool {
+    if let Some(root) = selector.strip_suffix("/**") {
+        return path == root || path.starts_with(&format!("{root}/"));
+    }
+    selector == path || selector.contains('*')
+}
+
+/// The exclusive reservations a proposal's changes fall under (norm-plane
+/// §7), split into those whose current token the requester presented — a
+/// grant's token is its record's head, so any later act on the grant
+/// rotates it — and those it did not, with why.
+fn fence(
+    view: &whipplescript_store::norm::NormView,
+    reservations: &BTreeSet<whipplescript_core::vocabulary::VocabularyRef>,
+    changed: &BTreeSet<String>,
+    presented: &BTreeSet<String>,
+) -> (BTreeMap<String, String>, BTreeMap<String, String>) {
+    let mut fenced = BTreeMap::new();
+    let mut unfenced = BTreeMap::new();
+    for (id, record) in &view.records {
+        if !reservations.contains(&record.vocabulary)
+            || record.status != "granted"
+            || record.fields["mode"] != "exclusive"
+        {
+            continue;
+        }
+        let selectors: Vec<&str> = record.fields["selectors"]
+            .as_array()
+            .map(|selectors| selectors.iter().filter_map(|s| s.as_str()).collect())
+            .unwrap_or_default();
+        let Some(path) = changed
+            .iter()
+            .find(|path| selectors.iter().any(|selector| covers(selector, path)))
+        else {
+            continue;
+        };
+        if presented.contains(&record.head) {
+            fenced.insert(id.clone(), record.head.clone());
+        } else {
+            unfenced.insert(
+                id.clone(),
+                format!("{path} is reserved, and its current token was not presented"),
+            );
+        }
+    }
+    (fenced, unfenced)
 }
 
 /// The norm ledger as an admission needs it: its state, and a way to hold
@@ -209,6 +286,8 @@ pub struct NormMainlineAdmission<'a, L: AdmissionLedger, S: RuntimeStore> {
     host: Result<AdmissionHost<'a, S>, String>,
     door: AdmissionDoor,
     target_ref: String,
+    /// The reservation tokens the requester presents.
+    tokens: BTreeSet<String>,
     certificate: Option<AdmissionCertificate>,
 }
 
@@ -224,8 +303,15 @@ impl<'a, L: AdmissionLedger, S: RuntimeStore> NormMainlineAdmission<'a, L, S> {
             host,
             door,
             target_ref: target_ref.to_owned(),
+            tokens: BTreeSet::new(),
             certificate: None,
         }
+    }
+
+    /// Present the requester's reservation tokens (norm-plane §7).
+    pub fn with_tokens(mut self, tokens: impl IntoIterator<Item = String>) -> Self {
+        self.tokens = tokens.into_iter().collect();
+        self
     }
 
     /// What the last preparation certified, for the door's receipt.
@@ -268,6 +354,7 @@ impl<L: AdmissionLedger, S: RuntimeStore> MainlineGate for NormMainlineAdmission
             anchor: None,
             requirements: BTreeSet::new(),
             evidence: BTreeSet::new(),
+            reservations: BTreeMap::new(),
         };
         if !self.ledger.bootstrapped()? {
             self.certificate = Some(certificate);
@@ -310,15 +397,42 @@ impl<L: AdmissionLedger, S: RuntimeStore> MainlineGate for NormMainlineAdmission
             host.verify_runtime,
         )
         .map_err(StoreError::Conflict)?;
+        let changed = changed_paths(
+            &match base_cut {
+                Some(base) => artifacts(base)?.files().clone(),
+                None => BTreeMap::new(),
+            },
+            artifacts(proposed_cut)?.files(),
+        );
+        let (fenced, unfenced) = fence(
+            &view,
+            host.configuration.reservation_vocabularies(),
+            &changed,
+            &self.tokens,
+        );
         match judge(&planned) {
-            Ok((requirements, evidence)) => {
+            Ok((requirements, evidence)) if unfenced.is_empty() => {
                 certificate.anchor = Some(planned.anchor.clone());
                 certificate.requirements = requirements;
                 certificate.evidence = evidence;
+                certificate.reservations = fenced;
                 self.certificate = Some(certificate);
                 Ok(GateVerdict::Admit)
             }
-            Err(refusal) => Ok(GateVerdict::Refuse(refusal.into_gate())),
+            Ok(_) => Ok(GateVerdict::Refuse(
+                AdmissionRefusal {
+                    reservations: unfenced,
+                    ..AdmissionRefusal::default()
+                }
+                .into_gate(),
+            )),
+            Err(refusal) => Ok(GateVerdict::Refuse(
+                AdmissionRefusal {
+                    reservations: unfenced,
+                    ..*refusal
+                }
+                .into_gate(),
+            )),
         }
     }
 

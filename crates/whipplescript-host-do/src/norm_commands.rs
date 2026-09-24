@@ -107,6 +107,9 @@ mod impact;
 pub use impact::{
     execute_hosted_norm_impact, execute_installed_hosted_norm_impact, HostedImpactConfiguration,
 };
+#[path = "norm_commands/promotion.rs"]
+mod promotion;
+pub use promotion::execute_installed_hosted_norm_promotion;
 
 const ENQUEUE_PROTOCOL: &str = "whipplescript.norm.enqueue/v1";
 

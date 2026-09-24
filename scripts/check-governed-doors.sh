@@ -114,6 +114,7 @@ DISPATCH=(
 DISPATCH_PINNED="\
 crates/whipplescript-cli/src/main.rs|run_reserved_boundary_promotion_generic|1
 crates/whipplescript-host-do/src/do_workstreams.rs|run_reserved_boundary_promotion_generic|1
+crates/whipplescript-host-do/src/norm_commands/promotion.rs|run_reserved_boundary_promotion_generic|1
 crates/whipplescript-kernel/src/effect_handlers.rs|run_reserved_boundary_promotion_generic|12
 crates/whipplescript-kernel/tests/mtarget_receipt_upgrade.rs|run_reserved_boundary_promotion_generic|1
 crates/whipplescript-kernel/src/effect_handlers.rs|release_reserved_boundary_generic|11

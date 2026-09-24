@@ -93,6 +93,9 @@ const hostFunctions = bindings as unknown as {
   host_norm_impact: (
     bridge: unknown, trustedConfiguration: string, commandJson: string, deployment: string,
   ) => string;
+  host_norm_promotion: (
+    bridge: unknown, trustedConfiguration: string, commandJson: string, deployment: string,
+  ) => string;
   host_norm_enqueue: (
     bridge: unknown, trustedConfiguration: string, commandJson: string,
     executorUrl: string, environmentEpoch: string, normRuntime?: string,
@@ -1455,7 +1458,7 @@ export class WorkflowInstance implements DurableObject {
     if (request.method !== "POST") {
       return Response.json({ error: "method not allowed" }, { status: 405 });
     }
-    if (url.pathname === "/host/norm/commands" || url.pathname === "/host/norm/provision" || url.pathname === "/host/norm/publications" || url.pathname === "/host/norm/enqueues" || url.pathname === "/host/norm/impacts") {
+    if (url.pathname === "/host/norm/commands" || url.pathname === "/host/norm/provision" || url.pathname === "/host/norm/publications" || url.pathname === "/host/norm/enqueues" || url.pathname === "/host/norm/impacts" || url.pathname === "/host/norm/promotions") {
       const trust = this.env.WHIP_NORM_TRUST;
       if (!trust) {
         return Response.json({ error: "norm trust configuration is unavailable" }, { status: 503 });
@@ -1468,16 +1471,20 @@ export class WorkflowInstance implements DurableObject {
       }
       ensureSchema(this.ctx.storage.sql);
       try {
-        if (url.pathname === "/host/norm/impacts") {
+        if (url.pathname === "/host/norm/impacts" || url.pathname === "/host/norm/promotions") {
           const { WHIP_NORM_PLANNING: planning, WHIP_NORM_RUNTIME: runtime,
             WHIP_NORM_IMAGE_BINDING: image_binding, WHIP_NORM_DEPLOYMENT_IMAGE: deployed_image } = this.env;
           if (!planning?.trim() || !runtime?.trim() || !image_binding?.trim() || !deployed_image?.trim()) {
             return Response.json({ error: "norm planning installation is unavailable" }, { status: 503 });
           }
+          // A promotion's gate plans exactly what an impact query would.
+          const door = url.pathname === "/host/norm/impacts" ? "impact" : "admission";
           const deployment = JSON.stringify({ planning, runtime, image_binding, deployed_image,
-            time_basis: `hosted-impact/${Date.now()}/${crypto.randomUUID()}` });
-          return new Response(hostFunctions.host_norm_impact(makeBridge(this.ctx.storage), trust, body, deployment),
-            { headers: { "content-type": "application/json" } });
+            time_basis: `hosted-${door}/${Date.now()}/${crypto.randomUUID()}` });
+          const answer = url.pathname === "/host/norm/impacts"
+            ? hostFunctions.host_norm_impact(makeBridge(this.ctx.storage), trust, body, deployment)
+            : hostFunctions.host_norm_promotion(makeBridge(this.ctx.storage), trust, body, deployment);
+          return new Response(answer, { headers: { "content-type": "application/json" } });
         }
         if (url.pathname === "/host/norm/enqueues") {
           const endpoint = this.env.WHIP_EXECUTOR_URL;
@@ -5564,6 +5571,7 @@ export default {
         url.pathname === "/host/norm/publications" ||
         url.pathname === "/host/norm/enqueues" ||
         url.pathname === "/host/norm/impacts" ||
+        url.pathname === "/host/norm/promotions" ||
         url.pathname === "/host/instances/open" ||
         url.pathname === "/host/turns" ||
         url.pathname === "/host/forks/import" ||

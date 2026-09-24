@@ -193,3 +193,34 @@ fn the_gate_admits_what_is_supported_and_refuses_what_changed_or_is_not() {
         .as_array()
         .is_some_and(|gaps| gaps.iter().any(|gap| gap == &json!(record))));
 }
+
+/// A reservation's selectors cover their future members (norm-plane §7): a
+/// subtree covers files it does not hold yet, an exact path only itself,
+/// and a pattern the gate cannot resolve conservatively covers everything.
+#[test]
+fn reservation_selectors_cover_future_members_and_widen_what_they_cannot_resolve() {
+    assert!(covers("src/**", "src/parser.py"));
+    assert!(covers("src/**", "src/not/yet/created.py"));
+    assert!(covers("src/**", "src"));
+    assert!(!covers("src/**", "srcs/parser.py"));
+    assert!(!covers("src/**", "README.md"));
+    assert!(covers("src/auth.py", "src/auth.py"));
+    assert!(!covers("src/auth.py", "src/parser.py"));
+    assert!(covers("**", "README.md"));
+    assert!(covers("src/*.py", "checks/q0.json"));
+    assert_eq!(
+        changed_paths(
+            &[
+                ("a".to_owned(), "1".to_owned()),
+                ("b".to_owned(), "2".to_owned())
+            ]
+            .into(),
+            &[
+                ("b".to_owned(), "3".to_owned()),
+                ("c".to_owned(), "4".to_owned())
+            ]
+            .into(),
+        ),
+        ["a", "b", "c"].map(str::to_owned).into()
+    );
+}

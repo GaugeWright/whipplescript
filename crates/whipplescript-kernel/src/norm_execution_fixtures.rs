@@ -300,23 +300,115 @@ pub fn receipt(prepared: &PreparedNormExecution, actual: bool, timeout: bool) ->
         body: json!({"protocol":"whip-executor/1","effect_id":prepared.intent().effect_id,"stdout":stdout,"stderr":"","stdout_truncated":false,"stderr_truncated":false,"timed_out":timeout,"exit_code":if timeout {124} else if actual {1} else {0}}),
     }
 }
+/// A receipt reporting each named case's returned value, in the same
+/// authenticated transport shape as [`receipt`]; a failed run exits nonzero.
+pub fn receipt_cases(
+    prepared: &PreparedNormExecution,
+    cases: &[(&str, &str, Value)],
+    failed: bool,
+) -> HttpResponse {
+    let stdin = &prepared.request().body["stdin"];
+    let contract_json = stdin["contract_json"].as_str().expect("contract JSON");
+    let contract: ReportContract = serde_json::from_str(contract_json).expect("contract");
+    let method: PythonCallMethod = serde_json::from_str(
+        stdin["method_definition_json"]
+            .as_str()
+            .expect("method JSON"),
+    )
+    .expect("method");
+    let header = json!({"kind":"started","contract_digest":sha256_hex(contract_json.as_bytes()),"requirement":contract.subject.requirement,"protocol":method.protocol(),"run_id":prepared.intent().effect_id,"artifact":contract.subject.artifact,"method":contract.subject.method,"environment":method.runtime.environment,"adapter_digest":sha256_hex(method.adapter().as_bytes()),"python_version":method.runtime.python_version});
+    let mut stdout = format!("{header}\n");
+    for (case, assertion, actual) in cases {
+        stdout.push_str(&format!(
+            "{}\n",
+            json!({"kind":"case","case":case,"assertion":assertion,"actual":actual})
+        ));
+    }
+    stdout.push_str("{\"kind\":\"complete\"}\n");
+    HttpResponse {
+        status: 200,
+        body: json!({"protocol":"whip-executor/1","effect_id":prepared.intent().effect_id,"stdout":stdout,"stderr":"","stdout_truncated":false,"stderr_truncated":false,"timed_out":false,"exit_code":if failed {1} else {0}}),
+    }
+}
+
 pub fn journal_execution<S: RuntimeStore>(
     store: S,
     prepared: &PreparedNormExecution,
     response: &HttpResponse,
     failed: bool,
 ) -> crate::RuntimeKernel<S> {
+    journal_execution_in(
+        store,
+        prepared,
+        response,
+        failed,
+        JournalIds {
+            instance: "instance",
+            run: "run",
+            foreign: "foreign",
+            prepare: "prepare",
+            lease: "lease",
+        },
+    )
+}
+
+/// The journal coordinates one fixture execution occupies.
+struct JournalIds<'a> {
+    instance: &'a str,
+    run: &'a str,
+    foreign: &'a str,
+    prepare: &'a str,
+    lease: &'a str,
+}
+
+/// [`journal_execution`] under a chosen instance and run, so one runtime
+/// store can hold several settled executions.
+pub fn journal_execution_as<S: RuntimeStore>(
+    store: S,
+    prepared: &PreparedNormExecution,
+    response: &HttpResponse,
+    failed: bool,
+    instance_id: &str,
+    run_id: &str,
+) -> crate::RuntimeKernel<S> {
+    let foreign = format!("{}-foreign", prepared.intent().effect_id);
+    let prepare = format!("prepare-{instance_id}");
+    let lease = format!("lease-{run_id}");
+    journal_execution_in(
+        store,
+        prepared,
+        response,
+        failed,
+        JournalIds {
+            instance: instance_id,
+            run: run_id,
+            foreign: &foreign,
+            prepare: &prepare,
+            lease: &lease,
+        },
+    )
+}
+
+fn journal_execution_in<S: RuntimeStore>(
+    store: S,
+    prepared: &PreparedNormExecution,
+    response: &HttpResponse,
+    failed: bool,
+    ids: JournalIds<'_>,
+) -> crate::RuntimeKernel<S> {
     use crate::exec_http::{settle_exec_http_result, ExecSettleContext};
+    let (instance_id, run_id, foreign) = (ids.instance, ids.run, ids.foreign);
     use whipplescript_store::{NewEffect, RuleCommit, RunStart};
     let mut kernel = crate::RuntimeKernel::new(store);
     let input = prepared.effect_input().to_string();
+    let effect_id = prepared.intent().effect_id.clone();
     let effects = [NewEffect {
-        effect_id: "observe",
+        effect_id: &effect_id,
         kind: "exec.command",
         target: None,
         input_json: &input,
         status: "queued",
-        idempotency_key: "observe",
+        idempotency_key: &effect_id,
         required_capabilities_json: "[]",
         profile: None,
         correlation_id: None,
@@ -326,15 +418,15 @@ pub fn journal_execution<S: RuntimeStore>(
     let effects = [
         effects[0],
         NewEffect {
-            effect_id: "foreign",
-            idempotency_key: "foreign",
+            effect_id: foreign,
+            idempotency_key: foreign,
             ..effects[0]
         },
     ];
     kernel
         .store_mut()
         .commit_rule(RuleCommit {
-            instance_id: "instance",
+            instance_id,
             rule: "observe",
             trigger_event_id: None,
             facts: &[],
@@ -342,7 +434,7 @@ pub fn journal_execution<S: RuntimeStore>(
             effects: &effects,
             dependencies: &[],
             terminal: None,
-            idempotency_key: Some("prepare"),
+            idempotency_key: Some(ids.prepare),
             marks: &[],
             context_json: None,
         })
@@ -361,12 +453,12 @@ pub fn journal_execution<S: RuntimeStore>(
     );
     kernel
         .start_run(RunStart {
-            instance_id: "instance",
-            effect_id: "observe",
-            run_id: "run",
+            instance_id,
+            effect_id: &effect_id,
+            run_id,
             provider: "exec",
             worker_id: "whip-exec",
-            lease_id: "lease",
+            lease_id: ids.lease,
             lease_expires_at: "2030-01-01T00:00:00Z",
             metadata_json: &json!({"executor_dispatch":plan}).to_string(),
         })
@@ -374,9 +466,9 @@ pub fn journal_execution<S: RuntimeStore>(
     let context = ExecSettleContext {
         resolution_event_id: None,
         input_json: &prepared.effect_input().to_string(),
-        instance_id: "instance",
-        effect_id: "observe",
-        run_id: "run",
+        instance_id,
+        effect_id: &effect_id,
+        run_id,
         capability: "observer",
         script_sha256: digest,
         cache: None,

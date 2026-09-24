@@ -24888,7 +24888,7 @@ impl whipplescript_kernel::effect_handlers::CapabilityProvider for VcsSelectiveC
         } else {
             whipplescript_kernel::norm_admission::AdmissionDoor::Transport
         };
-        let outcome = norm_commands::with_mainline_admission(&self.store_path, door, |gate| {
+        let outcome = norm_commands::with_mainline_admission(&self.store_path, door, &[], |gate| {
             whipplescript_kernel::effect_handlers::run_selective_verb_generic(
                 &mut vcs,
                 effect.target.as_deref(),
@@ -24974,6 +24974,9 @@ impl whipplescript_kernel::effect_handlers::CapabilityProvider for VcsPromoteCap
             &holder,
             &at,
             &self.store_path,
+            // The effect's contract carries no reservation tokens yet, so an
+            // in-language promotion of a reserved change is refused.
+            &[],
         );
         // Fact routing is this host's surface (A5): the mediator delivers
         // vcs.* facts natively; the DO deliberately routes none.
@@ -38336,7 +38339,7 @@ const STREAM_USAGE: &str =
   whip stream join <stream> <branch>\n\
   whip stream leave <branch>\n\
   whip stream archive <stream>\n\
-  whip stream promote <stream>\n\
+  whip stream promote <stream> [--token <reservation-token>]...\n\
   whip stream list\n\
   whip stream show <stream>";
 
@@ -38438,7 +38441,7 @@ fn through_mainline_gate<T>(
         &mut dyn whipplescript_store::vcs::MainlineGate,
     ) -> whipplescript_store::StoreResult<T>,
 ) -> whipplescript_store::StoreResult<T> {
-    norm_commands::with_mainline_admission(runtime_path, door, f)
+    norm_commands::with_mainline_admission(runtime_path, door, &[], f)
         .map_err(whipplescript_store::StoreError::Conflict)?
 }
 
@@ -38469,6 +38472,7 @@ fn gate_stale_exit(door: &str, changed: &str) -> ExitCode {
     ExitCode::FAILURE
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_reserved_boundary_promotion(
     streams: &mut whipplescript_store::workstreams::WorkstreamStore,
     vcs: &mut whipplescript_store::vcs::NativeWorkspaceVcs,
@@ -38477,12 +38481,14 @@ fn run_reserved_boundary_promotion(
     holder: &str,
     at: &str,
     runtime_path: &Path,
+    tokens: &[String],
 ) -> Result<BoundaryRunOutcome, String> {
     let proposed_main = format!("{}-promote", generated_cut_id());
     let mut serialization = AdoptionLeaseSerialization::new(holder);
     norm_commands::with_mainline_admission(
         runtime_path,
         whipplescript_kernel::norm_admission::AdmissionDoor::Promote,
+        tokens,
         |gate| {
             whipplescript_kernel::effect_handlers::run_reserved_boundary_promotion_generic(
                 streams,
@@ -38657,6 +38663,13 @@ fn stream_command(options: &CliOptions) -> ExitCode {
                 eprintln!("{STREAM_USAGE}");
                 return ExitCode::from(2);
             };
+            // The requester's reservation tokens (norm-plane §7): a change to
+            // a reserved region is admitted only under its current token.
+            let tokens: Vec<String> = rest
+                .windows(2)
+                .filter(|pair| pair[0] == "--token")
+                .map(|pair| pair[1].to_owned())
+                .collect();
             let mut vcs = match open_vcs() {
                 Ok(vcs) => vcs,
                 Err(code) => return code,
@@ -38671,6 +38684,7 @@ fn stream_command(options: &CliOptions) -> ExitCode {
                 &holder,
                 &at,
                 &options.store_path,
+                &tokens,
             ) {
                 Ok(BoundaryRunOutcome::Promoted {
                     receipt,

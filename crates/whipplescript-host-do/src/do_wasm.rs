@@ -340,6 +340,25 @@ pub fn host_norm_command(
     .map_err(|error| JsValue::from_str(&error))
 }
 
+/// Promote a stream onto the object's gated mainline (norm-plane §5), with
+/// the same deployment-owned planning inputs `host_norm_impact` uses.
+#[wasm_bindgen]
+pub fn host_norm_promotion(
+    bridge: DoSqlBridge,
+    trusted_configuration: &str,
+    command: &str,
+    deployment: &str,
+) -> Result<String, JsValue> {
+    let sql = std::rc::Rc::new(JsDoSql { bridge });
+    crate::norm_commands::execute_installed_hosted_norm_promotion(
+        &sql,
+        trusted_configuration,
+        command,
+        deployment,
+    )
+    .map_err(|error| JsValue::from_str(&error))
+}
+
 /// Read-only planning with a deployment-owned probed image binding.
 #[wasm_bindgen]
 pub fn host_norm_impact(

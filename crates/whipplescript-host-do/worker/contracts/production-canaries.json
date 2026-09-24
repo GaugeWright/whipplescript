@@ -137,16 +137,18 @@
         "runtime.host.norm.provision",
         "runtime.host.norm.publications",
         "runtime.host.norm.enqueues",
-        "runtime.host.norm.impacts"
+        "runtime.host.norm.impacts",
+        "runtime.host.norm.promotions"
       ],
       "requiredInfrastructure": [
         "Dedicated synthetic norm ledger with deployment-owned principal bindings",
         "Deployment-owned planning roles and physically verified immutable image binding matched to the deployed executor for read-only impact queries",
         "Synthetic running instance with installed observer and deployment executor configuration for authenticated enqueue and retry",
         "Synthetic signer with independent creation grant and retained historical keys",
-        "Synthetic settled norm execution with retained runtime journal, captured artifact cut and externally signed observation publication"
+        "Synthetic settled norm execution with retained runtime journal, captured artifact cut and externally signed observation publication",
+        "Synthetic workspace stream line whose promotions the gate judges, with a synthetic reservation grant for fenced changes"
       ],
-      "cleanup": "Reuse only the dedicated synthetic ledger and stable signed invocation identities. Norm evidence is append-only: never erase production history or restore an older authority checkpoint as cleanup. Retain bounded synthetic receipts outside customer ledgers.",
+      "cleanup": "Reuse only the dedicated synthetic ledger and stable signed invocation identities. Norm evidence is append-only: never erase production history or restore an older authority checkpoint as cleanup. Retain bounded synthetic receipts outside customer ledgers. A promotion moves only the synthetic workspace's governed mainline and is recorded like any other; it is never undone by rewriting that history.",
       "surfaces": [
         "whip-runtime"
       ]

@@ -16,6 +16,7 @@ const publicOperations = [
 
 const hostOperations = [
   ["runtime.host.norm.impacts", "POST", "/host/norm/impacts", "http-json", "none", "critical"],
+  ["runtime.host.norm.promotions", "POST", "/host/norm/promotions", "http-json", "mutation", "critical"],
   ["runtime.host.norm.enqueues", "POST", "/host/norm/enqueues", "http-json", "mutation", "critical"],
   ["runtime.host.norm.publications", "POST", "/host/norm/publications", "http-json", "mutation", "critical"],
   ["runtime.host.norm.provision", "POST", "/host/norm/provision", "http-json", "mutation", "critical"],

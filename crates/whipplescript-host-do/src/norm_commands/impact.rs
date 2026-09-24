@@ -77,14 +77,37 @@ pub fn execute_hosted_norm_impact<S: NormCommandStore + RuntimeStore>(
     })
 }
 
+/// The deployment's installed planning premises, as the Worker supplies them.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Deployment {
-    planning: String,
-    runtime: String,
+pub(super) struct Deployment {
+    pub(super) planning: String,
+    pub(super) runtime: String,
     image_binding: String,
-    deployed_image: String,
-    time_basis: String,
+    pub(super) deployed_image: String,
+    pub(super) time_basis: String,
+}
+
+impl Deployment {
+    pub(super) fn parse(deployment: &str) -> Result<Self, String> {
+        if deployment.len() > 131_072 {
+            return Err("hosted impact deployment exceeds 128 KiB".into());
+        }
+        serde_json::from_str(deployment).map_err(|e| e.to_string())
+    }
+
+    /// The installed image binding, validated against the deployed image and
+    /// the deployment's runtime before anything reads history.
+    pub(super) fn installed(
+        &self,
+    ) -> Result<whipplescript_kernel::norm_runtime_image::InstalledRuntimeImage, String> {
+        let installed = whipplescript_kernel::norm_runtime_image::InstalledRuntimeImage::parse(
+            &self.image_binding,
+        )?;
+        let runtime = whipplescript_kernel::norm_runtime::parse(&self.runtime)?;
+        installed.validate_for(&self.deployed_image, &runtime)?;
+        Ok(installed)
+    }
 }
 /// Install the concrete image verifier from deployment-owned inputs. Request
 /// data never chooses the policy, image binding, image identity or query time.
@@ -95,15 +118,8 @@ pub fn execute_installed_hosted_norm_impact<S: NormCommandStore + RuntimeStore>(
     artifacts: &NormArtifactCapture<'_>,
     deployment: &str,
 ) -> Result<String, String> {
-    if deployment.len() > 131_072 {
-        return Err("hosted impact deployment exceeds 128 KiB".into());
-    }
-    let deployment: Deployment = serde_json::from_str(deployment).map_err(|e| e.to_string())?;
-    let installed = whipplescript_kernel::norm_runtime_image::InstalledRuntimeImage::parse(
-        &deployment.image_binding,
-    )?;
-    let runtime = whipplescript_kernel::norm_runtime::parse(&deployment.runtime)?;
-    installed.validate_for(&deployment.deployed_image, &runtime)?;
+    let deployment = Deployment::parse(deployment)?;
+    let installed = deployment.installed()?;
     execute_hosted_norm_impact(
         store,
         HostedImpactConfiguration {

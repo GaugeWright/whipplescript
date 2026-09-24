@@ -22,7 +22,11 @@ fn promote(fixture: &Fixture, stream: &str, host: Option<(&Value, &std::path::Pa
 }
 
 /// One `whip` command against the fixture's host-selected stores.
-fn whip(fixture: &Fixture, args: &[&str], host: Option<(&Value, &std::path::Path)>) -> Output {
+pub(super) fn whip(
+    fixture: &Fixture,
+    args: &[&str],
+    host: Option<(&Value, &std::path::Path)>,
+) -> Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_whip"));
     command
         .current_dir(&fixture.root)
