@@ -1272,6 +1272,11 @@ fn execute(options: &super::CliOptions) -> Result<Value, String> {
                 .arg("127.0.0.1:0")
                 .arg("--scratch")
                 .arg(build_root.join("actions"))
+                // The store and the action cache outlive this process: the
+                // next endpoint over the same build root serves what this one
+                // stored and executed.
+                .arg("--state")
+                .arg(build_root.join("endpoint.sqlite"))
                 .arg("--daemon")
                 .arg(binding)
                 .stdin(std::process::Stdio::piped())
@@ -1315,6 +1320,7 @@ fn execute(options: &super::CliOptions) -> Result<Value, String> {
                     "executor": announced.executor,
                     "daemon": binding,
                     "handles": announced.handles,
+                    "state": build_root.join("endpoint.sqlite"),
                     "config": config,
                 })
             );

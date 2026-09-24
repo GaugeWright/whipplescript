@@ -2,7 +2,9 @@
 //! a daemon. It reads its principals from `--principal name[=label,...]`,
 //! serves the connections that name no handle as `--daemon <name>`, prints
 //! one JSON line with the bound address and each principal's handle token,
-//! and runs until its standard input closes or it is told to stop.
+//! and runs until its standard input closes or it is told to stop. With
+//! `--state <file>` its store and action cache are that SQLite database, so
+//! the next process over the same file serves what this one stored.
 
 use std::sync::Arc;
 
@@ -10,12 +12,13 @@ use whipplescript_remote_execution::endpoint::Endpoint;
 use whipplescript_remote_execution::runner::LocalRunner;
 use whipplescript_remote_execution::store::Principal;
 
-const USAGE: &str = "usage: whip-remote-execution --listen <addr> --scratch <dir> [--principal <name>[=<label>,...]]... [--daemon <name>]";
+const USAGE: &str = "usage: whip-remote-execution --listen <addr> --scratch <dir> [--state <file>] [--principal <name>[=<label>,...]]... [--daemon <name>]";
 
 #[derive(Debug)]
 struct Arguments {
     listen: String,
     scratch: String,
+    state: Option<String>,
     principals: Vec<Principal>,
     daemon: Option<String>,
 }
@@ -23,6 +26,7 @@ struct Arguments {
 fn parse(args: &[String]) -> Result<Arguments, String> {
     let mut listen = None;
     let mut scratch = None;
+    let mut state = None;
     let mut principals = Vec::new();
     let mut daemon = None;
     let mut it = args.iter();
@@ -31,6 +35,7 @@ fn parse(args: &[String]) -> Result<Arguments, String> {
         match arg.as_str() {
             "--listen" => listen = value(),
             "--scratch" => scratch = value(),
+            "--state" => state = value(),
             "--daemon" => daemon = value(),
             "--principal" => {
                 let spec = value().ok_or_else(|| format!("--principal needs a value\n{USAGE}"))?;
@@ -58,6 +63,7 @@ fn parse(args: &[String]) -> Result<Arguments, String> {
     Ok(Arguments {
         listen: listen.ok_or_else(|| format!("--listen is required\n{USAGE}"))?,
         scratch: scratch.ok_or_else(|| format!("--scratch is required\n{USAGE}"))?,
+        state,
         principals,
         daemon,
     })
@@ -66,7 +72,11 @@ fn parse(args: &[String]) -> Result<Arguments, String> {
 async fn run(args: Arguments) -> Result<(), String> {
     std::fs::create_dir_all(&args.scratch)
         .map_err(|error| format!("cannot create {}: {error}", args.scratch))?;
-    let mut endpoint = Endpoint::new(Arc::new(LocalRunner::new(&args.scratch)));
+    let runner = Arc::new(LocalRunner::new(&args.scratch));
+    let mut endpoint = match &args.state {
+        Some(state) => Endpoint::open(runner, std::path::Path::new(state))?,
+        None => Endpoint::new(runner),
+    };
     let mut handles = serde_json::Map::new();
     let mut daemon_handle = None;
     for principal in args.principals {
@@ -85,7 +95,7 @@ async fn run(args: Arguments) -> Result<(), String> {
     let (listener, bound) = whipplescript_remote_execution::server::bind(&args.listen).await?;
     println!(
         "{}",
-        serde_json::json!({"address": bound.to_string(), "executor": endpoint.executor_name(), "handles": handles})
+        serde_json::json!({"address": bound.to_string(), "executor": endpoint.executor_name(), "handles": handles, "state": args.state})
     );
     let endpoint = Arc::new(endpoint);
     let stdin_closed = async {
@@ -141,6 +151,8 @@ mod tests {
             "127.0.0.1:0",
             "--scratch",
             "/tmp/s",
+            "--state",
+            "/tmp/s/endpoint.sqlite",
             "--principal",
             "owner=protected,internal",
             "--principal",
@@ -150,6 +162,7 @@ mod tests {
         ]))
         .unwrap();
         assert_eq!(parsed.listen, "127.0.0.1:0");
+        assert_eq!(parsed.state.as_deref(), Some("/tmp/s/endpoint.sqlite"));
         assert_eq!(parsed.principals.len(), 2);
         assert_eq!(parsed.principals[0].labels.len(), 2);
         assert!(parsed.principals[1].labels.is_empty());

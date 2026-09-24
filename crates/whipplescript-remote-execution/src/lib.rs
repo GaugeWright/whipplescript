@@ -6,6 +6,7 @@
 
 pub mod cache;
 pub mod cut;
+pub mod db;
 pub mod digest;
 pub mod endpoint;
 pub mod proto;

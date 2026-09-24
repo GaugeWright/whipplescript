@@ -17,6 +17,9 @@ dist = false
 whipplescript-store = { version = "0.5.6", path = "../whipplescript-store", features = ["native"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# The store and the action cache persist in one SQLite file beside the build
+# root, at the version the rest of the workspace uses.
+rusqlite = { version = "0.40.1", features = ["bundled"] }
 sha2 = "0.10"
 # The Remote Execution API is gRPC; the protocol files are vendored at the
 # pinned Buck2 release (the client that speaks to this endpoint), the code
