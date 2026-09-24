@@ -7,8 +7,9 @@
 //! the next process over the same file serves what this one stored; with
 //! `--content <file>` as well, its bytes are the workspace's content store.
 //! With `--sidecar <http://host:port>` its actions run at a Class-A executor
-//! (`whip executor`) instead of on this host, authenticated with
-//! `WHIP_EXECUTOR_TOKEN` when that is set.
+//! (`whip executor`) instead of on this host, over HTTP or HTTPS,
+//! authenticated with `WHIP_EXECUTOR_TOKEN` when that is set; `--sidecar-ca
+//! <pem>` adds a pool's own authority to the platform's roots.
 
 use std::sync::Arc;
 
@@ -17,7 +18,7 @@ use whipplescript_remote_execution::runner::{ActionRunner, LocalRunner};
 use whipplescript_remote_execution::sidecar::SidecarRunner;
 use whipplescript_remote_execution::store::Principal;
 
-const USAGE: &str = "usage: whip-remote-execution --listen <addr> --scratch <dir> [--state <file> [--content <file>]] [--sidecar <http://host:port>] [--principal <name>[=<label>,...]]... [--daemon <name>]";
+const USAGE: &str = "usage: whip-remote-execution --listen <addr> --scratch <dir> [--state <file> [--content <file>]] [--sidecar <http(s)://host:port> [--sidecar-ca <pem>]] [--principal <name>[=<label>,...]]... [--daemon <name>]";
 
 #[derive(Debug)]
 struct Arguments {
@@ -26,6 +27,7 @@ struct Arguments {
     state: Option<String>,
     content: Option<String>,
     sidecar: Option<String>,
+    sidecar_ca: Option<String>,
     principals: Vec<Principal>,
     daemon: Option<String>,
 }
@@ -36,6 +38,7 @@ fn parse(args: &[String]) -> Result<Arguments, String> {
     let mut state = None;
     let mut content = None;
     let mut sidecar = None;
+    let mut sidecar_ca = None;
     let mut principals = Vec::new();
     let mut daemon = None;
     let mut it = args.iter();
@@ -47,6 +50,7 @@ fn parse(args: &[String]) -> Result<Arguments, String> {
             "--state" => state = value(),
             "--content" => content = value(),
             "--sidecar" => sidecar = value(),
+            "--sidecar-ca" => sidecar_ca = value(),
             "--daemon" => daemon = value(),
             "--principal" => {
                 let spec = value().ok_or_else(|| format!("--principal needs a value\n{USAGE}"))?;
@@ -76,12 +80,18 @@ fn parse(args: &[String]) -> Result<Arguments, String> {
             "--content needs --state: the uses that scope shared bytes must outlive the process as the bytes do\n{USAGE}"
         ));
     }
+    if sidecar_ca.is_some() && sidecar.is_none() {
+        return Err(format!(
+            "--sidecar-ca needs --sidecar: it names the authority of the executor actions run at\n{USAGE}"
+        ));
+    }
     Ok(Arguments {
         listen: listen.ok_or_else(|| format!("--listen is required\n{USAGE}"))?,
         scratch: scratch.ok_or_else(|| format!("--scratch is required\n{USAGE}"))?,
         state,
         content,
         sidecar,
+        sidecar_ca,
         principals,
         daemon,
     })
@@ -91,10 +101,13 @@ async fn run(args: Arguments) -> Result<(), String> {
     std::fs::create_dir_all(&args.scratch)
         .map_err(|error| format!("cannot create {}: {error}", args.scratch))?;
     let runner: Arc<dyn ActionRunner> = match &args.sidecar {
-        Some(url) => Arc::new(SidecarRunner::new(
-            url,
-            std::env::var("WHIP_EXECUTOR_TOKEN").ok(),
-        )?),
+        Some(url) => {
+            let token = std::env::var("WHIP_EXECUTOR_TOKEN").ok();
+            Arc::new(match &args.sidecar_ca {
+                Some(ca) => SidecarRunner::trusting(url, token, std::path::Path::new(ca))?,
+                None => SidecarRunner::new(url, token)?,
+            })
+        }
         None => Arc::new(LocalRunner::new(&args.scratch)),
     };
     let mut endpoint = match (&args.state, &args.content) {
@@ -185,7 +198,9 @@ mod tests {
             "--content",
             "/tmp/s/vcs-content.sqlite",
             "--sidecar",
-            "http://127.0.0.1:8080",
+            "https://pool.example:8443",
+            "--sidecar-ca",
+            "/tmp/s/pool-ca.pem",
             "--principal",
             "owner=protected,internal",
             "--principal",
@@ -197,7 +212,18 @@ mod tests {
         assert_eq!(parsed.listen, "127.0.0.1:0");
         assert_eq!(parsed.state.as_deref(), Some("/tmp/s/endpoint.sqlite"));
         assert_eq!(parsed.content.as_deref(), Some("/tmp/s/vcs-content.sqlite"));
-        assert_eq!(parsed.sidecar.as_deref(), Some("http://127.0.0.1:8080"));
+        assert_eq!(parsed.sidecar.as_deref(), Some("https://pool.example:8443"));
+        assert_eq!(parsed.sidecar_ca.as_deref(), Some("/tmp/s/pool-ca.pem"));
+        assert!(parse(&owned(&[
+            "--listen",
+            "x",
+            "--scratch",
+            "s",
+            "--sidecar-ca",
+            "c"
+        ]))
+        .unwrap_err()
+        .starts_with("--sidecar-ca needs --sidecar: "));
         assert!(parse(&owned(&[
             "--listen",
             "x",

@@ -1,33 +1,41 @@
 //! The sidecar tier as a runner (DR-0124 §14.4, compute-plane design note
-//! §3–§4): the endpoint hands an action to a Class-A executor over HTTP, and
-//! the executor runs it with the same confined run the endpoint's own runner
-//! uses. It is another runner, not another endpoint — the endpoint still
-//! resolves the action under the caller's view, classifies it, refuses it,
-//! stores its outputs and caches its result; the sidecar only runs what it is
-//! handed and holds no view, no label and no cache of results.
+//! §3–§4): the endpoint hands an action to a Class-A executor over HTTP or
+//! HTTPS, and the executor runs it with the same confined run the endpoint's
+//! own runner uses. It is another runner, not another endpoint — the endpoint
+//! still resolves the action under the caller's view, classifies it, refuses
+//! it, stores its outputs and caches its result; the sidecar only runs what it
+//! is handed and holds no view, no label and no cache of results.
 //!
-//! The wire is `whipplescript.build.action/v1`, three routes beside the
-//! executor's `whip-executor/1` ones, each one request and one response:
+//! The wire is `whipplescript.build.action/v2`, routes beside the executor's
+//! `whip-executor/1` ones. No request and no answer has to hold more than one
+//! chunk of any blob, so neither side's size is bounded by a response:
 //!
 //! - `POST /action/missing` names the input digests the action will need and
 //!   is answered with the ones the sidecar does not hold, so only those
 //!   travel (the note's "pulls only missing blobs", pushed by the endpoint);
-//! - `POST /action/blobs` carries a batch of those blobs, each checked
-//!   against its digest before it is kept;
+//! - `POST /action/blobs` carries a batch of small blobs, and
+//!   `POST /action/upload` one chunk of a large one at a checked offset — the
+//!   blob is kept only once it is complete and hashes to its digest;
 //! - `POST /action` names the command, its environment, its working
 //!   directory, its inputs by digest and the outputs it may produce, and is
 //!   answered with the exit status, the two streams and the named outputs —
-//!   or with the inputs still missing, when the sidecar lost some between the
-//!   two requests, which the runner uploads and asks once more.
+//!   each inline when small, otherwise by digest, left in the sidecar's cache
+//!   — or with the inputs still missing, when the sidecar lost some between
+//!   the requests, which the runner sends and asks once more;
+//! - `POST /action/fetch` reads one chunk of a blob the sidecar holds, as raw
+//!   bytes, which is how an output named by digest comes back.
 //!
-//! Bytes travel as base64 inside JSON, as the executor's own protocol
-//! carries scripts. The executor's blobs are a cache keyed by digest and
-//! nothing more: bytes that do not hash to their key are refused, never
-//! stored.
+//! The executor's blobs are a cache keyed by digest and nothing more: bytes
+//! that do not hash to their key are refused, never kept, and the cache holds
+//! at most its capacity — the least recently used blobs are evicted past it.
+//! A blob evicted between two requests is sent again, or read as lost; it is
+//! never answered as something else.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
-use std::time::Duration;
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard};
+use std::time::{Duration, SystemTime};
 
 use base64::Engine as _;
 use serde_json::{json, Value};
@@ -36,16 +44,21 @@ use crate::digest::Digest;
 use crate::runner::{run_confined, ActionOutcome, Output, PreparedAction};
 
 /// The protocol every request and response of these routes names.
-pub const ACTION_PROTOCOL: &str = "whipplescript.build.action/v1";
+pub const ACTION_PROTOCOL: &str = "whipplescript.build.action/v2";
 
-/// The largest request body the executor accepts on these routes. A blob
-/// batch is sized below it by the runner; a single input larger than a batch
-/// can hold is refused by the runner before anything is sent.
+/// The largest request body the executor accepts on these routes: one chunk
+/// or one batch, base64, and the JSON around it.
 pub const MAX_ACTION_BODY_BYTES: usize = 64 * 1024 * 1024;
 
-/// The raw bytes one blob batch carries at most, leaving room for base64's
-/// third and the JSON around it.
-pub const BLOB_BATCH_BYTES: usize = 32 * 1024 * 1024;
+/// The raw bytes one chunk, or one batch of small blobs, carries at most.
+pub const CHUNK_BYTES: usize = 16 * 1024 * 1024;
+
+/// An output or stream at most this large comes back inside the answer;
+/// anything larger is fetched by digest.
+pub const INLINE_BYTES: usize = 1024 * 1024;
+
+/// The executor's cache capacity unless `WHIP_EXECUTOR_ACTIONS_BYTES` says.
+pub const DEFAULT_CAPACITY_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 
 /// The name results the sidecar ran are recorded under.
 pub const SIDECAR_EXECUTOR: &str = "whip-executor/sidecar";
@@ -77,6 +90,39 @@ fn check_protocol(request: &Value) -> Result<(), String> {
     }
 }
 
+fn not_those_bytes(digest: &Digest) -> String {
+    format!("the bytes sent as {digest} are not those bytes")
+}
+
+fn size_of(digest: &Digest) -> u64 {
+    u64::try_from(digest.size_bytes).unwrap_or(0)
+}
+
+/// The digest of a file's bytes, read in chunks.
+fn digest_of_file(path: &Path) -> std::io::Result<Digest> {
+    use sha2::Digest as _;
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = sha2::Sha256::new();
+    let mut window = vec![0u8; 256 * 1024];
+    let mut size: u64 = 0;
+    loop {
+        let read = file.read(&mut window)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&window[..read]);
+        size += read as u64;
+    }
+    Ok(Digest {
+        hash: hasher
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect(),
+        size_bytes: i64::try_from(size).unwrap_or(i64::MAX),
+    })
+}
+
 /// An action as the wire names it: its inputs by digest, not by bytes.
 pub fn encode_action(action: &PreparedAction) -> Value {
     let inputs: serde_json::Map<String, Value> = action
@@ -100,92 +146,68 @@ pub fn encode_action(action: &PreparedAction) -> Value {
     })
 }
 
-fn encode_files(files: &BTreeMap<String, (Vec<u8>, bool)>) -> Value {
-    Value::Object(
-        files
-            .iter()
-            .map(|(path, (bytes, executable))| {
-                (
-                    path.clone(),
-                    json!({"bytes": encode(bytes), "executable": executable}),
-                )
-            })
-            .collect(),
-    )
+/// A blob an answer names: its bytes inline, or only its digest.
+fn blob_of(
+    value: &Value,
+    what: &str,
+    fetch: &mut dyn FnMut(&Digest) -> Result<Vec<u8>, String>,
+) -> Result<Vec<u8>, String> {
+    let digest = parse_digest(value.get("digest").and_then(Value::as_str).unwrap_or(""))?;
+    let bytes = match value.get("bytes").and_then(Value::as_str) {
+        Some(text) => decode(text, what)?,
+        None => fetch(&digest)?,
+    };
+    if Digest::of(&bytes) != digest {
+        return Err(format!(
+            "the sidecar sent other bytes for {what} than {digest}"
+        ));
+    }
+    Ok(bytes)
 }
 
-fn decode_files(value: &Value, what: &str) -> Result<BTreeMap<String, (Vec<u8>, bool)>, String> {
-    value
-        .as_object()
-        .ok_or_else(|| format!("{what} is not a map of files"))?
-        .iter()
-        .map(|(path, file)| {
-            let bytes = decode(
-                file.get("bytes").and_then(Value::as_str).unwrap_or(""),
-                path,
-            )?;
-            let executable = file
-                .get("executable")
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
-            Ok((path.clone(), (bytes, executable)))
-        })
-        .collect()
-}
-
-/// An outcome as the wire carries it back.
-pub fn encode_outcome(outcome: &ActionOutcome) -> Value {
-    let outputs: serde_json::Map<String, Value> = outcome
-        .outputs
-        .iter()
-        .map(|(path, output)| {
-            let encoded = match output {
-                Output::File { bytes, executable } => {
-                    json!({"file": {"bytes": encode(bytes), "executable": executable}})
-                }
-                Output::Directory { files } => json!({"directory": encode_files(files)}),
-            };
-            (path.clone(), encoded)
-        })
-        .collect();
-    json!({
-        "protocol": ACTION_PROTOCOL,
-        "executor": SIDECAR_EXECUTOR,
-        "exit_code": outcome.exit_code,
-        "timed_out": outcome.timed_out,
-        "stdout": encode(&outcome.stdout),
-        "stderr": encode(&outcome.stderr),
-        "outputs": outputs,
-    })
-}
-
-/// The outcome a sidecar answered with.
-pub fn decode_outcome(response: &Value) -> Result<ActionOutcome, String> {
+/// The outcome a sidecar answered with, fetching with `fetch` every blob it
+/// named only by digest.
+pub fn decode_outcome(
+    response: &Value,
+    mut fetch: impl FnMut(&Digest) -> Result<Vec<u8>, String>,
+) -> Result<ActionOutcome, String> {
     check_protocol(response)?;
+    let executable = |file: &Value| {
+        file.get("executable")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    };
     let mut outputs = BTreeMap::new();
     if let Some(named) = response.get("outputs").and_then(Value::as_object) {
         for (path, output) in named {
             let decoded = if let Some(file) = output.get("file") {
                 Output::File {
-                    bytes: decode(
-                        file.get("bytes").and_then(Value::as_str).unwrap_or(""),
-                        path,
-                    )?,
-                    executable: file
-                        .get("executable")
-                        .and_then(Value::as_bool)
-                        .unwrap_or(false),
+                    bytes: blob_of(file, path, &mut fetch)?,
+                    executable: executable(file),
                 }
-            } else if let Some(files) = output.get("directory") {
-                Output::Directory {
-                    files: decode_files(files, path)?,
+            } else if let Some(files) = output.get("directory").and_then(Value::as_object) {
+                let mut decoded = BTreeMap::new();
+                for (name, file) in files {
+                    let what = format!("{path}/{name}");
+                    decoded.insert(
+                        name.clone(),
+                        (blob_of(file, &what, &mut fetch)?, executable(file)),
+                    );
                 }
+                Output::Directory { files: decoded }
             } else {
                 return Err(format!("output {path} is neither a file nor a directory"));
             };
             outputs.insert(path.clone(), decoded);
         }
     }
+    let stream =
+        |name: &str, fetch: &mut dyn FnMut(&Digest) -> Result<Vec<u8>, String>| match response
+            .get(name)
+        {
+            Some(blob) => blob_of(blob, name, fetch),
+            None => Ok(Vec::new()),
+        };
     Ok(ActionOutcome {
         exit_code: response
             .get("exit_code")
@@ -196,63 +218,201 @@ pub fn decode_outcome(response: &Value) -> Result<ActionOutcome, String> {
             .get("timed_out")
             .and_then(Value::as_bool)
             .unwrap_or(false),
-        stdout: decode(
-            response.get("stdout").and_then(Value::as_str).unwrap_or(""),
-            "stdout",
-        )?,
-        stderr: decode(
-            response.get("stderr").and_then(Value::as_str).unwrap_or(""),
-            "stderr",
-        )?,
+        stdout: stream("stdout", &mut fetch)?,
+        stderr: stream("stderr", &mut fetch)?,
         outputs,
     })
 }
 
-/// The executor's half: a blob cache keyed by digest and a scratch root for
-/// confined runs, answering the three routes. Synchronous, because the
+/// What the executor answers one of these routes with.
+#[derive(Debug, PartialEq)]
+pub enum Answer {
+    Json(Value),
+    /// One chunk of a blob, raw.
+    Bytes(Vec<u8>),
+}
+
+type Refusal = (u16, String);
+
+/// The executor's half: a bounded blob cache keyed by digest and a scratch
+/// root for confined runs, answering the routes. Synchronous, because the
 /// executor serves each connection on its own thread.
 pub struct ActionSidecar {
     root: PathBuf,
+    capacity: u64,
+    /// Held while a chunk is appended, so two uploads of one blob cannot
+    /// interleave.
+    uploads: Mutex<()>,
+    /// What the cache holds, as last counted plus what has been written
+    /// since; counted again whenever it passes the capacity.
+    held_bytes: Mutex<Option<u64>>,
 }
 
 impl ActionSidecar {
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+        Self::with_capacity(root, DEFAULT_CAPACITY_BYTES)
+    }
+
+    pub fn with_capacity(root: impl Into<PathBuf>, capacity: u64) -> Self {
+        Self {
+            root: root.into(),
+            capacity,
+            uploads: Mutex::new(()),
+            held_bytes: Mutex::new(None),
+        }
+    }
+
+    fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+        mutex
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     fn blob_path(&self, digest: &Digest) -> PathBuf {
         self.root.join("blobs").join(&digest.hash)
     }
 
+    fn partial_path(&self, digest: &Digest) -> PathBuf {
+        self.root.join("partial").join(&digest.hash)
+    }
+
+    /// Mark a blob used now, so eviction takes others first.
+    fn touch(path: &Path) {
+        let _ = std::fs::File::options()
+            .write(true)
+            .open(path)
+            .and_then(|file| file.set_modified(SystemTime::now()));
+    }
+
+    /// Whether the cache holds a blob of the digest's size. Cheap: the bytes
+    /// are checked against the digest when they are used.
+    fn holds(&self, digest: &Digest) -> bool {
+        if digest.is_empty() {
+            return true;
+        }
+        let path = self.blob_path(digest);
+        let held = std::fs::metadata(&path).is_ok_and(|meta| meta.len() == size_of(digest));
+        if held {
+            Self::touch(&path);
+        }
+        held
+    }
+
+    /// The bytes of a blob, only when they are the bytes its digest names.
     fn held(&self, digest: &Digest) -> Option<Vec<u8>> {
         if digest.is_empty() {
             return Some(Vec::new());
         }
-        std::fs::read(self.blob_path(digest))
+        let path = self.blob_path(digest);
+        let bytes = std::fs::read(&path)
             .ok()
-            .filter(|bytes| Digest::of(bytes) == *digest)
+            .filter(|bytes| Digest::of(bytes) == *digest)?;
+        Self::touch(&path);
+        Some(bytes)
+    }
+
+    fn keep_refusal(digest: &Digest, error: impl std::fmt::Display) -> Refusal {
+        (500, format!("cannot keep blob {digest}: {error}"))
+    }
+
+    fn dir(path: &Path) -> Result<(), Refusal> {
+        std::fs::create_dir_all(path)
+            .map_err(|error| (500, format!("cannot create {}: {error}", path.display())))
+    }
+
+    /// Keep verified bytes under their digest: written aside and renamed, so
+    /// a concurrent reader never sees a partial blob under its digest.
+    fn store(&self, digest: &Digest, bytes: &[u8]) -> Result<(), Refusal> {
+        let dir = self.root.join("blobs");
+        Self::dir(&dir)?;
+        tempfile::NamedTempFile::new_in(&dir)
+            .and_then(|mut file| {
+                file.write_all(bytes)?;
+                Ok(file)
+            })
+            .and_then(|file| {
+                file.persist(self.blob_path(digest))
+                    .map_err(|error| error.error)
+            })
+            .map_err(|error| Self::keep_refusal(digest, error))?;
+        self.note_written(bytes.len() as u64);
+        Ok(())
+    }
+
+    /// Account for bytes just written, evicting when the cache passes its
+    /// capacity.
+    fn note_written(&self, bytes: u64) {
+        let mut held = Self::lock(&self.held_bytes);
+        let total = held.get_or_insert_with(|| self.counted().iter().map(|e| e.1).sum());
+        *total += bytes;
+        if *total > self.capacity {
+            *total = self.evict(self.capacity / 10 * 9);
+        }
+    }
+
+    /// Every blob and partial upload the cache holds: path, size, last use.
+    fn counted(&self) -> Vec<(PathBuf, u64, SystemTime)> {
+        let mut entries = Vec::new();
+        for dir in [self.root.join("blobs"), self.root.join("partial")] {
+            for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+                if let Ok(meta) = entry.metadata() {
+                    if meta.is_file() {
+                        let used = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+                        entries.push((entry.path(), meta.len(), used));
+                    }
+                }
+            }
+        }
+        entries
+    }
+
+    /// Remove the least recently used blobs until the cache holds at most
+    /// `target` bytes; returns what it then holds.
+    fn evict(&self, target: u64) -> u64 {
+        let mut entries = self.counted();
+        entries.sort_by_key(|entry| entry.2);
+        let mut total: u64 = entries.iter().map(|entry| entry.1).sum();
+        for (path, size, _) in entries {
+            if total <= target {
+                break;
+            }
+            if std::fs::remove_file(&path).is_ok() {
+                total = total.saturating_sub(size);
+            }
+        }
+        total
     }
 
     /// Answer one request to a route of this protocol, or `None` when the
     /// path is not one of them.
-    pub fn handle(&self, path: &str, body: &[u8]) -> Option<(u16, Value)> {
+    pub fn handle(&self, path: &str, body: &[u8]) -> Option<(u16, Answer)> {
         let answer = match path {
             "/action/missing" => self.missing(body),
             "/action/blobs" => self.keep(body),
+            "/action/upload" => self.upload(body),
+            "/action/fetch" => self.fetch(body),
             "/action" => self.run(body),
             _ => return None,
         };
-        Some(answer.unwrap_or_else(|(status, error)| (status, json!({"error": error}))))
+        Some(
+            answer
+                .unwrap_or_else(|(status, error)| (status, Answer::Json(json!({"error": error})))),
+        )
     }
 
-    fn request(body: &[u8]) -> Result<Value, (u16, String)> {
+    fn request(body: &[u8]) -> Result<Value, Refusal> {
         let request: Value = serde_json::from_slice(body)
             .map_err(|error| (400, format!("invalid JSON body: {error}")))?;
         check_protocol(&request).map_err(|error| (400, error))?;
         Ok(request)
     }
 
-    fn missing(&self, body: &[u8]) -> Result<(u16, Value), (u16, String)> {
+    fn named_digest(request: &Value) -> Result<Digest, Refusal> {
+        parse_digest(request.get("digest").and_then(Value::as_str).unwrap_or(""))
+            .map_err(|error| (400, error))
+    }
+
+    fn missing(&self, body: &[u8]) -> Result<(u16, Answer), Refusal> {
         let request = Self::request(body)?;
         let mut missing = Vec::new();
         for named in request
@@ -262,52 +422,141 @@ impl ActionSidecar {
             .flatten()
         {
             let digest = parse_digest(named.as_str().unwrap_or("")).map_err(|e| (400, e))?;
-            if self.held(&digest).is_none() {
+            if !self.holds(&digest) {
                 missing.push(digest.to_string());
             }
         }
         Ok((
             200,
-            json!({"protocol": ACTION_PROTOCOL, "missing": missing}),
+            Answer::Json(json!({"protocol": ACTION_PROTOCOL, "missing": missing})),
         ))
     }
 
-    fn keep(&self, body: &[u8]) -> Result<(u16, Value), (u16, String)> {
+    fn keep(&self, body: &[u8]) -> Result<(u16, Answer), Refusal> {
         let request = Self::request(body)?;
         let blobs = request
             .get("blobs")
             .and_then(Value::as_object)
             .ok_or((400, "a blob batch names no blobs".to_owned()))?;
-        let dir = self.root.join("blobs");
-        std::fs::create_dir_all(&dir)
-            .map_err(|error| (500, format!("cannot create {}: {error}", dir.display())))?;
         let mut kept = 0;
         for (named, encoded) in blobs {
             let digest = parse_digest(named).map_err(|e| (400, e))?;
             let bytes = decode(encoded.as_str().unwrap_or(""), named).map_err(|e| (400, e))?;
             if Digest::of(&bytes) != digest {
-                return Err((
-                    400,
-                    format!("the bytes sent as {digest} are not those bytes"),
-                ));
+                return Err((400, not_those_bytes(&digest)));
             }
-            // Written aside and renamed, so a concurrent reader never sees a
-            // partial blob under its digest.
-            let target = self.blob_path(&digest);
-            let partial = tempfile::NamedTempFile::new_in(&dir)
-                .and_then(|mut file| {
-                    std::io::Write::write_all(&mut file, &bytes)?;
-                    Ok(file)
-                })
-                .and_then(|file| file.persist(&target).map_err(|error| error.error))
-                .map_err(|error| (500, format!("cannot keep blob {digest}: {error}")));
-            partial?;
+            self.store(&digest, &bytes)?;
             kept += 1;
         }
-        Ok((200, json!({"protocol": ACTION_PROTOCOL, "kept": kept})))
+        Ok((
+            200,
+            Answer::Json(json!({"protocol": ACTION_PROTOCOL, "kept": kept})),
+        ))
     }
 
-    fn run(&self, body: &[u8]) -> Result<(u16, Value), (u16, String)> {
+    /// One chunk of a large blob, appended at the offset the upload has
+    /// reached; the blob is kept once it is complete and hashes to its
+    /// digest.
+    fn upload(&self, body: &[u8]) -> Result<(u16, Answer), Refusal> {
+        let request = Self::request(body)?;
+        let digest = Self::named_digest(&request)?;
+        let offset = request
+            .get("offset")
+            .and_then(Value::as_u64)
+            .ok_or((400, "an upload names no offset".to_owned()))?;
+        let chunk = decode(
+            request.get("bytes").and_then(Value::as_str).unwrap_or(""),
+            "the chunk",
+        )
+        .map_err(|e| (400, e))?;
+        let size = size_of(&digest);
+        let answer = |committed: u64, complete: bool| {
+            Answer::Json(
+                json!({"protocol": ACTION_PROTOCOL, "committed": committed, "complete": complete}),
+            )
+        };
+        let _uploading = Self::lock(&self.uploads);
+        if self.holds(&digest) {
+            return Ok((200, answer(size, true)));
+        }
+        let partial = self.partial_path(&digest);
+        Self::dir(&self.root.join("partial"))?;
+        let committed = std::fs::metadata(&partial).map_or(0, |meta| meta.len());
+        if offset != committed {
+            return Ok((
+                409,
+                Answer::Json(json!({
+                    "protocol": ACTION_PROTOCOL,
+                    "error": format!("the upload of {digest} is at {committed}, not {offset}"),
+                    "committed": committed,
+                })),
+            ));
+        }
+        let reached = committed + chunk.len() as u64;
+        if reached > size {
+            let _ = std::fs::remove_file(&partial);
+            return Err((
+                400,
+                format!("the upload of {digest} is longer than its digest says"),
+            ));
+        }
+        std::fs::File::options()
+            .create(true)
+            .append(true)
+            .open(&partial)
+            .and_then(|mut file| file.write_all(&chunk))
+            .map_err(|error| Self::keep_refusal(&digest, error))?;
+        if reached < size {
+            return Ok((200, answer(reached, false)));
+        }
+        if digest_of_file(&partial).ok().as_ref() != Some(&digest) {
+            let _ = std::fs::remove_file(&partial);
+            return Err((400, not_those_bytes(&digest)));
+        }
+        Self::dir(&self.root.join("blobs"))?;
+        std::fs::rename(&partial, self.blob_path(&digest))
+            .map_err(|error| Self::keep_refusal(&digest, error))?;
+        self.note_written(size);
+        Ok((200, answer(size, true)))
+    }
+
+    /// One chunk of a held blob, raw.
+    fn fetch(&self, body: &[u8]) -> Result<(u16, Answer), Refusal> {
+        let request = Self::request(body)?;
+        let digest = Self::named_digest(&request)?;
+        let offset = request.get("offset").and_then(Value::as_u64).unwrap_or(0);
+        let limit = request
+            .get("limit")
+            .and_then(Value::as_u64)
+            .unwrap_or(CHUNK_BYTES as u64)
+            .min(CHUNK_BYTES as u64);
+        if !self.holds(&digest) {
+            return Err((404, format!("the sidecar does not hold {digest}")));
+        }
+        let mut chunk = Vec::new();
+        std::fs::File::open(self.blob_path(&digest))
+            .and_then(|mut file| {
+                file.seek(SeekFrom::Start(offset))?;
+                file.take(limit).read_to_end(&mut chunk)
+            })
+            .map_err(|error| (500, format!("cannot read blob {digest}: {error}")))?;
+        Ok((200, Answer::Bytes(chunk)))
+    }
+
+    /// A blob an answer names: inline when small, otherwise kept here and
+    /// named by digest for the runner to fetch.
+    fn answer_blob(&self, bytes: &[u8]) -> Result<Value, Refusal> {
+        let digest = Digest::of(bytes);
+        if bytes.len() <= INLINE_BYTES {
+            return Ok(json!({"digest": digest.to_string(), "bytes": encode(bytes)}));
+        }
+        if !self.holds(&digest) {
+            self.store(&digest, bytes)?;
+        }
+        Ok(json!({"digest": digest.to_string()}))
+    }
+
+    fn run(&self, body: &[u8]) -> Result<(u16, Answer), Refusal> {
         let request = Self::request(body)?;
         let strings = |field: &str| -> Vec<String> {
             request
@@ -326,8 +575,7 @@ impl ActionSidecar {
             .into_iter()
             .flatten()
         {
-            let digest = parse_digest(input.get("digest").and_then(Value::as_str).unwrap_or(""))
-                .map_err(|e| (400, e))?;
+            let digest = Self::named_digest(input)?;
             let executable = input
                 .get("executable")
                 .and_then(Value::as_bool)
@@ -344,7 +592,9 @@ impl ActionSidecar {
             missing.dedup();
             return Ok((
                 409,
-                json!({"protocol": ACTION_PROTOCOL, "error": "inputs are missing from the sidecar", "missing": missing}),
+                Answer::Json(
+                    json!({"protocol": ACTION_PROTOCOL, "error": "inputs are missing from the sidecar", "missing": missing}),
+                ),
             ));
         }
         let action = PreparedAction {
@@ -374,7 +624,38 @@ impl ActionSidecar {
                 .map(Duration::from_millis),
         };
         let outcome = run_confined(&self.root.join("actions"), &action).map_err(|e| (422, e))?;
-        Ok((200, encode_outcome(&outcome)))
+        let mut outputs = serde_json::Map::new();
+        for (path, output) in &outcome.outputs {
+            let encoded = match output {
+                Output::File { bytes, executable } => {
+                    let mut blob = self.answer_blob(bytes)?;
+                    blob["executable"] = json!(executable);
+                    json!({"file": blob})
+                }
+                Output::Directory { files } => {
+                    let mut encoded = serde_json::Map::new();
+                    for (name, (bytes, executable)) in files {
+                        let mut blob = self.answer_blob(bytes)?;
+                        blob["executable"] = json!(executable);
+                        encoded.insert(name.clone(), blob);
+                    }
+                    json!({"directory": encoded})
+                }
+            };
+            outputs.insert(path.clone(), encoded);
+        }
+        Ok((
+            200,
+            Answer::Json(json!({
+                "protocol": ACTION_PROTOCOL,
+                "executor": SIDECAR_EXECUTOR,
+                "exit_code": outcome.exit_code,
+                "timed_out": outcome.timed_out,
+                "stdout": self.answer_blob(&outcome.stdout)?,
+                "stderr": self.answer_blob(&outcome.stderr)?,
+                "outputs": outputs,
+            })),
+        ))
     }
 }
 
@@ -386,96 +667,108 @@ pub fn default_sidecar_root() -> PathBuf {
         .unwrap_or_else(|| std::env::temp_dir().join("whip-executor-actions"))
 }
 
+/// The executor's cache capacity: `WHIP_EXECUTOR_ACTIONS_BYTES`, else
+/// [`DEFAULT_CAPACITY_BYTES`]. A value that is not a positive count of bytes
+/// is the default rather than an unbounded cache.
+pub fn default_sidecar_capacity() -> u64 {
+    std::env::var("WHIP_EXECUTOR_ACTIONS_BYTES")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|bytes| *bytes > 0)
+        .unwrap_or(DEFAULT_CAPACITY_BYTES)
+}
+
 #[cfg(feature = "endpoint")]
 pub use client::SidecarRunner;
 
 #[cfg(feature = "endpoint")]
 mod client {
+    use std::sync::Arc;
+
     use super::*;
     use crate::runner::ActionRunner;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    /// The largest answer the runner reads from a sidecar: the outputs of one
-    /// action, inline.
-    const MAX_RESPONSE_BYTES: u64 = 512 * 1024 * 1024;
+    /// The largest answer the runner reads in one response: an action's
+    /// answer with its small outputs inline, or one chunk.
+    const MAX_ANSWER_BYTES: u64 = 256 * 1024 * 1024;
 
     /// The endpoint's half: a runner that hands each action to a Class-A
-    /// executor at `http://host:port`, authenticated with the executor's own
-    /// bearer token when one is configured.
+    /// executor at an `http://` or `https://` address, authenticated with the
+    /// executor's own bearer token when one is configured. HTTPS trusts the
+    /// platform's roots (and `SSL_CERT_FILE`), and a pool's own CA when it is
+    /// named.
+    #[derive(Clone)]
     pub struct SidecarRunner {
         url: String,
-        address: String,
+        agent: ureq::Agent,
         token: Option<String>,
     }
 
     impl SidecarRunner {
         pub fn new(url: &str, token: Option<String>) -> Result<Self, String> {
-            let address = url
+            Self::connect(url, token, None)
+        }
+
+        /// A runner whose HTTPS also trusts the certificates in `ca`, a PEM
+        /// bundle — a pool behind its own authority.
+        pub fn trusting(url: &str, token: Option<String>, ca: &Path) -> Result<Self, String> {
+            Self::connect(url, token, Some(ca))
+        }
+
+        fn connect(url: &str, token: Option<String>, ca: Option<&Path>) -> Result<Self, String> {
+            let base = url.trim_end_matches('/');
+            let host = base
                 .strip_prefix("http://")
-                .map(|rest| rest.trim_end_matches('/'))
-                .filter(|rest| !rest.is_empty() && !rest.contains('/'))
-                .ok_or_else(|| {
-                    format!("the sidecar runner speaks plain HTTP to host:port; {url} is not an http://host:port address")
-                })?;
+                .or_else(|| base.strip_prefix("https://"))
+                .filter(|host| !host.is_empty());
+            if host.is_none() {
+                return Err(format!(
+                    "the sidecar runner speaks HTTP or HTTPS; {url} is neither"
+                ));
+            }
+            let mut agent = ureq::AgentBuilder::new();
+            if let Some(ca) = ca {
+                agent = agent.tls_config(Arc::new(trusting(ca)?));
+            }
             Ok(Self {
-                url: url.trim_end_matches('/').to_owned(),
-                address: address.to_owned(),
+                url: base.to_owned(),
+                agent: agent.build(),
                 token: token.filter(|token| !token.trim().is_empty()),
             })
         }
 
-        /// One HTTP/1.1 request, `connection: close`, as the executor serves.
-        async fn post(&self, path: &str, body: &Value) -> Result<(u16, Value), String> {
-            let unreachable = |error: std::io::Error| {
-                format!("the sidecar at {} did not answer {path}: {error}", self.url)
+        /// One request; the status and the body, whatever the status.
+        fn call(&self, path: &str, body: &Value) -> Result<(u16, Vec<u8>), String> {
+            let mut request = self
+                .agent
+                .post(&format!("{}{path}", self.url))
+                .set("content-type", "application/json");
+            if let Some(token) = &self.token {
+                request = request.set("authorization", &format!("Bearer {token}"));
+            }
+            // A request that never reached an answer, and an answer that
+            // broke off, are the same fact to the caller.
+            let answered = match request.send_string(&body.to_string()) {
+                Ok(response) | Err(ureq::Error::Status(_, response)) => {
+                    let status = response.status();
+                    let mut answer = Vec::new();
+                    response
+                        .into_reader()
+                        .take(MAX_ANSWER_BYTES)
+                        .read_to_end(&mut answer)
+                        .map(|_| (status, answer))
+                        .map_err(|error| error.to_string())
+                }
+                Err(error) => Err(error.to_string()),
             };
-            let payload = body.to_string();
-            let mut stream = tokio::net::TcpStream::connect(&self.address)
-                .await
-                .map_err(unreachable)?;
-            let authorization = self
-                .token
-                .as_ref()
-                .map(|token| format!("authorization: Bearer {token}\r\n"))
-                .unwrap_or_default();
-            let head = format!(
-                "POST {path} HTTP/1.1\r\nhost: {}\r\ncontent-type: application/json\r\ncontent-length: {}\r\n{authorization}connection: close\r\n\r\n",
-                self.address,
-                payload.len()
-            );
-            stream
-                .write_all(head.as_bytes())
-                .await
-                .map_err(unreachable)?;
-            stream
-                .write_all(payload.as_bytes())
-                .await
-                .map_err(unreachable)?;
-            let mut answer = Vec::new();
-            (&mut stream)
-                .take(MAX_RESPONSE_BYTES)
-                .read_to_end(&mut answer)
-                .await
-                .map_err(unreachable)?;
-            let (split, status) = answer
-                .windows(4)
-                .position(|window| window == b"\r\n\r\n")
-                .and_then(|split| {
-                    let status = std::str::from_utf8(&answer[..split])
-                        .ok()?
-                        .split_whitespace()
-                        .nth(1)?
-                        .parse::<u16>()
-                        .ok()?;
-                    Some((split, status))
-                })
-                .ok_or_else(|| {
-                    format!(
-                        "the sidecar at {} answered {path} with no HTTP response",
-                        self.url
-                    )
-                })?;
-            let value = serde_json::from_slice(&answer[split + 4..]).map_err(|error| {
+            answered.map_err(|error| {
+                format!("the sidecar at {} did not answer {path}: {error}", self.url)
+            })
+        }
+
+        fn json(&self, path: &str, body: &Value) -> Result<(u16, Value), String> {
+            let (status, answer) = self.call(path, body)?;
+            let value = serde_json::from_slice(&answer).map_err(|error| {
                 format!(
                     "the sidecar at {} answered {path} with no JSON: {error}",
                     self.url
@@ -495,47 +788,113 @@ mod client {
             )
         }
 
-        /// Send the named blobs in batches the executor accepts.
-        async fn send(&self, action: &PreparedAction, wanted: &[String]) -> Result<(), String> {
-            let by_digest: BTreeMap<String, (&String, &Vec<u8>)> = action
+        fn ok(&self, path: &str, body: &Value) -> Result<Value, String> {
+            let (status, value) = self.json(path, body)?;
+            if status != 200 {
+                return Err(self.refused(path, status, &value));
+            }
+            Ok(value)
+        }
+
+        /// Send the named blobs: small ones in batches, large ones in chunks.
+        fn send(&self, action: &PreparedAction, wanted: &[String]) -> Result<(), String> {
+            let by_digest: BTreeMap<String, &Vec<u8>> = action
                 .inputs
-                .iter()
-                .map(|(path, (bytes, _))| (Digest::of(bytes).to_string(), (path, bytes)))
+                .values()
+                .map(|(bytes, _)| (Digest::of(bytes).to_string(), bytes))
                 .collect();
             let mut batch = serde_json::Map::new();
             let mut size = 0;
             for named in wanted {
-                let Some((path, bytes)) = by_digest.get(named) else {
+                let Some(bytes) = by_digest.get(named) else {
                     return Err(format!(
                         "the sidecar at {} asked for {named}, which this action does not name",
                         self.url
                     ));
                 };
-                if bytes.len() > BLOB_BATCH_BYTES {
-                    return Err(format!(
-                        "input {path} ({} bytes) is larger than the sidecar accepts in one request",
-                        bytes.len()
-                    ));
+                if bytes.len() > CHUNK_BYTES {
+                    self.upload(&Digest::of(bytes), bytes)?;
+                    continue;
                 }
-                if size + bytes.len() > BLOB_BATCH_BYTES {
-                    self.keep(std::mem::take(&mut batch)).await?;
+                if size + bytes.len() > CHUNK_BYTES {
+                    self.ok(
+                        "/action/blobs",
+                        &json!({"protocol": ACTION_PROTOCOL, "blobs": std::mem::take(&mut batch)}),
+                    )?;
                     size = 0;
                 }
                 size += bytes.len();
                 batch.insert(named.clone(), Value::String(encode(bytes)));
             }
             if !batch.is_empty() {
-                self.keep(batch).await?;
+                self.ok(
+                    "/action/blobs",
+                    &json!({"protocol": ACTION_PROTOCOL, "blobs": batch}),
+                )?;
             }
             Ok(())
         }
 
-        async fn keep(&self, blobs: serde_json::Map<String, Value>) -> Result<(), String> {
-            let body = json!({"protocol": ACTION_PROTOCOL, "blobs": blobs});
-            match self.post("/action/blobs", &body).await? {
-                (200, _) => Ok(()),
-                (status, value) => Err(self.refused("/action/blobs", status, &value)),
+        /// Upload one large blob chunk by chunk, resuming where the sidecar
+        /// says its upload stands.
+        fn upload(&self, digest: &Digest, bytes: &[u8]) -> Result<(), String> {
+            let mut offset: usize = 0;
+            // Every chunk, and one resumption per chunk, before it is a
+            // refusal rather than a loop.
+            let mut budget = 2 * (bytes.len() / CHUNK_BYTES + 1);
+            loop {
+                let end = (offset + CHUNK_BYTES).min(bytes.len());
+                let request = json!({
+                    "protocol": ACTION_PROTOCOL,
+                    "digest": digest.to_string(),
+                    "offset": offset,
+                    "bytes": encode(&bytes[offset..end]),
+                });
+                let (status, value) = self.json("/action/upload", &request)?;
+                let committed = value
+                    .get("committed")
+                    .and_then(Value::as_u64)
+                    .and_then(|committed| usize::try_from(committed).ok());
+                match (status, committed) {
+                    (200, _) if value.get("complete").and_then(Value::as_bool) == Some(true) => {
+                        return Ok(())
+                    }
+                    (200 | 409, Some(committed)) if committed < bytes.len() && budget > 0 => {
+                        offset = committed;
+                        budget -= 1;
+                    }
+                    _ => return Err(self.refused("/action/upload", status, &value)),
+                }
             }
+        }
+
+        /// Read one blob the sidecar holds, chunk by chunk.
+        fn fetch(&self, digest: &Digest) -> Result<Vec<u8>, String> {
+            let size = usize::try_from(digest.size_bytes).unwrap_or(0);
+            let mut bytes = Vec::with_capacity(size.min(CHUNK_BYTES));
+            while bytes.len() < size {
+                let request = json!({
+                    "protocol": ACTION_PROTOCOL,
+                    "digest": digest.to_string(),
+                    "offset": bytes.len(),
+                    "limit": CHUNK_BYTES,
+                });
+                match self.call("/action/fetch", &request)? {
+                    (200, chunk) if !chunk.is_empty() => bytes.extend_from_slice(&chunk),
+                    (200, _) => {
+                        return Err(format!(
+                            "the sidecar at {} ended {digest} after {} bytes",
+                            self.url,
+                            bytes.len()
+                        ))
+                    }
+                    (status, answer) => {
+                        let value = serde_json::from_slice(&answer).unwrap_or(Value::Null);
+                        return Err(self.refused("/action/fetch", status, &value));
+                    }
+                }
+            }
+            Ok(bytes)
         }
 
         fn missing_of(value: &Value) -> Vec<String> {
@@ -547,6 +906,66 @@ mod client {
                 .filter_map(|v| v.as_str().map(str::to_owned))
                 .collect()
         }
+
+        /// The whole exchange for one action, blocking.
+        pub fn run_blocking(&self, action: &PreparedAction) -> Result<ActionOutcome, String> {
+            let digests: Vec<String> = action
+                .inputs
+                .values()
+                .map(|(bytes, _)| Digest::of(bytes).to_string())
+                .collect();
+            let asked = json!({"protocol": ACTION_PROTOCOL, "digests": digests});
+            let missing = Self::missing_of(&self.ok("/action/missing", &asked)?);
+            self.send(action, &missing)?;
+            let encoded = encode_action(action);
+            // A sidecar may lose a blob between the requests; what it names
+            // as missing is sent once more, and a second loss is a refusal
+            // rather than a loop.
+            for attempt in 0..2 {
+                match self.json("/action", &encoded)? {
+                    (200, value) => return decode_outcome(&value, |digest| self.fetch(digest)),
+                    (409, value) if attempt == 0 && !Self::missing_of(&value).is_empty() => {
+                        self.send(action, &Self::missing_of(&value))?;
+                    }
+                    (status, value) => return Err(self.refused("/action", status, &value)),
+                }
+            }
+            unreachable!("the second attempt returns")
+        }
+    }
+
+    /// A TLS configuration trusting the platform's roots and every
+    /// certificate in the PEM bundle at `ca`.
+    fn trusting(ca: &Path) -> Result<rustls::ClientConfig, String> {
+        let unusable = |error: String| {
+            format!(
+                "{} is not a usable PEM certificate bundle: {error}",
+                ca.display()
+            )
+        };
+        let mut roots = rustls::RootCertStore::empty();
+        for cert in rustls_native_certs::load_native_certs().unwrap_or_default() {
+            let _ = roots.add(cert);
+        }
+        let pem = std::fs::read(ca).map_err(|error| unusable(error.to_string()))?;
+        let mut named = 0;
+        for cert in rustls_pemfile::certs(&mut pem.as_slice()) {
+            let cert = cert.map_err(|error| unusable(error.to_string()))?;
+            roots
+                .add(cert)
+                .map_err(|error| unusable(error.to_string()))?;
+            named += 1;
+        }
+        if named == 0 {
+            return Err(unusable("it holds no certificate".into()));
+        }
+        Ok(rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .expect("the ring provider supports the default protocol versions")
+        .with_root_certificates(roots)
+        .with_no_client_auth())
     }
 
     #[async_trait::async_trait]
@@ -556,517 +975,13 @@ mod client {
         }
 
         async fn run(&self, action: PreparedAction) -> Result<ActionOutcome, String> {
-            let digests: Vec<String> = action
-                .inputs
-                .values()
-                .map(|(bytes, _)| Digest::of(bytes).to_string())
-                .collect();
-            let asked = json!({"protocol": ACTION_PROTOCOL, "digests": digests});
-            let missing = match self.post("/action/missing", &asked).await? {
-                (200, value) => Self::missing_of(&value),
-                (status, value) => return Err(self.refused("/action/missing", status, &value)),
-            };
-            self.send(&action, &missing).await?;
-            let encoded = encode_action(&action);
-            // A sidecar may lose a blob between the two requests; what it
-            // names as missing is sent once more, and a second loss is a
-            // refusal rather than a loop.
-            for attempt in 0..2 {
-                match self.post("/action", &encoded).await? {
-                    (200, value) => return decode_outcome(&value),
-                    (409, value) if attempt == 0 && !Self::missing_of(&value).is_empty() => {
-                        self.send(&action, &Self::missing_of(&value)).await?;
-                    }
-                    (status, value) => return Err(self.refused("/action", status, &value)),
-                }
-            }
-            unreachable!("the second attempt returns")
+            let runner = self.clone();
+            tokio::task::spawn_blocking(move || runner.run_blocking(&action))
+                .await
+                .unwrap_or_else(|failed| std::panic::resume_unwind(failed.into_panic()))
         }
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn action(inputs: &[(&str, &[u8])]) -> PreparedAction {
-        PreparedAction {
-            arguments: vec![
-                "sh".into(),
-                "-c".into(),
-                "tr a-z A-Z < in.txt > out.txt; mkdir -p d; echo x > d/x; echo ran".into(),
-            ],
-            environment: vec![("LANG".into(), "C".into())],
-            working_directory: String::new(),
-            inputs: inputs
-                .iter()
-                .map(|(path, bytes)| ((*path).to_owned(), (bytes.to_vec(), false)))
-                .collect(),
-            output_paths: vec!["out.txt".into(), "d".into()],
-            timeout: Some(Duration::from_secs(30)),
-        }
-    }
-
-    fn body(value: Value) -> Vec<u8> {
-        value.to_string().into_bytes()
-    }
-
-    #[test]
-    fn the_sidecar_runs_what_it_holds_and_names_what_it_lacks() {
-        let root = tempfile::tempdir().expect("scratch");
-        let sidecar = ActionSidecar::new(root.path());
-        let prepared = action(&[("in.txt", b"shout")]);
-        let input = Digest::of(b"shout");
-        assert_eq!(sidecar.handle("/exec", b"{}"), None);
-        let (status, answer) = sidecar
-            .handle(
-                "/action/missing",
-                &body(json!({"protocol": ACTION_PROTOCOL, "digests": [input.to_string(), Digest::empty().to_string()]})),
-            )
-            .unwrap();
-        assert_eq!(
-            (status, answer["missing"].clone()),
-            (200, json!([input.to_string()]))
-        );
-        // Asked to run before it holds the input, it names what is missing.
-        let (status, answer) = sidecar
-            .handle("/action", &body(encode_action(&prepared)))
-            .unwrap();
-        assert_eq!(status, 409);
-        assert_eq!(answer["missing"], json!([input.to_string()]));
-        // Bytes that are not the digest they are sent as are refused.
-        let (status, answer) = sidecar
-            .handle(
-                "/action/blobs",
-                &body(json!({"protocol": ACTION_PROTOCOL, "blobs": {input.to_string(): encode(b"other")}})),
-            )
-            .unwrap();
-        assert_eq!(
-            (status, answer["error"].clone()),
-            (
-                400,
-                json!(format!("the bytes sent as {input} are not those bytes"))
-            )
-        );
-        let (status, _) = sidecar
-            .handle(
-                "/action/blobs",
-                &body(json!({"protocol": ACTION_PROTOCOL, "blobs": {input.to_string(): encode(b"shout")}})),
-            )
-            .unwrap();
-        assert_eq!(status, 200);
-        let (status, answer) = sidecar
-            .handle("/action", &body(encode_action(&prepared)))
-            .unwrap();
-        assert_eq!(status, 200, "{answer}");
-        let outcome = decode_outcome(&answer).unwrap();
-        assert_eq!(outcome.exit_code, 0);
-        assert_eq!(outcome.stdout, b"ran\n");
-        assert!(
-            matches!(&outcome.outputs["out.txt"], Output::File { bytes, .. } if bytes == b"SHOUT")
-        );
-        assert!(
-            matches!(&outcome.outputs["d"], Output::Directory { files } if files["x"].0 == b"x\n")
-        );
-        // What the wire refuses, it refuses by name.
-        for (path, request, expected) in [
-            (
-                "/action",
-                json!({"protocol": "other/v1"}),
-                "expected protocol whipplescript.build.action/v1, not other/v1",
-            ),
-            (
-                "/action/blobs",
-                json!({"protocol": ACTION_PROTOCOL}),
-                "a blob batch names no blobs",
-            ),
-            (
-                "/action/missing",
-                json!({"protocol": ACTION_PROTOCOL, "digests": ["nohash"]}),
-                "not a digest: nohash",
-            ),
-        ] {
-            let (status, answer) = sidecar.handle(path, &body(request)).unwrap();
-            assert_eq!((status, answer["error"].as_str().unwrap()), (400, expected));
-        }
-        assert!(sidecar.handle("/action", b"not json").unwrap().1["error"]
-            .as_str()
-            .unwrap()
-            .starts_with("invalid JSON body: "));
-        let (status, answer) = sidecar
-            .handle(
-                "/action",
-                &body(json!({"protocol": ACTION_PROTOCOL, "arguments": []})),
-            )
-            .unwrap();
-        assert_eq!(
-            (status, answer["error"].as_str().unwrap()),
-            (422, "an action names no command")
-        );
-        assert_eq!(
-            decode_outcome(&json!({"protocol": ACTION_PROTOCOL})).unwrap_err(),
-            "the sidecar's answer names no exit code"
-        );
-        assert_eq!(
-            decode_outcome(
-                &json!({"protocol": ACTION_PROTOCOL, "exit_code": 0, "outputs": {"o": {}}})
-            )
-            .unwrap_err(),
-            "output o is neither a file nor a directory"
-        );
-        assert_eq!(
-            decode_outcome(&json!({"protocol": ACTION_PROTOCOL, "exit_code": 0, "stdout": "!!"}))
-                .unwrap_err(),
-            "stdout is not base64: Invalid symbol 33, offset 0."
-        );
-        assert_eq!(
-            decode_outcome(&json!({"protocol": ACTION_PROTOCOL, "exit_code": 0, "outputs": {"o": {"directory": 3}}}))
-                .unwrap_err(),
-            "o is not a map of files"
-        );
-        // A root it cannot write under, and a blob it cannot put in place.
-        let batch = body(
-            json!({"protocol": ACTION_PROTOCOL, "blobs": {input.to_string(): encode(b"shout")}}),
-        );
-        let unwritable = root.path().join("blobs").join(&input.hash);
-        let (status, answer) = ActionSidecar::new(&unwritable)
-            .handle("/action/blobs", &batch)
-            .unwrap();
-        assert_eq!(status, 500);
-        assert!(answer["error"].as_str().unwrap().starts_with(&format!(
-            "cannot create {}: ",
-            unwritable.join("blobs").display()
-        )));
-        let blocked = tempfile::tempdir().expect("scratch");
-        std::fs::create_dir_all(blocked.path().join("blobs").join(&input.hash).join("x"))
-            .expect("the fixture's own step");
-        let (status, answer) = ActionSidecar::new(blocked.path())
-            .handle("/action/blobs", &batch)
-            .unwrap();
-        assert_eq!(status, 500);
-        assert!(answer["error"]
-            .as_str()
-            .unwrap()
-            .starts_with(&format!("cannot keep blob {input}: ")));
-    }
-}
-
-#[cfg(all(test, feature = "endpoint"))]
-mod client_tests {
-    use super::*;
-    use crate::runner::ActionRunner;
-    use std::io::{BufRead, BufReader, Read, Write};
-    use std::sync::{Arc, Mutex};
-
-    type Seen = Arc<Mutex<Vec<(String, Option<String>)>>>;
-
-    /// A one-thread HTTP/1.1 server answering each request with `respond`,
-    /// recording each path and its authorization header.
-    fn serve(respond: impl Fn(&str, &[u8]) -> Vec<u8> + Send + 'static) -> (String, Seen) {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a port");
-        let url = format!("http://{}", listener.local_addr().expect("an address"));
-        let seen: Seen = Arc::default();
-        let log = seen.clone();
-        std::thread::spawn(move || {
-            for stream in listener.incoming() {
-                let Ok(mut stream) = stream else { return };
-                let mut reader = BufReader::new(stream.try_clone().expect("a clone"));
-                let mut line = String::new();
-                reader.read_line(&mut line).expect("a request line");
-                let path = line.split_whitespace().nth(1).unwrap_or("").to_owned();
-                let (mut length, mut authorization) = (0, None);
-                loop {
-                    let mut header = String::new();
-                    reader.read_line(&mut header).expect("a header");
-                    let header = header.trim_end();
-                    if header.is_empty() {
-                        break;
-                    }
-                    let (name, value) = header.split_once(':').expect("a header");
-                    if name.eq_ignore_ascii_case("content-length") {
-                        length = value.trim().parse().expect("a length");
-                    } else if name.eq_ignore_ascii_case("authorization") {
-                        authorization = Some(value.trim().to_owned());
-                    }
-                }
-                let mut body = vec![0; length];
-                reader.read_exact(&mut body).expect("a body");
-                log.lock()
-                    .expect("the log")
-                    .push((path.clone(), authorization));
-                let _ = stream.write_all(&respond(&path, &body));
-            }
-        });
-        (url, seen)
-    }
-
-    fn http(status: u16, value: &Value) -> Vec<u8> {
-        let body = value.to_string();
-        format!(
-            "HTTP/1.1 {status} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-            body.len()
-        )
-        .into_bytes()
-    }
-
-    fn sidecar(root: &std::path::Path) -> impl Fn(&str, &[u8]) -> Vec<u8> + Send + 'static {
-        let sidecar = ActionSidecar::new(root);
-        move |path, body| {
-            let (status, value) = sidecar.handle(path, body).expect("an action route");
-            http(status, &value)
-        }
-    }
-
-    fn action(input: &[u8]) -> PreparedAction {
-        PreparedAction {
-            arguments: vec![
-                "sh".into(),
-                "-c".into(),
-                "tr a-z A-Z < in.txt > out.txt".into(),
-            ],
-            environment: vec![],
-            working_directory: String::new(),
-            inputs: [("in.txt".to_owned(), (input.to_vec(), false))]
-                .into_iter()
-                .collect(),
-            output_paths: vec!["out.txt".into()],
-            timeout: Some(Duration::from_secs(30)),
-        }
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn the_runner_sends_only_what_the_sidecar_lacks_and_reads_back_the_outputs() {
-        let root = tempfile::tempdir().expect("scratch");
-        let (url, seen) = serve(sidecar(root.path()));
-        let runner = SidecarRunner::new(&url, Some("secret".into())).unwrap();
-        assert_eq!(runner.name(), SIDECAR_EXECUTOR);
-        for _ in 0..2 {
-            let outcome = runner
-                .run(action(b"loud"))
-                .await
-                .expect("ran at the sidecar");
-            assert!(
-                matches!(&outcome.outputs["out.txt"], Output::File { bytes, .. } if bytes == b"LOUD")
-            );
-        }
-        let seen = seen.lock().unwrap().clone();
-        let paths: Vec<&str> = seen.iter().map(|(path, _)| path.as_str()).collect();
-        // The second run found the input held and sent no blob.
-        assert_eq!(
-            paths,
-            [
-                "/action/missing",
-                "/action/blobs",
-                "/action",
-                "/action/missing",
-                "/action"
-            ]
-        );
-        assert!(seen
-            .iter()
-            .all(|(_, auth)| auth.as_deref() == Some("Bearer secret")));
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn a_sidecar_that_loses_an_input_is_sent_it_once_more_and_then_refused() {
-        let root = tempfile::tempdir().expect("scratch");
-        let real = sidecar(root.path());
-        let losses = Arc::new(Mutex::new(1));
-        let remaining = losses.clone();
-        let blob_dir = root.path().join("blobs");
-        let (url, _) = serve(move |path, body| {
-            if path == "/action" && *remaining.lock().unwrap() > 0 {
-                *remaining.lock().unwrap() -= 1;
-                let _ = std::fs::remove_dir_all(&blob_dir);
-            }
-            real(path, body)
-        });
-        let runner = SidecarRunner::new(&url, None).unwrap();
-        runner
-            .run(action(b"once"))
-            .await
-            .expect("recovered by one resend");
-        *losses.lock().unwrap() = 2;
-        assert_eq!(
-            runner.run(action(b"twice")).await.unwrap_err(),
-            format!(
-                "the sidecar at {url} refused /action (409): inputs are missing from the sidecar"
-            )
-        );
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn what_the_runner_cannot_use_it_refuses_by_name() {
-        assert_eq!(
-            SidecarRunner::new("https://pool.example:8080", None).err(),
-            Some("the sidecar runner speaks plain HTTP to host:port; https://pool.example:8080 is not an http://host:port address".into())
-        );
-        let closed = {
-            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            format!("http://{}", listener.local_addr().unwrap())
-        };
-        assert!(SidecarRunner::new(&closed, None)
-            .unwrap()
-            .run(action(b"x"))
-            .await
-            .unwrap_err()
-            .starts_with(&format!(
-                "the sidecar at {closed} did not answer /action/missing: "
-            )));
-        let (url, _) = serve(|_, _| b"garbage".to_vec());
-        assert_eq!(
-            SidecarRunner::new(&url, None)
-                .unwrap()
-                .run(action(b"x"))
-                .await
-                .unwrap_err(),
-            format!("the sidecar at {url} answered /action/missing with no HTTP response")
-        );
-        let (url, _) = serve(|_, _| b"HTTP/1.1 200 OK\r\n\r\nnot json".to_vec());
-        assert!(SidecarRunner::new(&url, None)
-            .unwrap()
-            .run(action(b"x"))
-            .await
-            .unwrap_err()
-            .starts_with(&format!(
-                "the sidecar at {url} answered /action/missing with no JSON: "
-            )));
-        let (url, _) = serve(|_, _| http(401, &json!({"error": "unauthorized"})));
-        assert_eq!(
-            SidecarRunner::new(&url, None)
-                .unwrap()
-                .run(action(b"x"))
-                .await
-                .unwrap_err(),
-            format!("the sidecar at {url} refused /action/missing (401): unauthorized")
-        );
-        let stranger = Digest::of(b"not an input").to_string();
-        let (url, _) = serve(move |path, _| {
-            if path == "/action/missing" {
-                http(
-                    200,
-                    &json!({"protocol": ACTION_PROTOCOL, "missing": [stranger.clone()]}),
-                )
-            } else {
-                http(500, &json!({}))
-            }
-        });
-        assert_eq!(
-            SidecarRunner::new(&url, None)
-                .unwrap()
-                .run(action(b"x"))
-                .await
-                .unwrap_err(),
-            format!(
-                "the sidecar at {url} asked for {}, which this action does not name",
-                Digest::of(b"not an input")
-            )
-        );
-        let root = tempfile::tempdir().expect("scratch");
-        let (url, _) = serve(sidecar(root.path()));
-        let (blobs, _) = serve(|path, _| {
-            if path == "/action/missing" {
-                http(
-                    200,
-                    &json!({"protocol": ACTION_PROTOCOL, "missing": [Digest::of(b"x").to_string()]}),
-                )
-            } else {
-                http(507, &json!({"error": "full"}))
-            }
-        });
-        assert_eq!(
-            SidecarRunner::new(&blobs, None)
-                .unwrap()
-                .run(action(b"x"))
-                .await
-                .unwrap_err(),
-            format!("the sidecar at {blobs} refused /action/blobs (507): full")
-        );
-        let huge = vec![b'a'; BLOB_BATCH_BYTES + 1];
-        assert_eq!(
-            SidecarRunner::new(&url, None)
-                .unwrap()
-                .run(action(&huge))
-                .await
-                .unwrap_err(),
-            format!(
-                "input in.txt ({} bytes) is larger than the sidecar accepts in one request",
-                BLOB_BATCH_BYTES + 1
-            )
-        );
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn the_endpoint_records_what_the_sidecar_ran_as_the_sidecars() {
-        use crate::endpoint::Endpoint;
-        use crate::proto::re;
-        use crate::store::{Labels, Principal};
-        use prost::Message;
-        let root = tempfile::tempdir().expect("scratch");
-        let (url, seen) = serve(sidecar(root.path()));
-        let endpoint = Endpoint::new(Arc::new(SidecarRunner::new(&url, None).unwrap()));
-        let (_, view) = endpoint
-            .admit(Principal {
-                name: "owner".into(),
-                labels: Labels::new(),
-            })
-            .expect("admitted");
-        let put = |bytes: Vec<u8>| endpoint.store.put(&view, &bytes, &Labels::new()).unwrap();
-        let file = put(b"remote".to_vec());
-        let command = put(re::Command {
-            arguments: vec![
-                "sh".into(),
-                "-c".into(),
-                "tr a-z A-Z < in.txt > out.txt".into(),
-            ],
-            output_paths: vec!["out.txt".into()],
-            ..Default::default()
-        }
-        .encode_to_vec());
-        let root_directory = put(re::Directory {
-            files: vec![re::FileNode {
-                name: "in.txt".into(),
-                digest: Some(file.to_proto()),
-                is_executable: false,
-                node_properties: None,
-            }],
-            ..Default::default()
-        }
-        .encode_to_vec());
-        let action = put(re::Action {
-            command_digest: Some(command.to_proto()),
-            input_root_digest: Some(root_directory.to_proto()),
-            ..Default::default()
-        }
-        .encode_to_vec());
-        let executed = endpoint.execute(&view, &action, false).await.expect("ran");
-        assert_eq!(
-            executed.result.execution_metadata.as_ref().unwrap().worker,
-            SIDECAR_EXECUTOR
-        );
-        let output =
-            Digest::from_proto(executed.result.output_files[0].digest.as_ref().unwrap()).unwrap();
-        assert_eq!(
-            endpoint.store.get(&view, &output).as_deref(),
-            Some(&b"REMOTE"[..])
-        );
-        assert_eq!(
-            endpoint.evidence(&action).map(|entry| entry.origin),
-            Some(crate::cache::Origin::Executed {
-                executor: SIDECAR_EXECUTOR.into()
-            })
-        );
-        assert!(seen
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|(path, _)| path == "/action"));
-        assert!(
-            endpoint
-                .execute(&view, &action, false)
-                .await
-                .expect("served")
-                .cached
-        );
-    }
-}
+mod tests;

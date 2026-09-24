@@ -44,6 +44,13 @@ hyper-util = { version = "0.1", features = ["tokio"], optional = true }
 async-trait = { version = "0.1", optional = true }
 futures = { version = "0.3", optional = true }
 rand = { version = "0.8", optional = true }
+# The sidecar runner's client: HTTP and HTTPS to a Class-A executor, with
+# rustls on the ring provider as the workspace already builds it, the
+# platform's roots, and a pool's own CA from a PEM bundle.
+ureq = { version = "2", features = ["json", "native-certs"], optional = true }
+rustls = { version = "0.23", default-features = false, features = ["logging", "ring", "std", "tls12"], optional = true }
+rustls-native-certs = { version = "0.7", optional = true }
+rustls-pemfile = { version = "2", optional = true }
 
 [features]
 default = ["endpoint"]
@@ -61,9 +68,16 @@ endpoint = [
     "dep:async-trait",
     "dep:futures",
     "dep:rand",
+    "dep:ureq",
+    "dep:rustls",
+    "dep:rustls-native-certs",
+    "dep:rustls-pemfile",
 ]
 
 [dev-dependencies]
+# A CA and a server certificate minted per test, so the sidecar's HTTPS is
+# tested against a real handshake without a key in the tree.
+rcgen = { version = "0.13", default-features = false, features = ["crypto", "pem", "ring"] }
 protox = "0.9"
 prost-build = "0.14"
 tonic-prost-build = "0.14"

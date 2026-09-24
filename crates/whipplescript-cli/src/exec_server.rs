@@ -531,17 +531,23 @@ fn handle_connection(
             }
         }
         // Build actions an endpoint hands to this executor
-        // (`whipplescript.build.action/v1`): the sidecar tier as the
+        // (`whipplescript.build.action/v2`): the sidecar tier as the
         // endpoint's runner, confined exactly as the endpoint's own runner is.
+        // A fetched chunk of a blob goes back raw.
         ("POST", route) if is_action_route(route) => {
+            use whipplescript_remote_execution::sidecar::Answer;
             match check_executor_auth(
                 local_addr.map(|addr| addr.ip()),
                 &authorization,
                 &executor_token_header,
             ) {
-                Ok(()) => action_sidecar()
-                    .handle(route, &body)
-                    .unwrap_or_else(|| (404, json!({"error": "unknown action route"}))),
+                Ok(()) => match action_sidecar().handle(route, &body) {
+                    Some((status, Answer::Json(value))) => (status, value),
+                    Some((status, Answer::Bytes(bytes))) => {
+                        return write_bytes_response(stream, status, &bytes);
+                    }
+                    None => (404, json!({"error": "unknown action route"})),
+                },
                 Err((status, message)) => (status, json!({"error": message})),
             }
         }
@@ -577,15 +583,41 @@ fn is_action_route(path: &str) -> bool {
 }
 
 /// The executor's build-action half: one blob cache and scratch root per
-/// process, under `WHIP_EXECUTOR_ACTIONS` or the system's temporary directory.
+/// process, under `WHIP_EXECUTOR_ACTIONS` or the system's temporary directory,
+/// holding at most `WHIP_EXECUTOR_ACTIONS_BYTES`.
 fn action_sidecar() -> &'static whipplescript_remote_execution::sidecar::ActionSidecar {
-    static SIDECAR: std::sync::OnceLock<whipplescript_remote_execution::sidecar::ActionSidecar> =
-        std::sync::OnceLock::new();
+    use whipplescript_remote_execution::sidecar::{
+        default_sidecar_capacity, default_sidecar_root, ActionSidecar,
+    };
+    static SIDECAR: std::sync::OnceLock<ActionSidecar> = std::sync::OnceLock::new();
     SIDECAR.get_or_init(|| {
-        whipplescript_remote_execution::sidecar::ActionSidecar::new(
-            whipplescript_remote_execution::sidecar::default_sidecar_root(),
-        )
+        ActionSidecar::with_capacity(default_sidecar_root(), default_sidecar_capacity())
     })
+}
+
+fn status_text(status: u16) -> &'static str {
+    match status {
+        200 => "OK",
+        400 => "Bad Request",
+        401 => "Unauthorized",
+        404 => "Not Found",
+        409 => "Conflict",
+        413 => "Payload Too Large",
+        422 => "Unprocessable Content",
+        431 => "Request Header Fields Too Large",
+        _ => "Internal Server Error",
+    }
+}
+
+fn write_bytes_response(mut stream: TcpStream, status: u16, bytes: &[u8]) -> std::io::Result<()> {
+    write!(
+        stream,
+        "HTTP/1.1 {status} {}\r\ncontent-type: application/octet-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+        status_text(status),
+        bytes.len(),
+    )?;
+    stream.write_all(bytes)?;
+    stream.flush()
 }
 
 fn write_json_response(
@@ -597,17 +629,7 @@ fn write_json_response(
     write!(
         stream,
         "HTTP/1.1 {status} {}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{payload}",
-        match status {
-            200 => "OK",
-            400 => "Bad Request",
-            404 => "Not Found",
-            409 => "Conflict",
-            401 => "Unauthorized",
-            413 => "Payload Too Large",
-            422 => "Unprocessable Content",
-            431 => "Request Header Fields Too Large",
-            _ => "Internal Server Error",
-        },
+        status_text(status),
         payload.len(),
     )?;
     stream.flush()
@@ -1673,13 +1695,17 @@ mod tests {
                 SidecarRunner::new(&base, None)
                     .expect("an http address")
                     .run(PreparedAction {
-                        arguments: vec!["sh".into(), "-c".into(), "wc -c < in.bin > count".into()],
+                        arguments: vec![
+                            "sh".into(),
+                            "-c".into(),
+                            "wc -c < in.bin > count; cat in.bin in.bin > twice".into(),
+                        ],
                         environment: vec![],
                         working_directory: String::new(),
                         inputs: [("in.bin".to_owned(), (input.clone(), false))]
                             .into_iter()
                             .collect(),
-                        output_paths: vec!["count".into()],
+                        output_paths: vec!["count".into(), "twice".into()],
                         timeout: Some(Duration::from_secs(60)),
                     }),
             )
@@ -1692,6 +1718,10 @@ mod tests {
             ),
             other => panic!("not a file: {other:?}"),
         }
+        // Larger than an answer carries inline: fetched back as raw chunks.
+        assert!(
+            matches!(&outcome.outputs["twice"], Output::File { bytes, .. } if bytes.len() == 2 * input.len())
+        );
         match ureq::post(&format!("{base}/action/elsewhere")).send_json(json!({})) {
             Err(ureq::Error::Status(404, response)) => assert_eq!(
                 response.into_json::<Value>().expect("json")["error"],

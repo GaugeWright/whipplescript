@@ -58,9 +58,10 @@ pub(crate) const USAGE: &str = "usage: whip [--json] build <command> --as <bindi
   result <label> --cut <cut>        read the cut's results for a label under the binding's view\n\
   test <target>... --cut <cut> [--report <file>] [--timeout <seconds>]\n\
   daemon status|stop --cut <cut>\n\
-  endpoint --cut <cut> [--sidecar <http://host:port>]\n\
+  endpoint --cut <cut> [--sidecar <http(s)://host:port> [--sidecar-ca <pem>]]\n\
                                     serve the remote-execution endpoint to the cut's daemon until stdin closes;\n\
-                                    with --sidecar its actions run at that `whip executor`\n\
+                                    with --sidecar its actions run at that `whip executor`, trusting the\n\
+                                    platform's roots and --sidecar-ca's authority\n\
   record <dir> [--cut <id>] [--branch <name>]   record a directory tree (a git workspace, its cells) as a cut\n\
   The cut is materialized under .whipplescript/build/cuts/<cut> and evaluated there by the\n\
   Home's Buck2 daemon (isolation dir whip-home), which reaches whip-test-executor over the TCP launch.\n\
@@ -1138,7 +1139,10 @@ impl<'a> Arguments<'a> {
             "result" => (Verb::Result, &["--cut", "--as"]),
             "test" => (Verb::Test, &["--cut", "--as", "--report", "--timeout"]),
             "daemon" => (Verb::Daemon, &["--cut", "--as"]),
-            "endpoint" => (Verb::Endpoint, &["--cut", "--as", "--sidecar"]),
+            "endpoint" => (
+                Verb::Endpoint,
+                &["--cut", "--as", "--sidecar", "--sidecar-ca"],
+            ),
             "record" => (Verb::Record, &["--as", "--cut", "--branch"]),
             _ => return Err(format!("unknown build command {name:?}\n{USAGE}")),
         };
@@ -1286,10 +1290,11 @@ fn execute(options: &super::CliOptions) -> Result<Value, String> {
                 .args(
                     // Actions run at a Class-A executor rather than on this
                     // host when the operator names one (§14.4).
-                    args.flags
-                        .get("--sidecar")
-                        .map(|url| vec!["--sidecar", *url])
-                        .unwrap_or_default(),
+                    ["--sidecar", "--sidecar-ca"]
+                        .into_iter()
+                        .filter_map(|flag| args.flags.get(flag).map(|value| [flag, *value]))
+                        .flatten()
+                        .collect::<Vec<_>>(),
                 )
                 .arg("--daemon")
                 .arg(binding)
