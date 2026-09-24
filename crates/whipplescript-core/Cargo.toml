@@ -8,6 +8,13 @@ homepage.workspace = true
 repository.workspace = true
 readme.workspace = true
 
+[package.metadata.native-tests]
+# What this crate's tests read at run time beyond the crate and what its
+# sources name by relative path, for the native test runs (GaugeWright
+# BUILD.md stage 5). A run's mount holds only declared files, so a missing
+# entry fails the test instead of caching a pass it never earned.
+data = ["crates", "spec/diagnostic-codes-runtime.txt", "spec/diagnostic-codes.txt"]
+
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

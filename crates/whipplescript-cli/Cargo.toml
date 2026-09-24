@@ -10,6 +10,18 @@ readme.workspace = true
 keywords = ["agents", "automation", "cli", "orchestration", "workflow"]
 categories = ["command-line-utilities", "development-tools"]
 
+[package.metadata.native-tests]
+# What this crate's tests read at run time beyond the crate and what its
+# sources name by relative path, for the native test runs (GaugeWright
+# BUILD.md stage 5). A run's mount holds only declared files, so a missing
+# entry fails the test instead of caching a pass it never earned.
+data = ["Cargo.toml", "scripts"]
+
+[package.metadata.native-tests.artifacts]
+# Built files the tests read where the repository holds them: the norm
+# reactor experiments/norm-wasi/prepare.py builds into target/.
+"target/norm-cpython-observer.wasm" = "//:norm-reactor"
+
 [dependencies]
 # Native executor controller authority lives on its Docker-owned volume.
 rusqlite = { version = "0.40.1", features = ["bundled"] }
