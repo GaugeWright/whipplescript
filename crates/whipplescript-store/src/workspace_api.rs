@@ -26,8 +26,8 @@ use crate::branches::{BranchRow, CreateBranchOutcome, StatusOutcome};
 use crate::content::ContentBlobs;
 use crate::merge::PathConflict;
 use crate::vcs::{
-    BranchStatusReport, MergeProbeOutcome, QuiescentCut, ReconcileEntry, ReconcileOutcome,
-    RestoreOutcome, SyncOutcome, VcsMergeOutcome, WorkspaceVcs,
+    BranchStatusReport, MainlineGate, MergeProbeOutcome, QuiescentCut, ReconcileEntry,
+    ReconcileOutcome, RestoreOutcome, SyncOutcome, VcsMergeOutcome, WorkspaceVcs,
 };
 use crate::{branches::Branches, StoreResult};
 
@@ -176,10 +176,14 @@ pub enum WorkspaceOpOutcome {
 /// Apply one operation. Errors are store-level failures (I/O,
 /// serialization, optimistic-guard retry exhaustion); every domain
 /// refusal comes back as a `WorkspaceOpOutcome`.
+///
+/// `gate` is the host's mainline gate: a merge or restore onto a gated ref
+/// passes it, and its refusal comes back as `Refused` with its reason.
 pub fn apply<B: Branches, C: ContentBlobs>(
     vcs: &mut WorkspaceVcs<B, C>,
     op: &WorkspaceOp,
     at: &str,
+    gate: &mut dyn MainlineGate,
 ) -> StoreResult<WorkspaceOpOutcome> {
     Ok(match op {
         WorkspaceOp::Init => WorkspaceOpOutcome::Initialized {
@@ -241,7 +245,7 @@ pub fn apply<B: Branches, C: ContentBlobs>(
         WorkspaceOp::Merge {
             branch_id,
             merge_cut_id,
-        } => match vcs.merge(branch_id, merge_cut_id, at)? {
+        } => match vcs.merge(branch_id, merge_cut_id, at, gate)? {
             VcsMergeOutcome::Adopted {
                 merge_cut_id,
                 into_branch_id,
@@ -261,12 +265,14 @@ pub fn apply<B: Branches, C: ContentBlobs>(
                 refused(format!("branch `{branch_id}` is not active"))
             }
             VcsMergeOutcome::NoParent => refused(format!("branch `{branch_id}` has no parent")),
+            VcsMergeOutcome::GateRefused(refusal) => refused(refusal.reason),
+            VcsMergeOutcome::GateStale { changed } => refused(changed),
         },
         WorkspaceOp::Restore {
             branch_id,
             to_cut_id,
             new_cut_id,
-        } => match vcs.restore(branch_id, to_cut_id, new_cut_id, at)? {
+        } => match vcs.restore(branch_id, to_cut_id, new_cut_id, at, gate)? {
             RestoreOutcome::Restored {
                 cut_id,
                 manifest_hash,
@@ -280,6 +286,8 @@ pub fn apply<B: Branches, C: ContentBlobs>(
             RestoreOutcome::BranchNotActive => {
                 refused(format!("branch `{branch_id}` is not active"))
             }
+            RestoreOutcome::GateRefused(refusal) => refused(refusal.reason),
+            RestoreOutcome::GateStale { changed } => refused(changed),
         },
         WorkspaceOp::Promote {
             branch_id,
@@ -380,7 +388,7 @@ mod tests {
         // The external-host path: ops arrive as JSON, outcomes leave as
         // JSON — this test drives the protocol exactly as a host would.
         let op: WorkspaceOp = serde_json::from_value(op_json).expect("decode op");
-        let outcome = apply(vcs, &op, at).expect("apply");
+        let outcome = apply(vcs, &op, at, &mut crate::vcs::NoNormLedger).expect("apply");
         serde_json::to_value(&outcome).expect("encode")["outcome"]
             .as_str()
             .expect("tagged")
@@ -427,7 +435,9 @@ mod tests {
             json!({"op": "cut_at_quiescence", "branch_id": "draft_a", "cut_id": "cut_named"}),
         )
         .expect("decode");
-        let WorkspaceOpOutcome::Cut { cut } = apply(&mut vcs, &op, "t3").expect("apply") else {
+        let WorkspaceOpOutcome::Cut { cut } =
+            apply(&mut vcs, &op, "t3", &mut crate::vcs::NoNormLedger).expect("apply")
+        else {
             panic!("expected a cut");
         };
         assert_eq!(cut.cut_id, "cut_a1");
@@ -439,7 +449,7 @@ mod tests {
             up_to_date,
             changed_paths,
             ..
-        } = apply(&mut vcs, &op, "t4").expect("apply")
+        } = apply(&mut vcs, &op, "t4", &mut crate::vcs::NoNormLedger).expect("apply")
         else {
             panic!("expected a probe report");
         };
@@ -475,7 +485,8 @@ mod tests {
         // Status: the fork is ahead (its write) and not behind.
         let op: WorkspaceOp =
             serde_json::from_value(json!({"op": "status", "branch_id": "fork_1"})).expect("decode");
-        let WorkspaceOpOutcome::Status { report } = apply(&mut vcs, &op, "t8").expect("apply")
+        let WorkspaceOpOutcome::Status { report } =
+            apply(&mut vcs, &op, "t8", &mut crate::vcs::NoNormLedger).expect("apply")
         else {
             panic!("expected status");
         };
@@ -485,7 +496,7 @@ mod tests {
         let op: WorkspaceOp =
             serde_json::from_value(json!({"op": "reconcile_list"})).expect("decode");
         let WorkspaceOpOutcome::ReconcileList { entries } =
-            apply(&mut vcs, &op, "t9").expect("apply")
+            apply(&mut vcs, &op, "t9", &mut crate::vcs::NoNormLedger).expect("apply")
         else {
             panic!("expected entries");
         };
@@ -499,7 +510,7 @@ mod tests {
                 "to_cut_id": "cut_merge_1", "new_cut_id": "cut_f2"}))
             .expect("decode");
         assert!(matches!(
-            apply(&mut vcs, &op, "t10").expect("apply"),
+            apply(&mut vcs, &op, "t10", &mut crate::vcs::NoNormLedger).expect("apply"),
             WorkspaceOpOutcome::Restored { .. }
         ));
         assert_eq!(
@@ -537,7 +548,13 @@ mod tests {
             .expect("create");
         vcs.write("draft_a", "a.md", Some("A"), "cut_a1", "t2")
             .expect("write");
-        vcs.merge("draft_a", "cut_merge_1", "t3").expect("merge");
+        vcs.merge(
+            "draft_a",
+            "cut_merge_1",
+            "t3",
+            &mut crate::vcs::NoNormLedger,
+        )
+        .expect("merge");
         vcs.create_branch("draft_b", None, "main", "t4")
             .expect("create");
         vcs.discard_branch("draft_b", "t5").expect("discard");

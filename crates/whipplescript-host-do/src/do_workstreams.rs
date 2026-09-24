@@ -852,42 +852,53 @@ impl<Sql: DoSql + Clone> whipplescript_kernel::effect_handlers::CapabilityProvid
         let at = format!("promote:{}", effect.effect_id);
         let reservation_id = format!("effect-{}", effect.effect_id);
         let proposed_main = format!("cut-{seed}-promote");
-        // The mainline's gate (norm-plane §5) over this object's ledger. The
-        // hosted door does not yet receive the deployment's planning inputs,
-        // so a workspace with a norm ledger is refused rather than promoted
-        // unevaluated; one without a ledger is gated by nothing.
-        let ledger = crate::do_store::DoSqliteStore::new(self.sql.clone());
-        let mut gate = whipplescript_kernel::norm_admission::NormMainlineAdmission::new(
-            &ledger,
-            Err::<
-                whipplescript_kernel::norm_admission::AdmissionHost<
-                    '_,
-                    crate::do_store::DoSqliteStore<Sql>,
-                >,
-                _,
-            >(HOSTED_ADMISSION_UNCONFIGURED.to_owned()),
-            whipplescript_kernel::norm_admission::AdmissionDoor::Promote,
-            whipplescript_store::branches::MAINLINE_BRANCH_ID,
-        );
         // Single-writer per object: the DO's turn IS the serialization
         // (DR-0091 Decision 2), so the kernel choreography runs unleased.
-        let result = whipplescript_kernel::effect_handlers::run_reserved_boundary_promotion_generic(
-            &mut streams,
-            &mut vcs,
-            &whipplescript_kernel::effect_handlers::PromoteDoorRequest {
-                stream_id,
-                reservation_id: &reservation_id,
-                proposed_main: &proposed_main,
-                at: &at,
-                receipt_scope: "durable-object-workspace",
-            },
-            &mut whipplescript_kernel::effect_handlers::SingleWriterSerialization,
-            &mut gate,
-        );
+        let door = whipplescript_kernel::norm_admission::AdmissionDoor::Promote;
+        let result = with_hosted_mainline_gate(&self.sql, door, |gate| {
+            whipplescript_kernel::effect_handlers::run_reserved_boundary_promotion_generic(
+                &mut streams,
+                &mut vcs,
+                &whipplescript_kernel::effect_handlers::PromoteDoorRequest {
+                    stream_id,
+                    reservation_id: &reservation_id,
+                    proposed_main: &proposed_main,
+                    at: &at,
+                    receipt_scope: "durable-object-workspace",
+                },
+                &mut whipplescript_kernel::effect_handlers::SingleWriterSerialization,
+                gate,
+            )
+        });
         // No fact routing: vcs.* fact delivery is the mediator surface (A5),
         // which lives native-side.
         whipplescript_kernel::effect_handlers::promote_effect_outcome(stream_id, &result)
     }
+}
+
+/// The mainline's gate (norm-plane §5) over this object's ledger, for one
+/// door. The hosted doors do not yet receive the deployment's planning inputs,
+/// so a workspace with a norm ledger is refused rather than moved unevaluated;
+/// one without a ledger is gated by nothing.
+pub(crate) fn with_hosted_mainline_gate<Sql: DoSql + Clone, T>(
+    sql: &Sql,
+    door: whipplescript_kernel::norm_admission::AdmissionDoor,
+    f: impl FnOnce(&mut dyn whipplescript_store::vcs::MainlineGate) -> T,
+) -> T {
+    let ledger = crate::do_store::DoSqliteStore::new(sql.clone());
+    let mut gate = whipplescript_kernel::norm_admission::NormMainlineAdmission::new(
+        &ledger,
+        Err::<
+            whipplescript_kernel::norm_admission::AdmissionHost<
+                '_,
+                crate::do_store::DoSqliteStore<Sql>,
+            >,
+            _,
+        >(HOSTED_ADMISSION_UNCONFIGURED.to_owned()),
+        door,
+        whipplescript_store::branches::MAINLINE_BRANCH_ID,
+    );
+    f(&mut gate)
 }
 
 /// The DO-side selective-verb provider (DR-0052 R4, DO parity):
@@ -952,22 +963,32 @@ impl<Sql: DoSql + Clone> whipplescript_kernel::effect_handlers::CapabilityProvid
         // and the staleness advisory lists this store's issues + assertions.
         // No fact routing — the mediator surface is native (A5).
         let sql = self.sql.clone();
-        let result = whipplescript_kernel::effect_handlers::run_selective_verb_generic(
-            &mut vcs,
-            effect.target.as_deref(),
-            &input,
-            &expr,
-            &branch_id,
-            &cut_id,
-            &at,
-            &mut |onto| {
-                DoWorkstreams::new(sql.clone())
-                    .ok()
-                    .and_then(|streams| streams.get_stream(onto).ok().flatten())
-                    .map(|stream| stream.line_branch_id)
-            },
-            &mut |vcs, line, cut| do_staleness_deltas(&sql, vcs, line, cut),
-        );
+        // `vcs.undo` stays on the instance's own line, which is never gated;
+        // `vcs.transport … onto mainline` passes the mainline's gate.
+        let door = if effect.target.as_deref() == Some("vcs.undo") {
+            whipplescript_kernel::norm_admission::AdmissionDoor::Undo
+        } else {
+            whipplescript_kernel::norm_admission::AdmissionDoor::Transport
+        };
+        let result = with_hosted_mainline_gate(&self.sql, door, |gate| {
+            whipplescript_kernel::effect_handlers::run_selective_verb_generic(
+                &mut vcs,
+                effect.target.as_deref(),
+                &input,
+                &expr,
+                &branch_id,
+                &cut_id,
+                &at,
+                &mut |onto| {
+                    DoWorkstreams::new(sql.clone())
+                        .ok()
+                        .and_then(|streams| streams.get_stream(onto).ok().flatten())
+                        .map(|stream| stream.line_branch_id)
+                },
+                &mut |vcs, line, cut| do_staleness_deltas(&sql, vcs, line, cut),
+                gate,
+            )
+        });
         whipplescript_kernel::effect_handlers::selective_effect_outcome(result)
     }
 }

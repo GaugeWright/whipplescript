@@ -216,6 +216,7 @@ pub struct NormCommandHost<'a, S: NormCommandStore> {
     store: &'a mut S,
     verifier: &'a dyn NormVerifier,
     artifacts: Option<&'a NormArtifactCapture<'a>>,
+    gated_refs: Option<&'a mut dyn FnMut() -> StoreResult<()>>,
 }
 impl<'a, S: NormCommandStore> NormCommandHost<'a, S> {
     pub fn new(store: &'a mut S, verifier: &'a dyn NormVerifier) -> Self {
@@ -223,7 +224,18 @@ impl<'a, S: NormCommandStore> NormCommandHost<'a, S> {
             store,
             verifier,
             artifacts: None,
+            gated_refs: None,
         }
+    }
+
+    /// The host's way to lease its gated refs (norm-plane §5). A ledger's
+    /// first event — a bootstrap, or an import that may carry one — leases
+    /// them before it lands, so a governed workspace's mainline never exists
+    /// unleased; an append that then fails leaves the lease, which only
+    /// over-protects, and the ungoverned gate still admits through it.
+    pub fn with_gated_refs(mut self, lease: &'a mut dyn FnMut() -> StoreResult<()>) -> Self {
+        self.gated_refs = Some(lease);
+        self
     }
 
     pub fn with_artifacts(mut self, artifacts: &'a NormArtifactCapture<'a>) -> Self {
@@ -401,6 +413,21 @@ impl<'a, S: NormCommandStore> NormCommandHost<'a, S> {
             return Err(StoreError::Conflict(
                 "unsupported norm command protocol".into(),
             ));
+        }
+        let governs = match &request.command {
+            NormCommand::Append { event } => {
+                matches!(
+                    event.statement.action,
+                    crate::norm::NormAct::Bootstrap { .. }
+                )
+            }
+            NormCommand::Import { .. } => true,
+            _ => false,
+        };
+        if governs {
+            if let Some(lease) = self.gated_refs.as_mut() {
+                lease()?;
+            }
         }
         let result = match request.command {
             NormCommand::Append { event } => NormCommandResult::Appended {

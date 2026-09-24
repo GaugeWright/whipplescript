@@ -19021,6 +19021,10 @@ mod norm_admission_tests {
             .unwrap();
         vcs.write("line-triage", "feature.md", Some("work"), "cut_1", "t3")
             .unwrap();
+        vcs.bind_instance("inst-1", "line-triage", "t3").unwrap();
+        // The host's norm command door leases the mainline before the
+        // ledger's first event lands (`host_norm_command`).
+        whipplescript_store::branches::lease_gated_mainline(&mut branches, "t3").unwrap();
         let mut ledger = DoSqliteStore::new(Rc::clone(&sql));
         ledger
             .append_norm_event(
@@ -19077,6 +19081,128 @@ mod norm_admission_tests {
             Some("cut_0"),
             "the mainline did not move"
         );
+
+        // Every other door onto the mainline asks the same predicate
+        // (norm-plane §5, NP-15): a transport onto mainline, a restore and an
+        // operator undo refuse alike, and the mainline stays.
+        let selective = crate::do_workstreams::DoVcsSelectiveCapabilityProvider {
+            sql: Rc::clone(&sql),
+            instance_id: "inst-1".into(),
+        };
+        let CapabilityOutcome::Failed {
+            error_kind,
+            message: transported,
+        } = selective.produce(
+            &whipplescript_store::ClaimableEffect {
+                attempt_admission_event_id: None,
+                effect_id: "transport-1".into(),
+                kind: "capability.call".into(),
+                target: Some("vcs.transport".into()),
+                profile: None,
+                input_json:
+                    serde_json::json!({"selection": "path(feature.md)", "onto": "mainline"})
+                        .to_string(),
+                required_capabilities_json: "[]".into(),
+                declared_profiles_json: "[]".into(),
+            },
+            &whipplescript_kernel::effect_config::EffectConfig::default(),
+        )
+        else {
+            panic!("a transport onto a governed mainline moved unevaluated");
+        };
+        assert_eq!(error_kind, "norm_gate_refused");
+        assert_eq!(transported, message);
+        let mut vcs = crate::do_branches::compose_vcs(&sql).unwrap();
+        let door = whipplescript_kernel::norm_admission::AdmissionDoor::Restore;
+        let restored = crate::do_workstreams::with_hosted_mainline_gate(&sql, door, |gate| {
+            vcs.restore(MAINLINE_BRANCH_ID, "cut_1", "cut_restore", "t5", gate)
+        })
+        .unwrap();
+        assert!(
+            matches!(&restored, whipplescript_store::vcs::RestoreOutcome::GateRefused(refusal) if refusal.reason == message),
+            "{restored:?}"
+        );
+        let door = whipplescript_kernel::norm_admission::AdmissionDoor::Undo;
+        let undone = crate::do_workstreams::with_hosted_mainline_gate(&sql, door, |gate| {
+            vcs.undo_op("op-cut_0", "undo-main", "t6", gate)
+        })
+        .unwrap();
+        assert!(
+            matches!(&undone, whipplescript_store::vcs::UndoOpOutcome::GateRefused(refusal) if refusal.reason == message),
+            "{undone:?}"
+        );
+        // The lease is the store's own refusal: a write that is not a door
+        // cannot move a governed mainline at all.
+        let written = vcs.write(MAINLINE_BRANCH_ID, "base.md", Some("raw"), "cut_raw", "t7");
+        assert!(
+            matches!(&written, Err(whipplescript_store::StoreError::Conflict(reason)) if reason.contains("reserved by `norm-gate`")),
+            "{written:?}"
+        );
+        assert_eq!(
+            vcs.read(MAINLINE_BRANCH_ID, "base.md").unwrap().as_deref(),
+            Some("base")
+        );
+        assert_eq!(
+            branches
+                .get_branch(MAINLINE_BRANCH_ID)
+                .unwrap()
+                .unwrap()
+                .head_cut_id
+                .as_deref(),
+            Some("cut_0"),
+            "no door moved the mainline"
+        );
+    }
+
+    /// The hosted branch store holds the same lease the native one does:
+    /// every head mutation but the gated advance refuses it, and nothing
+    /// releases it.
+    #[test]
+    fn the_hosted_mainline_gates_lease_admits_only_the_gated_advance() {
+        use std::rc::Rc;
+        use whipplescript_store::branches::{
+            AdvanceOutcome, Branches, OpBranchState, MAINLINE_BRANCH_ID, MAINLINE_GATE_LEASE,
+        };
+        let sql = Rc::new(super::test_support::RusqliteDoSql::from_store_schema());
+        let mut vcs = crate::do_branches::compose_vcs(&sql).unwrap();
+        vcs.init("t0").unwrap();
+        vcs.write(MAINLINE_BRANCH_ID, "base.md", Some("base"), "main-1", "t1")
+            .unwrap();
+        let mut branches = crate::do_branches::DoBranches::new(Rc::clone(&sql)).unwrap();
+        let head = branches.get_branch(MAINLINE_BRANCH_ID).unwrap().unwrap();
+        let manifest = head.head_manifest_hash.clone().unwrap();
+        whipplescript_store::branches::lease_gated_mainline(&mut branches, "t2").unwrap();
+        let reserved = |result: whipplescript_store::StoreResult<AdvanceOutcome>| matches!(&result, Err(whipplescript_store::StoreError::Conflict(reason)) if reason == "branch `main` head is reserved by `norm-gate`");
+        assert!(reserved(branches.advance_head(
+            MAINLINE_BRANCH_ID,
+            Some("main-1"),
+            "main-x",
+            &manifest,
+            "t3"
+        )));
+        assert!(reserved(branches.restore_branch_state(
+            MAINLINE_BRANCH_ID,
+            Some("main-1"),
+            &OpBranchState::of(&head),
+            "t3"
+        )));
+        let released = branches.release_head_reservation(MAINLINE_BRANCH_ID, MAINLINE_GATE_LEASE);
+        assert!(
+            matches!(&released, Err(whipplescript_store::StoreError::Conflict(reason)) if reason == "the mainline gate's lease is never released"),
+            "{released:?}"
+        );
+        assert!(matches!(
+            branches
+                .advance_gated_head(
+                    MAINLINE_BRANCH_ID,
+                    Some("main-1"),
+                    "main-1",
+                    &manifest,
+                    "t4"
+                )
+                .unwrap(),
+            AdvanceOutcome::Advanced(_)
+        ));
     }
 
     #[test]

@@ -3527,6 +3527,7 @@ pub fn run_selective_verb_generic<B, C>(
     at: &str,
     resolve_stream_line: &mut dyn FnMut(&str) -> Option<String>,
     staleness: &mut StalenessAdvisory<'_, B, C>,
+    gate: &mut dyn whipplescript_store::vcs::MainlineGate,
 ) -> Result<Value, String>
 where
     B: whipplescript_store::branches::Branches,
@@ -3535,7 +3536,7 @@ where
     use whipplescript_store::vcs::{TransportOutcome, UndoSelectionOutcome};
 
     if target == Some("vcs.undo") {
-        match vcs.apply_undo_selection(branch_id, expr, cut_id, at) {
+        match vcs.apply_undo_selection(branch_id, expr, cut_id, at, gate) {
             Ok(UndoSelectionOutcome::Proposed {
                 cut_id,
                 reverted_paths,
@@ -3569,6 +3570,10 @@ where
                 "cut_id": "",
                 "detail": "nothing_selected",
             })),
+            Ok(UndoSelectionOutcome::GateRefused(refusal)) => Ok(gate_refused_json(&refusal)),
+            Ok(UndoSelectionOutcome::GateStale { changed }) => {
+                Err(format!("{changed}; the undo is prepared again on retry"))
+            }
             Ok(other) => Err(format!("undo refused: {other:?}")),
             Err(error) => Err(format!("undo failed: {error:?}")),
         }
@@ -3585,7 +3590,7 @@ where
                 None => return Err(format!("`onto {onto}` names no stream")),
             }
         };
-        match vcs.transport_selection(branch_id, expr, &onto_line, cut_id, at) {
+        match vcs.transport_selection(branch_id, expr, &onto_line, cut_id, at, gate) {
             Ok(TransportOutcome::Transported {
                 cut_id,
                 moved_paths,
@@ -3614,16 +3619,37 @@ where
                 "cut_id": "",
                 "detail": "nothing_to_move",
             })),
+            Ok(TransportOutcome::GateRefused(refusal)) => Ok(gate_refused_json(&refusal)),
+            Ok(TransportOutcome::GateStale { changed }) => Err(format!(
+                "{changed}; the transport is prepared again on retry"
+            )),
             Ok(other) => Err(format!("transport refused: {other:?}")),
             Err(error) => Err(format!("transport failed: {error:?}")),
         }
     }
 }
 
+/// A selective verb's gate refusal as the door's data: the reason names what
+/// the proposed result lacks, and `refusal` carries it structurally.
+fn gate_refused_json(refusal: &whipplescript_store::vcs::GateRefusal) -> Value {
+    json!({
+        "variant": "GateRefused",
+        "cut_id": "",
+        "detail": refusal.reason,
+        "refusal": refusal.detail,
+    })
+}
+
 /// Render a selective run as the effect door's outcome — the `vcs_selective`
 /// failure kind both doors always used.
 pub fn selective_effect_outcome(result: Result<Value, String>) -> CapabilityOutcome {
     match result {
+        // A gated ref's refusal is the promote door's distinct failure: the
+        // ref is intact and retrying the same result cannot fix it.
+        Ok(value) if value["variant"] == "GateRefused" => CapabilityOutcome::Failed {
+            error_kind: "norm_gate_refused".to_owned(),
+            message: value["detail"].as_str().unwrap_or_default().to_owned(),
+        },
         Ok(value) => CapabilityOutcome::Produced(value),
         Err(message) => CapabilityOutcome::Failed {
             error_kind: "vcs_selective".to_owned(),
@@ -5230,7 +5256,7 @@ mod promote_door_tests {
 
     /// These door fixtures carry no norm ledger, so nothing gates their
     /// mainline: the gate admits and runs the compare-and-swap as asked.
-    struct NoNormLedger;
+    pub(super) struct NoNormLedger;
 
     impl whipplescript_store::vcs::MainlineGate for NoNormLedger {
         fn prepare(
@@ -5727,9 +5753,9 @@ mod promote_door_tests {
     }
 
     /// A mainline gate whose answers the test chooses.
-    struct ScriptedGate {
-        refuse: Option<whipplescript_store::vcs::GateRefusal>,
-        stale: Option<String>,
+    pub(super) struct ScriptedGate {
+        pub(super) refuse: Option<whipplescript_store::vcs::GateRefusal>,
+        pub(super) stale: Option<String>,
     }
 
     impl whipplescript_store::vcs::MainlineGate for ScriptedGate {
@@ -6525,6 +6551,94 @@ mod selective_door_tests {
 
     use super::*;
 
+    /// A selective verb onto the mainline passes its gate (norm-plane §5,
+    /// NP-15): a refusal is the promote door's own failure kind with the
+    /// requirement named, and a stale commit is a retry; nothing moves.
+    #[test]
+    fn selective_verbs_onto_the_mainline_pass_its_gate() {
+        use super::promote_door_tests::ScriptedGate;
+        let (mut vcs, dir) = temp_vcs("gate");
+        vcs.write("main", "base.md", Some("base"), "main-1", "t1")
+            .expect("seed main");
+        vcs.create_branch("line-a", None, "main", "t1")
+            .expect("line");
+        vcs.write("line-a", "src/x.rs", Some("x"), "line-1", "t2")
+            .expect("line work");
+        let refusal = whipplescript_store::vcs::GateRefusal {
+            reason: "the proposed result is not supported: R0 (repair)".into(),
+            detail: json!({"requirements": {"R0": ["repair"]}}),
+        };
+        let stale = "the norm ledger changed after the admission was prepared";
+        // A refused proposal leaves its recorded cut behind, so each attempt
+        // proposes under its own id.
+        let mut attempt = 0;
+        let mut run = |target: &str, input: Value, branch: &str, gate: &mut ScriptedGate| {
+            attempt += 1;
+            let cut_id = format!("cut-gated-{attempt}");
+            let expr = selective_selection(&input).expect("selection");
+            run_selective_verb_generic(
+                &mut vcs,
+                Some(target),
+                &input,
+                &expr,
+                branch,
+                &cut_id,
+                "t3",
+                &mut |_| None,
+                &mut |_, _, _| Vec::new(),
+                gate,
+            )
+        };
+        let transport = json!({"selection": "path(src/**)", "onto": "mainline"});
+        let undo = json!({"selection": "path(base.md)"});
+        for (target, input, branch, door) in [
+            ("vcs.transport", &transport, "line-a", "transport"),
+            ("vcs.undo", &undo, "main", "undo"),
+        ] {
+            let refused = run(
+                target,
+                input.clone(),
+                branch,
+                &mut ScriptedGate {
+                    refuse: Some(refusal.clone()),
+                    stale: None,
+                },
+            );
+            let CapabilityOutcome::Failed {
+                error_kind,
+                message,
+            } = selective_effect_outcome(refused)
+            else {
+                panic!("a refused {door} onto the mainline produced");
+            };
+            assert_eq!(error_kind, "norm_gate_refused");
+            assert_eq!(message, refusal.reason);
+            let retried = run(
+                target,
+                input.clone(),
+                branch,
+                &mut ScriptedGate {
+                    refuse: None,
+                    stale: Some(stale.into()),
+                },
+            );
+            assert_eq!(
+                retried,
+                Err(format!("{stale}; the {door} is prepared again on retry"))
+            );
+        }
+        assert_eq!(
+            vcs.get_branch("main")
+                .expect("main")
+                .expect("row")
+                .head_cut_id
+                .as_deref(),
+            Some("main-1"),
+            "no refused door moved the mainline"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn selective_selection_gate_refuses_by_reason() {
         let missing = selective_selection(&json!({})).expect_err("no selection");
@@ -6592,6 +6706,7 @@ mod selective_door_tests {
                 staleness_calls += 1;
                 Vec::new()
             },
+            &mut super::promote_door_tests::NoNormLedger,
         )
         .expect("undo applies");
         assert_eq!(value["variant"], "Applied");
@@ -6612,6 +6727,7 @@ mod selective_door_tests {
             "t4",
             &mut |_| None,
             &mut |_, _, _| Vec::new(),
+            &mut super::promote_door_tests::NoNormLedger,
         )
         .expect("nothing selected is data");
         assert_eq!(nothing["detail"], "nothing_selected");
@@ -6627,6 +6743,7 @@ mod selective_door_tests {
             "t5",
             &mut |_| None,
             &mut |_, _, _| Vec::new(),
+            &mut super::promote_door_tests::NoNormLedger,
         )
         .expect_err("unresolvable stream refuses");
         assert_eq!(refusal, "`onto ghost` names no stream");
@@ -6663,6 +6780,7 @@ mod selective_door_tests {
             "t3",
             &mut |_| None,
             &mut |_, _, _| Vec::new(),
+            &mut super::promote_door_tests::NoNormLedger,
         )
         .expect_err("missing branch refuses");
         assert_eq!(refused, "undo refused: BranchMissing");
@@ -6678,6 +6796,7 @@ mod selective_door_tests {
             "t4",
             &mut |_| Some("ghost-line".to_owned()),
             &mut |_, _, _| Vec::new(),
+            &mut super::promote_door_tests::NoNormLedger,
         )
         .expect_err("missing target refuses");
         assert_eq!(refused, "transport refused: TargetMissing");
@@ -6698,6 +6817,7 @@ mod selective_door_tests {
             "t5",
             &mut |_| None,
             &mut |_, _, _| Vec::new(),
+            &mut super::promote_door_tests::NoNormLedger,
         )
         .expect_err("broken store fails undo");
         assert!(failed.starts_with("undo failed:"), "{failed}");
@@ -6711,6 +6831,7 @@ mod selective_door_tests {
             "t6",
             &mut |_| None,
             &mut |_, _, _| Vec::new(),
+            &mut super::promote_door_tests::NoNormLedger,
         )
         .expect_err("broken store fails transport");
         assert!(failed.starts_with("transport failed:"), "{failed}");

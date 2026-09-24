@@ -543,9 +543,17 @@ fn execute(args: &[String], runtime_path: &std::path::Path) -> Result<Value, Str
             "observation": execution.observation(),
         }));
     }
+    // A ledger's first event leases the mainline for its gate (norm-plane §5).
+    let mut lease_gated_refs = || {
+        whipplescript_store::branches::lease_gated_mainline(
+            &mut whipplescript_store::branches::BranchStore::open(super::branch_store_path())?,
+            &super::now_stamp(),
+        )
+    };
     if args.verb == "dispatch" {
         let response = NormCommandHost::new(&mut store, &verifier)
             .with_artifacts(&artifacts)
+            .with_gated_refs(&mut lease_gated_refs)
             .execute_json(&args.file("--request")?)
             .map_err(debug_error)?;
         return serde_json::from_str(&response).map_err(|error| error.to_string());
@@ -746,6 +754,7 @@ fn execute(args: &[String], runtime_path: &std::path::Path) -> Result<Value, Str
     };
     let response = NormCommandHost::new(&mut store, &verifier)
         .with_artifacts(&artifacts)
+        .with_gated_refs(&mut lease_gated_refs)
         .execute(NormCommandRequest::new(command))
         .map_err(debug_error)?;
     serde_json::to_value(response).map_err(|error| error.to_string())
@@ -762,11 +771,10 @@ fn debug_error(error: whipplescript_store::StoreError) -> String {
 /// missing configuration.
 pub(crate) fn with_mainline_admission<T>(
     runtime_path: &std::path::Path,
+    door: whipplescript_kernel::norm_admission::AdmissionDoor,
     f: impl FnOnce(&mut dyn whipplescript_store::vcs::MainlineGate) -> T,
 ) -> Result<T, String> {
-    use whipplescript_kernel::norm_admission::{
-        AdmissionDoor, AdmissionHost, NormMainlineAdmission,
-    };
+    use whipplescript_kernel::norm_admission::{AdmissionHost, NormMainlineAdmission};
     use whipplescript_kernel::norm_execution_policy::ProtectedPythonPolicy;
     use whipplescript_kernel::norm_planning::PlanningConfiguration;
     use whipplescript_kernel::norm_runner::PythonRuntime;
@@ -839,7 +847,7 @@ pub(crate) fn with_mainline_admission<T>(
     let mut gate = NormMainlineAdmission::new(
         &ledger,
         host,
-        AdmissionDoor::Promote,
+        door,
         whipplescript_store::branches::MAINLINE_BRANCH_ID,
     );
     Ok(f(&mut gate))

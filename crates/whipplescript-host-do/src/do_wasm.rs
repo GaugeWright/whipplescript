@@ -323,11 +323,19 @@ pub fn host_norm_command(
             whipplescript_store::norm_artifact::ArtifactLimits::default(),
         )
     };
+    let at = format!("norm-lease:{}", crate::do_store::stable_hash_hex(command));
+    let mut lease_gated_refs = || {
+        whipplescript_store::branches::lease_gated_mainline(
+            &mut crate::do_branches::DoBranches::new(sql.clone())?,
+            &at,
+        )
+    };
     crate::norm_commands::execute_hosted_norm_command_with_artifacts(
         &mut store,
         trusted_configuration,
         command,
         Some(&artifacts),
+        Some(&mut lease_gated_refs),
     )
     .map_err(|error| JsValue::from_str(&error))
 }

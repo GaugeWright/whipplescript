@@ -1878,8 +1878,10 @@ impl ParityWorlds {
         // promote door's mainline gate reads it.
         let do_sql =
             whipplescript_host_do::do_store::test_support::RusqliteDoSql::with_store_schema();
+        // The runtime store and the norm ledger are separate stores, as on a
+        // host: the mainline gate opens the ledger beside the runtime store.
         Self {
-            store_path: dir.join("items.sqlite"),
+            store_path: dir.join("runtime.sqlite"),
             _dir: dir,
             prior_env,
             do_sql,

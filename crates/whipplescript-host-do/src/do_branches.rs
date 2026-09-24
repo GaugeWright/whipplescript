@@ -25,7 +25,7 @@ use std::collections::BTreeSet;
 use whipplescript_store::branches::{
     AdvanceOutcome, BindOutcome, BranchRow, BranchStatus, Branches, ClosurePinState, ConflictRow,
     CreateBranch, CreateBranchOutcome, CutRecord, CutRow, HeadReservationOutcome, OpBranchDelta,
-    OpRow, RetargetOutcome, StatusOutcome, MAINLINE_BRANCH_ID,
+    OpRow, RetargetOutcome, StatusOutcome, MAINLINE_BRANCH_ID, MAINLINE_GATE_LEASE,
 };
 use whipplescript_store::content::{BlobStatus, ContentBlobs, EraseOutcome};
 use whipplescript_store::event_chain;
@@ -40,6 +40,45 @@ pub struct DoBranches<S: DoSql> {
 }
 
 impl<S: DoSql> DoBranches<S> {
+    fn advance_head_leased(
+        &mut self,
+        lease: Option<&str>,
+        branch_id: &str,
+        expected_head_cut_id: Option<&str>,
+        cut_id: &str,
+        manifest_hash: &str,
+        at: &str,
+    ) -> StoreResult<AdvanceOutcome> {
+        let Some(row) = self.row_by_id(branch_id)? else {
+            return Ok(AdvanceOutcome::NotFound);
+        };
+        if row.status != BranchStatus::Active {
+            return Ok(AdvanceOutcome::NotActive { status: row.status });
+        }
+        if let Some(reservation_id) = self
+            .head_reservation(branch_id)?
+            .filter(|held| Some(held.as_str()) != lease)
+        {
+            return Err(StoreError::Conflict(format!(
+                "branch `{branch_id}` head is reserved by `{reservation_id}`"
+            )));
+        }
+        if row.head_cut_id.as_deref() != expected_head_cut_id {
+            return Ok(AdvanceOutcome::Stale {
+                current_head_cut_id: row.head_cut_id,
+            });
+        }
+        self.sql
+            .execute(
+                "UPDATE branches SET head_cut_id = ?2, head_manifest_hash = ?3, \
+                 updated_at = ?4 WHERE branch_id = ?1",
+                &[text(branch_id), text(cut_id), text(manifest_hash), text(at)],
+            )
+            .map_err(sql_err)?;
+        let row = StoreError::written_row(self.row_by_id(branch_id)?, "advanced branch row")?;
+        Ok(AdvanceOutcome::Advanced(Box::new(row)))
+    }
+
     pub fn new(sql: S) -> StoreResult<Self> {
         let store = Self { sql };
         store.ensure_schema()?;
@@ -520,31 +559,32 @@ impl<S: DoSql> Branches for DoBranches<S> {
         manifest_hash: &str,
         at: &str,
     ) -> StoreResult<AdvanceOutcome> {
-        let Some(row) = self.row_by_id(branch_id)? else {
-            return Ok(AdvanceOutcome::NotFound);
-        };
-        if row.status != BranchStatus::Active {
-            return Ok(AdvanceOutcome::NotActive { status: row.status });
-        }
-        if let Some(reservation_id) = self.head_reservation(branch_id)? {
-            return Err(StoreError::Conflict(format!(
-                "branch `{branch_id}` head is reserved by `{reservation_id}`"
-            )));
-        }
-        if row.head_cut_id.as_deref() != expected_head_cut_id {
-            return Ok(AdvanceOutcome::Stale {
-                current_head_cut_id: row.head_cut_id,
-            });
-        }
-        self.sql
-            .execute(
-                "UPDATE branches SET head_cut_id = ?2, head_manifest_hash = ?3, \
-                 updated_at = ?4 WHERE branch_id = ?1",
-                &[text(branch_id), text(cut_id), text(manifest_hash), text(at)],
-            )
-            .map_err(sql_err)?;
-        let row = StoreError::written_row(self.row_by_id(branch_id)?, "advanced branch row")?;
-        Ok(AdvanceOutcome::Advanced(Box::new(row)))
+        self.advance_head_leased(
+            None,
+            branch_id,
+            expected_head_cut_id,
+            cut_id,
+            manifest_hash,
+            at,
+        )
+    }
+
+    fn advance_gated_head(
+        &mut self,
+        branch_id: &str,
+        expected_head_cut_id: Option<&str>,
+        cut_id: &str,
+        manifest_hash: &str,
+        at: &str,
+    ) -> StoreResult<AdvanceOutcome> {
+        self.advance_head_leased(
+            Some(MAINLINE_GATE_LEASE),
+            branch_id,
+            expected_head_cut_id,
+            cut_id,
+            manifest_hash,
+            at,
+        )
     }
 
     /// Install the durable exclusion consulted by both head-mutation paths.
@@ -600,6 +640,13 @@ impl<S: DoSql> Branches for DoBranches<S> {
         branch_id: &str,
         reservation_id: &str,
     ) -> StoreResult<bool> {
+        // A governed mainline stays leased: nothing a door holds can release
+        // the gate's hold on it (norm-plane §5).
+        if reservation_id == MAINLINE_GATE_LEASE {
+            return Err(StoreError::Conflict(
+                "the mainline gate's lease is never released".into(),
+            ));
+        }
         Ok(self
             .sql
             .execute(
@@ -1082,6 +1129,11 @@ impl<S: DoSql> Branches for DoBranches<S> {
         let Some(row) = self.row_by_id(branch_id)? else {
             return Ok(AdvanceOutcome::NotFound);
         };
+        if let Some(reservation_id) = self.head_reservation(branch_id)? {
+            return Err(StoreError::Conflict(format!(
+                "branch `{branch_id}` head is reserved by `{reservation_id}`"
+            )));
+        }
         if row.head_cut_id.as_deref() != expected_head_cut_id {
             return Ok(AdvanceOutcome::Stale {
                 current_head_cut_id: row.head_cut_id,

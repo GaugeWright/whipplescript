@@ -35,6 +35,12 @@ use std::collections::BTreeSet;
 /// The distinguished mainline branch id.
 pub const MAINLINE_BRANCH_ID: &str = "main";
 
+/// The standing head reservation a governed workspace holds on its mainline
+/// (norm-plane §5, the mainline adoption lease). Every ordinary head mutation
+/// refuses a reserved head, so the mainline moves only through
+/// [`Branches::advance_gated_head`], which the mainline gate's commit calls.
+pub const MAINLINE_GATE_LEASE: &str = "norm-gate";
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum BranchStatus {
@@ -384,6 +390,19 @@ pub enum ClosurePinState {
     Absent,
 }
 
+/// Take the mainline gate's lease (norm-plane §5), creating the mainline if
+/// it does not exist yet. Idempotent; a head another holder reserved refuses,
+/// since the gate cannot govern a ref it does not hold.
+pub fn lease_gated_mainline(branches: &mut dyn Branches, at: &str) -> StoreResult<()> {
+    branches.ensure_mainline(at)?;
+    match branches.reserve_head(MAINLINE_BRANCH_ID, MAINLINE_GATE_LEASE, at)? {
+        HeadReservationOutcome::Reserved | HeadReservationOutcome::Existing => Ok(()),
+        other => Err(crate::StoreError::Conflict(format!(
+            "the mainline gate cannot take its lease: {other:?}"
+        ))),
+    }
+}
+
 /// Object-safe branch-tier seam, mirroring `Coordination`/`WorkItems`: the
 /// DO host supplies its own implementation over `DoSql`.
 pub trait Branches {
@@ -411,6 +430,17 @@ pub trait Branches {
     /// Walk parent pointers from the branch to its root, inclusive.
     fn lineage(&self, branch_id: &str) -> StoreResult<Vec<BranchRow>>;
     fn advance_head(
+        &mut self,
+        branch_id: &str,
+        expected_head_cut_id: Option<&str>,
+        cut_id: &str,
+        manifest_hash: &str,
+        at: &str,
+    ) -> StoreResult<AdvanceOutcome>;
+    /// `advance_head` for a head held only by the mainline gate's lease: the
+    /// one mutation a leased mainline admits, called inside the gate's commit.
+    /// Any other reservation refuses exactly as `advance_head` does.
+    fn advance_gated_head(
         &mut self,
         branch_id: &str,
         expected_head_cut_id: Option<&str>,
@@ -716,6 +746,51 @@ impl BranchStore {
         ensure_branch_schema(&connection)?;
         connection.set_prepared_statement_cache_capacity(crate::STATEMENT_CACHE_CAPACITY);
         Ok(Self { connection })
+    }
+
+    fn advance_head_leased(
+        &mut self,
+        lease: Option<&str>,
+        branch_id: &str,
+        expected_head_cut_id: Option<&str>,
+        cut_id: &str,
+        manifest_hash: &str,
+        at: &str,
+    ) -> StoreResult<AdvanceOutcome> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let Some(row) = Self::row_by_id(&tx, branch_id)? else {
+            return Ok(AdvanceOutcome::NotFound);
+        };
+        if row.status != BranchStatus::Active {
+            return Ok(AdvanceOutcome::NotActive { status: row.status });
+        }
+        let reservation: Option<String> = tx
+            .query_row(
+                "SELECT reservation_id FROM branch_head_reservations WHERE branch_id = ?1",
+                params![branch_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(reservation_id) = reservation.filter(|held| Some(held.as_str()) != lease) {
+            return Err(StoreError::Conflict(format!(
+                "branch `{branch_id}` head is reserved by `{reservation_id}`"
+            )));
+        }
+        if row.head_cut_id.as_deref() != expected_head_cut_id {
+            return Ok(AdvanceOutcome::Stale {
+                current_head_cut_id: row.head_cut_id,
+            });
+        }
+        tx.execute(
+            "UPDATE branches SET head_cut_id = ?2, head_manifest_hash = ?3, \
+             updated_at = ?4 WHERE branch_id = ?1",
+            params![branch_id, cut_id, manifest_hash, at],
+        )?;
+        let row = Self::row_by_id(&tx, branch_id)?.expect("advanced row");
+        tx.commit()?;
+        Ok(AdvanceOutcome::Advanced(Box::new(row)))
     }
 
     fn row_by_id(connection: &Connection, branch_id: &str) -> StoreResult<Option<BranchRow>> {
@@ -1253,40 +1328,32 @@ impl Branches for BranchStore {
         manifest_hash: &str,
         at: &str,
     ) -> StoreResult<AdvanceOutcome> {
-        let tx = self
-            .connection
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let Some(row) = Self::row_by_id(&tx, branch_id)? else {
-            return Ok(AdvanceOutcome::NotFound);
-        };
-        if row.status != BranchStatus::Active {
-            return Ok(AdvanceOutcome::NotActive { status: row.status });
-        }
-        let reservation: Option<String> = tx
-            .query_row(
-                "SELECT reservation_id FROM branch_head_reservations WHERE branch_id = ?1",
-                params![branch_id],
-                |row| row.get(0),
-            )
-            .optional()?;
-        if let Some(reservation_id) = reservation {
-            return Err(StoreError::Conflict(format!(
-                "branch `{branch_id}` head is reserved by `{reservation_id}`"
-            )));
-        }
-        if row.head_cut_id.as_deref() != expected_head_cut_id {
-            return Ok(AdvanceOutcome::Stale {
-                current_head_cut_id: row.head_cut_id,
-            });
-        }
-        tx.execute(
-            "UPDATE branches SET head_cut_id = ?2, head_manifest_hash = ?3, \
-             updated_at = ?4 WHERE branch_id = ?1",
-            params![branch_id, cut_id, manifest_hash, at],
-        )?;
-        let row = Self::row_by_id(&tx, branch_id)?.expect("advanced row");
-        tx.commit()?;
-        Ok(AdvanceOutcome::Advanced(Box::new(row)))
+        self.advance_head_leased(
+            None,
+            branch_id,
+            expected_head_cut_id,
+            cut_id,
+            manifest_hash,
+            at,
+        )
+    }
+
+    fn advance_gated_head(
+        &mut self,
+        branch_id: &str,
+        expected_head_cut_id: Option<&str>,
+        cut_id: &str,
+        manifest_hash: &str,
+        at: &str,
+    ) -> StoreResult<AdvanceOutcome> {
+        self.advance_head_leased(
+            Some(MAINLINE_GATE_LEASE),
+            branch_id,
+            expected_head_cut_id,
+            cut_id,
+            manifest_hash,
+            at,
+        )
     }
 
     fn reserve_head(
@@ -1346,6 +1413,13 @@ impl Branches for BranchStore {
         branch_id: &str,
         reservation_id: &str,
     ) -> StoreResult<bool> {
+        // A governed mainline stays leased: nothing a door holds can release
+        // the gate's hold on it (norm-plane §5).
+        if reservation_id == MAINLINE_GATE_LEASE {
+            return Err(StoreError::Conflict(
+                "the mainline gate's lease is never released".into(),
+            ));
+        }
         Ok(self.connection.execute(
             "DELETE FROM branch_head_reservations WHERE branch_id = ?1 AND reservation_id = ?2",
             params![branch_id, reservation_id],
@@ -1741,6 +1815,18 @@ impl Branches for BranchStore {
         let Some(row) = Self::row_by_id(&tx, branch_id)? else {
             return Ok(AdvanceOutcome::NotFound);
         };
+        let reservation: Option<String> = tx
+            .query_row(
+                "SELECT reservation_id FROM branch_head_reservations WHERE branch_id = ?1",
+                params![branch_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(reservation_id) = reservation {
+            return Err(StoreError::Conflict(format!(
+                "branch `{branch_id}` head is reserved by `{reservation_id}`"
+            )));
+        }
         if row.head_cut_id.as_deref() != expected_head_cut_id {
             return Ok(AdvanceOutcome::Stale {
                 current_head_cut_id: row.head_cut_id,

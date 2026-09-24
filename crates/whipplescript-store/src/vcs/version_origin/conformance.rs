@@ -154,7 +154,7 @@ pub fn check<B: Branches, C: ContentBlobs>(mut make: impl FnMut() -> WorkspaceVc
     );
     vcs.write("main", "note.txt", Some("changed"), "changed", "t4")
         .expect("retained-version conformance fixture");
-    vcs.restore("main", "first", "restored", "t5")
+    vcs.restore("main", "first", "restored", "t5", &mut Ungoverned)
         .expect("retained-version conformance fixture");
     assert_eq!(
         vcs.file_version_origin("restored", "note.txt", budget)
@@ -193,5 +193,26 @@ pub fn check<B: Branches, C: ContentBlobs>(mut make: impl FnMut() -> WorkspaceVc
             vcs.read_at_cut("first", path).is_err(),
             "erased manifest is not an absent file"
         );
+    }
+}
+
+/// These observations carry no norm ledger, so nothing gates the mainline.
+struct Ungoverned;
+
+impl crate::vcs::MainlineGate for Ungoverned {
+    fn prepare(
+        &mut self,
+        _base_cut: Option<&str>,
+        _proposed_cut: &str,
+        _artifacts: &crate::norm_commands::NormArtifactCapture<'_>,
+    ) -> crate::StoreResult<crate::vcs::GateVerdict> {
+        Ok(crate::vcs::GateVerdict::Admit)
+    }
+    fn commit(
+        &mut self,
+        advance: &mut dyn FnMut() -> crate::StoreResult<()>,
+    ) -> crate::StoreResult<crate::vcs::GateCommit> {
+        advance()?;
+        Ok(crate::vcs::GateCommit::Committed)
     }
 }

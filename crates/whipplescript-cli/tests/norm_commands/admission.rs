@@ -18,6 +18,11 @@ const ALLOWING: &str = "def allow(user): return True";
 /// `whip stream promote` in the fixture's workspace, with the norm host's
 /// configuration as the arguments say.
 fn promote(fixture: &Fixture, stream: &str, host: Option<(&Value, &std::path::Path)>) -> Output {
+    whip(fixture, &["stream", "promote", stream], host)
+}
+
+/// One `whip` command against the fixture's host-selected stores.
+fn whip(fixture: &Fixture, args: &[&str], host: Option<(&Value, &std::path::Path)>) -> Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_whip"));
     command
         .current_dir(&fixture.root)
@@ -53,10 +58,31 @@ fn promote(fixture: &Fixture, stream: &str, host: Option<(&Value, &std::path::Pa
             .env("WHIPPLESCRIPT_NORM_PLANNING", planning.to_string())
             .env("WHIPPLESCRIPT_NATIVE_NORM_RUNTIME", runtime_host);
     }
-    command
-        .args(["stream", "promote", stream])
-        .output()
-        .expect("promote process")
+    command.args(args).output().expect("whip process")
+}
+
+/// A door's structured refusal of a mainline move, with the mainline unmoved.
+fn refused_naming(fixture: &Fixture, output: &Output, door: &str, requirement: &str) -> Value {
+    assert!(
+        !output.status.success(),
+        "{door} moved the mainline: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let refused: Value = serde_json::from_slice(&output.stdout).expect("refusal JSON");
+    assert_eq!(refused["door"], door);
+    assert_eq!(refused["target"], "main");
+    assert!(
+        refused["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains(requirement)),
+        "{refused}"
+    );
+    assert_eq!(
+        main_file(fixture).as_deref(),
+        Some("def allow(user): return None"),
+        "a refused {door} leaves the mainline where it was"
+    );
+    refused
 }
 
 fn main_file(fixture: &Fixture) -> Option<String> {
@@ -77,6 +103,38 @@ fn main_file(fixture: &Fixture) -> Option<String> {
 fn stream_promotion_passes_the_mainline_gate_only_with_support_at_the_merged_result() {
     for actual in [false, true] {
         let fixture = Fixture::new();
+        // The workspace: Main holds a base; the stream's line holds the
+        // candidate the evidence is about. Bootstrapping the ledger then
+        // leases the mainline to its gate, after which only doors move it.
+        let mut vcs = NativeWorkspaceVcs::open(
+            fixture.root.join("branches.sqlite"),
+            fixture.root.join("content.sqlite"),
+        )
+        .unwrap();
+        vcs.init("t0").unwrap();
+        vcs.write(
+            MAINLINE_BRANCH_ID,
+            "main.py",
+            Some("def allow(user): return None"),
+            "cut_0",
+            "t1",
+        )
+        .unwrap();
+        vcs.create_branch("line-triage", None, MAINLINE_BRANCH_ID, "t2")
+            .unwrap();
+        vcs.write(
+            "line-triage",
+            "main.py",
+            Some(if actual { ALLOWING } else { DENYING }),
+            "cut_1",
+            "t3",
+        )
+        .unwrap();
+        WorkstreamStore::open(fixture.root.join("workstreams.sqlite"))
+            .unwrap()
+            .create_stream("triage", None, "line-triage", "t3", None)
+            .unwrap();
+
         let mut charter = whipplescript_store::norm::NormCharter::bundled().unwrap();
         let observation = execution::observation_vocabulary();
         let observation_ref = Vocabulary::new(observation.definition.clone())
@@ -126,32 +184,6 @@ fn stream_promotion_passes_the_mainline_gate_only_with_support_at_the_merged_res
         ]);
         let requirement = created["result"]["event_id"].as_str().unwrap().to_owned();
         fixture.run(&["transition", &requirement, "accepted", "--as", "owner"]);
-
-        // The workspace: Main holds a base; the stream's line holds the
-        // candidate the evidence is about.
-        let candidate = if actual { ALLOWING } else { DENYING };
-        let mut vcs = NativeWorkspaceVcs::open(
-            fixture.root.join("branches.sqlite"),
-            fixture.root.join("content.sqlite"),
-        )
-        .unwrap();
-        vcs.init("t0").unwrap();
-        vcs.write(
-            MAINLINE_BRANCH_ID,
-            "main.py",
-            Some("def allow(user): return None"),
-            "cut_0",
-            "t1",
-        )
-        .unwrap();
-        vcs.create_branch("line-triage", None, MAINLINE_BRANCH_ID, "t2")
-            .unwrap();
-        vcs.write("line-triage", "main.py", Some(candidate), "cut_1", "t3")
-            .unwrap();
-        WorkstreamStore::open(fixture.root.join("workstreams.sqlite"))
-            .unwrap()
-            .create_stream("triage", None, "line-triage", "t3", None)
-            .unwrap();
 
         // The host: an installed observer, the protected runtime, and how to
         // read the ledger's vocabularies.
@@ -279,11 +311,69 @@ fn stream_promotion_passes_the_mainline_gate_only_with_support_at_the_merged_res
                 Some("def allow(user): return None"),
                 "a refused promotion leaves the mainline where it was"
             );
+            // The same result through every other door onto the mainline
+            // asks the same predicate and refuses with the requirement named
+            // (NP-15): a transport onto mainline, a restore to the line's cut,
+            // and an operator undo of the mainline's own write.
+            let host = Some((&planning, host_path.as_path()));
+            let transported = refused_naming(
+                &fixture,
+                &whip(
+                    &fixture,
+                    &[
+                        "--json",
+                        "branch",
+                        "transport",
+                        "line-triage",
+                        "path(main.py)",
+                        "--onto",
+                        "main",
+                        "--apply",
+                    ],
+                    host,
+                ),
+                "transport",
+                &requirement,
+            );
+            assert_eq!(
+                transported["detail"]["requirements"][&requirement],
+                json!(["repair"])
+            );
+            refused_naming(
+                &fixture,
+                &whip(
+                    &fixture,
+                    &["--json", "branch", "restore", "main", "cut_1"],
+                    host,
+                ),
+                "restore",
+                &requirement,
+            );
+            refused_naming(
+                &fixture,
+                &whip(&fixture, &["--json", "branch", "undo-op", "op-cut_0"], host),
+                "undo-op",
+                &requirement,
+            );
         } else {
             assert!(
                 output.status.success(),
                 "{}",
                 String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(main_file(&fixture).as_deref(), Some(DENYING));
+            // A governed mainline moves only through doors: the store refuses
+            // a plain write under the gate's lease.
+            let written = whip(
+                &fixture,
+                &["branch", "write", "main", "main.py", "--body", ALLOWING],
+                Some((&planning, &host_path)),
+            );
+            assert!(!written.status.success());
+            assert!(
+                String::from_utf8_lossy(&written.stderr).contains("reserved by `norm-gate`"),
+                "{}",
+                String::from_utf8_lossy(&written.stderr)
             );
             assert_eq!(main_file(&fixture).as_deref(), Some(DENYING));
         }

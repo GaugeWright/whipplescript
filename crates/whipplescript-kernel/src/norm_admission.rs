@@ -34,11 +34,18 @@ use crate::norm_impact::ImpactWork;
 use crate::norm_planning::{ImpactQuery, Planned, PlanningConfiguration};
 use crate::norm_runner::PythonRuntime;
 
-/// Which door is asking.
+/// Which door is asking. Enforcement attaches to the ref, so every door onto
+/// a gated ref asks the same predicate; the door is recorded on the
+/// certificate for the receipt.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AdmissionDoor {
     Promote,
+    Transport,
+    Undo,
+    Restore,
+    Merge,
+    Adopt,
 }
 
 /// What an admission certified: the proposal, and the ledger state its
