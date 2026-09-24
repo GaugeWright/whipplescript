@@ -122,6 +122,7 @@ case "${1:-}" in
   workstream-host-contract) python3 scripts/check-workstream-host-contract.py ;;
   refusal-scanner)      python3 scripts/test-mutation-sweep.py ;;
   vendored-std)         scripts/check-vendored-std.sh ;;
+  native-crates)        python3 scripts/buckify-crates.py --check ;;
   trackers)             scripts/check-trackers.sh ;;
   gate-reachability)    scripts/check-gate-reachability.sh ;;
   decision-records)     scripts/check-decision-records.sh ;;

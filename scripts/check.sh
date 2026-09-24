@@ -460,6 +460,15 @@ section diagnostic-codes
 # script's own map, and therefore checked by nothing at all.
 section vendored-std
 
+# The workspace crates as native Buck2 targets (GaugeWright BUILD.md stage 5) are
+# rendered from Cargo.toml by scripts/buckify-crates.py, so Cargo.toml stays the
+# one source of truth; this fails when the rendered file has drifted from it.
+# The mirror publishes no BUCK file, so it has no native targets to drift and
+# no rendered file to compare: the guard is that file's presence.
+if [ -f native-crates.bzl ]; then
+    section native-crates
+fi
+
 # The tracker registry. `spec/TRACKERS.md` is the status ledger and this script
 # is its enforcement, but nothing invoked it — so on 2026-08-27 trunk carried a
 # closed tracker with a forward horizon and no gate said so. Found the same day,
