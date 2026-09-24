@@ -107,7 +107,8 @@ pub struct WorkItem {
 #[cfg(test)]
 const STORE_PRODUCED_STATUSES: &[&str] = &[
     // `open` on file, `closed` on finish, `canceled` on cancel, `open` again on
-    // reopen (items.rs fold), `archived` via `whip issue archive`.
+    // reopen, and any of the four through a `status` field set; `archived` has
+    // no verb and is reached only by `whip issue set <id> status archived`.
     "open",
     "closed",
     "canceled",
