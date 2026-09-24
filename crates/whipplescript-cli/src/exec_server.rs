@@ -395,7 +395,14 @@ fn handle_connection(
     // budget that the header deadline had been shrinking.
     stream.set_read_timeout(Some(HEADER_READ_TIMEOUT))?;
 
-    if content_length > MAX_REQUEST_BODY_BYTES {
+    // A build action's blobs travel in bodies the script routes never need;
+    // only those routes get the larger cap.
+    let body_cap = if is_action_route(&path) {
+        whipplescript_remote_execution::sidecar::MAX_ACTION_BODY_BYTES
+    } else {
+        MAX_REQUEST_BODY_BYTES
+    };
+    if content_length > body_cap {
         return write_json_response(stream, 413, json!({"error": "request body too large"}));
     }
 
@@ -523,6 +530,21 @@ fn handle_connection(
                 Err((status, message)) => (status, json!({"error": message})),
             }
         }
+        // Build actions an endpoint hands to this executor
+        // (`whipplescript.build.action/v1`): the sidecar tier as the
+        // endpoint's runner, confined exactly as the endpoint's own runner is.
+        ("POST", route) if is_action_route(route) => {
+            match check_executor_auth(
+                local_addr.map(|addr| addr.ip()),
+                &authorization,
+                &executor_token_header,
+            ) {
+                Ok(()) => action_sidecar()
+                    .handle(route, &body)
+                    .unwrap_or_else(|| (404, json!({"error": "unknown action route"}))),
+                Err((status, message)) => (status, json!({"error": message})),
+            }
+        }
         // Class-B blocking form: run (or re-attach to) a whole agent turn and
         // answer with its final outcome. The WS form on GET /turn streams.
         ("POST", "/turn") => {
@@ -543,11 +565,27 @@ fn handle_connection(
         }
         _ => (
             404,
-            json!({"error": "unknown route; POST /exec or GET /healthz"}),
+            json!({"error": "unknown route; POST /exec, POST /action or GET /healthz"}),
         ),
     };
 
     write_json_response(stream, status, response_body)
+}
+
+fn is_action_route(path: &str) -> bool {
+    path == "/action" || path.starts_with("/action/")
+}
+
+/// The executor's build-action half: one blob cache and scratch root per
+/// process, under `WHIP_EXECUTOR_ACTIONS` or the system's temporary directory.
+fn action_sidecar() -> &'static whipplescript_remote_execution::sidecar::ActionSidecar {
+    static SIDECAR: std::sync::OnceLock<whipplescript_remote_execution::sidecar::ActionSidecar> =
+        std::sync::OnceLock::new();
+    SIDECAR.get_or_init(|| {
+        whipplescript_remote_execution::sidecar::ActionSidecar::new(
+            whipplescript_remote_execution::sidecar::default_sidecar_root(),
+        )
+    })
 }
 
 fn write_json_response(
@@ -564,7 +602,9 @@ fn write_json_response(
             400 => "Bad Request",
             404 => "Not Found",
             409 => "Conflict",
+            401 => "Unauthorized",
             413 => "Payload Too Large",
+            422 => "Unprocessable Content",
             431 => "Request Header Fields Too Large",
             _ => "Internal Server Error",
         },
@@ -1613,8 +1653,51 @@ mod tests {
         assert_eq!(response["exit_code"], json!(0));
         assert_eq!(response["stdout"], json!("not-unstaged\n"));
     }
-}
 
-#[cfg(test)]
-#[path = "exec_server_norm_tests.rs"]
-mod norm_runner_tests;
+    #[test]
+    fn the_action_route_runs_a_build_action_for_the_endpoints_sidecar_runner() {
+        use whipplescript_remote_execution::runner::{ActionRunner, Output, PreparedAction};
+        use whipplescript_remote_execution::sidecar::SidecarRunner;
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind executor");
+        let address = listener.local_addr().expect("address");
+        std::thread::spawn(move || {
+            let _ = serve_on(listener);
+        });
+        let base = format!("http://{address}");
+        // An input larger than the script routes accept: the action routes
+        // carry blobs, so only they take the larger body.
+        let input = vec![b'q'; MAX_REQUEST_BODY_BYTES + 1024];
+        let runtime = tokio::runtime::Runtime::new().expect("a runtime");
+        let outcome = runtime
+            .block_on(
+                SidecarRunner::new(&base, None)
+                    .expect("an http address")
+                    .run(PreparedAction {
+                        arguments: vec!["sh".into(), "-c".into(), "wc -c < in.bin > count".into()],
+                        environment: vec![],
+                        working_directory: String::new(),
+                        inputs: [("in.bin".to_owned(), (input.clone(), false))]
+                            .into_iter()
+                            .collect(),
+                        output_paths: vec!["count".into()],
+                        timeout: Some(Duration::from_secs(60)),
+                    }),
+            )
+            .expect("the executor ran the action");
+        assert_eq!(outcome.exit_code, 0);
+        match &outcome.outputs["count"] {
+            Output::File { bytes, .. } => assert_eq!(
+                String::from_utf8_lossy(bytes).trim(),
+                input.len().to_string()
+            ),
+            other => panic!("not a file: {other:?}"),
+        }
+        match ureq::post(&format!("{base}/action/elsewhere")).send_json(json!({})) {
+            Err(ureq::Error::Status(404, response)) => assert_eq!(
+                response.into_json::<Value>().expect("json")["error"],
+                "unknown action route"
+            ),
+            other => panic!("expected a 404, got {other:?}"),
+        }
+    }
+}

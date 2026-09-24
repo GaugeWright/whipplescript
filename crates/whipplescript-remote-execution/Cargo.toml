@@ -14,29 +14,54 @@ readme.workspace = true
 dist = false
 
 [dependencies]
-whipplescript-store = { version = "0.5.6", path = "../whipplescript-store", features = ["native"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
+tempfile = "3"
+# The sidecar runner's wire contract carries bytes as base64 in JSON, as the
+# executor's own `whip-executor/1` does.
+base64 = "0.23"
+# Everything below is the endpoint itself. The confined run and the sidecar's
+# wire contract need none of it, which is how the `whip executor` sidecar
+# mounts the action route without the endpoint's runtime (`default-features
+# = false`).
+whipplescript-store = { version = "0.5.6", path = "../whipplescript-store", features = ["native"], optional = true }
 # The store and the action cache persist in one SQLite file beside the build
 # root, at the version the rest of the workspace uses.
-rusqlite = { version = "0.40.1", features = ["bundled"] }
-sha2 = "0.10"
+rusqlite = { version = "0.40.1", features = ["bundled"], optional = true }
 # The Remote Execution API is gRPC; the protocol files are vendored at the
 # pinned Buck2 release (the client that speaks to this endpoint), the code
 # generated once by a pure-Rust compiler and checked in, and a test proves the
 # checked-in code is current.
-tonic = { version = "0.14", default-features = false, features = ["channel", "server", "router", "codegen"] }
-tonic-prost = "0.14"
-prost = "0.14"
-prost-types = "0.14"
-tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "sync", "time", "process", "fs", "io-std"] }
-tokio-stream = { version = "0.1", features = ["net"] }
-tower = { version = "0.5", features = ["util"] }
-hyper-util = { version = "0.1", features = ["tokio"] }
-async-trait = "0.1"
-futures = "0.3"
-rand = "0.8"
-tempfile = "3"
+tonic = { version = "0.14", default-features = false, features = ["channel", "server", "router", "codegen"], optional = true }
+tonic-prost = { version = "0.14", optional = true }
+prost = { version = "0.14", optional = true }
+prost-types = { version = "0.14", optional = true }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "sync", "time", "process", "fs", "io-std"], optional = true }
+tokio-stream = { version = "0.1", features = ["net"], optional = true }
+tower = { version = "0.5", features = ["util"], optional = true }
+hyper-util = { version = "0.1", features = ["tokio"], optional = true }
+async-trait = { version = "0.1", optional = true }
+futures = { version = "0.3", optional = true }
+rand = { version = "0.8", optional = true }
+
+[features]
+default = ["endpoint"]
+endpoint = [
+    "dep:whipplescript-store",
+    "dep:rusqlite",
+    "dep:tonic",
+    "dep:tonic-prost",
+    "dep:prost",
+    "dep:prost-types",
+    "dep:tokio",
+    "dep:tokio-stream",
+    "dep:tower",
+    "dep:hyper-util",
+    "dep:async-trait",
+    "dep:futures",
+    "dep:rand",
+]
 
 [dev-dependencies]
 protox = "0.9"
@@ -47,6 +72,7 @@ tempfile = "3"
 [[bin]]
 name = "whip-remote-execution"
 path = "src/main.rs"
+required-features = ["endpoint"]
 
 [lints]
 workspace = true

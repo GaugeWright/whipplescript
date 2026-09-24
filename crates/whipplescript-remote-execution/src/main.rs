@@ -6,14 +6,18 @@
 //! `--state <file>` its store and action cache are that SQLite database, so
 //! the next process over the same file serves what this one stored; with
 //! `--content <file>` as well, its bytes are the workspace's content store.
+//! With `--sidecar <http://host:port>` its actions run at a Class-A executor
+//! (`whip executor`) instead of on this host, authenticated with
+//! `WHIP_EXECUTOR_TOKEN` when that is set.
 
 use std::sync::Arc;
 
 use whipplescript_remote_execution::endpoint::Endpoint;
-use whipplescript_remote_execution::runner::LocalRunner;
+use whipplescript_remote_execution::runner::{ActionRunner, LocalRunner};
+use whipplescript_remote_execution::sidecar::SidecarRunner;
 use whipplescript_remote_execution::store::Principal;
 
-const USAGE: &str = "usage: whip-remote-execution --listen <addr> --scratch <dir> [--state <file> [--content <file>]] [--principal <name>[=<label>,...]]... [--daemon <name>]";
+const USAGE: &str = "usage: whip-remote-execution --listen <addr> --scratch <dir> [--state <file> [--content <file>]] [--sidecar <http://host:port>] [--principal <name>[=<label>,...]]... [--daemon <name>]";
 
 #[derive(Debug)]
 struct Arguments {
@@ -21,6 +25,7 @@ struct Arguments {
     scratch: String,
     state: Option<String>,
     content: Option<String>,
+    sidecar: Option<String>,
     principals: Vec<Principal>,
     daemon: Option<String>,
 }
@@ -30,6 +35,7 @@ fn parse(args: &[String]) -> Result<Arguments, String> {
     let mut scratch = None;
     let mut state = None;
     let mut content = None;
+    let mut sidecar = None;
     let mut principals = Vec::new();
     let mut daemon = None;
     let mut it = args.iter();
@@ -40,6 +46,7 @@ fn parse(args: &[String]) -> Result<Arguments, String> {
             "--scratch" => scratch = value(),
             "--state" => state = value(),
             "--content" => content = value(),
+            "--sidecar" => sidecar = value(),
             "--daemon" => daemon = value(),
             "--principal" => {
                 let spec = value().ok_or_else(|| format!("--principal needs a value\n{USAGE}"))?;
@@ -74,6 +81,7 @@ fn parse(args: &[String]) -> Result<Arguments, String> {
         scratch: scratch.ok_or_else(|| format!("--scratch is required\n{USAGE}"))?,
         state,
         content,
+        sidecar,
         principals,
         daemon,
     })
@@ -82,7 +90,13 @@ fn parse(args: &[String]) -> Result<Arguments, String> {
 async fn run(args: Arguments) -> Result<(), String> {
     std::fs::create_dir_all(&args.scratch)
         .map_err(|error| format!("cannot create {}: {error}", args.scratch))?;
-    let runner = Arc::new(LocalRunner::new(&args.scratch));
+    let runner: Arc<dyn ActionRunner> = match &args.sidecar {
+        Some(url) => Arc::new(SidecarRunner::new(
+            url,
+            std::env::var("WHIP_EXECUTOR_TOKEN").ok(),
+        )?),
+        None => Arc::new(LocalRunner::new(&args.scratch)),
+    };
     let mut endpoint = match (&args.state, &args.content) {
         (Some(state), Some(content)) => Endpoint::open_sharing(
             runner,
@@ -170,6 +184,8 @@ mod tests {
             "/tmp/s/endpoint.sqlite",
             "--content",
             "/tmp/s/vcs-content.sqlite",
+            "--sidecar",
+            "http://127.0.0.1:8080",
             "--principal",
             "owner=protected,internal",
             "--principal",
@@ -181,6 +197,7 @@ mod tests {
         assert_eq!(parsed.listen, "127.0.0.1:0");
         assert_eq!(parsed.state.as_deref(), Some("/tmp/s/endpoint.sqlite"));
         assert_eq!(parsed.content.as_deref(), Some("/tmp/s/vcs-content.sqlite"));
+        assert_eq!(parsed.sidecar.as_deref(), Some("http://127.0.0.1:8080"));
         assert!(parse(&owned(&[
             "--listen",
             "x",

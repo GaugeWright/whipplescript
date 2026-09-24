@@ -147,6 +147,9 @@ case "${1:-}" in
     cargo check -p whipplescript-store --no-default-features
     cargo check -p whipplescript-kernel --no-default-features
     cargo check -p whipplescript --no-default-features
+    # The runner-only half `whip executor` links: the confined run and the
+    # sidecar's wire contract, without the endpoint's gRPC runtime.
+    cargo check -p whipplescript-remote-execution --no-default-features --all-targets
     # whipplescript-custodian's `pkcs11` gates eight cfg sites and was compiled
     # by nothing. cryptoki loads its vendor module at runtime and its bindings
     # are pre-generated, so this needs no system library and is portable. Its

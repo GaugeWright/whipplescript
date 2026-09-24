@@ -24,7 +24,6 @@ pub const LABELS_PROPERTY: &str = "whipplescript.labels";
 /// The metadata key a direct client names its handle under.
 pub const HANDLE_HEADER: &str = "x-whipplescript-handle";
 
-const DEFAULT_TIMEOUT: Duration = Duration::from_secs(600);
 const INLINE_LIMIT: usize = 64 * 1024;
 
 /// Why an execution did not happen.
@@ -275,7 +274,7 @@ impl Endpoint {
             .as_ref()
             .and_then(|d| Duration::try_from(*d).ok())
             .filter(|d| !d.is_zero())
-            .unwrap_or(DEFAULT_TIMEOUT);
+            .unwrap_or(crate::runner::DEFAULT_TIMEOUT);
         let prepared = PreparedAction {
             arguments: command.arguments.clone(),
             environment: command

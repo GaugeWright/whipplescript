@@ -3,6 +3,8 @@
 //! tree that says another. Set `WHIPPLESCRIPT_REGENERATE_PROTO=1` to write
 //! the generated code into `src/proto` instead of comparing.
 
+#![cfg(feature = "endpoint")]
+
 use std::path::Path;
 
 const GENERATED: &[&str] = &[

@@ -7,6 +7,7 @@ use std::fmt;
 
 use sha2::{Digest as _, Sha256};
 
+#[cfg(feature = "endpoint")]
 use crate::proto::re;
 
 #[derive(
@@ -40,20 +41,28 @@ impl Digest {
 
     /// A digest a client named: well-formed only as 64 hex characters and a
     /// non-negative size.
+    #[cfg(feature = "endpoint")]
     pub fn from_proto(digest: &re::Digest) -> Result<Self, String> {
-        let hash = digest.hash.to_ascii_lowercase();
-        if hash.len() != 64 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
-            return Err(format!("not a SHA-256 digest: {}", digest.hash));
+        Self::named(&digest.hash, digest.size_bytes)
+    }
+
+    /// A digest named by its hash and size: well-formed only as 64 hex
+    /// characters and a non-negative size.
+    pub fn named(hash: &str, size_bytes: i64) -> Result<Self, String> {
+        let lowered = hash.to_ascii_lowercase();
+        if lowered.len() != 64 || !lowered.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(format!("not a SHA-256 digest: {hash}"));
         }
-        if digest.size_bytes < 0 {
-            return Err(format!("negative digest size: {}", digest.size_bytes));
+        if size_bytes < 0 {
+            return Err(format!("negative digest size: {size_bytes}"));
         }
         Ok(Self {
-            hash,
-            size_bytes: digest.size_bytes,
+            hash: lowered,
+            size_bytes,
         })
     }
 
+    #[cfg(feature = "endpoint")]
     pub fn to_proto(&self) -> re::Digest {
         re::Digest {
             hash: self.hash.clone(),
@@ -66,10 +75,7 @@ impl Digest {
         let size_bytes = size
             .parse::<i64>()
             .map_err(|_| format!("not a blob size: {size}"))?;
-        Self::from_proto(&re::Digest {
-            hash: hash.to_owned(),
-            size_bytes,
-        })
+        Self::named(hash, size_bytes)
     }
 }
 
@@ -93,21 +99,14 @@ mod tests {
         assert_eq!(digest.size_bytes, 5);
         assert_eq!(digest.to_string(), format!("{}/5", digest.hash));
         assert!(Digest::empty().is_empty());
+        #[cfg(feature = "endpoint")]
         assert_eq!(Digest::from_proto(&digest.to_proto()).unwrap(), digest);
         assert_eq!(
-            Digest::from_proto(&re::Digest {
-                hash: "abc".into(),
-                size_bytes: 1
-            })
-            .unwrap_err(),
+            Digest::named("abc", 1).unwrap_err(),
             "not a SHA-256 digest: abc"
         );
         assert_eq!(
-            Digest::from_proto(&re::Digest {
-                hash: digest.hash.clone(),
-                size_bytes: -1
-            })
-            .unwrap_err(),
+            Digest::named(&digest.hash, -1).unwrap_err(),
             "negative digest size: -1"
         );
         assert_eq!(

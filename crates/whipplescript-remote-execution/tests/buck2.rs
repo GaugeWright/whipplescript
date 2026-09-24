@@ -6,6 +6,8 @@
 //! needs `buck2` on the PATH and is run by the bar's `buck2-test-executor`
 //! section, which names the remedy where Buck2 is absent.
 
+#![cfg(feature = "endpoint")]
+
 use std::path::Path;
 use std::sync::Arc;
 
