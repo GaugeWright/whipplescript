@@ -23,6 +23,16 @@ use whipplescript_core::{
 // validated against, and the path of the build-script executable itself.
 include!(concat!(env!("OUT_DIR"), "/build_script_probe.rs"));
 
+// Where the build script is. Under cargo, the path it recorded for itself.
+// Built natively (GaugeWright BUILD.md stage 5) that path is on whichever
+// machine ran the build script, which the shared cache makes any machine, so
+// the crate declares `build-script` in `[package.metadata.native-tests]` and
+// the executable arrives as a binary the test is given.
+const BUILD_SCRIPT: &str = match option_env!("CARGO_BIN_EXE_build-script-build") {
+    Some(path) => path,
+    None => BUILD_SCRIPT_PATH,
+};
+
 /// Every vocabulary list the build script validated against is core's list, so
 /// a re-introduced private copy fails here the moment it differs by one word.
 #[test]
@@ -80,7 +90,7 @@ fn a_declaration_clause_may_be_introduced_by_onto() {
 
     let out_dir = scratch.join("out");
     fs::create_dir_all(&out_dir).unwrap();
-    let run = Command::new(BUILD_SCRIPT_PATH)
+    let run = Command::new(BUILD_SCRIPT)
         .env("CARGO_MANIFEST_DIR", &scratch)
         .env("OUT_DIR", &out_dir)
         .output()

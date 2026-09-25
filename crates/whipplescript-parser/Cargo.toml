@@ -32,3 +32,9 @@ serde_json = "1"
 
 [lints]
 workspace = true
+
+# The construct-grammar tests run this crate's build script against a fixture
+# (tests/construct_grammar_vocabulary.rs); natively it is handed to them as a
+# binary (scripts/buckify-crates.py).
+[package.metadata.native-tests]
+build-script = true

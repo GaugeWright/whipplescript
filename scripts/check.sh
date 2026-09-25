@@ -352,8 +352,25 @@ section norm-observer
 # `cargo test `. Nothing is weakened today because this run carries no filter,
 # but a future filtered nextest call would be unguarded — that lint needs
 # widening before one is written.
+#
+# Where this checkout is a cell and the host is Linux with bubblewrap — every
+# fleet gate host that answers this bar — the same tests run as native targets
+# instead (GaugeWright BUILD.md, stage 5): each test binary is its own action
+# over only the files its crate declares, so a binary whose code and data did
+# not change is served its recorded pass rather than run again. That is most
+# of every change: a documentation-only change ran 80 s of cargo here and now
+# runs none. The binaries are the same tests, compiled from the same sources in
+# the configuration nextest uses, each test in its own process as nextest runs
+# it, and a test reading a file its crate did not declare fails rather than
+# passing unobserved. Anywhere else — a Mac, a worktree outside a workspace —
+# the cargo line above runs, and asserts the same set.
 echo "== tests =="
-section tests
+if [ -n "$via_buck2" ] && [ "$(uname -s)" = Linux ] && command -v bwrap >/dev/null 2>&1; then
+    buck2 build //:native-tests -c "green_bar.run=$GREEN_BAR_RUN" \
+      -c "green_bar.prerequisites=$prerequisites"
+else
+    section tests
+fi
 
 echo "== buck2 test executor =="
 section buck2-test-executor
