@@ -40,8 +40,8 @@ Its abstractions are intentionally narrow:
   fencing tokens, message loss, or fairness assumptions.
 
 The admission-fence comparison below takes up the first missing authority
-question. Later models still need durable change identity under rewriting and
-an external target after the single-ref invariants remain sound.
+question. The subsequent probes cover change identity under rewriting and
+two external targets, within the limits stated for each model.
 
 ## Admission-fence comparison
 
