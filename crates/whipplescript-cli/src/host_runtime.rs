@@ -2061,6 +2061,26 @@ impl GovernedHostRuntime {
         S: SecretResolver + ?Sized,
         R: ResourceResolver + ?Sized,
     {
+        self.run_turn_observing_model_requests(command, packages, secrets, resources, &|_| {})
+    }
+
+    /// Drive a native turn while observing each provider-bound request body.
+    /// The observer runs immediately before transport and is never written to
+    /// the governed event stream. Callers must keep its capture ephemeral and
+    /// authorize any reader separately.
+    pub fn run_turn_observing_model_requests<P, S, R>(
+        &mut self,
+        command: &StartTurnCommand,
+        packages: &P,
+        secrets: &S,
+        resources: &R,
+        observe_request: &dyn Fn(&Value),
+    ) -> Result<TurnExecution, HostRuntimeError>
+    where
+        P: PackageResolver + ?Sized,
+        S: SecretResolver + ?Sized,
+        R: ResourceResolver + ?Sized,
+    {
         self.admit_command(command, packages)?;
         let binding = self.resolve_provider(command, secrets)?;
         let sink = |delta: &str| resources.observe_text_delta(delta);
@@ -2077,7 +2097,8 @@ impl GovernedHostRuntime {
         let released = || probe.released();
         let driver = NativeHttpDriver::new(binding.timeout)
             .with_delta_sink(&sink)
-            .with_cancel_probe(&observed);
+            .with_cancel_probe(&observed)
+            .with_request_observer(observe_request);
         self.run_admitted_turn(
             command,
             packages,
@@ -3240,6 +3261,7 @@ struct NativeHttpDriver<'a> {
     /// cancelled through its paired release probe. `None` reads to the end
     /// exactly as before.
     cancel_probe: Option<&'a dyn Fn() -> bool>,
+    request_observer: Option<&'a dyn Fn(&Value)>,
 }
 
 impl<'a> NativeHttpDriver<'a> {
@@ -3256,6 +3278,7 @@ impl<'a> NativeHttpDriver<'a> {
                 .build(),
             delta_sink: None,
             cancel_probe: None,
+            request_observer: None,
         }
     }
 
@@ -3266,6 +3289,11 @@ impl<'a> NativeHttpDriver<'a> {
 
     fn with_cancel_probe(mut self, probe: &'a dyn Fn() -> bool) -> Self {
         self.cancel_probe = Some(probe);
+        self
+    }
+
+    fn with_request_observer(mut self, observer: &'a dyn Fn(&Value)) -> Self {
+        self.request_observer = Some(observer);
         self
     }
 
@@ -3335,6 +3363,9 @@ fn sse_output_text_delta(line: &str) -> Option<String> {
 impl HostDriver for NativeHttpDriver<'_> {
     fn fulfill(&self, request: &IoRequest) -> IoResult {
         let IoRequest::Http(request) = request;
+        if let Some(observer) = self.request_observer {
+            observer(&request.body);
+        }
         let mut builder = self.agent.post(&request.url);
         for (name, value) in &request.headers {
             builder = builder.set(name, value);
@@ -5799,11 +5830,15 @@ workflow Method {
         });
         let seen: RefCell<Vec<String>> = RefCell::new(Vec::new());
         let sink = |delta: &str| seen.borrow_mut().push(delta.to_owned());
-        let driver = NativeHttpDriver::new(Duration::from_secs(10)).with_delta_sink(&sink);
+        let observed_body = RefCell::new(Vec::new());
+        let observe = |body: &Value| observed_body.borrow_mut().push(body.clone());
+        let driver = NativeHttpDriver::new(Duration::from_secs(10))
+            .with_delta_sink(&sink)
+            .with_request_observer(&observe);
         let request = IoRequest::Http(HttpRequest {
             url: format!("http://{addr}/v1/responses"),
             headers: vec![("accept".to_owned(), "text/event-stream".to_owned())],
-            body: json!({}),
+            body: json!({"input": "private model input"}),
         });
         let IoResult::Http(result) = driver.fulfill(&request);
         server.join().expect("server thread");
@@ -5816,6 +5851,10 @@ workflow Method {
         );
         assert_eq!(response.body, assemble_responses_sse(raw));
         assert_eq!(response.body["output_text"], "GaugeWright is live.");
+        assert_eq!(
+            observed_body.borrow().as_slice(),
+            &[json!({"input": "private model input"})]
+        );
     }
 
     /// A cancellation observed mid-stream releases the read at a complete-line

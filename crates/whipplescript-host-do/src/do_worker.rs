@@ -105,6 +105,7 @@ pub struct DurableEffectPorts {
     /// their write attenuation.
     pub agent_workspace_resources: Option<Vec<ResourceRef>>,
     pub agent_tool_specs: Option<Vec<whipplescript_kernel::harness_loop::ToolSpec>>,
+    pub external_tool_bindings: Vec<(String, String)>,
     /// Version-pinned Agent `AGENTS.md` from an authored package. The hosted
     /// project-context store already carries deployment-supplied documents;
     /// this occupies a distinct position before them and is idempotent on
@@ -227,7 +228,8 @@ impl<Sql: DoSql + 'static> DurableInstance<Sql> {
             Some(tools) => tools,
             None => {
                 let executor =
-                    crate::do_tools::DoToolExecutor::for_instance(Rc::clone(&sql), instance_id);
+                    crate::do_tools::DoToolExecutor::for_instance(Rc::clone(&sql), instance_id)
+                        .with_external_tools(&ports.external_tool_bindings);
                 match ports.agent_workspace_resources.as_deref() {
                     Some(resources) => {
                         Box::new(executor.with_resources(resources)?) as Box<dyn ToolExecutor>

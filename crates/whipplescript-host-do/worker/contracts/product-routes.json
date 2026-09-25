@@ -75,6 +75,42 @@
       }
     },
     {
+      "id": "runtime.public.external-call.answer",
+      "jurisdiction": "public-panel-session",
+      "transport": "http-json",
+      "method": "POST",
+      "path": "/public/session/external-calls/:call/answer",
+      "producer": "whipplescript-session-durable-object",
+      "consumer": "GaugeWright edge Deployment object",
+      "authentication": "runtime-control-bearer",
+      "scope": "deployment-session",
+      "capability": "session-control",
+      "requestSchema": "typescript:whipplescript-runtime/runtime.public.external-call.answer/request",
+      "responseSchema": "typescript:whipplescript-runtime/runtime.public.external-call.answer/response",
+      "sideEffect": "mutation",
+      "risk": "critical",
+      "compatibility": {
+        "contractVersion": 1,
+        "minimumConsumer": 1,
+        "maximumConsumer": null
+      },
+      "evidence": {
+        "contract": [
+          "src/session.integration.test.ts#external-tool-answer-persistence"
+        ],
+        "authority": [
+          "src/session.integration.test.ts#external-tool-answer-persistence"
+        ],
+        "journey": [
+          "src/session.integration.test.ts#external-tool-answer-persistence"
+        ],
+        "deployed": [],
+        "property": [
+          "src/session.integration.test.ts#external-tool-answer-persistence"
+        ]
+      }
+    },
+    {
       "id": "runtime.public.erase",
       "jurisdiction": "public-panel-session",
       "transport": "http-json",
@@ -1211,6 +1247,42 @@
       "responseSchema": "typescript:whipplescript-runtime/runtime.host.transcript/response",
       "sideEffect": "none",
       "risk": "important",
+      "compatibility": {
+        "contractVersion": 1,
+        "minimumConsumer": 1,
+        "maximumConsumer": null
+      },
+      "evidence": {
+        "contract": [
+          "src/authenticated-host.integration.test.ts#declared-route-surface"
+        ],
+        "authority": [
+          "src/authenticated-host.integration.test.ts#declared-route-surface"
+        ],
+        "journey": [
+          "src/authenticated-host.integration.test.ts#authenticated-placement-journey"
+        ],
+        "deployed": [],
+        "property": [
+          "src/authenticated-host.integration.test.ts#declared-route-surface"
+        ]
+      }
+    },
+    {
+      "id": "runtime.host.live-model-context",
+      "jurisdiction": "managed-workflow-placement",
+      "transport": "http-json",
+      "method": "GET",
+      "path": "/host/instances/:instance/turns/:turn/model-context",
+      "producer": "whipplescript-host-worker",
+      "consumer": "WhippleScript host protocol client",
+      "authentication": "runtime-control-bearer",
+      "scope": "tenant-placement",
+      "capability": "workflow-control",
+      "requestSchema": "typescript:whipplescript-runtime/runtime.host.live-model-context/request",
+      "responseSchema": "typescript:whipplescript-runtime/runtime.host.live-model-context/response",
+      "sideEffect": "none",
+      "risk": "critical",
       "compatibility": {
         "contractVersion": 1,
         "minimumConsumer": 1,

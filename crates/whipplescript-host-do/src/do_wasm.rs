@@ -1204,6 +1204,14 @@ extern "C" {
     /// swallowed by design: a dropped projection must never fail a turn.
     #[wasm_bindgen(method, catch)]
     fn activity(this: &DoSqlBridge, kind: &str, detail: Option<String>) -> Result<(), JsValue>;
+
+    #[wasm_bindgen(method, catch, js_name = externalTool)]
+    fn external_tool_bridge(
+        this: &DoSqlBridge,
+        name: &str,
+        call_id: &str,
+        arguments: &str,
+    ) -> Result<String, JsValue>;
 }
 
 /// [`DoSql`] over the JS `DoSqlBridge`. `SqlValue` marshals as JSON scalars.
@@ -1266,6 +1274,12 @@ impl DoSql for JsDoSql {
 
     fn activity(&self, kind: &str, detail: Option<&str>) {
         let _ = self.bridge.activity(kind, detail.map(str::to_owned));
+    }
+
+    fn external_tool(&self, name: &str, call_id: &str, arguments: &str) -> Result<String, String> {
+        self.bridge
+            .external_tool_bridge(name, call_id, arguments)
+            .map_err(|error| format!("{error:?}"))
     }
 }
 
@@ -1652,6 +1666,7 @@ impl WasmDurableInstance {
                 agent_model,
                 agent_workspace_resources,
                 agent_tool_specs: Some(resolved.tools),
+                external_tool_bindings: package.external_tool_bindings(),
                 agent_project_context: resolved.project_context,
                 ..DurableEffectPorts::default()
             },

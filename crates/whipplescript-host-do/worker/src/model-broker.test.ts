@@ -66,6 +66,8 @@ test("broker envelope strips provider auth and preserves idempotency", async () 
         reconciliation_ref: "gateway-request-7",
       });
     },
+    undefined,
+    undefined,
   );
 
   assert.equal(capturedUrl, "https://home.example/model-egress");
@@ -131,6 +133,7 @@ test("public Session DO streams directly from the signed provider endpoint", asy
   const deltas: string[] = [];
   const timing: string[] = [];
   let capturedAuthorization = "";
+  let inspectedBody: unknown;
   const encoder = new TextEncoder();
   const directBinding = {
     ...binding,
@@ -177,8 +180,13 @@ test("public Session DO streams directly from the signed provider endpoint", asy
     },
     (delta) => deltas.push(delta),
     (event) => timing.push(event),
+    undefined,
+    undefined,
+    (body) => { inspectedBody = body; },
   );
   assert.equal(capturedAuthorization, "Bearer sk-session-secret");
+  assert.deepEqual(inspectedBody, { model: "gpt-test", stream: true });
+  assert.ok(!JSON.stringify(inspectedBody).includes("sk-session-secret"));
   assert.deepEqual(deltas, ["direct"]);
   assert.deepEqual(timing, [
     "direct_provider_fetch_start",

@@ -1084,6 +1084,15 @@ describe("real WorkflowInstance hibernation", () => {
     });
     expect(brokerFetch).toHaveBeenCalledOnce();
 
+    const liveContextPath = `${instancePath}/turns/${commandId}/model-context`;
+    const afterSettlement = await placementFetch(liveContextPath);
+    expect(afterSettlement.status).toBe(404);
+    expect(afterSettlement.headers.get("cache-control")).toBe("no-store");
+    const publicTokenRead = await SELF.fetch(`${route}${liveContextPath}`, {
+      headers: { authorization: "Bearer session-token" },
+    });
+    expect(publicTokenRead.status).toBe(401);
+
     const turnStream = await placementFetch(
       `${instancePath}/turns/${commandId}/stream`,
     );
@@ -1656,7 +1665,7 @@ describe("real WorkflowInstance hibernation", () => {
     // declared operations, six are `/v1/...` routes outside it. Writing the
     // declared total here counts those six and fails; this number is counted
     // from `runtime-route-surface.json` through the same filter.
-    expect(operations.length).toBe(37);
+    expect(operations.length).toBe(38);
 
     for (const operation of operations) {
       for (const authorization of [undefined, "Bearer wrong-control-token"]) {

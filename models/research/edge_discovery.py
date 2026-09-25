@@ -71,6 +71,20 @@ def route(current_known: frozenset[Edge], proposed_known: frozenset[Edge],
     return reverse_closure(current_possible | proposed_possible, ROOT, roster)
 
 
+def route_after_capture(query_succeeded: bool,
+                        current_known: frozenset[Edge],
+                        proposed_known: frozenset[Edge],
+                        current_incomplete: frozenset[tuple[str, str]],
+                        proposed_incomplete: frozenset[tuple[str, str]]
+                        ) -> frozenset[str] | None:
+    # A failed analysis supplies no graph witness. In particular, its lack of
+    # returned edges is not a complete, empty graph.
+    if not query_succeeded:
+        return None
+    return route(current_known, proposed_known, current_incomplete,
+                 proposed_incomplete)
+
+
 def states():
     # For each edge: absent, present and observed, or present but unresolved.
     for choices in product((0, 1, 2), repeat=len(UNIVERSE)):
@@ -127,6 +141,12 @@ def main():
         "omitted repository", hidden,
         route(hidden, hidden, frozenset(), frozenset(),
               frozenset(("a", "b")))
+    ))
+    assert route_after_capture(False, known, known, incomplete,
+                               incomplete) is None
+    negatives.append(expect_miss(
+        "failed query treated as empty", hidden,
+        reverse_closure(frozenset(), ROOT)
     ))
 
     # An added edge after capture invalidates its graph-epoch certificate.

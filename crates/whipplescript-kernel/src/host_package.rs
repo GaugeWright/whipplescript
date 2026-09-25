@@ -33,7 +33,19 @@ pub struct AuthoredAgentPackage {
     project_context: Option<crate::context_assembly::ProjectInstruction>,
     capabilities: Vec<String>,
     agent_abilities: Vec<String>,
+    external_tools: Vec<ExternalTool>,
     max_steps: usize,
+}
+
+/// A host supplied tool. The package declares its model contract and the
+/// capability that admits it; the placement supplies its implementation.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExternalTool {
+    name: String,
+    capability: String,
+    description: String,
+    input_schema: Value,
 }
 
 #[derive(Debug, Deserialize)]
@@ -48,6 +60,8 @@ struct AuthoredAgentPackageManifest {
     project_context: Option<String>,
     capabilities: Vec<String>,
     agent_abilities: Vec<String>,
+    #[serde(default)]
+    external_tools: Vec<ExternalTool>,
     max_steps: usize,
 }
 
@@ -150,6 +164,31 @@ impl AuthoredAgentPackage {
                     .to_owned(),
             );
         }
+        let external_tools = manifest.external_tools;
+        let mut names = std::collections::BTreeSet::new();
+        let built_in_names = workspace_tool_specs_from_registry(true, true, true)
+            .into_iter()
+            .map(|tool| tool.name)
+            .chain(std::iter::once("add_todo".to_owned()))
+            .chain(std::iter::once(
+                crate::result_contract::TOOL_SUBMIT_RESULT.to_owned(),
+            ))
+            .collect::<std::collections::BTreeSet<_>>();
+        for tool in &external_tools {
+            if tool.name.is_empty()
+                || !tool
+                    .name
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+                || !names.insert(tool.name.clone())
+                || built_in_names.contains(&tool.name)
+                || tool.capability.trim().is_empty()
+                || tool.description.trim().is_empty()
+                || tool.input_schema.get("type").and_then(Value::as_str) != Some("object")
+            {
+                return Err(format!("invalid external tool `{}`", tool.name));
+            }
+        }
         let mut capabilities = manifest.capabilities;
         capabilities.sort();
         capabilities.dedup();
@@ -157,7 +196,10 @@ impl AuthoredAgentPackage {
             if !matches!(
                 capability.as_str(),
                 "workspace.read" | "workspace.write" | "command.run" | "tracker.file"
-            ) {
+            ) && !external_tools
+                .iter()
+                .any(|tool| tool.capability == *capability)
+            {
                 return Err(format!(
                     "agent package declares unsupported capability `{capability}`"
                 ));
@@ -175,6 +217,14 @@ impl AuthoredAgentPackage {
             if !capabilities.contains(ability) {
                 return Err(format!(
                     "agent ability `{ability}` is absent from the package capability registry"
+                ));
+            }
+        }
+        for tool in &external_tools {
+            if !capabilities.contains(&tool.capability) {
+                return Err(format!(
+                    "external tool `{}` capability `{}` is absent from the package registry",
+                    tool.name, tool.capability
                 ));
             }
         }
@@ -255,6 +305,7 @@ impl AuthoredAgentPackage {
             }),
             capabilities,
             agent_abilities,
+            external_tools,
             max_steps: manifest.max_steps,
         })
     }
@@ -269,6 +320,16 @@ impl AuthoredAgentPackage {
 
     pub fn agent_abilities(&self) -> &[String] {
         &self.agent_abilities
+    }
+
+    /// Names the placement must implement for this package's admitted ability
+    /// ceiling. No undeclared host callback is reachable through the package.
+    pub fn external_tool_bindings(&self) -> Vec<(String, String)> {
+        self.external_tools
+            .iter()
+            .filter(|tool| self.agent_abilities.contains(&tool.capability))
+            .map(|tool| (tool.name.clone(), tool.capability.clone()))
+            .collect()
     }
 
     /// Exact authored documents whose content hash produced [`Self::version_ref`].
@@ -314,6 +375,16 @@ impl AuthoredAgentPackage {
         if tracker_file {
             tools.push(tracker_add_todo_spec());
         }
+        tools.extend(
+            self.external_tools
+                .iter()
+                .filter(|tool| self.agent_abilities.contains(&tool.capability))
+                .map(|tool| ToolSpec {
+                    name: tool.name.clone(),
+                    description: tool.description.clone(),
+                    input_schema: tool.input_schema.clone(),
+                }),
+        );
         let mut resolved = ResolvedPackage::compile_with_capabilities(
             self.version_ref.clone(),
             &self.source,
@@ -1057,6 +1128,69 @@ workflow Chat {
         )
         .unwrap_err();
         assert!(error.contains("unsupported capability `tracker.erase`"));
+    }
+
+    #[test]
+    fn external_tool_is_offered_only_when_the_authored_ability_admits_it() {
+        let source = r#"workflow Chat {
+  agent assistant {
+    provider owned
+    profile "question-asker"
+    capacity 1
+    capabilities ["question.ask"]
+  }
+}"#;
+        let mut manifest = json!({
+            "schema": AGENT_PACKAGE_SCHEMA,
+            "source": "agent.whip",
+            "workflow": "Chat",
+            "agent": "assistant",
+            "system_prompt": "persona.md",
+            "capabilities": ["question.ask"],
+            "agent_abilities": ["question.ask"],
+            "external_tools": [{
+                "name": "ask",
+                "capability": "question.ask",
+                "description": "Ask the person a question.",
+                "input_schema": {"type": "object", "properties": {"question": {"type": "string"}}}
+            }],
+            "max_steps": 12
+        });
+        let package =
+            AuthoredAgentPackage::from_documents(manifest.to_string(), source, "Ask when needed.")
+                .expect("package");
+        let resolved = package.resolve(package.version_ref()).expect("resolved");
+        assert_eq!(resolved.tools.len(), 1);
+        assert_eq!(resolved.tools[0].name, "ask");
+
+        manifest["agent_abilities"] = json!([]);
+        let package =
+            AuthoredAgentPackage::from_documents(manifest.to_string(), source, "Ask when needed.")
+                .expect("narrowed package");
+        assert!(package
+            .resolve(package.version_ref())
+            .unwrap()
+            .tools
+            .is_empty());
+
+        let mut missing_registry = manifest.clone();
+        missing_registry["capabilities"] = json!([]);
+        assert!(AuthoredAgentPackage::from_documents(
+            missing_registry.to_string(),
+            source,
+            "Ask when needed."
+        )
+        .unwrap_err()
+        .contains("external tool `ask` capability `question.ask` is absent"));
+
+        manifest["external_tools"][0]["name"] = json!("read");
+        assert!(AuthoredAgentPackage::from_documents(
+            manifest.to_string(),
+            source,
+            "Ask when needed."
+        )
+        .unwrap_err()
+        .contains("invalid external tool"));
     }
 
     #[test]

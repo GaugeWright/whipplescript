@@ -40,6 +40,24 @@
       ]
     },
     {
+      "id": "public-external-call-answer",
+      "state": "runner-needed",
+      "runner": null,
+      "executionBoundary": "managed-public-edge",
+      "contracts": [
+        "runtime.public.external-call.answer"
+      ],
+      "requiredInfrastructure": [
+        "dedicated Panels deployment with an external tool in its authored package",
+        "synthetic audience identity",
+        "runtime control identity"
+      ],
+      "cleanup": "Use only a dedicated synthetic deployment and session, answer one deterministic external call through the public edge, prove a second answer cannot replace the first, then erase the synthetic session and retain only bounded audit evidence.",
+      "surfaces": [
+        "whip-runtime"
+      ]
+    },
+    {
       "id": "managed-host-lifecycle",
       "state": "ready-awaiting-identity",
       "runner": "scripts/production-wiring-canary.mjs#managed-host-lifecycle",
@@ -125,6 +143,23 @@
       "cleanup": "Use one stable command-scoped Durable object and deterministic package, issue a fresh five-minute request-bound grant on every call, perform no model effect or spend, and retain only the bounded synthetic policy, instance, and position projections.",
       "surfaces": [
         "whip-private-runtime"
+      ]
+    },
+    {
+      "id": "live-model-context",
+      "state": "runner-needed",
+      "runner": null,
+      "executionBoundary": "managed-workflow-placement",
+      "contracts": [
+        "runtime.host.live-model-context"
+      ],
+      "requiredInfrastructure": [
+        "Dedicated synthetic placement with a controlled provider request that can be held in flight",
+        "Runtime control credential and a separate public-session credential for denial checks"
+      ],
+      "cleanup": "Release or stop the synthetic model call, restore the placement baseline, and verify the transient request body is no longer readable.",
+      "surfaces": [
+        "whip-runtime"
       ]
     },
     {

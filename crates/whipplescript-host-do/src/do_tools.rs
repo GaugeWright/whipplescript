@@ -140,6 +140,7 @@ pub struct DoToolExecutor<Sql: DoSql> {
     sql: Rc<Sql>,
     key_prefix: String,
     file_scopes: Option<Vec<DoFileScope>>,
+    external_tools: BTreeMap<String, String>,
     /// The running turn's result contract, installed by the host before the
     /// turn. Behind a lock because one executor serves an instance's turns and
     /// the tool surface takes `&self`.
@@ -159,6 +160,7 @@ impl<Sql: DoSql> DoToolExecutor<Sql> {
             sql,
             key_prefix: String::new(),
             file_scopes: None,
+            external_tools: BTreeMap::new(),
             result_contract: std::sync::Mutex::new(None),
         }
     }
@@ -169,6 +171,7 @@ impl<Sql: DoSql> DoToolExecutor<Sql> {
             sql,
             key_prefix: format!("{instance_id}/"),
             file_scopes: None,
+            external_tools: BTreeMap::new(),
             result_contract: std::sync::Mutex::new(None),
         }
     }
@@ -192,8 +195,20 @@ impl<Sql: DoSql> DoToolExecutor<Sql> {
             .collect::<Result<Vec<_>, String>>()?;
         scopes.sort();
         scopes.dedup();
+        let external_handles = resources
+            .iter()
+            .filter(|resource| resource.kind == "external_tool")
+            .map(|resource| resource.handle.as_str())
+            .collect::<BTreeSet<_>>();
+        self.external_tools
+            .retain(|_, capability| external_handles.contains(capability.as_str()));
         self.file_scopes = Some(scopes);
         Ok(self)
+    }
+
+    pub fn with_external_tools(mut self, bindings: &[(String, String)]) -> Self {
+        self.external_tools.extend(bindings.iter().cloned());
+        self
     }
 
     fn path_access(&self, path: &str, write: bool) -> Result<String, String> {
@@ -246,6 +261,9 @@ impl<Sql: DoSql> DoToolExecutor<Sql> {
             TOOL_UPDATE_TODO => self.update_todo(args),
             TOOL_BASH => self.bash(args),
             TOOL_SUBMIT_RESULT => self.submit_result(args),
+            other if self.external_tools.contains_key(other) => {
+                self.sql.external_tool(other, &call.id, &args.to_string())
+            }
             other => Err(format!("unknown tool `{other}`")),
         }
     }
@@ -1908,5 +1926,34 @@ mod tests {
             arguments: serde_json::json!({}),
         });
         assert_eq!(known.status, ToolStatus::Ok, "{}", known.content);
+    }
+
+    #[test]
+    fn external_tool_needs_its_authored_binding_and_turn_resource() {
+        let bindings = vec![("ask_choices".to_owned(), "question.ask".to_owned())];
+        let missing = executor()
+            .with_external_tools(&bindings)
+            .with_resources(&[])
+            .unwrap();
+        let call = call("ask_choices", json!({ "questions": [] }));
+        assert!(missing.execute(&call).content.contains("unknown tool"));
+
+        let resource = ResourceRef {
+            handle: "question.ask".to_owned(),
+            kind: "external_tool".to_owned(),
+            selector: None,
+            writable: None,
+        };
+        let admitted = executor()
+            .with_external_tools(&bindings)
+            .with_resources(&[resource])
+            .unwrap();
+        let result = admitted.execute(&call);
+        assert_eq!(result.status, ToolStatus::Error);
+        assert!(
+            result.content.contains("no placement implementation"),
+            "{}",
+            result.content
+        );
     }
 }

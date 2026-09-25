@@ -518,6 +518,7 @@ export async function performManagedGatewayFetch(
   onTiming?: ModelBrokerTimingSink,
   onGatewayLog?: (gatewayLogId: string) => void,
   tokenAdmission?: ManagedProviderTokenAdmission,
+  onProviderBody?: (body: unknown) => void,
 ): Promise<string> {
   if (binding.provider !== "cloudflare-ai-gateway") {
     throw new Error(
@@ -566,6 +567,7 @@ export async function performManagedGatewayFetch(
       onTiming,
       onGatewayLog,
       tokenAdmission,
+      onProviderBody,
     );
   } catch (error) {
     // Admission/endpoint/auth-sentinel failures occur before egress and remain
@@ -622,6 +624,7 @@ export async function performManagedGatewayFetch(
     onTiming,
     onGatewayLog,
     tokenAdmission,
+    onProviderBody,
   );
 }
 
@@ -637,6 +640,7 @@ export async function performDirectProviderFetch(
   /** Present only for managed funding. The callback durably consumes the
    * request's conservative total-token bound before fetch. */
   tokenAdmission?: ManagedProviderTokenAdmission,
+  onProviderBody?: (body: unknown) => void,
 ): Promise<string> {
   const startedAt = performance.now();
   const mark = (event: string) => onTiming?.(event, performance.now() - startedAt);
@@ -715,6 +719,7 @@ export async function performDirectProviderFetch(
     }
     providerBody = await tokenAdmission(request.url, providerBody);
   }
+  onProviderBody?.(providerBody);
   mark("direct_provider_fetch_start");
   const response = await fetcher(request.url, {
     method: "POST",

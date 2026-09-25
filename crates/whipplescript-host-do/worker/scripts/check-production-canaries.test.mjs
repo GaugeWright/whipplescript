@@ -22,7 +22,7 @@ const runnerSource = await readFile(
 test("every WhippleScript deployed gap has one cleanup-bounded suite", () => {
   assert.deepEqual(
     validateProductionCanaries(manifest, canaries, runnerSource),
-    { gaps: 23, covered: 25, ready: 19, pending: 6, suites: 5 },
+    { gaps: 24, covered: 26, ready: 19, pending: 7, suites: 6 },
   );
 });
 
@@ -33,7 +33,7 @@ test("recorded deployed evidence does not unschedule its continuous canary", () 
   firstGap.evidence.deployed.push("production:identified-canary-run");
   assert.deepEqual(
     validateProductionCanaries(changed, canaries, runnerSource),
-    { gaps: 22, covered: 25, ready: 19, pending: 6, suites: 5 },
+    { gaps: 23, covered: 26, ready: 19, pending: 7, suites: 6 },
   );
 });
 
@@ -57,7 +57,7 @@ test("a mutable or invented external runner cannot claim evidence", () => {
 
 test("a missing local runner marker cannot claim readiness", () => {
   const changed = structuredClone(canaries);
-  changed.suites[1].runner = "scripts/production-wiring-canary.mjs#invented";
+  changed.suites[2].runner = "scripts/production-wiring-canary.mjs#invented";
   assert.throws(
     () => validateProductionCanaries(manifest, changed, runnerSource),
     /local runner marker is absent/,

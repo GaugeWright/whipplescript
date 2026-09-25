@@ -235,8 +235,9 @@ All 59,049 pairs of bounded graph states route every actually affected
 repository under those assumptions; 765 routes deliberately include an
 unaffected owner because coverage is incomplete. Negative scenarios miss an
 owner when routing uses known edges only, the current graph only, direct
-consumers only, an incomplete roster, or a graph captured before its epoch
-changed. A cycle scenario terminates with the expected closure.
+consumers only, an incomplete roster, a failed query treated as an empty
+answer, or a graph captured before its epoch changed. A cycle scenario
+terminates with the expected closure.
 
 The model's finite edge universe stands for a trusted, enforced possible
 provider set. Its coverage signal is an input independent of the hidden edges;
@@ -247,3 +248,7 @@ every restricted repository. A false completeness claim or missing repository
 is precisely the failure the protocol must prevent. The
 [research note](../../spec/branch-trunk-gate-research-note.md) §12.3 maps the
 candidate edge authorities and the unresolved evidence needed before a DR.
+Section 12.4 records a focused read of the current VMR, Buck graph, and
+WhippleScript package/construct contracts, including a real all-cell query
+failure. The probe now makes that failure a blocked capture rather than an
+empty route.

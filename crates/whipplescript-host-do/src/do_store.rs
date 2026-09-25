@@ -99,6 +99,19 @@ pub trait DoSql {
     /// as [`DoSql::execute`].
     fn query(&self, sql: &str, params: &[SqlValue]) -> Result<Vec<Vec<SqlValue>>, String>;
 
+    /// A placement-supplied implementation of an authored external tool. The
+    /// default refuses, so a package declaration alone never grants an effect.
+    fn external_tool(
+        &self,
+        name: &str,
+        _call_id: &str,
+        _arguments: &str,
+    ) -> Result<String, String> {
+        Err(format!(
+            "external tool `{name}` has no placement implementation"
+        ))
+    }
+
     /// Publish an ephemeral live-turn observation to the shell (DR 0061).
     ///
     /// This rides the SQL handle because that handle is the one thing already
