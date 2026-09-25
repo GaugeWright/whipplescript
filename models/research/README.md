@@ -217,3 +217,33 @@ settlement, historical bark-chip resolution, or delivery of a request through
 real queues. The
 [research note](../../spec/branch-trunk-gate-research-note.md) §12 describes
 those design obligations.
+
+## Edge discovery and coverage
+
+`edge_discovery.py` isolates the dependency-update probe's graph assumption.
+It gives a complete repository roster, a current and proposed graph, known
+build/semantic edges, and a per-owner/edge-kind signal for incomplete
+coverage. An incomplete class widens to an enforced possible-provider
+envelope. Routing uses reverse transitive reachability over both cuts and
+deduplicates cycles.
+
+```sh
+python3 models/research/edge_discovery.py
+```
+
+All 59,049 pairs of bounded graph states route every actually affected
+repository under those assumptions; 765 routes deliberately include an
+unaffected owner because coverage is incomplete. Negative scenarios miss an
+owner when routing uses known edges only, the current graph only, direct
+consumers only, an incomplete roster, or a graph captured before its epoch
+changed. A cycle scenario terminates with the expected closure.
+
+The model's finite edge universe stands for a trusted, enforced possible
+provider set. Its coverage signal is an input independent of the hidden edges;
+the explorer verifies that every actual edge lies within the envelope. This
+does **not** show that a real extractor can certify completeness, that a
+dynamic reference obeys its declared ceiling, or that the roster includes
+every restricted repository. A false completeness claim or missing repository
+is precisely the failure the protocol must prevent. The
+[research note](../../spec/branch-trunk-gate-research-note.md) §12.3 maps the
+candidate edge authorities and the unresolved evidence needed before a DR.
