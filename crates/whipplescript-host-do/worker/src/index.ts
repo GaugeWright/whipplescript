@@ -65,6 +65,7 @@ import {
   type ResolvedHostProviderBinding,
   resolveAdmittedProvider as resolveHostedProvider,
 } from "./provider-realization";
+import { agentWorkspaceResources } from "./agent-workspace-resources";
 
 const wasmInstance = new WebAssembly.Instance(wasmModule, {
   "./whipplescript_host_do_bg.js": bindings,
@@ -4700,10 +4701,10 @@ export class WorkflowInstance implements DurableObject {
           // The same admitted resource references drive the in-isolate tool
           // executor. WhippleScript, not this Worker, interprets selectors and
           // write attenuation; the shell only carries the validated command.
-          workspace_resources:
-            Array.isArray(request.command.resources) && request.command.resources.length > 0
-              ? request.command.resources
-              : undefined,
+          workspace_resources: agentWorkspaceResources(
+            request.package.manifest,
+            request.command.resources,
+          ),
         }),
       );
       const driven = await this.driveInstance(

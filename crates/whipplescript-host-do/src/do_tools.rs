@@ -190,9 +190,6 @@ impl<Sql: DoSql> DoToolExecutor<Sql> {
                 })
             })
             .collect::<Result<Vec<_>, String>>()?;
-        if scopes.is_empty() {
-            return Err("turn has no admitted file-store capability".to_owned());
-        }
         scopes.sort();
         scopes.dedup();
         self.file_scopes = Some(scopes);
@@ -1121,6 +1118,59 @@ mod tests {
         let read = exec.execute(&call("read", json!({ "path": "a.txt" })));
         assert_eq!(read.status, ToolStatus::Ok);
         assert_eq!(read.content, "hello");
+    }
+
+    #[test]
+    fn empty_admitted_file_scope_keeps_chat_available_without_file_access() {
+        let exec = executor()
+            .with_resources(&[])
+            .expect("empty scope is valid");
+        assert_eq!(
+            exec.execute(&call(
+                "write",
+                json!({ "path": "agent/AGENTS.md", "content": "x" })
+            ))
+            .status,
+            ToolStatus::Error,
+        );
+        assert_eq!(
+            exec.execute(&call("read", json!({ "path": "agent/AGENTS.md" })))
+                .status,
+            ToolStatus::Error,
+        );
+    }
+
+    #[test]
+    fn readonly_agent_definition_and_writable_run_roots_share_one_file_store() {
+        let resource = |selector: Option<&str>, writable| ResourceRef {
+            handle: "project".to_owned(),
+            kind: "file_store".to_owned(),
+            selector: selector.map(str::to_owned),
+            writable: Some(writable),
+        };
+        let exec = executor()
+            .with_resources(&[
+                resource(None, false),
+                resource(Some("artifacts"), true),
+                resource(Some("work"), true),
+            ])
+            .expect("scoped executor");
+        for path in ["agent/AGENTS.md", "agent/skills/triage/SKILL.md"] {
+            assert_eq!(
+                exec.execute(&call("write", json!({ "path": path, "content": "change" })))
+                    .status,
+                ToolStatus::Error,
+                "{path} must remain read-only",
+            );
+        }
+        for path in ["artifacts/report.md", "work/notes.md"] {
+            assert_eq!(
+                exec.execute(&call("write", json!({ "path": path, "content": "ok" })))
+                    .status,
+                ToolStatus::Ok,
+                "{path} is run-owned",
+            );
+        }
     }
 
     #[test]

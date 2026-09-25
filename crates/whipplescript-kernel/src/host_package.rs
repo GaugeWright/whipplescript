@@ -156,7 +156,7 @@ impl AuthoredAgentPackage {
         for capability in &capabilities {
             if !matches!(
                 capability.as_str(),
-                "workspace.read" | "workspace.write" | "command.run"
+                "workspace.read" | "workspace.write" | "command.run" | "tracker.file"
             ) {
                 return Err(format!(
                     "agent package declares unsupported capability `{capability}`"
@@ -306,13 +306,21 @@ impl AuthoredAgentPackage {
             .agent_abilities
             .iter()
             .any(|item| item == "command.run");
+        let tracker_file = self
+            .agent_abilities
+            .iter()
+            .any(|item| item == "tracker.file");
+        let mut tools = workspace_tool_specs_from_registry(readable, writable, command);
+        if tracker_file {
+            tools.push(tracker_add_todo_spec());
+        }
         let mut resolved = ResolvedPackage::compile_with_capabilities(
             self.version_ref.clone(),
             &self.source,
             Some(&self.workflow),
             self.agent.clone(),
             self.system_prompt.clone(),
-            workspace_tool_specs_from_registry(readable, writable, command),
+            tools,
             self.max_steps,
             self.agent_abilities.clone(),
         )?;
@@ -601,6 +609,25 @@ pub fn workspace_tool_specs_from_registry(
         ));
     }
     tools
+}
+
+/// The authored package's tracker filing facade. The actual queue and write
+/// authority are supplied by the host's admitted turn resource, never by a
+/// package field or a model-supplied path.
+pub fn tracker_add_todo_spec() -> ToolSpec {
+    tool_spec(
+        "add_todo",
+        "File a task in the current work tracker. Returns its issue id only after filing succeeds.",
+        json!({
+            "type": "object",
+            "properties": {
+                "content": { "type": "string", "minLength": 1 },
+                "status": { "type": "string", "enum": ["pending"] }
+            },
+            "required": ["content"],
+            "additionalProperties": false
+        }),
+    )
 }
 
 /// Default `read` window when the caller names no limit (pi-conformance §1:
@@ -968,6 +995,68 @@ workflow Chat {
             .find(|tool| tool.name == "bash")
             .expect("bash");
         assert!(bash.description.contains("virtual bash"));
+    }
+
+    #[test]
+    fn authored_tracker_filing_is_an_explicit_agent_ability() {
+        let source = r#"workflow Chat {
+  agent assistant {
+    provider owned
+    profile "task-filer"
+    capacity 1
+    capabilities ["tracker.file"]
+  }
+}"#;
+        let manifest = json!({
+            "schema": AGENT_PACKAGE_SCHEMA,
+            "source": "agent.whip",
+            "workflow": "Chat",
+            "agent": "assistant",
+            "system_prompt": "persona.md",
+            "capabilities": ["tracker.file"],
+            "agent_abilities": ["tracker.file"],
+            "max_steps": 12
+        });
+        let package = AuthoredAgentPackage::from_documents(
+            manifest.to_string(),
+            source,
+            "File actual tracker tasks.",
+        )
+        .expect("tracker-capable package");
+        let resolved = package
+            .resolve(package.version_ref())
+            .expect("resolve package");
+        assert_eq!(resolved.tools.len(), 1);
+        assert_eq!(resolved.tools[0].name, "add_todo");
+        assert_eq!(
+            resolved.tools[0].input_schema["required"],
+            json!(["content"])
+        );
+
+        let mut narrowed = manifest;
+        narrowed["agent_abilities"] = json!([]);
+        let package = AuthoredAgentPackage::from_documents(
+            narrowed.to_string(),
+            source,
+            "File actual tracker tasks.",
+        )
+        .expect("narrowed package");
+        assert!(package
+            .resolve(package.version_ref())
+            .unwrap()
+            .tools
+            .is_empty());
+
+        let mut unsupported = narrowed;
+        unsupported["capabilities"] = json!(["tracker.erase"]);
+        unsupported["agent_abilities"] = json!(["tracker.erase"]);
+        let error = AuthoredAgentPackage::from_documents(
+            unsupported.to_string(),
+            source,
+            "File actual tracker tasks.",
+        )
+        .unwrap_err();
+        assert!(error.contains("unsupported capability `tracker.erase`"));
     }
 
     #[test]
