@@ -372,32 +372,41 @@ impl ResolvedPackage {
     /// The authored package's pinned model context. V0 keeps its historical
     /// persona bytes; v1 carries AGENTS.md as a separate project contribution.
     pub fn context_for_model(&self) -> crate::context_assembly::AssembledContext {
+        self.context_for_model_with_skills(&[])
+    }
+
+    /// Assemble the package context with a host-registered, metadata-only
+    /// skill catalogue. Skill bodies remain available through the read tool.
+    pub fn context_for_model_with_skills(
+        &self,
+        skills: &[crate::context_assembly::SkillCatalogueEntry],
+    ) -> crate::context_assembly::AssembledContext {
         use crate::context_assembly::{
-            assemble, contribution, render_project_context, AssembledContext,
-            ContributionLifecycle, InstructionAuthority, InstructionRole,
+            assemble, contribution, render_available_skills, render_project_context,
+            AssembledContext, ContributionLifecycle, InstructionAuthority, InstructionRole,
         };
-        let Some(context) = self
+        let context = self
             .project_context
             .as_ref()
-            .filter(|context| !context.content.trim().is_empty())
-        else {
+            .filter(|context| !context.content.trim().is_empty());
+        if context.is_none() && skills.is_empty() {
             return AssembledContext {
                 system_prompt: self.system_prompt.clone(),
                 contributions: Vec::new(),
             };
-        };
-        assemble(vec![
-            contribution(
-                "persona",
-                "package:system-prompt",
-                self.version_ref.clone(),
-                InstructionAuthority::Runtime,
-                InstructionRole::System,
-                "010-persona",
-                ContributionLifecycle::Stable,
-                self.system_prompt.clone(),
-            ),
-            contribution(
+        }
+        let mut contributions = vec![contribution(
+            "persona",
+            "package:system-prompt",
+            self.version_ref.clone(),
+            InstructionAuthority::Runtime,
+            InstructionRole::System,
+            "010-persona",
+            ContributionLifecycle::Stable,
+            self.system_prompt.clone(),
+        )];
+        if let Some(context) = context {
+            contributions.push(contribution(
                 "agent-context",
                 context.path.clone(),
                 self.version_ref.clone(),
@@ -406,8 +415,21 @@ impl ResolvedPackage {
                 "040-agent-context",
                 ContributionLifecycle::Stable,
                 render_project_context(std::slice::from_ref(context)),
-            ),
-        ])
+            ));
+        }
+        if !skills.is_empty() {
+            contributions.push(contribution(
+                "available-skills",
+                "registry:skills",
+                self.version_ref.clone(),
+                InstructionAuthority::Runtime,
+                InstructionRole::System,
+                "050-available-skills",
+                ContributionLifecycle::Stable,
+                render_available_skills(skills),
+            ));
+        }
+        assemble(contributions)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -760,6 +782,27 @@ mod tests {
             1
         );
         assert_eq!(projected.contributions[1].source, "AGENTS.md");
+        let with_skills = first
+            .resolve(first.version_ref())
+            .unwrap()
+            .context_for_model_with_skills(&[crate::context_assembly::SkillCatalogueEntry {
+                name: "triage".into(),
+                description: "Inspect a report".into(),
+                location: ".gaugedesk-runtime/discipline/agent-skills/triage/SKILL.md".into(),
+            }]);
+        assert_eq!(with_skills.contributions.len(), 3);
+        assert_eq!(
+            with_skills
+                .system_prompt
+                .matches("<available_skills>")
+                .count(),
+            1
+        );
+        assert_eq!(
+            with_skills.system_prompt.matches("Read carefully.").count(),
+            1
+        );
+        assert_eq!(with_skills.contributions[2].source, "registry:skills");
         let without_system = AuthoredAgentPackage::from_documents_with_context(
             manifest.to_string(),
             source,

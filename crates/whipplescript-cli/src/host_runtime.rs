@@ -14,6 +14,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use whipplescript_kernel::coerce_native::CoerceProvider;
+use whipplescript_kernel::context_assembly::SkillCatalogueEntry;
 pub use whipplescript_kernel::harness_loop::ToolCall;
 use whipplescript_kernel::harness_loop::{
     BrokeredTurnInput, ChatMessage, MediaInput, NoopCompactor, ToolExecutor, ToolOutcome, ToolSpec,
@@ -2336,7 +2337,19 @@ impl GovernedHostRuntime {
         };
         let world = hosted_model_visible_world(command, &package, resources)
             .map_err(HostRuntimeError::Resolver)?;
-        let context = package.context_for_model();
+        let skills = self
+            .kernel
+            .store()
+            .list_skills()
+            .map_err(HostRuntimeError::Store)?
+            .into_iter()
+            .map(|skill| SkillCatalogueEntry {
+                name: skill.name,
+                description: skill.description,
+                location: skill.source_path,
+            })
+            .collect::<Vec<_>>();
+        let context = package.context_for_model_with_skills(&skills);
         let input = BrokeredTurnInput {
             system: context.system_prompt,
             user: command.input.text.clone(),
