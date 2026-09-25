@@ -153,3 +153,37 @@ capability, digest, target lane, and receipt authentication as trusted inputs.
 It checks status and receipt ordering, not those inputs' enforcement. It adds
 no new target-settlement policy; a flowing branch changes the frequency of
 local candidate admission, not the authority of an external Git repo or folder.
+
+## Contribution and branch lifecycle
+
+`contribution_lifecycle.py` probes one branch with two declared contributions,
+where `u1` depends on `u0`. It separates the durable holder of each unit from
+a disposable gate attempt. Ready declaration, twig-to-branch sharing, bounded
+attempt selection, Hold, revision, dependent rebase, failed/unrun gate,
+ref-fenced commit, crash before accounting, close, parking, and transfer of an
+external settlement obligation are separate transitions.
+
+```sh
+python3 models/research/contribution_lifecycle.py
+```
+
+The correct variant explores 8,752 states through twelve steps without violating
+its conservation, dependency, fence, or closure checks. Explicit scenarios
+exercise cancellation followed by resubmission, revision of a passed and a
+failed attempt, dependent rebase, recovery after CAS, parking of an in-flight
+twig, and transfer of an unsettled external act. Six defective variants each
+reach a forbidden history: cancellation drops the selected unit, a dependent
+lands without its predecessor, an old candidate lands after revision, a
+dependent lands on a stale basis, closure acknowledges before the ref is
+disabled, or closure drops the continuing owner of an external act.
+
+This is a state-shape probe, not a proof of the full lifecycle. A repair is
+collapsed to a new version of `u0`; the model has no actual content merge,
+cut-rewrite lineage, semantic dependency discovery, equivalence/no-op
+accounting receipt, independently failing topology/ref stores, or release
+gate. `parked` stands for a durable named holder without modeling its pin or
+receipt. It assumes that revision and cancellation fence the ref in one
+atomic transition and that the trunk CAS durably records its source units.
+The real host contracts and merge engine must supply those facts or refuse
+the operation. The [research note](../../spec/branch-trunk-gate-research-note.md)
+§11 states the intended lifecycle and its remaining design obligations.
