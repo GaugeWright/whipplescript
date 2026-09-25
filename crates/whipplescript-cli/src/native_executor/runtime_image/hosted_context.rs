@@ -2,8 +2,12 @@
 use super::*;
 use std::collections::BTreeMap;
 
-const PRODUCTION_RECIPE: &str =
-    include_str!("../../../../whipplescript-host-do/worker/executor/Dockerfile");
+// The hosted executor's recipe is owned by whipplescript-host-do, at
+// worker/executor/Dockerfile. A published crate carries only its own files, so
+// an include reaching into that crate compiled here and failed crates.io's
+// verification build (0.6.0 shipped without this crate for it). The copy is
+// held to the owner byte for byte by tests/native_runtime_context.rs.
+const PRODUCTION_RECIPE: &str = include_str!("executor.Dockerfile");
 const IGNORE: &str = "*\n!Dockerfile\n!whip\n!reactor.wasm\n!runtime.json\n";
 
 #[derive(Deserialize)]

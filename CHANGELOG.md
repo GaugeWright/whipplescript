@@ -37,6 +37,15 @@ follow [Semantic Versioning](https://semver.org). Dates are UTC.
   statement is kept as a proposal), and a dependency inherits the rank of what
   waits on it. Contradictory rankings show in `whip issue conflicts`.
 
+### Fixed
+
+- **The `whipplescript` crate builds from its own package again.** It embedded
+  the hosted executor's Dockerfile from `whipplescript-host-do`, a crate that is
+  never published, so crates.io's verification build could not find it and
+  0.6.0 of this one crate was not published. The ten others were. The recipe
+  now lives inside the crate, held byte for byte to the one host-do owns, and
+  every release packages and verifies all its crates before publishing any.
+
 ## [0.6.0] — 2026-09-24
 
 A minor release rather than a patch, because it breaks source that 0.5.6
