@@ -187,3 +187,33 @@ atomic transition and that the trunk CAS durably records its source units.
 The real host contracts and merge engine must supply those facts or refuse
 the operation. The [research note](../../spec/branch-trunk-gate-research-note.md)
 §11 states the intended lifecycle and its remaining design obligations.
+
+## Dependency update, owner routing, and external audit
+
+`dependency_update.py` adds a bounded probe for one external dependency and
+three repository owners. A depends directly on it, B depends transitively
+through A, and a graph edit discovers C. The update request keeps one proposed
+immutable source revision; replacing that revision changes its exact basis.
+Owners receive versioned routes and answer with a migration or compatibility
+claim. A separate audit approves or rejects the external source, and a gate
+passes the exact candidate. Only an admission receipt can advance the logical
+pin and account for the request.
+
+```sh
+python3 models/research/dependency_update.py
+```
+
+The safe variant explores 82,614 distinct states through eight transitions.
+Explicit scenarios cover graph expansion and rerouting, audit rejection,
+owner refusal, stale source approval, and recovery after the pin-moving receipt.
+Six bounded mutants and one longer explicit mutant expose missing owner
+resolution, stale owner basis, absent or stale audit, absent or stale gate,
+and a cut that moves the pin without resolving every affected repository.
+The model assumes the impact graph is correct, owner and auditor identities
+are authenticated, audit verdicts are trustworthy, and the logical cut plus
+receipt is atomic. It does not prove supply-chain inspection quality, migration
+correctness, discovery of missing semantic edges, independent Git-main
+settlement, historical bark-chip resolution, or delivery of a request through
+real queues. The
+[research note](../../spec/branch-trunk-gate-research-note.md) §12 describes
+those design obligations.
