@@ -104,7 +104,7 @@ impl AuthoredAgentPackage {
         for capability in &capabilities {
             if !matches!(
                 capability.as_str(),
-                "workspace.read" | "workspace.write" | "command.run"
+                "workspace.read" | "workspace.write" | "command.run" | "tracker.file"
             ) {
                 return Err(format!(
                     "agent package declares unsupported capability `{capability}`"
@@ -235,13 +235,21 @@ impl AuthoredAgentPackage {
             .agent_abilities
             .iter()
             .any(|item| item == "command.run");
+        let tracker_file = self
+            .agent_abilities
+            .iter()
+            .any(|item| item == "tracker.file");
+        let mut tools = workspace_tool_specs_from_registry(readable, writable, command);
+        if tracker_file {
+            tools.push(tracker_add_todo_spec());
+        }
         ResolvedPackage::compile_with_capabilities(
             self.version_ref.clone(),
             &self.source,
             Some(&self.workflow),
             self.agent.clone(),
             self.system_prompt.clone(),
-            workspace_tool_specs_from_registry(readable, writable, command),
+            tools,
             self.max_steps,
             self.agent_abilities.clone(),
         )
@@ -560,6 +568,19 @@ fn tool_spec(name: &str, description: &str, input_schema: Value) -> ToolSpec {
     }
 }
 
+/// File an item in the host-admitted project tracker. The host chooses the
+/// actual queue and checks current actor authority before returning its id.
+pub fn tracker_add_todo_spec() -> ToolSpec {
+    tool_spec(
+        "add_todo",
+        "File a task in the current work tracker. Returns its issue id after filing succeeds.",
+        json!({"type":"object","properties":{
+            "content":{"type":"string","minLength":1},
+            "status":{"type":"string","enum":["pending"]}
+        },"required":["content"],"additionalProperties":false}),
+    )
+}
+
 fn sha256_hex(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     hex_lower(&digest)
@@ -578,6 +599,59 @@ fn hex_lower(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn authored_task_filing_requires_its_explicit_ability() {
+        let source = r#"workflow Chat {
+  agent assistant {
+    provider owned
+    profile "task-filer"
+    capacity 1
+    capabilities ["tracker.file"]
+  }
+}"#;
+        let manifest = json!({
+            "schema": AGENT_PACKAGE_SCHEMA,
+            "source": "agent.whip", "workflow": "Chat", "agent": "assistant",
+            "system_prompt": "persona.md", "capabilities": ["tracker.file"],
+            "agent_abilities": ["tracker.file"], "max_steps": 12
+        });
+        let package = AuthoredAgentPackage::from_documents(
+            manifest.to_string(),
+            source,
+            "File actual tracker tasks.",
+        )
+        .expect("tracker capable package");
+        let tools = package.resolve(package.version_ref()).unwrap().tools;
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].name, "add_todo");
+        assert_eq!(tools[0].input_schema["required"], json!(["content"]));
+
+        let mut narrowed = manifest;
+        narrowed["agent_abilities"] = json!([]);
+        let package = AuthoredAgentPackage::from_documents(
+            narrowed.to_string(),
+            source,
+            "File actual tracker tasks.",
+        )
+        .unwrap();
+        assert!(package
+            .resolve(package.version_ref())
+            .unwrap()
+            .tools
+            .is_empty());
+
+        let mut unsupported = narrowed;
+        unsupported["capabilities"] = json!(["tracker.erase"]);
+        unsupported["agent_abilities"] = json!(["tracker.erase"]);
+        let error = AuthoredAgentPackage::from_documents(
+            unsupported.to_string(),
+            source,
+            "File actual tracker tasks.",
+        )
+        .unwrap_err();
+        assert!(error.contains("unsupported capability `tracker.erase`"));
+    }
 
     /// `edits_argument` and `read_line_window` moved here from the two host tool
     /// surfaces that each carried a copy. Their refusals came with them but
