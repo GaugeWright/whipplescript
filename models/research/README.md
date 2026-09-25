@@ -39,8 +39,33 @@ Its abstractions are intentionally narrow:
   completion. There are no independent policy and ref stores, lease owners,
   fencing tokens, message loss, or fairness assumptions.
 
-The next model should compare a policy epoch stored in the trunk ref authority
-with a durable cross-authority admission reservation, including crash and
-former-owner fencing. It should replace linear prefix transport with durable
-change identity under rewriting and add an external target only after the
-single-ref invariants remain sound.
+The admission-fence comparison below takes up the first missing authority
+question. Later models still need durable change identity under rewriting and
+an external target after the single-ref invariants remain sound.
+
+## Admission-fence comparison
+
+`admission_fence.py` compares two ways to implement the atomic step assumed by
+the first probe:
+
+```sh
+python3 models/research/admission_fence.py
+```
+
+The first keeps the admission policy epoch, Hold state, owner fence, and trunk
+ref in one authority. Hold, takeover, and CAS serialize there. The second
+keeps Hold and the reservation in topology, with a token registry and monotone
+revocation fence in the ref authority. A CAS accepts only the active token.
+Topology may acknowledge Hold or a new owner only after the old token is
+consumed or durably revoked at the ref authority. Revocation of an as-yet
+ungranted token still writes a tombstone, so a delayed grant cannot revive it.
+
+The explorer bounds one candidate, one Hold, and one owner takeover. It checks
+both safe variants through eight steps, runs crash and ordering scenarios, and
+requires five defective variants to find counterexamples. It does not model
+concurrent databases failing independently, lost replies, a lease clock,
+membership/closure, candidate construction, or policy grants beyond Hold. Its
+`recover_receipt` reads a durable admission fact; the actual evidence lookup
+and indeterminate outcome still need design. The split protocol's token
+registry is a *new required ref-authority capability*, not something the
+current DR-0078 boundary reservation already provides.
