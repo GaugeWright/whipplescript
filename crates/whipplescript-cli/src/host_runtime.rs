@@ -2336,8 +2336,9 @@ impl GovernedHostRuntime {
         };
         let world = hosted_model_visible_world(command, &package, resources)
             .map_err(HostRuntimeError::Resolver)?;
+        let context = package.context_for_model();
         let input = BrokeredTurnInput {
-            system: package.system_prompt,
+            system: context.system_prompt,
             user: command.input.text.clone(),
             tools: package.tools.clone(),
             max_steps: package.max_steps,
@@ -2349,7 +2350,7 @@ impl GovernedHostRuntime {
             result_tool: None,
             user_media: media,
             world: Some(world),
-            context_bundles: Vec::new(),
+            context_bundles: context.contributions,
             pinned_skills: Vec::new(),
         };
         self.kernel

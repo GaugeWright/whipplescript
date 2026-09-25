@@ -20,6 +20,7 @@ use whipplescript_parser::IrProgram;
 
 pub const AGENT_PACKAGE_MANIFEST: &str = "package.json";
 pub const AGENT_PACKAGE_SCHEMA: &str = "whipplescript.agent_package.v0";
+pub const AGENT_PACKAGE_SCHEMA_V1: &str = "whipplescript.agent_package.v1";
 
 #[derive(Clone, Debug)]
 pub struct AuthoredAgentPackage {
@@ -29,6 +30,7 @@ pub struct AuthoredAgentPackage {
     workflow: String,
     agent: String,
     system_prompt: String,
+    project_context: Option<crate::context_assembly::ProjectInstruction>,
     capabilities: Vec<String>,
     agent_abilities: Vec<String>,
     max_steps: usize,
@@ -42,6 +44,8 @@ struct AuthoredAgentPackageManifest {
     workflow: String,
     agent: String,
     system_prompt: String,
+    #[serde(default)]
+    project_context: Option<String>,
     capabilities: Vec<String>,
     agent_abilities: Vec<String>,
     max_steps: usize,
@@ -53,16 +57,58 @@ impl AuthoredAgentPackage {
         source: impl Into<String>,
         system_prompt: impl Into<String>,
     ) -> Result<Self, String> {
+        Self::from_documents_with_context(manifest_text, source, system_prompt, None)
+    }
+
+    /// The v1 package carries one authored `AGENTS.md` document separately
+    /// from its system prompt. The context bytes participate in package
+    /// identity and enter the model as project context on every fresh turn.
+    pub fn from_documents_with_context(
+        manifest_text: impl Into<String>,
+        source: impl Into<String>,
+        system_prompt: impl Into<String>,
+        project_context: Option<String>,
+    ) -> Result<Self, String> {
         let manifest_text = manifest_text.into();
         let manifest: AuthoredAgentPackageManifest = serde_json::from_str(&manifest_text)
             .map_err(|error| format!("invalid agent package manifest: {error}"))?;
-        if manifest.schema != AGENT_PACKAGE_SCHEMA {
+        if manifest.schema != AGENT_PACKAGE_SCHEMA && manifest.schema != AGENT_PACKAGE_SCHEMA_V1 {
             return Err(format!(
                 "unsupported agent package schema `{}`",
                 manifest.schema
             ));
         }
-        Self::from_parts(manifest_text, manifest, source.into(), system_prompt.into())
+        match manifest.schema.as_str() {
+            AGENT_PACKAGE_SCHEMA
+                if manifest.project_context.is_some() || project_context.is_some() =>
+            {
+                return Err("v0 agent packages cannot declare project context".to_owned());
+            }
+            AGENT_PACKAGE_SCHEMA_V1
+                if manifest.project_context.is_none() || project_context.is_none() =>
+            {
+                return Err("v1 agent packages require a project context document".to_owned());
+            }
+            _ => {}
+        }
+        if manifest.schema == AGENT_PACKAGE_SCHEMA_V1
+            && manifest.project_context.as_deref() != Some("AGENTS.md")
+        {
+            return Err("v1 agent package project context must be AGENTS.md".to_owned());
+        }
+        if manifest.schema == AGENT_PACKAGE_SCHEMA_V1
+            && (!is_direct_package_child(&manifest.source)
+                || !is_direct_package_child(&manifest.system_prompt))
+        {
+            return Err("v1 agent package files must name direct children".to_owned());
+        }
+        Self::from_parts(
+            manifest_text,
+            manifest,
+            source.into(),
+            system_prompt.into(),
+            project_context,
+        )
     }
 
     #[cfg(feature = "native")]
@@ -79,7 +125,12 @@ impl AuthoredAgentPackage {
             .map_err(|error| format!("invalid agent package manifest: {error}"))?;
         let source = read_package_child(&root, &manifest.source)?;
         let system_prompt = read_package_child(&root, &manifest.system_prompt)?;
-        Self::from_documents(manifest_text, source, system_prompt)
+        let project_context = manifest
+            .project_context
+            .as_deref()
+            .map(|path| read_package_child(&root, path))
+            .transpose()?;
+        Self::from_documents_with_context(manifest_text, source, system_prompt, project_context)
     }
 
     fn from_parts(
@@ -87,14 +138,15 @@ impl AuthoredAgentPackage {
         manifest: AuthoredAgentPackageManifest,
         source: String,
         system_prompt: String,
+        project_context: Option<String>,
     ) -> Result<Self, String> {
         if manifest.workflow.trim().is_empty()
             || manifest.agent.trim().is_empty()
-            || system_prompt.trim().is_empty()
+            || (manifest.schema == AGENT_PACKAGE_SCHEMA && system_prompt.trim().is_empty())
             || manifest.max_steps == 0
         {
             return Err(
-                "agent package requires workflow, agent, persona, and positive max_steps"
+                "agent package requires workflow, agent, project context for v1, and positive max_steps"
                     .to_owned(),
             );
         }
@@ -170,11 +222,20 @@ impl AuthoredAgentPackage {
             ));
         }
 
-        let identity = json!({
-            "manifest": &manifest_text,
-            "source": &source,
-            "system_prompt": &system_prompt,
-        });
+        let identity = if let Some(context) = &project_context {
+            json!({
+                "manifest": &manifest_text,
+                "source": &source,
+                "system_prompt": &system_prompt,
+                "project_context": context,
+            })
+        } else {
+            json!({
+                "manifest": &manifest_text,
+                "source": &source,
+                "system_prompt": &system_prompt,
+            })
+        };
         let version_ref = format!(
             "whip:agent-package:{}",
             sha256_hex(identity.to_string().as_bytes())
@@ -186,6 +247,12 @@ impl AuthoredAgentPackage {
             workflow: manifest.workflow,
             agent: manifest.agent,
             system_prompt,
+            project_context: project_context.map(|content| {
+                crate::context_assembly::ProjectInstruction {
+                    path: manifest.project_context.expect("v1 path checked above"),
+                    content,
+                }
+            }),
             capabilities,
             agent_abilities,
             max_steps: manifest.max_steps,
@@ -219,6 +286,10 @@ impl AuthoredAgentPackage {
         &self.system_prompt
     }
 
+    pub fn project_context_document(&self) -> Option<&crate::context_assembly::ProjectInstruction> {
+        self.project_context.as_ref()
+    }
+
     pub fn resolve(&self, version_ref: &str) -> Result<ResolvedPackage, String> {
         if version_ref != self.version_ref {
             return Err("agent package bytes do not match the pinned version ref".to_owned());
@@ -235,7 +306,7 @@ impl AuthoredAgentPackage {
             .agent_abilities
             .iter()
             .any(|item| item == "command.run");
-        ResolvedPackage::compile_with_capabilities(
+        let mut resolved = ResolvedPackage::compile_with_capabilities(
             self.version_ref.clone(),
             &self.source,
             Some(&self.workflow),
@@ -244,8 +315,14 @@ impl AuthoredAgentPackage {
             workspace_tool_specs_from_registry(readable, writable, command),
             self.max_steps,
             self.agent_abilities.clone(),
-        )
+        )?;
+        resolved.project_context = self.project_context.clone();
+        Ok(resolved)
     }
+}
+
+fn is_direct_package_child(path: &str) -> bool {
+    !path.is_empty() && path != "." && path != ".." && !path.contains('/') && !path.contains('\\')
 }
 
 impl PackageResolver for AuthoredAgentPackage {
@@ -279,6 +356,7 @@ pub struct ResolvedPackage {
     pub ir_hash: String,
     pub agent: String,
     pub system_prompt: String,
+    pub project_context: Option<crate::context_assembly::ProjectInstruction>,
     pub tools: Vec<ToolSpec>,
     pub capabilities: Vec<String>,
     pub max_steps: usize,
@@ -291,6 +369,47 @@ pub struct ResolvedPackage {
 }
 
 impl ResolvedPackage {
+    /// The authored package's pinned model context. V0 keeps its historical
+    /// persona bytes; v1 carries AGENTS.md as a separate project contribution.
+    pub fn context_for_model(&self) -> crate::context_assembly::AssembledContext {
+        use crate::context_assembly::{
+            assemble, contribution, render_project_context, AssembledContext,
+            ContributionLifecycle, InstructionAuthority, InstructionRole,
+        };
+        let Some(context) = self
+            .project_context
+            .as_ref()
+            .filter(|context| !context.content.trim().is_empty())
+        else {
+            return AssembledContext {
+                system_prompt: self.system_prompt.clone(),
+                contributions: Vec::new(),
+            };
+        };
+        assemble(vec![
+            contribution(
+                "persona",
+                "package:system-prompt",
+                self.version_ref.clone(),
+                InstructionAuthority::Runtime,
+                InstructionRole::System,
+                "010-persona",
+                ContributionLifecycle::Stable,
+                self.system_prompt.clone(),
+            ),
+            contribution(
+                "agent-context",
+                context.path.clone(),
+                self.version_ref.clone(),
+                InstructionAuthority::Project,
+                InstructionRole::Developer,
+                "040-agent-context",
+                ContributionLifecycle::Stable,
+                render_project_context(std::slice::from_ref(context)),
+            ),
+        ])
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn compile(
         version_ref: impl Into<String>,
@@ -378,6 +497,7 @@ impl ResolvedPackage {
             ir_hash,
             agent,
             system_prompt,
+            project_context: None,
             tools,
             capabilities,
             max_steps,
@@ -578,6 +698,148 @@ fn hex_lower(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn v1_agent_context_is_distinct_and_pinned() {
+        let source = "workflow Chat { agent assistant { provider owned profile \"repo-reader\" capacity 1 capabilities [\"workspace.read\"] } }";
+        let manifest = json!({
+            "schema": AGENT_PACKAGE_SCHEMA_V1,
+            "source": "chat.whip",
+            "workflow": "Chat",
+            "agent": "assistant",
+            "system_prompt": "persona.md",
+            "project_context": "AGENTS.md",
+            "capabilities": ["workspace.read"],
+            "agent_abilities": ["workspace.read"],
+            "max_steps": 12
+        });
+        assert!(AuthoredAgentPackage::from_documents(
+            manifest.to_string(),
+            source,
+            "Runtime instructions."
+        )
+        .unwrap_err()
+        .contains("require a project context"));
+        let first = AuthoredAgentPackage::from_documents_with_context(
+            manifest.to_string(),
+            source,
+            "Runtime instructions.",
+            Some("Read carefully.".into()),
+        )
+        .unwrap();
+        let second = AuthoredAgentPackage::from_documents_with_context(
+            manifest.to_string(),
+            source,
+            "Runtime instructions.",
+            Some("Read twice.".into()),
+        )
+        .unwrap();
+        assert_ne!(first.version_ref(), second.version_ref());
+        assert_eq!(first.system_prompt_document(), "Runtime instructions.");
+        let context = first.project_context_document().unwrap();
+        assert_eq!(context.path, "AGENTS.md");
+        assert_eq!(context.content, "Read carefully.");
+        assert_eq!(
+            first.resolve(first.version_ref()).unwrap().project_context,
+            Some(context.clone())
+        );
+        let projected = first
+            .resolve(first.version_ref())
+            .unwrap()
+            .context_for_model();
+        assert_eq!(projected.contributions.len(), 2);
+        assert_eq!(
+            projected.system_prompt.matches("Read carefully.").count(),
+            1
+        );
+        assert_eq!(
+            projected
+                .system_prompt
+                .matches("Runtime instructions.")
+                .count(),
+            1
+        );
+        assert_eq!(projected.contributions[1].source, "AGENTS.md");
+        let without_system = AuthoredAgentPackage::from_documents_with_context(
+            manifest.to_string(),
+            source,
+            "",
+            Some("Read carefully.".into()),
+        )
+        .unwrap();
+        assert_eq!(without_system.system_prompt_document(), "");
+        assert_ne!(first.version_ref(), without_system.version_ref());
+        let migrated = AuthoredAgentPackage::from_documents_with_context(
+            manifest.to_string(),
+            source,
+            "Legacy persona.",
+            Some(String::new()),
+        )
+        .unwrap();
+        let migrated_context = migrated
+            .resolve(migrated.version_ref())
+            .unwrap()
+            .context_for_model();
+        assert_eq!(migrated_context.system_prompt, "Legacy persona.");
+        assert!(migrated_context.contributions.is_empty());
+        let mut unsupported = manifest.clone();
+        unsupported["schema"] = json!("whipplescript.agent_package.v2");
+        assert!(AuthoredAgentPackage::from_documents_with_context(
+            unsupported.to_string(),
+            source,
+            "",
+            Some("Pinned.".into()),
+        )
+        .unwrap_err()
+        .contains("unsupported agent package schema"));
+        let mut v0 = manifest.clone();
+        v0["schema"] = json!(AGENT_PACKAGE_SCHEMA);
+        assert!(AuthoredAgentPackage::from_documents_with_context(
+            v0.to_string(),
+            source,
+            "Legacy persona.",
+            Some("Unexpected project context.".into()),
+        )
+        .unwrap_err()
+        .contains("v0 agent packages cannot declare project context"));
+        v0.as_object_mut().unwrap().remove("project_context");
+        assert!(
+            AuthoredAgentPackage::from_documents(v0.to_string(), source, "")
+                .unwrap_err()
+                .contains("agent package requires")
+        );
+        let mut wrong_context_path = manifest.clone();
+        wrong_context_path["project_context"] = json!("instructions.md");
+        assert!(AuthoredAgentPackage::from_documents_with_context(
+            wrong_context_path.to_string(),
+            source,
+            "",
+            Some("Pinned.".into()),
+        )
+        .unwrap_err()
+        .contains("project context must be AGENTS.md"));
+        let mut capability_drift = manifest.clone();
+        capability_drift["capabilities"] = json!([]);
+        capability_drift["agent_abilities"] = json!([]);
+        assert!(AuthoredAgentPackage::from_documents_with_context(
+            capability_drift.to_string(),
+            source,
+            "",
+            Some("Pinned.".into()),
+        )
+        .unwrap_err()
+        .contains("capabilities do not match"));
+        let mut escaped_manifest = manifest;
+        escaped_manifest["source"] = json!("../chat.whip");
+        assert!(AuthoredAgentPackage::from_documents_with_context(
+            escaped_manifest.to_string(),
+            source,
+            "",
+            Some("Pinned.".into()),
+        )
+        .unwrap_err()
+        .contains("direct children"));
+    }
 
     /// `edits_argument` and `read_line_window` moved here from the two host tool
     /// surfaces that each carried a copy. Their refusals came with them but

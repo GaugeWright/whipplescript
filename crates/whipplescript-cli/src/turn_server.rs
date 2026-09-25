@@ -310,6 +310,7 @@ pub fn run_turn_in_workspace(
         .and_then(Value::as_str)
         .unwrap_or("You are a coding agent working in a scratch directory.")
         .to_owned();
+    let mut context_bundles = Vec::new();
     let user = request
         .get("user")
         .and_then(Value::as_str)
@@ -393,7 +394,15 @@ pub fn run_turn_in_workspace(
             package.get("system_prompt").and_then(Value::as_str),
             package.get("version_ref").and_then(Value::as_str),
         ) {
-            let authored = match AuthoredAgentPackage::from_documents(manifest, source, persona) {
+            let authored = match AuthoredAgentPackage::from_documents_with_context(
+                manifest,
+                source,
+                persona,
+                package
+                    .get("project_context")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+            ) {
                 Ok(authored) => authored,
                 Err(error) => return failed_outcome(&error),
             };
@@ -405,7 +414,9 @@ pub fn run_turn_in_workspace(
             // program the package compiled, so it has to be taken first.
             result_tool = resolved.result_tool.clone();
             executor = executor.with_result_contract(resolved.result_contract());
-            system = resolved.system_prompt;
+            let context = resolved.context_for_model();
+            system = context.system_prompt;
+            context_bundles = context.contributions;
             max_steps = resolved.max_steps;
             tools = resolved.tools;
         } else {
@@ -438,7 +449,9 @@ pub fn run_turn_in_workspace(
             // program the package compiled, so it has to be taken first.
             result_tool = resolved.result_tool.clone();
             executor = executor.with_result_contract(resolved.result_contract());
-            system = resolved.system_prompt;
+            let context = resolved.context_for_model();
+            system = context.system_prompt;
+            context_bundles = context.contributions;
             max_steps = resolved.max_steps;
             tools = resolved.tools;
         }
@@ -498,7 +511,7 @@ pub fn run_turn_in_workspace(
         user_images,
         user_media,
         world,
-        context_bundles: Vec::new(),
+        context_bundles,
         pinned_skills: Vec::new(),
         result_tool,
     };
@@ -909,10 +922,32 @@ mod tests {
         assert_eq!(outcome.status, TurnStatus::Failed);
         assert_eq!(outcome.summary, "unknown provider `not-a-provider`");
 
-        let mut tampered = request;
+        let mut tampered = request.clone();
         tampered["package"]["system_prompt"] = json!("Different bytes.");
         let outcome = run_turn_in_workspace("batch-package", &tampered, &workspace);
         assert_eq!(outcome.status, TurnStatus::Failed);
+        assert!(outcome.summary.contains("pinned version"));
+
+        let mut v1_manifest: Value = serde_json::from_str(manifest).unwrap();
+        v1_manifest["schema"] = json!("whipplescript.agent_package.v1");
+        v1_manifest["project_context"] = json!("AGENTS.md");
+        let v1_manifest = v1_manifest.to_string();
+        let v1 = AuthoredAgentPackage::from_documents_with_context(
+            &v1_manifest,
+            source,
+            "",
+            Some("Pinned agent instructions.".into()),
+        )
+        .unwrap();
+        let mut request = request;
+        request["package"]["manifest"] = json!(v1_manifest);
+        request["package"]["system_prompt"] = json!("");
+        request["package"]["project_context"] = json!("Pinned agent instructions.");
+        request["package"]["version_ref"] = json!(v1.version_ref());
+        let outcome = run_turn_in_workspace("batch-package", &request, &workspace);
+        assert_eq!(outcome.summary, "unknown provider `not-a-provider`");
+        request["package"]["project_context"] = json!("Tampered instructions.");
+        let outcome = run_turn_in_workspace("batch-package", &request, &workspace);
         assert!(outcome.summary.contains("pinned version"));
         std::fs::remove_dir_all(workspace).ok();
     }

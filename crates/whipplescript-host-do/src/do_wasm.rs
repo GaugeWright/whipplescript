@@ -482,9 +482,15 @@ fn authored_package(
     manifest: &str,
     source: &str,
     system_prompt: &str,
+    project_context: Option<String>,
 ) -> Result<AuthoredAgentPackage, JsValue> {
-    AuthoredAgentPackage::from_documents(manifest, source, system_prompt)
-        .map_err(|error| JsValue::from_str(&error))
+    AuthoredAgentPackage::from_documents_with_context(
+        manifest,
+        source,
+        system_prompt,
+        project_context,
+    )
+    .map_err(|error| JsValue::from_str(&error))
 }
 
 /// Execute `OpenInstanceCommand` against the DO store through the common
@@ -500,11 +506,17 @@ pub fn host_open_instance(
     package_manifest: &str,
     package_source: &str,
     system_prompt: &str,
+    project_context: Option<String>,
 ) -> Result<String, JsValue> {
     let mut facade = hosted_facade(bridge, signed_envelope, expected_signer, public_key_hex)?;
     let command: OpenInstanceCommand = serde_json::from_str(command_json)
         .map_err(|error| JsValue::from_str(&error.to_string()))?;
-    let package = authored_package(package_manifest, package_source, system_prompt)?;
+    let package = authored_package(
+        package_manifest,
+        package_source,
+        system_prompt,
+        project_context,
+    )?;
     let opened = facade
         .open_instance(&command, &package)
         .map_err(|error| JsValue::from_str(&error.to_string()))?;
@@ -627,11 +639,17 @@ pub fn host_validate_turn(
     package_manifest: &str,
     package_source: &str,
     system_prompt: &str,
+    project_context: Option<String>,
 ) -> Result<String, JsValue> {
     let facade = hosted_facade(bridge, signed_envelope, expected_signer, public_key_hex)?;
     let command: StartTurnCommand = serde_json::from_str(command_json)
         .map_err(|error| JsValue::from_str(&error.to_string()))?;
-    let package = authored_package(package_manifest, package_source, system_prompt)?;
+    let package = authored_package(
+        package_manifest,
+        package_source,
+        system_prompt,
+        project_context,
+    )?;
     let admission = facade
         .validate_turn(&command, &package)
         .map_err(|error| JsValue::from_str(&error.to_string()))?;
@@ -652,6 +670,7 @@ pub fn host_begin_turn(
     package_manifest: &str,
     package_source: &str,
     system_prompt: &str,
+    project_context: Option<String>,
     provider: &str,
     model: &str,
     base_url: &str,
@@ -659,7 +678,12 @@ pub fn host_begin_turn(
     let mut facade = hosted_facade(bridge, signed_envelope, expected_signer, public_key_hex)?;
     let command: StartTurnCommand = serde_json::from_str(command_json)
         .map_err(|error| JsValue::from_str(&error.to_string()))?;
-    let package = authored_package(package_manifest, package_source, system_prompt)?;
+    let package = authored_package(
+        package_manifest,
+        package_source,
+        system_prompt,
+        project_context,
+    )?;
     facade
         .begin_turn(
             &command,
@@ -866,14 +890,18 @@ pub fn host_export_thread(
     package_manifest: &str,
     package_source: &str,
     system_prompt: &str,
+    project_context: Option<String>,
 ) -> Result<String, JsValue> {
     let facade = hosted_facade(bridge, signed_envelope, expected_signer, public_key_hex)?;
+    let package = authored_package(
+        package_manifest,
+        package_source,
+        system_prompt,
+        project_context,
+    )?;
     let source: EventPosition = serde_json::from_str(source_position_json)
         .map_err(|error| JsValue::from_str(&error.to_string()))?;
-    if source.sequence == 0 {
-        return Err(JsValue::from_str("fork source position must be nonzero"));
-    }
-    let package = authored_package(package_manifest, package_source, system_prompt)?;
+    crate::do_fork::validate_fork_source_position(&source).map_err(JsValue::from_str)?;
     let resolved = package
         .resolve_package(package.version_ref())
         .map_err(|error| JsValue::from_str(&error))?;
@@ -946,8 +974,15 @@ pub fn host_import_fork(
     package_manifest: &str,
     package_source: &str,
     system_prompt: &str,
+    project_context: Option<String>,
 ) -> Result<String, JsValue> {
     let mut facade = hosted_facade(bridge, signed_envelope, expected_signer, public_key_hex)?;
+    let package = authored_package(
+        package_manifest,
+        package_source,
+        system_prompt,
+        project_context,
+    )?;
     let command: ForkInstanceCommand = serde_json::from_str(command_json)
         .map_err(|error| JsValue::from_str(&error.to_string()))?;
     command
@@ -964,15 +999,14 @@ pub fn host_import_fork(
         .map_err(|error| JsValue::from_str(&error.to_string()))?;
     let exported_policy: PolicyEpochRef = serde_json::from_value(export["policy"].clone())
         .map_err(|error| JsValue::from_str(&error.to_string()))?;
-    if export.get("protocol").and_then(serde_json::Value::as_str) != Some(HOST_PROTOCOL)
-        || exported_source != command.source
-        || exported_policy != command.policy
-    {
-        return Err(JsValue::from_str(
-            "fork export does not match its admitted command",
-        ));
-    }
-    let package = authored_package(package_manifest, package_source, system_prompt)?;
+    crate::do_fork::validate_fork_export_admission(
+        &export,
+        &exported_source,
+        &exported_policy,
+        &command.source,
+        &command.policy,
+    )
+    .map_err(JsValue::from_str)?;
     let target_package = package
         .resolve_package(&command.package_version_ref)
         .map_err(|error| JsValue::from_str(&error))?;
@@ -1583,9 +1617,15 @@ impl WasmDurableInstance {
         package_manifest: &str,
         package_source: &str,
         system_prompt: &str,
+        project_context: Option<String>,
         agent_config_json: Option<String>,
     ) -> Result<WasmDurableInstance, JsValue> {
-        let package = authored_package(package_manifest, package_source, system_prompt)?;
+        let package = authored_package(
+            package_manifest,
+            package_source,
+            system_prompt,
+            project_context,
+        )?;
         let resolved = package
             .resolve(package.version_ref())
             .map_err(|error| JsValue::from_str(&error))?;
@@ -1612,6 +1652,7 @@ impl WasmDurableInstance {
                 agent_model,
                 agent_workspace_resources,
                 agent_tool_specs: Some(resolved.tools),
+                agent_project_context: resolved.project_context,
                 ..DurableEffectPorts::default()
             },
         )

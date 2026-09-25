@@ -119,6 +119,7 @@ const hostFunctions = bindings as unknown as {
     packageManifest: string,
     packageSource: string,
     systemPrompt: string,
+    projectContext?: string,
   ) => string;
   host_discard_instance: (
     bridge: unknown,
@@ -136,6 +137,7 @@ const hostFunctions = bindings as unknown as {
     packageManifest: string,
     packageSource: string,
     systemPrompt: string,
+    projectContext?: string,
   ) => string;
   host_begin_turn: (
     bridge: unknown,
@@ -146,6 +148,7 @@ const hostFunctions = bindings as unknown as {
     packageManifest: string,
     packageSource: string,
     systemPrompt: string,
+    projectContext: string | undefined,
     provider: string,
     model: string,
     baseUrl: string,
@@ -196,6 +199,7 @@ const hostFunctions = bindings as unknown as {
     packageManifest: string,
     packageSource: string,
     systemPrompt: string,
+    projectContext?: string,
   ) => string;
   host_import_fork: (
     bridge: unknown,
@@ -207,6 +211,7 @@ const hostFunctions = bindings as unknown as {
     packageManifest: string,
     packageSource: string,
     systemPrompt: string,
+    projectContext?: string,
   ) => string;
 };
 
@@ -1059,6 +1064,7 @@ interface HostPackageDocuments {
   manifest: string;
   source: string;
   system_prompt: string;
+  project_context?: string;
 }
 
 interface HostCommandRequest {
@@ -3955,6 +3961,7 @@ export class WorkflowInstance implements DurableObject {
         packageDocs.manifest,
         packageDocs.source,
         packageDocs.system_prompt,
+        packageDocs.project_context,
         undefined,
       );
       const report = command === "checkpoint" ? instance.checkpoint(cutId) : instance.restore(cutId);
@@ -4170,6 +4177,7 @@ export class WorkflowInstance implements DurableObject {
       typeof packageDocs.manifest !== "string" ||
       typeof packageDocs.source !== "string" ||
       typeof packageDocs.system_prompt !== "string" ||
+      (packageDocs.project_context !== undefined && typeof packageDocs.project_context !== "string") ||
       !policy ||
       !Number.isSafeInteger(policy.epoch) ||
       Number(policy.epoch) <= 0 ||
@@ -4314,6 +4322,7 @@ export class WorkflowInstance implements DurableObject {
           packageDocs.manifest,
           packageDocs.source,
           packageDocs.system_prompt,
+          packageDocs.project_context,
         ),
       ) as { instance_ref?: unknown };
     } catch (error) {
@@ -4421,6 +4430,7 @@ export class WorkflowInstance implements DurableObject {
       typeof candidate.manifest !== "string" ||
       typeof candidate.source !== "string" ||
       typeof candidate.system_prompt !== "string"
+      || (candidate.project_context !== undefined && typeof candidate.project_context !== "string")
     ) {
       return Response.json(
         { error: "package requires manifest, source, and system_prompt strings" },
@@ -4526,6 +4536,7 @@ export class WorkflowInstance implements DurableObject {
           request.package.manifest,
           request.package.source,
           request.package.system_prompt,
+          request.package.project_context,
         ),
       );
       await this.ctx.storage.put(
@@ -4617,6 +4628,7 @@ export class WorkflowInstance implements DurableObject {
       request.package.manifest,
       request.package.source,
       request.package.system_prompt,
+      request.package.project_context,
     ] as const;
     try {
       // Phase 1 crosses no credential boundary. Only after WhippleScript has
@@ -4673,6 +4685,7 @@ export class WorkflowInstance implements DurableObject {
         request.package.manifest,
         request.package.source,
         request.package.system_prompt,
+        request.package.project_context,
         JSON.stringify({
           provider: binding.provider,
           base_url: binding.base_url,
@@ -4857,6 +4870,7 @@ export class WorkflowInstance implements DurableObject {
         packageDocs.manifest,
         packageDocs.source,
         packageDocs.system_prompt,
+        packageDocs.project_context,
       )));
     } catch (error) {
       return Response.json({ error: `fork export rejected: ${String(error)}` }, { status: 409 });
@@ -4886,6 +4900,7 @@ export class WorkflowInstance implements DurableObject {
         request.package.manifest,
         request.package.source,
         request.package.system_prompt,
+        request.package.project_context,
       ));
       await this.ctx.storage.put(
         `host-package:${String(forked.target?.instance_ref ?? "")}`,

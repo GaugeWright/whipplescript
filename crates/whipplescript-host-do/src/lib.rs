@@ -36,6 +36,8 @@ use whipplescript_store::files::FileStore;
 #[cfg(test)]
 mod content_parity;
 pub mod do_branches;
+#[cfg(any(target_arch = "wasm32", test))]
+mod do_fork;
 pub mod do_instance;
 pub mod do_memory;
 pub mod do_packages;
