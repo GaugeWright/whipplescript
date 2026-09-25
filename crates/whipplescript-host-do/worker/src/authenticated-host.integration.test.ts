@@ -1665,7 +1665,7 @@ describe("real WorkflowInstance hibernation", () => {
     // declared operations, six are `/v1/...` routes outside it. Writing the
     // declared total here counts those six and fails; this number is counted
     // from `runtime-route-surface.json` through the same filter.
-    expect(operations.length).toBe(38);
+    expect(operations.length).toBe(39);
 
     for (const operation of operations) {
       for (const authorization of [undefined, "Bearer wrong-control-token"]) {
