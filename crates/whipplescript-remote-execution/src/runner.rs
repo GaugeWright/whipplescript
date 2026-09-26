@@ -4,13 +4,20 @@
 //! work, publish a release, change the charter or write externally: the
 //! runner gives it a scratch directory holding exactly its input root, the
 //! command's own environment and nothing of the endpoint's, and reads back
-//! only the outputs it named. The first runner is the host's own process
-//! table; the DO-host sidecar tier of the compute-plane design note is
-//! another implementation of this trait, not a change to the endpoint.
+//! only the outputs it named.
+//!
+//! That confinement is one function, [`run_confined`], and it is
+//! synchronous so that every place an action runs is the same code: the
+//! endpoint's own runner calls it on a blocking thread, and the Class-A
+//! executor sidecar of the compute-plane design note calls it from its
+//! request thread when an endpoint's [`crate::sidecar`] runner hands it an
+//! action. The two runners differ in where the process table is, never in
+//! what an action is allowed to see.
 
 use std::collections::BTreeMap;
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::digest::Digest;
 
@@ -48,6 +55,7 @@ pub enum Output {
     },
 }
 
+#[cfg(feature = "endpoint")]
 #[async_trait::async_trait]
 pub trait ActionRunner: Send + Sync {
     /// The executor's name, recorded as the origin of every result it
@@ -57,10 +65,12 @@ pub trait ActionRunner: Send + Sync {
 }
 
 /// The host's own processes, one scratch directory per action.
+#[cfg(feature = "endpoint")]
 pub struct LocalRunner {
     scratch_root: PathBuf,
 }
 
+#[cfg(feature = "endpoint")]
 impl LocalRunner {
     pub fn new(scratch_root: impl Into<PathBuf>) -> Self {
         Self {
@@ -126,6 +136,7 @@ fn read_file(path: &Path) -> Result<(Vec<u8>, bool), String> {
     Ok((bytes, executable))
 }
 
+#[cfg(feature = "endpoint")]
 #[async_trait::async_trait]
 impl ActionRunner for LocalRunner {
     fn name(&self) -> &str {
@@ -133,103 +144,150 @@ impl ActionRunner for LocalRunner {
     }
 
     async fn run(&self, action: PreparedAction) -> Result<ActionOutcome, String> {
-        std::fs::create_dir_all(&self.scratch_root)
-            .map_err(|error| format!("cannot create {}: {error}", self.scratch_root.display()))?;
-        let scratch = tempfile::Builder::new()
-            .prefix("action-")
-            .tempdir_in(&self.scratch_root)
-            .map_err(|error| {
-                format!(
-                    "cannot create a scratch directory under {}: {error}",
-                    self.scratch_root.display()
-                )
-            })?;
-        let root = scratch.path();
-        for (path, (bytes, executable)) in &action.inputs {
-            let target = confine(root, path)?;
-            if let Some(parent) = target.parent() {
-                std::fs::create_dir_all(parent)
-                    .map_err(|error| format!("cannot create {}: {error}", parent.display()))?;
-            }
-            std::fs::write(&target, bytes)
-                .map_err(|error| format!("cannot write {}: {error}", target.display()))?;
-            #[cfg(unix)]
-            if *executable {
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).map_err(
-                    |error| format!("cannot mark {} executable: {error}", target.display()),
-                )?;
-            }
-            #[cfg(not(unix))]
-            let _ = executable;
-        }
-        for output in &action.output_paths {
-            if let Some(parent) = confine(root, output)?.parent() {
-                std::fs::create_dir_all(parent)
-                    .map_err(|error| format!("cannot create {}: {error}", parent.display()))?;
-            }
-        }
-        let cwd = confine(root, &action.working_directory)?;
-        std::fs::create_dir_all(&cwd)
-            .map_err(|error| format!("cannot create {}: {error}", cwd.display()))?;
-        let Some((program, arguments)) = action.arguments.split_first() else {
-            return Err("an action names no command".into());
-        };
-        let mut command = tokio::process::Command::new(program);
-        command
-            .args(arguments)
-            .current_dir(&cwd)
-            .env_clear()
-            .envs(
-                action
-                    .environment
-                    .iter()
-                    .map(|(k, v)| (k.as_str(), v.as_str())),
-            )
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .kill_on_drop(true);
-        let child = command
-            .spawn()
-            .map_err(|error| format!("cannot start {program}: {error}"))?;
-        let waited = match action.timeout {
-            Some(timeout) => tokio::time::timeout(timeout, child.wait_with_output()).await,
-            None => Ok(child.wait_with_output().await),
-        };
-        let (exit_code, stdout, stderr, timed_out) = match waited {
-            Ok(finished) => {
-                let output =
-                    finished.map_err(|error| format!("{program} did not finish: {error}"))?;
-                (
-                    output.status.code().unwrap_or(-1),
-                    output.stdout,
-                    output.stderr,
-                    false,
-                )
-            }
-            Err(_) => (-1, Vec::new(), Vec::new(), true),
-        };
-        let mut outputs = BTreeMap::new();
-        for output in &action.output_paths {
-            let path = confine(root, output)?;
-            if path.is_dir() {
-                let mut files = BTreeMap::new();
-                collect_files(&path, &path, &mut files)?;
-                outputs.insert(output.clone(), Output::Directory { files });
-            } else if path.is_file() {
-                let (bytes, executable) = read_file(&path)?;
-                outputs.insert(output.clone(), Output::File { bytes, executable });
-            }
-        }
-        Ok(ActionOutcome {
-            exit_code,
-            stdout,
-            stderr,
-            outputs,
-            timed_out,
-        })
+        let scratch_root = self.scratch_root.clone();
+        tokio::task::spawn_blocking(move || run_confined(&scratch_root, &action))
+            .await
+            .unwrap_or_else(|failed| std::panic::resume_unwind(failed.into_panic()))
     }
+}
+
+/// How long an action that names no timeout may run.
+pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// Run an action confined: a fresh scratch directory under `scratch_root`
+/// holding exactly its inputs, the command's own environment and nothing of
+/// the caller's, its standard input closed, a timeout, and only the outputs
+/// it named read back. An action that names no timeout gets
+/// [`DEFAULT_TIMEOUT`]. A timed-out action reports no output at all.
+pub fn run_confined(scratch_root: &Path, action: &PreparedAction) -> Result<ActionOutcome, String> {
+    std::fs::create_dir_all(scratch_root)
+        .map_err(|error| format!("cannot create {}: {error}", scratch_root.display()))?;
+    let scratch = tempfile::Builder::new()
+        .prefix("action-")
+        .tempdir_in(scratch_root)
+        .map_err(|error| {
+            format!(
+                "cannot create a scratch directory under {}: {error}",
+                scratch_root.display()
+            )
+        })?;
+    let root = scratch.path();
+    for (path, (bytes, executable)) in &action.inputs {
+        let target = confine(root, path)?;
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|error| format!("cannot create {}: {error}", parent.display()))?;
+        }
+        std::fs::write(&target, bytes)
+            .map_err(|error| format!("cannot write {}: {error}", target.display()))?;
+        #[cfg(unix)]
+        if *executable {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755))
+                .map_err(|error| format!("cannot mark {} executable: {error}", target.display()))?;
+        }
+        #[cfg(not(unix))]
+        let _ = executable;
+    }
+    for output in &action.output_paths {
+        if let Some(parent) = confine(root, output)?.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|error| format!("cannot create {}: {error}", parent.display()))?;
+        }
+    }
+    let cwd = confine(root, &action.working_directory)?;
+    std::fs::create_dir_all(&cwd)
+        .map_err(|error| format!("cannot create {}: {error}", cwd.display()))?;
+    let Some((program, arguments)) = action.arguments.split_first() else {
+        return Err("an action names no command".into());
+    };
+    let mut child = std::process::Command::new(program)
+        .args(arguments)
+        .current_dir(&cwd)
+        .env_clear()
+        .envs(
+            action
+                .environment
+                .iter()
+                .map(|(k, v)| (k.as_str(), v.as_str())),
+        )
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("cannot start {program}: {error}"))?;
+    // Both streams drain on their own threads, so a chatty action never
+    // blocks on a full pipe while it is being waited for.
+    let drain = |stream: Option<Box<dyn Read + Send>>| {
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            if let Some(mut stream) = stream {
+                let _ = stream.read_to_end(&mut bytes);
+            }
+            bytes
+        })
+    };
+    let stdout = drain(
+        child
+            .stdout
+            .take()
+            .map(|s| Box::new(s) as Box<dyn Read + Send>),
+    );
+    let stderr = drain(
+        child
+            .stderr
+            .take()
+            .map(|s| Box::new(s) as Box<dyn Read + Send>),
+    );
+    // Every run has a deadline, the action's own or the default; a process
+    // table that cannot say whether the child has finished is waited on
+    // until then and treated as a timeout, never as a finish.
+    let deadline = Instant::now() + action.timeout.unwrap_or(DEFAULT_TIMEOUT);
+    let status = loop {
+        if let Some(status) = child.try_wait().ok().flatten() {
+            break Some(status);
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    let Some(status) = status else {
+        // A child the action started may still hold the pipes; its drains
+        // are left to finish on their own rather than waited for.
+        return Ok(ActionOutcome {
+            exit_code: -1,
+            timed_out: true,
+            ..Default::default()
+        });
+    };
+    let joined = |handle: std::thread::JoinHandle<Vec<u8>>| {
+        handle
+            .join()
+            .unwrap_or_else(|panicked| std::panic::resume_unwind(panicked))
+    };
+    let (stdout, stderr) = (joined(stdout), joined(stderr));
+    let mut outputs = BTreeMap::new();
+    for output in &action.output_paths {
+        let path = confine(root, output)?;
+        if path.is_dir() {
+            let mut files = BTreeMap::new();
+            collect_files(&path, &path, &mut files)?;
+            outputs.insert(output.clone(), Output::Directory { files });
+        } else if path.is_file() {
+            let (bytes, executable) = read_file(&path)?;
+            outputs.insert(output.clone(), Output::File { bytes, executable });
+        }
+    }
+    Ok(ActionOutcome {
+        exit_code: status.code().unwrap_or(-1),
+        stdout,
+        stderr,
+        outputs,
+        timed_out: false,
+    })
 }
 
 /// A digest-addressed view of an outcome's outputs, for the services.
@@ -248,23 +306,26 @@ pub fn digest_outputs(outcome: &ActionOutcome) -> Vec<(String, Digest)> {
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn an_action_runs_confined_to_its_root_with_only_what_it_named() {
+    #[test]
+    fn an_action_runs_confined_to_its_root_with_only_what_it_named() {
         let scratch = tempfile::tempdir().unwrap();
-        let runner = LocalRunner::new(scratch.path());
+        let run = |action: PreparedAction| run_confined(scratch.path(), &action);
         let mut inputs = BTreeMap::new();
         inputs.insert("in/a.txt".to_owned(), (b"alpha".to_vec(), false));
-        let outcome = runner
-            .run(PreparedAction {
-                arguments: vec!["sh".into(), "-c".into(), "cat in/a.txt > out/b.txt; mkdir -p out/d; echo x > out/d/x; echo err >&2; exit 3".into()],
-                environment: vec![("HOME".into(), "/nonexistent".into())],
-                working_directory: String::new(),
-                inputs,
-                output_paths: vec!["out/b.txt".into(), "out/d".into(), "out/absent".into()],
-                timeout: Some(Duration::from_secs(30)),
-            })
-            .await
-            .unwrap();
+        let outcome = run(PreparedAction {
+            arguments: vec![
+                "sh".into(),
+                "-c".into(),
+                "cat in/a.txt > out/b.txt; mkdir -p out/d; echo x > out/d/x; echo err >&2; exit 3"
+                    .into(),
+            ],
+            environment: vec![("HOME".into(), "/nonexistent".into())],
+            working_directory: String::new(),
+            inputs,
+            output_paths: vec!["out/b.txt".into(), "out/d".into(), "out/absent".into()],
+            timeout: Some(Duration::from_secs(30)),
+        })
+        .unwrap();
         assert_eq!(outcome.exit_code, 3);
         assert_eq!(outcome.stderr, b"err\n");
         assert!(!outcome.timed_out);
@@ -280,31 +341,27 @@ mod tests {
             vec![("out/b.txt".to_owned(), Digest::of(b"alpha"))]
         );
         assert!(
-            runner
-                .run(PreparedAction {
-                    arguments: vec!["sh".into(), "-c".into(), "sleep 5".into()],
-                    environment: vec![],
-                    working_directory: String::new(),
-                    inputs: BTreeMap::new(),
-                    output_paths: vec![],
-                    timeout: Some(Duration::from_millis(200)),
-                })
-                .await
-                .unwrap()
-                .timed_out
+            run(PreparedAction {
+                arguments: vec!["sh".into(), "-c".into(), "sleep 5".into()],
+                environment: vec![],
+                working_directory: String::new(),
+                inputs: BTreeMap::new(),
+                output_paths: vec![],
+                timeout: Some(Duration::from_millis(200)),
+            })
+            .unwrap()
+            .timed_out
         );
         assert_eq!(
-            runner
-                .run(PreparedAction {
-                    arguments: vec![],
-                    environment: vec![],
-                    working_directory: String::new(),
-                    inputs: BTreeMap::new(),
-                    output_paths: vec![],
-                    timeout: None,
-                })
-                .await
-                .unwrap_err(),
+            run(PreparedAction {
+                arguments: vec![],
+                environment: vec![],
+                working_directory: String::new(),
+                inputs: BTreeMap::new(),
+                output_paths: vec![],
+                timeout: None,
+            })
+            .unwrap_err(),
             "an action names no command"
         );
         assert_eq!(

@@ -8,12 +8,13 @@
 //! join of the labels of everything that shaped it (rule 5, and §14.2), and
 //! is served only to a view whose principal holds that classification.
 
-use std::collections::HashMap;
-use std::sync::{Mutex, MutexGuard};
+use prost::Message;
+use rusqlite::{params, OptionalExtension};
 
+use crate::db::Db;
 use crate::digest::Digest;
 use crate::proto::re;
-use crate::store::{HandleId, Labels, View};
+use crate::store::{written, Labels, View};
 
 /// Who produced a cached result.
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -42,24 +43,87 @@ pub struct Entry {
     pub result: re::ActionResult,
     pub origin: Origin,
     pub classification: Classification,
-    /// The view a submitted result is scoped to; none for an executed one.
-    pub submitted_under: Option<HandleId>,
+    /// The principal a submitted result is scoped to; none for an executed
+    /// one. A name, not a handle, so the scope outlives the process.
+    pub submitted_by: Option<String>,
 }
 
-#[derive(Default)]
+/// The action cache: rows of the endpoint's database, keyed by action digest.
 pub struct ActionCache {
-    entries: Mutex<HashMap<String, Entry>>,
+    db: Db,
+}
+
+impl Default for ActionCache {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ActionCache {
+    /// A cache that lives as long as the process.
     pub fn new() -> Self {
-        Self::default()
+        Self::over(Db::in_memory())
     }
 
-    fn lock(&self) -> MutexGuard<'_, HashMap<String, Entry>> {
-        self.entries
+    /// A cache over the endpoint's database.
+    pub fn over(db: Db) -> Self {
+        Self { db }
+    }
+
+    fn write(&self, action: &Digest, entry: &Entry) -> Result<(), String> {
+        written(
+            &format!("the result of {action}"),
+            self.db.lock().execute(
+                "INSERT INTO actions (hash, result, origin, classification, submitted_by)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT (hash) DO UPDATE SET result = excluded.result,
+                   origin = excluded.origin, classification = excluded.classification,
+                   submitted_by = excluded.submitted_by",
+                params![
+                    action.hash,
+                    entry.result.encode_to_vec(),
+                    serde_json::to_string(&entry.origin).unwrap_or_default(),
+                    serde_json::to_string(&entry.classification).unwrap_or_default(),
+                    entry.submitted_by,
+                ],
+            ),
+        )
+        .map(|_| ())
+    }
+
+    /// The stored entry for an action. A row that does not decode is no
+    /// entry: it is served to no one and vouches for nothing.
+    fn read(&self, action: &Digest) -> Option<Entry> {
+        let (result, origin, classification, submitted_by) = self
+            .db
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .query_row(
+                "SELECT result, origin, classification, submitted_by FROM actions WHERE hash = ?1",
+                params![action.hash],
+                |row| {
+                    Ok((
+                        row.get::<_, Vec<u8>>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                    ))
+                },
+            )
+            .optional()
+            .ok()
+            .flatten()?;
+        let origin: Origin = serde_json::from_str(&origin).ok()?;
+        // An executed row names no submitter and a submitted row names one;
+        // a row that says otherwise is damaged.
+        if matches!(origin, Origin::Executed { .. }) != submitted_by.is_none() {
+            return None;
+        }
+        Some(Entry {
+            result: re::ActionResult::decode(result.as_slice()).ok()?,
+            origin,
+            classification: serde_json::from_str(&classification).ok()?,
+            submitted_by,
+        })
     }
 
     /// Record what the approved executor produced. An executed entry
@@ -71,18 +135,18 @@ impl ActionCache {
         executor: &str,
         result: re::ActionResult,
         classification: Classification,
-    ) {
-        self.lock().insert(
-            action.hash.clone(),
-            Entry {
+    ) -> Result<(), String> {
+        self.write(
+            action,
+            &Entry {
                 result,
                 origin: Origin::Executed {
                     executor: executor.to_owned(),
                 },
                 classification,
-                submitted_under: None,
+                submitted_by: None,
             },
-        );
+        )
     }
 
     /// Accept a client's result under its own view. It never displaces an
@@ -94,57 +158,81 @@ impl ActionCache {
         result: re::ActionResult,
         classification: Classification,
     ) -> Result<(), String> {
-        let mut entries = self.lock();
-        if let Some(existing) = entries.get(&action.hash) {
-            if matches!(existing.origin, Origin::Executed { .. }) {
-                return Err(format!(
-                    "action {action} has an executed result; a submitted one does not replace it"
-                ));
-            }
+        if self.evidence(action).is_some() {
+            return Err(format!(
+                "action {action} has an executed result; a submitted one does not replace it"
+            ));
         }
-        entries.insert(
-            action.hash.clone(),
-            Entry {
+        self.write(
+            action,
+            &Entry {
                 result,
                 origin: Origin::Submitted {
                     by: view.principal.name.clone(),
                 },
                 classification,
-                submitted_under: Some(view.handle.clone()),
+                submitted_by: Some(view.principal.name.clone()),
             },
-        );
-        Ok(())
+        )
     }
 
     /// The entry a view may read: an executed one whose classification the
-    /// principal holds, or the view's own submission. Anything else is not
-    /// found under that view.
+    /// principal holds, or the principal's own submission. Anything else is
+    /// not found under that view.
     pub fn lookup(&self, view: &View, action: &Digest) -> Option<Entry> {
-        let entries = self.lock();
-        let entry = entries.get(&action.hash)?;
-        match &entry.submitted_under {
-            Some(handle) if handle != &view.handle => return None,
+        let entry = self.read(action)?;
+        match &entry.submitted_by {
+            Some(principal) if principal != &view.principal.name => return None,
             _ => {}
         }
         if !view.principal.holds(&entry.classification.labels) {
             return None;
         }
-        Some(entry.clone())
+        Some(entry)
+    }
+
+    /// How many results the cache holds by origin: (executed, submitted).
+    pub fn counts(&self) -> (usize, usize) {
+        self.db
+            .lock()
+            .query_row(
+                "SELECT COUNT(*) FILTER (WHERE submitted_by IS NULL),
+                        COUNT(*) FILTER (WHERE submitted_by IS NOT NULL) FROM actions",
+                [],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .map(|(executed, submitted)| {
+                (
+                    usize::try_from(executed).unwrap_or(0),
+                    usize::try_from(submitted).unwrap_or(0),
+                )
+            })
+            .unwrap_or((0, 0))
     }
 
     /// Every action the endpoint's executor ran, in no particular order.
     pub fn executed_actions(&self) -> Vec<(Digest, Entry)> {
-        self.lock()
-            .iter()
-            .filter(|(_, entry)| matches!(entry.origin, Origin::Executed { .. }))
-            .map(|(hash, entry)| {
-                (
-                    Digest {
-                        hash: hash.clone(),
-                        size_bytes: -1,
-                    },
-                    entry.clone(),
-                )
+        let hashes: Vec<String> = {
+            let connection = self.db.lock();
+            let Ok(mut statement) =
+                connection.prepare("SELECT hash FROM actions WHERE submitted_by IS NULL")
+            else {
+                return Vec::new();
+            };
+            statement
+                .query_map([], |row| row.get::<_, String>(0))
+                .map(|rows| rows.filter_map(Result::ok).collect())
+                .unwrap_or_default()
+        };
+        hashes
+            .into_iter()
+            .filter_map(|hash| {
+                let digest = Digest {
+                    hash,
+                    size_bytes: -1,
+                };
+                let entry = self.evidence(&digest)?;
+                Some((digest, entry))
             })
             .collect()
     }
@@ -153,18 +241,15 @@ impl ActionCache {
     /// and never a submitted one (rule 2). This is the only door from the
     /// cache toward the norm plane.
     pub fn evidence(&self, action: &Digest) -> Option<Entry> {
-        let entries = self.lock();
-        entries
-            .get(&action.hash)
+        self.read(action)
             .filter(|entry| matches!(entry.origin, Origin::Executed { .. }))
-            .cloned()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::{Principal, Store};
+    use crate::store::{HandleId, Principal, Store};
 
     fn view(store: &Store, name: &str, labels: &[&str]) -> View {
         store
@@ -212,7 +297,9 @@ mod tests {
         assert_eq!(cache.lookup(&other, &action), None);
         assert_eq!(cache.evidence(&action), None);
         // The executor's observation replaces the claim and is evidence.
-        cache.record_executed(&action, "endpoint", result(3), classified(&["protected"]));
+        cache
+            .record_executed(&action, "endpoint", result(3), classified(&["protected"]))
+            .unwrap();
         let evidence = cache.evidence(&action).expect("executed is evidence");
         assert_eq!(evidence.result.exit_code, 3);
         assert_eq!(
@@ -233,6 +320,77 @@ mod tests {
                 .record_submitted(&dev, &action, result(0), classified(&[]))
                 .unwrap_err(),
             format!("action {action} has an executed result; a submitted one does not replace it")
+        );
+    }
+
+    #[test]
+    fn a_cached_result_outlives_the_process_and_a_submission_stays_its_principals() {
+        let dir = tempfile::tempdir().expect("scratch");
+        let path = dir.path().join("endpoint.sqlite");
+        let submitted = Digest::of(b"submitted action");
+        let executed = Digest::of(b"executed action");
+        {
+            let db = Db::open(&path).unwrap();
+            let store = Store::over(db.clone());
+            let cache = ActionCache::over(db);
+            let dev = view(&store, "dev", &[]);
+            cache
+                .record_submitted(&dev, &submitted, result(0), classified(&[]))
+                .unwrap();
+            cache
+                .record_executed(&executed, "endpoint", result(0), classified(&["protected"]))
+                .unwrap();
+        }
+        let db = Db::open(&path).unwrap();
+        let store = Store::over(db.clone());
+        let cache = ActionCache::over(db.clone());
+        // dev under a new handle is still the submitter; other never was.
+        let dev = store
+            .admit(
+                HandleId("a-new-token".into()),
+                Principal {
+                    name: "dev".into(),
+                    labels: Labels::new(),
+                },
+            )
+            .unwrap();
+        let other = view(&store, "other", &[]);
+        let owner = view(&store, "owner", &["protected"]);
+        assert_eq!(
+            cache.lookup(&dev, &submitted).and_then(|e| e.submitted_by),
+            Some("dev".into())
+        );
+        assert_eq!(cache.lookup(&other, &submitted), None);
+        assert_eq!(cache.evidence(&submitted), None);
+        assert_eq!(cache.lookup(&dev, &executed), None);
+        assert!(cache.lookup(&owner, &executed).is_some());
+        assert_eq!(cache.counts(), (1, 1));
+        assert_eq!(
+            cache
+                .executed_actions()
+                .into_iter()
+                .map(|(digest, _)| digest.hash)
+                .collect::<Vec<_>>(),
+            vec![executed.hash.clone()]
+        );
+        // A row whose origin and submitter disagree is served to no one and
+        // vouches for nothing.
+        db.lock()
+            .execute(
+                "UPDATE actions SET submitted_by = 'dev' WHERE hash = ?1",
+                params![executed.hash],
+            )
+            .unwrap();
+        assert_eq!(cache.evidence(&executed), None);
+        assert_eq!(cache.lookup(&dev, &executed), None);
+        db.refuse_writes();
+        assert_eq!(
+            cache
+                .record_executed(&executed, "endpoint", result(0), classified(&[]))
+                .unwrap_err(),
+            format!(
+                "cannot write the result of {executed} to the endpoint's state: attempt to write a readonly database"
+            )
         );
     }
 }

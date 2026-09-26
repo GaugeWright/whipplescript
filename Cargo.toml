@@ -14,9 +14,12 @@ members = [
     "crates/whipplescript-test-executor",
 ]
 resolver = "2"
+# Reindeer's input for the native third-party targets (GaugeWright BUILD.md
+# stage 5), not a crate: never a member, and not a workspace of its own.
+exclude = ["third-party"]
 
 [workspace.package]
-version = "0.5.6"
+version = "0.6.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 homepage = "https://github.com/GaugeWright/whipplescript"

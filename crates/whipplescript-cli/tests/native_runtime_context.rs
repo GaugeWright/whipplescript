@@ -99,6 +99,16 @@ fn native_runtime_context_prepares_exact_profile_and_refuses_bad_inputs() {
             .join("../whipplescript-host-do/worker/executor/Dockerfile"),
     )
     .expect("owning production recipe");
+    let embedded = fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("src/native_executor/runtime_image/executor.Dockerfile"),
+    )
+    .expect("embedded production recipe");
+    assert_eq!(
+        embedded, production,
+        "the CLI's executor.Dockerfile has drifted from whipplescript-host-do's \
+         worker/executor/Dockerfile, which owns it: copy the owner over it"
+    );
     assert!(recipe.starts_with(&production));
     assert!(recipe.contains("RUN --network=none "));
     assert!(recipe.contains("executor verify-norm-runtime"));

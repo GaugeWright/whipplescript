@@ -1,9 +1,12 @@
 //! A real Buck2 daemon building through the endpoint (DR-0124 §14.4): the
 //! fixture project under its remote-only execution platform, every action
 //! sent to the endpoint, its result classified as the platform says and
-//! recorded as executed by the endpoint's own runner. Ignored by default: it
+//! recorded as executed by the endpoint's own runner, its bytes in a
+//! workspace content store as the Home's endpoint keeps them. Ignored by default: it
 //! needs `buck2` on the PATH and is run by the bar's `buck2-test-executor`
 //! section, which names the remedy where Buck2 is absent.
+
+#![cfg(feature = "endpoint")]
 
 use std::path::Path;
 use std::sync::Arc;
@@ -43,7 +46,15 @@ async fn buck2_builds_the_fixture_through_the_endpoint() {
             .join("buck2-tests"),
         &project,
     );
-    let mut endpoint = Endpoint::new(Arc::new(LocalRunner::new(scratch.path().join("actions"))));
+    // The endpoint as the Home serves it: its uses and cache in its own
+    // state, its bytes in the workspace's content store.
+    let content = scratch.path().join("vcs-content.sqlite");
+    let mut endpoint = Endpoint::open_sharing(
+        Arc::new(LocalRunner::new(scratch.path().join("actions"))),
+        &scratch.path().join("endpoint.sqlite"),
+        &content,
+    )
+    .expect("the fixture's own step");
     let (handle, _) = endpoint
         .admit(Principal {
             name: "owner".into(),
@@ -108,6 +119,19 @@ async fn buck2_builds_the_fixture_through_the_endpoint() {
         .iter()
         .any(|(name, value)| name == "whipplescript.labels" && value == "fixture"));
     assert_eq!(entry.result.exit_code, 0);
+    // Its output is stored once, in the workspace's content store.
+    let output = entry.result.output_files[0]
+        .digest
+        .as_ref()
+        .expect("an output digest");
+    let workspace =
+        whipplescript_store::content::ContentStore::open(&content).expect("the fixture's own step");
+    assert_eq!(
+        whipplescript_store::content::ContentBlobs::get(&workspace, &output.hash[..32])
+            .expect("the fixture's own step")
+            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned()),
+        Some(source.to_uppercase())
+    );
     // A second build is answered from the endpoint's cache, not rerun.
     let again = buck2(&["build", "//secret-gate:shout"])
         .output()

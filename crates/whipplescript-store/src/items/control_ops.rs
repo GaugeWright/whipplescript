@@ -1,10 +1,19 @@
 use super::*;
 
+/// The claim guard (DR-0126): a claim is granted only on an issue the one
+/// readiness calls ready at `at`, the caller's instant. `at` decides — which
+/// leases have lapsed, whether a wait holds — and `now`, the store's clock,
+/// stamps what is written. A non-open issue is always refused. Any other
+/// reason can be overridden by a person who says why; the reason and what was
+/// overridden go into the `claim.acquired` event, so the log shows it.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn claim_item(
     tx: &Transaction<'_>,
     item_id: &str,
     claimed_by: &str,
     expires: Option<&str>,
+    at: &str,
+    override_reason: Option<&str>,
     effect_id: Option<&str>,
     now: &str,
 ) -> StoreResult<ClaimOutcome> {
@@ -19,9 +28,23 @@ pub(super) fn claim_item(
     if !exists {
         return Ok(ClaimOutcome::NotFound);
     }
-    tx_expire_stale_leases(tx, item_id, now)?;
-    if let Some(holder) = tx_active_holder(tx, item_id, now)? {
+    tx_expire_stale_leases_at(tx, item_id, at, now)?;
+    if let Some(holder) = tx_active_holder(tx, item_id, at)? {
         return Ok(ClaimOutcome::AlreadyClaimed { holder });
+    }
+    let reasons = super::readiness::unready_reasons(
+        &super::readiness_native::NativeReadiness(tx),
+        item_id,
+        at,
+    )?;
+    if let Some(status) = reasons.iter().find_map(|reason| match reason {
+        super::readiness::Unready::NotOpen { status } => Some(status.clone()),
+        _ => None,
+    }) {
+        return Ok(ClaimOutcome::NotOpen { status });
+    }
+    if !reasons.is_empty() && override_reason.is_none() {
+        return Ok(ClaimOutcome::NotReady { reasons });
     }
     // No active lease: grant. The lease's identity IS its `claim.acquired`
     // event (content hash) — like comments/evidence, so ids from different
@@ -32,7 +55,13 @@ pub(super) fn claim_item(
     // status — readiness changes through the lease overlay.
     let content_id = content_id_of(tx, item_id)?
         .ok_or_else(|| StoreError::Conflict(format!("unknown issue alias {item_id}")))?;
-    let payload = json!({"actor": claimed_by, "expires_at": expires});
+    let mut payload = json!({"actor": claimed_by, "expires_at": expires});
+    if let (Some(reason), false) = (override_reason, reasons.is_empty()) {
+        payload["override"] = json!({
+            "reason": reason,
+            "unready": reasons.iter().map(super::readiness::Unready::describe).collect::<Vec<_>>(),
+        });
+    }
     let lease_id = tx_append_raw(
         tx,
         Some(&content_id),

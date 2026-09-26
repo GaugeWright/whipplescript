@@ -29,6 +29,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 from dataclasses import dataclass
 
@@ -980,8 +981,38 @@ def apply_mutation(lines: list[str], site: Site) -> list[str] | None:
     return None
 
 
-def run_suite_once(filter_expr: str) -> str:
-    """One run of the suite against whatever is on disk."""
+# libtest names each test it failed once in its `failures:` report, whatever
+# the verbosity; a binary that died before reporting has cargo's line instead.
+FAILED_TEST = re.compile(r"^---- (\S+) stdout ----$", re.MULTILINE)
+DIED_BINARY = re.compile(r"process didn't exit successfully: .*$", re.MULTILINE)
+
+
+def failing_tests(output: str) -> list[str]:
+    """The tests a nonzero `cargo test` blamed, in the order it named them."""
+    names = list(dict.fromkeys(FAILED_TEST.findall(output)))
+    names.extend(match.group(0) for match in DIED_BINARY.finditer(output))
+    return names
+
+
+# What the last confirmed CAUGHT was caught BY, for the report that needs it.
+# The self test's failure line read "unreachable calibration was reported
+# caught" and nothing else on 2026-09-23, when a loaded gate host failed it
+# twice in a row on a suite that was green under nextest: the test that raced
+# was never named, so what was left was to guess. `run_suite` keeps its verdict
+# a plain string because that is what its callers and their tests handle.
+CAUGHT_BY: list[str] = []
+
+
+def run_suite_once(filter_expr: str) -> tuple[str, list[str]]:
+    """One run of the suite against whatever is on disk, and who it blamed."""
+    # The suite runs the way `cargo test` runs it: one process per test binary,
+    # its tests on threads. That is also how the bar runs it on a host without
+    # nextest, so a test that cannot survive it is fixed in the test (see
+    # `env_lock` in whipplescript-cli's main.rs), never by serialising the run
+    # here. RUST_TEST_THREADS=1 was measured on 2026-09-23: it made the
+    # thirteen-site sweep of build_commands.rs an hour on the gate host, past
+    # the gate's 45-minute ceiling, and would have hidden the race, not fixed it.
+    #
     # A flag-style filter is a cargo argument LIST (`-p whipplescript-parser`)
     # and has to be split: passed whole, cargo receives one argv element
     # containing a space and rejects it, which reads as BUILD_FAILED for every
@@ -994,10 +1025,10 @@ def run_suite_once(filter_expr: str) -> str:
         command += ["--", filter_expr]
     result = subprocess.run(command, capture_output=True, text=True)
     if result.returncode == 0:
-        return PASSED
+        return PASSED, []
     if "could not compile" in result.stdout + result.stderr:
-        return BUILD_FAILED
-    return CAUGHT
+        return BUILD_FAILED, []
+    return CAUGHT, failing_tests(result.stdout + result.stderr)
 
 
 def run_suite(filter_expr: str) -> str:
@@ -1029,32 +1060,53 @@ def run_suite(filter_expr: str) -> str:
     the rebuild each mutation already pays. A flake does not reproduce; a real
     catch always does.
     """
-    outcome = run_suite_once(filter_expr)
+    outcome, blamed = run_suite_once(filter_expr)
     if outcome != CAUGHT:
         return outcome
-    confirm = run_suite_once(filter_expr)
+    confirm, confirmed = run_suite_once(filter_expr)
     if confirm == CAUGHT:
+        CAUGHT_BY[:] = confirmed
         return CAUGHT
     # The failure did not repeat, so the mutation did not reliably cause it.
     # Conservative on purpose: report the refusal as NOT caught. Claiming a catch
     # on one flaky failure is the invented coverage this whole gate exists to
-    # refuse.
+    # refuse. Name what flaked: a test that fails once under a sweep's load and
+    # passes on re-run is a test racing another, and the name is the repair's
+    # first step.
     print(
-        "       note: a test failure did not reproduce on re-run; "
-        "not counting it as a catch",
+        f"       note: {blamed_as_text(blamed)} failed once and passed on "
+        "re-run; not counting it as a catch",
         flush=True,
     )
     return confirm
 
 
+def blamed_as_text(names: list[str]) -> str:
+    return ", ".join(f"`{name}`" for name in names) or "a test cargo did not name"
+
+
 def sweep(
-    target: str, filter_expr: str, sites: list[Site], backup: str
-) -> tuple[list[Site], list[Site]]:
-    """Returns (unexercised refusals, sites the sweep could not measure)."""
+    target: str, filter_expr: str, sites: list[Site], backup: str, deadline: float | None = None
+) -> tuple[list[Site], list[Site], list[Site]]:
+    """Returns (unexercised refusals, sites the sweep could not measure, sites
+    it reached the deadline before starting).
+
+    The deadline is checked before each site and never during one: a mutation
+    interrupted mid-suite would be a verdict about nothing. A site the deadline
+    reached first is UNKNOWN, like one that could not be measured, but it is not
+    a finding — it says the run ran out of time, not that the refusal is loose —
+    so the caller reports it by name and does not fail on it.
+    """
     survivors: list[Site] = []
     unmeasured: list[Site] = []
+    deferred: list[Site] = []
     source = Path(backup).read_text().split("\n")
     for number, site in enumerate(sites, 1):
+        if deadline is not None and time.time() >= deadline:
+            deferred = sites[number - 1 :]
+            for later, left in enumerate(deferred, number):
+                print(f"  {later:4d}/{len(sites)}  NOT SWEPT (time budget)  {target}:{left.line}  {left.label}", flush=True)
+            break
         mutated = apply_mutation(source, site)
         if mutated is None:
             print(f"  {number:4d}/{len(sites)}  SKIP (no mutation)  {site.label}", flush=True)
@@ -1070,7 +1122,7 @@ def sweep(
             print(f"  {number:4d}/{len(sites)}  BUILD FAILED (not measured)  {target}:{site.line}  {site.label}", flush=True)
         else:
             print(f"  {number:4d}/{len(sites)}  caught       {site.label}", flush=True)
-    return survivors, unmeasured
+    return survivors, unmeasured, deferred
 
 
 # Five plants, one per refusal SHAPE the scanner claims to see: a pushed
@@ -1463,7 +1515,16 @@ def self_test(target: str, filter_expr: str, backup: str) -> bool:
     Path(target).write_text("\n".join(mutated))
     outcome = run_suite(filter_expr)
     if outcome != PASSED:
-        detail = "calibration did not compile/run" if outcome == BUILD_FAILED else "unreachable calibration was reported caught"
+        if outcome == BUILD_FAILED:
+            detail = "calibration did not compile/run"
+        else:
+            # The plants are unreachable, so whatever failed here failed for a
+            # reason of its own — twice, since `run_suite` re-ran it. Name it:
+            # that is the test to read, and it is the only line that will say so.
+            detail = (
+                "unreachable calibration was reported caught, by "
+                f"{blamed_as_text(CAUGHT_BY)}"
+            )
         print(f"SELF TEST FAILED: {detail}", file=sys.stderr)
         return False
     print(f"self test: all {len(matching)} independent calibration mutations compile; suite passes", flush=True)
@@ -1491,6 +1552,19 @@ def main() -> int:
         "invocation of the caller: the self test proves the mutator lands "
         "against a crate's build and suite, which is a property of the crate "
         "rather than of the file, and it costs one full rebuild per plant.",
+    )
+    parser.add_argument(
+        "--deadline",
+        type=float,
+        default=None,
+        help="seconds since the epoch; start no site at or after it. The sites "
+        "left are reported as not swept, and do not fail the run.",
+    )
+    parser.add_argument(
+        "--deferred-file",
+        default="",
+        help="append `<target>:<line>` for each site the deadline reached "
+        "first, so a caller spending one budget across files can report them.",
     )
     parser.add_argument(
         "--list-sites",
@@ -1561,7 +1635,7 @@ def main() -> int:
             print(f"note: sweeping {args.limit} of {len(sites)} sites", flush=True)
             sites = sites[: args.limit]
         print(f"== sweeping {len(sites)} refusals in {target} ==", flush=True)
-        survivors, unmeasured = sweep(target, args.filter, sites, backup)
+        survivors, unmeasured, deferred = sweep(target, args.filter, sites, backup, args.deadline)
     finally:
         shutil.copy(backup, target)
         os.remove(backup)
@@ -1577,6 +1651,17 @@ def main() -> int:
         )
         for site in unmeasured:
             print(f"  {target}:{site.line}  {site.label}")
+    if deferred:
+        print(
+            f"\n{len(deferred)} of {len(sites)} refusals were NOT swept — the time "
+            f"budget ran out first. These are unknown, not covered."
+        )
+        for site in deferred:
+            print(f"  {target}:{site.line}  {site.label}")
+        if args.deferred_file:
+            with open(args.deferred_file, "a") as handle:
+                for site in deferred:
+                    handle.write(f"{target}:{site.line}\n")
     if missing:
         print(
             f"\n{len(missing)} requested line(s) held no refusal site and were "

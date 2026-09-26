@@ -87,17 +87,32 @@ impl TrackerControl {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum TrackerControlOutcome {
-    Claimed { expires_at: String },
-    AlreadyClaimed { holder: String },
-    Renewed { expires_at: String },
+    Claimed {
+        expires_at: String,
+    },
+    AlreadyClaimed {
+        holder: String,
+    },
+    Renewed {
+        expires_at: String,
+    },
     NotHeld,
     NotMonotonic,
     Released,
-    HeldByOther { holder: String },
+    HeldByOther {
+        holder: String,
+    },
     Assigned,
-    AssignmentChanged { assignee: Option<String> },
+    AssignmentChanged {
+        assignee: Option<String>,
+    },
     NotOpen,
     DeadlineElapsed,
+    /// Open, but the one readiness (DR-0126) refused it: blocked, conflicted,
+    /// or deferred. Each reason as a sentence.
+    NotReady {
+        reasons: Vec<String>,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

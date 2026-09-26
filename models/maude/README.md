@@ -61,6 +61,25 @@ reuse, and the act for one successor activating the other — with weakenings
 for reuse by resemblance and for a door that transplants acceptance across
 the split. Witness adequacy and evidence premises are not modeled.
 
+`ledger-query.maude` models norm-plane §8 (DR-0098 §6, Q1): a dependency
+join reaches every record a family's live edges bind from where it starts,
+so an answer reported complete never lacks a bound record; a record the view
+withholds makes the answer partial, and partial is never presented as
+complete; and a query writes nothing. Three weakenings: the join marking a
+record reached without answering it, a partial answer presented as
+complete, and a query that files a fact.
+
+`admission-commit.maude` models how a host realizes norm-plane §5's atomic
+admission across two stores. The landing-gate model's single commit step
+becomes: take the norm ledger's write exclusion, re-check the certified
+evidence and base head, advance the ref by compare-and-swap, release. A
+ledger writer waits for the exclusion. Nine searches: the attempt admits; a
+write landing first refuses the stale certificate and moves nothing; the
+writer is delayed, not lost; a moved base refuses; and no evidence lands
+between check and move while the exclusion is held. Two weakenings reach
+that race: releasing before the compare-and-swap, and checking before taking
+the exclusion. A refusal never moves the ref.
+
 `action-classification.maude` models DR-0124 §14.2: an action's
 classification joins its declared label with every influence that shaped
 it — a declared input, a presence observation, an observation of absence —

@@ -323,11 +323,38 @@ pub fn host_norm_command(
             whipplescript_store::norm_artifact::ArtifactLimits::default(),
         )
     };
+    let at = format!("norm-lease:{}", crate::do_store::stable_hash_hex(command));
+    let mut lease_gated_refs = || {
+        whipplescript_store::branches::lease_gated_mainline(
+            &mut crate::do_branches::DoBranches::new(sql.clone())?,
+            &at,
+        )
+    };
     crate::norm_commands::execute_hosted_norm_command_with_artifacts(
         &mut store,
         trusted_configuration,
         command,
         Some(&artifacts),
+        Some(&mut lease_gated_refs),
+    )
+    .map_err(|error| JsValue::from_str(&error))
+}
+
+/// Promote a stream onto the object's gated mainline (norm-plane §5), with
+/// the same deployment-owned planning inputs `host_norm_impact` uses.
+#[wasm_bindgen]
+pub fn host_norm_promotion(
+    bridge: DoSqlBridge,
+    trusted_configuration: &str,
+    command: &str,
+    deployment: &str,
+) -> Result<String, JsValue> {
+    let sql = std::rc::Rc::new(JsDoSql { bridge });
+    crate::norm_commands::execute_installed_hosted_norm_promotion(
+        &sql,
+        trusted_configuration,
+        command,
+        deployment,
     )
     .map_err(|error| JsValue::from_str(&error))
 }
@@ -455,9 +482,15 @@ fn authored_package(
     manifest: &str,
     source: &str,
     system_prompt: &str,
+    project_context: Option<String>,
 ) -> Result<AuthoredAgentPackage, JsValue> {
-    AuthoredAgentPackage::from_documents(manifest, source, system_prompt)
-        .map_err(|error| JsValue::from_str(&error))
+    AuthoredAgentPackage::from_documents_with_context(
+        manifest,
+        source,
+        system_prompt,
+        project_context,
+    )
+    .map_err(|error| JsValue::from_str(&error))
 }
 
 /// Execute `OpenInstanceCommand` against the DO store through the common
@@ -473,11 +506,17 @@ pub fn host_open_instance(
     package_manifest: &str,
     package_source: &str,
     system_prompt: &str,
+    project_context: Option<String>,
 ) -> Result<String, JsValue> {
     let mut facade = hosted_facade(bridge, signed_envelope, expected_signer, public_key_hex)?;
     let command: OpenInstanceCommand = serde_json::from_str(command_json)
         .map_err(|error| JsValue::from_str(&error.to_string()))?;
-    let package = authored_package(package_manifest, package_source, system_prompt)?;
+    let package = authored_package(
+        package_manifest,
+        package_source,
+        system_prompt,
+        project_context,
+    )?;
     let opened = facade
         .open_instance(&command, &package)
         .map_err(|error| JsValue::from_str(&error.to_string()))?;
@@ -600,11 +639,17 @@ pub fn host_validate_turn(
     package_manifest: &str,
     package_source: &str,
     system_prompt: &str,
+    project_context: Option<String>,
 ) -> Result<String, JsValue> {
     let facade = hosted_facade(bridge, signed_envelope, expected_signer, public_key_hex)?;
     let command: StartTurnCommand = serde_json::from_str(command_json)
         .map_err(|error| JsValue::from_str(&error.to_string()))?;
-    let package = authored_package(package_manifest, package_source, system_prompt)?;
+    let package = authored_package(
+        package_manifest,
+        package_source,
+        system_prompt,
+        project_context,
+    )?;
     let admission = facade
         .validate_turn(&command, &package)
         .map_err(|error| JsValue::from_str(&error.to_string()))?;
@@ -625,6 +670,7 @@ pub fn host_begin_turn(
     package_manifest: &str,
     package_source: &str,
     system_prompt: &str,
+    project_context: Option<String>,
     provider: &str,
     model: &str,
     base_url: &str,
@@ -632,7 +678,12 @@ pub fn host_begin_turn(
     let mut facade = hosted_facade(bridge, signed_envelope, expected_signer, public_key_hex)?;
     let command: StartTurnCommand = serde_json::from_str(command_json)
         .map_err(|error| JsValue::from_str(&error.to_string()))?;
-    let package = authored_package(package_manifest, package_source, system_prompt)?;
+    let package = authored_package(
+        package_manifest,
+        package_source,
+        system_prompt,
+        project_context,
+    )?;
     facade
         .begin_turn(
             &command,
@@ -839,14 +890,18 @@ pub fn host_export_thread(
     package_manifest: &str,
     package_source: &str,
     system_prompt: &str,
+    project_context: Option<String>,
 ) -> Result<String, JsValue> {
     let facade = hosted_facade(bridge, signed_envelope, expected_signer, public_key_hex)?;
+    let package = authored_package(
+        package_manifest,
+        package_source,
+        system_prompt,
+        project_context,
+    )?;
     let source: EventPosition = serde_json::from_str(source_position_json)
         .map_err(|error| JsValue::from_str(&error.to_string()))?;
-    if source.sequence == 0 {
-        return Err(JsValue::from_str("fork source position must be nonzero"));
-    }
-    let package = authored_package(package_manifest, package_source, system_prompt)?;
+    crate::do_fork::validate_fork_source_position(&source).map_err(JsValue::from_str)?;
     let resolved = package
         .resolve_package(package.version_ref())
         .map_err(|error| JsValue::from_str(&error))?;
@@ -919,8 +974,15 @@ pub fn host_import_fork(
     package_manifest: &str,
     package_source: &str,
     system_prompt: &str,
+    project_context: Option<String>,
 ) -> Result<String, JsValue> {
     let mut facade = hosted_facade(bridge, signed_envelope, expected_signer, public_key_hex)?;
+    let package = authored_package(
+        package_manifest,
+        package_source,
+        system_prompt,
+        project_context,
+    )?;
     let command: ForkInstanceCommand = serde_json::from_str(command_json)
         .map_err(|error| JsValue::from_str(&error.to_string()))?;
     command
@@ -937,15 +999,14 @@ pub fn host_import_fork(
         .map_err(|error| JsValue::from_str(&error.to_string()))?;
     let exported_policy: PolicyEpochRef = serde_json::from_value(export["policy"].clone())
         .map_err(|error| JsValue::from_str(&error.to_string()))?;
-    if export.get("protocol").and_then(serde_json::Value::as_str) != Some(HOST_PROTOCOL)
-        || exported_source != command.source
-        || exported_policy != command.policy
-    {
-        return Err(JsValue::from_str(
-            "fork export does not match its admitted command",
-        ));
-    }
-    let package = authored_package(package_manifest, package_source, system_prompt)?;
+    crate::do_fork::validate_fork_export_admission(
+        &export,
+        &exported_source,
+        &exported_policy,
+        &command.source,
+        &command.policy,
+    )
+    .map_err(JsValue::from_str)?;
     let target_package = package
         .resolve_package(&command.package_version_ref)
         .map_err(|error| JsValue::from_str(&error))?;
@@ -1143,6 +1204,14 @@ extern "C" {
     /// swallowed by design: a dropped projection must never fail a turn.
     #[wasm_bindgen(method, catch)]
     fn activity(this: &DoSqlBridge, kind: &str, detail: Option<String>) -> Result<(), JsValue>;
+
+    #[wasm_bindgen(method, catch, js_name = externalTool)]
+    fn external_tool_bridge(
+        this: &DoSqlBridge,
+        name: &str,
+        call_id: &str,
+        arguments: &str,
+    ) -> Result<String, JsValue>;
 }
 
 /// [`DoSql`] over the JS `DoSqlBridge`. `SqlValue` marshals as JSON scalars.
@@ -1205,6 +1274,12 @@ impl DoSql for JsDoSql {
 
     fn activity(&self, kind: &str, detail: Option<&str>) {
         let _ = self.bridge.activity(kind, detail.map(str::to_owned));
+    }
+
+    fn external_tool(&self, name: &str, call_id: &str, arguments: &str) -> Result<String, String> {
+        self.bridge
+            .external_tool_bridge(name, call_id, arguments)
+            .map_err(|error| format!("{error:?}"))
     }
 }
 
@@ -1556,9 +1631,15 @@ impl WasmDurableInstance {
         package_manifest: &str,
         package_source: &str,
         system_prompt: &str,
+        project_context: Option<String>,
         agent_config_json: Option<String>,
     ) -> Result<WasmDurableInstance, JsValue> {
-        let package = authored_package(package_manifest, package_source, system_prompt)?;
+        let package = authored_package(
+            package_manifest,
+            package_source,
+            system_prompt,
+            project_context,
+        )?;
         let resolved = package
             .resolve(package.version_ref())
             .map_err(|error| JsValue::from_str(&error))?;
@@ -1585,6 +1666,8 @@ impl WasmDurableInstance {
                 agent_model,
                 agent_workspace_resources,
                 agent_tool_specs: Some(resolved.tools),
+                external_tool_bindings: package.external_tool_bindings(),
+                agent_project_context: resolved.project_context,
                 ..DurableEffectPorts::default()
             },
         )

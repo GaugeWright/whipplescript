@@ -140,6 +140,7 @@ pub struct DoToolExecutor<Sql: DoSql> {
     sql: Rc<Sql>,
     key_prefix: String,
     file_scopes: Option<Vec<DoFileScope>>,
+    external_tools: BTreeMap<String, String>,
     /// The running turn's result contract, installed by the host before the
     /// turn. Behind a lock because one executor serves an instance's turns and
     /// the tool surface takes `&self`.
@@ -159,6 +160,7 @@ impl<Sql: DoSql> DoToolExecutor<Sql> {
             sql,
             key_prefix: String::new(),
             file_scopes: None,
+            external_tools: BTreeMap::new(),
             result_contract: std::sync::Mutex::new(None),
         }
     }
@@ -169,6 +171,7 @@ impl<Sql: DoSql> DoToolExecutor<Sql> {
             sql,
             key_prefix: format!("{instance_id}/"),
             file_scopes: None,
+            external_tools: BTreeMap::new(),
             result_contract: std::sync::Mutex::new(None),
         }
     }
@@ -190,13 +193,22 @@ impl<Sql: DoSql> DoToolExecutor<Sql> {
                 })
             })
             .collect::<Result<Vec<_>, String>>()?;
-        if scopes.is_empty() {
-            return Err("turn has no admitted file-store capability".to_owned());
-        }
         scopes.sort();
         scopes.dedup();
+        let external_handles = resources
+            .iter()
+            .filter(|resource| resource.kind == "external_tool")
+            .map(|resource| resource.handle.as_str())
+            .collect::<BTreeSet<_>>();
+        self.external_tools
+            .retain(|_, capability| external_handles.contains(capability.as_str()));
         self.file_scopes = Some(scopes);
         Ok(self)
+    }
+
+    pub fn with_external_tools(mut self, bindings: &[(String, String)]) -> Self {
+        self.external_tools.extend(bindings.iter().cloned());
+        self
     }
 
     fn path_access(&self, path: &str, write: bool) -> Result<String, String> {
@@ -249,6 +261,9 @@ impl<Sql: DoSql> DoToolExecutor<Sql> {
             TOOL_UPDATE_TODO => self.update_todo(args),
             TOOL_BASH => self.bash(args),
             TOOL_SUBMIT_RESULT => self.submit_result(args),
+            other if self.external_tools.contains_key(other) => {
+                self.sql.external_tool(other, &call.id, &args.to_string())
+            }
             other => Err(format!("unknown tool `{other}`")),
         }
     }
@@ -729,6 +744,21 @@ impl<Sql: DoSql> DoToolExecutor<Sql> {
                     return Err(format!("`{id}` is already claimed by {current}"));
                 }
                 ClaimOutcome::NotFound => return Err(format!("`{id}` was not found")),
+                ClaimOutcome::NotOpen { status } => {
+                    return Err(format!("`{id}` is {status}, not open work"));
+                }
+                // The one readiness (DR-0126): a todo that is blocked or deferred
+                // is refused with why, so the model works something ready.
+                ClaimOutcome::NotReady { reasons } => {
+                    return Err(format!(
+                        "`{id}` is not ready: {}",
+                        reasons
+                            .iter()
+                            .map(whipplescript_store::items::readiness::Unready::describe)
+                            .collect::<Vec<_>>()
+                            .join("; ")
+                    ));
+                }
             },
             // Holder-scoped, at parity with the native path
             // (`tracker-lease.maude` I4): closing releases the lease, so an
@@ -1106,6 +1136,59 @@ mod tests {
         let read = exec.execute(&call("read", json!({ "path": "a.txt" })));
         assert_eq!(read.status, ToolStatus::Ok);
         assert_eq!(read.content, "hello");
+    }
+
+    #[test]
+    fn empty_admitted_file_scope_keeps_chat_available_without_file_access() {
+        let exec = executor()
+            .with_resources(&[])
+            .expect("empty scope is valid");
+        assert_eq!(
+            exec.execute(&call(
+                "write",
+                json!({ "path": "agent/AGENTS.md", "content": "x" })
+            ))
+            .status,
+            ToolStatus::Error,
+        );
+        assert_eq!(
+            exec.execute(&call("read", json!({ "path": "agent/AGENTS.md" })))
+                .status,
+            ToolStatus::Error,
+        );
+    }
+
+    #[test]
+    fn readonly_agent_definition_and_writable_run_roots_share_one_file_store() {
+        let resource = |selector: Option<&str>, writable| ResourceRef {
+            handle: "project".to_owned(),
+            kind: "file_store".to_owned(),
+            selector: selector.map(str::to_owned),
+            writable: Some(writable),
+        };
+        let exec = executor()
+            .with_resources(&[
+                resource(None, false),
+                resource(Some("artifacts"), true),
+                resource(Some("work"), true),
+            ])
+            .expect("scoped executor");
+        for path in ["agent/AGENTS.md", "agent/skills/triage/SKILL.md"] {
+            assert_eq!(
+                exec.execute(&call("write", json!({ "path": path, "content": "change" })))
+                    .status,
+                ToolStatus::Error,
+                "{path} must remain read-only",
+            );
+        }
+        for path in ["artifacts/report.md", "work/notes.md"] {
+            assert_eq!(
+                exec.execute(&call("write", json!({ "path": path, "content": "ok" })))
+                    .status,
+                ToolStatus::Ok,
+                "{path} is run-owned",
+            );
+        }
     }
 
     #[test]
@@ -1516,6 +1599,51 @@ mod tests {
         assert_eq!(rows.as_array().expect("array").len(), 1);
     }
 
+    /// DR-0126, at parity with the native tool: a todo that is blocked or
+    /// already finished is refused with why when marked `in_progress`.
+    #[test]
+    fn update_todo_refuses_work_that_is_not_ready_and_work_that_is_done() {
+        let sql = Rc::new(store().sql);
+        let exec = DoToolExecutor::new(Rc::clone(&sql));
+        let file = |content: &str| {
+            let added = exec.execute(&call("add_todo", json!({ "content": content })));
+            assert_eq!(added.status, ToolStatus::Ok, "{}", added.content);
+            serde_json::from_str::<Value>(&added.content).expect("add_todo json")["id"]
+                .as_str()
+                .expect("id string")
+                .to_owned()
+        };
+        let first = file("first");
+        let second = file("second");
+        let mut store = DoSqliteStore::new(Rc::clone(&sql));
+        WorkItems::add_blocks(&mut store, &first, &second).expect("gates");
+        let blocked = exec.execute(&call(
+            "update_todo",
+            json!({ "id": second, "status": "in_progress" }),
+        ));
+        assert_eq!(blocked.status, ToolStatus::Error, "{}", blocked.content);
+        assert!(
+            blocked.content.contains("is not ready") && blocked.content.contains(&first),
+            "{}",
+            blocked.content
+        );
+        let done = exec.execute(&call(
+            "update_todo",
+            json!({ "id": first, "status": "completed" }),
+        ));
+        assert_eq!(done.status, ToolStatus::Ok, "{}", done.content);
+        let reclaimed = exec.execute(&call(
+            "update_todo",
+            json!({ "id": first, "status": "in_progress" }),
+        ));
+        assert_eq!(reclaimed.status, ToolStatus::Error, "{}", reclaimed.content);
+        assert!(
+            reclaimed.content.contains("not open work"),
+            "{}",
+            reclaimed.content
+        );
+    }
+
     /// Parity with the native harness tool: a claim the store refused reaches
     /// the model instead of being reported as a successful `in_progress`. On
     /// the DO the holder is a constant, so the reachable conflict is a lease
@@ -1798,5 +1926,34 @@ mod tests {
             arguments: serde_json::json!({}),
         });
         assert_eq!(known.status, ToolStatus::Ok, "{}", known.content);
+    }
+
+    #[test]
+    fn external_tool_needs_its_authored_binding_and_turn_resource() {
+        let bindings = vec![("ask_choices".to_owned(), "question.ask".to_owned())];
+        let missing = executor()
+            .with_external_tools(&bindings)
+            .with_resources(&[])
+            .unwrap();
+        let call = call("ask_choices", json!({ "questions": [] }));
+        assert!(missing.execute(&call).content.contains("unknown tool"));
+
+        let resource = ResourceRef {
+            handle: "question.ask".to_owned(),
+            kind: "external_tool".to_owned(),
+            selector: None,
+            writable: None,
+        };
+        let admitted = executor()
+            .with_external_tools(&bindings)
+            .with_resources(&[resource])
+            .unwrap();
+        let result = admitted.execute(&call);
+        assert_eq!(result.status, ToolStatus::Error);
+        assert!(
+            result.content.contains("no placement implementation"),
+            "{}",
+            result.content
+        );
     }
 }

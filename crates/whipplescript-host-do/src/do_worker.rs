@@ -105,6 +105,12 @@ pub struct DurableEffectPorts {
     /// their write attenuation.
     pub agent_workspace_resources: Option<Vec<ResourceRef>>,
     pub agent_tool_specs: Option<Vec<whipplescript_kernel::harness_loop::ToolSpec>>,
+    pub external_tool_bindings: Vec<(String, String)>,
+    /// Version-pinned Agent `AGENTS.md` from an authored package. The hosted
+    /// project-context store already carries deployment-supplied documents;
+    /// this occupies a distinct position before them and is idempotent on
+    /// isolate reattachment.
+    pub agent_project_context: Option<whipplescript_kernel::context_assembly::ProjectInstruction>,
     /// Executor-sidecar wiring for Class-A exec effects (compute plane P8).
     pub exec: Option<ExecutorSidecarConfig>,
     /// Class-B turn-container wiring (agent turns run whole in a container).
@@ -198,6 +204,16 @@ impl<Sql: DoSql + 'static> DurableInstance<Sql> {
             .store()
             .claim_instance_ownership(instance_id)
             .map_err(|error| format!("claim instance log ownership: {error:?}"))?;
+        if let Some(context) = ports
+            .agent_project_context
+            .as_ref()
+            .filter(|context| !context.content.trim().is_empty())
+        {
+            kernel
+                .store()
+                .register_project_context_doc(-1, &context.path, &context.content)
+                .map_err(|error| format!("register agent project context: {error:?}"))?;
+        }
 
         // DO-plane package bootstrap (see `create`): the governed host facade
         // opens the instance without seeding std packages, so seed them here
@@ -212,7 +228,8 @@ impl<Sql: DoSql + 'static> DurableInstance<Sql> {
             Some(tools) => tools,
             None => {
                 let executor =
-                    crate::do_tools::DoToolExecutor::for_instance(Rc::clone(&sql), instance_id);
+                    crate::do_tools::DoToolExecutor::for_instance(Rc::clone(&sql), instance_id)
+                        .with_external_tools(&ports.external_tool_bindings);
                 match ports.agent_workspace_resources.as_deref() {
                     Some(resources) => {
                         Box::new(executor.with_resources(resources)?) as Box<dyn ToolExecutor>
@@ -993,6 +1010,70 @@ fn drive_fixpoint<D: InstanceDriver>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hosted_package_context_is_registered_once_across_reattach() {
+        let source = r#"workflow Context
+
+output result Done
+
+class Done {
+  ok int
+}
+
+rule finish
+  when started
+=> {
+  complete result { ok 1 }
+}
+"#;
+        let sql = store().sql;
+        let created = DurableInstance::create(
+            sql.clone(),
+            source,
+            "{}",
+            "local/Context",
+            DurableEffectPorts::default(),
+            &[],
+            &[],
+        )
+        .expect("create");
+        let instance_id = created.instance_id.clone();
+        drop(created);
+        let program = whipplescript_parser::compile_program(source)
+            .ir
+            .expect("compiled program");
+        for _ in 0..2 {
+            let attached = DurableInstance::attach(
+                sql.clone(),
+                program.clone(),
+                &instance_id,
+                String::new(),
+                12,
+                DurableEffectPorts {
+                    agent_project_context: Some(
+                        whipplescript_kernel::context_assembly::ProjectInstruction {
+                            path: "AGENTS.md".into(),
+                            content: "Pinned instructions.".into(),
+                        },
+                    ),
+                    ..DurableEffectPorts::default()
+                },
+            )
+            .expect("attach");
+            let docs = attached
+                .kernel
+                .as_ref()
+                .unwrap()
+                .store()
+                .list_project_context_docs()
+                .unwrap();
+            assert_eq!(docs.len(), 1);
+            assert_eq!(docs[0].position, -1);
+            assert_eq!(docs[0].path, "AGENTS.md");
+            assert_eq!(docs[0].body, "Pinned instructions.");
+        }
+    }
 
     struct DeferredDriver {
         store: DoSqliteStore<crate::do_store::test_support::RusqliteDoSql>,

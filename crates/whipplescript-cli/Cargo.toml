@@ -10,16 +10,32 @@ readme.workspace = true
 keywords = ["agents", "automation", "cli", "orchestration", "workflow"]
 categories = ["command-line-utilities", "development-tools"]
 
+[package.metadata.native-tests]
+# What this crate's tests read at run time beyond the crate and what its
+# sources name by relative path, for the native test runs (GaugeWright
+# BUILD.md stage 5). A run's mount holds only declared files, so a missing
+# entry fails the test instead of caching a pass it never earned.
+data = ["Cargo.toml", "scripts"]
+
+[package.metadata.native-tests.artifacts]
+# Built files the tests read where the repository holds them: the norm
+# reactor experiments/norm-wasi/prepare.py builds into target/.
+"target/norm-cpython-observer.wasm" = "//:norm-reactor"
+
 [dependencies]
 # Native executor controller authority lives on its Docker-owned volume.
 rusqlite = { version = "0.40.1", features = ["bundled"] }
-whipplescript-core = { version = "0.5.6", path = "../whipplescript-core" }
-whipplescript-custody = { version = "0.5.6", path = "../whipplescript-custody" }
-whipplescript-kernel = { version = "0.5.6", path = "../whipplescript-kernel", default-features = false, features = ["native"] }
-whipplescript-parser = { version = "0.5.6", path = "../whipplescript-parser" }
-whipplescript-provider-claude = { version = "0.5.6", path = "../whipplescript-provider-claude", optional = true }
-whipplescript-provider-codex = { version = "0.5.6", path = "../whipplescript-provider-codex", optional = true }
-whipplescript-store = { version = "0.5.6", path = "../whipplescript-store" }
+whipplescript-core = { version = "0.6.0", path = "../whipplescript-core" }
+whipplescript-custody = { version = "0.6.0", path = "../whipplescript-custody" }
+whipplescript-kernel = { version = "0.6.0", path = "../whipplescript-kernel", default-features = false, features = ["native"] }
+whipplescript-parser = { version = "0.6.0", path = "../whipplescript-parser" }
+whipplescript-provider-claude = { version = "0.6.0", path = "../whipplescript-provider-claude", optional = true }
+whipplescript-provider-codex = { version = "0.6.0", path = "../whipplescript-provider-codex", optional = true }
+whipplescript-store = { version = "0.6.0", path = "../whipplescript-store" }
+# The build-action route `whip executor` serves to a remote-execution
+# endpoint: the confined run and its wire contract only, without the
+# endpoint's gRPC runtime.
+whipplescript-remote-execution = { version = "0.6.0", path = "../whipplescript-remote-execution", default-features = false }
 regex = "1"
 serde_json = "1"
 serde = { version = "1", features = ["derive"] }
@@ -52,6 +68,10 @@ claude = ["dep:whipplescript-provider-claude"]
 
 [dev-dependencies]
 tempfile = "3"
+# The endpoint's sidecar runner, so a test drives the executor's action
+# route from the client the endpoint actually uses.
+whipplescript-remote-execution = { version = "0.6.0", path = "../whipplescript-remote-execution" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 whipplescript-custodian = { path = "../whipplescript-custodian" }
 # The DO host, so the W4 parity harness drives both hosts' governed doors in
 # one test and diffs the receipt shapes. Path-only: the crate is unpublished
@@ -64,7 +84,7 @@ whipplescript-host-do = { path = "../whipplescript-host-do", features = ["test-s
 # build matrix: a `--no-default-features` whip test target must agree with the
 # binary about which provider kinds exist); `native` is re-enabled explicitly
 # to match the regular dependency.
-whipplescript-kernel = { version = "0.5.6", path = "../whipplescript-kernel", default-features = false, features = ["test-support", "native"] }
+whipplescript-kernel = { version = "0.6.0", path = "../whipplescript-kernel", default-features = false, features = ["test-support", "native"] }
 
 [[bin]]
 name = "whip"

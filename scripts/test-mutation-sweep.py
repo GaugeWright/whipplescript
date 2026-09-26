@@ -185,6 +185,43 @@ class CalibrationTests(unittest.TestCase):
                 with self.subTest(outcome=outcome), mock.patch.object(sweep, "run_suite", return_value=outcome), contextlib.redirect_stderr(io.StringIO()):
                     self.assertFalse(sweep.self_test(str(target), "filter", str(backup)))
 
+    def test_a_failed_run_names_the_tests_libtest_blamed(self):
+        output = (
+            "....F.F\n\nfailures:\n\n"
+            "---- turn_server::tests::a_request stdout ----\nthread panicked at x\n\n"
+            "---- exec_server::tests::b stdout ----\n\n\n"
+            "failures:\n    turn_server::tests::a_request\n    exec_server::tests::b\n\n"
+            "test result: FAILED. 5 passed; 2 failed\n"
+            "error: test failed, to rerun pass `--bin whip`\n"
+        )
+        self.assertEqual(
+            sweep.failing_tests(output),
+            ["turn_server::tests::a_request", "exec_server::tests::b"],
+        )
+        died = "Caused by:\n  process didn't exit successfully: `target/debug/deps/whip-1` (signal: 11, SIGSEGV)\n"
+        self.assertEqual(
+            sweep.failing_tests(died),
+            ["process didn't exit successfully: `target/debug/deps/whip-1` (signal: 11, SIGSEGV)"],
+        )
+        self.assertEqual(sweep.failing_tests("test result: ok. 3 passed\n"), [])
+
+    def test_a_caught_calibration_says_which_test_caught_it(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "target.rs"
+            backup = Path(directory) / "original.rs"
+            backup.write_text("// original\n")
+            def trial(_filter):
+                sweep.CAUGHT_BY[:] = ["turn_server::tests::a_request"]
+                return sweep.CAUGHT
+            stderr = io.StringIO()
+            with mock.patch.object(sweep, "run_suite", side_effect=trial), contextlib.redirect_stderr(stderr):
+                self.assertFalse(sweep.self_test(str(target), "filter", str(backup)))
+            self.assertIn("caught, by `turn_server::tests::a_request`", stderr.getvalue())
+            sweep.CAUGHT_BY.clear()
+            with mock.patch.object(sweep, "run_suite", return_value=sweep.CAUGHT), contextlib.redirect_stderr(stderr):
+                self.assertFalse(sweep.self_test(str(target), "filter", str(backup)))
+            self.assertIn("a test cargo did not name", stderr.getvalue())
+
     def test_failed_calibration_restores_the_original_source(self):
         with tempfile.TemporaryDirectory() as directory:
             target = Path(directory) / "target.rs"
@@ -207,13 +244,72 @@ class CalibrationTests(unittest.TestCase):
                 observed.append(target.read_text())
                 return sweep.PASSED
             with mock.patch.object(sweep, "run_suite", side_effect=trial), contextlib.redirect_stdout(io.StringIO()):
-                survivors, unmeasured = sweep.sweep(str(target), "filter", sweep.find_sites(original.split("\n")), str(backup))
+                survivors, unmeasured, deferred = sweep.sweep(str(target), "filter", sweep.find_sites(original.split("\n")), str(backup))
             self.assertEqual(len(survivors), 2)
             self.assertEqual(unmeasured, [])
+            self.assertEqual(deferred, [])
             self.assertEqual(len(observed), 2)
             self.assertTrue(all(value.count("errors.push") == 1 for value in observed))
             self.assertNotEqual(observed[0], observed[1])
 
+
+
+class TimeBudgetTests(unittest.TestCase):
+    """The ceiling is time. A site the deadline reaches first is named, never
+    measured, and never counted as a finding either way."""
+
+    SOURCE = 'errors.push("first");\nerrors.push("second");\nerrors.push("third");'
+
+    def run_sweep(self, deadline, clock):
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "target.rs"
+            backup = Path(directory) / "original.rs"
+            backup.write_text(self.SOURCE)
+            trials = []
+            def trial(_filter):
+                trials.append(target.read_text())
+                return sweep.PASSED
+            output = io.StringIO()
+            with mock.patch.object(sweep, "run_suite", side_effect=trial), \
+                    mock.patch.object(sweep.time, "time", side_effect=clock), \
+                    contextlib.redirect_stdout(output):
+                result = sweep.sweep(str(target), "filter", sweep.find_sites(self.SOURCE.split("\n")), str(backup), deadline)
+            return result, trials, output.getvalue()
+
+    def test_no_deadline_sweeps_every_site(self):
+        (survivors, unmeasured, deferred), trials, _ = self.run_sweep(None, lambda: 0.0)
+        self.assertEqual((len(survivors), unmeasured, deferred), (3, [], []))
+        self.assertEqual(len(trials), 3)
+
+    def test_the_deadline_is_checked_before_each_site_and_never_during_one(self):
+        # The clock reads before each site: 0 and 50 are inside a 100 s budget,
+        # 150 is past it. The second site finishes; the third never starts.
+        clock = iter([0.0, 50.0, 150.0])
+        (survivors, _, deferred), trials, output = self.run_sweep(100.0, lambda: next(clock))
+        self.assertEqual(len(trials), 2)
+        self.assertEqual(len(survivors), 2)
+        self.assertEqual([site.line for site in deferred], [3])
+        self.assertIn("NOT SWEPT (time budget)", output)
+
+    def test_a_deadline_already_past_measures_nothing_and_names_everything(self):
+        (survivors, unmeasured, deferred), trials, _ = self.run_sweep(100.0, lambda: 200.0)
+        self.assertEqual(trials, [])
+        self.assertEqual((survivors, unmeasured), ([], []))
+        self.assertEqual([site.line for site in deferred], [1, 2, 3])
+
+    def test_deferred_sites_are_written_for_the_caller_and_do_not_fail_the_run(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "target.rs"
+            target.write_text(self.SOURCE)
+            deferred_file = Path(directory) / "deferred"
+            args = ["mutation_sweep.py", "--target", str(target), "--filter", "f",
+                    "--skip-self-test", "--deadline", "1", "--deferred-file", str(deferred_file)]
+            with mock.patch("sys.argv", args), mock.patch.object(sweep, "run_suite") as trial, \
+                    contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(sweep.main(), 0)
+            trial.assert_not_called()
+            self.assertEqual(deferred_file.read_text().split(), [f"{target}:{n}" for n in (1, 2, 3)])
+            self.assertEqual(target.read_text(), self.SOURCE, "the source is restored")
 
 
 class TestScaffoldingIsNotARefusalTests(unittest.TestCase):

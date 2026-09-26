@@ -58,6 +58,11 @@ ONLY_LINES="${4:-}"
 # tells you the mutator is landing, and a sweep without one reports "nothing
 # unexercised" identically whether that is true or whether no mutation applied.
 SKIP_SELF_TEST="${WHIPPLESCRIPT_SWEEP_SELF_TESTED:-}"
+# From scripts/check-new-refusals.sh, which spends a time budget across every
+# file it sweeps: when it runs out (whole seconds since the epoch), and where
+# to name the sites the sweep reached the deadline before measuring.
+DEADLINE="${WHIPPLESCRIPT_SWEEP_DEADLINE:-}"
+DEFERRED="${WHIPPLESCRIPT_SWEEP_DEFERRED:-}"
 
 # A sweep leaves the tree mutated if it is killed mid-run, and a stale mutation
 # reads as a broken build rather than an interrupted sweep. Refuse to start on a
@@ -82,10 +87,12 @@ python3 scripts/mutation_sweep.py \
   --filter "$FILTER" \
   --limit "$LIMIT" \
   ${SKIP_SELF_TEST:+--skip-self-test} \
+  ${DEADLINE:+--deadline "$DEADLINE"} \
+  ${DEFERRED:+--deferred-file "$DEFERRED"} \
   --only-lines "$ONLY_LINES" || STATUS=$?
 
 case "$STATUS" in
-  0) echo "== no unexercised refusals in $TARGET ==" ;;
+  0) echo "== no unexercised refusals among the sites swept in $TARGET ==" ;;
   1) echo "== unexercised or unmeasured refusals found in $TARGET (listed above) ==" ;;
   *) echo "mutation sweep errored (status $STATUS)" >&2 ;;
 esac

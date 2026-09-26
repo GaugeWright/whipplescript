@@ -30,17 +30,45 @@ struct Role {
 enum Interpretation {
     Context,
     PublishedExecution,
+    /// Claims over regions (norm-plane §7): context to evidence projection,
+    /// and the reservations a gated ref's admission fences.
+    Reservation,
 }
-#[derive(serde::Serialize)]
-struct MethodGap {
-    requirement: Option<EvidenceVersion>,
-    reason: String,
+/// A requirement the host could discover no installed method for.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct MethodGap {
+    pub requirement: Option<EvidenceVersion>,
+    pub reason: String,
+}
+
+/// A plan and the exact ledger state it was computed at: the read anchor the
+/// history was captured under, and the two frontiers it projected.
+pub struct Planned {
+    pub anchor: whipplescript_store::norm_history::NormReadAnchor,
+    pub before_frontier: std::collections::BTreeSet<String>,
+    pub after_frontier: std::collections::BTreeSet<String>,
+    pub plan: crate::norm_impact::ImpactPlan,
+    pub method_gaps: BTreeMap<String, Vec<MethodGap>>,
+}
+
+impl Planned {
+    /// The query's answer, as `norm impact` has always returned it.
+    pub fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "anchor": self.anchor,
+            "before_frontier": self.before_frontier,
+            "after_frontier": self.after_frontier,
+            "plan": self.plan,
+            "method_gaps": self.method_gaps,
+        })
+    }
 }
 
 /// Validated embedding configuration, never part of a query request.
 pub struct PlanningConfiguration {
     capability: String,
     roles: BTreeMap<VocabularyRef, ProjectionRole>,
+    reservations: std::collections::BTreeSet<VocabularyRef>,
 }
 impl PlanningConfiguration {
     pub fn parse(configured: &str) -> Result<Self, String> {
@@ -50,6 +78,7 @@ impl PlanningConfiguration {
             return Err("norm planning requires a named installed capability".into());
         }
         let mut roles = BTreeMap::new();
+        let mut reservations = std::collections::BTreeSet::new();
         for role in configuration.roles {
             if [
                 &role.vocabulary.name,
@@ -64,6 +93,10 @@ impl PlanningConfiguration {
             let interpretation = match role.interpretation {
                 Interpretation::Context => ProjectionRole::Context,
                 Interpretation::PublishedExecution => ProjectionRole::PublishedExecution,
+                Interpretation::Reservation => {
+                    reservations.insert(role.vocabulary.clone());
+                    ProjectionRole::Context
+                }
             };
             if roles.insert(role.vocabulary, interpretation).is_some() {
                 return Err("norm planning vocabulary interpretations must be unique".into());
@@ -72,7 +105,13 @@ impl PlanningConfiguration {
         Ok(Self {
             capability: configuration.capability,
             roles,
+            reservations,
         })
+    }
+
+    /// The vocabularies the host interprets as reservations.
+    pub fn reservation_vocabularies(&self) -> &std::collections::BTreeSet<VocabularyRef> {
+        &self.reservations
     }
 }
 
@@ -97,6 +136,14 @@ pub fn execute<S: RuntimeStore>(
     input: ImpactQuery<'_, S>,
     verify_runtime: impl Fn(&PythonRuntime) -> Result<(), String>,
 ) -> Result<serde_json::Value, String> {
+    plan(input, verify_runtime).map(|planned| planned.to_json())
+}
+
+/// The same composition, typed, for a door that must act on its answer.
+pub fn plan<S: RuntimeStore>(
+    input: ImpactQuery<'_, S>,
+    verify_runtime: impl Fn(&PythonRuntime) -> Result<(), String>,
+) -> Result<Planned, String> {
     let ImpactQuery {
         configuration,
         history,
@@ -172,11 +219,61 @@ pub fn execute<S: RuntimeStore>(
         ImpactLimits::default(),
     )
     .map_err(|error| format!("{error:?}"))?;
-    Ok(serde_json::json!({
-        "anchor": history.anchor(),
-        "before_frontier": before.frontier,
-        "after_frontier": after.frontier,
-        "plan": plan,
-        "method_gaps": method_gaps.into_inner(),
-    }))
+    Ok(Planned {
+        anchor: history.anchor(),
+        before_frontier: before.frontier,
+        after_frontier: after.frontier,
+        plan,
+        method_gaps: method_gaps.into_inner(),
+    })
+}
+
+#[cfg(test)]
+mod configuration_tests {
+    use super::PlanningConfiguration;
+    use serde_json::json;
+
+    fn vocabulary(name: &str) -> serde_json::Value {
+        json!({"name": name, "version": "1", "digest": format!("sha256:{name}")})
+    }
+
+    /// The host's planning configuration refuses what would let a query or a
+    /// door read the ledger ambiguously, and records which vocabularies it
+    /// interprets as reservations (norm-plane §7).
+    #[test]
+    fn planning_configuration_refuses_ambiguity_and_names_its_reservations() {
+        let parse = |configured: serde_json::Value| {
+            PlanningConfiguration::parse(&configured.to_string()).map(|parsed| {
+                parsed
+                    .reservation_vocabularies()
+                    .iter()
+                    .map(|reference| reference.name.clone())
+                    .collect::<Vec<_>>()
+            })
+        };
+        assert_eq!(
+            parse(json!({"capability": " ", "roles": []})),
+            Err("norm planning requires a named installed capability".into())
+        );
+        assert_eq!(
+            parse(json!({"capability": "observer", "roles": [
+                {"vocabulary": {"name": "claim", "version": "1", "digest": " "}, "interpretation": "context"}
+            ]})),
+            Err("norm planning vocabulary identities must be complete".into())
+        );
+        assert_eq!(
+            parse(json!({"capability": "observer", "roles": [
+                {"vocabulary": vocabulary("claim"), "interpretation": "context"},
+                {"vocabulary": vocabulary("claim"), "interpretation": "reservation"}
+            ]})),
+            Err("norm planning vocabulary interpretations must be unique".into())
+        );
+        assert_eq!(
+            parse(json!({"capability": "observer", "roles": [
+                {"vocabulary": vocabulary("requirement"), "interpretation": "context"},
+                {"vocabulary": vocabulary("claim"), "interpretation": "reservation"}
+            ]})),
+            Ok(vec!["claim".to_owned()])
+        );
+    }
 }

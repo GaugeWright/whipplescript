@@ -71,12 +71,12 @@ pub fn encode_cut(
     for path in manifest.keys() {
         let bytes = read(path)?;
         let executable = path.ends_with(".sh");
-        let digest = store.put(view, &bytes, &labels_of(path));
+        let digest = store.put(view, &bytes, &labels_of(path))?;
         root.insert(path, digest, executable)?;
         files += 1;
     }
     let mut directories = 0;
-    let input_root = store_directory(store, view, &root, &labels_of, "", &mut directories);
+    let input_root = store_directory(store, view, &root, &labels_of, "", &mut directories)?;
     Ok(EncodedCut {
         encoding: INPUT_ROOT_ENCODING_V1.into(),
         cut: cut.to_owned(),
@@ -93,35 +93,34 @@ fn store_directory(
     labels_of: &impl Fn(&str) -> Labels,
     prefix: &str,
     count: &mut usize,
-) -> Digest {
+) -> Result<Digest, String> {
     let mut labels = Labels::new();
+    let files = node
+        .files
+        .iter()
+        .map(|(name, (digest, executable))| {
+            labels.extend(labels_of(&join(prefix, name)));
+            re::FileNode {
+                name: name.clone(),
+                digest: Some(digest.to_proto()),
+                is_executable: *executable,
+                node_properties: None,
+            }
+        })
+        .collect();
+    let mut directories = Vec::new();
+    for (name, child) in &node.children {
+        let child_prefix = join(prefix, name);
+        let digest = store_directory(store, view, child, labels_of, &child_prefix, count)?;
+        labels.extend(labels_of(&child_prefix));
+        directories.push(re::DirectoryNode {
+            name: name.clone(),
+            digest: Some(digest.to_proto()),
+        });
+    }
     let directory = re::Directory {
-        files: node
-            .files
-            .iter()
-            .map(|(name, (digest, executable))| {
-                labels.extend(labels_of(&join(prefix, name)));
-                re::FileNode {
-                    name: name.clone(),
-                    digest: Some(digest.to_proto()),
-                    is_executable: *executable,
-                    node_properties: None,
-                }
-            })
-            .collect(),
-        directories: node
-            .children
-            .iter()
-            .map(|(name, child)| {
-                let child_prefix = join(prefix, name);
-                let digest = store_directory(store, view, child, labels_of, &child_prefix, count);
-                labels.extend(labels_of(&child_prefix));
-                re::DirectoryNode {
-                    name: name.clone(),
-                    digest: Some(digest.to_proto()),
-                }
-            })
-            .collect(),
+        files,
+        directories,
         symlinks: Vec::new(),
         node_properties: None,
     };

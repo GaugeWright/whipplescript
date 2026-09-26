@@ -352,8 +352,25 @@ section norm-observer
 # `cargo test `. Nothing is weakened today because this run carries no filter,
 # but a future filtered nextest call would be unguarded — that lint needs
 # widening before one is written.
+#
+# Where this checkout is a cell and the host is Linux with bubblewrap — every
+# fleet gate host that answers this bar — the same tests run as native targets
+# instead (GaugeWright BUILD.md, stage 5): each test binary is its own action
+# over only the files its crate declares, so a binary whose code and data did
+# not change is served its recorded pass rather than run again. That is most
+# of every change: a documentation-only change ran 80 s of cargo here and now
+# runs none. The binaries are the same tests, compiled from the same sources in
+# the configuration nextest uses, each test in its own process as nextest runs
+# it, and a test reading a file its crate did not declare fails rather than
+# passing unobserved. Anywhere else — a Mac, a worktree outside a workspace —
+# the cargo line above runs, and asserts the same set.
 echo "== tests =="
-section tests
+if [ -n "$via_buck2" ] && [ "$(uname -s)" = Linux ] && command -v bwrap >/dev/null 2>&1; then
+    buck2 build //:native-tests -c "green_bar.run=$GREEN_BAR_RUN" \
+      -c "green_bar.prerequisites=$prerequisites"
+else
+    section tests
+fi
 
 echo "== buck2 test executor =="
 section buck2-test-executor
@@ -459,6 +476,15 @@ section diagnostic-codes
 # hand — the same day one of its copies turned out to be missing from the
 # script's own map, and therefore checked by nothing at all.
 section vendored-std
+
+# The workspace crates as native Buck2 targets (GaugeWright BUILD.md stage 5) are
+# rendered from Cargo.toml by scripts/buckify-crates.py, so Cargo.toml stays the
+# one source of truth; this fails when the rendered file has drifted from it.
+# The mirror publishes no BUCK file, so it has no native targets to drift and
+# no rendered file to compare: the guard is that file's presence.
+if [ -f native-crates.bzl ]; then
+    section native-crates
+fi
 
 # The tracker registry. `spec/TRACKERS.md` is the status ledger and this script
 # is its enforcement, but nothing invoked it — so on 2026-08-27 trunk carried a

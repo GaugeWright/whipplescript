@@ -1,0 +1,10 @@
+{
+  "module": "src.auth",
+  "function": "authorize",
+  "cases": [
+    {"id": "owner-allow", "role": "owner", "grant": "allow", "expected": true},
+    {"id": "owner-deny", "role": "owner", "grant": "deny", "expected": true},
+    {"id": "worker-allow", "role": "worker", "grant": "allow", "expected": true},
+    {"id": "worker-deny", "role": "worker", "grant": "deny", "expected": false}
+  ]
+}

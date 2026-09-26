@@ -25,6 +25,17 @@
       "authentication": "runtime-control-bearer"
     },
     {
+      "id": "runtime.public.external-call.answer",
+      "method": "POST",
+      "path": "/public/session/external-calls/:call/answer",
+      "samplePath": "/public/session/external-calls/call-canary/answer",
+      "transport": "http-json",
+      "sideEffect": "mutation",
+      "risk": "critical",
+      "producer": "whipplescript-session-durable-object",
+      "authentication": "runtime-control-bearer"
+    },
+    {
       "id": "runtime.public.erase",
       "method": "POST",
       "path": "/public/session/erase",
@@ -75,6 +86,17 @@
       "samplePath": "/host/norm/impacts",
       "transport": "http-json",
       "sideEffect": "none",
+      "risk": "critical",
+      "producer": "whipplescript-host-worker",
+      "authentication": "runtime-control-bearer"
+    },
+    {
+      "id": "runtime.host.norm.promotions",
+      "method": "POST",
+      "path": "/host/norm/promotions",
+      "samplePath": "/host/norm/promotions",
+      "transport": "http-json",
+      "sideEffect": "mutation",
       "risk": "critical",
       "producer": "whipplescript-host-worker",
       "authentication": "runtime-control-bearer"
@@ -362,6 +384,17 @@
       "transport": "http-json",
       "sideEffect": "none",
       "risk": "important",
+      "producer": "whipplescript-host-worker",
+      "authentication": "runtime-control-bearer"
+    },
+    {
+      "id": "runtime.host.live-model-context",
+      "method": "GET",
+      "path": "/host/instances/:instance/turns/:turn/model-context",
+      "samplePath": "/host/instances/instance-canary/turns/turn-canary/model-context",
+      "transport": "http-json",
+      "sideEffect": "none",
+      "risk": "critical",
       "producer": "whipplescript-host-worker",
       "authentication": "runtime-control-bearer"
     },

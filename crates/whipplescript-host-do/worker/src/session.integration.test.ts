@@ -1,5 +1,5 @@
 import { env } from "cloudflare:workers";
-import { makeBridge } from "./index";
+import { makeBridge, recordExternalToolCall } from "./index";
 import { WasmDurableInstance } from "../pkg/whipplescript_host_do_bg.js";
 import DO_SCHEMA from "../do_schema.sql";
 // workerd-production-object
@@ -2364,6 +2364,99 @@ describe("real WorkflowInstance hibernation", () => {
     socket.close(1000, "done");
     reconnected.close(1000, "done");
   });
+});
+
+// external-tool-answer-persistence
+it("persists external tool calls before receipts and restores them on reconnect", async () => {
+  const sessionId = "session-external-tool-card";
+  const namespace = (env as unknown as TestEnv).WORKFLOW_INSTANCE;
+  const stub = namespace.get(namespace.idFromName(sessionId));
+  await bootstrapSession(stub, sessionId);
+  const receipt = await runInDurableObject(stub, async (_object, state) => {
+    const session = await state.storage.get<{ instance_ref: string }>("public-session-state");
+    expect(session).toBeDefined();
+    const record = () => recordExternalToolCall(
+      state.storage, session!.instance_ref, "turn-1", "ask_choices", "call-1",
+      JSON.stringify({ questions: [{ prompt: "Which?", options: [] }] }),
+    );
+    const first = record();
+    expect(record()).toBe(first);
+    expect(() => recordExternalToolCall(
+      state.storage, session!.instance_ref, "turn-1", "ask_choices", "call-1",
+      JSON.stringify({ questions: [{ prompt: "Changed", options: [] }] }),
+    )).toThrow("replay changed");
+    expect(() => recordExternalToolCall(
+      state.storage, session!.instance_ref, "turn-1", "ask_choices", "call-invalid",
+      JSON.stringify({ questions: [] }),
+      { type: "object", required: ["questions"], properties: {
+        questions: { type: "array", minItems: 1 },
+      } },
+    )).toThrow("authored schema");
+    return first;
+  });
+  const id = (JSON.parse(receipt) as { external_call_id: string }).external_call_id;
+  await evictDurableObject(stub);
+  const response = await stub.fetch("https://session.test/public/session/state", {
+    headers: { authorization: "Bearer session-token" },
+  });
+  expect(response.status, await response.clone().text()).toBe(200);
+  const body = await response.json() as { external_calls: { id: string; name: string; answer_json: string | null }[] };
+  expect(body.external_calls).toMatchObject([{ id, name: "ask_choices", answer_json: null }]);
+  await runInDurableObject(stub, async (_object, state) => {
+    state.storage.sql.exec(
+      "UPDATE host_external_calls SET answer_json = ?1 WHERE id = ?2",
+      JSON.stringify({ answer: { selections: [{ question_id: "q1", option_ids: ["q1-o1"] }] }, text: "first answer" }),
+      id,
+    );
+  });
+  const competing = await stub.fetch(
+    `https://session.test/public/session/external-calls/${encodeURIComponent(id)}/answer`,
+    {
+      method: "POST",
+      headers: { authorization: "Bearer session-token", "content-type": "application/json" },
+      body: JSON.stringify({ answer: { selections: [{ question_id: "q1", other: "different" }] }, text: "second answer" }),
+    },
+  );
+  expect(competing.status).toBe(409);
+  const completed = await runInDurableObject(stub, async (instance, state) => {
+    const object = instance as unknown as {
+      beginPublicTurn: () => Promise<Response>;
+      fetch: (request: Request) => Promise<Response>;
+    };
+    const original = object.beginPublicTurn;
+    object.beginPublicTurn = async () => Response.json({ outcome: "terminal" });
+    const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(id));
+    const suffix = [...new Uint8Array(digest)].slice(0, 12).map((byte) => byte.toString(16).padStart(2, "0")).join("");
+    state.storage.sql.exec(
+      "INSERT INTO public_turn_binding (singleton, request_id, command_id) VALUES (1, ?1, 'turn:test')",
+      `answer:${suffix}`,
+    );
+    try {
+      const accepted = await object.fetch(new Request(
+        `https://session.test/public/session/external-calls/${encodeURIComponent(id)}/answer`,
+        {
+          method: "POST",
+          headers: { authorization: "Bearer session-token", "content-type": "application/json" },
+          body: JSON.stringify({
+            answer: { selections: [{ question_id: "q1", option_ids: ["q1-o1"] }] },
+            text: "first answer",
+          }),
+        },
+      ));
+      return {
+        status: accepted.status,
+        bindingCount: state.storage.sql.exec<{ total: number }>(
+          "SELECT count(*) AS total FROM public_turn_binding",
+        ).one().total,
+        outcome: state.storage.sql.exec<{ status: string }>(
+          "SELECT status FROM host_external_call_outcomes WHERE id = ?1", id,
+        ).one().status,
+      };
+    } finally {
+      object.beginPublicTurn = original;
+    }
+  });
+  expect(completed).toEqual({ status: 200, bindingCount: 0, outcome: "completed" });
 });
 
 

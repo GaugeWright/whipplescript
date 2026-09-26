@@ -14,7 +14,7 @@ readme.workspace = true
 dist = false
 
 [dependencies]
-whipplescript-core = { version = "0.5.6", path = "../whipplescript-core" }
+whipplescript-core = { version = "0.6.0", path = "../whipplescript-core" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"

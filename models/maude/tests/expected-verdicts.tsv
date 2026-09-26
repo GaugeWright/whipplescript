@@ -194,8 +194,9 @@ tracker-claim-turn.maude	NSNS
 tracker-lease-merge.maude	SSSNNS
 tracker-lease.maude	SSSSSNNNN
 tracker-merge.maude	SSSSSNNNS
+tracker-ordering.maude	SSSSSSNNNNSNS
 tracker-projection.maude	SSNNN
-tracker-readiness.maude	SSSNNNN
+tracker-readiness.maude	SSSNNNNSSNNNSNSNNSNSNNSNNNS
 tracker-wait-settlement.maude	SNSNSNSSNSNSS
 turn-access-grant.maude	SSNN
 turn-witness.maude	SNNSSS
@@ -228,6 +229,7 @@ resource-inventory.maude	SSNSNSNSNSSSNSNS
 norm-frontier-query.maude	SSNSNSNSNSNSNS
 norm-observer.maude	SSSNSNSNSNSSNSNS
 landing-gate.maude	SSSSSSSSSSNSNSNSNSNSNSNSNSNSNSNSNSNS
+admission-commit.maude	SSSSNSNSN
 norm-run-admission.maude	SSSSNSNSNSNSNSNSNSNSNSNSNSNS
 exec-dispatch.maude	SSSSNSNSNSNSNS
 norm-run-preparation.maude	SSSNSNSNSNSNS
@@ -289,3 +291,4 @@ manifest-completeness.maude	SSNSSNSSSNS
 correspondence-reuse.maude	SNSNSSNSS
 action-classification.maude	SNSSSSSNSSNSSNS
 store-authorization.maude	SNSNSSSNSSNNS
+ledger-query.maude	SSNNSNNSSS

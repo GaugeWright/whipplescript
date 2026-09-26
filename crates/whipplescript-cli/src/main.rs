@@ -144,6 +144,7 @@ mod harness_tools;
 mod improve;
 mod ingress_listener;
 mod injected_secrets;
+mod issue_readiness;
 mod stats_report;
 use whipplescript::instance_view;
 mod build_commands;
@@ -13227,13 +13228,14 @@ fn execute_scenario(
     };
     let mut previous_event_count = 0usize;
     for _ in 0..max_rounds {
-        step_instance(
+        step_instance_at(
             &store_path,
             &instance_id,
             ir,
             Some(Path::new(path)),
             None,
             None,
+            worker_options.virtual_now.as_deref(),
         )
         .map_err(|error| format!("step scenario: {}", store_error(error)))?;
         run_worker_once(&store_path, &worker_options)
@@ -20255,12 +20257,37 @@ fn capability_for_output_type(output_type: &str) -> String {
 fn step_instance(
     store_path: &Path,
     instance_id: &str,
+    ir: &IrProgram,
+    source_path: Option<&Path>,
+    active_version_guard: Option<&str>,
+    side_stores: Option<&SideStorePaths>,
+) -> Result<StepReport, StoreError> {
+    step_instance_at(
+        store_path,
+        instance_id,
+        ir,
+        source_path,
+        active_version_guard,
+        side_stores,
+        None,
+    )
+}
+
+/// [`step_instance`] on a virtual clock: `pass_instant` is the instant tracker
+/// readiness is decided at (DR-0126 RV-3).
+fn step_instance_at(
+    store_path: &Path,
+    instance_id: &str,
     // Named again: the managed lowering stopped needing it here, and main's
     // media-registry defaults now do.
     ir: &IrProgram,
     source_path: Option<&Path>,
     active_version_guard: Option<&str>,
     side_stores: Option<&SideStorePaths>,
+    // The instant this step is at, when the caller runs on a virtual clock
+    // (DR-0126 RV-3): tracker readiness is decided at it. `None` is the store's
+    // own clock — a real run.
+    pass_instant: Option<&str>,
 ) -> Result<StepReport, StoreError> {
     let stores = NativeStores::open(
         store_path,
@@ -20284,7 +20311,8 @@ fn step_instance(
         // other kernels this binary builds inspect, replay or report; none of
         // them can end a run, so a reaper on those would be a door onto
         // nothing.
-        .with_credential_reaper(std::sync::Arc::new(CustodianReaper));
+        .with_credential_reaper(std::sync::Arc::new(CustodianReaper))
+        .with_pass_instant(pass_instant);
     step_active_program_generic(
         &mut kernel,
         instance_id,
@@ -24853,24 +24881,35 @@ impl whipplescript_kernel::effect_handlers::CapabilityProvider for VcsSelectiveC
         // DR-0091 W2: the verb itself is the kernel's one choreography; this
         // door supplies the host seams — how `onto <stream>` finds a line
         // here, and which subjects the staleness advisory lists.
-        let outcome = whipplescript_kernel::effect_handlers::run_selective_verb_generic(
-            &mut vcs,
-            effect.target.as_deref(),
-            &input,
-            &expr,
-            &branch_id,
-            &cut_id,
-            &at,
-            &mut |onto| {
-                open_streams().ok().and_then(|streams| {
-                    whipplescript_store::workstreams::Workstreams::get_stream(&streams, onto)
-                        .ok()
-                        .flatten()
-                        .map(|stream| stream.line_branch_id)
-                })
-            },
-            &mut |vcs, line, cut| staleness_deltas(vcs, line, cut),
-        );
+        // `vcs.undo` stays on the instance's own line, which is never gated;
+        // `vcs.transport … onto mainline` passes the mainline's gate.
+        let door = if effect.target.as_deref() == Some("vcs.undo") {
+            whipplescript_kernel::norm_admission::AdmissionDoor::Undo
+        } else {
+            whipplescript_kernel::norm_admission::AdmissionDoor::Transport
+        };
+        let outcome = norm_commands::with_mainline_admission(&self.store_path, door, &[], |gate| {
+            whipplescript_kernel::effect_handlers::run_selective_verb_generic(
+                &mut vcs,
+                effect.target.as_deref(),
+                &input,
+                &expr,
+                &branch_id,
+                &cut_id,
+                &at,
+                &mut |onto| {
+                    open_streams().ok().and_then(|streams| {
+                        whipplescript_store::workstreams::Workstreams::get_stream(&streams, onto)
+                            .ok()
+                            .flatten()
+                            .map(|stream| stream.line_branch_id)
+                    })
+                },
+                &mut |vcs, line, cut| staleness_deltas(vcs, line, cut),
+                gate,
+            )
+        })
+        .and_then(|outcome| outcome);
         // Whatever the op observed — refusal facts included — deliver and
         // arm, exactly as the CLI verbs do.
         let facts = vcs.take_pending_facts();
@@ -24934,6 +24973,10 @@ impl whipplescript_kernel::effect_handlers::CapabilityProvider for VcsPromoteCap
             &reservation_id,
             &holder,
             &at,
+            &self.store_path,
+            // The effect's contract carries no reservation tokens yet, so an
+            // in-language promotion of a reserved change is refused.
+            &[],
         );
         // Fact routing is this host's surface (A5): the mediator delivers
         // vcs.* facts natively; the DO deliberately routes none.
@@ -27394,13 +27437,14 @@ fn run_workflow_invoke_effect(
     }
 
     for _ in 0..options.max_child_iterations {
-        let step_report = step_instance(
+        let step_report = step_instance_at(
             store_path,
             &child_instance_id,
             &child_ir,
             Some(program_path),
             None,
             options.side_stores.as_ref(),
+            options.virtual_now.as_deref(),
         )?;
         let child_worker = WorkerOptions {
             instance_id: child_instance_id.clone(),
@@ -27980,13 +28024,14 @@ fn drive_subworkflow_tool(
     let child_instance_id = started.instance_id;
     let iterations = max_child_iterations.max(1);
     for _ in 0..iterations {
-        let step_report = step_instance(
+        let step_report = step_instance_at(
             store_path,
             &child_instance_id,
             &child_ir,
             Some(program_path),
             None,
             provider_ctx.side_stores.as_ref(),
+            provider_ctx.virtual_now.as_deref(),
         )?;
         let child_worker = WorkerOptions {
             instance_id: child_instance_id.clone(),
@@ -33691,15 +33736,19 @@ new --tracker TR --title T [--body B] [--label L]... [--actor A]|\
 list [--tracker TR] [--status S]|\
 show <id>|\
 ready <tracker> [--limit N]|\
-claim <id> [--actor A] [--ttl D]|\
+claim <id> [--actor A] [--ttl D] [--override REASON]|why <id>|\
 renew <id> [--actor A] [--ttl D]|\
 release <id>|\
 assign <id> [--to A|--clear]|\
 finish <id> [--summary S]|complete <id> [--summary S]|\
+cancel <id> [--reason R]|reopen <id> [--note N]|\
 fail <id> [--actor A]|\
 set <id> <field> <value> [--expect-state-token T]|\
 conflicts <id>|conflicts --tracker TR|\
-dep add <blocked> [depends-on] <blocker> [--kind K]|\
+dep add <blocked> [depends-on] <blocker> [--kind K] [--actor A]|\
+defer <id> (--until WHEN|--after ISSUE|--reached RECORD:STATUS|--demand LABEL:N) [--review WHEN] [--actor A]|\
+undefer <id> <wait>|undefer <id> --all|waits <id>|review [--tracker TR] [--assignee A]|\
+order <a> before <b> [--actor A]|rank <parent> <child> <child>... [--actor A]|\
 link <from> <kind> <to>|unlink <from> <kind> <to>|\
 note <id> <text>|comments <id>|\
 evidence <id> [--kind K --ref R --note N]|\
@@ -34409,7 +34458,7 @@ fn assert_command(options: &CliOptions) -> ExitCode {
 
 fn issue(options: &CliOptions) -> ExitCode {
     use whipplescript_store::items::{
-        ClaimOutcome, FinishOutcome, ReleaseOutcome, RenewOutcome, SetFieldOutcome, WorkItemStore,
+        FinishOutcome, ReleaseOutcome, RenewOutcome, ReopenOutcome, SetFieldOutcome, WorkItemStore,
     };
     let usage = ISSUE_USAGE;
     let args = &options.args;
@@ -34418,6 +34467,9 @@ fn issue(options: &CliOptions) -> ExitCode {
         Ok(store) => store,
         Err(error) => return report_store_error("failed to open items store", error),
     };
+    if let Some(code) = issue_readiness::verbs(&mut store, options, command, usage) {
+        return code;
+    }
     match command {
         "new" | "add" => {
             let mut queue = None;
@@ -34557,6 +34609,13 @@ fn issue(options: &CliOptions) -> ExitCode {
                                 map.insert("verification".to_owned(), verification);
                             }
                         }
+                        // DR-0126: the one readiness, with its reasons and waits.
+                        if let (Some(map), Some(readiness)) = (
+                            value.as_object_mut(),
+                            issue_readiness::readiness_json(&store, id),
+                        ) {
+                            map.insert("readiness".to_owned(), readiness);
+                        }
                         emit_json(value)
                     } else {
                         println!("{} [{}] tracker={}", item.id, item.status, item.queue);
@@ -34573,6 +34632,7 @@ fn issue(options: &CliOptions) -> ExitCode {
                         if let Some(filed) = &item.filed_by {
                             println!("filed by: {filed}");
                         }
+                        issue_readiness::print_readiness(&store, id);
                         if let Some(view) = &conflicts {
                             if view.conflicted() {
                                 println!("CONFLICTED (not ready):");
@@ -34656,28 +34716,7 @@ fn issue(options: &CliOptions) -> ExitCode {
             }
             ExitCode::SUCCESS
         }
-        "claim" => {
-            let Some(id) = args.get(1) else {
-                eprintln!("{usage}");
-                return ExitCode::from(2);
-            };
-            let actor = issue_actor(flag_value(args, "--actor"));
-            // `--ttl <duration>` records a timed claim (`expires_at = now + ttl`);
-            // omitting it is the untimed backstop lease.
-            let expires = issue_ttl_expires(args);
-            match store.claim_item(id, &actor, expires.as_deref()) {
-                Ok(ClaimOutcome::Claimed) => emit_issue_row(&store, id, "claimed", options.json),
-                Ok(ClaimOutcome::AlreadyClaimed { holder }) => {
-                    eprintln!("issue `{id}` is already claimed by {holder}");
-                    ExitCode::FAILURE
-                }
-                Ok(ClaimOutcome::NotFound) => {
-                    eprintln!("issue `{id}` was not found");
-                    ExitCode::FAILURE
-                }
-                Err(error) => report_store_error("failed to claim issue", error),
-            }
-        }
+        "claim" => issue_readiness::claim(&mut store, options, usage),
         "renew" => {
             let Some(id) = args.get(1) else {
                 eprintln!("{usage}");
@@ -34776,6 +34815,48 @@ fn issue(options: &CliOptions) -> ExitCode {
                 Err(error) => report_store_error("failed to finish issue", error),
             }
         }
+        "cancel" => {
+            // `cancel <id> [--reason R]`: withdraw an open issue nobody will do,
+            // releasing any claim on it. Not a closure — nothing waiting on the
+            // issue closing is woken by it.
+            let Some(id) = args.get(1) else {
+                eprintln!("{usage}");
+                return ExitCode::from(2);
+            };
+            let reason = flag_value(args, "--reason");
+            match store.cancel_item(id, reason.as_deref(), None) {
+                Ok(FinishOutcome::Finished) => emit_issue_row(&store, id, "canceled", options.json),
+                Ok(FinishOutcome::NotOpen) => {
+                    eprintln!("issue `{id}` is not open (cannot cancel)");
+                    ExitCode::FAILURE
+                }
+                Ok(FinishOutcome::HeldByOther { holder }) => {
+                    eprintln!("issue `{id}` is held by {holder}");
+                    ExitCode::FAILURE
+                }
+                Err(error) => report_store_error("failed to cancel issue", error),
+            }
+        }
+        "reopen" => {
+            // `reopen <id> [--note N]`: return a closed or canceled issue to open.
+            let Some(id) = args.get(1) else {
+                eprintln!("{usage}");
+                return ExitCode::from(2);
+            };
+            let note = flag_value(args, "--note");
+            match store.reopen_item(id, note.as_deref()) {
+                Ok(ReopenOutcome::Reopened) => emit_issue_row(&store, id, "reopened", options.json),
+                Ok(ReopenOutcome::NotFound) => {
+                    eprintln!("issue `{id}` was not found");
+                    ExitCode::FAILURE
+                }
+                Ok(ReopenOutcome::NotReopenable { status }) => {
+                    eprintln!("issue `{id}` is {status} (only closed or canceled issues reopen)");
+                    ExitCode::FAILURE
+                }
+                Err(error) => report_store_error("failed to reopen issue", error),
+            }
+        }
         "fail" => {
             // v1 `fail` releases the actor's lease so the issue re-projects as
             // ready (the ADR `fail --release` behavior). A durable failure
@@ -34807,12 +34888,13 @@ fn issue(options: &CliOptions) -> ExitCode {
                 return ExitCode::from(2);
             }
             let dep_kind = flag_value(args, "--kind");
+            let actor = issue_actor(flag_value(args, "--actor"));
             let mut positional = Vec::new();
             let mut iter = args.iter().skip(2);
             while let Some(token) = iter.next() {
                 match token.as_str() {
                     "depends-on" => {}
-                    "--kind" => {
+                    "--kind" | "--actor" => {
                         iter.next(); // its value is consumed by flag_value above
                     }
                     _ => positional.push(token),
@@ -34822,8 +34904,21 @@ fn issue(options: &CliOptions) -> ExitCode {
                 eprintln!("{usage}");
                 return ExitCode::from(2);
             };
-            match store.add_relation(blocker, blocked, "blocks", dep_kind.as_deref()) {
-                Ok(()) => emit_issue_row(&store, blocked, "gated by dependency", options.json),
+            // DR-0126: `order` and `soft` are ordering statements, not gates.
+            let note =
+                if whipplescript_store::items::readiness::dependency_gates(dep_kind.as_deref()) {
+                    "gated by dependency".to_owned()
+                } else {
+                    format!("ordered after {blocker}")
+                };
+            match store.add_relation_by(
+                blocker,
+                blocked,
+                "blocks",
+                dep_kind.as_deref(),
+                Some(&actor),
+            ) {
+                Ok(()) => emit_issue_row(&store, blocked, &note, options.json),
                 Err(error) => report_store_error("failed to add dependency", error),
             }
         }
@@ -34833,7 +34928,8 @@ fn issue(options: &CliOptions) -> ExitCode {
                 eprintln!("{usage}");
                 return ExitCode::from(2);
             };
-            match store.add_relation(from, to, kind, None) {
+            let actor = issue_actor(flag_value(args, "--actor"));
+            match store.add_relation_by(from, to, kind, None, Some(&actor)) {
                 Ok(()) => emit_issue_row(&store, from, &format!("{kind} -> {to}"), options.json),
                 Err(error) => report_store_error("failed to link relation", error),
             }
@@ -34875,6 +34971,18 @@ fn issue(options: &CliOptions) -> ExitCode {
                 eprintln!("{usage}");
                 return ExitCode::from(2);
             };
+            // The status domain is finite (DR-0093): a workflow that writes
+            // `"cancelled"` is a compile error, so the CLI refuses it too rather
+            // than storing a status no reader recognises.
+            if field.as_str() == "status"
+                && !matches!(value.as_str(), "open" | "closed" | "canceled" | "archived")
+            {
+                eprintln!(
+                    "`{value}` is not a status (open, closed, canceled, archived); \
+                     `cancel` and `reopen` also release or restore readiness"
+                );
+                return ExitCode::from(2);
+            }
             if let Some(expected) = flag_value(args, "--expect-state-token") {
                 match store.set_field_checked(id, field, value, &expected) {
                     Ok(SetFieldOutcome::Applied { state_token }) => {
@@ -34924,10 +35032,21 @@ fn issue(options: &CliOptions) -> ExitCode {
                     Ok(items) => items,
                     Err(error) => return report_store_error("failed to list issues", error),
                 };
+                // DR-0126: contradictory ordering statements are a conflict too,
+                // surfaced here though they gate nothing.
+                let ordering = match store.ordering_conflicts() {
+                    Ok(conflicted) => conflicted,
+                    Err(error) => return report_store_error("failed to read ordering", error),
+                };
                 let mut rows = Vec::new();
                 for item in listed {
                     match store.issue_conflicts(&item.id) {
-                        Ok(Some(view)) if view.conflicted() => rows.push((item, view)),
+                        Ok(Some(view))
+                            if view.conflicted() || ordering.contains(item.id.as_str()) =>
+                        {
+                            let ordered = ordering.contains(item.id.as_str());
+                            rows.push((item, view, ordered));
+                        }
                         Ok(_) => {}
                         Err(error) => return report_store_error("failed to read conflicts", error),
                     }
@@ -34935,17 +35054,26 @@ fn issue(options: &CliOptions) -> ExitCode {
                 if options.json {
                     return emit_json(Value::Array(
                         rows.iter()
-                            .map(|(item, view)| issue_conflicts_to_json(&item.id, view))
+                            .map(|(item, view, ordered)| {
+                                let mut row = issue_conflicts_to_json(&item.id, view);
+                                if let Some(map) = row.as_object_mut() {
+                                    map.insert("ordering_conflict".to_owned(), json!(ordered));
+                                }
+                                row
+                            })
                             .collect(),
                     ));
                 }
                 if rows.is_empty() {
                     println!("no conflicted issues in {queue}");
                 }
-                for (item, view) in rows {
+                for (item, view, ordered) in rows {
                     println!("{} {}", item.id, item.title);
                     for fc in &view.field_conflicts {
                         println!("  {} in dispute: {}", fc.field, fc.values.join(" | "));
+                    }
+                    if ordered {
+                        println!("  ordering statements contradict each other");
                     }
                 }
                 ExitCode::SUCCESS
@@ -38211,7 +38339,7 @@ const STREAM_USAGE: &str =
   whip stream join <stream> <branch>\n\
   whip stream leave <branch>\n\
   whip stream archive <stream>\n\
-  whip stream promote <stream>\n\
+  whip stream promote <stream> [--token <reservation-token>]...\n\
   whip stream list\n\
   whip stream show <stream>";
 
@@ -38302,6 +38430,49 @@ impl whipplescript_kernel::effect_handlers::PromotionSerialization for AdoptionL
 /// DR-0078's promotion coordinator, now a dispatch onto the kernel's one
 /// choreography (DR-0091 W1): this wrapper mints the identity-bearing
 /// coordinates the way native always has and supplies the adoption lease.
+/// The mainline's norm-plane gate (norm-plane §5) is the host's: the native
+/// ledger and the evaluation inputs `norm impact` uses, over `runtime_path`.
+/// Run a door that may move a gated ref under this host's mainline gate
+/// (norm-plane §5). A ledger this host cannot open is a refusal to move.
+fn through_mainline_gate<T>(
+    runtime_path: &Path,
+    door: whipplescript_kernel::norm_admission::AdmissionDoor,
+    f: impl FnOnce(
+        &mut dyn whipplescript_store::vcs::MainlineGate,
+    ) -> whipplescript_store::StoreResult<T>,
+) -> whipplescript_store::StoreResult<T> {
+    norm_commands::with_mainline_admission(runtime_path, door, &[], f)
+        .map_err(whipplescript_store::StoreError::Conflict)?
+}
+
+/// A gated ref's refusal as every operator door prints it: the structured
+/// refusal on stdout, which a caller reads, and the reason on stderr.
+fn gate_refused_exit(
+    door: &str,
+    subject: &str,
+    refusal: &whipplescript_store::vcs::GateRefusal,
+) -> ExitCode {
+    println!(
+        "{}",
+        json!({
+            "refused": subject,
+            "door": door,
+            "target": whipplescript_store::branches::MAINLINE_BRANCH_ID,
+            "reason": refusal.reason,
+            "detail": refusal.detail,
+        })
+    );
+    eprintln!("{door} refused: {}", refusal.reason);
+    ExitCode::FAILURE
+}
+
+/// A gated ref's stale admission: nothing moved, and a retry prepares again.
+fn gate_stale_exit(door: &str, changed: &str) -> ExitCode {
+    eprintln!("{door} refused: {changed}; nothing moved, and a retry prepares again");
+    ExitCode::FAILURE
+}
+
+#[allow(clippy::too_many_arguments)]
 fn run_reserved_boundary_promotion(
     streams: &mut whipplescript_store::workstreams::WorkstreamStore,
     vcs: &mut whipplescript_store::vcs::NativeWorkspaceVcs,
@@ -38309,21 +38480,31 @@ fn run_reserved_boundary_promotion(
     reservation_seed: &str,
     holder: &str,
     at: &str,
+    runtime_path: &Path,
+    tokens: &[String],
 ) -> Result<BoundaryRunOutcome, String> {
     let proposed_main = format!("{}-promote", generated_cut_id());
     let mut serialization = AdoptionLeaseSerialization::new(holder);
-    whipplescript_kernel::effect_handlers::run_reserved_boundary_promotion_generic(
-        streams,
-        vcs,
-        &whipplescript_kernel::effect_handlers::PromoteDoorRequest {
-            stream_id,
-            reservation_id: reservation_seed,
-            proposed_main: &proposed_main,
-            at,
-            receipt_scope: "native-workspace",
+    norm_commands::with_mainline_admission(
+        runtime_path,
+        whipplescript_kernel::norm_admission::AdmissionDoor::Promote,
+        tokens,
+        |gate| {
+            whipplescript_kernel::effect_handlers::run_reserved_boundary_promotion_generic(
+                streams,
+                vcs,
+                &whipplescript_kernel::effect_handlers::PromoteDoorRequest {
+                    stream_id,
+                    reservation_id: reservation_seed,
+                    proposed_main: &proposed_main,
+                    at,
+                    receipt_scope: "native-workspace",
+                },
+                &mut serialization,
+                gate,
+            )
         },
-        &mut serialization,
-    )
+    )?
 }
 
 /// `whip stream …` — the workstream tier: named shared lines +
@@ -38482,6 +38663,13 @@ fn stream_command(options: &CliOptions) -> ExitCode {
                 eprintln!("{STREAM_USAGE}");
                 return ExitCode::from(2);
             };
+            // The requester's reservation tokens (norm-plane §7): a change to
+            // a reserved region is admitted only under its current token.
+            let tokens: Vec<String> = rest
+                .windows(2)
+                .filter(|pair| pair[0] == "--token")
+                .map(|pair| pair[1].to_owned())
+                .collect();
             let mut vcs = match open_vcs() {
                 Ok(vcs) => vcs,
                 Err(code) => return code,
@@ -38495,6 +38683,8 @@ fn stream_command(options: &CliOptions) -> ExitCode {
                 &reservation_id,
                 &holder,
                 &at,
+                &options.store_path,
+                &tokens,
             ) {
                 Ok(BoundaryRunOutcome::Promoted {
                     receipt,
@@ -38541,6 +38731,21 @@ fn stream_command(options: &CliOptions) -> ExitCode {
                         "conflicts": conflicts.iter().map(conflict_json).collect::<Vec<_>>(),
                     });
                     eprintln!("promotion conflicted: {payload}");
+                    ExitCode::FAILURE
+                }
+                Ok(BoundaryRunOutcome::GateRefused(refusal)) => {
+                    // The structured refusal is the answer: a caller reads the
+                    // requirements it names, never this sentence.
+                    println!(
+                        "{}",
+                        json!({
+                            "refused": stream_id,
+                            "target": "main",
+                            "reason": refusal.reason,
+                            "detail": refusal.detail,
+                        })
+                    );
+                    eprintln!("promotion refused: {}", refusal.reason);
                     ExitCode::FAILURE
                 }
                 Ok(BoundaryRunOutcome::Refused(message)) | Err(message) => {
@@ -39525,7 +39730,11 @@ fn repair_command(options: &CliOptions) -> ExitCode {
             // apply: intent-stamped, slice-bounded, refusals stand.
             vcs.set_intent(Some(row.incident_id.clone()));
             let cut_id = generated_cut_id();
-            let outcome = vcs.apply_undo_selection(&row.branch_id, &expr, &cut_id, &at);
+            let outcome = through_mainline_gate(
+                &options.store_path,
+                whipplescript_kernel::norm_admission::AdmissionDoor::Undo,
+                |gate| vcs.apply_undo_selection(&row.branch_id, &expr, &cut_id, &at, gate),
+            );
             let facts = vcs.take_pending_facts();
             arm_incidents_from_facts(&facts, &at);
             route_workspace_facts(&vcs, facts, &options.store_path);
@@ -39551,6 +39760,12 @@ fn repair_command(options: &CliOptions) -> ExitCode {
                         stranded.len()
                     );
                     ExitCode::FAILURE
+                }
+                Ok(whipplescript_store::vcs::UndoSelectionOutcome::GateRefused(refusal)) => {
+                    gate_refused_exit("repair", &row.incident_id, &refusal)
+                }
+                Ok(whipplescript_store::vcs::UndoSelectionOutcome::GateStale { changed }) => {
+                    gate_stale_exit("repair", &changed)
                 }
                 Ok(other) => {
                     eprintln!("repair refused: {other:?}; the incident stays open");
@@ -39954,7 +40169,11 @@ fn branch_command(options: &CliOptions) -> ExitCode {
                 }
             }
             let merge_cut_id = generated_cut_id();
-            let outcome = vcs.merge(branch_id, &merge_cut_id, &at);
+            let outcome = through_mainline_gate(
+                &options.store_path,
+                whipplescript_kernel::norm_admission::AdmissionDoor::Merge,
+                |gate| vcs.merge(branch_id, &merge_cut_id, &at, gate),
+            );
             if let Some((mut coordination, lease_key)) = adoption_lease {
                 let _ = coordination.release("adoption", &lease_key, &holder);
             }
@@ -39989,6 +40208,10 @@ fn branch_command(options: &CliOptions) -> ExitCode {
                     }
                     ExitCode::FAILURE
                 }
+                Ok(VcsMergeOutcome::GateRefused(refusal)) => {
+                    gate_refused_exit("merge", branch_id, &refusal)
+                }
+                Ok(VcsMergeOutcome::GateStale { changed }) => gate_stale_exit("merge", &changed),
                 Ok(other) => {
                     eprintln!("merge refused: {other:?}");
                     ExitCode::FAILURE
@@ -40631,7 +40854,11 @@ fn branch_command(options: &CliOptions) -> ExitCode {
             };
             use whipplescript_store::vcs::RestoreOutcome;
             let new_cut_id = generated_cut_id();
-            match vcs.restore(branch_id, to_cut, &new_cut_id, &at) {
+            match through_mainline_gate(
+                &options.store_path,
+                whipplescript_kernel::norm_admission::AdmissionDoor::Restore,
+                |gate| vcs.restore(branch_id, to_cut, &new_cut_id, &at, gate),
+            ) {
                 Ok(RestoreOutcome::Restored {
                     cut_id,
                     manifest_hash,
@@ -40646,6 +40873,10 @@ fn branch_command(options: &CliOptions) -> ExitCode {
                     "to_cut_id": to_cut,
                     "already_there": true,
                 })),
+                Ok(RestoreOutcome::GateRefused(refusal)) => {
+                    gate_refused_exit("restore", branch_id, &refusal)
+                }
+                Ok(RestoreOutcome::GateStale { changed }) => gate_stale_exit("restore", &changed),
                 Ok(other) => {
                     eprintln!("restore refused: {other:?}");
                     ExitCode::FAILURE
@@ -41039,7 +41270,11 @@ fn branch_command(options: &CliOptions) -> ExitCode {
                     }
                     use whipplescript_store::vcs::UndoSelectionOutcome;
                     let cut_id = generated_cut_id();
-                    match vcs.apply_undo_selection(branch_id, &expr, &cut_id, &at) {
+                    match through_mainline_gate(
+                        &options.store_path,
+                        whipplescript_kernel::norm_admission::AdmissionDoor::Undo,
+                        |gate| vcs.apply_undo_selection(branch_id, &expr, &cut_id, &at, gate),
+                    ) {
                         Ok(UndoSelectionOutcome::Proposed {
                             cut_id,
                             manifest_hash,
@@ -41056,6 +41291,12 @@ fn branch_command(options: &CliOptions) -> ExitCode {
                                 "undo refused: the exclusion strands retained work: {payload}"
                             );
                             ExitCode::FAILURE
+                        }
+                        Ok(UndoSelectionOutcome::GateRefused(refusal)) => {
+                            gate_refused_exit("undo", branch_id, &refusal)
+                        }
+                        Ok(UndoSelectionOutcome::GateStale { changed }) => {
+                            gate_stale_exit("undo", &changed)
                         }
                         Ok(other) => {
                             eprintln!("undo refused: {other:?}");
@@ -41106,15 +41347,26 @@ fn branch_command(options: &CliOptions) -> ExitCode {
                     }
                     let cut_id = generated_cut_id();
                     let outcome = if transport_like == "transport" {
-                        vcs.transport_selection(
-                            branch_id,
-                            &expr,
-                            onto.expect("checked above"),
-                            &cut_id,
-                            &at,
+                        through_mainline_gate(
+                            &options.store_path,
+                            whipplescript_kernel::norm_admission::AdmissionDoor::Transport,
+                            |gate| {
+                                vcs.transport_selection(
+                                    branch_id,
+                                    &expr,
+                                    onto.expect("checked above"),
+                                    &cut_id,
+                                    &at,
+                                    gate,
+                                )
+                            },
                         )
                     } else {
-                        vcs.adopt_only(branch_id, &expr, &cut_id, &at)
+                        through_mainline_gate(
+                            &options.store_path,
+                            whipplescript_kernel::norm_admission::AdmissionDoor::Adopt,
+                            |gate| vcs.adopt_only(branch_id, &expr, &cut_id, &at, gate),
+                        )
                     };
                     match outcome {
                         Ok(TransportOutcome::Transported {
@@ -41139,6 +41391,12 @@ fn branch_command(options: &CliOptions) -> ExitCode {
                             });
                             eprintln!("{transport_like} conflicted: {payload}");
                             ExitCode::FAILURE
+                        }
+                        Ok(TransportOutcome::GateRefused(refusal)) => {
+                            gate_refused_exit(transport_like, branch_id, &refusal)
+                        }
+                        Ok(TransportOutcome::GateStale { changed }) => {
+                            gate_stale_exit(transport_like, &changed)
                         }
                         Ok(other) => {
                             eprintln!("{transport_like} refused: {other:?}");
@@ -41235,7 +41493,11 @@ fn branch_command(options: &CliOptions) -> ExitCode {
             };
             use whipplescript_store::vcs::UndoOpOutcome;
             let undo_op_id = format!("op-undo-{}", generated_cut_id());
-            match vcs.undo_op(&op_id, &undo_op_id, &at) {
+            match through_mainline_gate(
+                &options.store_path,
+                whipplescript_kernel::norm_admission::AdmissionDoor::Undo,
+                |gate| vcs.undo_op(&op_id, &undo_op_id, &at, gate),
+            ) {
                 Ok(UndoOpOutcome::Undone { undo_op_id }) => emit_json(json!({
                     "undone": op_id,
                     "undo_op_id": undo_op_id,
@@ -41260,6 +41522,10 @@ fn branch_command(options: &CliOptions) -> ExitCode {
                     eprintln!("op `{op_id}` moved no branch pointers; nothing to undo");
                     ExitCode::FAILURE
                 }
+                Ok(UndoOpOutcome::GateRefused(refusal)) => {
+                    gate_refused_exit("undo-op", &op_id, &refusal)
+                }
+                Ok(UndoOpOutcome::GateStale { changed }) => gate_stale_exit("undo-op", &changed),
                 Err(error) => {
                     eprintln!("branch undo-op failed: {error:?}");
                     ExitCode::FAILURE

@@ -1897,14 +1897,19 @@ pub fn project_tracker_issues<S: RuntimeStore + WorkItems>(
         // dispatching rule's multi-stage chain needs its trigger fact until
         // the item is finished or released. Re-fires are idempotent (effect
         // ids are identity-derived), matching the engine's existing idiom.
-        let ready = WorkItems::list_items(kernel.store(), Some(&queue.name), None)?
-            .into_iter()
-            .filter(|item| {
-                (item.status == "open" && item.claimed_by.is_none())
-                    || (item.status == "in_progress"
-                        && item.claimed_by.as_deref() == Some(instance_id))
-            })
-            .collect::<Vec<_>>();
+        // Readiness is the provider's one definition (DR-0126), decided at the
+        // instant the host is stepping at: blocked, conflicted and deferred
+        // issues are not projected ready. What this instance itself holds stays
+        // projected, as before.
+        let mut ready = match kernel.pass_instant() {
+            Some(at) => WorkItems::ready_items_at(kernel.store(), &queue.name, at)?,
+            None => WorkItems::ready_items(kernel.store(), &queue.name)?,
+        };
+        ready.extend(
+            WorkItems::list_items(kernel.store(), Some(&queue.name), Some("in_progress"))?
+                .into_iter()
+                .filter(|item| item.claimed_by.as_deref() == Some(instance_id)),
+        );
         let existing = kernel
             .store()
             .list_facts(instance_id)?

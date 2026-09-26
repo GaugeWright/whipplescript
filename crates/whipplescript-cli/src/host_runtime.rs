@@ -14,6 +14,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use whipplescript_kernel::coerce_native::CoerceProvider;
+use whipplescript_kernel::context_assembly::SkillCatalogueEntry;
 pub use whipplescript_kernel::harness_loop::ToolCall;
 use whipplescript_kernel::harness_loop::{
     BrokeredTurnInput, ChatMessage, MediaInput, NoopCompactor, ToolExecutor, ToolOutcome, ToolSpec,
@@ -2062,6 +2063,26 @@ impl GovernedHostRuntime {
         S: SecretResolver + ?Sized,
         R: ResourceResolver + ?Sized,
     {
+        self.run_turn_observing_model_requests(command, packages, secrets, resources, &|_| {})
+    }
+
+    /// Drive a native turn while observing each provider-bound request body.
+    /// The observer runs immediately before transport and is never written to
+    /// the governed event stream. Callers must keep its capture ephemeral and
+    /// authorize any reader separately.
+    pub fn run_turn_observing_model_requests<P, S, R>(
+        &mut self,
+        command: &StartTurnCommand,
+        packages: &P,
+        secrets: &S,
+        resources: &R,
+        observe_request: &dyn Fn(&Value),
+    ) -> Result<TurnExecution, HostRuntimeError>
+    where
+        P: PackageResolver + ?Sized,
+        S: SecretResolver + ?Sized,
+        R: ResourceResolver + ?Sized,
+    {
         self.admit_command(command, packages)?;
         let binding = self.resolve_provider(command, secrets)?;
         let sink = |delta: &str| resources.observe_text_delta(delta);
@@ -2078,7 +2099,8 @@ impl GovernedHostRuntime {
         let released = || probe.released();
         let driver = NativeHttpDriver::new(binding.timeout)
             .with_delta_sink(&sink)
-            .with_cancel_probe(&observed);
+            .with_cancel_probe(&observed)
+            .with_request_observer(observe_request);
         self.run_admitted_turn(
             command,
             packages,
@@ -2338,8 +2360,21 @@ impl GovernedHostRuntime {
         };
         let world = hosted_model_visible_world(command, &package, resources)
             .map_err(HostRuntimeError::Resolver)?;
+        let skills = self
+            .kernel
+            .store()
+            .list_skills()
+            .map_err(HostRuntimeError::Store)?
+            .into_iter()
+            .map(|skill| SkillCatalogueEntry {
+                name: skill.name,
+                description: skill.description,
+                location: skill.source_path,
+            })
+            .collect::<Vec<_>>();
+        let context = package.context_for_model_with_skills(&skills);
         let input = BrokeredTurnInput {
-            system: package.system_prompt,
+            system: context.system_prompt,
             user: command.input.text.clone(),
             tools: package.tools.clone(),
             max_steps: package.max_steps,
@@ -2351,7 +2386,7 @@ impl GovernedHostRuntime {
             result_tool: None,
             user_media: media,
             world: Some(world),
-            context_bundles: Vec::new(),
+            context_bundles: context.contributions,
             pinned_skills: Vec::new(),
         };
         self.kernel
@@ -3228,6 +3263,7 @@ struct NativeHttpDriver<'a> {
     /// cancelled through its paired release probe. `None` reads to the end
     /// exactly as before.
     cancel_probe: Option<&'a dyn Fn() -> bool>,
+    request_observer: Option<&'a dyn Fn(&Value)>,
 }
 
 impl<'a> NativeHttpDriver<'a> {
@@ -3244,6 +3280,7 @@ impl<'a> NativeHttpDriver<'a> {
                 .build(),
             delta_sink: None,
             cancel_probe: None,
+            request_observer: None,
         }
     }
 
@@ -3254,6 +3291,11 @@ impl<'a> NativeHttpDriver<'a> {
 
     fn with_cancel_probe(mut self, probe: &'a dyn Fn() -> bool) -> Self {
         self.cancel_probe = Some(probe);
+        self
+    }
+
+    fn with_request_observer(mut self, observer: &'a dyn Fn(&Value)) -> Self {
+        self.request_observer = Some(observer);
         self
     }
 
@@ -3328,6 +3370,9 @@ fn sse_output_text_delta(line: &str) -> Option<String> {
 impl HostDriver for NativeHttpDriver<'_> {
     fn fulfill(&self, request: &IoRequest) -> IoResult {
         let IoRequest::Http(request) = request;
+        if let Some(observer) = self.request_observer {
+            observer(&request.body);
+        }
         let mut builder = self.agent.post(&request.url);
         for (name, value) in &request.headers {
             builder = builder.set(name, value);
@@ -5804,11 +5849,15 @@ workflow Method {
         });
         let seen: RefCell<Vec<String>> = RefCell::new(Vec::new());
         let sink = |delta: &str| seen.borrow_mut().push(delta.to_owned());
-        let driver = NativeHttpDriver::new(Duration::from_secs(10)).with_delta_sink(&sink);
+        let observed_body = RefCell::new(Vec::new());
+        let observe = |body: &Value| observed_body.borrow_mut().push(body.clone());
+        let driver = NativeHttpDriver::new(Duration::from_secs(10))
+            .with_delta_sink(&sink)
+            .with_request_observer(&observe);
         let request = IoRequest::Http(HttpRequest {
             url: format!("http://{addr}/v1/responses"),
             headers: vec![("accept".to_owned(), "text/event-stream".to_owned())],
-            body: json!({}),
+            body: json!({"input": "private model input"}),
         });
         let IoResult::Http(result) = driver.fulfill(&request);
         server.join().expect("server thread");
@@ -5821,6 +5870,10 @@ workflow Method {
         );
         assert_eq!(response.body, assemble_responses_sse(raw));
         assert_eq!(response.body["output_text"], "GaugeWright is live.");
+        assert_eq!(
+            observed_body.borrow().as_slice(),
+            &[json!({"input": "private model input"})]
+        );
     }
 
     #[test]

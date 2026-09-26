@@ -158,6 +158,13 @@ pub enum VcsMergeOutcome {
     BranchNotActive,
     /// Mainline has no parent to merge into.
     NoParent,
+    /// The mainline's gate refused the proposed result; nothing moved.
+    GateRefused(GateRefusal),
+    /// A premise the gate certified changed before the ref could move;
+    /// nothing moved, and a retry prepares again.
+    GateStale {
+        changed: String,
+    },
 }
 
 /// Verdict of a source-aware merge attempt on one conflicted path.
@@ -294,6 +301,73 @@ pub enum BoundaryPromotionOutcome {
     StreamLineNotActive,
     MainMissing,
     MainNotActive,
+    /// The mainline's gate refused the proposed result; the ref did not move.
+    GateRefused(GateRefusal),
+    /// A premise the gate certified changed before the ref could move; the
+    /// ref did not move, and a retry prepares again.
+    GateStale {
+        changed: String,
+    },
+}
+
+/// Why a gate refused: a sentence for a person and the structured account a
+/// caller acts on, which names what the proposed result lacks.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GateRefusal {
+    pub reason: String,
+    pub detail: serde_json::Value,
+}
+
+/// What a gate concluded about a proposed result.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum GateVerdict {
+    Admit,
+    Refuse(GateRefusal),
+}
+
+/// What a gate's commit did.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum GateCommit {
+    /// The certified premises held and `advance` ran under them.
+    Committed,
+    /// A certified premise changed; `advance` did not run.
+    Stale { changed: String },
+}
+
+/// Whether a door onto this ref must pass the mainline gate (norm-plane §5).
+/// Enforcement attaches to the ref, not the verb: the mainline is gated, and
+/// every other line is ungated until the charter can declare a gated release
+/// line.
+pub fn is_gated_ref(branch_id: &str) -> bool {
+    branch_id == MAINLINE_BRANCH_ID
+}
+
+/// What a head movement through the gated-ref choke point came to.
+enum GatedMove {
+    /// The ref's own compare-and-swap answered.
+    Moved(AdvanceOutcome),
+    /// The gate refused the proposed result; nothing moved.
+    Refused(GateRefusal),
+    /// A certified premise changed before the ref could move; nothing moved.
+    Stale(String),
+}
+
+/// The admission a door onto the mainline passes through (norm-plane §5).
+/// The engine records the proposed cut, asks the gate to judge it, and moves
+/// the ref only inside the gate's commit, which re-checks every premise it
+/// certified while holding whatever exclusion keeps them from changing. The
+/// engine has no path that moves the mainline without one.
+pub trait MainlineGate {
+    /// Judge the recorded proposed cut against the base the ref would move
+    /// from. Pure with respect to the ref: it reads, it never advances.
+    fn prepare(
+        &mut self,
+        base_cut: Option<&str>,
+        proposed_cut: &str,
+        artifacts: &crate::norm_commands::NormArtifactCapture<'_>,
+    ) -> StoreResult<GateVerdict>;
+    /// Run `advance` if and only if what `prepare` certified still holds.
+    fn commit(&mut self, advance: &mut dyn FnMut() -> StoreResult<()>) -> StoreResult<GateCommit>;
 }
 
 /// Restore (un-tie's `revert` mapping): re-point the branch head to a
@@ -310,6 +384,13 @@ pub enum RestoreOutcome {
     CutMissing,
     BranchMissing,
     BranchNotActive,
+    /// The mainline's gate refused the proposed result; nothing moved.
+    GateRefused(GateRefusal),
+    /// A premise the gate certified changed before the ref could move;
+    /// nothing moved, and a retry prepares again.
+    GateStale {
+        changed: String,
+    },
 }
 
 /// A named quiescence cut (un-tie's commit-per-turn-finalize mapping).
@@ -383,6 +464,13 @@ pub enum UndoSelectionOutcome {
     NothingSelected,
     BranchMissing,
     BranchNotActive,
+    /// The mainline's gate refused the proposed result; nothing moved.
+    GateRefused(GateRefusal),
+    /// A premise the gate certified changed before the ref could move;
+    /// nothing moved, and a retry prepares again.
+    GateStale {
+        changed: String,
+    },
 }
 
 /// Outcome of `transport <selection>` / `adopt --only <selection>`.
@@ -404,6 +492,13 @@ pub enum TransportOutcome {
     BranchMissing,
     TargetMissing,
     TargetNotActive,
+    /// The mainline's gate refused the proposed result; nothing moved.
+    GateRefused(GateRefusal),
+    /// A premise the gate certified changed before the ref could move;
+    /// nothing moved, and a retry prepares again.
+    GateStale {
+        changed: String,
+    },
 }
 
 /// How to resolve one conflict item.
@@ -502,6 +597,13 @@ pub enum UndoOpOutcome {
     OpMissing,
     /// The op moved no branch pointers (e.g. an erasure record).
     NothingToUndo,
+    /// The mainline's gate refused the proposed result; nothing moved.
+    GateRefused(GateRefusal),
+    /// A premise the gate certified changed before the ref could move;
+    /// nothing moved, and a retry prepares again.
+    GateStale {
+        changed: String,
+    },
 }
 
 /// DR-0086 Decision 1: the kernel's read-only view of the versioned
@@ -721,6 +823,66 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
             )));
         }
         Ok(())
+    }
+
+    /// The one place a door moves a head (norm-plane §5). An ungated ref
+    /// advances by its own compare-and-swap. A gated ref's proposed result is
+    /// recorded first, so the gate judges the exact immutable cut, and then
+    /// moves only inside the gate's commit, through the lease-holding advance;
+    /// every other head mutation refuses the lease a governed mainline holds.
+    fn advance_through_gate(
+        &mut self,
+        gate: &mut dyn MainlineGate,
+        cut: CutRecord<'_>,
+    ) -> StoreResult<GatedMove> {
+        if !is_gated_ref(cut.branch_id) {
+            return Ok(GatedMove::Moved(self.branches.advance_head(
+                cut.branch_id,
+                cut.parent_cut_id,
+                cut.cut_id,
+                cut.manifest_hash,
+                cut.recorded_at,
+            )?));
+        }
+        // A proposal may name a cut already recorded (an undo returns the ref
+        // to one); the recorded cut must hold exactly the proposed result.
+        self.branches.record_cut(cut)?;
+        match self.branches.get_cut(cut.cut_id)? {
+            Some(recorded) if recorded.manifest_hash == cut.manifest_hash => {}
+            _ => {
+                return Err(StoreError::Conflict(format!(
+                    "cut `{}` already names a different result",
+                    cut.cut_id
+                )))
+            }
+        }
+        let verdict = {
+            let capture = |id: &str| {
+                self.capture_norm_artifact(id, crate::norm_artifact::ArtifactLimits::default())
+            };
+            gate.prepare(cut.parent_cut_id, cut.cut_id, &capture)?
+        };
+        if let GateVerdict::Refuse(refusal) = verdict {
+            return Ok(GatedMove::Refused(refusal));
+        }
+        let mut moved = None;
+        let committed = gate.commit(&mut || {
+            moved = Some(self.branches.advance_gated_head(
+                cut.branch_id,
+                cut.parent_cut_id,
+                cut.cut_id,
+                cut.manifest_hash,
+                cut.recorded_at,
+            )?);
+            Ok(())
+        })?;
+        match (committed, moved) {
+            (GateCommit::Stale { changed }, _) => Ok(GatedMove::Stale(changed)),
+            (GateCommit::Committed, Some(outcome)) => Ok(GatedMove::Moved(outcome)),
+            (GateCommit::Committed, None) => Err(StoreError::Conflict(
+                "the mainline gate committed without moving the ref".into(),
+            )),
+        }
     }
 
     fn verify_recorded_promotion_cut(
@@ -2306,8 +2468,9 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
         branch_id: &str,
         merge_cut_id: &str,
         at: &str,
+        gate: &mut dyn MainlineGate,
     ) -> StoreResult<VcsMergeOutcome> {
-        self.merge_with_mode(branch_id, merge_cut_id, at, false)
+        self.merge_with_mode(branch_id, merge_cut_id, at, false, gate)
     }
 
     /// `merge` for a LONG-LIVED member line (a chat, a workstream): the
@@ -2320,8 +2483,9 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
         branch_id: &str,
         merge_cut_id: &str,
         at: &str,
+        gate: &mut dyn MainlineGate,
     ) -> StoreResult<VcsMergeOutcome> {
-        self.merge_with_mode(branch_id, merge_cut_id, at, true)
+        self.merge_with_mode(branch_id, merge_cut_id, at, true, gate)
     }
 
     fn merge_with_mode(
@@ -2330,6 +2494,7 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
         merge_cut_id: &str,
         at: &str,
         keep_open: bool,
+        gate: &mut dyn MainlineGate,
     ) -> StoreResult<VcsMergeOutcome> {
         let Some(mut branch) = self.branches.get_branch(branch_id)? else {
             return Ok(VcsMergeOutcome::BranchMissing);
@@ -2404,13 +2569,28 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
                     .change_of(branch.head_cut_id.as_deref())?
                     .unwrap_or_else(|| merge_cut_id.to_owned());
                 let origin = format!("merge:{branch_id}");
-                let parent_advanced = match self.branches.advance_head(
-                    &parent_id,
-                    parent.head_cut_id.as_deref(),
-                    merge_cut_id,
-                    &merged_hash,
-                    at,
+                let (actor, intent) = (self.actor.clone(), self.intent.clone());
+                let gated = match self.advance_through_gate(
+                    gate,
+                    CutRecord {
+                        cut_id: merge_cut_id,
+                        change_id: &transported_change,
+                        branch_id: &parent_id,
+                        manifest_hash: &merged_hash,
+                        parent_cut_id: parent.head_cut_id.as_deref(),
+                        origin: Some(&origin),
+                        actor: actor.as_deref(),
+                        intent: intent.as_deref(),
+                        recorded_at: at,
+                    },
                 )? {
+                    GatedMove::Moved(outcome) => outcome,
+                    GatedMove::Refused(refusal) => {
+                        return Ok(VcsMergeOutcome::GateRefused(refusal))
+                    }
+                    GatedMove::Stale(changed) => return Ok(VcsMergeOutcome::GateStale { changed }),
+                };
+                let parent_advanced = match gated {
                     AdvanceOutcome::Advanced(advanced) => {
                         self.branches.record_cut(CutRecord {
                             cut_id: merge_cut_id,
@@ -2602,6 +2782,7 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
         expected_main_cut: Option<&str>,
         proposed_main_cut: &str,
         at: &str,
+        gate: &mut dyn MainlineGate,
     ) -> StoreResult<BoundaryPromotionOutcome> {
         self.require_head_reservation(stream_line_id, reservation_id)?;
         let Some(line) = self.branches.get_branch(stream_line_id)? else {
@@ -2693,24 +2874,44 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
             &origin,
         )?;
 
-        let advanced = match self.branches.advance_head(
-            MAINLINE_BRANCH_ID,
-            expected_main_cut,
-            proposed_main_cut,
-            &manifest_hash,
-            at,
+        // The recorded proposal is the exact result the gate judges; an
+        // unreferenced cut left by a refusal is collectible like a lost CAS's.
+        let (actor, intent) = (self.actor.clone(), self.intent.clone());
+        let advanced = match self.advance_through_gate(
+            gate,
+            CutRecord {
+                cut_id: proposed_main_cut,
+                change_id: proposed_main_cut,
+                branch_id: MAINLINE_BRANCH_ID,
+                manifest_hash: &manifest_hash,
+                parent_cut_id: expected_main_cut,
+                origin: Some(&origin),
+                actor: actor.as_deref(),
+                intent: intent.as_deref(),
+                recorded_at: at,
+            },
         )? {
-            AdvanceOutcome::Advanced(advanced) => advanced,
-            AdvanceOutcome::Stale {
+            GatedMove::Refused(refusal) => {
+                return Ok(BoundaryPromotionOutcome::GateRefused(refusal))
+            }
+            GatedMove::Stale(changed) => {
+                return Ok(BoundaryPromotionOutcome::GateStale { changed })
+            }
+            GatedMove::Moved(AdvanceOutcome::Advanced(advanced)) => advanced,
+            GatedMove::Moved(AdvanceOutcome::Stale {
                 current_head_cut_id,
-            } => {
+            }) => {
                 return Ok(BoundaryPromotionOutcome::ExpectedCutsMoved {
                     current_line_cut,
                     current_main_cut: current_head_cut_id,
                 })
             }
-            AdvanceOutcome::NotActive { .. } => return Ok(BoundaryPromotionOutcome::MainNotActive),
-            AdvanceOutcome::NotFound => return Ok(BoundaryPromotionOutcome::MainMissing),
+            GatedMove::Moved(AdvanceOutcome::NotActive { .. }) => {
+                return Ok(BoundaryPromotionOutcome::MainNotActive)
+            }
+            GatedMove::Moved(AdvanceOutcome::NotFound) => {
+                return Ok(BoundaryPromotionOutcome::MainMissing)
+            }
         };
         self.log_op(
             &format!("op-{proposed_main_cut}"),
@@ -2746,6 +2947,7 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
         to_cut_id: &str,
         new_cut_id: &str,
         at: &str,
+        gate: &mut dyn MainlineGate,
     ) -> StoreResult<RestoreOutcome> {
         let Some(row) = self.branches.get_branch(branch_id)? else {
             return Ok(RestoreOutcome::BranchMissing);
@@ -2759,17 +2961,30 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
         if row.head_manifest_hash.as_deref() == Some(cut.manifest_hash.as_str()) {
             return Ok(RestoreOutcome::AlreadyThere);
         }
-        match self.branches.advance_head(
-            branch_id,
-            row.head_cut_id.as_deref(),
-            new_cut_id,
-            &cut.manifest_hash,
-            at,
+        // A restore is a NEW intent (a counterfactual state the branch
+        // proposes), not the old change re-materialized.
+        let origin = format!("restore:{to_cut_id}");
+        let (actor, intent) = (self.actor.clone(), self.intent.clone());
+        let gated = match self.advance_through_gate(
+            gate,
+            CutRecord {
+                cut_id: new_cut_id,
+                change_id: new_cut_id,
+                branch_id,
+                manifest_hash: &cut.manifest_hash,
+                parent_cut_id: row.head_cut_id.as_deref(),
+                origin: Some(&origin),
+                actor: actor.as_deref(),
+                intent: intent.as_deref(),
+                recorded_at: at,
+            },
         )? {
+            GatedMove::Moved(outcome) => outcome,
+            GatedMove::Refused(refusal) => return Ok(RestoreOutcome::GateRefused(refusal)),
+            GatedMove::Stale(changed) => return Ok(RestoreOutcome::GateStale { changed }),
+        };
+        match gated {
             AdvanceOutcome::Advanced(advanced) => {
-                // A restore is a NEW intent (a counterfactual state the
-                // branch proposes), not the old change re-materialized.
-                let origin = format!("restore:{to_cut_id}");
                 self.branches.record_cut(CutRecord {
                     cut_id: new_cut_id,
                     change_id: new_cut_id,
@@ -2968,6 +3183,7 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
         op_id: &str,
         undo_op_id: &str,
         at: &str,
+        gate: &mut dyn MainlineGate,
     ) -> StoreResult<UndoOpOutcome> {
         let Some(op) = self.branches.get_op(op_id)? else {
             return Ok(UndoOpOutcome::OpMissing);
@@ -2995,15 +3211,136 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
                 });
             }
         }
-        // Apply pass: restore each branch to its before-state.
+        // An undo that moves a gated ref is a candidate like any other, judged
+        // at its proposed result — the state the op found — and applied
+        // whole inside the gate's commit (norm-plane §5).
+        let gated = op
+            .deltas
+            .iter()
+            .find(|delta| is_gated_ref(&delta.branch_id));
+        let undo_deltas = match gated {
+            None => self.apply_undo_deltas(op_id, &op.deltas, at, None)?,
+            Some(delta) => {
+                // The gated ref only ever moves its head: an undo returns it
+                // to the head the op found.
+                let before = delta.before.as_ref();
+                let (proposed, manifest_hash) = match before.and_then(|before| {
+                    before
+                        .head_cut_id
+                        .clone()
+                        .zip(before.head_manifest_hash.clone())
+                }) {
+                    Some(found) => found,
+                    // Before its first cut the ref held the empty tree: that
+                    // is the candidate, recorded so the gate judges a cut.
+                    None => {
+                        let manifest =
+                            match before.and_then(|before| before.head_manifest_hash.clone()) {
+                                Some(manifest) => manifest,
+                                None => self.store_manifest(&BTreeMap::new())?,
+                            };
+                        let cut = format!("{undo_op_id}-{}", delta.branch_id);
+                        let origin = format!("undo:{op_id}");
+                        let (actor, intent) = (self.actor.clone(), self.intent.clone());
+                        self.branches.record_cut(CutRecord {
+                            cut_id: &cut,
+                            change_id: &cut,
+                            branch_id: &delta.branch_id,
+                            manifest_hash: &manifest,
+                            parent_cut_id: delta.after.head_cut_id.as_deref(),
+                            origin: Some(&origin),
+                            actor: actor.as_deref(),
+                            intent: intent.as_deref(),
+                            recorded_at: at,
+                        })?;
+                        (cut, manifest)
+                    }
+                };
+                let verdict = {
+                    let capture = |id: &str| {
+                        self.capture_norm_artifact(
+                            id,
+                            crate::norm_artifact::ArtifactLimits::default(),
+                        )
+                    };
+                    gate.prepare(delta.after.head_cut_id.as_deref(), &proposed, &capture)?
+                };
+                if let GateVerdict::Refuse(refusal) = verdict {
+                    return Ok(UndoOpOutcome::GateRefused(refusal));
+                }
+                let mut applied = None;
+                match gate.commit(&mut || {
+                    applied = Some(self.apply_undo_deltas(
+                        op_id,
+                        &op.deltas,
+                        at,
+                        Some((&proposed, &manifest_hash)),
+                    )?);
+                    Ok(())
+                })? {
+                    GateCommit::Stale { changed } => {
+                        return Ok(UndoOpOutcome::GateStale { changed })
+                    }
+                    GateCommit::Committed => applied.ok_or_else(|| {
+                        StoreError::Conflict(
+                            "the mainline gate committed without moving the ref".into(),
+                        )
+                    })?,
+                }
+            }
+        };
+        self.log_op(
+            undo_op_id,
+            "undo",
+            undo_deltas,
+            Some(&format!("undo:{op_id}")),
+            at,
+        )?;
+        Ok(UndoOpOutcome::Undone {
+            undo_op_id: undo_op_id.to_owned(),
+        })
+    }
+
+    /// `undo_op`'s apply pass: restore each branch to its before-state. A
+    /// gated ref moves to the judged result `gated` names, and only when
+    /// `undo_op` runs this inside its gate's commit.
+    fn apply_undo_deltas(
+        &mut self,
+        op_id: &str,
+        deltas: &[OpBranchDelta],
+        at: &str,
+        gated: Option<(&str, &str)>,
+    ) -> StoreResult<Vec<OpBranchDelta>> {
         let mut undo_deltas = Vec::new();
-        for delta in &op.deltas {
+        for delta in deltas {
             let row = self
                 .branches
                 .get_branch(&delta.branch_id)?
                 .ok_or_else(|| StoreError::Conflict("branch vanished mid-undo".to_owned()))?;
-            let restored = match &delta.before {
-                Some(before) => {
+            let gated_to = gated.filter(|_| is_gated_ref(&delta.branch_id));
+            let restored = match (&delta.before, gated_to) {
+                // Only inside the gate's commit: the gated ref moves to the
+                // result `undo_op` judged, never to an unjudged state.
+                // Its compare-and-swap is on the base the gate judged, the head
+                // the op left, not on whatever the ref holds by now.
+                (_, Some((cut, manifest))) => {
+                    match self.branches.advance_gated_head(
+                        &delta.branch_id,
+                        delta.after.head_cut_id.as_deref(),
+                        cut,
+                        manifest,
+                        at,
+                    )? {
+                        AdvanceOutcome::Advanced(restored) => restored,
+                        other => {
+                            return Err(StoreError::Conflict(format!(
+                                "undo of `{op_id}` could not restore `{}`: {other:?}",
+                                delta.branch_id
+                            )))
+                        }
+                    }
+                }
+                (Some(before), None) => {
                     match self.branches.restore_branch_state(
                         &delta.branch_id,
                         row.head_cut_id.as_deref(),
@@ -3019,7 +3356,7 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
                         }
                     }
                 }
-                None => {
+                (None, None) => {
                     // The op created this branch: the compensator closes
                     // the head. The record remains readable history.
                     match self.branches.discard_branch(&delta.branch_id, at)? {
@@ -3039,16 +3376,7 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
                 after: OpBranchState::of(&restored),
             });
         }
-        self.log_op(
-            undo_op_id,
-            "undo",
-            undo_deltas,
-            Some(&format!("undo:{op_id}")),
-            at,
-        )?;
-        Ok(UndoOpOutcome::Undone {
-            undo_op_id: undo_op_id.to_owned(),
-        })
+        Ok(undo_deltas)
     }
 
     /// The branch's recorded change-units, oldest first (the selection
@@ -3396,6 +3724,7 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
         expr: &crate::selection::SelExpr,
         cut_id: &str,
         at: &str,
+        gate: &mut dyn MainlineGate,
     ) -> StoreResult<UndoSelectionOutcome> {
         let Some(plan) = self.plan_undo_selection(branch_id, expr)? else {
             return Ok(UndoSelectionOutcome::BranchMissing);
@@ -3435,16 +3764,30 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
         // plan already states the size of (DR-0066 §8 refusal 2).
         let manifest_hash =
             self.advance_manifest(row.head_manifest_hash.as_deref(), &plan.reverts)?;
-        match self.branches.advance_head(
-            branch_id,
-            row.head_cut_id.as_deref(),
-            cut_id,
-            &manifest_hash,
-            at,
+        // A counterfactual proposal is a NEW intent; the origin is the
+        // synthetic tag until gates revalidate. On a gated ref the undo is a
+        // candidate like any other, judged at its proposed result.
+        let (actor, intent) = (self.actor.clone(), self.intent.clone());
+        let gated = match self.advance_through_gate(
+            gate,
+            CutRecord {
+                cut_id,
+                change_id: cut_id,
+                branch_id,
+                manifest_hash: &manifest_hash,
+                parent_cut_id: row.head_cut_id.as_deref(),
+                origin: Some("undo-selection"),
+                actor: actor.as_deref(),
+                intent: intent.as_deref(),
+                recorded_at: at,
+            },
         )? {
+            GatedMove::Moved(outcome) => outcome,
+            GatedMove::Refused(refusal) => return Ok(UndoSelectionOutcome::GateRefused(refusal)),
+            GatedMove::Stale(changed) => return Ok(UndoSelectionOutcome::GateStale { changed }),
+        };
+        match gated {
             AdvanceOutcome::Advanced(advanced) => {
-                // A counterfactual proposal is a NEW intent; the origin
-                // is the synthetic tag until gates revalidate.
                 self.branches.record_cut(CutRecord {
                     cut_id,
                     change_id: cut_id,
@@ -3542,6 +3885,7 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
         onto: &str,
         cut_id: &str,
         at: &str,
+        gate: &mut dyn MainlineGate,
     ) -> StoreResult<TransportOutcome> {
         if self.branches.get_branch(branch_id)?.is_none() {
             return Ok(TransportOutcome::BranchMissing);
@@ -3650,15 +3994,30 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
         };
         let moved_changes: BTreeMap<String, Option<String>> = moved.iter().cloned().collect();
         let manifest_hash = self.advance_manifest(target_manifest_hash, &moved_changes)?;
-        match self.branches.advance_head(
-            onto,
-            target.head_cut_id.as_deref(),
-            cut_id,
-            &manifest_hash,
-            at,
+        // `transport … onto mainline` passes the same gate as `promote`; onto
+        // an ungated line it is not norm-gated.
+        let origin = format!("transport:{branch_id}");
+        let (actor, intent) = (self.actor.clone(), self.intent.clone());
+        let gated = match self.advance_through_gate(
+            gate,
+            CutRecord {
+                cut_id,
+                change_id: &transported_change,
+                branch_id: onto,
+                manifest_hash: &manifest_hash,
+                parent_cut_id: target.head_cut_id.as_deref(),
+                origin: Some(&origin),
+                actor: actor.as_deref(),
+                intent: intent.as_deref(),
+                recorded_at: at,
+            },
         )? {
+            GatedMove::Moved(outcome) => outcome,
+            GatedMove::Refused(refusal) => return Ok(TransportOutcome::GateRefused(refusal)),
+            GatedMove::Stale(changed) => return Ok(TransportOutcome::GateStale { changed }),
+        };
+        match gated {
             AdvanceOutcome::Advanced(advanced) => {
-                let origin = format!("transport:{branch_id}");
                 self.branches.record_cut(CutRecord {
                     cut_id,
                     change_id: &transported_change,
@@ -3715,6 +4074,7 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
         expr: &crate::selection::SelExpr,
         cut_id: &str,
         at: &str,
+        gate: &mut dyn MainlineGate,
     ) -> StoreResult<TransportOutcome> {
         let Some(branch) = self.branches.get_branch(branch_id)? else {
             return Ok(TransportOutcome::BranchMissing);
@@ -3722,7 +4082,7 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
         let Some(parent_id) = branch.parent_branch_id else {
             return Ok(TransportOutcome::TargetMissing);
         };
-        self.transport_selection(branch_id, expr, &parent_id, cut_id, at)
+        self.transport_selection(branch_id, expr, &parent_id, cut_id, at, gate)
     }
 
     /// Write-attribution (vw note §7.3: blame is a weak projection of
@@ -4886,6 +5246,27 @@ impl<B: Branches, C: ContentBlobs> FileStore for BranchFileStore<B, C> {
     }
 }
 
+/// These engine fixtures carry no norm ledger, so nothing gates their
+/// mainline: the gate admits and runs the compare-and-swap as asked.
+#[cfg(test)]
+pub(crate) struct NoNormLedger;
+
+#[cfg(test)]
+impl MainlineGate for NoNormLedger {
+    fn prepare(
+        &mut self,
+        _base_cut: Option<&str>,
+        _proposed_cut: &str,
+        _artifacts: &crate::norm_commands::NormArtifactCapture<'_>,
+    ) -> StoreResult<GateVerdict> {
+        Ok(GateVerdict::Admit)
+    }
+    fn commit(&mut self, advance: &mut dyn FnMut() -> StoreResult<()>) -> StoreResult<GateCommit> {
+        advance()?;
+        Ok(GateCommit::Committed)
+    }
+}
+
 #[cfg(all(test, feature = "native"))]
 mod tests {
     use super::*;
@@ -5451,7 +5832,13 @@ mod tests {
             .expect("write");
         let expr = crate::selection::parse("cut(cut_1)").expect("parse");
         let outcome = vcs
-            .apply_undo_selection(MAINLINE_BRANCH_ID, &expr, "cut_3", "t3")
+            .apply_undo_selection(
+                MAINLINE_BRANCH_ID,
+                &expr,
+                "cut_3",
+                "t3",
+                &mut crate::vcs::NoNormLedger,
+            )
             .expect("undo");
         assert!(matches!(outcome, UndoSelectionOutcome::WouldStrand { .. }));
         let facts = vcs.take_pending_facts();
@@ -5503,7 +5890,13 @@ mod tests {
         // Merge: adopted, mainline sees the branch content, branch is
         // terminal history.
         assert_eq!(
-            vcs.merge("draft_a", "cut_merge_1", "t4").expect("merge"),
+            vcs.merge(
+                "draft_a",
+                "cut_merge_1",
+                "t4",
+                &mut crate::vcs::NoNormLedger
+            )
+            .expect("merge"),
             VcsMergeOutcome::Adopted {
                 merge_cut_id: "cut_merge_1".to_owned(),
                 into_branch_id: MAINLINE_BRANCH_ID.to_owned(),
@@ -5652,7 +6045,8 @@ mod tests {
             VcsWriteOutcome::Written { .. }
         ));
         assert_eq!(
-            vcs.merge_keeping("chat", "cut_keep1", "t3").expect("merge"),
+            vcs.merge_keeping("chat", "cut_keep1", "t3", &mut crate::vcs::NoNormLedger)
+                .expect("merge"),
             VcsMergeOutcome::Landed {
                 merge_cut_id: "cut_keep1".to_owned(),
                 into_branch_id: MAINLINE_BRANCH_ID.to_owned(),
@@ -5686,7 +6080,8 @@ mod tests {
             VcsWriteOutcome::Written { .. }
         ));
         assert_eq!(
-            vcs.merge_keeping("chat", "cut_keep2", "t6").expect("merge"),
+            vcs.merge_keeping("chat", "cut_keep2", "t6", &mut crate::vcs::NoNormLedger)
+                .expect("merge"),
             VcsMergeOutcome::Landed {
                 merge_cut_id: "cut_keep2".to_owned(),
                 into_branch_id: MAINLINE_BRANCH_ID.to_owned(),
@@ -5756,7 +6151,8 @@ mod tests {
         );
         // …and merge now adopts into the workstream, not mainline.
         assert_eq!(
-            vcs.merge("chat", "cut_merge_c", "t6").expect("merge"),
+            vcs.merge("chat", "cut_merge_c", "t6", &mut crate::vcs::NoNormLedger)
+                .expect("merge"),
             VcsMergeOutcome::Adopted {
                 merge_cut_id: "cut_merge_c".to_owned(),
                 into_branch_id: "ws".to_owned(),
@@ -5814,7 +6210,13 @@ mod tests {
         vcs.write(MAINLINE_BRANCH_ID, "b.md", Some("B1"), "cut_m2", "t4")
             .expect("write");
         assert!(matches!(
-            vcs.merge("draft_a", "cut_merge_1", "t5").expect("merge"),
+            vcs.merge(
+                "draft_a",
+                "cut_merge_1",
+                "t5",
+                &mut crate::vcs::NoNormLedger
+            )
+            .expect("merge"),
             VcsMergeOutcome::Adopted { .. }
         ));
         assert_eq!(
@@ -5845,13 +6247,25 @@ mod tests {
         // The untouched sibling lands: mainline advances to a NEW cut
         // carrying the SAME manifest.
         assert!(matches!(
-            vcs.merge("sibling", "cut_merge_sib", "t3").expect("merge"),
+            vcs.merge(
+                "sibling",
+                "cut_merge_sib",
+                "t3",
+                &mut crate::vcs::NoNormLedger
+            )
+            .expect("merge"),
             VcsMergeOutcome::Adopted { .. }
         ));
         vcs.write("draft_a", "a.md", Some("A1"), "cut_d1", "t4")
             .expect("write");
         assert!(matches!(
-            vcs.merge("draft_a", "cut_merge_1", "t5").expect("merge"),
+            vcs.merge(
+                "draft_a",
+                "cut_merge_1",
+                "t5",
+                &mut crate::vcs::NoNormLedger
+            )
+            .expect("merge"),
             VcsMergeOutcome::Adopted { .. }
         ));
         assert_eq!(
@@ -5878,7 +6292,8 @@ mod tests {
             .expect("member");
         // The untouched sibling lands on the line: same manifest, new cut.
         assert!(matches!(
-            vcs.merge("sibling", "cut_line_2", "t5").expect("merge"),
+            vcs.merge("sibling", "cut_line_2", "t5", &mut crate::vcs::NoNormLedger)
+                .expect("merge"),
             VcsMergeOutcome::Adopted { .. }
         ));
         vcs.write("member", "m.md", Some("M0"), "cut_mem1", "t6")
@@ -5925,7 +6340,13 @@ mod tests {
         )
         .expect("write");
         assert!(matches!(
-            vcs.merge("draft_a", "cut_merge_1", "t5").expect("merge"),
+            vcs.merge(
+                "draft_a",
+                "cut_merge_1",
+                "t5",
+                &mut crate::vcs::NoNormLedger
+            )
+            .expect("merge"),
             VcsMergeOutcome::Adopted { .. }
         ));
         assert_eq!(
@@ -5995,7 +6416,14 @@ mod tests {
             "t7",
         )
         .expect("write");
-        let outcome = vcs.merge("draft_a", "cut_merge_1", "t8").expect("merge");
+        let outcome = vcs
+            .merge(
+                "draft_a",
+                "cut_merge_1",
+                "t8",
+                &mut crate::vcs::NoNormLedger,
+            )
+            .expect("merge");
         let VcsMergeOutcome::Conflicted { conflicts } = outcome else {
             panic!("expected escalation, got {outcome:?}");
         };
@@ -6445,7 +6873,13 @@ mod tests {
         vcs.write(MAINLINE_BRANCH_ID, "b.md", Some(draft_edit), "cut_m5", "t8")
             .expect("write");
         assert!(matches!(
-            vcs.merge("draft_a", "cut_merge_1", "t9").expect("merge"),
+            vcs.merge(
+                "draft_a",
+                "cut_merge_1",
+                "t9",
+                &mut crate::vcs::NoNormLedger
+            )
+            .expect("merge"),
             VcsMergeOutcome::Adopted { .. }
         ));
         assert_eq!(
@@ -6474,8 +6908,14 @@ mod tests {
         // Mainline advances on the SAME path: a real conflict.
         vcs.write(MAINLINE_BRANCH_ID, "a.md", Some("main A"), "cut_m2", "t4")
             .expect("write");
-        let VcsMergeOutcome::Conflicted { conflicts } =
-            vcs.merge("draft_a", "cut_merge_1", "t5").expect("merge")
+        let VcsMergeOutcome::Conflicted { conflicts } = vcs
+            .merge(
+                "draft_a",
+                "cut_merge_1",
+                "t5",
+                &mut crate::vcs::NoNormLedger,
+            )
+            .expect("merge")
         else {
             panic!("expected escalation");
         };
@@ -6501,7 +6941,13 @@ mod tests {
             .expect("write");
         // Still conflicted (base didn't move): the honest outcome.
         assert!(matches!(
-            vcs.merge("draft_a", "cut_merge_2", "t7").expect("merge"),
+            vcs.merge(
+                "draft_a",
+                "cut_merge_2",
+                "t7",
+                &mut crate::vcs::NoNormLedger
+            )
+            .expect("merge"),
             VcsMergeOutcome::Conflicted { .. }
         ));
         // Take-ours-into-mainline path: mainline itself adopts the
@@ -6518,7 +6964,13 @@ mod tests {
         vcs.write("draft_a", "a.md", Some("main A + draft A"), "cut_d3", "t9")
             .expect("write");
         assert!(matches!(
-            vcs.merge("draft_a", "cut_merge_3", "t10").expect("merge"),
+            vcs.merge(
+                "draft_a",
+                "cut_merge_3",
+                "t10",
+                &mut crate::vcs::NoNormLedger
+            )
+            .expect("merge"),
             VcsMergeOutcome::Adopted { .. }
         ));
     }
@@ -6789,7 +7241,8 @@ mod tests {
             .expect("write");
         // Undo the second write: head returns to cut_a1, the log grew.
         assert_eq!(
-            vcs.undo_op("op-cut_a2", "undo_1", "t4").expect("undo"),
+            vcs.undo_op("op-cut_a2", "undo_1", "t4", &mut crate::vcs::NoNormLedger)
+                .expect("undo"),
             UndoOpOutcome::Undone {
                 undo_op_id: "undo_1".to_owned()
             }
@@ -6801,12 +7254,14 @@ mod tests {
         // The moved-head bite: op-cut_a1's after-state is no longer
         // where the branch is (the undo moved it) — refused, honest.
         assert!(matches!(
-            vcs.undo_op("op-cut_a2", "undo_dup", "t5").expect("undo"),
+            vcs.undo_op("op-cut_a2", "undo_dup", "t5", &mut crate::vcs::NoNormLedger)
+                .expect("undo"),
             UndoOpOutcome::HeadMoved { .. },
         ));
         // Undo-of-undo: the same verb on the compensator returns to v2.
         assert_eq!(
-            vcs.undo_op("undo_1", "undo_2", "t6").expect("undo"),
+            vcs.undo_op("undo_1", "undo_2", "t6", &mut crate::vcs::NoNormLedger)
+                .expect("undo"),
             UndoOpOutcome::Undone {
                 undo_op_id: "undo_2".to_owned()
             }
@@ -6816,7 +7271,13 @@ mod tests {
             Some("v2")
         );
         // Undo the merge: mainline re-points AND the branch re-opens.
-        vcs.merge("draft_a", "cut_merge_1", "t7").expect("merge");
+        vcs.merge(
+            "draft_a",
+            "cut_merge_1",
+            "t7",
+            &mut crate::vcs::NoNormLedger,
+        )
+        .expect("merge");
         assert_eq!(
             vcs.read(MAINLINE_BRANCH_ID, "a.md")
                 .expect("read")
@@ -6824,7 +7285,13 @@ mod tests {
             Some("v2")
         );
         assert_eq!(
-            vcs.undo_op("op-cut_merge_1", "undo_3", "t8").expect("undo"),
+            vcs.undo_op(
+                "op-cut_merge_1",
+                "undo_3",
+                "t8",
+                &mut crate::vcs::NoNormLedger
+            )
+            .expect("undo"),
             UndoOpOutcome::Undone {
                 undo_op_id: "undo_3".to_owned()
             }
@@ -6839,8 +7306,13 @@ mod tests {
         vcs.create_branch("draft_b", None, MAINLINE_BRANCH_ID, "t9")
             .expect("create");
         assert_eq!(
-            vcs.undo_op("op-create-draft_b", "undo_4", "t10")
-                .expect("undo"),
+            vcs.undo_op(
+                "op-create-draft_b",
+                "undo_4",
+                "t10",
+                &mut crate::vcs::NoNormLedger
+            )
+            .expect("undo"),
             UndoOpOutcome::Undone {
                 undo_op_id: "undo_4".to_owned()
             }
@@ -6899,7 +7371,13 @@ mod tests {
         ));
         // ...but adoption refuses while a conflict is open.
         assert!(matches!(
-            vcs.merge("draft_a", "cut_merge_1", "t7").expect("merge"),
+            vcs.merge(
+                "draft_a",
+                "cut_merge_1",
+                "t7",
+                &mut crate::vcs::NoNormLedger
+            )
+            .expect("merge"),
             VcsMergeOutcome::Conflicted { .. }
         ));
         // Per-item authored resolution: closes the row, stores memory,
@@ -6922,7 +7400,13 @@ mod tests {
         };
         assert!(vcs.open_conflicts("draft_a").expect("open").is_empty());
         assert!(matches!(
-            vcs.merge("draft_a", "cut_merge_2", "t9").expect("merge"),
+            vcs.merge(
+                "draft_a",
+                "cut_merge_2",
+                "t9",
+                &mut crate::vcs::NoNormLedger
+            )
+            .expect("merge"),
             VcsMergeOutcome::Adopted { .. }
         ));
         assert_eq!(
@@ -7027,8 +7511,14 @@ mod tests {
         assert_eq!(plan.stranded.len(), 1);
         assert_eq!(plan.stranded[0].cut_id, "e3");
         assert!(matches!(
-            vcs.apply_undo_selection("draft_a", &parse("cut(e2)").expect("parse"), "u1", "t5")
-                .expect("undo"),
+            vcs.apply_undo_selection(
+                "draft_a",
+                &parse("cut(e2)").expect("parse"),
+                "u1",
+                "t5",
+                &mut crate::vcs::NoNormLedger
+            )
+            .expect("undo"),
             UndoSelectionOutcome::WouldStrand { .. }
         ));
         assert_eq!(
@@ -7044,6 +7534,7 @@ mod tests {
                 &parse("dependents-of(cut(e2))").expect("parse"),
                 "u2",
                 "t6",
+                &mut crate::vcs::NoNormLedger,
             )
             .expect("undo");
         assert!(matches!(outcome, UndoSelectionOutcome::Proposed { .. }));
@@ -7061,6 +7552,7 @@ mod tests {
                 MAINLINE_BRANCH_ID,
                 "tp1",
                 "t7",
+                &mut crate::vcs::NoNormLedger,
             )
             .expect("transport");
         let TransportOutcome::Transported { change_id, .. } = outcome else {
@@ -7085,6 +7577,7 @@ mod tests {
                 MAINLINE_BRANCH_ID,
                 "tp2",
                 "t10",
+                &mut crate::vcs::NoNormLedger,
             )
             .expect("transport"),
             TransportOutcome::Conflicted { .. }
@@ -7107,7 +7600,8 @@ mod tests {
                 "draft_a",
                 &parse("path(give.md)").expect("parse"),
                 "ao1",
-                "t13"
+                "t13",
+                &mut crate::vcs::NoNormLedger
             )
             .expect("adopt-only"),
             TransportOutcome::Transported { .. }
@@ -7155,6 +7649,7 @@ mod tests {
                 MAINLINE_BRANCH_ID,
                 "tp1",
                 "t4",
+                &mut crate::vcs::NoNormLedger,
             )
             .expect("transport");
         assert!(
@@ -7470,6 +7965,7 @@ mod tests {
                 Some("main-1"),
                 "main-2",
                 "t4",
+                &mut NoNormLedger,
             )
             .expect("promote")
         else {
@@ -7517,10 +8013,20 @@ mod tests {
             None,
             "a recorded proposal alone is not evidence of a successful CAS",
         );
-        vcs.undo_op("op-main-3", "undo-later", "t7")
-            .expect("undo later work");
-        vcs.undo_op("op-main-2", "undo-promotion", "t8")
-            .expect("explicitly undo Main projection");
+        vcs.undo_op(
+            "op-main-3",
+            "undo-later",
+            "t7",
+            &mut crate::vcs::NoNormLedger,
+        )
+        .expect("undo later work");
+        vcs.undo_op(
+            "op-main-2",
+            "undo-promotion",
+            "t8",
+            &mut crate::vcs::NoNormLedger,
+        )
+        .expect("explicitly undo Main projection");
         assert_eq!(
             vcs.get_branch(MAINLINE_BRANCH_ID)
                 .unwrap()
@@ -7751,6 +8257,7 @@ mod tests {
                 Some("main-1"),
                 "main-2",
                 "t4",
+                &mut NoNormLedger,
             )
             .expect("promote");
         let BoundaryPromotionOutcome::Promoted {
@@ -7798,6 +8305,7 @@ mod tests {
                 Some("main-1"),
                 "main-3",
                 "t5",
+                &mut NoNormLedger,
             )
             .expect("stale attempt");
         assert!(matches!(
@@ -7813,6 +8321,474 @@ mod tests {
         );
     }
 
+    /// A gate whose verdict and commit the test chooses, recording what it
+    /// was asked to judge.
+    struct ScriptedGate {
+        verdict: GateVerdict,
+        commit: GateCommit,
+        run_advance: bool,
+        judged: Vec<(Option<String>, String, BTreeMap<String, String>)>,
+    }
+
+    impl MainlineGate for ScriptedGate {
+        fn prepare(
+            &mut self,
+            base_cut: Option<&str>,
+            proposed_cut: &str,
+            artifacts: &crate::norm_commands::NormArtifactCapture<'_>,
+        ) -> StoreResult<GateVerdict> {
+            let captured = artifacts(proposed_cut)?;
+            self.judged.push((
+                base_cut.map(str::to_owned),
+                proposed_cut.to_owned(),
+                captured.files().clone(),
+            ));
+            Ok(self.verdict.clone())
+        }
+        fn commit(
+            &mut self,
+            advance: &mut dyn FnMut() -> StoreResult<()>,
+        ) -> StoreResult<GateCommit> {
+            if self.run_advance && self.commit == GateCommit::Committed {
+                advance()?;
+            }
+            Ok(self.commit.clone())
+        }
+    }
+
+    /// A gate a test expects never to be asked.
+    struct NeverAsked;
+
+    impl MainlineGate for NeverAsked {
+        fn prepare(
+            &mut self,
+            _base_cut: Option<&str>,
+            proposed_cut: &str,
+            _artifacts: &crate::norm_commands::NormArtifactCapture<'_>,
+        ) -> StoreResult<GateVerdict> {
+            panic!("an ungated ref consulted the mainline gate for {proposed_cut}")
+        }
+        fn commit(
+            &mut self,
+            _advance: &mut dyn FnMut() -> StoreResult<()>,
+        ) -> StoreResult<GateCommit> {
+            panic!("an ungated ref committed through the mainline gate")
+        }
+    }
+
+    /// The gate's lease on a governed mainline is the branch store's own
+    /// refusal (norm-plane §5): every head mutation but the gated advance
+    /// refuses it, and nothing releases it.
+    #[test]
+    fn the_mainline_gates_lease_admits_only_the_gated_advance() {
+        let mut vcs = vcs();
+        vcs.init("t0").expect("init");
+        vcs.write(MAINLINE_BRANCH_ID, "base.md", Some("base"), "main-1", "t1")
+            .expect("seed main");
+        let head = vcs
+            .get_branch(MAINLINE_BRANCH_ID)
+            .expect("main")
+            .expect("row");
+        crate::branches::lease_gated_mainline(&mut vcs.branches, "t2").expect("lease");
+        crate::branches::lease_gated_mainline(&mut vcs.branches, "t2").expect("idempotent");
+        let reserved = |result: StoreResult<AdvanceOutcome>| matches!(&result, Err(StoreError::Conflict(reason)) if reason == "branch `main` head is reserved by `norm-gate`");
+        let manifest = head.head_manifest_hash.clone().expect("manifest");
+        assert!(reserved(vcs.branches.advance_head(
+            MAINLINE_BRANCH_ID,
+            Some("main-1"),
+            "main-x",
+            &manifest,
+            "t3",
+        )));
+        assert!(reserved(vcs.branches.restore_branch_state(
+            MAINLINE_BRANCH_ID,
+            Some("main-1"),
+            &crate::branches::OpBranchState::of(&head),
+            "t3",
+        )));
+        let released = vcs
+            .branches
+            .release_head_reservation(MAINLINE_BRANCH_ID, crate::branches::MAINLINE_GATE_LEASE);
+        assert!(
+            matches!(&released, Err(StoreError::Conflict(reason)) if reason == "the mainline gate's lease is never released"),
+            "{released:?}"
+        );
+        assert!(matches!(
+            vcs.branches
+                .advance_gated_head(
+                    MAINLINE_BRANCH_ID,
+                    Some("main-1"),
+                    "main-1",
+                    &manifest,
+                    "t4"
+                )
+                .expect("gated advance"),
+            AdvanceOutcome::Advanced(_)
+        ));
+        // A mainline another holder reserved cannot be governed.
+        let mut other = BranchStore::open_in_memory().expect("store");
+        other.ensure_mainline("t0").expect("main");
+        other
+            .reserve_head(MAINLINE_BRANCH_ID, "boundary", "t1")
+            .expect("reserve");
+        let taken = crate::branches::lease_gated_mainline(&mut other, "t2");
+        assert!(
+            matches!(&taken, Err(StoreError::Conflict(reason)) if reason.starts_with("the mainline gate cannot take its lease: Busy")),
+            "{taken:?}"
+        );
+    }
+
+    /// A gate that admits, and whose commit finds the mainline moved by
+    /// another writer before it runs the door's advance.
+    struct MovedUnderneath {
+        branches: std::path::PathBuf,
+    }
+
+    impl MainlineGate for MovedUnderneath {
+        fn prepare(
+            &mut self,
+            _base_cut: Option<&str>,
+            _proposed_cut: &str,
+            _artifacts: &crate::norm_commands::NormArtifactCapture<'_>,
+        ) -> StoreResult<GateVerdict> {
+            Ok(GateVerdict::Admit)
+        }
+        fn commit(
+            &mut self,
+            advance: &mut dyn FnMut() -> StoreResult<()>,
+        ) -> StoreResult<GateCommit> {
+            let mut other = BranchStore::open(&self.branches)?;
+            let head = other
+                .get_branch(MAINLINE_BRANCH_ID)?
+                .and_then(|row| row.head_cut_id.zip(row.head_manifest_hash))
+                .expect("a mainline head");
+            other.advance_gated_head(MAINLINE_BRANCH_ID, Some(&head.0), "work-1", &head.1, "t8")?;
+            advance()?;
+            Ok(GateCommit::Committed)
+        }
+    }
+
+    /// Enforcement attaches to the ref (norm-plane §5): every door onto the
+    /// mainline asks its gate, a door onto an ungated line never does
+    /// (NP-16), and a mainline under the gate's lease moves through nothing
+    /// else — the store itself refuses a write that is not a door.
+    #[test]
+    fn every_door_onto_the_mainline_asks_its_gate_and_no_other_ref_does() {
+        use crate::selection::parse;
+        let refused = || ScriptedGate {
+            verdict: GateVerdict::Refuse(GateRefusal {
+                reason: "the proposed result is not supported: R0 (repair)".into(),
+                detail: serde_json::json!({"requirements": {"R0": ["repair"]}}),
+            }),
+            commit: GateCommit::Committed,
+            run_advance: true,
+            judged: Vec::new(),
+        };
+        let mut vcs = vcs();
+        vcs.init("t0").expect("init");
+        vcs.write(MAINLINE_BRANCH_ID, "base.md", Some("base"), "main-1", "t1")
+            .expect("seed main");
+        vcs.create_branch("work", None, MAINLINE_BRANCH_ID, "t2")
+            .expect("work");
+        vcs.create_branch("scratch", None, MAINLINE_BRANCH_ID, "t2")
+            .expect("scratch");
+        vcs.write("work", "fix.md", Some("fix"), "work-1", "t3")
+            .expect("work");
+        vcs.write("work", "fix.md", Some("fix2"), "work-2", "t4")
+            .expect("work");
+
+        // Ungated refs: a transport onto `scratch` and a branch-bound undo
+        // keep their own preconditions and never consult the gate.
+        assert!(matches!(
+            vcs.transport_selection(
+                "work",
+                &parse("path(fix.md)").expect("parse"),
+                "scratch",
+                "scratch-1",
+                "t5",
+                &mut NeverAsked,
+            )
+            .expect("transport"),
+            TransportOutcome::Transported { .. }
+        ));
+        assert!(matches!(
+            vcs.apply_undo_selection(
+                "work",
+                &parse("cut(work-2)").expect("parse"),
+                "work-3",
+                "t6",
+                &mut NeverAsked,
+            )
+            .expect("undo"),
+            UndoSelectionOutcome::Proposed { .. }
+        ));
+        assert!(matches!(
+            vcs.undo_op("op-work-3", "undo-work", "t7", &mut NeverAsked)
+                .expect("undo op"),
+            UndoOpOutcome::Undone { .. }
+        ));
+
+        // The mainline's doors: each asks the gate about its exact proposed
+        // result, and a refusal moves nothing.
+        let expr = parse("path(fix.md)").expect("parse");
+        let mut gate = refused();
+        assert!(matches!(
+            vcs.transport_selection("work", &expr, MAINLINE_BRANCH_ID, "main-t", "t8", &mut gate)
+                .expect("transport"),
+            TransportOutcome::GateRefused(_)
+        ));
+        let mut gate = refused();
+        assert!(matches!(
+            vcs.adopt_only("work", &expr, "main-a", "t8", &mut gate)
+                .expect("adopt"),
+            TransportOutcome::GateRefused(_)
+        ));
+        let mut gate = refused();
+        assert!(matches!(
+            vcs.merge("work", "main-m", "t8", &mut gate).expect("merge"),
+            VcsMergeOutcome::GateRefused(_)
+        ));
+        assert_eq!(gate.judged.len(), 1);
+        assert_eq!(gate.judged[0].0.as_deref(), Some("main-1"));
+        assert_eq!(
+            gate.judged[0].2["fix.md"], "fix2",
+            "the merged result is judged"
+        );
+        let mut gate = refused();
+        assert!(matches!(
+            vcs.restore(MAINLINE_BRANCH_ID, "work-2", "main-r", "t8", &mut gate)
+                .expect("restore"),
+            RestoreOutcome::GateRefused(_)
+        ));
+        let mut gate = refused();
+        assert!(matches!(
+            vcs.apply_undo_selection(
+                MAINLINE_BRANCH_ID,
+                &parse("path(base.md)").expect("parse"),
+                "main-u",
+                "t8",
+                &mut gate,
+            )
+            .expect("undo"),
+            UndoSelectionOutcome::GateRefused(_)
+        ));
+        let mut gate = refused();
+        assert!(matches!(
+            vcs.undo_op("op-main-1", "undo-main", "t8", &mut gate)
+                .expect("undo op"),
+            UndoOpOutcome::GateRefused(_)
+        ));
+        // Undoing the mainline's first write proposes the empty tree.
+        assert!(gate.judged[0].2.is_empty());
+        // A cut id that already names another result is not a proposal.
+        let reused = vcs.transport_selection(
+            "work",
+            &expr,
+            MAINLINE_BRANCH_ID,
+            "main-1",
+            "t8",
+            &mut NoNormLedger,
+        );
+        assert!(
+            matches!(&reused, Err(StoreError::Conflict(reason)) if reason == "cut `main-1` already names a different result"),
+            "{reused:?}"
+        );
+        // A gate that reports a commit it never ran moves nothing, loudly.
+        for undone in [
+            vcs.undo_op(
+                "op-main-1",
+                "undo-silent",
+                "t8",
+                &mut ScriptedGate {
+                    verdict: GateVerdict::Admit,
+                    commit: GateCommit::Committed,
+                    run_advance: false,
+                    judged: Vec::new(),
+                },
+            )
+            .map(|_| ()),
+            vcs.transport_selection(
+                "work",
+                &expr,
+                MAINLINE_BRANCH_ID,
+                "main-silent",
+                "t8",
+                &mut ScriptedGate {
+                    verdict: GateVerdict::Admit,
+                    commit: GateCommit::Committed,
+                    run_advance: false,
+                    judged: Vec::new(),
+                },
+            )
+            .map(|_| ()),
+        ] {
+            assert!(
+                matches!(&undone, Err(StoreError::Conflict(reason)) if reason == "the mainline gate committed without moving the ref"),
+                "{undone:?}"
+            );
+        }
+        let main = vcs
+            .get_branch(MAINLINE_BRANCH_ID)
+            .expect("main")
+            .expect("row");
+        assert_eq!(main.head_cut_id.as_deref(), Some("main-1"), "nothing moved");
+        assert_eq!(
+            vcs.get_branch("work").expect("work").expect("row").status,
+            BranchStatus::Active,
+            "a refused merge adopts nothing"
+        );
+
+        // Under the lease a governed mainline holds, a write that is not a
+        // door refuses, and an admitted door still moves it.
+        crate::branches::lease_gated_mainline(&mut vcs.branches, "t9").expect("lease");
+        let written = vcs.write(MAINLINE_BRANCH_ID, "base.md", Some("raw"), "main-raw", "t9");
+        assert!(
+            matches!(&written, Err(StoreError::Conflict(reason)) if reason.contains("reserved by `norm-gate`")),
+            "{written:?}"
+        );
+        assert!(matches!(
+            vcs.transport_selection(
+                "work",
+                &expr,
+                MAINLINE_BRANCH_ID,
+                "main-2",
+                "t10",
+                &mut NoNormLedger
+            )
+            .expect("transport"),
+            TransportOutcome::Transported { .. }
+        ));
+        assert!(matches!(
+            vcs.undo_op("op-main-2", "undo-main-2", "t11", &mut NoNormLedger)
+                .expect("undo op"),
+            UndoOpOutcome::Undone { .. }
+        ));
+        assert_eq!(
+            vcs.get_branch(MAINLINE_BRANCH_ID)
+                .expect("main")
+                .expect("row")
+                .head_cut_id
+                .as_deref(),
+            Some("main-1")
+        );
+        // An undo whose mainline moved inside the commit restores nothing it
+        // did not judge.
+        let branches = vcs.dir.join("branches.sqlite");
+        assert!(matches!(
+            vcs.transport_selection(
+                "work",
+                &expr,
+                MAINLINE_BRANCH_ID,
+                "main-3",
+                "t12",
+                &mut NoNormLedger
+            )
+            .expect("transport"),
+            TransportOutcome::Transported { .. }
+        ));
+        let raced = vcs.undo_op(
+            "op-main-3",
+            "undo-raced",
+            "t13",
+            &mut MovedUnderneath { branches },
+        );
+        assert!(
+            matches!(&raced, Err(StoreError::Conflict(reason)) if reason.starts_with("undo of `op-main-3` could not restore `main`")),
+            "{raced:?}"
+        );
+    }
+
+    #[test]
+    fn the_mainline_moves_only_inside_its_gates_commit() {
+        let mut vcs = vcs();
+        vcs.init("t0").expect("init");
+        vcs.write(MAINLINE_BRANCH_ID, "base.md", Some("base"), "main-1", "t1")
+            .expect("seed main");
+        vcs.create_branch("line-ws", None, MAINLINE_BRANCH_ID, "t2")
+            .expect("line");
+        vcs.write("line-ws", "work.md", Some("work"), "line-1", "t3")
+            .expect("stream work");
+        vcs.reserve_branch_head("line-ws", "reservation-ws", "t4")
+            .expect("reserve line");
+        let main_head = |vcs: &NativeWorkspaceVcs| {
+            vcs.get_branch(MAINLINE_BRANCH_ID)
+                .expect("main read")
+                .expect("main")
+                .head_cut_id
+        };
+        let refusal = GateRefusal {
+            reason: "custody-authorization is not supported at the proposed result".into(),
+            detail: serde_json::json!({"requirements": {"custody-authorization": ["repair"]}}),
+        };
+        let mut gate = ScriptedGate {
+            verdict: GateVerdict::Refuse(refusal.clone()),
+            commit: GateCommit::Committed,
+            run_advance: true,
+            judged: Vec::new(),
+        };
+        let promote = |vcs: &mut NativeWorkspaceVcs, cut: &str, gate: &mut ScriptedGate| {
+            vcs.promote_line_exact(
+                "line-ws",
+                "reservation-ws",
+                Some("line-1"),
+                Some("main-1"),
+                cut,
+                "t4",
+                gate,
+            )
+            .expect("promotion attempt")
+        };
+        // Refused: the ref stays, and the gate judged the exact merged result
+        // against the base the ref would have moved from.
+        assert_eq!(
+            promote(&mut vcs, "main-2", &mut gate),
+            BoundaryPromotionOutcome::GateRefused(refusal)
+        );
+        assert_eq!(main_head(&vcs).as_deref(), Some("main-1"));
+        let (base, proposed, files) = &gate.judged[0];
+        assert_eq!(
+            (base.as_deref(), proposed.as_str()),
+            (Some("main-1"), "main-2")
+        );
+        assert!(files.contains_key("work.md") && files.contains_key("base.md"));
+        // Stale: a certified premise changed; the ref stays.
+        gate.verdict = GateVerdict::Admit;
+        gate.commit = GateCommit::Stale {
+            changed: "the norm ledger moved".into(),
+        };
+        assert_eq!(
+            promote(&mut vcs, "main-3", &mut gate),
+            BoundaryPromotionOutcome::GateStale {
+                changed: "the norm ledger moved".into()
+            }
+        );
+        assert_eq!(main_head(&vcs).as_deref(), Some("main-1"));
+        // A gate that reports a commit it never ran is not believed.
+        gate.commit = GateCommit::Committed;
+        gate.run_advance = false;
+        assert!(matches!(
+            vcs.promote_line_exact(
+                "line-ws",
+                "reservation-ws",
+                Some("line-1"),
+                Some("main-1"),
+                "main-4",
+                "t4",
+                &mut gate,
+            )
+            .unwrap_err(),
+            StoreError::Conflict(message) if message == "the mainline gate committed without moving the ref"
+        ));
+        assert_eq!(main_head(&vcs).as_deref(), Some("main-1"));
+        // Admitted: the ref moves inside the commit.
+        gate.run_advance = true;
+        assert!(matches!(
+            promote(&mut vcs, "main-5", &mut gate),
+            BoundaryPromotionOutcome::Promoted { ref main_cut_id, .. } if main_cut_id == "main-5"
+        ));
+        assert_eq!(main_head(&vcs).as_deref(), Some("main-5"));
+    }
+
     #[test]
     fn exact_promotion_requires_its_durable_reservation() {
         let mut vcs = vcs();
@@ -7821,7 +8797,15 @@ mod tests {
             .expect("line");
 
         let error = vcs
-            .promote_line_exact("line-ws", "missing-reservation", None, None, "main-1", "t2")
+            .promote_line_exact(
+                "line-ws",
+                "missing-reservation",
+                None,
+                None,
+                "main-1",
+                "t2",
+                &mut NoNormLedger,
+            )
             .expect_err("promotion without the matching reservation must refuse");
         assert!(format!("{error:?}").contains("not frozen by reservation"));
     }
@@ -7862,6 +8846,7 @@ mod tests {
                 Some("main-2"),
                 "main-3",
                 "t5",
+                &mut NoNormLedger,
             )
             .expect("probe");
         assert!(matches!(
@@ -7940,6 +8925,7 @@ mod tests {
                 Some("main-1"),
                 "main-2",
                 "t4",
+                &mut NoNormLedger,
             )
             .expect_err("conflicting immutable cut identity must fail before Main CAS");
         assert!(format!("{error:?}").contains("different immutable content"));
@@ -7990,6 +8976,7 @@ mod tests {
                     Some("main-1"),
                     proposed,
                     "race",
+                    &mut NoNormLedger,
                 )
                 .expect("promotion outcome")
             }));

@@ -62,3 +62,5 @@ See also:
 
 - [trace-conformance.md](trace-conformance.md) for the first runtime trace
   checker contract.
+- [research/README.md](research/README.md) for a dependency-free, bounded
+  control-plane probe of flowing branch admission, outside the formal suites.

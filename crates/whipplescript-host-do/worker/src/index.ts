@@ -65,6 +65,8 @@ import {
   type ResolvedHostProviderBinding,
   resolveAdmittedProvider as resolveHostedProvider,
 } from "./provider-realization";
+import { agentWorkspaceResources } from "./agent-workspace-resources";
+import { LiveModelContext } from "./live-model-context";
 
 const wasmInstance = new WebAssembly.Instance(wasmModule, {
   "./whipplescript_host_do_bg.js": bindings,
@@ -93,6 +95,9 @@ const hostFunctions = bindings as unknown as {
   host_norm_impact: (
     bridge: unknown, trustedConfiguration: string, commandJson: string, deployment: string,
   ) => string;
+  host_norm_promotion: (
+    bridge: unknown, trustedConfiguration: string, commandJson: string, deployment: string,
+  ) => string;
   host_norm_enqueue: (
     bridge: unknown, trustedConfiguration: string, commandJson: string,
     executorUrl: string, environmentEpoch: string, normRuntime?: string,
@@ -116,6 +121,7 @@ const hostFunctions = bindings as unknown as {
     packageManifest: string,
     packageSource: string,
     systemPrompt: string,
+    projectContext?: string,
   ) => string;
   host_discard_instance: (
     bridge: unknown,
@@ -133,6 +139,7 @@ const hostFunctions = bindings as unknown as {
     packageManifest: string,
     packageSource: string,
     systemPrompt: string,
+    projectContext?: string,
   ) => string;
   host_begin_turn: (
     bridge: unknown,
@@ -143,6 +150,7 @@ const hostFunctions = bindings as unknown as {
     packageManifest: string,
     packageSource: string,
     systemPrompt: string,
+    projectContext: string | undefined,
     provider: string,
     model: string,
     baseUrl: string,
@@ -193,6 +201,7 @@ const hostFunctions = bindings as unknown as {
     packageManifest: string,
     packageSource: string,
     systemPrompt: string,
+    projectContext?: string,
   ) => string;
   host_import_fork: (
     bridge: unknown,
@@ -204,6 +213,7 @@ const hostFunctions = bindings as unknown as {
     packageManifest: string,
     packageSource: string,
     systemPrompt: string,
+    projectContext?: string,
   ) => string;
 };
 
@@ -814,6 +824,7 @@ function ensureSchema(sql: SqlStorage): void {
 export function makeBridge(
   storage: DurableObjectStorage,
   onActivity?: (kind: string, detail?: string) => void,
+  onExternalTool?: (name: string, callId: string, argumentsJson: string) => string,
 ) {
   const sql = storage.sql;
   return {
@@ -822,6 +833,10 @@ export function makeBridge(
     },
     activity(kind: string, detail?: string): void {
       onActivity?.(kind, detail);
+    },
+    externalTool(name: string, callId: string, argumentsJson: string): string {
+      if (!onExternalTool) throw new Error(`external tool ${name} has no placement implementation`);
+      return onExternalTool(name, callId, argumentsJson);
     },
     exec(query: string, paramsJson: string): number {
       const params = JSON.parse(paramsJson) as unknown[];
@@ -836,6 +851,78 @@ export function makeBridge(
       return JSON.stringify([...cursor.raw()]);
     },
   };
+}
+
+/** A placement can bind an authored external tool to this durable call inbox.
+ * The host owns the tool's meaning; the generic runtime only persists the
+ * exact call before returning a receipt. */
+export function recordExternalToolCall(
+  storage: DurableObjectStorage,
+  instanceId: string,
+  commandId: string,
+  name: string,
+  callId: string,
+  argumentsJson: string,
+  inputSchema?: unknown,
+): string {
+  if (argumentsJson.length > 16_384) throw new Error("external tool arguments exceed 16 KiB");
+  const argumentsValue: unknown = JSON.parse(argumentsJson);
+  if (inputSchema && !matchesExternalToolSchema(argumentsValue, inputSchema)) {
+    throw new Error(`external tool ${name} arguments do not match its authored schema`);
+  }
+  const id = encodeURIComponent(`${commandId}/${callId}`);
+  const sql = storage.sql;
+  sql.exec("CREATE TABLE IF NOT EXISTS host_external_calls (id TEXT PRIMARY KEY, instance_id TEXT NOT NULL, name TEXT NOT NULL, arguments_json TEXT NOT NULL, answer_json TEXT)");
+  sql.exec(
+    "INSERT OR IGNORE INTO host_external_calls (id, instance_id, name, arguments_json) VALUES (?1, ?2, ?3, ?4)",
+    id, instanceId, name, argumentsJson,
+  );
+  const row = [...sql.exec(
+    "SELECT name, arguments_json FROM host_external_calls WHERE id = ?1 AND instance_id = ?2",
+    id, instanceId,
+  )][0] as { name: string; arguments_json: string } | undefined;
+  if (row?.name !== name || row.arguments_json !== argumentsJson) {
+    throw new Error("external tool replay changed its arguments");
+  }
+  return JSON.stringify({ external_call_id: id });
+}
+
+/** The bounded structural subset used by authored external tool input schemas.
+ * Model tool metadata is advisory; this check keeps malformed calls out of a
+ * placement's durable inbox before a success receipt can be returned. */
+function matchesExternalToolSchema(value: unknown, schema: unknown, depth = 0): boolean {
+  if (depth > 8 || !schema || typeof schema !== "object" || Array.isArray(schema)) return false;
+  const rule = schema as Record<string, unknown>;
+  if (Array.isArray(rule.enum) && !rule.enum.some((item) => JSON.stringify(item) === JSON.stringify(value))) return false;
+  if (rule.type === "object") {
+    if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+    const object = value as Record<string, unknown>;
+    const properties = rule.properties && typeof rule.properties === "object" && !Array.isArray(rule.properties)
+      ? rule.properties as Record<string, unknown> : {};
+    if (Array.isArray(rule.required) && rule.required.some((key) => typeof key !== "string" || !(key in object))) return false;
+    return Object.entries(object).every(([key, item]) => key in properties
+      ? matchesExternalToolSchema(item, properties[key], depth + 1)
+      : rule.additionalProperties !== false);
+  }
+  if (rule.type === "array") {
+    if (!Array.isArray(value) ||
+        (typeof rule.minItems === "number" && value.length < rule.minItems) ||
+        (typeof rule.maxItems === "number" && value.length > rule.maxItems)) return false;
+    return rule.items === undefined || value.every((item) => matchesExternalToolSchema(item, rule.items, depth + 1));
+  }
+  if (rule.type === "string") {
+    return typeof value === "string" &&
+      (typeof rule.minLength !== "number" || value.length >= rule.minLength) &&
+      (typeof rule.maxLength !== "number" || value.length <= rule.maxLength);
+  }
+  if (rule.type === "integer" || rule.type === "number") {
+    return typeof value === "number" && Number.isFinite(value) &&
+      (rule.type !== "integer" || Number.isInteger(value)) &&
+      (typeof rule.minimum !== "number" || value >= rule.minimum) &&
+      (typeof rule.maximum !== "number" || value <= rule.maximum);
+  }
+  if (rule.type === "boolean") return typeof value === "boolean";
+  return rule.type === undefined;
 }
 
 /**
@@ -1056,6 +1143,7 @@ interface HostPackageDocuments {
   manifest: string;
   source: string;
   system_prompt: string;
+  project_context?: string;
 }
 
 interface HostCommandRequest {
@@ -1306,6 +1394,7 @@ function isMediaType(value: unknown): value is string {
 
 export class WorkflowInstance implements DurableObject {
   private executorLifetimeRun?: Promise<void>;
+  private readonly liveModelContext = new LiveModelContext();
   private readonly turnStreams = new Map<
     string,
     Set<ReadableStreamDefaultController<Uint8Array>>
@@ -1446,6 +1535,18 @@ export class WorkflowInstance implements DurableObject {
           url,
         );
       }
+      const modelContext = url.pathname.match(
+        /^\/host\/instances\/([^/]+)\/turns\/([^/]+)\/model-context$/,
+      );
+      if (modelContext) {
+        const key = `${decodeURIComponent(modelContext[1])}\0${decodeURIComponent(modelContext[2])}`;
+        const view = this.liveModelContext.read(key);
+        return view
+          ? Response.json(view, { headers: { "cache-control": "no-store" } })
+          : Response.json({ error: "live model context is unavailable" }, {
+              status: 404, headers: { "cache-control": "no-store" },
+            });
+      }
       const forkExport = url.pathname.match(/^\/host\/instances\/([^/]+)\/fork-export$/);
       if (forkExport) {
         return this.exportHostFork(decodeURIComponent(forkExport[1]), url);
@@ -1455,7 +1556,11 @@ export class WorkflowInstance implements DurableObject {
     if (request.method !== "POST") {
       return Response.json({ error: "method not allowed" }, { status: 405 });
     }
-    if (url.pathname === "/host/norm/commands" || url.pathname === "/host/norm/provision" || url.pathname === "/host/norm/publications" || url.pathname === "/host/norm/enqueues" || url.pathname === "/host/norm/impacts") {
+    const externalAnswer = url.pathname.match(/^\/public\/session\/external-calls\/([^/]+)\/answer$/);
+    if (externalAnswer) {
+      return this.answerPublicExternalCall(request, decodeURIComponent(externalAnswer[1]));
+    }
+    if (url.pathname === "/host/norm/commands" || url.pathname === "/host/norm/provision" || url.pathname === "/host/norm/publications" || url.pathname === "/host/norm/enqueues" || url.pathname === "/host/norm/impacts" || url.pathname === "/host/norm/promotions") {
       const trust = this.env.WHIP_NORM_TRUST;
       if (!trust) {
         return Response.json({ error: "norm trust configuration is unavailable" }, { status: 503 });
@@ -1468,16 +1573,20 @@ export class WorkflowInstance implements DurableObject {
       }
       ensureSchema(this.ctx.storage.sql);
       try {
-        if (url.pathname === "/host/norm/impacts") {
+        if (url.pathname === "/host/norm/impacts" || url.pathname === "/host/norm/promotions") {
           const { WHIP_NORM_PLANNING: planning, WHIP_NORM_RUNTIME: runtime,
             WHIP_NORM_IMAGE_BINDING: image_binding, WHIP_NORM_DEPLOYMENT_IMAGE: deployed_image } = this.env;
           if (!planning?.trim() || !runtime?.trim() || !image_binding?.trim() || !deployed_image?.trim()) {
             return Response.json({ error: "norm planning installation is unavailable" }, { status: 503 });
           }
+          // A promotion's gate plans exactly what an impact query would.
+          const door = url.pathname === "/host/norm/impacts" ? "impact" : "admission";
           const deployment = JSON.stringify({ planning, runtime, image_binding, deployed_image,
-            time_basis: `hosted-impact/${Date.now()}/${crypto.randomUUID()}` });
-          return new Response(hostFunctions.host_norm_impact(makeBridge(this.ctx.storage), trust, body, deployment),
-            { headers: { "content-type": "application/json" } });
+            time_basis: `hosted-${door}/${Date.now()}/${crypto.randomUUID()}` });
+          const answer = url.pathname === "/host/norm/impacts"
+            ? hostFunctions.host_norm_impact(makeBridge(this.ctx.storage), trust, body, deployment)
+            : hostFunctions.host_norm_promotion(makeBridge(this.ctx.storage), trust, body, deployment);
+          return new Response(answer, { headers: { "content-type": "application/json" } });
         }
         if (url.pathname === "/host/norm/enqueues") {
           const endpoint = this.env.WHIP_EXECUTOR_URL;
@@ -1875,6 +1984,7 @@ export class WorkflowInstance implements DurableObject {
       transcript,
       files,
       queue: this.publicTurnQueue(),
+      external_calls: this.publicExternalCalls(session.instance_ref),
       ...(active[0]
         ? {
             active_turn: {
@@ -1885,6 +1995,63 @@ export class WorkflowInstance implements DurableObject {
           }
         : {}),
     };
+  }
+
+  private publicExternalCalls(instanceId: string): Array<{
+    id: string; name: string; arguments_json: string; answer_json: string | null;
+    continuation_status: string | null; continuation_error: string | null;
+  }> {
+    this.ctx.storage.sql.exec("CREATE TABLE IF NOT EXISTS host_external_calls (id TEXT PRIMARY KEY, instance_id TEXT NOT NULL, name TEXT NOT NULL, arguments_json TEXT NOT NULL, answer_json TEXT)");
+    this.ctx.storage.sql.exec("CREATE TABLE IF NOT EXISTS host_external_call_outcomes (id TEXT PRIMARY KEY, status TEXT NOT NULL, error TEXT)");
+    return this.ctx.storage.sql.exec(
+      "SELECT c.id, c.name, c.arguments_json, c.answer_json, o.status AS continuation_status, o.error AS continuation_error FROM host_external_calls c LEFT JOIN host_external_call_outcomes o ON o.id = c.id WHERE c.instance_id = ?1 ORDER BY c.rowid",
+      instanceId,
+    ).toArray() as Array<{ id: string; name: string; arguments_json: string; answer_json: string | null; continuation_status: string | null; continuation_error: string | null }>;
+  }
+
+  private async answerPublicExternalCall(request: Request, id: string): Promise<Response> {
+    const session = await this.admitPublicSessionRequest();
+    if (session instanceof Response) return session;
+    const call = this.publicExternalCalls(session.instance_ref).find((item) => item.id === id);
+    if (!call) return Response.json({ error: "external call not found" }, { status: 404 });
+    const body = await request.json() as { answer?: unknown; text?: unknown };
+    if (!body.answer || typeof body.answer !== "object" ||
+        typeof body.text !== "string" || !body.text.trim() || body.text.length > 12_000) {
+      return Response.json({ error: "a structured answer and continuation text are required" }, { status: 400 });
+    }
+    const answerJson = JSON.stringify({ answer: body.answer, text: body.text });
+    this.ctx.storage.sql.exec(
+      "UPDATE host_external_calls SET answer_json = ?1 WHERE id = ?2 AND instance_id = ?3 AND answer_json IS NULL",
+      answerJson, id, session.instance_ref,
+    );
+    const committed = this.publicExternalCalls(session.instance_ref).find((item) => item.id === id);
+    if (committed?.answer_json !== answerJson) {
+      return Response.json({ error: "external call was already answered" }, { status: 409 });
+    }
+    if (committed.continuation_status === "completed") {
+      return Response.json({ answered: true, external_call_id: id, replayed: true });
+    }
+    if (committed.continuation_status === "refused") {
+      return Response.json({ error: committed.continuation_error ?? "continuation refused" }, { status: 409 });
+    }
+    const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(id));
+    const suffix = [...new Uint8Array(digest)].slice(0, 12).map((byte) => byte.toString(16).padStart(2, "0")).join("");
+    const requestId = `answer:${suffix}`;
+    const result = await this.beginPublicTurn({ request_id: requestId, text: body.text });
+    // The WebSocket send path settles this binding and publishes its terminal
+    // event after beginPublicTurn. A typed HTTP answer has the same obligation.
+    await this.publishPublicTurnResult(session.instance_ref, requestId, result.clone());
+    const resultBody = (await result.clone().json().catch(() => ({}))) as { outcome?: string; error?: string };
+    const status = result.ok && resultBody.outcome === "terminal" ? "completed"
+      : result.status >= 400 && result.status < 500 && result.status !== 409 ? "refused" : "pending";
+    const error = status === "completed" ? null : resultBody.error ?? `continuation returned ${result.status}`;
+    this.ctx.storage.sql.exec(
+      "INSERT INTO host_external_call_outcomes (id, status, error) VALUES (?1, ?2, ?3) ON CONFLICT(id) DO UPDATE SET status = excluded.status, error = excluded.error",
+      id, status, error,
+    );
+    return result.ok
+      ? Response.json({ answered: true, external_call_id: id, continuation: status })
+      : result;
   }
 
   private async publicSessionFiles(url: URL): Promise<Response> {
@@ -3058,6 +3225,14 @@ export class WorkflowInstance implements DurableObject {
     if (capabilities.has("command.run")) {
       resources.push({ handle: "command", kind: "command", selector: null });
     }
+    const manifest = JSON.parse(session.package.manifest) as {
+      external_tools?: { capability: string }[];
+    };
+    for (const capability of new Set((manifest.external_tools ?? []).map((tool) => tool.capability))) {
+      if (capabilities.has(capability)) {
+        resources.push({ handle: capability, kind: "external_tool", selector: null });
+      }
+    }
     const turnStartedAt = performance.now();
     this.publicTraceStarts.set(commandId, turnStartedAt);
     const traceBoundary = (boundary: string) => {
@@ -3948,6 +4123,7 @@ export class WorkflowInstance implements DurableObject {
         packageDocs.manifest,
         packageDocs.source,
         packageDocs.system_prompt,
+        packageDocs.project_context,
         undefined,
       );
       const report = command === "checkpoint" ? instance.checkpoint(cutId) : instance.restore(cutId);
@@ -4163,6 +4339,7 @@ export class WorkflowInstance implements DurableObject {
       typeof packageDocs.manifest !== "string" ||
       typeof packageDocs.source !== "string" ||
       typeof packageDocs.system_prompt !== "string" ||
+      (packageDocs.project_context !== undefined && typeof packageDocs.project_context !== "string") ||
       !policy ||
       !Number.isSafeInteger(policy.epoch) ||
       Number(policy.epoch) <= 0 ||
@@ -4307,6 +4484,7 @@ export class WorkflowInstance implements DurableObject {
           packageDocs.manifest,
           packageDocs.source,
           packageDocs.system_prompt,
+          packageDocs.project_context,
         ),
       ) as { instance_ref?: unknown };
     } catch (error) {
@@ -4414,6 +4592,7 @@ export class WorkflowInstance implements DurableObject {
       typeof candidate.manifest !== "string" ||
       typeof candidate.source !== "string" ||
       typeof candidate.system_prompt !== "string"
+      || (candidate.project_context !== undefined && typeof candidate.project_context !== "string")
     ) {
       return Response.json(
         { error: "package requires manifest, source, and system_prompt strings" },
@@ -4519,6 +4698,7 @@ export class WorkflowInstance implements DurableObject {
           request.package.manifest,
           request.package.source,
           request.package.system_prompt,
+          request.package.project_context,
         ),
       );
       await this.ctx.storage.put(
@@ -4610,6 +4790,7 @@ export class WorkflowInstance implements DurableObject {
       request.package.manifest,
       request.package.source,
       request.package.system_prompt,
+      request.package.project_context,
     ] as const;
     try {
       // Phase 1 crosses no credential boundary. Only after WhippleScript has
@@ -4657,15 +4838,30 @@ export class WorkflowInstance implements DurableObject {
         return Response.json({ error: "admitted host turn is missing its runtime binding" }, { status: 503 });
       }
       const commandId = String(request.command.command_id ?? "");
+      const sourceHandles = [
+        ...(Array.isArray(request.command.resources) ? request.command.resources : []),
+        ...((request.command.input && typeof request.command.input === "object"
+          && !Array.isArray(request.command.input)
+          && Array.isArray((request.command.input as { images?: unknown }).images))
+          ? (request.command.input as { images: unknown[] }).images : []),
+      ].flatMap((resource) => resource && typeof resource === "object"
+        && !Array.isArray(resource) && typeof (resource as { handle?: unknown }).handle === "string"
+        ? [(resource as { handle: string }).handle] : []);
       const instance = WasmDurableInstance.attach_host(
         makeBridge(
           this.ctx.storage,
           (kind, detail) => this.publishKernelActivity(commandId, kind, detail),
+          (name, callId, argumentsJson) => recordExternalToolCall(
+            this.ctx.storage, instanceId, commandId, name, callId, argumentsJson,
+            (JSON.parse(request.package.manifest) as { external_tools?: { name: string; input_schema: unknown }[] })
+              .external_tools?.find((tool) => tool.name === name)?.input_schema,
+          ),
         ),
         instanceId,
         request.package.manifest,
         request.package.source,
         request.package.system_prompt,
+        request.package.project_context,
         JSON.stringify({
           provider: binding.provider,
           base_url: binding.base_url,
@@ -4680,10 +4876,10 @@ export class WorkflowInstance implements DurableObject {
           // The same admitted resource references drive the in-isolate tool
           // executor. WhippleScript, not this Worker, interprets selectors and
           // write attenuation; the shell only carries the validated command.
-          workspace_resources:
-            Array.isArray(request.command.resources) && request.command.resources.length > 0
-              ? request.command.resources
-              : undefined,
+          workspace_resources: agentWorkspaceResources(
+            request.package.manifest,
+            request.command.resources,
+          ),
         }),
       );
       const driven = await this.driveInstance(
@@ -4694,7 +4890,9 @@ export class WorkflowInstance implements DurableObject {
         commandId,
         (activity) => this.publishPublicActivity(commandId, activity),
         managedTokenLimit,
+        sourceHandles,
       );
+      this.liveModelContext.clear(`${instanceId}\0${commandId}`);
       const runtimeProjection = JSON.parse(
         hostFunctions.host_project_turn(
           makeBridge(this.ctx.storage),
@@ -4799,6 +4997,7 @@ export class WorkflowInstance implements DurableObject {
         ? request.command.command_id
         : "";
       if (instanceId && commandId) {
+        this.liveModelContext.clear(`${instanceId}\0${commandId}`);
         this.ctx.storage.sql.exec(
           "DELETE FROM host_turn_images WHERE instance_id = ?1 AND command_id = ?2",
           instanceId,
@@ -4850,6 +5049,7 @@ export class WorkflowInstance implements DurableObject {
         packageDocs.manifest,
         packageDocs.source,
         packageDocs.system_prompt,
+        packageDocs.project_context,
       )));
     } catch (error) {
       return Response.json({ error: `fork export rejected: ${String(error)}` }, { status: 409 });
@@ -4879,6 +5079,7 @@ export class WorkflowInstance implements DurableObject {
         request.package.manifest,
         request.package.source,
         request.package.system_prompt,
+        request.package.project_context,
       ));
       await this.ctx.storage.put(
         `host-package:${String(forked.target?.instance_ref ?? "")}`,
@@ -5226,6 +5427,7 @@ export class WorkflowInstance implements DurableObject {
       activity: "streaming_output" | "retrying" | "settling",
     ) => void,
     maximumManagedTokens?: number,
+    sourceHandles: readonly string[] = [],
   ): Promise<{
     status: string;
     outcome: string;
@@ -5319,6 +5521,11 @@ export class WorkflowInstance implements DurableObject {
       }
       if (outcome.kind === "needs_http") {
         mark("model_round_start");
+        const capture = hostedInstanceId && traceId
+          ? (body: unknown) => this.liveModelContext.record(
+              `${hostedInstanceId}\0${traceId}`, body, sourceHandles,
+            )
+          : undefined;
         let streaming = false;
         const emitDelta = (delta: string) => {
           if (!streaming) {
@@ -5388,6 +5595,7 @@ export class WorkflowInstance implements DurableObject {
                 targetUrl,
                 body,
               ),
+              capture,
             );
             replay?.complete();
             transportFailures = 0;
@@ -5427,6 +5635,9 @@ export class WorkflowInstance implements DurableObject {
               // A customer-credential round has no gateway, so there is no log
               // id to report; its cost is the customer's own provider bill.
               (event, _elapsedMs) => mark(event),
+              undefined,
+              undefined,
+              capture,
             );
             replay?.complete();
             transportFailures = 0;
@@ -5564,6 +5775,7 @@ export default {
         url.pathname === "/host/norm/publications" ||
         url.pathname === "/host/norm/enqueues" ||
         url.pathname === "/host/norm/impacts" ||
+        url.pathname === "/host/norm/promotions" ||
         url.pathname === "/host/instances/open" ||
         url.pathname === "/host/turns" ||
         url.pathname === "/host/forks/import" ||
@@ -5573,7 +5785,7 @@ export default {
         /^\/host\/instances\/[^/]+\/human\/answer$/.test(url.pathname) ||
         /^\/host\/instances\/[^/]+\/fork-export$/.test(url.pathname) ||
         /^\/host\/instances\/[^/]+\/files\/sync$/.test(url.pathname) ||
-        /^\/host\/instances\/[^/]+\/turns\/[^/]+(?:\/transcript|\/result|\/cancel|\/stream)?$/.test(url.pathname);
+        /^\/host\/instances\/[^/]+\/turns\/[^/]+(?:\/transcript|\/result|\/cancel|\/stream|\/model-context)?$/.test(url.pathname);
       if (!legacy) return Response.json({ error: "not found" }, { status: 404 });
       // Kept for local conformance and migration only. Managed composition uses
       // the tenant/placement route above.

@@ -1,0 +1,3 @@
+# The nested cell's own configuration: its build file is FIXTURE too.
+[buildfile]
+name = FIXTURE

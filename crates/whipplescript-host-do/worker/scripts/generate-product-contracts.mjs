@@ -8,6 +8,7 @@ const contractsRoot = resolve(root, "contracts");
 const publicOperations = [
   ["runtime.public.bootstrap", "POST", "/public/session/bootstrap", "http-json", "session", "critical"],
   ["runtime.public.claim", "POST", "/public/session/claim", "http-json", "mutation", "critical"],
+  ["runtime.public.external-call.answer", "POST", "/public/session/external-calls/:call/answer", "http-json", "mutation", "critical"],
   ["runtime.public.erase", "POST", "/public/session/erase", "http-json", "mutation", "critical"],
   ["runtime.public.state", "GET", "/public/session/state", "http-json", "none", "important"],
   ["runtime.public.files", "GET", "/public/session/files", "http-json", "none", "important"],
@@ -16,6 +17,7 @@ const publicOperations = [
 
 const hostOperations = [
   ["runtime.host.norm.impacts", "POST", "/host/norm/impacts", "http-json", "none", "critical"],
+  ["runtime.host.norm.promotions", "POST", "/host/norm/promotions", "http-json", "mutation", "critical"],
   ["runtime.host.norm.enqueues", "POST", "/host/norm/enqueues", "http-json", "mutation", "critical"],
   ["runtime.host.norm.publications", "POST", "/host/norm/publications", "http-json", "mutation", "critical"],
   ["runtime.host.norm.provision", "POST", "/host/norm/provision", "http-json", "mutation", "critical"],
@@ -50,6 +52,7 @@ const hostOperations = [
   ["runtime.host.action.explain", "GET", "/host/instances/:instance/explain", "http-json", "none", "important"],
   ["runtime.host.turn.read", "GET", "/host/instances/:instance/turns/:turn", "http-json", "none", "important"],
   ["runtime.host.transcript", "GET", "/host/instances/:instance/turns/:turn/transcript", "http-json", "none", "important"],
+  ["runtime.host.live-model-context", "GET", "/host/instances/:instance/turns/:turn/model-context", "http-json", "none", "critical"],
   ["runtime.host.events", "GET", "/host/instances/:instance/events", "http-json", "none", "important"],
   ["runtime.host.evidence", "GET", "/host/instances/:instance/evidence", "http-json", "none", "important"],
   ["runtime.host.stats", "GET", "/host/instances/:instance/stats", "http-json", "none", "important"],
@@ -102,10 +105,15 @@ function samplePath(path) {
     .replace(":epoch", "1")
     .replace(":instance", "instance-canary")
     .replace(":turn", "turn-canary")
+    .replace(":call", "call-canary")
     .replace(":operation", "policy");
 }
 
 function evidenceFor(id) {
+  if (id === "runtime.public.external-call.answer") {
+    const answer = "src/session.integration.test.ts#external-tool-answer-persistence";
+    return { contract: [answer], authority: [answer], journey: [answer], deployed: [], property: [answer] };
+  }
   if (id === "runtime.host.norm.impacts") {
     const impact = "src/norm-impact.integration.test.ts#norm-installed-impact";
     return { contract: [impact], authority: [impact], journey: [impact], deployed: [], property: [impact] };

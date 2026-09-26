@@ -32,6 +32,7 @@ pub(crate) const USAGE: &str = "usage: whip [--json] norm <command>\n\
   compare-resources <before-cut> <after-cut> [--before-frontier <file>] [--after-frontier <file>]\n\
   impact <before-cut> <after-cut> [--before-frontier <file>] [--after-frontier <file>]\n\
   render <id-or-alias> [--frontier <file>] | explain <id-or-alias> [--frontier <file>]\n\
+  query <expression> [--frontier <file>] [--cut <cut>]\n\
   diff --before-frontier <file> [--after-frontier <file>]\n\
   bootstrap --as <binding> --creator <principal> [--charter <file>]\n\
   create <vocabulary@version> --as <binding> --fields <file>\n\
@@ -106,6 +107,7 @@ impl<'a> Arguments<'a> {
         let (arity, allowed): (usize, &[&str]) = match verb {
             "snapshot" | "inventory" => (0, &["--frontier"]),
             "render" | "explain" => (1, &["--frontier"]),
+            "query" => (1, &["--frontier", "--cut"]),
             "diff" => (0, &["--before-frontier", "--after-frontier"]),
             "export" | "provision" => (0, &[]),
             "resources" => (1, &["--frontier"]),
@@ -541,9 +543,17 @@ fn execute(args: &[String], runtime_path: &std::path::Path) -> Result<Value, Str
             "observation": execution.observation(),
         }));
     }
+    // A ledger's first event leases the mainline for its gate (norm-plane §5).
+    let mut lease_gated_refs = || {
+        whipplescript_store::branches::lease_gated_mainline(
+            &mut whipplescript_store::branches::BranchStore::open(super::branch_store_path())?,
+            &super::now_stamp(),
+        )
+    };
     if args.verb == "dispatch" {
         let response = NormCommandHost::new(&mut store, &verifier)
             .with_artifacts(&artifacts)
+            .with_gated_refs(&mut lease_gated_refs)
             .execute_json(&args.file("--request")?)
             .map_err(debug_error)?;
         return serde_json::from_str(&response).map_err(|error| error.to_string());
@@ -588,6 +598,11 @@ fn execute(args: &[String], runtime_path: &std::path::Path) -> Result<Value, Str
                 NormCommand::Explain { record, frontier }
             }
         }
+        "query" => NormCommand::Query {
+            expression: args.positional[0].to_owned(),
+            frontier: args.frontier("--frontier")?,
+            cut: args.flags.get("--cut").map(|cut| (*cut).to_owned()),
+        },
         "diff" => {
             args.required("--before-frontier")?;
             NormCommand::Diff {
@@ -739,6 +754,7 @@ fn execute(args: &[String], runtime_path: &std::path::Path) -> Result<Value, Str
     };
     let response = NormCommandHost::new(&mut store, &verifier)
         .with_artifacts(&artifacts)
+        .with_gated_refs(&mut lease_gated_refs)
         .execute(NormCommandRequest::new(command))
         .map_err(debug_error)?;
     serde_json::to_value(response).map_err(|error| error.to_string())
@@ -746,6 +762,97 @@ fn execute(args: &[String], runtime_path: &std::path::Path) -> Result<Value, Str
 
 fn debug_error(error: whipplescript_store::StoreError) -> String {
     format!("{error:?}")
+}
+
+/// The mainline gate on this host (norm-plane §5): the native ledger, and the
+/// same trust, planning configuration, managed runtime and runtime store `norm
+/// impact` evaluates with. A workspace with no norm ledger is gated by
+/// nothing; one with a ledger this host cannot evaluate refuses, naming the
+/// missing configuration.
+pub(crate) fn with_mainline_admission<T>(
+    runtime_path: &std::path::Path,
+    door: whipplescript_kernel::norm_admission::AdmissionDoor,
+    tokens: &[String],
+    f: impl FnOnce(&mut dyn whipplescript_store::vcs::MainlineGate) -> T,
+) -> Result<T, String> {
+    use whipplescript_kernel::norm_admission::{AdmissionHost, NormMainlineAdmission};
+    use whipplescript_kernel::norm_execution_policy::ProtectedPythonPolicy;
+    use whipplescript_kernel::norm_planning::PlanningConfiguration;
+    use whipplescript_kernel::norm_runner::PythonRuntime;
+    // A workspace that never opened a ledger has none to consult, and asking
+    // must not create one.
+    let path = super::items_store_path();
+    let ledger = if path.exists() {
+        WorkItemStore::open(path)
+    } else {
+        WorkItemStore::open_in_memory()
+    }
+    .map_err(debug_error)?;
+    let document = trust_document();
+    let transport = document
+        .as_ref()
+        .map_err(Clone::clone)
+        .and_then(|document| custody_transport_for(document));
+    let trust = document.and_then(|document| {
+        let transport = transport.as_ref().map_err(Clone::clone)?;
+        NormTrust::from_document(document, transport.as_deref())
+    });
+    let verifier = trust
+        .as_ref()
+        .map_err(Clone::clone)
+        .and_then(|trust| trust.verifier());
+    let configuration = std::env::var("WHIPPLESCRIPT_NORM_PLANNING")
+        .map_err(|_| "host must configure WHIPPLESCRIPT_NORM_PLANNING".to_owned())
+        .and_then(|configured| PlanningConfiguration::parse(&configured));
+    let managed = super::norm_exec_managed::configuration().map_err(debug_error);
+    let managed = managed
+        .as_ref()
+        .map_err(Clone::clone)
+        .and_then(|host| super::norm_exec_managed::require(host.as_ref()).map_err(debug_error));
+    let time_basis = format!(
+        "native-admission/{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_nanos())
+            .unwrap_or_default()
+    );
+    let policy = managed.as_ref().map_err(Clone::clone).and_then(|host| {
+        ProtectedPythonPolicy::new(
+            &serde_json::to_string(&host.installed.runtime).map_err(|error| error.to_string())?,
+            &time_basis,
+        )
+    });
+    // Opening the runtime store creates it; an ungoverned workspace's
+    // promotion must touch nothing it does not already have.
+    let governed = ledger.norm_checkpoint().map_err(debug_error)?.is_some();
+    let runtime = if governed {
+        super::open_store(runtime_path)
+    } else {
+        whipplescript_store::SqliteStore::open_in_memory().map_err(debug_error)
+    };
+    let verify = |selected: &PythonRuntime| {
+        managed
+            .as_ref()
+            .map_err(Clone::clone)
+            .and_then(|host| host.installed.validate_for(selected).map_err(debug_error))
+    };
+    let host = (|| {
+        Ok(AdmissionHost {
+            verifier: verifier.as_ref().map_err(Clone::clone)?,
+            configuration: configuration.as_ref().map_err(Clone::clone)?,
+            runtime: runtime.as_ref().map_err(Clone::clone)?,
+            policy: policy.as_ref().map_err(Clone::clone)?,
+            verify_runtime: &verify,
+        })
+    })();
+    let mut gate = NormMainlineAdmission::new(
+        &ledger,
+        host,
+        door,
+        whipplescript_store::branches::MAINLINE_BRANCH_ID,
+    )
+    .with_tokens(tokens.iter().cloned());
+    Ok(f(&mut gate))
 }
 
 #[cfg(test)]

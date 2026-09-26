@@ -1,0 +1,81 @@
+load ../tracker-ordering.maude
+
+--- Coverage 1: the parent's owner ranks two siblings.
+search [1] in TRACKER-ORDERING :
+  { parent(1, 2) parent(1, 3) owner(1, 5) stmt(2, 3, 5) }
+  =>* { prec(2, 3) RESIDUAL:Cfg } .
+
+--- Coverage 2: under a parent with no owner, anyone's statement ranks.
+search [1] in TRACKER-ORDERING :
+  { parent(1, 2) parent(1, 3) stmt(2, 3, 6) }
+  =>* { prec(2, 3) RESIDUAL:Cfg } .
+
+--- Coverage 3: roots are siblings with no owner.
+search [1] in TRACKER-ORDERING :
+  { stmt(1, 4, 9) }
+  =>* { prec(1, 4) RESIDUAL:Cfg } .
+
+--- Coverage 4: hierarchical -- children follow their parents' order, and so do
+--- grandchildren.
+search [1] in TRACKER-ORDERING :
+  { stmt(1, 4, 9) parent(1, 2) parent(4, 5) parent(2, 3) parent(5, 6) }
+  =>* { prec(3, 6) RESIDUAL:Cfg } .
+
+--- Coverage 5: inherited backward -- 7, under another parent, is a gating
+--- dependency of 2, which ranks before 3, so 7 is urgent before 3; and 8, a
+--- dependency of 7, inherits it in turn.
+search [1] in TRACKER-ORDERING :
+  { parent(1, 2) parent(1, 3) owner(1, 5) stmt(2, 3, 5) parent(6, 7)
+    gatesOn(7, 2) gatesOn(8, 7) }
+  =>* { urgent(8, 3) RESIDUAL:Cfg } .
+
+--- Coverage 6: a contradiction is marked, on both issues.
+search [1] in TRACKER-ORDERING :
+  { parent(1, 2) parent(1, 3) owner(1, 5) stmt(2, 3, 5) stmt(3, 2, 5) }
+  =>* { conflict(2) conflict(3) RESIDUAL:Cfg } .
+
+--- Bite 1: a statement by someone other than the parent's owner is a proposal
+--- and ranks nothing.
+search [1] in TRACKER-ORDERING :
+  { parent(1, 2) parent(1, 3) owner(1, 5) stmt(2, 3, 6) }
+  =>* { prec(2, 3) RESIDUAL:Cfg } .
+
+--- Bite 2: a statement between issues under different parents ranks nothing.
+search [1] in TRACKER-ORDERING :
+  { parent(1, 2) parent(4, 5) stmt(2, 5, 9) }
+  =>* { prec(2, 5) RESIDUAL:Cfg } .
+
+--- Bite 3: urgency never flows forward -- 2 is a gating dependency of 7, and
+--- 2 ranks before 3, but 7 does not inherit that rank.
+search [1] in TRACKER-ORDERING :
+  { parent(1, 2) parent(1, 3) owner(1, 5) stmt(2, 3, 5) parent(6, 7)
+    gatesOn(2, 7) }
+  =>* { urgent(7, 3) RESIDUAL:Cfg } .
+
+--- Bite 4: inheritance overriding a stated order is not a contradiction. The
+--- owner ranks 3 before 2, but 2 is a dependency of 9, which ranks before 3:
+--- 2 becomes urgent before 3, and no final state marks a conflict.
+search [1] in TRACKER-ORDERING :
+  { parent(1, 2) parent(1, 3) owner(1, 5) stmt(3, 2, 5) stmt(9, 1, 4)
+    gatesOn(2, 9) }
+  =>! { F:Cfg } such that hasConflict(2, F:Cfg) or hasConflict(3, F:Cfg) .
+
+--- Coverage 7: ... and 2 is urgent before 3 there.
+search [1] in TRACKER-ORDERING :
+  { parent(1, 2) parent(1, 3) owner(1, 5) stmt(3, 2, 5) stmt(9, 1, 4)
+    gatesOn(2, 9) }
+  =>* { urgent(2, 3) RESIDUAL:Cfg } .
+
+--- Bite 5: no silent winner -- every final state of a contradiction ranks the
+--- pair with the conflict marked.
+search [1] in TRACKER-ORDERING :
+  { parent(1, 2) parent(1, 3) owner(1, 5) stmt(2, 3, 5) stmt(3, 2, 5) }
+  =>! { F:Cfg } such that hasPrec(2, 3, F:Cfg) and not hasConflict(2, F:Cfg) .
+
+--- Bite 5 teeth: the SILENT-WINNER ordering does reach a final state that
+--- ranks the pair with no conflict -- the outcome Bite 5 makes unreachable.
+search [1] in TRACKER-ORDERING-SILENT-WINNER :
+  { stmt(2, 3, 6) stmt(3, 2, 5) }
+  =>! { F:Cfg } such that hasPrec(2, 3, F:Cfg) and not hasConflict(2, F:Cfg) .
+
+quit .

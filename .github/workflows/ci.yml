@@ -25,15 +25,15 @@ name: CI
 #                             runs inside the one bar.
 #   windows-compiles          `scripts/check-windows-compile.sh` on a Windows
 #                             runner. The bar's `windows-compile` section skips
-#                             on any other host and says so, and the fleet has
-#                             no Windows host yet: this leg is UNANSWERED until
-#                             one enrolls, and a release still compiles every
-#                             target in dist-workspace.toml.
+#                             on any other host and says so. The fleet's
+#                             Windows host runs it on default-branch heads;
+#                             release still compiles every target in
+#                             dist-workspace.toml.
 #   new-refusals              `scripts/check-new-refusals.sh` against the merge
 #                             base — a question only a diff can ask, so it was
-#                             never in the bar. Run it by hand on a branch that
-#                             adds a refusal until the fleet takes it as a job
-#                             of its own under the manifest's `gate` block.
+#                             never in the bar. The fleet runs it as a separate
+#                             per-change pull request job under the manifest's
+#                             `gate.jobs` block.
 #
 # The same file is published to the public mirror verbatim (publish-mirror.sh),
 # so the suites below that are marked mirror-only run there on the weekly cron

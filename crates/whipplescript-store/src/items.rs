@@ -13,8 +13,10 @@
 //! "combined claim/status write" cure): a plain `claim` appends only a
 //! `claim.acquired` event and changes readiness through a lease OVERLAY, not a
 //! durable `in_progress` write. Durable issue status is only `open` / `closed`
-//! / `canceled`; `in_progress` is purely the active-lease overlay, and `ready`
-//! is a derived predicate (open, unblocked, unleased).
+//! / `canceled` / `archived`; `in_progress` is purely the active-lease overlay,
+//! and `ready` is a derived predicate with one definition (DR-0126,
+//! [`readiness`]): open, unleased, unconflicted, no open gating dependency,
+//! and every wait condition holding, at the caller's instant.
 //!
 //! The three invariant models under `models/maude/` are the spec this storage
 //! realizes: exclusivity + expiry + holder-only renew + terminal-release
@@ -44,6 +46,10 @@ mod filing;
 mod protection;
 #[cfg(feature = "native")]
 pub use protection::TrackerEventMetadata;
+
+pub mod readiness;
+#[cfg(feature = "native")]
+mod readiness_native;
 
 #[cfg(feature = "native")]
 mod closure;
@@ -107,7 +113,8 @@ pub struct WorkItem {
 #[cfg(test)]
 const STORE_PRODUCED_STATUSES: &[&str] = &[
     // `open` on file, `closed` on finish, `canceled` on cancel, `open` again on
-    // reopen (items.rs fold), `archived` via `whip issue archive`.
+    // reopen, and any of the four through a `status` field set; `archived` has
+    // no verb and is reached only by `whip issue set <id> status archived`.
     "open",
     "closed",
     "canceled",
@@ -118,7 +125,9 @@ const STORE_PRODUCED_STATUSES: &[&str] = &[
 ];
 
 /// The relation kinds the builtin provider supports (ADR-0002 "Relations And
-/// Dependencies"). Only `blocks` gates readiness; the rest are graph metadata.
+/// Dependencies"). Only `blocks` bears on readiness, and only when its
+/// dependency kind gates (DR-0126); `parent-of` places an issue under the
+/// parent its position is ranked within; the rest are graph metadata.
 pub const RELATION_KINDS: &[&str] = &[
     "blocks",
     "parent-of",
@@ -129,8 +138,11 @@ pub const RELATION_KINDS: &[&str] = &[
 ];
 
 /// The dependency-kind taxonomy a `blocks` relation may carry (small and
-/// operational). Recorded metadata; every `blocks` edge gates readiness
-/// regardless of `dep_kind` (providers may later refine).
+/// operational). DR-0126 splits it by meaning: `order` and `soft` are ordering
+/// statements that rank and never gate
+/// ([`readiness::ORDERING_DEPENDENCY_KINDS`]); every other kind, and an edge
+/// with none, is a dependency that gates readiness. `discovered` records how a
+/// dependency was found, not how strong it is, so it gates like `hard`.
 pub const DEPENDENCY_KINDS: &[&str] = &[
     "hard",
     "soft",
@@ -508,47 +520,11 @@ impl WorkItemStore {
         Ok(items)
     }
 
-    /// Readiness is the tracker's promise (`tracker-readiness.maude`): ready
-    /// iff durable status is `open`, no ACTIVE blocker (`blocks(B, id)` with `B`
-    /// still open), and no ACTIVE lease. Expired/released leases do not block.
+    /// The ready set of `queue` at the store's own clock — the CLI's boundary
+    /// instant. The one readiness (DR-0126) decides; see [`Self::ready_items_at`].
     pub fn ready_items(&self, queue: &str) -> StoreResult<Vec<WorkItem>> {
-        let mut statement = self.connection.prepare(&format!(
-            "SELECT {ISSUE_COLS} FROM tracker_issues i \
-             WHERE i.queue = ?1 AND i.status = 'open' \
-             AND NOT EXISTS ( \
-               SELECT 1 FROM tracker_leases l \
-               WHERE l.issue_id = i.issue_id \
-                 AND l.released_at IS NULL \
-                 AND (l.expires_at IS NULL OR l.expires_at > datetime('now'))) \
-             AND NOT EXISTS ( \
-               SELECT 1 FROM tracker_relations r JOIN tracker_issues b ON b.issue_id = r.from_issue \
-               WHERE r.to_issue = i.issue_id AND r.kind = 'blocks' AND b.status = 'open') \
-             ORDER BY i.created_at, i.issue_id"
-        ))?;
-        let rows = statement
-            .query_map([queue], row_to_item)?
-            .collect::<Result<Vec<_>, _>>()?;
-        // A conflicted issue is not ready (ADR-0002 phase B1 slice ii): its
-        // field values are in dispute, so handing it to a worker would race a
-        // resolution. The DAG conflict test is not expressible in the SQL
-        // predicate above, so filter it here (the candidate set is small).
-        let mut ready = Vec::with_capacity(rows.len());
-        for item in rows {
-            let conflicted = match content_id_of(&self.connection, &item.id)? {
-                Some(content_id) => {
-                    analyze_issue_dag(&load_issue_events(&self.connection, &content_id)?)
-                        .conflicted()
-                }
-                None => false,
-            };
-            if !conflicted {
-                ready.push(item);
-            }
-        }
-        // Ready items have no active lease by construction, so the overlay is a
-        // no-op here; return them as the projection sees them (durable `open`,
-        // unclaimed).
-        Ok(ready)
+        let at = self.store_now()?;
+        self.ready_items_at(queue, &at)
     }
 
     /// Atomic claim (`tracker-lease.maude` I1, exclusivity): grants a lease ONLY
@@ -569,6 +545,24 @@ impl WorkItemStore {
         claimed_by: &str,
         expires: Option<&str>,
     ) -> StoreResult<ClaimOutcome> {
+        let at = self.store_now()?;
+        self.claim_item_at(item_id, claimed_by, expires, &at, None)
+    }
+
+    /// Claim at the caller's instant `at` (DR-0126 RV-1/RV-3): granted only when
+    /// the one readiness calls the issue ready then. `override_reason` lets a
+    /// person claim an issue that is open but not ready, and is recorded on the
+    /// claim; a workflow never passes one.
+    pub fn claim_item_at(
+        &mut self,
+        item_id: &str,
+        claimed_by: &str,
+        expires: Option<&str>,
+        at: &str,
+        override_reason: Option<&str>,
+    ) -> StoreResult<ClaimOutcome> {
+        let at = readiness::canonical_instant(at)
+            .ok_or_else(|| StoreError::Conflict(format!("`{at}` is not an instant")))?;
         let tx = self
             .connection
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -578,6 +572,8 @@ impl WorkItemStore {
             item_id,
             claimed_by,
             expires,
+            &at,
+            override_reason,
             self.event_effect_id.as_deref(),
             &now,
         )?;
@@ -893,6 +889,84 @@ impl WorkItemStore {
         Ok(FinishOutcome::Finished)
     }
 
+    /// Withdraws an open issue (`issue.canceled`) with an optional reason, and
+    /// releases any active lease. The same guards as `finish_item`: cancelable
+    /// only from durable `open`, and holder-scoped when `expect_holder` is
+    /// `Some`. Cancellation is not closure — `closings` deliberately does not
+    /// see it — so this is the door for work nobody will do, not work done.
+    ///
+    /// `set_field(id, "status", "canceled")` reaches the same status but
+    /// strands the lease: the issue stops being `open`, so the overlay stops
+    /// showing its holder, and the lease row outlives the work. This does not.
+    pub fn cancel_item(
+        &mut self,
+        item_id: &str,
+        reason: Option<&str>,
+        expect_holder: Option<&str>,
+    ) -> StoreResult<FinishOutcome> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let now = tx_now(&tx)?;
+        if let Some(holder) = tx_holder_conflict(&tx, item_id, &now, expect_holder)? {
+            tx.commit()?;
+            return Ok(FinishOutcome::HeldByOther { holder });
+        }
+        if tx_status(&tx, item_id)?.as_deref() != Some("open") {
+            tx.commit()?;
+            return Ok(FinishOutcome::NotOpen);
+        }
+        let payload = json!({"status": "canceled", "summary": reason});
+        tx_append_event(
+            &tx,
+            Some(item_id),
+            "issue.canceled",
+            &payload,
+            None,
+            self.event_effect_id.as_deref(),
+            &now,
+        )?;
+        fold_set_status(&tx, Some(item_id), &payload, "canceled", &now)?;
+        tx_release_active_lease(&tx, item_id, self.event_effect_id.as_deref(), &now)?;
+        tx.commit()?;
+        Ok(FinishOutcome::Finished)
+    }
+
+    /// Returns a `closed` or `canceled` issue to `open` (`issue.reopened`), so
+    /// it is ready again unless something blocks it. An `archived` issue stays
+    /// archived: archiving is the statement that nobody will look again.
+    pub fn reopen_item(&mut self, item_id: &str, note: Option<&str>) -> StoreResult<ReopenOutcome> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let now = tx_now(&tx)?;
+        match tx_status(&tx, item_id)?.as_deref() {
+            None => {
+                tx.commit()?;
+                return Ok(ReopenOutcome::NotFound);
+            }
+            Some("closed" | "canceled") => {}
+            Some(status) => {
+                let status = status.to_owned();
+                tx.commit()?;
+                return Ok(ReopenOutcome::NotReopenable { status });
+            }
+        }
+        let payload = json!({"status": "open", "summary": note});
+        tx_append_event(
+            &tx,
+            Some(item_id),
+            "issue.reopened",
+            &payload,
+            None,
+            self.event_effect_id.as_deref(),
+            &now,
+        )?;
+        fold_set_status(&tx, Some(item_id), &payload, "open", &now)?;
+        tx.commit()?;
+        Ok(ReopenOutcome::Reopened)
+    }
+
     /// Direct an open issue at `assignee`, or clear it with `None` (0.2.2).
     ///
     /// Assignment is advisory by design: it records who *should* act, and does
@@ -944,6 +1018,20 @@ impl WorkItemStore {
         kind: &str,
         dep_kind: Option<&str>,
     ) -> StoreResult<()> {
+        self.add_relation_by(from, to, kind, dep_kind, None)
+    }
+
+    /// [`Self::add_relation`], recording who wrote the edge. For an ordering
+    /// statement (an `order` or `soft` dependency) the writer is what decides
+    /// whether it ranks: only the parent's owner's statements do (DR-0126).
+    pub fn add_relation_by(
+        &mut self,
+        from: &str,
+        to: &str,
+        kind: &str,
+        dep_kind: Option<&str>,
+        actor: Option<&str>,
+    ) -> StoreResult<()> {
         if !RELATION_KINDS.contains(&kind) {
             return Err(StoreError::Conflict(format!(
                 "unknown relation kind `{kind}`"
@@ -975,7 +1063,7 @@ impl WorkItemStore {
             Some(to),
             "relation.added",
             &payload,
-            None,
+            actor,
             self.event_effect_id.as_deref(),
             &now,
         )?;
@@ -1790,6 +1878,24 @@ impl WorkItemStore {
 
     pub fn norm_checkpoint(&self) -> StoreResult<Option<crate::norm::NormCheckpoint>> {
         load_norm_checkpoint(&self.connection)
+    }
+
+    /// Run `f` holding the ledger database's write lock, so no norm event —
+    /// no evidence, revocation, rotation or grant — can be appended until it
+    /// returns. Reads inside `f` see the state the lock froze; nothing is
+    /// written, so the transaction is rolled back. A gated ref's admission
+    /// holds this across the branch store's compare-and-swap (norm-plane §5).
+    pub fn with_norm_write_exclusion<T>(
+        &self,
+        f: &mut dyn FnMut() -> StoreResult<T>,
+    ) -> StoreResult<T> {
+        let exclusion = rusqlite::Transaction::new_unchecked(
+            &self.connection,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
+        let result = f();
+        exclusion.rollback()?;
+        result
     }
 
     /// Pin the destination's trusted identity and authority event together.
@@ -2633,15 +2739,22 @@ fn tx_active_holder(tx: &Transaction<'_>, item_id: &str, now: &str) -> StoreResu
 
 /// Lazily expire past-due, still-held leases on an issue (append `claim.expired`,
 /// mark released), so an expired lease frees the issue for a fresh claim.
+/// Decides at the caller's instant `at` which leases have lapsed, and stamps
+/// the release with the store's `now`.
 #[cfg(feature = "native")]
-fn tx_expire_stale_leases(tx: &Transaction<'_>, item_id: &str, now: &str) -> StoreResult<()> {
+fn tx_expire_stale_leases_at(
+    tx: &Transaction<'_>,
+    item_id: &str,
+    at: &str,
+    now: &str,
+) -> StoreResult<()> {
     let stale: Vec<String> = tx
         .prepare(
             "SELECT lease_id FROM tracker_leases \
              WHERE issue_id = ?1 AND released_at IS NULL AND expires_at IS NOT NULL \
                AND expires_at <= ?2",
         )?
-        .query_map(params![item_id, now], |row| row.get(0))?
+        .query_map(params![item_id, at], |row| row.get(0))?
         .collect::<Result<Vec<_>, _>>()?;
     for lease_id in &stale {
         tx_mark_lease_released(tx, lease_id, item_id, "claim.expired", "system", None, now)?;
@@ -2664,6 +2777,18 @@ fn tx_active_lease_holder(
             ),
             params![item_id, now],
             |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?)
+}
+
+/// The issue's durable status (no lease overlay), or `None` if it is absent.
+#[cfg(feature = "native")]
+fn tx_status(tx: &Transaction<'_>, item_id: &str) -> StoreResult<Option<String>> {
+    Ok(tx
+        .query_row(
+            "SELECT status FROM tracker_issues WHERE issue_id = ?1",
+            [item_id],
+            |row| row.get(0),
         )
         .optional()?)
 }
@@ -3477,6 +3602,31 @@ pub trait WorkItems {
 
     fn ready_items(&self, queue: &str) -> StoreResult<Vec<WorkItem>>;
 
+    /// The ready set of `queue` at the caller's instant `at`, in derived order
+    /// (DR-0126): the one readiness decides, and nothing here reads a clock.
+    /// The kernel's projection asks this with its injected `now`.
+    fn ready_items_at(&self, queue: &str, at: &str) -> StoreResult<Vec<WorkItem>>;
+
+    /// A claim at the caller's instant `at` (DR-0126): granted only when the one
+    /// readiness calls the issue ready then, with no override — the door a
+    /// workflow uses.
+    fn claim_item_at(
+        &mut self,
+        item_id: &str,
+        claimed_by: &str,
+        expires: Option<&str>,
+        at: &str,
+    ) -> StoreResult<ClaimOutcome>;
+
+    /// The earliest instant after `at` at which readiness of any issue in
+    /// `queues` can change by time alone — a claim expiring, a deferral's
+    /// instant, a review date — so a parked instance wakes for it (DR-0126).
+    fn next_readiness_change_after(
+        &self,
+        queues: &[String],
+        at: &str,
+    ) -> StoreResult<Option<String>>;
+
     /// Every closing of every issue in `queue`, oldest first (DR-0110).
     ///
     /// Deliberately has NO default. A default returning an empty list would let
@@ -3658,6 +3808,32 @@ impl WorkItems for WorkItemStore {
         self.ready_items(queue)
     }
 
+    fn ready_items_at(&self, queue: &str, at: &str) -> StoreResult<Vec<WorkItem>> {
+        let at = readiness::canonical_instant(at)
+            .ok_or_else(|| StoreError::Conflict(format!("`{at}` is not an instant")))?;
+        self.ready_items_at(queue, &at)
+    }
+
+    fn claim_item_at(
+        &mut self,
+        item_id: &str,
+        claimed_by: &str,
+        expires: Option<&str>,
+        at: &str,
+    ) -> StoreResult<ClaimOutcome> {
+        self.claim_item_at(item_id, claimed_by, expires, at, None)
+    }
+
+    fn next_readiness_change_after(
+        &self,
+        queues: &[String],
+        at: &str,
+    ) -> StoreResult<Option<String>> {
+        let at = readiness::canonical_instant(at)
+            .ok_or_else(|| StoreError::Conflict(format!("`{at}` is not an instant")))?;
+        self.next_readiness_change_after(queues, &at)
+    }
+
     fn claim_item(
         &mut self,
         item_id: &str,
@@ -3734,8 +3910,20 @@ impl WorkItems for WorkItemStore {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ClaimOutcome {
     Claimed,
-    AlreadyClaimed { holder: String },
+    AlreadyClaimed {
+        holder: String,
+    },
     NotFound,
+    /// The issue is not open work — closed, canceled or archived. Never
+    /// overridable: reopen it first.
+    NotOpen {
+        status: String,
+    },
+    /// The one readiness refused it (DR-0126): every reason, so the caller can
+    /// say what the claim would have skipped.
+    NotReady {
+        reasons: Vec<readiness::Unready>,
+    },
 }
 
 /// Outcome of `renew_claim` (`tracker-lease.maude` I2). `NotHeld` = the actor
@@ -3951,6 +4139,14 @@ pub enum FinishOutcome {
     Finished,
     NotOpen,
     HeldByOther { holder: String },
+}
+
+/// Outcome of `reopen_item`. `NotReopenable` carries the status that refused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReopenOutcome {
+    Reopened,
+    NotFound,
+    NotReopenable { status: String },
 }
 
 #[cfg(feature = "native")]
@@ -5421,7 +5617,13 @@ mod tests {
         assert_eq!(after[0].kind, "related");
 
         // Validation: unknown kinds and misplaced dep_kind are rejected.
-        assert!(store.add_relation(&a.id, &b.id, "bogus", None).is_err());
+        let refused = store
+            .add_relation(&a.id, &b.id, "bogus", None)
+            .expect_err("an unknown kind is refused");
+        assert!(
+            format!("{refused:?}").contains("unknown relation kind `bogus`"),
+            "{refused:?}"
+        );
         assert!(store
             .add_relation(&a.id, &b.id, "related", Some("hard"))
             .is_err());
@@ -6087,7 +6289,7 @@ mod tests {
                 {
                     ClaimOutcome::Claimed => claimed += 1,
                     ClaimOutcome::AlreadyClaimed { .. } => already += 1,
-                    ClaimOutcome::NotFound => panic!("item vanished"),
+                    other => panic!("unexpected claim outcome {other:?}"),
                 }
             }
             assert_eq!(claimed, 1, "exactly one worker claims {id}");
@@ -6270,6 +6472,86 @@ mod tests {
                 .release_item(&item.id, Some("agent:a"))
                 .expect("holder releases"),
             ReleaseOutcome::Released
+        );
+    }
+
+    /// `cancel_item` withdraws held work without stranding its lease, is not a
+    /// closure, and survives a rebuild; `reopen_item` makes it ready again.
+    #[test]
+    fn cancel_releases_the_claim_and_reopen_restores_readiness() {
+        let mut store = open_memory();
+        let item = store
+            .file_item("backlog", "a", "", &[], &json!({}), None, None)
+            .expect("files");
+        store.claim_item(&item.id, "agent:a", None).expect("claims");
+
+        assert_eq!(
+            store
+                .cancel_item(&item.id, Some("nobody needs it"), Some("agent:b"))
+                .expect("cancel refused"),
+            FinishOutcome::HeldByOther {
+                holder: "agent:a".to_string()
+            }
+        );
+        assert_eq!(
+            store
+                .cancel_item(&item.id, Some("nobody needs it"), Some("agent:a"))
+                .expect("holder cancels"),
+            FinishOutcome::Finished
+        );
+        let canceled = store.get_item(&item.id).expect("gets").expect("exists");
+        assert_eq!(canceled.status, "canceled");
+        assert_eq!(canceled.claimed_by, None, "the lease went with the work");
+        assert!(store.ready_items("backlog").expect("ready").is_empty());
+        assert!(
+            store.closings("backlog").expect("closings").is_empty(),
+            "cancellation is not closure"
+        );
+        assert_eq!(
+            store
+                .cancel_item(&item.id, None, None)
+                .expect("second cancel"),
+            FinishOutcome::NotOpen
+        );
+
+        store.rebuild_projection().expect("rebuild");
+        let rebuilt = store.get_item(&item.id).expect("gets").expect("exists");
+        assert_eq!(rebuilt.status, "canceled");
+        assert_eq!(rebuilt.claimed_by, None);
+
+        assert_eq!(
+            store.reopen_item(&item.id, None).expect("reopens"),
+            ReopenOutcome::Reopened
+        );
+        let ready = store.ready_items("backlog").expect("ready");
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].id, item.id);
+        assert_eq!(
+            store.reopen_item(&item.id, None).expect("open refuses"),
+            ReopenOutcome::NotReopenable {
+                status: "open".to_string()
+            }
+        );
+        assert_eq!(
+            store.reopen_item("WS-404", None).expect("absent"),
+            ReopenOutcome::NotFound
+        );
+
+        store.finish_item(&item.id, None, None).expect("finishes");
+        assert_eq!(
+            store
+                .reopen_item(&item.id, Some("regressed"))
+                .expect("reopens closed"),
+            ReopenOutcome::Reopened
+        );
+        store.rebuild_projection().expect("rebuild");
+        assert_eq!(
+            store
+                .get_item(&item.id)
+                .expect("gets")
+                .expect("exists")
+                .status,
+            "open"
         );
     }
 

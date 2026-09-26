@@ -1,41 +1,147 @@
 load ../tracker-readiness.maude
 
 --- Coverage 1: an open, unblocked, unleased issue is ready.
-search in TRACKER-READINESS :
+search [1] in TRACKER-READINESS :
   { issue(1, open) now(50) }
   =>* { ready(1) RESIDUAL:Cfg } .
 
 --- Coverage 2: when the blocking issue is CLOSED, the blocked issue 2 becomes
 --- ready.
-search in TRACKER-READINESS :
+search [1] in TRACKER-READINESS :
   { issue(2, open) issue(1, closed) blocks(1, 2) now(50) }
   =>* { ready(2) RESIDUAL:Cfg } .
 
 --- Coverage 3: when the lease EXPIRES -- expiresAt 40 <= now 50 -- the issue
 --- becomes ready again.
-search in TRACKER-READINESS :
+search [1] in TRACKER-READINESS :
   { issue(1, open) lease(1, 7, 40) now(50) }
   =>* { ready(1) RESIDUAL:Cfg } .
 
 --- Bite 1: an issue blocked by an ACTIVE (open) issue is never ready.
-search in TRACKER-READINESS :
+search [1] in TRACKER-READINESS :
   { issue(2, open) issue(1, open) blocks(1, 2) now(50) }
   =>* { ready(2) RESIDUAL:Cfg } .
 
 --- Bite 2: an issue under an ACTIVE lease -- expiresAt 100 > now 50 -- is
 --- never ready.
-search in TRACKER-READINESS :
+search [1] in TRACKER-READINESS :
   { issue(1, open) lease(1, 7, 100) now(50) }
   =>* { ready(1) RESIDUAL:Cfg } .
 
 --- Bite 3: a CLOSED issue is never ready.
-search in TRACKER-READINESS :
+search [1] in TRACKER-READINESS :
   { issue(1, closed) now(50) }
   =>* { ready(1) RESIDUAL:Cfg } .
 
 --- Bite 4: a CANCELED issue is never ready.
-search in TRACKER-READINESS :
+search [1] in TRACKER-READINESS :
   { issue(1, canceled) now(50) }
   =>* { ready(1) RESIDUAL:Cfg } .
+
+--- DR-0126 Decision 3. Coverage 4: an `order` edge from an OPEN issue does not
+--- gate -- it is an ordering statement, not a dependency.
+search [1] in TRACKER-READINESS :
+  { issue(2, open) issue(1, open) blocks(1, 2, order) now(50) }
+  =>* { ready(2) RESIDUAL:Cfg } .
+
+--- Coverage 5: nor does a `soft` edge.
+search [1] in TRACKER-READINESS :
+  { issue(2, open) issue(1, open) blocks(1, 2, soft) now(50) }
+  =>* { ready(2) RESIDUAL:Cfg } .
+
+--- Bite 5: a `discovered` dependency on an open issue gates like a hard one.
+search [1] in TRACKER-READINESS :
+  { issue(2, open) issue(1, open) blocks(1, 2, discovered) now(50) }
+  =>* { ready(2) RESIDUAL:Cfg } .
+
+--- Bite 6: so does a `resource` dependency.
+search [1] in TRACKER-READINESS :
+  { issue(2, open) issue(1, open) blocks(1, 2, resource) now(50) }
+  =>* { ready(2) RESIDUAL:Cfg } .
+
+--- Bite 7: a conflicted issue is never ready.
+search [1] in TRACKER-READINESS :
+  { issue(1, open) conflicted(1) now(50) }
+  =>* { ready(1) RESIDUAL:Cfg } .
+
+--- DR-0126 Decision 2, wait conditions. Coverage 6: `at` holds once the
+--- evaluation instant has reached it.
+search [1] in TRACKER-READINESS :
+  { issue(1, open) wait(1, 1, at(40), 90) now(50) }
+  =>* { ready(1) RESIDUAL:Cfg } .
+
+--- Bite 8: before that instant the issue is never ready.
+search [1] in TRACKER-READINESS :
+  { issue(1, open) wait(1, 1, at(60), 90) now(50) }
+  =>* { ready(1) RESIDUAL:Cfg } .
+
+--- Coverage 7: `settled` holds once the issue waited on is withdrawn, not only
+--- closed -- the shipped behaviour of a gating dependency.
+search [1] in TRACKER-READINESS :
+  { issue(2, open) issue(1, canceled) wait(1, 2, settled(1), 90) now(50) }
+  =>* { ready(2) RESIDUAL:Cfg } .
+
+--- Bite 9: while the issue waited on is open, never ready.
+search [1] in TRACKER-READINESS :
+  { issue(2, open) issue(1, open) wait(1, 2, settled(1), 90) now(50) }
+  =>* { ready(2) RESIDUAL:Cfg } .
+
+--- Bite 10: nor when it is unknown here -- absence is not settlement.
+search [1] in TRACKER-READINESS :
+  { issue(2, open) wait(1, 2, settled(9), 90) now(50) }
+  =>* { ready(2) RESIDUAL:Cfg } .
+
+--- Coverage 8: `reached` holds once an admitted event reached the status.
+search [1] in TRACKER-READINESS :
+  { issue(1, open) reachedEvent(7, 2) wait(1, 1, reached(7, 2), 90) now(50) }
+  =>* { ready(1) RESIDUAL:Cfg } .
+
+--- Bite 11: a record at a different status does not satisfy it.
+search [1] in TRACKER-READINESS :
+  { issue(1, open) reachedEvent(7, 1) wait(1, 1, reached(7, 2), 90) now(50) }
+  =>* { ready(1) RESIDUAL:Cfg } .
+
+--- Coverage 9: `count` holds at its threshold.
+search [1] in TRACKER-READINESS :
+  { issue(1, open) issue(2, open) issue(3, closed) labeled(2, lblA)
+    labeled(3, lblA) wait(1, 1, count(lblA, 2), 90) now(50) }
+  =>* { ready(1) RESIDUAL:Cfg } .
+
+--- Bite 12: a withdrawn issue is not demand, so one short of the threshold.
+search [1] in TRACKER-READINESS :
+  { issue(1, open) issue(2, open) issue(3, canceled) labeled(2, lblA)
+    labeled(3, lblA) wait(1, 1, count(lblA, 2), 90) now(50) }
+  =>* { ready(1) RESIDUAL:Cfg } .
+
+--- Bite 13: every wait must hold -- one met and one unmet is not ready.
+search [1] in TRACKER-READINESS :
+  { issue(1, open) wait(1, 1, at(40), 90) wait(2, 1, at(60), 90) now(50) }
+  =>* { ready(1) RESIDUAL:Cfg } .
+
+--- Review. Coverage 10: an unmet wait past its review instant is due.
+search [1] in TRACKER-READINESS :
+  { issue(1, open) wait(1, 1, at(80), 45) now(50) }
+  =>* { dueReview(1) RESIDUAL:Cfg } .
+
+--- Bite 14: a wait that holds is never up for review, however old.
+search [1] in TRACKER-READINESS :
+  { issue(1, open) wait(1, 1, at(40), 10) now(50) }
+  =>* { dueReview(1) RESIDUAL:Cfg } .
+
+--- Bite 15: nor is an unmet one before its review instant.
+search [1] in TRACKER-READINESS :
+  { issue(1, open) wait(1, 1, at(80), 60) now(50) }
+  =>* { dueReview(1) RESIDUAL:Cfg } .
+
+--- Bite 16: being due for review does not make an issue ready.
+search [1] in TRACKER-READINESS :
+  { issue(1, open) wait(1, 1, at(80), 45) now(50) }
+  =>* { ready(1) RESIDUAL:Cfg } .
+
+--- Lifting is not an act. Coverage 11: with the clock the only rule that
+--- changes a fact, a deferral lifts and every other fact is as it was.
+search [1] in TRACKER-READINESS-CLOCK :
+  { issue(1, open) wait(1, 1, at(70), 90) now(50) }
+  =>* { ready(1) issue(1, open) wait(1, 1, at(70), 90) now(T:Nat) } .
 
 quit .

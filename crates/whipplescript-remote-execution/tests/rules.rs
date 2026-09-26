@@ -4,6 +4,8 @@
 //! principal issues a missing-blobs query naming blobs outside their view; a
 //! cached output is served for an action not rerun.
 
+#![cfg(feature = "endpoint")]
+
 use std::collections::BTreeMap;
 use std::sync::Arc;
 

@@ -5,7 +5,71 @@ follow [Semantic Versioning](https://semver.org). Dates are UTC.
 
 ## [Unreleased]
 
+### Changed
+
+- **A tracker has one definition of ready, and a claim asks it (DR-0126).**
+  `whip issue ready`, `when <tracker> has ready issue`, every claim — CLI,
+  workflow, agent todo tools, host actions — and the new `whip issue why <id>`
+  decide readiness the same way. Before, a workflow saw blocked and conflicted
+  issues as ready, and a claim succeeded on a blocked or a closed issue. A claim
+  of a closed, canceled or archived issue now fails as not open, and a claim of
+  an open issue that is not ready fails with every reason. A person may pass
+  `whip issue claim <id> --override "<why>"`; the claim records the reason.
+- **`order` and `soft` dependencies no longer hold an issue back.** They rank
+  it: `dep add B depends-on A --kind order` says A comes first, and a free
+  worker may still take B while A is claimed. `hard`, `resource`, `review`,
+  `contract` and `discovered` still gate.
+- **Readiness is decided at the worker's instant, not the store's clock.** A
+  claim `ttl` on a `given clock at` scenario lapses on the scenario's clock, a
+  claim `ttl` on a hosted instance lapses at all (it was ignored there), and a
+  parked hosted instance wakes when a claim lapses or a deferral comes due.
+
 ### Added
+
+- **Deferral: `whip issue defer <id> --until WHEN | --after ISSUE |
+  --reached RECORD:STATUS | --demand LABEL:N [--review WHEN]`.** An issue stays
+  out of the ready set until the condition holds, then becomes ready with no
+  one acting. Every deferral has a review date; `whip issue review` lists the
+  ones past it and still unmet. `waits` shows them and `undefer` lifts one early.
+- **Ordering: `whip issue order A before B` and `whip issue rank PARENT
+  CHILD...`.** `ready` returns issues in a derived order: a parent's rank leads
+  its children's, only the parent's assignee ranks its children (anyone else's
+  statement is kept as a proposal), and a dependency inherits the rank of what
+  waits on it. Contradictory rankings show in `whip issue conflicts`.
+
+### Fixed
+
+- **The `whipplescript` crate builds from its own package again.** It embedded
+  the hosted executor's Dockerfile from `whipplescript-host-do`, a crate that is
+  never published, so crates.io's verification build could not find it and
+  0.6.0 of this one crate was not published. The ten others were. The recipe
+  now lives inside the crate, held byte for byte to the one host-do owns, and
+  every release packages and verifies all its crates before publishing any.
+
+## [0.6.0] — 2026-09-24
+
+A minor release rather than a patch, because it breaks source that 0.5.6
+accepted: see **Breaking** below, and `mint`'s `scope` and `ttl`, which are
+gone. It is also the first release built on GaugeWright's own fleet rather than
+on GitHub Actions. The archives, installers and formula are the same set as
+before; what changes is how a release is verified. A GitHub build attestation
+is bound to an Actions run, so this release carries an in-toto provenance
+statement over every file's SHA-256 instead, signed with the key published in
+[`docs/release-provenance.pub`](docs/release-provenance.pub), and an SPDX SBOM.
+
+### Added
+
+- **`whip issue cancel <id> [--reason R]` and `whip issue reopen <id> [--note N]`.**
+  `cancel` withdraws an open issue nobody will do and releases any claim on it
+  in the same transaction, with `finish`'s holder guard. A canceled issue is not
+  a closed one: nothing waiting on the issue closing is woken by it. `reopen`
+  returns a closed or canceled issue to open, and so to ready unless something
+  blocks it. Both append the `issue.canceled` and `issue.reopened` events every
+  store already folded, so a store written by 0.5.6 needs nothing.
+
+- **`whip issue set <id> status` refuses a status outside open, closed,
+  canceled and archived**, as the compiler already did. `cancelled` used to be
+  stored silently, as a status no rule could match.
 
 - **`mint credential from <parent> { … }`** (DR-0053 §5, as amended
   2026-08-27) — spend a credential at an issuer's token endpoint for a scoped

@@ -99,6 +99,8 @@ fn native_promotion_releases_both_reservations_after_proven_pre_cas_error() {
         "ignored-retry-seed",
         "holder",
         "t3",
+        std::path::Path::new(":memory:"),
+        &[],
     )
     .expect_err("conflicting immutable cut identity must fail");
     assert!(error.contains("reservations released"), "{error}");
@@ -183,6 +185,8 @@ fn native_promotion_releases_both_reservations_after_proven_pre_cas_error() {
             stream_id,
             "holder",
             "t6",
+            std::path::Path::new(":memory:"),
+            &[],
         );
         db.execute_batch("DROP TRIGGER fail_promotion_log;")
             .expect("remove fault");
@@ -220,7 +224,9 @@ fn native_promotion_releases_both_reservations_after_proven_pre_cas_error() {
                     stream_id,
                     stream_id,
                     "holder",
-                    "t7"
+                    "t7",
+                    std::path::Path::new(":memory:"),
+                    &[],
                 ),
                 Ok(BoundaryRunOutcome::Promoted { .. })
             ));
@@ -1827,5 +1833,44 @@ coerce review() -> Review {
             .and_then(Value::as_array)
             .map(Vec::len),
         Some(0)
+    );
+}
+
+/// A door onto a possibly gated ref refuses to move when this host cannot
+/// open the ledger that would say whether the ref is governed (norm-plane §5):
+/// an unreadable ledger is never taken for an absent one.
+#[test]
+fn a_mainline_door_refuses_when_its_ledger_cannot_be_opened() {
+    let _guard = env_lock();
+    let root = std::env::temp_dir().join(format!(
+        "whip-gate-ledger-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos(),
+    ));
+    // A directory where the ledger's file belongs cannot be opened as one.
+    std::fs::create_dir_all(root.join("items.sqlite")).expect("mkdir");
+    let previous = std::env::var_os("WHIPPLESCRIPT_ITEMS_STORE");
+    std::env::set_var("WHIPPLESCRIPT_ITEMS_STORE", root.join("items.sqlite"));
+    let mut consulted = false;
+    let result = through_mainline_gate(
+        &root.join("runtime.sqlite"),
+        whipplescript_kernel::norm_admission::AdmissionDoor::Transport,
+        |_| {
+            consulted = true;
+            Ok(())
+        },
+    );
+    match previous {
+        Some(value) => std::env::set_var("WHIPPLESCRIPT_ITEMS_STORE", value),
+        None => std::env::remove_var("WHIPPLESCRIPT_ITEMS_STORE"),
+    }
+    let _ = std::fs::remove_dir_all(&root);
+    assert!(!consulted, "the door ran without a gate");
+    assert!(
+        matches!(&result, Err(whipplescript_store::StoreError::Conflict(reason)) if reason.contains("unable to open database")),
+        "{result:?}"
     );
 }

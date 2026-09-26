@@ -41,16 +41,19 @@ pub fn execute_hosted_norm_command<S: NormCommandStore>(
     trusted_configuration: &str,
     command: &str,
 ) -> Result<String, String> {
-    execute_hosted_norm_command_with_artifacts(store, trusted_configuration, command, None)
+    execute_hosted_norm_command_with_artifacts(store, trusted_configuration, command, None, None)
 }
 
 /// The embedding additionally authorizes whole-workspace artifact reads. The
 /// callback chooses the store and limits; neither is supplied by a command.
+/// `gated_refs` leases the workspace's gated refs before a ledger's first
+/// event lands (norm-plane §5).
 pub fn execute_hosted_norm_command_with_artifacts<S: NormCommandStore>(
     store: &mut S,
     trusted_configuration: &str,
     command: &str,
     artifacts: Option<&NormArtifactCapture<'_>>,
+    gated_refs: Option<&mut dyn FnMut() -> whipplescript_store::StoreResult<()>>,
 ) -> Result<String, String> {
     let trust: HostedNormTrust =
         serde_json::from_str(trusted_configuration).map_err(|error| error.to_string())?;
@@ -58,6 +61,9 @@ pub fn execute_hosted_norm_command_with_artifacts<S: NormCommandStore>(
         let mut host = NormCommandHost::new(store, verifier);
         if let Some(artifacts) = artifacts {
             host = host.with_artifacts(artifacts);
+        }
+        if let Some(gated_refs) = gated_refs {
+            host = host.with_gated_refs(gated_refs);
         }
         host.execute_json(command)
             .map_err(|error| format!("norm command refused: {error:?}"))
@@ -101,6 +107,9 @@ mod impact;
 pub use impact::{
     execute_hosted_norm_impact, execute_installed_hosted_norm_impact, HostedImpactConfiguration,
 };
+#[path = "norm_commands/promotion.rs"]
+mod promotion;
+pub use promotion::execute_installed_hosted_norm_promotion;
 
 const ENQUEUE_PROTOCOL: &str = "whipplescript.norm.enqueue/v1";
 

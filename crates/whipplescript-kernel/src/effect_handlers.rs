@@ -2222,6 +2222,15 @@ fn tracker_claim_result(
             Err(format!("already claimed by `{holder}`"))
         }
         Ok(ClaimOutcome::NotFound) => Err(format!("item `{id}` not found")),
+        Ok(ClaimOutcome::NotOpen { status }) => Err(format!("item `{id}` is {status}, not open")),
+        Ok(ClaimOutcome::NotReady { reasons }) => Err(format!(
+            "item `{id}` is not ready: {}",
+            reasons
+                .iter()
+                .map(whipplescript_store::items::readiness::Unready::describe)
+                .collect::<Vec<_>>()
+                .join("; ")
+        )),
         Err(error) => Err(format!("claim failed: {error}")),
     }
 }
@@ -2388,11 +2397,20 @@ pub fn run_queue_effect_generic<S: RuntimeStore + WorkItems + FrontierRead>(
             // or `None` (untimed backstop lease) when no `ttl` clause was given.
             let expires =
                 tracker_expires_from_now(now, input.get("ttl_seconds").and_then(Value::as_i64));
-            tracker_claim_result(
-                kernel
+            // Decided at the effect's instant when it is one (DR-0126 RV-3); a
+            // host still passing a clock stub gets the store's clock.
+            let claimed = match whipplescript_store::items::readiness::canonical_instant(now) {
+                Some(at) => {
+                    kernel
+                        .store_mut()
+                        .claim_item_at(id, instance_id, expires.as_deref(), &at)
+                }
+                None => kernel
                     .store_mut()
-                    .claim_item(id, instance_id, expires.as_deref())
-                    .map_err(|error| format!("{error:?}")),
+                    .claim_item(id, instance_id, expires.as_deref()),
+            };
+            tracker_claim_result(
+                claimed.map_err(|error| format!("{error:?}")),
                 queue,
                 id,
                 title,
@@ -2962,6 +2980,9 @@ pub enum BoundaryRunOutcome {
     Conflicted {
         conflicts: Vec<whipplescript_store::merge::PathConflict>,
     },
+    /// The mainline's gate refused the proposed result (norm-plane §5): the
+    /// ref did not move, and the refusal names what the result lacks.
+    GateRefused(whipplescript_store::vcs::GateRefusal),
     Refused(String),
 }
 
@@ -3097,6 +3118,7 @@ pub fn run_reserved_boundary_promotion_generic<W, B, C>(
     vcs: &mut whipplescript_store::vcs::WorkspaceVcs<B, C>,
     request: &PromoteDoorRequest<'_>,
     serialization: &mut dyn PromotionSerialization,
+    gate: &mut dyn whipplescript_store::vcs::MainlineGate,
 ) -> Result<BoundaryRunOutcome, String>
 where
     W: Workstreams + ?Sized,
@@ -3108,7 +3130,7 @@ where
         Ok(Some(refusal)) => return Ok(BoundaryRunOutcome::Refused(refusal)),
         Err(error) => return Err(error),
     }
-    let result = run_reserved_boundary_promotion_serialized(streams, vcs, request);
+    let result = run_reserved_boundary_promotion_serialized(streams, vcs, request, gate);
     serialization.release();
     result
 }
@@ -3117,6 +3139,7 @@ fn run_reserved_boundary_promotion_serialized<W, B, C>(
     streams: &mut W,
     vcs: &mut whipplescript_store::vcs::WorkspaceVcs<B, C>,
     request: &PromoteDoorRequest<'_>,
+    gate: &mut dyn whipplescript_store::vcs::MainlineGate,
 ) -> Result<BoundaryRunOutcome, String>
 where
     W: Workstreams + ?Sized,
@@ -3299,7 +3322,18 @@ where
             promote_cut_value(&expected_main),
             &proposed_main,
             at,
+            gate,
         ) {
+            Ok(whipplescript_store::vcs::BoundaryPromotionOutcome::GateRefused(refusal)) => {
+                release_reserved_boundary_generic(streams, vcs, stream_id, &reservation_id, at)?;
+                return Ok(BoundaryRunOutcome::GateRefused(refusal));
+            }
+            Ok(whipplescript_store::vcs::BoundaryPromotionOutcome::GateStale { changed }) => {
+                release_reserved_boundary_generic(streams, vcs, stream_id, &reservation_id, at)?;
+                return Ok(BoundaryRunOutcome::Refused(format!(
+                    "{changed}; the promotion is prepared again on retry"
+                )));
+            }
             Ok(whipplescript_store::vcs::BoundaryPromotionOutcome::Promoted {
                 ref_position,
                 ref_receipt_handle,
@@ -3416,7 +3450,8 @@ pub fn promote_conflict_json(conflict: &whipplescript_store::merge::PathConflict
 /// Render a promote run as the effect door's outcome — one output shape for
 /// every host, so receipt parity is by construction rather than lockstep.
 /// `Refused` and `Err` both complete as `Failed` with the `vcs_promote`
-/// error kind, exactly as both host doors always have.
+/// error kind, exactly as both host doors always have; a gate's refusal
+/// completes as `Failed` with `norm_gate_refused`.
 pub fn promote_effect_outcome(
     stream_id: &str,
     result: &Result<BoundaryRunOutcome, String>,
@@ -3443,6 +3478,12 @@ pub fn promote_effect_outcome(
                 &conflicts.iter().map(promote_conflict_json).collect::<Vec<_>>()
             ).unwrap_or_default(),
         })),
+        // The gate's refusal is a distinct failure: the ref is intact and the
+        // proposal is not supported, which retrying the same result cannot fix.
+        Ok(BoundaryRunOutcome::GateRefused(refusal)) => CapabilityOutcome::Failed {
+            error_kind: "norm_gate_refused".to_owned(),
+            message: refusal.reason.clone(),
+        },
         Ok(BoundaryRunOutcome::Refused(message)) => failed(message),
         Err(message) => failed(message),
     }
@@ -3504,6 +3545,7 @@ pub fn run_selective_verb_generic<B, C>(
     at: &str,
     resolve_stream_line: &mut dyn FnMut(&str) -> Option<String>,
     staleness: &mut StalenessAdvisory<'_, B, C>,
+    gate: &mut dyn whipplescript_store::vcs::MainlineGate,
 ) -> Result<Value, String>
 where
     B: whipplescript_store::branches::Branches,
@@ -3512,7 +3554,7 @@ where
     use whipplescript_store::vcs::{TransportOutcome, UndoSelectionOutcome};
 
     if target == Some("vcs.undo") {
-        match vcs.apply_undo_selection(branch_id, expr, cut_id, at) {
+        match vcs.apply_undo_selection(branch_id, expr, cut_id, at, gate) {
             Ok(UndoSelectionOutcome::Proposed {
                 cut_id,
                 reverted_paths,
@@ -3546,6 +3588,10 @@ where
                 "cut_id": "",
                 "detail": "nothing_selected",
             })),
+            Ok(UndoSelectionOutcome::GateRefused(refusal)) => Ok(gate_refused_json(&refusal)),
+            Ok(UndoSelectionOutcome::GateStale { changed }) => {
+                Err(format!("{changed}; the undo is prepared again on retry"))
+            }
             Ok(other) => Err(format!("undo refused: {other:?}")),
             Err(error) => Err(format!("undo failed: {error:?}")),
         }
@@ -3562,7 +3608,7 @@ where
                 None => return Err(format!("`onto {onto}` names no stream")),
             }
         };
-        match vcs.transport_selection(branch_id, expr, &onto_line, cut_id, at) {
+        match vcs.transport_selection(branch_id, expr, &onto_line, cut_id, at, gate) {
             Ok(TransportOutcome::Transported {
                 cut_id,
                 moved_paths,
@@ -3591,16 +3637,37 @@ where
                 "cut_id": "",
                 "detail": "nothing_to_move",
             })),
+            Ok(TransportOutcome::GateRefused(refusal)) => Ok(gate_refused_json(&refusal)),
+            Ok(TransportOutcome::GateStale { changed }) => Err(format!(
+                "{changed}; the transport is prepared again on retry"
+            )),
             Ok(other) => Err(format!("transport refused: {other:?}")),
             Err(error) => Err(format!("transport failed: {error:?}")),
         }
     }
 }
 
+/// A selective verb's gate refusal as the door's data: the reason names what
+/// the proposed result lacks, and `refusal` carries it structurally.
+fn gate_refused_json(refusal: &whipplescript_store::vcs::GateRefusal) -> Value {
+    json!({
+        "variant": "GateRefused",
+        "cut_id": "",
+        "detail": refusal.reason,
+        "refusal": refusal.detail,
+    })
+}
+
 /// Render a selective run as the effect door's outcome — the `vcs_selective`
 /// failure kind both doors always used.
 pub fn selective_effect_outcome(result: Result<Value, String>) -> CapabilityOutcome {
     match result {
+        // A gated ref's refusal is the promote door's distinct failure: the
+        // ref is intact and retrying the same result cannot fix it.
+        Ok(value) if value["variant"] == "GateRefused" => CapabilityOutcome::Failed {
+            error_kind: "norm_gate_refused".to_owned(),
+            message: value["detail"].as_str().unwrap_or_default().to_owned(),
+        },
         Ok(value) => CapabilityOutcome::Produced(value),
         Err(message) => CapabilityOutcome::Failed {
             error_kind: "vcs_selective".to_owned(),
@@ -4956,6 +5023,45 @@ mod queue_effect_refusal_tests {
             ),
             Err("item `WS-1` not found".into())
         );
+        // DR-0126: the claim guard's two refusals stay distinct from each other
+        // and name what refused them.
+        assert_eq!(
+            tracker_claim_result(
+                Ok(ClaimOutcome::NotOpen {
+                    status: "closed".into(),
+                }),
+                "backlog",
+                "WS-1",
+                "Fix login",
+                "instance",
+                None,
+            ),
+            Err("item `WS-1` is closed, not open".into())
+        );
+        assert_eq!(
+            tracker_claim_result(
+                Ok(ClaimOutcome::NotReady {
+                    reasons: vec![
+                        whipplescript_store::items::readiness::Unready::BlockedBy {
+                            issue: "WS-2".into(),
+                            dep_kind: None,
+                        },
+                        whipplescript_store::items::readiness::Unready::Conflicted {
+                            fields: vec!["title".into()],
+                        },
+                    ],
+                }),
+                "backlog",
+                "WS-1",
+                "Fix login",
+                "instance",
+                None,
+            ),
+            Err(
+                "item `WS-1` is not ready: waits on WS-2, still open; fields in conflict: title"
+                    .into()
+            )
+        );
         assert_eq!(
             tracker_claim_result(
                 Err("store".into()),
@@ -5204,6 +5310,28 @@ mod promote_door_tests {
     //! receipt parity rests on.
 
     use super::*;
+
+    /// These door fixtures carry no norm ledger, so nothing gates their
+    /// mainline: the gate admits and runs the compare-and-swap as asked.
+    pub(super) struct NoNormLedger;
+
+    impl whipplescript_store::vcs::MainlineGate for NoNormLedger {
+        fn prepare(
+            &mut self,
+            _base_cut: Option<&str>,
+            _proposed_cut: &str,
+            _artifacts: &whipplescript_store::norm_commands::NormArtifactCapture<'_>,
+        ) -> whipplescript_store::StoreResult<whipplescript_store::vcs::GateVerdict> {
+            Ok(whipplescript_store::vcs::GateVerdict::Admit)
+        }
+        fn commit(
+            &mut self,
+            advance: &mut dyn FnMut() -> whipplescript_store::StoreResult<()>,
+        ) -> whipplescript_store::StoreResult<whipplescript_store::vcs::GateCommit> {
+            advance()?;
+            Ok(whipplescript_store::vcs::GateCommit::Committed)
+        }
+    }
     use whipplescript_store::workstreams as ws;
 
     struct AtAcquire<F>(F);
@@ -5551,6 +5679,7 @@ mod promote_door_tests {
                     receipt_scope: "workspace",
                 },
                 &mut SingleWriterSerialization,
+                &mut NoNormLedger,
             )
             .unwrap();
             let BoundaryRunOutcome::Refused(message) = result else {
@@ -5596,6 +5725,7 @@ mod promote_door_tests {
                         Some("main-1"),
                         "main-2",
                         "t3",
+                        &mut NoNormLedger,
                     )
                     .unwrap();
                 let whipplescript_store::vcs::BoundaryPromotionOutcome::Promoted {
@@ -5633,6 +5763,7 @@ mod promote_door_tests {
                 &mut vcs,
                 &request,
                 &mut SingleWriterSerialization,
+                &mut NoNormLedger,
             )
             .unwrap();
             let BoundaryRunOutcome::Refused(message) = result else {
@@ -5663,6 +5794,7 @@ mod promote_door_tests {
                 &mut vcs,
                 &request,
                 &mut SingleWriterSerialization,
+                &mut NoNormLedger,
             )
             .unwrap();
             let BoundaryRunOutcome::Promoted { receipt, .. } = result else {
@@ -5675,6 +5807,113 @@ mod promote_door_tests {
             );
             assert_eq!(vcs.branch_head_reservation("line").unwrap(), None);
         }
+    }
+
+    /// A mainline gate whose answers the test chooses.
+    pub(super) struct ScriptedGate {
+        pub(super) refuse: Option<whipplescript_store::vcs::GateRefusal>,
+        pub(super) stale: Option<String>,
+    }
+
+    impl whipplescript_store::vcs::MainlineGate for ScriptedGate {
+        fn prepare(
+            &mut self,
+            _base_cut: Option<&str>,
+            _proposed_cut: &str,
+            _artifacts: &whipplescript_store::norm_commands::NormArtifactCapture<'_>,
+        ) -> whipplescript_store::StoreResult<whipplescript_store::vcs::GateVerdict> {
+            Ok(match &self.refuse {
+                Some(refusal) => whipplescript_store::vcs::GateVerdict::Refuse(refusal.clone()),
+                None => whipplescript_store::vcs::GateVerdict::Admit,
+            })
+        }
+        fn commit(
+            &mut self,
+            advance: &mut dyn FnMut() -> whipplescript_store::StoreResult<()>,
+        ) -> whipplescript_store::StoreResult<whipplescript_store::vcs::GateCommit> {
+            if let Some(changed) = &self.stale {
+                return Ok(whipplescript_store::vcs::GateCommit::Stale {
+                    changed: changed.clone(),
+                });
+            }
+            advance()?;
+            Ok(whipplescript_store::vcs::GateCommit::Committed)
+        }
+    }
+
+    /// The door hands the gate's refusal back whole and its stale commit as
+    /// a retry, releasing the stream both times with the mainline unmoved;
+    /// the effect renders the refusal as its own failure kind.
+    #[test]
+    fn the_door_returns_the_gates_refusal_whole_and_its_stale_commit_as_a_retry() {
+        let (mut streams, mut vcs) = refusal_fixture();
+        let refusal = whipplescript_store::vcs::GateRefusal {
+            reason: "the proposed result is not supported: custody-authorization (repair)".into(),
+            detail: serde_json::json!({"requirements": {"custody-authorization": ["repair"]}}),
+        };
+        let promote = |gate: &mut ScriptedGate,
+                       streams: &mut ws::WorkstreamStore,
+                       vcs: &mut whipplescript_store::vcs::NativeWorkspaceVcs,
+                       proposed: &str| {
+            run_reserved_boundary_promotion_generic(
+                streams,
+                vcs,
+                &PromoteDoorRequest {
+                    stream_id: "ws",
+                    reservation_id: proposed,
+                    proposed_main: proposed,
+                    at: "t3",
+                    receipt_scope: "workspace",
+                },
+                &mut SingleWriterSerialization,
+                gate,
+            )
+            .unwrap()
+        };
+        let main_head = |vcs: &whipplescript_store::vcs::NativeWorkspaceVcs| {
+            vcs.get_branch("main").unwrap().unwrap().head_cut_id
+        };
+        let mut gate = ScriptedGate {
+            refuse: Some(refusal.clone()),
+            stale: None,
+        };
+        let refused = promote(&mut gate, &mut streams, &mut vcs, "main-2");
+        assert!(matches!(&refused, BoundaryRunOutcome::GateRefused(got) if got == &refusal));
+        assert_eq!(main_head(&vcs).as_deref(), Some("main-1"));
+        let row = streams.get_stream("ws").unwrap().unwrap();
+        assert_eq!(row.status, ws::StreamStatus::Active);
+        assert_eq!(row.reservation_id, None);
+        let CapabilityOutcome::Failed {
+            error_kind,
+            message,
+        } = promote_effect_outcome("ws", &Ok(refused))
+        else {
+            panic!("a gate refusal renders as a failure");
+        };
+        assert_eq!(error_kind, "norm_gate_refused");
+        assert_eq!(message, refusal.reason);
+        let mut gate = ScriptedGate {
+            refuse: None,
+            stale: Some("the norm ledger changed after the admission was prepared".into()),
+        };
+        let stale = promote(&mut gate, &mut streams, &mut vcs, "main-3");
+        let BoundaryRunOutcome::Refused(message) = stale else {
+            panic!("{stale:?}")
+        };
+        assert_eq!(
+            message,
+            "the norm ledger changed after the admission was prepared; the promotion is prepared again on retry"
+        );
+        assert_eq!(main_head(&vcs).as_deref(), Some("main-1"));
+        let mut gate = ScriptedGate {
+            refuse: None,
+            stale: None,
+        };
+        assert!(matches!(
+            promote(&mut gate, &mut streams, &mut vcs, "main-4"),
+            BoundaryRunOutcome::Promoted { .. }
+        ));
+        assert_eq!(main_head(&vcs).as_deref(), Some("main-4"));
     }
 
     #[test]
@@ -5706,6 +5945,7 @@ mod promote_door_tests {
                 receipt_scope: "workspace",
             },
             &mut SingleWriterSerialization,
+            &mut NoNormLedger,
         )
         .unwrap();
         let BoundaryRunOutcome::Refused(message) = result else {
@@ -5822,6 +6062,7 @@ mod promote_door_tests {
                     receipt_scope: "workspace",
                 },
                 &mut serialization,
+                &mut NoNormLedger,
             )
             .unwrap();
             let BoundaryRunOutcome::Promoted { receipt, .. } = result else {
@@ -5985,6 +6226,7 @@ mod promote_door_tests {
                     receipt_scope: "test-workspace",
                 },
                 &mut serialization,
+                &mut NoNormLedger,
             );
             let row = streams
                 .get_stream("ws")
@@ -6069,6 +6311,7 @@ mod promote_door_tests {
                         receipt_scope: "test-workspace",
                     },
                     &mut SingleWriterSerialization,
+                    &mut NoNormLedger,
                 );
                 assert!(
                     retry.is_err(),
@@ -6138,6 +6381,7 @@ mod promote_door_tests {
             &mut vcs,
             &request,
             &mut SingleWriterSerialization,
+            &mut NoNormLedger,
         )
         .expect_err("receipt write fails after CAS");
         assert!(error.contains("ref receipt record failed"), "{error}");
@@ -6177,6 +6421,7 @@ mod promote_door_tests {
                 receipt_scope: "workspace",
             },
             &mut SingleWriterSerialization,
+            &mut NoNormLedger,
         )
         .expect("later promotion");
         assert!(matches!(second, BoundaryRunOutcome::Promoted { .. }));
@@ -6192,6 +6437,7 @@ mod promote_door_tests {
             &mut vcs,
             &request,
             &mut SingleWriterSerialization,
+            &mut NoNormLedger,
         )
         .expect("recover earlier promotion") else {
             panic!("earlier landed promotion must close forward");
@@ -6226,6 +6472,7 @@ mod promote_door_tests {
             &mut vcs,
             &request,
             &mut SingleWriterSerialization,
+            &mut NoNormLedger,
         )
         .expect("replay receipt");
         assert!(
@@ -6361,6 +6608,94 @@ mod selective_door_tests {
 
     use super::*;
 
+    /// A selective verb onto the mainline passes its gate (norm-plane §5,
+    /// NP-15): a refusal is the promote door's own failure kind with the
+    /// requirement named, and a stale commit is a retry; nothing moves.
+    #[test]
+    fn selective_verbs_onto_the_mainline_pass_its_gate() {
+        use super::promote_door_tests::ScriptedGate;
+        let (mut vcs, dir) = temp_vcs("gate");
+        vcs.write("main", "base.md", Some("base"), "main-1", "t1")
+            .expect("seed main");
+        vcs.create_branch("line-a", None, "main", "t1")
+            .expect("line");
+        vcs.write("line-a", "src/x.rs", Some("x"), "line-1", "t2")
+            .expect("line work");
+        let refusal = whipplescript_store::vcs::GateRefusal {
+            reason: "the proposed result is not supported: R0 (repair)".into(),
+            detail: json!({"requirements": {"R0": ["repair"]}}),
+        };
+        let stale = "the norm ledger changed after the admission was prepared";
+        // A refused proposal leaves its recorded cut behind, so each attempt
+        // proposes under its own id.
+        let mut attempt = 0;
+        let mut run = |target: &str, input: Value, branch: &str, gate: &mut ScriptedGate| {
+            attempt += 1;
+            let cut_id = format!("cut-gated-{attempt}");
+            let expr = selective_selection(&input).expect("selection");
+            run_selective_verb_generic(
+                &mut vcs,
+                Some(target),
+                &input,
+                &expr,
+                branch,
+                &cut_id,
+                "t3",
+                &mut |_| None,
+                &mut |_, _, _| Vec::new(),
+                gate,
+            )
+        };
+        let transport = json!({"selection": "path(src/**)", "onto": "mainline"});
+        let undo = json!({"selection": "path(base.md)"});
+        for (target, input, branch, door) in [
+            ("vcs.transport", &transport, "line-a", "transport"),
+            ("vcs.undo", &undo, "main", "undo"),
+        ] {
+            let refused = run(
+                target,
+                input.clone(),
+                branch,
+                &mut ScriptedGate {
+                    refuse: Some(refusal.clone()),
+                    stale: None,
+                },
+            );
+            let CapabilityOutcome::Failed {
+                error_kind,
+                message,
+            } = selective_effect_outcome(refused)
+            else {
+                panic!("a refused {door} onto the mainline produced");
+            };
+            assert_eq!(error_kind, "norm_gate_refused");
+            assert_eq!(message, refusal.reason);
+            let retried = run(
+                target,
+                input.clone(),
+                branch,
+                &mut ScriptedGate {
+                    refuse: None,
+                    stale: Some(stale.into()),
+                },
+            );
+            assert_eq!(
+                retried,
+                Err(format!("{stale}; the {door} is prepared again on retry"))
+            );
+        }
+        assert_eq!(
+            vcs.get_branch("main")
+                .expect("main")
+                .expect("row")
+                .head_cut_id
+                .as_deref(),
+            Some("main-1"),
+            "no refused door moved the mainline"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn selective_selection_gate_refuses_by_reason() {
         let missing = selective_selection(&json!({})).expect_err("no selection");
@@ -6428,6 +6763,7 @@ mod selective_door_tests {
                 staleness_calls += 1;
                 Vec::new()
             },
+            &mut super::promote_door_tests::NoNormLedger,
         )
         .expect("undo applies");
         assert_eq!(value["variant"], "Applied");
@@ -6448,6 +6784,7 @@ mod selective_door_tests {
             "t4",
             &mut |_| None,
             &mut |_, _, _| Vec::new(),
+            &mut super::promote_door_tests::NoNormLedger,
         )
         .expect("nothing selected is data");
         assert_eq!(nothing["detail"], "nothing_selected");
@@ -6463,6 +6800,7 @@ mod selective_door_tests {
             "t5",
             &mut |_| None,
             &mut |_, _, _| Vec::new(),
+            &mut super::promote_door_tests::NoNormLedger,
         )
         .expect_err("unresolvable stream refuses");
         assert_eq!(refusal, "`onto ghost` names no stream");
@@ -6499,6 +6837,7 @@ mod selective_door_tests {
             "t3",
             &mut |_| None,
             &mut |_, _, _| Vec::new(),
+            &mut super::promote_door_tests::NoNormLedger,
         )
         .expect_err("missing branch refuses");
         assert_eq!(refused, "undo refused: BranchMissing");
@@ -6514,6 +6853,7 @@ mod selective_door_tests {
             "t4",
             &mut |_| Some("ghost-line".to_owned()),
             &mut |_, _, _| Vec::new(),
+            &mut super::promote_door_tests::NoNormLedger,
         )
         .expect_err("missing target refuses");
         assert_eq!(refused, "transport refused: TargetMissing");
@@ -6534,6 +6874,7 @@ mod selective_door_tests {
             "t5",
             &mut |_| None,
             &mut |_, _, _| Vec::new(),
+            &mut super::promote_door_tests::NoNormLedger,
         )
         .expect_err("broken store fails undo");
         assert!(failed.starts_with("undo failed:"), "{failed}");
@@ -6547,6 +6888,7 @@ mod selective_door_tests {
             "t6",
             &mut |_| None,
             &mut |_, _, _| Vec::new(),
+            &mut super::promote_door_tests::NoNormLedger,
         )
         .expect_err("broken store fails transport");
         assert!(failed.starts_with("transport failed:"), "{failed}");

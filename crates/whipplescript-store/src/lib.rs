@@ -45,6 +45,7 @@ pub mod norm_history;
 pub mod norm_inventory;
 pub mod norm_manifests;
 pub mod norm_publication;
+pub mod norm_query;
 pub mod norm_relations;
 pub mod norm_resources;
 pub mod norm_views;
@@ -5015,6 +5016,42 @@ impl SqliteStore {
             .query_map([], skill_view_from_row)?
             .collect::<result::Result<Vec<_>, _>>()?;
         Ok(rows)
+    }
+
+    /// Drop a host's replaceable skill catalogue before it registers the
+    /// selected immutable Agent version. Attached skills carry durable run
+    /// authority and cannot be removed by a catalogue refresh.
+    pub fn remove_unattached_skills_from_source(&self, source: &str) -> StoreResult<usize> {
+        if source.is_empty() {
+            return Err(StoreError::Conflict(
+                "skill source must be nonempty".to_owned(),
+            ));
+        }
+        let candidates: Vec<_> = self
+            .list_skills()?
+            .into_iter()
+            .filter(|skill| skill.source == source)
+            .collect();
+        for skill in &candidates {
+            let attachments: i64 = self.connection.query_row(
+                "SELECT COUNT(*) FROM skill_attachments WHERE skill_id = ?1",
+                params![&skill.skill_id],
+                |row| row.get(0),
+            )?;
+            if attachments != 0 {
+                return Err(StoreError::Conflict(format!(
+                    "skill `{}` is attached and cannot be removed with its source catalogue",
+                    skill.name
+                )));
+            }
+        }
+        for skill in &candidates {
+            self.connection.execute(
+                "DELETE FROM skills WHERE skill_id = ?1",
+                params![&skill.skill_id],
+            )?;
+        }
+        Ok(candidates.len())
     }
 
     pub fn list_skill_attachments(
@@ -24934,6 +24971,62 @@ mod tests {
             .as_deref()
             .expect("summary")
             .contains("repo-user@1.0.0"));
+    }
+
+    #[test]
+    fn refreshable_skill_source_removes_only_its_unattached_entries() {
+        let store = SqliteStore::open_in_memory().expect("store opens");
+        for (name, source) in [("alpha", "gaugedesk-agent"), ("beta", "builtin")] {
+            store
+                .register_skill(SkillRegistration {
+                    skill_id: name,
+                    name,
+                    version: "1.0.0",
+                    source,
+                    source_path: "SKILL.md",
+                    body: "---\nname: skill\ndescription: test\n---\n",
+                    description: "test",
+                    required_capabilities_json: "[]",
+                    metadata_json: "{}",
+                })
+                .unwrap();
+        }
+        assert_eq!(
+            store
+                .remove_unattached_skills_from_source("gaugedesk-agent")
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            store
+                .list_skills()
+                .unwrap()
+                .iter()
+                .map(|skill| skill.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["beta"]
+        );
+        assert_eq!(
+            store
+                .remove_unattached_skills_from_source("gaugedesk-agent")
+                .unwrap(),
+            0
+        );
+        assert!(store.remove_unattached_skills_from_source("").is_err());
+
+        store
+            .attach_skill(SkillAttachment {
+                attachment_id: "keep-attached",
+                scope_type: "agent",
+                scope_id: "sample/agent",
+                skill_name: "beta",
+            })
+            .unwrap();
+        let attached = store
+            .remove_unattached_skills_from_source("builtin")
+            .unwrap_err();
+        assert!(matches!(attached, StoreError::Conflict(message) if message.contains("attached")));
+        assert_eq!(store.list_skills().unwrap().len(), 1);
     }
 
     #[test]

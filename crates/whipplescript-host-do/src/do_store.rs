@@ -35,6 +35,7 @@
 
 mod dispatch;
 mod host_actions;
+mod readiness;
 pub(crate) mod recovery;
 mod tracker_closure;
 mod tracker_control;
@@ -97,6 +98,19 @@ pub trait DoSql {
     /// Run one query and get back its rows. Single-statement, for the same reason
     /// as [`DoSql::execute`].
     fn query(&self, sql: &str, params: &[SqlValue]) -> Result<Vec<Vec<SqlValue>>, String>;
+
+    /// A placement-supplied implementation of an authored external tool. The
+    /// default refuses, so a package declaration alone never grants an effect.
+    fn external_tool(
+        &self,
+        name: &str,
+        _call_id: &str,
+        _arguments: &str,
+    ) -> Result<String, String> {
+        Err(format!(
+            "external tool `{name}` has no placement implementation"
+        ))
+    }
 
     /// Publish an ephemeral live-turn observation to the shell (DR 0061).
     ///
@@ -5130,6 +5144,32 @@ fn do_insert_program_version<Sql: DoSql>(
         .ok_or_else(|| sql_err("program_version row missing after insert".to_string()))
 }
 
+/// The hosted ledger as the mainline gate needs it (norm-plane §5). The
+/// workspace object is single-writer: a gate's commit runs inside the one
+/// request that holds the object, against the one database both the ledger
+/// and the branches live in, so no ledger write can interleave with it and
+/// the exclusion is the request itself.
+impl<Sql: DoSql> whipplescript_kernel::norm_admission::AdmissionLedger for DoSqliteStore<Sql> {
+    fn bootstrapped(&self) -> StoreResult<bool> {
+        Ok(self.norm_checkpoint()?.is_some())
+    }
+    fn capture(
+        &self,
+        verifier: &dyn whipplescript_store::norm::NormVerifier,
+    ) -> StoreResult<(
+        whipplescript_store::norm::NormView,
+        Vec<whipplescript_store::items::TrackerEvent>,
+    )> {
+        Ok((self.norm_view(verifier)?, self.export_events()?))
+    }
+    fn exclusively(
+        &self,
+        f: &mut dyn FnMut() -> StoreResult<whipplescript_store::vcs::GateCommit>,
+    ) -> StoreResult<whipplescript_store::vcs::GateCommit> {
+        f()
+    }
+}
+
 impl<Sql: DoSql> whipplescript_store::norm_commands::NormCommandStore for DoSqliteStore<Sql> {
     fn norm_state(
         &self,
@@ -8692,14 +8732,20 @@ fn do_active_holders(sql: &impl DoSql) -> StoreResult<std::collections::HashMap<
 }
 
 /// Lazily expire past-due, still-held leases on an issue, so an expired lease
-/// frees the issue for a fresh claim.
-fn do_expire_stale_leases(sql: &impl DoSql, item_id: &str, now: &str) -> StoreResult<()> {
+/// frees the issue for a fresh claim. Decides at the caller's instant `at`
+/// which leases have lapsed, and stamps each release with the store's `now`.
+fn do_expire_stale_leases_at(
+    sql: &impl DoSql,
+    item_id: &str,
+    at: &str,
+    now: &str,
+) -> StoreResult<()> {
     let stale = sql
         .query(
             "SELECT lease_id FROM tracker_leases \
              WHERE issue_id = ?1 AND released_at IS NULL AND expires_at IS NOT NULL \
                AND expires_at <= ?2",
-            &[text(item_id), text(now)],
+            &[text(item_id), text(at)],
         )
         .map_err(sql_err)?;
     for row in &stale {
@@ -9319,47 +9365,24 @@ impl<Sql: DoSql> WorkItems for DoSqliteStore<Sql> {
     }
 
     fn ready_items(&self, queue: &str) -> StoreResult<Vec<WorkItem>> {
-        // Ready iff durable `open`, no active lease, no active blocker (a
-        // `blocks(B, id)` with B still open). Expired/released leases and
-        // closed/canceled blockers do not gate.
-        let rows = self
-            .sql
-            .query(
-                &format!(
-                    "SELECT {DO_ISSUE_COLS} FROM tracker_issues i \
-                     WHERE i.queue = ?1 AND i.status = 'open' \
-                     AND NOT EXISTS ( \
-                       SELECT 1 FROM tracker_leases l \
-                       WHERE l.issue_id = i.issue_id \
-                         AND l.released_at IS NULL \
-                         AND (l.expires_at IS NULL OR l.expires_at > datetime('now'))) \
-                     AND NOT EXISTS ( \
-                       SELECT 1 FROM tracker_relations r JOIN tracker_issues b ON b.issue_id = r.from_issue \
-                       WHERE r.to_issue = i.issue_id AND r.kind = 'blocks' AND b.status = 'open') \
-                     ORDER BY i.created_at, i.issue_id"
-                ),
-                &[text(queue)],
-            )
-            .map_err(sql_err)?;
-        // A conflicted issue is not ready (ADR-0002 phase B1 slice ii): its
-        // field values are in dispute. Not expressible in the SQL predicate, so
-        // filter here via the shared DAG conflict analysis.
-        let mut ready = Vec::with_capacity(rows.len());
-        for row in &rows {
-            let item = do_issue_row(row);
-            let conflicted = match do_content_id(&self.sql, &item.id)? {
-                Some(content_id) => whipplescript_store::items::analyze_issue_dag(
-                    &do_load_issue_events(&self.sql, &content_id)?,
-                )
-                .conflicted(),
-                None => false,
-            };
-            if !conflicted {
-                ready.push(item);
-            }
-        }
-        // Ready rows have no active lease by construction; the overlay is a no-op.
-        Ok(ready)
+        let at = do_now(&self.sql)?;
+        self.do_ready_items_at(queue, &at)
+    }
+
+    fn ready_items_at(&self, queue: &str, at: &str) -> StoreResult<Vec<WorkItem>> {
+        let at = whipplescript_store::items::readiness::canonical_instant(at)
+            .ok_or_else(|| StoreError::Conflict(format!("`{at}` is not an instant")))?;
+        self.do_ready_items_at(queue, &at)
+    }
+
+    fn next_readiness_change_after(
+        &self,
+        queues: &[String],
+        at: &str,
+    ) -> StoreResult<Option<String>> {
+        let at = whipplescript_store::items::readiness::canonical_instant(at)
+            .ok_or_else(|| StoreError::Conflict(format!("`{at}` is not an instant")))?;
+        self.do_next_readiness_change_after(queues, &at)
     }
 
     fn claim_item(
@@ -9368,12 +9391,26 @@ impl<Sql: DoSql> WorkItems for DoSqliteStore<Sql> {
         claimed_by: &str,
         expires: Option<&str>,
     ) -> StoreResult<ClaimOutcome> {
+        let at = do_now(&self.sql)?;
+        WorkItems::claim_item_at(self, item_id, claimed_by, expires, &at)
+    }
+
+    fn claim_item_at(
+        &mut self,
+        item_id: &str,
+        claimed_by: &str,
+        expires: Option<&str>,
+        at: &str,
+    ) -> StoreResult<ClaimOutcome> {
+        let at = whipplescript_store::items::readiness::canonical_instant(at)
+            .ok_or_else(|| StoreError::Conflict(format!("`{at}` is not an instant")))?;
         let now = do_now(&self.sql)?;
         tracker_control_ops::claim_item(
             &self.sql,
             item_id,
             claimed_by,
             expires,
+            &at,
             self.event_effect_id.as_deref(),
             &now,
         )
@@ -10819,6 +10856,13 @@ pub mod test_support {
             Self {
                 conn: std::rc::Rc::new(Connection::open_in_memory().expect("sqlite")),
             }
+        }
+
+        /// A handle over the store's full schema, the norm ledger's included,
+        /// for a fixture outside this crate whose doors read the ledger (the
+        /// mainline gate) the way a workspace object always can.
+        pub fn with_store_schema() -> Self {
+            store().sql
         }
 
         /// The deployed Worker schema, for shared runtime conformance fixtures.
@@ -18952,6 +18996,226 @@ mod norm_admission_tests {
         }],owner_scopes:vec!["accept".into()]}
     }
 
+    /// The hosted promote door runs the mainline gate over the object's own
+    /// ledger (norm-plane §5). Until the door receives the deployment's
+    /// planning inputs, a governed workspace is refused with the reason named
+    /// and the mainline unmoved, never promoted unevaluated.
+    #[test]
+    fn the_hosted_mainline_gate_refuses_a_governed_workspace_it_cannot_evaluate() {
+        use std::rc::Rc;
+        use whipplescript_kernel::effect_handlers::{CapabilityOutcome, CapabilityProvider};
+        use whipplescript_store::branches::{Branches, MAINLINE_BRANCH_ID};
+        use whipplescript_store::workstreams::Workstreams;
+        let owner_key = SigningKey::from_slice(&[1; 32]).unwrap();
+        let owner = actor("owner", &owner_key);
+        let owner_root = crate::governance::GaugeDeskGovernanceRoot::new("owner", &owner.key_id);
+        let verifier = NormGovernanceVerifier::new(
+            vec![NormPrincipalBinding {
+                actor: owner.clone(),
+                verifier: &owner_root,
+            }],
+            BTreeSet::from([("owner".into(), "owner".into())]),
+        )
+        .unwrap();
+        let sql = Rc::new(super::test_support::RusqliteDoSql::from_store_schema());
+        let mut streams = crate::do_workstreams::DoWorkstreams::new(Rc::clone(&sql)).unwrap();
+        let mut branches = crate::do_branches::DoBranches::new(Rc::clone(&sql)).unwrap();
+        branches.ensure_mainline("t0").unwrap();
+        let mut vcs = crate::do_branches::compose_vcs(&sql).unwrap();
+        vcs.init("t0").unwrap();
+        vcs.write(MAINLINE_BRANCH_ID, "base.md", Some("base"), "cut_0", "t1")
+            .unwrap();
+        vcs.create_branch("line-triage", None, MAINLINE_BRANCH_ID, "t2")
+            .unwrap();
+        streams
+            .create_stream("triage", None, "line-triage", "t2", None)
+            .unwrap();
+        vcs.write("line-triage", "feature.md", Some("work"), "cut_1", "t3")
+            .unwrap();
+        vcs.bind_instance("inst-1", "line-triage", "t3").unwrap();
+        // The host's norm command door leases the mainline before the
+        // ledger's first event lands (`host_norm_command`).
+        whipplescript_store::branches::lease_gated_mainline(&mut branches, "t3").unwrap();
+        let mut ledger = DoSqliteStore::new(Rc::clone(&sql));
+        ledger
+            .append_norm_event(
+                &signed(
+                    owner.clone(),
+                    &owner_key,
+                    "genesis",
+                    NormAct::Bootstrap {
+                        creator: "owner".into(),
+                        charter: charter(),
+                    },
+                ),
+                &verifier,
+            )
+            .unwrap();
+        let provider = crate::do_workstreams::DoVcsPromoteCapabilityProvider {
+            sql: Rc::clone(&sql),
+        };
+        let outcome = provider.produce(
+            &whipplescript_store::ClaimableEffect {
+                attempt_admission_event_id: None,
+                effect_id: "promote-1".into(),
+                kind: "capability.call".into(),
+                target: Some("vcs.promote".into()),
+                profile: None,
+                input_json: serde_json::json!({"stream": "triage"}).to_string(),
+                required_capabilities_json: "[]".into(),
+                declared_profiles_json: "[]".into(),
+            },
+            &whipplescript_kernel::effect_config::EffectConfig::default(),
+        );
+        let CapabilityOutcome::Failed {
+            error_kind,
+            message,
+        } = outcome
+        else {
+            panic!("a governed hosted workspace promoted unevaluated");
+        };
+        assert_eq!(error_kind, "norm_gate_refused");
+        assert_eq!(
+            message,
+            format!(
+                "the mainline's gated requirements cannot be evaluated: {}",
+                crate::do_workstreams::HOSTED_ADMISSION_UNCONFIGURED
+            )
+        );
+        assert_eq!(
+            branches
+                .get_branch(MAINLINE_BRANCH_ID)
+                .unwrap()
+                .unwrap()
+                .head_cut_id
+                .as_deref(),
+            Some("cut_0"),
+            "the mainline did not move"
+        );
+
+        // Every other door onto the mainline asks the same predicate
+        // (norm-plane §5, NP-15): a transport onto mainline, a restore and an
+        // operator undo refuse alike, and the mainline stays.
+        let selective = crate::do_workstreams::DoVcsSelectiveCapabilityProvider {
+            sql: Rc::clone(&sql),
+            instance_id: "inst-1".into(),
+        };
+        let CapabilityOutcome::Failed {
+            error_kind,
+            message: transported,
+        } = selective.produce(
+            &whipplescript_store::ClaimableEffect {
+                attempt_admission_event_id: None,
+                effect_id: "transport-1".into(),
+                kind: "capability.call".into(),
+                target: Some("vcs.transport".into()),
+                profile: None,
+                input_json:
+                    serde_json::json!({"selection": "path(feature.md)", "onto": "mainline"})
+                        .to_string(),
+                required_capabilities_json: "[]".into(),
+                declared_profiles_json: "[]".into(),
+            },
+            &whipplescript_kernel::effect_config::EffectConfig::default(),
+        )
+        else {
+            panic!("a transport onto a governed mainline moved unevaluated");
+        };
+        assert_eq!(error_kind, "norm_gate_refused");
+        assert_eq!(transported, message);
+        let mut vcs = crate::do_branches::compose_vcs(&sql).unwrap();
+        let door = whipplescript_kernel::norm_admission::AdmissionDoor::Restore;
+        let restored = crate::do_workstreams::with_hosted_mainline_gate(&sql, door, |gate| {
+            vcs.restore(MAINLINE_BRANCH_ID, "cut_1", "cut_restore", "t5", gate)
+        })
+        .unwrap();
+        assert!(
+            matches!(&restored, whipplescript_store::vcs::RestoreOutcome::GateRefused(refusal) if refusal.reason == message),
+            "{restored:?}"
+        );
+        let door = whipplescript_kernel::norm_admission::AdmissionDoor::Undo;
+        let undone = crate::do_workstreams::with_hosted_mainline_gate(&sql, door, |gate| {
+            vcs.undo_op("op-cut_0", "undo-main", "t6", gate)
+        })
+        .unwrap();
+        assert!(
+            matches!(&undone, whipplescript_store::vcs::UndoOpOutcome::GateRefused(refusal) if refusal.reason == message),
+            "{undone:?}"
+        );
+        // The lease is the store's own refusal: a write that is not a door
+        // cannot move a governed mainline at all.
+        let written = vcs.write(MAINLINE_BRANCH_ID, "base.md", Some("raw"), "cut_raw", "t7");
+        assert!(
+            matches!(&written, Err(whipplescript_store::StoreError::Conflict(reason)) if reason.contains("reserved by `norm-gate`")),
+            "{written:?}"
+        );
+        assert_eq!(
+            vcs.read(MAINLINE_BRANCH_ID, "base.md").unwrap().as_deref(),
+            Some("base")
+        );
+        assert_eq!(
+            branches
+                .get_branch(MAINLINE_BRANCH_ID)
+                .unwrap()
+                .unwrap()
+                .head_cut_id
+                .as_deref(),
+            Some("cut_0"),
+            "no door moved the mainline"
+        );
+    }
+
+    /// The hosted branch store holds the same lease the native one does:
+    /// every head mutation but the gated advance refuses it, and nothing
+    /// releases it.
+    #[test]
+    fn the_hosted_mainline_gates_lease_admits_only_the_gated_advance() {
+        use std::rc::Rc;
+        use whipplescript_store::branches::{
+            AdvanceOutcome, Branches, OpBranchState, MAINLINE_BRANCH_ID, MAINLINE_GATE_LEASE,
+        };
+        let sql = Rc::new(super::test_support::RusqliteDoSql::from_store_schema());
+        let mut vcs = crate::do_branches::compose_vcs(&sql).unwrap();
+        vcs.init("t0").unwrap();
+        vcs.write(MAINLINE_BRANCH_ID, "base.md", Some("base"), "main-1", "t1")
+            .unwrap();
+        let mut branches = crate::do_branches::DoBranches::new(Rc::clone(&sql)).unwrap();
+        let head = branches.get_branch(MAINLINE_BRANCH_ID).unwrap().unwrap();
+        let manifest = head.head_manifest_hash.clone().unwrap();
+        whipplescript_store::branches::lease_gated_mainline(&mut branches, "t2").unwrap();
+        let reserved = |result: whipplescript_store::StoreResult<AdvanceOutcome>| matches!(&result, Err(whipplescript_store::StoreError::Conflict(reason)) if reason == "branch `main` head is reserved by `norm-gate`");
+        assert!(reserved(branches.advance_head(
+            MAINLINE_BRANCH_ID,
+            Some("main-1"),
+            "main-x",
+            &manifest,
+            "t3"
+        )));
+        assert!(reserved(branches.restore_branch_state(
+            MAINLINE_BRANCH_ID,
+            Some("main-1"),
+            &OpBranchState::of(&head),
+            "t3"
+        )));
+        let released = branches.release_head_reservation(MAINLINE_BRANCH_ID, MAINLINE_GATE_LEASE);
+        assert!(
+            matches!(&released, Err(whipplescript_store::StoreError::Conflict(reason)) if reason == "the mainline gate's lease is never released"),
+            "{released:?}"
+        );
+        assert!(matches!(
+            branches
+                .advance_gated_head(
+                    MAINLINE_BRANCH_ID,
+                    Some("main-1"),
+                    "main-1",
+                    &manifest,
+                    "t4"
+                )
+                .unwrap(),
+            AdvanceOutcome::Advanced(_)
+        ));
+    }
+
     #[test]
     fn norm_native_and_do_admit_the_same_authenticated_history() {
         let owner_key = SigningKey::from_slice(&[1; 32]).unwrap();
@@ -19923,6 +20187,9 @@ mod norm_admission_tests {
                 NormCommandResult::Explained { explanation, .. } => {
                     serde_json::to_value(&*explanation).unwrap()
                 }
+                NormCommandResult::Queried { result, .. } => {
+                    serde_json::to_value(&*result).unwrap()
+                }
                 other => panic!("view expected, got {other:?}"),
             }
         }
@@ -20061,6 +20328,31 @@ mod norm_admission_tests {
             },
         );
         assert_eq!(historical["members"][0]["standing"]["kind"], "effective");
+        // The typed query answers identically on both hosts, now and at the
+        // published frontier.
+        let queried = agree(
+            &mut native,
+            &mut hosted,
+            NormCommand::Query {
+                expression: format!(
+                    "related(work, members(record({s}))) | status(requirement, accepted)"
+                ),
+                frontier: None,
+                cut: None,
+            },
+        );
+        assert_eq!(queried["members"]["kind"], "records");
+        assert_eq!(queried["completeness"]["complete"], serde_json::json!(true));
+        let queried_then = agree(
+            &mut native,
+            &mut hosted,
+            NormCommand::Query {
+                expression: format!("revision({r0})"),
+                frontier: Some(published.clone()),
+                cut: None,
+            },
+        );
+        assert_eq!(queried_then["frontier"], serde_json::json!(published));
         let diff = agree(
             &mut native,
             &mut hosted,

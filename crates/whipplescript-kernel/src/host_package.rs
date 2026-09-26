@@ -20,6 +20,7 @@ use whipplescript_parser::IrProgram;
 
 pub const AGENT_PACKAGE_MANIFEST: &str = "package.json";
 pub const AGENT_PACKAGE_SCHEMA: &str = "whipplescript.agent_package.v0";
+pub const AGENT_PACKAGE_SCHEMA_V1: &str = "whipplescript.agent_package.v1";
 
 #[derive(Clone, Debug)]
 pub struct AuthoredAgentPackage {
@@ -29,9 +30,22 @@ pub struct AuthoredAgentPackage {
     workflow: String,
     agent: String,
     system_prompt: String,
+    project_context: Option<crate::context_assembly::ProjectInstruction>,
     capabilities: Vec<String>,
     agent_abilities: Vec<String>,
+    external_tools: Vec<ExternalTool>,
     max_steps: usize,
+}
+
+/// A host supplied tool. The package declares its model contract and the
+/// capability that admits it; the placement supplies its implementation.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExternalTool {
+    name: String,
+    capability: String,
+    description: String,
+    input_schema: Value,
 }
 
 #[derive(Debug, Deserialize)]
@@ -42,8 +56,12 @@ struct AuthoredAgentPackageManifest {
     workflow: String,
     agent: String,
     system_prompt: String,
+    #[serde(default)]
+    project_context: Option<String>,
     capabilities: Vec<String>,
     agent_abilities: Vec<String>,
+    #[serde(default)]
+    external_tools: Vec<ExternalTool>,
     max_steps: usize,
 }
 
@@ -53,16 +71,58 @@ impl AuthoredAgentPackage {
         source: impl Into<String>,
         system_prompt: impl Into<String>,
     ) -> Result<Self, String> {
+        Self::from_documents_with_context(manifest_text, source, system_prompt, None)
+    }
+
+    /// The v1 package carries one authored `AGENTS.md` document separately
+    /// from its system prompt. The context bytes participate in package
+    /// identity and enter the model as project context on every fresh turn.
+    pub fn from_documents_with_context(
+        manifest_text: impl Into<String>,
+        source: impl Into<String>,
+        system_prompt: impl Into<String>,
+        project_context: Option<String>,
+    ) -> Result<Self, String> {
         let manifest_text = manifest_text.into();
         let manifest: AuthoredAgentPackageManifest = serde_json::from_str(&manifest_text)
             .map_err(|error| format!("invalid agent package manifest: {error}"))?;
-        if manifest.schema != AGENT_PACKAGE_SCHEMA {
+        if manifest.schema != AGENT_PACKAGE_SCHEMA && manifest.schema != AGENT_PACKAGE_SCHEMA_V1 {
             return Err(format!(
                 "unsupported agent package schema `{}`",
                 manifest.schema
             ));
         }
-        Self::from_parts(manifest_text, manifest, source.into(), system_prompt.into())
+        match manifest.schema.as_str() {
+            AGENT_PACKAGE_SCHEMA
+                if manifest.project_context.is_some() || project_context.is_some() =>
+            {
+                return Err("v0 agent packages cannot declare project context".to_owned());
+            }
+            AGENT_PACKAGE_SCHEMA_V1
+                if manifest.project_context.is_none() || project_context.is_none() =>
+            {
+                return Err("v1 agent packages require a project context document".to_owned());
+            }
+            _ => {}
+        }
+        if manifest.schema == AGENT_PACKAGE_SCHEMA_V1
+            && manifest.project_context.as_deref() != Some("AGENTS.md")
+        {
+            return Err("v1 agent package project context must be AGENTS.md".to_owned());
+        }
+        if manifest.schema == AGENT_PACKAGE_SCHEMA_V1
+            && (!is_direct_package_child(&manifest.source)
+                || !is_direct_package_child(&manifest.system_prompt))
+        {
+            return Err("v1 agent package files must name direct children".to_owned());
+        }
+        Self::from_parts(
+            manifest_text,
+            manifest,
+            source.into(),
+            system_prompt.into(),
+            project_context,
+        )
     }
 
     #[cfg(feature = "native")]
@@ -79,7 +139,12 @@ impl AuthoredAgentPackage {
             .map_err(|error| format!("invalid agent package manifest: {error}"))?;
         let source = read_package_child(&root, &manifest.source)?;
         let system_prompt = read_package_child(&root, &manifest.system_prompt)?;
-        Self::from_documents(manifest_text, source, system_prompt)
+        let project_context = manifest
+            .project_context
+            .as_deref()
+            .map(|path| read_package_child(&root, path))
+            .transpose()?;
+        Self::from_documents_with_context(manifest_text, source, system_prompt, project_context)
     }
 
     fn from_parts(
@@ -87,16 +152,42 @@ impl AuthoredAgentPackage {
         manifest: AuthoredAgentPackageManifest,
         source: String,
         system_prompt: String,
+        project_context: Option<String>,
     ) -> Result<Self, String> {
         if manifest.workflow.trim().is_empty()
             || manifest.agent.trim().is_empty()
-            || system_prompt.trim().is_empty()
+            || (manifest.schema == AGENT_PACKAGE_SCHEMA && system_prompt.trim().is_empty())
             || manifest.max_steps == 0
         {
             return Err(
-                "agent package requires workflow, agent, persona, and positive max_steps"
+                "agent package requires workflow, agent, project context for v1, and positive max_steps"
                     .to_owned(),
             );
+        }
+        let external_tools = manifest.external_tools;
+        let mut names = std::collections::BTreeSet::new();
+        let built_in_names = workspace_tool_specs_from_registry(true, true, true)
+            .into_iter()
+            .map(|tool| tool.name)
+            .chain(std::iter::once("add_todo".to_owned()))
+            .chain(std::iter::once(
+                crate::result_contract::TOOL_SUBMIT_RESULT.to_owned(),
+            ))
+            .collect::<std::collections::BTreeSet<_>>();
+        for tool in &external_tools {
+            if tool.name.is_empty()
+                || !tool
+                    .name
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+                || !names.insert(tool.name.clone())
+                || built_in_names.contains(&tool.name)
+                || tool.capability.trim().is_empty()
+                || tool.description.trim().is_empty()
+                || tool.input_schema.get("type").and_then(Value::as_str) != Some("object")
+            {
+                return Err(format!("invalid external tool `{}`", tool.name));
+            }
         }
         let mut capabilities = manifest.capabilities;
         capabilities.sort();
@@ -104,8 +195,11 @@ impl AuthoredAgentPackage {
         for capability in &capabilities {
             if !matches!(
                 capability.as_str(),
-                "workspace.read" | "workspace.write" | "command.run"
-            ) {
+                "workspace.read" | "workspace.write" | "command.run" | "tracker.file"
+            ) && !external_tools
+                .iter()
+                .any(|tool| tool.capability == *capability)
+            {
                 return Err(format!(
                     "agent package declares unsupported capability `{capability}`"
                 ));
@@ -123,6 +217,14 @@ impl AuthoredAgentPackage {
             if !capabilities.contains(ability) {
                 return Err(format!(
                     "agent ability `{ability}` is absent from the package capability registry"
+                ));
+            }
+        }
+        for tool in &external_tools {
+            if !capabilities.contains(&tool.capability) {
+                return Err(format!(
+                    "external tool `{}` capability `{}` is absent from the package registry",
+                    tool.name, tool.capability
                 ));
             }
         }
@@ -170,11 +272,20 @@ impl AuthoredAgentPackage {
             ));
         }
 
-        let identity = json!({
-            "manifest": &manifest_text,
-            "source": &source,
-            "system_prompt": &system_prompt,
-        });
+        let identity = if let Some(context) = &project_context {
+            json!({
+                "manifest": &manifest_text,
+                "source": &source,
+                "system_prompt": &system_prompt,
+                "project_context": context,
+            })
+        } else {
+            json!({
+                "manifest": &manifest_text,
+                "source": &source,
+                "system_prompt": &system_prompt,
+            })
+        };
         let version_ref = format!(
             "whip:agent-package:{}",
             sha256_hex(identity.to_string().as_bytes())
@@ -186,8 +297,15 @@ impl AuthoredAgentPackage {
             workflow: manifest.workflow,
             agent: manifest.agent,
             system_prompt,
+            project_context: project_context.map(|content| {
+                crate::context_assembly::ProjectInstruction {
+                    path: manifest.project_context.expect("v1 path checked above"),
+                    content,
+                }
+            }),
             capabilities,
             agent_abilities,
+            external_tools,
             max_steps: manifest.max_steps,
         })
     }
@@ -204,6 +322,16 @@ impl AuthoredAgentPackage {
         &self.agent_abilities
     }
 
+    /// Names the placement must implement for this package's admitted ability
+    /// ceiling. No undeclared host callback is reachable through the package.
+    pub fn external_tool_bindings(&self) -> Vec<(String, String)> {
+        self.external_tools
+            .iter()
+            .filter(|tool| self.agent_abilities.contains(&tool.capability))
+            .map(|tool| (tool.name.clone(), tool.capability.clone()))
+            .collect()
+    }
+
     /// Exact authored documents whose content hash produced [`Self::version_ref`].
     /// Hosted placements transmit these bytes to the governed host; they must
     /// never reconstruct a manifest or persona from the compiled projection.
@@ -217,6 +345,10 @@ impl AuthoredAgentPackage {
 
     pub fn system_prompt_document(&self) -> &str {
         &self.system_prompt
+    }
+
+    pub fn project_context_document(&self) -> Option<&crate::context_assembly::ProjectInstruction> {
+        self.project_context.as_ref()
     }
 
     pub fn resolve(&self, version_ref: &str) -> Result<ResolvedPackage, String> {
@@ -235,17 +367,41 @@ impl AuthoredAgentPackage {
             .agent_abilities
             .iter()
             .any(|item| item == "command.run");
-        ResolvedPackage::compile_with_capabilities(
+        let tracker_file = self
+            .agent_abilities
+            .iter()
+            .any(|item| item == "tracker.file");
+        let mut tools = workspace_tool_specs_from_registry(readable, writable, command);
+        if tracker_file {
+            tools.push(tracker_add_todo_spec());
+        }
+        tools.extend(
+            self.external_tools
+                .iter()
+                .filter(|tool| self.agent_abilities.contains(&tool.capability))
+                .map(|tool| ToolSpec {
+                    name: tool.name.clone(),
+                    description: tool.description.clone(),
+                    input_schema: tool.input_schema.clone(),
+                }),
+        );
+        let mut resolved = ResolvedPackage::compile_with_capabilities(
             self.version_ref.clone(),
             &self.source,
             Some(&self.workflow),
             self.agent.clone(),
             self.system_prompt.clone(),
-            workspace_tool_specs_from_registry(readable, writable, command),
+            tools,
             self.max_steps,
             self.agent_abilities.clone(),
-        )
+        )?;
+        resolved.project_context = self.project_context.clone();
+        Ok(resolved)
     }
+}
+
+fn is_direct_package_child(path: &str) -> bool {
+    !path.is_empty() && path != "." && path != ".." && !path.contains('/') && !path.contains('\\')
 }
 
 impl PackageResolver for AuthoredAgentPackage {
@@ -279,6 +435,7 @@ pub struct ResolvedPackage {
     pub ir_hash: String,
     pub agent: String,
     pub system_prompt: String,
+    pub project_context: Option<crate::context_assembly::ProjectInstruction>,
     pub tools: Vec<ToolSpec>,
     pub capabilities: Vec<String>,
     pub max_steps: usize,
@@ -291,6 +448,69 @@ pub struct ResolvedPackage {
 }
 
 impl ResolvedPackage {
+    /// The authored package's pinned model context. V0 keeps its historical
+    /// persona bytes; v1 carries AGENTS.md as a separate project contribution.
+    pub fn context_for_model(&self) -> crate::context_assembly::AssembledContext {
+        self.context_for_model_with_skills(&[])
+    }
+
+    /// Assemble the package context with a host-registered, metadata-only
+    /// skill catalogue. Skill bodies remain available through the read tool.
+    pub fn context_for_model_with_skills(
+        &self,
+        skills: &[crate::context_assembly::SkillCatalogueEntry],
+    ) -> crate::context_assembly::AssembledContext {
+        use crate::context_assembly::{
+            assemble, contribution, render_available_skills, render_project_context,
+            AssembledContext, ContributionLifecycle, InstructionAuthority, InstructionRole,
+        };
+        let context = self
+            .project_context
+            .as_ref()
+            .filter(|context| !context.content.trim().is_empty());
+        if context.is_none() && skills.is_empty() {
+            return AssembledContext {
+                system_prompt: self.system_prompt.clone(),
+                contributions: Vec::new(),
+            };
+        }
+        let mut contributions = vec![contribution(
+            "persona",
+            "package:system-prompt",
+            self.version_ref.clone(),
+            InstructionAuthority::Runtime,
+            InstructionRole::System,
+            "010-persona",
+            ContributionLifecycle::Stable,
+            self.system_prompt.clone(),
+        )];
+        if let Some(context) = context {
+            contributions.push(contribution(
+                "agent-context",
+                context.path.clone(),
+                self.version_ref.clone(),
+                InstructionAuthority::Project,
+                InstructionRole::Developer,
+                "040-agent-context",
+                ContributionLifecycle::Stable,
+                render_project_context(std::slice::from_ref(context)),
+            ));
+        }
+        if !skills.is_empty() {
+            contributions.push(contribution(
+                "available-skills",
+                "registry:skills",
+                self.version_ref.clone(),
+                InstructionAuthority::Runtime,
+                InstructionRole::System,
+                "050-available-skills",
+                ContributionLifecycle::Stable,
+                render_available_skills(skills),
+            ));
+        }
+        assemble(contributions)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn compile(
         version_ref: impl Into<String>,
@@ -378,6 +598,7 @@ impl ResolvedPackage {
             ir_hash,
             agent,
             system_prompt,
+            project_context: None,
             tools,
             capabilities,
             max_steps,
@@ -459,6 +680,25 @@ pub fn workspace_tool_specs_from_registry(
         ));
     }
     tools
+}
+
+/// The authored package's tracker filing facade. The actual queue and write
+/// authority are supplied by the host's admitted turn resource, never by a
+/// package field or a model-supplied path.
+pub fn tracker_add_todo_spec() -> ToolSpec {
+    tool_spec(
+        "add_todo",
+        "File a task in the current work tracker. Returns its issue id only after filing succeeds.",
+        json!({
+            "type": "object",
+            "properties": {
+                "content": { "type": "string", "minLength": 1 },
+                "status": { "type": "string", "enum": ["pending"] }
+            },
+            "required": ["content"],
+            "additionalProperties": false
+        }),
+    )
 }
 
 /// Default `read` window when the caller names no limit (pi-conformance §1:
@@ -579,6 +819,169 @@ fn hex_lower(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn v1_agent_context_is_distinct_and_pinned() {
+        let source = "workflow Chat { agent assistant { provider owned profile \"repo-reader\" capacity 1 capabilities [\"workspace.read\"] } }";
+        let manifest = json!({
+            "schema": AGENT_PACKAGE_SCHEMA_V1,
+            "source": "chat.whip",
+            "workflow": "Chat",
+            "agent": "assistant",
+            "system_prompt": "persona.md",
+            "project_context": "AGENTS.md",
+            "capabilities": ["workspace.read"],
+            "agent_abilities": ["workspace.read"],
+            "max_steps": 12
+        });
+        assert!(AuthoredAgentPackage::from_documents(
+            manifest.to_string(),
+            source,
+            "Runtime instructions."
+        )
+        .unwrap_err()
+        .contains("require a project context"));
+        let first = AuthoredAgentPackage::from_documents_with_context(
+            manifest.to_string(),
+            source,
+            "Runtime instructions.",
+            Some("Read carefully.".into()),
+        )
+        .unwrap();
+        let second = AuthoredAgentPackage::from_documents_with_context(
+            manifest.to_string(),
+            source,
+            "Runtime instructions.",
+            Some("Read twice.".into()),
+        )
+        .unwrap();
+        assert_ne!(first.version_ref(), second.version_ref());
+        assert_eq!(first.system_prompt_document(), "Runtime instructions.");
+        let context = first.project_context_document().unwrap();
+        assert_eq!(context.path, "AGENTS.md");
+        assert_eq!(context.content, "Read carefully.");
+        assert_eq!(
+            first.resolve(first.version_ref()).unwrap().project_context,
+            Some(context.clone())
+        );
+        let projected = first
+            .resolve(first.version_ref())
+            .unwrap()
+            .context_for_model();
+        assert_eq!(projected.contributions.len(), 2);
+        assert_eq!(
+            projected.system_prompt.matches("Read carefully.").count(),
+            1
+        );
+        assert_eq!(
+            projected
+                .system_prompt
+                .matches("Runtime instructions.")
+                .count(),
+            1
+        );
+        assert_eq!(projected.contributions[1].source, "AGENTS.md");
+        let with_skills = first
+            .resolve(first.version_ref())
+            .unwrap()
+            .context_for_model_with_skills(&[crate::context_assembly::SkillCatalogueEntry {
+                name: "triage".into(),
+                description: "Inspect a report".into(),
+                location: ".gaugedesk-runtime/discipline/agent-skills/triage/SKILL.md".into(),
+            }]);
+        assert_eq!(with_skills.contributions.len(), 3);
+        assert_eq!(
+            with_skills
+                .system_prompt
+                .matches("<available_skills>")
+                .count(),
+            1
+        );
+        assert_eq!(
+            with_skills.system_prompt.matches("Read carefully.").count(),
+            1
+        );
+        assert_eq!(with_skills.contributions[2].source, "registry:skills");
+        let without_system = AuthoredAgentPackage::from_documents_with_context(
+            manifest.to_string(),
+            source,
+            "",
+            Some("Read carefully.".into()),
+        )
+        .unwrap();
+        assert_eq!(without_system.system_prompt_document(), "");
+        assert_ne!(first.version_ref(), without_system.version_ref());
+        let migrated = AuthoredAgentPackage::from_documents_with_context(
+            manifest.to_string(),
+            source,
+            "Legacy persona.",
+            Some(String::new()),
+        )
+        .unwrap();
+        let migrated_context = migrated
+            .resolve(migrated.version_ref())
+            .unwrap()
+            .context_for_model();
+        assert_eq!(migrated_context.system_prompt, "Legacy persona.");
+        assert!(migrated_context.contributions.is_empty());
+        let mut unsupported = manifest.clone();
+        unsupported["schema"] = json!("whipplescript.agent_package.v2");
+        assert!(AuthoredAgentPackage::from_documents_with_context(
+            unsupported.to_string(),
+            source,
+            "",
+            Some("Pinned.".into()),
+        )
+        .unwrap_err()
+        .contains("unsupported agent package schema"));
+        let mut v0 = manifest.clone();
+        v0["schema"] = json!(AGENT_PACKAGE_SCHEMA);
+        assert!(AuthoredAgentPackage::from_documents_with_context(
+            v0.to_string(),
+            source,
+            "Legacy persona.",
+            Some("Unexpected project context.".into()),
+        )
+        .unwrap_err()
+        .contains("v0 agent packages cannot declare project context"));
+        v0.as_object_mut().unwrap().remove("project_context");
+        assert!(
+            AuthoredAgentPackage::from_documents(v0.to_string(), source, "")
+                .unwrap_err()
+                .contains("agent package requires")
+        );
+        let mut wrong_context_path = manifest.clone();
+        wrong_context_path["project_context"] = json!("instructions.md");
+        assert!(AuthoredAgentPackage::from_documents_with_context(
+            wrong_context_path.to_string(),
+            source,
+            "",
+            Some("Pinned.".into()),
+        )
+        .unwrap_err()
+        .contains("project context must be AGENTS.md"));
+        let mut capability_drift = manifest.clone();
+        capability_drift["capabilities"] = json!([]);
+        capability_drift["agent_abilities"] = json!([]);
+        assert!(AuthoredAgentPackage::from_documents_with_context(
+            capability_drift.to_string(),
+            source,
+            "",
+            Some("Pinned.".into()),
+        )
+        .unwrap_err()
+        .contains("capabilities do not match"));
+        let mut escaped_manifest = manifest;
+        escaped_manifest["source"] = json!("../chat.whip");
+        assert!(AuthoredAgentPackage::from_documents_with_context(
+            escaped_manifest.to_string(),
+            source,
+            "",
+            Some("Pinned.".into()),
+        )
+        .unwrap_err()
+        .contains("direct children"));
+    }
+
     /// `edits_argument` and `read_line_window` moved here from the two host tool
     /// surfaces that each carried a copy. Their refusals came with them but
     /// their tests did not: the sweep runs per crate, so every refusal in this
@@ -663,6 +1066,131 @@ workflow Chat {
             .find(|tool| tool.name == "bash")
             .expect("bash");
         assert!(bash.description.contains("virtual bash"));
+    }
+
+    #[test]
+    fn authored_tracker_filing_is_an_explicit_agent_ability() {
+        let source = r#"workflow Chat {
+  agent assistant {
+    provider owned
+    profile "task-filer"
+    capacity 1
+    capabilities ["tracker.file"]
+  }
+}"#;
+        let manifest = json!({
+            "schema": AGENT_PACKAGE_SCHEMA,
+            "source": "agent.whip",
+            "workflow": "Chat",
+            "agent": "assistant",
+            "system_prompt": "persona.md",
+            "capabilities": ["tracker.file"],
+            "agent_abilities": ["tracker.file"],
+            "max_steps": 12
+        });
+        let package = AuthoredAgentPackage::from_documents(
+            manifest.to_string(),
+            source,
+            "File actual tracker tasks.",
+        )
+        .expect("tracker-capable package");
+        let resolved = package
+            .resolve(package.version_ref())
+            .expect("resolve package");
+        assert_eq!(resolved.tools.len(), 1);
+        assert_eq!(resolved.tools[0].name, "add_todo");
+        assert_eq!(
+            resolved.tools[0].input_schema["required"],
+            json!(["content"])
+        );
+
+        let mut narrowed = manifest;
+        narrowed["agent_abilities"] = json!([]);
+        let package = AuthoredAgentPackage::from_documents(
+            narrowed.to_string(),
+            source,
+            "File actual tracker tasks.",
+        )
+        .expect("narrowed package");
+        assert!(package
+            .resolve(package.version_ref())
+            .unwrap()
+            .tools
+            .is_empty());
+
+        let mut unsupported = narrowed;
+        unsupported["capabilities"] = json!(["tracker.erase"]);
+        unsupported["agent_abilities"] = json!(["tracker.erase"]);
+        let error = AuthoredAgentPackage::from_documents(
+            unsupported.to_string(),
+            source,
+            "File actual tracker tasks.",
+        )
+        .unwrap_err();
+        assert!(error.contains("unsupported capability `tracker.erase`"));
+    }
+
+    #[test]
+    fn external_tool_is_offered_only_when_the_authored_ability_admits_it() {
+        let source = r#"workflow Chat {
+  agent assistant {
+    provider owned
+    profile "question-asker"
+    capacity 1
+    capabilities ["question.ask"]
+  }
+}"#;
+        let mut manifest = json!({
+            "schema": AGENT_PACKAGE_SCHEMA,
+            "source": "agent.whip",
+            "workflow": "Chat",
+            "agent": "assistant",
+            "system_prompt": "persona.md",
+            "capabilities": ["question.ask"],
+            "agent_abilities": ["question.ask"],
+            "external_tools": [{
+                "name": "ask",
+                "capability": "question.ask",
+                "description": "Ask the person a question.",
+                "input_schema": {"type": "object", "properties": {"question": {"type": "string"}}}
+            }],
+            "max_steps": 12
+        });
+        let package =
+            AuthoredAgentPackage::from_documents(manifest.to_string(), source, "Ask when needed.")
+                .expect("package");
+        let resolved = package.resolve(package.version_ref()).expect("resolved");
+        assert_eq!(resolved.tools.len(), 1);
+        assert_eq!(resolved.tools[0].name, "ask");
+
+        manifest["agent_abilities"] = json!([]);
+        let package =
+            AuthoredAgentPackage::from_documents(manifest.to_string(), source, "Ask when needed.")
+                .expect("narrowed package");
+        assert!(package
+            .resolve(package.version_ref())
+            .unwrap()
+            .tools
+            .is_empty());
+
+        let mut missing_registry = manifest.clone();
+        missing_registry["capabilities"] = json!([]);
+        assert!(AuthoredAgentPackage::from_documents(
+            missing_registry.to_string(),
+            source,
+            "Ask when needed."
+        )
+        .unwrap_err()
+        .contains("external tool `ask` capability `question.ask` is absent"));
+
+        manifest["external_tools"][0]["name"] = json!("read");
+        assert!(AuthoredAgentPackage::from_documents(
+            manifest.to_string(),
+            source,
+            "Ask when needed."
+        )
+        .unwrap_err()
+        .contains("invalid external tool"));
     }
 
     #[test]

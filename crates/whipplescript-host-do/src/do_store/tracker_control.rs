@@ -49,6 +49,7 @@ fn execute(
                     id,
                     actor,
                     Some(expires_at),
+                    now,
                     effect,
                     now,
                 )? {
@@ -56,7 +57,13 @@ fn execute(
                         expires_at: expires_at.clone(),
                     },
                     ClaimOutcome::AlreadyClaimed { holder } => Outcome::AlreadyClaimed { holder },
-                    ClaimOutcome::NotFound => Outcome::NotOpen,
+                    ClaimOutcome::NotFound | ClaimOutcome::NotOpen { .. } => Outcome::NotOpen,
+                    ClaimOutcome::NotReady { reasons } => Outcome::NotReady {
+                        reasons: reasons
+                            .iter()
+                            .map(whipplescript_store::items::readiness::Unready::describe)
+                            .collect(),
+                    },
                 },
             )
         }

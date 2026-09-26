@@ -157,7 +157,7 @@ impl re::action_cache_server::ActionCache for Services {
     ) -> Result<Response<re::ActionResult>, Status> {
         let view = self.view(&request)?;
         let action = digest_of(request.get_ref().action_digest.as_ref(), "action")?;
-        match self.endpoint.cache.lookup(&view, &action) {
+        match self.endpoint.cached(&view, &action) {
             Some(entry) => Ok(Response::new(entry.result)),
             None => Err(Status::not_found(format!(
                 "no result for action {action} under this view"
@@ -234,8 +234,10 @@ impl re::content_addressable_storage_server::ContentAddressableStorage for Servi
                                 "the data does not match its digest",
                             )
                         } else {
-                            self.endpoint.store.put(&view, &item.data, &Labels::new());
-                            rpc_status(tonic::Code::Ok, "")
+                            match self.endpoint.store.put(&view, &item.data, &Labels::new()) {
+                                Ok(_) => rpc_status(tonic::Code::Ok, ""),
+                                Err(error) => rpc_status(tonic::Code::Internal, &error),
+                            }
                         }
                     }
                     Err(error) => rpc_status(tonic::Code::InvalidArgument, &error),
@@ -477,7 +479,10 @@ impl ByteStream for Services {
                 "the data does not match its digest",
             ));
         }
-        self.endpoint.store.put(&view, &data, &Labels::new());
+        self.endpoint
+            .store
+            .put(&view, &data, &Labels::new())
+            .map_err(Status::internal)?;
         Ok(Response::new(WriteResponse {
             committed_size: claimed.size_bytes,
         }))

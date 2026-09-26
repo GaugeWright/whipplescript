@@ -1,10 +1,16 @@
 use super::*;
+use whipplescript_store::items::readiness::ReadinessSource;
 
+/// The claim guard (DR-0126), as natively: granted only on an issue the one
+/// readiness calls ready at the caller's instant `at`; `now` stamps what is
+/// written. The hosted store has no person at a terminal, so no override.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn claim_item(
     sql: &impl DoSql,
     item_id: &str,
     claimed_by: &str,
     expires: Option<&str>,
+    at: &str,
     effect_id: Option<&str>,
     now: &str,
 ) -> StoreResult<ClaimOutcome> {
@@ -18,11 +24,22 @@ pub(super) fn claim_item(
     if !exists {
         return Ok(ClaimOutcome::NotFound);
     }
-    do_expire_stale_leases(sql, item_id, now)?;
+    do_expire_stale_leases_at(sql, item_id, at, now)?;
     // Exclusivity (tracker-lease I1): grant only when no active lease. The
     // single-writer invocation serializes this check-then-insert.
-    if let Some(holder) = do_active_holder(sql, item_id)? {
+    let source = super::readiness::DoReadiness(sql);
+    if let Some((holder, _)) = source.active_lease_at(item_id, at)? {
         return Ok(ClaimOutcome::AlreadyClaimed { holder });
+    }
+    let reasons = whipplescript_store::items::readiness::unready_reasons(&source, item_id, at)?;
+    if let Some(status) = reasons.iter().find_map(|reason| match reason {
+        whipplescript_store::items::readiness::Unready::NotOpen { status } => Some(status.clone()),
+        _ => None,
+    }) {
+        return Ok(ClaimOutcome::NotOpen { status });
+    }
+    if !reasons.is_empty() {
+        return Ok(ClaimOutcome::NotReady { reasons });
     }
     // The lease's identity IS its `claim.acquired` event (content hash) —
     // merge-stable across clones, matching the native store.

@@ -1,0 +1,148 @@
+--- Tracker ordering (DR-0126 Decision 4): an issue's priority is a derived
+--- position, never a stored number.
+---
+---   Local to a parent. An ordering statement "A before B" ranks A and B only
+---   when they are siblings -- both children of the same parent, or both
+---   roots. Between issues under different parents it ranks nothing.
+---
+---   The parent's owner's act. A statement counts only when its writer is the
+---   parent's owner (its assignee), or when the parent has none -- a root has
+---   none. Anyone may write one; a non-owner's statement is a proposal and
+---   ranks nothing.
+---
+---   Hierarchical. Whatever ranks before a parent ranks before its children,
+---   at every depth, and a parent's children rank before whatever it ranks
+---   before -- so children follow their parents' order.
+---
+---   Contradiction is a conflict. When the statements and the hierarchy rank A
+---   before B and B before A, both are marked in conflict; no statement
+---   silently wins.
+---
+---   Inherited backward along dependencies. When X is a gating dependency of Y
+---   and Y ranks before Z, X is urgent before Z: urgency flows from what waits
+---   to what it waits on, across parents, and overrides the stated order --
+---   that override is the point, so it is never a conflict. It never flows
+---   forward: a dependent does not inherit its dependency's rank.
+---
+--- `prec(A, B)` is the stated-and-hierarchical "A ranks before B";
+--- `urgent(X, Z)` is the inherited one, which the effective order puts first.
+--- Ids are positive; 0 is the root sentinel for "no parent" and "no owner".
+mod TRACKER-ORDERING is
+  protecting NAT .
+
+  sorts Fact Cfg State .
+  subsort Fact < Cfg .
+
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+  op {_} : Cfg -> State [ctor] .
+
+  --- parent(P, C): P is C's parent.
+  op parent : Nat Nat -> Fact [ctor] .
+  --- owner(P, W): W owns P (P's assignee).
+  op owner : Nat Nat -> Fact [ctor] .
+  --- stmt(A, B, W): W stated "A before B".
+  op stmt : Nat Nat Nat -> Fact [ctor] .
+  --- gatesOn(X, Y): X is a gating dependency of Y.
+  op gatesOn : Nat Nat -> Fact [ctor] .
+  --- prec(A, B): derived, A ranks before B by statement and hierarchy.
+  op prec : Nat Nat -> Fact [ctor] .
+  --- urgent(X, Z): derived, X ranks before Z by inheritance.
+  op urgent : Nat Nat -> Fact [ctor] .
+  --- conflict(A): derived, A's ordering is contradicted.
+  op conflict : Nat -> Fact [ctor] .
+
+  vars A B D P P1 P2 W X Y Z : Nat .
+  vars C Full : Cfg .
+
+  op parentOf : Nat Cfg -> Nat .
+  eq parentOf(A, parent(P, A) C) = P .
+  eq parentOf(A, C) = 0 [owise] .
+
+  op ownerOf : Nat Cfg -> Nat .
+  eq ownerOf(P, owner(P, W) C) = W .
+  eq ownerOf(P, C) = 0 [owise] .
+
+  --- Does W's statement about A and B rank them?
+  op counts : Nat Nat Nat Cfg -> Bool .
+  eq counts(A, B, W, Full) =
+    parentOf(A, Full) == parentOf(B, Full)
+    and (ownerOf(parentOf(A, Full), Full) == 0
+         or ownerOf(parentOf(A, Full), Full) == W) .
+
+  op hasPrec : Nat Nat Cfg -> Bool .
+  eq hasPrec(A, B, prec(A, B) C) = true .
+  eq hasPrec(A, B, C) = false [owise] .
+
+  op hasConflict : Nat Cfg -> Bool .
+  eq hasConflict(A, conflict(A) C) = true .
+  eq hasConflict(A, C) = false [owise] .
+
+  op hasUrgent : Nat Nat Cfg -> Bool .
+  eq hasUrgent(A, B, urgent(A, B) C) = true .
+  eq hasUrgent(A, B, C) = false [owise] .
+
+  crl [stmt] : { stmt(A, B, W) C } => { prec(A, B) stmt(A, B, W) C }
+    if counts(A, B, W, stmt(A, B, W) C) /\ hasPrec(A, B, C) = false .
+
+  crl [trans] : { prec(A, B) prec(B, D) C } => { prec(A, D) prec(A, B) prec(B, D) C }
+    if A =/= D /\ hasPrec(A, D, C) = false .
+
+  --- Hierarchy, as the lexicographic comparison of position paths does it:
+  --- whatever ranks before a parent ranks before its children, and a parent's
+  --- children rank before whatever the parent ranks before. Child against
+  --- child follows from applying both.
+  crl [hier-down] : { prec(A, P2) parent(P2, B) C }
+                 => { prec(A, B) prec(A, P2) parent(P2, B) C }
+    if A =/= B /\ hasPrec(A, B, C) = false .
+  crl [hier-up] : { prec(P1, B) parent(P1, A) C }
+               => { prec(A, B) prec(P1, B) parent(P1, A) C }
+    if A =/= B /\ hasPrec(A, B, C) = false .
+
+  crl [inherit] : { gatesOn(X, Y) prec(Y, Z) C }
+               => { urgent(X, Z) gatesOn(X, Y) prec(Y, Z) C }
+    if X =/= Z /\ hasUrgent(X, Z, C) = false .
+
+  --- Transitively: a dependency of something urgent is urgent too.
+  crl [inherit-urgent] : { gatesOn(X, Y) urgent(Y, Z) C }
+                      => { urgent(X, Z) gatesOn(X, Y) urgent(Y, Z) C }
+    if X =/= Z /\ hasUrgent(X, Z, C) = false .
+
+  crl [conflict] : { prec(A, B) prec(B, A) C } => { conflict(A) prec(A, B) prec(B, A) C }
+    if hasConflict(A, C) = false .
+endm
+
+--- Negative fixture (bite): a SLOPPY ordering that settles a contradiction by
+--- letting the statement with the larger writer id win and never marks a
+--- conflict. The contradiction search against the good module is a
+--- No-solution; against this one it has a solution, which is what gives that
+--- No-solution its content.
+mod TRACKER-ORDERING-SILENT-WINNER is
+  protecting NAT .
+
+  sorts Fact Cfg State .
+  subsort Fact < Cfg .
+
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+  op {_} : Cfg -> State [ctor] .
+
+  op stmt : Nat Nat Nat -> Fact [ctor] .
+  op prec : Nat Nat -> Fact [ctor] .
+  op conflict : Nat -> Fact [ctor] .
+
+  vars A B W W2 : Nat .
+  var C : Cfg .
+
+  op hasPrec : Nat Nat Cfg -> Bool .
+  eq hasPrec(A, B, prec(A, B) C) = true .
+  eq hasPrec(A, B, C) = false [owise] .
+
+  op hasConflict : Nat Cfg -> Bool .
+  eq hasConflict(A, conflict(A) C) = true .
+  eq hasConflict(A, C) = false [owise] .
+
+  crl [winner] : { stmt(A, B, W) stmt(B, A, W2) C }
+              => { prec(A, B) stmt(A, B, W) stmt(B, A, W2) C }
+    if W > W2 /\ hasPrec(A, B, C) = false .
+endm

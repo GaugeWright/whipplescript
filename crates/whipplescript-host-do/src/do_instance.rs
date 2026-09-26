@@ -938,7 +938,15 @@ impl<Sql: DoSql + Clone> InstanceDriver for DoInstanceDriver<'_, Sql> {
         .map(|wake| wake.due_epoch_ms)
         .filter(|due| *due > self.now_unix_ms)
         .min();
-        Ok([effect_due, clock_due, reconciliation_due]
+        // A claim lapsing, a deferral coming due, a review date passing: tracker
+        // readiness that changes with time alone (DR-0126 RV-3).
+        let tracker_due = whipplescript_kernel::time_pass::next_tracker_readiness_due_unix_ms(
+            &self.kernel,
+            now,
+            self.ir,
+        )?
+        .filter(|due| *due > self.now_unix_ms);
+        Ok([effect_due, clock_due, reconciliation_due, tracker_due]
             .into_iter()
             .flatten()
             .min())
@@ -2199,15 +2207,14 @@ impl<Sql: DoSql + Clone> InstanceDriver for DoInstanceDriver<'_, Sql> {
             }
             "tracker.file" | "tracker.claim" | "tracker.renew" | "tracker.release"
             | "tracker.finish" => {
-                // The DO worker uses "now" as its clock stub (like coordination
-                // below); deterministic/real-clock injection — hence a live claim
-                // `ttl` deadline — is a native/scenario concern for now. The renew
-                // heartbeat and untimed claims are unaffected.
+                // The host's own instant (DR-0126 RV-3): the claim guard decides
+                // readiness at it, and a claim `ttl` deadline is anchored to it,
+                // so a timed claim is timed here as it is natively.
                 run_queue_effect_generic(
                     &mut self.kernel,
                     self.instance_id,
                     effect,
-                    "now",
+                    &crate::do_worker::unix_ms_to_iso8601(self.now_unix_ms),
                     &config,
                 )?
             }

@@ -2108,5 +2108,9 @@ mod hosted_profile;
 #[path = "norm_commands/hosted_protected.rs"]
 mod hosted_protected;
 
+#[path = "norm_commands/admission.rs"]
+mod admission;
+#[path = "norm_commands/authorization_demo.rs"]
+mod authorization_demo;
 #[path = "norm_commands/impact.rs"]
 mod impact;
