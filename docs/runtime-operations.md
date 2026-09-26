@@ -373,7 +373,9 @@ At the `process` rung (r0) the store rests under a passphrase-derived key on
 the same machine. That protects the material from the language, not from an
 escape on the same account — every r0 reply says so with a `degraded` tag.
 Network egress from the custodian is deny-by-default: without `--egress-allow`
-the daemon refuses every outbound request.
+the daemon refuses every outbound request. The custodian returns HTTP redirects
+to the workflow without following them; a request to the new destination must
+pass the allow-list again, including when the original request used a credential.
 
 Governance signing uses the same machinery. Import an `ed25519` credential
 named `whip/governance-signing` and `whip gov sign` / `whip gov verify` will

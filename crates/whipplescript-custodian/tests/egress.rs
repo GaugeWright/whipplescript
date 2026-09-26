@@ -62,6 +62,54 @@ fn egress_is_deny_by_default_and_refuses_spoofed_hosts() {
     assert!(none.perform(&req("https://api.stripe.com/")).is_err());
 }
 
+#[test]
+fn redirected_request_does_not_bypass_the_host_allow_list() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind allowed host");
+    let port = listener.local_addr().expect("allowed address").port();
+    let blocked = TcpListener::bind("127.0.0.1:0").expect("reserve blocked port");
+    let blocked_port = blocked.local_addr().expect("blocked address").port();
+    drop(blocked);
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept allowed request");
+        let mut raw = Vec::new();
+        let mut chunk = [0u8; 2048];
+        while !raw.windows(4).any(|part| part == b"\r\n\r\n") {
+            let count = stream.read(&mut chunk).expect("read allowed request");
+            assert_ne!(count, 0, "request closed before its headers arrived");
+            raw.extend_from_slice(&chunk[..count]);
+        }
+        let seen = String::from_utf8_lossy(&raw);
+        assert!(
+            seen.to_ascii_lowercase()
+                .contains("x-api-key: synthetic-secret"),
+            "{seen}"
+        );
+        let reply = format!(
+            "HTTP/1.1 302 Found\r\nLocation: http://localhost:{blocked_port}/steal\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        );
+        stream.write_all(reply.as_bytes()).expect("write redirect");
+    });
+
+    let egress = UreqEgress::new(vec!["127.0.0.1".into()]);
+    let response = egress
+        .perform(&EgressRequest {
+            method: "GET".into(),
+            url: format!("http://127.0.0.1:{port}/start"),
+            headers: vec![("X-Api-Key".into(), "synthetic-secret".into())],
+            body_b64: None,
+        })
+        .expect("return the redirect without following it");
+    server.join().expect("allowed server");
+    assert_eq!(response.status, 302);
+    assert_eq!(
+        response.headers.iter().find(|(name, _)| name == "location"),
+        Some(&(
+            "location".into(),
+            format!("http://localhost:{blocked_port}/steal")
+        ))
+    );
+}
+
 /// Minimal one-shot loopback HTTP server: accepts one connection, captures
 /// the request bytes, answers 200 with a JSON body.
 ///

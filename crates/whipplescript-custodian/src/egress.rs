@@ -32,6 +32,10 @@ impl UreqEgress {
         Self {
             allow_hosts,
             agent: ureq::AgentBuilder::new()
+                // The allow-list is checked for the original URL. A redirect
+                // would bypass that check and could forward substituted
+                // material in a custom header to another host.
+                .redirects(0)
                 .timeout(std::time::Duration::from_secs(60))
                 .build(),
         }
