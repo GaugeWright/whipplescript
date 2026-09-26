@@ -75,7 +75,7 @@ To print the usage line of a command, run `whip <command> --help` or
 | `WHIPPLESCRIPT_CODEX_APP_SERVER_COMMAND` / `WHIPPLESCRIPT_CLAUDE_AGENT_SDK_COMMAND`, `_MODEL`, `_SIDECAR` | These variables override the launch command, the model, and the path of the sidecar of the native adapters. |
 | `WHIPPLESCRIPT_TELEMETRY_ALLOWLIST` | The allowlist of attributes for the `otel-export` command. The `--telemetry-allowlist` flag is the equivalent. |
 | `WHIPPLESCRIPT_OTEL_ALLOW_INSECURE_HEADERS` | This variable permits OTLP headers over an insecure transport. The default is off. |
-| `WHIPPLESCRIPT_IMPROVE_PROPOSER` / `WHIPPLESCRIPT_IMPROVE_PROPOSALS` / `WHIPPLESCRIPT_IMPROVE_PROPOSAL_USAGE` | The selection of the proposer for the improve loop, and the proposals and usage that you inject. These variables apply to a test and to a native run. |
+| `WHIPPLESCRIPT_IMPROVE_PROPOSER` / `WHIPPLESCRIPT_IMPROVE_PROPOSALS` / `WHIPPLESCRIPT_IMPROVE_PROPOSAL_USAGE` / `WHIPPLESCRIPT_IMPROVE_EDIT_ACCOUNT` | The selection of the proposer for the improve loop, and the fixture proposals, usage, and edit account that you inject. These variables apply to a test and to a native run. |
 | `WHIPPLESCRIPT_EVAL_CONCURRENCY` | The limit on the parallel evaluation of the candidates of a campaign. |
 | `WHIPPLESCRIPT_NO_CONTEXT_FILES` / `WHIPPLESCRIPT_GLOBAL_CONTEXT_DIR` | These variables disable the discovery of the context files of a project for a turn, or move the directory of those files. |
 | `WHIPPLESCRIPT_DESKTOP_NOTIFIER` | This variable overrides the notifier command of the `desktop` channel provider. |
@@ -1680,6 +1680,19 @@ The command checks each candidate for fragments of the payload of a scenario
 that are new in its source and that are identical to the original. A match puts
 the `leakage-overlap` tag on the card. The tag is a flag and never a block. The
 adoption stays the act of a person, and the system audits that act.
+
+The native proposer also states one testable mechanism, the declarations it
+expects to change, and the gauges it expects to improve. A mechanism may span
+several declarations. Each candidate's `edit` field records that account and
+the changed declarations computed from canonical parser identities and hashes.
+`edit-account-mismatch` names changes outside the account as a possible bundle;
+it does not establish that the changes are causally independent. Fixture
+proposals without an account carry `edit-account-unreported`. An unavailable
+structural diff is marked `edit-diff-unavailable`. These tags do not block
+evaluation or change the proposal and adoption rules. The fixture proposer can
+supply an account through
+`WHIPPLESCRIPT_IMPROVE_EDIT_ACCOUNT` as JSON with `mechanism`, `declarations`,
+and `expected_gauges`.
 
 The terminal state is one card of evidence for each candidate. The command
 proposes. The command does not apply.

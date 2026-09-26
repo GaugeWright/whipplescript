@@ -226,10 +226,16 @@ fn improve_campaign_proposes_dominant_candidate_and_adopts() {
             "--proposer",
             "fixture",
         ],
-        &[(
-            "WHIPPLESCRIPT_IMPROVE_PROPOSALS",
-            &candidate_path.to_string_lossy(),
-        )],
+        &[
+            (
+                "WHIPPLESCRIPT_IMPROVE_PROPOSALS",
+                &candidate_path.to_string_lossy(),
+            ),
+            (
+                "WHIPPLESCRIPT_IMPROVE_EDIT_ACCOUNT",
+                r#"{"mechanism":"Raise ticket priority","declarations":["rule other"],"expected_gauges":["priority_correct"]}"#,
+            ),
+        ],
     );
     assert_eq!(report["schema"].as_str(), Some("whipplescript.improve.v0"));
     assert_eq!(report["proposed"].as_bool(), Some(true));
@@ -242,6 +248,21 @@ fn improve_campaign_proposes_dominant_candidate_and_adopts() {
     assert_eq!(cards.len(), 1);
     let card = &cards[0];
     assert_eq!(card["proposable"].as_bool(), Some(true));
+    assert_eq!(
+        card["edit"]["status"].as_str(),
+        Some("declarations-unaccounted")
+    );
+    assert_eq!(card["edit"]["unaccounted_declarations"][0], "rule triage");
+    assert!(card["edit"]["changed_declarations"]
+        .as_array()
+        .expect("changed declarations")
+        .iter()
+        .any(|change| change["identity"].as_str() == Some("rule triage")));
+    assert!(card["tags"]
+        .as_array()
+        .expect("tags")
+        .iter()
+        .any(|tag| tag.as_str() == Some("edit-account-mismatch")));
     assert!(card["tags"]
         .as_array()
         .expect("tags")
@@ -263,6 +284,13 @@ fn improve_campaign_proposes_dominant_candidate_and_adopts() {
     assert_eq!(head["candidates"].as_i64(), Some(1));
     assert_eq!(head["proposed"].as_i64(), Some(1));
     let campaign_id = head["campaign"].as_str().expect("campaign id").to_owned();
+    let campaign = env.run_json(&["--json", "campaign", &campaign_id], &[]);
+    assert!(campaign["events"]
+        .as_array()
+        .expect("events")
+        .iter()
+        .any(|event| event["type"] == "candidate.recorded"
+            && event["payload"]["edit"] == card["edit"]));
 
     // Propose-don't-apply: the program on disk is untouched until adoption.
     assert_eq!(

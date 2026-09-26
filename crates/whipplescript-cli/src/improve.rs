@@ -39,6 +39,7 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use whipplescript_parser::{IrGauge, IrProgram, BUILTIN_GAUGES};
 use whipplescript_store::improve::{
@@ -3182,12 +3183,118 @@ trait Proposer {
 struct Proposal {
     source: String,
     rationale: String,
+    edit_account: Option<EditAccount>,
     /// Provider token usage of the proposing turn (0 for fixture), recorded
     /// as a `campaign.spend` event.
     tokens: i64,
     /// The turn's provider/model/split, when the proposer knows it: what
     /// record-time pricing consumes. `None` prices as `unpriced`.
     usage: Option<TurnUsage>,
+}
+
+/// A claim by the proposer, never an authority over the computed diff.
+/// One mechanism can legitimately change more than one declaration.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct EditAccount {
+    mechanism: String,
+    declarations: Vec<String>,
+    expected_gauges: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+struct EditObservation {
+    account: Option<EditAccount>,
+    changes: Option<Vec<Value>>,
+    unaccounted: Vec<String>,
+    tags: Vec<String>,
+}
+
+impl EditObservation {
+    fn payload(&self) -> Value {
+        json!({
+            "account": self.account,
+            "changed_declarations": self.changes,
+            "unaccounted_declarations": self.unaccounted,
+            "status": if self.changes.is_none() {
+                "diff-unavailable"
+            } else if self.account.is_none() {
+                "account-unreported"
+            } else if self.unaccounted.is_empty() {
+                "declarations-accounted"
+            } else {
+                "declarations-unaccounted"
+            },
+        })
+    }
+}
+
+/// Structural comparison only. Canonical declarations are the parser's
+/// existing identity/content units; this does not certify a blast radius or
+/// decide whether several changes form one causal mechanism.
+fn observe_edit(baseline: &str, candidate: &str, account: Option<EditAccount>) -> EditObservation {
+    let before = whipplescript_parser::canonical_declarations(baseline);
+    let after = whipplescript_parser::canonical_declarations(candidate);
+    let (Some(before), Some(after)) = (before, after) else {
+        let mut tags = vec!["edit-diff-unavailable".to_owned()];
+        if account.is_none() {
+            tags.push("edit-account-unreported".to_owned());
+        }
+        return EditObservation {
+            account,
+            changes: None,
+            unaccounted: Vec::new(),
+            tags,
+        };
+    };
+    let before: BTreeMap<String, String> = before
+        .into_iter()
+        .map(|decl| (decl.identity, decl.canon_hash))
+        .collect();
+    let after: BTreeMap<String, String> = after
+        .into_iter()
+        .map(|decl| (decl.identity, decl.canon_hash))
+        .collect();
+    let identities: BTreeSet<&String> = before.keys().chain(after.keys()).collect();
+    let mut changes = Vec::new();
+    let mut unaccounted = Vec::new();
+    for identity in identities {
+        let old = before.get(identity);
+        let new = after.get(identity);
+        if old == new {
+            continue;
+        }
+        let change = match (old, new) {
+            (None, Some(_)) => "added",
+            (Some(_), None) => "removed",
+            _ => "modified",
+        };
+        changes.push(json!({
+            "identity": identity,
+            "change": change,
+            "before_hash": old,
+            "after_hash": new,
+        }));
+        if account
+            .as_ref()
+            .is_some_and(|account| !account.declarations.contains(identity))
+        {
+            unaccounted.push(identity.clone());
+        }
+    }
+    let tags = if account.is_none() {
+        vec!["edit-account-unreported".to_owned()]
+    } else if unaccounted.is_empty() {
+        Vec::new()
+    } else {
+        vec!["edit-account-mismatch".to_owned()]
+    };
+    EditObservation {
+        account,
+        changes: Some(changes),
+        unaccounted,
+        tags,
+    }
 }
 
 /// Deterministic test/dev proposer: colon-separated candidate source paths
@@ -3236,9 +3343,17 @@ impl Proposer for FixtureProposer {
                     _ => None,
                 }
             });
+        let edit_account = std::env::var("WHIPPLESCRIPT_IMPROVE_EDIT_ACCOUNT")
+            .ok()
+            .map(|raw| {
+                serde_json::from_str(&raw)
+                    .map_err(|error| format!("fixture edit account is invalid: {error}"))
+            })
+            .transpose()?;
         Ok(Some(Proposal {
             source,
             rationale: format!("fixture proposal from {path}"),
+            edit_account,
             tokens: usage.as_ref().map_or(0, |usage| usage.total_tokens),
             usage,
         }))
@@ -3261,8 +3376,18 @@ impl Proposer for NativeProposer {
             "properties": {
                 "rationale": {"type": "string"},
                 "source": {"type": "string"},
+                "edit_account": {
+                    "type": "object",
+                    "properties": {
+                        "mechanism": {"type": "string"},
+                        "declarations": {"type": "array", "items": {"type": "string"}},
+                        "expected_gauges": {"type": "array", "items": {"type": "string"}},
+                    },
+                    "required": ["mechanism", "declarations", "expected_gauges"],
+                    "additionalProperties": false,
+                },
             },
-            "required": ["rationale", "source"],
+            "required": ["rationale", "source", "edit_account"],
             "additionalProperties": false,
         });
         let (value, usage) = native_coerce_turn(
@@ -3284,9 +3409,17 @@ impl Proposer for NativeProposer {
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_owned();
+        let edit_account = serde_json::from_value(
+            value
+                .get("edit_account")
+                .cloned()
+                .ok_or("proposer returned no edit account")?,
+        )
+        .map_err(|error| format!("proposer returned an invalid edit account: {error}"))?;
         Ok(Some(Proposal {
             source,
             rationale,
+            edit_account: Some(edit_account),
             tokens: usage.total_tokens,
             usage: Some(usage),
         }))
@@ -3314,9 +3447,12 @@ fn build_reflection(
     let mut reflection = String::new();
     reflection.push_str(
         "You are the improve proposer for a WhippleScript workflow. Propose ONE \
-         targeted revision of the program below. Return the COMPLETE revised \
-         program source. Improve the ascend gauges without regressing any \
-         guarded gauge; declared bars are hard constraints.\n\n",
+         testable mechanism for the program below. Return the COMPLETE revised \
+         program source and an edit_account: explain the mechanism, name every \
+         declaration you intend to change by its kind and name (for example, \
+         `rule triage`), and list the gauges you expect to improve. One mechanism \
+         may span several declarations. Improve the ascend gauges without \
+         regressing any guarded gauge; declared bars are hard constraints.\n\n",
     );
     reflection.push_str(&format!("## Campaign\n{}\n\n", campaign.to_json()));
     reflection.push_str("## Gauge evidence (open scenarios)\n");
@@ -4054,6 +4190,7 @@ fn run_improve(options: &CliOptions) -> Result<ExitCode, String> {
                 }
                 candidate_seq += 1;
                 let candidate_id = format!("K-{candidate_seq}");
+                let edit = observe_edit(&source, &proposal.source, proposal.edit_account.clone());
                 let candidate_path =
                     eval_scratch_dir().join(format!("candidate-{candidate_seq}.whip"));
                 std::fs::write(&candidate_path, &proposal.source)
@@ -4075,6 +4212,8 @@ fn run_improve(options: &CliOptions) -> Result<ExitCode, String> {
                             "candidate": candidate_id,
                             "reason": format!("does not compile: {}", compile_failure_summary(&error)),
                             "rationale": proposal.rationale,
+                            "edit": edit.payload(),
+                            "tags": edit.tags,
                         }),
                     )
                     .map_err(|error| format!("failed to record rejection: {error:?}"))?;
@@ -4118,6 +4257,7 @@ fn run_improve(options: &CliOptions) -> Result<ExitCode, String> {
                             "source": proposal.source,
                             "baseline_hash": baseline_hash,
                             "proposer": proposer.name(),
+                            "edit": edit.payload(),
                         }),
                     )
                     .map_err(|error| format!("failed to record candidate: {error:?}"))?;
@@ -4132,6 +4272,8 @@ fn run_improve(options: &CliOptions) -> Result<ExitCode, String> {
                             "candidate": candidate_id,
                             "reason": "no comparable scenario pairs (mode mismatch, refires, or incomplete drives)",
                             "rationale": proposal.rationale,
+                            "edit": edit.payload(),
+                            "tags": edit.tags,
                         }),
                     )
                     .map_err(|error| format!("failed to record rejection: {error:?}"))?;
@@ -4142,6 +4284,7 @@ fn run_improve(options: &CliOptions) -> Result<ExitCode, String> {
                     dominance_verdict(&specs, &spec_active, &paired_base, &paired_cand);
                 let mut verdict = open_verdict.clone();
                 let mut gate_tags = campaign_tags.clone();
+                gate_tags.extend(edit.tags.iter().cloned());
                 if dropped_pairs > 0 {
                     gate_tags.push(format!("pairs-dropped:{dropped_pairs}"));
                 }
@@ -4233,6 +4376,7 @@ fn run_improve(options: &CliOptions) -> Result<ExitCode, String> {
                     &verdict,
                     &gate_tags,
                     unheld_out,
+                    &edit,
                 );
                 if !overlap.is_empty() {
                     card["overlap"] = json!(overlap
@@ -4376,6 +4520,7 @@ fn evidence_card(
     verdict: &CandidateVerdict,
     tags: &[String],
     unheld_out: bool,
+    edit: &EditObservation,
 ) -> Value {
     let mut all_tags = tags.to_vec();
     if unheld_out && !all_tags.iter().any(|tag| tag == "unheld-out") {
@@ -4385,6 +4530,7 @@ fn evidence_card(
         "candidate": candidate_id,
         "campaign": campaign_id,
         "rationale": rationale,
+        "edit": edit.payload(),
         "proposable": verdict.proposable,
         "tradeoff": verdict.tradeoff,
         "reasons": verdict.reasons,
@@ -4422,6 +4568,27 @@ fn print_card(card: &Value) {
     if let Some(rationale) = card["rationale"].as_str() {
         if !rationale.is_empty() {
             println!("  rationale: {rationale}");
+        }
+    }
+    if let Some(mechanism) = card["edit"]["account"]["mechanism"].as_str() {
+        println!("  mechanism: {mechanism}");
+    }
+    if let Some(changes) = card["edit"]["changed_declarations"].as_array() {
+        let rendered: Vec<&str> = changes
+            .iter()
+            .filter_map(|change| change["identity"].as_str())
+            .collect();
+        if !rendered.is_empty() {
+            println!("  changed: {}", rendered.join(", "));
+        }
+    }
+    if let Some(unaccounted) = card["edit"]["unaccounted_declarations"].as_array() {
+        let rendered: Vec<&str> = unaccounted.iter().filter_map(Value::as_str).collect();
+        if !rendered.is_empty() {
+            println!(
+                "  possible bundle — unaccounted changes: {}",
+                rendered.join(", ")
+            );
         }
     }
     if let Some(gauges) = card["gauges"].as_array() {
@@ -5773,6 +5940,48 @@ pub(crate) fn ambient_score_after_dev(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn edit_account_mismatch_is_observed_without_claiming_causal_independence() {
+        let baseline = "workflow Demo\n\nclass Ticket {\n  status string\n}\n\nrule triage\n  when started\n=> {\n  record Ticket {\n    status \"open\"\n  }\n}\n\nrule close\n  when Ticket as t\n=> {\n  message \"done\"\n}\n";
+        let candidate = baseline
+            .replace("status \"open\"", "status \"closed\"")
+            .replace("message \"done\"", "message \"finished\"");
+        let account = EditAccount {
+            mechanism: "Change the initial ticket status".to_owned(),
+            declarations: vec!["rule triage".to_owned()],
+            expected_gauges: vec!["status_quality".to_owned()],
+        };
+        let observed = observe_edit(baseline, &candidate, Some(account));
+        assert_eq!(observed.payload()["status"], "declarations-unaccounted");
+        assert_eq!(observed.unaccounted, vec!["rule close"]);
+        assert_eq!(observed.tags, vec!["edit-account-mismatch"]);
+        assert_eq!(observed.changes.as_ref().map(Vec::len), Some(2));
+
+        // A single mechanism may span both declarations. The structural
+        // check stops at whether the account named what changed.
+        let accounted = observe_edit(
+            baseline,
+            &candidate,
+            Some(EditAccount {
+                mechanism: "Change ticket status and its response".to_owned(),
+                declarations: vec!["rule triage".to_owned(), "rule close".to_owned()],
+                expected_gauges: vec!["status_quality".to_owned()],
+            }),
+        );
+        assert_eq!(accounted.payload()["status"], "declarations-accounted");
+        assert!(accounted.tags.is_empty());
+        assert!(observe_edit(baseline, baseline, None)
+            .changes
+            .expect("parse")
+            .is_empty());
+        let unavailable = observe_edit(baseline, "rule {", None);
+        assert_eq!(unavailable.payload()["status"], "diff-unavailable");
+        assert_eq!(
+            unavailable.tags,
+            vec!["edit-diff-unavailable", "edit-account-unreported"]
+        );
+    }
 
     fn spec_quality_no_bar(name: &str) -> GaugeSpec {
         GaugeSpec {
