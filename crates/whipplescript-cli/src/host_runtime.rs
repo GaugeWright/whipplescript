@@ -19,7 +19,9 @@ use whipplescript_kernel::harness_loop::{
     BrokeredTurnInput, ChatMessage, MediaInput, NoopCompactor, ToolExecutor, ToolOutcome, ToolSpec,
     ToolStatus,
 };
-use whipplescript_kernel::harness_model::MessagesApiClient;
+use whipplescript_kernel::harness_model::{
+    assemble_anthropic_messages_sse, assemble_openai_chat_sse, MessagesApiClient,
+};
 use whipplescript_kernel::sansio::{HostDriver, HttpResponse, IoRequest, IoResult, TransportError};
 use whipplescript_kernel::whip_shell::{ShellFile, ShellRequest, WhipShell};
 use whipplescript_kernel::world_state::{
@@ -3300,22 +3302,27 @@ impl<'a> NativeHttpDriver<'a> {
     }
 }
 
-/// The one SSE event type whose payload is user-visible answer text.
-/// Reasoning deltas arrive as different event types and are deliberately
-/// never projected (spec/agent-harness.md "Live Turn Observation").
+/// Extract user-visible answer text from the three admitted provider SSE
+/// dialects. Reasoning deltas are deliberately never projected
+/// (spec/agent-harness.md "Live Turn Observation").
 fn sse_output_text_delta(line: &str) -> Option<String> {
     let payload = line.trim().strip_prefix("data:")?.trim();
     if payload.is_empty() || payload == "[DONE]" {
         return None;
     }
     let event = serde_json::from_str::<Value>(payload).ok()?;
-    if event.get("type").and_then(Value::as_str) != Some("response.output_text.delta") {
-        return None;
+    match event.get("type").and_then(Value::as_str) {
+        Some("response.output_text.delta") => event.get("delta").and_then(Value::as_str),
+        Some("content_block_delta")
+            if event.pointer("/delta/type").and_then(Value::as_str) == Some("text_delta") =>
+        {
+            event.pointer("/delta/text").and_then(Value::as_str)
+        }
+        _ => event
+            .pointer("/choices/0/delta/content")
+            .and_then(Value::as_str),
     }
-    event
-        .get("delta")
-        .and_then(Value::as_str)
-        .map(str::to_owned)
+    .map(str::to_owned)
 }
 
 impl HostDriver for NativeHttpDriver<'_> {
@@ -3341,8 +3348,20 @@ impl HostDriver for NativeHttpDriver<'_> {
             name.eq_ignore_ascii_case("accept") && value == "text/event-stream"
         });
         let status = response.status();
-        let body = if expects_sse {
-            assemble_responses_sse(&self.read_sse_body(response))
+        let is_sse = response.header("content-type").is_some_and(|content_type| {
+            content_type
+                .to_ascii_lowercase()
+                .contains("text/event-stream")
+        });
+        let body = if expects_sse && is_sse {
+            let raw = self.read_sse_body(response);
+            if request.url.ends_with("/chat/completions") {
+                assemble_openai_chat_sse(&raw)
+            } else if request.url.ends_with("/v1/messages") {
+                assemble_anthropic_messages_sse(&raw)
+            } else {
+                assemble_responses_sse(&raw)
+            }
         } else {
             response.into_json::<Value>().unwrap_or(Value::Null)
         };
@@ -5802,6 +5821,75 @@ workflow Method {
         );
         assert_eq!(response.body, assemble_responses_sse(raw));
         assert_eq!(response.body["output_text"], "GaugeWright is live.");
+    }
+
+    #[test]
+    fn native_driver_preserves_chat_completions_on_json_and_sse_wires() {
+        use std::io::{Read, Write};
+        fn round(content_type: &str, body: &str) -> (Value, Vec<String>) {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+            let addr = listener.local_addr().expect("loopback addr");
+            let body_owned = body.to_owned();
+            let content_type_owned = content_type.to_owned();
+            let server = std::thread::spawn(move || {
+                let (mut socket, _) = listener.accept().expect("accept");
+                let mut request = Vec::new();
+                let mut chunk = [0u8; 1024];
+                let body_start = loop {
+                    let n = socket.read(&mut chunk).expect("read request");
+                    request.extend_from_slice(&chunk[..n]);
+                    if let Some(pos) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break pos + 4;
+                    }
+                };
+                let content_length: usize = String::from_utf8_lossy(&request[..body_start])
+                    .lines()
+                    .find_map(|line| {
+                        line.to_ascii_lowercase()
+                            .strip_prefix("content-length:")
+                            .map(|value| value.trim().parse().unwrap_or(0))
+                    })
+                    .unwrap_or(0);
+                while request.len() < body_start + content_length {
+                    let n = socket.read(&mut chunk).expect("read body");
+                    if n == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&chunk[..n]);
+                }
+                write!(socket, "HTTP/1.1 200 OK\r\ncontent-type: {content_type_owned}\r\ncontent-length: {}\r\n\r\n{body_owned}", body_owned.len()).expect("respond");
+            });
+            let seen = RefCell::new(Vec::new());
+            let sink = |delta: &str| seen.borrow_mut().push(delta.to_owned());
+            let driver = NativeHttpDriver::new(Duration::from_secs(10)).with_delta_sink(&sink);
+            let request = IoRequest::Http(HttpRequest {
+                url: format!("http://{addr}/compat/chat/completions"),
+                headers: vec![("accept".to_owned(), "text/event-stream".to_owned())],
+                body: json!({}),
+            });
+            let IoResult::Http(result) = driver.fulfill(&request);
+            server.join().expect("server thread");
+            (result.expect("http response").body, seen.into_inner())
+        }
+        let json = r#"{"choices":[{"message":{"content":"live"}}]}"#;
+        let (body, deltas) = round("application/json", json);
+        assert_eq!(
+            body.pointer("/choices/0/message/content"),
+            Some(&json!("live"))
+        );
+        assert!(deltas.is_empty());
+
+        let stream = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"li\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"ve\"}}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let (body, deltas) = round("text/event-stream", stream);
+        assert_eq!(
+            body.pointer("/choices/0/message/content"),
+            Some(&json!("live"))
+        );
+        assert_eq!(deltas, ["li", "ve"]);
     }
 
     /// A cancellation observed mid-stream releases the read at a complete-line
