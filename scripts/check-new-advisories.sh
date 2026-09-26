@@ -24,8 +24,11 @@
 # audit on `main` and on the daily cron, which is where its own header already
 # says an advisory published against unchanged code belongs.
 #
-# Pre-existing advisories are PRINTED, never hidden. A change that inherits a
-# red tree should be able to see it without being blocked by it.
+# When an audited lockfile changes, pre-existing advisories are printed rather
+# than hidden. A change that inherits a red tree should be able to see it
+# without being blocked by it. A change to no audited lockfile cannot introduce
+# a new dependency revision, so its branch check needs no live audit; the
+# scheduled repository-health job still answers the full-tree question.
 #
 # dispatch: run by `scripts/check.sh`; run it by hand against your own branch
 # with `scripts/check-new-advisories.sh [base-ref]`.
@@ -62,6 +65,15 @@ fi
 # running two identical audits to compare a set against itself.
 if [[ "$BASE" == "$(git rev-parse HEAD)" ]]; then
     echo "new-advisory check: at the base ref; the full audit runs on main and on the daily cron"
+    exit 0
+fi
+
+# Only these lockfiles enter the two audits below. If none changed, the base
+# and head have identical resolved dependencies; a live advisory query would
+# return the same finding on both sides and can only add latency or outage to
+# an unrelated change. Manifest/lock disagreement is refused by the build.
+if git diff --quiet "$BASE" HEAD -- Cargo.lock package-lock.json ':(glob)**/package-lock.json'; then
+    echo "new-advisory check: no audited lockfile changed from $BASE_REF; no dependency revision introduced"
     exit 0
 fi
 
