@@ -66,7 +66,7 @@ import {
   resolveAdmittedProvider as resolveHostedProvider,
 } from "./provider-realization";
 import { agentWorkspaceResources } from "./agent-workspace-resources";
-import { LiveModelContext } from "./live-model-context";
+import { LiveModelContext, type ModelRequestProvenance } from "./live-model-context";
 
 const wasmInstance = new WebAssembly.Instance(wasmModule, {
   "./whipplescript_host_do_bg.js": bindings,
@@ -941,7 +941,8 @@ export type PublicTurnActivity =
   | "stopping";
 
 type StepOutcome =
-  | { kind: "needs_http"; request: { url: string; headers: [string, string][]; body: unknown } }
+  | { kind: "needs_http"; request: { url: string; headers: [string, string][]; body: unknown;
+      model_provenance?: ModelRequestProvenance | null } }
   | { kind: "needs_executor"; request: { url: string; headers: [string, string][]; body: unknown } }
   | { kind: "terminal" }
   | { kind: "parked"; next_due_unix_ms: number | null }
@@ -5524,6 +5525,7 @@ export class WorkflowInstance implements DurableObject {
         const capture = hostedInstanceId && traceId
           ? (body: unknown) => this.liveModelContext.record(
               `${hostedInstanceId}\0${traceId}`, body, sourceHandles,
+              outcome.request.model_provenance ?? null,
             )
           : undefined;
         let streaming = false;

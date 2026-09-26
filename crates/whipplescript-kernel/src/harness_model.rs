@@ -1024,6 +1024,7 @@ fn build_openai_compat_request(
         headers.push(("Idempotency-Key".into(), key.to_owned()));
     }
     HttpRequest {
+        model_provenance: None,
         // The configured endpoint is the OpenAI-compatible base URL as provider docs
         // give it (it already includes `/v1`), so append only `/chat/completions` —
         // the OpenAI SDK `base_url` convention every compat endpoint follows.
@@ -1222,6 +1223,7 @@ fn build_coerced_tools_request(
         headers.push(("Idempotency-Key".into(), key.to_owned()));
     }
     HttpRequest {
+        model_provenance: None,
         url: format!("{}/chat/completions", base_url.trim_end_matches('/')),
         headers,
         body,
@@ -1416,6 +1418,7 @@ fn build_anthropic_request(
         headers.push(("Idempotency-Key".into(), key.to_owned()));
     }
     HttpRequest {
+        model_provenance: None,
         url: format!("{base_url}/v1/messages"),
         headers,
         body: Value::Object(body),
@@ -1576,6 +1579,7 @@ fn build_openai_request(
         headers.push(("Idempotency-Key".into(), key.to_owned()));
     }
     HttpRequest {
+        model_provenance: None,
         url: format!("{base_url}/v1/responses"),
         headers,
         body,

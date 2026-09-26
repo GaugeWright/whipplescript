@@ -1200,6 +1200,7 @@ impl<Sql: DoSql + Clone> InstanceDriver for DoInstanceDriver<'_, Sql> {
                             headers.push(("authorization".to_owned(), format!("Bearer {token}")));
                         }
                         let request = whipplescript_kernel::sansio::HttpRequest {
+                            model_provenance: None,
                             url: format!("{}/turn", cfg.base_url.trim_end_matches('/')),
                             headers,
                             body: serde_json::json!({
@@ -1515,6 +1516,7 @@ impl<Sql: DoSql + Clone> InstanceDriver for DoInstanceDriver<'_, Sql> {
                     whipplescript_kernel::result_contract::TOOL_SUBMIT_RESULT.to_owned()
                 });
                 let turn_input = BrokeredTurnInput {
+                    model_provenance: Default::default(),
                     system: assembled.system_prompt,
                     user: prompt,
                     // The package-derived ability ceiling selects the exact
@@ -6823,6 +6825,7 @@ complete result { count count } }
             _tools: &[whipplescript_kernel::harness_loop::ToolSpec],
         ) -> whipplescript_kernel::sansio::HttpRequest {
             whipplescript_kernel::sansio::HttpRequest {
+                model_provenance: None,
                 url: "https://provider/agent".to_owned(),
                 headers: Vec::new(),
                 body: serde_json::json!({}),
@@ -6855,6 +6858,7 @@ complete result { count count } }
             _tools: &[whipplescript_kernel::harness_loop::ToolSpec],
         ) -> whipplescript_kernel::sansio::HttpRequest {
             whipplescript_kernel::sansio::HttpRequest {
+                model_provenance: None,
                 url: "https://provider/agent".to_owned(),
                 headers: Vec::new(),
                 body: serde_json::json!({}),
@@ -6997,6 +7001,7 @@ complete result { count count } }
                     }
                 }
                 whipplescript_kernel::sansio::HttpRequest {
+                    model_provenance: None,
                     url: "https://provider/agent".to_owned(),
                     headers: Vec::new(),
                     body: serde_json::json!({}),

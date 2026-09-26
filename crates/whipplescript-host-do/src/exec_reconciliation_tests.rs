@@ -179,6 +179,7 @@ pub(crate) fn prepared_at<S: RuntimeStore>(
     .unwrap();
     let invocation = serde_json::to_string(&envelope).unwrap();
     let request = whipplescript_kernel::sansio::HttpRequest {
+        model_provenance: None,
         url: executor_url.into(),
         headers: vec![],
         body: envelope.dispatch(&selected).unwrap().clone(),
@@ -1329,6 +1330,7 @@ fn check<S: RuntimeStore>(mut store: S, reopen: impl Fn() -> S, mutate: impl Fn(
         };
         let envelope: serde_json::Value = serde_json::from_str(&invocation).unwrap();
         let mut request = whipplescript_kernel::sansio::HttpRequest {
+            model_provenance: None,
             url: "http://executor/exec".into(),
             headers: vec![],
             body: envelope["dispatch"].clone(),

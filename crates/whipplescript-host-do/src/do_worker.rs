@@ -1144,6 +1144,7 @@ rule finish
                 if self.request_first {
                     self.request_first = false;
                     return Ok(EffectStep::NeedsHttp(HttpRequest {
+                        model_provenance: None,
                         url: "http://fixture/exec".into(),
                         headers: vec![],
                         body: serde_json::json!({}),

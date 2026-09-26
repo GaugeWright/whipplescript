@@ -93,6 +93,7 @@ fn check_recovery(tracked: bool) {
         "original".into()
     };
     let request = whipplescript_kernel::sansio::HttpRequest {
+        model_provenance: None,
         url: "http://executor/exec".into(),
         headers: vec![],
         body: envelope

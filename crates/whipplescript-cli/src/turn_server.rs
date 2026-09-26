@@ -503,6 +503,7 @@ pub fn run_turn_in_workspace(
         },
     };
     let input = BrokeredTurnInput {
+        model_provenance: Default::default(),
         system,
         user,
         tools,

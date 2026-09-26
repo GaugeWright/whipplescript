@@ -226,6 +226,7 @@ mod tests {
             if effect.kind == "http" && incoming.is_none() {
                 self.http_rounds += 1;
                 return Ok(EffectStep::NeedsHttp(HttpRequest {
+                    model_provenance: None,
                     url: "https://provider/settle".to_owned(),
                     headers: vec![],
                     body: json!({}),

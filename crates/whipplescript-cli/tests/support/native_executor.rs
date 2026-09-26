@@ -94,6 +94,7 @@ pub fn setup_with_executor(
         "original".into()
     };
     let request = whipplescript_kernel::sansio::HttpRequest {
+        model_provenance: None,
         url: executor_url.into(),
         headers: vec![],
         body: envelope

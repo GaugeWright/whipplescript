@@ -438,6 +438,7 @@ pub fn media_model_refusal(model: &str) -> Option<String> {
 /// ingested in the same turn rather than stored as a link.
 pub fn build_media_request(call: &CoerceCall<'_>) -> HttpRequest {
     HttpRequest {
+        model_provenance: None,
         url: format!(
             "{}/v1/images/generations",
             call.base_url.trim_end_matches('/')
@@ -530,6 +531,7 @@ fn build_openai_compat_request(call: &CoerceCall<'_>) -> HttpRequest {
         },
     });
     HttpRequest {
+        model_provenance: None,
         // The configured endpoint is the OpenAI-compatible base URL as provider docs
         // give it (it already includes `/v1`), so append only `/chat/completions` —
         // matching the OpenAI SDK `base_url` convention every compat endpoint follows.
@@ -577,6 +579,7 @@ fn build_codex_request(call: &CoerceCall<'_>, codex: CodexAuth<'_>) -> HttpReque
         },
     });
     HttpRequest {
+        model_provenance: None,
         url: format!(
             "{}/backend-api/codex/responses",
             call.base_url.trim_end_matches('/')
@@ -640,6 +643,7 @@ fn build_openai_request(call: &CoerceCall<'_>) -> HttpRequest {
         },
     });
     HttpRequest {
+        model_provenance: None,
         url: format!("{}/v1/responses", call.base_url.trim_end_matches('/')),
         headers: with_idempotency_key(
             call,
@@ -675,6 +679,7 @@ fn build_anthropic_request(call: &CoerceCall<'_>) -> HttpRequest {
     // (decided 2026-06-23, Jack), so the credential resolver rejects those before
     // we get here — this path always carries a real key.
     HttpRequest {
+        model_provenance: None,
         url: format!("{}/v1/messages", call.base_url.trim_end_matches('/')),
         headers: with_idempotency_key(
             call,

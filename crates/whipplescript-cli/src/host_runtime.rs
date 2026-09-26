@@ -240,6 +240,16 @@ pub trait ResourceResolver {
         Vec::new()
     }
 
+    /// Sources entering a tool result beyond its model-authored arguments.
+    /// An embedding host must opt in for tools it can account for completely.
+    fn model_output_provenance(
+        &self,
+        _admitted_resources: &[ResourceRef],
+        _call: &ToolCall,
+    ) -> whipplescript_kernel::sansio::ModelContentProvenance {
+        Default::default()
+    }
+
     fn execute_tool(
         &self,
         admitted_resources: &[ResourceRef],
@@ -2061,7 +2071,7 @@ impl GovernedHostRuntime {
         S: SecretResolver + ?Sized,
         R: ResourceResolver + ?Sized,
     {
-        self.run_turn_observing_model_requests(command, packages, secrets, resources, &|_| {})
+        self.run_turn_observing_model_requests(command, packages, secrets, resources, &|_, _| {})
     }
 
     /// Drive a native turn while observing each provider-bound request body.
@@ -2074,7 +2084,40 @@ impl GovernedHostRuntime {
         packages: &P,
         secrets: &S,
         resources: &R,
-        observe_request: &dyn Fn(&Value),
+        observe_request: &dyn Fn(
+            &Value,
+            Option<&whipplescript_kernel::sansio::ModelRequestProvenance>,
+        ),
+    ) -> Result<TurnExecution, HostRuntimeError>
+    where
+        P: PackageResolver + ?Sized,
+        S: SecretResolver + ?Sized,
+        R: ResourceResolver + ?Sized,
+    {
+        self.run_turn_observing_model_requests_with_provenance(
+            command,
+            packages,
+            secrets,
+            resources,
+            &Default::default(),
+            observe_request,
+        )
+    }
+
+    /// The owning product supplies source identities for the initial input
+    /// planes. WhippleScript propagates them through the turn and marks any
+    /// unaccounted content unknown; these labels do not authorize a reader.
+    pub fn run_turn_observing_model_requests_with_provenance<P, S, R>(
+        &mut self,
+        command: &StartTurnCommand,
+        packages: &P,
+        secrets: &S,
+        resources: &R,
+        model_provenance: &whipplescript_kernel::sansio::InitialModelProvenance,
+        observe_request: &dyn Fn(
+            &Value,
+            Option<&whipplescript_kernel::sansio::ModelRequestProvenance>,
+        ),
     ) -> Result<TurnExecution, HostRuntimeError>
     where
         P: PackageResolver + ?Sized,
@@ -2105,7 +2148,10 @@ impl GovernedHostRuntime {
             resources,
             binding,
             &driver,
-            Some(&released),
+            TurnRunInspection {
+                stream_released: Some(&released),
+                model_provenance,
+            },
         )
     }
 
@@ -2128,7 +2174,17 @@ impl GovernedHostRuntime {
     {
         self.admit_command(command, packages)?;
         let binding = self.resolve_provider(command, secrets)?;
-        self.run_admitted_turn(command, packages, resources, binding, driver, None)
+        self.run_admitted_turn(
+            command,
+            packages,
+            resources,
+            binding,
+            driver,
+            TurnRunInspection {
+                stream_released: None,
+                model_provenance: &Default::default(),
+            },
+        )
     }
 
     fn admit_command<P>(
@@ -2190,7 +2246,7 @@ impl GovernedHostRuntime {
         resources: &R,
         binding: ResolvedProviderBinding,
         driver: &H,
-        stream_released: Option<&dyn Fn() -> bool>,
+        inspection: TurnRunInspection<'_>,
     ) -> Result<TurnExecution, HostRuntimeError>
     where
         P: PackageResolver + ?Sized,
@@ -2372,6 +2428,7 @@ impl GovernedHostRuntime {
             .collect::<Vec<_>>();
         let context = package.context_for_model_with_skills(&skills);
         let input = BrokeredTurnInput {
+            model_provenance: inspection.model_provenance.clone(),
             system: context.system_prompt,
             user: command.input.text.clone(),
             tools: package.tools.clone(),
@@ -2395,7 +2452,7 @@ impl GovernedHostRuntime {
                     agent: &package.agent,
                     profile: None,
                     thread_continue: true,
-                    stream_released,
+                    stream_released: inspection.stream_released,
                 },
                 &client,
                 &executor,
@@ -3228,6 +3285,14 @@ impl<R: ResourceResolver + ?Sized> ToolExecutor for ResolverToolExecutor<'_, R> 
         self.resolver.take_workspace_reads()
     }
 
+    fn model_output_provenance(
+        &self,
+        call: &ToolCall,
+    ) -> whipplescript_kernel::sansio::ModelContentProvenance {
+        self.resolver
+            .model_output_provenance(self.admitted_resources, call)
+    }
+
     fn execute(&self, call: &ToolCall) -> ToolOutcome {
         if !self.offered.iter().any(|tool| tool.name == call.name) {
             return ToolOutcome {
@@ -3248,6 +3313,14 @@ impl<R: ResourceResolver + ?Sized> ToolExecutor for ResolverToolExecutor<'_, R> 
     }
 }
 
+type ModelRequestObserver<'a> =
+    dyn Fn(&Value, Option<&whipplescript_kernel::sansio::ModelRequestProvenance>) + 'a;
+
+struct TurnRunInspection<'a> {
+    stream_released: Option<&'a dyn Fn() -> bool>,
+    model_provenance: &'a whipplescript_kernel::sansio::InitialModelProvenance,
+}
+
 struct NativeHttpDriver<'a> {
     agent: ureq::Agent,
     /// Live `streaming_output` projection out of an active turn (the
@@ -3261,7 +3334,7 @@ struct NativeHttpDriver<'a> {
     /// cancelled through its paired release probe. `None` reads to the end
     /// exactly as before.
     cancel_probe: Option<&'a dyn Fn() -> bool>,
-    request_observer: Option<&'a dyn Fn(&Value)>,
+    request_observer: Option<&'a ModelRequestObserver<'a>>,
 }
 
 impl<'a> NativeHttpDriver<'a> {
@@ -3292,7 +3365,10 @@ impl<'a> NativeHttpDriver<'a> {
         self
     }
 
-    fn with_request_observer(mut self, observer: &'a dyn Fn(&Value)) -> Self {
+    fn with_request_observer(
+        mut self,
+        observer: &'a dyn Fn(&Value, Option<&whipplescript_kernel::sansio::ModelRequestProvenance>),
+    ) -> Self {
         self.request_observer = Some(observer);
         self
     }
@@ -3364,7 +3440,7 @@ impl HostDriver for NativeHttpDriver<'_> {
     fn fulfill(&self, request: &IoRequest) -> IoResult {
         let IoRequest::Http(request) = request;
         if let Some(observer) = self.request_observer {
-            observer(&request.body);
+            observer(&request.body, request.model_provenance.as_ref());
         }
         let mut builder = self.agent.post(&request.url);
         for (name, value) in &request.headers {
@@ -5831,11 +5907,17 @@ workflow Method {
         let seen: RefCell<Vec<String>> = RefCell::new(Vec::new());
         let sink = |delta: &str| seen.borrow_mut().push(delta.to_owned());
         let observed_body = RefCell::new(Vec::new());
-        let observe = |body: &Value| observed_body.borrow_mut().push(body.clone());
+        let observe = |body: &Value,
+                       _provenance: Option<
+            &whipplescript_kernel::sansio::ModelRequestProvenance,
+        >| {
+            observed_body.borrow_mut().push(body.clone());
+        };
         let driver = NativeHttpDriver::new(Duration::from_secs(10))
             .with_delta_sink(&sink)
             .with_request_observer(&observe);
         let request = IoRequest::Http(HttpRequest {
+            model_provenance: None,
             url: format!("http://{addr}/v1/responses"),
             headers: vec![("accept".to_owned(), "text/event-stream".to_owned())],
             body: json!({"input": "private model input"}),
@@ -5900,6 +5982,7 @@ workflow Method {
             .with_delta_sink(&sink)
             .with_cancel_probe(&probe);
         let request = IoRequest::Http(HttpRequest {
+            model_provenance: None,
             url: format!("http://{addr}/v1/responses"),
             headers: vec![("accept".to_owned(), "text/event-stream".to_owned())],
             body: json!({}),

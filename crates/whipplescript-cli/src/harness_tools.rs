@@ -3983,6 +3983,7 @@ impl HttpModelClient for FixtureModelClient {
             .map(|call| json!({ "id": call.id, "name": call.name, "arguments": call.arguments }))
             .collect();
         HttpRequest {
+            model_provenance: None,
             url: "fixture://owned-harness".to_string(),
             headers: Vec::new(),
             body: json!({
@@ -5481,6 +5482,7 @@ pub fn run_owned_agent_turn(
     )
     .map_err(StoreError::Conflict)?;
     let input = BrokeredTurnInput {
+        model_provenance: Default::default(),
         system: assembled.system_prompt,
         user: input_json.to_string(),
         tools,

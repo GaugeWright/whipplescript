@@ -17,6 +17,52 @@
 
 use serde_json::Value;
 
+/// Reader authority is a host concern. These labels describe where the
+/// provider-bound content came from; they never grant access by themselves.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize, Default)]
+pub struct ModelContentProvenance {
+    pub source_handles: Vec<String>,
+    pub complete: bool,
+}
+
+/// Ordered conversation provenance at the model-call boundary. A host may
+/// release the complete body only after authorizing every source in every
+/// entry; an incomplete entry makes the request unknown. The message mapping
+/// is deliberately separate from provider JSON because one logical message
+/// may expand into several wire items or be joined with another on a wire.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ModelRequestProvenance {
+    pub messages: Vec<ModelContentProvenance>,
+    pub tools: ModelContentProvenance,
+}
+
+impl ModelContentProvenance {
+    /// A transformation may reveal any of its inputs. Missing provenance is
+    /// contagious, and duplicate handles do not change the authority result.
+    pub fn derived_from<'a>(parts: impl IntoIterator<Item = &'a Self>) -> Self {
+        let mut handles = std::collections::BTreeSet::new();
+        let mut complete = true;
+        for part in parts {
+            complete &= part.complete;
+            handles.extend(part.source_handles.iter().cloned());
+        }
+        Self {
+            source_handles: handles.into_iter().collect(),
+            complete,
+        }
+    }
+}
+
+/// Host-supplied source identities for the distinct initial input planes.
+/// A host that cannot prove one plane leaves its default (unknown) value.
+#[derive(Clone, Debug, Default)]
+pub struct InitialModelProvenance {
+    pub system: ModelContentProvenance,
+    pub user: ModelContentProvenance,
+    pub world: ModelContentProvenance,
+    pub tools: ModelContentProvenance,
+}
+
 /// A transport-agnostic HTTP request. The kernel builds these; a host transport
 /// (the CLI's `ureq`, or the DO's `fetch`) executes them.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -24,6 +70,9 @@ pub struct HttpRequest {
     pub url: String,
     pub headers: Vec<(String, String)>,
     pub body: Value,
+    /// Live host-only inspection metadata; never serialized into `body` or
+    /// forwarded as an HTTP header.
+    pub model_provenance: Option<ModelRequestProvenance>,
 }
 
 /// A transport-agnostic HTTP response (status code + decoded JSON body).
@@ -149,6 +198,7 @@ mod tests {
             } else {
                 self.remaining -= 1;
                 Outcome::NeedsIo(IoRequest::Http(HttpRequest {
+                    model_provenance: None,
                     url: format!("https://example/{}", self.remaining),
                     headers: vec![],
                     body: json!({}),

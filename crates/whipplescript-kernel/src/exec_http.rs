@@ -115,6 +115,7 @@ pub fn build_executor_exec_request(
         body["timeout_ms"] = json!(timeout_ms);
     }
     Ok(HttpRequest {
+        model_provenance: None,
         url: format!("{}/exec", executor_base_url.trim_end_matches('/')),
         headers: vec![("content-type".to_owned(), "application/json".to_owned())],
         body,
@@ -1015,6 +1016,7 @@ mod tests {
     fn dispatch_body_identity_binds_execution_independently_of_endpoint() {
         let input = json!({"capability": "observer"});
         let request = HttpRequest {
+            model_provenance: None,
             url: "https://executor-one/exec".into(),
             headers: vec![],
             body: json!({"argv": ["python", "-I", "{script}"], "stdin": "captured"}),

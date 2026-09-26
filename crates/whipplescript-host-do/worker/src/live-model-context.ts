@@ -16,6 +16,17 @@ export interface LiveModelCall {
    * certify that arbitrary tool output has no additional source. */
   readonly source_handles: readonly string[];
   readonly provenance_complete: false;
+  readonly ordered_provenance: ModelRequestProvenance | null;
+}
+
+export interface ModelContentProvenance {
+  readonly source_handles: readonly string[];
+  readonly complete: boolean;
+}
+
+export interface ModelRequestProvenance {
+  readonly messages: readonly ModelContentProvenance[];
+  readonly tools: ModelContentProvenance;
 }
 
 export interface LiveModelContextView {
@@ -32,7 +43,12 @@ interface TurnCapture {
 export class LiveModelContext {
   private readonly turns = new Map<string, TurnCapture>();
 
-  record(turn: string, body: unknown, sourceHandles: readonly string[]): void {
+  record(
+    turn: string,
+    body: unknown,
+    sourceHandles: readonly string[],
+    provenance: ModelRequestProvenance | null = null,
+  ): void {
     const capture = this.turns.get(turn) ?? { calls: [], bytes: 0, incomplete: false };
     this.turns.set(turn, capture);
     if (capture.incomplete) return;
@@ -57,6 +73,9 @@ export class LiveModelContext {
       body: JSON.parse(encoded) as unknown,
       source_handles: [...new Set(sourceHandles)],
       provenance_complete: false,
+      ordered_provenance: provenance === null
+        ? null
+        : JSON.parse(JSON.stringify(provenance)) as ModelRequestProvenance,
     });
     capture.bytes += bytes;
   }

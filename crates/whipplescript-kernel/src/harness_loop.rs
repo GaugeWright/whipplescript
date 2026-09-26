@@ -21,8 +21,8 @@ use crate::harness::{ProviderFailure, ProviderRunResult, ProviderRunStatus};
 use serde_json::{json, Value};
 
 use crate::sansio::{
-    run_to_completion, HostDriver, HttpRequest, HttpResponse, IoRequest, IoResult, Outcome,
-    StepMachine, TransportError,
+    run_to_completion, HostDriver, HttpRequest, HttpResponse, InitialModelProvenance, IoRequest,
+    IoResult, ModelContentProvenance, ModelRequestProvenance, Outcome, StepMachine, TransportError,
 };
 use crate::world_state::{
     project_remaining_model_rounds, project_world, render_world_projection, WorldProjection,
@@ -69,6 +69,12 @@ pub struct ToolOutcome {
 /// The real impl lives in the CLI (file-store bounded); tests inject a fake.
 pub trait ToolExecutor {
     fn execute(&self, call: &ToolCall) -> ToolOutcome;
+
+    /// Additional sources that entered this result. The default is unknown:
+    /// a tool may read beyond its arguments, so call name alone is no proof.
+    fn model_output_provenance(&self, _call: &ToolCall) -> ModelContentProvenance {
+        ModelContentProvenance::default()
+    }
 
     /// Mid-turn delivery (DR-0052 Decision 7): information the host wants
     /// the running agent to see before its NEXT model call — raises
@@ -509,6 +515,9 @@ pub struct BrokeredTurnInput {
     pub system: String,
     pub user: String,
     pub tools: Vec<ToolSpec>,
+    /// Identity of the initial content, supplied by the owning host rather
+    /// than inferred from text, role, or a resource handle's spelling.
+    pub model_provenance: InitialModelProvenance,
     /// Hard safety bound on model calls for slice 1. The governing budget
     /// (counter) is slice 2; this just prevents an unbounded loop.
     pub max_steps: usize,
@@ -832,6 +841,9 @@ where
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct BrokeredTurnSnapshot {
     pub messages: Vec<ChatMessage>,
+    /// Aligned with `messages`. Old snapshots have no proof and resume unknown.
+    #[serde(default)]
+    pub message_provenance: Vec<ModelContentProvenance>,
     pub observations: Vec<LoopObservation>,
     pub usage: Value,
     pub step: usize,
@@ -884,6 +896,7 @@ where
     checkpoint: &'a mut dyn FnMut(&[ChatMessage]),
     compactor: &'a dyn Compactor,
     messages: Vec<ChatMessage>,
+    message_provenance: Vec<ModelContentProvenance>,
     observations: Vec<LoopObservation>,
     usage: Value,
     step: usize,
@@ -937,6 +950,7 @@ where
             checkpoint,
             compactor,
             messages: Vec::new(),
+            message_provenance: Vec::new(),
             observations: Vec::new(),
             usage: Value::Null,
             step: 0,
@@ -978,6 +992,7 @@ where
             checkpoint,
             compactor,
             messages: snapshot.messages,
+            message_provenance: snapshot.message_provenance,
             observations: snapshot.observations,
             usage: snapshot.usage,
             step: snapshot.step,
@@ -1028,6 +1043,7 @@ where
     pub fn snapshot(&self) -> BrokeredTurnSnapshot {
         BrokeredTurnSnapshot {
             messages: self.messages.clone(),
+            message_provenance: self.message_provenance.clone(),
             observations: self.observations.clone(),
             usage: self.usage.clone(),
             step: self.step,
@@ -1040,6 +1056,44 @@ where
             applied_command_ids: self.applied_command_ids.clone(),
             visible_world: self.visible_world.clone(),
         }
+    }
+
+    fn current_provenance(&self, tools: bool) -> ModelRequestProvenance {
+        let messages = if self.message_provenance.len() == self.messages.len() {
+            self.message_provenance.clone()
+        } else {
+            vec![ModelContentProvenance::default(); self.messages.len()]
+        };
+        ModelRequestProvenance {
+            messages,
+            tools: if tools {
+                self.input.model_provenance.tools.clone()
+            } else {
+                ModelContentProvenance {
+                    source_handles: Vec::new(),
+                    complete: true,
+                }
+            },
+        }
+    }
+
+    fn all_current_sources(&self) -> ModelContentProvenance {
+        let provenance = self.current_provenance(true);
+        ModelContentProvenance::derived_from(
+            provenance
+                .messages
+                .iter()
+                .chain(std::iter::once(&provenance.tools)),
+        )
+    }
+
+    fn attach_provenance(&self, mut request: HttpRequest, tools: bool) -> HttpRequest {
+        request.model_provenance = Some(self.current_provenance(tools));
+        request
+    }
+
+    fn relabel_rewrite(&mut self, prior: ModelContentProvenance) {
+        self.message_provenance = vec![prior; self.messages.len()];
     }
 
     fn project_current_world(&mut self) -> Result<bool, String> {
@@ -1065,6 +1119,12 @@ where
             WorldProjection::Unchanged => unreachable!("renderer returned content"),
         };
         self.messages.push(ChatMessage::System(rendered));
+        self.message_provenance
+            .push(if self.world_source.is_some() {
+                ModelContentProvenance::default()
+            } else {
+                self.input.model_provenance.world.clone()
+            });
         self.observations.push(LoopObservation::WorldProjected {
             epoch: current.world_epoch,
             projection: projection_kind.to_owned(),
@@ -1096,6 +1156,8 @@ where
                 text: command.text,
                 images: command.images,
             });
+            self.message_provenance
+                .push(ModelContentProvenance::default());
             self.observations.push(LoopObservation::UserCommandApplied {
                 command_id: command.command_id,
                 kind,
@@ -1141,7 +1203,9 @@ where
                     // A pure rewrite (front-trim / hard-reset): install it, disarm,
                     // and persist the new prefix once (apply-once).
                     let folded_messages = self.messages.len().saturating_sub(rewritten.len());
+                    let inherited = self.all_current_sources();
                     self.messages = rewritten;
+                    self.relabel_rewrite(inherited);
                     self.compaction_epoch += 1;
                     self.last_input_tokens = 0;
                     self.observations.push(LoopObservation::Compacted {
@@ -1158,7 +1222,15 @@ where
                     // in on re-entry. This is what makes the summarizer eviction-safe
                     // on the durable object.
                     self.awaiting = Awaiting::Summary;
-                    let http = self.model.build_request(&request.request_messages, &[]);
+                    let mut http = self.model.build_request(&request.request_messages, &[]);
+                    let inherited = self.all_current_sources();
+                    http.model_provenance = Some(ModelRequestProvenance {
+                        messages: vec![inherited; request.request_messages.len()],
+                        tools: ModelContentProvenance {
+                            source_handles: Vec::new(),
+                            complete: true,
+                        },
+                    });
                     self.pending_compaction = Some(request);
                     return Outcome::NeedsIo(IoRequest::Http(http));
                 }
@@ -1192,6 +1264,8 @@ where
             unreachable!("a full world projection always renders")
         };
         self.messages.push(ChatMessage::System(rendered));
+        self.message_provenance
+            .push(self.input.model_provenance.world.clone());
         self.observations.push(LoopObservation::WorldProjected {
             epoch: world.world_epoch,
             projection: "full".to_owned(),
@@ -1255,15 +1329,16 @@ where
                     text: notice,
                     images: Vec::new(),
                 });
+                self.message_provenance
+                    .push(ModelContentProvenance::default());
             }
             (self.checkpoint)(&self.messages);
         }
         self.awaiting = Awaiting::Main;
         self.observations
             .push(LoopObservation::ModelRequest { step: self.step });
-        Outcome::NeedsIo(IoRequest::Http(
-            self.model.build_request(&self.messages, &self.input.tools),
-        ))
+        let request = self.model.build_request(&self.messages, &self.input.tools);
+        Outcome::NeedsIo(IoRequest::Http(self.attach_provenance(request, true)))
     }
 
     /// The `TimedOut` terminal when the step bound is hit.
@@ -1300,10 +1375,13 @@ where
                     normalize_media_input(&self.input.user_media);
                 self.observations.extend(media_observations);
                 let mut messages = vec![ChatMessage::System(self.input.system.clone())];
+                self.message_provenance = vec![self.input.model_provenance.system.clone()];
                 if let Some(world) = self.input.world.clone() {
                     let projection = WorldProjection::Full(world.clone());
                     if let Some(rendered) = render_world_projection(&projection) {
                         messages.push(ChatMessage::System(rendered));
+                        self.message_provenance
+                            .push(self.input.model_provenance.world.clone());
                         self.observations.push(LoopObservation::WorldProjected {
                             epoch: world.world_epoch,
                             projection: "full".to_owned(),
@@ -1322,9 +1400,13 @@ where
                 let mut images = self.input.user_images.clone();
                 images.extend(media_images);
                 messages.push(ChatMessage::User { text, images });
+                self.message_provenance
+                    .push(self.input.model_provenance.user.clone());
                 messages
             } else {
-                sanitize_resume_messages(self.input.resume_from.clone())
+                let resumed = sanitize_resume_messages(self.input.resume_from.clone());
+                self.message_provenance = vec![ModelContentProvenance::default(); resumed.len()];
+                resumed
             };
             (self.checkpoint)(&self.messages);
             return self.decide_next_call();
@@ -1339,7 +1421,10 @@ where
                 // the model client derives its idempotency key from the stable
                 // turn scope plus these exact messages/tool specs.
                 let request = match self.awaiting {
-                    Awaiting::Main => self.model.build_request(&self.messages, &self.input.tools),
+                    Awaiting::Main => {
+                        let request = self.model.build_request(&self.messages, &self.input.tools);
+                        self.attach_provenance(request, true)
+                    }
                     Awaiting::Summary => {
                         let Some(compaction) = self.pending_compaction.as_ref() else {
                             return Outcome::Settle(BrokeredTurnOutcome {
@@ -1353,7 +1438,19 @@ where
                                 structured_result_json: None,
                             });
                         };
-                        self.model.build_request(&compaction.request_messages, &[])
+                        let mut request =
+                            self.model.build_request(&compaction.request_messages, &[]);
+                        request.model_provenance = Some(ModelRequestProvenance {
+                            messages: vec![
+                                self.all_current_sources();
+                                compaction.request_messages.len()
+                            ],
+                            tools: ModelContentProvenance {
+                                source_handles: Vec::new(),
+                                complete: true,
+                            },
+                        });
+                        request
                     }
                 };
                 return Outcome::NeedsIo(IoRequest::Http(request));
@@ -1396,7 +1493,9 @@ where
                 _ => None,
             };
             if let Some((messages, folded_messages, summary_bytes)) = folded {
+                let inherited = self.all_current_sources();
                 self.messages = messages;
+                self.relabel_rewrite(inherited);
                 self.compaction_epoch += 1;
                 self.observations.push(LoopObservation::Compacted {
                     epoch: self.compaction_epoch,
@@ -1425,7 +1524,9 @@ where
                     if trimmed.len() < self.messages.len() {
                         self.overflow_trims += 1;
                         let folded_messages = self.messages.len() - trimmed.len();
+                        let inherited = self.all_current_sources();
                         self.messages = trimmed;
+                        self.relabel_rewrite(inherited);
                         self.compaction_epoch += 1;
                         self.observations.push(LoopObservation::Compacted {
                             epoch: self.compaction_epoch,
@@ -1480,10 +1581,12 @@ where
         // so final-terminal-wins is untouched.
         if self.stream_released.is_some_and(|probe| probe()) {
             if !reply.text.is_empty() {
+                let inherited = self.all_current_sources();
                 self.messages.push(ChatMessage::Assistant {
                     text: reply.text.clone(),
                     tool_calls: Vec::new(),
                 });
+                self.message_provenance.push(inherited);
                 (self.checkpoint)(&self.messages);
             }
             self.step += 1;
@@ -1503,10 +1606,12 @@ where
             // settling (pi-conformance §4): the completed conversation is what
             // a `thread continue` follow-up turn seeds from — without this the
             // thread would end on the last tool round, not the answer.
+            let inherited = self.all_current_sources();
             self.messages.push(ChatMessage::Assistant {
                 text: reply.text.clone(),
                 tool_calls: Vec::new(),
             });
+            self.message_provenance.push(inherited);
             (self.checkpoint)(&self.messages);
             self.step += 1;
             // Steering wins over ordinary follow-up. Follow-ups are consumed
@@ -1543,6 +1648,10 @@ where
                     text: missing_result_nudge(tool),
                     images: Vec::new(),
                 });
+                self.message_provenance.push(ModelContentProvenance {
+                    source_handles: Vec::new(),
+                    complete: true,
+                });
                 (self.checkpoint)(&self.messages);
                 return self.decide_next_call();
             }
@@ -1560,11 +1669,14 @@ where
         // The model requested tools: record the assistant turn, broker each tool
         // through the executor (nested effects), feed results back, then advance
         // to the next model call.
+        let inherited = self.all_current_sources();
         self.messages.push(ChatMessage::Assistant {
             text: reply.text.clone(),
             tool_calls: reply.tool_calls.clone(),
         });
+        self.message_provenance.push(inherited);
         let mut results = Vec::with_capacity(reply.tool_calls.len());
+        let mut result_sources = Vec::with_capacity(reply.tool_calls.len());
         let mut asserted_result: Option<String> = None;
         for call in &reply.tool_calls {
             self.observations.push(LoopObservation::ToolRequested {
@@ -1575,6 +1687,10 @@ where
                 self.observations.push(observation);
             }
             let outcome = execute_offered_tool(self.executor, &self.input.tools, call);
+            result_sources.push(ModelContentProvenance::derived_from([
+                &self.all_current_sources(),
+                &self.executor.model_output_provenance(call),
+            ]));
             if asserted_result.is_none() && settles_turn(self.input, call, &outcome) {
                 asserted_result = Some(outcome.content.clone());
             }
@@ -1611,6 +1727,8 @@ where
             });
         }
         self.messages.push(ChatMessage::ToolResults(results));
+        self.message_provenance
+            .push(ModelContentProvenance::derived_from(&result_sources));
         (self.checkpoint)(&self.messages);
         // Settled AFTER the checkpoint, so the transcript a resume would read
         // already contains the call that ended the turn (mirrors the reference
@@ -2709,6 +2827,7 @@ mod tests {
 
     fn input(max_steps: usize) -> BrokeredTurnInput {
         BrokeredTurnInput {
+            model_provenance: InitialModelProvenance::default(),
             system: "you are a coding agent".to_string(),
             user: "read the readme".to_string(),
             tools: vec![ToolSpec {
@@ -2862,6 +2981,7 @@ mod tests {
     impl HttpModelClient for ScriptedHttpClient {
         fn build_request(&self, _messages: &[ChatMessage], _tools: &[ToolSpec]) -> HttpRequest {
             HttpRequest {
+                model_provenance: None,
                 url: "https://fake/model".to_string(),
                 headers: Vec::new(),
                 body: json!({}),
@@ -2891,6 +3011,87 @@ mod tests {
                 body: json!({}),
             }))
         }
+    }
+
+    #[test]
+    fn live_request_provenance_is_ordered_and_tool_output_fails_closed() {
+        let http = ScriptedHttpClient::new(vec![Ok(tool_reply("read-1", "read"))]);
+        let executor = RecordingExecutor::new(ToolOutcome {
+            status: ToolStatus::Ok,
+            content: "private file bytes".to_owned(),
+        });
+        let mut turn = input(3);
+        let known = |handle: &str| ModelContentProvenance {
+            source_handles: vec![handle.to_owned()],
+            complete: true,
+        };
+        turn.model_provenance = InitialModelProvenance {
+            system: known("method:one"),
+            user: known("chat:one"),
+            world: known("chat:one"),
+            tools: known("method:one"),
+        };
+        let mut checkpoint = no_checkpoint();
+        let mut machine =
+            BrokeredTurnMachine::new(&http, &executor, &turn, &mut checkpoint, &NoopCompactor);
+        let Outcome::NeedsIo(IoRequest::Http(first)) = machine.step(None) else {
+            panic!("first model call");
+        };
+        let first_labels = first.model_provenance.clone().expect("first call labels");
+        assert_eq!(
+            first_labels.messages,
+            vec![known("method:one"), known("chat:one")]
+        );
+        assert_eq!(first_labels.tools, known("method:one"));
+        let Outcome::NeedsIo(IoRequest::Http(second)) =
+            machine.step(Some(DummyHost.fulfill(&IoRequest::Http(first))))
+        else {
+            panic!("model call after tool result");
+        };
+        let second_labels = second.model_provenance.expect("second call labels");
+        assert_eq!(second_labels.messages.len(), 4);
+        assert!(second_labels.messages[2].complete);
+        assert!(
+            !second_labels.messages[3].complete,
+            "an executor without a source proof cannot disclose its output"
+        );
+    }
+
+    #[test]
+    fn live_request_provenance_survives_eviction_without_changing_the_request() {
+        let http = ScriptedHttpClient::new(Vec::new());
+        let executor = RecordingExecutor::new(ToolOutcome {
+            status: ToolStatus::Ok,
+            content: String::new(),
+        });
+        let mut turn = input(2);
+        turn.model_provenance.system = ModelContentProvenance {
+            source_handles: vec!["package:version-1".to_owned()],
+            complete: true,
+        };
+        let mut checkpoint = no_checkpoint();
+        let first = {
+            let mut machine =
+                BrokeredTurnMachine::new(&http, &executor, &turn, &mut checkpoint, &NoopCompactor);
+            let Outcome::NeedsIo(IoRequest::Http(first)) = machine.step(None) else {
+                panic!("first call");
+            };
+            let snapshot: BrokeredTurnSnapshot =
+                serde_json::from_str(&serde_json::to_string(&machine.snapshot()).unwrap()).unwrap();
+            (first, snapshot)
+        };
+        let mut restored = BrokeredTurnMachine::restore(
+            &http,
+            &executor,
+            &turn,
+            &mut checkpoint,
+            &NoopCompactor,
+            first.1,
+        );
+        let Outcome::NeedsIo(IoRequest::Http(retried)) = restored.step(None) else {
+            panic!("retried call");
+        };
+        assert_eq!(retried, first.0);
     }
 
     /// Transient provider errors auto-retry (bounded); a persistent one still
@@ -3488,6 +3689,7 @@ mod tests {
         ));
         assert!(matches!(
             machine.step(Some(DummyHost.fulfill(&IoRequest::Http(HttpRequest {
+                model_provenance: None,
                 url: "https://fake/model".to_owned(),
                 headers: Vec::new(),
                 body: json!({}),
@@ -3502,6 +3704,7 @@ mod tests {
         ));
         assert!(matches!(
             machine.step(Some(DummyHost.fulfill(&IoRequest::Http(HttpRequest {
+                model_provenance: None,
                 url: "https://fake/model".to_owned(),
                 headers: Vec::new(),
                 body: json!({}),
@@ -3572,6 +3775,7 @@ mod tests {
             assert!(matches!(machine.step(None), Outcome::NeedsIo(_)));
             assert!(matches!(
                 machine.step(Some(DummyHost.fulfill(&IoRequest::Http(HttpRequest {
+                    model_provenance: None,
                     url: "https://fake/model".to_owned(),
                     headers: Vec::new(),
                     body: json!({}),
@@ -3589,6 +3793,7 @@ mod tests {
             );
             assert!(matches!(
                 machine.step(Some(DummyHost.fulfill(&IoRequest::Http(HttpRequest {
+                    model_provenance: None,
                     url: "https://fake/model".to_owned(),
                     headers: Vec::new(),
                     body: json!({}),
@@ -3633,6 +3838,7 @@ mod tests {
         ));
         assert!(matches!(
             machine.step(Some(DummyHost.fulfill(&IoRequest::Http(HttpRequest {
+                model_provenance: None,
                 url: "https://fake/model".to_owned(),
                 headers: Vec::new(),
                 body: json!({}),
@@ -3640,6 +3846,7 @@ mod tests {
             Outcome::NeedsIo(_)
         ));
         let outcome = match machine.step(Some(DummyHost.fulfill(&IoRequest::Http(HttpRequest {
+            model_provenance: None,
             url: "https://fake/model".to_owned(),
             headers: Vec::new(),
             body: json!({}),
@@ -3697,6 +3904,7 @@ mod tests {
                     && text.contains("turn-compact")
         )));
         let outcome = match machine.step(Some(DummyHost.fulfill(&IoRequest::Http(HttpRequest {
+            model_provenance: None,
             url: "https://fake/model".to_owned(),
             headers: Vec::new(),
             body: json!({}),
@@ -4459,6 +4667,7 @@ mod tests {
         fn build_request(&self, _messages: &[ChatMessage], tools: &[ToolSpec]) -> HttpRequest {
             self.tools_seen.borrow_mut().push(!tools.is_empty());
             HttpRequest {
+                model_provenance: None,
                 url: "https://fake/model".to_string(),
                 headers: Vec::new(),
                 body: json!({}),

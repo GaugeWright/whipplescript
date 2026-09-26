@@ -13,9 +13,10 @@ test("captures ordered model calls without retaining a mutable request object", 
   assert.deepEqual(captures.read("instance\0turn"), {
     calls: [
       { ordinal: 0, body: { input: [{ role: "system", content: "instructions" }] },
-        source_handles: ["source:a", "source:b"], provenance_complete: false },
+        source_handles: ["source:a", "source:b"], provenance_complete: false,
+        ordered_provenance: null },
       { ordinal: 1, body: { input: [{ role: "tool", content: "result" }] },
-        source_handles: [], provenance_complete: false },
+        source_handles: [], provenance_complete: false, ordered_provenance: null },
     ],
     incomplete: false,
   });

@@ -682,6 +682,7 @@ mod tests {
         fn step(&mut self, incoming: Option<IoResult>) -> Outcome<u16> {
             match incoming {
                 None => Outcome::NeedsIo(IoRequest::Http(HttpRequest {
+                    model_provenance: None,
                     url: self.url.clone(),
                     headers: vec![],
                     body: serde_json::json!({}),

@@ -128,7 +128,17 @@ pub fn retained<S: RuntimeStore>(
         .clone();
     let mut headers = headers;
     headers.insert(0, ("content-type".into(), "application/json".into()));
-    select(store, instance, effect, HttpRequest { url, headers, body })
+    select(
+        store,
+        instance,
+        effect,
+        HttpRequest {
+            model_provenance: None,
+            url,
+            headers,
+            body,
+        },
+    )
 }
 
 /// Retain request custody before the host exposes external dispatch authority.

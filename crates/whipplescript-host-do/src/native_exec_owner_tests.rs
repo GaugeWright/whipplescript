@@ -264,6 +264,7 @@ fn native_executor_owner_custody() {
             )
             .unwrap();
             let dispatch = whipplescript_kernel::sansio::HttpRequest {
+                model_provenance: None,
                 url: url.into(),
                 headers: vec![],
                 body: envelope.dispatch(&selected).unwrap().clone(),

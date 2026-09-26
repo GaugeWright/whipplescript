@@ -1321,6 +1321,7 @@ fn outcome_to_json(outcome: &DurableStepOutcome) -> String {
                 "url": request.url,
                 "headers": request.headers,
                 "body": request.body,
+                "model_provenance": request.model_provenance,
             },
         }),
         DurableStepOutcome::NeedsExecutor(handoff) => serde_json::json!({
