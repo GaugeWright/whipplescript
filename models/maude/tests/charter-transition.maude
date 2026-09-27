@@ -1,0 +1,23 @@
+load ../charter-transition.maude
+--- A complete plan activates: the requirement and claim carried, the closed record untouched.
+search [1] in CHARTER-TRANSITION : { proposal old authorized rec(requirement, successor, authority, authority) rec(claim, retained, authority, authority) rec(closed, unplanned, public, public) } =>* { new C:Cfg } .
+--- A weakening the activation declares as authorized is admitted.
+search [1] in CHARTER-TRANSITION : { proposal old authorized declared rec(claim, successor, authority, public) } =>* { new C:Cfg } .
+--- An undeclared weakening never activates; checking only the map admits it.
+search in CHARTER-TRANSITION : { proposal old authorized rec(claim, successor, authority, public) } =>* { C:Cfg } such that laundered(C:Cfg) .
+search [1] in CHARTER-TRANSITION-WEAK-MAP-ONLY : { proposal old authorized rec(claim, successor, authority, public) } =>* { C:Cfg } such that laundered(C:Cfg) .
+--- A live record without a plan is never lost; dropping what is unplanned loses it.
+search in CHARTER-TRANSITION : { proposal old authorized rec(claim, unplanned, authority, authority) } =>* { C:Cfg } such that lost(C:Cfg) .
+search [1] in CHARTER-TRANSITION-WEAK-DROP : { proposal old authorized rec(claim, unplanned, authority, authority) } =>* { C:Cfg } such that lost(C:Cfg) .
+--- A live requirement is never demoted out of the inventory; checking only the map demotes it.
+search in CHARTER-TRANSITION : { proposal old authorized rec(requirement, demoted, authority, authority) } =>* { C:Cfg } such that lost(C:Cfg) .
+search [1] in CHARTER-TRANSITION-WEAK-MAP-ONLY : { proposal old authorized rec(requirement, demoted, authority, authority) } =>* { C:Cfg } such that lost(C:Cfg) .
+--- A live record's effectiveness is never relabeled; checking only the map relabels it.
+search in CHARTER-TRANSITION : { proposal old authorized declared rec(claim, relabeled, authority, authority) } =>* { C:Cfg } such that relabeled(C:Cfg) .
+search [1] in CHARTER-TRANSITION-WEAK-MAP-ONLY : { proposal old authorized declared rec(claim, relabeled, authority, authority) } =>* { C:Cfg } such that relabeled(C:Cfg) .
+--- An obstructed proposal is refused and the old charter stays in force.
+search [1] in CHARTER-TRANSITION : { proposal old authorized rec(claim, unplanned, authority, authority) } =>* { refused old C:Cfg } .
+--- Without the preceding charter's authority nothing activates; self-authorization does.
+search in CHARTER-TRANSITION : { proposal old rec(requirement, successor, authority, authority) } =>* { new C:Cfg } .
+search [1] in CHARTER-TRANSITION-WEAK-SELF-AUTHORIZED : { proposal old rec(requirement, successor, authority, authority) } =>* { new C:Cfg } .
+quit

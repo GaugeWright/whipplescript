@@ -616,9 +616,7 @@ fn eval_records(atom: &RecordAtom, input: &QueryInput<'_>) -> StoreResult<BTreeS
             // Narrow to the vocabulary and version first, and check the
             // literal against what that declaration admits before matching.
             let declared: Vec<_> = view
-                .charter
-                .vocabularies
-                .iter()
+                .interpreted_vocabularies()
                 .filter(|entry| {
                     entry.definition.name == *vocabulary
                         && version
@@ -718,10 +716,7 @@ fn eval_records(atom: &RecordAtom, input: &QueryInput<'_>) -> StoreResult<BTreeS
                     continue;
                 };
                 let Some(declaration) = view
-                    .charter
-                    .vocabularies
-                    .iter()
-                    .find(|entry| entry.definition.name == record.vocabulary.name)
+                    .interpretation(&record.vocabulary)
                     .and_then(|entry| entry.manifest.as_ref())
                 else {
                     continue;

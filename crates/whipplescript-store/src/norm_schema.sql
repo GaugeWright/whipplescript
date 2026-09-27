@@ -45,6 +45,17 @@ BEGIN
       AND genesis_id = json_extract(NEW.payload_json, '$.statement.action.ledger')
       AND authority_head = json_extract(NEW.payload_json, '$.statement.action.previous');
 END;
+-- A charter activation begins an authority epoch the same way (norm-plane §10):
+-- a partial import that drops it cannot fall back to the charter it replaced.
+CREATE TRIGGER IF NOT EXISTS tracker_norm_activation_checkpoint
+AFTER INSERT ON tracker_events
+WHEN NEW.kind = 'norm.governance.activated'
+BEGIN
+    UPDATE tracker_norm_checkpoint SET authority_head = NEW.event_id
+    WHERE singleton = 1
+      AND genesis_id = json_extract(NEW.payload_json, '$.statement.action.ledger')
+      AND authority_head = json_extract(NEW.payload_json, '$.statement.action.previous');
+END;
 -- A pre-succession reader must not ignore this retained authority checkpoint
 -- when rotation evidence is temporarily missing. Stamp after provisioning.
 INSERT OR IGNORE INTO schema_migrations (version, name)

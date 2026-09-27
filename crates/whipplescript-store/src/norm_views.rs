@@ -338,13 +338,7 @@ pub struct ManifestChange {
 /// The declaration's classification of one field of one record's vocabulary.
 fn classify(view: &NormView, vocabulary: &VocabularyRef, field: &str) -> ChangeClass {
     let editorial = view
-        .charter
-        .vocabularies
-        .iter()
-        .find(|entry| {
-            entry.definition.name == vocabulary.name
-                && entry.definition.version == vocabulary.version
-        })
+        .interpretation(vocabulary)
         .and_then(|entry| {
             entry
                 .definition
@@ -702,15 +696,45 @@ pub fn explain_record(
             }),
         });
     }
+    // A charter activation that acted on the record: it moved the record to a
+    // successor vocabulary, or retired it, under the preceding authority.
+    if let Some(ExplainedAct {
+        statement:
+            crate::norm::NormStatement {
+                action: crate::norm::NormAct::Activate { .. },
+                actor,
+                ..
+            },
+        ..
+    }) = acts.get(&subject.head)
+    {
+        let retired = view.is_retired(record);
+        nodes.push(ExplanationNode {
+            kind: ExplanationKind::Authority,
+            basis: ExplanationBasis::Act {
+                event: subject.head.clone(),
+            },
+            statement: if retired {
+                format!(
+                    "retired by a charter activation {} signed; no act is admitted on it",
+                    actor.principal
+                )
+            } else {
+                format!(
+                    "migrated to {}@{} by a charter activation {} signed",
+                    subject.vocabulary.name, subject.vocabulary.version, actor.principal
+                )
+            },
+            detail: serde_json::json!({
+                "activation": subject.head,
+                "vocabulary": subject.vocabulary,
+                "retired": retired,
+            }),
+        });
+    }
     if let EffectiveRevision::Active { lifecycle, .. } = &effective {
         let rules: Vec<Value> = view
-            .charter
-            .vocabularies
-            .iter()
-            .find(|entry| {
-                entry.definition.name == subject.vocabulary.name
-                    && entry.definition.version == subject.vocabulary.version
-            })
+            .interpretation(&subject.vocabulary)
             .map(|entry| {
                 entry
                     .definition

@@ -294,3 +294,4 @@ store-authorization.maude	SNSNSSSNSSNNS
 ledger-query.maude	SSNNSNNSSS
 decision-derivation.maude	SSSSNSNSNSNS
 region-reservation.maude	SNSSNSSSNSSNS
+charter-transition.maude	SSNSNSNSNSSNS

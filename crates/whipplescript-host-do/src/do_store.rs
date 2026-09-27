@@ -18993,7 +18993,7 @@ mod norm_admission_tests {
                 "name":"decision","version":"1","fields":[{"name":"title","required":true,"value_type":{"type":"text"}}],
                 "status":{"values":["proposed","accepted"],"initial":"proposed","transitions":[{"from":"proposed","to":"accepted","admission":{"requires":"authority","scope":"accept"}}]}
             })).expect("fixture"),creation:AdmissionPredicate::Public {},
-        }],owner_scopes:vec!["accept".into()]}
+        }],owner_scopes:vec!["accept".into()],activation:None,gated_refs:vec![]}
     }
 
     /// The hosted promote door runs the mainline gate over the object's own

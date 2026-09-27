@@ -1066,8 +1066,13 @@
   "owner_scopes": [
     "norm.accept",
     "norm.retire",
-    "build.publish"
+    "build.publish",
+    "charter.activate"
   ],
+  "activation": {
+    "requires": "authority",
+    "scope": "charter.activate"
+  },
   "resource_domains": {
     "workspace": {
       "include": [

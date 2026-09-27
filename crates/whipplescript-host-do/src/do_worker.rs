@@ -2021,6 +2021,58 @@ mod branch_dispatch_tests {
         );
     }
 
+    /// A line the charter declares gated (norm-plane §5, W1): the object's
+    /// branch store leases it only when it is active and unbound, and then
+    /// binds nothing to it, as the native store does.
+    #[test]
+    fn a_declared_gated_line_binds_nothing_on_the_object() {
+        use whipplescript_store::branches::BindOutcome;
+        let sql = Rc::new(store().sql);
+        let mut branches = DoBranches::new(Rc::clone(&sql)).unwrap();
+        branches.ensure_mainline("t0").unwrap();
+        for line in ["release", "bound"] {
+            assert!(matches!(
+                branches
+                    .create_branch(CreateBranch {
+                        branch_id: line,
+                        name: None,
+                        parent_branch_id: MAINLINE_BRANCH_ID,
+                        at_cut: None,
+                        created_at: "t0",
+                        idempotency_key: None,
+                    })
+                    .unwrap(),
+                CreateBranchOutcome::Created(_)
+            ));
+        }
+        assert_eq!(
+            branches.bind_instance("worker", "bound", "t1").unwrap(),
+            BindOutcome::Bound
+        );
+        let bound = whipplescript_store::branches::lease_gated_refs(
+            &mut branches,
+            &["bound".to_owned()],
+            "t2",
+        );
+        assert!(
+            matches!(&bound, Err(whipplescript_store::StoreError::Conflict(reason)) if reason.contains("`bound` has live instance bindings (worker)")),
+            "{bound:?}"
+        );
+        whipplescript_store::branches::lease_gated_refs(
+            &mut branches,
+            &["release".to_owned()],
+            "t2",
+        )
+        .unwrap();
+        for at in ["t3", "t4"] {
+            assert_eq!(
+                branches.bind_instance("worker-2", "release", at).unwrap(),
+                BindOutcome::GatedRef
+            );
+            assert_eq!(branches.instance_branch("worker-2").unwrap(), None);
+        }
+    }
+
     const TEST_NOW_MS: i64 = 1_767_225_600_000;
 
     /// DO parity for per-instance branch dispatch: an instance bound to a

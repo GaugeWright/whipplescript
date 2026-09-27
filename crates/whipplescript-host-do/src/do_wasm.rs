@@ -324,9 +324,10 @@ pub fn host_norm_command(
         )
     };
     let at = format!("norm-lease:{}", crate::do_store::stable_hash_hex(command));
-    let mut lease_gated_refs = || {
-        whipplescript_store::branches::lease_gated_mainline(
+    let mut lease_gated_refs = |declared: &[String]| {
+        whipplescript_store::branches::lease_gated_refs(
             &mut crate::do_branches::DoBranches::new(sql.clone())?,
+            declared,
             &at,
         )
     };

@@ -34,6 +34,7 @@ pub const TRANSITION_KIND: &str = "norm.record.transitioned";
 pub const ROTATE_KIND: &str = "norm.governance.rotated";
 pub const RETIRE_KIND: &str = "norm.record.retired";
 pub const EDIT_KIND: &str = "norm.record.edited";
+pub const ACTIVATE_KIND: &str = "norm.governance.activated";
 
 /// A signature verifier is supplied by the authenticated embedding boundary.
 /// It must verify both the cryptographic signature and the principal/key binding.
@@ -114,6 +115,15 @@ pub struct NormCharter {
     pub vocabularies: Vec<NormVocabulary>,
     /// Named scopes delegated to the authenticated governance owner by C0.
     pub owner_scopes: Vec<String>,
+    /// Who may activate a successor charter (norm-plane §10). Omission means
+    /// this charter is never replaced, not that anyone may replace it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activation: Option<AdmissionPredicate>,
+    /// Stream lines gated like the mainline (norm-plane §5), a release line
+    /// say. The mainline is always gated and is not named here. A host leases
+    /// each one to the gate when the act declaring it is admitted.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub gated_refs: Vec<String>,
 }
 
 impl NormCharter {
@@ -175,6 +185,18 @@ pub enum NormAct {
         ledger: String,
         previous: String,
         successor: NormActor,
+        frontier: Vec<String>,
+    },
+    /// Install a successor charter under the preceding charter's activation
+    /// rule (norm-plane §10, W1). Like a rotation it closes the exact frontier
+    /// and begins an authority epoch, so every later act descends from it.
+    Activate {
+        ledger: String,
+        previous: String,
+        charter: NormCharter,
+        migration: Vec<crate::norm_activation::VocabularyMigration>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        changes: Vec<crate::norm_activation::AuthorizedChange>,
         frontier: Vec<String>,
     },
 }
@@ -342,6 +364,16 @@ impl SignedNormEvent {
                 parents.extend([ledger.clone(), previous.clone()]);
                 (ROTATE_KIND, None, parents)
             }
+            NormAct::Activate {
+                ledger,
+                previous,
+                frontier,
+                ..
+            } => {
+                let mut parents = frontier.clone();
+                parents.extend([ledger.clone(), previous.clone()]);
+                (ACTIVATE_KIND, None, parents)
+            }
         };
         if let Some(premises) = &self.statement.premises {
             parents.extend(premises.family_basis.iter().cloned());
@@ -415,7 +447,7 @@ pub struct NormView {
     pub charter: NormCharter,
     pub records: BTreeMap<String, NormRecord>,
     pub effective_records: BTreeMap<String, NormRecord>,
-    effective_lifecycles: BTreeMap<String, EffectiveLifecycle>,
+    pub(crate) effective_lifecycles: BTreeMap<String, EffectiveLifecycle>,
     /// Every content revision ever admitted, by its revision id: the record as
     /// it stood at that act, so a revision reference resolves to its record
     /// after later edits moved the head and a view can render exact content.
@@ -437,7 +469,15 @@ pub struct NormView {
     authority_history: BTreeSet<String>,
     event_order: Vec<String>,
     creator: String,
-    registry: VocabularyRegistry,
+    /// Every vocabulary any charter of this ledger declared: the charter in
+    /// force's, and each earlier one's, which still interprets its records.
+    pub(crate) registry: VocabularyRegistry,
+    /// Declarations of earlier charters no longer in force, by which their
+    /// closed and retired records stay interpreted and replayable.
+    pub(crate) historical: Vec<NormVocabulary>,
+    /// Records an activation retired: closed under the preceding charter's
+    /// authority, and admitting no act again.
+    pub(crate) retired: BTreeSet<String>,
     nonces: BTreeMap<(String, String), String>,
 }
 
@@ -491,7 +531,7 @@ fn verify_event(event: &TrackerEvent, verifier: &dyn NormVerifier) -> StoreResul
     Ok(signed)
 }
 
-fn registry_for(charter: &NormCharter) -> StoreResult<VocabularyRegistry> {
+pub(crate) fn registry_for(charter: &NormCharter) -> StoreResult<VocabularyRegistry> {
     crate::norm_resources::validate_resource_domains(charter)?;
     let mut registry = VocabularyRegistry::default();
     let mut scopes: std::collections::BTreeSet<&String> = std::collections::BTreeSet::new();
@@ -499,6 +539,26 @@ fn registry_for(charter: &NormCharter) -> StoreResult<VocabularyRegistry> {
         let new_scope = scopes.insert(scope);
         if scope.trim().is_empty() || !new_scope {
             return Err(refused("C0 authority scopes must be nonempty and unique"));
+        }
+    }
+    let mut gated = BTreeSet::new();
+    for line in &charter.gated_refs {
+        if line.trim().is_empty()
+            || line == crate::branches::MAINLINE_BRANCH_ID
+            || !gated.insert(line)
+        {
+            return Err(refused(
+                "gated refs name distinct stream lines; the mainline is always gated",
+            ));
+        }
+    }
+    match &charter.activation {
+        None => {}
+        Some(AdmissionPredicate::Authority { scope }) if scopes.contains(scope) => {}
+        Some(_) => {
+            return Err(refused(
+                "charter activation must require one of the charter's own authority scopes",
+            ));
         }
     }
     let mut versions: std::collections::BTreeSet<VocabularyRef> = std::collections::BTreeSet::new();
@@ -668,6 +728,8 @@ impl NormView {
             event_order: vec![event.event_id.clone()],
             creator,
             registry,
+            historical: Vec::new(),
+            retired: BTreeSet::new(),
             nonces,
         })
     }
@@ -1002,6 +1064,35 @@ impl NormView {
                 self.authority_head = event.event_id.clone();
                 self.authority_history.insert(event.event_id.clone());
             }
+            NormAct::Activate {
+                ledger,
+                previous,
+                charter,
+                migration,
+                changes,
+                frontier,
+            } => {
+                self.check_ledger(&ledger)?;
+                self.check_authority(&previous)?;
+                let Some(rule) = self.charter.activation.clone() else {
+                    // MUTATION-SUCCESS-EXPR: Ok(())
+                    return Err(refused("the charter in force declares no activation rule"));
+                };
+                self.permitted(&rule, &statement.actor)?;
+                let expected: Vec<_> = self.frontier.iter().cloned().collect();
+                if frontier != expected {
+                    return Err(refused(
+                        "charter activation must close the exact current event frontier",
+                    ));
+                }
+                let obstructions = self.activation_obstructions(&charter, &migration, &changes)?;
+                if !obstructions.is_empty() {
+                    return Err(crate::norm_activation::obstruction_refusal(&obstructions));
+                }
+                self.activate(&event.event_id, charter, &migration)?;
+                self.authority_head = event.event_id.clone();
+                self.authority_history.insert(event.event_id.clone());
+            }
         }
         // Only an admitted lifecycle act (or an explicitly activating initial
         // state) changes effectiveness. Editing never reapplies an activation.
@@ -1033,14 +1124,105 @@ impl NormView {
     }
 
     fn effectiveness_rules(&self, record: &NormRecord) -> Option<&[EffectivenessRule]> {
+        self.interpretation(&record.vocabulary)
+            .and_then(|v| v.effectiveness.as_deref())
+    }
+
+    /// The declaration that interprets a vocabulary's records: the charter in
+    /// force's, or an earlier charter's for a vocabulary no longer in force.
+    pub fn interpretation(&self, vocabulary: &VocabularyRef) -> Option<&NormVocabulary> {
         self.charter
             .vocabularies
             .iter()
-            .find(|v| {
-                v.definition.name == record.vocabulary.name
-                    && v.definition.version == record.vocabulary.version
-            })
-            .and_then(|v| v.effectiveness.as_deref())
+            .chain(&self.historical)
+            .find(|entry| crate::norm_activation::same_version(entry, vocabulary))
+    }
+
+    /// Every declaration that interprets a record of this ledger, in force first.
+    pub fn interpreted_vocabularies(&self) -> impl Iterator<Item = &NormVocabulary> {
+        self.charter.vocabularies.iter().chain(&self.historical)
+    }
+
+    /// Move the ledger onto an admitted activation's charter: live records
+    /// migrate or retire as planned, and every declaration the new charter
+    /// drops stays behind to interpret what its records were.
+    fn activate(
+        &mut self,
+        event_id: &str,
+        charter: NormCharter,
+        migration: &[crate::norm_activation::VocabularyMigration],
+    ) -> StoreResult<()> {
+        use crate::norm_activation::MigrationPlan;
+        for entry in &charter.vocabularies {
+            let vocabulary =
+                Vocabulary::new(entry.definition.clone()).map_err(|e| refused(e.to_string()))?;
+            self.registry
+                .register(vocabulary)
+                .map_err(|e| refused(e.to_string()))?;
+        }
+        let mut touched = Vec::new();
+        for step in migration {
+            let live: Vec<String> = self
+                .records
+                .values()
+                .filter(|record| record.vocabulary == step.from && self.record_is_live(record))
+                .map(|record| record.id.clone())
+                .collect();
+            for id in live {
+                match &step.plan {
+                    MigrationPlan::Retain {} => continue,
+                    MigrationPlan::Retire {} => {
+                        self.retired.insert(id.clone());
+                        self.effective_records.remove(&id);
+                        self.effective_lifecycles.remove(&id);
+                    }
+                    MigrationPlan::Successor {
+                        vocabulary,
+                        statuses,
+                    } => {
+                        if let Some(effective) = self.effective_records.get_mut(&id) {
+                            effective.vocabulary = vocabulary.clone();
+                            effective.status = statuses[&effective.status].clone();
+                        }
+                        if let Some(lifecycle) = self.effective_lifecycles.get_mut(&id) {
+                            lifecycle.status = statuses[&lifecycle.status].clone();
+                        }
+                        let record = self.records.get_mut(&id).expect("live record exists");
+                        record.vocabulary = vocabulary.clone();
+                        record.status = statuses[&record.status].clone();
+                    }
+                }
+                let record = self.records.get_mut(&id).expect("live record exists");
+                record.head = event_id.to_owned();
+                touched.push(id);
+            }
+        }
+        let dropped: Vec<NormVocabulary> = self
+            .charter
+            .vocabularies
+            .iter()
+            .filter(|entry| !charter.vocabularies.contains(entry))
+            .cloned()
+            .collect();
+        for entry in dropped {
+            if !self.historical.contains(&entry) {
+                self.historical.push(entry);
+            }
+        }
+        self.historical
+            .retain(|entry| !charter.vocabularies.contains(entry));
+        self.charter = charter;
+        for id in touched {
+            let vocabulary = self.records[&id].vocabulary.clone();
+            self.advance_family(&vocabulary, event_id);
+            let act = RecordAct {
+                event: event_id.to_owned(),
+                record: self.records[&id].clone(),
+                effective: self.effective_records.get(&id).cloned(),
+            };
+            self.record_acts.entry(id).or_default().push(act);
+        }
+        Ok(())
     }
 
     /// Read-only projection under the record's pinned charter. Consumers must
@@ -1101,7 +1283,11 @@ impl NormView {
     /// The ledger as it stands now.
     fn current_lens(&self) -> Lens<'_> {
         Lens {
-            records: self.records.values().collect(),
+            records: self
+                .records
+                .values()
+                .filter(|record| !self.retired.contains(&record.id))
+                .collect(),
             effective: self.effective_records.values().collect(),
         }
     }
@@ -1123,7 +1309,12 @@ impl NormView {
             records: Vec::new(),
             effective: Vec::new(),
         };
-        for acts in self.record_acts.values() {
+        // A retired record counts for no later act: the activation that
+        // retired it closed the frontier, so every later act descends from it.
+        for (id, acts) in &self.record_acts {
+            if self.retired.contains(id) {
+                continue;
+            }
             if let Some(act) = acts.iter().rev().find(|act| past.contains(&act.event)) {
                 lens.records.push(&act.record);
                 lens.effective.extend(act.effective.as_ref());
@@ -1262,7 +1453,11 @@ impl NormView {
         let references = premises
             .map(|premises| premises.references.as_slice())
             .unwrap_or(&[]);
-        let records: Vec<&NormRecord> = self.records.values().collect();
+        let records: Vec<&NormRecord> = self
+            .records
+            .values()
+            .filter(|record| !self.retired.contains(&record.id))
+            .collect();
         if let Some(unbound) = Self::overlapping_claims(arbitration, record, &records)
             .into_iter()
             .find(|other| &other.status != initial && !references.contains(&other.head))
@@ -1318,6 +1513,7 @@ impl NormView {
                 .filter(|record| {
                     record.vocabulary.name == entry.definition.name
                         && record.vocabulary.version == entry.definition.version
+                        && !self.retired.contains(&record.id)
                         && (&record.status == initial || record.status == granted)
                 })
                 .map(|record| {
@@ -1515,7 +1711,10 @@ impl NormView {
             .iter()
             .filter_map(|record| {
                 let (_, relation) = self.relation_of(&record.vocabulary)?;
-                if relation.family != family || !relation.live_statuses.contains(&record.status) {
+                if relation.family != family
+                    || !relation.live_statuses.contains(&record.status)
+                    || self.retired.contains(&record.id)
+                {
                     return None;
                 }
                 Some((
@@ -1530,13 +1729,7 @@ impl NormView {
         &self,
         vocabulary: &VocabularyRef,
     ) -> Option<(&NormVocabulary, &RelationDeclaration)> {
-        self.charter
-            .vocabularies
-            .iter()
-            .find(|entry| {
-                entry.definition.name == vocabulary.name
-                    && entry.definition.version == vocabulary.version
-            })
+        self.interpretation(vocabulary)
             .and_then(|entry| entry.relation.as_ref().map(|relation| (entry, relation)))
     }
 
@@ -1602,7 +1795,8 @@ impl NormView {
             let Some((entry, relation)) = self.relation_of(&record.vocabulary) else {
                 continue;
             };
-            if !relation.live_statuses.contains(&record.status) {
+            if !relation.live_statuses.contains(&record.status) || self.retired.contains(&record.id)
+            {
                 continue;
             }
             let source = self.resolve_endpoint(
@@ -1753,13 +1947,7 @@ impl NormView {
         &self,
         vocabulary: &VocabularyRef,
     ) -> Option<(&NormVocabulary, &ManifestDeclaration)> {
-        self.charter
-            .vocabularies
-            .iter()
-            .find(|entry| {
-                entry.definition.name == vocabulary.name
-                    && entry.definition.version == vocabulary.version
-            })
+        self.interpretation(vocabulary)
             .and_then(|entry| entry.manifest.as_ref().map(|manifest| (entry, manifest)))
     }
 
@@ -1940,6 +2128,21 @@ impl NormView {
         if current.vocabulary != *vocabulary || current.head != previous {
             return Err(refused(
                 "norm act must name the exact record version and current head",
+            ));
+        }
+        if self.retired.contains(record) {
+            return Err(refused(
+                "the record was retired by a charter activation; no act is admitted on it",
+            ));
+        }
+        let in_force = self
+            .charter
+            .vocabularies
+            .iter()
+            .any(|entry| crate::norm_activation::same_version(entry, vocabulary));
+        if !in_force {
+            return Err(refused(
+                "the record's vocabulary is no longer in force; its history is read-only",
             ));
         }
         Ok(current)

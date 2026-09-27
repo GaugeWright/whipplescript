@@ -16,7 +16,9 @@ exclusive reservation, and a gated mainline.
   `observation`, the kernel's `local-observation`, and the `incorporates`,
   `supports` and `supersedes` relations as the engineering charter does, and a `reservation`
   that only the owner's `reservation.grant` authority grants, releases or
-  expires. Its `authorization` domain is `src`, `checks` and `config`.
+  expires. Its `authorization` domain is `src`, `checks` and `config`. Its
+  `activation` rule lets the owner's `charter.activate` authority install a
+  successor charter.
 
 ## The loop
 
@@ -51,3 +53,11 @@ after an expired one is refused. The folding and the first support stay in
 the ledger's history throughout. Its evidence is supplied executor receipts
 recovered through the verified publication path, not a physical run of
 Q0.
+
+The same test then evolves the charter. C1 drops reservations, and the
+owner plans it with `whip norm plan-activation --proposal c1.json`. Until the
+proposal says what becomes of the three claims still held, the plan names
+each of them, and `whip norm activate` is refused and changes nothing. Once
+the proposal retires them, the owner's activation is admitted and W's is
+refused. Both hosts then hold C1 and the same checkpoint, and the retired
+grant no longer fences the next promotion.

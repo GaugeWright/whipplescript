@@ -12,6 +12,12 @@ mod tests {
     use whipplescript_store::norm::*;
     use whipplescript_store::StoreError;
 
+    #[cfg(test)]
+    mod activation {
+        use super::*;
+        include!("norm_ledger/activation.rs");
+    }
+
     struct Keys {
         keys: BTreeMap<String, SigningKey>,
         permit_creation: bool,
@@ -234,6 +240,8 @@ mod tests {
                 creation: AdmissionPredicate::Public {},
             }],
             owner_scopes: vec!["accept".into()],
+            activation: None,
+            gated_refs: vec![],
         }
     }
 

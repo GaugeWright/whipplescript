@@ -42,6 +42,7 @@ pub(crate) const USAGE: &str = "usage: whip [--json] norm <command>\n\
   transition <id-or-alias> <status> --as <binding>\n\
   retire <id-or-alias> <status> --as <binding>\n\
   rotate --as <binding> --successor <binding>\n\
+  plan-activation --proposal <file> | activate --as <binding> --proposal <file>\n\
   sign --as <binding> --statement <file>\n\
   cosign --as <binding> --event <file>\n\
   dispatch --request <file> | import --events <file>\n\
@@ -144,6 +145,8 @@ impl<'a> Arguments<'a> {
                 &["--as", "--family-basis", "--references", "--nonce", "--at"],
             ),
             "rotate" => (0, &["--as", "--successor", "--nonce", "--at"]),
+            "plan-activation" => (0, &["--proposal"]),
+            "activate" => (0, &["--as", "--proposal", "--nonce", "--at"]),
             _ => {
                 // MUTATION-SUCCESS-EXPR: Ok(Self { verb: "snapshot", positional: Vec::new(), flags: BTreeMap::new() })
                 return Err(format!("unknown norm command {verb}"));
@@ -544,9 +547,10 @@ fn execute(args: &[String], runtime_path: &std::path::Path) -> Result<Value, Str
         }));
     }
     // A ledger's first event leases the mainline for its gate (norm-plane §5).
-    let mut lease_gated_refs = || {
-        whipplescript_store::branches::lease_gated_mainline(
+    let mut lease_gated_refs = |declared: &[String]| {
+        whipplescript_store::branches::lease_gated_refs(
             &mut whipplescript_store::branches::BranchStore::open(super::branch_store_path())?,
+            declared,
             &super::now_stamp(),
         )
     };
@@ -611,6 +615,10 @@ fn execute(args: &[String], runtime_path: &std::path::Path) -> Result<Value, Str
             }
         }
         "export" => NormCommand::Export {},
+        "plan-activation" => NormCommand::PlanActivation {
+            proposal: serde_json::from_str(&args.file("--proposal")?)
+                .map_err(|error| error.to_string())?,
+        },
         "import" => NormCommand::Import {
             events: serde_json::from_str(&args.file("--events")?)
                 .map_err(|error| error.to_string())?,
@@ -651,6 +659,19 @@ fn execute(args: &[String], runtime_path: &std::path::Path) -> Result<Value, Str
                                 .reference()
                                 .clone(),
                             fields_json: args.file("--fields")?,
+                        }
+                    }
+                    "activate" => {
+                        let proposal: whipplescript_store::norm_activation::ActivationProposal =
+                            serde_json::from_str(&args.file("--proposal")?)
+                                .map_err(|error| error.to_string())?;
+                        NormAct::Activate {
+                            ledger,
+                            previous: view.authority_head,
+                            charter: proposal.charter,
+                            migration: proposal.migration,
+                            changes: proposal.changes,
+                            frontier: view.frontier.into_iter().collect(),
                         }
                     }
                     "rotate" => NormAct::Rotate {

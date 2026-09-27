@@ -382,13 +382,22 @@ impl Hosted {
             )
         });
         let mut store = DoSqliteStore::new(self.sql.clone());
-        store
-            .pin_norm_checkpoint(&checkpoint)
-            .expect("independent host pin");
+        // A host pins once; importing an authority event (a rotation or a
+        // charter activation) is what advances its checkpoint afterwards.
+        if store
+            .norm_checkpoint()
+            .expect("hosted checkpoint")
+            .is_none()
+        {
+            store
+                .pin_norm_checkpoint(&checkpoint)
+                .expect("independent host pin");
+        }
         let sql = self.sql.clone();
-        let mut lease = || {
-            whipplescript_store::branches::lease_gated_mainline(
+        let mut lease = |declared: &[String]| {
+            whipplescript_store::branches::lease_gated_refs(
                 &mut whipplescript_host_do::do_branches::DoBranches::new(sql.clone())?,
+                declared,
                 "hosted-import",
             )
         };
@@ -1103,6 +1112,173 @@ fn the_authorization_demo_repairs_a_violated_requirement_under_a_current_token()
         assert!(
             detail["reservations"].get(&lapsed).is_none(),
             "an expired grant fences nothing: {detail}"
+        );
+    }
+
+    // W1: the owner activates C1 under C0's activation rule. C1 keeps every
+    // vocabulary but the reservation, and the migration must say what becomes
+    // of the claims still held: planned without a word about them, each one
+    // is named, and the activation is refused and changes nothing.
+    // C1 also gates a release line, which both hosts hold before it does.
+    NativeWorkspaceVcs::open(
+        fixture.root.join("branches.sqlite"),
+        fixture.root.join("content.sqlite"),
+    )
+    .expect("workspace")
+    .create_branch("line-release", None, MAINLINE_BRANCH_ID, "t6")
+    .expect("release line");
+    whipplescript_host_do::do_branches::compose_vcs_shared(&hosted.sql)
+        .expect("hosted workspace")
+        .create_branch("line-release", None, MAINLINE_BRANCH_ID, "t6")
+        .expect("hosted release line");
+    let release_lease = || {
+        use whipplescript_store::branches::Branches as _;
+        whipplescript_store::branches::BranchStore::open(fixture.root.join("branches.sqlite"))
+            .expect("branch store")
+            .head_reservation("line-release")
+            .expect("reservation")
+    };
+    let mut c1 = charter.clone();
+    c1.vocabularies
+        .retain(|entry| entry.definition.name != "reservation");
+    c1.gated_refs = vec!["line-release".into()];
+    let reference = |entry: &whipplescript_store::norm::NormVocabulary| {
+        Vocabulary::new(entry.definition.clone())
+            .expect("definition")
+            .reference()
+            .clone()
+    };
+    let mut migration: Vec<Value> = c1
+        .vocabularies
+        .iter()
+        .map(|entry| json!({"from": reference(entry), "plan": {"plan": "retain"}}))
+        .collect();
+    fixture.write(
+        "c1-unplanned.json",
+        &json!({"charter": c1, "migration": migration}),
+    );
+    let planned = fixture.run(&["plan-activation", "--proposal", "c1-unplanned.json"]);
+    let obstructions = planned["result"]["obstructions"]
+        .as_array()
+        .expect("obstructions");
+    for claim in [&renewed, &future, &lapsed] {
+        assert!(
+            obstructions
+                .iter()
+                .any(|obstruction| obstruction["record"] == claim.as_str()
+                    && obstruction["reason"] == "a live record has no migration plan"),
+            "{planned}"
+        );
+    }
+    let before_activation = snapshot(&fixture, None)["result"]["snapshot"].clone();
+    let unplanned = fixture.refuse(&[
+        "activate",
+        "--as",
+        "owner",
+        "--proposal",
+        "c1-unplanned.json",
+    ]);
+    assert!(
+        String::from_utf8_lossy(&unplanned.stderr).contains("charter activation is obstructed"),
+        "{}",
+        String::from_utf8_lossy(&unplanned.stderr)
+    );
+    // Retiring them is the plan. W cannot activate it; the owner can.
+    let reservation = charter
+        .vocabularies
+        .iter()
+        .find(|entry| entry.definition.name == "reservation")
+        .expect("C0 declares reservations");
+    migration.push(json!({"from": reference(reservation), "plan": {"plan": "retire"}}));
+    fixture.write("c1.json", &json!({"charter": c1, "migration": migration}));
+    let by_worker = fixture.refuse(&["activate", "--as", "worker", "--proposal", "c1.json"]);
+    assert!(
+        String::from_utf8_lossy(&by_worker.stderr)
+            .contains("lacks the charter's authenticated governance authority"),
+        "{}",
+        String::from_utf8_lossy(&by_worker.stderr)
+    );
+    assert_eq!(
+        snapshot(&fixture, None)["result"]["snapshot"],
+        before_activation,
+        "a refused activation changes nothing"
+    );
+    assert_eq!(release_lease(), None, "nor gates the line it declares");
+    let activated = fixture.run(&["activate", "--as", "owner", "--proposal", "c1.json"])["result"]
+        ["event_id"]
+        .as_str()
+        .expect("activation")
+        .to_owned();
+    let after_activation = snapshot(&fixture, None)["result"]["snapshot"].clone();
+    assert_eq!(
+        after_activation["checkpoint"]["authority_head"],
+        activated.as_str()
+    );
+    assert_eq!(after_activation["charter"], json!(c1));
+    for claim in [&renewed, &future, &lapsed] {
+        assert!(
+            after_activation["retired"]
+                .as_array()
+                .is_some_and(|retired| retired.iter().any(|id| id == claim.as_str())),
+            "{after_activation}"
+        );
+    }
+    // The release line is now gated like the mainline: a transport of the
+    // new file onto it asks the gate, which refuses it for the support the
+    // requirement lacks there, and the line does not move.
+    assert_eq!(release_lease().as_deref(), Some("norm-gate"));
+    let onto_release = refused(&whip(
+        &fixture,
+        &[
+            "--json",
+            "branch",
+            "transport",
+            "line-next",
+            "path(src/new.py)",
+            "--onto",
+            "line-release",
+            "--apply",
+        ],
+        host.configured(),
+    ));
+    assert_eq!(
+        onto_release["detail"]["requirements"]
+            .as_object()
+            .map(|requirements| requirements.len()),
+        Some(1),
+        "{onto_release}"
+    );
+    assert_eq!(read(&fixture, "line-release", "src/new.py"), None);
+    // Both hosts hold the same activated ledger, and on both the retired
+    // grant fences nothing: the promotion is refused only for the support
+    // the requirement still lacks at the new file.
+    hosted.sync(&fixture);
+    let hosted_after = hosted.snapshot_at(&after_activation["frontier"]);
+    for field in ["charter", "retired", "checkpoint"] {
+        assert_eq!(hosted_after[field], after_activation[field], "{field}");
+    }
+    {
+        use whipplescript_store::branches::Branches as _;
+        assert_eq!(
+            whipplescript_host_do::do_branches::DoBranches::new(hosted.sql.clone())
+                .expect("hosted branches")
+                .head_reservation("line-release")
+                .expect("hosted reservation")
+                .as_deref(),
+            Some("norm-gate"),
+            "importing the activation gates the line on the object too"
+        );
+    }
+    let native = promote_stream(&fixture, &host, "next", &[]);
+    let hosted_promotion = hosted.promote_stream("next", "after-activation", &[]);
+    for detail in [&refused(&native)["detail"], &hosted_promotion["detail"]] {
+        assert_eq!(detail["reservations"], json!({}), "{detail}");
+        assert_eq!(
+            detail["requirements"]
+                .as_object()
+                .map(|requirements| requirements.len()),
+            Some(1),
+            "{detail}"
         );
     }
 

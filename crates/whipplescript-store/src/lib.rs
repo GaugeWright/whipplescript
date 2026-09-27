@@ -38,6 +38,7 @@ mod native_existing;
 #[cfg(feature = "native")]
 pub mod native_stores;
 pub mod norm;
+pub mod norm_activation;
 pub mod norm_artifact;
 pub mod norm_commands;
 pub mod norm_correspondence;

@@ -1,0 +1,87 @@
+--- norm-plane §10 and slice W1: charter activation is a governed transition.
+---
+--- Activation is the preceding charter's authority's act. Its migration plans
+--- every live record: a successor under the new charter, retention under its
+--- old vocabulary, or explicit retirement. A closed record needs no plan and
+--- stays replayable. A total plan is necessary but not sufficient: a
+--- successor must not weaken an admission its old vocabulary required unless
+--- the activation declares that change authorized, and must not demote a live
+--- requirement out of the inventory. Any obstruction refuses the activation,
+--- which then changes nothing. A successor that changes what a live record's
+--- status means for its effectiveness is obstructed outright: migration cannot
+--- resurrect a retired privilege or relabel weak evidence as strong support.
+---
+--- One live requirement, one live claim and one closed record are modelled.
+--- A record carries its kind, the migration's plan for it, the admission its
+--- old vocabulary required and the admission its successor would require.
+mod CHARTER-TRANSITION is
+  sorts Kind Plan Strength Fact Cfg State .
+  ops requirement claim closed : -> Kind [ctor] .
+  --- What the migration does with a record's vocabulary.
+  ops successor demoted relabeled retained retired unplanned : -> Plan [ctor] .
+  ops public authority : -> Strength [ctor] .
+  subsort Fact < Cfg .
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+  op {_} : Cfg -> State [ctor] .
+  op rec : Kind Plan Strength Strength -> Fact [ctor] .
+  --- The preceding charter authorizes the act; the proposal declares a change.
+  ops authorized declared : -> Fact [ctor] .
+  --- The proposal, the charter in force, and the outcome.
+  ops proposal old new refused : -> Fact [ctor] .
+  vars K : Kind . var P : Plan . vars A B : Strength . var C : Cfg .
+
+  op isDeclared : Cfg -> Bool .
+  eq isDeclared(declared C) = true .
+  eq isDeclared(C) = false [owise] .
+  --- Is any record obstructed? The whole configuration is inspected.
+  op obstructed : Cfg Cfg -> Bool .
+  eq obstructed(rec(closed, P, A, B) C, All:Cfg) = obstructed(C, All:Cfg) .
+  eq obstructed(rec(K, unplanned, A, B) C, All:Cfg) = true .
+  eq obstructed(rec(requirement, demoted, A, B) C, All:Cfg) = true .
+  eq obstructed(rec(K, relabeled, A, B) C, All:Cfg) = true .
+  eq obstructed(rec(K, successor, authority, public) C, All:Cfg) =
+    if isDeclared(All:Cfg) then obstructed(C, All:Cfg) else true fi .
+  eq obstructed(C, All:Cfg) = false [owise] .
+
+  --- The two bad outcomes the searches look for.
+  op laundered : Cfg -> Bool .
+  eq laundered(new rec(K, successor, authority, public) C) = not isDeclared(C) .
+  eq laundered(C) = false [owise] .
+  op lost : Cfg -> Bool .
+  eq lost(new rec(K, unplanned, A, B) C) = K =/= closed .
+  eq lost(new rec(requirement, demoted, A, B) C) = true .
+  eq lost(C) = false [owise] .
+  op relabeled : Cfg -> Bool .
+  eq relabeled(new rec(K, relabeled, A, B) C) = true .
+  eq relabeled(C) = false [owise] .
+
+  crl [activate] : { proposal old authorized C } => { new authorized C }
+    if not obstructed(C, C) .
+  crl [refuse] : { proposal old authorized C } => { refused old authorized C }
+    if obstructed(C, C) .
+endm
+--- Checking only that every live vocabulary has some plan lets an undeclared
+--- weakening and a demoted requirement through.
+mod CHARTER-TRANSITION-WEAK-MAP-ONLY is
+  including CHARTER-TRANSITION .
+  var C : Cfg .
+  op planned : Cfg -> Bool .
+  eq planned(rec(K:Kind, unplanned, A:Strength, B:Strength) C) = K:Kind == closed and planned(C) .
+  eq planned(C) = true [owise] .
+  crl [activate-planned] : { proposal old authorized C } => { new authorized C }
+    if planned(C) .
+endm
+--- Activation that drops whatever it does not plan for.
+mod CHARTER-TRANSITION-WEAK-DROP is
+  including CHARTER-TRANSITION .
+  var C : Cfg .
+  rl [activate-dropping] : { proposal old authorized C } => { new authorized C } .
+endm
+--- Activation authorized by the proposed charter rather than the preceding one.
+mod CHARTER-TRANSITION-WEAK-SELF-AUTHORIZED is
+  including CHARTER-TRANSITION .
+  var C : Cfg .
+  crl [self-authorize] : { proposal old C } => { new authorized C }
+    if not obstructed(C, C) .
+endm

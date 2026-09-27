@@ -1784,6 +1784,7 @@ describe("real WorkflowInstance hibernation", () => {
       state.storage.sql.exec("DROP TRIGGER tracker_norm_creation_alias");
       state.storage.sql.exec("DROP TABLE tracker_norm_aliases");
       state.storage.sql.exec("DROP TRIGGER tracker_norm_rotation_checkpoint");
+      state.storage.sql.exec("DROP TRIGGER tracker_norm_activation_checkpoint");
       state.storage.sql.exec("DROP TRIGGER tracker_norm_identity_checkpoint");
       state.storage.sql.exec("DROP TRIGGER tracker_norm_checkpoint_identity");
       state.storage.sql.exec("DROP TABLE tracker_norm_checkpoint");
@@ -1824,6 +1825,7 @@ describe("real WorkflowInstance hibernation", () => {
       for (const trigger of [
         "tracker_norm_bootstrap_pin", "tracker_norm_rotation_checkpoint", "tracker_norm_creation_alias",
         "tracker_norm_identity_checkpoint", "tracker_norm_checkpoint_identity",
+        "tracker_norm_activation_checkpoint",
       ]) {
         expect(state.storage.sql.exec(
           "SELECT name FROM sqlite_master WHERE type = 'trigger' AND name = ?",

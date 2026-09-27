@@ -891,6 +891,8 @@ fn norm_cli_restores_hosted_p256_history_with_public_bindings_only() {
                 resource_domains: None,
                 vocabularies: vec![],
                 owner_scopes: vec![],
+                activation: None,
+                gated_refs: vec![],
             },
         },
         premises: None,

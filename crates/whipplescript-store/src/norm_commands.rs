@@ -14,7 +14,7 @@ use crate::norm_resources::{
 };
 use crate::{StoreError, StoreResult};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 pub const NORM_COMMAND_PROTOCOL: &str = "whipplescript.norm.commands/v1";
 
@@ -77,6 +77,12 @@ pub enum NormCommand {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         frontier: Option<Vec<String>>,
     },
+    /// Every obstruction a proposed charter activation would meet at the
+    /// current frontier (norm-plane §10). An empty list is not an admission:
+    /// the signed act is judged again when it is appended.
+    PlanActivation {
+        proposal: crate::norm_activation::ActivationProposal,
+    },
     /// Evaluate a typed query (§8, `norm_query`) at a frontier; a query that
     /// reaches the artifact names the cut it is read at.
     Query {
@@ -94,6 +100,25 @@ pub struct NormResourcePoint {
     pub cut: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub frontier: Option<Vec<String>>,
+}
+
+/// The stream lines the charter-installing acts among these statements
+/// declare gated, or `None` when none of them installs a charter.
+fn declared_gates<'s>(
+    statements: impl Iterator<Item = &'s crate::norm::NormStatement>,
+) -> Option<Vec<String>> {
+    let mut installs = false;
+    let mut declared = BTreeSet::new();
+    for statement in statements {
+        let (crate::norm::NormAct::Bootstrap { charter, .. }
+        | crate::norm::NormAct::Activate { charter, .. }) = &statement.action
+        else {
+            continue;
+        };
+        installs = true;
+        declared.extend(charter.gated_refs.iter().cloned());
+    }
+    installs.then(|| declared.into_iter().collect())
 }
 
 /// Configured only by a host with whole-workspace read authority. The request
@@ -166,6 +191,10 @@ pub enum NormCommandResult {
         captured: NormReadAnchor,
         result: Box<crate::norm_query::QueryResult>,
     },
+    ActivationPlanned {
+        captured: NormReadAnchor,
+        obstructions: Vec<crate::norm_activation::ActivationObstruction>,
+    },
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -188,6 +217,10 @@ pub struct NormSnapshot {
     /// The conflicts among live claims (norm-plane §7, R1).
     #[serde(default)]
     pub reservations: crate::norm_reservations::ReservationsView,
+    /// Records a charter activation retired (norm-plane §10, W1): closed, and
+    /// admitting no act again.
+    #[serde(default)]
+    pub retired: BTreeSet<String>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -215,11 +248,15 @@ pub trait NormCommandStore {
     ) -> StoreResult<usize>;
 }
 
+/// A host's lease on the refs a charter gates: the mainline, and every line
+/// named (norm-plane §5).
+pub type GatedRefLease<'a> = dyn FnMut(&[String]) -> StoreResult<()> + 'a;
+
 pub struct NormCommandHost<'a, S: NormCommandStore> {
     store: &'a mut S,
     verifier: &'a dyn NormVerifier,
     artifacts: Option<&'a NormArtifactCapture<'a>>,
-    gated_refs: Option<&'a mut dyn FnMut() -> StoreResult<()>>,
+    gated_refs: Option<&'a mut GatedRefLease<'a>>,
 }
 impl<'a, S: NormCommandStore> NormCommandHost<'a, S> {
     pub fn new(store: &'a mut S, verifier: &'a dyn NormVerifier) -> Self {
@@ -231,12 +268,13 @@ impl<'a, S: NormCommandStore> NormCommandHost<'a, S> {
         }
     }
 
-    /// The host's way to lease its gated refs (norm-plane §5). A ledger's
-    /// first event — a bootstrap, or an import that may carry one — leases
-    /// them before it lands, so a governed workspace's mainline never exists
-    /// unleased; an append that then fails leaves the lease, which only
-    /// over-protects, and the ungoverned gate still admits through it.
-    pub fn with_gated_refs(mut self, lease: &'a mut dyn FnMut() -> StoreResult<()>) -> Self {
+    /// The host's way to lease its gated refs (norm-plane §5): the mainline
+    /// and the lines a charter declares. An act that installs a charter — a
+    /// bootstrap, an activation, or an import that may carry either — leases
+    /// them before it lands, so a gated ref never exists unleased. An
+    /// activation is judged first and a refused one leases nothing; any other
+    /// append that then fails leaves the lease, which only over-protects.
+    pub fn with_gated_refs(mut self, lease: &'a mut GatedRefLease<'a>) -> Self {
         self.gated_refs = Some(lease);
         self
     }
@@ -272,6 +310,7 @@ impl<'a, S: NormCommandStore> NormCommandHost<'a, S> {
             });
         }
         Ok(NormSnapshot {
+            retired: view.retired_records().clone(),
             reservations: view.reservations_view(),
             manifests: self.manifest_judgments(&view, None)?,
             families: view.relation_families()?,
@@ -418,19 +457,45 @@ impl<'a, S: NormCommandStore> NormCommandHost<'a, S> {
                 "unsupported norm command protocol".into(),
             ));
         }
+        // The acts that install a charter lease the refs it gates before they
+        // are admitted: the mainline, and every line the charter declares.
+        // A lease that is refused — a declared line with live bindings, say
+        // — refuses the act with it.
         let governs = match &request.command {
-            NormCommand::Append { event } => {
-                matches!(
-                    event.statement.action,
-                    crate::norm::NormAct::Bootstrap { .. }
-                )
+            NormCommand::Append { event } => declared_gates(std::iter::once(&event.statement)),
+            NormCommand::Import { events } => {
+                let statements: Vec<crate::norm::NormStatement> = events
+                    .iter()
+                    .filter(|event| event.kind.starts_with("norm."))
+                    .filter_map(|event| {
+                        serde_json::from_str::<SignedNormEvent>(&event.payload_json).ok()
+                    })
+                    .map(|signed| signed.statement)
+                    .collect();
+                Some(declared_gates(statements.iter()).unwrap_or_default())
             }
-            NormCommand::Import { .. } => true,
-            _ => false,
+            _ => None,
         };
-        if governs {
+        if let Some(declared) = governs {
+            // An activation is judged before its lines are leased, so one the
+            // ledger refuses leaves every line as it found it; a lease is
+            // never released.
+            if let NormCommand::Append { event } = &request.command {
+                if matches!(
+                    event.statement.action,
+                    crate::norm::NormAct::Activate { .. }
+                ) {
+                    let view = self.store.norm_state(self.verifier)?;
+                    crate::norm::admit_norm(
+                        &self.store.tracker_history()?,
+                        Some(&view.checkpoint()),
+                        &event.tracker_event()?,
+                        self.verifier,
+                    )?;
+                }
+            }
             if let Some(lease) = self.gated_refs.as_mut() {
-                lease()?;
+                lease(&declared)?;
             }
         }
         let result = match request.command {
@@ -572,6 +637,18 @@ impl<'a, S: NormCommandStore> NormCommandHost<'a, S> {
                 NormCommandResult::Differed {
                     captured: history.anchor(),
                     diff: Box::new(diff),
+                }
+            }
+            NormCommand::PlanActivation { proposal } => {
+                let history = self.history()?;
+                let view = history.project(None, self.verifier)?;
+                NormCommandResult::ActivationPlanned {
+                    captured: history.anchor(),
+                    obstructions: view.activation_obstructions(
+                        &proposal.charter,
+                        &proposal.migration,
+                        &proposal.changes,
+                    )?,
                 }
             }
             NormCommand::Explain { record, frontier } => {

@@ -210,29 +210,23 @@ fn fence(
     let mut fenced = BTreeMap::new();
     let mut unfenced = BTreeMap::new();
     for (id, record) in &view.records {
-        if !reservations.contains(&record.vocabulary) {
+        // A claim a charter activation retired fences nothing.
+        if !reservations.contains(&record.vocabulary) || view.is_retired(id) {
             continue;
         }
         // Where the claim keeps its region, exclusivity and expiry: its
         // vocabulary's arbitration, or the bundled reservation's field names.
-        let arbitration =
-            view.charter
-                .vocabularies
+        let arbitration = view.interpretation(&record.vocabulary).and_then(|entry| {
+            entry
+                .definition
+                .status
+                .transitions
                 .iter()
-                .find(|entry| {
-                    entry.definition.name == record.vocabulary.name
-                        && entry.definition.version == record.vocabulary.version
+                .find_map(|rule| match &rule.admission {
+                    AdmissionPredicate::Arbitrated { arbitration, .. } => Some(arbitration.clone()),
+                    _ => None,
                 })
-                .and_then(|entry| {
-                    entry.definition.status.transitions.iter().find_map(|rule| {
-                        match &rule.admission {
-                            AdmissionPredicate::Arbitrated { arbitration, .. } => {
-                                Some(arbitration.clone())
-                            }
-                            _ => None,
-                        }
-                    })
-                });
+        });
         let (selectors_field, mode_field, exclusive, expires_field) = match &arbitration {
             Some(arbitration) => (
                 arbitration.selectors.as_str(),

@@ -403,6 +403,51 @@ pub fn lease_gated_mainline(branches: &mut dyn Branches, at: &str) -> StoreResul
     }
 }
 
+/// Take the gate's lease on the mainline and on every stream line the
+/// charter declares gated (norm-plane §5). A declared line must be an active
+/// line with no instance bound to it: declaring a bound ref gated refuses
+/// until its bindings are resolved under the charter-transition contract. Once
+/// leased, a line refuses every ordinary head mutation and every binding, and
+/// moves only inside the gate's commit, exactly as the mainline does.
+pub fn lease_gated_refs(
+    branches: &mut dyn Branches,
+    declared: &[String],
+    at: &str,
+) -> StoreResult<()> {
+    lease_gated_mainline(branches, at)?;
+    for branch_id in declared {
+        if branches.head_reservation(branch_id)?.as_deref() == Some(MAINLINE_GATE_LEASE) {
+            continue;
+        }
+        let active = matches!(
+            branches.get_branch(branch_id)?,
+            Some(row) if row.status == BranchStatus::Active
+        );
+        if !active {
+            return Err(crate::StoreError::Conflict(format!(
+                "a gated ref must name an active line; `{branch_id}` is not one"
+            )));
+        }
+        let bound = branches.list_bound_instances(branch_id)?;
+        if !bound.is_empty() {
+            return Err(crate::StoreError::Conflict(format!(
+                "`{branch_id}` has live instance bindings ({}); resolve them under the charter-transition contract before gating it",
+                bound.join(", ")
+            )));
+        }
+        let outcome = branches.reserve_head(branch_id, MAINLINE_GATE_LEASE, at)?;
+        if !matches!(
+            outcome,
+            HeadReservationOutcome::Reserved | HeadReservationOutcome::Existing
+        ) {
+            return Err(crate::StoreError::Conflict(format!(
+                "the gate cannot take its lease on `{branch_id}`: {outcome:?}"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Object-safe branch-tier seam, mirroring `Coordination`/`WorkItems`: the
 /// DO host supplies its own implementation over `DoSql`.
 pub trait Branches {
@@ -1492,6 +1537,18 @@ impl Branches for BranchStore {
         let tx = self
             .connection
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        // A line the charter declares gated holds the gate's lease, and is
+        // bound like the mainline: never.
+        let gated: Option<String> = tx
+            .query_row(
+                "SELECT reservation_id FROM branch_head_reservations WHERE branch_id = ?1",
+                params![branch_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if gated.as_deref() == Some(MAINLINE_GATE_LEASE) {
+            return Ok(BindOutcome::GatedRef);
+        }
         let existing: Option<String> = tx
             .query_row(
                 "SELECT branch_id FROM branch_instances WHERE instance_id = ?1",

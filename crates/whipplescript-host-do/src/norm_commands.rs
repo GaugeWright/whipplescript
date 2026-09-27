@@ -53,7 +53,7 @@ pub fn execute_hosted_norm_command_with_artifacts<S: NormCommandStore>(
     trusted_configuration: &str,
     command: &str,
     artifacts: Option<&NormArtifactCapture<'_>>,
-    gated_refs: Option<&mut dyn FnMut() -> whipplescript_store::StoreResult<()>>,
+    gated_refs: Option<&mut whipplescript_store::norm_commands::GatedRefLease<'_>>,
 ) -> Result<String, String> {
     let trust: HostedNormTrust =
         serde_json::from_str(trusted_configuration).map_err(|error| error.to_string())?;

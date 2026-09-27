@@ -334,14 +334,6 @@ pub enum GateCommit {
     Stale { changed: String },
 }
 
-/// Whether a door onto this ref must pass the mainline gate (norm-plane §5).
-/// Enforcement attaches to the ref, not the verb: the mainline is gated, and
-/// every other line is ungated until the charter can declare a gated release
-/// line.
-pub fn is_gated_ref(branch_id: &str) -> bool {
-    branch_id == MAINLINE_BRANCH_ID
-}
-
 /// What a head movement through the gated-ref choke point came to.
 enum GatedMove {
     /// The ref's own compare-and-swap answered.
@@ -825,6 +817,16 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
         Ok(())
     }
 
+    /// Whether a door onto this ref must pass the mainline gate (norm-plane
+    /// §5). Enforcement attaches to the ref, not the verb: the mainline is
+    /// gated, and so is every stream line the charter declares gated, which
+    /// holds the gate's lease from the act that declared it.
+    fn is_gated_ref(&self, branch_id: &str) -> StoreResult<bool> {
+        Ok(branch_id == MAINLINE_BRANCH_ID
+            || self.branches.head_reservation(branch_id)?.as_deref()
+                == Some(crate::branches::MAINLINE_GATE_LEASE))
+    }
+
     /// The one place a door moves a head (norm-plane §5). An ungated ref
     /// advances by its own compare-and-swap. A gated ref's proposed result is
     /// recorded first, so the gate judges the exact immutable cut, and then
@@ -835,7 +837,7 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
         gate: &mut dyn MainlineGate,
         cut: CutRecord<'_>,
     ) -> StoreResult<GatedMove> {
-        if !is_gated_ref(cut.branch_id) {
+        if !self.is_gated_ref(cut.branch_id)? {
             return Ok(GatedMove::Moved(self.branches.advance_head(
                 cut.branch_id,
                 cut.parent_cut_id,
@@ -3214,10 +3216,13 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
         // An undo that moves a gated ref is a candidate like any other, judged
         // at its proposed result — the state the op found — and applied
         // whole inside the gate's commit (norm-plane §5).
-        let gated = op
-            .deltas
-            .iter()
-            .find(|delta| is_gated_ref(&delta.branch_id));
+        let mut gated = None;
+        for delta in &op.deltas {
+            if self.is_gated_ref(&delta.branch_id)? {
+                gated = Some(delta);
+                break;
+            }
+        }
         let undo_deltas = match gated {
             None => self.apply_undo_deltas(op_id, &op.deltas, at, None)?,
             Some(delta) => {
@@ -3311,6 +3316,14 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
         at: &str,
         gated: Option<(&str, &str)>,
     ) -> StoreResult<Vec<OpBranchDelta>> {
+        // Which refs are gated is read before any of them moves.
+        let mut gated_refs = std::collections::BTreeSet::new();
+        for delta in deltas {
+            if self.is_gated_ref(&delta.branch_id)? {
+                gated_refs.insert(delta.branch_id.clone());
+            }
+        }
+        let is_gated_ref = |branch_id: &str| gated_refs.contains(branch_id);
         let mut undo_deltas = Vec::new();
         for delta in deltas {
             let row = self
@@ -8466,6 +8479,98 @@ mod tests {
             advance()?;
             Ok(GateCommit::Committed)
         }
+    }
+
+    /// A stream line the charter declares gated (norm-plane §5, W1) holds the
+    /// gate's lease like the mainline: nothing binds to it, nothing writes to
+    /// it, and a door onto it asks the gate. A line with a live binding, or no
+    /// line at all, cannot be declared gated.
+    #[test]
+    fn a_line_the_charter_declares_gated_is_gated_like_the_mainline() {
+        use crate::selection::parse;
+        let mut vcs = vcs();
+        vcs.init("t0").expect("init");
+        vcs.write(MAINLINE_BRANCH_ID, "base.md", Some("base"), "main-1", "t1")
+            .expect("seed main");
+        for line in ["release", "bound", "work"] {
+            vcs.create_branch(line, None, MAINLINE_BRANCH_ID, "t2")
+                .expect("line");
+        }
+        vcs.write("work", "fix.md", Some("fix"), "work-1", "t3")
+            .expect("work");
+        assert_eq!(
+            vcs.bind_instance("worker", "bound", "t3").expect("bind"),
+            crate::branches::BindOutcome::Bound
+        );
+        let refused = |declared: &[&str], branches: &mut BranchStore| {
+            let declared: Vec<String> = declared.iter().map(|line| (*line).to_owned()).collect();
+            match crate::branches::lease_gated_refs(branches, &declared, "t4") {
+                Err(StoreError::Conflict(reason)) => reason,
+                other => panic!("the lease must be refused: {other:?}"),
+            }
+        };
+        assert!(refused(&["bound"], &mut vcs.branches)
+            .contains("`bound` has live instance bindings (worker)"));
+        assert!(refused(&["missing"], &mut vcs.branches)
+            .contains("a gated ref must name an active line; `missing` is not one"));
+        assert_eq!(vcs.branches.head_reservation("bound").expect("read"), None);
+        vcs.create_branch("frozen", None, MAINLINE_BRANCH_ID, "t2")
+            .expect("line");
+        vcs.branches
+            .reserve_head("frozen", "boundary", "t3")
+            .expect("reserve");
+        assert!(refused(&["frozen"], &mut vcs.branches)
+            .starts_with("the gate cannot take its lease on `frozen`: Busy"));
+
+        let declared = vec!["release".to_owned()];
+        crate::branches::lease_gated_refs(&mut vcs.branches, &declared, "t4").expect("lease");
+        crate::branches::lease_gated_refs(&mut vcs.branches, &declared, "t4").expect("idempotent");
+        assert_eq!(
+            vcs.bind_instance("worker-2", "release", "t5")
+                .expect("bind"),
+            crate::branches::BindOutcome::GatedRef
+        );
+        assert!(vcs
+            .write("release", "direct.md", Some("direct"), "release-x", "t5")
+            .is_err());
+        let expr = parse("path(fix.md)").expect("parse");
+        let mut gate = ScriptedGate {
+            verdict: GateVerdict::Refuse(GateRefusal {
+                reason: "the proposed result is not supported: R0 (repair)".into(),
+                detail: serde_json::json!({"requirements": {"R0": ["repair"]}}),
+            }),
+            commit: GateCommit::Committed,
+            run_advance: true,
+            judged: Vec::new(),
+        };
+        assert!(matches!(
+            vcs.transport_selection("work", &expr, "release", "release-1", "t6", &mut gate)
+                .expect("transport"),
+            TransportOutcome::GateRefused(_)
+        ));
+        assert_eq!(gate.judged.len(), 1);
+        assert_eq!(vcs.read("release", "fix.md").expect("read"), None);
+        let mut gate = ScriptedGate {
+            verdict: GateVerdict::Admit,
+            commit: GateCommit::Committed,
+            run_advance: true,
+            judged: Vec::new(),
+        };
+        assert!(matches!(
+            vcs.transport_selection("work", &expr, "release", "release-2", "t7", &mut gate)
+                .expect("transport"),
+            TransportOutcome::Transported { .. }
+        ));
+        assert_eq!(
+            vcs.read("release", "fix.md").expect("read").as_deref(),
+            Some("fix")
+        );
+        // An undeclared line is still no gate's business.
+        assert!(matches!(
+            vcs.transport_selection("work", &expr, "bound", "bound-1", "t8", &mut NeverAsked)
+                .expect("transport"),
+            TransportOutcome::Transported { .. }
+        ));
     }
 
     /// Enforcement attaches to the ref (norm-plane §5): every door onto the

@@ -106,6 +106,20 @@ resolving only today's members, which both doubles a grant and grants before
 expiry; a later-writer merge dropping a claim; and an unfenced door
 admitting a superseded token.
 
+`charter-transition.maude` models norm-plane §10 for slice W1: activating a
+successor charter is the preceding charter's authority's act. Its migration
+plans every live record — a successor, retention under the old vocabulary, or
+explicit retirement — and a closed record needs no plan. A total plan is
+necessary but not sufficient: a successor may not weaken an admission unless
+the activation declares the change authorized, may not demote a live
+requirement out of the inventory, and may not change what a live record's
+status means for its effectiveness, declared or not. An obstructed proposal
+is refused and the old charter stays in force. Thirteen searches; five
+refusals each with the weakening that reaches it: checking only the map
+(which launders a weakening, demotes a requirement and relabels
+effectiveness), dropping unplanned records, and self-authorization by the
+proposed charter.
+
 `action-classification.maude` models DR-0124 §14.2: an action's
 classification joins its declared label with every influence that shaped
 it — a declared input, a presence observation, an observation of absence —

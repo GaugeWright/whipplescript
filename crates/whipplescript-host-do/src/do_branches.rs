@@ -753,6 +753,21 @@ impl<S: DoSql> Branches for DoBranches<S> {
         if branch_id == MAINLINE_BRANCH_ID {
             return Ok(BindOutcome::GatedRef);
         }
+        // A line the charter declares gated holds the gate's lease, and is
+        // bound like the mainline: never.
+        let gated = self
+            .sql
+            .query(
+                "SELECT reservation_id FROM branch_head_reservations WHERE branch_id = ?1",
+                &[text(branch_id)],
+            )
+            .map_err(sql_err)?;
+        if gated
+            .first()
+            .is_some_and(|row| as_text(&row[0]) == MAINLINE_GATE_LEASE)
+        {
+            return Ok(BindOutcome::GatedRef);
+        }
         let existing = self
             .sql
             .query(

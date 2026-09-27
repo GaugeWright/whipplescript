@@ -183,7 +183,7 @@ impl NormView {
             unclassified: BTreeSet::new(),
             gaps: Vec::new(),
         };
-        for entry in &self.charter.vocabularies {
+        for entry in self.interpreted_vocabularies() {
             let vocabulary = Vocabulary::new(entry.definition.clone())
                 .map_err(|error| StoreError::Conflict(error.to_string()))?;
             let reference = vocabulary.reference();

@@ -837,6 +837,11 @@
     "norm.accept",
     "norm.retire",
     "observe.publish",
-    "reservation.grant"
-  ]
+    "reservation.grant",
+    "charter.activate"
+  ],
+  "activation": {
+    "requires": "authority",
+    "scope": "charter.activate"
+  }
 }

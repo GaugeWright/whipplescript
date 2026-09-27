@@ -54,7 +54,7 @@ crates/whipplescript-cli/src/host_runtime.rs|admit_host_action|2
 crates/whipplescript-store/src/vcs.rs|apply_undo_selection|5
 crates/whipplescript-kernel/src/effect_handlers.rs|apply_undo_selection|1
 crates/whipplescript-cli/src/main.rs|apply_undo_selection|2
-crates/whipplescript-store/src/vcs.rs|transport_selection|10
+crates/whipplescript-store/src/vcs.rs|transport_selection|13
 crates/whipplescript-kernel/src/effect_handlers.rs|transport_selection|1
 crates/whipplescript-cli/src/main.rs|transport_selection|1
 crates/whipplescript-store/src/vcs.rs|promote_line_exact|9
