@@ -26,6 +26,15 @@ homepage = "https://github.com/GaugeWright/whipplescript"
 repository = "https://github.com/GaugeWright/whipplescript"
 readme = "README.md"
 
+# How this workspace is rendered as native Buck2 targets (GaugeWright BUILD.md
+# stages 5 and 6): the cell and repository it is, and the section of the bar
+# whose `cargo check -p` lines are its other configurations. Read by
+# scripts/buckify-crates.py, which the GaugeWright repository renders here.
+[workspace.metadata.native]
+cell = "whipplescript"
+checkout = "whipplescript-src"
+feature-checks = "feature-builds"
+
 [workspace.lints.rust]
 unsafe_code = "forbid"
 

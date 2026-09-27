@@ -288,8 +288,29 @@ section supply-chain
 echo "== formatting =="
 section formatting
 
+# Where this checkout is a cell and the host is Linux with bubblewrap -- every
+# fleet gate host that answers this bar -- the lints, the feature builds and the
+# tests run on the native targets (GaugeWright BUILD.md, stages 5 and 6), which
+# scripts/buckify-crates.py renders from Cargo.toml and from the feature-builds
+# case of scripts/section.sh. Anywhere else -- a Mac, a worktree outside a
+# workspace -- the cargo lines run, and assert the same set.
+native=""
+if [ -n "$via_buck2" ] && [ "$(uname -s)" = Linux ] && command -v bwrap >/dev/null 2>&1; then
+    native=1
+fi
+
+# Natively, clippy runs on every target the cargo line lints, with this
+# repository's clippy.toml, and any report with anything in it fails the build,
+# which is what `-D warnings` makes of it. The prelude never uploads a clippy
+# action, so clippy runs again on a daemon that has not run it -- on the
+# first-party crates alone, since what it reads of the rest is cached.
 echo "== lints =="
-section lints
+if [ -n "$native" ]; then
+    buck2 build //:native-lints -c "green_bar.run=$GREEN_BAR_RUN" \
+      -c "green_bar.prerequisites=$prerequisites"
+else
+    section lints
+fi
 
 # The default feature set is not the only one this repository promises. Until
 # now `grep -rn 'no-default-features\|all-features' scripts/ .github/` returned
@@ -307,7 +328,12 @@ section lints
 # runner, where these feature unifications share no artifacts with the workspace
 # build above — about 80s.
 echo "== non-default feature builds =="
-section feature-builds
+if [ -n "$native" ]; then
+    buck2 build //:native-feature-checks -c "green_bar.run=$GREEN_BAR_RUN" \
+      -c "green_bar.prerequisites=$prerequisites"
+else
+    section feature-builds
+fi
 
 echo "== norm observer runtime preparation =="
 # `prepare.py` builds the CPython observer reactor and refuses on any host that
@@ -365,7 +391,7 @@ section norm-observer
 # passing unobserved. Anywhere else — a Mac, a worktree outside a workspace —
 # the cargo line above runs, and asserts the same set.
 echo "== tests =="
-if [ -n "$via_buck2" ] && [ "$(uname -s)" = Linux ] && command -v bwrap >/dev/null 2>&1; then
+if [ -n "$native" ]; then
     buck2 build //:native-tests -c "green_bar.run=$GREEN_BAR_RUN" \
       -c "green_bar.prerequisites=$prerequisites"
 else
