@@ -141,6 +141,7 @@ pub struct DoToolExecutor<Sql: DoSql> {
     key_prefix: String,
     file_scopes: Option<Vec<DoFileScope>>,
     external_tools: BTreeMap<String, String>,
+    workspace_source: Option<String>,
     /// The running turn's result contract, installed by the host before the
     /// turn. Behind a lock because one executor serves an instance's turns and
     /// the tool surface takes `&self`.
@@ -161,6 +162,7 @@ impl<Sql: DoSql> DoToolExecutor<Sql> {
             key_prefix: String::new(),
             file_scopes: None,
             external_tools: BTreeMap::new(),
+            workspace_source: None,
             result_contract: std::sync::Mutex::new(None),
         }
     }
@@ -172,8 +174,16 @@ impl<Sql: DoSql> DoToolExecutor<Sql> {
             key_prefix: format!("{instance_id}/"),
             file_scopes: None,
             external_tools: BTreeMap::new(),
+            workspace_source: None,
             result_contract: std::sync::Mutex::new(None),
         }
+    }
+
+    /// Source identity supplied by the authenticated owning host for its
+    /// per-chat workspace. Other tools remain unclassified.
+    pub fn with_workspace_source(mut self, source: Option<String>) -> Self {
+        self.workspace_source = source;
+        self
     }
 
     /// Confine this executor to the exact file-store objects admitted for the
@@ -836,6 +846,25 @@ impl<Sql: DoSql> DoToolExecutor<Sql> {
 }
 
 impl<Sql: DoSql> ToolExecutor for DoToolExecutor<Sql> {
+    fn model_output_provenance(
+        &self,
+        call: &ToolCall,
+    ) -> whipplescript_kernel::sansio::ModelContentProvenance {
+        if matches!(
+            call.name.as_str(),
+            TOOL_READ | TOOL_WRITE | TOOL_EDIT | TOOL_GREP | TOOL_FIND | TOOL_LS | TOOL_BASH
+        ) {
+            if let Some(source) = &self.workspace_source {
+                return whipplescript_kernel::sansio::ModelContentProvenance {
+                    source_handles: vec![source.clone()],
+                    complete: true,
+                };
+            }
+        }
+        // Recall, tracker, and external tools can reveal another source.
+        whipplescript_kernel::sansio::ModelContentProvenance::default()
+    }
+
     fn install_result_contract(&self, contract: Option<ResultContract>) {
         *self
             .result_contract
@@ -1016,6 +1045,30 @@ mod tests {
     use super::*;
     use crate::do_store::test_support::store;
     use whipplescript_kernel::harness_loop::ToolCall;
+
+    #[test]
+    fn only_bounded_workspace_tools_inherit_the_host_workspace_source() {
+        let executor = executor().with_workspace_source(Some("workspace:chat-one".to_owned()));
+        for name in ["read", "write", "edit", "grep", "find", "ls", "bash"] {
+            let label = executor.model_output_provenance(&call(name, serde_json::json!({})));
+            assert!(label.complete, "{name}");
+            assert_eq!(label.source_handles, ["workspace:chat-one"]);
+        }
+        for name in [
+            "recall",
+            "list_todos",
+            "add_todo",
+            "update_todo",
+            "external",
+        ] {
+            assert!(
+                !executor
+                    .model_output_provenance(&call(name, serde_json::json!({})))
+                    .complete,
+                "{name}"
+            );
+        }
+    }
 
     /// Build an executor over a fresh schema-applied DO SQLite (the same test
     /// handle the store tests use), sharing the `Rc` the way `create` does.

@@ -15,7 +15,7 @@ export interface LiveModelCall {
   /** Conservative source set supplied by the admitted turn. This does not
    * certify that arbitrary tool output has no additional source. */
   readonly source_handles: readonly string[];
-  readonly provenance_complete: false;
+  readonly provenance_complete: boolean;
   readonly ordered_provenance: ModelRequestProvenance | null;
 }
 
@@ -68,11 +68,17 @@ export class LiveModelContext {
       capture.incomplete = true;
       return;
     }
+    // The sidecar is supplied by the kernel at this exact model-call boundary.
+    // An absent or incomplete label remains unknown to the owning host.
+    const provenanceComplete = provenance !== null
+      && provenance.messages.length > 0
+      && provenance.messages.every((part) => part.complete)
+      && provenance.tools.complete;
     capture.calls.push({
       ordinal: capture.calls.length,
       body: JSON.parse(encoded) as unknown,
       source_handles: [...new Set(sourceHandles)],
-      provenance_complete: false,
+      provenance_complete: provenanceComplete,
       ordered_provenance: provenance === null
         ? null
         : JSON.parse(JSON.stringify(provenance)) as ModelRequestProvenance,

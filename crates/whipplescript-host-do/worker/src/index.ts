@@ -1151,6 +1151,8 @@ interface HostCommandRequest {
   command: Record<string, unknown>;
   package: HostPackageDocuments;
   image_bodies: unknown[];
+  /** Ephemeral source labels from the authenticated owning host. */
+  initial_model_provenance?: unknown;
 }
 
 interface PublicSessionBootstrap {
@@ -4604,6 +4606,7 @@ export class WorkflowInstance implements DurableObject {
       command: command as Record<string, unknown>,
       package: candidate as HostPackageDocuments,
       image_bodies: Array.isArray(parsed.image_bodies) ? parsed.image_bodies : [],
+      initial_model_provenance: parsed.initial_model_provenance,
     };
   }
 
@@ -4881,6 +4884,11 @@ export class WorkflowInstance implements DurableObject {
             request.package.manifest,
             request.command.resources,
           ),
+          // Public visitors cannot assert authoring source labels. For an
+          // authenticated host these labels remain in the attached isolate;
+          // neither the command nor WhippleScript evidence stores them.
+          initial_model_provenance: this.isPublicSession()
+            ? undefined : request.initial_model_provenance,
         }),
       );
       const driven = await this.driveInstance(

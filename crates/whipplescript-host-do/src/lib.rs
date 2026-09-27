@@ -91,7 +91,9 @@ mod governed_host_tests {
         CredentialRef, OpenInstanceCommand, ProviderBindingRef, StartTurnCommand, TurnInput,
         HOST_PROTOCOL,
     };
-    use whipplescript_kernel::sansio::HttpResponse;
+    use whipplescript_kernel::sansio::{
+        HttpResponse, InitialModelProvenance, ModelContentProvenance,
+    };
     use whipplescript_store::RuntimeStore;
 
     use crate::do_store::{test_support, DoSql, DoSqliteStore};
@@ -272,6 +274,24 @@ workflow Method {
             .resolve_package(package.version_ref())
             .expect("package IR");
         let ports = DurableEffectPorts {
+            initial_model_provenance: Some(InitialModelProvenance {
+                system: ModelContentProvenance {
+                    source_handles: vec!["package:one".to_owned()],
+                    complete: true,
+                },
+                user: ModelContentProvenance {
+                    source_handles: vec!["chat:one".to_owned()],
+                    complete: true,
+                },
+                world: ModelContentProvenance {
+                    source_handles: vec!["workspace:one".to_owned()],
+                    complete: true,
+                },
+                tools: ModelContentProvenance {
+                    source_handles: vec!["package:one".to_owned()],
+                    complete: true,
+                },
+            }),
             agent_model: Some(Box::new(MessagesApiClient::new(
                 CoerceProvider::OpenAi,
                 "test-key",
@@ -303,6 +323,16 @@ workflow Method {
             matches!(first_step, DurableStepOutcome::NeedsHttp(_)),
             "an admitted hosted turn must be claimed and driven, got {first_step:?}; status: {instance_status:?}; effects: {after_step:?}"
         );
+        let DurableStepOutcome::NeedsHttp(request) = &first_step else {
+            unreachable!();
+        };
+        let labels = request
+            .model_provenance
+            .as_ref()
+            .expect("live model labels");
+        assert!(labels.messages.iter().all(|part| part.complete));
+        assert_eq!(labels.messages[0].source_handles, ["package:one"]);
+        assert!(labels.tools.complete);
         let resumed = attached.step(
             Some(Ok(HttpResponse {
                 status: 200,

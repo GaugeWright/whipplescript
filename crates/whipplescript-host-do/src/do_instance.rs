@@ -270,6 +270,11 @@ fn agent_prompt(input: &serde_json::Value) -> Result<String, StoreError> {
         })
 }
 
+fn is_governed_host_model_input(input: &serde_json::Value, effect_id: &str) -> bool {
+    input.get("command_id").and_then(serde_json::Value::as_str) == Some(effect_id)
+        && input.pointer("/input/text").is_some()
+}
+
 /// Refuse a turn whose grants name a resource this placement cannot serve.
 ///
 /// Neither durable-object agent path can honor an external MCP server
@@ -441,6 +446,8 @@ pub struct DoInstanceDriver<'a, Sql: DoSql> {
     /// Exact host-turn workspace references used by implicit context discovery
     /// as well as explicit tools. `None` is the legacy authored-instance view.
     pub agent_workspace_resources: Option<&'a [ResourceRef]>,
+    /// Transient host attestation for the current model input planes.
+    pub initial_model_provenance: Option<&'a whipplescript_kernel::sansio::InitialModelProvenance>,
     /// Executor-sidecar wiring for Class-A exec effects (compute plane P8), or
     /// `None` if no sidecar is configured (an `exec.command` then errors).
     pub exec: Option<&'a ExecutorSidecarConfig>,
@@ -1515,8 +1522,28 @@ impl<Sql: DoSql + Clone> InstanceDriver for DoInstanceDriver<'_, Sql> {
                     tools.insert(0, contract.tool_spec());
                     whipplescript_kernel::result_contract::TOOL_SUBMIT_RESULT.to_owned()
                 });
+                // A package may start its own agent.tell effect while this
+                // worker is attached. The host's labels certify only the
+                // exact governed command, never that authored effect's input.
+                let host_command = is_governed_host_model_input(&input, &effect.effect_id);
+                let mut model_provenance = if host_command {
+                    self.initial_model_provenance.cloned().unwrap_or_default()
+                } else {
+                    Default::default()
+                };
+                if !docs.is_empty() {
+                    model_provenance.system =
+                        whipplescript_kernel::sansio::ModelContentProvenance::derived_from([
+                            &model_provenance.system,
+                            &model_provenance.world,
+                        ]);
+                }
+                if !skills.is_empty() {
+                    // Skill discovery can read an unclassified workspace source.
+                    model_provenance.system.complete = false;
+                }
                 let turn_input = BrokeredTurnInput {
-                    model_provenance: Default::default(),
+                    model_provenance,
                     system: assembled.system_prompt,
                     user: prompt,
                     // The package-derived ability ceiling selects the exact
@@ -2600,6 +2627,8 @@ mod tests {
             agent_prompt(&input).expect("host text"),
             "the exact GaugeDesk user turn"
         );
+        assert!(is_governed_host_model_input(&input, "command-1"));
+        assert!(!is_governed_host_model_input(&input, "other-command"));
     }
 
     #[test]
@@ -2610,6 +2639,10 @@ mod tests {
         );
         assert!(agent_prompt(&serde_json::json!({"input": {}})).is_err());
         assert!(agent_prompt(&serde_json::json!({"prompt": "  "})).is_err());
+        assert!(!is_governed_host_model_input(
+            &serde_json::json!({"prompt": "authored turn", "command_id": "command-1"}),
+            "command-1",
+        ));
     }
 
     #[test]
@@ -2714,6 +2747,7 @@ mod tests {
                 agent_tools: &NoTools,
                 agent_tool_specs: None,
                 agent_workspace_resources: None,
+                initial_model_provenance: None,
                 exec: None,
                 turn: None,
                 ir: &ir,
@@ -2879,6 +2913,7 @@ mod tests {
             agent_tools: &NoTools,
             agent_tool_specs: None,
             agent_workspace_resources: None,
+            initial_model_provenance: None,
             exec: None,
             turn: None,
             ir: &ir,
@@ -2974,6 +3009,7 @@ mod tests {
             agent_tools: &NoTools,
             agent_tool_specs: None,
             agent_workspace_resources: None,
+            initial_model_provenance: None,
             exec: None,
             turn: None,
             ir: &ir,
@@ -3063,6 +3099,7 @@ mod tests {
             agent_tools: &NoTools,
             agent_tool_specs: None,
             agent_workspace_resources: None,
+            initial_model_provenance: None,
             exec: None,
             turn: None,
             ir: &ir,
@@ -3158,6 +3195,7 @@ complete result { text selected.text } }
             agent_tools: &NoTools,
             agent_tool_specs: None,
             agent_workspace_resources: None,
+            initial_model_provenance: None,
             exec: None,
             turn: None,
             ir: &ir,
@@ -3306,6 +3344,7 @@ rule finish when started => {
             agent_tools: &NoTools,
             agent_tool_specs: None,
             agent_workspace_resources: None,
+            initial_model_provenance: None,
             exec: None,
             turn: None,
             ir: &ir,
@@ -3450,6 +3489,7 @@ rule finish when started => {
                 agent_tools: &NoTools,
                 agent_tool_specs: None,
                 agent_workspace_resources: None,
+                initial_model_provenance: None,
                 exec: None,
                 turn: None,
                 ir: &ir,
@@ -3661,6 +3701,7 @@ rule finish when Ticket as ticket => {
             agent_tools: &NoTools,
             agent_tool_specs: None,
             agent_workspace_resources: None,
+            initial_model_provenance: None,
             exec: None,
             turn: None,
             ir: &ir,
@@ -3756,6 +3797,7 @@ rule finish when started => { during empty(Stop) { timer 1h as held } on lapse a
             agent_tools: &NoTools,
             agent_tool_specs: None,
             agent_workspace_resources: None,
+            initial_model_provenance: None,
             exec: None,
             turn: None,
             ir: &ir,
@@ -4050,6 +4092,7 @@ rule finish when started => {
             agent_tools: &NoTools,
             agent_tool_specs: None,
             agent_workspace_resources: None,
+            initial_model_provenance: None,
             exec: None,
             turn: None,
             ir: &ir,
@@ -4168,6 +4211,7 @@ rule finish when started => {
             agent_tools: &NoTools,
             agent_tool_specs: None,
             agent_workspace_resources: None,
+            initial_model_provenance: None,
             exec: None,
             turn: None,
             ir: &ir,
@@ -4495,6 +4539,7 @@ complete result verdict }
             agent_tools: &NoTools,
             agent_tool_specs: None,
             agent_workspace_resources: None,
+            initial_model_provenance: None,
             exec: None,
             turn: None,
             ir: &ir,
@@ -4635,6 +4680,7 @@ complete result { text report.text } }
             agent_tools: &NoTools,
             agent_tool_specs: None,
             agent_workspace_resources: None,
+            initial_model_provenance: None,
             exec: Some(&exec_cfg),
             turn: None,
             ir: &ir,
@@ -4752,6 +4798,7 @@ complete result { text content } }
             agent_tools: &NoTools,
             agent_tool_specs: None,
             agent_workspace_resources: None,
+            initial_model_provenance: None,
             exec: None,
             turn: None,
             ir: &ir,
@@ -4865,6 +4912,7 @@ complete result { count count } }
             agent_tools: &NoTools,
             agent_tool_specs: None,
             agent_workspace_resources: None,
+            initial_model_provenance: None,
             exec: None,
             turn: None,
             ir: &ir,
@@ -5003,6 +5051,7 @@ complete result { event event } }
             agent_tools: &NoTools,
             agent_tool_specs: None,
             agent_workspace_resources: None,
+            initial_model_provenance: None,
             exec: None,
             turn: None,
             ir: &ir,
@@ -5119,6 +5168,7 @@ complete result { remaining remaining } }
             agent_tools: &NoTools,
             agent_tool_specs: None,
             agent_workspace_resources: None,
+            initial_model_provenance: None,
             exec: None,
             turn: None,
             ir: &ir,
@@ -5240,6 +5290,7 @@ complete result result }
             agent_tools: &NoTools,
             agent_tool_specs: None,
             agent_workspace_resources: None,
+            initial_model_provenance: None,
             exec: None,
             turn: None,
             ir: &ir,
@@ -5365,6 +5416,7 @@ complete result result }
             agent_tools: &NoTools,
             agent_tool_specs: None,
             agent_workspace_resources: None,
+            initial_model_provenance: None,
             exec: None,
             turn: None,
             ir: &ir,
@@ -5524,6 +5576,7 @@ complete result result }
             agent_tools: &NoTools,
             agent_tool_specs: None,
             agent_workspace_resources: None,
+            initial_model_provenance: None,
             exec: None,
             turn: None,
             ir: &ir,
@@ -5650,6 +5703,7 @@ complete result { text digest } }
             agent_tools: &NoTools,
             agent_tool_specs: None,
             agent_workspace_resources: None,
+            initial_model_provenance: None,
             exec: None,
             turn: None,
             ir: &ir,
@@ -5770,6 +5824,7 @@ complete result { count count } }
             agent_tools: &NoTools,
             agent_tool_specs: None,
             agent_workspace_resources: None,
+            initial_model_provenance: None,
             exec: None,
             turn: None,
             ir: &ir,
@@ -6039,6 +6094,7 @@ complete result { count count } }
                 agent_tools: &NoTools,
                 agent_tool_specs: None,
                 agent_workspace_resources: None,
+                initial_model_provenance: None,
                 exec: Some(&exec_cfg),
                 turn: None,
                 ir: &ir,
@@ -6417,6 +6473,7 @@ complete result { count count } }
             agent_tools: &NoTools,
             agent_tool_specs: None,
             agent_workspace_resources: None,
+            initial_model_provenance: None,
             exec: Some(&exec_cfg),
             turn: None,
             ir: &ir,
@@ -6790,6 +6847,7 @@ complete result { count count } }
             agent_tools: &NoTools,
             agent_tool_specs: None,
             agent_workspace_resources: None,
+            initial_model_provenance: None,
             exec: None,
             turn: None,
             ir: &ir,
@@ -6885,6 +6943,17 @@ complete result { count count } }
     // terminal over the DO store.
     #[test]
     fn do_instance_driver_runs_an_agent_turn_over_fetch() {
+        use std::cell::RefCell;
+        struct CaptureHost(RefCell<Vec<whipplescript_kernel::sansio::ModelRequestProvenance>>);
+        impl HostDriver for CaptureHost {
+            fn fulfill(&self, request: &IoRequest) -> IoResult {
+                let IoRequest::Http(request) = request;
+                self.0
+                    .borrow_mut()
+                    .push(request.model_provenance.clone().expect("model labels"));
+                OkHost.fulfill(&IoRequest::Http(request.clone()))
+            }
+        }
         let source = "workflow AgentDemo\n\noutput result Done\n\n\
              class Done {\n  ok int\n}\n\n\
              agent helper {\n  provider owned\n  profile \"repo-reader\"\n  capacity 1\n}\n\n\
@@ -6935,6 +7004,16 @@ complete result { count count } }
             .expect("start event");
 
         let model = FinalReplyModel;
+        let known = |handle: &str| whipplescript_kernel::sansio::ModelContentProvenance {
+            source_handles: vec![handle.to_owned()],
+            complete: true,
+        };
+        let initial = whipplescript_kernel::sansio::InitialModelProvenance {
+            system: known("package:one"),
+            user: known("chat:one"),
+            world: known("workspace:one"),
+            tools: known("package:one"),
+        };
         let driver = DoInstanceDriver {
             now_unix_ms: 0,
             kernel,
@@ -6945,6 +7024,7 @@ complete result { count count } }
             agent_tools: &NoTools,
             agent_tool_specs: None,
             agent_workspace_resources: None,
+            initial_model_provenance: Some(&initial),
             exec: None,
             turn: None,
             ir: &ir,
@@ -6953,7 +7033,13 @@ complete result { count count } }
             max_steps: 8,
         };
         let mut machine = InstanceStepMachine::new(driver);
-        let outcome = run_to_completion(&mut machine, &OkHost);
+        let host = CaptureHost(RefCell::new(Vec::new()));
+        let outcome = run_to_completion(&mut machine, &host);
+        let calls = host.0.borrow();
+        assert!(!calls.is_empty());
+        assert!(calls[0].messages.iter().all(|part| !part.complete));
+        assert!(calls[0].messages[0].source_handles.is_empty());
+        assert!(!calls[0].tools.complete);
         assert!(
             matches!(outcome, InstanceOutcome::Terminal),
             "the DO drives the agent turn over fetch to a terminal: {outcome:?}"
@@ -7130,6 +7216,7 @@ complete result { count count } }
             agent_tools: &NoTools,
             agent_tool_specs: Some(&tool_specs),
             agent_workspace_resources: Some(&workspace_resources),
+            initial_model_provenance: None,
             exec: None,
             turn: None,
             ir: &ir,
@@ -7332,6 +7419,7 @@ complete result { count count } }
             agent_tools: &NoTools,
             agent_tool_specs: None,
             agent_workspace_resources: None,
+            initial_model_provenance: None,
             exec: None,
             turn: Some(&turn_cfg),
             ir: &ir,
@@ -7436,6 +7524,7 @@ complete result { count count } }
             agent_tools: &NoTools,
             agent_tool_specs: None,
             agent_workspace_resources: None,
+            initial_model_provenance: None,
             exec: None,
             turn: Some(&turn_cfg),
             ir: &ir,
@@ -7556,6 +7645,7 @@ complete result { count count } }
             agent_tools: &tools,
             agent_tool_specs: None,
             agent_workspace_resources: None,
+            initial_model_provenance: None,
             exec: None,
             turn: None,
             ir: &ir,

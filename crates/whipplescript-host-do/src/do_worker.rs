@@ -104,6 +104,9 @@ pub struct DurableEffectPorts {
     /// the default in-isolate executor serves only these selectors and honors
     /// their write attenuation.
     pub agent_workspace_resources: Option<Vec<ResourceRef>>,
+    /// Live inspection labels supplied by the authenticated owning host. They
+    /// are kept only in this attached worker and never written to the event log.
+    pub initial_model_provenance: Option<whipplescript_kernel::sansio::InitialModelProvenance>,
     pub agent_tool_specs: Option<Vec<whipplescript_kernel::harness_loop::ToolSpec>>,
     pub external_tool_bindings: Vec<(String, String)>,
     /// Version-pinned Agent `AGENTS.md` from an authored package. The hosted
@@ -146,6 +149,7 @@ pub struct DurableInstance<Sql: DoSql> {
     agent_model: Option<Box<dyn HttpModelClient>>,
     agent_tools: Box<dyn ToolExecutor>,
     agent_workspace_resources: Option<Vec<ResourceRef>>,
+    initial_model_provenance: Option<whipplescript_kernel::sansio::InitialModelProvenance>,
     agent_tool_specs: Option<Vec<whipplescript_kernel::harness_loop::ToolSpec>>,
     exec: Option<ExecutorSidecarConfig>,
     turn: Option<TurnContainerConfig>,
@@ -224,12 +228,25 @@ impl<Sql: DoSql + 'static> DurableInstance<Sql> {
         let default_files: Box<dyn FileStore> = Box::new(DoFileStore::new(
             DoSqlStorage::for_instance(Rc::clone(&sql), instance_id),
         ));
+        let workspace_source = ports.initial_model_provenance.as_ref().and_then(|labels| {
+            if !labels.world.complete {
+                return None;
+            }
+            let mut sources = labels
+                .world
+                .source_handles
+                .iter()
+                .filter(|handle| handle.starts_with("workspace:"));
+            let first = sources.next()?;
+            sources.next().is_none().then(|| first.clone())
+        });
         let agent_tools = match ports.agent_tools {
             Some(tools) => tools,
             None => {
                 let executor =
                     crate::do_tools::DoToolExecutor::for_instance(Rc::clone(&sql), instance_id)
-                        .with_external_tools(&ports.external_tool_bindings);
+                        .with_external_tools(&ports.external_tool_bindings)
+                        .with_workspace_source(workspace_source);
                 match ports.agent_workspace_resources.as_deref() {
                     Some(resources) => {
                         Box::new(executor.with_resources(resources)?) as Box<dyn ToolExecutor>
@@ -251,6 +268,7 @@ impl<Sql: DoSql + 'static> DurableInstance<Sql> {
             agent_model: ports.agent_model,
             agent_tools,
             agent_workspace_resources: ports.agent_workspace_resources,
+            initial_model_provenance: ports.initial_model_provenance,
             agent_tool_specs: ports.agent_tool_specs,
             exec: ports.exec,
             turn: ports.turn,
@@ -573,6 +591,7 @@ impl<Sql: DoSql + 'static> DurableInstance<Sql> {
                 .agent_tools
                 .unwrap_or_else(|| Box::new(crate::do_tools::DoToolExecutor::new(Rc::clone(&sql)))),
             agent_workspace_resources: ports.agent_workspace_resources,
+            initial_model_provenance: ports.initial_model_provenance,
             agent_tool_specs: ports.agent_tool_specs,
             exec: ports.exec,
             turn: ports.turn,
@@ -691,6 +710,7 @@ impl<Sql: DoSql + 'static> DurableInstance<Sql> {
             agent_model: self.agent_model.as_deref(),
             agent_tools: self.agent_tools.as_ref(),
             agent_workspace_resources: self.agent_workspace_resources.as_deref(),
+            initial_model_provenance: self.initial_model_provenance.as_ref(),
             agent_tool_specs: self.agent_tool_specs.as_deref(),
             exec: self.exec.as_ref(),
             turn: self.turn.as_ref(),

@@ -1447,6 +1447,20 @@ fn parse_coerce_config(json: &str) -> Result<ResolvedCoercionConfig, String> {
 /// WhippleScript derives the provider-required finite request value from the
 /// selected model's output capability; the host does not impose a product limit.
 /// The client is transport-free: the shell performs each round's `fetch`.
+fn parse_initial_model_provenance(
+    json: &str,
+) -> Result<Option<whipplescript_kernel::sansio::InitialModelProvenance>, String> {
+    let value: serde_json::Value =
+        serde_json::from_str(json).map_err(|error| format!("invalid agent config: {error}"))?;
+    value
+        .get("initial_model_provenance")
+        .map(|labels| {
+            serde_json::from_value(labels.clone())
+                .map_err(|error| format!("invalid initial model provenance: {error}"))
+        })
+        .transpose()
+}
+
 fn parse_agent_config(json: &str) -> Result<MessagesApiClient, String> {
     let value: serde_json::Value = serde_json::from_str(json).map_err(|error| error.to_string())?;
     let provider_id = value.get("provider").and_then(serde_json::Value::as_str);
@@ -1650,6 +1664,12 @@ impl WasmDurableInstance {
             .transpose()
             .map_err(|error| JsValue::from_str(&error))?
             .flatten();
+        let initial_model_provenance = agent_config_json
+            .as_deref()
+            .map(parse_initial_model_provenance)
+            .transpose()
+            .map_err(|error| JsValue::from_str(&error))?
+            .flatten();
         let agent_model: Option<Box<dyn whipplescript_kernel::harness_loop::HttpModelClient>> =
             match agent_config_json {
                 Some(config) => Some(Box::new(
@@ -1666,6 +1686,7 @@ impl WasmDurableInstance {
             DurableEffectPorts {
                 agent_model,
                 agent_workspace_resources,
+                initial_model_provenance,
                 agent_tool_specs: Some(resolved.tools),
                 external_tool_bindings: package.external_tool_bindings(),
                 agent_project_context: resolved.project_context,

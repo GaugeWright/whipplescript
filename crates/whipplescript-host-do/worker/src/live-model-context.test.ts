@@ -32,3 +32,19 @@ test("does not coalesce two isolated turns", () => {
   assert.equal(captures.read("one\0turn"), null);
   assert.deepEqual(captures.read("two\0turn")?.calls[0]?.body, { input: "two" });
 });
+
+test("only a fully labeled model call can claim complete provenance", () => {
+  const captures = new LiveModelContext();
+  const known = { source_handles: ["chat:one"], complete: true };
+  captures.record("one", { messages: ["first"] }, [], {
+    messages: [known], tools: { source_handles: ["package:one"], complete: true },
+  });
+  captures.record("one", { messages: ["second"] }, [], {
+    messages: [known, { source_handles: [], complete: false }], tools: known,
+  });
+  captures.record("one", { messages: ["third"] }, [], {
+    messages: [known], tools: { source_handles: [], complete: false },
+  });
+  assert.deepEqual(captures.read("one")?.calls.map((call) => call.provenance_complete),
+    [true, false, false]);
+});

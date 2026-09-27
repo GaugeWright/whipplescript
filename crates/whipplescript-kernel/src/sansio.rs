@@ -20,6 +20,7 @@ use serde_json::Value;
 /// Reader authority is a host concern. These labels describe where the
 /// provider-bound content came from; they never grant access by themselves.
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct ModelContentProvenance {
     pub source_handles: Vec<String>,
     pub complete: bool,
@@ -55,7 +56,8 @@ impl ModelContentProvenance {
 
 /// Host-supplied source identities for the distinct initial input planes.
 /// A host that cannot prove one plane leaves its default (unknown) value.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct InitialModelProvenance {
     pub system: ModelContentProvenance,
     pub user: ModelContentProvenance,
