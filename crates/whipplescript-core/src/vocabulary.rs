@@ -110,6 +110,28 @@ pub enum AdmissionPredicate {
         scope: String,
         witness: Witness,
     },
+    /// The arbiter's grant of an exclusive claim over a region (norm-plane
+    /// §7, R1): the authority's act, admitted only when no other unexpired
+    /// exclusive claim of the same vocabulary already in the target status
+    /// overlaps it, future members included. Only a transition may require it.
+    Arbitrated {
+        scope: String,
+        arbitration: Arbitration,
+    },
+}
+
+/// Where an arbitrated record keeps its region, its exclusivity and its expiry.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Arbitration {
+    /// A list-of-text field of path selectors.
+    pub selectors: String,
+    /// The field, and the value of it, that make a record exclusive.
+    pub mode: String,
+    pub exclusive: String,
+    /// A text field holding an RFC 3339 expiry, when claims expire.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires: Option<String>,
 }
 
 /// What must hold in the ledger for a witnessed transition: a live relation of
@@ -211,6 +233,16 @@ impl Vocabulary {
                 AdmissionPredicate::Public {} => {}
                 AdmissionPredicate::Authority { scope } => {
                     nonempty(scope, &format!("{path}.admission.scope"))?;
+                }
+                AdmissionPredicate::Arbitrated { scope, arbitration } => {
+                    nonempty(scope, &format!("{path}.admission.scope"))?;
+                    for (field, value) in [
+                        ("selectors", &arbitration.selectors),
+                        ("mode", &arbitration.mode),
+                        ("exclusive", &arbitration.exclusive),
+                    ] {
+                        nonempty(value, &format!("{path}.admission.arbitration.{field}"))?;
+                    }
                 }
                 AdmissionPredicate::Witnessed { scope, witness } => {
                     nonempty(scope, &format!("{path}.admission.scope"))?;

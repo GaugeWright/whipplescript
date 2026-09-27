@@ -1584,8 +1584,10 @@ export class WorkflowInstance implements DurableObject {
           }
           // A promotion's gate plans exactly what an impact query would.
           const door = url.pathname === "/host/norm/impacts" ? "impact" : "admission";
+          const now = new Date();
           const deployment = JSON.stringify({ planning, runtime, image_binding, deployed_image,
-            time_basis: `hosted-${door}/${Date.now()}/${crypto.randomUUID()}` });
+            time_basis: `hosted-${door}/${now.getTime()}/${crypto.randomUUID()}`,
+            now: now.toISOString() });
           const answer = url.pathname === "/host/norm/impacts"
             ? hostFunctions.host_norm_impact(makeBridge(this.ctx.storage), trust, body, deployment)
             : hostFunctions.host_norm_promotion(makeBridge(this.ctx.storage), trust, body, deployment);

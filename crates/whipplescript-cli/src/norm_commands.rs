@@ -836,8 +836,10 @@ pub(crate) fn with_mainline_admission<T>(
             .map_err(Clone::clone)
             .and_then(|host| host.installed.validate_for(selected).map_err(debug_error))
     };
+    let now = super::now_stamp();
     let host = (|| {
         Ok(AdmissionHost {
+            now: Some(&now),
             verifier: verifier.as_ref().map_err(Clone::clone)?,
             configuration: configuration.as_ref().map_err(Clone::clone)?,
             runtime: runtime.as_ref().map_err(Clone::clone)?,

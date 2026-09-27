@@ -1,0 +1,107 @@
+--- norm-plane §7 and slice R1: reservations over regions, extending what
+--- `tracker-lease` pins for issues (exclusivity, expiry) and what
+--- `tracker-lease-merge` pins for merged claims (both survive) to regions with
+--- future members and to a fenced token checked at a door.
+---
+--- Regions: `tree` is the subtree src/**, `future` a file under it that does
+--- not exist yet, `docs` a disjoint subtree. Overlap counts future members, so
+--- `tree` and `future` overlap although no file is in both today.
+---
+--- The arbiter grants an exclusive claim only when no other unexpired exclusive
+--- grant overlaps it; an expiry is an explicit clock input. Offline claims are
+--- speculative: a merge keeps both of two overlapping ones and surfaces a
+--- conflict naming them, and neither silently wins. A door admits a change to a
+--- region only under the current, unexpired grant's token.
+mod REGION-RESERVATION is
+  protecting NAT .
+  sorts Region Actor Grant Fact Cfg State .
+  ops tree future docs : -> Region [ctor] .
+  ops w1 w2 : -> Actor [ctor] .
+  --- A claim's standing: speculative, or granted with an expiry time.
+  op speculative : -> Grant [ctor] .
+  op granted : Nat -> Grant [ctor] .
+  subsort Fact < Cfg .
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+  op {_} : Cfg -> State [ctor] .
+  --- claim(token, region, holder, standing): tokens are monotonic.
+  op claim : Nat Region Actor Grant -> Fact [ctor] .
+  op clock : Nat -> Fact [ctor] .
+  --- A request the arbiter answers, and an offline peer's claim to merge.
+  op request : Nat Region Actor -> Fact [ctor] .
+  op offline : Nat Region Actor -> Fact [ctor] .
+  --- A door publication under a token, and what the door did with it.
+  op publish : Actor Nat Region -> Fact [ctor] .
+  op admitted : Actor Nat -> Fact [ctor] .
+  op conflict : Nat Nat -> Fact [ctor] .
+  vars N M E E2 T : Nat . vars R R2 : Region . vars A A2 : Actor .
+  var C : Cfg . var G G2 : Grant .
+
+  op overlap : Region Region -> Bool [comm] .
+  eq overlap(R, R) = true .
+  eq overlap(tree, future) = true .
+  eq overlap(tree, docs) = false .
+  eq overlap(future, docs) = false .
+
+  --- Is there an unexpired exclusive grant other than token N overlapping R?
+  op blocked : Nat Region Nat Cfg -> Bool .
+  eq blocked(N, R, T, claim(M, R2, A, granted(E)) C) =
+    if M =/= N and overlap(R, R2) and T < E then true else blocked(N, R, T, C) fi .
+  eq blocked(N, R, T, C) = false [owise] .
+  --- The current grant for a region: the unexpired one with the largest token.
+  op current : Nat Region Nat Cfg -> Bool .
+  eq current(N, R, T, claim(N, R2, A, granted(E)) C) =
+    overlap(R, R2) and T < E and not newer(N, R, T, C) .
+  eq current(N, R, T, C) = false [owise] .
+  op newer : Nat Region Nat Cfg -> Bool .
+  eq newer(N, R, T, claim(M, R2, A, granted(E)) C) =
+    if M > N and overlap(R, R2) and T < E then true else newer(N, R, T, C) fi .
+  eq newer(N, R, T, C) = false [owise] .
+  --- Do two unexpired exclusive grants overlap? (the arbiter's bad state)
+  op doubled : Nat Cfg -> Bool .
+  eq doubled(T, claim(N, R, A, granted(E)) claim(M, R2, A2, granted(E2)) C) =
+    if overlap(R, R2) and T < E and T < E2 then true else doubled(T, C) fi .
+  eq doubled(T, C) = false [owise] .
+  op speculativeCount : Cfg -> Nat .
+  eq speculativeCount(claim(N, R, A, speculative) C) = s speculativeCount(C) .
+  eq speculativeCount(C) = 0 [owise] .
+
+  crl [grant] : { clock(T) request(N, R, A) C }
+    => { clock(T) claim(N, R, A, granted(T + 2)) C }
+    if not blocked(N, R, T, C) .
+  crl [tick] : { clock(T) C } => { clock(s T) C } if T < 3 .
+  --- A merge carries an offline claim in as speculative, and surfaces every
+  --- overlap it has with a claim already present.
+  rl [merge] : { offline(N, R, A) C } => { claim(N, R, A, speculative) C } .
+  crl [surface] : { claim(N, R, A, speculative) claim(M, R2, A2, G) C }
+    => { claim(N, R, A, speculative) claim(M, R2, A2, G) conflict(N, M) C }
+    if N =/= M /\ overlap(R, R2) /\ not hasConflict(N, M, C) .
+  op hasConflict : Nat Nat Cfg -> Bool .
+  eq hasConflict(N, M, conflict(N, M) C) = true .
+  eq hasConflict(N, M, conflict(M, N) C) = true .
+  eq hasConflict(N, M, C) = false [owise] .
+  crl [door] : { clock(T) publish(A, N, R) C } => { clock(T) admitted(A, N) C }
+    if current(N, R, T, C) .
+endm
+--- Resolving only today's members makes a grant of the subtree and one of a
+--- future file under it vacuously disjoint.
+mod REGION-RESERVATION-WEAK-TODAY is
+  including REGION-RESERVATION .
+  vars N T : Nat . var R : Region . var A : Actor . var C : Cfg .
+  rl [grant-today] : { clock(T) request(N, future, A) C }
+    => { clock(T) claim(N, future, A, granted(T + 2)) C } .
+endm
+--- A merge in which the later claim silently wins drops the earlier one.
+mod REGION-RESERVATION-WEAK-LAST-WRITER is
+  including REGION-RESERVATION .
+  vars N M : Nat . vars R R2 : Region . vars A A2 : Actor . var C : Cfg .
+  crl [last-writer] : { offline(N, R, A) claim(M, R2, A2, speculative) C }
+    => { claim(N, R, A, speculative) C } if overlap(R, R2) .
+endm
+--- A door that checks a token was ever granted, not that it is current.
+mod REGION-RESERVATION-WEAK-UNFENCED is
+  including REGION-RESERVATION .
+  vars N E T : Nat . vars R R2 : Region . vars A A2 : Actor . var C : Cfg .
+  rl [ever-granted] : { clock(T) publish(A, N, R) claim(N, R2, A2, granted(E)) C }
+    => { clock(T) admitted(A, N) claim(N, R2, A2, granted(E)) C } .
+endm

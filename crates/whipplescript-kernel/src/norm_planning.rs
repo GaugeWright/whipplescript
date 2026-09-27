@@ -51,6 +51,8 @@ pub struct Planned {
     pub method_gaps: BTreeMap<String, Vec<MethodGap>>,
     /// Each witnessed record's derived current conformance at the candidate.
     pub conformance: Vec<Conformance>,
+    /// Conflicts among live claims at the after frontier (norm-plane §7).
+    pub reservation_conflicts: Vec<whipplescript_store::norm_reservations::ReservationConflict>,
 }
 
 /// A witnessed record's derived current conformance (norm-plane §6, D1): the
@@ -140,6 +142,7 @@ impl Planned {
             "plan": self.plan,
             "method_gaps": self.method_gaps,
             "conformance": self.conformance,
+            "reservation_conflicts": self.reservation_conflicts,
         })
     }
 }
@@ -300,6 +303,7 @@ pub fn plan<S: RuntimeStore>(
     )
     .map_err(|error| format!("{error:?}"))?;
     let conformance = conformance(&after, &plan);
+    let reservation_conflicts = after.reservation_conflicts();
     Ok(Planned {
         anchor: history.anchor(),
         before_frontier: before.frontier,
@@ -307,6 +311,7 @@ pub fn plan<S: RuntimeStore>(
         plan,
         method_gaps: method_gaps.into_inner(),
         conformance,
+        reservation_conflicts,
     })
 }
 

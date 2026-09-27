@@ -84,6 +84,7 @@ fn the_gate_admits_what_is_supported_and_refuses_what_changed_or_is_not() {
     let verify = |_: &PythonRuntime| Ok(());
     let host = || {
         Ok(AdmissionHost {
+            now: None,
             verifier: &Boundary,
             configuration: &configuration,
             runtime: &runtime,

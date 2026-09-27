@@ -765,6 +765,13 @@
                 "speculative"
               ]
             }
+          },
+          {
+            "name": "expires_at",
+            "required": false,
+            "value_type": {
+              "type": "text"
+            }
           }
         ],
         "status": {
@@ -782,8 +789,14 @@
               "from": "speculative",
               "to": "granted",
               "admission": {
-                "requires": "authority",
-                "scope": "reservation.grant"
+                "requires": "arbitrated",
+                "scope": "reservation.grant",
+                "arbitration": {
+                  "selectors": "selectors",
+                  "mode": "mode",
+                  "exclusive": "exclusive",
+                  "expires": "expires_at"
+                }
               }
             },
             {

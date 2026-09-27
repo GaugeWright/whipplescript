@@ -86,6 +86,10 @@ pub(super) struct Deployment {
     image_binding: String,
     pub(super) deployed_image: String,
     pub(super) time_basis: String,
+    /// The Worker's clock, RFC 3339, when it supplies one: a promotion judges
+    /// reservation expiry against it (norm-plane §7).
+    #[serde(default)]
+    pub(super) now: Option<String>,
 }
 
 impl Deployment {

@@ -2974,6 +2974,296 @@ mod tests {
         }
     }
 
+    /// An arbitrated grant is judged against its causal past: a claim created
+    /// concurrently with it — whichever way a replay orders the two — neither
+    /// refuses the grant on replay nor was judged by it.
+    #[test]
+    fn norm_arbitrated_history_replays_whatever_concurrent_claims_arrive() {
+        use whipplescript_store::norm_commands::NormCommandStore;
+        let charter: NormCharter = serde_json::from_str(include_str!(
+            "../../../examples/authorization-demo/charter.json"
+        ))
+        .expect("C0 is a charter");
+        let keys = Keys::new();
+        let reservation = Vocabulary::new(
+            charter
+                .vocabularies
+                .iter()
+                .find(|entry| entry.definition.name == "reservation")
+                .expect("declared")
+                .definition
+                .clone(),
+        )
+        .unwrap()
+        .reference()
+        .clone();
+        for round in 0..8 {
+            let mut store = WorkItemStore::open_in_memory().unwrap();
+            let ledger = store
+                .append_norm_event(
+                    &keys.sign(
+                        "owner",
+                        &format!("arbitrated-{round}"),
+                        NormAct::Bootstrap {
+                            creator: "worker".into(),
+                            charter: charter.clone(),
+                        },
+                    ),
+                    &keys,
+                )
+                .unwrap();
+            let claim = |nonce: &str, selectors: &[&str]| {
+                keys.sign(
+                    "worker",
+                    &format!("{nonce}-{round}"),
+                    NormAct::Create {
+                        ledger: ledger.clone(),
+                        authority: None,
+                        vocabulary: reservation.clone(),
+                        fields_json:
+                            json!({"purpose": nonce, "selectors": selectors, "mode": "exclusive"})
+                                .to_string(),
+                    },
+                )
+            };
+            let tree = store
+                .append_norm_event(&claim("tree", &["src/**"]), &keys)
+                .unwrap();
+            let grant = keys.sign(
+                "owner",
+                &format!("grant-{round}"),
+                NormAct::Transition {
+                    ledger: ledger.clone(),
+                    authority: None,
+                    vocabulary: reservation.clone(),
+                    record: tree.clone(),
+                    previous: tree.clone(),
+                    status: "granted".into(),
+                },
+            );
+            store.append_norm_event(&grant, &keys).unwrap();
+            // Concurrent with the grant: its parents do not include it.
+            let future = store
+                .append_norm_event(&claim("future", &["src/new.py"]), &keys)
+                .unwrap();
+            let view = store.norm_state(&keys).unwrap();
+            assert_eq!(view.records[&tree].status, "granted", "round {round}");
+            assert_eq!(view.records[&future].status, "speculative", "round {round}");
+        }
+    }
+
+    /// R1 (norm-plane §7): the arbiter grants an exclusive claim only when no
+    /// unexpired exclusive grant overlaps it — a file that does not exist yet
+    /// under a granted subtree included — and the grant binds the current head
+    /// of every overlapping claim it judged, so a replay sees what the arbiter
+    /// saw. Two offline clones' overlapping speculative claims both survive a
+    /// merge, with a conflict naming both holders.
+    #[test]
+    fn norm_reservations_are_arbitrated_over_regions_and_merged_claims_conflict() {
+        use whipplescript_store::norm_commands::NormCommandStore;
+        let charter: NormCharter = serde_json::from_str(include_str!(
+            "../../../examples/authorization-demo/charter.json"
+        ))
+        .expect("C0 is a charter");
+        let keys = Keys::new();
+        let mut store = WorkItemStore::open_in_memory().unwrap();
+        let ledger = store
+            .append_norm_event(
+                &keys.sign(
+                    "owner",
+                    "r1",
+                    NormAct::Bootstrap {
+                        creator: "worker".into(),
+                        charter: charter.clone(),
+                    },
+                ),
+                &keys,
+            )
+            .unwrap();
+        let reservation = Vocabulary::new(
+            charter
+                .vocabularies
+                .iter()
+                .find(|entry| entry.definition.name == "reservation")
+                .expect("C0 declares reservation")
+                .definition
+                .clone(),
+        )
+        .unwrap()
+        .reference()
+        .clone();
+        let view = |store: &WorkItemStore| store.norm_state(&keys).unwrap();
+        let refused = |result: Result<String, StoreError>, needle: &str| {
+            let message = format!("{:?}", result.expect_err("refusal expected"));
+            assert!(message.contains(needle), "{message}");
+        };
+        let claim = |nonce: &str, selectors: &[&str], expires: Option<&str>| {
+            let mut fields = json!({"purpose": nonce, "selectors": selectors, "mode": "exclusive"});
+            if let Some(expires) = expires {
+                fields["expires_at"] = json!(expires);
+            }
+            keys.sign(
+                "worker",
+                nonce,
+                NormAct::Create {
+                    ledger: ledger.clone(),
+                    authority: None,
+                    vocabulary: reservation.clone(),
+                    fields_json: fields.to_string(),
+                },
+            )
+        };
+        let overlapping_heads = |store: &WorkItemStore, record: &str| -> Vec<String> {
+            let view = view(store);
+            let selectors = |id: &str| -> Vec<String> {
+                serde_json::from_value(view.records[id].fields["selectors"].clone()).unwrap()
+            };
+            let mine = selectors(record);
+            view.records
+                .values()
+                .filter(|other| {
+                    other.id != record
+                        && other.vocabulary == reservation
+                        && other.fields["mode"] == "exclusive"
+                        && whipplescript_store::norm_reservations::claims_overlap(
+                            &mine,
+                            &selectors(&other.id),
+                        )
+                })
+                .map(|other| other.head.clone())
+                .collect()
+        };
+        let grant_with =
+            |store: &WorkItemStore, nonce: &str, record: &str, references: Vec<String>| {
+                keys.sign_with(
+                    "owner",
+                    nonce,
+                    NormAct::Transition {
+                        ledger: ledger.clone(),
+                        authority: None,
+                        vocabulary: reservation.clone(),
+                        record: record.into(),
+                        previous: view(store).records[record].head.clone(),
+                        status: "granted".into(),
+                    },
+                    Some(NormPremises {
+                        family_basis: None,
+                        references,
+                        inventory_frontier: Vec::new(),
+                    }),
+                )
+            };
+        let grant = |store: &WorkItemStore, nonce: &str, record: &str| {
+            grant_with(store, nonce, record, overlapping_heads(store, record))
+        };
+
+        let tree = store
+            .append_norm_event(&claim("tree", &["src/**"], None), &keys)
+            .unwrap();
+        store
+            .append_norm_event(&grant(&store, "grant-tree", &tree), &keys)
+            .unwrap();
+        assert_eq!(view(&store).records[&tree].status, "granted");
+        // A file that does not exist yet under the granted subtree overlaps it.
+        let future = store
+            .append_norm_event(&claim("future", &["src/new.py"], None), &keys)
+            .unwrap();
+        refused(
+            store.append_norm_event(&grant(&store, "grant-future", &future), &keys),
+            &format!("an exclusive grant would overlap {tree}, which is granted and unexpired"),
+        );
+        // A disjoint region is granted alongside.
+        let docs = store
+            .append_norm_event(&claim("docs", &["docs/**"], None), &keys)
+            .unwrap();
+        store
+            .append_norm_event(&grant(&store, "grant-docs", &docs), &keys)
+            .unwrap();
+        // A grant whose expiry has passed by the granting act's time no longer
+        // blocks; one that overlaps it must still bind its current head, so an
+        // unbound or superseded head is refused.
+        let lapsed = store
+            .append_norm_event(
+                &claim("lapsed", &["config/**"], Some("2026-01-01T00:00:00Z")),
+                &keys,
+            )
+            .unwrap();
+        store
+            .append_norm_event(&grant(&store, "grant-lapsed", &lapsed), &keys)
+            .unwrap();
+        let after = store
+            .append_norm_event(
+                &claim("after", &["config/app.toml"], Some("2030-01-01T00:00:00Z")),
+                &keys,
+            )
+            .unwrap();
+        refused(
+            store.append_norm_event(
+                &grant_with(&store, "after-unbound", &after, Vec::new()),
+                &keys,
+            ),
+            &format!("an arbitrated grant must bind the current head of every overlapping claim it judged; {lapsed} is not bound"),
+        );
+        refused(
+            store.append_norm_event(
+                &grant_with(&store, "after-stale", &after, vec![lapsed.clone()]),
+                &keys,
+            ),
+            &format!("{lapsed} is not bound"),
+        );
+        store
+            .append_norm_event(&grant(&store, "grant-after", &after), &keys)
+            .unwrap();
+        let blocked = store
+            .append_norm_event(&claim("blocked", &["config/**"], None), &keys)
+            .unwrap();
+        refused(
+            store.append_norm_event(&grant(&store, "grant-blocked", &blocked), &keys),
+            &format!("an exclusive grant would overlap {after}, which is granted and unexpired"),
+        );
+        // A speculative claim is not a grant: the refused `future` claim still
+        // stands, and it conflicts with the grant it overlaps.
+        assert!(view(&store)
+            .reservation_conflicts()
+            .iter()
+            .any(|conflict| conflict.claims.contains(&tree) && conflict.claims.contains(&future)));
+
+        // Two offline clones each claim the same future file; merged, both
+        // claims survive and the conflict names both holders.
+        let base = store.export_events().unwrap();
+        let clone = |nonce: &str, selectors: &[&str]| {
+            let mut clone = WorkItemStore::open_in_memory().unwrap();
+            clone.pin_norm_ledger(&ledger).unwrap();
+            clone.import_norm_events(&base, &keys).unwrap();
+            let id = clone
+                .append_norm_event(&claim(nonce, selectors, None), &keys)
+                .unwrap();
+            (id, clone.export_events().unwrap())
+        };
+        let (left, left_events) = clone("left", &["checks/q1.py"]);
+        let (right, right_events) = clone("right", &["checks/**"]);
+        store.import_norm_events(&left_events, &keys).unwrap();
+        store.import_norm_events(&right_events, &keys).unwrap();
+        let merged = view(&store);
+        assert_eq!(merged.records[&left].status, "speculative");
+        assert_eq!(merged.records[&right].status, "speculative");
+        let conflict = merged
+            .reservation_conflicts()
+            .into_iter()
+            .find(|conflict| conflict.claims.contains(&left) && conflict.claims.contains(&right))
+            .expect("the merged overlap is a conflict");
+        assert_eq!(conflict.holders, ["worker".to_owned(), "worker".to_owned()]);
+        assert_eq!(
+            conflict.statuses,
+            ["speculative".to_owned(), "speculative".to_owned()]
+        );
+        assert!(merged
+            .reservations_view()
+            .conflicts
+            .iter()
+            .any(|conflict| conflict.claims.contains(&left) && conflict.claims.contains(&right)));
+    }
+
     /// A charter's witnesses are validated with it: only a status transition
     /// of a record that is not itself a relation may require one, and it names
     /// relation families the charter declares.
@@ -3059,6 +3349,51 @@ mod tests {
         empty.vocabularies[decision].definition.status.transitions[folded].admission =
             witnessed(" ");
         refused(empty, "admission.witness.family");
+
+        // An arbitration is validated with its charter the same way.
+        use whipplescript_core::vocabulary::Arbitration;
+        let demo: NormCharter = serde_json::from_str(include_str!(
+            "../../../examples/authorization-demo/charter.json"
+        ))
+        .expect("C0 is a charter");
+        assert!(bootstrap(demo.clone()).is_ok());
+        let arbitrated = |selectors: &str| AdmissionPredicate::Arbitrated {
+            scope: "reservation.grant".into(),
+            arbitration: Arbitration {
+                selectors: selectors.into(),
+                mode: "mode".into(),
+                exclusive: "exclusive".into(),
+                expires: Some("expires_at".into()),
+            },
+        };
+        let reservation = |charter: &mut NormCharter| named(charter, "reservation");
+        let granted = |charter: &NormCharter, index: usize| {
+            charter.vocabularies[index]
+                .definition
+                .status
+                .transitions
+                .iter()
+                .position(|rule| rule.to == "granted")
+                .expect("granting")
+        };
+        let mut creation = demo.clone();
+        let index = reservation(&mut creation);
+        creation.vocabularies[index].creation = arbitrated("selectors");
+        refused(creation, "only a status transition may be arbitrated");
+        let mut undeclared = demo.clone();
+        let index = reservation(&mut undeclared);
+        let rule = granted(&undeclared, index);
+        undeclared.vocabularies[index].definition.status.transitions[rule].admission =
+            arbitrated("regions");
+        refused(
+            undeclared,
+            "an arbitration names a field its vocabulary does not declare",
+        );
+        let mut empty = demo;
+        let index = reservation(&mut empty);
+        let rule = granted(&empty, index);
+        empty.vocabularies[index].definition.status.transitions[rule].admission = arbitrated("");
+        refused(empty, "admission.arbitration.selectors");
     }
 
     /// D1 (norm-plane §6): a decision folds and is implemented only on the

@@ -93,6 +93,19 @@ that reaches them: an anchor edit counted as folding, a proposed successor
 superseding, staleness erasing the implementation event, and an edit keeping
 the old acceptance.
 
+`region-reservation.maude` extends what `tracker-lease` and
+`tracker-lease-merge` pin for issues to reservations over regions (norm-plane
+§7, slice R1). Overlap counts future members, so a subtree and a file that
+does not exist yet under it overlap. The arbiter grants an exclusive claim
+only when no other unexpired exclusive grant overlaps it, with expiry an
+explicit clock input. A merge carries offline claims in as speculative,
+keeps both of two overlapping ones, and surfaces a conflict naming them. A
+door admits a change only under the current, unexpired grant's token.
+Thirteen searches, four refusals, each with the weakening that reaches it:
+resolving only today's members, which both doubles a grant and grants before
+expiry; a later-writer merge dropping a claim; and an unfenced door
+admitting a superseded token.
+
 `action-classification.maude` models DR-0124 §14.2: an action's
 classification joins its declared label with every influence that shaped
 it — a declared input, a presence observation, an observation of absence —

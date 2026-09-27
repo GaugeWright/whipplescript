@@ -1,0 +1,25 @@
+load ../region-reservation.maude
+--- The arbiter grants an exclusive claim on a free region.
+search [1] in REGION-RESERVATION : { clock(0) request(1, tree, w1) } =>* { claim(1, tree, w1, granted(2)) C:Cfg } .
+--- Two unexpired overlapping grants never coexist, future members included;
+--- resolving only today's members admits both.
+search in REGION-RESERVATION : { clock(0) request(1, tree, w1) request(2, future, w2) } =>* { clock(T:Nat) C:Cfg } such that doubled(T:Nat, C:Cfg) .
+search [1] in REGION-RESERVATION-WEAK-TODAY : { clock(0) request(1, tree, w1) request(2, future, w2) } =>* { clock(T:Nat) C:Cfg } such that doubled(T:Nat, C:Cfg) .
+--- An overlapping request waits for the live grant's expiry on the clock: it
+--- is granted only at or after time 2, never before.
+search [1] in REGION-RESERVATION : { clock(0) claim(1, tree, w1, granted(2)) request(2, future, w2) } =>* { claim(2, future, w2, granted(E:Nat)) C:Cfg } such that E:Nat >= 4 .
+search in REGION-RESERVATION : { clock(0) claim(1, tree, w1, granted(2)) request(2, future, w2) } =>* { claim(2, future, w2, granted(E:Nat)) C:Cfg } such that E:Nat < 4 .
+search [1] in REGION-RESERVATION-WEAK-TODAY : { clock(0) claim(1, tree, w1, granted(2)) request(2, future, w2) } =>* { claim(2, future, w2, granted(E:Nat)) C:Cfg } such that E:Nat < 4 .
+--- A disjoint region is granted alongside.
+search [1] in REGION-RESERVATION : { clock(0) request(1, tree, w1) request(2, docs, w2) } =>* { clock(0) claim(1, tree, w1, granted(2)) claim(2, docs, w2, granted(2)) } .
+--- Two peers' offline claims on one future file both survive the merge with a
+--- conflict naming both; a later-writer merge drops one.
+search [1] in REGION-RESERVATION : { clock(0) offline(1, future, w1) offline(2, future, w2) } =>* { claim(1, future, w1, speculative) claim(2, future, w2, speculative) conflict(N:Nat, M:Nat) C:Cfg } .
+search in REGION-RESERVATION : { clock(0) offline(1, future, w1) offline(2, future, w2) } =>! { C:Cfg } such that speculativeCount(C:Cfg) < 2 .
+search [1] in REGION-RESERVATION-WEAK-LAST-WRITER : { clock(0) offline(1, future, w1) offline(2, future, w2) } =>! { C:Cfg } such that speculativeCount(C:Cfg) < 2 .
+--- The door admits the current token.
+search [1] in REGION-RESERVATION : { clock(0) claim(1, tree, w1, granted(2)) publish(w1, 1, future) } =>* { admitted(w1, 1) C:Cfg } .
+--- An expired or superseded token never publishes; an unfenced door admits it.
+search in REGION-RESERVATION : { clock(2) claim(1, tree, w1, granted(2)) claim(2, tree, w2, granted(4)) publish(w1, 1, future) } =>* { admitted(w1, 1) C:Cfg } .
+search [1] in REGION-RESERVATION-WEAK-UNFENCED : { clock(2) claim(1, tree, w1, granted(2)) claim(2, tree, w2, granted(4)) publish(w1, 1, future) } =>* { admitted(w1, 1) C:Cfg } .
+quit

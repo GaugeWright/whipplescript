@@ -185,6 +185,9 @@ pub struct NormSnapshot {
     /// within its scope. Never inferred from the members.
     #[serde(default)]
     pub manifests: BTreeMap<String, crate::norm_manifests::ManifestJudgment>,
+    /// The conflicts among live claims (norm-plane §7, R1).
+    #[serde(default)]
+    pub reservations: crate::norm_reservations::ReservationsView,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -269,6 +272,7 @@ impl<'a, S: NormCommandStore> NormCommandHost<'a, S> {
             });
         }
         Ok(NormSnapshot {
+            reservations: view.reservations_view(),
             manifests: self.manifest_judgments(&view, None)?,
             families: view.relation_families()?,
             inventory: view.requirement_inventory()?,

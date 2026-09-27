@@ -293,3 +293,4 @@ action-classification.maude	SNSSSSSNSSNSSNS
 store-authorization.maude	SNSNSSSNSSNNS
 ledger-query.maude	SSNNSNNSSS
 decision-derivation.maude	SSSSNSNSNSNS
+region-reservation.maude	SNSSNSSSNSSNS

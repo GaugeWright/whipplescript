@@ -9,8 +9,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use whipplescript_core::vocabulary::{
-    AdmissionPredicate, ReferenceForm, ValueType, Vocabulary, VocabularyDefinition, VocabularyRef,
-    VocabularyRegistry, Witness, WitnessSide,
+    AdmissionPredicate, Arbitration, ReferenceForm, ValueType, Vocabulary, VocabularyDefinition,
+    VocabularyRef, VocabularyRegistry, Witness, WitnessSide,
 };
 
 use crate::norm_correspondence::CorrespondenceDeclaration;
@@ -534,7 +534,8 @@ fn registry_for(charter: &NormCharter) -> StoreResult<VocabularyRegistry> {
             )
         {
             if let AdmissionPredicate::Authority { scope }
-            | AdmissionPredicate::Witnessed { scope, .. } = predicate
+            | AdmissionPredicate::Witnessed { scope, .. }
+            | AdmissionPredicate::Arbitrated { scope, .. } = predicate
             {
                 if !scopes.contains(scope) {
                     return Err(refused(
@@ -548,6 +549,30 @@ fn registry_for(charter: &NormCharter) -> StoreResult<VocabularyRegistry> {
         for predicate in std::iter::once(&entry.creation).chain(entry.editing.iter()) {
             if matches!(predicate, AdmissionPredicate::Witnessed { .. }) {
                 return Err(refused("only a status transition may require a witness"));
+            }
+            if matches!(predicate, AdmissionPredicate::Arbitrated { .. }) {
+                return Err(refused("only a status transition may be arbitrated"));
+            }
+        }
+        for rule in &entry.definition.status.transitions {
+            if let AdmissionPredicate::Arbitrated { arbitration, .. } = &rule.admission {
+                let declared = |name: &str| {
+                    entry
+                        .definition
+                        .fields
+                        .iter()
+                        .any(|field| field.name == name)
+                };
+                let named = [&arbitration.selectors, &arbitration.mode]
+                    .into_iter()
+                    .chain(&arbitration.expires);
+                for field in named {
+                    if !declared(field) {
+                        return Err(refused(
+                            "an arbitration names a field its vocabulary does not declare",
+                        ));
+                    }
+                }
             }
         }
         let families: BTreeSet<&str> = charter
@@ -651,7 +676,8 @@ impl NormView {
         let permitted = match predicate {
             AdmissionPredicate::Public {} => true,
             AdmissionPredicate::Authority { scope }
-            | AdmissionPredicate::Witnessed { scope, .. } => {
+            | AdmissionPredicate::Witnessed { scope, .. }
+            | AdmissionPredicate::Arbitrated { scope, .. } => {
                 actor == &self.owner && self.charter.owner_scopes.contains(scope)
             }
         };
@@ -802,6 +828,15 @@ impl NormView {
                     // validated so), so its premises bind the witness instead.
                     let lens = self.causal_lens(&event.parents);
                     self.witness_evidence(witness, current, &lens)?;
+                } else if let AdmissionPredicate::Arbitrated { arbitration, .. } = predicate {
+                    let lens = self.causal_lens(&event.parents);
+                    self.check_arbitration(
+                        arbitration,
+                        current,
+                        &status,
+                        &statement.created_at,
+                        &lens,
+                    )?;
                 } else {
                     self.check_relation_act(
                         Some(&record),
@@ -1133,7 +1168,188 @@ impl NormView {
         if let AdmissionPredicate::Witnessed { witness, .. } = predicate {
             self.check_witness_binding(witness, current, statement.premises.as_ref())?;
         }
+        if let AdmissionPredicate::Arbitrated { arbitration, .. } = predicate {
+            // The arbiter judges everything the ledger holds now — a grant the
+            // grant has not bound is still a grant — and then asks the grant
+            // to bind what it judged, so its replay judges the same claims.
+            let lens = self.current_lens();
+            self.check_arbitration(arbitration, current, &status, &statement.created_at, &lens)?;
+            self.check_arbitration_binding(arbitration, current, statement.premises.as_ref())?;
+        }
+
         Ok(())
+    }
+
+    /// The exclusive claims of a record's vocabulary, other than the record,
+    /// whose regions overlap its region, future members included.
+    fn overlapping_claims<'a>(
+        arbitration: &Arbitration,
+        record: &NormRecord,
+        records: &[&'a NormRecord],
+    ) -> Vec<&'a NormRecord> {
+        let selectors = |claim: &NormRecord| -> Vec<String> {
+            claim.fields[&arbitration.selectors]
+                .as_array()
+                .map(|selectors| {
+                    selectors
+                        .iter()
+                        .filter_map(|selector| selector.as_str().map(str::to_owned))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let mine = selectors(record);
+        records
+            .iter()
+            .copied()
+            .filter(|other| {
+                other.id != record.id
+                    && other.vocabulary == record.vocabulary
+                    && other.fields[&arbitration.mode] == arbitration.exclusive
+                    && crate::norm_reservations::claims_overlap(&mine, &selectors(other))
+            })
+            .collect()
+    }
+
+    /// The arbiter's grant (norm-plane §7, R1): an exclusive claim is granted
+    /// only when no other exclusive claim of its vocabulary, already in the
+    /// target status and unexpired at the granting act's time, overlaps it,
+    /// future members included. It is judged against the grant's causal past,
+    /// so a replay gives the verdict the arbiter gave.
+    fn check_arbitration(
+        &self,
+        arbitration: &Arbitration,
+        record: &NormRecord,
+        status: &str,
+        at: &str,
+        lens: &Lens<'_>,
+    ) -> StoreResult<()> {
+        if record.fields[&arbitration.mode] != arbitration.exclusive {
+            return Ok(());
+        }
+        let unexpired = |claim: &NormRecord| {
+            arbitration
+                .expires
+                .as_ref()
+                .and_then(|field| claim.fields[field].as_str())
+                .is_none_or(|expires| !crate::norm_reservations::lapsed(expires, at))
+        };
+        if let Some(held) = Self::overlapping_claims(arbitration, record, &lens.records)
+            .into_iter()
+            .find(|other| other.status == status && unexpired(other))
+        {
+            return Err(refused(format!(
+                "an exclusive grant would overlap {}, which is {status} and unexpired",
+                held.id
+            )));
+        }
+        Ok(())
+    }
+
+    /// What an arbitrated grant must bind when it is appended: the current head
+    /// of every overlapping exclusive claim that has left its initial status,
+    /// so everything the arbiter judged is in the grant's causal past.
+    fn check_arbitration_binding(
+        &self,
+        arbitration: &Arbitration,
+        record: &NormRecord,
+        premises: Option<&NormPremises>,
+    ) -> StoreResult<()> {
+        let Ok(definition) = self.registry.get(&record.vocabulary) else {
+            return Ok(());
+        };
+        let initial = &definition.definition().status.initial;
+        let references = premises
+            .map(|premises| premises.references.as_slice())
+            .unwrap_or(&[]);
+        let records: Vec<&NormRecord> = self.records.values().collect();
+        if let Some(unbound) = Self::overlapping_claims(arbitration, record, &records)
+            .into_iter()
+            .find(|other| &other.status != initial && !references.contains(&other.head))
+        {
+            return Err(refused(format!(
+                "an arbitrated grant must bind the current head of every overlapping claim it judged; {} is not bound",
+                unbound.id
+            )));
+        }
+        Ok(())
+    }
+
+    /// The snapshot's reservations: the conflicts among live claims.
+    pub fn reservations_view(&self) -> crate::norm_reservations::ReservationsView {
+        crate::norm_reservations::ReservationsView {
+            conflicts: self.reservation_conflicts(),
+        }
+    }
+
+    /// Every pair of live claims whose regions overlap, at least one of them
+    /// exclusive, in each vocabulary whose grant is arbitrated (norm-plane §7):
+    /// a merge keeps both, and the conflict names both holders. A claim is live
+    /// in its vocabulary's initial status and in an arbitrated status.
+    pub fn reservation_conflicts(&self) -> Vec<crate::norm_reservations::ReservationConflict> {
+        let holder = |id: &str| {
+            self.nonces
+                .iter()
+                .find(|(_, event)| event.as_str() == id)
+                .map(|((principal, _), _)| principal.clone())
+                .unwrap_or_default()
+        };
+        let mut conflicts = Vec::new();
+        for entry in &self.charter.vocabularies {
+            let Some((arbitration, granted)) =
+                entry
+                    .definition
+                    .status
+                    .transitions
+                    .iter()
+                    .find_map(|rule| match &rule.admission {
+                        AdmissionPredicate::Arbitrated { arbitration, .. } => {
+                            Some((arbitration, rule.to.clone()))
+                        }
+                        _ => None,
+                    })
+            else {
+                continue;
+            };
+            let initial = &entry.definition.status.initial;
+            let claims: Vec<(&NormRecord, Vec<String>, bool)> = self
+                .records
+                .values()
+                .filter(|record| {
+                    record.vocabulary.name == entry.definition.name
+                        && record.vocabulary.version == entry.definition.version
+                        && (&record.status == initial || record.status == granted)
+                })
+                .map(|record| {
+                    let selectors = record.fields[&arbitration.selectors]
+                        .as_array()
+                        .map(|selectors| {
+                            selectors
+                                .iter()
+                                .filter_map(|selector| selector.as_str().map(str::to_owned))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let exclusive = record.fields[&arbitration.mode] == arbitration.exclusive;
+                    (record, selectors, exclusive)
+                })
+                .collect();
+            for (index, (a, a_selectors, a_exclusive)) in claims.iter().enumerate() {
+                for (b, b_selectors, b_exclusive) in &claims[index + 1..] {
+                    if (*a_exclusive || *b_exclusive)
+                        && crate::norm_reservations::claims_overlap(a_selectors, b_selectors)
+                    {
+                        conflicts.push(crate::norm_reservations::ReservationConflict {
+                            claims: [a.id.clone(), b.id.clone()],
+                            holders: [holder(&a.id), holder(&b.id)],
+                            statuses: [a.status.clone(), b.status.clone()],
+                            selectors: [a_selectors.clone(), b_selectors.clone()],
+                        });
+                    }
+                }
+            }
+        }
+        conflicts
     }
 
     /// A witnessed transition's premise (norm-plane §6, D1): a live relation of

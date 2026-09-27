@@ -190,13 +190,9 @@ fn changed_paths(
 }
 
 /// Whether a reservation selector covers a path, future members included
-/// (norm-plane §7): `dir/**` is the subtree, `**` everything, and any other
-/// pattern the gate cannot resolve conservatively covers every path.
+/// (norm-plane §7) — the store's one definition, which its arbiter uses too.
 fn covers(selector: &str, path: &str) -> bool {
-    if let Some(root) = selector.strip_suffix("/**") {
-        return path == root || path.starts_with(&format!("{root}/"));
-    }
-    selector == path || selector.contains('*')
+    whipplescript_store::norm_reservations::selector_covers(selector, path)
 }
 
 /// The exclusive reservations a proposal's changes fall under (norm-plane
@@ -208,17 +204,62 @@ fn fence(
     reservations: &BTreeSet<whipplescript_core::vocabulary::VocabularyRef>,
     changed: &BTreeSet<String>,
     presented: &BTreeSet<String>,
+    now: Option<&str>,
 ) -> (BTreeMap<String, String>, BTreeMap<String, String>) {
+    use whipplescript_core::vocabulary::AdmissionPredicate;
     let mut fenced = BTreeMap::new();
     let mut unfenced = BTreeMap::new();
     for (id, record) in &view.records {
-        if !reservations.contains(&record.vocabulary)
-            || record.status != "granted"
-            || record.fields["mode"] != "exclusive"
-        {
+        if !reservations.contains(&record.vocabulary) {
             continue;
         }
-        let selectors: Vec<&str> = record.fields["selectors"]
+        // Where the claim keeps its region, exclusivity and expiry: its
+        // vocabulary's arbitration, or the bundled reservation's field names.
+        let arbitration =
+            view.charter
+                .vocabularies
+                .iter()
+                .find(|entry| {
+                    entry.definition.name == record.vocabulary.name
+                        && entry.definition.version == record.vocabulary.version
+                })
+                .and_then(|entry| {
+                    entry.definition.status.transitions.iter().find_map(|rule| {
+                        match &rule.admission {
+                            AdmissionPredicate::Arbitrated { arbitration, .. } => {
+                                Some(arbitration.clone())
+                            }
+                            _ => None,
+                        }
+                    })
+                });
+        let (selectors_field, mode_field, exclusive, expires_field) = match &arbitration {
+            Some(arbitration) => (
+                arbitration.selectors.as_str(),
+                arbitration.mode.as_str(),
+                arbitration.exclusive.as_str(),
+                arbitration.expires.as_deref(),
+            ),
+            None => ("selectors", "mode", "exclusive", None),
+        };
+        if record.status != "granted" || record.fields[mode_field] != exclusive {
+            continue;
+        }
+        // A grant whose expiry has passed on the host's clock fences nothing,
+        // so its token is stale; without a clock an expiring grant still fences.
+        let expired = match (
+            expires_field.and_then(|field| record.fields[field].as_str()),
+            now,
+        ) {
+            (Some(expires), Some(now)) => {
+                whipplescript_store::norm_reservations::lapsed(expires, now)
+            }
+            _ => false,
+        };
+        if expired {
+            continue;
+        }
+        let selectors: Vec<&str> = record.fields[selectors_field]
             .as_array()
             .map(|selectors| selectors.iter().filter_map(|s| s.as_str()).collect())
             .unwrap_or_default();
@@ -272,6 +313,9 @@ impl AdmissionLedger for WorkItemStore {
 
 /// What a host supplies to evaluate its gated requirements.
 pub struct AdmissionHost<'a, S: RuntimeStore> {
+    /// The host's clock, RFC 3339, against which a reservation's expiry is
+    /// judged; `None` when the host keeps none.
+    pub now: Option<&'a str>,
     pub verifier: &'a dyn NormVerifier,
     pub configuration: &'a PlanningConfiguration,
     pub runtime: &'a S,
@@ -409,6 +453,7 @@ impl<L: AdmissionLedger, S: RuntimeStore> MainlineGate for NormMainlineAdmission
             host.configuration.reservation_vocabularies(),
             &changed,
             &self.tokens,
+            host.now,
         );
         match judge(&planned) {
             Ok((requirements, evidence)) if unfenced.is_empty() => {

@@ -72,6 +72,7 @@ pub fn execute_installed_hosted_norm_promotion<Sql: DoSql + Clone>(
         let mut gate = NormMainlineAdmission::new(
             &ledger,
             Ok(AdmissionHost {
+                now: deployment.now.as_deref(),
                 verifier,
                 configuration: &planning,
                 runtime: &runtime,

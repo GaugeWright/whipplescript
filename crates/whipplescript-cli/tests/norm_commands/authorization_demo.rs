@@ -323,6 +323,14 @@ impl Hosted {
             "deployed_image": image,
             "image_binding": json!({"protocol":"whipplescript.exec.runtime-image/v1","image_id":image,"runtime":host.runtime}).to_string(),
             "time_basis": "hosted-demo",
+            // The Worker's clock, as `/host/norm/promotions` supplies it.
+            "now": format!(
+                "unix:{}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("clock")
+                    .as_secs()
+            ),
         })
         .to_string();
         whipplescript_host_do::do_branches::compose_vcs_shared(&sql)
@@ -395,10 +403,14 @@ impl Hosted {
     }
 
     fn promote(&self, promotion: &str, tokens: &[&str]) -> Value {
+        self.promote_stream("work", promotion, tokens)
+    }
+
+    fn promote_stream(&self, stream: &str, promotion: &str, tokens: &[&str]) -> Value {
         let answer = whipplescript_host_do::norm_commands::execute_installed_hosted_norm_promotion(
             &self.sql,
             &self.trust,
-            &json!({"protocol":"whipplescript.norm.promotion/v1","command":{"stream":"work","promotion":promotion,"tokens":tokens}}).to_string(),
+            &json!({"protocol":"whipplescript.norm.promotion/v1","command":{"stream":stream,"promotion":promotion,"tokens":tokens}}).to_string(),
             &self.deployment,
         )
         .expect("the hosted door answers");
@@ -509,7 +521,11 @@ fn conformance(planned: &Value, record: &str) -> (String, String) {
 }
 
 fn promote(fixture: &Fixture, host: &Host, tokens: &[&str]) -> Output {
-    let mut args = vec!["stream", "promote", "work"];
+    promote_stream(fixture, host, "work", tokens)
+}
+
+fn promote_stream(fixture: &Fixture, host: &Host, stream: &str, tokens: &[&str]) -> Output {
+    let mut args = vec!["stream", "promote", stream];
     for token in tokens {
         args.extend(["--token", token]);
     }
@@ -543,6 +559,12 @@ fn line_write(fixture: &Fixture, body: &str, cut: &str, at: &str) {
     .expect("workspace")
     .write("line-work", "src/parser.py", Some(body), cut, at)
     .expect("line write");
+}
+
+/// The current head of a record, which an arbitrated grant binds when it
+/// judged that claim.
+fn head(fixture: &Fixture, record: &str) -> String {
+    with_view(fixture, |_, view, _| view.records[record].head.clone())
 }
 
 fn snapshot(fixture: &Fixture, frontier: Option<&str>) -> Value {
@@ -940,8 +962,16 @@ fn the_authorization_demo_repairs_a_violated_requirement_under_a_current_token()
         .as_str()
         .expect("renewed claim")
         .to_owned();
-    let t2 = fixture.run(&["transition", &renewed, "granted", "--as", "owner"])["result"]
-        ["event_id"]
+    // T2's grant judged the expired first claim, so it binds that claim's head.
+    let t2 = fixture.run(&[
+        "transition",
+        &renewed,
+        "granted",
+        "--as",
+        "owner",
+        "--references",
+        &head(&fixture, &claim),
+    ])["result"]["event_id"]
         .as_str()
         .expect("T2")
         .to_owned();
@@ -989,6 +1019,92 @@ fn the_authorization_demo_repairs_a_violated_requirement_under_a_current_token()
         hosted.read(MAINLINE_BRANCH_ID, "src/parser.py").as_deref(),
         Some(REPAIRED)
     );
+
+    // R1 through the doors. A second exclusive claim on a file that does not
+    // exist yet under the granted `src/**` is refused at the arbiter, and the
+    // gate fences that nonexistent file's creation under T2 on both hosts. A
+    // grant whose expiry has passed on the host's clock fences nothing.
+    fixture.write(
+        "future.json",
+        &json!({"purpose": "add a parser test", "selectors": ["src/new.py"], "mode": "exclusive"}),
+    );
+    let future = fixture.run(&[
+        "create",
+        "reservation@1",
+        "--as",
+        "worker",
+        "--fields",
+        "future.json",
+    ])["result"]["event_id"]
+        .as_str()
+        .expect("future claim")
+        .to_owned();
+    let overlapping = fixture.refuse(&["transition", &future, "granted", "--as", "owner"]);
+    assert!(
+        String::from_utf8_lossy(&overlapping.stderr)
+            .contains(&format!("an exclusive grant would overlap {renewed}")),
+        "{}",
+        String::from_utf8_lossy(&overlapping.stderr)
+    );
+    fixture.write(
+        "lapsed.json",
+        &json!({"purpose": "old config work", "selectors": ["config/**"], "mode": "exclusive", "expires_at": "2020-01-01T00:00:00Z"}),
+    );
+    let lapsed = fixture.run(&[
+        "create",
+        "reservation@1",
+        "--as",
+        "worker",
+        "--fields",
+        "lapsed.json",
+    ])["result"]["event_id"]
+        .as_str()
+        .expect("lapsed claim")
+        .to_owned();
+    fixture.run(&["transition", &lapsed, "granted", "--as", "owner"]);
+    // The first stream was archived by its promotion; this work is a second.
+    let mut vcs = NativeWorkspaceVcs::open(
+        fixture.root.join("branches.sqlite"),
+        fixture.root.join("content.sqlite"),
+    )
+    .expect("workspace");
+    vcs.create_branch("line-next", None, MAINLINE_BRANCH_ID, "t5")
+        .expect("next line");
+    WorkstreamStore::open(fixture.root.join("workstreams.sqlite"))
+        .expect("streams")
+        .create_stream("next", None, "line-next", "t5", None)
+        .expect("next stream");
+    whipplescript_host_do::do_branches::compose_vcs_shared(&hosted.sql)
+        .expect("hosted workspace")
+        .create_branch("line-next", None, MAINLINE_BRANCH_ID, "t5")
+        .expect("hosted next line");
+    whipplescript_host_do::do_workstreams::DoWorkstreams::new(hosted.sql.clone())
+        .expect("hosted streams")
+        .create_stream("next", None, "line-next", "t5", None)
+        .expect("hosted next stream");
+    for (path, body, cut) in [
+        ("src/new.py", "NEW = True\n", "a3"),
+        ("config/app.toml", "mode = \"strict\"\n", "a4"),
+    ] {
+        vcs.write("line-next", path, Some(body), cut, "t5")
+            .expect("line write");
+        hosted.write("line-next", path, body, cut, "t5");
+    }
+    drop(vcs);
+    hosted.sync(&fixture);
+    let native = refused(&promote_stream(&fixture, &host, "next", &[]));
+    let hosted_refusal = hosted.promote_stream("next", "new-file", &[]);
+    for detail in [&native["detail"], &hosted_refusal["detail"]] {
+        assert_eq!(
+            detail["reservations"][&renewed],
+            "src/new.py is reserved, and its current token was not presented",
+            "{detail}"
+        );
+        assert!(
+            detail["reservations"].get(&lapsed).is_none(),
+            "an expired grant fences nothing: {detail}"
+        );
+    }
 
     // The failure and its fixing cut stay inspectable: both observations
     // and the passing one are in the ledger, the counterexample located at

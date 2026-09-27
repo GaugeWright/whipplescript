@@ -607,6 +607,10 @@ fn admission_text(predicate: &AdmissionPredicate) -> String {
     match predicate {
         AdmissionPredicate::Public {} => "public admission".into(),
         AdmissionPredicate::Authority { scope } => format!("authority scope {scope}"),
+        AdmissionPredicate::Arbitrated { scope, arbitration } => format!(
+            "authority scope {scope}, arbitrated over its {} selectors",
+            arbitration.selectors
+        ),
         AdmissionPredicate::Witnessed { scope, witness } => format!(
             "authority scope {scope}, witnessed by a live {} relation{}",
             witness.family,
