@@ -607,6 +607,15 @@ fn admission_text(predicate: &AdmissionPredicate) -> String {
     match predicate {
         AdmissionPredicate::Public {} => "public admission".into(),
         AdmissionPredicate::Authority { scope } => format!("authority scope {scope}"),
+        AdmissionPredicate::Witnessed { scope, witness } => format!(
+            "authority scope {scope}, witnessed by a live {} relation{}",
+            witness.family,
+            witness
+                .opposite_witnessed_by
+                .as_ref()
+                .map(|family| format!(" whose other endpoint has a live {family} relation"))
+                .unwrap_or_default()
+        ),
     }
 }
 

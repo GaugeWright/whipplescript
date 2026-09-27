@@ -80,6 +80,19 @@ between check and move while the exclusion is held. Two weakenings reach
 that race: releasing before the compare-and-swap, and checking before taking
 the exclusion. A refusal never moves the ref.
 
+`decision-derivation.maude` models norm-plane §6 for slice D1: a decision's
+lifecycle is derived from immutable attested events, and its current
+conformance is a separate view. Acceptance covers exact content, so an edit
+leaves the new revision unaccepted. Folding is the authority's act witnessed
+by a live incorporation edge from the accepted revision. Implementation also
+needs live support for what the decision incorporates. A successor
+supersedes only once accepted. Twelve searches: folding, implementation and
+supersession are reachable; stale support makes the current view `stale`
+while the implementation event stands. Four refusals each have the weakening
+that reaches them: an anchor edit counted as folding, a proposed successor
+superseding, staleness erasing the implementation event, and an edit keeping
+the old acceptance.
+
 `action-classification.maude` models DR-0124 §14.2: an action's
 classification joins its declared label with every influence that shaped
 it — a declared input, a presence observation, an observation of absence —

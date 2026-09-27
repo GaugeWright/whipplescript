@@ -244,6 +244,67 @@
               "admission": {
                 "requires": "public"
               }
+            },
+            {
+              "from": "accepted",
+              "to": "folded",
+              "admission": {
+                "requires": "witnessed",
+                "scope": "norm.accept",
+                "witness": {
+                  "family": "incorporation",
+                  "side": "source"
+                }
+              }
+            },
+            {
+              "from": "folded",
+              "to": "implemented",
+              "admission": {
+                "requires": "witnessed",
+                "scope": "norm.accept",
+                "witness": {
+                  "family": "incorporation",
+                  "side": "source",
+                  "opposite_witnessed_by": "support"
+                }
+              }
+            },
+            {
+              "from": "accepted",
+              "to": "superseded",
+              "admission": {
+                "requires": "witnessed",
+                "scope": "norm.accept",
+                "witness": {
+                  "family": "succession",
+                  "side": "target"
+                }
+              }
+            },
+            {
+              "from": "folded",
+              "to": "superseded",
+              "admission": {
+                "requires": "witnessed",
+                "scope": "norm.accept",
+                "witness": {
+                  "family": "succession",
+                  "side": "target"
+                }
+              }
+            },
+            {
+              "from": "implemented",
+              "to": "superseded",
+              "admission": {
+                "requires": "witnessed",
+                "scope": "norm.accept",
+                "witness": {
+                  "family": "succession",
+                  "side": "target"
+                }
+              }
             }
           ]
         }
@@ -589,6 +650,87 @@
         "live_statuses": [
           "asserted"
         ]
+      }
+    },
+    {
+      "definition": {
+        "name": "supersedes",
+        "version": "1",
+        "fields": [
+          {
+            "name": "source",
+            "required": true,
+            "value_type": {
+              "type": "reference",
+              "form": "identity"
+            }
+          },
+          {
+            "name": "target",
+            "required": true,
+            "value_type": {
+              "type": "reference",
+              "form": "identity"
+            }
+          },
+          {
+            "name": "note",
+            "required": false,
+            "value_type": {
+              "type": "text"
+            }
+          }
+        ],
+        "status": {
+          "values": [
+            "asserted",
+            "withdrawn"
+          ],
+          "initial": "asserted",
+          "transitions": [
+            {
+              "from": "asserted",
+              "to": "withdrawn",
+              "admission": {
+                "requires": "public"
+              }
+            },
+            {
+              "from": "withdrawn",
+              "to": "asserted",
+              "admission": {
+                "requires": "public"
+              }
+            }
+          ]
+        }
+      },
+      "creation": {
+        "requires": "public"
+      },
+      "editing": {
+        "requires": "public"
+      },
+      "inventory_role": {
+        "kind": "non_requirement"
+      },
+      "relation": {
+        "source": "source",
+        "target": "target",
+        "source_kinds": [
+          "decision",
+          "requirement"
+        ],
+        "target_kinds": [
+          "decision",
+          "requirement"
+        ],
+        "family": "succession",
+        "acyclic": true,
+        "live_statuses": [
+          "asserted"
+        ],
+        "cardinality": "at_most_one_live_per_target"
       }
     },
     {

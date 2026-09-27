@@ -13,8 +13,8 @@ exclusive reservation, and a gated mainline.
   owner/worker by allow/deny. A requirement installs it as its support
   contract over the host's pinned protected runtime.
 - `charter.json` is C0. It declares `requirement`, `decision`,
-  `observation`, the kernel's `local-observation`, the `incorporates` and
-  `supports` relations as the engineering charter does, and a `reservation`
+  `observation`, the kernel's `local-observation`, and the `incorporates`,
+  `supports` and `supersedes` relations as the engineering charter does, and a `reservation`
   that only the owner's `reservation.grant` authority grants, releases or
   expires. Its `authorization` domain is `src`, `checks` and `config`.
 

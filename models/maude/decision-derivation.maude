@@ -1,0 +1,92 @@
+--- norm-plane §6 and slice D1: a decision's lifecycle is derived from immutable
+--- attested events, and its current conformance is a separate view.
+---
+--- Acceptance attests exact content: an edit after acceptance leaves the
+--- decision proposed at its new revision until the authority accepts again.
+--- Folding is the authority's witnessed act — admitted only while a live
+--- incorporation edge binds the accepted revision to an effective requirement
+--- revision — never an edit that merely touches the intent anchor.
+--- Implementation additionally needs live support for every requirement the
+--- decision incorporates. Both are events; the support later going stale
+--- changes the current view and never the history. A successor supersedes only
+--- once the authority has accepted it.
+mod DECISION-DERIVATION is
+  sorts Rev Status Fact Cfg State Conformance .
+  ops r0 r1 : -> Rev [ctor] .
+  op next : Rev -> Rev .
+  eq next(r0) = r1 .
+  ops proposed accepted folded implemented superseded : -> Status [ctor] .
+  ops holds stale : -> Conformance [ctor] .
+  subsort Fact < Cfg .
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+  op {_} : Cfg -> State [ctor] .
+  --- The decision: its lifecycle status and current content revision.
+  op dec : Status Rev -> Fact [ctor] .
+  --- The authority's acceptance of exact content.
+  op attested : Rev -> Fact [ctor] .
+  --- A live incorporation edge from a decision revision to the requirement.
+  op inc : Rev -> Fact [ctor] .
+  --- Live support for the incorporated requirement, and its staling edit.
+  ops support staleEdit anchorEdit contentEdit : -> Fact [ctor] .
+  --- An immutable historical event about a decision revision.
+  op ev : Status Rev -> Fact [ctor] .
+  --- The successor decision, and its supersedes edge to this one.
+  op succ : Status -> Fact [ctor] .
+  op supersedesEdge : -> Fact [ctor] .
+  vars R : Rev . var C : Cfg . var S : Status .
+
+  op witnessed : Rev Cfg -> Bool .
+  eq witnessed(R, inc(R) C) = true .
+  eq witnessed(R, C) = false [owise] .
+  op hasEvent : Status Rev Cfg -> Bool .
+  eq hasEvent(S, R, ev(S, R) C) = true .
+  eq hasEvent(S, R, C) = false [owise] .
+  op isAttested : Rev Cfg -> Bool .
+  eq isAttested(R, attested(R) C) = true .
+  eq isAttested(R, C) = false [owise] .
+  --- The derived current view: folding holds while its edge and the support
+  --- for what it incorporates both live.
+  op current : Cfg -> Conformance .
+  eq current(inc(R) support C) = holds .
+  eq current(C) = stale [owise] .
+
+  rl [accept] : { dec(proposed, R) C } => { dec(accepted, R) attested(R) C } .
+  rl [edit-content] : { dec(accepted, R) contentEdit C } => { dec(proposed, next(R)) C } .
+  rl [edit-anchor] : { anchorEdit C } => { C } .
+  crl [fold] : { dec(accepted, R) C } => { dec(folded, R) ev(folded, R) C }
+    if witnessed(R, C) .
+  crl [implement] : { dec(folded, R) support C } => { dec(implemented, R) ev(implemented, R) support C }
+    if witnessed(R, C) .
+  rl [stale-support] : { support staleEdit C } => { C } .
+  rl [accept-successor] : { succ(proposed) C } => { succ(accepted) C } .
+  crl [supersede] : { dec(S, R) succ(accepted) supersedesEdge C }
+    => { dec(superseded, R) ev(superseded, R) succ(accepted) C }
+    if S =/= superseded .
+endm
+--- An edit to the intent anchor counted as folding.
+mod DECISION-DERIVATION-WEAK-EDIT-FOLDS is
+  including DECISION-DERIVATION .
+  var R : Rev . var C : Cfg .
+  rl [anchor-edit-folds] : { dec(accepted, R) anchorEdit C } => { dec(folded, R) ev(folded, R) C } .
+endm
+--- A successor that is only proposed supersedes.
+mod DECISION-DERIVATION-WEAK-PROPOSED-SUCCESSOR is
+  including DECISION-DERIVATION .
+  var R : Rev . var C : Cfg . var S : Status .
+  crl [proposed-supersedes] : { dec(S, R) succ(proposed) supersedesEdge C }
+    => { dec(superseded, R) ev(superseded, R) succ(proposed) C }
+    if S =/= superseded .
+endm
+--- Stale support rewrites the implementation event away.
+mod DECISION-DERIVATION-WEAK-STALENESS-ERASES is
+  including DECISION-DERIVATION .
+  var R : Rev . var C : Cfg .
+  rl [staleness-erases] : { support staleEdit ev(implemented, R) C } => { C } .
+endm
+--- An edit keeps the old acceptance as if it covered the new content.
+mod DECISION-DERIVATION-WEAK-EDIT-KEEPS-ACCEPTANCE is
+  including DECISION-DERIVATION .
+  var R : Rev . var C : Cfg .
+  rl [edit-keeps-acceptance] : { dec(accepted, R) contentEdit C } => { dec(accepted, next(R)) C } .
+endm

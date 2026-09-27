@@ -49,6 +49,85 @@ pub struct Planned {
     pub after_frontier: std::collections::BTreeSet<String>,
     pub plan: crate::norm_impact::ImpactPlan,
     pub method_gaps: BTreeMap<String, Vec<MethodGap>>,
+    /// Each witnessed record's derived current conformance at the candidate.
+    pub conformance: Vec<Conformance>,
+}
+
+/// A witnessed record's derived current conformance (norm-plane §6, D1): the
+/// status its history reached, whether the witness that admitted it holds at
+/// the after frontier, and the work each requirement it relies on needs at the
+/// candidate. `current` is `holds` only when the witness holds and every one of
+/// them is supported, `contradicted` when any needs repair, and otherwise
+/// `stale`. The history is never revised by it.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct Conformance {
+    pub record: String,
+    pub status: String,
+    pub family: String,
+    pub holds: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    pub requirements: BTreeMap<String, Vec<String>>,
+    pub current: &'static str,
+}
+
+/// Derive the conformance of every witnessed record in `view` from a plan of
+/// the candidate.
+pub fn conformance(
+    view: &whipplescript_store::norm::NormView,
+    plan: &crate::norm_impact::ImpactPlan,
+) -> Vec<Conformance> {
+    view.witnessed_records()
+        .into_iter()
+        .map(|witnessed| {
+            let requirements: BTreeMap<String, Vec<String>> = witnessed
+                .relied
+                .iter()
+                .map(|requirement| {
+                    let work = plan
+                        .requirements
+                        .get(requirement)
+                        .map(|impacts| {
+                            impacts
+                                .iter()
+                                .map(|impact| {
+                                    serde_json::to_value(&impact.work)
+                                        .ok()
+                                        .and_then(|work| {
+                                            work.get("kind")
+                                                .and_then(|kind| kind.as_str())
+                                                .map(str::to_owned)
+                                        })
+                                        .unwrap_or_default()
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    (requirement.clone(), work)
+                })
+                .collect();
+            let needs = |kind: &str| requirements.values().flatten().any(|work| work == kind);
+            let supported = requirements
+                .values()
+                .all(|work| !work.is_empty() && work.iter().all(|kind| kind == "supported"));
+            let current = if needs("repair") {
+                "contradicted"
+            } else if witnessed.holds && supported {
+                "holds"
+            } else {
+                "stale"
+            };
+            Conformance {
+                record: witnessed.record,
+                status: witnessed.status,
+                family: witnessed.family,
+                holds: witnessed.holds,
+                reason: witnessed.reason,
+                requirements,
+                current,
+            }
+        })
+        .collect()
 }
 
 impl Planned {
@@ -60,6 +139,7 @@ impl Planned {
             "after_frontier": self.after_frontier,
             "plan": self.plan,
             "method_gaps": self.method_gaps,
+            "conformance": self.conformance,
         })
     }
 }
@@ -219,12 +299,14 @@ pub fn plan<S: RuntimeStore>(
         ImpactLimits::default(),
     )
     .map_err(|error| format!("{error:?}"))?;
+    let conformance = conformance(&after, &plan);
     Ok(Planned {
         anchor: history.anchor(),
         before_frontier: before.frontier,
         after_frontier: after.frontier,
         plan,
         method_gaps: method_gaps.into_inner(),
+        conformance,
     })
 }
 

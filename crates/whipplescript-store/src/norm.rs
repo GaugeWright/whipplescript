@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use whipplescript_core::vocabulary::{
     AdmissionPredicate, ReferenceForm, ValueType, Vocabulary, VocabularyDefinition, VocabularyRef,
-    VocabularyRegistry,
+    VocabularyRegistry, Witness, WitnessSide,
 };
 
 use crate::norm_correspondence::CorrespondenceDeclaration;
@@ -423,6 +423,13 @@ pub struct NormView {
     /// The last admitted act on any record of each relation family; the basis
     /// a relation act binds. A family with no act yet has the ledger as its basis.
     family_heads: BTreeMap<String, String>,
+    /// Every admitted act's causal parents, so an admission rule that reads
+    /// ledger state judges it as the act's causal past saw it — the same in
+    /// every replay order.
+    event_parents: BTreeMap<String, Vec<String>>,
+    /// Each record's state, and its effective revision, after each of its
+    /// acts in admission order.
+    record_acts: BTreeMap<String, Vec<RecordAct>>,
     /// The inventory frontier each exhaustive manifest revision bound.
     manifest_bases: BTreeMap<String, Vec<String>>,
     pub authority_head: String,
@@ -526,11 +533,43 @@ fn registry_for(charter: &NormCharter) -> StoreResult<VocabularyRegistry> {
                     .map(|rule| &rule.admission),
             )
         {
-            if let AdmissionPredicate::Authority { scope } = predicate {
+            if let AdmissionPredicate::Authority { scope }
+            | AdmissionPredicate::Witnessed { scope, .. } = predicate
+            {
                 if !scopes.contains(scope) {
                     return Err(refused(
                         "vocabulary references an undeclared C0 authority scope",
                     ));
+                }
+            }
+        }
+        // A witness is a premise of changing an existing record's status, and
+        // it names relation families this charter declares.
+        for predicate in std::iter::once(&entry.creation).chain(entry.editing.iter()) {
+            if matches!(predicate, AdmissionPredicate::Witnessed { .. }) {
+                return Err(refused("only a status transition may require a witness"));
+            }
+        }
+        let families: BTreeSet<&str> = charter
+            .vocabularies
+            .iter()
+            .filter_map(|entry| entry.relation.as_ref())
+            .map(|relation| relation.family.as_str())
+            .collect();
+        for rule in &entry.definition.status.transitions {
+            if let AdmissionPredicate::Witnessed { witness, .. } = &rule.admission {
+                if entry.relation.is_some() {
+                    return Err(refused(
+                        "a relation's own transitions cannot require a witness",
+                    ));
+                }
+                let named = std::iter::once(&witness.family).chain(&witness.opposite_witnessed_by);
+                for family in named {
+                    if !families.contains(family.as_str()) {
+                        return Err(refused(
+                            "a witness names a relation family the charter does not declare",
+                        ));
+                    }
                 }
             }
         }
@@ -539,6 +578,36 @@ fn registry_for(charter: &NormCharter) -> StoreResult<VocabularyRegistry> {
             .map_err(|e| refused(e.to_string()))?;
     }
     Ok(registry)
+}
+
+/// A record's state, and its effective revision, after one of its acts.
+#[derive(Clone, Debug)]
+struct RecordAct {
+    event: String,
+    record: NormRecord,
+    effective: Option<NormRecord>,
+}
+
+/// What an admission rule reads: records and their effective revisions, now
+/// or as an act's causal past saw them.
+struct Lens<'a> {
+    records: Vec<&'a NormRecord>,
+    effective: Vec<&'a NormRecord>,
+}
+
+/// A record's witnessed status as the current ledger derives it (D1).
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct WitnessedRecord {
+    pub record: String,
+    /// The status its history reached, which this view never revises.
+    pub status: String,
+    pub family: String,
+    /// Whether the witness that admitted that status holds now.
+    pub holds: bool,
+    /// The effective records the witness relies on now.
+    pub relied: Vec<String>,
+    /// Why the witness does not hold, when it does not.
+    pub reason: Option<String>,
 }
 
 impl NormView {
@@ -565,6 +634,8 @@ impl NormView {
             effective_lifecycles: BTreeMap::new(),
             revisions: BTreeMap::new(),
             family_heads: BTreeMap::new(),
+            event_parents: BTreeMap::from([(event.event_id.clone(), Vec::new())]),
+            record_acts: BTreeMap::new(),
             manifest_bases: BTreeMap::new(),
             authority_head: event.event_id.clone(),
             frontier: BTreeSet::from([event.event_id.clone()]),
@@ -579,7 +650,8 @@ impl NormView {
     fn permitted(&self, predicate: &AdmissionPredicate, actor: &NormActor) -> StoreResult<()> {
         let permitted = match predicate {
             AdmissionPredicate::Public {} => true,
-            AdmissionPredicate::Authority { scope } => {
+            AdmissionPredicate::Authority { scope }
+            | AdmissionPredicate::Witnessed { scope, .. } => {
                 actor == &self.owner && self.charter.owner_scopes.contains(scope)
             }
         };
@@ -725,13 +797,20 @@ impl NormView {
                     .transition(&current.status, &status)
                     .map_err(|e| refused(e.to_string()))?;
                 self.permitted(predicate, &statement.actor)?;
-                self.check_relation_act(
-                    Some(&record),
-                    &vocabulary,
-                    &current.fields,
-                    &status,
-                    statement.premises.as_ref(),
-                )?;
+                if let AdmissionPredicate::Witnessed { witness, .. } = predicate {
+                    // A witnessed record is never a relation (the charter is
+                    // validated so), so its premises bind the witness instead.
+                    let lens = self.causal_lens(&event.parents);
+                    self.witness_evidence(witness, current, &lens)?;
+                } else {
+                    self.check_relation_act(
+                        Some(&record),
+                        &vocabulary,
+                        &current.fields,
+                        &status,
+                        statement.premises.as_ref(),
+                    )?;
+                }
                 let mut updated = current.clone();
                 updated.status = status;
                 updated.head = event.event_id.clone();
@@ -895,6 +974,20 @@ impl NormView {
             let record_id = event.issue_id.as_deref().unwrap_or(&event.event_id);
             self.project_effectiveness(record_id);
         }
+        let touched = event.issue_id.as_deref().unwrap_or(&event.event_id);
+        if let Some(record) = self.records.get(touched) {
+            let act = RecordAct {
+                event: event.event_id.clone(),
+                record: record.clone(),
+                effective: self.effective_records.get(touched).cloned(),
+            };
+            self.record_acts
+                .entry(touched.to_owned())
+                .or_default()
+                .push(act);
+        }
+        self.event_parents
+            .insert(event.event_id.clone(), event.parents.clone());
         for parent in &event.parents {
             self.frontier.remove(parent);
         }
@@ -968,6 +1061,253 @@ impl NormView {
                 },
             );
         }
+    }
+
+    /// The ledger as it stands now.
+    fn current_lens(&self) -> Lens<'_> {
+        Lens {
+            records: self.records.values().collect(),
+            effective: self.effective_records.values().collect(),
+        }
+    }
+
+    /// The ledger as an act's causal past saw it: each record after its latest
+    /// act among the act's ancestors. An admission rule judged through it gives
+    /// the same verdict whichever order a replay applies concurrent acts in.
+    fn causal_lens(&self, parents: &[String]) -> Lens<'_> {
+        let mut past = BTreeSet::new();
+        let mut pending: Vec<&str> = parents.iter().map(String::as_str).collect();
+        while let Some(event) = pending.pop() {
+            if past.insert(event.to_owned()) {
+                if let Some(grandparents) = self.event_parents.get(event) {
+                    pending.extend(grandparents.iter().map(String::as_str));
+                }
+            }
+        }
+        let mut lens = Lens {
+            records: Vec::new(),
+            effective: Vec::new(),
+        };
+        for acts in self.record_acts.values() {
+            if let Some(act) = acts.iter().rev().find(|act| past.contains(&act.event)) {
+                lens.records.push(&act.record);
+                lens.effective.extend(act.effective.as_ref());
+            }
+        }
+        lens
+    }
+
+    /// The premises a new act must bind, checked when it is appended against
+    /// everything the ledger then holds (norm-plane §5, §6). A replay never
+    /// re-runs these: the act's causal past is what it then judges against.
+    pub(crate) fn check_admission_premises(
+        &self,
+        event: &TrackerEvent,
+        verifier: &dyn NormVerifier,
+    ) -> StoreResult<()> {
+        let statement = verify_event(event, verifier)?.statement;
+        let NormAct::Transition {
+            vocabulary,
+            record,
+            previous,
+            status,
+            ..
+        } = statement.action
+        else {
+            return Ok(());
+        };
+        let Ok(current) = self.current_record(&record, &vocabulary, &previous) else {
+            return Ok(());
+        };
+        let Ok(definition) = self.registry.get(&current.vocabulary) else {
+            return Ok(());
+        };
+        let Ok(predicate) = definition.transition(&current.status, &status) else {
+            return Ok(());
+        };
+        // An act the replay refuses anyway (here, for authority) is refused
+        // there with its own reason, not for what it failed to bind.
+        if self.permitted(predicate, &statement.actor).is_err() {
+            return Ok(());
+        }
+        if let AdmissionPredicate::Witnessed { witness, .. } = predicate {
+            self.check_witness_binding(witness, current, statement.premises.as_ref())?;
+        }
+        Ok(())
+    }
+
+    /// A witnessed transition's premise (norm-plane §6, D1): a live relation of
+    /// the witness's family binds the record's current revision, on the
+    /// declared side, to an effective revision on the other; and when the
+    /// witness names a second family, a live edge of it targets each of those.
+    ///
+    /// The transition binds what it relied on as premises, so a replay orders
+    /// it after them: the witness family's basis, which a moved family refuses
+    /// for re-evaluation; the act that made each relied-on revision effective;
+    /// and the second family's basis when the witness names one.
+    fn check_witness_binding(
+        &self,
+        witness: &Witness,
+        record: &NormRecord,
+        premises: Option<&NormPremises>,
+    ) -> StoreResult<()> {
+        let basis = self.relation_family(&witness.family)?.basis;
+        match premises.and_then(|premises| premises.family_basis.as_deref()) {
+            Some(bound) if bound == basis => {}
+            Some(_) => {
+                return Err(refused(
+                    "the witness family's basis moved since it was captured; re-evaluate the transition",
+                ))
+            }
+            None => {
+                return Err(refused(
+                    "a witnessed transition must bind its witness family's basis as a premise",
+                ))
+            }
+        }
+        let references = premises
+            .map(|premises| premises.references.as_slice())
+            .unwrap_or(&[]);
+        let (_, heads) = self.witness_evidence(witness, record, &self.current_lens())?;
+        if heads.iter().any(|head| !references.contains(head)) {
+            return Err(refused(
+                "a witnessed transition must bind the act that made each revision it relies on effective",
+            ));
+        }
+        if let Some(second) = &witness.opposite_witnessed_by {
+            if !references.contains(&self.relation_family(second)?.basis) {
+                return Err(refused(format!(
+                    "a witnessed transition must bind the {second} family's basis as a premise"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Evaluate a witness against this view: the effective revisions it
+    /// relies on, and the acts that made them effective. A witness that does
+    /// not hold is refused with the reason.
+    fn witness_evidence(
+        &self,
+        witness: &Witness,
+        record: &NormRecord,
+        lens: &Lens<'_>,
+    ) -> StoreResult<(BTreeSet<String>, Vec<String>)> {
+        let names = |id: &str, record: &NormRecord| id == record.content_head || id == record.id;
+        // The act that made a revision effective, when it is effective.
+        let effective = |id: &str| {
+            lens.effective
+                .iter()
+                .find(|record| names(id, record))
+                .map(|record| record.head.clone())
+        };
+        let edges = self.live_relation_endpoints(&witness.family, &lens.records);
+        let opposite: BTreeSet<String> = edges
+            .iter()
+            .filter_map(|(source, target)| match witness.side {
+                WitnessSide::Source if names(source, record) => Some(target.clone()),
+                WitnessSide::Target if names(target, record) => Some(source.clone()),
+                _ => None,
+            })
+            .filter(|opposite| effective(opposite).is_some())
+            .collect();
+        if opposite.is_empty() {
+            return Err(refused(format!(
+                "the transition's witness does not hold: no live {} relation binds this revision to an effective one",
+                witness.family
+            )));
+        }
+        if let Some(second) = &witness.opposite_witnessed_by {
+            let witnessed: BTreeSet<String> = self
+                .live_relation_endpoints(second, &lens.records)
+                .into_iter()
+                .map(|(_, target)| target)
+                .collect();
+            if let Some(unwitnessed) = opposite.iter().find(|id| !witnessed.contains(*id)) {
+                return Err(refused(format!(
+                    "the transition's witness does not hold: {unwitnessed} has no live {second} relation"
+                )));
+            }
+        }
+        let heads = opposite.iter().filter_map(|id| effective(id)).collect();
+        Ok((opposite, heads))
+    }
+
+    /// The derived current state of every record whose status its charter
+    /// reaches only through a witness (norm-plane §6, D1): whether that witness
+    /// still holds now, and what it relies on. The lifecycle is history and is
+    /// never revised by this view.
+    pub fn witnessed_records(&self) -> Vec<WitnessedRecord> {
+        let mut witnessed = Vec::new();
+        for record in self.records.values() {
+            let Ok(definition) = self.registry.get(&record.vocabulary) else {
+                continue;
+            };
+            let Some(witness) = definition
+                .definition()
+                .status
+                .transitions
+                .iter()
+                .filter(|rule| rule.to == record.status)
+                .find_map(|rule| match &rule.admission {
+                    AdmissionPredicate::Witnessed { witness, .. } => Some(witness),
+                    _ => None,
+                })
+            else {
+                continue;
+            };
+            let (holds, relied, reason) =
+                match self.witness_evidence(witness, record, &self.current_lens()) {
+                    Ok((opposite, _)) => (
+                        true,
+                        opposite
+                            .iter()
+                            .filter_map(|id| {
+                                self.effective_records
+                                    .values()
+                                    .find(|effective| {
+                                        effective.content_head == *id || effective.id == *id
+                                    })
+                                    .map(|effective| effective.id.clone())
+                            })
+                            .collect(),
+                        None,
+                    ),
+                    Err(StoreError::Conflict(reason)) => (false, Vec::new(), Some(reason)),
+                    Err(other) => (false, Vec::new(), Some(format!("{other:?}"))),
+                };
+            witnessed.push(WitnessedRecord {
+                record: record.id.clone(),
+                status: record.status.clone(),
+                family: witness.family.clone(),
+                holds,
+                relied,
+                reason,
+            });
+        }
+        witnessed
+    }
+
+    /// The endpoint values of every live relation record in a family, as the
+    /// relation's reference fields name them.
+    fn live_relation_endpoints(
+        &self,
+        family: &str,
+        records: &[&NormRecord],
+    ) -> Vec<(String, String)> {
+        records
+            .iter()
+            .filter_map(|record| {
+                let (_, relation) = self.relation_of(&record.vocabulary)?;
+                if relation.family != family || !relation.live_statuses.contains(&record.status) {
+                    return None;
+                }
+                Some((
+                    record.fields[&relation.source].as_str()?.to_owned(),
+                    record.fields[&relation.target].as_str()?.to_owned(),
+                ))
+            })
+            .collect()
     }
 
     pub(crate) fn relation_of(
@@ -1479,6 +1819,13 @@ pub fn admit_norm(
 ) -> StoreResult<NormView> {
     let initial = NormCheckpoint::genesis(event.event_id.clone());
     let expected = pin.unwrap_or(&initial);
+    // What the new act must bind is judged against everything the ledger holds
+    // now; the replay below judges it against its causal past.
+    if let Some(pin) = pin {
+        if existing.iter().any(|prior| prior.kind.starts_with("norm.")) {
+            replay_norm(existing, pin, verifier)?.check_admission_premises(event, verifier)?;
+        }
+    }
     let mut all = existing.to_vec();
     all.push(event.clone());
     let view = replay_norm(&all, expected, verifier)?;

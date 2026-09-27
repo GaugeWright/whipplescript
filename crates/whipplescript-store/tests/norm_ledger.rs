@@ -2836,6 +2836,720 @@ mod tests {
         assert_eq!(record.content_head, r0);
     }
 
+    /// A witnessed act is judged against its causal past, so an act that later
+    /// withdraws its witness — concurrent with it, and ordered either way by a
+    /// replay — never makes the admitted history unreadable.
+    #[test]
+    fn norm_witnessed_history_replays_whatever_later_acts_withdraw() {
+        use whipplescript_store::norm_commands::NormCommandStore;
+        let charter: NormCharter =
+            serde_json::from_str(include_str!("../../../examples/engineering/charter.json"))
+                .expect("the engineering charter is a charter");
+        let keys = Keys::new();
+        let reference = |name: &str| {
+            Vocabulary::new(
+                charter
+                    .vocabularies
+                    .iter()
+                    .find(|entry| entry.definition.name == name)
+                    .expect("declared")
+                    .definition
+                    .clone(),
+            )
+            .unwrap()
+            .reference()
+            .clone()
+        };
+        // Different nonces give different event ids, so across rounds the
+        // replay's tie-break orders the fold and the withdrawal both ways.
+        for round in 0..8 {
+            let mut store = WorkItemStore::open_in_memory().unwrap();
+            let ledger = store
+                .append_norm_event(
+                    &keys.sign(
+                        "owner",
+                        &format!("replay-{round}"),
+                        NormAct::Bootstrap {
+                            creator: "worker".into(),
+                            charter: charter.clone(),
+                        },
+                    ),
+                    &keys,
+                )
+                .unwrap();
+            let view = |store: &WorkItemStore| store.norm_state(&keys).unwrap();
+            let act = |store: &mut WorkItemStore,
+                       actor: &str,
+                       nonce: &str,
+                       action: NormAct,
+                       premises: Option<NormPremises>| {
+                store
+                    .append_norm_event(
+                        &keys.sign_with(actor, &format!("{nonce}-{round}"), action, premises),
+                        &keys,
+                    )
+                    .unwrap()
+            };
+            let create = |kind: &str, fields: serde_json::Value| NormAct::Create {
+                ledger: ledger.clone(),
+                authority: None,
+                vocabulary: reference(kind),
+                fields_json: fields.to_string(),
+            };
+            let transition = |store: &WorkItemStore, kind: &str, record: &str, status: &str| {
+                NormAct::Transition {
+                    ledger: ledger.clone(),
+                    authority: None,
+                    vocabulary: reference(kind),
+                    record: record.into(),
+                    previous: view(store).records[record].head.clone(),
+                    status: status.into(),
+                }
+            };
+            let r = act(
+                &mut store,
+                "worker",
+                "R",
+                create(
+                    "requirement",
+                    json!({
+                        "name": "r", "proposition": "p", "domain": "src/", "subject": "src/a.py",
+                        "applicability": "always", "owner": "owner"
+                    }),
+                ),
+                None,
+            );
+            let accept = transition(&store, "requirement", &r, "accepted");
+            act(&mut store, "owner", "accept-R", accept, None);
+            let d = act(
+                &mut store,
+                "worker",
+                "D",
+                create(
+                    "decision",
+                    json!({
+                        "title": "t", "question": "q", "course": "c", "rationale": "r",
+                        "alternatives": ["a"], "scope": "s", "consequences": "c", "subjects": ["src/a.py"]
+                    }),
+                ),
+                None,
+            );
+            let accept = transition(&store, "decision", &d, "accepted");
+            act(&mut store, "owner", "accept-D", accept, None);
+            let (d0, r0) = (
+                view(&store).effective_records[&d].content_head.clone(),
+                view(&store).effective_records[&r].content_head.clone(),
+            );
+            let basis = view(&store).relation_family("incorporation").unwrap().basis;
+            let premises = NormPremises {
+                family_basis: Some(basis),
+                references: vec![d0.clone(), r0.clone()],
+                inventory_frontier: Vec::new(),
+            };
+            let edge = act(
+                &mut store,
+                "owner",
+                "inc",
+                create("incorporates", json!({"source": d0, "target": r0})),
+                Some(premises),
+            );
+            let fold = transition(&store, "decision", &d, "folded");
+            let premises = NormPremises {
+                family_basis: Some(view(&store).relation_family("incorporation").unwrap().basis),
+                references: vec![view(&store).effective_records[&r].head.clone()],
+                inventory_frontier: Vec::new(),
+            };
+            act(&mut store, "owner", "fold", fold, Some(premises));
+            // The withdrawal binds the family's basis (the edge), not the fold.
+            let withdraw = transition(&store, "incorporates", &edge, "withdrawn");
+            let premises = NormPremises {
+                family_basis: Some(view(&store).relation_family("incorporation").unwrap().basis),
+                references: Vec::new(),
+                inventory_frontier: Vec::new(),
+            };
+            act(&mut store, "worker", "withdraw", withdraw, Some(premises));
+            let replayed = view(&store);
+            assert_eq!(replayed.records[&d].status, "folded", "round {round}");
+            assert!(!replayed.witnessed_records()[0].holds, "round {round}");
+        }
+    }
+
+    /// A charter's witnesses are validated with it: only a status transition
+    /// of a record that is not itself a relation may require one, and it names
+    /// relation families the charter declares.
+    #[test]
+    fn norm_witnessed_transitions_are_validated_with_their_charter() {
+        use whipplescript_core::vocabulary::{Witness, WitnessSide};
+        let engineering: NormCharter =
+            serde_json::from_str(include_str!("../../../examples/engineering/charter.json"))
+                .expect("the engineering charter is a charter");
+        let keys = Keys::new();
+        let witnessed = |family: &str| AdmissionPredicate::Witnessed {
+            scope: "norm.accept".into(),
+            witness: Witness {
+                family: family.into(),
+                side: WitnessSide::Source,
+                opposite_witnessed_by: None,
+            },
+        };
+        let bootstrap = |charter: NormCharter| {
+            WorkItemStore::open_in_memory().unwrap().append_norm_event(
+                &keys.sign(
+                    "owner",
+                    "witness-validation",
+                    NormAct::Bootstrap {
+                        creator: "worker".into(),
+                        charter,
+                    },
+                ),
+                &keys,
+            )
+        };
+        let refused = |charter: NormCharter, needle: &str| {
+            let message = format!("{:?}", bootstrap(charter).expect_err("refusal expected"));
+            assert!(message.contains(needle), "{message}");
+        };
+        let named = |charter: &mut NormCharter, name: &str| -> usize {
+            charter
+                .vocabularies
+                .iter()
+                .position(|entry| entry.definition.name == name)
+                .expect("declared")
+        };
+        assert!(bootstrap(engineering.clone()).is_ok());
+
+        let mut creation = engineering.clone();
+        let decision = named(&mut creation, "decision");
+        creation.vocabularies[decision].creation = witnessed("incorporation");
+        refused(creation, "only a status transition may require a witness");
+
+        let mut undeclared = engineering.clone();
+        let decision = named(&mut undeclared, "decision");
+        let folded = undeclared.vocabularies[decision]
+            .definition
+            .status
+            .transitions
+            .iter()
+            .position(|rule| rule.to == "folded")
+            .expect("folding");
+        undeclared.vocabularies[decision]
+            .definition
+            .status
+            .transitions[folded]
+            .admission = witnessed("absent");
+        refused(
+            undeclared,
+            "a witness names a relation family the charter does not declare",
+        );
+
+        let mut relation = engineering.clone();
+        let supports = named(&mut relation, "supports");
+        relation.vocabularies[supports]
+            .definition
+            .status
+            .transitions[0]
+            .admission = witnessed("support");
+        refused(
+            relation,
+            "a relation's own transitions cannot require a witness",
+        );
+
+        let mut empty = engineering;
+        let decision = named(&mut empty, "decision");
+        empty.vocabularies[decision].definition.status.transitions[folded].admission =
+            witnessed(" ");
+        refused(empty, "admission.witness.family");
+    }
+
+    /// D1 (norm-plane §6): a decision folds and is implemented only on the
+    /// ledger's witnesses, and a successor supersedes it only once accepted.
+    /// An edit to the decision's intent resets it rather than folding it, the
+    /// worker cannot attest, and support going stale afterwards leaves the
+    /// decision's history exactly as it was.
+    #[test]
+    fn norm_decisions_fold_implement_and_supersede_only_on_their_witnesses() {
+        use whipplescript_store::norm_commands::NormCommandStore;
+        let charter: NormCharter =
+            serde_json::from_str(include_str!("../../../examples/engineering/charter.json"))
+                .expect("the engineering charter is a charter");
+        let keys = Keys::new();
+        let mut store = WorkItemStore::open_in_memory().unwrap();
+        let ledger = store
+            .append_norm_event(
+                &keys.sign(
+                    "owner",
+                    "d1",
+                    NormAct::Bootstrap {
+                        creator: "worker".into(),
+                        charter: charter.clone(),
+                    },
+                ),
+                &keys,
+            )
+            .unwrap();
+        let reference = |name: &str| {
+            Vocabulary::new(
+                charter
+                    .vocabularies
+                    .iter()
+                    .find(|entry| entry.definition.name == name)
+                    .unwrap_or_else(|| panic!("charter declares {name}"))
+                    .definition
+                    .clone(),
+            )
+            .unwrap()
+            .reference()
+            .clone()
+        };
+        let refused = |result: Result<String, StoreError>, needle: &str| {
+            let message = format!("{:?}", result.expect_err("refusal expected"));
+            assert!(message.contains(needle), "{message}");
+        };
+        let create = |actor: &str, nonce: &str, kind: &str, fields: serde_json::Value| {
+            keys.sign(
+                actor,
+                nonce,
+                NormAct::Create {
+                    ledger: ledger.clone(),
+                    authority: None,
+                    vocabulary: reference(kind),
+                    fields_json: fields.to_string(),
+                },
+            )
+        };
+        let view = |store: &WorkItemStore| store.norm_state(&keys).unwrap();
+        let head = |store: &WorkItemStore, id: &str| view(store).records[id].head.clone();
+        let status = |store: &WorkItemStore, id: &str| view(store).records[id].status.clone();
+        let effective = |store: &WorkItemStore, id: &str| {
+            view(store).effective_records[id].content_head.clone()
+        };
+        let transition = |store: &WorkItemStore,
+                          actor: &str,
+                          nonce: &str,
+                          kind: &str,
+                          record: &str,
+                          status: &str| {
+            keys.sign(
+                actor,
+                nonce,
+                NormAct::Transition {
+                    ledger: ledger.clone(),
+                    authority: None,
+                    vocabulary: reference(kind),
+                    record: record.into(),
+                    previous: head(store, record),
+                    status: status.into(),
+                },
+            )
+        };
+        let relate = |store: &WorkItemStore,
+                      actor: &str,
+                      nonce: &str,
+                      kind: &str,
+                      family: &str,
+                      source: &str,
+                      target: &str| {
+            keys.sign_with(
+                actor,
+                nonce,
+                NormAct::Create {
+                    ledger: ledger.clone(),
+                    authority: None,
+                    vocabulary: reference(kind),
+                    fields_json: json!({"source": source, "target": target}).to_string(),
+                },
+                Some(NormPremises {
+                    family_basis: Some(view(store).relation_family(family).unwrap().basis),
+                    references: vec![source.into(), target.into()],
+                    inventory_frontier: Vec::new(),
+                }),
+            )
+        };
+        // A witnessed transition binds what it relies on: the witness family's
+        // basis, the act that made each relied-on record effective, and the
+        // second family's basis when the witness names one.
+        let witnessed = |store: &WorkItemStore,
+                         nonce: &str,
+                         record: &str,
+                         status: &str,
+                         family: &str,
+                         relied: &[&str],
+                         second: Option<&str>| {
+            let view = view(store);
+            let mut references: Vec<String> = relied
+                .iter()
+                .map(|id| view.effective_records[*id].head.clone())
+                .collect();
+            references.extend(second.map(|family| view.relation_family(family).unwrap().basis));
+            keys.sign_with(
+                "owner",
+                nonce,
+                NormAct::Transition {
+                    ledger: ledger.clone(),
+                    authority: None,
+                    vocabulary: reference("decision"),
+                    record: record.into(),
+                    previous: view.records[record].head.clone(),
+                    status: status.into(),
+                },
+                Some(NormPremises {
+                    family_basis: Some(view.relation_family(family).unwrap().basis),
+                    references,
+                    inventory_frontier: Vec::new(),
+                }),
+            )
+        };
+        let decision = |title: &str| {
+            json!({
+                "title": title, "question": "who may act",
+                "course": "owners always, workers when granted", "rationale": "least authority",
+                "alternatives": ["grants only"], "scope": "src/auth.py",
+                "consequences": "the parser interprets grants", "subjects": ["src/auth.py"]
+            })
+        };
+
+        let r = store
+            .append_norm_event(
+                &create("worker", "R", "requirement", json!({
+                    "name": "custody-authorization", "proposition": "role == owner or grant == allow",
+                    "domain": "src/", "subject": "src/auth.py",
+                    "applicability": "every mainline candidate", "owner": "owner"
+                })),
+                &keys,
+            )
+            .unwrap();
+        store
+            .append_norm_event(
+                &transition(&store, "owner", "accept-R", "requirement", &r, "accepted"),
+                &keys,
+            )
+            .unwrap();
+        let r0 = effective(&store, &r);
+        let d = store
+            .append_norm_event(
+                &create(
+                    "worker",
+                    "D",
+                    "decision",
+                    decision("Authorize by role or grant"),
+                ),
+                &keys,
+            )
+            .unwrap();
+        store
+            .append_norm_event(
+                &transition(&store, "owner", "accept-D", "decision", &d, "accepted"),
+                &keys,
+            )
+            .unwrap();
+
+        // Folding is witnessed: without an incorporation edge the authority
+        // cannot fold, and the worker cannot attest at all.
+        refused(
+            store.append_norm_event(
+                &transition(&store, "worker", "fold-worker", "decision", &d, "folded"),
+                &keys,
+            ),
+            "authenticated governance authority",
+        );
+        refused(
+            store.append_norm_event(&witnessed(&store, "fold-bare", &d, "folded", "incorporation", &[], None), &keys),
+            "the transition's witness does not hold: no live incorporation relation binds this revision to an effective one",
+        );
+        // An edit to the decision's intent is not folding: it resets the
+        // decision to proposed, and only a fresh acceptance can follow.
+        store
+            .append_norm_event(
+                &keys.sign(
+                    "worker",
+                    "anchor-edit",
+                    NormAct::Edit {
+                        ledger: ledger.clone(),
+                        authority: None,
+                        vocabulary: reference("decision"),
+                        record: d.clone(),
+                        previous: head(&store, &d),
+                        fields_json: decision("Authorize by role, or by an allowing grant")
+                            .to_string(),
+                    },
+                ),
+                &keys,
+            )
+            .unwrap();
+        assert_eq!(status(&store, &d), "proposed");
+        refused(
+            store.append_norm_event(
+                &transition(&store, "owner", "fold-edited", "decision", &d, "folded"),
+                &keys,
+            ),
+            "no admission rule",
+        );
+        store
+            .append_norm_event(
+                &transition(&store, "owner", "re-accept-D", "decision", &d, "accepted"),
+                &keys,
+            )
+            .unwrap();
+        let d1 = effective(&store, &d);
+        store
+            .append_norm_event(
+                &relate(
+                    &store,
+                    "owner",
+                    "inc",
+                    "incorporates",
+                    "incorporation",
+                    &d1,
+                    &r0,
+                ),
+                &keys,
+            )
+            .unwrap();
+        // Unbound premises refuse: a replay could order the fold before the
+        // witness it relied on.
+        let unbound =
+            |store: &WorkItemStore, nonce: &str, basis: Option<String>, references: Vec<String>| {
+                keys.sign_with(
+                    "owner",
+                    nonce,
+                    NormAct::Transition {
+                        ledger: ledger.clone(),
+                        authority: None,
+                        vocabulary: reference("decision"),
+                        record: d.clone(),
+                        previous: head(store, &d),
+                        status: "folded".into(),
+                    },
+                    Some(NormPremises {
+                        family_basis: basis,
+                        references,
+                        inventory_frontier: Vec::new(),
+                    }),
+                )
+            };
+        let incorporation = view(&store).relation_family("incorporation").unwrap().basis;
+        let r_effective = view(&store).effective_records[&r].head.clone();
+        refused(
+            store.append_norm_event(
+                &unbound(&store, "fold-no-basis", None, vec![r_effective.clone()]),
+                &keys,
+            ),
+            "a witnessed transition must bind its witness family's basis as a premise",
+        );
+        refused(
+            store.append_norm_event(
+                &unbound(
+                    &store,
+                    "fold-old-basis",
+                    Some(ledger.clone()),
+                    vec![r_effective],
+                ),
+                &keys,
+            ),
+            "the witness family's basis moved since it was captured; re-evaluate the transition",
+        );
+        refused(
+            store.append_norm_event(&unbound(&store, "fold-no-reference", Some(incorporation), Vec::new()), &keys),
+            "a witnessed transition must bind the act that made each revision it relies on effective",
+        );
+        store
+            .append_norm_event(
+                &witnessed(&store, "fold", &d, "folded", "incorporation", &[&r], None),
+                &keys,
+            )
+            .unwrap();
+        assert_eq!(status(&store, &d), "folded");
+
+        // Implementation needs live support for everything the decision
+        // incorporates.
+        refused(
+            store.append_norm_event(
+                &witnessed(
+                    &store,
+                    "implement-bare",
+                    &d,
+                    "implemented",
+                    "incorporation",
+                    &[&r],
+                    Some("support"),
+                ),
+                &keys,
+            ),
+            &format!("the transition's witness does not hold: {r0} has no live support relation"),
+        );
+        let o = store
+            .append_norm_event(&create("worker", "O", "observation", json!({
+                "title": "four cases pass", "statement": "Q0 passed at A0", "subject": "src/auth.py",
+                "artifact": "A0", "method": "Q0", "outcome": "pass"
+            })), &keys)
+            .unwrap();
+        store
+            .append_norm_event(
+                &transition(&store, "owner", "activate-O", "observation", &o, "active"),
+                &keys,
+            )
+            .unwrap();
+        let o0 = effective(&store, &o);
+        let support = store
+            .append_norm_event(
+                &relate(&store, "worker", "sup", "supports", "support", &o0, &r0),
+                &keys,
+            )
+            .unwrap();
+        refused(
+            store.append_norm_event(
+                &witnessed(
+                    &store,
+                    "implement-unbound",
+                    &d,
+                    "implemented",
+                    "incorporation",
+                    &[&r],
+                    None,
+                ),
+                &keys,
+            ),
+            "a witnessed transition must bind the support family's basis as a premise",
+        );
+        let implemented = store
+            .append_norm_event(
+                &witnessed(
+                    &store,
+                    "implement",
+                    &d,
+                    "implemented",
+                    "incorporation",
+                    &[&r],
+                    Some("support"),
+                ),
+                &keys,
+            )
+            .unwrap();
+
+        // The derived current view: the witness holds, relying on R.
+        let current = |store: &WorkItemStore| {
+            view(store)
+                .witnessed_records()
+                .into_iter()
+                .find(|witnessed| witnessed.record == d)
+                .expect("the decision's status is witnessed")
+        };
+        let now = current(&store);
+        assert!(now.holds, "{now:?}");
+        assert_eq!(now.relied, vec![r.clone()]);
+        assert_eq!(now.status, "implemented");
+
+        // The support goes stale; the decision's history does not change.
+        store
+            .append_norm_event(
+                &keys.sign_with(
+                    "worker",
+                    "withdraw-sup",
+                    NormAct::Transition {
+                        ledger: ledger.clone(),
+                        authority: None,
+                        vocabulary: reference("supports"),
+                        record: support.clone(),
+                        previous: head(&store, &support),
+                        status: "withdrawn".into(),
+                    },
+                    Some(NormPremises {
+                        family_basis: Some(view(&store).relation_family("support").unwrap().basis),
+                        references: Vec::new(),
+                        inventory_frontier: Vec::new(),
+                    }),
+                ),
+                &keys,
+            )
+            .unwrap();
+        assert!(view(&store)
+            .relation_family("support")
+            .unwrap()
+            .edges
+            .is_empty());
+        assert_eq!(status(&store, &d), "implemented");
+        let stale = current(&store);
+        assert!(
+            !stale.holds,
+            "stale support no longer witnesses implementation"
+        );
+        assert_eq!(stale.status, "implemented", "the history is not revised");
+        assert_eq!(
+            stale.reason.as_deref(),
+            Some(
+                format!(
+                    "the transition's witness does not hold: {r0} has no live support relation"
+                )
+                .as_str()
+            )
+        );
+        assert!(store
+            .export_events()
+            .unwrap()
+            .iter()
+            .any(|event| event.event_id == implemented));
+
+        // A successor supersedes only once the authority accepts it.
+        let successor = store
+            .append_norm_event(
+                &create(
+                    "worker",
+                    "D2",
+                    "decision",
+                    decision("Authorize by role alone"),
+                ),
+                &keys,
+            )
+            .unwrap();
+        // `supersedes` names its endpoints by record identity.
+        store
+            .append_norm_event(
+                &relate(
+                    &store,
+                    "worker",
+                    "succ",
+                    "supersedes",
+                    "succession",
+                    &successor,
+                    &d,
+                ),
+                &keys,
+            )
+            .unwrap();
+        refused(
+            store.append_norm_event(&witnessed(&store, "supersede-early", &d, "superseded", "succession", &[], None), &keys),
+            "the transition's witness does not hold: no live succession relation binds this revision to an effective one",
+        );
+        store
+            .append_norm_event(
+                &transition(
+                    &store,
+                    "owner",
+                    "accept-D2",
+                    "decision",
+                    &successor,
+                    "accepted",
+                ),
+                &keys,
+            )
+            .unwrap();
+        store
+            .append_norm_event(
+                &witnessed(
+                    &store,
+                    "supersede",
+                    &d,
+                    "superseded",
+                    "succession",
+                    &[&successor],
+                    None,
+                ),
+                &keys,
+            )
+            .unwrap();
+        assert_eq!(status(&store, &d), "superseded");
+        assert!(!view(&store).effective_records.contains_key(&d));
+    }
     /// Stage 3 of the operating-model note (norm-plane §8.1, the Q1 subset):
     /// rendering, the diff of meaning and explanation are pure projections at
     /// a named frontier. A rendering carries the derived completeness

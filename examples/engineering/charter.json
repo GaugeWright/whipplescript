@@ -235,6 +235,67 @@
               "admission": {
                 "requires": "public"
               }
+            },
+            {
+              "from": "accepted",
+              "to": "folded",
+              "admission": {
+                "requires": "witnessed",
+                "scope": "norm.accept",
+                "witness": {
+                  "family": "incorporation",
+                  "side": "source"
+                }
+              }
+            },
+            {
+              "from": "folded",
+              "to": "implemented",
+              "admission": {
+                "requires": "witnessed",
+                "scope": "norm.accept",
+                "witness": {
+                  "family": "incorporation",
+                  "side": "source",
+                  "opposite_witnessed_by": "support"
+                }
+              }
+            },
+            {
+              "from": "accepted",
+              "to": "superseded",
+              "admission": {
+                "requires": "witnessed",
+                "scope": "norm.accept",
+                "witness": {
+                  "family": "succession",
+                  "side": "target"
+                }
+              }
+            },
+            {
+              "from": "folded",
+              "to": "superseded",
+              "admission": {
+                "requires": "witnessed",
+                "scope": "norm.accept",
+                "witness": {
+                  "family": "succession",
+                  "side": "target"
+                }
+              }
+            },
+            {
+              "from": "implemented",
+              "to": "superseded",
+              "admission": {
+                "requires": "witnessed",
+                "scope": "norm.accept",
+                "witness": {
+                  "family": "succession",
+                  "side": "target"
+                }
+              }
             }
           ]
         }

@@ -18,7 +18,7 @@ VERDICTS_FILE="$ROOT/models/maude/tests/expected-verdicts.tsv"
 verdict_signature() {
   grep -oE '^Solution 1|^No solution\.' \
     | sed 's/Solution 1/S/; s/No solution\./N/' \
-    | paste -sd '' -
+    | tr -d '\n'
 }
 
 # `check-formal-models.sh --update-verdicts` regenerates the signature golden. Needs
@@ -242,6 +242,7 @@ declare -A EXPECTED_NO_SOLUTION=(
   ["hosted-norm-lease.maude"]=1
   ["landing-gate.maude"]=13
   ["admission-commit.maude"]=3
+  ["decision-derivation.maude"]=4
   ["resource-inventory.maude"]=6
   ["artifact-capture.maude"]=6
   ["alias-admission.maude"]=2
@@ -534,6 +535,7 @@ declare -A EXPECTED_SOLUTION=(
   ["hosted-norm-lease.maude"]=4
   ["landing-gate.maude"]=23
   ["admission-commit.maude"]=6
+  ["decision-derivation.maude"]=8
   ["resource-inventory.maude"]=10
   ["artifact-capture.maude"]=8
   ["alias-admission.maude"]=5

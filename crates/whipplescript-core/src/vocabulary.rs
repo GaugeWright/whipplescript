@@ -100,7 +100,38 @@ pub struct TransitionRule {
 #[serde(tag = "requires", rename_all = "snake_case", deny_unknown_fields)]
 pub enum AdmissionPredicate {
     Public {},
-    Authority { scope: String },
+    Authority {
+        scope: String,
+    },
+    /// The authority's act, admitted only while the ledger holds its witness
+    /// (norm-plane §6, D1): folding is attested through a live correspondence,
+    /// never by an authority-only transition. Only a transition may require it.
+    Witnessed {
+        scope: String,
+        witness: Witness,
+    },
+}
+
+/// What must hold in the ledger for a witnessed transition: a live relation of
+/// `family` whose `side` endpoint is the record's current revision and whose
+/// opposite endpoint is an effective revision — and, when `opposite_witnessed_by`
+/// names another family, a live edge of that family targets every such
+/// opposite endpoint.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Witness {
+    pub family: String,
+    pub side: WitnessSide,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opposite_witnessed_by: Option<String>,
+}
+
+/// Which endpoint of the witnessing relation the record occupies.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WitnessSide {
+    Source,
+    Target,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -176,8 +207,21 @@ impl Vocabulary {
                     "duplicate transition; admission must be unambiguous",
                 ));
             }
-            if let AdmissionPredicate::Authority { scope } = &transition.admission {
-                nonempty(scope, &format!("{path}.admission.scope"))?;
+            match &transition.admission {
+                AdmissionPredicate::Public {} => {}
+                AdmissionPredicate::Authority { scope } => {
+                    nonempty(scope, &format!("{path}.admission.scope"))?;
+                }
+                AdmissionPredicate::Witnessed { scope, witness } => {
+                    nonempty(scope, &format!("{path}.admission.scope"))?;
+                    nonempty(&witness.family, &format!("{path}.admission.witness.family"))?;
+                    if let Some(family) = &witness.opposite_witnessed_by {
+                        nonempty(
+                            family,
+                            &format!("{path}.admission.witness.opposite_witnessed_by"),
+                        )?;
+                    }
+                }
             }
         }
         // Definitions contain only structs, vectors and scalar strings/bools.

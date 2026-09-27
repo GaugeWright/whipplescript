@@ -1,0 +1,22 @@
+load ../decision-derivation.maude
+--- An accepted decision folds on its witnessing incorporation edge.
+search [1] in DECISION-DERIVATION : { dec(proposed, r0) inc(r0) support staleEdit anchorEdit contentEdit succ(proposed) supersedesEdge } =>* { ev(folded, r0) CFG:Cfg } .
+--- It is implemented while the requirement it incorporates is supported.
+search [1] in DECISION-DERIVATION : { dec(proposed, r0) inc(r0) support staleEdit anchorEdit contentEdit succ(proposed) supersedesEdge } =>* { ev(implemented, r0) CFG:Cfg } .
+--- The support goes stale: the current view says so and the history stands.
+search [1] in DECISION-DERIVATION : { dec(proposed, r0) inc(r0) support staleEdit anchorEdit contentEdit succ(proposed) supersedesEdge } =>* { ev(implemented, r0) CFG:Cfg } such that current(CFG:Cfg) == stale .
+--- An accepted successor supersedes.
+search [1] in DECISION-DERIVATION : { dec(proposed, r0) inc(r0) support staleEdit anchorEdit contentEdit succ(proposed) supersedesEdge } =>* { dec(superseded, r0) succ(accepted) CFG:Cfg } .
+--- Without a witnessing edge nothing folds, and an anchor edit counted as folding does.
+search in DECISION-DERIVATION : { dec(proposed, r0) support staleEdit anchorEdit contentEdit succ(proposed) supersedesEdge } =>* { ev(folded, R:Rev) CFG:Cfg } .
+search [1] in DECISION-DERIVATION-WEAK-EDIT-FOLDS : { dec(proposed, r0) support staleEdit anchorEdit contentEdit succ(proposed) supersedesEdge } =>* { ev(folded, R:Rev) CFG:Cfg } .
+--- A proposed successor never supersedes; the weakening lets it.
+search in DECISION-DERIVATION : { dec(proposed, r0) inc(r0) support staleEdit anchorEdit contentEdit succ(proposed) supersedesEdge } =>* { dec(superseded, R:Rev) succ(proposed) CFG:Cfg } .
+search [1] in DECISION-DERIVATION-WEAK-PROPOSED-SUCCESSOR : { dec(proposed, r0) inc(r0) support staleEdit anchorEdit contentEdit succ(proposed) supersedesEdge } =>* { dec(superseded, R:Rev) succ(proposed) CFG:Cfg } .
+--- Staleness never erases the implementation event; the weakening erases it.
+search in DECISION-DERIVATION : { dec(proposed, r0) inc(r0) support staleEdit anchorEdit contentEdit succ(proposed) supersedesEdge } =>* { dec(implemented, R:Rev) CFG:Cfg } such that hasEvent(implemented, R:Rev, CFG:Cfg) == false .
+search [1] in DECISION-DERIVATION-WEAK-STALENESS-ERASES : { dec(proposed, r0) inc(r0) support staleEdit anchorEdit contentEdit succ(proposed) supersedesEdge } =>* { dec(implemented, R:Rev) CFG:Cfg } such that hasEvent(implemented, R:Rev, CFG:Cfg) == false .
+--- Acceptance covers exact content: an edit leaves the new content unaccepted.
+search in DECISION-DERIVATION : { dec(proposed, r0) inc(r0) support staleEdit anchorEdit contentEdit succ(proposed) supersedesEdge } =>* { dec(accepted, R:Rev) CFG:Cfg } such that isAttested(R:Rev, CFG:Cfg) == false .
+search [1] in DECISION-DERIVATION-WEAK-EDIT-KEEPS-ACCEPTANCE : { dec(proposed, r0) inc(r0) support staleEdit anchorEdit contentEdit succ(proposed) supersedesEdge } =>* { dec(accepted, R:Rev) CFG:Cfg } such that isAttested(R:Rev, CFG:Cfg) == false .
+quit

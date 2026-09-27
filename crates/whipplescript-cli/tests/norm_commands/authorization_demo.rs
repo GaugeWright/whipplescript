@@ -204,7 +204,7 @@ fn observe(
     cut: &str,
     run: &str,
     wrong: &[&str],
-) {
+) -> String {
     let prepared = with_view(fixture, |ledger, view, verifier| {
         let history = CapturedNormHistory::capture(
             view,
@@ -279,6 +279,13 @@ fn observe(
         "{}",
         String::from_utf8_lossy(&published.stderr)
     );
+    let published: Value = serde_json::from_slice(&published.stdout).expect("publication JSON");
+    published
+        .get("event_id")
+        .or_else(|| published["result"].get("event_id"))
+        .and_then(Value::as_str)
+        .expect("the published observation")
+        .to_owned()
 }
 
 /// The same workspace as a hosted workspace object: its own branches,
@@ -399,6 +406,10 @@ impl Hosted {
     }
 
     fn impact(&self, before: &str, after: &str, requirement: &str) -> Vec<String> {
+        work_kinds(&self.planned(before, after), requirement)
+    }
+
+    fn planned(&self, before: &str, after: &str) -> Value {
         let sql = self.sql.clone();
         let answer = whipplescript_host_do::norm_commands::execute_installed_hosted_norm_impact(
             &DoSqliteStore::new(self.sql.clone()),
@@ -412,7 +423,7 @@ impl Hosted {
         )
         .expect("the hosted query answers");
         let answer: Value = serde_json::from_str(&answer).expect("impact JSON");
-        work_kinds(&answer["result"], requirement)
+        answer["result"].clone()
     }
 
     fn read(&self, branch: &str, path: &str) -> Option<String> {
@@ -461,6 +472,11 @@ fn impact(
     after: &str,
     requirement: &str,
 ) -> Vec<String> {
+    work_kinds(&planned(fixture, host, before, after), requirement)
+}
+
+/// The whole `norm impact` answer.
+fn planned(fixture: &Fixture, host: &Host, before: &str, after: &str) -> Value {
     let output = whip(
         fixture,
         &["--json", "norm", "impact", before, after],
@@ -472,12 +488,24 @@ fn impact(
         String::from_utf8_lossy(&output.stderr)
     );
     let planned: Value = serde_json::from_slice(&output.stdout).expect("impact JSON");
-    let planned = if planned.get("plan").is_some() {
+    if planned.get("plan").is_some() {
         planned
     } else {
         planned["result"].clone()
-    };
-    work_kinds(&planned, requirement)
+    }
+}
+
+/// A witnessed record's derived current conformance in an impact answer
+/// (norm-plane §6, D1), with the status its history reached.
+fn conformance(planned: &Value, record: &str) -> (String, String) {
+    let entry = planned["conformance"]
+        .as_array()
+        .and_then(|entries| entries.iter().find(|entry| entry["record"] == record))
+        .unwrap_or_else(|| panic!("{record} has no conformance in {planned}"));
+    (
+        entry["status"].as_str().unwrap_or_default().to_owned(),
+        entry["current"].as_str().unwrap_or_default().to_owned(),
+    )
 }
 
 fn promote(fixture: &Fixture, host: &Host, tokens: &[&str]) -> Output {
@@ -675,16 +703,90 @@ fn the_authorization_demo_repairs_a_violated_requirement_under_a_current_token()
         .as_str()
         .expect("folding")
         .to_owned();
-    observe(&fixture, &host, &hosted, &requirement, "a0", "a0", &[]);
+    let a0_observation = observe(&fixture, &host, &hosted, &requirement, "a0", "a0", &[]);
     assert_eq!(
         impact(&fixture, &host, "a0", "a0", &requirement),
         ["supported"]
+    );
+    // D0 is folded on its incorporation and implemented on R0's support, each
+    // a witnessed act binding what it relied on (D1). Before the support edge
+    // exists, implementation is refused.
+    let family = |name: &str| {
+        with_view(&fixture, |_, view, _| {
+            view.relation_family(name).expect("declared family").basis
+        })
+    };
+    let r_head = with_view(&fixture, |_, view, _| {
+        view.effective_records[&requirement].head.clone()
+    });
+    let (observation_revision, requirement_revision) = with_view(&fixture, |_, view, _| {
+        (
+            view.records[&a0_observation].content_head.clone(),
+            view.effective_records[&requirement].content_head.clone(),
+        )
+    });
+    fixture.run(&[
+        "transition",
+        &decision,
+        "folded",
+        "--as",
+        "owner",
+        "--family-basis",
+        &family("incorporation"),
+        "--references",
+        &r_head,
+    ]);
+    fixture.refuse(&[
+        "transition",
+        &decision,
+        "implemented",
+        "--as",
+        "owner",
+        "--family-basis",
+        &family("incorporation"),
+        "--references",
+        &format!("{r_head},{}", family("support")),
+    ]);
+    fixture.write(
+        "support.json",
+        &json!({"source": observation_revision, "target": requirement_revision}),
+    );
+    fixture.run(&[
+        "create",
+        "supports@1",
+        "--as",
+        "worker",
+        "--fields",
+        "support.json",
+        "--family-basis",
+        &family("support"),
+        "--references",
+        &format!("{observation_revision},{requirement_revision}"),
+    ]);
+    fixture.run(&[
+        "transition",
+        &decision,
+        "implemented",
+        "--as",
+        "owner",
+        "--family-basis",
+        &family("incorporation"),
+        "--references",
+        &format!("{r_head},{}", family("support")),
+    ]);
+    assert_eq!(
+        conformance(&planned(&fixture, &host, "a0", "a0"), &decision),
+        ("implemented".to_owned(), "holds".to_owned())
     );
     let historical = with_view(&fixture, |_, view, _| view.frontier.clone());
     fixture.write("historical.json", &json!(historical));
     let folded = snapshot(&fixture, Some("historical.json"));
     hosted.sync(&fixture);
     assert_eq!(hosted.impact("a0", "a0", &requirement), ["supported"]);
+    assert_eq!(
+        conformance(&hosted.planned("a0", "a0"), &decision),
+        ("implemented".to_owned(), "holds".to_owned())
+    );
 
     // W's exclusive reservation of `src/**`, granted by O: T1.
     fixture.write(
@@ -721,6 +823,17 @@ fn the_authorization_demo_repairs_a_violated_requirement_under_a_current_token()
     assert_eq!(impact(&fixture, &host, "a0", "a1", &requirement), ["check"]);
     hosted.sync(&fixture);
     assert_eq!(hosted.impact("a0", "a1", &requirement), ["check"]);
+    // D0's current conformance goes stale at the parser edit; its history
+    // still says implemented (NP-22).
+    for planned in [
+        planned(&fixture, &host, "a0", "a1"),
+        hosted.planned("a0", "a1"),
+    ] {
+        assert_eq!(
+            conformance(&planned, &decision),
+            ("implemented".to_owned(), "stale".to_owned())
+        );
+    }
     observe(
         &fixture,
         &host,
@@ -736,6 +849,16 @@ fn the_authorization_demo_repairs_a_violated_requirement_under_a_current_token()
     );
     hosted.sync(&fixture);
     assert_eq!(hosted.impact("a0", "a1", &requirement), ["repair"]);
+    // ...and contradicted once Q0 fails there.
+    for planned in [
+        planned(&fixture, &host, "a0", "a1"),
+        hosted.planned("a0", "a1"),
+    ] {
+        assert_eq!(
+            conformance(&planned, &decision),
+            ("implemented".to_owned(), "contradicted".to_owned())
+        );
+    }
     let violated = refused(&promote(&fixture, &host, &[&t1]));
     assert_eq!(
         violated["detail"]["requirements"][&requirement],
