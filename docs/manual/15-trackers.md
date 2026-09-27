@@ -65,6 +65,27 @@ An issue with no assignee is the ordinary case. It means "whoever has access",
 and any party can claim it. Do not treat the absence of an assignee as an
 omission.
 
+## Labels
+
+An issue is filed with its labels, and they can change afterwards:
+
+```sh
+whip issue label WS-1 needs:founder p1
+whip issue unlabel WS-1 needs:founder
+```
+
+Labels are a set. Adding a label the issue already carries, or removing one it
+does not, changes nothing and records nothing. Any issue can be relabelled,
+whatever its status: a label is a note about the work, and a closed issue can
+still carry one that is no longer true.
+
+Each change is an event in the issue's log, so it survives `whip issue
+rebuild` and travels with `export` and `import`. When two copies of a tracker
+change one issue's labels independently, the merge is the same on both sides.
+Labels that either side added are both kept. When one side removed a label
+while the other added it back, the event later in the log's canonical order
+decides, and every copy picks the same one.
+
 Work enters from the two sides of the surface. A rule files an issue with a
 statement:
 

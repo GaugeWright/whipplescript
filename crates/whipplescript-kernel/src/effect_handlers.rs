@@ -3021,6 +3021,23 @@ pub fn promote_stream_id(input: &Value) -> Option<&str> {
         .filter(|value| !value.is_empty())
 }
 
+/// The grant a `vcs.promote` effect names, if any (`promote <stream> with
+/// <grant>`, norm-plane §7): a norm record's id or local alias, whose current
+/// token the door presents. Anything but a nonempty string is refused rather
+/// than presenting nothing.
+pub fn promote_grant(input: &Value) -> Result<Option<&str>, String> {
+    let Some(grant) = input.get("grant").filter(|grant| !grant.is_null()) else {
+        return Ok(None);
+    };
+    let named = grant.as_str().filter(|name| !name.trim().is_empty());
+    if named.is_none() {
+        return Err(format!(
+            "a promote grant names a norm record by its id or alias, not {grant}"
+        ));
+    }
+    Ok(named)
+}
+
 fn promote_cut_value(value: &str) -> Option<&str> {
     (!value.is_empty()).then_some(value)
 }
@@ -6482,6 +6499,25 @@ mod promote_door_tests {
         drop(streams);
         drop(database);
         std::fs::remove_dir_all(dir).expect("remove fixture");
+    }
+
+    #[test]
+    fn a_promote_grant_is_a_named_record_or_nothing() {
+        assert_eq!(promote_grant(&json!({ "stream": "triage" })), Ok(None));
+        assert_eq!(
+            promote_grant(&json!({ "stream": "triage", "grant": null })),
+            Ok(None)
+        );
+        assert_eq!(
+            promote_grant(&json!({ "stream": "triage", "grant": "N-7" })),
+            Ok(Some("N-7"))
+        );
+        for bad in [json!(""), json!(" "), json!(7), json!(["N-7"])] {
+            assert!(
+                promote_grant(&json!({ "stream": "triage", "grant": bad })).is_err(),
+                "{bad}"
+            );
+        }
     }
 
     #[test]

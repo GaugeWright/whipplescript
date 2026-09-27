@@ -30,7 +30,8 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-WHIP=(cargo run --quiet --manifest-path "$ROOT/Cargo.toml" -p whipplescript --)
+. "$ROOT/scripts/whip-bin.sh"
+WHIP=("$(whip_bin)")
 
 # The examples that carry an `.ir` golden — 25 of the 64 under examples/. The
 # rest are exercised by the run-driven gates (docs-examples, rule-coverage, the

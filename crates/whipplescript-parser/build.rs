@@ -274,6 +274,7 @@ fn emit_construct_row(
     seen_keywords.push((construct_keyword.to_owned(), label.to_owned()));
 
     let mut slot_rows = String::new();
+    let mut seen_optional = false;
     for slot in grammar
         .get("slots")
         .and_then(Value::as_array)
@@ -308,6 +309,23 @@ fn emit_construct_row(
                 Some(connective)
             }
         };
+        let required = match slot.get("required") {
+            None | Some(Value::Null) => true,
+            Some(required) => required.as_bool().unwrap_or_else(|| {
+                fail(&format!("grammar slot `{name}` required must be a boolean"))
+            }),
+        };
+        if !required && connective.is_none() {
+            fail(&format!(
+                "grammar slot `{name}` is optional and must be introduced by a connective"
+            ));
+        }
+        if required && seen_optional {
+            fail(&format!(
+                "grammar slot `{name}` is required but follows an optional slot"
+            ));
+        }
+        seen_optional |= !required;
         let kind_variant = if kind == "identifier" {
             "SlotKind::Identifier"
         } else {
@@ -322,6 +340,7 @@ fn emit_construct_row(
              \x20               name: {name:?},\n\
              \x20               kind: {kind_variant},\n\
              \x20               connective: {connective_expr},\n\
+             \x20               required: {required},\n\
              \x20           }},\n"
         ));
     }

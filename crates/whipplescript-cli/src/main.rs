@@ -24888,28 +24888,31 @@ impl whipplescript_kernel::effect_handlers::CapabilityProvider for VcsSelectiveC
         } else {
             whipplescript_kernel::norm_admission::AdmissionDoor::Transport
         };
-        let outcome = norm_commands::with_mainline_admission(&self.store_path, door, &[], |gate| {
-            whipplescript_kernel::effect_handlers::run_selective_verb_generic(
-                &mut vcs,
-                effect.target.as_deref(),
-                &input,
-                &expr,
-                &branch_id,
-                &cut_id,
-                &at,
-                &mut |onto| {
-                    open_streams().ok().and_then(|streams| {
-                        whipplescript_store::workstreams::Workstreams::get_stream(&streams, onto)
+        let outcome =
+            norm_commands::with_mainline_admission(&self.store_path, door, &[], &[], |gate| {
+                whipplescript_kernel::effect_handlers::run_selective_verb_generic(
+                    &mut vcs,
+                    effect.target.as_deref(),
+                    &input,
+                    &expr,
+                    &branch_id,
+                    &cut_id,
+                    &at,
+                    &mut |onto| {
+                        open_streams().ok().and_then(|streams| {
+                            whipplescript_store::workstreams::Workstreams::get_stream(
+                                &streams, onto,
+                            )
                             .ok()
                             .flatten()
                             .map(|stream| stream.line_branch_id)
-                    })
-                },
-                &mut |vcs, line, cut| staleness_deltas(vcs, line, cut),
-                gate,
-            )
-        })
-        .and_then(|outcome| outcome);
+                        })
+                    },
+                    &mut |vcs, line, cut| staleness_deltas(vcs, line, cut),
+                    gate,
+                )
+            })
+            .and_then(|outcome| outcome);
         // Whatever the op observed — refusal facts included — deliver and
         // arm, exactly as the CLI verbs do.
         let facts = vcs.take_pending_facts();
@@ -24953,6 +24956,24 @@ impl whipplescript_kernel::effect_handlers::CapabilityProvider for VcsPromoteCap
         else {
             return failed("vcs.promote input names no stream".to_owned());
         };
+        // `promote <stream> with <grant>` (norm-plane §7): the named grant is
+        // resolved to its record here, and the gate presents that record's
+        // current token from the ledger state it certifies.
+        let grants = match whipplescript_kernel::effect_handlers::promote_grant(&input) {
+            Ok(None) => Vec::new(),
+            Ok(Some(grant)) => {
+                match whipplescript_store::items::WorkItemStore::open(items_store_path())
+                    .and_then(|ledger| ledger.resolve_norm_record(grant))
+                {
+                    Ok(Some(record)) => vec![record],
+                    Ok(None) => {
+                        return failed(format!("the named grant {grant} is not a norm record"))
+                    }
+                    Err(error) => return failed(format!("norm ledger unavailable: {error:?}")),
+                }
+            }
+            Err(message) => return failed(message),
+        };
         let mut streams = match whipplescript_store::workstreams::WorkstreamStore::open(
             workstream_store_path(),
         ) {
@@ -24974,9 +24995,8 @@ impl whipplescript_kernel::effect_handlers::CapabilityProvider for VcsPromoteCap
             &holder,
             &at,
             &self.store_path,
-            // The effect's contract carries no reservation tokens yet, so an
-            // in-language promotion of a reserved change is refused.
             &[],
+            &grants,
         );
         // Fact routing is this host's surface (A5): the mediator delivers
         // vcs.* facts natively; the DO deliberately routes none.
@@ -33740,6 +33760,7 @@ claim <id> [--actor A] [--ttl D] [--override REASON]|why <id>|\
 renew <id> [--actor A] [--ttl D]|\
 release <id>|\
 assign <id> [--to A|--clear]|\
+label <id> <label>...|unlabel <id> <label>...|\
 finish <id> [--summary S]|complete <id> [--summary S]|\
 cancel <id> [--reason R]|reopen <id> [--note N]|\
 fail <id> [--actor A]|\
@@ -34789,6 +34810,44 @@ fn issue(options: &CliOptions) -> ExitCode {
                     ExitCode::FAILURE
                 }
                 Err(error) => report_store_error("failed to assign issue", error),
+            }
+        }
+        // Add or remove labels on a filed issue. Labels are a set, so a label
+        // already present (or already absent) changes nothing and records
+        // nothing; any status may be relabelled.
+        "label" | "unlabel" => {
+            let Some(id) = args.get(1) else {
+                eprintln!("{usage}");
+                return ExitCode::from(2);
+            };
+            let labels: Vec<String> = args.iter().skip(2).cloned().collect();
+            if labels.is_empty() {
+                eprintln!("{usage}");
+                return ExitCode::from(2);
+            }
+            let outcome = if command == "label" {
+                store.label_item(id, &labels)
+            } else {
+                store.unlabel_item(id, &labels)
+            };
+            match outcome {
+                Ok(Some(labels)) => {
+                    if options.json {
+                        return emit_issue_row(&store, id, "labels", true);
+                    }
+                    let shown = if labels.is_empty() {
+                        "(none)".to_owned()
+                    } else {
+                        labels.join(", ")
+                    };
+                    println!("{id} labels: {shown}");
+                    ExitCode::SUCCESS
+                }
+                Ok(None) => {
+                    eprintln!("issue `{id}` not found");
+                    ExitCode::FAILURE
+                }
+                Err(error) => report_store_error("failed to change labels", error),
             }
         }
         "finish" | "complete" => {
@@ -38339,7 +38398,7 @@ const STREAM_USAGE: &str =
   whip stream join <stream> <branch>\n\
   whip stream leave <branch>\n\
   whip stream archive <stream>\n\
-  whip stream promote <stream> [--token <reservation-token>]...\n\
+  whip stream promote <stream> [--token <reservation-token>]... [--grant <grant-id-or-alias>]...\n\
   whip stream list\n\
   whip stream show <stream>";
 
@@ -38441,7 +38500,7 @@ fn through_mainline_gate<T>(
         &mut dyn whipplescript_store::vcs::MainlineGate,
     ) -> whipplescript_store::StoreResult<T>,
 ) -> whipplescript_store::StoreResult<T> {
-    norm_commands::with_mainline_admission(runtime_path, door, &[], f)
+    norm_commands::with_mainline_admission(runtime_path, door, &[], &[], f)
         .map_err(whipplescript_store::StoreError::Conflict)?
 }
 
@@ -38482,6 +38541,7 @@ fn run_reserved_boundary_promotion(
     at: &str,
     runtime_path: &Path,
     tokens: &[String],
+    grants: &[String],
 ) -> Result<BoundaryRunOutcome, String> {
     let proposed_main = format!("{}-promote", generated_cut_id());
     let mut serialization = AdoptionLeaseSerialization::new(holder);
@@ -38489,6 +38549,7 @@ fn run_reserved_boundary_promotion(
         runtime_path,
         whipplescript_kernel::norm_admission::AdmissionDoor::Promote,
         tokens,
+        grants,
         |gate| {
             whipplescript_kernel::effect_handlers::run_reserved_boundary_promotion_generic(
                 streams,
@@ -38670,6 +38731,27 @@ fn stream_command(options: &CliOptions) -> ExitCode {
                 .filter(|pair| pair[0] == "--token")
                 .map(|pair| pair[1].to_owned())
                 .collect();
+            // Or the grants themselves, as `promote <stream> with <grant>`
+            // names one: the gate presents each record's current token.
+            let mut grants = Vec::new();
+            for pair in rest.windows(2).filter(|pair| pair[0] == "--grant") {
+                match whipplescript_store::items::WorkItemStore::open(items_store_path())
+                    .and_then(|ledger| ledger.resolve_norm_record(pair[1]))
+                {
+                    Ok(Some(record)) => grants.push(record),
+                    Ok(None) => {
+                        eprintln!(
+                            "stream promote: the named grant {} is not a norm record",
+                            pair[1]
+                        );
+                        return ExitCode::from(2);
+                    }
+                    Err(error) => {
+                        eprintln!("stream promote: norm ledger unavailable: {error:?}");
+                        return ExitCode::FAILURE;
+                    }
+                }
+            }
             let mut vcs = match open_vcs() {
                 Ok(vcs) => vcs,
                 Err(code) => return code,
@@ -38685,6 +38767,7 @@ fn stream_command(options: &CliOptions) -> ExitCode {
                 &at,
                 &options.store_path,
                 &tokens,
+                &grants,
             ) {
                 Ok(BoundaryRunOutcome::Promoted {
                     receipt,

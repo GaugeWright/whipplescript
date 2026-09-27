@@ -995,6 +995,78 @@ impl WorkItemStore {
         Ok(outcome)
     }
 
+    /// Adds labels to an issue after it is filed (`issue.labeled`). Returns the
+    /// issue's labels afterwards, or `None` if the issue does not exist. Labels
+    /// are a set: one already present is not added twice, and a call that
+    /// changes nothing appends no event. Any status may be labelled — a label
+    /// is metadata, not work, and a closed issue can still need one removed.
+    pub fn label_item(
+        &mut self,
+        item_id: &str,
+        labels: &[String],
+    ) -> StoreResult<Option<Vec<String>>> {
+        self.change_labels(item_id, LABELED, labels)
+    }
+
+    /// Removes labels from an issue (`issue.unlabeled`), the inverse of
+    /// [`Self::label_item`]. Removing a label the issue does not carry is a
+    /// no-op that appends no event.
+    pub fn unlabel_item(
+        &mut self,
+        item_id: &str,
+        labels: &[String],
+    ) -> StoreResult<Option<Vec<String>>> {
+        self.change_labels(item_id, UNLABELED, labels)
+    }
+
+    fn change_labels(
+        &mut self,
+        item_id: &str,
+        kind: &str,
+        labels: &[String],
+    ) -> StoreResult<Option<Vec<String>>> {
+        let labels = normalize_labels(labels)?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let current: Option<String> = tx
+            .query_row(
+                "SELECT whip_payload_open('tracker.issue.labels_json', issue_id, labels_json) \
+                 FROM tracker_issues WHERE issue_id = ?1",
+                [item_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(current) = current else {
+            tx.commit()?;
+            return Ok(None);
+        };
+        let current: Vec<String> = serde_json::from_str(&current).unwrap_or_default();
+        let payload = json!({ "labels": labels });
+        let next = apply_label_change(&current, kind, &payload);
+        if next == current {
+            tx.commit()?;
+            return Ok(Some(current));
+        }
+        let now = tx_now(&tx)?;
+        tx_append_event(
+            &tx,
+            Some(item_id),
+            kind,
+            &payload,
+            None,
+            self.event_effect_id.as_deref(),
+            &now,
+        )?;
+        tx.execute(
+            "UPDATE tracker_issues SET labels_json = whip_payload_seal('tracker.issue.labels_json', ?1, ?2), \
+             updated_at = ?3 WHERE issue_id = ?1",
+            params![item_id, serde_json::to_string(&next)?, now],
+        )?;
+        tx.commit()?;
+        Ok(Some(next))
+    }
+
     /// Records a `blocks(from -> to)` edge: `from` blocks `to`, so `to` is not
     /// ready until `from` closes (`tracker-readiness.maude`). Appends a
     /// `relation.added` event and folds it into `tracker_relations` in one
@@ -3026,6 +3098,65 @@ fn load_issue_events(conn: &Connection, issue_id: &str) -> StoreResult<Vec<Issue
         .collect())
 }
 
+/// The event that adds labels to a filed issue; its payload is `{"labels": [..]}`.
+pub const LABELED: &str = "issue.labeled";
+/// The event that removes labels from an issue; same payload shape.
+pub const UNLABELED: &str = "issue.unlabeled";
+
+/// An issue's labels after one `issue.labeled` / `issue.unlabeled` event. The
+/// one place either store computes it, live or in a rebuild, so the native and
+/// DO projections cannot disagree. Set semantics: labelling adds only what is
+/// absent (appended in the event's order), unlabelling removes every copy.
+/// Two clones' events meet in the fold's topological order — concurrent events
+/// by event id — so a merge resolves identically everywhere: labels added on
+/// both sides union, and a label one side added while the other removed it
+/// ends as the later event in that order leaves it.
+pub fn apply_label_change(current: &[String], kind: &str, payload: &Value) -> Vec<String> {
+    let changed: Vec<&str> = payload
+        .get("labels")
+        .and_then(Value::as_array)
+        .map(|labels| labels.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    let mut next: Vec<String> = Vec::with_capacity(current.len() + changed.len());
+    for label in current {
+        if !next.contains(label) {
+            next.push(label.clone());
+        }
+    }
+    match kind {
+        LABELED => {
+            for label in changed {
+                if !next.iter().any(|held| held == label) {
+                    next.push(label.to_owned());
+                }
+            }
+        }
+        UNLABELED => next.retain(|held| !changed.contains(&held.as_str())),
+        _ => {}
+    }
+    next
+}
+
+/// Labels as a caller gave them, refused if one is blank and deduplicated in
+/// order, so an event never records a label twice.
+#[cfg(feature = "native")]
+fn normalize_labels(labels: &[String]) -> StoreResult<Vec<String>> {
+    let mut out: Vec<String> = Vec::with_capacity(labels.len());
+    for label in labels {
+        let label = label.trim();
+        if label.is_empty() {
+            return Err(StoreError::Conflict("a label cannot be empty".to_owned()));
+        }
+        if !out.iter().any(|held| held == label) {
+            out.push(label.to_owned());
+        }
+    }
+    if out.is_empty() {
+        return Err(StoreError::Conflict("name at least one label".to_owned()));
+    }
+    Ok(out)
+}
+
 /// The frontier of an issue's event DAG — the events nothing lists as a parent
 /// — from one pass over `(event_id, parents)` pairs. These are the heads an
 /// append chains on and the analysis's `heads`; an event with no id is never
@@ -3276,6 +3407,27 @@ fn fold_event(
                     ),
                     params![id, value, created_at],
                 )?;
+            }
+        }
+        LABELED | UNLABELED => {
+            if let Some(id) = issue_id {
+                let current: Option<String> = tx
+                    .query_row(
+                        "SELECT whip_payload_open('tracker.issue.labels_json', issue_id, labels_json) \
+                         FROM tracker_issues WHERE issue_id = ?1",
+                        [id],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                if let Some(current) = current {
+                    let current: Vec<String> = serde_json::from_str(&current).unwrap_or_default();
+                    let next = apply_label_change(&current, kind, payload);
+                    tx.execute(
+                        "UPDATE tracker_issues SET labels_json = whip_payload_seal('tracker.issue.labels_json', ?1, ?2), \
+                         updated_at = ?3 WHERE issue_id = ?1",
+                        params![id, serde_json::to_string(&next)?, created_at],
+                    )?;
+                }
             }
         }
         "issue.closed" => fold_set_status(tx, issue_id, payload, "closed", created_at)?,
@@ -6844,6 +6996,238 @@ mod tests {
         store.rebuild_projection().expect("rebuild");
         let after = store.dump_projection().expect("dump after");
         assert_eq!(before, after, "rebuild reproduces the live projection");
+    }
+
+    fn labels_of(store: &WorkItemStore, id: &str) -> Vec<String> {
+        store.get_item(id).expect("gets").expect("present").labels
+    }
+
+    fn strings(labels: &[&str]) -> Vec<String> {
+        labels.iter().map(|l| (*l).to_owned()).collect()
+    }
+
+    fn label_events(store: &WorkItemStore) -> usize {
+        store
+            .export_events()
+            .expect("exports")
+            .iter()
+            .filter(|e| e.kind == LABELED || e.kind == UNLABELED)
+            .count()
+    }
+
+    /// Labels change after filing, so a label that stood for a question — the
+    /// founder's `needs:founder` — can be taken off once it is answered.
+    #[test]
+    fn labels_are_added_and_removed_after_filing() {
+        let mut store = open_memory();
+        let item = store
+            .file_item(
+                "q",
+                "a",
+                "",
+                &strings(&["needs:founder"]),
+                &json!({}),
+                None,
+                None,
+            )
+            .expect("files");
+        assert_eq!(
+            store
+                .label_item(&item.id, &strings(&["bug", "p1"]))
+                .expect("labels"),
+            Some(strings(&["needs:founder", "bug", "p1"]))
+        );
+        assert_eq!(
+            store
+                .unlabel_item(&item.id, &strings(&["needs:founder"]))
+                .expect("unlabels"),
+            Some(strings(&["bug", "p1"]))
+        );
+        assert_eq!(labels_of(&store, &item.id), strings(&["bug", "p1"]));
+        assert_eq!(label_events(&store), 2);
+    }
+
+    #[test]
+    fn labelling_is_idempotent_and_records_only_changes() {
+        let mut store = open_memory();
+        let item = store
+            .file_item("q", "a", "", &strings(&["x"]), &json!({}), None, None)
+            .expect("files");
+        store
+            .label_item(&item.id, &strings(&["x"]))
+            .expect("no-op label");
+        store
+            .unlabel_item(&item.id, &strings(&["absent"]))
+            .expect("no-op unlabel");
+        assert_eq!(
+            label_events(&store),
+            0,
+            "a call that changes nothing records nothing"
+        );
+        store
+            .label_item(&item.id, &strings(&["y", "y"]))
+            .expect("labels");
+        store
+            .label_item(&item.id, &strings(&["y"]))
+            .expect("labels again");
+        assert_eq!(labels_of(&store, &item.id), strings(&["x", "y"]));
+        assert_eq!(label_events(&store), 1);
+        store
+            .unlabel_item(&item.id, &strings(&["y"]))
+            .expect("unlabels");
+        store
+            .unlabel_item(&item.id, &strings(&["y"]))
+            .expect("unlabels again");
+        assert_eq!(labels_of(&store, &item.id), strings(&["x"]));
+        assert_eq!(label_events(&store), 2);
+    }
+
+    #[test]
+    fn labelling_refuses_blank_labels_and_reports_an_absent_issue() {
+        let mut store = open_memory();
+        let item = store
+            .file_item("q", "a", "", &[], &json!({}), None, None)
+            .expect("files");
+        let blank = store.label_item(&item.id, &strings(&[" "])).unwrap_err();
+        assert!(format!("{blank:?}").contains("a label cannot be empty"));
+        let none = store.unlabel_item(&item.id, &[]).unwrap_err();
+        assert!(format!("{none:?}").contains("name at least one label"));
+        assert_eq!(
+            store.label_item("WS-99", &strings(&["x"])).expect("absent"),
+            None
+        );
+        assert_eq!(
+            store
+                .unlabel_item("WS-99", &strings(&["x"]))
+                .expect("absent"),
+            None
+        );
+    }
+
+    #[test]
+    fn a_closed_issue_can_still_be_relabelled() {
+        let mut store = open_memory();
+        let item = store
+            .file_item(
+                "q",
+                "a",
+                "",
+                &strings(&["needs:founder"]),
+                &json!({}),
+                None,
+                None,
+            )
+            .expect("files");
+        store.finish_item(&item.id, None, None).expect("finishes");
+        store
+            .unlabel_item(&item.id, &strings(&["needs:founder"]))
+            .expect("unlabels");
+        assert!(labels_of(&store, &item.id).is_empty());
+    }
+
+    #[test]
+    fn label_changes_survive_a_rebuild() {
+        let mut store = open_memory();
+        let item = store
+            .file_item(
+                "q",
+                "a",
+                "",
+                &strings(&["needs:founder", "x"]),
+                &json!({}),
+                None,
+                None,
+            )
+            .expect("files");
+        store
+            .label_item(&item.id, &strings(&["y"]))
+            .expect("labels");
+        store
+            .unlabel_item(&item.id, &strings(&["needs:founder"]))
+            .expect("unlabels");
+        let before = store.dump_projection().expect("dump before");
+        store.rebuild_projection().expect("rebuilds");
+        assert_eq!(store.dump_projection().expect("dump after"), before);
+        assert_eq!(labels_of(&store, &item.id), strings(&["x", "y"]));
+    }
+
+    #[test]
+    fn label_changes_round_trip_through_export_and_import() {
+        let mut a = open_memory();
+        let item = a
+            .file_item(
+                "q",
+                "a",
+                "",
+                &strings(&["needs:founder"]),
+                &json!({}),
+                None,
+                None,
+            )
+            .expect("files");
+        a.label_item(&item.id, &strings(&["decided"]))
+            .expect("labels");
+        a.unlabel_item(&item.id, &strings(&["needs:founder"]))
+            .expect("unlabels");
+
+        let mut b = open_memory();
+        let report = b.import_events(&a.export_events().unwrap()).unwrap();
+        assert_eq!(report.rejected, 0);
+        assert_eq!(labels_of(&b, "WS-1"), strings(&["decided"]));
+
+        let dir =
+            std::env::temp_dir().join(format!("whip-labels-{}-{}", std::process::id(), item.id));
+        let _ = std::fs::remove_dir_all(&dir);
+        a.export_to_dir(&dir).expect("exports to dir");
+        let mut c = open_memory();
+        c.import_from_dir(&dir).expect("imports from dir");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(labels_of(&c, "WS-1"), strings(&["decided"]));
+    }
+
+    /// Two clones changing one issue's labels independently meet at a merge
+    /// and resolve to the same set on both sides, whichever imports first:
+    /// disjoint additions union, and a label one side removed while the other
+    /// put it back resolves by the fold's canonical order, identically.
+    #[test]
+    fn concurrent_label_changes_merge_deterministically() {
+        let mut a = open_memory();
+        let mut b = open_memory();
+        let item = a
+            .file_item("q", "shared", "", &strings(&["z"]), &json!({}), None, None)
+            .expect("files");
+        b.import_events(&a.export_events().unwrap()).unwrap();
+        let b_id = "WS-1";
+
+        a.label_item(&item.id, &strings(&["from-a"]))
+            .expect("a labels");
+        a.unlabel_item(&item.id, &strings(&["z"]))
+            .expect("a unlabels");
+        b.label_item(b_id, &strings(&["from-b"])).expect("b labels");
+        b.unlabel_item(b_id, &strings(&["z"])).expect("b unlabels");
+        b.label_item(b_id, &strings(&["z"])).expect("b relabels");
+
+        let from_a = a.export_events().unwrap();
+        let from_b = b.export_events().unwrap();
+        a.import_events(&from_b).unwrap();
+        b.import_events(&from_a).unwrap();
+
+        let merged = labels_of(&a, &item.id);
+        assert_eq!(merged, labels_of(&b, b_id), "both clones agree");
+        assert!(merged.contains(&"from-a".to_owned()));
+        assert!(merged.contains(&"from-b".to_owned()));
+        assert!(
+            merged.iter().filter(|l| l.as_str() == "z").count() <= 1,
+            "a label is held at most once"
+        );
+        let mut rebuilt = open_memory();
+        rebuilt.import_events(&from_b).unwrap();
+        rebuilt.import_events(&from_a).unwrap();
+        assert_eq!(
+            labels_of(&rebuilt, "WS-1"),
+            merged,
+            "import order does not matter"
+        );
     }
 
     // -- test-only projection helpers -------------------------------------

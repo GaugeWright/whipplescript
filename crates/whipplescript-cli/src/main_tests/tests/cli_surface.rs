@@ -101,6 +101,7 @@ fn native_promotion_releases_both_reservations_after_proven_pre_cas_error() {
         "t3",
         std::path::Path::new(":memory:"),
         &[],
+        &[],
     )
     .expect_err("conflicting immutable cut identity must fail");
     assert!(error.contains("reservations released"), "{error}");
@@ -187,6 +188,7 @@ fn native_promotion_releases_both_reservations_after_proven_pre_cas_error() {
             "t6",
             std::path::Path::new(":memory:"),
             &[],
+            &[],
         );
         db.execute_batch("DROP TRIGGER fail_promotion_log;")
             .expect("remove fault");
@@ -226,6 +228,7 @@ fn native_promotion_releases_both_reservations_after_proven_pre_cas_error() {
                     "holder",
                     "t7",
                     std::path::Path::new(":memory:"),
+                    &[],
                     &[],
                 ),
                 Ok(BoundaryRunOutcome::Promoted { .. })

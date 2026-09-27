@@ -19029,6 +19029,16 @@ rule hop
         .expect("promote lowers to a capability call");
     assert_eq!(promote.binding.as_deref(), Some("p"));
 
+    // `with <grant>` is optional (norm-plane §7): it names the grant whose
+    // current token the door presents, and a `with` that names nothing is a
+    // parse error rather than a promote without one.
+    let granted =
+        compile_program(&base.replace("promote triage as p", "promote triage with \"N-7\" as p"));
+    assert!(granted.diagnostics.is_empty(), "{:?}", granted.diagnostics);
+    assert!(granted.ir.is_some());
+    let empty = compile_program(&base.replace("promote triage as p", "promote triage with as p"));
+    assert!(!empty.diagnostics.is_empty());
+
     // `succeeds` on a promote binding is refused (a workflow must not
     // proceed "as if promoted" on a conflicted boundary).
     let succeeds = base.replace(

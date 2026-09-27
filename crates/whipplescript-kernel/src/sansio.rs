@@ -55,7 +55,9 @@ impl ModelContentProvenance {
 }
 
 /// Host-supplied source identities for the distinct initial input planes.
-/// A host that cannot prove one plane leaves its default (unknown) value.
+/// `workspace_content` is an auxiliary source for discovered documents and
+/// file-tool results; it is not automatically a dependency of the generated
+/// world-state message. A host that cannot prove a source leaves it unknown.
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct InitialModelProvenance {
@@ -63,6 +65,8 @@ pub struct InitialModelProvenance {
     pub user: ModelContentProvenance,
     pub world: ModelContentProvenance,
     pub tools: ModelContentProvenance,
+    #[serde(default)]
+    pub workspace_content: ModelContentProvenance,
 }
 
 /// A transport-agnostic HTTP request. The kernel builds these; a host transport
@@ -162,6 +166,28 @@ pub fn run_to_completion<M: StepMachine, H: HostDriver + ?Sized>(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn workspace_content_is_separate_from_the_model_world_label() {
+        let labels: InitialModelProvenance = serde_json::from_value(json!({
+            "system": {"source_handles": ["package:one"], "complete": true},
+            "user": {"source_handles": ["chat:one"], "complete": true},
+            "world": {"source_handles": ["package:one"], "complete": true},
+            "tools": {"source_handles": ["package:one"], "complete": true}
+        }))
+        .expect("older hosts can omit the auxiliary field");
+        assert!(!labels.workspace_content.complete);
+        assert_eq!(labels.world.source_handles, ["package:one"]);
+
+        let mut value = serde_json::to_value(labels).expect("labels serialize");
+        value["workspace_content"] = json!({
+            "source_handles": ["workspace:one"], "complete": true
+        });
+        let labels: InitialModelProvenance =
+            serde_json::from_value(value).expect("workspace source parses");
+        assert_eq!(labels.workspace_content.source_handles, ["workspace:one"]);
+        assert_eq!(labels.world.source_handles, ["package:one"]);
+    }
 
     /// A host that echoes each request's URL back as a 200 body, and counts the
     /// I/O rounds it fulfilled.

@@ -64,9 +64,8 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
 # Build once; the per-fence runs then cost a process each rather than a compile.
-cargo build --quiet -p whipplescript --bin whip
-WHIP="$ROOT/target/debug/whip"
-[ -x "$WHIP" ] || WHIP="$ROOT/target/release/whip"
+. "$ROOT/scripts/whip-bin.sh"
+WHIP="$(whip_bin)"
 
 WHIP="$WHIP" python3 - <<'PY'
 import os, pathlib, re, subprocess, sys, tempfile

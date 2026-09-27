@@ -878,6 +878,9 @@ struct EffectSlotSpec {
     name: &'static str,
     kind: SlotKind,
     connective: Option<&'static str>,
+    /// An optional slot follows every required one and is introduced by its
+    /// connective: a use that does not say the connective does not supply it.
+    required: bool,
 }
 
 /// One field inside the optional `{ ... }` payload block: a named expression,
@@ -3541,6 +3544,9 @@ impl<'a> BodyParser<'a> {
         let mut fields: Vec<ConstructUseField> = Vec::new();
         for slot in spec.slots {
             if let Some(connective) = slot.connective {
+                if !slot.required && !self.at_ident(connective) {
+                    continue;
+                }
                 if !self.consume_ident(connective) {
                     let span = self.span_here();
                     self.error(

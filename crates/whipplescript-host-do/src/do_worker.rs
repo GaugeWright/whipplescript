@@ -229,11 +229,11 @@ impl<Sql: DoSql + 'static> DurableInstance<Sql> {
             DoSqlStorage::for_instance(Rc::clone(&sql), instance_id),
         ));
         let workspace_source = ports.initial_model_provenance.as_ref().and_then(|labels| {
-            if !labels.world.complete {
+            if !labels.workspace_content.complete {
                 return None;
             }
             let mut sources = labels
-                .world
+                .workspace_content
                 .source_handles
                 .iter()
                 .filter(|handle| handle.starts_with("workspace:"));

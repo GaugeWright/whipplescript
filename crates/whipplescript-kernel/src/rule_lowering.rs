@@ -4334,11 +4334,20 @@ pub fn parse_effect_statements(
                 after: current_after,
             });
         } else if let Some(rest) = trimmed.strip_prefix("promote ") {
-            // promote <stream> as <binding> (std.vcs, DR-0052): the
-            // boundary hop lowers to a `vcs.promote` capability.call whose
-            // input carries the stream name; the outcome's `variant`
-            // (Promoted|Conflicted) is what the after-arms dispatch on.
+            // promote <stream> [with <grant>] as <binding> (std.vcs,
+            // DR-0052): the boundary hop lowers to a `vcs.promote`
+            // capability.call whose input carries the stream name and the
+            // grant the workflow names, if any (norm-plane §7); the outcome's
+            // `variant` (Promoted|Conflicted) is what the after-arms dispatch on.
             let stream = rest.split_whitespace().next().unwrap_or("").to_owned();
+            let mut args = vec![stream];
+            if let Some((_, grant)) = rest.split_once(" with ") {
+                let grant = match grant.rsplit_once(" as ") {
+                    Some((expr, _)) => expr,
+                    None => grant,
+                };
+                args.push(grant.trim().to_owned());
+            }
             let target = "vcs.promote".to_owned();
             effects.push(ParsedEffect {
                 timeout_seconds: parse_timeout_clause_seconds(trimmed),
@@ -4346,7 +4355,7 @@ pub fn parse_effect_statements(
                 target: Some(target.clone()),
                 name: Some("promote".to_owned()),
                 binding: binding_after_as(trimmed),
-                args: vec![stream],
+                args,
                 prompt: None,
                 prompt_content_type: None,
                 prompt_template: None,
@@ -5369,12 +5378,21 @@ pub fn parsed_effect_input_json(
             "bindings": context_bindings_json(context),
             "rule": rule.name,
         }),
-        "capability.call" if effect.name.as_deref() == Some("promote") => json!({
-            "target": effect.target,
-            "stream": effect.args.first().cloned().unwrap_or_default(),
-            "bindings": context_bindings_json(context),
-            "rule": rule.name,
-        }),
+        "capability.call" if effect.name.as_deref() == Some("promote") => {
+            let mut input = json!({
+                "target": effect.target,
+                "stream": effect.args.first().cloned().unwrap_or_default(),
+                "bindings": context_bindings_json(context),
+                "rule": rule.name,
+            });
+            // The grant the workflow names: the door presents its record's
+            // current token (norm-plane §7).
+            if let Some(grant) = effect.args.get(1) {
+                input["grant"] =
+                    parse_field_value_scoped(grant, context, live_facts, live_effects, live_ir);
+            }
+            input
+        }
         "capability.call" => {
             let mut input = json!({
                 "target": effect.target,
@@ -7557,6 +7575,79 @@ mod ir_reference_admission_tests {
             None,
         )
         .errors
+    }
+
+    /// `promote <stream> with <grant>` (norm-plane §7) carries the grant it
+    /// names into the effect's input, evaluated in the rule's scope; a
+    /// promote that names none carries no grant at all.
+    #[test]
+    fn a_promote_carries_the_grant_it_names_into_its_input() {
+        let program = |promote: &str| {
+            format!(
+                r#"@service
+workflow Promote
+use std.vcs
+agent worker {{
+  provider fixture
+  profile "repo-writer"
+  capacity 1
+}}
+stream triage {{
+  members [worker]
+}}
+class Hold {{ grant string }}
+class Note {{ body string }}
+rule hop
+  when Hold as hold
+=> {{
+  {promote}
+  after p promoted {{
+    record Note {{ body "landed" }}
+  }}
+  after p conflicted {{
+    record Note {{ body "blocked" }}
+  }}
+}}
+"#
+            )
+        };
+        let input_of = |promote: &str| {
+            let ir = ir_of(&program(promote));
+            let rule = ir
+                .rules
+                .iter()
+                .find(|rule| rule.name == "hop")
+                .expect("rule");
+            let facts = [fact("Hold", "hold-1", r#"{"grant":"N-7"}"#)];
+            let ready = ready_contexts(&ir, rule, &facts, &[], None);
+            let lowered = lower_rule(
+                "ins_test",
+                "ver_test",
+                "0",
+                "fixture",
+                &ir,
+                rule,
+                &ready.contexts[0],
+                &facts,
+                &[],
+                None,
+            );
+            assert!(lowered.errors.is_empty(), "{:?}", lowered.errors);
+            let effect = lowered
+                .effects
+                .iter()
+                .find(|effect| effect.target.as_deref() == Some("vcs.promote"))
+                .expect("a vcs.promote effect");
+            serde_json::from_str::<serde_json::Value>(&effect.input_json).expect("input")
+        };
+        let named = input_of("promote triage with hold.grant as p");
+        assert_eq!(named["stream"], "triage");
+        assert_eq!(named["grant"], "N-7");
+        let literal = input_of(r#"promote triage with "N-9" as p"#);
+        assert_eq!(literal["grant"], "N-9");
+        let bare = input_of("promote triage as p");
+        assert_eq!(bare["stream"], "triage");
+        assert!(bare.get("grant").is_none(), "{bare}");
     }
 
     #[test]

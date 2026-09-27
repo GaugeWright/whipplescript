@@ -284,11 +284,15 @@ workflow Method {
                     complete: true,
                 },
                 world: ModelContentProvenance {
-                    source_handles: vec!["workspace:one".to_owned()],
+                    source_handles: vec!["package:one".to_owned()],
                     complete: true,
                 },
                 tools: ModelContentProvenance {
                     source_handles: vec!["package:one".to_owned()],
+                    complete: true,
+                },
+                workspace_content: ModelContentProvenance {
+                    source_handles: vec!["workspace:one".to_owned()],
                     complete: true,
                 },
             }),
@@ -332,6 +336,12 @@ workflow Method {
             .expect("live model labels");
         assert!(labels.messages.iter().all(|part| part.complete));
         assert_eq!(labels.messages[0].source_handles, ["package:one"]);
+        assert!(labels.messages.iter().all(|part| {
+            !part
+                .source_handles
+                .iter()
+                .any(|handle| handle.starts_with("workspace:"))
+        }));
         assert!(labels.tools.complete);
         let resumed = attached.step(
             Some(Ok(HttpResponse {

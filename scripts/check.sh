@@ -453,7 +453,7 @@ echo "== docs =="
 # failure rather than an empty sample, and a block that looks like compiler
 # output but names no source fails outright, so a sample nobody can regenerate
 # cannot be added.
-section docs
+if [ -n "$native" ]; then section native-docs; else section docs; fi
 
 # The other half of the examples corpus: examples/invalid/, whose *.diagnostics
 # files are snapshots of what `whip check` actually prints. They were written by
@@ -466,7 +466,7 @@ section docs
 # fails when one is absent from the corpus test's hand-maintained include_str!
 # list, which is the same self-flattering shape the coverage gate had.
 echo "== invalid-fixture diagnostics =="
-section invalid-diagnostics
+if [ -n "$native" ]; then section native-invalid-diagnostics; else section invalid-diagnostics; fi
 
 # The `.ir` lowering goldens. Same shape as the two --check regenerations above,
 # and it belonged here for the same reason: it was reachable only from
@@ -476,7 +476,7 @@ section invalid-diagnostics
 # `whip` is already built by the docs gate above — which is cheap enough to ask
 # on every change, and one command blesses a deliberate move.
 echo "== IR lowering goldens =="
-section ir-goldens
+if [ -n "$native" ]; then section native-ir-goldens; else section ir-goldens; fi
 
 # The diagnostic code registers, and the coverage column that makes the code set
 # answerable. A second audit of the codes kept finding one-fault-two-codes pairs
@@ -491,7 +491,7 @@ section ir-goldens
 # what keeps the macro the only door: `DiagnosticCode` has no constructor, so an
 # unregistered literal does not compile.
 echo "== diagnostic code registers =="
-section diagnostic-codes
+if [ -n "$native" ]; then section native-diagnostic-codes; else section diagnostic-codes; fi
 
 # The vendored `std/` copies. `std/` is the source of truth and each crate
 # carries a build-time copy; `crates/whipplescript-parser/build.rs`,

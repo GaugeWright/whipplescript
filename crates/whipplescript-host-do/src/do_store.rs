@@ -10304,6 +10304,28 @@ fn do_fold_tracker_event(
                 .map_err(sql_err)?;
             }
         }
+        whipplescript_store::items::LABELED | whipplescript_store::items::UNLABELED => {
+            if let Some(issue) = issue_id {
+                let rows = sql
+                    .query(
+                        "SELECT labels_json FROM tracker_issues WHERE issue_id = ?1",
+                        &[text(issue)],
+                    )
+                    .map_err(sql_err)?;
+                if let Some(row) = rows.first() {
+                    let current: Vec<String> =
+                        serde_json::from_str(&as_text(&row[0])).unwrap_or_default();
+                    let next =
+                        whipplescript_store::items::apply_label_change(&current, kind, payload);
+                    let next = serde_json::to_string(&next).map_err(|e| sql_err(e.to_string()))?;
+                    sql.execute(
+                        "UPDATE tracker_issues SET labels_json = ?2, updated_at = ?3 WHERE issue_id = ?1",
+                        &[text(issue), text(&next), text(created_at)],
+                    )
+                    .map_err(sql_err)?;
+                }
+            }
+        }
         "issue.assigned" => {
             // `assigned_to: null` is the clearing assignment, so the column is
             // set from the payload unconditionally; `str_of` yields `None` for
@@ -12695,6 +12717,46 @@ pub(crate) mod tests {
                 .assigned_to,
             None,
             "a transported clearing assignment folds too"
+        );
+    }
+
+    /// Label changes after filing are written by the native store; they reach
+    /// a DO only by transport, and must fold there to the same set, or a synced
+    /// issue would keep a label its owner took off.
+    #[test]
+    fn do_import_folds_label_changes_into_the_projection() {
+        use whipplescript_store::items::WorkItems;
+
+        let mut native = whipplescript_store::items::WorkItemStore::open_in_memory().unwrap();
+        let issue = native
+            .file_item(
+                "q",
+                "decided",
+                "",
+                &["needs:founder".to_owned()],
+                &serde_json::json!({}),
+                None,
+                None,
+            )
+            .unwrap();
+        native
+            .label_item(&issue.id, &["decided".to_owned()])
+            .unwrap();
+        native
+            .unlabel_item(&issue.id, &["needs:founder".to_owned()])
+            .unwrap();
+
+        let mut store = store();
+        let report = store
+            .import_events(&native.export_events().unwrap())
+            .expect("import");
+        assert_eq!(report.rejected, 0);
+        assert_eq!(
+            WorkItems::get_item(&store, "WS-1")
+                .expect("get")
+                .expect("present")
+                .labels,
+            vec!["decided".to_owned()]
         );
     }
 
@@ -19125,7 +19187,7 @@ mod norm_admission_tests {
         assert_eq!(transported, message);
         let mut vcs = crate::do_branches::compose_vcs(&sql).unwrap();
         let door = whipplescript_kernel::norm_admission::AdmissionDoor::Restore;
-        let restored = crate::do_workstreams::with_hosted_mainline_gate(&sql, door, |gate| {
+        let restored = crate::do_workstreams::with_hosted_mainline_gate(&sql, door, &[], |gate| {
             vcs.restore(MAINLINE_BRANCH_ID, "cut_1", "cut_restore", "t5", gate)
         })
         .unwrap();
@@ -19134,7 +19196,7 @@ mod norm_admission_tests {
             "{restored:?}"
         );
         let door = whipplescript_kernel::norm_admission::AdmissionDoor::Undo;
-        let undone = crate::do_workstreams::with_hosted_mainline_gate(&sql, door, |gate| {
+        let undone = crate::do_workstreams::with_hosted_mainline_gate(&sql, door, &[], |gate| {
             vcs.undo_op("op-cut_0", "undo-main", "t6", gate)
         })
         .unwrap();

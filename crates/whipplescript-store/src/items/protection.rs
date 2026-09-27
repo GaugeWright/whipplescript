@@ -161,6 +161,9 @@ fn operational(kind: &str, payload: &Value) -> Value {
     let keys: &[&str] = match kind {
         "issue.created" => &["queue", "filed_by", "assigned_to", "filing_fingerprint"],
         "issue.assigned" => &["assigned_to"],
+        // Labels are sealed in `issue.created` and in the projection, so the
+        // events that change them after filing keep them sealed too.
+        LABELED | UNLABELED => &[],
         "issue.closed" | "issue.canceled" | "issue.reopened" => {
             &["actor", "operation_id", "fingerprint", "subject_id"]
         }

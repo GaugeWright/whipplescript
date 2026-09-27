@@ -5,7 +5,8 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TMPDIR="$(mktemp -d)"
 trap 'rm -rf "$TMPDIR"' EXIT
 
-WHIP=(cargo run --quiet --manifest-path "$ROOT/Cargo.toml" -p whipplescript --)
+. "$ROOT/scripts/whip-bin.sh"
+WHIP=("$(whip_bin)")
 
 "$ROOT/scripts/check-docs-quickstart.sh" >/dev/null
 "$ROOT/scripts/check-docs-examples.sh" >/dev/null

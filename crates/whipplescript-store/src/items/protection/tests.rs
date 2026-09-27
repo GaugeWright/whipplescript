@@ -664,3 +664,37 @@ fn tracker_control_retains_keys_through_mutation_and_refuses_erased_retry() {
     );
     assert_eq!(store.event_metadata().unwrap(), before);
 }
+
+#[test]
+fn label_changes_stay_sealed_and_replay_under_protection() {
+    let mut store = store();
+    let item = file(&mut store);
+    store
+        .label_item(&item.id, &["later-label-canary".into()])
+        .unwrap();
+    store
+        .unlabel_item(&item.id, &["private-label-canary".into()])
+        .unwrap();
+    let raw: Vec<Vec<u8>> = store
+        .connection
+        .prepare("SELECT CAST(payload_json AS BLOB) FROM tracker_events WHERE kind IN ('issue.labeled', 'issue.unlabeled') UNION ALL SELECT CAST(labels_json AS BLOB) FROM tracker_issues")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(raw.len(), 3);
+    assert!(raw
+        .iter()
+        .all(|r| !String::from_utf8_lossy(r).contains("label-canary")));
+    for metadata in store.event_metadata().unwrap() {
+        if metadata.kind == LABELED || metadata.kind == UNLABELED {
+            assert_eq!(metadata.operational, json!({}));
+        }
+    }
+    store.rebuild_projection().unwrap();
+    assert_eq!(
+        store.get_item(&item.id).unwrap().unwrap().labels,
+        vec!["later-label-canary".to_owned()]
+    );
+}

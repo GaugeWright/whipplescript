@@ -1535,7 +1535,7 @@ impl<Sql: DoSql + Clone> InstanceDriver for DoInstanceDriver<'_, Sql> {
                     model_provenance.system =
                         whipplescript_kernel::sansio::ModelContentProvenance::derived_from([
                             &model_provenance.system,
-                            &model_provenance.world,
+                            &model_provenance.workspace_content,
                         ]);
                 }
                 if !skills.is_empty() {
@@ -7011,8 +7011,9 @@ complete result { count count } }
         let initial = whipplescript_kernel::sansio::InitialModelProvenance {
             system: known("package:one"),
             user: known("chat:one"),
-            world: known("workspace:one"),
+            world: known("package:one"),
             tools: known("package:one"),
+            workspace_content: known("workspace:one"),
         };
         let driver = DoInstanceDriver {
             now_unix_ms: 0,

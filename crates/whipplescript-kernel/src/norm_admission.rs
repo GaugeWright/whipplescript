@@ -326,6 +326,9 @@ pub struct NormMainlineAdmission<'a, L: AdmissionLedger, S: RuntimeStore> {
     target_ref: String,
     /// The reservation tokens the requester presents.
     tokens: BTreeSet<String>,
+    /// Grant records the requester names (norm-plane §7): each presents the
+    /// token its record holds in the ledger the gate captures.
+    grants: BTreeSet<String>,
     certificate: Option<AdmissionCertificate>,
 }
 
@@ -342,6 +345,7 @@ impl<'a, L: AdmissionLedger, S: RuntimeStore> NormMainlineAdmission<'a, L, S> {
             door,
             target_ref: target_ref.to_owned(),
             tokens: BTreeSet::new(),
+            grants: BTreeSet::new(),
             certificate: None,
         }
     }
@@ -349,6 +353,15 @@ impl<'a, L: AdmissionLedger, S: RuntimeStore> NormMainlineAdmission<'a, L, S> {
     /// Present the requester's reservation tokens (norm-plane §7).
     pub fn with_tokens(mut self, tokens: impl IntoIterator<Item = String>) -> Self {
         self.tokens = tokens.into_iter().collect();
+        self
+    }
+
+    /// Name the requester's grants: the gate presents each one's current
+    /// token, read from the same capture it certifies, so the token and the
+    /// verdict describe one ledger state. A name that is not a reservation of
+    /// this ledger refuses rather than presenting nothing.
+    pub fn with_grants(mut self, grants: impl IntoIterator<Item = String>) -> Self {
+        self.grants = grants.into_iter().collect();
         self
     }
 
@@ -442,13 +455,24 @@ impl<L: AdmissionLedger, S: RuntimeStore> MainlineGate for NormMainlineAdmission
             },
             artifacts(proposed_cut)?.files(),
         );
-        let (fenced, unfenced) = fence(
-            &view,
-            host.configuration.reservation_vocabularies(),
-            &changed,
-            &self.tokens,
-            host.now,
-        );
+        let reservations = host.configuration.reservation_vocabularies();
+        let mut presented = self.tokens.clone();
+        let mut misnamed = BTreeMap::new();
+        for grant in &self.grants {
+            match view.records.get(grant) {
+                Some(record) if reservations.contains(&record.vocabulary) => {
+                    presented.insert(record.head.clone());
+                }
+                _ => {
+                    misnamed.insert(
+                        grant.clone(),
+                        "the named grant is not a reservation of this ledger".to_owned(),
+                    );
+                }
+            }
+        }
+        let (fenced, mut unfenced) = fence(&view, reservations, &changed, &presented, host.now);
+        unfenced.append(&mut misnamed);
         match judge(&planned) {
             Ok((requirements, evidence)) if unfenced.is_empty() => {
                 certificate.anchor = Some(planned.anchor.clone());

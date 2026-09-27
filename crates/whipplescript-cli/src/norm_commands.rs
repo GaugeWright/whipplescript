@@ -794,6 +794,7 @@ pub(crate) fn with_mainline_admission<T>(
     runtime_path: &std::path::Path,
     door: whipplescript_kernel::norm_admission::AdmissionDoor,
     tokens: &[String],
+    grants: &[String],
     f: impl FnOnce(&mut dyn whipplescript_store::vcs::MainlineGate) -> T,
 ) -> Result<T, String> {
     use whipplescript_kernel::norm_admission::{AdmissionHost, NormMainlineAdmission};
@@ -874,7 +875,8 @@ pub(crate) fn with_mainline_admission<T>(
         door,
         whipplescript_store::branches::MAINLINE_BRANCH_ID,
     )
-    .with_tokens(tokens.iter().cloned());
+    .with_tokens(tokens.iter().cloned())
+    .with_grants(grants.iter().cloned());
     Ok(f(&mut gate))
 }
 

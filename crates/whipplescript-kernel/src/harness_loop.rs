@@ -3030,6 +3030,7 @@ mod tests {
             user: known("chat:one"),
             world: known("chat:one"),
             tools: known("method:one"),
+            workspace_content: ModelContentProvenance::default(),
         };
         let mut checkpoint = no_checkpoint();
         let mut machine =

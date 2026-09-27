@@ -5,6 +5,15 @@ follow [Semantic Versioning](https://semver.org). Dates are UTC.
 
 ## [Unreleased]
 
+### Added
+
+- **`whip issue label <id> <label>...` and `whip issue unlabel <id>
+  <label>...`.** Labels could only be set when an issue was filed, so a label
+  that marked an open question stayed after the question was answered. Labels
+  are a set: a change that alters nothing records nothing. Each change is an
+  event, so it survives `whip issue rebuild`, travels through `export` and
+  `import`, and resolves the same way on every copy at a merge.
+
 ## [0.7.0] — 2026-09-27
 
 A minor release because a claim behaves differently: a claim of a blocked,

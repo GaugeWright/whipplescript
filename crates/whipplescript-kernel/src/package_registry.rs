@@ -1458,10 +1458,11 @@ pub fn validate_manifest_construct_grammar_shape(
             validate_manifest_object_fields(
                 slot,
                 &label,
-                &["name", "kind", "connective"],
+                &["name", "kind", "connective", "required"],
                 problems,
             );
             validate_manifest_required_fields(slot, &label, &["name", "kind"], problems);
+            validate_manifest_bool_fields(slot, &label, &["required"], problems);
             validate_manifest_string_fields(
                 slot,
                 &label,
@@ -2321,10 +2322,31 @@ pub fn package_construct_grammar(
                 ));
             }
         }
+        let required = slot
+            .get("required")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
+        // An optional slot is introduced by its connective and follows every
+        // required slot, so a use's next word alone says whether it is there.
+        if !required && connective.is_none() {
+            return Err(format!(
+                "{slot_owner} is optional and must be introduced by a connective {in_path}"
+            ));
+        }
+        if required
+            && slots
+                .iter()
+                .any(|earlier: &ConstructGrammarSlot| !earlier.required)
+        {
+            return Err(format!(
+                "{slot_owner} is required but follows an optional slot {in_path}"
+            ));
+        }
         slots.push(ConstructGrammarSlot {
             name,
             kind,
             connective,
+            required,
         });
     }
     let payload = match value.get("payload") {
@@ -3245,6 +3267,40 @@ mod grammar_refusal_tests {
             declaration_grammar(grammar).expect_err("rejection"),
             "construct `acme.widgets.block` grammar keyword `gadget` does not match the construct \
              keyword `widget` in `acme.json`"
+        );
+    }
+
+    /// An optional slot is introduced by its connective and trails every
+    /// required one, so a use's next word alone says whether it is present.
+    #[test]
+    fn an_optional_slot_has_a_connective_and_trails_the_required_ones() {
+        let with_slots = |slots: Value| {
+            let mut grammar = valid_effect_grammar();
+            grammar["slots"] = slots;
+            effect_grammar(grammar)
+        };
+        with_slots(json!([
+            {"name": "target", "kind": "identifier"},
+            {"name": "grant", "kind": "expression", "connective": "with", "required": false}
+        ]))
+        .expect("a trailing optional slot with a connective");
+        assert_eq!(
+            with_slots(json!([
+                {"name": "target", "kind": "identifier"},
+                {"name": "grant", "kind": "expression", "required": false}
+            ]))
+            .expect_err("rejection"),
+            "construct `acme.widgets.emit` grammar slots[1] is optional and must be introduced \
+             by a connective in `acme.json`"
+        );
+        assert_eq!(
+            with_slots(json!([
+                {"name": "grant", "kind": "expression", "connective": "with", "required": false},
+                {"name": "target", "kind": "identifier", "connective": "to"}
+            ]))
+            .expect_err("rejection"),
+            "construct `acme.widgets.emit` grammar slots[1] is required but follows an optional \
+             slot in `acme.json`"
         );
     }
 

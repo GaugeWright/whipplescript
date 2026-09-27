@@ -838,6 +838,23 @@ impl<Sql: DoSql + Clone> whipplescript_kernel::effect_handlers::CapabilityProvid
         else {
             return failed("vcs.promote input names no stream".to_owned());
         };
+        // `promote <stream> with <grant>` (norm-plane §7), as the native door
+        // resolves it: the gate presents the record's current token.
+        let grants = match whipplescript_kernel::effect_handlers::promote_grant(&input) {
+            Ok(None) => Vec::new(),
+            Ok(Some(grant)) => {
+                match crate::do_store::DoSqliteStore::new(self.sql.clone())
+                    .resolve_norm_record(grant)
+                {
+                    Ok(Some(record)) => vec![record],
+                    Ok(None) => {
+                        return failed(format!("the named grant {grant} is not a norm record"))
+                    }
+                    Err(error) => return failed(format!("norm ledger unavailable: {error:?}")),
+                }
+            }
+            Err(message) => return failed(message),
+        };
         let mut streams = match DoWorkstreams::new(self.sql.clone()) {
             Ok(streams) => streams,
             Err(error) => return failed(format!("workstream store unavailable: {error:?}")),
@@ -855,7 +872,7 @@ impl<Sql: DoSql + Clone> whipplescript_kernel::effect_handlers::CapabilityProvid
         // Single-writer per object: the DO's turn IS the serialization
         // (DR-0091 Decision 2), so the kernel choreography runs unleased.
         let door = whipplescript_kernel::norm_admission::AdmissionDoor::Promote;
-        let result = with_hosted_mainline_gate(&self.sql, door, |gate| {
+        let result = with_hosted_mainline_gate(&self.sql, door, &grants, |gate| {
             whipplescript_kernel::effect_handlers::run_reserved_boundary_promotion_generic(
                 &mut streams,
                 &mut vcs,
@@ -883,6 +900,7 @@ impl<Sql: DoSql + Clone> whipplescript_kernel::effect_handlers::CapabilityProvid
 pub(crate) fn with_hosted_mainline_gate<Sql: DoSql + Clone, T>(
     sql: &Sql,
     door: whipplescript_kernel::norm_admission::AdmissionDoor,
+    grants: &[String],
     f: impl FnOnce(&mut dyn whipplescript_store::vcs::MainlineGate) -> T,
 ) -> T {
     let ledger = crate::do_store::DoSqliteStore::new(sql.clone());
@@ -897,7 +915,8 @@ pub(crate) fn with_hosted_mainline_gate<Sql: DoSql + Clone, T>(
         >(HOSTED_ADMISSION_UNCONFIGURED.to_owned()),
         door,
         whipplescript_store::branches::MAINLINE_BRANCH_ID,
-    );
+    )
+    .with_grants(grants.iter().cloned());
     f(&mut gate)
 }
 
@@ -970,7 +989,7 @@ impl<Sql: DoSql + Clone> whipplescript_kernel::effect_handlers::CapabilityProvid
         } else {
             whipplescript_kernel::norm_admission::AdmissionDoor::Transport
         };
-        let result = with_hosted_mainline_gate(&self.sql, door, |gate| {
+        let result = with_hosted_mainline_gate(&self.sql, door, &[], |gate| {
             whipplescript_kernel::effect_handlers::run_selective_verb_generic(
                 &mut vcs,
                 effect.target.as_deref(),

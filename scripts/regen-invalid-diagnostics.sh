@@ -32,8 +32,8 @@ cd "$ROOT"
 # may not share that channel: a "Compiling …" or "Blocking waiting for file
 # lock" line would land inside a committed file. Build first (this is the
 # "build it if absent" step), then invoke the built binary directly.
-cargo build --quiet --manifest-path "$ROOT/Cargo.toml" -p whipplescript
-WHIP="${CARGO_TARGET_DIR:-$ROOT/target}/debug/whip"
+. "$ROOT/scripts/whip-bin.sh"
+WHIP="$(whip_bin)"
 if [[ ! -x "$WHIP" ]]; then
   echo "no whip binary at $WHIP after a successful build" >&2
   exit 1

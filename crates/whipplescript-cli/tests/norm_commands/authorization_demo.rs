@@ -1114,6 +1114,50 @@ fn the_authorization_demo_repairs_a_violated_requirement_under_a_current_token()
             "an expired grant fences nothing: {detail}"
         );
     }
+    // Naming the grant instead, as `promote next with <grant>` does, presents
+    // its current token from the ledger the gate certifies: the reservation no
+    // longer fences the promotion, which is refused only for the support the
+    // requirement lacks. A name that is not a reservation refuses by name.
+    let alias = snapshot(&fixture, None)["result"]["snapshot"]["records"]
+        .as_array()
+        .and_then(|records| {
+            records
+                .iter()
+                .find(|entry| entry["record"]["id"] == renewed.as_str())
+        })
+        .and_then(|entry| entry["alias"].as_str())
+        .expect("the grant's local alias")
+        .to_owned();
+    let granted = refused(&whip(
+        &fixture,
+        &["--json", "stream", "promote", "next", "--grant", &alias],
+        host.configured(),
+    ));
+    assert_eq!(granted["detail"]["reservations"], json!({}), "{granted}");
+    assert_eq!(
+        granted["detail"]["requirements"]
+            .as_object()
+            .map(|requirements| requirements.len()),
+        Some(1),
+        "{granted}"
+    );
+    let misnamed = refused(&whip(
+        &fixture,
+        &[
+            "--json",
+            "stream",
+            "promote",
+            "next",
+            "--grant",
+            &requirement,
+        ],
+        host.configured(),
+    ));
+    assert_eq!(
+        misnamed["detail"]["reservations"][&requirement],
+        "the named grant is not a reservation of this ledger",
+        "{misnamed}"
+    );
 
     // W1: the owner activates C1 under C0's activation rule. C1 keeps every
     // vocabulary but the reservation, and the migration must say what becomes

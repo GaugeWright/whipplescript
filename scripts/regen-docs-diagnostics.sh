@@ -100,8 +100,8 @@ cd "$ROOT"
 # Build first, then invoke the built binary directly: a "Compiling …" or
 # "Blocking waiting for file lock" line on cargo's stderr would otherwise land
 # inside a page, because stderr is exactly the channel being captured.
-cargo build --quiet --manifest-path "$ROOT/Cargo.toml" -p whipplescript --bin whip
-WHIP="${CARGO_TARGET_DIR:-$ROOT/target}/debug/whip"
+. "$ROOT/scripts/whip-bin.sh"
+WHIP="$(whip_bin)"
 if [[ ! -x "$WHIP" ]]; then
   echo "no whip binary at $WHIP after a successful build" >&2
   exit 1

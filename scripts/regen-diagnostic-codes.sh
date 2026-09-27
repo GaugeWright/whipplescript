@@ -325,8 +325,8 @@ fi
 # ---------------------------------------------------------------------------
 # 4. Measure coverage: which codes does the corpus actually make come out?
 # ---------------------------------------------------------------------------
-cargo build --quiet --manifest-path "$ROOT/Cargo.toml" -p whipplescript
-WHIP="${CARGO_TARGET_DIR:-$ROOT/target}/debug/whip"
+. "$ROOT/scripts/whip-bin.sh"
+WHIP="$(whip_bin)"
 if [[ ! -x "$WHIP" ]]; then
   echo "no whip binary at $WHIP after a successful build" >&2
   exit 1

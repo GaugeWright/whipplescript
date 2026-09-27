@@ -246,6 +246,12 @@
               {
                 "name": "stream",
                 "kind": "identifier"
+              },
+              {
+                "name": "grant",
+                "kind": "expression",
+                "connective": "with",
+                "required": false
               }
             ],
             "binding": "required",

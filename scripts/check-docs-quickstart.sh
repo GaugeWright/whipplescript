@@ -13,7 +13,8 @@ trap cleanup EXIT
 mkdir -p "$ROOT/.whipplescript" "$ROOT/target"
 cleanup
 
-WHIP=(cargo run --quiet --manifest-path "$ROOT/Cargo.toml" -p whipplescript --)
+. "$ROOT/scripts/whip-bin.sh"
+WHIP=("$(whip_bin)")
 
 "${WHIP[@]}" doctor >/dev/null
 "${WHIP[@]}" check "$ROOT/examples/multi-agent-bounded-concurrency.whip" >/dev/null

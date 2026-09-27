@@ -100,12 +100,15 @@ pub struct ConstructGrammar {
 
 /// One ordered grammar slot: a named value (`identifier` | `expression`),
 /// optionally introduced by a fixed connective word from
-/// `CONSTRUCT_GRAMMAR_CONNECTIVES`.
+/// `CONSTRUCT_GRAMMAR_CONNECTIVES`. An optional slot is introduced by its
+/// connective and follows every required slot, so its connective alone says
+/// whether a use supplies it.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ConstructGrammarSlot {
     pub name: String,
     pub kind: String,
     pub connective: Option<String>,
+    pub required: bool,
 }
 
 /// One field inside the optional payload block: a named expression, required
@@ -1347,6 +1350,7 @@ pub fn std_messaging_send_construct() -> ConstructRegistration {
                 name: "channel".to_owned(),
                 kind: "identifier".to_owned(),
                 connective: Some("via".to_owned()),
+                required: true,
             }],
             payload: Some(vec![
                 ConstructGrammarPayloadField {
