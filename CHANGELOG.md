@@ -5,6 +5,14 @@ follow [Semantic Versioning](https://semver.org). Dates are UTC.
 
 ## [Unreleased]
 
+## [0.7.0] — 2026-09-27
+
+A minor release because a claim behaves differently: a claim of a blocked,
+deferred or conflicted issue now fails where 0.6.0 let it succeed, and `order`
+and `soft` dependencies rank an issue instead of holding it back. A workflow
+that relied on either sees the difference, so this is not a patch. It is also
+the first release whose `whipplescript` crate is on crates.io since 0.5.6.
+
 ### Changed
 
 - **A tracker has one definition of ready, and a claim asks it (DR-0126).**
