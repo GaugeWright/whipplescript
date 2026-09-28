@@ -15,6 +15,7 @@
 //! terminal — the record is immutable history, never rewritten (the
 //! no-destructive-verbs surface).
 
+pub mod flowing_sources;
 pub mod resolution_batch;
 pub mod resolution_origin;
 pub mod write_commit;
@@ -587,7 +588,9 @@ pub trait Branches {
     /// Propagates store failures.
     fn release_closure_pins(&mut self, holder: &str) -> StoreResult<usize>;
 
-    /// DR-0068 §5: cut ids currently held, expiry applied at `now`.
+    /// DR-0068 §5: cut ids currently held, expiry applied at `now` for run
+    /// closure pins. DR-0130 private draft pins have no expiry and remain in
+    /// this set until explicit release; the collector reads this same query.
     ///
     /// # Errors
     /// Propagates store failures.
@@ -1001,8 +1004,13 @@ fn map_op_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoreResult<OpRow>> {
 
 #[cfg(feature = "native")]
 /// This store's schema generation. Bumped when its `CREATE TABLE` set
-/// changes in a way an older build cannot read.
-const SATELLITE_SCHEMA_VERSION: i64 = 4;
+/// changes in a way an older build cannot read. Version 5 adds permanent
+/// private cut pins to `pinned_cuts`; a version-4 collector would ignore them
+/// and could reclaim an undeclared twig draft. Version 6 gives declared
+/// units an optional, immutable source-atom basis with unique atom ownership.
+/// Version 7 records atomic twig-to-branch holder transfers; older writers
+/// cannot tell which authority owns an already shared unit.
+const SATELLITE_SCHEMA_VERSION: i64 = 7;
 
 #[cfg(feature = "native")]
 fn ensure_branch_schema(connection: &Connection) -> StoreResult<()> {
@@ -1013,6 +1021,9 @@ fn ensure_branch_schema(connection: &Connection) -> StoreResult<()> {
     connection.execute_batch(write_evidence::CREATE)?;
     connection.execute_batch(resolution_batch::CREATE)?;
     connection.execute_batch(resolution_origin::CREATE)?;
+    for statement in flowing_sources::SCHEMA {
+        connection.execute(statement, [])?;
+    }
     connection.execute_batch(
         r#"
         CREATE TABLE IF NOT EXISTS branches (
@@ -1641,9 +1652,13 @@ impl Branches for BranchStore {
     }
 
     fn pinned_cuts(&self, now: &str) -> StoreResult<BTreeSet<String>> {
-        let mut statement = self
-            .connection
-            .prepare("SELECT cut_id FROM closure_pins WHERE expires_at > ?1")?;
+        let mut statement = self.connection.prepare(
+            "SELECT cut_id FROM closure_pins WHERE expires_at > ?1 \
+                      UNION SELECT cut_id FROM flowing_private_pins \
+                      WHERE released_at IS NULL \
+                      UNION SELECT source_cut_id FROM flowing_handoffs \
+                      UNION SELECT target_after_cut_id FROM flowing_handoffs",
+        )?;
         let cuts = statement
             .query_map(params![now], |row| row.get::<_, String>(0))?
             .collect::<Result<BTreeSet<_>, _>>()?;

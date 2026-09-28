@@ -190,6 +190,25 @@ local candidate admission, not the authority of an external Git repo or folder.
 
 ## Contribution and branch lifecycle
 
+`private_pin_closure.py` probes the conservation boundary before and during
+branch closure for two member twigs:
+
+```sh
+python3 models/research/private_pin_closure.py
+```
+
+Its explorer reaches 440 safe states through ten transitions. Positive traces
+retain a private draft across session end, leave a conflicting handoff on the
+twig, overlap twig and branch pins during a successful handoff, report a CAS
+that wins before ref disable, and close with either an admitted or named
+parked obligation. Eight weakened variants lose a private pin or declared
+unit, transfer without a durable pin or exact handoff receipt, acknowledge
+closure before ref disable or member resolution, drop a branch unit, or omit
+a parked obligation from the close receipt. The gate and CAS are abstracted;
+`flowing_recovery.py` covers their immediate recovery seam. This model does
+not prove real cut retention, rehome/abandonment, dependency repair, external
+settlement, or native and hosted storage transactions.
+
 `contribution_lifecycle.py` probes one branch with two declared contributions,
 where `u1` depends on `u0`. It separates the durable holder of each unit from
 a disposable gate attempt. Ready declaration, twig-to-branch sharing, bounded
@@ -221,6 +240,45 @@ atomic transition and that the trunk CAS durably records its source units.
 The real host contracts and merge engine must supply those facts or refuse
 the operation. The [research note](../../spec/branch-trunk-gate-research-note.md)
 §11 states the intended lifecycle and its remaining design obligations.
+
+`flowing_recovery.py` composes the ref-owned source fence, norm-ledger
+exclusion, exact trunk basis, source-unit accounting, and lagging frontier
+projection for a branch or direct twig:
+
+```sh
+python3 models/research/flowing_recovery.py
+```
+
+Its bounded explorer finds 805 safe states through nine transitions. Explicit
+traces cover a metadata-only admission that accounts two selected units, a
+coordinator crash after CAS, replacement-coordinator selection before frontier
+recovery, Hold, source rewrite, grant revocation, and independent ref, norm,
+and topology outages. Six defective variants admit a mixed-output alias,
+ungated no-op, manual Hold bypass, CAS after releasing norm exclusion,
+duplicate admission by a replacement coordinator that trusts the lagging
+frontier, or operation-id reuse. This probes the CAS-to-frontier seam under
+the actual norm/ref lock order. It still abstracts private draft retention,
+source lineage derivation, revision across all real mutation doors, branch
+closure with member twigs and parked work, the complete gate plan, and
+physical lock scheduling. Those remain open in FB-1 and its implementation
+items; this model alone does not qualify host activation.
+
+`twig_handoff.py` isolates the holder transfer that the larger lifecycle
+probe treats as one step:
+
+```sh
+python3 models/research/twig_handoff.py
+```
+
+Its bounded explorer finds 720 safe states through eight steps. Positive
+traces keep an unselected twig tail through a content-backed target cut,
+atomic holder receipt, crash, receipt delivery and source-pin release. An
+omitted target effect, second coordinator using the same unit, and stale
+target base refuse. Six mutants expose a metadata-only transfer, early pin
+release, target head movement before receipt, duplicate transfer, stale-base
+commit and dropped tail. Source content is a Boolean in this probe; actual
+manifest comparison, selected-unit lineage, content retention, SQL rollback,
+and independent authority failures still need native and hosted evidence.
 
 ## Dependency update, owner routing, and external audit
 
@@ -286,3 +344,24 @@ Section 12.4 records a focused read of the current VMR, Buck graph, and
 WhippleScript package/construct contracts, including a real all-cell query
 failure. The probe now makes that failure a blocked capture rather than an
 empty route.
+
+## Required reference scopes
+
+`reference_scope_registry.py` probes the other half of RC-1: deriving the
+required class/scope set from one admitted, versioned declaration registry
+and checking every member of the authoritative consumer population. It
+separates live dependencies from provenance, historical pins, authority and
+content references. A complete witness binds registry, roster, source cut
+and graph revisions, the examined set and an edge digest.
+
+```sh
+python3 models/research/reference_scope_registry.py
+```
+
+It checks all subsets of a two-consumer population and gives negative
+fixtures for an unclassified field, omitted consumer, opaque reference,
+unenforced accepting boundary, stale basis and provenance treated as live.
+The model assumes production parsers and accepting operations cannot bypass
+the registry; that is the central implementation obligation, not a property
+this Python probe establishes. The current admitted fields, constructs and
+provider bindings still need a real exact-cut inventory before RC-1 closes.

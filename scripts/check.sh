@@ -47,7 +47,7 @@ export prerequisites
 
 # Stages 2 and 3 of the Buck2 migration (GaugeWright BUILD.md, DR-0124): every
 # section of this bar is a Buck2 target declaring what it reads. When this
-# checkout is a# cell of a materialized workspace, a section runs through Buck2, which spares
+# checkout is a cell of a materialized workspace, a section runs through Buck2, which spares
 # the re-run when nothing the section declares has changed and otherwise runs
 # scripts/section.sh exactly as the direct path does. When it is not — a
 # worktree, a CI runner, a host without buck2 — the same script runs directly.
@@ -55,9 +55,30 @@ export prerequisites
 # never beside it. Inside a Buck2 action already running the whole bar, the
 # direct path is taken so no nested client meets the daemon.
 via_buck2=""
-if [ -z "${GREEN_BAR_INSIDE_BUCK2:-}" ] && command -v buck2 >/dev/null 2>&1 \
-   && buck2 audit cell 2>/dev/null | grep -qx "whipplescript: $(pwd -P)"; then
-  via_buck2=1
+if [ -z "${GREEN_BAR_INSIDE_BUCK2:-}" ]; then
+  # The gate places this cell and names its workspace explicitly. A transient
+  # failure of `buck2 audit cell` must not silently turn its native test bar
+  # into a full cargo run: on 2026-09-28 two unrelated PRs went red in that
+  # fallback under load, and the gate's action weights were never exercised.
+  # The first Buck build will diagnose a broken cell; it is not a reason to
+  # run a different bar.
+  workspace_cell=""
+  if [ -n "${GAUGEWRIGHT_WORKSPACE:-}" ] \
+     && [ -f "$GAUGEWRIGHT_WORKSPACE/.buckroot" ] \
+     && [ "$(cd "$GAUGEWRIGHT_WORKSPACE/whipplescript-src" 2>/dev/null && pwd -P)" = "$(pwd -P)" ]; then
+    workspace_cell=1
+  fi
+  if [ -n "$workspace_cell" ]; then
+    if ! command -v buck2 >/dev/null 2>&1; then
+      echo "this materialized workspace needs buck2 for its declared bar" >&2
+      exit 126
+    fi
+    scripts/wait-buck-cell.sh
+    via_buck2=1
+  elif command -v buck2 >/dev/null 2>&1 \
+       && buck2 audit cell 2>/dev/null | grep -qx "whipplescript: $(pwd -P)"; then
+    via_buck2=1
+  fi
 fi
 # One nonce for the whole run: the sections whose answer is not in this tree
 # put it in their action's environment and will not run without it, while the
@@ -68,9 +89,8 @@ section() {
     # The word travels with the run, for the opposite reason to the nonce. The
     # rule defaults an absent `green_bar.prerequisites` to `required`, so a
     # dispatcher that computes the word and then drops it makes this bar
-    # STRICTER than the block at the top of this file documents: on the one
-    # host that takes this path — the founder's, the only checkout that is a
-    # cell of a materialized workspace — a bare `scripts/check.sh` without
+    # STRICTER than the block at the top of this file documents: in a
+    # materialized workspace, a bare `scripts/check.sh` without
     # cargo-deny or wrangler failed with a message about the host rather than
     # skipping and naming the remedy. That is the failure GaugeWright DR-0127
     # was written against, arriving through the door the direct path had
@@ -144,6 +164,7 @@ finish() {
 }
 trap finish EXIT
 export WHIPPLESCRIPT_ITEMS_STORE="$items_store_root/items.sqlite"
+echo "#bar-mode: $([ -n "$via_buck2" ] && echo buck2 || echo direct)"
 
 # The green bar also runs on the public mirror, which is a curated projection
 # rather than an active repository and so does not receive AGENTS.md. The guide

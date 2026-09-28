@@ -20,9 +20,14 @@
 //! head guards make a racing writer a refused normal outcome rather
 //! than a lost update.
 
+mod flowing_selection;
 pub mod resolution_recording;
 pub mod resolution_scope;
 pub mod version_origin;
+pub use flowing_selection::{
+    FlowingSelection, FlowingSelectionOutcome, FlowingSourceAtom, FlowingTargetEffect,
+    FlowingTargetEffects, FlowingTargetEffectsOutcome,
+};
 pub use version_origin::{FileVersionSource, RecordedFileVersion};
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -769,8 +774,9 @@ impl NativeWorkspaceVcs {
     /// tombstones untouched), so archaeology keeps everything a recorded
     /// cut can reach and a wrong root set can only retain too much.
     ///
-    /// DR-0068 §5: run-held cuts are added to the root set explicitly. Today
-    /// that changes nothing — every recorded cut is already a root, so no
+    /// DR-0068 §5: run-held cuts are added to the root set explicitly. DR-0130
+    /// adds unexpiring private draft pins to that same `pinned_cuts` query.
+    /// Today that changes nothing — every recorded cut is already a root, so no
     /// cut's closure is collectable and the pin is not yet load-bearing. It is
     /// wired now precisely because that stops being true the moment retention
     /// (research note §15) begins pruning recorded cuts: the guard exists

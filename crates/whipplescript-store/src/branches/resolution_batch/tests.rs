@@ -98,7 +98,7 @@ fn resolution_batch_reopens_read_only_without_repeating_or_rewriting_memory() {
     assert!(matches!(
         crate::stamp_satellite_schema(&writer.connection, "branch", 2),
         Err(StoreError::UnsupportedVersion {
-            found: 4,
+            found: super::super::SATELLITE_SCHEMA_VERSION,
             supported: 2,
             ..
         })

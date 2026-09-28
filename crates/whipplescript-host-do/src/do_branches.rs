@@ -14,6 +14,7 @@
 //! table (the one checkpoint manifests already live in), created
 //! defensively for stores that predate it.
 
+mod flowing_sources;
 mod resolution_batch;
 mod resolution_origin;
 
@@ -191,6 +192,9 @@ impl<S: DoSql> DoBranches<S> {
             "CREATE INDEX IF NOT EXISTS closure_pins_holder_idx
                 ON closure_pins(holder)",
         ] {
+            self.sql.execute(statement, &[]).map_err(sql_err)?;
+        }
+        for statement in whipplescript_store::branches::flowing_sources::SCHEMA {
             self.sql.execute(statement, &[]).map_err(sql_err)?;
         }
         // Provenance columns arrived with Phase 2 (exactly as native):
@@ -873,7 +877,11 @@ impl<S: DoSql> Branches for DoBranches<S> {
         let rows = self
             .sql
             .query(
-                "SELECT cut_id FROM closure_pins WHERE expires_at > ?1",
+                "SELECT cut_id FROM closure_pins WHERE expires_at > ?1 \
+                 UNION SELECT cut_id FROM flowing_private_pins \
+                 WHERE released_at IS NULL \
+                 UNION SELECT source_cut_id FROM flowing_handoffs \
+                 UNION SELECT target_after_cut_id FROM flowing_handoffs",
                 &[text(now)],
             )
             .map_err(sql_err)?;

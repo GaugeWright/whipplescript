@@ -65,7 +65,7 @@ fn resolution_origin_migration_never_invents_old_authorship() {
     assert!(matches!(
         crate::stamp_satellite_schema(&store.connection, "branch", 3),
         Err(StoreError::UnsupportedVersion {
-            found: 4,
+            found: super::super::SATELLITE_SCHEMA_VERSION,
             supported: 3,
             ..
         })

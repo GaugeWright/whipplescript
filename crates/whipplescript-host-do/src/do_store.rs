@@ -9808,6 +9808,13 @@ impl<Sql: DoSql> DoSqliteStore<Sql> {
         whipplescript_store::norm::replay_norm(&self.norm_events()?, &pin, verifier)
     }
 
+    pub fn norm_reference_inventory(
+        &self,
+        verifier: &dyn whipplescript_store::norm::NormVerifier,
+    ) -> StoreResult<whipplescript_store::norm_reference_inventory::NormReferenceInventory> {
+        whipplescript_store::norm_reference_inventory::inventory_at(&self.norm_view(verifier)?)
+    }
+
     pub fn append_norm_event(
         &mut self,
         signed: &whipplescript_store::norm::SignedNormEvent,
@@ -19325,6 +19332,9 @@ mod norm_admission_tests {
             },
         );
         let ledger = hosted.append_norm_event(&bootstrap, &verifier).unwrap();
+        let inventory_at_genesis = hosted.norm_reference_inventory(&verifier).unwrap();
+        assert_eq!(inventory_at_genesis.ledger, ledger);
+        assert_eq!(inventory_at_genesis.frontier, vec![ledger.clone()]);
         // NP-01: the genesis binds the owner, never the worker who created it.
         assert_eq!(hosted.norm_view(&verifier).unwrap().owner, owner);
         let vocabulary = Vocabulary::new(charter().vocabularies[0].definition.clone())
@@ -19347,6 +19357,15 @@ mod norm_admission_tests {
                 &verifier,
             )
             .unwrap();
+        let inventory_after_create = hosted.norm_reference_inventory(&verifier).unwrap();
+        assert_ne!(
+            inventory_after_create.frontier,
+            inventory_at_genesis.frontier
+        );
+        assert_eq!(
+            inventory_after_create.charter_digest,
+            inventory_at_genesis.charter_digest
+        );
         // NP-02: the worker's acceptance is refused naming the authority it lacks.
         let acceptance = |ledger: &str, authority: Option<String>| NormAct::Transition {
             authority,
@@ -19552,6 +19571,10 @@ mod norm_admission_tests {
         assert_eq!(
             native.append_norm_event(&accepted, &verifier).unwrap(),
             hosted.append_norm_event(&accepted, &verifier).unwrap()
+        );
+        assert_eq!(
+            native.norm_reference_inventory(&verifier).unwrap(),
+            hosted.norm_reference_inventory(&verifier).unwrap(),
         );
         assert_eq!(
             native.norm_view(&verifier).unwrap().records,

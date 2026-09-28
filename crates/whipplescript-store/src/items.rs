@@ -2023,6 +2023,13 @@ impl WorkItemStore {
         crate::norm::replay_norm(&load_norm_events(&self.connection)?, &pin, verifier)
     }
 
+    pub fn norm_reference_inventory(
+        &self,
+        verifier: &dyn crate::norm::NormVerifier,
+    ) -> StoreResult<crate::norm_reference_inventory::NormReferenceInventory> {
+        crate::norm_reference_inventory::inventory_at(&self.norm_view(verifier)?)
+    }
+
     pub fn append_norm_event(
         &mut self,
         signed: &crate::norm::SignedNormEvent,

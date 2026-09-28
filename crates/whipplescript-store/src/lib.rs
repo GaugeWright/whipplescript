@@ -48,6 +48,7 @@ pub mod norm_inventory;
 pub mod norm_manifests;
 pub mod norm_publication;
 pub mod norm_query;
+pub mod norm_reference_inventory;
 pub mod norm_relations;
 pub mod norm_reservations;
 pub mod norm_resources;
