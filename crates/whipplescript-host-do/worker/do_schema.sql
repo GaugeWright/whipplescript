@@ -6,6 +6,7 @@
             INSERT INTO schema_migrations (version, name) VALUES (5, 'tracker-closure-receipts');
             INSERT INTO schema_migrations (version, name) VALUES (6, 'tracker-control-receipts');
             INSERT INTO schema_migrations (version, name) VALUES (7, 'fact-validity');
+            INSERT INTO schema_migrations (version, name) VALUES (8, 'program-import-admission');
             CREATE TABLE events (
                 event_id TEXT PRIMARY KEY, instance_id TEXT NOT NULL, sequence INTEGER NOT NULL,
                 event_type TEXT NOT NULL, payload_json TEXT NOT NULL, occurred_at TEXT NOT NULL,
@@ -59,6 +60,12 @@
                 analysis_summary TEXT NOT NULL DEFAULT '{}',
                 generated_artifacts TEXT NOT NULL DEFAULT '[]', artifact_root TEXT,
                 UNIQUE(program_id, source_hash, ir_hash)
+            );
+            CREATE TABLE program_import_admissions (
+                version_id TEXT NOT NULL REFERENCES program_versions(version_id),
+                witness_digest TEXT NOT NULL,
+                witness_json TEXT NOT NULL,
+                PRIMARY KEY (version_id, witness_digest)
             );
             CREATE TABLE artifacts (
                 artifact_id TEXT PRIMARY KEY, run_id TEXT NOT NULL, kind TEXT NOT NULL,

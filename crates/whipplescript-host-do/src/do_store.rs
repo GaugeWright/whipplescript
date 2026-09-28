@@ -5081,6 +5081,24 @@ fn do_insert_package_row<Sql: DoSql>(
 /// `create_program_version` and `reattest_instance_program`. Both write the
 /// identical twelve-column row and then recover the id through the conflict
 /// key, because the insert is a no-op when the version already exists.
+fn do_ensure_program_id<Sql: DoSql>(sql: &Sql, name: &str) -> StoreResult<String> {
+    sql.execute(
+        "INSERT INTO programs (program_id, name) \
+         VALUES ('prg_' || lower(hex(randomblob(16))), ?1) ON CONFLICT(name) DO NOTHING",
+        &[text(name)],
+    )
+    .map_err(sql_err)?;
+    let rows = sql
+        .query(
+            "SELECT program_id FROM programs WHERE name = ?1",
+            &[text(name)],
+        )
+        .map_err(sql_err)?;
+    rows.first()
+        .map(|row| as_text(&row[0]))
+        .ok_or_else(|| sql_err("program row missing after insert".to_string()))
+}
+
 fn do_insert_program_version<Sql: DoSql>(
     sql: &Sql,
     program_id: &str,
@@ -5293,29 +5311,81 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
         &mut self,
         version: NewProgramVersion<'_>,
     ) -> StoreResult<ProgramVersionRecord> {
-        self.sql
-            .execute(
-                "INSERT INTO programs (program_id, name) \
-                 VALUES ('prg_' || lower(hex(randomblob(16))), ?1) ON CONFLICT(name) DO NOTHING",
-                &[text(version.program_name)],
-            )
-            .map_err(sql_err)?;
-        let program_rows = self
-            .sql
-            .query(
-                "SELECT program_id FROM programs WHERE name = ?1",
-                &[text(version.program_name)],
-            )
-            .map_err(sql_err)?;
-        let program_id = program_rows
-            .first()
-            .map(|r| as_text(&r[0]))
-            .ok_or_else(|| sql_err("program row missing after insert".to_string()))?;
+        let program_id = do_ensure_program_id(&self.sql, version.program_name)?;
         let version_id = do_insert_program_version(&self.sql, &program_id, version)?;
         Ok(ProgramVersionRecord {
             program_id,
             version_id,
         })
+    }
+
+    fn create_program_version_with_import_witness(
+        &mut self,
+        version: NewProgramVersion<'_>,
+        witness: &whipplescript_store::program_imports::ProgramImportWitness,
+    ) -> StoreResult<whipplescript_store::program_imports::ProgramImportAdmissionRecord> {
+        if !whipplescript_store::program_imports::matches_source_id(witness, version.source_hash) {
+            return Err(StoreError::Conflict(
+                "import witness program source differs from the version".into(),
+            ));
+        }
+        let (digest, json) = whipplescript_store::program_imports::encode(witness)?;
+        let mut record = None;
+        self.sql.atomic(&mut || {
+            let program_id = do_ensure_program_id(&self.sql, version.program_name)?;
+            let version_id = do_insert_program_version(&self.sql, &program_id, version)?;
+            self.sql
+                .execute(
+                    "INSERT OR IGNORE INTO program_import_admissions \
+                     (version_id, witness_digest, witness_json) VALUES (?1, ?2, ?3)",
+                    &[text(&version_id), text(&digest), text(&json)],
+                )
+                .map_err(sql_err)?;
+            record = Some(
+                whipplescript_store::program_imports::ProgramImportAdmissionRecord {
+                    program_id,
+                    version_id,
+                    witness_digest: digest.clone(),
+                },
+            );
+            Ok(())
+        })?;
+        Ok(record.expect("the successful atomic body sets its admission record"))
+    }
+
+    fn program_import_witness(
+        &self,
+        version_id: &str,
+        witness_digest: &str,
+    ) -> StoreResult<Option<whipplescript_store::program_imports::ProgramImportWitness>> {
+        let rows = self
+            .sql
+            .query(
+                "SELECT admissions.witness_json, versions.source_hash \
+                 FROM program_import_admissions AS admissions \
+                 JOIN program_versions AS versions ON versions.version_id = admissions.version_id \
+                 WHERE admissions.version_id = ?1 AND admissions.witness_digest = ?2",
+                &[text(version_id), text(witness_digest)],
+            )
+            .map_err(sql_err)?;
+        rows.first()
+            .map(|row| {
+                let witness: whipplescript_store::program_imports::ProgramImportWitness =
+                    serde_json::from_str(&as_text(&row[0]))?;
+                let (actual, _) = whipplescript_store::program_imports::encode(&witness)?;
+                if actual != witness_digest
+                    || !whipplescript_store::program_imports::matches_source_id(
+                        &witness,
+                        &as_text(&row[1]),
+                    )
+                {
+                    return Err(StoreError::Conflict(
+                        "stored import witness differs from its version or digest".into(),
+                    ));
+                }
+                Ok(witness)
+            })
+            .transpose()
     }
 
     fn reattest_instance_program(
@@ -11036,6 +11106,7 @@ pub mod test_support {
             INSERT INTO schema_migrations (version, name) VALUES (5, 'tracker-closure-receipts');
             INSERT INTO schema_migrations (version, name) VALUES (6, 'tracker-control-receipts');
             INSERT INTO schema_migrations (version, name) VALUES (7, 'fact-validity');
+            INSERT INTO schema_migrations (version, name) VALUES (8, 'program-import-admission');
             CREATE TABLE events (
                 event_id TEXT PRIMARY KEY, instance_id TEXT NOT NULL, sequence INTEGER NOT NULL,
                 event_type TEXT NOT NULL, payload_json TEXT NOT NULL, occurred_at TEXT NOT NULL,
@@ -11342,6 +11413,8 @@ pub mod test_support {
             .expect("tracker closure schema");
         conn.execute_batch(whipplescript_store::tracker_control::SCHEMA)
             .expect("tracker control schema");
+        conn.execute_batch(whipplescript_store::program_imports::SCHEMA)
+            .expect("program import admission schema");
         DoSqliteStore::new(RusqliteDoSql {
             conn: std::rc::Rc::new(conn),
         })
@@ -14457,14 +14530,113 @@ pub(crate) mod tests {
         );
     }
 
+    /// A reused version may carry two separately accepted exact import bases.
+    #[test]
+    fn hosted_import_admission_keeps_exact_bases_and_rolls_back_bad_witnesses() {
+        use whipplescript_store::program_imports::{ProgramImportEdge, ProgramImportWitness};
+
+        const SOURCE: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        const SOURCE_ID: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        const LOCK: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        const NEXT_LOCK: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+        const COMPILER: &str = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+        let version = |name: &'static str| NewProgramVersion {
+            program_name: name,
+            source_hash: SOURCE_ID,
+            ir_hash: COMPILER,
+            compiler_version: "test-compiler",
+            ir_snapshot: None,
+            declared_capabilities_json: "[]",
+            declared_profiles_json: "[]",
+            declared_skills_json: "[]",
+            declared_schemas_json: "[]",
+            analysis_summary_json: "{}",
+            generated_artifacts_json: "[]",
+            artifact_root: None,
+        };
+        let witness = |lock: &str| {
+            let edges = vec![ProgramImportEdge {
+                import: "local.paint".into(),
+                package_id: "pkg-paint".into(),
+                version: "1".into(),
+                source_digest: SOURCE.into(),
+            }];
+            ProgramImportWitness {
+                program_source_digest: SOURCE.into(),
+                lock_digest: lock.into(),
+                compiler_artifact_digest: COMPILER.into(),
+                examined: vec!["local.paint".into()],
+                edge_digest: whipplescript_store::items::sha256_hex(
+                    &serde_json::to_string(&edges).expect("fixture edge JSON"),
+                ),
+                edges,
+            }
+        };
+        let mut store = store();
+        let first_witness = witness(LOCK);
+        let first = store
+            .create_program_version_with_import_witness(version("paint"), &first_witness)
+            .unwrap();
+        assert_eq!(
+            store
+                .program_import_witness(&first.version_id, &first.witness_digest)
+                .unwrap(),
+            Some(first_witness.clone())
+        );
+        let second_witness = witness(NEXT_LOCK);
+        let second = store
+            .create_program_version_with_import_witness(version("paint"), &second_witness)
+            .unwrap();
+        assert_eq!(second.version_id, first.version_id);
+        assert_ne!(second.witness_digest, first.witness_digest);
+        assert_eq!(
+            store
+                .program_import_witness(&second.version_id, &second.witness_digest)
+                .unwrap(),
+            Some(second_witness)
+        );
+
+        let mut bad = witness(LOCK);
+        bad.edge_digest = NEXT_LOCK.into();
+        assert!(store
+            .create_program_version_with_import_witness(version("bad"), &bad)
+            .is_err());
+        let mut wrong_source = witness(LOCK);
+        wrong_source.program_source_digest = NEXT_LOCK.into();
+        assert!(store
+            .create_program_version_with_import_witness(version("wrong-source"), &wrong_source)
+            .is_err());
+        let rows = store
+            .sql
+            .query(
+                "SELECT COUNT(*) FROM program_versions WHERE program_id IN \
+                 (SELECT program_id FROM programs WHERE name IN ('bad', 'wrong-source'))",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(as_i64(&rows[0][0]), 0);
+        store
+            .sql
+            .execute(
+                "UPDATE program_versions SET source_hash = ?1 WHERE version_id = ?2",
+                &[
+                    text("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"),
+                    text(&first.version_id),
+                ],
+            )
+            .unwrap();
+        assert!(matches!(
+            store.program_import_witness(&first.version_id, &first.witness_digest),
+            Err(StoreError::Conflict(message)) if message.contains("differs from its version")
+        ));
+    }
+
     /// The ported core methods run their real SQL against a real engine.
     #[test]
     fn do_store_core_methods_run_real_sql() {
         let store = store();
 
-        // 7: main's six generations plus this branch's `fact-validity`, which
-        // was renumbered off 4 because both sides had taken it.
-        assert_eq!(store.schema_version().expect("version"), 7);
+        assert_eq!(store.schema_version().expect("version"), 8);
         assert!(!store.fact_exists("i1", "ready").expect("fact"));
 
         let event = store

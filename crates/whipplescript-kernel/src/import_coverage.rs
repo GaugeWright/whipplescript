@@ -8,8 +8,8 @@
 
 use std::collections::BTreeMap;
 
-use serde::{Deserialize, Serialize};
 use whipplescript_parser::IrProgram;
+pub use whipplescript_store::program_imports::{ProgramImportEdge, ProgramImportWitness};
 
 use crate::exec_http::sha256_hex;
 
@@ -21,26 +21,6 @@ pub struct ResolvedLocalPackage<'a> {
     /// Digest of the source bytes relevant to this package, freshly read at
     /// capture/verification time; v0's lock digest alone does not cover them.
     pub source_digest: &'a str,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct ProgramImportEdge {
-    pub import: String,
-    pub package_id: String,
-    pub version: String,
-    pub source_digest: String,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct ProgramImportWitness {
-    pub program_source_digest: String,
-    pub lock_digest: String,
-    pub compiler_artifact_digest: String,
-    /// This is the complete non-std import set from the admitted IR. An empty
-    /// set is meaningful only for this one checked program revision.
-    pub examined: Vec<String>,
-    pub edges: Vec<ProgramImportEdge>,
-    pub edge_digest: String,
 }
 
 fn is_digest(value: &str) -> bool {

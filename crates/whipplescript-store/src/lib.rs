@@ -56,6 +56,7 @@ pub mod norm_views;
 #[cfg(feature = "native")]
 pub mod payload_protection;
 pub mod preflight;
+pub mod program_imports;
 pub mod projection_prefix;
 pub mod read_through;
 pub mod reconcile;
@@ -123,7 +124,7 @@ pub fn run_block_event_key(legacy: &str, payload: &str, original: Option<&str>) 
 /// understands. Must stay equal to the highest version in `MIGRATIONS`
 /// (asserted by test); `apply_migrations` refuses to open a store stamped
 /// beyond it instead of silently misreading a newer layout.
-pub const SUPPORTED_SCHEMA_VERSION: i64 = 4;
+pub const SUPPORTED_SCHEMA_VERSION: i64 = 5;
 
 /// Stamp a satellite store's schema generation, and refuse one stamped beyond
 /// what this build understands.
@@ -1683,6 +1684,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "fact-validity",
         sql: include_str!("../migrations/0004_fact_validity.sql"),
     },
+    Migration {
+        version: 5,
+        name: "program-import-admission",
+        sql: program_imports::SCHEMA,
+    },
 ];
 
 /// The schema owner an existing runtime store must carry: the name of its
@@ -1954,13 +1960,61 @@ impl SqliteStore {
         version: NewProgramVersion<'_>,
     ) -> StoreResult<ProgramVersionRecord> {
         self.retained_publication()
-            .run(|| self.create_program_version_retained(version))
+            .run(|| self.create_program_version_retained(version, None))
+            .map(|(record, _)| record)
+    }
+
+    pub fn create_program_version_with_import_witness(
+        &mut self,
+        version: NewProgramVersion<'_>,
+        witness: &program_imports::ProgramImportWitness,
+    ) -> StoreResult<program_imports::ProgramImportAdmissionRecord> {
+        let (record, digest) = self
+            .retained_publication()
+            .run(|| self.create_program_version_retained(version, Some(witness)))?;
+        Ok(program_imports::ProgramImportAdmissionRecord {
+            program_id: record.program_id,
+            version_id: record.version_id,
+            witness_digest: digest.expect("the supplied witness was stored in the transaction"),
+        })
+    }
+
+    pub fn program_import_witness(
+        &self,
+        version_id: &str,
+        witness_digest: &str,
+    ) -> StoreResult<Option<program_imports::ProgramImportWitness>> {
+        let row: Option<(String, String)> = self
+            .connection
+            .query_row(
+                "SELECT admissions.witness_json, versions.source_hash \
+                 FROM program_import_admissions AS admissions \
+                 JOIN program_versions AS versions ON versions.version_id = admissions.version_id \
+                 WHERE admissions.version_id = ?1 AND admissions.witness_digest = ?2",
+                params![version_id, witness_digest],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        row.map(|(json, source_id)| {
+            let witness: program_imports::ProgramImportWitness = serde_json::from_str(&json)?;
+            let (actual_digest, _) = program_imports::encode(&witness)?;
+            if actual_digest != witness_digest
+                || !program_imports::matches_source_id(&witness, &source_id)
+            {
+                return Err(StoreError::Conflict(
+                    "stored import witness differs from its version or digest".into(),
+                ));
+            }
+            Ok(witness)
+        })
+        .transpose()
     }
 
     fn create_program_version_retained(
         &mut self,
         version: NewProgramVersion<'_>,
-    ) -> StoreResult<ProgramVersionRecord> {
+        witness: Option<&program_imports::ProgramImportWitness>,
+    ) -> StoreResult<(ProgramVersionRecord, Option<String>)> {
         let tx = self
             .connection
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -2052,12 +2106,31 @@ impl SqliteStore {
                 params![&actual, snapshot, snapshot.len() as i64],
             )?;
         }
+        let witness_digest = if let Some(witness) = witness {
+            if !program_imports::matches_source_id(witness, version.source_hash) {
+                return Err(StoreError::Conflict(
+                    "import witness program source differs from the version".into(),
+                ));
+            }
+            let (digest, json) = program_imports::encode(witness)?;
+            tx.execute(
+                "INSERT OR IGNORE INTO program_import_admissions \
+                 (version_id, witness_digest, witness_json) VALUES (?1, ?2, ?3)",
+                params![&version_id, &digest, &json],
+            )?;
+            Some(digest)
+        } else {
+            None
+        };
         tx.commit()?;
 
-        Ok(ProgramVersionRecord {
-            program_id,
-            version_id,
-        })
+        Ok((
+            ProgramVersionRecord {
+                program_id,
+                version_id,
+            },
+            witness_digest,
+        ))
     }
 
     /// Re-attest an instance's program under the current compiler
@@ -8387,6 +8460,16 @@ pub trait RuntimeStore {
         &mut self,
         version: NewProgramVersion<'_>,
     ) -> StoreResult<ProgramVersionRecord>;
+    fn create_program_version_with_import_witness(
+        &mut self,
+        version: NewProgramVersion<'_>,
+        witness: &program_imports::ProgramImportWitness,
+    ) -> StoreResult<program_imports::ProgramImportAdmissionRecord>;
+    fn program_import_witness(
+        &self,
+        version_id: &str,
+        witness_digest: &str,
+    ) -> StoreResult<Option<program_imports::ProgramImportWitness>>;
     /// Re-attest an instance's program under the current compiler: same
     /// authored identity, new IR (see `SqliteStore::reattest_instance_program`).
     fn reattest_instance_program(
@@ -8833,6 +8916,20 @@ impl RuntimeStore for SqliteStore {
         version: NewProgramVersion<'_>,
     ) -> StoreResult<ProgramVersionRecord> {
         self.create_program_version(version)
+    }
+    fn create_program_version_with_import_witness(
+        &mut self,
+        version: NewProgramVersion<'_>,
+        witness: &program_imports::ProgramImportWitness,
+    ) -> StoreResult<program_imports::ProgramImportAdmissionRecord> {
+        self.create_program_version_with_import_witness(version, witness)
+    }
+    fn program_import_witness(
+        &self,
+        version_id: &str,
+        witness_digest: &str,
+    ) -> StoreResult<Option<program_imports::ProgramImportWitness>> {
+        self.program_import_witness(version_id, witness_digest)
     }
     fn reattest_instance_program(
         &mut self,
