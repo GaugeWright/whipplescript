@@ -20342,6 +20342,9 @@ mod norm_admission_tests {
         let mut native = whipplescript_store::items::WorkItemStore::open_in_memory().unwrap();
         let mut hosted = test_support::store();
         let mut admitted_charter = charter();
+        admitted_charter.activation = Some(AdmissionPredicate::Authority {
+            scope: "accept".into(),
+        });
         for (name, form) in [
             (
                 "basis",
@@ -20418,7 +20421,7 @@ mod norm_admission_tests {
         let denied = signed(worker, &worker_key, "denied", action.clone());
         assert!(native.append_norm_event(&denied, &verifier).is_err());
         assert!(hosted.append_norm_event(&denied, &verifier).is_err());
-        let accepted = signed(owner, &owner_key, "accepted", action);
+        let accepted = signed(owner.clone(), &owner_key, "accepted", action);
         assert_eq!(
             native.append_norm_event(&accepted, &verifier).unwrap(),
             hosted.append_norm_event(&accepted, &verifier).unwrap()
@@ -20429,6 +20432,11 @@ mod norm_admission_tests {
             hosted.norm_reference_inventory(&verifier).unwrap()
         );
         assert!(native_inventory.has_unclassified);
+        assert_eq!(
+            native_inventory.charter_events,
+            std::slice::from_ref(&ledger)
+        );
+        assert!(!native_inventory.historical_population_unknown);
         assert_eq!(
             native_inventory
                 .fields
@@ -20442,6 +20450,48 @@ mod norm_admission_tests {
                 ),
                 ("later", None),
             ]
+        );
+        let mut successor = admitted_charter;
+        successor.vocabularies[0].definition.version = "2".into();
+        successor.reference_classes[0].vocabulary_version = "2".into();
+        successor.reference_classes.push(
+            whipplescript_store::norm_reference_inventory::NormReferenceClass {
+                vocabulary: "decision".into(),
+                vocabulary_version: "2".into(),
+                path: "later".into(),
+                meaning:
+                    whipplescript_store::norm_reference_inventory::NormReferenceMeaning::Authority,
+            },
+        );
+        let before_activation = native.norm_view(&verifier).unwrap();
+        let activate = signed(
+            owner,
+            &owner_key,
+            "classify-later",
+            NormAct::Activate {
+                ledger: ledger.clone(),
+                previous: before_activation.authority_head,
+                charter: successor,
+                migration: vec![],
+                changes: vec![],
+                frontier: before_activation.frontier.into_iter().collect(),
+            },
+        );
+        let activation_id = native.append_norm_event(&activate, &verifier).unwrap();
+        assert_eq!(
+            activation_id,
+            hosted.append_norm_event(&activate, &verifier).unwrap()
+        );
+        let native_inventory = native.norm_reference_inventory(&verifier).unwrap();
+        assert_eq!(
+            native_inventory,
+            hosted.norm_reference_inventory(&verifier).unwrap()
+        );
+        assert!(!native_inventory.has_unclassified);
+        assert!(native_inventory.historical_population_unknown);
+        assert_eq!(
+            native_inventory.charter_events,
+            [ledger.clone(), activation_id]
         );
         assert_eq!(
             native.norm_view(&verifier).unwrap().records,
@@ -20469,7 +20519,7 @@ mod norm_admission_tests {
         assert!(restored.norm_view(&verifier).is_err());
         let mut history = hosted.export_events().unwrap();
         history.reverse();
-        assert_eq!(restored.import_norm_events(&history, &verifier).unwrap(), 3);
+        assert_eq!(restored.import_norm_events(&history, &verifier).unwrap(), 4);
         assert_eq!(restored.import_norm_events(&history, &verifier).unwrap(), 0);
         let mut foreign = creation.tracker_event().unwrap();
         foreign.kind = "issue.created".into();
@@ -20479,7 +20529,7 @@ mod norm_admission_tests {
             hosted.norm_view(&verifier).unwrap().records
         );
         let mut legacy = test_support::store();
-        assert_eq!(legacy.import_events(&history).unwrap().rejected, 3);
+        assert_eq!(legacy.import_events(&history).unwrap().rejected, 4);
         assert!(legacy.export_events().unwrap().is_empty());
     }
 

@@ -71,6 +71,12 @@ pub struct NormReferenceInventory {
     pub authority_head: String,
     pub frontier: Vec<String>,
     pub charter_digest: String,
+    /// The exact signed acts that installed each charter, from genesis through
+    /// the current one. This field inventory describes only the last charter.
+    pub charter_events: Vec<String>,
+    /// Earlier admissions cannot be certified by the current charter's field
+    /// declarations alone, even if every current field has a meaning.
+    pub historical_population_unknown: bool,
     pub fields: Vec<NormReferenceField>,
     pub has_unclassified: bool,
 }
@@ -83,6 +89,8 @@ pub fn inventory_at(view: &NormView) -> StoreResult<NormReferenceInventory> {
         authority_head: view.authority_head.clone(),
         frontier: view.frontier.iter().cloned().collect(),
         charter_digest,
+        charter_events: view.charter_events.clone(),
+        historical_population_unknown: view.charter_events.len() > 1,
         has_unclassified: fields.iter().any(|field| field.meaning.is_none()),
         fields,
     })
@@ -197,6 +205,23 @@ pub(crate) fn validate_classes(charter: &NormCharter) -> StoreResult<()> {
         }
     }
     Ok(())
+}
+
+/// The meaning contract for one exact vocabulary version, including the empty
+/// contract. Activation may not change it for a version already admitted.
+pub(crate) fn classes_for(
+    charter: &NormCharter,
+    vocabulary: &NormVocabulary,
+) -> std::collections::BTreeMap<String, NormReferenceMeaning> {
+    charter
+        .reference_classes
+        .iter()
+        .filter(|class| {
+            class.vocabulary == vocabulary.definition.name
+                && class.vocabulary_version == vocabulary.definition.version
+        })
+        .map(|class| (class.path.clone(), class.meaning))
+        .collect()
 }
 
 fn role(vocabulary: &NormVocabulary, path: &str) -> NormReferenceRole {

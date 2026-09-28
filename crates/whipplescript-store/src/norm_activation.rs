@@ -231,6 +231,17 @@ impl NormView {
                     )));
                 }
             }
+            if let Some(earlier) = self.reference_meaning_history.get(&(
+                entry.definition.name.clone(),
+                entry.definition.version.clone(),
+            )) {
+                if earlier != &crate::norm_reference_inventory::classes_for(charter, entry) {
+                    return Err(refused(format!(
+                        "a successor charter redefines reference meanings for {}; a new meaning needs a new vocabulary version",
+                        label(&reference)
+                    )));
+                }
+            }
         }
         let mut planned: BTreeSet<String> = BTreeSet::new();
         for step in migration {

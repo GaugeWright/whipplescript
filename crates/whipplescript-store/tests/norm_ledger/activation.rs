@@ -3,6 +3,7 @@
 
 use whipplescript_core::vocabulary::VocabularyRef;
 use whipplescript_store::norm_activation::*;
+use whipplescript_store::norm_reference_inventory::{NormReferenceClass, NormReferenceMeaning};
 
 fn vocabulary(value: serde_json::Value) -> NormVocabulary {
     serde_json::from_value(value).expect("vocabulary fixture")
@@ -18,7 +19,8 @@ fn reference(entry: &NormVocabulary) -> VocabularyRef {
 fn decision_v1() -> NormVocabulary {
     vocabulary(json!({
         "definition": {"name":"decision","version":"1",
-            "fields":[{"name":"title","required":true,"value_type":{"type":"text"}}],
+            "fields":[{"name":"title","required":true,"value_type":{"type":"text"}},
+                      {"name":"basis","required":false,"value_type":{"type":"reference","form":"revision"}}],
             "status":{"values":["proposed","accepted","retired","withdrawn"],"initial":"proposed","transitions":[
                 {"from":"proposed","to":"accepted","admission":{"requires":"authority","scope":"accept"}},
                 {"from":"accepted","to":"retired","admission":{"requires":"authority","scope":"accept"}},
@@ -474,6 +476,19 @@ fn norm_charter_activation_refuses_with_every_obstruction_located() {
         ),
     );
     assert!(error.contains("redefines note@1; a new definition needs a new version"), "{error}");
+    let mut reclassified = view.charter.clone();
+    reclassified.reference_classes.push(NormReferenceClass {
+        vocabulary: "decision".into(),
+        vocabulary_version: "1".into(),
+        path: "basis".into(),
+        meaning: NormReferenceMeaning::HistoricalPin,
+    });
+    let error = refusal(
+        &mut store,
+        &keys,
+        &activation(&keys, &view, "owner", "reclassified", reclassified, vec![], vec![]),
+    );
+    assert!(error.contains("redefines reference meanings for decision@1"), "{error}");
     let mut open = governed(vec![strong.clone(), duty("1", true)]);
     open.activation = Some(AdmissionPredicate::Public {});
     let error = refusal(
@@ -629,6 +644,9 @@ fn norm_charter_activation_migrates_live_records_and_keeps_history_replayable() 
     // the checkpoint records.
     assert_eq!(view.charter, governed(vec![weak.clone(), duty("1", true)]));
     assert_eq!(view.authority_head, activated);
+    let reference_inventory = store.norm_reference_inventory(&keys).unwrap();
+    assert_eq!(reference_inventory.charter_events, [view.ledger.clone(), activated.clone()]);
+    assert!(reference_inventory.historical_population_unknown);
     assert_eq!(store.norm_checkpoint().unwrap(), Some(view.checkpoint()));
 
     // Live decisions moved to the successor with their meaning intact.

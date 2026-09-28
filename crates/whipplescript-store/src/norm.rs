@@ -489,6 +489,15 @@ pub struct NormView {
     manifest_bases: BTreeMap<String, Vec<String>>,
     pub authority_head: String,
     pub frontier: BTreeSet<String>,
+    /// Genesis and every admitted activation, in replay order. The current
+    /// charter's fields do not cover records accepted in earlier epochs.
+    pub(crate) charter_events: Vec<String>,
+    /// Every admitted vocabulary version's reference meanings, including
+    /// versions with no declared classes. Reintroduction cannot change them.
+    pub(crate) reference_meaning_history: BTreeMap<
+        (String, String),
+        BTreeMap<String, crate::norm_reference_inventory::NormReferenceMeaning>,
+    >,
     authority_history: BTreeSet<String>,
     event_order: Vec<String>,
     creator: String,
@@ -729,6 +738,19 @@ impl NormView {
             return Err(refused("norm genesis must be a bootstrap act"));
         };
         let registry = registry_for(&charter)?;
+        let reference_meaning_history = charter
+            .vocabularies
+            .iter()
+            .map(|vocabulary| {
+                (
+                    (
+                        vocabulary.definition.name.clone(),
+                        vocabulary.definition.version.clone(),
+                    ),
+                    crate::norm_reference_inventory::classes_for(&charter, vocabulary),
+                )
+            })
+            .collect();
         let mut nonces = BTreeMap::new();
         nonces.insert(
             (
@@ -751,6 +773,8 @@ impl NormView {
             manifest_bases: BTreeMap::new(),
             authority_head: event.event_id.clone(),
             frontier: BTreeSet::from([event.event_id.clone()]),
+            charter_events: vec![event.event_id.clone()],
+            reference_meaning_history,
             authority_history: BTreeSet::from([event.event_id.clone()]),
             event_order: vec![event.event_id.clone()],
             creator,
@@ -1252,7 +1276,17 @@ impl NormView {
         }
         self.historical
             .retain(|entry| !charter.vocabularies.contains(entry));
+        for entry in &charter.vocabularies {
+            self.reference_meaning_history.insert(
+                (
+                    entry.definition.name.clone(),
+                    entry.definition.version.clone(),
+                ),
+                crate::norm_reference_inventory::classes_for(&charter, entry),
+            );
+        }
         self.charter = charter;
+        self.charter_events.push(event_id.to_owned());
         for id in touched {
             let vocabulary = self.records[&id].vocabulary.clone();
             self.advance_family(&vocabulary, event_id);

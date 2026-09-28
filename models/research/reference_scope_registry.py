@@ -29,6 +29,7 @@ class AcceptedRef:
     consumer: str
     field: str
     provider: str
+    admitted_registry: int = 1
 
 
 @dataclass(frozen=True)
@@ -85,7 +86,9 @@ def capture(declarations: tuple[Declaration, ...],
     edges = set()
     for ref in accepted:
         declaration = by_field.get(ref.field)
-        if ref.consumer not in population:
+        if ref.admitted_registry != basis.registry:
+            gaps.append("accepted reference from an earlier registry needs its own witness")
+        elif ref.consumer not in population:
             gaps.append("accepted reference outside roster")
         elif declaration is None or declaration.meaning not in REF_MEANINGS:
             gaps.append("accepted reference lacks declared meaning")
@@ -169,6 +172,13 @@ def probe():
     # opaque reference, and falsely claim complete coverage.
     assert capture(declarations, population, population, accepted, basis).state == "complete"
 
+    earlier = accepted | {AcceptedRef("program-b", "norm.derived_from",
+                                      "package-x", admitted_registry=0)}
+    assert capture(declarations, population, population, earlier, basis).state == "unknown"
+    # Defect: the current registry's declarations are used for an admitted
+    # reference whose earlier accepting registry is absent from this witness.
+    assert capture(declarations, population, population, accepted, basis).state == "complete"
+
     unenforced = capture(declarations, population, population, accepted, basis,
                          boundary_enforced=False)
     assert unenforced.state == "unknown"
@@ -192,9 +202,9 @@ def probe():
     assert all_typed == population
     print(f"reference scope registry: {checked} population subsets; "
           f"{len(complete.required)} required scopes")
-    print("  unclassified field, omitted consumer, opaque path, and open boundary refuse")
+    print("  unclassified field, omitted consumer, opaque path, earlier registry, and open boundary refuse")
     print("  graph/registry/roster/cut changes invalidate; provenance and pins stay non-live")
-    print("  six weakened variants give false completeness, staleness, or live routing")
+    print("  seven weakened variants give false completeness, staleness, or live routing")
 
 
 if __name__ == "__main__":
