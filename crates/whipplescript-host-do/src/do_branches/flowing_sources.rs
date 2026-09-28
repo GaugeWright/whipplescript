@@ -890,30 +890,12 @@ mod tests {
                 .expect("bind source"),
             BindContributionBasisOutcome::Bound
         );
+        vcs.write("twig", "b.txt", Some("later"), "twig-tail", "t5")
+            .expect("unselected tail remains on twig");
         let body = DoContentBlobs::new(Rc::clone(&sql)).expect("content");
-        let selected = selection.changes()[0]
-            .after
-            .as_deref()
-            .expect("source body");
-        let manifest = body
-            .put_text(&format!(r#"{{"a.txt":"{selected}"}}"#))
-            .expect("exact candidate manifest");
-        branches
-            .record_cut(CutRecord {
-                cut_id: "trunk-exact",
-                change_id: "candidate-a",
-                branch_id: MAINLINE_BRANCH_ID,
-                manifest_hash: &manifest,
-                parent_cut_id: None,
-                origin: Some("transport:twig"),
-                actor: Some("coordinator"),
-                intent: None,
-                recorded_at: "t5",
-            })
-            .expect("exact candidate cut");
         let FlowingTargetEffectsOutcome::Verified(witness) = vcs
-            .verify_trunk_target_effects("unit-a", "trunk-exact")
-            .expect("verify candidate")
+            .prepare_direct_trunk_candidate("unit-a", "trunk-exact", "coordinator", "t5")
+            .expect("prepare candidate")
         else {
             panic!("trunk candidate should carry selected content")
         };
@@ -921,6 +903,11 @@ mod tests {
         assert_eq!(
             witness.effects()[0].disposition,
             FlowingEffectDisposition::Applied
+        );
+        assert_eq!(
+            vcs.prepare_direct_trunk_candidate("unit-a", "trunk-exact", "coordinator", "t5")
+                .expect("exact retry"),
+            FlowingTargetEffectsOutcome::Verified(witness.clone())
         );
 
         let omitted = body.put_text("{}").expect("omitted candidate manifest");
@@ -944,6 +931,102 @@ mod tests {
                 path: "a.txt".into()
             }
         );
+        assert!(branches
+            .get_branch(MAINLINE_BRANCH_ID)
+            .unwrap()
+            .unwrap()
+            .head_cut_id
+            .is_none());
+
+        vcs.write(
+            MAINLINE_BRANCH_ID,
+            "a.txt",
+            Some("A"),
+            "trunk-existing",
+            "t6",
+        )
+        .expect("fixture installs equivalent trunk content");
+        let FlowingTargetEffectsOutcome::Verified(equivalent) = vcs
+            .prepare_direct_trunk_candidate("unit-a", "trunk-existing", "coordinator", "t7")
+            .expect("prepare metadata-only candidate")
+        else {
+            panic!("current trunk content should be equivalent")
+        };
+        assert_eq!(
+            equivalent.effects()[0].disposition,
+            FlowingEffectDisposition::Equivalent
+        );
+        assert_eq!(equivalent.target_before_cut_id(), Some("trunk-existing"));
+        assert_eq!(equivalent.target_after_cut_id(), "trunk-existing");
+    }
+
+    #[test]
+    fn hosted_direct_trunk_initial_noop_keeps_unit_owed() {
+        use std::rc::Rc;
+
+        use crate::do_branches::DoContentBlobs;
+        use whipplescript_store::selection::parse;
+        use whipplescript_store::vcs::{
+            FlowingSelectionOutcome, FlowingTargetEffectsOutcome, WorkspaceVcs,
+        };
+
+        let sql = Rc::new(RusqliteDoSql::with_runtime_schema());
+        let mut vcs = WorkspaceVcs::from_parts(
+            DoBranches::new(Rc::clone(&sql)).unwrap(),
+            DoContentBlobs::new(Rc::clone(&sql)).unwrap(),
+        );
+        vcs.init("t0").unwrap();
+        vcs.create_branch("twig", None, MAINLINE_BRANCH_ID, "t1")
+            .unwrap();
+        vcs.write("twig", "a.txt", Some("A"), "twig-a", "t2")
+            .unwrap();
+        vcs.write("twig", "a.txt", None, "twig-undo", "t3").unwrap();
+        let mut branches = DoBranches::new(Rc::clone(&sql)).unwrap();
+        let source_cut = branches.get_cut("twig-undo").unwrap().unwrap();
+        branches
+            .pin_private_cut(PinPrivateCut {
+                pin_id: "pin-undo",
+                twig_branch_id: "twig",
+                cut_id: "twig-undo",
+                manifest_hash: &source_cut.manifest_hash,
+                principal: "s:author",
+                retained_at: "t4",
+            })
+            .unwrap();
+        branches
+            .declare_contribution(DeclareContribution {
+                unit_id: "unit-undo",
+                pin_id: "pin-undo",
+                principal: "s:author",
+                intent: "undo the file",
+                read_basis_digest: "reads-a",
+                dependency_basis_digest: "deps-a",
+                scope_digest: "scope-a",
+                declared_at: "t4",
+            })
+            .unwrap();
+        let FlowingSelectionOutcome::Selected(selection) = vcs
+            .select_private_changes("pin-undo", &parse("path(a.txt)").unwrap())
+            .unwrap()
+        else {
+            panic!("write and undo must remain selected")
+        };
+        assert_eq!(selection.changes().len(), 2);
+        assert_eq!(
+            vcs.bind_private_selection("unit-undo", &selection, "t5")
+                .unwrap(),
+            BindContributionBasisOutcome::Bound
+        );
+        assert_eq!(
+            vcs.prepare_direct_trunk_candidate("unit-undo", "first-cut", "coordinator", "t6")
+                .unwrap(),
+            FlowingTargetEffectsOutcome::InitialNoopNeedsGenesis
+        );
+        assert!(branches.get_cut("first-cut").unwrap().is_none());
+        assert!(branches
+            .contribution_declaration("unit-undo")
+            .unwrap()
+            .is_some());
         assert!(branches
             .get_branch(MAINLINE_BRANCH_ID)
             .unwrap()

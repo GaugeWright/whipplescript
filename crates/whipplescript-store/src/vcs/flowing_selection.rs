@@ -143,6 +143,7 @@ pub enum FlowingTargetEffectsOutcome {
     TargetNotParent,
     TargetCutMissing,
     TargetCutMismatch,
+    InitialNoopNeedsGenesis,
     MissingManifest { cut_id: String },
     MissingContent { content_id: String },
     IncoherentSourcePath { path: String },
@@ -196,6 +197,158 @@ impl<B: Branches + FlowingSources, C: ContentBlobs> WorkspaceVcs<B, C> {
             }
         }
         Ok(Ok(selected))
+    }
+
+    /// Prepare a direct twig's prospective trunk cut from its bound source
+    /// atoms. This is content preparation, not admission: the caller still
+    /// owes candidate retention, a gate certificate, norm exclusion and the
+    /// ref-owned receipt. For an equivalent result on an existing trunk cut,
+    /// `target_cut_id` must be that cut's id; no new cut is minted. An empty
+    /// trunk has no cut against which to record a metadata-only result yet.
+    pub fn prepare_direct_trunk_candidate(
+        &mut self,
+        unit_id: &str,
+        target_cut_id: &str,
+        actor: &str,
+        recorded_at: &str,
+    ) -> StoreResult<FlowingTargetEffectsOutcome> {
+        if target_cut_id.trim().is_empty() || actor.trim().is_empty() {
+            return Err(StoreError::Conflict(
+                "trunk candidate cut id and actor must be nonempty".to_owned(),
+            ));
+        }
+        let Some(unit) = self.branches.contribution_declaration(unit_id)? else {
+            return Ok(FlowingTargetEffectsOutcome::UnitMissing);
+        };
+        let Some(basis) = self.branches.contribution_basis(unit_id)? else {
+            return Ok(FlowingTargetEffectsOutcome::BasisMissing);
+        };
+        let Some(source) = self.branches.get_branch(&unit.source_branch_id)? else {
+            return Ok(FlowingTargetEffectsOutcome::TargetNotParent);
+        };
+        if source.parent_branch_id.as_deref() != Some(crate::branches::MAINLINE_BRANCH_ID)
+            || source.name.is_some()
+        {
+            return Ok(FlowingTargetEffectsOutcome::TargetNotParent);
+        }
+        let Some(trunk) = self
+            .branches
+            .get_branch(crate::branches::MAINLINE_BRANCH_ID)?
+        else {
+            return Ok(FlowingTargetEffectsOutcome::TargetMissing);
+        };
+        if trunk.status != BranchStatus::Active {
+            return Ok(FlowingTargetEffectsOutcome::TargetMissing);
+        }
+        if let Some(head_id) = trunk.head_cut_id.as_deref() {
+            let Some(head) = self.branches.get_cut(head_id)? else {
+                return Ok(FlowingTargetEffectsOutcome::TargetCutMissing);
+            };
+            if head.branch_id != trunk.branch_id
+                || trunk.head_manifest_hash.as_deref() != Some(head.manifest_hash.as_str())
+                || self.load_manifest_opt_raw(&head.manifest_hash)?.is_none()
+            {
+                return Ok(FlowingTargetEffectsOutcome::TargetCutMismatch);
+            }
+        } else if trunk.head_manifest_hash.is_some() {
+            return Ok(FlowingTargetEffectsOutcome::TargetCutMismatch);
+        }
+        let selected = match self.net_source_paths(&basis)? {
+            Ok(selected) => selected,
+            Err(refusal) => return Ok(refusal),
+        };
+        let mut changes = BTreeMap::new();
+        for (path, (before, after)) in &selected {
+            let current = self.manifest_entry(trunk.head_manifest_hash.as_deref(), path)?;
+            if current.as_deref() != *before && current.as_deref() != *after {
+                return Ok(FlowingTargetEffectsOutcome::BeforeMismatch {
+                    path: (*path).to_owned(),
+                });
+            }
+            if current.as_deref() != *after {
+                changes.insert((*path).to_owned(), after.map(str::to_owned));
+            }
+        }
+        if changes.is_empty() {
+            let Some(head_id) = trunk.head_cut_id.as_deref() else {
+                return Ok(FlowingTargetEffectsOutcome::InitialNoopNeedsGenesis);
+            };
+            let Some(head_manifest_hash) = trunk.head_manifest_hash.clone() else {
+                return Ok(FlowingTargetEffectsOutcome::TargetCutMismatch);
+            };
+            if target_cut_id != head_id {
+                return Ok(FlowingTargetEffectsOutcome::TargetCutMismatch);
+            }
+            let effects = selected
+                .into_iter()
+                .map(|(path, (before, after))| FlowingTargetEffect {
+                    path: path.to_owned(),
+                    before: after.map(str::to_owned),
+                    after: after.map(str::to_owned),
+                    disposition: if before == after {
+                        FlowingEffectDisposition::Neutralized
+                    } else {
+                        FlowingEffectDisposition::Equivalent
+                    },
+                })
+                .collect();
+            return Ok(FlowingTargetEffectsOutcome::Verified(
+                FlowingTargetEffects {
+                    unit_id: unit_id.to_owned(),
+                    basis_digest: basis.basis_digest,
+                    target_branch_id: trunk.branch_id,
+                    target_before_cut_id: Some(head_id.to_owned()),
+                    target_after_cut_id: head_id.to_owned(),
+                    target_after_manifest_hash: head_manifest_hash,
+                    effects,
+                },
+            ));
+        }
+        let manifest_hash = self.advance_manifest(trunk.head_manifest_hash.as_deref(), &changes)?;
+        let mut change_ids = basis.atoms.iter().map(|atom| atom.change_id.as_str());
+        let first_change_id = change_ids.next().unwrap_or(target_cut_id);
+        let change_id = if change_ids.all(|id| id == first_change_id) {
+            first_change_id
+        } else {
+            target_cut_id
+        };
+        let origin = format!("transport:{}", unit.source_branch_id);
+        let matches_candidate = |cut: &CutRow| {
+            cut.branch_id == trunk.branch_id
+                && cut.manifest_hash == manifest_hash
+                && cut.parent_cut_id == trunk.head_cut_id
+                && cut.change_id == change_id
+                && cut.origin.as_deref() == Some(origin.as_str())
+                && cut.actor.as_deref() == Some(actor)
+                && cut.intent.as_deref() == Some(unit.intent.as_str())
+                && cut.recorded_at == recorded_at
+        };
+        if let Some(existing) = self.branches.get_cut(target_cut_id)? {
+            if !matches_candidate(&existing) {
+                return Ok(FlowingTargetEffectsOutcome::TargetCutMismatch);
+            }
+        } else {
+            self.branches.record_cut(CutRecord {
+                cut_id: target_cut_id,
+                change_id,
+                branch_id: &trunk.branch_id,
+                manifest_hash: &manifest_hash,
+                parent_cut_id: trunk.head_cut_id.as_deref(),
+                origin: Some(&origin),
+                actor: Some(actor),
+                intent: Some(&unit.intent),
+                recorded_at,
+            })?;
+        }
+        if !self
+            .branches
+            .get_cut(target_cut_id)?
+            .as_ref()
+            .is_some_and(matches_candidate)
+        {
+            return Ok(FlowingTargetEffectsOutcome::TargetCutMismatch);
+        }
+        self.verify_trunk_target_effects(unit_id, target_cut_id)
     }
 
     /// Build a target cut from a bound unit and the current parent-branch
@@ -760,31 +913,11 @@ mod tests {
     #[test]
     fn direct_trunk_candidate_checks_actual_selected_content() {
         let mut vcs = bound_direct_twig();
-        let basis = vcs
-            .branches
-            .contribution_basis("unit-a")
-            .expect("read basis")
-            .expect("bound unit");
-        let after = basis.atoms[0].after.clone().expect("source body");
-        let exact_manifest = vcs
-            .store_manifest(&BTreeMap::from([("a.txt".to_owned(), after)]))
-            .expect("exact candidate manifest");
-        vcs.branches
-            .record_cut(CutRecord {
-                cut_id: "trunk-exact",
-                change_id: "candidate-a",
-                branch_id: MAINLINE_BRANCH_ID,
-                manifest_hash: &exact_manifest,
-                parent_cut_id: None,
-                origin: Some("transport:twig"),
-                actor: Some("coordinator"),
-                intent: None,
-                recorded_at: "t4",
-            })
-            .expect("record exact candidate");
+        vcs.write("twig", "b.txt", Some("later"), "twig-tail", "t3")
+            .expect("unselected tail remains on twig");
         let FlowingTargetEffectsOutcome::Verified(witness) = vcs
-            .verify_trunk_target_effects("unit-a", "trunk-exact")
-            .expect("verify candidate")
+            .prepare_direct_trunk_candidate("unit-a", "trunk-exact", "coordinator", "t4")
+            .expect("prepare candidate")
         else {
             panic!("trunk candidate should carry selected content")
         };
@@ -792,6 +925,16 @@ mod tests {
         assert_eq!(
             witness.effects()[0].disposition,
             FlowingEffectDisposition::Applied
+        );
+        assert_eq!(
+            vcs.prepare_direct_trunk_candidate("unit-a", "trunk-exact", "coordinator", "t4")
+                .expect("exact candidate retry"),
+            FlowingTargetEffectsOutcome::Verified(witness.clone())
+        );
+        assert_eq!(
+            vcs.prepare_direct_trunk_candidate("unit-a", "trunk-exact", "other", "t4")
+                .expect("changed actor"),
+            FlowingTargetEffectsOutcome::TargetCutMismatch
         );
         assert_eq!(
             vcs.verify_private_target_effects("unit-a", "trunk-exact")
@@ -827,6 +970,95 @@ mod tests {
             .get_branch(MAINLINE_BRANCH_ID)
             .expect("read trunk")
             .expect("trunk exists")
+            .head_cut_id
+            .is_none());
+
+        vcs.write(
+            MAINLINE_BRANCH_ID,
+            "a.txt",
+            Some("A"),
+            "trunk-existing",
+            "t5",
+        )
+        .expect("fixture installs equivalent trunk content");
+        let FlowingTargetEffectsOutcome::Verified(equivalent) = vcs
+            .prepare_direct_trunk_candidate("unit-a", "trunk-existing", "coordinator", "t6")
+            .expect("prepare metadata-only candidate")
+        else {
+            panic!("current trunk content should be equivalent")
+        };
+        assert_eq!(
+            equivalent.effects()[0].disposition,
+            FlowingEffectDisposition::Equivalent
+        );
+        assert_eq!(equivalent.target_before_cut_id(), Some("trunk-existing"));
+        assert_eq!(equivalent.target_after_cut_id(), "trunk-existing");
+        assert_eq!(
+            vcs.prepare_direct_trunk_candidate("unit-a", "new-cut", "coordinator", "t6")
+                .expect("no-op cannot mint a second cut"),
+            FlowingTargetEffectsOutcome::TargetCutMismatch
+        );
+    }
+
+    #[test]
+    fn direct_trunk_planner_refuses_missing_cut_or_actor_before_recording() {
+        let mut vcs = bound_direct_twig();
+        for (cut_id, actor) in [("", "coordinator"), ("trunk-empty-actor", "")] {
+            let error = vcs
+                .prepare_direct_trunk_candidate("unit-a", cut_id, actor, "t4")
+                .expect_err("a trunk candidate needs both identities");
+            assert!(matches!(
+                error,
+                StoreError::Conflict(reason)
+                    if reason == "trunk candidate cut id and actor must be nonempty"
+            ));
+        }
+        assert!(vcs
+            .branches
+            .get_cut("trunk-empty-actor")
+            .expect("read rejected cut")
+            .is_none());
+    }
+
+    #[test]
+    fn direct_trunk_initial_noop_keeps_unit_owed_without_inventing_genesis() {
+        let mut vcs = workspace();
+        vcs.init("t0").unwrap();
+        vcs.create_branch("twig", None, MAINLINE_BRANCH_ID, "t1")
+            .unwrap();
+        vcs.write("twig", "a.txt", Some("A"), "twig-a", "t2")
+            .unwrap();
+        vcs.write("twig", "a.txt", None, "twig-undo", "t3").unwrap();
+        pin(&mut vcs, "twig-undo", "pin-undo");
+        declare(&mut vcs, "unit-undo", "pin-undo");
+        let FlowingSelectionOutcome::Selected(selection) = vcs
+            .select_private_changes("pin-undo", &selection::parse("path(a.txt)").unwrap())
+            .unwrap()
+        else {
+            panic!("write and undo must remain selected")
+        };
+        assert_eq!(selection.changes().len(), 2);
+        assert_eq!(
+            vcs.bind_private_selection("unit-undo", &selection, "t4")
+                .unwrap(),
+            BindContributionBasisOutcome::Bound
+        );
+        assert_eq!(
+            vcs.prepare_direct_trunk_candidate("unit-undo", "first-cut", "coordinator", "t5")
+                .unwrap(),
+            FlowingTargetEffectsOutcome::InitialNoopNeedsGenesis
+        );
+        assert!(vcs.branches.get_cut("first-cut").unwrap().is_none());
+        assert!(vcs
+            .branches
+            .contribution_declaration("unit-undo")
+            .unwrap()
+            .is_some());
+        assert!(vcs
+            .branches
+            .get_branch(MAINLINE_BRANCH_ID)
+            .unwrap()
+            .unwrap()
             .head_cut_id
             .is_none());
     }
