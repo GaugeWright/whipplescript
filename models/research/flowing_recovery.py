@@ -24,6 +24,7 @@ class Attempt:
     epoch: int
     owner_fence: int
     norm_revision: int
+    graph_revision: int
     principal: str = "original"
     intent: str = "declared contribution"
     door: str = "scheduled"  # manual has exactly the same admission guards
@@ -46,6 +47,9 @@ class Admission:
     owner_fence: int
     norm_revision: int
     submitted_norm_revision: int
+    graph_revision: int
+    submitted_graph_revision: int
+    coverage_complete: bool
     ledger_held: bool
     principal: str
     gate: str
@@ -64,12 +68,16 @@ class State:
     owner: int = 0
     owner_fence: int = 0
     norm_revision: int = 0
+    graph_revision: int = 0
+    coverage_revision: int = 0
+    coverage_complete: bool = True
     original_grant: bool = True
     ledger_owner: int = -1
     validated_revision: int = -1
     validated_grant: bool = False
     ref_up: bool = True
     norm_up: bool = True
+    graph_up: bool = True
     topology_up: bool = True
     actor0_up: bool = True
     trunk_version: int = 0
@@ -116,7 +124,7 @@ def submit(s: State, actor: int, selected: tuple[str, ...] | None = None,
         op = s.op_registry[0].op
     attempt = Attempt(op, actor, selected, s.source_cut, s.trunk_version,
                       s.trunk_content, s.epoch, s.owner_fence,
-                      s.norm_revision, door=door)
+                      s.norm_revision, s.graph_revision, door=door)
     if any(old.op == op and old != attempt for old in s.op_registry):
         if defect != "reuse_op":
             raise ValueError("operation id already binds a different candidate")
@@ -135,6 +143,11 @@ def gate(s: State, op: int, verdict: str) -> State:
     old = attempt_at(s, op)
     if old.gate != "waiting":
         raise ValueError("attempt already answered")
+    if verdict == "passed" and (
+            not s.graph_up or not s.coverage_complete
+            or s.coverage_revision != s.graph_revision
+            or old.graph_revision != s.graph_revision):
+        raise ValueError("reference coverage is unknown or stale")
     return replace(s, attempts=tuple(replace(a, gate=verdict) if a == old else a
                                      for a in s.attempts))
 
@@ -159,6 +172,19 @@ def norm_revoke(s: State) -> State:
         raise ValueError("norm ledger write waits for its exclusion")
     return replace(s, norm_revision=s.norm_revision + 1,
                    original_grant=False)
+
+
+def graph_change(s: State) -> State:
+    if not s.graph_up:
+        raise ValueError("graph authority unavailable")
+    return replace(s, graph_revision=s.graph_revision + 1)
+
+
+def recapture_coverage(s: State, complete: bool) -> State:
+    if not s.graph_up:
+        raise ValueError("graph authority unavailable")
+    return replace(s, coverage_revision=s.graph_revision,
+                   coverage_complete=complete)
 
 
 def hold(s: State) -> State:
@@ -216,6 +242,10 @@ def cas(s: State, op: int, actor: int, defect: str = "") -> State:
             or (s.norm_revision != a.norm_revision and
                 defect != "cas_after_ledger_release")):
         raise ValueError("current norm premises do not match certificate")
+    if (not s.graph_up or not s.coverage_complete
+            or s.coverage_revision != s.graph_revision
+            or a.graph_revision != s.graph_revision) and defect != "stale_graph":
+        raise ValueError("reference graph or coverage basis moved")
     if not all(s.holders[("a", "b").index(unit)] == s.kind
                for unit in a.selected):
         raise ValueError("selected unit is not held by its source")
@@ -232,7 +262,9 @@ def cas(s: State, op: int, actor: int, defect: str = "") -> State:
                       output, s.trunk_version, s.trunk_version + 1,
                       s.trunk_content, after, outcomes, a.source_cut,
                       s.epoch, s.owner_fence, s.norm_revision,
-                      a.norm_revision, s.ledger_owner == actor, a.principal,
+                      a.norm_revision, s.graph_revision, a.graph_revision,
+                      s.coverage_complete and s.coverage_revision == s.graph_revision,
+                      s.ledger_owner == actor, a.principal,
                       a.gate, s.held, s.enabled)
     return replace(s, trunk_content=after, trunk_version=s.trunk_version + 1,
                    admissions=s.admissions + (entry,))
@@ -271,6 +303,9 @@ def violation(s: State) -> str | None:
         if (entry.norm_revision != entry.submitted_norm_revision
                 or not entry.ledger_held):
             return "admission escaped the current norm ledger exclusion"
+        if (entry.graph_revision != entry.submitted_graph_revision
+                or not entry.coverage_complete):
+            return "admission used stale or incomplete reference coverage"
         if entry.before_version != before_version or entry.before_content != before_content:
             return "admission did not compare the exact trunk basis"
         if entry.after_version != entry.before_version + 1:
@@ -387,6 +422,41 @@ def scenario() -> None:
         raise AssertionError("topology outage erased durable accounting")
     assert violation(durable) is None
 
+    # A reference graph or required-scope inventory is an independent basis.
+    # An unknown no-edge answer cannot bless a candidate, and a graph change
+    # after a passed gate fences CAS even when norm exclusion remains held.
+    unknown = submit(recapture_coverage(initial(), False), 0)
+    try:
+        gate(unknown, 1, "passed")
+    except ValueError as error:
+        assert "coverage" in str(error)
+    else:
+        raise AssertionError("unknown reference scope became a passed gate")
+    assert unknown.holders == ("branch", "branch")
+
+    stale_graph = lock_ledger(gate(submit(initial(), 0), 1, "passed"), 0)
+    stale_graph = graph_change(stale_graph)
+    for candidate in (stale_graph, recapture_coverage(stale_graph, True)):
+        try:
+            cas(candidate, 1, 0)
+        except ValueError as error:
+            assert "reference graph" in str(error)
+        else:
+            raise AssertionError("old gate survived changed reference graph")
+    fresh = unlock_ledger(recapture_coverage(stale_graph, True), 0)
+    fresh = submit(fresh, 0)
+    fresh = gate(fresh, 2, "passed")
+    fresh = lock_ledger(fresh, 0)
+    assert violation(cas(fresh, 2, 0)) is None
+
+    blind_graph = lock_ledger(gate(submit(initial(), 0), 1, "passed"), 0)
+    try:
+        cas(replace(blind_graph, graph_up=False), 1, 0)
+    except ValueError as error:
+        assert "reference graph" in str(error)
+    else:
+        raise AssertionError("graph outage became an empty dependency answer")
+
 
 def mutant_scenarios() -> None:
     # Each mutation must make its forbidden history reachable; it is not a
@@ -422,6 +492,11 @@ def mutant_scenarios() -> None:
     rebound = submit(rebound, 0, defect="reuse_op")
     assert violation(rebound) == "one operation id was rebound to another candidate"
 
+    stale_graph = lock_ledger(gate(submit(initial(), 0), 1, "passed"), 0)
+    stale_graph = recapture_coverage(graph_change(stale_graph), True)
+    wrong = cas(stale_graph, 1, 0, "stale_graph")
+    assert violation(wrong) == "admission used stale or incomplete reference coverage"
+
 
 def steps(s: State):
     """Small interleaving core; the scenarios above cover specialized edges."""
@@ -433,7 +508,10 @@ def steps(s: State):
                 pass
     for a in s.attempts:
         if a.gate == "waiting":
-            yield f"pass{a.op}", gate(s, a.op, "passed")
+            try:
+                yield f"pass{a.op}", gate(s, a.op, "passed")
+            except ValueError:
+                pass
         if a.gate == "passed" and a.actor == s.owner:
             if s.ledger_owner == -1:
                 try:
@@ -458,6 +536,10 @@ def steps(s: State):
         yield "takeover", takeover(s)
     if s.epoch == 0:
         yield "rewrite", rewrite_source(s)
+    if s.graph_revision == 0:
+        yield "graph change", graph_change(s)
+    if s.coverage_revision != s.graph_revision:
+        yield "recapture graph", recapture_coverage(s, True)
 
 
 def explore(depth: int = 9) -> int:
@@ -481,7 +563,7 @@ def main() -> None:
     mutant_scenarios()
     count = explore()
     print(f"flowing recovery: {count} safe states through nine transitions")
-    print("direct twig, no-op, competing coordinators, recovery, and six mutants passed")
+    print("direct twig, no-op, graph freshness, competing coordinators, recovery, and seven mutants passed")
 
 
 if __name__ == "__main__":
