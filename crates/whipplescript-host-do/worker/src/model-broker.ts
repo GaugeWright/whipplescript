@@ -380,6 +380,7 @@ export async function performModelBrokerFetch(
   onTextDelta?: (delta: string) => void,
   traceId?: string,
   onTiming?: ModelBrokerTimingSink,
+  onProviderBody?: (body: unknown) => void,
 ): Promise<string> {
   const startedAt = performance.now();
   const mark = (event: string) => onTiming?.(event, performance.now() - startedAt);
@@ -441,6 +442,9 @@ export async function performModelBrokerFetch(
     }
     const contentType = response.headers.get("x-whip-provider-content-type") ?? "";
     if (!response.body) throw new Error("model broker stream had no body");
+    // The validated broker stream represents the provider attempt. The broker
+    // forwards this body unchanged; its credential envelope is not model input.
+    onProviderBody?.(request.body);
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
     const chunks: string[] = [];
@@ -492,6 +496,7 @@ export async function performModelBrokerFetch(
   // Rolling-deploy compatibility: an old Home broker still returns the v1
   // terminal JSON envelope. It remains valid, but cannot publish deltas.
   const decoded = validatedBrokerResponse(await readJsonCapped(response));
+  onProviderBody?.(request.body);
   mark("broker_body_complete");
   return JSON.stringify({ status: decoded.status, body: decoded.body });
 }

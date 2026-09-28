@@ -44,6 +44,7 @@ function credentialResolver(
 test("broker envelope strips provider auth and preserves idempotency", async () => {
   let capturedUrl = "";
   let capturedInit: RequestInit | undefined;
+  let capturedProviderBody: unknown;
   const result = await performModelBrokerFetch(
     {
       url: "https://api.openai.com/v1/responses",
@@ -68,6 +69,8 @@ test("broker envelope strips provider auth and preserves idempotency", async () 
     },
     undefined,
     undefined,
+    undefined,
+    (body) => { capturedProviderBody = body; },
   );
 
   assert.equal(capturedUrl, "https://home.example/model-egress");
@@ -83,6 +86,9 @@ test("broker envelope strips provider auth and preserves idempotency", async () 
   ]);
   assert.ok(!JSON.stringify(envelope).includes("broker-token"));
   assert.ok(!JSON.stringify(envelope).includes(MODEL_AUTH_SENTINEL));
+  assert.deepEqual(capturedProviderBody, { model: "gpt-test", input: "hello" });
+  assert.ok(!JSON.stringify(capturedProviderBody).includes(binding.credential_id));
+  assert.ok(!JSON.stringify(capturedProviderBody).includes("broker-token"));
   assert.deepEqual(JSON.parse(result), {
     status: 200,
     body: { output: [{ type: "message" }] },
@@ -524,6 +530,21 @@ test("broker configuration and protocol failures are fail-closed", async () => {
     performModelBrokerFetch(request, binding, { url: "https://broker.example" }),
     /authorization is unavailable/,
   );
+  let rejectedHandoffCaptured = false;
+  await assert.rejects(
+    performModelBrokerFetch(
+      request,
+      binding,
+      { url: "https://broker.example", token: "token" },
+      async () => new Response(null, { status: 403 }),
+      undefined,
+      undefined,
+      undefined,
+      () => { rejectedHandoffCaptured = true; },
+    ),
+    /HTTP 403/,
+  );
+  assert.equal(rejectedHandoffCaptured, false);
   await performModelBrokerFetch(
     request,
     binding,
@@ -550,15 +571,21 @@ test("broker configuration and protocol failures are fail-closed", async () => {
       });
     },
   );
+  let invalidProtocolCaptured = false;
   await assert.rejects(
     performModelBrokerFetch(
       request,
       binding,
       { url: "http://127.0.0.1:8789/model-egress", token: "token" },
       async () => Response.json({ protocol: "wrong", status: 200, body: {} }),
+      undefined,
+      undefined,
+      undefined,
+      () => { invalidProtocolCaptured = true; },
     ),
     /wrong protocol/,
   );
+  assert.equal(invalidProtocolCaptured, false);
 });
 
 // ---- managed gateway funding (ADR 0085 §3/§6, FUND-1) --------------------

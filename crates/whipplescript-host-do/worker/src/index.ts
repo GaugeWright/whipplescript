@@ -5563,6 +5563,7 @@ export class WorkflowInstance implements DurableObject {
               },
               traceId,
               (event, _elapsedMs) => mark(event),
+              capture,
             );
             transportFailures = 0;
             mark("model_round_complete");
