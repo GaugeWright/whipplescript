@@ -55,7 +55,7 @@ action-workflow-terminals.maude	SNSNNSNNNSSNSNS
 actsfor-unanimity.maude	SSNNS
 admission.maude	SSSSNNNNNSSNNNSSNNN
 agent-provider-binding.maude	SSSNNNSS
-alpha-canonicalization.maude	SNSNSSSNSSNS
+alpha-canonicalization.maude	SNSNSSSNSSNSSSNSN
 branch-effect-key.maude	SSSNSN
 cache-prefix-append-only.maude	SSSN
 case-family.maude	SSSSSNNNN

@@ -35,6 +35,14 @@ Runtime and host fixtures establish the correspondence to captured plans and
 durable terminal evidence.
 
 
+`alpha-canonicalization.maude` models DR-0054's canonicalization, and for
+slice C1 of the norm plane (§9) it separates identity continuity from
+evidence preservation. A section's heading is semantic, so a reformat under
+the same heading transports support, while a pure retitle is continuity
+(`moved`) with the evidence stale. Required -> Optional never carries
+support, and the weakening that erases headings from the key carries it.
+Seventeen searches.
+
 `relation-validation-scope.maude` models DR-0122 §13.4: a candidate edge in an
 acyclic relation family is captured against the family's edge set, and the
 strong door commits only on the basis it captured, re-evaluating when the

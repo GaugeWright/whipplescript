@@ -3,6 +3,10 @@
 //! regenerated evaluations, campaign record, and adoption — all through the
 //! built binary with deterministic exec judges (no live provider).
 
+#[path = "support/isolated_whip.rs"]
+mod isolated_whip;
+use isolated_whip::whip_command;
+
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
@@ -51,7 +55,7 @@ impl Env {
     }
 
     fn command(&self) -> Command {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_whip"));
+        let mut command = whip_command(env!("CARGO_BIN_EXE_whip"));
         command
             .env("WHIPPLESCRIPT_EXEC_ALLOW", "python3 *")
             .env("WHIPPLESCRIPT_IMPROVE_STORE", &self.improve_store)

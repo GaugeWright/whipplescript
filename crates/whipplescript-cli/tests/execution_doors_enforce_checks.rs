@@ -16,9 +16,12 @@
 //! This pins the property as a difference the two doors must not have: whatever
 //! `check` refuses, `run` refuses.
 
+#[path = "support/isolated_whip.rs"]
+mod isolated_whip;
+use isolated_whip::whip_command;
+
 use std::fs;
 use std::path::PathBuf;
-use std::process::Command;
 
 fn temp_dir(label: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!(
@@ -34,7 +37,7 @@ fn temp_dir(label: &str) -> PathBuf {
 }
 
 fn whip(dir: &PathBuf, args: &[&str]) -> (bool, String) {
-    let output = Command::new(env!("CARGO_BIN_EXE_whip"))
+    let output = whip_command(env!("CARGO_BIN_EXE_whip"))
         .args(args)
         .current_dir(dir)
         .output()

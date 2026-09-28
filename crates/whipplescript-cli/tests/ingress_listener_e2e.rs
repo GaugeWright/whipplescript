@@ -9,9 +9,13 @@
 //! The listener is written to `models/tla/IngressDeliveryLifecycle.tla`; these
 //! are the same three guards, observed from outside.
 
+#[path = "support/isolated_whip.rs"]
+mod isolated_whip;
+use isolated_whip::whip_command;
+
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 
 const SECRET: &str = "s3cret-webhook-token";
 
@@ -82,7 +86,7 @@ fn start(dir: &std::path::Path) -> (Listener, String) {
     // no notion of creating one, and should not: a webhook that could start
     // workflows would be an unauthenticated peer deciding what runs. So the
     // instance exists first, and the listener admits into it.
-    let started = Command::new(bin)
+    let started = whip_command(bin)
         .args([
             "--store",
             store.to_str().expect("store path"),
@@ -105,7 +109,7 @@ fn start(dir: &std::path::Path) -> (Listener, String) {
         .expect("instance id")
         .to_owned();
 
-    let mut child = Command::new(bin)
+    let mut child = whip_command(bin)
         .args([
             "--store",
             store.to_str().expect("store path"),

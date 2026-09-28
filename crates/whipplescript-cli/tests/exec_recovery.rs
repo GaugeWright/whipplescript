@@ -1,4 +1,8 @@
 //! The public recovery command must not manufacture executor lifetime evidence.
+#[path = "support/isolated_whip.rs"]
+mod isolated_whip;
+use isolated_whip::{isolate_stores, whip_command};
+
 use std::process::Command;
 use whipplescript_store::*;
 
@@ -152,7 +156,7 @@ fn check_recovery(tracked: bool) {
     assert_eq!(runs[0].status, "running");
     drop(store);
     for attempt in 0..2 {
-        let result = Command::new(env!("CARGO_BIN_EXE_whip"))
+        let result = whip_command(env!("CARGO_BIN_EXE_whip"))
             .args(["recover", &instance, "--json", "--store"])
             .arg(&path)
             .output()
@@ -220,8 +224,7 @@ fn check_recovery(tracked: bool) {
             .all(|event| event.event_type != "exec.settlement.retained"));
         drop(store);
         for _ in 0..2 {
-            let result = Command::new(env!("CARGO_BIN_EXE_whip"))
-                .env_clear()
+            let result = isolate_stores(Command::new(env!("CARGO_BIN_EXE_whip")).env_clear())
                 .env("WHIPPLESCRIPT_STORE", &path)
                 .args(["--json", "worker", &instance, "--once"])
                 .output()

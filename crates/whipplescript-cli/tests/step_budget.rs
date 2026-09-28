@@ -11,9 +11,12 @@
 //! instance, a diagnostic that says how to continue, facts still there, and a
 //! `whip resume` that actually resumes.
 
+#[path = "support/isolated_whip.rs"]
+mod isolated_whip;
+use isolated_whip::whip_command;
+
 use std::fs;
 use std::path::PathBuf;
-use std::process::Command;
 
 /// The world-paced agent loop: legal, unbounded by design, and exactly the shape
 /// no static analysis will ever bound. Each turn is one world crossing.
@@ -62,7 +65,7 @@ fn temp_dir(label: &str) -> PathBuf {
 }
 
 fn whip(dir: &PathBuf, args: &[&str], budget: &str) -> String {
-    let output = Command::new(env!("CARGO_BIN_EXE_whip"))
+    let output = whip_command(env!("CARGO_BIN_EXE_whip"))
         .args(args)
         .env("WHIPPLESCRIPT_STEP_BUDGET", budget)
         .current_dir(dir)

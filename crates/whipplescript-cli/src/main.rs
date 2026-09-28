@@ -38914,6 +38914,18 @@ fn open_vcs() -> Result<whipplescript_store::vcs::NativeWorkspaceVcs, ExitCode> 
             vcs.set_decl_canonicalizer(Box::new(
                 whipplescript_kernel::source_merge::WhipDeclCanonicalizer,
             ));
+            // Symbol and section identity for the languages this host
+            // canonicalizes (norm-plane §9): exact syntactic match only.
+            vcs.register_decl_canonicalizer("rs", Box::new(whipplescript_canon::RustItems));
+            vcs.register_decl_canonicalizer(
+                "ts",
+                Box::new(whipplescript_canon::TypeScriptItems::typescript()),
+            );
+            vcs.register_decl_canonicalizer(
+                "tsx",
+                Box::new(whipplescript_canon::TypeScriptItems::tsx()),
+            );
+            vcs.register_decl_canonicalizer("md", Box::new(whipplescript_canon::MarkdownSections));
             vcs.set_actor(Some(ambient_actor()));
             vcs
         })

@@ -11,10 +11,13 @@
 //! information-flow checker do not exist — which is precisely how a false claim
 //! about this property survived a green test.
 
+#[path = "support/isolated_whip.rs"]
+mod isolated_whip;
+use isolated_whip::whip_command;
+
 use std::{
     fs,
     path::{Path, PathBuf},
-    process::Command,
 };
 
 use serde_json::Value;
@@ -25,7 +28,7 @@ use whipplescript_parser::{Applicability, Fixit, FixitEdit, SourceSpan};
 /// The exit status is deliberately ignored: every interesting program here
 /// fails to check, which is why it carries a fixit at all.
 fn check_json(paths: &[PathBuf]) -> Vec<Value> {
-    let output = Command::new(env!("CARGO_BIN_EXE_whip"))
+    let output = whip_command(env!("CARGO_BIN_EXE_whip"))
         .arg("check")
         .arg("--json")
         .args(paths)

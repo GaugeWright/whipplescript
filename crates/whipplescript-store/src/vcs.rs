@@ -211,6 +211,12 @@ pub struct CanonDecl {
 /// path-level rows only — attribution never guesses (fail closed).
 pub trait DeclCanonicalizer {
     fn canonical_declarations(&self, source: &str) -> Option<Vec<CanonDecl>>;
+    /// The same, for a file at `path`: a canonicalizer whose identities are
+    /// qualified by the file's module path reads it here (norm-plane §9).
+    fn canonical_declarations_at(&self, path: &str, source: &str) -> Option<Vec<CanonDecl>> {
+        let _ = path;
+        self.canonical_declarations(source)
+    }
 }
 
 /// One reconciliation-daemon tick over one branch (the executor of
@@ -673,7 +679,10 @@ pub struct WorkspaceVcs<B: Branches, C: ContentBlobs> {
     branches: B,
     content: C,
     source_merger: Option<Box<dyn SourceMerger>>,
-    decl_canonicalizer: Option<Box<dyn DeclCanonicalizer>>,
+    /// The host's declaration canonicalizers, by file class (the path's
+    /// extension): `.whip` source, and whichever languages the host installs
+    /// (norm-plane §9). A class with none keeps path-level rows only.
+    decl_canonicalizers: BTreeMap<String, Box<dyn DeclCanonicalizer>>,
     /// The acting principal every cut this handle records is attributed
     /// to (DR-0052 Decision 1: authorship observed at the mediator, so
     /// the handle's constructor — CLI seam, harness, daemon — decides,
@@ -765,7 +774,7 @@ impl NativeWorkspaceVcs {
             branches: BranchStore::open(branches_path)?,
             content: ContentStore::open(content_path)?,
             source_merger: None,
-            decl_canonicalizer: None,
+            decl_canonicalizers: BTreeMap::new(),
             actor: None,
             intent: None,
             pending_facts: Vec::new(),
@@ -820,6 +829,15 @@ impl NativeWorkspaceVcs {
 }
 
 impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
+    fn require_legacy_source(&self, branch_id: &str, verb: &str) -> StoreResult<()> {
+        if self.branches.flowing_source(branch_id)?.is_some() {
+            return Err(StoreError::Conflict(format!(
+                "legacy {verb} cannot move flowing source `{branch_id}`; use a controlled lifecycle operation"
+            )));
+        }
+        Ok(())
+    }
+
     fn require_head_reservation(&self, branch_id: &str, reservation_id: &str) -> StoreResult<()> {
         if self.branches.head_reservation(branch_id)?.as_deref() != Some(reservation_id) {
             return Err(StoreError::Conflict(format!(
@@ -1054,7 +1072,7 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
             branches,
             content,
             source_merger: None,
-            decl_canonicalizer: None,
+            decl_canonicalizers: BTreeMap::new(),
             actor: None,
             intent: None,
             pending_facts: Vec::new(),
@@ -1069,7 +1087,24 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
     }
 
     pub fn set_decl_canonicalizer(&mut self, canonicalizer: Box<dyn DeclCanonicalizer>) {
-        self.decl_canonicalizer = Some(canonicalizer);
+        self.register_decl_canonicalizer("whip", canonicalizer);
+    }
+
+    /// Install the canonicalizer for one file class, the path's extension.
+    pub fn register_decl_canonicalizer(
+        &mut self,
+        extension: &str,
+        canonicalizer: Box<dyn DeclCanonicalizer>,
+    ) {
+        self.decl_canonicalizers
+            .insert(extension.to_owned(), canonicalizer);
+    }
+
+    /// The canonicalizer for a path's file class, if the host installed one.
+    fn canonicalizer_for(&self, path: &str) -> Option<&dyn DeclCanonicalizer> {
+        let name = path.rsplit('/').next().unwrap_or(path);
+        let (_, extension) = name.rsplit_once('.')?;
+        self.decl_canonicalizers.get(extension).map(|c| c.as_ref())
     }
 
     /// Attribute every cut this handle records to `actor` (DR-0052:
@@ -1440,17 +1475,14 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
         let mut frontier = crate::freshness::FrontierContent::default();
         for (path, content_id) in &manifest {
             frontier.paths.insert(path.clone(), content_id.clone());
-            if !path.ends_with(".whip") {
-                continue;
-            }
-            let Some(canonicalizer) = self.decl_canonicalizer.as_deref() else {
+            let Some(canonicalizer) = self.canonicalizer_for(path) else {
                 continue;
             };
             let Some(text) = self.content.get_text(content_id)?.text() else {
                 // Unreadable OR not text: path entry only, fail closed.
                 continue;
             };
-            let Some(decls) = canonicalizer.canonical_declarations(&text) else {
+            let Some(decls) = canonicalizer.canonical_declarations_at(path, &text) else {
                 continue; // no canonical form: path entry only, fail closed
             };
             for decl in decls {
@@ -2344,6 +2376,7 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
         rebase_cut_id: &str,
         at: &str,
     ) -> StoreResult<ReconcileOutcome> {
+        self.require_legacy_source(branch_id, "reconcile")?;
         let Some(branch) = self.branches.get_branch(branch_id)? else {
             return Ok(ReconcileOutcome::BranchMissing);
         };
@@ -2510,6 +2543,7 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
         keep_open: bool,
         gate: &mut dyn MainlineGate,
     ) -> StoreResult<VcsMergeOutcome> {
+        self.require_legacy_source(branch_id, "merge")?;
         let Some(mut branch) = self.branches.get_branch(branch_id)? else {
             return Ok(VcsMergeOutcome::BranchMissing);
         };
@@ -2519,6 +2553,7 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
         let Some(parent_id) = branch.parent_branch_id.clone() else {
             return Ok(VcsMergeOutcome::NoParent);
         };
+        self.require_legacy_source(&parent_id, "merge")?;
         let Some(parent) = self.branches.get_branch(&parent_id)? else {
             return Ok(VcsMergeOutcome::NoParent);
         };
@@ -2798,6 +2833,7 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
         at: &str,
         gate: &mut dyn MainlineGate,
     ) -> StoreResult<BoundaryPromotionOutcome> {
+        self.require_legacy_source(stream_line_id, "promotion")?;
         self.require_head_reservation(stream_line_id, reservation_id)?;
         let Some(line) = self.branches.get_branch(stream_line_id)? else {
             return Ok(BoundaryPromotionOutcome::StreamLineMissing);
@@ -2963,6 +2999,7 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
         at: &str,
         gate: &mut dyn MainlineGate,
     ) -> StoreResult<RestoreOutcome> {
+        self.require_legacy_source(branch_id, "restore")?;
         let Some(row) = self.branches.get_branch(branch_id)? else {
             return Ok(RestoreOutcome::BranchMissing);
         };
@@ -3204,6 +3241,9 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
         };
         if op.deltas.is_empty() {
             return Ok(UndoOpOutcome::NothingToUndo);
+        }
+        for delta in &op.deltas {
+            self.require_legacy_source(&delta.branch_id, "undo-op")?;
         }
         // Guard pass: every touched branch must still be exactly where
         // the op left it (the model's moved-head bite).
@@ -3590,12 +3630,9 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
         before_hash: Option<&str>,
         after_hash: Option<&str>,
     ) -> StoreResult<Vec<crate::selection::DeclUnit>> {
-        let Some(canonicalizer) = self.decl_canonicalizer.as_deref() else {
+        let Some(canonicalizer) = self.canonicalizer_for(path) else {
             return Ok(Vec::new());
         };
-        if !path.ends_with(".whip") {
-            return Ok(Vec::new());
-        }
         let canon_side = |hash: Option<&str>| -> StoreResult<Option<Vec<CanonDecl>>> {
             let Some(hash) = hash else {
                 return Ok(Some(Vec::new())); // absent side: no declarations
@@ -3604,7 +3641,7 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
                 // Unreadable OR not text: fail closed.
                 return Ok(None);
             };
-            Ok(canonicalizer.canonical_declarations(&text))
+            Ok(canonicalizer.canonical_declarations_at(path, &text))
         };
         let (Some(before), Some(after)) = (canon_side(before_hash)?, canon_side(after_hash)?)
         else {
@@ -3751,6 +3788,7 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
         at: &str,
         gate: &mut dyn MainlineGate,
     ) -> StoreResult<UndoSelectionOutcome> {
+        self.require_legacy_source(branch_id, "undo")?;
         let Some(plan) = self.plan_undo_selection(branch_id, expr)? else {
             return Ok(UndoSelectionOutcome::BranchMissing);
         };
@@ -3912,6 +3950,8 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
         at: &str,
         gate: &mut dyn MainlineGate,
     ) -> StoreResult<TransportOutcome> {
+        self.require_legacy_source(branch_id, "transport")?;
+        self.require_legacy_source(onto, "transport")?;
         if self.branches.get_branch(branch_id)?.is_none() {
             return Ok(TransportOutcome::BranchMissing);
         }
@@ -4630,6 +4670,8 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
         sync_cut_id: &str,
         at: &str,
     ) -> StoreResult<SyncOutcome> {
+        self.require_legacy_source(branch_id, "sync")?;
+        self.require_legacy_source(line_id, "sync")?;
         if branch_id == line_id {
             return Ok(SyncOutcome::UpToDate);
         }
@@ -5317,6 +5359,7 @@ impl MainlineGate for NoNormLedger {
 #[cfg(all(test, feature = "native"))]
 mod tests {
     use super::*;
+    use crate::branches::flowing_fence::{FlowingFence, FlowingSourceKind, OpenFlowingSource};
 
     /// A vcs bound to a temp directory that is removed when the binding drops,
     /// including on a panicking assertion. `Deref`/`DerefMut` keep the 21 call
@@ -5354,6 +5397,84 @@ mod tests {
         let inner = WorkspaceVcs::open(dir.join("branches.sqlite"), dir.join("content.sqlite"))
             .expect("open vcs");
         TempVcs { dir, inner }
+    }
+
+    #[test]
+    fn legacy_vcs_mutations_cannot_bypass_a_flowing_source_fence() {
+        fn controlled<T>(result: StoreResult<T>) {
+            assert!(matches!(
+                result,
+                Err(StoreError::Conflict(message))
+                    if message.contains("controlled lifecycle operation")
+            ));
+        }
+
+        let mut vcs = vcs();
+        vcs.init("t0").expect("mainline");
+        vcs.create_branch("flow", Some("feature"), MAINLINE_BRANCH_ID, "t1")
+            .expect("branch");
+        vcs.branches
+            .open_flowing_source(&OpenFlowingSource {
+                source_branch_id: "flow".into(),
+                incarnation_id: "flow-inc".into(),
+                kind: FlowingSourceKind::Branch,
+                owner: "coordinator".into(),
+                opened_at: "t2".into(),
+            })
+            .expect("flowing source");
+        let selection = crate::selection::parse("path(*)").expect("selection");
+        controlled(vcs.reconcile_branch("flow", true, "rebase-1", "t3"));
+        controlled(vcs.merge("flow", "merge-1", "t3", &mut NoNormLedger));
+        controlled(vcs.apply_undo_selection("flow", &selection, "undo-1", "t3", &mut NoNormLedger));
+        controlled(vcs.transport_selection(
+            "flow",
+            &selection,
+            MAINLINE_BRANCH_ID,
+            "transport-1",
+            "t3",
+            &mut NoNormLedger,
+        ));
+        controlled(vcs.sync_to_line("flow", MAINLINE_BRANCH_ID, "sync-1", "t3"));
+        controlled(vcs.promote_line_exact(
+            "flow",
+            "reservation-1",
+            None,
+            None,
+            "main-1",
+            "t3",
+            &mut NoNormLedger,
+        ));
+        controlled(vcs.restore("flow", "missing", "restore-1", "t3", &mut NoNormLedger));
+        controlled(vcs.undo_op("op-create-flow", "undo-op-1", "t3", &mut NoNormLedger));
+
+        vcs.create_branch("plain", None, "flow", "t4")
+            .expect("member");
+        controlled(vcs.merge("plain", "merge-2", "t5", &mut NoNormLedger));
+        controlled(vcs.transport_selection(
+            "plain",
+            &selection,
+            "flow",
+            "transport-2",
+            "t5",
+            &mut NoNormLedger,
+        ));
+        controlled(vcs.sync_to_line("plain", "flow", "sync-2", "t5"));
+        assert_eq!(
+            vcs.branches
+                .get_branch("flow")
+                .expect("ref")
+                .unwrap()
+                .head_cut_id,
+            None
+        );
+        assert_eq!(
+            vcs.branches
+                .get_branch(MAINLINE_BRANCH_ID)
+                .expect("mainline ref")
+                .unwrap()
+                .head_cut_id,
+            None
+        );
     }
 
     #[test]

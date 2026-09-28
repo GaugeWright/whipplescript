@@ -114,4 +114,36 @@ mod WHIPPLESCRIPT-ALPHA-CANON is
     if eqC(canon(CD), canon(CA)) = false .
   rl [ren-touched-conflict] :
     mergeRen(NA, CD, NB, CA, true) => renConflict(NA) .
+
+  --- norm-plane §9 and slice C1: identity continuity is not evidence
+  --- preservation. A section's heading text is semantic content, so the
+  --- property its evidence bears on includes it. Evidence transports only
+  --- when the title is unchanged and the body canon-equal (a reformat); a
+  --- pure retitle is recognised as continuity (`moved`) while the evidence
+  --- goes stale, which is what keeps Required -> Optional from carrying
+  --- support; any body edit leaves it stale too.
+  sort Title .
+  ops tRequired tOptional : -> Title [ctor] .
+  op xferSection : Title Content Title Content -> Cfg [ctor] .
+  ops transported moved stale : -> Cfg [ctor] .
+  vars TO TN : Title .
+
+  crl [section-transport] :
+    xferSection(TO, CD, TN, CA) ev(NA) => transported
+    if TO == TN /\ eqC(canon(CD), canon(CA)) = true .
+  crl [section-retitled] :
+    xferSection(TO, CD, TN, CA) ev(NA) => moved stale
+    if TO =/= TN /\ eqC(canon(CD), canon(CA)) = true .
+  crl [section-edited] :
+    xferSection(TO, CD, TN, CA) ev(NA) => stale
+    if eqC(canon(CD), canon(CA)) = false .
+endm
+
+--- A freshness key that erases headings transports support across a retitle.
+mod WHIPPLESCRIPT-ALPHA-CANON-WEAK-HEADING-ERASED is
+  including WHIPPLESCRIPT-ALPHA-CANON .
+  vars TO TN : Title . vars CD CA : Content . var NA : Name .
+  crl [heading-erased] :
+    xferSection(TO, CD, TN, CA) ev(NA) => transported
+    if eqC(canon(CD), canon(CA)) = true .
 endm

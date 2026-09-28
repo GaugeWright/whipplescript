@@ -1,12 +1,13 @@
+#[path = "support/isolated_whip.rs"]
+mod isolated_whip;
+use isolated_whip::whip_command;
+
 use serde_json::{json, Value};
-use std::{
-    io::Write,
-    process::{Command, Stdio},
-};
+use std::{io::Write, process::Stdio};
 use whipplescript_kernel::exec_http::sha256_hex;
 
 fn probe(body: &[u8], extra: bool) -> std::process::Output {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_whip"));
+    let mut command = whip_command(env!("CARGO_BIN_EXE_whip"));
     command.args(["executor", "verify-norm-runtime"]);
     if extra {
         command.arg("unexpected");

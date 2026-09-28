@@ -1,3 +1,7 @@
+#[path = "support/isolated_whip.rs"]
+mod isolated_whip;
+use isolated_whip::whip_command;
+
 use serde_json::{json, Value};
 use std::{fs, path::PathBuf, process::Command};
 use whipplescript_kernel::{
@@ -32,7 +36,7 @@ fn native_runtime_context_prepares_exact_profile_and_refuses_bad_inputs() {
     let request_path = fixture.0.join("request.json");
     let invoke = |text: &[u8]| {
         fs::write(&request_path, text).expect("write context request");
-        Command::new(env!("CARGO_BIN_EXE_whip"))
+        whip_command(env!("CARGO_BIN_EXE_whip"))
             .current_dir(&fixture.0)
             .args(["executor", "prepare-norm-runtime-context", "--request"])
             .arg(&request_path)
@@ -217,7 +221,7 @@ fn native_runtime_context_builds_and_probes_the_exact_image() {
         let request = json!({"runtime":runtime, "artifact_source":source, "build_root":fixture.0.join("contexts")});
         let request_path = fixture.0.join("request.json");
         fs::write(&request_path, request.to_string()).expect("physical request");
-        let prepared = Command::new(&executable)
+        let prepared = whip_command(&executable)
             .args(["executor", "prepare-norm-runtime-context", "--request"])
             .arg(&request_path)
             .output()
@@ -333,7 +337,7 @@ fn native_runtime_context_builds_and_probes_the_exact_image() {
         let verify_path = fixture.0.join("verify-image.json");
         fs::write(&verify_path, verification.to_string()).expect("verification request");
         let invoke = || {
-            Command::new(&executable)
+            whip_command(&executable)
                 .args(["executor", "verify-norm-runtime-image", "--request"])
                 .arg(&verify_path)
                 .output()

@@ -5,9 +5,12 @@
 //! `rule` instead of `view` must keep every derivation live — that is what
 //! makes this a test of supersede rather than a test that the program runs.
 
+#[path = "support/isolated_whip.rs"]
+mod isolated_whip;
+use isolated_whip::whip_command;
+
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 /// A view whose count moves 1 -> 2 -> 3, driven by a rule that adds a `Ticket`
 /// whenever the count is still low.
@@ -86,14 +89,14 @@ fn run_and_read(dir: &Path, source: &str) -> (String, Vec<String>) {
     let program = dir.join("program.whip");
     fs::write(&program, source).expect("write program");
 
-    let run = Command::new(env!("CARGO_BIN_EXE_whip"))
+    let run = whip_command(env!("CARGO_BIN_EXE_whip"))
         .args(["run", program.to_str().expect("path")])
         .current_dir(dir)
         .output()
         .expect("spawn whip run");
     let status = String::from_utf8_lossy(&run.stdout).into_owned();
 
-    let instances = Command::new(env!("CARGO_BIN_EXE_whip"))
+    let instances = whip_command(env!("CARGO_BIN_EXE_whip"))
         .args(["instances"])
         .current_dir(dir)
         .output()
@@ -105,7 +108,7 @@ fn run_and_read(dir: &Path, source: &str) -> (String, Vec<String>) {
         .unwrap_or_else(|| panic!("no instance in:\n{listing}"))
         .to_owned();
 
-    let facts = Command::new(env!("CARGO_BIN_EXE_whip"))
+    let facts = whip_command(env!("CARGO_BIN_EXE_whip"))
         .args(["facts", &instance])
         .current_dir(dir)
         .output()

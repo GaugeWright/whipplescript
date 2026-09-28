@@ -452,7 +452,7 @@ pub fn lease_gated_refs(
 
 /// Object-safe branch-tier seam, mirroring `Coordination`/`WorkItems`: the
 /// DO host supplies its own implementation over `DoSql`.
-pub trait Branches {
+pub trait Branches: flowing_fence::FlowingFence {
     /// Commit a fresh write's exact head CAS, immutable cut and operation
     /// receipt together. A reused cut/operation id refuses; recovery reads the
     /// original receipt instead of issuing the write again. No non-atomic

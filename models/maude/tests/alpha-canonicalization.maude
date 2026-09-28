@@ -70,3 +70,27 @@ search [1] in WHIPPLESCRIPT-ALPHA-CANON :
 search [1] in WHIPPLESCRIPT-ALPHA-CANON :
   mergeRen(nA, c0, nB, c0fmt, true)
   =>* C:Cfg renConflict(nA) .
+
+--- C1 coverage: a reformat under the same heading transports support.
+search [1] in WHIPPLESCRIPT-ALPHA-CANON :
+  xferSection(tRequired, c0, tRequired, c0fmt) ev(nA)
+  =>* C:Cfg transported .
+
+--- C1 coverage: a pure retitle is recognised as continuity.
+search [1] in WHIPPLESCRIPT-ALPHA-CANON :
+  xferSection(tRequired, c0, tOptional, c0) ev(nA)
+  =>* C:Cfg moved .
+
+--- Bite 5: Required -> Optional never transports support, however equal the
+--- body; erasing headings from the key transports it.
+search [1] in WHIPPLESCRIPT-ALPHA-CANON :
+  xferSection(tRequired, c0, tOptional, c0) ev(nA)
+  =>* transported RESIDUAL:Cfg .
+search [1] in WHIPPLESCRIPT-ALPHA-CANON-WEAK-HEADING-ERASED :
+  xferSection(tRequired, c0, tOptional, c0) ev(nA)
+  =>* C:Cfg transported .
+
+--- Bite 6: a body edit never transports support.
+search [1] in WHIPPLESCRIPT-ALPHA-CANON :
+  xferSection(tRequired, c0, tRequired, c1) ev(nA)
+  =>* transported RESIDUAL:Cfg .

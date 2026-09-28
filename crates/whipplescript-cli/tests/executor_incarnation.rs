@@ -1,8 +1,12 @@
 //! Actual process replacement at the same endpoint must reject old bindings.
+#[path = "support/isolated_whip.rs"]
+mod isolated_whip;
+use isolated_whip::whip_command;
+
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::net::{SocketAddr, TcpListener};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::time::{Duration, Instant};
 use whipplescript_kernel::exec_incarnation;
 
@@ -41,7 +45,7 @@ impl Drop for Executor {
 fn start(address: SocketAddr) -> (Executor, String) {
     let mut log = executor_log();
     let mut process = Executor(
-        Command::new(env!("CARGO_BIN_EXE_whip"))
+        whip_command(env!("CARGO_BIN_EXE_whip"))
             .args(["executor", "--bind", &address.to_string()])
             .env("WHIP_EXECUTOR_TOKEN", "incarnation-fixture")
             .stdout(Stdio::from(log.try_clone().expect("share the log")))

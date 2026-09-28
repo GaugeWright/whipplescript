@@ -1,11 +1,15 @@
 //! Actual authenticated executor -> observer child -> shared report evaluation.
+#[path = "support/isolated_whip.rs"]
+mod isolated_whip;
+use isolated_whip::whip_command;
+
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::net::TcpListener;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::time::{Duration, Instant};
 use whipplescript_core::norm_evidence::{
     EvidenceSubject, EvidenceVersion, ReportContract, RequiredCase, TestOutcome,
@@ -56,7 +60,7 @@ impl Executor {
         let address = listener.local_addr().expect("norm observer fixture");
         drop(listener);
         let log = executor_log();
-        let child = Command::new(env!("CARGO_BIN_EXE_whip"))
+        let child = whip_command(env!("CARGO_BIN_EXE_whip"))
             .args(["executor", "--bind", &address.to_string()])
             .env("WHIP_EXECUTOR_TOKEN", "norm-observer-fixture-token")
             .stdout(Stdio::from(log.try_clone().expect("share the log")))

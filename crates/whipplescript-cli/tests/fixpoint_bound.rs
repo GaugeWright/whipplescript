@@ -11,9 +11,13 @@
 //! inside ONE pass and was still going. `--max-iterations` does not help — it
 //! bounds passes, and the run never leaves the first one.
 
+#[path = "support/isolated_whip.rs"]
+mod isolated_whip;
+use isolated_whip::whip_command;
+
 use std::fs;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 /// The runaway: recursive through its own aggregate, and every firing mints a
@@ -93,7 +97,7 @@ fn a_runaway_rule_fixpoint_stops_the_pass_instead_of_hanging_it() {
     // Eight rounds exercise repeated growth and the bound without turning the
     // 60-second hang detector into a disk-throughput requirement. The shipped
     // default remains 10_000; removing the bound still hangs this same program.
-    let child = Command::new(env!("CARGO_BIN_EXE_whip"))
+    let child = whip_command(env!("CARGO_BIN_EXE_whip"))
         .args([
             "run",
             program.to_str().expect("path"),
@@ -112,7 +116,7 @@ fn a_runaway_rule_fixpoint_stops_the_pass_instead_of_hanging_it() {
         "`whip run` did not return: the pure-rule fixpoint is unbounded again"
     );
 
-    let instances = Command::new(env!("CARGO_BIN_EXE_whip"))
+    let instances = whip_command(env!("CARGO_BIN_EXE_whip"))
         .args(["instances"])
         .current_dir(&dir)
         .output()
@@ -124,7 +128,7 @@ fn a_runaway_rule_fixpoint_stops_the_pass_instead_of_hanging_it() {
         .unwrap_or_else(|| panic!("no instance in `whip instances` output:\n{listing}"))
         .to_owned();
 
-    let diagnostics = Command::new(env!("CARGO_BIN_EXE_whip"))
+    let diagnostics = whip_command(env!("CARGO_BIN_EXE_whip"))
         .args(["diagnostics", &instance])
         .current_dir(&dir)
         .output()
