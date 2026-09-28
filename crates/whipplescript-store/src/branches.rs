@@ -761,6 +761,9 @@ pub struct BranchStore {
 }
 
 #[cfg(feature = "native")]
+const BRANCH_SCHEMA_OPEN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+#[cfg(feature = "native")]
 impl BranchStore {
     /// Open an existing store without creating directories, initializing or
     /// migrating its schema. Missing or incompatible records fail when read.
@@ -781,9 +784,15 @@ impl BranchStore {
             }
         }
         let connection = Connection::open(path)?;
+        // Concurrent first openers must wait for the initial WAL conversion
+        // and schema writer. Keep the shorter timeout for ordinary operations
+        // once the branch store is open.
+        connection.busy_timeout(BRANCH_SCHEMA_OPEN_TIMEOUT)?;
         crate::establish_wal(&connection)?;
+        connection.busy_timeout(BRANCH_SCHEMA_OPEN_TIMEOUT)?;
         connection.execute_batch("PRAGMA foreign_keys = ON;")?;
         ensure_branch_schema(&connection)?;
+        connection.busy_timeout(crate::STORE_BUSY_TIMEOUT)?;
         connection.set_prepared_statement_cache_capacity(crate::STATEMENT_CACHE_CAPACITY);
         Ok(Self { connection })
     }

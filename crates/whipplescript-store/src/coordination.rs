@@ -98,6 +98,9 @@ pub struct CoordinationStore {
 }
 
 #[cfg(feature = "native")]
+const COORDINATION_SCHEMA_OPEN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+#[cfg(feature = "native")]
 impl CoordinationStore {
     /// Open only a current existing coordination store. Checks its owning stamp and
     /// SQLite integrity, establishes WAL, and never creates or repairs schema.
@@ -115,12 +118,20 @@ impl CoordinationStore {
             }
         }
         let connection = Connection::open(path)?;
+        // A fresh shared file may have many first openers. The protection
+        // probe and schema transaction both run during that one-time race;
+        // give them an initialization wait rather than the shorter steady
+        // operation timeout.
+        connection.busy_timeout(COORDINATION_SCHEMA_OPEN_TIMEOUT)?;
         Self::require_plain_before_initialize(&connection)?;
         // Several workers open one shared coordination store, and the first of
         // them to arrive at a fresh file has to establish WAL against the
         // others. `establish_wal` is what survives that race.
         crate::establish_wal(&connection)?;
-        Self::from_connection(connection)
+        connection.busy_timeout(COORDINATION_SCHEMA_OPEN_TIMEOUT)?;
+        let store = Self::from_connection(connection)?;
+        store.connection.busy_timeout(crate::STORE_BUSY_TIMEOUT)?;
+        Ok(store)
     }
 
     /// In-memory coordination store, for tests that need a handle satisfying
