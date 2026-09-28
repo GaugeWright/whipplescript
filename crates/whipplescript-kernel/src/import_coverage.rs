@@ -23,6 +23,16 @@ pub struct ResolvedLocalPackage<'a> {
     pub source_digest: &'a str,
 }
 
+/// Exact inputs captured from the same checked source and resolved package
+/// snapshot that produced the IR. The admitting caller owns that snapshot;
+/// this type does not claim the rest of the Home used the same boundary.
+pub struct CheckedImportBasis<'a> {
+    pub program_source_digest: &'a str,
+    pub lock_digest: &'a str,
+    pub compiler_artifact_digest: &'a str,
+    pub packages: &'a [ResolvedLocalPackage<'a>],
+}
+
 fn is_digest(value: &str) -> bool {
     value.len() == 64
         && value
@@ -130,6 +140,64 @@ mod tests {
         whipplescript_parser::compile_program(source)
             .ir
             .expect("checked program")
+    }
+
+    #[cfg(feature = "native")]
+    #[test]
+    fn checked_compiled_admission_persists_the_extracted_imports_with_the_version() {
+        let source = "use local.x\nworkflow Imports\n";
+        let ir = program(source);
+        let program_source_digest = sha256_hex(source.as_bytes());
+        let package_source_digest = sha256_hex(b"checked package source");
+        let packages = [ResolvedLocalPackage {
+            name: "local.x",
+            package_id: "pkg-x",
+            version: "1",
+            source_digest: &package_source_digest,
+        }];
+        let basis = CheckedImportBasis {
+            program_source_digest: &program_source_digest,
+            lock_digest: A,
+            compiler_artifact_digest: B,
+            packages: &packages,
+        };
+        let mut kernel = crate::RuntimeKernel::new(
+            whipplescript_store::SqliteStore::open_in_memory().expect("store"),
+        );
+        let input = crate::CompiledProgramVersionInput {
+            program_name: &ir.workflow,
+            source_hash: &crate::stable_hash_hex(source),
+            compiler_version: "test",
+        };
+        let admitted = kernel
+            .create_program_version_for_compiled_program_with_imports(input, &ir, None, &basis)
+            .expect("admitted");
+        let stored = kernel
+            .store()
+            .program_import_witness(&admitted.version_id, &admitted.witness_digest)
+            .expect("read witness")
+            .expect("witness");
+        assert_eq!(
+            stored,
+            capture(&ir, &program_source_digest, A, B, &packages).unwrap()
+        );
+        assert!(kernel
+            .store()
+            .get_program_version(&admitted.version_id)
+            .expect("read version")
+            .is_some());
+
+        let missing = CheckedImportBasis {
+            packages: &[],
+            ..basis
+        };
+        assert!(matches!(
+            kernel.create_program_version_for_compiled_program_with_imports(
+                input, &ir, None, &missing
+            ),
+            Err(whipplescript_store::StoreError::Conflict(message))
+                if message.contains("unresolved local package import")
+        ));
     }
 
     #[test]

@@ -1301,6 +1301,69 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
         }
     }
 
+    /// Admit a checked program and its bounded local-import witness in one
+    /// store transaction. The caller must provide an immutable source/lock/
+    /// package snapshot from the compile and resolution pass.
+    pub fn create_program_version_for_compiled_program_with_imports(
+        &mut self,
+        input: CompiledProgramVersionInput<'_>,
+        program: &IrProgram,
+        typed_actions: Option<
+            &std::collections::BTreeMap<
+                String,
+                whipplescript_parser::action_plan::resolved::TypedActionPlan,
+            >,
+        >,
+        basis: &import_coverage::CheckedImportBasis<'_>,
+    ) -> StoreResult<whipplescript_store::program_imports::ProgramImportAdmissionRecord> {
+        let identity = program_artifact::identity_projection(program, typed_actions)
+            .map_err(StoreError::Conflict)?;
+        let identity_hash = stable_hash_hex(&identity);
+        let version_input = ProgramVersionInput {
+            program_name: input.program_name,
+            source_hash: input.source_hash,
+            ir_hash: &identity_hash,
+            compiler_version: input.compiler_version,
+            ir_snapshot: Some(&identity),
+        };
+        let declared_profiles_json = declared_profiles_json(program);
+        let declared_skills_json = declared_skills_json(program);
+        let declared_schemas_json = declared_schemas_json(program);
+        let analysis_summary_json = match typed_actions {
+            Some(typed_actions) => program_artifact::capture_typed(
+                &self.store,
+                &version_input,
+                program,
+                typed_actions,
+            )?,
+            None => program_artifact::capture(&self.store, &version_input, program)?,
+        };
+        let version = NewProgramVersion {
+            program_name: version_input.program_name,
+            source_hash: version_input.source_hash,
+            ir_hash: version_input.ir_hash,
+            compiler_version: version_input.compiler_version,
+            ir_snapshot: version_input.ir_snapshot,
+            declared_capabilities_json: "[]",
+            declared_profiles_json: &declared_profiles_json,
+            declared_skills_json: &declared_skills_json,
+            declared_schemas_json: &declared_schemas_json,
+            analysis_summary_json: &analysis_summary_json,
+            generated_artifacts_json: "[]",
+            artifact_root: None,
+        };
+        let witness = import_coverage::capture(
+            program,
+            basis.program_source_digest,
+            basis.lock_digest,
+            basis.compiler_artifact_digest,
+            basis.packages,
+        )
+        .map_err(StoreError::Conflict)?;
+        self.store
+            .create_program_version_with_import_witness(version, &witness)
+    }
+
     /// Re-attest an instance's program under the current compiler: same
     /// authored identity (`source_hash`), new `ir_hash`. See
     /// `RuntimeStore::reattest_instance_program`.
