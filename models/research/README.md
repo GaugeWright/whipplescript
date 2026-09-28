@@ -1,5 +1,26 @@
 # Branch-to-trunk gate research models
 
+## Forge source-review boundary
+
+`source_review.py` is a bounded transition probe for the reviewed-contribution
+contract in [source review](../../spec/source-review.md):
+
+```sh
+python3 models/research/source_review.py
+```
+
+It exercises Git and flowing-prefix sources through the same review and
+admission state, stable review identity across immutable revisions, a source
+tail arriving behind a selected prefix, dependent contributions, stale base
+and policy, Hold, cancellation, and receipt delivery after a durable ref
+entry. Ten deliberately weakened guards must produce an observable forbidden
+history, including a repeated post-crash advance. It assumes the candidate
+constructor really computes the proposed result, that its token names the
+checked tree, and that one ref entry can atomically record admission. It does
+not prove the Git/WhippleScript merge engine, authentication, durable storage,
+independent failures, or cross-repository atomicity. Those are running-host
+and restore obligations in the source-review tracker.
+
 `branch_trunk_gate.py` is a dependency-free bounded state explorer for the
 control plane sketched in [the research note](../../spec/branch-trunk-gate-research-note.md).
 Run it with:
