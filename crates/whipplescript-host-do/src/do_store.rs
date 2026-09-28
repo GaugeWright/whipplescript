@@ -5311,12 +5311,25 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
         &mut self,
         version: NewProgramVersion<'_>,
     ) -> StoreResult<ProgramVersionRecord> {
-        let program_id = do_ensure_program_id(&self.sql, version.program_name)?;
-        let version_id = do_insert_program_version(&self.sql, &program_id, version)?;
-        Ok(ProgramVersionRecord {
-            program_id,
-            version_id,
-        })
+        let mut record = None;
+        self.sql.atomic(&mut || {
+            let program_id = do_ensure_program_id(&self.sql, version.program_name)?;
+            let version_id = do_insert_program_version(&self.sql, &program_id, version)?;
+            self.sql
+                .execute(
+                    "INSERT INTO program_import_operations \
+                     (operation_id, version_id, kind) \
+                     VALUES ('imp_' || lower(hex(randomblob(16))), ?1, 'unwitnessed')",
+                    &[text(&version_id)],
+                )
+                .map_err(sql_err)?;
+            record = Some(ProgramVersionRecord {
+                program_id,
+                version_id,
+            });
+            Ok(())
+        })?;
+        Ok(record.expect("the successful atomic body sets its version record"))
     }
 
     fn create_program_version_with_import_witness(
@@ -5339,6 +5352,14 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
                     "INSERT OR IGNORE INTO program_import_admissions \
                      (version_id, witness_digest, witness_json) VALUES (?1, ?2, ?3)",
                     &[text(&version_id), text(&digest), text(&json)],
+                )
+                .map_err(sql_err)?;
+            self.sql
+                .execute(
+                    "INSERT INTO program_import_operations \
+                     (operation_id, version_id, witness_digest, kind) \
+                     VALUES ('imp_' || lower(hex(randomblob(16))), ?1, ?2, 'checked')",
+                    &[text(&version_id), text(&digest)],
                 )
                 .map_err(sql_err)?;
             record = Some(
@@ -11118,6 +11139,7 @@ pub mod test_support {
             INSERT INTO schema_migrations (version, name) VALUES (6, 'tracker-control-receipts');
             INSERT INTO schema_migrations (version, name) VALUES (7, 'fact-validity');
             INSERT INTO schema_migrations (version, name) VALUES (8, 'program-import-admission');
+            INSERT INTO schema_migrations (version, name) VALUES (9, 'program-import-operation-population');
             CREATE TABLE events (
                 event_id TEXT PRIMARY KEY, instance_id TEXT NOT NULL, sequence INTEGER NOT NULL,
                 event_type TEXT NOT NULL, payload_json TEXT NOT NULL, occurred_at TEXT NOT NULL,
@@ -11426,6 +11448,8 @@ pub mod test_support {
             .expect("tracker control schema");
         conn.execute_batch(whipplescript_store::program_imports::SCHEMA)
             .expect("program import admission schema");
+        conn.execute_batch(whipplescript_store::program_imports::OPERATIONS_SCHEMA)
+            .expect("program import operation schema");
         DoSqliteStore::new(RusqliteDoSql {
             conn: std::rc::Rc::new(conn),
         })
@@ -14615,13 +14639,42 @@ pub(crate) mod tests {
             .unwrap();
         assert_eq!(second.version_id, first.version_id);
         assert_ne!(second.witness_digest, first.witness_digest);
+        let unwitnessed = store.create_program_version(version("paint")).unwrap();
+        assert_eq!(unwitnessed.version_id, first.version_id);
+        let operations = store
+            .sql
+            .query(
+                "SELECT sequence, kind, witness_digest FROM program_import_operations \
+                 WHERE version_id = ?1 ORDER BY sequence",
+                &[text(&first.version_id)],
+            )
+            .unwrap();
+        assert_eq!(operations.len(), 3);
+        assert!(operations
+            .windows(2)
+            .all(|pair| { as_i64(&pair[0][0]) < as_i64(&pair[1][0]) }));
+        assert_eq!(
+            operations
+                .iter()
+                .filter(|row| as_text(&row[1]) == "checked")
+                .count(),
+            2
+        );
+        assert_eq!(
+            operations
+                .iter()
+                .filter(|row| {
+                    as_text(&row[1]) == "unwitnessed" && matches!(row[2], SqlValue::Null)
+                })
+                .count(),
+            1
+        );
         assert_eq!(
             store
                 .program_import_witness(&second.version_id, &second.witness_digest)
                 .unwrap(),
             Some(second_witness)
         );
-
         let mut bad = witness(LOCK);
         bad.edge_digest = NEXT_LOCK.into();
         assert!(store
@@ -14662,7 +14715,7 @@ pub(crate) mod tests {
     fn do_store_core_methods_run_real_sql() {
         let store = store();
 
-        assert_eq!(store.schema_version().expect("version"), 8);
+        assert_eq!(store.schema_version().expect("version"), 9);
         assert!(!store.fact_exists("i1", "ready").expect("fact"));
 
         let event = store

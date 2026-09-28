@@ -127,7 +127,7 @@ pub fn run_block_event_key(legacy: &str, payload: &str, original: Option<&str>) 
 /// understands. Must stay equal to the highest version in `MIGRATIONS`
 /// (asserted by test); `apply_migrations` refuses to open a store stamped
 /// beyond it instead of silently misreading a newer layout.
-pub const SUPPORTED_SCHEMA_VERSION: i64 = 5;
+pub const SUPPORTED_SCHEMA_VERSION: i64 = 6;
 
 /// Stamp a satellite store's schema generation, and refuse one stamped beyond
 /// what this build understands.
@@ -1692,6 +1692,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "program-import-admission",
         sql: program_imports::SCHEMA,
     },
+    Migration {
+        version: 6,
+        name: "program-import-operation-population",
+        sql: include_str!("../migrations/0006_program_import_operations.sql"),
+    },
 ];
 
 /// The schema owner an existing runtime store must carry: the name of its
@@ -2125,6 +2130,20 @@ impl SqliteStore {
         } else {
             None
         };
+        tx.execute(
+            "INSERT INTO program_import_operations \
+             (operation_id, version_id, witness_digest, kind) \
+             VALUES ('imp_' || lower(hex(randomblob(16))), ?1, ?2, ?3)",
+            params![
+                &version_id,
+                &witness_digest,
+                if witness_digest.is_some() {
+                    "checked"
+                } else {
+                    "unwitnessed"
+                },
+            ],
+        )?;
         tx.commit()?;
 
         Ok((
@@ -14479,6 +14498,27 @@ fn initialize_runtime_schema_on(connection: &Connection) -> StoreResult<()> {
         }
 
         connection.execute_batch(migration.sql)?;
+        if migration.name == "program-import-operation-population" {
+            // Some v1 stores carry only the tables they used. Their stamped
+            // schema predates program_versions, so an unconditional SELECT in
+            // the migration would make a valid older store unopenable. Where
+            // versions do exist, retain an unknown gap for prior admissions.
+            let has_versions: bool = connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master \
+                 WHERE type = 'table' AND name = 'program_versions')",
+                [],
+                |row| row.get(0),
+            )?;
+            if has_versions {
+                connection.execute(
+                    "INSERT OR IGNORE INTO program_import_operations \
+                     (operation_id, version_id, kind) \
+                     SELECT 'legacy:' || version_id, version_id, 'legacy-gap' \
+                     FROM program_versions",
+                    [],
+                )?;
+            }
+        }
         connection.execute(
             "INSERT INTO schema_migrations (version, name) VALUES (?1, ?2)",
             params![migration.version, migration.name],

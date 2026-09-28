@@ -1,8 +1,9 @@
 //! Exact, per-admission import evidence (DR-0131, RC-2).
 //!
-//! A program version can be reused under a changed package lock. Each
-//! accepting operation therefore retains its own immutable witness basis;
-//! absence of a row remains unknown, never an empty import set.
+//! A program version can be reused under a changed package lock. Checked
+//! version creation retains an immutable witness basis, while each call to
+//! the version-creation API records a separate operation. Other accepting
+//! paths still need coverage before this population can describe a Home.
 
 use serde::{Deserialize, Serialize};
 
@@ -38,6 +39,20 @@ pub const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS program_import_admissions (
     witness_digest TEXT NOT NULL,
     witness_json TEXT NOT NULL,
     PRIMARY KEY (version_id, witness_digest)
+)";
+
+/// One row per version-creation call, including repeated calls returning the
+/// same version. Existing stores cannot reconstruct old calls;
+/// their migration records a conservative unknown gap for every old version.
+pub const OPERATIONS_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS program_import_operations (
+    sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+    operation_id TEXT NOT NULL UNIQUE,
+    version_id TEXT NOT NULL REFERENCES program_versions(version_id),
+    witness_digest TEXT,
+    kind TEXT NOT NULL CHECK (kind IN ('checked', 'unwitnessed', 'legacy-gap')),
+    FOREIGN KEY (version_id, witness_digest)
+        REFERENCES program_import_admissions(version_id, witness_digest),
+    CHECK ((kind = 'checked') = (witness_digest IS NOT NULL))
 )";
 
 fn is_digest(value: &str) -> bool {
@@ -221,6 +236,8 @@ mod tests {
             .create_program_version_with_import_witness(version("paint"), &first_witness)
             .unwrap();
         assert_eq!(repeated, first);
+        let unwitnessed = store.create_program_version(version("paint")).unwrap();
+        assert_eq!(unwitnessed.version_id, first.version_id);
 
         let changed_lock = witness(NEXT_LOCK);
         let second = store
@@ -249,6 +266,39 @@ mod tests {
             )
             .unwrap();
         assert_eq!(rows, 3);
+        let operations: Vec<(i64, String, Option<String>)> = store
+            .connection
+            .prepare(
+                "SELECT sequence, kind, witness_digest FROM program_import_operations \
+                 WHERE version_id = ?1 ORDER BY sequence",
+            )
+            .unwrap()
+            .query_map([&first.version_id], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            })
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(operations.len(), 4);
+        assert!(operations.windows(2).all(|pair| pair[0].0 < pair[1].0));
+        assert_eq!(
+            operations
+                .iter()
+                .filter(|(_, kind, _)| kind == "checked")
+                .count(),
+            3
+        );
+        assert_eq!(
+            operations
+                .iter()
+                .filter(|(_, kind, digest)| { kind == "unwitnessed" && digest.is_none() })
+                .count(),
+            1
+        );
         store
             .connection
             .execute(
@@ -284,5 +334,59 @@ mod tests {
             })
             .unwrap();
         assert_eq!(rows, 0);
+        let operations: i64 = store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM program_import_operations",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(operations, 0);
+    }
+
+    #[test]
+    fn migration_keeps_prior_acceptance_unknown_after_version_reuse() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let first = store
+            .create_program_version_with_import_witness(version("old"), &witness(LOCK))
+            .unwrap();
+        // Model an existing store stamped before operation tracking. Its
+        // earlier checked witness says nothing about each old accepting call.
+        store
+            .connection
+            .execute_batch(
+                "DROP TABLE program_import_operations;
+                 DELETE FROM schema_migrations WHERE version = 6;",
+            )
+            .unwrap();
+        crate::initialize_runtime_schema_on(&store.connection).unwrap();
+        let kinds: Vec<String> = store
+            .connection
+            .prepare("SELECT kind FROM program_import_operations ORDER BY sequence")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(kinds, ["legacy-gap"]);
+        store
+            .create_program_version_with_import_witness(version("old"), &witness(LOCK))
+            .unwrap();
+        let rows: Vec<(String, String)> = store
+            .connection
+            .prepare("SELECT version_id, kind FROM program_import_operations ORDER BY sequence")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                (first.version_id.clone(), "legacy-gap".into()),
+                (first.version_id, "checked".into())
+            ]
+        );
     }
 }
