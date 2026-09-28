@@ -75,7 +75,29 @@ nothing a `whip` user does needs to change.
 
 ## [0.7.1] — 2026-09-28
 
-A patch release: nothing it adds breaks what 0.7.0 accepted.
+Numbered as a patch release, but it is not one: three published crates changed
+public types that a dependent can match on or construct, which the versioning
+rule numbers in the middle place. Nothing checked the number before this cut;
+the release script has checked it since. A published number is never moved, so
+0.7.1 stands, and a dependent that accepts `0.7` receives it. Code that matches
+these enums without a wildcard arm, builds these structs with a literal, or
+calls `vcs::is_gated_ref` must follow the change:
+
+- `whipplescript-core`: `AdmissionPredicate` gained `Witnessed` and
+  `Arbitrated`; `ConstructGrammarSlot` gained `required`.
+- `whipplescript-store`: `NormAct` gained `Activate`, `NormCommand` gained
+  `PlanActivation`, `NormCommandResult` gained `ActivationPlanned`, and
+  `TransportOutcome` gained `IncompletePathSelection`; `NormSnapshot` gained
+  `reservations`, `retired` and `enforcement`, and `NormCharter` gained
+  `activation` and `gated_refs`. The function `vcs::is_gated_ref` is gone:
+  whether a ref is gated now depends on the store — the mainline, or a line
+  the charter declares gated — not on its name alone.
+- `whipplescript-kernel`: `norm_impact::ImpactWork` gained `Quarantined`;
+  `norm_planning::Planned` gained `conformance`, `reservation_conflicts` and
+  `investigations`, `norm_admission::AdmissionCertificate` gained
+  `exceptions`, `norm_admission::AdmissionHost` gained `now`,
+  `sansio::InitialModelProvenance` gained `workspace_content`, and
+  `package_registry::PackageWorkflowTool` gained `attested_source`.
 
 ### Added
 
