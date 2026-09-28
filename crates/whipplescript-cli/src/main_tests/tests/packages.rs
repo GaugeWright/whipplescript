@@ -4,6 +4,70 @@
 //! fixtures and the crate-root imports in scope.
 
 use super::*;
+
+#[test]
+fn loaded_package_source_witness_uses_the_attested_tool_bundle() {
+    let manifest_path =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/packages/toolkit.json");
+    let manifest = load_package_manifest(&manifest_path).expect("tool manifest loads");
+    let tool = &manifest.workflow_tools[0];
+    let (checked_source, _) = compile_source_path_for_validation(
+        tool.source.to_str().expect("source path"),
+        Some(&tool.name),
+    )
+    .unwrap_or_else(|_| panic!("tool source checks"));
+    assert_eq!(
+        tool.attested_source.as_deref(),
+        Some(checked_source.as_str())
+    );
+    assert!(manifest.checked_source_digest().is_some());
+}
+
+#[test]
+fn package_tool_grant_refuses_a_source_file_without_its_attested_bundle() {
+    let examples = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples");
+    let manifest_path = examples.join("packages/toolkit.json");
+    let mut manifest = load_package_manifest(&manifest_path).expect("tool manifest loads");
+    let program = examples.join("subworkflow-tool-consumer.whip");
+    let (_, ir) = compile_source_path_with_root(
+        program.to_str().expect("program path"),
+        Some("ConsumerFlow"),
+    )
+    .unwrap_or_else(|_| panic!("consumer compiles"));
+    let lock = LoadedPackageLock {
+        path: examples.join("subworkflow-tool-consumer.lock.json"),
+        manifests: vec![manifest.clone()],
+    };
+    resolve_package_tool_grant_from_lock(&lock, &ir, "EchoText")
+        .expect("attested package tool resolves")
+        .expect("tool exists in imported package");
+    let mut no_import = ir.clone();
+    no_import.uses.clear();
+    let error = match resolve_package_tool_grant_from_lock(&lock, &no_import, "EchoText") {
+        Ok(_) => panic!("a lock entry alone must not grant the tool"),
+        Err(error) => error,
+    };
+    assert!(error.contains("does not `use`"), "{error}");
+    assert!(
+        resolve_package_tool_grant_from_lock(&lock, &ir, "UnknownTool")
+            .expect("an absent tool is not a package rejection")
+            .is_none()
+    );
+
+    // Its source path still points to a valid file. Losing the attested bytes
+    // must refuse the grant instead of silently compiling today's file.
+    manifest.workflow_tools[0].attested_source = None;
+    let unbounded = LoadedPackageLock {
+        path: lock.path,
+        manifests: vec![manifest],
+    };
+    let error = match resolve_package_tool_grant_from_lock(&unbounded, &ir, "EchoText") {
+        Ok(_) => panic!("unattested package tool must refuse"),
+        Err(error) => error,
+    };
+    assert!(error.contains("no attested source bundle"), "{error}");
+}
+
 #[test]
 fn package_manifest_rejects_old_manifest_without_package_schema() {
     let error = package_manifest_from_json(

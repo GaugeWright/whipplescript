@@ -25,8 +25,8 @@ pub mod resolution_recording;
 pub mod resolution_scope;
 pub mod version_origin;
 pub use flowing_selection::{
-    FlowingSelection, FlowingSelectionOutcome, FlowingSourceAtom, FlowingTargetEffect,
-    FlowingTargetEffects, FlowingTargetEffectsOutcome,
+    FlowingEffectDisposition, FlowingSelection, FlowingSelectionOutcome, FlowingSourceAtom,
+    FlowingTargetEffect, FlowingTargetEffects, FlowingTargetEffectsOutcome,
 };
 pub use version_origin::{FileVersionSource, RecordedFileVersion};
 

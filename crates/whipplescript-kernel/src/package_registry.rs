@@ -429,6 +429,30 @@ pub struct PackageManifest {
     pub workflow_tools: Vec<PackageWorkflowTool>,
 }
 
+impl PackageManifest {
+    /// Digest the manifest and the exact expanded tool sources that were
+    /// attested at load time. A declaration without attested source has no
+    /// package source witness. Other files are outside this bounded slice.
+    pub fn checked_source_digest(&self) -> Option<String> {
+        let tools = self
+            .workflow_tools
+            .iter()
+            .map(|tool| {
+                Some(json!({
+                    "name": tool.name,
+                    "source": sha256_hex(tool.attested_source.as_ref()?.as_bytes()),
+                }))
+            })
+            .collect::<Option<Vec<_>>>()?;
+        let witness = json!({
+            "schema": "whipplescript.package_checked_source.v0",
+            "manifest": self.manifest_sha256,
+            "tools": tools,
+        });
+        Some(sha256_hex(witness.to_string().as_bytes()))
+    }
+}
+
 /// A `@tool` workflow exported by a package (DR-0025 cross-package attestation):
 /// the tool name, the resolved source path it is driven from, and the derived
 /// input/output JSON schemas (canonical JSON strings) that make up its tool
@@ -437,6 +461,9 @@ pub struct PackageManifest {
 pub struct PackageWorkflowTool {
     pub name: String,
     pub source: PathBuf,
+    /// Expanded source bundle used by the load-time attestation. The parser
+    /// leaves this absent; the filesystem-coupled attestation fills it.
+    pub attested_source: Option<String>,
     pub input_schema: String,
     pub output_schema: String,
 }
@@ -643,6 +670,7 @@ pub fn package_manifest_workflow_tool_decls(
         tools.push(PackageWorkflowTool {
             name,
             source,
+            attested_source: None,
             input_schema: String::new(),
             output_schema: String::new(),
         });
@@ -3431,13 +3459,36 @@ mod manifest_refusal_tests {
 
     use super::{
         package_capability_contracts, package_construct, package_manifest_from_json_with_embedded,
-        package_manifest_workflow_tool_decls, PACKAGE_MANIFEST_SCHEMA,
+        package_manifest_workflow_tool_decls, PackageManifest, PACKAGE_MANIFEST_SCHEMA,
     };
     use serde_json::{json, Value};
     use std::path::Path;
 
     fn path() -> &'static Path {
         Path::new("acme.json")
+    }
+
+    #[test]
+    fn checked_source_digest_requires_attested_bundle_and_tracks_same_manifest_source_drift() {
+        let mut manifest = PackageManifest {
+            path: path().to_path_buf(),
+            manifest_json: "manifest bytes".to_owned(),
+            manifest_sha256: super::sha256_hex(b"manifest bytes"),
+            package_id: "acme.widgets".to_owned(),
+            name: "acme.widgets".to_owned(),
+            version: "0.1.0".to_owned(),
+            registry: Default::default(),
+            workflow_tools: package_manifest_workflow_tool_decls(
+                path(),
+                &json!({"workflow_tools": [{"name": "paint", "source": "paint.whip"}]}),
+            )
+            .expect("tool declaration"),
+        };
+        assert_eq!(manifest.checked_source_digest(), None);
+        manifest.workflow_tools[0].attested_source = Some("workflow paint\n  return 1".to_owned());
+        let first = manifest.checked_source_digest().expect("attested source");
+        manifest.workflow_tools[0].attested_source = Some("workflow paint\n  return 2".to_owned());
+        assert_ne!(manifest.checked_source_digest(), Some(first));
     }
 
     #[test]

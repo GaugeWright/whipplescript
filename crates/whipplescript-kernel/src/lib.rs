@@ -35,6 +35,7 @@ pub mod host_package;
 pub mod host_policy;
 pub mod host_protocol;
 pub mod ifc;
+pub mod import_coverage;
 pub mod ingress_pass;
 pub mod instance_machine;
 pub mod lowering;

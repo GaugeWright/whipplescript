@@ -813,6 +813,110 @@ mod tests {
     }
 
     #[test]
+    fn hosted_handoff_accounts_consecutive_writes_as_one_target_effect() {
+        use std::rc::Rc;
+
+        use crate::do_branches::DoContentBlobs;
+        use whipplescript_store::content::ContentBlobs;
+        use whipplescript_store::selection::parse;
+        use whipplescript_store::vcs::{
+            FlowingSelectionOutcome, FlowingTargetEffectsOutcome, WorkspaceVcs,
+        };
+
+        let sql = Rc::new(RusqliteDoSql::with_runtime_schema());
+        let mut vcs = WorkspaceVcs::from_parts(
+            DoBranches::new(Rc::clone(&sql)).expect("branches"),
+            DoContentBlobs::new(Rc::clone(&sql)).expect("content"),
+        );
+        vcs.init("t0").unwrap();
+        vcs.create_branch("branch", None, MAINLINE_BRANCH_ID, "t1")
+            .unwrap();
+        vcs.create_branch("twig", None, "branch", "t1").unwrap();
+        vcs.write("twig", "a.txt", Some("A"), "twig-a", "t2")
+            .unwrap();
+        vcs.write("twig", "a.txt", Some("B"), "twig-b", "t3")
+            .unwrap();
+        let mut branches = DoBranches::new(Rc::clone(&sql)).unwrap();
+        let source_cut = branches.get_cut("twig-b").unwrap().unwrap();
+        assert_eq!(
+            branches
+                .pin_private_cut(PinPrivateCut {
+                    pin_id: "pin-b",
+                    twig_branch_id: "twig",
+                    cut_id: "twig-b",
+                    manifest_hash: &source_cut.manifest_hash,
+                    principal: "s:author",
+                    retained_at: "t4",
+                })
+                .unwrap(),
+            PinPrivateCutOutcome::Pinned
+        );
+        assert_eq!(
+            branches
+                .declare_contribution(DeclareContribution {
+                    unit_id: "unit-b",
+                    pin_id: "pin-b",
+                    principal: "s:author",
+                    intent: "two writes to one path",
+                    read_basis_digest: "reads-b",
+                    dependency_basis_digest: "deps-b",
+                    scope_digest: "scope-b",
+                    declared_at: "t4",
+                })
+                .unwrap(),
+            DeclareContributionOutcome::Declared
+        );
+        let FlowingSelectionOutcome::Selected(selection) = vcs
+            .select_private_changes("pin-b", &parse("path(a.txt)").unwrap())
+            .unwrap()
+        else {
+            panic!("select both writes");
+        };
+        assert_eq!(selection.changes().len(), 2);
+        assert_eq!(
+            vcs.bind_private_selection("unit-b", &selection, "t5")
+                .unwrap(),
+            BindContributionBasisOutcome::Bound
+        );
+        let expected = selection.changes()[1].after.as_ref().unwrap();
+        let manifest = DoContentBlobs::new(Rc::clone(&sql))
+            .unwrap()
+            .put_text(&format!(r#"{{"a.txt":"{expected}"}}"#))
+            .unwrap();
+        branches
+            .record_cut(CutRecord {
+                cut_id: "target-b",
+                change_id: "shared-b",
+                branch_id: "branch",
+                manifest_hash: &manifest,
+                parent_cut_id: None,
+                origin: Some("transport:twig"),
+                actor: Some("mediator"),
+                intent: None,
+                recorded_at: "t6",
+            })
+            .unwrap();
+        let FlowingTargetEffectsOutcome::Verified(witness) = vcs
+            .verify_private_target_effects("unit-b", "target-b")
+            .unwrap()
+        else {
+            panic!("net source effect matches target");
+        };
+        assert_eq!(witness.effects().len(), 1);
+        assert_eq!(witness.effects()[0].after.as_ref(), Some(expected));
+        assert_eq!(
+            witness.effects()[0].disposition,
+            whipplescript_store::vcs::FlowingEffectDisposition::Applied
+        );
+        assert!(matches!(
+            vcs.handoff_private_selection("op-b", &witness, "mediator", "t7")
+                .unwrap(),
+            HandoffContributionOutcome::Transferred(_)
+        ));
+        assert!(branches.handoff_receipt("op-b").unwrap().is_some());
+    }
+
+    #[test]
     fn hosted_handoff_rolls_back_receipt_and_ref_together() {
         use std::rc::Rc;
 

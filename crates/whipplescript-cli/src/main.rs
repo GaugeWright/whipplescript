@@ -5331,8 +5331,8 @@ fn imported_tool_irs(
     if let Some(lock) = package_lock {
         for manifest in &lock.manifests {
             for tool in &manifest.workflow_tools {
-                if let Ok(source) = std::fs::read_to_string(&tool.source) {
-                    if let Some(tool_ir) = whipplescript_parser::compile_program(&source).ir {
+                if let Some(source) = tool.attested_source.as_deref() {
+                    if let Some(tool_ir) = whipplescript_parser::compile_program(source).ir {
                         out.push(tool_ir);
                     }
                 }
@@ -5359,8 +5359,8 @@ fn imported_tool_surfaces(package_lock: Option<&LoadedPackageLock>) -> Vec<(Stri
     if let Some(lock) = package_lock {
         for manifest in &lock.manifests {
             for tool in &manifest.workflow_tools {
-                if let Ok(source) = std::fs::read_to_string(&tool.source) {
-                    if let Some(tool_ir) = whipplescript_parser::compile_program(&source).ir {
+                if let Some(source) = tool.attested_source.as_deref() {
+                    if let Some(tool_ir) = whipplescript_parser::compile_program(source).ir {
                         out.push((
                             tool.name.clone(),
                             package_tool_ifc_surface(&manifest.package_id, &tool.name, &tool_ir),
@@ -5390,8 +5390,8 @@ fn package_workflow_tool_attestations_json(manifests: &[PackageManifest]) -> Vec
             // holds by construction; `flow` is the opaque join box (Fork A). Best
             // effort — if the source cannot be compiled standalone, the optional
             // block is omitted (the consumer then governs it fail-closed).
-            if let Ok(source) = std::fs::read_to_string(&tool.source) {
-                if let Some(tool_ir) = whipplescript_parser::compile_program(&source).ir {
+            if let Some(source) = tool.attested_source.as_deref() {
+                if let Some(tool_ir) = whipplescript_parser::compile_program(source).ir {
                     entry["information_flow"] = json!({
                         "surface": package_tool_ifc_surface(&manifest.package_id, &tool.name, &tool_ir),
                         "flow": "join_box",
@@ -18763,7 +18763,7 @@ fn attest_manifest_workflow_tools(manifest: &mut PackageManifest) -> Result<(), 
     for tool in &mut manifest.workflow_tools {
         let name = tool.name.clone();
         let source = tool.source.clone();
-        let (_, ir) =
+        let (checked_source, ir) =
             compile_source_path_for_validation(source.to_str().unwrap_or_default(), Some(&name))
                 .map_err(|error| {
                     format!(
@@ -18807,6 +18807,7 @@ fn attest_manifest_workflow_tools(manifest: &mut PackageManifest) -> Result<(), 
             .unwrap_or_else(|| json!({ "type": "object", "additionalProperties": false }));
         tool.input_schema = input_schema.to_string();
         tool.output_schema = output_schema.to_string();
+        tool.attested_source = Some(checked_source);
     }
     Ok(())
 }
@@ -42862,8 +42863,8 @@ fn resolve_tool_grant(
         }),
         Err(local_reason) => {
             match resolve_package_tool_grant(program_path, ir, name, package_lock_path) {
-                Ok(resolved) => Ok(resolved),
-                Err(package_reason) if package_reason.is_empty() => Err(local_reason),
+                Ok(Some(resolved)) => Ok(resolved),
+                Ok(None) => Err(local_reason),
                 Err(package_reason) => Err(package_reason),
             }
         }
@@ -42883,20 +42884,28 @@ struct ResolvedToolGrant {
 /// program's directory; each locked manifest's `workflow_tools` were already
 /// convergence-checked and attested when the manifest loaded, so resolution here
 /// just locates the exporting package and compiles its shipped source for the
-/// tool IR. An empty `Err("")` means "no package resolves this name" so the
-/// caller keeps the same-bundle reason; a non-empty `Err` is a concrete package
-/// rejection (e.g. a broken package lock).
+/// tool IR. `Ok(None)` means no package resolves this name, so the caller keeps
+/// the same-bundle reason; `Err` is a concrete package rejection (e.g. a
+/// broken package lock).
 fn resolve_package_tool_grant(
     program_path: &Path,
     ir: &IrProgram,
     name: &str,
     package_lock_path: Option<&Path>,
-) -> Result<ResolvedToolGrant, String> {
+) -> Result<Option<ResolvedToolGrant>, String> {
     let lock = match load_package_lock(package_lock_path, &[program_path]) {
         Ok(Some(lock)) => lock,
-        Ok(None) => return Err(String::new()),
+        Ok(None) => return Ok(None),
         Err(error) => return Err(error),
     };
+    resolve_package_tool_grant_from_lock(&lock, ir, name)
+}
+
+fn resolve_package_tool_grant_from_lock(
+    lock: &LoadedPackageLock,
+    ir: &IrProgram,
+    name: &str,
+) -> Result<Option<ResolvedToolGrant>, String> {
     // A grant resolves only against a package the program actually `use`s: the
     // lock is the dependency set, but `use` is the explicit import. This keeps the
     // invoke-tool graph's edges tied to declared dependencies.
@@ -42909,9 +42918,15 @@ fn resolve_package_tool_grant(
             .workflow_tools
             .iter()
             .find(|tool| tool.name == name)
-            .map(|tool| (manifest.package_id.clone(), tool.source.clone()))
+            .map(|tool| {
+                (
+                    manifest.package_id.clone(),
+                    tool.source.clone(),
+                    tool.attested_source.clone(),
+                )
+            })
     });
-    let Some((package_id, source)) = resolved else {
+    let Some((package_id, source, attested_source)) = resolved else {
         // A clearer message when the tool exists but its package is not `use`d.
         if let Some(manifest) = lock
             .manifests
@@ -42923,22 +42938,24 @@ fn resolve_package_tool_grant(
                 manifest.name, manifest.name
             ));
         }
-        return Err(String::new());
+        return Ok(None);
     };
-    let (_, tool_ir) =
-        compile_source_path_with_root(source.to_str().unwrap_or_default(), Some(name)).map_err(
-            |error| {
-                format!(
-                    "package tool `{name}` failed to compile: {}",
-                    child_compile_error(name, error)
-                )
-            },
-        )?;
-    Ok(ResolvedToolGrant {
+    let attested_source = match attested_source {
+        Some(source) => source,
+        None => {
+            return Err(format!(
+                "package tool `{name}` has no attested source bundle"
+            ))
+        }
+    };
+    let tool_ir = compile_program_with_root_cached(&attested_source, Some(name))
+        .ir
+        .ok_or_else(|| format!("package tool `{name}` failed to compile its attested source"))?;
+    Ok(Some(ResolvedToolGrant {
         tool_ir,
         source_path: source,
         package_id,
-    })
+    }))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

@@ -87,7 +87,15 @@ pub struct FlowingTargetEffect {
     pub path: String,
     pub before: Option<String>,
     pub after: Option<String>,
-    pub already_equivalent: bool,
+    pub disposition: FlowingEffectDisposition,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FlowingEffectDisposition {
+    Applied,
+    Equivalent,
+    Neutralized,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -136,7 +144,7 @@ pub enum FlowingTargetEffectsOutcome {
     TargetCutMismatch,
     MissingManifest { cut_id: String },
     MissingContent { content_id: String },
-    RepeatedSourcePath { path: String },
+    IncoherentSourcePath { path: String },
     BeforeMismatch { path: String },
     OmittedEffect { path: String },
     UnexpectedEffect { path: String },
@@ -198,9 +206,11 @@ impl<B: Branches + FlowingSources, C: ContentBlobs> WorkspaceVcs<B, C> {
             .publish_retained(&ids, || branches.handoff_contribution(request))
     }
 
-    /// Check that the target cut contains exactly one bound unit's path
-    /// effects. Multiple source writes to the same path and mixed target
-    /// output stay unsupported until their constituent lineage is recorded.
+    /// Check that the target cut contains exactly one bound unit's net path
+    /// effects. Consecutive source writes to one path compose in ancestry
+    /// order; a selection that skips an intermediate write refuses. Mixed
+    /// target output stays unsupported until its constituent lineage is
+    /// recorded.
     /// No caller may treat `Verified` as a handoff receipt.
     pub fn verify_private_target_effects(
         &self,
@@ -260,12 +270,20 @@ impl<B: Branches + FlowingSources, C: ContentBlobs> WorkspaceVcs<B, C> {
                 cut_id: target_cut.cut_id,
             });
         };
-        let mut selected = BTreeMap::new();
+        let mut selected: BTreeMap<&str, (Option<&str>, Option<&str>)> = BTreeMap::new();
         for atom in &basis.atoms {
-            if selected.insert(atom.path.as_str(), atom).is_some() {
-                return Ok(FlowingTargetEffectsOutcome::RepeatedSourcePath {
-                    path: atom.path.clone(),
-                });
+            if let Some((_, previous_after)) = selected.get_mut(atom.path.as_str()) {
+                if *previous_after != atom.before.as_deref() {
+                    return Ok(FlowingTargetEffectsOutcome::IncoherentSourcePath {
+                        path: atom.path.clone(),
+                    });
+                }
+                *previous_after = atom.after.as_deref();
+            } else {
+                selected.insert(
+                    atom.path.as_str(),
+                    (atom.before.as_deref(), atom.after.as_deref()),
+                );
             }
             for content_id in [atom.before.as_deref(), atom.after.as_deref()]
                 .into_iter()
@@ -279,17 +297,15 @@ impl<B: Branches + FlowingSources, C: ContentBlobs> WorkspaceVcs<B, C> {
             }
         }
         let mut effects = Vec::new();
-        for (path, atom) in &selected {
+        for (path, (expected_before, expected_after)) in &selected {
             let old = self.manifest_entry(before_manifest_hash.as_deref(), path)?;
             let new = self.manifest_entry(Some(&target_cut.manifest_hash), path)?;
-            let expected_before = atom.before.as_ref();
-            let expected_after = atom.after.as_ref();
-            if old.as_ref() != expected_before && old.as_ref() != expected_after {
+            if old.as_deref() != *expected_before && old.as_deref() != *expected_after {
                 return Ok(FlowingTargetEffectsOutcome::BeforeMismatch {
                     path: (*path).to_owned(),
                 });
             }
-            if new.as_ref() != expected_after {
+            if new.as_deref() != *expected_after {
                 return Ok(FlowingTargetEffectsOutcome::OmittedEffect {
                     path: (*path).to_owned(),
                 });
@@ -298,7 +314,13 @@ impl<B: Branches + FlowingSources, C: ContentBlobs> WorkspaceVcs<B, C> {
                 path: (*path).to_owned(),
                 before: old.clone(),
                 after: new,
-                already_equivalent: old.as_ref() == expected_after,
+                disposition: if expected_before == expected_after {
+                    FlowingEffectDisposition::Neutralized
+                } else if old.as_deref() == *expected_after {
+                    FlowingEffectDisposition::Equivalent
+                } else {
+                    FlowingEffectDisposition::Applied
+                },
             });
         }
         // Tree-to-tree comparisons skip shared subtrees. Flat legacy roots
@@ -725,7 +747,10 @@ mod tests {
         assert_eq!(witness.target_branch_id, "branch");
         assert_eq!(witness.effects.len(), 1);
         assert_eq!(witness.effects[0].path, "a.txt");
-        assert!(!witness.effects[0].already_equivalent);
+        assert_eq!(
+            witness.effects[0].disposition,
+            FlowingEffectDisposition::Applied
+        );
         assert_eq!(
             vcs.verify_private_target_effects("missing", "branch-a")
                 .unwrap(),
@@ -768,7 +793,10 @@ mod tests {
         else {
             panic!("same content is equivalent")
         };
-        assert!(witness.effects[0].already_equivalent);
+        assert_eq!(
+            witness.effects[0].disposition,
+            FlowingEffectDisposition::Equivalent
+        );
         assert!(vcs
             .branches
             .contribution_declaration("unit-a")
@@ -816,7 +844,7 @@ mod tests {
     }
 
     #[test]
-    fn target_effect_comparison_refuses_unrelated_before_and_repeated_source_path() {
+    fn target_effect_comparison_refuses_unrelated_before_and_composes_source_path() {
         let mut vcs = bound_unit();
         vcs.write("branch", "a.txt", Some("other"), "branch-other", "t4")
             .unwrap();
@@ -861,14 +889,124 @@ mod tests {
         repeated_vcs
             .write("branch", "a.txt", Some("B"), "branch-b", "t5")
             .unwrap();
+        let FlowingTargetEffectsOutcome::Verified(effects) = repeated_vcs
+            .verify_private_target_effects("unit-b", "branch-b")
+            .unwrap()
+        else {
+            panic!("consecutive writes must compose");
+        };
+        assert_eq!(effects.effects.len(), 1);
+        assert_eq!(effects.effects[0].path, "a.txt");
+        assert_eq!(effects.effects[0].before, None);
         assert_eq!(
-            repeated_vcs
-                .verify_private_target_effects("unit-b", "branch-b")
+            effects.effects[0].disposition,
+            FlowingEffectDisposition::Applied
+        );
+        assert_eq!(
+            effects.effects[0].after,
+            Some(repeated_vcs.content.put_text("B").unwrap())
+        );
+    }
+
+    #[test]
+    fn target_effect_comparison_refuses_a_skipped_intermediate_source_write() {
+        let mut vcs = workspace();
+        vcs.init("t0").unwrap();
+        vcs.create_branch("branch", None, MAINLINE_BRANCH_ID, "t1")
+            .unwrap();
+        vcs.create_branch("twig", None, "branch", "t1").unwrap();
+        for (body, cut, time) in [
+            ("A", "twig-a", "t2"),
+            ("B", "twig-b", "t3"),
+            ("C", "twig-c", "t4"),
+        ] {
+            vcs.write("twig", "a.txt", Some(body), cut, time).unwrap();
+        }
+        pin(&mut vcs, "twig-c", "pin-c");
+        declare(&mut vcs, "unit-c", "pin-c");
+        let FlowingSelectionOutcome::Selected(skipped) = vcs
+            .select_private_changes(
+                "pin-c",
+                &selection::parse("change(twig-a) | change(twig-c)").unwrap(),
+            )
+            .unwrap()
+        else {
+            panic!("source selection");
+        };
+        assert_eq!(skipped.changes().len(), 2);
+        assert_eq!(
+            vcs.bind_private_selection("unit-c", &skipped, "t5")
                 .unwrap(),
-            FlowingTargetEffectsOutcome::RepeatedSourcePath {
+            BindContributionBasisOutcome::Bound
+        );
+        vcs.write("branch", "a.txt", Some("C"), "branch-c", "t6")
+            .unwrap();
+        assert_eq!(
+            vcs.verify_private_target_effects("unit-c", "branch-c")
+                .unwrap(),
+            FlowingTargetEffectsOutcome::IncoherentSourcePath {
                 path: "a.txt".into(),
             }
         );
+    }
+
+    #[test]
+    fn target_effect_comparison_records_a_neutralized_undo() {
+        let mut vcs = workspace();
+        vcs.init("t0").unwrap();
+        vcs.create_branch("branch", None, MAINLINE_BRANCH_ID, "t1")
+            .unwrap();
+        vcs.create_branch("twig", None, "branch", "t1").unwrap();
+        vcs.write("twig", "a.txt", Some("A"), "twig-a", "t2")
+            .unwrap();
+        vcs.write("twig", "a.txt", None, "twig-undo", "t3").unwrap();
+        pin(&mut vcs, "twig-undo", "pin-undo");
+        declare(&mut vcs, "unit-undo", "pin-undo");
+        let FlowingSelectionOutcome::Selected(selection) = vcs
+            .select_private_changes("pin-undo", &selection::parse("path(a.txt)").unwrap())
+            .unwrap()
+        else {
+            panic!("select the write and undo");
+        };
+        assert_eq!(selection.changes().len(), 2);
+        assert_eq!(
+            vcs.bind_private_selection("unit-undo", &selection, "t4")
+                .unwrap(),
+            BindContributionBasisOutcome::Bound
+        );
+        let empty_hash = vcs.store_manifest(&BTreeMap::new()).unwrap();
+        vcs.branches
+            .record_cut(CutRecord {
+                cut_id: "target-undo",
+                change_id: "net-neutral",
+                branch_id: "branch",
+                manifest_hash: &empty_hash,
+                parent_cut_id: None,
+                origin: Some("transport:twig"),
+                actor: Some("mediator"),
+                intent: None,
+                recorded_at: "t5",
+            })
+            .unwrap();
+        let FlowingTargetEffectsOutcome::Verified(witness) = vcs
+            .verify_private_target_effects("unit-undo", "target-undo")
+            .unwrap()
+        else {
+            panic!("neutralized source unit must still be witnessed");
+        };
+        assert_eq!(witness.effects().len(), 1);
+        assert_eq!(
+            witness.effects()[0].disposition,
+            FlowingEffectDisposition::Neutralized
+        );
+        assert!(serde_json::to_string(&witness.effects()[0])
+            .unwrap()
+            .contains(r#""disposition":"neutralized""#));
+        assert!(matches!(
+            vcs.handoff_private_selection("op-undo", &witness, "mediator", "t6")
+                .unwrap(),
+            HandoffContributionOutcome::Transferred(_)
+        ));
     }
 
     #[test]
