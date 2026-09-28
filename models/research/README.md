@@ -220,22 +220,26 @@ external settlement obligation are separate transitions.
 python3 models/research/contribution_lifecycle.py
 ```
 
-The correct variant explores 8,752 states through twelve steps without violating
+The correct variant explores 11,105 states through twelve steps without violating
 its conservation, dependency, fence, or closure checks. Explicit scenarios
 exercise cancellation followed by resubmission, revision of a passed and a
 failed attempt, dependent rebase, recovery after CAS, parking of an in-flight
-twig, and transfer of an unsettled external act. Six defective variants each
+twig and an empty member twig, and transfer of an unsettled external act.
+Seven defective variants each
 reach a forbidden history: cancellation drops the selected unit, a dependent
 lands without its predecessor, an old candidate lands after revision, a
 dependent lands on a stale basis, closure acknowledges before the ref is
-disabled, or closure drops the continuing owner of an external act.
+disabled, closure drops the continuing owner of an external act, or closure
+leaves a member twig active.
 
 This is a state-shape probe, not a proof of the full lifecycle. A repair is
 collapsed to a new version of `u0`; the model has no actual content merge,
 cut-rewrite lineage, semantic dependency discovery, equivalence/no-op
 accounting receipt, independently failing topology/ref stores, or release
 gate. `parked` stands for a durable named holder without modeling its pin or
-receipt. It assumes that revision and cancellation fence the ref in one
+receipt. Member parking is separate from contribution parking; even an empty
+member must park before close is acknowledged. The probe assumes that revision
+and cancellation fence the ref in one
 atomic transition and that the trunk CAS durably records its source units.
 The real host contracts and merge engine must supply those facts or refuse
 the operation. The [research note](../../spec/branch-trunk-gate-research-note.md)

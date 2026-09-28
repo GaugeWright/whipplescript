@@ -2,9 +2,10 @@
 
 Run: python3 models/research/contribution_lifecycle.py
 
-This abstracts one branch, two contributions (u1 depends on u0), one revision,
-one Hold, gate attempts, crash/recovery, and closure. It does not model cuts or
-the physical ref/ledger stores. See models/research/README.md for limits.
+This abstracts one branch with two member twigs (one can be empty), two
+contributions (u1 depends on u0), one revision, one Hold, gate attempts,
+crash/recovery, and closure. It does not model cuts or the physical ref/ledger
+stores. See models/research/README.md for limits.
 """
 
 from collections import deque
@@ -41,6 +42,7 @@ class Admission:
 @dataclass(frozen=True)
 class State:
     holders: tuple[str, str] = ("none", "none")
+    member_twigs: tuple[str, str] = ("active", "active")
     ever_written: tuple[bool, bool] = (False, False)
     version0: int = 0
     basis1: int = 0
@@ -68,6 +70,12 @@ def written_at(s: State, unit: int) -> State:
     written = list(s.ever_written)
     written[unit] = True
     return replace(s, ever_written=tuple(written))
+
+
+def member_at(s: State, member: int, status: str) -> State:
+    members = list(s.member_twigs)
+    members[member] = status
+    return replace(s, member_twigs=tuple(members))
 
 
 def accounted(s: State) -> tuple[int, ...]:
@@ -223,9 +231,16 @@ def steps(s: State, defect: str = ""):
     if s.close == "closing" and not s.ref_enabled:
         admitted = {i for entry in s.admissions for i in entry.selected}
         for i in (0, 1):
-            if s.holders[i] in ("twig", "twig_ready", "branch", "revising") and i not in admitted:
+            if s.member_twigs[i] == "active":
+                parked = member_at(s, i, "parked")
+                if s.holders[i] in ("twig", "twig_ready"):
+                    parked = unit_at(parked, i, "parked")
+                yield f"park member {i}", parked
+            if s.holders[i] in ("branch", "revising") and i not in admitted:
                 yield f"park u{i}", unit_at(s, i, "parked")
-        if (all(h in ("none", "accounted", "parked") for h in s.holders)
+        if ((all(member == "parked" for member in s.member_twigs)
+             or defect == "skip_member_parking")
+                and all(h in ("none", "accounted", "parked") for h in s.holders)
                 and attempt is None and
                 (s.external != "branch" or defect == "drop_external_on_close")):
             yield "ack close", replace(s, close="closed")
@@ -258,6 +273,7 @@ def violation(s: State) -> str | None:
         prior.update(entry.selected)
     if s.close == "closed" and (
         s.ref_enabled or s.attempt is not None or
+        any(member != "parked" for member in s.member_twigs) or
         any(h not in ("none", "accounted", "parked") for h in s.holders) or
         s.external == "branch"
     ):
@@ -310,15 +326,17 @@ def main():
         ("write u0", "ready u0", "share u0", "submit (0,)",
          "gate passed", "commit", "crash", "restart", "finish accounting"),
         ("write u0", "ready u0", "share u0", "write u1",
-         "request close", "disable admission", "park u0", "park u1",
-         "ack close"),
+         "request close", "disable admission", "park u0",
+         "park member 0", "park member 1", "ack close"),
         ("write u0", "ready u0", "share u0", "submit (0,)",
          "gate passed", "commit", "finish accounting",
          "request external settlement", "request close", "disable admission",
-         "transfer external settlement", "ack close"),
+         "transfer external settlement", "park member 0", "park member 1",
+         "ack close"),
         ("write u0", "ready u0", "share u0", "submit (0,)",
          "gate passed", "commit", "finish accounting", "request close",
-         "disable admission", "ack close", "request external settlement"),
+         "disable admission", "park member 0", "park member 1",
+         "ack close", "request external settlement"),
     )
     for events in scenarios:
         scenario(events)
@@ -332,8 +350,9 @@ def main():
     for defect in (
         "drop_on_cancel", "skip_dependency", "trust_stale_revision",
         "skip_rebase", "close_before_disable", "drop_external_on_close",
+        "skip_member_parking",
     ):
-        states, path, error = explore(defect, depth=12)
+        states, path, error = explore(defect, depth=15)
         assert error, (defect, states)
         print(f"  {defect}: {error} via {' -> '.join(path)}")
 
