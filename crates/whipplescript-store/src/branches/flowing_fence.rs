@@ -7,11 +7,11 @@
 //! revision fence before acknowledging a changed selected unit.
 
 #[cfg(feature = "native")]
-mod native;
+pub(crate) mod native;
 
 use serde::{Deserialize, Serialize};
 
-use crate::StoreResult;
+use crate::{StoreError, StoreResult};
 
 pub const SCHEMA: [&str; 2] = [
     "CREATE TABLE IF NOT EXISTS flowing_source_fences (
@@ -155,6 +155,63 @@ pub trait FlowingFence {
         request: &FlowingFenceTransition,
     ) -> StoreResult<FlowingFenceOutcome>;
     fn flowing_fence_receipt(&self, op_id: &str) -> StoreResult<Option<FlowingFenceReceipt>>;
+}
+
+/// A flowing source may grow a new tail without invalidating a selected
+/// immutable prefix. A ref move with another ancestry needs the revision
+/// fence taken before the move; an unrecorded cut proves neither case.
+#[doc(hidden)]
+pub fn require_head_move(
+    state: &FlowingFenceState,
+    before_cut_id: Option<&str>,
+    after_cut_id: &str,
+    manifest_hash: &str,
+    cut: Option<&crate::branches::CutRow>,
+) -> StoreResult<()> {
+    if !state.admission_enabled {
+        return Err(StoreError::Conflict(format!(
+            "flowing source `{}` no longer accepts head moves",
+            state.source_branch_id
+        )));
+    }
+    let Some(cut) = cut else {
+        return Err(StoreError::Conflict(format!(
+            "flowing source `{}` needs a recorded cut before its head moves",
+            state.source_branch_id
+        )));
+    };
+    if cut.cut_id != after_cut_id
+        || cut.branch_id != state.source_branch_id
+        || cut.manifest_hash != manifest_hash
+    {
+        return Err(StoreError::Conflict(format!(
+            "flowing source `{}` cut differs from the proposed head",
+            state.source_branch_id
+        )));
+    }
+    if let Some(revision) = state.revision.as_ref() {
+        if revision.before_cut_id.as_deref() != before_cut_id
+            || revision.after_cut_id != after_cut_id
+        {
+            return Err(StoreError::Conflict(format!(
+                "flowing source `{}` head move differs from its pending revision",
+                state.source_branch_id
+            )));
+        }
+    } else if cut.parent_cut_id.as_deref() != before_cut_id {
+        return Err(StoreError::Conflict(format!(
+            "flowing source `{}` rewrite needs a revision fence",
+            state.source_branch_id
+        )));
+    }
+    Ok(())
+}
+
+#[doc(hidden)]
+pub fn refuse_legacy_shape_move(source_branch_id: &str) -> StoreError {
+    StoreError::Conflict(format!(
+        "flowing source `{source_branch_id}` needs a controlled lifecycle move"
+    ))
 }
 
 pub fn missing_open_field(request: &OpenFlowingSource) -> Option<&'static str> {

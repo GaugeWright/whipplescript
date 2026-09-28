@@ -11,7 +11,10 @@ use whipplescript_store::StoreResult;
 
 type FenceOutcome = FlowingFenceOutcome;
 
-fn read_state<S: DoSql>(sql: &S, source: &str) -> StoreResult<Option<FlowingFenceState>> {
+pub(super) fn read_state<S: DoSql>(
+    sql: &S,
+    source: &str,
+) -> StoreResult<Option<FlowingFenceState>> {
     sql.query(
         "SELECT state_json FROM flowing_source_fences WHERE source_branch_id = ?1",
         &[text(source)],
@@ -215,7 +218,9 @@ mod tests {
     use crate::do_store::test_support::RusqliteDoSql;
     use std::rc::Rc;
     use whipplescript_store::branches::flowing_fence::FlowingFenceAction;
-    use whipplescript_store::branches::{BranchStore, Branches, CreateBranch};
+    use whipplescript_store::branches::{
+        AdvanceOutcome, BranchStore, Branches, CreateBranch, CutRecord, OpBranchState,
+    };
 
     fn exercise<B: Branches + FlowingFence>(mut store: B) -> Vec<FlowingFenceOutcome> {
         store.ensure_mainline("t0").unwrap();
@@ -314,6 +319,19 @@ mod tests {
         };
         outcomes.push(store.transition_flowing_source(&finish).unwrap());
         store
+            .record_cut(CutRecord {
+                cut_id: "c1",
+                change_id: "c1",
+                branch_id: "branch",
+                manifest_hash: "manifest-1",
+                parent_cut_id: None,
+                origin: Some("revision"),
+                actor: Some("mediator"),
+                intent: None,
+                recorded_at: "t3",
+            })
+            .unwrap();
+        store
             .advance_head("branch", None, "c1", "manifest-1", "t3")
             .unwrap();
         outcomes.push(store.transition_flowing_source(&finish).unwrap());
@@ -335,9 +353,9 @@ mod tests {
         );
     }
 
-    fn open_after_parent_discard<B: Branches + FlowingFence>(
-        mut store: B,
-    ) -> OpenFlowingSourceOutcome {
+    fn open_after_parent_discard() -> OpenFlowingSourceOutcome {
+        let sql = Rc::new(RusqliteDoSql::with_runtime_schema());
+        let mut store = DoBranches::new(Rc::clone(&sql)).unwrap();
         store.ensure_mainline("t0").unwrap();
         store
             .create_branch(CreateBranch {
@@ -371,7 +389,12 @@ mod tests {
                 idempotency_key: None,
             })
             .unwrap();
-        store.discard_branch("branch", "t4").unwrap();
+        // Simulate an older writer bypassing the new terminal guard.
+        sql.execute(
+            "UPDATE branches SET status = 'discarded' WHERE branch_id = 'branch'",
+            &[],
+        )
+        .unwrap();
         let result = store
             .open_flowing_source(&OpenFlowingSource {
                 source_branch_id: "twig".into(),
@@ -386,16 +409,185 @@ mod tests {
     }
 
     #[test]
-    fn inactive_parent_cannot_open_a_member_twig_in_either_store() {
+    fn hosted_inactive_parent_cannot_open_a_member_twig() {
         assert_eq!(
-            open_after_parent_discard(BranchStore::open(":memory:").unwrap()),
+            open_after_parent_discard(),
             OpenFlowingSourceOutcome::InvalidKindParent
         );
+    }
+
+    fn cut<'a>(id: &'a str, parent: Option<&'a str>, manifest: &'a str) -> CutRecord<'a> {
+        CutRecord {
+            cut_id: id,
+            change_id: id,
+            branch_id: "branch",
+            manifest_hash: manifest,
+            parent_cut_id: parent,
+            origin: Some("write:note.txt"),
+            actor: Some("human:fixture"),
+            intent: Some("fixture"),
+            recorded_at: "t3",
+        }
+    }
+
+    fn exercise_source_mutation_boundary<B: Branches + FlowingFence>(mut store: B) {
+        store.ensure_mainline("t0").unwrap();
+        store
+            .create_branch(CreateBranch {
+                branch_id: "branch",
+                name: Some("feature"),
+                parent_branch_id: MAINLINE_BRANCH_ID,
+                at_cut: None,
+                created_at: "t1",
+                idempotency_key: None,
+            })
+            .unwrap();
+        store
+            .open_flowing_source(&OpenFlowingSource {
+                source_branch_id: "branch".into(),
+                incarnation_id: "inc-1".into(),
+                kind: FlowingSourceKind::Branch,
+                owner: "coordinator".into(),
+                opened_at: "t2".into(),
+            })
+            .unwrap();
+
+        assert!(store
+            .advance_head("branch", None, "unrecorded", "m1", "t3")
+            .is_err());
+        assert!(store
+            .get_branch("branch")
+            .unwrap()
+            .unwrap()
+            .head_cut_id
+            .is_none());
+        store.record_cut(cut("a", None, "m1")).unwrap();
+        assert!(matches!(
+            store.advance_head("branch", None, "a", "m1", "t3").unwrap(),
+            AdvanceOutcome::Advanced(_)
+        ));
+        assert!(matches!(
+            store.commit_write(cut("b", Some("a"), "m2")).unwrap(),
+            AdvanceOutcome::Advanced(_)
+        ));
         assert_eq!(
-            open_after_parent_discard(
-                DoBranches::new(Rc::new(RusqliteDoSql::with_runtime_schema())).unwrap()
-            ),
-            OpenFlowingSourceOutcome::InvalidKindParent
+            store
+                .flowing_source("branch")
+                .unwrap()
+                .unwrap()
+                .eligibility_epoch,
+            0
+        );
+
+        store.record_cut(cut("next", Some("b"), "m-next")).unwrap();
+        assert!(store
+            .advance_head("branch", Some("b"), "next", "substituted", "t4")
+            .is_err());
+
+        store.record_cut(cut("rewrite", None, "m3")).unwrap();
+        assert!(store
+            .advance_head("branch", Some("b"), "rewrite", "m3", "t4")
+            .is_err());
+        assert_eq!(
+            store
+                .get_branch("branch")
+                .unwrap()
+                .unwrap()
+                .head_cut_id
+                .as_deref(),
+            Some("b")
+        );
+        let state = store.flowing_source("branch").unwrap().unwrap();
+        let begin = FlowingFenceTransition {
+            op_id: "begin-rewrite".into(),
+            source_branch_id: "branch".into(),
+            incarnation_id: "inc-1".into(),
+            expected_eligibility_epoch: state.eligibility_epoch,
+            expected_owner_epoch: state.owner_epoch,
+            actor: "coordinator".into(),
+            action: FlowingFenceAction::BeginRevision {
+                before_cut_id: Some("b".into()),
+                after_cut_id: "rewrite".into(),
+            },
+            recorded_at: "t4".into(),
+        };
+        assert!(matches!(
+            store.transition_flowing_source(&begin).unwrap(),
+            FlowingFenceOutcome::Applied(_)
+        ));
+        store.record_cut(cut("other", Some("b"), "m4")).unwrap();
+        assert!(store
+            .advance_head("branch", Some("b"), "other", "m4", "t4")
+            .is_err());
+        assert!(store
+            .commit_write(cut("pending-write", Some("b"), "m-pending"))
+            .is_err());
+        assert!(store.get_cut("pending-write").unwrap().is_none());
+        assert!(store.get_op("op-pending-write").unwrap().is_none());
+        assert!(matches!(
+            store
+                .advance_head("branch", Some("b"), "rewrite", "m3", "t4")
+                .unwrap(),
+            AdvanceOutcome::Advanced(_)
+        ));
+
+        store
+            .create_branch(CreateBranch {
+                branch_id: "other-parent",
+                name: Some("other"),
+                parent_branch_id: MAINLINE_BRANCH_ID,
+                at_cut: None,
+                created_at: "t5",
+                idempotency_key: None,
+            })
+            .unwrap();
+        assert!(store
+            .retarget_branch("branch", "other-parent", "t5")
+            .is_err());
+        assert!(store
+            .rebase_branch("branch", Some("rewrite"), "p", "mp", "r", "mr", "t5")
+            .is_err());
+        let before = store.get_branch("branch").unwrap().unwrap();
+        assert!(store
+            .restore_branch_state("branch", Some("rewrite"), &OpBranchState::of(&before), "t5")
+            .is_err());
+        assert!(store.discard_branch("branch", "t5").is_err());
+        assert!(store.adopt_branch("branch", "merge", "t5").is_err());
+        assert_eq!(store.get_branch("branch").unwrap(), Some(before));
+
+        let state = store.flowing_source("branch").unwrap().unwrap();
+        let finish = FlowingFenceTransition {
+            op_id: "finish-rewrite".into(),
+            source_branch_id: "branch".into(),
+            incarnation_id: "inc-1".into(),
+            expected_eligibility_epoch: state.eligibility_epoch,
+            expected_owner_epoch: state.owner_epoch,
+            actor: "coordinator".into(),
+            action: FlowingFenceAction::FinishRevision {
+                begin_op_id: "begin-rewrite".into(),
+            },
+            recorded_at: "t6".into(),
+        };
+        assert!(matches!(
+            store.transition_flowing_source(&finish).unwrap(),
+            FlowingFenceOutcome::Applied(_)
+        ));
+        assert_eq!(
+            store
+                .flowing_source("branch")
+                .unwrap()
+                .unwrap()
+                .eligibility_epoch,
+            2
+        );
+        assert!(store.discard_branch("branch", "t7").is_err());
+    }
+
+    #[test]
+    fn flowing_source_head_and_shape_mutations_have_native_hosted_parity() {
+        exercise_source_mutation_boundary(BranchStore::open(":memory:").unwrap());
+        exercise_source_mutation_boundary(
+            DoBranches::new(Rc::new(RusqliteDoSql::with_runtime_schema())).unwrap(),
         );
     }
 
@@ -493,7 +685,11 @@ mod tests {
             store.transition_flowing_source(&no_state).unwrap(),
             FlowingFenceOutcome::Refused(FlowingFenceRefusal::Missing)
         );
-        store.discard_branch("branch", "t3").unwrap();
+        sql.execute(
+            "UPDATE branches SET status = 'discarded' WHERE branch_id = 'branch'",
+            &[],
+        )
+        .unwrap();
         assert_eq!(
             store.transition_flowing_source(&request).unwrap(),
             FlowingFenceOutcome::Refused(FlowingFenceRefusal::BranchNotActive)

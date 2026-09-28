@@ -290,6 +290,7 @@ pub enum HandoffContributionOutcome {
     TrunkRequiresGate,
     TargetReserved { holder: String },
     TargetStale { current_head_cut_id: Option<String> },
+    TargetFenceRefused,
     TargetCutMissing,
     TargetCutMismatch,
     TargetCutAuthorshipMismatch,

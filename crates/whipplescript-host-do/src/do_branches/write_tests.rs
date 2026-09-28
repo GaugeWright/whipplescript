@@ -71,8 +71,8 @@ fn hosted_retained_publication_rolls_back_every_sql_boundary() {
     }
     assert!(completed);
     assert_eq!(
-        refused, 8,
-        "two availability reads and all six branch publication statements"
+        refused, 9,
+        "two availability reads, the source-fence read, and six branch publication statements"
     );
 }
 
@@ -170,8 +170,8 @@ fn hosted_write_commit_rolls_back_every_sql_boundary() {
     }
     assert!(reached_success);
     assert_eq!(
-        refused, 5,
-        "both reads and all three mutations must be exercised"
+        refused, 6,
+        "the branch, reservation and source-fence reads and all three mutations must be exercised"
     );
 }
 
@@ -233,8 +233,8 @@ fn hosted_write_evidence_rolls_back_every_sql_boundary() {
     }
     assert!(reached_success);
     assert_eq!(
-        refused, 6,
-        "two reads and all four writes must be exercised"
+        refused, 7,
+        "three reads and all four writes must be exercised"
     );
 }
 

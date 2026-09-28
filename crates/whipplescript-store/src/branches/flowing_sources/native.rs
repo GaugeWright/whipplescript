@@ -466,28 +466,7 @@ impl FlowingSources for BranchStore {
                 current_head_cut_id: target.head_cut_id,
             });
         }
-        struct TargetCutProvenance {
-            branch_id: String,
-            manifest_hash: String,
-            parent_cut_id: Option<String>,
-            origin: Option<String>,
-            actor: Option<String>,
-        }
-        let target_cut: Option<TargetCutProvenance> = tx
-            .query_row(
-                "SELECT branch_id, manifest_hash, parent_cut_id, origin, actor FROM cuts WHERE cut_id = ?1",
-                params![witness.target_after_cut_id()],
-                |row| {
-                    Ok(TargetCutProvenance {
-                        branch_id: row.get(0)?,
-                        manifest_hash: row.get(1)?,
-                        parent_cut_id: row.get(2)?,
-                        origin: row.get(3)?,
-                        actor: row.get(4)?,
-                    })
-                },
-            )
-            .optional()?;
+        let target_cut = BranchStore::cut_by_id(&tx, witness.target_after_cut_id())?;
         let Some(target_cut) = target_cut else {
             return Ok(HandoffContributionOutcome::TargetCutMissing);
         };
@@ -502,6 +481,21 @@ impl FlowingSources for BranchStore {
             || target_cut.actor.as_deref() != Some(request.actor)
         {
             return Ok(HandoffContributionOutcome::TargetCutAuthorshipMismatch);
+        }
+        if let Some(state) =
+            crate::branches::flowing_fence::native::read_state(&tx, witness.target_branch_id())?
+        {
+            if crate::branches::flowing_fence::require_head_move(
+                &state,
+                witness.target_before_cut_id(),
+                witness.target_after_cut_id(),
+                witness.target_after_manifest_hash(),
+                Some(&target_cut),
+            )
+            .is_err()
+            {
+                return Ok(HandoffContributionOutcome::TargetFenceRefused);
+            }
         }
         let receipt = HandoffReceipt {
             op_id: request.op_id.to_owned(),

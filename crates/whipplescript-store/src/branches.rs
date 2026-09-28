@@ -841,6 +841,16 @@ impl BranchStore {
                 current_head_cut_id: row.head_cut_id,
             });
         }
+        if let Some(state) = flowing_fence::native::read_state(&tx, branch_id)? {
+            let cut = Self::cut_by_id(&tx, cut_id)?;
+            flowing_fence::require_head_move(
+                &state,
+                expected_head_cut_id,
+                cut_id,
+                manifest_hash,
+                cut.as_ref(),
+            )?;
+        }
         tx.execute(
             "UPDATE branches SET head_cut_id = ?2, head_manifest_hash = ?3, \
              updated_at = ?4 WHERE branch_id = ?1",
@@ -862,6 +872,24 @@ impl BranchStore {
             .query_row(params![branch_id], map_branch_row)
             .optional()?;
         Ok(row)
+    }
+
+    fn cut_by_id(connection: &Connection, cut_id: &str) -> StoreResult<Option<CutRow>> {
+        Ok(connection
+            .prepare_cached(
+                "SELECT cut_id, change_id, branch_id, manifest_hash, \
+                 parent_cut_id, origin, actor, intent, recorded_at \
+                 FROM cuts WHERE cut_id = ?1",
+            )?
+            .query_row(params![cut_id], map_cut_row)
+            .optional()?)
+    }
+
+    fn require_legacy_shape_move(connection: &Connection, branch_id: &str) -> StoreResult<()> {
+        if flowing_fence::native::read_state(connection, branch_id)?.is_some() {
+            return Err(flowing_fence::refuse_legacy_shape_move(branch_id));
+        }
+        Ok(())
     }
 
     /// Every content id the branch plane can still name: cut manifests
@@ -1358,6 +1386,7 @@ impl Branches for BranchStore {
         if row.status != BranchStatus::Active {
             return Ok(RetargetOutcome::BranchNotActive { status: row.status });
         }
+        Self::require_legacy_shape_move(&tx, branch_id)?;
         let Some(parent) = Self::row_by_id(&tx, new_parent_branch_id)? else {
             return Ok(RetargetOutcome::ParentMissing);
         };
@@ -1532,6 +1561,7 @@ impl Branches for BranchStore {
                 current_head_cut_id: row.head_cut_id,
             });
         }
+        Self::require_legacy_shape_move(&tx, branch_id)?;
         tx.execute(
             "UPDATE branches SET branch_point_cut_id = ?2, \
              branch_point_manifest_hash = ?3, head_cut_id = ?4, \
@@ -1862,16 +1892,7 @@ impl Branches for BranchStore {
     }
 
     fn get_cut(&self, cut_id: &str) -> StoreResult<Option<CutRow>> {
-        let row = self
-            .connection
-            .prepare_cached(
-                "SELECT cut_id, change_id, branch_id, manifest_hash, \
-                 parent_cut_id, origin, actor, intent, recorded_at \
-                 FROM cuts WHERE cut_id = ?1",
-            )?
-            .query_row(params![cut_id], map_cut_row)
-            .optional()?;
-        Ok(row)
+        Self::cut_by_id(&self.connection, cut_id)
     }
 
     fn list_cuts(&self, branch_id: &str, limit: usize) -> StoreResult<Vec<CutRow>> {
@@ -1918,6 +1939,7 @@ impl Branches for BranchStore {
                 current_head_cut_id: row.head_cut_id,
             });
         }
+        Self::require_legacy_shape_move(&tx, branch_id)?;
         tx.execute(
             "UPDATE branches SET head_cut_id = ?2, head_manifest_hash = ?3, \
              branch_point_cut_id = ?4, branch_point_manifest_hash = ?5, \
@@ -2113,6 +2135,7 @@ impl Branches for BranchStore {
         if row.status != BranchStatus::Active {
             return Ok(StatusOutcome::InvalidTransition { from: row.status });
         }
+        Self::require_legacy_shape_move(&tx, branch_id)?;
         tx.execute(
             "UPDATE branches SET status = 'discarded', updated_at = ?2 \
              WHERE branch_id = ?1",
@@ -2138,6 +2161,7 @@ impl Branches for BranchStore {
         if row.status != BranchStatus::Active {
             return Ok(StatusOutcome::InvalidTransition { from: row.status });
         }
+        Self::require_legacy_shape_move(&tx, branch_id)?;
         tx.execute(
             "UPDATE branches SET status = 'adopted', adopted_merge_cut_id = ?2, \
              updated_at = ?3 WHERE branch_id = ?1",

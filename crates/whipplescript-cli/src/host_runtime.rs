@@ -8,6 +8,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use std::fs;
+use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
@@ -716,18 +717,78 @@ impl NativeWorkspaceResolver {
         Ok(self.cap(names.join("\n")))
     }
 
-    fn find(&self, arguments: &Value, scopes: &[AdmittedFileScope]) -> Result<String, String> {
+    fn find(
+        &self,
+        call_id: &str,
+        arguments: &Value,
+        scopes: &[AdmittedFileScope],
+    ) -> Result<String, String> {
         let path = arguments.get("path").and_then(Value::as_str).unwrap_or(".");
         let resolved = self.resolve_admitted(path, false, scopes)?;
         self.witness_read(path);
         let pattern = string_argument(arguments, "pattern")?;
         let mut matches = Vec::new();
-        walk_workspace(&self.root, &resolved, &mut |relative, _| {
+        let single_file = fs::symlink_metadata(&resolved).is_ok_and(|metadata| metadata.is_file());
+        // A negative name match still depends on every traversed file. Keep a
+        // bounded exact witness for the whole search, including nonmatches;
+        // an unreadable or larger scan remains coarse for model projection.
+        let mut scan_files = Vec::new();
+        let mut scan_complete = true;
+        let mut scan_bytes = 0u64;
+        walk_workspace(&self.root, &resolved, &mut |relative, absolute| {
+            if scan_files.len() < 128 {
+                // `find` needs filenames, not bodies. Bound the extra reads
+                // made only to attest current bytes for Raw context.
+                let remaining = (16 * 1024 * 1024u64).saturating_sub(scan_bytes);
+                let max_file = remaining.min(8 * 1024 * 1024);
+                let bytes = fs::File::open(absolute).and_then(|file| {
+                    let mut bytes = Vec::new();
+                    file.take(max_file + 1).read_to_end(&mut bytes)?;
+                    Ok(bytes)
+                });
+                match bytes {
+                    Ok(bytes) if bytes.len() as u64 <= max_file => {
+                        scan_bytes += bytes.len() as u64;
+                        scan_files.push(ModelReadWitness {
+                            path: relative.to_owned(),
+                            content_hash: whipplescript_store::stable_hash_bytes_hex(&bytes),
+                        });
+                    }
+                    Ok(_) => scan_complete = false,
+                    Err(_) => scan_complete = false,
+                }
+            } else {
+                scan_complete = false;
+            }
             if wildcard_matches(pattern, relative) {
                 matches.push(relative.to_owned());
             }
-            matches.len() < 5_000
+            if matches.len() >= 5_000 {
+                scan_complete = false;
+                false
+            } else {
+                true
+            }
         })?;
+        if scan_complete && !scan_files.is_empty() {
+            if single_file {
+                self.model_read_witnesses
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .insert(call_id.to_owned(), scan_files.remove(0));
+            } else {
+                self.model_scan_witnesses
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .insert(
+                        call_id.to_owned(),
+                        ModelScanWitness {
+                            root: path.to_owned(),
+                            files: scan_files,
+                        },
+                    );
+            }
+        }
         matches.sort();
         Ok(self.cap(matches.join("\n")))
     }
@@ -1035,7 +1096,7 @@ impl ResourceResolver for NativeWorkspaceResolver {
             "write" => self.write(&call.arguments, scopes),
             "edit" => self.edit(&call.arguments, scopes),
             "ls" => self.list(&call.arguments, scopes),
-            "find" => self.find(&call.arguments, scopes),
+            "find" => self.find(&call.id, &call.arguments, scopes),
             "grep" => self.grep(&call.id, &call.arguments, scopes),
             "bash" => {
                 if !admitted_resources
@@ -5338,6 +5399,47 @@ workflow UnsafeHostChat {
             "a negative match still contributes its source"
         );
         assert!(resolver.take_model_scan_witness("grep-directory").is_none());
+        let found = resolver
+            .execute_tool(
+                &resources,
+                &ToolCall {
+                    id: "find-directory".to_owned(),
+                    name: "find".to_owned(),
+                    arguments: json!({ "path": ".", "pattern": "note*" }),
+                },
+            )
+            .expect("find filenames");
+        assert_eq!(found, "note.txt");
+        let find_scan = resolver
+            .take_model_scan_witness("find-directory")
+            .expect("bounded find witness");
+        assert_eq!(find_scan.root, ".");
+        assert_eq!(find_scan.files.len(), 3);
+        assert!(find_scan.files.iter().any(|file| {
+            file.path == "other.txt"
+                && file.content_hash == whipplescript_store::stable_hash_bytes_hex(b"separate\n")
+        }));
+        assert!(resolver.take_model_scan_witness("find-directory").is_none());
+        assert_eq!(
+            resolver
+                .execute_tool(
+                    &resources,
+                    &ToolCall {
+                        id: "find-file".to_owned(),
+                        name: "find".to_owned(),
+                        arguments: json!({ "path": "other.txt", "pattern": "absent*" }),
+                    },
+                )
+                .expect("single-file find"),
+            ""
+        );
+        assert_eq!(
+            resolver.take_model_read_witness("find-file"),
+            Some(ModelReadWitness {
+                path: "other.txt".to_owned(),
+                content_hash: whipplescript_store::stable_hash_bytes_hex(b"separate\n"),
+            })
+        );
         assert!(resolver.take_model_read_witness("read-1").is_none());
         assert_eq!(
             resolver.execute_tool(
@@ -5390,6 +5492,17 @@ workflow UnsafeHostChat {
             )
             .expect("empty grep still runs");
         assert!(resolver.take_model_scan_witness("empty-scan").is_none());
+        resolver
+            .execute_tool(
+                &resources,
+                &ToolCall {
+                    id: "empty-find".to_owned(),
+                    name: "find".to_owned(),
+                    arguments: json!({ "path": "empty", "pattern": "*" }),
+                },
+            )
+            .expect("empty find still runs");
+        assert!(resolver.take_model_scan_witness("empty-find").is_none());
         fs::write(root.join("invalid.txt"), [0xff]).expect("invalid UTF-8 file");
         resolver
             .execute_tool(
@@ -5405,9 +5518,28 @@ workflow UnsafeHostChat {
             .take_model_scan_witness("incomplete-scan")
             .is_none());
         fs::remove_file(root.join("invalid.txt")).expect("remove invalid text");
-        for index in 0..126 {
+        for index in 0..125 {
             fs::write(root.join(format!("extra-{index}.txt")), "no match").expect("extra file");
         }
+        resolver
+            .execute_tool(
+                &resources,
+                &ToolCall {
+                    id: "bounded-find".to_owned(),
+                    name: "find".to_owned(),
+                    arguments: json!({ "path": ".", "pattern": "absent*" }),
+                },
+            )
+            .expect("bounded find still runs");
+        assert_eq!(
+            resolver
+                .take_model_scan_witness("bounded-find")
+                .expect("128 files are fully witnessed")
+                .files
+                .len(),
+            128
+        );
+        fs::write(root.join("extra-125.txt"), "no match").expect("129th file");
         resolver
             .execute_tool(
                 &resources,
@@ -5419,6 +5551,35 @@ workflow UnsafeHostChat {
             )
             .expect("large grep still runs");
         assert!(resolver.take_model_scan_witness("oversized-scan").is_none());
+        resolver
+            .execute_tool(
+                &resources,
+                &ToolCall {
+                    id: "oversized-find".to_owned(),
+                    name: "find".to_owned(),
+                    arguments: json!({ "path": ".", "pattern": "absent*" }),
+                },
+            )
+            .expect("large find still runs");
+        assert!(resolver.take_model_scan_witness("oversized-find").is_none());
+        fs::create_dir(root.join("large")).expect("large directory");
+        fs::File::create(root.join("large/one.bin"))
+            .expect("large file")
+            .set_len(8 * 1024 * 1024 + 1)
+            .expect("sparse large file");
+        resolver
+            .execute_tool(
+                &resources,
+                &ToolCall {
+                    id: "large-file-find".to_owned(),
+                    name: "find".to_owned(),
+                    arguments: json!({ "path": "large", "pattern": "absent*" }),
+                },
+            )
+            .expect("large-file find still runs");
+        assert!(resolver
+            .take_model_scan_witness("large-file-find")
+            .is_none());
         let _ = fs::remove_dir_all(root);
     }
 

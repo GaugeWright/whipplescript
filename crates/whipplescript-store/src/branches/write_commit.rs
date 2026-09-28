@@ -106,6 +106,16 @@ pub(super) fn native(
             cut.recorded_at
         ],
     )?;
+    if let Some(state) = super::flowing_fence::native::read_state(&tx, cut.branch_id)? {
+        let recorded = super::BranchStore::cut_by_id(&tx, cut.cut_id)?;
+        super::flowing_fence::require_head_move(
+            &state,
+            cut.parent_cut_id,
+            cut.cut_id,
+            cut.manifest_hash,
+            recorded.as_ref(),
+        )?;
+    }
     tx.execute(
         ADVANCE_HEAD,
         params![

@@ -470,6 +470,21 @@ impl<S: DoSql> FlowingSources for DoBranches<S> {
             {
                 return Ok(HandoffContributionOutcome::TargetCutAuthorshipMismatch);
             }
+            if let Some(state) =
+                super::flowing_fence::read_state(&self.sql, witness.target_branch_id())?
+            {
+                if whipplescript_store::branches::flowing_fence::require_head_move(
+                    &state,
+                    witness.target_before_cut_id(),
+                    witness.target_after_cut_id(),
+                    witness.target_after_manifest_hash(),
+                    Some(&target_cut),
+                )
+                .is_err()
+                {
+                    return Ok(HandoffContributionOutcome::TargetFenceRefused);
+                }
+            }
             let receipt = HandoffReceipt {
                 op_id: request.op_id().to_owned(),
                 unit_id: unit.unit_id,
@@ -823,6 +838,9 @@ mod tests {
         use std::rc::Rc;
 
         use crate::do_branches::DoContentBlobs;
+        use whipplescript_store::branches::flowing_fence::{
+            FlowingFence, FlowingSourceKind, OpenFlowingSource, OpenFlowingSourceOutcome,
+        };
         use whipplescript_store::selection::parse;
         use whipplescript_store::vcs::{
             FlowingSelectionOutcome, FlowingTargetEffectsOutcome, WorkspaceVcs,
@@ -834,9 +852,34 @@ mod tests {
             DoContentBlobs::new(Rc::clone(&sql)).expect("content"),
         );
         vcs.init("t0").unwrap();
-        vcs.create_branch("branch", None, MAINLINE_BRANCH_ID, "t1")
+        vcs.create_branch("branch", Some("feature"), MAINLINE_BRANCH_ID, "t1")
             .unwrap();
+        let mut opening = DoBranches::new(Rc::clone(&sql)).unwrap();
+        assert!(matches!(
+            opening
+                .open_flowing_source(&OpenFlowingSource {
+                    source_branch_id: "branch".into(),
+                    incarnation_id: "branch-inc".into(),
+                    kind: FlowingSourceKind::Branch,
+                    owner: "coordinator".into(),
+                    opened_at: "t1".into(),
+                })
+                .unwrap(),
+            OpenFlowingSourceOutcome::Opened(_)
+        ));
         vcs.create_branch("twig", None, "branch", "t1").unwrap();
+        assert!(matches!(
+            opening
+                .open_flowing_source(&OpenFlowingSource {
+                    source_branch_id: "twig".into(),
+                    incarnation_id: "twig-inc".into(),
+                    kind: FlowingSourceKind::Twig,
+                    owner: "coordinator".into(),
+                    opened_at: "t1".into(),
+                })
+                .unwrap(),
+            OpenFlowingSourceOutcome::Opened(_)
+        ));
         vcs.write("twig", "a.txt", Some("A"), "twig-a", "t2")
             .unwrap();
         vcs.write("twig", "a.txt", Some("B"), "twig-b", "t3")
@@ -902,6 +945,120 @@ mod tests {
             HandoffContributionOutcome::Transferred(_)
         ));
         assert!(branches.handoff_receipt("op-b").unwrap().is_some());
+    }
+
+    #[test]
+    fn hosted_handoff_refuses_a_disabled_flowing_target_without_moving_its_ref() {
+        use std::rc::Rc;
+
+        use crate::do_branches::DoContentBlobs;
+        use whipplescript_store::branches::flowing_fence::{
+            FlowingFence, FlowingFenceAction, FlowingFenceOutcome, FlowingFenceTransition,
+            FlowingSourceKind, OpenFlowingSource,
+        };
+        use whipplescript_store::selection::parse;
+        use whipplescript_store::vcs::{
+            FlowingSelectionOutcome, FlowingTargetEffectsOutcome, WorkspaceVcs,
+        };
+
+        let sql = Rc::new(RusqliteDoSql::with_runtime_schema());
+        let mut vcs = WorkspaceVcs::from_parts(
+            DoBranches::new(Rc::clone(&sql)).unwrap(),
+            DoContentBlobs::new(Rc::clone(&sql)).unwrap(),
+        );
+        vcs.init("t0").unwrap();
+        vcs.create_branch("branch", Some("feature"), MAINLINE_BRANCH_ID, "t1")
+            .unwrap();
+        let mut branches = DoBranches::new(Rc::clone(&sql)).unwrap();
+        branches
+            .open_flowing_source(&OpenFlowingSource {
+                source_branch_id: "branch".into(),
+                incarnation_id: "branch-inc".into(),
+                kind: FlowingSourceKind::Branch,
+                owner: "coordinator".into(),
+                opened_at: "t1".into(),
+            })
+            .unwrap();
+        vcs.create_branch("twig", None, "branch", "t1").unwrap();
+        branches
+            .open_flowing_source(&OpenFlowingSource {
+                source_branch_id: "twig".into(),
+                incarnation_id: "twig-inc".into(),
+                kind: FlowingSourceKind::Twig,
+                owner: "coordinator".into(),
+                opened_at: "t1".into(),
+            })
+            .unwrap();
+        vcs.write("twig", "a.txt", Some("A"), "twig-a", "t2")
+            .unwrap();
+        let source_cut = branches.get_cut("twig-a").unwrap().unwrap();
+        branches
+            .pin_private_cut(PinPrivateCut {
+                pin_id: "pin-a",
+                twig_branch_id: "twig",
+                cut_id: "twig-a",
+                manifest_hash: &source_cut.manifest_hash,
+                principal: "s:author",
+                retained_at: "t3",
+            })
+            .unwrap();
+        branches
+            .declare_contribution(DeclareContribution {
+                unit_id: "unit-a",
+                pin_id: "pin-a",
+                principal: "s:author",
+                intent: "selected work",
+                read_basis_digest: "reads-a",
+                dependency_basis_digest: "deps-a",
+                scope_digest: "scope-a",
+                declared_at: "t3",
+            })
+            .unwrap();
+        let FlowingSelectionOutcome::Selected(selection) = vcs
+            .select_private_changes("pin-a", &parse("path(a.txt)").unwrap())
+            .unwrap()
+        else {
+            panic!("source selection");
+        };
+        assert_eq!(
+            vcs.bind_private_selection("unit-a", &selection, "t4")
+                .unwrap(),
+            BindContributionBasisOutcome::Bound
+        );
+        let FlowingTargetEffectsOutcome::Verified(witness) = vcs
+            .prepare_private_handoff_target("unit-a", "target-a", "mediator", "t5")
+            .unwrap()
+        else {
+            panic!("prepared target");
+        };
+        let state = branches.flowing_source("branch").unwrap().unwrap();
+        assert!(matches!(
+            branches
+                .transition_flowing_source(&FlowingFenceTransition {
+                    op_id: "disable".into(),
+                    source_branch_id: "branch".into(),
+                    incarnation_id: "branch-inc".into(),
+                    expected_eligibility_epoch: state.eligibility_epoch,
+                    expected_owner_epoch: state.owner_epoch,
+                    actor: "coordinator".into(),
+                    action: FlowingFenceAction::DisableAdmission,
+                    recorded_at: "t5".into(),
+                })
+                .unwrap(),
+            FlowingFenceOutcome::Applied(_)
+        ));
+        assert_eq!(
+            vcs.handoff_private_selection("handoff-a", &witness, "mediator", "t6")
+                .unwrap(),
+            HandoffContributionOutcome::TargetFenceRefused
+        );
+        assert!(branches.handoff_receipt("handoff-a").unwrap().is_none());
+        assert!(branches
+            .get_branch("branch")
+            .unwrap()
+            .unwrap()
+            .head_cut_id
+            .is_none());
     }
 
     #[test]

@@ -140,8 +140,8 @@ pub struct DoToolExecutor<Sql: DoSql> {
     /// Full bytes seen by successful native-hosted `read` calls, keyed by tool
     /// call ID until the next model request consumes their source labels.
     model_read_witnesses: std::sync::Mutex<BTreeMap<String, (String, String)>>,
-    /// Every file searched by a bounded directory grep, including negative
-    /// matches. A partial or oversized scan never enters this map.
+    /// Every file searched by a bounded directory grep or find, including
+    /// negative matches. A partial or oversized scan never enters this map.
     model_scan_witnesses: std::sync::Mutex<BTreeMap<String, DoScanWitness>>,
     sql: Rc<Sql>,
     key_prefix: String,
@@ -278,7 +278,7 @@ impl<Sql: DoSql> DoToolExecutor<Sql> {
             TOOL_WRITE => self.write(args),
             TOOL_EDIT => self.edit(args),
             TOOL_GREP => self.grep(&call.id, args),
-            TOOL_FIND => self.find(args),
+            TOOL_FIND => self.find(&call.id, args),
             TOOL_LS => self.ls(args),
             TOOL_RECALL => self.recall(args),
             TOOL_LIST_TODOS => self.list_todos(args),
@@ -611,17 +611,64 @@ impl<Sql: DoSql> DoToolExecutor<Sql> {
 
     /// Find `files` keys matching a glob pattern (flat-key `find`): the classic
     /// `*`-wildcard match over the key, optionally prefix-filtered by `path`.
-    fn find(&self, args: &Value) -> Result<String, String> {
+    fn find(&self, call_id: &str, args: &Value) -> Result<String, String> {
         let pattern = str_arg(args, "pattern")?;
         let admitted = self.path_access(optional_str_arg(args, "path").unwrap_or("."), false)?;
         let prefix = directory_prefix(&admitted);
         let limit = usize_arg(args, "limit").unwrap_or(1000);
-        let mut hits: Vec<String> = self
+        let searched: Vec<String> = self
             .all_keys()?
             .into_iter()
-            .filter(|key| key.starts_with(&prefix) && glob_match(pattern, key))
+            .filter(|key| key.starts_with(&prefix))
+            .collect();
+        let mut hits: Vec<String> = searched
+            .iter()
+            .filter(|key| glob_match(pattern, key))
+            .cloned()
             .collect();
         hits.truncate(limit);
+        // The filename result also depends on the files that did not match.
+        // Reading their bodies is only for a bounded provenance witness; a
+        // failed or larger read leaves find's ordinary result intact.
+        if !searched.is_empty() && searched.len() <= 128 {
+            if let Ok(files) = self.all_files(Some(&prefix)) {
+                let files: Vec<_> = files
+                    .into_iter()
+                    .filter(|(key, _)| key.starts_with(&prefix))
+                    .collect();
+                let same_keys = files.len() == searched.len()
+                    && files.iter().map(|(key, _)| key).collect::<BTreeSet<_>>()
+                        == searched.iter().collect::<BTreeSet<_>>();
+                let within_bytes = files
+                    .iter()
+                    .all(|(_, content)| content.len() <= 8 * 1024 * 1024)
+                    && files.iter().fold(0usize, |total, (_, content)| {
+                        total.saturating_add(content.len())
+                    }) <= 16 * 1024 * 1024;
+                if same_keys && within_bytes {
+                    self.model_scan_witnesses
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .insert(
+                            call_id.to_owned(),
+                            DoScanWitness {
+                                root: admitted,
+                                files: files
+                                    .into_iter()
+                                    .map(|(key, content)| {
+                                        (
+                                            key,
+                                            whipplescript_store::stable_hash_bytes_hex(
+                                                content.as_bytes(),
+                                            ),
+                                        )
+                                    })
+                                    .collect(),
+                            },
+                        );
+                }
+            }
+        }
         if hits.is_empty() {
             Ok("No files found".to_string())
         } else {
@@ -916,7 +963,7 @@ impl<Sql: DoSql> ToolExecutor for DoToolExecutor<Sql> {
                 };
             }
         }
-        if call.name == TOOL_GREP {
+        if matches!(call.name.as_str(), TOOL_GREP | TOOL_FIND) {
             let scan = self
                 .model_scan_witnesses
                 .lock()
@@ -1233,7 +1280,7 @@ mod tests {
     }
 
     #[test]
-    fn hosted_directory_grep_witnesses_negative_matches_and_refuses_empty_scans() {
+    fn hosted_directory_search_witnesses_negative_matches_and_refuses_large_scans() {
         let executor = executor().with_workspace_source(Some("workspace:chat-one".to_owned()));
         for (path, content) in [
             ("targets/t-one/found.txt", "found\n"),
@@ -1270,6 +1317,37 @@ mod tests {
                 whipplescript_store::stable_hash_bytes_hex(content)
             )));
         }
+        let find = ToolCall {
+            id: "find-one".to_owned(),
+            name: "find".to_owned(),
+            arguments: json!({"path": "targets/t-one", "pattern": "*found.txt"}),
+        };
+        let outcome = executor.execute(&find);
+        assert_eq!(outcome.status, ToolStatus::Ok);
+        assert!(outcome.content.contains("found.txt"));
+        assert!(!outcome.content.contains("negative.txt"));
+        let find_label = executor.model_output_provenance(&find);
+        assert_eq!(find_label, label, "find witnesses negative matches too");
+        let absent = ToolCall {
+            id: "find-absent".to_owned(),
+            arguments: json!({"path": "targets/t-one", "pattern": "*absent.txt"}),
+            ..find.clone()
+        };
+        assert_eq!(executor.execute(&absent).status, ToolStatus::Ok);
+        assert_eq!(executor.model_output_provenance(&absent), label);
+        let single_file = ToolCall {
+            id: "find-file".to_owned(),
+            arguments: json!({"path": "targets/t-one/found.txt", "pattern": "*absent.txt"}),
+            ..find.clone()
+        };
+        assert_eq!(executor.execute(&single_file).status, ToolStatus::Ok);
+        assert_eq!(
+            executor
+                .model_output_provenance(&single_file)
+                .source_handles,
+            ["workspace:chat-one"],
+            "hosted find's path is a directory prefix, so a file path searches no keys"
+        );
         assert_eq!(
             executor.model_output_provenance(&grep).source_handles,
             ["workspace:chat-one"]
@@ -1295,6 +1373,19 @@ mod tests {
             ["workspace:chat-one"],
             "a reused ID cannot inherit an earlier scan"
         );
+        assert_eq!(executor.execute(&find).status, ToolStatus::Ok);
+        let failed_find = ToolCall {
+            arguments: json!({"path": "targets/t-one"}),
+            ..find.clone()
+        };
+        assert_eq!(executor.execute(&failed_find).status, ToolStatus::Error);
+        assert_eq!(
+            executor
+                .model_output_provenance(&failed_find)
+                .source_handles,
+            ["workspace:chat-one"],
+            "a reused find ID cannot inherit an earlier witness"
+        );
         for index in 0..126 {
             assert_eq!(
                 executor
@@ -1315,6 +1406,19 @@ mod tests {
         let bounded_source = executor.model_output_provenance(&bounded);
         assert!(bounded_source.complete);
         assert_eq!(bounded_source.source_handles.len(), 129);
+        let bounded_find = ToolCall {
+            id: "bounded-find".to_owned(),
+            arguments: json!({"path": "targets/t-one", "pattern": "*absent.txt"}),
+            ..find.clone()
+        };
+        assert_eq!(executor.execute(&bounded_find).status, ToolStatus::Ok);
+        assert_eq!(
+            executor
+                .model_output_provenance(&bounded_find)
+                .source_handles
+                .len(),
+            129
+        );
         assert_eq!(
             executor
                 .execute(&call(
@@ -1334,6 +1438,17 @@ mod tests {
             executor.model_output_provenance(&large).source_handles,
             ["workspace:chat-one"],
             "a scan over more than 128 files cannot claim a complete witness"
+        );
+        let large_find = ToolCall {
+            id: "large-find".to_owned(),
+            arguments: json!({"path": "targets/t-one", "pattern": "*absent.txt"}),
+            ..find
+        };
+        assert_eq!(executor.execute(&large_find).status, ToolStatus::Ok);
+        assert_eq!(
+            executor.model_output_provenance(&large_find).source_handles,
+            ["workspace:chat-one"],
+            "find over more than 128 files cannot claim a complete witness"
         );
     }
 

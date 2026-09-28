@@ -648,6 +648,10 @@ impl<B: Branches + FlowingSources, C: ContentBlobs> WorkspaceVcs<B, C> {
 #[cfg(all(test, feature = "native"))]
 mod tests {
     use super::*;
+    use crate::branches::flowing_fence::{
+        FlowingFence, FlowingFenceAction, FlowingFenceOutcome, FlowingFenceTransition,
+        FlowingSourceKind, OpenFlowingSource, OpenFlowingSourceOutcome,
+    };
     use crate::branches::flowing_sources::{
         DeclareContribution, DeclareContributionOutcome, PinPrivateCut, PinPrivateCutOutcome,
         ReleasePrivateCut, ReleasePrivateCutOutcome,
@@ -702,12 +706,49 @@ mod tests {
     }
 
     fn bound_unit() -> WorkspaceVcs<BranchStore, ContentStore> {
+        bound_unit_with_flowing_target(false)
+    }
+
+    fn bound_unit_with_flowing_target(flowing: bool) -> WorkspaceVcs<BranchStore, ContentStore> {
         let mut vcs = workspace();
         vcs.init("t0").expect("initialize workspace");
-        vcs.create_branch("branch", None, MAINLINE_BRANCH_ID, "t1")
-            .expect("create target branch");
+        vcs.create_branch(
+            "branch",
+            flowing.then_some("feature"),
+            MAINLINE_BRANCH_ID,
+            "t1",
+        )
+        .expect("create target branch");
+        if flowing {
+            assert!(matches!(
+                vcs.branches
+                    .open_flowing_source(&OpenFlowingSource {
+                        source_branch_id: "branch".into(),
+                        incarnation_id: "branch-inc".into(),
+                        kind: FlowingSourceKind::Branch,
+                        owner: "coordinator".into(),
+                        opened_at: "t1".into(),
+                    })
+                    .expect("open shared flowing branch"),
+                OpenFlowingSourceOutcome::Opened(_)
+            ));
+        }
         vcs.create_branch("twig", None, "branch", "t1")
             .expect("create source twig");
+        if flowing {
+            assert!(matches!(
+                vcs.branches
+                    .open_flowing_source(&OpenFlowingSource {
+                        source_branch_id: "twig".into(),
+                        incarnation_id: "twig-inc".into(),
+                        kind: FlowingSourceKind::Twig,
+                        owner: "coordinator".into(),
+                        opened_at: "t1".into(),
+                    })
+                    .expect("open flowing member twig"),
+                OpenFlowingSourceOutcome::Opened(_)
+            ));
+        }
         vcs.write("twig", "a.txt", Some("A"), "twig-a", "t2")
             .expect("write source cut");
         pin(&mut vcs, "twig-a", "pin-a");
@@ -727,6 +768,56 @@ mod tests {
             BindContributionBasisOutcome::Bound
         );
         vcs
+    }
+
+    #[test]
+    fn handoff_to_flowing_branch_obeys_its_ref_owned_fence() {
+        let mut allowed = bound_unit_with_flowing_target(true);
+        let witness = prepare_target(&mut allowed, "target-a");
+        assert!(matches!(
+            allowed
+                .handoff_private_selection("handoff-a", &witness, "mediator", "t5")
+                .unwrap(),
+            HandoffContributionOutcome::Transferred(_)
+        ));
+
+        let mut closed = bound_unit_with_flowing_target(true);
+        let witness = prepare_target(&mut closed, "target-a");
+        let state = closed.branches.flowing_source("branch").unwrap().unwrap();
+        assert!(matches!(
+            closed
+                .branches
+                .transition_flowing_source(&FlowingFenceTransition {
+                    op_id: "disable".into(),
+                    source_branch_id: "branch".into(),
+                    incarnation_id: "branch-inc".into(),
+                    expected_eligibility_epoch: state.eligibility_epoch,
+                    expected_owner_epoch: state.owner_epoch,
+                    actor: "coordinator".into(),
+                    action: FlowingFenceAction::DisableAdmission,
+                    recorded_at: "t5".into(),
+                })
+                .unwrap(),
+            FlowingFenceOutcome::Applied(_)
+        ));
+        assert_eq!(
+            closed
+                .handoff_private_selection("handoff-a", &witness, "mediator", "t6")
+                .unwrap(),
+            HandoffContributionOutcome::TargetFenceRefused
+        );
+        assert!(closed
+            .branches
+            .handoff_receipt("handoff-a")
+            .unwrap()
+            .is_none());
+        assert!(closed
+            .branches
+            .get_branch("branch")
+            .unwrap()
+            .unwrap()
+            .head_cut_id
+            .is_none());
     }
 
     fn prepare_target(

@@ -42,6 +42,15 @@ pub struct DoBranches<S: DoSql> {
 }
 
 impl<S: DoSql> DoBranches<S> {
+    fn require_legacy_shape_move(&self, branch_id: &str) -> StoreResult<()> {
+        if flowing_fence::read_state(&self.sql, branch_id)?.is_some() {
+            return Err(
+                whipplescript_store::branches::flowing_fence::refuse_legacy_shape_move(branch_id),
+            );
+        }
+        Ok(())
+    }
+
     fn advance_head_leased(
         &mut self,
         lease: Option<&str>,
@@ -69,6 +78,16 @@ impl<S: DoSql> DoBranches<S> {
             return Ok(AdvanceOutcome::Stale {
                 current_head_cut_id: row.head_cut_id,
             });
+        }
+        if let Some(state) = flowing_fence::read_state(&self.sql, branch_id)? {
+            let cut = self.get_cut(cut_id)?;
+            whipplescript_store::branches::flowing_fence::require_head_move(
+                &state,
+                expected_head_cut_id,
+                cut_id,
+                manifest_hash,
+                cut.as_ref(),
+            )?;
         }
         self.sql
             .execute(
@@ -329,6 +348,16 @@ impl<S: DoSql> Branches for DoBranches<S> {
                     ],
                 )
                 .map_err(sql_err)?;
+            if let Some(state) = flowing_fence::read_state(&self.sql, cut.branch_id)? {
+                let recorded = self.get_cut(cut.cut_id)?;
+                whipplescript_store::branches::flowing_fence::require_head_move(
+                    &state,
+                    cut.parent_cut_id,
+                    cut.cut_id,
+                    cut.manifest_hash,
+                    recorded.as_ref(),
+                )?;
+            }
             self.sql
                 .execute(
                     write_commit::ADVANCE_HEAD,
@@ -524,6 +553,7 @@ impl<S: DoSql> Branches for DoBranches<S> {
         if row.status != BranchStatus::Active {
             return Ok(RetargetOutcome::BranchNotActive { status: row.status });
         }
+        self.require_legacy_shape_move(branch_id)?;
         let Some(parent) = self.row_by_id(new_parent_branch_id)? else {
             return Ok(RetargetOutcome::ParentMissing);
         };
@@ -692,6 +722,7 @@ impl<S: DoSql> Branches for DoBranches<S> {
                 current_head_cut_id: row.head_cut_id,
             });
         }
+        self.require_legacy_shape_move(branch_id)?;
         self.sql
             .execute(
                 "UPDATE branches SET branch_point_cut_id = ?2, \
@@ -718,6 +749,7 @@ impl<S: DoSql> Branches for DoBranches<S> {
         if row.status != BranchStatus::Active {
             return Ok(StatusOutcome::InvalidTransition { from: row.status });
         }
+        self.require_legacy_shape_move(branch_id)?;
         self.sql
             .execute(
                 "UPDATE branches SET status = 'discarded', updated_at = ?2 \
@@ -741,6 +773,7 @@ impl<S: DoSql> Branches for DoBranches<S> {
         if row.status != BranchStatus::Active {
             return Ok(StatusOutcome::InvalidTransition { from: row.status });
         }
+        self.require_legacy_shape_move(branch_id)?;
         self.sql
             .execute(
                 "UPDATE branches SET status = 'adopted', adopted_merge_cut_id = ?2, \
@@ -1166,6 +1199,7 @@ impl<S: DoSql> Branches for DoBranches<S> {
                 current_head_cut_id: row.head_cut_id,
             });
         }
+        self.require_legacy_shape_move(branch_id)?;
         self.sql
             .execute(
                 "UPDATE branches SET head_cut_id = ?2, head_manifest_hash = ?3, \

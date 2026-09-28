@@ -10,7 +10,10 @@ use crate::StoreResult;
 
 type FenceOutcome = FlowingFenceOutcome;
 
-fn read_state(connection: &Connection, source: &str) -> StoreResult<Option<FlowingFenceState>> {
+pub(crate) fn read_state(
+    connection: &Connection,
+    source: &str,
+) -> StoreResult<Option<FlowingFenceState>> {
     connection
         .query_row(
             "SELECT state_json FROM flowing_source_fences WHERE source_branch_id = ?1",
@@ -199,8 +202,11 @@ impl FlowingFence for BranchStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::branches::flowing_fence::FlowingFenceAction;
-    use crate::branches::{AdvanceOutcome, Branches, CreateBranch, CreateBranchOutcome};
+    use crate::branches::flowing_fence::{FlowingFenceAction, FlowingRevision};
+    use crate::branches::{
+        AdvanceOutcome, Branches, CreateBranch, CreateBranchOutcome, CutRecord, CutRow,
+    };
+    use crate::StoreError;
 
     fn source() -> BranchStore {
         let mut store = BranchStore::open_in_memory().unwrap();
@@ -237,6 +243,87 @@ mod tests {
             action,
             recorded_at: op_id.into(),
         }
+    }
+
+    #[test]
+    fn head_move_guard_requires_a_recorded_cut_and_exact_revision() {
+        let mut state = FlowingFenceState {
+            source_branch_id: "branch".into(),
+            incarnation_id: "inc-1".into(),
+            kind: FlowingSourceKind::Branch,
+            owner: "coordinator".into(),
+            owner_epoch: 0,
+            eligibility_epoch: 0,
+            held: false,
+            revision: None,
+            admission_enabled: true,
+            opened_at: "t0".into(),
+        };
+        let mut cut = CutRow {
+            cut_id: "cut-1".into(),
+            change_id: "change-1".into(),
+            branch_id: "branch".into(),
+            manifest_hash: "manifest-1".into(),
+            parent_cut_id: None,
+            origin: Some("write:file".into()),
+            actor: Some("human:author".into()),
+            intent: None,
+            recorded_at: "t1".into(),
+        };
+        let guard = crate::branches::flowing_fence::require_head_move;
+        assert!(matches!(
+            guard(&state, None, "cut-1", "manifest-1", None),
+            Err(StoreError::Conflict(message)) if message.contains("needs a recorded cut")
+        ));
+        assert!(matches!(
+            guard(&state, None, "cut-1", "wrong-manifest", Some(&cut)),
+            Err(StoreError::Conflict(message)) if message.contains("cut differs from the proposed head")
+        ));
+        assert!(guard(&state, None, "cut-1", "manifest-1", Some(&cut)).is_ok());
+
+        cut.parent_cut_id = Some("unrelated-cut".into());
+        assert!(matches!(
+            guard(&state, None, "cut-1", "manifest-1", Some(&cut)),
+            Err(StoreError::Conflict(message)) if message.contains("rewrite needs a revision fence")
+        ));
+        state.revision = Some(FlowingRevision {
+            begin_op_id: "begin-1".into(),
+            before_cut_id: None,
+            after_cut_id: "planned-cut".into(),
+        });
+        assert!(matches!(
+            guard(&state, None, "cut-1", "manifest-1", Some(&cut)),
+            Err(StoreError::Conflict(message)) if message.contains("differs from its pending revision")
+        ));
+        state.revision.as_mut().unwrap().after_cut_id = "cut-1".into();
+        assert!(guard(&state, None, "cut-1", "manifest-1", Some(&cut)).is_ok());
+        state.admission_enabled = false;
+        assert!(matches!(
+            guard(&state, None, "cut-1", "manifest-1", Some(&cut)),
+            Err(StoreError::Conflict(message)) if message.contains("no longer accepts head moves")
+        ));
+    }
+
+    #[test]
+    fn legacy_terminal_move_cannot_discard_a_flowing_source() {
+        let mut store = source();
+        store
+            .open_flowing_source(&OpenFlowingSource {
+                source_branch_id: "branch".into(),
+                incarnation_id: "inc-1".into(),
+                kind: FlowingSourceKind::Branch,
+                owner: "coordinator".into(),
+                opened_at: "t2".into(),
+            })
+            .unwrap();
+        assert!(matches!(
+            store.discard_branch("branch", "t3"),
+            Err(StoreError::Conflict(message)) if message.contains("controlled lifecycle move")
+        ));
+        assert_eq!(
+            store.get_branch("branch").unwrap().unwrap().status,
+            crate::branches::BranchStatus::Active
+        );
     }
 
     #[test]
@@ -370,6 +457,19 @@ mod tests {
             store.transition_flowing_source(&finish).unwrap(),
             FlowingFenceOutcome::Refused(FlowingFenceRefusal::HeadMismatch { current: None })
         );
+        store
+            .record_cut(CutRecord {
+                cut_id: "branch-cut-1",
+                change_id: "branch-cut-1",
+                branch_id: "branch",
+                manifest_hash: "manifest-1",
+                parent_cut_id: None,
+                origin: Some("revision"),
+                actor: Some("mediator"),
+                intent: None,
+                recorded_at: "t3",
+            })
+            .unwrap();
         assert!(matches!(
             store
                 .advance_head("branch", None, "branch-cut-1", "manifest-1", "t3")
@@ -519,7 +619,14 @@ mod tests {
             store.transition_flowing_source(&no_state).unwrap(),
             FlowingFenceOutcome::Refused(FlowingFenceRefusal::Missing)
         );
-        store.discard_branch("branch", "t3").unwrap();
+        // Simulate an older writer bypassing the new terminal guard.
+        store
+            .connection
+            .execute(
+                "UPDATE branches SET status = 'discarded' WHERE branch_id = 'branch'",
+                [],
+            )
+            .unwrap();
         let hold = request(&store, "closed-branch", FlowingFenceAction::Hold);
         assert_eq!(
             store.transition_flowing_source(&hold).unwrap(),
@@ -541,6 +648,51 @@ mod tests {
             store.transition_flowing_source(&hold).unwrap(),
             FlowingFenceOutcome::Refused(FlowingFenceRefusal::Missing)
         );
+    }
+
+    #[test]
+    fn inactive_parent_cannot_open_a_member_twig() {
+        let mut store = source();
+        store
+            .open_flowing_source(&OpenFlowingSource {
+                source_branch_id: "branch".into(),
+                incarnation_id: "branch-inc".into(),
+                kind: FlowingSourceKind::Branch,
+                owner: "coordinator".into(),
+                opened_at: "t2".into(),
+            })
+            .unwrap();
+        store
+            .create_branch(CreateBranch {
+                branch_id: "twig",
+                name: None,
+                parent_branch_id: "branch",
+                at_cut: None,
+                created_at: "t3",
+                idempotency_key: None,
+            })
+            .unwrap();
+        // Simulate an older writer bypassing the new terminal guard.
+        store
+            .connection
+            .execute(
+                "UPDATE branches SET status = 'discarded' WHERE branch_id = 'branch'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .open_flowing_source(&OpenFlowingSource {
+                    source_branch_id: "twig".into(),
+                    incarnation_id: "twig-inc".into(),
+                    kind: FlowingSourceKind::Twig,
+                    owner: "coordinator".into(),
+                    opened_at: "t4".into(),
+                })
+                .unwrap(),
+            OpenFlowingSourceOutcome::InvalidKindParent
+        );
+        assert!(store.flowing_source("twig").unwrap().is_none());
     }
 
     #[test]
