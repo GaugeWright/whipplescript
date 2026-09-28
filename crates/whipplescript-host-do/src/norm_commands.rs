@@ -515,4 +515,413 @@ mod tests {
         assert_eq!(store.norm_checkpoint().unwrap(), None);
         assert!(store.export_events().unwrap().is_empty());
     }
+
+    // --- the production norm-ledger canary ----------------------------------
+    //
+    // `worker/scripts/production-wiring-canary.mjs#norm-ledger` signs nothing:
+    // it forwards one stable signed act and the host's retained observation,
+    // and every other body it sends is built by `normLedgerRequests`, which the
+    // runner's own test pins to this vector. These tests are the Rust half: the
+    // bodies decode at the real doors, the refusals it expects are refused for
+    // the reason it names, and re-appending an act the ledger holds is the same
+    // receipt even after the ledger moved. That last is what makes a re-run of
+    // the canary an exact retry rather than new history.
+
+    use p256::ecdsa::signature::Signer as _;
+    use p256::ecdsa::{Signature, SigningKey};
+    use p256::elliptic_curve::sec1::ToSec1Point as _;
+    use serde_json::Value;
+    use whipplescript_store::norm::{NormStatement, SignedNormEvent};
+
+    const CANARY_REQUESTS: &str =
+        include_str!("../worker/scripts/fixtures/norm-ledger-canary-requests.json");
+    const CANARY_OBJECT: &str = "norm-ledger-canary-object";
+
+    fn canary_vector() -> Value {
+        let vector: Value = serde_json::from_str(CANARY_REQUESTS).expect("canary vector");
+        assert_eq!(
+            vector["protocol"],
+            "whipplescript.production-canary.norm-ledger-requests/v1"
+        );
+        vector
+    }
+
+    fn canary_actor(principal: &str, key: &SigningKey) -> Value {
+        json!({"principal":principal,"algorithm":"p256-sha256","key_id":hex::encode(
+            key.verifying_key().as_affine().to_sec1_point(false).as_bytes(),
+        )})
+    }
+
+    /// Signed the way the Rust signer that provisions the ledger signs.
+    fn canary_signed(actor: &Value, key: &SigningKey, nonce: &str, action: Value) -> Value {
+        let statement: NormStatement = serde_json::from_value(json!({
+            "protocol":"whipplescript.norm/v1","actor":actor,"nonce":nonce,
+            "created_at":"2026-09-28T00:00:00Z","action":action,
+        }))
+        .expect("statement");
+        let signature: Signature = key.sign(&statement.signing_bytes().expect("bytes"));
+        json!({"statement":statement,"signature":hex::encode(signature.to_bytes())})
+    }
+
+    fn event_id(event: &Value) -> String {
+        serde_json::from_value::<SignedNormEvent>(event.clone())
+            .expect("signed event")
+            .tracker_event()
+            .expect("tracker event")
+            .event_id
+    }
+
+    /// The request with `event` in place of the vector's `null`: the runner
+    /// forwards a signed event verbatim inside exactly this envelope.
+    fn carrying(request: &Value, event: &Value) -> String {
+        let mut request = request.clone();
+        assert_eq!(request["command"]["event"], Value::Null);
+        request["command"]["event"] = event.clone();
+        request.to_string()
+    }
+
+    /// A synthetic ledger as provisioning leaves it: an owner-signed genesis
+    /// with a vocabulary the worker may create under, the deployment's trust
+    /// binding owner, worker and the vector's publisher, and a restoration for
+    /// this object at the genesis checkpoint.
+    struct CanaryLedger {
+        sql: crate::do_store::test_support::RusqliteDoSql,
+        trust: String,
+        genesis: Value,
+        worker: (Value, SigningKey),
+        vocabulary: Value,
+    }
+
+    impl CanaryLedger {
+        fn provisioned(vector: &Value) -> Self {
+            let (owner_key, worker_key) = (
+                SigningKey::from_slice(&[3; 32]).unwrap(),
+                SigningKey::from_slice(&[5; 32]).unwrap(),
+            );
+            let owner = canary_actor("canary-owner", &owner_key);
+            let worker = canary_actor("canary-worker", &worker_key);
+            let charter = json!({"vocabularies":[{
+                "definition":{"name":"canary-note","version":"1",
+                    "fields":[{"name":"title","required":true,"value_type":{"type":"text"}}],
+                    "status":{"values":["draft"],"initial":"draft","transitions":[]}},
+                "creation":{"requires":"public"},"editing":{"requires":"public"},
+            }],"owner_scopes":[]});
+            let definition =
+                serde_json::from_value(charter["vocabularies"][0]["definition"].clone())
+                    .expect("definition");
+            let vocabulary = serde_json::to_value(
+                whipplescript_core::vocabulary::Vocabulary::new(definition)
+                    .expect("vocabulary")
+                    .reference(),
+            )
+            .unwrap();
+            let genesis = canary_signed(
+                &owner,
+                &owner_key,
+                "production-norm-ledger-canary:genesis:v1",
+                json!({"act":"bootstrap","creator":"canary-worker","charter":charter}),
+            );
+            let ledger = event_id(&genesis);
+            let trust = json!({
+                "bindings":[owner, worker, vector["workspace"]["publisher"]],
+                "creation_grants":[{"creator":"canary-worker","owner":"canary-owner"}],
+                "restorations":[{"object_id":CANARY_OBJECT,
+                    "checkpoint":{"ledger":ledger,"authority_head":ledger}}],
+            })
+            .to_string();
+            let hosted = Self {
+                sql: crate::do_store::test_support::RusqliteDoSql::from_store_schema(),
+                trust,
+                genesis,
+                worker: (worker, worker_key),
+                vocabulary,
+            };
+            let append = json!({"protocol":"whipplescript.norm.commands/v1",
+                "command":{"kind":"append","event":hosted.genesis}});
+            hosted.command(&append.to_string()).expect("genesis");
+            hosted
+        }
+
+        fn store(
+            &self,
+        ) -> crate::do_store::DoSqliteStore<crate::do_store::test_support::RusqliteDoSql> {
+            crate::do_store::DoSqliteStore::new(self.sql.clone())
+        }
+
+        fn command(&self, body: &str) -> Result<String, String> {
+            execute_hosted_norm_command(&mut self.store(), &self.trust, body)
+        }
+
+        fn provision(&self, body: &Value) -> Result<String, String> {
+            provision_hosted_norm(
+                &mut self.store(),
+                CANARY_OBJECT,
+                &self.trust,
+                &body.to_string(),
+            )
+        }
+
+        /// One more worker record: the ledger moving between two canary runs.
+        fn advance(&self, nonce: &str) -> String {
+            let (worker, key) = &self.worker;
+            let record = canary_signed(
+                worker,
+                key,
+                nonce,
+                json!({"act":"create","ledger":event_id(&self.genesis),
+                    "vocabulary":self.vocabulary,"fields_json":r#"{"title":"moved"}"#}),
+            );
+            self.command(
+                &json!({"protocol":"whipplescript.norm.commands/v1",
+                    "command":{"kind":"append","event":record}})
+                .to_string(),
+            )
+            .expect("advance")
+        }
+
+        /// The ledger's event ids, sorted: export orders concurrent acts
+        /// canonically rather than by arrival, and the claim is about the set.
+        fn history(&self) -> Vec<String> {
+            let exported: Value = serde_json::from_str(
+                &self
+                    .command(&canary_vector()["requests"]["export"].to_string())
+                    .expect("export"),
+            )
+            .unwrap();
+            exported["result"]["events"]
+                .as_array()
+                .expect("events")
+                .iter()
+                .map(|event| event["event_id"].as_str().unwrap().to_owned())
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect()
+        }
+    }
+
+    /// The deployment premises the planning doors are installed with.
+    fn canary_deployment() -> String {
+        let runtime = json!({
+            "engine":{"kind":"cpython3147_wasi","artifact_path":"/opt/reactor.wasm",
+                "artifact_sha256":"a".repeat(64)},
+            "executable":"/usr/local/bin/whip","python_version":"3.14.7","environment":"epoch",
+        });
+        let image = format!("sha256:{}", "c".repeat(64));
+        json!({
+            "planning":json!({"capability":"observer","roles":[]}).to_string(),
+            "runtime":runtime.to_string(),
+            "deployed_image":image,
+            "image_binding":json!({"protocol":"whipplescript.exec.runtime-image/v1",
+                "image_id":image,"runtime":runtime}).to_string(),
+            "time_basis":"hosted-impact/0/canary",
+            "now":"2026-09-28T00:00:00Z",
+        })
+        .to_string()
+    }
+
+    /// What serde and the protocol checks say when a body does not decode.
+    const UNDECODED: [&str; 7] = [
+        "unknown field",
+        "missing field",
+        "invalid type",
+        "unknown variant",
+        "EOF while parsing",
+        "trailing characters",
+        "protocol",
+    ];
+
+    fn assert_decoded(door: &str, answer: &Result<String, String>) {
+        if let Err(error) = answer {
+            assert!(
+                !UNDECODED.iter().any(|marker| error.contains(marker)),
+                "{door}: the canary's request did not decode: {error}"
+            );
+        }
+    }
+
+    /// The same request with a field the door does not know: the control that
+    /// shows `assert_decoded` would have seen a decoding failure at this door.
+    fn with_unknown_field(request: &Value) -> String {
+        let mut request = request.clone();
+        request["command"]["canary_unexpected"] = json!(true);
+        request.to_string()
+    }
+
+    #[test]
+    fn norm_ledger_canary_requests_decode_at_every_hosted_door() {
+        let vector = canary_vector();
+        let requests = &vector["requests"];
+        let refused = &requests["refused"];
+        let ledger = CanaryLedger::provisioned(&vector);
+        let deployment = canary_deployment();
+        let sql = ledger.sql.clone();
+        let artifacts = |cut: &str| {
+            crate::do_branches::compose_vcs(&sql)?.capture_norm_artifact(
+                cut,
+                whipplescript_store::norm_artifact::ArtifactLimits::default(),
+            )
+        };
+        let unknown = |door: &str, answer: Result<String, String>| {
+            assert!(
+                answer
+                    .as_ref()
+                    .is_err_and(|error| error.contains("unknown field")),
+                "{door}: an unknown field was not refused as one: {answer:?}"
+            );
+        };
+
+        // Commands and provision, which answer outright on this ledger.
+        assert!(ledger.command(&requests["export"].to_string()).is_ok());
+        assert!(ledger
+            .command(&carrying(&requests["append"], &ledger.genesis))
+            .is_ok());
+        unknown(
+            "commands",
+            ledger.command(&with_unknown_field(&requests["export"])),
+        );
+        unknown("commands", ledger.command(&refused["commands"].to_string()));
+        assert!(ledger.provision(&requests["provision"]).is_ok());
+        assert!(ledger
+            .provision(&refused["provision"])
+            .is_err_and(|error| error.contains("must be an empty object")));
+
+        // Impacts: past the installed deployment, into the request.
+        let impact = |body: String| {
+            execute_installed_hosted_norm_impact(
+                &ledger.store(),
+                &ledger.trust,
+                &body,
+                &artifacts,
+                &deployment,
+            )
+        };
+        assert_decoded("impacts", &impact(requests["impact"].to_string()));
+        unknown("impacts", impact(with_unknown_field(&requests["impact"])));
+        unknown("impacts", impact(refused["impact"].to_string()));
+
+        // Enqueues: the publisher the vector names is bound; the refusal's is not.
+        let enqueue = |body: String| {
+            execute_hosted_norm_enqueue(
+                &mut whipplescript_kernel::RuntimeKernel::new(ledger.store()),
+                &ledger.trust,
+                &body,
+                &artifacts,
+                "https://executor.invalid",
+                "epoch",
+                None,
+            )
+        };
+        assert_decoded("enqueues", &enqueue(requests["enqueue"].to_string()));
+        unknown(
+            "enqueues",
+            enqueue(with_unknown_field(&requests["enqueue"])),
+        );
+        assert!(enqueue(refused["enqueue"].to_string())
+            .is_err_and(|error| error.contains("deployment binding")));
+
+        // Publications: prepare, and publish around a signed event.
+        let publication = |body: String| {
+            execute_hosted_norm_publication(&mut ledger.store(), &ledger.trust, &body, &artifacts)
+        };
+        assert_decoded(
+            "publications",
+            &publication(requests["prepare"].to_string()),
+        );
+        unknown(
+            "publications",
+            publication(with_unknown_field(&requests["prepare"])),
+        );
+        let publish = carrying(&requests["publish"], &ledger.genesis);
+        assert_decoded("publications", &publication(publish));
+        let mut forged = ledger.genesis.clone();
+        forged["signature"] = json!("invalid");
+        assert_decoded(
+            "publications",
+            &publication(carrying(&refused["publish"], &forged)),
+        );
+
+        // Promotions.
+        let promotion = |body: String| {
+            execute_installed_hosted_norm_promotion(&sql, &ledger.trust, &body, &deployment)
+        };
+        assert_decoded("promotions", &promotion(requests["promotion"].to_string()));
+        unknown(
+            "promotions",
+            promotion(with_unknown_field(&requests["promotion"])),
+        );
+        unknown("promotions", promotion(refused["promotion"].to_string()));
+
+        // None of it appended anything but the genesis the ledger began with.
+        assert_eq!(ledger.history(), vec![event_id(&ledger.genesis)]);
+    }
+
+    #[test]
+    fn norm_ledger_canary_retry_of_a_held_act_is_the_same_receipt() {
+        let vector = canary_vector();
+        let requests = &vector["requests"];
+        let ledger = CanaryLedger::provisioned(&vector);
+        let genesis = event_id(&ledger.genesis);
+        ledger.advance("provisioned-record");
+
+        // The canary's stable act, first run: admitted once, retried the same.
+        let (worker, key) = &ledger.worker;
+        let act = canary_signed(
+            worker,
+            key,
+            "production-norm-ledger-canary:act:v1",
+            json!({"act":"create","ledger":genesis,"vocabulary":ledger.vocabulary,
+                "fields_json":r#"{"title":"canary"}"#}),
+        );
+        let provisioned = ledger.provision(&requests["provision"]).expect("provision");
+        let appended = ledger
+            .command(&carrying(&requests["append"], &act))
+            .expect("append");
+        assert_eq!(
+            ledger.command(&carrying(&requests["append"], &act)),
+            Ok(appended.clone())
+        );
+        let after_first_run = ledger.history();
+        assert_eq!(after_first_run.len(), 3);
+
+        // The ledger moves between runs. The next run re-provisions, and
+        // re-appends the same act and the genesis: each is its first receipt,
+        // and the history gains nothing but what moved it.
+        let moved = ledger.advance("between-runs");
+        assert_eq!(
+            ledger.provision(&requests["provision"]),
+            Ok(provisioned.clone())
+        );
+        assert_eq!(
+            ledger.command(&carrying(&requests["append"], &act)),
+            Ok(appended)
+        );
+        let genesis_receipt = ledger
+            .command(&carrying(&requests["append"], &ledger.genesis))
+            .expect("genesis retry");
+        assert_eq!(
+            serde_json::from_str::<Value>(&genesis_receipt).unwrap()["result"]["event_id"],
+            genesis.as_str()
+        );
+        let mut expected = after_first_run;
+        expected.push(
+            serde_json::from_str::<Value>(&moved).unwrap()["result"]["event_id"]
+                .as_str()
+                .unwrap()
+                .to_owned(),
+        );
+        expected.sort();
+        assert_eq!(ledger.history(), expected);
+        assert_eq!(
+            serde_json::from_str::<Value>(&provisioned).unwrap()["checkpoint"]["ledger"],
+            genesis.as_str()
+        );
+
+        // The runner's forged copy of the act is refused and appends nothing.
+        let mut forged = act.clone();
+        forged["signature"] = json!("00");
+        assert!(ledger
+            .command(&carrying(&requests["refused"]["append"], &forged))
+            .is_err());
+        assert_eq!(ledger.history(), expected);
+    }
 }

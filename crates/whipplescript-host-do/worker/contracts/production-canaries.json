@@ -164,8 +164,8 @@
     },
     {
       "id": "norm-ledger",
-      "state": "runner-needed",
-      "runner": null,
+      "state": "ready-awaiting-identity",
+      "runner": "scripts/production-wiring-canary.mjs#norm-ledger",
       "executionBoundary": "managed-workflow-placement",
       "contracts": [
         "runtime.host.norm.commands",
@@ -176,14 +176,22 @@
         "runtime.host.norm.promotions"
       ],
       "requiredInfrastructure": [
-        "Dedicated synthetic norm ledger with deployment-owned principal bindings",
+        "Dedicated synthetic norm ledger placement with deployment-owned principal bindings, creation grant and a restoration checkpoint for that object in the Worker's norm trust",
+        "One stable act of that ledger, signed by the synthetic signer outside the runner and presented verbatim as an exact retry; the runner holds no signing key",
         "Deployment-owned planning roles and physically verified immutable image binding matched to the deployed executor for read-only impact queries",
-        "Synthetic running instance with installed observer and deployment executor configuration for authenticated enqueue and retry",
-        "Synthetic signer with independent creation grant and retained historical keys",
-        "Synthetic settled norm execution with retained runtime journal, captured artifact cut and externally signed observation publication",
-        "Synthetic workspace stream line whose promotions the gate judges, with a synthetic reservation grant for fenced changes"
+        "Synthetic running instance with installed observer capability, requirement record, recorded artifact cut and deployment executor configuration for authenticated enqueue and retry",
+        "Synthetic settled norm execution with retained runtime journal, captured artifact cut and an observation publication signed externally once at provisioning; the runner only republishes what the host retains",
+        "Synthetic workspace stream line promoted once through the gate under a stable promotion identity, with a synthetic reservation grant for fenced changes"
       ],
-      "cleanup": "Reuse only the dedicated synthetic ledger and stable signed invocation identities. Norm evidence is append-only: never erase production history or restore an older authority checkpoint as cleanup. Retain bounded synthetic receipts outside customer ledgers. A promotion moves only the synthetic workspace's governed mainline and is recorded like any other; it is never undone by rewriting that history.",
+      "requiredEnvironment": [
+        "GW_SYNTHETIC_WHIP_MANAGED_ORIGIN",
+        "GW_SYNTHETIC_WHIP_CONTROL_TOKEN",
+        "GW_SYNTHETIC_WHIP_TENANT",
+        "GW_SYNTHETIC_NORM_PLACEMENT",
+        "GW_SYNTHETIC_NORM_SIGNED_ACT",
+        "GW_SYNTHETIC_NORM_WORKSPACE"
+      ],
+      "cleanup": "Reuse only the dedicated synthetic ledger and stable signed invocation identities, so every run after the first is an exact retry that adds nothing. Norm evidence is append-only: never erase production history or restore an older authority checkpoint as cleanup, and the runner calls no delete, discard, restore or rollback route. Retain bounded synthetic receipts outside customer ledgers; the runner fails once the synthetic history exceeds 256 events. A promotion moves only the synthetic workspace's governed mainline and is recorded like any other; it is never undone by rewriting that history.",
       "surfaces": [
         "whip-runtime"
       ]

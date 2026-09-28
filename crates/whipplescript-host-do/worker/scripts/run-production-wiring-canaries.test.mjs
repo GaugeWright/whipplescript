@@ -180,6 +180,7 @@ test("every ready local suite in the inventory starts a journey the runner has",
       return childThatCloses(0);
     },
   });
-  assert.deepEqual(spawned, ["managed-host-lifecycle", "private-home-forwarding"]);
+  assert.deepEqual(spawned, ["managed-host-lifecycle", "private-home-forwarding", "norm-ledger"]);
+  assert(result.executed.includes("norm-ledger"));
   assert(result.executed.includes("placement-forwarding"));
 });

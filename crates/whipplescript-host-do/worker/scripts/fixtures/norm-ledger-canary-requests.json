@@ -1,0 +1,150 @@
+{
+  "protocol": "whipplescript.production-canary.norm-ledger-requests/v1",
+  "workspace": {
+    "instance": "norm-ledger-canary-instance",
+    "run": "norm-ledger-canary-run",
+    "requirement": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "cut": "norm-ledger-canary-cut",
+    "effect": "norm-ledger-canary-effect",
+    "capability": "observer",
+    "vocabulary": "local-observation@1",
+    "publisher": {
+      "principal": "norm-ledger-canary-publisher",
+      "algorithm": "p256-sha256",
+      "key_id": "041e18532fd4754c02f3041d9c75ceb33b83ffd81ac7ce4fe882ccb1c98bc5896ea46c311c4e2ff40dd96a3653e6e45445d32dfe486eced75c7a90c6a18881c0a3"
+    },
+    "impact": {
+      "before_cut": "norm-ledger-canary-before",
+      "after_cut": "norm-ledger-canary-after"
+    },
+    "promotion": {
+      "stream": "norm-ledger-canary-stream",
+      "tokens": []
+    }
+  },
+  "requests": {
+    "provision": {},
+    "export": {
+      "protocol": "whipplescript.norm.commands/v1",
+      "command": {
+        "kind": "export"
+      }
+    },
+    "append": {
+      "protocol": "whipplescript.norm.commands/v1",
+      "command": {
+        "kind": "append",
+        "event": null
+      }
+    },
+    "impact": {
+      "protocol": "whipplescript.norm.impact/v1",
+      "command": {
+        "before_cut": "norm-ledger-canary-before",
+        "after_cut": "norm-ledger-canary-after"
+      }
+    },
+    "enqueue": {
+      "protocol": "whipplescript.norm.enqueue/v1",
+      "command": {
+        "instance": "norm-ledger-canary-instance",
+        "requirement": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "cut": "norm-ledger-canary-cut",
+        "effect": "norm-ledger-canary-effect",
+        "capability": "observer",
+        "publisher": "norm-ledger-canary-publisher"
+      }
+    },
+    "prepare": {
+      "protocol": "whipplescript.norm.publication/v1",
+      "command": {
+        "kind": "prepare",
+        "instance": "norm-ledger-canary-instance",
+        "run": "norm-ledger-canary-run",
+        "vocabulary": "local-observation@1",
+        "actor": {
+          "principal": "norm-ledger-canary-publisher",
+          "algorithm": "p256-sha256",
+          "key_id": "041e18532fd4754c02f3041d9c75ceb33b83ffd81ac7ce4fe882ccb1c98bc5896ea46c311c4e2ff40dd96a3653e6e45445d32dfe486eced75c7a90c6a18881c0a3"
+        },
+        "created_at": "2026-09-28T00:00:00Z"
+      }
+    },
+    "publish": {
+      "protocol": "whipplescript.norm.publication/v1",
+      "command": {
+        "kind": "publish",
+        "instance": "norm-ledger-canary-instance",
+        "run": "norm-ledger-canary-run",
+        "event": null
+      }
+    },
+    "promotion": {
+      "protocol": "whipplescript.norm.promotion/v1",
+      "command": {
+        "stream": "norm-ledger-canary-stream",
+        "promotion": "production-norm-ledger-canary:promotion:v1",
+        "tokens": []
+      }
+    },
+    "refused": {
+      "provision": {
+        "checkpoint": {
+          "ledger": "0000000000000000000000000000000000000000000000000000000000000000",
+          "authority_head": "0000000000000000000000000000000000000000000000000000000000000000"
+        }
+      },
+      "append": {
+        "protocol": "whipplescript.norm.commands/v1",
+        "command": {
+          "kind": "append",
+          "event": null
+        }
+      },
+      "commands": {
+        "protocol": "whipplescript.norm.commands/v1",
+        "command": {
+          "kind": "export"
+        },
+        "bindings": []
+      },
+      "impact": {
+        "protocol": "whipplescript.norm.impact/v1",
+        "command": {
+          "before_cut": "norm-ledger-canary-before",
+          "after_cut": "norm-ledger-canary-after"
+        },
+        "deployment": {}
+      },
+      "enqueue": {
+        "protocol": "whipplescript.norm.enqueue/v1",
+        "command": {
+          "instance": "norm-ledger-canary-instance",
+          "requirement": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "cut": "norm-ledger-canary-cut",
+          "effect": "norm-ledger-canary-effect",
+          "capability": "observer",
+          "publisher": "production-norm-ledger-canary-unbound"
+        }
+      },
+      "publish": {
+        "protocol": "whipplescript.norm.publication/v1",
+        "command": {
+          "kind": "publish",
+          "instance": "norm-ledger-canary-instance",
+          "run": "norm-ledger-canary-run",
+          "event": null
+        }
+      },
+      "promotion": {
+        "protocol": "whipplescript.norm.promotion/v1",
+        "command": {
+          "stream": "norm-ledger-canary-stream",
+          "promotion": "production-norm-ledger-canary:promotion:v1",
+          "tokens": []
+        },
+        "deployment": {}
+      }
+    }
+  }
+}

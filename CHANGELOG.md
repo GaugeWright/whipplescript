@@ -29,12 +29,15 @@ dependent can match on or construct:
   `NormCommandResult::ActivationPlanned` gained `effects`; `NormVocabulary`
   gained `constraint` and `deployment`; `NormCharter` gained `canonicalizers`.
 - `whipplescript-kernel`: `AdmissionDoor` gained `Deploy`, `RequirementImpact`
-  gained `ceiling`, and `norm_admission::AdmissionHost` is now `Copy`.
+  gained `ceiling`, `ProjectionGap::ExecutionUnavailable` gained `requirement`,
+  `norm_buck2_tests::test_report` and `norm_buck2_tests::judge` take a fourth
+  parameter, `norm_projection::EvidenceProjection::capture` takes a type
+  parameter, and `norm_admission::AdmissionHost` is now `Copy`.
 - `whipplescript`: `host_runtime::ModelScanWitness` gained `directories`.
 
 Code that matches those enums without a wildcard arm, builds those structs with
-a literal, or casts those enums to integers must handle the new variants and
-fields. The command line, stored data and configuration stay compatible:
+a literal, calls those functions, or casts those enums to integers must follow
+the change. The command line, stored data and configuration stay compatible:
 nothing a `whip` user does needs to change.
 
 ### Added
