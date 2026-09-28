@@ -142,6 +142,10 @@ function evidenceFor(id) {
     "src/authenticated-host.integration.test.ts#signed-private-home-journey";
   const privateHomeDeployed =
     "contracts/deployed-evidence.json#private-home-forwarding-2026-08-03T23:13:55Z";
+  // The norm ledger's doors on the managed harness (whipplescript-src DR-0140).
+  const normLedgerRoute = id === "runtime.host.norm.commands" || id === "runtime.host.norm.provision";
+  const normLedgerDeployed =
+    "contracts/deployed-evidence.json#norm-ledger-2026-09-28T19:14:10Z";
   return {
     contract: publicSession
       ? ["src/session.integration.test.ts#workerd-production-object"]
@@ -170,7 +174,11 @@ function evidenceFor(id) {
         : privateHomeRoute
           ? [privateHomeJourney]
           : [],
-    deployed: privateHomeRoute ? [privateHomeDeployed] : [],
+    deployed: privateHomeRoute
+      ? [privateHomeDeployed]
+      : normLedgerRoute
+        ? [normLedgerDeployed]
+        : [],
     property: publicSession || declaredInnerRoute
       ? ["src/authenticated-host.integration.test.ts#declared-route-surface"]
       : placementRoute

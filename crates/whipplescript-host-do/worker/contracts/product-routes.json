@@ -428,7 +428,9 @@
         "journey": [
           "src/authenticated-host.integration.test.ts#authenticated-placement-journey"
         ],
-        "deployed": [],
+        "deployed": [
+          "contracts/deployed-evidence.json#norm-ledger-2026-09-28T19:14:10Z"
+        ],
         "property": [
           "src/authenticated-host.integration.test.ts#declared-route-surface"
         ]
@@ -464,7 +466,9 @@
         "journey": [
           "src/authenticated-host.integration.test.ts#authenticated-placement-journey"
         ],
-        "deployed": [],
+        "deployed": [
+          "contracts/deployed-evidence.json#norm-ledger-2026-09-28T19:14:10Z"
+        ],
         "property": [
           "src/authenticated-host.integration.test.ts#declared-route-surface"
         ]

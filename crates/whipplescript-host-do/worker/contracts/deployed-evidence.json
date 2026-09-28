@@ -21,6 +21,28 @@
         "valid signature over a tampered request body denied with 403",
         "fresh five-minute P-256 grant admitted for exact method, path, body, package, and command"
       ]
+    },
+    {
+      "id": "norm-ledger-2026-09-28T19:14:10Z",
+      "sourceCommit": "234d8eea368b4118df17135c469c315998d91810",
+      "worker": "whipplescript-runtime",
+      "workerVersion": "51b4e78c-d56e-4128-8e55-ab6b26db8a61",
+      "origin": "https://whipplescript-runtime.jack-168.workers.dev",
+      "runner": "scripts/production-wiring-canary.mjs#norm-ledger",
+      "executedAt": "2026-09-28T19:14:10Z",
+      "execution": "identified-operator-run",
+      "result": "passed",
+      "contracts": [
+        "runtime.host.norm.commands",
+        "runtime.host.norm.provision"
+      ],
+      "authorityChecks": [
+        "missing and wrong control tokens denied with 401 on both doors",
+        "a request-supplied restoration checkpoint refused; provisioning installs only the deployment's",
+        "the canary ledger's custody-signed history admitted from public bindings alone",
+        "an exact retry of the stable signed act returns its first receipt and adds nothing",
+        "an unverifiable signature and request-supplied norm trust refused"
+      ]
     }
   ]
 }
