@@ -169,6 +169,10 @@ impl EvidenceProjection {
     pub fn events(&self) -> &[SelectionEvent] {
         &self.events
     }
+    /// The verified execution behind one published observation.
+    pub fn execution(&self, event: &str) -> Option<&VerifiedNormExecution> {
+        self.executions.get(event)
+    }
     pub fn gaps(&self) -> &BTreeMap<String, ProjectionGap> {
         &self.gaps
     }

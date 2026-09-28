@@ -33,6 +33,15 @@ enum Interpretation {
     /// Claims over regions (norm-plane §7): context to evidence projection,
     /// and the reservations a gated ref's admission fences.
     Reservation,
+    /// Methods whose positive support is insufficient for gated admission
+    /// while their reliability is unresolved (norm-plane §3.5, N1).
+    Quarantine,
+    /// Fixed-budget statistical policies that can recover a quarantined
+    /// method (norm-plane §3.5).
+    SamplingPolicy,
+    /// Scoped, expiring, authorized exceptions to a gated requirement
+    /// (norm-plane §5).
+    Exception,
 }
 /// A requirement the host could discover no installed method for.
 #[derive(Clone, Debug, serde::Serialize)]
@@ -53,6 +62,9 @@ pub struct Planned {
     pub conformance: Vec<Conformance>,
     /// Conflicts among live claims at the after frontier (norm-plane §7).
     pub reservation_conflicts: Vec<whipplescript_store::norm_reservations::ReservationConflict>,
+    /// Methods whose runs call for an investigation, each with the nonce that
+    /// files it once (norm-plane §3.5).
+    pub investigations: Vec<crate::norm_reliability::Investigation>,
 }
 
 /// A witnessed record's derived current conformance (norm-plane §6, D1): the
@@ -143,6 +155,7 @@ impl Planned {
             "method_gaps": self.method_gaps,
             "conformance": self.conformance,
             "reservation_conflicts": self.reservation_conflicts,
+            "investigations": self.investigations,
         })
     }
 }
@@ -152,6 +165,7 @@ pub struct PlanningConfiguration {
     capability: String,
     roles: BTreeMap<VocabularyRef, ProjectionRole>,
     reservations: std::collections::BTreeSet<VocabularyRef>,
+    reliability: crate::norm_reliability::ReliabilityVocabularies,
 }
 impl PlanningConfiguration {
     pub fn parse(configured: &str) -> Result<Self, String> {
@@ -162,6 +176,7 @@ impl PlanningConfiguration {
         }
         let mut roles = BTreeMap::new();
         let mut reservations = std::collections::BTreeSet::new();
+        let mut reliability = crate::norm_reliability::ReliabilityVocabularies::default();
         for role in configuration.roles {
             if [
                 &role.vocabulary.name,
@@ -180,6 +195,18 @@ impl PlanningConfiguration {
                     reservations.insert(role.vocabulary.clone());
                     ProjectionRole::Context
                 }
+                Interpretation::Quarantine => {
+                    reliability.quarantines.insert(role.vocabulary.clone());
+                    ProjectionRole::Context
+                }
+                Interpretation::SamplingPolicy => {
+                    reliability.policies.insert(role.vocabulary.clone());
+                    ProjectionRole::Context
+                }
+                Interpretation::Exception => {
+                    reliability.exceptions.insert(role.vocabulary.clone());
+                    ProjectionRole::Context
+                }
             };
             if roles.insert(role.vocabulary, interpretation).is_some() {
                 return Err("norm planning vocabulary interpretations must be unique".into());
@@ -189,7 +216,14 @@ impl PlanningConfiguration {
             capability: configuration.capability,
             roles,
             reservations,
+            reliability,
         })
+    }
+
+    /// The vocabularies the host interprets as quarantines, sampling
+    /// policies and exceptions (norm-plane §3.5, §5).
+    pub fn reliability_vocabularies(&self) -> &crate::norm_reliability::ReliabilityVocabularies {
+        &self.reliability
     }
 
     /// The vocabularies the host interprets as reservations.
@@ -302,8 +336,68 @@ pub fn plan<S: RuntimeStore>(
         ImpactLimits::default(),
     )
     .map_err(|error| format!("{error:?}"))?;
+    let mut plan = plan;
+    // Whether an observation's run was prepared against a frontier that held
+    // an act: the causal past of the frontier its intent recorded.
+    let parents: BTreeMap<&str, &[String]> = history
+        .events()
+        .map(|event| (event.event_id.as_str(), event.parents.as_slice()))
+        .collect();
+    let prepared_after = |observation: &str, act: &str| {
+        let Some(execution) = projection.execution(observation) else {
+            return false;
+        };
+        let mut pending: Vec<&str> = execution
+            .intent()
+            .anchor
+            .frontier
+            .iter()
+            .map(String::as_str)
+            .collect();
+        let mut seen = std::collections::BTreeSet::new();
+        while let Some(event) = pending.pop() {
+            if event == act {
+                return true;
+            }
+            if seen.insert(event) {
+                pending.extend(
+                    parents
+                        .get(event)
+                        .into_iter()
+                        .flat_map(|up| up.iter().map(String::as_str)),
+                );
+            }
+        }
+        false
+    };
+    crate::norm_reliability::apply(
+        &mut plan,
+        &after,
+        &configuration.reliability,
+        &prepared_after,
+    );
     let conformance = conformance(&after, &plan);
     let reservation_conflicts = after.reservation_conflicts();
+    let mut observed = BTreeMap::new();
+    for impact in plan.requirements.values().flatten() {
+        let Some(selection) = &impact.selection else {
+            continue;
+        };
+        for (event, judgment) in &selection.judgments {
+            observed.insert(event.clone(), judgment.clone());
+        }
+    }
+    let investigations =
+        crate::norm_reliability::investigations(observed.iter().map(|(event, judgment)| {
+            crate::norm_reliability::Observed {
+                event,
+                method: &judgment.subject.method,
+                artifact: &judgment.subject.artifact,
+                outcome: &judgment.outcome,
+                counterexample: !judgment.counterexamples.is_empty(),
+                diagnosed: !judgment.diagnostics.is_empty(),
+            }
+        }));
     Ok(Planned {
         anchor: history.anchor(),
         before_frontier: before.frontier,
@@ -312,6 +406,7 @@ pub fn plan<S: RuntimeStore>(
         method_gaps: method_gaps.into_inner(),
         conformance,
         reservation_conflicts,
+        investigations,
     })
 }
 

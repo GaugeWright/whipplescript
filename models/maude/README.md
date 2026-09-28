@@ -133,6 +133,19 @@ that bypasses the gate, a forward-only policy that deadlocks where an undo
 is the only recovery, an exception that launders the requirement, and one
 that outlives its expiry.
 
+`evidence-reliability.maude` models norm-plane §3.5 for slice N1: check
+reliability is separate from requirement conformance. A quarantined method's
+positive support does not admit on its own. A statistical policy fixed before
+the evidence it evaluates recovers the method when its window holds the budget
+of runs at the threshold, counting every run in order: a failure as a failure,
+a missing run as a failure too, and a retry never resetting the window.
+Alternate support from a method in good standing admits, and a scoped
+exception leaves a residual obligation and is never support. Fourteen
+searches; each of five refusals has the weakening that reaches it: a reset
+after a failure, a failure reclassified as a harness fault, a missing run
+replaced, three passes clearing quarantine short of the budget, and
+quarantine or an exception standing in for support.
+
 `action-classification.maude` models DR-0124 §14.2: an action's
 classification joins its declared label with every influence that shaped
 it — a declared input, a presence observation, an observation of absence —

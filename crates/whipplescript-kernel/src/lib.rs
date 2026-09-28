@@ -56,6 +56,7 @@ pub mod norm_projection;
 pub mod norm_public_key;
 pub mod norm_publication;
 pub mod norm_query_producer;
+pub mod norm_reliability;
 pub mod norm_runner;
 pub mod norm_runtime;
 pub mod norm_runtime_image;

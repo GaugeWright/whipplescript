@@ -831,6 +831,267 @@
       "inventory_role": {
         "kind": "non_requirement"
       }
+    },
+    {
+      "definition": {
+        "name": "quarantine",
+        "version": "1",
+        "fields": [
+          {
+            "name": "method",
+            "required": true,
+            "value_type": {
+              "type": "text"
+            }
+          },
+          {
+            "name": "reason",
+            "required": true,
+            "value_type": {
+              "type": "text"
+            }
+          }
+        ],
+        "status": {
+          "values": [
+            "active",
+            "cleared"
+          ],
+          "initial": "active",
+          "transitions": [
+            {
+              "from": "active",
+              "to": "cleared",
+              "admission": {
+                "requires": "authority",
+                "scope": "evidence.quarantine"
+              }
+            }
+          ]
+        }
+      },
+      "creation": {
+        "requires": "authority",
+        "scope": "evidence.quarantine"
+      },
+      "effectiveness": [
+        {
+          "status": "active",
+          "effect": "activate"
+        },
+        {
+          "status": "cleared",
+          "effect": "retire"
+        }
+      ],
+      "inventory_role": {
+        "kind": "non_requirement"
+      }
+    },
+    {
+      "definition": {
+        "name": "sampling-policy",
+        "version": "1",
+        "fields": [
+          {
+            "name": "method",
+            "required": true,
+            "value_type": {
+              "type": "text"
+            }
+          },
+          {
+            "name": "proposition",
+            "required": true,
+            "value_type": {
+              "type": "text"
+            }
+          },
+          {
+            "name": "population",
+            "required": true,
+            "value_type": {
+              "type": "text"
+            }
+          },
+          {
+            "name": "binding",
+            "required": true,
+            "value_type": {
+              "type": "text"
+            }
+          },
+          {
+            "name": "budget",
+            "required": true,
+            "value_type": {
+              "type": "integer"
+            }
+          },
+          {
+            "name": "threshold",
+            "required": true,
+            "value_type": {
+              "type": "integer"
+            }
+          },
+          {
+            "name": "missing",
+            "required": true,
+            "value_type": {
+              "type": "enum",
+              "values": [
+                "failure"
+              ]
+            }
+          },
+          {
+            "name": "stopping",
+            "required": true,
+            "value_type": {
+              "type": "enum",
+              "values": [
+                "fixed-budget"
+              ]
+            }
+          }
+        ],
+        "status": {
+          "values": [
+            "proposed",
+            "accepted",
+            "retired"
+          ],
+          "initial": "proposed",
+          "transitions": [
+            {
+              "from": "proposed",
+              "to": "accepted",
+              "admission": {
+                "requires": "authority",
+                "scope": "evidence.policy"
+              }
+            },
+            {
+              "from": "accepted",
+              "to": "retired",
+              "admission": {
+                "requires": "authority",
+                "scope": "evidence.policy"
+              }
+            }
+          ]
+        }
+      },
+      "creation": {
+        "requires": "public"
+      },
+      "effectiveness": [
+        {
+          "status": "accepted",
+          "effect": "activate"
+        },
+        {
+          "status": "retired",
+          "effect": "retire"
+        }
+      ],
+      "inventory_role": {
+        "kind": "non_requirement"
+      }
+    },
+    {
+      "definition": {
+        "name": "exception",
+        "version": "1",
+        "fields": [
+          {
+            "name": "requirement",
+            "required": true,
+            "value_type": {
+              "type": "reference",
+              "form": "identity"
+            }
+          },
+          {
+            "name": "scope",
+            "required": true,
+            "value_type": {
+              "type": "text"
+            }
+          },
+          {
+            "name": "effects",
+            "required": true,
+            "value_type": {
+              "type": "text"
+            }
+          },
+          {
+            "name": "residual",
+            "required": true,
+            "value_type": {
+              "type": "text"
+            }
+          },
+          {
+            "name": "accountable",
+            "required": true,
+            "value_type": {
+              "type": "text"
+            }
+          },
+          {
+            "name": "expires_at",
+            "required": true,
+            "value_type": {
+              "type": "text"
+            }
+          }
+        ],
+        "status": {
+          "values": [
+            "proposed",
+            "granted",
+            "closed"
+          ],
+          "initial": "proposed",
+          "transitions": [
+            {
+              "from": "proposed",
+              "to": "granted",
+              "admission": {
+                "requires": "authority",
+                "scope": "norm.except"
+              }
+            },
+            {
+              "from": "granted",
+              "to": "closed",
+              "admission": {
+                "requires": "authority",
+                "scope": "norm.except"
+              }
+            }
+          ]
+        }
+      },
+      "creation": {
+        "requires": "public"
+      },
+      "effectiveness": [
+        {
+          "status": "granted",
+          "effect": "activate"
+        },
+        {
+          "status": "closed",
+          "effect": "retire"
+        }
+      ],
+      "inventory_role": {
+        "kind": "non_requirement"
+      }
     }
   ],
   "owner_scopes": [
@@ -838,7 +1099,10 @@
     "norm.retire",
     "observe.publish",
     "reservation.grant",
-    "charter.activate"
+    "charter.activate",
+    "evidence.quarantine",
+    "evidence.policy",
+    "norm.except"
   ],
   "activation": {
     "requires": "authority",

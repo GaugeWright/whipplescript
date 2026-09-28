@@ -1,0 +1,97 @@
+--- norm-plane §3.5 and slice N1: check reliability is separate from
+--- requirement conformance.
+---
+--- A quarantined method's positive support does not admit a gated change on
+--- its own. The method is recovered by a statistical policy fixed before the
+--- evidence it evaluates: a sample budget and an acceptance threshold over
+--- runs taken in order. Every run counts, a failure as a failure and a missing
+--- or harness-failed run as a failure too, and a retry never resets the
+--- window. Exhausting the budget below the threshold leaves the result
+--- unresolved. Alternate support from a method in good standing admits. A
+--- scoped exception admits the effect while leaving a residual obligation, and
+--- is never counted as support. Quarantine never makes the requirement
+--- advisory.
+fmod RELIABILITY-SIGNATURE is
+  protecting NAT .
+  sorts Outcome Runs Fact Cfg State .
+  ops pass fail missing : -> Outcome [ctor] .
+  op nil : -> Runs [ctor] .
+  op _;_ : Outcome Runs -> Runs [ctor] .
+  subsort Fact < Cfg .
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+  op {_} : Cfg -> State [ctor] .
+  --- The quarantined method's upcoming runs, in the order they are taken.
+  op runs : Runs -> Fact [ctor] .
+  --- Passes, failures and missing runs counted into the policy's window.
+  op window : Nat Nat Nat -> Fact [ctor] .
+  --- The policy fixed before the evidence: sample budget, passes required.
+  op policy : Nat Nat -> Fact [ctor] .
+  --- Positive support from a method in good standing.
+  op alternate : -> Fact [ctor] .
+  ops open quarantined exception accepted unresolved admitted residual : -> Fact [ctor] .
+endfm
+mod RELIABILITY-BASE is
+  including RELIABILITY-SIGNATURE .
+  vars P F X B T : Nat . var L : Runs . var C : Cfg .
+  --- Runs are counted in order while the window is open and short of its budget.
+  crl [sample-pass] : { open runs(pass ; L) window(P, F, X) policy(B, T) C }
+    => { open runs(L) window(s P, F, X) policy(B, T) C } if P + F + X < B .
+  crl [sample-fail] : { open runs(fail ; L) window(P, F, X) policy(B, T) C }
+    => { open runs(L) window(P, s F, X) policy(B, T) C } if P + F + X < B .
+  crl [sample-missing] : { open runs(missing ; L) window(P, F, X) policy(B, T) C }
+    => { open runs(L) window(P, F, s X) policy(B, T) C } if P + F + X < B .
+  --- The window closes once, at its budget; a missing run is not a pass.
+  crl [accept] : { open window(P, F, X) policy(B, T) C } => { accepted window(P, F, X) policy(B, T) C }
+    if P + F + X == B /\ P >= T .
+  crl [exhaust] : { open window(P, F, X) policy(B, T) C } => { unresolved window(P, F, X) policy(B, T) C }
+    if P + F + X == B /\ P < T .
+  rl [admit-accepted] : { accepted quarantined C } => { admitted C } .
+  rl [admit-alternate] : { alternate quarantined C } => { admitted C } .
+  crl [except] : { exception quarantined C } => { residual exception quarantined C }
+    if not hasResidual(C) .
+  op hasResidual : Cfg -> Bool .
+  eq hasResidual(residual C) = true .
+  eq hasResidual(C) = false [owise] .
+endm
+--- The runs are taken until the budget is spent: sampling stops at the budget.
+mod RELIABILITY is
+  including RELIABILITY-BASE .
+endm
+--- A retry after a failure resets the window.
+mod RELIABILITY-WEAK-RESET is
+  including RELIABILITY-BASE .
+  vars P F X : Nat . var C : Cfg .
+  crl [reset] : { open window(P, F, X) C } => { open window(0, 0, 0) C } if F > 0 .
+endm
+--- A real failure reclassified as a harness fault and dropped.
+mod RELIABILITY-WEAK-HARNESS-FAULT is
+  including RELIABILITY-BASE .
+  var L : Runs . var C : Cfg .
+  rl [fail-as-harness] : { runs(fail ; L) C } => { runs(L) C } .
+endm
+--- A missing run silently replaced by the next one.
+mod RELIABILITY-WEAK-MISSING-REPLACED is
+  including RELIABILITY-BASE .
+  var L : Runs . var C : Cfg .
+  rl [replace-missing] : { runs(missing ; L) C } => { runs(L) C } .
+endm
+--- Three consecutive passes clear quarantine, whatever the policy says.
+mod RELIABILITY-WEAK-THREE-PASSES is
+  including RELIABILITY-BASE .
+  vars P F X : Nat . var C : Cfg .
+  crl [three-passes] : { window(P, F, X) quarantined C } => { admitted window(P, F, X) C }
+    if P >= 3 .
+endm
+--- Quarantine downgrades the requirement to advisory.
+mod RELIABILITY-WEAK-ADVISORY is
+  including RELIABILITY-BASE .
+  var C : Cfg .
+  rl [advisory] : { quarantined C } => { admitted C } .
+endm
+--- An exception counted as support.
+mod RELIABILITY-WEAK-EXCEPTION-SUPPORTS is
+  including RELIABILITY-BASE .
+  var C : Cfg .
+  rl [exception-supports] : { exception quarantined C } => { admitted exception C } .
+endm

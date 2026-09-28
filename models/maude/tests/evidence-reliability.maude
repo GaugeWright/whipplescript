@@ -1,0 +1,24 @@
+load ../evidence-reliability.maude
+--- A full window at its threshold admits the quarantined method's support.
+search [1] in RELIABILITY : { open quarantined runs(pass ; pass ; pass ; nil) window(0, 0, 0) policy(3, 3) } =>* { admitted C:Cfg } .
+--- A failure in the window stays counted; resetting the window after it admits.
+search in RELIABILITY : { open quarantined runs(fail ; pass ; pass ; pass ; nil) window(0, 0, 0) policy(3, 3) } =>* { admitted C:Cfg } .
+search [1] in RELIABILITY-WEAK-RESET : { open quarantined runs(fail ; pass ; pass ; pass ; nil) window(0, 0, 0) policy(3, 3) } =>* { admitted C:Cfg } .
+--- A real failure is not a harness fault; dropping it as one admits.
+search [1] in RELIABILITY-WEAK-HARNESS-FAULT : { open quarantined runs(fail ; pass ; pass ; pass ; nil) window(0, 0, 0) policy(3, 3) } =>* { admitted C:Cfg } .
+--- A missing run counts against the window; replacing it admits.
+search in RELIABILITY : { open quarantined runs(pass ; missing ; pass ; pass ; nil) window(0, 0, 0) policy(3, 3) } =>* { admitted C:Cfg } .
+search [1] in RELIABILITY-WEAK-MISSING-REPLACED : { open quarantined runs(pass ; missing ; pass ; pass ; nil) window(0, 0, 0) policy(3, 3) } =>* { admitted C:Cfg } .
+--- Three passes short of the policy's budget admit nothing; three-pass clearing does.
+search in RELIABILITY : { open quarantined runs(pass ; pass ; pass ; nil) window(0, 0, 0) policy(4, 4) } =>* { admitted C:Cfg } .
+search [1] in RELIABILITY-WEAK-THREE-PASSES : { open quarantined runs(pass ; pass ; pass ; nil) window(0, 0, 0) policy(4, 4) } =>* { admitted C:Cfg } .
+--- Alternate support from a method in good standing admits.
+search [1] in RELIABILITY : { open quarantined alternate runs(nil) window(0, 0, 0) policy(3, 3) } =>* { admitted C:Cfg } .
+--- Without support nothing admits; an advisory quarantine does.
+search in RELIABILITY : { open quarantined runs(nil) window(0, 0, 0) policy(3, 3) } =>* { admitted C:Cfg } .
+search [1] in RELIABILITY-WEAK-ADVISORY : { open quarantined runs(nil) window(0, 0, 0) policy(3, 3) } =>* { admitted C:Cfg } .
+--- A scoped exception leaves a residual obligation and is never support; counting it as support admits.
+search [1] in RELIABILITY : { open quarantined exception runs(nil) window(0, 0, 0) policy(3, 3) } =>* { residual C:Cfg } .
+search in RELIABILITY : { open quarantined exception runs(nil) window(0, 0, 0) policy(3, 3) } =>* { admitted C:Cfg } .
+search [1] in RELIABILITY-WEAK-EXCEPTION-SUPPORTS : { open quarantined exception runs(nil) window(0, 0, 0) policy(3, 3) } =>* { admitted C:Cfg } .
+quit

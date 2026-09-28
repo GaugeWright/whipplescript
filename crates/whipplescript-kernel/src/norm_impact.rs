@@ -62,12 +62,17 @@ pub enum ImpactBasis {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ImpactWork {
     Supported,
-    Check { method: EvidenceVersion },
+    Check {
+        method: EvidenceVersion,
+    },
     Repair,
     ResolveEvidence,
     ObservationGap,
     VerifyEvidence,
     ResourceGap,
+    /// The only positive support comes from a quarantined method, and no
+    /// policy window over it has accepted (norm-plane §3.5, N1).
+    Quarantined(Box<crate::norm_reliability::QuarantinedSupport>),
 }
 #[derive(Clone, Debug, Serialize)]
 pub struct RequirementImpact {

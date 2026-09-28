@@ -1198,7 +1198,10 @@ mod tests {
                 "derived_from",
                 "manifest",
                 "correspondence",
-                "artifact"
+                "artifact",
+                "quarantine",
+                "sampling-policy",
+                "exception"
             ]
         );
         let keys = Keys::new();
@@ -1216,7 +1219,8 @@ mod tests {
                 &keys,
             )
             .unwrap();
-        let mut ids = BTreeMap::new();
+        let mut ids: BTreeMap<String, (String, whipplescript_core::vocabulary::VocabularyRef)> =
+            BTreeMap::new();
         for entry in &c.vocabularies {
             // Relations and manifests need resolvable references and bound
             // premises, and an artifact the owner's `build.publish` scope;
@@ -1240,14 +1244,34 @@ mod tests {
                 "reservation" => {
                     json!({"purpose":"repair","selectors":["src/future.py"],"mode":"speculative"})
                 }
+                "quarantine" => {
+                    json!({"method":"python-calls@2","reason":"a pass and a failure on matching premises"})
+                }
+                "sampling-policy" => json!({
+                    "method":"python-calls@2","proposition":"Q0 decides the requirement",
+                    "population":"runs on the candidate","binding":"the pinned runtime",
+                    "budget":3,"threshold":3,"missing":"failure","stopping":"fixed-budget"
+                }),
+                "exception" => json!({
+                    "requirement": ids["obligation"].0,
+                    "scope":"main","effects":"promote","residual":"check it","accountable":"owner",
+                    "expires_at":"2999-01-01T00:00:00Z"
+                }),
                 _ => panic!("uncovered bundled declaration"),
+            };
+            // A quarantine is the owner's `evidence.quarantine` act; every other
+            // bundled creation is public.
+            let signer = if entry.definition.name == "quarantine" {
+                "owner"
+            } else {
+                "worker"
             };
             let vocabulary = Vocabulary::new(entry.definition.clone())
                 .unwrap()
                 .reference()
                 .clone();
             let event = keys.sign(
-                "worker",
+                signer,
                 &entry.definition.name,
                 NormAct::Create {
                     ledger: ledger.clone(),
@@ -1300,7 +1324,8 @@ mod tests {
             },
         );
         assert!(store.append_norm_event(&granted, &keys).is_err());
-        assert_eq!(store.norm_aliases().unwrap().len(), 5);
+        // One record for each bundled vocabulary created above.
+        assert_eq!(store.norm_aliases().unwrap().len(), 8);
     }
     /// DR-0122 §13.2 and §13.4, the runtime half of
     /// `models/maude/relation-validation-scope.maude`: an act that makes an

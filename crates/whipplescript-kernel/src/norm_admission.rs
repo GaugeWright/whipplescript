@@ -65,6 +65,10 @@ pub struct AdmissionCertificate {
     /// Each exclusive reservation the proposal's changes fall under, with
     /// the current token the requester presented for it (norm-plane §7).
     pub reservations: BTreeMap<String, String>,
+    /// Each gated requirement admitted unsupported under a scoped, unexpired
+    /// exception, with the residual obligation it leaves (norm-plane §5).
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub exceptions: BTreeMap<String, crate::norm_reliability::AppliedException>,
 }
 
 /// Why a proposal was refused, named by what it lacks.
@@ -140,6 +144,25 @@ fn work_name(work: &ImpactWork) -> String {
 pub fn judge(
     planned: &Planned,
 ) -> Result<(BTreeSet<String>, BTreeSet<String>), Box<AdmissionRefusal>> {
+    judge_with_exceptions(planned, &BTreeMap::new())
+        .map(|(requirements, evidence, _)| (requirements, evidence))
+}
+
+/// What an admissible plan certifies: the requirements judged, the evidence
+/// selected for them, and the exceptions applied.
+pub type Judged = (
+    BTreeSet<String>,
+    BTreeSet<String>,
+    BTreeMap<String, crate::norm_reliability::AppliedException>,
+);
+
+/// Judge a plan as `judge` does, except that a requirement an applicable
+/// exception covers is admitted unsupported; the exceptions applied are
+/// returned so the certificate records them and their residual obligations.
+pub fn judge_with_exceptions(
+    planned: &Planned,
+    exceptions: &BTreeMap<String, crate::norm_reliability::AppliedException>,
+) -> Result<Judged, Box<AdmissionRefusal>> {
     let mut refusal = AdmissionRefusal {
         evidence_gaps: planned.plan.evidence_gaps.keys().cloned().collect(),
         method_gaps: planned.method_gaps.keys().cloned().collect(),
@@ -153,6 +176,7 @@ pub fn judge(
     };
     let mut requirements = BTreeSet::new();
     let mut evidence = BTreeSet::new();
+    let mut applied = BTreeMap::new();
     for (requirement, impacts) in &planned.plan.requirements {
         requirements.insert(requirement.clone());
         for impact in impacts {
@@ -160,6 +184,8 @@ pub fn judge(
                 if let Some(selection) = &impact.selection {
                     evidence.extend(selection.positive.iter().cloned());
                 }
+            } else if let Some(exception) = exceptions.get(requirement) {
+                applied.insert(requirement.clone(), exception.clone());
             } else {
                 refusal
                     .requirements
@@ -170,7 +196,7 @@ pub fn judge(
         }
     }
     if refusal == AdmissionRefusal::default() {
-        Ok((requirements, evidence))
+        Ok((requirements, evidence, applied))
     } else {
         Err(Box::new(refusal))
     }
@@ -406,6 +432,7 @@ impl<L: AdmissionLedger, S: RuntimeStore> MainlineGate for NormMainlineAdmission
             requirements: BTreeSet::new(),
             evidence: BTreeSet::new(),
             reservations: BTreeMap::new(),
+            exceptions: BTreeMap::new(),
         };
         if !self.ledger.bootstrapped()? {
             self.certificate = Some(certificate);
@@ -473,12 +500,19 @@ impl<L: AdmissionLedger, S: RuntimeStore> MainlineGate for NormMainlineAdmission
         }
         let (fenced, mut unfenced) = fence(&view, reservations, &changed, &presented, host.now);
         unfenced.append(&mut misnamed);
-        match judge(&planned) {
-            Ok((requirements, evidence)) if unfenced.is_empty() => {
+        let exceptions = crate::norm_reliability::exceptions(
+            &view,
+            host.configuration.reliability_vocabularies(),
+            &self.target_ref,
+            host.now,
+        );
+        match judge_with_exceptions(&planned, &exceptions) {
+            Ok((requirements, evidence, applied)) if unfenced.is_empty() => {
                 certificate.anchor = Some(planned.anchor.clone());
                 certificate.requirements = requirements;
                 certificate.evidence = evidence;
                 certificate.reservations = fenced;
+                certificate.exceptions = applied;
                 self.certificate = Some(certificate);
                 Ok(GateVerdict::Admit)
             }

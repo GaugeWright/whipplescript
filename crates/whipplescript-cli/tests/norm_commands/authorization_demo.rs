@@ -129,6 +129,9 @@ impl Host {
                 let interpretation = match entry.definition.name.as_str() {
                     "local-observation" => "published_execution",
                     "reservation" => "reservation",
+                    "quarantine" => "quarantine",
+                    "sampling-policy" => "sampling_policy",
+                    "exception" => "exception",
                     _ => "context",
                 };
                 json!({
@@ -1011,6 +1014,87 @@ fn the_authorization_demo_repairs_a_violated_requirement_under_a_current_token()
         Some(demo("src/parser.py"))
     );
 
+    // N1: Q0's method is quarantined, and its passing run no longer carries
+    // the promotion. The requirement is not advisory: it blocks as
+    // `quarantined` until a policy fixed before its own evidence accepts.
+    let method = {
+        let plan = planned(&fixture, &host, "a0", "a2");
+        let impact = &plan["plan"]["requirements"][&requirement][0];
+        let positive = impact["selection"]["positive"][0]
+            .as_str()
+            .expect("the supporting run")
+            .to_owned();
+        let method = &impact["selection"]["judgments"][&positive]["subject"]["method"];
+        format!(
+            "{}@{}",
+            method["name"].as_str().expect("method name"),
+            method["version"].as_str().expect("method version")
+        )
+    };
+    fixture.write(
+        "quarantine.json",
+        &json!({"method": method, "reason": "worker-deny has passed and failed on matching premises"}),
+    );
+    let quarantine = fixture.run(&[
+        "create",
+        "quarantine@1",
+        "--as",
+        "owner",
+        "--fields",
+        "quarantine.json",
+    ])["result"]["event_id"]
+        .as_str()
+        .expect("quarantine")
+        .to_owned();
+    assert_eq!(
+        impact(&fixture, &host, "a0", "a2", &requirement),
+        ["quarantined"]
+    );
+    assert_eq!(
+        refused(&promote(&fixture, &host, &[&t2]))["detail"]["requirements"][&requirement],
+        json!(["quarantined"])
+    );
+    fixture.write(
+        "policy.json",
+        &json!({
+            "method": method,
+            "proposition": "Q0 decides custody-authorization at the candidate",
+            "population": "runs of Q0 on this candidate's exact artifact",
+            "binding": "the host's pinned protected runtime",
+            "budget": 3,
+            "threshold": 3,
+            "missing": "failure",
+            "stopping": "fixed-budget",
+        }),
+    );
+    let policy = fixture.run(&[
+        "create",
+        "sampling-policy@1",
+        "--as",
+        "worker",
+        "--fields",
+        "policy.json",
+    ])["result"]["event_id"]
+        .as_str()
+        .expect("policy")
+        .to_owned();
+    fixture.run(&["transition", &policy, "accepted", "--as", "owner"]);
+    // The run before the policy does not count, and two after it leave the
+    // window collecting; the third fills it at its threshold.
+    observe(&fixture, &host, &hosted, &requirement, "a2", "a2-p1", &[]);
+    observe(&fixture, &host, &hosted, &requirement, "a2", "a2-p2", &[]);
+    let collecting = planned(&fixture, &host, "a0", "a2");
+    let work = &collecting["plan"]["requirements"][&requirement][0]["work"];
+    assert_eq!(work["kind"], "quarantined", "{work}");
+    assert_eq!(work["window"]["verdict"], "collecting", "{work}");
+    assert_eq!(work["window"]["passes"], 2, "{work}");
+    observe(&fixture, &host, &hosted, &requirement, "a2", "a2-p3", &[]);
+    assert_eq!(
+        impact(&fixture, &host, "a0", "a2", &requirement),
+        ["supported"]
+    );
+    fixture.run(&["transition", &quarantine, "cleared", "--as", "owner"]);
+
     // NP-19: the repair, freshly supported, admitted under the current T2.
     let admitted = promote(&fixture, &host, &[&t2]);
     assert!(
@@ -1326,6 +1410,61 @@ fn the_authorization_demo_repairs_a_violated_requirement_under_a_current_token()
         );
     }
 
+    // A scoped exception admits what support cannot yet (norm-plane §5). An
+    // expired one changes nothing; one granted for `main` and unexpired
+    // admits the promotion on both hosts, and its residual obligation stays
+    // on the ledger with its accountable holder. It is never support: the
+    // requirement still needs its check at the new file.
+    let exception = |name: &str, expires_at: &str| {
+        fixture.write(
+            name,
+            &json!({
+                "requirement": requirement,
+                "scope": "main",
+                "effects": "promote the stream `next`",
+                "residual": "check custody-authorization at src/new.py",
+                "accountable": "owner",
+                "expires_at": expires_at,
+            }),
+        );
+        let proposed = fixture.run(&["create", "exception@1", "--as", "worker", "--fields", name])
+            ["result"]["event_id"]
+            .as_str()
+            .expect("exception")
+            .to_owned();
+        fixture.run(&["transition", &proposed, "granted", "--as", "owner"]);
+        proposed
+    };
+    exception("expired-exception.json", "2020-01-01T00:00:00Z");
+    let still = refused(&promote_stream(&fixture, &host, "next", &[]));
+    assert_eq!(
+        still["detail"]["requirements"]
+            .as_object()
+            .map(|requirements| requirements.len()),
+        Some(1),
+        "{still}"
+    );
+    exception("exception.json", "2999-01-01T00:00:00Z");
+    assert!(
+        !impact(&fixture, &host, "a4", "a4", &requirement)
+            .iter()
+            .any(|work| work == "supported"),
+        "an exception is never support"
+    );
+    hosted.sync(&fixture);
+    let excepted = promote_stream(&fixture, &host, "next", &[]);
+    assert!(
+        excepted.status.success(),
+        "{}",
+        String::from_utf8_lossy(&excepted.stdout)
+    );
+    assert_eq!(
+        read(&fixture, MAINLINE_BRANCH_ID, "src/new.py").as_deref(),
+        Some("NEW = True\n")
+    );
+    let hosted_excepted = hosted.promote_stream("next", "excepted", &[]);
+    assert_eq!(hosted_excepted["promoted"], "next", "{hosted_excepted}");
+
     // The failure and its fixing cut stay inspectable: both observations
     // and the passing one are in the ledger, the counterexample located at
     // worker-deny, and `work` holds the fixing cut after the failing one.
@@ -1345,7 +1484,8 @@ fn the_authorization_demo_repairs_a_violated_requirement_under_a_current_token()
                 .collect()
         })
         .unwrap_or_default();
-    assert_eq!(observations.len(), 3, "{observations:?}");
+    // A0, the failing A1, the repair's A2, and the policy's three runs of A2.
+    assert_eq!(observations.len(), 6, "{observations:?}");
     assert!(observations
         .iter()
         .any(|observation| observation.contains("worker-deny")

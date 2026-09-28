@@ -650,6 +650,7 @@ fn the_gate_admits_only_a_fully_supported_plan_and_names_what_is_lacking() {
         method_gaps,
         conformance: Vec::new(),
         reservation_conflicts: Vec::new(),
+        investigations: Vec::new(),
     };
     let plan_for = |mode: &str| {
         let mut host = Host {
