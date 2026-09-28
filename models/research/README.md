@@ -140,6 +140,23 @@ provenance. Production must supply that derivation and bind it to the
 declaration; accepting an arbitrary caller-provided change list would move
 the same defect one layer earlier.
 
+`transitive_transport_lineage.py` checks the content and identity shape a
+durable transport derivation must carry through two outputs:
+
+```sh
+python3 models/research/transitive_transport_lineage.py
+```
+
+It derives a mixed branch output from two source atoms, then transports that
+output again while retaining both original units. A Hold on either unit still
+blocks admission; accounting uses the roots rather than either output change
+id. Its counterexamples lose a constituent from a derivation edge, settle the
+output id in place of the units, or hide an unselected middle write behind
+matching path endpoints. It also refuses changed substance under one atom id.
+This is an explicit-scenario content abstraction: a trusted selection supplies
+the source atoms, and no native or hosted store yet persists these derivation
+edges with a ref move. It does not close FB-1 or FB-2.
+
 `revision_lineage.py` probes the other half of that boundary: every
 acknowledged mutation of a selected unit's meaning must advance the ref-owned
 source epoch before the topology head changes. It models eight mutation
