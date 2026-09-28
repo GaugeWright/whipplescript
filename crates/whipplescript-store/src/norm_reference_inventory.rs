@@ -148,7 +148,7 @@ mod tests {
     fn bundled_charter_exposes_every_typed_reference_without_live_routing_claim() {
         let charter = NormCharter::bundled().expect("bundled charter");
         let fields = inventory(&charter);
-        assert_eq!(fields.len(), 11);
+        assert_eq!(fields.len(), 12);
         assert_eq!(
             fields
                 .iter()
@@ -170,9 +170,17 @@ mod tests {
                 .count(),
             2
         );
-        assert!(fields
-            .iter()
-            .all(|field| field.role != NormReferenceRole::Unclassified));
+        // An exception's requirement is read by the planner's interpretation
+        // (norm-plane §3.5), not declared by the charter, so the charter
+        // alone leaves it unclassified, and says so.
+        assert_eq!(
+            fields
+                .iter()
+                .filter(|field| field.role == NormReferenceRole::Unclassified)
+                .map(|field| (field.vocabulary.as_str(), field.path.as_str()))
+                .collect::<Vec<_>>(),
+            [("exception", "requirement")]
+        );
     }
 
     #[test]
@@ -201,7 +209,7 @@ mod tests {
             editorial: false,
         });
         let fields = inventory(&charter);
-        assert_eq!(fields.len(), 12);
+        assert_eq!(fields.len(), 13);
         assert!(fields.iter().any(|field| {
             field.vocabulary == "issue"
                 && field.path == "metadata.new_links[]"
