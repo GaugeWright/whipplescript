@@ -12941,6 +12941,11 @@ fn execute_scenario(
     typed_actions: Option<&TypedActionPlans>,
     path: &str,
 ) -> Result<ScenarioWorld, String> {
+    let scenario_source = Path::new(path);
+    let package_lock = load_package_lock(None, &[scenario_source])?;
+    contract_registry_for_ir(package_lock.as_ref(), ir)?;
+    let checked_packages = checked_local_packages(package_lock.as_ref())?;
+    let compiler_artifact_digest = native_compiler_artifact_digest()?;
     let scratch = ScenarioScratch::new(&test.name)?;
     let store_path = scratch.store_path();
     // Isolate the workspace-scoped builtin tracker per scenario so `given tracker`
@@ -12951,6 +12956,7 @@ fn execute_scenario(
     env::set_var("WHIPPLESCRIPT_ITEMS_STORE", &items_store_path);
     let store = SqliteStore::open(&store_path)
         .map_err(|error| format!("open scenario store: {}", store_error(error)))?;
+    register_locked_packages(&store, package_lock.as_ref()).map_err(store_error)?;
     let mut kernel = RuntimeKernel::new(store);
 
     // `given file <store> at <path> "<content>"` seeds deterministic fixture
@@ -13025,17 +13031,16 @@ fn execute_scenario(
     // so old-body completion can reload this version's rule bodies after a
     // later revision. Idempotent; best-effort.
     let _ = kernel.store().put_content(source);
-    let version = kernel
-        .create_program_version_for_compiled_program(
-            CompiledProgramVersionInput {
-                program_name: &ir.workflow,
-                source_hash: &stable_hash_hex(source),
-                compiler_version: whipplescript_core::version(),
-            },
-            ir,
-            typed_actions,
-        )
-        .map_err(store_error)?;
+    let version = create_checked_native_program_version(
+        &mut kernel,
+        source,
+        ir,
+        typed_actions,
+        package_lock.as_ref(),
+        &checked_packages,
+        &compiler_artifact_digest,
+    )
+    .map_err(store_error)?;
     // `given input` seeds the workflow input the instance is created with.
     let mut input_json = "{}".to_owned();
     let mut input_seen = false;

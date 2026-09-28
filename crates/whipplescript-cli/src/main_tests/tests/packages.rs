@@ -113,6 +113,81 @@ fn native_child_admits_its_checked_local_import_basis() {
 }
 
 #[test]
+fn native_scenario_refuses_an_unresolved_local_import() {
+    let examples = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples");
+    let source = format!(
+        "use toolkit\n{}",
+        fs::read_to_string(examples.join("tested-agent-turn.whip")).unwrap()
+    );
+    let path = unique_test_path("unresolved-scenario-import", "whip");
+    fs::write(&path, &source).unwrap();
+    let compiled = whipplescript_parser::compile_program(&source);
+    assert!(
+        compiled.diagnostics.is_empty(),
+        "{:?}",
+        compiled.diagnostics
+    );
+    let ir = compiled.ir.expect("scenario program compiles");
+    let report = run_test_scenario(
+        &ir.tests[0],
+        &source,
+        &ir,
+        compiled.typed_actions.as_ref(),
+        path.to_str().unwrap(),
+    );
+    assert_eq!(report.status, "invalid");
+    assert!(report
+        .messages
+        .iter()
+        .any(|message| { message.contains("import `toolkit` requires a package lock") }));
+    let _ = fs::remove_file(path);
+}
+
+#[test]
+fn native_scenario_admits_a_locked_local_import() {
+    let examples = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples");
+    let fixture = unique_test_path("checked-scenario-import", "dir");
+    fs::create_dir_all(fixture.join("packages")).unwrap();
+    fs::copy(
+        examples.join("subworkflow-tool-consumer.lock.json"),
+        fixture.join("whip.lock"),
+    )
+    .unwrap();
+    fs::copy(
+        examples.join("packages/toolkit.json"),
+        fixture.join("packages/toolkit.json"),
+    )
+    .unwrap();
+    fs::copy(
+        examples.join("echo-text-tool.whip"),
+        fixture.join("echo-text-tool.whip"),
+    )
+    .unwrap();
+    let source = format!(
+        "use toolkit\n{}",
+        fs::read_to_string(examples.join("tested-agent-turn.whip")).unwrap()
+    );
+    let program = fixture.join("scenario.whip");
+    fs::write(&program, &source).unwrap();
+    let compiled = whipplescript_parser::compile_program(&source);
+    assert!(
+        compiled.diagnostics.is_empty(),
+        "{:?}",
+        compiled.diagnostics
+    );
+    let ir = compiled.ir.expect("scenario program compiles");
+    let report = run_test_scenario(
+        &ir.tests[0],
+        &source,
+        &ir,
+        compiled.typed_actions.as_ref(),
+        program.to_str().unwrap(),
+    );
+    assert_eq!(report.status, "passed", "{:?}", report.messages);
+    let _ = fs::remove_dir_all(fixture);
+}
+
+#[test]
 fn native_start_admits_the_checked_local_import_basis() {
     let examples = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples");
     let program = examples.join("subworkflow-tool-consumer.whip");
