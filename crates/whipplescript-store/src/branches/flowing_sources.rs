@@ -292,6 +292,7 @@ pub enum HandoffContributionOutcome {
     TargetStale { current_head_cut_id: Option<String> },
     TargetCutMissing,
     TargetCutMismatch,
+    TargetCutAuthorshipMismatch,
     TargetManifestMissing,
     Invalid { field: &'static str },
 }

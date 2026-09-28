@@ -466,21 +466,42 @@ impl FlowingSources for BranchStore {
                 current_head_cut_id: target.head_cut_id,
             });
         }
-        let target_cut: Option<(String, String, Option<String>)> = tx
+        struct TargetCutProvenance {
+            branch_id: String,
+            manifest_hash: String,
+            parent_cut_id: Option<String>,
+            origin: Option<String>,
+            actor: Option<String>,
+        }
+        let target_cut: Option<TargetCutProvenance> = tx
             .query_row(
-                "SELECT branch_id, manifest_hash, parent_cut_id FROM cuts WHERE cut_id = ?1",
+                "SELECT branch_id, manifest_hash, parent_cut_id, origin, actor FROM cuts WHERE cut_id = ?1",
                 params![witness.target_after_cut_id()],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| {
+                    Ok(TargetCutProvenance {
+                        branch_id: row.get(0)?,
+                        manifest_hash: row.get(1)?,
+                        parent_cut_id: row.get(2)?,
+                        origin: row.get(3)?,
+                        actor: row.get(4)?,
+                    })
+                },
             )
             .optional()?;
-        let Some((branch_id, manifest_hash, parent_cut_id)) = target_cut else {
+        let Some(target_cut) = target_cut else {
             return Ok(HandoffContributionOutcome::TargetCutMissing);
         };
-        if branch_id != witness.target_branch_id()
-            || manifest_hash != witness.target_after_manifest_hash()
-            || parent_cut_id.as_deref() != witness.target_before_cut_id()
+        if target_cut.branch_id != witness.target_branch_id()
+            || target_cut.manifest_hash != witness.target_after_manifest_hash()
+            || target_cut.parent_cut_id.as_deref() != witness.target_before_cut_id()
         {
             return Ok(HandoffContributionOutcome::TargetCutMismatch);
+        }
+        if target_cut.origin.as_deref()
+            != Some(format!("transport:{}", unit.source_branch_id).as_str())
+            || target_cut.actor.as_deref() != Some(request.actor)
+        {
+            return Ok(HandoffContributionOutcome::TargetCutAuthorshipMismatch);
         }
         let receipt = HandoffReceipt {
             op_id: request.op_id.to_owned(),

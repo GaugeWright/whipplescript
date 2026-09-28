@@ -464,6 +464,12 @@ impl<S: DoSql> FlowingSources for DoBranches<S> {
             {
                 return Ok(HandoffContributionOutcome::TargetCutMismatch);
             }
+            if target_cut.origin.as_deref()
+                != Some(format!("transport:{}", unit.source_branch_id).as_str())
+                || target_cut.actor.as_deref() != Some(request.actor())
+            {
+                return Ok(HandoffContributionOutcome::TargetCutAuthorshipMismatch);
+            }
             let receipt = HandoffReceipt {
                 op_id: request.op_id().to_owned(),
                 unit_id: unit.unit_id,
@@ -1003,6 +1009,12 @@ mod tests {
         else {
             panic!("target must contain exact selected effect")
         };
+        assert_eq!(
+            vcs.handoff_private_selection("wrong-actor", &witness, "another", "t6")
+                .expect("authorship refusal"),
+            HandoffContributionOutcome::TargetCutAuthorshipMismatch
+        );
+        assert_eq!(branches.handoff_receipt("wrong-actor").unwrap(), None);
         sql.execute(
             "CREATE TRIGGER fail_handoff_head BEFORE UPDATE ON branches \
              WHEN NEW.branch_id = 'branch' BEGIN SELECT RAISE(ABORT, 'late head failure'); END",

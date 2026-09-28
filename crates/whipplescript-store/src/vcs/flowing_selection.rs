@@ -734,6 +734,74 @@ mod tests {
     }
 
     #[test]
+    fn target_cut_provenance_is_checked_inside_the_handoff_transaction() {
+        let mut vcs = bound_unit();
+        let witness = prepare_target(&mut vcs, "target-a");
+        assert_eq!(
+            vcs.handoff_private_selection("wrong-actor", &witness, "another", "t5")
+                .unwrap(),
+            HandoffContributionOutcome::TargetCutAuthorshipMismatch
+        );
+        assert!(vcs
+            .branches
+            .handoff_receipt("wrong-actor")
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            vcs.branches
+                .get_branch("branch")
+                .unwrap()
+                .unwrap()
+                .head_cut_id,
+            None
+        );
+
+        let mut vcs = bound_unit();
+        let basis = vcs.branches.contribution_basis("unit-a").unwrap().unwrap();
+        let after = basis.atoms[0].after.clone().unwrap();
+        let manifest = vcs
+            .store_manifest(&BTreeMap::from([("a.txt".to_owned(), after)]))
+            .unwrap();
+        vcs.branches
+            .record_cut(CutRecord {
+                cut_id: "unrelated-write",
+                change_id: "unrelated-write",
+                branch_id: "branch",
+                manifest_hash: &manifest,
+                parent_cut_id: None,
+                origin: Some("write:a.txt"),
+                actor: Some("mediator"),
+                intent: None,
+                recorded_at: "t4",
+            })
+            .unwrap();
+        let FlowingTargetEffectsOutcome::Verified(witness) = vcs
+            .verify_private_target_effects("unit-a", "unrelated-write")
+            .unwrap()
+        else {
+            panic!("bytes alone match")
+        };
+        assert_eq!(
+            vcs.handoff_private_selection("wrong-origin", &witness, "mediator", "t5")
+                .unwrap(),
+            HandoffContributionOutcome::TargetCutAuthorshipMismatch
+        );
+        assert!(vcs
+            .branches
+            .handoff_receipt("wrong-origin")
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            vcs.branches
+                .get_branch("branch")
+                .unwrap()
+                .unwrap()
+                .head_cut_id,
+            None
+        );
+    }
+
+    #[test]
     fn target_effect_comparison_requires_the_actual_selected_bytes() {
         let mut vcs = bound_unit();
         vcs.write("branch", "a.txt", Some("A"), "branch-a", "t4")
