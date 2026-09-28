@@ -2232,6 +2232,35 @@ impl GovernedHostRuntime {
         R: ResourceResolver + ?Sized,
         H: HostDriver,
     {
+        self.run_turn_with_driver_and_provenance(
+            command,
+            packages,
+            secrets,
+            resources,
+            driver,
+            &Default::default(),
+        )
+    }
+
+    /// Drive the same admitted machine through a caller-supplied transport
+    /// while carrying host-attested input sources into each HTTP request's
+    /// transient model provenance. The driver may inspect the request body and
+    /// labels before transport; neither enters durable runtime evidence.
+    pub fn run_turn_with_driver_and_provenance<P, S, R, H>(
+        &mut self,
+        command: &StartTurnCommand,
+        packages: &P,
+        secrets: &S,
+        resources: &R,
+        driver: &H,
+        model_provenance: &whipplescript_kernel::sansio::InitialModelProvenance,
+    ) -> Result<TurnExecution, HostRuntimeError>
+    where
+        P: PackageResolver + ?Sized,
+        S: SecretResolver + ?Sized,
+        R: ResourceResolver + ?Sized,
+        H: HostDriver,
+    {
         self.admit_command(command, packages)?;
         let binding = self.resolve_provider(command, secrets)?;
         self.run_admitted_turn(
@@ -2242,7 +2271,7 @@ impl GovernedHostRuntime {
             driver,
             TurnRunInspection {
                 stream_released: None,
-                model_provenance: &Default::default(),
+                model_provenance,
             },
         )
     }
@@ -4035,6 +4064,7 @@ workflow UnsafeHostChat {
     struct ScriptedDriver {
         replies: RefCell<VecDeque<Value>>,
         requests: RefCell<Vec<Value>>,
+        provenance: RefCell<Vec<Option<whipplescript_kernel::sansio::ModelRequestProvenance>>>,
     }
 
     impl ScriptedDriver {
@@ -4042,6 +4072,7 @@ workflow UnsafeHostChat {
             Self {
                 replies: RefCell::new(replies.into()),
                 requests: RefCell::new(Vec::new()),
+                provenance: RefCell::new(Vec::new()),
             }
         }
     }
@@ -4050,6 +4081,9 @@ workflow UnsafeHostChat {
         fn fulfill(&self, request: &IoRequest) -> IoResult {
             let IoRequest::Http(request) = request;
             self.requests.borrow_mut().push(request.body.clone());
+            self.provenance
+                .borrow_mut()
+                .push(request.model_provenance.clone());
             IoResult::Http(Ok(HttpResponse {
                 status: 200,
                 body: self
@@ -4059,6 +4093,56 @@ workflow UnsafeHostChat {
                     .expect("scripted reply"),
             }))
         }
+    }
+
+    #[test]
+    fn custom_driver_receives_attested_model_sources() {
+        use whipplescript_kernel::sansio::{InitialModelProvenance, ModelContentProvenance};
+
+        let path = temp_store();
+        let policy_text = signed_policy();
+        let mut runtime = GovernedHostRuntime::open(&path, 7, &policy_text).expect("runtime");
+        let open = OpenInstanceCommand {
+            protocol: HOST_PROTOCOL.to_owned(),
+            request_id: "open-chat".to_owned(),
+            package_version_ref: "package:v1".to_owned(),
+            policy: runtime.policy_ref().clone(),
+        };
+        let instance = runtime.open_instance(&open, &Packages).expect("instance");
+        let known = |source: &str| ModelContentProvenance {
+            source_handles: vec![source.to_owned()],
+            complete: true,
+        };
+        let sources = InitialModelProvenance {
+            system: known("package:v1"),
+            user: known("chat:one"),
+            world: known("chat:one"),
+            tools: known("package:v1"),
+            workspace_content: ModelContentProvenance::default(),
+        };
+        let driver = ScriptedDriver::new(vec![json!({
+            "output_text": "done",
+            "usage": { "input_tokens": 10, "output_tokens": 2 }
+        })]);
+        runtime
+            .run_turn_with_driver_and_provenance(
+                &turn(&instance.instance_ref, &open.policy, 1),
+                &Packages,
+                &Secrets {
+                    calls: Cell::new(0),
+                },
+                &Resources {
+                    calls: Cell::new(0),
+                },
+                &driver,
+                &sources,
+            )
+            .expect("turn");
+        let labels = driver.provenance.borrow();
+        assert_eq!(labels.len(), 1);
+        let labels = labels[0].as_ref().expect("transient model sources");
+        assert_eq!(labels.messages[0], known("package:v1"));
+        assert_eq!(labels.tools, known("package:v1"));
     }
 
     struct CancellingDriver {
