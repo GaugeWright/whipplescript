@@ -140,6 +140,9 @@ pub struct DoToolExecutor<Sql: DoSql> {
     /// Full bytes seen by successful native-hosted `read` calls, keyed by tool
     /// call ID until the next model request consumes their source labels.
     model_read_witnesses: std::sync::Mutex<BTreeMap<String, (String, String)>>,
+    /// Every file searched by a bounded directory grep, including negative
+    /// matches. A partial or oversized scan never enters this map.
+    model_scan_witnesses: std::sync::Mutex<BTreeMap<String, DoScanWitness>>,
     sql: Rc<Sql>,
     key_prefix: String,
     file_scopes: Option<Vec<DoFileScope>>,
@@ -157,11 +160,17 @@ struct DoFileScope {
     writable: bool,
 }
 
+struct DoScanWitness {
+    root: String,
+    files: Vec<(String, String)>,
+}
+
 impl<Sql: DoSql> DoToolExecutor<Sql> {
     pub fn new(sql: Rc<Sql>) -> Self {
         Self {
             workspace_reads: std::sync::Mutex::new(Vec::new()),
             model_read_witnesses: std::sync::Mutex::new(BTreeMap::new()),
+            model_scan_witnesses: std::sync::Mutex::new(BTreeMap::new()),
             sql,
             key_prefix: String::new(),
             file_scopes: None,
@@ -175,6 +184,7 @@ impl<Sql: DoSql> DoToolExecutor<Sql> {
         Self {
             workspace_reads: std::sync::Mutex::new(Vec::new()),
             model_read_witnesses: std::sync::Mutex::new(BTreeMap::new()),
+            model_scan_witnesses: std::sync::Mutex::new(BTreeMap::new()),
             sql,
             key_prefix: format!("{instance_id}/"),
             file_scopes: None,
@@ -267,7 +277,7 @@ impl<Sql: DoSql> DoToolExecutor<Sql> {
             TOOL_READ => self.read(&call.id, args),
             TOOL_WRITE => self.write(args),
             TOOL_EDIT => self.edit(args),
-            TOOL_GREP => self.grep(args),
+            TOOL_GREP => self.grep(&call.id, args),
             TOOL_FIND => self.find(args),
             TOOL_LS => self.ls(args),
             TOOL_RECALL => self.recall(args),
@@ -624,7 +634,7 @@ impl<Sql: DoSql> DoToolExecutor<Sql> {
     /// per-line char cap, match-count limit. A valid pattern is a regular
     /// expression; an invalid pattern falls back to a literal substring so a
     /// pasted code fragment remains searchable.
-    fn grep(&self, args: &Value) -> Result<String, String> {
+    fn grep(&self, call_id: &str, args: &Value) -> Result<String, String> {
         let pattern = str_arg(args, "pattern")?;
         let admitted = self.path_access(optional_str_arg(args, "path").unwrap_or("."), false)?;
         let prefix = directory_prefix(&admitted);
@@ -647,12 +657,22 @@ impl<Sql: DoSql> DoToolExecutor<Sql> {
             .collect();
         let mut hits: Vec<String> = Vec::new();
         let mut matches_found = 0usize;
+        let mut searched_files = Vec::new();
+        let mut scan_complete = true;
         for (key, content) in self.all_files(Some(&prefix))? {
             if matches_found >= limit {
                 break;
             }
             if !keys.contains(&key) {
                 continue;
+            }
+            if searched_files.len() < 128 {
+                searched_files.push((
+                    key.clone(),
+                    whipplescript_store::stable_hash_bytes_hex(content.as_bytes()),
+                ));
+            } else {
+                scan_complete = false;
             }
             let lines: Vec<&str> = content.lines().collect();
             let matched: Vec<bool> = lines.iter().map(|line| matcher.is_match(line)).collect();
@@ -679,6 +699,18 @@ impl<Sql: DoSql> DoToolExecutor<Sql> {
                     hits.push(format!("{key}-{}-{line}", index + 1));
                 }
             }
+        }
+        if scan_complete && !searched_files.is_empty() {
+            self.model_scan_witnesses
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .insert(
+                    call_id.to_owned(),
+                    DoScanWitness {
+                        root: admitted,
+                        files: searched_files,
+                    },
+                );
         }
         if hits.is_empty() {
             Ok("No matches".to_string())
@@ -884,6 +916,30 @@ impl<Sql: DoSql> ToolExecutor for DoToolExecutor<Sql> {
                 };
             }
         }
+        if call.name == TOOL_GREP {
+            let scan = self
+                .model_scan_witnesses
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(&call.id);
+            if let (Some(scan), Some(chat_id)) = (
+                scan,
+                self.workspace_source
+                    .as_deref()
+                    .and_then(|source| source.strip_prefix("workspace:")),
+            ) {
+                let mut handles = vec![format!("workspace-dir:{chat_id}:{}", scan.root)];
+                handles.extend(
+                    scan.files
+                        .into_iter()
+                        .map(|(path, digest)| format!("workspace-file:{chat_id}:{digest}:{path}")),
+                );
+                return whipplescript_kernel::sansio::ModelContentProvenance {
+                    source_handles: handles,
+                    complete: true,
+                };
+            }
+        }
         if matches!(
             call.name.as_str(),
             TOOL_READ | TOOL_WRITE | TOOL_EDIT | TOOL_GREP | TOOL_FIND | TOOL_LS | TOOL_BASH
@@ -918,6 +974,10 @@ impl<Sql: DoSql> ToolExecutor for DoToolExecutor<Sql> {
     fn execute(&self, call: &ToolCall) -> ToolOutcome {
         // A reused ID cannot inherit an earlier file source if this call fails.
         self.model_read_witnesses
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&call.id);
+        self.model_scan_witnesses
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .remove(&call.id);
@@ -1169,6 +1229,111 @@ mod tests {
             executor.model_output_provenance(&binary).source_handles,
             ["workspace:chat-one"],
             "binary content cannot acquire a readable file witness"
+        );
+    }
+
+    #[test]
+    fn hosted_directory_grep_witnesses_negative_matches_and_refuses_empty_scans() {
+        let executor = executor().with_workspace_source(Some("workspace:chat-one".to_owned()));
+        for (path, content) in [
+            ("targets/t-one/found.txt", "found\n"),
+            ("targets/t-one/negative.txt", "unrelated\n"),
+        ] {
+            assert_eq!(
+                executor
+                    .execute(&call("write", json!({"path": path, "content": content})))
+                    .status,
+                ToolStatus::Ok
+            );
+        }
+        let grep = ToolCall {
+            id: "scan-one".to_owned(),
+            name: "grep".to_owned(),
+            arguments: json!({"path": "targets/t-one", "pattern": "found"}),
+        };
+        let outcome = executor.execute(&grep);
+        assert_eq!(outcome.status, ToolStatus::Ok);
+        assert!(outcome.content.contains("found.txt"));
+        assert!(!outcome.content.contains("negative.txt"));
+        let label = executor.model_output_provenance(&grep);
+        assert!(label.complete);
+        assert_eq!(label.source_handles.len(), 3);
+        assert!(label
+            .source_handles
+            .contains(&"workspace-dir:chat-one:targets/t-one".to_owned()));
+        for (path, content) in [
+            ("targets/t-one/found.txt", b"found\n".as_slice()),
+            ("targets/t-one/negative.txt", b"unrelated\n".as_slice()),
+        ] {
+            assert!(label.source_handles.contains(&format!(
+                "workspace-file:chat-one:{}:{path}",
+                whipplescript_store::stable_hash_bytes_hex(content)
+            )));
+        }
+        assert_eq!(
+            executor.model_output_provenance(&grep).source_handles,
+            ["workspace:chat-one"]
+        );
+        let empty = ToolCall {
+            id: "empty-scan".to_owned(),
+            arguments: json!({"path": "targets/empty", "pattern": "found"}),
+            ..grep.clone()
+        };
+        assert_eq!(executor.execute(&empty).status, ToolStatus::Ok);
+        assert_eq!(
+            executor.model_output_provenance(&empty).source_handles,
+            ["workspace:chat-one"]
+        );
+        assert_eq!(executor.execute(&grep).status, ToolStatus::Ok);
+        let failed = ToolCall {
+            arguments: json!({"path": "targets/t-one"}),
+            ..grep.clone()
+        };
+        assert_eq!(executor.execute(&failed).status, ToolStatus::Error);
+        assert_eq!(
+            executor.model_output_provenance(&failed).source_handles,
+            ["workspace:chat-one"],
+            "a reused ID cannot inherit an earlier scan"
+        );
+        for index in 0..126 {
+            assert_eq!(
+                executor
+                    .execute(&call(
+                        "write",
+                        json!({"path": format!("targets/t-one/extra-{index}.txt"), "content": "other"})
+                    ))
+                    .status,
+                ToolStatus::Ok
+            );
+        }
+        let bounded = ToolCall {
+            id: "bounded-scan".to_owned(),
+            arguments: json!({"path": "targets/t-one", "pattern": "absent"}),
+            ..grep.clone()
+        };
+        assert_eq!(executor.execute(&bounded).status, ToolStatus::Ok);
+        let bounded_source = executor.model_output_provenance(&bounded);
+        assert!(bounded_source.complete);
+        assert_eq!(bounded_source.source_handles.len(), 129);
+        assert_eq!(
+            executor
+                .execute(&call(
+                    "write",
+                    json!({"path": "targets/t-one/extra-126.txt", "content": "other"})
+                ))
+                .status,
+            ToolStatus::Ok
+        );
+        let large = ToolCall {
+            id: "large-scan".to_owned(),
+            arguments: json!({"path": "targets/t-one", "pattern": "absent"}),
+            ..grep
+        };
+        assert_eq!(executor.execute(&large).status, ToolStatus::Ok);
+        assert_eq!(
+            executor.model_output_provenance(&large).source_handles,
+            ["workspace:chat-one"],
+            "a scan over more than 128 files cannot claim a complete witness"
         );
     }
 
