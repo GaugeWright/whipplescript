@@ -5,7 +5,9 @@
 //! the evidence supports; this says where a requirement actually blocks. A
 //! phase is wired when a door evaluates requirements there: every gated ref
 //! is one, since each door onto it judges the proposed result against every
-//! effective requirement. Deployment has no admission contract, so it is
+//! effective requirement. Deployment is wired where the charter declares a
+//! deployment vocabulary, whose admission a host judges against every
+//! effective requirement at the cuts it deploys (§10); without one it is
 //! reported as an unwired phase rather than left out.
 
 use std::collections::BTreeMap;
@@ -55,11 +57,31 @@ impl NormView {
                 ),
             })
             .collect();
-        phases.push(AdmissionPhase {
-            phase: "deployment".into(),
-            kind: PhaseKind::Deployment,
-            wired: false,
-            reason: "deployment has no admission contract; it evaluates no requirement".into(),
+        let deployments: Vec<String> = self
+            .charter
+            .vocabularies
+            .iter()
+            .filter(|entry| entry.deployment.is_some())
+            .map(|entry| format!("{}@{}", entry.definition.name, entry.definition.version))
+            .collect();
+        phases.push(if deployments.is_empty() {
+            AdmissionPhase {
+                phase: "deployment".into(),
+                kind: PhaseKind::Deployment,
+                wired: false,
+                reason: "the charter declares no deployment, so none evaluates a requirement"
+                    .into(),
+            }
+        } else {
+            AdmissionPhase {
+                phase: "deployment".into(),
+                kind: PhaseKind::Deployment,
+                wired: true,
+                reason: format!(
+                    "admitting a deployment of {} judges every effective requirement at each cut it deploys",
+                    deployments.join(", ")
+                ),
+            }
         });
         let wired: Vec<String> = phases
             .iter()

@@ -148,6 +148,7 @@ mod ingress_listener;
 mod injected_secrets;
 mod issue_readiness;
 mod stats_report;
+mod subcommand_refusal;
 use whipplescript::instance_view;
 mod build_commands;
 mod build_scope;
@@ -27548,6 +27549,7 @@ fn run_workflow_invoke_effect(
                 target_workflow,
                 &child_input.to_string(),
                 &parent_identity.package,
+                options.package_lock_path.as_deref(),
                 child_authority,
             ) {
                 Ok(started) => started,
@@ -27965,6 +27967,7 @@ fn start_child_workflow_instance(
         root,
         input_json,
         LOCAL_WORKFLOW_PACKAGE,
+        None,
         authority,
     )
 }
@@ -27975,6 +27978,7 @@ fn start_child_workflow_instance_in_package(
     root: &str,
     input_json: &str,
     package: &str,
+    package_lock_path: Option<&Path>,
     authority: ChildStartAuthority,
 ) -> Result<(StartedWorkflow, IrProgram), StoreError> {
     let input_value = serde_json::from_str::<Value>(input_json)?;
@@ -28003,20 +28007,28 @@ fn start_child_workflow_instance_in_package(
         }
     }
     let typed_actions = typed_action_plans_for_compiled_source(&source, Some(root));
+    let package_lock =
+        load_package_lock(package_lock_path, &[program_path]).map_err(StoreError::Conflict)?;
+    contract_registry_for_ir(package_lock.as_ref(), &ir).map_err(StoreError::Conflict)?;
+    let checked_packages =
+        checked_local_packages(package_lock.as_ref()).map_err(StoreError::Conflict)?;
+    let compiler_artifact_digest =
+        native_compiler_artifact_digest().map_err(StoreError::Conflict)?;
     let store = SqliteStore::open(store_path)?;
+    register_locked_packages(&store, package_lock.as_ref())?;
     let mut kernel = RuntimeKernel::new(store);
     // DR-0043 Decision 3: content-address the source (blob id == source_hash)
     // so old-body completion can reload this version's rule bodies after a
     // later revision. Idempotent; best-effort.
     let _ = kernel.store().put_content(&source);
-    let version = kernel.create_program_version_for_compiled_program(
-        CompiledProgramVersionInput {
-            program_name: &ir.workflow,
-            source_hash: &stable_hash_hex(&source),
-            compiler_version: whipplescript_core::version(),
-        },
+    let version = create_checked_native_program_version(
+        &mut kernel,
+        &source,
         &ir,
         typed_actions.as_ref(),
+        package_lock.as_ref(),
+        &checked_packages,
+        &compiler_artifact_digest,
     )?;
     let (workflow_principal, declared_authority_json) = authority_for_ir_in_package(package, &ir);
     let effective_authority_json = if authority.delegating {
@@ -28204,6 +28216,7 @@ fn drive_subworkflow_tool(
         root,
         input_json,
         package,
+        provider_ctx.package_lock_path.as_deref(),
         ChildStartAuthority::non_delegating(),
     )?;
     let child_instance_id = started.instance_id;
@@ -33945,6 +33958,21 @@ attest <id> [--kind K --ref R --note N] [--basis \"<region>\"]|\
 export [--to DIR]|import <path|->|import --from DIR|sync DIR|\
 rebuild>";
 
+/// Words other issue trackers use for what `whip issue` names differently.
+/// `gh issue`'s verbs lead, since that is what an agent reaches for first.
+const ISSUE_SYNONYMS: &[(&str, &[&str])] = &[
+    ("create", &["new"]),
+    ("view", &["show"]),
+    ("get", &["show"]),
+    ("close", &["finish", "cancel"]),
+    ("done", &["finish"]),
+    ("resolve", &["finish"]),
+    ("delete", &["cancel"]),
+    ("comment", &["note"]),
+    ("edit", &["set", "label"]),
+    ("unclaim", &["release"]),
+];
+
 /// Run-identity provenance stamp: anything filed/claimed from inside a turn is
 /// attributed to the exact turn that produced it ("two doors, one stamp").
 fn run_identity_stamp() -> Option<String> {
@@ -34058,16 +34086,14 @@ fn knowledge_subject_verbs(
     match command {
         "anchor" => {
             let Some(id) = args.get(1) else {
-                eprintln!("{usage}");
-                return ExitCode::from(2);
+                return subcommand_refusal::refuse(usage, "anchor", "missing <id>");
             };
             // `--replace <old>` with a region: the recorded two-event act —
             // remove the old anchor, add the new one (DR-0084 Decision 4:
             // re-anchoring is always explicit, never automatic).
             if let Some(old_anchor) = flag_value(args, "--replace") {
                 let Some(region) = args.get(2).filter(|arg| !arg.starts_with("--")) else {
-                    eprintln!("{usage}");
-                    return ExitCode::from(2);
+                    return subcommand_refusal::refuse(usage, "anchor", "missing \"<region>\"");
                 };
                 if let Err(error) = validated_region(region) {
                     eprintln!("anchor region refused: {error}");
@@ -34110,8 +34136,7 @@ fn knowledge_subject_verbs(
                 };
             }
             let Some(region) = args.get(2).filter(|arg| !arg.starts_with("--")) else {
-                eprintln!("{usage}");
-                return ExitCode::from(2);
+                return subcommand_refusal::refuse(usage, "anchor", "missing \"<region>\"");
             };
             if let Err(error) = validated_region(region) {
                 eprintln!("anchor region refused: {error}");
@@ -34142,8 +34167,7 @@ fn knowledge_subject_verbs(
         }
         "anchors" => {
             let Some(id) = args.get(1) else {
-                eprintln!("{usage}");
-                return ExitCode::from(2);
+                return subcommand_refusal::refuse(usage, "anchors", "missing <id>");
             };
             let anchors = match store.anchors(id) {
                 Ok(anchors) => anchors,
@@ -34171,8 +34195,7 @@ fn knowledge_subject_verbs(
         }
         "attest" => {
             let Some(id) = args.get(1) else {
-                eprintln!("{usage}");
-                return ExitCode::from(2);
+                return subcommand_refusal::refuse(usage, "attest", "missing <id>");
             };
             let kind = flag_value(args, "--kind");
             let reference = flag_value(args, "--ref");
@@ -34297,10 +34320,7 @@ fn knowledge_subject_verbs(
                 Err(error) => report_store_error("failed to attest", error),
             }
         }
-        _ => {
-            eprintln!("{usage}");
-            ExitCode::from(2)
-        }
+        _ => subcommand_refusal::unknown(usage, command, &[]),
     }
 }
 
@@ -34514,15 +34534,18 @@ fn assert_command(options: &CliOptions) -> ExitCode {
                     "--title" => title = iter.next().cloned(),
                     "--body" => body = iter.next().cloned().unwrap_or_default(),
                     "--actor" => actor = iter.next().cloned(),
-                    _ => {
-                        eprintln!("{usage}");
-                        return ExitCode::from(2);
+                    other => {
+                        return subcommand_refusal::refuse(
+                            usage,
+                            "new",
+                            &subcommand_refusal::unexpected(other),
+                        );
                     }
                 }
             }
             let Some(title) = title else {
-                eprintln!("{usage}");
-                return ExitCode::from(2);
+                let problem = subcommand_refusal::missing_option(args, "--title");
+                return subcommand_refusal::refuse(usage, "new", &problem);
             };
             // Two doors, one stamp: the CLI door records provenance exactly as
             // the (future) effect door will.
@@ -34570,8 +34593,7 @@ fn assert_command(options: &CliOptions) -> ExitCode {
         }
         "show" => {
             let Some(id) = args.get(1) else {
-                eprintln!("{usage}");
-                return ExitCode::from(2);
+                return subcommand_refusal::refuse(usage, "show", "missing <id>");
             };
             match store.get_assertion(id) {
                 Ok(Some(assertion)) => {
@@ -34615,8 +34637,7 @@ fn assert_command(options: &CliOptions) -> ExitCode {
         "anchor" | "anchors" | "attest" => knowledge_subject_verbs(&mut store, options, usage),
         "retire" => {
             let Some(id) = args.get(1) else {
-                eprintln!("{usage}");
-                return ExitCode::from(2);
+                return subcommand_refusal::refuse(usage, "retire", "missing <id>");
             };
             let actor = flag_value(args, "--actor").or_else(run_identity_stamp);
             match store.retire_assertion(id, actor.as_deref()) {
@@ -34638,10 +34659,7 @@ fn assert_command(options: &CliOptions) -> ExitCode {
                 Err(error) => report_store_error("failed to retire assertion", error),
             }
         }
-        _ => {
-            eprintln!("{usage}");
-            ExitCode::from(2)
-        }
+        _ => subcommand_refusal::unknown(usage, command, &[]),
     }
 }
 
@@ -34678,20 +34696,32 @@ fn issue(options: &CliOptions) -> ExitCode {
                             labels.push(label.clone());
                         }
                     }
-                    _ => {
-                        eprintln!("{usage}");
-                        return ExitCode::from(2);
+                    other if other.starts_with('-') => {
+                        let problem = subcommand_refusal::unexpected(other);
+                        return subcommand_refusal::refuse(usage, "new", &problem);
+                    }
+                    other => {
+                        let problem = format!(
+                            "{}; the title goes after --title",
+                            subcommand_refusal::unexpected(other)
+                        );
+                        return subcommand_refusal::refuse(usage, "new", &problem);
                     }
                 }
             }
-            let (Some(queue), Some(title)) = (queue, title) else {
-                eprintln!("{usage}");
-                return ExitCode::from(2);
+            let (Some(queue), Some(title)) = (queue.as_deref(), title.as_deref()) else {
+                let problem = [("--tracker", queue.is_none()), ("--title", title.is_none())]
+                    .into_iter()
+                    .filter(|(_, absent)| *absent)
+                    .map(|(option, _)| subcommand_refusal::missing_option(args, option))
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                return subcommand_refusal::refuse(usage, "new", &problem);
             };
             let filed_by = actor.or_else(run_identity_stamp);
             match store.file_item(
-                &queue,
-                &title,
+                queue,
+                title,
                 &item_body,
                 &labels,
                 &json!({}),
@@ -34717,9 +34747,16 @@ fn issue(options: &CliOptions) -> ExitCode {
                 match arg.as_str() {
                     "--tracker" => queue = iter.next().cloned(),
                     "--status" => status = iter.next().cloned(),
-                    _ => {
-                        eprintln!("{usage}");
-                        return ExitCode::from(2);
+                    other if other.starts_with('-') => {
+                        let problem = subcommand_refusal::unexpected(other);
+                        return subcommand_refusal::refuse(usage, "list", &problem);
+                    }
+                    other => {
+                        let problem = format!(
+                            "{}; name a tracker with --tracker",
+                            subcommand_refusal::unexpected(other)
+                        );
+                        return subcommand_refusal::refuse(usage, "list", &problem);
                     }
                 }
             }
@@ -34752,8 +34789,7 @@ fn issue(options: &CliOptions) -> ExitCode {
         }
         "show" => {
             let Some(id) = args.get(1) else {
-                eprintln!("{usage}");
-                return ExitCode::from(2);
+                return subcommand_refusal::refuse(usage, "show", "missing <id>");
             };
             match store.get_item(id) {
                 Ok(Some(item)) => {
@@ -34871,17 +34907,25 @@ fn issue(options: &CliOptions) -> ExitCode {
         }
         "ready" => {
             let Some(queue) = args.get(1).filter(|q| !q.starts_with('-')) else {
-                eprintln!("{usage}");
-                return ExitCode::from(2);
+                // `new` and `list` name a tracker with --tracker; `ready` takes
+                // it as a word, and that difference is the usual slip.
+                let problem = match args.get(1).map(String::as_str) {
+                    Some("--tracker") => {
+                        "the tracker is a word here, not an option: drop --tracker".to_owned()
+                    }
+                    Some(option) => format!("missing <tracker> before `{option}`"),
+                    None => "missing <tracker>".to_owned(),
+                };
+                return subcommand_refusal::refuse(usage, "ready", &problem);
             };
             let mut limit = None;
             let mut iter = args.iter().skip(2);
             while let Some(arg) = iter.next() {
                 match arg.as_str() {
                     "--limit" => limit = iter.next().and_then(|v| v.parse::<usize>().ok()),
-                    _ => {
-                        eprintln!("{usage}");
-                        return ExitCode::from(2);
+                    other => {
+                        let problem = subcommand_refusal::unexpected(other);
+                        return subcommand_refusal::refuse(usage, "ready", &problem);
                     }
                 }
             }
@@ -34908,8 +34952,7 @@ fn issue(options: &CliOptions) -> ExitCode {
         "claim" => issue_readiness::claim(&mut store, options, usage),
         "renew" => {
             let Some(id) = args.get(1) else {
-                eprintln!("{usage}");
-                return ExitCode::from(2);
+                return subcommand_refusal::refuse(usage, "renew", "missing <id>");
             };
             let actor = issue_actor(flag_value(args, "--actor"));
             // `--ttl <duration>` extends the claim to `now + ttl` (holder-checked,
@@ -34933,8 +34976,7 @@ fn issue(options: &CliOptions) -> ExitCode {
         }
         "release" => {
             let Some(id) = args.get(1) else {
-                eprintln!("{usage}");
-                return ExitCode::from(2);
+                return subcommand_refusal::refuse(usage, "release", "missing <id>");
             };
             // `None`: an operator clearing a stuck lease is the deliberate
             // escape hatch the holder precondition must not close.
@@ -34958,8 +35000,7 @@ fn issue(options: &CliOptions) -> ExitCode {
         // optimistically and let anyone with access pick the issue up.
         "assign" => {
             let Some(id) = args.get(1) else {
-                eprintln!("{usage}");
-                return ExitCode::from(2);
+                return subcommand_refusal::refuse(usage, "assign", "missing <id>");
             };
             let clear = args.iter().any(|arg| arg == "--clear");
             let to = flag_value(args, "--to");
@@ -34968,8 +35009,12 @@ fn issue(options: &CliOptions) -> ExitCode {
                 return ExitCode::from(2);
             }
             if !clear && to.is_none() {
-                eprintln!("{usage}");
-                return ExitCode::from(2);
+                let problem = if args.iter().any(|arg| arg == "--to") {
+                    "--to needs a value".to_owned()
+                } else {
+                    "needs --to <actor> or --clear".to_owned()
+                };
+                return subcommand_refusal::refuse(usage, "assign", &problem);
             }
             match store.assign_item(id, to.as_deref()) {
                 Ok(true) => emit_issue_row(&store, id, "assigned", options.json),
@@ -34985,13 +35030,11 @@ fn issue(options: &CliOptions) -> ExitCode {
         // nothing; any status may be relabelled.
         "label" | "unlabel" => {
             let Some(id) = args.get(1) else {
-                eprintln!("{usage}");
-                return ExitCode::from(2);
+                return subcommand_refusal::refuse(usage, command, "missing <id>");
             };
             let labels: Vec<String> = args.iter().skip(2).cloned().collect();
             if labels.is_empty() {
-                eprintln!("{usage}");
-                return ExitCode::from(2);
+                return subcommand_refusal::refuse(usage, command, "missing <label>");
             }
             let outcome = if command == "label" {
                 store.label_item(id, &labels)
@@ -35020,8 +35063,7 @@ fn issue(options: &CliOptions) -> ExitCode {
         }
         "finish" | "complete" => {
             let Some(id) = args.get(1) else {
-                eprintln!("{usage}");
-                return ExitCode::from(2);
+                return subcommand_refusal::refuse(usage, command, "missing <id>");
             };
             let summary = flag_value(args, "--summary");
             match store.finish_item(id, summary.as_deref(), None) {
@@ -35047,8 +35089,7 @@ fn issue(options: &CliOptions) -> ExitCode {
             // releasing any claim on it. Not a closure — nothing waiting on the
             // issue closing is woken by it.
             let Some(id) = args.get(1) else {
-                eprintln!("{usage}");
-                return ExitCode::from(2);
+                return subcommand_refusal::refuse(usage, "cancel", "missing <id>");
             };
             let reason = flag_value(args, "--reason");
             match store.cancel_item(id, reason.as_deref(), None) {
@@ -35067,8 +35108,7 @@ fn issue(options: &CliOptions) -> ExitCode {
         "reopen" => {
             // `reopen <id> [--note N]`: return a closed or canceled issue to open.
             let Some(id) = args.get(1) else {
-                eprintln!("{usage}");
-                return ExitCode::from(2);
+                return subcommand_refusal::refuse(usage, "reopen", "missing <id>");
             };
             let note = flag_value(args, "--note");
             match store.reopen_item(id, note.as_deref()) {
@@ -35089,8 +35129,7 @@ fn issue(options: &CliOptions) -> ExitCode {
             // ready (the ADR `fail --release` behavior). A durable failure
             // status is deferred to the event-sourced rebuild's op set.
             let Some(id) = args.get(1) else {
-                eprintln!("{usage}");
-                return ExitCode::from(2);
+                return subcommand_refusal::refuse(usage, "fail", "missing <id>");
             };
             match store.release_item(id, None) {
                 Ok(ReleaseOutcome::Released) => {
@@ -35111,8 +35150,11 @@ fn issue(options: &CliOptions) -> ExitCode {
             // `dep add <blocked> [depends-on] <blocker> [--kind <dep_kind>]`:
             // blocker blocks blocked (a `blocks` relation carrying the dep kind).
             if args.get(1).map(String::as_str) != Some("add") {
-                eprintln!("{usage}");
-                return ExitCode::from(2);
+                let problem = match args.get(1) {
+                    Some(word) => format!("`dep` takes `add`, not `{word}`"),
+                    None => "missing `add`".to_owned(),
+                };
+                return subcommand_refusal::refuse(usage, "dep", &problem);
             }
             let dep_kind = flag_value(args, "--kind");
             let actor = issue_actor(flag_value(args, "--actor"));
@@ -35128,8 +35170,9 @@ fn issue(options: &CliOptions) -> ExitCode {
                 }
             }
             let (Some(blocked), Some(blocker)) = (positional.first(), positional.get(1)) else {
-                eprintln!("{usage}");
-                return ExitCode::from(2);
+                let problem =
+                    subcommand_refusal::missing(&["<blocked>", "<blocker>"], positional.len());
+                return subcommand_refusal::refuse(usage, "dep", &problem);
             };
             // DR-0126: `order` and `soft` are ordering statements, not gates.
             let note =
@@ -35152,8 +35195,9 @@ fn issue(options: &CliOptions) -> ExitCode {
         "link" => {
             // `link <from> <kind> <to>`: add a directed relation edge.
             let (Some(from), Some(kind), Some(to)) = (args.get(1), args.get(2), args.get(3)) else {
-                eprintln!("{usage}");
-                return ExitCode::from(2);
+                let problem =
+                    subcommand_refusal::missing(&["<from>", "<kind>", "<to>"], args.len() - 1);
+                return subcommand_refusal::refuse(usage, command, &problem);
             };
             let actor = issue_actor(flag_value(args, "--actor"));
             match store.add_relation_by(from, to, kind, None, Some(&actor)) {
@@ -35164,8 +35208,9 @@ fn issue(options: &CliOptions) -> ExitCode {
         "unlink" => {
             // `unlink <from> <kind> <to>`: remove a directed relation edge.
             let (Some(from), Some(kind), Some(to)) = (args.get(1), args.get(2), args.get(3)) else {
-                eprintln!("{usage}");
-                return ExitCode::from(2);
+                let problem =
+                    subcommand_refusal::missing(&["<from>", "<kind>", "<to>"], args.len() - 1);
+                return subcommand_refusal::refuse(usage, command, &problem);
             };
             match store.remove_relation(from, to, kind) {
                 Ok(true) => emit_issue_row(
@@ -35195,8 +35240,9 @@ fn issue(options: &CliOptions) -> ExitCode {
             let (Some(id), Some(field), Some(value)) =
                 (positional.first(), positional.get(1), positional.get(2))
             else {
-                eprintln!("{usage}");
-                return ExitCode::from(2);
+                let problem =
+                    subcommand_refusal::missing(&["<id>", "<field>", "<value>"], positional.len());
+                return subcommand_refusal::refuse(usage, "set", &problem);
             };
             // The status domain is finite (DR-0093): a workflow that writes
             // `"cancelled"` is a compile error, so the CLI refuses it too rather
@@ -35329,8 +35375,12 @@ fn issue(options: &CliOptions) -> ExitCode {
                     Err(error) => report_store_error("failed to read conflicts", error),
                 }
             } else {
-                eprintln!("{usage}");
-                ExitCode::from(2)
+                let problem = if args.iter().any(|arg| arg == "--tracker") {
+                    "--tracker needs a value"
+                } else {
+                    "missing <id> or --tracker TR"
+                };
+                subcommand_refusal::refuse(usage, "conflicts", problem)
             }
         }
         "rebuild" => match store.rebuild_projection() {
@@ -35347,8 +35397,7 @@ fn issue(options: &CliOptions) -> ExitCode {
         "note" => {
             // `note <id> <text...>`: add a comment to an issue.
             let Some(id) = args.get(1) else {
-                eprintln!("{usage}");
-                return ExitCode::from(2);
+                return subcommand_refusal::refuse(usage, "note", "missing <id>");
             };
             let body = args
                 .iter()
@@ -35358,8 +35407,7 @@ fn issue(options: &CliOptions) -> ExitCode {
                 .collect::<Vec<_>>()
                 .join(" ");
             if body.is_empty() {
-                eprintln!("{usage}");
-                return ExitCode::from(2);
+                return subcommand_refusal::refuse(usage, "note", "missing <text>");
             }
             let author = issue_actor(flag_value(args, "--actor"));
             match store.add_comment(id, Some(&author), &body) {
@@ -35373,8 +35421,7 @@ fn issue(options: &CliOptions) -> ExitCode {
         }
         "comments" => {
             let Some(id) = args.get(1) else {
-                eprintln!("{usage}");
-                return ExitCode::from(2);
+                return subcommand_refusal::refuse(usage, "comments", "missing <id>");
             };
             match store.comments(id) {
                 Ok(list) => {
@@ -35411,8 +35458,7 @@ fn issue(options: &CliOptions) -> ExitCode {
             // `evidence <id> [--kind K] [--ref R] [--note N]`: add evidence if any
             // field flag is given, else list the issue's evidence.
             let Some(id) = args.get(1) else {
-                eprintln!("{usage}");
-                return ExitCode::from(2);
+                return subcommand_refusal::refuse(usage, "evidence", "missing <id>");
             };
             let kind = flag_value(args, "--kind");
             let reference = flag_value(args, "--ref");
@@ -35503,8 +35549,7 @@ fn issue(options: &CliOptions) -> ExitCode {
             // export local events to it, then import everything it holds. Two
             // clones that both `sync` the same dir converge.
             let Some(dir) = args.get(1) else {
-                eprintln!("{usage}");
-                return ExitCode::from(2);
+                return subcommand_refusal::refuse(usage, "sync", "missing DIR");
             };
             match store.sync_dir(std::path::Path::new(dir)) {
                 Ok((written, report)) => {
@@ -35554,8 +35599,7 @@ fn issue(options: &CliOptions) -> ExitCode {
                 };
             }
             let Some(path) = args.get(1) else {
-                eprintln!("{usage}");
-                return ExitCode::from(2);
+                return subcommand_refusal::refuse(usage, "import", "missing <path> or --from DIR");
             };
             let raw = if path == "-" {
                 let mut buf = String::new();
@@ -35588,10 +35632,7 @@ fn issue(options: &CliOptions) -> ExitCode {
                 Err(error) => report_store_error("failed to import events", error),
             }
         }
-        _ => {
-            eprintln!("{usage}");
-            ExitCode::from(2)
-        }
+        _ => subcommand_refusal::unknown(usage, command, ISSUE_SYNONYMS),
     }
 }
 
@@ -39086,24 +39127,7 @@ fn open_vcs() -> Result<whipplescript_store::vcs::NativeWorkspaceVcs, ExitCode> 
             vcs.set_source_merger(Box::new(
                 whipplescript_kernel::source_merge::WhipSourceMerger,
             ));
-            // DR-0054 declaration identity for the change-unit index's
-            // declaration-level sub-rows; absent it, attribution stays
-            // path-level (fail closed, never guessed).
-            vcs.set_decl_canonicalizer(Box::new(
-                whipplescript_kernel::source_merge::WhipDeclCanonicalizer,
-            ));
-            // Symbol and section identity for the languages this host
-            // canonicalizes (norm-plane §9): exact syntactic match only.
-            vcs.register_decl_canonicalizer("rs", Box::new(whipplescript_canon::RustItems));
-            vcs.register_decl_canonicalizer(
-                "ts",
-                Box::new(whipplescript_canon::TypeScriptItems::typescript()),
-            );
-            vcs.register_decl_canonicalizer(
-                "tsx",
-                Box::new(whipplescript_canon::TypeScriptItems::tsx()),
-            );
-            vcs.register_decl_canonicalizer("md", Box::new(whipplescript_canon::MarkdownSections));
+            install_decl_canonicalizers(&mut vcs);
             vcs.set_actor(Some(ambient_actor()));
             vcs
         })
@@ -39111,6 +39135,26 @@ fn open_vcs() -> Result<whipplescript_store::vcs::NativeWorkspaceVcs, ExitCode> 
             eprintln!("could not open the branch stores: {error:?}");
             ExitCode::FAILURE
         })
+}
+
+/// The native host's canonicalizer registry.
+fn install_decl_canonicalizers(vcs: &mut whipplescript_store::vcs::NativeWorkspaceVcs) {
+    // DR-0054 declaration identity for the change-unit index's
+    // declaration-level sub-rows; absent it, attribution stays
+    // path-level (fail closed, never guessed).
+    vcs.set_decl_canonicalizer(Box::new(
+        whipplescript_kernel::source_merge::WhipDeclCanonicalizer,
+    ));
+    // Symbol and section identity for the languages this host
+    // canonicalizes (norm-plane §9): exact syntactic match only. A norm
+    // capture keys a requirement's declaration subject through these.
+    vcs.register_decl_canonicalizer("rs", Box::new(whipplescript_canon::RustItems));
+    vcs.register_decl_canonicalizer(
+        "ts",
+        Box::new(whipplescript_canon::TypeScriptItems::typescript()),
+    );
+    vcs.register_decl_canonicalizer("tsx", Box::new(whipplescript_canon::TypeScriptItems::tsx()));
+    vcs.register_decl_canonicalizer("md", Box::new(whipplescript_canon::MarkdownSections));
 }
 
 /// The acting principal for CLI-driven cuts (DR-0052 Decision 1's CLI

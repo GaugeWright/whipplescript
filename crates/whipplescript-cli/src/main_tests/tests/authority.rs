@@ -38,6 +38,7 @@ workflow Tool {
         "Tool",
         "{}",
         "pkg-tools",
+        None,
         ChildStartAuthority::non_delegating(),
     )
     .expect("child starts");

@@ -1,0 +1,106 @@
+--- norm-plane §3.4, §3.6 and §14.5, slice N1: a requirement declared by its
+--- Buck2 check keeps the case inventory it was declared with.
+---
+--- Inference lists the check's cases once, when the requirement is written,
+--- and that inventory is the denominator every later run is judged against.
+--- A run executes whatever the runner lists at the time. A declared case the
+--- runner no longer lists is a missing case: the run cannot support the
+--- requirement and is unresolved, never a smaller denominator. A case the
+--- runner newly lists is not required: it neither adds support nor refutes.
+--- A case that ends without a verdict line is not exercised, and an empty
+--- inventory supports nothing. The adapter's report binding and the
+--- evaluator's other diagnostics are premises here, modelled in
+--- obligation-status.
+fmod CASE-INVENTORY-SIGNATURE is
+  protecting BOOL .
+  sorts Case Cases Verdict Fact Cfg State .
+  subsort Case < Cases .
+  ops c1 c2 c3 : -> Case [ctor] .
+  op none : -> Cases [ctor] .
+  op _;_ : Cases Cases -> Cases [ctor assoc comm id: none] .
+  --- What a case does when it runs: a verdict line, or none at all.
+  ops pass fail silent : -> Verdict [ctor] .
+  subsort Fact < Cfg .
+  op empty : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: empty] .
+  op {_} : Cfg -> State [ctor] .
+  --- The inventory fixed when the requirement was declared.
+  op declared : Cases -> Fact [ctor] .
+  --- What the runner lists at this run, still to execute.
+  op listing : Cases -> Fact [ctor] .
+  --- How a case behaves when the runner executes it.
+  op behaves : Case Verdict -> Fact [ctor] .
+  --- An observation the adapter reads: a case and its verdict line.
+  op seen : Case Verdict -> Fact [ctor] .
+  ops run judge supported refuted unresolved : -> Fact [ctor] .
+endfm
+mod CASE-INVENTORY-BASE is
+  including CASE-INVENTORY-SIGNATURE .
+  var C : Case . vars D L : Cases . var V : Verdict . var F : Cfg .
+  --- The runner executes each case it lists now, and nothing else.
+  rl [run-case] : { run listing(C ; L) behaves(C, V) F }
+    => { run listing(L) behaves(C, V) seen(C, V) F } .
+  rl [end-run] : { run listing(none) F } => { judge F } .
+  op passed : Case Cfg -> Bool .
+  eq passed(C, seen(C, pass) F) = true .
+  eq passed(C, F) = false [owise] .
+  op failed : Case Cfg -> Bool .
+  eq failed(C, seen(C, fail) F) = true .
+  eq failed(C, F) = false [owise] .
+  op allPassed : Cases Cfg -> Bool .
+  eq allPassed(none, F) = true .
+  eq allPassed(C ; D, F) = passed(C, F) and allPassed(D, F) .
+  op someFailed : Cases Cfg -> Bool .
+  eq someFailed(none, F) = false .
+  eq someFailed(C ; D, F) = failed(C, F) or someFailed(D, F) .
+  --- A declared case with no verdict line: never listed, or silent.
+  op someMissing : Cases Cfg -> Bool .
+  eq someMissing(none, F) = false .
+  eq someMissing(C ; D, F) = not (passed(C, F) or failed(C, F)) or someMissing(D, F) .
+  --- Judged against the declared inventory, whatever the runner listed.
+  crl [support] : { judge declared(D) F } => { supported declared(D) F }
+    if D =/= none /\ allPassed(D, F) .
+  crl [refute] : { judge declared(D) F } => { refuted declared(D) F }
+    if someFailed(D, F) .
+  crl [leave-unresolved] : { judge declared(D) F } => { unresolved declared(D) F }
+    if D == none or someMissing(D, F) .
+endm
+mod CASE-INVENTORY is
+  including CASE-INVENTORY-BASE .
+endm
+--- The runner supplies the denominator: a run is judged against the cases
+--- it produced verdicts for, so a case it stopped listing drops out.
+mod CASE-INVENTORY-WEAK-RUNNER-DENOMINATOR is
+  including CASE-INVENTORY-BASE .
+  var D : Cases . var F : Cfg .
+  op seenCases : Cfg -> Cases .
+  var C : Case . var V : Verdict .
+  eq seenCases(seen(C, V) F) = C ; seenCases(F) .
+  eq seenCases(F) = none [owise] .
+  crl [runner-denominator] : { judge declared(D) F } => { judge declared(seenCases(F)) F }
+    if seenCases(F) =/= D .
+endm
+--- Whatever the runner lists becomes required: a new case joins the
+--- inventory, and its failure refutes a requirement that never named it.
+mod CASE-INVENTORY-WEAK-LISTED-REQUIRED is
+  including CASE-INVENTORY-BASE .
+  var C : Case . var V : Verdict . var D : Cases . var F : Cfg .
+  op declares : Cases Case -> Bool .
+  eq declares(C ; D, C) = true .
+  eq declares(D, C) = false [owise] .
+  crl [listed-required] : { judge declared(D) seen(C, V) F } => { judge declared(C ; D) seen(C, V) F }
+    if not declares(D, C) .
+endm
+--- The exit status stands in for a missing verdict line.
+mod CASE-INVENTORY-WEAK-SILENT-PASSES is
+  including CASE-INVENTORY-BASE .
+  var C : Case . var L : Cases . var F : Cfg .
+  rl [silent-as-pass] : { run listing(C ; L) behaves(C, silent) F }
+    => { run listing(L) behaves(C, silent) seen(C, pass) F } .
+endm
+--- An empty inventory is vacuously satisfied.
+mod CASE-INVENTORY-WEAK-VACUOUS is
+  including CASE-INVENTORY-BASE .
+  var F : Cfg .
+  rl [vacuous] : { judge declared(none) F } => { supported declared(none) F } .
+endm

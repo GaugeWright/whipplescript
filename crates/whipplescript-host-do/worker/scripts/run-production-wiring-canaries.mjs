@@ -39,6 +39,30 @@ export function missingEnvironment(suites, environment) {
     .sort();
 }
 
+/// What the lane spawns: one child per distinct runner, started with the
+/// runner's `#marker`, crediting every suite that names it.
+///
+/// A runner names a journey, and a suite is the contracts that journey proves.
+/// They are not one-to-one: `placement-forwarding` is proved by the managed-host
+/// journey, which forwards through the placement root. The lane used to start
+/// each runner with the suite's id, so a full run asked the runner for a journey
+/// called `placement-forwarding`, which it does not have, and failed that suite
+/// on every run. Running a shared journey once per suite would also repeat a
+/// production mutation to prove nothing new.
+export function dispatchPlan(suites) {
+  const plan = new Map();
+  for (const suite of suites) {
+    const [locator, marker] = String(suite.runner ?? "").split("#");
+    if (!locator || !marker) {
+      throw new Error(`production wiring canary suite ${suite.id} has no runner marker: ${suite.runner}`);
+    }
+    const step = plan.get(suite.runner) ?? { locator, marker, suites: [] };
+    step.suites.push(suite.id);
+    plan.set(suite.runner, step);
+  }
+  return [...plan.values()];
+}
+
 function runChild(spawnImpl, command, args, options) {
   return new Promise((resolveChild, reject) => {
     const child = spawnImpl(command, args, options);
@@ -90,16 +114,15 @@ export async function runProductionWiringCanaries({
 
   const failures = [];
   const executed = [];
-  for (const suite of suites) {
-    const [locator] = suite.runner.split("#");
-    const result = await runChild(spawnImpl, process.execPath, [resolve(root, locator), suite.id], {
+  for (const step of dispatchPlan(suites)) {
+    const result = await runChild(spawnImpl, process.execPath, [resolve(root, step.locator), step.marker], {
       cwd: root,
       env: environment,
       stdio: "inherit",
     });
-    executed.push(suite.id);
+    executed.push(...step.suites);
     if (result.code !== 0) {
-      failures.push(`${suite.id} (${result.signal ?? `exit ${result.code}`})`);
+      failures.push(`${step.suites.join(" and ")} via #${step.marker} (${result.signal ?? `exit ${result.code}`})`);
     }
   }
   if (failures.length > 0) {

@@ -31,6 +31,38 @@ pub enum PythonCallSupport {
     },
 }
 
+/// A requirement's declared support template, by its protocol.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SupportTemplate {
+    PythonCalls(PythonCallSupport),
+    Buck2Tests(crate::norm_buck2_execution::Buck2TestsSupport),
+}
+
+/// Parse the support template a requirement declares. A template of an
+/// unknown protocol refuses rather than being read as either kind.
+pub fn support_template(
+    selected: &whipplescript_store::norm_inventory::InventoryRequirement,
+) -> Result<SupportTemplate, String> {
+    let template = selected
+        .declaration
+        .as_ref()
+        .and_then(|d| d.support_contract.as_ref())
+        .ok_or("norm requirement has no support template")?;
+    let invalid = |e: serde_json::Error| format!("invalid norm support template: {e}");
+    let value: Value = serde_json::from_str(template).map_err(invalid)?;
+    if value.get("protocol").and_then(Value::as_str)
+        == Some(crate::norm_buck2_execution::BUCK2_TESTS_SUPPORT_PROTOCOL)
+    {
+        serde_json::from_value(value)
+            .map(SupportTemplate::Buck2Tests)
+            .map_err(invalid)
+    } else {
+        serde_json::from_value(value)
+            .map(SupportTemplate::PythonCalls)
+            .map_err(invalid)
+    }
+}
+
 pub struct NormRunSelection<'a> {
     pub ledger: &'a str,
     pub frontier: Option<&'a [String]>,
@@ -260,12 +292,12 @@ impl PreparedNormExecution {
     fn template(
         selected: &whipplescript_store::norm_inventory::InventoryRequirement,
     ) -> Result<PythonCallSupport, String> {
-        let template = selected
-            .declaration
-            .as_ref()
-            .and_then(|d| d.support_contract.as_ref())
-            .ok_or("norm requirement has no support template")?;
-        serde_json::from_str(template).map_err(|e| format!("invalid norm support template: {e}"))
+        match support_template(selected)? {
+            SupportTemplate::PythonCalls(support) => Ok(support),
+            SupportTemplate::Buck2Tests(_) => {
+                Err("norm requirement's support template runs Buck2 tests, not Python calls".into())
+            }
+        }
     }
 
     /// The method a requirement's support template declares.

@@ -289,17 +289,20 @@ fn plan_with_selection(
                 })
                 .transpose()
                 .map_err(StoreError::Conflict)?;
+            // Only a gap that could hide this requirement's evidence doubts it.
+            let in_doubt = record.requirement.as_ref().is_some_and(|requirement| {
+                result
+                    .evidence_gaps
+                    .values()
+                    .any(|gap| gap.applies_to(&requirement.name))
+            });
             let work = match (&selection, bound) {
                 (Some(selected), true) => match selected.conformance {
-                    Conformance::Satisfied if !result.evidence_gaps.is_empty() => {
-                        ImpactWork::VerifyEvidence
-                    }
+                    Conformance::Satisfied if in_doubt => ImpactWork::VerifyEvidence,
                     Conformance::Satisfied => ImpactWork::Supported,
                     Conformance::Violated => ImpactWork::Repair,
                     Conformance::Conflicted => ImpactWork::ResolveEvidence,
-                    Conformance::Stale | Conformance::Unresolved
-                        if !result.evidence_gaps.is_empty() =>
-                    {
+                    Conformance::Stale | Conformance::Unresolved if in_doubt => {
                         ImpactWork::VerifyEvidence
                     }
                     Conformance::Stale | Conformance::Unresolved => {

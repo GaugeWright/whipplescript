@@ -424,6 +424,7 @@ impl Hosted {
             None,
             Some(&mut lease),
             None,
+            None,
         )
         .expect("the object admits the history");
         serde_json::from_str::<Value>(&answer).expect("import JSON")["result"].clone()
@@ -453,6 +454,7 @@ impl Hosted {
             &mut DoSqliteStore::new(self.sql.clone()),
             &self.trust,
             &json!({"protocol":"whipplescript.norm.commands/v1","command":command}).to_string(),
+            None,
             None,
             None,
             None,
@@ -1750,5 +1752,177 @@ fn np11_concurrent_pass_and_fail_fold_to_the_same_conflict_in_either_order() {
             json!(["resolve_evidence"]),
             "{refusal}"
         );
+    }
+}
+
+/// Every non-ledger table of a hosted object, as the workerd harness seeds
+/// it: each table's rows by column, and the DDL that created it, for a table
+/// the Worker's object has not created yet. The ledger (`tracker_*`) is left
+/// out: the Worker takes it through its own import door.
+fn hosted_tables(sql: &RusqliteDoSql) -> BTreeMap<String, Value> {
+    use whipplescript_host_do::do_store::{DoSql, SqlValue};
+    let text = |value: &SqlValue| match value {
+        SqlValue::Text(text) => text.clone(),
+        other => panic!("{other:?} is not text"),
+    };
+    let mut tables = BTreeMap::new();
+    for row in sql
+        .query(
+            "SELECT name, sql FROM sqlite_master WHERE type = 'table' ORDER BY name",
+            &[],
+        )
+        .expect("tables")
+    {
+        let table = text(&row[0]);
+        if table.starts_with("tracker_")
+            || table.starts_with("sqlite_")
+            || table == "schema_migrations"
+        {
+            continue;
+        }
+        let mut ddl = vec![text(&row[1])];
+        for index in sql
+            .query(
+                "SELECT sql FROM sqlite_master WHERE type = 'index' AND tbl_name = ?1 AND sql IS NOT NULL ORDER BY name",
+                &[SqlValue::Text(table.clone())],
+            )
+            .expect("indexes")
+        {
+            ddl.push(text(&index[0]));
+        }
+        let columns: Vec<String> = sql
+            .query(&format!("PRAGMA table_info(\"{table}\")"), &[])
+            .expect("columns")
+            .iter()
+            .map(|column| text(&column[1]))
+            .collect();
+        let rows: Vec<Value> = sql
+            .query(&format!("SELECT * FROM \"{table}\" ORDER BY rowid"), &[])
+            .expect("rows")
+            .iter()
+            .map(|row| {
+                json!(row
+                    .iter()
+                    .map(|value| match value {
+                        SqlValue::Null => Value::Null,
+                        SqlValue::Int(n) => json!(n),
+                        SqlValue::Text(s) => json!(s),
+                    })
+                    .collect::<Vec<_>>())
+            })
+            .collect();
+        tables.insert(
+            table.clone(),
+            json!({"table": table, "ddl": ddl, "columns": columns, "rows": rows}),
+        );
+    }
+    tables
+}
+
+/// The hosted promotion route's workerd vector (WS-115): the demo's governed
+/// object with R0 accepted and W's repair of the parser on `work`, first with
+/// no support at the candidate and then with Q0's passing run settled in the
+/// object's journal and published. The hosted door refuses the first naming
+/// R0 and admits the second; the Worker must answer both exactly as this door
+/// did, over rows and history this door's own codecs wrote.
+#[test]
+fn norm_cli_promotion_vector_refuses_unsupported_and_admits_supported_candidates() {
+    let world = World::new();
+    world.line("src/parser.py", REPAIRED, "a1", "t3");
+    let unsupported_tables = hosted_tables(&world.hosted.sql);
+    let (checkpoint, unsupported_events) = world.history(&world.items());
+
+    let refused = world.hosted.promote("unsupported");
+    assert_eq!(refused["refused"], "work", "{refused}");
+    assert_eq!(
+        refused["detail"]["requirements"][&world.requirement],
+        json!(["check"]),
+        "{refused}"
+    );
+    assert_eq!(
+        world.hosted.read(MAINLINE_BRANCH_ID, "src/parser.py"),
+        Some(demo("src/parser.py"))
+    );
+
+    world.observe("a1", "a1", &[]);
+    let supported_tables = hosted_tables(&world.hosted.sql);
+    let (_, supported_events) = world.history(&world.items());
+    world.hosted.sync(&world.fixture);
+    // Only the settled run's journal is new: the rows its observation needs,
+    // with nothing the refused promotion wrote.
+    let journal: Vec<Value> = supported_tables
+        .values()
+        .filter(|table| {
+            table["columns"]
+                .as_array()
+                .expect("columns")
+                .iter()
+                .any(|column| column == "instance_id")
+        })
+        .filter_map(|table| {
+            let before = unsupported_tables
+                .get(table["table"].as_str().expect("table"))
+                .map(|before| before["rows"].as_array().expect("rows").clone())
+                .unwrap_or_default();
+            let rows: Vec<Value> = table["rows"]
+                .as_array()
+                .expect("rows")
+                .iter()
+                .filter(|row| !before.contains(row))
+                .cloned()
+                .collect();
+            (!rows.is_empty()).then(|| {
+                json!({"table": table["table"], "ddl": table["ddl"], "columns": table["columns"], "rows": rows})
+            })
+        })
+        .collect();
+    assert!(
+        !journal.is_empty(),
+        "the run settled in the object's journal"
+    );
+
+    let admitted = world.hosted.promote("supported");
+    assert_eq!(admitted["promoted"], "work", "{admitted}");
+    assert_eq!(
+        world
+            .hosted
+            .read(MAINLINE_BRANCH_ID, "src/parser.py")
+            .as_deref(),
+        Some(REPAIRED)
+    );
+
+    if let Ok(path) = std::env::var("WHIPPLESCRIPT_NORM_PROMOTION_VECTOR_OUT") {
+        let trust: Value = serde_json::from_str(&world.hosted.trust).expect("trust");
+        let deployment: Value = serde_json::from_str(&world.hosted.deployment).expect("deployment");
+        std::fs::write(
+            path,
+            json!({
+                "protocol": "whipplescript.norm.promotion-test-vector/v1",
+                "public_bindings": trust["public_bindings"],
+                "checkpoint": checkpoint,
+                "events": unsupported_events,
+                "supported_events": supported_events,
+                "deployment": {
+                    "planning": deployment["planning"],
+                    "runtime": deployment["runtime"],
+                    "image_binding": deployment["image_binding"],
+                    "deployed_image": deployment["deployed_image"],
+                },
+                "workspace": unsupported_tables
+                    .values()
+                    .filter(|table| !table["rows"].as_array().expect("rows").is_empty())
+                    .collect::<Vec<_>>(),
+                "journal": journal,
+                "requirement": world.requirement,
+                "stream": "work",
+                "path": "src/parser.py",
+                "base": demo("src/parser.py"),
+                "candidate": REPAIRED,
+                "refused": refused,
+                "admitted": admitted,
+            })
+            .to_string(),
+        )
+        .expect("promotion vector");
     }
 }

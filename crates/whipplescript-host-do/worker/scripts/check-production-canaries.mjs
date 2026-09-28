@@ -18,7 +18,12 @@ const allowedBoundaries = new Set([
   "managed-workflow-placement",
 ]);
 
-export function validateProductionCanaries(manifest, canaries, localRunnerSource = "") {
+/// `localJourneys` is what the local runner can actually be started with: the
+/// keys of its exported `runners` table. The check used to ask only whether the
+/// marker appeared somewhere in the runner's source, and a marker can appear
+/// there without being a journey the runner dispatches.
+export function validateProductionCanaries(manifest, canaries, localJourneys = []) {
+  const journeys = new Set(localJourneys);
   assert.equal(canaries.schemaVersion, 1);
   assert.equal(canaries.owner, manifest.owner);
   // This repository orchestrates its own canaries. It used to declare
@@ -83,8 +88,8 @@ export function validateProductionCanaries(manifest, canaries, localRunnerSource
         assert.equal(locator, localRunner, `${suite.id} has an unapproved runner`);
         assert(marker, `${suite.id} runner has no marker`);
         assert(
-          localRunnerSource.includes(`"${marker}"`),
-          `${suite.id} local runner marker is absent`,
+          journeys.has(marker),
+          `${suite.id} local runner marker #${marker} is not a journey the runner dispatches`,
         );
       }
     } else {
@@ -109,12 +114,12 @@ export function validateProductionCanaries(manifest, canaries, localRunnerSource
 
 async function main() {
   const root = resolve(import.meta.dirname, "..");
-  const [manifest, canaries, runnerSource] = await Promise.all([
+  const [manifest, canaries, { runners }] = await Promise.all([
     readFile(resolve(root, "contracts/product-routes.json"), "utf8").then(JSON.parse),
     readFile(resolve(root, "contracts/production-canaries.json"), "utf8").then(JSON.parse),
-    readFile(resolve(root, localRunner), "utf8"),
+    import(pathToFileURL(resolve(root, localRunner)).href),
   ]);
-  const result = validateProductionCanaries(manifest, canaries, runnerSource);
+  const result = validateProductionCanaries(manifest, canaries, Object.keys(runners));
   // A lane cannot be declared into being. The workflow the manifest names has to
   // exist, or the declaration is the same kind of true-on-paper the orchestrator
   // field was before this: agreeing with its own assertion and with nothing else.

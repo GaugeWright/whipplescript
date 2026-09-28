@@ -92,6 +92,7 @@ fn governed(vocabularies: Vec<NormVocabulary>) -> NormCharter {
             scope: "activate".into(),
         }),
         gated_refs: vec![],
+        canonicalizers: BTreeMap::new(),
     }
 }
 
@@ -755,7 +756,8 @@ fn norm_charter_activation_migrates_live_records_and_keeps_history_replayable() 
 
 /// Enforcement (norm-plane §4): every gated ref is a wired phase that
 /// evaluates every effective requirement, a line the charter declares gated is
-/// one more, and deployment is reported as unwired rather than left out.
+/// one more, and deployment is wired only where the charter declares a
+/// deployment, reported as unwired rather than left out otherwise.
 #[test]
 fn norm_enforcement_names_every_phase_and_the_unwired_one() {
     use whipplescript_store::norm_enforcement::PhaseKind;
@@ -793,6 +795,220 @@ fn norm_enforcement_names_every_phase_and_the_unwired_one() {
         vec!["ref:main".to_owned(), "ref:release".to_owned()]
     );
     assert!(phases(&view).contains(&("ref:release".to_owned(), PhaseKind::GatedRef, true)));
+    view.charter.vocabularies.push(release());
+    assert!(phases(&view).contains(&("deployment".to_owned(), PhaseKind::Deployment, true)));
+    assert_eq!(
+        view.enforcement().unwrap().requirements[&requirement],
+        vec![
+            "ref:main".to_owned(),
+            "ref:release".to_owned(),
+            "deployment".to_owned()
+        ]
+    );
+}
+
+/// A release whose admission deploys the cuts it lists (norm-plane §10).
+fn release() -> NormVocabulary {
+    vocabulary(json!({
+        "definition": {"name":"release","version":"1",
+            "fields":[{"name":"title","required":true,"value_type":{"type":"text"}},
+                      {"name":"artifacts","required":true,"value_type":{"type":"list","item":{"type":"text"}}}],
+            "status":{"values":["draft","admitted","superseded"],"initial":"draft","transitions":[
+                {"from":"draft","to":"admitted","admission":{"requires":"authority","scope":"accept"}},
+                {"from":"admitted","to":"superseded","admission":{"requires":"authority","scope":"accept"}}]}},
+        "creation":{"requires":"public"},
+        "inventory_role":{"kind":"non_requirement"},
+        "deployment":{"cuts":"artifacts","status":"admitted"}
+    }))
+}
+
+/// A deployment role names a required list of cuts and a status only a
+/// transition reaches; anything else is not a charter.
+#[test]
+fn norm_deployment_roles_are_validated_with_their_charter() {
+    let keys = Keys::new();
+    let refused = |mutate: &dyn Fn(&mut serde_json::Value)| {
+        let mut entry = serde_json::to_value(release()).unwrap();
+        mutate(&mut entry);
+        let mut store = WorkItemStore::open_in_memory().unwrap();
+        let bootstrap = keys.sign(
+            "owner",
+            "genesis",
+            NormAct::Bootstrap {
+                creator: "worker".into(),
+                charter: governed(vec![serde_json::from_value(entry).unwrap()]),
+            },
+        );
+        format!("{:?}", store.append_norm_event(&bootstrap, &keys).unwrap_err())
+    };
+    for (why, mutate) in [
+        (
+            "no such field",
+            &(|entry: &mut serde_json::Value| entry["deployment"]["cuts"] = json!("missing"))
+                as &dyn Fn(&mut serde_json::Value),
+        ),
+        ("a text field", &|entry| entry["deployment"]["cuts"] = json!("title")),
+        ("an optional field", &|entry| {
+            entry["definition"]["fields"][1]["required"] = json!(false)
+        }),
+    ] {
+        assert!(
+            refused(mutate).contains("a required list of text"),
+            "{why}"
+        );
+    }
+    for (why, mutate) in [
+        (
+            "the initial status",
+            &(|entry: &mut serde_json::Value| entry["deployment"]["status"] = json!("draft"))
+                as &dyn Fn(&mut serde_json::Value),
+        ),
+        ("an unreachable status", &|entry| {
+            entry["deployment"]["status"] = json!("nowhere")
+        }),
+    ] {
+        assert!(
+            refused(mutate).contains("only a transition reaches"),
+            "{why}"
+        );
+    }
+}
+
+/// A deployment binds the frontier its support was judged at, and the
+/// command door judges it at the current frontier with the host's gate:
+/// no gate, a stale frontier, no cut, or the gate's refusal each refuse and
+/// append nothing; the gate's admission appends it.
+#[test]
+fn norm_deployment_is_judged_at_the_door_and_binds_its_frontier() {
+    use std::cell::RefCell;
+    use whipplescript_store::norm_commands::{NormCommand, NormCommandHost, NormCommandRequest};
+    use whipplescript_store::items::TrackerEvent;
+    use whipplescript_store::vcs::GateRefusal;
+    let keys = Keys::new();
+    let mut store = WorkItemStore::open_in_memory().unwrap();
+    store
+        .append_norm_event(
+            &keys.sign(
+                "owner",
+                "genesis",
+                NormAct::Bootstrap {
+                    creator: "worker".into(),
+                    charter: governed(vec![release()]),
+                },
+            ),
+            &keys,
+        )
+        .unwrap();
+    let r1 = create(
+        &keys,
+        &mut store,
+        &release(),
+        json!({"title":"r1","artifacts":["a1"]}),
+        "r1",
+    );
+    let empty = create(
+        &keys,
+        &mut store,
+        &release(),
+        json!({"title":"nothing","artifacts":[]}),
+        "empty",
+    );
+    let deploy = |view: &NormView, record: &str, nonce: &str, frontier: Vec<String>| {
+        let current = &view.records[record];
+        keys.sign_with(
+            "owner",
+            nonce,
+            NormAct::Transition {
+                ledger: view.ledger.clone(),
+                authority: Some(view.authority_head.clone()),
+                vocabulary: current.vocabulary.clone(),
+                record: record.into(),
+                previous: current.head.clone(),
+                status: "admitted".into(),
+            },
+            (!frontier.is_empty()).then(|| NormPremises {
+                inventory_frontier: frontier,
+                ..NormPremises::default()
+            }),
+        )
+    };
+    let view = store.norm_view(&keys).unwrap();
+    let current: Vec<String> = view.frontier.iter().cloned().collect();
+    let asked = RefCell::new(Vec::new());
+    let refusing = |_: &NormView, _: &[TrackerEvent], release: &str, cuts: &[String]| {
+        asked.borrow_mut().push((release.to_owned(), cuts.to_vec()));
+        Ok(Err(GateRefusal {
+            reason: "the proposed result is not supported: duty (repair)".into(),
+            detail: serde_json::Value::Null,
+        }))
+    };
+    let admitting = |_: &NormView, _: &[TrackerEvent], _: &str, _: &[String]| Ok(Ok(()));
+    let before = store.export_events().unwrap();
+    let door = |store: &mut WorkItemStore,
+                gate: Option<&whipplescript_store::norm_commands::NormDeploymentGate<'_>>,
+                event: SignedNormEvent| {
+        let mut host = NormCommandHost::new(store, &keys);
+        if let Some(gate) = gate {
+            host = host.with_deployment_gate(gate);
+        }
+        host.execute(NormCommandRequest::new(NormCommand::append(event)))
+            .map(|_| ())
+            .map_err(|error| format!("{error:?}"))
+    };
+    for (why, gate, event, expected) in [
+        (
+            "no gate",
+            None,
+            deploy(&view, &r1, "no-gate", current.clone()),
+            "no deployment gate",
+        ),
+        (
+            "a stale frontier",
+            Some(&admitting as &whipplescript_store::norm_commands::NormDeploymentGate<'_>),
+            deploy(&view, &r1, "stale", vec![view.ledger.clone()]),
+            "binds another",
+        ),
+        (
+            "no cut",
+            Some(&admitting),
+            deploy(&view, &empty, "empty", current.clone()),
+            "names no cut",
+        ),
+        (
+            "the gate's refusal",
+            Some(&refusing),
+            deploy(&view, &r1, "refused", current.clone()),
+            "deployment refused: the proposed result is not supported: duty (repair)",
+        ),
+    ] {
+        let refusal = door(&mut store, gate, event).expect_err(why);
+        assert!(refusal.contains(expected), "{why}: {refusal}");
+    }
+    assert_eq!(asked.borrow().as_slice(), [(r1.clone(), vec!["a1".to_owned()])]);
+    assert_eq!(store.export_events().unwrap(), before, "nothing was appended");
+    // Without its frontier the ledger refuses the act outright, gate or none.
+    assert!(format!(
+        "{:?}",
+        store
+            .append_norm_event(&deploy(&view, &r1, "unbound", Vec::new()), &keys)
+            .unwrap_err()
+    )
+    .contains("binds the ledger frontier"));
+    door(
+        &mut store,
+        Some(&admitting),
+        deploy(&view, &r1, "admitted", current),
+    )
+    .unwrap();
+    assert_eq!(store.norm_view(&keys).unwrap().records[&r1].status, "admitted");
+    // Any other act passes the door untouched.
+    let after = store.norm_view(&keys).unwrap();
+    door(
+        &mut store,
+        None,
+        transition(&keys, &after, "owner", &r1, "superseded", "superseded"),
+    )
+    .unwrap();
 }
 
 /// Running effects live in the runtime store; the host lists them and the

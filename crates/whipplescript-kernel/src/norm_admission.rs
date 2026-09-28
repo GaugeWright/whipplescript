@@ -29,7 +29,7 @@ use whipplescript_store::norm_history::{CapturedNormHistory, NormHistoryLimits, 
 use whipplescript_store::vcs::{GateCommit, GateRefusal, GateVerdict, MainlineGate};
 use whipplescript_store::{RuntimeStore, StoreError, StoreResult};
 
-use crate::norm_execution_policy::ProtectedPythonPolicy;
+use crate::norm_execution_policy::EvidencePolicy;
 use crate::norm_impact::ImpactWork;
 use crate::norm_planning::{ImpactQuery, Planned, PlanningConfiguration};
 use crate::norm_runner::PythonRuntime;
@@ -46,6 +46,8 @@ pub enum AdmissionDoor {
     Restore,
     Merge,
     Adopt,
+    /// A deployment admitted at the command door (norm-plane §10).
+    Deploy,
 }
 
 /// What an admission certified: the proposal, and the ledger state its
@@ -164,7 +166,15 @@ pub fn judge_with_exceptions(
     exceptions: &BTreeMap<String, crate::norm_reliability::AppliedException>,
 ) -> Result<Judged, Box<AdmissionRefusal>> {
     let mut refusal = AdmissionRefusal {
-        evidence_gaps: planned.plan.evidence_gaps.keys().cloned().collect(),
+        // A gap scoped to one requirement refuses through that
+        // requirement's own work, and through nothing else.
+        evidence_gaps: planned
+            .plan
+            .evidence_gaps
+            .iter()
+            .filter(|(_, gap)| gap.is_unscoped())
+            .map(|(event, _)| event.clone())
+            .collect(),
         method_gaps: planned.method_gaps.keys().cloned().collect(),
         authority_actions: planned
             .plan
@@ -339,8 +349,58 @@ pub struct AdmissionHost<'a, S: RuntimeStore> {
     pub verifier: &'a dyn NormVerifier,
     pub configuration: &'a PlanningConfiguration,
     pub runtime: &'a S,
-    pub policy: &'a ProtectedPythonPolicy,
+    pub policy: &'a dyn EvidencePolicy,
     pub verify_runtime: &'a dyn Fn(&PythonRuntime) -> Result<(), String>,
+}
+
+impl<S: RuntimeStore> Clone for AdmissionHost<'_, S> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+impl<S: RuntimeStore> Copy for AdmissionHost<'_, S> {}
+
+/// A ledger its caller has already captured: a deployment is judged inside
+/// the command door that appends it, over the state that door read.
+pub struct CapturedLedger<'a> {
+    pub view: &'a NormView,
+    pub events: &'a [TrackerEvent],
+}
+
+impl AdmissionLedger for CapturedLedger<'_> {
+    fn bootstrapped(&self) -> StoreResult<bool> {
+        Ok(true)
+    }
+    fn capture(&self, _: &dyn NormVerifier) -> StoreResult<(NormView, Vec<TrackerEvent>)> {
+        Ok((self.view.clone(), self.events.to_vec()))
+    }
+    fn exclusively(
+        &self,
+        f: &mut dyn FnMut() -> StoreResult<GateCommit>,
+    ) -> StoreResult<GateCommit> {
+        f()
+    }
+}
+
+/// Judge a deployment of `release` (norm-plane §10): every gated
+/// requirement must be supported at each cut it deploys, exactly as the
+/// mainline gate judges a proposed result with no base. The first cut that
+/// is not refuses the whole deployment, naming what it lacks.
+pub fn judge_deployment<S: RuntimeStore>(
+    host: AdmissionHost<'_, S>,
+    ledger: CapturedLedger<'_>,
+    release: &str,
+    cuts: &[String],
+    artifacts: &NormArtifactCapture<'_>,
+) -> StoreResult<Result<(), GateRefusal>> {
+    for cut in cuts {
+        let mut gate =
+            NormMainlineAdmission::new(&ledger, Ok(host), AdmissionDoor::Deploy, release);
+        if let GateVerdict::Refuse(refusal) = gate.prepare(None, cut, artifacts)? {
+            return Ok(Err(refusal));
+        }
+    }
+    Ok(Ok(()))
 }
 
 /// The norm-plane gate on the mainline, over one host's ledger.
@@ -498,7 +558,13 @@ impl<L: AdmissionLedger, S: RuntimeStore> MainlineGate for NormMainlineAdmission
                 }
             }
         }
-        let (fenced, mut unfenced) = fence(&view, reservations, &changed, &presented, host.now);
+        // A reservation fences a change to its region; a deployment changes
+        // no region, so it is not fenced.
+        let (fenced, mut unfenced) = if self.door == AdmissionDoor::Deploy {
+            (BTreeMap::new(), BTreeMap::new())
+        } else {
+            fence(&view, reservations, &changed, &presented, host.now)
+        };
         unfenced.append(&mut misnamed);
         let exceptions = crate::norm_reliability::exceptions(
             &view,

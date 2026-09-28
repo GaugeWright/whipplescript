@@ -40,6 +40,7 @@ pub struct ArtifactBasis {
 pub struct CapturedArtifact {
     basis: ArtifactBasis,
     files: BTreeMap<String, String>,
+    declarations: CapturedDeclarations,
 }
 impl CapturedArtifact {
     pub fn basis(&self) -> &ArtifactBasis {
@@ -48,6 +49,27 @@ impl CapturedArtifact {
     pub fn files(&self) -> &BTreeMap<String, String> {
         &self.files
     }
+    /// What the capturing host's canonicalizers keyed at this cut. Empty for
+    /// a capture no host keyed, so every declaration subject is unresolved.
+    pub fn declarations(&self) -> &CapturedDeclarations {
+        &self.declarations
+    }
+    pub(crate) fn set_declarations(&mut self, declarations: CapturedDeclarations) {
+        self.declarations = declarations;
+    }
+}
+
+/// The capturing host's declaration map (norm-plane §9): the version of each
+/// versioned canonicalizer it installs, by file class, and the declaration
+/// identities each captured file of those classes keys to. The host computes
+/// it when it captures the cut, since store code cannot call a canonicalizer.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct CapturedDeclarations {
+    /// File class (the extension the registry keys on) -> installed version.
+    pub versions: BTreeMap<String, String>,
+    /// Captured path of a versioned class -> its declaration identities, or
+    /// `None` when the file has no canonical form.
+    pub files: BTreeMap<String, Option<std::collections::BTreeSet<String>>>,
 }
 
 struct FlatManifest(BTreeMap<String, String>);
@@ -218,6 +240,7 @@ pub fn capture_cut<B: Branches + ?Sized, C: ContentBlobs + ?Sized>(
             manifest: cut.manifest_hash,
         },
         files,
+        declarations: CapturedDeclarations::default(),
     })
 }
 

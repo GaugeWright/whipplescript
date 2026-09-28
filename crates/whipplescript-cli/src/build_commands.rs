@@ -1071,6 +1071,63 @@ pub(crate) fn test_targets(
     report: &Path,
     timeout_seconds: u64,
 ) -> Result<(std::process::ExitStatus, Buck2TestReport), String> {
+    let run = run_tests(tree, targets, executor, report, timeout_seconds, false)?;
+    let parsed = run.report.map_err(|error| {
+        format!(
+            "the executor left no report at {} ({error}): {}",
+            report.display(),
+            run.stderr
+        )
+    })?;
+    Ok((run.status, parsed))
+}
+
+/// List the targets' cases through the executor, running none of them: what
+/// a requirement's case inventory is inferred from (norm-plane §3.4).
+pub(crate) fn list_tests(
+    tree: &CutTree,
+    targets: &[String],
+    executor: &Path,
+    report: &Path,
+    timeout_seconds: u64,
+) -> Result<Buck2TestReport, String> {
+    let run = run_tests(tree, targets, executor, report, timeout_seconds, true)?;
+    run.report.map_err(|error| {
+        format!(
+            "the executor left no listing at {} ({error}): {}",
+            report.display(),
+            run.stderr
+        )
+    })
+}
+
+/// What one `buck2 test` through the executor left behind.
+pub(crate) struct TestRun {
+    pub status: std::process::ExitStatus,
+    /// The executor's report, or why there is none: a report it did not
+    /// write, or one that does not parse, is missing.
+    pub report: Result<Buck2TestReport, String>,
+    pub stderr: String,
+}
+
+/// Run `buck2 test` over the targets with the executor the daemon calls. An
+/// earlier report at `report` is removed first, so an absent one is this
+/// run's. The executor is handed an absolute path: buck2 runs in the tree,
+/// and a relative one would land there.
+pub(crate) fn run_tests(
+    tree: &CutTree,
+    targets: &[String],
+    executor: &Path,
+    report: &Path,
+    timeout_seconds: u64,
+    list_only: bool,
+) -> Result<TestRun, String> {
+    let report = &std::path::absolute(report)
+        .map_err(|error| format!("cannot resolve {}: {error}", report.display()))?;
+    if report.exists() {
+        std::fs::remove_file(report)
+            .map_err(|error| format!("cannot clear {}: {error}", report.display()))?;
+    }
     let mut command = buck2(tree);
     command
         .arg("test")
@@ -1084,20 +1141,23 @@ pub(crate) fn test_targets(
         .arg(&tree.cut)
         .arg("--timeout")
         .arg(timeout_seconds.to_string());
+    if list_only {
+        command.arg("--list-only");
+    }
     let output = command
         .output()
         .map_err(|error| format!("cannot run buck2 test: {error}"))?;
-    let bytes = std::fs::read(report).map_err(|error| {
-        format!(
-            "the executor left no report at {} ({}): {}",
-            report.display(),
-            error,
-            String::from_utf8_lossy(&output.stderr).trim()
-        )
-    })?;
-    let parsed: Buck2TestReport = serde_json::from_slice(&bytes)
-        .map_err(|error| format!("the executor's report does not parse: {error}"))?;
-    Ok((output.status, parsed))
+    let report = std::fs::read(report)
+        .map_err(|error| error.to_string())
+        .and_then(|bytes| {
+            serde_json::from_slice::<Buck2TestReport>(&bytes)
+                .map_err(|error| format!("the executor's report does not parse: {error}"))
+        });
+    Ok(TestRun {
+        status: output.status,
+        report,
+        stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+    })
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1186,7 +1246,7 @@ impl<'a> Arguments<'a> {
     }
 }
 
-fn build_root() -> PathBuf {
+pub(crate) fn build_root() -> PathBuf {
     std::env::var_os("WHIPPLESCRIPT_BUILD_ROOT")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(".whipplescript/build"))
@@ -1690,6 +1750,91 @@ mod tests {
             materialize_projection(&vcs, "nope", &build_root, &buck2, &policy(), &dev).unwrap_err(),
             "no recorded cut nope"
         );
+    }
+
+    #[test]
+    fn a_test_run_reads_only_the_report_this_run_left() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let mut vcs = NativeWorkspaceVcs::open(
+            dir.path().join("branches.sqlite"),
+            dir.path().join("content.sqlite"),
+        )
+        .expect("a vcs");
+        vcs.init("t0").expect("init");
+        vcs.write("main", "FIXTURE", Some("# empty\n"), "cut-0", "t1")
+            .expect("record a cut");
+        let build_root = dir.path().join("build");
+        let tree = materialize_cut(&vcs, "cut-0", &build_root, &fake_buck2(dir.path(), false))
+            .expect("materializes");
+        let targets = ["//:a".to_owned()];
+        let executor = Path::new("/named/executor");
+        // A stale report is cleared first, so a run that writes none has none.
+        let report = dir.path().join("report.json");
+        std::fs::write(&report, "stale").expect("write");
+        let run = run_tests(&tree, &targets, executor, &report, 5, false).expect("buck2 ran");
+        assert!(!run.status.success());
+        assert_eq!(run.stderr, "boom");
+        assert!(run.report.is_err());
+        assert!(!report.exists());
+        assert!(test_targets(&tree, &targets, executor, &report, 5)
+            .unwrap_err()
+            .starts_with(&format!(
+                "the executor left no report at {}",
+                report.display()
+            )));
+        assert!(list_tests(&tree, &targets, executor, &report, 5)
+            .unwrap_err()
+            .starts_with(&format!(
+                "the executor left no listing at {}",
+                report.display()
+            )));
+        let directory = dir.path().join("a-directory");
+        std::fs::create_dir(&directory).expect("mkdir");
+        assert!(run_tests(&tree, &targets, executor, &directory, 5, false)
+            .err()
+            .expect("a directory is not a report")
+            .starts_with(&format!("cannot clear {}", directory.display())));
+        assert!(
+            run_tests(&tree, &targets, executor, Path::new(""), 5, false)
+                .err()
+                .expect("an empty path resolves to nothing")
+                .starts_with("cannot resolve")
+        );
+        let mut absent = tree.clone();
+        absent.buck2 = dir.path().join("no-buck2");
+        assert!(run_tests(&absent, &targets, executor, &report, 5, false)
+            .err()
+            .expect("no buck2 to run")
+            .starts_with("cannot run buck2 test"));
+        // What the executor is handed: the report's absolute path, and
+        // --list-only for a listing. This stand-in writes its arguments there,
+        // which is not a report.
+        let echo = dir.path().join("echo-buck2");
+        std::fs::write(
+            &echo,
+            "#!/bin/sh\nprev=\"\"\nfor a in \"$@\"; do [ \"$prev\" = --report ] && echo \"$*\" > \"$a\"; prev=\"$a\"; done\nexit 0\n",
+        )
+        .expect("write the stand-in");
+        std::fs::set_permissions(&echo, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        let mut echoing = tree.clone();
+        echoing.buck2 = echo;
+        let relative = Path::new("relative-report.json");
+        let run = run_tests(&echoing, &targets, executor, relative, 5, true).expect("ran");
+        assert!(run
+            .report
+            .unwrap_err()
+            .starts_with("the executor's report does not parse"));
+        let written = std::path::absolute(relative).expect("absolute");
+        let arguments =
+            std::fs::read_to_string(&written).expect("the stand-in wrote its arguments");
+        std::fs::remove_file(&written).expect("remove");
+        assert!(arguments.contains("--list-only"), "{arguments}");
+        assert!(
+            arguments.contains(&format!("--report {}", written.display())),
+            "{arguments}"
+        );
+        assert!(arguments.contains("--cut cut-0 --timeout 5"), "{arguments}");
     }
 
     #[test]

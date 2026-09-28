@@ -14585,6 +14585,21 @@ pub(crate) mod tests {
         };
         let mut store = store();
         let first_witness = witness(LOCK);
+        let full_source = store
+            .create_program_version_with_import_witness(
+                NewProgramVersion {
+                    source_hash: SOURCE,
+                    ..version("hosted-full-source")
+                },
+                &first_witness,
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .program_import_witness(&full_source.version_id, &full_source.witness_digest)
+                .unwrap(),
+            Some(first_witness.clone())
+        );
         let first = store
             .create_program_version_with_import_witness(version("paint"), &first_witness)
             .unwrap();
@@ -19239,6 +19254,7 @@ mod norm_admission_tests {
             relation: None,
             manifest: None,
             correspondence: None,
+            deployment: None,
                 editing: None,
                 effectiveness: None,
                 inventory_role: None,
@@ -19246,7 +19262,7 @@ mod norm_admission_tests {
                 "name":"decision","version":"1","fields":[{"name":"title","required":true,"value_type":{"type":"text"}}],
                 "status":{"values":["proposed","accepted"],"initial":"proposed","transitions":[{"from":"proposed","to":"accepted","admission":{"requires":"authority","scope":"accept"}}]}
             })).expect("fixture"),creation:AdmissionPredicate::Public {},
-        }],owner_scopes:vec!["accept".into()],activation:None,gated_refs:vec![]}
+        }],owner_scopes:vec!["accept".into()],activation:None,gated_refs:vec![],canonicalizers:Default::default()}
     }
 
     /// The hosted promote door runs the mainline gate over the object's own
@@ -19654,6 +19670,49 @@ mod norm_admission_tests {
     /// §5, NP-15). A requirement with no support at the candidate refuses the
     /// promote, the transport onto mainline, the restore and the undo of the
     /// mainline alike, each naming the requirement, and the mainline stays.
+    /// A deployment the object's installed configuration cannot evaluate is
+    /// refused naming why (norm-plane §10), never admitted unjudged.
+    #[test]
+    fn a_hosted_deployment_the_configuration_cannot_evaluate_is_refused_naming_why() {
+        let (sql, gate, _) = configured_hosted_workspace(true);
+        let owner_key = SigningKey::from_slice(&[1; 32]).unwrap();
+        let owner = actor("owner", &owner_key);
+        let owner_root = crate::governance::GaugeDeskGovernanceRoot::new("owner", &owner.key_id);
+        let verifier = NormGovernanceVerifier::new(
+            vec![NormPrincipalBinding {
+                actor: owner.clone(),
+                verifier: &owner_root,
+            }],
+            BTreeSet::from([("owner".into(), "owner".into())]),
+        )
+        .unwrap();
+        let store = DoSqliteStore::new(sql.clone());
+        let view = store.norm_view(&verifier).unwrap();
+        let events =
+            whipplescript_store::norm_commands::NormCommandStore::tracker_history(&store).unwrap();
+        let artifacts = |cut: &str| {
+            crate::do_branches::compose_vcs(&sql)?.capture_norm_artifact(
+                cut,
+                whipplescript_store::norm_artifact::ArtifactLimits::default(),
+            )
+        };
+        let broken = crate::norm_commands::HostedNormGate {
+            trust: gate.trust.clone(),
+            deployment: "{}".into(),
+        };
+        let judge = crate::norm_commands::hosted_deployment_gate(&broken, &sql, 0, &artifacts);
+        let refusal = judge(&view, &events, "release", &["cut_1".to_owned()])
+            .unwrap()
+            .expect_err("an unevaluable deployment is refused");
+        assert!(
+            refusal
+                .reason
+                .starts_with("the deployment's gated requirements cannot be evaluated: "),
+            "{}",
+            refusal.reason
+        );
+    }
+
     #[test]
     fn the_configured_hosted_mainline_gate_refuses_naming_the_unsupported_requirement() {
         use std::rc::Rc;

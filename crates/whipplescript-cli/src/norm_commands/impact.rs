@@ -1,6 +1,8 @@
 //! Native read-only planning through captured host-owned evidence.
 use super::*;
-use whipplescript_kernel::norm_execution_policy::ProtectedPythonPolicy;
+use whipplescript_kernel::norm_execution_policy::{
+    Buck2TestsPolicy, NativeEvidencePolicy, ProtectedPythonPolicy,
+};
 use whipplescript_kernel::norm_planning::{ImpactQuery, PlanningConfiguration};
 use whipplescript_store::norm_commands::NormArtifactCapture;
 use whipplescript_store::norm_history::{CapturedNormHistory, NormHistoryLimits};
@@ -25,9 +27,14 @@ pub(super) fn execute(
             .map_err(|error| error.to_string())?
             .as_nanos()
     );
-    let policy = ProtectedPythonPolicy::new(
-        &serde_json::to_string(&host.installed.runtime).map_err(|error| error.to_string())?,
-        &time_basis,
+    // A native host accepts Buck2 test runs beside the protected
+    // interpreter's (norm-plane §3.4).
+    let policy = NativeEvidencePolicy::new(
+        ProtectedPythonPolicy::new(
+            &serde_json::to_string(&host.installed.runtime).map_err(|error| error.to_string())?,
+            &time_basis,
+        )?,
+        Buck2TestsPolicy::new(&time_basis)?,
     )?;
     let current = store.norm_view(verifier).map_err(debug_error)?;
     let history = CapturedNormHistory::capture(

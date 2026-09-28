@@ -174,6 +174,28 @@ after a failure, a failure reclassified as a harness fault, a missing run
 replaced, three passes clearing quarantine short of the budget, and
 quarantine or an exception standing in for support.
 
+`deployment-admission.maude` models norm-plane §10 for slice W1's
+deployment: admitting a release deploys the cut it names, and a host admits
+it only when the requirement is supported there, judged at the frontier the
+act binds and only when that frontier is current. A refused release changes
+nothing, and a release of a repaired cut is admitted, the recovery. A release
+admitted before a failing run lands stays admitted at the frontier it bound.
+Seven searches; two refusals each with the weakening that reaches it: a host
+that skips the gate, and one that admits a judgment the ledger has moved
+past.
+`norm-case-inventory.maude` models norm-plane §3.4, §3.6 and §14.5 for slice
+N1: a requirement declared by its Buck2 check keeps the case inventory
+inference fixed when it was written, and every later run is judged against
+it. A declared case the runner no longer lists is missing, so the run is
+unresolved rather than supported by a smaller denominator; a case the runner
+newly lists is not required, so its failure refutes nothing; a case without a
+verdict line is not exercised; an empty inventory supports nothing. Twelve
+searches: four positive (all declared cases pass, a new failing case changes
+nothing, a declared failure refutes, a dropped case is unresolved) and four
+refusals each paired with the weakening that reaches it: a runner-supplied
+denominator, listed cases made required, an exit status standing in for a
+verdict line, and vacuous support.
+
 `action-classification.maude` models DR-0124 §14.2: an action's
 classification joins its declared label with every influence that shaped
 it — a declared input, a presence observation, an observation of absence —

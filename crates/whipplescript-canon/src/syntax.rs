@@ -280,6 +280,9 @@ impl DeclCanonicalizer for RustItems {
     fn canonical_declarations_at(&self, path: &str, source: &str) -> Option<Vec<CanonDecl>> {
         canonicalize::<Self>(path, source)
     }
+    fn version(&self) -> Option<&str> {
+        Some(<Self as Grammar>::VERSION)
+    }
 }
 
 /// TypeScript declarations: functions, classes, interfaces, type aliases,
@@ -497,6 +500,13 @@ impl DeclCanonicalizer for TypeScriptItems {
         } else {
             canonicalize::<TypeScript>(path, source)
         }
+    }
+    fn version(&self) -> Option<&str> {
+        Some(if self.tsx {
+            Tsx::VERSION
+        } else {
+            TypeScript::VERSION
+        })
     }
 }
 

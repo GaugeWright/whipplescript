@@ -521,3 +521,287 @@ fn principals_reach_the_daemon_through_scoped_interfaces_and_the_tiers_correspon
     fixture.stop(&home);
     fixture.restore();
 }
+
+/// Copy the fixture project into `into`, never its `buck-out`.
+fn copy_project(from: &std::path::Path, into: &std::path::Path) {
+    std::fs::create_dir_all(into).expect("mkdir");
+    for entry in std::fs::read_dir(from).expect("the fixture lists") {
+        let entry = entry.expect("an entry");
+        let path = entry.path();
+        let target = into.join(entry.file_name());
+        if path.is_dir() {
+            if entry.file_name() != "buck-out" {
+                copy_project(&path, &target);
+            }
+        } else {
+            std::fs::copy(&path, &target).expect("copy");
+        }
+    }
+}
+
+/// Norm-plane §3.4 and §14.5: a requirement declared by its Buck2 check.
+/// Inference lists the check's cases once into the template; each run goes
+/// through the real Buck2 and executor, is recorded in the journal, published,
+/// and recovered by the impact plan, which re-judges the retained report.
+#[test]
+#[ignore = "needs buck2 on the PATH; the bar's buck2-test-executor section runs it"]
+fn a_requirement_declared_by_its_buck2_check_is_run_published_and_planned() {
+    use crate::norm_commands::buck2::{infer_support, run_and_publish, Buck2RunHost};
+    use whipplescript_core::norm_evidence::{EvidenceDiagnostic, TestOutcome};
+    use whipplescript_kernel::norm_buck2_execution::Buck2RunSelection;
+    use whipplescript_kernel::norm_execution_policy::Buck2TestsPolicy;
+    use whipplescript_kernel::norm_planning::{plan, ImpactQuery, PlanningConfiguration};
+    use whipplescript_kernel::norm_publication::ObservationSigning;
+    use whipplescript_store::norm_artifact::ArtifactLimits;
+    use whipplescript_store::norm_history::{CapturedNormHistory, NormHistoryLimits};
+
+    let _guard = crate::env_lock();
+    let mut fixture = Fixture::new();
+    let cut = fixture.cut.clone();
+    let executor = fixture.executor.clone();
+    let build_root = fixture.build_root.clone();
+    let tree = materialize_cut(
+        &fixture.vcs,
+        &cut,
+        &build_root,
+        &crate::build_commands::buck2_binary(),
+    )
+    .expect("the cut materializes");
+    let artifact = fixture
+        .vcs
+        .capture_norm_artifact(&cut, ArtifactLimits::default())
+        .expect("the cut captures");
+
+    // One declaration: the check names the targets, and their listings at
+    // the cut are the requirement's cases, fixed now.
+    let listing = build_root.join("listing.json");
+    let support = infer_support(&tree, "buck2 test //:passing", &executor, &listing, 60)
+        .expect("the passing suite lists its cases");
+    assert_eq!(
+        support
+            .cases()
+            .iter()
+            .map(|case| case.id.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "root//:passing::parses_empty",
+            "root//:passing::parses_nested"
+        ]
+    );
+    // Inference runs nothing: the listing report carries no execution.
+    let listed: whipplescript_core::norm_buck2_report::Buck2TestReport =
+        serde_json::from_slice(&std::fs::read(&listing).expect("the listing report"))
+            .expect("parses");
+    assert!(listed
+        .suites
+        .iter()
+        .all(|suite| suite.executions.is_empty()));
+    assert!(
+        infer_support(&tree, "buck2 test //...", &executor, &listing, 60)
+            .unwrap_err()
+            .starts_with("`//...` is not a Buck2 target label")
+    );
+
+    // Three requirements, each declared by its check.
+    let view = fixture.items.norm_view(&Sha256Signer).expect("view");
+    let requirement_vocabulary = crate::build_commands::charter_vocabulary(&view, "requirement")
+        .expect("the charter declares requirement");
+    let observation_vocabulary =
+        crate::build_commands::charter_vocabulary(&view, "local-observation")
+            .expect("the charter declares local-observation");
+    let mut declared = std::collections::BTreeMap::new();
+    for (name, subject) in [
+        ("passing", "tests/passing.sh"),
+        ("swallowed", "tests/swallowed.sh"),
+        ("silent", "tests/silent.sh"),
+    ] {
+        let check = format!("buck2 test //:{name}");
+        let template = infer_support(&tree, &check, &executor, &listing, 60)
+            .unwrap_or_else(|error| panic!("{check}: {error}"));
+        let created = fixture
+            .items
+            .append_norm_event(
+                &signed(
+                    &format!("requirement-{name}"),
+                    NormAct::Create {
+                        ledger: fixture.ledger.clone(),
+                        authority: None,
+                        vocabulary: requirement_vocabulary.clone(),
+                        fields_json: serde_json::json!({
+                            "name": name,
+                            "proposition": format!("every case of //:{name} passes"),
+                            "domain": "workspace",
+                            "subject": subject,
+                            "applicability": "always",
+                            "owner": "owner",
+                            "support_contract": serde_json::to_string(&template).expect("template"),
+                        })
+                        .to_string(),
+                    },
+                ),
+                &Sha256Signer,
+            )
+            .expect("the requirement is created");
+        let view = fixture.items.norm_view(&Sha256Signer).expect("view");
+        fixture
+            .items
+            .append_norm_event(
+                &signed(
+                    &format!("accept-{name}"),
+                    NormAct::Transition {
+                        ledger: fixture.ledger.clone(),
+                        authority: Some(view.authority_head.clone()),
+                        vocabulary: requirement_vocabulary.clone(),
+                        record: created.clone(),
+                        previous: created.clone(),
+                        status: "accepted".into(),
+                    },
+                ),
+                &Sha256Signer,
+            )
+            .expect("the requirement is accepted");
+        declared.insert(name, created);
+    }
+
+    // Each run, through the real Buck2 and executor, recorded and published.
+    let mut judgments = std::collections::BTreeMap::new();
+    for (name, requirement) in &declared {
+        let view = fixture.items.norm_view(&Sha256Signer).expect("view");
+        let history = CapturedNormHistory::capture(
+            &view,
+            &fixture.items.export_events().expect("events"),
+            &Sha256Signer,
+            NormHistoryLimits::default(),
+        )
+        .expect("history");
+        let effect = format!("{name}-at-cut");
+        let report = build_root.join(format!("{name}.json"));
+        let (execution, _) = run_and_publish(
+            &history,
+            &Sha256Signer,
+            Buck2RunHost {
+                tree: &tree,
+                artifact: &artifact,
+                executor: &executor,
+                report: &report,
+                timeout_seconds: 60,
+            },
+            &fixture.journal,
+            &mut fixture.items,
+            Buck2RunSelection {
+                ledger: &fixture.ledger,
+                frontier: None,
+                requirement,
+                effect_id: &effect,
+                publisher: "owner",
+            },
+            ObservationSigning {
+                vocabulary: &observation_vocabulary,
+                authority: Some(&view.authority_head),
+                actor: &owner(),
+                created_at: "2026-09-28T00:00:00Z",
+            },
+            |statement| {
+                Ok(sha256_hex(
+                    &statement.signing_bytes().expect("signing bytes"),
+                ))
+            },
+        )
+        .unwrap_or_else(|error| panic!("{name}: {error}"));
+        judgments.insert(*name, execution.judgment());
+    }
+    assert_eq!(judgments["passing"].outcome, TestOutcome::Pass);
+    assert_eq!(judgments["swallowed"].outcome, TestOutcome::Fail);
+    assert_eq!(
+        judgments["swallowed"].counterexamples[0].case,
+        "root//:swallowed::rejects_stale_grant"
+    );
+    // A case that exits without a verdict line is a harness failure.
+    assert_eq!(judgments["silent"].outcome, TestOutcome::HarnessFailed);
+    assert!(judgments["silent"]
+        .diagnostics
+        .contains(&EvidenceDiagnostic::MissingCase(
+            "root//:silent::says_nothing".into()
+        )));
+
+    // A changed file: the fixture again, with one test's script edited.
+    let edited = fixture._scratch.path().join("edited");
+    let source =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/buck2-tests");
+    copy_project(&source, &edited);
+    let script = edited.join("tests/passing.sh");
+    let body = std::fs::read_to_string(&script).expect("the script");
+    std::fs::write(&script, format!("{body}# edited\n")).expect("edit");
+    let changed = record_tree(&mut fixture.vcs, &edited, "build", None, "t2")
+        .expect("the edited tree records")
+        .cut;
+    assert_ne!(changed, cut);
+
+    // The plan recovers each published run from the journal and re-judges it.
+    let view = fixture.items.norm_view(&Sha256Signer).expect("view");
+    let history = CapturedNormHistory::capture(
+        &view,
+        &fixture.items.export_events().expect("events"),
+        &Sha256Signer,
+        NormHistoryLimits::default(),
+    )
+    .expect("history");
+    let configuration = PlanningConfiguration::parse(
+        &serde_json::json!({"capability": "observer", "roles": [
+            {"vocabulary": requirement_vocabulary, "interpretation": "context"},
+            {"vocabulary": observation_vocabulary, "interpretation": "published_execution"},
+        ]})
+        .to_string(),
+    )
+    .expect("planning configuration");
+    let policy = Buck2TestsPolicy::new("buck2-fixture").expect("policy");
+    let vcs = &fixture.vcs;
+    let artifacts = |cut: &str| vcs.capture_norm_artifact(cut, ArtifactLimits::default());
+    let work = |before: &str, after: &str| {
+        let planned = plan(
+            ImpactQuery {
+                configuration: &configuration,
+                history: &history,
+                verifier: &Sha256Signer,
+                runtime: &fixture.journal,
+                artifacts: &artifacts,
+                before_cut: before,
+                after_cut: after,
+                before_frontier: None,
+                after_frontier: None,
+                policy: &policy,
+            },
+            |_| Err("no Python runtime is installed".into()),
+        )
+        .expect("the plan");
+        assert!(
+            planned.plan.evidence_gaps.is_empty(),
+            "{}",
+            planned.to_json()
+        );
+        declared
+            .iter()
+            .map(|(name, id)| {
+                let impact = &planned.plan.requirements[id][0];
+                (
+                    *name,
+                    serde_json::to_value(&impact.work).expect("work")["kind"]
+                        .as_str()
+                        .expect("a kind")
+                        .to_owned(),
+                )
+            })
+            .collect::<std::collections::BTreeMap<_, _>>()
+    };
+    let at_cut = work(&cut, &cut);
+    assert_eq!(at_cut["passing"], "supported");
+    assert_eq!(at_cut["swallowed"], "repair");
+    // No support from the harness failure: the requirement is checked again.
+    assert_eq!(at_cut["silent"], "check");
+    // Another tested artifact: every requirement is checked again.
+    let at_changed = work(&cut, &changed);
+    assert_eq!(at_changed["passing"], "check");
+
+    fixture.stop(&tree);
+    fixture.restore();
+}

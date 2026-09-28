@@ -1,7 +1,9 @@
 //! Verified execution -> retained signed envelope -> ledger receipt -> journal ack.
 //! The journal and ledger commit separately; each returned value retains the
 //! original envelope so recovery never signs or submits a competing candidate.
+use crate::norm_buck2_execution::VerifiedBuck2Execution;
 use crate::norm_execution::VerifiedNormExecution;
+use crate::norm_projection::VerifiedExecution;
 use serde_json::{json, Value};
 use whipplescript_core::vocabulary::VocabularyRef;
 use whipplescript_store::norm::{NormAct, NormActor, NormStatement, NormVerifier, SignedNormEvent};
@@ -41,24 +43,146 @@ pub struct ObservationPublicationReceipt {
     event_id: String,
 }
 
-pub(crate) fn fields(execution: &VerifiedNormExecution) -> Result<Value, String> {
+/// A recovered execution a publication can bind to: its journal slot, its
+/// prepared publisher, and the durable fact its retention rests on. Only
+/// verified executions implement it; it is not a publication grant.
+pub trait PublishableExecution {
+    fn ledger(&self) -> &str;
+    fn instance_id(&self) -> &str;
+    fn effect_id(&self) -> &str;
+    fn run_id(&self) -> &str;
+    /// The requirement the signed invocation names.
+    fn requirement(&self) -> &str;
+    fn publisher(&self) -> &str;
+    /// The invocation as it is published, in the existing codec.
+    fn invocation_json(&self) -> Result<String, String>;
+    /// The observation as it is published, in the existing codec.
+    fn observation_json(&self) -> Result<String, String>;
+    /// The durable journal fact the retention rests on.
+    fn basis(&self) -> PublicationBasis;
+}
+
+impl PublishableExecution for VerifiedNormExecution {
+    fn ledger(&self) -> &str {
+        &self.intent().anchor.checkpoint.ledger
+    }
+    fn instance_id(&self) -> &str {
+        VerifiedNormExecution::instance_id(self)
+    }
+    fn effect_id(&self) -> &str {
+        &self.intent().effect_id
+    }
+    fn run_id(&self) -> &str {
+        VerifiedNormExecution::run_id(self)
+    }
+    fn requirement(&self) -> &str {
+        &self.intent().requirement.name
+    }
+    fn publisher(&self) -> &str {
+        &self.intent().publisher
+    }
+    fn invocation_json(&self) -> Result<String, String> {
+        serde_json::to_string(self.intent()).map_err(|e| e.to_string())
+    }
+    fn observation_json(&self) -> Result<String, String> {
+        serde_json::to_string(self.observation()).map_err(|e| e.to_string())
+    }
+    fn basis(&self) -> PublicationBasis {
+        PublicationBasis::Run {}
+    }
+}
+
+/// A Buck2 run rests on its durable record, whose payload is the published
+/// invocation; its observation is the adapter's report of the record.
+impl PublishableExecution for VerifiedBuck2Execution {
+    fn ledger(&self) -> &str {
+        &self.intent().anchor.checkpoint.ledger
+    }
+    fn instance_id(&self) -> &str {
+        VerifiedBuck2Execution::instance_id(self)
+    }
+    fn effect_id(&self) -> &str {
+        &self.intent().effect_id
+    }
+    fn run_id(&self) -> &str {
+        VerifiedBuck2Execution::run_id(self)
+    }
+    fn requirement(&self) -> &str {
+        &self.intent().requirement.name
+    }
+    fn publisher(&self) -> &str {
+        &self.intent().publisher
+    }
+    fn invocation_json(&self) -> Result<String, String> {
+        serde_json::to_string(self.record()).map_err(|e| e.to_string())
+    }
+    fn observation_json(&self) -> Result<String, String> {
+        serde_json::to_string(self.report()).map_err(|e| e.to_string())
+    }
+    fn basis(&self) -> PublicationBasis {
+        PublicationBasis::Event {
+            event_id: self.run_id().into(),
+        }
+    }
+}
+
+impl PublishableExecution for VerifiedExecution {
+    fn ledger(&self) -> &str {
+        self.as_publishable().ledger()
+    }
+    fn instance_id(&self) -> &str {
+        self.as_publishable().instance_id()
+    }
+    fn effect_id(&self) -> &str {
+        self.as_publishable().effect_id()
+    }
+    fn run_id(&self) -> &str {
+        self.as_publishable().run_id()
+    }
+    fn requirement(&self) -> &str {
+        self.as_publishable().requirement()
+    }
+    fn publisher(&self) -> &str {
+        self.as_publishable().publisher()
+    }
+    fn invocation_json(&self) -> Result<String, String> {
+        self.as_publishable().invocation_json()
+    }
+    fn observation_json(&self) -> Result<String, String> {
+        self.as_publishable().observation_json()
+    }
+    fn basis(&self) -> PublicationBasis {
+        self.as_publishable().basis()
+    }
+}
+
+impl VerifiedExecution {
+    fn as_publishable(&self) -> &dyn PublishableExecution {
+        match self {
+            Self::PythonCalls(execution) => execution.as_ref(),
+            Self::Buck2Tests(execution) => execution.as_ref(),
+        }
+    }
+}
+
+pub(crate) fn fields(execution: &dyn PublishableExecution) -> Result<Value, String> {
     Ok(json!({
         "instance": execution.instance_id(),
-        "effect": execution.intent().effect_id,
+        "effect": execution.effect_id(),
         "run": execution.run_id(),
-        "invocation_json": serde_json::to_string(execution.intent()).map_err(|e| e.to_string())?,
-        "observation_json": serde_json::to_string(execution.observation()).map_err(|e| e.to_string())?,
+        "invocation_json": execution.invocation_json()?,
+        "observation_json": execution.observation_json()?,
     }))
 }
 
 /// A charter activation that retires a requirement retires its running
 /// effects with it (norm-plane §10): a late outcome is not published.
 fn refuse_retired(
-    execution: &VerifiedNormExecution,
+    execution: &dyn PublishableExecution,
     history: &CapturedNormHistory,
     verifier: &dyn NormVerifier,
 ) -> Result<(), String> {
-    let requirement = &execution.intent().requirement.name;
+    let requirement = execution.requirement();
     if history
         .project(None, verifier)
         .map_err(|e| format!("{e:?}"))?
@@ -71,9 +195,18 @@ fn refuse_retired(
     Ok(())
 }
 
+fn slot(execution: &dyn PublishableExecution) -> PublicationSlot {
+    PublicationSlot {
+        ledger: execution.ledger().into(),
+        instance: execution.instance_id().into(),
+        effect: execution.effect_id().into(),
+        run: execution.run_id().into(),
+    }
+}
+
 impl PreparedObservationPublication {
     fn statement(
-        execution: &VerifiedNormExecution,
+        execution: &dyn PublishableExecution,
         signing: &ObservationSigning<'_>,
     ) -> Result<NormStatement, String> {
         // The signer is checked once, in `prepare`, which every path reaches;
@@ -84,16 +217,13 @@ impl PreparedObservationPublication {
             actor: signing.actor.clone(),
             nonce: crate::execution_run_key(
                 execution.instance_id(),
-                &execution.intent().effect_id,
+                execution.effect_id(),
                 execution.run_id(),
-                &[
-                    "norm-observation",
-                    &execution.intent().anchor.checkpoint.ledger,
-                ],
+                &["norm-observation", execution.ledger()],
             ),
             created_at: signing.created_at.into(),
             action: NormAct::Create {
-                ledger: execution.intent().anchor.checkpoint.ledger.clone(),
+                ledger: execution.ledger().into(),
                 authority: signing.authority.map(str::to_owned),
                 vocabulary: signing.vocabulary.clone(),
                 fields_json: fields(execution)?.to_string(),
@@ -104,7 +234,7 @@ impl PreparedObservationPublication {
     /// Reconstruct the signing payload, or return a verified retained winner.
     /// An empty-slot read is not a reservation; prepare still arbitrates races.
     pub fn draft<S: NormPublicationJournal>(
-        execution: &VerifiedNormExecution,
+        execution: &dyn PublishableExecution,
         history: &CapturedNormHistory,
         journal: &S,
         verifier: &dyn NormVerifier,
@@ -112,12 +242,7 @@ impl PreparedObservationPublication {
     ) -> Result<ObservationPublicationDraft, String> {
         refuse_retired(execution, history, verifier)?;
         let statement = Self::statement(execution, &signing)?;
-        let slot = PublicationSlot {
-            ledger: execution.intent().anchor.checkpoint.ledger.clone(),
-            instance: execution.instance_id().into(),
-            effect: execution.intent().effect_id.clone(),
-            run: execution.run_id().into(),
-        };
+        let slot = slot(execution);
         if journal
             .retained_publication(&slot)
             .map_err(|e| format!("{e:?}"))?
@@ -140,7 +265,7 @@ impl PreparedObservationPublication {
     /// A client signature supplies authentication only. Reconstruct the entire
     /// expected statement before retention, including when recovering a winner.
     pub fn prepare_signed<S: NormPublicationJournal>(
-        execution: &VerifiedNormExecution,
+        execution: &dyn PublishableExecution,
         history: &CapturedNormHistory,
         journal: &S,
         verifier: &dyn NormVerifier,
@@ -174,25 +299,22 @@ impl PreparedObservationPublication {
     /// authority parents survive configuration changes; ledger admission still
     /// verifies their historical binding and current admission requirements.
     pub fn prepare<S: NormPublicationJournal>(
-        execution: &VerifiedNormExecution,
+        execution: &dyn PublishableExecution,
         history: &CapturedNormHistory,
         journal: &S,
         verifier: &dyn NormVerifier,
         signing: ObservationSigning<'_>,
         sign: impl FnOnce(&NormStatement) -> Result<String, String>,
     ) -> Result<Self, String> {
-        if signing.actor.principal != execution.intent().publisher {
+        if signing.actor.principal != execution.publisher() {
             return Err("observation signer differs from prepared publisher".into());
         }
-        let slot = PublicationSlot {
-            ledger: execution.intent().anchor.checkpoint.ledger.clone(),
-            instance: execution.instance_id().into(),
-            effect: execution.intent().effect_id.clone(),
-            run: execution.run_id().into(),
-        };
-        let invocation = serde_json::to_value(execution.intent()).map_err(|e| e.to_string())?;
-        let observation =
-            serde_json::to_value(execution.observation()).map_err(|e| e.to_string())?;
+        let slot = slot(execution);
+        let invocation: Value =
+            serde_json::from_str(&execution.invocation_json()?).map_err(|e| e.to_string())?;
+        let observation: Value =
+            serde_json::from_str(&execution.observation_json()?).map_err(|e| e.to_string())?;
+        let basis = execution.basis();
         let expected_fields = fields(execution)?;
         let retained = match journal
             .retained_publication(&slot)
@@ -229,7 +351,7 @@ impl PreparedObservationPublication {
                             invocation: invocation.clone(),
                             observation: observation.clone(),
                             event,
-                            basis: PublicationBasis::Run {},
+                            basis: basis.clone(),
                         })
                         .map_err(|e| format!("{e:?}"))?
                 }
@@ -253,7 +375,7 @@ impl PreparedObservationPublication {
         if candidate.slot != slot
             || candidate.invocation != invocation
             || candidate.observation != observation
-            || candidate.event.statement.actor.principal != execution.intent().publisher
+            || candidate.event.statement.actor.principal != execution.publisher()
             || candidate.event.statement.protocol != "whipplescript.norm/v1"
             || !action_matches
         {

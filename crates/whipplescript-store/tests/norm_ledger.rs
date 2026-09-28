@@ -239,6 +239,7 @@ mod tests {
                 manifest: None,
                 correspondence: None,
                 constraint: None,
+                deployment: None,
                 editing: None,
                 effectiveness: None,
                 inventory_role: None,
@@ -248,6 +249,7 @@ mod tests {
             owner_scopes: vec!["accept".into()],
             activation: None,
             gated_refs: vec![],
+            canonicalizers: BTreeMap::new(),
         }
     }
 
@@ -6677,6 +6679,310 @@ mod tests {
             json!({"kind":"non_requirement","fields":{"proposition":"must not disappear"}})
         )
         .is_err());
+    }
+    /// A versioned stand-in for a host canonicalizer: each `name=body` line
+    /// is the declaration `fn <name>`, and a file holding `ERR` has no
+    /// canonical form.
+    struct Lines(Option<&'static str>);
+    impl whipplescript_store::vcs::DeclCanonicalizer for Lines {
+        fn canonical_declarations(
+            &self,
+            source: &str,
+        ) -> Option<Vec<whipplescript_store::vcs::CanonDecl>> {
+            source
+                .lines()
+                .map(|line| {
+                    let (name, body) = line.split_once('=')?;
+                    Some(whipplescript_store::vcs::CanonDecl {
+                        identity: format!("fn {name}"),
+                        canon_hash: body.into(),
+                        rename_hash: body.into(),
+                    })
+                })
+                .collect()
+        }
+        fn version(&self) -> Option<&str> {
+            self.0
+        }
+    }
+    /// `files` written on a native workspace whose `.rs` canonicalizer is
+    /// `canonicalizer`, captured at the last write as the host captures it.
+    fn keyed_artifact(
+        canonicalizer: Option<Lines>,
+        files: &[(&str, &str)],
+    ) -> whipplescript_store::norm_artifact::CapturedArtifact {
+        use whipplescript_store::branches::MAINLINE_BRANCH_ID;
+        use whipplescript_store::norm_artifact::ArtifactLimits;
+        let mut vcs = whipplescript_store::vcs::NativeWorkspaceVcs::open(":memory:", ":memory:")
+            .expect("keyed workspace");
+        if let Some(canonicalizer) = canonicalizer {
+            vcs.register_decl_canonicalizer("rs", Box::new(canonicalizer));
+        }
+        vcs.init("t0").expect("keyed mainline");
+        for (index, (path, body)) in files.iter().enumerate() {
+            vcs.write(
+                MAINLINE_BRANCH_ID,
+                path,
+                Some(body),
+                &format!("cut-{index}"),
+                "t1",
+            )
+            .expect("keyed write");
+        }
+        vcs.capture_norm_artifact(
+            &format!("cut-{}", files.len() - 1),
+            ArtifactLimits::default(),
+        )
+        .expect("keyed capture")
+    }
+    const KEYED: [(&str, &str); 4] = [
+        ("src/auth.rs", "grant_allows=allow\ndeny=false"),
+        ("src/bad.rs", "ERR"),
+        ("src/view.ts", "render"),
+        ("docs/a.rs", "x=1"),
+    ];
+    /// A charter pinning `.rs` to `lines/1` over a `src` domain.
+    fn pinned_charter() -> NormCharter {
+        use whipplescript_store::norm_resources::*;
+        let mut charter = NormCharter::bundled().expect("bundled charter");
+        charter
+            .resource_domains
+            .as_mut()
+            .expect("bundled domains")
+            .insert(
+                "src".into(),
+                ResourceDomain {
+                    include: vec![ResourceSelector::Subtree { root: "src".into() }],
+                },
+            );
+        charter.canonicalizers = BTreeMap::from([("rs".into(), "lines/1".into())]);
+        charter
+    }
+    #[test]
+    fn norm_resources_bind_a_declaration_subject_through_the_pinned_canonicalizer() {
+        use whipplescript_store::norm_resources::*;
+        let (keys, mut store) = inventory_store(pinned_charter());
+        let present = resource_requirement(
+            &keys,
+            &mut store,
+            "present",
+            "src",
+            "src/auth.rs#fn grant_allows",
+        );
+        let file = resource_requirement(&keys, &mut store, "file", "src", "src/auth.rs");
+        let gone = resource_requirement(&keys, &mut store, "gone", "src", "src/auth.rs#fn removed");
+        let absent = resource_requirement(&keys, &mut store, "absent", "src", "src/new.rs#fn x");
+        let unkeyed = resource_requirement(&keys, &mut store, "unkeyed", "src", "src/bad.rs#fn x");
+        let outside = resource_requirement(&keys, &mut store, "outside", "src", "docs/a.rs#fn x");
+        let invalid: Vec<(String, &str)> = [
+            "src/auth.rs#",
+            "src/auth.rs# fn grant_allows",
+            "src/auth.rs#unkeyed src/auth.rs",
+            "src/Makefile#fn x",
+            "src/auth.#fn x",
+            "../auth.rs#fn x",
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, subject)| {
+            let nonce = format!("invalid-{index}");
+            (
+                resource_requirement(&keys, &mut store, &nonce, "src", subject),
+                subject,
+            )
+        })
+        .collect();
+        let view = store.norm_view(&keys).unwrap();
+        let result = view
+            .resource_inventory(
+                &keyed_artifact(Some(Lines(Some("lines/1"))), &KEYED),
+                ResourceLimits::default(),
+            )
+            .unwrap();
+        // Present at the cut, as a whole file subject there is.
+        for id in [&present, &file] {
+            let binding = &result.bindings[id];
+            assert!(binding.subject_present, "{id}");
+            assert!(binding.resources.contains("src/auth.rs"));
+            assert!(!result
+                .gaps
+                .iter()
+                .any(|gap| gap.requirement.as_ref() == Some(id)));
+        }
+        assert_eq!(
+            result.bindings[&present].subject,
+            "src/auth.rs#fn grant_allows"
+        );
+        // A declaration gone from its file, or its file gone, is missing and
+        // keeps its domain binding; a file with no canonical form cannot say.
+        for (id, reason) in [
+            (&gone, ResourceGapKind::MissingSubject {}),
+            (&absent, ResourceGapKind::MissingSubject {}),
+            (&unkeyed, ResourceGapKind::UnkeyedSubject {}),
+        ] {
+            assert!(!result.bindings[id].subject_present);
+            assert!(result.gaps.contains(&ResourceGap {
+                requirement: Some(id.clone()),
+                reason,
+            }));
+        }
+        // Its file lies outside the domain, so the declaration does.
+        assert!(result.gaps.contains(&ResourceGap {
+            requirement: Some(outside.clone()),
+            reason: ResourceGapKind::SubjectOutsideDomain {},
+        }));
+        assert!(!result.bindings.contains_key(&outside));
+        for (id, subject) in invalid {
+            assert!(
+                result.gaps.contains(&ResourceGap {
+                    requirement: Some(id.clone()),
+                    reason: ResourceGapKind::InvalidSubject {
+                        subject: subject.into()
+                    },
+                }),
+                "{subject}"
+            );
+            assert!(!result.bindings.contains_key(&id));
+        }
+        assert!(!result.binding_complete);
+    }
+    #[test]
+    fn norm_resources_leave_a_declaration_subject_unresolved_without_its_pinned_canonicalizer() {
+        use whipplescript_store::norm_resources::*;
+        let (keys, mut store) = inventory_store(pinned_charter());
+        let rust = resource_requirement(
+            &keys,
+            &mut store,
+            "rust",
+            "src",
+            "src/auth.rs#fn grant_allows",
+        );
+        let unpinned = resource_requirement(
+            &keys,
+            &mut store,
+            "unpinned",
+            "src",
+            "src/view.ts#function render",
+        );
+        let view = store.norm_view(&keys).unwrap();
+        let unresolved = |artifact, reason: ResourceGapKind| {
+            let result = view
+                .resource_inventory(&artifact, ResourceLimits::default())
+                .unwrap();
+            // Never resolved by path: the file is present, the subject is not.
+            assert!(result.resources.contains_key("src/auth.rs"));
+            assert!(!result.bindings[&rust].subject_present);
+            assert!(result.bindings[&rust].resources.contains("src/auth.rs"));
+            assert!(
+                result.gaps.contains(&ResourceGap {
+                    requirement: Some(rust.clone()),
+                    reason: reason.clone(),
+                }),
+                "{reason:?}: {:?}",
+                result.gaps
+            );
+            assert!(!result.binding_complete);
+            result
+        };
+        // The charter pins no `.ts` canonicalizer.
+        let pinned = unresolved(
+            keyed_artifact(Some(Lines(Some("lines/2"))), &KEYED),
+            ResourceGapKind::CanonicalizerMismatch {
+                class: "rs".into(),
+                pinned: "lines/1".into(),
+                installed: "lines/2".into(),
+            },
+        );
+        assert!(pinned.gaps.contains(&ResourceGap {
+            requirement: Some(unpinned.clone()),
+            reason: ResourceGapKind::UnpinnedCanonicalizer { class: "ts".into() },
+        }));
+        // A host with no versioned `.rs` canonicalizer, or a capture no host
+        // keyed, cannot establish it either.
+        for artifact in [
+            keyed_artifact(Some(Lines(None)), &KEYED),
+            keyed_artifact(None, &KEYED),
+            resource_artifact("bare", &KEYED),
+        ] {
+            unresolved(
+                artifact,
+                ResourceGapKind::MissingCanonicalizer { class: "rs".into() },
+            );
+        }
+        // Unpinned stays unresolved even where a host keys the class.
+        let mut charter = pinned_charter();
+        charter.canonicalizers.clear();
+        let (keys, mut store) = inventory_store(charter);
+        let id = resource_requirement(
+            &keys,
+            &mut store,
+            "rust",
+            "src",
+            "src/auth.rs#fn grant_allows",
+        );
+        let result = store
+            .norm_view(&keys)
+            .unwrap()
+            .resource_inventory(
+                &keyed_artifact(Some(Lines(Some("lines/1"))), &KEYED),
+                ResourceLimits::default(),
+            )
+            .unwrap();
+        assert!(!result.bindings[&id].subject_present);
+        assert!(result.gaps.contains(&ResourceGap {
+            requirement: Some(id),
+            reason: ResourceGapKind::UnpinnedCanonicalizer { class: "rs".into() },
+        }));
+    }
+    #[test]
+    fn norm_resources_c0_refuses_malformed_canonicalizer_pins() {
+        let bundled = NormCharter::bundled().unwrap();
+        assert!(bundled.canonicalizers.is_empty());
+        assert!(serde_json::to_value(&bundled)
+            .unwrap()
+            .get("canonicalizers")
+            .is_none());
+        let bootstrap = |charter: &NormCharter| {
+            let keys = Keys::new();
+            let mut store = WorkItemStore::open_in_memory().unwrap();
+            store.append_norm_event(
+                &keys.sign(
+                    "owner",
+                    "pinned-charter",
+                    NormAct::Bootstrap {
+                        creator: "worker".into(),
+                        charter: charter.clone(),
+                    },
+                ),
+                &keys,
+            )
+        };
+        let pinned = pinned_charter();
+        assert!(bootstrap(&pinned).is_ok());
+        let wire = serde_json::to_value(&pinned).unwrap();
+        assert_eq!(wire["canonicalizers"], json!({"rs": "lines/1"}));
+        assert_eq!(serde_json::from_value::<NormCharter>(wire).unwrap(), pinned);
+        for (class, version) in [
+            ("", "lines/1"),
+            ("r.s", "lines/1"),
+            (".rs", "lines/1"),
+            ("rs ", "lines/1"),
+            ("rs", ""),
+            ("rs", " "),
+            ("rs", " lines/1"),
+        ] {
+            let mut charter = pinned.clone();
+            charter.canonicalizers = BTreeMap::from([(class.into(), version.into())]);
+            assert!(
+                matches!(bootstrap(&charter), Err(StoreError::Conflict(message)) if message.contains("canonicalizer pin")),
+                "{class:?} {version:?}"
+            );
+        }
+        let duplicate = r#"{"vocabularies":[],"owner_scopes":[],"canonicalizers":{"rs":"lines/1","rs":"lines/2"}}"#;
+        assert!(serde_json::from_str::<NormCharter>(duplicate)
+            .unwrap_err()
+            .to_string()
+            .contains("repeats the key \"rs\""));
     }
     #[test]
     fn norm_query_projects_history_without_rolling_back_authority() {

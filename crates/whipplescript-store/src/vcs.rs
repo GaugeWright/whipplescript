@@ -217,6 +217,18 @@ pub trait DeclCanonicalizer {
         let _ = path;
         self.canonical_declarations(source)
     }
+    /// The version a charter pins this canonicalizer by (norm-plane §9).
+    /// `None` is unversioned: nothing can pin it, so no requirement subject
+    /// resolves through it.
+    fn version(&self) -> Option<&str> {
+        None
+    }
+}
+
+/// A path's file class, the extension the canonicalizer registry keys on.
+pub fn file_class(path: &str) -> Option<&str> {
+    let name = path.rsplit('/').next().unwrap_or(path);
+    name.rsplit_once('.').map(|(_, extension)| extension)
 }
 
 /// One reconciliation-daemon tick over one branch (the executor of
@@ -1102,9 +1114,9 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
 
     /// The canonicalizer for a path's file class, if the host installed one.
     fn canonicalizer_for(&self, path: &str) -> Option<&dyn DeclCanonicalizer> {
-        let name = path.rsplit('/').next().unwrap_or(path);
-        let (_, extension) = name.rsplit_once('.')?;
-        self.decl_canonicalizers.get(extension).map(|c| c.as_ref())
+        self.decl_canonicalizers
+            .get(file_class(path)?)
+            .map(|c| c.as_ref())
     }
 
     /// Attribute every cut this handle records to `actor` (DR-0052:
@@ -4238,7 +4250,35 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
         cut_id: &str,
         limits: crate::norm_artifact::ArtifactLimits,
     ) -> StoreResult<crate::norm_artifact::CapturedArtifact> {
-        crate::norm_artifact::capture_cut(&self.branches, &self.content, cut_id, limits)
+        let mut artifact =
+            crate::norm_artifact::capture_cut(&self.branches, &self.content, cut_id, limits)?;
+        // The declaration map a requirement's declaration subject resolves
+        // through (norm-plane §9), keyed here because the store's resource
+        // inventory cannot call a canonicalizer. Only versioned canonicalizers
+        // contribute: an unversioned one cannot be pinned.
+        let mut declarations = crate::norm_artifact::CapturedDeclarations::default();
+        for (class, canonicalizer) in &self.decl_canonicalizers {
+            if let Some(version) = canonicalizer.version() {
+                declarations
+                    .versions
+                    .insert(class.clone(), version.to_owned());
+            }
+        }
+        for (path, body) in artifact.files() {
+            let Some(class) = file_class(path) else {
+                continue;
+            };
+            if !declarations.versions.contains_key(class) {
+                continue;
+            }
+            let canonicalizer = &self.decl_canonicalizers[class];
+            let keyed = canonicalizer
+                .canonical_declarations_at(path, body)
+                .map(|decls| decls.into_iter().map(|decl| decl.identity).collect());
+            declarations.files.insert(path.clone(), keyed);
+        }
+        artifact.set_declarations(declarations);
+        Ok(artifact)
     }
 
     /// A recorded cut's manifest (bisect materializes these directly —

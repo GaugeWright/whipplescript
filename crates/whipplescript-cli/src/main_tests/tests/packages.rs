@@ -49,6 +49,70 @@ fn native_start_refuses_an_unresolved_local_import_before_opening_its_store() {
 }
 
 #[test]
+fn native_child_refuses_an_unresolved_local_import_before_opening_its_store() {
+    let examples = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples");
+    let program = unique_test_path("unresolved-child-import", "whip");
+    fs::copy(examples.join("subworkflow-tool-consumer.whip"), &program).unwrap();
+    let store_path = unique_test_path("unresolved-child-import-store", "sqlite");
+    let result = start_child_workflow_instance_in_package(
+        &store_path,
+        &program,
+        "ConsumerFlow",
+        r#"{"request":{"task":"echo"}}"#,
+        LOCAL_WORKFLOW_PACKAGE,
+        None,
+        ChildStartAuthority::non_delegating(),
+    );
+    let Err(StoreError::Conflict(message)) = result else {
+        panic!("expected package-lock refusal, got {result:?}");
+    };
+    assert!(message.contains("import `toolkit` requires a package lock"));
+    assert!(
+        !store_path.exists(),
+        "an unresolved child import cannot admit a version"
+    );
+    let _ = fs::remove_file(program);
+}
+
+#[test]
+fn native_child_admits_its_checked_local_import_basis() {
+    let examples = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples");
+    let program = examples.join("subworkflow-tool-consumer.whip");
+    let lock_path = examples.join("subworkflow-tool-consumer.lock.json");
+    let store_path = unique_test_path("checked-child-import", "sqlite");
+    let (started, _) = start_child_workflow_instance_in_package(
+        &store_path,
+        &program,
+        "ConsumerFlow",
+        r#"{"request":{"task":"echo"}}"#,
+        LOCAL_WORKFLOW_PACKAGE,
+        Some(&lock_path),
+        ChildStartAuthority::non_delegating(),
+    )
+    .expect("checked child starts");
+    let connection = rusqlite::Connection::open(&store_path).unwrap();
+    let witness_digest: String = connection
+        .query_row(
+            "SELECT witness_digest FROM program_import_admissions WHERE version_id = ?1",
+            [&started.version_id],
+            |row| row.get(0),
+        )
+        .expect("child admission retained a witness");
+    let store = SqliteStore::open(&store_path).unwrap();
+    let witness = store
+        .program_import_witness(&started.version_id, &witness_digest)
+        .unwrap()
+        .unwrap();
+    assert_eq!(witness.examined, ["toolkit"]);
+    assert_eq!(witness.edges[0].package_id, "package-toolkit");
+    assert_eq!(
+        witness.compiler_artifact_digest,
+        native_compiler_artifact_digest().unwrap()
+    );
+    let _ = fs::remove_file(store_path);
+}
+
+#[test]
 fn native_start_admits_the_checked_local_import_basis() {
     let examples = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples");
     let program = examples.join("subworkflow-tool-consumer.whip");

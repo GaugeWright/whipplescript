@@ -49,6 +49,10 @@ impl DeclCanonicalizer for MarkdownSections {
         self.canonical_declarations_at("README.md", source)
     }
 
+    fn version(&self) -> Option<&str> {
+        Some(VERSION)
+    }
+
     fn canonical_declarations_at(&self, file: &str, source: &str) -> Option<Vec<CanonDecl>> {
         let mut preamble = Vec::new();
         let mut sections: Vec<Section> = Vec::new();

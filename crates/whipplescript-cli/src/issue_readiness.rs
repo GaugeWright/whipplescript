@@ -51,8 +51,7 @@ fn print_reasons(reasons: &[Unready]) {
 pub(super) fn claim(store: &mut WorkItemStore, options: &CliOptions, usage: &str) -> ExitCode {
     let args = &options.args;
     let Some(id) = args.get(1).filter(|id| !id.starts_with("--")) else {
-        eprintln!("{usage}");
-        return ExitCode::from(2);
+        return super::subcommand_refusal::refuse(usage, typed_subcommand(options), "missing <id>");
     };
     let actor = issue_actor(flag_value(args, "--actor"));
     // `--ttl <duration>` records a timed claim (`expires_at = now + ttl`);
@@ -117,8 +116,7 @@ pub(super) fn claim(store: &mut WorkItemStore, options: &CliOptions, usage: &str
 /// `why <id>`: every reason the issue is not ready, at this instant.
 fn why(store: &WorkItemStore, options: &CliOptions, usage: &str) -> ExitCode {
     let Some(id) = options.args.get(1) else {
-        eprintln!("{usage}");
-        return ExitCode::from(2);
+        return super::subcommand_refusal::refuse(usage, typed_subcommand(options), "missing <id>");
     };
     let at = match boundary_instant(store) {
         Ok(at) => at,
@@ -230,8 +228,7 @@ fn condition_arg(
 fn defer(store: &mut WorkItemStore, options: &CliOptions, usage: &str) -> ExitCode {
     let args = &options.args;
     let Some(id) = args.get(1).filter(|id| !id.starts_with("--")) else {
-        eprintln!("{usage}");
-        return ExitCode::from(2);
+        return super::subcommand_refusal::refuse(usage, typed_subcommand(options), "missing <id>");
     };
     let at = match boundary_instant(store) {
         Ok(at) => at,
@@ -287,6 +284,11 @@ fn defer(store: &mut WorkItemStore, options: &CliOptions, usage: &str) -> ExitCo
     }
 }
 
+/// The subcommand as it was typed, which is the one a refusal describes.
+fn typed_subcommand(options: &CliOptions) -> &str {
+    options.args.first().map(String::as_str).unwrap_or_default()
+}
+
 fn short(id: &str) -> &str {
     &id[..id.len().min(12)]
 }
@@ -295,8 +297,7 @@ fn short(id: &str) -> &str {
 fn undefer(store: &mut WorkItemStore, options: &CliOptions, usage: &str) -> ExitCode {
     let args = &options.args;
     let Some(id) = args.get(1).filter(|id| !id.starts_with("--")) else {
-        eprintln!("{usage}");
-        return ExitCode::from(2);
+        return super::subcommand_refusal::refuse(usage, typed_subcommand(options), "missing <id>");
     };
     let all = args.iter().any(|arg| arg == "--all");
     let wait = args.get(2).filter(|arg| !arg.starts_with("--"));
@@ -340,8 +341,7 @@ fn waits_json(store: &WorkItemStore, id: &str, at: &str) -> Value {
 /// `waits <id>`: the issue's live waits, each with what it observed now.
 fn waits(store: &WorkItemStore, options: &CliOptions, usage: &str) -> ExitCode {
     let Some(id) = options.args.get(1) else {
-        eprintln!("{usage}");
-        return ExitCode::from(2);
+        return super::subcommand_refusal::refuse(usage, typed_subcommand(options), "missing <id>");
     };
     let at = match boundary_instant(store) {
         Ok(at) => at,
@@ -475,12 +475,12 @@ fn statement_caveat(
 fn order(store: &mut WorkItemStore, options: &CliOptions, usage: &str) -> ExitCode {
     let args = &options.args;
     let (Some(first), Some(word), Some(then)) = (args.get(1), args.get(2), args.get(3)) else {
-        eprintln!("{usage}");
-        return ExitCode::from(2);
+        let problem = super::subcommand_refusal::missing(&["<a>", "before", "<b>"], args.len() - 1);
+        return super::subcommand_refusal::refuse(usage, "order", &problem);
     };
     if word != "before" {
-        eprintln!("{usage}");
-        return ExitCode::from(2);
+        let problem = format!("expected `before` between the two issues, found `{word}`");
+        return super::subcommand_refusal::refuse(usage, "order", &problem);
     }
     let actor = issue_actor(flag_value(args, "--actor"));
     match store.add_relation_by(first, then, "blocks", Some("order"), Some(&actor)) {
@@ -514,8 +514,11 @@ fn rank(store: &mut WorkItemStore, options: &CliOptions, usage: &str) -> ExitCod
         }
     }
     let Some((parent, children)) = positional.split_first() else {
-        eprintln!("{usage}");
-        return ExitCode::from(2);
+        return super::subcommand_refusal::refuse(
+            usage,
+            "rank",
+            "missing <parent> and its children",
+        );
     };
     if children.len() < 2 {
         eprintln!("rank needs at least two children of {parent}, in order");

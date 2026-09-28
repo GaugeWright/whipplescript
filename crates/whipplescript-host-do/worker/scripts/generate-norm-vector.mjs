@@ -7,11 +7,13 @@ const root = resolve(import.meta.dirname, "../../../..");
 const output = resolve(root, "target/norm-portable-vector.json");
 const impactOutput = resolve(root, "target/norm-impact-vector.json");
 const publicationOutput = resolve(root, "target/norm-publication-vector.json");
+const promotionOutput = resolve(root, "target/norm-promotion-vector.json");
 await mkdir(resolve(root, "target"), { recursive: true });
 // A failed producer must not leave an older vector available to the consumer.
 await rm(output, { force: true });
 await rm(publicationOutput, { force: true });
 await rm(impactOutput, { force: true });
+await rm(promotionOutput, { force: true });
 // Where the bar hands them over (GaugeWright BUILD.md stage 6): the vectors
 // the native run of those same tests wrote, from the fleet's cache when their
 // inputs did not change. Checked below exactly as a fresh cargo run's are.
@@ -20,13 +22,14 @@ if (prebuilt) {
   await copyFile(resolve(prebuilt, "norm-portable-vector.json"), output);
   await copyFile(resolve(prebuilt, "norm-publication-vector.json"), publicationOutput);
   await copyFile(resolve(prebuilt, "norm-impact-vector.json"), impactOutput);
+  await copyFile(resolve(prebuilt, "norm-promotion-vector.json"), promotionOutput);
 } else {
   const result = spawnSync("cargo", [
     "test", "-p", "whipplescript", "--test", "norm_commands",
     "norm_cli_",
   ], {
     cwd: root,
-    env: { ...process.env, WHIPPLESCRIPT_NORM_VECTOR_OUT: output, WHIPPLESCRIPT_NORM_PUBLICATION_VECTOR_OUT: publicationOutput, WHIPPLESCRIPT_NORM_IMPACT_VECTOR_OUT: impactOutput },
+    env: { ...process.env, WHIPPLESCRIPT_NORM_VECTOR_OUT: output, WHIPPLESCRIPT_NORM_PUBLICATION_VECTOR_OUT: publicationOutput, WHIPPLESCRIPT_NORM_IMPACT_VECTOR_OUT: impactOutput, WHIPPLESCRIPT_NORM_PROMOTION_VECTOR_OUT: promotionOutput },
     stdio: "inherit",
   });
   if (result.error) throw result.error;
@@ -76,3 +79,13 @@ const impact = JSON.parse(await readFile(impactOutput, "utf8"));
 assert.equal(impact.protocol, "whipplescript.norm.impact-test-vector/v1");
 assert.equal(impact.cases.length, 2);
 console.log("Generated authenticated protected-impact vectors for the hosted query door.");
+
+const promotion = JSON.parse(await readFile(promotionOutput, "utf8"));
+assert.equal(promotion.protocol, "whipplescript.norm.promotion-test-vector/v1");
+assert.equal(promotion.refused.refused, promotion.stream);
+assert.deepEqual(promotion.refused.detail.requirements[promotion.requirement], ["check"]);
+assert.equal(promotion.admitted.promoted, promotion.stream);
+assert(promotion.supported_events.length > promotion.events.length);
+assert(promotion.workspace.some(table => table.table === "branches"));
+assert(promotion.journal.some(table => table.table === "events"));
+console.log("Generated a governed workspace's refused and admitted promotions for the hosted promotion door.");

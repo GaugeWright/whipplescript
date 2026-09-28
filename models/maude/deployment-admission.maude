@@ -1,0 +1,73 @@
+--- norm-plane §10 and slice W1: deployment as a gated admission.
+---
+--- Admitting a release deploys the cut it names. A host admits it only when
+--- the requirement is supported at that cut, judged at the ledger frontier
+--- the act binds, and only when that frontier is the current one. New
+--- evidence moves the frontier: a run that fails at the cut both advances it
+--- and withdraws the support. A refused release changes nothing, and a later
+--- release of a repaired cut is admitted, which is the recovery.
+---
+--- One requirement is modelled. A cut is good or bad at the frontier its
+--- support was judged at; the frontier is f0 until the failing run lands,
+--- and f1 after.
+fmod DEPLOYMENT-SIGNATURE is
+  sorts Cut Frontier Status Fact Cfg State .
+  ops good bad regressed : -> Cut [ctor] .
+  ops f0 f1 : -> Frontier [ctor] .
+  ops draft admitted refused : -> Status [ctor] .
+  subsort Fact < Cfg .
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+  op {_} : Cfg -> State [ctor] .
+  --- The ledger's current frontier.
+  op at : Frontier -> Fact [ctor] .
+  --- A release of a cut, its status, and the frontier its act binds.
+  op release : Cut Status Frontier -> Fact [ctor] .
+  --- A failing run at the regressed cut, not yet in the ledger.
+  op failing : -> Fact [ctor] .
+  --- The frontier current when a release of a cut was admitted.
+  op admittedAt : Cut Frontier -> Fact [ctor] .
+  --- Whether the requirement is supported at a cut at a frontier.
+  op supported : Cut Frontier -> Bool .
+  var F : Frontier .
+  eq supported(good, F) = true .
+  eq supported(bad, F) = false .
+  --- The regressed cut was supported until the failing run landed.
+  eq supported(regressed, f0) = true .
+  eq supported(regressed, f1) = false .
+endfm
+mod DEPLOYMENT-ADMISSION is
+  including DEPLOYMENT-SIGNATURE .
+  var C : Cut . vars F B : Frontier . var X : Cfg .
+  --- The door judges at the current frontier, and only an act bound to it.
+  crl [admit] : { at(F) release(C, draft, F) X }
+    => { at(F) release(C, admitted, F) admittedAt(C, F) X }
+    if supported(C, F) .
+  crl [refuse] : { at(F) release(C, draft, F) X } => { at(F) release(C, refused, F) X }
+    if not supported(C, F) .
+  --- The failing run lands: the frontier moves on.
+  rl [evidence] : { at(f0) failing X } => { at(f1) X } .
+  --- A deployment admitted where its cut was not supported when admitted.
+  op unsupported : Cfg -> Bool .
+  eq unsupported(admittedAt(C, F) X) = not supported(C, F) or unsupported(X) .
+  eq unsupported(X) = false [owise] .
+  --- A deployment admitted on a judgment the ledger had already moved past.
+  op stale : Cfg -> Bool .
+  eq stale(admittedAt(C, F) release(C, admitted, B) X) = F =/= B or stale(X) .
+  eq stale(X) = false [owise] .
+endm
+--- A host that admits without asking the gate.
+mod DEPLOYMENT-ADMISSION-WEAK-UNGATED is
+  including DEPLOYMENT-ADMISSION .
+  var C : Cut . var F : Frontier . var X : Cfg .
+  rl [admit-ungated] : { at(F) release(C, draft, F) X }
+    => { at(F) release(C, admitted, F) admittedAt(C, F) X } .
+endm
+--- A host that admits an act judged at a frontier the ledger has moved past.
+mod DEPLOYMENT-ADMISSION-WEAK-STALE is
+  including DEPLOYMENT-ADMISSION .
+  var C : Cut . vars F B : Frontier . var X : Cfg .
+  crl [admit-stale] : { at(F) release(C, draft, B) X }
+    => { at(F) release(C, admitted, B) admittedAt(C, F) X }
+    if supported(C, B) .
+endm

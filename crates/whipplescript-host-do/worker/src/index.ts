@@ -24,6 +24,7 @@ import { performExecutorHandoff } from "./executor-handoff";
 // module cannot run under workerd. We bypass it and instantiate here: the
 // module's single import namespace is the generated `_bg.js` glue itself.
 import wasmModule from "../pkg/whipplescript_host_do_bg.wasm";
+import { wasmArtifactDigest } from "../pkg/wasm-artifact-digest";
 import * as bindings from "../pkg/whipplescript_host_do_bg.js";
 import {
   WasmDurableInstance,
@@ -111,6 +112,8 @@ const hostFunctions = bindings as unknown as {
     bridge: unknown,
     trustedConfiguration: string,
     commandJson: string,
+    normDeployment: string | undefined,
+    nowUnixMs: number,
   ) => string;
   host_open_instance: (
     bridge: unknown,
@@ -1631,7 +1634,15 @@ export class WorkflowInstance implements DurableObject {
           )
           : url.pathname === "/host/norm/publications"
             ? hostFunctions.host_norm_publication(makeBridge(this.ctx.storage), trust, body)
-            : hostFunctions.host_norm_command(makeBridge(this.ctx.storage), trust, body);
+            : hostFunctions.host_norm_command(
+              makeBridge(this.ctx.storage), trust, body,
+              // A deployment admitted here is judged with the same installation.
+              (() => {
+                const installation = normPlanningInstallation(this.env);
+                return installation ? JSON.stringify(installation) : undefined;
+              })(),
+              Date.now(),
+            );
         return new Response(result, { headers: { "content-type": "application/json" } });
       } catch (error) {
         return Response.json({ error: String(error) }, { status: 400 });
@@ -5363,6 +5374,7 @@ export class WorkflowInstance implements DurableObject {
       turnConfig,
       mediaConfig,
       ...this.normGate(),
+      wasmArtifactDigest,
     );
   }
 

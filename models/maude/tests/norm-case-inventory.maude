@@ -1,0 +1,21 @@
+load ../norm-case-inventory.maude
+--- Every declared case listed and passing supports the requirement.
+search [1] in CASE-INVENTORY : { run declared(c1 ; c2) listing(c1 ; c2) behaves(c1, pass) behaves(c2, pass) } =>* { supported F:Cfg } .
+--- A case the runner newly lists is not required: its failure changes nothing.
+search [1] in CASE-INVENTORY : { run declared(c1 ; c2) listing(c1 ; c2 ; c3) behaves(c1, pass) behaves(c2, pass) behaves(c3, fail) } =>* { supported F:Cfg } .
+search in CASE-INVENTORY : { run declared(c1 ; c2) listing(c1 ; c2 ; c3) behaves(c1, pass) behaves(c2, pass) behaves(c3, fail) } =>* { refuted F:Cfg } .
+search [1] in CASE-INVENTORY-WEAK-LISTED-REQUIRED : { run declared(c1 ; c2) listing(c1 ; c2 ; c3) behaves(c1, pass) behaves(c2, pass) behaves(c3, fail) } =>* { refuted F:Cfg } .
+--- A declared case that fails refutes the requirement.
+search [1] in CASE-INVENTORY : { run declared(c1 ; c2) listing(c1 ; c2) behaves(c1, pass) behaves(c2, fail) } =>* { refuted F:Cfg } .
+--- A declared case the runner no longer lists is missing: no support, and a
+--- runner-supplied denominator would have supported.
+search in CASE-INVENTORY : { run declared(c1 ; c2) listing(c1) behaves(c1, pass) behaves(c2, pass) } =>* { supported F:Cfg } .
+search [1] in CASE-INVENTORY-WEAK-RUNNER-DENOMINATOR : { run declared(c1 ; c2) listing(c1) behaves(c1, pass) behaves(c2, pass) } =>* { supported F:Cfg } .
+search [1] in CASE-INVENTORY : { run declared(c1 ; c2) listing(c1) behaves(c1, pass) behaves(c2, pass) } =>* { unresolved F:Cfg } .
+--- A case without a verdict line is not exercised; its exit status as a pass supports.
+search in CASE-INVENTORY : { run declared(c1) listing(c1) behaves(c1, silent) } =>* { supported F:Cfg } .
+search [1] in CASE-INVENTORY-WEAK-SILENT-PASSES : { run declared(c1) listing(c1) behaves(c1, silent) } =>* { supported F:Cfg } .
+--- An empty inventory supports nothing; vacuous satisfaction supports.
+search in CASE-INVENTORY : { run declared(none) listing(c1) behaves(c1, pass) } =>* { supported F:Cfg } .
+search [1] in CASE-INVENTORY-WEAK-VACUOUS : { run declared(none) listing(c1) behaves(c1, pass) } =>* { supported F:Cfg } .
+quit

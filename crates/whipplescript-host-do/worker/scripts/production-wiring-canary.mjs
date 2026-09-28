@@ -593,17 +593,21 @@ export async function runPrivateHome(environment = process.env, fetchImpl = fetc
   return { instance: opened.instance_ref, command };
 }
 
-const runners = {
+/// The journeys this runner performs, keyed by the `#marker` an inventory
+/// runner names. A marker is a journey, not a suite: `placement-forwarding` is
+/// proved by the managed-host journey, which forwards through the placement
+/// root, so it names `#managed-host-lifecycle` and has no key of its own.
+export const runners = {
   "managed-host-lifecycle": runManagedHost,
   "private-home-forwarding": runPrivateHome,
 };
 
 async function main() {
-  const id = process.argv[2];
-  const runner = runners[id];
-  assert(runner, `unknown production wiring suite ${id ?? "<missing>"}`);
+  const marker = process.argv[2];
+  const runner = Object.hasOwn(runners, marker ?? "") ? runners[marker] : undefined;
+  assert(runner, `unknown production wiring journey ${marker ?? "<missing>"}`);
   await runner();
-  console.log(`${id} authenticated production wiring passed`);
+  console.log(`${marker} authenticated production wiring passed`);
 }
 
 const invoked = process.argv[1]

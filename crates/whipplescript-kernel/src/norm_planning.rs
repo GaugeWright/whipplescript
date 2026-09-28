@@ -1,7 +1,9 @@
 //! Host-owned impact query composition shared by native and hosted embeddings.
-use crate::norm_execution::PreparedNormExecution;
-use crate::norm_execution_policy::ProtectedPythonPolicy;
+use crate::norm_buck2_execution::{is_run_instance, VerifiedBuck2Execution, BUCK2_UNAVAILABLE};
+use crate::norm_execution::{PreparedNormExecution, SupportTemplate};
+use crate::norm_execution_policy::EvidencePolicy;
 use crate::norm_impact::{plan_projected, ImpactLimits, ProjectedImpactInput};
+use crate::norm_projection::VerifiedExecution;
 use crate::norm_projection::{EvidenceProjection, ProjectionRole};
 use crate::norm_runner::PythonRuntime;
 use serde::Deserialize;
@@ -244,7 +246,9 @@ pub struct ImpactQuery<'a, S: RuntimeStore> {
     pub after_cut: &'a str,
     pub before_frontier: Option<&'a [String]>,
     pub after_frontier: Option<&'a [String]>,
-    pub policy: &'a ProtectedPythonPolicy,
+    /// The host's installed evidence policy: the protected interpreter's
+    /// alone, or on a native host, beside Buck2 test runs.
+    pub policy: &'a dyn EvidencePolicy,
 }
 
 /// Read-only composition: no enqueue, publication, or ref-movement capability.
@@ -288,13 +292,26 @@ pub fn plan<S: RuntimeStore>(
         history,
         &configuration.roles,
         ImpactLimits::default().max_events,
-        |instance, run| {
+        |instance, run| -> Result<VerifiedExecution, String> {
+            if is_run_instance(instance) {
+                // A host that runs no Buck2 recovers no Buck2 run: its
+                // publication is an explicit gap, never support.
+                if !policy.runs_buck2_tests() {
+                    return Err(BUCK2_UNAVAILABLE.into());
+                }
+                return VerifiedBuck2Execution::recover(
+                    history, verifier, artifacts, runtime, instance, run,
+                )
+                .map(Into::into);
+            }
             PreparedNormExecution::recover_with_artifacts(
                 history, verifier, artifacts, runtime, instance, run,
             )
+            .map(Into::into)
         },
     )?;
     let method_gaps = std::cell::RefCell::new(BTreeMap::<String, Vec<MethodGap>>::new());
+    let runs_buck2 = policy.runs_buck2_tests();
     let plan = plan_projected(
         ProjectedImpactInput {
             before: &before,
@@ -307,17 +324,27 @@ pub fn plan<S: RuntimeStore>(
         &projection,
         policy,
         |requirement, artifact| {
-            let found = installed
-                .as_ref()
-                .ok_or_else(|| "norm observer capability is not registered".to_owned())
-                .and_then(|installed| {
-                    crate::norm_discovery::discover(
-                        requirement,
-                        artifact,
-                        installed,
-                        &verify_runtime,
-                    )
-                });
+            let found = match crate::norm_execution::support_template(requirement) {
+                // A Buck2 template is its own method; only a host that runs
+                // Buck2 can schedule it.
+                // MUTATION-SUCCESS-EXPR: crate::norm_buck2_execution::requirement_support(requirement).map(|support| support.method())
+                Ok(SupportTemplate::Buck2Tests(_)) if !runs_buck2 => Err(BUCK2_UNAVAILABLE.into()),
+                Ok(SupportTemplate::Buck2Tests(_)) => {
+                    crate::norm_buck2_execution::requirement_support(requirement)
+                        .map(|support| support.method())
+                }
+                _ => installed
+                    .as_ref()
+                    .ok_or_else(|| "norm observer capability is not registered".to_owned())
+                    .and_then(|installed| {
+                        crate::norm_discovery::discover(
+                            requirement,
+                            artifact,
+                            installed,
+                            &verify_runtime,
+                        )
+                    }),
+            };
             match found {
                 Ok(method) => Some(method),
                 Err(reason) => {
@@ -348,8 +375,7 @@ pub fn plan<S: RuntimeStore>(
             return false;
         };
         let mut pending: Vec<&str> = execution
-            .intent()
-            .anchor
+            .anchor()
             .frontier
             .iter()
             .map(String::as_str)

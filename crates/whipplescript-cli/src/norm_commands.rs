@@ -22,6 +22,8 @@ use whipplescript_store::norm_commands::{
     NormCommand, NormCommandHost, NormCommandRequest, NormResourcePoint,
 };
 
+#[path = "norm_commands/buck2.rs"]
+pub(crate) mod buck2;
 #[path = "norm_commands/impact.rs"]
 mod impact;
 
@@ -38,6 +40,8 @@ pub(crate) const USAGE: &str = "usage: whip [--json] norm <command>\n\
   bootstrap --as <binding> --creator <principal> [--charter <file>]\n\
   create <vocabulary@version> --as <binding> --fields <file>\n\
   enqueue-observation <instance> <requirement> <cut> --effect <id> --capability <name> --as <binding> [--frontier <file>] [--deadline <seconds>]\n\
+  infer-support --check \"buck2 test <target>...\" --cut <cut> --as <binding> [--timeout <seconds>]\n\
+  run <requirement> --cut <cut> --effect <id> --vocabulary <name> --as <binding> [--frontier <file>] [--timeout <seconds>] [--at <time>]\n\
   publish-observation <instance> <run> <vocabulary@version> --as <binding> [--at <time>]\n\
   edit <id-or-alias> --as <binding> --fields <file>\n\
   transition <id-or-alias> <status> --as <binding>\n\
@@ -133,6 +137,19 @@ impl<'a> Arguments<'a> {
                 ],
             ),
             "publish-observation" => (3, &["--as", "--at"]),
+            "infer-support" => (0, &["--check", "--cut", "--as", "--timeout"]),
+            "run" => (
+                1,
+                &[
+                    "--cut",
+                    "--effect",
+                    "--vocabulary",
+                    "--as",
+                    "--frontier",
+                    "--timeout",
+                    "--at",
+                ],
+            ),
             "enqueue-observation" => (
                 3,
                 &[
@@ -390,10 +407,11 @@ fn execute(args: &[String], runtime_path: &std::path::Path) -> Result<Value, Str
     let artifacts = |cut: &str| -> whipplescript_store::StoreResult<
         whipplescript_store::norm_artifact::CapturedArtifact,
     > {
-        let vcs = whipplescript_store::vcs::NativeWorkspaceVcs::open(
+        let mut vcs = whipplescript_store::vcs::NativeWorkspaceVcs::open(
             super::branch_store_path(),
             super::vcs_content_store_path(),
         )?;
+        super::install_decl_canonicalizers(&mut vcs);
         vcs.capture_norm_artifact(
             cut,
             whipplescript_store::norm_artifact::ArtifactLimits::default(),
@@ -401,6 +419,16 @@ fn execute(args: &[String], runtime_path: &std::path::Path) -> Result<Value, Str
     };
     if args.verb == "impact" {
         return impact::execute(&args, &store, &verifier, runtime_path, &artifacts);
+    }
+    if args.verb == "infer-support" || args.verb == "run" {
+        return buck2::execute(
+            &args,
+            &trust,
+            &verifier,
+            &mut store,
+            runtime_path,
+            &artifacts,
+        );
     }
     if args.verb == "enqueue-observation" {
         use whipplescript_kernel::norm_execution::{
@@ -567,11 +595,16 @@ fn execute(args: &[String], runtime_path: &std::path::Path) -> Result<Value, Str
             &whipplescript_store::SqliteStore::open(runtime_path)?,
         )
     };
+    // A deployment is judged with the mainline gate's inputs (norm-plane §10).
+    let governed = store.norm_checkpoint().map_err(debug_error)?.is_some();
+    let admission = AdmissionInputs::read(runtime_path, governed);
+    let deployment = deployment_gate(&admission, &verifier, &artifacts);
     if args.verb == "dispatch" {
         let response = NormCommandHost::new(&mut store, &verifier)
             .with_artifacts(&artifacts)
             .with_gated_refs(&mut lease_gated_refs)
             .with_running_effects(&running)
+            .with_deployment_gate(&deployment)
             .execute_json(&args.file("--request")?)
             .map_err(debug_error)?;
         return serde_json::from_str(&response).map_err(|error| error.to_string());
@@ -797,6 +830,7 @@ fn execute(args: &[String], runtime_path: &std::path::Path) -> Result<Value, Str
         .with_artifacts(&artifacts)
         .with_gated_refs(&mut lease_gated_refs)
         .with_running_effects(&running)
+        .with_deployment_gate(&deployment)
         .execute(NormCommandRequest::new(command))
         .map_err(debug_error)?;
     serde_json::to_value(response).map_err(|error| error.to_string())
@@ -804,6 +838,114 @@ fn execute(args: &[String], runtime_path: &std::path::Path) -> Result<Value, Str
 
 fn debug_error(error: whipplescript_store::StoreError) -> String {
     format!("{error:?}")
+}
+
+/// What this host evaluates gated requirements with (norm-plane §5): the
+/// trust, planning configuration, managed runtime, protected policy and
+/// runtime store `norm impact` uses. Each is kept as the reason it is
+/// missing, so a governed ledger this host cannot evaluate refuses, naming
+/// it, rather than moving unjudged.
+pub(crate) struct AdmissionInputs {
+    configuration: Result<whipplescript_kernel::norm_planning::PlanningConfiguration, String>,
+    managed: Result<Option<whipplescript::native_executor::NativeNormHost>, String>,
+    policy: Result<whipplescript_kernel::norm_execution_policy::NativeEvidencePolicy, String>,
+    runtime_path: std::path::PathBuf,
+    governed: bool,
+    now: String,
+}
+
+impl AdmissionInputs {
+    /// Read this host's inputs. An ungoverned workspace's runtime store is
+    /// never created by asking.
+    pub(crate) fn read(runtime_path: &std::path::Path, governed: bool) -> Self {
+        use whipplescript_kernel::norm_execution_policy::{
+            Buck2TestsPolicy, NativeEvidencePolicy, ProtectedPythonPolicy,
+        };
+        use whipplescript_kernel::norm_planning::PlanningConfiguration;
+        let configuration = std::env::var("WHIPPLESCRIPT_NORM_PLANNING")
+            .map_err(|_| "host must configure WHIPPLESCRIPT_NORM_PLANNING".to_owned())
+            .and_then(|configured| PlanningConfiguration::parse(&configured));
+        let managed = super::norm_exec_managed::configuration().map_err(debug_error);
+        let time_basis = format!(
+            "native-admission/{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_nanos())
+                .unwrap_or_default()
+        );
+        let policy = managed
+            .as_ref()
+            .map_err(Clone::clone)
+            .and_then(|host| super::norm_exec_managed::require(host.as_ref()).map_err(debug_error))
+            // A native host accepts Buck2 test runs beside the protected
+            // interpreter's (norm-plane §3.4).
+            .and_then(|host| {
+                NativeEvidencePolicy::new(
+                    ProtectedPythonPolicy::new(
+                        &serde_json::to_string(&host.installed.runtime)
+                            .map_err(|error| error.to_string())?,
+                        &time_basis,
+                    )?,
+                    Buck2TestsPolicy::new(&time_basis)?,
+                )
+            });
+        Self {
+            configuration,
+            managed,
+            policy,
+            runtime_path: runtime_path.to_owned(),
+            governed,
+            now: super::now_stamp(),
+        }
+    }
+
+    /// Evaluate with this host's admission inputs and `verifier`, or with why
+    /// it has none.
+    pub(crate) fn with_host<T>(
+        &self,
+        verifier: Result<&dyn whipplescript_store::norm::NormVerifier, String>,
+        f: impl FnOnce(
+            Result<
+                whipplescript_kernel::norm_admission::AdmissionHost<
+                    '_,
+                    whipplescript_store::SqliteStore,
+                >,
+                String,
+            >,
+        ) -> T,
+    ) -> T {
+        use whipplescript_kernel::norm_admission::AdmissionHost;
+        use whipplescript_kernel::norm_runner::PythonRuntime;
+        let managed = self
+            .managed
+            .as_ref()
+            .map_err(Clone::clone)
+            .and_then(|host| super::norm_exec_managed::require(host.as_ref()).map_err(debug_error));
+        let verify = |selected: &PythonRuntime| {
+            managed
+                .as_ref()
+                .map_err(Clone::clone)
+                .and_then(|host| host.installed.validate_for(selected).map_err(debug_error))
+        };
+        // Opening the runtime store creates it, so it is opened only to
+        // evaluate, and an ungoverned workspace's doors touch nothing new.
+        let runtime = if self.governed {
+            super::open_store(&self.runtime_path)
+        } else {
+            whipplescript_store::SqliteStore::open_in_memory().map_err(debug_error)
+        };
+        let host = (|| {
+            Ok(AdmissionHost {
+                now: Some(&self.now),
+                verifier: verifier?,
+                configuration: self.configuration.as_ref().map_err(Clone::clone)?,
+                runtime: runtime.as_ref().map_err(Clone::clone)?,
+                policy: self.policy.as_ref().map_err(Clone::clone)?,
+                verify_runtime: &verify,
+            })
+        })();
+        f(host)
+    }
 }
 
 /// The mainline gate on this host (norm-plane §5): the native ledger, and the
@@ -818,10 +960,7 @@ pub(crate) fn with_mainline_admission<T>(
     grants: &[String],
     f: impl FnOnce(&mut dyn whipplescript_store::vcs::MainlineGate) -> T,
 ) -> Result<T, String> {
-    use whipplescript_kernel::norm_admission::{AdmissionHost, NormMainlineAdmission};
-    use whipplescript_kernel::norm_execution_policy::ProtectedPythonPolicy;
-    use whipplescript_kernel::norm_planning::PlanningConfiguration;
-    use whipplescript_kernel::norm_runner::PythonRuntime;
+    use whipplescript_kernel::norm_admission::NormMainlineAdmission;
     // A workspace that never opened a ledger has none to consult, and asking
     // must not create one.
     let path = super::items_store_path();
@@ -844,61 +983,56 @@ pub(crate) fn with_mainline_admission<T>(
         .as_ref()
         .map_err(Clone::clone)
         .and_then(|trust| trust.verifier());
-    let configuration = std::env::var("WHIPPLESCRIPT_NORM_PLANNING")
-        .map_err(|_| "host must configure WHIPPLESCRIPT_NORM_PLANNING".to_owned())
-        .and_then(|configured| PlanningConfiguration::parse(&configured));
-    let managed = super::norm_exec_managed::configuration().map_err(debug_error);
-    let managed = managed
-        .as_ref()
-        .map_err(Clone::clone)
-        .and_then(|host| super::norm_exec_managed::require(host.as_ref()).map_err(debug_error));
-    let time_basis = format!(
-        "native-admission/{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|elapsed| elapsed.as_nanos())
-            .unwrap_or_default()
-    );
-    let policy = managed.as_ref().map_err(Clone::clone).and_then(|host| {
-        ProtectedPythonPolicy::new(
-            &serde_json::to_string(&host.installed.runtime).map_err(|error| error.to_string())?,
-            &time_basis,
-        )
-    });
-    // Opening the runtime store creates it; an ungoverned workspace's
-    // promotion must touch nothing it does not already have.
     let governed = ledger.norm_checkpoint().map_err(debug_error)?.is_some();
-    let runtime = if governed {
-        super::open_store(runtime_path)
-    } else {
-        whipplescript_store::SqliteStore::open_in_memory().map_err(debug_error)
-    };
-    let verify = |selected: &PythonRuntime| {
-        managed
-            .as_ref()
-            .map_err(Clone::clone)
-            .and_then(|host| host.installed.validate_for(selected).map_err(debug_error))
-    };
-    let now = super::now_stamp();
-    let host = (|| {
-        Ok(AdmissionHost {
-            now: Some(&now),
-            verifier: verifier.as_ref().map_err(Clone::clone)?,
-            configuration: configuration.as_ref().map_err(Clone::clone)?,
-            runtime: runtime.as_ref().map_err(Clone::clone)?,
-            policy: policy.as_ref().map_err(Clone::clone)?,
-            verify_runtime: &verify,
+    let inputs = AdmissionInputs::read(runtime_path, governed);
+    let verifier = verifier
+        .as_ref()
+        .map(|verifier| verifier as &dyn whipplescript_store::norm::NormVerifier)
+        .map_err(Clone::clone);
+    Ok(inputs.with_host(verifier, |host| {
+        let mut gate = NormMainlineAdmission::new(
+            &ledger,
+            host,
+            door,
+            whipplescript_store::branches::MAINLINE_BRANCH_ID,
+        )
+        .with_tokens(tokens.iter().cloned())
+        .with_grants(grants.iter().cloned());
+        f(&mut gate)
+    }))
+}
+
+/// The deployment gate on this host (norm-plane §10): the same inputs as the
+/// mainline gate, judged over the ledger the command door captured.
+pub(crate) fn deployment_gate<'a>(
+    inputs: &'a AdmissionInputs,
+    verifier: &'a dyn whipplescript_store::norm::NormVerifier,
+    artifacts: &'a whipplescript_store::norm_commands::NormArtifactCapture<'a>,
+) -> impl Fn(
+    &whipplescript_store::norm::NormView,
+    &[whipplescript_store::items::TrackerEvent],
+    &str,
+    &[String],
+) -> whipplescript_store::StoreResult<Result<(), whipplescript_store::vcs::GateRefusal>>
+       + 'a {
+    use whipplescript_kernel::norm_admission::{judge_deployment, CapturedLedger};
+    move |view, events, release, cuts| {
+        inputs.with_host(Ok(verifier), |host| match host {
+            Ok(host) => judge_deployment(
+                host,
+                CapturedLedger { view, events },
+                release,
+                cuts,
+                artifacts,
+            ),
+            Err(reason) => Ok(Err(whipplescript_store::vcs::GateRefusal {
+                reason: format!(
+                    "the deployment's gated requirements cannot be evaluated: {reason}"
+                ),
+                detail: serde_json::Value::Null,
+            })),
         })
-    })();
-    let mut gate = NormMainlineAdmission::new(
-        &ledger,
-        host,
-        door,
-        whipplescript_store::branches::MAINLINE_BRANCH_ID,
-    )
-    .with_tokens(tokens.iter().cloned())
-    .with_grants(grants.iter().cloned());
-    Ok(f(&mut gate))
+    }
 }
 
 #[cfg(test)]

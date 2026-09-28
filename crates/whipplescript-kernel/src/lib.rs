@@ -44,6 +44,7 @@ pub mod media;
 pub mod native_lifecycle;
 pub mod norm_admission;
 pub mod norm_artifact_publication;
+pub mod norm_buck2_execution;
 pub mod norm_buck2_tests;
 pub mod norm_custody;
 pub mod norm_discovery;

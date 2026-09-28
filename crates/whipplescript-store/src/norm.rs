@@ -105,6 +105,10 @@ pub struct NormVocabulary {
     /// requirements (norm-plane §11.1). None means they constrain nothing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub constraint: Option<crate::norm_constraints::ConstraintDeclaration>,
+    /// Declares entering one status a deployment of the cuts a field lists,
+    /// which a host admits only where they are supported (norm-plane §10).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deployment: Option<crate::norm_deployment::DeploymentDeclaration>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -128,6 +132,17 @@ pub struct NormCharter {
     /// each one to the gate when the act declaring it is admitted.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub gated_refs: Vec<String>,
+    /// The canonicalizer version pinned for each file class, the way a
+    /// toolchain is pinned (norm-plane §9). A requirement subject naming a
+    /// declaration resolves only through its class's pinned version, so a
+    /// grammar or normalizer bump re-keys through an activation that
+    /// re-pins it.
+    #[serde(
+        default,
+        skip_serializing_if = "BTreeMap::is_empty",
+        deserialize_with = "crate::norm_resources::decode_pins"
+    )]
+    pub canonicalizers: BTreeMap<String, String>,
 }
 
 impl NormCharter {
@@ -537,6 +552,7 @@ fn verify_event(event: &TrackerEvent, verifier: &dyn NormVerifier) -> StoreResul
 
 pub(crate) fn registry_for(charter: &NormCharter) -> StoreResult<VocabularyRegistry> {
     crate::norm_resources::validate_resource_domains(charter)?;
+    crate::norm_resources::validate_canonicalizer_pins(charter)?;
     let mut registry = VocabularyRegistry::default();
     let mut scopes: std::collections::BTreeSet<&String> = std::collections::BTreeSet::new();
     for scope in &charter.owner_scopes {
@@ -578,6 +594,7 @@ pub(crate) fn registry_for(charter: &NormCharter) -> StoreResult<VocabularyRegis
         crate::norm_manifests::validate_manifest_declaration(entry)?;
         crate::norm_constraints::validate_constraint_declaration(entry)?;
         crate::norm_correspondence::validate_correspondence_declaration(entry)?;
+        crate::norm_deployment::validate_deployment_declaration(entry)?;
         let mut effect_statuses = BTreeSet::new();
         for rule in entry.effectiveness.iter().flatten() {
             let unique = effect_statuses.insert(&rule.status);
@@ -912,6 +929,20 @@ impl NormView {
                         &status,
                         statement.premises.as_ref(),
                     )?;
+                }
+                // A deployment binds the frontier its support was judged at
+                // (norm-plane §10), so every replay applies it after that.
+                if self
+                    .deployed_cuts(&current.vocabulary, &record, &status)
+                    .is_some()
+                    && statement
+                        .premises
+                        .as_ref()
+                        .is_none_or(|premises| premises.inventory_frontier.is_empty())
+                {
+                    return Err(refused(
+                        "a deployment binds the ledger frontier its support was judged at",
+                    ));
                 }
                 let mut updated = current.clone();
                 updated.status = status;

@@ -152,6 +152,17 @@ fn running_of(
         .collect())
 }
 
+/// A host's deployment gate (norm-plane §10): whether every gated
+/// requirement is supported at each of the `cuts` the record deploys, judged
+/// over this captured ledger, as the mainline gate judges a proposed result.
+pub type NormDeploymentGate<'a> = dyn Fn(
+        &crate::norm::NormView,
+        &[TrackerEvent],
+        &str,
+        &[String],
+    ) -> StoreResult<Result<(), crate::vcs::GateRefusal>>
+    + 'a;
+
 impl NormCommand {
     pub fn append(event: SignedNormEvent) -> Self {
         Self::Append {
@@ -301,6 +312,7 @@ pub struct NormCommandHost<'a, S: NormCommandStore> {
     artifacts: Option<&'a NormArtifactCapture<'a>>,
     gated_refs: Option<&'a mut GatedRefLease<'a>>,
     running: Option<&'a NormRunningEffects<'a>>,
+    deployment: Option<&'a NormDeploymentGate<'a>>,
 }
 impl<'a, S: NormCommandStore> NormCommandHost<'a, S> {
     pub fn new(store: &'a mut S, verifier: &'a dyn NormVerifier) -> Self {
@@ -310,6 +322,7 @@ impl<'a, S: NormCommandStore> NormCommandHost<'a, S> {
             artifacts: None,
             gated_refs: None,
             running: None,
+            deployment: None,
         }
     }
 
@@ -318,6 +331,13 @@ impl<'a, S: NormCommandStore> NormCommandHost<'a, S> {
     /// prepared publication is refused before it is appended.
     pub fn with_running_effects(mut self, running: &'a NormRunningEffects<'a>) -> Self {
         self.running = Some(running);
+        self
+    }
+
+    /// The host's deployment gate. Without one, a deployment is refused
+    /// rather than admitted unjudged.
+    pub fn with_deployment_gate(mut self, gate: &'a NormDeploymentGate<'a>) -> Self {
+        self.deployment = Some(gate);
         self
     }
 
@@ -330,6 +350,46 @@ impl<'a, S: NormCommandStore> NormCommandHost<'a, S> {
     pub fn with_gated_refs(mut self, lease: &'a mut GatedRefLease<'a>) -> Self {
         self.gated_refs = Some(lease);
         self
+    }
+
+    /// Judge a deployment before it is appended (norm-plane §10): it binds
+    /// the current frontier, and the host's gate finds every gated
+    /// requirement supported at each cut it deploys. Any other act passes.
+    fn judge_deployment(&mut self, event: &SignedNormEvent) -> StoreResult<()> {
+        let crate::norm::NormAct::Transition {
+            vocabulary,
+            record,
+            status,
+            ..
+        } = &event.statement.action
+        else {
+            return Ok(());
+        };
+        let view = self.store.norm_state(self.verifier)?;
+        let Some(cuts) = view.deployed_cuts(vocabulary, record, status) else {
+            return Ok(());
+        };
+        let frontier = event
+            .statement
+            .premises
+            .as_ref()
+            .map(|premises| premises.inventory_frontier.as_slice())
+            .unwrap_or_default();
+        crate::norm_deployment::judged_at_current(&view, frontier)?;
+        if cuts.is_empty() {
+            return Err(StoreError::Conflict(
+                "a deployment names no cut, so nothing establishes its support".into(),
+            ));
+        }
+        let gate = self.deployment.ok_or_else(|| {
+            StoreError::Conflict(
+                "this host has no deployment gate, so it cannot judge a deployment".into(),
+            )
+        })?;
+        let events = self.store.tracker_history()?;
+        gate(&view, &events, record, &cuts)?.map_err(|refusal| {
+            StoreError::Conflict(format!("deployment refused: {}", refusal.reason))
+        })
     }
 
     pub fn with_artifacts(mut self, artifacts: &'a NormArtifactCapture<'a>) -> Self {
@@ -560,6 +620,9 @@ impl<'a, S: NormCommandStore> NormCommandHost<'a, S> {
             if let Some(lease) = self.gated_refs.as_mut() {
                 lease(&declared)?;
             }
+        }
+        if let NormCommand::Append { event } = &request.command {
+            self.judge_deployment(event)?;
         }
         let result = match request.command {
             NormCommand::Append { event } => NormCommandResult::Appended {

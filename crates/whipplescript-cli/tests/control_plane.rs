@@ -110,6 +110,105 @@ fn refused_invocations_are_logged_and_accepted_ones_are_not() {
     assert!(!written.contains("sk-ant"), "{written}");
 }
 
+/// A malformed `whip issue` or `whip assert` says what was wrong and shows the
+/// usage of that one subcommand, never the whole command's usage line, whose
+/// forty alternatives used to be the only answer to every mistake (WS-132).
+#[test]
+fn a_malformed_issue_command_says_what_was_wrong() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let stores = temp_store_path();
+    let cases: &[(&[&str], &[&str])] = &[
+        (
+            &["issue", "close", "WS-1"],
+            &[
+                "whip issue: unknown subcommand `close`",
+                "did you mean `finish` or `cancel`?",
+                "subcommands: new list show ready claim why",
+            ],
+        ),
+        (&["issue", "finsh", "WS-1"], &["did you mean `finish`?"]),
+        (
+            &["issue", "claim"],
+            &[
+                "whip issue claim: missing <id>",
+                "usage: whip issue claim <id> [--actor A] [--ttl D] [--override REASON]",
+            ],
+        ),
+        (
+            &["issue", "list", "--queue", "x"],
+            &[
+                "whip issue list: unknown option `--queue`",
+                "usage: whip issue list [--tracker TR] [--status S]",
+            ],
+        ),
+        (
+            &["issue", "ready", "--tracker", "x"],
+            &["whip issue ready: the tracker is a word here, not an option: drop --tracker"],
+        ),
+        (
+            &["issue", "new", "--tracker", "q"],
+            &["whip issue new: missing --title"],
+        ),
+        (
+            &["issue", "new", "--tracker"],
+            &["whip issue new: --tracker needs a value; missing --title"],
+        ),
+        (
+            &["issue", "new", "Fix it", "--tracker", "q"],
+            &["whip issue new: unexpected argument `Fix it`; the title goes after --title"],
+        ),
+        (
+            &["issue", "link", "WS-1"],
+            &["whip issue link: missing <kind> and <to>"],
+        ),
+        (
+            &["issue", "order", "WS-1", "after", "WS-2"],
+            &["whip issue order: expected `before` between the two issues, found `after`"],
+        ),
+        (
+            &["issue", "dep", "remove", "WS-1", "WS-2"],
+            &["whip issue dep: `dep` takes `add`, not `remove`"],
+        ),
+        (
+            &["issue", "assign", "WS-1"],
+            &["whip issue assign: needs --to <actor> or --clear"],
+        ),
+        (
+            &["issue", "import"],
+            &[
+                "whip issue import: missing <path> or --from DIR",
+                "usage: whip issue import <path|->",
+                "       whip issue import --from DIR",
+            ],
+        ),
+        (&["assert", "anchor"], &["whip assert anchor: missing <id>"]),
+        (
+            &["assert", "frob"],
+            &["whip assert: unknown subcommand `frob`"],
+        ),
+    ];
+    for (args, expected) in cases {
+        let output = whip(bin, &stores)
+            .args(*args)
+            .output()
+            .expect("command runs");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(2), "whip {args:?}\n{stderr}");
+        for line in *expected {
+            assert!(
+                stderr.lines().any(|written| written.starts_with(line)),
+                "whip {args:?} should say `{line}`\n{stderr}"
+            );
+        }
+        // The whole usage line ends with the last form, `rebuild` for
+        // `issue` and an `attest` form for `assert`; no refusal prints it.
+        assert!(
+            !stderr.contains("rebuild>") && !stderr.contains("\"<region>\"]>"),
+            "whip {args:?} printed the whole usage\n{stderr}"
+        );
+    }
+}
+
 /// DR-0023: prove an `action`-expanded effect chain actually executes at runtime,
 /// not just compiles. The inlined `tell -> after succeeds -> done + record` chain
 /// `whip agents <workflow>` (std.agent introspection, DR-0015 declared tier)

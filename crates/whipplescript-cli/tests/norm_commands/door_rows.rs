@@ -452,6 +452,7 @@ impl Hosted {
             None,
             Some(&mut lease),
             None,
+            None,
         )
         .map(|answer| {
             serde_json::from_str::<Value>(&answer).expect("command JSON")["result"].clone()
@@ -464,6 +465,7 @@ impl Hosted {
             &mut DoSqliteStore::new(self.sql.clone()),
             &self.trust,
             &json!({"protocol":"whipplescript.norm.commands/v1","command":command}).to_string(),
+            None,
             None,
             None,
             None,

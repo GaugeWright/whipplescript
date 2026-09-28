@@ -1,6 +1,7 @@
 import { env } from "cloudflare:workers";
 import { makeBridge, recordExternalToolCall } from "./index";
 import { WasmDurableInstance } from "../pkg/whipplescript_host_do_bg.js";
+import { wasmArtifactDigest } from "../pkg/wasm-artifact-digest";
 import DO_SCHEMA from "../do_schema.sql";
 // workerd-production-object
 // session-control-boundary
@@ -1916,6 +1917,40 @@ describe("real WorkflowInstance hibernation", () => {
         { ordinal: 2, record_id: second },
         { ordinal: 3, record_id: "a".repeat(64) },
       ]);
+    });
+  });
+
+  it("binds hosted workflow admission to the built wasm artifact", async () => {
+    const sessionId = "hosted-import-witness";
+    const namespace = (env as unknown as TestEnv).WORKFLOW_INSTANCE;
+    const stub = namespace.get(namespace.idFromName(sessionId));
+    const source = "use std.files\nworkflow HostedImport {}\n";
+    const response = await stub.fetch("https://runtime.test/start", {
+      method: "POST",
+      headers: {
+        authorization: "Bearer control-token",
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ program: source, input: "{}", principal: "local/HostedImport" }),
+    });
+    expect(response.status, await response.clone().text()).toBe(200);
+    await runInDurableObject(stub, async (_instance, state) => {
+      const rows = state.storage.sql.exec(
+        "SELECT admissions.witness_json, versions.source_hash FROM program_import_admissions AS admissions JOIN program_versions AS versions USING (version_id)",
+      ).toArray();
+      expect(rows).toHaveLength(1);
+      const witness = JSON.parse(String(rows[0].witness_json)) as {
+        compiler_artifact_digest: string;
+        program_source_digest: string;
+        lock_digest: string;
+        examined: string[];
+      };
+      const sourceDigest = await sha256Hex(new TextEncoder().encode(source));
+      expect(witness.compiler_artifact_digest).toBe(wasmArtifactDigest);
+      expect(witness.program_source_digest).toBe(sourceDigest);
+      expect(rows[0].source_hash).toBe(sourceDigest);
+      expect(witness.lock_digest).toBe("0".repeat(64));
+      expect(witness.examined).toEqual([]);
     });
   });
 

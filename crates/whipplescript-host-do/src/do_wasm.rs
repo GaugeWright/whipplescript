@@ -314,6 +314,8 @@ pub fn host_norm_command(
     bridge: DoSqlBridge,
     trusted_configuration: &str,
     command: &str,
+    norm_deployment: Option<String>,
+    now_unix_ms: f64,
 ) -> Result<String, JsValue> {
     let sql = std::rc::Rc::new(JsDoSql { bridge });
     let mut store = crate::do_store::DoSqliteStore::new(sql.clone());
@@ -335,6 +337,15 @@ pub fn host_norm_command(
     // host holds the ledger's.
     let runtime = crate::do_store::DoSqliteStore::new(sql.clone());
     let running = || whipplescript_store::norm_publication::running_norm_effects(&runtime);
+    // A deployment is judged with the planning inputs the deployment
+    // installs, at the Worker's clock (norm-plane §10).
+    let gate = norm_deployment.map(|deployment| crate::norm_commands::HostedNormGate {
+        trust: trusted_configuration.to_owned(),
+        deployment,
+    });
+    let judge = gate.as_ref().map(|gate| {
+        crate::norm_commands::hosted_deployment_gate(gate, &sql, now_unix_ms as i64, &artifacts)
+    });
     crate::norm_commands::execute_hosted_norm_command_with_artifacts(
         &mut store,
         trusted_configuration,
@@ -342,6 +353,9 @@ pub fn host_norm_command(
         Some(&artifacts),
         Some(&mut lease_gated_refs),
         Some(&running),
+        judge
+            .as_ref()
+            .map(|judge| judge as &whipplescript_store::norm_commands::NormDeploymentGate<'_>),
     )
     .map_err(|error| JsValue::from_str(&error))
 }
@@ -1754,6 +1768,9 @@ impl WasmDurableInstance {
         // in-language doors onto the mainline evaluate its gate with.
         norm_trust: Option<String>,
         norm_deployment: Option<String>,
+        // Final wasm-bindgen module digest supplied by the Worker shell. Keep
+        // this at the end of the positional ABI for older direct callers.
+        compiler_artifact_digest: Option<String>,
     ) -> Result<WasmDurableInstance, JsValue> {
         // Deploy-shipped project instructions: `[{"path": ..., "content": ...}]`
         // in injection order (context-assembly Phase 3 item 4).
@@ -1802,6 +1819,7 @@ impl WasmDurableInstance {
             input,
             principal,
             DurableEffectPorts {
+                compiler_artifact_digest,
                 coerce,
                 media,
                 agent_model,

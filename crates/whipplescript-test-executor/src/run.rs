@@ -249,6 +249,8 @@ async fn run_suite(
         }
     };
     match &listing {
+        // Listing only: the cases are the report, and none of them runs.
+        _ if args.list_only => {}
         Listing::Listed { cases, .. } => {
             client
                 .report_tests_discovered(ReportTestsDiscoveredRequest {

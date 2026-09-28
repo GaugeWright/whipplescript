@@ -19,6 +19,24 @@ next free number rather than a patch — it says so.
 
 ## [Unreleased]
 
+## [0.8.0] — 2026-09-28
+
+A minor release because three published crates changed public types that a
+dependent can match on or construct:
+
+- `whipplescript-store`: `NormCommand`, `NormCommandResult`,
+  `NormReferenceRole` and `ResourceGapKind` gained variants;
+  `NormCommandResult::ActivationPlanned` gained `effects`; `NormVocabulary`
+  gained `constraint` and `deployment`; `NormCharter` gained `canonicalizers`.
+- `whipplescript-kernel`: `AdmissionDoor` gained `Deploy`, `RequirementImpact`
+  gained `ceiling`, and `norm_admission::AdmissionHost` is now `Copy`.
+- `whipplescript`: `host_runtime::ModelScanWitness` gained `directories`.
+
+Code that matches those enums without a wildcard arm, builds those structs with
+a literal, or casts those enums to integers must handle the new variants and
+fields. The command line, stored data and configuration stay compatible:
+nothing a `whip` user does needs to change.
+
 ### Added
 
 - **The misuse log.** Each invocation whip refuses with exit status 2 — an
@@ -28,6 +46,25 @@ next free number rather than a patch — it says so.
   Arguments that can hold a secret are written as `<redacted>`, and the log
   never leaves the machine. `WHIPPLESCRIPT_MISUSE_LOG` names another path, or
   `off` keeps no log.
+
+### Changed
+
+- **A malformed `whip issue` or `whip assert` says what was wrong.** Every
+  mistake used to print the command's whole usage line — forty alternatives
+  for `whip issue` — and nothing else. The refusal now names the problem
+  (`missing <id>`, ``unknown option `--queue` ``, a tracker passed to `ready`
+  as `--tracker`), shows the usage of that one subcommand, and for an unknown
+  subcommand suggests the nearest, including the verbs other trackers use
+  (`close` for `finish` or `cancel`). The exit status is still 2.
+
+### Fixed
+
+- **Closing a tracker item no longer leaves empty workspace stores behind.**
+  `whip issue finish` opened the versioned-workspace stores to attest the
+  work's cut trail, and opening creates them, so every checkout an item was
+  closed from gained an untracked `.whipplescript/branches.sqlite` and
+  `vcs-content.sqlite`. `issue finish`, `issue show --json`, `assert` and a
+  keyed `attest` now open them only where they already exist.
 
 ## [0.7.1] — 2026-09-28
 

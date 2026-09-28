@@ -893,6 +893,7 @@ fn norm_cli_restores_hosted_p256_history_with_public_bindings_only() {
                 owner_scopes: vec![],
                 activation: None,
                 gated_refs: vec![],
+                canonicalizers: Default::default(),
             },
         },
         premises: None,
@@ -2114,6 +2115,10 @@ mod hosted_protected;
 mod admission;
 #[path = "norm_commands/authorization_demo.rs"]
 mod authorization_demo;
+#[path = "norm_commands/buck2.rs"]
+mod buck2;
+#[path = "norm_commands/declaration_subjects.rs"]
+mod declaration_subjects;
 #[path = "norm_commands/door_rows.rs"]
 mod door_rows;
 #[path = "norm_commands/evidence_rows.rs"]

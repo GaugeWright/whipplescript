@@ -2,6 +2,7 @@ use std::cell::RefCell;
 
 use super::*;
 use crate::norm_execution::fixtures::{self as f, Boundary};
+use crate::norm_execution_policy::ProtectedPythonPolicy;
 use serde_json::json;
 use whipplescript_store::branches::{BranchStore, Branches, CutRecord, MAINLINE_BRANCH_ID};
 use whipplescript_store::content::ContentBlobs;

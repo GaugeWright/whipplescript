@@ -12,6 +12,7 @@ export default defineConfig({
         NORM_IMPACT_VECTOR: readFileSync(new URL("../../../target/norm-impact-vector.json", import.meta.url), "utf8"),
         NORM_PUBLICATION_VECTOR: readFileSync(new URL("../../../target/norm-publication-vector.json", import.meta.url), "utf8"),
         NORM_PORTABLE_VECTOR: readFileSync(new URL("../../../target/norm-portable-vector.json", import.meta.url), "utf8"),
+        NORM_PROMOTION_VECTOR: readFileSync(new URL("../../../target/norm-promotion-vector.json", import.meta.url), "utf8"),
       } },
     }),
   ],
@@ -19,6 +20,7 @@ export default defineConfig({
     include: [
       "src/authenticated-host.integration.test.ts",
       "src/norm-impact.integration.test.ts",
+      "src/norm-promotion.integration.test.ts",
       "src/private-home-objects.integration.test.ts",
     ],
     // Bounds a hang, not the machine's load. See `src/test-bounds.ts`.

@@ -291,31 +291,45 @@ fn impact_rechecks_support_without_subject_shortcuts_or_retry_washing() {
         assert_eq!(result[0].work, expected, "{mode}");
         // Independent typed-evidence fixture: a verification gap must retain
         // already established repair/conflict work, but block support/rechecks.
-        let gap_plan = plan_with_selection(
-            ImpactInput {
-                before: &view,
-                before_artifact: &before,
-                after: &view,
-                candidate: &candidate,
-                policy: &version("policy"),
-                time_basis: "captured",
-                evidence: &host.events,
-            },
-            ImpactLimits::default(),
-            [("unverified".into(), ProjectionGap::MalformedPublication)].into(),
-            |query, events| select_evidence(query, events, &host),
-            |_, _| panic!("gap must not request an automatic replacement"),
-        )
-        .unwrap();
-        assert_eq!(gap_plan.evidence_gaps.len(), 1);
-        assert_eq!(
-            gap_plan.requirements[&id][0].work,
-            match mode {
-                "failure" => ImpactWork::Repair,
-                "conflict" => ImpactWork::ResolveEvidence,
-                _ => ImpactWork::VerifyEvidence,
-            }
-        );
+        let gapped = |gap: ProjectionGap| {
+            plan_with_selection(
+                ImpactInput {
+                    before: &view,
+                    before_artifact: &before,
+                    after: &view,
+                    candidate: &candidate,
+                    policy: &version("policy"),
+                    time_basis: "captured",
+                    evidence: &host.events,
+                },
+                ImpactLimits::default(),
+                [("unverified".into(), gap)].into(),
+                |query, events| select_evidence(query, events, &host),
+                |_, _| Some(version("method")),
+            )
+            .unwrap()
+        };
+        let unavailable = |requirement: Option<&str>| ProjectionGap::ExecutionUnavailable {
+            reason: "unrecoverable".into(),
+            requirement: requirement.map(Into::into),
+        };
+        let doubted = match mode {
+            "failure" => ImpactWork::Repair,
+            "conflict" => ImpactWork::ResolveEvidence,
+            _ => ImpactWork::VerifyEvidence,
+        };
+        // A gap no invocation scopes, or one naming this requirement, doubts
+        // its evidence; one naming another requirement leaves it as it was.
+        for (gap, work) in [
+            (ProjectionGap::MalformedPublication, &doubted),
+            (unavailable(None), &doubted),
+            (unavailable(Some(&requirement.name)), &doubted),
+            (unavailable(Some("another requirement")), &expected),
+        ] {
+            let gap_plan = gapped(gap);
+            assert_eq!(gap_plan.evidence_gaps.len(), 1);
+            assert_eq!(&gap_plan.requirements[&id][0].work, work, "{mode}");
+        }
 
         assert_eq!(
             result[0].selection.as_ref().unwrap().query.artifact,
@@ -699,6 +713,17 @@ fn the_gate_admits_only_a_fully_supported_plan_and_names_what_is_lacking() {
             .reason(),
         "the proposed result is not supported: uninterpretable evidence unverified"
     );
+    // One scoped to a requirement refuses through that requirement's own
+    // work, which the planner set; beside supported work it refuses nothing.
+    let mut scoped = plan_for("exact");
+    scoped.evidence_gaps.insert(
+        "unrecoverable".into(),
+        crate::norm_projection::ProjectionGap::ExecutionUnavailable {
+            reason: "unrecoverable".into(),
+            requirement: Some("another requirement".into()),
+        },
+    );
+    assert!(judge(&planned(scoped, BTreeMap::new())).is_ok());
     let unmethoded = [(
         id.clone(),
         vec![MethodGap {

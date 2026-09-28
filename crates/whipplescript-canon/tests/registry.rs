@@ -163,3 +163,71 @@ fn renaming_a_local_is_not_a_declaration_change() {
     drop(vcs);
     std::fs::remove_dir_all(&root).expect("scratch");
 }
+
+/// A norm capture carries the host's declaration map (norm-plane §9): each
+/// versioned canonicalizer's version by file class, and the identities each
+/// file of those classes keys to, so the store's resource inventory can
+/// resolve a declaration subject without calling a canonicalizer.
+#[test]
+fn a_norm_capture_carries_each_versioned_class_and_its_identities() {
+    use std::collections::BTreeSet;
+    use whipplescript_store::norm_artifact::ArtifactLimits;
+    use whipplescript_store::vcs::DeclCanonicalizer;
+
+    let mut vcs = NativeWorkspaceVcs::open(":memory:", ":memory:").expect("workspace");
+    vcs.register_decl_canonicalizer("rs", Box::new(RustItems));
+    vcs.register_decl_canonicalizer("ts", Box::new(TypeScriptItems::typescript()));
+    vcs.register_decl_canonicalizer("tsx", Box::new(TypeScriptItems::tsx()));
+    vcs.register_decl_canonicalizer("md", Box::new(MarkdownSections));
+    vcs.init("t0").expect("init");
+    for (path, body, cut) in [
+        (
+            "crates/auth/src/lib.rs",
+            "pub fn allows() -> bool { true }\n",
+            "c1",
+        ),
+        ("docs/policy.md", "# Policy\n\nDeny the worker.\n", "c2"),
+        ("notes.txt", "prose", "c3"),
+    ] {
+        vcs.write(MAINLINE_BRANCH_ID, path, Some(body), cut, "t1")
+            .expect("write");
+    }
+    let captured = vcs
+        .capture_norm_artifact("c3", ArtifactLimits::default())
+        .expect("capture");
+    let declarations = captured.declarations();
+    let versions: Vec<(&str, &str)> = declarations
+        .versions
+        .iter()
+        .map(|(class, version)| (class.as_str(), version.as_str()))
+        .collect();
+    assert_eq!(
+        versions,
+        [
+            ("md", "whipplescript.canon.markdown/1"),
+            ("rs", "whipplescript.canon.rust/2 tree-sitter-rust/0.24"),
+            (
+                "ts",
+                "whipplescript.canon.typescript/2 tree-sitter-typescript/0.23"
+            ),
+            (
+                "tsx",
+                "whipplescript.canon.tsx/2 tree-sitter-typescript/0.23"
+            ),
+        ]
+    );
+    assert_eq!(RustItems.version(), Some(versions[1].1));
+    let keyed = |path: &str| declarations.files[path].clone().expect("a canonical form");
+    assert_eq!(
+        keyed("crates/auth/src/lib.rs"),
+        BTreeSet::from(["fn crates/auth::allows".to_owned()])
+    );
+    assert_eq!(
+        keyed("docs/policy.md"),
+        BTreeSet::from(["section docs/policy.md # Policy".to_owned()])
+    );
+    assert!(
+        !declarations.files.contains_key("notes.txt"),
+        "a class with no canonicalizer carries path identity only"
+    );
+}

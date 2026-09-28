@@ -11,6 +11,10 @@
 //! report of `whipplescript_core::norm_buck2_report`, and the norm plane's
 //! adapter judges it.
 //!
+//! With `--list-only` it lists every suite's cases and runs none of them:
+//! the listing a requirement's case inventory is inferred from, once, when
+//! the requirement is declared (norm-plane §3.4).
+//!
 //! This executor speaks the TCP launch (`--executor-addr`, `--orchestrator-addr`),
 //! which Buck2 uses when its daemon runs with `BUCK2_TEST_TPX_USE_TCP=1`; the
 //! wrapper starts the daemon that way. The file-descriptor launch is refused

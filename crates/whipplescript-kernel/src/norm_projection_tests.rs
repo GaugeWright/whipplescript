@@ -186,12 +186,9 @@ fn projection_recovers_published_evidence_and_preserves_causal_gaps() {
         ));
         assert!(!verifier.accepts_contract(&query, verified.contract()));
         let missing =
-            EvidenceProjection::capture(
-                &current,
-                &roles,
-                100,
-                |_, _| Err("missing receipt".into()),
-            )
+            EvidenceProjection::capture::<VerifiedExecution>(&current, &roles, 100, |_, _| {
+                Err("missing receipt".into())
+            })
             .unwrap();
         assert!(matches!(
             missing.gaps()[published.event_id()],
@@ -245,17 +242,19 @@ fn projection_recovers_published_evidence_and_preserves_causal_gaps() {
             );
         }
 
-        assert!(
-            EvidenceProjection::capture(&current, &roles, 0, |_, _| panic!(
-                "budget before recovery"
-            ))
-            .is_err()
-        );
+        assert!(EvidenceProjection::capture::<VerifiedExecution>(
+            &current,
+            &roles,
+            0,
+            |_, _| panic!("budget before recovery")
+        )
+        .is_err());
         roles.remove(&vocabulary);
-        let unsupported = EvidenceProjection::capture(&current, &roles, 100, |_, _| {
-            panic!("unknown vocabulary cannot recover")
-        })
-        .unwrap();
+        let unsupported =
+            EvidenceProjection::capture::<VerifiedExecution>(&current, &roles, 100, |_, _| {
+                panic!("unknown vocabulary cannot recover")
+            })
+            .unwrap();
         assert!(matches!(
             unsupported.gaps()[published.event_id()],
             ProjectionGap::UnknownVocabulary { .. }
@@ -385,10 +384,11 @@ fn projected_impact_keeps_gaps_and_history_checks_with_no_active_requirements() 
         (vocabulary, ProjectionRole::PublishedExecution),
     ]
     .into();
-    let projection = EvidenceProjection::capture(&captured, &roles, 100, |_, _| {
-        panic!("malformed coordinates cannot recover")
-    })
-    .unwrap();
+    let projection =
+        EvidenceProjection::capture::<VerifiedExecution>(&captured, &roles, 100, |_, _| {
+            panic!("malformed coordinates cannot recover")
+        })
+        .unwrap();
     let artifact = artifact("uncovered");
     let version = policy_version();
     let policy = Policy {

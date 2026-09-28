@@ -11,9 +11,17 @@
 //! printed `fail` while its process exited 0 is a counterexample, and the
 //! termination it implies is failure, so the swallowed failure never becomes
 //! a pass. A report that is not there is missing.
+//!
+//! The requirement's case inventory is the denominator, fixed when the
+//! requirement was declared. A case it names that the runner no longer lists
+//! or runs is a missing case, never a smaller denominator. A case the runner
+//! lists that the inventory does not name is outside the requirement: its
+//! execution is not an observation and changes nothing about the judgment,
+//! and neither does a suite the inventory names no case of.
 
 use std::collections::BTreeSet;
 
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use whipplescript_core::norm_buck2_report::{
     Buck2TestReport, CaseStatus, Listing, SuiteReport, BUCK2_TEST_SUPPORT_PROTOCOL,
@@ -35,18 +43,23 @@ pub fn case_id(suite: &SuiteReport, case: &str) -> String {
 
 /// The build the report was produced against: the pinned Buck2 the wrapper
 /// ran, and the toolchain it pinned.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Buck2Build {
     pub buck2_version: String,
     pub toolchain: String,
     pub environment: String,
 }
 
-/// Turn the executor's report into the evidence report for `contract`.
-/// `report` is `None` when the executor left no report at all.
+/// Turn the executor's report into the evidence report for `contract`, for
+/// a run the wrapper made at `cut`. `report` is `None` when the executor left
+/// no report at all. The report is bound only when it names that cut: the
+/// contract's artifact is the identity of the cut's files, and the cut is the
+/// coordinate the wrapper handed the executor.
 pub fn test_report(
     contract: &ReportContract,
     build: &Buck2Build,
+    cut: &str,
     report: Option<&Buck2TestReport>,
 ) -> TestReport {
     let subject = contract.subject.clone();
@@ -59,18 +72,28 @@ pub fn test_report(
             observations: Vec::new(),
         };
     };
-    let bound = report.protocol == BUCK2_TEST_SUPPORT_PROTOCOL
-        && report.cut.as_deref() == Some(contract.subject.artifact.as_str());
+    let bound =
+        report.protocol == BUCK2_TEST_SUPPORT_PROTOCOL && report.cut.as_deref() == Some(cut);
+    let required = required_cases(contract);
     let mut observations = Vec::new();
     let mut truncated = false;
     let mut failed = false;
     let mut crashed = false;
     for suite in &report.suites {
+        let prefix = format!("{}::", suite.target.label());
+        if !required.iter().any(|id| id.starts_with(&prefix)) {
+            // A suite the requirement names no case of is outside it.
+            continue;
+        }
         match &suite.listing {
             Listing::Listed { .. } => {}
             Listing::ListingFailed { .. } | Listing::MissingAdapter { .. } => truncated = true,
         }
         for execution in &suite.executions {
+            if !required.contains(&case_id(suite, &execution.case)) {
+                // A case the runner lists and the requirement does not name.
+                continue;
+            }
             match execution.status {
                 CaseStatus::Pass | CaseStatus::Fail if execution.verdict_line => {
                     let actual = json!(match execution.status {
@@ -160,13 +183,14 @@ impl ReportVerifier for BoundReport<'_> {
     }
 }
 
-/// Judge the executor's report against the contract.
+/// Judge the executor's report of a run at `cut` against the contract.
 pub fn judge(
     contract: &ReportContract,
     build: &Buck2Build,
+    cut: &str,
     report: Option<&Buck2TestReport>,
 ) -> TestJudgment {
-    let test_report = test_report(contract, build, report);
+    let test_report = test_report(contract, build, cut, report);
     let verifier = BoundReport {
         report: &test_report,
         bound: test_report.provenance.is_some(),
@@ -284,6 +308,7 @@ mod tests {
         let judgment = judge(
             &contract(&["root//:passing::a", "root//:passing::b"]),
             &build(),
+            "cut-a0",
             Some(&report(vec![suite(
                 "passing",
                 listed(&["a", "b"]),
@@ -303,6 +328,7 @@ mod tests {
         let judgment = judge(
             &contract(&["root//:swallowed::a", "root//:swallowed::b"]),
             &build(),
+            "cut-a0",
             Some(&report(vec![suite(
                 "swallowed",
                 listed(&["a", "b"]),
@@ -329,6 +355,7 @@ mod tests {
         let silent = judge(
             &contract(&["root//:silent::a"]),
             &build(),
+            "cut-a0",
             Some(&report(vec![suite(
                 "silent",
                 listed(&["a"]),
@@ -344,7 +371,7 @@ mod tests {
             .contains(&EvidenceDiagnostic::TruncatedReport));
         assert!(silent.exercised.is_empty());
 
-        let missing = judge(&contract(&["root//:silent::a"]), &build(), None);
+        let missing = judge(&contract(&["root//:silent::a"]), &build(), "cut-a0", None);
         assert_eq!(missing.outcome, TestOutcome::HarnessFailed);
         assert!(missing
             .diagnostics
@@ -357,6 +384,7 @@ mod tests {
         let unadapted = judge(
             &contract(&["root//:other::a"]),
             &build(),
+            "cut-a0",
             Some(&report(vec![suite(
                 "other",
                 Listing::MissingAdapter {
@@ -372,6 +400,52 @@ mod tests {
     }
 
     #[test]
+    fn the_inventory_is_the_declarations_whatever_the_runner_lists() {
+        let declared = contract(&["root//:passing::a", "root//:passing::b"]);
+        // A suite and a case the requirement does not name change nothing.
+        let judgment = judge(
+            &declared,
+            &build(),
+            "cut-a0",
+            Some(&report(vec![
+                suite(
+                    "passing",
+                    listed(&["a", "b", "new"]),
+                    vec![
+                        execution("a", CaseStatus::Pass, Some(0), true),
+                        execution("b", CaseStatus::Pass, Some(0), true),
+                        execution("new", CaseStatus::Timeout, None, false),
+                    ],
+                ),
+                suite(
+                    "other",
+                    Listing::MissingAdapter {
+                        test_type: "rust".into(),
+                    },
+                    vec![execution("root//:other", CaseStatus::Fail, Some(1), false)],
+                ),
+            ])),
+        );
+        assert_eq!(judgment.outcome, TestOutcome::Pass, "{judgment:?}");
+        // A declared case the runner no longer lists is missing.
+        let shrunk = judge(
+            &declared,
+            &build(),
+            "cut-a0",
+            Some(&report(vec![suite(
+                "passing",
+                listed(&["a"]),
+                vec![execution("a", CaseStatus::Pass, Some(0), true)],
+            )])),
+        );
+        assert_eq!(shrunk.outcome, TestOutcome::HarnessFailed);
+        assert!(shrunk
+            .diagnostics
+            .contains(&EvidenceDiagnostic::MissingCase("root//:passing::b".into())));
+        assert_eq!(shrunk.required.len(), 2);
+    }
+
+    #[test]
     fn a_report_for_another_cut_is_unbound() {
         let mut other = report(vec![suite(
             "passing",
@@ -379,7 +453,12 @@ mod tests {
             vec![execution("a", CaseStatus::Pass, Some(0), true)],
         )]);
         other.cut = Some("cut-b1".into());
-        let judgment = judge(&contract(&["root//:passing::a"]), &build(), Some(&other));
+        let judgment = judge(
+            &contract(&["root//:passing::a"]),
+            &build(),
+            "cut-a0",
+            Some(&other),
+        );
         assert_eq!(judgment.outcome, TestOutcome::HarnessFailed);
         assert!(judgment
             .diagnostics

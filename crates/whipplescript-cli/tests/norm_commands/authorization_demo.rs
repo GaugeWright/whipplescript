@@ -446,6 +446,7 @@ impl Hosted {
             None,
             Some(&mut lease),
             None,
+            None,
         )
         .expect("the object admits the native history");
     }
@@ -505,9 +506,45 @@ impl Hosted {
             None,
             None,
             Some(&running),
+            None,
         )
         .expect("hosted activation plan");
         serde_json::from_str::<Value>(&answer).expect("plan JSON")["result"].clone()
+    }
+
+    /// Append a signed act at the object's command door, with the deployment
+    /// gate its Worker installs (norm-plane §10).
+    fn deploy(&self, event: &Value) -> Result<Value, String> {
+        let mut installation: Value = serde_json::from_str(&self.deployment).expect("deployment");
+        let installation = installation.as_object_mut().expect("deployment object");
+        installation.remove("time_basis");
+        installation.remove("now");
+        let gate = whipplescript_host_do::norm_commands::HostedNormGate {
+            trust: self.trust.clone(),
+            deployment: Value::Object(installation.clone()).to_string(),
+        };
+        let sql = self.sql.clone();
+        let artifacts = |cut: &str| {
+            whipplescript_host_do::do_branches::compose_vcs_shared(&sql)?
+                .capture_norm_artifact(cut, ArtifactLimits::default())
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_millis() as i64;
+        let judge = whipplescript_host_do::norm_commands::hosted_deployment_gate(
+            &gate, &self.sql, now, &artifacts,
+        );
+        execute_hosted_norm_command_with_artifacts(
+            &mut DoSqliteStore::new(self.sql.clone()),
+            &self.trust,
+            &json!({"protocol":"whipplescript.norm.commands/v1","command":{"kind":"append","event":event}}).to_string(),
+            Some(&artifacts),
+            None,
+            None,
+            Some(&judge),
+        )
+        .map(|answer| serde_json::from_str::<Value>(&answer).expect("append JSON")["result"].clone())
     }
 
     fn snapshot_at(&self, frontier: &Value) -> Value {
@@ -515,6 +552,7 @@ impl Hosted {
             &mut DoSqliteStore::new(self.sql.clone()),
             &self.trust,
             &json!({"protocol":"whipplescript.norm.commands/v1","command":{"kind":"snapshot_at","frontier":frontier}}).to_string(),
+            None,
             None,
             None,
             None,
@@ -1004,6 +1042,128 @@ fn the_authorization_demo_repairs_a_violated_requirement_under_a_current_token()
     assert_eq!(
         impact(&fixture, &host, "a0", "a2", &requirement),
         ["supported"]
+    );
+
+    // W1, deployment (norm-plane §10): admitting a release deploys the cuts
+    // it lists, and each host admits that only where every gated requirement
+    // is supported at each of them, judged at the frontier the act binds. A
+    // release of the violated A1 is refused on both hosts naming R0; one of
+    // the repaired A2 is admitted on both, the recovery.
+    let deployable = |name: &str, cut: &str| -> String {
+        fixture.write(
+            &format!("{name}.json"),
+            &json!({"title": name, "artifacts": [cut], "policy": "every gated requirement supported"}),
+        );
+        fixture.run(&[
+            "create",
+            "release@1",
+            "--as",
+            "worker",
+            "--fields",
+            &format!("{name}.json"),
+        ])["result"]["event_id"]
+            .as_str()
+            .expect("release")
+            .to_owned()
+    };
+    let violated_release = deployable("release-a1", "a1");
+    let repaired_release = deployable("release-a2", "a2");
+    hosted.sync(&fixture);
+    let admission = |record: &str, nonce: &str| -> Value {
+        let current = snapshot(&fixture, None)["result"]["snapshot"].clone();
+        let entry = current["records"]
+            .as_array()
+            .expect("records")
+            .iter()
+            .map(|entry| &entry["record"])
+            .find(|entry| entry["id"] == record)
+            .expect("the release")
+            .clone();
+        fixture.write(
+            &format!("{nonce}.json"),
+            &json!({
+                "protocol": "whipplescript.norm/v1",
+                "actor": {"principal": "owner", "algorithm": "ed25519-custodian", "key_id": "credential:norm/owner#local"},
+                "nonce": nonce,
+                "created_at": "2026-09-28T00:00:00Z",
+                "action": {
+                    "act": "transition",
+                    "ledger": current["checkpoint"]["ledger"],
+                    "authority": current["checkpoint"]["authority_head"],
+                    "vocabulary": entry["vocabulary"],
+                    "record": record,
+                    "previous": entry["head"],
+                    "status": "admitted",
+                },
+                "premises": {"inventory_frontier": current["frontier"]},
+            }),
+        );
+        fixture.run(&[
+            "sign",
+            "--as",
+            "owner",
+            "--statement",
+            &format!("{nonce}.json"),
+        ])
+    };
+    let dispatch = |event: &Value, name: &str| {
+        fixture.write(
+            name,
+            &json!({"protocol": "whipplescript.norm.commands/v1", "command": {"kind": "append", "event": event}}),
+        );
+        // The host's own planning configuration judges it, as a promotion.
+        whip(
+            &fixture,
+            &["--json", "norm", "dispatch", "--request", name],
+            host.configured(),
+        )
+    };
+    let before_deploy = snapshot(&fixture, None)["result"]["snapshot"].clone();
+    let unsupported = admission(&violated_release, "deploy-a1");
+    // A host without its planning configuration cannot judge a deployment,
+    // and refuses it rather than admitting it unjudged.
+    fixture.write(
+        "deploy-unjudged.json",
+        &json!({"protocol": "whipplescript.norm.commands/v1", "command": {"kind": "append", "event": unsupported}}),
+    );
+    let unjudged = fixture.refuse(&["dispatch", "--request", "deploy-unjudged.json"]);
+    assert!(
+        String::from_utf8_lossy(&unjudged.stderr)
+            .contains("the deployment's gated requirements cannot be evaluated"),
+        "{}",
+        String::from_utf8_lossy(&unjudged.stderr)
+    );
+    let native_refusal = dispatch(&unsupported, "deploy-a1-request.json");
+    assert!(!native_refusal.status.success());
+    let native_refusal = String::from_utf8_lossy(&native_refusal.stderr).into_owned();
+    let hosted_refusal = hosted
+        .deploy(&unsupported)
+        .expect_err("the object refuses the unsupported release");
+    for refusal in [&native_refusal, &hosted_refusal] {
+        assert!(
+            refusal.contains("deployment refused: the proposed result is not supported")
+                && refusal.contains(&format!("{requirement} (repair)")),
+            "{refusal}"
+        );
+    }
+    assert_eq!(
+        snapshot(&fixture, None)["result"]["snapshot"],
+        before_deploy,
+        "a refused deployment appends nothing"
+    );
+    let supported = admission(&repaired_release, "deploy-a2");
+    let deployed = dispatch(&supported, "deploy-a2-request.json");
+    assert!(
+        deployed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&deployed.stderr)
+    );
+    assert_eq!(
+        hosted
+            .deploy(&supported)
+            .expect("the object admits the repaired release")["event_id"],
+        serde_json::from_slice::<Value>(&deployed.stdout).expect("deploy JSON")["result"]
+            ["event_id"],
     );
 
     // A change to the reserved region is admitted only under the current
@@ -1618,6 +1778,7 @@ fn the_authorization_demo_repairs_a_violated_requirement_under_a_current_token()
             &mut DoSqliteStore::new(hosted.sql.clone()),
             &hosted.trust,
             &json!({"protocol":"whipplescript.norm.commands/v1","command": command}).to_string(),
+            None,
             None,
             None,
             None,

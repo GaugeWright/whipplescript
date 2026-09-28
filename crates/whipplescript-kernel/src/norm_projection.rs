@@ -2,6 +2,7 @@
 //! Policy, automatic method discovery and ref admission remain host operations.
 use std::collections::{BTreeMap, BTreeSet};
 
+use crate::norm_buck2_execution::VerifiedBuck2Execution;
 use crate::norm_execution::VerifiedNormExecution;
 use serde::Serialize;
 use whipplescript_core::norm_evidence::{
@@ -25,34 +26,156 @@ pub enum ProjectionRole {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ProjectionGap {
-    UnknownVocabulary { vocabulary: VocabularyRef },
+    UnknownVocabulary {
+        vocabulary: VocabularyRef,
+    },
     MalformedPublication,
-    ExecutionUnavailable { reason: String },
+    /// A publication whose run this host cannot recover. Its signed
+    /// invocation names the one requirement it could ever support, so the
+    /// gap is that requirement's alone; one whose invocation names none is
+    /// every requirement's.
+    ExecutionUnavailable {
+        reason: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        requirement: Option<String>,
+    },
     PublicationMismatch,
+}
+impl ProjectionGap {
+    /// Whether this gap leaves the named requirement's evidence in doubt.
+    pub fn applies_to(&self, requirement: &str) -> bool {
+        match self {
+            Self::ExecutionUnavailable {
+                requirement: Some(scope),
+                ..
+            } => scope == requirement,
+            _ => true,
+        }
+    }
+    /// Whether this gap is every requirement's rather than one's.
+    pub fn is_unscoped(&self) -> bool {
+        !matches!(
+            self,
+            Self::ExecutionUnavailable {
+                requirement: Some(_),
+                ..
+            }
+        )
+    }
+}
+
+/// The requirement a publication's signed invocation names. A recovered run
+/// must reproduce that invocation exactly (`fields` is compared whole), so a
+/// publication can only ever count for this requirement.
+fn invoked_requirement(instance: &str, fields: &serde_json::Value) -> Option<String> {
+    let invocation = fields["invocation_json"].as_str()?;
+    if crate::norm_buck2_execution::is_run_instance(instance) {
+        serde_json::from_str::<crate::norm_buck2_execution::Buck2RunRecord>(invocation)
+            .ok()
+            .map(|record| record.intent.requirement.name)
+    } else {
+        serde_json::from_str::<crate::norm_execution::NormRunIntent>(invocation)
+            .ok()
+            .map(|intent| intent.requirement.name)
+    }
+}
+
+/// One recovered execution of either kind: a Python-call run settled by the
+/// executor, or a Buck2 test run re-judged from its durable record. Only
+/// recovery constructs either; neither deserializes.
+#[derive(Clone, Debug)]
+pub enum VerifiedExecution {
+    PythonCalls(Box<VerifiedNormExecution>),
+    Buck2Tests(Box<VerifiedBuck2Execution>),
+}
+impl From<VerifiedNormExecution> for VerifiedExecution {
+    fn from(execution: VerifiedNormExecution) -> Self {
+        Self::PythonCalls(Box::new(execution))
+    }
+}
+impl From<VerifiedBuck2Execution> for VerifiedExecution {
+    fn from(execution: VerifiedBuck2Execution) -> Self {
+        Self::Buck2Tests(Box::new(execution))
+    }
+}
+impl VerifiedExecution {
+    /// Rebuilt from verified history and the captured artifact.
+    pub fn contract(&self) -> &ReportContract {
+        match self {
+            Self::PythonCalls(execution) => execution.contract(),
+            Self::Buck2Tests(execution) => execution.contract(),
+        }
+    }
+    /// The adapter's report of what the run observed.
+    pub fn report(&self) -> &TestReport {
+        match self {
+            Self::PythonCalls(execution) => &execution.observation().report,
+            Self::Buck2Tests(execution) => execution.report(),
+        }
+    }
+    /// The ledger state the run was prepared against.
+    pub fn anchor(&self) -> &whipplescript_store::norm_history::NormReadAnchor {
+        match self {
+            Self::PythonCalls(execution) => &execution.intent().anchor,
+            Self::Buck2Tests(execution) => &execution.intent().anchor,
+        }
+    }
+    fn accepted_by(&self, policy: &dyn ExecutionSelectionPolicy, query: &SelectionQuery) -> bool {
+        match self {
+            Self::PythonCalls(execution) => policy.accepts(query, execution.as_ref()),
+            Self::Buck2Tests(execution) => policy.accepts_buck2_tests(query, execution.as_ref()),
+        }
+    }
+}
+impl ReportVerifier for VerifiedExecution {
+    fn verify_report_binding(&self, report: &TestReport) -> bool {
+        match self {
+            Self::PythonCalls(execution) => execution.verify_report_binding(report),
+            Self::Buck2Tests(execution) => execution.verify_report_binding(report),
+        }
+    }
+    fn verify_assertion_exercise(
+        &self,
+        report: &TestReport,
+        observation: &AssertionObservation,
+    ) -> bool {
+        match self {
+            Self::PythonCalls(execution) => {
+                execution.verify_assertion_exercise(report, observation)
+            }
+            Self::Buck2Tests(execution) => execution.verify_assertion_exercise(report, observation),
+        }
+    }
 }
 
 /// No deserializer: creation requires authenticated history and recovered runs.
 pub struct EvidenceProjection {
     ledger: String,
     events: Vec<SelectionEvent>,
-    executions: BTreeMap<String, VerifiedNormExecution>,
+    executions: BTreeMap<String, VerifiedExecution>,
     gaps: BTreeMap<String, ProjectionGap>,
 }
 /// Installed policy must verify exact policy/time, requirement/method and
 /// observer integrity. It is not taken from an observation's serialized flags.
 pub trait ExecutionSelectionPolicy {
     fn accepts(&self, query: &SelectionQuery, execution: &VerifiedNormExecution) -> bool;
+    /// A Buck2 test run is a separate named kind; a policy that does not
+    /// name it accepts none.
+    fn accepts_buck2_tests(&self, _: &SelectionQuery, _: &VerifiedBuck2Execution) -> bool {
+        false
+    }
 }
 
 impl EvidenceProjection {
     /// `recover` resolves coordinates through host-owned runtime/artifact stores,
-    /// normally using PreparedNormExecution::recover_with_artifacts. Failure is
+    /// normally using PreparedNormExecution::recover_with_artifacts, or
+    /// VerifiedBuck2Execution::recover on a host that runs Buck2. Failure is
     /// retained as a gap; it is never interpreted as passing evidence.
-    pub fn capture(
+    pub fn capture<E: Into<VerifiedExecution>>(
         history: &CapturedNormHistory,
         roles: &BTreeMap<VocabularyRef, ProjectionRole>,
         max_events: usize,
-        mut recover: impl FnMut(&str, &str) -> Result<VerifiedNormExecution, String>,
+        mut recover: impl FnMut(&str, &str) -> Result<E, String>,
     ) -> Result<Self, String> {
         if history.events().count() > max_events {
             return Err("evidence projection exceeds its event budget".into());
@@ -91,18 +214,22 @@ impl EvidenceProjection {
                             (Some(instance), Some(run))
                                 if !instance.is_empty() && !run.is_empty() =>
                             {
-                                recover(instance, run).map_err(|reason| {
-                                    ProjectionGap::ExecutionUnavailable { reason }
+                                recover(instance, run).map(Into::into).map_err(|reason| {
+                                    ProjectionGap::ExecutionUnavailable {
+                                        reason,
+                                        requirement: invoked_requirement(instance, &fields),
+                                    }
                                 })
                             }
+                            // MUTATION-SUCCESS-EXPR: recover(fields["instance"].as_str().unwrap_or_default(), fields["run"].as_str().unwrap_or_default()).map(Into::into).map_err(|reason| ProjectionGap::ExecutionUnavailable { reason, requirement: None })
                             _ => Err(ProjectionGap::MalformedPublication),
                         };
                         match verified {
                             Ok(execution) => {
+                                use crate::norm_publication::PublishableExecution;
                                 if crate::norm_publication::fields(&execution)? != fields
-                                    || execution.intent().publisher
-                                        != signed.statement.actor.principal
-                                    || execution.intent().anchor.checkpoint.ledger != *ledger
+                                    || execution.publisher() != signed.statement.actor.principal
+                                    || execution.ledger() != ledger
                                 {
                                     result.gaps.insert(
                                         event.event_id.clone(),
@@ -111,7 +238,7 @@ impl EvidenceProjection {
                                 } else {
                                     payload = SelectionPayload::Observation {
                                         contract: execution.contract().clone(),
-                                        report: Box::new(execution.observation().report.clone()),
+                                        report: Box::new(execution.report().clone()),
                                     };
                                     result.executions.insert(event.event_id.clone(), execution);
                                 }
@@ -170,7 +297,7 @@ impl EvidenceProjection {
         &self.events
     }
     /// The verified execution behind one published observation.
-    pub fn execution(&self, event: &str) -> Option<&VerifiedNormExecution> {
+    pub fn execution(&self, event: &str) -> Option<&VerifiedExecution> {
         self.executions.get(event)
     }
     pub fn gaps(&self) -> &BTreeMap<String, ProjectionGap> {
@@ -196,7 +323,9 @@ impl EvidenceProjection {
         let gaps = self
             .gaps
             .iter()
-            .filter(|(id, _)| selection.history.contains_key(*id))
+            .filter(|(id, gap)| {
+                selection.history.contains_key(*id) && gap.applies_to(&query.requirement.name)
+            })
             .map(|(id, gap)| (id.clone(), gap.clone()))
             .collect();
         Ok(ProjectedSelection { selection, gaps })
@@ -217,7 +346,7 @@ impl ReportVerifier for ProjectionVerifier<'_> {
         self.projection
             .executions
             .values()
-            .any(|e| self.policy.accepts(self.query, e) && e.verify_report_binding(report))
+            .any(|e| e.accepted_by(self.policy, self.query) && e.verify_report_binding(report))
     }
     fn verify_assertion_exercise(
         &self,
@@ -225,7 +354,8 @@ impl ReportVerifier for ProjectionVerifier<'_> {
         observation: &AssertionObservation,
     ) -> bool {
         self.projection.executions.values().any(|e| {
-            self.policy.accepts(self.query, e) && e.verify_assertion_exercise(report, observation)
+            e.accepted_by(self.policy, self.query)
+                && e.verify_assertion_exercise(report, observation)
         })
     }
 }
@@ -242,7 +372,7 @@ impl SelectionVerifier for ProjectionVerifier<'_> {
         self.projection
             .executions
             .values()
-            .any(|e| e.contract() == contract && self.policy.accepts(query, e))
+            .any(|e| e.contract() == contract && e.accepted_by(self.policy, query))
     }
     fn authorize_resolution(&self, _: &SelectionQuery, _: &SelectionEvent) -> bool {
         false

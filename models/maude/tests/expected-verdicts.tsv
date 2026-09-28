@@ -296,6 +296,8 @@ decision-derivation.maude	SSSSNSNSNSNS
 region-reservation.maude	SNSSNSSSNSSNS
 charter-transition.maude	SSNSNSNSNSSNSSSNSNSNS
 recovery-admission.maude	SSSNSNSNSNS
+deployment-admission.maude	SSNSNSS
 evidence-reliability.maude	SNSSNSNSSNSSNS
 norm-compatibility.maude	SSNSSNNS
 verdict-admission.maude	SNSSNSNSS
+norm-case-inventory.maude	SSNSSNSSNSNS

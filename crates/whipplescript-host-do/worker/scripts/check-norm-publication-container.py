@@ -162,7 +162,10 @@ def main():
             before = command(index, {"kind": "export"})
             draft_command = {"kind": "prepare", "instance": instance, "run": run["run_id"], "vocabulary": "local-observation@1", "actor": case["public_bindings"][0]["actor"], "created_at": "2026-09-13T00:00:00Z"}
             wrong = publication(index, {**draft_command, "actor": case["public_bindings"][1]["actor"]}, 400)
-            assert "publisher" in json.dumps(wrong), wrong
+            # A signer who is not the run's publisher gets no draft. The ledger
+            # refuses its authority before the publisher is compared, and
+            # publishing is refused either way (`prepare` checks the publisher).
+            assert "governance authority" in json.dumps(wrong) or "publisher" in json.dumps(wrong), wrong
             assert command(index, {"kind": "export"}) == before
             draft = publication(index, draft_command)
             statement = directory / f"statement-{index}.json"
@@ -182,8 +185,9 @@ def main():
             observation = result["result"]["observation"]
             assert observation["observation_integrity"] == {"kind": "protected_interpreter"}, observation
             assert observation["judgment"]["outcome"] == ("fail" if case["actual"] else "pass"), observation
-            assert observation["report"]["observations"][0]["actual"] is case["actual"], observation
-            assert len(observation["judgment"]["counterexamples"]) == int(case["actual"]), observation
+            # Each case names the cases its run must refute, and no others.
+            refuted = sorted(c["case"] for c in observation["judgment"]["counterexamples"])
+            assert refuted == sorted(case["counterexamples"]), observation
             after = command(index, {"kind": "export"})
             assert len(after["result"]["events"]) == len(before["result"]["events"]) + 1
             retained.append((index, enqueue, acknowledgment, publish, result, after, initial_frontier))

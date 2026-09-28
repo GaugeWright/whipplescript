@@ -19,6 +19,7 @@
 use whipplescript_kernel::coerce_native::CoerceProvider;
 use whipplescript_kernel::harness_loop::{HttpModelClient, ToolExecutor};
 use whipplescript_kernel::host_protocol::ResourceRef;
+use whipplescript_kernel::import_coverage::CheckedImportBasis;
 use whipplescript_kernel::instance_machine::{EffectStep, InstanceDriver};
 use whipplescript_kernel::sansio::{HttpRequest, HttpResponse, TransportError};
 use whipplescript_kernel::{idempotency_key, CompiledProgramVersionInput, RuntimeKernel};
@@ -27,7 +28,7 @@ use whipplescript_store::branches::Branches;
 use whipplescript_store::files::FileStore;
 use whipplescript_store::{
     CheckpointCapture, ClaimableEffect, DurableDiagnosticCode, NewInstanceAuthority,
-    RestoreDecision, RuntimeStore, StoreError,
+    ProgramVersionRecord, RestoreDecision, RuntimeStore, StoreError,
 };
 
 use crate::do_instance::{
@@ -88,6 +89,10 @@ pub fn unix_ms_to_iso8601(unix_ms: i64) -> String {
 /// so an instance running only store-only + effect-free workflows needs none.
 #[derive(Default)]
 pub struct DurableEffectPorts {
+    /// SHA-256 of the final wasm-bindgen module compiled into this Worker.
+    /// The production shell supplies it; legacy direct callers without an
+    /// artifact basis remain outside RC-2's checked import slice.
+    pub compiler_artifact_digest: Option<String>,
     pub files: Option<Box<dyn FileStore>>,
     pub coerce: Option<ResolvedCoercionConfig>,
     /// Generation backends by capability (`image.generate` -> its config).
@@ -314,17 +319,43 @@ impl<Sql: DoSql + 'static> DurableInstance<Sql> {
         // instances keep the immutable version they already point at.
         let source_hash = whipplescript_kernel::exec_http::sha256_hex(program_source.as_bytes());
         let compiler_version = concat!("whipplescript-host-do ", env!("CARGO_PKG_VERSION"));
-        let version = kernel
-            .create_program_version_for_compiled_program(
-                CompiledProgramVersionInput {
-                    program_name: &ir.workflow,
-                    source_hash: &source_hash,
-                    compiler_version,
-                },
-                &ir,
-                compiled.typed_actions.as_ref(),
-            )
-            .map_err(|error| format!("{error:?}"))?;
+        let version_input = CompiledProgramVersionInput {
+            program_name: &ir.workflow,
+            source_hash: &source_hash,
+            compiler_version,
+        };
+        let version = match ports.compiler_artifact_digest.as_deref() {
+            Some(compiler_artifact_digest) => {
+                // Hosted workflow creation has no local package lock yet. The
+                // explicit no-lock basis accepts std-only imports and refuses
+                // unresolved local imports instead of inventing empty edges.
+                let no_lock_digest = "0".repeat(64);
+                let admission = kernel
+                    .create_program_version_for_compiled_program_with_imports(
+                        version_input,
+                        &ir,
+                        compiled.typed_actions.as_ref(),
+                        &CheckedImportBasis {
+                            program_source_digest: &source_hash,
+                            lock_digest: &no_lock_digest,
+                            compiler_artifact_digest,
+                            packages: &[],
+                        },
+                    )
+                    .map_err(|error| format!("{error:?}"))?;
+                ProgramVersionRecord {
+                    program_id: admission.program_id,
+                    version_id: admission.version_id,
+                }
+            }
+            None => kernel
+                .create_program_version_for_compiled_program(
+                    version_input,
+                    &ir,
+                    compiled.typed_actions.as_ref(),
+                )
+                .map_err(|error| format!("{error:?}"))?,
+        };
         // DO-plane package bootstrap (spec/durable-object-runtime-tracker.md):
         // seed the embedded std manifests so the admission gate is REAL for
         // coordination / file / tracker / ingress / coercion kinds — the DO
@@ -1297,6 +1328,79 @@ rule finish
     /// A fixed injected clock for deterministic tests (2026-01-01T00:00:00Z).
     const TEST_NOW_MS: i64 = 1_767_225_600_000;
     use crate::do_store::test_support::store;
+
+    #[test]
+    fn hosted_worker_admits_std_only_imports_with_its_exact_wasm_basis() {
+        use crate::do_store::{as_text, SqlValue};
+
+        let source = "use std.files\nworkflow HostedImport {}\n";
+        let compiler_digest = "d".repeat(64);
+        let sql = store().sql;
+        let instance = DurableInstance::create(
+            sql.clone(),
+            source,
+            "{}",
+            "local/HostedImport",
+            DurableEffectPorts {
+                compiler_artifact_digest: Some(compiler_digest.clone()),
+                ..DurableEffectPorts::default()
+            },
+            &[],
+            &[],
+        )
+        .expect("hosted std-only source admits");
+        let kernel = instance.kernel.as_ref().expect("kernel");
+        let version_id = &kernel.store().list_instances().unwrap()[0].version_id;
+        let rows = sql
+            .query(
+                "SELECT witness_digest FROM program_import_admissions WHERE version_id = ?1",
+                &[SqlValue::Text(version_id.clone())],
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        let digest = as_text(&rows[0][0]);
+        let witness = kernel
+            .store()
+            .program_import_witness(version_id, &digest)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            witness.program_source_digest,
+            whipplescript_kernel::exec_http::sha256_hex(source.as_bytes())
+        );
+        assert_eq!(witness.compiler_artifact_digest, compiler_digest);
+        assert_eq!(witness.lock_digest, "0".repeat(64));
+        assert!(witness.examined.is_empty());
+        assert!(witness.edges.is_empty());
+    }
+
+    #[test]
+    fn hosted_worker_refuses_unresolved_local_import_before_version_admission() {
+        use crate::do_store::as_i64;
+
+        let source = "use toolkit\nworkflow HostedImport {}\n";
+        let sql = store().sql;
+        let result = DurableInstance::create(
+            sql.clone(),
+            source,
+            "{}",
+            "local/HostedImport",
+            DurableEffectPorts {
+                compiler_artifact_digest: Some("d".repeat(64)),
+                ..DurableEffectPorts::default()
+            },
+            &[],
+            &[],
+        );
+        let Err(message) = result else {
+            panic!("unresolved hosted import must refuse");
+        };
+        assert!(message.contains("toolkit"), "{message}");
+        let rows = sql
+            .query("SELECT COUNT(*) FROM program_versions", &[])
+            .unwrap();
+        assert_eq!(as_i64(&rows[0][0]), 0);
+    }
 
     #[test]
     fn create_publishes_action_source_as_a_typed_executable() {

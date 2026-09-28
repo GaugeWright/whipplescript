@@ -434,7 +434,9 @@ local lock, and binds its edge set to the program source, lock and compiler
 revisions. The probe checks every examined subset of two imports and shows
 that an unresolved or omitted import refuses admission. A second admitted
 program without a witness, a changed package source under the same name, or
-an unclosed Home population makes broader coverage unknown. The model assumes
-the admitted-program roster is authoritative and the production accepting
-operation captures the witness atomically; neither property follows from an
-on-demand `whip compile` report.
+an unclosed Home population makes broader coverage unknown. It also admits
+the same version twice, first with a witness and then through an unwitnessed
+path: a version-keyed roster sees the first witness and hides the second
+operation. The model therefore assumes an authoritative **operation** roster
+and atomic witness capture for each acceptance. Neither property follows from
+an on-demand `whip compile` report or the current version and witness tables.

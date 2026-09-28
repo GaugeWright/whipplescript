@@ -48,6 +48,7 @@ pub fn execute_hosted_norm_command<S: NormCommandStore>(
         None,
         None,
         None,
+        None,
     )
 }
 
@@ -63,6 +64,7 @@ pub fn execute_hosted_norm_command_with_artifacts<S: NormCommandStore>(
     artifacts: Option<&NormArtifactCapture<'_>>,
     gated_refs: Option<&mut whipplescript_store::norm_commands::GatedRefLease<'_>>,
     running: Option<&whipplescript_store::norm_commands::NormRunningEffects<'_>>,
+    deployment: Option<&whipplescript_store::norm_commands::NormDeploymentGate<'_>>,
 ) -> Result<String, String> {
     let trust: HostedNormTrust =
         serde_json::from_str(trusted_configuration).map_err(|error| error.to_string())?;
@@ -76,6 +78,9 @@ pub fn execute_hosted_norm_command_with_artifacts<S: NormCommandStore>(
         }
         if let Some(running) = running {
             host = host.with_running_effects(running);
+        }
+        if let Some(deployment) = deployment {
+            host = host.with_deployment_gate(deployment);
         }
         host.execute_json(command)
             .map_err(|error| format!("norm command refused: {error:?}"))
@@ -152,6 +157,45 @@ impl HostedNormGate {
     ) -> Result<T, String> {
         let deployment = impact::Deployment::at_step(&self.deployment, now_unix_ms)?;
         promotion::with_admission_host(sql, &self.trust, &deployment, evaluate)
+    }
+}
+
+/// The object's deployment gate (norm-plane §10): the gate the promotion
+/// route builds, at `now_unix_ms`, judging a deployment over the ledger its
+/// command door captured. A configuration that cannot build a host refuses
+/// the deployment, naming why, rather than admitting it unjudged.
+pub fn hosted_deployment_gate<'a, Sql: crate::do_store::DoSql + Clone>(
+    gate: &'a HostedNormGate,
+    sql: &'a Sql,
+    now_unix_ms: i64,
+    artifacts: &'a NormArtifactCapture<'a>,
+) -> impl Fn(
+    &whipplescript_store::norm::NormView,
+    &[whipplescript_store::items::TrackerEvent],
+    &str,
+    &[String],
+) -> whipplescript_store::StoreResult<Result<(), whipplescript_store::vcs::GateRefusal>>
+       + 'a {
+    use whipplescript_kernel::norm_admission::{judge_deployment, CapturedLedger};
+    move |view, events, release, cuts| {
+        let judged = gate.with_admission_host(sql, now_unix_ms, |host| {
+            judge_deployment(
+                host,
+                CapturedLedger { view, events },
+                release,
+                cuts,
+                artifacts,
+            )
+            .map_err(|error| format!("{error:?}"))
+        });
+        Ok(judged.unwrap_or_else(|reason| {
+            Err(whipplescript_store::vcs::GateRefusal {
+                reason: format!(
+                    "the deployment's gated requirements cannot be evaluated: {reason}"
+                ),
+                detail: serde_json::Value::Null,
+            })
+        }))
     }
 }
 

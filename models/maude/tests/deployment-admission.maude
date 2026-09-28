@@ -1,0 +1,14 @@
+load ../deployment-admission.maude
+--- A release of a supported cut is admitted.
+search [1] in DEPLOYMENT-ADMISSION : { at(f0) release(good, draft, f0) } =>* { at(f0) release(good, admitted, f0) admittedAt(good, f0) } .
+--- Recovery: a release of the bad cut is refused, and one of the repaired cut is admitted.
+search [1] in DEPLOYMENT-ADMISSION : { at(f0) release(bad, draft, f0) release(good, draft, f0) } =>* { at(f0) release(bad, refused, f0) release(good, admitted, f0) admittedAt(good, f0) } .
+--- A release of an unsupported cut is never admitted; a host that skips the gate admits it.
+search in DEPLOYMENT-ADMISSION : { at(f0) release(bad, draft, f0) } =>* { C:Cfg } such that unsupported(C:Cfg) .
+search [1] in DEPLOYMENT-ADMISSION-WEAK-UNGATED : { at(f0) release(bad, draft, f0) } =>* { C:Cfg } such that unsupported(C:Cfg) .
+--- A release judged before the failing run landed is never admitted after it; accepting the stale judgment admits it.
+search in DEPLOYMENT-ADMISSION : { at(f0) failing release(regressed, draft, f0) } =>* { C:Cfg } such that stale(C:Cfg) .
+search [1] in DEPLOYMENT-ADMISSION-WEAK-STALE : { at(f0) failing release(regressed, draft, f0) } =>* { C:Cfg } such that stale(C:Cfg) .
+--- Judged before the run, it is admitted, and the later failure leaves it admitted at the frontier it bound: the admission is true of its causal past.
+search [1] in DEPLOYMENT-ADMISSION : { at(f0) failing release(regressed, draft, f0) } =>* { at(f1) release(regressed, admitted, f0) admittedAt(regressed, f0) } .
+quit

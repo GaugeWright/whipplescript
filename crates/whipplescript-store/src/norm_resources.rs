@@ -31,39 +31,143 @@ pub struct ResourceDomain {
     pub include: Vec<ResourceSelector>,
 }
 
+/// A map whose keys are unique: a repeated key refuses before a map can
+/// collapse it.
+struct UniqueMap<V>(BTreeMap<String, V>);
+impl<'de, V: Deserialize<'de>> Deserialize<'de> for UniqueMap<V> {
+    fn deserialize<D: serde::Deserializer<'de>>(decoder: D) -> Result<Self, D::Error> {
+        struct Entries<V>(std::marker::PhantomData<V>);
+        impl<'de, V: Deserialize<'de>> serde::de::Visitor<'de> for Entries<V> {
+            type Value = UniqueMap<V>;
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("a map with unique keys")
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<UniqueMap<V>, A::Error> {
+                let mut entries = BTreeMap::new();
+                while let Some((key, value)) = map.next_entry::<String, V>()? {
+                    if entries.contains_key(&key) {
+                        return Err(serde::de::Error::custom(format!(
+                            "the charter repeats the key {key:?}"
+                        )));
+                    }
+                    entries.insert(key, value);
+                }
+                Ok(UniqueMap(entries))
+            }
+        }
+        decoder.deserialize_map(Entries(std::marker::PhantomData))
+    }
+}
+
 /// Reject duplicate domain keys before a map can collapse them.
 pub(crate) fn decode_domains<'de, D: serde::Deserializer<'de>>(
     decoder: D,
 ) -> Result<Option<BTreeMap<String, ResourceDomain>>, D::Error> {
-    struct Unique(BTreeMap<String, ResourceDomain>);
-    impl<'de> Deserialize<'de> for Unique {
-        fn deserialize<D: serde::Deserializer<'de>>(decoder: D) -> Result<Self, D::Error> {
-            struct Entries;
-            impl<'de> serde::de::Visitor<'de> for Entries {
-                type Value = Unique;
-                fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
-                    formatter.write_str("unique named resource domains")
-                }
-                fn visit_map<A: serde::de::MapAccess<'de>>(
-                    self,
-                    mut map: A,
-                ) -> Result<Unique, A::Error> {
-                    let mut domains = BTreeMap::new();
-                    while let Some((name, domain)) = map.next_entry::<String, ResourceDomain>()? {
-                        let prior = domains.insert(name, domain);
-                        if prior.is_some() {
-                            return Err(serde::de::Error::custom(
-                                "resource policy repeats a domain name",
-                            ));
-                        }
-                    }
-                    Ok(Unique(domains))
-                }
-            }
-            decoder.deserialize_map(Entries)
+    Ok(Option::<UniqueMap<ResourceDomain>>::deserialize(decoder)?.map(|unique| unique.0))
+}
+
+/// Reject a file class pinned twice before a map can collapse the pins.
+pub(crate) fn decode_pins<'de, D: serde::Deserializer<'de>>(
+    decoder: D,
+) -> Result<BTreeMap<String, String>, D::Error> {
+    Ok(UniqueMap::<String>::deserialize(decoder)?.0)
+}
+
+/// A pin names a file class, the extension the canonicalizer registry keys
+/// on, and the nonempty version pinned for it (norm-plane §9). Which classes
+/// a host canonicalizes is the host's: a pin for one it lacks leaves the
+/// class's declaration subjects unresolved there, never resolved by path.
+pub(crate) fn validate_canonicalizer_pins(charter: &NormCharter) -> StoreResult<()> {
+    for (class, version) in &charter.canonicalizers {
+        let known = !class.is_empty() && class.bytes().all(|byte| byte.is_ascii_alphanumeric());
+        if !known || version.trim().is_empty() || version.trim() != version {
+            return Err(StoreError::Conflict(format!(
+                "canonicalizer pin {class:?} must name a file extension and a nonempty, trimmed version"
+            )));
         }
     }
-    Ok(Option::<Unique>::deserialize(decoder)?.map(|unique| unique.0))
+    Ok(())
+}
+
+/// What a requirement's `subject` names: a whole file, or one declaration in
+/// a file, written `<path>#<identity>` with the identity the file class's
+/// canonicalizer produces. The first `#` begins the identity, so a subject's
+/// path never contains one; a Markdown section's identity may.
+enum Subject<'a> {
+    File(&'a str),
+    Declaration {
+        path: &'a str,
+        class: &'a str,
+        identity: &'a str,
+    },
+}
+impl<'a> Subject<'a> {
+    fn parse(subject: &'a str) -> Option<Self> {
+        let Some((path, identity)) = subject.split_once('#') else {
+            return crate::norm_artifact::canonical_path(subject).then_some(Self::File(subject));
+        };
+        let class = crate::vcs::file_class(path).filter(|class| !class.is_empty())?;
+        // The unkeyed unit is what could not be keyed: it names no declaration.
+        let keyed = !identity.is_empty()
+            && identity.trim() == identity
+            && identity.split(' ').next() != Some("unkeyed");
+        (keyed && crate::norm_artifact::canonical_path(path)).then_some(Self::Declaration {
+            path,
+            class,
+            identity,
+        })
+    }
+    fn path(&self) -> &'a str {
+        match self {
+            Self::File(path) | Self::Declaration { path, .. } => path,
+        }
+    }
+}
+
+/// Whether a subject is present at the cut, or why that cannot be said. A
+/// declaration resolves only through its class's pinned canonicalizer, as
+/// the capturing host keyed it; it never falls back to its file's path.
+fn resolve(
+    charter: &NormCharter,
+    artifact: &CapturedArtifact,
+    subject: &Subject<'_>,
+) -> Result<bool, ResourceGapKind> {
+    let (path, class, identity) = match subject {
+        Subject::File(path) => return Ok(artifact.files().contains_key(*path)),
+        Subject::Declaration {
+            path,
+            class,
+            identity,
+        } => (*path, *class, *identity),
+    };
+    let owned = || class.to_owned();
+    let Some(pinned) = charter.canonicalizers.get(class) else {
+        // MUTATION-SUCCESS-EXPR: Ok(true)
+        return Err(ResourceGapKind::UnpinnedCanonicalizer { class: owned() });
+    };
+    let declarations = artifact.declarations();
+    let Some(installed) = declarations.versions.get(class) else {
+        // MUTATION-SUCCESS-EXPR: Ok(true)
+        return Err(ResourceGapKind::MissingCanonicalizer { class: owned() });
+    };
+    if installed != pinned {
+        return Err(ResourceGapKind::CanonicalizerMismatch {
+            class: owned(),
+            pinned: pinned.clone(),
+            installed: installed.clone(),
+        });
+    }
+    if !artifact.files().contains_key(path) {
+        return Ok(false);
+    }
+    match declarations.files.get(path) {
+        Some(Some(identities)) => Ok(identities.contains(identity)),
+        // MUTATION-SUCCESS-EXPR: Ok(true)
+        _ => Err(ResourceGapKind::UnkeyedSubject {}),
+    }
 }
 
 pub(crate) fn validate_resource_domains(charter: &NormCharter) -> StoreResult<()> {
@@ -131,10 +235,33 @@ impl Budget {
 pub enum ResourceGapKind {
     MissingPolicy {},
     UninterpretedRequirement {},
-    UnknownDomain { domain: String },
-    InvalidSubject { subject: String },
+    UnknownDomain {
+        domain: String,
+    },
+    InvalidSubject {
+        subject: String,
+    },
     SubjectOutsideDomain {},
     MissingSubject {},
+    /// A declaration subject whose file class the charter pins no
+    /// canonicalizer for.
+    UnpinnedCanonicalizer {
+        class: String,
+    },
+    /// The capturing host installs no versioned canonicalizer for the class.
+    MissingCanonicalizer {
+        class: String,
+    },
+    /// The capturing host's canonicalizer is not the version the charter
+    /// pins: the subject waits for an activation that re-pins it.
+    CanonicalizerMismatch {
+        class: String,
+        pinned: String,
+        installed: String,
+    },
+    /// The subject's file has no canonical form at the cut, so its
+    /// declarations cannot be keyed.
+    UnkeyedSubject {},
 }
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -181,6 +308,7 @@ fn inventory(
 ) -> StoreResult<ResourceInventory> {
     budget.step()?;
     validate_resource_domains(&view.charter)?;
+    validate_canonicalizer_pins(&view.charter)?;
     let mut result = ResourceInventory {
         artifact: artifact.basis().clone(),
         inventory: view.requirement_inventory()?,
@@ -236,22 +364,32 @@ fn inventory(
             }));
             continue;
         };
-        if !crate::norm_artifact::canonical_path(&declaration.subject) {
+        let Some(subject) = Subject::parse(&declaration.subject) else {
             result.gaps.push(gap(ResourceGapKind::InvalidSubject {
                 subject: declaration.subject.clone(),
             }));
             continue;
-        }
-        if !budget.matches(domain, &declaration.subject)? {
+        };
+        if !budget.matches(domain, subject.path())? {
             result
                 .gaps
                 .push(gap(ResourceGapKind::SubjectOutsideDomain {}));
             continue;
         }
-        let subject_present = artifact.files().contains_key(&declaration.subject);
-        if !subject_present {
-            result.gaps.push(gap(ResourceGapKind::MissingSubject {}));
-        }
+        // An unresolved subject keeps its domain binding, as a missing one
+        // does, and is never present.
+        let subject_present = match resolve(&view.charter, artifact, &subject) {
+            Ok(present) => {
+                if !present {
+                    result.gaps.push(gap(ResourceGapKind::MissingSubject {}));
+                }
+                present
+            }
+            Err(reason) => {
+                result.gaps.push(gap(reason));
+                false
+            }
+        };
         let mut resources = BTreeSet::new();
         for path in members.get(&declaration.domain).into_iter().flatten() {
             budget.step()?;

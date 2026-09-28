@@ -1247,6 +1247,87 @@
       "inventory_role": {
         "kind": "non_requirement"
       }
+    },
+    {
+      "definition": {
+        "name": "release",
+        "version": "1",
+        "fields": [
+          {
+            "name": "title",
+            "required": true,
+            "value_type": {
+              "type": "text"
+            }
+          },
+          {
+            "name": "artifacts",
+            "required": true,
+            "value_type": {
+              "type": "list",
+              "item": {
+                "type": "text"
+              }
+            }
+          },
+          {
+            "name": "policy",
+            "required": true,
+            "value_type": {
+              "type": "text"
+            }
+          },
+          {
+            "name": "exceptions",
+            "required": false,
+            "value_type": {
+              "type": "list",
+              "item": {
+                "type": "text"
+              }
+            }
+          }
+        ],
+        "status": {
+          "values": [
+            "draft",
+            "admitted",
+            "superseded"
+          ],
+          "initial": "draft",
+          "transitions": [
+            {
+              "from": "draft",
+              "to": "admitted",
+              "admission": {
+                "requires": "authority",
+                "scope": "release.admit"
+              }
+            },
+            {
+              "from": "admitted",
+              "to": "superseded",
+              "admission": {
+                "requires": "authority",
+                "scope": "release.admit"
+              }
+            }
+          ]
+        }
+      },
+      "creation": {
+        "requires": "public"
+      },
+      "editing": {
+        "requires": "public"
+      },
+      "inventory_role": {
+        "kind": "non_requirement"
+      },
+      "deployment": {
+        "cuts": "artifacts",
+        "status": "admitted"
+      }
     }
   ],
   "owner_scopes": [
@@ -1257,7 +1338,8 @@
     "charter.activate",
     "evidence.quarantine",
     "evidence.policy",
-    "norm.except"
+    "norm.except",
+    "release.admit"
   ],
   "activation": {
     "requires": "authority",

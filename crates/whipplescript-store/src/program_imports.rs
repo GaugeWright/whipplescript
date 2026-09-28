@@ -47,15 +47,19 @@ fn is_digest(value: &str) -> bool {
             .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
 }
 
-/// Runtime program source ids are the first 128 bits of SHA-256 over the same
-/// bytes. The witness keeps the full digest, so the store can bind it to the
-/// version without trusting a caller-supplied second source identifier.
+/// Native program source ids are the first 128 bits of SHA-256 over the same
+/// bytes; hosted versions already retain all 256 bits. The witness keeps the
+/// full digest, so either stored form binds to those exact source bytes.
 pub fn matches_source_id(witness: &ProgramImportWitness, source_id: &str) -> bool {
-    source_id.len() == 32
+    matches!(source_id.len(), 32 | 64)
         && source_id
             .bytes()
             .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-        && witness.program_source_digest.starts_with(source_id)
+        && if source_id.len() == 32 {
+            witness.program_source_digest.starts_with(source_id)
+        } else {
+            witness.program_source_digest == source_id
+        }
 }
 
 /// Check the witness's internal structure before it is retained. The compiler
@@ -159,8 +163,14 @@ mod tests {
         let mut witness = witness(LOCK);
         witness.program_source_digest = crate::items::sha256_hex(source);
         assert!(matches_source_id(&witness, &crate::stable_hash_hex(source)));
+        assert!(matches_source_id(&witness, &witness.program_source_digest));
         assert!(!matches_source_id(&witness, ""));
         assert!(!matches_source_id(&witness, SOURCE_ID));
+        assert!(!matches_source_id(&witness, SOURCE));
+        assert!(!matches_source_id(
+            &witness,
+            &witness.program_source_digest[..63]
+        ));
     }
 
     #[test]
@@ -183,6 +193,21 @@ mod tests {
     fn exact_import_admissions_are_immutable_per_basis_even_when_version_is_reused() {
         let mut store = SqliteStore::open_in_memory().unwrap();
         let first_witness = witness(LOCK);
+        let full_source = store
+            .create_program_version_with_import_witness(
+                NewProgramVersion {
+                    source_hash: SOURCE,
+                    ..version("hosted-full-source")
+                },
+                &first_witness,
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .program_import_witness(&full_source.version_id, &full_source.witness_digest)
+                .unwrap(),
+            Some(first_witness.clone())
+        );
         let first = store
             .create_program_version_with_import_witness(version("paint"), &first_witness)
             .unwrap();
@@ -223,7 +248,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(rows, 2);
+        assert_eq!(rows, 3);
         store
             .connection
             .execute(

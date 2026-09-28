@@ -118,6 +118,10 @@ function evidenceFor(id) {
     const impact = "src/norm-impact.integration.test.ts#norm-installed-impact";
     return { contract: [impact], authority: [impact], journey: [impact], deployed: [], property: [impact] };
   }
+  if (id === "runtime.host.norm.promotions") {
+    const promotion = "src/norm-promotion.integration.test.ts#norm-installed-promotion";
+    return { contract: [promotion], authority: [promotion], journey: [promotion], deployed: [], property: [promotion] };
+  }
   if (id === "runtime.host.norm.enqueues") {
     const enqueue = "src/authenticated-host.integration.test.ts#norm-observation-enqueue";
     return { contract: [enqueue], authority: [enqueue], journey: [enqueue], deployed: [], property: [enqueue] };

@@ -16,6 +16,9 @@ pub struct Args {
     pub trace_id: Option<String>,
     /// The `--config-entry` values Buck2 passed, kept as provenance.
     pub config_entries: Vec<String>,
+    /// List every suite's cases and run none of them: what a requirement's
+    /// case inventory is inferred from, fixed when it is declared.
+    pub list_only: bool,
 }
 
 impl Args {
@@ -27,6 +30,7 @@ impl Args {
         let mut timeout = Duration::from_secs(600);
         let mut trace_id = None;
         let mut config_entries = Vec::new();
+        let mut list_only = false;
         let mut args = args.into_iter();
         let mut own = false;
         while let Some(arg) = args.next() {
@@ -54,6 +58,7 @@ impl Args {
                         required(&mut args, &arg)?;
                     }
                     positional if !positional.starts_with("--") => {}
+                    "--list-only" => list_only = true,
                     "--report" => report = Some(required(&mut args, &arg)?),
                     "--cut" => cut = Some(required(&mut args, &arg)?),
                     "--timeout" => {
@@ -74,6 +79,7 @@ impl Args {
             timeout,
             trace_id,
             config_entries,
+            list_only,
         })
     }
 }
@@ -120,6 +126,17 @@ mod tests {
         assert_eq!(args.timeout, Duration::from_secs(30));
         assert_eq!(args.trace_id.as_deref(), Some("trace-1"));
         assert_eq!(args.config_entries, vec!["host=linux"]);
+        assert!(!args.list_only);
+        let listing = parse(&[
+            "--executor-addr",
+            "a",
+            "--orchestrator-addr",
+            "b",
+            "--",
+            "--list-only",
+        ])
+        .unwrap();
+        assert!(listing.list_only);
     }
 
     #[test]

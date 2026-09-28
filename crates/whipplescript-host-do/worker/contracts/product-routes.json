@@ -312,17 +312,17 @@
       },
       "evidence": {
         "contract": [
-          "src/authenticated-host.integration.test.ts#declared-route-surface"
+          "src/norm-promotion.integration.test.ts#norm-installed-promotion"
         ],
         "authority": [
-          "src/authenticated-host.integration.test.ts#declared-route-surface"
+          "src/norm-promotion.integration.test.ts#norm-installed-promotion"
         ],
         "journey": [
-          "src/authenticated-host.integration.test.ts#authenticated-placement-journey"
+          "src/norm-promotion.integration.test.ts#norm-installed-promotion"
         ],
         "deployed": [],
         "property": [
-          "src/authenticated-host.integration.test.ts#declared-route-surface"
+          "src/norm-promotion.integration.test.ts#norm-installed-promotion"
         ]
       }
     },
