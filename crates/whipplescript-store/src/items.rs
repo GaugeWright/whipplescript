@@ -2017,10 +2017,26 @@ impl WorkItemStore {
         &self,
         verifier: &dyn crate::norm::NormVerifier,
     ) -> StoreResult<crate::norm::NormView> {
-        let pin = self.norm_checkpoint()?.ok_or_else(|| {
+        // A rotation or activation can advance the trusted checkpoint while
+        // adding its event. Capture both sides from one SQLite read snapshot;
+        // two independent reads could pair a new pin with old event rows.
+        // This still observes only this store, not an authoritative Home cut.
+        // Gate commit already holds the ledger's write transaction. Reuse its
+        // snapshot there; SQLite does not permit a nested BEGIN. A standalone
+        // read opens its own transaction to keep the two queries together.
+        let owned_tx = if self.connection.is_autocommit() {
+            Some(self.connection.unchecked_transaction()?)
+        } else {
+            None
+        };
+        let pin = load_norm_checkpoint(&self.connection)?.ok_or_else(|| {
             StoreError::Conflict("norm ledger is not bootstrapped or pinned".into())
         })?;
-        crate::norm::replay_norm(&load_norm_events(&self.connection)?, &pin, verifier)
+        let events = load_norm_events(&self.connection)?;
+        if let Some(tx) = owned_tx {
+            tx.commit()?;
+        }
+        crate::norm::replay_norm(&events, &pin, verifier)
     }
 
     pub fn norm_reference_inventory(

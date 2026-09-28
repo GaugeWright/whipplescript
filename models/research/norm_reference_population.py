@@ -39,6 +39,42 @@ class Witness:
     gaps: tuple[str, ...]
 
 
+@dataclass(frozen=True)
+class HomeCut:
+    """A host-issued snapshot, never inferred from a successful replay.
+
+    `source` stands for the Home capability supplied by the host, not by an
+    imported event or a caller. `operations` includes interpreting acts even
+    when several acts refer to the same content revision.
+    """
+
+    source: str
+    operations: tuple[str, ...]
+    registry: int
+
+
+def capture_home_cut(source: str, operations: tuple[str, ...], registry: int) -> HomeCut:
+    if source != "home":
+        raise ValueError("a peer replay cannot close the Home admission roster")
+    if len(operations) != len(set(operations)):
+        raise ValueError("an operation may appear only once in a Home cut")
+    return HomeCut(source, operations, registry)
+
+
+def commit_at_home(cut: HomeCut, current_operations: tuple[str, ...], current_registry: int) -> bool:
+    """The gate's final comparison while holding Home ledger write exclusion.
+
+    The caller must keep exclusion through the governed ref CAS. A comparison
+    before acquiring it is insufficient: another admission can land afterward.
+    """
+
+    return (
+        cut.source == "home"
+        and cut.operations == current_operations
+        and cut.registry == current_registry
+    )
+
+
 def digest(events: frozenset[str]) -> str:
     return sha256(repr(tuple(sorted(events))).encode()).hexdigest()
 
@@ -120,8 +156,30 @@ def probe() -> None:
     later_roster = ids | {later.event}
     assert not valid(complete, Basis(frontier=5, roster=5, registry=2), later_roster)
     assert not valid(complete, basis, later_roster)
+
+    # A replay on a peer may be internally complete while the Home has an
+    # independent concurrent act. Only a Home-issued cut closes that roster.
+    try:
+        capture_home_cut("peer", ("create", "edit", "activate"), 2)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("peer replay was mistaken for Home authority")
+
+    cut = capture_home_cut("home", ("create", "edit", "activate", "retire"), 2)
+    assert commit_at_home(cut, cut.operations, 2)
+    # Capturing and extracting before another act is fine, but committing
+    # against the old cut after that act must refuse and re-prepare.
+    assert not commit_at_home(cut, cut.operations + ("later",), 2)
+    assert not commit_at_home(cut, cut.operations, 3)
+    # An observed-only replay cannot detect an omitted concurrent act even if
+    # its own frontier and record rows are self-consistent.
+    peer_operations = ("create", "edit", "activate")
+    assert peer_operations == cut.operations[:3]
+    assert not commit_at_home(cut, peer_operations, 2)
     print("norm reference population: create, edit, migration and retirement are distinct")
     print("  omitted act, old charter class, open roster and changed cut remain unknown")
+    print("  Home-issued roster and final under-exclusion recheck fence concurrent acts")
 
 
 if __name__ == "__main__":
