@@ -823,7 +823,6 @@ mod tests {
         use std::rc::Rc;
 
         use crate::do_branches::DoContentBlobs;
-        use whipplescript_store::content::ContentBlobs;
         use whipplescript_store::selection::parse;
         use whipplescript_store::vcs::{
             FlowingSelectionOutcome, FlowingTargetEffectsOutcome, WorkspaceVcs,
@@ -885,28 +884,11 @@ mod tests {
             BindContributionBasisOutcome::Bound
         );
         let expected = selection.changes()[1].after.as_ref().unwrap();
-        let manifest = DoContentBlobs::new(Rc::clone(&sql))
-            .unwrap()
-            .put_text(&format!(r#"{{"a.txt":"{expected}"}}"#))
-            .unwrap();
-        branches
-            .record_cut(CutRecord {
-                cut_id: "target-b",
-                change_id: "shared-b",
-                branch_id: "branch",
-                manifest_hash: &manifest,
-                parent_cut_id: None,
-                origin: Some("transport:twig"),
-                actor: Some("mediator"),
-                intent: None,
-                recorded_at: "t6",
-            })
-            .unwrap();
         let FlowingTargetEffectsOutcome::Verified(witness) = vcs
-            .verify_private_target_effects("unit-b", "target-b")
+            .prepare_private_handoff_target("unit-b", "target-b", "mediator", "t6")
             .unwrap()
         else {
-            panic!("net source effect matches target");
+            panic!("planner derives the net source effect on the target");
         };
         assert_eq!(witness.effects().len(), 1);
         assert_eq!(witness.effects()[0].after.as_ref(), Some(expected));

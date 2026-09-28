@@ -8,13 +8,13 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::branches::flowing_sources::{
-    BindContributionBasis, BindContributionBasisOutcome, FlowingSources, HandoffContribution,
-    HandoffContributionOutcome,
+    BindContributionBasis, BindContributionBasisOutcome, ContributionBasis, FlowingSources,
+    HandoffContribution, HandoffContributionOutcome,
 };
-use crate::branches::{Branches, CutRow};
+use crate::branches::{BranchStatus, Branches, CutRecord, CutRow};
 use crate::content::ContentBlobs;
 use crate::selection::{self, SelAtom, SelExpr};
-use crate::StoreResult;
+use crate::{StoreError, StoreResult};
 
 use super::{RawManifest, WorkspaceVcs};
 
@@ -163,7 +163,151 @@ fn requires_unproved_semantics(expr: &SelExpr) -> bool {
     }
 }
 
+type NetSourcePaths<'a> = BTreeMap<&'a str, (Option<&'a str>, Option<&'a str>)>;
+type NetSourceResult<'a> = StoreResult<Result<NetSourcePaths<'a>, FlowingTargetEffectsOutcome>>;
+
 impl<B: Branches + FlowingSources, C: ContentBlobs> WorkspaceVcs<B, C> {
+    fn net_source_paths<'a>(&self, basis: &'a ContributionBasis) -> NetSourceResult<'a> {
+        let mut selected = BTreeMap::new();
+        for atom in &basis.atoms {
+            if let Some((_, previous_after)) = selected.get_mut(atom.path.as_str()) {
+                if *previous_after != atom.before.as_deref() {
+                    return Ok(Err(FlowingTargetEffectsOutcome::IncoherentSourcePath {
+                        path: atom.path.clone(),
+                    }));
+                }
+                *previous_after = atom.after.as_deref();
+            } else {
+                selected.insert(
+                    atom.path.as_str(),
+                    (atom.before.as_deref(), atom.after.as_deref()),
+                );
+            }
+            for content_id in [atom.before.as_deref(), atom.after.as_deref()]
+                .into_iter()
+                .flatten()
+            {
+                if !self.content.cached_read_available(content_id)? {
+                    return Ok(Err(FlowingTargetEffectsOutcome::MissingContent {
+                        content_id: content_id.to_owned(),
+                    }));
+                }
+            }
+        }
+        Ok(Ok(selected))
+    }
+
+    /// Build a target cut from a bound unit and the current parent-branch
+    /// manifest, then re-read it through the exact target-effect verifier.
+    /// This only prepares an immutable candidate. The later handoff still
+    /// performs target-head CAS and receipt insertion in one transaction; a
+    /// stale candidate remains an orphan cut and never transfers ownership.
+    pub fn prepare_private_handoff_target(
+        &mut self,
+        unit_id: &str,
+        target_cut_id: &str,
+        actor: &str,
+        recorded_at: &str,
+    ) -> StoreResult<FlowingTargetEffectsOutcome> {
+        if target_cut_id.trim().is_empty() || actor.trim().is_empty() {
+            return Err(StoreError::Conflict(
+                "handoff target cut id and actor must be nonempty".to_owned(),
+            ));
+        }
+        let Some(unit) = self.branches.contribution_declaration(unit_id)? else {
+            return Ok(FlowingTargetEffectsOutcome::UnitMissing);
+        };
+        let Some(basis) = self.branches.contribution_basis(unit_id)? else {
+            return Ok(FlowingTargetEffectsOutcome::BasisMissing);
+        };
+        let Some(source) = self.branches.get_branch(&unit.source_branch_id)? else {
+            return Ok(FlowingTargetEffectsOutcome::TargetNotParent);
+        };
+        let Some(target_branch_id) = source.parent_branch_id.as_deref() else {
+            return Ok(FlowingTargetEffectsOutcome::TargetNotParent);
+        };
+        if target_branch_id == crate::branches::MAINLINE_BRANCH_ID {
+            return Ok(FlowingTargetEffectsOutcome::TargetNotParent);
+        }
+        let Some(target) = self.branches.get_branch(target_branch_id)? else {
+            return Ok(FlowingTargetEffectsOutcome::TargetMissing);
+        };
+        if target.status != BranchStatus::Active {
+            return Ok(FlowingTargetEffectsOutcome::TargetMissing);
+        }
+        let selected = match self.net_source_paths(&basis)? {
+            Ok(selected) => selected,
+            Err(refusal) => return Ok(refusal),
+        };
+        let mut changes = BTreeMap::new();
+        for (path, (before, after)) in selected {
+            let current = self.manifest_entry(target.head_manifest_hash.as_deref(), path)?;
+            if current.as_deref() != before && current.as_deref() != after {
+                return Ok(FlowingTargetEffectsOutcome::BeforeMismatch {
+                    path: path.to_owned(),
+                });
+            }
+            if current.as_deref() != after {
+                changes.insert(path.to_owned(), after.map(str::to_owned));
+            }
+        }
+        let manifest_hash = if changes.is_empty() {
+            match target.head_manifest_hash.clone() {
+                Some(hash) => hash,
+                None => self.store_manifest(&BTreeMap::new())?,
+            }
+        } else {
+            self.advance_manifest(target.head_manifest_hash.as_deref(), &changes)?
+        };
+        let mut change_ids = basis.atoms.iter().map(|atom| atom.change_id.as_str());
+        let first_change_id = change_ids.next().unwrap_or(target_cut_id);
+        let change_id = if change_ids.all(|id| id == first_change_id) {
+            first_change_id
+        } else {
+            target_cut_id
+        };
+        let origin = format!("transport:{}", unit.source_branch_id);
+        let matches_candidate = |cut: &CutRow| {
+            cut.branch_id == target.branch_id
+                && cut.manifest_hash == manifest_hash
+                && cut.parent_cut_id == target.head_cut_id
+                && cut.change_id == change_id
+                && cut.origin.as_deref() == Some(origin.as_str())
+                && cut.actor.as_deref() == Some(actor)
+                && cut.intent.as_deref() == Some(unit.intent.as_str())
+                && cut.recorded_at == recorded_at
+        };
+        if let Some(existing) = self.branches.get_cut(target_cut_id)? {
+            if !matches_candidate(&existing) {
+                return Ok(FlowingTargetEffectsOutcome::TargetCutMismatch);
+            }
+        } else {
+            self.branches.record_cut(CutRecord {
+                cut_id: target_cut_id,
+                change_id,
+                branch_id: &target.branch_id,
+                manifest_hash: &manifest_hash,
+                parent_cut_id: target.head_cut_id.as_deref(),
+                origin: Some(&origin),
+                actor: Some(actor),
+                intent: Some(&unit.intent),
+                recorded_at,
+            })?;
+        }
+        // `record_cut` is first-writer-wins for its identity. A concurrent
+        // writer can win between the preceding read and this write; re-read
+        // before giving the caller a witness for that identity.
+        if !self
+            .branches
+            .get_cut(target_cut_id)?
+            .as_ref()
+            .is_some_and(matches_candidate)
+        {
+            return Ok(FlowingTargetEffectsOutcome::TargetCutMismatch);
+        }
+        self.verify_private_target_effects(unit_id, target_cut_id)
+    }
+
     /// Publish one content-verified unit onto its parent branch. Retain the
     /// candidate's entire manifest closure while the branch authority moves
     /// the target ref and records the holder receipt in one transaction.
@@ -270,32 +414,10 @@ impl<B: Branches + FlowingSources, C: ContentBlobs> WorkspaceVcs<B, C> {
                 cut_id: target_cut.cut_id,
             });
         };
-        let mut selected: BTreeMap<&str, (Option<&str>, Option<&str>)> = BTreeMap::new();
-        for atom in &basis.atoms {
-            if let Some((_, previous_after)) = selected.get_mut(atom.path.as_str()) {
-                if *previous_after != atom.before.as_deref() {
-                    return Ok(FlowingTargetEffectsOutcome::IncoherentSourcePath {
-                        path: atom.path.clone(),
-                    });
-                }
-                *previous_after = atom.after.as_deref();
-            } else {
-                selected.insert(
-                    atom.path.as_str(),
-                    (atom.before.as_deref(), atom.after.as_deref()),
-                );
-            }
-            for content_id in [atom.before.as_deref(), atom.after.as_deref()]
-                .into_iter()
-                .flatten()
-            {
-                if !self.content.cached_read_available(content_id)? {
-                    return Ok(FlowingTargetEffectsOutcome::MissingContent {
-                        content_id: content_id.to_owned(),
-                    });
-                }
-            }
-        }
+        let selected = match self.net_source_paths(&basis)? {
+            Ok(selected) => selected,
+            Err(refusal) => return Ok(refusal),
+        };
         let mut effects = Vec::new();
         for (path, (expected_before, expected_after)) in &selected {
             let old = self.manifest_entry(before_manifest_hash.as_deref(), path)?;
@@ -802,6 +924,225 @@ mod tests {
     }
 
     #[test]
+    fn first_branch_cut_compares_inherited_parent_cut() {
+        let mut vcs = workspace();
+        vcs.init("t0").unwrap();
+        vcs.write(
+            MAINLINE_BRANCH_ID,
+            "base.txt",
+            Some("base"),
+            "main-base",
+            "t1",
+        )
+        .unwrap();
+        vcs.create_branch("branch", None, MAINLINE_BRANCH_ID, "t2")
+            .unwrap();
+        vcs.create_branch("twig", None, "branch", "t2").unwrap();
+        vcs.write("twig", "a.txt", Some("A"), "twig-a", "t3")
+            .unwrap();
+        pin(&mut vcs, "twig-a", "pin-a");
+        declare(&mut vcs, "unit-a", "pin-a");
+        let FlowingSelectionOutcome::Selected(selection) = vcs
+            .select_private_changes("pin-a", &selection::parse("path(a.txt)").unwrap())
+            .unwrap()
+        else {
+            panic!("source selection")
+        };
+        assert_eq!(
+            vcs.bind_private_selection("unit-a", &selection, "t4")
+                .unwrap(),
+            BindContributionBasisOutcome::Bound
+        );
+        let source_after = selection.changes()[0].after.clone();
+        let target = vcs.branches.get_branch("branch").unwrap().unwrap();
+        assert_eq!(target.head_cut_id.as_deref(), Some("main-base"));
+        assert_eq!(target.branch_point_cut_id.as_deref(), Some("main-base"));
+        let manifest = vcs
+            .advance_manifest(
+                target.branch_point_manifest_hash.as_deref(),
+                &BTreeMap::from([("a.txt".to_owned(), source_after)]),
+            )
+            .unwrap();
+        vcs.branches
+            .record_cut(CutRecord {
+                cut_id: "target-a",
+                change_id: "shared-a",
+                branch_id: "branch",
+                manifest_hash: &manifest,
+                parent_cut_id: target.branch_point_cut_id.as_deref(),
+                origin: Some("transport:twig"),
+                actor: Some("mediator"),
+                intent: None,
+                recorded_at: "t5",
+            })
+            .unwrap();
+        let FlowingTargetEffectsOutcome::Verified(witness) = vcs
+            .verify_private_target_effects("unit-a", "target-a")
+            .unwrap()
+        else {
+            panic!("inherited basis must verify")
+        };
+        assert_eq!(witness.target_before_cut_id(), Some("main-base"));
+        assert!(matches!(
+            vcs.handoff_private_selection("handoff-a", &witness, "mediator", "t6")
+                .unwrap(),
+            HandoffContributionOutcome::Transferred(_)
+        ));
+    }
+
+    #[test]
+    fn planner_refuses_missing_cut_or_actor_without_recording_a_candidate() {
+        let mut vcs = bound_unit();
+        for (cut_id, actor) in [("", "mediator"), ("target-empty-actor", "")] {
+            let error = vcs
+                .prepare_private_handoff_target("unit-a", cut_id, actor, "t5")
+                .expect_err("a candidate needs both identities");
+            assert!(matches!(
+                error,
+                StoreError::Conflict(reason)
+                    if reason.contains("target cut id and actor must be nonempty")
+            ));
+        }
+        assert!(vcs
+            .branches
+            .get_cut("target-empty-actor")
+            .unwrap()
+            .is_none());
+        assert!(vcs
+            .branches
+            .contribution_handoff("unit-a")
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn planner_builds_exact_target_and_stale_handoff_keeps_the_unit_owed() {
+        let mut vcs = bound_unit();
+        vcs.write("twig", "tail.txt", Some("later"), "twig-tail", "t4")
+            .unwrap();
+        let FlowingTargetEffectsOutcome::Verified(witness) = vcs
+            .prepare_private_handoff_target("unit-a", "target-a", "mediator", "t5")
+            .unwrap()
+        else {
+            panic!("planner must derive target from the selected atom")
+        };
+        assert_eq!(
+            vcs.branches
+                .get_branch("branch")
+                .unwrap()
+                .unwrap()
+                .head_cut_id,
+            None
+        );
+        assert_eq!(
+            vcs.read("twig", "tail.txt").unwrap().as_deref(),
+            Some("later")
+        );
+        assert_eq!(
+            vcs.prepare_private_handoff_target("unit-a", "target-a", "mediator", "t5")
+                .unwrap(),
+            FlowingTargetEffectsOutcome::Verified(witness.clone())
+        );
+        assert_eq!(
+            vcs.prepare_private_handoff_target("unit-a", "target-a", "mediator", "changed-time")
+                .unwrap(),
+            FlowingTargetEffectsOutcome::TargetCutMismatch
+        );
+        vcs.write("branch", "other.txt", Some("other"), "other-cut", "t6")
+            .unwrap();
+        assert_eq!(
+            vcs.handoff_private_selection("handoff-a", &witness, "mediator", "t7")
+                .unwrap(),
+            HandoffContributionOutcome::TargetStale {
+                current_head_cut_id: Some("other-cut".into())
+            }
+        );
+        assert!(vcs
+            .branches
+            .contribution_handoff("unit-a")
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            vcs.branches
+                .get_branch("twig")
+                .unwrap()
+                .unwrap()
+                .head_cut_id
+                .as_deref(),
+            Some("twig-tail")
+        );
+        let FlowingTargetEffectsOutcome::Verified(retry) = vcs
+            .prepare_private_handoff_target("unit-a", "target-retry", "mediator", "t8")
+            .unwrap()
+        else {
+            panic!("retry must derive a fresh target from the moved head")
+        };
+        assert!(matches!(
+            vcs.handoff_private_selection("handoff-retry", &retry, "mediator", "t9")
+                .unwrap(),
+            HandoffContributionOutcome::Transferred(_)
+        ));
+        assert_eq!(
+            vcs.branches
+                .get_branch("twig")
+                .unwrap()
+                .unwrap()
+                .head_cut_id
+                .as_deref(),
+            Some("twig-tail")
+        );
+    }
+
+    #[test]
+    fn planner_refuses_conflicting_target_without_minting_a_cut() {
+        let mut vcs = bound_unit();
+        vcs.write("branch", "a.txt", Some("other"), "other-cut", "t4")
+            .unwrap();
+        assert_eq!(
+            vcs.prepare_private_handoff_target("unit-a", "target-a", "mediator", "t5")
+                .unwrap(),
+            FlowingTargetEffectsOutcome::BeforeMismatch {
+                path: "a.txt".into()
+            }
+        );
+        assert!(vcs.branches.get_cut("target-a").unwrap().is_none());
+        assert!(vcs
+            .branches
+            .contribution_handoff("unit-a")
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn planner_refuses_unavailable_source_body_without_minting_a_cut() {
+        let mut vcs = bound_unit();
+        let after = vcs
+            .branches
+            .contribution_basis("unit-a")
+            .unwrap()
+            .unwrap()
+            .atoms[0]
+            .after
+            .clone()
+            .unwrap();
+        assert!(matches!(
+            vcs.content.erase(&after, "t4").unwrap(),
+            crate::content::EraseOutcome::Erased { .. }
+        ));
+        assert_eq!(
+            vcs.prepare_private_handoff_target("unit-a", "target-a", "mediator", "t5")
+                .unwrap(),
+            FlowingTargetEffectsOutcome::MissingContent { content_id: after }
+        );
+        assert!(vcs.branches.get_cut("target-a").unwrap().is_none());
+        assert!(vcs
+            .branches
+            .contribution_handoff("unit-a")
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
     fn target_effect_comparison_requires_the_actual_selected_bytes() {
         let mut vcs = bound_unit();
         vcs.write("branch", "a.txt", Some("A"), "branch-a", "t4")
@@ -829,6 +1170,18 @@ mod tests {
             .contribution_declaration("unit-a")
             .unwrap()
             .is_some());
+        assert_eq!(
+            vcs.handoff_private_selection("op-equivalent", &witness, "mediator", "t6")
+                .unwrap(),
+            HandoffContributionOutcome::TargetStale {
+                current_head_cut_id: Some("branch-a".into())
+            }
+        );
+        assert!(vcs
+            .branches
+            .handoff_receipt("op-equivalent")
+            .unwrap()
+            .is_none());
         assert!(vcs
             .branches
             .pinned_cuts("year-3000")
@@ -837,26 +1190,12 @@ mod tests {
     }
 
     #[test]
-    fn target_effect_comparison_marks_an_existing_effect_as_equivalent() {
+    fn planner_records_an_existing_effect_as_equivalent() {
         let mut vcs = bound_unit();
         vcs.write("branch", "a.txt", Some("A"), "branch-a", "t4")
             .unwrap();
-        let already = vcs.branches.get_cut("branch-a").unwrap().unwrap();
-        vcs.branches
-            .record_cut(CutRecord {
-                cut_id: "branch-equivalent",
-                change_id: "equivalent-output",
-                branch_id: "branch",
-                manifest_hash: &already.manifest_hash,
-                parent_cut_id: Some("branch-a"),
-                origin: Some("transport:twig"),
-                actor: Some("mediator"),
-                intent: None,
-                recorded_at: "t5",
-            })
-            .unwrap();
         let FlowingTargetEffectsOutcome::Verified(witness) = vcs
-            .verify_private_target_effects("unit-a", "branch-equivalent")
+            .prepare_private_handoff_target("unit-a", "branch-equivalent", "mediator", "t5")
             .unwrap()
         else {
             panic!("same content is equivalent")
@@ -1019,7 +1358,7 @@ mod tests {
     }
 
     #[test]
-    fn target_effect_comparison_records_a_neutralized_undo() {
+    fn planner_records_a_neutralized_undo() {
         let mut vcs = workspace();
         vcs.init("t0").unwrap();
         vcs.create_branch("branch", None, MAINLINE_BRANCH_ID, "t1")
@@ -1042,22 +1381,8 @@ mod tests {
                 .unwrap(),
             BindContributionBasisOutcome::Bound
         );
-        let empty_hash = vcs.store_manifest(&BTreeMap::new()).unwrap();
-        vcs.branches
-            .record_cut(CutRecord {
-                cut_id: "target-undo",
-                change_id: "net-neutral",
-                branch_id: "branch",
-                manifest_hash: &empty_hash,
-                parent_cut_id: None,
-                origin: Some("transport:twig"),
-                actor: Some("mediator"),
-                intent: None,
-                recorded_at: "t5",
-            })
-            .unwrap();
         let FlowingTargetEffectsOutcome::Verified(witness) = vcs
-            .verify_private_target_effects("unit-undo", "target-undo")
+            .prepare_private_handoff_target("unit-undo", "target-undo", "mediator", "t5")
             .unwrap()
         else {
             panic!("neutralized source unit must still be witnessed");
