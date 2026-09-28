@@ -264,8 +264,23 @@ frontier, or operation-id reuse. This probes the CAS-to-frontier seam under
 the actual norm/ref lock order. It still abstracts private draft retention,
 source lineage derivation, revision across all real mutation doors, branch
 closure with member twigs and parked work, the complete gate plan, and
-physical lock scheduling. Those remain open in FB-1 and its implementation
+production lock scheduling. Those remain open in FB-1 and its implementation
 items; this model alone does not qualify host activation.
+
+`flowing_lock_order.py` probes the physical acquisition order that the recovery
+model assumes:
+
+```sh
+python3 models/research/flowing_lock_order.py
+```
+
+It finds 67 safe states through eight transitions when both operations take
+norm exclusion before the ref lock. A reversed acquisition reaches a circular
+wait; retaining norm exclusion after a ref outage strands revocation. Positive
+traces commit an admission, release on outage and let revocation proceed, and
+let a second operation finish before admission. This is a lock schedule model,
+not a measurement of the actual store APIs; FB-3 must enforce the same order
+at every production path that needs both authorities.
 
 `twig_handoff.py` isolates the holder transfer that the larger lifecycle
 probe treats as one step:
