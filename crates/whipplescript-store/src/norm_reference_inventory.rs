@@ -8,7 +8,7 @@
 //! bind this projection to the exact admitted charter revision; this module
 //! does not certify a Home-wide consumer population or authorize routing.
 
-use whipplescript_core::vocabulary::{ReferenceForm, ValueType};
+use whipplescript_core::vocabulary::{ReferenceForm, ValueType, VocabularyRef};
 
 use crate::norm::{NormCharter, NormView, NormVocabulary};
 use crate::{stable_hash_hex, StoreError, StoreResult};
@@ -79,6 +79,41 @@ pub struct NormReferenceInventory {
     pub historical_population_unknown: bool,
     pub fields: Vec<NormReferenceField>,
     pub has_unclassified: bool,
+}
+
+/// One record act observed in replay, including lifecycle and activation acts
+/// that reinterpret an unchanged content revision. It is a population member,
+/// not an extracted dependency edge or proof that the Home roster is closed.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NormReferenceAdmission {
+    pub event: String,
+    pub record: String,
+    pub content_head: String,
+    pub charter_event: String,
+    pub vocabulary: VocabularyRef,
+    pub status: String,
+}
+
+/// The record acts one authenticated local replay observed at its frontier.
+/// A Home-wide coverage witness still needs an authoritative operation roster
+/// and a closed cut; this projection supplies neither by itself.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NormObservedReferenceActs {
+    pub ledger: String,
+    pub authority_head: String,
+    pub frontier: Vec<String>,
+    pub charter_events: Vec<String>,
+    pub admissions: Vec<NormReferenceAdmission>,
+}
+
+pub fn observed_acts_at(view: &NormView) -> NormObservedReferenceActs {
+    NormObservedReferenceActs {
+        ledger: view.ledger.clone(),
+        authority_head: view.authority_head.clone(),
+        frontier: view.frontier.iter().cloned().collect(),
+        charter_events: view.charter_events.clone(),
+        admissions: view.observed_reference_admissions(),
+    }
 }
 
 pub fn inventory_at(view: &NormView) -> StoreResult<NormReferenceInventory> {

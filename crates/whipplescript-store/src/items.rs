@@ -2030,6 +2030,15 @@ impl WorkItemStore {
         crate::norm_reference_inventory::inventory_at(&self.norm_view(verifier)?)
     }
 
+    pub fn norm_observed_reference_acts(
+        &self,
+        verifier: &dyn crate::norm::NormVerifier,
+    ) -> StoreResult<crate::norm_reference_inventory::NormObservedReferenceActs> {
+        Ok(crate::norm_reference_inventory::observed_acts_at(
+            &self.norm_view(verifier)?,
+        ))
+    }
+
     pub fn append_norm_event(
         &mut self,
         signed: &crate::norm::SignedNormEvent,

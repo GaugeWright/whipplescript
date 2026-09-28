@@ -705,6 +705,7 @@ pub(crate) fn registry_for(charter: &NormCharter) -> StoreResult<VocabularyRegis
 #[derive(Clone, Debug)]
 struct RecordAct {
     event: String,
+    charter_event: String,
     record: NormRecord,
     effective: Option<NormRecord>,
 }
@@ -1169,6 +1170,11 @@ impl NormView {
         if let Some(record) = self.records.get(touched) {
             let act = RecordAct {
                 event: event.event_id.clone(),
+                charter_event: self
+                    .charter_events
+                    .last()
+                    .expect("bootstrap charter")
+                    .clone(),
                 record: record.clone(),
                 effective: self.effective_records.get(touched).cloned(),
             };
@@ -1208,6 +1214,32 @@ impl NormView {
         self.charter.vocabularies.iter().chain(&self.historical)
     }
 
+    /// Every record act observed by this replay. A later charter activation
+    /// contributes a new interpretation even when content_head stays fixed.
+    pub(crate) fn observed_reference_admissions(
+        &self,
+    ) -> Vec<crate::norm_reference_inventory::NormReferenceAdmission> {
+        let mut admissions = self
+            .record_acts
+            .iter()
+            .flat_map(|(record_id, acts)| {
+                acts.iter().map(
+                    |act| crate::norm_reference_inventory::NormReferenceAdmission {
+                        event: act.event.clone(),
+                        record: record_id.clone(),
+                        content_head: act.record.content_head.clone(),
+                        charter_event: act.charter_event.clone(),
+                        vocabulary: act.record.vocabulary.clone(),
+                        status: act.record.status.clone(),
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        admissions
+            .sort_by(|left, right| (&left.event, &left.record).cmp(&(&right.event, &right.record)));
+        admissions
+    }
+
     /// Move the ledger onto an admitted activation's charter: live records
     /// migrate or retire as planned, and every declaration the new charter
     /// drops stays behind to interpret what its records were.
@@ -1225,6 +1257,11 @@ impl NormView {
                 .register(vocabulary)
                 .map_err(|e| refused(e.to_string()))?;
         }
+        let preceding_charter = self
+            .charter_events
+            .last()
+            .expect("bootstrap charter")
+            .clone();
         let mut touched = Vec::new();
         for step in migration {
             let live: Vec<String> = self
@@ -1234,12 +1271,13 @@ impl NormView {
                 .map(|record| record.id.clone())
                 .collect();
             for id in live {
-                match &step.plan {
+                let interpretation_charter = match &step.plan {
                     MigrationPlan::Retain {} => continue,
                     MigrationPlan::Retire {} => {
                         self.retired.insert(id.clone());
                         self.effective_records.remove(&id);
                         self.effective_lifecycles.remove(&id);
+                        preceding_charter.clone()
                     }
                     MigrationPlan::Successor {
                         vocabulary,
@@ -1255,11 +1293,12 @@ impl NormView {
                         let record = self.records.get_mut(&id).expect("live record exists");
                         record.vocabulary = vocabulary.clone();
                         record.status = statuses[&record.status].clone();
+                        event_id.to_owned()
                     }
-                }
+                };
                 let record = self.records.get_mut(&id).expect("live record exists");
                 record.head = event_id.to_owned();
-                touched.push(id);
+                touched.push((id, interpretation_charter));
             }
         }
         let dropped: Vec<NormVocabulary> = self
@@ -1287,11 +1326,12 @@ impl NormView {
         }
         self.charter = charter;
         self.charter_events.push(event_id.to_owned());
-        for id in touched {
+        for (id, charter_event) in touched {
             let vocabulary = self.records[&id].vocabulary.clone();
             self.advance_family(&vocabulary, event_id);
             let act = RecordAct {
                 event: event_id.to_owned(),
+                charter_event,
                 record: self.records[&id].clone(),
                 effective: self.effective_records.get(&id).cloned(),
             };

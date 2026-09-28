@@ -647,6 +647,28 @@ fn norm_charter_activation_migrates_live_records_and_keeps_history_replayable() 
     let reference_inventory = store.norm_reference_inventory(&keys).unwrap();
     assert_eq!(reference_inventory.charter_events, [view.ledger.clone(), activated.clone()]);
     assert!(reference_inventory.historical_population_unknown);
+    let population = store.norm_observed_reference_acts(&keys).unwrap();
+    assert_eq!(population.charter_events, reference_inventory.charter_events);
+    assert!(population.admissions.iter().any(|act| {
+        act.event == proposed
+            && act.record == proposed
+            && act.content_head == before.records[&proposed].content_head
+            && act.charter_event == view.ledger
+            && act.vocabulary == reference(&decision_v1())
+    }));
+    assert!(population.admissions.iter().any(|act| {
+        act.event == activated
+            && act.record == proposed
+            && act.content_head == before.records[&proposed].content_head
+            && act.charter_event == activated
+            && act.vocabulary == reference(&weak)
+    }));
+    assert!(population.admissions.iter().any(|act| {
+        act.event == activated
+            && act.record == note
+            && act.charter_event == view.ledger
+            && act.vocabulary == reference(&note_v1())
+    }));
     assert_eq!(store.norm_checkpoint().unwrap(), Some(view.checkpoint()));
 
     // Live decisions moved to the successor with their meaning intact.

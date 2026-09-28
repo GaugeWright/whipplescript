@@ -833,6 +833,20 @@ mod tests {
             current.records[&record].fields,
             json!({"title":"a different decision"})
         );
+        let observed = store.norm_observed_reference_acts(&keys).unwrap();
+        assert_eq!(observed.admissions.len(), 4);
+        assert!(observed.admissions.iter().any(|act| {
+            act.event == noop_id
+                && act.record == record
+                && act.content_head == record
+                && act.charter_event == ledger
+        }));
+        assert!(observed.admissions.iter().any(|act| {
+            act.event == changed
+                && act.record == record
+                && act.content_head == changed
+                && act.charter_event == ledger
+        }));
         assert_eq!(current.effective_records[&record].content_head, record);
         assert_eq!(
             current.effective_records[&record].fields,

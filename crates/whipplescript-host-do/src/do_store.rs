@@ -9966,6 +9966,17 @@ impl<Sql: DoSql> DoSqliteStore<Sql> {
         whipplescript_store::norm_reference_inventory::inventory_at(&self.norm_view(verifier)?)
     }
 
+    pub fn norm_observed_reference_acts(
+        &self,
+        verifier: &dyn whipplescript_store::norm::NormVerifier,
+    ) -> StoreResult<whipplescript_store::norm_reference_inventory::NormObservedReferenceActs> {
+        Ok(
+            whipplescript_store::norm_reference_inventory::observed_acts_at(
+                &self.norm_view(verifier)?,
+            ),
+        )
+    }
+
     pub fn append_norm_event(
         &mut self,
         signed: &whipplescript_store::norm::SignedNormEvent,
@@ -20493,6 +20504,18 @@ mod norm_admission_tests {
             native_inventory.charter_events,
             [ledger.clone(), activation_id]
         );
+        let observed = native.norm_observed_reference_acts(&verifier).unwrap();
+        assert_eq!(
+            observed,
+            hosted.norm_observed_reference_acts(&verifier).unwrap()
+        );
+        assert_eq!(observed.admissions.len(), 2);
+        assert!(observed.admissions.iter().all(|act| {
+            act.record == record
+                && act.content_head == record
+                && act.charter_event == ledger
+                && act.vocabulary.version == "1"
+        }));
         assert_eq!(
             native.norm_view(&verifier).unwrap().records,
             hosted.norm_view(&verifier).unwrap().records
