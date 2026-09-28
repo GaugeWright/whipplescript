@@ -485,6 +485,12 @@ pub enum TransportOutcome {
     Conflicted {
         conflicts: Vec<PathConflict>,
     },
+    /// A selection skipped a write between two selected writes on one path.
+    /// The net result cannot claim a continuous source history.
+    IncompletePathSelection {
+        path: String,
+        omitted_cut_id: String,
+    },
     NothingSelected,
     BranchMissing,
     TargetMissing,
@@ -3919,6 +3925,28 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
         let selected = crate::selection::eval(expr, &universe);
         if selected.is_empty() {
             return Ok(TransportOutcome::NothingSelected);
+        }
+        // The oldest/newest net effect below is sound only when every write
+        // between them on the same path was selected. Otherwise the output
+        // silently incorporates an omitted source write while its identity
+        // is absent from the selection and any later accounting receipt.
+        let mut selected_spans: BTreeMap<&str, (usize, usize)> = BTreeMap::new();
+        for &index in &selected {
+            let path = universe[index].path.as_str();
+            selected_spans
+                .entry(path)
+                .and_modify(|(_, last)| *last = index)
+                .or_insert((index, index));
+        }
+        for (index, unit) in universe.iter().enumerate() {
+            if let Some(&(first, last)) = selected_spans.get(unit.path.as_str()) {
+                if first < index && index < last && !selected.contains(&index) {
+                    return Ok(TransportOutcome::IncompletePathSelection {
+                        path: unit.path.clone(),
+                        omitted_cut_id: unit.cut_id.clone(),
+                    });
+                }
+            }
         }
         // Net effect per path folds the OLDEST and NEWEST selected writes to
         // that path: the certified precondition on the target is the oldest's
@@ -7681,6 +7709,74 @@ mod tests {
                 .as_deref(),
             Some("v2"),
             "the net result (newest after) lands on the target"
+        );
+    }
+
+    #[test]
+    fn transport_refuses_a_gap_between_selected_writes_on_one_path() {
+        use crate::selection::parse;
+        let mut vcs = vcs();
+        vcs.init("t0").expect("init");
+        vcs.create_branch("draft", None, MAINLINE_BRANCH_ID, "t1")
+            .expect("create");
+        vcs.write("draft", "p.md", Some("v1"), "e1", "t2")
+            .expect("first write");
+        vcs.write("draft", "p.md", Some("v2"), "e2", "t3")
+            .expect("middle write");
+        vcs.write("draft", "p.md", Some("v3"), "e3", "t4")
+            .expect("last write");
+
+        let omitted_middle = vcs
+            .transport_selection(
+                "draft",
+                &parse("cut(e1) | cut(e3)").expect("parse"),
+                MAINLINE_BRANCH_ID,
+                "gap",
+                "t5",
+                &mut crate::vcs::NoNormLedger,
+            )
+            .expect("transport");
+        assert_eq!(
+            omitted_middle,
+            TransportOutcome::IncompletePathSelection {
+                path: "p.md".into(),
+                omitted_cut_id: "e2".into(),
+            }
+        );
+        assert_eq!(vcs.read(MAINLINE_BRANCH_ID, "p.md").expect("read"), None);
+        assert!(vcs.branches.get_cut("gap").expect("cut").is_none());
+
+        // A contiguous suffix remains a valid selection once its exact
+        // precondition has reached the target.
+        assert!(matches!(
+            vcs.transport_selection(
+                "draft",
+                &parse("cut(e1)").expect("parse"),
+                MAINLINE_BRANCH_ID,
+                "prefix",
+                "t6",
+                &mut crate::vcs::NoNormLedger,
+            )
+            .expect("prefix transport"),
+            TransportOutcome::Transported { .. }
+        ));
+        assert!(matches!(
+            vcs.transport_selection(
+                "draft",
+                &parse("cut(e2) | cut(e3)").expect("parse"),
+                MAINLINE_BRANCH_ID,
+                "suffix",
+                "t7",
+                &mut crate::vcs::NoNormLedger,
+            )
+            .expect("suffix transport"),
+            TransportOutcome::Transported { .. }
+        ));
+        assert_eq!(
+            vcs.read(MAINLINE_BRANCH_ID, "p.md")
+                .expect("read")
+                .as_deref(),
+            Some("v3")
         );
     }
 
