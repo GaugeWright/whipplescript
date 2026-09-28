@@ -2310,6 +2310,12 @@ impl SqliteStore {
             "UPDATE instances SET version_id = ?1 WHERE instance_id = ?2",
             params![&to_version_id, instance_id],
         )?;
+        tx.execute(
+            "INSERT INTO program_import_operations \
+             (operation_id, version_id, kind) \
+             VALUES ('imp_' || lower(hex(randomblob(16))), ?1, 'unwitnessed')",
+            [&to_version_id],
+        )?;
         tx.commit()?;
         Ok(ProgramVersionRecord {
             program_id,
@@ -18050,6 +18056,16 @@ mod tests {
             .expect("re-attesting the same pair again is the same durable statement");
         assert_eq!(again.version_id, reattested.version_id);
         assert_eq!(version_after(&store), reattested.version_id);
+        let accepting_calls: i64 = store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM program_import_operations \
+                 WHERE version_id = ?1 AND kind = 'unwitnessed'",
+                params![&reattested.version_id],
+                |row| row.get(0),
+            )
+            .expect("re-attestation population");
+        assert_eq!(accepting_calls, 2, "each changed-IR call remains unknown");
         let reattestations: i64 = store
             .connection
             .query_row(

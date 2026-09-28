@@ -5414,9 +5414,8 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
         instance_id: &str,
         version: NewProgramVersion<'_>,
     ) -> StoreResult<ProgramVersionRecord> {
-        // Same semantics as `SqliteStore::reattest_instance_program`: the DO's
-        // single-writer serializes these statements, standing in for the
-        // native transaction.
+        // Same semantics as `SqliteStore::reattest_instance_program`: the
+        // changed-IR writes below commit together in a DO SQL transaction.
         let recorded_rows = self
             .sql
             .query(
@@ -5447,39 +5446,54 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
                 version_id: from_version_id,
             });
         }
-        let to_version_id = do_insert_program_version(&self.sql, &program_id, version)?;
-        let payload = serde_json::json!({
-            "from_version_id": &from_version_id,
-            "to_version_id": &to_version_id,
-            "source_hash": version.source_hash,
-            "from_ir_hash": &recorded_ir,
-            "to_ir_hash": version.ir_hash,
-            "compiler_version": version.compiler_version,
-        })
-        .to_string();
-        let idempotency = format!("reattest:{instance_id}:{from_version_id}:{to_version_id}");
-        do_append_event_idempotent(
-            &self.sql,
-            NewEvent {
-                instance_id,
-                event_type: "instance.program.reattested",
-                payload_json: &payload,
-                source: "kernel",
-                causation_id: None,
-                correlation_id: None,
-                idempotency_key: Some(&idempotency),
-            },
-        )?;
-        self.sql
-            .execute(
-                "UPDATE instances SET version_id = ?1 WHERE instance_id = ?2",
-                &[text(&to_version_id), text(instance_id)],
-            )
-            .map_err(sql_err)?;
-        Ok(ProgramVersionRecord {
-            program_id,
-            version_id: to_version_id,
-        })
+        // A changed-IR re-attestation accepts a new version. Its event,
+        // instance move and unknown import operation commit as one unit.
+        let mut record = None;
+        self.sql.atomic(&mut || {
+            let to_version_id = do_insert_program_version(&self.sql, &program_id, version)?;
+            let payload = serde_json::json!({
+                "from_version_id": &from_version_id,
+                "to_version_id": &to_version_id,
+                "source_hash": version.source_hash,
+                "from_ir_hash": &recorded_ir,
+                "to_ir_hash": version.ir_hash,
+                "compiler_version": version.compiler_version,
+            })
+            .to_string();
+            let idempotency = format!("reattest:{instance_id}:{from_version_id}:{to_version_id}");
+            do_append_event_idempotent(
+                &self.sql,
+                NewEvent {
+                    instance_id,
+                    event_type: "instance.program.reattested",
+                    payload_json: &payload,
+                    source: "kernel",
+                    causation_id: None,
+                    correlation_id: None,
+                    idempotency_key: Some(&idempotency),
+                },
+            )?;
+            self.sql
+                .execute(
+                    "UPDATE instances SET version_id = ?1 WHERE instance_id = ?2",
+                    &[text(&to_version_id), text(instance_id)],
+                )
+                .map_err(sql_err)?;
+            self.sql
+                .execute(
+                    "INSERT INTO program_import_operations \
+                 (operation_id, version_id, kind) \
+                 VALUES ('imp_' || lower(hex(randomblob(16))), ?1, 'unwitnessed')",
+                    &[text(&to_version_id)],
+                )
+                .map_err(sql_err)?;
+            record = Some(ProgramVersionRecord {
+                program_id: program_id.clone(),
+                version_id: to_version_id,
+            });
+            Ok(())
+        })?;
+        Ok(record.expect("the successful atomic body sets its re-attestation record"))
     }
 
     fn get_program_version(&self, version_id: &str) -> StoreResult<Option<ProgramVersionView>> {
@@ -14675,6 +14689,31 @@ pub(crate) mod tests {
                 .unwrap(),
             Some(second_witness)
         );
+        let instance = store
+            .create_instance(NewInstance {
+                program_id: &first.program_id,
+                version_id: &first.version_id,
+                input_json: "{}",
+            })
+            .unwrap();
+        let reattested = store
+            .reattest_instance_program(
+                &instance.instance_id,
+                NewProgramVersion {
+                    ir_hash: NEXT_LOCK,
+                    ..version("paint")
+                },
+            )
+            .unwrap();
+        let reattestation_calls = store
+            .sql
+            .query(
+                "SELECT COUNT(*) FROM program_import_operations \
+                 WHERE version_id = ?1 AND kind = 'unwitnessed'",
+                &[text(&reattested.version_id)],
+            )
+            .unwrap();
+        assert_eq!(as_i64(&reattestation_calls[0][0]), 1);
         let mut bad = witness(LOCK);
         bad.edge_digest = NEXT_LOCK.into();
         assert!(store
@@ -14708,6 +14747,35 @@ pub(crate) mod tests {
             store.program_import_witness(&first.version_id, &first.witness_digest),
             Err(StoreError::Conflict(message)) if message.contains("differs from its version")
         ));
+        store
+            .sql
+            .execute("DROP TABLE program_import_operations", &[])
+            .unwrap();
+        assert!(store
+            .reattest_instance_program(
+                &instance.instance_id,
+                NewProgramVersion {
+                    ir_hash: LOCK,
+                    ..version("paint")
+                },
+            )
+            .is_err());
+        let retained = store
+            .sql
+            .query(
+                "SELECT version_id FROM instances WHERE instance_id = ?1",
+                &[text(&instance.instance_id)],
+            )
+            .unwrap();
+        assert_eq!(as_text(&retained[0][0]), reattested.version_id);
+        let rolled_back = store
+            .sql
+            .query(
+                "SELECT version_id FROM program_versions WHERE program_id = ?1 AND ir_hash = ?2",
+                &[text(&first.program_id), text(LOCK)],
+            )
+            .unwrap();
+        assert!(rolled_back.is_empty());
     }
 
     /// The ported core methods run their real SQL against a real engine.

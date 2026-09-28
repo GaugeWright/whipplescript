@@ -2,8 +2,9 @@
 //!
 //! A program version can be reused under a changed package lock. Checked
 //! version creation retains an immutable witness basis, while each call to
-//! the version-creation API records a separate operation. Other accepting
-//! paths still need coverage before this population can describe a Home.
+//! the version-creation API records a separate operation. A changed-IR
+//! re-attestation records an unwitnessed operation. Other accepting paths
+//! still need coverage before this population can describe a Home.
 
 use serde::{Deserialize, Serialize};
 
@@ -41,8 +42,8 @@ pub const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS program_import_admissions (
     PRIMARY KEY (version_id, witness_digest)
 )";
 
-/// One row per version-creation call, including repeated calls returning the
-/// same version. Existing stores cannot reconstruct old calls;
+/// One row per version-creation call or changed-IR re-attestation, including
+/// repeated calls returning the same version. Existing stores cannot reconstruct old calls;
 /// their migration records a conservative unknown gap for every old version.
 pub const OPERATIONS_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS program_import_operations (
     sequence INTEGER PRIMARY KEY AUTOINCREMENT,
