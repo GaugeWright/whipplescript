@@ -11,7 +11,33 @@
 use whipplescript_core::vocabulary::{ReferenceForm, ValueType};
 
 use crate::norm::{NormCharter, NormView, NormVocabulary};
-use crate::{stable_hash_hex, StoreResult};
+use crate::{stable_hash_hex, StoreError, StoreResult};
+
+/// Meaning is declared at charter admission, never inferred from the
+/// reference's content-id shape or structural role. A missing declaration is
+/// unknown and cannot support a complete dependency-coverage claim.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NormReferenceMeaning {
+    LiveDependency,
+    HistoricalPin,
+    Provenance,
+    Authority,
+    ContentInput,
+}
+
+/// One versioned classification of a typed norm reference field. The charter
+/// and its exact vocabulary declaration supply the ledger authority, the
+/// population of admitted records, and identity/revision provider resolution;
+/// this entry supplies the otherwise unknowable edge meaning.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NormReferenceClass {
+    pub vocabulary: String,
+    pub vocabulary_version: String,
+    pub path: String,
+    pub meaning: NormReferenceMeaning,
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum NormReferenceRole {
@@ -32,6 +58,7 @@ pub struct NormReferenceField {
     pub path: String,
     pub form: ReferenceForm,
     pub role: NormReferenceRole,
+    pub meaning: Option<NormReferenceMeaning>,
 }
 
 /// The field inventory from a replayed, authenticated norm cut. `frontier`
@@ -56,22 +83,31 @@ pub fn inventory_at(view: &NormView) -> StoreResult<NormReferenceInventory> {
         authority_head: view.authority_head.clone(),
         frontier: view.frontier.iter().cloned().collect(),
         charter_digest,
-        has_unclassified: fields
-            .iter()
-            .any(|field| field.role == NormReferenceRole::Unclassified),
+        has_unclassified: fields.iter().any(|field| field.meaning.is_none()),
         fields,
     })
 }
 
 /// Enumerate every typed reference, including nested object/list fields.
 /// A newly added reference always appears, even if no existing X1 construct
-/// names its role. Completeness remains unknown while any role is unclassified.
+/// names its role. Completeness remains unknown while any meaning is absent.
 pub fn inventory(charter: &NormCharter) -> Vec<NormReferenceField> {
     let mut fields = Vec::new();
     for vocabulary in &charter.vocabularies {
         for field in &vocabulary.definition.fields {
             visit_field(vocabulary, &field.name, &field.value_type, &mut fields);
         }
+    }
+    for field in &mut fields {
+        field.meaning = charter
+            .reference_classes
+            .iter()
+            .find(|class| {
+                class.vocabulary == field.vocabulary
+                    && class.vocabulary_version == field.vocabulary_version
+                    && class.path == field.path
+            })
+            .map(|class| class.meaning);
     }
     fields.sort_by(|left, right| {
         (&left.vocabulary, &left.vocabulary_version, &left.path).cmp(&(
@@ -96,6 +132,7 @@ fn visit_field(
             path: path.to_owned(),
             form: *form,
             role: role(vocabulary, path),
+            meaning: None,
         }),
         ValueType::List { item } => visit_field(vocabulary, &format!("{path}[]"), item, fields),
         ValueType::Object { fields: nested } => {
@@ -113,6 +150,53 @@ fn visit_field(
         | ValueType::Integer { .. }
         | ValueType::Enum { .. } => {}
     }
+}
+
+/// A charter may leave a class unclassified (coverage then stays unknown),
+/// but it may not assert a class for a nonexistent field or use one key twice.
+/// The current norm charter has no propagation declaration, so claiming a
+/// live update edge here would be unsound until RC-3 adds that contract.
+pub(crate) fn validate_classes(charter: &NormCharter) -> StoreResult<()> {
+    let fields = inventory(charter);
+    let mut seen: std::collections::BTreeSet<(&str, &str, &str)> =
+        std::collections::BTreeSet::new();
+    for class in &charter.reference_classes {
+        let key = (
+            class.vocabulary.as_str(),
+            class.vocabulary_version.as_str(),
+            class.path.as_str(),
+        );
+        if !seen.insert(key) {
+            return Err(StoreError::Conflict(
+                "reference class must name one distinct typed field of this charter".into(),
+            ));
+        }
+        if let Some(field) = fields.iter().find(|field| {
+            field.vocabulary == class.vocabulary
+                && field.vocabulary_version == class.vocabulary_version
+                && field.path == class.path
+        }) {
+            if matches!(
+                class.meaning,
+                NormReferenceMeaning::HistoricalPin | NormReferenceMeaning::ContentInput
+            ) && field.form != ReferenceForm::Revision
+            {
+                return Err(StoreError::Conflict(
+                    "historical pins and content inputs require exact revision references".into(),
+                ));
+            }
+        } else {
+            return Err(StoreError::Conflict(
+                "reference class must name one distinct typed field of this charter".into(),
+            ));
+        }
+        if class.meaning == NormReferenceMeaning::LiveDependency {
+            return Err(StoreError::Conflict(
+                "a live dependency class requires a declared propagation rule".into(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn role(vocabulary: &NormVocabulary, path: &str) -> NormReferenceRole {
@@ -160,6 +244,7 @@ mod tests {
         let charter = NormCharter::bundled().expect("bundled charter");
         let fields = inventory(&charter);
         assert_eq!(fields.len(), 13);
+        assert!(fields.iter().all(|field| field.meaning.is_none()));
         assert_eq!(
             fields
                 .iter()
@@ -235,6 +320,91 @@ mod tests {
                 && field.path == "metadata.new_links[]"
                 && field.form == ReferenceForm::Identity
                 && field.role == NormReferenceRole::Unclassified
+                && field.meaning.is_none()
         }));
+        charter.reference_classes.push(NormReferenceClass {
+            vocabulary: "issue".into(),
+            vocabulary_version: "1".into(),
+            path: "metadata.new_links[]".into(),
+            meaning: NormReferenceMeaning::Authority,
+        });
+        crate::norm::registry_for(&charter).expect("exact nested class admission");
+        assert!(inventory(&charter).iter().any(|field| {
+            field.path == "metadata.new_links[]"
+                && field.meaning == Some(NormReferenceMeaning::Authority)
+        }));
+    }
+
+    #[test]
+    fn charter_classifies_only_the_exact_declared_reference_field() {
+        let mut charter = NormCharter::bundled().expect("bundled charter");
+        let member = inventory(&charter)
+            .into_iter()
+            .find(|field| field.role == NormReferenceRole::ManifestMember)
+            .expect("manifest member field");
+        charter.reference_classes.push(NormReferenceClass {
+            vocabulary: member.vocabulary.clone(),
+            vocabulary_version: member.vocabulary_version.clone(),
+            path: member.path.clone(),
+            meaning: NormReferenceMeaning::HistoricalPin,
+        });
+        crate::norm::registry_for(&charter).expect("exact class admission");
+        let fields = inventory(&charter);
+        assert_eq!(
+            fields
+                .iter()
+                .find(|field| field.path == member.path && field.vocabulary == member.vocabulary)
+                .expect("classified member")
+                .meaning,
+            Some(NormReferenceMeaning::HistoricalPin)
+        );
+        assert_eq!(
+            fields
+                .iter()
+                .filter(|field| field.meaning.is_some())
+                .count(),
+            1
+        );
+
+        let mut changed_version = charter.clone();
+        changed_version.reference_classes[0].vocabulary_version = "later".into();
+        assert!(matches!(
+            crate::norm::registry_for(&changed_version),
+            Err(StoreError::Conflict(reason))
+                if reason == "reference class must name one distinct typed field of this charter"
+        ));
+        let mut duplicate = charter.clone();
+        duplicate
+            .reference_classes
+            .push(charter.reference_classes[0].clone());
+        assert!(matches!(
+            crate::norm::registry_for(&duplicate),
+            Err(StoreError::Conflict(reason))
+                if reason == "reference class must name one distinct typed field of this charter"
+        ));
+        let mut unsupported_live = charter;
+        unsupported_live.reference_classes[0].meaning = NormReferenceMeaning::LiveDependency;
+        assert!(matches!(
+            crate::norm::registry_for(&unsupported_live),
+            Err(StoreError::Conflict(reason))
+                if reason == "a live dependency class requires a declared propagation rule"
+        ));
+
+        let mut false_pin = NormCharter::bundled().expect("bundled charter");
+        let identity = inventory(&false_pin)
+            .into_iter()
+            .find(|field| field.form == ReferenceForm::Identity)
+            .expect("identity reference");
+        false_pin.reference_classes.push(NormReferenceClass {
+            vocabulary: identity.vocabulary,
+            vocabulary_version: identity.vocabulary_version,
+            path: identity.path,
+            meaning: NormReferenceMeaning::HistoricalPin,
+        });
+        assert!(matches!(
+            crate::norm::registry_for(&false_pin),
+            Err(StoreError::Conflict(reason))
+                if reason == "historical pins and content inputs require exact revision references"
+        ));
     }
 }

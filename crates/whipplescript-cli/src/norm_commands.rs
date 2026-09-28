@@ -669,8 +669,10 @@ fn execute(args: &[String], runtime_path: &std::path::Path) -> Result<Value, Str
             frontier: args.frontier("--frontier")?,
         },
         "plan-activation" => NormCommand::PlanActivation {
-            proposal: serde_json::from_str(&args.file("--proposal")?)
-                .map_err(|error| error.to_string())?,
+            proposal: Box::new(
+                serde_json::from_str(&args.file("--proposal")?)
+                    .map_err(|error| error.to_string())?,
+            ),
         },
         "import" => NormCommand::Import {
             events: serde_json::from_str(&args.file("--events")?)

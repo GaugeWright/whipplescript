@@ -246,6 +246,7 @@ mod tests {
                 definition: definition(),
                 creation: AdmissionPredicate::Public {},
             }],
+            reference_classes: vec![],
             owner_scopes: vec!["accept".into()],
             activation: None,
             gated_refs: vec![],

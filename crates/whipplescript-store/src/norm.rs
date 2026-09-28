@@ -121,6 +121,10 @@ pub struct NormCharter {
     )]
     pub resource_domains: Option<BTreeMap<String, crate::norm_resources::ResourceDomain>>,
     pub vocabularies: Vec<NormVocabulary>,
+    /// Exact, versioned meanings for typed reference fields. Missing entries
+    /// remain unknown to dependency coverage; structural roles imply none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reference_classes: Vec<crate::norm_reference_inventory::NormReferenceClass>,
     /// Named scopes delegated to the authenticated governance owner by C0.
     pub owner_scopes: Vec<String>,
     /// Who may activate a successor charter (norm-plane §10). Omission means
@@ -553,6 +557,7 @@ fn verify_event(event: &TrackerEvent, verifier: &dyn NormVerifier) -> StoreResul
 pub(crate) fn registry_for(charter: &NormCharter) -> StoreResult<VocabularyRegistry> {
     crate::norm_resources::validate_resource_domains(charter)?;
     crate::norm_resources::validate_canonicalizer_pins(charter)?;
+    crate::norm_reference_inventory::validate_classes(charter)?;
     let mut registry = VocabularyRegistry::default();
     let mut scopes: std::collections::BTreeSet<&String> = std::collections::BTreeSet::new();
     for scope in &charter.owner_scopes {

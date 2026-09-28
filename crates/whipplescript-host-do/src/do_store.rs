@@ -19422,7 +19422,7 @@ mod norm_admission_tests {
                 "name":"decision","version":"1","fields":[{"name":"title","required":true,"value_type":{"type":"text"}}],
                 "status":{"values":["proposed","accepted"],"initial":"proposed","transitions":[{"from":"proposed","to":"accepted","admission":{"requires":"authority","scope":"accept"}}]}
             })).expect("fixture"),creation:AdmissionPredicate::Public {},
-        }],owner_scopes:vec!["accept".into()],activation:None,gated_refs:vec![],canonicalizers:Default::default()}
+        }],reference_classes:vec![],owner_scopes:vec!["accept".into()],activation:None,gated_refs:vec![],canonicalizers:Default::default()}
     }
 
     /// The hosted promote door runs the mainline gate over the object's own
@@ -20341,13 +20341,41 @@ mod norm_admission_tests {
         .unwrap();
         let mut native = whipplescript_store::items::WorkItemStore::open_in_memory().unwrap();
         let mut hosted = test_support::store();
+        let mut admitted_charter = charter();
+        for (name, form) in [
+            (
+                "basis",
+                whipplescript_core::vocabulary::ReferenceForm::Revision,
+            ),
+            (
+                "later",
+                whipplescript_core::vocabulary::ReferenceForm::Identity,
+            ),
+        ] {
+            admitted_charter.vocabularies[0].definition.fields.push(
+                whipplescript_core::vocabulary::FieldDefinition {
+                    name: name.into(),
+                    required: false,
+                    value_type: whipplescript_core::vocabulary::ValueType::Reference { form },
+                    editorial: false,
+                },
+            );
+        }
+        admitted_charter.reference_classes.push(
+            whipplescript_store::norm_reference_inventory::NormReferenceClass {
+                vocabulary: "decision".into(),
+                vocabulary_version: "1".into(),
+                path: "basis".into(),
+                meaning: whipplescript_store::norm_reference_inventory::NormReferenceMeaning::HistoricalPin,
+            },
+        );
         let bootstrap = signed(
             owner.clone(),
             &owner_key,
             "genesis",
             NormAct::Bootstrap {
                 creator: "worker".into(),
-                charter: charter(),
+                charter: admitted_charter.clone(),
             },
         );
         let ledger = native.append_norm_event(&bootstrap, &verifier).unwrap();
@@ -20359,7 +20387,7 @@ mod norm_admission_tests {
             hosted.append_norm_event(&bootstrap, &verifier).unwrap(),
             ledger
         );
-        let vocabulary = Vocabulary::new(charter().vocabularies[0].definition.clone())
+        let vocabulary = Vocabulary::new(admitted_charter.vocabularies[0].definition.clone())
             .unwrap()
             .reference()
             .clone();
@@ -20395,9 +20423,25 @@ mod norm_admission_tests {
             native.append_norm_event(&accepted, &verifier).unwrap(),
             hosted.append_norm_event(&accepted, &verifier).unwrap()
         );
+        let native_inventory = native.norm_reference_inventory(&verifier).unwrap();
         assert_eq!(
-            native.norm_reference_inventory(&verifier).unwrap(),
-            hosted.norm_reference_inventory(&verifier).unwrap(),
+            native_inventory,
+            hosted.norm_reference_inventory(&verifier).unwrap()
+        );
+        assert!(native_inventory.has_unclassified);
+        assert_eq!(
+            native_inventory
+                .fields
+                .iter()
+                .map(|field| (field.path.as_str(), field.meaning))
+                .collect::<Vec<_>>(),
+            [
+                (
+                    "basis",
+                    Some(whipplescript_store::norm_reference_inventory::NormReferenceMeaning::HistoricalPin)
+                ),
+                ("later", None),
+            ]
         );
         assert_eq!(
             native.norm_view(&verifier).unwrap().records,

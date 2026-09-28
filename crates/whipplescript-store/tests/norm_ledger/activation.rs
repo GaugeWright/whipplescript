@@ -87,6 +87,7 @@ fn governed(vocabularies: Vec<NormVocabulary>) -> NormCharter {
     NormCharter {
         resource_domains: None,
         vocabularies,
+        reference_classes: vec![],
         owner_scopes: vec!["accept".into(), "activate".into()],
         activation: Some(AdmissionPredicate::Authority {
             scope: "activate".into(),
@@ -1068,11 +1069,11 @@ fn norm_activation_door_refuses_to_strand_a_prepared_publication() {
     let planned = NormCommandHost::new(&mut store, &keys)
         .with_running_effects(&stranding)
         .execute(NormCommandRequest::new(NormCommand::PlanActivation {
-            proposal: ActivationProposal {
+            proposal: Box::new(ActivationProposal {
                 charter: charter.clone(),
                 migration: migration.clone(),
                 changes: Vec::new(),
-            },
+            }),
         }))
         .unwrap();
     let NormCommandResult::ActivationPlanned {
@@ -1103,14 +1104,14 @@ fn norm_activation_door_refuses_to_strand_a_prepared_publication() {
     let planned = NormCommandHost::new(&mut store, &keys)
         .with_running_effects(&elsewhere)
         .execute(NormCommandRequest::new(NormCommand::PlanActivation {
-            proposal: ActivationProposal {
+            proposal: Box::new(ActivationProposal {
                 charter: governed(vec![duty("1", true)]),
                 migration: vec![VocabularyMigration {
                     from: reference(&duty("1", true)),
                     plan: MigrationPlan::Retain {},
                 }],
                 changes: Vec::new(),
-            },
+            }),
         }))
         .unwrap();
     let NormCommandResult::ActivationPlanned {

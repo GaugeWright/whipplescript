@@ -81,7 +81,7 @@ pub enum NormCommand {
     /// current frontier (norm-plane §10). An empty list is not an admission:
     /// the signed act is judged again when it is appended.
     PlanActivation {
-        proposal: crate::norm_activation::ActivationProposal,
+        proposal: Box<crate::norm_activation::ActivationProposal>,
     },
     /// Project the ledger through the UPROAR binding profile (norm-plane
     /// §11.2): graded slots and wire v1 records for `repository`.

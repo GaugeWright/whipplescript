@@ -218,11 +218,11 @@ fn an_activation_plans_every_running_norm_effect_and_never_strands_a_prepared_pu
     let planned = NormCommandHost::new(&mut ledger, &Boundary)
         .with_running_effects(&listed)
         .execute(NormCommandRequest::new(NormCommand::PlanActivation {
-            proposal: whipplescript_store::norm_activation::ActivationProposal {
+            proposal: Box::new(whipplescript_store::norm_activation::ActivationProposal {
                 charter,
                 migration,
                 changes: Vec::new(),
-            },
+            }),
         }))
         .unwrap();
     let NormCommandResult::ActivationPlanned {
