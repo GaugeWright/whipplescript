@@ -396,6 +396,10 @@ pub struct NativeWorkspaceResolver {
     /// keyed by their call IDs.
     /// A batch may execute several tools before the next model request.
     model_read_witnesses: std::sync::Mutex<HashMap<String, ModelReadWitness>>,
+    /// A directory grep's complete bounded set of files whose contents were
+    /// searched, including files with no match. Omitted if traversal cannot
+    /// attest every searched file.
+    model_scan_witnesses: std::sync::Mutex<HashMap<String, ModelScanWitness>>,
     root: PathBuf,
     read_only: Vec<PathBuf>,
     max_output_bytes: usize,
@@ -415,6 +419,12 @@ pub struct ModelReadWitness {
     pub content_hash: String,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ModelScanWitness {
+    pub root: String,
+    pub files: Vec<ModelReadWitness>,
+}
+
 #[derive(Default)]
 struct WitnessState {
     writes: Vec<WitnessedWrite>,
@@ -431,6 +441,13 @@ struct AdmittedFileScope {
 impl NativeWorkspaceResolver {
     pub fn take_model_read_witness(&self, call_id: &str) -> Option<ModelReadWitness> {
         self.model_read_witnesses
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(call_id)
+    }
+
+    pub fn take_model_scan_witness(&self, call_id: &str) -> Option<ModelScanWitness> {
+        self.model_scan_witnesses
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .remove(call_id)
@@ -489,6 +506,7 @@ impl NativeWorkspaceResolver {
         Ok(Self {
             workspace_reads: std::sync::Mutex::new(Vec::new()),
             model_read_witnesses: std::sync::Mutex::new(HashMap::new()),
+            model_scan_witnesses: std::sync::Mutex::new(HashMap::new()),
             root,
             read_only: Vec::new(),
             max_output_bytes: 50_000,
@@ -747,17 +765,32 @@ impl NativeWorkspaceResolver {
         let matcher = crate::workspace_grep::GrepMatcher::new(pattern, ignore_case);
         let mut matches = Vec::new();
         let mut matches_found = 0usize;
-        // A directory search also reveals its traversal and negative matches.
-        // Only an explicit file search can be attributed to one retained cut.
+        // A directory search also reveals negative matches. Its witness must
+        // include every file searched, not just paths that produced matches.
         let single_file = fs::symlink_metadata(&resolved).is_ok_and(|metadata| metadata.is_file());
         let mut exact_witness = None;
+        let mut scan_files = Vec::new();
+        let mut scan_complete = true;
         walk_workspace(&self.root, &resolved, &mut |relative, absolute| {
             if matches_found >= limit {
                 return false;
             }
             let Ok(text) = fs::read_to_string(absolute) else {
+                scan_complete = false;
                 return true;
             };
+            if !single_file {
+                // A scan over a very large tree still runs, but cannot be
+                // projected as a bounded current-access proof.
+                if scan_files.len() < 128 {
+                    scan_files.push(ModelReadWitness {
+                        path: relative.to_owned(),
+                        content_hash: whipplescript_store::stable_hash_bytes_hex(text.as_bytes()),
+                    });
+                } else {
+                    scan_complete = false;
+                }
+            }
             if single_file && absolute == resolved {
                 exact_witness = Some(ModelReadWitness {
                     path: relative.to_owned(),
@@ -780,6 +813,17 @@ impl NativeWorkspaceResolver {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .insert(call_id.to_owned(), witness);
+        } else if !single_file && scan_complete && !scan_files.is_empty() {
+            self.model_scan_witnesses
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .insert(
+                    call_id.to_owned(),
+                    ModelScanWitness {
+                        root: path.to_owned(),
+                        files: scan_files,
+                    },
+                );
         }
         Ok(self.cap(matches.join("\n")))
     }
@@ -983,6 +1027,7 @@ impl ResourceResolver for NativeWorkspaceResolver {
     ) -> Result<String, String> {
         // Reusing an ID cannot inherit a prior read, even if this call fails.
         self.take_model_read_witness(&call.id);
+        self.take_model_scan_witness(&call.id);
         let scopes = self.admitted_file_scopes(admitted_resources)?;
         let scopes = scopes.as_slice();
         match call.name.as_str() {
@@ -1007,6 +1052,10 @@ impl ResourceResolver for NativeWorkspaceResolver {
 
     fn take_turn_witness(&self) -> TurnWitness {
         self.model_read_witnesses
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+        self.model_scan_witnesses
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clear();
@@ -5275,6 +5324,20 @@ workflow UnsafeHostChat {
             })
         );
         assert!(resolver.take_model_read_witness("grep-directory").is_none());
+        let scan = resolver
+            .take_model_scan_witness("grep-directory")
+            .expect("directory scan witness");
+        assert_eq!(scan.root, ".");
+        assert_eq!(scan.files.len(), 3);
+        assert!(
+            scan.files.iter().any(|file| {
+                file.path == "other.txt"
+                    && file.content_hash
+                        == whipplescript_store::stable_hash_bytes_hex(b"separate\n")
+            }),
+            "a negative match still contributes its source"
+        );
+        assert!(resolver.take_model_scan_witness("grep-directory").is_none());
         assert!(resolver.take_model_read_witness("read-1").is_none());
         assert_eq!(
             resolver.execute_tool(
@@ -5315,6 +5378,47 @@ workflow UnsafeHostChat {
         assert!(native_workspace_tool_specs(true)
             .iter()
             .any(|tool| tool.name == "write"));
+        fs::create_dir(root.join("empty")).expect("empty directory");
+        resolver
+            .execute_tool(
+                &resources,
+                &ToolCall {
+                    id: "empty-scan".to_owned(),
+                    name: "grep".to_owned(),
+                    arguments: json!({ "path": "empty", "pattern": "absent" }),
+                },
+            )
+            .expect("empty grep still runs");
+        assert!(resolver.take_model_scan_witness("empty-scan").is_none());
+        fs::write(root.join("invalid.txt"), [0xff]).expect("invalid UTF-8 file");
+        resolver
+            .execute_tool(
+                &resources,
+                &ToolCall {
+                    id: "incomplete-scan".to_owned(),
+                    name: "grep".to_owned(),
+                    arguments: json!({ "path": ".", "pattern": "absent" }),
+                },
+            )
+            .expect("grep ignores unreadable text");
+        assert!(resolver
+            .take_model_scan_witness("incomplete-scan")
+            .is_none());
+        fs::remove_file(root.join("invalid.txt")).expect("remove invalid text");
+        for index in 0..126 {
+            fs::write(root.join(format!("extra-{index}.txt")), "no match").expect("extra file");
+        }
+        resolver
+            .execute_tool(
+                &resources,
+                &ToolCall {
+                    id: "oversized-scan".to_owned(),
+                    name: "grep".to_owned(),
+                    arguments: json!({ "path": ".", "pattern": "absent" }),
+                },
+            )
+            .expect("large grep still runs");
+        assert!(resolver.take_model_scan_witness("oversized-scan").is_none());
         let _ = fs::remove_dir_all(root);
     }
 
