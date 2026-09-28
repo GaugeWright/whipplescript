@@ -15,6 +15,7 @@
 //! terminal — the record is immutable history, never rewritten (the
 //! no-destructive-verbs surface).
 
+pub mod flowing_admission;
 pub mod flowing_fence;
 pub mod flowing_sources;
 pub mod resolution_batch;
@@ -1049,7 +1050,9 @@ fn map_op_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoreResult<OpRow>> {
 /// Version 7 records atomic twig-to-branch holder transfers; older writers
 /// cannot tell which authority owns an already shared unit. Version 8 adds
 /// ref-owned flowing source fences and their exact operation receipts.
-const SATELLITE_SCHEMA_VERSION: i64 = 8;
+/// Version 9 records gated trunk admissions and per-unit uniqueness with the
+/// ref authority; an older writer must not reuse an admitted source unit.
+const SATELLITE_SCHEMA_VERSION: i64 = 9;
 
 #[cfg(feature = "native")]
 fn ensure_branch_schema(connection: &Connection) -> StoreResult<()> {
@@ -1064,6 +1067,9 @@ fn ensure_branch_schema(connection: &Connection) -> StoreResult<()> {
         connection.execute(statement, [])?;
     }
     for statement in flowing_fence::SCHEMA {
+        connection.execute(statement, [])?;
+    }
+    for statement in flowing_admission::SCHEMA {
         connection.execute(statement, [])?;
     }
     connection.execute_batch(

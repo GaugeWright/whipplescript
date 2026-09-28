@@ -17,6 +17,12 @@ categories = ["command-line-utilities", "development-tools"]
 # entry fails the test instead of caching a pass it never earned. The fixture's
 # dotfiles are for the build_engine tests that run a real Buck2 over it.
 data = ["Cargo.toml", "scripts", "examples/buck2-tests", "examples/buck2-tests/.buck2-version", "examples/buck2-tests/.buckconfig", "examples/buck2-tests/.buckroot", "examples/buck2-tests/inner/.buckconfig"]
+# The two test binaries too long for one run's four cores, split into that many
+# runs of a stable share of their tests each (GaugeWright tools/buck
+# native_test.bzl). control_plane is about 720 test-seconds, soft_middle 280;
+# every other binary is held to its time by one long test, which a shard does
+# not shorten.
+shards = { control_plane = 4, soft_middle = 2 }
 
 [package.metadata.native-tests.artifacts]
 # Built files the tests read where the repository holds them: the norm
