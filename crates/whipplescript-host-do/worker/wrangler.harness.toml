@@ -107,10 +107,12 @@ WHIP_EXECUTOR_POOL_SIZE = "0"
 # per-turn container (idFromName over the turn id) over whip-turn/1.
 WHIP_TURN_URL = "http://turn"
 # The norm plane's ledger half (DR-0140): the production canary ledger's
-# public bindings and creation grant. Public keys only; the signing keys are
-# held by the custodian on the founder's workstation. No planning, runtime or
+# public bindings and creation grant, and the restoration pinning its object
+# (tenant synthetic-wiring, placement production-norm-ledger-canary-v1) to the
+# ledger's genesis checkpoint. Public keys only; the signing keys are held by
+# the custodian on the founder's workstation. No planning, runtime or
 # image binding is set, so the evidence doors answer unavailable (DR-0139).
-WHIP_NORM_TRUST = '{"bindings":[],"creation_grants":[{"creator":"norm-canary-worker","owner":"norm-canary-owner"}],"public_bindings":[{"actor":{"principal":"norm-canary-owner","algorithm":"ed25519-custodian","key_id":"credential:norm/canary-owner#local"},"public_key_hex":"10cd2b6605e11c0bf46a16b27d7a720a83237ca9646f590adef687ad22012798"},{"actor":{"principal":"norm-canary-worker","algorithm":"ed25519-custodian","key_id":"credential:norm/canary-worker#local"},"public_key_hex":"8b63653f041934d80ca209c9af6a2b6468cb91d8c9ced6d3d163ce59330c7fe0"},{"actor":{"principal":"norm-canary-publisher","algorithm":"ed25519-custodian","key_id":"credential:norm/canary-publisher#local"},"public_key_hex":"e125d4939b6abf4d44455ea791e1372d767adc09dac3db90373de47bb76490b1"}],"restorations":[]}'
+WHIP_NORM_TRUST = '{"bindings":[],"creation_grants":[{"creator":"norm-canary-worker","owner":"norm-canary-owner"}],"public_bindings":[{"actor":{"principal":"norm-canary-owner","algorithm":"ed25519-custodian","key_id":"credential:norm/canary-owner#local"},"public_key_hex":"10cd2b6605e11c0bf46a16b27d7a720a83237ca9646f590adef687ad22012798"},{"actor":{"principal":"norm-canary-worker","algorithm":"ed25519-custodian","key_id":"credential:norm/canary-worker#local"},"public_key_hex":"8b63653f041934d80ca209c9af6a2b6468cb91d8c9ced6d3d163ce59330c7fe0"},{"actor":{"principal":"norm-canary-publisher","algorithm":"ed25519-custodian","key_id":"credential:norm/canary-publisher#local"},"public_key_hex":"e125d4939b6abf4d44455ea791e1372d767adc09dac3db90373de47bb76490b1"}],"restorations":[{"object_id":"e4e5bbe8746e192b5140cf8f09697ae15080ed3d92340b6fb336ac6b53a52c9b","checkpoint":{"ledger":"2b323b0a7c16a088c0a7f073361a48184c03ee9da80aa66c7c3e8aee5c0ae79f","authority_head":"2b323b0a7c16a088c0a7f073361a48184c03ee9da80aa66c7c3e8aee5c0ae79f"}}]}'
 
 # The wasm module built from the #[wasm_bindgen] surface (crate whipplescript-host-do).
 # `wasm-pack build --target bundler` emits worker/pkg/*; the bundler inlines the .wasm.
