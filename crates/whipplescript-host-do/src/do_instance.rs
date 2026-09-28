@@ -50,7 +50,7 @@ use whipplescript_kernel::instance_machine::{EffectStep, InstanceDriver};
 use whipplescript_kernel::rule_lowering::json_from_str;
 use whipplescript_kernel::rule_pass::step_active_program_generic;
 use whipplescript_kernel::sansio::{
-    HttpResponse, IoRequest, IoResult, Outcome, StepMachine, TransportError,
+    HttpResponse, IoRequest, IoResult, ModelContentProvenance, Outcome, StepMachine, TransportError,
 };
 use whipplescript_kernel::world_state::{
     AgentRelation, AgentState, AgentTopology, ComputeResources, EffectiveTurnEnvelope,
@@ -63,7 +63,8 @@ use whipplescript_parser::IrProgram;
 use whipplescript_store::files::FileStore;
 use whipplescript_store::skill_frontmatter::parse_skill_frontmatter;
 use whipplescript_store::{
-    ClaimableEffect, EffectView, EvidenceRecord, RunStart, RuntimeStore, StoreError,
+    ClaimableEffect, EffectView, EvidenceRecord, ProjectContextDoc, RunStart, RuntimeStore,
+    StoreError,
 };
 
 /// What a model round about to be issued should be called (DR 0061).
@@ -273,6 +274,29 @@ fn agent_prompt(input: &serde_json::Value) -> Result<String, StoreError> {
 fn is_governed_host_model_input(input: &serde_json::Value, effect_id: &str) -> bool {
     input.get("command_id").and_then(serde_json::Value::as_str) == Some(effect_id)
         && input.pointer("/input/text").is_some()
+}
+
+fn project_doc_model_provenance(
+    system: ModelContentProvenance,
+    workspace_content: &ModelContentProvenance,
+    docs: &[ProjectContextDoc],
+) -> ModelContentProvenance {
+    // Position -1 is reserved for the version-pinned Agent AGENTS.md supplied
+    // by the resolved package on attach. It inherits the package source only
+    // when the authenticated host actually attested that package. Edit chats
+    // and package-authored turns cannot acquire that grant by position alone.
+    if docs.iter().any(|doc| {
+        doc.position != -1
+            || !system.complete
+            || !system
+                .source_handles
+                .iter()
+                .any(|source| source.starts_with("package:"))
+    }) {
+        ModelContentProvenance::derived_from([&system, workspace_content])
+    } else {
+        system
+    }
 }
 
 /// Refuse a turn whose grants name a resource this placement cannot serve.
@@ -1531,13 +1555,11 @@ impl<Sql: DoSql + Clone> InstanceDriver for DoInstanceDriver<'_, Sql> {
                 } else {
                     Default::default()
                 };
-                if !docs.is_empty() {
-                    model_provenance.system =
-                        whipplescript_kernel::sansio::ModelContentProvenance::derived_from([
-                            &model_provenance.system,
-                            &model_provenance.workspace_content,
-                        ]);
-                }
+                model_provenance.system = project_doc_model_provenance(
+                    model_provenance.system,
+                    &model_provenance.workspace_content,
+                    &docs,
+                );
                 if !skills.is_empty() {
                     // Skill discovery can read an unclassified workspace source.
                     model_provenance.system.complete = false;
@@ -2629,6 +2651,67 @@ mod tests {
         );
         assert!(is_governed_host_model_input(&input, "command-1"));
         assert!(!is_governed_host_model_input(&input, "other-command"));
+    }
+
+    #[test]
+    fn package_project_doc_does_not_inherit_workspace_source() {
+        let known = |handle: &str| ModelContentProvenance {
+            source_handles: vec![handle.to_owned()],
+            complete: true,
+        };
+        let package = known("package:version-one");
+        let workspace = known("workspace:chat-one");
+        let package_doc = ProjectContextDoc {
+            position: -1,
+            path: "AGENTS.md".to_owned(),
+            content_hash: "package-hash".to_owned(),
+            body: "Package instructions".to_owned(),
+        };
+        let discovered_doc = ProjectContextDoc {
+            position: 0,
+            path: "repo/AGENTS.md".to_owned(),
+            content_hash: "workspace-hash".to_owned(),
+            body: "Workspace instructions".to_owned(),
+        };
+        assert_eq!(
+            project_doc_model_provenance(
+                package.clone(),
+                &workspace,
+                std::slice::from_ref(&package_doc),
+            ),
+            package,
+        );
+        assert_eq!(
+            project_doc_model_provenance(
+                known("runtime"),
+                &workspace,
+                std::slice::from_ref(&package_doc),
+            ),
+            ModelContentProvenance::derived_from([&known("runtime"), &workspace]),
+            "a reserved document position cannot create a package grant",
+        );
+        assert_eq!(
+            project_doc_model_provenance(
+                package.clone(),
+                &workspace,
+                &[package_doc, discovered_doc]
+            ),
+            ModelContentProvenance::derived_from([&package, &workspace]),
+        );
+        let unknown_workspace = ModelContentProvenance::default();
+        assert!(
+            !project_doc_model_provenance(
+                package,
+                &unknown_workspace,
+                &[ProjectContextDoc {
+                    position: 0,
+                    path: "repo/AGENTS.md".to_owned(),
+                    content_hash: "workspace-hash".to_owned(),
+                    body: "Workspace instructions".to_owned(),
+                }]
+            )
+            .complete
+        );
     }
 
     #[test]
