@@ -3893,10 +3893,20 @@ mod tests {
             BrokeredTurnMachine::new(&http, &exec, &turn_input, &mut checkpoint, &compactor)
                 .with_command_source(&mut commands);
 
-        assert!(matches!(machine.step(None), Outcome::NeedsIo(_)));
+        let Outcome::NeedsIo(IoRequest::Http(first_after_compaction)) = machine.step(None) else {
+            panic!("compacted provider request");
+        };
         let snapshot = machine.snapshot();
         assert!(snapshot.applied_command_ids.contains("compact-1"));
         assert_eq!(snapshot.compaction_epoch, 1);
+        let labels = first_after_compaction
+            .model_provenance
+            .expect("the compacted provider call retains source labels");
+        assert_eq!(labels.messages.len(), snapshot.messages.len());
+        assert!(
+            labels.messages.iter().all(|label| !label.complete),
+            "a resumed transcript without source witnesses must remain hidden after compaction"
+        );
         assert!(snapshot.messages.len() < turn_input.resume_from.len());
         assert!(snapshot.messages.iter().any(|message| matches!(
             message,
